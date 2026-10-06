@@ -12,10 +12,10 @@ use crate::auth::authenticate::Authenticator;
 use ::vault::{
     ZA_MARKER,
     keys::{
-        Argon2Params, Secret, aad, derive_kek, derive_recovery_kek, derive_verifier_hash,
-        generate_keypair, unwrap_key, wrap_key,
+        Argon2Params, Secret, aad, app_aad, derive_app_kek, derive_kek, derive_recovery_kek,
+        derive_verifier_hash, generate_keypair, unwrap_key, wrap_key,
     },
-    record::{VaultRecord, VaultState},
+    record::{AppWrap, VaultRecord, VaultState, WrapState},
     recovery::RecoveryKey,
     session::SessionKeys,
 };
@@ -28,16 +28,16 @@ use common::{
         vault::{VaultRead, za_derive_root},
     },
 };
-use directory::Credentials;
+use directory::{Credentials, core::secret::hash_secret};
 use http_proto::{HttpRequest, HttpResponse, HttpSessionData};
 use hyper::StatusCode;
 use registry::{
     schema::{
-        enums::Permission,
+        enums::{Permission, StorageQuota},
         prelude::{Object, ObjectInner, ObjectType},
-        structs::{Account, Credential, PasswordCredential, UserAccount},
+        structs::{Account, Credential, PasswordCredential, SecondaryCredential, UserAccount},
     },
-    types::id::ObjectId,
+    types::{datetime::UTCDateTime, id::ObjectId},
 };
 use sha2::{Digest, Sha256};
 use std::{future::Future, net::IpAddr, sync::Arc};
@@ -46,10 +46,17 @@ use store::{
     write::now,
 };
 use subtle::ConstantTimeEq;
+use trc::AddContext;
 use types::{collection::Collection, id::Id};
 
 /// Lifetime of a setup token (spec 4.1).
 pub const SETUP_TOKEN_TTL_SECS: i64 = 7 * 86400;
+
+/// Longest app-password description, in bytes (spec 10).
+pub const MAX_APP_PASSWORD_DESCRIPTION: usize = 255;
+
+/// Attempts at publishing a Pending app-password wrap before giving up.
+const PUBLISH_RETRIES: usize = 5;
 
 #[derive(serde::Deserialize)]
 struct SetupTokenRequest {
@@ -91,6 +98,30 @@ struct CredentialsRequest {
     password: String,
     #[serde(default)]
     totp: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct AppPasswordRequest {
+    username: String,
+    password: String,
+    #[serde(default)]
+    totp: Option<String>,
+    description: String,
+}
+
+#[derive(serde::Serialize)]
+struct AppPasswordResponse {
+    app_password: String,
+    credential_id: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct RevokeRequest {
+    username: String,
+    password: String,
+    #[serde(default)]
+    totp: Option<String>,
+    credential_id: u32,
 }
 
 #[derive(serde::Serialize)]
@@ -206,6 +237,10 @@ impl VaultApi for Server {
             ("password", None) => za_password(self, session, parse(&body)?).await,
             ("recover", None) => za_recover(self, session, parse(&body)?).await,
             ("recovery-key", None) => za_recovery_key(self, session, parse(&body)?).await,
+            ("app-password", None) => za_app_password(self, session, parse(&body)?).await,
+            ("app-password", Some("revoke")) => {
+                za_app_password_revoke(self, session, parse(&body)?).await
+            }
             _ => Err(trc::ResourceEvent::NotFound.into_err()),
         }
     }
@@ -290,8 +325,6 @@ async fn za_registry_update(
     }
 }
 
-// First used by the app-password endpoints (Task 9).
-#[allow(dead_code)]
 async fn za_delete_registry_credential(
     server: &Server,
     account_id: u32,
@@ -836,4 +869,318 @@ async fn za_recovery_key(
     Ok(json(RecoveryKeyResponse {
         recovery_key: new_key.encode(),
     }))
+}
+
+/// Creates an app password (spec 4.1): the secret is generated as the
+/// registry generates it, and published in three steps so that a registry
+/// credential never outlives its wrap: (1) Pending wrap, (2) registry
+/// credential, (3) wrap Published, conditional on the same Pending entry.
+async fn za_app_password(
+    server: &Server,
+    session: &HttpSessionData,
+    request: AppPasswordRequest,
+) -> trc::Result<HttpResponse> {
+    let verified = match za_verify_primary(
+        server,
+        session,
+        &request.username,
+        &request.password,
+        request.totp,
+    )
+    .await?
+    {
+        Ok(verified) => verified,
+        Err(response) => return Ok(response),
+    };
+    let description = request.description.trim();
+    if description.is_empty() || description.len() > MAX_APP_PASSWORD_DESCRIPTION {
+        return Err(bad_request(format!(
+            "Description must be between 1 and {MAX_APP_PASSWORD_DESCRIPTION} bytes."
+        )));
+    }
+    let account_id = verified.account_id;
+    let Some(reg) = za_registry_account(server, account_id).await? else {
+        return Ok(conflict("not a user account"));
+    };
+    let quota = server.object_quota(
+        server.account(account_id).await?.object_quotas(),
+        StorageQuota::MaxAppPasswords,
+    );
+    let existing = reg
+        .account
+        .credentials
+        .values()
+        .filter(|c| matches!(c, Credential::AppPassword(_)))
+        .count();
+    if existing >= quota as usize {
+        return Ok(conflict("app password quota exceeded"));
+    }
+    let credential_id = reg.account.next_credential_id() as u32;
+    let app_pass = AppPassword::new(credential_id);
+    let secret_hash = hash_secret(
+        server.core.network.security.password_hash_algorithm,
+        app_pass.secret.to_vec(),
+    )
+    .await
+    .caused_by(trc::location!())?;
+    let publication_id = store::rand::random::<u64>();
+
+    // (1) Pending wrap, on top of the verified generation (invariant 8).
+    let read = match za_reread_verified(server, &verified).await? {
+        Ok(read) => read,
+        Err(response) => return Ok(response),
+    };
+    let created = now() as i64;
+    let mut record = read.record.clone();
+    // Pruning first: ids are reused once the highest credential is deleted,
+    // and a stale Published wrap under a reused id is an orphan. Any wrap
+    // left under the id belongs to a concurrent creation and is never
+    // touched (spec 4.1).
+    za_prune(server, &mut record, account_id, created).await?;
+    if record.app_wrap(credential_id).is_some() {
+        return Ok(conflict("app password publication in progress"));
+    }
+    record.app_wraps.push(AppWrap {
+        credential_id,
+        wrap: wrap_key(
+            verified.keys.mk(),
+            &derive_app_kek(&app_pass.secret, credential_id),
+            &app_aad(account_id, credential_id),
+        ),
+        state: WrapState::Pending,
+        created,
+        publication_id,
+    });
+    if let Err(response) = za_commit(
+        server,
+        account_id,
+        &mut record,
+        Some(&read),
+        Some(verified.keys.generation),
+        created,
+    )
+    .await?
+    {
+        return Ok(response);
+    }
+
+    #[cfg(feature = "test_mode")]
+    crate::auth::authenticate::za_test::publish_pause_point(account_id).await;
+
+    // (2) Registry credential, as the registry mapping creates it.
+    let mut account = reg.account.clone();
+    account
+        .credentials
+        .push(Credential::AppPassword(SecondaryCredential {
+            credential_id: Id::from(credential_id),
+            description: description.to_string(),
+            secret: secret_hash,
+            created_at: UTCDateTime::now(),
+            ..Default::default()
+        }));
+    let registered = za_registry_update(server, account_id, &reg, account).await;
+    if !matches!(registered, Ok(true)) {
+        za_withdraw_pending(server, account_id, credential_id, publication_id).await;
+        return registered.and(Ok(conflict("registry write failed")));
+    }
+
+    // (3) Publish, conditional on the same Pending entry.
+    for _ in 0..PUBLISH_RETRIES {
+        let Some(read) = server.za_vault_record(account_id).await? else {
+            break;
+        };
+        let mut record = read.record.clone();
+        match record.app_wrap_mut(credential_id) {
+            Some(wrap)
+                if wrap.state == WrapState::Pending && wrap.publication_id == publication_id =>
+            {
+                wrap.state = WrapState::Published;
+            }
+            _ => break,
+        }
+        // Without an expected revision the only refusal is a lost race.
+        if za_commit(
+            server,
+            account_id,
+            &mut record,
+            Some(&read),
+            None,
+            now() as i64,
+        )
+        .await?
+        .is_ok()
+        {
+            return Ok(json(AppPasswordResponse {
+                app_password: app_pass.build(),
+                credential_id,
+            }));
+        }
+    }
+
+    // Entry gone (pruned or revoked) or publication kept losing: the
+    // registry credential must not live on.
+    za_withdraw_pending(server, account_id, credential_id, publication_id).await;
+    za_delete_registry_credential_logged(server, account_id, credential_id).await;
+    Ok(conflict("app password publication failed"))
+}
+
+/// Removes this publication's Pending wrap, conditional on it still being
+/// that entry. Failure is logged: the wrap cannot log in, and pruning
+/// removes it after `PENDING_WRAP_MAX_AGE_SECS`.
+async fn za_withdraw_pending(
+    server: &Server,
+    account_id: u32,
+    credential_id: u32,
+    publication_id: u64,
+) {
+    let result = async {
+        for _ in 0..PUBLISH_RETRIES {
+            let Some(read) = server.za_vault_record(account_id).await? else {
+                return Ok(true);
+            };
+            let mut record = read.record.clone();
+            let before = record.app_wraps.len();
+            record.app_wraps.retain(|w| {
+                !(w.credential_id == credential_id
+                    && w.state == WrapState::Pending
+                    && w.publication_id == publication_id)
+            });
+            if record.app_wraps.len() == before {
+                return Ok(true);
+            }
+            if za_commit(
+                server,
+                account_id,
+                &mut record,
+                Some(&read),
+                None,
+                now() as i64,
+            )
+            .await?
+            .is_ok()
+            {
+                return Ok(true);
+            }
+        }
+        trc::Result::Ok(false)
+    }
+    .await;
+    match result {
+        Ok(true) => (),
+        Ok(false) => {
+            trc::error!(
+                trc::AuthEvent::Error
+                    .into_err()
+                    .account_id(account_id)
+                    .id(credential_id)
+                    .details("Zero-access: pending app-password wrap removal kept losing")
+            );
+        }
+        Err(err) => {
+            trc::error!(
+                err.account_id(account_id)
+                    .id(credential_id)
+                    .details("Zero-access: pending app-password wrap removal failed")
+            );
+        }
+    }
+}
+
+/// Registry credential delete, retried on a lost revision race. Failure
+/// leaves a dead credential (no Published wrap, so no login): logged, not
+/// returned.
+async fn za_delete_registry_credential_logged(
+    server: &Server,
+    account_id: u32,
+    credential_id: u32,
+) {
+    let mut result = Ok(false);
+    for _ in 0..PUBLISH_RETRIES {
+        result = za_delete_registry_credential(server, account_id, credential_id).await;
+        if !matches!(result, Ok(false)) {
+            break;
+        }
+    }
+    match result {
+        Ok(true) => (),
+        Ok(false) => {
+            trc::error!(
+                trc::AuthEvent::Error
+                    .into_err()
+                    .account_id(account_id)
+                    .id(credential_id)
+                    .details("Zero-access: app-password registry credential delete rejected")
+            );
+        }
+        Err(err) => {
+            trc::error!(
+                err.account_id(account_id)
+                    .id(credential_id)
+                    .details("Zero-access: app-password registry credential delete failed")
+            );
+        }
+    }
+}
+
+/// Revokes an app password (spec 4.1): the wrap goes in one conditional
+/// write on top of the verified generation, then the registry credential.
+async fn za_app_password_revoke(
+    server: &Server,
+    session: &HttpSessionData,
+    request: RevokeRequest,
+) -> trc::Result<HttpResponse> {
+    let verified = match za_verify_primary(
+        server,
+        session,
+        &request.username,
+        &request.password,
+        request.totp,
+    )
+    .await?
+    {
+        Ok(verified) => verified,
+        Err(response) => return Ok(response),
+    };
+    let account_id = verified.account_id;
+    let read = match za_reread_verified(server, &verified).await? {
+        Ok(read) => read,
+        Err(response) => return Ok(response),
+    };
+    let mut record = read.record.clone();
+    let before = record.app_wraps.len();
+    record
+        .app_wraps
+        .retain(|w| w.credential_id != request.credential_id);
+    if record.app_wraps.len() == before {
+        return Ok(conflict("unknown app password"));
+    }
+    // The commit invalidates cached authentication; from here the
+    // credential cannot log in even if the registry delete fails (spec 4.3).
+    if let Err(response) = za_commit(
+        server,
+        account_id,
+        &mut record,
+        Some(&read),
+        Some(verified.keys.generation),
+        now() as i64,
+    )
+    .await?
+    {
+        return Ok(response);
+    }
+    za_delete_registry_credential_logged(server, account_id, request.credential_id).await;
+    Ok(ok())
+}
+
+/// Test hook: deletes a registry credential the API cannot revoke (one
+/// without a wrap). False on any failure.
+#[cfg(feature = "test_mode")]
+pub async fn za_delete_registry_credential_for_test(
+    server: &Server,
+    account_id: u32,
+    credential_id: u32,
+) -> bool {
+    za_delete_registry_credential(server, account_id, credential_id)
+        .await
+        .unwrap_or(false)
 }

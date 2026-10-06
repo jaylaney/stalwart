@@ -242,7 +242,9 @@ impl Authenticator for Server {
 /// requests for other accounts pass through and leave it set. `PAUSE` sits
 /// between credential verification and the cache insert fence (paused
 /// verification tests); `ENDPOINT_PAUSE` sits in the vault endpoints between
-/// the fresh verification and the record re-read (generation fence tests).
+/// the fresh verification and the record re-read (generation fence tests);
+/// `PUBLISH_PAUSE` sits in `app-password` between the Pending wrap and the
+/// registry credential (interleaving tests).
 #[cfg(feature = "test_mode")]
 pub mod za_test {
     use std::sync::{Arc, Mutex};
@@ -268,12 +270,18 @@ pub mod za_test {
 
     pub static ENDPOINT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
+    pub static PUBLISH_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
     pub fn set(pause: Option<Arc<Pause>>) {
         *PAUSE.lock().unwrap_or_else(|e| e.into_inner()) = pause;
     }
 
     pub fn set_endpoint(pause: Option<Arc<Pause>>) {
         *ENDPOINT_PAUSE.lock().unwrap_or_else(|e| e.into_inner()) = pause;
+    }
+
+    pub fn set_publish(pause: Option<Arc<Pause>>) {
+        *PUBLISH_PAUSE.lock().unwrap_or_else(|e| e.into_inner()) = pause;
     }
 
     fn take_for(slot: &Mutex<Option<Arc<Pause>>>, account_id: u32) -> Option<Arc<Pause>> {
@@ -299,6 +307,10 @@ pub mod za_test {
 
     pub(crate) async fn endpoint_pause_point(account_id: u32) {
         wait_at(&ENDPOINT_PAUSE, account_id).await;
+    }
+
+    pub(crate) async fn publish_pause_point(account_id: u32) {
+        wait_at(&PUBLISH_PAUSE, account_id).await;
     }
 
     #[cfg(test)]

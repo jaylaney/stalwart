@@ -7,6 +7,7 @@
 use crate::utils::server::{TestServer, TestServerBuilder};
 use registry::schema::{enums::Permission, prelude::Property, structs::Http};
 
+pub mod app_password;
 pub mod password;
 pub mod setup;
 
@@ -49,6 +50,7 @@ pub async fn za_tests() {
 
     setup::test(&mut test).await;
     password::test(&mut test).await;
+    app_password::test(&mut test).await;
 
     destroy_key_accounts(&test).await;
     test.assert_is_empty().await;

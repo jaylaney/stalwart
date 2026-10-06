@@ -4,11 +4,13 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::utils::{account::Account, http::HttpRequest};
-use hyper::Method;
+use crate::utils::{account::Account, http::HttpRequest, server::TestServer};
+use http::auth::authenticate::za_test::{self, Pause};
+use hyper::{Method, StatusCode};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
+use tokio::task::JoinHandle;
 
 /// The suite's HTTPS listener.
 pub const SERVER_URL: &str = "https://127.0.0.1:8899";
@@ -155,4 +157,115 @@ pub async fn za_setup(username: &str, token: &str, password: &str) -> String {
     )
     .await
     .str(200, "recovery_key")
+}
+
+/// PROPFIND on the calendar home. Requests expected to fail are sent from
+/// `fail_ip`, so a module's deliberate failures do not consume the loopback
+/// address's fail2ban budget.
+pub async fn caldav_from(fail_ip: &str, name: &str, secret: &str, status: StatusCode) {
+    let mut request = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+        .request(
+            Method::from_bytes(b"PROPFIND").unwrap(),
+            format!("{SERVER_URL}/dav/cal/{name}/"),
+        )
+        .basic_auth(name, Some(secret));
+    if !status.is_success() {
+        request = request.header("X-Forwarded-For", fail_ip);
+    }
+    let response = request.send().await.unwrap();
+    assert_eq!(
+        response.status().as_u16(),
+        status.as_u16(),
+        "PROPFIND as {name}"
+    );
+}
+
+pub fn assert_nothing_cached(test: &TestServer, account_id: u32) {
+    assert!(
+        !test
+            .server
+            .inner
+            .cache
+            .http_auth
+            .inner()
+            .iter()
+            .any(|(_, v)| v.account_id == account_id),
+        "no cached authentication for the account"
+    );
+    assert!(
+        !test.server.inner.cache.za_keys.contains_account(account_id),
+        "no resident keys for the account"
+    );
+}
+
+/// A request held at a test-mode pause point. `set` names the slot:
+/// `za_test::set` (after verification, before the cache-insert fence),
+/// `za_test::set_endpoint` (vault endpoints, after verification, before the
+/// record re-read) or `za_test::set_publish` (`app-password`, between the
+/// Pending wrap and the registry credential). Dropping it clears that
+/// process-global slot and releases the request, also on a failed assertion.
+pub struct Parked<T> {
+    pause: Arc<Pause>,
+    clear: fn(Option<Arc<Pause>>),
+    handle: Option<JoinHandle<T>>,
+}
+
+impl<T: Send + 'static> Parked<T> {
+    pub async fn start(
+        account_id: u32,
+        set: fn(Option<Arc<Pause>>),
+        request: impl Future<Output = T> + Send + 'static,
+    ) -> Self {
+        let pause = Arc::new(Pause::new(account_id));
+        set(Some(pause.clone()));
+        let mut parked = Parked {
+            pause: pause.clone(),
+            clear: set,
+            handle: None,
+        };
+        parked.handle = Some(tokio::spawn(request));
+        tokio::time::timeout(Duration::from_secs(5), pause.arrived.notified())
+            .await
+            .expect("the request did not reach the pause point");
+        parked
+    }
+
+    pub async fn finish(mut self) -> T {
+        self.pause.release.notify_one();
+        self.handle.take().unwrap().await.unwrap()
+    }
+}
+
+impl<T> Drop for Parked<T> {
+    fn drop(&mut self) {
+        (self.clear)(None);
+        self.pause.release.notify_one();
+    }
+}
+
+/// A CalDAV login parked after its credentials were verified. The harness
+/// client times out after 5 s, long enough to stay parked.
+pub async fn park_login(account_id: u32, name: &str, secret: &str) -> Parked<u16> {
+    let request = HttpRequest::with_credentials(8899, name, secret);
+    let path = format!("/dav/cal/{name}/");
+    Parked::start(account_id, za_test::set, async move {
+        request
+            .send_full(Method::from_bytes(b"PROPFIND").unwrap(), &path, None, None)
+            .await
+            .status
+            .as_u16()
+    })
+    .await
+}
+
+/// A vault request parked between its fresh verification and the re-read.
+pub async fn park_endpoint(account_id: u32, path: &'static str, body: Value) -> Parked<VaultReply> {
+    Parked::start(account_id, za_test::set_endpoint, async move {
+        za_post(path, &body).await
+    })
+    .await
 }
