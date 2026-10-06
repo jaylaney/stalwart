@@ -20,6 +20,23 @@ use store::registry::write::{RegistryWrite, RegistryWriteResult};
 use trc::AddContext;
 use types::id::Id;
 
+/// Applies a directory-supplied secret to an existing account, as upstream
+/// does, except that a key account's marker is never replaced (spec 4.2):
+/// classification derives from it, and the vault record holds the real
+/// verifier. Returns whether the account changed.
+fn merge_directory_secret(account: &mut UserAccount, secret: Option<String>) -> bool {
+    let current = account.password();
+    match secret {
+        Some(secret)
+            if current != Some(::vault::ZA_MARKER) && secret != current.unwrap_or_default() =>
+        {
+            account.set_password(secret);
+            true
+        }
+        _ => false,
+    }
+}
+
 pub struct AccountWithId {
     pub id: u32,
     pub account: Account,
@@ -85,13 +102,7 @@ impl Server {
                             .ctx(trc::Key::AccountId, account_id)
                     })?;
 
-                let mut has_changes = false;
-                if let Some(secret) = account.secret
-                    && secret != updated_account.password().unwrap_or_default()
-                {
-                    has_changes = true;
-                    updated_account.set_password(secret);
-                }
+                let mut has_changes = merge_directory_secret(&mut updated_account, account.secret);
                 if account.description.is_some()
                     && account.description != updated_account.description
                 {
@@ -522,5 +533,45 @@ impl Server {
                 .map(|domain| domain.map(|domain| (local, domain))),
             None => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directory_secret_never_replaces_the_key_account_marker() {
+        let mut key_account = UserAccount::default();
+        key_account.set_password(::vault::ZA_MARKER.to_string());
+        let before = key_account.clone();
+        assert!(!merge_directory_secret(
+            &mut key_account,
+            Some("$argon2id$directory-hash".into())
+        ));
+        assert_eq!(key_account, before);
+        assert_eq!(key_account.password(), Some(::vault::ZA_MARKER));
+
+        // Upstream behaviour is unchanged for other accounts.
+        let mut account = UserAccount::default();
+        account.set_password("$argon2id$old".into());
+        assert!(merge_directory_secret(
+            &mut account,
+            Some("$argon2id$new".into())
+        ));
+        assert_eq!(account.password(), Some("$argon2id$new"));
+        assert!(!merge_directory_secret(
+            &mut account,
+            Some("$argon2id$new".into())
+        ));
+        assert!(!merge_directory_secret(&mut account, None));
+        assert_eq!(account.password(), Some("$argon2id$new"));
+
+        let mut no_password = UserAccount::default();
+        assert!(merge_directory_secret(
+            &mut no_password,
+            Some("$argon2id$first".into())
+        ));
+        assert_eq!(no_password.password(), Some("$argon2id$first"));
     }
 }
