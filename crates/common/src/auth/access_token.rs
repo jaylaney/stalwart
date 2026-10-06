@@ -10,6 +10,7 @@ use crate::{
     auth::{
         AccessScope, AccessTo, AccessTokenInner, AccountTenantIds, Permissions, RECOVERY_ADMIN_ID,
         permissions::{BuildPermissions, PermissionsListBuilder},
+        vault::is_vault_unusable,
     },
     network::limiter::{ConcurrencyLimiter, LimiterResult},
 };
@@ -123,6 +124,8 @@ impl Server {
 
                 let now = now();
                 let mut credential_version = 0;
+                // Same credential as classification: the first Password one.
+                let mut is_marker: Option<bool> = None;
                 let mut credential_scopes = Vec::with_capacity(account.credentials.len());
 
                 credential_scopes.push(AccessScope::new(permissions.finalize(), u32::MAX));
@@ -130,6 +133,7 @@ impl Server {
                 for credential in account.credentials {
                     match credential {
                         structs::Credential::Password(credential) => {
+                            is_marker.get_or_insert(credential.secret == ::vault::ZA_MARKER);
                             credential_version = xxh3::xxh3_64(credential.secret.as_bytes()).max(1);
 
                             if credential.expires_at.is_some() || !credential.allowed_ips.is_empty()
@@ -185,13 +189,16 @@ impl Server {
 
                 // A marker secret is constant, so OAuth token revocation on
                 // password change must follow the vault generation instead.
-                if credential_version == xxh3::xxh3_64(::vault::ZA_MARKER.as_bytes()).max(1) {
-                    credential_version = self
-                        .za_vault_record(account_id)
-                        .await?
-                        .map(|read| read.record.revision)
-                        .unwrap_or(0)
-                        .max(1);
+                if is_marker == Some(true) {
+                    let read = match self.za_vault_record(account_id).await {
+                        Ok(read) => read,
+                        Err(err) if is_vault_unusable(&err) => {
+                            trc::error!(err);
+                            None
+                        }
+                        Err(err) => return Err(err),
+                    };
+                    credential_version = read.map(|read| read.record.revision).unwrap_or(0).max(1);
                 }
 
                 Ok(AccessTokenInner {

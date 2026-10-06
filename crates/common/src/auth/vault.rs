@@ -26,7 +26,7 @@ impl Deserialize for RawValue {
 
 pub struct VaultRead {
     pub record: VaultRecord,
-    /// xxh3 of the stored bytes; pass back to `za_vault_write` as `expected_cas`.
+    /// xxh3 of the stored bytes; `za_vault_write(.., Some(&read))` asserts it.
     pub cas: u64,
 }
 
@@ -49,6 +49,22 @@ fn vault_corrupted(account_id: u32) -> trc::Error {
         .caused_by(trc::location!())
 }
 
+fn vault_unsupported(account_id: u32, version: u8) -> trc::Error {
+    trc::StoreEvent::DataCorruption
+        .into_err()
+        .details("unsupported zero-access vault record version")
+        .account_id(account_id)
+        .id(u64::from(version))
+        .caused_by(trc::location!())
+}
+
+/// True for a record that exists but cannot be used (corrupt or unknown
+/// version). Classification treats it like a missing record (spec 3.2); any
+/// other error is a store failure and propagates.
+pub(crate) fn is_vault_unusable(err: &trc::Error) -> bool {
+    err.matches(trc::EventType::Store(trc::StoreEvent::DataCorruption))
+}
+
 /// The stored value is one version byte followed by the record's archive.
 pub(crate) async fn vault_read_store(
     store: &Store,
@@ -64,26 +80,14 @@ pub(crate) async fn vault_read_store(
     let cas = xxh3_64(&raw.0);
     let archived = match raw.0.split_first() {
         Some((&version, archived)) if version == VAULT_RECORD_VERSION => archived,
-        Some((&version, _)) => {
-            return Err(trc::StoreEvent::DataCorruption
-                .into_err()
-                .details("unsupported zero-access vault record version")
-                .account_id(account_id)
-                .id(u64::from(version))
-                .caused_by(trc::location!()));
-        }
+        Some((&version, _)) => return Err(vault_unsupported(account_id, version)),
         None => return Err(vault_corrupted(account_id)),
     };
     let record = <Archive<AlignedBytes> as Deserialize>::deserialize(archived)
         .and_then(|archive| archive.deserialize::<VaultRecord>())
         .map_err(|_| vault_corrupted(account_id))?;
     if record.version != VAULT_RECORD_VERSION {
-        return Err(trc::StoreEvent::DataCorruption
-            .into_err()
-            .details("unsupported zero-access vault record version")
-            .account_id(account_id)
-            .id(u64::from(record.version))
-            .caused_by(trc::location!()));
+        return Err(vault_unsupported(account_id, record.version));
     }
     Ok(Some(VaultRead { record, cas }))
 }
@@ -92,8 +96,20 @@ pub(crate) async fn vault_write_store(
     store: &Store,
     account_id: u32,
     record: &VaultRecord,
-    expected_cas: Option<u64>,
+    previous: Option<&VaultRead>,
 ) -> trc::Result<()> {
+    if let Some(previous) = previous
+        && record.revision <= previous.record.revision
+    {
+        return Err(trc::StoreEvent::UnexpectedError
+            .into_err()
+            .details("zero-access vault revision must increase on every write")
+            .account_id(account_id)
+            .ctx(trc::Key::From, previous.record.revision)
+            .ctx(trc::Key::To, record.revision)
+            .caused_by(trc::location!()));
+    }
+
     let archive = Archiver::new(record.clone())
         .serialize()
         .caused_by(trc::location!())?;
@@ -108,7 +124,9 @@ pub(crate) async fn vault_write_store(
         .with_document(0)
         .assert_value(
             PrincipalField::ZeroAccessVault,
-            expected_cas.map_or(AssertValue::None, AssertValue::Hash),
+            previous.map_or(AssertValue::None, |previous| {
+                AssertValue::Hash(previous.cas)
+            }),
         )
         .set(PrincipalField::ZeroAccessVault, value);
     store.write(batch.build_all()).await.map(|_| ())
@@ -119,16 +137,19 @@ impl Server {
         vault_read_store(self.store(), account_id).await
     }
 
-    /// Conditional write (spec 3.1). `expected_cas: None` means "must not
-    /// exist". A lost race surfaces as `StoreEvent::AssertValueFailed`
-    /// (`err.is_assertion_failure()`), which endpoints map to 409.
+    /// Conditional write (spec 3.1). `previous: None` means "must not exist";
+    /// `Some(read)` requires the stored bytes to be unchanged since `read` and
+    /// `record.revision` to exceed `read.record.revision` (otherwise a
+    /// `StoreEvent::UnexpectedError`, nothing written). A lost race surfaces
+    /// as `StoreEvent::AssertValueFailed` (`err.is_assertion_failure()`),
+    /// which endpoints map to 409.
     pub async fn za_vault_write(
         &self,
         account_id: u32,
         record: &VaultRecord,
-        expected_cas: Option<u64>,
+        previous: Option<&VaultRead>,
     ) -> trc::Result<()> {
-        vault_write_store(self.store(), account_id, record, expected_cas).await
+        vault_write_store(self.store(), account_id, record, previous).await
     }
 
     /// After any successful vault write (spec 4.1): drops cached authentication
@@ -193,12 +214,12 @@ mod tests {
         record.revision += 1;
         record.state = VaultState::Active;
         assert!(
-            vault_write_store(&store, 5, &record, Some(read.cas))
+            vault_write_store(&store, 5, &record, Some(&read))
                 .await
                 .is_ok()
         );
         assert!(
-            vault_write_store(&store, 5, &record, Some(read.cas))
+            vault_write_store(&store, 5, &record, Some(&read))
                 .await
                 .unwrap_err()
                 .is_assertion_failure(),
@@ -250,5 +271,51 @@ mod tests {
         write_raw(&store, 9, Vec::new()).await;
         let err = vault_read_store(&store, 9).await.err().unwrap();
         assert!(err.matches(trc::EventType::Store(trc::StoreEvent::DataCorruption)));
+        assert!(is_vault_unusable(&err), "call sites classify on this");
+        assert!(!is_vault_unusable(
+            &trc::StoreEvent::AssertValueFailed.into_err()
+        ));
+    }
+
+    #[tokio::test]
+    async fn write_requires_increasing_revision() {
+        let store = EphemeralStore::open();
+        let record = VaultRecord::pending(vec![3; 32], 100);
+        vault_write_store(&store, 4, &record, None).await.unwrap();
+        let read = vault_read_store(&store, 4).await.unwrap().unwrap();
+
+        let mut same = read.record.clone();
+        same.state = VaultState::Active;
+        let err = vault_write_store(&store, 4, &same, Some(&read))
+            .await
+            .unwrap_err();
+        assert!(
+            !err.is_assertion_failure(),
+            "an invariant violation, not a race"
+        );
+        assert!(err.matches(trc::EventType::Store(trc::StoreEvent::UnexpectedError)));
+
+        let after = vault_read_store(&store, 4).await.unwrap().unwrap();
+        assert_eq!(after.cas, read.cas);
+        assert_eq!(after.record, record);
+    }
+
+    #[test]
+    fn za_keys_for_only_yields_the_authenticated_account() {
+        use crate::auth::AccessToken;
+        use ::vault::{keys::Secret, session::SessionKeys};
+        use std::sync::Arc;
+
+        let token = AccessToken::from_permissions(7, []).with_session_keys(Arc::new(
+            SessionKeys::new(7, 1, Secret::from_bytes([1; 32])),
+        ));
+        assert!(token.session_keys().is_some());
+        assert_eq!(token.za_keys_for(7).map(|k| k.account_id), Some(7));
+        assert!(token.za_keys_for(8).is_none());
+        assert!(
+            AccessToken::from_permissions(7, [])
+                .za_keys_for(7)
+                .is_none()
+        );
     }
 }

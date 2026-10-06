@@ -14,7 +14,7 @@ use crate::{
         ACCOUNT_IS_KEY_ACCOUNT, ACCOUNT_IS_USER, AccountCache, AccountInfo, AccountTenantIds,
         DOMAIN_FLAG_RELAY, DOMAIN_FLAG_SUB_ADDRESSING, DomainCache, EmailAddress, EmailAddressRef,
         EmailCache, MailingListCache, PermissionsGroup, RECOVERY_ADMIN_ID, RoleCache, TenantCache,
-        permissions::BuildPermissions,
+        permissions::BuildPermissions, vault::is_vault_unusable,
     },
     config::smtp::auth::DkimSigners,
     expr::if_block::BootstrapExprExt,
@@ -420,13 +420,21 @@ impl Server {
                             .password_credential()
                             .is_some_and(|c| c.secret == vault::ZA_MARKER);
                         let (za_generation, za_public_key) = if is_key_account {
-                            match self.za_vault_record(account_id).await? {
+                            let read = match self.za_vault_record(account_id).await {
+                                Ok(read) => read,
+                                Err(err) if is_vault_unusable(&err) => {
+                                    trc::error!(err);
+                                    None
+                                }
+                                Err(err) => return Err(err),
+                            };
+                            match read {
                                 Some(read) => (
                                     read.record.revision,
                                     read.record.public_key.as_slice().try_into().ok(),
                                 ),
                                 None => {
-                                    // Marker without record: corruption (spec 3.2).
+                                    // Marker without a usable record: corruption (spec 3.2).
                                     // Classified as a key account, logins refused in Task 5.
                                     (0, None)
                                 }
