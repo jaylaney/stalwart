@@ -72,6 +72,20 @@ pub async fn verify_mfa_secret_hash(
     }
 }
 
+/// Checks `code` against an `otpauth://` URL with the same semantics as
+/// `verify_mfa_secret_hash` (current window only). The URL holds the TOTP
+/// secret, so it is never attached to the error.
+pub fn verify_totp_code(totp_uri: &str, code: &str) -> trc::Result<bool> {
+    Ok(Totp::from_url(totp_uri)
+        .map_err(|err| {
+            trc::AuthEvent::Error
+                .reason(err)
+                .details("Invalid TOTP URL")
+        })?
+        .check_current(code)
+        .is_some())
+}
+
 async fn verify_hash_prefix(hashed_secret: &str, secret: &[u8]) -> trc::Result<bool> {
     let is_argon = hashed_secret.starts_with("$argon2");
     let is_pbkdf2 = !is_argon && hashed_secret.starts_with("$pbkdf2");

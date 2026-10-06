@@ -10,6 +10,7 @@ use crate::{
         AccessToken, AuthRequest, DomainCache,
         credential::{ApiKey, AppPassword},
         oauth::{GrantType, token::TOKEN_HEADER},
+        vault::{ZA_REASON_VAULT_MISSING, ZaVerification},
     },
 };
 use base64::{Engine, engine::general_purpose};
@@ -25,6 +26,7 @@ use serde::Deserialize;
 use std::{borrow::Cow, net::IpAddr, sync::Arc};
 use store::write::now;
 use trc::AddContext;
+use vault::ZA_MARKER;
 
 pub struct UsernameParts {
     pub account: Username,
@@ -185,8 +187,17 @@ impl Server {
                     };
 
                     is_alias_login = directory_account.email != auth_as_address;
-                    self.build_directory_token(directory_account, req.remote_ip)
-                        .await
+                    let token = self
+                        .build_directory_token(directory_account, req.remote_ip)
+                        .await?;
+                    if self.account(token.account_id()).await?.is_key_account() {
+                        return Err(trc::AuthEvent::Failed
+                            .into_err()
+                            .ctx(trc::Key::AccountName, auth_as_address.to_string())
+                            .ctx(trc::Key::SpanId, req.session_id)
+                            .reason("Zero-access accounts cannot authenticate through an external directory"));
+                    }
+                    Ok(token)
                 } else if let Some(account_id) =
                     self.account_id_from_parts(auth_as_local, domain.id).await?
                 {
@@ -205,19 +216,52 @@ impl Server {
                                 .reason("Password credential not found for account"));
                         };
 
-                        match verify_mfa_secret_hash(
-                            credential.otp_auth.as_deref(),
-                            mfa_token.as_deref(),
-                            credential.secret.as_str(),
-                            secret,
-                        )
-                        .await?
-                        {
+                        let (result, session_keys) = if credential.secret == ZA_MARKER {
+                            match self
+                                .za_verify_password(account_id, secret, mfa_token.as_deref())
+                                .await?
+                            {
+                                ZaVerification::Valid(keys) => {
+                                    (SecretVerificationResult::Valid, Some(keys))
+                                }
+                                ZaVerification::Invalid => {
+                                    (SecretVerificationResult::Invalid, None)
+                                }
+                                ZaVerification::MissingMfaToken => {
+                                    (SecretVerificationResult::MissingMfaToken, None)
+                                }
+                                ZaVerification::NoRecord => {
+                                    return Err(trc::AuthEvent::Error
+                                        .into_err()
+                                        .ctx(trc::Key::AccountName, auth_as_address.to_string())
+                                        .ctx(trc::Key::AccountId, account_id)
+                                        .ctx(trc::Key::SpanId, req.session_id)
+                                        .reason(ZA_REASON_VAULT_MISSING));
+                                }
+                            }
+                        } else {
+                            (
+                                verify_mfa_secret_hash(
+                                    credential.otp_auth.as_deref(),
+                                    mfa_token.as_deref(),
+                                    credential.secret.as_str(),
+                                    secret,
+                                )
+                                .await?,
+                                None,
+                            )
+                        };
+
+                        match result {
                             SecretVerificationResult::Valid => {
                                 is_alias_login = account.name != auth_as_local;
                                 self.access_token(account_id)
                                     .await
                                     .and_then(|token| AccessToken::new(token, req.remote_ip))
+                                    .map(|token| match session_keys {
+                                        Some(keys) => token.with_session_keys(keys),
+                                        None => token,
+                                    })
                             }
                             SecretVerificationResult::Invalid => Err(trc::AuthEvent::Failed
                                 .into_err()
@@ -398,6 +442,7 @@ impl Server {
         {
             // Find credential by credential_id
             let mut authenticated = false;
+            let mut authenticated_as_app_password = false;
             for (credential, credential_type) in
                 account.credentials.iter().filter_map(|credential| {
                     credential
@@ -443,17 +488,45 @@ impl Server {
                         }
                     );
 
+                    authenticated_as_app_password =
+                        matches!(credential_type, Credential::AppPassword(_));
                     authenticated = true;
                     break;
                 }
             }
 
             if authenticated {
+                let session_keys = if authenticated_as_app_password
+                    && account
+                        .password_credential()
+                        .is_some_and(|c| c.secret == ZA_MARKER)
+                {
+                    match self
+                        .za_open_app_wrap(account_id, credential_id, secret)
+                        .await?
+                    {
+                        Some(keys) => Some(keys),
+                        None => {
+                            return Err(trc::AuthEvent::Failed
+                                .into_err()
+                                .ctx(trc::Key::AccountId, account_id)
+                                .ctx(trc::Key::Id, credential_id)
+                                .ctx(trc::Key::SpanId, span_id)
+                                .reason("Zero-access app password has no published wrap"));
+                        }
+                    }
+                } else {
+                    None
+                };
                 let token = self
                     .access_token_from_account(account_id, structs::Account::User(account))
                     .await?;
 
                 AccessToken::new_scoped(token, credential_id, remote_ip)
+                    .map(|token| match session_keys {
+                        Some(keys) => token.with_session_keys(keys),
+                        None => token,
+                    })
                     .add_context(|ctx| ctx.span_id(span_id))
             } else {
                 Err(trc::AuthEvent::Failed

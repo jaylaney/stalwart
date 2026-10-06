@@ -1366,6 +1366,7 @@ dependencies = [
  "tinyvec",
  "tokio",
  "tokio-rustls",
+ "totp-rs",
  "trc",
  "types",
  "unicode-security",

@@ -97,6 +97,7 @@ foundation = []
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["full"] }
+totp-rs = { version = "6.0.0", features = ["otpauth"] }
 
 [lints]
 workspace = true
