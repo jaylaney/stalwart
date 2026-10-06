@@ -370,6 +370,20 @@ impl Server {
     }
 }
 
+/// `ZA_ACCOUNT_PAGE_ORIGIN` (spec 4.1): the origin of the account page,
+/// allowed by CORS on `/api/vault/*`. Read once at startup; unset, empty or
+/// not a valid header value leaves the vault API without CORS headers.
+pub fn za_account_page_origin_from_env() -> Option<hyper::header::HeaderValue> {
+    za_parse_origin(std::env::var("ZA_ACCOUNT_PAGE_ORIGIN").ok().as_deref())
+}
+
+fn za_parse_origin(origin: Option<&str>) -> Option<hyper::header::HeaderValue> {
+    origin
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .and_then(|origin| hyper::header::HeaderValue::from_str(origin).ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -725,6 +739,18 @@ mod tests {
             AccessToken::from_permissions(7, [])
                 .za_keys_for(7)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn account_page_origin_parsing() {
+        assert_eq!(za_parse_origin(None), None);
+        assert_eq!(za_parse_origin(Some("")), None);
+        assert_eq!(za_parse_origin(Some("  ")), None);
+        assert_eq!(za_parse_origin(Some("bad\norigin")), None);
+        assert_eq!(
+            za_parse_origin(Some(" https://account.example.com ")).unwrap(),
+            "https://account.example.com"
         );
     }
 }

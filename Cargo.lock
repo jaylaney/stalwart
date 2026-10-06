@@ -4205,6 +4205,7 @@ dependencies = [
  "tungstenite 0.30.0",
  "types",
  "utils",
+ "vault",
 ]
 
 [[package]]
@@ -8562,6 +8563,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls",
+ "totp-rs",
  "trc",
  "types",
  "utils",

@@ -182,6 +182,8 @@ pub struct Caches {
     /// Bumped before every local `Account`/`AccessToken` invalidation; a
     /// loader that saw it change since its read must not publish its value.
     pub account_epoch: AtomicU64,
+    /// Origin of the account page, allowed by CORS on `/api/vault/*` (spec 4.1).
+    pub za_account_page_origin: Option<hyper::header::HeaderValue>,
 
     pub messages: Cache<u32, Arc<MessageStoreCache>>,
     pub files: Cache<u32, Arc<DavResources>>,

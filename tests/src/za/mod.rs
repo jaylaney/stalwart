@@ -5,16 +5,26 @@
  */
 
 use crate::utils::server::{TestServer, TestServerBuilder};
-use registry::schema::{enums::Permission, prelude::Property, structs::Http};
+use ::registry::schema::{enums::Permission, prelude::Property, structs::Http};
 
 pub mod app_password;
+pub mod cors;
 pub mod password;
+pub mod registry;
 pub mod setup;
+pub mod totp;
 
 pub const STRONG: &str = "correct horse battery staple 1";
 
+/// Origin of the account page, allowed by CORS on `/api/vault/*`.
+pub const ACCOUNT_PAGE_ORIGIN: &str = "https://account.example.com";
+
 #[tokio::test(flavor = "multi_thread")]
 pub async fn za_tests() {
+    // Read once when the server starts. SAFETY: set before this test builds
+    // its server and starts its runtime work; the variable is only read by
+    // server startup, and no test in this binary writes the environment.
+    unsafe { std::env::set_var("ZA_ACCOUNT_PAGE_ORIGIN", ACCOUNT_PAGE_ORIGIN) };
     let mut test = TestServerBuilder::new("za_tests")
         .await
         .with_default_listeners()
@@ -51,6 +61,9 @@ pub async fn za_tests() {
     setup::test(&mut test).await;
     password::test(&mut test).await;
     app_password::test(&mut test).await;
+    totp::test(&mut test).await;
+    registry::test(&mut test).await;
+    cors::test(&mut test).await;
 
     destroy_key_accounts(&test).await;
     test.assert_is_empty().await;

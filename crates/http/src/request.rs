@@ -6,7 +6,10 @@
 
 use crate::{
     HttpSessionManager,
-    api::{AuthChallenge, ManagementApi, ToManageHttpResponse},
+    api::{
+        AuthChallenge, ManagementApi, ToManageHttpResponse,
+        vault::{za_cors_preflight, za_with_cors},
+    },
     auth::{
         authenticate::{Authenticator, HttpHeaders},
         oauth::{
@@ -469,19 +472,27 @@ impl ParseHttp for Server {
             }
             // SPDX-SnippetEnd
             "api" => {
+                // Zero-access account API: CORS for the account page only (spec 4.1).
+                let za_origin = if req.uri().path().split('/').nth(2) == Some("vault") {
+                    self.inner.cache.za_account_page_origin.as_ref()
+                } else {
+                    None
+                };
+
                 // Allow CORS preflight requests
                 if req.method() == Method::OPTIONS {
-                    return Ok(HttpResponse::new(StatusCode::NO_CONTENT));
+                    return Ok(za_cors_preflight(za_origin));
                 }
 
-                return Ok(match self.handle_api_request(&mut req, &session).await {
+                let response = match self.handle_api_request(&mut req, &session).await {
                     Ok(response) => response,
                     Err(err) => {
                         let response = err.into_http_response(AuthChallenge::Bearer);
                         trc::error!(err.span_id(session.session_id));
                         response
                     }
-                });
+                };
+                return Ok(za_with_cors(response, za_origin));
             }
             "mail" => {
                 if req.method() == Method::GET

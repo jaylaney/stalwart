@@ -28,9 +28,15 @@ use common::{
         vault::{VaultRead, za_derive_root},
     },
 };
-use directory::{Credentials, core::secret::hash_secret};
+use directory::{
+    Credentials,
+    core::secret::{hash_secret, verify_totp_code},
+};
 use http_proto::{HttpRequest, HttpResponse, HttpSessionData};
-use hyper::StatusCode;
+use hyper::{
+    StatusCode,
+    header::{self, HeaderValue},
+};
 use registry::{
     schema::{
         enums::{Permission, StorageQuota},
@@ -124,6 +130,17 @@ struct RevokeRequest {
     credential_id: u32,
 }
 
+#[derive(serde::Deserialize)]
+struct TotpRequest {
+    username: String,
+    password: String,
+    #[serde(default)]
+    totp: Option<String>,
+    /// The new otpauth:// URL; null, absent or empty removes TOTP.
+    #[serde(default)]
+    otp_auth: Option<String>,
+}
+
 #[derive(serde::Serialize)]
 struct RecoveryKeyResponse {
     recovery_key: String,
@@ -202,6 +219,33 @@ fn za_argon2_params() -> Argon2Params {
     }
 }
 
+/// CORS preflight on `/api/vault/*` (spec 4.1). Without a configured
+/// account-page origin this is upstream's bare 204.
+pub fn za_cors_preflight(origin: Option<&HeaderValue>) -> HttpResponse {
+    let response = HttpResponse::new(StatusCode::NO_CONTENT);
+    if origin.is_none() {
+        return response;
+    }
+    za_with_cors(response, origin)
+        .with_header(header::ACCESS_CONTROL_ALLOW_METHODS, "POST, OPTIONS")
+        .with_header(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            "Content-Type, Authorization",
+        )
+        .with_header(header::ACCESS_CONTROL_MAX_AGE, "600")
+}
+
+/// Every `/api/vault/*` response allows the configured account-page origin
+/// (spec 4.1); without one the response is unchanged.
+pub fn za_with_cors(response: HttpResponse, origin: Option<&HeaderValue>) -> HttpResponse {
+    match origin {
+        Some(origin) => response
+            .with_header(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone())
+            .with_header(header::VARY, "Origin"),
+        None => response,
+    }
+}
+
 pub trait VaultApi: Sync + Send {
     fn handle_vault_request(
         &self,
@@ -241,6 +285,7 @@ impl VaultApi for Server {
             ("app-password", Some("revoke")) => {
                 za_app_password_revoke(self, session, parse(&body)?).await
             }
+            ("totp", None) => za_totp(self, session, parse(&body)?).await,
             _ => Err(trc::ResourceEvent::NotFound.into_err()),
         }
     }
@@ -1210,4 +1255,115 @@ async fn za_app_password_revoke(
     }
     za_delete_registry_credential_logged(server, account_id, request.credential_id).await;
     Ok(ok())
+}
+
+/// Enrols, replaces or removes TOTP (spec 4.1): the password and, when
+/// enrolled, the current code are verified, then the new URL (or its
+/// removal) is committed to the vault record in one conditional write.
+/// Nothing is written to the registry, whose TOTP field stays empty.
+async fn za_totp(
+    server: &Server,
+    session: &HttpSessionData,
+    request: TotpRequest,
+) -> trc::Result<HttpResponse> {
+    let verified = match za_verify_primary(
+        server,
+        session,
+        &request.username,
+        &request.password,
+        request.totp,
+    )
+    .await?
+    {
+        Ok(verified) => verified,
+        Err(response) => return Ok(response),
+    };
+    let otp_auth = request.otp_auth.filter(|url| !url.is_empty());
+    // The URL carries the secret: the error names neither it nor the parser's message.
+    if let Some(url) = &otp_auth
+        && verify_totp_code(url, "000000").is_err()
+    {
+        return Err(bad_request("otp_auth is not a valid otpauth:// URL."));
+    }
+    let account_id = verified.account_id;
+    let read = match za_reread_verified(server, &verified).await? {
+        Ok(read) => read,
+        Err(response) => return Ok(response),
+    };
+    let mut record = read.record.clone();
+    record.totp_url = otp_auth;
+    // Only on top of the verified generation (invariant 8); the commit
+    // invalidates cached authentication, so a password-only login cached
+    // before an enrolment does not outlive it.
+    if let Err(response) = za_commit(
+        server,
+        account_id,
+        &mut record,
+        Some(&read),
+        Some(verified.keys.generation),
+        now() as i64,
+    )
+    .await?
+    {
+        return Ok(response);
+    }
+    Ok(ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ORIGIN: &str = "https://account.example.com";
+
+    fn header_of(response: &HttpResponse, name: header::HeaderName) -> Option<&str> {
+        response
+            .headers()
+            .and_then(|headers| headers.get(name))
+            .map(|value| value.to_str().unwrap())
+    }
+
+    #[test]
+    fn cors_unset_changes_nothing() {
+        let preflight = za_cors_preflight(None);
+        assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+        assert!(preflight.headers().is_none_or(|headers| {
+            !headers
+                .keys()
+                .any(|name| name.as_str().starts_with("access-control-") || name == header::VARY)
+        }));
+        let response = za_with_cors(ok(), None);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            header_of(&response, header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            None
+        );
+        assert_eq!(header_of(&response, header::VARY), None);
+    }
+
+    #[test]
+    fn cors_set_allows_the_account_page() {
+        let origin = HeaderValue::from_static(ORIGIN);
+        let preflight = za_cors_preflight(Some(&origin));
+        assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+        for (name, value) in [
+            (header::ACCESS_CONTROL_ALLOW_ORIGIN, ORIGIN),
+            (header::ACCESS_CONTROL_ALLOW_METHODS, "POST, OPTIONS"),
+            (
+                header::ACCESS_CONTROL_ALLOW_HEADERS,
+                "Content-Type, Authorization",
+            ),
+            (header::ACCESS_CONTROL_MAX_AGE, "600"),
+            (header::VARY, "Origin"),
+        ] {
+            assert_eq!(header_of(&preflight, name), Some(value));
+        }
+        let response = za_with_cors(conflict("conflict"), Some(&origin));
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            header_of(&response, header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(ORIGIN)
+        );
+        assert_eq!(header_of(&response, header::VARY), Some("Origin"));
+    }
 }

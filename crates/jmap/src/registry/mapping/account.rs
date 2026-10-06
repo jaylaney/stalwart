@@ -135,6 +135,17 @@ pub(crate) async fn account_set(
                 }
             }) {
                 'outer: for (id, value) in set.update.drain(..) {
+                    // Key accounts (spec 4.2).
+                    if old_credential.secret == vault::ZA_MARKER {
+                        set.response.not_updated.append(
+                            id,
+                            SetError::forbidden().with_description(
+                                "Password and TOTP changes for this account go through the zero-access account API (/api/vault).",
+                            ),
+                        );
+                        continue 'outer;
+                    }
+
                     if id != Id::singleton() {
                         set.response.not_updated.append(id, SetError::not_found());
                     }
@@ -344,6 +355,17 @@ pub(crate) async fn account_set(
         }
 
         ObjectType::AppPassword | ObjectType::ApiKey => {
+            // Key accounts (spec 4.2).
+            if account
+                .password_credential()
+                .is_some_and(|c| c.secret == vault::ZA_MARKER)
+            {
+                set.fail_all(SetError::forbidden().with_description(
+                    "App passwords and API keys for this account are managed by the zero-access account API (/api/vault).",
+                ));
+                return Ok(set);
+            }
+
             // Process creations
             if !set.create.is_empty() {
                 let account_cache = set.server.account(set.account_id).await?;
