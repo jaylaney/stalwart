@@ -19,6 +19,14 @@ pub trait Authenticator: Sync + Send {
         req: &HttpRequest,
         session: &HttpSessionData,
     ) -> impl Future<Output = trc::Result<(Option<InFlight>, AccessToken)>> + Send;
+
+    fn authenticate_uncached(
+        &self,
+        mechanism: &str,
+        token: &str,
+        fp: [u8; 32],
+        session: &HttpSessionData,
+    ) -> impl Future<Output = trc::Result<(Option<InFlight>, AccessToken)>> + Send;
 }
 
 impl Authenticator for Server {
@@ -28,8 +36,11 @@ impl Authenticator for Server {
         session: &HttpSessionData,
     ) -> trc::Result<(Option<InFlight>, AccessToken)> {
         if let Some((mechanism, token)) = req.authorization() {
-            // Check if the credentials are cached
+            // The cache key is a keyed fingerprint of the header value; the
+            // value itself is never stored (spec 5).
             let fp = self.inner.cache.za_fingerprint(token);
+
+            // Check if the credentials are cached
             if let Some(http_cache) = self.inner.cache.http_auth.get(&fp) {
                 // Make sure the revision is still valid
                 if http_cache.expires > Instant::now() {
@@ -40,74 +51,49 @@ impl Authenticator for Server {
                     )?;
 
                     if access_token.revision() == http_cache.revision {
-                        // Enforce authenticated rate limit
-                        return self
-                            .is_http_authenticated_request_allowed(&access_token, session.remote_ip)
-                            .await
-                            .map(|in_flight| (in_flight, access_token));
+                        if http_cache.generation == 0 {
+                            // Non-key account: unchanged upstream path.
+                            // Enforce authenticated rate limit
+                            return self
+                                .is_http_authenticated_request_allowed(
+                                    &access_token,
+                                    session.remote_ip,
+                                )
+                                .await
+                                .map(|in_flight| (in_flight, access_token));
+                        }
+
+                        // Generation fence (spec 5): the entry must match the
+                        // account's current authentication generation, and the
+                        // resident keys must still be present and current.
+                        // Anything else forces a full verification.
+                        let account = self.account(http_cache.account_id).await?;
+                        if account.za_generation == http_cache.generation
+                            && let Some(keys) = self.inner.cache.za_keys.get(&fp, Instant::now())
+                            && keys.generation == http_cache.generation
+                            && keys.account_id == http_cache.account_id
+                        {
+                            let access_token = access_token.with_session_keys(keys);
+
+                            // Enforce authenticated rate limit
+                            return self
+                                .is_http_authenticated_request_allowed(
+                                    &access_token,
+                                    session.remote_ip,
+                                )
+                                .await
+                                .map(|in_flight| (in_flight, access_token));
+                        }
                     }
                 }
 
-                // If the revision is not valid, remove the cached credentials
+                // If the entry is not valid, remove the cached credentials and keys
                 self.inner.cache.http_auth.remove(&fp);
+                self.inner.cache.za_keys.remove(&fp);
             }
 
-            let credentials = if mechanism.eq_ignore_ascii_case("basic") {
-                // Decode the base64 encoded credentials
-                decode_plain_auth(token).ok_or_else(|| {
-                    trc::AuthEvent::Error
-                        .into_err()
-                        .details("Failed to decode Basic auth request.")
-                        .id(token.to_string())
-                        .caused_by(trc::location!())
-                })?
-            } else if mechanism.eq_ignore_ascii_case("bearer") {
-                // Enforce anonymous rate limit
-                self.is_http_anonymous_request_allowed(session.remote_ip)
-                    .await?;
-
-                Credentials::Bearer {
-                    username: None,
-                    token: token.to_string(),
-                }
-            } else {
-                // Enforce anonymous rate limit
-                self.is_http_anonymous_request_allowed(session.remote_ip)
-                    .await?;
-
-                return Err(trc::AuthEvent::Error
-                    .into_err()
-                    .reason("Unsupported authentication mechanism.")
-                    .details(token.to_string())
-                    .caused_by(trc::location!()));
-            };
-
-            // Authenticate
-            let access_token = self
-                .authenticate(&AuthRequest::from_credentials(
-                    credentials,
-                    session.session_id,
-                    session.remote_ip,
-                ))
-                .await?;
-
-            // Cache credentials
-            self.inner.cache.http_auth.insert(
-                fp,
-                HttpAuthCache {
-                    account_id: access_token.account_id(),
-                    revision: access_token.revision(),
-                    credential_id: access_token.credential_id(),
-                    expires: Instant::now()
-                        + Duration::from_secs(self.core.oauth.oauth_expiry_token),
-                    generation: 0,
-                },
-            );
-
-            // Enforce authenticated rate limit
-            self.is_http_authenticated_request_allowed(&access_token, session.remote_ip)
+            self.authenticate_uncached(mechanism, token, fp, session)
                 .await
-                .map(|in_flight| (in_flight, access_token))
         } else {
             // Enforce anonymous rate limit
             self.is_http_anonymous_request_allowed(session.remote_ip)
@@ -117,6 +103,160 @@ impl Authenticator for Server {
                 .into_err()
                 .details("Missing Authorization header.")
                 .caused_by(trc::location!()))
+        }
+    }
+
+    async fn authenticate_uncached(
+        &self,
+        mechanism: &str,
+        token: &str,
+        fp: [u8; 32],
+        session: &HttpSessionData,
+    ) -> trc::Result<(Option<InFlight>, AccessToken)> {
+        // The raw header value never reaches an event (spec 5).
+        let credentials = if mechanism.eq_ignore_ascii_case("basic") {
+            // Decode the base64 encoded credentials
+            decode_plain_auth(token).ok_or_else(|| {
+                trc::AuthEvent::Error
+                    .into_err()
+                    .details("Failed to decode Basic auth request.")
+                    .caused_by(trc::location!())
+            })?
+        } else if mechanism.eq_ignore_ascii_case("bearer") {
+            // Enforce anonymous rate limit
+            self.is_http_anonymous_request_allowed(session.remote_ip)
+                .await?;
+
+            Credentials::Bearer {
+                username: None,
+                token: token.to_string(),
+            }
+        } else {
+            // Enforce anonymous rate limit
+            self.is_http_anonymous_request_allowed(session.remote_ip)
+                .await?;
+
+            return Err(trc::AuthEvent::Error
+                .into_err()
+                .reason("Unsupported authentication mechanism.")
+                .caused_by(trc::location!()));
+        };
+
+        // Authenticate
+        let access_token = self
+            .authenticate(&AuthRequest::from_credentials(
+                credentials,
+                session.session_id,
+                session.remote_ip,
+            ))
+            .await?;
+
+        #[cfg(feature = "test_mode")]
+        za_test::pause_point().await;
+
+        let expires = Instant::now() + Duration::from_secs(self.core.oauth.oauth_expiry_token);
+        match access_token.session_keys() {
+            None => {
+                // Non-key account: unchanged upstream caching, generation 0.
+                self.inner.cache.http_auth.insert(
+                    fp,
+                    HttpAuthCache {
+                        account_id: access_token.account_id(),
+                        revision: access_token.revision(),
+                        credential_id: access_token.credential_id(),
+                        expires,
+                        generation: 0,
+                    },
+                );
+            }
+            Some(keys) => {
+                // Generation fence (spec 5). Race defended: this login read the
+                // vault record at revision r and spent its time in Argon2 while
+                // a password change committed r+1 and called `remove_account`.
+                // Caching now would resurrect the superseded verification, so
+                // both inserts happen only if the verified generation still
+                // equals the one rebuilt from the store; otherwise the request
+                // succeeds uncached.
+                let account = self.account(access_token.account_id()).await?;
+                if keys.generation == account.za_generation
+                    && keys.account_id == access_token.account_id()
+                {
+                    self.inner.cache.http_auth.insert(
+                        fp,
+                        HttpAuthCache {
+                            account_id: access_token.account_id(),
+                            revision: access_token.revision(),
+                            credential_id: access_token.credential_id(),
+                            expires,
+                            generation: keys.generation,
+                        },
+                    );
+                    self.inner
+                        .cache
+                        .za_keys
+                        .insert(fp, keys.clone(), Instant::now());
+                }
+            }
+        }
+
+        // Enforce authenticated rate limit
+        self.is_http_authenticated_request_allowed(&access_token, session.remote_ip)
+            .await
+            .map(|in_flight| (in_flight, access_token))
+    }
+}
+
+/// Test-only pause point between credential verification and the cache
+/// insert fence, used by the paused-verification tests. One-shot: the first
+/// request to reach it takes the pause, so later requests run unpaused.
+#[cfg(feature = "test_mode")]
+pub mod za_test {
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::Notify;
+
+    #[derive(Default)]
+    pub struct Pause {
+        pub arrived: Notify,
+        pub release: Notify,
+    }
+
+    pub static PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
+    pub fn set(pause: Option<Arc<Pause>>) {
+        *PAUSE.lock().unwrap_or_else(|e| e.into_inner()) = pause;
+    }
+
+    fn take() -> Option<Arc<Pause>> {
+        PAUSE.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    pub(super) async fn pause_point() {
+        // The guard is dropped inside `take`, before any await.
+        if let Some(pause) = take() {
+            pause.arrived.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn pause_is_one_shot_and_waits_for_release() {
+            let pause = Arc::new(Pause::default());
+            set(Some(pause.clone()));
+
+            let task = tokio::spawn(pause_point());
+            pause.arrived.notified().await;
+            assert!(take().is_none(), "the paused request takes the pause");
+            assert!(!task.is_finished());
+
+            pause.release.notify_one();
+            task.await.unwrap();
+
+            // Unset: the pause point returns immediately.
+            pause_point().await;
         }
     }
 }

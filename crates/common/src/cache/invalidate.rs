@@ -341,6 +341,9 @@ impl Server {
         self.inner.cache.roles.clear();
         self.inner.cache.lists.clear();
         self.inner.cache.za_keys.clear();
+        // Cached authentication is trusted only up to a generation; a global
+        // invalidation must drop it together with the resident keys.
+        self.inner.cache.http_auth.clear();
         self.inner.data.logos.lock().clear();
     }
 

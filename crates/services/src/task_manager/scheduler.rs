@@ -40,6 +40,7 @@ enum Event {
     CalculateMetrics,
     TrainSpamClassifier,
     RenewNodeIdLease,
+    ZaKeySweep,
     // SPDX-SnippetBegin
     // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
     // SPDX-License-Identifier: LicenseRef-SEL
@@ -56,6 +57,9 @@ enum Event {
 struct Queue {
     heap: BinaryHeap<Action>,
 }
+
+/// Zero-access key cache sweep interval (spec 5: at least every 60 seconds).
+const ZA_KEY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 // SPDX-SnippetBegin
 // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
@@ -128,6 +132,9 @@ pub fn spawn_task_scheduler(inner: Arc<Inner>) {
 
             // Calculate expensive metrics
             queue.schedule(Instant::now(), Event::CalculateMetrics);
+
+            // Zero-access key cache sweep (process-local, every node)
+            queue.schedule(Instant::now() + ZA_KEY_SWEEP_INTERVAL, Event::ZaKeySweep);
 
             // SPDX-SnippetBegin
             // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
@@ -228,6 +235,10 @@ pub fn spawn_task_scheduler(inner: Arc<Inner>) {
                                 shard_index: None,
                             }));
                         }
+                    }
+                    Event::ZaKeySweep => {
+                        queue.schedule(Instant::now() + ZA_KEY_SWEEP_INTERVAL, Event::ZaKeySweep);
+                        server.inner.cache.za_keys.sweep(Instant::now());
                     }
                     Event::RenewNodeIdLease => {
                         queue.schedule(
@@ -571,6 +582,7 @@ impl Event {
             Event::CalculateMetrics => "calculateMetrics",
             Event::TrainSpamClassifier => "trainSpamClassifier",
             Event::RenewNodeIdLease => "renewNodeIdLease",
+            Event::ZaKeySweep => "zaKeySweep",
             // SPDX-SnippetBegin
             // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <info@stalwartlabs.com>
             // SPDX-License-Identifier: LicenseRef-SEL
