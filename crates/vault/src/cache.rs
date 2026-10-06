@@ -106,6 +106,15 @@ impl KeyCache {
             .retain(|_, e| e.keys.account_id != account_id);
     }
 
+    /// Whether any entry holds keys of `account_id`, expired or not.
+    pub fn contains_account(&self, account_id: u32) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .values()
+            .any(|e| e.keys.account_id == account_id)
+    }
+
     /// Sweep-driven removal; returns the number of entries removed.
     pub fn sweep(&self, now: Instant) -> usize {
         let mut map = self.inner.lock().unwrap();

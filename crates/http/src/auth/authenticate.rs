@@ -237,10 +237,12 @@ impl Authenticator for Server {
     }
 }
 
-/// Test-only pause point between credential verification and the cache
-/// insert fence, used by the paused-verification tests. Keyed on an account
-/// id and one-shot: only the first successful verification for that account
-/// takes the pause; requests for other accounts pass through and leave it set.
+/// Test-only pause points, each keyed on an account id and one-shot: only
+/// the first request for that account reaching the point takes the pause;
+/// requests for other accounts pass through and leave it set. `PAUSE` sits
+/// between credential verification and the cache insert fence (paused
+/// verification tests); `ENDPOINT_PAUSE` sits in the vault endpoints between
+/// the fresh verification and the record re-read (generation fence tests).
 #[cfg(feature = "test_mode")]
 pub mod za_test {
     use std::sync::{Arc, Mutex};
@@ -264,12 +266,18 @@ pub mod za_test {
 
     pub static PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
+    pub static ENDPOINT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
     pub fn set(pause: Option<Arc<Pause>>) {
         *PAUSE.lock().unwrap_or_else(|e| e.into_inner()) = pause;
     }
 
-    fn take_for(account_id: u32) -> Option<Arc<Pause>> {
-        let mut pause = PAUSE.lock().unwrap_or_else(|e| e.into_inner());
+    pub fn set_endpoint(pause: Option<Arc<Pause>>) {
+        *ENDPOINT_PAUSE.lock().unwrap_or_else(|e| e.into_inner()) = pause;
+    }
+
+    fn take_for(slot: &Mutex<Option<Arc<Pause>>>, account_id: u32) -> Option<Arc<Pause>> {
+        let mut pause = slot.lock().unwrap_or_else(|e| e.into_inner());
         if pause.as_ref().is_some_and(|p| p.account_id == account_id) {
             pause.take()
         } else {
@@ -277,12 +285,20 @@ pub mod za_test {
         }
     }
 
-    pub(super) async fn pause_point(account_id: u32) {
+    async fn wait_at(slot: &Mutex<Option<Arc<Pause>>>, account_id: u32) {
         // The guard is dropped inside `take_for`, before any await.
-        if let Some(pause) = take_for(account_id) {
+        if let Some(pause) = take_for(slot, account_id) {
             pause.arrived.notify_one();
             pause.release.notified().await;
         }
+    }
+
+    pub(super) async fn pause_point(account_id: u32) {
+        wait_at(&PAUSE, account_id).await;
+    }
+
+    pub(crate) async fn endpoint_pause_point(account_id: u32) {
+        wait_at(&ENDPOINT_PAUSE, account_id).await;
     }
 
     #[cfg(test)]
@@ -311,6 +327,22 @@ pub mod za_test {
 
             // Unset: the pause point returns immediately.
             pause_point(7).await;
+        }
+
+        #[tokio::test]
+        async fn endpoint_slot_is_independent() {
+            let pause = Arc::new(Pause::new(9));
+            set_endpoint(Some(pause.clone()));
+
+            // The verification pause point does not consume the endpoint slot.
+            pause_point(9).await;
+            assert!(ENDPOINT_PAUSE.lock().unwrap().is_some());
+
+            let task = tokio::spawn(endpoint_pause_point(9));
+            pause.arrived.notified().await;
+            assert!(ENDPOINT_PAUSE.lock().unwrap().is_none());
+            pause.release.notify_one();
+            task.await.unwrap();
         }
     }
 }

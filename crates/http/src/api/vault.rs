@@ -453,6 +453,25 @@ async fn za_verify_primary(
     }
 }
 
+/// Second record read after `za_verify_primary`: the `previous` of the
+/// commit, which checks it against the verified generation. Missing record
+/// or a state other than Active is 409.
+async fn za_reread_verified(
+    server: &Server,
+    verified: &ZaVerified,
+) -> trc::Result<Result<VaultRead, HttpResponse>> {
+    #[cfg(feature = "test_mode")]
+    crate::auth::authenticate::za_test::endpoint_pause_point(verified.account_id).await;
+
+    let Some(read) = server.za_vault_record(verified.account_id).await? else {
+        return Ok(Err(conflict("vault record missing")));
+    };
+    if read.record.state != VaultState::Active {
+        return Ok(Err(conflict("account is not active")));
+    }
+    Ok(Ok(read))
+}
+
 /// Fresh salt, Argon2 parameters, verifier hash and password wrap.
 async fn za_set_password(
     record: &mut VaultRecord,
@@ -688,12 +707,10 @@ async fn za_password(
         return Err(bad_request(err));
     }
     let account_id = verified.account_id;
-    let Some(read) = server.za_vault_record(account_id).await? else {
-        return Ok(conflict("vault record missing"));
+    let read = match za_reread_verified(server, &verified).await? {
+        Ok(read) => read,
+        Err(response) => return Ok(response),
     };
-    if read.record.state != VaultState::Active {
-        return Ok(conflict("account is not active"));
-    }
     let mut record = read.record.clone();
     za_set_password(
         &mut record,
@@ -797,12 +814,10 @@ async fn za_recovery_key(
         Err(response) => return Ok(response),
     };
     let account_id = verified.account_id;
-    let Some(read) = server.za_vault_record(account_id).await? else {
-        return Ok(conflict("vault record missing"));
+    let read = match za_reread_verified(server, &verified).await? {
+        Ok(read) => read,
+        Err(response) => return Ok(response),
     };
-    if read.record.state != VaultState::Active {
-        return Ok(conflict("account is not active"));
-    }
     let mut record = read.record.clone();
     let new_key = za_set_recovery(&mut record, account_id, verified.keys.mk());
     // Only on top of the verified generation (invariant 8).
