@@ -13,14 +13,20 @@ use crate::utils::{
     },
 };
 use common::{auth::credential::AppPassword, ipc::CacheInvalidation};
-use http::{
-    api::vault::{MAX_APP_PASSWORD_DESCRIPTION, za_delete_registry_credential_for_test},
-    auth::authenticate::za_test,
-};
+use http::{api::vault::MAX_APP_PASSWORD_DESCRIPTION, auth::authenticate::za_test};
 use hyper::StatusCode;
-use registry::schema::structs::{self, Credential};
+use registry::{
+    schema::{
+        prelude::{Object, ObjectInner, ObjectType},
+        structs::{self, Credential},
+    },
+    types::id::ObjectId,
+};
 use serde_json::{Value, json};
-use store::write::now;
+use store::{
+    registry::write::{RegistryWrite, RegistryWriteResult},
+    write::now,
+};
 use vault::record::{AppWrap, PENDING_WRAP_MAX_AGE_SECS, WrapState};
 
 const STRONG2: &str = "another long passphrase with 2 numbers";
@@ -107,6 +113,67 @@ async fn wrap_state(test: &TestServer, id: u32, credential_id: u32) -> Option<Wr
         .record
         .app_wrap(credential_id)
         .map(|w| w.state)
+}
+
+/// A creation parked between its Pending wrap and the registry credential,
+/// with the id of that Pending wrap.
+async fn park_creation(
+    test: &TestServer,
+    id: u32,
+    description: &'static str,
+) -> (Parked<VaultReply>, u32) {
+    let parked = Parked::start(id, za_test::set_publish, async move {
+        za_post(
+            "app-password",
+            &json!({ "username": NAME, "password": STRONG, "description": description }),
+        )
+        .await
+    })
+    .await;
+    let pending: Vec<u32> = test
+        .server
+        .za_vault_record(id)
+        .await
+        .unwrap()
+        .unwrap()
+        .record
+        .app_wraps
+        .iter()
+        .filter(|w| w.state == WrapState::Pending)
+        .map(|w| w.credential_id)
+        .collect();
+    assert_eq!(pending.len(), 1, "the parked creation holds a Pending wrap");
+    (parked, pending[0])
+}
+
+/// A harmless registry edit of the account: bumps the object's revision,
+/// so a registry write based on an earlier read loses its revision check.
+async fn bump_registry_revision(test: &TestServer) {
+    let id = test.account(NAME).id();
+    let object = test
+        .server
+        .registry()
+        .get(ObjectId::new(ObjectType::Account, id))
+        .await
+        .unwrap()
+        .unwrap();
+    let old_object = Object::with_revision(object.inner.clone(), object.revision);
+    let mut inner = object.inner;
+    let ObjectInner::Account(structs::Account::User(user)) = &mut inner else {
+        panic!("not a user account");
+    };
+    user.description = Some(format!("Key Seven, revision {}", object.revision));
+    let result = test
+        .server
+        .registry()
+        .write(RegistryWrite::Update {
+            object: &Object::new(inner),
+            id,
+            old_object: &old_object,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(result, RegistryWriteResult::Success(_)));
 }
 
 fn garbage_wrap(credential_id: u32, state: WrapState, created: i64) -> AppWrap {
@@ -202,27 +269,7 @@ pub async fn test(test: &mut TestServer) {
     // wrap and the registry credential. The wrap is under the app secret,
     // not the password, and pruning never touches a fresh Pending wrap, so
     // the returned app password still decrypts afterwards.
-    let parked = Parked::start(id, za_test::set_publish, async move {
-        za_post(
-            "app-password",
-            &json!({ "username": NAME, "password": STRONG, "description": "Laptop" }),
-        )
-        .await
-    })
-    .await;
-    let pending: Vec<u32> = test
-        .server
-        .za_vault_record(id)
-        .await
-        .unwrap()
-        .unwrap()
-        .record
-        .app_wraps
-        .iter()
-        .filter(|w| w.state == WrapState::Pending)
-        .map(|w| w.credential_id)
-        .collect();
-    assert_eq!(pending.len(), 1, "the parked creation holds a Pending wrap");
+    let (parked, pending_id) = park_creation(test, id, "Laptop").await;
     za_post(
         "password",
         &json!({ "username": NAME, "password": STRONG, "new_password": STRONG2 }),
@@ -230,14 +277,14 @@ pub async fn test(test: &mut TestServer) {
     .await
     .expect(200);
     assert_eq!(
-        wrap_state(test, id, pending[0]).await,
+        wrap_state(test, id, pending_id).await,
         Some(WrapState::Pending),
         "the password change kept the fresh Pending wrap"
     );
     let reply = parked.finish().await.expect(200);
     let laptop = reply["app_password"].as_str().unwrap().to_string();
     let laptop_id = reply["credential_id"].as_u64().unwrap() as u32;
-    assert_eq!(laptop_id, pending[0]);
+    assert_eq!(laptop_id, pending_id);
     assert_eq!(
         wrap_state(test, id, laptop_id).await,
         Some(WrapState::Published)
@@ -367,6 +414,30 @@ pub async fn test(test: &mut TestServer) {
     }
     assert_eq!(registry_app_ids(test).await, vec![phone_id]);
 
+    // Rollback, entry gone (spec 4.1): the parked creation's Pending wrap is
+    // revoked before its registry credential lands; step (3) finds the
+    // entry gone, deletes the registry credential and fails.
+    let (parked, gone_id) = park_creation(test, id, "Gone").await;
+    revoke(gone_id).await.expect(200);
+    let reply = parked.finish().await;
+    assert_eq!(
+        reply.expect(409)["error"],
+        "app password publication failed"
+    );
+    assert_eq!(wrap_state(test, id, gone_id).await, None);
+    assert!(!registry_app_ids(test).await.contains(&gone_id));
+
+    // Rollback, registry write failed (spec 4.1): the account's registry
+    // object changes while the creation is parked, so step (2) loses its
+    // revision check and the Pending wrap is removed.
+    let (parked, raced_id) = park_creation(test, id, "Raced").await;
+    bump_registry_revision(test).await;
+    let reply = parked.finish().await;
+    assert_eq!(reply.expect(409)["error"], "registry write failed");
+    assert_eq!(wrap_state(test, id, raced_id).await, None);
+    assert!(!registry_app_ids(test).await.contains(&raced_id));
+    assert_eq!(registry_app_ids(test).await, vec![phone_id]);
+
     // Paused verification across a revocation: the login verified the app
     // password before the revocation and succeeds, but nothing is cached.
     let (desk, desk_id) = create("Desk").await;
@@ -408,16 +479,20 @@ pub async fn test(test: &mut TestServer) {
     );
     caldav(&phone, StatusCode::UNAUTHORIZED).await;
 
-    // A registry credential whose wrap is gone cannot log in (spec 4.3).
+    // A registry credential whose wrap is gone cannot log in (spec 4.3);
+    // revoke deletes it, freeing its quota slot.
     let (dangling, dangling_id) = create("Dangling").await;
     edit_record(test, id, |wraps| {
         wraps.retain(|w| w.credential_id != dangling_id)
     })
     .await;
     caldav(&dangling, StatusCode::UNAUTHORIZED).await;
-    // The API only revokes credentials it holds a wrap for.
+    revoke(dangling_id).await.expect(200);
+    assert!(
+        registry_app_ids(test).await.is_empty(),
+        "dangling credential deleted"
+    );
+    // Neither a wrap nor a registry credential: unknown.
     revoke(dangling_id).await.expect(409);
-    assert!(za_delete_registry_credential_for_test(&test.server, id, dangling_id).await);
-    assert!(registry_app_ids(test).await.is_empty());
     caldav(STRONG, StatusCode::MULTI_STATUS).await;
 }

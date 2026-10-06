@@ -984,10 +984,33 @@ async fn za_app_password(
         return registered.and(Ok(conflict("registry write failed")));
     }
 
-    // (3) Publish, conditional on the same Pending entry.
+    // (3) Publish. Unless it lands, the registry credential must not live
+    // on, also when a store error interrupts it (best effort, then the error).
+    let published = za_publish(server, account_id, credential_id, publication_id).await;
+    if matches!(published, Ok(true)) {
+        return Ok(json(AppPasswordResponse {
+            app_password: app_pass.build(),
+            credential_id,
+        }));
+    }
+    za_withdraw_pending(server, account_id, credential_id, publication_id).await;
+    za_delete_registry_credential_logged(server, account_id, credential_id).await;
+    published.and(Ok(conflict("app password publication failed")))
+}
+
+/// Step (3) of the publication: Published, conditional on the same Pending
+/// entry. False when the entry is gone (pruned or revoked), when the
+/// commit's pruning removed it (its registry credential vanished since step
+/// (2)), or when every attempt lost a race.
+async fn za_publish(
+    server: &Server,
+    account_id: u32,
+    credential_id: u32,
+    publication_id: u64,
+) -> trc::Result<bool> {
     for _ in 0..PUBLISH_RETRIES {
         let Some(read) = server.za_vault_record(account_id).await? else {
-            break;
+            return Ok(false);
         };
         let mut record = read.record.clone();
         match record.app_wrap_mut(credential_id) {
@@ -996,7 +1019,7 @@ async fn za_app_password(
             {
                 wrap.state = WrapState::Published;
             }
-            _ => break,
+            _ => return Ok(false),
         }
         // Without an expected revision the only refusal is a lost race.
         if za_commit(
@@ -1010,18 +1033,12 @@ async fn za_app_password(
         .await?
         .is_ok()
         {
-            return Ok(json(AppPasswordResponse {
-                app_password: app_pass.build(),
-                credential_id,
-            }));
+            return Ok(record
+                .app_wrap(credential_id)
+                .is_some_and(|w| w.state == WrapState::Published));
         }
     }
-
-    // Entry gone (pruned or revoked) or publication kept losing: the
-    // registry credential must not live on.
-    za_withdraw_pending(server, account_id, credential_id, publication_id).await;
-    za_delete_registry_credential_logged(server, account_id, credential_id).await;
-    Ok(conflict("app password publication failed"))
+    Ok(false)
 }
 
 /// Removes this publication's Pending wrap, conditional on it still being
@@ -1087,13 +1104,13 @@ async fn za_withdraw_pending(
 }
 
 /// Registry credential delete, retried on a lost revision race. Failure
-/// leaves a dead credential (no Published wrap, so no login): logged, not
-/// returned.
+/// leaves a dead credential (no Published wrap, so no login): logged, and
+/// reported as false.
 async fn za_delete_registry_credential_logged(
     server: &Server,
     account_id: u32,
     credential_id: u32,
-) {
+) -> bool {
     let mut result = Ok(false);
     for _ in 0..PUBLISH_RETRIES {
         result = za_delete_registry_credential(server, account_id, credential_id).await;
@@ -1102,7 +1119,7 @@ async fn za_delete_registry_credential_logged(
         }
     }
     match result {
-        Ok(true) => (),
+        Ok(true) => true,
         Ok(false) => {
             trc::error!(
                 trc::AuthEvent::Error
@@ -1111,6 +1128,7 @@ async fn za_delete_registry_credential_logged(
                     .id(credential_id)
                     .details("Zero-access: app-password registry credential delete rejected")
             );
+            false
         }
         Err(err) => {
             trc::error!(
@@ -1118,6 +1136,7 @@ async fn za_delete_registry_credential_logged(
                     .id(credential_id)
                     .details("Zero-access: app-password registry credential delete failed")
             );
+            false
         }
     }
 }
@@ -1152,7 +1171,28 @@ async fn za_app_password_revoke(
         .app_wraps
         .retain(|w| w.credential_id != request.credential_id);
     if record.app_wraps.len() == before {
-        return Ok(conflict("unknown app password"));
+        // No wrap: a registry credential left by a publication that failed
+        // after step (2) is dead (no login without a Published wrap), but it
+        // holds a quota slot until deleted.
+        let dangling = za_registry_account(server, account_id)
+            .await?
+            .is_some_and(|reg| {
+                reg.account.credentials.values().any(|c| {
+                    matches!(c, Credential::AppPassword(c)
+                        if c.credential_id.document_id() == request.credential_id)
+                })
+            });
+        if !dangling {
+            return Ok(conflict("unknown app password"));
+        }
+        return Ok(
+            if za_delete_registry_credential_logged(server, account_id, request.credential_id).await
+            {
+                ok()
+            } else {
+                conflict("conflict")
+            },
+        );
     }
     // The commit invalidates cached authentication; from here the
     // credential cannot log in even if the registry delete fails (spec 4.3).
@@ -1170,17 +1210,4 @@ async fn za_app_password_revoke(
     }
     za_delete_registry_credential_logged(server, account_id, request.credential_id).await;
     Ok(ok())
-}
-
-/// Test hook: deletes a registry credential the API cannot revoke (one
-/// without a wrap). False on any failure.
-#[cfg(feature = "test_mode")]
-pub async fn za_delete_registry_credential_for_test(
-    server: &Server,
-    account_id: u32,
-    credential_id: u32,
-) -> bool {
-    za_delete_registry_credential(server, account_id, credential_id)
-        .await
-        .unwrap_or(false)
 }
