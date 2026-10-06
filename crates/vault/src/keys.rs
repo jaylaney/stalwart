@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
@@ -90,9 +89,18 @@ impl std::error::Error for KeyError {}
 
 /// Argon2id(password, salt) -> 32-byte root. CPU-heavy: callers run it on the
 /// blocking pool (see Task 5).
-pub fn derive_root(password: &[u8], salt: &[u8; SALT_LEN], params: Argon2Params) -> Result<Secret, KeyError> {
-    let params = Params::new(params.m_cost_kib, params.t_cost, params.p_cost, Some(KEY_LEN))
-        .map_err(|_| KeyError::Argon2)?;
+pub fn derive_root(
+    password: &[u8],
+    salt: &[u8; SALT_LEN],
+    params: Argon2Params,
+) -> Result<Secret, KeyError> {
+    let params = Params::new(
+        params.m_cost_kib,
+        params.t_cost,
+        params.p_cost,
+        Some(KEY_LEN),
+    )
+    .map_err(|_| KeyError::Argon2)?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut out = Zeroizing::new([0u8; KEY_LEN]);
     argon
@@ -157,7 +165,13 @@ pub fn seal(dek: &Secret, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
     let nonce_bytes = rand::random::<[u8; NONCE_LEN]>();
     let nonce = XNonce::from(nonce_bytes);
     let ciphertext = cipher(dek)
-        .encrypt(&nonce, Payload { msg: plaintext, aad })
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .expect("XChaCha20-Poly1305 encryption cannot fail for in-memory buffers");
     let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
     out.extend_from_slice(&nonce_bytes);
@@ -172,7 +186,13 @@ pub fn open(dek: &Secret, aad: &[u8], sealed: &[u8]) -> Result<Zeroizing<Vec<u8>
     let (nonce_bytes, ciphertext) = sealed.split_at(NONCE_LEN);
     let nonce = XNonce::try_from(nonce_bytes).map_err(|_| KeyError::Length)?;
     cipher(dek)
-        .decrypt(&nonce, Payload { msg: ciphertext, aad })
+        .decrypt(
+            &nonce,
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map(Zeroizing::new)
         .map_err(|_| KeyError::Aead)
 }
@@ -213,7 +233,11 @@ mod tests {
 
     fn fast_params() -> Argon2Params {
         // Small parameters keep the unit tests fast; production uses Default.
-        Argon2Params { m_cost_kib: 64, t_cost: 1, p_cost: 1 }
+        Argon2Params {
+            m_cost_kib: 64,
+            t_cost: 1,
+            p_cost: 1,
+        }
     }
 
     #[test]
@@ -266,10 +290,19 @@ mod tests {
         ];
         for (purpose, key) in kinds {
             let w = wrap_key(&mk, &key, &aad(purpose, 1));
-            assert_eq!(unwrap_key(&w, &key, &aad(purpose, 1)).unwrap().as_bytes(), mk.as_bytes());
+            assert_eq!(
+                unwrap_key(&w, &key, &aad(purpose, 1)).unwrap().as_bytes(),
+                mk.as_bytes()
+            );
         }
-        assert_ne!(derive_app_kek(b"abcdef", 42).as_bytes(), derive_app_kek(b"abcdef", 43).as_bytes());
-        assert_ne!(derive_app_kek(b"abcdef", 42).as_bytes(), derive_app_kek(b"abcdeg", 42).as_bytes());
+        assert_ne!(
+            derive_app_kek(b"abcdef", 42).as_bytes(),
+            derive_app_kek(b"abcdef", 43).as_bytes()
+        );
+        assert_ne!(
+            derive_app_kek(b"abcdef", 42).as_bytes(),
+            derive_app_kek(b"abcdeg", 42).as_bytes()
+        );
     }
 
     #[test]
@@ -277,7 +310,10 @@ mod tests {
         let dek = Secret::random();
         let sealed = seal(&dek, &aad("event", 5), b"hello world");
         assert_eq!(sealed.len(), NONCE_LEN + 11 + TAG_LEN);
-        assert_eq!(&*open(&dek, &aad("event", 5), &sealed).unwrap(), b"hello world");
+        assert_eq!(
+            &*open(&dek, &aad("event", 5), &sealed).unwrap(),
+            b"hello world"
+        );
         assert!(open(&dek, &aad("event", 6), &sealed).is_err());
         assert!(open(&Secret::random(), &aad("event", 5), &sealed).is_err());
         let mut t = sealed.clone();
@@ -297,7 +333,8 @@ mod tests {
     #[test]
     fn keypair_public_matches_private() {
         let (public, private) = generate_keypair();
-        let derived = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*private.as_bytes()));
+        let derived =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*private.as_bytes()));
         assert_eq!(public, derived.to_bytes());
     }
 
@@ -312,6 +349,21 @@ mod tests {
     fn event_key_differs_from_master_key() {
         let mk = Secret::random();
         assert_ne!(derive_event_key(&mk).as_bytes(), mk.as_bytes());
-        assert_eq!(derive_event_key(&mk).as_bytes(), derive_event_key(&mk).as_bytes());
+        assert_eq!(
+            derive_event_key(&mk).as_bytes(),
+            derive_event_key(&mk).as_bytes()
+        );
+    }
+
+    #[test]
+    fn default_argon2_params_are_production_values() {
+        assert_eq!(
+            Argon2Params::default(),
+            Argon2Params {
+                m_cost_kib: 65536,
+                t_cost: 3,
+                p_cost: 1
+            }
+        );
     }
 }

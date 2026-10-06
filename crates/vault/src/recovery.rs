@@ -66,20 +66,22 @@ impl RecoveryKey {
         if cleaned.len() != TOTAL_CHARS || !cleaned.chars().all(|c| ALPHABET.contains(c)) {
             return None;
         }
+        // The 26th character carries two padding bits that must be zero,
+        // otherwise several texts would map to one key.
+        let last = cleaned.as_bytes()[DATA_CHARS - 1] as char;
+        if ALPHABET.find(last)? as u8 & 0b11 != 0 {
+            return None;
+        }
         let (data, check) = cleaned.split_at(DATA_CHARS);
-        let decoded = Zeroizing::new(base32::decode(base32::Alphabet::Rfc4648 { padding: false }, data)?);
+        let decoded = Zeroizing::new(base32::decode(
+            base32::Alphabet::Rfc4648 { padding: false },
+            data,
+        )?);
         let bytes: [u8; 16] = decoded.as_slice().try_into().ok()?;
         if check.chars().next()? != Self::check_char(&bytes) {
             return None;
         }
-        // Canonical form only: the 26th character carries two padding bits
-        // that must be zero, otherwise several texts would map to one key.
-        let key = RecoveryKey(bytes);
-        let canonical: String = key.encode().chars().filter(|c| *c != '-').collect();
-        if canonical != *cleaned {
-            return None;
-        }
-        Some(key)
+        Some(RecoveryKey(bytes))
     }
 }
 
@@ -92,7 +94,10 @@ mod tests {
         let key = RecoveryKey([0x5Au8; 16]);
         let text = key.encode();
         assert_eq!(text.len(), 27 + 6, "{text}");
-        assert_eq!(text.split('-').map(str::len).collect::<Vec<_>>(), vec![4, 4, 4, 4, 4, 4, 3]);
+        assert_eq!(
+            text.split('-').map(str::len).collect::<Vec<_>>(),
+            vec![4, 4, 4, 4, 4, 4, 3]
+        );
         assert!(text.chars().all(|c| c == '-' || ALPHABET.contains(c)));
     }
 
@@ -100,10 +105,21 @@ mod tests {
     fn parse_round_trips_and_tolerates_spacing_and_case() {
         let key = RecoveryKey::generate();
         let text = key.encode();
-        assert_eq!(RecoveryKey::parse(&text).unwrap().as_bytes(), key.as_bytes());
+        assert_eq!(
+            RecoveryKey::parse(&text).unwrap().as_bytes(),
+            key.as_bytes()
+        );
         let loose = text.replace('-', " ").to_lowercase();
-        assert_eq!(RecoveryKey::parse(&loose).unwrap().as_bytes(), key.as_bytes());
-        assert_eq!(RecoveryKey::parse(&text.replace('-', "")).unwrap().as_bytes(), key.as_bytes());
+        assert_eq!(
+            RecoveryKey::parse(&loose).unwrap().as_bytes(),
+            key.as_bytes()
+        );
+        assert_eq!(
+            RecoveryKey::parse(&text.replace('-', ""))
+                .unwrap()
+                .as_bytes(),
+            key.as_bytes()
+        );
     }
 
     #[test]
@@ -135,6 +151,9 @@ mod tests {
 
     #[test]
     fn generate_is_random() {
-        assert_ne!(RecoveryKey::generate().as_bytes(), RecoveryKey::generate().as_bytes());
+        assert_ne!(
+            RecoveryKey::generate().as_bytes(),
+            RecoveryKey::generate().as_bytes()
+        );
     }
 }
