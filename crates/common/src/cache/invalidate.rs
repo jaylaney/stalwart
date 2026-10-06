@@ -388,6 +388,10 @@ impl Server {
                 }
                 CacheInvalidation::Account(id) => {
                     cache.accounts.remove(id);
+                    // Set order is arbitrary: drop HTTP auth here too, or an entry
+                    // cached between the AccessToken and Account arms survives.
+                    cache.http_auth.inner().retain(|_, v| v.account_id != *id);
+                    cache.za_keys.remove_account(*id);
                     cache.emails.inner().retain(|_, v| {
                         !matches!(
                             v,
