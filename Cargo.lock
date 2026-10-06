@@ -9446,6 +9446,7 @@ dependencies = [
  "hkdf 0.13.0",
  "hmac 0.13.0",
  "rand 0.10.3",
+ "rkyv",
  "sha2 0.11.0",
  "subtle",
  "x25519-dalek",

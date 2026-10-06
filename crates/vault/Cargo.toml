@@ -15,6 +15,7 @@ base32 = "0.5"
 rand = "0.10.2"
 subtle = "2.6"
 blake3 = "1.8"
+rkyv = { version = "0.8.18", features = ["little_endian"] }
 
 [lints]
 workspace = true

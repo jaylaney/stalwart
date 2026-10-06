@@ -156,6 +156,12 @@ pub fn aad(purpose: &str, account_id: u32) -> Vec<u8> {
     out
 }
 
+/// Associated data for an app-password wrap. Built here only, so the auth
+/// router and the endpoints cannot disagree on the string.
+pub fn app_aad(account_id: u32, credential_id: u32) -> Vec<u8> {
+    aad(&format!("app/{credential_id}"), account_id)
+}
+
 fn cipher(key: &Secret) -> XChaCha20Poly1305 {
     XChaCha20Poly1305::new_from_slice(key.as_bytes()).expect("32-byte key")
 }
@@ -303,6 +309,13 @@ mod tests {
             derive_app_kek(b"abcdef", 42).as_bytes(),
             derive_app_kek(b"abcdeg", 42).as_bytes()
         );
+    }
+
+    #[test]
+    fn app_aad_names_the_credential_and_account() {
+        assert_eq!(app_aad(7, 42), aad("app/42", 7));
+        assert_ne!(app_aad(7, 42), app_aad(7, 43));
+        assert_ne!(app_aad(7, 42), app_aad(8, 42));
     }
 
     #[test]
