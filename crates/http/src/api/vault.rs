@@ -13,7 +13,7 @@ use ::vault::{
     ZA_MARKER,
     keys::{
         Argon2Params, Secret, aad, derive_kek, derive_recovery_kek, derive_verifier_hash,
-        generate_keypair, wrap_key,
+        generate_keypair, unwrap_key, wrap_key,
     },
     record::{VaultRecord, VaultState},
     recovery::RecoveryKey,
@@ -69,6 +69,30 @@ struct SetupRequest {
     password: String,
 }
 
+#[derive(serde::Deserialize)]
+struct PasswordRequest {
+    username: String,
+    password: String,
+    #[serde(default)]
+    totp: Option<String>,
+    new_password: String,
+}
+
+#[derive(serde::Deserialize)]
+struct RecoverRequest {
+    username: String,
+    recovery_key: String,
+    new_password: String,
+}
+
+#[derive(serde::Deserialize)]
+struct CredentialsRequest {
+    username: String,
+    password: String,
+    #[serde(default)]
+    totp: Option<String>,
+}
+
 #[derive(serde::Serialize)]
 struct RecoveryKeyResponse {
     recovery_key: String,
@@ -84,8 +108,6 @@ struct OkResponse {
     ok: bool,
 }
 
-// First used by the endpoints of Tasks 8-10.
-#[allow(dead_code)]
 fn ok() -> HttpResponse {
     json(OkResponse { ok: true })
 }
@@ -181,6 +203,9 @@ impl VaultApi for Server {
 
         match (endpoint, sub) {
             ("setup", None) => za_setup(self, session, parse(&body)?).await,
+            ("password", None) => za_password(self, session, parse(&body)?).await,
+            ("recover", None) => za_recover(self, session, parse(&body)?).await,
+            ("recovery-key", None) => za_recovery_key(self, session, parse(&body)?).await,
             _ => Err(trc::ResourceEvent::NotFound.into_err()),
         }
     }
@@ -383,8 +408,6 @@ async fn za_auth_failure(server: &Server, remote_ip: IpAddr, username: &str) -> 
         .await
 }
 
-// First used by the password endpoints (Task 8).
-#[allow(dead_code)]
 struct ZaVerified {
     account_id: u32,
     keys: Arc<SessionKeys>,
@@ -393,8 +416,6 @@ struct ZaVerified {
 /// Fresh, full verification of the primary password and TOTP (spec 4.1).
 /// Cached CalDAV authentication is never consulted; app passwords and
 /// master logins are refused with 400.
-// First used by the password endpoints (Task 8).
-#[allow(dead_code)]
 async fn za_verify_primary(
     server: &Server,
     session: &HttpSessionData,
@@ -641,5 +662,163 @@ async fn za_setup(
     }
     Ok(json(RecoveryKeyResponse {
         recovery_key: recovery.encode(),
+    }))
+}
+
+/// Re-derives the password root and rewraps MK; the recovery and
+/// app-password wraps are untouched (spec 4.1).
+async fn za_password(
+    server: &Server,
+    session: &HttpSessionData,
+    request: PasswordRequest,
+) -> trc::Result<HttpResponse> {
+    let verified = match za_verify_primary(
+        server,
+        session,
+        &request.username,
+        &request.password,
+        request.totp,
+    )
+    .await?
+    {
+        Ok(verified) => verified,
+        Err(response) => return Ok(response),
+    };
+    if let Err(err) = server.is_secure_password(&request.new_password, &[&request.username]) {
+        return Err(bad_request(err));
+    }
+    let account_id = verified.account_id;
+    let Some(read) = server.za_vault_record(account_id).await? else {
+        return Ok(conflict("vault record missing"));
+    };
+    if read.record.state != VaultState::Active {
+        return Ok(conflict("account is not active"));
+    }
+    let mut record = read.record.clone();
+    za_set_password(
+        &mut record,
+        account_id,
+        verified.keys.mk(),
+        &request.new_password,
+    )
+    .await?;
+    // Only on top of the verified generation (invariant 8).
+    if let Err(response) = za_commit(
+        server,
+        account_id,
+        &mut record,
+        Some(&read),
+        Some(verified.keys.generation),
+        now() as i64,
+    )
+    .await?
+    {
+        return Ok(response);
+    }
+    Ok(ok())
+}
+
+/// Opens MK with the recovery key, then sets the new password and a fresh
+/// recovery wrap in one write; the old recovery key stops working.
+async fn za_recover(
+    server: &Server,
+    session: &HttpSessionData,
+    request: RecoverRequest,
+) -> trc::Result<HttpResponse> {
+    let Some(account_id) = server
+        .account_id_from_email(&request.username, false)
+        .await?
+    else {
+        return Err(za_auth_failure(server, session.remote_ip, &request.username).await);
+    };
+    let Some(read) = server.za_vault_record(account_id).await? else {
+        return Err(za_auth_failure(server, session.remote_ip, &request.username).await);
+    };
+    if read.record.state != VaultState::Active {
+        return za_refuse(
+            server,
+            session.remote_ip,
+            &request.username,
+            conflict("account is not active"),
+        )
+        .await;
+    }
+    let Some(key) = RecoveryKey::parse(&request.recovery_key) else {
+        return Err(za_auth_failure(server, session.remote_ip, &request.username).await);
+    };
+    let Ok(mk) = unwrap_key(
+        &read.record.recovery_wrap,
+        &derive_recovery_kek(key.as_bytes()),
+        &aad("recovery", account_id),
+    ) else {
+        return Err(za_auth_failure(server, session.remote_ip, &request.username).await);
+    };
+    if let Err(err) = server.is_secure_password(&request.new_password, &[&request.username]) {
+        return Err(bad_request(err));
+    }
+    let mut record = read.record.clone();
+    za_set_password(&mut record, account_id, &mk, &request.new_password).await?;
+    let new_key = za_set_recovery(&mut record, account_id, &mk);
+    // Conditional on the record whose recovery wrap was opened: a concurrent
+    // recovery with the same key loses the revision check.
+    if let Err(response) = za_commit(
+        server,
+        account_id,
+        &mut record,
+        Some(&read),
+        None,
+        now() as i64,
+    )
+    .await?
+    {
+        return Ok(response);
+    }
+    Ok(json(RecoveryKeyResponse {
+        recovery_key: new_key.encode(),
+    }))
+}
+
+/// Fresh recovery wrap; the previous recovery key stops working.
+async fn za_recovery_key(
+    server: &Server,
+    session: &HttpSessionData,
+    request: CredentialsRequest,
+) -> trc::Result<HttpResponse> {
+    let verified = match za_verify_primary(
+        server,
+        session,
+        &request.username,
+        &request.password,
+        request.totp,
+    )
+    .await?
+    {
+        Ok(verified) => verified,
+        Err(response) => return Ok(response),
+    };
+    let account_id = verified.account_id;
+    let Some(read) = server.za_vault_record(account_id).await? else {
+        return Ok(conflict("vault record missing"));
+    };
+    if read.record.state != VaultState::Active {
+        return Ok(conflict("account is not active"));
+    }
+    let mut record = read.record.clone();
+    let new_key = za_set_recovery(&mut record, account_id, verified.keys.mk());
+    // Only on top of the verified generation (invariant 8).
+    if let Err(response) = za_commit(
+        server,
+        account_id,
+        &mut record,
+        Some(&read),
+        Some(verified.keys.generation),
+        now() as i64,
+    )
+    .await?
+    {
+        return Ok(response);
+    }
+    Ok(json(RecoveryKeyResponse {
+        recovery_key: new_key.encode(),
     }))
 }

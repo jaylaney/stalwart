@@ -7,6 +7,7 @@
 use crate::utils::server::{TestServer, TestServerBuilder};
 use registry::schema::{enums::Permission, prelude::Property, structs::Http};
 
+pub mod password;
 pub mod setup;
 
 pub const STRONG: &str = "correct horse battery staple 1";
@@ -47,6 +48,7 @@ pub async fn za_tests() {
     test.insert_account(admin);
 
     setup::test(&mut test).await;
+    password::test(&mut test).await;
 
     destroy_key_accounts(&test).await;
     test.assert_is_empty().await;
