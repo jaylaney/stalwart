@@ -23,6 +23,7 @@ members = [
     "crates/store",
     "crates/coordinator",
     "crates/directory",
+    "crates/vault",
     "crates/registry",
     "crates/services",
     "crates/utils",

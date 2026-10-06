@@ -1,0 +1,19 @@
+[package]
+name = "vault"
+version = "0.16.25"
+edition = "2024"
+
+[dependencies]
+argon2 = "0.6.0"
+hkdf = "0.13"
+sha2 = "0.11"
+chacha20poly1305 = "0.11"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+zeroize = "1.9"
+base32 = "0.5"
+rand = "0.10.2"
+subtle = "2.6"
+blake3 = "1.8"
+
+[lints]
+workspace = true
