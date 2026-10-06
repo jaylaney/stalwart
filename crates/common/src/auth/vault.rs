@@ -263,6 +263,13 @@ fn corrupt(account_id: u32, what: &'static str) -> trc::Error {
         .caused_by(trc::location!())
 }
 
+/// A record that was read but cannot be used is treated like a missing one:
+/// logged once (account id and a fixed description only), then `NoRecord`.
+fn unusable(account_id: u32, what: &'static str) -> ZaVerification {
+    trc::error!(corrupt(account_id, what));
+    ZaVerification::NoRecord
+}
+
 /// Spec 4.3 against one record read: Argon2 once, constant-time verifier
 /// compare, TOTP with `verify_mfa_secret_hash` semantics (a missing code is
 /// only reported once the password is correct), MK unwrapped on success.
@@ -275,16 +282,12 @@ async fn za_check_password(
     if record.state != VaultState::Active || password.is_empty() {
         return Ok(ZaVerification::Invalid);
     }
-    let salt: [u8; 16] = record
-        .salt
-        .as_slice()
-        .try_into()
-        .map_err(|_| corrupt(account_id, "vault salt length"))?;
-    let verifier: [u8; 32] = record
-        .verifier_hash
-        .as_slice()
-        .try_into()
-        .map_err(|_| corrupt(account_id, "vault verifier length"))?;
+    let Ok(salt) = <[u8; 16]>::try_from(record.salt.as_slice()) else {
+        return Ok(unusable(account_id, "vault salt length"));
+    };
+    let Ok(verifier) = <[u8; 32]>::try_from(record.verifier_hash.as_slice()) else {
+        return Ok(unusable(account_id, "vault verifier length"));
+    };
     let root = za_derive_root(password, salt, record.argon2_params()).await?;
     if !verifier_matches(&root, &verifier) {
         return Ok(ZaVerification::Invalid);
@@ -300,8 +303,9 @@ async fn za_check_password(
         }
     }
     let kek = derive_kek(&root);
-    let mk = unwrap_key(&record.password_wrap, &kek, &aad("password", account_id))
-        .map_err(|_| corrupt(account_id, "vault password wrap does not open"))?;
+    let Ok(mk) = unwrap_key(&record.password_wrap, &kek, &aad("password", account_id)) else {
+        return Ok(unusable(account_id, "vault password wrap does not open"));
+    };
     Ok(ZaVerification::Valid(Arc::new(SessionKeys::new(
         account_id,
         record.revision,
@@ -500,6 +504,24 @@ mod tests {
             .unwrap()
     }
 
+    /// A six-digit code that matches no window `check_current` could accept,
+    /// including the next one in case the step rolls over mid-test.
+    fn wrong_totp_code(uri: &str) -> String {
+        let totp = totp_rs::Totp::from_url(uri).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let accepted: Vec<String> = [now.saturating_sub(30), now, now + 30, now + 60]
+            .into_iter()
+            .map(|time| totp.generate(time).to_string())
+            .collect();
+        (0u32..)
+            .map(|n| format!("{n:06}"))
+            .find(|code| !accepted.contains(code))
+            .unwrap()
+    }
+
     #[test]
     fn totp_helper_accepts_current_code_and_rejects_garbage() {
         use directory::core::secret::verify_totp_code;
@@ -509,8 +531,8 @@ mod tests {
             .generate_current()
             .to_string();
         assert!(verify_totp_code(&uri, &code).unwrap());
-        let wrong = if code == "000000" { "111111" } else { "000000" };
-        assert!(!verify_totp_code(&uri, wrong).unwrap());
+        let wrong = wrong_totp_code(&uri);
+        assert!(!verify_totp_code(&uri, &wrong).unwrap());
         let err = verify_totp_code("not a url", "000000").unwrap_err();
         assert!(!format!("{err:?}").contains("not a url"));
     }
@@ -573,14 +595,30 @@ mod tests {
             ZaVerification::Invalid
         ));
 
-        // A wrap bound to another account does not open: corruption, and the
-        // error carries no secret.
-        let err = za_check_password(2, record, "correct horse", None)
-            .await
-            .err()
-            .unwrap();
-        assert!(is_vault_unusable(&err));
-        assert!(!format!("{err:?}").contains("correct horse"));
+        // A wrap bound to another account does not open: the record is
+        // unusable, refused like a missing one.
+        assert!(matches!(
+            za_check_password(2, record.clone(), "correct horse", None)
+                .await
+                .unwrap(),
+            ZaVerification::NoRecord
+        ));
+
+        // Structural corruption is unusable whatever the password.
+        let mut short_salt = record.clone();
+        short_salt.salt.pop();
+        let mut short_verifier = record;
+        short_verifier.verifier_hash.pop();
+        for corrupted in [short_salt, short_verifier] {
+            for password in ["correct horse", "wrong horse"] {
+                assert!(matches!(
+                    za_check_password(1, corrupted.clone(), password, None)
+                        .await
+                        .unwrap(),
+                    ZaVerification::NoRecord
+                ));
+            }
+        }
     }
 
     #[tokio::test]
@@ -592,8 +630,8 @@ mod tests {
             .unwrap()
             .generate_current()
             .to_string();
-        let wrong = if code == "000000" { "111111" } else { "000000" };
-        assert!(!verify_totp_code(&uri, wrong).unwrap());
+        let wrong = wrong_totp_code(&uri);
+        assert!(!verify_totp_code(&uri, &wrong).unwrap());
         record.totp_url = Some(uri);
 
         assert!(matches!(
@@ -615,7 +653,7 @@ mod tests {
             ZaVerification::Invalid
         ));
         assert!(matches!(
-            za_check_password(1, record.clone(), "correct horse", Some(wrong))
+            za_check_password(1, record.clone(), "correct horse", Some(&wrong))
                 .await
                 .unwrap(),
             ZaVerification::Invalid

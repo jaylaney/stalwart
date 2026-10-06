@@ -469,7 +469,7 @@ impl Server {
         }
     }
 
-    async fn validate_address<'x>(
+    pub(crate) async fn validate_address<'x>(
         &self,
         email: &'x str,
     ) -> trc::Result<(&'x str, Arc<DomainCache>)> {

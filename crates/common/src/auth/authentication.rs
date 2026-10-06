@@ -174,6 +174,14 @@ impl Server {
                 // Obtain external directory, if any
                 let mut is_alias_login = false;
                 let token = if let Some(directory) = self.get_directory_for_cached_domain(&domain) {
+                    // Refused before the directory sees the password.
+                    self.za_refuse_directory_login(
+                        auth_as_local,
+                        domain.id,
+                        auth_as_address,
+                        req.session_id,
+                    )
+                    .await?;
                     let directory_account = if username.is_master() {
                         directory
                             .authenticate(&Credentials::Basic {
@@ -187,17 +195,12 @@ impl Server {
                     };
 
                     is_alias_login = directory_account.email != auth_as_address;
-                    let token = self
-                        .build_directory_token(directory_account, req.remote_ip)
+                    // The directory may name another account; refused before
+                    // synchronization could overwrite its marker.
+                    self.za_refuse_directory_account(&directory_account, req.session_id)
                         .await?;
-                    if self.account(token.account_id()).await?.is_key_account() {
-                        return Err(trc::AuthEvent::Failed
-                            .into_err()
-                            .ctx(trc::Key::AccountName, auth_as_address.to_string())
-                            .ctx(trc::Key::SpanId, req.session_id)
-                            .reason("Zero-access accounts cannot authenticate through an external directory"));
-                    }
-                    Ok(token)
+                    self.build_directory_token(directory_account, req.remote_ip)
+                        .await
                 } else if let Some(account_id) =
                     self.account_id_from_parts(auth_as_local, domain.id).await?
                 {
@@ -379,6 +382,8 @@ impl Server {
                 {
                     match directory.authenticate(&req.credentials).await {
                         Ok(result) => {
+                            self.za_refuse_directory_account(&result, req.session_id)
+                                .await?;
                             return self.build_directory_token(result, req.remote_ip).await;
                         }
                         Err(err) => {
@@ -566,6 +571,41 @@ impl Server {
             address.domain_start = address.name.len() + 1;
             address.name = format!("{}@{}", address.name, self.core.email.default_domain_name);
         }
+    }
+
+    /// Spec 4.2: key accounts never authenticate through an external
+    /// directory. Resolves the local account with the same lookup the
+    /// internal path and `synchronize_account` use.
+    async fn za_refuse_directory_login(
+        &self,
+        local: &str,
+        domain_id: u32,
+        account_name: &str,
+        span_id: u64,
+    ) -> trc::Result<()> {
+        if let Some(account_id) = self.account_id_from_parts(local, domain_id).await?
+            && self.account(account_id).await?.is_key_account()
+        {
+            return Err(trc::AuthEvent::Failed
+                .into_err()
+                .ctx(trc::Key::AccountName, account_name.to_string())
+                .ctx(trc::Key::AccountId, account_id)
+                .ctx(trc::Key::SpanId, span_id)
+                .reason("Zero-access accounts cannot authenticate through an external directory"));
+        }
+        Ok(())
+    }
+
+    /// The account a directory result would synchronize into, resolved as
+    /// `synchronize_account` resolves it.
+    async fn za_refuse_directory_account(
+        &self,
+        account: &directory::Account,
+        span_id: u64,
+    ) -> trc::Result<()> {
+        let (local, domain) = self.validate_address(&account.email).await?;
+        self.za_refuse_directory_login(local, domain.id, &account.email, span_id)
+            .await
     }
 
     async fn build_directory_token(
