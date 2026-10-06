@@ -183,6 +183,17 @@ impl Server {
                     }
                 }
 
+                // A marker secret is constant, so OAuth token revocation on
+                // password change must follow the vault generation instead.
+                if credential_version == xxh3::xxh3_64(::vault::ZA_MARKER.as_bytes()).max(1) {
+                    credential_version = self
+                        .za_vault_record(account_id)
+                        .await?
+                        .map(|read| read.record.revision)
+                        .unwrap_or(0)
+                        .max(1);
+                }
+
                 Ok(AccessTokenInner {
                     concurrent_imap_requests: self
                         .core
@@ -375,6 +386,7 @@ impl AccessToken {
         AccessToken {
             scope_idx: 0,
             inner,
+            session_keys: None,
         }
         .assert_is_valid(remote_ip)
     }
@@ -383,6 +395,7 @@ impl AccessToken {
         AccessToken {
             scope_idx: 0,
             inner,
+            session_keys: None,
         }
     }
 
@@ -402,7 +415,11 @@ impl AccessToken {
                     .ctx(trc::Key::Id, credential_id)
                     .reason("Credential expired or removed.")
             })
-            .map(|scope_idx| AccessToken { scope_idx, inner })
+            .map(|scope_idx| AccessToken {
+                scope_idx,
+                inner,
+                session_keys: None,
+            })
             .and_then(|token| token.assert_is_valid(remote_ip))
     }
 
@@ -417,9 +434,28 @@ impl AccessToken {
             AccessToken {
                 scope_idx: 0,
                 inner,
+                session_keys: None,
             }
             .assert_is_valid(remote_ip)
         }
+    }
+
+    pub fn with_session_keys(mut self, keys: Arc<::vault::session::SessionKeys>) -> Self {
+        self.session_keys = Some(keys);
+        self
+    }
+
+    pub fn session_keys(&self) -> Option<&Arc<::vault::session::SessionKeys>> {
+        self.session_keys.as_ref()
+    }
+
+    /// Keys usable for `account_id`'s data: only the keys of the account that
+    /// authenticated this request. Impersonation, group membership and
+    /// sharing never yield another account's keys.
+    pub fn za_keys_for(&self, account_id: u32) -> Option<&Arc<::vault::session::SessionKeys>> {
+        self.session_keys
+            .as_ref()
+            .filter(|k| k.account_id == account_id)
     }
 
     pub fn state(&self) -> u32 {
@@ -578,6 +614,7 @@ impl AccessToken {
                 access_token = AccessToken {
                     scope_idx: access_token.scope_idx,
                     inner: Arc::new(inner),
+                    session_keys: access_token.session_keys.take(),
                 };
             }
 
@@ -760,6 +797,7 @@ impl AccessToken {
         AccessToken {
             scope_idx: 0,
             inner: Arc::new(AccessTokenInner::new_admin()),
+            session_keys: None,
         }
     }
 
@@ -787,6 +825,7 @@ impl AccessToken {
                 credential_version: Default::default(),
                 obj_size: Default::default(),
             }),
+            session_keys: None,
         }
     }
 

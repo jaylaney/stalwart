@@ -174,7 +174,11 @@ pub struct LogoCache {
 
 pub struct Caches {
     pub access_tokens: Cache<u32, Arc<AccessTokenInner>>,
-    pub http_auth: Cache<Box<str>, HttpAuthCache>,
+    pub http_auth: Cache<[u8; 32], HttpAuthCache>,
+    /// Resident master keys for CalDAV sessions (spec 5).
+    pub za_keys: vault::cache::KeyCache,
+    /// Per-process secret for keyed fingerprints of Authorization headers.
+    pub za_fingerprint_key: [u8; 32],
 
     pub messages: Cache<u32, Arc<MessageStoreCache>>,
     pub files: Cache<u32, Arc<DavResources>>,
@@ -268,6 +272,15 @@ pub struct HttpAuthCache {
     pub revision: u64,
     pub credential_id: Option<u32>,
     pub expires: Instant,
+    /// Authentication generation at verification time; 0 for non-key accounts.
+    pub generation: u64,
+}
+
+impl Caches {
+    /// Keyed BLAKE3 of the Authorization header value; usable only by this process.
+    pub fn za_fingerprint(&self, token: &str) -> [u8; 32] {
+        vault::keys::fingerprint(&self.za_fingerprint_key, token.as_bytes())
+    }
 }
 
 pub struct Ipc {

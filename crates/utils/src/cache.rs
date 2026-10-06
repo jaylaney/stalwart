@@ -301,6 +301,12 @@ impl CacheItemWeight for u32 {
     }
 }
 
+impl<const N: usize> CacheItemWeight for [u8; N] {
+    fn weight(&self) -> u64 {
+        N as u64
+    }
+}
+
 impl CacheItemWeight for IpAddr {
     fn weight(&self) -> u64 {
         std::mem::size_of::<IpAddr>() as u64

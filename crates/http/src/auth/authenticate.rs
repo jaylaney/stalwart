@@ -29,7 +29,8 @@ impl Authenticator for Server {
     ) -> trc::Result<(Option<InFlight>, AccessToken)> {
         if let Some((mechanism, token)) = req.authorization() {
             // Check if the credentials are cached
-            if let Some(http_cache) = self.inner.cache.http_auth.get(token) {
+            let fp = self.inner.cache.za_fingerprint(token);
+            if let Some(http_cache) = self.inner.cache.http_auth.get(&fp) {
                 // Make sure the revision is still valid
                 if http_cache.expires > Instant::now() {
                     let access_token = AccessToken::renew(
@@ -48,7 +49,7 @@ impl Authenticator for Server {
                 }
 
                 // If the revision is not valid, remove the cached credentials
-                self.inner.cache.http_auth.remove(token);
+                self.inner.cache.http_auth.remove(&fp);
             }
 
             let credentials = if mechanism.eq_ignore_ascii_case("basic") {
@@ -92,13 +93,14 @@ impl Authenticator for Server {
 
             // Cache credentials
             self.inner.cache.http_auth.insert(
-                token.into(),
+                fp,
                 HttpAuthCache {
                     account_id: access_token.account_id(),
                     revision: access_token.revision(),
                     credential_id: access_token.credential_id(),
                     expires: Instant::now()
                         + Duration::from_secs(self.core.oauth.oauth_expiry_token),
+                    generation: 0,
                 },
             );
 

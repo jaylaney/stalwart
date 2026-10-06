@@ -340,6 +340,7 @@ impl Server {
         self.inner.cache.accounts.clear();
         self.inner.cache.roles.clear();
         self.inner.cache.lists.clear();
+        self.inner.cache.za_keys.clear();
         self.inner.data.logos.lock().clear();
     }
 
@@ -369,6 +370,7 @@ impl Server {
                 CacheInvalidation::AccessToken(id) => {
                     cache.access_tokens.remove(id);
                     cache.http_auth.inner().retain(|_, v| v.account_id != *id);
+                    cache.za_keys.remove_account(*id);
                 }
                 CacheInvalidation::DavResources(id) => {
                     cache.files.remove(id);

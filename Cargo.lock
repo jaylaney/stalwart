@@ -1370,6 +1370,7 @@ dependencies = [
  "types",
  "unicode-security",
  "utils",
+ "vault",
  "whatlang",
  "x509-parser",
  "xxhash-rust",

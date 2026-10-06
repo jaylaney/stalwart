@@ -83,6 +83,7 @@ pub enum PrincipalField {
     DefaultAddressBookId = 48,
     ActiveScriptId = 49,
     PushSubscriptions = 44,
+    ZeroAccessVault = 46,
 }
 
 impl From<ContactField> for u8 {
@@ -162,6 +163,7 @@ impl From<PrincipalField> for u8 {
             PrincipalField::DefaultAddressBookId => 48,
             PrincipalField::ActiveScriptId => 49,
             PrincipalField::PushSubscriptions => 44,
+            PrincipalField::ZeroAccessVault => 46,
             PrincipalField::Archive => ARCHIVE_FIELD,
         }
     }
