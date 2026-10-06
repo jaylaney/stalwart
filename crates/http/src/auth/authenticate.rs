@@ -157,17 +157,27 @@ impl Authenticator for Server {
         let expires = Instant::now() + Duration::from_secs(self.core.oauth.oauth_expiry_token);
         match access_token.session_keys() {
             None => {
-                // Non-key account: unchanged upstream caching, generation 0.
-                self.inner.cache.http_auth.insert(
-                    fp,
-                    HttpAuthCache {
-                        account_id: access_token.account_id(),
-                        revision: access_token.revision(),
-                        credential_id: access_token.credential_id(),
-                        expires,
-                        generation: 0,
-                    },
-                );
+                // A keyless result for a key account (Bearer/OAuth, or a
+                // password verified against the pre-setup hash while setup
+                // committed) must not survive in the cache: a generation-0
+                // entry is served on later hits without the fence. Only
+                // non-key accounts are cached here, as upstream does.
+                if !self
+                    .account(access_token.account_id())
+                    .await?
+                    .is_key_account()
+                {
+                    self.inner.cache.http_auth.insert(
+                        fp,
+                        HttpAuthCache {
+                            account_id: access_token.account_id(),
+                            revision: access_token.revision(),
+                            credential_id: access_token.credential_id(),
+                            expires,
+                            generation: 0,
+                        },
+                    );
+                }
             }
             Some(keys) => {
                 // Generation fence (spec 5). Race defended: this login read the
