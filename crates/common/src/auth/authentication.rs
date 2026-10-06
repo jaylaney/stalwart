@@ -46,34 +46,49 @@ impl Server {
             .and_then(|token| token.assert_has_permission(Permission::Authenticate))
         {
             Ok(token) => Ok(token),
-            Err(err) => {
-                // Random delay to mitigate user enumeration attacks
-                #[cfg(not(feature = "test_mode"))]
-                {
-                    use store::rand::{self, RngExt};
+            Err(err) => Err(self
+                .authentication_failure(err, req.remote_ip, req.username())
+                .await),
+        }
+    }
 
-                    let delay = rand::rng().random_range(50..500);
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                }
+    /// Failure path of every credential check: a random delay against user
+    /// enumeration, then fail2ban accounting. Returns the error to report: a
+    /// ban, the fail2ban lookup's own error, or `err` with the remote IP.
+    pub async fn authentication_failure(
+        &self,
+        err: trc::Error,
+        remote_ip: IpAddr,
+        username: Option<&str>,
+    ) -> trc::Error {
+        // Random delay to mitigate user enumeration attacks
+        #[cfg(not(feature = "test_mode"))]
+        {
+            use store::rand::{self, RngExt};
 
-                if matches!(
-                    err.as_ref(),
-                    trc::EventType::Auth(trc::AuthEvent::Failed)
-                        | trc::EventType::Security(trc::SecurityEvent::IpUnauthorized)
-                ) && self.has_auth_fail2ban()
-                    && self
-                        .is_auth_fail2banned(req.remote_ip, req.username())
-                        .await?
-                {
-                    Err(trc::SecurityEvent::AuthenticationBan
+            let delay = rand::rng().random_range(50..500);
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+
+        if matches!(
+            err.as_ref(),
+            trc::EventType::Auth(trc::AuthEvent::Failed)
+                | trc::EventType::Security(trc::SecurityEvent::IpUnauthorized)
+        ) && self.has_auth_fail2ban()
+        {
+            match self.is_auth_fail2banned(remote_ip, username).await {
+                Ok(true) => {
+                    return trc::SecurityEvent::AuthenticationBan
                         .into_err()
-                        .ctx(trc::Key::RemoteIp, req.remote_ip)
-                        .ctx_opt(trc::Key::AccountName, req.username().map(|s| s.to_string())))
-                } else {
-                    Err(err.ctx(trc::Key::RemoteIp, req.remote_ip))
+                        .ctx(trc::Key::RemoteIp, remote_ip)
+                        .ctx_opt(trc::Key::AccountName, username.map(|s| s.to_string()));
                 }
+                Ok(false) => (),
+                Err(lookup_err) => return lookup_err,
             }
         }
+
+        err.ctx(trc::Key::RemoteIp, remote_ip)
     }
 
     async fn route_auth_request(&self, req: &AuthRequest) -> trc::Result<AccessToken> {

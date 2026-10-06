@@ -20,6 +20,7 @@ types = { path = "../types" }
 directory = { path =  "../directory" }
 services = { path =  "../services" }
 registry = { path =  "../registry" }
+vault = { path = "../vault" }
 mail-parser = { version = "0.11", features = ["full_encoding", "rkyv"] } 
 mail-builder = { version = "1.0" }
 mail-auth = { version = "0.13", features = ["generate", "arc"] }
@@ -33,6 +34,7 @@ serde_json = "1.0"
 chrono = "0.4"
 base64 = "0.23"
 sha2 = "0.11"
+subtle = "2.6"
 rkyv = { version = "0.8.18", features = ["little_endian"] }
 form-data = { version = "0.6.0", features = ["sync"], default-features = false }
 mime = "0.3.17"

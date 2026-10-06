@@ -3335,10 +3335,12 @@ dependencies = [
  "sha2 0.11.0",
  "smtp",
  "store",
+ "subtle",
  "tokio",
  "trc",
  "types",
  "utils",
+ "vault",
 ]
 
 [[package]]
@@ -8563,6 +8565,7 @@ dependencies = [
  "trc",
  "types",
  "utils",
+ "vault",
  "x509-parser",
 ]
 

@@ -11,9 +11,13 @@
 pub mod telemetry;
 // SPDX-SnippetEnd
 pub mod diagnose;
+pub mod vault;
 
 use crate::{
-    api::diagnose::{DeliveryStage, spawn_delivery_diagnose},
+    api::{
+        diagnose::{DeliveryStage, spawn_delivery_diagnose},
+        vault::VaultApi,
+    },
     auth::{
         authenticate::Authenticator, oauth::auth::OAuthApiHandler, permissions::AccountApiHandler,
     },
@@ -266,6 +270,16 @@ impl ManagementApi for Server {
                     }
                     _ => Err(trc::ResourceEvent::NotFound.into_err()),
                 }
+            }
+            "vault" if is_post => {
+                self.handle_vault_request(
+                    req,
+                    session,
+                    path.get(1).copied().unwrap_or_default(),
+                    path.get(2).copied(),
+                    body.ok_or_else(|| trc::LimitEvent::SizeRequest.into_err())?,
+                )
+                .await
             }
             _ => Err(trc::ResourceEvent::NotFound.into_err()),
         }
