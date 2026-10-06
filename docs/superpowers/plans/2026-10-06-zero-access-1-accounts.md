@@ -26,6 +26,7 @@
 - Key material lives in `Zeroizing` buffers, has a silent `Debug`, and never appears in logs, traces or error messages (invariant 7).
 - No stored struct changes layout; the vault record is a new Principal property (`PrincipalField::ZeroAccessVault = 46`), not a change to any existing archive (invariant 1).
 - Every new or modified file keeps the SPDX header used by the file around it.
+- **Shipping build excludes the enterprise feature.** The product binary is built with `cargo build --release -p stalwart --no-default-features --features rocks` (add other store backends by name as needed, never `enterprise`). Code under `cfg(feature = "enterprise")` and the whole `scim` crate are licensed only under the Stalwart Enterprise License and are not part of the product. Every compile check in these plans that builds the server uses the same flags, so fork code is always verified in the shipping configuration. The `tests` crate enables `enterprise` on `store`, `directory` and `coordinator` for upstream's own test modules; that is test-only and stays as is.
 - Tests: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests <filter> -- --nocapture`. Code in this plan was written without a compiler; small type and import fixes are expected and are not deviations.
 
 ## Review Focus
@@ -78,7 +79,16 @@ STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests webdav_tests -- --noca
 
 Expected: `test result: ok. 1 passed`. If it fails on stock code, stop and report: the baseline must be green before any fork change.
 
-- [ ] **Step 4: Write the developer note**
+- [ ] **Step 4: Build the shipping configuration once**
+
+```bash
+cd ~/stalwart
+cargo build -p stalwart --no-default-features --features rocks 2>&1 | tail -3
+```
+
+Expected: `Finished`. This is the configuration the product ships in: no `enterprise` feature, so none of the Enterprise-licensed code is compiled. Every later "build" step uses the same flags.
+
+- [ ] **Step 5: Write the developer note**
 
 Create `docs/superpowers/plans/README-dev.md`:
 
@@ -86,7 +96,8 @@ Create `docs/superpowers/plans/README-dev.md`:
 # Building and testing the zero-access fork
 
 - Toolchain: stable Rust via rustup. Xcode command line tools for RocksDB.
-- Build: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo build -p tests`
+- Build (tests): `STORE=RocksDb RUST_MIN_STACK=16777216 cargo build -p tests`
+- Build (product, no enterprise code): `cargo build --release -p stalwart --no-default-features --features rocks`
 - CalDAV suite (upstream, non-key accounts): `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests webdav_tests`
 - CalDAV suite against key accounts (added in plan 1, task 12): `STORE=RocksDb RUST_MIN_STACK=16777216 ZA_KEY_ACCOUNTS=1 cargo test -p tests webdav_tests`
 - Vault unit tests: `cargo test -p vault`
@@ -94,7 +105,7 @@ Create `docs/superpowers/plans/README-dev.md`:
 - Never open upstream issues or PRs from this fork (see AGENTS.md).
 ```
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add docs/superpowers/plans/README-dev.md
@@ -1593,7 +1604,7 @@ impl Caches {
 - [ ] **Step 9: Build the workspace**
 
 ```bash
-cargo build -p common -p http 2>&1 | grep -E "^(error|warning: unused)" | head -20
+cargo build -p stalwart --no-default-features --features rocks 2>&1 | grep -E "^(error|warning: unused)" | head -20
 ```
 
 Expected: no errors. The `http` crate's `authenticate.rs` will fail to compile because `http_auth` is now keyed by `[u8; 32]`; fix it minimally for now by replacing `self.inner.cache.http_auth.get(token)` / `.remove(token)` / `.insert(token.into(), ..)` with `let fp = self.inner.cache.za_fingerprint(token);` and `get(&fp)` / `remove(&fp)` / `insert(fp, HttpAuthCache { generation: 0, .. })`. Task 6 rewrites this function fully.
@@ -1967,7 +1978,7 @@ Append to the tests module of `crates/common/src/auth/vault.rs` a test that driv
 - [ ] **Step 8: Build and run the unit tests**
 
 ```bash
-cargo test -p common auth::vault 2>&1 | tail -8 && cargo build -p http 2>&1 | grep -E "^error" | head
+cargo test -p common auth::vault 2>&1 | tail -8 && cargo build -p stalwart --no-default-features --features rocks 2>&1 | grep -E "^error" | head
 ```
 
 Expected: tests pass; no build errors.
@@ -2196,7 +2207,7 @@ Note the two removed `.id(token.to_string())` / `.details(token.to_string())` co
 - [ ] **Step 3: Build and run the upstream suites that exercise HTTP auth**
 
 ```bash
-cargo build 2>&1 | grep -E "^error" | head
+cargo build -p stalwart --no-default-features --features rocks 2>&1 | grep -E "^error" | head
 STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests system::system_tests -- --nocapture 2>&1 | tail -3
 STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests webdav::webdav_tests -- --nocapture 2>&1 | tail -3
 ```
@@ -2829,7 +2840,7 @@ impl Server {
 - [ ] **Step 3: Build**
 
 ```bash
-cargo build -p http 2>&1 | grep -E "^error" -A 6 | head -60
+cargo build -p stalwart --no-default-features --features rocks 2>&1 | grep -E "^error" -A 6 | head -60
 ```
 
 Expected: no errors (fix import paths against `crates/jmap/src/registry/mapping/account.rs`, which uses the same registry and store types).

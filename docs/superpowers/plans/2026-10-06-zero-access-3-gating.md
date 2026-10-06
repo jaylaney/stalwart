@@ -16,6 +16,7 @@
 - Backup and restore need no change: sealed records are copied as-is and no plaintext calendar content exists in any subspace, which the leak test asserts.
 - The leak test is a regression test for the sealing boundary, not a proof (spec 11). It runs in CI on every change once CI runs the tests crate (upstream's `test.yml` is manual; a `webdav` and `za` job is added here).
 - Non-key accounts take unchanged code paths: every gate is `if account.is_key_account()`.
+- **Shipping build excludes the enterprise feature.** The product binary is built with `cargo build --release -p stalwart --no-default-features --features rocks` (add other store backends by name as needed, never `enterprise`). Code under `cfg(feature = "enterprise")` and the whole `scim` crate are licensed only under the Stalwart Enterprise License and are not part of the product. Every compile check in these plans that builds the server uses the same flags, so fork code is always verified in the shipping configuration. The `tests` crate enables `enterprise` on `store`, `directory` and `coordinator` for upstream's own test modules; that is test-only and stays as is.
 - Code in this plan was written without a compiler; small type and import fixes are expected.
 
 ## Review Focus
@@ -440,7 +441,7 @@ git commit -m "Disable scheduling, iMIP ingest and RSVP for key accounts"
 - [ ] **Step 4: Build, run the upstream alarm test and commit**
 
 ```bash
-cargo build 2>&1 | grep -E "^error" -A 5 | head -30
+cargo build -p stalwart --no-default-features --features rocks 2>&1 | grep -E "^error" -A 5 | head -30
 STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests webdav::webdav_tests -- --nocapture 2>&1 | tail -3
 git add crates/services crates/groupware crates/dav
 git commit -m "Skip full-text indexing, drop iCalendar dumps from traces and send generic alarms for key accounts"

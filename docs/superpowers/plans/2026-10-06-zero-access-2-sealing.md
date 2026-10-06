@@ -21,6 +21,7 @@
 - Sealing never adds, removes or reorders components or `component_ids`; unsealing restores entries and parameters at their original indices (invariant 2).
 - Unseal failure is a 500 for DAV with a logged error naming account, collection and document id and never any content; a multi-item report fails that one item (spec 10). A key-account calendar operation without `SessionKeys` is a 403 with a `SecurityEvent::Unauthorized` event whose details start with `zero-access:` (spec 10).
 - Non-key accounts take unchanged code paths: every new call is behind `if let Some(keys) = &za_keys` (invariant 9).
+- **Shipping build excludes the enterprise feature.** The product binary is built with `cargo build --release -p stalwart --no-default-features --features rocks` (add other store backends by name as needed, never `enterprise`). Code under `cfg(feature = "enterprise")` and the whole `scim` crate are licensed only under the Stalwart Enterprise License and are not part of the product. Every compile check in these plans that builds the server uses the same flags, so fork code is always verified in the shipping configuration. The `tests` crate enables `enterprise` on `store`, `directory` and `coordinator` for upstream's own test modules; that is test-only and stays as is.
 - Code in this plan was written without a compiler; small type and import fixes are expected.
 
 ## Review Focus
