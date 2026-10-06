@@ -179,9 +179,14 @@ impl Authenticator for Server {
                     // Double-check after publish: the check above may have read
                     // a stale non-key entry while setup's `Account` invalidation
                     // was still pending. If the account is a key account now,
-                    // withdraw the entry just inserted.
-                    if self.account(account_id).await?.is_key_account() {
-                        self.inner.cache.http_auth.remove(&fp);
+                    // withdraw the entry just inserted. A failed lookup also
+                    // withdraws it (fail closed) before the error propagates.
+                    match self.account(account_id).await {
+                        Ok(account) if !account.is_key_account() => {}
+                        result => {
+                            self.inner.cache.http_auth.remove(&fp);
+                            result?;
+                        }
                     }
                 }
             }

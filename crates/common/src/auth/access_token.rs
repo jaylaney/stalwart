@@ -25,7 +25,7 @@ use registry::{
 use std::{
     hash::{Hash, Hasher},
     net::IpAddr,
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
 };
 use store::{query::acl::AclQuery, rand, write::now};
 use tinyvec::TinyVec;
@@ -299,6 +299,7 @@ impl Server {
                     Collection = "accessToken",
                 );
 
+                let epoch = self.inner.cache.account_epoch.load(Ordering::SeqCst);
                 let token: Arc<AccessTokenInner> = if let Some(account) =
                     self.registry().object::<Account>(account_id.into()).await?
                 {
@@ -317,7 +318,15 @@ impl Server {
                         .caused_by(trc::location!()));
                 };
 
-                let _ = guard.insert(token.clone());
+                // As in `try_account`: an invalidation during the load cannot
+                // evict the placeholder, so a stale token is returned uncached.
+                let epoch_now = || self.inner.cache.account_epoch.load(Ordering::SeqCst);
+                if epoch_now() == epoch {
+                    let _ = guard.insert(token.clone());
+                    if epoch_now() != epoch {
+                        self.inner.cache.access_tokens.remove(&account_id);
+                    }
+                }
                 Ok(token)
             }
         }

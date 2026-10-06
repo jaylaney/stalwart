@@ -113,6 +113,7 @@ impl Caches {
             ),
             za_keys: vault::cache::KeyCache::new(vault::cache::KeyCacheConfig::from_env()),
             za_fingerprint_key: vault::Zeroizing::new(rand::random::<[u8; 32]>()),
+            account_epoch: std::sync::atomic::AtomicU64::new(0),
             messages: Cache::new_single_shard(
                 cache.messages,
                 (std::mem::size_of::<u32>()

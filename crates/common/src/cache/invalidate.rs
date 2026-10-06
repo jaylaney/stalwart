@@ -327,6 +327,11 @@ impl Server {
 
     pub fn invalidate_all_local_caches(&self) {
         self.invalidate_all_local_negative_caches();
+        // Before the clears: a loader in flight must not republish (see `try_account`).
+        self.inner
+            .cache
+            .account_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.cache.access_tokens.clear();
         self.inner.cache.domains.clear();
         self.inner.cache.domain_names.clear();
@@ -371,6 +376,9 @@ impl Server {
         for change in changes {
             match change {
                 CacheInvalidation::AccessToken(id) => {
+                    cache
+                        .account_epoch
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     cache.access_tokens.remove(id);
                     cache.http_auth.inner().retain(|_, v| v.account_id != *id);
                     cache.za_keys.remove_account(*id);
@@ -387,6 +395,9 @@ impl Server {
                     cache.domain_names.inner().retain(|_, v| v != id);
                 }
                 CacheInvalidation::Account(id) => {
+                    cache
+                        .account_epoch
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     cache.accounts.remove(id);
                     // Set order is arbitrary: drop HTTP auth here too, or an entry
                     // cached between the AccessToken and Account arms survives.

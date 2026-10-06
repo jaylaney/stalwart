@@ -35,7 +35,10 @@ use registry::{
     },
     types::id::ObjectId,
 };
-use std::{borrow::Cow, sync::Arc};
+use std::{
+    borrow::Cow,
+    sync::{Arc, atomic::Ordering},
+};
 use store::{
     U64_LEN,
     registry::{RegistryQuery, bootstrap::Bootstrap},
@@ -391,6 +394,7 @@ impl Server {
                     Collection = "account",
                 );
 
+                let epoch = self.inner.cache.account_epoch.load(Ordering::SeqCst);
                 let Some(account) = self.registry().object::<Account>(account_id.into()).await?
                 else {
                     return Ok(None);
@@ -609,7 +613,18 @@ impl Server {
                     }
                 });
 
-                let _ = guard.insert(cache.clone());
+                // quick_cache's `remove` is a no-op on a pending placeholder, so
+                // an invalidation during this load cannot evict what we would
+                // publish: if one ran since the read, return the value without
+                // caching it (dropping the guard releases the placeholder). One
+                // landing between the check and the insert is caught after it.
+                let epoch_now = || self.inner.cache.account_epoch.load(Ordering::SeqCst);
+                if epoch_now() == epoch {
+                    let _ = guard.insert(cache.clone());
+                    if epoch_now() != epoch {
+                        self.inner.cache.accounts.remove(&account_id);
+                    }
+                }
                 Ok(Some(cache))
             }
         }

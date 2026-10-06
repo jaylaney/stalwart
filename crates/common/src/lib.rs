@@ -179,6 +179,9 @@ pub struct Caches {
     pub za_keys: vault::cache::KeyCache,
     /// Per-process secret for keyed fingerprints of Authorization headers.
     pub za_fingerprint_key: vault::Zeroizing<[u8; 32]>,
+    /// Bumped before every local `Account`/`AccessToken` invalidation; a
+    /// loader that saw it change since its read must not publish its value.
+    pub account_epoch: AtomicU64,
 
     pub messages: Cache<u32, Arc<MessageStoreCache>>,
     pub files: Cache<u32, Arc<DavResources>>,
