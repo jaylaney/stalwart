@@ -61,6 +61,9 @@ pub const SETUP_TOKEN_TTL_SECS: i64 = 7 * 86400;
 /// Longest app-password description, in bytes (spec 10).
 pub const MAX_APP_PASSWORD_DESCRIPTION: usize = 255;
 
+/// Longest `otp_auth` URL accepted by `totp`, in bytes. Checked before parsing.
+pub const MAX_OTP_AUTH_URL: usize = 1024;
+
 /// Attempts at publishing a Pending app-password wrap before giving up.
 const PUBLISH_RETRIES: usize = 5;
 
@@ -136,9 +139,19 @@ struct TotpRequest {
     password: String,
     #[serde(default)]
     totp: Option<String>,
-    /// The new otpauth:// URL; null, absent or empty removes TOTP.
-    #[serde(default)]
-    otp_auth: Option<String>,
+    /// Required: absent `None`, `null` `Some(None)` (removes TOTP), a URL
+    /// `Some(Some(url))` (enrols or replaces).
+    #[serde(default, deserialize_with = "deserialize_some")]
+    otp_auth: Option<Option<String>>,
+}
+
+/// Double option: a present field, `null` included, becomes `Some`.
+fn deserialize_some<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 #[derive(serde::Serialize)]
@@ -1266,6 +1279,20 @@ async fn za_totp(
     session: &HttpSessionData,
     request: TotpRequest,
 ) -> trc::Result<HttpResponse> {
+    // Removal is explicit: a client that omits the field changes nothing.
+    let Some(otp_auth) = request.otp_auth else {
+        return Err(bad_request(
+            "otp_auth is required (URL to enrol or replace, null to remove).",
+        ));
+    };
+    if otp_auth
+        .as_ref()
+        .is_some_and(|url| url.len() > MAX_OTP_AUTH_URL)
+    {
+        return Err(bad_request(format!(
+            "otp_auth must be at most {MAX_OTP_AUTH_URL} bytes."
+        )));
+    }
     let verified = match za_verify_primary(
         server,
         session,
@@ -1278,8 +1305,8 @@ async fn za_totp(
         Ok(verified) => verified,
         Err(response) => return Ok(response),
     };
-    let otp_auth = request.otp_auth.filter(|url| !url.is_empty());
-    // The URL carries the secret: the error names neither it nor the parser's message.
+    // The URL carries the secret: the error names neither it nor the
+    // parser's message. An empty string is not a URL.
     if let Some(url) = &otp_auth
         && verify_totp_code(url, "000000").is_err()
     {

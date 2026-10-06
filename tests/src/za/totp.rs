@@ -10,6 +10,7 @@ use crate::utils::{
     za::{VaultReply, assert_nothing_cached, caldav_from, park_login, za_post, za_post_from},
 };
 use common::ipc::CacheInvalidation;
+use http::api::vault::MAX_OTP_AUTH_URL;
 use hyper::StatusCode;
 use registry::{
     schema::{
@@ -109,6 +110,18 @@ async fn totp_url_of(test: &TestServer, id: u32) -> Option<String> {
         .totp_url
 }
 
+trait Detail {
+    fn assert_detail(&self, expected: &str);
+}
+
+impl Detail for Value {
+    /// The problem detail names the refusal.
+    fn assert_detail(&self, expected: &str) {
+        let detail = self["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains(expected), "{detail}");
+    }
+}
+
 /// One endpoint with TOTP enrolled: no code 402, a wrong code 401, the
 /// current code 200 (spec 4.1).
 async fn requires_code(path: &str, body: Value, url: &str) -> Value {
@@ -145,7 +158,24 @@ pub async fn test(test: &mut TestServer) {
     )
     .await
     .expect(409);
+    // `otp_auth` is required (absent 400) and capped before parsing.
+    za_fail("totp", &json!({ "username": NAME, "password": STRONG }))
+        .await
+        .expect(400)
+        .assert_detail("otp_auth is required");
+    let long = format!(
+        "{url}&image=https://x.example/{}",
+        "a".repeat(MAX_OTP_AUTH_URL)
+    );
+    za_fail(
+        "totp",
+        &json!({ "username": NAME, "password": STRONG, "otp_auth": long }),
+    )
+    .await
+    .expect(400)
+    .assert_detail("at most 1024 bytes");
     for bad in [
+        "",
         "garbage",
         "otpauth://totp/Leaky?secret=SHORTSECRET&issuer=Leaky",
         "otpauth://hotp/Leaky?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&counter=1",
@@ -280,6 +310,19 @@ pub async fn test(test: &mut TestServer) {
     )
     .await
     .expect(200);
+
+    // An absent `otp_auth` is refused, even with the code, and removes nothing.
+    let before = test.server.za_vault_record(id).await.unwrap().unwrap();
+    za_fail(
+        "totp",
+        &json!({ "username": NAME, "password": STRONG, "totp": code(&url2) }),
+    )
+    .await
+    .expect(400)
+    .assert_detail("otp_auth is required");
+    let after = test.server.za_vault_record(id).await.unwrap().unwrap();
+    assert_eq!(after.record.revision, before.record.revision);
+    assert_eq!(after.record.totp_url.as_deref(), Some(url2.as_str()));
 
     // Removal: `otp_auth` null, with the current code.
     let removal = json!({ "username": NAME, "password": STRONG, "otp_auth": null });
