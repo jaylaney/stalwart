@@ -8,6 +8,7 @@ use crate::utils::{account::Account, http::HttpRequest};
 use hyper::Method;
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::time::Duration;
 
 pub struct VaultReply {
     pub status: u16,
@@ -59,6 +60,30 @@ async fn za_post_with(request: HttpRequest, path: &str, body: &impl Serialize) -
     VaultReply {
         status: response.status.as_u16(),
         body: serde_json::from_str(&response.body).unwrap_or(Value::Null),
+    }
+}
+
+/// Unauthenticated POST from `remote_ip` (via `X-Forwarded-For`; the za
+/// suite enables forwarded addresses), for fail2ban tests that must not ban
+/// the loopback address the rest of the suite uses.
+pub async fn za_post_from(remote_ip: &str, path: &str, body: &impl Serialize) -> VaultReply {
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+        .post(format!("https://127.0.0.1:8899/api/vault/{path}"))
+        .header("X-Forwarded-For", remote_ip)
+        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(body).unwrap())
+        .send()
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+    VaultReply {
+        status,
+        body: serde_json::from_str(&body).unwrap_or(Value::Null),
     }
 }
 

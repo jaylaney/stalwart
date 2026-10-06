@@ -5,7 +5,7 @@
  */
 
 use crate::utils::server::{TestServer, TestServerBuilder};
-use registry::schema::enums::Permission;
+use registry::schema::{enums::Permission, prelude::Property, structs::Http};
 
 pub mod setup;
 
@@ -32,6 +32,17 @@ pub async fn za_tests() {
             vec![Permission::UnlimitedRequests, Permission::UnlimitedUploads],
         )
         .await;
+    // Forwarded addresses let the fail2ban test use its own client address.
+    admin
+        .registry_update_setting(
+            Http {
+                use_x_forwarded: true,
+                ..Default::default()
+            },
+            &[Property::UseXForwarded],
+        )
+        .await;
+    admin.reload_settings().await;
     test.insert_account(plain);
     test.insert_account(admin);
 

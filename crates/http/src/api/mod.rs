@@ -31,7 +31,7 @@ use groupware::calendar::itip::{ItipIngest, RsvpRequest};
 use http_body_util::{StreamBody, combinators::BoxBody};
 use http_proto::{
     HttpRequest, HttpResponse, HttpSessionData, JsonResponse, ToHttpResponse,
-    request::{decode_path_element, fetch_body},
+    request::{decode_path_element, fetch_body, fetch_body_untraced},
 };
 use hyper::{
     Method, StatusCode,
@@ -65,10 +65,14 @@ impl ManagementApi for Server {
         session: &HttpSessionData,
     ) -> trc::Result<HttpResponse> {
         let is_post = req.method() == Method::POST;
-        let body = if is_post {
-            fetch_body(req, 1024 * 1024, session.session_id).await
-        } else {
+        // Zero-access request bodies carry passwords, tokens and recovery keys.
+        let is_vault = req.uri().path().split('/').nth(2) == Some("vault");
+        let body = if !is_post {
             None
+        } else if is_vault {
+            fetch_body_untraced(req, 1024 * 1024).await
+        } else {
+            fetch_body(req, 1024 * 1024, session.session_id).await
         };
         let path = req.uri().path().split('/').skip(2).collect::<Vec<_>>();
 

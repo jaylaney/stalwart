@@ -29,7 +29,7 @@ use common::{
     },
 };
 use directory::Credentials;
-use http_proto::{HttpRequest, HttpResponse, HttpSessionData, JsonResponse, ToHttpResponse};
+use http_proto::{HttpRequest, HttpResponse, HttpSessionData};
 use hyper::StatusCode;
 use registry::{
     schema::{
@@ -87,20 +87,25 @@ struct OkResponse {
 // First used by the endpoints of Tasks 8-10.
 #[allow(dead_code)]
 fn ok() -> HttpResponse {
-    JsonResponse::new(OkResponse { ok: true })
-        .no_cache()
-        .into_http_response()
+    json(OkResponse { ok: true })
 }
 
 fn json<T: serde::Serialize>(value: T) -> HttpResponse {
-    JsonResponse::new(value).no_cache().into_http_response()
+    json_with_status(StatusCode::OK, value)
+}
+
+/// Responses carry tokens and recovery keys. A binary body keeps them out of
+/// the `HttpEvent::ResponseBody` trace, which records text bodies verbatim.
+fn json_with_status<T: serde::Serialize>(status: StatusCode, value: T) -> HttpResponse {
+    HttpResponse::new(status)
+        .with_content_type("application/json; charset=utf-8")
+        .with_binary_body(serde_json::to_vec(&value).unwrap_or_default())
+        .with_no_store()
 }
 
 /// 409: wrong state, ineligible account, or a lost revision check (spec 10).
 fn conflict(error: &'static str) -> HttpResponse {
-    JsonResponse::with_status(StatusCode::CONFLICT, ErrorResponse { error })
-        .no_cache()
-        .into_http_response()
+    json_with_status(StatusCode::CONFLICT, ErrorResponse { error })
 }
 
 fn token_hash(token: &str) -> Vec<u8> {
@@ -167,7 +172,7 @@ impl VaultApi for Server {
         if endpoint == "setup-token" && sub.is_none() {
             let (_in_flight, access_token) = self.authenticate_headers(req, session).await?;
             access_token.enforce_permission(Permission::SysAccountUpdate)?;
-            return za_setup_token(self, parse(&body)?).await;
+            return za_setup_token(self, access_token.tenant_id(), parse(&body)?).await;
         }
 
         // Credentials travel in the body; rate-limit like the other anonymous endpoints.
@@ -329,8 +334,38 @@ async fn za_commit(
         Err(err) if err.is_assertion_failure() => return Ok(Err(conflict("conflict"))),
         Err(err) => return Err(err),
     }
-    server.za_invalidate_account(account_id).await?;
+    za_invalidate_after_commit(server, account_id).await;
     Ok(Ok(()))
+}
+
+/// Invalidation after a committed write: a failure is logged, never turned
+/// into an error response, so a committed `setup` still returns its one-time
+/// recovery key.
+async fn za_invalidate_after_commit(server: &Server, account_id: u32) {
+    if let Err(err) = server.za_invalidate_account(account_id).await {
+        trc::error!(
+            err.account_id(account_id)
+                .details("Zero-access cache invalidation failed after a committed write")
+        );
+    }
+}
+
+/// Refusal with a status other than 401 (e.g. 409 on an active account):
+/// counted like a failed attempt, so probing for account states is delayed,
+/// rate-limited and banned like guessing credentials. A ban or a fail2ban
+/// lookup error replaces `response`.
+async fn za_refuse(
+    server: &Server,
+    remote_ip: IpAddr,
+    username: &str,
+    response: HttpResponse,
+) -> trc::Result<HttpResponse> {
+    let err = za_auth_failure(server, remote_ip, username).await;
+    if err.matches(trc::EventType::Auth(trc::AuthEvent::Failed)) {
+        Ok(response)
+    } else {
+        Err(err)
+    }
 }
 
 /// Failure path for endpoints that verify something other than the primary
@@ -424,25 +459,51 @@ fn za_set_recovery(record: &mut VaultRecord, account_id: u32, mk: &Secret) -> Re
     key
 }
 
-async fn za_setup_token(server: &Server, request: SetupTokenRequest) -> trc::Result<HttpResponse> {
+async fn za_setup_token(
+    server: &Server,
+    caller_tenant_id: Option<u32>,
+    request: SetupTokenRequest,
+) -> trc::Result<HttpResponse> {
     let Some(account_id) = server
         .account_id_from_email(&request.account, false)
         .await?
     else {
         return Err(trc::ResourceEvent::NotFound.into_err());
     };
-    let Some(reg) = za_registry_account(server, account_id).await? else {
+    let reg = za_registry_account(server, account_id).await?;
+    // A tenant administrator only sees its own tenant's accounts, like the
+    // registry set path; a tenant-less caller sees all.
+    if let Some(tenant_id) = caller_tenant_id
+        && reg
+            .as_ref()
+            .is_none_or(|reg| reg.account.member_tenant_id != Some(Id::from(tenant_id)))
+    {
+        return Err(trc::ResourceEvent::NotFound.into_err());
+    }
+    let Some(reg) = reg else {
         return Ok(conflict("not a user account"));
     };
-    if let Some(domain) = server
+    let Some(domain) = server
         .domain_by_id(reg.account.domain_id.document_id())
         .await?
-        && server.get_directory_for_cached_domain(&domain).is_some()
-    {
+    else {
+        return Ok(conflict("account domain not found"));
+    };
+    if server.get_directory_for_cached_domain(&domain).is_some() {
         return Ok(conflict(
             "accounts in external directories are not supported",
         ));
     }
+
+    // State first, so an active account is refused as such.
+    let previous = server.za_vault_record(account_id).await?;
+    if previous
+        .as_ref()
+        .is_some_and(|read| read.record.state != VaultState::PendingSetup)
+    {
+        return Ok(conflict("account is already active"));
+    }
+
     let has_marker = reg
         .account
         .password_credential()
@@ -451,14 +512,14 @@ async fn za_setup_token(server: &Server, request: SetupTokenRequest) -> trc::Res
     let has_credentials = reg.account.credentials.values().next().is_some();
 
     // Data checks apply to initial issuance and to reissuance (spec 4.1).
-    if server
-        .za_has_documents(account_id, Collection::Calendar)
-        .await?
-        || server
-            .za_has_documents(account_id, Collection::CalendarEvent)
-            .await?
-    {
-        return Ok(conflict("account already holds calendar data"));
+    for collection in [
+        Collection::Calendar,
+        Collection::CalendarEvent,
+        Collection::CalendarEventNotification,
+    ] {
+        if server.za_has_documents(account_id, collection).await? {
+            return Ok(conflict("account already holds calendar data"));
+        }
     }
 
     let token = URL_SAFE_NO_PAD.encode(store::rand::random::<[u8; 32]>());
@@ -467,7 +528,6 @@ async fn za_setup_token(server: &Server, request: SetupTokenRequest) -> trc::Res
 
     // (1) PendingSetup record: created conditional on no record existing, or
     // a reissue that rotates the token (the old token becomes invalid).
-    let previous = server.za_vault_record(account_id).await?;
     let mut record = match &previous {
         None if has_marker => {
             // Marker without record: data loss, operator intervention (spec 3.2).
@@ -475,9 +535,6 @@ async fn za_setup_token(server: &Server, request: SetupTokenRequest) -> trc::Res
         }
         None if has_credentials => return Ok(conflict("account already has credentials")),
         None => VaultRecord::pending(token_hash(&token), expires),
-        Some(read) if read.record.state != VaultState::PendingSetup => {
-            return Ok(conflict("account is already active"));
-        }
         Some(_) if !has_marker && has_credentials => {
             // Crash recovery writes the marker below: same eligibility as issuance.
             return Ok(conflict("account already has credentials"));
@@ -520,7 +577,7 @@ async fn za_setup_token(server: &Server, request: SetupTokenRequest) -> trc::Res
 
         // (3) Invalidate classification and cached authentication again: the
         // marker is what classifies the account.
-        server.za_invalidate_account(account_id).await?;
+        za_invalidate_after_commit(server, account_id).await;
     }
 
     Ok(json(SetupTokenResponse { token, expires }))
@@ -541,7 +598,13 @@ async fn za_setup(
         return Err(za_auth_failure(server, session.remote_ip, &request.username).await);
     };
     if read.record.state != VaultState::PendingSetup {
-        return Ok(conflict("account is already active"));
+        return za_refuse(
+            server,
+            session.remote_ip,
+            &request.username,
+            conflict("account is already active"),
+        )
+        .await;
     }
     let now = now() as i64;
     let presented = token_hash(&request.token);

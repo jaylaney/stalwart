@@ -23,11 +23,28 @@ pub async fn fetch_body(
     max_size: usize,
     session_id: u64,
 ) -> Option<Vec<u8>> {
+    fetch_body_inner(req, max_size, session_id, true).await
+}
+
+/// Like `fetch_body`, but never emits `HttpEvent::RequestBody`: for bodies
+/// that carry passwords, tokens or recovery keys.
+pub async fn fetch_body_untraced(req: &mut HttpRequest, max_size: usize) -> Option<Vec<u8>> {
+    fetch_body_inner(req, max_size, 0, false).await
+}
+
+async fn fetch_body_inner(
+    req: &mut HttpRequest,
+    max_size: usize,
+    session_id: u64,
+    trace: bool,
+) -> Option<Vec<u8>> {
     let mut bytes = Vec::with_capacity(1024);
     while let Some(Ok(frame)) = req.frame().await {
         if let Some(data) = frame.data_ref() {
             if bytes.len() + data.len() <= max_size || max_size == 0 {
                 bytes.extend_from_slice(data);
+            } else if !trace {
+                return None;
             } else {
                 trc::event!(
                     Http(trc::HttpEvent::RequestBody),
@@ -50,6 +67,10 @@ pub async fn fetch_body(
                 return None;
             }
         }
+    }
+
+    if !trace {
+        return bytes.into();
     }
 
     trc::event!(

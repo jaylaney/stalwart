@@ -6,16 +6,25 @@
 
 use super::{STRONG, user_permissions};
 use crate::utils::{
+    account::Account,
+    registry::UnwrapRegistryId,
     server::TestServer,
     webdav::DummyWebDavClient,
-    za::{za_post, za_post_as, za_setup, za_setup_token},
+    za::{za_post, za_post_as, za_post_from, za_setup, za_setup_token},
 };
-use common::ipc::CacheInvalidation;
+use common::ipc::{CacheInvalidation, RegistryChange};
 use http::api::vault::SETUP_TOKEN_TTL_SECS;
 use hyper::StatusCode;
-use registry::schema::structs::{self, PasswordCredential};
+use registry::{
+    schema::{
+        enums::BlockReason,
+        prelude::{ObjectType, Property},
+        structs::{self, BlockedIp, PasswordCredential, Rate},
+    },
+    types::{duration::Duration, ipmask::IpAddrOrMask},
+};
 use serde_json::json;
-use store::write::now;
+use store::{registry::write::RegistryWrite, write::now};
 use types::id::Id;
 use vault::record::{VaultRecord, VaultState};
 
@@ -304,6 +313,85 @@ pub async fn test(test: &mut TestServer) {
     .expect(409);
     admin.destroy_account(key4).await;
     test.wait_for_tasks().await;
+
+    // Review Focus 2: failed setup attempts go through fail2ban. A low ban
+    // rate for the duration of the block, a forwarded client address and a
+    // dedicated account keep the loopback address and other logins unbanned.
+    const BANNED_IP: &str = "10.0.0.77";
+    const BAN_RATE: u64 = 5;
+    let key5 = admin
+        .create_passwordless_user_account(
+            "key5@example.com",
+            STRONG,
+            "Key Five",
+            &[],
+            user_permissions(),
+        )
+        .await;
+    let token = za_setup_token(&admin, "key5@example.com").await;
+    set_auth_ban_rate(&admin, BAN_RATE).await;
+    let wrong =
+        json!({ "username": "key5@example.com", "token": "not-the-token", "password": STRONG });
+    let mut statuses = Vec::new();
+    for _ in 0..BAN_RATE + 1 {
+        statuses.push(za_post_from(BANNED_IP, "setup", &wrong).await.status);
+    }
+    assert_eq!(
+        statuses,
+        [vec![401; BAN_RATE as usize], vec![429]].concat(),
+        "every failure is counted, the one over the rate is a ban"
+    );
+    let blocked_id = test
+        .server
+        .registry()
+        .primary_key(
+            ObjectType::BlockedIp.into(),
+            Property::Address,
+            IpAddrOrMask::from_ip(BANNED_IP.parse().unwrap()).to_index_key(),
+        )
+        .await
+        .unwrap()
+        .expect("failed setup attempts must ban the client address");
+    let blocked = test
+        .server
+        .registry()
+        .object::<BlockedIp>(blocked_id.id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(blocked.reason, BlockReason::AuthFailure);
+    // Lift the ban and restore the default rate.
+    test.server
+        .registry()
+        .write(RegistryWrite::delete(blocked_id))
+        .await
+        .unwrap()
+        .unwrap_id(trc::location!());
+    test.server
+        .reload_registry(RegistryChange::Delete(blocked_id))
+        .await
+        .unwrap();
+    set_auth_ban_rate(&admin, 100).await;
+    // The failures did not consume the real token.
+    let mut key5 = key5;
+    key5.recovery_key = Some(za_setup("key5@example.com", &token, STRONG).await);
+    test.insert_account(key5);
+}
+
+async fn set_auth_ban_rate(admin: &Account, count: u64) {
+    admin
+        .registry_update_object(
+            ObjectType::Security,
+            Id::singleton(),
+            json!({
+                Property::AuthBanRate: Rate {
+                    count,
+                    period: Duration::from_millis(86_400_000),
+                }
+            }),
+        )
+        .await;
+    admin.reload_settings().await;
 }
 
 /// Read from the registry directly: the JMAP view masks credential secrets.
