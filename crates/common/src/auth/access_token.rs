@@ -452,6 +452,11 @@ impl AccessToken {
         self
     }
 
+    pub fn without_session_keys(mut self) -> Self {
+        self.session_keys = None;
+        self
+    }
+
     pub fn session_keys(&self) -> Option<&Arc<::vault::session::SessionKeys>> {
         self.session_keys.as_ref()
     }

@@ -152,32 +152,51 @@ impl Authenticator for Server {
             .await?;
 
         #[cfg(feature = "test_mode")]
-        za_test::pause_point().await;
+        za_test::pause_point(access_token.account_id()).await;
 
+        let account_id = access_token.account_id();
         let expires = Instant::now() + Duration::from_secs(self.core.oauth.oauth_expiry_token);
-        match access_token.session_keys() {
+        let mut access_token = access_token;
+        match access_token.session_keys().cloned() {
             None => {
                 // A keyless result for a key account (Bearer/OAuth, or a
                 // password verified against the pre-setup hash while setup
                 // committed) must not survive in the cache: a generation-0
                 // entry is served on later hits without the fence. Only
                 // non-key accounts are cached here, as upstream does.
-                if !self
-                    .account(access_token.account_id())
-                    .await?
-                    .is_key_account()
-                {
+                if !self.account(account_id).await?.is_key_account() {
                     self.inner.cache.http_auth.insert(
                         fp,
                         HttpAuthCache {
-                            account_id: access_token.account_id(),
+                            account_id,
                             revision: access_token.revision(),
                             credential_id: access_token.credential_id(),
                             expires,
                             generation: 0,
                         },
                     );
+
+                    // Double-check after publish: the check above may have read
+                    // a stale non-key entry while setup's `Account` invalidation
+                    // was still pending. If the account is a key account now,
+                    // withdraw the entry just inserted.
+                    if self.account(account_id).await?.is_key_account() {
+                        self.inner.cache.http_auth.remove(&fp);
+                    }
                 }
+            }
+            Some(keys) if keys.account_id != account_id => {
+                // Keys of another account must never travel with this token:
+                // serve the request keyless and cache nothing.
+                trc::error!(
+                    trc::AuthEvent::Error
+                        .into_err()
+                        .details("Session keys do not belong to the authenticated account.")
+                        .account_id(account_id)
+                        .ctx(trc::Key::Id, keys.account_id)
+                        .caused_by(trc::location!())
+                );
+                access_token = access_token.without_session_keys();
             }
             Some(keys) => {
                 // Generation fence (spec 5). Race defended: this login read the
@@ -186,25 +205,22 @@ impl Authenticator for Server {
                 // Caching now would resurrect the superseded verification, so
                 // both inserts happen only if the verified generation still
                 // equals the one rebuilt from the store; otherwise the request
-                // succeeds uncached.
-                let account = self.account(access_token.account_id()).await?;
-                if keys.generation == account.za_generation
-                    && keys.account_id == access_token.account_id()
-                {
+                // succeeds uncached. Generation 0 is never cached: such an
+                // entry would be served from the non-key hit branch, unfenced,
+                // with keys resident.
+                let account = self.account(account_id).await?;
+                if keys.generation != 0 && keys.generation == account.za_generation {
                     self.inner.cache.http_auth.insert(
                         fp,
                         HttpAuthCache {
-                            account_id: access_token.account_id(),
+                            account_id,
                             revision: access_token.revision(),
                             credential_id: access_token.credential_id(),
                             expires,
                             generation: keys.generation,
                         },
                     );
-                    self.inner
-                        .cache
-                        .za_keys
-                        .insert(fp, keys.clone(), Instant::now());
+                    self.inner.cache.za_keys.insert(fp, keys, Instant::now());
                 }
             }
         }
@@ -217,17 +233,28 @@ impl Authenticator for Server {
 }
 
 /// Test-only pause point between credential verification and the cache
-/// insert fence, used by the paused-verification tests. One-shot: the first
-/// request to reach it takes the pause, so later requests run unpaused.
+/// insert fence, used by the paused-verification tests. Keyed on an account
+/// id and one-shot: only the first successful verification for that account
+/// takes the pause; requests for other accounts pass through and leave it set.
 #[cfg(feature = "test_mode")]
 pub mod za_test {
     use std::sync::{Arc, Mutex};
     use tokio::sync::Notify;
 
-    #[derive(Default)]
     pub struct Pause {
+        pub account_id: u32,
         pub arrived: Notify,
         pub release: Notify,
+    }
+
+    impl Pause {
+        pub fn new(account_id: u32) -> Self {
+            Pause {
+                account_id,
+                arrived: Notify::new(),
+                release: Notify::new(),
+            }
+        }
     }
 
     pub static PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
@@ -236,13 +263,18 @@ pub mod za_test {
         *PAUSE.lock().unwrap_or_else(|e| e.into_inner()) = pause;
     }
 
-    fn take() -> Option<Arc<Pause>> {
-        PAUSE.lock().unwrap_or_else(|e| e.into_inner()).take()
+    fn take_for(account_id: u32) -> Option<Arc<Pause>> {
+        let mut pause = PAUSE.lock().unwrap_or_else(|e| e.into_inner());
+        if pause.as_ref().is_some_and(|p| p.account_id == account_id) {
+            pause.take()
+        } else {
+            None
+        }
     }
 
-    pub(super) async fn pause_point() {
-        // The guard is dropped inside `take`, before any await.
-        if let Some(pause) = take() {
+    pub(super) async fn pause_point(account_id: u32) {
+        // The guard is dropped inside `take_for`, before any await.
+        if let Some(pause) = take_for(account_id) {
             pause.arrived.notify_one();
             pause.release.notified().await;
         }
@@ -253,20 +285,27 @@ pub mod za_test {
         use super::*;
 
         #[tokio::test]
-        async fn pause_is_one_shot_and_waits_for_release() {
-            let pause = Arc::new(Pause::default());
+        async fn pause_fires_once_for_its_account_only() {
+            let pause = Arc::new(Pause::new(7));
             set(Some(pause.clone()));
 
-            let task = tokio::spawn(pause_point());
+            // Another account's request passes through and leaves it set.
+            pause_point(8).await;
+            assert!(PAUSE.lock().unwrap().is_some());
+
+            let task = tokio::spawn(pause_point(7));
             pause.arrived.notified().await;
-            assert!(take().is_none(), "the paused request takes the pause");
+            assert!(
+                PAUSE.lock().unwrap().is_none(),
+                "the paused request takes the pause"
+            );
             assert!(!task.is_finished());
 
             pause.release.notify_one();
             task.await.unwrap();
 
             // Unset: the pause point returns immediately.
-            pause_point().await;
+            pause_point(7).await;
         }
     }
 }

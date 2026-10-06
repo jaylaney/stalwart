@@ -58,8 +58,10 @@ struct Queue {
     heap: BinaryHeap<Action>,
 }
 
-/// Zero-access key cache sweep interval (spec 5: at least every 60 seconds).
-const ZA_KEY_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+/// Zero-access key cache sweep interval. Spec 5 requires a sweep at least
+/// every 60 seconds; half that leaves room for wake-up latency and for the
+/// inline awaits of other events drained in the same pass.
+const ZA_KEY_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 // SPDX-SnippetBegin
 // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
