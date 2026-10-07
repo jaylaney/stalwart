@@ -37,6 +37,15 @@ async fn za_fail(path: &str, body: &Value) -> VaultReply {
     za_post_from(FAIL_IP, path, body).await
 }
 
+fn assert_shape_refused(reply: VaultReply) {
+    let body = reply.expect(400);
+    let detail = body["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("must not look like an app password"),
+        "{detail}"
+    );
+}
+
 pub async fn test(test: &mut TestServer) {
     println!("Running zero-access password tests...");
     let name = "key1@example.com";
@@ -87,6 +96,25 @@ pub async fn test(test: &mut TestServer) {
     )
     .await
     .expect(400);
+    // A new password shaped like an app password could never log in as a
+    // primary password: refused by password and recover (setup below),
+    // nothing written.
+    let shaped = AppPassword::new(7).build();
+    let before = test.server.za_vault_record(id).await.unwrap().unwrap();
+    for (endpoint, body) in [
+        (
+            "password",
+            json!({ "username": name, "password": STRONG, "new_password": shaped }),
+        ),
+        (
+            "recover",
+            json!({ "username": name, "recovery_key": recovery, "new_password": shaped }),
+        ),
+    ] {
+        assert_shape_refused(za_fail(endpoint, &body).await);
+    }
+    let after = test.server.za_vault_record(id).await.unwrap().unwrap();
+    assert_eq!(after.cas, before.cas, "nothing written");
     // recover: an account without a vault record is 401, a pending one 409.
     za_fail(
         "recover",
@@ -104,7 +132,14 @@ pub async fn test(test: &mut TestServer) {
             user_permissions(),
         )
         .await;
-    za_setup_token(&admin, "key6@example.com").await;
+    let token = za_setup_token(&admin, "key6@example.com").await;
+    assert_shape_refused(
+        za_fail(
+            "setup",
+            &json!({ "username": "key6@example.com", "token": token, "password": shaped }),
+        )
+        .await,
+    );
     za_fail(
         "recover",
         &json!({ "username": "key6@example.com", "recovery_key": RecoveryKey::generate().encode(), "new_password": STRONG2 }),

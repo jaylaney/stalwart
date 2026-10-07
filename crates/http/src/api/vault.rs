@@ -143,6 +143,10 @@ struct TotpRequest {
     /// `Some(Some(url))` (enrols or replaces).
     #[serde(default, deserialize_with = "deserialize_some")]
     otp_auth: Option<Option<String>>,
+    /// Required with a URL: a current code generated from the new secret,
+    /// proving the authenticator holds it before the old one is replaced.
+    #[serde(default)]
+    confirm: Option<String>,
 }
 
 /// Double option: a present field, `null` included, becomes `Some`.
@@ -157,6 +161,13 @@ where
 #[derive(serde::Serialize)]
 struct RecoveryKeyResponse {
     recovery_key: String,
+}
+
+#[derive(serde::Serialize)]
+struct RecoverResponse {
+    recovery_key: String,
+    /// Recovery also removes TOTP: the recovery key is the stronger factor.
+    totp_removed: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -394,7 +405,11 @@ async fn za_delete_registry_credential(
     let mut account = reg.account.clone();
     let credentials = &mut account.credentials.inner_mut().inner;
     let before = credentials.len();
-    credentials.retain(|c| c.value.credential_id().document_id() != credential_id);
+    // App passwords only: no other credential type is ever deleted here.
+    credentials.retain(|c| {
+        !(matches!(c.value, Credential::AppPassword(_))
+            && c.value.credential_id().document_id() == credential_id)
+    });
     if credentials.len() == before {
         return Ok(true);
     }
@@ -561,6 +576,18 @@ async fn za_reread_verified(
         return Ok(Err(conflict("account is not active")));
     }
     Ok(Ok(read))
+}
+
+/// Checks a new primary password: strength, and not shaped like an app
+/// password, which the router would treat as one and never verify as a
+/// primary password (Basic logins and these endpoints alike).
+fn za_check_new_password(server: &Server, password: &str, username: &str) -> trc::Result<()> {
+    if AppPassword::parse(password).is_some() {
+        return Err(bad_request("password must not look like an app password"));
+    }
+    server
+        .is_secure_password(password, &[username])
+        .map_err(bad_request)
 }
 
 /// Fresh salt, Argon2 parameters, verifier hash and password wrap.
@@ -748,9 +775,7 @@ async fn za_setup(
     if !token_ok {
         return Err(za_auth_failure(server, session.remote_ip, &request.username).await);
     }
-    if let Err(err) = server.is_secure_password(&request.password, &[&request.username]) {
-        return Err(bad_request(err));
-    }
+    za_check_new_password(server, &request.password, &request.username)?;
 
     // Generate everything (spec 3). Nothing comes from an admin-supplied password.
     let mk = Secret::random();
@@ -794,9 +819,7 @@ async fn za_password(
         Ok(verified) => verified,
         Err(response) => return Ok(response),
     };
-    if let Err(err) = server.is_secure_password(&request.new_password, &[&request.username]) {
-        return Err(bad_request(err));
-    }
+    za_check_new_password(server, &request.new_password, &request.username)?;
     let account_id = verified.account_id;
     let read = match za_reread_verified(server, &verified).await? {
         Ok(read) => read,
@@ -827,7 +850,8 @@ async fn za_password(
 }
 
 /// Opens MK with the recovery key, then sets the new password and a fresh
-/// recovery wrap in one write; the old recovery key stops working.
+/// recovery wrap and removes TOTP in one write; the old recovery key stops
+/// working.
 async fn za_recover(
     server: &Server,
     session: &HttpSessionData,
@@ -861,12 +885,13 @@ async fn za_recover(
     ) else {
         return Err(za_auth_failure(server, session.remote_ip, &request.username).await);
     };
-    if let Err(err) = server.is_secure_password(&request.new_password, &[&request.username]) {
-        return Err(bad_request(err));
-    }
+    za_check_new_password(server, &request.new_password, &request.username)?;
     let mut record = read.record.clone();
     za_set_password(&mut record, account_id, &mk, &request.new_password).await?;
     let new_key = za_set_recovery(&mut record, account_id, &mk);
+    // The recovery key is the stronger factor: recovery also removes TOTP,
+    // so a lost authenticator cannot lock the account (controller ruling).
+    let totp_removed = record.totp_url.take().is_some();
     // Conditional on the record whose recovery wrap was opened: a concurrent
     // recovery with the same key loses the revision check.
     if let Err(response) = za_commit(
@@ -881,8 +906,9 @@ async fn za_recover(
     {
         return Ok(response);
     }
-    Ok(json(RecoveryKeyResponse {
+    Ok(json(RecoverResponse {
         recovery_key: new_key.encode(),
+        totp_removed,
     }))
 }
 
@@ -1271,8 +1297,9 @@ async fn za_app_password_revoke(
 }
 
 /// Enrols, replaces or removes TOTP (spec 4.1): the password and, when
-/// enrolled, the current code are verified, then the new URL (or its
-/// removal) is committed to the vault record in one conditional write.
+/// enrolled, the current code are verified, a new URL must be confirmed
+/// with a current code of its own, then the new URL (or its removal) is
+/// committed to the vault record in one conditional write.
 /// Nothing is written to the registry, whose TOTP field stays empty.
 async fn za_totp(
     server: &Server,
@@ -1293,6 +1320,14 @@ async fn za_totp(
             "otp_auth must be at most {MAX_OTP_AUTH_URL} bytes."
         )));
     }
+    // Enrolment and replacement prove the new secret first (controller
+    // ruling): a mistyped secret would otherwise lock the account.
+    let confirm = request.confirm.filter(|code| !code.is_empty());
+    if otp_auth.is_some() && confirm.is_none() {
+        return Err(bad_request(
+            "confirm is required: a current code generated from the new otp_auth.",
+        ));
+    }
     let verified = match za_verify_primary(
         server,
         session,
@@ -1307,10 +1342,20 @@ async fn za_totp(
     };
     // The URL carries the secret: the error names neither it nor the
     // parser's message. An empty string is not a URL.
-    if let Some(url) = &otp_auth
-        && verify_totp_code(url, "000000").is_err()
-    {
-        return Err(bad_request("otp_auth is not a valid otpauth:// URL."));
+    if let Some(url) = &otp_auth {
+        match verify_totp_code(url, confirm.as_deref().unwrap_or_default()) {
+            Ok(true) => (),
+            // 401 without fail2ban accounting: the caller has just proved
+            // the password (and any current code); a mistyped confirmation
+            // guesses nothing.
+            Ok(false) => {
+                return Err(trc::AuthEvent::Failed
+                    .into_err()
+                    .ctx(trc::Key::AccountName, request.username)
+                    .details("TOTP confirmation code does not match the new otp_auth"));
+            }
+            Err(_) => return Err(bad_request("otp_auth is not a valid otpauth:// URL.")),
+        }
     }
     let account_id = verified.account_id;
     let read = match za_reread_verified(server, &verified).await? {

@@ -148,13 +148,13 @@ pub async fn test(test: &mut TestServer) {
     // quoting it (it carries the secret).
     za_fail(
         "totp",
-        &json!({ "username": NAME, "password": "nope nope nope", "otp_auth": url }),
+        &json!({ "username": NAME, "password": "nope nope nope", "otp_auth": url, "confirm": code(&url) }),
     )
     .await
     .expect(401);
     za_fail(
         "totp",
-        &json!({ "username": "plain@example.com", "password": "plain secret with entropy 9", "otp_auth": url }),
+        &json!({ "username": "plain@example.com", "password": "plain secret with entropy 9", "otp_auth": url, "confirm": code(&url) }),
     )
     .await
     .expect(409);
@@ -185,7 +185,7 @@ pub async fn test(test: &mut TestServer) {
     ] {
         let body = za_fail(
             "totp",
-            &json!({ "username": NAME, "password": STRONG, "otp_auth": bad }),
+            &json!({ "username": NAME, "password": STRONG, "otp_auth": bad, "confirm": "000000" }),
         )
         .await
         .expect(400)
@@ -196,6 +196,38 @@ pub async fn test(test: &mut TestServer) {
         );
     }
     assert_eq!(totp_url_of(test, id).await, None);
+
+    // Enrolment requires a current code of the new secret (`confirm`):
+    // missing 400 before verification, wrong 401; neither writes anything.
+    let before = test.server.za_vault_record(id).await.unwrap().unwrap();
+    for password in [STRONG, "nope nope nope"] {
+        for confirm in [json!(null), json!("")] {
+            za_fail(
+                "totp",
+                &json!({ "username": NAME, "password": password, "otp_auth": url, "confirm": confirm }),
+            )
+            .await
+            .expect(400)
+            .assert_detail("confirm is required");
+        }
+        za_fail(
+            "totp",
+            &json!({ "username": NAME, "password": password, "otp_auth": url }),
+        )
+        .await
+        .expect(400)
+        .assert_detail("confirm is required");
+    }
+    za_fail(
+        "totp",
+        &json!({ "username": NAME, "password": STRONG, "otp_auth": url, "confirm": wrong_code(&url) }),
+    )
+    .await
+    .expect(401);
+    let after = test.server.za_vault_record(id).await.unwrap().unwrap();
+    assert_eq!(after.record.revision, before.record.revision, "no write");
+    assert_eq!(after.record.totp_url, None);
+    caldav(STRONG, StatusCode::MULTI_STATUS).await;
 
     // Paused verification across the enrolment (spec 11): a login verified
     // with the password alone before the enrolment succeeds, but nothing is
@@ -210,7 +242,7 @@ pub async fn test(test: &mut TestServer) {
     let parked = park_login(id, NAME, STRONG).await;
     za_post(
         "totp",
-        &json!({ "username": NAME, "password": STRONG, "otp_auth": url }),
+        &json!({ "username": NAME, "password": STRONG, "otp_auth": url, "confirm": code(&url) }),
     )
     .await
     .expect(200);
@@ -267,30 +299,44 @@ pub async fn test(test: &mut TestServer) {
     .await;
     caldav(&phone, StatusCode::UNAUTHORIZED).await;
 
-    // Replacement requires the current code; a malformed URL is refused
-    // even with it.
+    // Replacement requires the current code and a confirmation from the new
+    // secret; a malformed URL is refused even with both.
     let url2 = totp_url();
     za_fail(
         "totp",
-        &json!({ "username": NAME, "password": STRONG, "otp_auth": url2 }),
+        &json!({ "username": NAME, "password": STRONG, "otp_auth": url2, "confirm": code(&url2) }),
     )
     .await
     .expect(402);
     za_fail(
         "totp",
-        &json!({ "username": NAME, "password": STRONG, "totp": wrong_code(&url), "otp_auth": url2 }),
+        &json!({ "username": NAME, "password": STRONG, "totp": wrong_code(&url), "otp_auth": url2, "confirm": code(&url2) }),
     )
     .await
     .expect(401);
     za_fail(
         "totp",
-        &json!({ "username": NAME, "password": STRONG, "totp": code(&url), "otp_auth": "garbage" }),
+        &json!({ "username": NAME, "password": STRONG, "totp": code(&url), "otp_auth": url2 }),
+    )
+    .await
+    .expect(400)
+    .assert_detail("confirm is required");
+    za_fail(
+        "totp",
+        &json!({ "username": NAME, "password": STRONG, "totp": code(&url), "otp_auth": url2, "confirm": wrong_code(&url2) }),
+    )
+    .await
+    .expect(401);
+    za_fail(
+        "totp",
+        &json!({ "username": NAME, "password": STRONG, "totp": code(&url), "otp_auth": "garbage", "confirm": "000000" }),
     )
     .await
     .expect(400);
+    assert_eq!(totp_url_of(test, id).await.as_deref(), Some(url.as_str()));
     za_post(
         "totp",
-        &json!({ "username": NAME, "password": STRONG, "totp": code(&url), "otp_auth": url2 }),
+        &json!({ "username": NAME, "password": STRONG, "totp": code(&url), "otp_auth": url2, "confirm": code(&url2) }),
     )
     .await
     .expect(200);
@@ -349,7 +395,7 @@ pub async fn test(test: &mut TestServer) {
     let url3 = totp_url();
     za_post(
         "totp",
-        &json!({ "username": NAME, "password": STRONG, "otp_auth": url3 }),
+        &json!({ "username": NAME, "password": STRONG, "otp_auth": url3, "confirm": code(&url3) }),
     )
     .await
     .expect(200);
@@ -374,4 +420,40 @@ pub async fn test(test: &mut TestServer) {
     .expect(200);
     let after = test.server.za_vault_record(id).await.unwrap().unwrap();
     assert_eq!(after.record.revision, before.record.revision);
+
+    // Recovery removes TOTP (the recovery key is the stronger factor) and
+    // says so; the new password then logs in without a code.
+    let recovery = za_post(
+        "recovery-key",
+        &json!({ "username": NAME, "password": STRONG }),
+    )
+    .await
+    .str(200, "recovery_key");
+    let url4 = totp_url();
+    za_post(
+        "totp",
+        &json!({ "username": NAME, "password": STRONG, "otp_auth": url4, "confirm": code(&url4) }),
+    )
+    .await
+    .expect(200);
+    caldav(STRONG, MFA_REFUSED).await;
+    let reply = za_post(
+        "recover",
+        &json!({ "username": NAME, "recovery_key": recovery, "new_password": STRONG2 }),
+    )
+    .await
+    .expect(200);
+    assert_eq!(reply["totp_removed"], json!(true));
+    assert_eq!(totp_url_of(test, id).await, None);
+    caldav(STRONG2, StatusCode::MULTI_STATUS).await;
+    // Without TOTP enrolled, recovery reports nothing removed.
+    let reply = za_post(
+        "recover",
+        &json!({ "username": NAME, "recovery_key": reply["recovery_key"], "new_password": STRONG }),
+    )
+    .await
+    .expect(200);
+    assert_eq!(reply["totp_removed"], json!(false));
+    caldav(STRONG, StatusCode::MULTI_STATUS).await;
+    assert_eq!(registry_state(test).await, (None, registry_revision));
 }
