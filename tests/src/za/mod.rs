@@ -8,8 +8,9 @@ use crate::utils::server::{TestServer, TestServerBuilder};
 use ::registry::schema::{
     enums::Permission,
     prelude::Property,
-    structs::{Http, Imap},
+    structs::{Http, Imap, Rate},
 };
+use ::registry::types::duration::Duration;
 
 pub mod app_password;
 pub mod caches;
@@ -48,13 +49,19 @@ pub async fn za_tests() {
         )
         .await;
     // Forwarded addresses let the fail2ban test use its own client address.
+    // The vault modules send well over upstream's default of 100 anonymous
+    // requests per minute from one address; raise the limit for the suite.
     admin
         .registry_update_setting(
             Http {
                 use_x_forwarded: true,
+                rate_limit_anonymous: Some(Rate {
+                    count: 10000,
+                    period: Duration::from_millis(60000),
+                }),
                 ..Default::default()
             },
-            &[Property::UseXForwarded],
+            &[Property::UseXForwarded, Property::RateLimitAnonymous],
         )
         .await;
     // The cache module logs a key account in over plain-text IMAP.
