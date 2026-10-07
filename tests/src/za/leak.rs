@@ -12,7 +12,7 @@ use super::{
     dav_seal::{CANARIES, EVENT, mkcalendar_body},
 };
 use crate::utils::{server::TestServer, webdav::DummyWebDavClient};
-use calcard::icalendar::{ICalendar, ICalendarProperty};
+use calcard::icalendar::{ICalendar, ICalendarEntry, ICalendarProperty};
 use email::cache::MessageCacheFetch;
 use groupware::{
     cache::GroupwareCache,
@@ -35,7 +35,7 @@ use store::{
     SUBSPACE_REGISTRY_IDX, SUBSPACE_REGISTRY_PK, SUBSPACE_REPORT_IN, SUBSPACE_REPORT_OUT,
     SUBSPACE_SEARCH_INDEX, SUBSPACE_SPAM_SAMPLES, SUBSPACE_TASK_QUEUE, SUBSPACE_TELEMETRY_METRIC,
     SUBSPACE_TELEMETRY_SPAN, U32_LEN,
-    write::{AlignedBytes, AnyKey, Archive},
+    write::{AlignedBytes, AnyKey, Archive, SearchIndex},
 };
 use types::{
     collection::{Collection, SyncCollection},
@@ -108,6 +108,8 @@ pub struct Scan {
     pub records: usize,
     pub archives: usize,
     pub blobs: usize,
+    pub search_records: usize,
+    pub search_account_records: usize,
     pub events: usize,
     pub calendars: usize,
     pub emails: usize,
@@ -130,43 +132,73 @@ fn find_canaries(bytes: &[u8], what: &str, how: &str, violations: &mut Vec<Strin
     }
 }
 
-/// The three carriers the sealer writes; any other `X-ZA-*` property is an
-/// ordinary `X-` property and must have been sealed.
-fn is_carrier_name(name: &ICalendarProperty) -> bool {
-    matches!(name, ICalendarProperty::Other(n)
-        if [SEALED_PROP, KEY_PROP, EXTRA_PROP].iter().any(|c| n.eq_ignore_ascii_case(c)))
+/// Which of the three carriers `entry` is, if any.
+fn carrier_kind(entry: &ICalendarEntry) -> Option<&'static str> {
+    match &entry.name {
+        ICalendarProperty::Other(n) => [SEALED_PROP, KEY_PROP, EXTRA_PROP]
+            .into_iter()
+            .find(|c| n.eq_ignore_ascii_case(c)),
+        _ => None,
+    }
 }
 
-fn check_tree(tree: &ICalendar, what: &str, require_key: bool, violations: &mut Vec<String>) {
+/// Visibility of every non-carrier entry and parameter, and the carrier
+/// layout the sealer writes: no parameters on a carrier, `X-ZA-SEALED` only
+/// as the last entry of its component, and (events) the root ending with
+/// `X-ZA-EXTRA` (if any) then `X-ZA-KEY`. A custom timezone has no
+/// `X-ZA-KEY` or `X-ZA-EXTRA`.
+fn check_tree(tree: &ICalendar, what: &str, is_event: bool, violations: &mut Vec<String>) {
+    if is_event && tree.components.is_empty() {
+        violations.push(format!("{what}: missing {KEY_PROP}"));
+    }
     for (index, component) in tree.components.iter().enumerate() {
-        for entry in component.entries.iter() {
-            if is_carrier_name(&entry.name) {
-                continue;
+        let mut body = component.entries.as_slice();
+        if is_event && index == 0 {
+            match body.split_last() {
+                Some((last, rest)) if carrier_kind(last) == Some(KEY_PROP) => {
+                    body = rest;
+                    if let Some((last, rest)) = body.split_last()
+                        && carrier_kind(last) == Some(EXTRA_PROP)
+                    {
+                        body = rest;
+                    }
+                }
+                _ => violations.push(format!("{what}: missing {KEY_PROP}")),
             }
-            if !is_visible_property(&component.component_type, &entry.name) {
-                violations.push(format!(
-                    "{what}: component {index} ({:?}) has sealed-class property {:?}",
-                    component.component_type, entry.name
-                ));
-            }
-            for param in entry.params.iter() {
-                if !is_visible_parameter(&param.name) {
-                    violations.push(format!(
-                        "{what}: component {index} {:?} has sealed-class parameter {:?}",
-                        entry.name, param.name
-                    ));
+        }
+        for (position, entry) in body.iter().enumerate() {
+            match carrier_kind(entry) {
+                Some(SEALED_PROP) if position + 1 == body.len() => {}
+                Some(kind) => violations.push(format!(
+                    "{what}: component {index} has misplaced carrier {kind} at entry {position}"
+                )),
+                None => {
+                    if !is_visible_property(&component.component_type, &entry.name) {
+                        violations.push(format!(
+                            "{what}: component {index} ({:?}) has sealed-class property {:?}",
+                            component.component_type, entry.name
+                        ));
+                    }
+                    for param in entry.params.iter() {
+                        if !is_visible_parameter(&param.name) {
+                            violations.push(format!(
+                                "{what}: component {index} {:?} has sealed-class parameter {:?}",
+                                entry.name, param.name
+                            ));
+                        }
+                    }
                 }
             }
         }
-    }
-    if require_key
-        && !tree
-            .components
-            .first()
-            .and_then(|c| c.entries.last())
-            .is_some_and(|e| matches!(&e.name, ICalendarProperty::Other(n) if n == KEY_PROP))
-    {
-        violations.push(format!("{what}: missing {KEY_PROP}"));
+        for entry in component.entries.iter() {
+            if let Some(kind) = carrier_kind(entry)
+                && !entry.params.is_empty()
+            {
+                violations.push(format!(
+                    "{what}: component {index} carrier {kind} has parameters"
+                ));
+            }
+        }
     }
 }
 
@@ -176,6 +208,10 @@ fn check_event(event: &CalendarEvent, what: &str, violations: &mut Vec<String>) 
     }
     if !event.dead_properties.0.is_empty() {
         violations.push(format!("{what}: dead_properties not empty"));
+    }
+    // Per-account properties and alerts are not sealed (decision 7).
+    if !event.preferences.is_empty() {
+        violations.push(format!("{what}: event preferences not empty"));
     }
     check_tree(&event.data.event, what, true, violations);
 }
@@ -274,6 +310,29 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
             {
                 scan.blobs += 1;
                 find_canaries(&blob, &what, "decoded blob", &mut scan.violations);
+            }
+
+            // Term keys are hashes of tokens, so a canary never appears in
+            // them whole: assert structurally that no calendar data of the
+            // account was indexed (spec 9). Key: class (index | type << 6),
+            // then the account id (u32 BE) for every index but tracing,
+            // which is global (`store/src/write/key.rs`). Only calendar
+            // indexing is gated: the account's mail (here the generic alarm
+            // email) is indexed as upstream does, and its entries prove the
+            // key layout is read correctly.
+            if subspace == SUBSPACE_SEARCH_INDEX {
+                scan.search_records += 1;
+                if let Some(index) = key.first().and_then(|c| SearchIndex::try_from_u8(c & 0x3f))
+                    && index != SearchIndex::Tracing
+                    && key.get(1..1 + U32_LEN) == Some(account_id.to_be_bytes().as_slice())
+                {
+                    scan.search_account_records += 1;
+                    if index == SearchIndex::Calendar {
+                        scan.violations.push(format!(
+                            "{what}: calendar search index entry of the account"
+                        ));
+                    }
+                }
             }
 
             let Some(archive) = try_archive(&value) else {
@@ -390,6 +449,8 @@ pub async fn test(test: &mut TestServer) {
             ],
         )
         .await;
+    let body = props.response.body.as_deref().unwrap_or_default();
+    assert!(!body.contains("X-ZA-"), "{body}");
     let props = props.properties(cal);
     props.get("D:displayname").with_values(["leakcal-canary"]);
     props
@@ -422,6 +483,8 @@ pub async fn test(test: &mut TestServer) {
     let event_props = client
         .propfind(EVENT_PATH, ["D:displayname", "C:leak-dead"])
         .await;
+    let body = event_props.response.body.as_deref().unwrap_or_default();
+    assert!(!body.contains("X-ZA-"), "{body}");
     let event_props = event_props.properties(EVENT_PATH);
     event_props
         .get("D:displayname")
@@ -529,10 +592,12 @@ pub async fn test(test: &mut TestServer) {
 
     let result = scan(test, id).await;
     println!(
-        "Leak scan: {} records, {} archives, {} blobs, {} events, {} calendars, {} emails",
+        "Leak scan: {} records, {} archives, {} blobs, {} search index records ({} of the account, none calendar), {} events, {} calendars, {} emails",
         result.records,
         result.archives,
         result.blobs,
+        result.search_records,
+        result.search_account_records,
         result.events,
         result.calendars,
         result.emails
@@ -548,6 +613,10 @@ pub async fn test(test: &mut TestServer) {
     assert!(result.events >= 3, "{result:?}");
     assert!(result.calendars >= 2, "{result:?}");
     assert!(result.emails >= 1, "the alarm email was not delivered");
+    assert!(
+        result.search_account_records > 0,
+        "no search index entry of the account: the key layout is misread: {result:?}"
+    );
 
     // Negative control: an unsealed event planted directly must be caught,
     // both by the canary search and by the structural check.
