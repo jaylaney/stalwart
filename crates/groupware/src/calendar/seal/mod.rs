@@ -6,12 +6,13 @@
 
 //! Zero-access sealing of calendar data (spec 6, 7).
 //!
-//! The re-exports of `collection` and `event` are added by Tasks 3-4, when
-//! those modules gain content.
+//! The re-export of `collection` is added by Task 4, when that module gains
+//! content.
 
 pub mod collection;
 pub mod event;
 pub mod policy;
 pub mod tree;
 
+pub use event::{seal_event, unseal_event, unseal_event_archive};
 pub use tree::{SealError, seal_error, tree_has_carriers};

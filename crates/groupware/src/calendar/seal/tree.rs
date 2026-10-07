@@ -159,6 +159,21 @@ pub fn open_bytes(dek: &Secret, aad: &[u8], text: &str) -> Result<Vec<u8>, SealE
         .ok_or(SealError::Format)
 }
 
+/// `open_bytes`, then a checked rkyv decode of the plaintext. rkyv
+/// validates alignment and the decrypted bytes carry no guarantee, so they
+/// are copied into an aligned buffer first.
+pub(super) fn open_archive<T>(dek: &Secret, aad: &[u8], text: &str) -> Result<T, SealError>
+where
+    T: rkyv::Archive,
+    T::Archived: for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>
+        + rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>,
+{
+    let plain = open_bytes(dek, aad, text)?;
+    let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(plain.len());
+    aligned.extend_from_slice(&plain);
+    rkyv::from_bytes::<T, rkyv::rancor::Error>(&aligned).map_err(|_| SealError::Format)
+}
+
 fn seal_component(component: &mut ICalendarComponent, dek: &Secret, aad: &[u8]) -> bool {
     let mut removals = Removals {
         entries: Vec::new(),
@@ -224,12 +239,7 @@ fn unseal_component(
         return Ok(());
     };
     let text = entry_text(&carrier).ok_or(SealError::Format)?;
-    let plain = open_bytes(dek, aad, text)?;
-    // rkyv validates alignment; the decrypted bytes carry no guarantee.
-    let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(plain.len());
-    aligned.extend_from_slice(&plain);
-    let mut removals = rkyv::from_bytes::<Removals, rkyv::rancor::Error>(&aligned)
-        .map_err(|_| SealError::Format)?;
+    let mut removals = open_archive::<Removals>(dek, aad, text)?;
     // Entries first, ascending: each index refers to the original list, so
     // inserting in ascending order restores every original position.
     removals.entries.sort_by_key(|r| r.index);
