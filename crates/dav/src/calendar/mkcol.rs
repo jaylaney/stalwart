@@ -11,6 +11,7 @@ use crate::{
         ExtractETag,
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
+        za::ZeroAccessGate,
     },
 };
 use common::{Server, auth::AccessToken};
@@ -20,7 +21,10 @@ use dav_proto::{
 };
 use groupware::{
     cache::GroupwareCache,
-    calendar::{Calendar, CalendarPreferences},
+    calendar::{
+        Calendar, CalendarPreferences,
+        seal::{seal_calendar, seal_error},
+    },
 };
 use http_proto::HttpResponse;
 use hyper::StatusCode;
@@ -50,6 +54,7 @@ impl CalendarMkColRequestHandler for Server {
             .await?
             .into_owned_uri()?;
         let account_id = resource.account_id;
+        let za_keys = self.za_session_keys(access_token, account_id).await?;
         let name = resource
             .resource
             .ok_or(DavError::Code(StatusCode::FORBIDDEN))?;
@@ -120,6 +125,11 @@ impl CalendarMkColRequestHandler for Server {
             if headers.ret != Return::Minimal {
                 return_prop_stat = Some(prop_stat);
             }
+        }
+
+        if let Some(keys) = &za_keys {
+            seal_calendar(&mut calendar, keys, account_id)
+                .map_err(|err| seal_error(err, account_id, u32::MAX))?;
         }
 
         // Prepare write batch

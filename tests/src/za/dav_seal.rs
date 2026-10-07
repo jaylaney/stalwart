@@ -9,7 +9,10 @@ use crate::utils::{server::TestServer, webdav::DummyWebDavClient};
 use calcard::{Entry, Parser};
 use dav_proto::Depth;
 use dav_proto::schema::property::{DavProperty, WebDavProperty};
-use groupware::{cache::GroupwareCache, calendar::CalendarEvent};
+use groupware::{
+    cache::GroupwareCache,
+    calendar::{Calendar, CalendarEvent},
+};
 use hyper::StatusCode;
 use store::{
     ValueKey,
@@ -420,6 +423,340 @@ pub async fn test_reports(test: &mut TestServer) {
 
     test.wait_for_tasks().await;
     for path in [path, other] {
+        client
+            .request("DELETE", path, "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+}
+
+/// MKCALENDAR with the Apple `calendar-color` dead property; the helper in
+/// `utils/webdav.rs` does not declare the `C:` prefix for MKCOL bodies.
+fn mkcalendar_body(props: &[(&str, &str)]) -> String {
+    let mut body = concat!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>",
+        "<A:mkcalendar xmlns:D=\"DAV:\" xmlns:A=\"urn:ietf:params:xml:ns:caldav\" ",
+        "xmlns:C=\"http://calendarserver.org/ns/\"><D:set><D:prop>"
+    )
+    .to_string();
+    for (key, value) in props {
+        body.push_str(&format!("<{key}>{value}</{key}>"));
+    }
+    body.push_str("</D:prop></D:set></A:mkcalendar>");
+    body
+}
+
+pub async fn test_collections(test: &mut TestServer) {
+    println!("Running zero-access collection sealing tests...");
+    let name = "key1@example.com";
+    let id = test.account(name).id().document_id();
+    let client = DummyWebDavClient::new(id, name, STRONG, name);
+    let cal = "/dav/cal/key1%40example.com/work/";
+    let collection_canaries = [
+        "displayname-canary",
+        "coldesc-canary",
+        "#aabbcc-canary",
+        "tzname-canary",
+        "tzcomment-canary",
+    ];
+
+    client
+        .request(
+            "MKCALENDAR",
+            cal,
+            mkcalendar_body(&[
+                ("D:displayname", "Work displayname-canary"),
+                ("A:calendar-description", "coldesc-canary"),
+                ("C:calendar-color", "#aabbcc-canary"),
+            ]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let archive = raw_calendar(test, id, "work").await;
+    let raw = String::from_utf8_lossy(archive.as_bytes()).to_string();
+    assert!(raw.contains("$za$"), "no collection marker");
+    for canary in collection_canaries {
+        assert!(
+            !raw.contains(canary),
+            "{canary} leaked into the stored collection"
+        );
+    }
+    let stored = archive.unarchive::<Calendar>().unwrap();
+    assert_eq!(stored.name, "work", "slug visible");
+    let pref = stored.preferences(id);
+    assert!(pref.name.starts_with("$za$"));
+    assert!(pref.description.is_none());
+    assert!(stored.dead_properties.0.is_empty());
+    let props = client
+        .propfind(
+            cal,
+            [
+                "D:displayname",
+                "A:calendar-description",
+                "C:calendar-color",
+            ],
+        )
+        .await;
+    props
+        .properties(cal)
+        .get("D:displayname")
+        .with_values(["Work displayname-canary"]);
+    props
+        .properties(cal)
+        .get("A:calendar-description")
+        .with_values(["coldesc-canary"]);
+    props
+        .properties(cal)
+        .get("calendar-color")
+        .with_values(["#aabbcc-canary", "[xmlns]:http://calendarserver.org/ns/"]);
+
+    // Custom timezone: calculation rules visible, names and comments sealed,
+    // round trip intact.
+    let tz = crate::webdav::TEST_VTIMEZONE_1
+        .replace("Eastern Standard Time (US Canada)", "tzname-canary")
+        .replace(
+            "LAST-MODIFIED:19870101T000000Z\n",
+            "LAST-MODIFIED:19870101T000000Z\nX-LIC-LOCATION:America/New_York\n",
+        )
+        .replace(
+            "TZOFFSETTO:-0500\n",
+            "TZOFFSETTO:-0500\nCOMMENT:tzcomment-canary\n",
+        )
+        .replace('\n', "\r\n");
+    client
+        .proppatch(cal, [("A:calendar-timezone", tz.as_str())], [], [])
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    let archive = raw_calendar(test, id, "work").await;
+    let raw = String::from_utf8_lossy(archive.as_bytes()).to_string();
+    assert!(raw.contains("$za$"), "no collection marker");
+    for canary in collection_canaries {
+        assert!(
+            !raw.contains(canary),
+            "{canary} leaked into the stored collection"
+        );
+    }
+    let stored = archive.unarchive::<Calendar>().unwrap();
+    let groupware::calendar::ArchivedTimezone::Custom(stored_tz) =
+        &stored.preferences(id).time_zone
+    else {
+        panic!("custom timezone expected")
+    };
+    let dump = stored_tz.to_string();
+    assert!(
+        dump.contains("TZID:US-Eastern")
+            && dump.contains("TZOFFSETFROM:-0400")
+            && dump.contains("RRULE:")
+            && dump.contains("X-LIC-LOCATION:America/New_York")
+            && !dump.contains("COMMENT"),
+        "{dump}"
+    );
+    let back = client.propfind(cal, ["A:calendar-timezone"]).await;
+    let value = back
+        .properties(cal)
+        .get("A:calendar-timezone")
+        .value()
+        .to_string();
+    assert!(
+        value.contains("tzname-canary")
+            && value.contains("tzcomment-canary")
+            && value.contains("X-LIC-LOCATION:America/New_York")
+            && value.contains("TZID:US-Eastern")
+            && !value.contains("X-ZA-"),
+        "{value}"
+    );
+
+    // Clearing the last ordinary value keeps the timezone readable.
+    client
+        .proppatch(cal, [], ["A:calendar-description", "C:calendar-color"], [])
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    let back = client
+        .propfind(cal, ["A:calendar-timezone", "D:displayname"])
+        .await;
+    assert!(
+        back.properties(cal)
+            .get("A:calendar-timezone")
+            .value()
+            .contains("tzname-canary")
+    );
+    back.properties(cal)
+        .get("D:displayname")
+        .with_values(["Work displayname-canary"]);
+
+    // The server-created default calendar: plaintext until the owner first
+    // writes a property, sealed afterwards.
+    let default = "/dav/cal/key1%40example.com/default/";
+    let archive = raw_calendar(test, id, "default").await;
+    assert!(
+        !archive
+            .unarchive::<Calendar>()
+            .unwrap()
+            .preferences(id)
+            .name
+            .starts_with("$za$"),
+        "the default calendar starts in plaintext"
+    );
+    client
+        .proppatch(
+            default,
+            [("D:displayname", "Default displayname-canary")],
+            [],
+            [],
+        )
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    let archive = raw_calendar(test, id, "default").await;
+    assert!(
+        archive
+            .unarchive::<Calendar>()
+            .unwrap()
+            .preferences(id)
+            .name
+            .starts_with("$za$")
+    );
+    assert!(!String::from_utf8_lossy(archive.as_bytes()).contains("displayname-canary"));
+    client
+        .propfind(default, ["D:displayname"])
+        .await
+        .properties(default)
+        .get("D:displayname")
+        .with_values(["Default displayname-canary"]);
+
+    // Event PROPPATCH: display name and dead properties go into X-ZA-EXTRA.
+    let path = "/dav/cal/key1%40example.com/work/evt.ics";
+    client
+        .request_with_headers("PUT", path, [CONTENT_TYPE], EVENT)
+        .await
+        .with_status(StatusCode::CREATED);
+    client
+        .proppatch(
+            path,
+            [
+                ("D:displayname", "evtname-canary"),
+                ("C:za-dead", "dead-canary"),
+            ],
+            [],
+            [],
+        )
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    let (archive, _) = raw_event(test, id, "work/evt.ics").await;
+    let raw = String::from_utf8_lossy(archive.as_bytes()).to_string();
+    for canary in CANARIES.iter().chain(&["evtname-canary", "dead-canary"]) {
+        assert!(
+            !raw.contains(canary),
+            "{canary} leaked into the stored event"
+        );
+    }
+    let stored = archive.unarchive::<CalendarEvent>().unwrap();
+    assert!(stored.display_name.is_none() && stored.dead_properties.0.is_empty());
+    assert!(stored.data.event.to_string().contains("X-ZA-EXTRA:"));
+    let props = client.propfind(path, ["D:displayname", "C:za-dead"]).await;
+    props
+        .properties(path)
+        .get("D:displayname")
+        .with_values(["evtname-canary"]);
+    props
+        .properties(path)
+        .get("za-dead")
+        .with_values(["dead-canary", "[xmlns]:http://calendarserver.org/ns/"]);
+    let body = client
+        .request("GET", path, "")
+        .await
+        .with_status(StatusCode::OK)
+        .body
+        .unwrap();
+    assert!(
+        !body.contains("X-ZA-") && body.contains("summary-canary"),
+        "{body}"
+    );
+
+    // Collection COPY within the account: copied as stored, readable at the
+    // new id.
+    let copy = "/dav/cal/key1%40example.com/work-copy/";
+    test.wait_for_tasks().await;
+    client
+        .request_with_headers(
+            "COPY",
+            cal,
+            [("destination", copy), ("depth", "infinity")],
+            "",
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    client
+        .propfind(copy, ["D:displayname"])
+        .await
+        .properties(copy)
+        .get("D:displayname")
+        .with_values(["Work displayname-canary"]);
+    let body = client
+        .request("GET", "/dav/cal/key1%40example.com/work-copy/evt.ics", "")
+        .await
+        .with_status(StatusCode::OK)
+        .body
+        .unwrap();
+    assert!(body.contains("summary-canary"));
+
+    // A copied collection is editable: its bundle unseals and reseals.
+    client
+        .proppatch(copy, [("D:displayname", "stale-name")], [], [])
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    client
+        .propfind(copy, ["D:displayname"])
+        .await
+        .properties(copy)
+        .get("D:displayname")
+        .with_values(["stale-name"]);
+
+    // COPY over an existing collection (Overwrite: T): destination replaced,
+    // still readable. The destination holds no copy of the source's events:
+    // upstream answers 409 when it does, for any account (both batch updates
+    // hit the same event document).
+    let dest = "/dav/cal/key1%40example.com/work-dest/";
+    client
+        .request(
+            "MKCALENDAR",
+            dest,
+            mkcalendar_body(&[("D:displayname", "stale-name")]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    test.wait_for_tasks().await;
+    client
+        .request_with_headers(
+            "COPY",
+            cal,
+            [
+                ("destination", dest),
+                ("depth", "infinity"),
+                ("overwrite", "T"),
+            ],
+            "",
+        )
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    client
+        .propfind(dest, ["D:displayname"])
+        .await
+        .properties(dest)
+        .get("D:displayname")
+        .with_values(["Work displayname-canary"]);
+    let body = client
+        .request("GET", "/dav/cal/key1%40example.com/work-dest/evt.ics", "")
+        .await
+        .with_status(StatusCode::OK)
+        .body
+        .unwrap();
+    assert!(
+        body.contains("summary-canary") && !body.contains("X-ZA-"),
+        "{body}"
+    );
+
+    test.wait_for_tasks().await;
+    for path in [dest, copy, cal] {
         client
             .request("DELETE", path, "")
             .await
