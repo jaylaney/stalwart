@@ -121,14 +121,43 @@ pub async fn copy_move(test: &TestServer) {
     )
     .await
     .with_status(StatusCode::FORBIDDEN);
-
-    for path in [
-        "/dav/cal/john@example.com/other-copy/",
-        "/dav/cal/john@example.com/other/",
-        "/dav/cal/john@example.com/default/a.ics",
+    // Jane (key account, member of support) moves from her own calendar into
+    // the group: refused by the gate, not by permissions.
+    jane.request_with_headers(
+        "MOVE",
         "/dav/cal/jane@example.com/default/j.ics",
+        [("destination", "/dav/cal/support@example.com/default/j2.ics")],
+        "",
+    )
+    .await
+    .with_status(StatusCode::FORBIDDEN);
+    // From the group's calendar into Jane's account: refused too.
+    jane.request_with_headers(
+        "PUT",
+        "/dav/cal/support@example.com/default/g.ics",
+        [("content-type", "text/calendar")],
+        TEST_ICAL_2,
+    )
+    .await
+    .with_status(StatusCode::CREATED);
+    jane.request_with_headers(
+        "COPY",
+        "/dav/cal/support@example.com/default/g.ics",
+        [("destination", "/dav/cal/jane@example.com/default/g.ics")],
+        "",
+    )
+    .await
+    .with_status(StatusCode::FORBIDDEN);
+    jane.request("DELETE", "/dav/cal/support@example.com/default/g.ics", "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+
+    for (client, path) in [
+        (&john, "/dav/cal/john@example.com/other-copy/"),
+        (&john, "/dav/cal/john@example.com/other/"),
+        (&john, "/dav/cal/john@example.com/default/a.ics"),
+        (&jane, "/dav/cal/jane@example.com/default/j.ics"),
     ] {
-        let client = if path.contains("john") { &john } else { &jane };
         client
             .request("DELETE", path, "")
             .await
@@ -136,6 +165,8 @@ pub async fn copy_move(test: &TestServer) {
     }
     john.delete_default_containers().await;
     jane.delete_default_containers().await;
+    jane.delete_default_containers_by_account("support@example.com")
+        .await;
     test.assert_is_empty().await;
 }
 
@@ -151,12 +182,48 @@ pub async fn acl(test: &TestServer) {
         .await
         .with_status(StatusCode::FORBIDDEN);
     // A key account that is a group member reads the group's calendar (Review Focus 1).
+    jane.request_with_headers(
+        "PUT",
+        "/dav/cal/support@example.com/default/member.ics",
+        [("content-type", "text/calendar")],
+        TEST_ICAL_2,
+    )
+    .await
+    .with_status(StatusCode::CREATED);
+    let body = jane
+        .request("GET", "/dav/cal/support@example.com/default/member.ics", "")
+        .await
+        .with_status(StatusCode::OK)
+        .body
+        .unwrap();
+    assert!(body.contains("BEGIN:VEVENT"), "{body}");
+    let listing = jane
+        .request_with_headers(
+            "PROPFIND",
+            "/dav/cal/support@example.com/default/",
+            [("depth", "1")],
+            "",
+        )
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    assert!(
+        listing.hrefs().iter().any(|h| h.ends_with("member.ics")),
+        "{:?}",
+        listing.hrefs()
+    );
     jane.request("PROPFIND", "/dav/cal/support@example.com/", "")
         .await
         .with_status(StatusCode::MULTI_STATUS);
     john.request("PROPFIND", "/dav/cal/support@example.com/", "")
         .await
         .with_status(StatusCode::FORBIDDEN);
+    jane.request(
+        "DELETE",
+        "/dav/cal/support@example.com/default/member.ics",
+        "",
+    )
+    .await
+    .with_status(StatusCode::NO_CONTENT);
     john.delete_default_containers().await;
     jane.delete_default_containers().await;
     jane.delete_default_containers_by_account("support@example.com")
@@ -271,6 +338,7 @@ pub async fn scheduling(test: &TestServer) {
         )
         .await
         .with_status(StatusCode::MULTI_STATUS);
+    // hrefs() includes the collection itself, so 1 means nothing was delivered.
     assert_eq!(inbox.hrefs().len(), 1, "{:?}", inbox.hrefs());
     // The event is readable by its owner with attendees intact.
     let body = john
@@ -284,6 +352,17 @@ pub async fn scheduling(test: &TestServer) {
         .await
         .with_status(StatusCode::NO_CONTENT);
     test.wait_for_tasks().await;
+    // The CANCEL on DELETE must not be delivered either.
+    let inbox = jane
+        .request_with_headers(
+            "PROPFIND",
+            "/dav/itip/jane@example.com/inbox/",
+            [("depth", "1")],
+            "",
+        )
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    assert_eq!(inbox.hrefs().len(), 1, "{:?}", inbox.hrefs());
     john.delete_default_containers().await;
     jane.delete_default_containers().await;
     test.assert_is_empty().await;
