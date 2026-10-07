@@ -15,7 +15,7 @@ Every shell command that uses cargo must start with `export PATH="/opt/homebrew/
   - `webdav_tests`: upstream CalDAV/CardDAV suite. `ZA_KEY_ACCOUNTS=1` runs it with every user provisioned as a key account.
   - Others: `system_tests`, `imap_tests`, `jmap_tests`, `smtp_tests`, etc.
   - Upstream's `cal_itip` sub-test of `webdav_tests` is timing-flaky (DTSTAMP index mismatch, `tests/src/webdav/cal_itip.rs`); rerun once before treating a failure there as a regression.
-- rustfmt: `cargo fmt -p <crate> -- --check`. Workspace lints are strict; build output must stay warning-free for new code.
+- rustfmt: `cargo fmt -p <crate> -- --check`; for the http crate cargo rejects `-p http@0.16.25` for fmt, so use `cargo fmt --manifest-path crates/http/Cargo.toml -- --check`. Workspace lints are strict; build output must stay warning-free for new code.
 - Local manual run: scripts in the git-ignored `.run/` (`env.sh` shared settings). First boot is `start-recovery.sh` then `provision.sh`; afterwards `start.sh`. `--config` takes a JSON data-store file (`{"@type":"RocksDb","path":...}`); a missing file means web bootstrap mode. `STALWART_RECOVERY_ADMIN=user:pass` sets a fallback admin.
 
 ## Repository rules (AGENTS.md, CONTRIBUTING.md)
