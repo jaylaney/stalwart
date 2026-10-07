@@ -7,7 +7,7 @@
 - CalDAV suite (upstream, non-key accounts): `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests webdav_tests`
 - CalDAV suite against key accounts (added in plan 1, task 11): `STORE=RocksDb RUST_MIN_STACK=16777216 ZA_KEY_ACCOUNTS=1 cargo test -p tests webdav_tests`
 - Vault unit tests: `cargo test -p vault`
-- Leak regression test (plan 3): `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests zero_access_leak`
+- Leak regression test (plan 3): runs inside `za::za_tests` (`tests/src/za/leak.rs`); there is no separate test to select.
 - Upstream's `cal_itip` sub-test is timing-sensitive (DTSTAMP index mismatch when a second boundary falls between two iTIP operations); rerun once before treating a failure there as a regression.
 - The za suite (`za::za_tests`) now ends with the leak regression test (`tests/src/za/leak.rs`). On failure it panics with a list of violation lines, each `<where>: <what>`: `subspace 'X' key [...]: raw value contains <canary>` (a plaintext canary string found in a store key, raw value or decoded blob), `missing <prop>` or sealed-tree complaints (an unsealed or wrongly shaped iCalendar tree), and `display_name`/`dead_properties`/event-preferences not empty (plaintext fields on a sealed row). The subspace letter and key locate the record.
 - Full verification: `cargo test -p vault -p groupware -p common`, then `za::za_tests`, then `webdav::webdav_tests` in both modes.

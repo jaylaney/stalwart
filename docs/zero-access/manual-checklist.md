@@ -18,6 +18,7 @@ For each client:
 10. Change the password through the account page, reconnect the client with the new password.
 11. Log in with an app password; revoke it through the account page; confirm the client is refused.
 12. Enrol TOTP through the account page (the account page is where TOTP is enrolled and removed); confirm the client needs an app password; remove TOTP. A client with a cached session keeps working until its next authentication (spec 5), so reconnect the client before judging the result.
+13. Invite an attendee from the key account; confirm the client reports that the server does not send invitations (no auto-schedule) and that nothing is delivered to the attendee.
 
-Server-side, after the run: `cargo test -p tests za::za_tests` passes against the same build, and the admin
+Server-side, after the run: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests` passes against the same build, and the admin
 can read nothing meaningful in the stored records (spot-check with the leak scanner's output).
