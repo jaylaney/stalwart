@@ -8,7 +8,12 @@
 
 use super::{TEST_ICAL_1, TEST_ICAL_2};
 use crate::utils::server::TestServer;
+use calcard::common::timezone::Tz;
 use email::cache::MessageCacheFetch;
+use groupware::scheduling::{
+    ItipTime, ItipValue,
+    format::{DateStyle, TextFormatter},
+};
 use hyper::StatusCode;
 use mail_parser::{DateTime, MessageParser};
 use store::write::now;
@@ -235,6 +240,7 @@ pub async fn alarm(test: &TestServer) {
     println!("Running key-account alarm tests...");
     let account = test.account("john@example.com");
     let client = account.webdav_client();
+    let start = now() as i64 + 5;
     client
         .request_with_headers(
             "PUT",
@@ -242,7 +248,7 @@ pub async fn alarm(test: &TestServer) {
             [("content-type", "text/calendar; charset=utf-8")],
             super::cal_alarm::TEST_ALARM_1.replace(
                 "$START",
-                &DateTime::from_timestamp(now() as i64 + 5)
+                &DateTime::from_timestamp(start)
                     .to_rfc3339()
                     .replace(['-', ':'], ""),
             ),
@@ -256,6 +262,14 @@ pub async fn alarm(test: &TestServer) {
         .await
         .unwrap();
     assert_eq!(messages.emails.items.len(), 2);
+    // Spec 11: the generic email still carries the event's start time.
+    let start = TextFormatter::new("en").unwrap().field_to_string(
+        &ItipValue::Time(ItipTime {
+            start,
+            tz_id: Tz::UTC.as_id(),
+        }),
+        DateStyle::Short,
+    );
     for message in messages.emails.items.iter() {
         let contents = test
             .fetch_email(client.account_id, message.document_id)
@@ -267,6 +281,8 @@ pub async fn alarm(test: &TestServer) {
             .and_then(|a| a.address())
             .unwrap_or_default()
             .to_string();
+        // External alarm recipients are allowed on this server (key mode),
+        // so only the key-account override keeps the VALARM ATTENDEE out.
         assert_eq!(
             to, "john@example.com",
             "recipient is the account address, not the alarm attendee"
@@ -286,6 +302,7 @@ pub async fn alarm(test: &TestServer) {
             ),
             "{html}"
         );
+        assert!(text.contains(&start), "{start} missing from: {text}");
         for canary in [
             "See the pretty girl",
             "What mirror where",

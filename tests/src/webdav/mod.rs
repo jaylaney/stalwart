@@ -174,6 +174,9 @@ pub async fn webdav_tests() {
     admin
         .registry_create_object(CalendarAlarm {
             min_trigger_interval: 1000u64.into(),
+            // Key mode: with external alarm recipients allowed, only the
+            // key-account override keeps alarm email at the account address.
+            allow_external_rcpts: key_accounts_mode(),
             ..Default::default()
         })
         .await;
