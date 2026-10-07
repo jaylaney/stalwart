@@ -21,10 +21,7 @@ use crate::{
         query::{serialize_vcard_with_props, vcard_query},
     },
     common::{
-        DavQueryResource,
-        acl::current_user_privilege_set,
-        uri::DavUriResource,
-        za::{ZeroAccessGate, za_calendar_view, za_event_view},
+        DavQueryResource, acl::current_user_privilege_set, uri::DavUriResource, za::za_archive_view,
     },
     file::{FILE_CONTAINER_PROPS, FILE_ITEM_PROPS},
     principal::{
@@ -462,17 +459,15 @@ impl PropFindRequestHandler for Server {
                 // Spec 8.2: key-account calendar content is unsealed before any
                 // use; the view keeps the stored version, so `archive_.etag()`
                 // stays bound to the stored bytes. One failure fails one item.
-                let view = match collection {
-                    Collection::Calendar => {
-                        let keys = self.za_session_keys(access_token, account_id).await?;
-                        za_calendar_view(&stored_, keys.as_ref(), account_id, document_id)
-                    }
-                    Collection::CalendarEvent => {
-                        let keys = self.za_session_keys(access_token, account_id).await?;
-                        za_event_view(&stored_, keys.as_ref(), account_id, document_id)
-                    }
-                    _ => Ok(Cow::Borrowed(&stored_)),
-                };
+                let view = za_archive_view(
+                    self,
+                    access_token,
+                    account_id,
+                    document_id,
+                    collection,
+                    &stored_,
+                )
+                .await?;
                 archive_ = match view {
                     Ok(archive) => archive,
                     Err(err) => {

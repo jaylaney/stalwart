@@ -80,7 +80,7 @@ impl std::error::Error for SealError {}
 pub fn seal_error(err: SealError, account_id: u32, document_id: u32) -> trc::Error {
     trc::StoreEvent::DataCorruption
         .into_err()
-        .details(format!("zero-access unseal failed: {err}"))
+        .details(format!("zero-access sealing error: {err}"))
         .account_id(account_id)
         .document_id(document_id)
         .caused_by(trc::location!())

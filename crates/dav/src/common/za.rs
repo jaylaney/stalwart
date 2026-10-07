@@ -11,6 +11,7 @@ use hyper::StatusCode;
 use std::{borrow::Cow, future::Future, sync::Arc};
 use store::write::{AlignedBytes, Archive};
 use trc::AddContext;
+use types::collection::Collection;
 use vault::session::SessionKeys;
 
 /// What a free-busy computation may read from an account (ruling R6).
@@ -151,6 +152,31 @@ pub(crate) fn za_calendar_view<'x>(
             .map_err(|err| seal_error(err, account_id, document_id)),
         None => Ok(Cow::Borrowed(stored)),
     }
+}
+
+/// The PROPFIND loader's per-item view: only calendar collections and events
+/// consult the gate (outer `Err` is the 403 that fails the request); an
+/// unseal failure (inner `Err`) fails one item. Other collections borrow the
+/// stored archive with no lookup.
+pub(crate) async fn za_archive_view<'x>(
+    server: &Server,
+    access_token: &AccessToken,
+    account_id: u32,
+    document_id: u32,
+    collection: Collection,
+    stored: &'x Archive<AlignedBytes>,
+) -> crate::Result<trc::Result<Cow<'x, Archive<AlignedBytes>>>> {
+    Ok(match collection {
+        Collection::Calendar => {
+            let keys = server.za_session_keys(access_token, account_id).await?;
+            za_calendar_view(stored, keys.as_ref(), account_id, document_id)
+        }
+        Collection::CalendarEvent => {
+            let keys = server.za_session_keys(access_token, account_id).await?;
+            za_event_view(stored, keys.as_ref(), account_id, document_id)
+        }
+        _ => Ok(Cow::Borrowed(stored)),
+    })
 }
 
 async fn is_key_account(server: &Server, account_id: u32) -> crate::Result<bool> {

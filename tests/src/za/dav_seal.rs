@@ -158,6 +158,25 @@ pub async fn test(test: &mut TestServer) {
         .await
         .with_status(StatusCode::OK);
     assert_eq!(got.etag(), etag1);
+
+    // PROPFIND getetag is the PUT's (and GET's) ETag: bound to the stored bytes.
+    let propfind = client
+        .request_with_headers(
+            "PROPFIND",
+            path,
+            [("depth", "0")],
+            "<?xml version=\"1.0\"?><D:propfind xmlns:D=\"DAV:\"><D:prop><D:getetag/></D:prop></D:propfind>",
+        )
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .body
+        .unwrap();
+    let bare = etag1.trim_matches('"');
+    assert!(
+        propfind.contains(&format!("getetag>\"{bare}\"<"))
+            || propfind.contains(&format!("getetag>&quot;{bare}&quot;<")),
+        "PROPFIND getetag differs from PUT ETag {etag1}: {propfind}"
+    );
     let body = got.body.clone().unwrap();
     assert!(!body.contains("X-ZA-"), "{body}");
     for canary in CANARIES {
