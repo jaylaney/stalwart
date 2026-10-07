@@ -12,6 +12,7 @@ use crate::{
         ETag, ExtractETag,
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
+        za::ZeroAccessGate,
     },
     file::DavFileResource,
     fix_percent_encoding,
@@ -28,7 +29,11 @@ use dav_proto::{
 };
 use groupware::{
     cache::GroupwareCache,
-    calendar::{CalendarEvent, CalendarEventData, itip::ItipSendStatus},
+    calendar::{
+        CalendarEvent, CalendarEventData,
+        itip::ItipSendStatus,
+        seal::{seal_error, seal_event, unseal_event_archive},
+    },
     scheduling::{
         ItipMessages, event_create::itip_create, event_update::itip_update,
         itip::itip_set_unreachable_status,
@@ -72,6 +77,7 @@ impl CalendarUpdateRequestHandler for Server {
             .await?
             .into_owned_uri()?;
         let account_id = resource.account_id;
+        let za_keys = self.za_session_keys(access_token, account_id).await?;
         let resources = self
             .fetch_dav_resources(
                 access_token.account_id(),
@@ -148,6 +154,21 @@ impl CalendarUpdateRequestHandler for Server {
             let event = event_
                 .to_unarchived::<CalendarEvent>()
                 .caused_by(trc::location!())?;
+            // Spec 8.1: the stored sealed archive stays `current` for the
+            // index builder; the unsealed view is used for comparison, editing
+            // and response bodies only.
+            let view_;
+            let view = if let Some(keys) = &za_keys {
+                view_ = unseal_event_archive(&event_, keys, account_id)
+                    .map_err(|err| seal_error(err, account_id, document_id))?;
+                view_
+                    .to_unarchived::<CalendarEvent>()
+                    .caused_by(trc::location!())?
+            } else {
+                event_
+                    .to_unarchived::<CalendarEvent>()
+                    .caused_by(trc::location!())?
+            };
 
             // Validate headers
             match self
@@ -178,12 +199,12 @@ impl CalendarUpdateRequestHandler for Server {
                             Rfc1123DateTime::new(i64::from(event.inner.modified)).to_string(),
                         )
                         .with_header("Preference-Applied", "return=representation")
-                        .with_binary_body(event.inner.data.event.to_string()));
+                        .with_binary_body(view.inner.data.event.to_string()));
                 }
                 Err(e) => return Err(e),
             }
 
-            if ical == event.inner.data.event {
+            if ical == view.inner.data.event {
                 // No changes, return existing event
                 return Ok(HttpResponse::new(StatusCode::NO_CONTENT));
             }
@@ -210,7 +231,7 @@ impl CalendarUpdateRequestHandler for Server {
 
             // Build event
             let mut next_email_alarm = None;
-            let mut new_event = event
+            let mut new_event = view
                 .deserialize::<CalendarEvent>()
                 .caused_by(trc::location!())?;
             let old_ical = new_event.data.event;
@@ -311,6 +332,11 @@ impl CalendarUpdateRequestHandler for Server {
             if extra_bytes > 0 {
                 self.has_available_quota(self.account(account_id).await?.as_ref(), extra_bytes)
                     .await?;
+            }
+
+            if let Some(keys) = &za_keys {
+                seal_event(&mut new_event, keys, account_id)
+                    .map_err(|err| seal_error(err, account_id, document_id))?;
             }
 
             // Prepare write batch
@@ -462,6 +488,11 @@ impl CalendarUpdateRequestHandler for Server {
                     bytes.len() as u64,
                 )
                 .await?;
+            }
+
+            if let Some(keys) = &za_keys {
+                seal_event(&mut event, keys, account_id)
+                    .map_err(|err| seal_error(err, account_id, u32::MAX))?;
             }
 
             // Prepare write batch

@@ -16,6 +16,7 @@ pub mod app_password;
 pub mod caches;
 pub mod cors;
 pub mod dav_gate;
+pub mod dav_seal;
 pub mod disabled;
 pub mod password;
 pub mod registry;
@@ -87,6 +88,7 @@ pub async fn za_tests() {
     cors::test(&mut test).await;
     caches::test(&mut test).await;
     dav_gate::test(&mut test).await;
+    dav_seal::test(&mut test).await;
 
     destroy_key_accounts(&test).await;
     test.assert_is_empty().await;
