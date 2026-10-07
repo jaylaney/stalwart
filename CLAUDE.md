@@ -66,7 +66,7 @@ Invariants (spec section 12):
 - Sealing never adds, removes or reorders iCalendar components; visibility is an allowlist; the index builder only sees the stored sealed archive.
 - Keep the fork diff narrow: new modules plus one-line call insertions at existing sites. Merge hotspots with upstream are `http/src/auth/authenticate.rs` and `common/src/auth/authentication.rs`.
 
-Status: plan 1 (accounts) is done at `98883a42` and plan 2 (sealing) at `ac0bcdca`; read `docs/superpowers/plans/2026-10-06-zero-access-plan2-outcome.md` before plan 3 (gating, `...-3-gating.md`), which is next. The outcome notes list deferred findings, decisions awaiting Jay's confirmation (spec revision 6 candidates), and facts for plan 3. The key-account web page (product name Circulo) lives in a separate repository, `~/Development/circulo-account` (`jaylaney/circulo-account`); its endpoint contract is `docs/api.md` there.
+Status: all three plans are done: plan 1 (accounts) at `98883a42`, plan 2 (sealing) at `ac0bcdca`, plan 3 (gating) at `fde504f3`. Read `docs/superpowers/plans/2026-10-06-zero-access-plan3-outcome.md` before touching fork code; it lists the gate inventory, deferred findings, decisions awaiting Jay's confirmation (spec revision 7 candidates) and the merge hotspots. The za suite ends with the leak regression test (`tests/src/za/leak.rs`); key-mode `webdav_tests` runs the variants in `tests/src/webdav/za_variants.rs`; CI job `zero-access` runs the vault/groupware units, `za_tests` and both `webdav_tests` modes. The key-account web page (product name Circulo) lives in a separate repository, `~/Development/circulo-account` (`jaylaney/circulo-account`); its endpoint contract is `docs/api.md` there.
 
 ## Working conventions
 
