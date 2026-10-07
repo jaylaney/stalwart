@@ -244,6 +244,14 @@ fn za_argon2_params() -> Argon2Params {
     }
 }
 
+/// True for `/api/vault` and every path below it: the responses whose
+/// allowed origin is the account page's (spec 4.1, invariant 9).
+pub fn za_is_vault_path(path: &str) -> bool {
+    let mut segments = path.split('/');
+    segments.next();
+    segments.next() == Some("api") && segments.next() == Some("vault")
+}
+
 /// CORS preflight on `/api/vault/*` (spec 4.1). Without a configured
 /// account-page origin this is upstream's bare 204.
 pub fn za_cors_preflight(origin: Option<&HeaderValue>) -> HttpResponse {
@@ -1399,6 +1407,23 @@ mod tests {
             .headers()
             .and_then(|headers| headers.get(name))
             .map(|value| value.to_str().unwrap())
+    }
+
+    #[test]
+    fn vault_paths() {
+        for path in ["/api/vault", "/api/vault/", "/api/vault/password"] {
+            assert!(za_is_vault_path(path), "{path}");
+        }
+        for path in [
+            "/",
+            "/api",
+            "/api/auth",
+            "/api/vaults/x",
+            "/x/api/vault",
+            "/vault",
+        ] {
+            assert!(!za_is_vault_path(path), "{path}");
+        }
     }
 
     #[test]

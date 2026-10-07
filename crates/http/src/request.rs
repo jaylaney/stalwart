@@ -8,7 +8,7 @@ use crate::{
     HttpSessionManager,
     api::{
         AuthChallenge, ManagementApi, ToManageHttpResponse,
-        vault::{za_cors_preflight, za_with_cors},
+        vault::{za_cors_preflight, za_is_vault_path, za_with_cors},
     },
     auth::{
         authenticate::{Authenticator, HttpHeaders},
@@ -481,7 +481,7 @@ impl ParseHttp for Server {
             // SPDX-SnippetEnd
             "api" => {
                 // Zero-access account API: CORS for the account page only (spec 4.1).
-                let za_origin = if req.uri().path().split('/').nth(2) == Some("vault") {
+                let za_origin = if za_is_vault_path(req.uri().path()) {
                     self.inner.cache.za_account_page_origin()
                 } else {
                     None
@@ -843,6 +843,9 @@ async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionDat
                         );
                     }
 
+                    // Vault responses keep their own allowed origin (below).
+                    let is_vault_path = za_is_vault_path(req.uri().path());
+
                     // Parse HTTP request
                     let response = match Box::pin(server.parse_http_request(
                         req,
@@ -889,10 +892,11 @@ async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionDat
                         let headers = response.headers_mut();
 
                         for (header, value) in &server.core.network.http.response_headers {
-                            // A response that names its allowed origin keeps
-                            // it: the vault API allows only the account page
-                            // (spec 4.1); elsewhere it is already `*`.
-                            if header == hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN
+                            // The vault API allows only the account page
+                            // (spec 4.1, invariant 9); every other response
+                            // takes the operator's value, as upstream.
+                            if is_vault_path
+                                && header == hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN
                                 && headers.contains_key(header)
                             {
                                 continue;

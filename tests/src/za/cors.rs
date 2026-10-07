@@ -11,6 +11,7 @@ use hyper::header::{self, HeaderValue};
 use reqwest::{Method, Response};
 use serde_json::json;
 use std::time::Duration;
+use utils::map::vec_map::VecMap;
 
 async fn send(method: Method, path: &str, body: Option<Vec<u8>>) -> Response {
     let mut request = reqwest::Client::builder()
@@ -165,6 +166,56 @@ pub async fn test(test: &mut TestServer) {
                 Some("*"),
                 "permissive CORS is on"
             );
+            let response = send(Method::OPTIONS, "/api/vault/password", None).await;
+            assert_allows_origin(&response);
+            let response = send(
+                Method::POST,
+                "/api/vault/recovery-key",
+                Some(b"not json".to_vec()),
+            )
+            .await;
+            assert_eq!(response.status().as_u16(), 400);
+            assert_allows_origin(&response);
+        }
+    }
+
+    // An operator-set `Access-Control-Allow-Origin` still replaces every
+    // other response's value, as upstream, including endpoints that set
+    // `*` themselves; only vault responses keep the account page.
+    const OPERATOR_ORIGIN: &str = "https://operator.example.com";
+    for headers in [
+        VecMap::from_iter([(
+            "Access-Control-Allow-Origin".to_string(),
+            OPERATOR_ORIGIN.to_string(),
+        )]),
+        VecMap::new(),
+    ] {
+        let enabled = !headers.is_empty();
+        admin
+            .registry_update_setting(
+                Http {
+                    response_headers: headers,
+                    ..Default::default()
+                },
+                &[Property::ResponseHeaders],
+            )
+            .await;
+        admin.reload_settings().await;
+        if enabled {
+            for (method, path) in [
+                (Method::OPTIONS, "/api/auth"),
+                (Method::POST, "/api/auth"),
+                (Method::OPTIONS, "/.well-known/openid-configuration"),
+            ] {
+                let response = send(method, path, None).await;
+                assert_eq!(
+                    header_of(&response, header::ACCESS_CONTROL_ALLOW_ORIGIN),
+                    Some(OPERATOR_ORIGIN),
+                    "{path}: {} {:?}",
+                    response.status(),
+                    response.headers()
+                );
+            }
             let response = send(Method::OPTIONS, "/api/vault/password", None).await;
             assert_allows_origin(&response);
             let response = send(
