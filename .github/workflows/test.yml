@@ -60,6 +60,25 @@ jobs:
       - name: JMAP Tests
         run: cargo test -p tests jmap -- --nocapture
 
+  zero-access:
+    name: Zero-access Test
+    needs: style
+    runs-on: ubuntu-latest
+
+    env:
+      STORE: RocksDb
+      RUST_MIN_STACK: "16777216"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Vault and Groupware Unit Tests
+        run: cargo test -p vault -p groupware -- --nocapture
+
       - name: Zero-access Tests
         run: cargo test -p tests za::za_tests -- --nocapture
 
