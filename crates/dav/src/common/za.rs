@@ -6,10 +6,23 @@
 
 use crate::{DavError, DavResourceName};
 use common::{Server, auth::AccessToken};
+use groupware::calendar::seal::{seal_error, unseal_calendar_archive, unseal_event_archive};
 use hyper::StatusCode;
-use std::{future::Future, sync::Arc};
+use std::{borrow::Cow, future::Future, sync::Arc};
+use store::write::{AlignedBytes, Archive};
 use trc::AddContext;
 use vault::session::SessionKeys;
+
+/// What a free-busy computation may read from an account (ruling R6).
+pub(crate) enum ZaFreeBusy {
+    /// Not a key account: the upstream path.
+    Plain,
+    /// A key account whose keys this session holds: read unsealed events.
+    Unsealed(Arc<SessionKeys>),
+    /// A key account whose keys this session does not hold: report no busy
+    /// periods, so nothing of the account is disclosed.
+    Withheld,
+}
 
 pub(crate) trait ZeroAccessGate: Sync + Send {
     /// `None` for a non-key account (unchanged upstream path). For a key
@@ -19,6 +32,14 @@ pub(crate) trait ZeroAccessGate: Sync + Send {
         access_token: &AccessToken,
         account_id: u32,
     ) -> impl Future<Output = crate::Result<Option<Arc<SessionKeys>>>> + Send;
+
+    /// Ruling R6: like `za_session_keys`, but a key account without its
+    /// keys yields `Withheld` instead of 403.
+    fn za_freebusy_access(
+        &self,
+        access_token: &AccessToken,
+        account_id: u32,
+    ) -> impl Future<Output = crate::Result<ZaFreeBusy>> + Send;
 
     /// Spec 8.1: a calendar COPY or MOVE across accounts is refused (403)
     /// when either side is a key account.
@@ -52,6 +73,20 @@ impl ZeroAccessGate for Server {
         }
     }
 
+    async fn za_freebusy_access(
+        &self,
+        access_token: &AccessToken,
+        account_id: u32,
+    ) -> crate::Result<ZaFreeBusy> {
+        if !is_key_account(self, account_id).await? {
+            return Ok(ZaFreeBusy::Plain);
+        }
+        Ok(match access_token.za_keys_for(account_id) {
+            Some(keys) => ZaFreeBusy::Unsealed(keys.clone()),
+            None => ZaFreeBusy::Withheld,
+        })
+    }
+
     async fn za_refuse_cross_account(
         &self,
         from_account_id: u32,
@@ -82,6 +117,39 @@ pub(crate) fn za_calendar_report_uri(resource: DavResourceName) -> crate::Result
         Ok(())
     } else {
         Err(DavError::Code(StatusCode::METHOD_NOT_ALLOWED))
+    }
+}
+
+/// Spec 7.3: the content view of a stored event. Without keys (a non-key
+/// account) the stored archive is returned as is. The view keeps the stored
+/// `version`, so ETags stay bound to the stored bytes; it is read-only and
+/// never written back.
+pub(crate) fn za_event_view<'x>(
+    stored: &'x Archive<AlignedBytes>,
+    keys: Option<&Arc<SessionKeys>>,
+    account_id: u32,
+    document_id: u32,
+) -> trc::Result<Cow<'x, Archive<AlignedBytes>>> {
+    match keys {
+        Some(keys) => unseal_event_archive(stored, keys, account_id)
+            .map(Cow::Owned)
+            .map_err(|err| seal_error(err, account_id, document_id)),
+        None => Ok(Cow::Borrowed(stored)),
+    }
+}
+
+/// The collection counterpart of [`za_event_view`], same contract.
+pub(crate) fn za_calendar_view<'x>(
+    stored: &'x Archive<AlignedBytes>,
+    keys: Option<&Arc<SessionKeys>>,
+    account_id: u32,
+    document_id: u32,
+) -> trc::Result<Cow<'x, Archive<AlignedBytes>>> {
+    match keys {
+        Some(keys) => unseal_calendar_archive(stored, keys, account_id)
+            .map(Cow::Owned)
+            .map_err(|err| seal_error(err, account_id, document_id)),
+        None => Ok(Cow::Borrowed(stored)),
     }
 }
 

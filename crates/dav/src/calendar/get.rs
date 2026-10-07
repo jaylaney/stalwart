@@ -10,18 +10,12 @@ use crate::{
         ETag,
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
-        za::ZeroAccessGate,
+        za::{ZeroAccessGate, za_event_view},
     },
 };
 use common::{Server, auth::AccessToken};
 use dav_proto::{RequestHeaders, schema::property::Rfc1123DateTime};
-use groupware::{
-    cache::GroupwareCache,
-    calendar::{
-        CalendarEvent,
-        seal::{seal_error, unseal_event_archive},
-    },
-};
+use groupware::{cache::GroupwareCache, calendar::CalendarEvent};
 use http_proto::HttpResponse;
 use hyper::StatusCode;
 use store::{
@@ -99,18 +93,15 @@ impl CalendarGetRequestHandler for Server {
             .caused_by(trc::location!())?
             .ok_or(DavError::Code(StatusCode::NOT_FOUND))?;
         let etag = event_.etag();
-        let view_;
-        let event = if let Some(keys) = &za_keys {
-            view_ = unseal_event_archive(&event_, keys, account_id)
-                .map_err(|err| seal_error(err, account_id, resource.document_id()))?;
-            view_
-                .unarchive::<CalendarEvent>()
-                .caused_by(trc::location!())?
-        } else {
-            event_
-                .unarchive::<CalendarEvent>()
-                .caused_by(trc::location!())?
-        };
+        let view_ = za_event_view(
+            &event_,
+            za_keys.as_ref(),
+            account_id,
+            resource.document_id(),
+        )?;
+        let event = view_
+            .unarchive::<CalendarEvent>()
+            .caused_by(trc::location!())?;
 
         // Validate headers
         let schedule_tag = event.schedule_tag.as_ref().map(|tag| tag.to_native());

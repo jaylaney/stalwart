@@ -12,7 +12,7 @@ use crate::{
         ETag, ExtractETag,
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
-        za::ZeroAccessGate,
+        za::{ZeroAccessGate, za_event_view},
     },
     file::DavFileResource,
     fix_percent_encoding,
@@ -32,7 +32,7 @@ use groupware::{
     calendar::{
         CalendarEvent, CalendarEventData,
         itip::ItipSendStatus,
-        seal::{seal_error, seal_event, unseal_event_archive},
+        seal::{seal_error, seal_event},
     },
     scheduling::{
         ItipMessages, event_create::itip_create, event_update::itip_update,
@@ -157,18 +157,10 @@ impl CalendarUpdateRequestHandler for Server {
             // Spec 8.1: the stored sealed archive stays `current` for the
             // index builder; the unsealed view is used for comparison, editing
             // and response bodies only.
-            let view_;
-            let view = if let Some(keys) = &za_keys {
-                view_ = unseal_event_archive(&event_, keys, account_id)
-                    .map_err(|err| seal_error(err, account_id, document_id))?;
-                view_
-                    .to_unarchived::<CalendarEvent>()
-                    .caused_by(trc::location!())?
-            } else {
-                event_
-                    .to_unarchived::<CalendarEvent>()
-                    .caused_by(trc::location!())?
-            };
+            let view_ = za_event_view(&event_, za_keys.as_ref(), account_id, document_id)?;
+            let view = view_
+                .to_unarchived::<CalendarEvent>()
+                .caused_by(trc::location!())?;
 
             // Validate headers
             match self

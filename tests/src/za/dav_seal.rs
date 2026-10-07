@@ -7,6 +7,7 @@
 use super::STRONG;
 use crate::utils::{server::TestServer, webdav::DummyWebDavClient};
 use calcard::{Entry, Parser};
+use dav_proto::Depth;
 use dav_proto::schema::property::{DavProperty, WebDavProperty};
 use groupware::{cache::GroupwareCache, calendar::CalendarEvent};
 use hyper::StatusCode;
@@ -251,4 +252,177 @@ pub async fn test(test: &mut TestServer) {
         baseline,
         "quota returns to baseline after DELETE"
     );
+}
+
+pub async fn test_reports(test: &mut TestServer) {
+    println!("Running zero-access report tests...");
+    let name = "key1@example.com";
+    let id = test.account(name).id().document_id();
+    let client = DummyWebDavClient::new(id, name, STRONG, name);
+    let path = "/dav/cal/key1@example.com/default/report-1.ics";
+    let other = "/dav/cal/key1@example.com/default/report-2.ics";
+    client
+        .request_with_headers("PUT", path, [CONTENT_TYPE], EVENT)
+        .await
+        .with_status(StatusCode::CREATED);
+    client
+        .request_with_headers(
+            "PUT",
+            other,
+            [CONTENT_TYPE],
+            EVENT
+                .replace("za-event-1", "za-event-2")
+                .replace("summary-canary", "other-canary"),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+
+    // PROPFIND with calendar-data on the collection.
+    let response = client
+        .request_with_headers(
+            "PROPFIND",
+            "/dav/cal/key1@example.com/default/",
+            [("depth", "1")],
+            "<?xml version=\"1.0\"?><D:propfind xmlns:D=\"DAV:\" xmlns:A=\"urn:ietf:params:xml:ns:caldav\"><D:prop><D:getetag/><A:calendar-data/></D:prop></D:propfind>",
+        )
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    let body = response.body.clone().unwrap();
+    assert!(
+        body.contains("summary-canary") && !body.contains("X-ZA-"),
+        "{body}"
+    );
+
+    // calendar-query with a text match on a sealed property.
+    let query = "<?xml version=\"1.0\"?><A:calendar-query xmlns:D=\"DAV:\" xmlns:A=\"urn:ietf:params:xml:ns:caldav\"><D:prop><A:calendar-data/></D:prop><A:filter><A:comp-filter name=\"VCALENDAR\"><A:comp-filter name=\"VEVENT\"><A:prop-filter name=\"SUMMARY\"><A:text-match>summary-canary</A:text-match></A:prop-filter></A:comp-filter></A:comp-filter></A:filter></A:calendar-query>";
+    let body = client
+        .request_with_headers(
+            "REPORT",
+            "/dav/cal/key1@example.com/default/",
+            [("depth", "1")],
+            query,
+        )
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .body
+        .unwrap();
+    assert!(
+        body.contains("report-1.ics")
+            && !body.contains("report-2.ics")
+            && body.contains("location-canary")
+            && !body.contains("X-ZA-"),
+        "{body}"
+    );
+    let miss = query.replace("summary-canary", "no-such-summary");
+    let body = client
+        .request_with_headers(
+            "REPORT",
+            "/dav/cal/key1@example.com/default/",
+            [("depth", "1")],
+            miss,
+        )
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .body
+        .unwrap();
+    assert!(!body.contains("report-1.ics"), "{body}");
+
+    // multiget and sync-collection.
+    let body = client
+        .multiget_calendar("/dav/cal/key1@example.com/default/", &[path])
+        .await
+        .response
+        .body
+        .unwrap();
+    assert!(
+        body.contains("description-canary") && !body.contains("X-ZA-"),
+        "{body}"
+    );
+    let body = client
+        .sync_collection(
+            "/dav/cal/key1@example.com/default/",
+            "",
+            Depth::One,
+            None,
+            ["A:calendar-data"],
+        )
+        .await
+        .body
+        .unwrap();
+    assert!(
+        body.contains("summary-canary") && !body.contains("X-ZA-"),
+        "{body}"
+    );
+
+    // free-busy by the owner.
+    let fb = "<?xml version=\"1.0\"?><A:free-busy-query xmlns:A=\"urn:ietf:params:xml:ns:caldav\"><A:time-range start=\"20240101T000000Z\" end=\"20240103T000000Z\"/></A:free-busy-query>";
+    let body = client
+        .request("REPORT", "/dav/cal/key1@example.com/default/", fb)
+        .await
+        .with_status(StatusCode::OK)
+        .body
+        .unwrap();
+    assert!(
+        body.contains("FREEBUSY") && body.contains("20240102T080000Z/20240102T090000Z"),
+        "{body}"
+    );
+
+    // A corrupted stored record fails that one item with 500 and leaves the rest readable.
+    let (archive, document_id) = raw_event(test, id, "default/report-1.ics").await;
+    let mut broken = archive.deserialize::<CalendarEvent>().unwrap();
+    let root = &mut broken.data.event.components[0];
+    let last = root.entries.last_mut().unwrap();
+    last.values = vec![calcard::icalendar::ICalendarValue::Text("AQI=".into())];
+    let account_info = test.server.account_info(id).await.unwrap();
+    let mut batch = store::write::BatchBuilder::new();
+    broken
+        .update(
+            account_info.account_tenant_ids(),
+            archive.to_unarchived::<CalendarEvent>().unwrap(),
+            id,
+            document_id,
+            &mut batch,
+        )
+        .unwrap();
+    test.server.commit_batch(batch).await.unwrap();
+    client
+        .request("GET", path, "")
+        .await
+        .with_status(StatusCode::INTERNAL_SERVER_ERROR);
+    let body = client
+        .multiget_calendar("/dav/cal/key1@example.com/default/", &[path, other])
+        .await
+        .response
+        .body
+        .unwrap();
+    assert!(
+        body.contains("HTTP/1.1 500")
+            && body.contains("other-canary")
+            && !body.contains("summary-canary")
+            && !body.contains("X-ZA-"),
+        "{body}"
+    );
+    let body = client
+        .request_with_headers(
+            "PROPFIND",
+            "/dav/cal/key1@example.com/default/",
+            [("depth", "1")],
+            "<?xml version=\"1.0\"?><D:propfind xmlns:D=\"DAV:\" xmlns:A=\"urn:ietf:params:xml:ns:caldav\"><D:prop><D:getetag/><A:calendar-data/></D:prop></D:propfind>",
+        )
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .body
+        .unwrap();
+    assert!(
+        body.contains("HTTP/1.1 500") && body.contains("other-canary"),
+        "{body}"
+    );
+
+    test.wait_for_tasks().await;
+    for path in [path, other] {
+        client
+            .request("DELETE", path, "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
 }

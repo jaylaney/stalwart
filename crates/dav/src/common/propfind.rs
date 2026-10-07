@@ -20,7 +20,12 @@ use crate::{
         CARD_CONTAINER_PROPS, CARD_ITEM_PROPS,
         query::{serialize_vcard_with_props, vcard_query},
     },
-    common::{DavQueryResource, acl::current_user_privilege_set, uri::DavUriResource},
+    common::{
+        DavQueryResource,
+        acl::current_user_privilege_set,
+        uri::DavUriResource,
+        za::{ZeroAccessGate, za_calendar_view, za_event_view},
+    },
     file::{FILE_CONTAINER_PROPS, FILE_ITEM_PROPS},
     principal::{
         CurrentUserPrincipal,
@@ -57,7 +62,7 @@ use groupware::{
 use http_proto::HttpResponse;
 use hyper::StatusCode;
 use registry::schema::{enums::Permission, prelude::ObjectType};
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 use store::{
     ValueKey,
     registry::RegistryQuery,
@@ -436,9 +441,10 @@ impl PropFindRequestHandler for Server {
             };
 
             // Unarchive resource
+            let stored_;
             let archive_;
             let archive = if is_scheduling && item.is_container {
-                archive_ = Archive::default();
+                archive_ = Cow::Owned(Archive::default());
                 ArchivedResource::CalendarEventNotificationCollection(
                     item.document_id == SCHEDULE_INBOX_ID,
                 )
@@ -452,7 +458,32 @@ impl PropFindRequestHandler for Server {
                 .await
                 .caused_by(trc::location!())?
             {
-                archive_ = archive;
+                stored_ = archive;
+                // Spec 8.2: key-account calendar content is unsealed before any
+                // use; the view keeps the stored version, so `archive_.etag()`
+                // stays bound to the stored bytes. One failure fails one item.
+                let view = match collection {
+                    Collection::Calendar => {
+                        let keys = self.za_session_keys(access_token, account_id).await?;
+                        za_calendar_view(&stored_, keys.as_ref(), account_id, document_id)
+                    }
+                    Collection::CalendarEvent => {
+                        let keys = self.za_session_keys(access_token, account_id).await?;
+                        za_event_view(&stored_, keys.as_ref(), account_id, document_id)
+                    }
+                    _ => Ok(Cow::Borrowed(&stored_)),
+                };
+                archive_ = match view {
+                    Ok(archive) => archive,
+                    Err(err) => {
+                        trc::error!(err);
+                        response.add_response(Response::new_status(
+                            [item.name],
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                        ));
+                        continue;
+                    }
+                };
                 ArchivedResource::from_archive(&archive_, collection).caused_by(trc::location!())?
             } else {
                 response.add_response(Response::new_status([item.name], StatusCode::NOT_FOUND));
