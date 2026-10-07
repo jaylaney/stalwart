@@ -234,6 +234,56 @@ pub async fn test(test: &mut TestServer) {
         "{plain_session}"
     );
 
+    // Principal/get: a key account's principal advertises no calendars
+    // capability; a non-key account's does.
+    let response = plain
+        .jmap_method_call(
+            "Principal/get",
+            json!({
+                "accountId": plain.id_string(),
+                "ids": [key1.id_string(), plain.id_string()],
+                "properties": ["id", "accounts", "capabilities"],
+            }),
+        )
+        .await;
+    let principal = |id: &str| {
+        response
+            .list()
+            .iter()
+            .find(|principal| principal["id"] == id)
+            .unwrap_or_else(|| panic!("{id}: {:?}", response.0))
+            .clone()
+    };
+    let calendars = "urn:ietf:params:jmap:calendars";
+    let key_principal = principal(key1.id_string());
+    assert!(
+        key_principal["capabilities"].get(calendars).is_none(),
+        "{key_principal}"
+    );
+    assert!(
+        key_principal["accounts"][key1.id_string()]
+            .get(calendars)
+            .is_none(),
+        "{key_principal}"
+    );
+    assert!(
+        key_principal["accounts"][key1.id_string()]
+            .get("urn:ietf:params:jmap:contacts")
+            .is_some(),
+        "{key_principal}"
+    );
+    let plain_principal = principal(plain.id_string());
+    assert!(
+        plain_principal["capabilities"].get(calendars).is_some(),
+        "{plain_principal}"
+    );
+    assert!(
+        plain_principal["accounts"][plain.id_string()]
+            .get(calendars)
+            .is_some(),
+        "{plain_principal}"
+    );
+
     // JMAP calendar methods on the key account are refused.
     let key1_account = key1.id_string();
     for (method, args) in [
