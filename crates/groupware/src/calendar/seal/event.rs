@@ -16,13 +16,13 @@
 use super::{
     policy::POLICY_VERSION,
     tree::{
-        EXTRA_PROP, KEY_PROP, SealError, entry_text, is_carrier, open_archive, seal_bytes,
-        seal_tree, text_entry, unseal_tree,
+        EXTRA_PROP, KEY_PROP, SEALED_PROP, SealError, entry_text, is_carrier, open_archive,
+        seal_bytes, seal_tree, text_entry, unseal_tree,
     },
 };
 use crate::calendar::CalendarEvent;
 use base64::{Engine, engine::general_purpose::STANDARD};
-use calcard::icalendar::ICalendarComponentType;
+use calcard::icalendar::{ICalendar, ICalendarComponentType, ICalendarEntry, ICalendarProperty};
 use store::{
     Deserialize, Serialize,
     write::{AlignedBytes, Archive, Archiver},
@@ -72,7 +72,7 @@ fn uid_of(event: &CalendarEvent) -> String {
 }
 
 /// True if the VCALENDAR root's last entry is a key envelope.
-fn is_sealed(event: &CalendarEvent) -> bool {
+pub(crate) fn is_sealed(event: &CalendarEvent) -> bool {
     event
         .data
         .event
@@ -80,6 +80,25 @@ fn is_sealed(event: &CalendarEvent) -> bool {
         .first()
         .and_then(|root| root.entries.last())
         .is_some_and(|e| is_carrier(e, KEY_PROP))
+}
+
+fn is_za_entry(entry: &ICalendarEntry) -> bool {
+    matches!(&entry.name, ICalendarProperty::Other(n)
+        if n.len() > 5 && n.as_bytes()[..5].eq_ignore_ascii_case(b"X-ZA-"))
+}
+
+/// No `X-ZA-*` name is visible under the policy, so once the root's key
+/// envelope and extra bundle are removed, the only `X-ZA-*` entry a sealed
+/// tree may hold is each component's trailing `X-ZA-SEALED`. Anything else
+/// is a moved or reordered carrier.
+fn has_stray_carriers(ical: &ICalendar) -> bool {
+    ical.components.iter().any(|component| {
+        let entries = match component.entries.split_last() {
+            Some((last, rest)) if is_carrier(last, SEALED_PROP) => rest,
+            _ => component.entries.as_slice(),
+        };
+        entries.iter().any(is_za_entry)
+    })
 }
 
 /// Seals an event immediately before the store write (spec 8.1). Time
@@ -101,6 +120,9 @@ pub fn seal_event(
         .ok_or(SealError::Structure("empty tree"))?;
     if root.component_type != ICalendarComponentType::VCalendar {
         return Err(SealError::Structure("root is not VCALENDAR"));
+    }
+    if keys.account_id != account_id {
+        return Err(SealError::Structure("keys of another account"));
     }
     let uid = uid_of(event);
     let dek = Secret::random();
@@ -159,7 +181,11 @@ pub fn unseal_event(
         [version, ..] if *version != POLICY_VERSION => return Err(SealError::Policy(*version)),
         _ => return Err(SealError::Format),
     };
-    if let Some(carrier) = root.entries.pop_if(|e| is_carrier(e, EXTRA_PROP)) {
+    let extra = root.entries.pop_if(|e| is_carrier(e, EXTRA_PROP));
+    if has_stray_carriers(&event.data.event) {
+        return Err(SealError::Structure("misplaced carrier"));
+    }
+    if let Some(carrier) = extra {
         let extra = open_archive::<Extra>(
             &dek,
             &extra_aad(account_id, &uid),
@@ -176,6 +202,11 @@ pub fn unseal_event(
 ///
 /// Works on a deserialised copy that is dropped on any error, so the stored
 /// archive is never affected. A plaintext event yields a copy of `stored`.
+///
+/// The view is read-only: its `version` (including the integrity hash) is
+/// the stored one, but its bytes are plaintext. It must never be written
+/// back, passed to `into_inner()` for a write, or used as an update's
+/// "current" value (`AssertValue`); writes start from the stored archive.
 pub fn unseal_event_archive(
     stored: &Archive<AlignedBytes>,
     keys: &SessionKeys,
@@ -200,8 +231,8 @@ pub fn unseal_event_archive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calendar::{CalendarEvent, CalendarEventData, seal::tree::SEALED_PROP};
-    use calcard::{Entry, Parser, common::timezone::Tz};
+    use crate::calendar::{CalendarEvent, CalendarEventData};
+    use calcard::{Entry, Parser, common::timezone::Tz, icalendar::ICalendarValue};
     use store::{Serialize, write::Archiver};
     use types::dead_property::{DeadElementTag, DeadPropertyTag};
     use vault::keys::Secret;
@@ -270,6 +301,26 @@ mod tests {
         assert_eq!(back, original);
     }
 
+    fn root_entries(event: &mut CalendarEvent) -> &mut Vec<ICalendarEntry> {
+        &mut event.data.event.components[0].entries
+    }
+
+    fn dek_of(event: &CalendarEvent, keys: &SessionKeys) -> Secret {
+        let envelope = STANDARD
+            .decode(entry_text(event.data.event.components[0].entries.last().unwrap()).unwrap())
+            .unwrap();
+        unwrap_key(&envelope[2..], keys.ewk(), &key_aad(9, &uid_of(event))).unwrap()
+    }
+
+    fn with_envelope(sealed: &CalendarEvent, f: impl FnOnce(&mut Vec<u8>)) -> CalendarEvent {
+        let mut out = sealed.clone();
+        let last = root_entries(&mut out).last_mut().unwrap();
+        let mut envelope = STANDARD.decode(entry_text(last).unwrap()).unwrap();
+        f(&mut envelope);
+        last.values = vec![ICalendarValue::Text(STANDARD.encode(envelope))];
+        out
+    }
+
     #[test]
     fn every_write_gets_a_new_dek() {
         let keys = keys();
@@ -277,9 +328,95 @@ mod tests {
         let mut b = event();
         seal_event(&mut a, &keys, 9).unwrap();
         seal_event(&mut b, &keys, 9).unwrap();
-        assert_ne!(
-            a.data.event.components[0].entries.last(),
-            b.data.event.components[0].entries.last()
+        assert_ne!(dek_of(&a, &keys).as_bytes(), dek_of(&b, &keys).as_bytes());
+    }
+
+    #[test]
+    fn sealing_with_another_accounts_keys_is_refused() {
+        let mut e = event();
+        assert_eq!(
+            seal_event(&mut e, &SessionKeys::new(10, 1, Secret::random()), 9),
+            Err(SealError::Structure("keys of another account"))
+        );
+    }
+
+    #[test]
+    fn envelope_and_extra_errors() {
+        let keys = keys();
+        let mut sealed = event();
+        seal_event(&mut sealed, &keys, 9).unwrap();
+        let cases = [
+            (with_envelope(&sealed, |e| e[0] = 2), SealError::Policy(2)),
+            (with_envelope(&sealed, |e| e[1] = 2), SealError::Format),
+            (
+                with_envelope(&sealed, |e| {
+                    e.pop();
+                }),
+                SealError::Aead,
+            ),
+            (
+                {
+                    let mut t = sealed.clone();
+                    root_entries(&mut t).last_mut().unwrap().values =
+                        vec![ICalendarValue::Text("!!not base64!!".into())];
+                    t
+                },
+                SealError::Decode,
+            ),
+            (
+                {
+                    // EXTRA from another seal of the same event.
+                    let mut other = event();
+                    seal_event(&mut other, &keys, 9).unwrap();
+                    let mut t = sealed.clone();
+                    let n = root_entries(&mut t).len();
+                    root_entries(&mut t)[n - 2] = root_entries(&mut other)[n - 2].clone();
+                    assert!(is_carrier(&root_entries(&mut t)[n - 2], EXTRA_PROP));
+                    t
+                },
+                SealError::Aead,
+            ),
+        ];
+        for (mut input, expected) in cases {
+            assert_eq!(unseal_event(&mut input, &keys, 9), Err(expected));
+        }
+    }
+
+    #[test]
+    fn misplaced_carriers_are_refused() {
+        let keys = keys();
+        let mut sealed = event();
+        seal_event(&mut sealed, &keys, 9).unwrap();
+
+        // Root order [.., SEALED, EXTRA, KEY] swapped to [.., EXTRA, SEALED, KEY].
+        let mut swapped = sealed.clone();
+        let n = root_entries(&mut swapped).len();
+        root_entries(&mut swapped).swap(n - 3, n - 2);
+        assert!(is_carrier(&root_entries(&mut swapped)[n - 2], SEALED_PROP));
+        let stored = archive(&swapped);
+        assert_eq!(
+            unseal_event(&mut swapped, &keys, 9),
+            Err(SealError::Structure("misplaced carrier"))
+        );
+
+        // EXTRA moved into the VEVENT, ahead of that component's SEALED.
+        let mut moved = sealed.clone();
+        let n = root_entries(&mut moved).len();
+        let extra = root_entries(&mut moved).remove(n - 2);
+        let vevent = &mut moved.data.event.components[1].entries;
+        assert!(is_carrier(vevent.last().unwrap(), SEALED_PROP));
+        let at = vevent.len() - 1;
+        vevent.insert(at, extra);
+        assert_eq!(
+            unseal_event(&mut moved, &keys, 9),
+            Err(SealError::Structure("misplaced carrier"))
+        );
+
+        // The archive path refuses it too (`swapped` itself was consumed by
+        // the failed in-place unseal above, hence the copy taken before).
+        assert_eq!(
+            unseal_event_archive(&stored, &keys, 9).err(),
+            Some(SealError::Structure("misplaced carrier"))
         );
     }
 
