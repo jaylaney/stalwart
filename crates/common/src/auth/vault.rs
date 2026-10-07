@@ -229,6 +229,24 @@ pub enum ZaVerification {
     NoRecord,
 }
 
+/// Argon2 parameters for every new password. Stored in the record, so test
+/// builds use cheap parameters without affecting production records. Under
+/// the same feature as the startup warning that says so (`manager::boot`).
+pub fn za_argon2_params() -> Argon2Params {
+    #[cfg(feature = "test_mode")]
+    {
+        Argon2Params {
+            m_cost_kib: 1024,
+            t_cost: 1,
+            p_cost: 1,
+        }
+    }
+    #[cfg(not(feature = "test_mode"))]
+    {
+        Argon2Params::default()
+    }
+}
+
 /// Process-wide bound on concurrent Argon2 derivations. Each one allocates
 /// `m_cost_kib` (64 MiB with the production parameters), so the transient
 /// memory of key derivation is at most one such allocation per available

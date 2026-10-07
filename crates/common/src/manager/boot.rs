@@ -188,6 +188,24 @@ impl BootManager {
                     );
                 }
 
+                // Effective zero-access key cache settings (no secrets).
+                let za_keys = cache.za_keys.config();
+                trc::event!(
+                    Server(trc::ServerEvent::Startup),
+                    Details = "Zero-access key cache",
+                    Value = format!(
+                        "ZA_KEY_IDLE_SECS={} ZA_KEY_MAX_AGE_SECS={} ZA_KEY_MAX_ENTRIES={}",
+                        za_keys.idle.as_secs(),
+                        za_keys.max_age.as_secs(),
+                        za_keys.max_entries
+                    ),
+                );
+                #[cfg(feature = "test_mode")]
+                trc::event!(
+                    Registry(trc::RegistryEvent::BuildWarning),
+                    Details = "Built with test_mode: zero-access Argon2 parameters are weakened",
+                );
+
                 if core.storage.coordinator.is_enabled() {
                     trc::event!(
                         Cluster(trc::ClusterEvent::Startup),

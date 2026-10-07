@@ -12,9 +12,9 @@ use crate::auth::authenticate::Authenticator;
 use ::vault::{
     ZA_MARKER,
     keys::{
-        AAD_PASSWORD, AAD_PRIVATE_KEY, AAD_RECOVERY, Argon2Params, Secret, aad, app_aad,
-        derive_app_kek, derive_kek, derive_recovery_kek, derive_verifier_hash, generate_keypair,
-        unwrap_key, wrap_key,
+        AAD_PASSWORD, AAD_PRIVATE_KEY, AAD_RECOVERY, Secret, aad, app_aad, derive_app_kek,
+        derive_kek, derive_recovery_kek, derive_verifier_hash, generate_keypair, unwrap_key,
+        wrap_key,
     },
     record::{AppWrap, VaultRecord, VaultState, WrapState},
     recovery::RecoveryKey,
@@ -26,7 +26,7 @@ use common::{
     auth::{
         AuthRequest,
         credential::AppPassword,
-        vault::{VaultRead, za_derive_root},
+        vault::{VaultRead, za_argon2_params, za_derive_root},
     },
 };
 use directory::{
@@ -225,23 +225,6 @@ fn parse<T: serde::de::DeserializeOwned>(body: &[u8]) -> trc::Result<T> {
             err.column()
         ))
     })
-}
-
-/// Argon2 parameters for every new password. Stored in the record, so test
-/// builds use cheap parameters without affecting production records.
-fn za_argon2_params() -> Argon2Params {
-    #[cfg(feature = "test_mode")]
-    {
-        Argon2Params {
-            m_cost_kib: 1024,
-            t_cost: 1,
-            p_cost: 1,
-        }
-    }
-    #[cfg(not(feature = "test_mode"))]
-    {
-        Argon2Params::default()
-    }
 }
 
 /// True for `/api/vault` and every path below it: the responses whose
