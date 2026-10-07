@@ -270,10 +270,17 @@ impl ParseHttp for Server {
                     (Some(_), Some(DavMethod::OPTIONS)) => HttpResponse::new(StatusCode::OK)
                         .with_header(
                             "DAV",
-                            concat!(
-                                "1, 2, 3, access-control, extended-mkcol, calendar-access, ",
-                                "calendar-auto-schedule, calendar-no-timezone, addressbook"
-                            ),
+                            if za_is_key_account_request(self, &req, &session).await {
+                                concat!(
+                                    "1, 2, 3, access-control, extended-mkcol, calendar-access, ",
+                                    "calendar-no-timezone, addressbook"
+                                )
+                            } else {
+                                concat!(
+                                    "1, 2, 3, access-control, extended-mkcol, calendar-access, ",
+                                    "calendar-auto-schedule, calendar-no-timezone, addressbook"
+                                )
+                            },
                         )
                         .with_header(
                             "Allow",
@@ -956,6 +963,29 @@ impl SessionManager for HttpSessionManager {
             let _ = self.inner.ipc.push_tx.send(PushEvent::Stop).await;
         }
     }
+}
+
+/// Spec 9: a key account is not offered `calendar-auto-schedule` in the DAV
+/// OPTIONS header. Upstream answers OPTIONS without authenticating; credentials
+/// are checked only when present, and any failure or a non-key account keeps
+/// upstream's header (the error is not propagated).
+async fn za_is_key_account_request(
+    server: &Server,
+    req: &HttpRequest,
+    session: &HttpSessionData,
+) -> bool {
+    if !req.headers().contains_key(header::AUTHORIZATION) {
+        return false;
+    }
+    let Ok((_in_flight, access_token)) = server.authenticate_headers(req, session).await else {
+        return false;
+    };
+    server
+        .try_account(access_token.account_id())
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|account| account.is_key_account())
 }
 
 #[cfg(test)]

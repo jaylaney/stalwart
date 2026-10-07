@@ -18,10 +18,18 @@ pub async fn test(test: &TestServer) {
         .await
         .with_header(
             "dav",
-            concat!(
-                "1, 2, 3, access-control, extended-mkcol, calendar-access, ",
-                "calendar-auto-schedule, calendar-no-timezone, addressbook"
-            ),
+            if super::key_accounts_mode() {
+                // Auto-schedule is not advertised to a key account (spec 9).
+                concat!(
+                    "1, 2, 3, access-control, extended-mkcol, calendar-access, ",
+                    "calendar-no-timezone, addressbook"
+                )
+            } else {
+                concat!(
+                    "1, 2, 3, access-control, extended-mkcol, calendar-access, ",
+                    "calendar-auto-schedule, calendar-no-timezone, addressbook"
+                )
+            },
         )
         .with_header(
             "allow",

@@ -9,6 +9,7 @@ use crate::utils::{
     jmap::{JmapResponse, JmapUtils},
     server::TestServer,
     webdav::DummyWebDavClient,
+    za::SERVER_URL,
 };
 use common::auth::oauth::GrantType;
 use dav_proto::schema::property::{DavProperty, PrincipalProperty};
@@ -32,6 +33,16 @@ const OUTBOX_FREEBUSY: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN
 fn method_error(response: &JmapResponse) -> Option<&str> {
     let call = &response.0["methodResponses"][0];
     (call[0] == "error").then(|| call[1]["type"].as_str().unwrap_or_default())
+}
+
+/// The `DAV` header of an OPTIONS request on the calendar root.
+async fn dav_header(client: &DummyWebDavClient) -> String {
+    client
+        .request("OPTIONS", "/dav/cal/", "")
+        .await
+        .with_status(StatusCode::OK)
+        .header("dav")
+        .to_string()
 }
 
 pub async fn test(test: &mut TestServer) {
@@ -128,6 +139,29 @@ pub async fn test(test: &mut TestServer) {
             .with_status(StatusCode::OK)
             .is_not_empty();
     }
+
+    // DAV OPTIONS: calendar-auto-schedule is not advertised to a key
+    // account (spec 9); a non-key or anonymous request keeps upstream's header.
+    let key_dav = dav_header(&key_client).await;
+    assert!(key_dav.contains("calendar-access"), "{key_dav}");
+    assert!(!key_dav.contains("calendar-auto-schedule"), "{key_dav}");
+    let plain_dav = dav_header(&plain_client).await;
+    assert!(plain_dav.contains("calendar-auto-schedule"), "{plain_dav}");
+    let anonymous = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+        .request(reqwest::Method::OPTIONS, format!("{SERVER_URL}/dav/cal/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::OK);
+    let anonymous_dav = anonymous.headers()["dav"].to_str().unwrap();
+    assert!(
+        anonymous_dav.contains("calendar-auto-schedule"),
+        "{anonymous_dav}"
+    );
 
     // Scheduling outbox: a free-busy request naming a key account answers
     // 3.7 for that recipient.
