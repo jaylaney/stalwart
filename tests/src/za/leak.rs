@@ -63,7 +63,19 @@ const EXTRA_CANARIES: &[&str] = &[
     "todo-canary",
     "todo-description-canary",
     "negative-canary",
+    "sched-canary",
 ];
+
+/// A future invitation organized by the key account to a local non-key
+/// account: with iTIP gated it is stored sealed and nothing is sent.
+const SCHED_EVENT: &str = concat!(
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\n",
+    "UID:leak-sched\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990102T090000Z\r\n",
+    "DTEND:20990102T100000Z\r\nSUMMARY:sched-canary\r\n",
+    "ORGANIZER:mailto:key2@example.com\r\n",
+    "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:plain@example.com\r\n",
+    "END:VEVENT\r\nEND:VCALENDAR\r\n"
+);
 
 /// Archive marker bits (`store/src/write/serialize.rs`, private there).
 const ARCHIVE_MAGIC_MARKER: u8 = 1 << 7;
@@ -531,6 +543,24 @@ pub async fn test(test: &mut TestServer) {
         )
         .await
         .with_status(StatusCode::CREATED);
+    client
+        .request_with_headers(
+            "PUT",
+            "/dav/cal/key2%40example.com/leak/sched.ics",
+            [CONTENT_TYPE],
+            SCHED_EVENT,
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    // Scan before the task queue drains: a regression that turned iTIP back
+    // on for key accounts would leave the invitation's plaintext in the task
+    // or message queue here, and in the attendee's mail after delivery.
+    let pending = scan(test, id).await;
+    assert!(
+        pending.violations.is_empty(),
+        "leaks found before the task queue drained:\n{}",
+        pending.violations.join("\n")
+    );
     test.wait_for_tasks().await;
     client
         .request_with_headers(
@@ -577,6 +607,7 @@ pub async fn test(test: &mut TestServer) {
             "/dav/cal/key2%40example.com/leak-copy/e.ics",
             "xprop-canary",
         ),
+        ("/dav/cal/key2%40example.com/leak/sched.ics", "sched-canary"),
     ] {
         let body = client
             .request("GET", path, "")
@@ -607,12 +638,14 @@ pub async fn test(test: &mut TestServer) {
         "leaks found:\n{}",
         result.violations.join("\n")
     );
-    // Not blind: e.ics, t.ics and alarm.ics (an in-account collection COPY
-    // adds a name to each event document instead of duplicating it), both
-    // collections, and the alarm email.
-    assert!(result.events >= 3, "{result:?}");
+    // Not blind: e.ics, t.ics, alarm.ics and sched.ics (an in-account
+    // collection COPY adds a name to each event document instead of
+    // duplicating it), both collections, the alarm email, and its blob (a
+    // blob store split from the data store would leave none to scan).
+    assert!(result.events >= 4, "{result:?}");
     assert!(result.calendars >= 2, "{result:?}");
     assert!(result.emails >= 1, "the alarm email was not delivered");
+    assert!(result.blobs > 0, "no blob decoded: {result:?}");
     assert!(
         result.search_account_records > 0,
         "no search index entry of the account: the key layout is misread: {result:?}"
