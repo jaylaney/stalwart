@@ -118,6 +118,21 @@ impl CalendarCopyMoveRequestHandler for Server {
         let to_account_id = destination
             .account_id
             .ok_or(DavError::Code(StatusCode::BAD_GATEWAY))?;
+        // Spec 8.1: across accounts, refused when either side is a key account.
+        if to_account_id != from_account_id
+            && (self
+                .try_account(from_account_id)
+                .await
+                .caused_by(trc::location!())?
+                .is_some_and(|account| account.is_key_account())
+                || self
+                    .try_account(to_account_id)
+                    .await
+                    .caused_by(trc::location!())?
+                    .is_some_and(|account| account.is_key_account()))
+        {
+            return Err(DavError::Code(StatusCode::FORBIDDEN));
+        }
         let to_resources = if to_account_id == from_account_id {
             from_resources.clone()
         } else {
