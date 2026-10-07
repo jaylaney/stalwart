@@ -21,10 +21,6 @@ pub const ACCOUNT_PAGE_ORIGIN: &str = "https://account.example.com";
 
 #[tokio::test(flavor = "multi_thread")]
 pub async fn za_tests() {
-    // Read once when the server starts. SAFETY: set before this test builds
-    // its server and starts its runtime work; the variable is only read by
-    // server startup, and no test in this binary writes the environment.
-    unsafe { std::env::set_var("ZA_ACCOUNT_PAGE_ORIGIN", ACCOUNT_PAGE_ORIGIN) };
     let mut test = TestServerBuilder::new("za_tests")
         .await
         .with_default_listeners()

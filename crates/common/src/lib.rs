@@ -183,7 +183,8 @@ pub struct Caches {
     /// loader that saw it change since its read must not publish its value.
     pub account_epoch: AtomicU64,
     /// Origin of the account page, allowed by CORS on `/api/vault/*` (spec 4.1).
-    pub za_account_page_origin: Option<hyper::header::HeaderValue>,
+    /// Set from the environment at startup; only test builds change it.
+    za_account_page_origin: arc_swap::ArcSwapOption<hyper::header::HeaderValue>,
 
     pub messages: Cache<u32, Arc<MessageStoreCache>>,
     pub files: Cache<u32, Arc<DavResources>>,
@@ -285,6 +286,16 @@ impl Caches {
     /// Keyed BLAKE3 of the Authorization header value; usable only by this process.
     pub fn za_fingerprint(&self, token: &str) -> [u8; 32] {
         vault::keys::fingerprint(&self.za_fingerprint_key, token.as_bytes())
+    }
+
+    pub fn za_account_page_origin(&self) -> Option<Arc<hyper::header::HeaderValue>> {
+        self.za_account_page_origin.load_full()
+    }
+
+    /// Per-server override of `ZA_ACCOUNT_PAGE_ORIGIN` for tests.
+    #[cfg(feature = "test_mode")]
+    pub fn set_za_account_page_origin(&self, origin: Option<hyper::header::HeaderValue>) {
+        self.za_account_page_origin.store(origin.map(Arc::new));
     }
 }
 

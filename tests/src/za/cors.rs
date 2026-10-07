@@ -6,7 +6,8 @@
 
 use super::{ACCOUNT_PAGE_ORIGIN, STRONG};
 use crate::utils::{server::TestServer, za::SERVER_URL};
-use hyper::header;
+use ::registry::schema::{prelude::Property, structs::Http};
+use hyper::header::{self, HeaderValue};
 use reqwest::{Method, Response};
 use serde_json::json;
 use std::time::Duration;
@@ -45,11 +46,39 @@ fn assert_allows_origin(response: &Response) {
     assert_eq!(header_of(response, header::VARY), Some("Origin"));
 }
 
-/// CORS for the account page (spec 4.1). The suite sets
-/// `ZA_ACCOUNT_PAGE_ORIGIN` before the server starts; the unset case is
-/// covered by the `http` crate's unit tests.
+fn assert_no_cors(response: &Response) {
+    assert_eq!(
+        header_of(response, header::ACCESS_CONTROL_ALLOW_ORIGIN),
+        None,
+        "{} {:?}",
+        response.status(),
+        response.headers()
+    );
+    assert_eq!(header_of(response, header::VARY), None);
+}
+
+/// CORS for the account page (spec 4.1). The suite's server starts without
+/// `ZA_ACCOUNT_PAGE_ORIGIN`; the origin is then set on this server only.
 pub async fn test(test: &mut TestServer) {
     println!("Running zero-access CORS tests...");
+
+    // Unset: the vault API carries no CORS headers.
+    let response = send(Method::OPTIONS, "/api/vault/password", None).await;
+    assert_eq!(response.status().as_u16(), 204);
+    assert_no_cors(&response);
+    let response = send(
+        Method::POST,
+        "/api/vault/recovery-key",
+        Some(b"not json".to_vec()),
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 400);
+    assert_no_cors(&response);
+
+    test.server
+        .inner
+        .cache
+        .set_za_account_page_origin(Some(HeaderValue::from_static(ACCOUNT_PAGE_ORIGIN)));
 
     // Preflight on a vault path.
     let response = send(Method::OPTIONS, "/api/vault/password", None).await;
@@ -114,4 +143,40 @@ pub async fn test(test: &mut TestServer) {
         header_of(&response, header::ACCESS_CONTROL_ALLOW_ORIGIN),
         None
     );
+
+    // Permissive CORS adds `*` to every response, except where the vault
+    // API already allows the account page.
+    let admin = test.account("admin@example.com");
+    for enabled in [true, false] {
+        admin
+            .registry_update_setting(
+                Http {
+                    use_permissive_cors: enabled,
+                    ..Default::default()
+                },
+                &[Property::UsePermissiveCors],
+            )
+            .await;
+        admin.reload_settings().await;
+        if enabled {
+            let response = send(Method::OPTIONS, "/api/auth", None).await;
+            assert_eq!(
+                header_of(&response, header::ACCESS_CONTROL_ALLOW_ORIGIN),
+                Some("*"),
+                "permissive CORS is on"
+            );
+            let response = send(Method::OPTIONS, "/api/vault/password", None).await;
+            assert_allows_origin(&response);
+            let response = send(
+                Method::POST,
+                "/api/vault/recovery-key",
+                Some(b"not json".to_vec()),
+            )
+            .await;
+            assert_eq!(response.status().as_u16(), 400);
+            assert_allows_origin(&response);
+        }
+    }
+
+    test.server.inner.cache.set_za_account_page_origin(None);
 }

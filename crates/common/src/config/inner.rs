@@ -114,7 +114,9 @@ impl Caches {
             za_keys: vault::cache::KeyCache::new(vault::cache::KeyCacheConfig::from_env()),
             za_fingerprint_key: vault::Zeroizing::new(rand::random::<[u8; 32]>()),
             account_epoch: std::sync::atomic::AtomicU64::new(0),
-            za_account_page_origin: crate::auth::vault::za_account_page_origin_from_env(),
+            za_account_page_origin: arc_swap::ArcSwapOption::from_pointee(
+                crate::auth::vault::za_account_page_origin_from_env(),
+            ),
             messages: Cache::new_single_shard(
                 cache.messages,
                 (std::mem::size_of::<u32>()

@@ -1317,6 +1317,11 @@ async fn za_totp(
         Ok(read) => read,
         Err(response) => return Ok(response),
     };
+    if read.record.totp_url == otp_auth {
+        // Nothing to change (e.g. removal when not enrolled): no write, no
+        // generation bump, no cache drop.
+        return Ok(ok());
+    }
     let mut record = read.record.clone();
     record.totp_url = otp_auth;
     // Only on top of the verified generation (invariant 8); the commit

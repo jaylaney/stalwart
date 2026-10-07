@@ -474,14 +474,14 @@ impl ParseHttp for Server {
             "api" => {
                 // Zero-access account API: CORS for the account page only (spec 4.1).
                 let za_origin = if req.uri().path().split('/').nth(2) == Some("vault") {
-                    self.inner.cache.za_account_page_origin.as_ref()
+                    self.inner.cache.za_account_page_origin()
                 } else {
                     None
                 };
 
                 // Allow CORS preflight requests
                 if req.method() == Method::OPTIONS {
-                    return Ok(za_cors_preflight(za_origin));
+                    return Ok(za_cors_preflight(za_origin.as_deref()));
                 }
 
                 let response = match self.handle_api_request(&mut req, &session).await {
@@ -492,7 +492,7 @@ impl ParseHttp for Server {
                         response
                     }
                 };
-                return Ok(za_with_cors(response, za_origin));
+                return Ok(za_with_cors(response, za_origin.as_deref()));
             }
             "mail" => {
                 if req.method() == Method::GET
@@ -881,6 +881,14 @@ async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionDat
                         let headers = response.headers_mut();
 
                         for (header, value) in &server.core.network.http.response_headers {
+                            // A response that names its allowed origin keeps
+                            // it: the vault API allows only the account page
+                            // (spec 4.1); elsewhere it is already `*`.
+                            if header == hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN
+                                && headers.contains_key(header)
+                            {
+                                continue;
+                            }
                             headers.insert(header.clone(), value.clone());
                         }
                     }

@@ -158,22 +158,25 @@ pub async fn test(test: &mut TestServer) {
     )
     .await
     .expect(409);
-    // `otp_auth` is required (absent 400) and capped before parsing.
-    za_fail("totp", &json!({ "username": NAME, "password": STRONG }))
-        .await
-        .expect(400)
-        .assert_detail("otp_auth is required");
+    // `otp_auth` is required (absent 400) and capped before parsing, both
+    // checked before verification: a wrong password still gets the 400.
     let long = format!(
         "{url}&image=https://x.example/{}",
         "a".repeat(MAX_OTP_AUTH_URL)
     );
-    za_fail(
-        "totp",
-        &json!({ "username": NAME, "password": STRONG, "otp_auth": long }),
-    )
-    .await
-    .expect(400)
-    .assert_detail("at most 1024 bytes");
+    for password in [STRONG, "nope nope nope"] {
+        za_fail("totp", &json!({ "username": NAME, "password": password }))
+            .await
+            .expect(400)
+            .assert_detail("otp_auth is required");
+        za_fail(
+            "totp",
+            &json!({ "username": NAME, "password": password, "otp_auth": long }),
+        )
+        .await
+        .expect(400)
+        .assert_detail("at most 1024 bytes");
+    }
     for bad in [
         "",
         "garbage",
@@ -360,4 +363,15 @@ pub async fn test(test: &mut TestServer) {
     .expect(200);
     assert_eq!(registry_state(test).await, (None, registry_revision));
     caldav(STRONG, StatusCode::MULTI_STATUS).await;
+
+    // Removal when not enrolled changes nothing: no write.
+    let before = test.server.za_vault_record(id).await.unwrap().unwrap();
+    za_post(
+        "totp",
+        &json!({ "username": NAME, "password": STRONG, "otp_auth": null }),
+    )
+    .await
+    .expect(200);
+    let after = test.server.za_vault_record(id).await.unwrap().unwrap();
+    assert_eq!(after.record.revision, before.record.revision);
 }
