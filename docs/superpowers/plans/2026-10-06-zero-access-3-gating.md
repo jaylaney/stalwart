@@ -8,7 +8,7 @@
 
 **Tech Stack:** Stalwart `dav`, `jmap`, `groupware`, `services`, `email` crates; `tests` crate; `store` iteration API.
 
-**Spec:** `docs/superpowers/specs/2026-10-06-zero-access-calendar-design.md` (revision 4), sections 9, 10, 11 and invariants 4, 6, 9, 10. Plans 1 and 2 must be complete first.
+**Spec:** `docs/superpowers/specs/2026-10-06-zero-access-calendar-design.md` (revision 5), sections 9, 10, 11 and invariants 4, 6, 9, 10. Plans 1 and 2 must be complete first.
 
 ## Global Constraints
 

@@ -1,13 +1,18 @@
 # Zero-access calendar: design spec
 
-Date: 2026-10-06. Status: revision 4, for review. Scope: release 1 of the
+Date: 2026-10-06. Status: revision 5, approved. Scope: release 1 of the
 zero-access fork of Stalwart (`jaylaney/stalwart`, upstream
 `stalwartlabs/stalwart`, base commit 3f657330, Stalwart 0.16.25).
 
 Revision 2 incorporated the ten findings of the 2026-10-06 design review;
 revision 3 its seven follow-up findings and four clarifications; revision 4
 its two revision-3 findings and two clarifications
-(`2026-10-06-zero-access-calendar-design-review.md`).
+(`2026-10-06-zero-access-calendar-design-review.md`). Revision 5
+(2026-10-07) records the plan 1 outcome: the account API as built, in
+sections 4.1, 4.3, 5, 10 and 13, following the decisions in
+`../plans/2026-10-06-zero-access-plan1-outcome.md`. One item of 4.1 is not
+yet implemented and is scheduled for plan 2: the refusal of `setup` and
+`recover` for a disabled account or tenant.
 
 ## 1. Purpose
 
@@ -167,29 +172,44 @@ Stalwart code path unchanged.
 ### 4.1 Endpoints
 
 All under `/api/vault/`, JSON request and response, served by the existing
-HTTP server. CORS is allowed for the configured origin of the account page.
-The six user endpoints carry credentials in the request body so that a TOTP
-code can accompany the password (Stalwart's Basic decoder never carries one,
-and verification refuses a correct password without the code when TOTP is
-enabled). The one admin endpoint, `setup-token`, is the exception: it is
-authenticated by the `Authorization` header with a bearer token holding a
-new admin-only permission (name chosen in planning).
+HTTP server. The six user endpoints carry credentials in the request body
+so that a TOTP code can accompany the password (Stalwart's Basic decoder
+never carries one, and verification refuses a correct password without the
+code when TOTP is enabled). The one admin endpoint, `setup-token`, is the
+exception: it is authenticated by the standard `Authorization` header path
+(Basic or Bearer) and requires the existing `SysAccountUpdate` permission;
+no new permission is introduced. A tenant-bound caller can only target
+accounts of its own tenant, and any other account is reported as not found.
+
+CORS is driven by the environment variable `ZA_ACCOUNT_PAGE_ORIGIN`. When it
+is set, every `/api/vault/*` response and the `OPTIONS` preflight carry that
+value as the allowed origin, with `Vary: Origin`, regardless of the
+request's `Origin` header; the browser performs the comparison. The
+preflight allows `POST` and `OPTIONS` with the `Content-Type` and
+`Authorization` headers, and credentials are never allowed. When the
+variable is unset no CORS headers are sent. On vault responses the
+configured origin wins over a permissive `*` origin; other routes are
+unaffected.
 
 | Method and path | Request body | Response |
 |---|---|---|
-| `POST setup-token` (admin bearer) | account | token, expiry (default 7 days) |
+| `POST setup-token` (admin) | account | token, expiry (default 7 days) |
 | `POST setup` | username, token, password | recovery key |
 | `POST password` | username, password, totp (optional), new password | ok |
-| `POST recover` | username, recovery key, new password | new recovery key |
+| `POST recover` | username, recovery key, new password | new recovery key, whether TOTP was removed |
 | `POST recovery-key` | username, password, totp (optional) | new recovery key |
 | `POST app-password` | username, password, totp (optional), description | app password, credential id |
-| `POST totp` | username, password, totp (current code, required when enrolled), otp_auth (URL to enrol or replace, null to remove) | ok |
+| `POST totp` | username, password, totp (current code, required when enrolled), otp_auth (URL to enrol or replace, null to remove), confirm (a current code from the new secret, required with a URL) | ok |
 | `POST app-password/revoke` | username, password, totp (optional), credential id | ok |
 
 Verification for `password`, `recovery-key`, `app-password`,
 `app-password/revoke` and `totp` is a fresh, full verification of the
 primary password and TOTP; cached CalDAV authentication is never consulted.
-App passwords are not accepted on these endpoints.
+App passwords are not accepted on these endpoints, and a new password that
+parses as an app password is refused on `setup`, `password` and `recover`.
+Each write is additionally conditional on the generation that was verified
+for the request: if the vault record changed between verification and
+commit, the write is refused and the client retries.
 
 **State transitions.**
 
@@ -200,6 +220,10 @@ App passwords are not accepted on these endpoints.
 | `PendingSetup` | `setup` | `Active` |
 | `Active` | `setup-token` | refused, 409 |
 | `Active` | `setup` | refused, 409 |
+
+`setup` and `recover` do not pass through `Server::authenticate`, so they
+check the account's and the tenant's enabled state themselves and refuse a
+disabled account or tenant before touching the vault.
 
 Initial issuance (first row) is further restricted to **eligible**
 accounts: internal directory, no password credential of any kind, no
@@ -226,14 +250,20 @@ had no cache entries worth keeping; re-issuing is harmless.
   and password wrap in one conditional write. Recovery and app-password wraps
   are untouched.
 - `recover` unwraps MK with the recovery key, sets the new password as above,
-  and commits a fresh recovery wrap in the same write. The old recovery key
-  stops working.
+  removes the TOTP secret, and commits a fresh recovery wrap in the same
+  write. The old recovery key stops working. The response says whether TOTP
+  was removed. The recovery key is treated as the stronger factor: a lost
+  authenticator must not lock the user out of account management, and the
+  page offers re-enrolment afterwards.
 - `recovery-key` commits a fresh recovery wrap.
 - `totp` verifies the password and the current code when enrolled, then
   commits the new TOTP secret (or its removal) to the vault record in one
-  conditional write. Nothing is written to the registry. It exists because
-  the registry's own TOTP editing verifies the password against the stored
-  hash, which for key accounts is the marker.
+  conditional write. Enrolling or replacing a secret also requires a
+  confirmation code computed from the new secret, so that a mistyped or
+  unscanned secret cannot be committed; a wrong confirmation code counts as
+  a failed authentication. Nothing is written to the registry. The endpoint
+  exists because the registry's own TOTP editing verifies the password
+  against the stored hash, which for key accounts is the marker.
 - `app-password` generates the secret exactly as the registry does today and
   runs a three-step publication: (1) commit the wrap to the vault record in
   state `Pending` with a creation time and a random publication id; (2)
@@ -245,15 +275,20 @@ had no cache entries worth keeping; re-issuing is harmless.
   only `Published` wraps whose registry credential no longer exists and
   `Pending` wraps older than one hour. It never touches a fresh `Pending`
   wrap, which closes the race between publication and a concurrent password
-  change.
+  change. Credential ids are the registry's next id; creation is refused
+  while a wrap that survived pruning still exists under that id, which can
+  block creation for up to an hour after a failed publication. Ids are
+  reused once the highest credential is deleted.
 - `app-password/revoke` removes the wrap from the vault record in one
   conditional write (bumping the generation), then deletes the registry
   credential. If the registry delete fails, the credential is dead anyway:
   app-password logins require a `Published` wrap (section 4.3), so the
   stale registry entry can no longer authenticate, and orphan pruning on the
   next vault write removes nothing because there is no wrap left to prune.
-  Revocation through the registry is refused for key accounts (section
-  4.2).
+  Revoking an id that has no wrap but still has a registry credential
+  deletes that dangling credential and succeeds; revoking an id that has
+  neither is refused. Revocation through the registry is refused for key
+  accounts (section 4.2).
 
 **Atomicity and crash behaviour.** Every state change is one conditional
 write of the vault record, except the two-record sequences above, both of
@@ -265,7 +300,10 @@ classification, public key and generation).
 
 All endpoints pass through the existing authentication failure delay and
 fail2ban accounting. Setup, recover and the password-bearing endpoints count
-against the IP and username.
+against the IP and username; so does a `setup` attempt on an account that is
+already active. Request bodies and responses of these endpoints are kept out
+of the request trace events, so passwords, tokens, recovery keys and app
+passwords never reach traces.
 
 ### 4.2 What is refused for key accounts
 
@@ -298,6 +336,9 @@ from that single read, and the generation returned is that read's revision.
 On success the KEK and the generation are returned to the caller, so one
 Argon2 run both verifies the password and unlocks the master key. Because this sits in the common routing
 function, IMAP, POP3, SMTP and ManageSieve inherit it in later releases.
+A key account is never authenticated against an external directory: the
+request is refused before the directory is contacted, and the directory
+synchronisation never replaces a password credential that holds the marker.
 
 App-password logins keep the existing registry hash verification and then
 read the vault record once and open the wrap stored under their credential
@@ -370,6 +411,20 @@ sweep-driven: an entry is refused by every lookup from the moment it passes
 the idle timeout (15 minutes after last use) or the hard cap (60 minutes
 after creation), and it is removed and zeroed by the next sweep, at most 60
 seconds later. The authentication cache holds no credential at any time.
+
+**Fingerprint residency.** An authentication-cache entry for a key account
+lives exactly as long as its key-cache entry: the sweep, LRU eviction,
+expiry at lookup, explicit removal and clearing all drop the matching
+fingerprint. A fingerprint therefore never outlives the key it was verified
+with.
+
+**Cache loaders.** The account and access-token cache loaders are fenced by
+a global account epoch, because the cache's `remove` is a no-op on a
+pending placeholder: without the fence an in-flight load could republish a
+stale classification after an invalidation. A residual window remains in
+which a waiter on a placeholder is handed an account entry loaded just
+before the invalidation; it is the size of a thread pre-emption and is
+accepted for release 1.
 
 **In-flight copies.** The per-request `AccessToken` wrapper (not the shared,
 account-keyed `AccessTokenInner`) gains an optional `Arc<SessionKeys>`
@@ -590,10 +645,15 @@ return ciphertext:
   type, so the leak test can assert it never happens on supported paths.
 - A marker credential with no vault record refuses login with a distinct
   logged event (section 3.2).
-- Setup, recover and password endpoints return 401 for a wrong token,
-  recovery key, password or TOTP code, 409 for a wrong state, an ineligible
-  account or a failed revision check (the client retries), and never say
-  which input was wrong beyond that.
+- Setup, recover and the password-bearing endpoints return 401 for a wrong
+  token, recovery key, password, TOTP code or TOTP confirmation code, and
+  never say which input was wrong; 402 when TOTP is enrolled and no code
+  was presented, so the page can ask for one and retry; 403 when the
+  account or its tenant is disabled; 409 for a wrong state, an ineligible
+  account, a failed revision check or a lost race (the client retries),
+  with a short fixed reason in an `error` field. Every other failure uses
+  the server's generic problem body, so clients branch on the status code,
+  not on the body.
 - Argon2 runs on the blocking pool as the existing hash verification does.
 
 ## 11. Testing
@@ -705,15 +765,13 @@ one account.
 
 ## 13. Prerequisites
 
-- A Rust toolchain is not installed on the development machine (no `cargo`,
-  `rustc` or `rustup`). Install rustup and the Xcode command line tools
-  before implementation; RocksDB builds from source.
+- The toolchain is Homebrew's keg-only rustup (`/opt/homebrew/opt/rustup/bin`
+  must be on `PATH`); RocksDB builds from source.
 - Tests require `STORE=RocksDb` (as CI uses) and `RUST_MIN_STACK=16777216`.
   The CalDAV suite is not in upstream CI and runs with
   `cargo test -p tests webdav_tests`.
 - Still unverified at spec time and to be settled in planning: how calcard
   serializes an `X-` property with a text value (affects only the
-  never-expected case of a sealed property leaking to a client); whether the
-  registry write path accepts the `$za$` marker without a validator change;
-  which periodic housekeeping task hosts the key-cache sweep; and what the
+  never-expected case of a sealed property leaking to a client); which
+  periodic housekeeping task hosts the key-cache sweep; and what the
   resource cache stores for a custom collection timezone.
