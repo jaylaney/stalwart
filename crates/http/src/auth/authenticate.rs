@@ -224,8 +224,7 @@ async fn authenticate_uncached(
                 server
                     .inner
                     .cache
-                    .za_keys
-                    .insert(fp, keys.clone(), Instant::now());
+                    .za_insert_keys(fp, keys.clone(), Instant::now());
             }
             access_token = access_token.with_session_keys(keys);
         }

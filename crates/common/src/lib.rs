@@ -288,6 +288,30 @@ impl Caches {
         vault::keys::fingerprint(&self.za_fingerprint_key, token.as_bytes())
     }
 
+    /// Makes `keys` resident under `fp`. An entry evicted to stay within the
+    /// bound takes its cached authentication with it: a fingerprint lives no
+    /// longer than its keys (spec 5).
+    pub fn za_insert_keys(
+        &self,
+        fp: [u8; 32],
+        keys: Arc<vault::session::SessionKeys>,
+        now: Instant,
+    ) {
+        if let Some(evicted) = self.za_keys.insert(fp, keys, now) {
+            self.http_auth.remove(&evicted);
+        }
+    }
+
+    /// Sweep of expired resident keys, dropping the cached authentication
+    /// under each removed fingerprint. Returns the number of entries removed.
+    pub fn za_sweep_keys(&self, now: Instant) -> usize {
+        let removed = self.za_keys.sweep(now);
+        for fp in &removed {
+            self.http_auth.remove(fp);
+        }
+        removed.len()
+    }
+
     pub fn za_account_page_origin(&self) -> Option<Arc<hyper::header::HeaderValue>> {
         self.za_account_page_origin.load_full()
     }

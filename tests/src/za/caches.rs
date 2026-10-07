@@ -83,11 +83,11 @@ fn residency_rules() {
 
     // Idle timeout: an entry inserted and never looked up again is refused by
     // a lookup once past the timeout, and removed by the next sweep.
-    cache.insert(fp(1), keys.clone(), t0);
-    cache.insert(fp(2), keys.clone(), t0);
+    assert_eq!(cache.insert(fp(1), keys.clone(), t0), None);
+    assert_eq!(cache.insert(fp(2), keys.clone(), t0), None);
     assert_eq!(
         cache.sweep(t0 + config.idle - second),
-        0,
+        Vec::<[u8; 32]>::new(),
         "nothing idle yet"
     );
     assert!(
@@ -97,8 +97,8 @@ fn residency_rules() {
     assert_eq!(cache.len(), 1, "a refused entry is removed");
     assert_eq!(
         cache.sweep(t0 + config.idle),
-        1,
-        "the sweep removes the idle entry never looked up"
+        vec![fp(2)],
+        "the sweep removes the idle entry never looked up, and names it"
     );
     assert!(cache.is_empty());
 
@@ -106,9 +106,9 @@ fn residency_rules() {
     // within every idle period outlives the idle timeout but not the cap,
     // both at lookup and at sweep.
     let refused: fn(&KeyCache, Instant) -> bool = |cache, now| cache.get(&fp(3), now).is_none();
-    let swept: fn(&KeyCache, Instant) -> bool = |cache, now| cache.sweep(now) == 1;
+    let swept: fn(&KeyCache, Instant) -> bool = |cache, now| cache.sweep(now) == vec![fp(3)];
     for at_cap in [refused, swept] {
-        cache.insert(fp(3), keys.clone(), t0);
+        assert_eq!(cache.insert(fp(3), keys.clone(), t0), None);
         let step = config.idle - second;
         let mut now = t0;
         while now + step < t0 + config.max_age {
@@ -128,11 +128,18 @@ fn residency_rules() {
 
     // Bounded entry count with least recently used eviction.
     for i in 0..config.max_entries {
-        cache.insert(fp(i), keys.clone(), t0 + Duration::from_millis(i as u64));
+        assert_eq!(
+            cache.insert(fp(i), keys.clone(), t0 + Duration::from_millis(i as u64)),
+            None
+        );
     }
     let later = t0 + Duration::from_millis(config.max_entries as u64);
     assert!(cache.get(&fp(0), later).is_some());
-    cache.insert(fp(config.max_entries), keys.clone(), later + second);
+    assert_eq!(
+        cache.insert(fp(config.max_entries), keys.clone(), later + second),
+        Some(fp(1)),
+        "the evicted fingerprint is returned"
+    );
     assert_eq!(cache.len(), config.max_entries, "the bound holds");
     assert!(
         cache.get(&fp(1), later + second).is_none(),
@@ -191,10 +198,16 @@ async fn live_caches(test: &TestServer) {
     drop(keys);
 
     // Idle keys: a sweep once the server's idle timeout has passed removes
-    // them, and the next request re-verifies (new entry, same count).
+    // them together with the authentication cached under the same
+    // fingerprint (spec 5), and the next request re-verifies (new entry,
+    // same count).
     let live = KeyCacheConfig::from_env();
-    assert_eq!(caches.za_keys.sweep(Instant::now() + live.idle), 1);
+    assert_eq!(caches.za_sweep_keys(Instant::now() + live.idle), 1);
     assert!(caches.za_keys.is_empty());
+    assert!(
+        caches.http_auth.peek(&fp).is_none(),
+        "the fingerprint does not outlive its keys"
+    );
     let entry = reverified(caches, &client, fp, entry.expires).await;
     assert_eq!(entry.generation, generation);
     assert_eq!(caches.za_keys.len(), 1);
@@ -213,7 +226,7 @@ async fn live_caches(test: &TestServer) {
     );
 
     // Resident keys of a stale generation are discarded on hit as well.
-    caches.za_keys.insert(
+    caches.za_insert_keys(
         fp,
         Arc::new(SessionKeys::new(id, generation + 1, Secret::random())),
         Instant::now(),

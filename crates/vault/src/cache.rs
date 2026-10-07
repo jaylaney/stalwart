@@ -82,6 +82,9 @@ impl KeyCache {
     }
 
     /// Deadline-driven expiry: an expired entry is refused and removed here.
+    /// `None` means no entry is left under `fp`, so the caller drops the
+    /// authentication it cached under the same fingerprint (spec 5: a
+    /// fingerprint lives no longer than its keys).
     pub fn get(&self, fp: &[u8; 32], now: Instant) -> Option<Arc<SessionKeys>> {
         let mut map = self.inner.lock().unwrap();
         let expired = map.get(fp).is_some_and(|e| e.is_expired(now, &self.config));
@@ -94,12 +97,17 @@ impl KeyCache {
         Some(entry.keys.clone())
     }
 
-    pub fn insert(&self, fp: [u8; 32], keys: Arc<SessionKeys>, now: Instant) {
+    /// Returns the fingerprint evicted to stay within the bound, if any; the
+    /// caller drops what it cached under it.
+    #[must_use = "the evicted fingerprint's cached authentication must be dropped"]
+    pub fn insert(&self, fp: [u8; 32], keys: Arc<SessionKeys>, now: Instant) -> Option<[u8; 32]> {
         let mut map = self.inner.lock().unwrap();
+        let mut evicted = None;
         if !map.contains_key(&fp) && map.len() >= self.config.max_entries {
             // Least recently used eviction (spec 5).
             if let Some(victim) = map.iter().min_by_key(|(_, e)| e.last_used).map(|(k, _)| *k) {
                 map.remove(&victim);
+                evicted = Some(victim);
             }
         }
         map.insert(
@@ -110,6 +118,7 @@ impl KeyCache {
                 last_used: now,
             },
         );
+        evicted
     }
 
     pub fn remove(&self, fp: &[u8; 32]) {
@@ -132,12 +141,25 @@ impl KeyCache {
             .any(|e| e.keys.account_id == account_id)
     }
 
-    /// Sweep-driven removal; returns the number of entries removed.
-    pub fn sweep(&self, now: Instant) -> usize {
+    /// Sweep-driven removal; returns the fingerprints removed, so the caller
+    /// drops what it cached under them.
+    #[must_use = "the removed fingerprints' cached authentication must be dropped"]
+    pub fn sweep(&self, now: Instant) -> Vec<[u8; 32]> {
         let mut map = self.inner.lock().unwrap();
-        let before = map.len();
-        map.retain(|_, e| !e.is_expired(now, &self.config));
-        before - map.len()
+        let mut removed = Vec::new();
+        map.retain(|fp, e| {
+            let expired = e.is_expired(now, &self.config);
+            if expired {
+                removed.push(*fp);
+            }
+            !expired
+        });
+        removed
+    }
+
+    /// The effective configuration (logged once at startup, no secrets).
+    pub fn config(&self) -> KeyCacheConfig {
+        self.config
     }
 
     pub fn len(&self) -> usize {
@@ -175,7 +197,7 @@ mod tests {
     fn idle_entry_is_refused_after_timeout_and_removed_by_sweep() {
         let cache = KeyCache::new(cfg());
         let t0 = Instant::now();
-        cache.insert([1; 32], keys(1, 1), t0);
+        assert_eq!(cache.insert([1; 32], keys(1, 1), t0), None);
         assert!(cache.get(&[1; 32], t0 + Duration::from_secs(899)).is_some());
         // The lookup above refreshed last_used; now go idle.
         let t_idle = t0 + Duration::from_secs(899) + Duration::from_secs(901);
@@ -184,11 +206,11 @@ mod tests {
             "expired entries are refused at lookup"
         );
         assert_eq!(cache.len(), 0, "a refused entry is removed immediately");
-        cache.insert([2; 32], keys(2, 1), t0);
+        assert_eq!(cache.insert([2; 32], keys(2, 1), t0), None);
         assert_eq!(
             cache.sweep(t0 + Duration::from_secs(901)),
-            1,
-            "sweep removes idle entries never looked up"
+            vec![[2; 32]],
+            "sweep removes idle entries never looked up, and names them"
         );
         assert_eq!(cache.len(), 0);
     }
@@ -197,7 +219,7 @@ mod tests {
     fn hard_cap_evicts_a_continuously_used_entry() {
         let cache = KeyCache::new(cfg());
         let t0 = Instant::now();
-        cache.insert([1; 32], keys(1, 1), t0);
+        assert_eq!(cache.insert([1; 32], keys(1, 1), t0), None);
         for minute in 1..60 {
             assert!(
                 cache
@@ -217,11 +239,15 @@ mod tests {
         let cache = KeyCache::new(cfg());
         let t0 = Instant::now();
         let at = |s: u64| t0 + Duration::from_secs(s);
-        cache.insert([1; 32], keys(1, 1), t0);
-        cache.insert([2; 32], keys(2, 1), at(1));
-        cache.insert([3; 32], keys(3, 1), at(2));
+        assert_eq!(cache.insert([1; 32], keys(1, 1), t0), None);
+        assert_eq!(cache.insert([2; 32], keys(2, 1), at(1)), None);
+        assert_eq!(cache.insert([3; 32], keys(3, 1), at(2)), None);
         assert!(cache.get(&[1; 32], at(3)).is_some()); // 1 is now most recent
-        cache.insert([4; 32], keys(4, 1), at(4));
+        assert_eq!(
+            cache.insert([4; 32], keys(4, 1), at(4)),
+            Some([2; 32]),
+            "the evicted fingerprint is returned"
+        );
         assert_eq!(cache.len(), 3);
         assert!(
             cache.get(&[2; 32], at(5)).is_none(),
@@ -230,7 +256,12 @@ mod tests {
         // Touch 1 and 3 so that 4 (last used at t4) is the next LRU victim.
         assert!(cache.get(&[1; 32], at(6)).is_some());
         assert!(cache.get(&[3; 32], at(6)).is_some());
-        cache.insert([5; 32], keys(1, 2), at(7));
+        assert_eq!(cache.insert([5; 32], keys(1, 2), at(7)), Some([4; 32]));
+        assert_eq!(
+            cache.insert([5; 32], keys(1, 2), at(7)),
+            None,
+            "replacing an entry evicts nothing"
+        );
         assert!(
             cache.get(&[4; 32], at(8)).is_none(),
             "4 was least recently used"
@@ -246,7 +277,7 @@ mod tests {
         let cache = KeyCache::new(cfg());
         let t0 = Instant::now();
         let k = keys(1, 1);
-        cache.insert([1; 32], k.clone(), t0);
+        assert_eq!(cache.insert([1; 32], k.clone(), t0), None);
         assert_eq!(Arc::strong_count(&k), 2);
         cache.remove(&[1; 32]);
         assert_eq!(
