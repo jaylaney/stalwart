@@ -217,15 +217,23 @@ impl ParseHttp for Server {
                         let (_in_flight, access_token) =
                             self.authenticate_headers(&req, &session).await?;
 
-                        return self.handle_event_source(req, access_token).await;
+                        // A stream outlives the key residency bound (spec 5).
+                        return self
+                            .handle_event_source(req, access_token.without_session_keys())
+                            .await;
                     }
                     ("ws", &Method::GET) => {
                         // Authenticate request
                         let (_in_flight, access_token) =
                             self.authenticate_headers(&req, &session).await?;
 
+                        // A WebSocket outlives the key residency bound (spec 5).
                         return self
-                            .upgrade_websocket_connection(req, access_token, session)
+                            .upgrade_websocket_connection(
+                                req,
+                                access_token.without_session_keys(),
+                                session,
+                            )
                             .await;
                     }
                     ("session", &Method::GET) => {

@@ -5,7 +5,11 @@
  */
 
 use crate::utils::server::{TestServer, TestServerBuilder};
-use ::registry::schema::{enums::Permission, prelude::Property, structs::Http};
+use ::registry::schema::{
+    enums::Permission,
+    prelude::Property,
+    structs::{Http, Imap},
+};
 
 pub mod app_password;
 pub mod caches;
@@ -49,6 +53,16 @@ pub async fn za_tests() {
                 ..Default::default()
             },
             &[Property::UseXForwarded],
+        )
+        .await;
+    // The cache module logs a key account in over plain-text IMAP.
+    admin
+        .registry_update_setting(
+            Imap {
+                allow_plain_text_auth: true,
+                ..Default::default()
+            },
+            &[Property::AllowPlainTextAuth],
         )
         .await;
     admin.reload_settings().await;

@@ -307,11 +307,7 @@ pub trait BuildAccessToken {
 
 impl BuildAccessToken for Arc<AccessTokenInner> {
     fn build(self) -> AccessToken {
-        AccessToken {
-            scope_idx: 0,
-            inner: self,
-            session_keys: None,
-        }
+        AccessToken::from_parts(0, self)
     }
 }
 

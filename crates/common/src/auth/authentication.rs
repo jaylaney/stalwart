@@ -26,7 +26,7 @@ use serde::Deserialize;
 use std::{borrow::Cow, net::IpAddr, sync::Arc};
 use store::write::now;
 use trc::AddContext;
-use vault::ZA_MARKER;
+use vault::{ZA_MARKER, session::SessionKeys};
 
 pub struct UsernameParts {
     pub account: Username,
@@ -40,12 +40,32 @@ pub struct Username {
 }
 
 impl Server {
+    /// Authenticates a request. The token never carries session keys: IMAP,
+    /// POP3, ManageSieve and long-lived HTTP streams hold their token for the
+    /// connection's lifetime, past the key residency bound (spec 2, 5). A
+    /// key account's keys, derived to verify the password, are dropped here.
     pub async fn authenticate(&self, req: &AuthRequest) -> trc::Result<AccessToken> {
+        self.authenticate_with_keys(req)
+            .await
+            .map(|(token, _keys)| token)
+    }
+
+    /// As `authenticate`, with a key account's session keys returned beside
+    /// the (keyless) token. Only the HTTP authentication layer and the vault
+    /// endpoints' fresh verification use this; the HTTP layer attaches the
+    /// keys to the request's token under the residency rules (spec 5).
+    pub async fn authenticate_with_keys(
+        &self,
+        req: &AuthRequest,
+    ) -> trc::Result<(AccessToken, Option<Arc<SessionKeys>>)> {
         match Box::pin(self.route_auth_request(req))
             .await
             .and_then(|token| token.assert_has_permission(Permission::Authenticate))
         {
-            Ok(token) => Ok(token),
+            Ok(token) => {
+                let keys = token.session_keys().cloned();
+                Ok((token.without_session_keys(), keys))
+            }
             Err(err) => Err(self
                 .authentication_failure(err, req.remote_ip, req.username())
                 .await),
@@ -91,6 +111,8 @@ impl Server {
         err.ctx(trc::Key::RemoteIp, remote_ip)
     }
 
+    /// The returned token may carry a key account's session keys; only
+    /// `authenticate_with_keys` sees it, and it detaches them.
     async fn route_auth_request(&self, req: &AuthRequest) -> trc::Result<AccessToken> {
         match &req.credentials {
             Credentials::Basic {

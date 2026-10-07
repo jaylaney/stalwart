@@ -5,10 +5,17 @@
  */
 
 use super::STRONG;
-use crate::utils::{server::TestServer, webdav::DummyWebDavClient, za::assert_nothing_cached};
-use common::{Caches, ipc::CacheInvalidation};
+use crate::utils::{
+    imap::{ImapConnection, Type},
+    server::TestServer,
+    webdav::DummyWebDavClient,
+    za::assert_nothing_cached,
+};
+use common::{Caches, auth::AuthRequest, ipc::CacheInvalidation};
 use hyper::StatusCode;
+use imap_proto::ResponseType;
 use std::{
+    net::IpAddr,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -25,7 +32,44 @@ const HOME: &str = "/dav/cal/key3@example.com/";
 pub async fn test(test: &mut TestServer) {
     println!("Running zero-access cache tests...");
     residency_rules();
+    keys_only_over_http(test).await;
     live_caches(test).await;
+}
+
+/// Spec 2 and 5: session keys are attached by the HTTP layer only. An IMAP
+/// session holds its token for the connection's lifetime, so a key
+/// account's IMAP login leaves nothing resident, and `Server::authenticate`
+/// (the entry point of IMAP, POP3 and ManageSieve) returns keyless tokens.
+async fn keys_only_over_http(test: &TestServer) {
+    let id = test.account(NAME).id().document_id();
+    let caches = &test.server.inner.cache;
+    caches.za_keys.clear();
+    caches.http_auth.clear();
+
+    let mut imap = ImapConnection::connect(b"_z ").await;
+    imap.authenticate(NAME, STRONG).await;
+    imap.send("NOOP").await;
+    imap.assert_read(Type::Tagged, ResponseType::Ok).await;
+    assert!(
+        !caches.za_keys.contains_account(id),
+        "an IMAP login leaves no resident keys"
+    );
+
+    let request = AuthRequest::from_plain(NAME, STRONG, 0, IpAddr::from([127, 0, 0, 1]));
+    let token = test.server.authenticate(&request).await.unwrap();
+    assert_eq!(token.account_id(), id);
+    assert!(token.session_keys().is_none(), "a keyless token");
+    let (token, keys) = test.server.authenticate_with_keys(&request).await.unwrap();
+    assert!(
+        token.session_keys().is_none(),
+        "keys travel beside the token"
+    );
+    let keys = keys.expect("the key account's keys");
+    assert_eq!(keys.account_id, id);
+    assert!(
+        !caches.za_keys.contains_account(id),
+        "neither entry point makes keys resident"
+    );
 }
 
 /// Spec 5 residency rules, on a standalone cache with the default

@@ -524,8 +524,8 @@ async fn za_verify_primary(
             "App passwords are not accepted on this endpoint.",
         ));
     }
-    let token = server
-        .authenticate(&AuthRequest::from_credentials(
+    let (token, keys) = server
+        .authenticate_with_keys(&AuthRequest::from_credentials(
             Credentials::Basic {
                 username: username.to_string(),
                 secret: password.to_string(),
@@ -535,10 +535,10 @@ async fn za_verify_primary(
             session.remote_ip,
         ))
         .await?;
-    match token.session_keys() {
+    match keys {
         Some(keys) if keys.account_id == token.account_id() => Ok(Ok(ZaVerified {
             account_id: token.account_id(),
-            keys: keys.clone(),
+            keys,
         })),
         _ => Ok(Err(conflict("not a zero-access account"))),
     }

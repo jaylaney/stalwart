@@ -19,14 +19,6 @@ pub trait Authenticator: Sync + Send {
         req: &HttpRequest,
         session: &HttpSessionData,
     ) -> impl Future<Output = trc::Result<(Option<InFlight>, AccessToken)>> + Send;
-
-    fn authenticate_uncached(
-        &self,
-        mechanism: &str,
-        token: &str,
-        fp: [u8; 32],
-        session: &HttpSessionData,
-    ) -> impl Future<Output = trc::Result<(Option<InFlight>, AccessToken)>> + Send;
 }
 
 impl Authenticator for Server {
@@ -92,8 +84,7 @@ impl Authenticator for Server {
                 self.inner.cache.za_keys.remove(&fp);
             }
 
-            self.authenticate_uncached(mechanism, token, fp, session)
-                .await
+            authenticate_uncached(self, mechanism, token, session).await
         } else {
             // Enforce anonymous rate limit
             self.is_http_anonymous_request_allowed(session.remote_ip)
@@ -105,136 +96,146 @@ impl Authenticator for Server {
                 .caused_by(trc::location!()))
         }
     }
+}
 
-    async fn authenticate_uncached(
-        &self,
-        mechanism: &str,
-        token: &str,
-        fp: [u8; 32],
-        session: &HttpSessionData,
-    ) -> trc::Result<(Option<InFlight>, AccessToken)> {
-        // The raw header value never reaches an event (spec 5).
-        let credentials = if mechanism.eq_ignore_ascii_case("basic") {
-            // Decode the base64 encoded credentials
-            decode_plain_auth(token).ok_or_else(|| {
-                trc::AuthEvent::Error
-                    .into_err()
-                    .details("Failed to decode Basic auth request.")
-                    .caused_by(trc::location!())
-            })?
-        } else if mechanism.eq_ignore_ascii_case("bearer") {
-            // Enforce anonymous rate limit
-            self.is_http_anonymous_request_allowed(session.remote_ip)
-                .await?;
+/// Full verification of an Authorization header, caching the result under
+/// the header's own fingerprint, computed here so that no caller can cache
+/// under another key. The only place session keys are attached (spec 5).
+async fn authenticate_uncached(
+    server: &Server,
+    mechanism: &str,
+    token: &str,
+    session: &HttpSessionData,
+) -> trc::Result<(Option<InFlight>, AccessToken)> {
+    let fp = server.inner.cache.za_fingerprint(token);
 
-            Credentials::Bearer {
-                username: None,
-                token: token.to_string(),
-            }
-        } else {
-            // Enforce anonymous rate limit
-            self.is_http_anonymous_request_allowed(session.remote_ip)
-                .await?;
-
-            return Err(trc::AuthEvent::Error
+    // The raw header value never reaches an event (spec 5).
+    let credentials = if mechanism.eq_ignore_ascii_case("basic") {
+        // Decode the base64 encoded credentials
+        decode_plain_auth(token).ok_or_else(|| {
+            trc::AuthEvent::Error
                 .into_err()
-                .reason("Unsupported authentication mechanism.")
-                .caused_by(trc::location!()));
-        };
-
-        // Authenticate
-        let access_token = self
-            .authenticate(&AuthRequest::from_credentials(
-                credentials,
-                session.session_id,
-                session.remote_ip,
-            ))
+                .details("Failed to decode Basic auth request.")
+                .caused_by(trc::location!())
+        })?
+    } else if mechanism.eq_ignore_ascii_case("bearer") {
+        // Enforce anonymous rate limit
+        server
+            .is_http_anonymous_request_allowed(session.remote_ip)
             .await?;
 
-        #[cfg(feature = "test_mode")]
-        za_test::pause_point(access_token.account_id()).await;
+        Credentials::Bearer {
+            username: None,
+            token: token.to_string(),
+        }
+    } else {
+        // Enforce anonymous rate limit
+        server
+            .is_http_anonymous_request_allowed(session.remote_ip)
+            .await?;
 
-        let account_id = access_token.account_id();
-        let expires = Instant::now() + Duration::from_secs(self.core.oauth.oauth_expiry_token);
-        let mut access_token = access_token;
-        match access_token.session_keys().cloned() {
-            None => {
-                // A keyless result for a key account (Bearer/OAuth, or a
-                // password verified against the pre-setup hash while setup
-                // committed) must not survive in the cache: a generation-0
-                // entry is served on later hits without the fence. Only
-                // non-key accounts are cached here, as upstream does.
-                if !self.account(account_id).await?.is_key_account() {
-                    self.inner.cache.http_auth.insert(
-                        fp,
-                        HttpAuthCache {
-                            account_id,
-                            revision: access_token.revision(),
-                            credential_id: access_token.credential_id(),
-                            expires,
-                            generation: 0,
-                        },
-                    );
+        return Err(trc::AuthEvent::Error
+            .into_err()
+            .reason("Unsupported authentication mechanism.")
+            .caused_by(trc::location!()));
+    };
 
-                    // Double-check after publish: the check above may have read
-                    // a stale non-key entry while setup's `Account` invalidation
-                    // was still pending. If the account is a key account now,
-                    // withdraw the entry just inserted. A failed lookup also
-                    // withdraws it (fail closed) before the error propagates.
-                    match self.account(account_id).await {
-                        Ok(account) if !account.is_key_account() => {}
-                        result => {
-                            self.inner.cache.http_auth.remove(&fp);
-                            result?;
-                        }
+    // Authenticate
+    let (mut access_token, session_keys) = server
+        .authenticate_with_keys(&AuthRequest::from_credentials(
+            credentials,
+            session.session_id,
+            session.remote_ip,
+        ))
+        .await?;
+
+    #[cfg(feature = "test_mode")]
+    za_test::pause_point(access_token.account_id()).await;
+
+    let account_id = access_token.account_id();
+    let expires = Instant::now() + Duration::from_secs(server.core.oauth.oauth_expiry_token);
+    match session_keys {
+        None => {
+            // A keyless result for a key account (Bearer/OAuth, or a
+            // password verified against the pre-setup hash while setup
+            // committed) must not survive in the cache: a generation-0
+            // entry is served on later hits without the fence. Only
+            // non-key accounts are cached here, as upstream does.
+            if !server.account(account_id).await?.is_key_account() {
+                server.inner.cache.http_auth.insert(
+                    fp,
+                    HttpAuthCache {
+                        account_id,
+                        revision: access_token.revision(),
+                        credential_id: access_token.credential_id(),
+                        expires,
+                        generation: 0,
+                    },
+                );
+
+                // Double-check after publish: the check above may have read
+                // a stale non-key entry while setup's `Account` invalidation
+                // was still pending. If the account is a key account now,
+                // withdraw the entry just inserted. A failed lookup also
+                // withdraws it (fail closed) before the error propagates.
+                match server.account(account_id).await {
+                    Ok(account) if !account.is_key_account() => {}
+                    result => {
+                        server.inner.cache.http_auth.remove(&fp);
+                        result?;
                     }
                 }
             }
-            Some(keys) if keys.account_id != account_id => {
-                // Keys of another account must never travel with this token:
-                // serve the request keyless and cache nothing.
-                trc::error!(
-                    trc::AuthEvent::Error
-                        .into_err()
-                        .details("Session keys do not belong to the authenticated account.")
-                        .account_id(account_id)
-                        .ctx(trc::Key::Id, keys.account_id)
-                        .caused_by(trc::location!())
-                );
-                access_token = access_token.without_session_keys();
-            }
-            Some(keys) => {
-                // Generation fence (spec 5). Race defended: this login read the
-                // vault record at revision r and spent its time in Argon2 while
-                // a password change committed r+1 and called `remove_account`.
-                // Caching now would resurrect the superseded verification, so
-                // both inserts happen only if the verified generation still
-                // equals the one rebuilt from the store; otherwise the request
-                // succeeds uncached. Generation 0 is never cached: such an
-                // entry would be served from the non-key hit branch, unfenced,
-                // with keys resident.
-                let account = self.account(account_id).await?;
-                if keys.generation != 0 && keys.generation == account.za_generation {
-                    self.inner.cache.http_auth.insert(
-                        fp,
-                        HttpAuthCache {
-                            account_id,
-                            revision: access_token.revision(),
-                            credential_id: access_token.credential_id(),
-                            expires,
-                            generation: keys.generation,
-                        },
-                    );
-                    self.inner.cache.za_keys.insert(fp, keys, Instant::now());
-                }
-            }
         }
-
-        // Enforce authenticated rate limit
-        self.is_http_authenticated_request_allowed(&access_token, session.remote_ip)
-            .await
-            .map(|in_flight| (in_flight, access_token))
+        Some(keys) if keys.account_id != account_id => {
+            // Keys of another account must never travel with this token:
+            // serve the request keyless and cache nothing.
+            trc::error!(
+                trc::AuthEvent::Error
+                    .into_err()
+                    .details("Session keys do not belong to the authenticated account.")
+                    .account_id(account_id)
+                    .ctx(trc::Key::Id, keys.account_id)
+                    .caused_by(trc::location!())
+            );
+        }
+        Some(keys) => {
+            // Generation fence (spec 5). Race defended: this login read the
+            // vault record at revision r and spent its time in Argon2 while
+            // a password change committed r+1 and called `remove_account`.
+            // Caching now would resurrect the superseded verification, so
+            // both inserts happen only if the verified generation still
+            // equals the one rebuilt from the store; otherwise the request
+            // succeeds uncached. Generation 0 is never cached: such an
+            // entry would be served from the non-key hit branch, unfenced,
+            // with keys resident.
+            let account = server.account(account_id).await?;
+            if keys.generation != 0 && keys.generation == account.za_generation {
+                server.inner.cache.http_auth.insert(
+                    fp,
+                    HttpAuthCache {
+                        account_id,
+                        revision: access_token.revision(),
+                        credential_id: access_token.credential_id(),
+                        expires,
+                        generation: keys.generation,
+                    },
+                );
+                server
+                    .inner
+                    .cache
+                    .za_keys
+                    .insert(fp, keys.clone(), Instant::now());
+            }
+            access_token = access_token.with_session_keys(keys);
+        }
     }
+
+    // Enforce authenticated rate limit
+    server
+        .is_http_authenticated_request_allowed(&access_token, session.remote_ip)
+        .await
+        .map(|in_flight| (in_flight, access_token))
 }
 
 /// Test-only pause points, each keyed on an account id and one-shot: only
