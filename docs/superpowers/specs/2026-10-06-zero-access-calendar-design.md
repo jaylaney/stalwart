@@ -1,6 +1,6 @@
 # Zero-access calendar: design spec
 
-Date: 2026-10-06. Status: revision 5, approved. Scope: release 1 of the
+Date: 2026-10-06. Status: revision 6, approved. Scope: release 1 of the
 zero-access fork of Stalwart (`jaylaney/stalwart`, upstream
 `stalwartlabs/stalwart`, base commit 3f657330, Stalwart 0.16.25).
 
@@ -10,9 +10,14 @@ its two revision-3 findings and two clarifications
 (`2026-10-06-zero-access-calendar-design-review.md`). Revision 5
 (2026-10-07) records the plan 1 outcome: the account API as built, in
 sections 4.1, 4.3, 5, 10 and 13, following the decisions in
-`../plans/2026-10-06-zero-access-plan1-outcome.md`. One item of 4.1 is not
-yet implemented and is scheduled for plan 2: the refusal of `setup` and
-`recover` for a disabled account or tenant.
+`../plans/2026-10-06-zero-access-plan1-outcome.md`. Revision 6
+(2026-10-07) records the plan 2 outcome, following the decisions in
+`../plans/2026-10-06-zero-access-plan2-outcome.md`: the field-policy
+amendments in section 6, what is visible by structure in section 2, the
+carrier layout, quota rule and tolerance of plaintext in sections 7.1 and
+7.3, the refusal event in section 10, and the one all-account routing change
+in section 8.2. The 4.1 item scheduled for plan 2 (refusing `setup` and
+`recover` for a disabled account or tenant) was implemented in plan 2.
 
 ## 1. Purpose
 
@@ -81,13 +86,22 @@ are distinct and must not be conflated in product copy: how long a
 credential's authentication result is cached, how long a key is resident, and
 whether the user's client is connected.
 
+**Integrity.** The guarantee is confidentiality, not integrity, against an
+operator who can write to the store. Such an operator can drop or swap
+sealed fields and bundles silently (the server reads an absent carrier as
+nothing sealed) but cannot read them. Tampering with a bundle that is
+present is detected and fails the request (section 10).
+
 **Visible metadata** (section 6): when events happen and for how long,
 timezones (including the calculation rules of custom timezones), recurrence
 rules and exceptions, status and transparency, alarm trigger times and
 whether an alarm is an email alarm, UIDs, filenames chosen by clients (often
 UID-derived), how many calendars and events a user has, the exact plaintext
-size of each event, ETags and sync history, and account metadata such as
-login times.
+size of each event, the type name of every component including `X-`
+components, which components carry a sealed bundle and the size class of
+each bundle (a multiple of 256 bytes), free text that sits in visible slots
+(TZID values, `X-` values of STATUS and TRANSP, and `X-` parts of RRULE),
+ETags and sync history, and account metadata such as login times.
 
 **Sealed:** titles, descriptions, locations, geo, URLs, attendees,
 organizers, categories, comments, attachments, conference links, class,
@@ -444,15 +458,21 @@ journals, and the custom timezone trees stored in collection preferences.
 
 **Visible properties in event, task and journal components:** UID, DTSTART,
 DTEND, DURATION, DUE, RRULE, RDATE, EXDATE, RECURRENCE-ID, SEQUENCE, STATUS,
-TRANSP, DTSTAMP, CREATED, LAST-MODIFIED.
+TRANSP, DTSTAMP, CREATED, LAST-MODIFIED. UID is visible on every
+component, not only these: also on VALARM, VTIMEZONE, STANDARD, DAYLIGHT,
+VFREEBUSY and the VCALENDAR root, because events already expose their UIDs
+and components are indexed by UID.
 
 **Visible properties in alarm components:** TRIGGER, ACTION, REPEAT,
 DURATION. The precomputed "is email alarm" flag is visible.
 
 **Visible properties in timezone components, wherever they occur:** TZID,
-LAST-MODIFIED; in their STANDARD and DAYLIGHT subcomponents: DTSTART,
-TZOFFSETFROM, TZOFFSETTO, RRULE, RDATE. TZNAME, TZURL, COMMENT and extension
-properties inside timezones are sealed like any other property.
+LAST-MODIFIED, and on the VTIMEZONE component X-LIC-LOCATION and
+X-MICROSOFT-CDO-TZID, because calcard resolves timezones by name and
+clients send those names there; in their STANDARD and DAYLIGHT
+subcomponents: DTSTART, TZOFFSETFROM, TZOFFSETTO, RRULE, RDATE. TZNAME,
+TZURL, COMMENT and other extension properties inside timezones are sealed
+like any other property.
 
 **Visible properties on the VCALENDAR root:** PRODID, VERSION, CALSCALE,
 METHOD.
@@ -472,10 +492,10 @@ offsets and ACL list.
 **Sealed:** every other property of every component (SUMMARY, DESCRIPTION,
 LOCATION, GEO, URL, ATTENDEE, ORGANIZER, CATEGORIES, COMMENT, CONTACT,
 RESOURCES, ATTACH, RELATED-TO, CLASS, PRIORITY, COLOR, CONFERENCE, IMAGE,
-STRUCTURED-DATA, all `X-` properties, alarm SUMMARY, DESCRIPTION and
-ATTENDEE, timezone TZNAME and TZURL), every non-listed parameter, the event's
-WebDAV display name and dead properties, and a collection's display name,
-description, colour and dead properties.
+STRUCTURED-DATA, all `X-` properties except the two timezone names above,
+alarm SUMMARY, DESCRIPTION and ATTENDEE, timezone TZNAME and TZURL), every
+non-listed parameter, the event's WebDAV display name and dead properties,
+and a collection's display name, description, colour and dead properties.
 
 The policy version is recorded with each sealed object. Moving an item
 between sets is a new version applied to objects written from then on; old
@@ -498,25 +518,38 @@ properties are removed from `entries`, sealed parameters are removed from
 their properties, and one property is appended:
 
 - `X-ZA-SEALED` on each component that had any sealed property or
-  parameter. Its text value is base64 of: format byte, nonce, ciphertext.
-  The plaintext is the rkyv serialization of a list of removals, each either
+  parameter, as the last entry of that component. Its text value is base64
+  of: format byte, nonce, ciphertext. The plaintext is the rkyv
+  serialization of a list of removals, each either
   (original entry index, `ICalendarEntry`) or (entry index, parameter index,
   `ICalendarParameter`), with names, parameters and values intact and no
   text round trip, prefixed by its length and padded to a multiple of 256
   bytes. Unsealing re-inserts each removal at its original index, so the
   restored component is identical to the parsed one, entry for entry and in
   order. Associated data: account id, UID, component index, policy version.
-- `X-ZA-KEY` on the VCALENDAR root: policy version, wrap type (`mk` now,
-  `pk` later for events written to the public key), nonce and the DEK
-  wrapped under EWK. Associated data: account id, UID.
+- `X-ZA-KEY` on the VCALENDAR root: policy version byte, wrap type byte
+  (`0x01` is the master-key wrap now; a public-key wrap type follows later
+  for events written to the public key) and the wrapped DEK. Associated
+  data: account id, UID.
+
+On the VCALENDAR root the carriers are `X-ZA-EXTRA` (when present) then
+`X-ZA-KEY`, as the root's last entries. A carrier anywhere else in a tree (a
+stray carrier) makes the object unreadable (section 10) rather than being
+partly unsealed.
 
 The event's `display_name` and `dead_properties` fields, when non-empty, are
 sealed with the same DEK into an `X-ZA-EXTRA` root property and the fields
 themselves are emptied.
 
-The stored `size` is the plaintext iCalendar length, exactly as upstream
-computes it, so HEAD, PROPFIND content-length and quota accounting are
-unchanged and agree. The exact size is visible metadata (section 2).
+The stored `size` of an event is the plaintext iCalendar length exactly as
+upstream computes it, so HEAD, PROPFIND content-length and quota accounting
+are unchanged. The sealing overhead inside the record (about 400 bytes per
+component with sealed content, plus the `X-ZA-EXTRA` content) is not charged
+to quota. Collections are different: upstream's size function counts the
+stored preferences name, so a sealed collection charges its real sealed
+bytes (about 500 bytes each). This asymmetry is accepted: event overhead is
+bounded per component and collection counts are small. The exact event size
+is visible metadata (section 2).
 
 ### 7.2 Calendar collections
 
@@ -568,9 +601,15 @@ as `current` and uses the unsealed view solely for comparison, editing and
 response bodies. `unseal_calendar` is the collection equivalent and covers
 the custom timezone tree.
 
-Any failure to open a bundle, an unknown policy version, a wrap type the
-server cannot open, or an `X-ZA-*` property on a non-key account is an error
-(section 10).
+A bundle that is present but cannot be opened, an unknown policy version, a
+wrap type the server cannot open, or a stray carrier is an error (section
+10). An object in a key account with no carriers at all is plaintext: it
+passes through unseal unchanged and is sealed by its next write, so accounts
+converted with existing data keep working and are sealed incrementally.
+(Plan 3 closes every writer that could store plaintext into a key account
+without a key.) `X-ZA-*` properties on a non-key account are ordinary
+properties and are neither checked nor removed; non-key accounts take
+unchanged paths (invariant 9).
 
 ## 8. Write and read paths
 
@@ -613,6 +652,13 @@ The in-memory resource cache (`DavResources`) copies only filenames, start
 and duration from events and only slug, ACLs, timezone calculation data and
 preference flags from collections. It is built without a key and needs none.
 
+Calendar REPORTs (`calendar-query`, `calendar-multiget`, `free-busy-query`)
+are accepted only under the `/dav/cal/` and `/dav/itip/` prefixes and answer
+405 elsewhere, and a multiget href outside the requested account's calendars
+answers 404 for that href. This applies to all accounts and is the one
+deliberate change to non-key behaviour: the old routing let a REPORT reach a
+key account's calendar through an ungated prefix.
+
 ## 9. Feature gating for key accounts
 
 Every path that would need a key it does not have is closed, never left to
@@ -631,18 +677,21 @@ return ciphertext:
 | Alarm email | generic: subject and body carry the start time, timezone and a link; no title, description, location, organizer, guests or conference link; recipient is the account address |
 | Display alarm push | unchanged (already carries only ids) |
 | Trace events that log a whole iCalendar (`dates.rs`, `query.rs`) | removed in the fork for all accounts |
+| Per-account event preferences (`CalendarEvent.preferences`, JMAP-only) | not sealed in plan 2; plan 3 traces which paths populate it for key accounts and seals or gates them |
 | Backup and restore | copy sealed records as-is; no plaintext calendar content exists in any subspace, including the task queue |
 
 ## 10. Error handling
 
-- Unseal failure (tampering, corruption, unknown version, missing key):
-  the request fails with 500 for DAV and a logged error naming account,
-  collection and document id but never any content. Nothing is deleted or
-  rewritten. A multi-item report fails the single item with a 500 status
-  element and continues.
-- A calendar operation reaching the groupware layer for a key account without
-  `SessionKeys` is a programming error surfaced as 403 with a distinct event
-  type, so the leak test can assert it never happens on supported paths.
+- Unseal failure (tampering, corruption, unknown version, missing key) or
+  a stray carrier: the request fails with 500 for DAV and a logged error
+  naming account, collection and document id but never any content. Nothing
+  is deleted or rewritten. A multi-item report fails the single item with a
+  500 status element and continues.
+- A calendar request for a key account that arrives without `SessionKeys`
+  (admin, impersonation, master user, a background path) is refused with
+  403, logged as `SecurityEvent::Unauthorized` with details prefixed
+  `zero-access:`, so tests can assert it never happens on supported paths.
+  No new event type is added; event enums are generated upstream.
 - A marker credential with no vault record refuses login with a distinct
   logged event (section 3.2).
 - Setup, recover and the password-bearing endpoints return 401 for a wrong
@@ -758,7 +807,8 @@ one account.
    it is conditional on its revision; verification reads it exactly once;
    and that revision is the authentication generation carried by every
    cached result. No registry-only edit may change login outcome.
-9. Non-key accounts take unchanged upstream code paths.
+9. Non-key accounts take unchanged upstream code paths, with one recorded
+   exception: the calendar REPORT prefix check in section 8.2.
 10. Fork diff stays narrow: new modules for keys, sealing, the key cache and
     the account API; one-line call insertions at read and write sites;
     gating checks at existing permission points.

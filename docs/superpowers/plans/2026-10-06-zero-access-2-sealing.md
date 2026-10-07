@@ -8,7 +8,7 @@
 
 **Tech Stack:** `calcard 0.3.14` (`ICalendar`, `ICalendarComponent`, `ICalendarEntry`, `ICalendarParameter`, rkyv derives enabled), `rkyv 0.8.18`, `base64 0.23`, the `vault` crate from plan 1, Stalwart `groupware`, `dav`, `store`.
 
-**Spec:** `docs/superpowers/specs/2026-10-06-zero-access-calendar-design.md` (revision 5), sections 6, 7, 8, 10 and invariants 1-5. Plan 1 (`2026-10-06-zero-access-1-accounts.md`) must be complete first; plan 3 follows.
+**Spec:** `docs/superpowers/specs/2026-10-06-zero-access-calendar-design.md` (revision 6), sections 6, 7, 8, 10 and invariants 1-5. Plan 1 (`2026-10-06-zero-access-1-accounts.md`) must be complete first; plan 3 follows.
 
 ## Global Constraints
 

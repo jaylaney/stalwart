@@ -47,7 +47,7 @@ Test harness: `TestServer`/`TestServerBuilder` (`tests/src/utils/server.rs`), on
 
 ## Zero-access fork
 
-Spec: `docs/superpowers/specs/2026-10-06-zero-access-calendar-design.md` (revision 5, approved; binding for plans 2 and 3). Trust model: the operator cannot read data at rest or while the user is logged out; native CalDAV clients stay unmodified; the running server holds plaintext during a session.
+Spec: `docs/superpowers/specs/2026-10-06-zero-access-calendar-design.md` (revision 6, approved; binding for plans 2 and 3). Trust model: the operator cannot read data at rest or while the user is logged out; native CalDAV clients stay unmodified; the running server holds plaintext during a session.
 
 Where the code lives:
 - `crates/vault`: key primitives (`keys`), the vault record (`record`), recovery key, `SessionKeys` (`session`), the key cache (`cache`). `ZA_MARKER = "$za$"`.

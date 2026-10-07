@@ -8,7 +8,9 @@
 
 **Tech Stack:** Stalwart `dav`, `jmap`, `groupware`, `services`, `email` crates; `tests` crate; `store` iteration API.
 
-**Spec:** `docs/superpowers/specs/2026-10-06-zero-access-calendar-design.md` (revision 5), sections 9, 10, 11 and invariants 4, 6, 9, 10. Plans 1 and 2 must be complete first.
+**Spec:** `docs/superpowers/specs/2026-10-06-zero-access-calendar-design.md` (revision 6), sections 9, 10, 11 and invariants 4, 6, 9, 10. Plans 1 and 2 must be complete first.
+
+**Read first:** `2026-10-06-zero-access-plan2-outcome.md`. Its "Facts for plan 3" section lists obligations this plan text predates, including spec decision 7: trace which paths populate the per-account `CalendarEvent.preferences` field for key accounts and decide whether it needs sealing or gating.
 
 ## Global Constraints
 

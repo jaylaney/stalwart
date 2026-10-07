@@ -158,6 +158,8 @@ Other deviations:
 
 ## Decisions that are Jay's to confirm or reverse
 
+Decided 2026-10-07: all seven candidates and the two non-spec items were accepted as recommended and are now spec revision 6 (candidate 7 is carried into plan 3 as an obligation). The list below is kept as the record of what was decided.
+
 Candidates for spec revision 6:
 
 1. Policy amendments R1 (UID visible on every component) and B2
