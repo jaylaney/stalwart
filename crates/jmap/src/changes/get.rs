@@ -4,7 +4,10 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::{api::auth::JmapAuthorization, changes::state::JmapCacheState};
+use crate::{
+    api::{auth::JmapAuthorization, request::za_assert_calendar_allowed},
+    changes::state::JmapCacheState,
+};
 use common::{Server, auth::AccessToken};
 use email::cache::{MessageCacheFetch, email::MessageCacheAccess, mailbox::MailboxCacheAccess};
 use groupware::cache::GroupwareCache;
@@ -91,16 +94,19 @@ impl ChangesLookup for Server {
             }
             MethodObject::Calendar => {
                 access_token.assert_has_access(request.account_id, Collection::Calendar)?;
+                za_assert_calendar_allowed(self, request.account_id).await?;
 
                 (SyncCollection::Calendar, true)
             }
             MethodObject::CalendarEvent => {
                 access_token.assert_has_access(request.account_id, Collection::CalendarEvent)?;
+                za_assert_calendar_allowed(self, request.account_id).await?;
 
                 (SyncCollection::Calendar, false)
             }
             MethodObject::CalendarEventNotification => {
                 access_token.assert_is_member(request.account_id)?;
+                za_assert_calendar_allowed(self, request.account_id).await?;
 
                 (SyncCollection::CalendarEventNotification, false)
             }

@@ -126,6 +126,17 @@ impl DavAclHandler for Server {
 
         // Validate ACL
         let acls = container.acls().unwrap();
+
+        // Spec 9: sharing is refused on calendars owned by key accounts.
+        if collection == Collection::Calendar
+            && self
+                .account(account_id)
+                .await
+                .caused_by(trc::location!())?
+                .is_key_account()
+        {
+            return Err(DavError::Code(StatusCode::FORBIDDEN));
+        }
         if !access_token.is_member(account_id)
             && !acls.effective_acl(access_token).contains(Acl::Share)
         {

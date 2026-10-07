@@ -18,6 +18,7 @@ pub mod cors;
 pub mod dav_gate;
 pub mod dav_seal;
 pub mod disabled;
+pub mod gating;
 pub mod password;
 pub mod registry;
 pub mod setup;
@@ -92,6 +93,7 @@ pub async fn za_tests() {
     dav_seal::test(&mut test).await;
     dav_seal::test_reports(&mut test).await;
     dav_seal::test_collections(&mut test).await;
+    gating::test(&mut test).await;
 
     destroy_key_accounts(&test).await;
     test.assert_is_empty().await;
