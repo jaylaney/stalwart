@@ -490,6 +490,11 @@ async fn build_calendar_document(
         return Ok(BuildResult::NotIndexed);
     };
 
+    // Spec 9: nothing readable to index for key accounts.
+    if server.account(account_id).await?.is_key_account() {
+        return Ok(BuildResult::NotIndexed);
+    }
+
     match server
         .store()
         .get_value::<Archive<AlignedBytes>>(ValueKey::archive(

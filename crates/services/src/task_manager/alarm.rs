@@ -470,64 +470,67 @@ async fn build_template(
     let mut conference = None;
     let mut organizer = None;
     let mut guests = vec![];
+    let generic = account_info.account().is_key_account();
 
-    for entry in alarm_component.entries.iter() {
-        match &entry.name {
-            ArchivedICalendarProperty::Summary => {
-                summary = entry.values.first().and_then(|v| v.as_text());
+    if !generic {
+        for entry in alarm_component.entries.iter() {
+            match &entry.name {
+                ArchivedICalendarProperty::Summary => {
+                    summary = entry.values.first().and_then(|v| v.as_text());
+                }
+                ArchivedICalendarProperty::Description => {
+                    description = entry.values.first().and_then(|v| v.as_text());
+                }
+                ArchivedICalendarProperty::Attendee => {
+                    rcpt_to = entry
+                        .values
+                        .first()
+                        .and_then(|v| v.as_text())
+                        .map(strip_mailto_scheme)
+                        .and_then(sanitize_email);
+                }
+                _ => {}
             }
-            ArchivedICalendarProperty::Description => {
-                description = entry.values.first().and_then(|v| v.as_text());
-            }
-            ArchivedICalendarProperty::Attendee => {
-                rcpt_to = entry
-                    .values
-                    .first()
-                    .and_then(|v| v.as_text())
-                    .map(strip_mailto_scheme)
-                    .and_then(sanitize_email);
-            }
-            _ => {}
         }
-    }
 
-    for entry in event_component.entries.iter() {
-        match &entry.name {
-            ArchivedICalendarProperty::Summary if summary.is_none() => {
-                summary = entry.values.first().and_then(|v| v.as_text());
-            }
-            ArchivedICalendarProperty::Description if description.is_none() => {
-                description = entry.values.first().and_then(|v| v.as_text());
-            }
-            ArchivedICalendarProperty::Location => {
-                location = entry.values.first().and_then(|v| v.as_text());
-            }
-            ArchivedICalendarProperty::Conference if conference.is_none() => {
-                conference = entry.values.first().and_then(|v| v.as_text());
-            }
-            ArchivedICalendarProperty::Organizer | ArchivedICalendarProperty::Attendee => {
-                let email = entry
-                    .values
-                    .first()
-                    .and_then(|v| v.as_text())
-                    .map(strip_mailto_scheme);
-                let name = entry.params.iter().find_map(|param| {
-                    if let ArchivedICalendarParameterName::Cn = param.name {
-                        param.value.as_text()
-                    } else {
-                        None
-                    }
-                });
+        for entry in event_component.entries.iter() {
+            match &entry.name {
+                ArchivedICalendarProperty::Summary if summary.is_none() => {
+                    summary = entry.values.first().and_then(|v| v.as_text());
+                }
+                ArchivedICalendarProperty::Description if description.is_none() => {
+                    description = entry.values.first().and_then(|v| v.as_text());
+                }
+                ArchivedICalendarProperty::Location => {
+                    location = entry.values.first().and_then(|v| v.as_text());
+                }
+                ArchivedICalendarProperty::Conference if conference.is_none() => {
+                    conference = entry.values.first().and_then(|v| v.as_text());
+                }
+                ArchivedICalendarProperty::Organizer | ArchivedICalendarProperty::Attendee => {
+                    let email = entry
+                        .values
+                        .first()
+                        .and_then(|v| v.as_text())
+                        .map(strip_mailto_scheme);
+                    let name = entry.params.iter().find_map(|param| {
+                        if let ArchivedICalendarParameterName::Cn = param.name {
+                            param.value.as_text()
+                        } else {
+                            None
+                        }
+                    });
 
-                if email.is_some() || name.is_some() {
-                    if matches!(entry.name, ArchivedICalendarProperty::Organizer) {
-                        organizer = Some((email, name));
-                    } else {
-                        guests.push((email, name));
+                    if email.is_some() || name.is_some() {
+                        if matches!(entry.name, ArchivedICalendarProperty::Organizer) {
+                            organizer = Some((email, name));
+                        } else {
+                            guests.push((email, name));
+                        }
                     }
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
 
@@ -583,12 +586,16 @@ async fn build_template(
         }),
         DateStyle::Short,
     );
-    let subject = format!(
-        "{}: {} @ {}",
-        locale.calendar_alarm_subject_prefix,
-        summary.or(description).unwrap_or("No Subject"),
-        start
-    );
+    let subject = if generic {
+        format!("{}: {}", locale.calendar_alarm_subject_prefix, start)
+    } else {
+        format!(
+            "{}: {} @ {}",
+            locale.calendar_alarm_subject_prefix,
+            summary.or(description).unwrap_or("No Subject"),
+            start
+        )
+    };
     let organizer = organizer
         .map(|(email, name)| match (email, name) {
             (Some(email), Some(name)) => format!("{} <{}>", name, email),
