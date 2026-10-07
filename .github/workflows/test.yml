@@ -2,6 +2,10 @@ name: Test
 
 on:
   workflow_dispatch:
+  push:
+    branches: [zero-access]
+  pull_request:
+    branches: [zero-access]
 
 jobs:
   style:
@@ -55,3 +59,14 @@ jobs:
 
       - name: JMAP Tests
         run: cargo test -p tests jmap -- --nocapture
+
+      - name: Zero-access Tests
+        run: cargo test -p tests za::za_tests -- --nocapture
+
+      - name: CalDAV Tests (plain accounts)
+        run: cargo test -p tests webdav::webdav_tests -- --nocapture
+
+      - name: CalDAV Tests (key accounts)
+        run: cargo test -p tests webdav::webdav_tests -- --nocapture
+        env:
+          ZA_KEY_ACCOUNTS: "1"

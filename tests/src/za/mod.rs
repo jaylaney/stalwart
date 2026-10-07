@@ -19,6 +19,7 @@ pub mod dav_gate;
 pub mod dav_seal;
 pub mod disabled;
 pub mod gating;
+pub mod leak;
 pub mod password;
 pub mod registry;
 pub mod setup;
@@ -95,6 +96,7 @@ pub async fn za_tests() {
     dav_seal::test_collections(&mut test).await;
     gating::test(&mut test).await;
     gating::test_scheduling(&mut test).await;
+    leak::test(&mut test).await;
 
     destroy_key_accounts(&test).await;
     test.assert_is_empty().await;

@@ -451,7 +451,7 @@ pub async fn test_reports(test: &mut TestServer) {
 
 /// MKCALENDAR with the Apple `calendar-color` dead property; the helper in
 /// `utils/webdav.rs` does not declare the `C:` prefix for MKCOL bodies.
-fn mkcalendar_body(props: &[(&str, &str)]) -> String {
+pub(super) fn mkcalendar_body(props: &[(&str, &str)]) -> String {
     let mut body = concat!(
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>",
         "<A:mkcalendar xmlns:D=\"DAV:\" xmlns:A=\"urn:ietf:params:xml:ns:caldav\" ",
