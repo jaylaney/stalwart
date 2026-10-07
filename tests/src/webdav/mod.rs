@@ -82,20 +82,30 @@ pub async fn webdav_tests() {
             &["mike@example.com"],
         ),
     ] {
-        let account = admin
-            .create_user_account(
-                name,
-                secret,
-                description,
-                aliases,
-                vec![
-                    Permission::UnlimitedRequests,
-                    Permission::UnlimitedUploads,
-                    Permission::DavPrincipalList,
-                    Permission::DavPrincipalSearch,
-                ],
-            )
-            .await;
+        let permissions = vec![
+            Permission::UnlimitedRequests,
+            Permission::UnlimitedUploads,
+            Permission::DavPrincipalList,
+            Permission::DavPrincipalSearch,
+        ];
+        let account = if key_accounts_mode() {
+            let account = admin
+                .create_key_user_account(name, secret, description, aliases, permissions)
+                .await;
+            let account_id = account.id().document_id();
+            assert!(
+                test.server
+                    .account(account_id)
+                    .await
+                    .unwrap()
+                    .is_key_account()
+            );
+            account
+        } else {
+            admin
+                .create_user_account(name, secret, description, aliases, permissions)
+                .await
+        };
         if name == "mike@example.com" {
             admin
                 .registry_update_object(
@@ -197,6 +207,13 @@ pub async fn webdav_tests() {
     cal_itip::test();
     cal_scheduling::test(&test).await;
 
+    if key_accounts_mode() {
+        // Vault records are exempt from the empty-store scan only while their
+        // account exists: destroying the key accounts must leave none behind.
+        crate::za::destroy_key_accounts(&test).await;
+        test.assert_is_empty().await;
+    }
+
     // Print elapsed time
     let elapsed = start_time.elapsed();
     println!(
@@ -209,6 +226,12 @@ pub async fn webdav_tests() {
     if test.is_reset() {
         test.temp_dir.delete();
     }
+}
+
+/// `ZA_KEY_ACCOUNTS=1`: every test user is a zero-access key account,
+/// provisioned through the account API (setup token, then setup).
+pub fn key_accounts_mode() -> bool {
+    std::env::var("ZA_KEY_ACCOUNTS").is_ok_and(|v| v == "1")
 }
 
 pub trait DavResourcesTest {

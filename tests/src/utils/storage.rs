@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::utils::cleanup::{search_store_destroy, store_assert_is_empty};
+use crate::utils::cleanup::{search_store_destroy, store_assert_is_empty_except_vaults};
 use crate::utils::registry::UnwrapRegistryId;
 use common::Server;
 use registry::schema::structs::{Task, TaskStatus};
@@ -246,12 +246,23 @@ pub async fn assert_is_empty(server: &Server, include_registry: bool) {
     wait_for_tasks(server, false, false).await;
 
     // Assert is empty
-    store_assert_is_empty(
+    let vault_accounts = store_assert_is_empty_except_vaults(
         server.store(),
         server.core.storage.blob.clone(),
         include_registry,
     )
     .await;
+    for account_id in vault_accounts {
+        assert!(
+            server
+                .registry()
+                .object::<registry::schema::structs::Account>(account_id.into())
+                .await
+                .unwrap()
+                .is_some(),
+            "Found a zero-access vault record of destroyed account {account_id}"
+        );
+    }
     search_store_destroy(server.search_store()).await;
 
     // Clean caches

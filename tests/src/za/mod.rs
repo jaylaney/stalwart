@@ -8,6 +8,7 @@ use crate::utils::server::{TestServer, TestServerBuilder};
 use ::registry::schema::{enums::Permission, prelude::Property, structs::Http};
 
 pub mod app_password;
+pub mod caches;
 pub mod cors;
 pub mod password;
 pub mod registry;
@@ -60,6 +61,7 @@ pub async fn za_tests() {
     totp::test(&mut test).await;
     registry::test(&mut test).await;
     cors::test(&mut test).await;
+    caches::test(&mut test).await;
 
     destroy_key_accounts(&test).await;
     test.assert_is_empty().await;
@@ -78,8 +80,8 @@ pub fn user_permissions() -> Vec<Permission> {
     ]
 }
 
-/// Vault records live in the Principal property subspace, which
-/// `assert_is_empty` scans, so every key account is destroyed at the end.
+/// `assert_is_empty` allows a vault record only while its account exists;
+/// destroying every key account at the end checks that none outlives it.
 pub async fn destroy_key_accounts(test: &TestServer) {
     let admin = test.account("admin@example.com");
     let accounts: Vec<_> = test

@@ -11,11 +11,28 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Sliding idle timeout of a resident entry (spec 5: 15 minutes).
+pub const DEFAULT_IDLE_SECS: u64 = 900;
+/// Hard cap from insertion, however often the entry is used (spec 5: 60 minutes).
+pub const DEFAULT_MAX_AGE_SECS: u64 = 3600;
+/// Entry bound; the least recently used entry is evicted beyond it.
+pub const DEFAULT_MAX_ENTRIES: usize = 10_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyCacheConfig {
     pub idle: Duration,
     pub max_age: Duration,
     pub max_entries: usize,
+}
+
+impl Default for KeyCacheConfig {
+    fn default() -> Self {
+        KeyCacheConfig {
+            idle: Duration::from_secs(DEFAULT_IDLE_SECS),
+            max_age: Duration::from_secs(DEFAULT_MAX_AGE_SECS),
+            max_entries: DEFAULT_MAX_ENTRIES,
+        }
+    }
 }
 
 impl KeyCacheConfig {
@@ -29,9 +46,9 @@ impl KeyCacheConfig {
                 .unwrap_or(default)
         }
         KeyCacheConfig {
-            idle: Duration::from_secs(var("ZA_KEY_IDLE_SECS", 900u64)),
-            max_age: Duration::from_secs(var("ZA_KEY_MAX_AGE_SECS", 3600u64)),
-            max_entries: var("ZA_KEY_MAX_ENTRIES", 10_000usize).max(1),
+            idle: Duration::from_secs(var("ZA_KEY_IDLE_SECS", DEFAULT_IDLE_SECS)),
+            max_age: Duration::from_secs(var("ZA_KEY_MAX_AGE_SECS", DEFAULT_MAX_AGE_SECS)),
+            max_entries: var("ZA_KEY_MAX_ENTRIES", DEFAULT_MAX_ENTRIES).max(1),
         }
     }
 }
