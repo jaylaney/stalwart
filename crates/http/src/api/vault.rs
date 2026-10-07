@@ -12,8 +12,9 @@ use crate::auth::authenticate::Authenticator;
 use ::vault::{
     ZA_MARKER,
     keys::{
-        Argon2Params, Secret, aad, app_aad, derive_app_kek, derive_kek, derive_recovery_kek,
-        derive_verifier_hash, generate_keypair, unwrap_key, wrap_key,
+        AAD_PASSWORD, AAD_PRIVATE_KEY, AAD_RECOVERY, Argon2Params, Secret, aad, app_aad,
+        derive_app_kek, derive_kek, derive_recovery_kek, derive_verifier_hash, generate_keypair,
+        unwrap_key, wrap_key,
     },
     record::{AppWrap, VaultRecord, VaultState, WrapState},
     recovery::RecoveryKey,
@@ -603,7 +604,7 @@ async fn za_set_password(
     record.salt = salt.to_vec();
     record.set_argon2_params(params);
     record.verifier_hash = derive_verifier_hash(&root).to_vec();
-    record.password_wrap = wrap_key(mk, &derive_kek(&root), &aad("password", account_id));
+    record.password_wrap = wrap_key(mk, &derive_kek(&root), &aad(AAD_PASSWORD, account_id));
     Ok(())
 }
 
@@ -612,7 +613,7 @@ fn za_set_recovery(record: &mut VaultRecord, account_id: u32, mk: &Secret) -> Re
     record.recovery_wrap = wrap_key(
         mk,
         &derive_recovery_kek(key.as_bytes()),
-        &aad("recovery", account_id),
+        &aad(AAD_RECOVERY, account_id),
     );
     key
 }
@@ -784,7 +785,7 @@ async fn za_setup(
     let recovery = za_set_recovery(&mut record, account_id, &mk);
     let (public, private) = generate_keypair();
     record.public_key = public.to_vec();
-    record.private_key_wrap = wrap_key(&private, &mk, &aad("private-key", account_id));
+    record.private_key_wrap = wrap_key(&private, &mk, &aad(AAD_PRIVATE_KEY, account_id));
     record.state = VaultState::Active;
     record.setup_token_hash.clear();
     record.setup_token_expires = 0;
@@ -881,7 +882,7 @@ async fn za_recover(
     let Ok(mk) = unwrap_key(
         &read.record.recovery_wrap,
         &derive_recovery_kek(key.as_bytes()),
-        &aad("recovery", account_id),
+        &aad(AAD_RECOVERY, account_id),
     ) else {
         return Err(za_auth_failure(server, session.remote_ip, &request.username).await);
     };

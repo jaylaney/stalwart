@@ -8,14 +8,14 @@ use crate::{Server, cache::invalidate::CacheInvalidationBuilder, ipc::CacheInval
 use ::vault::{
     Zeroizing,
     keys::{
-        Argon2Params, Secret, aad, app_aad, derive_app_kek, derive_kek, derive_root, unwrap_key,
-        verifier_matches,
+        AAD_PASSWORD, Argon2Params, Secret, aad, app_aad, derive_app_kek, derive_kek, derive_root,
+        unwrap_key, verifier_matches,
     },
     record::{VAULT_RECORD_VERSION, VaultRecord, VaultState, WrapState},
     session::SessionKeys,
 };
 use directory::core::secret::verify_totp_code;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use store::{
     Deserialize, IterateParams, Serialize, Store, ValueKey,
     write::{AlignedBytes, Archive, Archiver, BatchBuilder, ValueClass, assert::AssertValue},
@@ -229,17 +229,39 @@ pub enum ZaVerification {
     NoRecord,
 }
 
-/// Argon2id on the blocking pool, like `hash_secret` (spec 10). A failure is
-/// a server fault, not an authentication failure; it never carries the
-/// password or the salt.
+/// Process-wide bound on concurrent Argon2 derivations. Each one allocates
+/// `m_cost_kib` (64 MiB with the production parameters), so the transient
+/// memory of key derivation is at most one such allocation per available
+/// core (64 MiB x `available_parallelism`); further logins queue for a
+/// permit instead of each spawning its own blocking derivation.
+static ZA_DERIVE_PERMITS: LazyLock<tokio::sync::Semaphore> = LazyLock::new(|| {
+    tokio::sync::Semaphore::new(
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+            .max(1),
+    )
+});
+
+/// Argon2id on the blocking pool, like `hash_secret` (spec 10), at most
+/// `ZA_DERIVE_PERMITS` at a time. A failure is a server fault, not an
+/// authentication failure; it never carries the password or the salt.
 pub async fn za_derive_root(
     password: &str,
     salt: [u8; 16],
     params: Argon2Params,
 ) -> trc::Result<Secret> {
     let password = Zeroizing::new(password.as_bytes().to_vec());
+    let permit = ZA_DERIVE_PERMITS.acquire().await.map_err(|_| {
+        trc::EventType::Server(trc::ServerEvent::ThreadError)
+            .caused_by(trc::location!())
+            .details("Zero-access key derivation limiter closed")
+    })?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::task::spawn_blocking(move || {
+        // The permit lives as long as the derivation, also when the caller
+        // stops waiting for it.
+        let _permit = permit;
         tx.send(derive_root(&password, &salt, params)).ok();
     });
     match rx.await {
@@ -303,7 +325,7 @@ async fn za_check_password(
         }
     }
     let kek = derive_kek(&root);
-    let Ok(mk) = unwrap_key(&record.password_wrap, &kek, &aad("password", account_id)) else {
+    let Ok(mk) = unwrap_key(&record.password_wrap, &kek, &aad(AAD_PASSWORD, account_id)) else {
         return Ok(unusable(account_id, "vault password wrap does not open"));
     };
     Ok(ZaVerification::Valid(Arc::new(SessionKeys::new(
@@ -566,7 +588,7 @@ mod tests {
         record.salt = salt.to_vec();
         record.set_argon2_params(TEST_PARAMS);
         record.verifier_hash = derive_verifier_hash(&root).to_vec();
-        record.password_wrap = wrap_key(mk, &derive_kek(&root), &aad("password", 1));
+        record.password_wrap = wrap_key(mk, &derive_kek(&root), &aad(AAD_PASSWORD, 1));
         record
     }
 
@@ -677,6 +699,31 @@ mod tests {
                 .await
                 .unwrap(),
         );
+    }
+
+    #[tokio::test]
+    async fn key_derivation_waits_for_a_permit() {
+        // Hold every permit: a derivation must queue until one is released.
+        let permits = u32::try_from(
+            std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1)
+                .max(1),
+        )
+        .unwrap();
+        let held = ZA_DERIVE_PERMITS.acquire_many(permits).await.unwrap();
+        let derivation = tokio::spawn(za_derive_root("queued", [1u8; 16], TEST_PARAMS));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !derivation.is_finished(),
+            "no derivation runs beyond the bound"
+        );
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(10), derivation)
+            .await
+            .expect("the derivation runs once a permit is free")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

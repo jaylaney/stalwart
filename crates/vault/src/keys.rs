@@ -145,6 +145,13 @@ pub fn derive_event_key(mk: &Secret) -> Secret {
     hkdf_expand(mk.as_bytes(), LABEL_EVENTS)
 }
 
+/// AAD purpose of the primary-password wrap of MK.
+pub const AAD_PASSWORD: &str = "password";
+/// AAD purpose of the recovery-key wrap of MK.
+pub const AAD_RECOVERY: &str = "recovery";
+/// AAD purpose of the X25519 private key wrapped under MK.
+pub const AAD_PRIVATE_KEY: &str = "private-key";
+
 /// Associated data naming the purpose and the account, so a ciphertext
 /// cannot be replayed as a different wrap or on a different account.
 pub fn aad(purpose: &str, account_id: u32) -> Vec<u8> {

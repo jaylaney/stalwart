@@ -132,7 +132,7 @@ impl VaultRecord {
         let before = self.app_wraps.len();
         self.app_wraps.retain(|w| match w.state {
             WrapState::Published => registry_credential_ids.contains(&w.credential_id),
-            WrapState::Pending => now - w.created < PENDING_WRAP_MAX_AGE_SECS,
+            WrapState::Pending => now.saturating_sub(w.created) < PENDING_WRAP_MAX_AGE_SECS,
         });
         before - self.app_wraps.len()
     }
