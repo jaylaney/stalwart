@@ -11,6 +11,7 @@
 - Upstream's `cal_itip` sub-test is timing-sensitive (DTSTAMP index mismatch when a second boundary falls between two iTIP operations); rerun once before treating a failure there as a regression.
 - Never open upstream issues or PRs from this fork (see AGENTS.md).
 - Zero-access account API tests: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests`
+- CalDAV suite against key accounts: `STORE=RocksDb RUST_MIN_STACK=16777216 ZA_KEY_ACCOUNTS=1 cargo test -p tests webdav_tests`. In that mode the `acl`, `cal_alarm`, `cal_scheduling` and `copy_move` modules are skipped until plan 3 adds their key-account variants.
 - Key cache tuning (environment): `ZA_KEY_IDLE_SECS` (900), `ZA_KEY_MAX_AGE_SECS` (3600), `ZA_KEY_MAX_ENTRIES` (10000).
 - Setup tokens expire after 7 days. The admin permission for `setup-token` is `sysAccountUpdate`.
 - Account page origin (environment): `ZA_ACCOUNT_PAGE_ORIGIN`, e.g. `https://account.example.com`. Read once at startup; it is the only origin CORS allows on `/api/vault/*`. Unset, empty or not a valid header value leaves the vault API without CORS headers. Other responses keep the operator's own `Access-Control-Allow-Origin` (or permissive CORS) unchanged.
@@ -22,4 +23,55 @@
 - Corrupt or missing vault record: a key account whose marker has no usable record cannot log in (the refusal names `zero-access vault record missing` in the log). This only arises from data loss; recovery is operator intervention (restore the record from backup). There is no in-band reset: the server cannot recreate the keys.
 - Key cache: unlocked keys are held per node in process memory only, never shared across a cluster or written to disk. Each node applies `ZA_KEY_IDLE_SECS` (sliding idle timeout, 900), `ZA_KEY_MAX_AGE_SECS` (hard cap from login, 3600) and `ZA_KEY_MAX_ENTRIES` (LRU bound, 10000), swept every 30 seconds; a node logs the effective values at startup. Only HTTP requests carry keys; IMAP, POP3, ManageSieve, WebSocket and EventSource sessions never do.
 - Test builds (`test_mode` feature) use weakened Argon2 parameters for new passwords and log a warning at startup; never deploy them.
-- In ZA_KEY_ACCOUNTS=1 mode the acl, cal_alarm, cal_scheduling and copy_move modules are skipped until plan 3 (variants).
+
+## Merging upstream
+
+The fork tracks Stalwart's tagged releases (base 0.16.25). Merge a release
+tag, not the tip of `main`, about once per upstream minor version, with
+`git merge upstream/vX.Y.Z`; never rebase the published branch. Treat each
+merge as a small plan: scan what upstream changed in the hotspot files, merge,
+run the full net below, and have the conflict resolutions reviewed.
+
+Merge hotspots (fork insertions inside upstream files; everything else lives
+in fork-owned modules and merges cleanly):
+
+- `crates/common/src/auth/authentication.rs` (marker diversion in
+  `route_auth_request`) and `crates/http/src/auth/authenticate.rs`
+  (keyed-fingerprint auth cache, restructured).
+- `crates/dav/src/common/uri.rs` (gate call), `crates/dav/src/request.rs`
+  (calendar REPORT prefix check), `crates/dav/src/common/propfind.rs` (the
+  loader's `za_archive_view` call), `crates/dav/src/calendar/{update,get,
+  freebusy,mkcol,proppatch,copy_move}.rs` (seal/unseal insertions).
+- `crates/jmap/src/registry/mapping/{principal,account}.rs` (credential
+  edit refusals).
+- The 24 non-enterprise warnings in `store`, `common`, `jmap` and `services`
+  are upstream's; silence them when those files are touched by a merge, not
+  before.
+
+Storage checks at every merge (the fork never changes a stored struct's
+layout, so upstream migrations keep working; ciphertext rides in existing
+fields and moves with them):
+
+- calcard version: sealed bundles embed calcard's rkyv layout for
+  `ICalendarEntry` and `ICalendarParameter`, and `X-ZA-EXTRA` embeds
+  `types::DeadProperty`. If a merge bumps calcard (pinned at 0.3.x in
+  `crates/groupware/Cargo.toml`) or changes `DeadProperty`, old bundles need a
+  versioned reader keyed on the bundle format byte before the binary ships;
+  the user's key is available at login, so lazy re-sealing is possible.
+- Numeric collisions: `PrincipalField::ZeroAccessVault = 150`
+  (`crates/types/src/field.rs`) and `ACCOUNT_IS_KEY_ACCOUNT = 1 << 9`
+  (`crates/common/src/auth/mod.rs`) sit in gaps upstream has not used; confirm
+  the merge did not take either.
+- Visibility policy: upstream migrations that recompute derived data (time
+  ranges, alarms, the UID index) read only properties the policy keeps
+  visible; a merge that adds a new derived value must be checked against
+  `crates/groupware/src/calendar/seal/policy.rs`.
+- Generated files (`crates/registry/src/schema/*`, `crates/trc/src/event/
+  enums.rs`) carry no fork edits; take upstream's version outright.
+
+Regression net after a merge, in this order: `cargo test -p vault`,
+`-p groupware`, `-p common`, `-p http@0.16.25 --features test_mode`;
+`za_tests`; `webdav_tests` in baseline and `ZA_KEY_ACCOUNTS=1` mode; the
+product build warning-free in `vault`, `groupware`, `dav` and `http`. The
+key-account mode of the upstream suite is the real guard: it runs upstream's
+own tests against sealed data.
