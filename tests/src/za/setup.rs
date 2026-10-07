@@ -378,6 +378,90 @@ pub async fn test(test: &mut TestServer) {
     test.insert_account(key5);
 }
 
+/// The setup token outlives the moment of issue: calendar data that appears
+/// in the still-plain account before `setup` must make `setup` refuse.
+pub async fn test_data_check(test: &mut TestServer) {
+    println!("Running zero-access setup data check tests...");
+    let admin = test.account("admin@example.com").clone();
+    let key6 = admin
+        .create_passwordless_user_account(
+            "key6@example.com",
+            STRONG,
+            "Key Six",
+            &[],
+            user_permissions(),
+        )
+        .await;
+    let key6_id = key6.id().document_id();
+    let token = za_setup_token(&admin, "key6@example.com").await;
+
+    // Plaintext calendar data arrives behind the DAV gate (which already
+    // refuses a pending account), as an internal write would.
+    let calendar_id = 0u32;
+    {
+        use groupware::calendar::{Calendar, CalendarPreferences};
+        let account_info = test.server.account_info(key6_id).await.unwrap();
+        let mut batch = store::write::BatchBuilder::new();
+        Calendar {
+            name: "stray".into(),
+            preferences: vec![CalendarPreferences {
+                account_id: key6_id,
+                name: "stray".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+        .insert(
+            account_info.account_tenant_ids(),
+            key6_id,
+            calendar_id,
+            &mut batch,
+        )
+        .unwrap();
+        test.server.commit_batch(batch).await.unwrap();
+    }
+    let body = json!({ "username": "key6@example.com", "token": token, "password": STRONG });
+    let reply = za_post("setup", &body).await.expect(409);
+    assert_eq!(reply["error"], "account already holds calendar data");
+
+    // Remove the data: the same token still works.
+    {
+        use groupware::{DestroyArchive, calendar::Calendar};
+        use store::{
+            ValueKey,
+            write::{AlignedBytes, Archive},
+        };
+        use types::collection::Collection;
+        let account_info = test.server.account_info(key6_id).await.unwrap();
+        let archive = test
+            .server
+            .store()
+            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                key6_id,
+                Collection::Calendar,
+                calendar_id,
+            ))
+            .await
+            .unwrap()
+            .expect("calendar archive");
+        let mut batch = store::write::BatchBuilder::new();
+        DestroyArchive(archive.to_unarchived::<Calendar>().unwrap())
+            .delete(
+                account_info.account_tenant_ids(),
+                key6_id,
+                calendar_id,
+                None,
+                &mut batch,
+            )
+            .unwrap();
+        test.server.commit_batch(batch).await.unwrap();
+    }
+    let mut key6 = key6;
+    key6.recovery_key = Some(za_setup("key6@example.com", &token, STRONG).await);
+    admin.destroy_account(key6).await;
+    test.wait_for_tasks().await;
+}
+
 async fn set_auth_ban_rate(admin: &Account, count: u64) {
     admin
         .registry_update_object(

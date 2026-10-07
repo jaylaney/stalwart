@@ -80,6 +80,7 @@ pub async fn za_tests() {
     test.insert_account(admin);
 
     setup::test(&mut test).await;
+    setup::test_data_check(&mut test).await;
     disabled::test(&mut test).await;
     password::test(&mut test).await;
     app_password::test(&mut test).await;

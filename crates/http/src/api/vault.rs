@@ -662,14 +662,8 @@ async fn za_setup_token(
     let has_credentials = reg.account.credentials.values().next().is_some();
 
     // Data checks apply to initial issuance and to reissuance (spec 4.1).
-    for collection in [
-        Collection::Calendar,
-        Collection::CalendarEvent,
-        Collection::CalendarEventNotification,
-    ] {
-        if server.za_has_documents(account_id, collection).await? {
-            return Ok(conflict("account already holds calendar data"));
-        }
+    if let Some(response) = za_assert_no_calendar_data(server, account_id).await? {
+        return Ok(response);
     }
 
     let token = URL_SAFE_NO_PAD.encode(store::rand::random::<[u8; 32]>());
@@ -749,6 +743,24 @@ async fn za_assert_enabled(server: &Server, account_id: u32) -> trc::Result<()> 
     }
 }
 
+/// Refuses an account that already holds calendar data: setup would
+/// otherwise convert plaintext into a key account.
+async fn za_assert_no_calendar_data(
+    server: &Server,
+    account_id: u32,
+) -> trc::Result<Option<HttpResponse>> {
+    for collection in [
+        Collection::Calendar,
+        Collection::CalendarEvent,
+        Collection::CalendarEventNotification,
+    ] {
+        if server.za_has_documents(account_id, collection).await? {
+            return Ok(Some(conflict("account already holds calendar data")));
+        }
+    }
+    Ok(None)
+}
+
 async fn za_setup(
     server: &Server,
     session: &HttpSessionData,
@@ -785,6 +797,10 @@ async fn za_setup(
     }
     za_assert_enabled(server, account_id).await?;
     za_check_new_password(server, &request.password, &request.username)?;
+    // The token may be days old: data can have arrived since issuance.
+    if let Some(response) = za_assert_no_calendar_data(server, account_id).await? {
+        return Ok(response);
+    }
 
     // Generate everything (spec 3). Nothing comes from an admin-supplied password.
     let mk = Secret::random();
