@@ -14,9 +14,8 @@
 //! `X-ZA-KEY`.
 
 use super::tree::{
-    EXTRA_PROP, KEY_PROP, SEALED_PROP, SealError, entry_text, has_stray_carriers, is_carrier,
-    open_archive, open_key_envelope, seal_bytes, seal_key_envelope, seal_tree, text_entry,
-    unseal_tree,
+    EXTRA_PROP, KEY_PROP, SealError, entry_text, has_stray_carriers, is_carrier, open_archive,
+    open_key_envelope, seal_bytes, seal_key_envelope, seal_tree, text_entry, unseal_tree,
 };
 use crate::calendar::CalendarEvent;
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -199,6 +198,7 @@ pub fn unseal_event_archive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::calendar::seal::tree::SEALED_PROP;
     use crate::calendar::{CalendarEvent, CalendarEventData};
     use calcard::{
         Entry, Parser,

@@ -25,6 +25,7 @@ use crate::{
         lock::{LockRequest, LockRequestHandler},
         propfind::PropFindRequestHandler,
         uri::DavUriResource,
+        za::za_calendar_report_uri,
     },
     file::{
         copy_move::FileCopyMoveRequestHandler, delete::FileDeleteRequestHandler,
@@ -275,6 +276,7 @@ impl DavRequestDispatcher for Server {
                     .await
                 }
                 Report::CalendarQuery(report) => {
+                    za_calendar_report_uri(resource)?;
                     // Validate permissions
                     let access_token =
                         access_token.assert_has_permission(Permission::DavCalQuery)?;
@@ -283,6 +285,7 @@ impl DavRequestDispatcher for Server {
                         .await
                 }
                 Report::CalendarMultiGet(report) => {
+                    za_calendar_report_uri(resource)?;
                     // Validate permissions
                     let access_token =
                         access_token.assert_has_permission(Permission::DavCalMultiGet)?;
@@ -294,6 +297,7 @@ impl DavRequestDispatcher for Server {
                     .await
                 }
                 Report::FreeBusyQuery(report) => {
+                    za_calendar_report_uri(resource)?;
                     // Validate permissions
                     let access_token =
                         access_token.assert_has_permission(Permission::DavCalFreeBusyQuery)?;

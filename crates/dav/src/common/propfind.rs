@@ -1518,6 +1518,11 @@ async fn multiget(
                 return Err(err);
             }
         };
+        // Zero-access: an href is read only from this REPORT's collection.
+        if resource.collection != collection_container {
+            response.add_response(Response::new_status([item], StatusCode::NOT_FOUND));
+            continue;
+        }
 
         let account_id = resource.account_id;
         let resources = data
