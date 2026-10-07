@@ -1337,14 +1337,10 @@ async fn za_totp(
     if let Some(url) = &otp_auth {
         match verify_totp_code(url, confirm.as_deref().unwrap_or_default()) {
             Ok(true) => (),
-            // 401 without fail2ban accounting: the caller has just proved
-            // the password (and any current code); a mistyped confirmation
-            // guesses nothing.
+            // A wrong confirmation is a wrong credential: delay and
+            // fail2ban accounting like a wrong TOTP code (controller ruling).
             Ok(false) => {
-                return Err(trc::AuthEvent::Failed
-                    .into_err()
-                    .ctx(trc::Key::AccountName, request.username)
-                    .details("TOTP confirmation code does not match the new otp_auth"));
+                return Err(za_auth_failure(server, session.remote_ip, &request.username).await);
             }
             Err(_) => return Err(bad_request("otp_auth is not a valid otpauth:// URL.")),
         }
