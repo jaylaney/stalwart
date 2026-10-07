@@ -66,7 +66,7 @@ Invariants (spec section 12):
 - Sealing never adds, removes or reorders iCalendar components; visibility is an allowlist; the index builder only sees the stored sealed archive.
 - Keep the fork diff narrow: new modules plus one-line call insertions at existing sites. Merge hotspots with upstream are `http/src/auth/authenticate.rs` and `common/src/auth/authentication.rs`.
 
-Status: plan 1 (accounts) is done at `98883a42`. Plan 2 (sealing, `...-2-sealing.md`) and plan 3 (gating, `...-3-gating.md`) are next; the outcome note lists deferred findings, decisions awaiting Jay's confirmation, and facts for both plans. The key-account web page (product name Circulo) lives in a separate repository, `~/Development/circulo-account` (`jaylaney/circulo-account`); its endpoint contract is `docs/api.md` there.
+Status: plan 1 (accounts) is done at `98883a42` and plan 2 (sealing) at `ac0bcdca`; read `docs/superpowers/plans/2026-10-06-zero-access-plan2-outcome.md` before plan 3 (gating, `...-3-gating.md`), which is next. The outcome notes list deferred findings, decisions awaiting Jay's confirmation (spec revision 6 candidates), and facts for plan 3. The key-account web page (product name Circulo) lives in a separate repository, `~/Development/circulo-account` (`jaylaney/circulo-account`); its endpoint contract is `docs/api.md` there.
 
 ## Working conventions
 
