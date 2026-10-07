@@ -17,12 +17,14 @@ use calcard::icalendar::{
     ICalendar, ICalendarComponent, ICalendarEntry, ICalendarParameter, ICalendarProperty,
     ICalendarValue,
 };
-use vault::keys::{Secret, aad, open, seal};
+use vault::keys::{Secret, aad, open, seal, unwrap_key, wrap_key};
 
 pub const SEALED_PROP: &str = "X-ZA-SEALED";
 pub const KEY_PROP: &str = "X-ZA-KEY";
 pub const EXTRA_PROP: &str = "X-ZA-EXTRA";
 pub(crate) const FORMAT_V1: u8 = 1;
+/// Wrap type `mk` (spec 7.1). `0x02` is reserved for `pk`.
+const WRAP_MK: u8 = 1;
 const PAD: usize = 256;
 
 /// One component's removals. Entry indices refer to the original entry list;
@@ -117,12 +119,9 @@ pub fn entry_text(entry: &ICalendarEntry) -> Option<&str> {
 
 /// True if any component carries an `X-ZA-*` property, ours or a client's.
 pub fn tree_has_carriers(ical: &ICalendar) -> bool {
-    ical.components.iter().any(|c| {
-        c.entries.iter().any(|e| {
-            matches!(&e.name, ICalendarProperty::Other(n)
-                if n.len() > 5 && n.as_bytes()[..5].eq_ignore_ascii_case(b"X-ZA-"))
-        })
-    })
+    ical.components
+        .iter()
+        .any(|c| c.entries.iter().any(is_za_entry))
 }
 
 fn is_za_entry(entry: &ICalendarEntry) -> bool {
@@ -142,6 +141,29 @@ pub(super) fn has_stray_carriers(ical: &ICalendar) -> bool {
         };
         entries.iter().any(is_za_entry)
     })
+}
+
+/// A key envelope: `policy version || wrap type || wrapped DEK`, the DEK
+/// wrapped under the account's event wrapping key (spec 7.1, 7.2).
+pub(super) fn seal_key_envelope(dek: &Secret, ewk: &Secret, aad: &[u8]) -> Vec<u8> {
+    let mut envelope = vec![POLICY_VERSION, WRAP_MK];
+    envelope.extend_from_slice(&wrap_key(dek, ewk, aad));
+    envelope
+}
+
+/// Opens a key envelope written by `seal_key_envelope`.
+pub(super) fn open_key_envelope(
+    envelope: &[u8],
+    ewk: &Secret,
+    aad: &[u8],
+) -> Result<Secret, SealError> {
+    match envelope {
+        [POLICY_VERSION, WRAP_MK, wrapped @ ..] => {
+            unwrap_key(wrapped, ewk, aad).map_err(|_| SealError::Aead)
+        }
+        [version, ..] if *version != POLICY_VERSION => Err(SealError::Policy(*version)),
+        _ => Err(SealError::Format),
+    }
 }
 
 /// Length prefix, zero padding to 256 bytes, XChaCha20-Poly1305, base64 of

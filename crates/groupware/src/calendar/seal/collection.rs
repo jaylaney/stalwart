@@ -16,9 +16,9 @@
 //! own `name` (the URL slug), sort order, flags and default alerts stay
 //! visible.
 
-use super::{
-    policy::POLICY_VERSION,
-    tree::{SealError, has_stray_carriers, open_archive, seal_bytes, seal_tree, unseal_tree},
+use super::tree::{
+    SealError, has_stray_carriers, open_archive, open_key_envelope, seal_bytes, seal_key_envelope,
+    seal_tree, unseal_tree,
 };
 use crate::calendar::{Calendar, Timezone};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -28,15 +28,13 @@ use store::{
 };
 use types::dead_property::DeadProperty;
 use vault::{
-    keys::{Secret, aad, unwrap_key, wrap_key},
+    keys::{Secret, aad},
     session::SessionKeys,
 };
 
 /// Prefix of the owner's `CalendarPreferences.name` when sealed (spec 7.2).
 pub const COLLECTION_MARKER: &str = vault::ZA_MARKER;
 const TZ_SCOPE: &str = "calendar-tz";
-/// Wrap type `mk` (spec 7.1). `0x02` is reserved for `pk`.
-const WRAP_MK: u8 = 1;
 
 /// The stored fields that carry content.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
@@ -49,8 +47,8 @@ struct Bundle {
 
 /// The preferences entry `Calendar::preferences(account_id)` resolves to,
 /// without the panic on an empty list and without `preferences_mut`'s
-/// insertion of a missing entry. Sharing is refused for key accounts, so
-/// this is the owner's only entry.
+/// insertion of a missing entry. Used for reads only: `seal_calendar`
+/// requires the owner's entry to be the only one.
 fn owner_index(calendar: &Calendar, account_id: u32) -> Option<usize> {
     match calendar.preferences.len() {
         0 => None,
@@ -77,6 +75,15 @@ pub fn calendar_is_sealed(calendar: &Calendar, account_id: u32) -> bool {
 /// present whenever any ciphertext in the collection depends on it
 /// (spec 7.2).
 ///
+/// Spec 7.2: a key account's collection holds only the owner's preferences
+/// entry. Anything else is refused, so no other entry can reach the store in
+/// plaintext (upstream write paths append a copy of entry 0 for an account
+/// without an entry).
+///
+/// There is no "already sealed" check: a display name that starts with the
+/// marker is client data and is sealed and restored unchanged, like a
+/// client's `X-ZA-KEY` in an event. Each write path seals exactly once.
+///
 /// On `Err` the collection is unchanged.
 pub fn seal_calendar(
     calendar: &mut Calendar,
@@ -86,16 +93,12 @@ pub fn seal_calendar(
     if keys.account_id != account_id {
         return Err(SealError::Structure("keys of another account"));
     }
-    let index = owner_index(calendar, account_id).ok_or(SealError::Structure("no preferences"))?;
-    if calendar.preferences[index]
-        .name
-        .starts_with(COLLECTION_MARKER)
-    {
-        return Err(SealError::Structure("already sealed"));
+    if !matches!(calendar.preferences.as_slice(), [owner] if owner.account_id == account_id) {
+        return Err(SealError::Structure("preferences other than the owner's"));
     }
     let dek = Secret::random();
     let dead_properties = std::mem::take(&mut calendar.dead_properties);
-    let pref = &mut calendar.preferences[index];
+    let pref = &mut calendar.preferences[0];
     let bundle = Bundle {
         name: std::mem::take(&mut pref.name),
         description: pref.description.take(),
@@ -107,12 +110,7 @@ pub fn seal_calendar(
     }
     let plain = rkyv::to_bytes::<rkyv::rancor::Error>(&bundle)
         .expect("rkyv serialization of in-memory bundle cannot fail");
-    let mut envelope = vec![POLICY_VERSION, WRAP_MK];
-    envelope.extend_from_slice(&wrap_key(
-        &dek,
-        keys.ewk(),
-        &aad("calendar-key", account_id),
-    ));
+    let envelope = seal_key_envelope(&dek, keys.ewk(), &aad("calendar-key", account_id));
     pref.name = format!(
         "{COLLECTION_MARKER}{}|{}",
         STANDARD.encode(envelope),
@@ -142,14 +140,7 @@ pub fn unseal_calendar(
     };
     let (envelope, sealed) = rest.split_once('|').ok_or(SealError::Format)?;
     let envelope = STANDARD.decode(envelope).map_err(|_| SealError::Decode)?;
-    let dek = match envelope.as_slice() {
-        [POLICY_VERSION, WRAP_MK, wrapped @ ..] => {
-            unwrap_key(wrapped, keys.ewk(), &aad("calendar-key", account_id))
-                .map_err(|_| SealError::Aead)?
-        }
-        [version, ..] if *version != POLICY_VERSION => return Err(SealError::Policy(*version)),
-        _ => return Err(SealError::Format),
-    };
+    let dek = open_key_envelope(&envelope, keys.ewk(), &aad("calendar-key", account_id))?;
     let bundle = open_archive::<Bundle>(&dek, &aad("calendar-bundle", account_id), sealed)?;
     if let Timezone::Custom(tz) = &mut pref.time_zone {
         if has_stray_carriers(tz) {
@@ -203,7 +194,7 @@ mod tests {
     use calcard::{Entry, Parser};
     use store::{Serialize, write::Archiver};
     use types::dead_property::{DeadElementTag, DeadPropertyTag};
-    use vault::keys::Secret;
+    use vault::keys::{Secret, unwrap_key};
 
     const TZ: &str = "BEGIN:VCALENDAR\r\nPRODID:-//Example Corp.//CalDAV Client//EN\r\nVERSION:2.0\r\nBEGIN:VTIMEZONE\r\nTZID:US-Eastern\r\nLAST-MODIFIED:19870101T000000Z\r\nX-LIC-LOCATION:America/New_York\r\nBEGIN:STANDARD\r\nDTSTART:19671029T020000\r\nRRULE:FREQ=YEARLY;BYDAY=-1SU;BYMONTH=10\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nTZNAME:Eastern Standard canary\r\nCOMMENT:tz comment canary\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nEND:VCALENDAR\r\n";
 
@@ -379,14 +370,71 @@ mod tests {
     }
 
     #[test]
+    fn only_the_owners_single_entry_is_sealed() {
+        let keys = keys();
+        // A second entry, as upstream's `preferences_mut` appends for an
+        // account without one.
+        let mut two = calendar();
+        let mut other = two.preferences[0].clone();
+        other.account_id = 99;
+        two.preferences.push(other);
+        // The single entry belongs to another account.
+        let mut wrong_owner = calendar();
+        wrong_owner.preferences[0].account_id = 99;
+        let mut none = calendar();
+        none.preferences.clear();
+        for mut c in [two, wrong_owner, none] {
+            let before = c.clone();
+            assert_eq!(
+                seal_calendar(&mut c, &keys, 4),
+                Err(SealError::Structure("preferences other than the owner's"))
+            );
+            assert_eq!(c, before);
+        }
+    }
+
+    #[test]
+    fn marker_in_a_display_name_is_client_data() {
+        let keys = keys();
+        let mut c = calendar();
+        c.preferences[0].name = format!("{COLLECTION_MARKER}abc|x");
+        let original = c.clone();
+        seal_calendar(&mut c, &keys, 4).unwrap();
+        let stored_name = &c.preferences[0].name;
+        assert_ne!(stored_name, &original.preferences[0].name);
+        assert!(stored_name.starts_with(COLLECTION_MARKER));
+        assert!(!stored_name.contains("abc|x"));
+        unseal_calendar(&mut c, &keys, 4).unwrap();
+        assert_eq!(c, original);
+    }
+
+    #[test]
+    fn iana_timezone_and_empty_name_round_trip() {
+        let keys = keys();
+        let mut iana = calendar();
+        iana.preferences[0].time_zone = Timezone::IANA(42);
+        let mut empty_name = calendar();
+        empty_name.preferences[0].name = String::new();
+        empty_name.preferences[0].time_zone = Timezone::Default;
+        for original in [iana, empty_name] {
+            let mut c = original.clone();
+            seal_calendar(&mut c, &keys, 4).unwrap();
+            assert!(calendar_is_sealed(&c, 4));
+            assert!(c.preferences[0].description.is_none());
+            assert_eq!(
+                c.preferences[0].time_zone,
+                original.preferences[0].time_zone
+            );
+            unseal_calendar(&mut c, &keys, 4).unwrap();
+            assert_eq!(c, original);
+        }
+    }
+
+    #[test]
     fn errors() {
         let keys = keys();
         let mut sealed = calendar();
         seal_calendar(&mut sealed, &keys, 4).unwrap();
-        assert_eq!(
-            seal_calendar(&mut sealed.clone(), &keys, 4),
-            Err(SealError::Structure("already sealed"))
-        );
         assert_eq!(
             unseal_calendar(&mut sealed.clone(), &keys, 5),
             Err(SealError::Aead)
@@ -399,7 +447,8 @@ mod tests {
             ),
             Err(SealError::Aead)
         );
-        // Copying to a new document id needs no resealing: the AAD binds the account only.
+        // The archive view of the sealed collection: the AAD binds the
+        // account only, so a fresh archive of the same record opens.
         let stored = archive(&sealed);
         let view = unseal_calendar_archive(&stored, &keys, 4).unwrap();
         assert_eq!(view.version, stored.version);

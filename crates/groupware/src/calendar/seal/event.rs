@@ -13,12 +13,10 @@
 //! order on the root: `X-ZA-SEALED` (if any), `X-ZA-EXTRA` (if any),
 //! `X-ZA-KEY`.
 
-use super::{
-    policy::POLICY_VERSION,
-    tree::{
-        EXTRA_PROP, KEY_PROP, SEALED_PROP, SealError, entry_text, has_stray_carriers, is_carrier,
-        open_archive, seal_bytes, seal_tree, text_entry, unseal_tree,
-    },
+use super::tree::{
+    EXTRA_PROP, KEY_PROP, SEALED_PROP, SealError, entry_text, has_stray_carriers, is_carrier,
+    open_archive, open_key_envelope, seal_bytes, seal_key_envelope, seal_tree, text_entry,
+    unseal_tree,
 };
 use crate::calendar::CalendarEvent;
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -29,12 +27,9 @@ use store::{
 };
 use types::dead_property::DeadProperty;
 use vault::{
-    keys::{Secret, aad, unwrap_key, wrap_key},
+    keys::{Secret, aad},
     session::SessionKeys,
 };
-
-/// Wrap type `mk` (spec 7.1). `0x02` is reserved for `pk`.
-const WRAP_MK: u8 = 1;
 
 /// The stored fields outside the iCalendar tree that carry content.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Clone, PartialEq)]
@@ -122,8 +117,7 @@ pub fn seal_event(
         ));
     }
 
-    let mut envelope = vec![POLICY_VERSION, WRAP_MK];
-    envelope.extend_from_slice(&wrap_key(&dek, keys.ewk(), &key_aad(account_id, &uid)));
+    let envelope = seal_key_envelope(&dek, keys.ewk(), &key_aad(account_id, &uid));
     event.data.event.components[0]
         .entries
         .push(text_entry(KEY_PROP, STANDARD.encode(envelope)));
@@ -154,14 +148,7 @@ pub fn unseal_event(
     let envelope = STANDARD
         .decode(entry_text(&key_entry).ok_or(SealError::Format)?)
         .map_err(|_| SealError::Decode)?;
-    let dek = match envelope.as_slice() {
-        [POLICY_VERSION, WRAP_MK, wrapped @ ..] => {
-            unwrap_key(wrapped, keys.ewk(), &key_aad(account_id, &uid))
-                .map_err(|_| SealError::Aead)?
-        }
-        [version, ..] if *version != POLICY_VERSION => return Err(SealError::Policy(*version)),
-        _ => return Err(SealError::Format),
-    };
+    let dek = open_key_envelope(&envelope, keys.ewk(), &key_aad(account_id, &uid))?;
     let extra = root.entries.pop_if(|e| is_carrier(e, EXTRA_PROP));
     if has_stray_carriers(&event.data.event) {
         return Err(SealError::Structure("misplaced carrier"));
@@ -220,7 +207,7 @@ mod tests {
     };
     use store::{Serialize, write::Archiver};
     use types::dead_property::{DeadElementTag, DeadPropertyTag};
-    use vault::keys::Secret;
+    use vault::keys::{Secret, unwrap_key};
 
     const ICS: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nX-WR-CALNAME:cal canary\r\nBEGIN:VEVENT\r\nUID:ev-1\r\nDTSTAMP:20240101T000000Z\r\nDTSTART;TZID=UTC:20240102T090000\r\nDTEND;TZID=UTC:20240102T100000\r\nSUMMARY:secret summary canary\r\nATTENDEE;CN=Bob:mailto:bob@example.com\r\nBEGIN:VALARM\r\nACTION:EMAIL\r\nTRIGGER:-PT5M\r\nSUMMARY:alarm canary\r\nATTENDEE:mailto:me@example.com\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 
