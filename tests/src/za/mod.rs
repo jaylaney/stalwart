@@ -14,6 +14,7 @@ use ::registry::schema::{
 pub mod app_password;
 pub mod caches;
 pub mod cors;
+pub mod disabled;
 pub mod password;
 pub mod registry;
 pub mod setup;
@@ -70,6 +71,7 @@ pub async fn za_tests() {
     test.insert_account(admin);
 
     setup::test(&mut test).await;
+    disabled::test(&mut test).await;
     password::test(&mut test).await;
     app_password::test(&mut test).await;
     totp::test(&mut test).await;

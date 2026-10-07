@@ -24,7 +24,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use common::{
     Server,
     auth::{
-        AuthRequest,
+        AuthRequest, BuildAccessToken,
         credential::AppPassword,
         vault::{VaultRead, za_argon2_params, za_derive_root},
     },
@@ -733,6 +733,22 @@ async fn za_setup_token(
     Ok(json(SetupTokenResponse { token, expires }))
 }
 
+/// `setup` and `recover` verify their own credential without passing through
+/// `Server::authenticate`, so they enforce its enabled-state rule themselves: an
+/// account (or its tenant) without `Authenticate` is disabled. Called after the
+/// credential check and before any write.
+async fn za_assert_enabled(server: &Server, account_id: u32) -> trc::Result<()> {
+    let token = server.access_token(account_id).await?.build();
+    if token.has_permission(Permission::Authenticate) {
+        Ok(())
+    } else {
+        Err(trc::SecurityEvent::Unauthorized
+            .into_err()
+            .details("zero-access: account disabled")
+            .account_id(account_id))
+    }
+}
+
 async fn za_setup(
     server: &Server,
     session: &HttpSessionData,
@@ -767,6 +783,7 @@ async fn za_setup(
     if !token_ok {
         return Err(za_auth_failure(server, session.remote_ip, &request.username).await);
     }
+    za_assert_enabled(server, account_id).await?;
     za_check_new_password(server, &request.password, &request.username)?;
 
     // Generate everything (spec 3). Nothing comes from an admin-supplied password.
@@ -877,6 +894,7 @@ async fn za_recover(
     ) else {
         return Err(za_auth_failure(server, session.remote_ip, &request.username).await);
     };
+    za_assert_enabled(server, account_id).await?;
     za_check_new_password(server, &request.new_password, &request.username)?;
     let mut record = read.record.clone();
     za_set_password(&mut record, account_id, &mk, &request.new_password).await?;
