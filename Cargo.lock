@@ -3019,6 +3019,7 @@ name = "groupware"
 version = "0.16.25"
 dependencies = [
  "ahash",
+ "base64 0.23.1",
  "calcard",
  "chrono",
  "common",
@@ -3039,6 +3040,7 @@ dependencies = [
  "trc",
  "types",
  "utils",
+ "vault",
 ]
 
 [[package]]
