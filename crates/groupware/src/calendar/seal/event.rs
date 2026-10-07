@@ -16,13 +16,13 @@
 use super::{
     policy::POLICY_VERSION,
     tree::{
-        EXTRA_PROP, KEY_PROP, SEALED_PROP, SealError, entry_text, is_carrier, open_archive,
-        seal_bytes, seal_tree, text_entry, unseal_tree,
+        EXTRA_PROP, KEY_PROP, SEALED_PROP, SealError, entry_text, has_stray_carriers, is_carrier,
+        open_archive, seal_bytes, seal_tree, text_entry, unseal_tree,
     },
 };
 use crate::calendar::CalendarEvent;
 use base64::{Engine, engine::general_purpose::STANDARD};
-use calcard::icalendar::{ICalendar, ICalendarComponentType, ICalendarEntry, ICalendarProperty};
+use calcard::icalendar::ICalendarComponentType;
 use store::{
     Deserialize, Serialize,
     write::{AlignedBytes, Archive, Archiver},
@@ -80,25 +80,6 @@ pub(crate) fn is_sealed(event: &CalendarEvent) -> bool {
         .first()
         .and_then(|root| root.entries.last())
         .is_some_and(|e| is_carrier(e, KEY_PROP))
-}
-
-fn is_za_entry(entry: &ICalendarEntry) -> bool {
-    matches!(&entry.name, ICalendarProperty::Other(n)
-        if n.len() > 5 && n.as_bytes()[..5].eq_ignore_ascii_case(b"X-ZA-"))
-}
-
-/// No `X-ZA-*` name is visible under the policy, so once the root's key
-/// envelope and extra bundle are removed, the only `X-ZA-*` entry a sealed
-/// tree may hold is each component's trailing `X-ZA-SEALED`. Anything else
-/// is a moved or reordered carrier.
-fn has_stray_carriers(ical: &ICalendar) -> bool {
-    ical.components.iter().any(|component| {
-        let entries = match component.entries.split_last() {
-            Some((last, rest)) if is_carrier(last, SEALED_PROP) => rest,
-            _ => component.entries.as_slice(),
-        };
-        entries.iter().any(is_za_entry)
-    })
 }
 
 /// Seals an event immediately before the store write (spec 8.1). Time
@@ -232,7 +213,11 @@ pub fn unseal_event_archive(
 mod tests {
     use super::*;
     use crate::calendar::{CalendarEvent, CalendarEventData};
-    use calcard::{Entry, Parser, common::timezone::Tz, icalendar::ICalendarValue};
+    use calcard::{
+        Entry, Parser,
+        common::timezone::Tz,
+        icalendar::{ICalendarEntry, ICalendarValue},
+    };
     use store::{Serialize, write::Archiver};
     use types::dead_property::{DeadElementTag, DeadPropertyTag};
     use vault::keys::Secret;

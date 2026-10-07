@@ -125,6 +125,25 @@ pub fn tree_has_carriers(ical: &ICalendar) -> bool {
     })
 }
 
+fn is_za_entry(entry: &ICalendarEntry) -> bool {
+    matches!(&entry.name, ICalendarProperty::Other(n)
+        if n.len() > 5 && n.as_bytes()[..5].eq_ignore_ascii_case(b"X-ZA-"))
+}
+
+/// No `X-ZA-*` name is visible under the policy, so once a caller has removed
+/// its own envelope carriers (an event root's key envelope and extra bundle),
+/// the only `X-ZA-*` entry a sealed tree may hold is each component's
+/// trailing `X-ZA-SEALED`. Anything else is a moved or reordered carrier.
+pub(super) fn has_stray_carriers(ical: &ICalendar) -> bool {
+    ical.components.iter().any(|component| {
+        let entries = match component.entries.split_last() {
+            Some((last, rest)) if is_carrier(last, SEALED_PROP) => rest,
+            _ => component.entries.as_slice(),
+        };
+        entries.iter().any(is_za_entry)
+    })
+}
+
 /// Length prefix, zero padding to 256 bytes, XChaCha20-Poly1305, base64 of
 /// `format || nonce || ciphertext`.
 pub fn seal_bytes(dek: &Secret, aad: &[u8], plaintext: &[u8]) -> String {
