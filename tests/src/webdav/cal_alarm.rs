@@ -106,7 +106,7 @@ pub async fn test(test: &TestServer) {
     test.assert_is_empty().await
 }
 
-const TEST_ALARM_1: &str = r#"BEGIN:VCALENDAR
+pub(super) const TEST_ALARM_1: &str = r#"BEGIN:VCALENDAR
 VERSION:2.0
 BEGIN:VEVENT
 UID: 2371c2d9-a136-43b0-bba3-f6ab249ad46e

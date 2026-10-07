@@ -39,6 +39,7 @@ pub mod principals;
 pub mod prop;
 pub mod put_get;
 pub mod sync;
+pub mod za_variants;
 
 // In key-account mode MKCALENDAR seals the new collection, and the sealed
 // preferences name (marker, envelope, padded bundle) is charged against the
@@ -205,33 +206,33 @@ pub async fn webdav_tests() {
     basic::test(&test).await;
     put_get::test(&test).await;
     mkcol::test(&test).await;
-    if !key_accounts_mode() {
-        copy_move::test(&test, assisted_discovery).await;
+    if key_accounts_mode() {
+        za_variants::copy_move(&test).await;
     } else {
-        println!("copy_move: skipped in key-account mode until plan 3 adds the variant");
+        copy_move::test(&test, assisted_discovery).await;
     }
     prop::test(&test, assisted_discovery).await;
     multiget::test(&test).await;
     sync::test(&test).await;
     lock::test(&test).await;
     principals::test(&test, assisted_discovery).await;
-    if !key_accounts_mode() {
-        acl::test(&test).await;
+    if key_accounts_mode() {
+        za_variants::acl(&test).await;
     } else {
-        println!("acl: skipped in key-account mode until plan 3 adds the variant");
+        acl::test(&test).await;
     }
     card_query::test(&test).await;
     cal_query::test(&test).await;
-    if !key_accounts_mode() {
-        cal_alarm::test(&test).await;
+    if key_accounts_mode() {
+        za_variants::alarm(&test).await;
     } else {
-        println!("cal_alarm: skipped in key-account mode until plan 3 adds the variant");
+        cal_alarm::test(&test).await;
     }
     cal_itip::test();
-    if !key_accounts_mode() {
-        cal_scheduling::test(&test).await;
+    if key_accounts_mode() {
+        za_variants::scheduling(&test).await;
     } else {
-        println!("cal_scheduling: skipped in key-account mode until plan 3 adds the variant");
+        cal_scheduling::test(&test).await;
     }
 
     if key_accounts_mode() {
