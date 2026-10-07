@@ -10,9 +10,16 @@ use crate::utils::{
     server::TestServer,
     webdav::DummyWebDavClient,
 };
+use common::auth::oauth::GrantType;
 use dav_proto::schema::property::{DavProperty, PrincipalProperty};
+use groupware::{
+    cache::GroupwareCache,
+    calendar::itip::{ItipIngest, RsvpError, RsvpRequest, RsvpResponse},
+};
 use hyper::StatusCode;
 use serde_json::{Value, json};
+use std::time::Duration;
+use types::collection::SyncCollection;
 
 const CONTENT_TYPE: (&str, &str) = ("content-type", "text/calendar; charset=utf-8");
 
@@ -316,6 +323,248 @@ pub async fn test(test: &mut TestServer) {
         .request("DELETE", &format!("{key_cal}busy.ics"), "")
         .await
         .with_status(StatusCode::NO_CONTENT);
+    plain_client
+        .request("DELETE", plain_cal, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+}
+
+/// Invitation from the key account to the non-key account.
+const KEY_INVITE: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\nUID:za-invite-1\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990102T090000Z\r\nDTEND:20990102T100000Z\r\nSUMMARY:invite-canary\r\nORGANIZER:mailto:key1@example.com\r\nATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:plain@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+/// Invitation from the non-key account to the key account.
+const PLAIN_INVITE: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\nUID:za-invite-2\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990103T090000Z\r\nDTEND:20990103T100000Z\r\nSUMMARY:invite-canary\r\nORGANIZER:mailto:plain@example.com\r\nATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:key1@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+/// Lets iMIP delivery finish: the task manager hands the message to a local
+/// SMTP session, which ingests it outside the task queue (as in
+/// `webdav::cal_scheduling`).
+async fn wait_for_delivery(test: &TestServer) {
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    test.wait_for_tasks().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    test.wait_for_tasks().await;
+}
+
+/// Hrefs of a depth-1 PROPFIND other than the collection itself.
+async fn members(client: &DummyWebDavClient, href: &str) -> Vec<String> {
+    client
+        .request_with_headers("PROPFIND", href, [("depth", "1")], "")
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .hrefs()
+        .into_iter()
+        .filter(|member| *member != href)
+        .map(str::to_string)
+        .collect()
+}
+
+pub async fn test_scheduling(test: &mut TestServer) {
+    println!("Running zero-access scheduling gating tests...");
+    let key1 = test.account("key1@example.com").clone();
+    let key1_id = key1.id().document_id();
+    let key_client =
+        DummyWebDavClient::new(key1_id, "key1@example.com", STRONG, "key1@example.com");
+    let plain = test.account("plain@example.com").clone();
+    // `plain` has no email address, so `webdav_client()` cannot be used.
+    let plain_client = DummyWebDavClient::new(
+        plain.id().document_id(),
+        plain.name(),
+        plain.secret(),
+        plain.name(),
+    );
+    let key_cal = "/dav/cal/key1%40example.com/default/";
+    let key_inbox = "/dav/itip/key1%40example.com/inbox/";
+    let plain_cal = "/dav/cal/plain%40example.com/scheduling/";
+    let plain_inbox = "/dav/itip/plain%40example.com/inbox/";
+
+    // Organizer is a key account: stored, nothing sent, no schedule tag.
+    let response = key_client
+        .request_with_headers(
+            "PUT",
+            &format!("{key_cal}invite.ics"),
+            [CONTENT_TYPE],
+            KEY_INVITE,
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert!(
+        response.headers.get("schedule-tag").is_none(),
+        "{:?}",
+        response.headers
+    );
+    wait_for_delivery(test).await;
+    assert_eq!(
+        members(&plain_client, plain_inbox).await,
+        Vec::<String>::new()
+    );
+
+    // RSVP page: a token for a key account's event is refused as an invalid
+    // link, before the event is read.
+    let document_id = test
+        .server
+        .fetch_dav_resources(key1_id, key1_id, SyncCollection::Calendar)
+        .await
+        .unwrap()
+        .by_path("default/invite.ics")
+        .unwrap()
+        .document_id();
+    for partstat in [None, Some("ACCEPTED".to_string())] {
+        let token = test
+            .server
+            .encode_access_token(
+                GrantType::Rsvp,
+                key1_id,
+                "key1@example.com",
+                3600,
+                Some(&format!("plain@example.com;{document_id}")),
+                None,
+            )
+            .await
+            .unwrap();
+        let response = test
+            .server
+            .http_rsvp_handle(
+                RsvpRequest {
+                    token,
+                    partstat,
+                    comment: None,
+                },
+                "en",
+                "127.0.0.1".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                response,
+                RsvpResponse::Error {
+                    reason: RsvpError::InvalidLink,
+                    ..
+                }
+            ),
+            "{response:?}"
+        );
+    }
+
+    // Deleting the key organizer's event sends no CANCEL.
+    key_client
+        .request("DELETE", &format!("{key_cal}invite.ics"), "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    wait_for_delivery(test).await;
+    assert_eq!(
+        members(&plain_client, plain_inbox).await,
+        Vec::<String>::new()
+    );
+
+    // Attendee is a key account: the invitation (and its cancellation) never
+    // reaches its scheduling inbox or calendar. The email itself may land in
+    // its mailbox; mail is not sealed in this release.
+    plain_client
+        .request(
+            "MKCALENDAR",
+            plain_cal,
+            "<?xml version=\"1.0\" encoding=\"utf-8\" ?><A:mkcalendar xmlns:D=\"DAV:\" xmlns:A=\"urn:ietf:params:xml:ns:caldav\"/>",
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    plain_client
+        .request_with_headers(
+            "PUT",
+            &format!("{plain_cal}invite.ics"),
+            [CONTENT_TYPE],
+            PLAIN_INVITE,
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    wait_for_delivery(test).await;
+    assert_eq!(members(&key_client, key_inbox).await, Vec::<String>::new());
+    assert_eq!(members(&key_client, key_cal).await, Vec::<String>::new());
+
+    // RSVP from the key attendee on the non-key organizer's page: the
+    // organizer's copy records it, the key attendee's own sealed copy is
+    // left alone.
+    let copy = format!("{key_cal}copy.ics");
+    let etag = key_client
+        .request_with_headers("PUT", &copy, [CONTENT_TYPE], PLAIN_INVITE)
+        .await
+        .with_status(StatusCode::CREATED)
+        .headers
+        .get("etag")
+        .cloned()
+        .unwrap();
+    let plain_id = plain.id().document_id();
+    let document_id = test
+        .server
+        .fetch_dav_resources(plain_id, plain_id, SyncCollection::Calendar)
+        .await
+        .unwrap()
+        .by_path("scheduling/invite.ics")
+        .unwrap()
+        .document_id();
+    let token = test
+        .server
+        .encode_access_token(
+            GrantType::Rsvp,
+            plain_id,
+            plain.name(),
+            3600,
+            Some(&format!("key1@example.com;{document_id}")),
+            None,
+        )
+        .await
+        .unwrap();
+    let response = test
+        .server
+        .http_rsvp_handle(
+            RsvpRequest {
+                token,
+                partstat: Some("ACCEPTED".to_string()),
+                comment: None,
+            },
+            "en",
+            "127.0.0.1".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(response, RsvpResponse::Recorded { .. }),
+        "{response:?}"
+    );
+    let organizer_copy = plain_client
+        .request("GET", &format!("{plain_cal}invite.ics"), "")
+        .await
+        .with_status(StatusCode::OK)
+        .body
+        .unwrap();
+    assert!(
+        organizer_copy.contains("PARTSTAT=ACCEPTED"),
+        "{organizer_copy}"
+    );
+    let response = key_client
+        .request("GET", &copy, "")
+        .await
+        .with_status(StatusCode::OK);
+    assert_eq!(response.headers.get("etag"), Some(&etag));
+    key_client
+        .request("DELETE", &copy, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    // The organizer's scheduling inbox holds the reply notification.
+    for member in members(&plain_client, plain_inbox).await {
+        plain_client
+            .request("DELETE", &member, "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+
+    plain_client
+        .request("DELETE", &format!("{plain_cal}invite.ics"), "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    wait_for_delivery(test).await;
+    assert_eq!(members(&key_client, key_inbox).await, Vec::<String>::new());
+    assert_eq!(members(&key_client, key_cal).await, Vec::<String>::new());
     plain_client
         .request("DELETE", plain_cal, "")
         .await

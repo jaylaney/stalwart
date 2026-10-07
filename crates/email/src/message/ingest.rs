@@ -364,6 +364,7 @@ impl EmailIngest for Server {
                 if self.core.groupware.itip_enabled
                     && !is_spam
                     && is_sender_authenticated
+                    && !account.is_key_account()
                     && params
                         .access_token
                         .has_permission(Permission::CalendarSchedulingReceive)
