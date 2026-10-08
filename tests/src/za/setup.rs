@@ -13,6 +13,7 @@ use crate::utils::{
     za::{za_post, za_post_as, za_post_from, za_setup, za_setup_token},
 };
 use common::ipc::{CacheInvalidation, RegistryChange};
+use groupware::calendar::Timezone;
 use http::api::vault::SETUP_TOKEN_TTL_SECS;
 use hyper::StatusCode;
 use registry::{
@@ -478,13 +479,49 @@ pub async fn test_data_check(test: &mut TestServer) {
     );
 
     // 1. Renamed default calendar: user data, refused.
-    insert_default_calendar(test, key6_id, 1, default_name.clone(), "My calendar".into()).await;
+    insert_default_calendar(
+        test,
+        key6_id,
+        1,
+        default_name.clone(),
+        "My calendar".into(),
+        Timezone::Default,
+    )
+    .await;
     let reply = za_post("setup", &body).await.expect(409);
     assert_eq!(reply["error"], "account already holds calendar data");
     remove_calendar(test, key6_id, 1).await;
 
-    // 2. Untouched default calendar plus one event: refused.
-    insert_default_calendar(test, key6_id, 2, default_name.clone(), default_display).await;
+    // 2. Default calendar carrying a custom `calendar-timezone` (sealed
+    //    material under spec 7.2): user data, refused.
+    let vtimezone = calcard::icalendar::ICalendar::parse(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\nBEGIN:VTIMEZONE\r\nTZID:Za/Custom\r\nBEGIN:STANDARD\r\nDTSTART:19700101T000000\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0100\r\nTZNAME:ZAT\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nEND:VCALENDAR\r\n",
+    )
+    .unwrap();
+    assert!(vtimezone.is_timezone());
+    insert_default_calendar(
+        test,
+        key6_id,
+        3,
+        default_name.clone(),
+        default_display.clone(),
+        Timezone::Custom(vtimezone),
+    )
+    .await;
+    let reply = za_post("setup", &body).await.expect(409);
+    assert_eq!(reply["error"], "account already holds calendar data");
+    remove_calendar(test, key6_id, 3).await;
+
+    // 3. Untouched default calendar plus one event: refused.
+    insert_default_calendar(
+        test,
+        key6_id,
+        2,
+        default_name.clone(),
+        default_display,
+        Timezone::Default,
+    )
+    .await;
     let event_id = 0u32;
     {
         use groupware::calendar::{CalendarEvent, CalendarEventData};
@@ -536,7 +573,7 @@ pub async fn test_data_check(test: &mut TestServer) {
         test.server.commit_batch(batch).await.unwrap();
     }
 
-    // 3. Sole untouched default calendar (document 2): the setup below
+    // 4. Sole untouched default calendar (document 2): the setup below
     //    succeeds; the calendar is destroyed with the account.
     let mut key6 = key6;
     key6.recovery_key = Some(za_setup("key6@example.com", &token, STRONG).await);
@@ -545,13 +582,14 @@ pub async fn test_data_check(test: &mut TestServer) {
 }
 
 /// Plants a calendar shaped like upstream's `create_default_calendar`, with
-/// the given calendar name and preferences display name.
+/// the given calendar name, preferences display name and time zone.
 async fn insert_default_calendar(
     test: &TestServer,
     account_id: u32,
     document_id: u32,
     name: String,
     display: String,
+    time_zone: Timezone,
 ) {
     use groupware::calendar::{CALENDAR_SUBSCRIBED, Calendar, CalendarPreferences};
     let account_info = test.server.account_info(account_id).await.unwrap();
@@ -562,6 +600,7 @@ async fn insert_default_calendar(
             account_id,
             name: display,
             flags: CALENDAR_SUBSCRIBED,
+            time_zone,
             ..Default::default()
         }],
         ..Default::default()

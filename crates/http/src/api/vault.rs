@@ -33,7 +33,7 @@ use directory::{
     Credentials,
     core::secret::{hash_secret, verify_totp_code},
 };
-use groupware::calendar::Calendar;
+use groupware::calendar::{ArchivedTimezone, Calendar};
 use http_proto::{HttpRequest, HttpResponse, HttpSessionData};
 use hyper::{
     StatusCode,
@@ -776,7 +776,8 @@ async fn za_assert_no_calendar_data(
 /// True when the account holds any calendar document other than a sole
 /// untouched default calendar: the name `create_default_calendar` gives it,
 /// no ACLs or dead properties, and at most the one preferences entry it
-/// writes (display name unchanged, no description, color or default alerts).
+/// writes (display name unchanged, no description, color, default alerts or
+/// time zone; a custom `calendar-timezone` is sealed material, spec 7.2).
 async fn za_has_user_calendars(server: &Server, account_id: u32) -> trc::Result<bool> {
     let Some(default_name) = server.core.groupware.default_calendar_name.as_deref() else {
         return server
@@ -814,6 +815,7 @@ async fn za_has_user_calendars(server: &Server, account_id: u32) -> trc::Result<
                             && prefs.description.is_none()
                             && prefs.color.is_none()
                             && prefs.default_alerts.is_empty()
+                            && matches!(prefs.time_zone, ArchivedTimezone::Default)
                     }
                     _ => false,
                 };
