@@ -48,9 +48,11 @@ fn assert_allows_origin(response: &Response) {
 }
 
 fn assert_no_cors(response: &Response) {
-    assert_eq!(
-        header_of(response, header::ACCESS_CONTROL_ALLOW_ORIGIN),
-        None,
+    assert!(
+        !response
+            .headers()
+            .keys()
+            .any(|name| name.as_str().starts_with("access-control-")),
         "{} {:?}",
         response.status(),
         response.headers()
@@ -75,6 +77,46 @@ pub async fn test(test: &mut TestServer) {
     .await;
     assert_eq!(response.status().as_u16(), 400);
     assert_no_cors(&response);
+
+    // Unset plus permissive CORS: the operator's `*` reaches every other
+    // route and never a vault route (spec 4.1).
+    let admin = test.account("admin@example.com");
+    admin
+        .registry_update_setting(
+            Http {
+                use_permissive_cors: true,
+                ..Default::default()
+            },
+            &[Property::UsePermissiveCors],
+        )
+        .await;
+    admin.reload_settings().await;
+    let response = send(Method::OPTIONS, "/api/auth", None).await;
+    assert_eq!(
+        header_of(&response, header::ACCESS_CONTROL_ALLOW_ORIGIN),
+        Some("*")
+    );
+    for (method, path, body) in [
+        (Method::OPTIONS, "/api/vault/password", None),
+        (
+            Method::POST,
+            "/api/vault/recovery-key",
+            Some(b"not json".to_vec()),
+        ),
+    ] {
+        let response = send(method, path, body).await;
+        assert_no_cors(&response);
+    }
+    admin
+        .registry_update_setting(
+            Http {
+                use_permissive_cors: false,
+                ..Default::default()
+            },
+            &[Property::UsePermissiveCors],
+        )
+        .await;
+    admin.reload_settings().await;
 
     test.server
         .inner

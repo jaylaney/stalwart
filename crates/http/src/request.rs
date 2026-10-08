@@ -907,13 +907,12 @@ async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionDat
                         let headers = response.headers_mut();
 
                         for (header, value) in &server.core.network.http.response_headers {
-                            // The vault API allows only the account page
-                            // (spec 4.1, invariant 9); every other response
-                            // takes the operator's value, as upstream.
-                            if is_vault_path
-                                && header == hyper::header::ACCESS_CONTROL_ALLOW_ORIGIN
-                                && headers.contains_key(header)
-                            {
+                            // The vault API sets its own CORS headers from
+                            // the account-page origin and none when that is
+                            // unset (spec 4.1); operator CORS headers never
+                            // apply there. Every other response takes the
+                            // operator's value, as upstream.
+                            if is_vault_path && header.as_str().starts_with("access-control-") {
                                 continue;
                             }
                             headers.insert(header.clone(), value.clone());
