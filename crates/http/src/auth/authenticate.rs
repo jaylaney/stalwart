@@ -272,6 +272,8 @@ pub mod za_test {
 
     pub static PUBLISH_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
+    pub static REGISTERED_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
     pub fn set(pause: Option<Arc<Pause>>) {
         *PAUSE.lock().unwrap_or_else(|e| e.into_inner()) = pause;
     }
@@ -282,6 +284,10 @@ pub mod za_test {
 
     pub fn set_publish(pause: Option<Arc<Pause>>) {
         *PUBLISH_PAUSE.lock().unwrap_or_else(|e| e.into_inner()) = pause;
+    }
+
+    pub fn set_registered(pause: Option<Arc<Pause>>) {
+        *REGISTERED_PAUSE.lock().unwrap_or_else(|e| e.into_inner()) = pause;
     }
 
     fn take_for(slot: &Mutex<Option<Arc<Pause>>>, account_id: u32) -> Option<Arc<Pause>> {
@@ -311,6 +317,10 @@ pub mod za_test {
 
     pub(crate) async fn publish_pause_point(account_id: u32) {
         wait_at(&PUBLISH_PAUSE, account_id).await;
+    }
+
+    pub(crate) async fn registered_pause_point(account_id: u32) {
+        wait_at(&REGISTERED_PAUSE, account_id).await;
     }
 
     #[cfg(test)]

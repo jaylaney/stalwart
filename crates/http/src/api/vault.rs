@@ -393,6 +393,7 @@ async fn za_delete_registry_credential(
     server: &Server,
     account_id: u32,
     credential_id: u32,
+    secret_hash: &str,
 ) -> trc::Result<bool> {
     let Some(reg) = za_registry_account(server, account_id).await? else {
         return Ok(false);
@@ -401,9 +402,12 @@ async fn za_delete_registry_credential(
     let credentials = &mut account.credentials.inner_mut().inner;
     let before = credentials.len();
     // App passwords only: no other credential type is ever deleted here.
+    // The hashed secret pins the exact credential, so a replacement that
+    // reused the id is never removed.
     credentials.retain(|c| {
-        !(matches!(c.value, Credential::AppPassword(_))
-            && c.value.credential_id().document_id() == credential_id)
+        !(matches!(&c.value, Credential::AppPassword(app)
+            if app.credential_id.document_id() == credential_id
+                && app.secret == secret_hash))
     });
     if credentials.len() == before {
         return Ok(true);
@@ -1146,7 +1150,7 @@ async fn za_app_password(
         .push(Credential::AppPassword(SecondaryCredential {
             credential_id: Id::from(credential_id),
             description: description.to_string(),
-            secret: secret_hash,
+            secret: secret_hash.clone(),
             created_at: UTCDateTime::now(),
             ..Default::default()
         }));
@@ -1155,6 +1159,9 @@ async fn za_app_password(
         za_withdraw_pending(server, account_id, credential_id, publication_id).await;
         return registered.and(Ok(conflict("registry write failed")));
     }
+
+    #[cfg(feature = "test_mode")]
+    crate::auth::authenticate::za_test::registered_pause_point(account_id).await;
 
     // (3) Publish. Unless it lands, the registry credential must not live
     // on, also when a store error interrupts it (best effort, then the error).
@@ -1166,7 +1173,7 @@ async fn za_app_password(
         }));
     }
     za_withdraw_pending(server, account_id, credential_id, publication_id).await;
-    za_delete_registry_credential_logged(server, account_id, credential_id).await;
+    za_delete_registry_credential_logged(server, account_id, credential_id, &secret_hash).await;
     published.and(Ok(conflict("app password publication failed")))
 }
 
@@ -1275,17 +1282,21 @@ async fn za_withdraw_pending(
     }
 }
 
-/// Registry credential delete, retried on a lost revision race. Failure
-/// leaves a dead credential (no Published wrap, so no login): logged, and
-/// reported as false.
+/// Registry credential delete, retried on a lost revision race. Each retry
+/// re-reads the registry and matches the hashed secret too, so a
+/// replacement under the same id is never deleted. Failure leaves a dead
+/// credential (no Published wrap, so no login): logged, and reported as
+/// false.
 async fn za_delete_registry_credential_logged(
     server: &Server,
     account_id: u32,
     credential_id: u32,
+    secret_hash: &str,
 ) -> bool {
     let mut result = Ok(false);
     for _ in 0..PUBLISH_RETRIES {
-        result = za_delete_registry_credential(server, account_id, credential_id).await;
+        result =
+            za_delete_registry_credential(server, account_id, credential_id, secret_hash).await;
         if !matches!(result, Ok(false)) {
             break;
         }
@@ -1337,6 +1348,21 @@ async fn za_app_password_revoke(
         Ok(read) => read,
         Err(response) => return Ok(response),
     };
+    // The registry credential's hashed secret, read before the commit: the
+    // delete removes only this credential, never a replacement that reuses
+    // its id afterwards.
+    let registry_secret = za_registry_account(server, account_id)
+        .await?
+        .and_then(|reg| {
+            reg.account.credentials.values().find_map(|c| match c {
+                Credential::AppPassword(c)
+                    if c.credential_id.document_id() == request.credential_id =>
+                {
+                    Some(c.secret.clone())
+                }
+                _ => None,
+            })
+        });
     let mut record = read.record.clone();
     let before = record.app_wraps.len();
     record
@@ -1346,19 +1372,17 @@ async fn za_app_password_revoke(
         // No wrap: a registry credential left by a publication that failed
         // after step (2) is dead (no login without a Published wrap), but it
         // holds a quota slot until deleted.
-        let dangling = za_registry_account(server, account_id)
-            .await?
-            .is_some_and(|reg| {
-                reg.account.credentials.values().any(|c| {
-                    matches!(c, Credential::AppPassword(c)
-                        if c.credential_id.document_id() == request.credential_id)
-                })
-            });
-        if !dangling {
+        let Some(secret_hash) = registry_secret else {
             return Ok(conflict("unknown app password"));
-        }
+        };
         return Ok(
-            if za_delete_registry_credential_logged(server, account_id, request.credential_id).await
+            if za_delete_registry_credential_logged(
+                server,
+                account_id,
+                request.credential_id,
+                &secret_hash,
+            )
+            .await
             {
                 ok()
             } else {
@@ -1380,7 +1404,15 @@ async fn za_app_password_revoke(
     {
         return Ok(response);
     }
-    za_delete_registry_credential_logged(server, account_id, request.credential_id).await;
+    if let Some(secret_hash) = registry_secret {
+        za_delete_registry_credential_logged(
+            server,
+            account_id,
+            request.credential_id,
+            &secret_hash,
+        )
+        .await;
+    }
     Ok(ok())
 }
 

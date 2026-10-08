@@ -115,14 +115,17 @@ async fn wrap_state(test: &TestServer, id: u32, credential_id: u32) -> Option<Wr
         .map(|w| w.state)
 }
 
-/// A creation parked between its Pending wrap and the registry credential,
-/// with the id of that Pending wrap.
+/// A creation parked at `set`'s pause point (`za_test::set_publish`:
+/// between its Pending wrap and the registry credential;
+/// `za_test::set_registered`: after the registry credential, before
+/// publication), with the id of its Pending wrap.
 async fn park_creation(
     test: &TestServer,
     id: u32,
+    set: fn(Option<std::sync::Arc<za_test::Pause>>),
     description: &'static str,
 ) -> (Parked<VaultReply>, u32) {
-    let parked = Parked::start(id, za_test::set_publish, async move {
+    let parked = Parked::start(id, set, async move {
         za_post(
             "app-password",
             &json!({ "username": NAME, "password": STRONG, "description": description }),
@@ -269,7 +272,7 @@ pub async fn test(test: &mut TestServer) {
     // wrap and the registry credential. The wrap is under the app secret,
     // not the password, and pruning never touches a fresh Pending wrap, so
     // the returned app password still decrypts afterwards.
-    let (parked, pending_id) = park_creation(test, id, "Laptop").await;
+    let (parked, pending_id) = park_creation(test, id, za_test::set_publish, "Laptop").await;
     za_post(
         "password",
         &json!({ "username": NAME, "password": STRONG, "new_password": STRONG2 }),
@@ -417,7 +420,7 @@ pub async fn test(test: &mut TestServer) {
     // Rollback, entry gone (spec 4.1): the parked creation's Pending wrap is
     // revoked before its registry credential lands; step (3) finds the
     // entry gone, deletes the registry credential and fails.
-    let (parked, gone_id) = park_creation(test, id, "Gone").await;
+    let (parked, gone_id) = park_creation(test, id, za_test::set_publish, "Gone").await;
     revoke(gone_id).await.expect(200);
     let reply = parked.finish().await;
     assert_eq!(
@@ -427,10 +430,34 @@ pub async fn test(test: &mut TestServer) {
     assert_eq!(wrap_state(test, id, gone_id).await, None);
     assert!(!registry_app_ids(test).await.contains(&gone_id));
 
+    // Rollback must not touch a replacement (PR #5 P2): creation A parks
+    // after step (2), is revoked, and creation B reuses its id and lands.
+    // A's cleanup must leave B's registry credential alone.
+    let (parked, reused_id) = park_creation(test, id, za_test::set_registered, "Parked").await;
+    revoke(reused_id).await.expect(200);
+    let (replacement, replacement_id) = create("Replacement").await;
+    assert_eq!(replacement_id, reused_id, "the id is reused");
+    caldav(&replacement, StatusCode::MULTI_STATUS).await;
+    let reply = parked.finish().await;
+    assert_eq!(
+        reply.expect(409)["error"],
+        "app password publication failed"
+    );
+    assert_eq!(
+        wrap_state(test, id, replacement_id).await,
+        Some(WrapState::Published)
+    );
+    assert!(registry_app_ids(test).await.contains(&replacement_id));
+    test.server
+        .invalidate_local_caches(&[CacheInvalidation::AccessToken(id)])
+        .await;
+    caldav(&replacement, StatusCode::MULTI_STATUS).await;
+    revoke(replacement_id).await.expect(200);
+
     // Rollback, registry write failed (spec 4.1): the account's registry
     // object changes while the creation is parked, so step (2) loses its
     // revision check and the Pending wrap is removed.
-    let (parked, raced_id) = park_creation(test, id, "Raced").await;
+    let (parked, raced_id) = park_creation(test, id, za_test::set_publish, "Raced").await;
     bump_registry_revision(test).await;
     let reply = parked.finish().await;
     assert_eq!(reply.expect(409)["error"], "registry write failed");
