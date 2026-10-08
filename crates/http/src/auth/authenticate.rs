@@ -244,7 +244,8 @@ async fn authenticate_uncached(
 /// verification tests); `ENDPOINT_PAUSE` sits in the vault endpoints between
 /// the fresh verification and the record re-read (generation fence tests);
 /// `PUBLISH_PAUSE` sits in `app-password` between the Pending wrap and the
-/// registry credential (interleaving tests).
+/// registry credential (interleaving tests); `REGISTERED_PAUSE` sits in
+/// `app-password` after the registry write, before the publication.
 #[cfg(feature = "test_mode")]
 pub mod za_test {
     use std::sync::{Arc, Mutex};

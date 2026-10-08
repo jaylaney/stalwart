@@ -4,8 +4,9 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-//! Spec invariant 7: nothing a key account sends or receives over DAV, and
-//! no credential header from any request, reaches the HTTP body traces.
+//! Spec section 10, "Traces": nothing a key account sends or receives over
+//! DAV or JMAP, and no credential header from any request, reaches the HTTP
+//! body traces.
 
 use super::STRONG;
 use crate::utils::{server::TestServer, webdav::DummyWebDavClient, za::SERVER_URL};
@@ -18,6 +19,8 @@ use trc::{
 
 const KEY_CANARY: &str = "trace-canary-key-9f3c";
 const PLAIN_CANARY: &str = "trace-canary-plain-7a1d";
+const KEY_JMAP_CANARY: &str = "trace-canary-jmap-key-3b7e";
+const PLAIN_JMAP_CANARY: &str = "trace-canary-jmap-plain-5c21";
 const SUBSCRIBER_ID: &str = "za-trace-test";
 const CONTENT_TYPE: (&str, &str) = ("content-type", "text/calendar; charset=utf-8");
 
@@ -62,6 +65,27 @@ async fn put_and_report(client: &DummyWebDavClient, collection: &str, uid: &str,
         .with_status(StatusCode::MULTI_STATUS)
         .body
         .unwrap();
+    assert!(body.contains(canary), "{body}");
+}
+
+/// POST a `Core/echo` call carrying `canary` to `/jmap`; the echoed
+/// response carries it back.
+async fn jmap_echo(user: &str, secret: &str, canary: &str) {
+    let response = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+        .post(format!("{SERVER_URL}/jmap"))
+        .basic_auth(user, Some(secret))
+        .json(&json!({
+            "using": ["urn:ietf:params:jmap:core"],
+            "methodCalls": [["Core/echo", {"canary": canary}, "c0"]],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.unwrap();
     assert!(body.contains(canary), "{body}");
 }
 
@@ -112,6 +136,10 @@ pub async fn test(test: &mut TestServer) {
 
     put_and_report(&key_client, key_cal, "trace-key", KEY_CANARY).await;
     put_and_report(&plain_client, plain_cal, "trace-plain", PLAIN_CANARY).await;
+    // JMAP: a key account's request body can carry its password (an
+    // `x:AccountPassword/set`), so neither side of its exchange is traced.
+    jmap_echo("key1@example.com", STRONG, KEY_JMAP_CANARY).await;
+    jmap_echo(plain.name(), plain.secret(), PLAIN_JMAP_CANARY).await;
     // A login through `/api/auth` carries the key account's password in its
     // body; it is traced before any verification, whatever the outcome.
     reqwest::Client::builder()
@@ -148,8 +176,16 @@ pub async fn test(test: &mut TestServer) {
         all.contains(PLAIN_CANARY),
         "no plain-account trace captured: {all}"
     );
+    assert!(
+        all.contains(PLAIN_JMAP_CANARY),
+        "no plain-account JMAP trace captured: {all}"
+    );
     // Key-account traffic is absent on both sides.
     assert!(!all.contains(KEY_CANARY), "key-account body traced: {all}");
+    assert!(
+        !all.contains(KEY_JMAP_CANARY),
+        "key-account JMAP body traced: {all}"
+    );
     // The key account's password never reaches the trace.
     assert!(!all.contains(STRONG), "login body traced: {all}");
     // Credentials are never traced, for any account.

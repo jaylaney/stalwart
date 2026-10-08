@@ -29,7 +29,8 @@ use dav::{DavMethod, request::DavRequestHandler};
 use groupware::DavResourceName;
 use http_proto::{
     DownloadResponse, HttpContext, HttpRequest, HttpResponse, HttpResponseBody, HttpSessionData,
-    JsonProblemResponse, ToHttpResponse, form_urlencoded, request::fetch_body,
+    JsonProblemResponse, ToHttpResponse, form_urlencoded,
+    request::{fetch_body, fetch_body_untraced},
 };
 use hyper::{
     Method, StatusCode, body,
@@ -125,6 +126,33 @@ impl ParseHttp for Server {
                             }
                         }
 
+                        if za_is_key_account(self, access_token.account_id()).await {
+                            let bytes = fetch_body_untraced(
+                                &mut req,
+                                if !access_token.has_permission(Permission::UnlimitedUploads) {
+                                    self.core.jmap.upload_max_size
+                                } else {
+                                    0
+                                },
+                            )
+                            .await
+                            .ok_or_else(|| trc::LimitEvent::SizeRequest.into_err())?;
+
+                            return Ok(self
+                                .handle_jmap_request(
+                                    Request::parse(
+                                        &bytes,
+                                        self.core.jmap.request_max_calls,
+                                        self.core.jmap.request_max_size,
+                                    )?,
+                                    &access_token,
+                                    &session,
+                                )
+                                .await
+                                .into_http_response()
+                                .with_untraced_body());
+                        }
+
                         let bytes = fetch_body(
                             &mut req,
                             if !access_token.has_permission(Permission::UnlimitedUploads) {
@@ -185,6 +213,34 @@ impl ParseHttp for Server {
                             self.authenticate_headers(&req, &session).await?;
 
                         if let Some(account_id) = path.next().and_then(|p| Id::from_str(p).ok()) {
+                            if za_is_key_account(self, access_token.account_id()).await {
+                                return match fetch_body_untraced(
+                                    &mut req,
+                                    if !access_token.has_permission(Permission::UnlimitedUploads) {
+                                        self.core.jmap.upload_max_size
+                                    } else {
+                                        0
+                                    },
+                                )
+                                .await
+                                {
+                                    Some(bytes) => Ok(self
+                                        .blob_upload(
+                                            account_id,
+                                            req.headers()
+                                                .get(CONTENT_TYPE)
+                                                .and_then(|h| h.to_str().ok())
+                                                .unwrap_or("application/octet-stream"),
+                                            &bytes,
+                                            &access_token,
+                                        )
+                                        .await?
+                                        .into_http_response()
+                                        .with_untraced_body()),
+                                    None => Err(trc::LimitEvent::SizeUpload.into_err()),
+                                };
+                            }
+
                             return match fetch_body(
                                 &mut req,
                                 if !access_token.has_permission(Permission::UnlimitedUploads) {
@@ -993,6 +1049,17 @@ async fn za_is_key_account_request(
         .ok()
         .flatten()
         .is_some_and(|account| account.is_key_account())
+}
+
+/// Spec section 10, "Traces": a key account's JMAP request and response
+/// bodies are never traced, since a request can carry the account's password
+/// (`x:AccountPassword/set`). A failed lookup is treated as a key account.
+async fn za_is_key_account(server: &Server, account_id: u32) -> bool {
+    server
+        .try_account(account_id)
+        .await
+        .map(|account| account.is_some_and(|account| account.is_key_account()))
+        .unwrap_or(true)
 }
 
 #[cfg(test)]

@@ -602,8 +602,9 @@ impl DavRequestHandler for Server {
         resource: DavResourceName,
         method: DavMethod,
     ) -> HttpResponse {
-        // Spec invariant 7: a key account's DAV traffic never reaches the
-        // HTTP body traces. A failed lookup is treated as a key account.
+        // Spec section 10, "Traces": a key account's DAV traffic never
+        // reaches the HTTP body traces. A failed lookup is treated as a key
+        // account.
         let untraced = crate::common::za::is_key_account(self, access_token.account_id())
             .await
             .unwrap_or(true);
