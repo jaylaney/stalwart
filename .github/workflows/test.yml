@@ -21,6 +21,9 @@ jobs:
   test:
     name: Test
     needs: style
+    # Upstream's full suite runs only when dispatched by hand; pushes to the
+    # fork branch run the style check and the zero-access job.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
 
     env:
