@@ -46,6 +46,14 @@ impl WebSocketHandler for Server {
             AccountId = access_token.account_id(),
         );
 
+        // Spec section 10, "Traces": a key account's messages are never
+        // traced. Fails closed: a failed lookup counts as a key account.
+        let untraced = self
+            .try_account(access_token.account_id())
+            .await
+            .map(|account| account.is_some_and(|account| account.is_key_account()))
+            .unwrap_or(true);
+
         // Set timeouts
         let throttle = self.core.jmap.web_socket_throttle;
         let timeout = self.core.jmap.web_socket_timeout;
@@ -117,6 +125,16 @@ impl WebSocketHandler for Server {
                                             continue;
                                         }
                                         Err(err) => {
+                                            // The parser's error can echo the message.
+                                            let err = if untraced
+                                                && err.matches(trc::EventType::Jmap(JmapEvent::NotRequest))
+                                            {
+                                                JmapEvent::NotRequest
+                                                    .into_err()
+                                                    .reason("invalid JMAP request")
+                                            } else {
+                                                err
+                                            };
                                             let response = WebSocketRequestError::from(err.to_request_error()).to_json();
                                             trc::error!(err.details("Failed to parse WebSocket message").span_id(session.session_id));
                                             response

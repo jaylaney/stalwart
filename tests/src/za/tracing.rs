@@ -10,8 +10,19 @@
 
 use super::STRONG;
 use crate::utils::{server::TestServer, webdav::DummyWebDavClient, za::SERVER_URL};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use hyper::StatusCode;
 use serde_json::json;
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio_rustls::{
+    TlsConnector,
+    rustls::{
+        self, DigitallySignedStruct, SignatureScheme,
+        client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+        pki_types::{CertificateDer, ServerName, UnixTime},
+    },
+};
 use trc::{
     Collector, EventType, HttpEvent, JmapEvent,
     ipc::subscriber::{Interests, SubscriberBuilder},
@@ -25,6 +36,8 @@ const KEY_BAD_CANARY: &str = "trace-canary-jmap-key-bad-8d2f";
 const PLAIN_BAD_CANARY: &str = "trace-canary-jmap-plain-bad-1e6a";
 const KEY_UPLOAD_CANARY: &str = "trace-canary-upload-key-4a90";
 const PLAIN_UPLOAD_CANARY: &str = "trace-canary-upload-plain-c2d7";
+const KEY_WS_CANARY: &str = "trace-canary-ws-key-6f1b";
+const PLAIN_WS_CANARY: &str = "trace-canary-ws-plain-2d8c";
 const SUBSCRIBER_ID: &str = "za-trace-test";
 const CONTENT_TYPE: (&str, &str) = ("content-type", "text/calendar; charset=utf-8");
 
@@ -129,6 +142,163 @@ async fn jmap_upload(user: &str, secret: &str, account_id: &str, canary: &str) {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
+/// Accepts the test server's self-signed certificate.
+#[derive(Debug)]
+struct AcceptAnyCert(Arc<rustls::crypto::CryptoProvider>);
+
+impl ServerCertVerifier for AcceptAnyCert {
+    fn verify_server_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// Write one masked client frame (RFC 6455 section 5.2).
+async fn ws_send(stream: &mut (impl AsyncWriteExt + Unpin), opcode: u8, payload: &[u8]) {
+    let mask = [0x5a, 0x17, 0xc3, 0x8e];
+    let mut frame = vec![0x80 | opcode];
+    match payload.len() {
+        len @ 0..=125 => frame.push(0x80 | len as u8),
+        len @ 126..=0xffff => {
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(&(len as u16).to_be_bytes());
+        }
+        len => {
+            frame.push(0x80 | 127);
+            frame.extend_from_slice(&(len as u64).to_be_bytes());
+        }
+    }
+    frame.extend_from_slice(&mask);
+    frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+    stream.write_all(&frame).await.unwrap();
+    stream.flush().await.unwrap();
+}
+
+/// Read one unmasked server frame: its opcode and payload, or `None` once
+/// the server has hung up.
+async fn ws_recv(stream: &mut (impl AsyncReadExt + Unpin)) -> Option<(u8, Vec<u8>)> {
+    let mut head = [0u8; 2];
+    stream.read_exact(&mut head).await.ok()?;
+    let len = match head[1] & 0x7f {
+        126 => stream.read_u16().await.ok()? as usize,
+        127 => stream.read_u64().await.ok()? as usize,
+        len => len as usize,
+    };
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload).await.ok()?;
+    Some((head[0] & 0x0f, payload))
+}
+
+/// Open a JMAP WebSocket, send `message` as one text frame, return the
+/// server's text reply and close the socket. A minimal client, since
+/// `jmap_client` cannot send a malformed message.
+async fn ws_exchange(user: &str, secret: &str, message: &str) -> String {
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
+        .with_no_client_auth();
+    let tcp = tokio::net::TcpStream::connect("127.0.0.1:8899")
+        .await
+        .unwrap();
+    let tls = TlsConnector::from(Arc::new(config))
+        .connect(ServerName::try_from("127.0.0.1").unwrap(), tcp)
+        .await
+        .unwrap();
+    let mut stream = BufReader::new(tls);
+    let auth = STANDARD.encode(format!("{user}:{secret}"));
+    stream
+        .write_all(
+            format!(
+                "GET /jmap/ws HTTP/1.1\r\nHost: 127.0.0.1:8899\r\nAuthorization: Basic {auth}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: jmap\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    stream.flush().await.unwrap();
+    let mut status = String::new();
+    stream.read_line(&mut status).await.unwrap();
+    assert!(status.starts_with("HTTP/1.1 101"), "{status}");
+    loop {
+        let mut line = String::new();
+        stream.read_line(&mut line).await.unwrap();
+        if line == "\r\n" {
+            break;
+        }
+    }
+
+    ws_send(&mut stream, 0x1, message.as_bytes()).await;
+    let reply = loop {
+        match ws_recv(&mut stream)
+            .await
+            .expect("server hung up before replying")
+        {
+            (0x1, payload) => break String::from_utf8(payload).unwrap(),
+            (0x9, payload) => ws_send(&mut stream, 0xa, &payload).await,
+            (opcode, _) => panic!("unexpected WebSocket frame {opcode:#x}"),
+        }
+    };
+
+    // Close handshake: wait for the server's close frame, then hang up.
+    ws_send(&mut stream, 0x8, &[]).await;
+    while let Some((opcode, _)) = ws_recv(&mut stream).await {
+        if opcode == 0x8 {
+            break;
+        }
+    }
+    let _ = stream.shutdown().await;
+    reply
+}
+
+/// Send a WebSocket JMAP request whose `methodCalls` is a string carrying
+/// `canary`. The parser rejects it, and its error echoes the string.
+async fn ws_malformed(user: &str, secret: &str, canary: &str) -> String {
+    let reply = ws_exchange(
+        user,
+        secret,
+        &format!(
+            "{{\"@type\":\"Request\",\"id\":\"1\",\"using\":[\"urn:ietf:params:jmap:core\"],\"methodCalls\":\"{canary}\"}}"
+        ),
+    )
+    .await;
+    assert!(
+        reply.contains("RequestError") && reply.contains("notRequest"),
+        "{reply}"
+    );
+    reply
+}
+
 pub async fn test(test: &mut TestServer) {
     println!("Running zero-access HTTP trace tests...");
     let key1 = test.account("key1@example.com").clone();
@@ -185,6 +355,10 @@ pub async fn test(test: &mut TestServer) {
     // A malformed or truncated body is echoed by the parser's error.
     jmap_malformed("key1@example.com", STRONG, KEY_BAD_CANARY).await;
     jmap_malformed(plain.name(), plain.secret(), PLAIN_BAD_CANARY).await;
+    // The same over a WebSocket: the error frame and the trace both carry
+    // the parser's error.
+    let key_ws_reply = ws_malformed("key1@example.com", STRONG, KEY_WS_CANARY).await;
+    let plain_ws_reply = ws_malformed(plain.name(), plain.secret(), PLAIN_WS_CANARY).await;
     jmap_upload(
         "key1@example.com",
         STRONG,
@@ -247,6 +421,14 @@ pub async fn test(test: &mut TestServer) {
         all.contains(PLAIN_UPLOAD_CANARY),
         "no plain-account upload trace captured: {all}"
     );
+    assert!(
+        all.contains(PLAIN_WS_CANARY),
+        "no plain-account malformed WebSocket trace captured: {all}"
+    );
+    assert!(
+        plain_ws_reply.contains(PLAIN_WS_CANARY),
+        "plain-account WebSocket error frame lost the parser's error: {plain_ws_reply}"
+    );
     // Key-account traffic is absent on both sides.
     assert!(!all.contains(KEY_CANARY), "key-account body traced: {all}");
     assert!(
@@ -260,6 +442,14 @@ pub async fn test(test: &mut TestServer) {
     assert!(
         !all.contains(KEY_UPLOAD_CANARY),
         "key-account upload traced: {all}"
+    );
+    assert!(
+        !all.contains(KEY_WS_CANARY),
+        "key-account malformed WebSocket message traced: {all}"
+    );
+    assert!(
+        !key_ws_reply.contains(KEY_WS_CANARY),
+        "key-account WebSocket error frame echoes the message: {key_ws_reply}"
     );
     // The key account's password never reaches the trace.
     assert!(!all.contains(STRONG), "login body traced: {all}");
