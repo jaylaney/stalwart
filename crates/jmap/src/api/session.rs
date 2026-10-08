@@ -39,13 +39,17 @@ impl SessionHandler for Server {
             .caused_by(trc::location!())?;
         session.username = account.name().to_string();
         let account_id = Id::from(access_token.account_id());
+        // Spec 9: JMAP calendars are not offered for key accounts.
+        let primary_is_key = account.is_key_account();
         let mut account = Account {
             name: account.name().to_string(),
             is_personal: true,
             is_read_only: false,
             account_capabilities: VecMap::with_capacity(account_capabilities.len()),
         };
-        for capability in access_token.account_capabilities() {
+        for capability in access_token.account_capabilities().filter(|c| {
+            !(primary_is_key && matches!(c, Capability::Calendars | Capability::CalendarsParse))
+        }) {
             session.primary_accounts.append(capability, account_id);
             account.account_capabilities.append(
                 capability,
@@ -74,13 +78,16 @@ impl SessionHandler for Server {
             };
 
             let account_id = Id::from(account_id);
+            let is_key = account.is_key_account();
             let mut account = Account {
                 name: account.name().to_string(),
                 is_personal: false,
                 is_read_only: false,
                 account_capabilities: VecMap::with_capacity(account_capabilities.len()),
             };
-            for capability in access_token.account_capabilities() {
+            for capability in access_token.account_capabilities().filter(|c| {
+                !(is_key && matches!(c, Capability::Calendars | Capability::CalendarsParse))
+            }) {
                 account.account_capabilities.append(
                     capability,
                     account_capabilities

@@ -65,6 +65,7 @@ pub enum ItipSendStatus {
     NoCalendarAddress,
     NoPermission,
     EventInPast,
+    KeyAccount,
 }
 
 pub trait ItipIngest: Sync + Send {
@@ -379,6 +380,14 @@ impl ItipIngest for Server {
             Ok(rsvp) => rsvp,
             Err(reason) => return Ok(RsvpResponse::error(reason, language)),
         };
+        if self
+            .try_account(rsvp.account_id)
+            .await
+            .caused_by(trc::location!())?
+            .is_some_and(|account| account.is_key_account())
+        {
+            return Ok(RsvpResponse::error(RsvpError::InvalidLink, language));
+        }
 
         let part_stat = match request.part_stat() {
             Ok(part_stat) => part_stat,
@@ -654,6 +663,16 @@ async fn http_rsvp_attendee_copy(
     else {
         return Ok(None);
     };
+
+    // A key account's copy is sealed: it is never rewritten without its keys.
+    if server
+        .try_account(account_id)
+        .await
+        .caused_by(trc::location!())?
+        .is_some_and(|account| account.is_key_account())
+    {
+        return Ok(None);
+    }
 
     let can_send = match server.access_token(account_id).await {
         Ok(access_token) => AccessToken::new(access_token, remote_ip).is_ok_and(|access_token| {
@@ -1055,6 +1074,8 @@ impl ItipSendStatus {
             Self::SchedulingDisabled
         } else if account_info.addresses().is_empty() {
             Self::NoCalendarAddress
+        } else if account_info.account().is_key_account() {
+            Self::KeyAccount
         } else if !access_token.has_permission(Permission::CalendarSchedulingSend) {
             Self::NoPermission
         } else if event_range_end <= now() as i64 {
@@ -1073,7 +1094,10 @@ impl ItipSendStatus {
     pub fn is_denied(&self) -> bool {
         matches!(
             self,
-            Self::SchedulingDisabled | Self::NoCalendarAddress | Self::NoPermission
+            Self::SchedulingDisabled
+                | Self::NoCalendarAddress
+                | Self::NoPermission
+                | Self::KeyAccount
         )
     }
 
@@ -1089,6 +1113,9 @@ impl ItipSendStatus {
             }
             Self::EventInPast => {
                 Some("No scheduling messages were sent because the event lies in the past.")
+            }
+            Self::KeyAccount => {
+                Some("Scheduling is not available for zero-access accounts in this release.")
             }
         }
     }

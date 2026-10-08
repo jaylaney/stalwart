@@ -14,7 +14,11 @@ use store::{
     *,
 };
 use trc::AddContext;
-use types::blob_hash::{BLOB_HASH_LEN, BlobHash};
+use types::{
+    blob_hash::{BLOB_HASH_LEN, BlobHash},
+    collection::Collection,
+    field::PrincipalField,
+};
 
 pub async fn store_destroy(store: &Store) {
     store_destroy_sql_indexes(store).await;
@@ -222,8 +226,26 @@ pub async fn store_lookup_expire_all(store: &Store) {
     }
 }
 
-#[allow(unused_variables)]
 pub async fn store_assert_is_empty(store: &Store, blob_store: BlobStore, include_registry: bool) {
+    let vault_accounts =
+        store_assert_is_empty_except_vaults(store, blob_store, include_registry).await;
+    assert!(
+        vault_accounts.is_empty(),
+        "Found zero-access vault records of accounts {vault_accounts:?}"
+    );
+}
+
+/// Like `store_assert_is_empty`, but returns the accounts holding a
+/// zero-access vault record instead of reporting them. The caller must check
+/// that each account still exists: a vault record lives exactly as long as
+/// its account.
+#[allow(unused_variables)]
+#[must_use]
+pub async fn store_assert_is_empty_except_vaults(
+    store: &Store,
+    blob_store: BlobStore,
+    include_registry: bool,
+) -> Vec<u32> {
     store_blob_expire_all(store).await;
     store_lookup_expire_all(store).await;
     for shard_idx in 0..=u8::MAX {
@@ -237,6 +259,7 @@ pub async fn store_assert_is_empty(store: &Store, blob_store: BlobStore, include
     let store = store.clone();
     let mut failed = false;
     let mut delete_batch = BatchBuilder::new();
+    let mut vault_accounts = Vec::new();
 
     for (subspace, with_values) in [
         (SUBSPACE_ACL, true),
@@ -356,6 +379,16 @@ pub async fn store_assert_is_empty(store: &Store, blob_store: BlobStore, include
                                 object_id, key
                             );
                         }
+                        SUBSPACE_PROPERTY
+                            if key.len() == U32_LEN + 2 + U32_LEN
+                                && key[U32_LEN] == Collection::Principal as u8
+                                && key[U32_LEN + 1] == PrincipalField::ZeroAccessVault as u8 =>
+                        {
+                            // Zero-access vault records persist for the life of the
+                            // account; the caller checks that the account exists.
+                            vault_accounts.push(key.deserialize_be_u32(0).unwrap());
+                            return Ok(true);
+                        }
                         _ => {
                             println!(
                                 "Found key in {:?}: {:?} ({:?}) = {:?} ({:?})",
@@ -406,6 +439,8 @@ pub async fn store_assert_is_empty(store: &Store, blob_store: BlobStore, include
     if failed {
         panic!("Store is not empty.");
     }
+
+    vault_accounts
 }
 
 fn is_allowed_registry_type(object_type: ObjectType) -> bool {

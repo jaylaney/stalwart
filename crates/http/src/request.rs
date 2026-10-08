@@ -6,7 +6,10 @@
 
 use crate::{
     HttpSessionManager,
-    api::{AuthChallenge, ManagementApi, ToManageHttpResponse},
+    api::{
+        AuthChallenge, ManagementApi, ToManageHttpResponse,
+        vault::{za_cors_preflight, za_is_vault_path, za_with_cors},
+    },
     auth::{
         authenticate::{Authenticator, HttpHeaders},
         oauth::{
@@ -26,7 +29,8 @@ use dav::{DavMethod, request::DavRequestHandler};
 use groupware::DavResourceName;
 use http_proto::{
     DownloadResponse, HttpContext, HttpRequest, HttpResponse, HttpResponseBody, HttpSessionData,
-    JsonProblemResponse, ToHttpResponse, form_urlencoded, request::fetch_body,
+    JsonProblemResponse, ToHttpResponse, form_urlencoded,
+    request::{fetch_body, fetch_body_untraced},
 };
 use hyper::{
     Method, StatusCode, body,
@@ -122,6 +126,45 @@ impl ParseHttp for Server {
                             }
                         }
 
+                        if za_jmap_untraced(self, access_token.account_id()).await {
+                            let bytes = fetch_body_untraced(
+                                &mut req,
+                                if !access_token.has_permission(Permission::UnlimitedUploads) {
+                                    self.core.jmap.upload_max_size
+                                } else {
+                                    0
+                                },
+                            )
+                            .await
+                            .ok_or_else(|| trc::LimitEvent::SizeRequest.into_err())?;
+
+                            let request = match Request::parse(
+                                &bytes,
+                                self.core.jmap.request_max_calls,
+                                self.core.jmap.request_max_size,
+                            ) {
+                                Ok(request) => request,
+                                // Spec section 10, "Traces": the parser's
+                                // details and reason can echo the body.
+                                Err(err)
+                                    if err.matches(trc::EventType::Jmap(
+                                        trc::JmapEvent::NotRequest,
+                                    )) =>
+                                {
+                                    return Err(trc::JmapEvent::NotRequest
+                                        .into_err()
+                                        .reason("invalid JMAP request"));
+                                }
+                                Err(err) => return Err(err),
+                            };
+
+                            return Ok(self
+                                .handle_jmap_request(request, &access_token, &session)
+                                .await
+                                .into_http_response()
+                                .with_untraced_body());
+                        }
+
                         let bytes = fetch_body(
                             &mut req,
                             if !access_token.has_permission(Permission::UnlimitedUploads) {
@@ -182,6 +225,34 @@ impl ParseHttp for Server {
                             self.authenticate_headers(&req, &session).await?;
 
                         if let Some(account_id) = path.next().and_then(|p| Id::from_str(p).ok()) {
+                            if za_jmap_untraced(self, access_token.account_id()).await {
+                                return match fetch_body_untraced(
+                                    &mut req,
+                                    if !access_token.has_permission(Permission::UnlimitedUploads) {
+                                        self.core.jmap.upload_max_size
+                                    } else {
+                                        0
+                                    },
+                                )
+                                .await
+                                {
+                                    Some(bytes) => Ok(self
+                                        .blob_upload(
+                                            account_id,
+                                            req.headers()
+                                                .get(CONTENT_TYPE)
+                                                .and_then(|h| h.to_str().ok())
+                                                .unwrap_or("application/octet-stream"),
+                                            &bytes,
+                                            &access_token,
+                                        )
+                                        .await?
+                                        .into_http_response()
+                                        .with_untraced_body()),
+                                    None => Err(trc::LimitEvent::SizeUpload.into_err()),
+                                };
+                            }
+
                             return match fetch_body(
                                 &mut req,
                                 if !access_token.has_permission(Permission::UnlimitedUploads) {
@@ -214,15 +285,23 @@ impl ParseHttp for Server {
                         let (_in_flight, access_token) =
                             self.authenticate_headers(&req, &session).await?;
 
-                        return self.handle_event_source(req, access_token).await;
+                        // A stream outlives the key residency bound (spec 5).
+                        return self
+                            .handle_event_source(req, access_token.without_session_keys())
+                            .await;
                     }
                     ("ws", &Method::GET) => {
                         // Authenticate request
                         let (_in_flight, access_token) =
                             self.authenticate_headers(&req, &session).await?;
 
+                        // A WebSocket outlives the key residency bound (spec 5).
                         return self
-                            .upgrade_websocket_connection(req, access_token, session)
+                            .upgrade_websocket_connection(
+                                req,
+                                access_token.without_session_keys(),
+                                session,
+                            )
                             .await;
                     }
                     ("session", &Method::GET) => {
@@ -259,10 +338,17 @@ impl ParseHttp for Server {
                     (Some(_), Some(DavMethod::OPTIONS)) => HttpResponse::new(StatusCode::OK)
                         .with_header(
                             "DAV",
-                            concat!(
-                                "1, 2, 3, access-control, extended-mkcol, calendar-access, ",
-                                "calendar-auto-schedule, calendar-no-timezone, addressbook"
-                            ),
+                            if za_is_key_account_request(self, &req, &session).await {
+                                concat!(
+                                    "1, 2, 3, access-control, extended-mkcol, calendar-access, ",
+                                    "calendar-no-timezone, addressbook"
+                                )
+                            } else {
+                                concat!(
+                                    "1, 2, 3, access-control, extended-mkcol, calendar-access, ",
+                                    "calendar-auto-schedule, calendar-no-timezone, addressbook"
+                                )
+                            },
                         )
                         .with_header(
                             "Allow",
@@ -469,19 +555,27 @@ impl ParseHttp for Server {
             }
             // SPDX-SnippetEnd
             "api" => {
+                // Zero-access account API: CORS for the account page only (spec 4.1).
+                let za_origin = if za_is_vault_path(req.uri().path()) {
+                    self.inner.cache.za_account_page_origin()
+                } else {
+                    None
+                };
+
                 // Allow CORS preflight requests
                 if req.method() == Method::OPTIONS {
-                    return Ok(HttpResponse::new(StatusCode::NO_CONTENT));
+                    return Ok(za_cors_preflight(za_origin.as_deref()));
                 }
 
-                return Ok(match self.handle_api_request(&mut req, &session).await {
+                let response = match self.handle_api_request(&mut req, &session).await {
                     Ok(response) => response,
                     Err(err) => {
                         let response = err.into_http_response(AuthChallenge::Bearer);
                         trc::error!(err.span_id(session.session_id));
                         response
                     }
-                });
+                };
+                return Ok(za_with_cors(response, za_origin.as_deref()));
             }
             "mail" => {
                 if req.method() == Method::GET
@@ -824,6 +918,9 @@ async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionDat
                         );
                     }
 
+                    // Vault responses keep their own allowed origin (below).
+                    let is_vault_path = za_is_vault_path(req.uri().path());
+
                     // Parse HTTP request
                     let response = match Box::pin(server.parse_http_request(
                         req,
@@ -850,13 +947,21 @@ async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionDat
                     trc::event!(
                         Http(trc::HttpEvent::ResponseBody),
                         SpanId = session.session_id,
-                        Contents = match response.body() {
-                            HttpResponseBody::Text(value) =>
-                                trc::Value::String(value.as_str().into()),
-                            HttpResponseBody::Binary(_) =>
-                                trc::Value::String("[binary data]".into()),
-                            HttpResponseBody::Stream(_) => trc::Value::String("[stream]".into()),
-                            _ => trc::Value::None,
+                        Contents = if response.is_untraced() {
+                            trc::Value::String("[redacted]".into())
+                        } else {
+                            match response.body() {
+                                HttpResponseBody::Text(value) => {
+                                    trc::Value::String(value.as_str().into())
+                                }
+                                HttpResponseBody::Binary(_) => {
+                                    trc::Value::String("[binary data]".into())
+                                }
+                                HttpResponseBody::Stream(_) => {
+                                    trc::Value::String("[stream]".into())
+                                }
+                                _ => trc::Value::None,
+                            }
                         },
                         Code = response.status().as_u16(),
                         Size = response.size(),
@@ -870,6 +975,14 @@ async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionDat
                         let headers = response.headers_mut();
 
                         for (header, value) in &server.core.network.http.response_headers {
+                            // The vault API sets its own CORS headers from
+                            // the account-page origin and none when that is
+                            // unset (spec 4.1); operator CORS headers never
+                            // apply there. Every other response takes the
+                            // operator's value, as upstream.
+                            if is_vault_path && header.as_str().starts_with("access-control-") {
+                                continue;
+                            }
                             headers.insert(header.clone(), value.clone());
                         }
                     }
@@ -925,6 +1038,41 @@ impl SessionManager for HttpSessionManager {
             let _ = self.inner.ipc.push_tx.send(PushEvent::Stop).await;
         }
     }
+}
+
+/// Spec 9: a key account is not offered `calendar-auto-schedule` in the DAV
+/// OPTIONS header. Upstream answers OPTIONS without authenticating; credentials
+/// are checked only when present, and any failure or a non-key account keeps
+/// upstream's header (the error is not propagated).
+async fn za_is_key_account_request(
+    server: &Server,
+    req: &HttpRequest,
+    session: &HttpSessionData,
+) -> bool {
+    if !req.headers().contains_key(header::AUTHORIZATION) {
+        return false;
+    }
+    let Ok((_in_flight, access_token)) = server.authenticate_headers(req, session).await else {
+        return false;
+    };
+    server
+        .try_account(access_token.account_id())
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|account| account.is_key_account())
+}
+
+/// Spec section 10, "Traces": a key account's JMAP request and response
+/// bodies are never traced, since a request can carry the account's password
+/// (`x:AccountPassword/set`). Fails closed: a failed lookup counts as a key
+/// account, unlike the fail-open `za_is_key_account_request`.
+async fn za_jmap_untraced(server: &Server, account_id: u32) -> bool {
+    server
+        .try_account(account_id)
+        .await
+        .map(|account| account.is_some_and(|account| account.is_key_account()))
+        .unwrap_or(true)
 }
 
 #[cfg(test)]

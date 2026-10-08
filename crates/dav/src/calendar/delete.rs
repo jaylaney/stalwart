@@ -78,6 +78,7 @@ impl CalendarDeleteRequestHandler for Server {
         let send_itip = self.core.groupware.itip_enabled
             && !headers.no_schedule_reply
             && !account_info.addresses().is_empty()
+            && !account_info.account().is_key_account()
             && access_token.has_permission(Permission::CalendarSchedulingSend);
 
         // Fetch entry

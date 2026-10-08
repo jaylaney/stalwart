@@ -11,9 +11,13 @@
 pub mod telemetry;
 // SPDX-SnippetEnd
 pub mod diagnose;
+pub mod vault;
 
 use crate::{
-    api::diagnose::{DeliveryStage, spawn_delivery_diagnose},
+    api::{
+        diagnose::{DeliveryStage, spawn_delivery_diagnose},
+        vault::VaultApi,
+    },
     auth::{
         authenticate::Authenticator, oauth::auth::OAuthApiHandler, permissions::AccountApiHandler,
     },
@@ -27,7 +31,7 @@ use groupware::calendar::itip::{ItipIngest, RsvpRequest};
 use http_body_util::{StreamBody, combinators::BoxBody};
 use http_proto::{
     HttpRequest, HttpResponse, HttpSessionData, JsonResponse, ToHttpResponse,
-    request::{decode_path_element, fetch_body},
+    request::{decode_path_element, fetch_body, fetch_body_untraced},
 };
 use hyper::{
     Method, StatusCode,
@@ -61,10 +65,15 @@ impl ManagementApi for Server {
         session: &HttpSessionData,
     ) -> trc::Result<HttpResponse> {
         let is_post = req.method() == Method::POST;
-        let body = if is_post {
-            fetch_body(req, 1024 * 1024, session.session_id).await
-        } else {
+        // Zero-access and login request bodies carry passwords, tokens and
+        // recovery keys; no account is known before they are parsed.
+        let untraced = matches!(req.uri().path().split('/').nth(2), Some("vault" | "auth"));
+        let body = if !is_post {
             None
+        } else if untraced {
+            fetch_body_untraced(req, 1024 * 1024).await
+        } else {
+            fetch_body(req, 1024 * 1024, session.session_id).await
         };
         let path = req.uri().path().split('/').skip(2).collect::<Vec<_>>();
 
@@ -77,6 +86,7 @@ impl ManagementApi for Server {
                     body.ok_or_else(|| trc::LimitEvent::SizeRequest.into_err())?,
                 ))
                 .await
+                .map(HttpResponse::with_untraced_body)
             }
             "calendar"
                 if is_post
@@ -266,6 +276,16 @@ impl ManagementApi for Server {
                     }
                     _ => Err(trc::ResourceEvent::NotFound.into_err()),
                 }
+            }
+            "vault" if is_post => {
+                self.handle_vault_request(
+                    req,
+                    session,
+                    path.get(1).copied().unwrap_or_default(),
+                    path.get(2).copied(),
+                    body.ok_or_else(|| trc::LimitEvent::SizeRequest.into_err())?,
+                )
+                .await
             }
             _ => Err(trc::ResourceEvent::NotFound.into_err()),
         }

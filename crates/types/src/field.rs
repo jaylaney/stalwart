@@ -83,6 +83,10 @@ pub enum PrincipalField {
     DefaultAddressBookId = 48,
     ActiveScriptId = 49,
     PushSubscriptions = 44,
+    /// Zero-access vault record. 150 has never been assigned to any field:
+    /// 46 was `EncryptionKeys` and then `IdentityAddresses` (0.16.18) before
+    /// that moved to 110, so leftover bytes there must not read as a record.
+    ZeroAccessVault = 150,
 }
 
 impl From<ContactField> for u8 {
@@ -162,6 +166,7 @@ impl From<PrincipalField> for u8 {
             PrincipalField::DefaultAddressBookId => 48,
             PrincipalField::ActiveScriptId => 49,
             PrincipalField::PushSubscriptions => 44,
+            PrincipalField::ZeroAccessVault => 150,
             PrincipalField::Archive => ARCHIVE_FIELD,
         }
     }

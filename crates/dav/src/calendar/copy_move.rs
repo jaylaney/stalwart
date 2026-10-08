@@ -10,6 +10,7 @@ use crate::{
     common::{
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
+        za::ZeroAccessGate,
     },
     file::DavFileResource,
 };
@@ -118,6 +119,8 @@ impl CalendarCopyMoveRequestHandler for Server {
         let to_account_id = destination
             .account_id
             .ok_or(DavError::Code(StatusCode::BAD_GATEWAY))?;
+        self.za_refuse_cross_account(from_account_id, to_account_id)
+            .await?;
         let to_resources = if to_account_id == from_account_id {
             from_resources.clone()
         } else {

@@ -23,6 +23,7 @@ use serde_json::json;
 use std::time::Duration;
 use types::id::Id;
 
+#[derive(Clone)]
 pub struct Account {
     name: &'static str,
     secret: &'static str,
@@ -31,6 +32,8 @@ pub struct Account {
     id: Id,
     id_string: String,
     pub http_listener_port: u16,
+    /// Set for zero-access key accounts provisioned through the account API.
+    pub recovery_key: Option<String>,
 }
 
 impl TestServer {
@@ -84,6 +87,7 @@ impl Account {
             id,
             id_string: id.to_string(),
             http_listener_port: 8899,
+            recovery_key: None,
         }
     }
 
@@ -139,6 +143,68 @@ impl Account {
         aliases: &'static [&'static str],
         extra_permissions: Vec<Permission>,
     ) -> Account {
+        self.create_user_account_with_credentials(
+            name,
+            secret,
+            description,
+            aliases,
+            extra_permissions,
+            vec![Credential::Password(PasswordCredential {
+                secret: secret.to_string(),
+                ..Default::default()
+            })],
+        )
+        .await
+    }
+
+    /// Same as `create_user_account` but with no credentials at all, which is
+    /// what the zero-access setup flow requires (spec 4.1 eligibility).
+    pub async fn create_passwordless_user_account(
+        &self,
+        name: &'static str,
+        secret: &'static str,
+        description: &'static str,
+        aliases: &'static [&'static str],
+        extra_permissions: Vec<Permission>,
+    ) -> Account {
+        self.create_user_account_with_credentials(
+            name,
+            secret,
+            description,
+            aliases,
+            extra_permissions,
+            vec![],
+        )
+        .await
+    }
+
+    /// Creates a zero-access key account through the account API
+    /// (`setup-token` as this admin, then `setup` with `secret`).
+    pub async fn create_key_user_account(
+        &self,
+        name: &'static str,
+        secret: &'static str,
+        description: &'static str,
+        aliases: &'static [&'static str],
+        extra_permissions: Vec<Permission>,
+    ) -> Account {
+        let mut account = self
+            .create_passwordless_user_account(name, secret, description, aliases, extra_permissions)
+            .await;
+        let token = crate::utils::za::za_setup_token(self, name).await;
+        account.recovery_key = Some(crate::utils::za::za_setup(name, &token, secret).await);
+        account
+    }
+
+    async fn create_user_account_with_credentials(
+        &self,
+        name: &'static str,
+        secret: &'static str,
+        description: &'static str,
+        aliases: &'static [&'static str],
+        extra_permissions: Vec<Permission>,
+        credentials: Vec<Credential>,
+    ) -> Account {
         let mut domains = AHashMap::from_iter(aliases.iter().copied().chain([name]).map(|email| {
             let domain = email.split('@').nth(1).expect("Invalid email address");
             (domain, Id::singleton())
@@ -167,10 +233,7 @@ impl Account {
             .registry_create_object(structs::Account::User(UserAccount {
                 name: account_name,
                 domain_id,
-                credentials: List::from_iter([Credential::Password(PasswordCredential {
-                    secret: secret.to_string(),
-                    ..Default::default()
-                })]),
+                credentials: List::from(credentials),
                 aliases: List::from_iter(account_aliases),
                 description: description.to_string().into(),
                 permissions: Permissions::Merge(PermissionsList {

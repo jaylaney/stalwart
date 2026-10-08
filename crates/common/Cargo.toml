@@ -12,6 +12,7 @@ trc = { path = "../trc" }
 directory = { path = "../directory" }
 coordinator = { path = "../coordinator" }
 types = { path = "../types" }
+vault = { path = "../vault" }
 registry = { path = "../registry" }
 jmap_proto = { path = "../jmap-proto" }
 sieve-rs = { version = "0.7", features = ["rkyv", "serde"] }
@@ -96,6 +97,7 @@ foundation = []
 
 [dev-dependencies]
 tokio = { version = "1.53", features = ["full"] }
+totp-rs = { version = "6.0.0", features = ["otpauth"] }
 
 [lints]
 workspace = true

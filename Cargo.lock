@@ -186,6 +186,7 @@ dependencies = [
  "blake2 0.11.0",
  "cpufeatures 0.3.1",
  "password-hash 0.6.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -1170,6 +1171,7 @@ dependencies = [
  "cipher 0.5.2",
  "cpufeatures 0.3.1",
  "rand_core 0.10.1",
+ "zeroize",
 ]
 
 [[package]]
@@ -1182,6 +1184,7 @@ dependencies = [
  "chacha20",
  "cipher 0.5.2",
  "poly1305",
+ "zeroize",
 ]
 
 [[package]]
@@ -1363,10 +1366,12 @@ dependencies = [
  "tinyvec",
  "tokio",
  "tokio-rustls",
+ "totp-rs",
  "trc",
  "types",
  "unicode-security",
  "utils",
+ "vault",
  "whatlang",
  "x509-parser",
  "xxhash-rust",
@@ -1907,6 +1912,7 @@ dependencies = [
  "trc",
  "types",
  "utils",
+ "vault",
 ]
 
 [[package]]
@@ -3014,6 +3020,7 @@ name = "groupware"
 version = "0.16.25"
 dependencies = [
  "ahash",
+ "base64 0.23.1",
  "calcard",
  "chrono",
  "common",
@@ -3034,6 +3041,7 @@ dependencies = [
  "trc",
  "types",
  "utils",
+ "vault",
 ]
 
 [[package]]
@@ -3330,10 +3338,12 @@ dependencies = [
  "sha2 0.11.0",
  "smtp",
  "store",
+ "subtle",
  "tokio",
  "trc",
  "types",
  "utils",
+ "vault",
 ]
 
 [[package]]
@@ -4198,6 +4208,7 @@ dependencies = [
  "tungstenite 0.30.0",
  "types",
  "utils",
+ "vault",
 ]
 
 [[package]]
@@ -8555,9 +8566,11 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls",
+ "totp-rs",
  "trc",
  "types",
  "utils",
+ "vault",
  "x509-parser",
 ]
 
@@ -9431,6 +9444,24 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "vault"
+version = "0.16.25"
+dependencies = [
+ "argon2 0.6.0",
+ "base32",
+ "blake3",
+ "chacha20poly1305",
+ "hkdf 0.13.0",
+ "hmac 0.13.0",
+ "rand 0.10.3",
+ "rkyv",
+ "sha2 0.11.0",
+ "subtle",
+ "x25519-dalek",
+ "zeroize",
+]
 
 [[package]]
 name = "vcpkg"

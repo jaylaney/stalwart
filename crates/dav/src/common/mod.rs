@@ -40,6 +40,7 @@ pub mod acl;
 pub mod lock;
 pub mod propfind;
 pub mod uri;
+pub mod za;
 
 #[derive(Debug)]
 pub(crate) struct DavQuery<'x> {

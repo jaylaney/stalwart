@@ -5,7 +5,14 @@
  */
 
 use super::query::CalendarQueryHandler;
-use crate::{DavError, calendar::query::is_resource_in_time_range, common::uri::DavUriResource};
+use crate::{
+    DavError,
+    calendar::query::is_resource_in_time_range,
+    common::{
+        uri::DavUriResource,
+        za::{ZaFreeBusy, ZeroAccessGate, za_event_view},
+    },
+};
 use calcard::{
     common::{PartialDateTime, timezone::Tz},
     icalendar::{
@@ -158,6 +165,15 @@ impl CalendarFreebusyRequestHandler for Server {
                 .map(|resource| resource.document_id())
                 .collect::<Vec<_>>();
 
+            // Ruling R6: a key account's busy times come from unsealed events,
+            // or are not reported at all when this session lacks its keys.
+            let (za_keys, document_ids) =
+                match self.za_freebusy_access(access_token, account_id).await? {
+                    ZaFreeBusy::Plain => (None, document_ids),
+                    ZaFreeBusy::Unsealed(keys) => (Some(keys), document_ids),
+                    ZaFreeBusy::Withheld => (None, Vec::new()),
+                };
+
             let mut fb_entries: AHashMap<ICalendarFreeBusyType, Vec<(i64, i64)>> =
                 AHashMap::with_capacity(document_ids.len());
             let max_instances = self.core.groupware.max_ical_instances;
@@ -176,7 +192,8 @@ impl CalendarFreebusyRequestHandler for Server {
                 else {
                     continue;
                 };
-                let event = archive
+                let view_ = za_event_view(&archive, za_keys.as_ref(), account_id, document_id)?;
+                let event = view_
                     .unarchive::<CalendarEvent>()
                     .caused_by(trc::location!())?;
 

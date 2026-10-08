@@ -10,6 +10,7 @@ use crate::{
         ETag,
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
+        za::{ZeroAccessGate, za_event_view},
     },
 };
 use common::{Server, auth::AccessToken};
@@ -49,6 +50,7 @@ impl CalendarGetRequestHandler for Server {
             .await?
             .into_owned_uri()?;
         let account_id = resource_.account_id;
+        let za_keys = self.za_session_keys(access_token, account_id).await?;
         let resources = self
             .fetch_dav_resources(
                 access_token.account_id(),
@@ -90,12 +92,18 @@ impl CalendarGetRequestHandler for Server {
             .await
             .caused_by(trc::location!())?
             .ok_or(DavError::Code(StatusCode::NOT_FOUND))?;
-        let event = event_
+        let etag = event_.etag();
+        let view_ = za_event_view(
+            &event_,
+            za_keys.as_ref(),
+            account_id,
+            resource.document_id(),
+        )?;
+        let event = view_
             .unarchive::<CalendarEvent>()
             .caused_by(trc::location!())?;
 
         // Validate headers
-        let etag = event_.etag();
         let schedule_tag = event.schedule_tag.as_ref().map(|tag| tag.to_native());
         self.validate_headers(
             access_token,

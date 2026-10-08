@@ -10,6 +10,7 @@ use crate::{
         AccessToken, AuthRequest, DomainCache,
         credential::{ApiKey, AppPassword},
         oauth::{GrantType, token::TOKEN_HEADER},
+        vault::{ZA_REASON_VAULT_MISSING, ZaVerification},
     },
 };
 use base64::{Engine, engine::general_purpose};
@@ -25,6 +26,7 @@ use serde::Deserialize;
 use std::{borrow::Cow, net::IpAddr, sync::Arc};
 use store::write::now;
 use trc::AddContext;
+use vault::{ZA_MARKER, session::SessionKeys};
 
 pub struct UsernameParts {
     pub account: Username,
@@ -38,42 +40,79 @@ pub struct Username {
 }
 
 impl Server {
+    /// Authenticates a request. The token never carries session keys: IMAP,
+    /// POP3, ManageSieve and long-lived HTTP streams hold their token for the
+    /// connection's lifetime, past the key residency bound (spec 2, 5). A
+    /// key account's keys, derived to verify the password, are dropped here.
     pub async fn authenticate(&self, req: &AuthRequest) -> trc::Result<AccessToken> {
+        self.authenticate_with_keys(req)
+            .await
+            .map(|(token, _keys)| token)
+    }
+
+    /// As `authenticate`, with a key account's session keys returned beside
+    /// the (keyless) token. Only the HTTP authentication layer and the vault
+    /// endpoints' fresh verification use this; the HTTP layer attaches the
+    /// keys to the request's token under the residency rules (spec 5).
+    pub async fn authenticate_with_keys(
+        &self,
+        req: &AuthRequest,
+    ) -> trc::Result<(AccessToken, Option<Arc<SessionKeys>>)> {
         match Box::pin(self.route_auth_request(req))
             .await
             .and_then(|token| token.assert_has_permission(Permission::Authenticate))
         {
-            Ok(token) => Ok(token),
-            Err(err) => {
-                // Random delay to mitigate user enumeration attacks
-                #[cfg(not(feature = "test_mode"))]
-                {
-                    use store::rand::{self, RngExt};
-
-                    let delay = rand::rng().random_range(50..500);
-                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-                }
-
-                if matches!(
-                    err.as_ref(),
-                    trc::EventType::Auth(trc::AuthEvent::Failed)
-                        | trc::EventType::Security(trc::SecurityEvent::IpUnauthorized)
-                ) && self.has_auth_fail2ban()
-                    && self
-                        .is_auth_fail2banned(req.remote_ip, req.username())
-                        .await?
-                {
-                    Err(trc::SecurityEvent::AuthenticationBan
-                        .into_err()
-                        .ctx(trc::Key::RemoteIp, req.remote_ip)
-                        .ctx_opt(trc::Key::AccountName, req.username().map(|s| s.to_string())))
-                } else {
-                    Err(err.ctx(trc::Key::RemoteIp, req.remote_ip))
-                }
+            Ok(token) => {
+                let keys = token.session_keys().cloned();
+                Ok((token.without_session_keys(), keys))
             }
+            Err(err) => Err(self
+                .authentication_failure(err, req.remote_ip, req.username())
+                .await),
         }
     }
 
+    /// Failure path of every credential check: a random delay against user
+    /// enumeration, then fail2ban accounting. Returns the error to report: a
+    /// ban, the fail2ban lookup's own error, or `err` with the remote IP.
+    pub async fn authentication_failure(
+        &self,
+        err: trc::Error,
+        remote_ip: IpAddr,
+        username: Option<&str>,
+    ) -> trc::Error {
+        // Random delay to mitigate user enumeration attacks
+        #[cfg(not(feature = "test_mode"))]
+        {
+            use store::rand::{self, RngExt};
+
+            let delay = rand::rng().random_range(50..500);
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+
+        if matches!(
+            err.as_ref(),
+            trc::EventType::Auth(trc::AuthEvent::Failed)
+                | trc::EventType::Security(trc::SecurityEvent::IpUnauthorized)
+        ) && self.has_auth_fail2ban()
+        {
+            match self.is_auth_fail2banned(remote_ip, username).await {
+                Ok(true) => {
+                    return trc::SecurityEvent::AuthenticationBan
+                        .into_err()
+                        .ctx(trc::Key::RemoteIp, remote_ip)
+                        .ctx_opt(trc::Key::AccountName, username.map(|s| s.to_string()));
+                }
+                Ok(false) => (),
+                Err(lookup_err) => return lookup_err,
+            }
+        }
+
+        err.ctx(trc::Key::RemoteIp, remote_ip)
+    }
+
+    /// The returned token may carry a key account's session keys; only
+    /// `authenticate_with_keys` sees it, and it detaches them.
     async fn route_auth_request(&self, req: &AuthRequest) -> trc::Result<AccessToken> {
         match &req.credentials {
             Credentials::Basic {
@@ -172,6 +211,14 @@ impl Server {
                 // Obtain external directory, if any
                 let mut is_alias_login = false;
                 let token = if let Some(directory) = self.get_directory_for_cached_domain(&domain) {
+                    // Refused before the directory sees the password.
+                    self.za_refuse_directory_login(
+                        auth_as_local,
+                        domain.id,
+                        auth_as_address,
+                        req.session_id,
+                    )
+                    .await?;
                     let directory_account = if username.is_master() {
                         directory
                             .authenticate(&Credentials::Basic {
@@ -185,6 +232,10 @@ impl Server {
                     };
 
                     is_alias_login = directory_account.email != auth_as_address;
+                    // The directory may name another account; refused before
+                    // synchronization could overwrite its marker.
+                    self.za_refuse_directory_account(&directory_account, req.session_id)
+                        .await?;
                     self.build_directory_token(directory_account, req.remote_ip)
                         .await
                 } else if let Some(account_id) =
@@ -205,19 +256,52 @@ impl Server {
                                 .reason("Password credential not found for account"));
                         };
 
-                        match verify_mfa_secret_hash(
-                            credential.otp_auth.as_deref(),
-                            mfa_token.as_deref(),
-                            credential.secret.as_str(),
-                            secret,
-                        )
-                        .await?
-                        {
+                        let (result, session_keys) = if credential.secret == ZA_MARKER {
+                            match self
+                                .za_verify_password(account_id, secret, mfa_token.as_deref())
+                                .await?
+                            {
+                                ZaVerification::Valid(keys) => {
+                                    (SecretVerificationResult::Valid, Some(keys))
+                                }
+                                ZaVerification::Invalid => {
+                                    (SecretVerificationResult::Invalid, None)
+                                }
+                                ZaVerification::MissingMfaToken => {
+                                    (SecretVerificationResult::MissingMfaToken, None)
+                                }
+                                ZaVerification::NoRecord => {
+                                    return Err(trc::AuthEvent::Error
+                                        .into_err()
+                                        .ctx(trc::Key::AccountName, auth_as_address.to_string())
+                                        .ctx(trc::Key::AccountId, account_id)
+                                        .ctx(trc::Key::SpanId, req.session_id)
+                                        .reason(ZA_REASON_VAULT_MISSING));
+                                }
+                            }
+                        } else {
+                            (
+                                verify_mfa_secret_hash(
+                                    credential.otp_auth.as_deref(),
+                                    mfa_token.as_deref(),
+                                    credential.secret.as_str(),
+                                    secret,
+                                )
+                                .await?,
+                                None,
+                            )
+                        };
+
+                        match result {
                             SecretVerificationResult::Valid => {
                                 is_alias_login = account.name != auth_as_local;
                                 self.access_token(account_id)
                                     .await
                                     .and_then(|token| AccessToken::new(token, req.remote_ip))
+                                    .map(|token| match session_keys {
+                                        Some(keys) => token.with_session_keys(keys),
+                                        None => token,
+                                    })
                             }
                             SecretVerificationResult::Invalid => Err(trc::AuthEvent::Failed
                                 .into_err()
@@ -335,6 +419,8 @@ impl Server {
                 {
                     match directory.authenticate(&req.credentials).await {
                         Ok(result) => {
+                            self.za_refuse_directory_account(&result, req.session_id)
+                                .await?;
                             return self.build_directory_token(result, req.remote_ip).await;
                         }
                         Err(err) => {
@@ -398,6 +484,7 @@ impl Server {
         {
             // Find credential by credential_id
             let mut authenticated = false;
+            let mut authenticated_as_app_password = false;
             for (credential, credential_type) in
                 account.credentials.iter().filter_map(|credential| {
                     credential
@@ -443,17 +530,45 @@ impl Server {
                         }
                     );
 
+                    authenticated_as_app_password =
+                        matches!(credential_type, Credential::AppPassword(_));
                     authenticated = true;
                     break;
                 }
             }
 
             if authenticated {
+                let session_keys = if authenticated_as_app_password
+                    && account
+                        .password_credential()
+                        .is_some_and(|c| c.secret == ZA_MARKER)
+                {
+                    match self
+                        .za_open_app_wrap(account_id, credential_id, secret)
+                        .await?
+                    {
+                        Some(keys) => Some(keys),
+                        None => {
+                            return Err(trc::AuthEvent::Failed
+                                .into_err()
+                                .ctx(trc::Key::AccountId, account_id)
+                                .ctx(trc::Key::Id, credential_id)
+                                .ctx(trc::Key::SpanId, span_id)
+                                .reason("Zero-access app password has no published wrap"));
+                        }
+                    }
+                } else {
+                    None
+                };
                 let token = self
                     .access_token_from_account(account_id, structs::Account::User(account))
                     .await?;
 
                 AccessToken::new_scoped(token, credential_id, remote_ip)
+                    .map(|token| match session_keys {
+                        Some(keys) => token.with_session_keys(keys),
+                        None => token,
+                    })
                     .add_context(|ctx| ctx.span_id(span_id))
             } else {
                 Err(trc::AuthEvent::Failed
@@ -493,6 +608,41 @@ impl Server {
             address.domain_start = address.name.len() + 1;
             address.name = format!("{}@{}", address.name, self.core.email.default_domain_name);
         }
+    }
+
+    /// Spec 4.2: key accounts never authenticate through an external
+    /// directory. Resolves the local account with the same lookup the
+    /// internal path and `synchronize_account` use.
+    async fn za_refuse_directory_login(
+        &self,
+        local: &str,
+        domain_id: u32,
+        account_name: &str,
+        span_id: u64,
+    ) -> trc::Result<()> {
+        if let Some(account_id) = self.account_id_from_parts(local, domain_id).await?
+            && self.account(account_id).await?.is_key_account()
+        {
+            return Err(trc::AuthEvent::Failed
+                .into_err()
+                .ctx(trc::Key::AccountName, account_name.to_string())
+                .ctx(trc::Key::AccountId, account_id)
+                .ctx(trc::Key::SpanId, span_id)
+                .reason("Zero-access accounts cannot authenticate through an external directory"));
+        }
+        Ok(())
+    }
+
+    /// The account a directory result would synchronize into, resolved as
+    /// `synchronize_account` resolves it.
+    async fn za_refuse_directory_account(
+        &self,
+        account: &directory::Account,
+        span_id: u64,
+    ) -> trc::Result<()> {
+        let (local, domain) = self.validate_address(&account.email).await?;
+        self.za_refuse_directory_login(local, domain.id, &account.email, span_id)
+            .await
     }
 
     async fn build_directory_token(

@@ -84,6 +84,7 @@ impl PrincipalGet for Server {
                 .account(document_id)
                 .await
                 .caused_by(trc::location!())?;
+            let is_key = principal.is_key_account();
 
             let mut result = Map::with_capacity(properties.len());
             for property in &properties {
@@ -154,7 +155,8 @@ impl PrincipalGet for Server {
                                         ),
                                     ])),
                                 ),
-                            ]),
+                            ])
+                            .filter(|(key, _)| za_shown_capability(is_key, key)),
                         )),
                     )])),
                     PrincipalProperty::Capabilities => Value::Object(Map::from_iter(
@@ -171,7 +173,8 @@ impl PrincipalGet for Server {
                                 Key::Property(PrincipalProperty::Capability(*cap)),
                                 Value::Object(Map::new()),
                             )
-                        }),
+                        })
+                        .filter(|(key, _)| za_shown_capability(is_key, key)),
                     )),
                     _ => Value::Null,
                 };
@@ -183,4 +186,13 @@ impl PrincipalGet for Server {
 
         Ok(response)
     }
+}
+
+/// Spec 9: a key account's principal advertises no calendars capability.
+fn za_shown_capability(is_key: bool, key: &Key<'_, PrincipalProperty>) -> bool {
+    !(is_key
+        && matches!(
+            key,
+            Key::Property(PrincipalProperty::Capability(Capability::Calendars))
+        ))
 }

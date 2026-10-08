@@ -372,6 +372,22 @@ impl CalendarEventNotificationHandler for Server {
                 .await
                 .caused_by(trc::location!())?
             {
+                // Spec 9: a key account's free-busy is not offered; answer
+                // as for an unknown or unpermitted calendar user.
+                if self
+                    .account(account_id)
+                    .await
+                    .caused_by(trc::location!())?
+                    .is_key_account()
+                {
+                    response.items.0.push(ScheduleResponseItem {
+                        recipient: Href(format!("mailto:{email}")),
+                        request_status: "3.7;Invalid calendar user or insufficient permissions"
+                            .into(),
+                        calendar_data: None,
+                    });
+                    continue;
+                }
                 let resources = self
                     .fetch_dav_resources(
                         access_token.account_id(),

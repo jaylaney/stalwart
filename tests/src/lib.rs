@@ -37,6 +37,8 @@ pub mod telemetry;
 pub mod utils;
 #[cfg(test)]
 pub mod webdav;
+#[cfg(test)]
+pub mod za;
 
 #[cfg(test)]
 pub trait AssertConfig {

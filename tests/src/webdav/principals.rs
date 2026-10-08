@@ -131,22 +131,33 @@ pub async fn test(test: &TestServer, assisted_discovery: bool) {
                 "INDIVIDUAL"
             }])
             .with_status(StatusCode::OK);
-        props
-            .get(DavProperty::Principal(PrincipalProperty::ScheduleInboxURL))
-            .with_values([format!(
-                "D:href:{}/{account_name}/inbox/",
-                DavResourceName::Scheduling.base_path()
-            )
-            .as_str()])
-            .with_status(StatusCode::OK);
-        props
-            .get(DavProperty::Principal(PrincipalProperty::ScheduleOutboxURL))
-            .with_values([format!(
-                "D:href:{}/{account_name}/outbox/",
-                DavResourceName::Scheduling.base_path()
-            )
-            .as_str()])
-            .with_status(StatusCode::OK);
+        // Key accounts have no scheduling collections (spec 9); admin and groups are not key accounts.
+        let key_principal = account_.recovery_key.is_some();
+        if key_principal {
+            props
+                .get(DavProperty::Principal(PrincipalProperty::ScheduleInboxURL))
+                .with_status(StatusCode::NOT_FOUND);
+            props
+                .get(DavProperty::Principal(PrincipalProperty::ScheduleOutboxURL))
+                .with_status(StatusCode::NOT_FOUND);
+        } else {
+            props
+                .get(DavProperty::Principal(PrincipalProperty::ScheduleInboxURL))
+                .with_values([format!(
+                    "D:href:{}/{account_name}/inbox/",
+                    DavResourceName::Scheduling.base_path()
+                )
+                .as_str()])
+                .with_status(StatusCode::OK);
+            props
+                .get(DavProperty::Principal(PrincipalProperty::ScheduleOutboxURL))
+                .with_values([format!(
+                    "D:href:{}/{account_name}/outbox/",
+                    DavResourceName::Scheduling.base_path()
+                )
+                .as_str()])
+                .with_status(StatusCode::OK);
+        }
     }
 
     // Test 2: PROPFIND on /dav/[resource] should return user and shared resources

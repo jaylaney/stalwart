@@ -31,6 +31,7 @@ pub mod credential;
 pub mod oauth;
 pub mod permissions;
 pub mod rate_limit;
+pub mod vault;
 
 pub const RECOVERY_ADMIN_ID: u32 = u32::MAX;
 const PERMISSIONS_BITSET_SIZE: usize = Permission::COUNT.div_ceil(std::mem::size_of::<usize>());
@@ -89,6 +90,10 @@ pub struct AccountCache {
     pub encryption_key: Option<EncryptionKeys>,
     pub locale: Locale,
     pub flags: u64,
+    /// Authentication generation (vault record revision); 0 for non-key accounts.
+    pub za_generation: u64,
+    /// X25519 public key of a key account.
+    pub za_public_key: Option<[u8; 32]>,
 }
 
 pub type EncryptionKeys = Box<[Box<[u8]>]>;
@@ -102,6 +107,8 @@ pub const ACCOUNT_FLAG_ENCRYPT_ALGO_AES128: u64 = 1 << 5;
 pub const ACCOUNT_FLAG_ENCRYPT_APPEND: u64 = 1 << 6;
 pub const ACCOUNT_FLAG_ENCRYPT_ALGO_AES256_GCM: u64 = 1 << 7;
 pub const ACCOUNT_FLAG_ENCRYPT_ALGO_CHACHA20_POLY1305: u64 = 1 << 8;
+/// The registry password credential holds `vault::ZA_MARKER` (spec 3.2).
+pub const ACCOUNT_IS_KEY_ACCOUNT: u64 = 1 << 9;
 
 #[derive(Debug, Clone)]
 pub struct RoleCache {
@@ -134,6 +141,8 @@ pub struct PermissionsGroup {
 pub struct AccessToken {
     scope_idx: usize,
     inner: Arc<AccessTokenInner>,
+    /// Resident keys for this request only (spec 5, "in-flight copies").
+    session_keys: Option<Arc<::vault::session::SessionKeys>>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -298,10 +307,7 @@ pub trait BuildAccessToken {
 
 impl BuildAccessToken for Arc<AccessTokenInner> {
     fn build(self) -> AccessToken {
-        AccessToken {
-            scope_idx: 0,
-            inner: self,
-        }
+        AccessToken::from_parts(0, self)
     }
 }
 
@@ -326,6 +332,11 @@ impl<'x> EmailAddressRef<'x> {
 impl AccountCache {
     pub fn domain_id(&self) -> Option<u32> {
         self.addresses.first().map(|address| address.domain_id)
+    }
+
+    #[inline(always)]
+    pub fn is_key_account(&self) -> bool {
+        self.flags & ACCOUNT_IS_KEY_ACCOUNT != 0
     }
 }
 

@@ -10,6 +10,7 @@ use crate::{
         ETag, ExtractETag,
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
+        za::ZeroAccessGate,
     },
 };
 use calcard::common::timezone::Tz;
@@ -25,7 +26,10 @@ use dav_proto::{
 };
 use groupware::{
     cache::GroupwareCache,
-    calendar::{Calendar, CalendarEvent, SupportedComponent, Timezone},
+    calendar::{
+        Calendar, CalendarEvent, SupportedComponent, Timezone,
+        seal::{seal_calendar, seal_error, seal_event, unseal_calendar, unseal_event},
+    },
 };
 use http_proto::HttpResponse;
 use hyper::StatusCode;
@@ -82,6 +86,7 @@ impl CalendarPropPatchRequestHandler for Server {
             .into_owned_uri()?;
         let uri = headers.uri;
         let account_id = resource_.account_id;
+        let za_keys = self.za_session_keys(access_token, account_id).await?;
         let resources = self
             .fetch_dav_resources(
                 access_token.account_id(),
@@ -159,6 +164,11 @@ impl CalendarPropPatchRequestHandler for Server {
             let mut new_calendar = archive
                 .deserialize::<Calendar>()
                 .caused_by(trc::location!())?;
+            // Spec 8.1: edit the plaintext; `calendar` (stored) stays current.
+            if let Some(keys) = &za_keys {
+                unseal_calendar(&mut new_calendar, keys, account_id)
+                    .map_err(|err| seal_error(err, account_id, document_id))?;
+            }
             let personal_id = access_token.personal_id(account_id, Collection::Calendar);
 
             // Remove properties
@@ -191,6 +201,10 @@ impl CalendarPropPatchRequestHandler for Server {
             }
 
             if is_success {
+                if let Some(keys) = &za_keys {
+                    seal_calendar(&mut new_calendar, keys, account_id)
+                        .map_err(|err| seal_error(err, account_id, document_id))?;
+                }
                 new_calendar
                     .update(
                         access_token.account_tenant_ids(),
@@ -212,6 +226,11 @@ impl CalendarPropPatchRequestHandler for Server {
             let mut new_event = archive
                 .deserialize::<CalendarEvent>()
                 .caused_by(trc::location!())?;
+            // Spec 8.1: edit the plaintext; `event` (stored) stays current.
+            if let Some(keys) = &za_keys {
+                unseal_event(&mut new_event, keys, account_id)
+                    .map_err(|err| seal_error(err, account_id, document_id))?;
+            }
 
             // Remove properties
             if !request.set_first && !request.remove.is_empty() {
@@ -231,6 +250,10 @@ impl CalendarPropPatchRequestHandler for Server {
             }
 
             if is_success {
+                if let Some(keys) = &za_keys {
+                    seal_event(&mut new_event, keys, account_id)
+                        .map_err(|err| seal_error(err, account_id, document_id))?;
+                }
                 new_event
                     .update(
                         access_token.account_tenant_ids(),

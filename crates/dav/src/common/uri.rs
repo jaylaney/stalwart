@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::{DavError, DavResourceName};
+use crate::{DavError, DavResourceName, common::za::ZeroAccessGate};
 use common::{Server, auth::AccessToken};
 use groupware::cache::GroupwareCache;
 use http_proto::request::decode_path_element;
@@ -102,6 +102,15 @@ impl DavUriResource for Server {
                 && !access_token.has_access(account_id, resource.collection)
             {
                 return Err(DavError::Code(StatusCode::FORBIDDEN));
+            }
+
+            // Zero-access gate (spec 9): a key account's calendar and
+            // scheduling data is reachable only with that account's keys.
+            if matches!(
+                resource.collection,
+                Collection::Calendar | Collection::CalendarEventNotification
+            ) {
+                self.za_session_keys(access_token, account_id).await?;
             }
 
             // Obtain remaining path

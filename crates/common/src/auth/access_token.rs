@@ -10,6 +10,7 @@ use crate::{
     auth::{
         AccessScope, AccessTo, AccessTokenInner, AccountTenantIds, Permissions, RECOVERY_ADMIN_ID,
         permissions::{BuildPermissions, PermissionsListBuilder},
+        vault::is_vault_unusable,
     },
     network::limiter::{ConcurrencyLimiter, LimiterResult},
 };
@@ -24,7 +25,7 @@ use registry::{
 use std::{
     hash::{Hash, Hasher},
     net::IpAddr,
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
 };
 use store::{query::acl::AclQuery, rand, write::now};
 use tinyvec::TinyVec;
@@ -123,6 +124,8 @@ impl Server {
 
                 let now = now();
                 let mut credential_version = 0;
+                // Same credential as classification: the first Password one.
+                let mut is_marker: Option<bool> = None;
                 let mut credential_scopes = Vec::with_capacity(account.credentials.len());
 
                 credential_scopes.push(AccessScope::new(permissions.finalize(), u32::MAX));
@@ -130,6 +133,7 @@ impl Server {
                 for credential in account.credentials {
                     match credential {
                         structs::Credential::Password(credential) => {
+                            is_marker.get_or_insert(credential.secret == ::vault::ZA_MARKER);
                             credential_version = xxh3::xxh3_64(credential.secret.as_bytes()).max(1);
 
                             if credential.expires_at.is_some() || !credential.allowed_ips.is_empty()
@@ -181,6 +185,20 @@ impl Server {
                             }
                         }
                     }
+                }
+
+                // A marker secret is constant, so OAuth token revocation on
+                // password change must follow the vault generation instead.
+                if is_marker == Some(true) {
+                    let read = match self.za_vault_record(account_id).await {
+                        Ok(read) => read,
+                        Err(err) if is_vault_unusable(&err) => {
+                            trc::error!(err);
+                            None
+                        }
+                        Err(err) => return Err(err),
+                    };
+                    credential_version = read.map(|read| read.record.revision).unwrap_or(0).max(1);
                 }
 
                 Ok(AccessTokenInner {
@@ -281,6 +299,7 @@ impl Server {
                     Collection = "accessToken",
                 );
 
+                let epoch = self.inner.cache.account_epoch.load(Ordering::SeqCst);
                 let token: Arc<AccessTokenInner> = if let Some(account) =
                     self.registry().object::<Account>(account_id.into()).await?
                 {
@@ -299,7 +318,15 @@ impl Server {
                         .caused_by(trc::location!()));
                 };
 
-                let _ = guard.insert(token.clone());
+                // As in `try_account`: an invalidation during the load cannot
+                // evict the placeholder, so a stale token is returned uncached.
+                let epoch_now = || self.inner.cache.account_epoch.load(Ordering::SeqCst);
+                if epoch_now() == epoch {
+                    let _ = guard.insert(token.clone());
+                    if epoch_now() != epoch {
+                        self.inner.cache.access_tokens.remove(&account_id);
+                    }
+                }
                 Ok(token)
             }
         }
@@ -371,19 +398,22 @@ impl Server {
 }
 
 impl AccessToken {
-    pub fn new(inner: Arc<AccessTokenInner>, remote_ip: IpAddr) -> trc::Result<Self> {
+    /// The one constructor: every token starts without session keys, which
+    /// only the HTTP authentication layer attaches (spec 5).
+    pub(crate) fn from_parts(scope_idx: usize, inner: Arc<AccessTokenInner>) -> Self {
         AccessToken {
-            scope_idx: 0,
+            scope_idx,
             inner,
+            session_keys: None,
         }
-        .assert_is_valid(remote_ip)
+    }
+
+    pub fn new(inner: Arc<AccessTokenInner>, remote_ip: IpAddr) -> trc::Result<Self> {
+        AccessToken::from_parts(0, inner).assert_is_valid(remote_ip)
     }
 
     pub fn new_maybe_invalid(inner: Arc<AccessTokenInner>) -> Self {
-        AccessToken {
-            scope_idx: 0,
-            inner,
-        }
+        AccessToken::from_parts(0, inner)
     }
 
     pub fn new_scoped(
@@ -402,7 +432,7 @@ impl AccessToken {
                     .ctx(trc::Key::Id, credential_id)
                     .reason("Credential expired or removed.")
             })
-            .map(|scope_idx| AccessToken { scope_idx, inner })
+            .map(|scope_idx| AccessToken::from_parts(scope_idx, inner))
             .and_then(|token| token.assert_is_valid(remote_ip))
     }
 
@@ -414,12 +444,31 @@ impl AccessToken {
         if let Some(credential_id) = credential_id {
             Self::new_scoped(inner, credential_id, remote_ip)
         } else {
-            AccessToken {
-                scope_idx: 0,
-                inner,
-            }
-            .assert_is_valid(remote_ip)
+            AccessToken::from_parts(0, inner).assert_is_valid(remote_ip)
         }
+    }
+
+    pub fn with_session_keys(mut self, keys: Arc<::vault::session::SessionKeys>) -> Self {
+        self.session_keys = Some(keys);
+        self
+    }
+
+    pub fn without_session_keys(mut self) -> Self {
+        self.session_keys = None;
+        self
+    }
+
+    pub fn session_keys(&self) -> Option<&Arc<::vault::session::SessionKeys>> {
+        self.session_keys.as_ref()
+    }
+
+    /// Keys usable for `account_id`'s data: only the keys of the account that
+    /// authenticated this request. Impersonation, group membership and
+    /// sharing never yield another account's keys.
+    pub fn za_keys_for(&self, account_id: u32) -> Option<&Arc<::vault::session::SessionKeys>> {
+        self.session_keys
+            .as_ref()
+            .filter(|k| k.account_id == account_id)
     }
 
     pub fn state(&self) -> u32 {
@@ -578,6 +627,7 @@ impl AccessToken {
                 access_token = AccessToken {
                     scope_idx: access_token.scope_idx,
                     inner: Arc::new(inner),
+                    session_keys: access_token.session_keys.take(),
                 };
             }
 
@@ -757,10 +807,7 @@ impl AccessToken {
     }
 
     pub fn new_admin() -> AccessToken {
-        AccessToken {
-            scope_idx: 0,
-            inner: Arc::new(AccessTokenInner::new_admin()),
-        }
+        AccessToken::from_parts(0, Arc::new(AccessTokenInner::new_admin()))
     }
 
     pub fn from_permissions(
@@ -771,9 +818,9 @@ impl AccessToken {
         for permission in set_permissions {
             permissions.set(permission as usize);
         }
-        AccessToken {
-            scope_idx: 0,
-            inner: Arc::new(AccessTokenInner {
+        AccessToken::from_parts(
+            0,
+            Arc::new(AccessTokenInner {
                 account_id,
                 tenant_id: Default::default(),
                 member_of: Default::default(),
@@ -787,7 +834,7 @@ impl AccessToken {
                 credential_version: Default::default(),
                 obj_size: Default::default(),
             }),
-        }
+        )
     }
 
     pub fn from_id_maybe_invalid(account_id: u32) -> Self {

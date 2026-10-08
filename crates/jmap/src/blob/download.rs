@@ -114,7 +114,18 @@ impl BlobDownload for Server {
                             collection,
                             document_id,
                         } => {
-                            if access_token.is_member(*account_id) {
+                            if matches!(
+                                Collection::from(*collection),
+                                Collection::Calendar | Collection::CalendarEvent
+                            ) && self
+                                .try_account(*account_id)
+                                .await
+                                .caused_by(trc::location!())?
+                                .is_some_and(|account| account.is_key_account())
+                            {
+                                // Spec 9: never for a key account's calendar data.
+                                false
+                            } else if access_token.is_member(*account_id) {
                                 true
                             } else {
                                 match Collection::from(*collection) {

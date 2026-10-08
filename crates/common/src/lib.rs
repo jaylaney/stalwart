@@ -174,7 +174,17 @@ pub struct LogoCache {
 
 pub struct Caches {
     pub access_tokens: Cache<u32, Arc<AccessTokenInner>>,
-    pub http_auth: Cache<Box<str>, HttpAuthCache>,
+    pub http_auth: Cache<[u8; 32], HttpAuthCache>,
+    /// Resident master keys for CalDAV sessions (spec 5).
+    pub za_keys: vault::cache::KeyCache,
+    /// Per-process secret for keyed fingerprints of Authorization headers.
+    pub za_fingerprint_key: vault::Zeroizing<[u8; 32]>,
+    /// Bumped before every local `Account`/`AccessToken` invalidation; a
+    /// loader that saw it change since its read must not publish its value.
+    pub account_epoch: AtomicU64,
+    /// Origin of the account page, allowed by CORS on `/api/vault/*` (spec 4.1).
+    /// Set from the environment at startup; only test builds change it.
+    za_account_page_origin: arc_swap::ArcSwapOption<hyper::header::HeaderValue>,
 
     pub messages: Cache<u32, Arc<MessageStoreCache>>,
     pub files: Cache<u32, Arc<DavResources>>,
@@ -268,6 +278,49 @@ pub struct HttpAuthCache {
     pub revision: u64,
     pub credential_id: Option<u32>,
     pub expires: Instant,
+    /// Authentication generation at verification time; 0 for non-key accounts.
+    pub generation: u64,
+}
+
+impl Caches {
+    /// Keyed BLAKE3 of the Authorization header value; usable only by this process.
+    pub fn za_fingerprint(&self, token: &str) -> [u8; 32] {
+        vault::keys::fingerprint(&self.za_fingerprint_key, token.as_bytes())
+    }
+
+    /// Makes `keys` resident under `fp`. An entry evicted to stay within the
+    /// bound takes its cached authentication with it: a fingerprint lives no
+    /// longer than its keys (spec 5).
+    pub fn za_insert_keys(
+        &self,
+        fp: [u8; 32],
+        keys: Arc<vault::session::SessionKeys>,
+        now: Instant,
+    ) {
+        if let Some(evicted) = self.za_keys.insert(fp, keys, now) {
+            self.http_auth.remove(&evicted);
+        }
+    }
+
+    /// Sweep of expired resident keys, dropping the cached authentication
+    /// under each removed fingerprint. Returns the number of entries removed.
+    pub fn za_sweep_keys(&self, now: Instant) -> usize {
+        let removed = self.za_keys.sweep(now);
+        for fp in &removed {
+            self.http_auth.remove(fp);
+        }
+        removed.len()
+    }
+
+    pub fn za_account_page_origin(&self) -> Option<Arc<hyper::header::HeaderValue>> {
+        self.za_account_page_origin.load_full()
+    }
+
+    /// Per-server override of `ZA_ACCOUNT_PAGE_ORIGIN` for tests.
+    #[cfg(feature = "test_mode")]
+    pub fn set_za_account_page_origin(&self, origin: Option<hyper::header::HeaderValue>) {
+        self.za_account_page_origin.store(origin.map(Arc::new));
+    }
 }
 
 pub struct Ipc {

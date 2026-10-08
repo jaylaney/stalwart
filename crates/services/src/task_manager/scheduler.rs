@@ -40,6 +40,7 @@ enum Event {
     CalculateMetrics,
     TrainSpamClassifier,
     RenewNodeIdLease,
+    ZaKeySweep,
     // SPDX-SnippetBegin
     // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
     // SPDX-License-Identifier: LicenseRef-SEL
@@ -56,6 +57,12 @@ enum Event {
 struct Queue {
     heap: BinaryHeap<Action>,
 }
+
+/// Zero-access key cache sweep interval. Spec 5 requires a sweep at least
+/// every 60 seconds; half that leaves room for wake-up latency and for the
+/// inline awaits of other events drained in the same pass.
+const ZA_KEY_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+const _: () = assert!(ZA_KEY_SWEEP_INTERVAL.as_secs() <= 60);
 
 // SPDX-SnippetBegin
 // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
@@ -128,6 +135,9 @@ pub fn spawn_task_scheduler(inner: Arc<Inner>) {
 
             // Calculate expensive metrics
             queue.schedule(Instant::now(), Event::CalculateMetrics);
+
+            // Zero-access key cache sweep (process-local, every node)
+            queue.schedule(Instant::now() + ZA_KEY_SWEEP_INTERVAL, Event::ZaKeySweep);
 
             // SPDX-SnippetBegin
             // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
@@ -228,6 +238,10 @@ pub fn spawn_task_scheduler(inner: Arc<Inner>) {
                                 shard_index: None,
                             }));
                         }
+                    }
+                    Event::ZaKeySweep => {
+                        queue.schedule(Instant::now() + ZA_KEY_SWEEP_INTERVAL, Event::ZaKeySweep);
+                        server.inner.cache.za_sweep_keys(Instant::now());
                     }
                     Event::RenewNodeIdLease => {
                         queue.schedule(
@@ -571,6 +585,7 @@ impl Event {
             Event::CalculateMetrics => "calculateMetrics",
             Event::TrainSpamClassifier => "trainSpamClassifier",
             Event::RenewNodeIdLease => "renewNodeIdLease",
+            Event::ZaKeySweep => "zaKeySweep",
             // SPDX-SnippetBegin
             // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <info@stalwartlabs.com>
             // SPDX-License-Identifier: LicenseRef-SEL

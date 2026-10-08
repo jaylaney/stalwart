@@ -10,10 +10,11 @@ use crate::{
         ACCOUNT_FLAG_ENCRYPT_ALGO_AES128, ACCOUNT_FLAG_ENCRYPT_ALGO_AES256,
         ACCOUNT_FLAG_ENCRYPT_ALGO_AES256_GCM, ACCOUNT_FLAG_ENCRYPT_ALGO_CHACHA20_POLY1305,
         ACCOUNT_FLAG_ENCRYPT_APPEND, ACCOUNT_FLAG_ENCRYPT_METHOD_PGP,
-        ACCOUNT_FLAG_ENCRYPT_METHOD_SMIME, ACCOUNT_FLAG_ENCRYPT_TRAIN_SPAM_FILTER, ACCOUNT_IS_USER,
-        AccountCache, AccountInfo, AccountTenantIds, DOMAIN_FLAG_RELAY, DOMAIN_FLAG_SUB_ADDRESSING,
-        DomainCache, EmailAddress, EmailAddressRef, EmailCache, MailingListCache, PermissionsGroup,
-        RECOVERY_ADMIN_ID, RoleCache, TenantCache, permissions::BuildPermissions,
+        ACCOUNT_FLAG_ENCRYPT_METHOD_SMIME, ACCOUNT_FLAG_ENCRYPT_TRAIN_SPAM_FILTER,
+        ACCOUNT_IS_KEY_ACCOUNT, ACCOUNT_IS_USER, AccountCache, AccountInfo, AccountTenantIds,
+        DOMAIN_FLAG_RELAY, DOMAIN_FLAG_SUB_ADDRESSING, DomainCache, EmailAddress, EmailAddressRef,
+        EmailCache, MailingListCache, PermissionsGroup, RECOVERY_ADMIN_ID, RoleCache, TenantCache,
+        permissions::BuildPermissions, vault::is_vault_unusable,
     },
     config::smtp::auth::DkimSigners,
     expr::if_block::BootstrapExprExt,
@@ -34,7 +35,10 @@ use registry::{
     },
     types::id::ObjectId,
 };
-use std::{borrow::Cow, sync::Arc};
+use std::{
+    borrow::Cow,
+    sync::{Arc, atomic::Ordering},
+};
 use store::{
     U64_LEN,
     registry::{RegistryQuery, bootstrap::Bootstrap},
@@ -354,6 +358,8 @@ impl Server {
                 encryption_key: Default::default(),
                 locale: Default::default(),
                 flags: Default::default(),
+                za_generation: 0,
+                za_public_key: None,
             }))
         } else {
             Err(trc::AuthEvent::Error
@@ -388,6 +394,7 @@ impl Server {
                     Collection = "account",
                 );
 
+                let epoch = self.inner.cache.account_epoch.load(Ordering::SeqCst);
                 let Some(account) = self.registry().object::<Account>(account_id.into()).await?
                 else {
                     return Ok(None);
@@ -412,6 +419,34 @@ impl Server {
                         name.push('@');
                         name.push_str(domain.names[0].as_ref());
 
+                        // Before `account` is partially moved below.
+                        let is_key_account = account
+                            .password_credential()
+                            .is_some_and(|c| c.secret == vault::ZA_MARKER);
+                        let (za_generation, za_public_key) = if is_key_account {
+                            let read = match self.za_vault_record(account_id).await {
+                                Ok(read) => read,
+                                Err(err) if is_vault_unusable(&err) => {
+                                    trc::error!(err);
+                                    None
+                                }
+                                Err(err) => return Err(err),
+                            };
+                            match read {
+                                Some(read) => (
+                                    read.record.revision,
+                                    read.record.public_key.as_slice().try_into().ok(),
+                                ),
+                                None => {
+                                    // Marker without a usable record: corruption (spec 3.2).
+                                    // Classified as a key account, logins refused in Task 5.
+                                    (0, None)
+                                }
+                            }
+                        } else {
+                            (0, None)
+                        };
+
                         let mut quota_objects: Option<ObjectQuota> = None;
                         let mut quota_disk = 0;
                         for (resource, limit) in account.quotas {
@@ -425,6 +460,9 @@ impl Server {
                         }
 
                         let mut flags = ACCOUNT_IS_USER;
+                        if is_key_account {
+                            flags |= ACCOUNT_IS_KEY_ACCOUNT;
+                        }
                         let encryption_settings = match account.encryption_at_rest {
                             EncryptionAtRest::Disabled => None,
                             EncryptionAtRest::Aes256(settings) => {
@@ -508,6 +546,8 @@ impl Server {
                             locale: account.locale,
                             encryption_key,
                             flags,
+                            za_generation,
+                            za_public_key,
                         }
                     }
                     Account::Group(account) => {
@@ -567,11 +607,24 @@ impl Server {
                             encryption_key: None,
                             locale: account.locale,
                             flags: 0,
+                            za_generation: 0,
+                            za_public_key: None,
                         }
                     }
                 });
 
-                let _ = guard.insert(cache.clone());
+                // quick_cache's `remove` is a no-op on a pending placeholder, so
+                // an invalidation during this load cannot evict what we would
+                // publish: if one ran since the read, return the value without
+                // caching it (dropping the guard releases the placeholder). One
+                // landing between the check and the insert is caught after it.
+                let epoch_now = || self.inner.cache.account_epoch.load(Ordering::SeqCst);
+                if epoch_now() == epoch {
+                    let _ = guard.insert(cache.clone());
+                    if epoch_now() != epoch {
+                        self.inner.cache.accounts.remove(&account_id);
+                    }
+                }
                 Ok(Some(cache))
             }
         }

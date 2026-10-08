@@ -76,6 +76,19 @@ pub async fn validate_account(
 
     let validate_permissions = match (&mut account, old_account) {
         (Account::User(account), AccountUpdate::Update(Account::User(old_account))) => {
+            // Key accounts: every credential edit goes through the account
+            // API (spec 4.2). Compared before the masked-secret restore, so
+            // echoing the masked view back is refused too.
+            if old_account
+                .password_credential()
+                .is_some_and(|c| c.secret == vault::ZA_MARKER)
+                && account.credentials != old_account.credentials
+            {
+                return Ok(Err(SetError::forbidden().with_description(
+                    "This account's credentials are managed by the zero-access account API (/api/vault).",
+                )));
+            }
+
             // Validate credentials
             let has_password = account.credentials.values().any(|credential| {
                 matches!(credential, Credential::Password(credential) if credential.credential_id.is_valid())

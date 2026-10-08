@@ -234,7 +234,13 @@ impl CalendarQueryHandler {
                             trc::event!(
                                 Calendar(trc::CalendarEvent::RuleExpansionError),
                                 Reason = "chrono error",
-                                Details = event.data.event.to_string(),
+                                Details = event
+                                    .data
+                                    .event
+                                    .uids()
+                                    .next()
+                                    .unwrap_or_default()
+                                    .to_string(),
                             );
                             vec![]
                         })
