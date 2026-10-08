@@ -33,6 +33,7 @@ use directory::{
     Credentials,
     core::secret::{hash_secret, verify_totp_code},
 };
+use groupware::calendar::Calendar;
 use http_proto::{HttpRequest, HttpResponse, HttpSessionData};
 use hyper::{
     StatusCode,
@@ -744,13 +745,15 @@ async fn za_assert_enabled(server: &Server, account_id: u32) -> trc::Result<()> 
 }
 
 /// Refuses an account that already holds calendar data: setup would
-/// otherwise convert plaintext into a key account.
+/// otherwise convert plaintext into a key account. A sole default calendar
+/// created by the server (`create_default_calendar`) with untouched
+/// preferences is not user data and is ignored; it is sealed by its first
+/// write (spec 7.3).
 async fn za_assert_no_calendar_data(
     server: &Server,
     account_id: u32,
 ) -> trc::Result<Option<HttpResponse>> {
     for collection in [
-        Collection::Calendar,
         Collection::CalendarEvent,
         Collection::CalendarEventNotification,
     ] {
@@ -758,7 +761,64 @@ async fn za_assert_no_calendar_data(
             return Ok(Some(conflict("account already holds calendar data")));
         }
     }
+    if za_has_user_calendars(server, account_id).await? {
+        return Ok(Some(conflict("account already holds calendar data")));
+    }
     Ok(None)
+}
+
+/// True when the account holds any calendar document other than a sole
+/// untouched default calendar: the name `create_default_calendar` gives it,
+/// no ACLs or dead properties, and at most the one preferences entry it
+/// writes (display name unchanged, no description, color or default alerts).
+async fn za_has_user_calendars(server: &Server, account_id: u32) -> trc::Result<bool> {
+    let Some(default_name) = server.core.groupware.default_calendar_name.as_deref() else {
+        return server
+            .za_has_documents(account_id, Collection::Calendar)
+            .await;
+    };
+    let Some(account) = server.try_account(account_id).await? else {
+        return server
+            .za_has_documents(account_id, Collection::Calendar)
+            .await;
+    };
+    let expected_display = format!(
+        "{} ({})",
+        server
+            .core
+            .groupware
+            .default_calendar_display_name
+            .as_deref()
+            .unwrap_or(default_name),
+        account.name()
+    );
+    let mut count = 0u32;
+    let mut user_data = false;
+    server
+        .archives(account_id, Collection::Calendar, &(), |_, archive| {
+            count += 1;
+            let calendar = archive.unarchive::<Calendar>()?;
+            let untouched = calendar.name.as_str() == default_name
+                && calendar.acls.is_empty()
+                && calendar.dead_properties.0.is_empty()
+                && match calendar.preferences.as_slice() {
+                    [] => true,
+                    [prefs] => {
+                        prefs.name.as_str() == expected_display
+                            && prefs.description.is_none()
+                            && prefs.color.is_none()
+                            && prefs.default_alerts.is_empty()
+                    }
+                    _ => false,
+                };
+            if !untouched {
+                user_data = true;
+            }
+            Ok(count < 2 && !user_data)
+        })
+        .await
+        .caused_by(trc::location!())?;
+    Ok(user_data || count > 1)
 }
 
 async fn za_setup(

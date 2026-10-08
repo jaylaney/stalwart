@@ -456,10 +456,156 @@ pub async fn test_data_check(test: &mut TestServer) {
             .unwrap();
         test.server.commit_batch(batch).await.unwrap();
     }
+
+    // A server-created default calendar with untouched preferences is not
+    // user data: setup must not be blocked by it (plan 3 outcome, candidate 4).
+    let default_name = test
+        .server
+        .core
+        .groupware
+        .default_calendar_name
+        .clone()
+        .expect("test server configures a default calendar");
+    let default_display = format!(
+        "{} ({})",
+        test.server
+            .core
+            .groupware
+            .default_calendar_display_name
+            .as_deref()
+            .unwrap_or(default_name.as_str()),
+        "key6@example.com"
+    );
+
+    // 1. Renamed default calendar: user data, refused.
+    insert_default_calendar(test, key6_id, 1, default_name.clone(), "My calendar".into()).await;
+    let reply = za_post("setup", &body).await.expect(409);
+    assert_eq!(reply["error"], "account already holds calendar data");
+    remove_calendar(test, key6_id, 1).await;
+
+    // 2. Untouched default calendar plus one event: refused.
+    insert_default_calendar(test, key6_id, 2, default_name.clone(), default_display).await;
+    let event_id = 0u32;
+    {
+        use groupware::calendar::{CalendarEvent, CalendarEventData};
+        let account_info = test.server.account_info(key6_id).await.unwrap();
+        let mut batch = store::write::BatchBuilder::new();
+        CalendarEvent {
+            names: vec![common::DavName {
+                name: "stray.ics".into(),
+                parent_id: 2,
+            }],
+            data: CalendarEventData::default(),
+            ..Default::default()
+        }
+        .insert(
+            account_info.account_tenant_ids(),
+            key6_id,
+            event_id,
+            None,
+            &mut batch,
+        )
+        .unwrap();
+        test.server.commit_batch(batch).await.unwrap();
+    }
+    let reply = za_post("setup", &body).await.expect(409);
+    assert_eq!(reply["error"], "account already holds calendar data");
+    {
+        use groupware::{DestroyArchive, calendar::CalendarEvent};
+        use store::{
+            ValueKey,
+            write::{AlignedBytes, Archive},
+        };
+        use types::collection::Collection;
+        let account_info = test.server.account_info(key6_id).await.unwrap();
+        let archive = test
+            .server
+            .store()
+            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                key6_id,
+                Collection::CalendarEvent,
+                event_id,
+            ))
+            .await
+            .unwrap()
+            .expect("event archive");
+        let mut batch = store::write::BatchBuilder::new();
+        DestroyArchive(archive.to_unarchived::<CalendarEvent>().unwrap())
+            .delete_all(&account_info, key6_id, event_id, false, &mut batch)
+            .unwrap();
+        test.server.commit_batch(batch).await.unwrap();
+    }
+
+    // 3. Sole untouched default calendar (document 2): the setup below
+    //    succeeds; the calendar is destroyed with the account.
     let mut key6 = key6;
     key6.recovery_key = Some(za_setup("key6@example.com", &token, STRONG).await);
     admin.destroy_account(key6).await;
     test.wait_for_tasks().await;
+}
+
+/// Plants a calendar shaped like upstream's `create_default_calendar`, with
+/// the given calendar name and preferences display name.
+async fn insert_default_calendar(
+    test: &TestServer,
+    account_id: u32,
+    document_id: u32,
+    name: String,
+    display: String,
+) {
+    use groupware::calendar::{CALENDAR_SUBSCRIBED, Calendar, CalendarPreferences};
+    let account_info = test.server.account_info(account_id).await.unwrap();
+    let mut batch = store::write::BatchBuilder::new();
+    Calendar {
+        name,
+        preferences: vec![CalendarPreferences {
+            account_id,
+            name: display,
+            flags: CALENDAR_SUBSCRIBED,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+    .insert(
+        account_info.account_tenant_ids(),
+        account_id,
+        document_id,
+        &mut batch,
+    )
+    .unwrap();
+    test.server.commit_batch(batch).await.unwrap();
+}
+
+async fn remove_calendar(test: &TestServer, account_id: u32, document_id: u32) {
+    use groupware::{DestroyArchive, calendar::Calendar};
+    use store::{
+        ValueKey,
+        write::{AlignedBytes, Archive},
+    };
+    use types::collection::Collection;
+    let account_info = test.server.account_info(account_id).await.unwrap();
+    let archive = test
+        .server
+        .store()
+        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            account_id,
+            Collection::Calendar,
+            document_id,
+        ))
+        .await
+        .unwrap()
+        .expect("calendar archive");
+    let mut batch = store::write::BatchBuilder::new();
+    DestroyArchive(archive.to_unarchived::<Calendar>().unwrap())
+        .delete(
+            account_info.account_tenant_ids(),
+            account_id,
+            document_id,
+            None,
+            &mut batch,
+        )
+        .unwrap();
+    test.server.commit_batch(batch).await.unwrap();
 }
 
 async fn set_auth_ban_rate(admin: &Account, count: u64) {
