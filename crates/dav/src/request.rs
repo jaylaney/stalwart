@@ -48,7 +48,10 @@ use dav_proto::{
         },
     },
 };
-use http_proto::{HttpRequest, HttpResponse, HttpSessionData, request::fetch_body};
+use http_proto::{
+    HttpRequest, HttpResponse, HttpSessionData,
+    request::{fetch_body, fetch_body_untraced},
+};
 use hyper::{StatusCode, header};
 use registry::schema::enums::Permission;
 use std::time::Instant;
@@ -599,6 +602,11 @@ impl DavRequestHandler for Server {
         resource: DavResourceName,
         method: DavMethod,
     ) -> HttpResponse {
+        // Spec invariant 7: a key account's DAV traffic never reaches the
+        // HTTP body traces. A failed lookup is treated as a key account.
+        let untraced = crate::common::za::is_key_account(self, access_token.account_id())
+            .await
+            .unwrap_or(true);
         let body = if method.has_body()
             || request
                 .headers()
@@ -607,17 +615,17 @@ impl DavRequestHandler for Server {
                 .and_then(|v| v.parse::<u64>().ok())
                 .is_some_and(|len| len > 0)
         {
-            if let Some(body) = fetch_body(
-                &mut request,
-                if !access_token.has_permission(Permission::UnlimitedUploads) {
-                    self.core.groupware.max_request_size
-                } else {
-                    0
-                },
-                session.session_id,
-            )
-            .await
-            {
+            let max = if !access_token.has_permission(Permission::UnlimitedUploads) {
+                self.core.groupware.max_request_size
+            } else {
+                0
+            };
+            let body = if untraced {
+                fetch_body_untraced(&mut request, max).await
+            } else {
+                fetch_body(&mut request, max, session.session_id).await
+            };
+            if let Some(body) = body {
                 body
             } else {
                 trc::event!(
@@ -656,7 +664,11 @@ impl DavRequestHandler for Server {
                     Elapsed = start_time.elapsed(),
                 );
 
-                response
+                if untraced {
+                    response.with_untraced_body()
+                } else {
+                    response
+                }
             }
             Err(DavError::Internal(err)) => {
                 let err_type = err.event_type();

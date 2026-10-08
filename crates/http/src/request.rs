@@ -879,13 +879,21 @@ async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionDat
                     trc::event!(
                         Http(trc::HttpEvent::ResponseBody),
                         SpanId = session.session_id,
-                        Contents = match response.body() {
-                            HttpResponseBody::Text(value) =>
-                                trc::Value::String(value.as_str().into()),
-                            HttpResponseBody::Binary(_) =>
-                                trc::Value::String("[binary data]".into()),
-                            HttpResponseBody::Stream(_) => trc::Value::String("[stream]".into()),
-                            _ => trc::Value::None,
+                        Contents = if response.is_untraced() {
+                            trc::Value::String("[redacted]".into())
+                        } else {
+                            match response.body() {
+                                HttpResponseBody::Text(value) => {
+                                    trc::Value::String(value.as_str().into())
+                                }
+                                HttpResponseBody::Binary(_) => {
+                                    trc::Value::String("[binary data]".into())
+                                }
+                                HttpResponseBody::Stream(_) => {
+                                    trc::Value::String("[stream]".into())
+                                }
+                                _ => trc::Value::None,
+                            }
                         },
                         Code = response.status().as_u16(),
                         Size = response.size(),

@@ -24,6 +24,7 @@ impl HttpResponse {
             status,
             builder: hyper::Response::builder().status(status),
             body: HttpResponseBody::Empty,
+            untraced: false,
         }
     }
 
@@ -262,6 +263,17 @@ impl HttpResponse {
 
     pub fn body(&self) -> &HttpResponseBody {
         &self.body
+    }
+
+    /// Marks a body that must not appear in the `HttpEvent::ResponseBody`
+    /// trace (a key account's calendar data, or tokens).
+    pub fn with_untraced_body(mut self) -> Self {
+        self.untraced = true;
+        self
+    }
+
+    pub fn is_untraced(&self) -> bool {
+        self.untraced
     }
 
     pub fn status(&self) -> StatusCode {

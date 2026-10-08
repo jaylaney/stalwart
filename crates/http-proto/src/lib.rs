@@ -41,6 +41,7 @@ pub struct HttpResponse {
     status: StatusCode,
     builder: hyper::http::response::Builder,
     body: HttpResponseBody,
+    untraced: bool,
 }
 
 pub struct HttpContext<'x> {

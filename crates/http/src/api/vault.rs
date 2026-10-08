@@ -190,13 +190,15 @@ fn json<T: serde::Serialize>(value: T) -> HttpResponse {
     json_with_status(StatusCode::OK, value)
 }
 
-/// Responses carry tokens and recovery keys. A binary body keeps them out of
-/// the `HttpEvent::ResponseBody` trace, which records text bodies verbatim.
+/// Responses carry tokens and recovery keys. The binary body and the
+/// untraced flag both keep them out of the `HttpEvent::ResponseBody` trace,
+/// which records text bodies verbatim.
 fn json_with_status<T: serde::Serialize>(status: StatusCode, value: T) -> HttpResponse {
     HttpResponse::new(status)
         .with_content_type("application/json; charset=utf-8")
         .with_binary_body(serde_json::to_vec(&value).unwrap_or_default())
         .with_no_store()
+        .with_untraced_body()
 }
 
 /// 409: wrong state, ineligible account, or a lost revision check (spec 10).
