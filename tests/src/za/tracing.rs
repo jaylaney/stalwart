@@ -13,7 +13,7 @@ use crate::utils::{server::TestServer, webdav::DummyWebDavClient, za::SERVER_URL
 use hyper::StatusCode;
 use serde_json::json;
 use trc::{
-    Collector, EventType, HttpEvent,
+    Collector, EventType, HttpEvent, JmapEvent,
     ipc::subscriber::{Interests, SubscriberBuilder},
 };
 
@@ -21,6 +21,10 @@ const KEY_CANARY: &str = "trace-canary-key-9f3c";
 const PLAIN_CANARY: &str = "trace-canary-plain-7a1d";
 const KEY_JMAP_CANARY: &str = "trace-canary-jmap-key-3b7e";
 const PLAIN_JMAP_CANARY: &str = "trace-canary-jmap-plain-5c21";
+const KEY_BAD_CANARY: &str = "trace-canary-jmap-key-bad-8d2f";
+const PLAIN_BAD_CANARY: &str = "trace-canary-jmap-plain-bad-1e6a";
+const KEY_UPLOAD_CANARY: &str = "trace-canary-upload-key-4a90";
+const PLAIN_UPLOAD_CANARY: &str = "trace-canary-upload-plain-c2d7";
 const SUBSCRIBER_ID: &str = "za-trace-test";
 const CONTENT_TYPE: (&str, &str) = ("content-type", "text/calendar; charset=utf-8");
 
@@ -89,6 +93,42 @@ async fn jmap_echo(user: &str, secret: &str, canary: &str) {
     assert!(body.contains(canary), "{body}");
 }
 
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+}
+
+/// POST a truncated `Core/echo` call carrying `canary` to `/jmap`. The
+/// parser rejects it, and its error echoes the body it could not parse.
+async fn jmap_malformed(user: &str, secret: &str, canary: &str) {
+    let response = http_client()
+        .post(format!("{SERVER_URL}/jmap"))
+        .basic_auth(user, Some(secret))
+        .header("content-type", "application/json")
+        .body(format!(
+            "{{\"using\":[\"urn:ietf:params:jmap:core\"],\"methodCalls\":[[\"Core/echo\",{{\"canary\":\"{canary}\""
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Upload a `text/plain` blob carrying `canary` to `account_id`.
+async fn jmap_upload(user: &str, secret: &str, account_id: &str, canary: &str) {
+    let response = http_client()
+        .post(format!("{SERVER_URL}/jmap/upload/{account_id}/"))
+        .basic_auth(user, Some(secret))
+        .header("content-type", "text/plain")
+        .body(format!("upload {canary}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 pub async fn test(test: &mut TestServer) {
     println!("Running zero-access HTTP trace tests...");
     let key1 = test.account("key1@example.com").clone();
@@ -119,9 +159,11 @@ pub async fn test(test: &mut TestServer) {
 
     // The test server configures no tracer, so the two Trace-level events
     // are not emitted at all until something declares interest in them.
+    // `jmap.not-request` carries the body the JMAP parser rejected.
     let traced = [
         EventType::Http(HttpEvent::RequestBody),
         EventType::Http(HttpEvent::ResponseBody),
+        EventType::Jmap(JmapEvent::NotRequest),
     ];
     let mut interests = Interests::default();
     for event_type in traced {
@@ -140,6 +182,23 @@ pub async fn test(test: &mut TestServer) {
     // `x:AccountPassword/set`), so neither side of its exchange is traced.
     jmap_echo("key1@example.com", STRONG, KEY_JMAP_CANARY).await;
     jmap_echo(plain.name(), plain.secret(), PLAIN_JMAP_CANARY).await;
+    // A malformed or truncated body is echoed by the parser's error.
+    jmap_malformed("key1@example.com", STRONG, KEY_BAD_CANARY).await;
+    jmap_malformed(plain.name(), plain.secret(), PLAIN_BAD_CANARY).await;
+    jmap_upload(
+        "key1@example.com",
+        STRONG,
+        key1.id_string(),
+        KEY_UPLOAD_CANARY,
+    )
+    .await;
+    jmap_upload(
+        plain.name(),
+        plain.secret(),
+        plain.id_string(),
+        PLAIN_UPLOAD_CANARY,
+    )
+    .await;
     // A login through `/api/auth` carries the key account's password in its
     // body; it is traced before any verification, whatever the outcome.
     reqwest::Client::builder()
@@ -180,11 +239,27 @@ pub async fn test(test: &mut TestServer) {
         all.contains(PLAIN_JMAP_CANARY),
         "no plain-account JMAP trace captured: {all}"
     );
+    assert!(
+        all.contains(PLAIN_BAD_CANARY),
+        "no plain-account malformed JMAP trace captured: {all}"
+    );
+    assert!(
+        all.contains(PLAIN_UPLOAD_CANARY),
+        "no plain-account upload trace captured: {all}"
+    );
     // Key-account traffic is absent on both sides.
     assert!(!all.contains(KEY_CANARY), "key-account body traced: {all}");
     assert!(
         !all.contains(KEY_JMAP_CANARY),
         "key-account JMAP body traced: {all}"
+    );
+    assert!(
+        !all.contains(KEY_BAD_CANARY),
+        "key-account malformed JMAP body traced: {all}"
+    );
+    assert!(
+        !all.contains(KEY_UPLOAD_CANARY),
+        "key-account upload traced: {all}"
     );
     // The key account's password never reaches the trace.
     assert!(!all.contains(STRONG), "login body traced: {all}");
@@ -199,6 +274,7 @@ pub async fn test(test: &mut TestServer) {
     );
 
     test.wait_for_tasks().await;
+    test.blob_expire_all().await;
     key_client
         .request("DELETE", &format!("{key_cal}trace-key.ics"), "")
         .await

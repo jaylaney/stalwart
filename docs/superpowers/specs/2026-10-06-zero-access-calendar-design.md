@@ -747,7 +747,7 @@ body (shown as `[redacted]`), nor the value of an `Authorization`,
 `Proxy-Authorization` or `Cookie` header on any request. Vault API bodies
 are never traced. Login bodies and responses on `/api/auth` are never
 traced either, since the password arrives before any account is known.
-Non-key DAV traffic is traced as upstream traces it. Mail-protocol
+Non-key DAV and JMAP traffic is traced as upstream traces it. Mail-protocol
 raw-input traces (`imap.raw-input` and the POP3, ManageSieve and SMTP
 equivalents) are upstream's and still record the authentication exchange,
 so an operator who enables them can capture a key account's password or

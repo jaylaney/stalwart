@@ -126,7 +126,7 @@ impl ParseHttp for Server {
                             }
                         }
 
-                        if za_is_key_account(self, access_token.account_id()).await {
+                        if za_jmap_untraced(self, access_token.account_id()).await {
                             let bytes = fetch_body_untraced(
                                 &mut req,
                                 if !access_token.has_permission(Permission::UnlimitedUploads) {
@@ -138,16 +138,28 @@ impl ParseHttp for Server {
                             .await
                             .ok_or_else(|| trc::LimitEvent::SizeRequest.into_err())?;
 
+                            let request = match Request::parse(
+                                &bytes,
+                                self.core.jmap.request_max_calls,
+                                self.core.jmap.request_max_size,
+                            ) {
+                                Ok(request) => request,
+                                // Spec section 10, "Traces": the parser's
+                                // details and reason can echo the body.
+                                Err(err)
+                                    if err.matches(trc::EventType::Jmap(
+                                        trc::JmapEvent::NotRequest,
+                                    )) =>
+                                {
+                                    return Err(trc::JmapEvent::NotRequest
+                                        .into_err()
+                                        .reason("invalid JMAP request"));
+                                }
+                                Err(err) => return Err(err),
+                            };
+
                             return Ok(self
-                                .handle_jmap_request(
-                                    Request::parse(
-                                        &bytes,
-                                        self.core.jmap.request_max_calls,
-                                        self.core.jmap.request_max_size,
-                                    )?,
-                                    &access_token,
-                                    &session,
-                                )
+                                .handle_jmap_request(request, &access_token, &session)
                                 .await
                                 .into_http_response()
                                 .with_untraced_body());
@@ -213,7 +225,7 @@ impl ParseHttp for Server {
                             self.authenticate_headers(&req, &session).await?;
 
                         if let Some(account_id) = path.next().and_then(|p| Id::from_str(p).ok()) {
-                            if za_is_key_account(self, access_token.account_id()).await {
+                            if za_jmap_untraced(self, access_token.account_id()).await {
                                 return match fetch_body_untraced(
                                     &mut req,
                                     if !access_token.has_permission(Permission::UnlimitedUploads) {
@@ -1053,8 +1065,9 @@ async fn za_is_key_account_request(
 
 /// Spec section 10, "Traces": a key account's JMAP request and response
 /// bodies are never traced, since a request can carry the account's password
-/// (`x:AccountPassword/set`). A failed lookup is treated as a key account.
-async fn za_is_key_account(server: &Server, account_id: u32) -> bool {
+/// (`x:AccountPassword/set`). Fails closed: a failed lookup counts as a key
+/// account, unlike the fail-open `za_is_key_account_request`.
+async fn za_jmap_untraced(server: &Server, account_id: u32) -> bool {
     server
         .try_account(account_id)
         .await
