@@ -607,14 +607,22 @@ async fn build_template(
             start
         )
     };
-    let organizer = organizer
-        .map(|(email, name)| match (email, name) {
-            (Some(email), Some(name)) => format!("{} <{}>", name, email),
-            (Some(email), None) => email.to_string(),
-            (None, Some(name)) => name.to_string(),
-            _ => unreachable!(),
-        })
-        .unwrap_or_else(|| account_info.name().to_string());
+    let organizer = if generic {
+        // Spec 9: the generic email names no organizer, not even the
+        // account itself.
+        None
+    } else {
+        Some(
+            organizer
+                .map(|(email, name)| match (email, name) {
+                    (Some(email), Some(name)) => format!("{} <{}>", name, email),
+                    (Some(email), None) => email.to_string(),
+                    (None, Some(name)) => name.to_string(),
+                    _ => unreachable!(),
+                })
+                .unwrap_or_else(|| account_info.name().to_string()),
+        )
+    };
     let logo_cid = format!("cid:{logo_cid}");
     let mut variables = Variables::new();
     variables.insert_single(CalendarTemplateVariable::PageTitle, subject.as_str());
@@ -671,10 +679,12 @@ async fn build_template(
                 }
                 detail
             }),
-            Some(vec![
-                (CalendarTemplateVariable::Key, locale.calendar_organizer),
-                (CalendarTemplateVariable::Value, organizer.as_str()),
-            ]),
+            organizer.as_deref().map(|organizer| {
+                vec![
+                    (CalendarTemplateVariable::Key, locale.calendar_organizer),
+                    (CalendarTemplateVariable::Value, organizer),
+                ]
+            }),
         ]
         .into_iter()
         .flatten(),

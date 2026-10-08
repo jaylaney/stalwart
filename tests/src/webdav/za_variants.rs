@@ -303,6 +303,13 @@ pub async fn alarm(test: &TestServer) {
             "{html}"
         );
         assert!(text.contains(&start), "{start} missing from: {text}");
+        // Spec 9: no organizer row. The account address appears only in the
+        // headers; the link carries it percent-encoded, which is why the
+        // plain form is a usable canary for the organizer row.
+        assert!(
+            !html.contains("john@example.com") && !text.contains("john@example.com"),
+            "organizer row present in the generic alarm email: {text}"
+        );
         for canary in [
             "See the pretty girl",
             "What mirror where",
