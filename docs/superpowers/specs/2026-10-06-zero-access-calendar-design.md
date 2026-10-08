@@ -1,6 +1,6 @@
 # Zero-access calendar: design spec
 
-Date: 2026-10-06. Status: revision 6, approved. Scope: release 1 of the
+Date: 2026-10-06. Status: revision 7, approved. Scope: release 1 of the
 zero-access fork of Stalwart (`jaylaney/stalwart`, upstream
 `stalwartlabs/stalwart`, base commit 3f657330, Stalwart 0.16.25).
 
@@ -18,6 +18,13 @@ carrier layout, quota rule and tolerance of plaintext in sections 7.1 and
 7.3, the refusal event in section 10, and the one all-account routing change
 in section 8.2. The 4.1 item scheduled for plan 2 (refusing `setup` and
 `recover` for a disabled account or tenant) was implemented in plan 2.
+Revision 7 (2026-10-08) records the plan 3 outcome, following the
+decisions in `../plans/2026-10-06-zero-access-plan3-outcome.md`:
+collection path names as visible by structure (section 2), the setup
+refusal of pre-existing calendar data (section 4.1), the DAV OPTIONS
+authentication as the second invariant 9 exception (section 8.2), and in
+the section 9 table the `ParticipantIdentity/changes` answer, the mail
+index of key accounts and the contents of the generic alarm email.
 
 ## 1. Purpose
 
@@ -94,14 +101,15 @@ present is detected and fails the request (section 10).
 
 **Visible metadata** (section 6): when events happen and for how long,
 timezones (including the calculation rules of custom timezones), recurrence
-rules and exceptions, status and transparency, alarm trigger times and
-whether an alarm is an email alarm, UIDs, filenames chosen by clients (often
-UID-derived), how many calendars and events a user has, the exact plaintext
-size of each event, the type name of every component including `X-`
-components, which components carry a sealed bundle and the size class of
-each bundle (a multiple of 256 bytes), free text that sits in visible slots
-(TZID values, `X-` values of STATUS and TRANSP, and `X-` parts of RRULE),
-ETags and sync history, and account metadata such as login times.
+rules and exceptions, status and transparency, alarm trigger times and whether
+an alarm is an email alarm, UIDs, filenames chosen by clients (often
+UID-derived), the path names of calendar collections (they route URLs and so
+are never sealed), how many calendars and events a user has, the exact
+plaintext size of each event, the type name of every component including `X-`
+components, which components carry a sealed bundle and the size class of each
+bundle (a multiple of 256 bytes), free text that sits in visible slots (TZID
+values, `X-` values of STATUS and TRANSP, and `X-` parts of RRULE), ETags and
+sync history, and account metadata such as login times.
 
 **Sealed:** titles, descriptions, locations, geo, URLs, attendees,
 organizers, categories, comments, attachments, conference links, class,
@@ -201,9 +209,10 @@ value as the allowed origin, with `Vary: Origin`, regardless of the
 request's `Origin` header; the browser performs the comparison. The
 preflight allows `POST` and `OPTIONS` with the `Content-Type` and
 `Authorization` headers, and credentials are never allowed. When the
-variable is unset no CORS headers are sent. On vault responses the
-configured origin wins over a permissive `*` origin; other routes are
-unaffected.
+variable is unset no CORS headers are sent on vault routes, including
+operator-configured ones (permissive CORS or response headers). On vault
+responses the configured origin wins over a permissive `*` origin; other
+routes are unaffected.
 
 | Method and path | Request body | Response |
 |---|---|---|
@@ -255,6 +264,15 @@ rotates the token and writes the marker. A crash after (2) is recovered by
 the next registry read, which invalidates nothing stale because the account
 had no cache entries worth keeping; re-issuing is harmless.
 
+**Pre-existing data.** `setup-token` and `setup` refuse (409, `account
+already holds calendar data`) an account that holds calendar events,
+scheduling notifications, or any calendar collection other than a sole
+default calendar created by the server with untouched preferences. That
+one calendar holds only the server's default display name and the account
+address; it is kept, passes through unseal as plaintext, and is sealed by
+its first write (section 7.3). Converting an account with real calendar
+data is not supported in release 1.
+
 - `setup` is single use: it verifies the token hash, requires state
   `PendingSetup`, generates everything in section 3, and commits the
   `Active` record in one conditional write. A used or expired token is
@@ -292,7 +310,10 @@ had no cache entries worth keeping; re-issuing is harmless.
   change. Credential ids are the registry's next id; creation is refused
   while a wrap that survived pruning still exists under that id, which can
   block creation for up to an hour after a failed publication. Ids are
-  reused once the highest credential is deleted.
+  reused once the highest credential is deleted. Cleanup after a failed
+  publication, and the registry delete after a revocation, remove only the
+  registry credential whose hashed secret matches the one the operation
+  read, so a replacement that reused the id is never deleted.
 - `app-password/revoke` removes the wrap from the vault record in one
   conditional write (bumping the generation), then deletes the registry
   credential. If the registry delete fails, the credential is dead anyway:
@@ -659,6 +680,15 @@ answers 404 for that href. This applies to all accounts and is the one
 deliberate change to non-key behaviour: the old routing let a REPORT reach a
 key account's calendar through an ungated prefix.
 
+The second all-account change is DAV `OPTIONS`: when the request carries an
+`Authorization` header the server authenticates it, so a key account's
+`DAV` header omits `calendar-auto-schedule` and clients never offer
+invitations (verified with Apple Calendar on 2026-10-08). A wrong
+credential there counts as a failed attempt, an unparseable header charges
+the anonymous rate limit, and a transient authentication failure falls
+back to upstream's header rather than failing the request. Non-key
+accounts see the same header as before.
+
 ## 9. Feature gating for key accounts
 
 Every path that would need a key it does not have is closed, never left to
@@ -672,9 +702,9 @@ return ciphertext:
 | CalDAV scheduling (RFC 6638) | scheduling permissions off; auto-schedule not advertised; a `PUT` with attendees stores them sealed and sends nothing; no schedule tag is ever set; the notification collection is never written |
 | Inbound iMIP ingest from mail | skipped for key accounts (events would need the public key; release 2) |
 | HTTP RSVP page | not routed for key accounts |
-| JMAP calendars capability and methods | not advertised; methods return `accountNotSupportedByMethod` |
-| Full-text indexing | `build_calendar_document` returns `NotIndexed` for key accounts; the stored search-hash index value is computed from the sealed tree and therefore from visible fields only |
-| Alarm email | generic: subject and body carry the start time, timezone and a link; no title, description, location, organizer, guests or conference link; recipient is the account address |
+| JMAP calendars capability and methods | not advertised; methods return `accountNotSupportedByMethod`; `ParticipantIdentity/changes` answers `cannotCalculateChanges` as upstream does for every account |
+| Full-text indexing | `build_calendar_document` returns `NotIndexed` for key accounts; the stored search-hash index value is computed from the sealed tree and therefore from visible fields only; mail is unsealed in release 1, so its index, including the generic alarm emails, is upstream's (accepted scope limit until a mail release) |
+| Alarm email | generic: subject and body carry the start time, timezone and a link to the event (collection path name and filename, both visible by structure); no title, description, location, organizer, guests or conference link; recipient is the account address |
 | Display alarm push | unchanged (already carries only ids) |
 | Trace events that log a whole iCalendar (`dates.rs`, `query.rs`) | removed in the fork for all accounts |
 | Per-account event preferences (`CalendarEvent.preferences`, JMAP-only) | not sealed in plan 2; plan 3 traces which paths populate it for key accounts and seals or gates them |
@@ -704,6 +734,14 @@ return ciphertext:
   the server's generic problem body, so clients branch on the status code,
   not on the body.
 - Argon2 runs on the blocking pool as the existing hash verification does.
+
+**Traces.** HTTP body traces (`http.request-body`, `http.response-body`,
+Trace level) never carry a key account's DAV request or response body
+(shown as `[redacted]`), nor the value of an `Authorization`,
+`Proxy-Authorization` or `Cookie` header on any request. Vault API bodies
+are never traced. Login bodies and responses on `/api/auth` are never
+traced either, since the password arrives before any account is known.
+Non-key DAV traffic is traced as upstream traces it.
 
 ## 11. Testing
 
@@ -807,8 +845,9 @@ one account.
    it is conditional on its revision; verification reads it exactly once;
    and that revision is the authentication generation carried by every
    cached result. No registry-only edit may change login outcome.
-9. Non-key accounts take unchanged upstream code paths, with one recorded
-   exception: the calendar REPORT prefix check in section 8.2.
+9. Non-key accounts take unchanged upstream code paths, with two recorded
+   exceptions, both in section 8.2: the calendar REPORT prefix check and DAV
+   OPTIONS authentication.
 10. Fork diff stays narrow: new modules for keys, sealing, the key cache and
     the account API; one-line call insertions at read and write sites;
     gating checks at existing permission points.

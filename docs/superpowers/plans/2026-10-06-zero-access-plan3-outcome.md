@@ -206,6 +206,22 @@ Final review and fix wave:
 
 ## Decisions that are Jay's to confirm or reverse
 
+Decided 2026-10-08: all five candidates were accepted as recommended and
+are now spec revision 7, with one refinement to candidate 2: the generic
+alarm email keeps its link, because collection path names are visible by
+structure and without the link a reminder cannot be traced to its event;
+only the organizer row was dropped (plan 4,
+`2026-10-08-zero-access-4-revision7.md`). Candidate 4 was implemented as
+proposed: a sole untouched default calendar no longer blocks setup. The
+three non-spec items (R3, R5/R7/R15, R9) stand as recorded. The same plan
+fixed the three findings of the 2026-10-08 review of PR #5: HTTP body
+traces (key-account DAV bodies and credential headers), app-password
+cleanup identity, and operator CORS headers on vault routes. The same
+review of that fix found the login endpoint's traced body, which was closed
+in the same plan, and the app-password test needed a fourth test-mode pause
+slot after the registry write. The list below is kept as the record of what
+was decided.
+
 Candidates for spec revision 7:
 
 1. `ParticipantIdentity/changes` answers `cannotCalculateChanges` (upstream
