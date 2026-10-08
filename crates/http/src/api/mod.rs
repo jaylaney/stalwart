@@ -65,11 +65,12 @@ impl ManagementApi for Server {
         session: &HttpSessionData,
     ) -> trc::Result<HttpResponse> {
         let is_post = req.method() == Method::POST;
-        // Zero-access request bodies carry passwords, tokens and recovery keys.
-        let is_vault = req.uri().path().split('/').nth(2) == Some("vault");
+        // Zero-access and login request bodies carry passwords, tokens and
+        // recovery keys; no account is known before they are parsed.
+        let untraced = matches!(req.uri().path().split('/').nth(2), Some("vault" | "auth"));
         let body = if !is_post {
             None
-        } else if is_vault {
+        } else if untraced {
             fetch_body_untraced(req, 1024 * 1024).await
         } else {
             fetch_body(req, 1024 * 1024, session.session_id).await
@@ -85,6 +86,7 @@ impl ManagementApi for Server {
                     body.ok_or_else(|| trc::LimitEvent::SizeRequest.into_err())?,
                 ))
                 .await
+                .map(HttpResponse::with_untraced_body)
             }
             "calendar"
                 if is_post

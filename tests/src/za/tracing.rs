@@ -8,8 +8,9 @@
 //! no credential header from any request, reaches the HTTP body traces.
 
 use super::STRONG;
-use crate::utils::{server::TestServer, webdav::DummyWebDavClient};
+use crate::utils::{server::TestServer, webdav::DummyWebDavClient, za::SERVER_URL};
 use hyper::StatusCode;
+use serde_json::json;
 use trc::{
     Collector, EventType, HttpEvent,
     ipc::subscriber::{Interests, SubscriberBuilder},
@@ -111,6 +112,22 @@ pub async fn test(test: &mut TestServer) {
 
     put_and_report(&key_client, key_cal, "trace-key", KEY_CANARY).await;
     put_and_report(&plain_client, plain_cal, "trace-plain", PLAIN_CANARY).await;
+    // A login through `/api/auth` carries the key account's password in its
+    // body; it is traced before any verification, whatever the outcome.
+    reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+        .post(format!("{SERVER_URL}/api/auth"))
+        .json(&json!({
+            "type": "authCode",
+            "accountName": "key1@example.com",
+            "accountSecret": STRONG,
+            "clientId": "za-trace-test",
+        }))
+        .send()
+        .await
+        .unwrap();
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let mut seen = Vec::new();
@@ -133,6 +150,8 @@ pub async fn test(test: &mut TestServer) {
     );
     // Key-account traffic is absent on both sides.
     assert!(!all.contains(KEY_CANARY), "key-account body traced: {all}");
+    // The key account's password never reaches the trace.
+    assert!(!all.contains(STRONG), "login body traced: {all}");
     // Credentials are never traced, for any account.
     assert!(
         !all.to_ascii_lowercase().contains("basic ") && !all.contains("Bearer "),
