@@ -341,6 +341,27 @@ Structure:
 - The plan 3 task text predates P1 to P10 and the final rulings; this note
   and the ledger win.
 
+Plan 4 (revision 7 follow-ups), whole-branch review:
+
+- Mail-protocol raw-input traces (`imap.raw-input` and the POP3,
+  ManageSieve and SMTP equivalents) are upstream's and still record the
+  authentication exchange, so an operator who enables them can capture a
+  key account's password or app password. Spec section 10 records this as
+  a release 1 limit, since the calendar is served over HTTP only.
+- A WebDAV `Error` event's `Reason` carries a parse error's
+  `UnexpectedToken.found`, and a DAV precondition's `condition.details` is
+  traced as `Reason` on the method's event; both can carry text from a key
+  account's calendar-query. Pre-existing upstream behaviour, and not a body
+  trace, so the section 10 redaction does not cover it.
+- Operator `Vary` or `Cache-Control` entries in `http.headers` are inserted
+  after the vault handler builds its response and overwrite the vault's
+  `Vary: Origin` and `no-store`; only `access-control-*` entries are kept
+  off vault routes. Pre-existing.
+- The setup check-then-commit window (see "Security and robustness") is
+  easier to hit now that setup tolerates an untouched default calendar: a
+  client syncing that calendar during setup can leave a plaintext event
+  that is sealed only on its next write (spec section 4.1).
+
 ## Facts for the account web page and the next release
 
 Gate inventory (every place a key account is refused or treated differently;

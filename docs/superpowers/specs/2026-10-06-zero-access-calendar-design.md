@@ -21,10 +21,13 @@ in section 8.2. The 4.1 item scheduled for plan 2 (refusing `setup` and
 Revision 7 (2026-10-08) records the plan 3 outcome, following the
 decisions in `../plans/2026-10-06-zero-access-plan3-outcome.md`:
 collection path names as visible by structure (section 2), the setup
-refusal of pre-existing calendar data (section 4.1), the DAV OPTIONS
-authentication as the second invariant 9 exception (section 8.2), and in
-the section 9 table the `ParticipantIdentity/changes` answer, the mail
-index of key accounts and the contents of the generic alarm email.
+refusal of pre-existing calendar data, the identity check of app-password
+cleanup and the vault CORS sentences (section 4.1), the DAV OPTIONS
+authentication as the second invariant 9 exception (section 8.2), the
+Traces paragraph (section 10), the HTTP trace redactions as further
+invariant 9 exceptions (section 12), and in the section 9 table the
+`ParticipantIdentity/changes` answer, the mail index of key accounts and
+the contents of the generic alarm email.
 
 ## 1. Purpose
 
@@ -271,7 +274,10 @@ default calendar created by the server with untouched preferences. That
 one calendar holds only the server's default display name and the account
 address; it is kept, passes through unseal as plaintext, and is sealed by
 its first write (section 7.3). Converting an account with real calendar
-data is not supported in release 1.
+data is not supported in release 1. The check runs before the vault write;
+a client syncing the tolerated calendar during that window can leave a
+plaintext event that is sealed only on its next write (see the plan 3
+outcome note's deferred findings).
 
 - `setup` is single use: it verifies the token hash, requires state
   `PendingSetup`, generates everything in section 3, and commits the
@@ -736,12 +742,17 @@ return ciphertext:
 - Argon2 runs on the blocking pool as the existing hash verification does.
 
 **Traces.** HTTP body traces (`http.request-body`, `http.response-body`,
-Trace level) never carry a key account's DAV request or response body
-(shown as `[redacted]`), nor the value of an `Authorization`,
+Trace level) never carry a key account's DAV or JMAP request or response
+body (shown as `[redacted]`), nor the value of an `Authorization`,
 `Proxy-Authorization` or `Cookie` header on any request. Vault API bodies
 are never traced. Login bodies and responses on `/api/auth` are never
 traced either, since the password arrives before any account is known.
-Non-key DAV traffic is traced as upstream traces it.
+Non-key DAV traffic is traced as upstream traces it. Mail-protocol
+raw-input traces (`imap.raw-input` and the POP3, ManageSieve and SMTP
+equivalents) are upstream's and still record the authentication exchange,
+so an operator who enables them can capture a key account's password or
+app password; release 1 records this as a limit, since the calendar is
+served over HTTP only.
 
 ## 11. Testing
 
@@ -845,9 +856,10 @@ one account.
    it is conditional on its revision; verification reads it exactly once;
    and that revision is the authentication generation carried by every
    cached result. No registry-only edit may change login outcome.
-9. Non-key accounts take unchanged upstream code paths, with two recorded
-   exceptions, both in section 8.2: the calendar REPORT prefix check and DAV
-   OPTIONS authentication.
+9. Non-key accounts take unchanged upstream code paths, with the recorded
+   exceptions in section 8.2 (the calendar REPORT prefix check and DAV
+   OPTIONS authentication) and the HTTP trace redactions in section 10
+   (credential headers on every request, `/api/auth` bodies).
 10. Fork diff stays narrow: new modules for keys, sealing, the key cache and
     the account API; one-line call insertions at read and write sites;
     gating checks at existing permission points.
