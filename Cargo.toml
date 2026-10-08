@@ -47,6 +47,11 @@ debug-assertions = true
 overflow-checks = false
 rpath = false
 
+# Argon2 at opt-level 0 takes ~0.5 s per password verification, which trips
+# the 500 ms client timeout in the DAV test helper on CI runners.
+[profile.dev.package.argon2]
+opt-level = 3
+
 [profile.release]
 opt-level = 3
 debug = false
@@ -68,6 +73,9 @@ incremental = true
 debug-assertions = true
 overflow-checks = true
 rpath = false
+
+[profile.test.package.argon2]
+opt-level = 3
 
 [profile.bench]
 opt-level = 3
