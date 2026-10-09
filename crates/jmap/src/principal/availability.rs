@@ -109,10 +109,9 @@ impl PrincipalGetAvailability for Server {
         for account_id in principal.all_ids_by_collection(Collection::Calendar) {
             // Spec 9: a key account contributes no busy periods.
             if self
-                .try_account(account_id)
+                .za_is_key_account(account_id)
                 .await
                 .caused_by(trc::location!())?
-                .is_some_and(|account| account.is_key_account())
             {
                 continue;
             }

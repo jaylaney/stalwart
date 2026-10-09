@@ -491,11 +491,7 @@ async fn build_calendar_document(
     };
 
     // Spec 9: nothing readable to index for key accounts.
-    if server
-        .try_account(account_id)
-        .await?
-        .is_some_and(|account| account.is_key_account())
-    {
+    if server.za_is_key_account(account_id).await? {
         return Ok(BuildResult::NotIndexed);
     }
 

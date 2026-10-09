@@ -374,12 +374,7 @@ impl CalendarEventNotificationHandler for Server {
             {
                 // Spec 9: a key account's free-busy is not offered; answer
                 // as for an unknown or unpermitted calendar user.
-                if self
-                    .account(account_id)
-                    .await
-                    .caused_by(trc::location!())?
-                    .is_key_account()
-                {
+                if crate::common::za::is_key_account(self, account_id).await? {
                     response.items.0.push(ScheduleResponseItem {
                         recipient: Href(format!("mailto:{email}")),
                         request_status: "3.7;Invalid calendar user or insufficient permissions"

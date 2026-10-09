@@ -181,8 +181,7 @@ pub(crate) async fn za_archive_view<'x>(
 
 pub(crate) async fn is_key_account(server: &Server, account_id: u32) -> crate::Result<bool> {
     Ok(server
-        .try_account(account_id)
+        .za_is_key_account(account_id)
         .await
-        .caused_by(trc::location!())?
-        .is_some_and(|account| account.is_key_account()))
+        .caused_by(trc::location!())?)
 }

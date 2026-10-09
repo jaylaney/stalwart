@@ -1040,10 +1040,11 @@ impl SessionManager for HttpSessionManager {
     }
 }
 
-/// Spec 9: a key account is not offered `calendar-auto-schedule` in the DAV
-/// OPTIONS header. Upstream answers OPTIONS without authenticating; credentials
-/// are checked only when present, and any failure or a non-key account keeps
-/// upstream's header (the error is not propagated).
+/// Spec 8: a key account is not offered `calendar-auto-schedule` in the DAV
+/// OPTIONS header. Upstream answers OPTIONS without authenticating;
+/// credentials are checked only when present. An authentication error is
+/// reported like any request's, and the response falls back to upstream's
+/// header; a failed account lookup does too.
 async fn za_is_key_account_request(
     server: &Server,
     req: &HttpRequest,
@@ -1052,15 +1053,16 @@ async fn za_is_key_account_request(
     if !req.headers().contains_key(header::AUTHORIZATION) {
         return false;
     }
-    let Ok((_in_flight, access_token)) = server.authenticate_headers(req, session).await else {
-        return false;
-    };
-    server
-        .try_account(access_token.account_id())
-        .await
-        .ok()
-        .flatten()
-        .is_some_and(|account| account.is_key_account())
+    match server.authenticate_headers(req, session).await {
+        Ok((_in_flight, access_token)) => server
+            .za_is_key_account(access_token.account_id())
+            .await
+            .unwrap_or(false),
+        Err(err) => {
+            trc::error!(err.span_id(session.session_id));
+            false
+        }
+    }
 }
 
 /// Spec section 10, "Traces": a key account's JMAP request and response
@@ -1068,11 +1070,7 @@ async fn za_is_key_account_request(
 /// (`x:AccountPassword/set`). Fails closed: a failed lookup counts as a key
 /// account, unlike the fail-open `za_is_key_account_request`.
 async fn za_jmap_untraced(server: &Server, account_id: u32) -> bool {
-    server
-        .try_account(account_id)
-        .await
-        .map(|account| account.is_some_and(|account| account.is_key_account()))
-        .unwrap_or(true)
+    server.za_is_key_account(account_id).await.unwrap_or(true)
 }
 
 #[cfg(test)]

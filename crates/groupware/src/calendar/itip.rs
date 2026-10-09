@@ -381,10 +381,9 @@ impl ItipIngest for Server {
             Err(reason) => return Ok(RsvpResponse::error(reason, language)),
         };
         if self
-            .try_account(rsvp.account_id)
+            .za_is_key_account(rsvp.account_id)
             .await
             .caused_by(trc::location!())?
-            .is_some_and(|account| account.is_key_account())
         {
             return Ok(RsvpResponse::error(RsvpError::InvalidLink, language));
         }
@@ -666,10 +665,9 @@ async fn http_rsvp_attendee_copy(
 
     // A key account's copy is sealed: it is never rewritten without its keys.
     if server
-        .try_account(account_id)
+        .za_is_key_account(account_id)
         .await
         .caused_by(trc::location!())?
-        .is_some_and(|account| account.is_key_account())
     {
         return Ok(None);
     }

@@ -763,6 +763,78 @@ pub async fn test(test: &mut TestServer) {
     test.destroy_all_mailboxes(test.account(name)).await;
 }
 
+/// Positive control for the scanner's calendar search-index check: entries
+/// planted with the store's own key serializer are flagged exactly when they
+/// are Calendar entries of the scanned account.
+pub async fn test_index_control(test: &mut TestServer) {
+    use store::write::{
+        BatchBuilder, SearchIndexClass, SearchIndexId, SearchIndexType, ValueClass,
+    };
+    println!("Running zero-access leak scanner index control...");
+    // `leak::test` ends by deleting key2's calendars and mailboxes without
+    // waiting: their unindex tasks may still be running. Drain them so the
+    // baseline below is stable.
+    test.wait_for_tasks().await;
+    let id = test.account("key2@example.com").id().document_id();
+    let plain_id = test.account("plain@example.com").id().document_id();
+    let entry = |index, account_id, typ| {
+        ValueClass::SearchIndex(SearchIndexClass {
+            index,
+            id: SearchIndexId::Account {
+                account_id,
+                document_id: u32::MAX - 1,
+            },
+            typ,
+        })
+    };
+    let term = || SearchIndexType::Term {
+        field: 0,
+        hash: utils::cheeky_hash::CheekyHash::new(b"za-control"),
+    };
+    let planted = [
+        // Flagged: Calendar entries of the scanned account (document and term layouts).
+        entry(SearchIndex::Calendar, id, SearchIndexType::Document),
+        entry(SearchIndex::Calendar, id, term()),
+        // Not flagged: an Email entry of the account, a Calendar entry of another.
+        entry(SearchIndex::Email, id, SearchIndexType::Document),
+        entry(SearchIndex::Calendar, plain_id, SearchIndexType::Document),
+    ];
+    let before = scan(test, id).await;
+    assert!(before.violations.is_empty(), "{:?}", before.violations);
+    let mut batch = BatchBuilder::new();
+    for class in &planted {
+        batch.set(class.clone(), Vec::<u8>::new());
+    }
+    test.server.store().write(batch.build_all()).await.unwrap();
+
+    let result = scan(test, id).await;
+    let flagged = result
+        .violations
+        .iter()
+        .filter(|v| v.ends_with("calendar search index entry of the account"))
+        .count();
+    assert_eq!(flagged, 2, "{:?}", result.violations);
+    assert_eq!(
+        result.violations.len(),
+        2,
+        "unexpected violations: {:?}",
+        result.violations
+    );
+    assert_eq!(
+        result.search_account_records,
+        before.search_account_records + 3,
+        "the three entries of the account were not all counted"
+    );
+
+    let mut batch = BatchBuilder::new();
+    for class in planted {
+        batch.clear(class);
+    }
+    test.server.store().write(batch.build_all()).await.unwrap();
+    let after = scan(test, id).await;
+    assert!(after.violations.is_empty(), "{:?}", after.violations);
+}
+
 #[cfg(test)]
 mod tests {
     use super::try_archive;

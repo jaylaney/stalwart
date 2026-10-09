@@ -24,7 +24,7 @@ use tokio_rustls::{
     },
 };
 use trc::{
-    Collector, EventType, HttpEvent, JmapEvent,
+    AuthEvent, CalendarEvent, Collector, EventType, HttpEvent, JmapEvent,
     ipc::subscriber::{Interests, SubscriberBuilder},
 };
 
@@ -46,6 +46,11 @@ const KEY_METHOD_CANARY: &str = "trace-canary-method-key-2c8e";
 const PLAIN_METHOD_CANARY: &str = "trace-canary-method-plain-6f41";
 const KEY_REF_CANARY: &str = "trace-canary-ref-key-4d07";
 const PLAIN_REF_CANARY: &str = "trace-canary-ref-plain-8a35";
+const OPTIONS_WRONG_SECRET: &str = "trace-canary-options-wrong-3e9a";
+/// A login name no account has and no other module fails with: the probe
+/// must not push a real account toward a fail2ban ban, which would turn the
+/// reported event into `security.authentication-ban`.
+const OPTIONS_PROBE_USER: &str = "options-probe@example.com";
 const SUBSCRIBER_ID: &str = "za-trace-test";
 const CONTENT_TYPE: (&str, &str) = ("content-type", "text/calendar; charset=utf-8");
 
@@ -53,6 +58,36 @@ fn event(uid: &str, summary: &str) -> String {
     format!(
         "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\nBEGIN:VEVENT\r\nUID:{uid}\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990102T090000Z\r\nDTEND:20990102T100000Z\r\nSUMMARY:{summary}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
     )
+}
+
+fn past_event(uid: &str, summary: &str) -> String {
+    format!(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\nBEGIN:VEVENT\r\nUID:{uid}\r\nDTSTAMP:20000101T000000Z\r\nDTSTART:20000102T090000Z\r\nDTEND:20000102T100000Z\r\nSUMMARY:{summary}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+    )
+}
+
+/// PUT a past event, then PUT it again with a changed SUMMARY: the first
+/// takes the create path of the DAV PUT handler, the second the update path.
+async fn put_past_twice(client: &DummyWebDavClient, collection: &str) {
+    let path = format!("{collection}past.ics");
+    client
+        .request_with_headers(
+            "PUT",
+            &path,
+            [CONTENT_TYPE],
+            past_event("trace-past", "first"),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    client
+        .request_with_headers(
+            "PUT",
+            &path,
+            [CONTENT_TYPE],
+            past_event("trace-past", "second"),
+        )
+        .await
+        .with_status(StatusCode::NO_CONTENT);
 }
 
 /// calendar-query returning `calendar-data` for every event whose SUMMARY
@@ -68,6 +103,7 @@ fn strings(value: &trc::Value, out: &mut Vec<String>) {
     match value {
         trc::Value::String(s) => out.push(s.to_string()),
         trc::Value::Array(items) => items.iter().for_each(|v| strings(v, out)),
+        trc::Value::Event(err) => err.keys().iter().for_each(|(_, v)| strings(v, out)),
         _ => {}
     }
 }
@@ -118,6 +154,19 @@ fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
+        .unwrap()
+}
+
+/// DAV OPTIONS with a wrong Basic credential, from its own forwarded address
+/// (the suite enables `use_x_forwarded`) so the failed attempt is not charged
+/// to the suite's other clients.
+async fn options_wrong_password(user: &str) -> reqwest::Response {
+    http_client()
+        .request(reqwest::Method::OPTIONS, format!("{SERVER_URL}/dav/cal/"))
+        .basic_auth(user, Some(OPTIONS_WRONG_SECRET))
+        .header("x-forwarded-for", "10.77.0.1")
+        .send()
+        .await
         .unwrap()
 }
 
@@ -428,6 +477,8 @@ pub async fn test(test: &mut TestServer) {
         EventType::Jmap(JmapEvent::InvalidArguments),
         EventType::Jmap(JmapEvent::UnknownMethod),
         EventType::Jmap(JmapEvent::InvalidResultReference),
+        EventType::Auth(AuthEvent::Failed),
+        EventType::Calendar(CalendarEvent::ItipMessageError),
     ];
     let mut interests = Interests::default();
     for event_type in traced {
@@ -495,6 +546,24 @@ pub async fn test(test: &mut TestServer) {
         .send()
         .await
         .unwrap();
+    // Scheduling traces on both PUT paths, for both accounts.
+    put_past_twice(&key_client, key_cal).await;
+    put_past_twice(&plain_client, plain_cal).await;
+    // Spec 8: OPTIONS with a wrong credential keeps upstream's header and
+    // is reported like any other authentication failure.
+    // The secret check below relies on this error's text: "Authentication
+    // failed" carries no "basic ". A malformed header would instead report
+    // "Failed to decode Basic auth request." and trip the credential-header
+    // assertion further down.
+    let response = options_wrong_password(OPTIONS_PROBE_USER).await;
+    assert_eq!(response.status().as_u16(), 200);
+    let dav = response
+        .headers()
+        .get("dav")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(dav.contains("calendar-auto-schedule"), "{dav}");
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let mut seen = Vec::new();
@@ -514,17 +583,17 @@ pub async fn test(test: &mut TestServer) {
     Collector::reload();
     let all = seen.join("\n");
     // Every string of the captured events of one type.
-    let traced_as = |event: JmapEvent| {
+    let traced_as = |event_type: EventType| {
         typed
             .iter()
-            .filter(|(typ, _)| *typ == EventType::Jmap(event))
+            .filter(|(typ, _)| *typ == event_type)
             .map(|(_, values)| values.as_str())
             .collect::<Vec<_>>()
             .join("\n")
     };
-    let invalid_arguments = traced_as(JmapEvent::InvalidArguments);
-    let unknown_method = traced_as(JmapEvent::UnknownMethod);
-    let result_reference = traced_as(JmapEvent::InvalidResultReference);
+    let invalid_arguments = traced_as(EventType::Jmap(JmapEvent::InvalidArguments));
+    let unknown_method = traced_as(EventType::Jmap(JmapEvent::UnknownMethod));
+    let result_reference = traced_as(EventType::Jmap(JmapEvent::InvalidResultReference));
     // Positive control: the subscriber works and plain traffic is traced.
     assert!(
         all.contains(PLAIN_CANARY),
@@ -617,11 +686,39 @@ pub async fn test(test: &mut TestServer) {
         all.contains("[redacted]"),
         "redaction marker missing: {all}"
     );
+    // OPTIONS: the failed credential is reported, never its secret.
+    assert!(
+        typed
+            .iter()
+            .any(|(typ, _)| *typ == EventType::Auth(AuthEvent::Failed)),
+        "OPTIONS authentication failure not reported: {all}"
+    );
+    assert!(
+        !all.contains(OPTIONS_WRONG_SECRET),
+        "OPTIONS credential traced: {all}"
+    );
+    // Scheduling: the plain account's past event still traces its reason on
+    // the create and the update path; the key account's fixed refusal is
+    // traced on neither (three key-account PUTs reach it in this module).
+    let itip = traced_as(EventType::Calendar(CalendarEvent::ItipMessageError));
+    assert_eq!(
+        itip.matches("lies in the past").count(),
+        2,
+        "plain-account scheduling reason not traced on both PUT paths: {itip}"
+    );
+    assert!(
+        !itip.contains("zero-access accounts"),
+        "key-account scheduling refusal traced: {itip}"
+    );
 
     test.wait_for_tasks().await;
     test.blob_expire_all().await;
     key_client
         .request("DELETE", &format!("{key_cal}trace-key.ics"), "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    key_client
+        .request("DELETE", &format!("{key_cal}past.ics"), "")
         .await
         .with_status(StatusCode::NO_CONTENT);
     plain_client
