@@ -309,7 +309,10 @@ impl CalendarUpdateRequestHandler for Server {
                 }
 
                 itip_set_unreachable_status(&mut new_event.data.event, account_info.addresses());
-            } else if let Some(reason) = itip_status.reason() {
+            } else if itip_status != ItipSendStatus::KeyAccount
+                && let Some(reason) = itip_status.reason()
+            {
+                // Spec 9: a key account's refusal is its normal state, not an error.
                 trc::event!(
                     Calendar(trc::CalendarEvent::ItipMessageError),
                     AccountId = account_id,
@@ -465,7 +468,10 @@ impl CalendarUpdateRequestHandler for Server {
                 }
 
                 itip_set_unreachable_status(&mut event.data.event, account_info.addresses());
-            } else if let Some(reason) = itip_status.reason() {
+            } else if itip_status != ItipSendStatus::KeyAccount
+                && let Some(reason) = itip_status.reason()
+            {
+                // Spec 9: a key account's refusal is its normal state, not an error.
                 trc::event!(
                     Calendar(trc::CalendarEvent::ItipMessageError),
                     AccountId = account_id,
