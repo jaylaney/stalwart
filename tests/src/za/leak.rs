@@ -34,7 +34,7 @@ use store::{
     SUBSPACE_QUEUE_EVENT, SUBSPACE_QUEUE_MESSAGE, SUBSPACE_QUOTA, SUBSPACE_REGISTRY,
     SUBSPACE_REGISTRY_IDX, SUBSPACE_REGISTRY_PK, SUBSPACE_REPORT_IN, SUBSPACE_REPORT_OUT,
     SUBSPACE_SEARCH_INDEX, SUBSPACE_SPAM_SAMPLES, SUBSPACE_TASK_QUEUE, SUBSPACE_TELEMETRY_METRIC,
-    SUBSPACE_TELEMETRY_SPAN, U32_LEN,
+    SUBSPACE_TELEMETRY_SPAN, U32_LEN, U64_LEN,
     write::{AlignedBytes, AnyKey, Archive, SearchIndex},
 };
 use types::{
@@ -80,6 +80,8 @@ const SCHED_EVENT: &str = concat!(
 /// Archive marker bits (`store/src/write/serialize.rs`, private there).
 const ARCHIVE_MAGIC_MARKER: u8 = 1 << 7;
 const ARCHIVE_LZ4_COMPRESSED: u8 = 1 << 4;
+const ARCHIVE_VERSIONED: u8 = 1 << 6;
+const ARCHIVE_HASHED: u8 = 1 << 5;
 /// Largest decompressed size the scanner accepts for a value that merely
 /// looks like an LZ4 archive, so arbitrary bytes cannot ask for gigabytes.
 const MAX_DECODED_LEN: usize = 64 * 1024 * 1024;
@@ -263,10 +265,22 @@ fn check_calendar(calendar: &Calendar, account_id: u32, what: &str, violations: 
 
 /// Decodes a value as a stored archive if it carries the archive marker.
 /// An LZ4 archive starts with its decompressed size (little endian u32);
-/// values that only look like one and claim a huge size are skipped.
+/// values that only look like one and claim a huge size are skipped, as are
+/// values too short for the trailer their marker implies (the store's
+/// deserializer would underflow on them).
 fn try_archive(value: &[u8]) -> Option<Archive<AlignedBytes>> {
     let marker = *value.last()?;
     if marker & ARCHIVE_MAGIC_MARKER == 0 {
+        return None;
+    }
+    let min_len = 1 + if marker & ARCHIVE_VERSIONED != 0 {
+        U64_LEN + U32_LEN
+    } else if marker & ARCHIVE_HASHED != 0 {
+        U32_LEN
+    } else {
+        0
+    };
+    if value.len() < min_len {
         return None;
     }
     if marker & ARCHIVE_LZ4_COMPRESSED != 0 {
@@ -747,4 +761,26 @@ pub async fn test(test: &mut TestServer) {
             .with_status(StatusCode::NO_CONTENT);
     }
     test.destroy_all_mailboxes(test.account(name)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::try_archive;
+
+    #[test]
+    fn try_archive_short_values_are_not_archives() {
+        for marker in [0xC0u8, 0xA0, 0xE0] {
+            assert!(try_archive(&[marker]).is_none());
+        }
+        // A bare unversioned marker is a valid empty archive; it must only
+        // not panic.
+        let _ = try_archive(&[0x80]);
+        let mut versioned = vec![0u8; 11];
+        versioned.push(0xC0);
+        assert!(try_archive(&versioned).is_none());
+        assert!(try_archive(&[0, 0, 0, 0xA0]).is_none());
+        assert!(try_archive(&[0, 0, 0, 0, 0x01]).is_none());
+        // Unversioned and long enough: must not panic, result is irrelevant.
+        let _ = try_archive(&[0, 0, 0, 0, 0x80]);
+    }
 }
