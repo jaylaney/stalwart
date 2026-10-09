@@ -18,6 +18,7 @@ pub mod cors;
 pub mod dav_gate;
 pub mod dav_seal;
 pub mod disabled;
+pub mod expansion;
 pub mod gating;
 pub mod index_task;
 pub mod leak;
@@ -97,6 +98,7 @@ pub async fn za_tests() {
     dav_seal::test_reports(&mut test).await;
     dav_seal::test_collections(&mut test).await;
     tracing::test(&mut test).await;
+    expansion::test(&mut test).await;
     gating::test(&mut test).await;
     gating::test_scheduling(&mut test).await;
     leak::test(&mut test).await;
