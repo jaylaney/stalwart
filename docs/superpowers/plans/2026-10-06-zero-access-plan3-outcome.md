@@ -257,25 +257,31 @@ Also Jay's, but not spec text:
 
 ## Deferred findings (reviewed, not fixed), by area
 
+Plan 5 (`docs/superpowers/plans/2026-10-09-zero-access-5-deferred-findings.md`,
+2026-10-09) closed the items marked **Closed (plan 5)** below. Spec
+revision 7 had already decided the OPTIONS fail-open, the anonymous rate
+limit on an unparseable OPTIONS header, the sole default calendar and the
+check-then-commit window; they are marked **Decided (revision 7)**.
+
 Security and robustness:
 
 - A pending account refused at setup for stray data has no operator path to
   remove it except direct store writes (Task 0; Minor 8 above).
-- OPTIONS fail-open (R12, re-review): a key account whose OPTIONS
+- **Decided (revision 7)** OPTIONS fail-open (R12, re-review): a key account whose OPTIONS
   authentication fails transiently (in-flight limit, store error, fail2ban
   ban) receives upstream's header including `calendar-auto-schedule`. Clients
   cache OPTIONS capabilities at setup, so a failure at that moment leaves the
   client believing the server sends invitations.
-- Authentication errors on OPTIONS are swallowed, so the usual `Auth(Failed)`
+- **Closed (plan 5)** Authentication errors on OPTIONS are swallowed, so the usual `Auth(Failed)`
   or `AuthenticationBan` error is not emitted through request error reporting
   (fail2ban accounting still runs inside `authentication_failure`).
-- `za_is_key_account_request` checks for the presence of an `Authorization`
+- **Decided (revision 7)** `za_is_key_account_request` checks for the presence of an `Authorization`
   header while `authenticate_headers` parses it, so an unparseable or
   non-Basic/Bearer header on OPTIONS charges the anonymous rate limit, which
   upstream never did there.
-- The check-then-commit window at setup remains in principle; ingest gating
+- **Decided (revision 7)** The check-then-commit window at setup remains in principle; ingest gating
   closes it in practice.
-- `ItipMessageError` is logged on every key-account PUT (static reason, no
+- **Closed (plan 5)** `ItipMessageError` is logged on every key-account PUT (static reason, no
   content, but trace noise).
 - Blob decode in the leak scanner works only when the blob store is the data
   store; with an FS or S3 blob store only mail reachable through
@@ -286,16 +292,25 @@ Security and robustness:
   `try_account` fix (R8) is covered only by the plain-mode suites.
 - `RuleExpansionError` reasons still carry calcard error strings (RRULE is
   visible) and the `query.rs` trace carries no account or document id.
-- Account lookups: `acl.rs` and `scheduling.rs` use `account()` where every
+- **Closed (plan 5)** Account lookups: `acl.rs` and `scheduling.rs` use `account()` where every
   other gate uses `try_account`; four inline gates in JMAP and three in
   groupware could reuse dav's private `is_key_account` helper.
-- The gates in Task 2 key off the authenticated account
+- **Decided (revision 7)** The gates in Task 2 key off the authenticated account
   (`scheduling_account_info`); a plain writer into a key calendar is stopped by
   Task 1 and plan 2's gate.
+- R8's fall-through can index a destroyed key account's sealed archive:
+  if a calendar index task runs after the registry delete but before
+  `DestroyAccount` removes the data, the key-account gate sees no account
+  and the builder indexes the sealed tree, which exposes only visible
+  metadata. `DestroyAccount` unindexes calendars before destroying the
+  data, so a write landing in between leaves an orphan search entry. The
+  window is milliseconds after a PUT in the product build; no test can
+  open it deterministically. A fix would skip sealed archives in
+  `build_calendar_document`.
 
 Tests:
 
-- The `zero-access` CI job's plain-mode `webdav_tests` step has no retry for
+- **Closed (plan 5)** The `zero-access` CI job's plain-mode `webdav_tests` step has no retry for
   the known `cal_itip` flake, so CI will go red intermittently until that
   sub-test is fixed or retried.
 - The post-DELETE CANCEL checks in `za_variants::scheduling` and
@@ -318,14 +333,14 @@ Tests:
   record; its planting block duplicates key4's; `za_assert_no_calendar_data`
   returns `Ok(Some(409))` where `za_assert_enabled` returns an error.
 - The leak scanner: no positive control plants a calendar search-index entry,
-  so the index check proves the key layout through mail entries only; the
+  so the index check proves the key layout through mail entries only (**closed, plan 5**); the
   task-queue channel is scanned both before and after the drain, but the
   alarm email assertion does not prove the alarm fired for the right reason;
   silent blob decode failures are not asserted; the fixed `SUBSPACES` list
   needs updating whenever upstream adds a subspace; allprop PROPFIND may omit
   `calendar-timezone`; CI step ordering is now behind the `style` job only.
 - Final review "can stay": no trace-event test for the removed trace
-  content; the alarm override has no red test (R15); `webdav_tests` has no
+  content (**closed, plan 5**); the alarm override has no red test (R15); `webdav_tests` has no
   queue capture, so nothing asserts that no mail was queued to the
   `john_doe@unknown.com` attendee in the alarm variant.
 - The key-mode branch in upstream `tests/src/webdav/basic.rs` (OPTIONS header
@@ -451,12 +466,12 @@ calendar data (including the default calendar) gets 409 at `setup`
 
 ## Tests worth adding
 
-- A positive control that plants a calendar search-index entry for a key
+- **Added (plan 5)** A positive control that plants a calendar search-index entry for a key
   account, so the index check proves the Calendar class byte and not only the
   mail entries.
-- A destroyed account's pending index task (R8): delete a key account with
+- **Added (plan 5)** A destroyed account's pending index task (R8): delete a key account with
   an `IndexDocument` task queued and assert the task drains.
-- A trace event with a store tracer that asserts the `RuleExpansionError`
+- **Added (plan 5)** A trace event with a store tracer that asserts the `RuleExpansionError`
   traces carry UIDs and no iCalendar text.
 - Mutation runs for the variants (remove each gate and confirm the variant
   fails), in particular `copy_move`, `acl` and the scheduling variant.
