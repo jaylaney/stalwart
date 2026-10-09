@@ -260,8 +260,10 @@ Also Jay's, but not spec text:
 Plan 5 (`docs/superpowers/plans/2026-10-09-zero-access-5-deferred-findings.md`,
 2026-10-09) closed the items marked **Closed (plan 5)** below. Spec
 revision 7 had already decided the OPTIONS fail-open, the anonymous rate
-limit on an unparseable OPTIONS header, the sole default calendar and the
-check-then-commit window; they are marked **Decided (revision 7)**.
+limit on an unparseable OPTIONS header and the check-then-commit window; they
+are marked **Decided (revision 7)**. The sole-default-calendar decision (spec
+4.1) has no bullet of its own here. **No action (plan 5)** marks a finding
+that records no hole to fix.
 
 Security and robustness:
 
@@ -295,7 +297,7 @@ Security and robustness:
 - **Closed (plan 5)** Account lookups: `acl.rs` and `scheduling.rs` use `account()` where every
   other gate uses `try_account`; four inline gates in JMAP and three in
   groupware could reuse dav's private `is_key_account` helper.
-- **Decided (revision 7)** The gates in Task 2 key off the authenticated account
+- **No action (plan 5)** The gates in Task 2 key off the authenticated account
   (`scheduling_account_info`); a plain writer into a key calendar is stopped by
   Task 1 and plan 2's gate.
 - R8's fall-through can index a destroyed key account's sealed archive:
@@ -459,9 +461,11 @@ subject change); the JMAP `request.rs` arms and `changes/get.rs`; plus
 `tests/src/jmap/mail/set.rs` (R9).
 
 For the account page: key accounts now see no calendars in JMAP, so the page
-must not offer sharing or scheduling; a pending account that holds any
-calendar data (including the default calendar) gets 409 at `setup`
-(Minor 8). The manual client checklist is `docs/zero-access/manual-checklist.md`
+must not offer sharing or scheduling; a pending account that holds calendar
+events, scheduling notifications, or any calendar collection other than a sole
+default calendar created by the server with untouched preferences gets 409
+(`account already holds calendar data`) at `setup` (spec 4.1; Minor 8). The manual client checklist is
+`docs/zero-access/manual-checklist.md`
 (item 13 is the invitation check).
 
 ## Tests worth adding
@@ -471,7 +475,7 @@ calendar data (including the default calendar) gets 409 at `setup`
   mail entries.
 - **Added (plan 5)** A destroyed account's pending index task (R8): delete a key account with
   an `IndexDocument` task queued and assert the task drains.
-- **Added (plan 5)** A trace event with a store tracer that asserts the `RuleExpansionError`
+- **Added (plan 5)** A trace event with an in-process trace subscriber that asserts the `RuleExpansionError`
   traces carry UIDs and no iCalendar text.
 - Mutation runs for the variants (remove each gate and confirm the variant
   fails), in particular `copy_move`, `acl` and the scheduling variant.

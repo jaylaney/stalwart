@@ -163,7 +163,9 @@ impl Server {
     /// Spec 3: whether `account_id` is a key account. An unknown account id
     /// is not a key account, so upstream's outcome stands for it (plan 3
     /// ruling R3); a lookup error propagates. A caller that must fail closed
-    /// maps the error to `true`.
+    /// maps the error to `true`. An unknown account id still yields
+    /// `Ok(false)`, so a caller that must fail closed on unknown ids uses
+    /// `account()` instead.
     pub async fn za_is_key_account(&self, account_id: u32) -> trc::Result<bool> {
         Ok(self
             .try_account(account_id)
