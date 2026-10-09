@@ -1056,11 +1056,9 @@ async fn za_is_key_account_request(
         return false;
     };
     server
-        .try_account(access_token.account_id())
+        .za_is_key_account(access_token.account_id())
         .await
-        .ok()
-        .flatten()
-        .is_some_and(|account| account.is_key_account())
+        .unwrap_or(false)
 }
 
 /// Spec section 10, "Traces": a key account's JMAP request and response
@@ -1068,11 +1066,7 @@ async fn za_is_key_account_request(
 /// (`x:AccountPassword/set`). Fails closed: a failed lookup counts as a key
 /// account, unlike the fail-open `za_is_key_account_request`.
 async fn za_jmap_untraced(server: &Server, account_id: u32) -> bool {
-    server
-        .try_account(account_id)
-        .await
-        .map(|account| account.is_some_and(|account| account.is_key_account()))
-        .unwrap_or(true)
+    server.za_is_key_account(account_id).await.unwrap_or(true)
 }
 
 #[cfg(test)]

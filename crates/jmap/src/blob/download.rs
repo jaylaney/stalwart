@@ -118,10 +118,9 @@ impl BlobDownload for Server {
                                 Collection::from(*collection),
                                 Collection::Calendar | Collection::CalendarEvent
                             ) && self
-                                .try_account(*account_id)
+                                .za_is_key_account(*account_id)
                                 .await
                                 .caused_by(trc::location!())?
-                                .is_some_and(|account| account.is_key_account())
                             {
                                 // Spec 9: never for a key account's calendar data.
                                 false

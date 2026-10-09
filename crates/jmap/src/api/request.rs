@@ -735,11 +735,7 @@ impl RequestHandler for Server {
 /// Spec 9: JMAP calendar methods are not offered for key accounts in this
 /// release. An unknown account is not a key account: upstream's outcome stands.
 pub(crate) async fn za_assert_calendar_allowed(server: &Server, account_id: Id) -> trc::Result<()> {
-    if server
-        .try_account(account_id.document_id())
-        .await?
-        .is_some_and(|account| account.is_key_account())
-    {
+    if server.za_is_key_account(account_id.document_id()).await? {
         Err(trc::JmapEvent::AccountNotSupportedByMethod.into_err())
     } else {
         Ok(())
@@ -751,11 +747,7 @@ pub(crate) async fn za_assert_calendar_allowed(server: &Server, account_id: Id) 
 /// (`x:AccountPassword/set`). Fails closed: a failed lookup counts as a key
 /// account.
 pub(crate) async fn za_jmap_untraced(server: &Server, account_id: u32) -> bool {
-    server
-        .try_account(account_id)
-        .await
-        .map(|account| account.is_some_and(|account| account.is_key_account()))
-        .unwrap_or(true)
+    server.za_is_key_account(account_id).await.unwrap_or(true)
 }
 
 /// Spec section 10, "Traces": the five method errors whose details carry

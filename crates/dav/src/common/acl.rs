@@ -129,11 +129,7 @@ impl DavAclHandler for Server {
 
         // Spec 9: sharing is refused on calendars owned by key accounts.
         if collection == Collection::Calendar
-            && self
-                .account(account_id)
-                .await
-                .caused_by(trc::location!())?
-                .is_key_account()
+            && crate::common::za::is_key_account(self, account_id).await?
         {
             return Err(DavError::Code(StatusCode::FORBIDDEN));
         }

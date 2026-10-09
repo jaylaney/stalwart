@@ -160,6 +160,18 @@ pub(crate) async fn vault_write_store(
 }
 
 impl Server {
+    /// Spec 3: whether `account_id` is a key account. An unknown account id
+    /// is not a key account, so upstream's outcome stands for it (plan 3
+    /// ruling R3); a lookup error propagates. A caller that must fail closed
+    /// maps the error to `true`.
+    pub async fn za_is_key_account(&self, account_id: u32) -> trc::Result<bool> {
+        Ok(self
+            .try_account(account_id)
+            .await
+            .caused_by(trc::location!())?
+            .is_some_and(|account| account.is_key_account()))
+    }
+
     pub async fn za_vault_record(&self, account_id: u32) -> trc::Result<Option<VaultRead>> {
         vault_read_store(self.store(), account_id).await
     }
