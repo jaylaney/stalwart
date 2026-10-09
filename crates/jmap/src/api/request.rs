@@ -758,9 +758,11 @@ pub(crate) async fn za_jmap_untraced(server: &Server, account_id: u32) -> bool {
         .unwrap_or(true)
 }
 
-/// Spec section 10, "Traces": the three method errors whose details carry
+/// Spec section 10, "Traces": the five method errors whose details carry
 /// free text derived from the request (the argument parser's error echoes
-/// the arguments) are traced for a key account with a fixed reason instead.
+/// the arguments, an unknown method its name, an invalid result reference
+/// its call id or path) are traced for a key account with a fixed reason
+/// instead.
 /// The client still receives the detailed error.
 async fn za_method_error_for_trace(
     server: &Server,
@@ -771,7 +773,11 @@ async fn za_method_error_for_trace(
     if matches!(
         event_type,
         trc::EventType::Jmap(
-            JmapEvent::InvalidArguments | JmapEvent::UnsupportedFilter | JmapEvent::UnsupportedSort
+            JmapEvent::InvalidArguments
+                | JmapEvent::UnsupportedFilter
+                | JmapEvent::UnsupportedSort
+                | JmapEvent::UnknownMethod
+                | JmapEvent::InvalidResultReference
         )
     ) && za_jmap_untraced(server, access_token.account_id()).await
     {

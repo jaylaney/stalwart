@@ -42,6 +42,10 @@ const KEY_ARGS_CANARY: &str = "trace-canary-args-key-7e4d";
 const PLAIN_ARGS_CANARY: &str = "trace-canary-args-plain-9b02";
 const KEY_WS_ARGS_CANARY: &str = "trace-canary-ws-args-key-5a6c";
 const PLAIN_WS_ARGS_CANARY: &str = "trace-canary-ws-args-plain-0d13";
+const KEY_METHOD_CANARY: &str = "trace-canary-method-key-2c8e";
+const PLAIN_METHOD_CANARY: &str = "trace-canary-method-plain-6f41";
+const KEY_REF_CANARY: &str = "trace-canary-ref-key-4d07";
+const PLAIN_REF_CANARY: &str = "trace-canary-ref-plain-8a35";
 const SUBSCRIBER_ID: &str = "za-trace-test";
 const CONTENT_TYPE: (&str, &str) = ("content-type", "text/calendar; charset=utf-8");
 
@@ -329,6 +333,47 @@ async fn jmap_bad_arguments(user: &str, secret: &str, canary: &str) {
     );
 }
 
+/// POST a well-formed request with the single method call `call`, which
+/// fails with `error_type` and a description echoing `canary`; the client
+/// keeps the detailed error.
+async fn jmap_call_error(
+    user: &str,
+    secret: &str,
+    call: serde_json::Value,
+    error_type: &str,
+    canary: &str,
+) {
+    let response = http_client()
+        .post(format!("{SERVER_URL}/jmap"))
+        .basic_auth(user, Some(secret))
+        .json(&json!({
+            "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+            "methodCalls": [call],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.unwrap();
+    assert!(body.contains(canary) && body.contains(error_type), "{body}");
+}
+
+/// An unknown method whose name carries `canary`.
+async fn jmap_unknown_method(user: &str, secret: &str, canary: &str) {
+    let call = json!([format!("Email/{canary}"), {}, "c0"]);
+    jmap_call_error(user, secret, call, "unknownMethod", canary).await;
+}
+
+/// A result reference to a call id, `canary`, that is not in the request.
+async fn jmap_bad_reference(user: &str, secret: &str, canary: &str) {
+    let call = json!([
+        "Email/get",
+        {"#ids": {"resultOf": canary, "name": "Email/query", "path": "/ids"}},
+        "c0"
+    ]);
+    jmap_call_error(user, secret, call, "invalidResultReference", canary).await;
+}
+
 /// Send `bad_arguments` over a WebSocket; the client keeps the detailed
 /// error in the `Response` frame.
 async fn ws_bad_arguments(user: &str, secret: &str, canary: &str) {
@@ -381,6 +426,8 @@ pub async fn test(test: &mut TestServer) {
         EventType::Http(HttpEvent::ResponseBody),
         EventType::Jmap(JmapEvent::NotRequest),
         EventType::Jmap(JmapEvent::InvalidArguments),
+        EventType::Jmap(JmapEvent::UnknownMethod),
+        EventType::Jmap(JmapEvent::InvalidResultReference),
     ];
     let mut interests = Interests::default();
     for event_type in traced {
@@ -412,6 +459,12 @@ pub async fn test(test: &mut TestServer) {
     jmap_bad_arguments(plain.name(), plain.secret(), PLAIN_ARGS_CANARY).await;
     ws_bad_arguments("key1@example.com", STRONG, KEY_WS_ARGS_CANARY).await;
     ws_bad_arguments(plain.name(), plain.secret(), PLAIN_WS_ARGS_CANARY).await;
+    // An unknown method name and a dangling result reference are echoed
+    // the same way.
+    jmap_unknown_method("key1@example.com", STRONG, KEY_METHOD_CANARY).await;
+    jmap_unknown_method(plain.name(), plain.secret(), PLAIN_METHOD_CANARY).await;
+    jmap_bad_reference("key1@example.com", STRONG, KEY_REF_CANARY).await;
+    jmap_bad_reference(plain.name(), plain.secret(), PLAIN_REF_CANARY).await;
     jmap_upload(
         "key1@example.com",
         STRONG,
@@ -445,7 +498,7 @@ pub async fn test(test: &mut TestServer) {
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let mut seen = Vec::new();
-    let mut invalid_arguments = Vec::new();
+    let mut typed = Vec::new();
     while let Ok(batch) = rx.try_recv() {
         for event in batch {
             let mut values = Vec::new();
@@ -453,16 +506,25 @@ pub async fn test(test: &mut TestServer) {
                 strings(value, &mut values);
             }
             let values = values.join("\n");
-            if event.inner.typ == EventType::Jmap(JmapEvent::InvalidArguments) {
-                invalid_arguments.push(values.clone());
-            }
+            typed.push((event.inner.typ, values.clone()));
             seen.push(values);
         }
     }
     Collector::remove_subscriber(SUBSCRIBER_ID.into());
     Collector::reload();
     let all = seen.join("\n");
-    let invalid_arguments = invalid_arguments.join("\n");
+    // Every string of the captured events of one type.
+    let traced_as = |event: JmapEvent| {
+        typed
+            .iter()
+            .filter(|(typ, _)| *typ == EventType::Jmap(event))
+            .map(|(_, values)| values.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let invalid_arguments = traced_as(JmapEvent::InvalidArguments);
+    let unknown_method = traced_as(JmapEvent::UnknownMethod);
+    let result_reference = traced_as(JmapEvent::InvalidResultReference);
     // Positive control: the subscriber works and plain traffic is traced.
     assert!(
         all.contains(PLAIN_CANARY),
@@ -489,7 +551,7 @@ pub async fn test(test: &mut TestServer) {
         "plain-account WebSocket error frame lost the parser's error: {plain_ws_reply}"
     );
     // The plain account's request body is traced too, so look for its
-    // argument canaries in the `jmap.invalid-arguments` events themselves.
+    // method-error canaries in the method-error events themselves.
     assert!(
         invalid_arguments.contains(PLAIN_ARGS_CANARY),
         "no plain-account invalid-arguments trace captured: {invalid_arguments}"
@@ -497,6 +559,14 @@ pub async fn test(test: &mut TestServer) {
     assert!(
         invalid_arguments.contains(PLAIN_WS_ARGS_CANARY),
         "no plain-account WebSocket invalid-arguments trace captured: {invalid_arguments}"
+    );
+    assert!(
+        unknown_method.contains(PLAIN_METHOD_CANARY),
+        "no plain-account unknown-method trace captured: {unknown_method}"
+    );
+    assert!(
+        result_reference.contains(PLAIN_REF_CANARY),
+        "no plain-account invalid-result-reference trace captured: {result_reference}"
     );
     // Key-account traffic is absent on both sides.
     assert!(!all.contains(KEY_CANARY), "key-account body traced: {all}");
@@ -527,6 +597,14 @@ pub async fn test(test: &mut TestServer) {
     assert!(
         !all.contains(KEY_WS_ARGS_CANARY),
         "key-account WebSocket method arguments traced: {all}"
+    );
+    assert!(
+        !all.contains(KEY_METHOD_CANARY),
+        "key-account unknown method name traced: {all}"
+    );
+    assert!(
+        !all.contains(KEY_REF_CANARY),
+        "key-account result reference traced: {all}"
     );
     // The key account's password never reaches the trace.
     assert!(!all.contains(STRONG), "login body traced: {all}");
