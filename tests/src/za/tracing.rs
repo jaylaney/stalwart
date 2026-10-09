@@ -38,6 +38,10 @@ const KEY_UPLOAD_CANARY: &str = "trace-canary-upload-key-4a90";
 const PLAIN_UPLOAD_CANARY: &str = "trace-canary-upload-plain-c2d7";
 const KEY_WS_CANARY: &str = "trace-canary-ws-key-6f1b";
 const PLAIN_WS_CANARY: &str = "trace-canary-ws-plain-2d8c";
+const KEY_ARGS_CANARY: &str = "trace-canary-args-key-7e4d";
+const PLAIN_ARGS_CANARY: &str = "trace-canary-args-plain-9b02";
+const KEY_WS_ARGS_CANARY: &str = "trace-canary-ws-args-key-5a6c";
+const PLAIN_WS_ARGS_CANARY: &str = "trace-canary-ws-args-plain-0d13";
 const SUBSCRIBER_ID: &str = "za-trace-test";
 const CONTENT_TYPE: (&str, &str) = ("content-type", "text/calendar; charset=utf-8");
 
@@ -299,6 +303,47 @@ async fn ws_malformed(user: &str, secret: &str, canary: &str) -> String {
     reply
 }
 
+/// A well-formed request with one `Email/get` call whose `ids` is a string
+/// carrying `canary`. The call's `invalidArguments` error echoes it.
+fn bad_arguments(canary: &str) -> serde_json::Value {
+    json!({
+        "using": ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"],
+        "methodCalls": [["Email/get", {"ids": canary}, "c0"]],
+    })
+}
+
+/// POST `bad_arguments` to `/jmap`; the client keeps the detailed error.
+async fn jmap_bad_arguments(user: &str, secret: &str, canary: &str) {
+    let response = http_client()
+        .post(format!("{SERVER_URL}/jmap"))
+        .basic_auth(user, Some(secret))
+        .json(&bad_arguments(canary))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.unwrap();
+    assert!(
+        body.contains(canary) && body.contains("invalidArguments"),
+        "{body}"
+    );
+}
+
+/// Send `bad_arguments` over a WebSocket; the client keeps the detailed
+/// error in the `Response` frame.
+async fn ws_bad_arguments(user: &str, secret: &str, canary: &str) {
+    let mut message = bad_arguments(canary);
+    message["@type"] = json!("Request");
+    message["id"] = json!("1");
+    let reply = ws_exchange(user, secret, &message.to_string()).await;
+    assert!(
+        reply.contains("\"Response\"")
+            && reply.contains(canary)
+            && reply.contains("invalidArguments"),
+        "{reply}"
+    );
+}
+
 pub async fn test(test: &mut TestServer) {
     println!("Running zero-access HTTP trace tests...");
     let key1 = test.account("key1@example.com").clone();
@@ -329,11 +374,13 @@ pub async fn test(test: &mut TestServer) {
 
     // The test server configures no tracer, so the two Trace-level events
     // are not emitted at all until something declares interest in them.
-    // `jmap.not-request` carries the body the JMAP parser rejected.
+    // `jmap.not-request` carries the body the JMAP parser rejected, and
+    // `jmap.invalid-arguments` a method call's rejected arguments.
     let traced = [
         EventType::Http(HttpEvent::RequestBody),
         EventType::Http(HttpEvent::ResponseBody),
         EventType::Jmap(JmapEvent::NotRequest),
+        EventType::Jmap(JmapEvent::InvalidArguments),
     ];
     let mut interests = Interests::default();
     for event_type in traced {
@@ -359,6 +406,12 @@ pub async fn test(test: &mut TestServer) {
     // the parser's error.
     let key_ws_reply = ws_malformed("key1@example.com", STRONG, KEY_WS_CANARY).await;
     let plain_ws_reply = ws_malformed(plain.name(), plain.secret(), PLAIN_WS_CANARY).await;
+    // A well-formed request whose method arguments do not parse: the
+    // per-method error echoes them, over HTTP and over a WebSocket.
+    jmap_bad_arguments("key1@example.com", STRONG, KEY_ARGS_CANARY).await;
+    jmap_bad_arguments(plain.name(), plain.secret(), PLAIN_ARGS_CANARY).await;
+    ws_bad_arguments("key1@example.com", STRONG, KEY_WS_ARGS_CANARY).await;
+    ws_bad_arguments(plain.name(), plain.secret(), PLAIN_WS_ARGS_CANARY).await;
     jmap_upload(
         "key1@example.com",
         STRONG,
@@ -392,18 +445,24 @@ pub async fn test(test: &mut TestServer) {
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let mut seen = Vec::new();
+    let mut invalid_arguments = Vec::new();
     while let Ok(batch) = rx.try_recv() {
         for event in batch {
             let mut values = Vec::new();
             for (_, value) in event.keys.iter() {
                 strings(value, &mut values);
             }
-            seen.push(values.join("\n"));
+            let values = values.join("\n");
+            if event.inner.typ == EventType::Jmap(JmapEvent::InvalidArguments) {
+                invalid_arguments.push(values.clone());
+            }
+            seen.push(values);
         }
     }
     Collector::remove_subscriber(SUBSCRIBER_ID.into());
     Collector::reload();
     let all = seen.join("\n");
+    let invalid_arguments = invalid_arguments.join("\n");
     // Positive control: the subscriber works and plain traffic is traced.
     assert!(
         all.contains(PLAIN_CANARY),
@@ -429,6 +488,16 @@ pub async fn test(test: &mut TestServer) {
         plain_ws_reply.contains(PLAIN_WS_CANARY),
         "plain-account WebSocket error frame lost the parser's error: {plain_ws_reply}"
     );
+    // The plain account's request body is traced too, so look for its
+    // argument canaries in the `jmap.invalid-arguments` events themselves.
+    assert!(
+        invalid_arguments.contains(PLAIN_ARGS_CANARY),
+        "no plain-account invalid-arguments trace captured: {invalid_arguments}"
+    );
+    assert!(
+        invalid_arguments.contains(PLAIN_WS_ARGS_CANARY),
+        "no plain-account WebSocket invalid-arguments trace captured: {invalid_arguments}"
+    );
     // Key-account traffic is absent on both sides.
     assert!(!all.contains(KEY_CANARY), "key-account body traced: {all}");
     assert!(
@@ -450,6 +519,14 @@ pub async fn test(test: &mut TestServer) {
     assert!(
         !key_ws_reply.contains(KEY_WS_CANARY),
         "key-account WebSocket error frame echoes the message: {key_ws_reply}"
+    );
+    assert!(
+        !all.contains(KEY_ARGS_CANARY),
+        "key-account method arguments traced: {all}"
+    );
+    assert!(
+        !all.contains(KEY_WS_ARGS_CANARY),
+        "key-account WebSocket method arguments traced: {all}"
     );
     // The key account's password never reaches the trace.
     assert!(!all.contains(STRONG), "login body traced: {all}");

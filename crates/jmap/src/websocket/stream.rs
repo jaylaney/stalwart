@@ -4,7 +4,10 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::api::{ToRequestError, notifications_into_push_objects, request::RequestHandler};
+use crate::api::{
+    ToRequestError, notifications_into_push_objects,
+    request::{RequestHandler, za_jmap_untraced},
+};
 use common::{Server, auth::AccessToken, ipc::PushNotification};
 use futures_util::{SinkExt, StreamExt};
 use http_proto::HttpSessionData;
@@ -45,14 +48,6 @@ impl WebSocketHandler for Server {
             SpanId = session.session_id,
             AccountId = access_token.account_id(),
         );
-
-        // Spec section 10, "Traces": a key account's messages are never
-        // traced. Fails closed: a failed lookup counts as a key account.
-        let untraced = self
-            .try_account(access_token.account_id())
-            .await
-            .map(|account| account.is_some_and(|account| account.is_key_account()))
-            .unwrap_or(true);
 
         // Set timeouts
         let throttle = self.core.jmap.web_socket_throttle;
@@ -125,9 +120,10 @@ impl WebSocketHandler for Server {
                                             continue;
                                         }
                                         Err(err) => {
-                                            // The parser's error can echo the message.
-                                            let err = if untraced
-                                                && err.matches(trc::EventType::Jmap(JmapEvent::NotRequest))
+                                            // Spec section 10, "Traces": the parser's error can
+                                            // echo the message, which a key account's must not.
+                                            let err = if err.matches(trc::EventType::Jmap(JmapEvent::NotRequest))
+                                                && za_jmap_untraced(self, access_token.account_id()).await
                                             {
                                                 JmapEvent::NotRequest
                                                     .into_err()

@@ -98,6 +98,7 @@ impl RequestHandler for Server {
             // Resolve result and id references
             if let Err(error) = response.resolve_references(&mut call.method) {
                 let method_error = error.clone();
+                let error = za_method_error_for_trace(self, access_token, error).await;
 
                 trc::error!(error.span_id(session.session_id));
 
@@ -204,6 +205,7 @@ impl RequestHandler for Server {
                     }
                     Err(error) => {
                         let method_error = error.clone();
+                        let error = za_method_error_for_trace(self, access_token, error).await;
 
                         trc::error!(
                             error
@@ -741,6 +743,41 @@ pub(crate) async fn za_assert_calendar_allowed(server: &Server, account_id: Id) 
         Err(trc::JmapEvent::AccountNotSupportedByMethod.into_err())
     } else {
         Ok(())
+    }
+}
+
+/// Spec section 10, "Traces": a key account's JMAP request and response
+/// bodies are never traced, since a request can carry the account's password
+/// (`x:AccountPassword/set`). Fails closed: a failed lookup counts as a key
+/// account.
+pub(crate) async fn za_jmap_untraced(server: &Server, account_id: u32) -> bool {
+    server
+        .try_account(account_id)
+        .await
+        .map(|account| account.is_some_and(|account| account.is_key_account()))
+        .unwrap_or(true)
+}
+
+/// Spec section 10, "Traces": the three method errors whose details carry
+/// free text derived from the request (the argument parser's error echoes
+/// the arguments) are traced for a key account with a fixed reason instead.
+/// The client still receives the detailed error.
+async fn za_method_error_for_trace(
+    server: &Server,
+    access_token: &AccessToken,
+    error: trc::Error,
+) -> trc::Error {
+    let event_type = error.event_type();
+    if matches!(
+        event_type,
+        trc::EventType::Jmap(
+            JmapEvent::InvalidArguments | JmapEvent::UnsupportedFilter | JmapEvent::UnsupportedSort
+        )
+    ) && za_jmap_untraced(server, access_token.account_id()).await
+    {
+        event_type.into_err().reason("invalid method arguments")
+    } else {
+        error
     }
 }
 
