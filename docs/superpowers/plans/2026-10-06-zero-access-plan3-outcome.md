@@ -288,7 +288,7 @@ Security and robustness:
   `fetch_email` is decoded. The archive marker bits are mirrored from private
   constants in `store/src/write/serialize.rs`; the event and calendar counters
   fail loudly if they drift.
-- A destroyed account's pending index task has no regression test; the
+- **Closed (plan 5)** A destroyed account's pending index task has no regression test; the
   `try_account` fix (R8) is covered only by the plain-mode suites.
 - `RuleExpansionError` reasons still carry calcard error strings (RRULE is
   visible) and the `query.rs` trace carries no account or document id.
