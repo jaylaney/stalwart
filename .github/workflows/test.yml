@@ -3,9 +3,9 @@ name: Test
 on:
   workflow_dispatch:
   push:
-    branches: [zero-access]
+    branches: [main]
   pull_request:
-    branches: [zero-access]
+    branches: [main]
 
 jobs:
   style:
@@ -21,8 +21,8 @@ jobs:
   test:
     name: Test
     needs: style
-    # Upstream's full suite runs only when dispatched by hand; pushes to the
-    # fork branch run the style check and the zero-access job.
+    # Upstream's full suite runs only when dispatched by hand; pushes and pull
+    # requests to main run the style check and the zero-access job.
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
 
