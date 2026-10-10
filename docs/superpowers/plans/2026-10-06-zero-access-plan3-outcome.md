@@ -263,7 +263,9 @@ revision 7 had already decided the OPTIONS fail-open, the anonymous rate
 limit on an unparseable OPTIONS header and the check-then-commit window; they
 are marked **Decided (revision 7)**. The sole-default-calendar decision (spec
 4.1) has no bullet of its own here. **No action (plan 5)** marks a finding
-that records no hole to fix.
+that records no hole to fix. Plan 6
+(`docs/superpowers/plans/2026-10-10-zero-access-6-index-and-traces.md`,
+2026-10-10) closed the items marked **Closed (plan 6)**.
 
 Security and robustness:
 
@@ -300,7 +302,7 @@ Security and robustness:
 - **No action (plan 5)** The gates in Task 2 key off the authenticated account
   (`scheduling_account_info`); a plain writer into a key calendar is stopped by
   Task 1 and plan 2's gate.
-- R8's fall-through can index a destroyed key account's sealed archive:
+- **Closed (plan 6)** R8's fall-through can index a destroyed key account's sealed archive:
   if a calendar index task runs after the registry delete but before
   `DestroyAccount` removes the data, the key-account gate sees no account
   and the builder indexes the sealed tree, which exposes only visible

@@ -7,7 +7,11 @@
 use crate::task_manager::{Task, TaskDetails, TaskFailureType, TaskResult, deferred_retry_time};
 use common::Server;
 use email::{cache::MessageCacheFetch, message::metadata::MessageMetadata};
-use groupware::{cache::GroupwareCache, calendar::CalendarEvent, contact::ContactCard};
+use groupware::{
+    cache::GroupwareCache,
+    calendar::{CalendarEvent, seal::archived_event_is_sealed},
+    contact::ContactCard,
+};
 use registry::{
     schema::{
         enums::IndexDocumentType,
@@ -504,17 +508,22 @@ async fn build_calendar_document(
         ))
         .await?
     {
-        Some(metadata_) => Ok(BuildResult::Document(
-            metadata_
+        Some(metadata_) => {
+            let event = metadata_
                 .unarchive::<CalendarEvent>()
-                .caused_by(trc::location!())?
-                .index_document(
-                    account_id,
-                    document_id,
-                    index_fields,
-                    server.core.email.default_language,
-                ),
-        )),
+                .caused_by(trc::location!())?;
+            // Spec 9: a sealed archive has nothing to index. Reached when the
+            // account was destroyed after the key-account check (plan 3 R8).
+            if archived_event_is_sealed(event) {
+                return Ok(BuildResult::NotIndexed);
+            }
+            Ok(BuildResult::Document(event.index_document(
+                account_id,
+                document_id,
+                index_fields,
+                server.core.email.default_language,
+            )))
+        }
         None => Ok(BuildResult::NotFound),
     }
 }

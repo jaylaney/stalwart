@@ -104,6 +104,7 @@ pub async fn za_tests() {
     leak::test(&mut test).await;
     leak::test_index_control(&mut test).await;
     index_task::test(&mut test).await;
+    index_task::test_sealed_archive(&mut test).await;
 
     destroy_key_accounts(&test).await;
     test.assert_is_empty().await;
