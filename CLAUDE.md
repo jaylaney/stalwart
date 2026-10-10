@@ -20,7 +20,7 @@ Every shell command that uses cargo must start with `export PATH="/opt/homebrew/
 
 ## Repository rules (AGENTS.md, CONTRIBUTING.md)
 
-- Never open GitHub issues, pull requests or security reports against upstream `stalwartlabs/stalwart`, and do not draft them for the user. `origin` is Jay's fork (`jaylaney/stalwart`); `upstream` is Stalwart Labs; never push to upstream. Upstream bugs and questions go to support.stalw.art, by the human. Do not request CVEs or advisories.
+- Never open GitHub issues, pull requests or security reports against upstream `stalwartlabs/stalwart`, and do not draft them for the user. `origin` is Jay's fork (`jaylaney/stalwart`) and the only remote, on purpose: there is no `upstream` remote, and `gh` is set to default to the fork (`gh repo set-default jaylaney/stalwart`); still pass `--repo jaylaney/stalwart` to every `gh` command that writes. To merge an upstream release, fetch its tag by URL (`git fetch https://github.com/stalwartlabs/stalwart.git tag v0.16.26 --no-tags`) into a branch; never push to upstream. Upstream bugs and questions go to support.stalw.art, by the human. Do not request CVEs or advisories.
 - Upstream does not accept AI-generated code or pull requests from non-vouched contributors. This fork publishes under AGPL-3.0 and does not contribute back.
 - Code under `cfg(feature = "enterprise")` and the whole `scim` crate are licensed only under the Stalwart Enterprise License and are excluded from the product build. The `tests` crate enables `enterprise` on `store`, `directory`, `coordinator` (and others) for upstream's own tests; leave that.
 
