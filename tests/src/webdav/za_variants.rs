@@ -9,7 +9,7 @@
 use super::{TEST_ICAL_1, TEST_ICAL_2};
 use crate::utils::{
     server::TestServer,
-    za::{mail_count, wait_for_delivery},
+    za::{mail_count, plant_event, queued_recipients, wait_for_delivery},
 };
 use calcard::common::timezone::Tz;
 use email::cache::MessageCacheFetch;
@@ -22,6 +22,7 @@ use groupware::{
 };
 use hyper::StatusCode;
 use mail_parser::{DateTime, MessageParser};
+use std::time::{Duration, Instant};
 use store::write::now;
 
 pub async fn copy_move(test: &TestServer) {
@@ -407,4 +408,83 @@ pub async fn scheduling(test: &TestServer) {
     test.destroy_all_mailboxes(test.account("jane@example.com"))
         .await;
     test.assert_is_empty().await;
+}
+
+/// A legacy plaintext event whose VALARM names an external recipient.
+const R15_ALARM: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\nBEGIN:VEVENT\r\nUID:za-r15\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:$START\r\nDURATION:PT1H\r\nSUMMARY:r15-canary\r\nBEGIN:VALARM\r\nTRIGGER:-P2S\r\nACTION:EMAIL\r\nATTENDEE:mailto:r15-external@unknown.com\r\nSUMMARY:r15-canary\r\nDESCRIPTION:r15-canary\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+/// R15: a key account's alarm email goes to the account's own address even
+/// when the VALARM names an external ATTENDEE and the server allows external
+/// alarm recipients (key mode sets `allow_external_rcpts`). Sealing hides a
+/// VALARM's ATTENDEE in every event written with keys, so only a legacy
+/// plaintext event, planted here, reaches the override in the alarm task.
+pub async fn alarm_override(test: &TestServer) {
+    println!("Running key-account alarm recipient override test...");
+    let account = test.account("john@example.com");
+    let client = account.webdav_client();
+    let id = client.account_id;
+    let cal = "/dav/cal/john%40example.com/r15/";
+    client
+        .request(
+            "MKCALENDAR",
+            cal,
+            "<?xml version=\"1.0\" encoding=\"utf-8\" ?><A:mkcalendar xmlns:D=\"DAV:\" xmlns:A=\"urn:ietf:params:xml:ns:caldav\"/>",
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let start = DateTime::from_timestamp(now() as i64 + 5)
+        .to_rfc3339()
+        .replace(['-', ':'], "");
+    plant_event(
+        test,
+        id,
+        "r15",
+        "r15.ics",
+        &R15_ALARM.replace("$START", &start),
+        None,
+    )
+    .await;
+
+    // The alarm fires two seconds before the start.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while mail_count(test, id).await == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "no alarm email reached the account; queued for {:?}",
+            queued_recipients(test).await
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    wait_for_delivery(test).await;
+    let messages = test.server.get_cached_messages(id).await.unwrap();
+    assert_eq!(messages.emails.items.len(), 1);
+    let contents = test
+        .fetch_email(id, messages.emails.items[0].document_id)
+        .await;
+    let message = MessageParser::new().parse(&contents).unwrap();
+    let to = message
+        .to()
+        .and_then(|t| t.first())
+        .and_then(|a| a.address())
+        .unwrap_or_default();
+    assert_eq!(to, "john@example.com", "recipient is the account address");
+    assert!(
+        !String::from_utf8_lossy(&contents).contains("r15-external"),
+        "the external alarm attendee appears in the email"
+    );
+
+    test.wait_for_tasks().await;
+    client
+        .request("DELETE", &format!("{cal}r15.ics"), "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    client
+        .request("DELETE", cal, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    // The MKCALENDAR above recreated the default containers that `alarm`
+    // deleted.
+    client.delete_default_containers().await;
+    test.destroy_all_mailboxes(account).await;
+    test.assert_is_empty().await
 }

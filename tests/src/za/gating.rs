@@ -109,6 +109,25 @@ pub async fn test(test: &mut TestServer) {
         .request("PROPFIND", plain_cal, "")
         .await
         .with_status(StatusCode::MULTI_STATUS);
+    // `CalendarEvent/copy` gates both of its accounts. Here the target is
+    // plain's account, which key1 reaches through the grant above, so only
+    // the source gate (`fromAccountId` is the key account) can refuse it.
+    let response = key1
+        .jmap_method_call(
+            "CalendarEvent/copy",
+            json!({
+                "accountId": plain.id_string(),
+                "fromAccountId": key1.id_string(),
+                "create": {}
+            }),
+        )
+        .await;
+    assert_eq!(
+        method_error(&response),
+        Some("accountNotSupportedByMethod"),
+        "{:?}",
+        response.0
+    );
 
     // Scheduling URLs are not advertised for key accounts.
     let inbox = DavProperty::Principal(PrincipalProperty::ScheduleInboxURL);

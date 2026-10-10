@@ -228,6 +228,7 @@ pub async fn webdav_tests() {
     cal_query::test(&test).await;
     if key_accounts_mode() {
         za_variants::alarm(&test).await;
+        za_variants::alarm_override(&test).await;
     } else {
         cal_alarm::test(&test).await;
     }
