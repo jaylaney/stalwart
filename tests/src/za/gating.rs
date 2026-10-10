@@ -594,8 +594,9 @@ pub async fn test_scheduling(test: &mut TestServer) {
     );
 
     // Attendee is a key account: the invitation (and its cancellation) never
-    // reaches its scheduling inbox or calendar. The email itself may land in
-    // its mailbox; mail is not sealed in this release.
+    // reaches its scheduling inbox or calendar. The email itself lands in its
+    // mailbox (mail is not sealed in this release), as the mail-count asserts
+    // below show.
     plain_client
         .request(
             "MKCALENDAR",
@@ -685,7 +686,11 @@ pub async fn test_scheduling(test: &mut TestServer) {
         .request("GET", &copy, "")
         .await
         .with_status(StatusCode::OK);
-    assert_eq!(response.etag(), etag);
+    assert_eq!(
+        response.etag(),
+        etag,
+        "the key attendee's copy was rewritten (ETag changed)"
+    );
     let (archive, _) = raw_event(test, key1_id, "default/copy.ics").await;
     let stored = archive
         .unarchive::<CalendarEvent>()

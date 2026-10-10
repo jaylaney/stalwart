@@ -411,7 +411,7 @@ pub async fn scheduling(test: &TestServer) {
 }
 
 /// A legacy plaintext event whose VALARM names an external recipient.
-const R15_ALARM: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\nBEGIN:VEVENT\r\nUID:za-r15\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:$START\r\nDURATION:PT1H\r\nSUMMARY:r15-canary\r\nBEGIN:VALARM\r\nTRIGGER:-P2S\r\nACTION:EMAIL\r\nATTENDEE:mailto:r15-external@unknown.com\r\nSUMMARY:r15-canary\r\nDESCRIPTION:r15-canary\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+const R15_ALARM: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\nBEGIN:VEVENT\r\nUID:za-r15\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:$START\r\nDURATION:PT1H\r\nSUMMARY:r15-canary\r\nBEGIN:VALARM\r\nTRIGGER:-P2S\r\nACTION:EMAIL\r\nATTENDEE:mailto:r15-external@unknown.com\r\nSUMMARY:r15-canary-summary\r\nDESCRIPTION:r15-canary-description\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 
 /// R15: a key account's alarm email goes to the account's own address even
 /// when the VALARM names an external ATTENDEE and the server allows external
@@ -432,7 +432,10 @@ pub async fn alarm_override(test: &TestServer) {
         )
         .await
         .with_status(StatusCode::CREATED);
-    let start = DateTime::from_timestamp(now() as i64 + 5)
+    // The alarm is scheduled only if its time is still ahead when the event
+    // is written (`next_alarm` drops it otherwise), so leave a wide lead: it
+    // fires eight seconds from now, two seconds before the start.
+    let start = DateTime::from_timestamp(now() as i64 + 10)
         .to_rfc3339()
         .replace(['-', ':'], "");
     plant_event(
@@ -445,8 +448,7 @@ pub async fn alarm_override(test: &TestServer) {
     )
     .await;
 
-    // The alarm fires two seconds before the start.
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(25);
     while mail_count(test, id).await == 0 {
         assert!(
             Instant::now() < deadline,
@@ -490,10 +492,27 @@ pub async fn alarm_override(test: &TestServer) {
         .and_then(|a| a.address())
         .unwrap_or_default();
     assert_eq!(to, "john@example.com", "recipient is the account address");
-    assert!(
-        !String::from_utf8_lossy(&contents).contains("r15-external"),
-        "the external alarm attendee appears in the email"
-    );
+    // Spec 9: the generic email carries neither the alarm's title nor its
+    // description (`r15-canary-summary`, `r15-canary-description`), nor the
+    // external attendee. The bodies may be transfer-encoded, so check them
+    // decoded; the raw check, last, still covers every header.
+    let subject = message.subject().unwrap_or_default().to_string();
+    let text = message.body_text(0).unwrap_or_default().to_string();
+    let html = message.body_html(0).unwrap_or_default().to_string();
+    let raw = String::from_utf8_lossy(&contents).to_string();
+    for (part, value) in [
+        ("subject", &subject),
+        ("text body", &text),
+        ("html body", &html),
+        ("raw message", &raw),
+    ] {
+        for canary in ["r15-canary", "r15-external"] {
+            assert!(
+                !value.contains(canary),
+                "{canary} appears in the alarm email's {part}: {value}"
+            );
+        }
+    }
 
     test.wait_for_tasks().await;
     client

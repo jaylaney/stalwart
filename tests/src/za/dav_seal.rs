@@ -681,9 +681,12 @@ pub async fn test_collections(test: &mut TestServer) {
         .with_values(["Work displayname-canary"]);
 
     // Time-range REPORT in a calendar with a sealed custom timezone: the
-    // query reads the timezone's rules from the stored record, so a floating
-    // event lands where it does on an ordinary calendar with the same
-    // timezone. 23:00 floating is 04:00Z the next day in US-Eastern (UTC-5
+    // query resolves the calendar timezone by name (here its
+    // X-LIC-LOCATION:America/New_York) from the stored, sealed record, so a
+    // floating event lands where it does on an ordinary calendar with the
+    // same timezone. calcard never reads the STANDARD/DAYLIGHT rules for
+    // this; their visibility is covered by the TZOFFSETFROM dump check
+    // above. 23:00 floating is 04:00Z the next day in US-Eastern (UTC-5
     // in January) and 23:00Z if the timezone were lost.
     //
     // The query first drops events by the range cached at write time, which
@@ -862,12 +865,17 @@ pub async fn test_collections(test: &mut TestServer) {
     assert!(groupware::calendar::seal::archived_event_is_sealed(stored));
     assert_eq!(stored.created.to_native(), 946684800);
     assert_eq!(stored.size.to_native() as usize, EVENT.len());
-    client
-        .propfind(path, ["D:displayname"])
-        .await
+    assert!(stored.display_name.is_none() && stored.dead_properties.0.is_empty());
+    assert!(stored.data.event.to_string().contains("X-ZA-EXTRA:"));
+    let props = client.propfind(path, ["D:displayname", "C:za-dead"]).await;
+    props
         .properties(path)
         .get("D:displayname")
         .with_values(["evtname-canary"]);
+    props
+        .properties(path)
+        .get("za-dead")
+        .with_values(["dead-canary", "[xmlns]:http://calendarserver.org/ns/"]);
 
     // Collection COPY within the account: copied as stored, readable at the
     // new id.
@@ -1051,15 +1059,17 @@ pub async fn test_conditional(test: &mut TestServer) {
         plain.secret(),
         plain.name(),
     );
-    // dav_gate removed plain's default calendar; create it again.
+    // Plain's side runs in a calendar this module owns, so nothing here
+    // depends on whether plain's default calendar exists.
+    let plain_cal = "/dav/cal/plain@example.com/cond/";
     plain_client
-        .request("MKCALENDAR", "/dav/cal/plain@example.com/default", "")
+        .request("MKCALENDAR", plain_cal, "")
         .await
         .with_status(StatusCode::CREATED);
     let mut results = Vec::new();
     for (client, base) in [
         (&key_client, "/dav/cal/key1@example.com/default/"),
-        (&plain_client, "/dav/cal/plain@example.com/default/"),
+        (&plain_client, plain_cal),
     ] {
         let path = format!("{base}cond.ics");
         client
@@ -1081,7 +1091,7 @@ pub async fn test_conditional(test: &mut TestServer) {
     test.wait_for_tasks().await;
     for (client, base) in [
         (&key_client, "/dav/cal/key1@example.com/default/"),
-        (&plain_client, "/dav/cal/plain@example.com/default/"),
+        (&plain_client, plain_cal),
     ] {
         for name in ["cond.ics", "cond-new.ics"] {
             client
@@ -1090,9 +1100,9 @@ pub async fn test_conditional(test: &mut TestServer) {
                 .with_status(StatusCode::NO_CONTENT);
         }
     }
-    // `plain` outlives this module: drop the calendar its PUT created.
+    // `plain` outlives this module: drop the calendar it created above.
     plain_client
-        .request("DELETE", "/dav/cal/plain@example.com/default", "")
+        .request("DELETE", plain_cal, "")
         .await
         .with_status(StatusCode::NO_CONTENT);
 }

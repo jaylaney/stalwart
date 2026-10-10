@@ -367,8 +367,10 @@ pub async fn queued_recipients(test: &TestServer) -> Vec<String> {
 /// Waits until everything the server has queued is delivered. A task that
 /// sends mail (iMIP, alarms) waits for the local SMTP session to accept the
 /// message, so once the task queue is empty every such message is in the
-/// SMTP queue; local delivery ingests it and then removes it. Panics after
-/// ten seconds, naming what is still queued.
+/// SMTP queue; local delivery ingests it and then removes it. The task-queue
+/// waits have no deadline and include tasks not yet due (an alarm scheduled
+/// for later holds them until it fires); only the SMTP-queue poll between
+/// them panics, after ten seconds, naming what is still queued.
 pub async fn wait_for_delivery(test: &TestServer) {
     test.wait_for_tasks().await;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
