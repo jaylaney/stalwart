@@ -97,6 +97,8 @@ pub async fn za_tests() {
     dav_seal::test(&mut test).await;
     dav_seal::test_reports(&mut test).await;
     dav_seal::test_collections(&mut test).await;
+    dav_seal::test_conditional(&mut test).await;
+    dav_seal::test_legacy(&mut test).await;
     tracing::test(&mut test).await;
     expansion::test(&mut test).await;
     gating::test(&mut test).await;

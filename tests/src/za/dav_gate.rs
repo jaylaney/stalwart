@@ -335,6 +335,21 @@ pub async fn test(test: &mut TestServer) {
         )
         .await
         .with_status(StatusCode::OK);
+    // The revocation takes effect at once: key1 can no longer read or write
+    // plain's calendar (403, as for a user who never had a grant).
+    key_client
+        .request("GET", "/dav/cal/plain@example.com/default/x.ics", "")
+        .await
+        .with_status(StatusCode::FORBIDDEN);
+    key_client
+        .request_with_headers(
+            "PUT",
+            "/dav/cal/plain@example.com/default/revoked.ics",
+            [("content-type", "text/calendar")],
+            TEST_ICAL_2,
+        )
+        .await
+        .with_status(StatusCode::FORBIDDEN);
 
     key_client
         .request("DELETE", "/dav/cal/key1@example.com/default/y.ics", "")
