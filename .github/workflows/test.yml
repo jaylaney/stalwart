@@ -86,6 +86,14 @@ jobs:
       - name: Zero-access Tests
         run: cargo test -p tests za::za_tests -- --nocapture
 
+      - name: Zero-access Tests (filesystem blob store)
+        # The leak scanner reads blobs through the configured blob store;
+        # this run keeps blobs outside the data store. The test server wipes
+        # its data directory, blob files included, at start.
+        run: cargo test -p tests za::za_tests -- --nocapture
+        env:
+          BLOB_STORE: FileSystem
+
       - name: CalDAV Tests (plain accounts)
         # Upstream's cal_itip sub-test is timing-flaky (DTSTAMP index
         # mismatch); one rerun keeps it from failing the job. A real

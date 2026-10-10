@@ -28,7 +28,7 @@ use groupware::{
 use hyper::StatusCode;
 use mail_parser::{DateTime, MessageParser};
 use store::{
-    BlobStore, IterateParams, SUBSPACE_ACL, SUBSPACE_BLOB_LINK, SUBSPACE_BLOBS, SUBSPACE_COUNTER,
+    IterateParams, SUBSPACE_ACL, SUBSPACE_BLOB_LINK, SUBSPACE_BLOBS, SUBSPACE_COUNTER,
     SUBSPACE_DELETED_ITEMS, SUBSPACE_DIRECTORY, SUBSPACE_IN_MEMORY_COUNTER,
     SUBSPACE_IN_MEMORY_VALUE, SUBSPACE_INDEXES, SUBSPACE_LOGS, SUBSPACE_PROPERTY,
     SUBSPACE_QUEUE_EVENT, SUBSPACE_QUEUE_MESSAGE, SUBSPACE_QUOTA, SUBSPACE_REGISTRY,
@@ -38,6 +38,7 @@ use store::{
     write::{AlignedBytes, AnyKey, Archive, SearchIndex},
 };
 use types::{
+    blob_hash::BLOB_HASH_LEN,
     collection::{Collection, SyncCollection},
     field::Field,
 };
@@ -296,9 +297,9 @@ fn try_archive(value: &[u8]) -> Option<Archive<AlignedBytes>> {
 /// violations found for `account_id`.
 pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
     let store = test.server.store().clone();
-    let blob_store = BlobStore::Store(store.clone());
     let archive_field = u8::from(Field::ARCHIVE);
     let mut scan = Scan::default();
+    let mut blob_hashes: Vec<Vec<u8>> = Vec::new();
 
     for &subspace in SUBSPACES {
         if subspace == SUBSPACE_SEARCH_INDEX && store.is_pg_or_mysql() {
@@ -326,16 +327,14 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
             find_canaries(&key, &what, "key", &mut scan.violations);
             find_canaries(&value, &what, "raw value", &mut scan.violations);
 
-            // Blobs are stored compressed; decode them the way readers do.
-            if subspace == SUBSPACE_BLOBS
-                && let Some(blob) = blob_store
-                    .get_blob(&key, 0..usize::MAX)
-                    .await
-                    .ok()
-                    .flatten()
-            {
-                scan.blobs += 1;
-                find_canaries(&blob, &what, "decoded blob", &mut scan.violations);
+            // Blob contents are decoded after the walk, through the server's
+            // configured blob store: the data store's own blob subspace, or a
+            // filesystem or S3 store whose blobs only the link records name
+            // (a link key starts with the blob hash).
+            if subspace == SUBSPACE_BLOBS {
+                blob_hashes.push(key.clone());
+            } else if subspace == SUBSPACE_BLOB_LINK && key.len() >= BLOB_HASH_LEN {
+                blob_hashes.push(key[..BLOB_HASH_LEN].to_vec());
             }
 
             // Term keys are hashes of tokens, so a canary never appears in
@@ -400,6 +399,24 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
                         .push(format!("{what}: calendar archive does not decode: {err:?}")),
                 }
             }
+        }
+    }
+
+    // Blobs are stored compressed; decode them the way readers do.
+    blob_hashes.sort_unstable();
+    blob_hashes.dedup();
+    for hash in blob_hashes {
+        if let Some(blob) = test
+            .server
+            .blob_store()
+            .get_blob(&hash, 0..usize::MAX)
+            .await
+            .ok()
+            .flatten()
+        {
+            scan.blobs += 1;
+            let what = format!("blob {hash:?}");
+            find_canaries(&blob, &what, "decoded blob", &mut scan.violations);
         }
     }
 
@@ -654,8 +671,8 @@ pub async fn test(test: &mut TestServer) {
     );
     // Not blind: e.ics, t.ics, alarm.ics and sched.ics (an in-account
     // collection COPY adds a name to each event document instead of
-    // duplicating it), both collections, the alarm email, and its blob (a
-    // blob store split from the data store would leave none to scan).
+    // duplicating it), both collections, the alarm email, and its blob
+    // (read through the configured blob store, so a filesystem store is covered too).
     assert!(result.events >= 4, "{result:?}");
     assert!(result.calendars >= 2, "{result:?}");
     assert!(result.emails >= 1, "the alarm email was not delivered");
