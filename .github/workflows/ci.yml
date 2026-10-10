@@ -105,6 +105,8 @@ jobs:
           push-to-registry: true
 
   linux:
+    # Disabled in this fork: these builds enable the enterprise feature (see issue #25).
+    if: ${{ false }}
     permissions:
       id-token: write
       contents: write
@@ -317,6 +319,8 @@ jobs:
           retention-days: 1
 
   windows:
+    # Disabled in this fork: these builds enable the enterprise feature (see issue #25).
+    if: ${{ false }}
     name: Build / ${{matrix.target}}
     runs-on: windows-latest
     strategy:
@@ -349,6 +353,8 @@ jobs:
           path: artifacts
 
   macos:
+    # Disabled in this fork: these builds enable the enterprise feature (see issue #25).
+    if: ${{ false }}
     name: Build / ${{matrix.target}}
     runs-on: macos-latest
     strategy:
@@ -394,6 +400,8 @@ jobs:
           path: artifacts
 
   freebsd:
+    # Disabled in this fork: these builds enable the enterprise feature (see issue #25).
+    if: ${{ false }}
     name: Build / ${{matrix.target}}
     runs-on: ubuntu-latest
     timeout-minutes: 360
