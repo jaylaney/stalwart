@@ -7,12 +7,18 @@
 //! Key-account variants of copy_move, acl, cal_alarm and cal_scheduling (spec 11).
 
 use super::{TEST_ICAL_1, TEST_ICAL_2};
-use crate::utils::server::TestServer;
+use crate::utils::{
+    server::TestServer,
+    za::{mail_count, wait_for_delivery},
+};
 use calcard::common::timezone::Tz;
 use email::cache::MessageCacheFetch;
-use groupware::scheduling::{
-    ItipTime, ItipValue,
-    format::{DateStyle, TextFormatter},
+use groupware::{
+    calendar::CalendarEvent,
+    scheduling::{
+        ItipTime, ItipValue,
+        format::{DateStyle, TextFormatter},
+    },
 };
 use hyper::StatusCode;
 use mail_parser::{DateTime, MessageParser};
@@ -341,6 +347,7 @@ pub async fn scheduling(test: &TestServer) {
     println!("Running key-account scheduling tests...");
     let john = test.account("john@example.com").webdav_client();
     let jane = test.account("jane@example.com").webdav_client();
+    let jane_mail = mail_count(test, jane.account_id).await;
     let invite = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\nUID:za-sched-1\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990102T090000Z\r\nDTEND:20990102T100000Z\r\nSUMMARY:sched-canary\r\nORGANIZER:mailto:john@example.com\r\nATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:jane@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     let response = john
         .request_with_headers(
@@ -352,7 +359,12 @@ pub async fn scheduling(test: &TestServer) {
         .await
         .with_status(StatusCode::CREATED);
     assert!(response.headers.get("schedule-tag").is_none());
-    test.wait_for_tasks().await;
+    wait_for_delivery(test).await;
+    // Sender side: no iMIP email reached jane's mailbox. Her scheduling inbox
+    // would stay empty even if john's send gate failed, because jane is a key
+    // account whose own ingest gate drops invitations; the mailbox is what
+    // shows john sent nothing.
+    assert_eq!(mail_count(test, jane.account_id).await, jane_mail);
     let inbox = jane
         .request_with_headers(
             "PROPFIND",
@@ -362,7 +374,8 @@ pub async fn scheduling(test: &TestServer) {
         )
         .await
         .with_status(StatusCode::MULTI_STATUS);
-    // hrefs() includes the collection itself, so 1 means nothing was delivered.
+    // hrefs() includes the collection itself, so one href is an empty inbox
+    // (jane's own ingest gate).
     assert_eq!(inbox.hrefs().len(), 1, "{:?}", inbox.hrefs());
     // The event is readable by its owner with attendees intact.
     let body = john
@@ -372,22 +385,26 @@ pub async fn scheduling(test: &TestServer) {
         .body
         .unwrap();
     assert!(body.contains("mailto:jane@example.com") && !body.contains("X-ZA-"));
+    // A CANCEL on DELETE needs a stored schedule tag (`delete_all`); key
+    // accounts never get one. The DELETE gate itself is tested with a
+    // planted event in `za::gating::test_scheduling`.
+    let (archive, _) = crate::za::dav_seal::raw_event(test, john.account_id, "default/s.ics").await;
+    assert!(
+        archive
+            .unarchive::<CalendarEvent>()
+            .unwrap()
+            .schedule_tag
+            .is_none()
+    );
     john.request("DELETE", "/dav/cal/john@example.com/default/s.ics", "")
         .await
         .with_status(StatusCode::NO_CONTENT);
-    test.wait_for_tasks().await;
-    // The CANCEL on DELETE must not be delivered either.
-    let inbox = jane
-        .request_with_headers(
-            "PROPFIND",
-            "/dav/itip/jane@example.com/inbox/",
-            [("depth", "1")],
-            "",
-        )
-        .await
-        .with_status(StatusCode::MULTI_STATUS);
-    assert_eq!(inbox.hrefs().len(), 1, "{:?}", inbox.hrefs());
+    wait_for_delivery(test).await;
+    assert_eq!(mail_count(test, jane.account_id).await, jane_mail);
     john.delete_default_containers().await;
     jane.delete_default_containers().await;
+    // Counting jane's mail created her default mailboxes.
+    test.destroy_all_mailboxes(test.account("jane@example.com"))
+        .await;
     test.assert_is_empty().await;
 }

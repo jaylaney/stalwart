@@ -5,12 +5,21 @@
  */
 
 use crate::utils::{account::Account, http::HttpRequest, server::TestServer};
+use calcard::common::timezone::Tz;
+use common::ipc::CacheInvalidation;
+use email::cache::MessageCacheFetch;
+use groupware::{
+    cache::GroupwareCache,
+    calendar::{CalendarEvent, CalendarEventData},
+};
 use http::auth::authenticate::za_test::{self, Pause};
 use hyper::{Method, StatusCode};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{future::Future, sync::Arc, time::Duration};
+use store::write::BatchBuilder;
 use tokio::task::JoinHandle;
+use types::collection::{Collection, SyncCollection};
 
 /// The suite's HTTPS listener.
 pub const SERVER_URL: &str = "https://127.0.0.1:8899";
@@ -268,4 +277,112 @@ pub async fn park_endpoint(account_id: u32, path: &'static str, body: Value) -> 
         za_post(path, &body).await
     })
     .await
+}
+
+/// Writes `ical` into the store as the event `name` in the account's
+/// calendar `calendar` (a slug such as "default"), bypassing the DAV
+/// handlers and so the seal. Such an event is what a legacy plaintext event
+/// (written before the account held keys) looks like; tests use it to reach
+/// code that sealing otherwise hides. Schedules the event's next email alarm
+/// the way a PUT does. Returns the document id.
+pub async fn plant_event(
+    test: &TestServer,
+    account_id: u32,
+    calendar: &str,
+    name: &str,
+    ical: &str,
+    schedule_tag: Option<u32>,
+) -> u32 {
+    let calendar_id = test
+        .server
+        .fetch_dav_resources(account_id, account_id, SyncCollection::Calendar)
+        .await
+        .unwrap()
+        .by_path(calendar)
+        .unwrap_or_else(|| panic!("calendar {calendar} not found"))
+        .document_id();
+    let size = ical.len() as u32;
+    let ical = match calcard::Parser::new(ical).entry() {
+        calcard::Entry::ICalendar(ical) => ical,
+        other => panic!("{other:?}"),
+    };
+    let mut next_alarm = None;
+    let event = CalendarEvent {
+        names: vec![common::DavName {
+            name: name.into(),
+            parent_id: calendar_id,
+        }],
+        data: CalendarEventData::new(ical, Tz::Floating, 100, &mut next_alarm),
+        size,
+        schedule_tag,
+        ..Default::default()
+    };
+    let account_info = test.server.account_info(account_id).await.unwrap();
+    let document_id = test
+        .server
+        .store()
+        .assign_document_ids(account_id, Collection::CalendarEvent, 1)
+        .await
+        .unwrap();
+    let mut batch = BatchBuilder::new();
+    event
+        .insert(
+            account_info.account_tenant_ids(),
+            account_id,
+            document_id,
+            next_alarm,
+            &mut batch,
+        )
+        .unwrap();
+    test.server.commit_batch(batch).await.unwrap();
+    // A direct store write neither wakes the task manager nor refreshes the
+    // DAV resource cache the way the DAV handlers do.
+    test.server.notify_task_queue();
+    test.server
+        .invalidate_local_caches(&[CacheInvalidation::DavResources(account_id)])
+        .await;
+    document_id
+}
+
+/// Emails in the account's mailboxes.
+pub async fn mail_count(test: &TestServer, account_id: u32) -> usize {
+    test.server
+        .get_cached_messages(account_id)
+        .await
+        .unwrap()
+        .emails
+        .items
+        .len()
+}
+
+/// Recipients of every message still in the SMTP queue.
+pub async fn queued_recipients(test: &TestServer) -> Vec<String> {
+    test.read_queued_messages()
+        .await
+        .iter()
+        .flat_map(|m| m.message.recipients.iter().map(|r| r.address.to_string()))
+        .collect()
+}
+
+/// Waits until everything the server has queued is delivered. A task that
+/// sends mail (iMIP, alarms) waits for the local SMTP session to accept the
+/// message, so once the task queue is empty every such message is in the
+/// SMTP queue; local delivery ingests it and then removes it. Panics after
+/// ten seconds, naming what is still queued.
+pub async fn wait_for_delivery(test: &TestServer) {
+    test.wait_for_tasks().await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let queued = queued_recipients(test).await;
+        if queued.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mail still queued for {queued:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Ingest can queue index tasks of its own.
+    test.wait_for_tasks().await;
 }
