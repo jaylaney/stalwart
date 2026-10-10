@@ -27,6 +27,7 @@ pub mod registry;
 pub mod setup;
 pub mod totp;
 pub mod tracing;
+pub mod websocket;
 
 pub const STRONG: &str = "correct horse battery staple 1";
 
@@ -103,6 +104,7 @@ pub async fn za_tests() {
     expansion::test(&mut test).await;
     gating::test(&mut test).await;
     gating::test_scheduling(&mut test).await;
+    websocket::test(&mut test).await;
     leak::test(&mut test).await;
     leak::test_index_control(&mut test).await;
     index_task::test(&mut test).await;

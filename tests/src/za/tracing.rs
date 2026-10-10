@@ -274,10 +274,10 @@ async fn ws_recv(stream: &mut (impl AsyncReadExt + Unpin)) -> Option<(u8, Vec<u8
     Some((head[0] & 0x0f, payload))
 }
 
-/// Open a JMAP WebSocket, send `message` as one text frame, return the
-/// server's text reply and close the socket. A minimal client, since
-/// `jmap_client` cannot send a malformed message.
-async fn ws_exchange(user: &str, secret: &str, message: &str) -> String {
+pub(super) type WsStream = BufReader<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
+
+/// Open a JMAP WebSocket with Basic credentials.
+pub(super) async fn ws_connect(user: &str, secret: &str) -> WsStream {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let config = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
@@ -314,20 +314,28 @@ async fn ws_exchange(user: &str, secret: &str, message: &str) -> String {
             break;
         }
     }
+    stream
+}
 
-    ws_send(&mut stream, 0x1, message.as_bytes()).await;
+/// Send `message` as one text frame and return the server's text reply,
+/// answering pings meanwhile.
+pub(super) async fn ws_call(stream: &mut WsStream, message: &str) -> String {
+    ws_send(stream, 0x1, message.as_bytes()).await;
     let reply = loop {
-        match ws_recv(&mut stream)
+        match ws_recv(stream)
             .await
             .expect("server hung up before replying")
         {
             (0x1, payload) => break String::from_utf8(payload).unwrap(),
-            (0x9, payload) => ws_send(&mut stream, 0xa, &payload).await,
+            (0x9, payload) => ws_send(stream, 0xa, &payload).await,
             (opcode, _) => panic!("unexpected WebSocket frame {opcode:#x}"),
         }
     };
+    reply
+}
 
-    // Close handshake: wait for the server's close frame, then hang up.
+/// Close handshake: wait for the server's close frame, then hang up.
+pub(super) async fn ws_close(mut stream: WsStream) {
     ws_send(&mut stream, 0x8, &[]).await;
     while let Some((opcode, _)) = ws_recv(&mut stream).await {
         if opcode == 0x8 {
@@ -335,6 +343,15 @@ async fn ws_exchange(user: &str, secret: &str, message: &str) -> String {
         }
     }
     let _ = stream.shutdown().await;
+}
+
+/// Open a JMAP WebSocket, send `message` as one text frame, return the
+/// server's text reply and close the socket. A minimal client, since
+/// `jmap_client` cannot send a malformed message.
+async fn ws_exchange(user: &str, secret: &str, message: &str) -> String {
+    let mut stream = ws_connect(user, secret).await;
+    let reply = ws_call(&mut stream, message).await;
+    ws_close(stream).await;
     reply
 }
 
