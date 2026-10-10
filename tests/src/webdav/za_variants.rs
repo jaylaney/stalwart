@@ -457,11 +457,33 @@ pub async fn alarm_override(test: &TestServer) {
     }
     wait_for_delivery(test).await;
     let messages = test.server.get_cached_messages(id).await.unwrap();
-    assert_eq!(messages.emails.items.len(), 1);
+    assert_eq!(
+        messages.emails.items.len(),
+        1,
+        "exactly one email reached the account"
+    );
     let contents = test
         .fetch_email(id, messages.emails.items[0].document_id)
         .await;
     let message = MessageParser::new().parse(&contents).unwrap();
+    // The email is the alarm itself, not a delivery-failure bounce.
+    let from = message
+        .from()
+        .and_then(|f| f.first())
+        .and_then(|a| a.address())
+        .unwrap_or_default();
+    let alarm_from = test.server.core.groupware.alarms_from_email.as_deref();
+    assert_eq!(
+        from,
+        alarm_from.unwrap_or("calendar-notification@example.com"),
+        "the email is the alarm: {}",
+        String::from_utf8_lossy(&contents)
+    );
+    assert_eq!(
+        message.header_raw("Auto-Submitted").map(str::trim),
+        Some("auto-generated"),
+        "the alarm email is auto-generated"
+    );
     let to = message
         .to()
         .and_then(|t| t.first())
