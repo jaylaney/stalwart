@@ -4,18 +4,21 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::STRONG;
+use super::{STRONG, dav_seal::raw_event};
 use crate::utils::{
     jmap::{JmapResponse, JmapUtils},
     server::TestServer,
     webdav::DummyWebDavClient,
-    za::SERVER_URL,
+    za::{SERVER_URL, mail_count, plant_event, wait_for_delivery},
 };
 use common::auth::oauth::GrantType;
 use dav_proto::schema::property::{DavProperty, PrincipalProperty};
 use groupware::{
     cache::GroupwareCache,
-    calendar::itip::{ItipIngest, RsvpError, RsvpRequest, RsvpResponse},
+    calendar::{
+        CalendarEvent,
+        itip::{ItipIngest, RsvpError, RsvpRequest, RsvpResponse},
+    },
 };
 use hyper::StatusCode;
 use serde_json::{Value, json};
@@ -106,6 +109,25 @@ pub async fn test(test: &mut TestServer) {
         .request("PROPFIND", plain_cal, "")
         .await
         .with_status(StatusCode::MULTI_STATUS);
+    // `CalendarEvent/copy` gates both of its accounts. Here the target is
+    // plain's account, which key1 reaches through the grant above, so only
+    // the source gate (`fromAccountId` is the key account) can refuse it.
+    let response = key1
+        .jmap_method_call(
+            "CalendarEvent/copy",
+            json!({
+                "accountId": plain.id_string(),
+                "fromAccountId": key1.id_string(),
+                "create": {}
+            }),
+        )
+        .await;
+    assert_eq!(
+        method_error(&response),
+        Some("accountNotSupportedByMethod"),
+        "{:?}",
+        response.0
+    );
 
     // Scheduling URLs are not advertised for key accounts.
     let inbox = DavProperty::Principal(PrincipalProperty::ScheduleInboxURL);
@@ -419,16 +441,6 @@ const KEY_INVITE: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nB
 /// Invitation from the non-key account to the key account.
 const PLAIN_INVITE: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\nUID:za-invite-2\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990103T090000Z\r\nDTEND:20990103T100000Z\r\nSUMMARY:invite-canary\r\nORGANIZER:mailto:plain@example.com\r\nATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:key1@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 
-/// Lets iMIP delivery finish: the task manager hands the message to a local
-/// SMTP session, which ingests it outside the task queue (as in
-/// `webdav::cal_scheduling`).
-async fn wait_for_delivery(test: &TestServer) {
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    test.wait_for_tasks().await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    test.wait_for_tasks().await;
-}
-
 /// Hrefs of a depth-1 PROPFIND other than the collection itself.
 async fn members(client: &DummyWebDavClient, href: &str) -> Vec<String> {
     client
@@ -460,6 +472,12 @@ pub async fn test_scheduling(test: &mut TestServer) {
     let key_inbox = "/dav/itip/key1%40example.com/inbox/";
     let plain_cal = "/dav/cal/plain%40example.com/scheduling/";
     let plain_inbox = "/dav/itip/plain%40example.com/inbox/";
+    let plain_id = plain.id().document_id();
+    // Mail counts before anything is sent. iMIP email is delivered to the
+    // recipient's mailbox (mail is not sealed in this release), so a count
+    // that does not move shows the sender sent nothing.
+    let plain_mail = mail_count(test, plain_id).await;
+    let key_mail = mail_count(test, key1_id).await;
 
     // Organizer is a key account: stored, nothing sent, no schedule tag.
     let response = key_client
@@ -477,6 +495,8 @@ pub async fn test_scheduling(test: &mut TestServer) {
         response.headers
     );
     wait_for_delivery(test).await;
+    // Sender side: nothing left the key organizer.
+    assert_eq!(mail_count(test, plain_id).await, plain_mail);
     assert_eq!(
         members(&plain_client, plain_inbox).await,
         Vec::<String>::new()
@@ -530,20 +550,53 @@ pub async fn test_scheduling(test: &mut TestServer) {
         );
     }
 
-    // Deleting the key organizer's event sends no CANCEL.
+    // A CANCEL on DELETE needs a stored schedule tag (`delete_all` in
+    // groupware's calendar storage); a key account's events never get one,
+    // so deleting this one cannot send anything whatever the DELETE gate does.
+    let (archive, _) = raw_event(test, key1_id, "default/invite.ics").await;
+    assert!(
+        archive
+            .unarchive::<CalendarEvent>()
+            .unwrap()
+            .schedule_tag
+            .is_none()
+    );
     key_client
         .request("DELETE", &format!("{key_cal}invite.ics"), "")
         .await
         .with_status(StatusCode::NO_CONTENT);
+
+    // The DELETE gate itself (`send_itip` off for key accounts): a legacy
+    // plaintext event with a schedule tag and a visible attendee is what a
+    // CANCEL can be built from, so only the gate stops one here.
+    plant_event(
+        test,
+        key1_id,
+        "default",
+        "planted-invite.ics",
+        &KEY_INVITE.replace("za-invite-1", "za-invite-planted"),
+        Some(1),
+    )
+    .await;
+    key_client
+        .request("DELETE", &format!("{key_cal}planted-invite.ics"), "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
     wait_for_delivery(test).await;
+    assert_eq!(
+        mail_count(test, plain_id).await,
+        plain_mail,
+        "a CANCEL left the key organizer"
+    );
     assert_eq!(
         members(&plain_client, plain_inbox).await,
         Vec::<String>::new()
     );
 
     // Attendee is a key account: the invitation (and its cancellation) never
-    // reaches its scheduling inbox or calendar. The email itself may land in
-    // its mailbox; mail is not sealed in this release.
+    // reaches its scheduling inbox or calendar. The email itself lands in its
+    // mailbox (mail is not sealed in this release), as the mail-count asserts
+    // below show.
     plain_client
         .request(
             "MKCALENDAR",
@@ -562,22 +615,26 @@ pub async fn test_scheduling(test: &mut TestServer) {
         .await
         .with_status(StatusCode::CREATED);
     wait_for_delivery(test).await;
+    // The invitation email itself was delivered, so the empty inbox and
+    // calendar below are the ingest gate's doing, not timing.
+    assert_eq!(mail_count(test, key1_id).await, key_mail + 1);
     assert_eq!(members(&key_client, key_inbox).await, Vec::<String>::new());
     assert_eq!(members(&key_client, key_cal).await, Vec::<String>::new());
 
     // RSVP from the key attendee on the non-key organizer's page: the
-    // organizer's copy records it, the key attendee's own sealed copy is
-    // left alone.
+    // organizer's copy records it, and the key attendee's own copy is never
+    // rewritten. A copy written through DAV is sealed and shows no ATTENDEE,
+    // so the attendee-copy sync could not match it anyway; a legacy
+    // plaintext copy does match, which makes the attendee-copy gate the only
+    // thing keeping it unchanged.
     let copy = format!("{key_cal}copy.ics");
+    plant_event(test, key1_id, "default", "copy.ics", PLAIN_INVITE, None).await;
     let etag = key_client
-        .request_with_headers("PUT", &copy, [CONTENT_TYPE], PLAIN_INVITE)
+        .request("GET", &copy, "")
         .await
-        .with_status(StatusCode::CREATED)
-        .headers
-        .get("etag")
-        .cloned()
-        .unwrap();
-    let plain_id = plain.id().document_id();
+        .with_status(StatusCode::OK)
+        .etag()
+        .to_string();
     let document_id = test
         .server
         .fetch_dav_resources(plain_id, plain_id, SyncCollection::Calendar)
@@ -629,13 +686,31 @@ pub async fn test_scheduling(test: &mut TestServer) {
         .request("GET", &copy, "")
         .await
         .with_status(StatusCode::OK);
-    assert_eq!(response.headers.get("etag"), Some(&etag));
+    assert_eq!(
+        response.etag(),
+        etag,
+        "the key attendee's copy was rewritten (ETag changed)"
+    );
+    let (archive, _) = raw_event(test, key1_id, "default/copy.ics").await;
+    let stored = archive
+        .unarchive::<CalendarEvent>()
+        .unwrap()
+        .data
+        .event
+        .to_string();
+    assert!(
+        stored.contains("PARTSTAT=NEEDS-ACTION") && !stored.contains("PARTSTAT=ACCEPTED"),
+        "the key attendee's copy was rewritten: {stored}"
+    );
     key_client
         .request("DELETE", &copy, "")
         .await
         .with_status(StatusCode::NO_CONTENT);
-    // The organizer's scheduling inbox holds the reply notification.
-    for member in members(&plain_client, plain_inbox).await {
+    // The RSVP reply reaches the organizer's scheduling inbox directly, not
+    // through the mail queue: exactly one notification.
+    let replies = members(&plain_client, plain_inbox).await;
+    assert_eq!(replies.len(), 1, "{replies:?}");
+    for member in replies {
         plain_client
             .request("DELETE", &member, "")
             .await
@@ -647,10 +722,15 @@ pub async fn test_scheduling(test: &mut TestServer) {
         .await
         .with_status(StatusCode::NO_CONTENT);
     wait_for_delivery(test).await;
+    // The CANCEL email was delivered too; the ingest gate dropped it.
+    assert_eq!(mail_count(test, key1_id).await, key_mail + 2);
     assert_eq!(members(&key_client, key_inbox).await, Vec::<String>::new());
     assert_eq!(members(&key_client, key_cal).await, Vec::<String>::new());
     plain_client
         .request("DELETE", plain_cal, "")
         .await
         .with_status(StatusCode::NO_CONTENT);
+    // Counting `plain`'s mail created its default mailboxes; `plain` outlives
+    // the suite, so remove them for the final emptiness check.
+    test.destroy_all_mailboxes(&plain).await;
 }

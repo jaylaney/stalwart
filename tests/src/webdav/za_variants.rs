@@ -7,15 +7,22 @@
 //! Key-account variants of copy_move, acl, cal_alarm and cal_scheduling (spec 11).
 
 use super::{TEST_ICAL_1, TEST_ICAL_2};
-use crate::utils::server::TestServer;
+use crate::utils::{
+    server::TestServer,
+    za::{mail_count, plant_event, queued_recipients, wait_for_delivery},
+};
 use calcard::common::timezone::Tz;
 use email::cache::MessageCacheFetch;
-use groupware::scheduling::{
-    ItipTime, ItipValue,
-    format::{DateStyle, TextFormatter},
+use groupware::{
+    calendar::CalendarEvent,
+    scheduling::{
+        ItipTime, ItipValue,
+        format::{DateStyle, TextFormatter},
+    },
 };
 use hyper::StatusCode;
 use mail_parser::{DateTime, MessageParser};
+use std::time::{Duration, Instant};
 use store::write::now;
 
 pub async fn copy_move(test: &TestServer) {
@@ -341,6 +348,7 @@ pub async fn scheduling(test: &TestServer) {
     println!("Running key-account scheduling tests...");
     let john = test.account("john@example.com").webdav_client();
     let jane = test.account("jane@example.com").webdav_client();
+    let jane_mail = mail_count(test, jane.account_id).await;
     let invite = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\nUID:za-sched-1\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990102T090000Z\r\nDTEND:20990102T100000Z\r\nSUMMARY:sched-canary\r\nORGANIZER:mailto:john@example.com\r\nATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:jane@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     let response = john
         .request_with_headers(
@@ -352,7 +360,12 @@ pub async fn scheduling(test: &TestServer) {
         .await
         .with_status(StatusCode::CREATED);
     assert!(response.headers.get("schedule-tag").is_none());
-    test.wait_for_tasks().await;
+    wait_for_delivery(test).await;
+    // Sender side: no iMIP email reached jane's mailbox. Her scheduling inbox
+    // would stay empty even if john's send gate failed, because jane is a key
+    // account whose own ingest gate drops invitations; the mailbox is what
+    // shows john sent nothing.
+    assert_eq!(mail_count(test, jane.account_id).await, jane_mail);
     let inbox = jane
         .request_with_headers(
             "PROPFIND",
@@ -362,7 +375,8 @@ pub async fn scheduling(test: &TestServer) {
         )
         .await
         .with_status(StatusCode::MULTI_STATUS);
-    // hrefs() includes the collection itself, so 1 means nothing was delivered.
+    // hrefs() includes the collection itself, so one href is an empty inbox
+    // (jane's own ingest gate).
     assert_eq!(inbox.hrefs().len(), 1, "{:?}", inbox.hrefs());
     // The event is readable by its owner with attendees intact.
     let body = john
@@ -372,22 +386,146 @@ pub async fn scheduling(test: &TestServer) {
         .body
         .unwrap();
     assert!(body.contains("mailto:jane@example.com") && !body.contains("X-ZA-"));
+    // A CANCEL on DELETE needs a stored schedule tag (`delete_all`); key
+    // accounts never get one. The DELETE gate itself is tested with a
+    // planted event in `za::gating::test_scheduling`.
+    let (archive, _) = crate::za::dav_seal::raw_event(test, john.account_id, "default/s.ics").await;
+    assert!(
+        archive
+            .unarchive::<CalendarEvent>()
+            .unwrap()
+            .schedule_tag
+            .is_none()
+    );
     john.request("DELETE", "/dav/cal/john@example.com/default/s.ics", "")
         .await
         .with_status(StatusCode::NO_CONTENT);
-    test.wait_for_tasks().await;
-    // The CANCEL on DELETE must not be delivered either.
-    let inbox = jane
-        .request_with_headers(
-            "PROPFIND",
-            "/dav/itip/jane@example.com/inbox/",
-            [("depth", "1")],
-            "",
-        )
-        .await
-        .with_status(StatusCode::MULTI_STATUS);
-    assert_eq!(inbox.hrefs().len(), 1, "{:?}", inbox.hrefs());
+    wait_for_delivery(test).await;
+    assert_eq!(mail_count(test, jane.account_id).await, jane_mail);
     john.delete_default_containers().await;
     jane.delete_default_containers().await;
+    // Counting jane's mail created her default mailboxes.
+    test.destroy_all_mailboxes(test.account("jane@example.com"))
+        .await;
     test.assert_is_empty().await;
+}
+
+/// A legacy plaintext event whose VALARM names an external recipient.
+const R15_ALARM: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\nBEGIN:VEVENT\r\nUID:za-r15\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:$START\r\nDURATION:PT1H\r\nSUMMARY:r15-canary\r\nBEGIN:VALARM\r\nTRIGGER:-P2S\r\nACTION:EMAIL\r\nATTENDEE:mailto:r15-external@unknown.com\r\nSUMMARY:r15-canary-summary\r\nDESCRIPTION:r15-canary-description\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+/// R15: a key account's alarm email goes to the account's own address even
+/// when the VALARM names an external ATTENDEE and the server allows external
+/// alarm recipients (key mode sets `allow_external_rcpts`). Sealing hides a
+/// VALARM's ATTENDEE in every event written with keys, so only a legacy
+/// plaintext event, planted here, reaches the override in the alarm task.
+pub async fn alarm_override(test: &TestServer) {
+    println!("Running key-account alarm recipient override test...");
+    let account = test.account("john@example.com");
+    let client = account.webdav_client();
+    let id = client.account_id;
+    let cal = "/dav/cal/john%40example.com/r15/";
+    client
+        .request(
+            "MKCALENDAR",
+            cal,
+            "<?xml version=\"1.0\" encoding=\"utf-8\" ?><A:mkcalendar xmlns:D=\"DAV:\" xmlns:A=\"urn:ietf:params:xml:ns:caldav\"/>",
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    // The alarm is scheduled only if its time is still ahead when the event
+    // is written (`next_alarm` drops it otherwise), so leave a wide lead: it
+    // fires eight seconds from now, two seconds before the start.
+    let start = DateTime::from_timestamp(now() as i64 + 10)
+        .to_rfc3339()
+        .replace(['-', ':'], "");
+    plant_event(
+        test,
+        id,
+        "r15",
+        "r15.ics",
+        &R15_ALARM.replace("$START", &start),
+        None,
+    )
+    .await;
+
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while mail_count(test, id).await == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "no alarm email reached the account; queued for {:?}",
+            queued_recipients(test).await
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    wait_for_delivery(test).await;
+    let messages = test.server.get_cached_messages(id).await.unwrap();
+    assert_eq!(
+        messages.emails.items.len(),
+        1,
+        "exactly one email reached the account"
+    );
+    let contents = test
+        .fetch_email(id, messages.emails.items[0].document_id)
+        .await;
+    let message = MessageParser::new().parse(&contents).unwrap();
+    // The email is the alarm itself, not a delivery-failure bounce.
+    let from = message
+        .from()
+        .and_then(|f| f.first())
+        .and_then(|a| a.address())
+        .unwrap_or_default();
+    let alarm_from = test.server.core.groupware.alarms_from_email.as_deref();
+    assert_eq!(
+        from,
+        alarm_from.unwrap_or("calendar-notification@example.com"),
+        "the email is the alarm: {}",
+        String::from_utf8_lossy(&contents)
+    );
+    assert_eq!(
+        message.header_raw("Auto-Submitted").map(str::trim),
+        Some("auto-generated"),
+        "the alarm email is auto-generated"
+    );
+    let to = message
+        .to()
+        .and_then(|t| t.first())
+        .and_then(|a| a.address())
+        .unwrap_or_default();
+    assert_eq!(to, "john@example.com", "recipient is the account address");
+    // Spec 9: the generic email carries neither the alarm's title nor its
+    // description (`r15-canary-summary`, `r15-canary-description`), nor the
+    // external attendee. The bodies may be transfer-encoded, so check them
+    // decoded; the raw check, last, still covers every header.
+    let subject = message.subject().unwrap_or_default().to_string();
+    let text = message.body_text(0).unwrap_or_default().to_string();
+    let html = message.body_html(0).unwrap_or_default().to_string();
+    let raw = String::from_utf8_lossy(&contents).to_string();
+    for (part, value) in [
+        ("subject", &subject),
+        ("text body", &text),
+        ("html body", &html),
+        ("raw message", &raw),
+    ] {
+        for canary in ["r15-canary", "r15-external"] {
+            assert!(
+                !value.contains(canary),
+                "{canary} appears in the alarm email's {part}: {value}"
+            );
+        }
+    }
+
+    test.wait_for_tasks().await;
+    client
+        .request("DELETE", &format!("{cal}r15.ics"), "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    client
+        .request("DELETE", cal, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    // The MKCALENDAR above recreated the default containers that `alarm`
+    // deleted.
+    client.delete_default_containers().await;
+    test.destroy_all_mailboxes(account).await;
+    test.assert_is_empty().await
 }

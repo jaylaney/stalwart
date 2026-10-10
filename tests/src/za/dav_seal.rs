@@ -5,7 +5,7 @@
  */
 
 use super::STRONG;
-use crate::utils::{server::TestServer, webdav::DummyWebDavClient};
+use crate::utils::{server::TestServer, webdav::DummyWebDavClient, za::plant_event};
 use calcard::{Entry, Parser};
 use dav_proto::Depth;
 use dav_proto::schema::property::{DavProperty, WebDavProperty};
@@ -411,6 +411,25 @@ pub async fn test_reports(test: &mut TestServer) {
         .request("GET", path, "")
         .await
         .with_status(StatusCode::INTERNAL_SERVER_ERROR);
+    // HEAD shares GET's handler, and a PUT over an existing event unseals it
+    // to compare: both fail the same way, before any conditional header is
+    // looked at, and the failed PUT leaves the record as it was.
+    let (tampered, _) = raw_event(test, id, "default/report-1.ics").await;
+    client
+        .request("HEAD", path, "")
+        .await
+        .with_status(StatusCode::INTERNAL_SERVER_ERROR);
+    client
+        .request_with_headers(
+            "PUT",
+            path,
+            [CONTENT_TYPE],
+            EVENT.replace("summary-canary", "tampered-put-canary"),
+        )
+        .await
+        .with_status(StatusCode::INTERNAL_SERVER_ERROR);
+    let (after, _) = raw_event(test, id, "default/report-1.ics").await;
+    assert_eq!(after.as_bytes(), tampered.as_bytes(), "a failed PUT wrote");
     let body = client
         .multiget_calendar("/dav/cal/key1@example.com/default/", &[path, other])
         .await
@@ -464,6 +483,27 @@ pub(super) fn mkcalendar_body(props: &[(&str, &str)]) -> String {
     body.push_str("</D:prop></D:set></A:mkcalendar>");
     body
 }
+
+fn time_range_query(start: &str, end: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\" ?><C:calendar-query xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:prop><D:getetag/></D:prop><C:filter><C:comp-filter name=\"VCALENDAR\"><C:comp-filter name=\"VEVENT\"><C:time-range start=\"{start}\" end=\"{end}\"/></C:comp-filter></C:comp-filter></C:filter></C:calendar-query>"
+    )
+}
+
+/// Whether a depth-1 calendar-query on `cal` returns `floating.ics`.
+async fn reports_floating(client: &DummyWebDavClient, cal: &str, query: &str) -> bool {
+    let response = client
+        .request_with_headers("REPORT", cal, [("depth", "1")], query)
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    response
+        .hrefs()
+        .iter()
+        .any(|href| href.ends_with("/floating.ics"))
+}
+
+/// A floating event: 23:00 local on 10 January 2099.
+const FLOATING: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\nBEGIN:VEVENT\r\nUID:za-floating-1\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990110T230000\r\nDTEND:20990110T233000\r\nSUMMARY:floating\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 
 pub async fn test_collections(test: &mut TestServer) {
     println!("Running zero-access collection sealing tests...");
@@ -603,6 +643,117 @@ pub async fn test_collections(test: &mut TestServer) {
         .get("D:displayname")
         .with_values(["Work displayname-canary"]);
 
+    // The cleared values are gone, and the record stays sealed.
+    let gone = client
+        .propfind(cal, ["A:calendar-description", "C:calendar-color"])
+        .await;
+    gone.properties(cal)
+        .get("A:calendar-description")
+        .with_status(StatusCode::NOT_FOUND);
+    gone.properties(cal)
+        .get("calendar-color")
+        .with_status(StatusCode::NOT_FOUND);
+    let archive = raw_calendar(test, id, "work").await;
+    let raw = String::from_utf8_lossy(archive.as_bytes()).to_string();
+    assert!(raw.contains("$za$"), "no collection marker");
+    for canary in collection_canaries {
+        assert!(!raw.contains(canary), "{canary} in the stored collection");
+    }
+
+    // A PROPPATCH that sets only creationdate still writes a sealed bundle.
+    client
+        .proppatch(cal, [("D:creationdate", "2000-01-01T00:00:00Z")], [], [])
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    let archive = raw_calendar(test, id, "work").await;
+    let raw = String::from_utf8_lossy(archive.as_bytes()).to_string();
+    for canary in collection_canaries {
+        assert!(!raw.contains(canary), "{canary} in the stored collection");
+    }
+    let stored = archive.unarchive::<Calendar>().unwrap();
+    assert!(stored.preferences(id).name.starts_with("$za$"));
+    assert_eq!(stored.created.to_native(), 946684800);
+    client
+        .propfind(cal, ["D:displayname"])
+        .await
+        .properties(cal)
+        .get("D:displayname")
+        .with_values(["Work displayname-canary"]);
+
+    // Time-range REPORT in a calendar with a sealed custom timezone: the
+    // query resolves the calendar timezone by name (here its
+    // X-LIC-LOCATION:America/New_York) from the stored, sealed record, so a
+    // floating event lands where it does on an ordinary calendar with the
+    // same timezone. calcard never reads the STANDARD/DAYLIGHT rules for
+    // this; their visibility is covered by the TZOFFSETFROM dump check
+    // above. 23:00 floating is 04:00Z the next day in US-Eastern (UTC-5
+    // in January) and 23:00Z if the timezone were lost.
+    //
+    // The query first drops events by the range cached at write time, which
+    // reads floating times as UTC (23:00Z), before any timezone is applied
+    // (`is_resource_in_time_range`). So the positive window spans both the
+    // cached 23:00Z interval and the Eastern 04:00Z one; the narrow UTC
+    // window passes that prefilter and is then decided by the timezone. A
+    // lost timezone would give (true, true).
+    let plain = test.account("plain@example.com").clone();
+    let plain_client = DummyWebDavClient::new(
+        plain.id().document_id(),
+        plain.name(),
+        plain.secret(),
+        plain.name(),
+    );
+    let plain_cal = "/dav/cal/plain%40example.com/tz/";
+    plain_client
+        .request("MKCALENDAR", plain_cal, mkcalendar_body(&[]))
+        .await
+        .with_status(StatusCode::CREATED);
+    plain_client
+        .proppatch(plain_cal, [("A:calendar-timezone", tz.as_str())], [], [])
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    for (client, cal) in [(&client, cal), (&plain_client, plain_cal)] {
+        client
+            .request_with_headers(
+                "PUT",
+                &format!("{cal}floating.ics"),
+                [CONTENT_TYPE],
+                FLOATING,
+            )
+            .await
+            .with_status(StatusCode::CREATED);
+    }
+    let eastern = time_range_query("20990110T223000Z", "20990111T043000Z");
+    let utc = time_range_query("20990110T223000Z", "20990110T233000Z");
+    let key = (
+        reports_floating(&client, cal, &eastern).await,
+        reports_floating(&client, cal, &utc).await,
+    );
+    let ordinary = (
+        reports_floating(&plain_client, plain_cal, &eastern).await,
+        reports_floating(&plain_client, plain_cal, &utc).await,
+    );
+    println!("time-range REPORT: key={key:?} ordinary={ordinary:?}");
+    assert_eq!(
+        key, ordinary,
+        "the sealed timezone changes time-range results"
+    );
+    assert_eq!(
+        ordinary,
+        (true, false),
+        "the calendar timezone places the event"
+    );
+    test.wait_for_tasks().await;
+    for (client, cal) in [(&client, cal), (&plain_client, plain_cal)] {
+        client
+            .request("DELETE", &format!("{cal}floating.ics"), "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    plain_client
+        .request("DELETE", plain_cal, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+
     // The server-created default calendar: plaintext until the owner first
     // writes a property, sealed afterwards.
     let default = "/dav/cal/key1%40example.com/default/";
@@ -669,6 +820,11 @@ pub async fn test_collections(test: &mut TestServer) {
         );
     }
     let stored = archive.unarchive::<CalendarEvent>().unwrap();
+    assert_eq!(
+        stored.size.to_native() as usize,
+        EVENT.len(),
+        "PROPPATCH keeps the stored size"
+    );
     assert!(stored.display_name.is_none() && stored.dead_properties.0.is_empty());
     assert!(stored.data.event.to_string().contains("X-ZA-EXTRA:"));
     let props = client.propfind(path, ["D:displayname", "C:za-dead"]).await;
@@ -690,6 +846,36 @@ pub async fn test_collections(test: &mut TestServer) {
         !body.contains("X-ZA-") && body.contains("summary-canary"),
         "{body}"
     );
+
+    // A PROPPATCH that sets only creationdate still seals the event, and the
+    // extra properties written above survive it.
+    client
+        .proppatch(path, [("D:creationdate", "2000-01-01T00:00:00Z")], [], [])
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    let (archive, _) = raw_event(test, id, "work/evt.ics").await;
+    let raw = String::from_utf8_lossy(archive.as_bytes()).to_string();
+    for canary in CANARIES.iter().chain(&["evtname-canary", "dead-canary"]) {
+        assert!(
+            !raw.contains(canary),
+            "{canary} leaked into the stored event"
+        );
+    }
+    let stored = archive.unarchive::<CalendarEvent>().unwrap();
+    assert!(groupware::calendar::seal::archived_event_is_sealed(stored));
+    assert_eq!(stored.created.to_native(), 946684800);
+    assert_eq!(stored.size.to_native() as usize, EVENT.len());
+    assert!(stored.display_name.is_none() && stored.dead_properties.0.is_empty());
+    assert!(stored.data.event.to_string().contains("X-ZA-EXTRA:"));
+    let props = client.propfind(path, ["D:displayname", "C:za-dead"]).await;
+    props
+        .properties(path)
+        .get("D:displayname")
+        .with_values(["evtname-canary"]);
+    props
+        .properties(path)
+        .get("za-dead")
+        .with_values(["dead-canary", "[xmlns]:http://calendarserver.org/ns/"]);
 
     // Collection COPY within the account: copied as stored, readable at the
     // new id.
@@ -781,4 +967,240 @@ pub async fn test_collections(test: &mut TestServer) {
             .await
             .with_status(StatusCode::NO_CONTENT);
     }
+}
+
+/// What the conditional cases answer, from code reading of upstream's
+/// `validate_headers`; the plain account is the oracle.
+const CONDITIONAL_EXPECTED: [(&str, StatusCode); 8] = [
+    ("GET If-None-Match current", StatusCode::NOT_MODIFIED),
+    ("GET If-None-Match *", StatusCode::NOT_MODIFIED),
+    ("GET If-Match current", StatusCode::OK),
+    ("GET If-Match stale", StatusCode::PRECONDITION_FAILED),
+    (
+        "PUT If-None-Match * existing",
+        StatusCode::PRECONDITION_FAILED,
+    ),
+    ("PUT If-Match stale", StatusCode::PRECONDITION_FAILED),
+    ("PUT If-Match current", StatusCode::NO_CONTENT),
+    ("PUT If-None-Match * new", StatusCode::CREATED),
+];
+
+/// Runs the conditional cases against `path` (which holds `EVENT`) and a
+/// not-yet-existing `fresh` path; returns each case's status.
+async fn conditional_statuses(
+    client: &DummyWebDavClient,
+    path: &str,
+    fresh: &str,
+) -> Vec<(&'static str, StatusCode)> {
+    let etag = client
+        .request("GET", path, "")
+        .await
+        .with_status(StatusCode::OK)
+        .etag()
+        .to_string();
+    let stale = "\"stale-etag\"";
+    let changed = EVENT.replace("summary-canary", "conditional-canary");
+    let mut out = Vec::new();
+    for (case, header, value) in [
+        ("GET If-None-Match current", "if-none-match", etag.as_str()),
+        ("GET If-None-Match *", "if-none-match", "*"),
+        ("GET If-Match current", "if-match", etag.as_str()),
+        ("GET If-Match stale", "if-match", stale),
+    ] {
+        let status = client
+            .request_with_headers("GET", path, [(header, value)], "")
+            .await
+            .status;
+        out.push((case, status));
+    }
+    for (case, header, value) in [
+        ("PUT If-None-Match * existing", "if-none-match", "*"),
+        ("PUT If-Match stale", "if-match", stale),
+        ("PUT If-Match current", "if-match", etag.as_str()),
+    ] {
+        let status = client
+            .request_with_headers(
+                "PUT",
+                path,
+                [CONTENT_TYPE, (header, value)],
+                changed.clone(),
+            )
+            .await
+            .status;
+        out.push((case, status));
+    }
+    // A UID of its own: a second event with `EVENT`'s UID in the same
+    // calendar is refused (412 no-uid-conflict) before the condition is
+    // looked at.
+    let status = client
+        .request_with_headers(
+            "PUT",
+            fresh,
+            [CONTENT_TYPE, ("if-none-match", "*")],
+            EVENT.replace("za-event-1", "za-cond-new"),
+        )
+        .await
+        .status;
+    out.push(("PUT If-None-Match * new", status));
+    out
+}
+
+/// 304, If-Match and If-None-Match on sealed events answer exactly as on
+/// ordinary ones: they compare against the stored record's ETag.
+pub async fn test_conditional(test: &mut TestServer) {
+    println!("Running zero-access conditional request tests...");
+    let name = "key1@example.com";
+    let id = test.account(name).id().document_id();
+    let key_client = DummyWebDavClient::new(id, name, STRONG, name);
+    let plain = test.account("plain@example.com").clone();
+    let plain_client = DummyWebDavClient::new(
+        plain.id().document_id(),
+        plain.name(),
+        plain.secret(),
+        plain.name(),
+    );
+    // Plain's side runs in a calendar this module owns, so nothing here
+    // depends on whether plain's default calendar exists.
+    let plain_cal = "/dav/cal/plain@example.com/cond/";
+    plain_client
+        .request("MKCALENDAR", plain_cal, "")
+        .await
+        .with_status(StatusCode::CREATED);
+    let mut results = Vec::new();
+    let mut before = Vec::new();
+    for (client, base) in [
+        (&key_client, "/dav/cal/key1@example.com/default/"),
+        (&plain_client, plain_cal),
+    ] {
+        let path = format!("{base}cond.ics");
+        client
+            .request_with_headers("PUT", &path, [CONTENT_TYPE], EVENT)
+            .await
+            .with_status(StatusCode::CREATED);
+        let etag_before = client
+            .request("GET", &path, "")
+            .await
+            .with_status(StatusCode::OK)
+            .etag()
+            .to_string();
+        let bytes_before = if base.contains("key1") {
+            Some(
+                raw_event(test, id, "default/cond.ics")
+                    .await
+                    .0
+                    .as_bytes()
+                    .to_vec(),
+            )
+        } else {
+            None
+        };
+        results.push(conditional_statuses(client, &path, &format!("{base}cond-new.ics")).await);
+
+        // The accepted If-Match PUT stored its edit: the read-back shows it
+        // under a new ETag.
+        let got = client
+            .request("GET", &path, "")
+            .await
+            .with_status(StatusCode::OK);
+        assert_ne!(got.etag(), etag_before, "{base}: ETag unchanged");
+        let body = got.body.unwrap();
+        assert!(body.contains("conditional-canary"), "{base}: {body}");
+        assert!(!body.contains("X-ZA-"), "{base}: {body}");
+        before.push(bytes_before);
+    }
+    assert_eq!(results[0], results[1], "sealed events answer differently");
+    assert_eq!(results[1], CONDITIONAL_EXPECTED.to_vec(), "plain oracle");
+
+    // The stored archive is still sealed, holds no plaintext canary, and is
+    // not the bytes it held before the If-Match write.
+    let (archive, _) = raw_event(test, id, "default/cond.ics").await;
+    assert_ne!(
+        Some(archive.as_bytes().to_vec()),
+        before[0],
+        "stored archive unchanged by the accepted If-Match PUT"
+    );
+    assert!(groupware::calendar::seal::archived_event_is_sealed(
+        archive.unarchive::<CalendarEvent>().unwrap()
+    ));
+    assert!(!String::from_utf8_lossy(archive.as_bytes()).contains("conditional-canary"));
+
+    test.wait_for_tasks().await;
+    for (client, base) in [
+        (&key_client, "/dav/cal/key1@example.com/default/"),
+        (&plain_client, plain_cal),
+    ] {
+        for name in ["cond.ics", "cond-new.ics"] {
+            client
+                .request("DELETE", &format!("{base}{name}"), "")
+                .await
+                .with_status(StatusCode::NO_CONTENT);
+        }
+    }
+    // `plain` outlives this module: drop the calendar it created above.
+    plain_client
+        .request("DELETE", plain_cal, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+}
+
+/// Spec 7: an event stored before the account held keys is read as it is,
+/// and the next write that changes it seals it.
+pub async fn test_legacy(test: &mut TestServer) {
+    println!("Running zero-access legacy event tests...");
+    let name = "key1@example.com";
+    let id = test.account(name).id().document_id();
+    let client = DummyWebDavClient::new(id, name, STRONG, name);
+    let path = "/dav/cal/key1@example.com/default/legacy.ics";
+    let legacy = EVENT.replace("za-event-1", "za-legacy-1");
+    plant_event(test, id, "default", "legacy.ics", &legacy, None).await;
+    let is_sealed = |archive: &Archive<AlignedBytes>| {
+        groupware::calendar::seal::archived_event_is_sealed(
+            archive.unarchive::<CalendarEvent>().unwrap(),
+        )
+    };
+    let (archive, _) = raw_event(test, id, "default/legacy.ics").await;
+    assert!(!is_sealed(&archive));
+
+    let body = client
+        .request("GET", path, "")
+        .await
+        .with_status(StatusCode::OK)
+        .body
+        .unwrap();
+    assert!(!body.contains("X-ZA-"), "{body}");
+    assert_eq!(parse(&body), parse(&legacy), "legacy event read as stored");
+
+    // An unchanged PUT is the no-change shortcut: no write, still plaintext.
+    client
+        .request_with_headers("PUT", path, [CONTENT_TYPE], legacy.clone())
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    let (archive, _) = raw_event(test, id, "default/legacy.ics").await;
+    assert!(!is_sealed(&archive));
+
+    // A changed PUT seals it.
+    let changed = legacy.replace("summary-canary", "legacy-rewritten-canary");
+    client
+        .request_with_headers("PUT", path, [CONTENT_TYPE], changed)
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    let (archive, _) = raw_event(test, id, "default/legacy.ics").await;
+    assert!(is_sealed(&archive));
+    let raw = String::from_utf8_lossy(archive.as_bytes()).to_string();
+    for canary in CANARIES.iter().chain(&["legacy-rewritten-canary"]) {
+        assert!(!raw.contains(canary), "{canary} left in the clear");
+    }
+    let body = client
+        .request("GET", path, "")
+        .await
+        .with_status(StatusCode::OK)
+        .body
+        .unwrap();
+    assert!(body.contains("legacy-rewritten-canary") && !body.contains("X-ZA-"));
+
+    test.wait_for_tasks().await;
+    client
+        .request("DELETE", path, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
 }

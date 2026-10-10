@@ -243,16 +243,25 @@ Security and robustness:
 
 Tests worth adding:
 
-- The scheduling outbox free-busy `Withheld` path (needs an outbox POST).
-- An OAuth Bearer request to a key account's calendar without keys (no
-  helper in the tests crate; the Task 5 re-review left it open).
-- Revocation asserted in the cross-account grant test; tampered-event 500 on
-  GET, HEAD and PUT; read of a legacy plaintext event followed by a sealing
-  write; 304, `If-Match` and `If-None-Match: *` cases on sealed events.
-- Removal of description and colour on a sealed collection; a
+- **Unreachable, no test (plan 7)** The scheduling outbox free-busy `Withheld` path.
+  The outbox refuses a key attendee with 3.7 before free-busy is built
+  (`crates/dav/src/calendar/scheduling.rs:375-385`), and a free-busy REPORT
+  without the account's keys is refused by the URI gate
+  (`crates/dav/src/common/uri.rs:105-115`). `ZaFreeBusy::Withheld` stays as
+  defence in depth.
+- **Closed (plan 7)** An OAuth Bearer request to a key account's calendar without keys (no
+  helper in the tests crate; the Task 5 re-review left it open). Bearer case
+  in `tests/src/za/dav_gate.rs`.
+- **Closed (plan 7)** Revocation asserted in the cross-account grant test (`dav_gate.rs`, after
+  the grant is dropped); tampered-event 500 on
+  GET, HEAD and PUT (`dav_seal::test_reports`); read of a legacy plaintext
+  event followed by a sealing write (`dav_seal::test_legacy`); 304,
+  `If-Match` and `If-None-Match: *` cases on sealed events
+  (`dav_seal::test_conditional`, with a plain account as the oracle).
+- **Closed (plan 7)** Removal of description and colour on a sealed collection; a
   creationdate-only PROPPATCH staying sealed; event PROPPATCH leaving
   the stored `size` unchanged; `tz()` of a sealed custom timezone in a
-  time-range REPORT.
+  time-range REPORT. All in `dav_seal::test_collections`.
 - Whether a key account's quota returns to baseline after a sealed
   collection is deleted (unasserted).
 - Policy tests for UID on VALARM, VTIMEZONE, VCALENDAR, STANDARD and

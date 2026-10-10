@@ -9,6 +9,7 @@ use crate::{
     utils::{server::TestServer, webdav::DummyWebDavClient},
     webdav::{TEST_ICAL_1, TEST_ICAL_2},
 };
+use common::auth::oauth::GrantType;
 use hyper::StatusCode;
 
 const CALENDAR_QUERY: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
@@ -92,6 +93,69 @@ pub async fn test(test: &mut TestServer) {
         .with_status(StatusCode::MULTI_STATUS);
     admin_client
         .request("PROPFIND", "/dav/pal/key1@example.com/", "")
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    // OAuth Bearer for the key account itself: the token is valid (the
+    // address book answers) but carries no keys, so calendar paths refuse
+    // it (spec 4.2). Minted in-process: it is the token the server issues at
+    // the end of an OAuth flow, and the tests crate has no OAuth client.
+    let token = test
+        .server
+        .encode_access_token(
+            GrantType::AccessToken,
+            key1_id,
+            "key1@example.com",
+            3600,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut bearer_client =
+        DummyWebDavClient::new(key1_id, "key1@example.com", STRONG, "key1@example.com");
+    bearer_client.credentials = format!("Bearer {token}");
+    bearer_client
+        .request("PROPFIND", "/dav/card/key1@example.com/", "")
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    for path in [
+        "/dav/cal/key1@example.com/",
+        "/dav/cal/key1@example.com/default/",
+        "/dav/itip/key1@example.com/",
+    ] {
+        bearer_client
+            .request("PROPFIND", path, "")
+            .await
+            .with_status(StatusCode::FORBIDDEN);
+    }
+    bearer_client
+        .request_with_headers(
+            "REPORT",
+            "/dav/cal/key1@example.com/default/",
+            [("depth", "1")],
+            CALENDAR_QUERY,
+        )
+        .await
+        .with_status(StatusCode::FORBIDDEN);
+    // Control: a Bearer token of the non-key account reads its own calendars.
+    let plain_id = plain.id().document_id();
+    let token = test
+        .server
+        .encode_access_token(
+            GrantType::AccessToken,
+            plain_id,
+            plain.name(),
+            3600,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut plain_bearer =
+        DummyWebDavClient::new(plain_id, plain.name(), plain.secret(), plain.name());
+    plain_bearer.credentials = format!("Bearer {token}");
+    plain_bearer
+        .request("PROPFIND", "/dav/cal/plain@example.com/", "")
         .await
         .with_status(StatusCode::MULTI_STATUS);
     // Another user without any grant: 403 (as upstream), unchanged.
@@ -271,6 +335,21 @@ pub async fn test(test: &mut TestServer) {
         )
         .await
         .with_status(StatusCode::OK);
+    // The revocation takes effect at once: key1 can no longer read or write
+    // plain's calendar (403, as for a user who never had a grant).
+    key_client
+        .request("GET", "/dav/cal/plain@example.com/default/x.ics", "")
+        .await
+        .with_status(StatusCode::FORBIDDEN);
+    key_client
+        .request_with_headers(
+            "PUT",
+            "/dav/cal/plain@example.com/default/revoked.ics",
+            [("content-type", "text/calendar")],
+            TEST_ICAL_2,
+        )
+        .await
+        .with_status(StatusCode::FORBIDDEN);
 
     key_client
         .request("DELETE", "/dav/cal/key1@example.com/default/y.ics", "")
