@@ -263,7 +263,9 @@ revision 7 had already decided the OPTIONS fail-open, the anonymous rate
 limit on an unparseable OPTIONS header and the check-then-commit window; they
 are marked **Decided (revision 7)**. The sole-default-calendar decision (spec
 4.1) has no bullet of its own here. **No action (plan 5)** marks a finding
-that records no hole to fix.
+that records no hole to fix. Plan 6
+(`docs/superpowers/plans/2026-10-10-zero-access-6-index-and-traces.md`,
+2026-10-10) closed the items marked **Closed (plan 6)**.
 
 Security and robustness:
 
@@ -292,7 +294,7 @@ Security and robustness:
   fail loudly if they drift.
 - **Closed (plan 5)** A destroyed account's pending index task has no regression test; the
   `try_account` fix (R8) is covered only by the plain-mode suites.
-- `RuleExpansionError` reasons still carry calcard error strings (RRULE is
+- **Closed (plan 6)** `RuleExpansionError` reasons still carry calcard error strings (RRULE is
   visible) and the `query.rs` trace carries no account or document id.
 - **Closed (plan 5)** Account lookups: `acl.rs` and `scheduling.rs` use `account()` where every
   other gate uses `try_account`; four inline gates in JMAP and three in
@@ -300,14 +302,14 @@ Security and robustness:
 - **No action (plan 5)** The gates in Task 2 key off the authenticated account
   (`scheduling_account_info`); a plain writer into a key calendar is stopped by
   Task 1 and plan 2's gate.
-- R8's fall-through can index a destroyed key account's sealed archive:
+- **Closed (plan 6)** R8's fall-through can index a destroyed key account's sealed archive:
   if a calendar index task runs after the registry delete but before
   `DestroyAccount` removes the data, the key-account gate sees no account
   and the builder indexes the sealed tree, which exposes only visible
   metadata. `DestroyAccount` unindexes calendars before destroying the
   data, so a write landing in between leaves an orphan search entry. The
   window is milliseconds after a PUT in the product build; no test can
-  open it deterministically. A fix would skip sealed archives in
+  open it deterministically. Plan 6 skips sealed archives in
   `build_calendar_document`.
 
 Tests:
@@ -402,7 +404,8 @@ noted):
 - `crates/groupware/src/calendar/itip.rs`: `ItipSendStatus::KeyAccount`,
   `http_rsvp_handle` (InvalidLink) and `http_rsvp_attendee_copy`.
 - `crates/email/src/message/ingest.rs`: the iMIP ingest condition.
-- `crates/services/src/task_manager/index.rs`: `build_calendar_document`.
+- `crates/services/src/task_manager/index.rs`: `build_calendar_document`
+  (key-account gate; sealed-archive check, plan 6).
 - `crates/services/src/task_manager/alarm.rs`: generic alarm clearing.
 - `crates/jmap/src/api/request.rs`: `za_assert_calendar_allowed` in the Get,
   Query and Set arms of Calendar, CalendarEvent, CalendarEventNotification,

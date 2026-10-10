@@ -228,11 +228,12 @@ impl CalendarUpdateRequestHandler for Server {
                 .caused_by(trc::location!())?;
             let old_ical = new_event.data.event;
             new_event.size = bytes.len() as u32;
-            new_event.data = CalendarEventData::new(
+            new_event.data = CalendarEventData::new_for(
                 ical,
                 Tz::Floating,
                 self.core.groupware.max_ical_instances,
                 &mut next_email_alarm,
+                za_keys.is_some(),
             );
 
             // Scheduling
@@ -415,11 +416,12 @@ impl CalendarUpdateRequestHandler for Server {
                     name: name.to_string(),
                     parent_id: parent.document_id(),
                 }],
-                data: CalendarEventData::new(
+                data: CalendarEventData::new_for(
                     ical,
                     Tz::Floating,
                     self.core.groupware.max_ical_instances,
                     &mut next_email_alarm,
+                    za_keys.is_some(),
                 ),
                 size: bytes.len() as u32,
                 ..Default::default()

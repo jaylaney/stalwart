@@ -11,7 +11,10 @@ use super::{
 use crate::calendar::{ComponentTimeRange, alarm::CalendarAlarmType};
 use calcard::{
     common::timezone::Tz,
-    icalendar::{ICalendar, ICalendarComponentType, dates::TimeOrDelta},
+    icalendar::{
+        ICalendar, ICalendarComponentType,
+        dates::{CalendarErrorType, TimeOrDelta},
+    },
 };
 use compact_str::ToCompactString;
 use indexmap::IndexMap;
@@ -28,6 +31,19 @@ impl CalendarEventData {
         default_tz: Tz,
         max_expansions: usize,
         next_email_alarm: &mut Option<CalendarAlarm>,
+    ) -> Self {
+        Self::new_for(ical, default_tz, max_expansions, next_email_alarm, false)
+    }
+
+    /// `new`, except that for a key account the rule-expansion trace names
+    /// each error's kind instead of calcard's text, which quotes RRULE values
+    /// (spec 10, "Traces").
+    pub fn new_for(
+        ical: ICalendar,
+        default_tz: Tz,
+        max_expansions: usize,
+        next_email_alarm: &mut Option<CalendarAlarm>,
+        key_account: bool,
     ) -> Self {
         let mut ranges = TimeRanges::default();
         let now = now() as i64;
@@ -179,7 +195,13 @@ impl CalendarEventData {
                 Reason = expanded
                     .errors
                     .into_iter()
-                    .map(|e| e.error.to_compact_string())
+                    .map(|e| {
+                        if key_account {
+                            za_expansion_reason(&e.error).to_compact_string()
+                        } else {
+                            e.error.to_compact_string()
+                        }
+                    })
                     .collect::<Vec<_>>(),
                 Details = ical.uids().next().unwrap_or_default().to_string(),
                 Limit = max_expansions,
@@ -284,6 +306,18 @@ impl Timezone {
     }
 }
 
+/// The kind of a rule-expansion error without calcard's values; the same
+/// words calcard prints, minus the RRULE detail.
+fn za_expansion_reason(error: &CalendarErrorType) -> &'static str {
+    match error {
+        CalendarErrorType::MissingDtStart => "Missing DTSTART property",
+        CalendarErrorType::InvalidDtStart => "Invalid DTSTART property",
+        CalendarErrorType::InvalidDtEnd => "Invalid DTEND property",
+        CalendarErrorType::InvalidDuration => "Invalid DURATION property",
+        CalendarErrorType::RRule(_) => "RRule error",
+    }
+}
+
 impl ArchivedTimezone {
     pub fn tz(&self) -> Option<Tz> {
         match self {
@@ -294,5 +328,37 @@ impl ArchivedTimezone {
                 .next(),
             ArchivedTimezone::Default => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::za_expansion_reason;
+
+    #[test]
+    fn za_expansion_reason_is_static() {
+        use calcard::icalendar::dates::CalendarErrorType;
+        assert_eq!(
+            za_expansion_reason(&CalendarErrorType::MissingDtStart),
+            "Missing DTSTART property"
+        );
+        assert_eq!(
+            za_expansion_reason(&CalendarErrorType::InvalidDtStart),
+            "Invalid DTSTART property"
+        );
+        assert_eq!(
+            za_expansion_reason(&CalendarErrorType::InvalidDtEnd),
+            "Invalid DTEND property"
+        );
+        assert_eq!(
+            za_expansion_reason(&CalendarErrorType::InvalidDuration),
+            "Invalid DURATION property"
+        );
+        assert_eq!(
+            za_expansion_reason(&CalendarErrorType::RRule(
+                calcard::datecalc::error::RRuleError::IterError("UNTIL=20200101T000000Z".into())
+            )),
+            "RRule error"
+        );
     }
 }

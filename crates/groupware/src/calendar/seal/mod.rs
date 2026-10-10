@@ -14,5 +14,5 @@ pub mod tree;
 pub use collection::{
     COLLECTION_MARKER, calendar_is_sealed, seal_calendar, unseal_calendar, unseal_calendar_archive,
 };
-pub use event::{seal_event, unseal_event, unseal_event_archive};
+pub use event::{archived_event_is_sealed, seal_event, unseal_event, unseal_event_archive};
 pub use tree::{SealError, seal_error, tree_has_carriers};

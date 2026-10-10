@@ -130,6 +130,8 @@ pub async fn test(test: &mut TestServer) {
             .await
             .with_status(StatusCode::CREATED);
     }
+    // (UID, account id, document id) of each broken event
+    let mut broken = Vec::new();
     for (who, id, client, cal, name) in &clients {
         client
             .request_with_headers(
@@ -149,6 +151,7 @@ pub async fn test(test: &mut TestServer) {
             .by_path(&format!("{name}/broken-{who}.ics"))
             .unwrap()
             .document_id();
+        broken.push((format!("za-chrono-{who}"), *id, document_id));
         break_time_ranges(test, *id, document_id).await;
         client
             .request_with_headers("REPORT", cal, [("depth", "1")], TIME_RANGE_QUERY)
@@ -157,13 +160,15 @@ pub async fn test(test: &mut TestServer) {
     }
 
     tokio::time::sleep(Duration::from_millis(500)).await;
-    // (details, reason strings, every string of the event)
-    let mut captured: Vec<(String, Vec<String>, String)> = Vec::new();
+    // (details, reason strings, every string of the event, account id, document id)
+    let mut captured: Vec<(String, Vec<String>, String, Option<u64>, Option<u64>)> = Vec::new();
     while let Ok(batch) = rx.try_recv() {
         for event in batch {
             let mut details = String::new();
             let mut reason = Vec::new();
             let mut all = Vec::new();
+            let mut account_id = None;
+            let mut document_id = None;
             for (key, value) in event.keys.iter() {
                 strings(value, &mut all);
                 match key {
@@ -173,10 +178,20 @@ pub async fn test(test: &mut TestServer) {
                         details = d.join("");
                     }
                     Key::Reason => strings(value, &mut reason),
+                    Key::AccountId => {
+                        if let trc::Value::UInt(v) = value {
+                            account_id = Some(*v);
+                        }
+                    }
+                    Key::DocumentId => {
+                        if let trc::Value::UInt(v) = value {
+                            document_id = Some(*v);
+                        }
+                    }
                     _ => {}
                 }
             }
-            captured.push((details, reason, all.join("\n")));
+            captured.push((details, reason, all.join("\n"), account_id, document_id));
         }
     }
     Collector::remove_subscriber(SUBSCRIBER_ID.into());
@@ -194,20 +209,36 @@ pub async fn test(test: &mut TestServer) {
             "no rule-expansion trace with UID {uid}: {dump}"
         );
     }
-    for (details, reason, _) in &captured {
+    for (details, reason, _, account_id, document_id) in &captured {
         if details.starts_with("za-chrono-") {
             assert!(
                 reason.iter().any(|s| s == "chrono error"),
                 "unexpected chrono reason: {dump}"
             );
-        } else if details.starts_with("za-rrule-") {
+            let (_, expected_account, expected_document) = broken
+                .iter()
+                .find(|(uid, ..)| uid == details)
+                .expect("broken event");
+            assert_eq!(
+                *account_id,
+                Some(*expected_account as u64),
+                "chrono account id: {dump}"
+            );
+            assert_eq!(
+                *document_id,
+                Some(*expected_document as u64),
+                "chrono document id: {dump}"
+            );
+        } else if details == "za-rrule-key" {
+            assert_eq!(reason, &["RRule error".to_string()], "key reason: {dump}");
+        } else if details == "za-rrule-plain" {
             assert!(
-                !reason.is_empty() && reason.iter().all(|s| !s.is_empty()),
-                "empty rrule reason: {dump}"
+                reason.iter().any(|s| s.contains("Until date")),
+                "plain reason must stay upstream's text: {dump}"
             );
         }
     }
-    for (_, _, all) in &captured {
+    for (_, _, all, ..) in &captured {
         for forbidden in [
             SUMMARY_CANARY,
             DESCRIPTION_CANARY,

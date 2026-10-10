@@ -17,9 +17,9 @@ use super::tree::{
     EXTRA_PROP, KEY_PROP, SealError, entry_text, has_stray_carriers, is_carrier, open_archive,
     open_key_envelope, seal_bytes, seal_key_envelope, seal_tree, text_entry, unseal_tree,
 };
-use crate::calendar::CalendarEvent;
+use crate::calendar::{ArchivedCalendarEvent, CalendarEvent};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use calcard::icalendar::ICalendarComponentType;
+use calcard::icalendar::{ArchivedICalendarProperty, ICalendarComponentType};
 use store::{
     Deserialize, Serialize,
     write::{AlignedBytes, Archive, Archiver},
@@ -66,6 +66,7 @@ fn uid_of(event: &CalendarEvent) -> String {
 }
 
 /// True if the VCALENDAR root's last entry is a key envelope.
+/// `archived_event_is_sealed` is the same check on the stored archive.
 pub(crate) fn is_sealed(event: &CalendarEvent) -> bool {
     event
         .data
@@ -74,6 +75,22 @@ pub(crate) fn is_sealed(event: &CalendarEvent) -> bool {
         .first()
         .and_then(|root| root.entries.last())
         .is_some_and(|e| is_carrier(e, KEY_PROP))
+}
+
+/// `is_sealed` on the stored archive, for readers that never deserialize
+/// it (the index builder). It must stay the same predicate as `is_sealed`
+/// and `tree::is_carrier`.
+pub fn archived_event_is_sealed(event: &ArchivedCalendarEvent) -> bool {
+    event
+        .data
+        .event
+        .components
+        .first()
+        .and_then(|root| root.entries.last())
+        .is_some_and(|e| {
+            matches!(&e.name, ArchivedICalendarProperty::Other(n)
+                if n.as_str().eq_ignore_ascii_case(KEY_PROP))
+        })
 }
 
 /// Seals an event immediately before the store write (spec 8.1). Time
@@ -487,5 +504,44 @@ mod tests {
                 .contains("secret summary canary")
         );
         assert!(!String::from_utf8_lossy(stored.as_bytes()).contains("canary"));
+    }
+
+    #[test]
+    fn archived_seal_check_matches_is_sealed() {
+        let plain = event();
+        let stored = archive(&plain);
+        assert!(!archived_event_is_sealed(
+            stored.unarchive::<CalendarEvent>().unwrap()
+        ));
+
+        let mut sealed = event();
+        seal_event(&mut sealed, &keys(), 9).unwrap();
+        assert!(is_sealed(&sealed));
+        let stored = archive(&sealed);
+        assert!(archived_event_is_sealed(
+            stored.unarchive::<CalendarEvent>().unwrap()
+        ));
+    }
+
+    #[test]
+    fn archived_seal_check_needs_key_carrier_last() {
+        // Any case of the name and any text value count as a carrier.
+        let mut last = event();
+        root_entries(&mut last).push(text_entry("x-za-key", "anything".into()));
+        assert!(is_sealed(&last));
+        let stored = archive(&last);
+        assert!(archived_event_is_sealed(
+            stored.unarchive::<CalendarEvent>().unwrap()
+        ));
+
+        // A carrier followed by any other entry is not last, so not sealed.
+        let mut not_last = event();
+        root_entries(&mut not_last).push(text_entry(KEY_PROP, "anything".into()));
+        root_entries(&mut not_last).push(text_entry("X-OTHER", "value".into()));
+        assert!(!is_sealed(&not_last));
+        let stored = archive(&not_last);
+        assert!(!archived_event_is_sealed(
+            stored.unarchive::<CalendarEvent>().unwrap()
+        ));
     }
 }

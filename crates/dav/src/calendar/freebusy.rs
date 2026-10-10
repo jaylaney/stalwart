@@ -224,8 +224,14 @@ impl CalendarFreebusyRequestHandler for Server {
                     continue;
                 }
 
-                let events =
-                    CalendarQueryHandler::new(event, Some(range), default_tz).into_expanded_times();
+                let events = CalendarQueryHandler::new(
+                    event,
+                    Some(range),
+                    default_tz,
+                    account_id,
+                    document_id,
+                )
+                .into_expanded_times();
 
                 if events.is_empty() {
                     continue;
