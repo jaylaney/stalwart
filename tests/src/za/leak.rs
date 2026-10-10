@@ -406,17 +406,24 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
     blob_hashes.sort_unstable();
     blob_hashes.dedup();
     for hash in blob_hashes {
-        if let Some(blob) = test
+        let what = format!("blob {hash:?}");
+        // A link record can briefly outlive its blob around purge, so a
+        // missing blob stays silent; a blob that fails to read or
+        // decompress must not go unscanned unnoticed.
+        match test
             .server
             .blob_store()
             .get_blob(&hash, 0..usize::MAX)
             .await
-            .ok()
-            .flatten()
         {
-            scan.blobs += 1;
-            let what = format!("blob {hash:?}");
-            find_canaries(&blob, &what, "decoded blob", &mut scan.violations);
+            Ok(Some(blob)) => {
+                scan.blobs += 1;
+                find_canaries(&blob, &what, "decoded blob", &mut scan.violations);
+            }
+            Ok(None) => {}
+            Err(err) => scan
+                .violations
+                .push(format!("{what}: blob does not decode: {err:?}")),
         }
     }
 
@@ -672,7 +679,8 @@ pub async fn test(test: &mut TestServer) {
     // Not blind: e.ics, t.ics, alarm.ics and sched.ics (an in-account
     // collection COPY adds a name to each event document instead of
     // duplicating it), both collections, the alarm email, and its blob
-    // (read through the configured blob store, so a filesystem store is covered too).
+    // (read through the configured blob store, so a filesystem store is
+    // covered too).
     assert!(result.events >= 4, "{result:?}");
     assert!(result.calendars >= 2, "{result:?}");
     assert!(result.emails >= 1, "the alarm email was not delivered");
