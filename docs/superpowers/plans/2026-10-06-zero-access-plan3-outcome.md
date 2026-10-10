@@ -294,7 +294,7 @@ Security and robustness:
   fail loudly if they drift.
 - **Closed (plan 5)** A destroyed account's pending index task has no regression test; the
   `try_account` fix (R8) is covered only by the plain-mode suites.
-- `RuleExpansionError` reasons still carry calcard error strings (RRULE is
+- **Closed (plan 6)** `RuleExpansionError` reasons still carry calcard error strings (RRULE is
   visible) and the `query.rs` trace carries no account or document id.
 - **Closed (plan 5)** Account lookups: `acl.rs` and `scheduling.rs` use `account()` where every
   other gate uses `try_account`; four inline gates in JMAP and three in

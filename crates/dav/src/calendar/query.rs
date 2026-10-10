@@ -222,6 +222,8 @@ impl CalendarQueryHandler {
         event: &ArchivedCalendarEvent,
         max_time_range: Option<TimeRange>,
         default_tz: Tz,
+        account_id: u32,
+        document_id: u32,
     ) -> Self {
         Self {
             default_tz,
@@ -234,6 +236,8 @@ impl CalendarQueryHandler {
                             trc::event!(
                                 Calendar(trc::CalendarEvent::RuleExpansionError),
                                 Reason = "chrono error",
+                                AccountId = account_id,
+                                DocumentId = document_id,
                                 Details = event
                                     .data
                                     .event

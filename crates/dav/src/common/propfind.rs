@@ -513,8 +513,13 @@ impl PropFindRequestHandler for Server {
                         } else {
                             Tz::UTC
                         };
-                        let mut query_handler =
-                            CalendarQueryHandler::new(event.inner, *max_time_range, default_tz);
+                        let mut query_handler = CalendarQueryHandler::new(
+                            event.inner,
+                            *max_time_range,
+                            default_tz,
+                            account_id,
+                            document_id,
+                        );
                         if !query_handler.filter(event.inner, filter) {
                             continue;
                         }
@@ -1027,7 +1032,13 @@ impl PropFindRequestHandler for Server {
                             if calendar_filter.is_some() || !data.properties.is_empty() {
                                 if let Some(ical) = calendar_filter
                                     .get_or_insert_with(|| {
-                                        CalendarQueryHandler::new(event.inner, None, Tz::UTC)
+                                        CalendarQueryHandler::new(
+                                            event.inner,
+                                            None,
+                                            Tz::UTC,
+                                            account_id,
+                                            document_id,
+                                        )
                                     })
                                     .serialize_ical(event.inner, data, &mut ical_instances_limit)
                                 {
