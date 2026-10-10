@@ -20,7 +20,7 @@ use registry::schema::{
 };
 use std::time::Duration;
 use store::{
-    Serialize, ValueKey,
+    Deserialize, Serialize, ValueKey,
     write::{AlignedBytes, Archive, Archiver, BatchBuilder},
 };
 use types::{
@@ -85,12 +85,15 @@ pub async fn test(test: &mut TestServer) {
 /// after the key-account check (the account was destroyed in between)
 /// must not index it. The window cannot be opened on demand, so the test
 /// plants a key account's sealed archive under a plain account, which the
-/// key-account check lets through, and schedules its index task.
+/// key-account check lets through, and schedules its index task. A
+/// control copy without the trailing `X-ZA-KEY` is planted beside it and
+/// must be indexed, so the test cannot pass with calendar indexing off.
 pub async fn test_sealed_archive(test: &mut TestServer) {
     println!("Running zero-access sealed-archive index test...");
     const KEY: &str = "key10@example.com";
     const PLAIN: &str = "plain10@example.com";
     const PLANTED: u32 = u32::MAX - 3;
+    const CONTROL: u32 = u32::MAX - 4;
     let admin = test.account("admin@example.com").clone();
     let key = admin
         .create_key_user_account(KEY, STRONG, "Key Ten", &[], user_permissions())
@@ -134,22 +137,69 @@ pub async fn test_sealed_archive(test: &mut TestServer) {
     assert!(archived_event_is_sealed(
         sealed.unarchive::<CalendarEvent>().unwrap()
     ));
-    let sealed = Archiver::new(sealed.deserialize::<CalendarEvent>().unwrap())
-        .serialize()
-        .unwrap();
+    let sealed_event = sealed.deserialize::<CalendarEvent>().unwrap();
+    let sealed = Archiver::new(sealed_event.clone()).serialize().unwrap();
 
-    // Plant it under the plain account, which the key-account check lets
-    // through, and index it.
+    // The control: the same event without the root's trailing X-ZA-KEY.
+    let mut control_event = sealed_event;
+    control_event.data.event.components[0].entries.pop();
+    let control = Archiver::new(control_event).serialize().unwrap();
+    assert!(!archived_event_is_sealed(
+        <Archive<AlignedBytes> as Deserialize>::deserialize(&control)
+            .unwrap()
+            .unarchive::<CalendarEvent>()
+            .unwrap()
+    ));
+
+    // Plant both under the plain account, which the key-account check lets
+    // through, and index them.
     let class = ValueKey::archive(plain_id, Collection::CalendarEvent, PLANTED).class;
+    let control_class = ValueKey::archive(plain_id, Collection::CalendarEvent, CONTROL).class;
     let mut batch = BatchBuilder::new();
     batch
         .with_account_id(plain_id)
         .with_collection(Collection::CalendarEvent)
         .with_document(PLANTED)
-        .set(class.clone(), sealed);
-    batch.schedule_task(Task::IndexDocument(TaskIndexDocument {
+        .set(class.clone(), sealed)
+        .with_document(CONTROL)
+        .set(control_class.clone(), control);
+    for document_id in [PLANTED, CONTROL] {
+        batch.schedule_task(Task::IndexDocument(TaskIndexDocument {
+            account_id: Id::from(plain_id),
+            document_id: Id::from(document_id),
+            document_type: IndexDocumentType::Calendar,
+            status: TaskStatus::now(),
+        }));
+    }
+    test.server.store().write(batch.build_all()).await.unwrap();
+    test.server.notify_task_queue();
+    tokio::time::timeout(Duration::from_secs(60), test.wait_for_tasks())
+        .await
+        .expect("the planted index tasks must drain");
+
+    let violations = super::leak::scan(test, plain_id).await.violations;
+    assert!(
+        calendar_entries_of(&violations, CONTROL) > 0,
+        "the control document was not indexed: {violations:?}"
+    );
+    assert_eq!(
+        calendar_entries_of(&violations, PLANTED),
+        0,
+        "the sealed document was indexed: {violations:?}"
+    );
+
+    // Clear both plants and the control's index entries.
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(plain_id)
+        .with_collection(Collection::CalendarEvent)
+        .with_document(PLANTED)
+        .clear(class)
+        .with_document(CONTROL)
+        .clear(control_class);
+    batch.schedule_task(Task::UnindexDocument(TaskIndexDocument {
         account_id: Id::from(plain_id),
-        document_id: Id::from(PLANTED),
+        document_id: Id::from(CONTROL),
         document_type: IndexDocumentType::Calendar,
         status: TaskStatus::now(),
     }));
@@ -157,24 +207,25 @@ pub async fn test_sealed_archive(test: &mut TestServer) {
     test.server.notify_task_queue();
     tokio::time::timeout(Duration::from_secs(60), test.wait_for_tasks())
         .await
-        .expect("the planted index task must drain");
+        .expect("the control unindex task must drain");
+    let violations = super::leak::scan(test, plain_id).await.violations;
+    assert_eq!(
+        calendar_entries_of(&violations, CONTROL),
+        0,
+        "the control document was not unindexed: {violations:?}"
+    );
 
-    let calendar_entries = super::leak::scan(test, plain_id)
-        .await
-        .violations
-        .into_iter()
-        .filter(|v| v.ends_with("calendar search index entry of the account"))
-        .collect::<Vec<_>>();
-    assert!(calendar_entries.is_empty(), "{calendar_entries:?}");
-
-    let mut batch = BatchBuilder::new();
-    batch
-        .with_account_id(plain_id)
-        .with_collection(Collection::CalendarEvent)
-        .with_document(PLANTED)
-        .clear(class);
-    test.server.store().write(batch.build_all()).await.unwrap();
     admin.destroy_account(key).await;
     admin.destroy_account(plain).await;
     test.wait_for_tasks().await;
+}
+
+/// Calendar search-index entries that `leak::scan` flagged for one document.
+/// Every account-scoped search-index key ends with the document id (u32 BE,
+/// `store/src/write/key.rs`), and the violation text prints the key as a
+/// byte list followed by the reason.
+fn calendar_entries_of(violations: &[String], document_id: u32) -> usize {
+    let [a, b, c, d] = document_id.to_be_bytes();
+    let suffix = format!(", {a}, {b}, {c}, {d}]: calendar search index entry of the account");
+    violations.iter().filter(|v| v.ends_with(&suffix)).count()
 }

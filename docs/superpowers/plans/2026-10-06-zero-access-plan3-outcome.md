@@ -309,7 +309,7 @@ Security and robustness:
   metadata. `DestroyAccount` unindexes calendars before destroying the
   data, so a write landing in between leaves an orphan search entry. The
   window is milliseconds after a PUT in the product build; no test can
-  open it deterministically. A fix would skip sealed archives in
+  open it deterministically. Plan 6 skips sealed archives in
   `build_calendar_document`.
 
 Tests:
@@ -404,7 +404,8 @@ noted):
 - `crates/groupware/src/calendar/itip.rs`: `ItipSendStatus::KeyAccount`,
   `http_rsvp_handle` (InvalidLink) and `http_rsvp_attendee_copy`.
 - `crates/email/src/message/ingest.rs`: the iMIP ingest condition.
-- `crates/services/src/task_manager/index.rs`: `build_calendar_document`.
+- `crates/services/src/task_manager/index.rs`: `build_calendar_document`
+  (key-account gate; sealed-archive check, plan 6).
 - `crates/services/src/task_manager/alarm.rs`: generic alarm clearing.
 - `crates/jmap/src/api/request.rs`: `za_assert_calendar_allowed` in the Get,
   Query and Set arms of Calendar, CalendarEvent, CalendarEventNotification,

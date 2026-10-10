@@ -513,7 +513,8 @@ async fn build_calendar_document(
                 .unarchive::<CalendarEvent>()
                 .caused_by(trc::location!())?;
             // Spec 9: a sealed archive has nothing to index. Reached when the
-            // account was destroyed after the key-account check (plan 3 R8).
+            // account was destroyed after the key-account check (plan 3 R8), or
+            // for a plain event whose root ends with a client-written X-ZA-KEY.
             if archived_event_is_sealed(event) {
                 return Ok(BuildResult::NotIndexed);
             }

@@ -66,6 +66,7 @@ fn uid_of(event: &CalendarEvent) -> String {
 }
 
 /// True if the VCALENDAR root's last entry is a key envelope.
+/// `archived_event_is_sealed` is the same check on the stored archive.
 pub(crate) fn is_sealed(event: &CalendarEvent) -> bool {
     event
         .data
@@ -77,7 +78,8 @@ pub(crate) fn is_sealed(event: &CalendarEvent) -> bool {
 }
 
 /// `is_sealed` on the stored archive, for readers that never deserialize
-/// it (the index builder).
+/// it (the index builder). It must stay the same predicate as `is_sealed`
+/// and `tree::is_carrier`.
 pub fn archived_event_is_sealed(event: &ArchivedCalendarEvent) -> bool {
     event
         .data
@@ -517,6 +519,28 @@ mod tests {
         assert!(is_sealed(&sealed));
         let stored = archive(&sealed);
         assert!(archived_event_is_sealed(
+            stored.unarchive::<CalendarEvent>().unwrap()
+        ));
+    }
+
+    #[test]
+    fn archived_seal_check_needs_key_carrier_last() {
+        // Any case of the name and any text value count as a carrier.
+        let mut last = event();
+        root_entries(&mut last).push(text_entry("x-za-key", "anything".into()));
+        assert!(is_sealed(&last));
+        let stored = archive(&last);
+        assert!(archived_event_is_sealed(
+            stored.unarchive::<CalendarEvent>().unwrap()
+        ));
+
+        // A carrier followed by any other entry is not last, so not sealed.
+        let mut not_last = event();
+        root_entries(&mut not_last).push(text_entry(KEY_PROP, "anything".into()));
+        root_entries(&mut not_last).push(text_entry("X-OTHER", "value".into()));
+        assert!(!is_sealed(&not_last));
+        let stored = archive(&not_last);
+        assert!(!archived_event_is_sealed(
             stored.unarchive::<CalendarEvent>().unwrap()
         ));
     }
