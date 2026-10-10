@@ -484,6 +484,27 @@ pub(super) fn mkcalendar_body(props: &[(&str, &str)]) -> String {
     body
 }
 
+fn time_range_query(start: &str, end: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\" ?><C:calendar-query xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:prop><D:getetag/></D:prop><C:filter><C:comp-filter name=\"VCALENDAR\"><C:comp-filter name=\"VEVENT\"><C:time-range start=\"{start}\" end=\"{end}\"/></C:comp-filter></C:comp-filter></C:filter></C:calendar-query>"
+    )
+}
+
+/// Whether a depth-1 calendar-query on `cal` returns `floating.ics`.
+async fn reports_floating(client: &DummyWebDavClient, cal: &str, query: &str) -> bool {
+    let response = client
+        .request_with_headers("REPORT", cal, [("depth", "1")], query)
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    response
+        .hrefs()
+        .iter()
+        .any(|href| href.ends_with("/floating.ics"))
+}
+
+/// A floating event: 23:00 local on 10 January 2099.
+const FLOATING: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\nBEGIN:VEVENT\r\nUID:za-floating-1\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990110T230000\r\nDTEND:20990110T233000\r\nSUMMARY:floating\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
 pub async fn test_collections(test: &mut TestServer) {
     println!("Running zero-access collection sealing tests...");
     let name = "key1@example.com";
@@ -622,6 +643,114 @@ pub async fn test_collections(test: &mut TestServer) {
         .get("D:displayname")
         .with_values(["Work displayname-canary"]);
 
+    // The cleared values are gone, and the record stays sealed.
+    let gone = client
+        .propfind(cal, ["A:calendar-description", "C:calendar-color"])
+        .await;
+    gone.properties(cal)
+        .get("A:calendar-description")
+        .with_status(StatusCode::NOT_FOUND);
+    gone.properties(cal)
+        .get("calendar-color")
+        .with_status(StatusCode::NOT_FOUND);
+    let archive = raw_calendar(test, id, "work").await;
+    let raw = String::from_utf8_lossy(archive.as_bytes()).to_string();
+    assert!(raw.contains("$za$"), "no collection marker");
+    for canary in collection_canaries {
+        assert!(!raw.contains(canary), "{canary} in the stored collection");
+    }
+
+    // A PROPPATCH that sets only creationdate still writes a sealed bundle.
+    client
+        .proppatch(cal, [("D:creationdate", "2000-01-01T00:00:00Z")], [], [])
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    let archive = raw_calendar(test, id, "work").await;
+    let raw = String::from_utf8_lossy(archive.as_bytes()).to_string();
+    for canary in collection_canaries {
+        assert!(!raw.contains(canary), "{canary} in the stored collection");
+    }
+    let stored = archive.unarchive::<Calendar>().unwrap();
+    assert!(stored.preferences(id).name.starts_with("$za$"));
+    assert_eq!(stored.created.to_native(), 946684800);
+    client
+        .propfind(cal, ["D:displayname"])
+        .await
+        .properties(cal)
+        .get("D:displayname")
+        .with_values(["Work displayname-canary"]);
+
+    // Time-range REPORT in a calendar with a sealed custom timezone: the
+    // query reads the timezone's rules from the stored record, so a floating
+    // event lands where it does on an ordinary calendar with the same
+    // timezone. 23:00 floating is 04:00Z the next day in US-Eastern (UTC-5
+    // in January) and 23:00Z if the timezone were lost.
+    //
+    // The query first drops events by the range cached at write time, which
+    // reads floating times as UTC (23:00Z), before any timezone is applied
+    // (`is_resource_in_time_range`). So the positive window spans both the
+    // cached 23:00Z interval and the Eastern 04:00Z one; the narrow UTC
+    // window passes that prefilter and is then decided by the timezone. A
+    // lost timezone would give (true, true).
+    let plain = test.account("plain@example.com").clone();
+    let plain_client = DummyWebDavClient::new(
+        plain.id().document_id(),
+        plain.name(),
+        plain.secret(),
+        plain.name(),
+    );
+    let plain_cal = "/dav/cal/plain%40example.com/tz/";
+    plain_client
+        .request("MKCALENDAR", plain_cal, mkcalendar_body(&[]))
+        .await
+        .with_status(StatusCode::CREATED);
+    plain_client
+        .proppatch(plain_cal, [("A:calendar-timezone", tz.as_str())], [], [])
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    for (client, cal) in [(&client, cal), (&plain_client, plain_cal)] {
+        client
+            .request_with_headers(
+                "PUT",
+                &format!("{cal}floating.ics"),
+                [CONTENT_TYPE],
+                FLOATING,
+            )
+            .await
+            .with_status(StatusCode::CREATED);
+    }
+    let eastern = time_range_query("20990110T223000Z", "20990111T043000Z");
+    let utc = time_range_query("20990110T223000Z", "20990110T233000Z");
+    let key = (
+        reports_floating(&client, cal, &eastern).await,
+        reports_floating(&client, cal, &utc).await,
+    );
+    let ordinary = (
+        reports_floating(&plain_client, plain_cal, &eastern).await,
+        reports_floating(&plain_client, plain_cal, &utc).await,
+    );
+    println!("time-range REPORT: key={key:?} ordinary={ordinary:?}");
+    assert_eq!(
+        key, ordinary,
+        "the sealed timezone changes time-range results"
+    );
+    assert_eq!(
+        ordinary,
+        (true, false),
+        "the calendar timezone places the event"
+    );
+    test.wait_for_tasks().await;
+    for (client, cal) in [(&client, cal), (&plain_client, plain_cal)] {
+        client
+            .request("DELETE", &format!("{cal}floating.ics"), "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    plain_client
+        .request("DELETE", plain_cal, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+
     // The server-created default calendar: plaintext until the owner first
     // writes a property, sealed afterwards.
     let default = "/dav/cal/key1%40example.com/default/";
@@ -688,6 +817,11 @@ pub async fn test_collections(test: &mut TestServer) {
         );
     }
     let stored = archive.unarchive::<CalendarEvent>().unwrap();
+    assert_eq!(
+        stored.size.to_native() as usize,
+        EVENT.len(),
+        "PROPPATCH keeps the stored size"
+    );
     assert!(stored.display_name.is_none() && stored.dead_properties.0.is_empty());
     assert!(stored.data.event.to_string().contains("X-ZA-EXTRA:"));
     let props = client.propfind(path, ["D:displayname", "C:za-dead"]).await;
@@ -709,6 +843,31 @@ pub async fn test_collections(test: &mut TestServer) {
         !body.contains("X-ZA-") && body.contains("summary-canary"),
         "{body}"
     );
+
+    // A PROPPATCH that sets only creationdate still seals the event, and the
+    // extra properties written above survive it.
+    client
+        .proppatch(path, [("D:creationdate", "2000-01-01T00:00:00Z")], [], [])
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    let (archive, _) = raw_event(test, id, "work/evt.ics").await;
+    let raw = String::from_utf8_lossy(archive.as_bytes()).to_string();
+    for canary in CANARIES.iter().chain(&["evtname-canary", "dead-canary"]) {
+        assert!(
+            !raw.contains(canary),
+            "{canary} leaked into the stored event"
+        );
+    }
+    let stored = archive.unarchive::<CalendarEvent>().unwrap();
+    assert!(groupware::calendar::seal::archived_event_is_sealed(stored));
+    assert_eq!(stored.created.to_native(), 946684800);
+    assert_eq!(stored.size.to_native() as usize, EVENT.len());
+    client
+        .propfind(path, ["D:displayname"])
+        .await
+        .properties(path)
+        .get("D:displayname")
+        .with_values(["evtname-canary"]);
 
     // Collection COPY within the account: copied as stored, readable at the
     // new id.
