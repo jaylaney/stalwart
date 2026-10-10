@@ -243,7 +243,7 @@ Security and robustness:
 
 Tests worth adding:
 
-- **Unreachable, no test (plan 7)** The scheduling outbox free-busy `Withheld` path (needs an outbox POST).
+- **Unreachable, no test (plan 7)** The scheduling outbox free-busy `Withheld` path.
   The outbox refuses a key attendee with 3.7 before free-busy is built
   (`crates/dav/src/calendar/scheduling.rs:375-385`), and a free-busy REPORT
   without the account's keys is refused by the URI gate

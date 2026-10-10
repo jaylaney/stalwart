@@ -295,7 +295,8 @@ Security and robustness:
   store; with an FS or S3 blob store only mail reachable through
   `fetch_email` is decoded. Plan 7 decodes every blob the walk finds a
   record or link for through the configured blob store (`scan` in
-  `tests/src/za/leak.rs`); a blob that fails to read is a violation, and CI
+  `tests/src/za/leak.rs`); a blob that fails to read or decompress is a
+  violation (a missing blob, with no file, is skipped), and CI
   runs `za_tests` a second time with `BLOB_STORE=FileSystem`. S3 stays
   covered only by that code path, since no CI step runs it, and on a
   filesystem store an orphan blob with no link record is not scanned. The archive marker bits are mirrored from private
@@ -363,7 +364,8 @@ Tests:
   task-queue channel is scanned both before and after the drain, but the
   alarm email assertion does not prove the alarm fired for the right reason;
   silent blob decode failures are not asserted (**closed, plan 7**: a blob that
-  fails to read is a violation); the fixed `SUBSPACES` list
+  fails to read or decompress is a violation; a missing blob, with no file, is
+  skipped); the fixed `SUBSPACES` list
   needs updating whenever upstream adds a subspace; allprop PROPFIND may omit
   `calendar-timezone`; CI step ordering is now behind the `style` job only.
 - Final review "can stay": no trace-event test for the removed trace
@@ -434,21 +436,27 @@ failure bounce, which is addressed to john and also carries
 | M5 | DELETE `send_itip`, `crates/dav/src/calendar/delete.rs:81` | the `is_key_account` line deleted | `gating.rs:586`: planted DELETE, "a CANCEL left the key organizer" (left 1, right 0) | passed: a key account's events carry no schedule tag, so no CANCEL can be built |
 | M6 | `ItipSendStatus::KeyAccount`, `crates/groupware/src/calendar/itip.rs:1075` | `} else if false && account_info...` | `tests/src/za/tracing.rs:721`: "plain-account scheduling reason not traced on both PUT paths" (left 4, right 2): the key account's PUTs now trace upstream's reasons. `tracing` runs before `gating`. | `za_variants.rs:362` (`scheduling`): `response.headers.get("schedule-tag").is_none()` |
 | M6b | as M6 | M6's edit, with the two schedule-tag assertions (`gating.rs:492-496`, `za_variants.rs:362`) and `tracing.rs:721-725` commented out for the run | `gating.rs:499`: `mail_count(test, plain_id) == plain_mail` after the key organizer's PUT (left 1, right 0) | `za_variants.rs:368`: `mail_count(jane) == jane_mail` after john's PUT (left 1, right 0) |
-| M7 | RSVP attendee copy, `crates/groupware/src/calendar/itip.rs:667` | `if false && server` | `gating.rs:688`: the copy's ETag changed after plain's RSVP. With that assertion disabled, `:696-699` fails with "the key attendee's copy was rewritten" (Task 1's red run). | passed: john sends no RSVP |
-| M8 | iMIP ingest, `crates/email/src/message/ingest.rs:367` | `&& !account.is_key_account()` deleted | `gating.rs:620`: key1's scheduling inbox holds `inbox/1.ics` after plain's invitation | passed: john sends nothing |
-| M9 | Generic alarm, `crates/services/src/task_manager/alarm.rs:473` | `let generic = false;` | passed: no alarm fires in `za_tests` | `za_variants.rs:316` (`alarm`): "organizer row present in the generic alarm email" |
-| M10 | Alarm recipient, `alarm.rs:541` | `rcpt_to = None;` deleted | passed | `za_variants.rs:476` (`alarm_override`): "the email is the alarm", From `MAILER-DAEMON@example.org` (the bounce of the alarm sent to the external attendee) |
+| M7 | RSVP attendee copy, `crates/groupware/src/calendar/itip.rs:667` | `if false && server` | `gating.rs:689`: the copy's ETag changed after plain's RSVP ("the key attendee's copy was rewritten (ETag changed)"). With that assertion disabled, `:701-704` fails with "the key attendee's copy was rewritten" (Task 1's red run). | passed: john sends no RSVP |
+| M8 | iMIP ingest, `crates/email/src/message/ingest.rs:367` | `&& !account.is_key_account()` deleted | `gating.rs:621`: key1's scheduling inbox holds `inbox/1.ics` after plain's invitation | passed: john sends nothing |
+| M9 | Generic alarm, `crates/services/src/task_manager/alarm.rs:473` | `let generic = false;` | passed: key2's `alarm.ics` alarm fires in `leak`, but the event is sealed, so the full template has no canary text to print, and `leak` checks canaries, not the template's shape | `za_variants.rs:316` (`alarm`): "organizer row present in the generic alarm email" |
+| M10 | Alarm recipient, `alarm.rs:541` | `rcpt_to = None;` deleted | passed: the only alarm (key2's `alarm.ics` in `leak`) names key2's own address in its VALARM ATTENDEE, and sealing hides that ATTENDEE anyway, so the override changes nothing | `za_variants.rs:478` (`alarm_override`): "the email is the alarm", From `MAILER-DAEMON@example.org` (the bounce of the alarm sent to the external attendee) |
 | M11 | Schedule URLs hidden, `crates/dav/src/principal/propfind.rs:312` | `if false && account.is_key_account()` | `gating.rs:143`: key1's `schedule-inbox-URL`, "Expected status 404 Not Found, but got 200 OK" | `tests/src/webdav/principals.rs:139`: the same property of a key principal, same message |
 | M12 | OPTIONS header, `crates/http/src/request.rs:341` | `if false && za_is_key_account_request(...)` | `tracing.rs:707`: "OPTIONS authentication failure not reported" (with the check skipped, OPTIONS no longer authenticates the credential) | `tests/src/webdav/basic.rs:19`: "Header dav:1, 2, 3, access-control, extended-mkcol, calendar-access, calendar-no-timezone, addressbook not found." |
 | M13 | Copy source, `crates/jmap/src/api/request.rs:648` | the `from_account_id` line deleted | `gating.rs:125`: `CalendarEvent/copy` answered, left `None`, right `Some("accountNotSupportedByMethod")` | passed: the variants make no JMAP call |
 | M14 | Bearer on key calendars | M4's edit, with `dav_gate.rs:65-78` (master-user and admin PROPFINDs) commented out for the run | `dav_gate.rs:129`: the Bearer PROPFIND loop, "Expected 403 Forbidden but got 207 Multi-Status" | passed (as M4) |
+| M15 | Generic alarm title, `alarm.rs:539` | `summary = None;` deleted | not run: no plaintext alarm in `za_tests` (key2's `alarm.ics` is sealed, so its VALARM has no SUMMARY to print) | `za_variants.rs:510` (`alarm_override`): "r15-canary appears in the alarm email's text body", the decoded text showing "You have an upcoming event r15-canary-summary" (the VALARM's SUMMARY, so the title clearing, not `description = None;` at `:540`, is what the run removed) |
 
 Every gate fails at least one suite, so no gap needed a new test or a
-"layered behind" ruling. The key-mode variants miss M3, M4, M5, M7, M8 and
-M13 because they never send the request that reaches the gate (no keyless
-client, no schedule tag, no RSVP, no iMIP, no JMAP); `za_tests` covers each.
+"layered behind" ruling. The key-mode variants miss M3, M4, M5, M7, M8, M13
+and M14 because they never send the request that reaches the gate (no keyless
+client, no schedule tag, no RSVP, no iMIP, no JMAP, no Bearer token);
+`za_tests` covers each.
 M6b shows the sender-side mail counts catch a key organizer that sends, apart
 from the schedule-tag assertions that fire first.
+M15 comes from the plan 7 final-review fix wave, which made `alarm_override`
+check the decoded subject and bodies for the VALARM's title and description;
+only a plaintext legacy event reaches that clearing, so `za_tests` cannot
+fail it.
 
 The red runs recorded earlier are not repeated here: the outbox free-busy
 loop, the availability gate (R4), the OPTIONS and `Principal/get` runs, and
