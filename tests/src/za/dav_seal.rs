@@ -1067,6 +1067,7 @@ pub async fn test_conditional(test: &mut TestServer) {
         .await
         .with_status(StatusCode::CREATED);
     let mut results = Vec::new();
+    let mut before = Vec::new();
     for (client, base) in [
         (&key_client, "/dav/cal/key1@example.com/default/"),
         (&plain_client, plain_cal),
@@ -1076,13 +1077,48 @@ pub async fn test_conditional(test: &mut TestServer) {
             .request_with_headers("PUT", &path, [CONTENT_TYPE], EVENT)
             .await
             .with_status(StatusCode::CREATED);
+        let etag_before = client
+            .request("GET", &path, "")
+            .await
+            .with_status(StatusCode::OK)
+            .etag()
+            .to_string();
+        let bytes_before = if base.contains("key1") {
+            Some(
+                raw_event(test, id, "default/cond.ics")
+                    .await
+                    .0
+                    .as_bytes()
+                    .to_vec(),
+            )
+        } else {
+            None
+        };
         results.push(conditional_statuses(client, &path, &format!("{base}cond-new.ics")).await);
+
+        // The accepted If-Match PUT stored its edit: the read-back shows it
+        // under a new ETag.
+        let got = client
+            .request("GET", &path, "")
+            .await
+            .with_status(StatusCode::OK);
+        assert_ne!(got.etag(), etag_before, "{base}: ETag unchanged");
+        let body = got.body.unwrap();
+        assert!(body.contains("conditional-canary"), "{base}: {body}");
+        assert!(!body.contains("X-ZA-"), "{base}: {body}");
+        before.push(bytes_before);
     }
     assert_eq!(results[0], results[1], "sealed events answer differently");
     assert_eq!(results[1], CONDITIONAL_EXPECTED.to_vec(), "plain oracle");
 
-    // The If-Match write was a real write: sealed, with a fresh envelope.
+    // The stored archive is still sealed, holds no plaintext canary, and is
+    // not the bytes it held before the If-Match write.
     let (archive, _) = raw_event(test, id, "default/cond.ics").await;
+    assert_ne!(
+        Some(archive.as_bytes().to_vec()),
+        before[0],
+        "stored archive unchanged by the accepted If-Match PUT"
+    );
     assert!(groupware::calendar::seal::archived_event_is_sealed(
         archive.unarchive::<CalendarEvent>().unwrap()
     ));
