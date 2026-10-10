@@ -9,6 +9,8 @@ permissions:
 
 jobs:
   auto-close:
+    # Disabled in this fork so project backlog issues stay open.
+    if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
       - name: Close issues from non-allowed authors
