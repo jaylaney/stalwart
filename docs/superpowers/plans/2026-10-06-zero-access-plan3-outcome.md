@@ -113,7 +113,11 @@ JMAP (Task 1):
   exact assertions (P5); WebSocket and EventSource needed no code, because
   `websocket/stream.rs:98` calls the same `handle_jmap_request` and
   EventSource carries state strings only (P8, confirmed by Task 1 and its
-  reviewer).
+  reviewer). The key-account check runs per method call, not per
+  connection: every calendar method looks the account up live
+  (`za_assert_calendar_allowed`, `crates/jmap/src/api/request.rs:735-743`),
+  so a socket opened before its account became a key account is refused on
+  its next calendar call. `tests/src/za/websocket.rs` pins this (plan 7).
 - Test details: `sinceState` is `"n"`, not `"0"` (the latter fails parsing
   before any gate); principal hrefs are percent-encoded.
 - Key-mode `principals` (Task 4 supplement): upstream's `principals.rs`
@@ -287,9 +291,14 @@ Security and robustness:
   closes it in practice.
 - **Closed (plan 5)** `ItipMessageError` is logged on every key-account PUT (static reason, no
   content, but trace noise).
-- Blob decode in the leak scanner works only when the blob store is the data
+- **Closed (plan 7)** Blob decode in the leak scanner works only when the blob store is the data
   store; with an FS or S3 blob store only mail reachable through
-  `fetch_email` is decoded. The archive marker bits are mirrored from private
+  `fetch_email` is decoded. Plan 7 decodes every blob the walk finds a
+  record or link for through the configured blob store (`scan` in
+  `tests/src/za/leak.rs`); a blob that fails to read is a violation, and CI
+  runs `za_tests` a second time with `BLOB_STORE=FileSystem`. S3 stays
+  covered only by that code path, since no CI step runs it, and on a
+  filesystem store an orphan blob with no link record is not scanned. The archive marker bits are mirrored from private
   constants in `store/src/write/serialize.rs`; the event and calendar counters
   fail loudly if they drift.
 - **Closed (plan 5)** A destroyed account's pending index task has no regression test; the
@@ -317,21 +326,34 @@ Tests:
 - **Closed (plan 5)** The `zero-access` CI job's plain-mode `webdav_tests` step has no retry for
   the known `cal_itip` flake, so CI will go red intermittently until that
   sub-test is fixed or retried.
-- The post-DELETE CANCEL checks in `za_variants::scheduling` and
+- **Closed (plan 7)** The post-DELETE CANCEL checks in `za_variants::scheduling` and
   `gating::test_scheduling` are smoke checks: key accounts never get a
   schedule tag, so they cannot fail. The scheduling variant asserts that
-  jane's itip inbox holds one href, which is only the collection.
-- Negative inbox assertions rely on fixed sleeps (about 700 ms, upstream's
+  jane's itip inbox holds one href, which is only the collection. Plan 7:
+  `gating::test_scheduling` deletes a planted plaintext event that carries a
+  schedule tag (`plant_event`, `tests/src/utils/za.rs`) and asserts no
+  CANCEL reaches plain's mailbox (M5 fails it); both tests now assert the
+  stored event has no schedule tag, the variant's comment points to the
+  planted-event test, and a comment says why its inbox holds one href.
+- **Closed (plan 7)** Negative inbox assertions rely on fixed sleeps (about 700 ms, upstream's
   pattern); the cleanup loop in `test_scheduling` asserts nothing; the ETag
-  check's comment overstates what it covers.
+  check's comment overstates what it covers. Plan 7: `wait_for_delivery`
+  (`tests/src/utils/za.rs`) waits until the SMTP queue is empty, and the
+  sender and recipient mailbox counts make the negative checks fail when
+  mail is sent (M6b); the loop asserts exactly one reply; the attendee copy
+  is a planted plaintext event and its comment says why only the gate keeps
+  it unchanged (M7 fails the ETag check).
 - Variants are not mutation-tested except where recorded (outbox, availability
-  and the OPTIONS and `Principal/get` red runs); some 403s in the variants
+  and the OPTIONS and `Principal/get` red runs) (**closed, plan 7**: "Mutation
+  runs (plan 7)"); some 403s in the variants
   come from ordinary permissions, not the gate; refused COPY or MOVE sources
   and destinations are not checked directly; the inbox `len() == 1` needs a
-  comment; client selection uses `path.contains("john")`.
+  comment (**closed, plan 7**); client selection uses `path.contains("john")`.
 - The `CalendarEvent/copy` test cannot tell the `from_account_id` gate from
-  the target gate; the secondary-account session filter is untested (no
-  non-key account can reach a key account now); the shared-calendar read
+  the target gate (**closed, plan 7**: `gating::test` copies into plain's
+  account from key1's, so only the source gate can refuse it; M13 fails it);
+  the secondary-account session filter is untested (no
+  non-key account can reach a key account now; unchanged in plan 7); the shared-calendar read
   asserts status only.
 - Task 0's test asserts the 409 over HTTP only, not the unchanged vault
   record; its planting block duplicates key4's; `za_assert_no_calendar_data`
@@ -340,13 +362,21 @@ Tests:
   so the index check proves the key layout through mail entries only (**closed, plan 5**); the
   task-queue channel is scanned both before and after the drain, but the
   alarm email assertion does not prove the alarm fired for the right reason;
-  silent blob decode failures are not asserted; the fixed `SUBSPACES` list
+  silent blob decode failures are not asserted (**closed, plan 7**: a blob that
+  fails to read is a violation); the fixed `SUBSPACES` list
   needs updating whenever upstream adds a subspace; allprop PROPFIND may omit
   `calendar-timezone`; CI step ordering is now behind the `style` job only.
 - Final review "can stay": no trace-event test for the removed trace
-  content (**closed, plan 5**); the alarm override has no red test (R15); `webdav_tests` has no
+  content (**closed, plan 5**); the alarm override has no red test (R15)
+  (**closed, plan 7**: `za_variants::alarm_override`, M10); `webdav_tests` has no
   queue capture, so nothing asserts that no mail was queued to the
-  `john_doe@unknown.com` attendee in the alarm variant.
+  `john_doe@unknown.com` attendee in the alarm variant (**closed, plan 7**,
+  differently from the ask: `capture_queue()` is unusable in these suites
+  because it stops local delivery, so `wait_for_delivery` and
+  `queued_recipients` read the persisted SMTP queue instead;
+  `alarm_override` plants a plaintext event with an external VALARM
+  ATTENDEE, waits for the queue to drain, and asserts the one email is the
+  alarm itself, sent to the account).
 - The key-mode branch in upstream `tests/src/webdav/basic.rs` (OPTIONS header
   as john) is a new merge surface in an upstream test file, like
   `principals.rs` and `mod.rs`.
@@ -380,6 +410,49 @@ Plan 4 (revision 7 follow-ups), whole-branch review:
   easier to hit now that setup tolerates an untouched default calendar: a
   client syncing that calendar during setup can leave a plaintext event
   that is sealed only on its next write (spec section 4.1).
+
+## Mutation runs (plan 7)
+
+Plan 7 (`docs/superpowers/plans/2026-10-10-zero-access-7-test-hardening.md`,
+Task 7, 2026-10-10) removed each gate the key-mode suites cover, one edit at
+a time, ran `za_tests` and then key-mode `webdav_tests`, recorded each
+suite's first failure and reverted the edit before the next run. Line numbers
+are those of the product files at `main`. A failure inside a helper
+(`with_status` at `tests/src/utils/webdav.rs:599`, the property check at
+`:1061`, the header check at `:614`) is given at the calling test line.
+`alarm_override` was tightened before M10 so that it identifies the alarm
+email by its sender: under M10 the mail that reaches john is a delivery
+failure bounce, which is addressed to john and also carries
+`Auto-Submitted: auto-generated`.
+
+| Id | Gate | Edit | `za_tests` first failure | Key-mode `webdav_tests` first failure |
+|----|------|------|--------------------------|----------------------------------------|
+| M1 | Cross-account COPY/MOVE, `crates/dav/src/common/za.rs:96` (`za_refuse_cross_account`) | `if false && from_account_id != ...` | `tests/src/za/dav_gate.rs:307`: key1's COPY to plain's calendar, "Expected 403 Forbidden but got 201 Created" | `tests/src/webdav/za_variants.rs:124` (`copy_move`): jane's COPY to support's calendar, "Expected 403 Forbidden but got 201 Created" |
+| M2 | ACL on key calendars, `crates/dav/src/common/acl.rs:131` | `if false && collection == ...` | `tests/src/za/gating.rs:102`: key1's ACL on its calendar, "Expected 403 Forbidden but got 200 OK" | `za_variants.rs:192` (`acl`): john's ACL, "Expected 403 Forbidden but got 200 OK" |
+| M3 | DAV URI gate, `crates/dav/src/common/uri.rs:113` | the `za_session_keys` call removed | `dav_gate.rs:78`: admin PROPFIND of `/dav/itip/key1@example.com/`, "Expected 403 Forbidden but got 207 Multi-Status". The PROPFINDs of `/dav/cal/key1@example.com/` before it still answer 403: the PROPFIND loader's per-item gate (`za_archive_view`, `za.rs:171`) refuses them; the scheduling inbox has only the URI gate. | passed. Every client holds its own keys; jane's PROPFIND of john's calendar is refused by upstream's access check (`uri.rs:101-104`), and no grant can exist because of M2's gate. |
+| M4 | Keyless token refused, `crates/dav/src/common/za.rs:66-73` (`za_session_keys`) | `None => Ok(None)` | `dav_gate.rs:69`: master-user PROPFIND, "Expected 403 Forbidden but got 207 Multi-Status" | passed (as M3) |
+| M5 | DELETE `send_itip`, `crates/dav/src/calendar/delete.rs:81` | the `is_key_account` line deleted | `gating.rs:586`: planted DELETE, "a CANCEL left the key organizer" (left 1, right 0) | passed: a key account's events carry no schedule tag, so no CANCEL can be built |
+| M6 | `ItipSendStatus::KeyAccount`, `crates/groupware/src/calendar/itip.rs:1075` | `} else if false && account_info...` | `tests/src/za/tracing.rs:721`: "plain-account scheduling reason not traced on both PUT paths" (left 4, right 2): the key account's PUTs now trace upstream's reasons. `tracing` runs before `gating`. | `za_variants.rs:362` (`scheduling`): `response.headers.get("schedule-tag").is_none()` |
+| M6b | as M6 | M6's edit, with the two schedule-tag assertions (`gating.rs:492-496`, `za_variants.rs:362`) and `tracing.rs:721-725` commented out for the run | `gating.rs:499`: `mail_count(test, plain_id) == plain_mail` after the key organizer's PUT (left 1, right 0) | `za_variants.rs:368`: `mail_count(jane) == jane_mail` after john's PUT (left 1, right 0) |
+| M7 | RSVP attendee copy, `crates/groupware/src/calendar/itip.rs:667` | `if false && server` | `gating.rs:688`: the copy's ETag changed after plain's RSVP. With that assertion disabled, `:696-699` fails with "the key attendee's copy was rewritten" (Task 1's red run). | passed: john sends no RSVP |
+| M8 | iMIP ingest, `crates/email/src/message/ingest.rs:367` | `&& !account.is_key_account()` deleted | `gating.rs:620`: key1's scheduling inbox holds `inbox/1.ics` after plain's invitation | passed: john sends nothing |
+| M9 | Generic alarm, `crates/services/src/task_manager/alarm.rs:473` | `let generic = false;` | passed: no alarm fires in `za_tests` | `za_variants.rs:316` (`alarm`): "organizer row present in the generic alarm email" |
+| M10 | Alarm recipient, `alarm.rs:541` | `rcpt_to = None;` deleted | passed | `za_variants.rs:476` (`alarm_override`): "the email is the alarm", From `MAILER-DAEMON@example.org` (the bounce of the alarm sent to the external attendee) |
+| M11 | Schedule URLs hidden, `crates/dav/src/principal/propfind.rs:312` | `if false && account.is_key_account()` | `gating.rs:143`: key1's `schedule-inbox-URL`, "Expected status 404 Not Found, but got 200 OK" | `tests/src/webdav/principals.rs:139`: the same property of a key principal, same message |
+| M12 | OPTIONS header, `crates/http/src/request.rs:341` | `if false && za_is_key_account_request(...)` | `tracing.rs:707`: "OPTIONS authentication failure not reported" (with the check skipped, OPTIONS no longer authenticates the credential) | `tests/src/webdav/basic.rs:19`: "Header dav:1, 2, 3, access-control, extended-mkcol, calendar-access, calendar-no-timezone, addressbook not found." |
+| M13 | Copy source, `crates/jmap/src/api/request.rs:648` | the `from_account_id` line deleted | `gating.rs:125`: `CalendarEvent/copy` answered, left `None`, right `Some("accountNotSupportedByMethod")` | passed: the variants make no JMAP call |
+| M14 | Bearer on key calendars | M4's edit, with `dav_gate.rs:65-78` (master-user and admin PROPFINDs) commented out for the run | `dav_gate.rs:129`: the Bearer PROPFIND loop, "Expected 403 Forbidden but got 207 Multi-Status" | passed (as M4) |
+
+Every gate fails at least one suite, so no gap needed a new test or a
+"layered behind" ruling. The key-mode variants miss M3, M4, M5, M7, M8 and
+M13 because they never send the request that reaches the gate (no keyless
+client, no schedule tag, no RSVP, no iMIP, no JMAP); `za_tests` covers each.
+M6b shows the sender-side mail counts catch a key organizer that sends, apart
+from the schedule-tag assertions that fire first.
+
+The red runs recorded earlier are not repeated here: the outbox free-busy
+loop, the availability gate (R4), the OPTIONS and `Principal/get` runs, and
+the first JMAP gate run (see "Deviations from the plan").
 
 ## Facts for the account web page and the next release
 
@@ -447,7 +520,8 @@ control) must produce violations, so a clean run cannot mean a blind scanner.
 
 CI layout: job `style` (`cargo fmt --all --check`); job `test` (upstream
 suites, needs `style`); job `zero-access` (needs `style`; vault and groupware
-unit tests, `za::za_tests`, `webdav::webdav_tests`, and the same with
+unit tests, `za::za_tests`, `za::za_tests` again with `BLOB_STORE:
+FileSystem` (plan 7), `webdav::webdav_tests`, and the same with
 `ZA_KEY_ACCOUNTS: "1"`). The env sets `STORE: RocksDb` and `RUST_MIN_STACK`.
 Upstream's `cal_itip` flake can still fail the job; rerun once.
 
@@ -480,15 +554,29 @@ default calendar created by the server with untouched preferences gets 409
   an `IndexDocument` task queued and assert the task drains.
 - **Added (plan 5)** A trace event with an in-process trace subscriber that asserts the `RuleExpansionError`
   traces carry UIDs and no iCalendar text.
-- Mutation runs for the variants (remove each gate and confirm the variant
-  fails), in particular `copy_move`, `acl` and the scheduling variant.
-- An OAuth Bearer gate case for a key account's calendar without keys (still
-  no helper in the tests crate).
-- A red test for the alarm recipient override (R15) with a planted unsealed
+- **Closed (plan 7)** Mutation runs for the variants (remove each gate and confirm the variant
+  fails), in particular `copy_move`, `acl` and the scheduling variant. See
+  "Mutation runs (plan 7)".
+- **Closed (plan 7)** An OAuth Bearer gate case for a key account's calendar without keys (still
+  no helper in the tests crate). `tests/src/za/dav_gate.rs` mints the token
+  in process (`encode_access_token`) and expects 403 on the calendar,
+  default-calendar and itip PROPFINDs and the calendar-query REPORT, with a
+  plain-account Bearer control (M14).
+- **Closed (plan 7)** A red test for the alarm recipient override (R15) with a planted unsealed
   key-account event carrying an external VALARM ATTENDEE; queue capture in
   `webdav_tests` to assert nothing is queued to the external recipient.
-- The `from_account_id` gate of `CalendarEvent/copy` on its own, and the
+  `za_variants::alarm_override` (M10); the queue is read through
+  `wait_for_delivery`, not `capture_queue()` (see "Deferred findings",
+  Tests).
+- The `from_account_id` gate of `CalendarEvent/copy` on its own
+  (**closed, plan 7**: `gating::test`, M13), and the
   secondary-account session filter once a key account can be a secondary
-  account.
+  account (still untested, unchanged: no non-key account can reach a key
+  account now).
+- `ParticipantIdentity/changes` stays untested, unchanged: it answers
+  upstream's `cannotCalculateChanges` for every account (candidate 1 under
+  "Decisions that are Jay's"; spec revision 7 records the exception), so
+  there is no key-account gate to test.
 - The plan 2 list still stands (outbox `Withheld` path now unreachable for key
-  attendees; tampered-event 500; 304 and `If-Match` cases).
+  attendees; tampered-event 500; 304 and `If-Match` cases). Plan 7 marks the
+  items it closes there.
