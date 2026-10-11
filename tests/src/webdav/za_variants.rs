@@ -160,10 +160,14 @@ pub async fn copy_move(test: &TestServer) {
     )
     .await
     .with_status(StatusCode::FORBIDDEN);
+    // A DELETE that overtakes a pending index task can leave orphaned index
+    // entries (issue #29).
+    test.wait_for_tasks().await;
     jane.request("DELETE", "/dav/cal/support@example.com/default/g.ics", "")
         .await
         .with_status(StatusCode::NO_CONTENT);
 
+    test.wait_for_tasks().await;
     for (client, path) in [
         (&john, "/dav/cal/john@example.com/other-copy/"),
         (&john, "/dav/cal/john@example.com/other/"),
