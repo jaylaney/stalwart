@@ -245,7 +245,8 @@ Candidates for spec revision 7:
    the new setup check then answers 409 permanently. No trigger was found on
    this branch; every known path is gated before the fetch. A sole default
    calendar with no events carries no user data, so the check could ignore it.
-   There is no operator path to remove it (see Deferred findings).
+   The operator path is to destroy and recreate the account (see Deferred
+   findings, issue #10).
 5. The mail index of key accounts (R11). Mail is unsealed in release 1, so
    its full-text index and the generic alarm email's index entries are
    expected; a later mail release revisits it. Record it in the spec as an
@@ -269,12 +270,48 @@ are marked **Decided (revision 7)**. The sole-default-calendar decision (spec
 4.1) has no bullet of its own here. **No action (plan 5)** marks a finding
 that records no hole to fix. Plan 6
 (`docs/superpowers/plans/2026-10-10-zero-access-6-index-and-traces.md`,
-2026-10-10) closed the items marked **Closed (plan 6)**.
+2026-10-10) closed the items marked **Closed (plan 6)**. Issue #10
+(2026-10-11) closed the item marked **Closed (issue #10)** by documenting the
+operator path, with no code change.
 
 Security and robustness:
 
-- A pending account refused at setup for stray data has no operator path to
-  remove it except direct store writes (Task 0; Minor 8 above).
+- **Closed (issue #10)** A pending account refused at setup for stray data
+  has no operator path to remove it except direct store writes (Task 0;
+  Minor 8 above). Decided 2026-10-11: no code change. The operator path is
+  to destroy the account and recreate it. A pending account cannot normally
+  gather calendar data: `setup-token` issues only to an eligible account
+  (no credentials of any kind, no calendar data) and writes the marker
+  credential, so from then on nobody can log in (there is no password), the
+  plan 2 DAV gate answers 403 to DAV writes, iTIP ingest refuses key
+  accounts (`crates/groupware/src/calendar/itip.rs:668`), and the index task
+  is gated the same way (`crates/services/src/task_manager/index.rs:498`).
+  The remaining ways in are edge cases:
+  - The `setup-token` check-then-commit race: an incoming invitation that
+    commits between the data check and the marker write.
+  - A stale default calendar. The tolerance check (`za_has_user_calendars`,
+    `crates/http/src/api/vault.rs:792-801`) compares the sole calendar's
+    display name with the current `default_calendar_display_name` config and
+    the account's current name. If the server created the default calendar
+    before issuance (something built the account's calendar resource cache,
+    for example an admin browsing it) and the account was then renamed or
+    that config changed, the server's own empty calendar counts as user data
+    and setup answers 409 permanently.
+  - Direct store writes, an import or a migration tool.
+
+  Remedy: destroy the account (the account-destroy task,
+  `crates/services/src/task_manager/destroy_account.rs`, removes all
+  account-keyed data, the vault record included), recreate it with no
+  credentials and issue a new setup token. The cost is that the account id
+  changes, mail delivered while pending is lost, and aliases and settings
+  must be set again; the account never had a password and has never been
+  used, so the cost is small. Rejected: relaxing the default-calendar check
+  to ignore the display name would flip case 1 of `test_data_check`
+  (`tests/src/za/setup.rs:481`, "Renamed default calendar: user data,
+  refused"). That refusal is deliberate: spec 4.1 tolerates only the
+  server's default display name, and a chosen name stays plaintext until
+  the first write. Also rejected: an operator "discard calendar data" option
+  on setup-token reissue, which is not worth the code for these edge cases.
 - **Decided (revision 7)** OPTIONS fail-open (R12, re-review): a key account whose OPTIONS
   authentication fails transiently (in-flight limit, store error, fail2ban
   ban) receives upstream's header including `calendar-auto-schedule`. Clients
