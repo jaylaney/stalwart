@@ -319,10 +319,24 @@ recipients included. Under `SendSealed` the messages go to the fan-out: the
 task queue is never written for a key account's message and no mail is
 built.
 
-**Creating an event.** The create branch of a key account's PUT takes the
-UID creation lease (section 6.3) around `assert_is_unique_uid` and the
-insert, and its commit is fenced on the lease. This is the only change to
-the PUT path's write sequence.
+**Creating an event.** The create branch of a key account's PUT changes in
+two ways, and nothing else in the PUT path's write sequence changes. It
+takes the UID creation lease (section 6.3) before its uniqueness check and
+holds it through the insert, whose commit is fenced on the lease. And the
+uniqueness check, once the lease is held, reads current archives instead
+of the resource snapshot: the PUT loads an immutable `Arc<DavResources>`
+at the top of the handler (`fetch_dav_resources` in
+`crates/dav/src/calendar/update.rs`), and `assert_is_unique_uid`
+(`crates/dav/src/calendar/mod.rs`) intersects fresh UID-index hits with
+that snapshot's `children(calendar_id)`, so an event another creator
+committed after the snapshot is a hit the snapshot does not list. Under the
+lease the key-account PUT reads the fresh hits (`document_ids_matching` on
+`CalendarEventField::Uid`), reads each hit's current stored archive, and
+compares its parent calendar ids (`CalendarEvent.names`, visible by
+structure in release 1) with the target calendar; a hit in the target
+calendar answers `NoUidConflict` as upstream does. The snapshot is still
+used for everything else (resolving the parent, the create-versus-update
+decision).
 
 ### 5.2 Recipient split
 
@@ -520,8 +534,11 @@ one more writer and closes the gap for key accounts.)
    `try_lock` takes one: read, refuse if an unexpired value is present,
    write with an assertion on the value read. A session that cannot take
    it waits briefly and retries a bounded number of times (values for
-   planning); then the drain leaves the item pending, and the PUT repeats
-   the uniqueness check once the lease is free.
+   planning); then the drain leaves the item pending, and the PUT runs its
+   archive-based uniqueness check (section 5.1) once it holds the lease.
+   The drain's own absence check is the UID index read
+   (`document_ids_matching` on `CalendarEventField::Uid`), which is fresh,
+   so the drain needs no such change.
 2. **Its value** is `expiry (u64, big endian) || fence token (random
    bytes)`. The leading expiry keeps the key compatible with
    `purge_in_memory_store` (`lookup.rs`), which reads the first eight bytes
@@ -531,25 +548,42 @@ one more writer and closes the gap for key accounts.)
    drain, rewrites the item) also asserts that the lease key still holds
    this holder's exact value (`assert_value`). An expired holder whose
    lease was taken by another cannot commit: its assertion fails, the drain
-   aborts the pass, and the PUT repeats the uniqueness check (answering
+   aborts the pass, and the PUT takes the lease again and re-runs its
+   uniqueness check against current archives, not the snapshot (answering
    `NoUidConflict` as upstream does if the UID now exists there). This is
    what makes the lease safe; its duration only decides how long a crashed
    holder blocks others.
 4. **Release** is a batch that asserts the holder's value and clears the
    key, so a holder never removes a successor's lease. A crashed holder's
-   lease expires and is purged.
+   lease (or one whose release failed) expires and is purged by the
+   maintenance task's lease sweep, which runs on the data store whatever
+   the lookup backend. The existing purge does not cover it under every
+   configuration: the maintenance task
+   (`crates/services/src/task_manager/maintenance.rs`) calls
+   `purge_store()`, which on RocksDB visits only the quota and counter
+   subspaces (`crates/store/src/backend/rocksdb/write.rs`), and then the
+   lookup backend's `purge_in_memory_store()`, a no-op for Redis
+   (`lookup.rs`). The fork adds one call to that purge step: iterate the
+   `KV_LOCK_ZA_UID` key range in the data store and clear every key whose
+   leading eight-byte expiry is at or below now, the rule
+   `purge_in_memory_store` applies. When the in-memory store is the data
+   store, the sweep overlaps the existing purge harmlessly. Without the
+   sweep an abandoned lease is storage growth, not a fencing failure: a
+   later creator of the same UID replaces the expired value.
 5. **Scope.** The lease covers creation only, from the absence check
    through the insert. Updates and merges of an existing event are already
    protected by the assertion on the event's stored archive, which the
    drain's batch carries. Non-key accounts take no lease: the PUT path's
    lease is behind the key-account branch (invariant 9).
 6. **Why it suffices.** Two creators of one UID in one account serialize on
-   the lease, and the second finds the first's event when it re-checks.
-   This covers drain versus drain (the interleaving above), drain versus
-   PUT, and PUT versus PUT for key accounts. Expiry cannot reopen the race,
-   because the commit is fenced. The PUT's re-check is upstream's, which
-   refuses a UID only within the target calendar, so a PUT into another
-   calendar still creates its copy, as upstream allows.
+   the lease, and the second finds the first's event when it re-checks:
+   the drain through the fresh UID index, the PUT through current archives
+   rather than its resource snapshot (section 5.1). This covers drain
+   versus drain (the interleaving above), drain versus PUT, and PUT versus
+   PUT for key accounts. Expiry cannot reopen the race, because the commit
+   is fenced. The PUT's re-check keeps upstream's rule, which refuses a UID
+   only within the target calendar, so a PUT into another calendar still
+   creates its copy, as upstream allows.
 
 **The pass.** The drain processes pending items in creation (document id)
 order. It re-reads each item before processing it, and skips one whose
@@ -830,10 +864,11 @@ tests add test-mode hooks, compiled only under `test_mode` like release
 1's auth-cache pauses (`za_test` in `crates/http/src/auth/authenticate.rs`,
 a `Pause` with `arrived` and `release` notifies keyed by account id): a
 fan-out pause between document-id assignment and the item commit, a
-drain pause after its absence check, a per-account drain skip (while set,
-that account's drain does not run), and a task-consumer pause. None of
-them changes behaviour when unset. The consumer pause must live where both
-`http` and `services` can reach it (`common`), a note for planning.
+drain pause after its absence check, a PUT pause after the resource fetch,
+a per-account drain skip (while set, that account's drain does not run),
+and a task-consumer pause. None of them changes behaviour when unset. The
+consumer pause must live where both `http` and `services` can reach it
+(`common`), a note for planning.
 
 - Invite between two key accounts, drained on the attendee's first request,
   and on a mid-session arrival: a second request by an already connected
@@ -841,7 +876,7 @@ them changes behaviour when unset. The consumer pause must live where both
 - Drain cursor: an item that arrives while a pass is rewriting an earlier
   item is processed on the next request; a transiently failing item is
   retried on a later request without any new arrival.
-- Creation lease, three cases, each ending with exactly one calendar copy.
+- Creation lease, four cases, each ending with exactly one calendar copy.
   Drain versus drain: with the fan-out pause, two fan-outs for one UID
   publish the lower document id late (section 6.3) while two sessions of
   one attendee drain. Drain versus PUT: a drain pause after the drain's
@@ -849,7 +884,16 @@ them changes behaviour when unset. The consumer pause must live where both
   calendar; the loser either merges or answers `NoUidConflict`. Lease
   expiry: the lease duration is test-settable (`ZA_UID_LEASE_SECS`, a name
   to confirm); a holder paused past expiry while another session creates
-  the UID loses its commit.
+  the UID loses its commit. Stale snapshot: a PUT pause after the resource
+  fetch; while the PUT is paused, a drain commits the UID into the default
+  calendar and releases its lease; the PUT resumes, takes the lease, and
+  answers `NoUidConflict`.
+- Lease sweep: plant an expired lease key and a live one in the data
+  store, run the purge, and expect only the expired one gone. It runs with
+  the default configuration, where the in-memory store is the data store;
+  a Redis-plus-data-store run of the same check would live in the `store`
+  suite's Redis container harness (`tests/src/utils/containers.rs`, used by
+  `tests/src/store/lookup.rs`), a decision for planning (section 13).
 - The attendee's copy lands on the default calendar with `itip_auto_add`
   on and off (a local sender always adds).
 - An organizer client that drops unknown parameters on its next PUT keeps
@@ -905,8 +949,9 @@ mixed-list test fail (plaintext in the task queue); restoring the plaintext
 queue path makes the task-queue test fail, reliably rather than by chance
 because the consumer is paused; removing the lease assertion from the
 commit, or removing the lease from the PUT create branch, makes the
-creation-lease tests fail; removing the pending-bit skip makes a read of
-an undrained item fail.
+creation-lease tests fail; re-checking against the snapshot instead of
+current archives makes the stale-snapshot case fail; removing the
+pending-bit skip makes a read of an undrained item fail.
 
 **Manual checklist** (`docs/zero-access/manual-checklist.md`). Item 13
 changes from "nothing is delivered" to a two-client invitation between two
@@ -962,6 +1007,11 @@ Release 1's ten invariants hold. Release 2 adds:
   resource cache knows no flags, so the skip happens where items are
   loaded; whether the item then reports as new or as changed is settled
   with the tests.
+- **The lease sweep.** Its place in the maintenance task's purge step;
+  whether it is skipped when the in-memory store is the data store (the
+  existing purge already covers that case); and whether a
+  Redis-plus-data-store run of the sweep test joins the `store` suite's
+  Redis container harness.
 
 ## 14. Alternatives considered
 
