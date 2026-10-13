@@ -251,7 +251,7 @@ impl CalendarPropPatchRequestHandler for Server {
 
             if is_success {
                 if let Some(keys) = &za_keys {
-                    seal_event(&mut new_event, keys, account_id)
+                    seal_event(&mut new_event, keys, account_id, None)
                         .map_err(|err| seal_error(err, account_id, document_id))?;
                 }
                 new_event

@@ -331,7 +331,7 @@ impl CalendarUpdateRequestHandler for Server {
             }
 
             if let Some(keys) = &za_keys {
-                seal_event(&mut new_event, keys, account_id)
+                seal_event(&mut new_event, keys, account_id, None)
                     .map_err(|err| seal_error(err, account_id, document_id))?;
             }
 
@@ -491,7 +491,7 @@ impl CalendarUpdateRequestHandler for Server {
             }
 
             if let Some(keys) = &za_keys {
-                seal_event(&mut event, keys, account_id)
+                seal_event(&mut event, keys, account_id, None)
                     .map_err(|err| seal_error(err, account_id, u32::MAX))?;
             }
 

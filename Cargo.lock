@@ -3038,10 +3038,12 @@ dependencies = [
  "serde",
  "serde_json",
  "store",
+ "subtle",
  "trc",
  "types",
  "utils",
  "vault",
+ "zeroize",
 ]
 
 [[package]]
