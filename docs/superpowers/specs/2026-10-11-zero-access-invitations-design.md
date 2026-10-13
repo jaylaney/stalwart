@@ -198,17 +198,33 @@ app-password change.
   `crates/groupware/src/calendar/seal/event.rs`) is decoded with a checked
   rkyv read, so a bundle that carries pairs is a new bundle format
   (section 9); release 1 bundles read as before.
-- **Maintenance.** Whenever the organizer's session builds messages (a PUT,
-  a DELETE, or a drain that merges a reply) it reads the stored pairs and
-  adds a pair for every scheduled attendee that has none (new attendees,
-  and delegates that upstream's merge adds during the drain, section 6.4).
-  Messages are built from the union of the stored pairs and the current
-  attendees, so the CANCEL to a removed attendee carries that attendee's
-  old pair; the organizer's persisted bundle keeps only the pairs of
-  current attendees. Handing a removed attendee's token back is harmless:
-  they have nothing left to reply to, and a reply from them is rejected as
-  not a participant. A token is therefore stable for the event's life, and
-  a removed and re-added attendee gets a new one.
+- **Every rewrite carries the pairs.** Every rewrite of a key account's
+  event by its own session carries the stored bundle's pairs into the new
+  bundle, whether or not messages are built: a PUT with or without
+  messages, a PROPPATCH, the drain's merge, cancel and import (an import
+  takes the attendee's pair from the item), and the delegation fan-out in
+  the drain. This matters because `CalendarEvent` has no field the pairs
+  can ride in (invariant 1), and `seal_event`
+  (`crates/groupware/src/calendar/seal/event.rs`) rebuilds `X-ZA-EXTRA`
+  from the event's display name and dead properties alone, which the
+  unsealed view (`za_event_view`) restored from the old bundle. Rebuilt
+  from those fields only, an organizer PUT that builds no message (adding
+  an alarm) would drop every pair and turn every later reply into a
+  forgery, and an attendee's alarm edit would drop the attendee's own
+  pair. COPY and MOVE keep the stored bytes
+  (`crates/dav/src/calendar/copy_move.rs` has no seal step) and need
+  nothing.
+- **Maintenance.** A rewrite that builds messages (a PUT or DELETE that
+  yields messages, or a drain that merges a reply) additionally reads the
+  stored pairs and adds a pair for every scheduled attendee that has none
+  (new attendees, and delegates that upstream's merge adds during the
+  drain, section 6.4). Messages are built from the union of the stored
+  pairs and the current attendees, so the CANCEL to a removed attendee
+  carries that attendee's old pair; the organizer's persisted bundle keeps
+  only the pairs of current attendees. Handing a removed attendee's token
+  back is harmless: they have nothing left to reply to, and a reply from
+  them is rejected as not a participant. A token is therefore stable for
+  the event's life, and a removed and re-added attendee gets a new one.
 - **Delegates** receive their token from the organizer, never from the
   delegating attendee: an attendee-originated delegate invitation is not
   attempted (section 5.5), and the organizer's drain invites the delegate
@@ -217,10 +233,11 @@ app-password change.
   copy learns the delegate's status from the organizer's next update
   REQUEST (section 5.5).
 - **Attendee side.** An item sent to attendee X carries X's pair, and only
-  X's, in the item's own `X-ZA-EXTRA` bundle, not in the tree. The drain
-  moves the pair into the `X-ZA-EXTRA` bundle of X's copy of the event,
-  where X's session finds it when it replies; the rewritten inbox item
-  carries no token.
+  X's, in the item's own `X-ZA-EXTRA` bundle, not in the tree. The drain's
+  import moves the pair into the `X-ZA-EXTRA` bundle of X's copy of the
+  event, and every later rewrite of that copy carries it, so X's session
+  finds it there when it replies. The rewritten inbox item carries no
+  token.
 - **Reply item.** A reply carries the token in the clear, as the visible
   root property `X-ZA-RSVP-TOKEN` (base64url), so the organizer's drain can
   check it without a second unseal. The fan-out takes it from the bundle of
@@ -304,7 +321,9 @@ Under `SendSealed`, upstream's `itip_create`, `itip_update` and
 `itip_cancel` run on the plaintext tree exactly as for a plain account and
 produce their `ItipMessage` values (sender, recipients, tree). Before they
 run, the fan-out takes the union of the stored token pairs and pairs for
-new attendees (section 3.3). The
+new attendees (section 3.3). A PUT that yields no message still carries
+the stored pairs into the new bundle (section 3.3, "Every rewrite carries
+the pairs"). The
 schedule tag is set exactly as upstream sets it, and
 `itip_set_unreachable_status` runs as upstream runs it; release 1's "no
 schedule tag is ever set" ends for key organizers.
@@ -378,9 +397,8 @@ For each internal recipient R of a message:
 1. Copy the message tree. For a REQUEST or CANCEL to an attendee, take R's
    token pair, from the union of section 3.3 (so a removed attendee's
    CANCEL carries the old pair), for the item's `X-ZA-EXTRA` bundle. For a
-   reply to the
-   organizer, set the visible root property `X-ZA-RSVP-TOKEN` from the
-   bundle of the replying attendee's copy.
+   reply to the organizer, set the visible root property `X-ZA-RSVP-TOKEN`
+   from the bundle of the replying attendee's copy.
 2. Generate a fresh DEK. Seal the tree under the release 1 policy (release
    1 section 6) with an `X-ZA-SEALED` property per affected component,
    associated data shaped like events' (`tree_aad`) with the scope `itip`:
@@ -410,7 +428,12 @@ sealed and committed under the sender's MK, with tokens and schedule
 statuses inside. If the sender's commit fails after inbox writes,
 recipients hold an item for an event version that was not stored, and the
 sender's client resends; the drain's merge treats the duplicate by UID and
-SEQUENCE as upstream's merge does. This is accepted.
+SEQUENCE as upstream's merge does. A reply can also beat the sender's
+commit: if the attendee drains, imports and replies before the organizer's
+event commits, the organizer's drain finds no event for the UID and files
+the reply as history (section 6.4 step 4), never retried. The window lies
+inside one request of the sender, and the attendee's next participation
+change produces a fresh reply. Both consequences are accepted.
 
 ### 5.5 The paths that fan out
 
@@ -520,7 +543,8 @@ one more writer and closes the gap for key accounts.)
 **A per-(account, UID) creation lease with fenced commits.**
 
 1. **The lease.** Before a key account's session creates a calendar event
-   for UID U, by the drain's import or by a PUT create (section 5.1), it
+   for UID U, by the drain's import (after a first lookup found nothing,
+   section 6.4) or by a PUT create (section 5.1), it
    takes a short lease on the key (account id, U) in the data store,
    written directly through `Server::store()` as an existing
    in-memory-class key (`ValueClass::InMemory(InMemoryClass::Key(..))`, the
@@ -616,21 +640,26 @@ session (section 3.2). For each item:
    in `changed_by`, the check upstream's `itip_ingest` makes against the
    sender of a mail.
 3. Act by METHOD:
-   - **REQUEST.** If the account has an event with that UID (upstream's
-     lookup on `CalendarEventField::Uid`), unseal it and run
-     `itip_process_message` against the unsealed copy, then
-     `itip_merge_changes`, and commit the merged event through the existing
-     seal path (`seal_event`: new DEK, master-key wrap), with upstream's
-     size, quota and schedule-tag rules from `commit_itip_merge`.
-     Otherwise import it. Upstream's `itip_ingest` always adds an
+   - **REQUEST.** Look the UID up first (upstream's lookup on
+     `CalendarEventField::Uid`). If an event exists, merge with no lease:
+     unseal it, run `itip_process_message` against the unsealed copy, then
+     `itip_merge_changes`, and commit the merged event through the
+     existing seal path (`seal_event`: new DEK, master-key wrap) under the
+     assertion on the event's stored archive, with upstream's size, quota
+     and schedule-tag rules from `commit_itip_merge`. If none exists, take
+     the creation lease (section 6.3), look the UID up again, and import
+     only if it is still absent (merge as above if it appeared); release
+     the lease after the commit. Updates therefore pay no lease round
+     trip. Upstream's `itip_ingest` always adds an
      invitation whose sender is a local principal, and every release 2
      sender is one, so the attendee's copy always lands on the default
      calendar; the `itip_auto_add` setting and its address-book exception
      apply only to iMIP (release 3). The drain checks quota as upstream
      does, imports the tree with `itip_import_message` into the default
      calendar, and seals it under MK.
-     In both cases the attendee's token pair moves from the item's bundle
-     into the `X-ZA-EXTRA` bundle of the attendee's copy (section 3.3).
+     An import takes the attendee's token pair from the item's bundle into
+     the `X-ZA-EXTRA` bundle of the new copy; a merge carries the copy's
+     stored pairs into the new bundle (section 3.3).
    - **REPLY.** Find the organizer's event by UID, unseal it, match the
      attendee by address, and require the token (section 3.3). Upstream's
      merge does not reject stale replies: `handle_reply`
@@ -898,6 +927,10 @@ consumer pause must live where both `http` and `services` can reach it
   on and off (a local sender always adds).
 - An organizer client that drops unknown parameters on its next PUT keeps
   every attendee's token, and a reply afterwards still applies.
+- Pairs survive rewrites that build no message: the organizer adds an
+  alarm (a PUT that builds no message), then a reply from the attendee
+  applies; the attendee adds an alarm to their copy, then replies, and the
+  reply applies.
 - Update and cancel propagate to the attendee's copy, and the attendee's
   own alarm survives an update.
 - A reply with a matching token applies; a forged token is dropped with the
@@ -950,8 +983,10 @@ queue path makes the task-queue test fail, reliably rather than by chance
 because the consumer is paused; removing the lease assertion from the
 commit, or removing the lease from the PUT create branch, makes the
 creation-lease tests fail; re-checking against the snapshot instead of
-current archives makes the stale-snapshot case fail; removing the
-pending-bit skip makes a read of an undrained item fail.
+current archives makes the stale-snapshot case fail; rebuilding the
+`X-ZA-EXTRA` bundle from the view's fields alone makes both
+pairs-survive-rewrites cases fail; removing the pending-bit skip makes a
+read of an undrained item fail.
 
 **Manual checklist** (`docs/zero-access/manual-checklist.md`). Item 13
 changes from "nothing is delivered" to a two-client invitation between two
@@ -970,8 +1005,11 @@ Release 1's ten invariants hold. Release 2 adds:
 13. The organizer's event never stores an attendee's account id, and the
     token authenticates a reply; it does not hide the sender of an inbox
     item, whose principal id is visible by structure (section 2).
-14. The drain never fails the request that triggered it and never deletes
-    an item it could later read.
+14. The drain never fails the request that triggered it. It never deletes
+    an item because it cannot read it unless no key can ever open it (the
+    permanent errors of section 6.5); the only other deletion is a reply
+    whose token does not match (section 6.5), a deliberate, traced drop of
+    a forgery.
 15. The fan-out and the drain reuse upstream's iTIP builders and merge
     unchanged; the drain's own checks (sender, token, stale reply) run
     around them for key accounts only, so non-key accounts' scheduling
@@ -988,8 +1026,17 @@ Release 1's ten invariants hold. Release 2 adds:
   purpose, the drain's retry backoff (`ZA_DRAIN_RETRY_SECS`, 30 seconds),
   the creation lease prefix (`KV_LOCK_ZA_UID`), the lease duration and its
   test knob (`ZA_UID_LEASE_SECS`), the fence token length, and the lease
-  retry count and wait (values for planning). The names
-  in this spec are its choices, to be confirmed.
+  retry count and wait (values for planning). The lease key carries the
+  raw UID, and UIDs can be long; it may hold a fixed-length hash of the
+  UID instead, a choice for planning. The names in this spec are its
+  choices, to be confirmed.
+- **Where the seal step gets the pairs.** The pairs cannot live in
+  `CalendarEvent` fields (invariant 1), so the seal step takes them from
+  the stored bundle: for example `seal_event` receiving the previous
+  bundle's pairs alongside the event, or the unseal view returning them
+  beside the event. Both event seal sites need it (`update.rs` and
+  `proppatch.rs` in `crates/dav/src/calendar/`), as do the drain's
+  commits. COPY and MOVE keep the stored bytes and need nothing.
 - **Schedule-status codes.** Which RFC 6638 code marks a not-attempted
   recipient and which marks a failed delivery. The candidates are `3.7`
   (invalid calendar user; the only code upstream sets, for unparseable
