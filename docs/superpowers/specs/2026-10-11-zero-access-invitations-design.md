@@ -201,9 +201,13 @@ app-password change.
 - **Every rewrite carries the pairs.** Every rewrite of a key account's
   event by its own session carries the stored bundle's pairs into the new
   bundle, whether or not messages are built: a PUT with or without
-  messages, a PROPPATCH, the drain's merge, cancel and import (an import
-  takes the attendee's pair from the item), and the delegation fan-out in
-  the drain. This matters because `CalendarEvent` has no field the pairs
+  messages, a PROPPATCH, the drain's handling of a CANCEL (the CANCEL
+  item's pair is the one the copy already holds), the organizer's merge of
+  a REPLY, and the delegation fan-out in the drain. The one exception: an
+  accepted REQUEST, by import or by merge, replaces the attendee's pair
+  with the incoming one (section 6.4), so a removed and re-added
+  attendee's copy follows the organizer to the new token. This matters
+  because `CalendarEvent` has no field the pairs
   can ride in (invariant 1), and `seal_event`
   (`crates/groupware/src/calendar/seal/event.rs`) rebuilds `X-ZA-EXTRA`
   from the event's display name and dead properties alone, which the
@@ -235,8 +239,9 @@ app-password change.
 - **Attendee side.** An item sent to attendee X carries X's pair, and only
   X's, in the item's own `X-ZA-EXTRA` bundle, not in the tree. The drain's
   import moves the pair into the `X-ZA-EXTRA` bundle of X's copy of the
-  event, and every later rewrite of that copy carries it, so X's session
-  finds it there when it replies. The rewritten inbox item carries no
+  event, and every later rewrite of that copy carries it until a later
+  accepted REQUEST replaces it, so X's session finds it there when it
+  replies. The rewritten inbox item carries no
   token.
 - **Reply item.** A reply carries the token in the clear, as the visible
   root property `X-ZA-RSVP-TOKEN` (base64url), so the organizer's drain can
@@ -433,7 +438,11 @@ commit: if the attendee drains, imports and replies before the organizer's
 event commits, the organizer's drain finds no event for the UID and files
 the reply as history (section 6.4 step 4), never retried. The window lies
 inside one request of the sender, and the attendee's next participation
-change produces a fresh reply. Both consequences are accepted.
+change produces a fresh reply. Both consequences are accepted. A retried
+create delivers fresh tokens with an equal SEQUENCE, which upstream's
+merge accepts (`>=` in the `Request` arm of `inbound.rs`), and the copy
+adopts them under the section 6.4 rule, so the retry case needs nothing
+more.
 
 ### 5.5 The paths that fan out
 
@@ -657,9 +666,12 @@ session (section 3.2). For each item:
      apply only to iMIP (release 3). The drain checks quota as upstream
      does, imports the tree with `itip_import_message` into the default
      calendar, and seals it under MK.
-     An import takes the attendee's token pair from the item's bundle into
-     the `X-ZA-EXTRA` bundle of the new copy; a merge carries the copy's
-     stored pairs into the new bundle (section 3.3).
+     When the drain accepts a REQUEST, by import or by merge, the copy
+     takes the pair carried in the item into its `X-ZA-EXTRA` bundle,
+     replacing any stored pair for that attendee (section 3.3). A
+     re-invitation after a CANCEL, which leaves the copy in place with
+     `STATUS:CANCELLED` (upstream's `Cancel` arm in `inbound.rs` rewrites
+     entries and removes nothing), therefore adopts the new token.
    - **REPLY.** Find the organizer's event by UID, unseal it, match the
      attendee by address, and require the token (section 3.3). Upstream's
      merge does not reject stale replies: `handle_reply`
@@ -895,7 +907,8 @@ a `Pause` with `arrived` and `release` notifies keyed by account id): a
 fan-out pause between document-id assignment and the item commit, a
 drain pause after its absence check, a PUT pause after the resource fetch,
 a per-account drain skip (while set, that account's drain does not run),
-and a task-consumer pause. None of them changes behaviour when unset. The
+a one-shot failure of the sender's commit after the fan-out, and a
+task-consumer pause. None of them changes behaviour when unset. The
 consumer pause must live where both `http` and `services` can reach it
 (`common`), a note for planning.
 
@@ -931,6 +944,14 @@ consumer pause must live where both `http` and `services` can reach it
   alarm (a PUT that builds no message), then a reply from the attendee
   applies; the attendee adds an alarm to their copy, then replies, and the
   reply applies.
+- Accepted REQUESTs adopt the incoming pair. Remove, re-add, accept: alice
+  invites bob, removes him (bob's copy becomes cancelled) and re-adds him;
+  bob drains (a merge into the cancelled copy) and accepts; the reply
+  applies under the new token. Failed-create retry: the commit-failure
+  hook fails alice's commit once after the fan-out wrote bob's item;
+  alice's client resends; bob drains both items in order (the second
+  merges with an equal SEQUENCE and adopts the new token); bob's reply
+  applies.
 - Update and cancel propagate to the attendee's copy, and the attendee's
   own alarm survives an update.
 - A reply with a matching token applies; a forged token is dropped with the
@@ -985,7 +1006,8 @@ commit, or removing the lease from the PUT create branch, makes the
 creation-lease tests fail; re-checking against the snapshot instead of
 current archives makes the stale-snapshot case fail; rebuilding the
 `X-ZA-EXTRA` bundle from the view's fields alone makes both
-pairs-survive-rewrites cases fail; removing the pending-bit skip makes a
+pairs-survive-rewrites cases fail; keeping the stored pair on merge makes
+the re-add case fail; removing the pending-bit skip makes a
 read of an undrained item fail.
 
 **Manual checklist** (`docs/zero-access/manual-checklist.md`). Item 13
