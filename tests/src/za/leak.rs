@@ -90,6 +90,8 @@ const EXTRA_CANARIES: &[&str] = &[
     "fanoutloc-canary",
     "fanoutdesc-canary",
     "fanoutcn-canary",
+    "fanoutaddr-canary",
+    "fanoutextcn-canary",
 ];
 
 /// A future invitation organized by the key account to a local non-key
@@ -104,8 +106,9 @@ const SCHED_EVENT: &str = concat!(
 );
 
 /// A key organizer's invitation to the module's key account (plan 9's
-/// fan-out): canaries in the title, location, description and the
-/// attendee's display name.
+/// fan-out): canaries in the title, location, description, the attendees'
+/// display names and an external attendee's address (status 5.3, nothing
+/// sent).
 const FANOUT_EVENT: &str = concat!(
     "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\n",
     "UID:leak-fanout\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990104T090000Z\r\n",
@@ -113,6 +116,8 @@ const FANOUT_EVENT: &str = concat!(
     "LOCATION:fanoutloc-canary\r\nDESCRIPTION:fanoutdesc-canary\r\n",
     "ORGANIZER:mailto:key1@example.com\r\n",
     "ATTENDEE;CN=fanoutcn-canary;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:key2@example.com\r\n",
+    "ATTENDEE;CN=fanoutextcn-canary;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:",
+    "mailto:fanoutaddr-canary@remote.test\r\n",
     "END:VEVENT\r\nEND:VCALENDAR\r\n"
 );
 
@@ -862,6 +867,36 @@ pub async fn test(test: &mut TestServer) {
         0,
         "an invitation was queued as a task"
     );
+    // The organizer's stored event passes the structural check (`scan`
+    // checks only key2's records) and ends with its pair bundle, then its
+    // key envelope.
+    let (organizer_event, _) = raw_event(test, key1_id, "default/fo-leak.ics").await;
+    let mut organizer_violations = Vec::new();
+    let organizer = organizer_event.deserialize::<CalendarEvent>().unwrap();
+    check_event(&organizer, "key1 fo-leak.ics", &mut organizer_violations);
+    assert!(
+        organizer_violations.is_empty(),
+        "the organizer's event:\n{}",
+        organizer_violations.join("\n")
+    );
+    assert!(
+        ends_extra_then_key(&organizer.data.event),
+        "the organizer's root does not end {EXTRA_PROP} then {KEY_PROP}"
+    );
+    // The fan-out's token for key2 is in the clear nowhere, the held task
+    // queue included: its item carries it in the sealed bundle, and no
+    // reply item exists here.
+    let keys1 = za_unlock(test, key1_id, STRONG).await;
+    let fan_out_token = *event_token_pairs(&organizer_event, &keys1, key1_id)
+        .unwrap()
+        .expect("key1's bundle holds pairs")
+        .get("key2@example.com")
+        .expect("key2's pair");
+    let fan_out_hits = token_hits(test, &[fan_out_token]).await;
+    assert!(
+        fan_out_hits.is_empty(),
+        "the fan-out's token in the clear: {fan_out_hits:?}"
+    );
     drop(held);
     test.wait_for_tasks().await;
     client
@@ -1010,7 +1045,7 @@ pub async fn test(test: &mut TestServer) {
     // were seen before their envelopes.
     assert!(result.items >= 4, "{result:?}");
     assert_eq!(result.item_keys, result.items, "{result:?}");
-    assert!(result.item_extras >= 1, "{result:?}");
+    assert!(result.item_extras >= 2, "{result:?}");
     // The paired event's stored root ends with its pair bundle, then its key
     // envelope: the scan above checked an event that carries pairs.
     let (paired, _) = raw_event(test, id, "leak/pairs.ics").await;
@@ -1043,20 +1078,6 @@ pub async fn test(test: &mut TestServer) {
     assert!(
         stray.is_empty(),
         "a token in the clear outside the pending reply item: {stray:?}"
-    );
-    // The fan-out's token for key2 is in the clear nowhere: its item
-    // carries it in the sealed bundle, and no reply item exists here.
-    let keys1 = za_unlock(test, key1_id, STRONG).await;
-    let (organizer_event, _) = raw_event(test, key1_id, "default/fo-leak.ics").await;
-    let fan_out_token = *event_token_pairs(&organizer_event, &keys1, key1_id)
-        .unwrap()
-        .expect("key1's bundle holds pairs")
-        .get("key2@example.com")
-        .expect("key2's pair");
-    let fan_out_hits = token_hits(test, &[fan_out_token]).await;
-    assert!(
-        fan_out_hits.is_empty(),
-        "the fan-out's token in the clear: {fan_out_hits:?}"
     );
 
     // Negative control: an unsealed event planted directly must be caught,
