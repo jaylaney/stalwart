@@ -25,6 +25,7 @@ const LABEL_KEK: &[u8] = b"za/v1/kek";
 const LABEL_RKEK: &[u8] = b"za/v1/rkek";
 const LABEL_AKEK_PREFIX: &[u8] = b"za/v1/akek/";
 const LABEL_EVENTS: &[u8] = b"za/v1/events";
+const LABEL_PK: &[u8] = b"za/v1/pk";
 const AAD_PREFIX: &[u8] = b"za/v1|";
 
 /// A 32-byte secret that is zeroed on drop and never printed.
@@ -73,6 +74,8 @@ pub enum KeyError {
     Argon2,
     Length,
     Aead,
+    /// A public key whose shared secret is not contributory (low order).
+    PublicKey,
 }
 
 impl std::fmt::Display for KeyError {
@@ -81,6 +84,7 @@ impl std::fmt::Display for KeyError {
             KeyError::Argon2 => f.write_str("key derivation failed"),
             KeyError::Length => f.write_str("invalid ciphertext length"),
             KeyError::Aead => f.write_str("authentication failed"),
+            KeyError::PublicKey => f.write_str("invalid public key"),
         }
     }
 }
@@ -151,6 +155,11 @@ pub const AAD_PASSWORD: &str = "password";
 pub const AAD_RECOVERY: &str = "recovery";
 /// AAD purpose of the X25519 private key wrapped under MK.
 pub const AAD_PRIVATE_KEY: &str = "private-key";
+/// AAD purpose of a DEK wrapped to a recipient's public key (invitations
+/// spec 3.1). `aad` adds the `za/v1|` prefix.
+pub const AAD_PK_DEK: &str = "pk-dek";
+/// Length of an X25519 public key.
+pub const PUBLIC_KEY_LEN: usize = 32;
 
 /// Associated data naming the purpose and the account, so a ciphertext
 /// cannot be replayed as a different wrap or on a different account.
@@ -230,6 +239,57 @@ pub fn generate_keypair() -> ([u8; 32], Secret) {
     let secret = x25519_dalek::StaticSecret::from(*private.as_bytes());
     let public = x25519_dalek::PublicKey::from(&secret);
     (public.to_bytes(), private)
+}
+
+/// Wrapping key of a `pk` wrap: HKDF over the shared secret with the info
+/// `za/v1/pk || E || P` (ephemeral, then recipient public key), built by
+/// appending to the label as `derive_app_kek` does.
+fn pk_wrapping_key(
+    shared: &[u8; 32],
+    ephemeral: &[u8; PUBLIC_KEY_LEN],
+    recipient: &[u8; PUBLIC_KEY_LEN],
+) -> Secret {
+    let mut info = Vec::with_capacity(LABEL_PK.len() + 2 * PUBLIC_KEY_LEN);
+    info.extend_from_slice(LABEL_PK);
+    info.extend_from_slice(ephemeral);
+    info.extend_from_slice(recipient);
+    hkdf_expand(shared, &info)
+}
+
+/// Invitations spec 3.1: wraps `dek` to the X25519 public key `recipient`.
+/// Returns the ephemeral public key and `nonce || ciphertext`
+/// (`WRAP_LEN` bytes). The ephemeral private key is zeroed on return.
+pub fn pk_wrap(
+    dek: &Secret,
+    recipient: &[u8; PUBLIC_KEY_LEN],
+    aad: &[u8],
+) -> Result<([u8; PUBLIC_KEY_LEN], Vec<u8>), KeyError> {
+    let ephemeral = x25519_dalek::StaticSecret::from(*Secret::random().as_bytes());
+    let ephemeral_public = x25519_dalek::PublicKey::from(&ephemeral).to_bytes();
+    let shared = ephemeral.diffie_hellman(&x25519_dalek::PublicKey::from(*recipient));
+    if !shared.was_contributory() {
+        return Err(KeyError::PublicKey);
+    }
+    let wrapping = pk_wrapping_key(shared.as_bytes(), &ephemeral_public, recipient);
+    Ok((ephemeral_public, wrap_key(dek, &wrapping, aad)))
+}
+
+/// Opens a `pk_wrap` with the recipient's private key. Only the drain calls
+/// this (invariant 11).
+pub fn pk_unwrap(
+    ephemeral: &[u8; PUBLIC_KEY_LEN],
+    wrapped: &[u8],
+    private_key: &Secret,
+    aad: &[u8],
+) -> Result<Secret, KeyError> {
+    let secret = x25519_dalek::StaticSecret::from(*private_key.as_bytes());
+    let recipient = x25519_dalek::PublicKey::from(&secret).to_bytes();
+    let shared = secret.diffie_hellman(&x25519_dalek::PublicKey::from(*ephemeral));
+    if !shared.was_contributory() {
+        return Err(KeyError::PublicKey);
+    }
+    let wrapping = pk_wrapping_key(shared.as_bytes(), ephemeral, &recipient);
+    unwrap_key(wrapped, &wrapping, aad)
 }
 
 /// Keyed BLAKE3 fingerprint of an opaque value (used for cache keys that must
@@ -385,5 +445,90 @@ mod tests {
                 p_cost: 1
             }
         );
+    }
+
+    #[test]
+    fn pk_wrap_round_trips_for_the_recipient_only() {
+        let (public, private) = generate_keypair();
+        let dek = Secret::random();
+        let aad7 = aad(AAD_PK_DEK, 7);
+        let (ephemeral, wrapped) = pk_wrap(&dek, &public, &aad7).unwrap();
+        assert_eq!(wrapped.len(), WRAP_LEN);
+        assert_eq!(
+            pk_unwrap(&ephemeral, &wrapped, &private, &aad7)
+                .unwrap()
+                .as_bytes(),
+            dek.as_bytes()
+        );
+        // Another recipient's private key.
+        let (_, other) = generate_keypair();
+        assert_eq!(
+            pk_unwrap(&ephemeral, &wrapped, &other, &aad7).err(),
+            Some(KeyError::Aead)
+        );
+        // Associated data naming another account or another purpose.
+        for wrong in [aad(AAD_PK_DEK, 8), aad(AAD_PRIVATE_KEY, 7)] {
+            assert_eq!(
+                pk_unwrap(&ephemeral, &wrapped, &private, &wrong).err(),
+                Some(KeyError::Aead)
+            );
+        }
+        // The wrap moved under another ephemeral key.
+        let (other_ephemeral, _) = pk_wrap(&dek, &public, &aad7).unwrap();
+        assert_eq!(
+            pk_unwrap(&other_ephemeral, &wrapped, &private, &aad7).err(),
+            Some(KeyError::Aead)
+        );
+        // Tampered and truncated ciphertext.
+        let mut tampered = wrapped.clone();
+        tampered[40] ^= 1;
+        assert!(pk_unwrap(&ephemeral, &tampered, &private, &aad7).is_err());
+        assert!(pk_unwrap(&ephemeral, &wrapped[..WRAP_LEN - 1], &private, &aad7).is_err());
+    }
+
+    #[test]
+    fn two_pk_wraps_of_one_dek_differ() {
+        let (public, private) = generate_keypair();
+        let dek = Secret::random();
+        let aad1 = aad(AAD_PK_DEK, 1);
+        let (e1, w1) = pk_wrap(&dek, &public, &aad1).unwrap();
+        let (e2, w2) = pk_wrap(&dek, &public, &aad1).unwrap();
+        assert_ne!(e1, e2, "a fresh ephemeral key per wrap");
+        assert_ne!(w1, w2);
+        for (e, w) in [(e1, w1), (e2, w2)] {
+            assert_eq!(
+                pk_unwrap(&e, &w, &private, &aad1).unwrap().as_bytes(),
+                dek.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn pk_wrap_refuses_low_order_public_keys() {
+        let (public, private) = generate_keypair();
+        let dek = Secret::random();
+        let aad1 = aad(AAD_PK_DEK, 1);
+        assert_eq!(
+            pk_wrap(&dek, &[0u8; PUBLIC_KEY_LEN], &aad1).err(),
+            Some(KeyError::PublicKey)
+        );
+        let (_, wrapped) = pk_wrap(&dek, &public, &aad1).unwrap();
+        assert_eq!(
+            pk_unwrap(&[0u8; PUBLIC_KEY_LEN], &wrapped, &private, &aad1).err(),
+            Some(KeyError::PublicKey)
+        );
+    }
+
+    #[test]
+    fn pk_info_is_the_label_then_both_public_keys() {
+        let shared = [5u8; 32];
+        let (e, p) = ([1u8; 32], [2u8; 32]);
+        let mut info = LABEL_PK.to_vec();
+        info.extend_from_slice(&e);
+        info.extend_from_slice(&p);
+        let key = pk_wrapping_key(&shared, &e, &p);
+        assert_eq!(key.as_bytes(), hkdf_expand(&shared, &info).as_bytes());
+        assert_ne!(key.as_bytes(), pk_wrapping_key(&shared, &p, &e).as_bytes());
+        assert_ne!(key.as_bytes(), hkdf_expand(&shared, LABEL_PK).as_bytes());
     }
 }

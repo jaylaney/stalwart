@@ -144,7 +144,7 @@ To wrap a DEK to recipient account `r` with static public key `P`:
 | 1 | Generate an ephemeral X25519 keypair (`e`, `E`). |
 | 2 | Shared secret `s = X25519(e, P)`. |
 | 3 | Wrapping key: 32 bytes of HKDF-SHA256 over `s`, label `za/v1/pk`, with `E` and then `P` bound into the info input. |
-| 4 | XChaCha20-Poly1305 of the DEK under the wrapping key, 24-byte random nonce, associated data `aad("za/v1/pk-dek", r)`: the existing `wrap_key`, which yields `nonce || ciphertext`. |
+| 4 | XChaCha20-Poly1305 of the DEK under the wrapping key, 24-byte random nonce, associated data `aad("pk-dek", r) || "|" || uid` (section 9 has the full shape): the existing `wrap_key`, which yields `nonce || ciphertext`. |
 | 5 | Zeroize `e`. |
 
 The `X-ZA-KEY` bytes are `policy version || 0x02 || E (32 bytes) || wrapped
@@ -160,10 +160,9 @@ There is no HPKE library: one more dependency, and a format the fork does
 not control. The composition uses only `x25519-dalek`, `hkdf`, `sha2` and
 `chacha20poly1305`, already in `crates/vault` (`generate_keypair`,
 `wrap_key`, `seal`, `aad` in `crates/vault/src/keys.rs`). The associated
-data names the recipient account and the purpose in the existing
-`aad(purpose, account_id)` shape, so a `pk` wrap cannot be replayed as a
-master-key wrap or for another account. The sealed bundles bind the UID
-(section 5.3).
+data names the recipient account, the purpose and the UID in release 1's
+event-key shape (section 9), so a `pk` wrap cannot be replayed as a
+master-key wrap, for another account or for another UID.
 
 ### 3.2 The private key in session keys
 
@@ -408,8 +407,10 @@ For each internal recipient R of a message:
    1 section 6) with an `X-ZA-SEALED` property per affected component,
    associated data shaped like events' (`tree_aad`) with the scope `itip`:
    R's account id, `itip`, the component index and the policy version.
-   Seal R's token pair with the same DEK into the root's `X-ZA-EXTRA`.
-3. Append `X-ZA-KEY` to the root with the `pk` wrap to R (section 3.1).
+   Seal R's token pair with the same DEK into the root's `X-ZA-EXTRA`,
+   bound to R's account and the UID (section 9).
+3. Append `X-ZA-KEY` to the root with the `pk` wrap to R (section 3.1),
+   bound to R's account and the UID.
 4. Write a `CalendarEventNotification` (`crates/groupware/src/calendar/mod.rs`)
    into R's scheduling inbox collection with `event` the sealed tree,
    `event_id = None`, `changed_by = ChangedBy::PrincipalId(sender)`,
@@ -856,11 +857,14 @@ items) and `X-ZA-KEY`, the way events place `X-ZA-EXTRA` before
 |---|---|---|
 | Event (release 1) | `event-key`, account, UID | UID |
 | Collection timezone (release 1) | collection bundle | `calendar-tz` |
-| Pending inbox item | `aad("za/v1/pk-dek", recipient)` | `itip`, recipient's account id, component index |
-| Drained inbox item | event-key shape, owner, an `itip` purpose | `itip`, owner's account id, component index |
+| Pending inbox item | `pk-dek`, recipient, UID (the event-key shape) | `itip`, recipient's account id, component index |
+| Drained inbox item | `itip-key`, owner, UID (the event-key shape) | `itip`, owner's account id, component index |
 
-Inbox items use the one scope `itip` in both states; their `X-ZA-EXTRA`
-bundle is bound to the same scope and account.
+Inbox items use the one scope `itip` for their component bundles in both
+states. A pending item's `X-ZA-EXTRA` bundle is bound like an event's
+(`itip-extra`, recipient, UID). Both envelopes bind the UID, so an item's
+sealed parts cannot be moved onto another UID's record, as a release 1
+event's cannot.
 
 The policy version stays 1: release 2 changes no visibility.
 
@@ -1041,7 +1045,7 @@ Release 1's ten invariants hold. Release 2 adds:
 
 - **Names.** The sending state (`SendSealed`), the flag bit
   (`EVENT_NOTIFICATION_ZA_PENDING`), the HKDF label (`za/v1/pk`) and the
-  exact info layout, the wrap purpose string (`za/v1/pk-dek`, which the
+  exact info layout, the wrap purpose string (`pk-dek`, which the
   `aad` helper prefixes with `za/v1|`), the reply property
   (`X-ZA-RSVP-TOKEN`), the `X-ZA-EXTRA` format byte for bundles with token
   pairs (`2`), the inbox items' scope (`itip`) and drained key-envelope

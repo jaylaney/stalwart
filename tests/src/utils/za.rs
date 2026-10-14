@@ -5,21 +5,31 @@
  */
 
 use crate::utils::{account::Account, http::HttpRequest, server::TestServer};
-use calcard::common::timezone::Tz;
-use common::ipc::CacheInvalidation;
+use calcard::{common::timezone::Tz, icalendar::ICalendar};
+use common::{
+    auth::vault::ZaVerification, ipc::CacheInvalidation, storage::index::ObjectIndexBuilder,
+};
 use email::cache::MessageCacheFetch;
 use groupware::{
     cache::GroupwareCache,
-    calendar::{CalendarEvent, CalendarEventData},
+    calendar::{
+        CalendarEvent, CalendarEventData, CalendarEventNotification, ChangedBy,
+        EVENT_NOTIFICATION_ZA_PENDING,
+        seal::{TokenPairs, seal_drained_item, seal_event, seal_pending_item},
+    },
 };
 use http::auth::authenticate::za_test::{self, Pause};
 use hyper::{Method, StatusCode};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{future::Future, sync::Arc, time::Duration};
-use store::write::BatchBuilder;
+use store::{
+    ValueKey,
+    write::{AlignedBytes, Archive, BatchBuilder},
+};
 use tokio::task::JoinHandle;
 use types::collection::{Collection, SyncCollection};
+use vault::session::SessionKeys;
 
 /// The suite's HTTPS listener.
 pub const SERVER_URL: &str = "https://127.0.0.1:8899";
@@ -279,6 +289,21 @@ pub async fn park_endpoint(account_id: u32, path: &'static str, body: Value) -> 
     .await
 }
 
+/// The account's session keys, unlocked from `password` by the product's own
+/// login verification (`za_verify_password`: Argon2, verifier, MK unwrap), as
+/// a CalDAV login unlocks them.
+pub async fn za_unlock(test: &TestServer, account_id: u32, password: &str) -> Arc<SessionKeys> {
+    match test
+        .server
+        .za_verify_password(account_id, password, None)
+        .await
+        .unwrap()
+    {
+        ZaVerification::Valid(keys) => keys,
+        _ => panic!("the password does not unlock account {account_id}"),
+    }
+}
+
 /// Writes `ical` into the store as the event `name` in the account's
 /// calendar `calendar` (a slug such as "default"), bypassing the DAV
 /// handlers and so the seal. Such an event is what a legacy plaintext event
@@ -292,6 +317,44 @@ pub async fn plant_event(
     name: &str,
     ical: &str,
     schedule_tag: Option<u32>,
+) -> u32 {
+    insert_event(test, account_id, calendar, name, ical, schedule_tag, None).await
+}
+
+/// `plant_event`, sealed under the account's keys (unlocked from
+/// `password`) with `pairs` in a format 2 `X-ZA-EXTRA` bundle: the stored
+/// form of a key organizer's event once the fan-out (plan 9) hands out
+/// tokens. Returns the document id.
+pub async fn plant_sealed_event(
+    test: &TestServer,
+    account_id: u32,
+    calendar: &str,
+    name: &str,
+    ical: &str,
+    password: &str,
+    pairs: &TokenPairs,
+) -> u32 {
+    let keys = za_unlock(test, account_id, password).await;
+    insert_event(
+        test,
+        account_id,
+        calendar,
+        name,
+        ical,
+        None,
+        Some((&*keys, pairs)),
+    )
+    .await
+}
+
+async fn insert_event(
+    test: &TestServer,
+    account_id: u32,
+    calendar: &str,
+    name: &str,
+    ical: &str,
+    schedule_tag: Option<u32>,
+    seal: Option<(&SessionKeys, &TokenPairs)>,
 ) -> u32 {
     let calendar_id = test
         .server
@@ -307,7 +370,7 @@ pub async fn plant_event(
         other => panic!("{other:?}"),
     };
     let mut next_alarm = None;
-    let event = CalendarEvent {
+    let mut event = CalendarEvent {
         names: vec![common::DavName {
             name: name.into(),
             parent_id: calendar_id,
@@ -317,6 +380,9 @@ pub async fn plant_event(
         schedule_tag,
         ..Default::default()
     };
+    if let Some((keys, pairs)) = seal {
+        seal_event(&mut event, keys, account_id, Some(pairs)).unwrap();
+    }
     let account_info = test.server.account_info(account_id).await.unwrap();
     let document_id = test
         .server
@@ -387,4 +453,154 @@ pub async fn wait_for_delivery(test: &TestServer) {
     }
     // Ingest can queue index tasks of its own.
     test.wait_for_tasks().await;
+}
+
+/// How `plant_inbox_item` stores an item (invitations spec 9).
+pub enum PlantedItem<'a> {
+    /// Sealed to the account's public key, read from its vault record (the
+    /// fan-out's form, spec 5.3), pending bit set. `pair` is sealed into the
+    /// root's `X-ZA-EXTRA` (a REQUEST or CANCEL); `reply_token` becomes the
+    /// visible `X-ZA-RSVP-TOKEN` (a REPLY).
+    Pending {
+        pair: Option<(&'a str, [u8; 16])>,
+        reply_token: Option<[u8; 16]>,
+    },
+    /// Sealed under the account's keys, unlocked from `password` as a login
+    /// does (the drain's form, spec 6.4 step 5), pending bit clear.
+    Drained { password: &'a str },
+    /// Stored as given with `flags`: a plain account's item, or a key
+    /// account's legacy plaintext one.
+    Plain { flags: u16 },
+}
+
+fn parse_ical(ical: &str) -> ICalendar {
+    match calcard::Parser::new(ical).entry() {
+        calcard::Entry::ICalendar(ical) => ical,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Writes `ical` into the account's scheduling inbox as a
+/// `CalendarEventNotification` from `sender`, bypassing every handler: the
+/// fan-out (plan 9) and the drain (plan 10) that will write such items do not
+/// exist yet. `created` backdates the item (inbox expiry; upstream's
+/// `insert` would overwrite it). Returns the document id.
+pub async fn plant_inbox_item(
+    test: &TestServer,
+    account_id: u32,
+    ical: &str,
+    item: PlantedItem<'_>,
+    sender: u32,
+    created: Option<i64>,
+) -> u32 {
+    let mut tree = parse_ical(ical);
+    let flags = match item {
+        PlantedItem::Pending { pair, reply_token } => {
+            let record = test
+                .server
+                .za_vault_record(account_id)
+                .await
+                .unwrap()
+                .expect("vault record")
+                .record;
+            let public: [u8; 32] = record.public_key.as_slice().try_into().expect("public key");
+            let pairs = pair.map(|(address, token)| {
+                let mut pairs = TokenPairs::new();
+                pairs.insert(address, token);
+                pairs
+            });
+            seal_pending_item(
+                &mut tree,
+                account_id,
+                &public,
+                pairs.as_ref(),
+                reply_token.as_ref(),
+            )
+            .unwrap();
+            EVENT_NOTIFICATION_ZA_PENDING
+        }
+        PlantedItem::Drained { password } => {
+            let keys = za_unlock(test, account_id, password).await;
+            seal_drained_item(&mut tree, &keys, account_id).unwrap();
+            0
+        }
+        PlantedItem::Plain { flags } => flags,
+    };
+    let now = store::write::now() as i64;
+    let item = CalendarEventNotification {
+        event: tree,
+        event_id: None,
+        changed_by: ChangedBy::PrincipalId(sender),
+        flags,
+        size: ical.len() as u32,
+        created: created.unwrap_or(now),
+        modified: now,
+    };
+    let account_info = test.server.account_info(account_id).await.unwrap();
+    let document_id = test
+        .server
+        .store()
+        .assign_document_ids(account_id, Collection::CalendarEventNotification, 1)
+        .await
+        .unwrap();
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(account_id)
+        .with_collection(Collection::CalendarEventNotification)
+        .with_document(document_id)
+        .custom(
+            ObjectIndexBuilder::<(), _>::new()
+                .with_changes(item)
+                .with_changed_by(account_info.account_tenant_ids()),
+        )
+        .unwrap()
+        .commit_point();
+    test.server.commit_batch(batch).await.unwrap();
+    test.server
+        .invalidate_local_caches(&[CacheInvalidation::DavResources(account_id)])
+        .await;
+    document_id
+}
+
+/// Rewrites a planted item in place, same document id, as the drain's commit
+/// will (spec 6.4 step 5): `edit` changes the stored item, and the write
+/// asserts the archive it read.
+pub async fn rewrite_inbox_item(
+    test: &TestServer,
+    account_id: u32,
+    document_id: u32,
+    edit: impl FnOnce(&mut CalendarEventNotification),
+) {
+    let stored = test
+        .server
+        .store()
+        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            account_id,
+            Collection::CalendarEventNotification,
+            document_id,
+        ))
+        .await
+        .unwrap()
+        .expect("inbox item");
+    let mut item = stored.deserialize::<CalendarEventNotification>().unwrap();
+    edit(&mut item);
+    item.modified = store::write::now() as i64;
+    let account_info = test.server.account_info(account_id).await.unwrap();
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(account_id)
+        .with_collection(Collection::CalendarEventNotification)
+        .with_document(document_id)
+        .custom(
+            ObjectIndexBuilder::new()
+                .with_current(stored.to_unarchived::<CalendarEventNotification>().unwrap())
+                .with_changes(item)
+                .with_changed_by(account_info.account_tenant_ids()),
+        )
+        .unwrap()
+        .commit_point();
+    test.server.commit_batch(batch).await.unwrap();
+    test.server
+        .invalidate_local_caches(&[CacheInvalidation::DavResources(account_id)])
+        .await;
 }

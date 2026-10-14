@@ -17,14 +17,27 @@ use calcard::icalendar::{
     ICalendar, ICalendarComponent, ICalendarEntry, ICalendarParameter, ICalendarProperty,
     ICalendarValue,
 };
-use vault::keys::{Secret, aad, open, seal, unwrap_key, wrap_key};
+use std::borrow::Cow;
+use vault::keys::{
+    PUBLIC_KEY_LEN, Secret, WRAP_LEN, aad, open, pk_unwrap, pk_wrap, seal, unwrap_key, wrap_key,
+};
+use zeroize::{Zeroize, Zeroizing};
 
 pub const SEALED_PROP: &str = "X-ZA-SEALED";
 pub const KEY_PROP: &str = "X-ZA-KEY";
 pub const EXTRA_PROP: &str = "X-ZA-EXTRA";
 pub(crate) const FORMAT_V1: u8 = 1;
-/// Wrap type `mk` (spec 7.1). `0x02` is reserved for `pk`.
+/// Format of an `X-ZA-EXTRA` bundle that carries token pairs (invitations
+/// spec 9). Its associated data ends with `|` and this byte, so a flipped
+/// format byte fails authentication instead of decoding one plaintext
+/// struct as the other.
+pub(crate) const FORMAT_V2: u8 = 2;
+/// Wrap type `mk` (spec 7.1): the DEK wrapped under the account's event
+/// wrapping key.
 const WRAP_MK: u8 = 1;
+/// Wrap type `pk` (invitations spec 3.1): the DEK wrapped to a recipient's
+/// X25519 public key. Opened only by the drain (invariant 11).
+pub(super) const WRAP_PK: u8 = 2;
 const PAD: usize = 256;
 
 /// One component's removals. Entry indices refer to the original entry list;
@@ -166,28 +179,100 @@ pub(super) fn open_key_envelope(
     }
 }
 
+/// A `pk` key envelope: `policy version || 0x02 || E (32) || wrapped DEK
+/// (72)` (invitations spec 3.1, 9).
+pub(super) fn seal_pk_envelope(
+    dek: &Secret,
+    recipient_public: &[u8; PUBLIC_KEY_LEN],
+    aad: &[u8],
+) -> Result<Vec<u8>, SealError> {
+    let (ephemeral, wrapped) = pk_wrap(dek, recipient_public, aad)
+        .map_err(|_| SealError::Structure("recipient public key"))?;
+    let mut envelope = Vec::with_capacity(2 + PUBLIC_KEY_LEN + WRAP_LEN);
+    envelope.extend_from_slice(&[POLICY_VERSION, WRAP_PK]);
+    envelope.extend_from_slice(&ephemeral);
+    envelope.extend_from_slice(&wrapped);
+    Ok(envelope)
+}
+
+/// Opens a `seal_pk_envelope` with the recipient's private key.
+pub(super) fn open_pk_envelope(
+    envelope: &[u8],
+    private_key: &Secret,
+    aad: &[u8],
+) -> Result<Secret, SealError> {
+    match envelope {
+        [POLICY_VERSION, WRAP_PK, rest @ ..] if rest.len() == PUBLIC_KEY_LEN + WRAP_LEN => {
+            let (ephemeral, wrapped) = rest.split_at(PUBLIC_KEY_LEN);
+            let ephemeral: [u8; PUBLIC_KEY_LEN] =
+                ephemeral.try_into().map_err(|_| SealError::Format)?;
+            pk_unwrap(&ephemeral, wrapped, private_key, aad).map_err(|_| SealError::Aead)
+        }
+        [version, ..] if *version != POLICY_VERSION => Err(SealError::Policy(*version)),
+        _ => Err(SealError::Format),
+    }
+}
+
+/// The associated data a bundle of `format` is sealed under.
+fn format_aad(format: u8, aad: &[u8]) -> Cow<'_, [u8]> {
+    if format == FORMAT_V1 {
+        Cow::Borrowed(aad)
+    } else {
+        // The `|<format>` suffix follows the unescaped UID field, so a format 1
+        // AAD for UID `X|\x02` equals a format 2 AAD for UID `X`; harmless, because
+        // the DEK is reachable only through the UID-bound key envelope, which
+        // carries no such suffix.
+        let mut out = Vec::with_capacity(aad.len() + 2);
+        out.extend_from_slice(aad);
+        out.push(b'|');
+        out.push(format);
+        Cow::Owned(out)
+    }
+}
+
 /// Length prefix, zero padding to 256 bytes, XChaCha20-Poly1305, base64 of
 /// `format || nonce || ciphertext`.
 pub fn seal_bytes(dek: &Secret, aad: &[u8], plaintext: &[u8]) -> String {
-    let mut padded = Vec::with_capacity(4 + plaintext.len() + PAD);
+    seal_bytes_as(FORMAT_V1, dek, aad, plaintext)
+}
+
+/// `seal_bytes` with an explicit format byte (`FORMAT_V1` or `FORMAT_V2`).
+pub(super) fn seal_bytes_as(format: u8, dek: &Secret, aad: &[u8], plaintext: &[u8]) -> String {
+    // Capacity covers the padding, so `resize` never reallocates a copy.
+    let mut padded = Zeroizing::new(Vec::with_capacity(4 + plaintext.len() + PAD));
     padded.extend_from_slice(&(plaintext.len() as u32).to_le_bytes());
     padded.extend_from_slice(plaintext);
     let target = padded.len().div_ceil(PAD) * PAD;
     padded.resize(target, 0);
     let mut out = Vec::with_capacity(1 + padded.len() + 40);
-    out.push(FORMAT_V1);
-    out.extend_from_slice(&seal(dek, aad, &padded));
+    out.push(format);
+    out.extend_from_slice(&seal(dek, &format_aad(format, aad), &padded));
     STANDARD.encode(out)
 }
 
-pub fn open_bytes(dek: &Secret, aad: &[u8], text: &str) -> Result<Vec<u8>, SealError> {
+/// Opens a format 1 bundle.
+pub fn open_bytes(dek: &Secret, aad: &[u8], text: &str) -> Result<Zeroizing<Vec<u8>>, SealError> {
+    open_bytes_as(&[FORMAT_V1], dek, aad, text).map(|(_, plain)| plain)
+}
+
+/// Opens a bundle whose format byte is one of `formats`; returns that byte
+/// and the plaintext.
+pub(super) fn open_bytes_as(
+    formats: &[u8],
+    dek: &Secret,
+    aad: &[u8],
+    text: &str,
+) -> Result<(u8, Zeroizing<Vec<u8>>), SealError> {
     let raw = STANDARD
         .decode(text.trim())
         .map_err(|_| SealError::Decode)?;
-    let Some((&FORMAT_V1, sealed)) = raw.split_first() else {
+    let Some((&format, sealed)) = raw
+        .split_first()
+        .filter(|(format, _)| formats.contains(*format))
+    else {
         return Err(SealError::Format);
     };
-    let padded = open(dek, aad, sealed).map_err(|_| SealError::Aead)?;
+    let padded = open(dek, &format_aad(format, aad), sealed).map_err(|_| SealError::Aead)?;
     let len = padded
         .get(..4)
         .and_then(|b| <[u8; 4]>::try_from(b).ok())
@@ -196,23 +281,35 @@ pub fn open_bytes(dek: &Secret, aad: &[u8], text: &str) -> Result<Vec<u8>, SealE
     padded
         .get(4..)
         .and_then(|rest| rest.get(..len))
-        .map(|s| s.to_vec())
+        .map(|s| (format, Zeroizing::new(s.to_vec())))
         .ok_or(SealError::Format)
 }
 
-/// `open_bytes`, then a checked rkyv decode of the plaintext. rkyv
-/// validates alignment and the decrypted bytes carry no guarantee, so they
-/// are copied into an aligned buffer first.
+/// A checked rkyv decode of opened plaintext. rkyv validates alignment and
+/// decrypted bytes carry no guarantee, so they are copied into an aligned
+/// buffer first; the copy is zeroed after decoding.
+pub(super) fn decode_archive<T>(plain: &[u8]) -> Result<T, SealError>
+where
+    T: rkyv::Archive,
+    T::Archived: for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>
+        + rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>,
+{
+    let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(plain.len());
+    aligned.extend_from_slice(plain);
+    let decoded =
+        rkyv::from_bytes::<T, rkyv::rancor::Error>(&aligned).map_err(|_| SealError::Format);
+    aligned.as_mut_slice().zeroize();
+    decoded
+}
+
+/// `open_bytes`, then `decode_archive`.
 pub(super) fn open_archive<T>(dek: &Secret, aad: &[u8], text: &str) -> Result<T, SealError>
 where
     T: rkyv::Archive,
     T::Archived: for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>
         + rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>,
 {
-    let plain = open_bytes(dek, aad, text)?;
-    let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(plain.len());
-    aligned.extend_from_slice(&plain);
-    rkyv::from_bytes::<T, rkyv::rancor::Error>(&aligned).map_err(|_| SealError::Format)
+    decode_archive(&open_bytes(dek, aad, text)?)
 }
 
 fn seal_component(component: &mut ICalendarComponent, dek: &Secret, aad: &[u8]) -> bool {

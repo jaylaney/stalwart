@@ -6,10 +6,19 @@
 
 use crate::{DavError, DavResourceName};
 use common::{Server, auth::AccessToken};
-use groupware::calendar::seal::{seal_error, unseal_calendar_archive, unseal_event_archive};
+use groupware::calendar::{
+    CalendarEventNotification,
+    seal::{
+        archived_item_is_pending, seal_error, unseal_calendar_archive, unseal_event_archive,
+        unseal_item_archive,
+    },
+};
 use hyper::StatusCode;
 use std::{borrow::Cow, future::Future, sync::Arc};
-use store::write::{AlignedBytes, Archive};
+use store::{
+    ValueKey,
+    write::{AlignedBytes, Archive},
+};
 use trc::AddContext;
 use types::collection::Collection;
 use vault::session::SessionKeys;
@@ -154,10 +163,99 @@ pub(crate) fn za_calendar_view<'x>(
     }
 }
 
-/// The PROPFIND loader's per-item view: only calendar collections and events
-/// consult the gate (outer `Err` is the 403 that fails the request); an
-/// unseal failure (inner `Err`) fails one item. Other collections borrow the
-/// stored archive with no lookup.
+/// Invitations spec 6.6: the inbox counterpart of [`za_event_view`], same
+/// contract. A drained item is unsealed under the account's keys; a pending
+/// (`pk`) item reached here is an unseal failure (spec 10): the caller
+/// answers 500 for it and changes nothing.
+pub(crate) fn za_item_view<'x>(
+    stored: &'x Archive<AlignedBytes>,
+    keys: Option<&Arc<SessionKeys>>,
+    account_id: u32,
+    document_id: u32,
+) -> trc::Result<Cow<'x, Archive<AlignedBytes>>> {
+    match keys {
+        Some(keys) => unseal_item_archive(stored, keys, account_id)
+            .map(Cow::Owned)
+            .map_err(|err| seal_error(err, account_id, document_id)),
+        None => Ok(Cow::Borrowed(stored)),
+    }
+}
+
+/// Invitations spec 6.6: whether a loaded archive is a key account's pending
+/// inbox item, which clients do not see until the drain rewrites it. `false`
+/// for every other collection and for non-key accounts (invariant 9). The
+/// gate runs before the pending bit is read: a key account's item read
+/// without its keys is the gate's 403 and trace (release 1 spec 10). The
+/// resource cache knows no flags, so readers ask here after loading.
+pub(crate) async fn za_item_hidden(
+    server: &Server,
+    access_token: &AccessToken,
+    account_id: u32,
+    collection: Collection,
+    stored: &Archive<AlignedBytes>,
+) -> crate::Result<bool> {
+    if !za_reads_pending_bit(server, access_token, account_id, collection).await? {
+        return Ok(false);
+    }
+    stored_item_is_pending(stored)
+}
+
+/// Invitations spec 6.6: [`za_item_hidden`] for a path taken from the
+/// resource cache whose archive is not loaded, as the `propname` form of
+/// PROPFIND has it: a listing (depth 1) and a request naming the item
+/// (depth 0). A calendar-multiget never gets here for an inbox item, since
+/// the guard in `multiget` reads hrefs only from the calendar collection.
+/// Same gate, so other collections and non-key accounts answer `false` with
+/// no store read; a missing archive is listed as upstream lists it.
+pub(crate) async fn za_cached_item_hidden(
+    server: &Server,
+    access_token: &AccessToken,
+    account_id: u32,
+    collection: Collection,
+    document_id: u32,
+) -> crate::Result<bool> {
+    if !za_reads_pending_bit(server, access_token, account_id, collection).await? {
+        return Ok(false);
+    }
+    match server
+        .store()
+        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(account_id, collection, document_id))
+        .await
+        .caused_by(trc::location!())?
+    {
+        Some(stored) => stored_item_is_pending(&stored),
+        None => Ok(false),
+    }
+}
+
+/// The gate both readers above run before the pending bit is read: `false`
+/// outside the inbox (no lookup) and for a non-key account, the gate's 403
+/// for a key account's item read without its keys.
+async fn za_reads_pending_bit(
+    server: &Server,
+    access_token: &AccessToken,
+    account_id: u32,
+    collection: Collection,
+) -> crate::Result<bool> {
+    Ok(collection == Collection::CalendarEventNotification
+        && server
+            .za_session_keys(access_token, account_id)
+            .await?
+            .is_some())
+}
+
+fn stored_item_is_pending(stored: &Archive<AlignedBytes>) -> crate::Result<bool> {
+    Ok(archived_item_is_pending(
+        stored
+            .unarchive::<CalendarEventNotification>()
+            .caused_by(trc::location!())?,
+    ))
+}
+
+/// The PROPFIND loader's per-item view: only calendar collections, events
+/// and inbox items consult the gate (outer `Err` is the 403 that fails the
+/// request); an unseal failure (inner `Err`) fails one item. Other
+/// collections borrow the stored archive with no lookup.
 pub(crate) async fn za_archive_view<'x>(
     server: &Server,
     access_token: &AccessToken,
@@ -174,6 +272,10 @@ pub(crate) async fn za_archive_view<'x>(
         Collection::CalendarEvent => {
             let keys = server.za_session_keys(access_token, account_id).await?;
             za_event_view(stored, keys.as_ref(), account_id, document_id)
+        }
+        Collection::CalendarEventNotification => {
+            let keys = server.za_session_keys(access_token, account_id).await?;
+            za_item_view(stored, keys.as_ref(), account_id, document_id)
         }
         _ => Ok(Cow::Borrowed(stored)),
     })

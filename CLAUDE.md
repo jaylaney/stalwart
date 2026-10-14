@@ -43,7 +43,7 @@ Storage: `store` abstracts RocksDB, SQLite, FoundationDB, PostgreSQL and MySQL. 
 
 Caches (`common::Caches`): account and access-token caches, `http_auth`, the zero-access key cache `za_keys`, DAV resource caches. `CacheInvalidation` (`common/src/ipc.rs`) is broadcast across cluster nodes. Cache loaders are fenced by `Caches::account_epoch`.
 
-Test harness: `TestServer`/`TestServerBuilder` (`tests/src/utils/server.rs`), one server per suite on port 8899 with self-signed TLS. `Account` helpers in `tests/src/utils/account.rs` (`create_key_user_account` makes a zero-access account); fork helpers in `tests/src/utils/za.rs`. Every sub-module ends with `assert_is_empty`, which scans every store subspace (`tests/src/utils/cleanup.rs`); vault records are exempted there only while their account still exists, and the key-account suites destroy their key accounts at the end.
+Test harness: `TestServer`/`TestServerBuilder` (`tests/src/utils/server.rs`), one server per suite on port 8899 with self-signed TLS. `Account` helpers in `tests/src/utils/account.rs` (`create_key_user_account` makes a zero-access account); fork helpers in `tests/src/utils/za.rs`. `assert_is_empty` scans every store subspace (`tests/src/utils/cleanup.rs`); upstream's `webdav_tests` sub-modules call it at their end, while the za suite calls it once, at the very end (`tests/src/za/mod.rs`) after destroying its key accounts, so za sub-modules must delete what they create. Vault records are exempted there only while their account still exists.
 
 ## Zero-access fork
 
