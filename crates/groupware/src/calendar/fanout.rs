@@ -520,12 +520,20 @@ async fn write_item_inner(
         .account(recipient_id)
         .await
         .caused_by(trc::location!())?;
-    if server
+    // Only a quota limit is "over quota"; any other error reaches the
+    // `write_item` trace (as upstream's `copy_message` matches it).
+    match server
         .has_available_quota(account.as_ref(), size as u64)
         .await
-        .is_err()
     {
-        return Ok(false);
+        Ok(_) => {}
+        Err(err)
+            if err.matches(trc::EventType::Limit(trc::LimitEvent::Quota))
+                || err.matches(trc::EventType::Limit(trc::LimitEvent::TenantQuota)) =>
+        {
+            return Ok(false);
+        }
+        Err(err) => return Err(err.caused_by(trc::location!())),
     }
     // Steps 1-3 (plan 8): the tree sealed to the recipient's public key.
     let mut tree = message.clone();

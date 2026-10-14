@@ -30,6 +30,8 @@ use xxhash_rust::xxh3::xxh3_64;
 
 /// Lease duration when `ZA_UID_LEASE_SECS` is unset (spec 6.3).
 pub const DEFAULT_LEASE_SECS: u64 = 30;
+/// Upper bound of `ZA_UID_LEASE_SECS`; a larger value is clamped to it.
+pub const MAX_LEASE_SECS: u64 = 3600;
 /// Further attempts at a held lease, `LEASE_RETRY_WAIT` apart.
 pub const LEASE_RETRIES: u32 = 20;
 pub const LEASE_RETRY_WAIT: Duration = Duration::from_millis(50);
@@ -41,12 +43,14 @@ pub const LEASE_KEY_LEN: usize = 1 + 4 + 32;
 static LEASE_SECS: LazyLock<u64> =
     LazyLock::new(|| lease_secs_from(std::env::var("ZA_UID_LEASE_SECS").ok().as_deref()));
 
-/// `ZA_UID_LEASE_SECS`: unset, malformed or zero uses the default.
+/// `ZA_UID_LEASE_SECS`, in seconds, within `1..=MAX_LEASE_SECS`: unset,
+/// malformed or zero uses the default; a value above `MAX_LEASE_SECS` is
+/// clamped to it.
 fn lease_secs_from(value: Option<&str>) -> u64 {
     value
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|secs| *secs > 0)
-        .unwrap_or(DEFAULT_LEASE_SECS)
+        .map_or(DEFAULT_LEASE_SECS, |secs| secs.min(MAX_LEASE_SECS))
 }
 
 /// How long a new lease lasts: `ZA_UID_LEASE_SECS`, read once per process,
@@ -127,7 +131,7 @@ impl ZaUidLease {
                 continue;
             }
             let mut value = Vec::with_capacity(U64_LEN + FENCE_LEN);
-            value.extend_from_slice(&(now + lease_secs()).to_be_bytes());
+            value.extend_from_slice(&now.saturating_add(lease_secs()).to_be_bytes());
             value.extend_from_slice(&rand::random::<[u8; FENCE_LEN]>());
             let mut batch = BatchBuilder::new();
             batch.assert_value(
@@ -159,7 +163,10 @@ impl ZaUidLease {
 
     /// Spec 6.3 step 4: clears the key if it still holds this holder's
     /// value, so a holder never removes a successor's lease. Returns whether
-    /// it cleared it. A failure is traced; the key then expires and plan
+    /// the key is gone: cleared here, or already absent (the maintenance
+    /// purge swept the expired lease, which after a fenced commit is
+    /// benign and not traced). A key holding another value, or a store
+    /// error, is traced and returns `false`; the key then expires and plan
     /// 10's sweep removes it.
     pub async fn release(self, store: &Store) -> bool {
         let mut batch = BatchBuilder::new();
@@ -167,17 +174,26 @@ impl ZaUidLease {
             lease_class(self.key.clone()),
             AssertValue::Hash(xxh3_64(&self.value)),
         );
-        batch.clear(lease_class(self.key));
-        match store.write(batch.build_all()).await {
-            Ok(_) => true,
-            Err(err) => {
-                trc::error!(
-                    err.details("zero-access: UID creation lease not released")
-                        .caused_by(trc::location!())
-                );
-                false
-            }
+        batch.clear(lease_class(self.key.clone()));
+        let err = match store.write(batch.build_all()).await {
+            Ok(_) => return true,
+            Err(err) => err,
+        };
+        if err.is_assertion_failure()
+            && matches!(
+                store
+                    .get_value::<RawValue>(ValueKey::from(lease_class(self.key)))
+                    .await,
+                Ok(None)
+            )
+        {
+            return true;
         }
+        trc::error!(
+            err.details("zero-access: UID creation lease not released")
+                .caused_by(trc::location!())
+        );
+        false
     }
 }
 
@@ -289,6 +305,27 @@ mod tests {
         assert_eq!(lease_secs_from(Some(" 7 ")), 7);
         assert_eq!(lease_secs_from(Some("0")), DEFAULT_LEASE_SECS);
         assert_eq!(lease_secs_from(Some("soon")), DEFAULT_LEASE_SECS);
+        assert_eq!(lease_secs_from(Some("3600")), MAX_LEASE_SECS);
+        assert_eq!(lease_secs_from(Some("3601")), MAX_LEASE_SECS);
+        assert_eq!(lease_secs_from(Some(&u64::MAX.to_string())), MAX_LEASE_SECS);
+    }
+
+    #[tokio::test]
+    async fn a_purged_lease_counts_as_released() {
+        let store = EphemeralStore::open();
+        let lease = ZaUidLease::acquire(&store, 5, "purged")
+            .await
+            .unwrap()
+            .unwrap();
+        // The maintenance purge removed the expired key after the commit.
+        let mut batch = BatchBuilder::new();
+        batch.clear(lease_class(lease_key(5, "purged")));
+        store.write(batch.build_all()).await.unwrap();
+        assert!(
+            lease.release(&store).await,
+            "an absent key is already released"
+        );
+        assert!(stored(&store, 5, "purged").await.is_none());
     }
 
     #[tokio::test]

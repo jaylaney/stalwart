@@ -108,6 +108,7 @@ pub async fn za_tests() {
     fanout::test_task_queue(&mut test).await;
     fanout::test(&mut test).await;
     fanout::test_failures(&mut test).await;
+    fanout::test_plain_owner(&mut test).await;
     reply::test(&mut test).await;
     uid_lease::test(&mut test).await;
     tracing::test(&mut test).await;

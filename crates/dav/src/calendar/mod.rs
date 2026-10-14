@@ -249,14 +249,19 @@ pub(crate) async fn za_commit_create(
             Ok(())
         }
         Err(err) if err.is_assertion_failure() => {
-            lease.abandon();
-            let retry = za_take_uid_lease(server, resources, account_id, calendar_id, uid).await?;
-            retry.release().await;
+            // Traced first, so a busy lease or a 412 from the retake does not
+            // hide that the fence was lost.
             trc::event!(
                 Store(trc::StoreEvent::AssertValueFailed),
                 AccountId = account_id,
                 Details = "zero-access: UID creation lease lost before the commit",
             );
+            lease.abandon();
+            let retry = za_take_uid_lease(server, resources, account_id, calendar_id, uid).await?;
+            retry.release().await;
+            // Reached only when another creator took the lease and did not
+            // store the UID in this calendar (a PUT into another calendar, or
+            // plan 10's drain failing).
             Err(DavError::Code(StatusCode::SERVICE_UNAVAILABLE))
         }
         Err(err) => {

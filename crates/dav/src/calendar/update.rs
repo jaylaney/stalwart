@@ -247,6 +247,7 @@ impl CalendarUpdateRequestHandler for Server {
                 access_token,
                 &account_info,
                 new_event.data.event_range_end(),
+                za_keys.is_some(),
             );
             if itip_status.builds_messages() {
                 let result = if new_event.schedule_tag.is_some() {
@@ -421,22 +422,23 @@ impl CalendarUpdateRequestHandler for Server {
             .await?;
 
             // Validate ical object
-            let uid = validate_ical(&ical)?.to_string();
+            let uid = validate_ical(&ical)?;
             // Invitations spec 5.1, 6.3: a key account's create holds the UID
             // creation lease from here through the insert, and checks current
             // archives instead of the snapshot.
             let za_lease = if za_keys.is_some() {
-                Some(
-                    za_take_uid_lease(self, &resources, account_id, parent.document_id(), &uid)
+                Some((
+                    za_take_uid_lease(self, &resources, account_id, parent.document_id(), uid)
                         .await?,
-                )
+                    uid.to_string(),
+                ))
             } else {
                 assert_is_unique_uid(
                     self,
                     &resources,
                     account_id,
                     parent.document_id(),
-                    Some(uid.as_str()),
+                    uid.into(),
                 )
                 .await?;
                 None
@@ -468,6 +470,7 @@ impl CalendarUpdateRequestHandler for Server {
                 access_token,
                 &account_info,
                 event.data.event_range_end(),
+                za_keys.is_some(),
             );
             if itip_status.builds_messages() {
                 match itip_create(&mut event.data.event, account_info.addresses()) {
@@ -547,7 +550,7 @@ impl CalendarUpdateRequestHandler for Server {
             let mut batch = BatchBuilder::new();
             // Spec 6.3 step 3: the insert is fenced on the lease, in the same
             // transaction (ahead of the insert, so no commit point splits them).
-            if let Some(lease) = &za_lease {
+            if let Some((lease, _)) = &za_lease {
                 lease.lease().assert_in(&mut batch);
             }
             let document_id = self
@@ -571,7 +574,7 @@ impl CalendarUpdateRequestHandler for Server {
                     .queue(&mut batch)
                     .caused_by(trc::location!())?;
             }
-            if let Some(lease) = za_lease {
+            if let Some((lease, uid)) = za_lease {
                 za_commit_create(
                     self,
                     &resources,

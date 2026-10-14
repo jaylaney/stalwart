@@ -434,6 +434,8 @@ impl CalendarEventSet for Server {
                     access_token,
                     &account_info,
                     new_calendar_event.data.event_range_end(),
+                    // JMAP refuses key accounts; one arriving here builds nothing (SendSealed).
+                    account_info.account().is_key_account(),
                 )
             } else {
                 ItipSendStatus::NotRequested
@@ -643,6 +645,8 @@ impl CalendarEventSet for Server {
                     access_token,
                     &account_info,
                     calendar_event.inner.data.event_range_end(),
+                    // JMAP refuses key accounts; one arriving here builds nothing (SendSealed).
+                    account_info.account().is_key_account(),
                 )
             } else {
                 ItipSendStatus::NotRequested
@@ -833,6 +837,8 @@ impl CalendarEventSet for Server {
                 access_token,
                 account_info,
                 event.data.event_range_end(),
+                // JMAP refuses key accounts; one arriving here builds nothing (SendSealed).
+                account_info.account().is_key_account(),
             )
         } else {
             ItipSendStatus::NotRequested

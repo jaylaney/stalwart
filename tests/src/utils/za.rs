@@ -601,7 +601,7 @@ pub fn item_method(ical: &ICalendar) -> Option<ICalendarMethod> {
     itip_method(ical).ok().cloned()
 }
 
-/// The SEQUENCE of the first VEVENT.
+/// The first SEQUENCE found across the VEVENTs, in component order.
 pub fn item_sequence(ical: &ICalendar) -> Option<i64> {
     ical.components
         .iter()

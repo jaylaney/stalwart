@@ -16,7 +16,7 @@ use crate::utils::{
     za::{
         envelope_wrap, hold_task_consumer, inbox_ids, item_attendees, item_method, item_sequence,
         itip_tasks_for, mail_count, new_inbox_items, open_pending_item_as, schedule_statuses,
-        wait_for_delivery, za_unlock,
+        wait_for_delivery, za_uid_leases, za_unlock,
     },
 };
 use ::registry::{
@@ -27,7 +27,10 @@ use ::registry::{
     },
     types::{EnumImpl, map::Map},
 };
-use calcard::icalendar::{ICalendarMethod, ICalendarProperty};
+use calcard::{
+    Entry, Parser,
+    icalendar::{ICalendarMethod, ICalendarProperty},
+};
 use common::za::test_hooks;
 use groupware::calendar::{
     ChangedBy, EVENT_NOTIFICATION_ZA_PENDING,
@@ -137,6 +140,20 @@ pub async fn attendee_statuses(
         .unwrap();
     assert!(!body.contains("X-ZA-"), "{body}");
     schedule_statuses(&body, ICalendarProperty::Attendee, address)
+}
+
+/// The SEQUENCE of the event at `path`, as its owner's client reads it.
+pub async fn stored_sequence(client: &DummyWebDavClient, path: &str) -> i64 {
+    let body = client
+        .request("GET", path, "")
+        .await
+        .with_status(StatusCode::OK)
+        .body
+        .unwrap();
+    match Parser::new(&body).entry() {
+        Entry::ICalendar(ical) => item_sequence(&ical).expect("a stored SEQUENCE"),
+        other => panic!("not an iCalendar body: {other:?}"),
+    }
 }
 
 /// The token an opened item's pair carries for `address`.
@@ -453,6 +470,10 @@ pub async fn test(test: &mut TestServer) {
 
     // 2 (continued). key1 DELETEs the event: each internal attendee gets a
     // CANCEL built from the unsealed stored tree, with its pair (spec 5.5).
+    // Each CANCEL carries the stored SEQUENCE plus one; plain (5.3) gets no
+    // mail.
+    let stored_sequence = stored_sequence(&key1.client, &mixed).await;
+    let plain_mail = mail_count(test, plain_id).await;
     let before2 = inbox_ids(test, key2.id).await;
     let before3 = inbox_ids(test, key3.id).await;
     key1.client
@@ -463,11 +484,27 @@ pub async fn test(test: &mut TestServer) {
     assert_eq!(items.len(), 1, "key3 gets one CANCEL");
     let (tree, carriers) = open_pending_item_as(test, key3.id, STRONG, items[0].0).await;
     assert_eq!(item_method(&tree), Some(ICalendarMethod::Cancel));
+    assert_eq!(item_sequence(&tree), Some(stored_sequence + 1));
     assert_eq!(
         pair_token(carriers.pair.as_ref(), "key3@example.com"),
         key3_token
     );
-    assert_eq!(new_inbox_items(test, key2.id, &before2).await.len(), 1);
+    let items = new_inbox_items(test, key2.id, &before2).await;
+    assert_eq!(items.len(), 1, "key2 gets one CANCEL");
+    let (tree, carriers) = open_pending_item_as(test, key2.id, STRONG, items[0].0).await;
+    assert_eq!(item_method(&tree), Some(ICalendarMethod::Cancel));
+    assert_eq!(item_sequence(&tree), Some(stored_sequence + 1));
+    assert_eq!(
+        pair_token(carriers.pair.as_ref(), "key2@example.com"),
+        key2_new_token,
+        "key2's CANCEL carries its renewed pair"
+    );
+    wait_for_delivery(test).await;
+    assert_eq!(
+        mail_count(test, plain_id).await,
+        plain_mail,
+        "the DELETE mailed plain"
+    );
 
     // A collection DELETE cancels each scheduled event in it.
     let collection = "/dav/cal/key1%40example.com/fo-collection/";
@@ -486,6 +523,15 @@ pub async fn test(test: &mut TestServer) {
             .await
             .with_status(StatusCode::CREATED);
     }
+    let mut coll_tokens = Vec::new();
+    for uid in ["za-fo-coll-1", "za-fo-coll-2"] {
+        let token = *stored_pairs(test, &keys1, key1.id, &format!("fo-collection/{uid}.ics"))
+            .await
+            .unwrap()
+            .get("key2@example.com")
+            .unwrap();
+        coll_tokens.push((uid, token));
+    }
     let before2 = inbox_ids(test, key2.id).await;
     key1.client
         .request("DELETE", collection, "")
@@ -493,8 +539,18 @@ pub async fn test(test: &mut TestServer) {
         .with_status(StatusCode::NO_CONTENT);
     let items = new_inbox_items(test, key2.id, &before2).await;
     assert_eq!(items.len(), 2, "one CANCEL per scheduled event");
-    for (_, item) in &items {
+    for (item_id, item) in &items {
         assert_eq!(item_method(&item.event), Some(ICalendarMethod::Cancel));
+        let (tree, carriers) = open_pending_item_as(test, key2.id, STRONG, *item_id).await;
+        let (_, token) = coll_tokens
+            .iter()
+            .find(|(uid, _)| tree.uids().any(|item_uid| item_uid == *uid))
+            .expect("the CANCEL names one of the collection's events");
+        assert_eq!(
+            pair_token(carriers.pair.as_ref(), "key2@example.com"),
+            *token,
+            "a collection CANCEL carries its event's pair"
+        );
     }
 
     // Review Focus 2: an update that removes every ATTENDEE sends only
@@ -979,4 +1035,113 @@ pub async fn test_task_queue(test: &mut TestServer) {
         .with_status(StatusCode::NO_CONTENT);
     key2.delete_items_since(test, &start2).await;
     wait_for_delivery(test).await;
+}
+
+const SHARED_PLAIN: &str = "/dav/cal/plain%40example.com/default/fo-shared.ics";
+
+/// Final review F1: the sending state follows the calendar owner's key
+/// status, not the authenticated account's. key1 (a key account) writes an
+/// invitation into plain's shared calendar: upstream's path, a task and then
+/// mail, for the PUT and for the DELETE; no item and no lease.
+pub async fn test_plain_owner(test: &mut TestServer) {
+    println!("Running zero-access plain-owner scheduling tests...");
+    let key1 = Party::new(test, "key1@example.com");
+    let key2 = Party::new(test, "key2@example.com");
+    let plain = test.account("plain@example.com").clone();
+    let plain_id = plain.id().document_id();
+    let plain_client = DummyWebDavClient::new(plain_id, plain.name(), plain.secret(), plain.name());
+    let start2 = inbox_ids(test, key2.id).await;
+    let key2_mail = mail_count(test, key2.id).await;
+
+    // As release 1's `dav_gate` does: plain grants key1 write access to its
+    // `default` calendar (created here: earlier modules removed plain's).
+    plain_client
+        .request(
+            "MKCALENDAR",
+            "/dav/cal/plain%40example.com/default/",
+            MKCALENDAR,
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    plain_client
+        .acl(
+            "/dav/cal/plain@example.com/default/",
+            "/dav/pal/key1%40example.com/",
+            ["read", "write"],
+        )
+        .await
+        .with_status(StatusCode::OK);
+
+    let held = hold_task_consumer(test).await;
+    key1.client
+        .request_with_headers(
+            "PUT",
+            SHARED_PLAIN,
+            [CONTENT_TYPE],
+            invite("za-fo-shared", START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(
+        itip_tasks_for(test, plain_id).await,
+        1,
+        "a key user's invitation into a plain calendar was dropped"
+    );
+    assert_eq!(
+        inbox_ids(test, key2.id).await,
+        start2,
+        "a plain calendar's invitation reached key2's inbox"
+    );
+    assert_eq!(
+        za_uid_leases(test).await,
+        0,
+        "a plain calendar's create took a lease"
+    );
+    drop(held);
+    wait_for_delivery(test).await;
+    assert_eq!(
+        mail_count(test, key2.id).await,
+        key2_mail + 1,
+        "the invitation reached key2 as mail"
+    );
+
+    // The DELETE (no `Schedule-Reply: F`) follows the owner too: upstream's
+    // CANCEL task.
+    let held = hold_task_consumer(test).await;
+    key1.client
+        .request("DELETE", SHARED_PLAIN, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    assert_eq!(
+        itip_tasks_for(test, plain_id).await,
+        1,
+        "the DELETE in a plain calendar queued no CANCEL"
+    );
+    assert_eq!(
+        inbox_ids(test, key2.id).await,
+        start2,
+        "a plain calendar's CANCEL reached key2's inbox"
+    );
+    drop(held);
+    wait_for_delivery(test).await;
+    assert_eq!(
+        mail_count(test, key2.id).await,
+        key2_mail + 2,
+        "the CANCEL reached key2 as mail"
+    );
+
+    // Cleanup: revoke the grant; `plain` outlives the suite, so drop the
+    // calendar.
+    plain_client
+        .acl(
+            "/dav/cal/plain@example.com/default/",
+            "/dav/pal/key1%40example.com/",
+            [],
+        )
+        .await
+        .with_status(StatusCode::OK);
+    plain_client
+        .request("DELETE", "/dav/cal/plain@example.com/default", "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
 }

@@ -1066,11 +1066,16 @@ fn build_rsvp_invitation(
 }
 
 impl ItipSendStatus {
+    /// `owner_is_key`: whether the calendar's owner is a key account. The
+    /// sending state follows the owner, not the authenticated account
+    /// (invitations spec 5.1): a key account writing into a plain account's
+    /// shared calendar takes upstream's `Send`.
     pub fn resolve(
         server: &Server,
         access_token: &AccessToken,
         account_info: &AccountInfo,
         event_range_end: i64,
+        owner_is_key: bool,
     ) -> Self {
         if !server.core.groupware.itip_enabled {
             Self::SchedulingDisabled
@@ -1080,7 +1085,7 @@ impl ItipSendStatus {
             Self::NoPermission
         } else if event_range_end <= now() as i64 {
             Self::EventInPast
-        } else if account_info.account().is_key_account() {
+        } else if owner_is_key {
             Self::SendSealed
         } else {
             Self::Send
