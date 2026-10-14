@@ -567,9 +567,10 @@ pub async fn test_scheduling(test: &mut TestServer) {
         .await
         .with_status(StatusCode::NO_CONTENT);
 
-    // The DELETE gate itself (`send_itip` off for key accounts): a legacy
-    // plaintext event with a schedule tag and a visible attendee is what a
-    // CANCEL can be built from, so only the gate stops one here.
+    // A legacy plaintext event with a schedule tag and a visible attendee:
+    // a key account's DELETE builds its CANCEL (invitations spec 5.5), and
+    // the fan-out does not attempt plain, a non-key account, so no mail
+    // leaves.
     plant_event(
         test,
         key1_id,

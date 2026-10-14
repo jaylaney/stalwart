@@ -14,8 +14,9 @@ use crate::utils::{
     server::TestServer,
     webdav::DummyWebDavClient,
     za::{
-        envelope_wrap, inbox_ids, item_attendees, item_method, item_sequence, mail_count,
-        new_inbox_items, open_pending_item_as, schedule_statuses, wait_for_delivery, za_unlock,
+        envelope_wrap, hold_task_consumer, inbox_ids, item_attendees, item_method, item_sequence,
+        itip_tasks_for, mail_count, new_inbox_items, open_pending_item_as, schedule_statuses,
+        wait_for_delivery, za_unlock,
     },
 };
 use ::registry::{
@@ -450,6 +451,52 @@ pub async fn test(test: &mut TestServer) {
         "a kept attendee keeps its token"
     );
 
+    // 2 (continued). key1 DELETEs the event: each internal attendee gets a
+    // CANCEL built from the unsealed stored tree, with its pair (spec 5.5).
+    let before2 = inbox_ids(test, key2.id).await;
+    let before3 = inbox_ids(test, key3.id).await;
+    key1.client
+        .request("DELETE", &mixed, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    let items = new_inbox_items(test, key3.id, &before3).await;
+    assert_eq!(items.len(), 1, "key3 gets one CANCEL");
+    let (tree, carriers) = open_pending_item_as(test, key3.id, STRONG, items[0].0).await;
+    assert_eq!(item_method(&tree), Some(ICalendarMethod::Cancel));
+    assert_eq!(
+        pair_token(carriers.pair.as_ref(), "key3@example.com"),
+        key3_token
+    );
+    assert_eq!(new_inbox_items(test, key2.id, &before2).await.len(), 1);
+
+    // A collection DELETE cancels each scheduled event in it.
+    let collection = "/dav/cal/key1%40example.com/fo-collection/";
+    key1.client
+        .request("MKCALENDAR", collection, MKCALENDAR)
+        .await
+        .with_status(StatusCode::CREATED);
+    for uid in ["za-fo-coll-1", "za-fo-coll-2"] {
+        key1.client
+            .request_with_headers(
+                "PUT",
+                &format!("{collection}{uid}.ics"),
+                [CONTENT_TYPE],
+                invite(uid, START_A, &["key2@example.com"]),
+            )
+            .await
+            .with_status(StatusCode::CREATED);
+    }
+    let before2 = inbox_ids(test, key2.id).await;
+    key1.client
+        .request("DELETE", collection, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    let items = new_inbox_items(test, key2.id, &before2).await;
+    assert_eq!(items.len(), 2, "one CANCEL per scheduled event");
+    for (_, item) in &items {
+        assert_eq!(item_method(&item.event), Some(ICalendarMethod::Cancel));
+    }
+
     // Review Focus 2: an update that removes every ATTENDEE sends only
     // CANCELs, with the old pairs, and leaves no pair in the bundle.
     let gone = format!("{KEY1_CAL}fo-gone.ics");
@@ -493,7 +540,7 @@ pub async fn test(test: &mut TestServer) {
     );
 
     // Cleanup: the events without CANCELs, then every new item.
-    for name in ["fo-mixed", "fo-dup", "fo-own", "fo-fresh", "fo-gone"] {
+    for name in ["fo-dup", "fo-own", "fo-fresh", "fo-gone"] {
         key1.client
             .request_with_headers("DELETE", &format!("{KEY1_CAL}{name}.ics"), [NO_REPLY], "")
             .await
@@ -814,4 +861,122 @@ pub async fn test_failures(test: &mut TestServer) {
     }
     key2.delete_items_since(test, &start2).await;
     key3.delete_items_since(test, &start3).await;
+}
+
+const PLAIN_CAL: &str = "/dav/cal/plain%40example.com/fo-queue/";
+
+/// A plain organizer's invitation to key2 (spec 5.2, "Plain organizers").
+const PLAIN_INVITE: &str = concat!(
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\nBEGIN:VEVENT\r\n",
+    "UID:za-fo-plain\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990305T100000Z\r\n",
+    "DURATION:PT1H\r\nSEQUENCE:0\r\nSUMMARY:fo-plain-title\r\n",
+    "ORGANIZER:mailto:plain@example.com\r\n",
+    "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:key2@example.com\r\n",
+    "END:VEVENT\r\nEND:VCALENDAR\r\n"
+);
+
+/// Spec 11, task queue: with the consumer held, a key organizer's PUT and
+/// DELETE queue no `CalendarItipMessage` task (they fan out instead); a
+/// plain organizer's PUT does (control), and its invitation reaches key2 as
+/// mail only (test 6).
+pub async fn test_task_queue(test: &mut TestServer) {
+    println!("Running zero-access task queue tests...");
+    let key1 = Party::new(test, "key1@example.com");
+    let key2 = Party::new(test, "key2@example.com");
+    let plain = test.account("plain@example.com").clone();
+    let plain_id = plain.id().document_id();
+    let plain_client = DummyWebDavClient::new(plain_id, plain.name(), plain.secret(), plain.name());
+    let start2 = inbox_ids(test, key2.id).await;
+
+    let queue = format!("{KEY1_CAL}fo-queue.ics");
+    let held = hold_task_consumer(test).await;
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &queue,
+            [CONTENT_TYPE],
+            invite("za-fo-queue", START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    key1.client
+        .request("DELETE", &queue, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    assert_eq!(
+        itip_tasks_for(test, key1.id).await,
+        0,
+        "a CalendarItipMessage task was queued for the key organizer"
+    );
+    drop(held);
+    let methods: Vec<_> = new_inbox_items(test, key2.id, &start2)
+        .await
+        .iter()
+        .map(|(_, item)| item_method(&item.event))
+        .collect();
+    assert_eq!(
+        methods,
+        [
+            Some(ICalendarMethod::Request),
+            Some(ICalendarMethod::Cancel)
+        ],
+        "the PUT and the DELETE fanned out"
+    );
+
+    // Control and test 6: a plain organizer inviting key2 takes upstream's
+    // path, a task and then mail.
+    plain_client
+        .request("MKCALENDAR", PLAIN_CAL, MKCALENDAR)
+        .await
+        .with_status(StatusCode::CREATED);
+    let key2_mail = mail_count(test, key2.id).await;
+    let before2 = inbox_ids(test, key2.id).await;
+    let held = hold_task_consumer(test).await;
+    plain_client
+        .request_with_headers(
+            "PUT",
+            &format!("{PLAIN_CAL}fo-plain.ics"),
+            [CONTENT_TYPE],
+            PLAIN_INVITE,
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(
+        itip_tasks_for(test, plain_id).await,
+        1,
+        "the plain organizer's PUT queued its task (control)"
+    );
+    drop(held);
+    wait_for_delivery(test).await;
+    assert_eq!(
+        mail_count(test, key2.id).await,
+        key2_mail + 1,
+        "the mail reached key2"
+    );
+    assert_eq!(
+        inbox_ids(test, key2.id).await,
+        before2,
+        "nothing in key2's inbox"
+    );
+    assert_eq!(
+        uid_copies(test, key2.id, "za-fo-plain").await,
+        0,
+        "nothing in key2's calendar"
+    );
+
+    plain_client
+        .request_with_headers(
+            "DELETE",
+            &format!("{PLAIN_CAL}fo-plain.ics"),
+            [NO_REPLY],
+            "",
+        )
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    plain_client
+        .request("DELETE", PLAIN_CAL, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    key2.delete_items_since(test, &start2).await;
+    wait_for_delivery(test).await;
 }

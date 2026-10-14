@@ -10,12 +10,12 @@ use super::{TEST_ICAL_1, TEST_ICAL_2};
 use crate::utils::{
     server::TestServer,
     za::{
-        envelope_wrap, hold_task_consumer, inbox_ids, itip_tasks_for, mail_count, new_inbox_items,
-        plant_event, queued_recipients, schedule_statuses, wait_for_delivery,
+        envelope_wrap, hold_task_consumer, inbox_ids, item_method, itip_tasks_for, mail_count,
+        new_inbox_items, plant_event, queued_recipients, schedule_statuses, wait_for_delivery,
     },
 };
 use calcard::common::timezone::Tz;
-use calcard::icalendar::ICalendarProperty;
+use calcard::icalendar::{ICalendarMethod, ICalendarProperty};
 use email::cache::MessageCacheFetch;
 use groupware::{
     calendar::{CalendarEvent, EVENT_NOTIFICATION_ZA_PENDING},
@@ -448,16 +448,25 @@ pub async fn scheduling(test: &TestServer) {
             .schedule_tag
             .is_some()
     );
-    john.request_with_headers(
-        "DELETE",
-        "/dav/cal/john@example.com/default/s.ics",
-        [("schedule-reply", "F")],
-        "",
-    )
-    .await
-    .with_status(StatusCode::NO_CONTENT);
+    // john's DELETE cancels: a second pending item, a CANCEL (METHOD is
+    // visible on the sealed root), and still no mail (spec 5.5). The
+    // DELETE's task-queue check lives in the za suite's `test_task_queue`.
+    john.request("DELETE", "/dav/cal/john@example.com/default/s.ics", "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
     wait_for_delivery(test).await;
     assert_eq!(mail_count(test, jane.account_id).await, jane_mail);
+    let items = new_inbox_items(test, jane.account_id, &jane_items).await;
+    assert_eq!(
+        items.len(),
+        2,
+        "jane's inbox holds the REQUEST and the CANCEL"
+    );
+    assert_eq!(
+        item_method(&items[1].1.event),
+        Some(ICalendarMethod::Cancel)
+    );
+    assert_eq!(envelope_wrap(&items[1].1.event), Some(2));
     // Pending items are deleted by href, as any inbox item.
     let ids: Vec<u32> = inbox_ids(test, jane.account_id)
         .await

@@ -132,12 +132,22 @@ pub async fn test(test: &mut TestServer) {
         organizer_statuses(&key2.client, &reply, "key1@example.com").await,
         ["1.2"]
     );
-    // Removed here without a reply; the decline on DELETE is pinned with
-    // the DELETE paths.
+    // The attendee's DELETE of its copy yields upstream's declined REPLY,
+    // delivered the same way and with the same token (spec 5.5).
+    let before1 = inbox_ids(test, key1.id).await;
     key2.client
-        .request_with_headers("DELETE", &reply, [NO_REPLY], "")
+        .request("DELETE", &reply, "")
         .await
         .with_status(StatusCode::NO_CONTENT);
+    let items = new_inbox_items(test, key1.id, &before1).await;
+    assert_eq!(items.len(), 1, "one declined REPLY");
+    let (tree, carriers) = open_pending_item_as(test, key1.id, STRONG, items[0].0).await;
+    assert_eq!(item_method(&tree), Some(ICalendarMethod::Reply));
+    assert_eq!(
+        item_partstat(&tree, "key2@example.com").as_deref(),
+        Some("DECLINED")
+    );
+    assert_eq!(carriers.reply_token.as_deref(), Some(&TOKEN));
 
     // A copy whose bundle holds no pair for key2: the PUT succeeds, nothing
     // is delivered (the organizer's drain would drop it as a forgery), and
