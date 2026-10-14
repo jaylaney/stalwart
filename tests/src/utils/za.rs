@@ -366,6 +366,32 @@ pub async fn plant_sealed_event(
     .await
 }
 
+/// An attendee's copy of an invitation as the drain (plan 10) will import
+/// it: sealed under the account's keys (unlocked from `password`) with
+/// `pairs` (the attendee's own pair; empty pairs write no bundle) and
+/// upstream's import schedule tag, in the account's default calendar.
+/// Returns the document id.
+pub async fn plant_attendee_copy(
+    test: &TestServer,
+    account_id: u32,
+    name: &str,
+    ical: &str,
+    password: &str,
+    pairs: &TokenPairs,
+) -> u32 {
+    let keys = za_unlock(test, account_id, password).await;
+    insert_event(
+        test,
+        account_id,
+        "default",
+        name,
+        ical,
+        Some(1),
+        Some((&*keys, pairs)),
+    )
+    .await
+}
+
 async fn insert_event(
     test: &TestServer,
     account_id: u32,

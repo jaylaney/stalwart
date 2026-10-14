@@ -27,6 +27,7 @@ pub mod leak;
 pub mod pairs;
 pub mod password;
 pub mod registry;
+pub mod reply;
 pub mod setup;
 pub mod totp;
 pub mod tracing;
@@ -104,6 +105,8 @@ pub async fn za_tests() {
     dav_seal::test_conditional(&mut test).await;
     dav_seal::test_legacy(&mut test).await;
     fanout::test(&mut test).await;
+    fanout::test_failures(&mut test).await;
+    reply::test(&mut test).await;
     tracing::test(&mut test).await;
     expansion::test(&mut test).await;
     gating::test(&mut test).await;

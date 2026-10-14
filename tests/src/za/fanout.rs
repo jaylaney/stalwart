@@ -9,7 +9,7 @@
 //! drain, so the tests read items at store level and open them with the
 //! recipient's private key (`open_pending_item_as`).
 
-use super::{STRONG, dav_seal::raw_event};
+use super::{STRONG, dav_seal::raw_event, user_permissions};
 use crate::utils::{
     server::TestServer,
     webdav::DummyWebDavClient,
@@ -18,12 +18,23 @@ use crate::utils::{
         new_inbox_items, open_pending_item_as, schedule_statuses, wait_for_delivery, za_unlock,
     },
 };
+use ::registry::{
+    schema::{
+        enums::{Permission, StorageQuota},
+        prelude::{ObjectType, Property},
+        structs::{CalendarScheduling, Permissions, PermissionsList},
+    },
+    types::{EnumImpl, map::Map},
+};
 use calcard::icalendar::{ICalendarMethod, ICalendarProperty};
+use common::za::test_hooks;
 use groupware::calendar::{
     ChangedBy, EVENT_NOTIFICATION_ZA_PENDING,
     seal::{TOKEN_LEN, TokenPairs, event_token_pairs},
 };
 use hyper::StatusCode;
+use serde_json::json;
+use types::{collection::Collection, field::CalendarEventField};
 use vault::session::SessionKeys;
 
 pub const CONTENT_TYPE: (&str, &str) = ("content-type", "text/calendar; charset=utf-8");
@@ -497,4 +508,310 @@ pub async fn test(test: &mut TestServer) {
     // the suite.
     test.destroy_all_mailboxes(test.account("plain@example.com"))
         .await;
+}
+
+/// How many stored events of `account_id` carry `uid`.
+pub async fn uid_copies(test: &TestServer, account_id: u32, uid: &str) -> u64 {
+    test.server
+        .document_ids_matching(
+            account_id,
+            Collection::CalendarEvent,
+            CalendarEventField::Uid,
+            uid.as_bytes(),
+        )
+        .await
+        .unwrap()
+        .len()
+}
+
+/// Spec 5.3 step 5 and 5.4: a recipient's failure is that recipient's
+/// `5.1`, never a failed PUT; a key account without
+/// `CalendarSchedulingReceive` is not attempted (5.2); over the recipient
+/// limit the PUT fails before any delivery; a failed sender commit after the
+/// fan-out leaves its items.
+pub async fn test_failures(test: &mut TestServer) {
+    println!("Running zero-access fan-out failure tests...");
+    let admin = test.account("admin@example.com").clone();
+    let key1 = Party::new(test, "key1@example.com");
+    let key2 = Party::new(test, "key2@example.com");
+    let key3 = Party::new(test, "key3@example.com");
+    let key2_account = test.account("key2@example.com").id();
+    let keys1 = za_unlock(test, key1.id, STRONG).await;
+    let start2 = inbox_ids(test, key2.id).await;
+    let start3 = inbox_ids(test, key3.id).await;
+
+    // 7a. Quota: key2's quota cannot hold the item. key2 gets 5.1 and no
+    // item; key3 is unaffected.
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            key2_account,
+            json!({ Property::Quotas: { StorageQuota::MaxDiskQuota.as_str(): 1 } }),
+        )
+        .await;
+    let quota = format!("{KEY1_CAL}fo-quota.ics");
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &quota,
+            [CONTENT_TYPE],
+            invite(
+                "za-fo-quota",
+                START_A,
+                &["key2@example.com", "key3@example.com"],
+            ),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(
+        inbox_ids(test, key2.id).await,
+        start2,
+        "an item reached key2 past its quota"
+    );
+    assert_eq!(new_inbox_items(test, key3.id, &start3).await.len(), 1);
+    assert_eq!(
+        attendee_statuses(&key1.client, &quota, "key2@example.com").await,
+        ["5.1"]
+    );
+    assert_eq!(
+        attendee_statuses(&key1.client, &quota, "key3@example.com").await,
+        ["1.2"]
+    );
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            key2_account,
+            json!({ Property::Quotas: {} }),
+        )
+        .await;
+
+    // 7b. Inbound size: a message at or over `itip_inbound_max_ical_size`.
+    // 100 bytes is the setting's schema minimum, well under any invitation.
+    admin
+        .registry_update_setting(
+            CalendarScheduling {
+                itip_max_size: 100,
+                ..Default::default()
+            },
+            &[Property::ItipMaxSize],
+        )
+        .await;
+    admin.reload_settings().await;
+    let size = format!("{KEY1_CAL}fo-size.ics");
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &size,
+            [CONTENT_TYPE],
+            invite("za-fo-size", START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(
+        inbox_ids(test, key2.id).await,
+        start2,
+        "an oversized item reached key2"
+    );
+    assert_eq!(
+        attendee_statuses(&key1.client, &size, "key2@example.com").await,
+        ["5.1"]
+    );
+    admin
+        .registry_update_setting(CalendarScheduling::default(), &[Property::ItipMaxSize])
+        .await;
+    admin.reload_settings().await;
+
+    // 7d. A key account without `CalendarSchedulingReceive` (spec 5.2): not
+    // attempted. The permission is revoked through the registry as
+    // `disabled.rs` disables `Authenticate` (`Property::Permissions`,
+    // `Permissions::Merge`); the edit invalidates key3's access token
+    // (`permissions_changed` -> `CacheInvalidation::AccessToken`,
+    // `crates/common/src/cache/invalidate.rs:63-71`), so the fan-out's next
+    // `access_token(key3)` reads it.
+    fn key3_permissions(disabled: Vec<Permission>) -> serde_json::Value {
+        // As the suite created key3: `user_permissions()` enabled.
+        json!({ Property::Permissions: Permissions::Merge(PermissionsList {
+            disabled_permissions: Map::new(disabled),
+            enabled_permissions: Map::new(user_permissions()),
+        }) })
+    }
+    let key3_account = test.account("key3@example.com").id();
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            key3_account,
+            key3_permissions(vec![Permission::CalendarSchedulingReceive]),
+        )
+        .await;
+    let before2 = inbox_ids(test, key2.id).await;
+    let before3 = inbox_ids(test, key3.id).await;
+    let receive = format!("{KEY1_CAL}fo-receive.ics");
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &receive,
+            [CONTENT_TYPE],
+            invite(
+                "za-fo-receive",
+                START_A,
+                &["key2@example.com", "key3@example.com"],
+            ),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(
+        inbox_ids(test, key3.id).await,
+        before3,
+        "an item reached key3 without CalendarSchedulingReceive"
+    );
+    assert_eq!(new_inbox_items(test, key2.id, &before2).await.len(), 1);
+    assert_eq!(
+        attendee_statuses(&key1.client, &receive, "key3@example.com").await,
+        ["5.3"]
+    );
+    assert_eq!(
+        attendee_statuses(&key1.client, &receive, "key2@example.com").await,
+        ["1.2"]
+    );
+    // Restore key3's permissions, and check that the restore took.
+    admin
+        .registry_update_object(ObjectType::Account, key3_account, key3_permissions(vec![]))
+        .await;
+    let restored = format!("{KEY1_CAL}fo-restored.ics");
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &restored,
+            [CONTENT_TYPE],
+            invite("za-fo-restored", START_A, &["key3@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(
+        new_inbox_items(test, key3.id, &before3).await.len(),
+        1,
+        "key3 receives again after the restore"
+    );
+    assert_eq!(
+        attendee_statuses(&key1.client, &restored, "key3@example.com").await,
+        ["1.2"]
+    );
+    // The items now, so 7c and 8 keep their baselines; the events with the
+    // module's cleanup.
+    key2.delete_items_since(test, &before2).await;
+    key3.delete_items_since(test, &before3).await;
+
+    // 7c. Max recipients (spec 5.1): the PUT fails with the precondition
+    // before any delivery, and nothing is stored.
+    admin
+        .registry_update_setting(
+            CalendarScheduling {
+                max_recipients: 2,
+                ..Default::default()
+            },
+            &[Property::MaxRecipients],
+        )
+        .await;
+    admin.reload_settings().await;
+    let before3 = inbox_ids(test, key3.id).await;
+    let response = key1
+        .client
+        .request_with_headers(
+            "PUT",
+            &format!("{KEY1_CAL}fo-many.ics"),
+            [CONTENT_TYPE],
+            invite(
+                "za-fo-many",
+                START_A,
+                &[
+                    "key2@example.com",
+                    "key3@example.com",
+                    "outsider@remote.test",
+                ],
+            ),
+        )
+        .await
+        .with_status(StatusCode::PRECONDITION_FAILED);
+    assert!(
+        response
+            .expect_body()
+            .contains("max-attendees-per-instance"),
+        "{}",
+        response.expect_body()
+    );
+    assert_eq!(inbox_ids(test, key2.id).await, start2);
+    assert_eq!(inbox_ids(test, key3.id).await, before3);
+    assert_eq!(
+        uid_copies(test, key1.id, "za-fo-many").await,
+        0,
+        "nothing was stored"
+    );
+    admin
+        .registry_update_setting(CalendarScheduling::default(), &[Property::MaxRecipients])
+        .await;
+    admin.reload_settings().await;
+
+    // 8. The sender's commit fails after the fan-out wrote key2's item: 500.
+    // The client resends and gets 201; key2 holds two items with an equal
+    // SEQUENCE and different tokens, and key1's bundle holds the second.
+    let commit = format!("{KEY1_CAL}fo-commit.ics");
+    let body = invite("za-fo-commit", START_A, &["key2@example.com"]);
+    test_hooks::set_commit_fail_once(Some(key1.id));
+    key1.client
+        .request_with_headers("PUT", &commit, [CONTENT_TYPE], body.clone())
+        .await
+        .with_status(StatusCode::INTERNAL_SERVER_ERROR);
+    test_hooks::set_commit_fail_once(None);
+    assert_eq!(
+        new_inbox_items(test, key2.id, &start2).await.len(),
+        1,
+        "the item was written before the failed commit"
+    );
+    assert_eq!(
+        uid_copies(test, key1.id, "za-fo-commit").await,
+        0,
+        "no event was stored"
+    );
+    key1.client
+        .request_with_headers("PUT", &commit, [CONTENT_TYPE], body)
+        .await
+        .with_status(StatusCode::CREATED);
+    let items = new_inbox_items(test, key2.id, &start2).await;
+    assert_eq!(items.len(), 2);
+    let (first, first_carriers) = open_pending_item_as(test, key2.id, STRONG, items[0].0).await;
+    let (second, second_carriers) = open_pending_item_as(test, key2.id, STRONG, items[1].0).await;
+    assert_eq!(
+        item_sequence(&first),
+        item_sequence(&second),
+        "an equal SEQUENCE"
+    );
+    let first_token = pair_token(first_carriers.pair.as_ref(), "key2@example.com");
+    let second_token = pair_token(second_carriers.pair.as_ref(), "key2@example.com");
+    assert_ne!(
+        first_token, second_token,
+        "the retry hands out a fresh token"
+    );
+    assert_eq!(
+        stored_pairs(test, &keys1, key1.id, "default/fo-commit.ics")
+            .await
+            .unwrap()
+            .get("key2@example.com"),
+        Some(&second_token)
+    );
+
+    // Cleanup.
+    for name in [
+        "fo-quota",
+        "fo-size",
+        "fo-receive",
+        "fo-restored",
+        "fo-commit",
+    ] {
+        key1.client
+            .request_with_headers("DELETE", &format!("{KEY1_CAL}{name}.ics"), [NO_REPLY], "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    key2.delete_items_since(test, &start2).await;
+    key3.delete_items_since(test, &start3).await;
 }

@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::{STRONG, dav_seal::raw_event};
+use super::{STRONG, dav_seal::raw_event, fanout::NO_REPLY};
 use crate::utils::{
     jmap::{JmapResponse, JmapUtils},
     server::TestServer,
@@ -563,7 +563,7 @@ pub async fn test_scheduling(test: &mut TestServer) {
             .is_some()
     );
     key_client
-        .request("DELETE", &format!("{key_cal}invite.ics"), "")
+        .request_with_headers("DELETE", &format!("{key_cal}invite.ics"), [NO_REPLY], "")
         .await
         .with_status(StatusCode::NO_CONTENT);
 
