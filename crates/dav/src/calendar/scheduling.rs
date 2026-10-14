@@ -114,10 +114,13 @@ impl CalendarEventNotificationHandler for Server {
             .await
             .caused_by(trc::location!())?
             .ok_or(DavError::Code(StatusCode::NOT_FOUND))?;
+        // Release 1 spec 10: the gate inside `za_item_hidden` refuses a key
+        // account read without its keys (403) before the pending bit is read.
         // Invitations spec 6.6: a pending item answers 404 until drained; a
         // drained one is shown unsealed. Identity stays the stored archive's.
         if za_item_hidden(
             self,
+            access_token,
             account_id,
             Collection::CalendarEventNotification,
             &event_,

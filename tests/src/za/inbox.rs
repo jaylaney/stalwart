@@ -182,6 +182,20 @@ pub async fn test(test: &mut TestServer) {
         "{body}"
     );
 
+    // Release 1 spec 10: a session without key1's keys (a master-user login,
+    // as in `dav_gate`) is refused (403) before the pending bit is read.
+    let admin = test.account("admin@example.com").clone();
+    let master = Box::leak(format!("{name}%{}", admin.name()).into_boxed_str());
+    let master_client = DummyWebDavClient::new(id, master, admin.secret(), name);
+    master_client
+        .request("GET", &pending_href, "")
+        .await
+        .with_status(StatusCode::FORBIDDEN);
+    master_client
+        .request_with_headers("PROPFIND", KEY_INBOX, [("depth", "1")], PROPFIND_DATA)
+        .await
+        .with_status(StatusCode::FORBIDDEN);
+
     // GET of the drained and the legacy item: their plaintext trees.
     for (href, ical) in [(&drained_href, &drained_ical), (&legacy_href, &legacy_ical)] {
         let body = client

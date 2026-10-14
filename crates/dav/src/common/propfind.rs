@@ -460,7 +460,7 @@ impl PropFindRequestHandler for Server {
             {
                 stored_ = archive;
                 // Invitations spec 6.6: a pending inbox item is not listed.
-                if za_item_hidden(self, account_id, collection, &stored_).await? {
+                if za_item_hidden(self, access_token, account_id, collection, &stored_).await? {
                     continue;
                 }
                 // Spec 8.2: key-account calendar content is unsealed before any

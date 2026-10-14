@@ -462,7 +462,10 @@ impl Server {
     }
 
     /// Invitations spec 3.2: see `za_open_private_key`. The drain (plan 10)
-    /// is the caller; an error was already traced for the session.
+    /// is the caller; a recorded failure (the wrap does not open, the record
+    /// is missing or unusable) was traced once for the session; a propagated
+    /// store error was not traced and is not recorded, so the caller traces
+    /// it and a later call retries.
     pub async fn za_private_key<'k>(&self, keys: &'k SessionKeys) -> trc::Result<&'k Secret> {
         za_open_private_key(self.store(), keys).await
     }

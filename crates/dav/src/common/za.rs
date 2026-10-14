@@ -181,15 +181,21 @@ pub(crate) fn za_item_view<'x>(
 /// Invitations spec 6.6: whether a loaded archive is a key account's pending
 /// inbox item, which clients do not see until the drain rewrites it. `false`
 /// for every other collection and for non-key accounts (invariant 9). The
+/// gate runs before the pending bit is read: a key account's item read
+/// without its keys is the gate's 403 and trace (release 1 spec 10). The
 /// resource cache knows no flags, so readers ask here after loading.
 pub(crate) async fn za_item_hidden(
     server: &Server,
+    access_token: &AccessToken,
     account_id: u32,
     collection: Collection,
     stored: &Archive<AlignedBytes>,
 ) -> crate::Result<bool> {
     if collection != Collection::CalendarEventNotification
-        || !is_key_account(server, account_id).await?
+        || server
+            .za_session_keys(access_token, account_id)
+            .await?
+            .is_none()
     {
         return Ok(false);
     }

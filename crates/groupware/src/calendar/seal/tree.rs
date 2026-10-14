@@ -218,6 +218,10 @@ fn format_aad(format: u8, aad: &[u8]) -> Cow<'_, [u8]> {
     if format == FORMAT_V1 {
         Cow::Borrowed(aad)
     } else {
+        // The `|<format>` suffix follows the unescaped UID field, so a format 1
+        // AAD for UID `X|\x02` equals a format 2 AAD for UID `X`; harmless, because
+        // the DEK is reachable only through the UID-bound key envelope, which
+        // carries no such suffix.
         let mut out = Vec::with_capacity(aad.len() + 2);
         out.extend_from_slice(aad);
         out.push(b'|');

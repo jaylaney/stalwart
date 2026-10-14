@@ -201,12 +201,17 @@ pub fn open_pending_item(
     }
     let pair = match extra {
         Some(carrier) => {
-            open_extra(
+            let pairs = open_extra(
                 &dek,
                 &extra_aad(recipient_id, &uid),
                 entry_text(&carrier).ok_or(SealError::Format)?,
             )?
-            .pairs
+            .pairs;
+            // As on the seal side: a bundle holds exactly one pair.
+            if pairs.as_ref().map_or(0, |pairs| pairs.len()) != 1 {
+                return Err(SealError::Structure("an item carries one pair"));
+            }
+            pairs
         }
         None => None,
     };
@@ -446,6 +451,12 @@ mod tests {
             n - 2,
             text_entry(RSVP_TOKEN_PROP, URL_SAFE_NO_PAD.encode([1u8; TOKEN_LEN])),
         );
+        // A reply token after the pair: [.., SEALED, EXTRA, RSVP, KEY].
+        let mut after = sealed.clone();
+        root(&mut after).insert(
+            n - 1,
+            text_entry(RSVP_TOKEN_PROP, URL_SAFE_NO_PAD.encode([1u8; TOKEN_LEN])),
+        );
         // A reply item's token moved into its VEVENT.
         let (reply, reply_private) = pending(None, Some(&[3; TOKEN_LEN]));
         let m = reply.components[0].entries.len();
@@ -456,6 +467,7 @@ mod tests {
             ("swapped", swapped, &private),
             ("moved", moved, &private),
             ("both", both, &private),
+            ("after", after, &private),
             ("reply moved", reply_moved, &reply_private),
         ] {
             assert_eq!(
@@ -493,6 +505,44 @@ mod tests {
             Err(SealError::Structure("recipient public key"))
         );
         assert_eq!(ical, tree(), "a refused seal leaves the tree untouched");
+    }
+
+    /// A pending item for account 9 whose `X-ZA-EXTRA` is `extra`'s bundle,
+    /// built by hand: `seal_pending_item` writes only one-pair bundles.
+    fn pending_with_extra(
+        public: &[u8; PUBLIC_KEY_LEN],
+        extra: impl FnOnce(&Secret, &[u8]) -> Option<String>,
+    ) -> ICalendar {
+        let mut ical = tree();
+        let uid = uid_of(&ical);
+        let dek = Secret::random();
+        let envelope = seal_pk_envelope(&dek, public, &pending_key_aad(9, &uid)).unwrap();
+        seal_tree(&mut ical, &dek, 9, ITIP_SCOPE);
+        let text = extra(&dek, &extra_aad(9, &uid)).expect("a bundle");
+        root(&mut ical).push(text_entry(EXTRA_PROP, text));
+        root(&mut ical).push(text_entry(KEY_PROP, STANDARD.encode(envelope)));
+        ical
+    }
+
+    #[test]
+    fn pending_item_bundle_must_hold_exactly_one_pair() {
+        let (public, private) = generate_keypair();
+        let mut two = pair();
+        two.insert("other@example.com", [8; TOKEN_LEN]);
+        let two_pairs = pending_with_extra(&public, |dek, aad| {
+            seal_extra(dek, aad, None, DeadProperty::default(), Some(&two))
+        });
+        // A format 1 bundle (no pair list) under the item's purpose.
+        let no_pairs = pending_with_extra(&public, |dek, aad| {
+            seal_extra(dek, aad, Some("name".into()), DeadProperty::default(), None)
+        });
+        for (name, mut item) in [("two pairs", two_pairs), ("no pair list", no_pairs)] {
+            assert_eq!(
+                open_pending_item(&mut item, 9, &private).err(),
+                Some(SealError::Structure("an item carries one pair")),
+                "{name}"
+            );
+        }
     }
 
     #[test]
