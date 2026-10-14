@@ -144,7 +144,7 @@ To wrap a DEK to recipient account `r` with static public key `P`:
 | 1 | Generate an ephemeral X25519 keypair (`e`, `E`). |
 | 2 | Shared secret `s = X25519(e, P)`. |
 | 3 | Wrapping key: 32 bytes of HKDF-SHA256 over `s`, label `za/v1/pk`, with `E` and then `P` bound into the info input. |
-| 4 | XChaCha20-Poly1305 of the DEK under the wrapping key, 24-byte random nonce, associated data `aad("za/v1/pk-dek", r)`: the existing `wrap_key`, which yields `nonce || ciphertext`. |
+| 4 | XChaCha20-Poly1305 of the DEK under the wrapping key, 24-byte random nonce, associated data `aad("pk-dek", r) || "|" || uid` (section 9 has the full shape): the existing `wrap_key`, which yields `nonce || ciphertext`. |
 | 5 | Zeroize `e`. |
 
 The `X-ZA-KEY` bytes are `policy version || 0x02 || E (32 bytes) || wrapped
@@ -1045,7 +1045,7 @@ Release 1's ten invariants hold. Release 2 adds:
 
 - **Names.** The sending state (`SendSealed`), the flag bit
   (`EVENT_NOTIFICATION_ZA_PENDING`), the HKDF label (`za/v1/pk`) and the
-  exact info layout, the wrap purpose string (`za/v1/pk-dek`, which the
+  exact info layout, the wrap purpose string (`pk-dek`, which the
   `aad` helper prefixes with `za/v1|`), the reply property
   (`X-ZA-RSVP-TOKEN`), the `X-ZA-EXTRA` format byte for bundles with token
   pairs (`2`), the inbox items' scope (`itip`) and drained key-envelope
