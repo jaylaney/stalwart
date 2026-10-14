@@ -75,7 +75,7 @@ Invariants and code rules:
 - Nothing derived from a key account's invitation reaches the task queue, mail or any store location in plaintext (invariant 12). `ItipMessages::queue` is never called for `SendSealed` messages or for a key account's DELETE.
 - The `pk` wrap is opened only by `open_pending_item` (invariant 11). No product path opens one in plan 9; only tests do, through `open_pending_item_as`.
 - The organizer's event never stores an attendee's account id (invariant 13). The address-to-account mapping exists only inside one `za_fan_out` call.
-- Upstream's builders run unchanged (invariant 15). Non-key accounts take unchanged paths (invariant 9): every new call sits behind a key-account branch (`SendSealed`, `za_keys.is_some()`), and the upstream-signature `delete*` wrappers pass `None`.
+- Upstream's builders run unchanged (invariant 15). Non-key accounts take unchanged paths (invariant 9): every new call sits behind a key-account branch (`SendSealed`, `za_keys.is_some()`), or is the `za_session_keys` gate itself, which answers `None` for a non-key account after one account-cache lookup, as `update.rs:80` already does on every PUT; the DELETE handler takes that same shape. The upstream-signature `delete*` wrappers pass `None`.
 - Key material, tokens included, lives in `Zeroizing` buffers with a silent `Debug`. Traces name account ids and document ids only: never an address, a tree or a token.
 - New source files start with the SPDX header copied from a neighbour:
   ```
@@ -103,7 +103,7 @@ Tests:
 
 Process:
 - Code in this plan was written without a compiler. Small type and import fixes are expected; changes of behaviour are not.
-- Work on `release2-plan9-fanout` (cut from the plan 8 branch at `81cb6fbe`). Do not push.
+- Work on `release2-plan9-fanout` (cut from the plan 8 branch at `68e1f1df`). Do not push.
 - Commit messages: subject, blank line, body, then two trailer lines exactly as the harness's attribution reminder gives them at run time: `Co-Authored-By: ...` and `Claude-Session: ...`. Plan 8's commits carried `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` and `Claude-Session: https://claude.ai/code/session_01SmmW3Hx6r7uzLjDdJHEtkr`. A wrong trailer is rewritten before the branch is shared.
 - The final verification (Task 8) runs the unit suites, `za_tests` plain and with `BLOB_STORE=FileSystem`, `webdav_tests` in both modes, and the release build.
 
@@ -179,6 +179,7 @@ Each line names an input the spec implies but does not walk through, with the be
 | `tests/src/za/uid_lease.rs` | new: the creation lease, PUT side | 6 |
 | `tests/src/za/leak.rs` | the fan-out in the scan, its token | 7 |
 | `tests/src/za/mod.rs` | wiring before `leak::test` | 3, 4, 5, 6 |
+| `docs/superpowers/specs/2026-10-06-zero-access-calendar-design.md` | release 1 spec: "superseded" notes on the 8.1 DELETE bullet and the section 9 scheduling row | 8 |
 | `docs/superpowers/plans/2026-10-14-zero-access-plan9-outcome.md` | new: mutation table, rulings, facts for plan 10 | 8 |
 
 ---
@@ -818,7 +819,7 @@ git commit -m "Zero-access: the UID creation lease and the test-mode hooks"   # 
 - Consumes:
   - Task 1: `common::za::test_hooks::fan_out_pause_point` (test builds only).
   - Plan 8: `seal_pending_item(ical, recipient_id, &[u8; 32], Option<&TokenPairs>, Option<&[u8; 16]>)`, `TokenPairs::{new, insert, get, only, len, is_empty}`, `TOKEN_LEN`, `EVENT_NOTIFICATION_ZA_PENDING`, `seal_error`; `seal/event.rs`'s private `open_root`, `is_sealed`, `unseal_tree`.
-  - Upstream: `Email::new` (`scheduling/mod.rs:258-265`), `inbound::itip_method` (`inbound.rs:605`), `ical_size` (`scheduling/mod.rs:276`), `CalendarEventNotification::insert` (`calendar/storage.rs:285-310`), `Server::{account_id_from_email, try_account, access_token, account, has_available_quota, commit_batch, store}`, `AccountCache::{is_key_account, za_public_key, account_tenant_ids}`.
+  - Upstream: `Email::new` (`scheduling/mod.rs:245-251`), `inbound::itip_method` (`inbound.rs:605`), `ical_size` (`scheduling/mod.rs:262`), `CalendarEventNotification::insert` (`calendar/storage.rs:297-321`), `Server::{account_id_from_email, try_account, access_token, account, has_available_quota, commit_batch, store}`, `AccountCache::{is_key_account, za_public_key, account_tenant_ids}`.
 - Produces (Tasks 3, 5 and plan 10), in `groupware::calendar::fanout`:
   - `pub trait ZaFanOut` with `fn za_fan_out(&self, sender: &AccountInfo, keys: &SessionKeys, messages: Vec<ItipMessage<ICalendar>>, stored_pairs: Option<TokenPairs>, event: &ICalendar) -> impl Future<Output = trc::Result<ZaFanOutResult>> + Send`, implemented on `Server`
   - `pub struct ZaFanOutResult { pub pairs: Option<TokenPairs>, pub statuses: Vec<ZaScheduleStatus> }`
@@ -1211,7 +1212,9 @@ Prepend to `fanout.rs`, after the SPDX header:
 //! or CANCEL is attempted only when upstream marked it as the organizer's
 //! (`from_organizer`); a REPLY only to the event's ORGANIZER, and only when
 //! the replier's copy holds its token. Every other recipient is not
-//! attempted.
+//! attempted. `resolve_inner` builds, and so caches, the recipient's access
+//! token to read its permissions, as upstream's delivery does for its
+//! recipients.
 
 use crate::{
     calendar::{
@@ -1760,7 +1763,7 @@ git commit -m "Fan-out: sealed pending items for internal key recipients"
 - Modify: `tests/src/utils/za.rs:7-32` (imports), new helpers after `wait_for_delivery`
 - Create: `tests/src/za/fanout.rs`
 - Modify: `tests/src/za/mod.rs` (`pub mod fanout;`, the call after `dav_seal::test_legacy`)
-- Modify: `tests/src/za/tracing.rs:717-730`, `tests/src/za/gating.rs:482-497`, `:553-562`, `tests/src/za/pairs.rs:28-37`, `:134`, `:165`
+- Modify: `tests/src/za/tracing.rs:717-730`, `tests/src/za/gating.rs:482-496`, `:553-563`, `tests/src/za/pairs.rs:28-37`, `:88-89`, `:134`, `:165`
 - Modify: `tests/src/webdav/za_variants.rs:9-21` (imports), `:351-415` (`scheduling`)
 
 **Interfaces:**
@@ -2079,10 +2082,15 @@ impl Drop for ConsumerHeld {
 
 /// Holds the task manager's consumer at its pause point, so a task-queue
 /// read cannot miss a task the worker would otherwise run and clear
-/// (invitations spec 11). Waits for due tasks first, so nothing earlier is
-/// mid-flight, then wakes the consumer and waits until it is parked.
+/// (invitations spec 11). Waits for due tasks first (at most 30 s), so
+/// nothing earlier is mid-flight, then wakes the consumer and waits until it
+/// is parked.
 pub async fn hold_task_consumer(test: &TestServer) -> ConsumerHeld {
-    test.wait_for_tasks_skip_not_due().await;
+    // Bounded: a permanently failed task left by an earlier module would
+    // otherwise hang the suite here without a name.
+    tokio::time::timeout(Duration::from_secs(30), test.wait_for_tasks_skip_not_due())
+        .await
+        .expect("tasks did not drain before the consumer hold");
     let pause = Arc::new(HookPause::new(0));
     test_hooks::set_task_consumer_pause(Some(pause.clone()));
     test.server.notify_task_queue();
@@ -2569,7 +2577,10 @@ In `tests/src/za/mod.rs`, add `pub mod fanout;` after `pub mod expansion;`, and 
     // Scheduling: a past event traces its reason on the create and the
     // update path, for the plain account and, since a key account resolves
     // its sending state under upstream's preconditions (invitations spec
-    // 5.1, `SendSealed`), for the key account too.
+    // 5.1, `SendSealed`), for the key account too. Every key-account PUT of
+    // an event without an ORGANIZER now also traces upstream's
+    // `NoSchedulingInfo` ("No scheduling information found") at Debug level
+    // through the same arm, as a plain account's does.
     let itip = traced_as(EventType::Calendar(CalendarEvent::ItipMessageError));
     assert_eq!(
         itip.matches("lies in the past").count(),
@@ -2582,7 +2593,7 @@ In `tests/src/za/mod.rs`, add `pub mod fanout;` after `pub mod expansion;`, and 
     );
 ```
 
-`tests/src/za/gating.rs`, replace `:482-497` (from `// Organizer is a key account: stored, nothing sent, no schedule tag.` through the `schedule-tag` assertion) with:
+`tests/src/za/gating.rs`, replace `:482-496` (from `// Organizer is a key account: stored, nothing sent, no schedule tag.` through the `schedule-tag` assertion) with the block below. Line 497, `wait_for_delivery(test).await;`, stays: the mail-count and inbox assertions after it need the queue drained.
 
 ```rust
     // Organizer is a key account (invitations spec 5.1, `SendSealed`): the
@@ -2604,7 +2615,7 @@ In `tests/src/za/mod.rs`, add `pub mod fanout;` after `pub mod expansion;`, and 
     );
 ```
 
-and replace `:553-562` (from `// A CANCEL on DELETE needs a stored schedule tag` through the `.is_none()` assertion) with:
+and replace `:553-563` (from `// A CANCEL on DELETE needs a stored schedule tag` through the `.is_none()` assertion's closing `);`) with:
 
 ```rust
     // The stored event carries the schedule tag a CANCEL on DELETE needs
@@ -2631,6 +2642,16 @@ const EVENT_NO_ATTENDEES: &str = concat!(
     "ORGANIZER:mailto:key1@example.com\r\n",
     "END:VEVENT\r\nEND:VCALENDAR\r\n"
 );
+```
+
+replace the comment at `:88-89` (`// An alarm-only PUT builds no iTIP message; the bundle is rebuilt from` and its next line) with:
+
+```rust
+    // The planted event has no schedule tag, so under `SendSealed` this
+    // alarm-only PUT runs `itip_create` and builds REQUESTs to pair-a and
+    // pair-b, which the fan-out marks 5.3 (not internal). The union keeps
+    // the stored pairs, so the bundle still holds both. The module's final
+    // DELETEs build CANCELs that the fan-out does not attempt.
 ```
 
 and change the two bodies of the "events without pairs" block: `:134` becomes `let r1_body = EVENT_NO_ATTENDEES.replace("za-pairs-1", "za-pairs-r1");` and `:165` becomes `let legacy_body = EVENT_NO_ATTENDEES.replace("za-pairs-1", "za-pairs-legacy");`. Extend the block's comment (`:129-132`) with one sentence: "They carry no attendee: with attendees, the fan-out hands out tokens (invitations spec 3.3)."
@@ -3211,7 +3232,7 @@ git commit -m "SendSealed: a key account's PUT fans out sealed items under the U
 - Modify: `tests/src/za/mod.rs` (`pub mod reply;`; calls after `fanout::test`)
 
 **Interfaces:**
-- Consumes: Task 3's helpers and `fanout.rs` items (`Party`, `invite`, `stored_pairs`, `attendee_statuses`, `pair_token`, `CONTENT_TYPE`, `NO_REPLY`, `KEY1_CAL`, `START_A`); Task 1's `test_hooks::set_commit_fail_once`; plan 8's `RSVP_TOKEN_PROP`, `TokenPairs`; `insert_event` (`tests/src/utils/za.rs`, private).
+- Consumes: Task 3's helpers and `fanout.rs` items (`Party`, `invite`, `stored_pairs`, `attendee_statuses`, `pair_token`, `CONTENT_TYPE`, `NO_REPLY`, `KEY1_CAL`, `START_A`); Task 1's `test_hooks::set_commit_fail_once`; plan 8's `RSVP_TOKEN_PROP`, `TokenPairs`; `insert_event` (`tests/src/utils/za.rs`, private); `za::user_permissions` (`tests/src/za/mod.rs:127`).
 - Produces: `plant_attendee_copy(test, account_id, name, ical, password, pairs: &TokenPairs) -> u32`; `reply::test`, `fanout::test_failures`; `reply.rs`'s `copy` and `organizer_statuses` (Task 5 extends `reply::test`).
 
 Background:
@@ -3221,6 +3242,7 @@ Background:
   - **(a) key2 delegates to key3.** Upstream builds a REPLY to key1 and a REQUEST from key2 to key3 (`from_organizer = false`); only the REPLY is attempted.
   - **(b) key2 is key3's delegate and accepts.** Upstream addresses the REPLY to key1 and to the delegator key3 (`is_delegated_to`, `attendee.rs:137-141`); only key1 is attempted. Case (b) is the one the ORGANIZER-only rule decides; without it the brief's "no item to any delegator" would hold vacuously.
 - The quota and size settings are restored before the test returns: key2's quotas map is reset to `{}` (no disk quota); `CalendarScheduling` returns to its defaults (`itipMaxSize` 524288, `maxRecipients` 100).
+- Case 7d pins the fourth not-attempted class of spec 5.2, a key account without `CalendarSchedulingReceive`. It revokes the permission on key3 with `Account::registry_update_object(ObjectType::Account, key3, json!({ Property::Permissions: Permissions::Merge(PermissionsList { disabled_permissions: Map::new(vec![Permission::CalendarSchedulingReceive]), enabled_permissions: Map::new(user_permissions()) }) }))`, the shape `tests/src/za/disabled.rs:34-53` uses for `Authenticate`. The restore writes the same with `disabled_permissions` empty, which is how `setup.rs` created key3 (`user_permissions()` through `create_passwordless_user_account`). A permission change invalidates the account's access token (`crates/common/src/cache/invalidate.rs:63-71`), which is where `resolve_inner` reads the permission.
 
 - [ ] **Step 1: The attendee-copy helper**
 
@@ -3579,7 +3601,7 @@ pub async fn test(test: &mut TestServer) {
 In `tests/src/za/fanout.rs`, replace the import block with:
 
 ```rust
-use super::{STRONG, dav_seal::raw_event};
+use super::{STRONG, dav_seal::raw_event, user_permissions};
 use crate::utils::{
     server::TestServer,
     webdav::DummyWebDavClient,
@@ -3588,10 +3610,13 @@ use crate::utils::{
         new_inbox_items, open_pending_item_as, schedule_statuses, wait_for_delivery, za_unlock,
     },
 };
-use ::registry::schema::{
-    enums::StorageQuota,
-    prelude::{ObjectType, Property},
-    structs::CalendarScheduling,
+use ::registry::{
+    schema::{
+        enums::{Permission, StorageQuota},
+        prelude::{ObjectType, Property},
+        structs::{CalendarScheduling, Permissions, PermissionsList},
+    },
+    types::map::Map,
 };
 use calcard::icalendar::{ICalendarMethod, ICalendarProperty};
 use common::za::test_hooks;
@@ -3623,8 +3648,10 @@ pub async fn uid_copies(test: &TestServer, account_id: u32, uid: &str) -> u64 {
 }
 
 /// Spec 5.3 step 5 and 5.4: a recipient's failure is that recipient's
-/// `5.1`, never a failed PUT; over the recipient limit the PUT fails before
-/// any delivery; a failed sender commit after the fan-out leaves its items.
+/// `5.1`, never a failed PUT; a key account without
+/// `CalendarSchedulingReceive` is not attempted (5.2); over the recipient
+/// limit the PUT fails before any delivery; a failed sender commit after the
+/// fan-out leaves its items.
 pub async fn test_failures(test: &mut TestServer) {
     println!("Running zero-access fan-out failure tests...");
     let admin = test.account("admin@example.com").clone();
@@ -3690,6 +3717,73 @@ pub async fn test_failures(test: &mut TestServer) {
         .registry_update_setting(CalendarScheduling::default(), &[Property::ItipMaxSize])
         .await;
     admin.reload_settings().await;
+
+    // 7d. A key account without `CalendarSchedulingReceive` (spec 5.2): not
+    // attempted. The permission is revoked through the registry as
+    // `disabled.rs` disables `Authenticate` (`Property::Permissions`,
+    // `Permissions::Merge`); the edit invalidates key3's access token
+    // (`permissions_changed` -> `CacheInvalidation::AccessToken`,
+    // `crates/common/src/cache/invalidate.rs:63-71`), so the fan-out's next
+    // `access_token(key3)` reads it.
+    fn key3_permissions(disabled: Vec<Permission>) -> serde_json::Value {
+        // As the suite created key3: `user_permissions()` enabled.
+        json!({ Property::Permissions: Permissions::Merge(PermissionsList {
+            disabled_permissions: Map::new(disabled),
+            enabled_permissions: Map::new(user_permissions()),
+        }) })
+    }
+    let key3_account = test.account("key3@example.com").id();
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            key3_account,
+            key3_permissions(vec![Permission::CalendarSchedulingReceive]),
+        )
+        .await;
+    let before2 = inbox_ids(test, key2.id).await;
+    let before3 = inbox_ids(test, key3.id).await;
+    let receive = format!("{KEY1_CAL}fo-receive.ics");
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &receive,
+            [CONTENT_TYPE],
+            invite("za-fo-receive", START_A, &["key2@example.com", "key3@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(
+        inbox_ids(test, key3.id).await,
+        before3,
+        "an item reached key3 without CalendarSchedulingReceive"
+    );
+    assert_eq!(new_inbox_items(test, key2.id, &before2).await.len(), 1);
+    assert_eq!(attendee_statuses(&key1.client, &receive, "key3@example.com").await, ["5.3"]);
+    assert_eq!(attendee_statuses(&key1.client, &receive, "key2@example.com").await, ["1.2"]);
+    // Restore key3's permissions, and check that the restore took.
+    admin
+        .registry_update_object(ObjectType::Account, key3_account, key3_permissions(vec![]))
+        .await;
+    let restored = format!("{KEY1_CAL}fo-restored.ics");
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &restored,
+            [CONTENT_TYPE],
+            invite("za-fo-restored", START_A, &["key3@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(
+        new_inbox_items(test, key3.id, &before3).await.len(),
+        1,
+        "key3 receives again after the restore"
+    );
+    assert_eq!(attendee_statuses(&key1.client, &restored, "key3@example.com").await, ["1.2"]);
+    // The items now, so 7c and 8 keep their baselines; the events with the
+    // module's cleanup.
+    key2.delete_items_since(test, &before2).await;
+    key3.delete_items_since(test, &before3).await;
 
     // 7c. Max recipients (spec 5.1): the PUT fails with the precondition
     // before any delivery, and nothing is stored.
@@ -3769,7 +3863,7 @@ pub async fn test_failures(test: &mut TestServer) {
     );
 
     // Cleanup.
-    for name in ["fo-quota", "fo-size", "fo-commit"] {
+    for name in ["fo-quota", "fo-size", "fo-receive", "fo-restored", "fo-commit"] {
         key1.client
             .request_with_headers("DELETE", &format!("{KEY1_CAL}{name}.ics"), [NO_REPLY], "")
             .await
@@ -3793,14 +3887,16 @@ Run the za suite. Expected: PASS.
 
 Values from code reading, with their fallbacks:
 - The quota update invalidates key2's account cache (`quota_changed`, `crates/common/src/cache/invalidate.rs:40-57`). If key2 still gets `1.2` in 7a, stop and report.
+- The permission edit in 7d reaches the fan-out's next `access_token(key3)` (the `AccessToken` invalidation above). If key3 still gets `1.2` with the permission revoked, stop and report.
 - `reload_settings` makes the new `itipMaxSize` and `maxRecipients` visible to the next request (`core.groupware`, `crates/common/src/config/groupware.rs:136-137`). If 7b or 7c sees the old value, stop and report.
 - The DELEGATED-TO and DELEGATED-FROM parameters parse as `Email::from_uri` expects (`crates/groupware/src/scheduling/snapshot.rs`). If 4(a) yields no REQUEST to key3 at all, its status reads `[]` instead of `["5.3"]`; record a ruling and keep the item assertions, which are the rule under test.
 
-- [ ] **Step 5: Red runs (M26, M27)**
+- [ ] **Step 5: Red runs (M26, M27, M28)**
 
 One at a time; revert each with `git checkout -- crates/groupware/src/calendar/fanout.rs` and confirm `git status --short crates/` prints nothing. Write each failure line into the task report.
 1. **M26, the ORGANIZER-only rule for REPLY.** In `route`, change `Some(ICalendarMethod::Reply) if to_organizer =>` to `Some(ICalendarMethod::Reply) =>`. Run the za suite. Expected: FAIL in `reply.rs` 4(b), `an item reached the delegator key3`.
 2. **M27, the quota check.** In `write_item_inner`, delete the `if server.has_available_quota(..).await.is_err() { return Ok(false); }` block. Run the za suite. Expected: FAIL in `fanout.rs` 7a, `an item reached key2 past its quota`.
+3. **M28, the receive permission.** In `resolve_inner`, delete the `if !server.access_token(account_id).await?.build().has_permission(Permission::CalendarSchedulingReceive) { return Ok(Recipient::NotInternal); }` block. Run the za suite. Expected: FAIL in `fanout.rs` 7d, `an item reached key3 without CalendarSchedulingReceive`. No earlier case invites an account without the permission.
 
 - [ ] **Step 6: Format and commit**
 
@@ -4025,7 +4121,8 @@ In `tests/src/webdav/za_variants.rs`, add `item_method` to the `crate::utils::za
 
 ```rust
     // john's DELETE cancels: a second pending item, a CANCEL (METHOD is
-    // visible on the sealed root), and still no mail (spec 5.5).
+    // visible on the sealed root), and still no mail (spec 5.5). The
+    // DELETE's task-queue check lives in the za suite's `test_task_queue`.
     john.request("DELETE", "/dav/cal/john@example.com/default/s.ics", "")
         .await
         .with_status(StatusCode::NO_CONTENT);
@@ -4655,7 +4752,7 @@ Values from code reading, with their fallbacks:
 - [ ] **Step 3: Red runs (M24, M25)**
 
 One at a time; revert each with `git checkout -- <file>` and confirm `git status --short crates/` prints nothing. Write each failure line into the task report.
-1. **M24, the lease in the PUT create branch.** In `crates/dav/src/calendar/update.rs`, replace `Some(za_take_uid_lease(self, &resources, account_id, parent.document_id(), &uid).await?)` with `{ za_assert_is_unique_uid(self, &resources, account_id, parent.document_id(), &uid).await?; None }`, and add `za_assert_is_unique_uid` to the `use super::{..}` line. The archive re-check stays; the lease and its fence go. Run the za suite. Expected: FAIL in `uid_lease.rs` (b), `an expired holder committed` (left 201, right 412). Case (c) fails the same way (two 201s) when (b) is skipped.
+1. **M24, the lease in the PUT create branch.** In `crates/dav/src/calendar/update.rs`, replace `Some(za_take_uid_lease(self, &resources, account_id, parent.document_id(), &uid).await?)` with `{ za_assert_is_unique_uid(self, &resources, account_id, parent.document_id(), &uid).await?; None::<ZaUidLeaseGuard> }` (both arms are `None` now, so the type must be named), add `za_assert_is_unique_uid` to the `use super::{..}` line, and add `use common::za::lease::ZaUidLeaseGuard;` to `update.rs`; the revert removes all three. The archive re-check stays; the lease and its fence go. Run the za suite. Expected: FAIL in `uid_lease.rs` (b), `an expired holder committed` (left 201, right 412). Case (c) fails the same way (two 201s) when (b) is skipped.
 2. **M25, the snapshot re-check.** In `crates/dav/src/calendar/mod.rs`, `za_take_uid_lease`, replace the `za_assert_is_unique_uid(server, resources, account_id, calendar_id, uid).await` call with `assert_is_unique_uid(server, resources, account_id, calendar_id, Some(uid)).await`. Run the za suite. Expected: FAIL in `uid_lease.rs` (a), `the stale snapshot let a second copy in` (left 201, right 412).
 
 - [ ] **Step 4: Format and commit**
@@ -4672,7 +4769,7 @@ git commit -m "Creation lease tests: stale snapshot, expiry, PUT versus PUT, non
 ### Task 7: The fan-out in the leak scan
 
 **Files:**
-- Modify: `tests/src/za/leak.rs`: imports (`:10-44`), `EXTRA_CANARIES` (`:62-84`), a constant after `SCHED_EVENT` (`:88-95`), `test` (the scheduling PUT and the pre-drain scan at `:800-817`, the item count at `:962`, the token check, the item deletes at `:1130`)
+- Modify: `tests/src/za/leak.rs`: imports (`:10-55`), `EXTRA_CANARIES` (`:62-84`), a constant after `SCHED_EVENT` (`:88-95`), `test` (the scheduling PUT and the pre-drain scan at `:800-817`, the item count at `:962`, the token check, the item deletes at `:1130`)
 
 **Interfaces:**
 - Consumes: Task 3's `hold_task_consumer`, `itip_tasks_for`, `inbox_ids`, `new_inbox_items`, `za_unlock`; `fanout.rs`'s `NO_REPLY`; plan 8's `token_hits`, `event_token_pairs`, `raw_event`.
@@ -4820,6 +4917,7 @@ git commit -m "Leak scan: a real fan-out, its pending item and its token"
 
 **Files:**
 - Modify (temporarily, reverted after each run): the product files in the table below
+- Modify: `docs/superpowers/specs/2026-10-06-zero-access-calendar-design.md:659-660`, `:708` (release 1 notes)
 - Create: `docs/superpowers/plans/2026-10-14-zero-access-plan9-outcome.md`
 
 **Interfaces:**
@@ -4834,14 +4932,15 @@ How a run works:
 
 | Id | What it removes | Edit | Command | Expected first failure (from code reading) |
 |----|-----------------|------|---------|-------------------------------------------|
-| M22 | The recipient split | `crates/groupware/src/calendar/fanout.rs`, `resolve_inner`: everything after the `account_id == sender_id` check becomes `Ok(Recipient::Internal { account_id, public_key: [9u8; 32] })` | za suite | `fanout.rs` test 1, `plain's inbox received an item` |
+| M22 | The recipient split | `crates/groupware/src/calendar/fanout.rs`, `resolve_inner`: everything after the `account_id == sender_id` check becomes `Ok(Recipient::Internal { account_id, public_key: [9u8; 32] })` | za suite | `fanout.rs` test 1, `plain's inbox received an item`. Fallback: if `seal_pending_item` rejects `[9u8; 32]` as a non-contributory point, the first failure moves to `attendee_statuses(plain) == ["5.3"]` (gets `5.1`); either failure proves the split is load-bearing |
 | M23 | The queue path stays closed for key senders | `crates/dav/src/calendar/update.rs`, create branch: the `if itip_status.is_send_sealed() { .. } else { .. }` becomes `itip_messages = Some(ItipMessages::new(messages));` | za suite | `fanout.rs` `test_task_queue`, `a CalendarItipMessage task was queued for the key organizer` |
-| M24 | The lease in the PUT create branch | `update.rs`: `Some(za_take_uid_lease(..).await?)` becomes `{ za_assert_is_unique_uid(..).await?; None }` (import added) | za suite | `uid_lease.rs` (b), `an expired holder committed` |
+| M24 | The lease in the PUT create branch | `update.rs`: `Some(za_take_uid_lease(..).await?)` becomes `{ za_assert_is_unique_uid(..).await?; None::<ZaUidLeaseGuard> }`, with `za_assert_is_unique_uid` added to the `use super::{..}` line and `use common::za::lease::ZaUidLeaseGuard;` added | za suite | `uid_lease.rs` (b), `an expired holder committed` |
 | M25 | The archive-based re-check | `crates/dav/src/calendar/mod.rs`, `za_take_uid_lease`: `za_assert_is_unique_uid(..)` becomes `assert_is_unique_uid(server, resources, account_id, calendar_id, Some(uid))` | za suite | `uid_lease.rs` (a), `the stale snapshot let a second copy in` |
 | M26 | The ORGANIZER-only rule for REPLY | `fanout.rs`, `route`: `Some(ICalendarMethod::Reply) if to_organizer =>` becomes `Some(ICalendarMethod::Reply) =>` | za suite | `reply.rs` 4(b), `an item reached the delegator key3` |
 | M27 | The quota check | `fanout.rs`, `write_item_inner`: delete the `has_available_quota` block | za suite | `fanout.rs` 7a, `an item reached key2 past its quota` |
+| M28 | The `CalendarSchedulingReceive` check | `fanout.rs`, `resolve_inner`: delete the `has_permission(Permission::CalendarSchedulingReceive)` block | za suite | `fanout.rs` 7d, `an item reached key3 without CalendarSchedulingReceive` |
 
-- [ ] **Step 1: Run M22-M27**
+- [ ] **Step 1: Run M22-M28**
 
 Run them in order. Keep raw notes in the task report: the edit, the first failure, the revert confirmation.
 
@@ -4907,13 +5006,19 @@ Read it before plan 10.
 - The new za sub-modules run after `dav_seal::test_legacy`, before `tracing` and `gating`, so M22 and M23 fail in the tests that own them.
 - Existing tests changed by `SendSealed`: `tracing` (four past-event traces), `gating::test_scheduling` (schedule tag present; the DELETE comments), `pairs` (the no-pair cases carry no attendee), the key-mode `scheduling` variant (store-level delivery, the CANCEL).
 - None of upstream's `cal_scheduling` assertions runs unchanged in key mode before the drain; the variant asserts the organizer's schedule tag upstream asserts.
+- `pairs::test`: the alarm-only PUT on the planted event (no schedule tag) now runs `itip_create` and fans out REQUESTs to `pair-a` and `pair-b`, marked `5.3`; plan 8's M18 row ("no token pairs after an alarm-only PUT") now reads through the fan-out's union, which keeps the stored pairs.
+- The trace volume plan 5 removed for `KeyAccount` returns through upstream's `Err` arm for key accounts under `SendSealed`: every key-account PUT of an event without an ORGANIZER traces `NoSchedulingInfo` at Debug level, as a plain account's does. Correct under invariant 9; those traces carry ids and fixed strings only; no code change.
+- The leak test's attendee canary rides on the attendee's CN, not on an attendee address (spec 11 lists addresses): an address must resolve for the item to be delivered.
+- A disabled key account still receives items: `resolve_inner` does not check `Authenticate`. It cannot log in, so the items wait and expire under the inbox purge; upstream's mail path would refuse at RCPT. Accepted.
+- The lost-fence 503 can follow a fully delivered fan-out: items stay (spec 5.4), so the client's resend delivers a second set of items with fresh tokens, test 8's situation.
+- A key account's DELETE of a sealed event whose envelope does not open answers 500 when `send_itip` is true (the unseal before `itip_cancel` fails), per release 1 spec section 10's unseal-failure rule; `Schedule-Reply: F` deletes it without reading it.
 - Any other ruling from the task reports.
 
 ## Mutation runs (plan 9)
 
 | Id | Check, `file:line` | Edit | First failure | Command |
 |----|--------------------|------|---------------|---------|
-<one row per M22-M27, from Task 8 Step 1>
+<one row per M22-M28, from Task 8 Step 1>
 
 ## Facts for plan 10
 
@@ -4931,15 +5036,49 @@ Read it before plan 10.
 - `token_hits` (`tests/src/za/leak.rs`) does not decode MIME bodies; mail flows that carry tokens need that first.
 - Test helpers for the drain's tests: `open_pending_item_as`, `inbox_items`, `new_inbox_items`, `plant_attendee_copy`, `hold_task_consumer`, `itip_tasks_for`, `HookParked`.
 - An item whose sender's commit failed (`COMMIT_FAIL_ONCE`, lease case b) stays pending; a retried create delivers a second item with an equal SEQUENCE and a fresh token, which the drain must adopt (spec 5.4, 6.4).
+- `ZaUidLease::release` answers `false` and traces "UID creation lease not released" when the maintenance purge or the sweep already removed an expired lease; the sweep test should expect that trace.
+- `COMMIT_FAIL_ONCE` fires only in `za_commit_create`, the PUT create branch; the drain's commits need their own hook.
 
 ## Deferred findings
 
 <findings from task and branch reviews that were not fixed, each with its reason>
 ````
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 4: The release 1 spec notes**
+
+Release 1 spec section 8.1 and the section 9 table say a key account never gets a schedule tag and its DELETE never cancels; invitations spec 5.1 and 5.5, which this plan builds, supersede both. In `docs/superpowers/specs/2026-10-06-zero-access-calendar-design.md`, append one note to each and change nothing else in that spec.
+
+The 8.1 DELETE bullet (`:659-660`) reads:
+
+```
+- `DELETE`: unchanged. The cancel path that reads the event only runs when a
+  schedule tag is set, which never happens for key accounts in release 1.
+```
+
+Replace it with:
+
+```
+- `DELETE`: unchanged. The cancel path that reads the event only runs when a
+  schedule tag is set, which never happens for key accounts in release 1
+  (release 2: superseded by invitations spec 5.1 and 5.5; key accounts set the
+  schedule tag, and their CANCELs fan out as sealed items).
+```
+
+The section 9 table row (`:708`) reads:
+
+```
+| CalDAV scheduling (RFC 6638) | scheduling permissions off; auto-schedule not advertised; a `PUT` with attendees stores them sealed and sends nothing; no schedule tag is ever set; the notification collection is never written |
+```
+
+Replace it with:
+
+```
+| CalDAV scheduling (RFC 6638) | scheduling permissions off; auto-schedule not advertised; a `PUT` with attendees stores them sealed and sends nothing; no schedule tag is ever set; the notification collection is never written (release 2: superseded by invitations spec 5.1 and 5.5; key accounts set the schedule tag, and their CANCELs fan out as sealed items) |
+```
+
+- [ ] **Step 5: Commit**
 
 ```bash
-git add docs/superpowers/plans/2026-10-14-zero-access-plan9-outcome.md
-git commit -m "Record plan 9 mutation runs and rulings"
+git add docs/superpowers/plans/2026-10-14-zero-access-plan9-outcome.md docs/superpowers/specs/2026-10-06-zero-access-calendar-design.md
+git commit -m "Record plan 9 mutation runs and rulings; release 1 spec notes"
 ```
