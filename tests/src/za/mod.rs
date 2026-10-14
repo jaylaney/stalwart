@@ -20,6 +20,7 @@ pub mod dav_seal;
 pub mod disabled;
 pub mod expansion;
 pub mod gating;
+pub mod inbox;
 pub mod index_task;
 pub mod leak;
 pub mod pairs;
@@ -107,6 +108,7 @@ pub async fn za_tests() {
     gating::test_scheduling(&mut test).await;
     websocket::test(&mut test).await;
     pairs::test(&mut test).await;
+    inbox::test(&mut test).await;
     leak::test(&mut test).await;
     leak::test_index_control(&mut test).await;
     index_task::test(&mut test).await;

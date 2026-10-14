@@ -21,7 +21,10 @@ use crate::{
         query::{serialize_vcard_with_props, vcard_query},
     },
     common::{
-        DavQueryResource, acl::current_user_privilege_set, uri::DavUriResource, za::za_archive_view,
+        DavQueryResource,
+        acl::current_user_privilege_set,
+        uri::DavUriResource,
+        za::{za_archive_view, za_item_hidden},
     },
     file::{FILE_CONTAINER_PROPS, FILE_ITEM_PROPS},
     principal::{
@@ -456,6 +459,10 @@ impl PropFindRequestHandler for Server {
                 .caused_by(trc::location!())?
             {
                 stored_ = archive;
+                // Invitations spec 6.6: a pending inbox item is not listed.
+                if za_item_hidden(self, account_id, collection, &stored_).await? {
+                    continue;
+                }
                 // Spec 8.2: key-account calendar content is unsealed before any
                 // use; the view keeps the stored version, so `archive_.etag()`
                 // stays bound to the stored bytes. One failure fails one item.

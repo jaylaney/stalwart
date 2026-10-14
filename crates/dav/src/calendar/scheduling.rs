@@ -11,6 +11,7 @@ use crate::{
         ETag,
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
+        za::{ZeroAccessGate, za_item_hidden, za_item_view},
     },
 };
 use calcard::{
@@ -113,7 +114,26 @@ impl CalendarEventNotificationHandler for Server {
             .await
             .caused_by(trc::location!())?
             .ok_or(DavError::Code(StatusCode::NOT_FOUND))?;
-        let event = event_
+        // Invitations spec 6.6: a pending item answers 404 until drained; a
+        // drained one is shown unsealed. Identity stays the stored archive's.
+        if za_item_hidden(
+            self,
+            account_id,
+            Collection::CalendarEventNotification,
+            &event_,
+        )
+        .await?
+        {
+            return Err(DavError::Code(StatusCode::NOT_FOUND));
+        }
+        let za_keys = self.za_session_keys(access_token, account_id).await?;
+        let view_ = za_item_view(
+            &event_,
+            za_keys.as_ref(),
+            account_id,
+            resource.document_id(),
+        )?;
+        let event = view_
             .unarchive::<CalendarEventNotification>()
             .caused_by(trc::location!())?;
 
