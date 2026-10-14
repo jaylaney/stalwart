@@ -130,7 +130,7 @@ pub const KV_LOCK_DAV: u8 = 25;
 pub const KV_SIEVE_ID: u8 = 26;
 /// Invitations spec 6.3: the per-(account, UID) creation lease
 /// (`za::lease`).
-pub const KV_LOCK_ZA_UID: u8 = 27;
+pub const KV_LOCK_ZA_UID: u8 = store::ZA_UID_LEASE_PREFIX;
 
 #[derive(Clone)]
 pub struct Server {

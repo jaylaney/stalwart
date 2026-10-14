@@ -574,10 +574,11 @@ one more writer and closes the gap for key accounts.)
    (`document_ids_matching` on `CalendarEventField::Uid`), which is fresh,
    so the drain needs no such change.
 2. **Its value** is `expiry (u64, big endian) || fence token (random
-   bytes)`. The leading expiry keeps the key compatible with
-   `purge_in_memory_store` (`lookup.rs`), which reads the first eight bytes
-   as the expiry and deletes expired keys; the token makes the value unique
-   to one holder.
+   bytes)`. The leading expiry is what the fork's sweep (step 4) reads;
+   `purge_in_memory_store` (`lookup.rs`) skips the `KV_LOCK_ZA_UID` range,
+   because its unconditional clear would delete a replacement lease taken
+   between its scan and its clear (PR #35 review). The token makes the
+   value unique to one holder.
 3. **The fenced commit.** The batch that inserts the event (and, for the
    drain, rewrites the item) also asserts that the lease key still holds
    this holder's exact value (`assert_value`). An expired holder whose
@@ -591,18 +592,15 @@ one more writer and closes the gap for key accounts.)
    key, so a holder never removes a successor's lease. A crashed holder's
    lease (or one whose release failed) expires and is purged by the
    maintenance task's lease sweep, which runs on the data store whatever
-   the lookup backend. The existing purge does not cover it under every
-   configuration: the maintenance task
-   (`crates/services/src/task_manager/maintenance.rs`) calls
-   `purge_store()`, which on RocksDB visits only the quota and counter
-   subspaces (`crates/store/src/backend/rocksdb/write.rs`), and then the
-   lookup backend's `purge_in_memory_store()`, a no-op for Redis
-   (`lookup.rs`). The fork adds one call to that purge step: iterate the
+   the lookup backend. The generic purge never touches lease keys, on any
+   configuration: `purge_in_memory_store()` skips the `KV_LOCK_ZA_UID`
+   range (step 2), so the sweep is the only cleanup. The fork adds one call
+   to the maintenance task's purge step
+   (`crates/services/src/task_manager/maintenance.rs`): iterate the
    `KV_LOCK_ZA_UID` key range in the data store and clear every key whose
-   leading eight-byte expiry is at or below now, the rule
-   `purge_in_memory_store` applies. When the in-memory store is the data
-   store, the sweep overlaps the existing purge harmlessly. Without the
-   sweep an abandoned lease is storage growth, not a fencing failure: a
+   leading eight-byte expiry is at or below now, each clear asserting the
+   value the sweep read, so a lease re-taken in between survives. Without
+   the sweep an abandoned lease is storage growth, not a fencing failure: a
    later creator of the same UID replaces the expired value.
 5. **Scope.** The lease covers creation only, from the absence check
    through the insert. Updates and merges of an existing event are already
@@ -935,7 +933,8 @@ consumer pause must live where both `http` and `services` can reach it
   calendar and releases its lease; the PUT resumes, takes the lease, and
   answers `NoUidConflict`.
 - Lease sweep: plant an expired lease key and a live one in the data
-  store, run the purge, and expect only the expired one gone. It runs with
+  store; the sweep removes only the expired one, and the generic purge
+  leaves both. It runs with
   the default configuration, where the in-memory store is the data store;
   a Redis-plus-data-store run of the same check would live in the `store`
   suite's Redis container harness (`tests/src/utils/containers.rs`, used by

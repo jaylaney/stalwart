@@ -16,7 +16,10 @@
 //! through `Server::store()` the way `try_lock` writes one when the
 //! in-memory store is the data store, and never through the in-memory store
 //! dispatch: the fenced commit needs the lease and the event in one
-//! transaction.
+//! transaction. The generic `purge_in_memory_store` skips the
+//! `KV_LOCK_ZA_UID` range, since its unconditional clear would delete a
+//! replacement lease; plan 10's sweep clears expired leases with an
+//! assertion on the value it read.
 
 use crate::{KV_LOCK_ZA_UID, auth::vault::RawValue};
 use sha2::{Digest, Sha256};
@@ -163,9 +166,9 @@ impl ZaUidLease {
 
     /// Spec 6.3 step 4: clears the key if it still holds this holder's
     /// value, so a holder never removes a successor's lease. Returns whether
-    /// the key is gone: cleared here, or already absent (the maintenance
-    /// purge swept the expired lease, which after a fenced commit is
-    /// benign and not traced). A key holding another value, or a store
+    /// the key is gone: cleared here, or already absent (plan 10's sweep
+    /// removed the expired lease, which after a fenced commit is benign and
+    /// not traced). A key holding another value, or a store
     /// error, is traced and returns `false`; the key then expires and plan
     /// 10's sweep removes it.
     pub async fn release(self, store: &Store) -> bool {
@@ -249,7 +252,7 @@ impl Drop for ZaUidLeaseGuard {
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
-    use store::backend::ephemeral::EphemeralStore;
+    use store::{InMemoryStore, backend::ephemeral::EphemeralStore, dispatch::lookup::KeyValue};
 
     async fn stored(store: &Store, account_id: u32, uid: &str) -> Option<Vec<u8>> {
         store
@@ -317,7 +320,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        // The maintenance purge removed the expired key after the commit.
+        // Plan 10's sweep removed the expired key after the commit.
         let mut batch = BatchBuilder::new();
         batch.clear(lease_class(lease_key(5, "purged")));
         store.write(batch.build_all()).await.unwrap();
@@ -326,6 +329,49 @@ mod tests {
             "an absent key is already released"
         );
         assert!(stored(&store, 5, "purged").await.is_none());
+    }
+
+    /// The generic in-memory purge clears expired keys without an
+    /// assertion, so it would delete a replacement lease taken between its
+    /// scan and its clear; it skips the lease range (PR #35 review).
+    #[tokio::test]
+    async fn the_generic_purge_leaves_lease_keys() {
+        let store = EphemeralStore::open();
+        write_raw(&store, 9, "stale", expired_value(1)).await;
+        let live = ZaUidLease::acquire(&store, 9, "live")
+            .await
+            .unwrap()
+            .unwrap();
+        let control = KeyValue::<()>::build_key(25, b"za-purge-control");
+        let mut value = (now() - 1).to_be_bytes().to_vec();
+        value.extend_from_slice(b"payload");
+        let mut batch = BatchBuilder::new();
+        batch.set(lease_class(control.clone()), value);
+        store.write(batch.build_all()).await.unwrap();
+
+        InMemoryStore::from(store.clone())
+            .purge_in_memory_store()
+            .await
+            .unwrap();
+
+        assert!(
+            stored(&store, 9, "stale").await.is_some(),
+            "the purge deleted an expired lease"
+        );
+        assert!(
+            stored(&store, 9, "live").await.is_some(),
+            "the purge deleted a live lease"
+        );
+        assert!(
+            store
+                .get_value::<RawValue>(ValueKey::from(lease_class(control)))
+                .await
+                .unwrap()
+                .is_none(),
+            "the purge kept an expired key of another prefix"
+        );
+        assert!(commit_fenced(&store, &live).await.is_ok());
+        assert!(live.release(&store).await);
     }
 
     #[tokio::test]

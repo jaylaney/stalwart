@@ -109,6 +109,10 @@ pub const SUBSPACE_LOGS: u8 = b'l';
 pub const SUBSPACE_COUNTER: u8 = b'n';
 pub const SUBSPACE_IN_MEMORY_VALUE: u8 = b'm';
 pub const SUBSPACE_IN_MEMORY_COUNTER: u8 = b'y';
+/// Zero-access fork: first byte of the UID creation lease keys
+/// (`common::KV_LOCK_ZA_UID`, `common::za::lease`), which
+/// `purge_in_memory_store` skips.
+pub const ZA_UID_LEASE_PREFIX: u8 = 27;
 pub const SUBSPACE_PROPERTY: u8 = b'p';
 pub const SUBSPACE_REGISTRY: u8 = b's';
 pub const SUBSPACE_REGISTRY_IDX: u8 = b'b';
