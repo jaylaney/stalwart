@@ -10,11 +10,15 @@
 use super::{
     STRONG,
     dav_seal::{CANARIES, EVENT, mkcalendar_body, raw_event},
+    fanout::NO_REPLY,
 };
 use crate::utils::{
     server::TestServer,
     webdav::DummyWebDavClient,
-    za::{PlantedItem, plant_inbox_item, plant_sealed_event, wait_for_delivery},
+    za::{
+        PlantedItem, hold_task_consumer, inbox_ids, itip_tasks_for, new_inbox_items,
+        plant_inbox_item, plant_sealed_event, wait_for_delivery, za_unlock,
+    },
 };
 use base64::{
     Engine,
@@ -30,6 +34,7 @@ use groupware::{
         seal::{
             TokenPairs,
             collection::COLLECTION_MARKER,
+            event_token_pairs,
             item::RSVP_TOKEN_PROP,
             policy::{is_visible_parameter, is_visible_property},
             tree::{EXTRA_PROP, KEY_PROP, SEALED_PROP},
@@ -81,6 +86,10 @@ const EXTRA_CANARIES: &[&str] = &[
     "itip-drained-canary",
     "itip-pair-canary",
     "itip-neg-item-canary",
+    "fanoutsum-canary",
+    "fanoutloc-canary",
+    "fanoutdesc-canary",
+    "fanoutcn-canary",
 ];
 
 /// A future invitation organized by the key account to a local non-key
@@ -91,6 +100,19 @@ const SCHED_EVENT: &str = concat!(
     "DTEND:20990102T100000Z\r\nSUMMARY:sched-canary\r\n",
     "ORGANIZER:mailto:key2@example.com\r\n",
     "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:plain@example.com\r\n",
+    "END:VEVENT\r\nEND:VCALENDAR\r\n"
+);
+
+/// A key organizer's invitation to the module's key account (plan 9's
+/// fan-out): canaries in the title, location, description and the
+/// attendee's display name.
+const FANOUT_EVENT: &str = concat!(
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\n",
+    "UID:leak-fanout\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990104T090000Z\r\n",
+    "DTEND:20990104T100000Z\r\nSUMMARY:fanoutsum-canary\r\n",
+    "LOCATION:fanoutloc-canary\r\nDESCRIPTION:fanoutdesc-canary\r\n",
+    "ORGANIZER:mailto:key1@example.com\r\n",
+    "ATTENDEE;CN=fanoutcn-canary;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:key2@example.com\r\n",
     "END:VEVENT\r\nEND:VCALENDAR\r\n"
 );
 
@@ -797,6 +819,13 @@ pub async fn test(test: &mut TestServer) {
         )
         .await
         .with_status(StatusCode::CREATED);
+    // Hold the consumer across both invitations and the scan: a regression
+    // that queued either as a task leaves it in the task queue here, where
+    // the scan and the task count see it.
+    let key1_id = test.account("key1@example.com").id().document_id();
+    let key1 = DummyWebDavClient::new(key1_id, "key1@example.com", STRONG, "key1@example.com");
+    let key2_items = inbox_ids(test, id).await;
+    let held = hold_task_consumer(test).await;
     client
         .request_with_headers(
             "PUT",
@@ -806,15 +835,34 @@ pub async fn test(test: &mut TestServer) {
         )
         .await
         .with_status(StatusCode::CREATED);
-    // Scan before the task queue drains: a regression that turned iTIP back
-    // on for key accounts would leave the invitation's plaintext in the task
-    // or message queue here, and in the attendee's mail after delivery.
+    // Plan 9: key1's invitation reaches key2 as a sealed pending item.
+    key1.request_with_headers(
+        "PUT",
+        "/dav/cal/key1%40example.com/default/fo-leak.ics",
+        [CONTENT_TYPE],
+        FANOUT_EVENT,
+    )
+    .await
+    .with_status(StatusCode::CREATED);
+    let fan_out_items = new_inbox_items(test, id, &key2_items).await;
+    assert_eq!(
+        fan_out_items.len(),
+        1,
+        "key1's invitation reached key2 once"
+    );
+    let fan_out_item = fan_out_items[0].0;
     let pending = scan(test, id).await;
     assert!(
         pending.violations.is_empty(),
         "leaks found before the task queue drained:\n{}",
         pending.violations.join("\n")
     );
+    assert_eq!(
+        itip_tasks_for(test, key1_id).await + itip_tasks_for(test, id).await,
+        0,
+        "an invitation was queued as a task"
+    );
+    drop(held);
     test.wait_for_tasks().await;
     client
         .request_with_headers(
@@ -957,9 +1005,10 @@ pub async fn test(test: &mut TestServer) {
         "no search index entry of the account: the key layout is misread: {result:?}"
     );
 
-    // Inbox items were decoded and each carries its key envelope; the
-    // pending request's pair bundle was seen before its envelope.
-    assert!(result.items >= 3, "{result:?}");
+    // Inbox items were decoded (the three planted ones and the fan-out's)
+    // and each carries its key envelope; the pending requests' pair bundles
+    // were seen before their envelopes.
+    assert!(result.items >= 4, "{result:?}");
     assert_eq!(result.item_keys, result.items, "{result:?}");
     assert!(result.item_extras >= 1, "{result:?}");
     // The paired event's stored root ends with its pair bundle, then its key
@@ -994,6 +1043,20 @@ pub async fn test(test: &mut TestServer) {
     assert!(
         stray.is_empty(),
         "a token in the clear outside the pending reply item: {stray:?}"
+    );
+    // The fan-out's token for key2 is in the clear nowhere: its item
+    // carries it in the sealed bundle, and no reply item exists here.
+    let keys1 = za_unlock(test, key1_id, STRONG).await;
+    let (organizer_event, _) = raw_event(test, key1_id, "default/fo-leak.ics").await;
+    let fan_out_token = *event_token_pairs(&organizer_event, &keys1, key1_id)
+        .unwrap()
+        .expect("key1's bundle holds pairs")
+        .get("key2@example.com")
+        .expect("key2's pair");
+    let fan_out_hits = token_hits(test, &[fan_out_token]).await;
+    assert!(
+        fan_out_hits.is_empty(),
+        "the fan-out's token in the clear: {fan_out_hits:?}"
     );
 
     // Negative control: an unsealed event planted directly must be caught,
@@ -1127,7 +1190,15 @@ pub async fn test(test: &mut TestServer) {
             .await
             .with_status(StatusCode::NO_CONTENT);
     }
-    for item in [request_id, reply_id, drained_id] {
+    key1.request_with_headers(
+        "DELETE",
+        "/dav/cal/key1%40example.com/default/fo-leak.ics",
+        [NO_REPLY],
+        "",
+    )
+    .await
+    .with_status(StatusCode::NO_CONTENT);
+    for item in [request_id, reply_id, drained_id, fan_out_item] {
         client
             .request(
                 "DELETE",
