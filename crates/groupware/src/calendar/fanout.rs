@@ -434,7 +434,7 @@ async fn resolve_recipient(server: &Server, sender_id: u32, address: &str) -> Re
 }
 
 async fn resolve_inner(server: &Server, sender_id: u32, address: &str) -> trc::Result<Recipient> {
-    let Some(account_id) = server.account_id_from_email(address, true).await? else {
+    let Some(account_id) = server.za_account_id_from_email(address).await? else {
         return Ok(Recipient::NotInternal);
     };
     // Never the sender's own inbox (an alias or sub-address of its own).

@@ -50,6 +50,15 @@ use utils::DomainPart;
 
 impl Server {
     pub async fn domain(&self, domain: &str) -> trc::Result<Option<Arc<DomainCache>>> {
+        self.domain_inner(domain, false).await
+    }
+
+    // Zero-access fork: `quiet` skips the cache events that carry the name.
+    async fn domain_inner(
+        &self,
+        domain: &str,
+        quiet: bool,
+    ) -> trc::Result<Option<Arc<DomainCache>>> {
         let Some(domain) = domain.to_ascii_domain() else {
             return Ok(None);
         };
@@ -57,11 +66,13 @@ impl Server {
         let domain_names = &self.inner.cache.domain_names;
 
         if let Some(domain_id) = domain_names.get(domain) {
-            trc::event!(
-                Store(StoreEvent::CacheHit),
-                Key = domain.to_string(),
-                Collection = "domainName",
-            );
+            if !quiet {
+                trc::event!(
+                    Store(StoreEvent::CacheHit),
+                    Key = domain.to_string(),
+                    Collection = "domainName",
+                );
+            }
 
             let result = self.domain_by_id(domain_id).await?;
             if result.is_none() {
@@ -112,20 +123,24 @@ impl Server {
                         self.inner.cache.negative_cache_ttl,
                     );
 
-                    trc::event!(
-                        Store(StoreEvent::CacheMiss),
-                        Key = domain.to_string(),
-                        Collection = "domainName",
-                    );
+                    if !quiet {
+                        trc::event!(
+                            Store(StoreEvent::CacheMiss),
+                            Key = domain.to_string(),
+                            Collection = "domainName",
+                        );
+                    }
 
                     Ok(None)
                 }
             } else {
-                trc::event!(
-                    Store(StoreEvent::CacheHit),
-                    Key = domain.to_string(),
-                    Collection = "domainNameNegative",
-                );
+                if !quiet {
+                    trc::event!(
+                        Store(StoreEvent::CacheHit),
+                        Key = domain.to_string(),
+                        Collection = "domainNameNegative",
+                    );
+                }
 
                 Ok(None)
             }
@@ -222,15 +237,29 @@ impl Server {
         local_part: &str,
         domain_id: u32,
     ) -> trc::Result<Option<EmailCache>> {
+        self.rcpt_id_from_parts_inner(local_part, domain_id, false)
+            .await
+    }
+
+    // Zero-access fork: `quiet` skips the cache events that carry the local
+    // part.
+    async fn rcpt_id_from_parts_inner(
+        &self,
+        local_part: &str,
+        domain_id: u32,
+        quiet: bool,
+    ) -> trc::Result<Option<EmailCache>> {
         let emails = &self.inner.cache.emails;
 
         if let Some(email) = emails.get(&EmailAddressRef::new(local_part, domain_id)) {
-            trc::event!(
-                Store(StoreEvent::CacheHit),
-                Key = local_part.to_string(),
-                Domain = domain_id,
-                Collection = "email",
-            );
+            if !quiet {
+                trc::event!(
+                    Store(StoreEvent::CacheHit),
+                    Key = local_part.to_string(),
+                    Domain = domain_id,
+                    Collection = "email",
+                );
+            }
 
             Ok(Some(email))
         } else {
@@ -239,12 +268,14 @@ impl Server {
                 .get(&EmailAddressRef::new(local_part, domain_id))
                 .is_none()
             {
-                trc::event!(
-                    Store(StoreEvent::CacheMiss),
-                    Key = local_part.to_string(),
-                    Domain = domain_id,
-                    Collection = "email",
-                );
+                if !quiet {
+                    trc::event!(
+                        Store(StoreEvent::CacheMiss),
+                        Key = local_part.to_string(),
+                        Domain = domain_id,
+                        Collection = "email",
+                    );
+                }
 
                 if let Some(object) = self
                     .registry()
@@ -313,12 +344,14 @@ impl Server {
                     Ok(None)
                 }
             } else {
-                trc::event!(
-                    Store(StoreEvent::CacheHit),
-                    Key = local_part.to_string(),
-                    Domain = domain_id,
-                    Collection = "emailNegative",
-                );
+                if !quiet {
+                    trc::event!(
+                        Store(StoreEvent::CacheHit),
+                        Key = local_part.to_string(),
+                        Domain = domain_id,
+                        Collection = "emailNegative",
+                    );
+                }
                 Ok(None)
             }
         }
@@ -651,9 +684,27 @@ impl Server {
         address: &str,
         resolve: bool,
     ) -> trc::Result<Option<u32>> {
+        self.account_id_from_email_inner(address, resolve, false)
+            .await
+    }
+
+    /// Zero-access fan-out: `account_id_from_email(address, true)` without the
+    /// cache events that carry the address (invitations spec 10).
+    pub async fn za_account_id_from_email(&self, address: &str) -> trc::Result<Option<u32>> {
+        self.account_id_from_email_inner(address, true, true).await
+    }
+
+    // Zero-access fork: `quiet` skips the cache events that carry the
+    // address's domain or local part.
+    async fn account_id_from_email_inner(
+        &self,
+        address: &str,
+        resolve: bool,
+        quiet: bool,
+    ) -> trc::Result<Option<u32>> {
         let address = address.to_canonical_address();
         if let Some((local_part, domain)) = address.split_once('@') {
-            if let Some(domain) = self.domain(domain).await? {
+            if let Some(domain) = self.domain_inner(domain, quiet).await? {
                 let mut local_part = Cow::Borrowed(local_part);
                 if resolve {
                     if domain.flags & DOMAIN_FLAG_SUB_ADDRESSING != 0 {
@@ -698,7 +749,7 @@ impl Server {
                 }
 
                 let mut result = self
-                    .rcpt_id_from_parts(local_part.as_ref(), domain.id)
+                    .rcpt_id_from_parts_inner(local_part.as_ref(), domain.id, quiet)
                     .await?;
                 if resolve
                     && result.is_none()

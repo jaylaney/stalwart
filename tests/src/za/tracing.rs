@@ -8,7 +8,10 @@
 //! DAV or JMAP, and no credential header from any request, reaches the HTTP
 //! body traces.
 
-use super::STRONG;
+use super::{
+    STRONG,
+    fanout::{START_A, attendee_statuses, invite},
+};
 use crate::utils::{server::TestServer, webdav::DummyWebDavClient, za::SERVER_URL};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hyper::StatusCode;
@@ -24,7 +27,7 @@ use tokio_rustls::{
     },
 };
 use trc::{
-    AuthEvent, CalendarEvent, Collector, EventType, HttpEvent, JmapEvent,
+    AuthEvent, CalendarEvent, Collector, EventType, HttpEvent, JmapEvent, StoreEvent,
     ipc::subscriber::{Interests, SubscriberBuilder},
 };
 
@@ -51,6 +54,18 @@ const OPTIONS_WRONG_SECRET: &str = "trace-canary-options-wrong-3e9a";
 /// must not push a real account toward a fail2ban ban, which would turn the
 /// reported event into `security.authentication-ban`.
 const OPTIONS_PROBE_USER: &str = "options-probe@example.com";
+/// Invitations spec 10: attendees of a key account's invitation, whose
+/// fan-out lookups must not trace them. The local one names no account, so
+/// it is looked up and not attempted; the external one's domain is looked
+/// up. `LOOKUP_DOMAIN_CANARY` is the external domain's distinctive label.
+const LOOKUP_LOCAL_CANARY: &str = "tracing-local-canary";
+const LOOKUP_LOCAL_ATTENDEE: &str = "tracing-local-canary@example.com";
+const LOOKUP_DOMAIN_CANARY: &str = "tracing-canary";
+const LOOKUP_EXT_ATTENDEE: &str = "tracing-ext-canary@tracing-canary.remote.test";
+/// A login name no account has: upstream's login looks its local part up
+/// through the same cache, the positive control of the lookup traces.
+const LOOKUP_AUTH_CANARY: &str = "tracing-auth-canary";
+const LOOKUP_AUTH_USER: &str = "tracing-auth-canary@example.com";
 const SUBSCRIBER_ID: &str = "za-trace-test";
 const CONTENT_TYPE: (&str, &str) = ("content-type", "text/calendar; charset=utf-8");
 
@@ -165,6 +180,21 @@ async fn options_wrong_password(user: &str) -> reqwest::Response {
         .request(reqwest::Method::OPTIONS, format!("{SERVER_URL}/dav/cal/"))
         .basic_auth(user, Some(OPTIONS_WRONG_SECRET))
         .header("x-forwarded-for", "10.77.0.1")
+        .send()
+        .await
+        .unwrap()
+}
+
+/// A DAV request with a wrong Basic credential for `user`, from its own
+/// forwarded address, as `options_wrong_password` does.
+async fn login_wrong_password(user: &str) -> reqwest::Response {
+    http_client()
+        .request(
+            reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
+            format!("{SERVER_URL}/dav/cal/"),
+        )
+        .basic_auth(user, Some(OPTIONS_WRONG_SECRET))
+        .header("x-forwarded-for", "10.77.0.2")
         .send()
         .await
         .unwrap()
@@ -496,6 +526,8 @@ pub async fn test(test: &mut TestServer) {
         EventType::Jmap(JmapEvent::InvalidResultReference),
         EventType::Auth(AuthEvent::Failed),
         EventType::Calendar(CalendarEvent::ItipMessageError),
+        EventType::Store(StoreEvent::CacheHit),
+        EventType::Store(StoreEvent::CacheMiss),
     ];
     let mut interests = Interests::default();
     for event_type in traced {
@@ -581,6 +613,35 @@ pub async fn test(test: &mut TestServer) {
         .unwrap_or_default()
         .to_string();
     assert!(dav.contains("calendar-auto-schedule"), "{dav}");
+    // Invitations spec 10: the key account's fan-out looks its attendees up
+    // without tracing them, on the PUT and again on the DELETE's CANCEL.
+    let invite_path = format!("{key_cal}trace-invite.ics");
+    key_client
+        .request_with_headers(
+            "PUT",
+            &invite_path,
+            [CONTENT_TYPE],
+            invite(
+                "trace-invite",
+                START_A,
+                &[LOOKUP_LOCAL_ATTENDEE, LOOKUP_EXT_ATTENDEE],
+            ),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(
+        attendee_statuses(&key_client, &invite_path, LOOKUP_LOCAL_ATTENDEE).await,
+        ["5.3"]
+    );
+    key_client
+        .request("DELETE", &invite_path, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    // Positive control: upstream's login looks up the nonexistent name.
+    assert_eq!(
+        login_wrong_password(LOOKUP_AUTH_USER).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let mut seen = Vec::new();
@@ -730,6 +791,25 @@ pub async fn test(test: &mut TestServer) {
     assert!(
         !itip.contains("zero-access accounts"),
         "the removed key-account refusal was traced: {itip}"
+    );
+    // Recipient lookups: the subscriber sees upstream's cache events with
+    // the looked-up local part, and none carries a key account's attendee.
+    let lookups = [
+        traced_as(EventType::Store(StoreEvent::CacheHit)),
+        traced_as(EventType::Store(StoreEvent::CacheMiss)),
+    ]
+    .join("\n");
+    assert!(
+        lookups.contains(LOOKUP_AUTH_CANARY),
+        "no login lookup trace captured: {lookups}"
+    );
+    assert!(
+        !all.contains(LOOKUP_LOCAL_CANARY),
+        "a key account's local attendee traced: {all}"
+    );
+    assert!(
+        !all.contains(LOOKUP_DOMAIN_CANARY),
+        "a key account's external attendee domain traced: {all}"
     );
 
     test.wait_for_tasks().await;
