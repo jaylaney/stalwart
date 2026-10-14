@@ -7,12 +7,12 @@ Read it before plans 9 and 10.
 
 - Commits on `release2-invitations-plan` (cut from main at `8a6ae34a`, not pushed):
   - the spec amendment `971008e1`, the plan `933d4e2a` and the CLAUDE.md fix `dabae7af`;
-  - the implementation `1b5a3c2e..eca18e12` (Tasks 1 to 8), then this note.
+  - the implementation `dabae7af..eca18e12` (Tasks 1 to 8, commits `1b5a3c2e` to `eca18e12`), then this note.
 - The suites run in Task 9 Step 2, in order, all on the committed tree, with no reruns:
   - `cargo test -p vault -p groupware`: groupware 69 passed, vault 30 passed.
   - `cargo test -p common auth::vault`: 14 passed.
   - `za_tests`: 1 passed in 51.34s (leak scan: 1072 records, 58 archives, 5 blobs, 3 items, 1 email).
-  - `za_tests` with `BLOB_STORE=FileSystem`: 1 passed in 47.22s (leak scan: 1058 records, 3 items, 1 email).
+  - `za_tests` with `BLOB_STORE=FileSystem`: 1 passed in 47.22s (leak scan: 1058 records, 58 archives, 5 blobs, 3 items, 1 email).
   - `webdav_tests` with `ZA_KEY_ACCOUNTS=1`: 1 passed in 20.85s. This includes the key-account scheduling variant, which still asserts an empty inbox for jane.
   - `webdav_tests`: 1 passed in 16.63s. `cal_itip` passed on the first run.
   - `cargo build --release -p stalwart --no-default-features --features rocks`: finished in 16m 12s.
@@ -65,22 +65,25 @@ No task changed a name; the table is the plan's, unchanged.
 - `assert_is_empty`: za sub-modules do not call it; they clean up, and the suite end checks (plan Global Constraints).
 - `hkdf_expand` takes the full HKDF info, so the `pk` derivation appends `E || P` to the label like `derive_app_kek`; no sibling function.
 - Format 2 bundles bind their format byte into the associated data.
-- Inbox item envelopes and bundles bind the recipient and the UID, in release 1's event-key shape (spec amendment `971008e1`, sections 3.1, 5.3 and the section 9 table). The associated data:
+- Both key envelopes and the pending item's `X-ZA-EXTRA` bundle bind the account and the UID, in release 1's event-key shape (spec amendment `971008e1`, sections 3.1, 5.3 and the section 9 table). The pending envelope and bundle bind the recipient; the drained envelope binds the owner. The component `X-ZA-SEALED` bundles do not bind the UID: they bind the account, the `itip` scope and the component index. The associated data:
   - pending key envelope: `za/v1|pk-dek|<recipient>|<uid>`;
   - pending item's `X-ZA-EXTRA` bundle: `za/v1|itip-extra|<recipient>|<uid>`;
   - drained key envelope: `za/v1|itip-key|<owner>|<uid>`.
 
-  `<recipient>` and `<owner>` are `aad`'s 4-byte big-endian account id. The amendment also dropped the doubled `za/v1` prefix: the purpose string is `pk-dek`.
+  `<recipient>` and `<owner>` are `aad`'s 4-byte big-endian account id. The amendment dropped the doubled `za/v1` prefix from the section 9 table row only; the purpose string is `pk-dek`. Spec 3.1 step 4 (`spec:147`) and spec 13 (`spec:1048`) still carry the doubled prefix (see the Task 1 deferred findings).
 - Branch: implementation ran on `release2-invitations-plan`, not a new `plan8-*` branch as the plan's Global Constraints suggest. The branch was cut from main for this plan and already carried the plan and the spec amendment.
 - The fork's test-harness note in CLAUDE.md (where `assert_is_empty` runs in each suite) was corrected by the controller in `dabae7af`, not by a task. It is a one-line fact, verified by grep.
 - Commits carry two trailers, `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` and `Claude-Session: https://claude.ai/code/session_01SmmW3Hx6r7uzLjDdJHEtkr`. Dispatches stated them verbatim, and a wrong trailer is rewritten before the branch is shared.
 - Task 5:
   - The plan's `test.wait_for_tasks()` before the DELETE loop in `tests/src/za/pairs.rs:182` never returned. The alarm-only PUT queues a `CalendarAlarmNotification` task due in 2099.
   - Ruling: the line became `test.wait_for_tasks_skip_not_due()`. It still drains the due index tasks before the DELETEs, which is why the wait sits there (PR #30's orphaned-index lesson).
+  - Rejected: moving the full wait after the DELETEs. That would lose the drain of due index tasks before the DELETEs, and a quick PUT then DELETE can orphan index entries.
   - The suite-end full wait proves that the DELETE cleared the 2099 task.
+  - Cost if wrong: a flaky cleanup in one test module.
 - Task 6:
   - GET and the PROPFIND loader check `za_item_hidden` before `za_session_keys` (brief Step 4 order). A keyless member session of a key account (in practice the master user) therefore sees 404 for a pending item and 403 for any other item. That discloses the plaintext pending bit per href.
   - Ruling: the design stands. The bit is plaintext metadata the operator already reads from the store, and release 1 treats it as such. Swapping the order would add a `Security(Unauthorized)` trace per such request. The final review may still weigh it.
+  - Cost if wrong: a metadata oracle for keyless member sessions. Those do not exist outside the master user before the sharing release, so the 404/403 order must be looked at again when sharing arrives.
 - Task 9: every mutation failed as predicted, so no (a)/(b) decision was needed and no test was added.
 
 ## Mutation runs (plan 8)
@@ -91,8 +94,8 @@ Line numbers are those of the committed code at `eca18e12`. Each edit was revert
 |----|--------------------|------|---------------|---------|
 | M16 | Pending skip in the PROPFIND loader, `crates/dav/src/common/propfind.rs:463` | delete the `if za_item_hidden(..) { continue; }` block after `stored_ = archive;` | `tests/src/za/inbox.rs:130:5`: `pending item listed: [".../inbox/", ".../inbox/1.ics", ".../inbox/2.ics", ".../inbox/3.ics"]` | za suite |
 | M17 | Pending 404 on GET/HEAD, `crates/dav/src/calendar/scheduling.rs:119` | delete the `if za_item_hidden(..) { return Err(..NOT_FOUND) }` block | `tests/src/utils/webdav.rs:599:13`: `Expected 404 Not Found but got 500 Internal Server Error`, from the pending GET at `tests/src/za/inbox.rs:149-152`, the first request after the listing | za suite |
-| M18 | Pairs at the update seal site, `crates/dav/src/calendar/update.rs:337` | `seal_event(&mut new_event, keys, account_id, None)` in the update branch | `tests/src/za/pairs.rs:51:41`: `no token pairs after an alarm-only PUT` (`assert_both`, called at `pairs.rs:100`) | za suite |
-| M19 | Pairs at the PROPPATCH seal site, `crates/dav/src/calendar/proppatch.rs:259` | `None` instead of `pairs.as_ref()` | `tests/src/za/pairs.rs:51:41`: `no token pairs after a PROPPATCH` (called at `pairs.rs:120`, after the alarm-only PUT step passed) | za suite |
+| M18 | Pairs at the update seal site, `crates/dav/src/calendar/update.rs:337` | `seal_event(&mut new_event, keys, account_id, None)` in the update branch | `tests/src/za/pairs.rs:51:41`: `no token pairs after an alarm-only PUT` (`assert_both`, called at `pairs.rs:98`) | za suite |
+| M19 | Pairs at the PROPPATCH seal site, `crates/dav/src/calendar/proppatch.rs:259` | `None` instead of `pairs.as_ref()` | `tests/src/za/pairs.rs:51:41`: `no token pairs after a PROPPATCH` (called at `pairs.rs:118`, after the alarm-only PUT step passed) | za suite |
 | M20 | Carrier order on pending items, `crates/groupware/src/calendar/seal/item.rs:199` (`open_pending_item`) | delete the `has_stray_carriers` check | `pending_item_carriers_out_of_order_are_stray`, at `item.rs:458:13` in the mutated file (`:461` committed): `assertion left == right failed: swapped`, `left: None`, `right: Some(Structure("misplaced carrier"))`; 9 passed, 1 failed | `cargo test -p groupware seal::item` |
 | M21 | The inbox view arm, `crates/dav/src/common/za.rs:224` (`za_archive_view`) | delete the `Collection::CalendarEventNotification` arm | `tests/src/za/inbox.rs:139:5`, the listing body assertion. The dumped body shows `2.ics` (drained) as its sealed tree, `X-ZA-KEY` and `X-ZA-SEALED` with no SUMMARY, and `inbox-drained-canary` appears nowhere in the log | za suite |
 
@@ -112,15 +115,16 @@ Line numbers are those of the committed code at `eca18e12`. Each edit was revert
   - `open_pending_item` (returns `PendingCarriers`), `seal_drained_item`, `archived_item_is_pending`, `TokenPairs::matches`.
   - `rewrite_inbox_item` and `plant_inbox_item` (`tests/src/utils/za.rs`) for its tests.
 - `open_pending_item` returns whatever pair count the bundle holds; only the seal side enforces one pair. Anyone holding the recipient's public key can seal a pending item. The drain must therefore check `pair.len() == 1`, unless the final review's fix wave adds the check to the opener (Task 3 review).
-- DELETE of a pending item by its guessable href is upstream's DELETE, unchanged; spec 6.6 hides items from listings, reports and GET only.
+- DELETE of a pending item by its guessable href is upstream's DELETE, unchanged. Inbox hrefs are `<document id>.ics`, as `item_href` (`tests/src/za/inbox.rs:52-54`) and leak.rs's item deletes (`tests/src/za/leak.rs:1093`) build them. Spec 6.6 hides items from listings, reports and GET only.
 - A pending item's envelope and bundle bind the UID, so an item whose sealed parts were moved onto another UID's record does not open; the drain treats that as a permanent open failure (spec 6.5). Component bundles bind the account, the `itip` scope and the component index.
 - What the leak test's `token_hits` covers (`tests/src/za/leak.rs`), from the Task 8 review:
   - It searches three forms of each token: raw bytes, base64url without padding and padded standard base64.
   - It searches keys, values, decoded archives and decoded blobs.
   - It does not decode MIME bodies, so plan 10's mail flows need that added.
+  - It searches no unpadded standard base64 form (`STANDARD_NO_PAD`), so an unpadded encoding with `+` or `/` would be missed (see the Task 8 deferred findings).
   - It skips blobs it cannot read.
 - The views judge an item pending by its envelope's wrap type, not by `EVENT_NOTIFICATION_ZA_PENDING`. An item with the flag set and an `mk` envelope would open in the view; hiding by the flag is `za_item_hidden`'s job (Task 3).
-- `tests/src/za/leak.rs:686` ("the alarm email was not delivered") flaked once in Task 5 (0 emails) and passed on an unchanged rerun. It counts emails after a fixed 5-second sleep (`leak.rs:612-614`) behind a 1-second alarm. It did not flake in Task 9.
+- `tests/src/za/leak.rs:922` ("the alarm email was not delivered") flaked once in Task 5 (0 emails) and passed on an unchanged rerun. It counts emails after a fixed 5-second sleep (`leak.rs:797-799`) behind a 1-second alarm. It did not flake in Task 9.
 
 ## Deferred findings
 
@@ -136,6 +140,7 @@ Task 2 (pairs, format 2):
 - Heap residue when a `Zeroizing<Vec>` grows (the push in `TokenPairs::insert`, `rkyv::to_bytes` in `seal_extra`). Reason: inherent to `Vec`; the vault accepts the same class.
 - `format_aad`'s `|\x02` suffix follows the unescaped UID field (`tree.rs:177-187`). Reason: not exploitable (per-write DEK, UID-bound envelope); a comment would help.
 - No golden release 1 ciphertext vector pins format 1 compatibility. Reason: out of the brief's scope.
+- Resolved, listed for completeness: the interim state "dav callers pass `None`" was resolved by Task 5 for the update and PROPPATCH sites. The create branch of PUT still passes `None`, which plan 9 changes.
 
 Task 3 (sealed items):
 - `open_pending_item` does not re-check that the opened bundle holds exactly one pair (`item.rs:202-212`). Reason: not in the brief; a 3-line check plus a test, for the final review to weigh for the fix wave.
@@ -159,7 +164,7 @@ Task 5 (pairs at both rewrite sites):
 - No PUT follows the PROPPATCH on the paired event, so a display name and pairs together through the update site is untested (`pairs.rs:114-127`). Reason: a Task 2 unit test covers the V2 arm's `display_name` round trip.
 - The stored archive is opened twice per rewrite (the view, then `event_token_pairs`). Reason: brief design.
 - The comment label "Review Focus 5" at `pairs.rs:129` should become a spec reference. Reason: cosmetic.
-- The fixed 5-second sleep at `leak.rs:612-614` is the likely cause of the `leak.rs:686` "alarm email was not delivered" flake. Fix: replace it with `wait_for_delivery`, or document the test as flaky. Reason: pre-existing.
+- The fixed 5-second sleep at `leak.rs:612-614` (`:797-799` at `eca18e12`) is the likely cause of the `leak.rs:686` (`:922` at `eca18e12`) "alarm email was not delivered" flake. Fix: replace it with `wait_for_delivery`, or document the test as flaky. Reason: pre-existing.
 
 Task 6 (inbox read paths):
 - A token-bearing `sync-collection` across the rewrite is untested in Task 6. Reason: Task 7's `test_sync` covers exactly that.
