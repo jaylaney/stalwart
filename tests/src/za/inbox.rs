@@ -12,15 +12,19 @@ use super::STRONG;
 use crate::utils::{
     server::TestServer,
     webdav::DummyWebDavClient,
-    za::{PlantedItem, plant_inbox_item, rewrite_inbox_item},
+    za::{PlantedItem, plant_inbox_item, rewrite_inbox_item, za_unlock},
+};
+use ::registry::schema::{
+    enums::TaskAccountMaintenanceType,
+    structs::{Task, TaskAccountMaintenance, TaskStatus},
 };
 use calcard::{Entry, Parser};
 use dav_proto::Depth;
-use groupware::calendar::EVENT_NOTIFICATION_ZA_PENDING;
+use groupware::calendar::{EVENT_NOTIFICATION_ZA_PENDING, seal::seal_drained_item};
 use hyper::StatusCode;
 use store::{
     ValueKey,
-    write::{AlignedBytes, Archive},
+    write::{AlignedBytes, Archive, now},
 };
 use types::collection::Collection;
 
@@ -264,6 +268,133 @@ pub async fn test(test: &mut TestServer) {
     }
     plain_client
         .request("DELETE", &plain_href, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    test.wait_for_tasks().await;
+}
+
+/// Spec 13: a pending item drained between two syncs. The resource cache
+/// knows no flags, so the item is skipped where it is loaded; once rewritten
+/// in its drained form (same document id, bit cleared) a sync reports it.
+pub async fn test_sync(test: &mut TestServer) {
+    println!("Running zero-access inbox sync-collection test...");
+    let name = "key1@example.com";
+    let id = test.account(name).id().document_id();
+    let sender = test.account("key2@example.com").id().document_id();
+    let client = DummyWebDavClient::new(id, name, STRONG, name);
+    let keys = za_unlock(test, id, STRONG).await;
+
+    let t0 = client
+        .sync_collection(KEY_INBOX, "", Depth::One, None, ["D:getetag"])
+        .await
+        .sync_token()
+        .to_string();
+    let ical = invitation("za-inbox-sync", "inbox-sync-canary");
+    let item = plant_inbox_item(
+        test,
+        id,
+        &ical,
+        PlantedItem::Pending {
+            pair: Some(("key1@example.com", [0x33; 16])),
+            reply_token: None,
+        },
+        sender,
+        None,
+    )
+    .await;
+    let href = item_href(KEY_INBOX, item);
+    let reported = |hrefs: Vec<&str>| hrefs.iter().filter(|h| **h == href).count();
+
+    let response = client
+        .sync_collection(KEY_INBOX, &t0, Depth::One, None, ["D:getetag"])
+        .await;
+    assert_eq!(reported(response.hrefs()), 0, "a pending item was reported");
+    let t1 = response.sync_token().to_string();
+
+    rewrite_inbox_item(test, id, item, |stored| {
+        stored.event = parse(&ical);
+        seal_drained_item(&mut stored.event, &keys, id).unwrap();
+        stored.flags &= !EVENT_NOTIFICATION_ZA_PENDING;
+    })
+    .await;
+
+    for (token, taken) in [(&t1, "while it was pending"), (&t0, "before it arrived")] {
+        let response = client
+            .sync_collection(KEY_INBOX, token, Depth::One, None, ["D:getetag"])
+            .await;
+        assert_eq!(
+            reported(response.hrefs()),
+            1,
+            "drained item from a token taken {taken}: {:?}",
+            response.hrefs()
+        );
+        let body = response.body.as_deref().unwrap_or_default();
+        assert!(body.contains("HTTP/1.1 200"), "{body}");
+    }
+    client
+        .request("GET", &href, "")
+        .await
+        .with_status(StatusCode::OK);
+    client
+        .request("DELETE", &href, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    test.wait_for_tasks().await;
+}
+
+/// Spec 6.6: upstream's inbox expiry deletes by creation time and needs no
+/// key, so it also removes pending items older than the hold period.
+pub async fn test_expiry(test: &mut TestServer) {
+    println!("Running zero-access inbox expiry test...");
+    let admin = test.account("admin@example.com").clone();
+    let key1 = test.account("key1@example.com").clone();
+    let id = key1.id().document_id();
+    let sender = test.account("key2@example.com").id().document_id();
+    let client = DummyWebDavClient::new(id, key1.name(), STRONG, key1.name());
+    let pending = || PlantedItem::Pending {
+        pair: None,
+        reply_token: None,
+    };
+    // Older than the default 30-day `expungeSchedulingInboxAfter`.
+    let old = plant_inbox_item(
+        test,
+        id,
+        &invitation("za-inbox-old", "inbox-old-canary"),
+        pending(),
+        sender,
+        Some(now() as i64 - 31 * 86_400),
+    )
+    .await;
+    let fresh = plant_inbox_item(
+        test,
+        id,
+        &invitation("za-inbox-fresh", "inbox-fresh-canary"),
+        pending(),
+        sender,
+        None,
+    )
+    .await;
+
+    // The account purge, as the scheduler runs it: no session of key1.
+    admin
+        .registry_create_object(Task::AccountMaintenance(TaskAccountMaintenance {
+            account_id: key1.id(),
+            maintenance_type: TaskAccountMaintenanceType::Purge,
+            status: TaskStatus::now(),
+        }))
+        .await;
+    test.wait_for_tasks().await;
+    assert!(
+        stored_item(test, id, old).await.is_none(),
+        "an expired pending item survived the purge"
+    );
+    assert!(
+        stored_item(test, id, fresh).await.is_some(),
+        "the purge removed a fresh item"
+    );
+
+    client
+        .request("DELETE", &item_href(KEY_INBOX, fresh), "")
         .await
         .with_status(StatusCode::NO_CONTENT);
     test.wait_for_tasks().await;
