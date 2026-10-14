@@ -227,3 +227,20 @@ last run at `eca18e12` (Task 9); the fix wave passed the shipping-configuration 
   3.1 step 4 carry unescaped `|` inside backticks, which GitHub's table renderer splits; the
   CLAUDE.md status paragraph is updated at merge. The plan document's embedded test code still
   shows the old canary name; it is historical text.
+- PR #34 review (static, at `81cb6fbe`): the `PropFind::PropName` branch of `handle_dav_query`
+  answered from the resource cache before the per-item loop that hides pending items, so a key
+  account's own session saw pending inbox hrefs in a depth-1 `<D:propname/>` PROPFIND and got 207
+  instead of 404 for a depth-0 one. The fix adds `za_cached_item_hidden`
+  (`crates/dav/src/common/za.rs:210`), which shares its gate (`za_reads_pending_bit`, :234) and its
+  tail (`stored_item_is_pending`, :247) with `za_item_hidden` (:190). The branch calls it once per
+  non-container item (`crates/dav/src/common/propfind.rs:390-402`). Its return (:424) and the
+  handler tail (:1191) now go through one `dav_query_response` (:1227), so a PROPFIND whose items
+  were all hidden answers 404. Plain accounts see no change, because a PROPFIND always lists its
+  target. The review's third case, a calendar-multiget asking for `propname`, was a false
+  positive: `request.rs:298` binds every calendar-multiget to the calendar collection, and the
+  release 1 guard (`propfind.rs:1588`) answers 404 for every inbox href, drained items included.
+  New tests in `tests/src/za/inbox.rs` (:163-218) cover the depth-1 listing, the depth-0 404 for a
+  pending item, a depth-0 207 control on a drained item and a multiget pinned at 404 for both
+  hrefs; a plain-account propname listing is at :326-334. Before the fix the suite failed at the
+  depth-1 assertion. All of this is one commit, the one that adds this paragraph, on top of
+  `81cb6fbe`.

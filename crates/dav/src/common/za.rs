@@ -15,7 +15,10 @@ use groupware::calendar::{
 };
 use hyper::StatusCode;
 use std::{borrow::Cow, future::Future, sync::Arc};
-use store::write::{AlignedBytes, Archive};
+use store::{
+    ValueKey,
+    write::{AlignedBytes, Archive},
+};
 use trc::AddContext;
 use types::collection::Collection;
 use vault::session::SessionKeys;
@@ -191,14 +194,57 @@ pub(crate) async fn za_item_hidden(
     collection: Collection,
     stored: &Archive<AlignedBytes>,
 ) -> crate::Result<bool> {
-    if collection != Collection::CalendarEventNotification
-        || server
-            .za_session_keys(access_token, account_id)
-            .await?
-            .is_none()
-    {
+    if !za_reads_pending_bit(server, access_token, account_id, collection).await? {
         return Ok(false);
     }
+    stored_item_is_pending(stored)
+}
+
+/// Invitations spec 6.6: [`za_item_hidden`] for a path taken from the
+/// resource cache whose archive is not loaded, as the `propname` form of
+/// PROPFIND has it: a listing (depth 1) and a request naming the item
+/// (depth 0). A calendar-multiget never gets here for an inbox item, since
+/// the guard in `multiget` reads hrefs only from the calendar collection.
+/// Same gate, so other collections and non-key accounts answer `false` with
+/// no store read; a missing archive is listed as upstream lists it.
+pub(crate) async fn za_cached_item_hidden(
+    server: &Server,
+    access_token: &AccessToken,
+    account_id: u32,
+    collection: Collection,
+    document_id: u32,
+) -> crate::Result<bool> {
+    if !za_reads_pending_bit(server, access_token, account_id, collection).await? {
+        return Ok(false);
+    }
+    match server
+        .store()
+        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(account_id, collection, document_id))
+        .await
+        .caused_by(trc::location!())?
+    {
+        Some(stored) => stored_item_is_pending(&stored),
+        None => Ok(false),
+    }
+}
+
+/// The gate both readers above run before the pending bit is read: `false`
+/// outside the inbox (no lookup) and for a non-key account, the gate's 403
+/// for a key account's item read without its keys.
+async fn za_reads_pending_bit(
+    server: &Server,
+    access_token: &AccessToken,
+    account_id: u32,
+    collection: Collection,
+) -> crate::Result<bool> {
+    Ok(collection == Collection::CalendarEventNotification
+        && server
+            .za_session_keys(access_token, account_id)
+            .await?
+            .is_some())
+}
+
+fn stored_item_is_pending(stored: &Archive<AlignedBytes>) -> crate::Result<bool> {
     Ok(archived_item_is_pending(
         stored
             .unarchive::<CalendarEventNotification>()

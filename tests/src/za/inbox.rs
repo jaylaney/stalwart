@@ -31,6 +31,8 @@ use types::collection::Collection;
 pub const KEY_INBOX: &str = "/dav/itip/key1%40example.com/inbox/";
 const PLAIN_INBOX: &str = "/dav/itip/plain%40example.com/inbox/";
 const PROPFIND_DATA: &str = "<?xml version=\"1.0\"?><D:propfind xmlns:D=\"DAV:\" xmlns:A=\"urn:ietf:params:xml:ns:caldav\"><D:prop><D:getetag/><A:calendar-data/></D:prop></D:propfind>";
+const PROPNAME_DATA: &str =
+    "<?xml version=\"1.0\"?><D:propfind xmlns:D=\"DAV:\"><D:propname/></D:propfind>";
 
 /// An invitation from key2 to key1, as the fan-out will deliver it.
 pub fn invitation(uid: &str, canary: &str) -> String {
@@ -158,6 +160,62 @@ pub async fn test(test: &mut TestServer) {
         .request_with_headers("PROPFIND", &pending_href, [("depth", "0")], PROPFIND_DATA)
         .await
         .with_status(StatusCode::NOT_FOUND);
+    // PR #34 review: the `propname` form hides it too, listed (depth 1) or
+    // named (depth 0); a visible item still answers.
+    let hrefs: Vec<String> = client
+        .request_with_headers("PROPFIND", KEY_INBOX, [("depth", "1")], PROPNAME_DATA)
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .hrefs()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    assert!(
+        !hrefs.contains(&pending_href),
+        "pending item listed by propname: {hrefs:?}"
+    );
+    assert!(
+        hrefs.contains(&drained_href) && hrefs.contains(&legacy_href),
+        "{hrefs:?}"
+    );
+    client
+        .request_with_headers("PROPFIND", &pending_href, [("depth", "0")], PROPNAME_DATA)
+        .await
+        .with_status(StatusCode::NOT_FOUND);
+    let hrefs: Vec<String> = client
+        .request_with_headers("PROPFIND", &drained_href, [("depth", "0")], PROPNAME_DATA)
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .hrefs()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    assert!(hrefs.contains(&drained_href), "{hrefs:?}");
+    // RFC 4791 7.9: a calendar-multiget may ask for `propname`, but the
+    // release 1 guard binds it to the calendar collection, so it never reaches
+    // the inbox (every inbox href is 404) and the propname fix need not cover it.
+    let body = client
+        .request(
+            "REPORT",
+            KEY_INBOX,
+            format!(
+                "<?xml version=\"1.0\"?><A:calendar-multiget xmlns:D=\"DAV:\" xmlns:A=\"urn:ietf:params:xml:ns:caldav\"><D:propname/><D:href>{pending_href}</D:href><D:href>{drained_href}</D:href></A:calendar-multiget>"
+            ),
+        )
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .body
+        .unwrap();
+    let entry = |href: &str| {
+        body.split("</D:response>")
+            .find(|entry| entry.contains(&format!(">{href}<")))
+            .unwrap_or_default()
+    };
+    assert!(
+        entry(&pending_href).contains("HTTP/1.1 404")
+            && entry(&drained_href).contains("HTTP/1.1 404"),
+        "{body}"
+    );
     // Review Focus 1: a multiget naming it answers 404 for that href.
     let body = client
         .multiget_calendar(KEY_INBOX, &[pending_href.as_str()])
@@ -258,6 +316,15 @@ pub async fn test(test: &mut TestServer) {
     let plain_href = item_href(PLAIN_INBOX, plain_item);
     let hrefs: Vec<String> = plain_client
         .request_with_headers("PROPFIND", PLAIN_INBOX, [("depth", "1")], PROPFIND_DATA)
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .hrefs()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    assert!(hrefs.contains(&plain_href), "{hrefs:?}");
+    let hrefs: Vec<String> = plain_client
+        .request_with_headers("PROPFIND", PLAIN_INBOX, [("depth", "1")], PROPNAME_DATA)
         .await
         .with_status(StatusCode::MULTI_STATUS)
         .hrefs()

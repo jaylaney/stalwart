@@ -24,7 +24,7 @@ use crate::{
         DavQueryResource,
         acl::current_user_privilege_set,
         uri::DavUriResource,
-        za::{za_archive_view, za_item_hidden},
+        za::{za_archive_view, za_cached_item_hidden, za_item_hidden},
     },
     file::{FILE_CONTAINER_PROPS, FILE_ITEM_PROPS},
     principal::{
@@ -387,6 +387,19 @@ impl PropFindRequestHandler for Server {
                 }
 
                 for item in paths {
+                    // Invitations spec 6.6: a pending inbox item is not listed.
+                    if !item.is_container
+                        && za_cached_item_hidden(
+                            self,
+                            access_token,
+                            item.account_id,
+                            collection_children,
+                            item.document_id,
+                        )
+                        .await?
+                    {
+                        continue;
+                    }
                     let props = if item.is_container {
                         container_props
                             .iter()
@@ -407,9 +420,8 @@ impl PropFindRequestHandler for Server {
                     ));
                 }
 
-                return Ok(
-                    HttpResponse::new(StatusCode::MULTI_STATUS).with_xml_body(response.to_string())
-                );
+                // A PROPFIND always lists its target: 404 only when every item was hidden.
+                return Ok(dav_query_response(is_propfind, &response, &query.sync_type));
             }
             PropFind::AllProp(items) => {
                 skip_not_found = true;
@@ -1176,11 +1188,7 @@ impl PropFindRequestHandler for Server {
             );
         }
 
-        if !is_propfind || !response.response.0.is_empty() || !query.sync_type.is_none() {
-            Ok(HttpResponse::new(StatusCode::MULTI_STATUS).with_xml_body(response.to_string()))
-        } else {
-            Ok(HttpResponse::new(StatusCode::NOT_FOUND))
-        }
+        Ok(dav_query_response(is_propfind, &response, &query.sync_type))
     }
 
     async fn dav_quota(&self, account_id: u32) -> trc::Result<PropFindAccountQuota> {
@@ -1213,6 +1221,21 @@ impl PropFindRequestHandler for Server {
         Ok(PropFindAccountQuota { used, available })
     }
 }
+
+/// A PROPFIND that matched nothing (outside sync-collection) is 404, every
+/// other query answers 207; shared by the `propname` branch and the tail.
+fn dav_query_response(
+    is_propfind: bool,
+    response: &MultiStatus,
+    sync_type: &SyncType,
+) -> HttpResponse {
+    if !is_propfind || !response.response.0.is_empty() || !sync_type.is_none() {
+        HttpResponse::new(StatusCode::MULTI_STATUS).with_xml_body(response.to_string())
+    } else {
+        HttpResponse::new(StatusCode::NOT_FOUND)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn get(
     server: &Server,
