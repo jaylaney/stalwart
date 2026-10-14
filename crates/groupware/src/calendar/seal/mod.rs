@@ -18,6 +18,7 @@ pub use collection::{
 };
 pub use event::{
     archived_event_is_sealed, event_token_pairs, seal_event, unseal_event, unseal_event_archive,
+    unseal_event_pairs,
 };
 pub use item::{
     AAD_ITIP_KEY, ITIP_SCOPE, PendingCarriers, RSVP_TOKEN_PROP, archived_item_is_pending,
