@@ -32,7 +32,7 @@ use groupware::{
     calendar::{
         CalendarEvent, CalendarEventData,
         itip::ItipSendStatus,
-        seal::{seal_error, seal_event},
+        seal::{event_token_pairs, seal_error, seal_event},
     },
     scheduling::{
         ItipMessages, event_create::itip_create, event_update::itip_update,
@@ -331,7 +331,10 @@ impl CalendarUpdateRequestHandler for Server {
             }
 
             if let Some(keys) = &za_keys {
-                seal_event(&mut new_event, keys, account_id, None)
+                // Invitations spec 3.3: every rewrite carries the stored pairs.
+                let pairs = event_token_pairs(&event_, keys, account_id)
+                    .map_err(|err| seal_error(err, account_id, document_id))?;
+                seal_event(&mut new_event, keys, account_id, pairs.as_ref())
                     .map_err(|err| seal_error(err, account_id, document_id))?;
             }
 

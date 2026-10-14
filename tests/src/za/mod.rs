@@ -22,6 +22,7 @@ pub mod expansion;
 pub mod gating;
 pub mod index_task;
 pub mod leak;
+pub mod pairs;
 pub mod password;
 pub mod registry;
 pub mod setup;
@@ -105,6 +106,7 @@ pub async fn za_tests() {
     gating::test(&mut test).await;
     gating::test_scheduling(&mut test).await;
     websocket::test(&mut test).await;
+    pairs::test(&mut test).await;
     leak::test(&mut test).await;
     leak::test_index_control(&mut test).await;
     index_task::test(&mut test).await;

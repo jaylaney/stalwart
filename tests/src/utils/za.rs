@@ -6,11 +6,14 @@
 
 use crate::utils::{account::Account, http::HttpRequest, server::TestServer};
 use calcard::common::timezone::Tz;
-use common::ipc::CacheInvalidation;
+use common::{auth::vault::ZaVerification, ipc::CacheInvalidation};
 use email::cache::MessageCacheFetch;
 use groupware::{
     cache::GroupwareCache,
-    calendar::{CalendarEvent, CalendarEventData},
+    calendar::{
+        CalendarEvent, CalendarEventData,
+        seal::{TokenPairs, seal_event},
+    },
 };
 use http::auth::authenticate::za_test::{self, Pause};
 use hyper::{Method, StatusCode};
@@ -20,6 +23,7 @@ use std::{future::Future, sync::Arc, time::Duration};
 use store::write::BatchBuilder;
 use tokio::task::JoinHandle;
 use types::collection::{Collection, SyncCollection};
+use vault::session::SessionKeys;
 
 /// The suite's HTTPS listener.
 pub const SERVER_URL: &str = "https://127.0.0.1:8899";
@@ -279,6 +283,21 @@ pub async fn park_endpoint(account_id: u32, path: &'static str, body: Value) -> 
     .await
 }
 
+/// The account's session keys, unlocked from `password` by the product's own
+/// login verification (`za_verify_password`: Argon2, verifier, MK unwrap), as
+/// a CalDAV login unlocks them.
+pub async fn za_unlock(test: &TestServer, account_id: u32, password: &str) -> Arc<SessionKeys> {
+    match test
+        .server
+        .za_verify_password(account_id, password, None)
+        .await
+        .unwrap()
+    {
+        ZaVerification::Valid(keys) => keys,
+        _ => panic!("the password does not unlock account {account_id}"),
+    }
+}
+
 /// Writes `ical` into the store as the event `name` in the account's
 /// calendar `calendar` (a slug such as "default"), bypassing the DAV
 /// handlers and so the seal. Such an event is what a legacy plaintext event
@@ -292,6 +311,44 @@ pub async fn plant_event(
     name: &str,
     ical: &str,
     schedule_tag: Option<u32>,
+) -> u32 {
+    insert_event(test, account_id, calendar, name, ical, schedule_tag, None).await
+}
+
+/// `plant_event`, sealed under the account's keys (unlocked from
+/// `password`) with `pairs` in a format 2 `X-ZA-EXTRA` bundle: the stored
+/// form of a key organizer's event once the fan-out (plan 9) hands out
+/// tokens. Returns the document id.
+pub async fn plant_sealed_event(
+    test: &TestServer,
+    account_id: u32,
+    calendar: &str,
+    name: &str,
+    ical: &str,
+    password: &str,
+    pairs: &TokenPairs,
+) -> u32 {
+    let keys = za_unlock(test, account_id, password).await;
+    insert_event(
+        test,
+        account_id,
+        calendar,
+        name,
+        ical,
+        None,
+        Some((&*keys, pairs)),
+    )
+    .await
+}
+
+async fn insert_event(
+    test: &TestServer,
+    account_id: u32,
+    calendar: &str,
+    name: &str,
+    ical: &str,
+    schedule_tag: Option<u32>,
+    seal: Option<(&SessionKeys, &TokenPairs)>,
 ) -> u32 {
     let calendar_id = test
         .server
@@ -307,7 +364,7 @@ pub async fn plant_event(
         other => panic!("{other:?}"),
     };
     let mut next_alarm = None;
-    let event = CalendarEvent {
+    let mut event = CalendarEvent {
         names: vec![common::DavName {
             name: name.into(),
             parent_id: calendar_id,
@@ -317,6 +374,9 @@ pub async fn plant_event(
         schedule_tag,
         ..Default::default()
     };
+    if let Some((keys, pairs)) = seal {
+        seal_event(&mut event, keys, account_id, Some(pairs)).unwrap();
+    }
     let account_info = test.server.account_info(account_id).await.unwrap();
     let document_id = test
         .server

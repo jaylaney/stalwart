@@ -28,7 +28,9 @@ use groupware::{
     cache::GroupwareCache,
     calendar::{
         Calendar, CalendarEvent, SupportedComponent, Timezone,
-        seal::{seal_calendar, seal_error, seal_event, unseal_calendar, unseal_event},
+        seal::{
+            event_token_pairs, seal_calendar, seal_error, seal_event, unseal_calendar, unseal_event,
+        },
     },
 };
 use http_proto::HttpResponse;
@@ -251,7 +253,10 @@ impl CalendarPropPatchRequestHandler for Server {
 
             if is_success {
                 if let Some(keys) = &za_keys {
-                    seal_event(&mut new_event, keys, account_id, None)
+                    // Invitations spec 3.3: every rewrite carries the stored pairs.
+                    let pairs = event_token_pairs(&archive, keys, account_id)
+                        .map_err(|err| seal_error(err, account_id, document_id))?;
+                    seal_event(&mut new_event, keys, account_id, pairs.as_ref())
                         .map_err(|err| seal_error(err, account_id, document_id))?;
                 }
                 new_event
