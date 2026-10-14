@@ -5,9 +5,10 @@ Read it before plan 10.
 
 ## Where things stand
 
-- Commits `cbe5db0e..HEAD` (HEAD is the commit that adds this note) on `release2-plan9-fanout` (cut from plan 8's `68e1f1df`; plan and review fix round `621f88a4`, `44982485`; not pushed):
-  - Task 1 `cbe5db0e` (lease and test-mode hooks), Task 2 `e58ef0b7` (fan-out module), Task 3 `dc9d560f` (`SendSealed`, PUT paths), Task 4 `bba98065` (reply, delegation, failure tests), Task 5 `17f105c7` (DELETE paths), Task 6 `e34e37e6` (creation lease tests), Task 7 `396dd67a`, `05a1925b`, `74870ea7` (leak scan), then this note.
-- The suites run in Task 8 Step 2, in order, all on the committed tree, with no reruns:
+- Commits `44982485..` through the final fix wave's documentation commit (`Plan 9 outcome: final review rulings and spec note wording`, the last commit of the plan; a range ending there excludes `44982485` itself), on `release2-plan9-fanout` (cut from plan 8's `68e1f1df`; plan and review fix round `621f88a4`, `44982485`; not pushed). The first code commit is `cbe5db0e`:
+  - Task 1 `cbe5db0e` (lease and test-mode hooks), Task 2 `e58ef0b7` (fan-out module), Task 3 `dc9d560f` (`SendSealed`, PUT paths), Task 4 `bba98065` (reply, delegation, failure tests), Task 5 `17f105c7` (DELETE paths), Task 6 `e34e37e6` (creation lease tests), Task 7 `396dd67a`, `05a1925b`, `74870ea7` (leak scan), Task 8 `4dde5479` (mutation runs and this note);
+  - final fix wave: `4902accd` (sending state follows the owner, lease hardening, test breadth), then the documentation commit (this note's final-review sections, the release 1 spec parentheticals).
+- The suites run in Task 8 Step 2, in order, on `74870ea7`'s code (the spec and note edits uncommitted at the time), with no reruns:
   - `cargo test -p vault -p groupware`: groupware 76 passed, vault 30 passed.
   - `cargo test -p common za::lease`: 6 passed.
   - `cargo test -p common auth::vault`: 14 passed.
@@ -21,8 +22,18 @@ Read it before plan 10.
     - Crate warning totals, all upstream's: `store` 1, `common` 18 (those four included), `jmap` 3, `services` 2 (both in `task_manager/index.rs`).
   - `cargo tree -p stalwart --no-default-features --features rocks -e features -i common | grep test_mode`: nothing (`no test_mode in the product`).
   - `git status --short crates/` printed nothing.
+- The suites run in the final fix wave, after all its code changes, on `4902accd`'s code (the first runs with that code uncommitted, identical to the commit; the documentation edits uncommitted throughout), with no reruns:
+  - `cargo test -p common za::lease`: 7 passed (the absent-key release test is new).
+  - `cargo test -p groupware`: 76 passed.
+  - `za_tests`: 1 passed in 52.40s (leak scan: 1799 records, 70 archives, 8 blobs, 987 search index records (643 of the account, none calendar), 5 events, 3 calendars, 4 items, 4 emails; negative control caught 29 violations). The two extra emails are key2's upstream invitation and CANCEL from `fanout::test_plain_owner`.
+  - `za_tests` again after the M23 re-run and its revert, on the committed `4902accd`: 1 passed in 52.43s (leak scan: 1800 records, 69 archives, 8 blobs, 987 search index records (643 of the account, none calendar), 5 events, 3 calendars, 4 items, 4 emails; negative control caught 29 violations).
+  - `webdav_tests` with `ZA_KEY_ACCOUNTS=1`: 1 passed in 22.37s.
+  - `webdav_tests`: 1 passed in 19.29s. `cal_itip` passed on the first run.
+  - `cargo check -p stalwart --no-default-features --features rocks`: no warning in `groupware`, `dav`, `jmap/src/calendar_event`, `services/src/task_manager/manager.rs` or `common/src/{za,auth/vault.rs}`; the 24 upstream warnings unchanged.
+  - `cargo check -p tests --tests`: no warning in the fork's test files.
+  - `cargo fmt -p common -p groupware -p dav -p jmap -p tests -- --check`: clean.
 - What now exists:
-  - `ItipSendStatus::SendSealed`; `KeyAccount` is gone;
+  - `ItipSendStatus::SendSealed`, decided on the calendar owner's key status (final fix wave); `KeyAccount` is gone;
   - the fan-out (`ZaFanOut`) on the PUT create and update paths and on event and collection DELETE, for organizers and attendees;
   - token maintenance: a union per message-building rewrite, the current attendees' pairs persisted;
   - SCHEDULE-STATUS `1.2` / `5.3` / `5.1` in the sender's sealed copy;
@@ -35,11 +46,11 @@ Read it before plan 10.
 
 ## Names settled (spec 13)
 
-No task changed a name; the table is the plan's, unchanged. (`ZaUidLeaseGuard` also has `new`, `lease`, `release` and `abandon`, as the plan's code defines.)
+No task changed a name; the table is the plan's, with two rows amended by the final fix wave (the sending state's `owner_is_key` parameter, the knob's clamp). (`ZaUidLeaseGuard` also has `new`, `lease`, `release` and `abandon`, as the plan's code defines.)
 
 | Name | Value | Where |
 |---|---|---|
-| Sending state | `ItipSendStatus::SendSealed`: upstream's `Send` preconditions, for a key account; `KeyAccount` is removed. `builds_messages()` (`Send` or `SendSealed`), `is_send_sealed()`; `is_send()` stays `Send` only | `crates/groupware/src/calendar/itip.rs` |
+| Sending state | `ItipSendStatus::SendSealed`: upstream's `Send` preconditions, for a calendar owned by a key account (`resolve(.., owner_is_key)`; the PUT branches pass `za_keys.is_some()`); `KeyAccount` is removed. `builds_messages()` (`Send` or `SendSealed`), `is_send_sealed()`; `is_send()` stays `Send` only | `crates/groupware/src/calendar/itip.rs` |
 | Fan-out entry | trait `ZaFanOut` on `Server`, one method: `za_fan_out(&self, sender: &AccountInfo, keys: &SessionKeys, messages: Vec<ItipMessage<ICalendar>>, stored_pairs: Option<TokenPairs>, event: &ICalendar) -> trc::Result<ZaFanOutResult>` | new `crates/groupware/src/calendar/fanout.rs` |
 | Fan-out result | `ZaFanOutResult { pairs: Option<TokenPairs>, statuses: Vec<ZaScheduleStatus> }`; `ZaScheduleStatus { address, on_organizer, status }` | `fanout.rs` |
 | SCHEDULE-STATUS writer | `za_set_schedule_status(&mut ICalendar, &[ZaScheduleStatus])`: replaces an earlier fan-out status, keeps upstream's `3.7` | `fanout.rs` |
@@ -50,7 +61,7 @@ No task changed a name; the table is the plan's, unchanged. (`ZaUidLeaseGuard` a
 | Lease prefix | `KV_LOCK_ZA_UID: u8 = 27`, next to `KV_LOCK_DAV` | `crates/common/src/lib.rs` |
 | Lease key | `KV_LOCK_ZA_UID \|\| account_id (u32 BE) \|\| SHA-256(uid)`, 37 bytes whatever the UID | `crates/common/src/za/lease.rs` |
 | Lease value | `expiry (u64 BE, seconds) \|\| fence (16 random bytes)` | `lease.rs` |
-| Lease duration | `DEFAULT_LEASE_SECS = 30`; `ZA_UID_LEASE_SECS`, read once per process (unset, malformed or 0: the default); test-mode override `set_lease_secs_override` | `lease.rs`, `test_hooks.rs` |
+| Lease duration | `DEFAULT_LEASE_SECS = 30`; `ZA_UID_LEASE_SECS`, read once per process (unset, malformed or 0: the default; above `MAX_LEASE_SECS = 3600`: clamped to it); test-mode override `set_lease_secs_override` | `lease.rs`, `test_hooks.rs` |
 | Lease retries | `LEASE_RETRIES = 20`, `LEASE_RETRY_WAIT = 50 ms`, then `None` | `lease.rs` |
 | Lease API | `ZaUidLease::{acquire, assert_in, release}`, `ZaUidLeaseGuard` (releases on drop), `lease_key`, `lease_key_range`, `lease_value_expiry` | `lease.rs` |
 | PUT helpers | `za_take_uid_lease` (lease, then archive re-check; 503 when busy), `za_assert_is_unique_uid` (archive-based), `za_commit_create` (fenced commit, release, lost-fence path) | `crates/dav/src/calendar/mod.rs` |
@@ -74,7 +85,7 @@ No task changed a name; the table is the plan's, unchanged. (`ZaUidLeaseGuard` a
 - A disabled key account still receives items: `resolve_inner` does not check `Authenticate`. It cannot log in, so the items wait and expire under the inbox purge; upstream's mail path would refuse at RCPT. Accepted.
 - The lost-fence 503 can follow a fully delivered fan-out: items stay (spec 5.4), so the client's resend delivers a second set of items with fresh tokens, test 8's situation.
 - A key account's DELETE of a sealed event whose envelope does not open answers 500 when `send_itip` is true (the unseal before `itip_cancel` fails), per release 1 spec section 10's unseal-failure rule; `Schedule-Reply: F` deletes it without reading it.
-- `za_session_keys` runs on every DELETE, as on every PUT (`update.rs:80`): one account-cache lookup for a non-key DELETE, which answers `None`. A key account without keys gets 403 from the existing gate before any delete work.
+- `za_session_keys` runs on every DELETE, as on every PUT (`update.rs:81`): one account-cache lookup for a non-key DELETE, which answers `None`. A key account without keys gets 403 from the existing gate before any delete work.
 - A `za_fan_out` error on DELETE aborts the DELETE before the commit (nothing deleted), the PUT's shape and spec 5.4's "items first". The DELETE discards the `ZaFanOutResult`: the event is going away.
 - `COMMIT_FAIL_ONCE` fires only in `za_commit_create`, the PUT create branch; the drain gets its own hook in plan 10.
 - Deviations from the plan's text, each a ruling during execution:
@@ -105,6 +116,8 @@ All runs in Task 8 Step 1, one at a time, each reverted with `git checkout --` a
 
 No mutation survived.
 
+Final fix wave: P1 moved the `SendSealed` decision into `ItipSendStatus::resolve`'s new `owner_is_key` parameter, so M23 was re-run once on `4902accd` (the same edit at `crates/dav/src/calendar/update.rs:484-488`, create branch). It still fails first at `test_task_queue`: `tests/src/za/fanout.rs:962:5`, `a CalendarItipMessage task was queued for the key organizer` (left 1, right 0). Reverted with `git checkout --`; `git diff --stat` printed nothing.
+
 ## Facts for plan 10
 
 - The lease, for the drain's import (spec 6.3, 6.4):
@@ -121,41 +134,50 @@ No mutation survived.
 - `token_hits` (`tests/src/za/leak.rs`) does not decode MIME bodies; mail flows that carry tokens need that first. It also misses a token inside a larger base64 bundle at an offset that is not 3-aligned, or hex-encoded; and `try_archive` does not decode large LZ4 registry pickles, which matters if plan 10 plants large invitations.
 - Test helpers for the drain's tests: `open_pending_item_as`, `inbox_items`, `new_inbox_items`, `plant_attendee_copy`, `hold_task_consumer`, `itip_tasks_for`, `HookParked`.
 - An item whose sender's commit failed (`COMMIT_FAIL_ONCE`, lease case b) stays pending; a retried create delivers a second item with an equal SEQUENCE and a fresh token, which the drain must adopt (spec 5.4, 6.4).
-- `ZaUidLease::release` answers `false` and traces "UID creation lease not released" when the maintenance purge or the sweep already removed an expired lease; the sweep test should expect that trace.
+- `ZaUidLease::release` answers `true` without a trace when the key is already absent (the maintenance purge or the sweep removed an expired lease); it answers `false` and traces "UID creation lease not released" only when the key holds another holder's value or the store fails (final fix wave).
 - `COMMIT_FAIL_ONCE` fires only in `za_commit_create`, the PUT create branch; the drain's commits need their own hook.
 - Two attendee addresses that resolve to one account produce two items in one inbox for one UID, with different pairs (`fanout.rs`, recipient loop); the drain must accept two pending items per UID.
 - Test data: external attendees need a domain `utils::is_valid_domain` accepts (`remote.test`, not `remote.example`); `key7` belongs to `app_password.rs` and `key11` to `reply.rs` for the suite's lifetime; `itipMaxSize` cannot go below 100.
 
+## Final review
+
+The whole-branch review (`68e1f1df..4dde5479`, 0 critical, 2 important, 13 minor, "with fixes") and its rulings:
+
+- F1 (important), fixed. `SendSealed` was decided on the authenticated account while the fan-out ran only for a key-owned calendar, so a key account writing an invitation into a plain account's shared calendar got a 201 and the messages were dropped (and its DELETE mailed a CANCEL). Ruling: the sending state follows the calendar owner's key status. `ItipSendStatus::resolve` takes `owner_is_key` (`crates/groupware/src/calendar/itip.rs:1073-1093`); both PUT branches pass `za_keys.is_some()` (`crates/dav/src/calendar/update.rs:250`, `:473`); the three JMAP callers pass their previous value (`account_info.account().is_key_account()`; JMAP calendar methods are refused for key accounts, and a key account arriving there would build nothing); the DELETE already followed the owner. Such an event is stored in plaintext under its plain owner, so the invitation travels as upstream mail, a task and then mail, as `fanout::test_plain_owner` asserts for the PUT and the DELETE. For Jay: spec 5.1 says "a key account resolves to `SendSealed`" without saying whose calendar; amend it to "the sending state follows the calendar's owner".
+- F2 (important), parked for Jay (spec 5.4). A lost fence that ends in 412 (another session of the account stored the UID first) leaves the recipients holding items whose tokens the organizer never stored; under spec 6.4 the drain adopts the pair of the item it processes last, so a recipient's copy can end with the orphan token and its replies are dropped as forgeries until the organizer's next REQUEST re-sends the stored pair. Decide between accepting it with that consequence (it self-heals) and compensating deletion of the items this request wrote on the 412 path (the fan-out would return the `(recipient, document_id)` pairs; a race with a drain that already cleared the pending bit must skip the delete), designed together with plan 10's adoption rule.
+- F4, migration note. Release 1 stored key-account events with attendees and no schedule tag (it never sent anything). The first rewrite of such an event by its organizer after the upgrade runs `itip_create` and invites its internal key attendees (`tests/src/za/pairs.rs` documents the case). Upstream behaves the same for events PUT while scheduling was off; arguably what the organizer wants, but it belongs in the release notes or the manual checklist.
+- F5, catch-all delivery. `resolve_inner` uses `account_id_from_email(address, true)`, which falls back to the domain's catch-all address: an organizer's typo on a local domain whose catch-all is a key account yields a `1.2` item in the catch-all's inbox. Consistent with mail delivery and with upstream's iMIP sender lookup; spec 5.2's list of outcomes could say so.
+- F13, fork-diff width. `storage.rs`'s `delete`, `delete_all` and `delete_with_events` stay wrappers around `_za` twins (about 105 lines). The alternative is one `za_keys: Option<&SessionKeys>` parameter on the three upstream functions with their eleven callers updated, which keeps one body per function; the plan's shape is kept.
+
+Fixed in the final wave (`4902accd` and the documentation commit): F1; F3 (the release 1 spec parentheticals now read "release 2: superseded; see the invitations spec, section 5"); F6 (the non-key PUT create no longer allocates the UID, `update.rs:425-445`); F7 (an attendee's rewrite keeps exactly its own pair, `reply.rs:143-150`); F8a (the lost-fence trace precedes the retake, `crates/dav/src/calendar/mod.rs:251-266`); F8b (lease case (b'): a lost fence with no copy answers 503, zero copies, one leftover item, no lease, `uid_lease.rs:135-173`); F8c (the 503 branch's comment, `mod.rs:262-264`); F9 in part (`lease.rs:164-197`: an absent key counts as released, untraced; see the deferred lease item for the level); F10 (`lease.rs:134` `saturating_add`, `ZA_UID_LEASE_SECS` clamped to `1..=3600`, `lease.rs:46-55`); F11 (only `Limit(Quota)`/`Limit(TenantQuota)` maps to over quota, `crates/groupware/src/calendar/fanout.rs:523-537`); F12 in part (the DELETE CANCELs' SEQUENCE and pairs, `fanout.rs:473-552`); F14 (`reply.rs:383-386`); F15 in part (the `item_sequence` doc); Task 4's failed REPLY on the ORGANIZER (`reply.rs:168-218`) and 4(b)'s REPLY content (`reply.rs:349-357`); Task 5's mail assertion after the mixed DELETE, for plain (`fanout.rs:502-507`).
+
 ## Deferred findings
 
 Open items parked for Jay:
-- Upstream's `account_id_from_email` traces `StoreEvent::CacheHit` / `CacheMiss` with `Key = local_part` (`crates/common/src/cache/principals.rs:220-247`, `rcpt_id_from_parts`, reached through `account_id_from_email` at `:649`). Pre-existing upstream behaviour at debug level on every mail delivery and plain-account scheduling lookup, now also reached by the fan-out's recipient resolution. If the rule that traces name ids only is read as "no address in any trace during the fan-out", the fix is a fork-side non-tracing lookup.
-- Two addresses resolving to one account produce two items per UID (plan 10, above).
+- (Task 2 review) Upstream's `account_id_from_email` traces `StoreEvent::CacheHit` / `CacheMiss` with `Key = local_part` (`crates/common/src/cache/principals.rs:220-247`, `rcpt_id_from_parts`, reached through `account_id_from_email` at `:649`). Pre-existing upstream behaviour at debug level on every mail delivery and plain-account scheduling lookup, now also reached by the fan-out's recipient resolution. If the rule that traces name ids only is read as "no address in any trace during the fan-out", the fix is a fork-side non-tracing lookup.
+- (Task 2 review) Two addresses resolving to one account produce two items per UID (plan 10, above).
+- (final review) F2, the 412-after-delivery consequence (spec 5.4, above).
+- (final review) F1's spec 5.1 amendment (above).
 
-Deferred minors (the ledger, `.superpowers/sdd/2026-10-14-zero-access-9-fanout/progress.md`, has the detail), one line each; none changes behaviour a test or the spec relies on:
+Deferred minors (the ledger, `.superpowers/sdd/2026-10-14-zero-access-9-fanout/progress.md`, has the detail), one line each, tagged with the review they came from; none changes behaviour a test or the spec relies on:
 - Lease:
-  - `lease.rs:130` `now + lease_secs()` is an unchecked add; an absurd `ZA_UID_LEASE_SECS` panics in debug builds (saturating add or clamp).
-  - `mod.rs:252-261` the lost-fence trace is skipped when the retake fails (busy or no UID conflict); emit it before the retake.
-  - The lost-fence path with no planted copy (503, zero copies, one leftover item; `mod.rs:262-268`) is untested; a mutation answering 412 unconditionally survives.
-  - Removing the explicit `release` after the commit is masked by the guard's `Drop`; `abandon` versus `release` is an equivalent mutation.
-  - `ZaUidLeaseGuard::release` takes the lease before its await, so a request future dropped mid-release leaves the key until expiry.
-  - `release` rebuilds the assertion `assert_in` builds; its failure traces at error level (plan-mandated; warn would suit the slow-request cause); a guard dropped outside a runtime leaves the lease silently.
-  - The module doc says the duration only decides how long a crashed holder blocks others; a live holder slower than the lease also loses its commit.
-  - Unit tests: `expired_value(7)` evaluated twice can straddle a second; no test of `release` on an absent key; no concurrent-acquire test; the abandon half of the guard test is a timed negative; `LEASE_RETRY_WAIT` has no doc line.
+  - (Task 6 review) Removing the explicit `release` after the commit is masked by the guard's `Drop`; `abandon` versus `release` is an equivalent mutation.
+  - (Task 1 review) `ZaUidLeaseGuard::release` takes the lease before its await, so a request future dropped mid-release leaves the key until expiry.
+  - (Task 1 review; final review F9) `release` rebuilds the assertion `assert_in` builds. A release that fails because the key holds another value, or because the store fails, still traces at error level: trace levels are fixed per event type (`Store(AssertValueFailed)` is Error) and the fork adds no event types, so the final review's "warn" was not available. A guard dropped outside a runtime leaves the lease silently.
+  - (Task 1 review) The module doc says the duration only decides how long a crashed holder blocks others; a live holder slower than the lease also loses its commit.
+  - (Task 1 review) Unit tests: `expired_value(7)` evaluated twice can straddle a second; no concurrent-acquire test; the abandon half of the guard test is a timed negative; `LEASE_RETRY_WAIT` has no doc line.
+  - (final review) `ZaUidLeaseGuard::lease()` panics after `release` or `abandon` (internal use only).
 - Fan-out:
-  - A quota-lookup store error is swallowed as over-quota without a trace (`fanout.rs`, `write_item_inner`).
-  - The token is drawn into an un-zeroized stack temporary before `Zeroizing` (fork-wide pattern).
-  - A property can carry two SCHEDULE-STATUS parameters (upstream's `3.7`, then a fan-out status); RFC 6638's grammar is one comma-separated parameter. Upstream already produces the same shape (spec owner).
-  - A second `account()` lookup in `write_item_inner` (cache hit); the unit fixture is one VEVENT, so cross-component dedup and override-instance statuses are untested.
-  - `storage.rs` grew about 105 lines for the `*_za` delete variants; `za_session_keys` is evaluated twice per DELETE (URI gate and handler, as in every calendar handler).
+  - (Task 2 review) The token is drawn into an un-zeroized stack temporary before `Zeroizing` (fork-wide pattern).
+  - (Task 2 review) A property can carry two SCHEDULE-STATUS parameters (upstream's `3.7`, then a fan-out status); RFC 6638's grammar is one comma-separated parameter. Upstream already produces the same shape (spec owner).
+  - (Task 2 review) A second `account()` lookup in `write_item_inner` (cache hit); the unit fixture is one VEVENT, so cross-component dedup and override-instance statuses are untested.
+  - (Task 5 review; final review F13) `storage.rs` grew about 105 lines for the `*_za` delete variants; (Task 5 review) `za_session_keys` is evaluated twice per DELETE (URI gate and handler, as in every calendar handler).
 - Tests:
-  - A failed REPLY (status on the ORGANIZER, spec 5.3 step 5) is never tested.
-  - The setup-pending case does not assert that `key11` is a key account.
-  - Case 4(b) checks the REPLY count only, not its content.
-  - No DELETE test asserts the CANCEL's SEQUENCE (stored + 1).
-  - key2's CANCEL from the mixed DELETE is asserted by count only.
-  - No mail assertion for plain or the outsider after the sealed mixed DELETE.
-  - The size check's boundary (`>=` versus `>`) is unpinned; 7a's 1-byte quota cannot tell a size-based refusal from an exhausted quota; `Recipient::Failed` and the item-write-error `5.1` paths are untested; "others unaffected" relies on attendee order.
-  - Lease case (c) may pass uncontended on a slow runner (the plan accepts this) and does not check key2's item delta; (b)'s leftover item is checked by count only; the override reset is not panic-safe; the margins assume `ZA_UID_LEASE_SECS` is unset in CI; a UID-only lease key is caught only by Task 1's unit test, and `LEASE_RETRIES = 0` only by (c).
-  - The DELETE fan-out moved after `commit_batch` is not caught (no DELETE failure hook); the PUT's fan-out-after-commit is pinned only by the commit-fail hook.
-  - `item_sequence`'s doc says "first VEVENT" while the body scans all; `open_pending_item_as` logs in per call; `PLAIN_INVITE` duplicates `invite()`'s shape; the leak scan walks the store a second time for the token.
+  - (Task 5 review) After the sealed mixed DELETE, plain's mail count is asserted (final wave); the outsider's absence of mail is covered only indirectly, by `wait_for_delivery` panicking on a message still in the SMTP queue (from code reading).
+  - (Task 4 review) The size check's boundary (`>=` versus `>`) is unpinned; 7a's 1-byte quota cannot tell a size-based refusal from an exhausted quota; `Recipient::Failed` and the item-write-error `5.1` paths are untested; "others unaffected" relies on attendee order.
+  - (Task 4 review) `organizer_statuses`'s doc comment nit.
+  - (Task 6 review) Lease case (c) may pass uncontended on a slow runner (the plan accepts this) and does not check key2's item delta; (b)'s leftover item is checked by count only; the override reset is not panic-safe; the margins assume `ZA_UID_LEASE_SECS` is unset in CI; a UID-only lease key is caught only by Task 1's unit test, and `LEASE_RETRIES = 0` only by (c).
+  - (Task 6 review) `uid_lease.rs` has unlabelled asserts and full paths at call sites (`crate::utils::webdav::DummyWebDavClient`, `hyper::StatusCode`).
+  - (Task 5 review; final review F12) The DELETE fan-out moved after `commit_batch` is not caught (no DELETE failure hook; plan 10 material); (Task 3 review) the PUT's fan-out-after-commit is pinned only by the commit-fail hook.
+  - (Task 3 review) `open_pending_item_as` logs in per call; (Task 5 review) `PLAIN_INVITE` duplicates `invite()`'s shape; (Task 7 review) the leak scan walks the store a second time for the token.
+  - (Task 7 review, report only) Task 7's report mis-stated that the scan's events count includes key1's event; the scan counts only the scanned account.

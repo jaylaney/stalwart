@@ -658,8 +658,7 @@ unchanged paths (invariant 9).
   refused with 403 when either side is a key account.
 - `DELETE`: unchanged. The cancel path that reads the event only runs when a
   schedule tag is set, which never happens for key accounts in release 1
-  (release 2: superseded by invitations spec 5.1 and 5.5; key accounts set the
-  schedule tag, and their CANCELs fan out as sealed items).
+  (release 2: superseded; see the invitations spec, section 5).
 
 ### 8.2 Reads
 
@@ -707,7 +706,7 @@ return ciphertext:
 | Calendar sharing (`ACL` method, JMAP `shareWith`) | refused on calendars owned by key accounts; a key account may still read calendars shared *to* it by non-key accounts or groups |
 | Group-owned calendars, impersonation, master user | a key account's calendars are never readable through `is_member` shortcuts; impersonation and master-user sessions get 403 on calendar paths |
 | Free-busy by another user, scheduling outbox, `Principal/getAvailability` | 403 for key accounts' calendars |
-| CalDAV scheduling (RFC 6638) | scheduling permissions off; auto-schedule not advertised; a `PUT` with attendees stores them sealed and sends nothing; no schedule tag is ever set; the notification collection is never written (release 2: superseded by invitations spec 5.1 and 5.5; key accounts set the schedule tag, and their CANCELs fan out as sealed items) |
+| CalDAV scheduling (RFC 6638) | scheduling permissions off; auto-schedule not advertised; a `PUT` with attendees stores them sealed and sends nothing; no schedule tag is ever set; the notification collection is never written (release 2: superseded; see the invitations spec, section 5) |
 | Inbound iMIP ingest from mail | skipped for key accounts (events would need the public key; release 2) |
 | HTTP RSVP page | not routed for key accounts |
 | JMAP calendars capability and methods | not advertised; methods return `accountNotSupportedByMethod`; `ParticipantIdentity/changes` answers `cannotCalculateChanges` as upstream does for every account |
