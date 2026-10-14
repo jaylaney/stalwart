@@ -300,6 +300,11 @@ pub fn spawn_task_manager(inner: Arc<Inner>) {
         };
         let rx = inner.ipc.task_tx.clone();
         loop {
+            // Zero-access test hook (invitations spec 11): while it is held,
+            // the consumer takes no task, so a test can read the queue.
+            #[cfg(feature = "test_mode")]
+            common::za::test_hooks::task_consumer_pause_point().await;
+
             // Index any queued tasks
             let mut sleep_for = inner.build_server().process_tasks(&mut ipc).await;
             if is_clustered && sleep_for > REFRESH_INTERVAL {

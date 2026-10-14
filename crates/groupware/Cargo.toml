@@ -31,7 +31,7 @@ serde_json = "1.0"
 icu_datetime = { version = "~2.3", features = ["unstable_chrono_0_4"] }
 
 [features]
-test_mode = []
+test_mode = ["common/test_mode"]
 enterprise = []
 
 [dev-dependencies]
