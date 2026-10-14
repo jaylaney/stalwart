@@ -11,15 +11,26 @@ use super::{
     STRONG,
     dav_seal::{CANARIES, EVENT, mkcalendar_body},
 };
-use crate::utils::{server::TestServer, webdav::DummyWebDavClient};
+use crate::utils::{
+    server::TestServer,
+    webdav::DummyWebDavClient,
+    za::{PlantedItem, plant_inbox_item, plant_sealed_event},
+};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use calcard::icalendar::{ICalendar, ICalendarEntry, ICalendarProperty};
 use email::cache::MessageCacheFetch;
 use groupware::{
     cache::GroupwareCache,
     calendar::{
-        Calendar, CalendarEvent, CalendarEventData, Timezone,
+        Calendar, CalendarEvent, CalendarEventData, CalendarEventNotification,
+        EVENT_NOTIFICATION_ZA_PENDING, Timezone,
         seal::{
+            TokenPairs,
             collection::COLLECTION_MARKER,
+            item::RSVP_TOKEN_PROP,
             policy::{is_visible_parameter, is_visible_property},
             tree::{EXTRA_PROP, KEY_PROP, SEALED_PROP},
         },
@@ -65,6 +76,11 @@ const EXTRA_CANARIES: &[&str] = &[
     "todo-description-canary",
     "negative-canary",
     "sched-canary",
+    "itip-request-canary",
+    "itip-reply-canary",
+    "itip-drained-canary",
+    "itip-pair-canary",
+    "itip-negative-canary",
 ];
 
 /// A future invitation organized by the key account to a local non-key
@@ -77,6 +93,38 @@ const SCHED_EVENT: &str = concat!(
     "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:plain@example.com\r\n",
     "END:VEVENT\r\nEND:VCALENDAR\r\n"
 );
+
+/// Inbox items planted for the scan (invitations spec 11): a pending REQUEST
+/// to key2 with key2's pair, key2's pending REPLY from plain, a drained item.
+const ITIP_REQUEST: &str = concat!(
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\n",
+    "UID:leak-itip-request\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990102T090000Z\r\n",
+    "DTEND:20990102T100000Z\r\nSEQUENCE:0\r\nSUMMARY:itip-request-canary\r\n",
+    "ORGANIZER:mailto:plain@example.com\r\n",
+    "ATTENDEE;CN=itip-request-canary:mailto:key2@example.com\r\n",
+    "END:VEVENT\r\nEND:VCALENDAR\r\n"
+);
+const ITIP_REPLY: &str = concat!(
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nMETHOD:REPLY\r\nBEGIN:VEVENT\r\n",
+    "UID:leak-sched\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990102T090000Z\r\n",
+    "SEQUENCE:0\r\nORGANIZER:mailto:key2@example.com\r\n",
+    "ATTENDEE;PARTSTAT=ACCEPTED:mailto:plain@example.com\r\n",
+    "COMMENT:itip-reply-canary\r\n",
+    "END:VEVENT\r\nEND:VCALENDAR\r\n"
+);
+const ITIP_DRAINED: &str = concat!(
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\n",
+    "UID:leak-itip-drained\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990103T090000Z\r\n",
+    "DTEND:20990103T100000Z\r\nSEQUENCE:0\r\nSUMMARY:itip-drained-canary\r\n",
+    "ORGANIZER:mailto:plain@example.com\r\n",
+    "ATTENDEE:mailto:key2@example.com\r\n",
+    "END:VEVENT\r\nEND:VCALENDAR\r\n"
+);
+/// Tokens planted with them (16 ASCII bytes each).
+const TOKEN_REQUEST: [u8; 16] = *b"za-tok-request-1";
+const TOKEN_REPLY: [u8; 16] = *b"za-tok-reply-002";
+const TOKEN_EVENT_A: [u8; 16] = *b"za-tok-event-a03";
+const TOKEN_EVENT_B: [u8; 16] = *b"za-tok-event-b04";
 
 /// Archive marker bits (`store/src/write/serialize.rs`, private there).
 const ARCHIVE_MAGIC_MARKER: u8 = 1 << 7;
@@ -127,6 +175,8 @@ pub struct Scan {
     pub search_account_records: usize,
     pub events: usize,
     pub calendars: usize,
+    pub items: usize,
+    pub item_keys: usize,
     pub emails: usize,
 }
 
@@ -229,6 +279,33 @@ fn check_event(event: &CalendarEvent, what: &str, violations: &mut Vec<String>) 
         violations.push(format!("{what}: event preferences not empty"));
     }
     check_tree(&event.data.event, what, true, violations);
+}
+
+/// An inbox item (invitations spec 9): the root ends with `X-ZA-KEY` and,
+/// before it, at most one of `X-ZA-RSVP-TOKEN` (visible, a pending reply)
+/// or `X-ZA-EXTRA`; the rest as `check_tree` checks any component. Returns
+/// whether the item carries its key envelope.
+fn check_item(item: &CalendarEventNotification, what: &str, violations: &mut Vec<String>) -> bool {
+    let mut tree = item.event.clone();
+    let has_key = tree
+        .components
+        .first()
+        .and_then(|root| root.entries.last())
+        .is_some_and(|e| carrier_kind(e) == Some(KEY_PROP));
+    if !has_key {
+        violations.push(format!("{what}: missing {KEY_PROP}"));
+    } else {
+        let root = &mut tree.components[0].entries;
+        root.pop();
+        if root.last().is_some_and(|e| {
+            carrier_kind(e) == Some(EXTRA_PROP)
+                || matches!(&e.name, ICalendarProperty::Other(n) if n.eq_ignore_ascii_case(RSVP_TOKEN_PROP))
+        }) {
+            root.pop();
+        }
+    }
+    check_tree(&tree, what, false, violations);
+    has_key
 }
 
 fn check_calendar(calendar: &Calendar, account_id: u32, what: &str, violations: &mut Vec<String>) {
@@ -398,6 +475,18 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
                         .violations
                         .push(format!("{what}: calendar archive does not decode: {err:?}")),
                 }
+            } else if collection == Collection::CalendarEventNotification as u8 {
+                scan.items += 1;
+                match archive.deserialize::<CalendarEventNotification>() {
+                    Ok(item) => {
+                        if check_item(&item, &what, &mut scan.violations) {
+                            scan.item_keys += 1;
+                        }
+                    }
+                    Err(err) => scan.violations.push(format!(
+                        "{what}: inbox item archive does not decode: {err:?}"
+                    )),
+                }
             }
         }
     }
@@ -450,6 +539,102 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
         }
     }
     scan
+}
+
+/// The property-subspace key of an archive: account id (u32 BE) |
+/// collection | `Field::ARCHIVE` | document id (u32 BE).
+fn archive_key(account_id: u32, collection: Collection, document_id: u32) -> Vec<u8> {
+    let mut key = account_id.to_be_bytes().to_vec();
+    key.push(collection as u8);
+    key.push(u8::from(Field::ARCHIVE));
+    key.extend_from_slice(&document_id.to_be_bytes());
+    key
+}
+
+/// Where any of `tokens` appears in the clear (invitations spec 11): as raw
+/// bytes, base64url without padding (the `X-ZA-RSVP-TOKEN` form) or
+/// standard base64, in a raw key, a raw value, a decoded archive or a
+/// decoded blob. Returns (subspace, key, token index) per hit; a blob hit
+/// carries `SUBSPACE_BLOBS` and the blob hash.
+pub async fn token_hits(test: &TestServer, tokens: &[[u8; 16]]) -> Vec<(u8, Vec<u8>, usize)> {
+    let forms: Vec<(usize, Vec<u8>)> = tokens
+        .iter()
+        .enumerate()
+        .flat_map(|(i, token)| {
+            [
+                (i, token.to_vec()),
+                (i, URL_SAFE_NO_PAD.encode(token).into_bytes()),
+                (i, STANDARD.encode(token).into_bytes()),
+            ]
+        })
+        .collect();
+    let find = |bytes: &[u8]| -> Vec<usize> {
+        forms
+            .iter()
+            .filter(|(_, form)| bytes.windows(form.len()).any(|w| w == form.as_slice()))
+            .map(|(i, _)| *i)
+            .collect()
+    };
+    let store = test.server.store().clone();
+    let mut hits = Vec::new();
+    let mut blob_hashes: Vec<Vec<u8>> = Vec::new();
+    for &subspace in SUBSPACES {
+        if subspace == SUBSPACE_SEARCH_INDEX && store.is_pg_or_mysql() {
+            continue;
+        }
+        let mut records: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        store
+            .iterate(
+                IterateParams::new(
+                    AnyKey {
+                        subspace,
+                        key: vec![0u8],
+                    },
+                    AnyKey {
+                        subspace,
+                        key: vec![u8::MAX; 64],
+                    },
+                ),
+                |key, value| {
+                    records.push((key.to_vec(), value.to_vec()));
+                    Ok(true)
+                },
+            )
+            .await
+            .unwrap();
+        for (key, value) in records {
+            let mut found = find(&key);
+            found.extend(find(&value));
+            if let Some(archive) = try_archive(&value) {
+                found.extend(find(archive.as_bytes()));
+            }
+            if subspace == SUBSPACE_BLOBS {
+                blob_hashes.push(key.clone());
+            } else if subspace == SUBSPACE_BLOB_LINK && key.len() >= BLOB_HASH_LEN {
+                blob_hashes.push(key[..BLOB_HASH_LEN].to_vec());
+            }
+            found.sort_unstable();
+            found.dedup();
+            hits.extend(found.into_iter().map(|i| (subspace, key.clone(), i)));
+        }
+    }
+    blob_hashes.sort_unstable();
+    blob_hashes.dedup();
+    for hash in blob_hashes {
+        if let Ok(Some(blob)) = test
+            .server
+            .blob_store()
+            .get_blob(&hash, 0..usize::MAX)
+            .await
+        {
+            hits.extend(
+                find(&blob)
+                    .into_iter()
+                    .map(|i| (SUBSPACE_BLOBS, hash.clone(), i)),
+            );
+        }
+    }
+    hits
 }
 
 pub async fn test(test: &mut TestServer) {
@@ -659,9 +844,59 @@ pub async fn test(test: &mut TestServer) {
         );
     }
 
+    // Invitations spec 11: inbox items in both states and an event whose
+    // bundle holds token pairs, as plans 9 and 10 will write them.
+    let sender = test.account("plain@example.com").id().document_id();
+    let request_id = plant_inbox_item(
+        test,
+        id,
+        ITIP_REQUEST,
+        PlantedItem::Pending {
+            pair: Some(("itip-pair-canary@example.com", TOKEN_REQUEST)),
+            reply_token: None,
+        },
+        sender,
+        None,
+    )
+    .await;
+    let reply_id = plant_inbox_item(
+        test,
+        id,
+        ITIP_REPLY,
+        PlantedItem::Pending {
+            pair: None,
+            reply_token: Some(TOKEN_REPLY),
+        },
+        sender,
+        None,
+    )
+    .await;
+    let drained_id = plant_inbox_item(
+        test,
+        id,
+        ITIP_DRAINED,
+        PlantedItem::Drained { password: STRONG },
+        sender,
+        None,
+    )
+    .await;
+    let mut pairs = TokenPairs::new();
+    pairs.insert("itip-pair-canary@example.com", TOKEN_EVENT_A);
+    pairs.insert("key2@example.com", TOKEN_EVENT_B);
+    plant_sealed_event(
+        test,
+        id,
+        "leak",
+        "pairs.ics",
+        &EVENT.replace("za-event-1", "za-leak-pairs"),
+        STRONG,
+        &pairs,
+    )
+    .await;
+
     let result = scan(test, id).await;
     println!(
-        "Leak scan: {} records, {} archives, {} blobs, {} search index records ({} of the account, none calendar), {} events, {} calendars, {} emails",
+        "Leak scan: {} records, {} archives, {} blobs, {} search index records ({} of the account, none calendar), {} events, {} calendars, {} items, {} emails",
         result.records,
         result.archives,
         result.blobs,
@@ -669,6 +904,7 @@ pub async fn test(test: &mut TestServer) {
         result.search_account_records,
         result.events,
         result.calendars,
+        result.items,
         result.emails
     );
     assert!(
@@ -688,6 +924,35 @@ pub async fn test(test: &mut TestServer) {
     assert!(
         result.search_account_records > 0,
         "no search index entry of the account: the key layout is misread: {result:?}"
+    );
+
+    // Inbox items were decoded and each carries its key envelope.
+    assert!(result.items >= 3, "{result:?}");
+    assert_eq!(result.item_keys, result.items, "{result:?}");
+
+    // Tokens are in the clear only on the pending reply item, whose
+    // `X-ZA-RSVP-TOKEN` is visible by design (spec 3.3); that hit is the
+    // positive control.
+    let hits = token_hits(
+        test,
+        &[TOKEN_REQUEST, TOKEN_REPLY, TOKEN_EVENT_A, TOKEN_EVENT_B],
+    )
+    .await;
+    let reply_key = archive_key(id, Collection::CalendarEventNotification, reply_id);
+    let on_reply = |subspace: u8, key: &[u8], token: usize| {
+        subspace == SUBSPACE_PROPERTY && key == reply_key.as_slice() && token == 1
+    };
+    assert!(
+        hits.iter().any(|(s, k, t)| on_reply(*s, k, *t)),
+        "the visible reply token was not found: {hits:?}"
+    );
+    let stray: Vec<_> = hits
+        .iter()
+        .filter(|(s, k, t)| !on_reply(*s, k, *t))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "a token in the clear outside the pending reply item: {stray:?}"
     );
 
     // Negative control: an unsealed event planted directly must be caught,
@@ -774,6 +1039,60 @@ pub async fn test(test: &mut TestServer) {
             .await;
         client
             .request("DELETE", "/dav/cal/key2%40example.com/leak/planted.ics", "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+
+    // Negative control for items: a plaintext item with the pending bit is
+    // caught by the canary search and by the item check.
+    {
+        let negative = plant_inbox_item(
+            test,
+            id,
+            &ITIP_DRAINED.replace("itip-drained-canary", "itip-negative-canary"),
+            PlantedItem::Plain {
+                flags: EVENT_NOTIFICATION_ZA_PENDING,
+            },
+            sender,
+            None,
+        )
+        .await;
+        let key = format!(
+            "{:?}",
+            archive_key(id, Collection::CalendarEventNotification, negative)
+        );
+        let planted = scan(test, id).await;
+        let report = planted.violations.join("\n");
+        assert!(
+            planted
+                .violations
+                .iter()
+                .any(|v| v.contains("itip-negative-canary")),
+            "the scanner must catch the planted item canary:\n{report}"
+        );
+        assert!(
+            planted
+                .violations
+                .iter()
+                .any(|v| v.contains(&key) && v.ends_with(&format!("missing {KEY_PROP}"))),
+            "the scanner must catch the unsealed item:\n{report}"
+        );
+        client
+            .request(
+                "DELETE",
+                &format!("/dav/itip/key2%40example.com/inbox/{negative}.ics"),
+                "",
+            )
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    for item in [request_id, reply_id, drained_id] {
+        client
+            .request(
+                "DELETE",
+                &format!("/dav/itip/key2%40example.com/inbox/{item}.ics"),
+                "",
+            )
             .await
             .with_status(StatusCode::NO_CONTENT);
     }
