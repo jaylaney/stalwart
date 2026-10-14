@@ -8,8 +8,8 @@ use crate::{Server, cache::invalidate::CacheInvalidationBuilder, ipc::CacheInval
 use ::vault::{
     Zeroizing,
     keys::{
-        AAD_PASSWORD, Argon2Params, Secret, aad, app_aad, derive_app_kek, derive_kek, derive_root,
-        unwrap_key, verifier_matches,
+        AAD_PASSWORD, AAD_PRIVATE_KEY, Argon2Params, KeyError, Secret, aad, app_aad,
+        derive_app_kek, derive_kek, derive_root, unwrap_key, verifier_matches,
     },
     record::{VAULT_RECORD_VERSION, VaultRecord, VaultState, WrapState},
     session::SessionKeys,
@@ -317,6 +317,44 @@ fn corrupt(account_id: u32, what: &'static str) -> trc::Error {
         .caused_by(trc::location!())
 }
 
+/// Invitations spec 3.2: the session's X25519 private key, unwrapped from
+/// `private_key_wrap` under MK on first use and kept only in `keys`, which
+/// zeroes it on drop. The outcome is recorded:
+/// - a wrap that does not open, or a missing or unusable record, is traced
+///   once per session (account id and a `zero-access:` description only) and
+///   is an error on every call (spec 10);
+/// - a store error is not recorded, so a later call retries.
+pub(crate) async fn za_open_private_key<'k>(
+    store: &Store,
+    keys: &'k SessionKeys,
+) -> trc::Result<&'k Secret> {
+    if keys.private_key().is_none() {
+        let account_id = keys.account_id;
+        let outcome = match vault_read_store(store, account_id).await {
+            Ok(Some(read)) => unwrap_key(
+                &read.record.private_key_wrap,
+                keys.mk(),
+                &aad(AAD_PRIVATE_KEY, account_id),
+            ),
+            Ok(None) => Err(KeyError::Aead),
+            Err(err) if is_vault_unusable(&err) => Err(KeyError::Aead),
+            Err(err) => return Err(err),
+        };
+        let failed = outcome.is_err();
+        if keys.set_private_key(outcome) && failed {
+            trc::error!(private_key_unavailable(account_id));
+        }
+    }
+    match keys.private_key() {
+        Some(Ok(key)) => Ok(key),
+        _ => Err(private_key_unavailable(keys.account_id)),
+    }
+}
+
+fn private_key_unavailable(account_id: u32) -> trc::Error {
+    corrupt(account_id, "zero-access: session private key does not open")
+}
+
 /// A record that was read but cannot be used is treated like a missing one:
 /// logged once (account id and a fixed description only), then `NoRecord`.
 fn unusable(account_id: u32, what: &'static str) -> ZaVerification {
@@ -421,6 +459,12 @@ impl Server {
             return Ok(None);
         };
         za_open_app_record(account_id, &read.record, credential_id, secret)
+    }
+
+    /// Invitations spec 3.2: see `za_open_private_key`. The drain (plan 10)
+    /// is the caller; an error was already traced for the session.
+    pub async fn za_private_key<'k>(&self, keys: &'k SessionKeys) -> trc::Result<&'k Secret> {
+        za_open_private_key(self.store(), keys).await
     }
 }
 
@@ -830,6 +874,88 @@ mod tests {
         assert_eq!(
             za_parse_origin(Some(" https://account.example.com ")).unwrap(),
             "https://account.example.com"
+        );
+    }
+
+    fn record_with_private_key(account_id: u32, mk: &Secret, private: &Secret) -> VaultRecord {
+        let mut record = VaultRecord::pending(vec![], 0);
+        record.state = VaultState::Active;
+        record.private_key_wrap = wrap_key(private, mk, &aad(AAD_PRIVATE_KEY, account_id));
+        record
+    }
+
+    #[tokio::test]
+    async fn private_key_unwraps_from_the_record_once_per_session() {
+        let store = EphemeralStore::open();
+        let mk = Secret::random();
+        let (public, private) = ::vault::keys::generate_keypair();
+        let mut record = record_with_private_key(3, &mk, &private);
+        record.public_key = public.to_vec();
+        vault_write_store(&store, 3, &record, None).await.unwrap();
+
+        let keys = SessionKeys::new(3, 1, mk.clone());
+        assert!(keys.private_key().is_none());
+        let key = za_open_private_key(&store, &keys).await.unwrap();
+        assert_eq!(key.as_bytes(), private.as_bytes());
+        // Kept in the session: no second record read (the record is now
+        // unusable, and the call still succeeds).
+        write_raw(&store, 3, Vec::new()).await;
+        assert_eq!(
+            za_open_private_key(&store, &keys).await.unwrap().as_bytes(),
+            private.as_bytes()
+        );
+        // A new session reads the record again.
+        assert!(
+            za_open_private_key(&store, &SessionKeys::new(3, 1, mk.clone()))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_private_key_wrap_that_does_not_open_is_an_error_and_no_key() {
+        let store = EphemeralStore::open();
+        let mk = Secret::random();
+        let private = Secret::random();
+        let mut record = record_with_private_key(3, &mk, &private);
+        record.private_key_wrap[40] ^= 1;
+        vault_write_store(&store, 3, &record, None).await.unwrap();
+
+        let keys = SessionKeys::new(3, 1, mk.clone());
+        let err = za_open_private_key(&store, &keys).await.err().unwrap();
+        assert!(err.matches(trc::EventType::Store(trc::StoreEvent::DataCorruption)));
+        assert!(format!("{err:?}").contains("zero-access:"), "{err:?}");
+        assert!(matches!(keys.private_key(), Some(Err(_))), "no key is kept");
+
+        // Recorded (and traced) once: repairing the record does not change
+        // this session's outcome; a fresh session opens the repaired wrap.
+        let read = vault_read_store(&store, 3).await.unwrap().unwrap();
+        let mut repaired = record_with_private_key(3, &mk, &private);
+        repaired.revision = read.record.revision + 1;
+        vault_write_store(&store, 3, &repaired, Some(&read))
+            .await
+            .unwrap();
+        assert!(za_open_private_key(&store, &keys).await.is_err());
+        assert_eq!(
+            za_open_private_key(&store, &SessionKeys::new(3, 1, mk.clone()))
+                .await
+                .unwrap()
+                .as_bytes(),
+            private.as_bytes()
+        );
+
+        // A missing record, and a wrap bound to another account.
+        assert!(
+            za_open_private_key(&store, &SessionKeys::new(4, 1, mk.clone()))
+                .await
+                .is_err()
+        );
+        let moved = record_with_private_key(3, &mk, &private);
+        vault_write_store(&store, 5, &moved, None).await.unwrap();
+        assert!(
+            za_open_private_key(&store, &SessionKeys::new(5, 1, mk.clone()))
+                .await
+                .is_err()
         );
     }
 }
