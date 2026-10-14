@@ -116,8 +116,8 @@ const FANOUT_EVENT: &str = concat!(
     "LOCATION:fanoutloc-canary\r\nDESCRIPTION:fanoutdesc-canary\r\n",
     "ORGANIZER:mailto:key1@example.com\r\n",
     "ATTENDEE;CN=fanoutcn-canary;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:key2@example.com\r\n",
-    "ATTENDEE;CN=fanoutextcn-canary;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:",
-    "mailto:fanoutaddr-canary@remote.test\r\n",
+    // Under 75 octets, so no fold can split the address canary in a text form.
+    "ATTENDEE;CN=fanoutextcn-canary:mailto:fanoutaddr-canary@remote.test\r\n",
     "END:VEVENT\r\nEND:VCALENDAR\r\n"
 );
 
