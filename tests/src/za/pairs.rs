@@ -126,10 +126,10 @@ pub async fn test(test: &mut TestServer) {
         .get("D:displayname")
         .with_values(["pairs-name"]);
 
-    // Review Focus 5: events without pairs take the same rewrites. A release
-    // 1 event (its PROPPATCH writes a format 1 bundle) keeps its display name
-    // through a PUT; a legacy plaintext event is sealed by its PUT. Neither
-    // gains pairs.
+    // Release 1 spec 7.3 and 8.1: events without pairs take the same
+    // rewrites. A release 1 event (its PROPPATCH writes a format 1 bundle)
+    // keeps its display name through a PUT; a legacy plaintext event is
+    // sealed by its PUT. Neither gains pairs.
     let r1 = "/dav/cal/key1%40example.com/default/pairs-r1.ics";
     let r1_body = EVENT.replace("za-pairs-1", "za-pairs-r1");
     client

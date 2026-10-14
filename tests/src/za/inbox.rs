@@ -323,7 +323,10 @@ pub async fn test_sync(test: &mut TestServer) {
         .sync_collection(KEY_INBOX, &t0, Depth::One, None, ["D:getetag"])
         .await;
     assert_eq!(reported(response.hrefs()), 0, "a pending item was reported");
+    assert!(response.hrefs().is_empty(), "{:?}", response.hrefs());
     let t1 = response.sync_token().to_string();
+    // The token advances past a skipped insert.
+    assert_ne!(t0, t1);
 
     rewrite_inbox_item(test, id, item, |stored| {
         stored.event = parse(&ical);
@@ -342,6 +345,7 @@ pub async fn test_sync(test: &mut TestServer) {
             "drained item from a token taken {taken}: {:?}",
             response.hrefs()
         );
+        assert_eq!(response.hrefs().len(), 1, "{:?}", response.hrefs());
         let body = response.body.as_deref().unwrap_or_default();
         assert!(body.contains("HTTP/1.1 200"), "{body}");
     }

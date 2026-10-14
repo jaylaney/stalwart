@@ -9,16 +9,16 @@
 
 use super::{
     STRONG,
-    dav_seal::{CANARIES, EVENT, mkcalendar_body},
+    dav_seal::{CANARIES, EVENT, mkcalendar_body, raw_event},
 };
 use crate::utils::{
     server::TestServer,
     webdav::DummyWebDavClient,
-    za::{PlantedItem, plant_inbox_item, plant_sealed_event},
+    za::{PlantedItem, plant_inbox_item, plant_sealed_event, wait_for_delivery},
 };
 use base64::{
     Engine,
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD},
 };
 use calcard::icalendar::{ICalendar, ICalendarEntry, ICalendarProperty};
 use email::cache::MessageCacheFetch;
@@ -80,7 +80,7 @@ const EXTRA_CANARIES: &[&str] = &[
     "itip-reply-canary",
     "itip-drained-canary",
     "itip-pair-canary",
-    "itip-negative-canary",
+    "itip-neg-item-canary",
 ];
 
 /// A future invitation organized by the key account to a local non-key
@@ -177,6 +177,7 @@ pub struct Scan {
     pub calendars: usize,
     pub items: usize,
     pub item_keys: usize,
+    pub item_extras: usize,
     pub emails: usize,
 }
 
@@ -281,10 +282,22 @@ fn check_event(event: &CalendarEvent, what: &str, violations: &mut Vec<String>) 
     check_tree(&event.data.event, what, true, violations);
 }
 
+/// Whether the root's last two entries are `X-ZA-EXTRA` then `X-ZA-KEY`.
+fn ends_extra_then_key(tree: &ICalendar) -> bool {
+    tree.components.first().is_some_and(|root| {
+        matches!(
+            root.entries.as_slice(),
+            [.., extra, key]
+                if carrier_kind(extra) == Some(EXTRA_PROP) && carrier_kind(key) == Some(KEY_PROP)
+        )
+    })
+}
+
 /// An inbox item (invitations spec 9): the root ends with `X-ZA-KEY` and,
 /// before it, at most one of `X-ZA-RSVP-TOKEN` (visible, a pending reply)
-/// or `X-ZA-EXTRA`; the rest as `check_tree` checks any component. Returns
-/// whether the item carries its key envelope.
+/// or `X-ZA-EXTRA`, and neither once drained (pending bit clear); the rest
+/// as `check_tree` checks any component. Returns whether the item carries
+/// its key envelope.
 fn check_item(item: &CalendarEventNotification, what: &str, violations: &mut Vec<String>) -> bool {
     let mut tree = item.event.clone();
     let has_key = tree
@@ -297,10 +310,20 @@ fn check_item(item: &CalendarEventNotification, what: &str, violations: &mut Vec
     } else {
         let root = &mut tree.components[0].entries;
         root.pop();
-        if root.last().is_some_and(|e| {
-            carrier_kind(e) == Some(EXTRA_PROP)
-                || matches!(&e.name, ICalendarProperty::Other(n) if n.eq_ignore_ascii_case(RSVP_TOKEN_PROP))
-        }) {
+        let carrier = root.last().and_then(|e| {
+            if carrier_kind(e) == Some(EXTRA_PROP) {
+                Some(EXTRA_PROP)
+            } else if matches!(&e.name, ICalendarProperty::Other(n) if n.eq_ignore_ascii_case(RSVP_TOKEN_PROP))
+            {
+                Some(RSVP_TOKEN_PROP)
+            } else {
+                None
+            }
+        });
+        if let Some(carrier) = carrier {
+            if item.flags & EVENT_NOTIFICATION_ZA_PENDING == 0 {
+                violations.push(format!("{what}: drained item carries {carrier}"));
+            }
             root.pop();
         }
     }
@@ -482,6 +505,9 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
                         if check_item(&item, &what, &mut scan.violations) {
                             scan.item_keys += 1;
                         }
+                        if ends_extra_then_key(&item.event) {
+                            scan.item_extras += 1;
+                        }
                     }
                     Err(err) => scan.violations.push(format!(
                         "{what}: inbox item archive does not decode: {err:?}"
@@ -552,10 +578,11 @@ fn archive_key(account_id: u32, collection: Collection, document_id: u32) -> Vec
 }
 
 /// Where any of `tokens` appears in the clear (invitations spec 11): as raw
-/// bytes, base64url without padding (the `X-ZA-RSVP-TOKEN` form) or
-/// standard base64, in a raw key, a raw value, a decoded archive or a
-/// decoded blob. Returns (subspace, key, token index) per hit; a blob hit
-/// carries `SUBSPACE_BLOBS` and the blob hash.
+/// bytes, base64url without padding (the `X-ZA-RSVP-TOKEN` form), standard
+/// base64 or standard base64 without padding, in a raw key, a raw value, a
+/// decoded archive or a decoded blob. Returns (subspace, key, token index)
+/// per hit; a blob hit carries `SUBSPACE_BLOBS` and the blob hash. A blob
+/// that fails to read panics: it must not go unsearched unnoticed.
 pub async fn token_hits(test: &TestServer, tokens: &[[u8; 16]]) -> Vec<(u8, Vec<u8>, usize)> {
     let forms: Vec<(usize, Vec<u8>)> = tokens
         .iter()
@@ -565,6 +592,7 @@ pub async fn token_hits(test: &TestServer, tokens: &[[u8; 16]]) -> Vec<(u8, Vec<
                 (i, token.to_vec()),
                 (i, URL_SAFE_NO_PAD.encode(token).into_bytes()),
                 (i, STANDARD.encode(token).into_bytes()),
+                (i, STANDARD_NO_PAD.encode(token).into_bytes()),
             ]
         })
         .collect();
@@ -621,17 +649,20 @@ pub async fn token_hits(test: &TestServer, tokens: &[[u8; 16]]) -> Vec<(u8, Vec<
     blob_hashes.sort_unstable();
     blob_hashes.dedup();
     for hash in blob_hashes {
-        if let Ok(Some(blob)) = test
+        // A missing blob stays silent, as in `scan`.
+        match test
             .server
             .blob_store()
             .get_blob(&hash, 0..usize::MAX)
             .await
         {
-            hits.extend(
+            Ok(Some(blob)) => hits.extend(
                 find(&blob)
                     .into_iter()
                     .map(|i| (SUBSPACE_BLOBS, hash.clone(), i)),
-            );
+            ),
+            Ok(None) => {}
+            Err(err) => panic!("blob {hash:?} does not decode: {err:?}"),
         }
     }
     hits
@@ -794,9 +825,9 @@ pub async fn test(test: &mut TestServer) {
         )
         .await
         .with_status(StatusCode::CREATED);
-    // Let the alarm fire and its email be delivered.
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    test.wait_for_tasks().await;
+    // Wait for the alarm to fire and its email to be delivered: the task
+    // queue holds the alarm until it is due, then the SMTP queue drains.
+    wait_for_delivery(test).await;
 
     // No carrier ever reaches a client.
     for path in [cal, copy] {
@@ -926,9 +957,19 @@ pub async fn test(test: &mut TestServer) {
         "no search index entry of the account: the key layout is misread: {result:?}"
     );
 
-    // Inbox items were decoded and each carries its key envelope.
+    // Inbox items were decoded and each carries its key envelope; the
+    // pending request's pair bundle was seen before its envelope.
     assert!(result.items >= 3, "{result:?}");
     assert_eq!(result.item_keys, result.items, "{result:?}");
+    assert!(result.item_extras >= 1, "{result:?}");
+    // The paired event's stored root ends with its pair bundle, then its key
+    // envelope: the scan above checked an event that carries pairs.
+    let (paired, _) = raw_event(test, id, "leak/pairs.ics").await;
+    let paired = paired.deserialize::<CalendarEvent>().unwrap();
+    assert!(
+        ends_extra_then_key(&paired.data.event),
+        "the paired event's root does not end {EXTRA_PROP} then {KEY_PROP}"
+    );
 
     // Tokens are in the clear only on the pending reply item, whose
     // `X-ZA-RSVP-TOKEN` is visible by design (spec 3.3); that hit is the
@@ -1049,7 +1090,7 @@ pub async fn test(test: &mut TestServer) {
         let negative = plant_inbox_item(
             test,
             id,
-            &ITIP_DRAINED.replace("itip-drained-canary", "itip-negative-canary"),
+            &ITIP_DRAINED.replace("itip-drained-canary", "itip-neg-item-canary"),
             PlantedItem::Plain {
                 flags: EVENT_NOTIFICATION_ZA_PENDING,
             },
@@ -1067,7 +1108,7 @@ pub async fn test(test: &mut TestServer) {
             planted
                 .violations
                 .iter()
-                .any(|v| v.contains("itip-negative-canary")),
+                .any(|v| v.contains("itip-neg-item-canary")),
             "the scanner must catch the planted item canary:\n{report}"
         );
         assert!(
