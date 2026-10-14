@@ -1073,6 +1073,11 @@ pub async fn test_plain_owner(test: &mut TestServer) {
         .with_status(StatusCode::OK);
 
     let held = hold_task_consumer(test).await;
+    assert_eq!(
+        itip_tasks_for(test, plain_id).await,
+        0,
+        "a plain task was already queued"
+    );
     key1.client
         .request_with_headers(
             "PUT",

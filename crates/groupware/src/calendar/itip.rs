@@ -1097,8 +1097,8 @@ impl ItipSendStatus {
         matches!(self, Self::Send)
     }
 
-    /// Whether upstream's builders run: `Send`, and `SendSealed` for a key
-    /// account (invitations spec 5.1).
+    /// Whether upstream's builders run: `Send`, and `SendSealed` for a
+    /// key-owned calendar (invitations spec 5.1).
     #[inline(always)]
     pub fn builds_messages(&self) -> bool {
         matches!(self, Self::Send | Self::SendSealed)
