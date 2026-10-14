@@ -18,8 +18,8 @@
 //! dispatch: the fenced commit needs the lease and the event in one
 //! transaction. The generic `purge_in_memory_store` skips the
 //! `KV_LOCK_ZA_UID` range, since its unconditional clear would delete a
-//! replacement lease; plan 10's sweep clears expired leases with an
-//! assertion on the value it read.
+//! replacement lease; plan 10's sweep (not yet present) is to clear
+//! expired leases with an assertion on the value it read.
 
 use crate::{KV_LOCK_ZA_UID, auth::vault::RawValue};
 use sha2::{Digest, Sha256};

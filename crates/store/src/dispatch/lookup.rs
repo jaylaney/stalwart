@@ -424,7 +424,7 @@ impl InMemoryStore {
                 store
                     .iterate(IterateParams::new(from_key, to_key), |key, value| {
                         // Zero-access fork: the unconditional clear races a replacement
-                        // lease; the zero-access sweep clears these with an assertion.
+                        // lease; plan 10's sweep is to clear these with an assertion.
                         if key.first() == Some(&ZA_UID_LEASE_PREFIX) {
                             return Ok(true);
                         }

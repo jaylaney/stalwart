@@ -517,6 +517,9 @@ pub async fn test(test: &mut TestServer) {
     // are not emitted at all until something declares interest in them.
     // `jmap.not-request` carries the body the JMAP parser rejected, and
     // `jmap.invalid-arguments` a method call's rejected arguments.
+    // The negative assertions below are bounded by these event types: an
+    // address traced through an unsubscribed event type is not caught (the
+    // outcome note's deferred `eval_if` item is one).
     let traced = [
         EventType::Http(HttpEvent::RequestBody),
         EventType::Http(HttpEvent::ResponseBody),
