@@ -113,6 +113,10 @@ pub const EVENT_DRAFT: u16 = 1 << 3;
 
 pub const EVENT_NOTIFICATION_IS_DRAFT: u16 = 1;
 pub const EVENT_NOTIFICATION_IS_CHANGE: u16 = 1 << 1;
+/// Invitations spec 9: an inbox item still sealed to the recipient's public
+/// key. Set by the fan-out (plan 9), cleared by the drain (plan 10); hidden
+/// from clients meanwhile (spec 6.6).
+pub const EVENT_NOTIFICATION_ZA_PENDING: u16 = 1 << 2;
 
 pub const PREF_USE_DEFAULT_ALERTS: u16 = 1;
 

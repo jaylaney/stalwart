@@ -18,7 +18,9 @@ use calcard::icalendar::{
     ICalendarValue,
 };
 use std::borrow::Cow;
-use vault::keys::{Secret, aad, open, seal, unwrap_key, wrap_key};
+use vault::keys::{
+    PUBLIC_KEY_LEN, Secret, WRAP_LEN, aad, open, pk_unwrap, pk_wrap, seal, unwrap_key, wrap_key,
+};
 use zeroize::{Zeroize, Zeroizing};
 
 pub const SEALED_PROP: &str = "X-ZA-SEALED";
@@ -30,8 +32,12 @@ pub(crate) const FORMAT_V1: u8 = 1;
 /// format byte fails authentication instead of decoding one plaintext
 /// struct as the other.
 pub(crate) const FORMAT_V2: u8 = 2;
-/// Wrap type `mk` (spec 7.1). `0x02` is reserved for `pk`.
+/// Wrap type `mk` (spec 7.1): the DEK wrapped under the account's event
+/// wrapping key.
 const WRAP_MK: u8 = 1;
+/// Wrap type `pk` (invitations spec 3.1): the DEK wrapped to a recipient's
+/// X25519 public key. Opened only by the drain (invariant 11).
+pub(super) const WRAP_PK: u8 = 2;
 const PAD: usize = 256;
 
 /// One component's removals. Entry indices refer to the original entry list;
@@ -167,6 +173,40 @@ pub(super) fn open_key_envelope(
     match envelope {
         [POLICY_VERSION, WRAP_MK, wrapped @ ..] => {
             unwrap_key(wrapped, ewk, aad).map_err(|_| SealError::Aead)
+        }
+        [version, ..] if *version != POLICY_VERSION => Err(SealError::Policy(*version)),
+        _ => Err(SealError::Format),
+    }
+}
+
+/// A `pk` key envelope: `policy version || 0x02 || E (32) || wrapped DEK
+/// (72)` (invitations spec 3.1, 9).
+pub(super) fn seal_pk_envelope(
+    dek: &Secret,
+    recipient_public: &[u8; PUBLIC_KEY_LEN],
+    aad: &[u8],
+) -> Result<Vec<u8>, SealError> {
+    let (ephemeral, wrapped) = pk_wrap(dek, recipient_public, aad)
+        .map_err(|_| SealError::Structure("recipient public key"))?;
+    let mut envelope = Vec::with_capacity(2 + PUBLIC_KEY_LEN + WRAP_LEN);
+    envelope.extend_from_slice(&[POLICY_VERSION, WRAP_PK]);
+    envelope.extend_from_slice(&ephemeral);
+    envelope.extend_from_slice(&wrapped);
+    Ok(envelope)
+}
+
+/// Opens a `seal_pk_envelope` with the recipient's private key.
+pub(super) fn open_pk_envelope(
+    envelope: &[u8],
+    private_key: &Secret,
+    aad: &[u8],
+) -> Result<Secret, SealError> {
+    match envelope {
+        [POLICY_VERSION, WRAP_PK, rest @ ..] if rest.len() == PUBLIC_KEY_LEN + WRAP_LEN => {
+            let (ephemeral, wrapped) = rest.split_at(PUBLIC_KEY_LEN);
+            let ephemeral: [u8; PUBLIC_KEY_LEN] =
+                ephemeral.try_into().map_err(|_| SealError::Format)?;
+            pk_unwrap(&ephemeral, wrapped, private_key, aad).map_err(|_| SealError::Aead)
         }
         [version, ..] if *version != POLICY_VERSION => Err(SealError::Policy(*version)),
         _ => Err(SealError::Format),
