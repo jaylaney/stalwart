@@ -31,6 +31,7 @@ pub mod reply;
 pub mod setup;
 pub mod totp;
 pub mod tracing;
+pub mod uid_lease;
 pub mod websocket;
 
 pub const STRONG: &str = "correct horse battery staple 1";
@@ -108,6 +109,7 @@ pub async fn za_tests() {
     fanout::test(&mut test).await;
     fanout::test_failures(&mut test).await;
     reply::test(&mut test).await;
+    uid_lease::test(&mut test).await;
     tracing::test(&mut test).await;
     expansion::test(&mut test).await;
     gating::test(&mut test).await;
