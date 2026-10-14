@@ -190,3 +190,40 @@ Task 8 (leak coverage). The ledger marks the findings on `token_hits` skipping b
 - Token index 1 is hard-coded (`:943`).
 - `check_item` accepts `X-ZA-RSVP-TOKEN` regardless of flags or METHOD.
 - The `__eh_frame` linker note (as in Task 7).
+
+## Final review and fix wave
+
+Added by the controller after the whole-branch review of `8a6ae34a..69965b8f` and its one fix wave
+(`8fed1675` product, `cea5ef38` tests, `cc0ecd5d` spec), re-reviewed clean at `cc0ecd5d`. Every
+suite is green at that head: groupware 70, vault 30, `common auth::vault` 14, `za_tests` plain and
+with the filesystem blob store, `webdav_tests` in key mode and plain mode. The release build was
+last run at `eca18e12` (Task 9); the fix wave passed the shipping-configuration `cargo check`.
+
+- The review's one Important finding: both inbox read sites tested the pending bit before the
+  key-account gate, so a keyless session would see 404 (GET) or an empty 207 (a pending-only
+  listing or sync) instead of release 1 section 10's 403 with a `Security(Unauthorized)` trace.
+  The fix wave moved the gate first on both sites (`za_item_hidden` now takes the access token and
+  calls `za_session_keys`). While doing so the implementer found that `validate_uri`
+  (`crates/dav/src/common/uri.rs`) already gates every `/dav/cal` and `/dav/itip` account URI, so
+  the 404 and the empty 207 were not reachable through any request; the reorder is defence in
+  depth and the Task 6 ruling above is superseded on that basis. The new test
+  (`tests/src/za/inbox.rs`, the `key1@example.com%admin` master-user session, 403 on GET and
+  PROPFIND) pins the outcome through the URI gate; the handler order itself has no request-level
+  observer.
+- `open_pending_item` now refuses a bundle that does not hold exactly one pair, format 1 bundles
+  included (no legitimate writer produces one on a pending item), so plan 10's drain need not
+  re-check the count. The order case `[.., SEALED, EXTRA, RSVP, KEY]` is tested.
+- Fixed from the deferred list: the `Server::za_private_key` doc (a store error is untraced and
+  retried); `test_sync`'s three tightenings; `token_hits` gains the `STANDARD_NO_PAD` form and
+  panics on an unreadable blob; the item negative-control canary is `itip-neg-item-canary`;
+  `check_item` flags a carrier on an item whose pending bit is clear and the scan counts
+  `item_extras`; the leak module's alarm wait is `wait_for_delivery`; spec 3.1 step 4 and
+  section 13 say `pk-dek`; `format_aad` carries a comment on its suffix; the `pairs.rs` comment
+  cites the spec.
+- Left for plan 10 or later: `check_item` does not check carrier parameters or the RSVP value
+  shape; `token_hits` does not decode MIME bodies (needed once mail carries tokens) and its
+  padded `STANDARD` form is now redundant with `STANDARD_NO_PAD`; a golden release 1 format 1
+  ciphertext vector would pin byte-for-byte compatibility; the spec's section 9 table row and
+  3.1 step 4 carry unescaped `|` inside backticks, which GitHub's table renderer splits; the
+  CLAUDE.md status paragraph is updated at merge. The plan document's embedded test code still
+  shows the old canary name; it is historical text.
