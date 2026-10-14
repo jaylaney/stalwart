@@ -5,9 +5,22 @@
  */
 
 use crate::utils::{account::Account, http::HttpRequest, server::TestServer};
-use calcard::{common::timezone::Tz, icalendar::ICalendar};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use calcard::{
+    common::{IanaString, timezone::Tz},
+    icalendar::{
+        ICalendar, ICalendarComponentType, ICalendarEntry, ICalendarMethod, ICalendarParameterName,
+        ICalendarParameterValue, ICalendarProperty, ICalendarValue,
+    },
+};
 use common::{
-    auth::vault::ZaVerification, ipc::CacheInvalidation, storage::index::ObjectIndexBuilder,
+    auth::vault::ZaVerification,
+    ipc::CacheInvalidation,
+    storage::index::ObjectIndexBuilder,
+    za::{
+        lease::lease_key_range,
+        test_hooks::{self, Pause as HookPause},
+    },
 };
 use email::cache::MessageCacheFetch;
 use groupware::{
@@ -15,17 +28,23 @@ use groupware::{
     calendar::{
         CalendarEvent, CalendarEventData, CalendarEventNotification, ChangedBy,
         EVENT_NOTIFICATION_ZA_PENDING,
-        seal::{TokenPairs, seal_drained_item, seal_event, seal_pending_item},
+        seal::{
+            PendingCarriers, TokenPairs, open_pending_item, seal_drained_item, seal_event,
+            seal_pending_item, tree::KEY_PROP,
+        },
+        storage::ItipAutoExpunge,
     },
+    scheduling::inbound::itip_method,
 };
 use http::auth::authenticate::za_test::{self, Pause};
 use hyper::{Method, StatusCode};
+use registry::schema::structs::Task;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{future::Future, sync::Arc, time::Duration};
 use store::{
-    ValueKey,
-    write::{AlignedBytes, Archive, BatchBuilder},
+    Deserialize, IterateParams, ValueKey,
+    write::{AlignedBytes, Archive, BatchBuilder, TaskQueueClass, ValueClass},
 };
 use tokio::task::JoinHandle;
 use types::collection::{Collection, SyncCollection};
@@ -453,6 +472,294 @@ pub async fn wait_for_delivery(test: &TestServer) {
     }
     // Ingest can queue index tasks of its own.
     test.wait_for_tasks().await;
+}
+
+/// The account's scheduling inbox items, by ascending document id, as
+/// stored (pending items included; clients never see those).
+pub async fn inbox_items(
+    test: &TestServer,
+    account_id: u32,
+) -> Vec<(u32, CalendarEventNotification)> {
+    let mut items = Vec::new();
+    for document_id in test.server.itip_ids(account_id).await.unwrap() {
+        if let Some(stored) = test
+            .server
+            .store()
+            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                account_id,
+                Collection::CalendarEventNotification,
+                document_id,
+            ))
+            .await
+            .unwrap()
+        {
+            items.push((
+                document_id,
+                stored.deserialize::<CalendarEventNotification>().unwrap(),
+            ));
+        }
+    }
+    items
+}
+
+/// The document ids of the account's scheduling inbox items.
+pub async fn inbox_ids(test: &TestServer, account_id: u32) -> Vec<u32> {
+    test.server
+        .itip_ids(account_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .collect()
+}
+
+/// The items written since `before` was taken with `inbox_ids`.
+pub async fn new_inbox_items(
+    test: &TestServer,
+    account_id: u32,
+    before: &[u32],
+) -> Vec<(u32, CalendarEventNotification)> {
+    inbox_items(test, account_id)
+        .await
+        .into_iter()
+        .filter(|(id, _)| !before.contains(id))
+        .collect()
+}
+
+/// The wrap type of a stored tree's `X-ZA-KEY` envelope (`1` mk, `2` pk), or
+/// `None` when the root does not end with one.
+pub fn envelope_wrap(ical: &ICalendar) -> Option<u8> {
+    let last = ical.components.first()?.entries.last()?;
+    if !matches!(&last.name, ICalendarProperty::Other(name) if name.eq_ignore_ascii_case(KEY_PROP))
+    {
+        return None;
+    }
+    STANDARD
+        .decode(last.values.first()?.as_text()?.trim())
+        .ok()?
+        .get(1)
+        .copied()
+}
+
+/// Opens a pending item as the drain will (invitations spec 6.4 step 1):
+/// unlocks the recipient's keys from `password`, obtains its private key
+/// through `Server::za_private_key`, and opens the stored item's `pk` wrap.
+/// Returns the plaintext tree and what the item carries. In plan 9 only
+/// tests open pending items (invariant 11).
+pub async fn open_pending_item_as(
+    test: &TestServer,
+    recipient: u32,
+    password: &str,
+    document_id: u32,
+) -> (ICalendar, PendingCarriers) {
+    let keys = za_unlock(test, recipient, password).await;
+    let private_key = test.server.za_private_key(&keys).await.unwrap();
+    let stored = test
+        .server
+        .store()
+        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            recipient,
+            Collection::CalendarEventNotification,
+            document_id,
+        ))
+        .await
+        .unwrap()
+        .expect("inbox item");
+    let mut item = stored.deserialize::<CalendarEventNotification>().unwrap();
+    let carriers = open_pending_item(&mut item.event, recipient, private_key)
+        .unwrap_or_else(|err| panic!("item {document_id} does not open: {err:?}"));
+    (item.event, carriers)
+}
+
+/// The METHOD on an iTIP tree's root (visible on a sealed item too).
+pub fn item_method(ical: &ICalendar) -> Option<ICalendarMethod> {
+    itip_method(ical).ok().cloned()
+}
+
+/// The SEQUENCE of the first VEVENT.
+pub fn item_sequence(ical: &ICalendar) -> Option<i64> {
+    ical.components
+        .iter()
+        .filter(|comp| comp.component_type == ICalendarComponentType::VEvent)
+        .flat_map(|comp| comp.entries.iter())
+        .find(|entry| entry.name == ICalendarProperty::Sequence)
+        .and_then(|entry| entry.values.first())
+        .and_then(|value| match value {
+            ICalendarValue::Integer(sequence) => Some(*sequence),
+            _ => None,
+        })
+}
+
+fn names_address(entry: &ICalendarEntry, address: &str) -> bool {
+    entry
+        .values
+        .first()
+        .and_then(|value| value.as_text())
+        .is_some_and(|value| {
+            value
+                .trim_start_matches("mailto:")
+                .eq_ignore_ascii_case(address)
+        })
+}
+
+/// Every ATTENDEE address, lower case, sorted, deduplicated.
+pub fn item_attendees(ical: &ICalendar) -> Vec<String> {
+    let mut attendees: Vec<String> = ical
+        .components
+        .iter()
+        .flat_map(|comp| comp.entries.iter())
+        .filter(|entry| entry.name == ICalendarProperty::Attendee)
+        .filter_map(|entry| entry.values.first().and_then(|value| value.as_text()))
+        .map(|value| value.trim_start_matches("mailto:").to_ascii_lowercase())
+        .collect();
+    attendees.sort();
+    attendees.dedup();
+    attendees
+}
+
+/// The PARTSTAT of `address`'s ATTENDEE property, upper case.
+pub fn item_partstat(ical: &ICalendar, address: &str) -> Option<String> {
+    ical.components
+        .iter()
+        .flat_map(|comp| comp.entries.iter())
+        .filter(|entry| entry.name == ICalendarProperty::Attendee && names_address(entry, address))
+        .flat_map(|entry| entry.params.iter())
+        .find_map(|param| match (&param.name, &param.value) {
+            (ICalendarParameterName::Partstat, ICalendarParameterValue::Partstat(status)) => {
+                Some(status.as_str().to_string())
+            }
+            _ => None,
+        })
+}
+
+/// The SCHEDULE-STATUS values on every `property` (ORGANIZER or ATTENDEE)
+/// naming `address`, in an iCalendar body as GET returns it. Parsed, so
+/// folded lines do not matter.
+pub fn schedule_statuses(body: &str, property: ICalendarProperty, address: &str) -> Vec<String> {
+    parse_ical(body)
+        .components
+        .iter()
+        .flat_map(|comp| comp.entries.iter())
+        .filter(|entry| entry.name == property && names_address(entry, address))
+        .flat_map(|entry| entry.params.iter())
+        .filter(|param| param.name == ICalendarParameterName::ScheduleStatus)
+        .filter_map(|param| param.value.as_text().map(str::to_string))
+        .collect()
+}
+
+/// A request held at one of the fork's test-mode pause points in
+/// `common::za::test_hooks` (`set_fan_out_pause`, `set_put_pause`). As
+/// `Parked`, dropping it clears the slot and releases the request, also on a
+/// failed assertion.
+pub struct HookParked<T> {
+    pause: Arc<HookPause>,
+    clear: fn(Option<Arc<HookPause>>),
+    handle: Option<JoinHandle<T>>,
+}
+
+impl<T: Send + 'static> HookParked<T> {
+    pub async fn start(
+        account_id: u32,
+        set: fn(Option<Arc<HookPause>>),
+        request: impl Future<Output = T> + Send + 'static,
+    ) -> Self {
+        let pause = Arc::new(HookPause::new(account_id));
+        set(Some(pause.clone()));
+        let mut parked = HookParked {
+            pause: pause.clone(),
+            clear: set,
+            handle: None,
+        };
+        parked.handle = Some(tokio::spawn(request));
+        tokio::time::timeout(Duration::from_secs(5), pause.arrived.notified())
+            .await
+            .expect("the request did not reach the pause point");
+        parked
+    }
+
+    pub async fn finish(mut self) -> T {
+        self.pause.release.notify_one();
+        self.handle.take().unwrap().await.unwrap()
+    }
+}
+
+impl<T> Drop for HookParked<T> {
+    fn drop(&mut self) {
+        (self.clear)(None);
+        self.pause.release.notify_one();
+    }
+}
+
+/// The task manager's consumer held at `TASK_CONSUMER_PAUSE`; dropping it
+/// releases the consumer.
+pub struct ConsumerHeld {
+    pause: Arc<HookPause>,
+}
+
+impl Drop for ConsumerHeld {
+    fn drop(&mut self) {
+        test_hooks::set_task_consumer_pause(None);
+        self.pause.release.notify_one();
+    }
+}
+
+/// Holds the task manager's consumer at its pause point, so a task-queue
+/// read cannot miss a task the worker would otherwise run and clear
+/// (invitations spec 11). Waits for due tasks first (at most 30 s), so
+/// nothing earlier is mid-flight, then wakes the consumer and waits until it
+/// is parked.
+pub async fn hold_task_consumer(test: &TestServer) -> ConsumerHeld {
+    // Bounded: a permanently failed task left by an earlier module would
+    // otherwise hang the suite here without a name.
+    tokio::time::timeout(Duration::from_secs(30), test.wait_for_tasks_skip_not_due())
+        .await
+        .expect("tasks did not drain before the consumer hold");
+    let pause = Arc::new(HookPause::new(0));
+    test_hooks::set_task_consumer_pause(Some(pause.clone()));
+    test.server.notify_task_queue();
+    tokio::time::timeout(Duration::from_secs(5), pause.arrived.notified())
+        .await
+        .expect("the task consumer did not reach its pause point");
+    ConsumerHeld { pause }
+}
+
+/// `CalendarItipMessage` tasks of `account_id` in the task queue.
+pub async fn itip_tasks_for(test: &TestServer, account_id: u32) -> usize {
+    let mut count = 0;
+    test.server
+        .store()
+        .iterate(
+            IterateParams::new(
+                ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task { id: 0 })),
+                ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task { id: u64::MAX })),
+            )
+            .ascending(),
+            |_, value| {
+                if let Task::CalendarItipMessage(task) = Task::deserialize(value)?
+                    && task.account_id.document_id() == account_id
+                {
+                    count += 1;
+                }
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+    count
+}
+
+/// UID creation lease keys in the data store (invitations spec 6.3).
+pub async fn za_uid_leases(test: &TestServer) -> usize {
+    let (from, to) = lease_key_range();
+    let mut count = 0;
+    test.server
+        .store()
+        .iterate(IterateParams::new(from, to).no_values(), |_, _| {
+            count += 1;
+            Ok(true)
+        })
+        .await
+        .unwrap();
+    count
 }
 
 /// How `plant_inbox_item` stores an item (invitations spec 9).

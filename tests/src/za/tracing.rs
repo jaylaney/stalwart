@@ -714,18 +714,22 @@ pub async fn test(test: &mut TestServer) {
         !all.contains(OPTIONS_WRONG_SECRET),
         "OPTIONS credential traced: {all}"
     );
-    // Scheduling: the plain account's past event still traces its reason on
-    // the create and the update path; the key account's fixed refusal is
-    // traced on neither (three key-account PUTs reach it in this module).
+    // Scheduling: a past event traces its reason on the create and the
+    // update path, for the plain account and, since a key account resolves
+    // its sending state under upstream's preconditions (invitations spec
+    // 5.1, `SendSealed`), for the key account too. Every key-account PUT of
+    // an event without an ORGANIZER now also traces upstream's
+    // `NoSchedulingInfo` ("No scheduling information found") at Debug level
+    // through the same arm, as a plain account's does.
     let itip = traced_as(EventType::Calendar(CalendarEvent::ItipMessageError));
     assert_eq!(
         itip.matches("lies in the past").count(),
-        2,
-        "plain-account scheduling reason not traced on both PUT paths: {itip}"
+        4,
+        "scheduling reason not traced on both PUT paths of both accounts: {itip}"
     );
     assert!(
         !itip.contains("zero-access accounts"),
-        "key-account scheduling refusal traced: {itip}"
+        "the removed key-account refusal was traced: {itip}"
     );
 
     test.wait_for_tasks().await;

@@ -19,6 +19,7 @@ pub mod dav_gate;
 pub mod dav_seal;
 pub mod disabled;
 pub mod expansion;
+pub mod fanout;
 pub mod gating;
 pub mod inbox;
 pub mod index_task;
@@ -102,6 +103,7 @@ pub async fn za_tests() {
     dav_seal::test_collections(&mut test).await;
     dav_seal::test_conditional(&mut test).await;
     dav_seal::test_legacy(&mut test).await;
+    fanout::test(&mut test).await;
     tracing::test(&mut test).await;
     expansion::test(&mut test).await;
     gating::test(&mut test).await;

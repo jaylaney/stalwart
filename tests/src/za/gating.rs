@@ -479,7 +479,9 @@ pub async fn test_scheduling(test: &mut TestServer) {
     let plain_mail = mail_count(test, plain_id).await;
     let key_mail = mail_count(test, key1_id).await;
 
-    // Organizer is a key account: stored, nothing sent, no schedule tag.
+    // Organizer is a key account (invitations spec 5.1, `SendSealed`): the
+    // schedule tag is set as upstream sets it. plain is a non-key account,
+    // so the fan-out does not attempt it and no mail is sent.
     let response = key_client
         .request_with_headers(
             "PUT",
@@ -490,7 +492,7 @@ pub async fn test_scheduling(test: &mut TestServer) {
         .await
         .with_status(StatusCode::CREATED);
     assert!(
-        response.headers.get("schedule-tag").is_none(),
+        response.headers.get("schedule-tag").is_some(),
         "{:?}",
         response.headers
     );
@@ -550,16 +552,15 @@ pub async fn test_scheduling(test: &mut TestServer) {
         );
     }
 
-    // A CANCEL on DELETE needs a stored schedule tag (`delete_all` in
-    // groupware's calendar storage); a key account's events never get one,
-    // so deleting this one cannot send anything whatever the DELETE gate does.
+    // The stored event carries the schedule tag a CANCEL on DELETE needs
+    // (`delete_all` in groupware's calendar storage).
     let (archive, _) = raw_event(test, key1_id, "default/invite.ics").await;
     assert!(
         archive
             .unarchive::<CalendarEvent>()
             .unwrap()
             .schedule_tag
-            .is_none()
+            .is_some()
     );
     key_client
         .request("DELETE", &format!("{key_cal}invite.ics"), "")
