@@ -71,6 +71,7 @@ pub mod scripts;
 pub mod sharing;
 pub mod storage;
 pub mod telemetry;
+pub mod za;
 
 // SPDX-SnippetBegin
 // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
@@ -127,6 +128,9 @@ pub const KV_LOCK_QUEUE_MESSAGE: u8 = 21;
 pub const KV_LOCK_TASK: u8 = 23;
 pub const KV_LOCK_DAV: u8 = 25;
 pub const KV_SIEVE_ID: u8 = 26;
+/// Invitations spec 6.3: the per-(account, UID) creation lease
+/// (`za::lease`).
+pub const KV_LOCK_ZA_UID: u8 = store::ZA_UID_LEASE_PREFIX;
 
 #[derive(Clone)]
 pub struct Server {

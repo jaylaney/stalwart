@@ -10,6 +10,7 @@ use crate::{
         ETag,
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
+        za::ZeroAccessGate,
     },
 };
 use common::{Server, auth::AccessToken, sharing::EffectiveAcl};
@@ -17,7 +18,7 @@ use dav_proto::RequestHeaders;
 use groupware::{
     DestroyArchive,
     cache::GroupwareCache,
-    calendar::{Calendar, CalendarEvent},
+    calendar::{Calendar, CalendarEvent, fanout::ZaFanOut},
 };
 use http_proto::HttpResponse;
 use hyper::StatusCode;
@@ -78,8 +79,11 @@ impl CalendarDeleteRequestHandler for Server {
         let send_itip = self.core.groupware.itip_enabled
             && !headers.no_schedule_reply
             && !account_info.addresses().is_empty()
-            && !account_info.account().is_key_account()
             && access_token.has_permission(Permission::CalendarSchedulingSend);
+        // Invitations spec 5.5: a key account's CANCELs and declines are
+        // built from the unsealed stored tree and go to the fan-out.
+        let za_keys = self.za_session_keys(access_token, account_id).await?;
+        let mut za_messages = Vec::new();
 
         // Fetch entry
         let mut batch = BatchBuilder::new();
@@ -143,8 +147,8 @@ impl CalendarDeleteRequestHandler for Server {
             .await?;
 
             // Delete calendar and events
-            DestroyArchive(calendar)
-                .delete_with_events(
+            za_messages = DestroyArchive(calendar)
+                .delete_with_events_za(
                     self,
                     &account_info,
                     account_id,
@@ -156,6 +160,7 @@ impl CalendarDeleteRequestHandler for Server {
                         .collect::<Vec<_>>(),
                     resources.format_resource(delete_resource).into(),
                     send_itip,
+                    za_keys.as_deref(),
                     &mut batch,
                 )
                 .await
@@ -228,17 +233,35 @@ impl CalendarDeleteRequestHandler for Server {
             }
 
             // Delete event
-            DestroyArchive(event)
-                .delete(
+            za_messages.extend(
+                DestroyArchive(event)
+                    .delete_za(
+                        &account_info,
+                        account_id,
+                        document_id,
+                        calendar_id,
+                        resources.format_resource(delete_resource).into(),
+                        send_itip,
+                        za_keys.as_deref(),
+                        &mut batch,
+                    )
+                    .caused_by(trc::location!())?,
+            );
+        }
+
+        if let Some(keys) = &za_keys {
+            // Spec 5.4: the items first, immediately before the commit.
+            for message in za_messages {
+                self.za_fan_out(
                     &account_info,
-                    account_id,
-                    document_id,
-                    calendar_id,
-                    resources.format_resource(delete_resource).into(),
-                    send_itip,
-                    &mut batch,
+                    keys,
+                    vec![message.message],
+                    message.pairs,
+                    &message.event,
                 )
+                .await
                 .caused_by(trc::location!())?;
+            }
         }
 
         self.commit_batch(batch).await.caused_by(trc::location!())?;

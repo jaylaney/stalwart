@@ -7,6 +7,7 @@
 pub mod alarm;
 pub mod dates;
 pub mod expand;
+pub mod fanout;
 pub mod index;
 pub mod itip;
 pub mod seal;

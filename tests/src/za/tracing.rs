@@ -8,8 +8,21 @@
 //! DAV or JMAP, and no credential header from any request, reaches the HTTP
 //! body traces.
 
-use super::STRONG;
+use super::{
+    STRONG,
+    fanout::{START_A, attendee_statuses, invite},
+};
 use crate::utils::{server::TestServer, webdav::DummyWebDavClient, za::SERVER_URL};
+use ::registry::{
+    schema::{
+        prelude::ObjectType,
+        structs::{
+            Account as RegistryAccount, CertificateManagement, DkimManagement, DnsManagement,
+            Domain, Expression, ExpressionMatch, SubAddressing, SubAddressingCustom, UserAccount,
+        },
+    },
+    types::{list::List, map::Map},
+};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hyper::StatusCode;
 use serde_json::json;
@@ -24,7 +37,7 @@ use tokio_rustls::{
     },
 };
 use trc::{
-    AuthEvent, CalendarEvent, Collector, EventType, HttpEvent, JmapEvent,
+    AuthEvent, CalendarEvent, Collector, EvalEvent, EventType, HttpEvent, JmapEvent, StoreEvent,
     ipc::subscriber::{Interests, SubscriberBuilder},
 };
 
@@ -51,6 +64,35 @@ const OPTIONS_WRONG_SECRET: &str = "trace-canary-options-wrong-3e9a";
 /// must not push a real account toward a fail2ban ban, which would turn the
 /// reported event into `security.authentication-ban`.
 const OPTIONS_PROBE_USER: &str = "options-probe@example.com";
+/// Invitations spec 10: attendees of a key account's invitation, whose
+/// fan-out lookups must not trace them. The local one names no account, so
+/// it is looked up and not attempted; the external one's domain is looked
+/// up. `LOOKUP_DOMAIN_CANARY` is the external domain's distinctive label.
+const LOOKUP_LOCAL_CANARY: &str = "tracing-local-canary";
+const LOOKUP_LOCAL_ATTENDEE: &str = "tracing-local-canary@example.com";
+const LOOKUP_DOMAIN_CANARY: &str = "tracing-canary";
+const LOOKUP_EXT_ATTENDEE: &str = "tracing-ext-canary@tracing-canary.remote.test";
+/// A login name no account has: upstream's login looks its local part up
+/// through the same cache, the positive control of the lookup traces.
+const LOOKUP_AUTH_CANARY: &str = "tracing-auth-canary";
+const LOOKUP_AUTH_USER: &str = "tracing-auth-canary@example.com";
+/// A domain with a custom sub-addressing rule (`a.b` resolves to `a`):
+/// the fan-out evaluates it on the attendee's local part, and the
+/// evaluation's result must not be traced either. The positive control
+/// resolves through the domain's alias, so no control event names
+/// `SUBADDR_DOMAIN_CANARY`.
+const SUBADDR_DOMAIN: &str = "subaddr-canary.test";
+const SUBADDR_DOMAIN_ALIAS: &str = "subaddr-alias.test";
+const SUBADDR_DOMAIN_CANARY: &str = "subaddr-canary";
+const SUBADDR_CANARY: &str = "tracing-sub-canary";
+const SUBADDR_ATTENDEE: &str = "tracing-sub-canary.topic@subaddr-canary.test";
+const SUBADDR_AUTH_CANARY: &str = "tracing-sub-auth-canary";
+const SUBADDR_AUTH_ADDRESS: &str = "tracing-sub-auth-canary.topic@subaddr-alias.test";
+/// An account of the sub-addressing domain: only the rule turns
+/// `SUBADDR_USER_ADDRESS` into it, so finding it proves the quiet path ran
+/// the rule.
+const SUBADDR_USER: &str = "tracing-sub-user";
+const SUBADDR_USER_ADDRESS: &str = "tracing-sub-user.topic@subaddr-canary.test";
 const SUBSCRIBER_ID: &str = "za-trace-test";
 const CONTENT_TYPE: (&str, &str) = ("content-type", "text/calendar; charset=utf-8");
 
@@ -165,6 +207,21 @@ async fn options_wrong_password(user: &str) -> reqwest::Response {
         .request(reqwest::Method::OPTIONS, format!("{SERVER_URL}/dav/cal/"))
         .basic_auth(user, Some(OPTIONS_WRONG_SECRET))
         .header("x-forwarded-for", "10.77.0.1")
+        .send()
+        .await
+        .unwrap()
+}
+
+/// A DAV request with a wrong Basic credential for `user`, from its own
+/// forwarded address, as `options_wrong_password` does.
+async fn login_wrong_password(user: &str) -> reqwest::Response {
+    http_client()
+        .request(
+            reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
+            format!("{SERVER_URL}/dav/cal/"),
+        )
+        .basic_auth(user, Some(OPTIONS_WRONG_SECRET))
+        .header("x-forwarded-for", "10.77.0.2")
         .send()
         .await
         .unwrap()
@@ -482,11 +539,35 @@ pub async fn test(test: &mut TestServer) {
         )
         .await
         .with_status(StatusCode::CREATED);
+    // Created before the subscriber, so its creation traces nothing here.
+    let admin = test.account("admin@example.com").clone();
+    let subaddr_domain_id = admin
+        .registry_create_object(Domain {
+            name: SUBADDR_DOMAIN.to_string(),
+            aliases: Map::new(vec![SUBADDR_DOMAIN_ALIAS.to_string()]),
+            is_enabled: true,
+            certificate_management: CertificateManagement::Manual,
+            dns_management: DnsManagement::Manual,
+            dkim_management: DkimManagement::Manual,
+            sub_addressing: SubAddressing::Custom(SubAddressingCustom {
+                custom_rule: Expression {
+                    else_: "false".to_string(),
+                    match_: List::from_iter([ExpressionMatch {
+                        if_: "matches('^([^.]+)\\.([^.]+)', rcpt)".to_string(),
+                        then: "$1".to_string(),
+                    }]),
+                },
+            }),
+            ..Default::default()
+        })
+        .await;
 
     // The test server configures no tracer, so the two Trace-level events
     // are not emitted at all until something declares interest in them.
     // `jmap.not-request` carries the body the JMAP parser rejected, and
     // `jmap.invalid-arguments` a method call's rejected arguments.
+    // The negative assertions below are bounded by these event types: an
+    // address traced through an unsubscribed event type is not caught.
     let traced = [
         EventType::Http(HttpEvent::RequestBody),
         EventType::Http(HttpEvent::ResponseBody),
@@ -496,6 +577,10 @@ pub async fn test(test: &mut TestServer) {
         EventType::Jmap(JmapEvent::InvalidResultReference),
         EventType::Auth(AuthEvent::Failed),
         EventType::Calendar(CalendarEvent::ItipMessageError),
+        EventType::Store(StoreEvent::CacheHit),
+        EventType::Store(StoreEvent::CacheMiss),
+        EventType::Eval(EvalEvent::Result),
+        EventType::Eval(EvalEvent::Error),
     ];
     let mut interests = Interests::default();
     for event_type in traced {
@@ -581,6 +666,48 @@ pub async fn test(test: &mut TestServer) {
         .unwrap_or_default()
         .to_string();
     assert!(dav.contains("calendar-auto-schedule"), "{dav}");
+    // Invitations spec 10: the key account's fan-out looks its attendees up
+    // without tracing them, on the PUT and again on the DELETE's CANCEL.
+    let invite_path = format!("{key_cal}trace-invite.ics");
+    key_client
+        .request_with_headers(
+            "PUT",
+            &invite_path,
+            [CONTENT_TYPE],
+            invite(
+                "trace-invite",
+                START_A,
+                &[LOOKUP_LOCAL_ATTENDEE, LOOKUP_EXT_ATTENDEE, SUBADDR_ATTENDEE],
+            ),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(
+        attendee_statuses(&key_client, &invite_path, LOOKUP_LOCAL_ATTENDEE).await,
+        ["5.3"]
+    );
+    // The rule resolves the attendee to a local part no account has.
+    assert_eq!(
+        attendee_statuses(&key_client, &invite_path, SUBADDR_ATTENDEE).await,
+        ["5.3"]
+    );
+    key_client
+        .request("DELETE", &invite_path, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    // Positive control: upstream's login looks up the nonexistent name.
+    assert_eq!(
+        login_wrong_password(LOOKUP_AUTH_USER).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    // Positive control: the public lookup traces the rule's result.
+    assert_eq!(
+        test.server
+            .account_id_from_email(SUBADDR_AUTH_ADDRESS, true)
+            .await
+            .unwrap(),
+        None
+    );
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let mut seen = Vec::new();
@@ -596,6 +723,39 @@ pub async fn test(test: &mut TestServer) {
             seen.push(values);
         }
     }
+    // The quiet path runs the rule, observably and without a trace. The
+    // account's creation traces are drained first.
+    let sub_user_id = admin
+        .registry_create_object(RegistryAccount::User(UserAccount {
+            name: SUBADDR_USER.to_string(),
+            domain_id: subaddr_domain_id,
+            ..Default::default()
+        }))
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    while rx.try_recv().is_ok() {}
+    assert_eq!(
+        test.server
+            .za_account_id_from_email(SUBADDR_USER_ADDRESS)
+            .await
+            .unwrap(),
+        Some(sub_user_id.document_id()),
+        "the quiet lookup did not run the sub-addressing rule"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let mut quiet_run = Vec::new();
+    while let Ok(batch) = rx.try_recv() {
+        for event in batch {
+            for (_, value) in event.keys.iter() {
+                strings(value, &mut quiet_run);
+            }
+        }
+    }
+    let quiet_run = quiet_run.join("\n");
+    assert!(
+        !quiet_run.contains(SUBADDR_USER),
+        "the quiet rule run traced the address: {quiet_run}"
+    );
     Collector::remove_subscriber(SUBSCRIBER_ID.into());
     Collector::reload();
     let all = seen.join("\n");
@@ -714,18 +874,56 @@ pub async fn test(test: &mut TestServer) {
         !all.contains(OPTIONS_WRONG_SECRET),
         "OPTIONS credential traced: {all}"
     );
-    // Scheduling: the plain account's past event still traces its reason on
-    // the create and the update path; the key account's fixed refusal is
-    // traced on neither (three key-account PUTs reach it in this module).
+    // Scheduling: a past event traces its reason on the create and the
+    // update path, for the plain account and, since a key account resolves
+    // its sending state under upstream's preconditions (invitations spec
+    // 5.1, `SendSealed`), for the key account too. Every key-account PUT of
+    // an event without an ORGANIZER now also traces upstream's
+    // `NoSchedulingInfo` ("No scheduling information found") at Debug level
+    // through the same arm, as a plain account's does.
     let itip = traced_as(EventType::Calendar(CalendarEvent::ItipMessageError));
     assert_eq!(
         itip.matches("lies in the past").count(),
-        2,
-        "plain-account scheduling reason not traced on both PUT paths: {itip}"
+        4,
+        "scheduling reason not traced on both PUT paths of both accounts: {itip}"
     );
     assert!(
         !itip.contains("zero-access accounts"),
-        "key-account scheduling refusal traced: {itip}"
+        "the removed key-account refusal was traced: {itip}"
+    );
+    // Recipient lookups: the subscriber sees upstream's cache events with
+    // the looked-up local part, and none carries a key account's attendee.
+    let lookups = [
+        traced_as(EventType::Store(StoreEvent::CacheHit)),
+        traced_as(EventType::Store(StoreEvent::CacheMiss)),
+    ]
+    .join("\n");
+    assert!(
+        lookups.contains(LOOKUP_AUTH_CANARY),
+        "no login lookup trace captured: {lookups}"
+    );
+    assert!(
+        !all.contains(LOOKUP_LOCAL_CANARY),
+        "a key account's local attendee traced: {all}"
+    );
+    assert!(
+        !all.contains(LOOKUP_DOMAIN_CANARY),
+        "a key account's external attendee domain traced: {all}"
+    );
+    // Custom sub-addressing: the subscriber sees upstream's evaluation
+    // result, and none carries a key account's attendee.
+    let eval_results = traced_as(EventType::Eval(EvalEvent::Result));
+    assert!(
+        eval_results.contains(SUBADDR_AUTH_CANARY),
+        "no sub-addressing evaluation trace captured: {eval_results}"
+    );
+    assert!(
+        !all.contains(SUBADDR_CANARY),
+        "a key account's sub-addressed attendee traced: {all}"
+    );
+    assert!(
+        !all.contains(SUBADDR_DOMAIN_CANARY),
+        "a key account's sub-addressing domain traced: {all}"
     );
 
     test.wait_for_tasks().await;
@@ -742,4 +940,13 @@ pub async fn test(test: &mut TestServer) {
         .request("DELETE", plain_cal, "")
         .await
         .with_status(StatusCode::NO_CONTENT);
+    admin
+        .registry_destroy(ObjectType::Account, [sub_user_id])
+        .await
+        .assert_destroyed(&[sub_user_id]);
+    admin
+        .registry_destroy(ObjectType::Domain, [subaddr_domain_id])
+        .await
+        .assert_destroyed(&[subaddr_domain_id]);
+    test.wait_for_tasks().await;
 }

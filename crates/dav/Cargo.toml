@@ -26,7 +26,7 @@ chrono = "0.4.45"
 [dev-dependencies]
 
 [features]
-test_mode = []
+test_mode = ["common/test_mode"]
 dev_mode = []
 enterprise = []
 

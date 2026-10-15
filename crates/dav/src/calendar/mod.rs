@@ -15,13 +15,20 @@ pub mod scheduling;
 pub mod update;
 
 use crate::{DavError, DavErrorCondition};
-use common::{DavResources, Server};
+use common::{
+    DavResources, Server,
+    za::lease::{ZaUidLease, ZaUidLeaseGuard},
+};
 use dav_proto::schema::{
     property::{CalDavProperty, CalendarData, DavProperty, WebDavProperty},
     response::CalCondition,
 };
-use groupware::scheduling::ItipError;
+use groupware::{calendar::CalendarEvent, scheduling::ItipError};
 use hyper::StatusCode;
+use store::{
+    ValueKey,
+    write::{AlignedBytes, Archive, BatchBuilder},
+};
 use trc::AddContext;
 use types::{collection::Collection, field::CalendarEventField};
 
@@ -118,6 +125,150 @@ pub(crate) async fn assert_is_unique_uid(
     }
 
     Ok(())
+}
+
+/// Invitations spec 5.1, 6.3 step 1: takes the UID creation lease for a key
+/// account's PUT create, then checks the UID against current archives
+/// (`za_assert_is_unique_uid`) while holding it. A lease that stays held
+/// through the retries (two creators of one UID in one account within a
+/// second) answers 503 with a trace; a hit answers `NoUidConflict` after the
+/// lease is released.
+pub(crate) async fn za_take_uid_lease(
+    server: &Server,
+    resources: &DavResources,
+    account_id: u32,
+    calendar_id: u32,
+    uid: &str,
+) -> crate::Result<ZaUidLeaseGuard> {
+    let Some(lease) = ZaUidLease::acquire(server.store(), account_id, uid)
+        .await
+        .caused_by(trc::location!())?
+    else {
+        trc::event!(
+            Store(trc::StoreEvent::AssertValueFailed),
+            AccountId = account_id,
+            Details = "zero-access: UID creation lease busy",
+        );
+        return Err(DavError::Code(StatusCode::SERVICE_UNAVAILABLE));
+    };
+    let lease = ZaUidLeaseGuard::new(server.store().clone(), lease);
+    if let Err(err) = za_assert_is_unique_uid(server, resources, account_id, calendar_id, uid).await
+    {
+        lease.release().await;
+        return Err(err);
+    }
+    Ok(lease)
+}
+
+/// Invitations spec 5.1: the archive-based counterpart of
+/// `assert_is_unique_uid` for a key account's create, run under the
+/// creation lease. The handler's resource snapshot can predate another
+/// creator's commit, so this reads the fresh UID-index hits and each hit's
+/// current archive, and refuses the UID when a stored copy names the target
+/// calendar (upstream's rule: a UID is unique within one calendar). The
+/// snapshot only formats the href.
+pub(crate) async fn za_assert_is_unique_uid(
+    server: &Server,
+    resources: &DavResources,
+    account_id: u32,
+    calendar_id: u32,
+    uid: &str,
+) -> crate::Result<()> {
+    let hits = server
+        .document_ids_matching(
+            account_id,
+            Collection::CalendarEvent,
+            CalendarEventField::Uid,
+            uid.as_bytes(),
+        )
+        .await
+        .caused_by(trc::location!())?;
+    for document_id in hits {
+        let Some(stored) = server
+            .store()
+            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                account_id,
+                Collection::CalendarEvent,
+                document_id,
+            ))
+            .await
+            .caused_by(trc::location!())?
+        else {
+            continue;
+        };
+        let event = stored
+            .unarchive::<CalendarEvent>()
+            .caused_by(trc::location!())?;
+        if let Some(name) = event
+            .names
+            .iter()
+            .find(|name| name.parent_id.to_native() == calendar_id)
+        {
+            let href = resources
+                .container_resource_path_by_id(calendar_id)
+                .map(|calendar| {
+                    resources.format_item(&format!("{}/{}", calendar.path(), name.name))
+                })
+                .unwrap_or_default();
+            return Err(DavError::Condition(DavErrorCondition::new(
+                StatusCode::PRECONDITION_FAILED,
+                CalCondition::NoUidConflict(href.into()),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Invitations spec 6.3 steps 3-4: commits a key account's create batch,
+/// which carries the lease's fenced-commit assertion, then releases the
+/// lease. If the lease was taken over while the request ran, the commit
+/// loses its assertion: the request takes the lease again and re-checks
+/// current archives (`NoUidConflict` on a hit), and otherwise answers 503 so
+/// the client resends.
+pub(crate) async fn za_commit_create(
+    server: &Server,
+    resources: &DavResources,
+    batch: BatchBuilder,
+    lease: ZaUidLeaseGuard,
+    account_id: u32,
+    calendar_id: u32,
+    uid: &str,
+) -> crate::Result<()> {
+    #[cfg(feature = "test_mode")]
+    if common::za::test_hooks::take_commit_fail(account_id) {
+        lease.release().await;
+        return Err(trc::StoreEvent::UnexpectedError
+            .into_err()
+            .details("zero-access test hook: sender commit failure")
+            .caused_by(trc::location!())
+            .into());
+    }
+    match server.commit_batch(batch).await {
+        Ok(_) => {
+            lease.release().await;
+            Ok(())
+        }
+        Err(err) if err.is_assertion_failure() => {
+            // Traced first, so a busy lease or a 412 from the retake does not
+            // hide that the fence was lost.
+            trc::event!(
+                Store(trc::StoreEvent::AssertValueFailed),
+                AccountId = account_id,
+                Details = "zero-access: UID creation lease lost before the commit",
+            );
+            lease.abandon();
+            let retry = za_take_uid_lease(server, resources, account_id, calendar_id, uid).await?;
+            retry.release().await;
+            // Reached only when another creator took the lease and did not
+            // store the UID in this calendar (a PUT into another calendar, or
+            // plan 10's drain failing).
+            Err(DavError::Code(StatusCode::SERVICE_UNAVAILABLE))
+        }
+        Err(err) => {
+            lease.release().await;
+            Err(err.caused_by(trc::location!()).into())
+        }
+    }
 }
 
 pub(crate) trait ItipPrecondition {

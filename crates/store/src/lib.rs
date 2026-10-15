@@ -125,6 +125,14 @@ pub const SUBSPACE_SEARCH_INDEX: u8 = b'z';
 pub const SUBSPACE_DELETED_ITEMS: u8 = b'j';
 pub const SUBSPACE_SPAM_SAMPLES: u8 = b'w';
 
+/// Zero-access fork: the first byte of the UID creation lease keys
+/// (`common::KV_LOCK_ZA_UID`, `common::za::lease`) inside the in-memory
+/// subspace, not a subspace byte. `purge_in_memory_store` skips keys that
+/// start with it; a key written without a prefix byte (expression and
+/// Sieve `key_set`) that happens to start with 27 is skipped too, as
+/// upstream's own prefixes 0-26 are ambiguous in the same way.
+pub const ZA_UID_LEASE_PREFIX: u8 = 27;
+
 // TODO: Remove in v1.0
 pub const LEGACY_SUBSPACE_BITMAP_TEXT: u8 = b'v';
 pub const LEGACY_SUBSPACE_BITMAP_TAG: u8 = b'c';

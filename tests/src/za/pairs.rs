@@ -36,6 +36,16 @@ const EVENT: &str = concat!(
     "END:VEVENT\r\nEND:VCALENDAR\r\n"
 );
 
+/// `EVENT` without attendees: upstream's builders make no message for it, so
+/// no rewrite hands out tokens (invitations spec 3.3, 5.1).
+const EVENT_NO_ATTENDEES: &str = concat!(
+    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\nBEGIN:VEVENT\r\n",
+    "UID:za-pairs-1\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990101T100000Z\r\n",
+    "DTEND:20990101T110000Z\r\nSEQUENCE:0\r\nSUMMARY:pairs-canary\r\n",
+    "ORGANIZER:mailto:key1@example.com\r\n",
+    "END:VEVENT\r\nEND:VCALENDAR\r\n"
+);
+
 /// The pairs in the stored event's bundle, opened as the product opens them.
 async fn stored_pairs(
     test: &TestServer,
@@ -85,8 +95,11 @@ pub async fn test(test: &mut TestServer) {
         "{body}"
     );
 
-    // An alarm-only PUT builds no iTIP message; the bundle is rebuilt from
-    // the view's fields and the stored pairs.
+    // The planted event has no schedule tag, so under `SendSealed` this
+    // alarm-only PUT runs `itip_create` and builds REQUESTs to pair-a and
+    // pair-b, which the fan-out marks 5.3 (not internal). The union keeps
+    // the stored pairs, so the bundle still holds both. The module's final
+    // DELETEs build CANCELs that the fan-out does not attempt.
     let with_alarm = EVENT.replace(
         "END:VEVENT",
         "BEGIN:VALARM\r\nTRIGGER:-PT15M\r\nACTION:DISPLAY\r\nDESCRIPTION:pairs-alarm\r\nEND:VALARM\r\nEND:VEVENT",
@@ -129,9 +142,10 @@ pub async fn test(test: &mut TestServer) {
     // Release 1 spec 7.3 and 8.1: events without pairs take the same
     // rewrites. A release 1 event (its PROPPATCH writes a format 1 bundle)
     // keeps its display name through a PUT; a legacy plaintext event is
-    // sealed by its PUT. Neither gains pairs.
+    // sealed by its PUT. Neither gains pairs. They carry no attendee: with
+    // attendees, the fan-out hands out tokens (invitations spec 3.3).
     let r1 = "/dav/cal/key1%40example.com/default/pairs-r1.ics";
-    let r1_body = EVENT.replace("za-pairs-1", "za-pairs-r1");
+    let r1_body = EVENT_NO_ATTENDEES.replace("za-pairs-1", "za-pairs-r1");
     client
         .request_with_headers("PUT", r1, [CONTENT_TYPE], r1_body.clone())
         .await
@@ -162,7 +176,7 @@ pub async fn test(test: &mut TestServer) {
         .with_values(["pairs-r1-name"]);
 
     let legacy = "/dav/cal/key1%40example.com/default/pairs-legacy.ics";
-    let legacy_body = EVENT.replace("za-pairs-1", "za-pairs-legacy");
+    let legacy_body = EVENT_NO_ATTENDEES.replace("za-pairs-1", "za-pairs-legacy");
     plant_event(test, id, "default", "pairs-legacy.ics", &legacy_body, None).await;
     client
         .request_with_headers(

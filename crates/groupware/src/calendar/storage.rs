@@ -11,7 +11,10 @@ use super::{
 use crate::{
     DavResourceName, DestroyArchive, RFC_3986,
     calendar::{
-        ArchivedCalendarEventNotification, CalendarEventNotification, alarm::CalendarAlarmType,
+        ArchivedCalendarEventNotification, CalendarEventNotification,
+        alarm::CalendarAlarmType,
+        fanout::ZaDeleteMessage,
+        seal::{seal_error, unseal_event_pairs},
     },
     scheduling::{ItipMessages, event_cancel::itip_cancel},
 };
@@ -39,6 +42,7 @@ use types::{
     field::CalendarNotificationField,
     id::Id,
 };
+use vault::session::SessionKeys;
 
 pub trait ItipAutoExpunge: Sync + Send {
     fn itip_ids(&self, account_id: u32) -> impl Future<Output = trc::Result<RoaringBitmap>> + Send;
@@ -334,8 +338,40 @@ impl DestroyArchive<Archive<&ArchivedCalendar>> {
         send_itip: bool,
         batch: &mut BatchBuilder,
     ) -> trc::Result<()> {
+        self.delete_with_events_za(
+            server,
+            account_info,
+            account_id,
+            document_id,
+            children_ids,
+            delete_path,
+            send_itip,
+            None,
+            batch,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// `delete_with_events`. With `za_keys` (a key account, invitations
+    /// spec 5.5) each event's CANCEL is built from its unsealed tree and
+    /// returned for the fan-out instead of queued.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn delete_with_events_za(
+        self,
+        server: &Server,
+        account_info: &AccountInfo,
+        account_id: u32,
+        document_id: u32,
+        children_ids: Vec<u32>,
+        delete_path: Option<String>,
+        send_itip: bool,
+        za_keys: Option<&SessionKeys>,
+        batch: &mut BatchBuilder,
+    ) -> trc::Result<Vec<ZaDeleteMessage>> {
         // Process deletions
         let calendar_id = document_id;
+        let mut za_messages = Vec::new();
         for document_id in children_ids {
             if let Some(event_) = server
                 .store()
@@ -346,20 +382,23 @@ impl DestroyArchive<Archive<&ArchivedCalendar>> {
                 ))
                 .await?
             {
-                DestroyArchive(
-                    event_
-                        .to_unarchived::<CalendarEvent>()
-                        .caused_by(trc::location!())?,
-                )
-                .delete(
-                    account_info,
-                    account_id,
-                    document_id,
-                    calendar_id,
-                    None,
-                    send_itip,
-                    batch,
-                )?;
+                za_messages.extend(
+                    DestroyArchive(
+                        event_
+                            .to_unarchived::<CalendarEvent>()
+                            .caused_by(trc::location!())?,
+                    )
+                    .delete_za(
+                        account_info,
+                        account_id,
+                        document_id,
+                        calendar_id,
+                        None,
+                        send_itip,
+                        za_keys,
+                        batch,
+                    )?,
+                );
             }
         }
 
@@ -369,7 +408,8 @@ impl DestroyArchive<Archive<&ArchivedCalendar>> {
             document_id,
             delete_path,
             batch,
-        )
+        )?;
+        Ok(za_messages)
     }
 
     pub fn delete(
@@ -413,6 +453,34 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
         send_itip: bool,
         batch: &mut BatchBuilder,
     ) -> trc::Result<()> {
+        self.delete_za(
+            account_info,
+            account_id,
+            document_id,
+            calendar_id,
+            delete_path,
+            send_itip,
+            None,
+            batch,
+        )
+        .map(|_| ())
+    }
+
+    /// `delete`. With `za_keys`, the CANCEL `delete_all_za` builds is
+    /// returned instead of queued.
+    #[allow(clippy::too_many_arguments)]
+    pub fn delete_za(
+        self,
+        account_info: &AccountInfo,
+        account_id: u32,
+        document_id: u32,
+        calendar_id: u32,
+        delete_path: Option<String>,
+        send_itip: bool,
+        za_keys: Option<&SessionKeys>,
+        batch: &mut BatchBuilder,
+    ) -> trc::Result<Option<ZaDeleteMessage>> {
+        let mut za_message = None;
         if let Some(delete_idx) = self
             .0
             .inner
@@ -439,7 +507,14 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
                     )
                     .caused_by(trc::location!())?;
             } else {
-                self.delete_all(account_info, account_id, document_id, send_itip, batch)?;
+                za_message = self.delete_all_za(
+                    account_info,
+                    account_id,
+                    document_id,
+                    send_itip,
+                    za_keys,
+                    batch,
+                )?;
             }
 
             if let Some(delete_path) = delete_path {
@@ -449,7 +524,7 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
             batch.commit_point();
         }
 
-        Ok(())
+        Ok(za_message)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -461,7 +536,33 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
         send_itip: bool,
         batch: &mut BatchBuilder,
     ) -> trc::Result<()> {
+        self.delete_all_za(
+            account_info,
+            account_id,
+            document_id,
+            send_itip,
+            None,
+            batch,
+        )
+        .map(|_| ())
+    }
+
+    /// `delete_all`. With `za_keys` (a key account, invitations spec 5.5)
+    /// the stored tree is unsealed before `itip_cancel`, and the CANCEL (or
+    /// an attendee's declined REPLY) is returned with the stored pairs for
+    /// the fan-out instead of queued.
+    #[allow(clippy::too_many_arguments)]
+    pub fn delete_all_za(
+        self,
+        account_info: &AccountInfo,
+        account_id: u32,
+        document_id: u32,
+        send_itip: bool,
+        za_keys: Option<&SessionKeys>,
+        batch: &mut BatchBuilder,
+    ) -> trc::Result<Option<ZaDeleteMessage>> {
         let event = self.0;
+        let mut za_message = None;
         // Delete event
         batch
             .with_account_id(account_id)
@@ -479,14 +580,27 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
             && event.inner.schedule_tag.is_some()
             && event.inner.data.event_range_end() > now
         {
-            let event = event
+            let mut event = event
                 .deserialize::<CalendarEvent>()
                 .caused_by(trc::location!())?;
+            let pairs = match za_keys {
+                Some(keys) => unseal_event_pairs(&mut event, keys, account_id)
+                    .map_err(|err| seal_error(err, account_id, document_id))?,
+                None => None,
+            };
 
             if let Ok(messages) = itip_cancel(&event.data.event, account_info.addresses(), true) {
-                ItipMessages::new(vec![messages])
-                    .queue(batch)
-                    .caused_by(trc::location!())?;
+                if za_keys.is_some() {
+                    za_message = Some(ZaDeleteMessage {
+                        message: messages,
+                        pairs,
+                        event: event.data.event,
+                    });
+                } else {
+                    ItipMessages::new(vec![messages])
+                        .queue(batch)
+                        .caused_by(trc::location!())?;
+                }
             }
         }
 
@@ -498,7 +612,7 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
             )
             .caused_by(trc::location!())?;
 
-        Ok(())
+        Ok(za_message)
     }
 }
 

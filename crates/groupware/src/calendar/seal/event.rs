@@ -284,6 +284,32 @@ pub fn unseal_event(
     unseal_tree(&mut event.data.event, &dek, account_id, &uid)
 }
 
+/// `unseal_event`, also returning the token pairs of the bundle (invitations
+/// spec 3.3, 5.5): a key account's DELETE builds its CANCEL from the
+/// unsealed tree and hands the stored pairs to the fan-out, with one open of
+/// the envelope. `None` for a plaintext event (left unchanged), an event
+/// without a bundle, and a format 1 bundle.
+///
+/// On `Err` the event is partly modified and must be discarded.
+pub fn unseal_event_pairs(
+    event: &mut CalendarEvent,
+    keys: &SessionKeys,
+    account_id: u32,
+) -> Result<Option<TokenPairs>, SealError> {
+    if !is_sealed(event) {
+        return Ok(None);
+    }
+    let (dek, uid, extra) = open_root(event, keys, account_id)?;
+    let mut pairs = None;
+    if let Some(extra) = extra {
+        event.display_name = extra.display_name;
+        event.dead_properties = extra.dead_properties;
+        pairs = extra.pairs;
+    }
+    unseal_tree(&mut event.data.event, &dek, account_id, &uid)?;
+    Ok(pairs)
+}
+
 /// Invitations spec 3.3: the token pairs of a stored event, opening only its
 /// key envelope and `X-ZA-EXTRA` bundle. `None` for a plaintext event, an
 /// event without a bundle, and a format 1 bundle.
@@ -798,6 +824,35 @@ mod tests {
                 9
             )
             .err(),
+            Some(SealError::Aead)
+        );
+    }
+
+    #[test]
+    fn unseal_with_pairs_returns_the_bundle_pairs_once() {
+        let keys = keys();
+        let original = event();
+        let mut sealed = original.clone();
+        seal_event(&mut sealed, &keys, 9, Some(&two_pairs())).unwrap();
+        let mut opened = sealed.clone();
+        let pairs = unseal_event_pairs(&mut opened, &keys, 9)
+            .unwrap()
+            .expect("pairs");
+        assert_eq!(opened, original);
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs.matches("a@example.com", &[1; TOKEN_LEN]));
+        // A format 1 bundle and a plaintext event: no pairs; the plaintext
+        // event is left as it is.
+        let mut v1 = original.clone();
+        seal_event(&mut v1, &keys, 9, None).unwrap();
+        assert!(unseal_event_pairs(&mut v1, &keys, 9).unwrap().is_none());
+        assert_eq!(v1, original);
+        let mut plain = original.clone();
+        assert!(unseal_event_pairs(&mut plain, &keys, 9).unwrap().is_none());
+        assert_eq!(plain, original);
+        // Keys of another session do not open it.
+        assert_eq!(
+            unseal_event_pairs(&mut sealed, &SessionKeys::new(9, 1, Secret::random()), 9).err(),
             Some(SealError::Aead)
         );
     }

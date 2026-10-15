@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::assert_is_unique_uid;
+use super::{assert_is_unique_uid, za_commit_create, za_take_uid_lease};
 use crate::{
     DavError, DavErrorCondition, DavMethod,
     calendar::ItipPrecondition,
@@ -31,6 +31,7 @@ use groupware::{
     cache::GroupwareCache,
     calendar::{
         CalendarEvent, CalendarEventData,
+        fanout::{ZaFanOut, za_set_schedule_status},
         itip::ItipSendStatus,
         seal::{event_token_pairs, seal_error, seal_event},
     },
@@ -86,6 +87,8 @@ impl CalendarUpdateRequestHandler for Server {
             )
             .await
             .caused_by(trc::location!())?;
+        #[cfg(feature = "test_mode")]
+        common::za::test_hooks::put_pause_point(account_id).await;
         let resource_name = fix_percent_encoding(
             resource
                 .resource
@@ -238,13 +241,15 @@ impl CalendarUpdateRequestHandler for Server {
 
             // Scheduling
             let mut itip_messages = None;
+            let mut za_messages = None;
             let itip_status = ItipSendStatus::resolve(
                 self,
                 access_token,
                 &account_info,
                 new_event.data.event_range_end(),
+                za_keys.is_some(),
             );
-            if itip_status.is_send() {
+            if itip_status.builds_messages() {
                 let result = if new_event.schedule_tag.is_some() {
                     itip_update(
                         &mut new_event.data.event,
@@ -276,7 +281,13 @@ impl CalendarUpdateRequestHandler for Server {
                                 }
                             }
 
-                            itip_messages = Some(ItipMessages::new(messages));
+                            // Invitations spec 5.1: a key account's messages
+                            // go to the fan-out, never to the task queue.
+                            if itip_status.is_send_sealed() {
+                                za_messages = Some(messages);
+                            } else {
+                                itip_messages = Some(ItipMessages::new(messages));
+                            }
                         } else {
                             return Err(DavError::Condition(DavErrorCondition::new(
                                 StatusCode::PRECONDITION_FAILED,
@@ -310,10 +321,7 @@ impl CalendarUpdateRequestHandler for Server {
                 }
 
                 itip_set_unreachable_status(&mut new_event.data.event, account_info.addresses());
-            } else if itip_status != ItipSendStatus::KeyAccount
-                && let Some(reason) = itip_status.reason()
-            {
-                // Spec 9: a key account's refusal is its normal state, not an error.
+            } else if let Some(reason) = itip_status.reason() {
                 trc::event!(
                     Calendar(trc::CalendarEvent::ItipMessageError),
                     AccountId = account_id,
@@ -332,8 +340,19 @@ impl CalendarUpdateRequestHandler for Server {
 
             if let Some(keys) = &za_keys {
                 // Invitations spec 3.3: every rewrite carries the stored pairs.
-                let pairs = event_token_pairs(&event_, keys, account_id)
+                let mut pairs = event_token_pairs(&event_, keys, account_id)
                     .map_err(|err| seal_error(err, account_id, document_id))?;
+                // Spec 5.3-5.4: after every check of the request and
+                // immediately before the sealed commit, the items go out; the
+                // fan-out decides the pairs the bundle keeps.
+                if let Some(messages) = za_messages {
+                    let fan_out = self
+                        .za_fan_out(&account_info, keys, messages, pairs, &new_event.data.event)
+                        .await
+                        .caused_by(trc::location!())?;
+                    za_set_schedule_status(&mut new_event.data.event, &fan_out.statuses);
+                    pairs = fan_out.pairs;
+                }
                 seal_event(&mut new_event, keys, account_id, pairs.as_ref())
                     .map_err(|err| seal_error(err, account_id, document_id))?;
             }
@@ -403,14 +422,27 @@ impl CalendarUpdateRequestHandler for Server {
             .await?;
 
             // Validate ical object
-            assert_is_unique_uid(
-                self,
-                &resources,
-                account_id,
-                parent.document_id(),
-                validate_ical(&ical)?.into(),
-            )
-            .await?;
+            let uid = validate_ical(&ical)?;
+            // Invitations spec 5.1, 6.3: a key account's create holds the UID
+            // creation lease from here through the insert, and checks current
+            // archives instead of the snapshot.
+            let za_lease = if za_keys.is_some() {
+                Some((
+                    za_take_uid_lease(self, &resources, account_id, parent.document_id(), uid)
+                        .await?,
+                    uid.to_string(),
+                ))
+            } else {
+                assert_is_unique_uid(
+                    self,
+                    &resources,
+                    account_id,
+                    parent.document_id(),
+                    uid.into(),
+                )
+                .await?;
+                None
+            };
 
             // Build event
             let mut next_email_alarm = None;
@@ -432,20 +464,28 @@ impl CalendarUpdateRequestHandler for Server {
 
             // Scheduling
             let mut itip_messages = None;
+            let mut za_messages = None;
             let itip_status = ItipSendStatus::resolve(
                 self,
                 access_token,
                 &account_info,
                 event.data.event_range_end(),
+                za_keys.is_some(),
             );
-            if itip_status.is_send() {
+            if itip_status.builds_messages() {
                 match itip_create(&mut event.data.event, account_info.addresses()) {
                     Ok(messages) => {
                         if messages.iter().map(|r| r.to.len()).sum::<usize>()
                             < self.core.groupware.itip_outbound_max_recipients
                         {
                             event.schedule_tag = Some(1);
-                            itip_messages = Some(ItipMessages::new(messages));
+                            // Invitations spec 5.1: a key account's messages
+                            // go to the fan-out, never to the task queue.
+                            if itip_status.is_send_sealed() {
+                                za_messages = Some(messages);
+                            } else {
+                                itip_messages = Some(ItipMessages::new(messages));
+                            }
                         } else {
                             return Err(DavError::Condition(DavErrorCondition::new(
                                 StatusCode::PRECONDITION_FAILED,
@@ -473,10 +513,7 @@ impl CalendarUpdateRequestHandler for Server {
                 }
 
                 itip_set_unreachable_status(&mut event.data.event, account_info.addresses());
-            } else if itip_status != ItipSendStatus::KeyAccount
-                && let Some(reason) = itip_status.reason()
-            {
-                // Spec 9: a key account's refusal is its normal state, not an error.
+            } else if let Some(reason) = itip_status.reason() {
                 trc::event!(
                     Calendar(trc::CalendarEvent::ItipMessageError),
                     AccountId = account_id,
@@ -494,12 +531,28 @@ impl CalendarUpdateRequestHandler for Server {
             }
 
             if let Some(keys) = &za_keys {
-                seal_event(&mut event, keys, account_id, None)
+                // Spec 5.3-5.4: after every check, immediately before the
+                // sealed commit; the fan-out hands out the attendees' tokens.
+                let mut pairs = None;
+                if let Some(messages) = za_messages {
+                    let fan_out = self
+                        .za_fan_out(&account_info, keys, messages, None, &event.data.event)
+                        .await
+                        .caused_by(trc::location!())?;
+                    za_set_schedule_status(&mut event.data.event, &fan_out.statuses);
+                    pairs = fan_out.pairs;
+                }
+                seal_event(&mut event, keys, account_id, pairs.as_ref())
                     .map_err(|err| seal_error(err, account_id, u32::MAX))?;
             }
 
             // Prepare write batch
             let mut batch = BatchBuilder::new();
+            // Spec 6.3 step 3: the insert is fenced on the lease, in the same
+            // transaction (ahead of the insert, so no commit point splits them).
+            if let Some((lease, _)) = &za_lease {
+                lease.lease().assert_in(&mut batch);
+            }
             let document_id = self
                 .store()
                 .assign_document_ids(account_id, Collection::CalendarEvent, 1)
@@ -521,7 +574,20 @@ impl CalendarUpdateRequestHandler for Server {
                     .queue(&mut batch)
                     .caused_by(trc::location!())?;
             }
-            self.commit_batch(batch).await.caused_by(trc::location!())?;
+            if let Some((lease, uid)) = za_lease {
+                za_commit_create(
+                    self,
+                    &resources,
+                    batch,
+                    lease,
+                    account_id,
+                    parent.document_id(),
+                    &uid,
+                )
+                .await?;
+            } else {
+                self.commit_batch(batch).await.caused_by(trc::location!())?;
+            }
             self.notify_task_queue();
 
             Ok(HttpResponse::new(StatusCode::CREATED)

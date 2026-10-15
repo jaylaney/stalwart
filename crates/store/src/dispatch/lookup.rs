@@ -11,6 +11,7 @@ use trc::AddContext;
 #[allow(unused_imports)]
 use crate::{
     Deserialize, InMemoryStore, IterateParams, QueryResult, Store, U64_LEN, Value, ValueKey,
+    ZA_UID_LEASE_PREFIX,
     write::{
         BatchBuilder, Operation, ValueClass, ValueOp,
         key::{DeserializeBigEndian, KeySerializer},
@@ -422,6 +423,11 @@ impl InMemoryStore {
                 let mut expired_counters = Vec::new();
                 store
                     .iterate(IterateParams::new(from_key, to_key), |key, value| {
+                        // Zero-access fork: the unconditional clear races a replacement
+                        // lease; plan 10's sweep is to clear these with an assertion.
+                        if key.first() == Some(&ZA_UID_LEASE_PREFIX) {
+                            return Ok(true);
+                        }
                         let expiry = value.deserialize_be_u64(0).caused_by(trc::location!())?;
                         if expiry == 0 {
                             if value

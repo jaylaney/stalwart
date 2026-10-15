@@ -60,12 +60,16 @@ pub struct ItipRsvpUrl(String);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItipSendStatus {
     Send,
+    /// Invitations spec 5.1: a key account under upstream's `Send`
+    /// preconditions. Upstream's builders run on the plaintext tree; the
+    /// messages go to the fan-out (`calendar::fanout`), never to the task
+    /// queue.
+    SendSealed,
     NotRequested,
     SchedulingDisabled,
     NoCalendarAddress,
     NoPermission,
     EventInPast,
-    KeyAccount,
 }
 
 pub trait ItipIngest: Sync + Send {
@@ -1062,22 +1066,27 @@ fn build_rsvp_invitation(
 }
 
 impl ItipSendStatus {
+    /// `owner_is_key`: whether the calendar's owner is a key account. The
+    /// sending state follows the owner, not the authenticated account
+    /// (invitations spec 5.1): a key account writing into a plain account's
+    /// shared calendar takes upstream's `Send`.
     pub fn resolve(
         server: &Server,
         access_token: &AccessToken,
         account_info: &AccountInfo,
         event_range_end: i64,
+        owner_is_key: bool,
     ) -> Self {
         if !server.core.groupware.itip_enabled {
             Self::SchedulingDisabled
         } else if account_info.addresses().is_empty() {
             Self::NoCalendarAddress
-        } else if account_info.account().is_key_account() {
-            Self::KeyAccount
         } else if !access_token.has_permission(Permission::CalendarSchedulingSend) {
             Self::NoPermission
         } else if event_range_end <= now() as i64 {
             Self::EventInPast
+        } else if owner_is_key {
+            Self::SendSealed
         } else {
             Self::Send
         }
@@ -1088,20 +1097,29 @@ impl ItipSendStatus {
         matches!(self, Self::Send)
     }
 
+    /// Whether upstream's builders run: `Send`, and `SendSealed` for a
+    /// key-owned calendar (invitations spec 5.1).
+    #[inline(always)]
+    pub fn builds_messages(&self) -> bool {
+        matches!(self, Self::Send | Self::SendSealed)
+    }
+
+    #[inline(always)]
+    pub fn is_send_sealed(&self) -> bool {
+        matches!(self, Self::SendSealed)
+    }
+
     #[inline(always)]
     pub fn is_denied(&self) -> bool {
         matches!(
             self,
-            Self::SchedulingDisabled
-                | Self::NoCalendarAddress
-                | Self::NoPermission
-                | Self::KeyAccount
+            Self::SchedulingDisabled | Self::NoCalendarAddress | Self::NoPermission
         )
     }
 
     pub fn reason(&self) -> Option<&'static str> {
         match self {
-            Self::Send | Self::NotRequested => None,
+            Self::Send | Self::SendSealed | Self::NotRequested => None,
             Self::SchedulingDisabled => Some("Calendar scheduling is disabled on this server."),
             Self::NoCalendarAddress => {
                 Some("This account has no calendar address to send scheduling messages from.")
@@ -1111,9 +1129,6 @@ impl ItipSendStatus {
             }
             Self::EventInPast => {
                 Some("No scheduling messages were sent because the event lies in the past.")
-            }
-            Self::KeyAccount => {
-                Some("Scheduling is not available for zero-access accounts in this release.")
             }
         }
     }

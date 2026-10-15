@@ -9,12 +9,16 @@
 use super::{TEST_ICAL_1, TEST_ICAL_2};
 use crate::utils::{
     server::TestServer,
-    za::{mail_count, plant_event, queued_recipients, wait_for_delivery},
+    za::{
+        envelope_wrap, hold_task_consumer, inbox_ids, item_method, itip_tasks_for, mail_count,
+        new_inbox_items, plant_event, queued_recipients, schedule_statuses, wait_for_delivery,
+    },
 };
 use calcard::common::timezone::Tz;
+use calcard::icalendar::{ICalendarMethod, ICalendarProperty};
 use email::cache::MessageCacheFetch;
 use groupware::{
-    calendar::CalendarEvent,
+    calendar::{CalendarEvent, EVENT_NOTIFICATION_ZA_PENDING},
     scheduling::{
         ItipTime, ItipValue,
         format::{DateStyle, TextFormatter},
@@ -353,7 +357,12 @@ pub async fn scheduling(test: &TestServer) {
     let john = test.account("john@example.com").webdav_client();
     let jane = test.account("jane@example.com").webdav_client();
     let jane_mail = mail_count(test, jane.account_id).await;
+    let jane_items = inbox_ids(test, jane.account_id).await;
     let invite = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\nUID:za-sched-1\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990102T090000Z\r\nDTEND:20990102T100000Z\r\nSUMMARY:sched-canary\r\nORGANIZER:mailto:john@example.com\r\nATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:jane@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    // Invitations spec 5: john and jane are key accounts, so john's PUT
+    // delivers a sealed pending item into jane's inbox instead of queueing
+    // mail. The consumer is held so the task-queue read cannot miss a task.
+    let held = hold_task_consumer(test).await;
     let response = john
         .request_with_headers(
             "PUT",
@@ -363,13 +372,45 @@ pub async fn scheduling(test: &TestServer) {
         )
         .await
         .with_status(StatusCode::CREATED);
-    assert!(response.headers.get("schedule-tag").is_none());
+    // Upstream asserts the organizer's schedule tag; it holds in key mode
+    // too (spec 5.1).
+    assert!(
+        response.headers.get("schedule-tag").is_some(),
+        "{:?}",
+        response.headers
+    );
+    assert_eq!(
+        itip_tasks_for(test, john.account_id).await,
+        0,
+        "a CalendarItipMessage task was queued for john"
+    );
+    drop(held);
     wait_for_delivery(test).await;
-    // Sender side: no iMIP email reached jane's mailbox. Her scheduling inbox
-    // would stay empty even if john's send gate failed, because jane is a key
-    // account whose own ingest gate drops invitations; the mailbox is what
-    // shows john sent nothing.
+    // No iMIP email reached jane's mailbox.
     assert_eq!(mail_count(test, jane.account_id).await, jane_mail);
+    // Store level: exactly one new item in jane's inbox, pending and sealed
+    // to her public key.
+    let items = new_inbox_items(test, jane.account_id, &jane_items).await;
+    assert_eq!(
+        items.len(),
+        1,
+        "jane's inbox holds {} new items",
+        items.len()
+    );
+    let (_, item) = &items[0];
+    assert_ne!(
+        item.flags & EVENT_NOTIFICATION_ZA_PENDING,
+        0,
+        "the item is pending"
+    );
+    assert_eq!(
+        envelope_wrap(&item.event),
+        Some(2),
+        "the item has a pk envelope"
+    );
+    assert!(!item.event.to_string().contains("sched-canary"));
+    // Clients do not see pending items (spec 6.6); hrefs() includes the
+    // collection itself, so one href is an inbox that lists nothing.
     let inbox = jane
         .request_with_headers(
             "PROPFIND",
@@ -379,33 +420,68 @@ pub async fn scheduling(test: &TestServer) {
         )
         .await
         .with_status(StatusCode::MULTI_STATUS);
-    // hrefs() includes the collection itself, so one href is an empty inbox
-    // (jane's own ingest gate).
     assert_eq!(inbox.hrefs().len(), 1, "{:?}", inbox.hrefs());
-    // The event is readable by its owner with attendees intact.
+    // The event is readable by its owner with attendees intact, and jane's
+    // ATTENDEE says delivered.
     let body = john
         .request("GET", "/dav/cal/john@example.com/default/s.ics", "")
         .await
         .with_status(StatusCode::OK)
         .body
         .unwrap();
-    assert!(body.contains("mailto:jane@example.com") && !body.contains("X-ZA-"));
-    // A CANCEL on DELETE needs a stored schedule tag (`delete_all`); key
-    // accounts never get one. The DELETE gate itself is tested with a
-    // planted event in `za::gating::test_scheduling`.
+    // Unfolded (RFC 5545 3.1): the SCHEDULE-STATUS lengthens jane's
+    // ATTENDEE line past the fold width.
+    let unfolded = body.replace("\r\n ", "");
+    assert!(
+        unfolded.contains("mailto:jane@example.com") && !unfolded.contains("X-ZA-"),
+        "{body}"
+    );
+    assert_eq!(
+        schedule_statuses(&body, ICalendarProperty::Attendee, "jane@example.com"),
+        ["1.2"]
+    );
     let (archive, _) = crate::za::dav_seal::raw_event(test, john.account_id, "default/s.ics").await;
     assert!(
         archive
             .unarchive::<CalendarEvent>()
             .unwrap()
             .schedule_tag
-            .is_none()
+            .is_some()
     );
+    // john's DELETE cancels: a second pending item, a CANCEL (METHOD is
+    // visible on the sealed root), and still no mail (spec 5.5). The
+    // DELETE's task-queue check lives in the za suite's `test_task_queue`.
     john.request("DELETE", "/dav/cal/john@example.com/default/s.ics", "")
         .await
         .with_status(StatusCode::NO_CONTENT);
     wait_for_delivery(test).await;
     assert_eq!(mail_count(test, jane.account_id).await, jane_mail);
+    let items = new_inbox_items(test, jane.account_id, &jane_items).await;
+    assert_eq!(
+        items.len(),
+        2,
+        "jane's inbox holds the REQUEST and the CANCEL"
+    );
+    assert_eq!(
+        item_method(&items[1].1.event),
+        Some(ICalendarMethod::Cancel)
+    );
+    assert_eq!(envelope_wrap(&items[1].1.event), Some(2));
+    // Pending items are deleted by href, as any inbox item.
+    let ids: Vec<u32> = inbox_ids(test, jane.account_id)
+        .await
+        .into_iter()
+        .filter(|id| !jane_items.contains(id))
+        .collect();
+    for id in ids {
+        jane.request(
+            "DELETE",
+            &format!("/dav/itip/jane@example.com/inbox/{id}.ics"),
+            "",
+        )
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    }
     john.delete_default_containers().await;
     jane.delete_default_containers().await;
     // Counting jane's mail created her default mailboxes.

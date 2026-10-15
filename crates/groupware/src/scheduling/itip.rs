@@ -77,6 +77,16 @@ pub fn itip_assign_organizer(ical: &mut ICalendar, organizer_address: &str) -> b
 }
 
 pub(crate) const ITIP_STATUS_INVALID_USER: &str = "3.7";
+/// Invitations spec 13: the fan-out wrote the recipient's pending item
+/// (RFC 6638 "delivered"; upstream's iMIP task sets no status for local
+/// delivery, so there is no upstream constant to reuse).
+pub const ITIP_STATUS_DELIVERED: &str = "1.2";
+/// Not attempted: the recipient is not an internal key account, or the
+/// message may not go to it (RFC 6638 "no scheduling support for user").
+pub const ITIP_STATUS_NOT_ATTEMPTED: &str = "5.3";
+/// Delivery failed: the recipient's quota, the inbound size limit or a store
+/// error (RFC 6638 "could not complete delivery").
+pub const ITIP_STATUS_DELIVERY_FAILED: &str = "5.1";
 
 fn itip_is_server_scheduling(entry: &ICalendarEntry) -> bool {
     !entry.params.iter().any(|param| {
