@@ -604,10 +604,10 @@ one more writer and closes the gap for key accounts.)
    value the sweep read, so a lease re-taken in between survives. Without
    the sweep an abandoned lease is storage growth, not a fencing failure: a
    later creator of the same UID replaces the expired value.
-5. **Scope.** The lease covers creation only, from the absence check
-   through the insert. Updates and merges of an existing event are already
-   protected by the assertion on the event's stored archive, which the
-   drain's batch carries. Non-key accounts take no lease: the PUT path's
+5. **Scope.** The lease covers creation, from the absence check through
+   the insert, and the delegating merge's fan-out. Updates and merges of
+   an existing event are already protected by the assertion on the
+   event's stored archive, which the drain's batch carries. Non-key accounts take no lease: the PUT path's
    lease is behind the key-account branch (invariant 9). A merge whose
    fan-out would deliver new items takes the UID lease of the organizer's
    account first, so two sessions of the organizer cannot both fan out.
@@ -625,9 +625,9 @@ one more writer and closes the gap for key accounts.)
 order. It re-reads each item before processing it, and skips one whose
 pending bit is already clear. Each item's batch holds the event write
 (import or merge) and the item rewrite together and asserts the item's
-archive as read (`assert_value`), and the lease when the item imports; the
-event write of a merge carries the index builder's assertion on the
-event's stored archive. A lost assertion aborts the pass, and the next
+archive as read (`assert_value`), and the lease when the item imports or a
+merge fans out; the event write of a merge carries the index builder's
+assertion on the event's stored archive. A lost assertion aborts the pass, and the next
 trigger re-enumerates. A busy creation lease stops the pass at that item;
 later items wait for the next pass, so items for one UID keep their order.
 An async lock on the `SessionKeys` entry keeps to
