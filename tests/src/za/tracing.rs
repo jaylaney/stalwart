@@ -651,12 +651,10 @@ pub async fn test(test: &mut TestServer) {
     // Scheduling traces on both PUT paths, for both accounts.
     put_past_twice(&key_client, key_cal).await;
     put_past_twice(&plain_client, plain_cal).await;
-    // Spec 8: OPTIONS with a wrong credential keeps upstream's header and
-    // is reported like any other authentication failure.
-    // The secret check below relies on this error's text: "Authentication
-    // failed" carries no "basic ". A malformed header would instead report
-    // "Failed to decode Basic auth request." and trip the credential-header
-    // assertion further down.
+    // Invitations spec 8 reopened the OPTIONS gate: OPTIONS takes upstream's
+    // path and is answered before authentication, so a wrong credential on
+    // it yields upstream's header and no authentication failure. Its secret
+    // must still never reach a trace (checked below).
     let response = options_wrong_password(OPTIONS_PROBE_USER).await;
     assert_eq!(response.status().as_u16(), 200);
     let dav = response
@@ -863,13 +861,21 @@ pub async fn test(test: &mut TestServer) {
         all.contains("[redacted]"),
         "redaction marker missing: {all}"
     );
-    // OPTIONS: the failed credential is reported, never its secret.
+    // Positive control for the credential-header assertion above: a failed
+    // login is traced, so the trace did see a wrong Basic credential.
+    // `login_wrong_password` is this module's only `Auth(Failed)` producer
+    // (OPTIONS is answered before authentication). Its error text,
+    // "Authentication failed", carries no "basic "; a malformed header would
+    // instead report "Failed to decode Basic auth request." and trip the
+    // credential-header assertion.
     assert!(
         typed
             .iter()
             .any(|(typ, _)| *typ == EventType::Auth(AuthEvent::Failed)),
-        "OPTIONS authentication failure not reported: {all}"
+        "login authentication failure not reported: {all}"
     );
+    // OPTIONS: the wrong credential never reaches the trace (nor does the
+    // login's, which sends the same secret).
     assert!(
         !all.contains(OPTIONS_WRONG_SECRET),
         "OPTIONS credential traced: {all}"

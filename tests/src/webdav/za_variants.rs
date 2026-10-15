@@ -15,7 +15,7 @@ use crate::utils::{
         schedule_statuses, wait_for_delivery,
     },
 };
-use crate::za::fanout::uid_copies;
+use crate::za::fanout::{stored_sequence, uid_copies};
 use calcard::common::timezone::Tz;
 use calcard::icalendar::{ICalendarMethod, ICalendarProperty};
 use email::cache::MessageCacheFetch;
@@ -492,7 +492,59 @@ pub async fn scheduling(test: &TestServer) {
             .schedule_tag
             .is_some()
     );
-    // john's DELETE cancels: a second item, a CANCEL, still no mail (spec
+    // Update (spec 4.2): john moves the event and renames it. As in the za
+    // suite's drain test, the PUT carries the first PUT's SEQUENCE (none, so
+    // 0) and upstream's organizer path raises it to 1 for the significant change
+    // (a PUT carrying SEQUENCE:1 would be raised to 2). A second item
+    // reaches jane, pending, and still no mail; her next request drains it
+    // into the same copy, which takes the new time, title and SEQUENCE.
+    let moved = invite
+        .replace("DTSTART:20990102T090000Z", "DTSTART:20990103T090000Z")
+        .replace("DTEND:20990102T100000Z", "DTEND:20990103T100000Z")
+        .replace("SUMMARY:sched-canary", "SUMMARY:sched-canary-moved");
+    john.request_with_headers(
+        "PUT",
+        "/dav/cal/john@example.com/default/s.ics",
+        [("content-type", "text/calendar; charset=utf-8")],
+        &moved,
+    )
+    .await
+    .with_status(StatusCode::NO_CONTENT);
+    wait_for_delivery(test).await;
+    assert_eq!(mail_count(test, jane.account_id).await, jane_mail);
+    let items = new_inbox_items(test, jane.account_id, &jane_items).await;
+    assert_eq!(
+        items.len(),
+        2,
+        "jane's inbox holds the REQUEST and the update"
+    );
+    assert_eq!(
+        item_method(&items[1].1.event),
+        Some(ICalendarMethod::Request)
+    );
+    assert_eq!(envelope_wrap(&items[1].1.event), Some(2));
+    assert_eq!(pending_ids(test, jane.account_id).await, [items[1].0]);
+    let updated = jane
+        .request("GET", &copy, "")
+        .await
+        .with_status(StatusCode::OK)
+        .body
+        .unwrap();
+    assert!(
+        updated.contains("DTSTART:20990103T090000Z")
+            && updated.contains("SUMMARY:sched-canary-moved")
+            && !updated.contains("X-ZA-"),
+        "{updated}"
+    );
+    assert_eq!(
+        stored_sequence(&john, "/dav/cal/john@example.com/default/s.ics").await,
+        1
+    );
+    assert_eq!(stored_sequence(&jane, &copy).await, 1);
+    assert!(pending_ids(test, jane.account_id).await.is_empty());
+    assert_eq!(uid_copies(test, jane.account_id, "za-sched-1").await, 1);
+    assert_eq!(copy_href(test, jane.account_id, "za-sched-1").await, copy);
+    // john's DELETE cancels: a third item, a CANCEL, still no mail (spec
     // 5.5); jane's next request drains it and her copy is cancelled (spec
     // 4.3). The DELETE's task-queue check lives in the za suite.
     john.request("DELETE", "/dav/cal/john@example.com/default/s.ics", "")
@@ -503,14 +555,14 @@ pub async fn scheduling(test: &TestServer) {
     let items = new_inbox_items(test, jane.account_id, &jane_items).await;
     assert_eq!(
         items.len(),
-        2,
-        "jane's inbox holds the REQUEST and the CANCEL"
+        3,
+        "jane's inbox holds the REQUEST, the update and the CANCEL"
     );
     assert_eq!(
-        item_method(&items[1].1.event),
+        item_method(&items[2].1.event),
         Some(ICalendarMethod::Cancel)
     );
-    assert_eq!(envelope_wrap(&items[1].1.event), Some(2));
+    assert_eq!(envelope_wrap(&items[2].1.event), Some(2));
     let cancelled = jane
         .request("GET", &copy, "")
         .await
