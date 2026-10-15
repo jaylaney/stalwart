@@ -13,24 +13,31 @@ use super::{
     dav_seal::raw_event,
     fanout::{
         CONTENT_TYPE, KEY1_CAL, NO_REPLY, Party, START_A, START_B, attendee_statuses, invite,
-        stored_pairs, stored_sequence, uid_copies,
+        pair_token, stored_pairs, stored_sequence, uid_copies,
     },
+    uid_lease::put,
 };
 use crate::utils::{
     server::TestServer,
     webdav::DummyWebDavClient,
     za::{
-        PlantedItem, copy_href, envelope_wrap, inbox_ids, inbox_items, item_method, item_partstat,
-        new_inbox_items, pending_ids, plant_inbox_item, trigger_drain, za_uid_leases, za_unlock,
+        HookParked, PlantedItem, copy_href, envelope_wrap, inbox_ids, inbox_items, item_method,
+        item_partstat, new_inbox_items, open_pending_item_as, pending_ids, plant_inbox_item,
+        trigger_drain, wait_for_delivery, za_app_password, za_post, za_uid_leases, za_unlock,
     },
 };
 use ::registry::schema::{prelude::Property, structs::CalendarScheduling};
 use calcard::icalendar::ICalendarMethod;
-use common::za::test_hooks::{self, DRAIN_SKIP_ALL};
+use common::{
+    auth::credential::AppPassword,
+    za::test_hooks::{self, DRAIN_SKIP_ALL},
+};
 use groupware::calendar::{
     CalendarEvent, ChangedBy, EVENT_NOTIFICATION_IS_CHANGE, EVENT_NOTIFICATION_ZA_PENDING,
 };
 use hyper::StatusCode;
+use serde_json::json;
+use std::time::Duration;
 
 /// The suite skips every account's drain (`za_tests` sets `DRAIN_SKIP_ALL`
 /// after setup, so the plan 8 and 9 modules keep reading pending items);
@@ -883,6 +890,569 @@ pub async fn test_adoption(test: &mut TestServer) {
             .with_status(StatusCode::NO_CONTENT);
     }
     for name in ["drain-a1", "drain-a2"] {
+        key1.client
+            .request_with_headers("DELETE", &format!("{KEY1_CAL}{name}.ics"), [NO_REPLY], "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    key1.delete_items_since(test, &start1).await;
+    key2.delete_items_since(test, &start2).await;
+    assert_eq!(za_uid_leases(test).await, 0);
+    test.wait_for_tasks_skip_not_due().await;
+}
+
+pub async fn test_lease(test: &mut TestServer) {
+    println!("Running zero-access drain creation lease tests...");
+    let _drain = DrainOn::new();
+    let key1 = Party::new(test, "key1@example.com");
+    let key2 = Party::new(test, "key2@example.com");
+    let key3 = Party::new(test, "key3@example.com");
+    let keys2 = za_unlock(test, key2.id, STRONG).await;
+    let start1 = inbox_ids(test, key1.id).await;
+    let start2 = inbox_ids(test, key2.id).await;
+    let start3 = inbox_ids(test, key3.id).await;
+    let app = za_app_password(key2.name, STRONG, "drain-second-session").await;
+    test_hooks::set_drain_retry_override(Some(0));
+
+    // A. Drain versus drain (spec 6.3, 11). Two fan-outs for one UID
+    // publish the lower document id late. The late one is key1's PUT, held
+    // at the fan-out pause after its item's id was assigned; key1 holds
+    // its own creation lease for the UID while held, so the second
+    // fan-out comes from another organizer, key3, whose PUT of the same
+    // UID contends on nothing and delivers the higher id. Session 1 drains
+    // the higher id and is held, holding key2's creation lease, right
+    // before its commit; the first PUT then commits the lower id. Session
+    // 2 drains: both items find no event, the lease is busy, both stay
+    // pending. Session 1 commits one copy (key3's invitation); its next
+    // request finds the lower id, whose ORGANIZER differs, and keeps it as
+    // history. Exactly one copy, both items drained.
+    let uid = "za-drain-l1";
+    let parked_put = HookParked::start(
+        key2.id,
+        test_hooks::set_fan_out_pause,
+        put(
+            key1.name,
+            STRONG,
+            format!("{KEY1_CAL}drain-l1.ics"),
+            invite(uid, START_A, &["key2@example.com"]),
+        ),
+    )
+    .await;
+    key3.client
+        .request_with_headers(
+            "PUT",
+            "/dav/cal/key3%40example.com/default/drain-l1.ics",
+            [CONTENT_TYPE],
+            super::reply::copy(
+                uid,
+                "key3@example.com",
+                &["ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:key2@example.com"],
+            ),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let high = pending_ids(test, key2.id).await;
+    assert_eq!(high.len(), 1, "key3's item is the only committed one");
+    let session_1 = HookParked::start(
+        key2.id,
+        test_hooks::set_drain_lease_pause,
+        trigger_drain(key2.name, STRONG),
+    )
+    .await;
+    assert_eq!(parked_put.finish().await, 201, "the held PUT");
+    let both = pending_ids(test, key2.id).await;
+    assert_eq!(both.len(), 2);
+    assert!(
+        both[0] < both[1] && both[1] == high[0],
+        "the lower id arrived late: {both:?}"
+    );
+    assert_eq!(
+        trigger_drain(key2.name, &app).await,
+        207,
+        "session 2's request"
+    );
+    assert_eq!(
+        pending_ids(test, key2.id).await.len(),
+        2,
+        "session 2 imported past the lease"
+    );
+    assert_eq!(uid_copies(test, key2.id, uid).await, 0);
+    assert_eq!(session_1.finish().await, 207);
+    assert_eq!(
+        uid_copies(test, key2.id, uid).await,
+        1,
+        "session 1 committed one copy"
+    );
+    assert_eq!(
+        pending_ids(test, key2.id).await,
+        [both[0]],
+        "the late item waits for a pass"
+    );
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    assert!(pending_ids(test, key2.id).await.is_empty());
+    assert_eq!(
+        uid_copies(test, key2.id, uid).await,
+        1,
+        "a second copy was imported"
+    );
+    assert_eq!(za_uid_leases(test).await, 0);
+    // The copy is key3's invitation, with key3's token for key2; key1's
+    // late item was kept as history (OrganizerMismatch), its event_id set.
+    let keys3 = za_unlock(test, key3.id, STRONG).await;
+    let key3_token = *stored_pairs(test, &keys3, key3.id, "default/drain-l1.ics")
+        .await
+        .expect("pairs")
+        .get("key2@example.com")
+        .unwrap();
+    let copy = copy_href(test, key2.id, uid).await;
+    assert_eq!(
+        stored_pairs(test, &keys2, key2.id, &relative(&copy))
+            .await
+            .expect("pairs")
+            .get("key2@example.com"),
+        Some(&key3_token)
+    );
+    let late = stored_item(test, key2.id, both[0]).await;
+    assert_eq!(late.flags & EVENT_NOTIFICATION_IS_CHANGE, 0);
+    assert!(late.event_id.is_some());
+    let copy_body = body(&key2.client, &copy).await;
+    assert!(
+        copy_body.contains("ORGANIZER:mailto:key3@example.com"),
+        "{copy_body}"
+    );
+
+    // B. Drain versus PUT (spec 6.3, 11): session 1 is held after its first
+    // lookup found nothing, before the lease; session 2 (drain skipped)
+    // PUTs the same UID into key2's default calendar and wins; session 1
+    // takes the lease, finds the copy and merges. One copy.
+    let uid2 = "za-drain-l2";
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &format!("{KEY1_CAL}drain-l2.ics"),
+            [CONTENT_TYPE],
+            invite(uid2, START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let session_1 = HookParked::start(
+        key2.id,
+        test_hooks::set_drain_lookup_pause,
+        trigger_drain(key2.name, STRONG),
+    )
+    .await;
+    test_hooks::set_drain_skip(key2.id);
+    let own = format!("/dav/cal/key2%40example.com/default/drain-l2-own.ics");
+    assert_eq!(
+        put(
+            key2.name,
+            &app,
+            own.clone(),
+            super::reply::copy(
+                uid2,
+                "key1@example.com",
+                &["ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:key2@example.com"]
+            ),
+        )
+        .await,
+        201,
+        "session 2's PUT of the UID"
+    );
+    test_hooks::clear_drain_skip(key2.id);
+    assert_eq!(session_1.finish().await, 207);
+    assert_eq!(
+        uid_copies(test, key2.id, uid2).await,
+        1,
+        "the drain imported a second copy"
+    );
+    assert!(
+        pending_ids(test, key2.id).await.is_empty(),
+        "the drain did not merge"
+    );
+    let merged = body(&key2.client, &own).await;
+    assert!(
+        merged.contains(&format!("fo-title {uid2}")),
+        "the merge did not reach session 2's copy: {merged}"
+    );
+    assert_eq!(za_uid_leases(test).await, 0);
+
+    // C. Lease expiry (spec 6.3 step 3, 11): session 1 holds the lease past
+    // its 1-second duration; session 2's PUT takes the expired lease over
+    // and stores the UID; session 1's fenced commit is lost, the item stays
+    // pending, and the next pass merges. One copy.
+    let uid3 = "za-drain-l3";
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &format!("{KEY1_CAL}drain-l3.ics"),
+            [CONTENT_TYPE],
+            invite(uid3, START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    test_hooks::set_lease_secs_override(Some(1));
+    let session_1 = HookParked::start(
+        key2.id,
+        test_hooks::set_drain_lease_pause,
+        trigger_drain(key2.name, STRONG),
+    )
+    .await;
+    test_hooks::set_lease_secs_override(None);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    test_hooks::set_drain_skip(key2.id);
+    let own3 = format!("/dav/cal/key2%40example.com/default/drain-l3-own.ics");
+    assert_eq!(
+        put(
+            key2.name,
+            &app,
+            own3.clone(),
+            super::reply::copy(
+                uid3,
+                "key1@example.com",
+                &["ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:key2@example.com"]
+            ),
+        )
+        .await,
+        201,
+        "the expired lease was not taken over"
+    );
+    test_hooks::clear_drain_skip(key2.id);
+    assert_eq!(
+        session_1.finish().await,
+        207,
+        "a lost fence failed the request"
+    );
+    assert_eq!(
+        uid_copies(test, key2.id, uid3).await,
+        1,
+        "the expired holder committed"
+    );
+    assert_eq!(
+        pending_ids(test, key2.id).await.len(),
+        1,
+        "the lost commit drained the item"
+    );
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    assert!(pending_ids(test, key2.id).await.is_empty());
+    assert_eq!(uid_copies(test, key2.id, uid3).await, 1);
+    assert_eq!(za_uid_leases(test).await, 0);
+
+    // D. The item deleted under a pass (Review Focus 1): session 1 holds
+    // the lease before its commit; session 2 deletes the item by href; the
+    // commit loses the item's assertion, nothing is imported, the lease is
+    // released, the request succeeds.
+    let uid4 = "za-drain-l4";
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &format!("{KEY1_CAL}drain-l4.ics"),
+            [CONTENT_TYPE],
+            invite(uid4, START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let item = pending_ids(test, key2.id).await;
+    assert_eq!(item.len(), 1);
+    let session_1 = HookParked::start(
+        key2.id,
+        test_hooks::set_drain_lease_pause,
+        trigger_drain(key2.name, STRONG),
+    )
+    .await;
+    test_hooks::set_drain_skip(key2.id);
+    let item_href = format!("{}{}.ics", key2.inbox(), item[0]);
+    assert_eq!(
+        crate::utils::http::HttpRequest::with_credentials(8899, key2.name, &app)
+            .send_full(hyper::Method::DELETE, &item_href, None, None)
+            .await
+            .status
+            .as_u16(),
+        204
+    );
+    test_hooks::clear_drain_skip(key2.id);
+    assert_eq!(session_1.finish().await, 207);
+    assert_eq!(
+        uid_copies(test, key2.id, uid4).await,
+        0,
+        "a copy without its item"
+    );
+    assert!(!inbox_ids(test, key2.id).await.contains(&item[0]));
+    assert_eq!(
+        za_uid_leases(test).await,
+        0,
+        "the lost commit kept its lease"
+    );
+
+    // E. Two sessions of the organizer and one delegating REPLY (spec 6.3,
+    // 6.4 "Delegates"): key2 delegates to key3, so key1's drain of the
+    // REPLY fans out to key3 and first takes key1's creation lease for the
+    // UID. Session 1 (key1's password session) holds that lease, parked
+    // inside the fan-out to key3; session 2 (key1's app-password session)
+    // finds the lease busy and defers. Exactly one REQUEST reaches key3,
+    // with the token key1's copy keeps; session 2's retry finds nothing to
+    // do.
+    let uid5 = "za-drain-l5";
+    let organizer5 = format!("{KEY1_CAL}drain-l5.ics");
+    let keys1 = za_unlock(test, key1.id, STRONG).await;
+    let app1 = za_app_password(key1.name, STRONG, "drain test E").await;
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &organizer5,
+            [CONTENT_TYPE],
+            invite(uid5, START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    let copy5 = copy_href(test, key2.id, uid5).await;
+    let delegated = body(&key2.client, &copy5)
+        .await
+        .replace("\r\n ", "")
+        .replace(
+            "PARTSTAT=NEEDS-ACTION",
+            "PARTSTAT=DELEGATED;DELEGATED-TO=\"mailto:key3@example.com\"",
+        )
+        .replace(
+            "END:VEVENT",
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;DELEGATED-FROM=\"mailto:key2@example.com\":mailto:key3@example.com\r\nEND:VEVENT",
+        );
+    key2.client
+        .request_with_headers("PUT", &copy5, [CONTENT_TYPE], delegated)
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    wait_for_delivery(test).await;
+    let reply5 = pending_ids(test, key1.id).await;
+    assert_eq!(
+        reply5.len(),
+        1,
+        "key1's inbox holds one pending delegation reply"
+    );
+    let before3 = inbox_ids(test, key3.id).await;
+    assert_eq!(za_uid_leases(test).await, 0);
+    let session_1 = HookParked::start(
+        key3.id,
+        test_hooks::set_fan_out_pause,
+        trigger_drain(key1.name, STRONG),
+    )
+    .await;
+    assert_eq!(
+        trigger_drain(key1.name, &app1).await,
+        207,
+        "session 2's request"
+    );
+    assert_eq!(
+        new_inbox_items(test, key3.id, &before3).await.len(),
+        0,
+        "key3 received an item before session 1's fan-out wrote one"
+    );
+    assert_eq!(za_uid_leases(test).await, 1, "the parked holder's lease");
+    assert_eq!(
+        pending_ids(test, key1.id).await,
+        reply5,
+        "session 2 drained past the lease"
+    );
+    assert_eq!(session_1.finish().await, 207);
+    let key3_items = new_inbox_items(test, key3.id, &before3).await;
+    assert_eq!(key3_items.len(), 1, "key3 holds exactly one invitation");
+    assert_ne!(key3_items[0].1.flags & EVENT_NOTIFICATION_ZA_PENDING, 0);
+    assert_eq!(
+        za_uid_leases(test).await,
+        0,
+        "the delegating merge kept its lease"
+    );
+    assert!(
+        pending_ids(test, key1.id).await.is_empty(),
+        "the delegation reply is still pending"
+    );
+    let (_, carriers) = open_pending_item_as(test, key3.id, STRONG, key3_items[0].0).await;
+    let delivered = pair_token(carriers.pair.as_ref(), "key3@example.com");
+    assert_eq!(
+        stored_pairs(test, &keys1, key1.id, "default/drain-l5.ics")
+            .await
+            .expect("pairs")
+            .get("key3@example.com"),
+        Some(&delivered),
+        "key1's copy keeps a token other than the one key3 received"
+    );
+    test_hooks::set_drain_retry_override(Some(1));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(trigger_drain(key1.name, &app1).await, 207);
+    assert_eq!(
+        new_inbox_items(test, key3.id, &before3).await.len(),
+        1,
+        "session 2's retry fanned out again"
+    );
+    assert_eq!(za_uid_leases(test).await, 0);
+    test_hooks::set_drain_retry_override(None);
+
+    // Cleanup.
+    test_hooks::set_drain_retry_override(None);
+    for href in [copy, own, own3, copy5] {
+        key2.client
+            .request_with_headers("DELETE", &href, [NO_REPLY], "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    // key3's drain would import the case E invitation before its own
+    // requests run, leaving a copy behind: key3's cleanup skips it.
+    test_hooks::set_drain_skip(key3.id);
+    key3.client
+        .request_with_headers(
+            "DELETE",
+            "/dav/cal/key3%40example.com/default/drain-l1.ics",
+            [NO_REPLY],
+            "",
+        )
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    for href in [
+        format!("{KEY1_CAL}drain-l1.ics"),
+        format!("{KEY1_CAL}drain-l2.ics"),
+        format!("{KEY1_CAL}drain-l3.ics"),
+        format!("{KEY1_CAL}drain-l4.ics"),
+        organizer5,
+    ] {
+        key1.client
+            .request_with_headers("DELETE", &href, [NO_REPLY], "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    key1.delete_items_since(test, &start1).await;
+    key2.delete_items_since(test, &start2).await;
+    key3.delete_items_since(test, &start3).await;
+    test_hooks::clear_drain_skip(key3.id);
+    let credential_id = AppPassword::parse(&app).unwrap().credential_id;
+    za_post(
+        "app-password/revoke",
+        &json!({ "username": key2.name, "password": STRONG, "credential_id": credential_id }),
+    )
+    .await
+    .expect(200);
+    let credential_id = AppPassword::parse(&app1).unwrap().credential_id;
+    za_post(
+        "app-password/revoke",
+        &json!({ "username": key1.name, "password": STRONG, "credential_id": credential_id }),
+    )
+    .await
+    .expect(200);
+    assert_eq!(za_uid_leases(test).await, 0);
+    test.wait_for_tasks_skip_not_due().await;
+}
+
+pub async fn test_cursor(test: &mut TestServer) {
+    println!("Running zero-access drain cursor tests...");
+    let _drain = DrainOn::new();
+    let key1 = Party::new(test, "key1@example.com");
+    let key2 = Party::new(test, "key2@example.com");
+    let start1 = inbox_ids(test, key1.id).await;
+    let start2 = inbox_ids(test, key2.id).await;
+
+    // 1. An item that arrives while a pass is rewriting an earlier item is
+    // processed on the next request (spec 6.2, "The cursor"): the pass is
+    // held before its commit of item X; item Y arrives; the pass completes
+    // X only; the next request drains Y.
+    let (uid_x, uid_y) = ("za-drain-c1", "za-drain-c2");
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &format!("{KEY1_CAL}drain-c1.ics"),
+            [CONTENT_TYPE],
+            invite(uid_x, START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let pass = HookParked::start(
+        key2.id,
+        test_hooks::set_drain_lease_pause,
+        trigger_drain(key2.name, STRONG),
+    )
+    .await;
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &format!("{KEY1_CAL}drain-c2.ics"),
+            [CONTENT_TYPE],
+            invite(uid_y, START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(pass.finish().await, 207);
+    assert_eq!(uid_copies(test, key2.id, uid_x).await, 1);
+    assert_eq!(
+        uid_copies(test, key2.id, uid_y).await,
+        0,
+        "the pass took an item past its snapshot"
+    );
+    assert_eq!(pending_ids(test, key2.id).await.len(), 1);
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    assert_eq!(
+        uid_copies(test, key2.id, uid_y).await,
+        1,
+        "the late item was not drained next"
+    );
+    assert!(pending_ids(test, key2.id).await.is_empty());
+
+    // 2. A transient failure is retried without a new arrival, after the
+    // backoff (spec 6.2, 6.5): the drain's commit fails once; the item
+    // stays pending; the next request within the 30-second backoff does
+    // not drain; with the backoff overridden to zero, the next request
+    // drains.
+    let uid_z = "za-drain-c3";
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &format!("{KEY1_CAL}drain-c3.ics"),
+            [CONTENT_TYPE],
+            invite(uid_z, START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    // The deferral is an absolute deadline taken at the failing pass, so
+    // the short backoff is set before the failure; the override cannot
+    // shorten a deadline already stored.
+    test_hooks::set_drain_retry_override(Some(2));
+    test_hooks::set_drain_fail_once(Some(key2.id));
+    assert_eq!(
+        trigger_drain(key2.name, STRONG).await,
+        207,
+        "a drain failure failed the request"
+    );
+    assert_eq!(
+        pending_ids(test, key2.id).await.len(),
+        1,
+        "a failed commit drained the item"
+    );
+    assert_eq!(uid_copies(test, key2.id, uid_z).await, 0);
+    assert_eq!(
+        za_uid_leases(test).await,
+        0,
+        "the failed commit kept its lease"
+    );
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    assert_eq!(
+        pending_ids(test, key2.id).await.len(),
+        1,
+        "the drain retried inside the backoff"
+    );
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    assert!(
+        pending_ids(test, key2.id).await.is_empty(),
+        "the retry did not drain"
+    );
+    assert_eq!(uid_copies(test, key2.id, uid_z).await, 1);
+    test_hooks::set_drain_retry_override(None);
+
+    // Cleanup.
+    for uid in [uid_x, uid_y, uid_z] {
+        let href = copy_href(test, key2.id, uid).await;
+        key2.client
+            .request_with_headers("DELETE", &href, [NO_REPLY], "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    for name in ["drain-c1", "drain-c2", "drain-c3"] {
         key1.client
             .request_with_headers("DELETE", &format!("{KEY1_CAL}{name}.ics"), [NO_REPLY], "")
             .await

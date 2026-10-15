@@ -121,6 +121,8 @@ pub async fn za_tests() {
     drain::test(&mut test).await;
     drain::test_reply(&mut test).await;
     drain::test_adoption(&mut test).await;
+    drain::test_lease(&mut test).await;
+    drain::test_cursor(&mut test).await;
     sweep::test(&mut test).await;
     tracing::test(&mut test).await;
     expansion::test(&mut test).await;

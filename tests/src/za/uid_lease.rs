@@ -23,7 +23,7 @@ use hyper::Method;
 use std::{future::Future, time::Duration};
 
 /// A PUT with its own client and a 5-second timeout; resolves to the status.
-fn put(
+pub fn put(
     name: &str,
     secret: &str,
     path: String,
