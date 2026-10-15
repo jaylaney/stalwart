@@ -68,7 +68,7 @@ Invariants and code rules:
    * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
    */
   ```
-- Each item's event write and item rewrite are one store write. `Server::commit_batch` (`crates/common/src/storage/transaction.rs`) writes each commit point of a batch separately, and `CalendarEvent::insert` / `update` end with `commit_point()`, so the drain adds the item rewrite (and the lease assertion) to the batch **before** the event write and gives the rewrite no commit point of its own.
+- Each item's event write and item rewrite are one store write. `Server::commit_batch` (`crates/common/src/storage/transaction.rs`) writes each commit point of a batch separately, but `BatchBuilder::commit_point` records a boundary only once the batch is large (`is_large_batch`: over 5,000,000 bytes or 1,000 operations, `crates/store/src/write/batch.rs:377-395`), so an item's batch, far below that, is one write whatever its commit points. The drain still adds the item rewrite (and the lease assertion) **before** the event write, so an oversized batch, if one ever arose, would split after both; no mutation pins this, since a small batch cannot be split.
 
 Tests:
 - Every za sub-module removes what it creates. `assert_is_empty` runs once, at the suite end, after `destroy_key_accounts`; no sub-module calls it.
@@ -100,8 +100,9 @@ Process:
 | Hooks | `DRAIN_LOOKUP_PAUSE` (import: after the first UID lookup found nothing, before the lease), `DRAIN_LEASE_PAUSE` (holding the lease, after the second lookup, before the commit), `DRAIN_FAIL_ONCE` (the account's next drain commit fails with an internal error), `DRAIN_SKIP` (accounts whose drain does not run; `DRAIN_SKIP_ALL = u32::MAX`), `DRAIN_RETRY_OVERRIDE` | `test_hooks.rs` |
 | Trace details | `zero-access: drain pass failed` (error level, the pass's error), `zero-access: drain creation lease busy` (`Store(AssertValueFailed)`), `zero-access: drain commit lost its assertion` (the pass's error), `zero-access: undecodable inbox item deleted` and `zero-access: inbox item kept as history` (`Calendar(ItipMessageError)`, `Reason` = a fixed variant name), `zero-access: reply token mismatch` (`Security(Unauthorized)`) | `drain.rs` |
 | Item flags after the drain | import: `0`; merge: `EVENT_NOTIFICATION_IS_CHANGE` (as `commit_itip_merge` sets it); kept as history: `0`; `event_id` = the event's document id when one was found or created, else `None`; `created` kept, `modified` = now | `drain.rs` |
-| Stale reply | per item: a REPLY is stale when any of its instances has a SEQUENCE lower than the event's current SEQUENCE for the same `InstanceId` (absent = 0); rejected as `ItipError::OutOfSequence`, kept as history | `drain.rs` |
-| Sender check | the ORGANIZER of a REQUEST or CANCEL, the first ATTENDEE of a REPLY, resolved with `Server::za_account_id_from_email` (quiet), must equal `ChangedBy::PrincipalId`; a `CalendarAddress` sender or a mismatch is rejected as `SenderIsNotOrganizerNorAttendee`, kept as history | `drain.rs` |
+| Stale reply | per item: a REPLY is stale when any of its instances has a SEQUENCE lower than the event's current SEQUENCE for the same `InstanceId`, or, for an occurrence the event stores no override for, than the master's (absent = 0); rejected as `ItipError::OutOfSequence`, kept as history | `drain.rs` |
+| Sender check | the candidates are the ORGANIZER of a REQUEST or CANCEL and every ATTENDEE of a REPLY (upstream exports the replier with its delegates and delegators); those resolving with `Server::za_account_id_from_email` (quiet) to `ChangedBy::PrincipalId` are the sender's addresses; none, or a `CalendarAddress` sender, is rejected as `SenderIsNotOrganizerNorAttendee`, kept as history. For a REPLY the replier is the sender's address whose pair holds the token; none matching is a forgery | `drain.rs` |
+| Quota at the drain | only `Limit(Quota)` / `Limit(TenantQuota)` from `has_available_quota` is the `QuotaExceeded` rejection (as the fan-out classifies it); any other error is a store error that keeps the item pending | `drain.rs` |
 | Permanent errors | any `open_pending_item` error, an unparsable or missing METHOD, a METHOD other than REQUEST, REPLY, CANCEL: the item is deleted | `drain.rs` |
 | Missing reply token | a REPLY item without `X-ZA-RSVP-TOKEN` is treated as a token mismatch (deleted, security trace) | `drain.rs` |
 | Which copy merges | the lowest document id among the account's events with the UID, as upstream's `itip_ingest` takes the first hit | `drain.rs` |
@@ -740,7 +741,9 @@ Create `crates/groupware/src/calendar/drain.rs`:
 //! REPLY by its token and rejects a stale one, fans out the organizer's
 //! REQUEST to delegates the merge added, and rewrites the item resealed
 //! under the master key with the pending bit cleared (6.4 step 5). Each
-//! item is one store write holding the event write and the item rewrite.
+//! item is one store write holding the event write and the item rewrite
+//! (its batch stays far below `BatchBuilder::is_large_batch`, the only
+//! point at which a commit point splits a batch).
 //! Upstream's pure iTIP functions run unchanged (invariant 15); only the
 //! commit is the fork's. The drain never fails the request that triggered
 //! it (invariant 14): `za_drain` traces and returns.
@@ -769,7 +772,7 @@ use crate::{
         storage::ItipAutoExpunge,
     },
     scheduling::{
-        ItipError, ItipSnapshots, ical_size,
+        InstanceId, ItipError, ItipSnapshots, ical_size,
         inbound::{
             MergeAction, MergeResult, itip_import_message, itip_merge_changes, itip_method,
             itip_process_message,
@@ -1029,30 +1032,31 @@ async fn drain_item(
         Ok(_) => return ctx.delete_undecodable("UnsupportedMethod").await,
         Err(_) => return ctx.delete_undecodable("MissingMethod").await,
     };
-    let (uid, sender_address) = match itip_snapshot(&tree, account_info.addresses(), false) {
-        Ok(snapshots) => (snapshots.uid.to_string(), sender_of(&snapshots, method)),
+    let (uid, candidates) = match itip_snapshot(&tree, account_info.addresses(), false) {
+        Ok(snapshots) => (snapshots.uid.to_string(), sender_candidates(&snapshots, method)),
         Err(err) => return ctx.reject(tree, None, &err).await,
     };
-    // Step 2: the sending address (the ORGANIZER of a REQUEST or CANCEL,
-    // the replying ATTENDEE of a REPLY) must resolve to the principal in
+    // Step 2: the sending address must resolve to the principal in
     // `changed_by`, the check upstream's ingest makes against a mail's
-    // sender. The lookup is the quiet one (spec 10).
-    let Some(sender_address) = sender_address else {
-        return ctx
-            .reject(tree, None, &ItipError::SenderIsNotOrganizerNorAttendee)
-            .await;
-    };
-    let sender_matches = match &ctx.changed_by {
-        ChangedBy::PrincipalId(sender_id) => {
-            server
-                .za_account_id_from_email(&sender_address)
+    // sender. A REQUEST or CANCEL names one candidate, its ORGANIZER; a
+    // REPLY names every ATTENDEE it carries, since upstream's attendee
+    // builder lists the replier together with its delegates and
+    // delegators, so the sender's addresses are the candidates that
+    // resolve to `changed_by`. The lookup is the quiet one (spec 10).
+    let mut sender_addresses = Vec::new();
+    if let ChangedBy::PrincipalId(sender_id) = &ctx.changed_by {
+        for address in candidates {
+            if server
+                .za_account_id_from_email(&address)
                 .await
                 .caused_by(trc::location!())?
                 == Some(*sender_id)
+            {
+                sender_addresses.push(address);
+            }
         }
-        ChangedBy::CalendarAddress(_) => false,
-    };
-    if !sender_matches {
+    }
+    if sender_addresses.is_empty() {
         return ctx
             .reject(tree, None, &ItipError::SenderIsNotOrganizerNorAttendee)
             .await;
@@ -1062,16 +1066,18 @@ async fn drain_item(
     // takes the first hit.
     let existing = find_event(server, account_id, &uid).await?;
     match (method, existing) {
-        (Method::Request, None) => import(&ctx, tree, carriers.pair, &uid, sender_address).await,
+        (Method::Request, None) => {
+            import(&ctx, tree, carriers.pair, &uid, sender_addresses).await
+        }
         (Method::Request, Some(event_id)) => {
-            merge(&ctx, event_id, tree, Incoming::Request(carriers.pair), sender_address).await
+            merge(&ctx, event_id, tree, Incoming::Request(carriers.pair), sender_addresses).await
         }
         (Method::Cancel, Some(event_id)) => {
-            merge(&ctx, event_id, tree, Incoming::Cancel, sender_address).await
+            merge(&ctx, event_id, tree, Incoming::Cancel, sender_addresses).await
         }
         (Method::Reply, Some(event_id)) => match carriers.reply_token {
             Some(token) => {
-                merge(&ctx, event_id, tree, Incoming::Reply(token), sender_address).await
+                merge(&ctx, event_id, tree, Incoming::Reply(token), sender_addresses).await
             }
             // A fan-out REPLY always carries its token; one without cannot
             // be authenticated.
@@ -1097,27 +1103,40 @@ async fn find_event(server: &Server, account_id: u32, uid: &str) -> trc::Result<
         .next())
 }
 
-/// The sending address of an item (spec 6.4 step 2).
-fn sender_of(snapshots: &ItipSnapshots<'_>, method: Method) -> Option<String> {
+/// The addresses an item may have been sent from (spec 6.4 step 2): the
+/// ORGANIZER of a REQUEST or CANCEL; every ATTENDEE of a REPLY, because
+/// upstream's attendee builder exports the replier's entry together with
+/// its delegates' and delegators' (`attendee.rs`, `attendee_entry_uids`)
+/// and a set's iteration order says nothing about which one replied.
+/// Deduplicated case-insensitively, first occurrence kept.
+fn sender_candidates(snapshots: &ItipSnapshots<'_>, method: Method) -> Vec<String> {
     match method {
-        Method::Reply => snapshots
-            .components
-            .values()
-            .flat_map(|instance| instance.attendees.iter())
-            .map(|attendee| attendee.email.email.clone())
-            .next(),
-        Method::Request | Method::Cancel => Some(snapshots.organizer.email.email.clone()),
+        Method::Reply => {
+            let mut seen = AHashSet::new();
+            snapshots
+                .components
+                .values()
+                .flat_map(|instance| instance.attendees.iter())
+                .map(|attendee| attendee.email.email.clone())
+                .filter(|address| seen.insert(address.to_ascii_lowercase()))
+                .collect()
+        }
+        Method::Request | Method::Cancel => vec![snapshots.organizer.email.email.clone()],
     }
 }
 
 /// Spec 6.4, REPLY: stale when any instance of the reply carries a
 /// SEQUENCE below the event's current SEQUENCE for the same instance
-/// (absent counts as 0). Upstream's `handle_reply` makes no such check.
+/// (absent counts as 0). An occurrence the event stores no override for
+/// (a decline by EXDATE, which upstream's merge adds as a new override) is
+/// judged against the master, whose SEQUENCE a reschedule bumps. Upstream's
+/// `handle_reply` makes no such check.
 fn is_stale_reply(event: &ItipSnapshots<'_>, reply: &ItipSnapshots<'_>) -> bool {
     reply.components.iter().any(|(instance_id, instance)| {
         event
             .components
             .get(instance_id)
+            .or_else(|| event.components.get(&InstanceId::Main))
             .is_some_and(|current| {
                 instance.sequence.unwrap_or(0) < current.sequence.unwrap_or(0)
             })
@@ -1132,7 +1151,7 @@ async fn import(
     tree: ICalendar,
     pair: Option<TokenPairs>,
     uid: &str,
-    sender_address: String,
+    sender_addresses: Vec<String>,
 ) -> trc::Result<bool> {
     let server = ctx.server;
     let account_id = ctx.keys.account_id;
@@ -1158,7 +1177,7 @@ async fn import(
     // or PUT): merge instead.
     if let Some(event_id) = find_event(server, account_id, uid).await? {
         lease.release().await;
-        return merge(ctx, event_id, tree, Incoming::Request(pair), sender_address).await;
+        return merge(ctx, event_id, tree, Incoming::Request(pair), sender_addresses).await;
     }
     let mut event_tree = tree.clone();
     if let Err(err) = itip_import_message(&mut event_tree) {
@@ -1166,8 +1185,11 @@ async fn import(
         return ctx.reject(tree, None, &err).await;
     }
     // Upstream's two checks: quota for the plaintext size (the item's, as
-    // the fan-out computed it) and the default calendar.
-    if server
+    // the fan-out computed it) and the default calendar. Only a quota
+    // limit is the iTIP-level rejection; a failed counter read is a store
+    // error that keeps the item pending (spec 6.5), as the fan-out
+    // classifies it.
+    if let Err(err) = server
         .has_available_quota(
             server
                 .account(account_id)
@@ -1177,10 +1199,13 @@ async fn import(
             ctx.size as u64,
         )
         .await
-        .is_err()
     {
         lease.release().await;
-        return ctx.reject(tree, None, &ItipError::QuotaExceeded).await;
+        return if is_over_quota(&err) {
+            ctx.reject(tree, None, &ItipError::QuotaExceeded).await
+        } else {
+            Err(err.caused_by(trc::location!()))
+        };
     }
     let Some(parent_id) = server
         .get_or_create_default_calendar(account_id, account_id)
@@ -1220,7 +1245,7 @@ async fn import(
     common::za::test_hooks::drain_lease_pause_point(account_id).await;
     let mut batch = BatchBuilder::new();
     // Spec 6.3 step 3: fenced on the lease, with the item rewrite ahead of
-    // the insert so that the three share the insert's commit point.
+    // the insert (one write; see the module doc).
     lease.lease().assert_in(&mut batch);
     ctx.rewrite_in(&mut batch, tree, Some(document_id), 0)?;
     event
@@ -1249,7 +1274,7 @@ async fn merge(
     event_id: u32,
     tree: ICalendar,
     incoming: Incoming,
-    sender_address: String,
+    sender_addresses: Vec<String>,
 ) -> trc::Result<bool> {
     let server = ctx.server;
     let account_id = ctx.keys.account_id;
@@ -1275,14 +1300,20 @@ async fn merge(
     let mut pairs = unseal_event_pairs(&mut event, ctx.keys, account_id)
         .map_err(|err| seal_error(err, account_id, event_id))?;
     // Spec 3.3, "Verification": a REPLY is authenticated by the replier's
-    // token in this event's bundle, matched by address.
-    if let Incoming::Reply(token) = &incoming
-        && !pairs
-            .as_ref()
-            .is_some_and(|pairs| pairs.matches(&sender_address, token))
-    {
-        return ctx.drop_forgery().await;
-    }
+    // token in this event's bundle, matched by address. The replier is the
+    // sender's address whose pair holds the token; an alias of the sender
+    // with no pair, or a token that matches none, is a forgery.
+    let sender_address = match &incoming {
+        Incoming::Reply(token) => match sender_addresses.iter().find(|address| {
+            pairs
+                .as_ref()
+                .is_some_and(|pairs| pairs.matches(address, token))
+        }) {
+            Some(address) => address.clone(),
+            None => return ctx.drop_forgery().await,
+        },
+        Incoming::Request(_) | Incoming::Cancel => sender_addresses[0].clone(),
+    };
     let (step, is_organizer_update, before) = {
         let snapshots = match itip_snapshot(&event.data.event, addresses, false) {
             Ok(snapshots) => snapshots,
@@ -1337,7 +1368,7 @@ async fn merge(
     }
     let extra_bytes = (event.size as u64).saturating_sub(event_.inner.size.to_native() as u64);
     if extra_bytes > 0
-        && server
+        && let Err(err) = server
             .has_available_quota(
                 server
                     .account(account_id)
@@ -1347,9 +1378,12 @@ async fn merge(
                 extra_bytes,
             )
             .await
-            .is_err()
     {
-        return ctx.reject(tree, Some(event_id), &ItipError::QuotaExceeded).await;
+        return if is_over_quota(&err) {
+            ctx.reject(tree, Some(event_id), &ItipError::QuotaExceeded).await
+        } else {
+            Err(err.caused_by(trc::location!()))
+        };
     }
     // Spec 3.3: the pairs the copy keeps.
     match &incoming {
@@ -1441,8 +1475,8 @@ async fn merge(
     seal_event(&mut event, ctx.keys, account_id, pairs.as_ref())
         .map_err(|err| seal_error(err, account_id, event_id))?;
     let mut batch = BatchBuilder::new();
-    // The item rewrite first, so that it shares the event update's commit
-    // point: one store write (spec 6.3).
+    // The item rewrite first, ahead of the event update (one write; see
+    // the module doc).
     ctx.rewrite_in(&mut batch, tree, Some(event_id), EVENT_NOTIFICATION_IS_CHANGE)?;
     event
         .update(
@@ -1468,7 +1502,7 @@ impl ItemCtx<'_> {
     /// Spec 6.4 step 5: the item resealed under the master key, bit
     /// cleared, no carrier, `event_id` and the change flag as upstream's
     /// ingest sets them, `created` kept. No commit point of its own: the
-    /// callers add it ahead of the event write, or end the batch
+    /// callers put it ahead of the event write, or end the batch
     /// themselves.
     fn rewrite_in(
         &self,
@@ -1608,6 +1642,13 @@ impl ItemCtx<'_> {
     }
 }
 
+/// Only a quota limit is "over quota", as `fanout::write_item_inner`
+/// classifies it; any other error of the quota check is a store error.
+fn is_over_quota(err: &trc::Error) -> bool {
+    err.matches(trc::EventType::Limit(trc::LimitEvent::Quota))
+        || err.matches(trc::EventType::Limit(trc::LimitEvent::TenantQuota))
+}
+
 /// A fixed name per `SealError`; its `Structure` text is a fixed string too.
 fn seal_reason(err: &SealError) -> &'static str {
     match err {
@@ -1710,25 +1751,73 @@ mod tests {
         ));
     }
 
+    /// A delegation REPLY as upstream builds it: the replier's entry with
+    /// its delegate's (`attendee_entry_uids`).
+    fn delegation_reply() -> ICalendar {
+        parse(
+            "BEGIN:VCALENDAR\\r\\nVERSION:2.0\\r\\nPRODID:-//t//EN\\r\\nMETHOD:REPLY\\r\\nBEGIN:VEVENT\\r\\nUID:stale-1\\r\\nDTSTAMP:20240101T000000Z\\r\\nSEQUENCE:0\\r\\nORGANIZER:mailto:org@example.com\\r\\nATTENDEE;PARTSTAT=NEEDS-ACTION;DELEGATED-FROM=\\"mailto:att@example.com\\":mailto:del@example.com\\r\\nATTENDEE;PARTSTAT=DELEGATED;DELEGATED-TO=\\"mailto:del@example.com\\":mailto:att@example.com\\r\\nEND:VEVENT\\r\\nEND:VCALENDAR\\r\\n",
+        )
+    }
+
     #[test]
-    fn the_sender_is_the_organizer_or_the_replier() {
+    fn sender_candidates_name_the_organizer_or_every_attendee() {
         let org = organizer();
         let request = event(Some(0));
         let snapshots = itip_snapshot(&request, &org, false).unwrap();
         assert_eq!(
-            sender_of(&snapshots, Method::Request).as_deref(),
-            Some("org@example.com")
+            sender_candidates(&snapshots, Method::Request),
+            ["org@example.com"]
         );
         assert_eq!(
-            sender_of(&snapshots, Method::Cancel).as_deref(),
-            Some("org@example.com")
+            sender_candidates(&snapshots, Method::Cancel),
+            ["org@example.com"]
         );
         let reply = reply(Some(0));
         let snapshots = itip_snapshot(&reply, &org, false).unwrap();
         assert_eq!(
-            sender_of(&snapshots, Method::Reply).as_deref(),
-            Some("att@example.com")
+            sender_candidates(&snapshots, Method::Reply),
+            ["att@example.com"]
         );
+        // Both the delegator and the delegate are candidates: which one
+        // replied is decided by `changed_by` and the token, never by order.
+        let delegation = delegation_reply();
+        let snapshots = itip_snapshot(&delegation, &org, false).unwrap();
+        let mut candidates = sender_candidates(&snapshots, Method::Reply);
+        candidates.sort();
+        assert_eq!(candidates, ["att@example.com", "del@example.com"]);
+    }
+
+    fn recurring_event(sequence: i64, with_override: Option<i64>) -> ICalendar {
+        let override_ = with_override.map_or(String::new(), |s| format!(
+            "BEGIN:VEVENT\\r\\nUID:stale-1\\r\\nRECURRENCE-ID:20990103T090000Z\\r\\nDTSTAMP:20240101T000000Z\\r\\nDTSTART:20990103T100000Z\\r\\nDTEND:20990103T110000Z\\r\\nSEQUENCE:{s}\\r\\nORGANIZER:mailto:org@example.com\\r\\nATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:att@example.com\\r\\nEND:VEVENT\\r\\n"
+        ));
+        parse(&format!(
+            "BEGIN:VCALENDAR\\r\\nVERSION:2.0\\r\\nPRODID:-//t//EN\\r\\nBEGIN:VEVENT\\r\\nUID:stale-1\\r\\nDTSTAMP:20240101T000000Z\\r\\nDTSTART:20990102T090000Z\\r\\nDTEND:20990102T100000Z\\r\\nRRULE:FREQ=DAILY;COUNT=5\\r\\nSEQUENCE:{sequence}\\r\\nORGANIZER:mailto:org@example.com\\r\\nATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:att@example.com\\r\\nEND:VEVENT\\r\\n{override_}END:VCALENDAR\\r\\n"
+        ))
+    }
+
+    fn occurrence_reply(sequence: i64) -> ICalendar {
+        parse(&format!(
+            "BEGIN:VCALENDAR\\r\\nVERSION:2.0\\r\\nPRODID:-//t//EN\\r\\nMETHOD:REPLY\\r\\nBEGIN:VEVENT\\r\\nUID:stale-1\\r\\nRECURRENCE-ID:20990103T090000Z\\r\\nDTSTAMP:20240101T000000Z\\r\\nSEQUENCE:{sequence}\\r\\nORGANIZER:mailto:org@example.com\\r\\nATTENDEE;PARTSTAT=DECLINED:mailto:att@example.com\\r\\nEND:VEVENT\\r\\nEND:VCALENDAR\\r\\n"
+        ))
+    }
+
+    #[test]
+    fn an_occurrence_reply_without_an_override_is_judged_against_the_master() {
+        let org = organizer();
+        // The master was rescheduled to SEQUENCE 1; the decline of an
+        // occurrence at SEQUENCE 0 is stale although no override exists.
+        let master_only = recurring_event(1, None);
+        let master_only = itip_snapshot(&master_only, &org, false).unwrap();
+        let old = occurrence_reply(0);
+        assert!(is_stale_reply(&master_only, &itip_snapshot(&old, &org, false).unwrap()));
+        let fresh = occurrence_reply(1);
+        assert!(!is_stale_reply(&master_only, &itip_snapshot(&fresh, &org, false).unwrap()));
+        // A stored override keeps its own SEQUENCE: at 0 while the master
+        // is at 1, a reply at 0 for that occurrence is not stale.
+        let with_override = recurring_event(1, Some(0));
+        let with_override = itip_snapshot(&with_override, &org, false).unwrap();
+        assert!(!is_stale_reply(&with_override, &itip_snapshot(&old, &org, false).unwrap()));
     }
 
     #[test]
@@ -2323,7 +2412,10 @@ pub async fn test_reply(test: &mut TestServer) {
     );
 
     // 4. Delegation between three key accounts (spec 3.3, "Delegates";
-    // 6.4). key2 delegates to key3: the organizer's drain merges the REPLY
+    // 6.4). key2's REPLY carries key3's entry too, and key3's later REPLY
+    // carries key2's: the drain picks the replier by `changed_by` and the
+    // token, so neither direction depends on attendee order. key2
+    // delegates to key3: the organizer's drain merges the REPLY
     // and invites key3 itself; key3's inbox holds exactly one REQUEST, from
     // key1; key3's reply applies to key1's copy; key2's inbox receives
     // nothing from key3 and key2's copy is unchanged by key3's reply.
@@ -2395,12 +2487,60 @@ pub async fn test_reply(test: &mut TestServer) {
         "key2's copy learnt key3's status from somewhere other than the organizer"
     );
 
+    // 5. A stale occurrence reply with no stored override (spec 6.4,
+    // REPLY). key2 declines one occurrence of a recurring invitation by
+    // adding an EXDATE to its copy, which upstream sends as a REPLY with
+    // RECURRENCE-ID at the master's SEQUENCE 0 (`attendee.rs`, the EXDATE
+    // arm; from code reading). With key1's drain skipped, key1 reschedules
+    // the master (SEQUENCE 1). key1's drain judges the occurrence against
+    // the master: the decline is history and no override is added.
+    let uid4 = "za-drain-r4";
+    let organizer4 = format!("{KEY1_CAL}drain-r4.ics");
+    let recurring = |start: &str| {
+        invite(uid4, start, &["key2@example.com"])
+            .replace("DURATION:PT1H\r\n", "DURATION:PT1H\r\nRRULE:FREQ=DAILY;COUNT=5\r\n")
+    };
+    key1.client
+        .request_with_headers("PUT", &organizer4, [CONTENT_TYPE], recurring(START_A))
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    let copy4 = copy_href(test, key2.id, uid4).await;
+    let declined_occurrence = body(&key2.client, &copy4)
+        .await
+        .replace("END:VEVENT", "EXDATE:20990302T100000Z\r\nEND:VEVENT");
+    key2.client
+        .request_with_headers("PUT", &copy4, [CONTENT_TYPE], declined_occurrence)
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    let occurrence_reply = pending_ids(test, key1.id).await;
+    assert_eq!(occurrence_reply.len(), 1, "the EXDATE built no occurrence reply");
+    test_hooks::set_drain_skip(key1.id);
+    key1.client
+        .request_with_headers("PUT", &organizer4, [CONTENT_TYPE], recurring(START_B))
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    assert_eq!(stored_sequence(&key1.client, &organizer4).await, 1);
+    test_hooks::clear_drain_skip(key1.id);
+    assert_eq!(trigger_drain(key1.name, STRONG).await, 207);
+    assert!(pending_ids(test, key1.id).await.is_empty());
+    let item = stored_item(test, key1.id, occurrence_reply[0]).await;
+    assert_eq!(item.flags & EVENT_NOTIFICATION_IS_CHANGE, 0, "the stale occurrence reply applied");
+    let organizer4_body = body(&key1.client, &organizer4).await;
+    assert_eq!(
+        organizer4_body.matches("BEGIN:VEVENT").count(),
+        1,
+        "the stale decline added an override: {organizer4_body}"
+    );
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+
     // Cleanup.
     for (party, uid) in [
         (&key2, uid),
         (&key2, uid2),
         (&key2, uid3),
         (&key3, uid3),
+        (&key2, uid4),
     ] {
         let href = copy_href(test, party.id, uid).await;
         party
@@ -2409,7 +2549,7 @@ pub async fn test_reply(test: &mut TestServer) {
             .await
             .with_status(StatusCode::NO_CONTENT);
     }
-    for name in ["drain-r1", "drain-r2", "drain-r3"] {
+    for name in ["drain-r1", "drain-r2", "drain-r3", "drain-r4"] {
         key1.client
             .request_with_headers("DELETE", &format!("{KEY1_CAL}{name}.ics"), [NO_REPLY], "")
             .await
@@ -2442,7 +2582,7 @@ pub fn reply_tree(uid: &str, organizer: &str, attendee: &str, partstat: &str, se
 }
 ```
 
-Oracles: in step 3, the organizer's copy after a reschedule may show key2 as `NEEDS-ACTION` (upstream resets it) or keep `ACCEPTED` from nothing (the invite was never accepted here), so the assertion is only that it is not `DECLINED`. In step 4, the `DELEGATED-FROM`/`DELEGATED-TO` syntax is the one `tests/src/za/reply.rs` case 4(b) uses. If `set_partstat`'s line match fails because the client body folds the ATTENDEE line differently, fix the helper, not the assertions.
+Oracles: step 5's EXDATE reply is built only when the attendee is server-scheduled with RSVP, which the invitation's `RSVP=TRUE` gives; if the PUT builds no reply (no pending item in key1's inbox), stop and report rather than plant one, since the point is upstream's own occurrence reply. In step 3, the organizer's copy after a reschedule may show key2 as `NEEDS-ACTION` (upstream resets it) or keep `ACCEPTED` from nothing (the invite was never accepted here), so the assertion is only that it is not `DECLINED`. In step 4, the `DELEGATED-FROM`/`DELEGATED-TO` syntax is the one `tests/src/za/reply.rs` case 4(b) uses. If `set_partstat`'s line match fails because the client body folds the ATTENDEE line differently, fix the helper, not the assertions.
 
 - [ ] **Step 2: The adoption tests**
 
@@ -2531,7 +2671,7 @@ pub async fn test_adoption(test: &mut TestServer) {
     // applies.
     let uid2 = "za-drain-a2";
     let organizer2 = format!("{KEY1_CAL}drain-a2.ics");
-    test_hooks::set_commit_fail_once(key1.id);
+    test_hooks::set_commit_fail_once(Some(key1.id));
     key1.client
         .request_with_headers(
             "PUT",
@@ -2614,14 +2754,14 @@ Claude-Session: https://claude.ai/code/session_01SmmW3Hx6r7uzLjDdJHEtkr"
 - Modify (fix rounds only): `crates/groupware/src/calendar/drain.rs`
 
 **Interfaces:**
-- Consumes: `HookParked::start(account_id, set, request)` / `finish()` (`tests/src/utils/za.rs`; the request future must be `Send + 'static`), `test_hooks::{set_drain_lookup_pause, set_drain_lease_pause, set_drain_fail_once, set_drain_retry_override, set_lease_secs_override, set_fan_out_pause, set_drain_skip, clear_drain_skip}`, `za_app_password`, `trigger_drain`, `uid_lease::put` (make it `pub` in `tests/src/za/uid_lease.rs`; it builds a 5-second PUT future), `fanout::MKCALENDAR`.
+- Consumes: `HookParked::start(account_id, set, request)` / `finish()` (`tests/src/utils/za.rs`; the request future must be `Send + 'static`), `test_hooks::{set_drain_lookup_pause, set_drain_lease_pause, set_drain_fail_once, set_drain_retry_override, set_lease_secs_override, set_fan_out_pause, set_drain_skip, clear_drain_skip}`, `za_app_password`, `trigger_drain`, `uid_lease::put` (make it `pub` in `tests/src/za/uid_lease.rs`; it builds a 5-second PUT future), `reply::copy`.
 - Produces: nothing new.
 
 Two sessions of key2: the password session (`key2.client`, `trigger_drain(key2.name, STRONG)`) and the app-password session (`trigger_drain(key2.name, &app)`, `put(key2.name, &app, ..)`). They are two key-cache entries, so two `SessionKeys` and two drain locks (spec 6.3). The app password is created once at the start of `test_lease` and revoked at its end as `tests/src/za/app_password.rs` revokes one (`app-password/revoke` with the `credential_id` that `common::auth::credential::AppPassword::parse` reads from the password).
 
 - [ ] **Step 1: The lease tests**
 
-Append to `tests/src/za/drain.rs` (imports: `HookParked`, `za_app_password`, `za_post`, `super::uid_lease::put`, `super::fanout::MKCALENDAR`, `std::time::Duration`, `serde_json::json`):
+Append to `tests/src/za/drain.rs` (imports: `HookParked`, `za_app_password`, `za_post`, `super::uid_lease::put`, `common::auth::credential::AppPassword`, `std::time::Duration`, `serde_json::json`):
 
 ```rust
 pub async fn test_lease(test: &mut TestServer) {
@@ -2629,25 +2769,26 @@ pub async fn test_lease(test: &mut TestServer) {
     let _drain = DrainOn::new();
     let key1 = Party::new(test, "key1@example.com");
     let key2 = Party::new(test, "key2@example.com");
+    let key3 = Party::new(test, "key3@example.com");
     let keys2 = za_unlock(test, key2.id, STRONG).await;
     let start1 = inbox_ids(test, key1.id).await;
     let start2 = inbox_ids(test, key2.id).await;
+    let start3 = inbox_ids(test, key3.id).await;
     let app = za_app_password(key2.name, STRONG, "drain-second-session").await;
     test_hooks::set_drain_retry_override(Some(0));
-    key1.client
-        .request("MKCALENDAR", "/dav/cal/key1%40example.com/drain-second/", MKCALENDAR)
-        .await
-        .with_status(StatusCode::CREATED);
 
     // A. Drain versus drain (spec 6.3, 11). Two fan-outs for one UID
-    // publish the lower document id late: key1's PUT into `default` is
-    // held at the fan-out pause after its item's id was assigned; key1's
-    // PUT of the same UID into `drain-second` delivers the higher id.
-    // Session 1 drains the higher id and is held, holding the lease, right
-    // before its commit; the first PUT then commits the lower id. Session 2
-    // drains: both items find no event, the lease is busy, both stay
-    // pending. Session 1 commits one copy; its next request merges the
-    // lower id into it. Exactly one copy, both items drained.
+    // publish the lower document id late. The late one is key1's PUT, held
+    // at the fan-out pause after its item's id was assigned; key1 holds
+    // its own creation lease for the UID while held, so the second
+    // fan-out comes from another organizer, key3, whose PUT of the same
+    // UID contends on nothing and delivers the higher id. Session 1 drains
+    // the higher id and is held, holding key2's creation lease, right
+    // before its commit; the first PUT then commits the lower id. Session
+    // 2 drains: both items find no event, the lease is busy, both stay
+    // pending. Session 1 commits one copy (key3's invitation); its next
+    // request finds the lower id, whose ORGANIZER differs, and keeps it as
+    // history. Exactly one copy, both items drained.
     let uid = "za-drain-l1";
     let parked_put = HookParked::start(
         key2.id,
@@ -2660,17 +2801,21 @@ pub async fn test_lease(test: &mut TestServer) {
         ),
     )
     .await;
-    key1.client
+    key3.client
         .request_with_headers(
             "PUT",
-            "/dav/cal/key1%40example.com/drain-second/drain-l1.ics",
+            "/dav/cal/key3%40example.com/default/drain-l1.ics",
             [CONTENT_TYPE],
-            invite(uid, START_A, &["key2@example.com"]),
+            super::reply::copy(
+                uid,
+                "key3@example.com",
+                &["ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:key2@example.com"],
+            ),
         )
         .await
         .with_status(StatusCode::CREATED);
     let high = pending_ids(test, key2.id).await;
-    assert_eq!(high.len(), 1, "the second PUT's item is the only committed one");
+    assert_eq!(high.len(), 1, "key3's item is the only committed one");
     let session_1 = HookParked::start(
         key2.id,
         test_hooks::set_drain_lease_pause,
@@ -2699,10 +2844,10 @@ pub async fn test_lease(test: &mut TestServer) {
     assert!(pending_ids(test, key2.id).await.is_empty());
     assert_eq!(uid_copies(test, key2.id, uid).await, 1, "a second copy was imported");
     assert_eq!(za_uid_leases(test).await, 0);
-    // The copy adopted the pair of the item processed last, the late one
-    // (key1's `default` event).
-    let keys1 = za_unlock(test, key1.id, STRONG).await;
-    let late_token = *stored_pairs(test, &keys1, key1.id, "default/drain-l1.ics")
+    // The copy is key3's invitation, with key3's token for key2; key1's
+    // late item was kept as history (OrganizerMismatch), its event_id set.
+    let keys3 = za_unlock(test, key3.id, STRONG).await;
+    let key3_token = *stored_pairs(test, &keys3, key3.id, "default/drain-l1.ics")
         .await
         .expect("pairs")
         .get("key2@example.com")
@@ -2713,8 +2858,13 @@ pub async fn test_lease(test: &mut TestServer) {
             .await
             .expect("pairs")
             .get("key2@example.com"),
-        Some(&late_token)
+        Some(&key3_token)
     );
+    let late = stored_item(test, key2.id, both[0]).await;
+    assert_eq!(late.flags & EVENT_NOTIFICATION_IS_CHANGE, 0);
+    assert!(late.event_id.is_some());
+    let copy_body = body(&key2.client, &copy).await;
+    assert!(copy_body.contains("ORGANIZER:mailto:key3@example.com"), "{copy_body}");
 
     // B. Drain versus PUT (spec 6.3, 11): session 1 is held after its first
     // lookup found nothing, before the lease; session 2 (drain skipped)
@@ -2859,9 +3009,17 @@ pub async fn test_lease(test: &mut TestServer) {
             .await
             .with_status(StatusCode::NO_CONTENT);
     }
+    key3.client
+        .request_with_headers(
+            "DELETE",
+            "/dav/cal/key3%40example.com/default/drain-l1.ics",
+            [NO_REPLY],
+            "",
+        )
+        .await
+        .with_status(StatusCode::NO_CONTENT);
     for href in [
         format!("{KEY1_CAL}drain-l1.ics"),
-        "/dav/cal/key1%40example.com/drain-second/drain-l1.ics".to_string(),
         format!("{KEY1_CAL}drain-l2.ics"),
         format!("{KEY1_CAL}drain-l3.ics"),
         format!("{KEY1_CAL}drain-l4.ics"),
@@ -2871,12 +3029,9 @@ pub async fn test_lease(test: &mut TestServer) {
             .await
             .with_status(StatusCode::NO_CONTENT);
     }
-    key1.client
-        .request("DELETE", "/dav/cal/key1%40example.com/drain-second/", "")
-        .await
-        .with_status(StatusCode::NO_CONTENT);
     key1.delete_items_since(test, &start1).await;
     key2.delete_items_since(test, &start2).await;
+    key3.delete_items_since(test, &start3).await;
     let credential_id = AppPassword::parse(&app).unwrap().credential_id;
     za_post(
         "app-password/revoke",
@@ -2891,7 +3046,7 @@ pub async fn test_lease(test: &mut TestServer) {
 
 Notes for the implementer:
 - `put` in `uid_lease.rs` takes `(name: &str, secret: &str, path: String, body: String)`; make it `pub` and import it. `AppPassword` is `common::auth::credential::AppPassword`, as `tests/src/za/app_password.rs` imports it.
-- In case A, session 2's request takes about 2 s (two items, 20 retries of 50 ms each on the busy lease); `trigger_drain` allows 5 s. If the suite runner is slow enough that `LEASE_RETRIES` elapse before the fan-out pause is released, case A still holds: session 2 finds both items pending with the lease busy either way.
+- In case A, the second fan-out must come from another account: key1's held PUT holds key1's (account, UID) creation lease through its fan-out, so a second key1 PUT of the UID, into any calendar, would wait on that lease and answer 503. key3 is a key account of the suite with its own lease space. Session 2's request takes about 2 s (two items, 20 retries of 50 ms each on the busy lease); `trigger_drain` allows 5 s.
 - In case B, session 2's PUT is a key-account create of the UID: it takes the PUT lease (free, since session 1 is paused before the drain's lease), re-checks archives (none), inserts and releases. Its drain is skipped so it does not import the pending item itself. The PUT answers 201 although key2 is not the organizer: `itip_create` yields `NotOrganizer`, which has no failed precondition and is only traced (`crates/dav/src/calendar/update.rs`). The merged SUMMARY assertion is from code reading: upstream's `Request` arm applies the organizer's entries when the message's SEQUENCE is `>=` the copy's (`inbound.rs:101`); if the copy keeps `fo-reply-title`, stop and report.
 - The DELETE in case D goes through the raw client so the password session's lock (held by the parked pass) is not involved; the app-password session's own drain is skipped.
 - Every assertion naming the lease count is an oracle for `ZaUidLeaseGuard`'s release paths; a leftover lease is a drain bug, not a test bug.
@@ -2961,7 +3116,11 @@ pub async fn test_cursor(test: &mut TestServer) {
         )
         .await
         .with_status(StatusCode::CREATED);
-    test_hooks::set_drain_fail_once(key2.id);
+    // The deferral is an absolute deadline taken at the failing pass, so
+    // the short backoff is set before the failure; the override cannot
+    // shorten a deadline already stored.
+    test_hooks::set_drain_retry_override(Some(2));
+    test_hooks::set_drain_fail_once(Some(key2.id));
     assert_eq!(trigger_drain(key2.name, STRONG).await, 207, "a drain failure failed the request");
     assert_eq!(pending_ids(test, key2.id).await.len(), 1, "a failed commit drained the item");
     assert_eq!(uid_copies(test, key2.id, uid_z).await, 0);
@@ -2972,7 +3131,7 @@ pub async fn test_cursor(test: &mut TestServer) {
         1,
         "the drain retried inside the backoff"
     );
-    test_hooks::set_drain_retry_override(Some(0));
+    tokio::time::sleep(Duration::from_millis(2500)).await;
     assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
     assert!(pending_ids(test, key2.id).await.is_empty(), "the retry did not drain");
     assert_eq!(uid_copies(test, key2.id, uid_z).await, 1);
@@ -3001,7 +3160,7 @@ pub async fn test_cursor(test: &mut TestServer) {
 
 Wire `drain::test_lease` and `drain::test_cursor` after `drain::test_adoption`.
 
-Step 2's second request, inside the backoff, relies on the pass having set `retry_after` to now + 30 s; the suite's own clock makes that deterministic. The failing commit must release the lease (`ItemCtx::commit`'s hook branch does), which the lease count checks.
+Step 2's second request, inside the backoff, relies on the pass having set `retry_after` to now + 2 s (the override in force when it failed); the third request comes 2.5 s later. `now()` is the wall clock (`crates/store/src/write/mod.rs`), so a Tokio time pause would not help. The failing commit must release the lease (`ItemCtx::commit`'s hook branch does), which the lease count checks.
 
 - [ ] **Step 3: Run the suite, then commit**
 
@@ -3030,7 +3189,7 @@ Claude-Session: https://claude.ai/code/session_01SmmW3Hx6r7uzLjDdJHEtkr"
 
 - [ ] **Step 1: The error tests**
 
-Append to `tests/src/za/drain.rs` (imports: `rewrite_inbox_item`, `calcard::icalendar::ICalendarValue`):
+Append to `tests/src/za/drain.rs` (imports: `rewrite_inbox_item`, `calcard::icalendar::ICalendarValue`, `super::fanout::MKCALENDAR`; for step 6, `::registry::{schema::{enums::StorageQuota, prelude::ObjectType}, types::EnumImpl}` and `serde_json::json`, as `tests/src/za/fanout.rs` imports them):
 
 ```rust
 /// A REQUEST as upstream's organizer builder shapes it, for planting.
@@ -3209,6 +3368,41 @@ pub async fn test_errors(test: &mut TestServer) {
     assert_eq!(pairs.len(), 2, "the second item's pair was not adopted alongside the first");
     assert!(pairs.get("key2@example.com").is_some() && pairs.get("key2+two@example.com").is_some());
 
+    // 6. Quota (spec 6.4 step 4): an import past key2's disk quota is an
+    // iTIP-level rejection, kept as history, no copy. A failed quota
+    // counter read is a store error that keeps the item pending; the test
+    // store cannot fail, so that path rests on the classification in
+    // `is_over_quota`, the fan-out's.
+    let admin = test.account("admin@example.com").clone();
+    let key2_account = test.account("key2@example.com").id();
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            key2_account,
+            json!({ Property::Quotas: { StorageQuota::MaxDiskQuota.as_str(): 1 } }),
+        )
+        .await;
+    let uid3 = "za-drain-e7";
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &format!("{KEY1_CAL}drain-e7.ics"),
+            [CONTENT_TYPE],
+            invite(uid3, START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let over_quota = pending_ids(test, key2.id).await;
+    assert_eq!(over_quota.len(), 1);
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    let item = stored_item(test, key2.id, over_quota[0]).await;
+    assert_eq!(item.flags & EVENT_NOTIFICATION_ZA_PENDING, 0, "an over-quota import stayed pending");
+    assert_eq!(item.event_id, None);
+    assert_eq!(uid_copies(test, key2.id, uid3).await, 0, "an import past the quota");
+    admin
+        .registry_update_object(ObjectType::Account, key2_account, json!({ Property::Quotas: {} }))
+        .await;
+
     // Cleanup.
     for href in [first, second.to_string(), copy2] {
         key2.client
@@ -3220,7 +3414,7 @@ pub async fn test_errors(test: &mut TestServer) {
         .request("DELETE", "/dav/cal/key2%40example.com/drain-second/", "")
         .await
         .with_status(StatusCode::NO_CONTENT);
-    for name in ["drain-e5", "drain-e6"] {
+    for name in ["drain-e5", "drain-e6", "drain-e7"] {
         key1.client
             .request_with_headers("DELETE", &format!("{KEY1_CAL}{name}.ics"), [NO_REPLY], "")
             .await
@@ -3583,7 +3777,6 @@ One at a time, each reverted with `git checkout -- <file>` and confirmed with an
 | M34 | The sender check (spec 6.4 step 2) | in `drain_item`, replace `if !sender_matches` with `if false` | `drain::test_errors` step 2: "a mismatched sender's invitation was imported" |
 | M35 | The cursor rule (spec 6.2) | in `drain_pass`, make the `Ok(false)` and `Err` arms call `state.complete(snapshot)` | `drain::test_cursor` step 2: "the retry did not drain" (the item never drains again without an arrival) |
 | M36 | The sweep's assertion (spec 6.3 step 4) | in `clear_uid_leases`, delete the `batch.assert_value(..)` line | `cargo test -p common za::lease`: `the_sweep_keeps_a_lease_retaken_after_its_scan`, "the sweep removed the new holder's lease" |
-| M37 | One store write per item (spec 6.3, "The pass") | in `import`, add `batch.commit_point();` right after `ctx.rewrite_in(..)` | `drain::test_lease` case D: "a copy without its item" (the rewrite fails its assertion alone, the insert commits) |
 
 If a mutation survives, the covering test is wrong, not the mutation: add the assertion that catches it to the owning test, rerun, and record it.
 
