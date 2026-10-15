@@ -998,8 +998,11 @@ pub async fn copy_href(test: &TestServer, account_id: u32, uid: &str) -> String 
         .fetch_dav_resources(account_id, account_id, SyncCollection::Calendar)
         .await
         .unwrap();
-    let path = resources
-        .any_resource_path_by_id(ids.iter().next().unwrap())
-        .expect("the copy is in the resource cache");
-    resources.format_resource(path)
+    // Calendars and events number their documents separately, so a
+    // calendar can share the event's id: `format_resource` ends a
+    // container's href with '/', an event's never.
+    resources
+        .format_resource_paths_by_id(ids.iter().next().unwrap())
+        .find(|href| !href.ends_with('/'))
+        .expect("the copy is in the resource cache")
 }
