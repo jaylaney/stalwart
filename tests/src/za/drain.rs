@@ -12,8 +12,8 @@ use super::{
     STRONG,
     dav_seal::raw_event,
     fanout::{
-        CONTENT_TYPE, KEY1_CAL, NO_REPLY, Party, START_A, START_B, attendee_statuses, invite,
-        pair_token, stored_pairs, stored_sequence, uid_copies,
+        CONTENT_TYPE, KEY1_CAL, MKCALENDAR, NO_REPLY, Party, START_A, START_B, attendee_statuses,
+        invite, pair_token, stored_pairs, stored_sequence, uid_copies,
     },
     uid_lease::put,
 };
@@ -23,11 +23,19 @@ use crate::utils::{
     za::{
         HookParked, PlantedItem, copy_href, envelope_wrap, inbox_ids, inbox_items, item_method,
         item_partstat, new_inbox_items, open_pending_item_as, pending_ids, plant_inbox_item,
-        trigger_drain, wait_for_delivery, za_app_password, za_post, za_uid_leases, za_unlock,
+        rewrite_inbox_item, trigger_drain, wait_for_delivery, za_app_password, za_post,
+        za_uid_leases, za_unlock,
     },
 };
-use ::registry::schema::{prelude::Property, structs::CalendarScheduling};
-use calcard::icalendar::ICalendarMethod;
+use ::registry::{
+    schema::{
+        enums::StorageQuota,
+        prelude::{ObjectType, Property},
+        structs::CalendarScheduling,
+    },
+    types::EnumImpl,
+};
+use calcard::icalendar::{ICalendarMethod, ICalendarValue};
 use common::{
     auth::credential::AppPassword,
     za::test_hooks::{self, DRAIN_SKIP_ALL},
@@ -1453,6 +1461,296 @@ pub async fn test_cursor(test: &mut TestServer) {
             .with_status(StatusCode::NO_CONTENT);
     }
     for name in ["drain-c1", "drain-c2", "drain-c3"] {
+        key1.client
+            .request_with_headers("DELETE", &format!("{KEY1_CAL}{name}.ics"), [NO_REPLY], "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    key1.delete_items_since(test, &start1).await;
+    key2.delete_items_since(test, &start2).await;
+    assert_eq!(za_uid_leases(test).await, 0);
+    test.wait_for_tasks_skip_not_due().await;
+}
+
+/// A REQUEST as upstream's organizer builder shapes it, for planting.
+pub fn request_tree(uid: &str, organizer: &str, attendee: &str) -> String {
+    format!(
+        concat!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\nMETHOD:REQUEST\r\n",
+            "BEGIN:VEVENT\r\nUID:{uid}\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:{start}\r\n",
+            "DURATION:PT1H\r\nSEQUENCE:0\r\nSUMMARY:planted {uid}\r\n",
+            "ORGANIZER:mailto:{organizer}\r\n",
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{attendee}\r\n",
+            "END:VEVENT\r\nEND:VCALENDAR\r\n"
+        ),
+        uid = uid,
+        start = START_A,
+        organizer = organizer,
+        attendee = attendee
+    )
+}
+
+pub async fn test_errors(test: &mut TestServer) {
+    println!("Running zero-access drain item error tests...");
+    let _drain = DrainOn::new();
+    let key1 = Party::new(test, "key1@example.com");
+    let key2 = Party::new(test, "key2@example.com");
+    let key3 = Party::new(test, "key3@example.com");
+    let keys2 = za_unlock(test, key2.id, STRONG).await;
+    let start1 = inbox_ids(test, key1.id).await;
+    let start2 = inbox_ids(test, key2.id).await;
+
+    // 1. Permanent errors (spec 6.5): a plaintext item with the pending bit
+    // (no envelope) and a pending item whose envelope is corrupt are
+    // deleted; nothing is imported.
+    let plaintext = plant_inbox_item(
+        test,
+        key2.id,
+        &request_tree("za-drain-e1", "key1@example.com", "key2@example.com"),
+        PlantedItem::Plain {
+            flags: EVENT_NOTIFICATION_ZA_PENDING,
+        },
+        key1.id,
+        None,
+    )
+    .await;
+    let corrupt = plant_inbox_item(
+        test,
+        key2.id,
+        &request_tree("za-drain-e2", "key1@example.com", "key2@example.com"),
+        PlantedItem::Pending {
+            pair: Some(("key2@example.com", [0x11; 16])),
+            reply_token: None,
+        },
+        key1.id,
+        None,
+    )
+    .await;
+    rewrite_inbox_item(test, key2.id, corrupt, |item| {
+        // The root's last entry is `X-ZA-KEY`; its text becomes garbage.
+        let envelope = item.event.components[0].entries.last_mut().unwrap();
+        envelope.values = vec![ICalendarValue::Text("AAAA".to_string())];
+    })
+    .await;
+    assert_eq!(pending_ids(test, key2.id).await.len(), 2);
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    let ids = inbox_ids(test, key2.id).await;
+    assert!(
+        !ids.contains(&plaintext) && !ids.contains(&corrupt),
+        "an undecodable item was kept: {ids:?}"
+    );
+    assert_eq!(uid_copies(test, key2.id, "za-drain-e1").await, 0);
+    assert_eq!(uid_copies(test, key2.id, "za-drain-e2").await, 0);
+
+    // 2. Sender mismatch (spec 6.4 step 2): an item whose ORGANIZER is key1
+    // but whose `changed_by` is key3 is kept as history, not applied.
+    let mismatch = plant_inbox_item(
+        test,
+        key2.id,
+        &request_tree("za-drain-e3", "key1@example.com", "key2@example.com"),
+        PlantedItem::Pending {
+            pair: Some(("key2@example.com", [0x22; 16])),
+            reply_token: None,
+        },
+        key3.id,
+        None,
+    )
+    .await;
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    let item = stored_item(test, key2.id, mismatch).await;
+    assert_eq!(
+        item.flags & EVENT_NOTIFICATION_ZA_PENDING,
+        0,
+        "history is not pending"
+    );
+    assert_eq!(item.event_id, None);
+    assert_eq!(
+        envelope_wrap(&item.event),
+        Some(1),
+        "history is resealed under the master key"
+    );
+    assert_eq!(
+        uid_copies(test, key2.id, "za-drain-e3").await,
+        0,
+        "a mismatched sender's invitation was imported"
+    );
+
+    // 3. A REPLY for an event the organizer does not have (Review Focus 4):
+    // kept as history with no event, nothing deleted.
+    let orphan = plant_inbox_item(
+        test,
+        key2.id,
+        &reply_tree(
+            "za-drain-e4",
+            "key2@example.com",
+            "key1@example.com",
+            "ACCEPTED",
+            0,
+        ),
+        PlantedItem::Pending {
+            pair: None,
+            reply_token: Some([0x33; 16]),
+        },
+        key1.id,
+        None,
+    )
+    .await;
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    let item = stored_item(test, key2.id, orphan).await;
+    assert_eq!(item.flags & EVENT_NOTIFICATION_ZA_PENDING, 0);
+    assert_eq!(item.event_id, None);
+
+    // 4. The same UID in two calendars (Review Focus 2): key2 copies its
+    // imported event into a second calendar; key1's update merges into the
+    // lowest document id only.
+    let uid = "za-drain-e5";
+    let organizer = format!("{KEY1_CAL}drain-e5.ics");
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &organizer,
+            [CONTENT_TYPE],
+            invite(uid, START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    let first = copy_href(test, key2.id, uid).await;
+    key2.client
+        .request(
+            "MKCALENDAR",
+            "/dav/cal/key2%40example.com/drain-second/",
+            MKCALENDAR,
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    // A COPY within one account links the event into the second calendar
+    // (one document, two names: `copy_event` pushes a `DavName`), so the
+    // second copy is a PUT of the first's body (the brief's fallback).
+    let second = "/dav/cal/key2%40example.com/drain-second/e5-copy.ics";
+    let first_body = body(&key2.client, &first).await;
+    key2.client
+        .request_with_headers("PUT", second, [CONTENT_TYPE], first_body)
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(uid_copies(test, key2.id, uid).await, 2);
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &organizer,
+            [CONTENT_TYPE],
+            invite(uid, START_B, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    let merged = body(&key2.client, &first).await;
+    let untouched = body(&key2.client, second).await;
+    assert!(merged.contains(&format!("DTSTART:{START_B}")), "{merged}");
+    assert!(
+        untouched.contains(&format!("DTSTART:{START_A}")),
+        "{untouched}"
+    );
+    assert!(pending_ids(test, key2.id).await.is_empty());
+
+    // 5. Two addresses that resolve to one account (plan 9 outcome): two
+    // items for one UID, different pairs; the drain imports the first and
+    // merges the second; the copy ends with both pairs.
+    let uid2 = "za-drain-e6";
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &format!("{KEY1_CAL}drain-e6.ics"),
+            [CONTENT_TYPE],
+            invite(uid2, START_A, &["key2@example.com", "key2+two@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(
+        pending_ids(test, key2.id).await.len(),
+        2,
+        "one item per address"
+    );
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    assert!(pending_ids(test, key2.id).await.is_empty());
+    assert_eq!(uid_copies(test, key2.id, uid2).await, 1);
+    let copy2 = copy_href(test, key2.id, uid2).await;
+    let pairs = stored_pairs(test, &keys2, key2.id, &relative(&copy2))
+        .await
+        .expect("pairs");
+    assert_eq!(
+        pairs.len(),
+        2,
+        "the second item's pair was not adopted alongside the first"
+    );
+    assert!(pairs.get("key2@example.com").is_some() && pairs.get("key2+two@example.com").is_some());
+
+    // 6. Quota (spec 6.4 step 4): an import past key2's disk quota is an
+    // iTIP-level rejection, kept as history, no copy. A failed quota
+    // counter read is a store error that keeps the item pending; the test
+    // store cannot fail, so that path rests on the classification in
+    // `is_over_quota`, the fan-out's.
+    // The fan-out checks the recipient's quota too (plan 9, 7a), so the
+    // invitation is delivered first and the quota lowered before key2's
+    // request.
+    let admin = test.account("admin@example.com").clone();
+    let key2_account = test.account("key2@example.com").id();
+    let uid3 = "za-drain-e7";
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &format!("{KEY1_CAL}drain-e7.ics"),
+            [CONTENT_TYPE],
+            invite(uid3, START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let over_quota = pending_ids(test, key2.id).await;
+    assert_eq!(
+        over_quota.len(),
+        1,
+        "the invitation was delivered under the full quota"
+    );
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            key2_account,
+            json!({ Property::Quotas: { StorageQuota::MaxDiskQuota.as_str(): 1 } }),
+        )
+        .await;
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    let item = stored_item(test, key2.id, over_quota[0]).await;
+    assert_eq!(
+        item.flags & EVENT_NOTIFICATION_ZA_PENDING,
+        0,
+        "an over-quota import stayed pending"
+    );
+    assert_eq!(item.event_id, None);
+    assert_eq!(
+        uid_copies(test, key2.id, uid3).await,
+        0,
+        "an import past the quota"
+    );
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            key2_account,
+            json!({ Property::Quotas: {} }),
+        )
+        .await;
+
+    // Cleanup.
+    for href in [first, second.to_string(), copy2] {
+        key2.client
+            .request_with_headers("DELETE", &href, [NO_REPLY], "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    key2.client
+        .request("DELETE", "/dav/cal/key2%40example.com/drain-second/", "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    for name in ["drain-e5", "drain-e6", "drain-e7"] {
         key1.client
             .request_with_headers("DELETE", &format!("{KEY1_CAL}{name}.ics"), [NO_REPLY], "")
             .await
