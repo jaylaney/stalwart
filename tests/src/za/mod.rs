@@ -19,6 +19,7 @@ pub mod cors;
 pub mod dav_gate;
 pub mod dav_seal;
 pub mod disabled;
+pub mod drain;
 pub mod expansion;
 pub mod fanout;
 pub mod gating;
@@ -117,6 +118,7 @@ pub async fn za_tests() {
     fanout::test_plain_owner(&mut test).await;
     reply::test(&mut test).await;
     uid_lease::test(&mut test).await;
+    drain::test(&mut test).await;
     sweep::test(&mut test).await;
     tracing::test(&mut test).await;
     expansion::test(&mut test).await;

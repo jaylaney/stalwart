@@ -48,6 +48,7 @@ use dav_proto::{
         },
     },
 };
+use groupware::calendar::drain::ZaDrain;
 use http_proto::{
     HttpRequest, HttpResponse, HttpSessionData,
     request::{fetch_body, fetch_body_untraced},
@@ -645,6 +646,15 @@ impl DavRequestHandler for Server {
         let mut headers = RequestHeaders::new(request.uri().path());
         for (key, value) in request.headers() {
             headers.parse(key.as_str(), value.to_str().unwrap_or_default());
+        }
+
+        // Invitations spec 6.1-6.2: a key account's own request drains its
+        // pending inbox items first. The token holds keys only for the
+        // account that authenticated, so a request for another account's
+        // data still drains the caller's own inbox. The drain never fails
+        // the request (invariant 14).
+        if let Some(keys) = access_token.za_keys_for(access_token.account_id()) {
+            self.za_drain(keys).await;
         }
 
         let start_time = Instant::now();
