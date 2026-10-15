@@ -520,9 +520,9 @@ abort) or that could not take a creation lease for an item (section 6.3)
 does not advance the remembered id, because
 `fetch_dav_resources` returns unchanged state when nothing newer exists and
 the item would otherwise wait for an unrelated change. A per-session retry
-backoff, 30 seconds after such a pass (`ZA_DRAIN_RETRY_SECS` in this spec,
-a name to confirm in planning), keeps a stuck item from draining on every
-request.
+backoff, 30 seconds after such a pass (`DRAIN_RETRY_SECS`, a constant of
+30 seconds with a test-mode override; plan 10 settled on no environment
+knob), keeps a stuck item from draining on every request.
 
 An invitation therefore appears at the attendee client's next poll, not at
 the next login.
@@ -596,7 +596,9 @@ one more writer and closes the gap for key accounts.)
    configuration: `purge_in_memory_store()` skips the `KV_LOCK_ZA_UID`
    range (step 2), so the sweep is the only cleanup. The fork adds one call
    to the maintenance task's purge step
-   (`crates/services/src/task_manager/maintenance.rs`): iterate the
+   (`crates/services/src/task_manager/maintenance.rs`),
+   `sweep_expired_uid_leases`, in the `PurgeData` arm after
+   `purge_in_memory_store`: iterate the
    `KV_LOCK_ZA_UID` key range in the data store and clear every key whose
    leading eight-byte expiry is at or below now, each clear asserting the
    value the sweep read, so a lease re-taken in between survives. Without
@@ -606,7 +608,9 @@ one more writer and closes the gap for key accounts.)
    through the insert. Updates and merges of an existing event are already
    protected by the assertion on the event's stored archive, which the
    drain's batch carries. Non-key accounts take no lease: the PUT path's
-   lease is behind the key-account branch (invariant 9).
+   lease is behind the key-account branch (invariant 9). A merge whose
+   fan-out would deliver new items takes the UID lease of the organizer's
+   account first, so two sessions of the organizer cannot both fan out.
 6. **Why it suffices.** Two creators of one UID in one account serialize on
    the lease, and the second finds the first's event when it re-checks:
    the drain through the fresh UID index, the PUT through current archives
@@ -624,7 +628,9 @@ pending bit is already clear. Each item's batch holds the event write
 archive as read (`assert_value`), and the lease when the item imports; the
 event write of a merge carries the index builder's assertion on the
 event's stored archive. A lost assertion aborts the pass, and the next
-trigger re-enumerates. An async lock on the `SessionKeys` entry keeps to
+trigger re-enumerates. A busy creation lease stops the pass at that item;
+later items wait for the next pass, so items for one UID keep their order.
+An async lock on the `SessionKeys` entry keeps to
 one pass per session on a node without a store round trip. The drain never
 fails the request that triggered it: errors are traced and the request
 proceeds.
@@ -938,7 +944,8 @@ consumer pause must live where both `http` and `services` can reach it
   the default configuration, where the in-memory store is the data store;
   a Redis-plus-data-store run of the same check would live in the `store`
   suite's Redis container harness (`tests/src/utils/containers.rs`, used by
-  `tests/src/store/lookup.rs`), a decision for planning (section 13).
+  `tests/src/store/lookup.rs`), not added: the sweep reads and writes the
+  data store on every configuration (plan 10).
 - The attendee's copy lands on the default calendar with `itip_auto_add`
   on and off (a local sender always adds).
 - An organizer client that drops unknown parameters on its next PUT keeps
@@ -997,8 +1004,9 @@ greater than zero for them.
 **Key-mode CalDAV suite** (`ZA_KEY_ACCOUNTS=1 webdav_tests`,
 `tests/src/webdav/za_variants.rs`). The `scheduling` variant, which today
 asserts that nothing is sent, flips to asserting sealed delivery and a
-drained attendee copy. Which of upstream's `cal_scheduling` assertions can
-now run unchanged in key mode is settled in planning.
+drained attendee copy. Upstream's `cal_scheduling` test still does not run
+in key mode; the variant asserts the drained copy, the update and the cancel
+(plan 10).
 
 **Mutation checks** in the style of plan 7: removing the token check makes
 the forged-reply test fail; removing the recipient split makes the
@@ -1048,7 +1056,7 @@ Release 1's ten invariants hold. Release 2 adds:
   `aad` helper prefixes with `za/v1|`), the reply property
   (`X-ZA-RSVP-TOKEN`), the `X-ZA-EXTRA` format byte for bundles with token
   pairs (`2`), the inbox items' scope (`itip`) and drained key-envelope
-  purpose, the drain's retry backoff (`ZA_DRAIN_RETRY_SECS`, 30 seconds),
+  purpose, the drain's retry backoff (`DRAIN_RETRY_SECS`, a constant of 30 seconds),
   the creation lease prefix (`KV_LOCK_ZA_UID`), the lease duration and its
   test knob (`ZA_UID_LEASE_SECS`), the fence token length, and the lease
   retry count and wait (values for planning). The lease key carries the
@@ -1072,7 +1080,7 @@ Release 1's ten invariants hold. Release 2 adds:
 - **The mid-session trigger.** Options: the change-log since-query for the
   inbox per request (section 6.2), or a per-account pending counter in
   memory (never a stored struct), bumped by the fan-out and broadcast to
-  other nodes with `CacheInvalidation`.
+  other nodes with `CacheInvalidation`. Plan 10 took the first option.
 - **Upstream `cal_scheduling` assertions** runnable in key mode: the list.
 - **Pending items and `sync-collection`.** A drained item changes between
   two syncs, and the expected client behaviour is a normal change. The
@@ -1083,7 +1091,8 @@ Release 1's ten invariants hold. Release 2 adds:
   whether it is skipped when the in-memory store is the data store (the
   existing purge already covers that case); and whether a
   Redis-plus-data-store run of the sweep test joins the `store` suite's
-  Redis container harness.
+  Redis container harness. Plan 10: after `purge_in_memory_store` in the
+  `PurgeData` arm, on every configuration, no Redis container test.
 
 ## 14. Alternatives considered
 
