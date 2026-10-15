@@ -100,7 +100,7 @@ Process:
 | Hooks | `DRAIN_LOOKUP_PAUSE` (import: after the first UID lookup found nothing, before the lease), `DRAIN_LEASE_PAUSE` (holding the lease, after the second lookup, before the commit), `DRAIN_FAIL_ONCE` (the account's next drain commit fails with an internal error), `DRAIN_SKIP` (accounts whose drain does not run; `DRAIN_SKIP_ALL = u32::MAX`), `DRAIN_RETRY_OVERRIDE` | `test_hooks.rs` |
 | Trace details | `zero-access: drain pass failed` (error level, the pass's error), `zero-access: drain creation lease busy` (`Store(AssertValueFailed)`), `zero-access: drain commit lost its assertion` (the pass's error), `zero-access: undecodable inbox item deleted` and `zero-access: inbox item kept as history` (`Calendar(ItipMessageError)`, `Reason` = a fixed variant name), `zero-access: reply token mismatch` (`Security(Unauthorized)`) | `drain.rs` |
 | Item flags after the drain | import: `0`; merge: `EVENT_NOTIFICATION_IS_CHANGE` (as `commit_itip_merge` sets it); kept as history: `0`; `event_id` = the event's document id when one was found or created, else `None`; `created` kept, `modified` = now | `drain.rs` |
-| Stale reply | per item: a REPLY is stale when any of its instances has a SEQUENCE lower than the event's current SEQUENCE for the same `InstanceId`, or, for an occurrence the event stores no override for, than the master's (absent = 0); rejected as `ItipError::OutOfSequence`, kept as history | `drain.rs` |
+| Stale reply | per item: a REPLY is stale when any of its instances has a SEQUENCE lower than that of the event component governing it: the same `InstanceId`'s override, else the latest `RANGE=THISANDFUTURE` override at or before the occurrence, else the master (absent = 0); rejected as `ItipError::OutOfSequence`, kept as history | `drain.rs` |
 | Sender check | the candidates are the ORGANIZER of a REQUEST or CANCEL and every ATTENDEE of a REPLY (upstream exports the replier with its delegates and delegators); those resolving with `Server::za_account_id_from_email` (quiet) to `ChangedBy::PrincipalId` are the sender's addresses; none, or a `CalendarAddress` sender, is rejected as `SenderIsNotOrganizerNorAttendee`, kept as history. For a REPLY the replier is the sender's address whose pair holds the token; none matching is a forgery | `drain.rs` |
 | Quota at the drain | only `Limit(Quota)` / `Limit(TenantQuota)` from `has_available_quota` is the `QuotaExceeded` rejection (as the fan-out classifies it); any other error is a store error that keeps the item pending | `drain.rs` |
 | Permanent errors | any `open_pending_item` error, an unparsable or missing METHOD, a METHOD other than REQUEST, REPLY, CANCEL: the item is deleted | `drain.rs` |
@@ -1126,21 +1126,48 @@ fn sender_candidates(snapshots: &ItipSnapshots<'_>, method: Method) -> Vec<Strin
 }
 
 /// Spec 6.4, REPLY: stale when any instance of the reply carries a
-/// SEQUENCE below the event's current SEQUENCE for the same instance
-/// (absent counts as 0). An occurrence the event stores no override for
-/// (a decline by EXDATE, which upstream's merge adds as a new override) is
-/// judged against the master, whose SEQUENCE a reschedule bumps. Upstream's
-/// `handle_reply` makes no such check.
+/// SEQUENCE below the current SEQUENCE of the event component that
+/// governs that instance (absent counts as 0). Upstream's `handle_reply`
+/// makes no such check.
 fn is_stale_reply(event: &ItipSnapshots<'_>, reply: &ItipSnapshots<'_>) -> bool {
     reply.components.iter().any(|(instance_id, instance)| {
-        event
-            .components
-            .get(instance_id)
-            .or_else(|| event.components.get(&InstanceId::Main))
-            .is_some_and(|current| {
-                instance.sequence.unwrap_or(0) < current.sequence.unwrap_or(0)
-            })
+        governing_sequence(event, instance_id)
+            .is_some_and(|current| instance.sequence.unwrap_or(0) < current)
     })
+}
+
+/// The SEQUENCE of the event component that governs `instance_id`: its own
+/// override when stored; otherwise, for an occurrence, the latest
+/// `RANGE=THISANDFUTURE` override at or before it (a ranged override is a
+/// different `InstanceId`, since `RecurrenceId` equality includes the
+/// flag); otherwise the master, whose SEQUENCE a reschedule bumps. An
+/// occurrence without any of these (a decline by EXDATE, which upstream's
+/// merge adds as a new override) is therefore judged against what covers
+/// it. `None` only for an event without a master component.
+fn governing_sequence(event: &ItipSnapshots<'_>, instance_id: &InstanceId) -> Option<i64> {
+    if let Some(exact) = event.components.get(instance_id) {
+        return Some(exact.sequence.unwrap_or(0));
+    }
+    if let InstanceId::Recurrence(occurrence) = instance_id
+        && let Some((_, ranged)) = event
+            .components
+            .iter()
+            .filter_map(|(id, component)| match id {
+                InstanceId::Recurrence(range)
+                    if range.this_and_future && range.date <= occurrence.date =>
+                {
+                    Some((range.date, component))
+                }
+                _ => None,
+            })
+            .max_by_key(|(date, _)| *date)
+    {
+        return Some(ranged.sequence.unwrap_or(0));
+    }
+    event
+        .components
+        .get(&InstanceId::Main)
+        .map(|master| master.sequence.unwrap_or(0))
 }
 
 /// Spec 6.4, REQUEST with no event: upstream's import (`itip_ingest`) with
@@ -1755,7 +1782,7 @@ mod tests {
     /// its delegate's (`attendee_entry_uids`).
     fn delegation_reply() -> ICalendar {
         parse(
-            "BEGIN:VCALENDAR\\r\\nVERSION:2.0\\r\\nPRODID:-//t//EN\\r\\nMETHOD:REPLY\\r\\nBEGIN:VEVENT\\r\\nUID:stale-1\\r\\nDTSTAMP:20240101T000000Z\\r\\nSEQUENCE:0\\r\\nORGANIZER:mailto:org@example.com\\r\\nATTENDEE;PARTSTAT=NEEDS-ACTION;DELEGATED-FROM=\\"mailto:att@example.com\\":mailto:del@example.com\\r\\nATTENDEE;PARTSTAT=DELEGATED;DELEGATED-TO=\\"mailto:del@example.com\\":mailto:att@example.com\\r\\nEND:VEVENT\\r\\nEND:VCALENDAR\\r\\n",
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nMETHOD:REPLY\r\nBEGIN:VEVENT\r\nUID:stale-1\r\nDTSTAMP:20240101T000000Z\r\nSEQUENCE:0\r\nORGANIZER:mailto:org@example.com\r\nATTENDEE;PARTSTAT=NEEDS-ACTION;DELEGATED-FROM=\"mailto:att@example.com\":mailto:del@example.com\r\nATTENDEE;PARTSTAT=DELEGATED;DELEGATED-TO=\"mailto:del@example.com\":mailto:att@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
         )
     }
 
@@ -1787,37 +1814,51 @@ mod tests {
         assert_eq!(candidates, ["att@example.com", "del@example.com"]);
     }
 
-    fn recurring_event(sequence: i64, with_override: Option<i64>) -> ICalendar {
+    /// A daily master at `sequence`, with an override of the 3rd at
+    /// `with_override`'s sequence: an ordinary one, or (`ranged`) a
+    /// `RANGE=THISANDFUTURE` one.
+    fn recurring_event(sequence: i64, with_override: Option<i64>, ranged: bool) -> ICalendar {
+        let range = if ranged { ";RANGE=THISANDFUTURE" } else { "" };
         let override_ = with_override.map_or(String::new(), |s| format!(
-            "BEGIN:VEVENT\\r\\nUID:stale-1\\r\\nRECURRENCE-ID:20990103T090000Z\\r\\nDTSTAMP:20240101T000000Z\\r\\nDTSTART:20990103T100000Z\\r\\nDTEND:20990103T110000Z\\r\\nSEQUENCE:{s}\\r\\nORGANIZER:mailto:org@example.com\\r\\nATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:att@example.com\\r\\nEND:VEVENT\\r\\n"
+            "BEGIN:VEVENT\r\nUID:stale-1\r\nRECURRENCE-ID{range}:20990103T090000Z\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990103T100000Z\r\nDTEND:20990103T110000Z\r\nSEQUENCE:{s}\r\nORGANIZER:mailto:org@example.com\r\nATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:att@example.com\r\nEND:VEVENT\r\n"
         ));
         parse(&format!(
-            "BEGIN:VCALENDAR\\r\\nVERSION:2.0\\r\\nPRODID:-//t//EN\\r\\nBEGIN:VEVENT\\r\\nUID:stale-1\\r\\nDTSTAMP:20240101T000000Z\\r\\nDTSTART:20990102T090000Z\\r\\nDTEND:20990102T100000Z\\r\\nRRULE:FREQ=DAILY;COUNT=5\\r\\nSEQUENCE:{sequence}\\r\\nORGANIZER:mailto:org@example.com\\r\\nATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:att@example.com\\r\\nEND:VEVENT\\r\\n{override_}END:VCALENDAR\\r\\n"
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\nUID:stale-1\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990102T090000Z\r\nDTEND:20990102T100000Z\r\nRRULE:FREQ=DAILY;COUNT=5\r\nSEQUENCE:{sequence}\r\nORGANIZER:mailto:org@example.com\r\nATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:att@example.com\r\nEND:VEVENT\r\n{override_}END:VCALENDAR\r\n"
         ))
     }
 
-    fn occurrence_reply(sequence: i64) -> ICalendar {
+    /// An ordinary occurrence REPLY for the occurrence of `day` (2 to 6).
+    fn occurrence_reply(sequence: i64, day: u8) -> ICalendar {
         parse(&format!(
-            "BEGIN:VCALENDAR\\r\\nVERSION:2.0\\r\\nPRODID:-//t//EN\\r\\nMETHOD:REPLY\\r\\nBEGIN:VEVENT\\r\\nUID:stale-1\\r\\nRECURRENCE-ID:20990103T090000Z\\r\\nDTSTAMP:20240101T000000Z\\r\\nSEQUENCE:{sequence}\\r\\nORGANIZER:mailto:org@example.com\\r\\nATTENDEE;PARTSTAT=DECLINED:mailto:att@example.com\\r\\nEND:VEVENT\\r\\nEND:VCALENDAR\\r\\n"
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nMETHOD:REPLY\r\nBEGIN:VEVENT\r\nUID:stale-1\r\nRECURRENCE-ID:2099010{day}T090000Z\r\nDTSTAMP:20240101T000000Z\r\nSEQUENCE:{sequence}\r\nORGANIZER:mailto:org@example.com\r\nATTENDEE;PARTSTAT=DECLINED:mailto:att@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
         ))
     }
 
     #[test]
-    fn an_occurrence_reply_without_an_override_is_judged_against_the_master() {
+    fn an_occurrence_reply_is_judged_against_the_component_that_governs_it() {
         let org = organizer();
+        let snap = |ical: &ICalendar| itip_snapshot(ical, &org, false).unwrap();
         // The master was rescheduled to SEQUENCE 1; the decline of an
         // occurrence at SEQUENCE 0 is stale although no override exists.
-        let master_only = recurring_event(1, None);
-        let master_only = itip_snapshot(&master_only, &org, false).unwrap();
-        let old = occurrence_reply(0);
-        assert!(is_stale_reply(&master_only, &itip_snapshot(&old, &org, false).unwrap()));
-        let fresh = occurrence_reply(1);
-        assert!(!is_stale_reply(&master_only, &itip_snapshot(&fresh, &org, false).unwrap()));
+        let master_only = recurring_event(1, None, false);
+        let master_only = snap(&master_only);
+        let old = occurrence_reply(0, 3);
+        assert!(is_stale_reply(&master_only, &snap(&old)));
+        let fresh = occurrence_reply(1, 3);
+        assert!(!is_stale_reply(&master_only, &snap(&fresh)));
         // A stored override keeps its own SEQUENCE: at 0 while the master
         // is at 1, a reply at 0 for that occurrence is not stale.
-        let with_override = recurring_event(1, Some(0));
-        let with_override = itip_snapshot(&with_override, &org, false).unwrap();
-        assert!(!is_stale_reply(&with_override, &itip_snapshot(&old, &org, false).unwrap()));
+        let with_override = recurring_event(1, Some(0), false);
+        assert!(!is_stale_reply(&snap(&with_override), &snap(&old)));
+        // A THISANDFUTURE override at 1 from the 3rd governs the 3rd and
+        // later occurrences while the master stays at 0: an ordinary reply
+        // at 0 for the 4th is stale, one for the 2nd is not.
+        let ranged = recurring_event(0, Some(1), true);
+        let ranged = snap(&ranged);
+        assert!(is_stale_reply(&ranged, &snap(&occurrence_reply(0, 4))));
+        assert!(is_stale_reply(&ranged, &snap(&occurrence_reply(0, 3))));
+        assert!(!is_stale_reply(&ranged, &snap(&occurrence_reply(0, 2))));
+        assert!(!is_stale_reply(&ranged, &snap(&occurrence_reply(1, 4))));
     }
 
     #[test]
@@ -3373,15 +3414,11 @@ pub async fn test_errors(test: &mut TestServer) {
     // counter read is a store error that keeps the item pending; the test
     // store cannot fail, so that path rests on the classification in
     // `is_over_quota`, the fan-out's.
+    // The fan-out checks the recipient's quota too (plan 9, 7a), so the
+    // invitation is delivered first and the quota lowered before key2's
+    // request.
     let admin = test.account("admin@example.com").clone();
     let key2_account = test.account("key2@example.com").id();
-    admin
-        .registry_update_object(
-            ObjectType::Account,
-            key2_account,
-            json!({ Property::Quotas: { StorageQuota::MaxDiskQuota.as_str(): 1 } }),
-        )
-        .await;
     let uid3 = "za-drain-e7";
     key1.client
         .request_with_headers(
@@ -3393,7 +3430,14 @@ pub async fn test_errors(test: &mut TestServer) {
         .await
         .with_status(StatusCode::CREATED);
     let over_quota = pending_ids(test, key2.id).await;
-    assert_eq!(over_quota.len(), 1);
+    assert_eq!(over_quota.len(), 1, "the invitation was delivered under the full quota");
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            key2_account,
+            json!({ Property::Quotas: { StorageQuota::MaxDiskQuota.as_str(): 1 } }),
+        )
+        .await;
     assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
     let item = stored_item(test, key2.id, over_quota[0]).await;
     assert_eq!(item.flags & EVENT_NOTIFICATION_ZA_PENDING, 0, "an over-quota import stayed pending");
@@ -3769,12 +3813,12 @@ One at a time, each reverted with `git checkout -- <file>` and confirmed with an
 
 | Id | Check | Edit | Expected first failure |
 |----|-------|------|------------------------|
-| M29 | The token check (spec 3.3, "Verification") | in `merge`, make the `Incoming::Reply` guard never drop: replace `&& !pairs.as_ref().is_some_and(..)` with `&& false` | `drain::test_reply` step 2: "a forged reply was kept" |
+| M29 | The token check (spec 3.3, "Verification") | in `merge`, the `Incoming::Reply(token)` arm selects the sender without the token: replace `sender_addresses.iter().find(|address| { .. })` with `sender_addresses.first()` | `drain::test_reply` step 2: "a forged reply was kept" |
 | M30 | The lease's fence on the import (spec 6.3 step 3) | in `import`, delete `lease.lease().assert_in(&mut batch);` | `drain::test_lease` case C: "the expired holder committed" (two copies) |
 | M31 | The lease on the import (spec 6.3 step 1) | in `import`, replace the `acquire` with an unconditional import: `let Some(lease) = ..` becomes a lease taken from `ZaUidLease::acquire` on a UID suffixed with the document id (`&format!("{uid}#{}", ctx.document_id)`), so two items never contend | `drain::test_lease` case A: "a second copy was imported" (if session 2 imports past the lease first: "session 2 imported past the lease") |
 | M32 | Pair adoption on merge (spec 3.3, 6.4) | in `merge`, make the `Incoming::Request(Some(pair))` arm a no-op | `drain::test_adoption` step 1: "the copy did not adopt the new token", or the reply under the new token not applying |
 | M33 | The stale-reply check (spec 6.4, REPLY) | in `merge`, replace `is_stale_reply(&snapshots, &itip_snapshots)` with `false` | `drain::test_reply` step 3: "the stale decline applied" |
-| M34 | The sender check (spec 6.4 step 2) | in `drain_item`, replace `if !sender_matches` with `if false` | `drain::test_errors` step 2: "a mismatched sender's invitation was imported" |
+| M34 | The sender check (spec 6.4 step 2) | in `drain_item`, every candidate counts as the sender's: the resolution test `== Some(*sender_id)` becomes `== Some(*sender_id) \|\| true` | `drain::test_errors` step 2: "a mismatched sender's invitation was imported" |
 | M35 | The cursor rule (spec 6.2) | in `drain_pass`, make the `Ok(false)` and `Err` arms call `state.complete(snapshot)` | `drain::test_cursor` step 2: "the retry did not drain" (the item never drains again without an arrival) |
 | M36 | The sweep's assertion (spec 6.3 step 4) | in `clear_uid_leases`, delete the `batch.assert_value(..)` line | `cargo test -p common za::lease`: `the_sweep_keeps_a_lease_retaken_after_its_scan`, "the sweep removed the new holder's lease" |
 
