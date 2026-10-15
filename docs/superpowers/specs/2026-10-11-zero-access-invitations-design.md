@@ -747,8 +747,9 @@ ingest does.
   `SecurityEvent::Unauthorized` with details prefixed `zero-access:`, and
   the event is unchanged. A REPLY whose sender holds no pair in the
   event's bundle is rejected as not a participant and kept as history; a
-  REPLY from a participant whose token is missing or does not match is
-  deleted with a security trace.
+  REPLY from a participant whose token does not match is deleted with a
+  security trace, as is any REPLY that carries no token at all (that check
+  runs before the bundle is read).
 - **iTIP-level rejection** (step 4): resealed under MK, bit cleared, kept
   as history, with a trace.
 

@@ -31,10 +31,11 @@
 //! the REQUEST it cancels); a permanent one (the wrap does not open, a stray carrier, an unparsable
 //! tree, an unknown METHOD) deletes the item, since nothing can ever read
 //! it; a forgery, a REPLY from a participant (a sender address holding a
-//! pair in the event's bundle) whose token is wrong or missing, deletes
-//! the item with a security trace, while a REPLY from a sender holding no
-//! pair is not a participant and is kept as history; an iTIP-level
-//! rejection keeps the item as history, resealed, bit cleared.
+//! pair in the event's bundle) whose token is wrong, deletes the item with
+//! a security trace, as does a REPLY carrying no token at all (checked
+//! before the bundle is read), while a REPLY with a token from a sender
+//! holding no pair is not a participant and is kept as history; an
+//! iTIP-level rejection keeps the item as history, resealed, bit cleared.
 //! A pass that leaves any item pending does not advance the cursor and
 //! defers the next pass by `DRAIN_RETRY_SECS`.
 //!
