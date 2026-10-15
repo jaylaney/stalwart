@@ -5,10 +5,10 @@ Read it before plan 10.
 
 ## Where things stand
 
-- Commits `44982485..` through the PR #35 review's round 2 commit (`Quiet fan-out lookups through custom sub-addressing`, the last commit of the plan; a range ending there excludes `44982485` itself), on `release2-plan9-fanout` (cut from plan 8's `68e1f1df`; plan and review fix round `621f88a4`, `44982485`; not pushed). The first code commit is `cbe5db0e`:
+- Commits `44982485..` through the PR #35 review's round 3 commit (`PR #35 review round 3: residual rule traces, observable quiet rule run`, the last commit of the plan; a range ending there excludes `44982485` itself), on `release2-plan9-fanout` (cut from plan 8's `68e1f1df`; plan and review fix round `621f88a4`, `44982485`; pushed through `d6c3d156`, rounds 2 and 3 not yet pushed). The first code commit is `cbe5db0e`:
   - Task 1 `cbe5db0e` (lease and test-mode hooks), Task 2 `e58ef0b7` (fan-out module), Task 3 `dc9d560f` (`SendSealed`, PUT paths), Task 4 `bba98065` (reply, delegation, failure tests), Task 5 `17f105c7` (DELETE paths), Task 6 `e34e37e6` (creation lease tests), Task 7 `396dd67a`, `05a1925b`, `74870ea7` (leak scan), Task 8 `4dde5479` (mutation runs and this note);
   - final fix wave: `4902accd` (sending state follows the owner, lease hardening, test breadth), `88466b4c` (this note's final-review sections, the release 1 spec parentheticals), then the follow-up commit (the JMAP callers pass `false`; this note's F1 correction);
-  - PR #35 review: `ce92b08b` (quiet recipient lookups), then `6e3e4b36` (the generic purge skips lease keys, with the spec and this note) and `da97ddb3` (deferred lookup-trace items, comment hygiene); round 2, `Quiet fan-out lookups through custom sub-addressing`.
+  - PR #35 review: `ce92b08b` (quiet recipient lookups), then `6e3e4b36` (the generic purge skips lease keys, with the spec and this note) and `da97ddb3` (deferred lookup-trace items, comment hygiene); round 2 `9ccd9fd6` (`Quiet fan-out lookups through custom sub-addressing`); round 3, `PR #35 review round 3: residual rule traces, observable quiet rule run`.
 - The suites run in Task 8 Step 2, in order, on `74870ea7`'s code (the spec and note edits uncommitted at the time), with no reruns:
   - `cargo test -p vault -p groupware`: groupware 76 passed, vault 30 passed.
   - `cargo test -p common za::lease`: 6 passed.
@@ -167,6 +167,7 @@ Open items parked for Jay:
 - (Task 2 review) Two addresses resolving to one account produce two items per UID (plan 10, above).
 - (final review) F2, the 412-after-delivery consequence (spec 5.4, above).
 - (final review) F1's spec 5.1 amendment (above).
+- (PR #35 review, round 2) A custom sub-addressing rule that itself calls `is_local_domain(rcpt)`, `is_local_address(rcpt + '@constant')` or `sql_query(store, '...', rcpt)` sends the local part through the public `domain` / `rcpt_id_from_parts` cache events or `Store(SqlQuery)` (`crates/store/src/dispatch/store.rs`, `Details = query`, `Value = params`), which `za_eval_if` cannot reach, because the traces fire inside the called functions. The other async functions (`key_*`, `counter_*`, `dns_query`) and the whole sync function table trace nothing. Fix shape for the first two: a `quiet` field on `EvalContext` (four construction sites in `eval.rs`), `eval_fnc(.., quiet)`, and an `rcpt_id_from_email_inner(address, quiet)` built on round 1's inner forms; `sql_query` would need a quiet `Store::sql_query`, or acceptance as operator configuration, the same class as the catch-all item. Ruling pending Jay's decision.
 - (PR #35 review) The catch-all fallback traces the operator-configured catch-all address through the public lookup functions, not the attendee's address. Accepted as configuration.
 
 Deferred minors (the ledger, `.superpowers/sdd/2026-10-14-zero-access-9-fanout/progress.md`, has the detail), one line each, tagged with the review they came from; none changes behaviour a test or the spec relies on:

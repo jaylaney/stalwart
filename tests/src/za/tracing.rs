@@ -17,8 +17,8 @@ use ::registry::{
     schema::{
         prelude::ObjectType,
         structs::{
-            CertificateManagement, DkimManagement, DnsManagement, Domain, Expression,
-            ExpressionMatch, SubAddressing, SubAddressingCustom,
+            Account as RegistryAccount, CertificateManagement, DkimManagement, DnsManagement,
+            Domain, Expression, ExpressionMatch, SubAddressing, SubAddressingCustom, UserAccount,
         },
     },
     types::{list::List, map::Map},
@@ -88,6 +88,11 @@ const SUBADDR_CANARY: &str = "tracing-sub-canary";
 const SUBADDR_ATTENDEE: &str = "tracing-sub-canary.topic@subaddr-canary.test";
 const SUBADDR_AUTH_CANARY: &str = "tracing-sub-auth-canary";
 const SUBADDR_AUTH_ADDRESS: &str = "tracing-sub-auth-canary.topic@subaddr-alias.test";
+/// An account of the sub-addressing domain: only the rule turns
+/// `SUBADDR_USER_ADDRESS` into it, so finding it proves the quiet path ran
+/// the rule.
+const SUBADDR_USER: &str = "tracing-sub-user";
+const SUBADDR_USER_ADDRESS: &str = "tracing-sub-user.topic@subaddr-canary.test";
 const SUBSCRIBER_ID: &str = "za-trace-test";
 const CONTENT_TYPE: (&str, &str) = ("content-type", "text/calendar; charset=utf-8");
 
@@ -718,6 +723,39 @@ pub async fn test(test: &mut TestServer) {
             seen.push(values);
         }
     }
+    // The quiet path runs the rule, observably and without a trace. The
+    // account's creation traces are drained first.
+    let sub_user_id = admin
+        .registry_create_object(RegistryAccount::User(UserAccount {
+            name: SUBADDR_USER.to_string(),
+            domain_id: subaddr_domain_id,
+            ..Default::default()
+        }))
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    while rx.try_recv().is_ok() {}
+    assert_eq!(
+        test.server
+            .za_account_id_from_email(SUBADDR_USER_ADDRESS)
+            .await
+            .unwrap(),
+        Some(sub_user_id.document_id()),
+        "the quiet lookup did not run the sub-addressing rule"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let mut quiet_run = Vec::new();
+    while let Ok(batch) = rx.try_recv() {
+        for event in batch {
+            for (_, value) in event.keys.iter() {
+                strings(value, &mut quiet_run);
+            }
+        }
+    }
+    let quiet_run = quiet_run.join("\n");
+    assert!(
+        !quiet_run.contains(SUBADDR_USER),
+        "the quiet rule run traced the address: {quiet_run}"
+    );
     Collector::remove_subscriber(SUBSCRIBER_ID.into());
     Collector::reload();
     let all = seen.join("\n");
@@ -903,7 +941,12 @@ pub async fn test(test: &mut TestServer) {
         .await
         .with_status(StatusCode::NO_CONTENT);
     admin
+        .registry_destroy(ObjectType::Account, [sub_user_id])
+        .await
+        .assert_destroyed(&[sub_user_id]);
+    admin
         .registry_destroy(ObjectType::Domain, [subaddr_domain_id])
         .await
         .assert_destroyed(&[subaddr_domain_id]);
+    test.wait_for_tasks().await;
 }

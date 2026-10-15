@@ -45,6 +45,9 @@ impl Server {
 
     // Zero-access fork: `quiet` skips the events that carry evaluation
     // content (the result, and an error that may echo a resolved value).
+    // In quiet mode an evaluation error is neither traced nor returned (the
+    // caller gets `None`, as upstream does); the same rule evaluated on the
+    // SMTP path still traces its failures.
     async fn eval_if_inner<'x, R: TryFrom<Variable<'x>>, V: ResolveVariable>(
         &'x self,
         if_block: &'x IfBlock,
