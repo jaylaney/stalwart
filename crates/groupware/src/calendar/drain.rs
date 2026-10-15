@@ -26,13 +26,18 @@
 //!
 //! Item errors (6.5): a transient one (a store error, a lost assertion,
 //! the lease's fence included) aborts the pass and the item stays pending;
-//! a busy creation lease leaves that item pending and the pass goes on; a
-//! permanent one (the wrap does not open, a stray carrier, an unparsable
+//! a busy UID lease leaves that item pending and stops the pass there, so
+//! later items for the same UID keep their order (a CANCEL never overtakes
+//! the REQUEST it cancels); a permanent one (the wrap does not open, a stray carrier, an unparsable
 //! tree, an unknown METHOD) deletes the item, since nothing can ever read
 //! it; a token mismatch deletes the item with a security trace; an
 //! iTIP-level rejection keeps the item as history, resealed, bit cleared.
 //! A pass that leaves any item pending does not advance the cursor and
 //! defers the next pass by `DRAIN_RETRY_SECS`.
+//!
+//! Lease order: a drain holds its session lock and then may take a per-UID
+//! lease (an import, or a REPLY merge that fans out to delegates); the PUT
+//! path takes the lease without any drain lock, so there is no cycle.
 
 use crate::{
     DestroyArchive,
@@ -195,8 +200,9 @@ async fn read_item(
 
 /// Spec 6.4: the private key once, then each item in document id order.
 /// `Ok(true)` when every item is done; `Ok(false)` when one stays pending
-/// without an error (a busy creation lease); `Err` on a transient error,
-/// which aborts the pass (6.5).
+/// without an error (a busy UID lease): the pass stops at that item and the
+/// items after it stay pending, so later items for the same UID keep their
+/// order; `Err` on a transient error, which aborts the pass (6.5).
 async fn drain_items(
     server: &Server,
     keys: &Arc<SessionKeys>,
@@ -221,13 +227,12 @@ async fn drain_items(
         .account_info(account_id)
         .await
         .caused_by(trc::location!())?;
-    let mut all_done = true;
     for document_id in pending {
         if !drain_item(server, &account_info, keys, private_key, document_id).await? {
-            all_done = false;
+            return Ok(false);
         }
     }
-    Ok(all_done)
+    Ok(true)
 }
 
 /// One pending item: what the rewrite, the deletion and the commit need.
@@ -639,7 +644,7 @@ async fn merge(
         },
         Incoming::Request(_) | Incoming::Cancel => sender_addresses[0].clone(),
     };
-    let (step, is_organizer_update, before) = {
+    let (step, is_organizer_update, before, event_uid) = {
         let snapshots = match itip_snapshot(&event.data.event, addresses, false) {
             Ok(snapshots) => snapshots,
             Err(err) => return ctx.reject(tree, Some(event_id), &err).await,
@@ -649,6 +654,7 @@ async fn merge(
             Err(err) => return ctx.reject(tree, Some(event_id), &err).await,
         };
         let is_organizer_update = !itip_snapshots.organizer.email.is_local;
+        let event_uid = snapshots.uid.to_string();
         // The attendees before the merge: those the merge adds are
         // delegates (spec 6.4, "Delegates").
         let before: AHashSet<String> = snapshots
@@ -679,7 +685,7 @@ async fn merge(
                 Err(err) => Step::Reject(err),
             }
         };
-        (step, is_organizer_update, before)
+        (step, is_organizer_update, before, event_uid)
     };
     let changes = match step {
         Step::Reject(err) => return ctx.reject(tree, Some(event_id), &err).await,
@@ -713,6 +719,8 @@ async fn merge(
             Err(err.caused_by(trc::location!()))
         };
     }
+    // Held only by a REPLY merge that fans out to delegates.
+    let mut reply_lease = None;
     // Spec 3.3: the pairs the copy keeps.
     match &incoming {
         // An accepted REQUEST replaces this attendee's pair with the
@@ -720,8 +728,10 @@ async fn merge(
         // organizer to the new token.
         Incoming::Request(Some(pair)) => {
             let pairs = pairs.get_or_insert_with(TokenPairs::new);
-            for (address, token) in pair.to_vec() {
-                pairs.insert(&address, token);
+            // `to_vec` hands out a plain copy the caller zeroes.
+            let incoming = Zeroizing::new(pair.to_vec());
+            for (address, token) in incoming.iter() {
+                pairs.insert(address, *token);
             }
         }
         Incoming::Request(None) | Incoming::Cancel => {}
@@ -756,6 +766,49 @@ async fn merge(
                             .retain(|to| new_attendees.contains(&to.to_ascii_lowercase()));
                     }
                     messages.retain(|message| !message.to.is_empty());
+                    if !messages.is_empty() {
+                        // Two sessions of the organizer (two drain locks)
+                        // can both pass the re-read of this REPLY, and the
+                        // fan-out delivers its REQUEST outside the item's
+                        // transaction: the loser's write rolls back but its
+                        // delivered token stays and would replace the
+                        // winner's at the delegate. The per-UID lease a PUT
+                        // of this UID takes serializes them.
+                        let Some(lease) =
+                            ZaUidLease::acquire(server.store(), account_id, &event_uid)
+                                .await
+                                .caused_by(trc::location!())?
+                        else {
+                            trc::event!(
+                                Store(trc::StoreEvent::AssertValueFailed),
+                                AccountId = account_id,
+                                DocumentId = ctx.document_id,
+                                Details = "zero-access: drain creation lease busy",
+                            );
+                            return Ok(false);
+                        };
+                        let lease = ZaUidLeaseGuard::new(server.store().clone(), lease);
+                        // Under the lease: another session that finished
+                        // this item first leaves nothing to do.
+                        let current = read_item(server, account_id, ctx.document_id).await?;
+                        let unchanged = match &current {
+                            Some(current) => {
+                                current.as_bytes() == ctx.stored.as_bytes()
+                                    && current.version == ctx.stored.version
+                                    && archived_item_is_pending(
+                                        current
+                                            .unarchive::<CalendarEventNotification>()
+                                            .caused_by(trc::location!())?,
+                                    )
+                            }
+                            None => false,
+                        };
+                        if !unchanged {
+                            lease.release().await;
+                            return Ok(true);
+                        }
+                        reply_lease = Some(lease);
+                    }
                     let fan_out = server
                         .za_fan_out(
                             ctx.account_info,
@@ -803,6 +856,10 @@ async fn merge(
     seal_event(&mut event, ctx.keys, account_id, pairs.as_ref())
         .map_err(|err| seal_error(err, account_id, event_id))?;
     let mut batch = BatchBuilder::new();
+    // A delegating REPLY is fenced on its lease first, as `import` is.
+    if let Some(lease) = &reply_lease {
+        lease.lease().assert_in(&mut batch);
+    }
     // The item rewrite first, ahead of the event update (one write; see
     // the module doc).
     ctx.rewrite_in(
@@ -828,7 +885,7 @@ async fn merge(
             next_alarm.write_task(&mut batch);
         }
     }
-    ctx.commit(batch, None).await
+    ctx.commit(batch, reply_lease).await
 }
 
 impl ItemCtx<'_> {
