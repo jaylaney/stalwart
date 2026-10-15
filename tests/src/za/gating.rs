@@ -129,7 +129,8 @@ pub async fn test(test: &mut TestServer) {
         response.0
     );
 
-    // Scheduling URLs are not advertised for key accounts.
+    // Invitations spec 8: scheduling URLs are advertised for key accounts
+    // again (release 1 withheld them).
     let inbox = DavProperty::Principal(PrincipalProperty::ScheduleInboxURL);
     let outbox = DavProperty::Principal(PrincipalProperty::ScheduleOutboxURL);
     let home = DavProperty::Principal(PrincipalProperty::CalendarHomeSet);
@@ -140,11 +141,13 @@ pub async fn test(test: &mut TestServer) {
     props
         .properties(principal)
         .get(&inbox)
-        .with_status(StatusCode::NOT_FOUND);
+        .with_status(StatusCode::OK)
+        .is_not_empty();
     props
         .properties(principal)
         .get(&outbox)
-        .with_status(StatusCode::NOT_FOUND);
+        .with_status(StatusCode::OK)
+        .is_not_empty();
     props
         .properties(principal)
         .get(&home)
@@ -162,11 +165,12 @@ pub async fn test(test: &mut TestServer) {
             .is_not_empty();
     }
 
-    // DAV OPTIONS: calendar-auto-schedule is not advertised to a key
-    // account (spec 9); a non-key or anonymous request keeps upstream's header.
+    // DAV OPTIONS (invitations spec 8): `calendar-auto-schedule` is advertised
+    // to a key account again; a non-key or anonymous request keeps upstream's
+    // header.
     let key_dav = dav_header(&key_client).await;
     assert!(key_dav.contains("calendar-access"), "{key_dav}");
-    assert!(!key_dav.contains("calendar-auto-schedule"), "{key_dav}");
+    assert!(key_dav.contains("calendar-auto-schedule"), "{key_dav}");
     let plain_dav = dav_header(&plain_client).await;
     assert!(plain_dav.contains("calendar-auto-schedule"), "{plain_dav}");
     let anonymous = reqwest::Client::builder()

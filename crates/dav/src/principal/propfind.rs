@@ -306,13 +306,6 @@ impl PrincipalPropFind for Server {
                                 },
                             ));
                         }
-                        // Spec 9: key accounts do not advertise scheduling.
-                        PrincipalProperty::ScheduleInboxURL
-                        | PrincipalProperty::ScheduleOutboxURL
-                            if account.is_key_account() =>
-                        {
-                            fields_not_found.push(DavPropertyValue::empty(property.clone()));
-                        }
                         PrincipalProperty::ScheduleInboxURL => {
                             fields.push(DavPropertyValue::new(
                                 property.clone(),

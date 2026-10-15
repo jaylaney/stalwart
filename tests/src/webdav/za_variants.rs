@@ -10,10 +10,12 @@ use super::{TEST_ICAL_1, TEST_ICAL_2};
 use crate::utils::{
     server::TestServer,
     za::{
-        envelope_wrap, hold_task_consumer, inbox_ids, item_method, itip_tasks_for, mail_count,
-        new_inbox_items, plant_event, queued_recipients, schedule_statuses, wait_for_delivery,
+        copy_href, envelope_wrap, hold_task_consumer, inbox_ids, item_method, itip_tasks_for,
+        mail_count, new_inbox_items, pending_ids, plant_event, queued_recipients,
+        schedule_statuses, wait_for_delivery,
     },
 };
+use crate::za::fanout::uid_copies;
 use calcard::common::timezone::Tz;
 use calcard::icalendar::{ICalendarMethod, ICalendarProperty};
 use email::cache::MessageCacheFetch;
@@ -409,8 +411,10 @@ pub async fn scheduling(test: &TestServer) {
         "the item has a pk envelope"
     );
     assert!(!item.event.to_string().contains("sched-canary"));
-    // Clients do not see pending items (spec 6.6); hrefs() includes the
-    // collection itself, so one href is an inbox that lists nothing.
+    // Invitations spec 6: jane's next request drains the item before it is
+    // answered. Her inbox lists the item (the collection's href and the
+    // item's), its GET shows the invitation, and her default calendar
+    // holds the copy, sealed under her master key.
     let inbox = jane
         .request_with_headers(
             "PROPFIND",
@@ -420,7 +424,47 @@ pub async fn scheduling(test: &TestServer) {
         )
         .await
         .with_status(StatusCode::MULTI_STATUS);
-    assert_eq!(inbox.hrefs().len(), 1, "{:?}", inbox.hrefs());
+    assert_eq!(inbox.hrefs().len(), 2, "{:?}", inbox.hrefs());
+    assert!(pending_ids(test, jane.account_id).await.is_empty());
+    let item_id = items[0].0;
+    let shown = jane
+        .request(
+            "GET",
+            &format!("/dav/itip/jane@example.com/inbox/{item_id}.ics"),
+            "",
+        )
+        .await
+        .with_status(StatusCode::OK)
+        .body
+        .unwrap();
+    assert!(
+        shown.contains("sched-canary")
+            && shown.contains("METHOD:REQUEST")
+            && !shown.contains("X-ZA-"),
+        "{shown}"
+    );
+    assert_eq!(uid_copies(test, jane.account_id, "za-sched-1").await, 1);
+    let copy = copy_href(test, jane.account_id, "za-sched-1").await;
+    let copy_body = jane
+        .request("GET", &copy, "")
+        .await
+        .with_status(StatusCode::OK)
+        .body
+        .unwrap();
+    assert!(
+        copy_body.contains("sched-canary")
+            && copy_body.contains("ORGANIZER:mailto:john@example.com")
+            && !copy_body.contains("X-ZA-")
+            && !copy_body.contains("METHOD:"),
+        "{copy_body}"
+    );
+    let (copy_archive, _) = crate::za::dav_seal::raw_event(
+        test,
+        jane.account_id,
+        &format!("default/{}", copy.rsplit('/').next().unwrap()),
+    )
+    .await;
+    assert!(!String::from_utf8_lossy(copy_archive.as_bytes()).contains("sched-canary"));
     // The event is readable by its owner with attendees intact, and jane's
     // ATTENDEE says delivered.
     let body = john
@@ -448,9 +492,9 @@ pub async fn scheduling(test: &TestServer) {
             .schedule_tag
             .is_some()
     );
-    // john's DELETE cancels: a second pending item, a CANCEL (METHOD is
-    // visible on the sealed root), and still no mail (spec 5.5). The
-    // DELETE's task-queue check lives in the za suite's `test_task_queue`.
+    // john's DELETE cancels: a second item, a CANCEL, still no mail (spec
+    // 5.5); jane's next request drains it and her copy is cancelled (spec
+    // 4.3). The DELETE's task-queue check lives in the za suite.
     john.request("DELETE", "/dav/cal/john@example.com/default/s.ics", "")
         .await
         .with_status(StatusCode::NO_CONTENT);
@@ -467,6 +511,19 @@ pub async fn scheduling(test: &TestServer) {
         Some(ICalendarMethod::Cancel)
     );
     assert_eq!(envelope_wrap(&items[1].1.event), Some(2));
+    let cancelled = jane
+        .request("GET", &copy, "")
+        .await
+        .with_status(StatusCode::OK)
+        .body
+        .unwrap();
+    assert!(cancelled.contains("STATUS:CANCELLED"), "{cancelled}");
+    assert!(pending_ids(test, jane.account_id).await.is_empty());
+    // Cleanup: the copy with `Schedule-Reply: F` (no declined REPLY to
+    // john), then the items by href.
+    jane.request_with_headers("DELETE", &copy, [("schedule-reply", "F")], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
     // Pending items are deleted by href, as any inbox item.
     let ids: Vec<u32> = inbox_ids(test, jane.account_id)
         .await

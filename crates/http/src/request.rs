@@ -338,17 +338,10 @@ impl ParseHttp for Server {
                     (Some(_), Some(DavMethod::OPTIONS)) => HttpResponse::new(StatusCode::OK)
                         .with_header(
                             "DAV",
-                            if za_is_key_account_request(self, &req, &session).await {
-                                concat!(
-                                    "1, 2, 3, access-control, extended-mkcol, calendar-access, ",
-                                    "calendar-no-timezone, addressbook"
-                                )
-                            } else {
-                                concat!(
-                                    "1, 2, 3, access-control, extended-mkcol, calendar-access, ",
-                                    "calendar-auto-schedule, calendar-no-timezone, addressbook"
-                                )
-                            },
+                            concat!(
+                                "1, 2, 3, access-control, extended-mkcol, calendar-access, ",
+                                "calendar-auto-schedule, calendar-no-timezone, addressbook"
+                            ),
                         )
                         .with_header(
                             "Allow",
@@ -1040,35 +1033,10 @@ impl SessionManager for HttpSessionManager {
     }
 }
 
-/// Spec 8: a key account is not offered `calendar-auto-schedule` in the DAV
-/// OPTIONS header. Upstream answers OPTIONS without authenticating;
-/// credentials are checked only when present. An authentication error is
-/// reported like any request's, and the response falls back to upstream's
-/// header; a failed account lookup does too.
-async fn za_is_key_account_request(
-    server: &Server,
-    req: &HttpRequest,
-    session: &HttpSessionData,
-) -> bool {
-    if !req.headers().contains_key(header::AUTHORIZATION) {
-        return false;
-    }
-    match server.authenticate_headers(req, session).await {
-        Ok((_in_flight, access_token)) => server
-            .za_is_key_account(access_token.account_id())
-            .await
-            .unwrap_or(false),
-        Err(err) => {
-            trc::error!(err.span_id(session.session_id));
-            false
-        }
-    }
-}
-
 /// Spec section 10, "Traces": a key account's JMAP request and response
 /// bodies are never traced, since a request can carry the account's password
 /// (`x:AccountPassword/set`). Fails closed: a failed lookup counts as a key
-/// account, unlike the fail-open `za_is_key_account_request`.
+/// account.
 async fn za_jmap_untraced(server: &Server, account_id: u32) -> bool {
     server.za_is_key_account(account_id).await.unwrap_or(true)
 }
