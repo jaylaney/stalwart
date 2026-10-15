@@ -253,8 +253,9 @@ app-password change.
   event is open: match the attendee by address as upstream's merge does,
   then require the token of that address's pair to equal the item's token
   (constant time). A mismatch drops the item with a security trace and no
-  change to the event. A reply from an account that was never invited has
-  no valid token and is dropped.
+  change to the event. A reply from an account that was never invited
+  holds no pair, like a removed attendee's, and is rejected as not a
+  participant (history, section 6.5).
 
 ## 4. Message flow overview
 
@@ -520,9 +521,9 @@ abort) or that could not take a creation lease for an item (section 6.3)
 does not advance the remembered id, because
 `fetch_dav_resources` returns unchanged state when nothing newer exists and
 the item would otherwise wait for an unrelated change. A per-session retry
-backoff, 30 seconds after such a pass (`DRAIN_RETRY_SECS`, a constant of
-30 seconds with a test-mode override; plan 10 settled on no environment
-knob), keeps a stuck item from draining on every request.
+backoff after such a pass (`DRAIN_RETRY_SECS`, a constant of 30 seconds
+with a test-mode override; plan 10 settled on no environment knob) keeps
+a stuck item from draining on every request.
 
 An invitation therefore appears at the attendee client's next poll, not at
 the next login.
@@ -744,7 +745,10 @@ ingest does.
   open.
 - **Token mismatch:** the item is deleted, logged as
   `SecurityEvent::Unauthorized` with details prefixed `zero-access:`, and
-  the event is unchanged.
+  the event is unchanged. A REPLY whose sender holds no pair in the
+  event's bundle is rejected as not a participant and kept as history; a
+  REPLY from a participant whose token is missing or does not match is
+  deleted with a security trace.
 - **iTIP-level rejection** (step 4): resealed under MK, bit cleared, kept
   as history, with a trace.
 
@@ -908,10 +912,12 @@ is a stray carrier.
 
 **Integration.** New sub-modules under `tests/src/za/`. The za suite is one
 test function that runs its sub-modules in order against one server on
-port 8899, and every sub-module ends with `assert_is_empty`. The release 2
-tests add test-mode hooks, compiled only under `test_mode` like release
-1's auth-cache pauses (`za_test` in `crates/http/src/auth/authenticate.rs`,
-a `Pause` with `arrived` and `release` notifies keyed by account id): a
+port 8899; it calls `assert_is_empty` once, at its end, after
+`destroy_key_accounts`, and every sub-module removes what it creates.
+The release 2 tests add test-mode hooks, compiled only under `test_mode`
+like release 1's auth-cache pauses (`za_test` in
+`crates/http/src/auth/authenticate.rs`, a `Pause` with `arrived` and
+`release` notifies keyed by account id): a
 fan-out pause between document-id assignment and the item commit, a
 drain pause after its absence check, a PUT pause after the resource fetch,
 a per-account drain skip (while set, that account's drain does not run),
@@ -1052,11 +1058,11 @@ Release 1's ten invariants hold. Release 2 adds:
 
 - **Names.** The sending state (`SendSealed`), the flag bit
   (`EVENT_NOTIFICATION_ZA_PENDING`), the HKDF label (`za/v1/pk`) and the
-  exact info layout, the wrap purpose string (`pk-dek`, which the
-  `aad` helper prefixes with `za/v1|`), the reply property
-  (`X-ZA-RSVP-TOKEN`), the `X-ZA-EXTRA` format byte for bundles with token
-  pairs (`2`), the inbox items' scope (`itip`) and drained key-envelope
-  purpose, the drain's retry backoff (`DRAIN_RETRY_SECS`, a constant of 30 seconds),
+  exact info layout, the wrap purpose string (`pk-dek`, which the `aad`
+  helper prefixes with `za/v1|`), the reply property (`X-ZA-RSVP-TOKEN`),
+  the `X-ZA-EXTRA` format byte for bundles with token pairs (`2`), the
+  inbox items' scope (`itip`) and drained key-envelope purpose, the
+  drain's retry backoff (`DRAIN_RETRY_SECS`, a constant of 30 seconds),
   the creation lease prefix (`KV_LOCK_ZA_UID`), the lease duration and its
   test knob (`ZA_UID_LEASE_SECS`), the fence token length, and the lease
   retry count and wait (values for planning). The lease key carries the
@@ -1081,7 +1087,10 @@ Release 1's ten invariants hold. Release 2 adds:
   inbox per request (section 6.2), or a per-account pending counter in
   memory (never a stored struct), bumped by the fan-out and broadcast to
   other nodes with `CacheInvalidation`. Plan 10 took the first option.
-- **Upstream `cal_scheduling` assertions** runnable in key mode: the list.
+- **Upstream `cal_scheduling` assertions** runnable in key mode: settled
+  by section 11 (plan 10). Upstream's test still does not run in key mode;
+  the key-mode `scheduling` variant asserts the drained copy, the update
+  and the cancel.
 - **Pending items and `sync-collection`.** A drained item changes between
   two syncs, and the expected client behaviour is a normal change. The
   resource cache knows no flags, so the skip happens where items are

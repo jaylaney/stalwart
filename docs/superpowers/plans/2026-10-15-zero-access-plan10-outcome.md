@@ -12,7 +12,8 @@ Plan 10 completes release 2 (invitations between key accounts). Read it before r
   - Task 4 `df0c6c74` (lease cases A-E, the cursor and the backoff);
   - Task 5 `55f2afe2` (item errors, odd inboxes, the drain in the leak scan);
   - Task 6 `86a53361`, `f0a4f2f3` (gates reopened, key-mode variant with the update step, the OPTIONS tracing check reworded, checklist and CLAUDE.md);
-  - Task 7: `11656ec0` (plan 9's lease case (d) waits for the index task; see "Rulings"), then the commit of this note and the spec's settled names.
+  - Task 7: `11656ec0` (plan 9's lease case (d) waits for the index task; see "Rulings"), then the commit of this note and the spec's settled names (`a9b2c2e5`, `7d5c66b3`);
+  - final fix wave (see "Final review"): `22902e0a` (a REPLY from a sender holding no pair is history; `import` re-reads its item under the lease; `test_reply` step 6 and `test_lease` case F), then the documentation commit (spec 3.3, 6.2, 6.5, 11, 13; this note; CLAUDE.md).
 - The suites run in Task 7 Step 2, in order, one at a time:
   - `cargo test -p vault -p groupware`: groupware 80 passed, vault 31 passed (21 s).
   - `cargo test -p common za::lease`: 10 passed.
@@ -25,6 +26,14 @@ Plan 10 completes release 2 (invitations between key accounts). Read it before r
   - `cargo fmt --all --check`: clean.
   - Product compile check (`cargo check -p stalwart --no-default-features --features rocks`, filtered to the fork's files): clean; the upstream warning totals unchanged (`store` 1, `common` 18, `jmap` 3, `services` 2).
   - `cargo build --release -p stalwart --no-default-features --features rocks`: finished in 15m 41s; no warning in the fork's files, the same upstream warning totals.
+- The final fix wave's verification, on `22902e0a`, one at a time:
+  - `cargo fmt -p groupware -p tests -- --check`: clean.
+  - `cargo test -p groupware`: 80 passed.
+  - Product compile check (filtered to the fork's files): clean; upstream warning totals unchanged (`store` 1, `common` 18, `jmap` 3, `services` 2).
+  - `cargo check -p tests --tests`: clean.
+  - `za_tests`: 1 passed in 69.55 s (leak scan: 2140 records, 53 archives, 8 blobs, 988 search index records (644 of the account, none calendar), 5 events, 3 calendars, 4 items, 4 emails; negative control caught 29 violations).
+  - `webdav_tests` with `ZA_KEY_ACCOUNTS=1`: 1 passed in 20.92 s.
+  - Two mutation runs (M38, M39 below), each caught by the new test.
 - What now exists:
   - the drain (`crates/groupware/src/calendar/drain.rs`, `ZaDrain::za_drain`), called in `handle_dav_request` for every DAV request whose token holds the account's session keys; import under the creation lease, merge under the event's archive assertion, pair adoption, REPLY token check, stale-reply check, delegate fan-out under the organizer's UID lease, item rewrite resealed with the pending bit cleared, in one store write per item;
   - the drain state in `SessionKeys` (cursor, deferral, one-pass lock), in memory only;
@@ -55,7 +64,7 @@ The plan's table, with the changes the execution made:
 | Trace details | `zero-access: drain pass failed`, `zero-access: drain creation lease busy` (also the delegating merge's busy lease), `zero-access: drain commit lost its assertion`, `zero-access: undecodable inbox item deleted`, `zero-access: inbox item kept as history`, `zero-access: delegate invitation not built`, `zero-access: reply token mismatch` | `drain.rs` |
 | Item flags after the drain | import: `0`; merge: `EVENT_NOTIFICATION_IS_CHANGE`; kept as history: `0`; `event_id` = the event's document id when one was found or created, else `None`; `created` kept, `modified` = now | `drain.rs` |
 | Stale reply | a REPLY is stale when any of its instances has a SEQUENCE lower than that of the governing component (the same instance's override, else the latest `RANGE=THISANDFUTURE` override at or before it, else the master; absent = 0); rejected as `OutOfSequence`, kept as history | `drain.rs` |
-| Sender check | candidates: the ORGANIZER of a REQUEST or CANCEL, every ATTENDEE of a REPLY; those resolving quietly (`za_account_id_from_email`) to `ChangedBy::PrincipalId` are the sender's addresses; none, or a `CalendarAddress` sender: `SenderIsNotOrganizerNorAttendee`, kept as history. For a REPLY the replier is the sender's address whose pair holds the token; none matching is a forgery | `drain.rs` |
+| Sender check | candidates: the ORGANIZER of a REQUEST or CANCEL, every ATTENDEE of a REPLY; those resolving quietly (`za_account_id_from_email`) to `ChangedBy::PrincipalId` are the sender's addresses; none, or a `CalendarAddress` sender: `SenderIsNotOrganizerNorAttendee`, kept as history. For a REPLY: no sender address holding a pair in the event's bundle is `SenderIsNotParticipant`, kept as history (final review F1); otherwise the replier is the sender's address whose pair holds the token, and none matching is a forgery | `drain.rs` |
 | Quota at the drain | only `Limit(Quota)` / `Limit(TenantQuota)` is `QuotaExceeded`; any other error keeps the item pending | `drain.rs` |
 | Permanent errors | any `open_pending_item` error, an unparsable or missing METHOD, a METHOD other than REQUEST, REPLY, CANCEL: the item is deleted | `drain.rs` |
 | Missing reply token | treated as a token mismatch (deleted, security trace) | `drain.rs` |
@@ -105,10 +114,56 @@ All runs in Task 7 Step 1, one at a time, each reverted with `git checkout --` a
 | M35 | The cursor rule (spec 6.2), `drain.rs:174-181` (`drain_pass`) | the `Ok(false)` and `Err` arms call `state.complete(snapshot)` instead of `state.defer_until(..)` | `drain.rs:1144:5`: `assertion failed: pending_ids(test, key2.id).await.is_empty()`: after case C's lost commit the cursor had moved, so the next request did not retry the item (`test_lease` case C, which runs before `test_cursor`'s expected `the retry did not drain`) | za suite |
 | M36 | The sweep's assertion (spec 6.3 step 4), `crates/common/src/za/lease.rs:126` (`clear_uid_leases`) | delete `batch.assert_value(..)` | `crates/common/src/za/lease.rs:567:9`: `the_sweep_keeps_a_lease_retaken_after_its_scan`, `clear_uid_leases(..) == 0` (left 1, right 0), the line before `the sweep removed the new holder's lease` | `cargo test -p common za::lease` (9 passed, 1 failed) |
 | M37 | The delegating merge's lease (spec 6.3, "Concurrency"), `drain.rs:769-811` (`merge`) | the `if !messages.is_empty() { .. }` block (acquire, re-read, `reply_lease = Some(lease)`) deleted, `reply_lease` typed `Option<ZaUidLeaseGuard>` and left `None`, so `za_fan_out` runs unleased and the commit gets `None` | `drain.rs:1252:5`: `key3 received an item before session 1's fan-out wrote one` (left 1, right 0): session 2 fanned out while session 1 was parked (`test_lease` case E). The addendum's predicted message, "key3's inbox gained exactly one pending item", does not exist; the assertion it describes is `key3 holds exactly one invitation` (`tests/src/za/drain.rs:1265`), which comes later and would see two | za suite |
+| M38 | No pair is history (final review F1), `drain.rs:651-663` (`merge`, at `22902e0a`) | the `let Some(pairs) = .. else` branch returns `ctx.drop_forgery()` instead of `ctx.reject(.., SenderIsNotParticipant(..))` | `tests/src/za/drain.rs:96:28`: `item 13 is gone` (`stored_item`, from `test_reply` step 6) | za suite (final fix wave) |
+| M39 | The re-read under the import's lease (final review F2), `drain.rs:506-509` (`import`, at `22902e0a`) | the `if !ctx.still_pending().await? { .. }` block deleted | `tests/src/za/drain.rs:1452:5`: `session 2 was deferred after the race` (`test_lease` case F) | za suite (final fix wave) |
 
 No mutation survived.
 
 Retired by plan 10 (gates removed), from the plan 3 note's mutation table (plan 7): M11 (schedule URLs hidden, `crates/dav/src/principal/propfind.rs`) and M12 (OPTIONS header, `crates/http/src/request.rs`, which mutated `za_is_key_account_request`). Task 6 (`86a53361`) removed both branches and the function, so neither edit has a target. M12's `za_tests` catcher was the tracing check "OPTIONS authentication failure not reported", now reworded (Task 6); its key-mode catcher was the fork's branch of `tests/src/webdav/basic.rs`, now upstream's. The plan 3 note is unchanged.
+
+## Merge hotspots
+
+Upstream files plan 10 changed, where an upstream merge will collide:
+- New: `crates/dav/src/request.rs` (`handle_dav_request`, the drain trigger between header parsing and `dispatch_dav_request`); `crates/services/src/task_manager/maintenance.rs` (the `PurgeData` arm, the sweep after `purge_in_memory_store`); `crates/groupware/src/calendar/mod.rs` (the `drain` module).
+- Back to upstream: `crates/http/src/request.rs` (the OPTIONS arm; `za_is_key_account_request` removed) and `crates/dav/src/principal/propfind.rs` (the key-account schedule URL arm removed).
+- A silent dependency: the drain's `import` and `merge` (`crates/groupware/src/calendar/drain.rs`) mirror by hand the import branch of `itip_ingest` and `commit_itip_merge` (`crates/groupware/src/calendar/itip.rs`): the size cap, the quota check, the alarm task swap, the schedule tag and the `<now>_<random>.ics` naming. An upstream change to those functions compiles without touching the drain, so an upstream merge that changes them needs a re-read of both.
+
+## Final review
+
+The whole-branch review (`9a1855e4..7d5c66b3`, 0 critical, 5 important, 9 minor, "with fixes") and its rulings:
+
+- F1 (important 1), fixed in `22902e0a`. A REPLY from an attendee with no pair was deleted as a forgery with a security trace, so a removed attendee who declines from its cancelled copy (a routine client action: `attendee_decline` builds a declined REPLY for any attendee not yet DECLINED) raised an attack trace at the organizer and lost the item. Ruling: a REPLY whose sender holds no pair in the event's bundle is rejected as `SenderIsNotParticipant` and kept as history (flags 0, the usual `Calendar(ItipMessageError)` trace with a fixed reason); `drop_forgery` stays for a participant (an address holding a pair) whose token is missing or different. This resolves spec 3.3's two sentences: "never invited" and "removed" both mean "no pair" and both become history; spec 3.3 and 6.5 now say so. `merge`, `drain.rs:650-671`. `test_reply` step 6 (`tests/src/za/drain.rs:700-794`): key1 invites key2, key2 accepts, key1 removes key2, key2 drains the CANCEL (cancelled copy, pair kept) and declines from it; upstream's PUT built the REPLY (nothing planted); key1's drain keeps the item, pending bit 0, `event_id` the organizer's event, both copies unchanged. Cost if wrong: a never-invited sender's REPLY stays in the inbox as history instead of being deleted (harmless, visible to the organizer).
+- F2 (important 2), fixed in `22902e0a`. `import` did not re-read the item under the lease, so in the benign two-session race (two devices at login, or two nodes) the loser acquired the lease after the winner's commit, found the event, merged against a stale item archive, lost the assertion, traced "drain pass failed" at error level and deferred the session 30 s. Ruling: `import` re-reads the item right after `acquire` and returns `Ok(true)` when it is gone, no longer pending or changed, as the delegating merge already did; both now call `ItemCtx::still_pending` (`drain.rs:909-921`, used at `:506` and `:820`). `test_lease` case F (`tests/src/za/drain.rs:1394-1459`): session 1 parked at `DRAIN_LEASE_PAUSE`, session 2 inside `acquire`'s retries, session 1 released inside them; one copy, nothing pending, no lease; with the default backoff in force a second invitation drains on session 2's next request. Cost if wrong: one more store read per import.
+- F3 (important 3), deferred. The delegating merge's fan-out writes outside the fenced batch (the Task 2 residual under "Deferred findings") stays a follow-up together with plan 9's F2: one problem on the PUT side (update PUTs of events that carry pairs taking the UID lease, or compensating deletion). Cost if wrong: a delegate's replies dropped as forgeries for one backoff in a rare double fault.
+- F4 and F5 (important 4 and 5), fixed in the documentation commit, with the Task 7 doc nits: spec 11 now says the suite calls `assert_is_empty` once at its end after `destroy_key_accounts` and every module removes what it creates; spec 6.2 names the 30 seconds once; spec 13's Names bullet is wrapped and its `cal_scheduling` item marked settled by section 11; spec 6.5 carries F1's sentence; this note and CLAUDE.md carry the merge hotspots above and the hand-mirrored `itip_ingest` / `commit_itip_merge` dependency.
+- The nine minors and the triage lines marked "follow-up" are deferred to one follow-up (ruling: one fix wave only), listed below.
+
+Follow-up list (the final review's minors, then its "follow-up" triage lines not already under "Deferred findings"):
+- Minor 1, no poison-pill bound: a deterministic non-assertion `Err` on one item blocks every later item of the inbox, retried every 30 s with an error trace (`drain_items` aborts at the first `Err`); the owner can delete the item by href, but nothing names it. A per-item failure counter in `ZaDrainState`, or a troubleshooting line in the checklist.
+- Minor 2, no per-pass cap: a pass drains every pending item inside the triggering request under the session lock; a cap with a "more to do, no backoff" outcome would bound the request (cancellation is already safe).
+- Minor 3: store errors before the match (`fetch_dav_resources`, `itip_ids`, `read_item` in `drain_pass`) set no deferral, so a persistent store fault traces "drain pass failed" on every DAV request of every key session.
+- Minor 4: `is_stale_reply` counts an absent SEQUENCE as 0, so a client that strips SEQUENCE from the attendee's copy would have every reply to a rescheduled event kept as history; a client-behaviour risk for the manual checklist.
+- Minor 5: `Step::Nothing` writes history with flags 0 where upstream writes no inbox item for `MergeResult::None`; the names table's "merge: `EVENT_NOTIFICATION_IS_CHANGE`" does not mention it.
+- Minor 6: no test plants a REPLY carrying the real token under another principal's `changed_by` (the REPLY sender resolution has no catcher; the Task 3 deferred minor).
+- Minor 7: no test issues a DAV request for another account's data to show that it drains the caller's inbox, as the comment in `crates/dav/src/request.rs` promises.
+- Minor 8: CLAUDE.md's status sentence says plan 10 is "not yet merged" and is about 1,900 characters; split it into a status line and a locations line at merge time.
+- Minor 9: the `za_jmap_untraced` doc (`crates/http/src/request.rs`) lost its comparison target ("unlike the fail-open `za_is_key_account_request`") and now reads as if fail-closed were unusual.
+- (Task 2 triage) A recorded private-key failure: `defer_until(u64::MAX)` on that branch instead of the 30 s churn (already listed below as a spec 10 divergence).
+- (Task 4 triage) A positive "waited on the lease" signal in cases A and E (an elapsed-time assertion); case F asserts that session 2 had not finished 300 ms into its wait, which is not an elapsed-time bound.
+- (Task 5 triage) `test_errors` step 3: `uid_copies("za-drain-e4") == 0`; the leak test's `itip_tasks_for` check after the reply and a key1 scan while the reply is pending.
+- (Task 6 triage) The moved canary is not re-checked in the stored archive (one `raw_event` call).
+- (Tasks 1 and 3 triage) The "plan 10's sweep" comments, `test_hooks.rs`'s stray `//!` line and `secs as i64`, Step 1's "trigger 1" comment, the planted REPLY with the real token from another principal, the old token rejected after a re-add: already under "Deferred findings".
+
+Dropped by the final review's triage, with its reasons:
+- `maintenance.rs`'s `?` propagation: consistent with the neighbouring steps; a failed sweep should be loud.
+- The per-request since-query and full inbox read on any change: spec 6.2 accepts the cost; revisit with a pending index if inboxes grow.
+- `MissingUid` / `NoSchedulingInfo` kept as history: history is the safer choice and nothing is lost that a user could want (spec 6.5 to say iTIP-level parse errors are history).
+- The lost fence's extra "not released" trace, and the merge's busy trace reusing "creation lease busy": both ruled (see "Rulings").
+- Task 3's prelude repetition, `set_partstat`'s suffix match, the module split: until the module grows again.
+- Case E's redundant retry step, the duplicate override reset, bare asserts, the panic-path restore, a `drain_lease.rs` split.
+- `request_tree`'s positive control, step 4's "lowest id" versus "default calendar", the corruption closure's `X-ZA-KEY` check, the quota restore assertion.
+- `moved` built by three `replace`s; OPTIONS no longer touching the auth cache or failure accounting (upstream's behaviour by design).
+- The M35 row not saying the edit removed the backoff; `11656ec0`'s commit message stating the race as fact (this note records it as a hypothesis).
 
 ## Facts for release 3
 
