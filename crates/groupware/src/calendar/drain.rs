@@ -30,14 +30,19 @@
 //! later items for the same UID keep their order (a CANCEL never overtakes
 //! the REQUEST it cancels); a permanent one (the wrap does not open, a stray carrier, an unparsable
 //! tree, an unknown METHOD) deletes the item, since nothing can ever read
-//! it; a token mismatch deletes the item with a security trace; an
-//! iTIP-level rejection keeps the item as history, resealed, bit cleared.
+//! it; a forgery, a REPLY from a participant (a sender address holding a
+//! pair in the event's bundle) whose token is wrong or missing, deletes
+//! the item with a security trace, while a REPLY from a sender holding no
+//! pair is not a participant and is kept as history; an iTIP-level
+//! rejection keeps the item as history, resealed, bit cleared.
 //! A pass that leaves any item pending does not advance the cursor and
 //! defers the next pass by `DRAIN_RETRY_SECS`.
 //!
 //! Lease order: a drain holds its session lock and then may take a per-UID
 //! lease (an import, or a REPLY merge that fans out to delegates); the PUT
 //! path takes the lease without any drain lock, so there is no cycle.
+//! Both lease holders re-read the item once the lease is theirs and skip
+//! it, writing nothing, when another session finished it in the meantime.
 
 use crate::{
     DestroyArchive,
@@ -496,6 +501,12 @@ async fn import(
     };
     // Dropped on an early return, the guard releases from a spawned task.
     let lease = ZaUidLeaseGuard::new(server.store().clone(), lease);
+    // Under the lease: another session that imported this item while this
+    // one waited leaves nothing to do, as in the delegating merge.
+    if !ctx.still_pending().await? {
+        lease.release().await;
+        return Ok(true);
+    }
     // Under the lease the UID may have appeared (another session's drain
     // or PUT): merge instead.
     if let Some(event_id) = find_event(server, account_id, uid).await? {
@@ -630,18 +641,34 @@ async fn merge(
     let mut pairs = unseal_event_pairs(&mut event, ctx.keys, account_id)
         .map_err(|err| seal_error(err, account_id, event_id))?;
     // Spec 3.3, "Verification": a REPLY is authenticated by the replier's
-    // token in this event's bundle, matched by address. The replier is the
-    // sender's address whose pair holds the token; an alias of the sender
-    // with no pair, or a token that matches none, is a forgery.
+    // token in this event's bundle, matched by address. A sender none of
+    // whose addresses holds a pair is not a participant (never invited, or
+    // removed): kept as history, as upstream's participant check rejects
+    // it. Otherwise the replier is the sender's address whose pair holds
+    // the token; a token that matches none is a forgery.
     let sender_address = match &incoming {
-        Incoming::Reply(token) => match sender_addresses.iter().find(|address| {
-            pairs
-                .as_ref()
-                .is_some_and(|pairs| pairs.matches(address, token))
-        }) {
-            Some(address) => address.clone(),
-            None => return ctx.drop_forgery().await,
-        },
+        Incoming::Reply(token) => {
+            let Some(pairs) = pairs.as_ref().filter(|pairs| {
+                sender_addresses
+                    .iter()
+                    .any(|address| pairs.get(address).is_some())
+            }) else {
+                return ctx
+                    .reject(
+                        tree,
+                        Some(event_id),
+                        &ItipError::SenderIsNotParticipant(sender_addresses[0].clone()),
+                    )
+                    .await;
+            };
+            match sender_addresses
+                .iter()
+                .find(|address| pairs.matches(address, token))
+            {
+                Some(address) => address.clone(),
+                None => return ctx.drop_forgery().await,
+            }
+        }
         Incoming::Request(_) | Incoming::Cancel => sender_addresses[0].clone(),
     };
     let (step, is_organizer_update, before, event_uid) = {
@@ -790,20 +817,7 @@ async fn merge(
                         let lease = ZaUidLeaseGuard::new(server.store().clone(), lease);
                         // Under the lease: another session that finished
                         // this item first leaves nothing to do.
-                        let current = read_item(server, account_id, ctx.document_id).await?;
-                        let unchanged = match &current {
-                            Some(current) => {
-                                current.as_bytes() == ctx.stored.as_bytes()
-                                    && current.version == ctx.stored.version
-                                    && archived_item_is_pending(
-                                        current
-                                            .unarchive::<CalendarEventNotification>()
-                                            .caused_by(trc::location!())?,
-                                    )
-                            }
-                            None => false,
-                        };
-                        if !unchanged {
+                        if !ctx.still_pending().await? {
                             lease.release().await;
                             return Ok(true);
                         }
@@ -889,6 +903,23 @@ async fn merge(
 }
 
 impl ItemCtx<'_> {
+    /// The re-read under a lease: whether the item is still the archive
+    /// this pass read, pending. Another session that finished it (or a
+    /// deletion) while this one waited for the lease leaves nothing to do.
+    async fn still_pending(&self) -> trc::Result<bool> {
+        let Some(current) = read_item(self.server, self.keys.account_id, self.document_id).await?
+        else {
+            return Ok(false);
+        };
+        Ok(current.as_bytes() == self.stored.as_bytes()
+            && current.version == self.stored.version
+            && archived_item_is_pending(
+                current
+                    .unarchive::<CalendarEventNotification>()
+                    .caused_by(trc::location!())?,
+            ))
+    }
+
     /// Spec 6.4 step 5: the item resealed under the master key, bit
     /// cleared, no carrier, `event_id` and the change flag as upstream's
     /// ingest sets them, `created` kept. No commit point of its own: the
@@ -975,8 +1006,10 @@ impl ItemCtx<'_> {
         self.delete().await
     }
 
-    /// Spec 6.5, token mismatch: a traced drop of a forgery; the event is
-    /// unchanged.
+    /// Spec 6.5, token mismatch: a traced drop of a forgery, a REPLY from
+    /// a participant (an address holding a pair) whose token is wrong or
+    /// missing; the event is unchanged. A sender with no pair is not a
+    /// participant: `merge` keeps its REPLY as history instead.
     async fn drop_forgery(&self) -> trc::Result<bool> {
         trc::event!(
             Security(trc::SecurityEvent::Unauthorized),

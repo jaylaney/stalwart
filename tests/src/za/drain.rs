@@ -697,6 +697,102 @@ pub async fn test_reply(test: &mut TestServer) {
     );
     assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
 
+    // 6. A removed attendee's reply is history, not a forgery (spec 3.3,
+    // "Maintenance"; 6.5). key1 invites key2, key2 accepts; key1 removes
+    // key2 (a CANCEL to key2; key1's copy drops key2's pair); key2's copy
+    // turns cancelled and keeps its pair; key2 then declines from the
+    // cancelled copy, which upstream's attendee builder sends as a REPLY.
+    // The sender holds no pair in key1's bundle: key1's drain keeps the
+    // item as history (not deleted), and neither copy changes.
+    let uid5 = "za-drain-r5";
+    let organizer5 = format!("{KEY1_CAL}drain-r5.ics");
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &organizer5,
+            [CONTENT_TYPE],
+            invite(uid5, START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    let copy5 = copy_href(test, key2.id, uid5).await;
+    set_partstat(&key2.client, &copy5, "key2@example.com", "ACCEPTED").await;
+    assert_eq!(
+        partstat_of(&key1.client, &organizer5, "key2@example.com")
+            .await
+            .as_deref(),
+        Some("ACCEPTED"),
+        "the acceptance did not apply"
+    );
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &organizer5,
+            [CONTENT_TYPE],
+            invite(uid5, START_A, &[]),
+        )
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    assert!(
+        pending_ids(test, key1.id).await.is_empty(),
+        "the removal left key1 an item"
+    );
+    assert!(
+        stored_pairs(test, &keys1, key1.id, "default/drain-r5.ics")
+            .await
+            .is_none(),
+        "the organizer kept a pair for a removed attendee"
+    );
+    let keys2 = za_unlock(test, key2.id, STRONG).await;
+    let cancelled = body(&key2.client, &copy5).await;
+    assert!(cancelled.contains("STATUS:CANCELLED"), "{cancelled}");
+    assert!(
+        stored_pairs(test, &keys2, key2.id, &relative(&copy5))
+            .await
+            .expect("pairs")
+            .get("key2@example.com")
+            .is_some(),
+        "the cancelled copy dropped its pair"
+    );
+    let organizer5_before = body(&key1.client, &organizer5).await;
+    assert!(
+        !organizer5_before.contains("key2@example.com"),
+        "{organizer5_before}"
+    );
+    set_partstat(&key2.client, &copy5, "key2@example.com", "DECLINED").await;
+    let removed_reply = pending_ids(test, key1.id).await;
+    assert_eq!(
+        removed_reply.len(),
+        1,
+        "the decline from the cancelled copy built no reply"
+    );
+    let copy5_before = body(&key2.client, &copy5).await;
+    let (_, event5) = raw_event(test, key1.id, "default/drain-r5.ics").await;
+    assert_eq!(trigger_drain(key1.name, STRONG).await, 207);
+    let item = stored_item(test, key1.id, removed_reply[0]).await;
+    assert_eq!(
+        item.flags & EVENT_NOTIFICATION_ZA_PENDING,
+        0,
+        "the removed attendee's reply is still pending"
+    );
+    assert_eq!(
+        item.flags & EVENT_NOTIFICATION_IS_CHANGE,
+        0,
+        "the removed attendee's reply applied"
+    );
+    assert_eq!(item.event_id, Some(event5), "history names the event");
+    assert_eq!(
+        body(&key1.client, &organizer5).await,
+        organizer5_before,
+        "the removed attendee's reply changed the organizer's copy"
+    );
+    assert_eq!(
+        body(&key2.client, &copy5).await,
+        copy5_before,
+        "key1's drain changed key2's copy"
+    );
+
     // Cleanup.
     for (party, uid) in [
         (&key2, uid),
@@ -704,6 +800,7 @@ pub async fn test_reply(test: &mut TestServer) {
         (&key2, uid3),
         (&key3, uid3),
         (&key2, uid4),
+        (&key2, uid5),
     ] {
         let href = copy_href(test, party.id, uid).await;
         party
@@ -712,7 +809,7 @@ pub async fn test_reply(test: &mut TestServer) {
             .await
             .with_status(StatusCode::NO_CONTENT);
     }
-    for name in ["drain-r1", "drain-r2", "drain-r3", "drain-r4"] {
+    for name in ["drain-r1", "drain-r2", "drain-r3", "drain-r4", "drain-r5"] {
         key1.client
             .request_with_headers("DELETE", &format!("{KEY1_CAL}{name}.ics"), [NO_REPLY], "")
             .await
@@ -1294,9 +1391,76 @@ pub async fn test_lease(test: &mut TestServer) {
     assert_eq!(za_uid_leases(test).await, 0);
     test_hooks::set_drain_retry_override(None);
 
+    // F. The import winner commits while the loser waits for the lease
+    // (spec 6.3): session 1 (key2's password session) holds the creation
+    // lease, parked before its commit; session 2 (key2's app-password
+    // session) enters the lease's retry loop; session 1 commits inside it.
+    // Session 2 then takes the lease, re-reads the item, finds it drained
+    // and skips it, writing nothing. With the default backoff in force, a
+    // second invitation drains on session 2's next request, which a
+    // session deferred by a lost assertion would not do.
+    test_hooks::set_drain_retry_override(None);
+    let uid6 = "za-drain-l6";
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &format!("{KEY1_CAL}drain-l6.ics"),
+            [CONTENT_TYPE],
+            invite(uid6, START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(pending_ids(test, key2.id).await.len(), 1);
+    assert_eq!(za_uid_leases(test).await, 0);
+    let session_1 = HookParked::start(
+        key2.id,
+        test_hooks::set_drain_lease_pause,
+        trigger_drain(key2.name, STRONG),
+    )
+    .await;
+    let session_2 = tokio::spawn(trigger_drain(key2.name, &app));
+    // Inside `ZaUidLease::acquire`'s retries (20 x 50 ms).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !session_2.is_finished(),
+        "session 2 did not wait on the lease"
+    );
+    assert_eq!(session_1.finish().await, 207);
+    assert_eq!(session_2.await.unwrap(), 207, "session 2's request");
+    assert_eq!(
+        uid_copies(test, key2.id, uid6).await,
+        1,
+        "exactly one copy for the raced item"
+    );
+    assert!(
+        pending_ids(test, key2.id).await.is_empty(),
+        "the raced item is still pending"
+    );
+    assert_eq!(za_uid_leases(test).await, 0);
+    let uid7 = "za-drain-l7";
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &format!("{KEY1_CAL}drain-l7.ics"),
+            [CONTENT_TYPE],
+            invite(uid7, START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(pending_ids(test, key2.id).await.len(), 1);
+    assert_eq!(trigger_drain(key2.name, &app).await, 207);
+    assert!(
+        pending_ids(test, key2.id).await.is_empty(),
+        "session 2 was deferred after the race"
+    );
+    assert_eq!(uid_copies(test, key2.id, uid7).await, 1);
+    let copy6 = copy_href(test, key2.id, uid6).await;
+    let copy7 = copy_href(test, key2.id, uid7).await;
+    assert_eq!(za_uid_leases(test).await, 0);
+
     // Cleanup.
     test_hooks::set_drain_retry_override(None);
-    for href in [copy, own, own3, copy5] {
+    for href in [copy, own, own3, copy5, copy6, copy7] {
         key2.client
             .request_with_headers("DELETE", &href, [NO_REPLY], "")
             .await
@@ -1320,6 +1484,8 @@ pub async fn test_lease(test: &mut TestServer) {
         format!("{KEY1_CAL}drain-l3.ics"),
         format!("{KEY1_CAL}drain-l4.ics"),
         organizer5,
+        format!("{KEY1_CAL}drain-l6.ics"),
+        format!("{KEY1_CAL}drain-l7.ics"),
     ] {
         key1.client
             .request_with_headers("DELETE", &href, [NO_REPLY], "")
