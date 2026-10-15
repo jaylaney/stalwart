@@ -5,7 +5,10 @@
  */
 
 use crate::keys::{KeyError, Secret, derive_event_key};
-use std::sync::OnceLock;
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 
 /// Keys resident for one request (spec 5, "in-flight copies"). Cloned by
 /// `Arc`; the secrets are zeroed when the last reference drops.
@@ -18,6 +21,64 @@ pub struct SessionKeys {
     /// vault record on first use. Holds the outcome, so a wrap that does not
     /// open is traced once per session.
     private_key: OnceLock<Result<Secret, KeyError>>,
+    /// Invitations spec 6.2-6.3: what this session remembers about its
+    /// drain. In memory only, dropped with the key-cache entry.
+    drain: ZaDrainState,
+}
+
+/// The drain's per-session state (invitations spec 6.2, "The cursor", and
+/// 6.3, "The pass"): the inbox change id the last complete pass observed
+/// before enumerating, the time before which a pass that left an item
+/// pending is not retried, and the lock that keeps to one pass per session
+/// on a node. Never a value produced by the drain's own writes: the cursor
+/// is the snapshot the pass started from.
+pub struct ZaDrainState {
+    /// `NO_CURSOR` until a pass completes.
+    cursor: AtomicU64,
+    /// Unix seconds; `0` when no deferral is in force.
+    retry_after: AtomicU64,
+    pass: tokio::sync::Mutex<()>,
+}
+
+const NO_CURSOR: u64 = u64::MAX;
+
+impl ZaDrainState {
+    fn new() -> Self {
+        ZaDrainState {
+            cursor: AtomicU64::new(NO_CURSOR),
+            retry_after: AtomicU64::new(0),
+            pass: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    /// The inbox change id the last complete pass started from; `None`
+    /// until one completed (the session's first request drains).
+    pub fn cursor(&self) -> Option<u64> {
+        Some(self.cursor.load(Ordering::SeqCst)).filter(|cursor| *cursor != NO_CURSOR)
+    }
+
+    /// A pass found every pending item done: remember its snapshot and lift
+    /// any deferral.
+    pub fn complete(&self, snapshot: u64) {
+        self.cursor
+            .store(snapshot.min(NO_CURSOR - 1), Ordering::SeqCst);
+        self.retry_after.store(0, Ordering::SeqCst);
+    }
+
+    pub fn retry_after(&self) -> u64 {
+        self.retry_after.load(Ordering::SeqCst)
+    }
+
+    /// A pass left an item pending (spec 6.2): no pass before `secs`.
+    pub fn defer_until(&self, secs: u64) {
+        self.retry_after.store(secs, Ordering::SeqCst);
+    }
+
+    /// One pass per session on a node (spec 6.3): a second request of the
+    /// session waits for the running pass and then finds its cursor.
+    pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.pass.lock().await
+    }
 }
 
 impl SessionKeys {
@@ -29,6 +90,7 @@ impl SessionKeys {
             mk,
             ewk,
             private_key: OnceLock::new(),
+            drain: ZaDrainState::new(),
         }
     }
 
@@ -51,6 +113,10 @@ impl SessionKeys {
     /// first stands).
     pub fn set_private_key(&self, outcome: Result<Secret, KeyError>) -> bool {
         self.private_key.set(outcome).is_ok()
+    }
+
+    pub fn drain(&self) -> &ZaDrainState {
+        &self.drain
     }
 }
 
@@ -97,5 +163,36 @@ mod tests {
             failed.private_key().map(|outcome| outcome.err()),
             Some(Some(KeyError::Aead))
         );
+    }
+
+    #[tokio::test]
+    async fn drain_state_starts_empty_and_remembers_a_completed_pass() {
+        let keys = SessionKeys::new(3, 11, Secret::from_bytes([9; 32]));
+        let drain = keys.drain();
+        assert_eq!(drain.cursor(), None, "no pass completed yet");
+        assert_eq!(drain.retry_after(), 0);
+        drain.defer_until(1_700_000_000);
+        assert_eq!(drain.retry_after(), 1_700_000_000);
+        drain.complete(42);
+        assert_eq!(drain.cursor(), Some(42));
+        assert_eq!(drain.retry_after(), 0, "a complete pass lifts the deferral");
+        drain.complete(0);
+        assert_eq!(
+            drain.cursor(),
+            Some(0),
+            "an empty inbox's change id is a cursor too"
+        );
+        drain.complete(u64::MAX);
+        assert_eq!(
+            drain.cursor(),
+            Some(u64::MAX - 1),
+            "the sentinel is never stored"
+        );
+        // One pass at a time.
+        let held = drain.lock().await;
+        assert!(drain.pass.try_lock().is_err(), "a second pass waits");
+        drop(held);
+        assert!(drain.pass.try_lock().is_ok());
+        assert_eq!(format!("{keys:?}"), "SessionKeys(account 3, generation 11)");
     }
 }

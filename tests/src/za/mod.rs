@@ -11,6 +11,7 @@ use ::registry::schema::{
     structs::{Http, Imap, Rate},
 };
 use ::registry::types::duration::Duration;
+use common::za::test_hooks;
 
 pub mod app_password;
 pub mod caches;
@@ -29,6 +30,7 @@ pub mod password;
 pub mod registry;
 pub mod reply;
 pub mod setup;
+pub mod sweep;
 pub mod totp;
 pub mod tracing;
 pub mod uid_lease;
@@ -89,6 +91,10 @@ pub async fn za_tests() {
     admin.reload_settings().await;
     test.insert_account(plain);
     test.insert_account(admin);
+    // Plan 10: the drain runs on every DAV request of a key account. The
+    // plan 8 and 9 modules read pending items at store level, so the suite
+    // skips every account's drain; the drain modules turn it on (`DrainOn`).
+    test_hooks::set_drain_skip(test_hooks::DRAIN_SKIP_ALL);
 
     setup::test(&mut test).await;
     setup::test_data_check(&mut test).await;
@@ -111,6 +117,7 @@ pub async fn za_tests() {
     fanout::test_plain_owner(&mut test).await;
     reply::test(&mut test).await;
     uid_lease::test(&mut test).await;
+    sweep::test(&mut test).await;
     tracing::test(&mut test).await;
     expansion::test(&mut test).await;
     gating::test(&mut test).await;

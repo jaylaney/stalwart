@@ -221,6 +221,13 @@ async fn store_maintenance(
                 .await
                 .caused_by(trc::location!())?;
 
+            // Zero-access fork, invitations spec 6.3 step 4: the generic purge
+            // above skips UID creation leases (`KV_LOCK_ZA_UID`), so this
+            // asserting sweep is their only cleanup.
+            common::za::lease::sweep_expired_uid_leases(server.store())
+                .await
+                .caused_by(trc::location!())?;
+
             server
                 .registry()
                 .purge_dead_nodes()

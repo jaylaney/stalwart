@@ -25,11 +25,22 @@
 //! - The lease-duration override: stands in for `ZA_UID_LEASE_SECS`, which
 //!   is read once per process.
 //!
-//! Plan 10 adds the drain pause and the drain skip here.
+//! - `DRAIN_LOOKUP_PAUSE`: in the drain's import, after the first UID
+//!   lookup found nothing and before the creation lease, keyed by the
+//!   draining account (`groupware::calendar::drain`).
+//! - `DRAIN_LEASE_PAUSE`: in the drain's import, holding the lease, after
+//!   the second lookup and immediately before the commit, keyed by the
+//!   draining account.
+//! - `DRAIN_FAIL_ONCE`: the account's next drain commit fails with an
+//!   internal error (a transient item error, spec 6.5).
+//! - The drain skip: while an account is listed (or `DRAIN_SKIP_ALL` is),
+//!   its drain does not run; the za suite lists every account after setup
+//!   and the drain modules clear it for their duration.
+//! - The drain retry override: stands in for `DRAIN_RETRY_SECS`.
 
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicI64, AtomicU64, Ordering},
 };
 use tokio::sync::Notify;
 
@@ -58,6 +69,22 @@ pub static TASK_CONSUMER_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
 /// The account whose next key-account PUT create fails its commit.
 pub static COMMIT_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+
+pub static DRAIN_LOOKUP_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
+pub static DRAIN_LEASE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
+/// The account whose next drain commit fails.
+pub static DRAIN_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+
+/// Accounts whose drain does not run; `DRAIN_SKIP_ALL` stands for every
+/// account.
+static DRAIN_SKIP: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+pub const DRAIN_SKIP_ALL: u32 = u32::MAX;
+
+/// Seconds before a pass that left an item pending is retried; `-1` unset.
+static DRAIN_RETRY_OVERRIDE: AtomicI64 = AtomicI64::new(-1);
 
 /// Seconds a new creation lease lasts; 0 when unset.
 static LEASE_SECS_OVERRIDE: AtomicU64 = AtomicU64::new(0);
@@ -88,6 +115,47 @@ pub fn set_lease_secs_override(secs: Option<u64>) {
 
 pub fn lease_secs_override() -> Option<u64> {
     Some(LEASE_SECS_OVERRIDE.load(Ordering::SeqCst)).filter(|secs| *secs > 0)
+}
+
+pub fn set_drain_lookup_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&DRAIN_LOOKUP_PAUSE, pause);
+}
+
+pub fn set_drain_lease_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&DRAIN_LEASE_PAUSE, pause);
+}
+
+pub fn set_drain_fail_once(account_id: Option<u32>) {
+    *DRAIN_FAIL_ONCE.lock().unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn set_drain_skip(account_id: u32) {
+    let mut skipped = DRAIN_SKIP.lock().unwrap_or_else(|e| e.into_inner());
+    if !skipped.contains(&account_id) {
+        skipped.push(account_id);
+    }
+}
+
+pub fn clear_drain_skip(account_id: u32) {
+    DRAIN_SKIP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|skipped| *skipped != account_id);
+}
+
+/// Whether `account_id`'s drain is skipped: listed itself, or everyone is.
+pub fn drain_skipped(account_id: u32) -> bool {
+    let skipped = DRAIN_SKIP.lock().unwrap_or_else(|e| e.into_inner());
+    skipped.contains(&account_id) || skipped.contains(&DRAIN_SKIP_ALL)
+}
+
+pub fn set_drain_retry_override(secs: Option<u64>) {
+    DRAIN_RETRY_OVERRIDE.store(secs.map_or(-1, |secs| secs as i64), Ordering::SeqCst);
+}
+
+pub fn drain_retry_override() -> Option<u64> {
+    let secs = DRAIN_RETRY_OVERRIDE.load(Ordering::SeqCst);
+    (secs >= 0).then_some(secs as u64)
 }
 
 fn take_for(slot: &Mutex<Option<Arc<Pause>>>, account_id: u32) -> Option<Arc<Pause>> {
@@ -121,6 +189,25 @@ pub async fn task_consumer_pause_point() {
         .unwrap_or_else(|e| e.into_inner())
         .take();
     wait(pause).await;
+}
+
+pub async fn drain_lookup_pause_point(account_id: u32) {
+    wait(take_for(&DRAIN_LOOKUP_PAUSE, account_id)).await;
+}
+
+pub async fn drain_lease_pause_point(account_id: u32) {
+    wait(take_for(&DRAIN_LEASE_PAUSE, account_id)).await;
+}
+
+/// Whether the drain commit of `account_id` must fail now; clears the flag.
+pub fn take_drain_fail(account_id: u32) -> bool {
+    let mut slot = DRAIN_FAIL_ONCE.lock().unwrap_or_else(|e| e.into_inner());
+    if *slot == Some(account_id) {
+        *slot = None;
+        true
+    } else {
+        false
+    }
 }
 
 /// Whether the commit of `account_id` must fail now; clears the flag.

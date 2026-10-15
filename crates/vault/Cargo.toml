@@ -16,6 +16,10 @@ rand = "0.10.2"
 subtle = "2.6"
 blake3 = "1.8"
 rkyv = { version = "0.8.18", features = ["little_endian"] }
+tokio = { version = "1.53", default-features = false, features = ["sync"] }
+
+[dev-dependencies]
+tokio = { version = "1.53", features = ["macros", "rt"] }
 
 [lints]
 workspace = true
