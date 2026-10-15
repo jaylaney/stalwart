@@ -710,14 +710,16 @@ impl Server {
                     if domain.flags & DOMAIN_FLAG_SUB_ADDRESSING != 0 {
                         if let Some(sub_addressing) = &domain.sub_addressing_custom {
                             // Custom sub-addressing resolution
-                            if let Some(result) = self
-                                .eval_if::<String, _>(
-                                    sub_addressing,
-                                    &AddressResolver(local_part.as_ref()),
-                                    0,
-                                )
-                                .await
-                            {
+                            let resolver = AddressResolver(local_part.as_ref());
+                            // Zero-access fork: the quiet path skips the result trace.
+                            let result = if quiet {
+                                self.za_eval_if::<String, _>(sub_addressing, &resolver, 0)
+                                    .await
+                            } else {
+                                self.eval_if::<String, _>(sub_addressing, &resolver, 0)
+                                    .await
+                            };
+                            if let Some(result) = result {
                                 local_part = Cow::Owned(result);
                             }
                         } else if let Some((new_local_part, _)) = address.split_once('+') {

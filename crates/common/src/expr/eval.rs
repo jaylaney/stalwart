@@ -27,6 +27,31 @@ impl Server {
         resolver: &'x V,
         session_id: u64,
     ) -> Option<R> {
+        self.eval_if_inner(if_block, resolver, session_id, false)
+            .await
+    }
+
+    /// Zero-access fan-out: `eval_if` without the trace that carries the
+    /// evaluation result (invitations spec 10).
+    pub async fn za_eval_if<'x, R: TryFrom<Variable<'x>>, V: ResolveVariable>(
+        &'x self,
+        if_block: &'x IfBlock,
+        resolver: &'x V,
+        session_id: u64,
+    ) -> Option<R> {
+        self.eval_if_inner(if_block, resolver, session_id, true)
+            .await
+    }
+
+    // Zero-access fork: `quiet` skips the events that carry evaluation
+    // content (the result, and an error that may echo a resolved value).
+    async fn eval_if_inner<'x, R: TryFrom<Variable<'x>>, V: ResolveVariable>(
+        &'x self,
+        if_block: &'x IfBlock,
+        resolver: &'x V,
+        session_id: u64,
+        quiet: bool,
+    ) -> Option<R> {
         if if_block.is_empty() {
             trc::event!(
                 Eval(EvalEvent::Result),
@@ -50,13 +75,15 @@ impl Server {
         .await
         {
             Ok(result) => {
-                trc::event!(
-                    Eval(EvalEvent::Result),
-                    SpanId = session_id,
-                    Id = if_block.id.to_string(),
-                    Key = if_block.property.as_str(),
-                    Result = format!("{result:?}"),
-                );
+                if !quiet {
+                    trc::event!(
+                        Eval(EvalEvent::Result),
+                        SpanId = session_id,
+                        Id = if_block.id.to_string(),
+                        Key = if_block.property.as_str(),
+                        Result = format!("{result:?}"),
+                    );
+                }
 
                 match result.try_into() {
                     Ok(value) => Some(value),
@@ -74,13 +101,15 @@ impl Server {
                 }
             }
             Err(err) => {
-                trc::event!(
-                    Eval(EvalEvent::Error),
-                    SpanId = session_id,
-                    Id = if_block.id.to_string(),
-                    Key = if_block.property.as_str(),
-                    CausedBy = err,
-                );
+                if !quiet {
+                    trc::event!(
+                        Eval(EvalEvent::Error),
+                        SpanId = session_id,
+                        Id = if_block.id.to_string(),
+                        Key = if_block.property.as_str(),
+                        CausedBy = err,
+                    );
+                }
 
                 None
             }
