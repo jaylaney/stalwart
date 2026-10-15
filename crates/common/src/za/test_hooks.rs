@@ -167,6 +167,17 @@ fn take_for(slot: &Mutex<Option<Arc<Pause>>>, account_id: u32) -> Option<Arc<Pau
     }
 }
 
+/// Whether `slot` names `account_id`; clears it if so.
+fn take_flag(slot: &Mutex<Option<u32>>, account_id: u32) -> bool {
+    let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if *slot == Some(account_id) {
+        *slot = None;
+        true
+    } else {
+        false
+    }
+}
+
 /// The guard is gone before this await: `take_for` returns the pause.
 async fn wait(pause: Option<Arc<Pause>>) {
     if let Some(pause) = pause {
@@ -201,22 +212,10 @@ pub async fn drain_lease_pause_point(account_id: u32) {
 
 /// Whether the drain commit of `account_id` must fail now; clears the flag.
 pub fn take_drain_fail(account_id: u32) -> bool {
-    let mut slot = DRAIN_FAIL_ONCE.lock().unwrap_or_else(|e| e.into_inner());
-    if *slot == Some(account_id) {
-        *slot = None;
-        true
-    } else {
-        false
-    }
+    take_flag(&DRAIN_FAIL_ONCE, account_id)
 }
 
 /// Whether the commit of `account_id` must fail now; clears the flag.
 pub fn take_commit_fail(account_id: u32) -> bool {
-    let mut slot = COMMIT_FAIL_ONCE.lock().unwrap_or_else(|e| e.into_inner());
-    if *slot == Some(account_id) {
-        *slot = None;
-        true
-    } else {
-        false
-    }
+    take_flag(&COMMIT_FAIL_ONCE, account_id)
 }

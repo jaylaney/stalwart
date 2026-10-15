@@ -134,6 +134,7 @@ pub async fn za_tests() {
 
     destroy_key_accounts(&test).await;
     test.assert_is_empty().await;
+    test_hooks::clear_drain_skip(test_hooks::DRAIN_SKIP_ALL);
 
     if test.is_reset() {
         test.temp_dir.delete();
