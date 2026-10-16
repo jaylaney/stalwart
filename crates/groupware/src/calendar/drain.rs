@@ -15,8 +15,9 @@
 //! by UID, imports under the creation lease or merges under the event's
 //! archive assertion, adopts or keeps token pairs (3.3), authenticates a
 //! REPLY by its token and rejects a stale one, fans out the organizer's
-//! REQUEST to delegates the merge added, and rewrites the item resealed
-//! under the master key with the pending bit cleared (6.4 step 5). Each
+//! REQUEST to delegates the merge added (compared per instance), and
+//! rewrites the item resealed under the master key with the pending bit
+//! cleared (6.4 step 5). Each
 //! item is one store write holding the event write and the item rewrite
 //! (its batch stays far below `BatchBuilder::is_large_batch`, the only
 //! point at which a commit point splits a batch).
@@ -44,6 +45,9 @@
 //! path takes the lease without any drain lock, so there is no cycle.
 //! Both lease holders re-read the item once the lease is theirs and skip
 //! it, writing nothing, when another session finished it in the meantime.
+//! The lease fences the item's commit and, for a delegating merge, each
+//! delegate item the fan-out writes: a holder whose lease was taken over
+//! delivers nothing more and defers, as on a lost commit fence.
 
 use crate::{
     DestroyArchive,

@@ -612,6 +612,14 @@ one more writer and closes the gap for key accounts.)
    lease is behind the key-account branch (invariant 9). A merge whose
    fan-out would deliver new items takes the UID lease of the organizer's
    account first, so two sessions of the organizer cannot both fan out.
+   That fan-out is fenced on the same lease: each delegate item's batch
+   asserts the holder's value ahead of the insert (the lease key is
+   global, so the delegate's account can carry the assertion). A holder
+   whose lease expired and was taken over while it waited inside the
+   fan-out writes no further item: the first write that loses the fence
+   stops the fan-out, and the merge is abandoned as on a lost commit
+   fence, the item left pending for the next pass after the backoff. A
+   stale token therefore never reaches a delegate after the successor's.
 6. **Why it suffices.** Two creators of one UID in one account serialize on
    the lease, and the second finds the first's event when it re-checks:
    the drain through the fresh UID index, the PUT through current archives
@@ -695,9 +703,16 @@ session (section 3.2). For each item:
      REQUEST from the organizer to each newly added internal attendee,
      built with upstream's organizer request builder
      (`organizer_request_full`) on the merged tree and restricted to those
-     attendees, under the section 5 rules. The drain runs in the
+     attendees, under the section 5 rules. Attendance is compared per
+     instance (the master and each override, by RECURRENCE-ID): an
+     attendee is new when the merged event lists it in an instance it did
+     not attend before, where an override the merge created inherits the
+     master's attendance. A delegate who already attends another instance
+     is therefore still invited to the one it joins; the new addresses are
+     deduplicated for delivery. The drain runs in the
      organizer's own session and holds its keys, so this is the same
-     fan-out a PUT uses. A delegate's REPLY reaches only the organizer
+     fan-out a PUT uses, fenced on the organizer's UID lease (section 6.3,
+     step 5). A delegate's REPLY reaches only the organizer
      (section 5.2); the delegator's copy learns the delegate's status from
      the organizer's next update REQUEST, which carries every attendee's
      participation status, while the organizer's copy is correct
