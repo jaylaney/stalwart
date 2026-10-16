@@ -173,6 +173,15 @@ Two P2 findings on the drain's delegation handling, both fixed (one commit each,
 - Finding 2, fixed in `be0374a2`. New delegates were found by comparing event-wide attendee sets, so a delegation of the master to someone who already attended an override sent no organizer REQUEST, and the delegate's copy never learnt of its series participation. Ruling: attendance is compared per instance (`Attendance` and `instance_key` in `drain.rs`: the master as `None`, an override by RECURRENCE-ID date and range, never its entry id); an override the merge created inherits the master's attendance, so a delegator's per-occurrence delegation does not count the delegator as new; the new addresses are deduplicated for delivery. Test: `test_reply` step 7 (`za-drain-r7`): a master inviting key2 and an override of the second occurrence inviting key2 and key3; key2 delegates the master to key3; key1's drain sends key3 exactly one REQUEST, key2 nothing; key3's copy then lists key3 in the master, delegated from key2, and still in the override. With the fix reverted, the step fails at "key3 has exactly one new item" (0 items).
 - Ruling: the PUT create's fan-out passes no fence yet; the update PUT and DELETE fan-outs take no lease at all (their protection is the event-archive assertion), so they have nothing to fence on. A PUT create's fan-out followed by a lost commit fence is plan 9's F2 (spec 5.4), parked under "Deferred findings": the PUT create's fence, and whether updates should take the lease at all, belong with that decision.
 
+Deferred from the fix wave's review (pr-fix-review.md M1, M3, M4, M6, M9, M10, M11):
+- M1: the lost-fence error path in the fan-out (propagating the assertion failure, abandoning the lease) is defence in depth that no test pins: a regression turning the lost fence into a `5.1` status still passes case G, because the commit's own fence catches that case.
+- M3 (low confidence): an override the merge creates inside the range of an earlier THISANDFUTURE override takes the master's attendance for the new-attendee test, not that of the range override that governs the occurrence.
+- M4: the lost-fence error carries two account ids and two details entries (the delegate's from the fan-out, the organizer's from the drain), and the drain's trace lists the delegate's first.
+- M6: case G's closing retry override, sleep and drain clear the deferred session and assert nothing.
+- M9: with a fence present, any assertion failure in a delegate item's batch is read as a lost fence; the fence is the only assertion in that batch today.
+- M10: naming and an avoidable string allocation in `Attendance::attended`.
+- M11: no test exercises the branch where an override the merge created takes the master's attendance.
+
 ## Facts for release 3
 
 What iMIP for external and plain attendees, the sealed notification email and the RSVP page (spec 15) will need from the drain:
