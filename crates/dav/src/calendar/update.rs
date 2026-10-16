@@ -606,6 +606,8 @@ impl CalendarUpdateRequestHandler for Server {
                     .caused_by(trc::location!())?;
             }
             if let Some((lease, uid)) = za_lease {
+                #[cfg(feature = "test_mode")]
+                common::za::test_hooks::commit_pause_point(account_id).await;
                 za_commit_create(
                     self,
                     &resources,

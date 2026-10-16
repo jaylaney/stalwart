@@ -177,6 +177,84 @@ pub async fn test(test: &mut TestServer) {
     );
     assert_eq!(za_uid_leases(test).await, 0, "the 503 left a lease behind");
 
+    // (b'') Expiry at the commit (spec 6.3 step 3): a create with no
+    // attendees runs no fan-out, so only the commit's fence can find the
+    // takeover. Parked immediately before its commit past the 1-second
+    // lease, the PUT loses its fenced commit; the retake finds the planted
+    // copy (412).
+    let uid = "za-lease-commit";
+    test_hooks::set_lease_secs_override(Some(1));
+    let parked = HookParked::start(
+        key1.id,
+        test_hooks::set_commit_pause,
+        put(
+            key1.name,
+            STRONG,
+            format!("{KEY1_CAL}fo-commit.ics"),
+            invite(uid, START_A, &[]),
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let lease = ZaUidLease::acquire(test.server.store(), key1.id, uid)
+        .await
+        .unwrap()
+        .expect("an expired lease is taken over");
+    plant_sealed_event(
+        test,
+        key1.id,
+        "default",
+        "fo-commit-other.ics",
+        &invite(uid, START_A, &[]),
+        STRONG,
+        &TokenPairs::new(),
+    )
+    .await;
+    assert!(
+        lease.release(test.server.store()).await,
+        "the test's lease releases"
+    );
+    test_hooks::set_lease_secs_override(None);
+    assert_eq!(
+        parked.finish().await,
+        412,
+        "the lost commit fence did not answer 412"
+    );
+    assert_eq!(uid_copies(test, key1.id, uid).await, 1);
+    assert_eq!(za_uid_leases(test).await, 0, "the 412 left a lease behind");
+
+    // The same with no planted copy: the retake finds nothing (503).
+    let uid = "za-lease-commit-none";
+    test_hooks::set_lease_secs_override(Some(1));
+    let parked = HookParked::start(
+        key1.id,
+        test_hooks::set_commit_pause,
+        put(
+            key1.name,
+            STRONG,
+            format!("{KEY1_CAL}fo-commit-none.ics"),
+            invite(uid, START_A, &[]),
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let lease = ZaUidLease::acquire(test.server.store(), key1.id, uid)
+        .await
+        .unwrap()
+        .expect("an expired lease is taken over");
+    assert!(
+        lease.release(test.server.store()).await,
+        "the test's lease releases"
+    );
+    test_hooks::set_lease_secs_override(None);
+    assert_eq!(
+        parked.finish().await,
+        503,
+        "the lost commit fence did not answer 503"
+    );
+    assert_eq!(uid_copies(test, key1.id, uid).await, 0);
+    assert_eq!(za_uid_leases(test).await, 0, "the 503 left a lease behind");
+
     // (c) PUT versus PUT, one session holding the lease in its fan-out.
     let uid = "za-lease-race";
     let parked = HookParked::start(
@@ -306,6 +384,7 @@ pub async fn test(test: &mut TestServer) {
     for name in [
         "fo-stale-drained",
         "fo-expiry-other",
+        "fo-commit-other",
         "fo-race-a",
         "fo-busy",
     ] {

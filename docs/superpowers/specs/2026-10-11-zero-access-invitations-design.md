@@ -999,6 +999,7 @@ like release 1's auth-cache pauses (`za_test` in
 `release` notifies keyed by account id): a
 fan-out pause between document-id assignment and the item commit, a
 drain pause after its absence check, a PUT pause after the resource fetch,
+a commit pause (`COMMIT_PAUSE`),
 a per-account drain skip (while set, that account's drain does not run),
 a one-shot failure of the sender's commit after the fan-out, and a
 task-consumer pause, a one-shot private-key unwrap failure
