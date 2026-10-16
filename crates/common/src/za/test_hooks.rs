@@ -36,6 +36,13 @@
 //!   draining account.
 //! - `DRAIN_FAIL_ONCE`: the account's next drain commit fails with an
 //!   internal error (a transient item error, spec 6.5).
+//! - `PRIVATE_KEY_FAIL_ONCE`: the account's next private-key unwrap records
+//!   a failure, as a corrupt wrap would (`common::auth::vault`).
+//! - `DRAIN_ENUMERATE_FAIL_ONCE`: the account's next drain pass fails with an
+//!   internal error while enumerating, before any item is read.
+//! - `DRAIN_FAIL_ITEM`: every drain commit of the named (account, document
+//!   id) fails with an internal error until the slot is cleared (not
+//!   one-shot).
 //! - The drain skip: while an account is listed (or `DRAIN_SKIP_ALL` is),
 //!   its drain does not run; the za suite lists every account after setup
 //!   and the drain modules clear it for their duration.
@@ -81,6 +88,12 @@ pub static DRAIN_LEASE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
 /// The account whose next drain commit fails.
 pub static DRAIN_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+
+pub static PRIVATE_KEY_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+
+pub static DRAIN_ENUMERATE_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+
+pub static DRAIN_FAIL_ITEM: Mutex<Option<(u32, u32)>> = Mutex::new(None);
 
 /// Accounts whose drain does not run; `DRAIN_SKIP_ALL` stands for every
 /// account.
@@ -136,6 +149,22 @@ pub fn set_drain_lease_pause(pause: Option<Arc<Pause>>) {
 
 pub fn set_drain_fail_once(account_id: Option<u32>) {
     *DRAIN_FAIL_ONCE.lock().unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn set_private_key_fail(account_id: Option<u32>) {
+    *PRIVATE_KEY_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn set_drain_enumerate_fail(account_id: Option<u32>) {
+    *DRAIN_ENUMERATE_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn set_drain_fail_item(item: Option<(u32, u32)>) {
+    *DRAIN_FAIL_ITEM.lock().unwrap_or_else(|e| e.into_inner()) = item;
 }
 
 pub fn set_drain_skip(account_id: u32) {
@@ -231,4 +260,19 @@ pub fn take_drain_fail(account_id: u32) -> bool {
 /// Whether the commit of `account_id` must fail now; clears the flag.
 pub fn take_commit_fail(account_id: u32) -> bool {
     take_flag(&COMMIT_FAIL_ONCE, account_id)
+}
+
+/// Whether the account's next private-key unwrap must fail; clears the flag.
+pub fn take_private_key_fail(account_id: u32) -> bool {
+    take_flag(&PRIVATE_KEY_FAIL_ONCE, account_id)
+}
+
+/// Whether the account's next drain enumeration must fail; clears the flag.
+pub fn take_drain_enumerate_fail(account_id: u32) -> bool {
+    take_flag(&DRAIN_ENUMERATE_FAIL_ONCE, account_id)
+}
+
+/// Whether the drain commit of this item must fail; the slot stays set.
+pub fn drain_item_fails(account_id: u32, document_id: u32) -> bool {
+    *DRAIN_FAIL_ITEM.lock().unwrap_or_else(|e| e.into_inner()) == Some((account_id, document_id))
 }

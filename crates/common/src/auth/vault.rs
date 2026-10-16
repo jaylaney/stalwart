@@ -340,6 +340,12 @@ pub(crate) async fn za_open_private_key<'k>(
             Err(err) if is_vault_unusable(&err) => Err(KeyError::Aead),
             Err(err) => return Err(err),
         };
+        #[cfg(feature = "test_mode")]
+        let outcome = if crate::za::test_hooks::take_private_key_fail(account_id) {
+            Err(KeyError::Aead)
+        } else {
+            outcome
+        };
         let failed = outcome.is_err();
         if keys.set_private_key(outcome) && failed {
             trc::error!(private_key_unavailable(account_id));

@@ -20,6 +20,7 @@ pub mod dav_gate;
 pub mod dav_seal;
 pub mod disabled;
 pub mod drain;
+pub mod drain_limits;
 pub mod expansion;
 pub mod fanout;
 pub mod gating;
@@ -124,6 +125,7 @@ pub async fn za_tests() {
     drain::test_lease(&mut test).await;
     drain::test_cursor(&mut test).await;
     drain::test_errors(&mut test).await;
+    drain_limits::test(&mut test).await;
     sweep::test(&mut test).await;
     tracing::test(&mut test).await;
     expansion::test(&mut test).await;
