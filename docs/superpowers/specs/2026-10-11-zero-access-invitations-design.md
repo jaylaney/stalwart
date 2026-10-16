@@ -455,22 +455,25 @@ re-check current archives, `NoUidConflict` on a hit and 503 otherwise.
 
 **What remains.** Items delivered before the takeover stay: the recipient
 drains them in document-id order, so the successor's later item wins and
-the recipient ends on the committed token. A reply the recipient sends
-between draining the two items carries the earlier token and is dropped
-as a forgery; the recipient's next reply is accepted. When no successor
-exists (the lease expired, nobody took the UID, the create answers 503),
-the recipient holds an invitation for an event that was not stored until
-the sender's client resends, which 503 asks for; the resent create
-delivers fresh tokens with an equal SEQUENCE, which upstream's merge
-accepts (`>=` in the `Request` arm of `inbound.rs`), and the copy adopts
-them under the section 6.4 rule. Both are accepted: each needs a lease
-expiring under a live request, and each heals on the next message.
-Compensating deletion of delivered items was considered and rejected
-(section 14). A reply can also beat the sender's commit: if the attendee
-drains, imports and replies before the organizer's event commits, the
-organizer's drain finds no event for the UID and files the reply as
-history (section 6.4 step 4), never retried; the attendee's next
-participation change produces a fresh reply.
+the recipient ends on the committed token, provided the successor's
+SEQUENCE is not lower than the loser's; a lower one is rejected by
+upstream's merge and the recipient keeps the loser's token until the
+organizer's next message. A reply the recipient sends between draining
+the two items carries the earlier token and is dropped as a forgery; the
+recipient's next reply is accepted. When the create's commit fails for
+another reason, or no successor exists (the lease expired, nobody took
+the UID, the create answers 503), the recipient holds an invitation for an
+event that was not stored until the sender's client resends, which 503
+asks for; the resent create delivers fresh tokens with an equal SEQUENCE,
+which upstream's merge accepts (`>=` in the `Request` arm of
+`inbound.rs`), and the copy adopts them under the section 6.4 rule. Both
+are accepted: each needs a lease expiring under a live request, and each
+heals on the next message. Compensating deletion of delivered items was
+considered and rejected (section 14). A reply can also beat the sender's
+commit: if the attendee drains, imports and replies before the organizer's
+event commits, the organizer's drain finds no event for the UID and files
+the reply as history (section 6.4 step 4), never retried; the attendee's
+next participation change produces a fresh reply.
 
 **Updates and deletes** take no lease: their commit is fenced on the
 event's stored archive, and a lost update commit after a fan-out leaves
@@ -557,19 +560,28 @@ backoff after such a pass (`DRAIN_RETRY_SECS`, a constant of 30 seconds
 with a test-mode override; plan 10 settled on no environment knob) keeps
 a stuck item from draining on every request.
 
-**The cap.** A pass handles at most `DRAIN_PASS_CAP` (32) items. When
-more remain, the pass ends without a deferral and without advancing the
-remembered id, so the session's next request continues where it stopped.
-A pass that leaves an item pending for another reason defers as above,
-whether or not more items remained.
+**The cap.** A pass attempts at most `DRAIN_PASS_CAP` (32) items. An item
+found waiting behind a skipped one (below) is not an attempt, and it is
+not re-opened for the rest of that session. When more remain, the pass
+ends without a deferral and without advancing the remembered id, so the
+session's next request continues where it stopped. A pass that leaves an
+item pending for another reason defers as above, whether or not more items
+remained.
 
 **Skipped items.** An item whose drain failed `DRAIN_ITEM_FAILURE_LIMIT`
 (3) times in one session is skipped for the rest of that session, with
 one trace, and later items that name the same UID are left pending with
-it, so a CANCEL never overtakes the REQUEST it cancels (section 6.3).
-Neither a skipped item nor one waiting behind it holds the remembered
-id: a pass whose only pending items are those completes. The counters
-live in the session's drain state; a new session retries the item.
+it, so a CANCEL never overtakes the REQUEST it cancels (section 6.3). A
+failure is an error returned by the item's own drain (a store or apply
+error, including a lost fence inside the delegating merge). An item left
+pending behind a busy creation lease does not count, nor does one
+waiting behind a skipped item. A failure before the item's UID is known
+(the re-read of an item `enumerate` already read) is a store error, not
+the item's: it defers the pass like an enumeration error and is not
+counted. Neither a skipped item nor one waiting behind it holds the
+remembered id: a pass whose only pending items are those completes. The
+counters live in the session's drain state; a new session retries the
+item.
 
 An invitation therefore appears at the attendee client's next poll, not at
 the next login.
@@ -801,9 +813,9 @@ ingest does.
 - **Transient** (a store error; a lost conditional write, including a
   fenced commit whose lease was lost, which also aborts the pass; a
   creation lease not taken, section 6.3): the item stays pending and is
-  retried by a later pass (section 6.2), up to `DRAIN_ITEM_FAILURE_LIMIT`
-  failures in one session, after which the item is skipped for that
-  session (section 6.2).
+  retried by a later pass (section 6.2). Its failures are counted as 6.2
+  defines ("Skipped items"); an item that reaches
+  `DRAIN_ITEM_FAILURE_LIMIT` in one session is skipped for that session.
 - **Permanent** (unknown wrap type, unknown policy version, a wrap this
   account's private key does not open, a stray carrier, an unparsable tree,
   an unknown METHOD): the item is deleted with a trace naming account and
@@ -1001,13 +1013,15 @@ fan-out pause between document-id assignment and the item commit, a
 drain pause after its absence check, a PUT pause after the resource fetch,
 a commit pause (`COMMIT_PAUSE`),
 a per-account drain skip (while set, that account's drain does not run),
-a one-shot failure of the sender's commit after the fan-out, and a
+a one-shot failure of the sender's commit after the fan-out, a
 task-consumer pause, a one-shot private-key unwrap failure
 (`PRIVATE_KEY_FAIL_ONCE`), a one-shot failure of the drain's enumeration
-(`DRAIN_ENUMERATE_FAIL_ONCE`), and a persistent commit failure for one
-item (`DRAIN_FAIL_ITEM`, keyed by account and document id). None of them
-changes behaviour when unset. The consumer pause must live where both
-`http` and `services` can reach it (`common`), a note for planning.
+(`DRAIN_ENUMERATE_FAIL_ONCE`), a persistent commit failure for one item
+(`DRAIN_FAIL_ITEM`, keyed by account and document id), and a persistent
+failure of the drain's re-read of one item (`DRAIN_READ_FAIL_ITEM`, keyed
+the same way). None of them changes behaviour when unset. The consumer
+pause must live where both `http` and `services` can reach it (`common`),
+a note for planning.
 
 - Invite between two key accounts, drained on the attendee's first request,
   and on a mid-session arrival: a second request by an already connected
@@ -1088,9 +1102,16 @@ changes behaviour when unset. The consumer pause must live where both
   CANCEL for its UID waits with it, an unrelated item drains, and a fresh
   session applies both in order; a pass of 33 pending items drains 32 and
   the next request the rest, an arrival in between included, with the
-  default backoff in force.
-- The PUT create's fence: lease cases (b) and (b') assert that the held
-  create writes no attendee item after its lease was taken over.
+  default backoff in force; items waiting behind a skipped one are
+  neither re-opened nor counted toward the cap, which probe items prove
+  (step 5: an opened probe would be deleted as undecodable); a REQUEST
+  whose re-read fails three times is not skipped, so its CANCEL stays
+  pending behind it until the re-read succeeds (step 6).
+- The PUT create's fence: lease cases (b) and (b') in
+  `tests/src/za/uid_lease.rs` (the expiry case with and without a planted
+  copy) assert that the held create writes no attendee item after its
+  lease was taken over, and (b'') (a create with no attendees parked
+  before its commit) that it loses its fenced commit.
 
 **Leak tests** (`tests/src/za/leak.rs` pattern). An invitation carries
 canary titles, locations, descriptions and attendee addresses; the
@@ -1157,16 +1178,15 @@ Release 1's ten invariants hold. Release 2 adds:
   inbox items' scope (`itip`) and drained key-envelope purpose, the
   drain's retry backoff (`DRAIN_RETRY_SECS`, a constant of 30 seconds),
   the per-pass cap (`DRAIN_PASS_CAP`, 32) and the per-item failure limit
-  (`DRAIN_ITEM_FAILURE_LIMIT`, 3), both constants, the creation lease
-  prefix (`KV_LOCK_ZA_UID`), the lease duration and its
-  test knob (`ZA_UID_LEASE_SECS`), the fence token length, and the lease
-  retry count and wait (values for planning). The lease key carries the
-  raw UID, and UIDs can be long; it may hold a fixed-length hash of the
-  UID instead, a choice for planning. The names in this spec are its
-  choices, to be confirmed. A merge that changes nothing
-  (`MergeResult::None`) is written as history with flags `0`, where
-  upstream writes no inbox item; the item stays visible as the organizer's
-  unchanged message.
+  (`DRAIN_ITEM_FAILURE_LIMIT`, 3) (both constants), the creation lease
+  prefix (`KV_LOCK_ZA_UID`), the lease duration and its test knob
+  (`ZA_UID_LEASE_SECS`), the fence token length, and the lease retry
+  count and wait (values for planning). The lease key carries the raw
+  UID, and UIDs can be long; it may hold a fixed-length hash of the UID
+  instead, a choice for planning. The names in this spec are its choices,
+  to be confirmed. A merge that changes nothing (`MergeResult::None`) is
+  written as history with flags `0`, where upstream writes no inbox item;
+  the item stays visible as the organizer's unchanged message.
 - **Where the seal step gets the pairs.** The pairs cannot live in
   `CalendarEvent` fields (invariant 1), so the seal step takes them from
   the stored bundle: for example `seal_event` receiving the previous
