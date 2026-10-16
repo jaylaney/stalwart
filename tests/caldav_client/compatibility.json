@@ -1,0 +1,164 @@
+{
+  "plain": {
+    "features": {
+      "scheduling.auto-schedule": {
+        "value": true,
+        "reason": "This fork imports local invitations automatically and exposes schedule inbox collections; strict flows assert acceptance and organizer replies rather than relying on upstream early return.",
+        "source": "docs/superpowers/specs/2026-10-11-zero-access-invitations-design.md sections 6 and 6.6; pinned tests/test_caldav.py:_TestSchedulingBase.testInviteAndRespond"
+      },
+      "scheduling.mailbox.inbox-delivery": {
+        "value": true,
+        "reason": "This fork imports local invitations automatically and exposes schedule inbox collections; strict flows assert acceptance and organizer replies rather than relying on upstream early return.",
+        "source": "docs/superpowers/specs/2026-10-11-zero-access-invitations-design.md sections 6 and 6.6; pinned tests/test_caldav.py:_TestSchedulingBase.testInviteAndRespond"
+      },
+      "create-calendar.auto": {
+        "value": true,
+        "reason": "Stalwart auto-creates a missing calendar during get_events; the upstream test must not require NotFound on that operation. Fresh product diagnostic observed DID NOT RAISE at test_caldav.py:2049;",
+        "source": "Pinned tests/test_caldav.py:testCreateDeleteCalendar and caldav/compatibility_hints.py:stalwart create-calendar.auto; actual product diagnostic 64 passed/6 failed/2 skipped before policy (fresh product, both modes)."
+      },
+      "get-current-user-principal.has-calendar": {
+        "value": true,
+        "reason": "Disposable provisioned accounts expose a default calendar. Enable the upstream assertion rather than accept its default unsupported-feature skip. Fresh strict invitation flows used that default calendar successfully;",
+        "source": "Pinned tests/test_caldav.py:testGetDefaultCalendar; tests/caldav_client/test_flows.py uses principals[0].calendars()[0]."
+      }
+    },
+    "outcomes": {
+      "calendar/testCheckCompatibility": {
+        "outcome": "skipped",
+        "reason": "Upstream intentionally excludes caldav_server_tester: its released probe matrix does not match this pin. See pinned pyproject.toml test dependencies and tests/test_caldav.py:testCheckCompatibility.",
+        "source": "Pinned pyproject.toml optional test dependencies and tests/test_caldav.py:1634-1645."
+      },
+      "calendar/testPrincipals": {
+        "outcome": "xfailed",
+        "exception": "DeprecationWarning",
+        "reason": "The pinned upstream test calls DAVClient.principals(), which itself raises DeprecationWarning while upstream pytest configuration treats warnings as errors. This is a client-suite defect before server principal search executes.",
+        "source": "Pinned tests/test_caldav.py:2017; caldav/davclient.py:415; pyproject.toml filterwarnings=error.",
+        "failure": {
+          "file": "caldav/davclient.py",
+          "line": 415
+        }
+      },
+      "calendar/testAlarm": {
+        "outcome": "xfailed",
+        "exception": "AssertionError",
+        "reason": "Inherited server alarm time-range query returns zero events for the 07:40-07:55 query whose alarm is 07:45; test expects one. Event creation passes; alarm query compatibility remains a known gap.",
+        "source": "Pinned tests/test_caldav.py:2279 and caldav/compatibility_hints.py:stalwart search.time-range.alarm=False; unmasked diagnostic assertion len==1 observed0.",
+        "failure": {
+          "file": "tests/test_caldav.py",
+          "line": 2279
+        }
+      },
+      "calendar/testTodoDatesearch": {
+        "outcome": "xfailed",
+        "exception": "AssertionError",
+        "reason": "Inherited VTODO date search returns four resources where the pinned test initially expects five. Upstream Stalwart profile marks recurring todos and DTSTART-less date searches fragile; retain this exact test as strict xfail rather than importing broad flags.",
+        "source": "Pinned tests/test_caldav.py:3621; caldav/compatibility_hints.py:stalwart search.recurrences.includes-implicit.todo and search.time-range.todo.no-dtstart; unmasked diagnostic observed4 expected5.",
+        "failure": {
+          "file": "tests/test_caldav.py",
+          "line": 3621
+        }
+      },
+      "calendar/testRecurringDateSearch": {
+        "outcome": "xfailed",
+        "exception": "AssertionError",
+        "reason": "Client-side all-day expansion passes, but explicit server-side expansion retains the original DTSTART year instead of the selected anniversary year. The mandatory strict recurrence flow exercises client-side expansion only; it does not cover this server-side gap.",
+        "source": "Pinned tests/test_caldav.py:4391; unmasked diagnostic expected DTSTART;VALUE=DATE:2026 once, observed0 in server-expanded result.",
+        "failure": {
+          "file": "tests/test_caldav.py",
+          "line": 4391
+        }
+      },
+      "calendar/testRecurringDateWithExceptionSearch": {
+        "outcome": "xfailed",
+        "exception": "AssertionError",
+        "reason": "Client-side recurrence exception expansion returns two correct instances, but server-side expansion returns three including the overridden original. The mandatory strict recurrence flow checks client-side overrides and adjacent instances only; it does not cover this server-side gap.",
+        "source": "Pinned tests/test_caldav.py:4469; caldav/compatibility_hints.py:stalwart search.recurrences.expanded.exception; unmasked diagnostic observed3 expected2.",
+        "failure": {
+          "file": "tests/test_caldav.py",
+          "line": 4469
+        }
+      }
+    }
+  },
+  "key": {
+    "features": {
+      "scheduling.auto-schedule": {
+        "value": true,
+        "reason": "This fork imports local invitations automatically and exposes schedule inbox collections; strict flows assert acceptance and organizer replies rather than relying on upstream early return.",
+        "source": "docs/superpowers/specs/2026-10-11-zero-access-invitations-design.md sections 6 and 6.6; pinned tests/test_caldav.py:_TestSchedulingBase.testInviteAndRespond"
+      },
+      "scheduling.mailbox.inbox-delivery": {
+        "value": true,
+        "reason": "This fork imports local invitations automatically and exposes schedule inbox collections; strict flows assert acceptance and organizer replies rather than relying on upstream early return.",
+        "source": "docs/superpowers/specs/2026-10-11-zero-access-invitations-design.md sections 6 and 6.6; pinned tests/test_caldav.py:_TestSchedulingBase.testInviteAndRespond"
+      },
+      "create-calendar.auto": {
+        "value": true,
+        "reason": "Stalwart auto-creates a missing calendar during get_events; the upstream test must not require NotFound on that operation. Fresh product diagnostic observed DID NOT RAISE at test_caldav.py:2049;",
+        "source": "Pinned tests/test_caldav.py:testCreateDeleteCalendar and caldav/compatibility_hints.py:stalwart create-calendar.auto; actual product diagnostic 64 passed/6 failed/2 skipped before policy (fresh product, both modes)."
+      },
+      "get-current-user-principal.has-calendar": {
+        "value": true,
+        "reason": "Disposable provisioned accounts expose a default calendar. Enable the upstream assertion rather than accept its default unsupported-feature skip. Fresh strict invitation flows used that default calendar successfully;",
+        "source": "Pinned tests/test_caldav.py:testGetDefaultCalendar; tests/caldav_client/test_flows.py uses principals[0].calendars()[0]."
+      }
+    },
+    "outcomes": {
+      "calendar/testCheckCompatibility": {
+        "outcome": "skipped",
+        "reason": "Upstream intentionally excludes caldav_server_tester: its released probe matrix does not match this pin. See pinned pyproject.toml test dependencies and tests/test_caldav.py:testCheckCompatibility.",
+        "source": "Pinned pyproject.toml optional test dependencies and tests/test_caldav.py:1634-1645."
+      },
+      "calendar/testPrincipals": {
+        "outcome": "xfailed",
+        "exception": "DeprecationWarning",
+        "reason": "The pinned upstream test calls DAVClient.principals(), which itself raises DeprecationWarning while upstream pytest configuration treats warnings as errors. This is a client-suite defect before server principal search executes.",
+        "source": "Pinned tests/test_caldav.py:2017; caldav/davclient.py:415; pyproject.toml filterwarnings=error.",
+        "failure": {
+          "file": "caldav/davclient.py",
+          "line": 415
+        }
+      },
+      "calendar/testAlarm": {
+        "outcome": "xfailed",
+        "exception": "AssertionError",
+        "reason": "Inherited server alarm time-range query returns zero events for the 07:40-07:55 query whose alarm is 07:45; test expects one. Event creation passes; alarm query compatibility remains a known gap.",
+        "source": "Pinned tests/test_caldav.py:2279 and caldav/compatibility_hints.py:stalwart search.time-range.alarm=False; unmasked diagnostic assertion len==1 observed0.",
+        "failure": {
+          "file": "tests/test_caldav.py",
+          "line": 2279
+        }
+      },
+      "calendar/testTodoDatesearch": {
+        "outcome": "xfailed",
+        "exception": "AssertionError",
+        "reason": "Inherited VTODO date search returns four resources where the pinned test initially expects five. Upstream Stalwart profile marks recurring todos and DTSTART-less date searches fragile; retain this exact test as strict xfail rather than importing broad flags.",
+        "source": "Pinned tests/test_caldav.py:3621; caldav/compatibility_hints.py:stalwart search.recurrences.includes-implicit.todo and search.time-range.todo.no-dtstart; unmasked diagnostic observed4 expected5.",
+        "failure": {
+          "file": "tests/test_caldav.py",
+          "line": 3621
+        }
+      },
+      "calendar/testRecurringDateSearch": {
+        "outcome": "xfailed",
+        "exception": "AssertionError",
+        "reason": "Client-side all-day expansion passes, but explicit server-side expansion retains the original DTSTART year instead of the selected anniversary year. The mandatory strict recurrence flow exercises client-side expansion only; it does not cover this server-side gap.",
+        "source": "Pinned tests/test_caldav.py:4391; unmasked diagnostic expected DTSTART;VALUE=DATE:2026 once, observed0 in server-expanded result.",
+        "failure": {
+          "file": "tests/test_caldav.py",
+          "line": 4391
+        }
+      },
+      "calendar/testRecurringDateWithExceptionSearch": {
+        "outcome": "xfailed",
+        "exception": "AssertionError",
+        "reason": "Client-side recurrence exception expansion returns two correct instances, but server-side expansion returns three including the overridden original. The mandatory strict recurrence flow checks client-side overrides and adjacent instances only; it does not cover this server-side gap.",
+        "source": "Pinned tests/test_caldav.py:4469; caldav/compatibility_hints.py:stalwart search.recurrences.expanded.exception; unmasked diagnostic observed3 expected2.",
+        "failure": {
+          "file": "tests/test_caldav.py",
+          "line": 4469
+        }
+      }
+    }
+  }
+}
