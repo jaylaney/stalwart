@@ -24,6 +24,7 @@ use dav_proto::schema::{
     response::CalCondition,
 };
 use groupware::{calendar::CalendarEvent, scheduling::ItipError};
+use http_proto::HttpResponse;
 use hyper::StatusCode;
 use store::{
     ValueKey,
@@ -219,6 +220,35 @@ pub(crate) async fn za_assert_is_unique_uid(
     Ok(())
 }
 
+/// Invitations spec 5.4 and 6.3 step 3: what a key account's create does
+/// when its lease was taken over while the request ran, found by the
+/// fan-out's fence or by the commit's. Traced first, so a busy lease or a
+/// 412 from the retake does not hide that the fence was lost; the lease
+/// is abandoned (the key holds a successor's value, or is gone); the lease
+/// is taken again to re-check current archives (`NoUidConflict` on a hit)
+/// and released; otherwise 503, so the client resends. Never `Ok`.
+pub(crate) async fn za_lost_create_fence(
+    server: &Server,
+    resources: &DavResources,
+    lease: ZaUidLeaseGuard,
+    account_id: u32,
+    calendar_id: u32,
+    uid: &str,
+) -> crate::Result<HttpResponse> {
+    trc::event!(
+        Store(trc::StoreEvent::AssertValueFailed),
+        AccountId = account_id,
+        Details = "zero-access: UID creation lease lost before the commit",
+    );
+    lease.abandon();
+    let retry = za_take_uid_lease(server, resources, account_id, calendar_id, uid).await?;
+    retry.release().await;
+    // Reached only when another creator took the lease and did not store
+    // the UID in this calendar (a PUT into another calendar, or a drain
+    // that failed).
+    Err(DavError::Code(StatusCode::SERVICE_UNAVAILABLE))
+}
+
 /// Invitations spec 6.3 steps 3-4: commits a key account's create batch,
 /// which carries the lease's fenced-commit assertion, then releases the
 /// lease. If the lease was taken over while the request ran, the commit
@@ -249,20 +279,9 @@ pub(crate) async fn za_commit_create(
             Ok(())
         }
         Err(err) if err.is_assertion_failure() => {
-            // Traced first, so a busy lease or a 412 from the retake does not
-            // hide that the fence was lost.
-            trc::event!(
-                Store(trc::StoreEvent::AssertValueFailed),
-                AccountId = account_id,
-                Details = "zero-access: UID creation lease lost before the commit",
-            );
-            lease.abandon();
-            let retry = za_take_uid_lease(server, resources, account_id, calendar_id, uid).await?;
-            retry.release().await;
-            // Reached only when another creator took the lease and did not
-            // store the UID in this calendar (a PUT into another calendar, or
-            // plan 10's drain failing).
-            Err(DavError::Code(StatusCode::SERVICE_UNAVAILABLE))
+            za_lost_create_fence(server, resources, lease, account_id, calendar_id, uid)
+                .await
+                .map(|_| ())
         }
         Err(err) => {
             lease.release().await;

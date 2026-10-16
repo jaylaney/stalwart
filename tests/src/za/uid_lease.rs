@@ -90,7 +90,11 @@ pub async fn test(test: &mut TestServer) {
         "the refused PUT kept its lease"
     );
 
-    // (b) Expiry: the held PUT's commit is fenced out.
+    // (b) Expiry: the held PUT's fan-out and commit are fenced out (spec
+    // 5.4). Parked inside its fan-out to key2 past the 1-second lease, the
+    // PUT finds its lease taken over: the item's batch loses the fence, so
+    // key2 receives nothing from it, and the retake finds the planted copy
+    // (412).
     let uid = "za-lease-expiry";
     test_hooks::set_lease_secs_override(Some(1));
     let parked = HookParked::start(
@@ -128,13 +132,14 @@ pub async fn test(test: &mut TestServer) {
     assert_eq!(uid_copies(test, key1.id, uid).await, 1);
     assert_eq!(
         new_inbox_items(test, key2.id, &start2).await.len(),
-        1,
-        "the held PUT's item was written before its commit (spec 5.4)"
+        0,
+        "the held PUT delivered after its lease was taken over (spec 5.4)"
     );
 
     // (b') Expiry with no copy: the test takes the expired lease over and
     // releases it without planting. The held PUT's fenced commit fails, its
-    // retake finds no stored copy, and it answers 503; its item stays.
+    // retake finds no stored copy, and it answers 503; its item is fenced
+    // out too.
     let uid = "za-lease-expiry-none";
     let before2 = inbox_ids(test, key2.id).await;
     test_hooks::set_lease_secs_override(Some(1));
@@ -167,8 +172,8 @@ pub async fn test(test: &mut TestServer) {
     assert_eq!(uid_copies(test, key1.id, uid).await, 0);
     assert_eq!(
         new_inbox_items(test, key2.id, &before2).await.len(),
-        1,
-        "the held PUT's item was written before its commit (spec 5.4)"
+        0,
+        "the held PUT delivered after its lease was taken over (spec 5.4)"
     );
     assert_eq!(za_uid_leases(test).await, 0, "the 503 left a lease behind");
 

@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::{assert_is_unique_uid, za_commit_create, za_take_uid_lease};
+use super::{assert_is_unique_uid, za_commit_create, za_lost_create_fence, za_take_uid_lease};
 use crate::{
     DavError, DavErrorCondition, DavMethod,
     calendar::ItipPrecondition,
@@ -433,7 +433,7 @@ impl CalendarUpdateRequestHandler for Server {
             // Invitations spec 5.1, 6.3: a key account's create holds the UID
             // creation lease from here through the insert, and checks current
             // archives instead of the snapshot.
-            let za_lease = if za_keys.is_some() {
+            let mut za_lease = if za_keys.is_some() {
                 Some((
                     za_take_uid_lease(self, &resources, account_id, parent.document_id(), uid)
                         .await?,
@@ -540,12 +540,36 @@ impl CalendarUpdateRequestHandler for Server {
             if let Some(keys) = &za_keys {
                 // Spec 5.3-5.4: after every check, immediately before the
                 // sealed commit; the fan-out hands out the attendees' tokens.
+                // Fenced on the creation lease (spec 5.4): a creator whose
+                // lease was taken over writes no item after its successor's.
                 let mut pairs = None;
                 if let Some(messages) = za_messages {
-                    let fan_out = self
-                        .za_fan_out(&account_info, keys, messages, None, &event.data.event, None)
+                    let fan_out = match self
+                        .za_fan_out(
+                            &account_info,
+                            keys,
+                            messages,
+                            None,
+                            &event.data.event,
+                            za_lease.as_ref().map(|(lease, _)| lease.lease()),
+                        )
                         .await
-                        .caused_by(trc::location!())?;
+                    {
+                        Ok(fan_out) => fan_out,
+                        Err(err) if err.is_assertion_failure() => {
+                            let (lease, uid) = za_lease.take().expect("a lost fence needs a lease");
+                            return za_lost_create_fence(
+                                self,
+                                &resources,
+                                lease,
+                                account_id,
+                                parent.document_id(),
+                                &uid,
+                            )
+                            .await;
+                        }
+                        Err(err) => return Err(err.caused_by(trc::location!()).into()),
+                    };
                     za_set_schedule_status(&mut event.data.event, &fan_out.statuses);
                     pairs = fan_out.pairs;
                 }
