@@ -23,7 +23,7 @@ use hyper::Method;
 use std::{future::Future, time::Duration};
 
 /// A PUT with its own client and a 5-second timeout; resolves to the status.
-fn put(
+pub fn put(
     name: &str,
     secret: &str,
     path: String,
@@ -257,6 +257,9 @@ pub async fn test(test: &mut TestServer) {
         lease.release(test.server.store()).await,
         "the plain PUT left the lease as it found it"
     );
+    // The plain account's event is indexed by the background task: wait for
+    // it before deleting the calendar, or the index keys outlive the delete.
+    test.wait_for_tasks().await;
     plain_client
         .request("DELETE", plain_cal, "")
         .await

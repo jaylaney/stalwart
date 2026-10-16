@@ -18,7 +18,7 @@ For each client:
 10. Change the password through the account page, reconnect the client with the new password.
 11. Log in with an app password; revoke it through the account page; confirm the client is refused.
 12. Enrol TOTP through the account page (the account page is where TOTP is enrolled and removed); confirm the client needs an app password; remove TOTP. A client with a cached session keeps working until its next authentication (spec 5), so reconnect the client before judging the result.
-13. Invite an attendee from the key account; confirm the client reports that the server does not send invitations (no auto-schedule) and that nothing is delivered to the attendee.
+13. Invitations between two key accounts (release 2), with a client connected to each: from the first account, invite the second; confirm the invitation appears in the second client's inbox and on its calendar at its next refresh (no email is sent). Accept it from the second client; confirm the first client shows the attendee as accepted. Move the event from the first client; confirm the second client shows the new time. Delete the event from the first client; confirm the second client shows it cancelled. Repeat the invitation once with an external address alongside the second account; confirm the client shows delivery to the external address as not attempted (`SCHEDULE-STATUS` 5.3, shown as a delivery failure by clients that show it) and that nothing is sent.
 
 Server-side, after the run: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests` passes against the same build, and the admin
 can read nothing meaningful in the stored records (spot-check with the leak scanner's output).

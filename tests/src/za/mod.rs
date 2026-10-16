@@ -11,6 +11,7 @@ use ::registry::schema::{
     structs::{Http, Imap, Rate},
 };
 use ::registry::types::duration::Duration;
+use common::za::test_hooks;
 
 pub mod app_password;
 pub mod caches;
@@ -18,6 +19,7 @@ pub mod cors;
 pub mod dav_gate;
 pub mod dav_seal;
 pub mod disabled;
+pub mod drain;
 pub mod expansion;
 pub mod fanout;
 pub mod gating;
@@ -29,6 +31,7 @@ pub mod password;
 pub mod registry;
 pub mod reply;
 pub mod setup;
+pub mod sweep;
 pub mod totp;
 pub mod tracing;
 pub mod uid_lease;
@@ -89,6 +92,10 @@ pub async fn za_tests() {
     admin.reload_settings().await;
     test.insert_account(plain);
     test.insert_account(admin);
+    // Plan 10: the drain runs on every DAV request of a key account. The
+    // plan 8 and 9 modules read pending items at store level, so the suite
+    // skips every account's drain; the drain modules turn it on (`DrainOn`).
+    test_hooks::set_drain_skip(test_hooks::DRAIN_SKIP_ALL);
 
     setup::test(&mut test).await;
     setup::test_data_check(&mut test).await;
@@ -111,6 +118,13 @@ pub async fn za_tests() {
     fanout::test_plain_owner(&mut test).await;
     reply::test(&mut test).await;
     uid_lease::test(&mut test).await;
+    drain::test(&mut test).await;
+    drain::test_reply(&mut test).await;
+    drain::test_adoption(&mut test).await;
+    drain::test_lease(&mut test).await;
+    drain::test_cursor(&mut test).await;
+    drain::test_errors(&mut test).await;
+    sweep::test(&mut test).await;
     tracing::test(&mut test).await;
     expansion::test(&mut test).await;
     gating::test(&mut test).await;
@@ -120,6 +134,7 @@ pub async fn za_tests() {
     inbox::test(&mut test).await;
     inbox::test_sync(&mut test).await;
     inbox::test_expiry(&mut test).await;
+    leak::test_drain(&mut test).await;
     leak::test(&mut test).await;
     leak::test_index_control(&mut test).await;
     index_task::test(&mut test).await;
@@ -127,6 +142,7 @@ pub async fn za_tests() {
 
     destroy_key_accounts(&test).await;
     test.assert_is_empty().await;
+    test_hooks::clear_drain_skip(test_hooks::DRAIN_SKIP_ALL);
 
     if test.is_reset() {
         test.temp_dir.delete();

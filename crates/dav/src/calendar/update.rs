@@ -347,7 +347,14 @@ impl CalendarUpdateRequestHandler for Server {
                 // fan-out decides the pairs the bundle keeps.
                 if let Some(messages) = za_messages {
                     let fan_out = self
-                        .za_fan_out(&account_info, keys, messages, pairs, &new_event.data.event)
+                        .za_fan_out(
+                            &account_info,
+                            keys,
+                            messages,
+                            pairs,
+                            &new_event.data.event,
+                            None,
+                        )
                         .await
                         .caused_by(trc::location!())?;
                     za_set_schedule_status(&mut new_event.data.event, &fan_out.statuses);
@@ -536,7 +543,7 @@ impl CalendarUpdateRequestHandler for Server {
                 let mut pairs = None;
                 if let Some(messages) = za_messages {
                     let fan_out = self
-                        .za_fan_out(&account_info, keys, messages, None, &event.data.event)
+                        .za_fan_out(&account_info, keys, messages, None, &event.data.event, None)
                         .await
                         .caused_by(trc::location!())?;
                     za_set_schedule_status(&mut event.data.event, &fan_out.statuses);

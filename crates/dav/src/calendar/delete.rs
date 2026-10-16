@@ -258,6 +258,7 @@ impl CalendarDeleteRequestHandler for Server {
                     vec![message.message],
                     message.pairs,
                     &message.event,
+                    None,
                 )
                 .await
                 .caused_by(trc::location!())?;

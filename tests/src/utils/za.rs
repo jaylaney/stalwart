@@ -48,6 +48,7 @@ use store::{
 };
 use tokio::task::JoinHandle;
 use types::collection::{Collection, SyncCollection};
+use types::field::CalendarEventField;
 use vault::session::SessionKeys;
 
 /// The suite's HTTPS listener.
@@ -936,4 +937,72 @@ pub async fn rewrite_inbox_item(
     test.server
         .invalidate_local_caches(&[CacheInvalidation::DavResources(account_id)])
         .await;
+}
+
+/// An app password of `name`: a second session of the account (invitations
+/// spec 6.3, two key-cache entries), through `/api/vault/app-password`.
+pub async fn za_app_password(name: &str, password: &str, description: &str) -> String {
+    za_post(
+        "app-password",
+        &json!({ "username": name, "password": password, "description": description }),
+    )
+    .await
+    .str(200, "app_password")
+}
+
+/// Any DAV request of a key account drains its inbox first (invitations
+/// spec 6.2): a PROPFIND of the account's own principal, through the raw
+/// client (5 s), so a drain that waits on a lease or a pause is not cut off
+/// by `DummyWebDavClient`'s 500 ms timeout. Resolves to the status.
+pub fn trigger_drain(
+    name: &str,
+    secret: &str,
+) -> impl Future<Output = u16> + Send + 'static + use<> {
+    let request = HttpRequest::with_credentials(8899, name, secret);
+    let path = format!("/dav/pal/{}/", name.replace('@', "%40"));
+    async move {
+        request
+            .send_full(Method::from_bytes(b"PROPFIND").unwrap(), &path, None, None)
+            .await
+            .status
+            .as_u16()
+    }
+}
+
+/// The document ids of the account's inbox items whose pending bit is set.
+pub async fn pending_ids(test: &TestServer, account_id: u32) -> Vec<u32> {
+    inbox_items(test, account_id)
+        .await
+        .into_iter()
+        .filter(|(_, item)| item.flags & EVENT_NOTIFICATION_ZA_PENDING != 0)
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// The href of the account's one calendar event with `uid`: the drain names
+/// an imported copy `<time>_<random>.ics`, so tests find it by UID.
+pub async fn copy_href(test: &TestServer, account_id: u32, uid: &str) -> String {
+    let ids = test
+        .server
+        .document_ids_matching(
+            account_id,
+            Collection::CalendarEvent,
+            CalendarEventField::Uid,
+            uid.as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids.len(), 1, "{uid}: {} copies", ids.len());
+    let resources = test
+        .server
+        .fetch_dav_resources(account_id, account_id, SyncCollection::Calendar)
+        .await
+        .unwrap();
+    // Calendars and events number their documents separately, so a
+    // calendar can share the event's id: `format_resource` ends a
+    // container's href with '/', an event's never.
+    resources
+        .format_resource_paths_by_id(ids.iter().next().unwrap())
+        .find(|href| !href.ends_with('/'))
+        .expect("the copy is in the resource cache")
 }

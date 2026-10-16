@@ -12,13 +12,17 @@ use super::{
     dav_seal::{CANARIES, EVENT, mkcalendar_body, raw_event},
     fanout::NO_REPLY,
 };
-use crate::utils::{
-    server::TestServer,
-    webdav::DummyWebDavClient,
-    za::{
-        PlantedItem, hold_task_consumer, inbox_ids, itip_tasks_for, new_inbox_items,
-        plant_inbox_item, plant_sealed_event, wait_for_delivery, za_unlock,
+use crate::{
+    utils::{
+        server::TestServer,
+        webdav::DummyWebDavClient,
+        za::{
+            PlantedItem, copy_href, hold_task_consumer, inbox_ids, itip_tasks_for, new_inbox_items,
+            pending_ids, plant_inbox_item, plant_sealed_event, trigger_drain, wait_for_delivery,
+            za_unlock,
+        },
     },
+    za::drain::{DrainOn, body, set_partstat},
 };
 use base64::{
     Engine,
@@ -92,7 +96,16 @@ const EXTRA_CANARIES: &[&str] = &[
     "fanoutcn-canary",
     "fanoutaddr-canary",
     "fanoutextcn-canary",
+    "draintitle-canary",
+    "drainloc-canary",
+    "draindesc-canary",
+    "draincn-canary",
+    "drainaddr-canary",
 ];
+
+/// Plan 10: key1's invitation to key2 with every canary the drain handles,
+/// plus an external attendee whose address is a canary.
+const DRAIN_EVENT: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\nBEGIN:VEVENT\r\nUID:leak-drain\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990105T090000Z\r\nDTEND:20990105T100000Z\r\nSEQUENCE:0\r\nSUMMARY:draintitle-canary\r\nLOCATION:drainloc-canary\r\nDESCRIPTION:draindesc-canary\r\nORGANIZER:mailto:key1@example.com\r\nATTENDEE;CN=draincn-canary;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:key2@example.com\r\nATTENDEE:mailto:drainaddr-canary@remote.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 
 /// A future invitation organized by the key account to a local non-key
 /// account: with iTIP gated it is stored sealed and nothing is sent.
@@ -693,6 +706,134 @@ pub async fn token_hits(test: &TestServer, tokens: &[[u8; 16]]) -> Vec<(u8, Vec<
         }
     }
     hits
+}
+
+/// Spec 11, leak tests: a drained invitation, the attendee's copy and the
+/// reply leave no canary and no token in the clear anywhere, in either
+/// account's records; the reply's visible token is the one exception, and
+/// it is gone once the organizer drains.
+pub async fn test_drain(test: &mut TestServer) {
+    println!("Running zero-access leak test of the drain...");
+    let _drain = DrainOn::new();
+    let key1 = DummyWebDavClient::new(
+        test.account("key1@example.com").id().document_id(),
+        "key1@example.com",
+        STRONG,
+        "key1@example.com",
+    );
+    let key1_id = key1.account_id;
+    let key2_id = test.account("key2@example.com").id().document_id();
+    let key2 = DummyWebDavClient::new(key2_id, "key2@example.com", STRONG, "key2@example.com");
+    let key1_items = inbox_ids(test, key1_id).await;
+    let key2_items = inbox_ids(test, key2_id).await;
+    let held = hold_task_consumer(test).await;
+    key1.request_with_headers(
+        "PUT",
+        "/dav/cal/key1%40example.com/default/leak-drain.ics",
+        [CONTENT_TYPE],
+        DRAIN_EVENT,
+    )
+    .await
+    .with_status(StatusCode::CREATED);
+    let (organizer_event, _) = raw_event(test, key1_id, "default/leak-drain.ics").await;
+    let keys1 = za_unlock(test, key1_id, STRONG).await;
+    let token = *event_token_pairs(&organizer_event, &keys1, key1_id)
+        .unwrap()
+        .expect("key1's pairs")
+        .get("key2@example.com")
+        .expect("key2's pair");
+    assert_eq!(pending_ids(test, key2_id).await.len(), 1);
+
+    // key2 drains: the copy and the drained item are sealed; the token is
+    // in the clear nowhere; the task queue holds nothing of the invitation.
+    assert_eq!(trigger_drain("key2@example.com", STRONG).await, 207);
+    assert!(pending_ids(test, key2_id).await.is_empty());
+    let copy = copy_href(test, key2_id, "leak-drain").await;
+    let shown = body(&key2, &copy).await;
+    assert!(
+        shown.contains("draintitle-canary") && shown.contains("draincn-canary"),
+        "{shown}"
+    );
+    let drained = scan(test, key2_id).await;
+    assert!(
+        drained.violations.is_empty(),
+        "leaks after the drain:\n{}",
+        drained.violations.join("\n")
+    );
+    assert!(drained.events >= 1 && drained.items >= 1, "{drained:?}");
+    assert_eq!(drained.item_keys, drained.items, "{drained:?}");
+    let organizer_scan = scan(test, key1_id).await;
+    assert!(
+        organizer_scan.violations.is_empty(),
+        "leaks in the organizer's records:\n{}",
+        organizer_scan.violations.join("\n")
+    );
+    assert_eq!(
+        itip_tasks_for(test, key1_id).await + itip_tasks_for(test, key2_id).await,
+        0
+    );
+    assert!(
+        token_hits(test, &[token]).await.is_empty(),
+        "key2's token in the clear after the drain"
+    );
+
+    // key2 accepts: the pending reply in key1's inbox carries the token
+    // visibly (spec 3.3), the one place it may appear; key1's drain
+    // reseals the item without it.
+    set_partstat(&key2, &copy, "key2@example.com", "ACCEPTED").await;
+    assert_eq!(pending_ids(test, key1_id).await.len(), 1);
+    assert!(
+        !token_hits(test, &[token]).await.is_empty(),
+        "the positive control: the pending reply's visible token"
+    );
+    assert_eq!(trigger_drain("key1@example.com", STRONG).await, 207);
+    assert!(pending_ids(test, key1_id).await.is_empty());
+    assert!(
+        token_hits(test, &[token]).await.is_empty(),
+        "the token in the clear after the organizer's drain"
+    );
+    let after_reply = scan(test, key1_id).await;
+    assert!(
+        after_reply.violations.is_empty(),
+        "leaks after the reply:\n{}",
+        after_reply.violations.join("\n")
+    );
+    drop(held);
+    test.wait_for_tasks().await;
+
+    // Cleanup, as `test` does: events with `Schedule-Reply: F`, items by
+    // href.
+    key2.request_with_headers("DELETE", &copy, [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    key1.request_with_headers(
+        "DELETE",
+        "/dav/cal/key1%40example.com/default/leak-drain.ics",
+        [NO_REPLY],
+        "",
+    )
+    .await
+    .with_status(StatusCode::NO_CONTENT);
+    for (client, account_id, before) in
+        [(&key1, key1_id, &key1_items), (&key2, key2_id, &key2_items)]
+    {
+        for id in inbox_ids(test, account_id).await {
+            if !before.contains(&id) {
+                client
+                    .request(
+                        "DELETE",
+                        &format!(
+                            "/dav/itip/{}/inbox/{id}.ics",
+                            client.name.replace('@', "%40")
+                        ),
+                        "",
+                    )
+                    .await
+                    .with_status(StatusCode::NO_CONTENT);
+            }
+        }
+    }
+    test.wait_for_tasks().await;
 }
 
 pub async fn test(test: &mut TestServer) {

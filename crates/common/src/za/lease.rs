@@ -18,14 +18,15 @@
 //! dispatch: the fenced commit needs the lease and the event in one
 //! transaction. The generic `purge_in_memory_store` skips the
 //! `KV_LOCK_ZA_UID` range, since its unconditional clear would delete a
-//! replacement lease; plan 10's sweep (not yet present) is to clear
-//! expired leases with an assertion on the value it read.
+//! replacement lease; `sweep_expired_uid_leases` (spec 6.3 step 4), run by
+//! the maintenance task's purge step, is the only cleanup of lease keys and
+//! clears each expired lease with an assertion on the value it read.
 
 use crate::{KV_LOCK_ZA_UID, auth::vault::RawValue};
 use sha2::{Digest, Sha256};
 use std::{sync::LazyLock, time::Duration};
 use store::{
-    Store, U64_LEN, ValueKey, rand,
+    IterateParams, Store, U64_LEN, ValueKey, rand,
     write::{BatchBuilder, InMemoryClass, ValueClass, assert::AssertValue, now},
 };
 use trc::AddContext;
@@ -91,6 +92,53 @@ pub fn lease_value_expiry(value: &[u8]) -> Option<u64> {
         .get(..U64_LEN)
         .and_then(|bytes| <[u8; U64_LEN]>::try_from(bytes).ok())
         .map(u64::from_be_bytes)
+}
+
+/// Spec 6.3 step 4, first half: every lease key whose expiry is at or below
+/// `now`, with the hash of the value read. A value too short to hold an
+/// expiry counts as expired, as `acquire` treats it.
+pub async fn collect_expired_uid_leases(
+    store: &Store,
+    now: u64,
+) -> trc::Result<Vec<(Vec<u8>, u64)>> {
+    let (from, to) = lease_key_range();
+    let mut expired = Vec::new();
+    store
+        .iterate(IterateParams::new(from, to), |key, value| {
+            if lease_value_expiry(value).is_none_or(|expiry| expiry <= now) {
+                expired.push((key.to_vec(), xxh3_64(value)));
+            }
+            Ok(true)
+        })
+        .await
+        .caused_by(trc::location!())?;
+    Ok(expired)
+}
+
+/// Spec 6.3 step 4, second half: clears each collected key, asserting the
+/// value the sweep read, so a lease re-taken in between survives (its
+/// clear loses the assertion and is skipped). One write per key: a lost
+/// assertion must not undo the others. Returns how many were cleared.
+pub async fn clear_uid_leases(store: &Store, expired: Vec<(Vec<u8>, u64)>) -> trc::Result<usize> {
+    let mut cleared = 0;
+    for (key, hash) in expired {
+        let mut batch = BatchBuilder::new();
+        batch.assert_value(lease_class(key.clone()), AssertValue::Hash(hash));
+        batch.clear(lease_class(key));
+        match store.write(batch.build_all()).await {
+            Ok(_) => cleared += 1,
+            Err(err) if err.is_assertion_failure() => {}
+            Err(err) => return Err(err.caused_by(trc::location!())),
+        }
+    }
+    Ok(cleared)
+}
+
+/// Spec 6.3 step 4: the sweep the maintenance task runs on the data store,
+/// whatever the lookup backend.
+pub async fn sweep_expired_uid_leases(store: &Store) -> trc::Result<usize> {
+    let expired = collect_expired_uid_leases(store, now()).await?;
+    clear_uid_leases(store, expired).await
 }
 
 fn lease_class(key: Vec<u8>) -> ValueClass {
@@ -482,5 +530,46 @@ mod tests {
             stored(&store, 4, "guard").await.is_some(),
             "an abandoned lease stays"
         );
+    }
+
+    #[tokio::test]
+    async fn the_sweep_clears_expired_leases_and_keeps_live_ones() {
+        let store = EphemeralStore::open();
+        write_raw(&store, 11, "expired", expired_value(3)).await;
+        write_raw(&store, 11, "malformed", vec![1, 2, 3]).await;
+        let live = ZaUidLease::acquire(&store, 11, "live")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sweep_expired_uid_leases(&store).await.unwrap(), 2);
+        assert!(stored(&store, 11, "expired").await.is_none());
+        assert!(stored(&store, 11, "malformed").await.is_none());
+        assert!(
+            stored(&store, 11, "live").await.is_some(),
+            "a live lease was swept"
+        );
+        assert!(commit_fenced(&store, &live).await.is_ok());
+        assert!(live.release(&store).await);
+        assert_eq!(sweep_expired_uid_leases(&store).await.unwrap(), 0);
+    }
+
+    /// A lease re-taken between the sweep's scan and its clear survives: the
+    /// clear asserts the value the scan read.
+    #[tokio::test]
+    async fn the_sweep_keeps_a_lease_retaken_after_its_scan() {
+        let store = EphemeralStore::open();
+        write_raw(&store, 12, "retaken", expired_value(5)).await;
+        let expired = collect_expired_uid_leases(&store, now()).await.unwrap();
+        assert_eq!(expired.len(), 1);
+        let holder = ZaUidLease::acquire(&store, 12, "retaken")
+            .await
+            .unwrap()
+            .expect("the expired lease is taken over");
+        assert_eq!(clear_uid_leases(&store, expired).await.unwrap(), 0);
+        assert!(
+            commit_fenced(&store, &holder).await.is_ok(),
+            "the sweep removed the new holder's lease"
+        );
+        assert!(holder.release(&store).await);
     }
 }
