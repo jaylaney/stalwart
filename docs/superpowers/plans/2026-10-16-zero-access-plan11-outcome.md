@@ -21,7 +21,7 @@ Plan 11 closes the items release 2 left open: Jay's decisions of 2026-10-16 on s
   - `cargo test -p common za::lease`: 10 passed (21 s).
   - `cargo test -p common auth::vault`: 14 passed (1 s).
   - `za_tests`: 1 passed in 83.18 s, `drain_limits` included (leak scan: 2620 records, 76 archives, 8 blobs, 988 search index records (644 of the account, none calendar), 5 events, 3 calendars, 4 items, 4 emails; negative control caught 29 violations).
-  - `za_tests` with `BLOB_STORE=FileSystem`: 1 passed in 77.54 s (leak scan: 2613 records, 70 archives, 8 blobs, 988 search index records, 5 events, 3 calendars, 4 items, 4 emails; negative control caught 29 violations).
+  - `za_tests` with `BLOB_STORE=FileSystem`: 1 passed in 77.54 s (leak scan: 2613 records, 70 archives, 8 blobs, 988 search index records (644 of the account, none calendar), 5 events, 3 calendars, 4 items, 4 emails; negative control caught 29 violations).
   - `webdav_tests`: 1 passed in 16.92 s. `cal_itip` passed on the first run.
   - `webdav_tests` with `ZA_KEY_ACCOUNTS=1`: 1 passed in 21.13 s, including the key-account scheduling variant.
   - `cargo build --release -p stalwart --no-default-features --features rocks`, with no other cargo command alongside: finished in 15m 38s; no warning in the fork's files, the same upstream warning totals.
