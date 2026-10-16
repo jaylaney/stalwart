@@ -1512,6 +1512,44 @@ mod tests {
         assert!(!is_stale_reply(&ranged, &snap(&occurrence_reply(1, 4))));
     }
 
+    /// An address listed twice in one instance (one line with
+    /// DELEGATED-FROM, one without), in either order.
+    fn doubled(delegated_first: bool) -> ICalendar {
+        let with = "ATTENDEE;PARTSTAT=NEEDS-ACTION;DELEGATED-FROM=\"mailto:att@example.com\":mailto:del@example.com\r\n";
+        let without = "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:del@example.com\r\n";
+        let (first, second) = if delegated_first {
+            (with, without)
+        } else {
+            (without, with)
+        };
+        parse(&format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\nUID:stale-1\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990102T090000Z\r\nDTEND:20990102T100000Z\r\nSEQUENCE:0\r\nORGANIZER:mailto:org@example.com\r\n{first}{second}END:VEVENT\r\nEND:VCALENDAR\r\n"
+        ))
+    }
+
+    #[test]
+    fn a_doubled_attendee_keeps_the_union_of_its_delegators() {
+        let org = organizer();
+        let merged = delegation_reply();
+        let merged = itip_snapshot(&merged, &org, false).unwrap();
+        let del = merged
+            .components
+            .get(&InstanceId::Main)
+            .unwrap()
+            .attendees
+            .iter()
+            .find(|attendee| attendee.email.email == "del@example.com")
+            .unwrap();
+        for delegated_first in [true, false] {
+            let before = doubled(delegated_first);
+            let before = Attendance::of(&itip_snapshot(&before, &org, false).unwrap());
+            assert!(
+                !before.is_new(None, del),
+                "a doubled attendee (delegated line first: {delegated_first}) counted as new"
+            );
+        }
+    }
+
     #[test]
     fn reasons_carry_no_address() {
         assert_eq!(

@@ -543,6 +543,16 @@ pub async fn scheduling(test: &TestServer) {
     assert_eq!(stored_sequence(&jane, &copy).await, 1);
     assert!(pending_ids(test, jane.account_id).await.is_empty());
     assert_eq!(uid_copies(test, jane.account_id, "za-sched-1").await, 1);
+    let (copy_archive, _) = crate::za::dav_seal::raw_event(
+        test,
+        jane.account_id,
+        &format!("default/{}", copy.rsplit('/').next().unwrap()),
+    )
+    .await;
+    assert!(
+        !String::from_utf8_lossy(copy_archive.as_bytes()).contains("sched-canary-moved"),
+        "the drained update left the moved title in the clear"
+    );
     assert_eq!(copy_href(test, jane.account_id, "za-sched-1").await, copy);
     // john's DELETE cancels: a third item, a CANCEL, still no mail (spec
     // 5.5); jane's next request drains it and her copy is cancelled (spec
