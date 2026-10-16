@@ -645,11 +645,14 @@ impl Attendance {
         for (instance, snapshot) in &snapshots.components {
             let instance = instance_key(instance);
             attendance.instances.insert(instance);
+            // An address listed twice in one instance keeps the union of
+            // its DELEGATED-FROM sets.
             for attendee in &snapshot.attendees {
-                attendance.attendees.insert(
-                    (instance, attendee.email.email.to_ascii_lowercase()),
-                    delegators(attendee),
-                );
+                attendance
+                    .attendees
+                    .entry((instance, attendee.email.email.to_ascii_lowercase()))
+                    .or_default()
+                    .extend(delegators(attendee));
             }
         }
         attendance

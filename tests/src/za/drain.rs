@@ -913,12 +913,15 @@ pub async fn test_reply(test: &mut TestServer) {
     );
 
     // 8. A delegation in an occurrence governed by a range override (spec
-    // 6.4, "Delegates"): key1's recurring event lists key2 and key3 in the
-    // master and key2 only in a THISANDFUTURE override from the second
-    // occurrence. key2 delegates the fourth occurrence to key3 by adding an
-    // override; the merge creates it, and it inherits the range override's
-    // attendance, not the master's, so key3 is new there and key1's drain
-    // invites it.
+    // 6.4, "Delegates"): key1's recurring event's master has key2
+    // delegated to key3 (key3 attends the series as key2's delegate), and
+    // a THISANDFUTURE override from the second occurrence lists key2
+    // only. key2 delegates the fourth occurrence to key3 again by adding
+    // an override with the master's DELEGATED-TO and DELEGATED-FROM; the
+    // merge creates it, and it inherits the range override's attendance,
+    // not the master's, so key3 is new there and key1's drain invites it.
+    // key3's DELEGATED-FROM gains nothing against the master, so only the
+    // governing-instance rule makes key3 new.
     let uid8 = "za-drain-r8";
     let organizer8 = format!("{KEY1_CAL}drain-r8.ics");
     const FOURTH: &str = "20990304T100000Z";
@@ -945,6 +948,14 @@ pub async fn test_reply(test: &mut TestServer) {
         .replace(
             "DURATION:PT1H\r\n",
             "DURATION:PT1H\r\nRRULE:FREQ=DAILY;COUNT=5\r\n",
+        )
+        .replace(
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:key2@example.com",
+            "ATTENDEE;PARTSTAT=DELEGATED;DELEGATED-TO=\"mailto:key3@example.com\":mailto:key2@example.com",
+        )
+        .replace(
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:key3@example.com",
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;DELEGATED-FROM=\"mailto:key2@example.com\":mailto:key3@example.com",
         )
         .replace(
             "END:VCALENDAR\r\n",
