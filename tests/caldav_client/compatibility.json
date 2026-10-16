@@ -4,12 +4,12 @@
       "scheduling.auto-schedule": {
         "value": true,
         "reason": "This fork imports local invitations automatically and exposes schedule inbox collections; strict flows assert acceptance and organizer replies rather than relying on upstream early return.",
-        "source": "docs/superpowers/specs/2026-10-11-zero-access-invitations-design.md sections 6 and 7; pinned tests/test_caldav.py:_TestSchedulingBase.testInviteAndRespond"
+        "source": "docs/superpowers/specs/2026-10-11-zero-access-invitations-design.md sections 6 and 6.6; pinned tests/test_caldav.py:_TestSchedulingBase.testInviteAndRespond"
       },
       "scheduling.mailbox.inbox-delivery": {
         "value": true,
         "reason": "This fork imports local invitations automatically and exposes schedule inbox collections; strict flows assert acceptance and organizer replies rather than relying on upstream early return.",
-        "source": "docs/superpowers/specs/2026-10-11-zero-access-invitations-design.md sections 6 and 7; pinned tests/test_caldav.py:_TestSchedulingBase.testInviteAndRespond"
+        "source": "docs/superpowers/specs/2026-10-11-zero-access-invitations-design.md sections 6 and 6.6; pinned tests/test_caldav.py:_TestSchedulingBase.testInviteAndRespond"
       },
       "create-calendar.auto": {
         "value": true,
@@ -61,7 +61,7 @@
       "calendar/testRecurringDateSearch": {
         "outcome": "xfailed",
         "exception": "AssertionError",
-        "reason": "Client-side all-day expansion passes, but explicit server-side expansion retains the original DTSTART year instead of the selected anniversary year. Event recurrence remains exercised by mandatory strict client flow.",
+        "reason": "Client-side all-day expansion passes, but explicit server-side expansion retains the original DTSTART year instead of the selected anniversary year. The mandatory strict recurrence flow exercises client-side expansion only; it does not cover this server-side gap.",
         "source": "Pinned tests/test_caldav.py:4391; unmasked diagnostic expected DTSTART;VALUE=DATE:2026 once, observed0 in server-expanded result.",
         "failure": {
           "file": "tests/test_caldav.py",
@@ -71,7 +71,7 @@
       "calendar/testRecurringDateWithExceptionSearch": {
         "outcome": "xfailed",
         "exception": "AssertionError",
-        "reason": "Client-side recurrence exception expansion returns two correct instances, but server-side expansion returns three including the overridden original. Mandatory strict recurrence flow checks the override and unchanged adjacent instances.",
+        "reason": "Client-side recurrence exception expansion returns two correct instances, but server-side expansion returns three including the overridden original. The mandatory strict recurrence flow checks client-side overrides and adjacent instances only; it does not cover this server-side gap.",
         "source": "Pinned tests/test_caldav.py:4469; caldav/compatibility_hints.py:stalwart search.recurrences.expanded.exception; unmasked diagnostic observed3 expected2.",
         "failure": {
           "file": "tests/test_caldav.py",
@@ -85,12 +85,12 @@
       "scheduling.auto-schedule": {
         "value": true,
         "reason": "This fork imports local invitations automatically and exposes schedule inbox collections; strict flows assert acceptance and organizer replies rather than relying on upstream early return.",
-        "source": "docs/superpowers/specs/2026-10-11-zero-access-invitations-design.md sections 6 and 7; pinned tests/test_caldav.py:_TestSchedulingBase.testInviteAndRespond"
+        "source": "docs/superpowers/specs/2026-10-11-zero-access-invitations-design.md sections 6 and 6.6; pinned tests/test_caldav.py:_TestSchedulingBase.testInviteAndRespond"
       },
       "scheduling.mailbox.inbox-delivery": {
         "value": true,
         "reason": "This fork imports local invitations automatically and exposes schedule inbox collections; strict flows assert acceptance and organizer replies rather than relying on upstream early return.",
-        "source": "docs/superpowers/specs/2026-10-11-zero-access-invitations-design.md sections 6 and 7; pinned tests/test_caldav.py:_TestSchedulingBase.testInviteAndRespond"
+        "source": "docs/superpowers/specs/2026-10-11-zero-access-invitations-design.md sections 6 and 6.6; pinned tests/test_caldav.py:_TestSchedulingBase.testInviteAndRespond"
       },
       "create-calendar.auto": {
         "value": true,
@@ -142,7 +142,7 @@
       "calendar/testRecurringDateSearch": {
         "outcome": "xfailed",
         "exception": "AssertionError",
-        "reason": "Client-side all-day expansion passes, but explicit server-side expansion retains the original DTSTART year instead of the selected anniversary year. Event recurrence remains exercised by mandatory strict client flow.",
+        "reason": "Client-side all-day expansion passes, but explicit server-side expansion retains the original DTSTART year instead of the selected anniversary year. The mandatory strict recurrence flow exercises client-side expansion only; it does not cover this server-side gap.",
         "source": "Pinned tests/test_caldav.py:4391; unmasked diagnostic expected DTSTART;VALUE=DATE:2026 once, observed0 in server-expanded result.",
         "failure": {
           "file": "tests/test_caldav.py",
@@ -152,7 +152,7 @@
       "calendar/testRecurringDateWithExceptionSearch": {
         "outcome": "xfailed",
         "exception": "AssertionError",
-        "reason": "Client-side recurrence exception expansion returns two correct instances, but server-side expansion returns three including the overridden original. Mandatory strict recurrence flow checks the override and unchanged adjacent instances.",
+        "reason": "Client-side recurrence exception expansion returns two correct instances, but server-side expansion returns three including the overridden original. The mandatory strict recurrence flow checks client-side overrides and adjacent instances only; it does not cover this server-side gap.",
         "source": "Pinned tests/test_caldav.py:4469; caldav/compatibility_hints.py:stalwart search.recurrences.expanded.exception; unmasked diagnostic observed3 expected2.",
         "failure": {
           "file": "tests/test_caldav.py",

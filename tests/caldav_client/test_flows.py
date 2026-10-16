@@ -51,6 +51,7 @@ def event_data(uid, summary="Client interoperability", attendees=(),
 
 
 def poll_event(principal, uid, condition=lambda event: True, timeout=15):
+    # Stay below the 30-second drain retry deferral: an initial failure must be visible.
     deadline = time.monotonic() + timeout
     while True:
         # Every authenticated DAV read triggers the key-account drain.

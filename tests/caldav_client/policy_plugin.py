@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from runner import HERE, check_outcomes
+from runner import HERE, check_outcomes, validate_policy
 
 _outcomes = {}
 _keys = {}
@@ -33,15 +33,13 @@ def pytest_collection_modifyitems(session, config, items):
     _keys.update({item.nodeid: test_key(item) for item in items})
     if len(items) != len(expected) or set(_keys.values()) != expected:
         raise pytest.UsageError("Incomplete or unexpected pinned class/strict-flow collection")
-    policies = json.loads(Path(os.environ["CALDAV_CI_POLICY"]).read_text())
-    policy = policies[os.environ["CALDAV_CI_MODE"]]
-    # Validate exception policy before applying any marker or performing server I/O.
-    check_outcomes({}, policy["outcomes"])
-    from caldav.compatibility_hints import FeatureSet
-    features = {name: record["value"] for name, record in policy["features"].items()}
-    feature_set = FeatureSet(features)
-    for name in features:
-        feature_set.find_feature(name)  # Unknown names must fail before any server request.
+    try:
+        policies = json.loads(Path(os.environ["CALDAV_CI_POLICY"]).read_text())
+        policy = policies[os.environ["CALDAV_CI_MODE"]]
+        validate_policy(policy, expected)
+    except (ValueError, KeyError, TypeError, AttributeError, OSError) as error:
+        raise pytest.UsageError(f"Invalid compatibility policy: {error}") from None
+    config._caldav_policy = policy
     for item in items:
         record = policy["outcomes"].get(_keys[item.nodeid], {})
         if record.get("outcome") == "xfailed":
@@ -84,16 +82,18 @@ def pytest_runtest_logreport(report):
     if report.when == "call" or report.failed or report.skipped:
         key = _keys[report.nodeid]
         outcome = report.outcome
-        if getattr(report, "wasxfail", None):
+        if hasattr(report, "wasxfail"):
             outcome = "xfailed" if report.skipped else "xpassed"
         if report.failed or _outcomes.get(key) not in ("failed", "skipped"):
             _outcomes[key] = outcome
 
 
 def pytest_sessionfinish(session, exitstatus):
-    policy = json.loads(Path(os.environ["CALDAV_CI_POLICY"]).read_text())
+    if not hasattr(session.config, "_caldav_policy"):
+        return
+    policy = session.config._caldav_policy
     expected = set(json.loads((HERE / "collection.json").read_text()))
-    problems = check_outcomes(_outcomes, policy[os.environ["CALDAV_CI_MODE"]]["outcomes"])
+    problems = check_outcomes(_outcomes, policy["outcomes"])
     if set(_outcomes) != expected:
         problems.append("Pinned test reports missing or unexpected")
     if problems:

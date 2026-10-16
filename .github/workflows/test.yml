@@ -120,9 +120,10 @@ jobs:
 
   caldav-client:
     name: Independent CalDAV Client
+    # Avoid the expensive release build when the cheaper suites fail.
     needs: zero-access
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -153,4 +154,18 @@ jobs:
         run: |
           "$RUNNER_TEMP/caldav-venv/bin/python" tests/caldav_client/runner.py \
             --binary target/release/stalwart \
-            --caldav-source "$RUNNER_TEMP/python-caldav"
+            --caldav-source "$RUNNER_TEMP/python-caldav" \
+            --log-dir "$RUNNER_TEMP/caldav-client-logs"
+
+      - name: Retain sanitized CalDAV failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: caldav-client-logs
+          retention-days: 3
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/caldav-client-logs/plain-server.log
+            ${{ runner.temp }}/caldav-client-logs/plain-pytest.log
+            ${{ runner.temp }}/caldav-client-logs/key-server.log
+            ${{ runner.temp }}/caldav-client-logs/key-pytest.log
