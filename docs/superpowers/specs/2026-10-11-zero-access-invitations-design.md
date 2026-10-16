@@ -706,14 +706,18 @@ session (section 3.2). For each item:
      attendees, under the section 5 rules. Attendance is compared per
      instance (the master and each override, by RECURRENCE-ID): an
      attendee is new when the merged event lists it in an instance it did
-     not attend before, where an override the merge created inherits the
-     master's attendance. A delegate who already attends another instance
-     is therefore still invited to the one it joins; the new addresses are
-     deduplicated for delivery. The drain runs in the organizer's own
-     session and holds its keys, so this is the same fan-out a PUT uses,
-     fenced on the organizer's UID lease (section 6.3, step 5). A
-     delegate's REPLY reaches only the organizer (section 5.2); the
-     delegator's copy learns the delegate's status from
+     not attend before, or when its DELEGATED-FROM there gained an address
+     (a delegation to an existing attendee, which upstream's merge resets
+     to NEEDS-ACTION). An override the merge created inherits the
+     attendance of the instance that governs it: the latest
+     `RANGE=THISANDFUTURE` override at or before it, else the master (the
+     resolution the stale-reply check uses). A delegate who already
+     attends another instance is therefore still invited to the one it
+     joins; the new addresses are deduplicated for delivery. The drain
+     runs in the organizer's own session and holds its keys, so this is
+     the same fan-out a PUT uses, fenced on the organizer's UID lease
+     (section 6.3, step 5). A delegate's REPLY reaches only the organizer
+     (section 5.2); the delegator's copy learns the delegate's status from
      the organizer's next update REQUEST, which carries every attendee's
      participation status, while the organizer's copy is correct
      throughout.
