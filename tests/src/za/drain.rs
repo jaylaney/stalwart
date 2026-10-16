@@ -1028,6 +1028,113 @@ pub async fn test_reply(test: &mut TestServer) {
         "key3's fourth occurrence does not list key3 delegated from key2: {copy8_key3_body}"
     );
 
+    // 9. A delegation to an existing attendee (spec 6.4, "Delegates"):
+    // key1 invites key2 and key3; key3 declines and key1's drain applies
+    // it, while key2's copy still shows key3 NEEDS-ACTION (a reply reaches
+    // only the organizer). key2 then delegates to key3 by marking key3's
+    // existing ATTENDEE as delegated from key2. key1's merge resets key3 to
+    // NEEDS-ACTION, delegated from key2; key3's DELEGATED-FROM gained key2,
+    // so key1's drain invites key3 although key3 already attended.
+    let uid9 = "za-drain-r9";
+    let organizer9 = format!("{KEY1_CAL}drain-r9.ics");
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &organizer9,
+            [CONTENT_TYPE],
+            invite(uid9, START_A, &["key2@example.com", "key3@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    assert_eq!(trigger_drain(key3.name, STRONG).await, 207);
+    let copy9 = copy_href(test, key2.id, uid9).await;
+    let copy9_key3 = copy_href(test, key3.id, uid9).await;
+    set_partstat(&key3.client, &copy9_key3, "key3@example.com", "DECLINED").await;
+    assert_eq!(trigger_drain(key1.name, STRONG).await, 207);
+    assert_eq!(
+        partstat_of(&key1.client, &organizer9, "key3@example.com")
+            .await
+            .as_deref(),
+        Some("DECLINED"),
+        "key3's decline did not apply"
+    );
+    assert_eq!(
+        partstat_of(&key2.client, &copy9, "key3@example.com")
+            .await
+            .as_deref(),
+        Some("NEEDS-ACTION"),
+        "key2's copy learnt key3's decline"
+    );
+    let delegated9 = body(&key2.client, &copy9)
+        .await
+        .replace("\r\n ", "")
+        .split("\r\n")
+        .map(|line| {
+            if line.starts_with("ATTENDEE") && line.ends_with("mailto:key2@example.com") {
+                line.replace(
+                    "PARTSTAT=NEEDS-ACTION",
+                    "PARTSTAT=DELEGATED;DELEGATED-TO=\"mailto:key3@example.com\"",
+                )
+            } else if line.starts_with("ATTENDEE") && line.ends_with("mailto:key3@example.com") {
+                line.replacen(
+                    "ATTENDEE;",
+                    "ATTENDEE;DELEGATED-FROM=\"mailto:key2@example.com\";",
+                    1,
+                )
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    key2.client
+        .request_with_headers("PUT", &copy9, [CONTENT_TYPE], delegated9)
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    assert_eq!(
+        pending_ids(test, key1.id).await.len(),
+        1,
+        "the delegation to an existing attendee built no reply"
+    );
+    let before3 = inbox_ids(test, key3.id).await;
+    let before2 = inbox_ids(test, key2.id).await;
+    assert_eq!(trigger_drain(key1.name, STRONG).await, 207);
+    let key3_items = new_inbox_items(test, key3.id, &before3).await;
+    assert_eq!(
+        key3_items.len(),
+        1,
+        "key3 has exactly one new item: the organizer's invitation as a delegate"
+    );
+    assert_eq!(key3_items[0].1.changed_by, ChangedBy::PrincipalId(key1.id));
+    assert_eq!(
+        new_inbox_items(test, key2.id, &before2).await.len(),
+        0,
+        "key2 received an item from the delegation"
+    );
+    assert!(
+        pending_ids(test, key1.id).await.is_empty(),
+        "the delegation reply is still pending"
+    );
+    assert_eq!(
+        partstat_of(&key1.client, &organizer9, "key3@example.com")
+            .await
+            .as_deref(),
+        Some("NEEDS-ACTION"),
+        "key1's copy did not reset key3"
+    );
+    let organizer9_body = body(&key1.client, &organizer9).await.replace("\r\n ", "");
+    assert!(
+        key3_attends(&organizer9_body, true),
+        "key1's copy does not list key3 delegated from key2: {organizer9_body}"
+    );
+    assert_eq!(trigger_drain(key3.name, STRONG).await, 207);
+    let copy9_key3_body = body(&key3.client, &copy9_key3).await.replace("\r\n ", "");
+    assert!(
+        key3_attends(&copy9_key3_body, true),
+        "key3's copy does not list key3 delegated from key2: {copy9_key3_body}"
+    );
+
     // Cleanup.
     for (party, uid) in [
         (&key2, uid),
@@ -1040,6 +1147,8 @@ pub async fn test_reply(test: &mut TestServer) {
         (&key3, uid7),
         (&key2, uid8),
         (&key3, uid8),
+        (&key2, uid9),
+        (&key3, uid9),
     ] {
         let href = copy_href(test, party.id, uid).await;
         party
@@ -1050,6 +1159,7 @@ pub async fn test_reply(test: &mut TestServer) {
     }
     for name in [
         "drain-r1", "drain-r2", "drain-r3", "drain-r4", "drain-r5", "drain-r7", "drain-r8",
+        "drain-r9",
     ] {
         key1.client
             .request_with_headers("DELETE", &format!("{KEY1_CAL}{name}.ics"), [NO_REPLY], "")

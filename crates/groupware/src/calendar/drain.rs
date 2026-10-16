@@ -63,7 +63,7 @@ use crate::{
         storage::ItipAutoExpunge,
     },
     scheduling::{
-        InstanceId, ItipError, ItipSnapshots, ical_size,
+        Attendee, InstanceId, ItipError, ItipSnapshots, ical_size,
         inbound::{
             MergeAction, MergeResult, itip_import_message, itip_merge_changes, itip_method,
             itip_process_message,
@@ -72,7 +72,7 @@ use crate::{
         snapshot::itip_snapshot,
     },
 };
-use ahash::AHashSet;
+use ahash::{AHashMap, AHashSet};
 use calcard::{
     common::timezone::Tz,
     icalendar::{ICalendar, ICalendarMethod},
@@ -629,41 +629,57 @@ fn instance_key(instance: &InstanceId) -> InstanceKey {
 }
 
 /// An event's attendance before a merge, per instance (spec 6.4,
-/// "Delegates"), as lowercased addresses.
+/// "Delegates"): for each attendee's lowercased address, the lowercased
+/// addresses of its DELEGATED-FROM.
 struct Attendance {
     instances: AHashSet<InstanceKey>,
-    attendees: AHashSet<(InstanceKey, String)>,
+    attendees: AHashMap<(InstanceKey, String), AHashSet<String>>,
 }
 
 impl Attendance {
     fn of(snapshots: &ItipSnapshots<'_>) -> Self {
         let mut attendance = Attendance {
             instances: AHashSet::new(),
-            attendees: AHashSet::new(),
+            attendees: AHashMap::new(),
         };
         for (instance, snapshot) in &snapshots.components {
             let instance = instance_key(instance);
             attendance.instances.insert(instance);
             for attendee in &snapshot.attendees {
-                attendance
-                    .attendees
-                    .insert((instance, attendee.email.email.to_ascii_lowercase()));
+                attendance.attendees.insert(
+                    (instance, attendee.email.email.to_ascii_lowercase()),
+                    delegators(attendee),
+                );
             }
         }
         attendance
     }
 
-    /// Whether `address` attended `instance` before the merge. An override
-    /// the merge created inherits the attendance of the instance that
-    /// governs it (`governing_instance`: the latest range override at or
-    /// before it, else the master), so a delegator's own per-occurrence
-    /// delegation does not make the delegator new.
-    fn attended(&self, instance: InstanceKey, address: &str) -> bool {
-        self.attendees.contains(&(
+    /// Whether `attendee`, as `instance` of the merged event lists it, is
+    /// new to that instance: it did not attend it before, or its
+    /// DELEGATED-FROM gained an address (a new delegation to an existing
+    /// attendee). An override the merge created inherits the attendance
+    /// of the instance that governs it (`governing_instance`: the latest
+    /// range override at or before it, else the master), so a delegator's
+    /// own per-occurrence delegation does not make the delegator new.
+    fn is_new(&self, instance: InstanceKey, attendee: &Attendee<'_>) -> bool {
+        match self.attendees.get(&(
             governing_instance(instance, &self.instances),
-            address.to_string(),
-        ))
+            attendee.email.email.to_ascii_lowercase(),
+        )) {
+            Some(before) => !delegators(attendee).is_subset(before),
+            None => true,
+        }
     }
+}
+
+/// An attendee's DELEGATED-FROM addresses, lowercased.
+fn delegators(attendee: &Attendee<'_>) -> AHashSet<String> {
+    attendee
+        .delegated_from
+        .iter()
+        .map(|delegator| delegator.email.to_ascii_lowercase())
+        .collect()
 }
 
 /// Spec 6.4, an event exists: upstream's merge (`commit_itip_merge`'s
@@ -824,15 +840,15 @@ async fn merge(
             let new_attendees = match itip_snapshot(&event.data.event, addresses, false) {
                 Ok(after) => {
                     // Compared per instance, so a delegate who already
-                    // attends another instance is new to this one; the
-                    // set dedups the addresses for delivery.
+                    // attends another instance is new to this one, and an
+                    // attendee that became a delegate is new too; the set
+                    // dedups the addresses for delivery.
                     let mut new_attendees: AHashSet<String> = AHashSet::new();
                     for (instance, snapshot) in &after.components {
                         let instance = instance_key(instance);
                         for attendee in &snapshot.attendees {
-                            let address = attendee.email.email.to_ascii_lowercase();
-                            if !before.attended(instance, &address) {
-                                new_attendees.insert(address);
+                            if before.is_new(instance, attendee) {
+                                new_attendees.insert(attendee.email.email.to_ascii_lowercase());
                             }
                         }
                     }
