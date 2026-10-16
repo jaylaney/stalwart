@@ -27,7 +27,6 @@
 //!   while it is held; global (`services::task_manager::manager`).
 //! - The lease-duration override: stands in for `ZA_UID_LEASE_SECS`, which
 //!   is read once per process.
-//!
 //! - `DRAIN_LOOKUP_PAUSE`: in the drain's import, after the first UID
 //!   lookup found nothing and before the creation lease, keyed by the
 //!   draining account (`groupware::calendar::drain`).
@@ -188,7 +187,10 @@ pub fn drain_skipped(account_id: u32) -> bool {
 }
 
 pub fn set_drain_retry_override(secs: Option<u64>) {
-    DRAIN_RETRY_OVERRIDE.store(secs.map_or(-1, |secs| secs as i64), Ordering::SeqCst);
+    DRAIN_RETRY_OVERRIDE.store(
+        secs.map_or(-1, |secs| i64::try_from(secs).unwrap_or(i64::MAX)),
+        Ordering::SeqCst,
+    );
 }
 
 pub fn drain_retry_override() -> Option<u64> {
