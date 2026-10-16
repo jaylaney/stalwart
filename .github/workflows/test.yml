@@ -117,3 +117,40 @@ jobs:
           }
         env:
           ZA_KEY_ACCOUNTS: "1"
+
+  caldav-client:
+    name: Independent CalDAV Client
+    needs: zero-access
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build product (RocksDB, no enterprise or test mode)
+        run: cargo build --release -p stalwart --no-default-features --features rocks
+
+      - name: Fetch pinned independent client suite
+        run: |
+          git clone --no-checkout https://github.com/python-caldav/caldav.git "$RUNNER_TEMP/python-caldav"
+          git -C "$RUNNER_TEMP/python-caldav" checkout --detach 111ae14b875f40d100d5259820f10210f00e20f9
+          python -m venv "$RUNNER_TEMP/caldav-venv"
+          "$RUNNER_TEMP/caldav-venv/bin/python" -m pip install -r tests/caldav_client/requirements.txt
+          "$RUNNER_TEMP/caldav-venv/bin/python" -m pip install --no-deps --no-build-isolation "$RUNNER_TEMP/python-caldav"
+
+      - name: Check harness failure boundaries
+        run: "$RUNNER_TEMP/caldav-venv/bin/python -m unittest discover -s tests/caldav_client -p test_runner.py -v"
+
+      - name: Third-party CalDAV suites and strict scheduling flows (plain and key)
+        run: |
+          "$RUNNER_TEMP/caldav-venv/bin/python" tests/caldav_client/runner.py \
+            --binary target/release/stalwart \
+            --caldav-source "$RUNNER_TEMP/python-caldav"
