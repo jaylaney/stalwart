@@ -142,6 +142,9 @@ enum PassOutcome {
 struct ItemFailure {
     err: trc::Error,
     uid: Option<String>,
+    /// Whether the error is the item's own and counts toward
+    /// `DRAIN_ITEM_FAILURE_LIMIT` (spec 6.2, "Skipped items").
+    counts: bool,
 }
 
 pub trait ZaDrain: Sync + Send {
@@ -328,7 +331,12 @@ async fn drain_items(
                 pass.waiting.insert(document_id);
             }
             Ok(ItemOutcome::LeftPending) => return Ok(PassOutcome::LeftPending),
-            Err(ItemFailure { err, uid }) => {
+            Err(ItemFailure { err, uid, counts }) => {
+                // A failure before the UID is known is a store error on an
+                // archive `enumerate` read: it defers the pass, uncounted.
+                if !counts {
+                    return Err(err);
+                }
                 // Only the item's own error counts: neither a busy lease
                 // (`LeftPending`) nor `Waiting` reaches this arm.
                 if pass.record_failure(document_id, uid, DRAIN_ITEM_FAILURE_LIMIT) {
@@ -389,6 +397,14 @@ async fn drain_item(
     pass: &PassState,
 ) -> Result<ItemOutcome, ItemFailure> {
     let account_id = keys.account_id;
+    #[cfg(feature = "test_mode")]
+    if common::za::test_hooks::drain_read_fails(account_id, document_id) {
+        return Err(no_uid(
+            trc::StoreEvent::UnexpectedError
+                .into_err()
+                .details("zero-access test hook: drain read failure"),
+        ));
+    }
     // Re-read (spec 6.3, "The pass"): an item that is gone, or that another
     // session drained, is skipped.
     let Some(stored) = read_item(server, account_id, document_id)
@@ -449,8 +465,13 @@ async fn drain_item(
     item_outcome(result, Some(uid))
 }
 
+/// A failure before the item's UID is known: not counted (spec 6.2).
 fn no_uid(err: trc::Error) -> ItemFailure {
-    ItemFailure { err, uid: None }
+    ItemFailure {
+        err,
+        uid: None,
+        counts: false,
+    }
 }
 
 /// `Ok(true)`: done; `Ok(false)`: left pending (the lease was busy).
@@ -461,7 +482,11 @@ fn item_outcome(
     match result {
         Ok(true) => Ok(ItemOutcome::Done),
         Ok(false) => Ok(ItemOutcome::LeftPending),
-        Err(err) => Err(ItemFailure { err, uid }),
+        Err(err) => Err(ItemFailure {
+            err,
+            uid,
+            counts: true,
+        }),
     }
 }
 

@@ -50,6 +50,8 @@ pub struct ZaDrainState {
 pub struct PassState {
     /// Drain failures of each item (by document id) in this session.
     pub failures: HashMap<u32, u8>,
+    /// The first UID a failure of each item named, kept across failures.
+    pub uids: HashMap<u32, String>,
     /// Items skipped after `DRAIN_ITEM_FAILURE_LIMIT` failures, with the
     /// UID each named, if known: later items of that UID wait.
     pub skipped: HashMap<u32, Option<String>>,
@@ -60,12 +62,16 @@ pub struct PassState {
 
 impl PassState {
     /// Records a failure; `true` when it reached the limit and the item is
-    /// now skipped.
+    /// now skipped, with the first UID any of its failures named.
     pub fn record_failure(&mut self, document_id: u32, uid: Option<String>, limit: u8) -> bool {
+        if let Some(uid) = uid {
+            self.uids.entry(document_id).or_insert(uid);
+        }
         let count = self.failures.entry(document_id).or_insert(0);
         *count = count.saturating_add(1);
         if *count >= limit {
-            self.skipped.insert(document_id, uid);
+            self.skipped
+                .insert(document_id, self.uids.get(&document_id).cloned());
             true
         } else {
             false

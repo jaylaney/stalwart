@@ -345,6 +345,60 @@ pub async fn test(test: &mut TestServer) {
     assert_eq!(uid_copies(test, key2.id, uid_w).await, 1);
     assert_eq!(uid_copies(test, key2.id, other_w).await, 1);
 
+    // 6. A failure before the item's UID is known is not counted (spec
+    // 6.2, "Skipped items"): a re-read failure of a REQUEST aborts the pass
+    // each time, three times over, so its later CANCEL never applies
+    // first; once the re-read succeeds, the REQUEST imports and then the
+    // CANCEL applies, in order, in the same session.
+    let uid_p = "za-limit-p";
+    let organizer_p = format!("{KEY1_CAL}limit-p.ics");
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &organizer_p,
+            [CONTENT_TYPE],
+            invite(uid_p, START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let request_p = pending_ids(test, key2.id).await;
+    assert_eq!(request_p.len(), 1);
+    let request_p = request_p[0];
+    key1.client
+        .request("DELETE", &organizer_p, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    let cancel_p = pending_ids(test, key2.id).await;
+    assert_eq!(cancel_p.len(), 2);
+    let cancel_p = *cancel_p.iter().find(|id| **id != request_p).unwrap();
+    test_hooks::set_drain_read_fail_item(Some((key2.id, request_p)));
+    test_hooks::set_drain_retry_override(Some(0));
+    for attempt in 1..=2 {
+        assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+        assert_eq!(
+            pending_ids(test, key2.id).await.len(),
+            2,
+            "re-read failure {attempt} did not abort the pass"
+        );
+    }
+    // A third failure would reach the limit if it counted.
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    let left = pending_ids(test, key2.id).await;
+    assert!(
+        left.contains(&cancel_p),
+        "a prologue failure counted toward the limit"
+    );
+    assert!(left.contains(&request_p), "the failing REQUEST was applied");
+    assert_eq!(uid_copies(test, key2.id, uid_p).await, 0);
+    test_hooks::set_drain_read_fail_item(None);
+    test_hooks::set_drain_retry_override(None);
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    assert!(pending_ids(test, key2.id).await.is_empty());
+    assert_eq!(uid_copies(test, key2.id, uid_p).await, 1);
+    let copy_p = copy_href(test, key2.id, uid_p).await;
+    let cancelled_p = super::drain::body(&key2.client, &copy_p).await;
+    assert!(cancelled_p.contains("STATUS:CANCELLED"), "{cancelled_p}");
+
     // Cleanup.
     for name in ["limit-1", "limit-2", "limit-4"] {
         key1.client
@@ -355,7 +409,7 @@ pub async fn test(test: &mut TestServer) {
     for uid in [uid1, uid2, uid3, uid4]
         .into_iter()
         .chain(uids.iter().map(String::as_str))
-        .chain([late, uid_w, other_w])
+        .chain([late, uid_w, other_w, uid_p])
     {
         let href = copy_href(test, key2.id, uid).await;
         key2.client

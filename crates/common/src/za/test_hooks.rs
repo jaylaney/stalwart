@@ -42,6 +42,9 @@
 //! - `DRAIN_FAIL_ITEM`: every drain commit of the named (account, document
 //!   id) fails with an internal error until the slot is cleared (not
 //!   one-shot).
+//! - `DRAIN_READ_FAIL_ITEM`: the drain's re-read of the named (account,
+//!   document id) fails with an internal error until the slot is cleared
+//!   (not one-shot).
 //! - The drain skip: while an account is listed (or `DRAIN_SKIP_ALL` is),
 //!   its drain does not run; the za suite lists every account after setup
 //!   and the drain modules clear it for their duration.
@@ -93,6 +96,8 @@ pub static PRIVATE_KEY_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
 pub static DRAIN_ENUMERATE_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
 
 pub static DRAIN_FAIL_ITEM: Mutex<Option<(u32, u32)>> = Mutex::new(None);
+
+pub static DRAIN_READ_FAIL_ITEM: Mutex<Option<(u32, u32)>> = Mutex::new(None);
 
 /// Accounts whose drain does not run; `DRAIN_SKIP_ALL` stands for every
 /// account.
@@ -164,6 +169,12 @@ pub fn set_drain_enumerate_fail(account_id: Option<u32>) {
 
 pub fn set_drain_fail_item(item: Option<(u32, u32)>) {
     *DRAIN_FAIL_ITEM.lock().unwrap_or_else(|e| e.into_inner()) = item;
+}
+
+pub fn set_drain_read_fail_item(item: Option<(u32, u32)>) {
+    *DRAIN_READ_FAIL_ITEM
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = item;
 }
 
 pub fn set_drain_skip(account_id: u32) {
@@ -277,4 +288,12 @@ pub fn take_drain_enumerate_fail(account_id: u32) -> bool {
 /// Whether the drain commit of this item must fail; the slot stays set.
 pub fn drain_item_fails(account_id: u32, document_id: u32) -> bool {
     *DRAIN_FAIL_ITEM.lock().unwrap_or_else(|e| e.into_inner()) == Some((account_id, document_id))
+}
+
+/// Whether the drain's re-read of this item must fail; the slot stays set.
+pub fn drain_read_fails(account_id: u32, document_id: u32) -> bool {
+    *DRAIN_READ_FAIL_ITEM
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        == Some((account_id, document_id))
 }
