@@ -38,13 +38,13 @@
 //! holding no pair is not a participant and is kept as history; an
 //! iTIP-level rejection keeps the item as history, resealed, bit cleared.
 //! A pass that leaves any item pending does not advance the cursor and
-//! defers the next pass by `DRAIN_RETRY_SECS`. A pass handles at most
+//! defers the next pass by `DRAIN_RETRY_SECS`. A pass attempts at most
 //! `DRAIN_PASS_CAP` items and, with more remaining, ends without a deferral
 //! so the next request continues. An item that failed
 //! `DRAIN_ITEM_FAILURE_LIMIT` times in the session is skipped for the
 //! session, traced once, and later items of its UID wait with it; neither
-//! holds the cursor. A private key that does not open suspends the
-//! session's drain for good (spec 10).
+//! holds the cursor nor is re-opened in this session. A private key that
+//! does not open suspends the session's drain for good (spec 10).
 //!
 //! Lease order: a drain holds its session lock and then may take a per-UID
 //! lease (an import, or a REPLY merge that fans out to delegates); the PUT
@@ -120,7 +120,8 @@ enum ItemOutcome {
     Done,
     /// Left pending; the pass stops here (a busy UID lease, spec 6.3).
     LeftPending,
-    /// Left pending behind a skipped item of its UID; the pass goes on.
+    /// Left pending behind a skipped item of its UID; the pass goes on and
+    /// the session does not re-open it.
     Waiting,
 }
 
@@ -130,7 +131,8 @@ enum PassOutcome {
     Complete,
     /// An item stays pending for a reason a later pass can clear.
     LeftPending,
-    /// `DRAIN_PASS_CAP` items done, more remain: the next request continues.
+    /// `DRAIN_PASS_CAP` items attempted, more remain: the next request
+    /// continues.
     More,
     /// The private key does not open: no later pass of this session.
     Suspended,
@@ -194,8 +196,9 @@ async fn drain_pass(server: &Server, keys: &Arc<SessionKeys>) -> trc::Result<()>
         return Ok(());
     };
     // Spec 6.2, "Skipped items": neither a skipped item nor one waiting
-    // behind it holds the cursor.
-    pending.retain(|document_id| !pass.is_skipped(*document_id));
+    // behind it holds the cursor, and neither is re-opened in this session
+    // (a fresh session retries both).
+    pending.retain(|document_id| !pass.is_skipped(*document_id) && !pass.is_waiting(*document_id));
     if pending.is_empty() {
         state.complete(snapshot);
         return Ok(());
@@ -278,9 +281,10 @@ async fn read_item(
 }
 
 /// Spec 6.4: the private key once, then each item in document id order,
-/// at most `DRAIN_PASS_CAP` of them. A busy UID lease leaves its item
-/// pending and stops the pass there, so later items for the same UID keep
-/// their order; an item's error aborts the pass (6.5) until the item
+/// attempting at most `DRAIN_PASS_CAP` of them (an item found waiting
+/// behind a skipped one is not an attempt). A busy UID lease leaves its
+/// item pending and stops the pass there, so later items for the same UID
+/// keep their order; an item's error aborts the pass (6.5) until the item
 /// reaches `DRAIN_ITEM_FAILURE_LIMIT` failures in the session, when it is
 /// skipped and the pass goes on (6.2, "Skipped items").
 async fn drain_items(
@@ -308,12 +312,21 @@ async fn drain_items(
         .account_info(account_id)
         .await
         .caused_by(trc::location!())?;
-    for (handled, document_id) in pending.into_iter().enumerate() {
+    // Items attempted (done, left pending or failed); waiting ones are not.
+    let mut handled = 0;
+    for document_id in pending {
         if handled == DRAIN_PASS_CAP {
             return Ok(PassOutcome::More);
         }
-        match drain_item(server, &account_info, keys, private_key, document_id, pass).await {
-            Ok(ItemOutcome::Done | ItemOutcome::Waiting) => {}
+        let outcome = drain_item(server, &account_info, keys, private_key, document_id, pass).await;
+        if !matches!(outcome, Ok(ItemOutcome::Waiting)) {
+            handled += 1;
+        }
+        match outcome {
+            Ok(ItemOutcome::Done) => {}
+            Ok(ItemOutcome::Waiting) => {
+                pass.waiting.insert(document_id);
+            }
             Ok(ItemOutcome::LeftPending) => return Ok(PassOutcome::LeftPending),
             Err(ItemFailure { err, uid }) => {
                 // Only the item's own error counts: neither a busy lease

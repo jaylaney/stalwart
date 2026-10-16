@@ -19,6 +19,7 @@ use crate::utils::{
     },
 };
 use common::{auth::credential::AppPassword, za::test_hooks};
+use groupware::calendar::drain::DRAIN_ITEM_FAILURE_LIMIT;
 use hyper::StatusCode;
 use serde_json::json;
 use std::time::Duration;
@@ -136,6 +137,9 @@ pub async fn test(test: &mut TestServer) {
         .request("DELETE", &organizer3, "")
         .await
         .with_status(StatusCode::NO_CONTENT);
+    let cancel_item = pending_ids(test, key2.id).await;
+    assert_eq!(cancel_item.len(), 2);
+    let cancel_item = *cancel_item.iter().find(|id| **id != request_item).unwrap();
     let uid4 = "za-limit-4";
     key1.client
         .request_with_headers(
@@ -166,9 +170,8 @@ pub async fn test(test: &mut TestServer) {
         "the skipped item did not let the pass continue"
     );
     assert!(left.contains(&request_item), "the skipped item was applied");
-    assert_eq!(
-        uid_copies(test, key2.id, uid3).await,
-        0,
+    assert!(
+        left.contains(&cancel_item),
         "the CANCEL overtook its REQUEST"
     );
     assert_eq!(
@@ -244,6 +247,84 @@ pub async fn test(test: &mut TestServer) {
     }
     assert_eq!(copies, 34);
 
+    // 5. Items waiting behind a skipped one leave the pass and the cap
+    // (spec 6.2, "Skipped items"): with a REQUEST skipped and 33 later
+    // items of its UID waiting, a later pass neither re-opens them nor
+    // stops at the cap, so an unrelated invitation that arrives afterwards
+    // drains with the default backoff in force; a fresh session applies
+    // all 34, in order.
+    let uid_w = "za-limit-w";
+    let skipped_w = plant_inbox_item(
+        test,
+        key2.id,
+        &request_tree(uid_w, "key1@example.com", "key2@example.com"),
+        PlantedItem::Pending {
+            pair: Some(("key2@example.com", [0x80; 16])),
+            reply_token: None,
+        },
+        key1.id,
+        None,
+    )
+    .await;
+    test_hooks::set_drain_fail_item(Some((key2.id, skipped_w)));
+    test_hooks::set_drain_retry_override(Some(0));
+    for _ in 0..DRAIN_ITEM_FAILURE_LIMIT {
+        assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    }
+    test_hooks::set_drain_fail_item(None);
+    assert_eq!(pending_ids(test, key2.id).await, vec![skipped_w]);
+    for i in 0..33u8 {
+        plant_inbox_item(
+            test,
+            key2.id,
+            &request_tree(uid_w, "key1@example.com", "key2@example.com"),
+            PlantedItem::Pending {
+                pair: Some(("key2@example.com", [i + 0x81; 16])),
+                reply_token: None,
+            },
+            key1.id,
+            None,
+        )
+        .await;
+    }
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    assert_eq!(
+        pending_ids(test, key2.id).await.len(),
+        34,
+        "waiting items were applied"
+    );
+    assert_eq!(uid_copies(test, key2.id, uid_w).await, 0);
+    let other_w = "za-limit-w-other";
+    plant_inbox_item(
+        test,
+        key2.id,
+        &request_tree(other_w, "key1@example.com", "key2@example.com"),
+        PlantedItem::Pending {
+            pair: Some(("key2@example.com", [0x7f; 16])),
+            reply_token: None,
+        },
+        key1.id,
+        None,
+    )
+    .await;
+    test_hooks::set_drain_retry_override(None);
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    assert_eq!(
+        uid_copies(test, key2.id, other_w).await,
+        1,
+        "waiting items held the pass"
+    );
+    assert_eq!(pending_ids(test, key2.id).await.len(), 34);
+    // A fresh session: 34 items take two passes (the cap), the second at
+    // once on the next request.
+    let app_wait = za_app_password(key2.name, STRONG, "drain limits, waiting").await;
+    assert_eq!(trigger_drain(key2.name, &app_wait).await, 207);
+    assert_eq!(pending_ids(test, key2.id).await.len(), 2);
+    assert_eq!(trigger_drain(key2.name, &app_wait).await, 207);
+    assert!(pending_ids(test, key2.id).await.is_empty());
+    assert_eq!(uid_copies(test, key2.id, uid_w).await, 1);
+    assert_eq!(uid_copies(test, key2.id, other_w).await, 1);
+
     // Cleanup.
     for name in ["limit-1", "limit-2", "limit-4"] {
         key1.client
@@ -254,7 +335,7 @@ pub async fn test(test: &mut TestServer) {
     for uid in [uid1, uid2, uid3, uid4]
         .into_iter()
         .chain(uids.iter().map(String::as_str))
-        .chain([late])
+        .chain([late, uid_w, other_w])
     {
         let href = copy_href(test, key2.id, uid).await;
         key2.client
@@ -263,7 +344,7 @@ pub async fn test(test: &mut TestServer) {
             .with_status(StatusCode::NO_CONTENT);
     }
     key2.delete_items_since(test, &start2).await;
-    for app in [&app_fail, &app_fresh] {
+    for app in [&app_fail, &app_fresh, &app_wait] {
         let credential_id = AppPassword::parse(app).unwrap().credential_id;
         za_post(
             "app-password/revoke",

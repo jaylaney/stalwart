@@ -6,7 +6,7 @@
 
 use crate::keys::{KeyError, Secret, derive_event_key};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         OnceLock,
         atomic::{AtomicU64, Ordering},
@@ -53,6 +53,9 @@ pub struct PassState {
     /// Items skipped after `DRAIN_ITEM_FAILURE_LIMIT` failures, with the
     /// UID each named, if known: later items of that UID wait.
     pub skipped: HashMap<u32, Option<String>>,
+    /// Items left pending behind a skipped item of their UID in this
+    /// session: not re-opened until a fresh session retries them.
+    pub waiting: HashSet<u32>,
 }
 
 impl PassState {
@@ -71,6 +74,10 @@ impl PassState {
 
     pub fn is_skipped(&self, document_id: u32) -> bool {
         self.skipped.contains_key(&document_id)
+    }
+
+    pub fn is_waiting(&self, document_id: u32) -> bool {
+        self.waiting.contains(&document_id)
     }
 
     /// Whether a skipped item named `uid`.
