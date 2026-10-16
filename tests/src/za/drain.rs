@@ -793,6 +793,125 @@ pub async fn test_reply(test: &mut TestServer) {
         "key1's drain changed key2's copy"
     );
 
+    // 7. A delegation to someone who already attends another instance
+    // (spec 6.4, "Delegates"): key1's recurring event invites key2 to the
+    // series and key2 and key3 to an override of the second occurrence.
+    // key2 delegates the series (the master) to key3; key1's drain merges
+    // the REPLY, which adds key3 to the master, and invites key3 to the
+    // series although key3 already attended the override: attendance is
+    // compared per instance.
+    let uid7 = "za-drain-r7";
+    let organizer7 = format!("{KEY1_CAL}drain-r7.ics");
+    let recurring7 = invite(uid7, START_A, &["key2@example.com"])
+        .replace(
+            "DURATION:PT1H\r\n",
+            "DURATION:PT1H\r\nRRULE:FREQ=DAILY;COUNT=5\r\n",
+        )
+        .replace(
+            "END:VEVENT\r\nEND:VCALENDAR\r\n",
+            &format!(
+                concat!(
+                    "END:VEVENT\r\nBEGIN:VEVENT\r\nUID:{uid}\r\n",
+                    "DTSTAMP:20240101T000000Z\r\nRECURRENCE-ID:{start}\r\n",
+                    "DTSTART:{start}\r\nDURATION:PT1H\r\nSEQUENCE:0\r\n",
+                    "SUMMARY:fo-title {uid}\r\nORGANIZER:mailto:key1@example.com\r\n",
+                    "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:key2@example.com\r\n",
+                    "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:key3@example.com\r\n",
+                    "END:VEVENT\r\nEND:VCALENDAR\r\n"
+                ),
+                uid = uid7,
+                start = START_B
+            ),
+        );
+    key1.client
+        .request_with_headers("PUT", &organizer7, [CONTENT_TYPE], recurring7)
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    assert_eq!(trigger_drain(key3.name, STRONG).await, 207);
+    let copy7 = copy_href(test, key2.id, uid7).await;
+    let copy7_key3 = copy_href(test, key3.id, uid7).await;
+    // key2's master only: its ATTENDEE delegated, key3 added beside it.
+    let delegated7 = body(&key2.client, &copy7)
+        .await
+        .replace("\r\n ", "")
+        .split("BEGIN:VEVENT")
+        .enumerate()
+        .map(|(at, part)| {
+            if at == 0 || part.contains("RECURRENCE-ID") {
+                part.to_string()
+            } else {
+                part.replace(
+                    "PARTSTAT=NEEDS-ACTION",
+                    "PARTSTAT=DELEGATED;DELEGATED-TO=\"mailto:key3@example.com\"",
+                )
+                .replace(
+                    "END:VEVENT",
+                    "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;DELEGATED-FROM=\"mailto:key2@example.com\":mailto:key3@example.com\r\nEND:VEVENT",
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("BEGIN:VEVENT");
+    key2.client
+        .request_with_headers("PUT", &copy7, [CONTENT_TYPE], delegated7)
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    // The fan-out is synchronous; `wait_for_delivery` would wait for step
+    // 1's alarms, which are not due.
+    assert_eq!(
+        pending_ids(test, key1.id).await.len(),
+        1,
+        "the master's delegation built no reply"
+    );
+    let before3 = inbox_ids(test, key3.id).await;
+    let before2 = inbox_ids(test, key2.id).await;
+    assert_eq!(trigger_drain(key1.name, STRONG).await, 207);
+    let key3_items = new_inbox_items(test, key3.id, &before3).await;
+    assert_eq!(
+        key3_items.len(),
+        1,
+        "key3 has exactly one new item: the organizer's series invitation"
+    );
+    assert_eq!(key3_items[0].1.changed_by, ChangedBy::PrincipalId(key1.id));
+    assert_eq!(
+        new_inbox_items(test, key2.id, &before2).await.len(),
+        0,
+        "key2 received an item from the delegation"
+    );
+    assert!(
+        pending_ids(test, key1.id).await.is_empty(),
+        "the delegation reply is still pending"
+    );
+    assert_eq!(trigger_drain(key3.name, STRONG).await, 207);
+    let copy7_key3_body = body(&key3.client, &copy7_key3).await.replace("\r\n ", "");
+    let key3_attends = |component: &str, delegated: bool| {
+        component.lines().any(|line| {
+            let line = line.to_ascii_lowercase();
+            line.starts_with("attendee")
+                && line.ends_with("mailto:key3@example.com")
+                && (!delegated
+                    || (line.contains("delegated-from=") && line.contains("key2@example.com")))
+        })
+    };
+    let components: Vec<&str> = copy7_key3_body.split("BEGIN:VEVENT").skip(1).collect();
+    let master7 = components
+        .iter()
+        .find(|component| !component.contains("RECURRENCE-ID"))
+        .unwrap_or_else(|| panic!("key3's copy has no master: {copy7_key3_body}"));
+    assert!(
+        key3_attends(master7, true),
+        "key3's master does not list key3 delegated from key2: {copy7_key3_body}"
+    );
+    let override7 = components
+        .iter()
+        .find(|component| component.contains("RECURRENCE-ID"))
+        .unwrap_or_else(|| panic!("key3's copy lost the override: {copy7_key3_body}"));
+    assert!(
+        key3_attends(override7, false),
+        "key3's override no longer lists key3: {copy7_key3_body}"
+    );
+
     // Cleanup.
     for (party, uid) in [
         (&key2, uid),
@@ -801,6 +920,8 @@ pub async fn test_reply(test: &mut TestServer) {
         (&key3, uid3),
         (&key2, uid4),
         (&key2, uid5),
+        (&key2, uid7),
+        (&key3, uid7),
     ] {
         let href = copy_href(test, party.id, uid).await;
         party
@@ -809,7 +930,9 @@ pub async fn test_reply(test: &mut TestServer) {
             .await
             .with_status(StatusCode::NO_CONTENT);
     }
-    for name in ["drain-r1", "drain-r2", "drain-r3", "drain-r4", "drain-r5"] {
+    for name in [
+        "drain-r1", "drain-r2", "drain-r3", "drain-r4", "drain-r5", "drain-r7",
+    ] {
         key1.client
             .request_with_headers("DELETE", &format!("{KEY1_CAL}{name}.ics"), [NO_REPLY], "")
             .await

@@ -608,6 +608,55 @@ enum Step {
     Nothing,
 }
 
+/// An instance's identity across two snapshots of one event: `None` for
+/// the master, the RECURRENCE-ID's date and range for an override (never
+/// its entry id, which a merge may change).
+type InstanceKey = Option<(i64, bool)>;
+
+fn instance_key(instance: &InstanceId) -> InstanceKey {
+    match instance {
+        InstanceId::Main => None,
+        InstanceId::Recurrence(recurrence) => Some((recurrence.date, recurrence.this_and_future)),
+    }
+}
+
+/// An event's attendance before a merge, per instance (spec 6.4,
+/// "Delegates"), as lowercased addresses.
+struct Attendance {
+    instances: AHashSet<InstanceKey>,
+    attendees: AHashSet<(InstanceKey, String)>,
+}
+
+impl Attendance {
+    fn of(snapshots: &ItipSnapshots<'_>) -> Self {
+        let mut attendance = Attendance {
+            instances: AHashSet::new(),
+            attendees: AHashSet::new(),
+        };
+        for (instance, snapshot) in &snapshots.components {
+            let instance = instance_key(instance);
+            attendance.instances.insert(instance);
+            for attendee in &snapshot.attendees {
+                attendance
+                    .attendees
+                    .insert((instance, attendee.email.email.to_ascii_lowercase()));
+            }
+        }
+        attendance
+    }
+
+    /// Whether `address` attended `instance` before the merge. An override
+    /// the merge created inherits the master's attendance, so a
+    /// delegator's own per-occurrence delegation does not make the
+    /// delegator new.
+    fn attended(&self, instance: InstanceKey, address: &str) -> bool {
+        let attended =
+            |instance: InstanceKey| self.attendees.contains(&(instance, address.to_string()));
+        attended(instance)
+            || (instance.is_some() && !self.instances.contains(&instance) && attended(None))
+    }
+}
+
 /// Spec 6.4, an event exists: upstream's merge (`commit_itip_merge`'s
 /// rules) on the unsealed copy, committed sealed under the assertion on
 /// the event's stored archive, with the fork's checks around it.
@@ -683,14 +732,9 @@ async fn merge(
         };
         let is_organizer_update = !itip_snapshots.organizer.email.is_local;
         let event_uid = snapshots.uid.to_string();
-        // The attendees before the merge: those the merge adds are
-        // delegates (spec 6.4, "Delegates").
-        let before: AHashSet<String> = snapshots
-            .components
-            .values()
-            .flat_map(|instance| instance.attendees.iter())
-            .map(|attendee| attendee.email.email.to_ascii_lowercase())
-            .collect();
+        // The attendance before the merge, per instance: an attendee the
+        // merge adds to an instance is a delegate (spec 6.4, "Delegates").
+        let before = Attendance::of(&snapshots);
         let step = if matches!(incoming, Incoming::Reply(_))
             && is_stale_reply(&snapshots, &itip_snapshots)
         {
@@ -770,13 +814,19 @@ async fn merge(
         Incoming::Reply(_) => {
             let new_attendees = match itip_snapshot(&event.data.event, addresses, false) {
                 Ok(after) => {
-                    let new_attendees: AHashSet<String> = after
-                        .components
-                        .values()
-                        .flat_map(|instance| instance.attendees.iter())
-                        .map(|attendee| attendee.email.email.to_ascii_lowercase())
-                        .filter(|address| !before.contains(address))
-                        .collect();
+                    // Compared per instance, so a delegate who already
+                    // attends another instance is new to this one; the
+                    // set dedups the addresses for delivery.
+                    let mut new_attendees: AHashSet<String> = AHashSet::new();
+                    for (instance, snapshot) in &after.components {
+                        let instance = instance_key(instance);
+                        for attendee in &snapshot.attendees {
+                            let address = attendee.email.email.to_ascii_lowercase();
+                            if !before.attended(instance, &address) {
+                                new_attendees.insert(address);
+                            }
+                        }
+                    }
                     if new_attendees.is_empty() {
                         Ok(None)
                     } else {
