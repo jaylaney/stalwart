@@ -1458,26 +1458,148 @@ pub async fn test_lease(test: &mut TestServer) {
     let copy7 = copy_href(test, key2.id, uid7).await;
     assert_eq!(za_uid_leases(test).await, 0);
 
+    // G. The delegating merge's fan-out is fenced on its lease (spec 6.3,
+    // 6.4 "Delegates"): session 1 (key1's password session) holds key1's
+    // creation lease, parked inside the fan-out to key3 after it chose
+    // key3's token and reserved the item's id, until the 1-second lease
+    // expires. Session 2 (key1's app-password session) takes the expired
+    // lease over, delivers its own token to key3 and commits. Session 1's
+    // item write then finds the lease taken over and delivers nothing:
+    // key3 holds one invitation, with the token key1's copy keeps, and
+    // key3's acceptance applies to key1's copy.
+    let uid8 = "za-drain-l8";
+    let organizer8 = format!("{KEY1_CAL}drain-l8.ics");
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &organizer8,
+            [CONTENT_TYPE],
+            invite(uid8, START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    let copy8 = copy_href(test, key2.id, uid8).await;
+    let delegated = body(&key2.client, &copy8)
+        .await
+        .replace("\r\n ", "")
+        .replace(
+            "PARTSTAT=NEEDS-ACTION",
+            "PARTSTAT=DELEGATED;DELEGATED-TO=\"mailto:key3@example.com\"",
+        )
+        .replace(
+            "END:VEVENT",
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;DELEGATED-FROM=\"mailto:key2@example.com\":mailto:key3@example.com\r\nEND:VEVENT",
+        );
+    key2.client
+        .request_with_headers("PUT", &copy8, [CONTENT_TYPE], delegated)
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    wait_for_delivery(test).await;
+    assert_eq!(
+        pending_ids(test, key1.id).await.len(),
+        1,
+        "key1's inbox holds one pending delegation reply"
+    );
+    assert_eq!(za_uid_leases(test).await, 0);
+    test_hooks::set_lease_secs_override(Some(1));
+    let before3 = inbox_ids(test, key3.id).await;
+    let session_1 = HookParked::start(
+        key3.id,
+        test_hooks::set_fan_out_pause,
+        trigger_drain(key1.name, STRONG),
+    )
+    .await;
+    // Session 1 holds its 1-second lease; session 2's takes the default.
+    test_hooks::set_lease_secs_override(None);
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        trigger_drain(key1.name, &app1).await,
+        207,
+        "session 2's request"
+    );
+    assert_eq!(
+        new_inbox_items(test, key3.id, &before3).await.len(),
+        1,
+        "session 2 did not deliver key3's invitation"
+    );
+    assert!(
+        pending_ids(test, key1.id).await.is_empty(),
+        "session 2 did not take the expired lease over"
+    );
+    assert_eq!(za_uid_leases(test).await, 0);
+    // Session 1's lost fence defers its session; a short backoff lets the
+    // last drain below run.
+    test_hooks::set_drain_retry_override(Some(1));
+    assert_eq!(
+        session_1.finish().await,
+        207,
+        "a lost fan-out fence failed the request"
+    );
+    let key3_items = new_inbox_items(test, key3.id, &before3).await;
+    assert_eq!(
+        key3_items.len(),
+        1,
+        "key3 still has exactly one new item: the stale delivery was not fenced out"
+    );
+    assert_eq!(
+        za_uid_leases(test).await,
+        0,
+        "the fenced-out holder wrote its lease"
+    );
+    let (_, carriers) = open_pending_item_as(test, key3.id, STRONG, key3_items[0].0).await;
+    let delivered = pair_token(carriers.pair.as_ref(), "key3@example.com");
+    assert_eq!(
+        stored_pairs(test, &keys1, key1.id, "default/drain-l8.ics")
+            .await
+            .expect("pairs")
+            .get("key3@example.com"),
+        Some(&delivered),
+        "key1's copy keeps a token other than the one key3 received"
+    );
+    // End to end: key3's acceptance carries the token key1 keeps.
+    assert_eq!(trigger_drain(key3.name, STRONG).await, 207);
+    let copy8_key3 = copy_href(test, key3.id, uid8).await;
+    set_partstat(&key3.client, &copy8_key3, "key3@example.com", "ACCEPTED").await;
+    wait_for_delivery(test).await;
+    assert_eq!(trigger_drain(key1.name, &app1).await, 207);
+    assert!(pending_ids(test, key1.id).await.is_empty());
+    assert_eq!(
+        partstat_of(&key1.client, &organizer8, "key3@example.com")
+            .await
+            .as_deref(),
+        Some("ACCEPTED"),
+        "the delegate's reply did not apply to the organizer"
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(trigger_drain(key1.name, STRONG).await, 207);
+    assert!(pending_ids(test, key1.id).await.is_empty());
+    test_hooks::set_drain_retry_override(None);
+    // key3's drain above also imported the case E invitation.
+    let copy5_key3 = copy_href(test, key3.id, uid5).await;
+    assert_eq!(za_uid_leases(test).await, 0);
+
     // Cleanup.
     test_hooks::set_drain_retry_override(None);
-    for href in [copy, own, own3, copy5, copy6, copy7] {
+    for href in [copy, own, own3, copy5, copy6, copy7, copy8] {
         key2.client
             .request_with_headers("DELETE", &href, [NO_REPLY], "")
             .await
             .with_status(StatusCode::NO_CONTENT);
     }
-    // key3's drain would import the case E invitation before its own
-    // requests run, leaving a copy behind: key3's cleanup skips it.
+    // key3's drain finds nothing new by now; skipped all the same, so a
+    // late item cannot leave a copy behind.
     test_hooks::set_drain_skip(key3.id);
-    key3.client
-        .request_with_headers(
-            "DELETE",
-            "/dav/cal/key3%40example.com/default/drain-l1.ics",
-            [NO_REPLY],
-            "",
-        )
-        .await
-        .with_status(StatusCode::NO_CONTENT);
+    for href in [
+        "/dav/cal/key3%40example.com/default/drain-l1.ics".to_string(),
+        copy5_key3,
+        copy8_key3,
+    ] {
+        key3.client
+            .request_with_headers("DELETE", &href, [NO_REPLY], "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
     for href in [
         format!("{KEY1_CAL}drain-l1.ics"),
         format!("{KEY1_CAL}drain-l2.ics"),
@@ -1486,6 +1608,7 @@ pub async fn test_lease(test: &mut TestServer) {
         organizer5,
         format!("{KEY1_CAL}drain-l6.ics"),
         format!("{KEY1_CAL}drain-l7.ics"),
+        organizer8,
     ] {
         key1.client
             .request_with_headers("DELETE", &href, [NO_REPLY], "")

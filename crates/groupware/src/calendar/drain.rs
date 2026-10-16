@@ -824,16 +824,35 @@ async fn merge(
                         }
                         reply_lease = Some(lease);
                     }
-                    let fan_out = server
+                    // Each delegate item's write asserts the lease too: a
+                    // session whose lease expired and was taken over while
+                    // it waited inside the fan-out delivers nothing more,
+                    // so a stale token never reaches a delegate after the
+                    // successor's (spec 6.3).
+                    let fan_out = match server
                         .za_fan_out(
                             ctx.account_info,
                             ctx.keys,
                             messages,
                             pairs.take(),
                             &event.data.event,
+                            reply_lease.as_ref().map(|lease| lease.lease()),
                         )
                         .await
-                        .caused_by(trc::location!())?;
+                    {
+                        Ok(fan_out) => fan_out,
+                        // The key holds the successor's value: nothing to
+                        // release. The same outcome as a lost commit fence.
+                        Err(err) if err.is_assertion_failure() => {
+                            if let Some(lease) = reply_lease.take() {
+                                lease.abandon();
+                            }
+                            return Err(err
+                                .details("zero-access: drain fan-out lost its lease")
+                                .caused_by(trc::location!()));
+                        }
+                        Err(err) => return Err(err.caused_by(trc::location!())),
+                    };
                     za_set_schedule_status(&mut event.data.event, &fan_out.statuses);
                     pairs = fan_out.pairs;
                 }

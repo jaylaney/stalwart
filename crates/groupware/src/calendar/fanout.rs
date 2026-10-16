@@ -45,6 +45,7 @@ use calcard::icalendar::{
 use common::{
     Server,
     auth::{AccountInfo, BuildAccessToken},
+    za::lease::ZaUidLease,
 };
 use registry::schema::enums::Permission;
 use store::{rand, write::BatchBuilder};
@@ -97,8 +98,11 @@ pub trait ZaFanOut: Sync + Send {
     /// event (`event_token_pairs`), `None` on a create. A lookup or write
     /// failure for one recipient becomes that recipient's delivery-failed
     /// status (spec 10); the call fails only when `keys` are not the
-    /// sender's. Plan 10's drain calls it for the delegation fan-out
-    /// (spec 6.4).
+    /// sender's, or when `fence` is lost. Plan 10's drain calls it for the
+    /// delegation fan-out (spec 6.4) with its per-UID lease as `fence`:
+    /// each item's write asserts the lease, and the first write that finds
+    /// it taken over fails the call (an assertion failure), so no item is
+    /// written after the fence is lost.
     fn za_fan_out(
         &self,
         sender: &AccountInfo,
@@ -106,6 +110,7 @@ pub trait ZaFanOut: Sync + Send {
         messages: Vec<ItipMessage<ICalendar>>,
         stored_pairs: Option<TokenPairs>,
         event: &ICalendar,
+        fence: Option<&ZaUidLease>,
     ) -> impl Future<Output = trc::Result<ZaFanOutResult>> + Send;
 }
 
@@ -117,6 +122,7 @@ impl ZaFanOut for Server {
         messages: Vec<ItipMessage<ICalendar>>,
         stored_pairs: Option<TokenPairs>,
         event: &ICalendar,
+        fence: Option<&ZaUidLease>,
     ) -> trc::Result<ZaFanOutResult> {
         let sender_id = sender.account_id();
         if keys.account_id != sender_id {
@@ -167,18 +173,18 @@ impl ZaFanOut for Server {
                                 Recipient::Internal {
                                     account_id,
                                     public_key,
-                                } => {
-                                    write_item(
-                                        self,
-                                        sender_id,
-                                        account_id,
-                                        &public_key,
-                                        &message.message,
-                                        pair.as_ref(),
-                                        reply_token.as_deref(),
-                                    )
-                                    .await
-                                }
+                                } => write_item(
+                                    self,
+                                    sender_id,
+                                    account_id,
+                                    &public_key,
+                                    &message.message,
+                                    pair.as_ref(),
+                                    reply_token.as_deref(),
+                                    fence,
+                                )
+                                .await
+                                .caused_by(trc::location!())?,
                                 Recipient::NotInternal => ITIP_STATUS_NOT_ATTEMPTED,
                                 Recipient::Failed => ITIP_STATUS_DELIVERY_FAILED,
                             };
@@ -465,8 +471,11 @@ async fn resolve_inner(server: &Server, sender_id: u32, address: &str) -> trc::R
     })
 }
 
-/// Spec 5.3: one pending item for one recipient. A failure is `5.1`, traced
-/// with the recipient's account id and no content.
+/// Spec 5.3: one pending item for one recipient, its status. A failure is
+/// `5.1`, traced with the recipient's account id and no content, except a
+/// lost `fence`: that assertion failure is the only `Err`, and it stops the
+/// fan-out.
+#[allow(clippy::too_many_arguments)]
 async fn write_item(
     server: &Server,
     sender_id: u32,
@@ -475,7 +484,8 @@ async fn write_item(
     message: &ICalendar,
     pair: Option<&TokenPairs>,
     reply_token: Option<&[u8; TOKEN_LEN]>,
-) -> &'static str {
+    fence: Option<&ZaUidLease>,
+) -> trc::Result<&'static str> {
     match write_item_inner(
         server,
         sender_id,
@@ -484,24 +494,31 @@ async fn write_item(
         message,
         pair,
         reply_token,
+        fence,
     )
     .await
     {
-        Ok(true) => ITIP_STATUS_DELIVERED,
-        Ok(false) => ITIP_STATUS_DELIVERY_FAILED,
+        Ok(true) => Ok(ITIP_STATUS_DELIVERED),
+        Ok(false) => Ok(ITIP_STATUS_DELIVERY_FAILED),
+        Err(err) if fence.is_some() && err.is_assertion_failure() => Err(err
+            .account_id(recipient_id)
+            .details("zero-access: fan-out lost its fence")),
         Err(err) => {
             trc::error!(
                 err.account_id(recipient_id)
                     .details("zero-access: fan-out item not written")
                     .caused_by(trc::location!())
             );
-            ITIP_STATUS_DELIVERY_FAILED
+            Ok(ITIP_STATUS_DELIVERY_FAILED)
         }
     }
 }
 
 /// `Ok(false)` when the inbound size limit or the recipient's quota refuses
-/// the item (step 5); `Ok(true)` once it is committed (steps 1-4).
+/// the item (step 5); `Ok(true)` once it is committed (steps 1-4). With a
+/// `fence`, the item's batch asserts the lease (whose key is global), so a
+/// write after a takeover fails with an assertion failure.
+#[allow(clippy::too_many_arguments)]
 async fn write_item_inner(
     server: &Server,
     sender_id: u32,
@@ -510,6 +527,7 @@ async fn write_item_inner(
     message: &ICalendar,
     pair: Option<&TokenPairs>,
     reply_token: Option<&[u8; TOKEN_LEN]>,
+    fence: Option<&ZaUidLease>,
 ) -> trc::Result<bool> {
     // Step 5: the two checks upstream's ingest makes.
     let size = ical_size(message);
@@ -548,6 +566,11 @@ async fn write_item_inner(
     #[cfg(feature = "test_mode")]
     common::za::test_hooks::fan_out_pause_point(recipient_id).await;
     let mut batch = BatchBuilder::new();
+    // Ahead of the insert: the assertion and the insert share the batch's
+    // first commit point.
+    if let Some(fence) = fence {
+        fence.assert_in(&mut batch);
+    }
     CalendarEventNotification {
         event: tree,
         event_id: None,
