@@ -47,6 +47,9 @@ pub async fn test(test: &mut TestServer) {
     // A fresh session: the hook fires on a session's first unwrap only, and
     // key2's password session unwrapped its key in an earlier module.
     let app_fail = za_app_password(key2.name, STRONG, "drain limits, failing").await;
+    // The deferral is an absolute deadline: a zero backoff set before the
+    // failing pass, so only a permanent deferral keeps the next pass out.
+    test_hooks::set_drain_retry_override(Some(0));
     test_hooks::set_private_key_fail(Some(key2.id));
     assert_eq!(
         trigger_drain(key2.name, &app_fail).await,
@@ -58,13 +61,17 @@ pub async fn test(test: &mut TestServer) {
         1,
         "a session without its private key drained"
     );
-    test_hooks::set_drain_retry_override(Some(0));
+    // A pass that ran would consume the enumeration probe; the recorded
+    // unwrap failure alone keeps the item pending, so the probe is what
+    // tells the deferral apart. The `take_` in the assertion clears the
+    // flag.
+    test_hooks::set_drain_enumerate_fail(Some(key2.id));
     assert_eq!(trigger_drain(key2.name, &app_fail).await, 207);
-    assert_eq!(
-        pending_ids(test, key2.id).await.len(),
-        1,
+    assert!(
+        test_hooks::take_drain_enumerate_fail(key2.id),
         "the backoff lifted a permanent deferral"
     );
+    assert_eq!(pending_ids(test, key2.id).await.len(), 1);
     test_hooks::set_drain_retry_override(None);
     assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
     assert!(
