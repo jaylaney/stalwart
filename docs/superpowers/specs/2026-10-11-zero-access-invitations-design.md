@@ -709,11 +709,11 @@ session (section 3.2). For each item:
      not attend before, where an override the merge created inherits the
      master's attendance. A delegate who already attends another instance
      is therefore still invited to the one it joins; the new addresses are
-     deduplicated for delivery. The drain runs in the
-     organizer's own session and holds its keys, so this is the same
-     fan-out a PUT uses, fenced on the organizer's UID lease (section 6.3,
-     step 5). A delegate's REPLY reaches only the organizer
-     (section 5.2); the delegator's copy learns the delegate's status from
+     deduplicated for delivery. The drain runs in the organizer's own
+     session and holds its keys, so this is the same fan-out a PUT uses,
+     fenced on the organizer's UID lease (section 6.3, step 5). A
+     delegate's REPLY reaches only the organizer (section 5.2); the
+     delegator's copy learns the delegate's status from
      the organizer's next update REQUEST, which carries every attendee's
      participation status, while the organizer's copy is correct
      throughout.

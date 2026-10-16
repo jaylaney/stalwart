@@ -17,10 +17,10 @@
 //! REPLY by its token and rejects a stale one, fans out the organizer's
 //! REQUEST to delegates the merge added (compared per instance), and
 //! rewrites the item resealed under the master key with the pending bit
-//! cleared (6.4 step 5). Each
-//! item is one store write holding the event write and the item rewrite
-//! (its batch stays far below `BatchBuilder::is_large_batch`, the only
-//! point at which a commit point splits a batch).
+//! cleared (6.4 step 5). Each item is one store write holding the event
+//! write and the item rewrite (its batch stays far below
+//! `BatchBuilder::is_large_batch`, the only point at which a commit point
+//! splits a batch).
 //! Upstream's pure iTIP functions run unchanged (invariant 15); only the
 //! commit is the fork's. The drain never fails the request that triggered
 //! it (invariant 14): `za_drain` traces and returns.
@@ -895,8 +895,10 @@ async fn merge(
                         .await
                     {
                         Ok(fan_out) => fan_out,
-                        // The key holds the successor's value: nothing to
-                        // release. The same outcome as a lost commit fence.
+                        // The key holds a successor's value, or is gone
+                        // (the successor released it, or the sweep cleared
+                        // it): nothing to release. The same outcome as a
+                        // lost commit fence.
                         Err(err) if err.is_assertion_failure() => {
                             if let Some(lease) = reply_lease.take() {
                                 lease.abandon();
