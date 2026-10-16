@@ -322,6 +322,15 @@ enabled (`itip_enabled`), a calendar address, the
 `CalendarSchedulingSend` permission, and an event that does not lie in the
 past. Every other state keeps its upstream meaning.
 
+The sending state follows the calendar's owner, not the authenticated
+account: `ItipSendStatus::resolve` takes `owner_is_key`, whether the
+account that owns the calendar being written is a key account, and
+resolves to `SendSealed` on that alone. In release 2 only the owner
+writes to a key account's calendar (sharing is a later release), so the
+rule is descriptive; when sharing arrives it stays the right rule, since
+the copy that stores the token pairs is the owner's. JMAP callers pass
+`owner_is_key = false` (key accounts have no JMAP calendar access).
+
 Under `SendSealed`, upstream's `itip_create`, `itip_update` and
 `itip_cancel` run on the plaintext tree exactly as for a plain account and
 produce their `ItipMessage` values (sender, recipients, tree). Before they
@@ -432,19 +441,42 @@ The fan-out runs after every check of the request (headers, schedule tag,
 UID, quota) and immediately before the sender's commit. The recipients'
 inbox writes come first, each its own batch; then the sender's event is
 sealed and committed under the sender's MK, with tokens and schedule
-statuses inside. If the sender's commit fails after inbox writes,
-recipients hold an item for an event version that was not stored, and the
-sender's client resends; the drain's merge treats the duplicate by UID and
-SEQUENCE as upstream's merge does. A reply can also beat the sender's
-commit: if the attendee drains, imports and replies before the organizer's
-event commits, the organizer's drain finds no event for the UID and files
-the reply as history (section 6.4 step 4), never retried. The window lies
-inside one request of the sender, and the attendee's next participation
-change produces a fresh reply. Both consequences are accepted. A retried
-create delivers fresh tokens with an equal SEQUENCE, which upstream's
-merge accepts (`>=` in the `Request` arm of `inbound.rs`), and the copy
-adopts them under the section 6.4 rule, so the retry case needs nothing
-more.
+statuses inside.
+
+**The fence.** A key account's create holds the UID creation lease
+(section 6.3) and passes it to the fan-out: every recipient item's batch
+asserts the lease before its insert, as the drain's delegating merge does
+(section 6.4). A creator whose lease expired and was taken over by another
+session therefore writes no item after the successor's, so a recipient
+never adopts a token that lost to the committed one. A lost fence inside
+the fan-out ends the request the way a lost commit fence does (section
+6.3 step 3): a trace, the lease abandoned, the lease taken again to
+re-check current archives, `NoUidConflict` on a hit and 503 otherwise.
+
+**What remains.** Items delivered before the takeover stay: the recipient
+drains them in document-id order, so the successor's later item wins and
+the recipient ends on the committed token. A reply the recipient sends
+between draining the two items carries the earlier token and is dropped
+as a forgery; the recipient's next reply is accepted. When no successor
+exists (the lease expired, nobody took the UID, the create answers 503),
+the recipient holds an invitation for an event that was not stored until
+the sender's client resends, which 503 asks for; the resent create
+delivers fresh tokens with an equal SEQUENCE, which upstream's merge
+accepts (`>=` in the `Request` arm of `inbound.rs`), and the copy adopts
+them under the section 6.4 rule. Both are accepted: each needs a lease
+expiring under a live request, and each heals on the next message.
+Compensating deletion of delivered items was considered and rejected
+(section 14). A reply can also beat the sender's commit: if the attendee
+drains, imports and replies before the organizer's event commits, the
+organizer's drain finds no event for the UID and files the reply as
+history (section 6.4 step 4), never retried; the attendee's next
+participation change produces a fresh reply.
+
+**Updates and deletes** take no lease: their commit is fenced on the
+event's stored archive, and a lost update commit after a fan-out leaves
+the same bounded window as above. A lease on every update of a scheduled
+event would cost a store round trip and a 503 on a hot UID for no new
+guarantee.
 
 ### 5.5 The paths that fan out
 
@@ -524,6 +556,20 @@ the item would otherwise wait for an unrelated change. A per-session retry
 backoff after such a pass (`DRAIN_RETRY_SECS`, a constant of 30 seconds
 with a test-mode override; plan 10 settled on no environment knob) keeps
 a stuck item from draining on every request.
+
+**The cap.** A pass handles at most `DRAIN_PASS_CAP` (32) items. When
+more remain, the pass ends without a deferral and without advancing the
+remembered id, so the session's next request continues where it stopped.
+A pass that leaves an item pending for another reason defers as above,
+whether or not more items remained.
+
+**Skipped items.** An item whose drain failed `DRAIN_ITEM_FAILURE_LIMIT`
+(3) times in one session is skipped for the rest of that session, with
+one trace, and later items that name the same UID are left pending with
+it, so a CANCEL never overtakes the REQUEST it cancels (section 6.3).
+Neither a skipped item nor one waiting behind it holds the remembered
+id: a pass whose only pending items are those completes. The counters
+live in the session's drain state; a new session retries the item.
 
 An invitation therefore appears at the attendee client's next poll, not at
 the next login.
@@ -755,7 +801,9 @@ ingest does.
 - **Transient** (a store error; a lost conditional write, including a
   fenced commit whose lease was lost, which also aborts the pass; a
   creation lease not taken, section 6.3): the item stays pending and is
-  retried by a later pass (section 6.2).
+  retried by a later pass (section 6.2), up to `DRAIN_ITEM_FAILURE_LIMIT`
+  failures in one session, after which the item is skipped for that
+  session (section 6.2).
 - **Permanent** (unknown wrap type, unknown policy version, a wrap this
   account's private key does not open, a stray carrier, an unparsable tree,
   an unknown METHOD): the item is deleted with a trace naming account and
@@ -771,6 +819,9 @@ ingest does.
   runs before the bundle is read).
 - **iTIP-level rejection** (step 4): resealed under MK, bit cleared, kept
   as history, with a trace.
+  `MissingUid` and `NoSchedulingInfo` from the item's snapshot are
+  iTIP-level rejections too, kept as history (the item's tree parsed; its
+  scheduling content did not), not permanent errors.
 
 ### 6.6 The inbox as clients see it
 
@@ -910,9 +961,17 @@ The policy version stays 1: release 2 changes no visibility.
   request or the single report item, a logged error with no content,
   nothing deleted or rewritten.
 - A private-key unwrap failure in `SessionKeys` (a corrupt
-  `private_key_wrap`) is traced once per session and the drain is skipped;
-  the request proceeds. Pending items wait, since the private key is the
-  only way to open them.
+  `private_key_wrap`, a missing or unusable record) is traced once per
+  session and the drain is skipped for the rest of that session: the
+  session's drain state takes a permanent deferral, so no later request
+  of the session enumerates the inbox. The request proceeds. Pending
+  items wait for a new session, whose `SessionKeys` retry the unwrap. A
+  store error reading the record is not recorded: it is traced, the
+  session defers by `DRAIN_RETRY_SECS`, and a later pass retries.
+- A store error before the drain's match (the inbox change id, the item
+  ids, an item read) defers the session by `DRAIN_RETRY_SECS` like one
+  after it, so a persistent store fault traces once per backoff, not once
+  per request.
 - A destroyed recipient account takes its inbox with it: the destroy task
   removes all account-keyed data, pending items included.
 - No new trace event types are added (the event enums are generated
@@ -942,9 +1001,12 @@ fan-out pause between document-id assignment and the item commit, a
 drain pause after its absence check, a PUT pause after the resource fetch,
 a per-account drain skip (while set, that account's drain does not run),
 a one-shot failure of the sender's commit after the fan-out, and a
-task-consumer pause. None of them changes behaviour when unset. The
-consumer pause must live where both `http` and `services` can reach it
-(`common`), a note for planning.
+task-consumer pause, a one-shot private-key unwrap failure
+(`PRIVATE_KEY_FAIL_ONCE`), a one-shot failure of the drain's enumeration
+(`DRAIN_ENUMERATE_FAIL_ONCE`), and a persistent commit failure for one
+item (`DRAIN_FAIL_ITEM`, keyed by account and document id). None of them
+changes behaviour when unset. The consumer pause must live where both
+`http` and `services` can reach it (`common`), a note for planning.
 
 - Invite between two key accounts, drained on the attendee's first request,
   and on a mid-session arrival: a second request by an already connected
@@ -1018,6 +1080,16 @@ consumer pause must live where both `http` and `services` can reach it
   `wait_for_delivery` (`tests/src/utils/za.rs`) likewise waits until
   tasks are gone. The end-to-end check that no canary ever reaches any
   mailbox stays.
+- Drain limits (`tests/src/za/drain_limits.rs`): a session whose private
+  key does not open drains nothing on any later request and a fresh
+  session drains everything; an enumeration error defers the session
+  like an item error; an item that fails three times is skipped, a later
+  CANCEL for its UID waits with it, an unrelated item drains, and a fresh
+  session applies both in order; a pass of 33 pending items drains 32 and
+  the next request the rest, an arrival in between included, with the
+  default backoff in force.
+- The PUT create's fence: lease cases (b) and (b') assert that the held
+  create writes no attendee item after its lease was taken over.
 
 **Leak tests** (`tests/src/za/leak.rs` pattern). An invitation carries
 canary titles, locations, descriptions and attendee addresses; the
@@ -1083,12 +1155,17 @@ Release 1's ten invariants hold. Release 2 adds:
   the `X-ZA-EXTRA` format byte for bundles with token pairs (`2`), the
   inbox items' scope (`itip`) and drained key-envelope purpose, the
   drain's retry backoff (`DRAIN_RETRY_SECS`, a constant of 30 seconds),
-  the creation lease prefix (`KV_LOCK_ZA_UID`), the lease duration and its
+  the per-pass cap (`DRAIN_PASS_CAP`, 32) and the per-item failure limit
+  (`DRAIN_ITEM_FAILURE_LIMIT`, 3), both constants, the creation lease
+  prefix (`KV_LOCK_ZA_UID`), the lease duration and its
   test knob (`ZA_UID_LEASE_SECS`), the fence token length, and the lease
   retry count and wait (values for planning). The lease key carries the
   raw UID, and UIDs can be long; it may hold a fixed-length hash of the
   UID instead, a choice for planning. The names in this spec are its
-  choices, to be confirmed.
+  choices, to be confirmed. A merge that changes nothing
+  (`MergeResult::None`) is written as history with flags `0`, where
+  upstream writes no inbox item; the item stays visible as the organizer's
+  unchanged message.
 - **Where the seal step gets the pairs.** The pairs cannot live in
   `CalendarEvent` fields (invariant 1), so the seal step takes them from
   the stored bundle: for example `seal_event` receiving the previous
@@ -1137,6 +1214,13 @@ Release 1's ten invariants hold. Release 2 adds:
   anonymous attendee would become visible metadata, and a reply comment
   would still need the sealed path. Replies use the same sealed item type
   instead.
+- **Compensating deletion of delivered items** after a lost create fence
+  (section 5.4): the fan-out would return each recipient's document id and
+  the losing request would delete them, skipping any a drain already
+  cleared. Rejected: a cross-account delete racing the recipient's drain,
+  for a case that needs a lease to expire under a live request and that
+  heals on the next message. The fence removes the lasting harm; the rest
+  is accepted.
 
 ## 15. Release 3 and sharing-release pointers
 
