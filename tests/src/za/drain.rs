@@ -912,6 +912,122 @@ pub async fn test_reply(test: &mut TestServer) {
         "key3's override no longer lists key3: {copy7_key3_body}"
     );
 
+    // 8. A delegation in an occurrence governed by a range override (spec
+    // 6.4, "Delegates"): key1's recurring event lists key2 and key3 in the
+    // master and key2 only in a THISANDFUTURE override from the second
+    // occurrence. key2 delegates the fourth occurrence to key3 by adding an
+    // override; the merge creates it, and it inherits the range override's
+    // attendance, not the master's, so key3 is new there and key1's drain
+    // invites it.
+    let uid8 = "za-drain-r8";
+    let organizer8 = format!("{KEY1_CAL}drain-r8.ics");
+    const FOURTH: &str = "20990304T100000Z";
+    let override_of = |uid: &str, recurrence_id: &str, start: &str, attendees: &[&str]| {
+        let mut component = format!(
+            concat!(
+                "BEGIN:VEVENT\r\nUID:{uid}\r\nDTSTAMP:20240101T000000Z\r\n",
+                "{recurrence_id}\r\nDTSTART:{start}\r\nDURATION:PT1H\r\n",
+                "SEQUENCE:0\r\nSUMMARY:fo-title {uid}\r\n",
+                "ORGANIZER:mailto:key1@example.com\r\n"
+            ),
+            uid = uid,
+            recurrence_id = recurrence_id,
+            start = start
+        );
+        for attendee in attendees {
+            component.push_str(attendee);
+            component.push_str("\r\n");
+        }
+        component.push_str("END:VEVENT\r\n");
+        component
+    };
+    let recurring8 = invite(uid8, START_A, &["key2@example.com", "key3@example.com"])
+        .replace(
+            "DURATION:PT1H\r\n",
+            "DURATION:PT1H\r\nRRULE:FREQ=DAILY;COUNT=5\r\n",
+        )
+        .replace(
+            "END:VCALENDAR\r\n",
+            &format!(
+                "{}END:VCALENDAR\r\n",
+                override_of(
+                    uid8,
+                    &format!("RECURRENCE-ID;RANGE=THISANDFUTURE:{START_B}"),
+                    START_B,
+                    &["ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:key2@example.com"],
+                )
+            ),
+        );
+    key1.client
+        .request_with_headers("PUT", &organizer8, [CONTENT_TYPE], recurring8)
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    assert_eq!(trigger_drain(key3.name, STRONG).await, 207);
+    let copy8 = copy_href(test, key2.id, uid8).await;
+    let copy8_key3 = copy_href(test, key3.id, uid8).await;
+    let delegated8 = body(&key2.client, &copy8)
+        .await
+        .replace("\r\n ", "")
+        .replace(
+            "END:VCALENDAR\r\n",
+            &format!(
+                "{}END:VCALENDAR\r\n",
+                override_of(
+                    uid8,
+                    &format!("RECURRENCE-ID:{FOURTH}"),
+                    FOURTH,
+                    &[
+                        "ATTENDEE;PARTSTAT=DELEGATED;DELEGATED-TO=\"mailto:key3@example.com\":mailto:key2@example.com",
+                        "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;DELEGATED-FROM=\"mailto:key2@example.com\":mailto:key3@example.com",
+                    ],
+                )
+            ),
+        );
+    key2.client
+        .request_with_headers("PUT", &copy8, [CONTENT_TYPE], delegated8)
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    assert_eq!(
+        pending_ids(test, key1.id).await.len(),
+        1,
+        "the occurrence's delegation built no reply"
+    );
+    let before3 = inbox_ids(test, key3.id).await;
+    let before2 = inbox_ids(test, key2.id).await;
+    assert_eq!(trigger_drain(key1.name, STRONG).await, 207);
+    let key3_items = new_inbox_items(test, key3.id, &before3).await;
+    assert_eq!(
+        key3_items.len(),
+        1,
+        "key3 has exactly one new item: the organizer's occurrence invitation"
+    );
+    assert_eq!(key3_items[0].1.changed_by, ChangedBy::PrincipalId(key1.id));
+    assert_eq!(
+        new_inbox_items(test, key2.id, &before2).await.len(),
+        0,
+        "key2 received an item from the delegation"
+    );
+    assert!(
+        pending_ids(test, key1.id).await.is_empty(),
+        "the delegation reply is still pending"
+    );
+    assert_eq!(trigger_drain(key3.name, STRONG).await, 207);
+    let copy8_key3_body = body(&key3.client, &copy8_key3).await.replace("\r\n ", "");
+    let fourth8 = copy8_key3_body
+        .split("BEGIN:VEVENT")
+        .skip(1)
+        .find(|component| {
+            component
+                .lines()
+                .any(|line| line.starts_with("RECURRENCE-ID") && line.ends_with(FOURTH))
+        })
+        .unwrap_or_else(|| panic!("key3's copy has no fourth occurrence: {copy8_key3_body}"));
+    assert!(
+        key3_attends(fourth8, true),
+        "key3's fourth occurrence does not list key3 delegated from key2: {copy8_key3_body}"
+    );
+
     // Cleanup.
     for (party, uid) in [
         (&key2, uid),
@@ -922,6 +1038,8 @@ pub async fn test_reply(test: &mut TestServer) {
         (&key2, uid5),
         (&key2, uid7),
         (&key3, uid7),
+        (&key2, uid8),
+        (&key3, uid8),
     ] {
         let href = copy_href(test, party.id, uid).await;
         party
@@ -931,7 +1049,7 @@ pub async fn test_reply(test: &mut TestServer) {
             .with_status(StatusCode::NO_CONTENT);
     }
     for name in [
-        "drain-r1", "drain-r2", "drain-r3", "drain-r4", "drain-r5", "drain-r7",
+        "drain-r1", "drain-r2", "drain-r3", "drain-r4", "drain-r5", "drain-r7", "drain-r8",
     ] {
         key1.client
             .request_with_headers("DELETE", &format!("{KEY1_CAL}{name}.ics"), [NO_REPLY], "")

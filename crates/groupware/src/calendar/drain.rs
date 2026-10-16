@@ -451,29 +451,33 @@ fn is_stale_reply(event: &ItipSnapshots<'_>, reply: &ItipSnapshots<'_>) -> bool 
 /// merge adds as a new override) is therefore judged against what covers
 /// it. `None` only for an event without a master component.
 fn governing_sequence(event: &ItipSnapshots<'_>, instance_id: &InstanceId) -> Option<i64> {
-    if let Some(exact) = event.components.get(instance_id) {
-        return Some(exact.sequence.unwrap_or(0));
-    }
-    if let InstanceId::Recurrence(occurrence) = instance_id
-        && let Some((_, ranged)) = event
-            .components
-            .iter()
-            .filter_map(|(id, component)| match id {
-                InstanceId::Recurrence(range)
-                    if range.this_and_future && range.date <= occurrence.date =>
-                {
-                    Some((range.date, component))
-                }
-                _ => None,
-            })
-            .max_by_key(|(date, _)| *date)
-    {
-        return Some(ranged.sequence.unwrap_or(0));
-    }
+    let instances: AHashSet<InstanceKey> = event.components.keys().map(instance_key).collect();
+    let governing = governing_instance(instance_key(instance_id), &instances);
     event
         .components
-        .get(&InstanceId::Main)
-        .map(|master| master.sequence.unwrap_or(0))
+        .iter()
+        .find(|(id, _)| instance_key(id) == governing)
+        .map(|(_, component)| component.sequence.unwrap_or(0))
+}
+
+/// The instance of `instances` that governs `instance` (spec 6.4): the
+/// instance itself when present; otherwise, for an occurrence, the latest
+/// `RANGE=THISANDFUTURE` override at or before it; otherwise the master
+/// (`None`, which `instances` may lack). Shared by the stale-reply check
+/// and the delegates' attendance.
+fn governing_instance(instance: InstanceKey, instances: &AHashSet<InstanceKey>) -> InstanceKey {
+    if instances.contains(&instance) {
+        return instance;
+    }
+    let (occurrence, _) = instance?;
+    instances
+        .iter()
+        .filter_map(|key| match key {
+            Some((date, true)) if *date <= occurrence => Some(*date),
+            _ => None,
+        })
+        .max()
+        .map(|date| (date, true))
 }
 
 /// Spec 6.4, REQUEST with no event: upstream's import (`itip_ingest`) with
@@ -650,14 +654,15 @@ impl Attendance {
     }
 
     /// Whether `address` attended `instance` before the merge. An override
-    /// the merge created inherits the master's attendance, so a
-    /// delegator's own per-occurrence delegation does not make the
-    /// delegator new.
+    /// the merge created inherits the attendance of the instance that
+    /// governs it (`governing_instance`: the latest range override at or
+    /// before it, else the master), so a delegator's own per-occurrence
+    /// delegation does not make the delegator new.
     fn attended(&self, instance: InstanceKey, address: &str) -> bool {
-        let attended =
-            |instance: InstanceKey| self.attendees.contains(&(instance, address.to_string()));
-        attended(instance)
-            || (instance.is_some() && !self.instances.contains(&instance) && attended(None))
+        self.attendees.contains(&(
+            governing_instance(instance, &self.instances),
+            address.to_string(),
+        ))
     }
 }
 
