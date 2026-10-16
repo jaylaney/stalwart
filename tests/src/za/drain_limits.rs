@@ -14,10 +14,11 @@ use super::{
 use crate::utils::{
     server::TestServer,
     za::{
-        PlantedItem, copy_href, inbox_ids, pending_ids, plant_inbox_item, trigger_drain,
-        za_app_password, za_post,
+        PlantedItem, copy_href, inbox_ids, pending_ids, plant_inbox_item, rewrite_inbox_item,
+        trigger_drain, za_app_password, za_post,
     },
 };
+use calcard::icalendar::ICalendarValue;
 use common::{auth::credential::AppPassword, za::test_hooks};
 use groupware::calendar::drain::DRAIN_ITEM_FAILURE_LIMIT;
 use hyper::StatusCode;
@@ -315,8 +316,27 @@ pub async fn test(test: &mut TestServer) {
         "waiting items held the pass"
     );
     assert_eq!(pending_ids(test, key2.id).await.len(), 34);
+    // Survival proves the filter: a pass that opened them would delete them
+    // as undecodable (spec 6.5); the rewrite moves the inbox past the cursor.
+    let waiting_w = pending_ids(test, key2.id)
+        .await
+        .into_iter()
+        .find(|id| *id != skipped_w)
+        .unwrap();
+    for id in [skipped_w, waiting_w] {
+        rewrite_inbox_item(test, key2.id, id, |item| {
+            // The root's last entry is `X-ZA-KEY`; its text becomes garbage.
+            let envelope = item.event.components[0].entries.last_mut().unwrap();
+            envelope.values = vec![ICalendarValue::Text("AAAA".to_string())];
+        })
+        .await;
+    }
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    let ids = pending_ids(test, key2.id).await;
+    assert!(ids.contains(&skipped_w), "a skipped item was re-opened");
+    assert!(ids.contains(&waiting_w), "a waiting item was re-opened");
     // A fresh session: 34 items take two passes (the cap), the second at
-    // once on the next request.
+    // once on the next request; it deletes the two undecodable ones.
     let app_wait = za_app_password(key2.name, STRONG, "drain limits, waiting").await;
     assert_eq!(trigger_drain(key2.name, &app_wait).await, 207);
     assert_eq!(pending_ids(test, key2.id).await.len(), 2);
