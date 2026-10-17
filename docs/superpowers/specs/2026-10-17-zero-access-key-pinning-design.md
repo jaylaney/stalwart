@@ -42,16 +42,12 @@ any item is written.
 
 ### 1.2 In scope
 
-- A per-account pin record, sealed under MK, mapping each contact address to
-  the public key the sender has sealed to (section 4).
-- The pin check in `za_fan_out`, for every sealed delivery: refusal with a
-  `3.8` schedule status on a mismatch, trust on first use otherwise
-  (section 5).
-- A self-check that derives an account's own public key from its private
-  key and repairs a substituted stored key (section 3.3).
-- Four password-verified endpoints under `/api/vault/contacts` for the
-  account page: list, look up, pin (with redelivery of refused messages)
-  and forget (section 6).
+- A pin record sealed under MK, mapping contact addresses to keys (section
+  4), and the pin check in `za_fan_out`: `3.8` on a mismatch, trust on
+  first use otherwise (section 5).
+- A self-check that repairs a substituted stored key of one's own (3.3).
+- Four password-verified endpoints under `/api/vault/contacts`: list, look
+  up, pin (redelivering refused changes) and forget (section 6).
 
 ### 1.3 Out of scope
 
@@ -77,15 +73,13 @@ any item is written.
 
 ## 2. Threat model additions
 
-**Claim.** Invitations, updates, cancellations and replies between key
-accounts are confidential against a store writer who substitutes public
-keys, for every contact the sender has pinned, including the first message
-to a contact the sender pinned on the page before that message. A message
-to a pinned address whose served key differs from the pin is not sealed to
-the served key and no item is written. Everything stays inside release 1's
-and release 2's trust model: sessions hold plaintext, native clients are
-unmodified, and background code needs no key (release 1 invariant 6). Pins
-are the sender's own data, sealed under the sender's MK.
+**Claim.** Scheduling messages between key accounts are confidential
+against a store writer who substitutes public keys, for every contact the
+sender has pinned, including the first message to a contact pinned on the
+page beforehand: a message to a pinned address whose served key differs is
+not sealed and no item is written. The trust model is release 1's and 2's
+(sessions hold plaintext, clients unmodified, background code keyless,
+release 1 invariant 6); pins are the sender's own data under its MK.
 
 **Limits, stated alongside the claim.**
 
@@ -114,13 +108,10 @@ are the sender's own data, sealed under the sender's MK.
    record is caught by the sender's self-check, which repairs it; messages
    others sealed to it before the repair are exposed unless their senders
    had pinned the sender.
-4. **Lookup reveals key accounts.** Any key account holder can look up any
-   local key account's fingerprint by address (section 6.3), which confirms
-   that the address is a key account; each lookup costs a full password
-   verification under the anonymous-request rate limit. Accepted.
-5. **The running server** holds plaintext and pins during a session, as in
-   release 1, and can seal to any key it likes; pins defend against the
-   store, not the process.
+4. **Lookup reveals key accounts** to any key account holder (section 6.3),
+   at a full password verification per lookup. Accepted.
+5. **The running server** holds plaintext and pins during a session and can
+   seal to any key; pins defend against the store, not the process.
 6. **Redelivery sends current state** (section 6.4), not the refused
    messages, so three things are lost: a whole-event CANCEL for a deleted
    event is dropped; a removal CANCEL (the event no longer names the
@@ -248,8 +239,8 @@ is inside; nothing precedes the nonce.
 | | `since` | `i64` | Unix seconds of the first refusal. |
 | | `refusal_id` | `u64` | 64 random bits, regenerated on every refusal of the entry (a new entry gets one too), so a redelivery removes exactly the refusal it consumed (section 6.4). |
 
-The entry stores no message: redelivery and the next ordinary delivery
-send the event's current state (sections 5.1 and 6.4). Entries are small.
+The entry stores no message; delivery rebuilds current state (sections 5.1
+and 6.4). Entries are small.
 The structs have a silent `Debug` (they hold addresses).
 
 ### 4.2 Reads and writes
@@ -379,7 +370,7 @@ and its served key (`resolve_inner`, from the `AccountCache` entry's
 | Pin record | Private-key wrap | Pin for the address | Served key | Outcome |
 |---|---|---|---|---|
 | opens | not read | present, no entry for this document | equal to the pin | deliver as today (`1.2`, or `5.1` on a write failure) |
-| opens | not read | present, an entry for this document | equal to the pin | deliver the full current state in place of upstream's message (below) and remove the entry |
+| opens | not read | present, an entry for this document | equal to the pin | deliver upstream's message, then the full current state if the relationship remains (below); retire the entry after both (section 5.2) |
 | opens | not read | present | different | refuse: no item, `3.8`, a withheld entry |
 | opens | not read | absent | any | pin the served key as `FirstUse`, then deliver |
 | absent or unusable | legacy | (none) | any | pin as `FirstUse` in a fresh record with the rewrap (one batch, section 4.4), then deliver |
@@ -395,16 +386,26 @@ failure. The comparison is a byte equality of public values. Recipients
 that are not internal (release 2 section 5.2) are not attempted and never
 pinned; non-key senders never reach `za_fan_out` (release 1 invariant 9).
 
-**Ordinary delivery retires an entry.** A fan-out delivering to an address
-that has a withheld entry for this document sends that recipient the full
-current state instead of upstream's message: the organizer's full REQUEST
-for that attendee, or the attendee's current-participation REPLY, built as
-in section 6.4 (a CANCEL already is the current state). The entry is
-removed in a pin-record write that follows the item write (section 5.2),
-so an item write failure (`5.1`, as any) leaves the entry in place for the
-next delivery or `contacts/pin`. Entries therefore drain by themselves
-once deliveries flow again, and `contacts/pin` redelivers only documents
-nobody edited since.
+**Delivery to an address with an entry.** A fan-out delivering to a
+pinned, same-key address with a withheld entry for this document writes
+two items for that recipient, in order: (1) upstream's own message for this
+change, exactly as without pins (a partial or full REQUEST, a partial or
+whole-event CANCEL, or the change's REPLY, a DELETE's DECLINED reply and
+its occurrence declines included); then (2) the full current state, only
+while the relationship remains after the change: for an organizer, the
+committed event still names the address (not after a whole-event CANCEL or
+a removal); for an attendee, the event still exists (not after a DELETE).
+(2) is the organizer's full REQUEST for that attendee
+(`organizer_request_full`) or the attendee's current-participation REPLY
+(section 6.4's helper), built from the state being committed, never from a
+superseded tree: the DELETE path tells `za_fan_out` its tree is the
+pre-deletion one. The entry is retired after every item of that recipient
+is written (section 5.2, phase 4). Upstream's message carries the intended
+change (an occurrence cancel, a DELETE's decline), the full state carries
+everything withheld, and nothing is derived from a tree that contradicts
+the action; the cost is a second item, only while an entry exists. An item
+write failure (`5.1`) leaves the entry, so entries drain once deliveries
+flow again and `contacts/pin` redelivers only documents nobody edited.
 
 ### 5.2 Order
 
@@ -421,11 +422,19 @@ runs in four phases:
    record once, conditionally (section 4.2), before any item. Under a
    legacy wrap that write is the atomic batch with the rewrap (section
    4.4), re-decided on a conflict.
-3. Write the items of the recipients decided "deliver".
-4. When a delivery retired a withheld entry (section 5.1), remove it in one
-   more conditional pin-record write, after its item was written; a
-   failure of this write leaves the entry, which the next delivery or
-   `contacts/pin` retires again, harmlessly.
+3. Write the items of the recipients decided "deliver", two for a
+   recipient with an entry (section 5.1).
+4. Retire the entries of recipients whose items were all written, in one
+   more conditional pin-record write. The one retirement rule, here and in
+   `contacts/pin` step 5: an entry is removed only when its stored
+   `refusal_id` still equals the id the delivery consumed (read in phase
+   1), checked on every write attempt, the retry after a conflict
+   included. Otherwise a newer refusal re-armed the entry, and it stays.
+   A failed or skipped retirement leaves the entry and never undoes a
+   written item. `za_fan_out` takes a `redelivery` flag from its caller;
+   `contacts/pin` sets it, and the fan-out then sends only the message it
+   was given (already the full state), adds no second item and retires
+   nothing: the endpoint's guarded step 5 is its only cleanup.
 
 Pinning first, a crash between the writes leaves a pin without a delivery
 (the next edit delivers), never a delivery without a pin. A fan-out whose
@@ -451,12 +460,11 @@ upstream's `3.7`); a PUT that builds no message for the address keeps it.
 
 ### 5.4 Failures
 
-- A pin record read failure (a store error), or a write that loses its
-  assertion twice or fails, is the delivery failure (`5.1`) of every
-  key-account recipient of that fan-out, as today's store errors are;
-  nothing is written for them. It is traced with the sender's account id
-  and a `zero-access:` description, without addresses. The sender's request
-  succeeds.
+- A pin record read failure, or a phase 2 write that loses its assertion
+  twice or fails, is the delivery failure (`5.1`) of every key-account
+  recipient of that fan-out, and nothing is written for them; it is traced
+  with the sender's account id and no address. A failed phase 4 retirement
+  is not a failure: the items stand and the entry stays (section 5.2).
 - A refusal is traced once per fan-out under the same event as the
   self-check (section 3.3), with the sender's account id and the count of
   refused recipients only: no address, no recipient account id (it would
@@ -476,7 +484,9 @@ a delivery whose source commit then failed; the next edit sends it again.
 - **Replies.** bob's reply seals to alice's key, so bob pins alice's
   address on his first reply. A refused reply puts `3.8` on the ORGANIZER
   of bob's copy and a withheld entry for (his copy's document id, alice's
-  address); redelivery sends a REPLY of bob's current participation.
+  address). bob's next ordinary reply sends that change's REPLY, then his
+  current participation (unless he deleted the event); `contacts/pin`
+  sends his current participation alone.
 - **Delegates.** The delegating merge fans out in the organizer's session
   (release 2 section 6.4), so the organizer's pins apply: a refused
   delegate gets `3.8` on its ATTENDEE in the organizer's event, where that
@@ -600,23 +610,23 @@ rest left for the next `contacts/pin`. For each entry, with its
    small fork helper over upstream's builder pieces (release 2's attendee
    export, `itip_build_envelope`; section 13, item 3).
 3. Run `za_fan_out` with that message, the loaded event as the sender's
-   tree and its current token pairs (`event_token_pairs`); it now finds
-   the pin and delivers.
+   tree, its current token pairs (`event_token_pairs`) and `redelivery`
+   set (section 5.2); it finds the pin and delivers.
 4. Write the status with `za_set_schedule_status` and reseal the event as
    the drain's merge does (`seal_event` with the returned pairs, under the
    assertion on the stored archive), with no schedule-tag change. A lost
    assertion re-reads and retries once; the entry counts as delivered once
    its item is written, whether or not its status was.
-5. Cleanup, one conditional pin-record write at the end: a delivered or
-   dropped entry is removed only if its `refusal_id` still equals the one
-   read at the start, on every retry of the write. Otherwise a newer
-   refusal arrived (or the entry was removed and recreated) during the
-   call; the entry stays and counts as `remaining`, not as delivered.
-   Failed entries stay withheld.
+5. Cleanup, one conditional pin-record write under section 5.2's
+   retirement rule (the `refusal_id` read at the start, every attempt): an
+   entry re-armed during the call stays and counts as `remaining`, not as
+   delivered. Failed entries stay withheld.
 
 Why current state: a full REQUEST covers every refused partial occurrence
 change and can never revert a newer successful delivery, and so does a
-current-participation REPLY. Its losses are section 2, limit 6 (a deleted
+current-participation REPLY. `contacts/pin` sends only the full state, since
+it makes no change of its own; when the relationship no longer exists the
+entry is dropped (step 1). Its losses are section 2, limit 6 (a deleted
 event's CANCEL is dropped because the token pairs and the lease need the
 event); after a real key change the contact did a fresh setup, so the copy
 those messages would have reached no longer exists, which the page says.
@@ -664,12 +674,10 @@ Success (200): `{"ok": true}`.
 
 ### 6.6 Flows (for api.md)
 
-- **Check or pre-pin a contact:** `contacts/lookup`, compare out of band
-  with the contact's own page, then `contacts/pin` (before the first
-  invitation, it protects that one too).
-- **A key changed:** `contacts` shows a differing `served_fingerprint` and
-  a `withheld` count; after checking, `contacts/pin` pins and redelivers.
-- **`record_missing`:** `contacts/forget` with null, or pin each contact.
+Check or pre-pin: `contacts/lookup`, compare out of band, `contacts/pin`.
+Key changed: `contacts` shows a differing `served_fingerprint` and a
+`withheld` count; `contacts/pin` pins and redelivers. `record_missing`:
+`contacts/forget` with null, or pin each contact.
 
 api.md's "What the page never sees" is unchanged: no key material is
 returned; fingerprints and addresses go only to the record's owner.
@@ -688,13 +696,11 @@ and the policy version do not change.
 
 ## 8. Error handling
 
-- Endpoints: api.md's body shapes and shared table, plus section 6's 409s.
-- Fan-out: section 5.4; the sender's request succeeds.
-- Self-check: a lost race is not retried; a store error is traced and the
-  request proceeds; release 2 section 10's private-key handling stands.
-- Redelivery: a failed entry stays withheld and counts as `failed`.
-- No new settings, event types, permissions or environment knobs; traces
-  carry `zero-access:` details and no key bytes, fingerprints or addresses.
+Endpoints use api.md's body shapes and shared table plus section 6's 409s;
+the fan-out follows section 5.4; a self-check race is not retried and a
+store error is traced; a failed redelivery entry stays withheld. No new
+settings, event types, permissions or knobs; traces carry `zero-access:`
+details and no key bytes, fingerprints or addresses.
 
 ## 9. Testing
 
@@ -712,16 +718,16 @@ master's and each override's PARTSTAT.
 **Integration.** A new za sub-module, `tests/src/za/pinning.rs`, run in
 `tests/src/za/mod.rs` after the drain modules and before the leak tests,
 with the drain on (`DrainOn`). Helpers in `tests/src/utils/za.rs`:
-`substitute_public_key` rewrites an account's `public_key` through
-`za_vault_record` and `za_vault_write` at the next revision, invalidates
-its `Account` and `AccessToken` caches and returns the original key; a
-wrap helper reports which associated data `private_key_wrap` opens under
-(MK from `za_unlock`), saves and restores the raw wrap bytes, and can
-rewrap it as legacy. New test hooks in `crates/common/src/za/test_hooks.rs`:
-`PIN_DECIDE_PAUSE` parks a fan-out after its pin-record and vault reads,
-`REDELIVER_CLEANUP_PAUSE` parks `contacts/pin` after its event commits and
-before its cleanup write, and `PIN_WRITE_FAIL_ONCE` fails one pin write.
-Cases, with alice, bob and carol as key accounts:
+`substitute_public_key` rewrites an account's `public_key` (`za_vault_write`,
+next revision, caches invalidated) and returns the original; a wrap helper
+reports which associated data the wrap opens under, saves and restores its
+bytes, and can rewrap it as legacy. New test hooks in
+`crates/common/src/za/test_hooks.rs`: `PIN_DECIDE_PAUSE` parks a fan-out after
+its pin-record and vault reads, `RETIRE_PAUSE` parks `za_fan_out` after a
+recipient's item writes and before phase 4 (reached by ordinary fan-outs and by
+`contacts/pin`'s inner call), `REDELIVER_CLEANUP_PAUSE` parks `contacts/pin`
+after its event commits and before its cleanup write, and `PIN_WRITE_FAIL_ONCE`
+fails one pin write. Cases, with alice, bob and carol as key accounts:
 
 1. First use under a legacy wrap: alice, with no record, invites bob; the
    item is delivered, alice holds a `FirstUse` pin for bob, and her wrap
@@ -757,12 +763,16 @@ Cases, with alice, bob and carol as key accounts:
     protection): save carol's legacy wrap, pin, change her password,
     restore only the wrap and delete the record: first use reopens while
     the new password keeps logging in.
-11. Ordinary delivery retires an entry: refuse bob's DECLINED reply; restore
-    alice's key; bob's ordinary ACCEPTED reply is delivered (bob's full
-    current participation) and drained; `contacts/pin` then finds no entry,
-    and alice still shows bob ACCEPTED. Likewise an organizer edit of the
-    same document to a pinned, same-key bob sends the full state and
-    retires the entry.
+11. Ordinary delivery retires an entry. Reply: refuse bob's DECLINED reply;
+    restore alice's key; bob's ordinary ACCEPTED reply delivers the REPLY
+    and his current participation; `contacts/pin` then finds no entry and
+    alice still shows bob ACCEPTED. Organizer: refuse alice's update to
+    occurrence A; restore bob's key; alice cancels occurrence B by an
+    ordinary edit; bob receives B's cancellation and A's update (the full
+    REQUEST), and the entry is retired only after both items. DELETE:
+    refuse bob's ACCEPTED; restore alice's key; bob deletes his event;
+    alice receives DECLINED, no full state follows, bob's source is
+    deleted, and the entry is retired after the decline.
 12. Partial changes: with bob's key substituted, alice changes occurrence A
     and then occurrence B (two refused partial updates); after
     `contacts/pin`, bob's event holds both changes.
@@ -781,7 +791,11 @@ Cases, with alice, bob and carol as key accounts:
     after its event commit, substitute bob's key, commit a newer refused
     PUT, release: the newer refusal stays and counts as `remaining`. Then
     two calls A and B both read entry W; B delivers and removes W; a newer
-    refusal recreates W; A's cleanup retry leaves the new W in place.
+    refusal recreates W; A's cleanup retry leaves the new W in place. With
+    `RETIRE_PAUSE`: park an ordinary fan-out after bob's item write, commit
+    a newer refusal, release: the newer `refusal_id` survives phase 4; the
+    same with `contacts/pin`'s inner fan-out parked, whose step 5 then
+    keeps the newer entry.
 18. Event identity: alice holds UID U in calendars A and B, both naming
     bob; only B's refused update is redelivered; refusals of both give two
     entries, each redelivered from its own document; a refused source
@@ -795,10 +809,8 @@ while its account exists, as it does 150.
 every principal property; a pin record holding canary addresses must show
 no hit.
 
-**CalDAV client CI** (`tests/caldav_client/`): server suite only. The
-substitution is a store write the client harness cannot make, and a client
-sees only a `3.8` parameter on its own event, which the server suite
-asserts; a client flow would only show that a client tolerates `3.8`.
+**CalDAV client CI** (`tests/caldav_client/`): server suite only; the
+harness cannot write the store, and a client sees only a `3.8` parameter.
 
 **Mutation checks** in the style of plan 7: replacing the key equality with
 `true` fails case 2; moving the pin write after the item writes fails case
@@ -807,9 +819,11 @@ keying entries by UID fails case 18; comparing a counter instead of
 `refusal_id` in the cleanup fails case 17; trying only the legacy
 associated data, or treating an absent record as first use whatever the
 wrap, fails case 6; letting the self-check create a record fails case 7;
-dropping the healing rewrap fails case 9; skipping the retirement on
-ordinary delivery fails case 11; redelivering upstream's partial message
-instead of the full REQUEST fails case 12; removing the fingerprint check
+dropping the healing rewrap fails case 9; retiring without the id check
+in phase 4 fails case 17; sending only the full state, or only
+upstream's message, on an ordinary delivery with an entry fails case 11;
+redelivering upstream's partial message instead of the full REQUEST fails
+case 12; removing the fingerprint check
 in `contacts/pin` fails case 4.
 
 ## 10. Invariants for implementers
@@ -819,8 +833,10 @@ Release 1's ten and release 2's five (11 to 15) hold. This spec adds:
 16. The pin record is sealed under MK. It is read and written only in a
     request that holds the owner's session keys; background code never
     reads it.
-17. Pins are compared before any item is written, and a mismatch writes no
-    item. The pin record write of a fan-out precedes its item writes.
+17. Pins are compared before any item is written, and a refusal writes no
+    item. A fan-out's phase 2 pin-record write precedes its item writes;
+    its retirement write follows them, and a failed retirement leaves the
+    entry without undoing an item.
 18. Pins are keyed by lowercased address, never by account id.
 19. The page's own fingerprint and the self-check derive the public key
     from the private key, never from the stored public key.
@@ -832,8 +848,11 @@ Release 1's ten and release 2's five (11 to 15) hold. This spec adds:
     `contacts/pin`) creates the account's first record, atomically with the
     rewrap, which is the moment the account becomes pinned. The self-check
     and the listing never create one.
-23. Entries are bound to the source document; redelivery and the next
-    ordinary delivery send current state, never a stored message.
+23. Entries are bound to the source document and never hold a message.
+    The next ordinary delivery sends upstream's message, then the full
+    current state while the relationship remains; `contacts/pin` sends the
+    full current state. An entry is retired only under its consumed
+    `refusal_id`.
 
 ## 11. Alternatives considered
 
@@ -843,13 +862,10 @@ Release 1's ten and release 2's five (11 to 15) hold. This spec adds:
 - **Pins keyed by account id.** Rejected: the writer controls the
   address-to-account mapping, and an id-keyed pin accepts a fresh account
   behind bob's address as first use (section 4.3).
-- **A `has_pins` bool in the vault record.** Rejected: the vault record is
-  not authenticated, so a writer clears the bool with a plain edit and
-  reopens first use. The wrap's associated data cannot be changed without
-  MK.
-- **A version 2 vault record layout** to carry such a marker. Rejected as
-  unnecessary once the associated data carries it, and it would have made
-  pinned accounts unreadable to an older binary.
+- **A `has_pins` bool in the vault record**, in a version 2 layout.
+  Rejected: the record is unauthenticated, so a writer clears the bool with
+  a plain edit, and a new layout locks older binaries out; the wrap's
+  associated data cannot change without MK.
 - **Binding the pinned wrap to the vault revision**, so a replayed wrap
   would not open. Rejected: every vault write (a password change, an
   app-password publication) would then need MK and a rewrap. **Binding it
@@ -862,10 +878,9 @@ Release 1's ten and release 2's five (11 to 15) hold. This spec adds:
   the losses of section 2, limit 6, instead.
 - **Fingerprints read from the stored key on both sides.** Rejected: the
   writer controls both and can make them agree (section 3.2).
-- **Failing the PUT on a mismatch.** Rejected: a generic client error with
-  no reason, an event that cannot be saved, every other attendee held back.
-  SCHEDULE-STATUS signals per recipient and the request succeeds, as
-  release 2 section 5.3 handles a per-recipient failure.
+- **Failing the PUT on a mismatch.** Rejected: a generic client error, an
+  unsaveable event, every attendee held back; SCHEDULE-STATUS signals per
+  recipient (release 2 section 5.3).
 - **Strict mode, no trust on first use.** Rejected: every new contact
   blocked until a page visit; pre-pinning gives strictness per contact.
 - **Asking the user to resend from the client.** Rejected: an unchanged
