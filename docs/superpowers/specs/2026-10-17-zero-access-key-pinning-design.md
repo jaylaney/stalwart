@@ -1,6 +1,6 @@
 # Zero-access calendar: key pinning for invitations design spec
 
-Date: 2026-10-17. Status: revision 11, draft for review. Scope: the follow-up
+Date: 2026-10-17. Status: revision 11, approved 2026-10-17. Scope: the follow-up
 to release 2 of the zero-access fork (jaylaney/stalwart) that release 2 spec
 section 2 records as a limit ("Key substitution"); GitHub issue #32.
 The revision history is in git.
