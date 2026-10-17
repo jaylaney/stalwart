@@ -77,7 +77,8 @@ pub fn lease_key(account_id: u32, uid: &str) -> Vec<u8> {
     key
 }
 
-/// The key range that holds every lease (plan 10's sweep iterates it).
+/// The key range that holds every lease (`sweep_expired_uid_leases`
+/// iterates it).
 pub fn lease_key_range() -> (ValueKey<ValueClass>, ValueKey<ValueClass>) {
     (
         ValueKey::from(lease_class(vec![KV_LOCK_ZA_UID])),
@@ -212,13 +213,13 @@ impl ZaUidLease {
         );
     }
 
-    /// Spec 6.3 step 4: clears the key if it still holds this holder's
-    /// value, so a holder never removes a successor's lease. Returns whether
-    /// the key is gone: cleared here, or already absent (plan 10's sweep
+    /// Spec 6.3 step 4: clears the key if it still holds this holder's value,
+    /// so a holder never removes a successor's lease. Returns whether the key
+    /// is gone: cleared here, or already absent (`sweep_expired_uid_leases`
     /// removed the expired lease, which after a fenced commit is benign and
-    /// not traced). A key holding another value, or a store
-    /// error, is traced and returns `false`; the key then expires and plan
-    /// 10's sweep removes it.
+    /// not traced). A key holding another value, or a store error, is traced
+    /// and returns `false`; the key then expires and
+    /// `sweep_expired_uid_leases` removes it.
     pub async fn release(self, store: &Store) -> bool {
         let mut batch = BatchBuilder::new();
         batch.assert_value(

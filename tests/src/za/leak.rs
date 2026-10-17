@@ -786,6 +786,12 @@ pub async fn test_drain(test: &mut TestServer) {
         !token_hits(test, &[token]).await.is_empty(),
         "the positive control: the pending reply's visible token"
     );
+    let pending_scan = scan(test, key1_id).await;
+    assert!(
+        pending_scan.violations.is_empty(),
+        "leaks while the reply is pending:\n{}",
+        pending_scan.violations.join("\n")
+    );
     assert_eq!(trigger_drain("key1@example.com", STRONG).await, 207);
     assert!(pending_ids(test, key1_id).await.is_empty());
     assert!(
@@ -797,6 +803,11 @@ pub async fn test_drain(test: &mut TestServer) {
         after_reply.violations.is_empty(),
         "leaks after the reply:\n{}",
         after_reply.violations.join("\n")
+    );
+    assert_eq!(
+        itip_tasks_for(test, key1_id).await + itip_tasks_for(test, key2_id).await,
+        0,
+        "the reply reached the task queue"
     );
     drop(held);
     test.wait_for_tasks().await;

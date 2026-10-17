@@ -1036,7 +1036,9 @@ impl SessionManager for HttpSessionManager {
 /// Spec section 10, "Traces": a key account's JMAP request and response
 /// bodies are never traced, since a request can carry the account's password
 /// (`x:AccountPassword/set`). Fails closed: a failed lookup counts as a key
-/// account.
+/// account, unlike `Server::za_is_key_account`'s gates, which fail open on an
+/// unknown id (`crates/common/src/auth/vault.rs`); a trace is the thing to
+/// withhold when in doubt.
 async fn za_jmap_untraced(server: &Server, account_id: u32) -> bool {
     server.za_is_key_account(account_id).await.unwrap_or(true)
 }

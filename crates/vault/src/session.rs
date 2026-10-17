@@ -5,9 +5,12 @@
  */
 
 use crate::keys::{KeyError, Secret, derive_event_key};
-use std::sync::{
-    OnceLock,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 /// Keys resident for one request (spec 5, "in-flight copies"). Cloned by
@@ -37,7 +40,59 @@ pub struct ZaDrainState {
     cursor: AtomicU64,
     /// Unix seconds; `0` when no deferral is in force.
     retry_after: AtomicU64,
-    pass: tokio::sync::Mutex<()>,
+    pass: tokio::sync::Mutex<PassState>,
+}
+
+/// Per-session bookkeeping of items that failed (invitations spec 6.2,
+/// "Skipped items"), held under the pass lock. A UID kept here is never
+/// traced.
+#[derive(Default)]
+pub struct PassState {
+    /// Drain failures of each item (by document id) in this session.
+    pub failures: HashMap<u32, u8>,
+    /// The first UID a failure of each item named, kept across failures.
+    pub uids: HashMap<u32, String>,
+    /// Items skipped after `DRAIN_ITEM_FAILURE_LIMIT` failures, with the
+    /// UID each named, if known: later items of that UID wait.
+    pub skipped: HashMap<u32, Option<String>>,
+    /// Items left pending behind a skipped item of their UID in this
+    /// session: not re-opened until a fresh session retries them.
+    pub waiting: HashSet<u32>,
+}
+
+impl PassState {
+    /// Records a failure; `true` when it reached the limit and the item is
+    /// now skipped, with the first UID any of its failures named.
+    pub fn record_failure(&mut self, document_id: u32, uid: Option<String>, limit: u8) -> bool {
+        if let Some(uid) = uid {
+            self.uids.entry(document_id).or_insert(uid);
+        }
+        let count = self.failures.entry(document_id).or_insert(0);
+        *count = count.saturating_add(1);
+        if *count >= limit {
+            self.skipped
+                .insert(document_id, self.uids.get(&document_id).cloned());
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn is_skipped(&self, document_id: u32) -> bool {
+        self.skipped.contains_key(&document_id)
+    }
+
+    pub fn is_waiting(&self, document_id: u32) -> bool {
+        self.waiting.contains(&document_id)
+    }
+
+    /// Whether a skipped item named `uid`.
+    pub fn blocks_uid(&self, uid: &str) -> bool {
+        self.skipped
+            .values()
+            .flatten()
+            .any(|skipped| skipped == uid)
+    }
 }
 
 const NO_CURSOR: u64 = u64::MAX;
@@ -47,7 +102,7 @@ impl ZaDrainState {
         ZaDrainState {
             cursor: AtomicU64::new(NO_CURSOR),
             retry_after: AtomicU64::new(0),
-            pass: tokio::sync::Mutex::new(()),
+            pass: tokio::sync::Mutex::new(PassState::default()),
         }
     }
 
@@ -76,7 +131,7 @@ impl ZaDrainState {
 
     /// One pass per session on a node (spec 6.3): a second request of the
     /// session waits for the running pass and then finds its cursor.
-    pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+    pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, PassState> {
         self.pass.lock().await
     }
 }

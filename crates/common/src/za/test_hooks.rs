@@ -17,6 +17,9 @@
 //! - `PUT_PAUSE`: in the CalDAV PUT handler right after the resource
 //!   snapshot (`fetch_dav_resources`), keyed by the account
 //!   (`dav::calendar::update`).
+//! - `COMMIT_PAUSE`: in the CalDAV PUT handler immediately before the key
+//!   account's leased create commits (`za_commit_create`), after the fan-out
+//!   and the seal.
 //! - `COMMIT_FAIL_ONCE`: the commit of a key account's PUT create fails once
 //!   with an internal error after its fan-out, keyed by the account
 //!   (`dav::calendar::za_commit_create`).
@@ -24,7 +27,6 @@
 //!   while it is held; global (`services::task_manager::manager`).
 //! - The lease-duration override: stands in for `ZA_UID_LEASE_SECS`, which
 //!   is read once per process.
-//!
 //! - `DRAIN_LOOKUP_PAUSE`: in the drain's import, after the first UID
 //!   lookup found nothing and before the creation lease, keyed by the
 //!   draining account (`groupware::calendar::drain`).
@@ -33,6 +35,16 @@
 //!   draining account.
 //! - `DRAIN_FAIL_ONCE`: the account's next drain commit fails with an
 //!   internal error (a transient item error, spec 6.5).
+//! - `PRIVATE_KEY_FAIL_ONCE`: the account's next private-key unwrap records
+//!   a failure, as a corrupt wrap would (`common::auth::vault`).
+//! - `DRAIN_ENUMERATE_FAIL_ONCE`: the account's next drain pass fails with an
+//!   internal error while enumerating, before any item is read.
+//! - `DRAIN_FAIL_ITEM`: every drain commit of the named (account, document
+//!   id) fails with an internal error until the slot is cleared (not
+//!   one-shot).
+//! - `DRAIN_READ_FAIL_ITEM`: the drain's re-read of the named (account,
+//!   document id) fails with an internal error until the slot is cleared
+//!   (not one-shot).
 //! - The drain skip: while an account is listed (or `DRAIN_SKIP_ALL` is),
 //!   its drain does not run; the za suite lists every account after setup
 //!   and the drain modules clear it for their duration.
@@ -64,6 +76,8 @@ pub static FAN_OUT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
 pub static PUT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
+pub static COMMIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
 /// Global: its `account_id` is ignored.
 pub static TASK_CONSUMER_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
@@ -76,6 +90,14 @@ pub static DRAIN_LEASE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
 /// The account whose next drain commit fails.
 pub static DRAIN_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+
+pub static PRIVATE_KEY_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+
+pub static DRAIN_ENUMERATE_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+
+pub static DRAIN_FAIL_ITEM: Mutex<Option<(u32, u32)>> = Mutex::new(None);
+
+pub static DRAIN_READ_FAIL_ITEM: Mutex<Option<(u32, u32)>> = Mutex::new(None);
 
 /// Accounts whose drain does not run; `DRAIN_SKIP_ALL` stands for every
 /// account.
@@ -99,6 +121,10 @@ pub fn set_fan_out_pause(pause: Option<Arc<Pause>>) {
 
 pub fn set_put_pause(pause: Option<Arc<Pause>>) {
     set_slot(&PUT_PAUSE, pause);
+}
+
+pub fn set_commit_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&COMMIT_PAUSE, pause);
 }
 
 pub fn set_task_consumer_pause(pause: Option<Arc<Pause>>) {
@@ -129,6 +155,28 @@ pub fn set_drain_fail_once(account_id: Option<u32>) {
     *DRAIN_FAIL_ONCE.lock().unwrap_or_else(|e| e.into_inner()) = account_id;
 }
 
+pub fn set_private_key_fail(account_id: Option<u32>) {
+    *PRIVATE_KEY_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn set_drain_enumerate_fail(account_id: Option<u32>) {
+    *DRAIN_ENUMERATE_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn set_drain_fail_item(item: Option<(u32, u32)>) {
+    *DRAIN_FAIL_ITEM.lock().unwrap_or_else(|e| e.into_inner()) = item;
+}
+
+pub fn set_drain_read_fail_item(item: Option<(u32, u32)>) {
+    *DRAIN_READ_FAIL_ITEM
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = item;
+}
+
 pub fn set_drain_skip(account_id: u32) {
     let mut skipped = DRAIN_SKIP.lock().unwrap_or_else(|e| e.into_inner());
     if !skipped.contains(&account_id) {
@@ -150,7 +198,10 @@ pub fn drain_skipped(account_id: u32) -> bool {
 }
 
 pub fn set_drain_retry_override(secs: Option<u64>) {
-    DRAIN_RETRY_OVERRIDE.store(secs.map_or(-1, |secs| secs as i64), Ordering::SeqCst);
+    DRAIN_RETRY_OVERRIDE.store(
+        secs.map_or(-1, |secs| i64::try_from(secs).unwrap_or(i64::MAX)),
+        Ordering::SeqCst,
+    );
 }
 
 pub fn drain_retry_override() -> Option<u64> {
@@ -194,6 +245,10 @@ pub async fn put_pause_point(account_id: u32) {
     wait(take_for(&PUT_PAUSE, account_id)).await;
 }
 
+pub async fn commit_pause_point(account_id: u32) {
+    wait(take_for(&COMMIT_PAUSE, account_id)).await;
+}
+
 pub async fn task_consumer_pause_point() {
     let pause = TASK_CONSUMER_PAUSE
         .lock()
@@ -218,4 +273,27 @@ pub fn take_drain_fail(account_id: u32) -> bool {
 /// Whether the commit of `account_id` must fail now; clears the flag.
 pub fn take_commit_fail(account_id: u32) -> bool {
     take_flag(&COMMIT_FAIL_ONCE, account_id)
+}
+
+/// Whether the account's next private-key unwrap must fail; clears the flag.
+pub fn take_private_key_fail(account_id: u32) -> bool {
+    take_flag(&PRIVATE_KEY_FAIL_ONCE, account_id)
+}
+
+/// Whether the account's next drain enumeration must fail; clears the flag.
+pub fn take_drain_enumerate_fail(account_id: u32) -> bool {
+    take_flag(&DRAIN_ENUMERATE_FAIL_ONCE, account_id)
+}
+
+/// Whether the drain commit of this item must fail; the slot stays set.
+pub fn drain_item_fails(account_id: u32, document_id: u32) -> bool {
+    *DRAIN_FAIL_ITEM.lock().unwrap_or_else(|e| e.into_inner()) == Some((account_id, document_id))
+}
+
+/// Whether the drain's re-read of this item must fail; the slot stays set.
+pub fn drain_read_fails(account_id: u32, document_id: u32) -> bool {
+    *DRAIN_READ_FAIL_ITEM
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        == Some((account_id, document_id))
 }

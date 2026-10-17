@@ -18,6 +18,7 @@ use super::{
     uid_lease::put,
 };
 use crate::utils::{
+    http::HttpRequest,
     server::TestServer,
     webdav::DummyWebDavClient,
     za::{
@@ -43,7 +44,7 @@ use common::{
 use groupware::calendar::{
     CalendarEvent, ChangedBy, EVENT_NOTIFICATION_IS_CHANGE, EVENT_NOTIFICATION_ZA_PENDING,
 };
-use hyper::StatusCode;
+use hyper::{Method, StatusCode};
 use serde_json::json;
 use std::time::Duration;
 
@@ -320,16 +321,51 @@ pub async fn test(test: &mut TestServer) {
         .await;
     admin.reload_settings().await;
 
+    // 6. A request for another account's data drains the caller's own inbox
+    // (spec 6.1; the comment at the drain's call in
+    // `crates/dav/src/request.rs`): key2's PROPFIND of key1's calendar
+    // home, whatever it answers, drains key2's pending item first.
+    let uid6 = "za-drain-6";
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &format!("{KEY1_CAL}drain-6.ics"),
+            [CONTENT_TYPE],
+            invite(uid6, START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(pending_ids(test, key2.id).await.len(), 1);
+    let status = HttpRequest::with_credentials(8899, key2.name, STRONG)
+        .send_full(
+            Method::from_bytes(b"PROPFIND").unwrap(),
+            "/dav/cal/key1%40example.com/",
+            None,
+            None,
+        )
+        .await
+        .status
+        .as_u16();
+    assert!(
+        status < 500,
+        "key2's request for key1's data answered {status}"
+    );
+    assert!(
+        pending_ids(test, key2.id).await.is_empty(),
+        "a request for another account's data did not drain the caller"
+    );
+    assert_eq!(uid_copies(test, key2.id, uid6).await, 1);
+
     // Cleanup: the copies with `Schedule-Reply: F` (no declined REPLY), the
     // organizer's events the same way, every item written here.
-    for uid in [uid, uid2, uid3] {
+    for uid in [uid, uid2, uid3, uid6] {
         let href = copy_href(test, key2.id, uid).await;
         key2.client
             .request_with_headers("DELETE", &href, [NO_REPLY], "")
             .await
             .with_status(StatusCode::NO_CONTENT);
     }
-    for name in ["drain-2", "drain-3"] {
+    for name in ["drain-2", "drain-3", "drain-6"] {
         key1.client
             .request_with_headers("DELETE", &format!("{KEY1_CAL}{name}.ics"), [NO_REPLY], "")
             .await
@@ -1146,6 +1182,59 @@ pub async fn test_reply(test: &mut TestServer) {
         "key3's copy does not list key3 delegated from key2: {copy9_key3_body}"
     );
 
+    // 10. The sender of a REPLY is resolved before its token is checked
+    // (spec 6.4 step 2): a REPLY naming key2 as the replier and carrying
+    // key2's real token, planted as if key3 had sent it, is history for a
+    // sender mismatch, not applied and not a forgery; key1's copy keeps
+    // key2's status from step 1.
+    let real_token = *stored_pairs(test, &keys1, key1.id, "default/drain-r1.ics")
+        .await
+        .expect("key1's pairs for drain-r1")
+        .get("key2@example.com")
+        .expect("key2's pair");
+    let misattributed = plant_inbox_item(
+        test,
+        key1.id,
+        &reply_tree(
+            "za-drain-r1",
+            "key1@example.com",
+            "key2@example.com",
+            "DECLINED",
+            0,
+        ),
+        PlantedItem::Pending {
+            pair: None,
+            reply_token: Some(real_token),
+        },
+        key3.id,
+        None,
+    )
+    .await;
+    assert_eq!(trigger_drain(key1.name, STRONG).await, 207);
+    let item = stored_item(test, key1.id, misattributed).await;
+    assert_eq!(
+        item.flags & EVENT_NOTIFICATION_ZA_PENDING,
+        0,
+        "the item is still pending"
+    );
+    assert_eq!(
+        item.flags & EVENT_NOTIFICATION_IS_CHANGE,
+        0,
+        "a misattributed reply was a change"
+    );
+    assert_eq!(item.event_id, None);
+    assert_eq!(
+        partstat_of(
+            &key1.client,
+            &format!("{KEY1_CAL}drain-r1.ics"),
+            "key2@example.com"
+        )
+        .await
+        .as_deref(),
+        Some("ACCEPTED"),
+        "a reply from the wrong principal applied"
+    );
+
     // Cleanup.
     for (party, uid) in [
         (&key2, uid),
@@ -1292,6 +1381,33 @@ pub async fn test_adoption(test: &mut TestServer) {
         "the reply under the new token did not apply"
     );
 
+    // The old token is a forgery now (spec 3.3, "Verification"): a reply
+    // planted under it is deleted and the copy's status stands.
+    let stale_token = plant_inbox_item(
+        test,
+        key1.id,
+        &reply_tree(uid, "key1@example.com", "key2@example.com", "DECLINED", 0),
+        PlantedItem::Pending {
+            pair: None,
+            reply_token: Some(token_1),
+        },
+        key2.id,
+        None,
+    )
+    .await;
+    assert_eq!(trigger_drain(key1.name, STRONG).await, 207);
+    assert!(
+        !inbox_ids(test, key1.id).await.contains(&stale_token),
+        "a reply under the replaced token was kept"
+    );
+    assert_eq!(
+        partstat_of(&key1.client, &organizer, "key2@example.com")
+            .await
+            .as_deref(),
+        Some("ACCEPTED"),
+        "a reply under the replaced token applied"
+    );
+
     // 2. Failed-create retry (spec 5.4): key1's first commit fails after
     // the fan-out wrote key2's item; the resend delivers a second item with
     // an equal SEQUENCE and a fresh token. key2 drains both in order: the
@@ -1433,10 +1549,16 @@ pub async fn test_lease(test: &mut TestServer) {
         both[0] < both[1] && both[1] == high[0],
         "the lower id arrived late: {both:?}"
     );
+    let waited = std::time::Instant::now();
     assert_eq!(
         trigger_drain(key2.name, &app).await,
         207,
         "session 2's request"
+    );
+    assert!(
+        waited.elapsed() >= Duration::from_secs(1),
+        "session 2 did not wait on the lease ({:?})",
+        waited.elapsed()
     );
     assert_eq!(
         pending_ids(test, key2.id).await.len(),
@@ -1703,10 +1825,16 @@ pub async fn test_lease(test: &mut TestServer) {
         trigger_drain(key1.name, STRONG),
     )
     .await;
+    let waited = std::time::Instant::now();
     assert_eq!(
         trigger_drain(key1.name, &app1).await,
         207,
         "session 2's request"
+    );
+    assert!(
+        waited.elapsed() >= Duration::from_secs(1),
+        "session 2 did not wait on the lease ({:?})",
+        waited.elapsed()
     );
     assert_eq!(
         new_inbox_items(test, key3.id, &before3).await.len(),
@@ -2250,6 +2378,11 @@ pub async fn test_errors(test: &mut TestServer) {
     let item = stored_item(test, key2.id, orphan).await;
     assert_eq!(item.flags & EVENT_NOTIFICATION_ZA_PENDING, 0);
     assert_eq!(item.event_id, None);
+    assert_eq!(
+        uid_copies(test, key2.id, "za-drain-e4").await,
+        0,
+        "an orphan reply created an event"
+    );
 
     // 4. The same UID in two calendars (Review Focus 2): key2 copies its
     // imported event into a second calendar; key1's update merges into the

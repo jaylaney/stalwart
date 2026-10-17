@@ -38,7 +38,13 @@
 //! holding no pair is not a participant and is kept as history; an
 //! iTIP-level rejection keeps the item as history, resealed, bit cleared.
 //! A pass that leaves any item pending does not advance the cursor and
-//! defers the next pass by `DRAIN_RETRY_SECS`.
+//! defers the next pass by `DRAIN_RETRY_SECS`. A pass attempts at most
+//! `DRAIN_PASS_CAP` items and, with more remaining, ends without a deferral
+//! so the next request continues. An item that failed
+//! `DRAIN_ITEM_FAILURE_LIMIT` times in the session is skipped for the
+//! session, traced once, and later items of its UID wait with it; neither
+//! holds the cursor nor is re-opened in this session. A private key that
+//! does not open suspends the session's drain for good (spec 10).
 //!
 //! Lease order: a drain holds its session lock and then may take a per-UID
 //! lease (an import, or a REPLY merge that fans out to delegates); the PUT
@@ -57,8 +63,8 @@ use crate::{
         EVENT_NOTIFICATION_IS_CHANGE,
         fanout::{ZaFanOut, za_set_schedule_status},
         seal::{
-            SealError, TOKEN_LEN, TokenPairs, archived_item_is_pending, open_pending_item,
-            seal_drained_item, seal_error, seal_event, unseal_event_pairs,
+            PendingCarriers, SealError, TOKEN_LEN, TokenPairs, archived_item_is_pending,
+            open_pending_item, seal_drained_item, seal_error, seal_event, unseal_event_pairs,
         },
         storage::ItipAutoExpunge,
     },
@@ -93,13 +99,53 @@ use types::{
     collection::{Collection, SyncCollection},
     field::CalendarEventField,
 };
-use vault::session::SessionKeys;
+use vault::session::{PassState, SessionKeys, ZaDrainState};
 use zeroize::Zeroizing;
 
 /// Spec 6.2: a pass that left an item pending is not retried before this
 /// many seconds have passed. A constant with a test-mode override, not a
 /// setting (spec 13).
 pub const DRAIN_RETRY_SECS: u64 = 30;
+/// Spec 6.2, "The cap": items one pass handles at most. A constant (spec 13).
+pub const DRAIN_PASS_CAP: usize = 32;
+/// Spec 6.2, "Skipped items": failures of one item in one session before
+/// the session skips it. A constant (spec 13).
+pub const DRAIN_ITEM_FAILURE_LIMIT: u8 = 3;
+/// Spec 10: a deferral no later request of the session passes.
+const PERMANENT_DEFERRAL: u64 = u64::MAX;
+
+/// What one item's drain left behind.
+enum ItemOutcome {
+    /// Rewritten or deleted.
+    Done,
+    /// Left pending; the pass stops here (a busy UID lease, spec 6.3).
+    LeftPending,
+    /// Left pending behind a skipped item of its UID; the pass goes on and
+    /// the session does not re-open it.
+    Waiting,
+}
+
+/// What a pass left behind.
+enum PassOutcome {
+    /// Every item is done, skipped, or waiting behind a skipped one.
+    Complete,
+    /// An item stays pending for a reason a later pass can clear.
+    LeftPending,
+    /// `DRAIN_PASS_CAP` items attempted, more remain: the next request
+    /// continues.
+    More,
+    /// The private key does not open: no later pass of this session.
+    Suspended,
+}
+
+/// An item's error with the UID it named, if the item got that far.
+struct ItemFailure {
+    err: trc::Error,
+    uid: Option<String>,
+    /// Whether the error is the item's own and counts toward
+    /// `DRAIN_ITEM_FAILURE_LIMIT` (spec 6.2, "Skipped items").
+    counts: bool,
+}
 
 pub trait ZaDrain: Sync + Send {
     /// Spec 6.1: drains the inbox of the account whose session keys these
@@ -137,10 +183,56 @@ fn drain_retry_secs() -> u64 {
 async fn drain_pass(server: &Server, keys: &Arc<SessionKeys>) -> trc::Result<()> {
     let account_id = keys.account_id;
     let state = keys.drain();
-    let _pass = state.lock().await;
+    let mut pass = state.lock().await;
     let now = now();
     if state.retry_after() > now {
         return Ok(());
+    }
+    let Some((snapshot, mut pending)) = (match enumerate(server, account_id, state).await {
+        Ok(enumerated) => enumerated,
+        // Spec 10: a store error before the match defers like one after it.
+        Err(err) => {
+            state.defer_until(now + drain_retry_secs());
+            return Err(err);
+        }
+    }) else {
+        return Ok(());
+    };
+    // Spec 6.2, "Skipped items": neither a skipped item nor one waiting
+    // behind it holds the cursor, and neither is re-opened in this session
+    // (a fresh session retries both).
+    pending.retain(|document_id| !pass.is_skipped(*document_id) && !pass.is_waiting(*document_id));
+    if pending.is_empty() {
+        state.complete(snapshot);
+        return Ok(());
+    }
+    match drain_items(server, keys, pending, &mut pass).await {
+        Ok(PassOutcome::Complete) => state.complete(snapshot),
+        Ok(PassOutcome::LeftPending) => state.defer_until(now + drain_retry_secs()),
+        // The next request continues from the cursor, at once.
+        Ok(PassOutcome::More) => {}
+        Ok(PassOutcome::Suspended) => state.defer_until(PERMANENT_DEFERRAL),
+        Err(err) => {
+            state.defer_until(now + drain_retry_secs());
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+/// Spec 6.2: the snapshot and the pending items, oldest first; `None` when
+/// the cursor is at the snapshot.
+async fn enumerate(
+    server: &Server,
+    account_id: u32,
+    state: &ZaDrainState,
+) -> trc::Result<Option<(u64, Vec<u32>)>> {
+    #[cfg(feature = "test_mode")]
+    if common::za::test_hooks::take_drain_enumerate_fail(account_id) {
+        return Err(trc::StoreEvent::UnexpectedError
+            .into_err()
+            .details("zero-access test hook: drain enumeration failure")
+            .caused_by(trc::location!()));
     }
     // The snapshot: the inbox change id observed before enumeration, from
     // the same since-query upstream runs for a request's own collection.
@@ -154,7 +246,7 @@ async fn drain_pass(server: &Server, keys: &Arc<SessionKeys>) -> trc::Result<()>
         .caused_by(trc::location!())?
         .highest_change_id;
     if state.cursor().is_some_and(|cursor| cursor >= snapshot) {
-        return Ok(());
+        return Ok(None);
     }
     let mut pending = Vec::new();
     for document_id in server
@@ -172,24 +264,7 @@ async fn drain_pass(server: &Server, keys: &Arc<SessionKeys>) -> trc::Result<()>
             pending.push(document_id);
         }
     }
-    if pending.is_empty() {
-        state.complete(snapshot);
-        return Ok(());
-    }
-    match drain_items(server, keys, pending).await {
-        Ok(true) => {
-            state.complete(snapshot);
-            Ok(())
-        }
-        Ok(false) => {
-            state.defer_until(now + drain_retry_secs());
-            Ok(())
-        }
-        Err(err) => {
-            state.defer_until(now + drain_retry_secs());
-            Err(err)
-        }
-    }
+    Ok(Some((snapshot, pending)))
 }
 
 async fn read_item(
@@ -208,26 +283,29 @@ async fn read_item(
         .caused_by(trc::location!())
 }
 
-/// Spec 6.4: the private key once, then each item in document id order.
-/// `Ok(true)` when every item is done; `Ok(false)` when one stays pending
-/// without an error (a busy UID lease): the pass stops at that item and the
-/// items after it stay pending, so later items for the same UID keep their
-/// order; `Err` on a transient error, which aborts the pass (6.5).
+/// Spec 6.4: the private key once, then each item in document id order,
+/// attempting at most `DRAIN_PASS_CAP` of them (an item found waiting
+/// behind a skipped one is not an attempt). A busy UID lease leaves its
+/// item pending and stops the pass there, so later items for the same UID
+/// keep their order; an item's error aborts the pass (6.5) until the item
+/// reaches `DRAIN_ITEM_FAILURE_LIMIT` failures in the session, when it is
+/// skipped and the pass goes on (6.2, "Skipped items").
 async fn drain_items(
     server: &Server,
     keys: &Arc<SessionKeys>,
     pending: Vec<u32>,
-) -> trc::Result<bool> {
+    pass: &mut PassState,
+) -> trc::Result<PassOutcome> {
     let account_id = keys.account_id;
     let private_key = match server.za_private_key(keys).await {
         Ok(key) => key,
         // A recorded failure (the wrap does not open, the record is missing
-        // or unusable) was traced once for the session and the drain is
-        // skipped (spec 10); a store error is not recorded, so it is traced
+        // or unusable) was traced once for the session and suspends its
+        // drain (spec 10); a store error is not recorded, so it is traced
         // by the caller and the next pass retries it.
         Err(err) => {
             return if keys.private_key().is_some() {
-                Ok(false)
+                Ok(PassOutcome::Suspended)
             } else {
                 Err(err)
             };
@@ -237,12 +315,46 @@ async fn drain_items(
         .account_info(account_id)
         .await
         .caused_by(trc::location!())?;
+    // Items attempted (done, left pending or failed); waiting ones are not.
+    let mut handled = 0;
     for document_id in pending {
-        if !drain_item(server, &account_info, keys, private_key, document_id).await? {
-            return Ok(false);
+        if handled == DRAIN_PASS_CAP {
+            return Ok(PassOutcome::More);
+        }
+        let outcome = drain_item(server, &account_info, keys, private_key, document_id, pass).await;
+        if !matches!(outcome, Ok(ItemOutcome::Waiting)) {
+            handled += 1;
+        }
+        match outcome {
+            Ok(ItemOutcome::Done) => {}
+            Ok(ItemOutcome::Waiting) => {
+                pass.waiting.insert(document_id);
+            }
+            Ok(ItemOutcome::LeftPending) => return Ok(PassOutcome::LeftPending),
+            Err(ItemFailure { err, uid, counts }) => {
+                // A failure before the UID is known is a store error on an
+                // archive `enumerate` read: it defers the pass, uncounted.
+                if !counts {
+                    return Err(err);
+                }
+                // Only the item's own error counts: neither a busy lease
+                // (`LeftPending`) nor `Waiting` reaches this arm.
+                if pass.record_failure(document_id, uid, DRAIN_ITEM_FAILURE_LIMIT) {
+                    // Spec 6.2, "Skipped items": traced once, then skipped
+                    // for the session; its UID's later items wait.
+                    trc::error!(
+                        err.account_id(account_id)
+                            .document_id(document_id)
+                            .details("zero-access: drain item skipped after repeated failures")
+                            .caused_by(trc::location!())
+                    );
+                } else {
+                    return Err(err);
+                }
+            }
         }
     }
-    Ok(true)
+    Ok(PassOutcome::Complete)
 }
 
 /// One pending item: what the rewrite, the deletion and the commit need.
@@ -274,30 +386,44 @@ enum Incoming {
     Reply(Zeroizing<[u8; TOKEN_LEN]>),
 }
 
-/// Spec 6.4 steps 1-5 for one item. `Ok(true)`: done (rewritten or
-/// deleted); `Ok(false)`: left pending (the lease was busy).
+/// Spec 6.4 steps 1-5 for one item. An error carries the item's UID once
+/// it is known, so a skipped item holds back the later items of its UID.
 async fn drain_item(
     server: &Server,
     account_info: &AccountInfo,
     keys: &SessionKeys,
     private_key: &vault::keys::Secret,
     document_id: u32,
-) -> trc::Result<bool> {
+    pass: &PassState,
+) -> Result<ItemOutcome, ItemFailure> {
     let account_id = keys.account_id;
+    #[cfg(feature = "test_mode")]
+    if common::za::test_hooks::drain_read_fails(account_id, document_id) {
+        return Err(no_uid(
+            trc::StoreEvent::UnexpectedError
+                .into_err()
+                .details("zero-access test hook: drain read failure"),
+        ));
+    }
     // Re-read (spec 6.3, "The pass"): an item that is gone, or that another
     // session drained, is skipped.
-    let Some(stored) = read_item(server, account_id, document_id).await? else {
-        return Ok(true);
+    let Some(stored) = read_item(server, account_id, document_id)
+        .await
+        .map_err(no_uid)?
+    else {
+        return Ok(ItemOutcome::Done);
     };
     let archived = stored
         .unarchive::<CalendarEventNotification>()
-        .caused_by(trc::location!())?;
+        .caused_by(trc::location!())
+        .map_err(no_uid)?;
     if !archived_item_is_pending(archived) {
-        return Ok(true);
+        return Ok(ItemOutcome::Done);
     }
     let mut item = stored
         .deserialize::<CalendarEventNotification>()
-        .caused_by(trc::location!())?;
+        .caused_by(trc::location!())
+        .map_err(no_uid)?;
     let ctx = ItemCtx {
         server,
         account_info,
@@ -312,7 +438,7 @@ async fn drain_item(
     // never changes, so nothing will ever read this item.
     let carriers = match open_pending_item(&mut item.event, account_id, private_key) {
         Ok(carriers) => carriers,
-        Err(err) => return ctx.delete_undecodable(seal_reason(&err)).await,
+        Err(err) => return item_outcome(ctx.delete_undecodable(seal_reason(&err)).await, None),
     };
     let tree = item.event;
     // An unknown or missing METHOD cannot come from the fan-out: permanent.
@@ -320,16 +446,62 @@ async fn drain_item(
         Ok(ICalendarMethod::Request) => Method::Request,
         Ok(ICalendarMethod::Cancel) => Method::Cancel,
         Ok(ICalendarMethod::Reply) => Method::Reply,
-        Ok(_) => return ctx.delete_undecodable("UnsupportedMethod").await,
-        Err(_) => return ctx.delete_undecodable("MissingMethod").await,
+        Ok(_) => return item_outcome(ctx.delete_undecodable("UnsupportedMethod").await, None),
+        Err(_) => return item_outcome(ctx.delete_undecodable("MissingMethod").await, None),
     };
     let (uid, candidates) = match itip_snapshot(&tree, account_info.addresses(), false) {
         Ok(snapshots) => (
             snapshots.uid.to_string(),
             sender_candidates(&snapshots, method),
         ),
-        Err(err) => return ctx.reject(tree, None, &err).await,
+        Err(err) => return item_outcome(ctx.reject(tree, None, &err).await, None),
     };
+    // Spec 6.2, "Skipped items": behind a skipped item of this UID, so a
+    // CANCEL never overtakes the REQUEST it cancels.
+    if pass.blocks_uid(&uid) {
+        return Ok(ItemOutcome::Waiting);
+    }
+    let result = apply(&ctx, tree, carriers, method, &uid, candidates).await;
+    item_outcome(result, Some(uid))
+}
+
+/// A failure before the item's UID is known: not counted (spec 6.2).
+fn no_uid(err: trc::Error) -> ItemFailure {
+    ItemFailure {
+        err,
+        uid: None,
+        counts: false,
+    }
+}
+
+/// `Ok(true)`: done; `Ok(false)`: left pending (the lease was busy).
+fn item_outcome(
+    result: trc::Result<bool>,
+    uid: Option<String>,
+) -> Result<ItemOutcome, ItemFailure> {
+    match result {
+        Ok(true) => Ok(ItemOutcome::Done),
+        Ok(false) => Ok(ItemOutcome::LeftPending),
+        Err(err) => Err(ItemFailure {
+            err,
+            uid,
+            counts: true,
+        }),
+    }
+}
+
+/// Spec 6.4 steps 2-5 for an opened item. `Ok(true)`: done (rewritten or
+/// deleted); `Ok(false)`: left pending (the lease was busy).
+async fn apply(
+    ctx: &ItemCtx<'_>,
+    tree: ICalendar,
+    carriers: PendingCarriers,
+    method: Method,
+    uid: &str,
+    candidates: Vec<String>,
+) -> trc::Result<bool> {
+    let server = ctx.server;
+    let account_id = ctx.keys.account_id;
     // Step 2: the sending address must resolve to the principal in
     // `changed_by`, the check upstream's ingest makes against a mail's
     // sender. A REQUEST or CANCEL names one candidate, its ORGANIZER; a
@@ -358,12 +530,12 @@ async fn drain_item(
     // Step 3, by METHOD. The UID lookup is upstream's (the fresh index);
     // the lowest document id is the copy that merges, as `itip_ingest`
     // takes the first hit.
-    let existing = find_event(server, account_id, &uid).await?;
+    let existing = find_event(server, account_id, uid).await?;
     match (method, existing) {
-        (Method::Request, None) => import(&ctx, tree, carriers.pair, &uid, sender_addresses).await,
+        (Method::Request, None) => import(ctx, tree, carriers.pair, uid, sender_addresses).await,
         (Method::Request, Some(event_id)) => {
             merge(
-                &ctx,
+                ctx,
                 event_id,
                 tree,
                 Incoming::Request(carriers.pair),
@@ -372,12 +544,12 @@ async fn drain_item(
             .await
         }
         (Method::Cancel, Some(event_id)) => {
-            merge(&ctx, event_id, tree, Incoming::Cancel, sender_addresses).await
+            merge(ctx, event_id, tree, Incoming::Cancel, sender_addresses).await
         }
         (Method::Reply, Some(event_id)) => match carriers.reply_token {
             Some(token) => {
                 merge(
-                    &ctx,
+                    ctx,
                     event_id,
                     tree,
                     Incoming::Reply(token),
@@ -1146,7 +1318,9 @@ impl ItemCtx<'_> {
         lease: Option<ZaUidLeaseGuard>,
     ) -> trc::Result<bool> {
         #[cfg(feature = "test_mode")]
-        if common::za::test_hooks::take_drain_fail(self.keys.account_id) {
+        if common::za::test_hooks::take_drain_fail(self.keys.account_id)
+            || common::za::test_hooks::drain_item_fails(self.keys.account_id, self.document_id)
+        {
             if let Some(lease) = lease {
                 lease.release().await;
             }
@@ -1361,6 +1535,48 @@ mod tests {
         assert!(is_stale_reply(&ranged, &snap(&occurrence_reply(0, 3))));
         assert!(!is_stale_reply(&ranged, &snap(&occurrence_reply(0, 2))));
         assert!(!is_stale_reply(&ranged, &snap(&occurrence_reply(1, 4))));
+    }
+
+    /// An event listing `del@example.com` once per delegator in
+    /// `delegators` (`DELEGATED-FROM`), each on its own ATTENDEE line.
+    fn delegated_by(delegators: &[&str]) -> ICalendar {
+        let lines = delegators
+            .iter()
+            .map(|delegator| {
+                format!(
+                    "ATTENDEE;PARTSTAT=NEEDS-ACTION;DELEGATED-FROM=\"mailto:{delegator}\":mailto:del@example.com\r\n"
+                )
+            })
+            .collect::<String>();
+        parse(&format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\nUID:stale-1\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990102T090000Z\r\nDTEND:20990102T100000Z\r\nSEQUENCE:0\r\nORGANIZER:mailto:org@example.com\r\n{lines}END:VEVENT\r\nEND:VCALENDAR\r\n"
+        ))
+    }
+
+    /// An address listed twice in one instance, once per delegator (two
+    /// different non-empty DELEGATED-FROM sets), keeps the union of them
+    /// whatever order the snapshot's attendee set yields the lines in.
+    #[test]
+    fn a_doubled_attendee_keeps_the_union_of_its_delegators() {
+        let org = organizer();
+        let before = delegated_by(&["a@example.com", "b@example.com"]);
+        let before = Attendance::of(&itip_snapshot(&before, &org, false).unwrap());
+        for delegator in ["a@example.com", "b@example.com"] {
+            let merged = delegated_by(&[delegator]);
+            let merged = itip_snapshot(&merged, &org, false).unwrap();
+            let del = merged
+                .components
+                .get(&InstanceId::Main)
+                .unwrap()
+                .attendees
+                .iter()
+                .find(|attendee| attendee.email.email == "del@example.com")
+                .unwrap();
+            assert!(
+                !before.is_new(None, del),
+                "the union lost delegator {delegator}"
+            );
+        }
     }
 
     #[test]
