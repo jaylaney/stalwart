@@ -13,7 +13,7 @@
 - Full verification: `cargo test -p vault -p groupware -p common`, then `za::za_tests`, then `webdav::webdav_tests` in both modes.
 - Manual client checklist: `docs/zero-access/manual-checklist.md`.
 - Known limits (spec 2): the running server holds plaintext while serving a request and receives the password on every CalDAV request; the authentication cache and the key cache are process-local and bounded (15 minutes idle, 60 minutes hard cap).
-- rustfmt: `cargo fmt -p <crate> -- --check` works for most crates; for http use `cargo fmt --manifest-path crates/http/Cargo.toml -- --check` (cargo rejects `-p http@0.16.25` for fmt).
+- rustfmt: `cargo fmt -p <crate> -- --check` works for most crates; for http use `cargo fmt --manifest-path crates/http/Cargo.toml -- --check` (cargo rejects `-p http@0.16.26` for fmt).
 - Never open upstream issues or PRs from this fork (see AGENTS.md).
 - Zero-access account API tests: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests`
 - CalDAV suite against key accounts: `STORE=RocksDb RUST_MIN_STACK=16777216 ZA_KEY_ACCOUNTS=1 cargo test -p tests webdav_tests`. In that mode the `acl`, `cal_alarm`, `cal_scheduling` and `copy_move` modules run the four key-mode variants in `tests/src/webdav/za_variants.rs` (`acl`, `alarm`, `scheduling`, `copy_move`) instead of skipping.
@@ -31,7 +31,7 @@
 
 ## Merging upstream
 
-The fork tracks Stalwart's tagged releases (base 0.16.25). Merge a release
+The fork tracks Stalwart's tagged releases (base 0.16.26). Merge a release
 tag, not the tip of `main`, about once per upstream minor version, with
 `git merge upstream/vX.Y.Z`; never rebase the published branch. Treat each
 merge as a small plan: scan what upstream changed in the hotspot files, merge,
@@ -75,7 +75,7 @@ fields and moves with them):
   enums.rs`) carry no fork edits; take upstream's version outright.
 
 Regression net after a merge, in this order: `cargo test -p vault`,
-`-p groupware`, `-p common`, `-p http@0.16.25 --features test_mode`;
+`-p groupware`, `-p common`, `-p http@0.16.26 --features test_mode`;
 `za_tests`; `webdav_tests` in baseline and `ZA_KEY_ACCOUNTS=1` mode; the
 product build warning-free in `vault`, `groupware`, `dav` and `http`. The
 key-account mode of the upstream suite is the real guard: it runs upstream's

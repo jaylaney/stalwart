@@ -2,20 +2,20 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-This is a fork of the Stalwart mail server (Rust, edition 2024, Cargo workspace, base 0.16.25). Jay is building a zero-access (encrypted-at-rest) calendar product on branch `zero-access`. Read `docs/superpowers/plans/README-dev.md` for developer notes and `docs/superpowers/plans/2026-10-06-zero-access-plan1-outcome.md` before touching fork code.
+This is a fork of the Stalwart mail server (Rust, edition 2024, Cargo workspace, base 0.16.26). Jay is building a zero-access (encrypted-at-rest) calendar product on branch `zero-access`. Read `docs/superpowers/plans/README-dev.md` for developer notes and `docs/superpowers/plans/2026-10-06-zero-access-plan1-outcome.md` before touching fork code.
 
 ## Commands
 
 Every shell command that uses cargo must start with `export PATH="/opt/homebrew/opt/rustup/bin:$PATH"` (Homebrew's keg-only rustup; Claude Code's shell is non-interactive, so the zshrc PATH does not apply).
 
-- Product build (shipping configuration, never the `enterprise` feature): `cargo build --release -p stalwart --no-default-features --features rocks`. Add other store backends by name (`sqlite`, `postgres`, `mysql`, ...). For a local manual-test binary, prefix the same command with `CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`: the release profile's fat LTO and single codegen unit end in a long single-threaded tail, which this parallelises; the binary is slightly larger and slower, and switching between the two settings rebuilds from scratch. `-p http` is ambiguous in this workspace; use `-p http@0.16.25`.
-- Unit tests: `cargo test -p vault`, `cargo test -p common`, `cargo test -p http@0.16.25 --features test_mode`. `cargo test -p common --features test_mode` without `enterprise` fails to compile upstream (telemetry test data); the `tests` crate enables both.
+- Product build (shipping configuration, never the `enterprise` feature): `cargo build --release -p stalwart --no-default-features --features rocks`. Add other store backends by name (`sqlite`, `postgres`, `mysql`, ...). For a local manual-test binary, prefix the same command with `CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16`: the release profile's fat LTO and single codegen unit end in a long single-threaded tail, which this parallelises; the binary is slightly larger and slower, and switching between the two settings rebuilds from scratch. `-p http` is ambiguous in this workspace; use `-p http@0.16.26`.
+- Unit tests: `cargo test -p vault`, `cargo test -p common`, `cargo test -p http@0.16.26 --features test_mode`. `cargo test -p common --features test_mode` without `enterprise` fails to compile upstream (telemetry test data); the `tests` crate enables both.
 - Integration tests live in the `tests` crate and need `STORE=RocksDb RUST_MIN_STACK=16777216`. Each suite is ONE test function that runs its sub-modules in order against one server; you select the suite by filter and cannot select a sub-module:
   - `cargo test -p tests za_tests -- --nocapture`: zero-access account API, caches, CORS, registry refusals.
   - `webdav_tests`: upstream CalDAV/CardDAV suite. `ZA_KEY_ACCOUNTS=1` runs it with every user provisioned as a key account.
   - Others: `system_tests`, `imap_tests`, `jmap_tests`, etc. There is no `smtp_tests` suite: the SMTP tests are individual functions that CI runs with `cargo test -p tests smtp`. `system_tests` is timing-flaky locally (OIDC, quota and antispam sub-tests fail one at a time); `directory_tests` needs a Docker OpenLDAP container.
   - Upstream's `cal_itip` sub-test of `webdav_tests` is timing-flaky (DTSTAMP index mismatch, `tests/src/webdav/cal_itip.rs`); rerun once before treating a failure there as a regression. CI reruns each CalDAV step once.
-- rustfmt: `cargo fmt -p <crate> -- --check`; for the http crate cargo rejects `-p http@0.16.25` for fmt, so use `cargo fmt --manifest-path crates/http/Cargo.toml -- --check`. Workspace lints are strict; build output must stay warning-free for new code.
+- rustfmt: `cargo fmt -p <crate> -- --check`; for the http crate cargo rejects `-p http@0.16.26` for fmt, so use `cargo fmt --manifest-path crates/http/Cargo.toml -- --check`. Workspace lints are strict; build output must stay warning-free for new code.
 - Local manual run: tracked scripts in `scripts/local-server/` (its `README.md` has the first-run steps; `env.sh` holds the shared settings), with per-machine state (data store, `local.env`, `tls/`, logs) in the git-ignored `.run/` by default (`ZA_RUN_DIR` overrides). First boot is `start-recovery.sh` then `provision.sh`; afterwards `start.sh`. `--config` takes a JSON data-store file (`{"@type":"RocksDb","path":...}`); a missing file means web bootstrap mode. `STALWART_RECOVERY_ADMIN=user:pass` sets a fallback admin.
 
 ## Repository rules (AGENTS.md, CONTRIBUTING.md)
