@@ -24,7 +24,8 @@ Use stable Rust. On this Mac, prepend Cargo commands with
 - With the same environment, run `cargo test -p tests webdav::webdav_tests`; repeat with
   `ZA_KEY_ACCOUNTS=1` to cover encrypted accounts.
 
-For this checkout's local server, use the git-ignored `.run/` scripts: first
+For this checkout's local server, use the scripts in `scripts/local-server/` (see the
+README there), with state in the git-ignored `.run/` by default: first
 `start-recovery.sh`, then `provision.sh`; subsequent starts use `start.sh`.
 
 ## Coding Style & Naming Conventions

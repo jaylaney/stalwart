@@ -7,12 +7,15 @@
 #
 
 # Run against the recovery-mode server (start-recovery.sh, plain HTTP on 127.0.0.1:8080).
-# Creates, through the registry JMAP API as the fallback admin: three listeners (http 8080 and
-# imap 1143, both plain; https 8443 with TLS), the certificate from $ZA_RUN_DIR/tls (made by
-# tls-cert.sh) set as the default certificate, the domain example.com, and a user
+# Creates, in this order, through the registry JMAP API as the fallback admin: three listeners
+# (http 8080 and imap 1143, both plain; https 8443 with TLS), the domain example.com, the
+# certificate from $ZA_RUN_DIR/tls (made by tls-cert.sh), one update of the settings singleton
+# (default certificate, default domain example.com, default hostname), and a user
 # alice@example.com with NO password credential (eligible for the zero-access setup flow).
 # If PLAIN_PASS is set it also creates the ordinary account plain@example.com with that
 # password (the control account of the gating checks).
+# ZA_HOSTNAME is the default hostname (default mail.example.com); the server requires a
+# dotted name there and refuses "localhost".
 # Idempotent enough to rerun: duplicates are refused.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"
@@ -46,17 +49,24 @@ echo "listener http 8080: $(jmap_create NetworkListener '{"name":"http","bind":{
 echo "listener imap 1143: $(jmap_create NetworkListener '{"name":"imap","bind":{"[::]:1143":true},"protocol":"imap","useTls":false,"tlsImplicit":false}' | created_id)"
 echo "listener https 8443: $(jmap_create NetworkListener '{"name":"https","bind":{"[::]:8443":true},"protocol":"http","useTls":true,"tlsImplicit":true}' | created_id)"
 
+DOMAIN_ID=$(jmap_create Domain '{"name":"example.com","isEnabled":true,"description":"Zero-access test domain"}' | created_id)
+echo "domain example.com: $DOMAIN_ID"
+
 # issuer and subjectAlternativeNames are server-set and refused on create.
 CERT_JSON=$(python3 -I -c 'import json,sys; print(json.dumps({"certificate":{"@type":"File","filePath":sys.argv[1]},"privateKey":{"@type":"File","filePath":sys.argv[2]}},separators=(",",":")))' "$CERT" "$KEY")
 CERT_ID=$(jmap_create Certificate "$CERT_JSON" | created_id)
 echo "certificate $CERT: $CERT_ID"
-case "$CERT_ID" in
-  ERROR:*) echo "default certificate: skipped (no certificate id)" ;;
-  *) echo "default certificate: $(jmap_call 'x:SystemSettings/set' "\"update\":{\"singleton\":{\"defaultCertificateId\":\"$CERT_ID\"}}" | updated_ok)" ;;
+
+# A fresh store requires a default certificate, domain and hostname before the settings are valid.
+HOSTNAME_DEFAULT="${ZA_HOSTNAME:-mail.example.com}"
+case "$CERT_ID$DOMAIN_ID" in
+  *ERROR:*) echo "settings (default certificate, domain, hostname): skipped (no certificate id or domain id)" ;;
+  *)
+    SETTINGS_JSON=$(python3 -I -c 'import json,sys; print(json.dumps({"singleton":{"defaultCertificateId":sys.argv[1],"defaultDomainId":sys.argv[2],"defaultHostname":sys.argv[3]}},separators=(",",":")))' "$CERT_ID" "$DOMAIN_ID" "$HOSTNAME_DEFAULT")
+    echo "settings (default certificate, domain example.com, hostname $HOSTNAME_DEFAULT): $(jmap_call 'x:SystemSettings/set' "\"update\":$SETTINGS_JSON" | updated_ok)"
+    ;;
 esac
 
-DOMAIN_ID=$(jmap_create Domain '{"name":"example.com","isEnabled":true,"description":"Zero-access test domain"}' | created_id)
-echo "domain example.com: $DOMAIN_ID"
 USER_JSON="{\"@type\":\"User\",\"name\":\"alice\",\"domainId\":\"$DOMAIN_ID\",\"credentials\":{},\"description\":\"Alice (zero-access test)\"}"
 echo "user alice@example.com (no password): $(jmap_create Account "$USER_JSON" | created_id)"
 

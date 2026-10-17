@@ -47,7 +47,7 @@ All paths below are relative to the repository root.
    export STALWART_RECOVERY_ADMIN=admin:<password>
    ```
 
-   Optional lines for the later steps: `export PLAIN_PASS=...` (`provision.sh` creates the control account with it in step 5, and `gatecheck3.sh` reads it), `export ALICE_PASS=...` (alice's password after her setup flow; `gatecheck3.sh`), `export SMOKE_PASS=...` (`smoke.sh`). `local.env` is sourced by `env.sh`, so it wins over the environment.
+   Optional lines for the later steps: `export ZA_HOSTNAME=...` (the default hostname `provision.sh` sets in step 5; default `mail.example.com`; the server wants a dotted name and refuses `localhost`), `export PLAIN_PASS=...` (`provision.sh` creates the control account with it in step 5, and `gatecheck3.sh` reads it), `export ALICE_PASS=...` (alice's password after her setup flow; `gatecheck3.sh`), `export SMOKE_PASS=...` (`smoke.sh`). `local.env` is sourced by `env.sh`, so it wins over the environment.
 
 4. Start the server in recovery mode (first boot only). It stays in the foreground and listens on plain HTTP at `127.0.0.1:8080`:
 
@@ -61,7 +61,7 @@ All paths below are relative to the repository root.
    scripts/local-server/provision.sh
    ```
 
-   It creates the listeners, registers the certificate, and creates the domain and accounts listed below. Each result is printed.
+   It creates the listeners, the domain, the certificate and the settings update (default certificate, default domain and default hostname, which a fresh store needs), then the accounts listed below. Each result is printed.
 
 6. Stop the recovery server (Ctrl-C in its terminal).
 
@@ -112,15 +112,15 @@ All scripts load `env.sh` first.
   - Reads: `ZA_RUN_DIR`, `ZA_TLS_EXTRA_SAN`.
 - `start-recovery.sh`: first boot in recovery mode, one plain-HTTP listener on 8080, no listeners written. Runs from `$ZA_RUN_DIR`.
   - Reads: the `env.sh` variables.
-- `provision.sh`: against the recovery server, through the registry JMAP API as the fallback admin, creates the `http`, `imap` and `https` listeners, a `Certificate` from `$ZA_RUN_DIR/tls/` set as the default certificate, the domain `example.com`, the user `alice` with no credentials, and, only when `PLAIN_PASS` is set, the user `plain` with that password. Refuses to run if the certificate files are missing.
-  - Reads: the `env.sh` variables, `PLAIN_PASS` (optional).
+- `provision.sh`: against the recovery server, through the registry JMAP API as the fallback admin, creates, in this order, the `http`, `imap` and `https` listeners, the domain `example.com`, a `Certificate` from `$ZA_RUN_DIR/tls/`, one update of the settings singleton (default certificate, default domain `example.com`, default hostname), the user `alice` with no credentials, and, only when `PLAIN_PASS` is set, the user `plain` with that password. The settings update is skipped with a message if the certificate or the domain could not be created. Refuses to run if the certificate files are missing.
+  - Reads: the `env.sh` variables, `ZA_HOSTNAME` (optional; the default hostname, default `mail.example.com`), `PLAIN_PASS` (optional).
 - `start.sh`: normal mode, listeners from the registry. Runs from `$ZA_RUN_DIR`.
   - Reads: the `env.sh` variables.
 - `smoke.sh [localpart] [password]`: end-to-end zero-access flow for a fresh user (setup token, setup, CalDAV, app password, password change, recovery key, refusal of registry credential edits). The password is the second argument, else `SMOKE_PASS`, else a random one. Passwords and recovery keys are never printed.
   - Reads: the `env.sh` variables, `SMOKE_PASS` (optional).
 - `gatecheck.sh [address]`: tries to reach a key account's calendar as the admin and through the master-user path; expects 403/405 (default `alice@example.com`).
   - Reads: the `env.sh` variables.
-- `gatecheck3.sh`: the plan 3 gating checks over `curl` (scheduling and sharing are off for key accounts, no JMAP calendars capability, invitations between a key and an ordinary account leave the inboxes empty). Check 6's propstat parsing is a text heuristic.
+- `gatecheck3.sh`: the release 1 (plan 3) gating checks over `curl`. Its expectations are historical until the script is updated: plan 10 reopened the scheduling gates, so key accounts now get the auto-schedule `OPTIONS` header and the scheduling URLs on their principal, and checks 1 and 6 differ from the script's expectations by design; the invitation checks 8 and 9 predate release 2's invitations. Check 6's propstat parsing is a text heuristic.
   - Reads: the `env.sh` variables, `ALICE_PASS` and `PLAIN_PASS` (both required).
 - `leakcheck.sh <word>...`: greps `$ZA_RUN_DIR/rocks.db` for words that must not be at rest and reports how many data files contain each. Sealed content: 0. The `X-ZA-KEY` marker must appear once a key account has written, and a non-key account's event title (the positive control) must show up.
   - Reads: the `env.sh` variables.
