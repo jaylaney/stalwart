@@ -102,6 +102,8 @@ What stays open after this plan:
 - (plan 11 final review m6) One corrupt or truncated inbox archive fails `enumerate` in every session for good, and the failure limit never reaches it, so the account's drain stops, traced once per backoff. It predates plan 11; a skip with a trace inside `enumerate`, or a spec note in 6.5 or 10, is the fix shape.
 - (plan 11 final review m5) `drain_limits` steps 3 and 5 leave `skipped` and `waiting` entries in key2's password session for the rest of the suite, because the key-cache entry outlives the module; a later module reusing those UIDs with key2's password would see its items wait. Running steps 3 and 5 on app-password sessions would remove the coupling.
 - (plan 11 final review m8) `update.rs`'s `za_lease.take().expect(..)` at the lost-fence arm cannot fire (the arm needs a lease); a `let Some(..) else` falling through to the plain error would remove the panic path.
+- (plan 11 fix-wave re-review) `record_failure` keeps the first UID an item's failures named (`PassState.uids`), and no test or mutation pins that retention.
+- (plan 11 fix-wave re-review, accepted) A deterministic failure before an item's UID is known (the re-read or the decode, which ruling R11 does not count) defers every pass of the session at that item, so the session's drain stalls there until a fresh session; the same shape as plan 10's deferred (b).
 - The plan 10 note's other deferred items that plan 11 did not resolve stay as listed there (its "Deferred findings" now opens with a pointer to this note).
 
 The minors this plan's task reviews deferred, verbatim from the ledger, each deferred to the final review of plan 11. The final whole-branch review fixed some of them; those carry "fixed in" at their end.
