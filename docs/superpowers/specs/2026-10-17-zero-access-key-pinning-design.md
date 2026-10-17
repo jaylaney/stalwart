@@ -1,6 +1,6 @@
 # Zero-access calendar: key pinning for invitations design spec
 
-Date: 2026-10-17. Status: revision 6, draft for review. Scope: the follow-up
+Date: 2026-10-17. Status: revision 11, draft for review. Scope: the follow-up
 to release 2 of the zero-access fork (jaylaney/stalwart) that release 2 spec
 section 2 records as a limit ("Key substitution"); GitHub issue #32.
 The revision history is in git.
@@ -88,8 +88,8 @@ data under its MK.
    refused with `3.8`, and alice's page shows the mismatch. The fresh read
    also makes a substitution effective at once for an unpinned contact (the
    cache gave no protection a writer could not wait out). After
-   `forget(address)`, the next first-use delivery sends item (1) and the
-   withheld full state (section 5.1) to the served key (section 6.5).
+   `forget(address)`, the next first-use delivery sends the withheld full
+   state and the change's messages to the served key (sections 5.1, 6.5).
 2. **Replay.** The wrap mark (section 4.4) defends against deletion of the
    pin record, not against replay. A writer holding any earlier copy of
    field 151, the empty record `forget(null)` writes included, reverts the
@@ -121,7 +121,19 @@ data under its MK.
    decline whose attendee deletes the copy while the organizer's key still
    mismatches (with a match the DELETE delivers DECLINED); and the
    organizer's VALARMs on a refused first invitation that `contacts/pin`
-   redelivers (built with `is_first_request` false).
+   redelivers (built with `is_first_request` false). Also lost: an earlier
+   removal (a later full REQUEST holding the override for another attendee
+   replaces its STATUS and reactivates it: upstream parity, more frequent
+   while an entry exists); a withheld REPLY's change,
+   a delegation included, when an organizer REQUEST touching that instance
+   reaches the attendee first (the merge resets the attendee's lines to the
+   organizer's view, which is then redelivered and the entry retired;
+   upstream's crossing race made sequential); and the whole redelivered
+   REPLY, the recorded master's change with it, when one recorded override
+   lost its removal CANCEL (it passes the helper's rules, and the organizer
+   rejects the reply, `SenderIsNotParticipant` or the stale check first;
+   when it deleted the override instead, it applies the reply and gains a
+   stub override without DTSTART).
 7. **Out-of-order arrival.** A redelivery and a concurrent ordinary
    delivery can reach the recipient out of order, as can an item arriving
    between `contacts/pin`'s drain pass and its build. A SEQUENCE bump is
@@ -130,11 +142,35 @@ data under its MK.
    until the organizer's next edit, narrowed by section 6.4 step 4's
    not-retired rule; a REPLY is unprotected until the attendee's next
    change. Upstream shares the gap (`handle_reply` has no timestamp check).
+   A redelivered instance the attendee delegated (the master or an
+   override; under `all`, every delegated instance; section 4.1) carries the
+   delegate's line as the attendee's copy holds it, possibly behind the
+   organizer (a REPLY reaches only the organizer, so a delegator learns the
+   delegate's status only from the organizer's next REQUEST): parity with
+   upstream's REPLY in content, not in time.
 8. **Generation bumps.** Pinning costs one bump; each repair and each heal
    (section 4.4) another. A writer who keeps substituting the account's own
    key forces one per new session, logging its other devices out each time:
    availability, not confidentiality, and simpler denials exist; repairs
    are not bounded.
+9. **Pre-reconciliation backlog.** A recipient one ahead on an override
+   from a partial sent before the reconciliation (section 5.1) rejects the
+   first redelivery as `OutOfSequence`; the entry is retired and the
+   backlog lost until the organizer's next full edit. It reopens when a
+   PUT's commit fails after its items (update fan-outs take no fence). A
+   client writing back a lower SEQUENCE would reopen it too; the SEQUENCE
+   floor (section 5.1) closes that (upstream keeps the exposure; we do not
+   report it).
+10. **Stale replies after reconciliation.** Release 2's `is_stale_reply`
+    compares a REPLY with the organizer's governing component, which now
+    carries the partial's SEQUENCE, so a REPLY from an attendee who did not
+    apply that partial (pending, `5.1`, `3.8`, excluded from updates as
+    DECLINED or RSVP=FALSE, or not sent a new override because its PARTSTAT is
+    not NEEDS-ACTION, `send_invite_messages`) is stale where release 2 accepted
+    it, as release 2 already does after a full update. RFC 5546 treats it as
+    stale; the attendee's client shows its answer, the organizer's does not.
+    The floor keeps raised values, so such a reply stays stale until the
+    attendee applies a newer message.
 
 **Visible metadata added** (beyond release 2 section 2):
 
@@ -250,12 +286,15 @@ is inside; nothing precedes the nonce.
 | | `address` | `String` | The refused recipient's address, normalized as pins are (section 4.3). |
 | | `since` | `i64` | Unix seconds of the first refusal. |
 | | `refusal_id` | `u64` | 64 random bits, regenerated on every refusal of the entry (a new entry gets one too), so a delivery retires exactly the refusal it consumed (section 5.2, phase 4). |
+| | `instances` | `ZaInstances` | Attendee-side entries only: the instance keys of the refused REPLYs, `master: bool`, `keys: Vec<(i64, bool)>` (the drain's `InstanceKey`: the RECURRENCE-ID resolved to a UTC instant with the REPLY tree's own VTIMEZONEs, and the THISANDFUTURE flag; not upstream's `InstanceId`, whose `RecurrenceId` carries a positional entry id, and not the RECURRENCE-ID text) and `all: bool`. Every refused REPLY unions its scheduling components in. The master does not count toward the 64-key cap; past it `all` is set, meaning every qualifying instance, and `keys` is cleared and stays empty. Organizer-side entries leave it empty. |
 
-An entry's identity is (`document_id`, `uid`, `address`): document ids are
-a monotonic per-account counter never reused, a MOVE keeps the id and a
-COPY gives one document two names, so no calendar id is part of it. An
-entry holds no message (delivery rebuilds current state, sections 5.1 and
-6.4) and is small. The structs have a silent `Debug` (they hold addresses).
+An entry's identity is (`document_id`, `uid`, `address`): document ids are a
+monotonic per-account counter never reused, a MOVE keeps the id and a COPY
+gives one document two names, so no calendar id is part of it. An entry holds
+no message (delivery rebuilds current state, sections 5.1 and 6.4) and is
+small. Organizer-side entries record no instances: the full REQUEST alone
+reconciles the copy (`is_full_update` removals) and imports a never-received
+copy whole. The structs have a silent `Debug` (they hold addresses).
 
 ### 4.2 Reads and writes
 
@@ -426,7 +465,8 @@ A refusal writes no item for the recipient, sets its property (the
 ATTENDEE, or the ORGANIZER when `on_organizer`) to `3.8` through
 `za_set_schedule_status`, and records a withheld entry for (source
 `document_id`, `uid`, address) with a fresh `refusal_id`, or gives the
-existing entry a fresh one (section 4.1). A deletion's fan-out records no
+existing entry a fresh one; a refused REPLY also unions its instances into
+the entry (section 4.1). A deletion's fan-out records no
 entry, since nothing can be redelivered from a deleted document (section
 5.2, phase 4). The sender's request succeeds and the other recipients are
 delivered to, as release 2 section 5.3 handles a per-recipient failure.
@@ -436,46 +476,102 @@ non-key senders never reach `za_fan_out` (release 1 invariant 9). A
 "deliver" decision records no entry.
 
 **The two-item rule.** A fan-out delivering to an address with a withheld
-entry for this document writes up to two items for that recipient, in
-order:
+entry for this document writes, in order, the full state and then
+upstream's messages for it:
 
-1. Upstream's own message for this change, exactly as without pins: a
-   partial or full REQUEST, a partial or whole-event CANCEL, or the
-   change's REPLY, a DELETE's DECLINED reply and this change's occurrence
-   declines included. An attendee's DELETE enters `za_fan_out` with the
-   pre-deletion tree and the deletion flag even when `itip_cancel` returns
-   nothing (`delete_all_za` builds a `ZaDeleteMessage` only on `Ok` today;
-   the plan changes that). With an entry for the organizer, the fan-out
-   builds DECLINED with a fork variant of `attendee_decline` that drops the
-   PARTSTAT gate (`attendee.rs` lines 301-306: DECLINED and DELEGATED are
-   gated by `force_send`, not `skip_needs_action`) and keeps
-   `is_server_scheduling` and the RSVP check.
-2. The full current state, only while the relationship remains after the
-   change: for an organizer, the committed event still names the address
-   (not after a whole-event CANCEL or a removal); for an attendee, the
-   event still exists (not after a DELETE). For an organizer it is
-   `organizer_request_full(committed_tree, fresh_snapshot, None, false)`
-   for that attendee, without a second `itip_finalize` (no second SEQUENCE
-   bump); for an attendee, the current-participation REPLY of section
-   6.4's helper. Both are built from the state being committed, never from
-   a superseded tree: the deletion flag says the tree is the pre-deletion
-   one. Item (2) is skipped when item (1) is METHOD:REQUEST and contains
-   the master scheduling component (no RECURRENCE-ID): upstream routes
-   every master change to the full update, partial REQUESTs hold only
-   overrides, and `ItipSummary` cannot tell them apart. It is also
-   skipped when the helper finds nothing to send.
+1. The full current state, only while the relationship remains after the
+   change: for an organizer, the committed event still names the address (not
+   after a whole-event CANCEL or a removal); for an attendee, the event still
+   exists (not after a DELETE). For an organizer it is
+   `organizer_request_full(committed_tree, fresh_snapshot, None, false)` for
+   that attendee, without a second `itip_finalize` (no second SEQUENCE bump);
+   for an attendee, the refused instances' current participation (section 6.4's
+   helper). Both are built from the state being committed, reconciled (below),
+   never from a superseded tree: the deletion flag marks a pre-deletion one.
+   Item (1) is skipped when any message of item (2) is a METHOD:REQUEST
+   containing the master scheduling component (no RECURRENCE-ID): upstream
+   routes every master change to the full update, partial REQUESTs hold only
+   overrides, and `ItipSummary` cannot tell them apart (when the master has no
+   attendees the full REQUEST lacks it, the skip does not fire, and the full
+   state is a harmless duplicate). It is also skipped when one is a
+   METHOD:CANCEL with the master component (the address removed from the master
+   while an override still names it; the CANCEL then cancels every instance of
+   the copy, upstream's `cancel_all_instances`, parity), and when the full
+   state yields nothing for the address (the attendee's helper, or the full
+   REQUEST for a DECLINED, RSVP=FALSE, SCHEDULE-AGENT=CLIENT or NONE attendee).
+   After any of the three skips the entry is retired with upstream's messages.
+2. Upstream's own messages for the address in this change, in upstream's order
+   and exactly as without pins, their SEQUENCE reconciled (below): in the mixed
+   case the full REQUEST, then the partial (an address receives both only when
+   it has no master REQUEST of its own, since `organizer_handle_update` drops
+   the partials of any address that has one: it has no update-eligible master
+   line, or the master is unchanged and another attendee was switched to the
+   full update by a second method); otherwise a partial or full REQUEST, a
+   partial or whole-event CANCEL, or the change's REPLY, a DELETE's DECLINED
+   reply and this change's occurrence declines included. An attendee's DELETE
+   enters `za_fan_out` with the pre-deletion tree and the deletion flag even
+   when `itip_cancel` returns nothing (`delete_all_za` builds a
+   `ZaDeleteMessage` only on `Ok` today; the plan changes that). With an entry
+   for the organizer, the fan-out builds DECLINED with a fork variant of
+   `attendee_decline` that drops the PARTSTAT gate (`attendee.rs` lines
+   301-306: DECLINED and DELEGATED are gated by `force_send`, not
+   `skip_needs_action`) and keeps `is_server_scheduling` and the RSVP check.
 
-The entry is retired after all of that recipient's items are written
-(section 5.2, phase 4); an item write failure (`5.1`) leaves it. Upstream's
-message carries the intended change, the full state everything withheld,
-and nothing comes from a tree that contradicts the action; the cost is a
-second item while an entry exists. Entries drain once deliveries flow
-again, and `contacts/pin` redelivers only documents nobody edited.
+The entry is retired only when every item was written (section 5.2). The full
+state restores what was withheld; upstream's messages have the last word, since
+the full REQUEST, one message for every attendee, cannot express one attendee's
+removal from an occurrence (`inbound.rs`'s REQUEST merge replaces every
+differing entry, STATUS included). When they agree the later is a no-op (equal
+SEQUENCE after the reconciliation, `>=`); for a REPLY pair the second rewrites
+only SCHEDULE-STATUS. A CANCEL for an override the change removed meets no
+override after the full REQUEST and adds a cancelled one (keeping its
+SEQUENCE), as upstream's standalone CANCEL does, until the next full REQUEST.
+The cost is one extra item while an entry exists. Entries drain once deliveries
+flow again, and `contacts/pin` redelivers documents no delivering edit has
+reached since the refusal.
+
+**SEQUENCE floor and reconciliation.** In the PUT handler, before upstream's
+scheduling step and on every PUT of an existing event whether or not it builds
+messages (one that builds none stores the body as sent), each scheduling
+component's SEQUENCE is raised to the stored component's value when lower,
+matched by instance (`InstanceId` and `InstanceKey` agree here); no component
+is added, and SEQUENCE never decreases (RFC 5545 requires it monotonic). It
+applies to events a key account organizes, by its own organizer check, which
+reads the stored tree's ORGANIZER. A client that trusts the returned ETag never
+refetches the reconciled event, so without the floor its next PUT would write
+its own lower values back. Upstream's partial branch of
+`organizer_handle_update` then loses a partial REQUEST's increments to a local
+that shadows the caller's, and CANCEL components are never recorded; a
+removal's CANCEL is built from the old tree at old+1 (usually: the group loop's
+tree switch can build a later one from the new tree; matching each component by
+the snapshot of the message that carries it covers both), a new
+STATUS:CANCELLED override's from the new tree. So a bumping partial carries
+`s+1` over a stored `s`, which a later full REQUEST from the stored tree fails
+(`OutOfSequence`), and a removal CANCEL at old+1 falls behind the remaining
+attendees' REQUEST when the client bumped that component in the same PUT
+(SEQUENCE is not in the snapshot's entries), including when another attendee's
+full update then raised it. The reconciliation is uniform: after upstream's
+builders return and before any delivery and the commit, for every instance the
+change's organizer REQUESTs and CANCELs carry, the full REQUEST included (it
+already equals the committed value, so this costs nothing and removes any need
+to tell partial from full), matched by the drain's `InstanceKey` from each
+message's own snapshot, the fan-out sets the committed component and every
+message's component to the highest SEQUENCE among them; for an instance the
+committed tree lacks (a removed override) only the messages are set and no
+component is added. The committed tree and every message then agree per
+instance, so the full state agrees with upstream's messages after it. Attendee
+REPLYs are untouched (an attendee never bumps); a deletion's fan-out, and
+`itip_cancel`'s fallback (the new tree has no usable local ORGANIZER: removed,
+SCHEDULE-AGENT=CLIENT or NONE, or replaced; no snapshot of the committed tree),
+leave their CANCEL as built. It runs on every other non-deletion fan-out of a
+key organizer, entries or not, and returns the committed values
+for the caller to apply before its commit, as statuses are; key organizers only
+(release 1 invariant 9), upstream's builders untouched (section 13, item 4).
 
 ### 5.2 Order
 
 `za_fan_out` today resolves and writes recipient by recipient; with pins it
-runs in four phases:
+runs in four phases, after section 5.1's reconciliation:
 
 1. Resolve every recipient of every message (the per-call recipient map already
    deduplicates addresses), read each key-account recipient's served key
@@ -488,25 +584,29 @@ runs in four phases:
    when anything changed (new first-use pins, any refusal), write the pin
    record once, conditionally (section 4.2), before any item. Under a
    legacy wrap that write is the batch with the rewrap (section 4.4).
-3. Write the items of the recipients decided "deliver", up to two for a
-   recipient with an entry (section 5.1).
-4. Retire, in one more conditional pin-record write asserting the bytes
-   phase 2 wrote (or those read in phase 1 when phase 2 wrote nothing):
-   the entries of recipients whose items were all written, and for a
-   deletion's fan-out every entry of the deleted document; it runs only
-   when upstream builds a message (a scheduled, tagged, not-past event,
-   `Schedule-Reply` not `F`, the send permission), else `contacts/pin`
-   drops them (section 6.4, step 1). The
-   retirement rule, here and in `contacts/pin` step 5: an entry is removed
-   only when its stored `refusal_id` still equals the id the delivery
-   consumed (read in phase 1), checked on every attempt of section 4.2,
-   the retries after a conflict included. Otherwise a newer refusal
-   re-armed the entry, and it stays. A failed or skipped retirement leaves
-   the entry and never undoes a written item. When `contacts/pin` sets
-   `redelivery`, the fan-out sends only the message it was given (already
-   the full state), adds no second item and retires nothing: the
-   endpoint's guarded step 5 is its only cleanup. A heal by this write is a
-   generation bump after the items and before the sender's commit.
+3. Write the items of the recipients decided "deliver". Every recipient's
+   items follow upstream's message order (the full REQUEST before a
+   partial), entry or not; with an entry the full state comes first
+   (section 5.1). A failed full state (`5.1`) never stops upstream's
+   messages.
+4. Retire, in one more conditional pin-record write asserting the bytes phase 2
+   wrote (or those read in phase 1 when phase 2 wrote nothing): the entries of
+   recipients whose items were all written, and for a deletion's fan-out every
+   entry of the deleted document; it runs only when the fan-out has a message
+   to send (upstream's, for a scheduled, tagged, not-past event,
+   `Schedule-Reply` not `F`, the send permission; or the fork's DECLINED of
+   section 5.1 item (2)), whether or not its items are written; else
+   `contacts/pin` drops them (section 6.4, step 1). The retirement rule,
+   here and in `contacts/pin` step 5: an entry is removed only when its stored
+   `refusal_id` still equals the id the delivery consumed (read in phase 1),
+   checked on every attempt of section 4.2, the retries after a conflict
+   included. Otherwise a newer refusal re-armed the entry, and it stays. A
+   failed or skipped retirement leaves the entry and never undoes a written
+   item. When `contacts/pin` sets `redelivery`, the fan-out sends only the
+   message it was given (already the full state), adds no other item and
+   retires nothing: the endpoint's guarded step 5 is its only cleanup. A heal
+   by this write is a generation bump after the items and before the sender's
+   commit.
 
 Pinning first, a crash between phases 2 and 3 leaves a pin without a
 delivery, which the next edit that builds a message to the address
@@ -553,9 +653,9 @@ entries it retired; the next edit sends the state again.
 - **Replies.** bob's reply seals to alice's key, so bob pins alice's
   address on his first reply. A refused reply puts `3.8` on the ORGANIZER
   of bob's copy and a withheld entry for (his copy's document, alice's
-  address). bob's next ordinary reply sends that change's REPLY, then his
-  current participation (unless he deleted the event); a DELETE delivers
-  DECLINED; `contacts/pin` sends his current participation alone.
+  address), recording the refused instances. His next ordinary reply sends
+  their current participation, then that change's REPLY (only DECLINED
+  after a DELETE); `contacts/pin` sends their participation alone.
 - **Delegates.** The delegating merge fans out in the organizer's session
   (release 2 section 6.4), so the organizer's pins apply: a refused
   delegate gets `3.8` on its ATTENDEE in the organizer's event, where that
@@ -662,8 +762,8 @@ first, creating a fresh record when the read found none or an unusable one
 (asserted as section 4.2 states; under a legacy wrap, the batch with the
 rewrap). Then it drains the account (`za_drain` with the request's
 `SessionKeys`, looping while a pass returns `More`), as DAV paths do: the
-stale check rejects a whole REPLY when any instance of the attendee's copy
-is behind the organizer, ordinary in a page-only flow. A pass ending
+stale check rejects a whole REPLY when any instance it carries is behind
+the organizer, ordinary in a page-only flow. A pass ending
 `LeftPending` or `Suspended` (`PassOutcome` in `drain.rs`; release 2
 sections 6.2 and 10) means no REPLY is built (attendee-side entries count
 as `remaining`); REQUEST redelivery proceeds, the stale check not applying
@@ -679,25 +779,25 @@ drain (whose delegating merge may re-arm or retire them):
    enabled, `CalendarSchedulingSend`, an event not in the past). No
    account-wide UID lookup is made: two events with one UID in two
    calendars are separate entries.
-2. Build the full current state for that one recipient. When the user
-   organizes the event: the full REQUEST for that attendee through the
-   path the drain's delegating merge uses for a new delegate
-   (`organizer_request_full`, release 2 section 6.4), under the
-   organizer's UID lease passed as the fence (release 2 section 6.3, step
-   5). The refusing fan-out already created the recipient's token, so no
-   minting is expected; the lease is cheap and keeps redelivery consistent
-   with the delegating merge. When the user is an attendee: the fork
-   helper's REPLY, mirroring `attendee_handle_update`'s instance selection
-   minus its "changed" predicate and, like upstream's reply path, ignoring
-   RSVP: only instances whose local attendee is `is_server_scheduling` and
-   has the reply's `from` address (`handle_reply` matches the sender per
-   instance by exact string), whose ORGANIZER is not SCHEDULE-AGENT=CLIENT
-   and whose STATUS is not CANCELLED, with the ATTENDEE, DELEGATED-FROM and
-   DELEGATED-TO lines as upstream exports them (section 13, item 3). The
-   filter is needed because `handle_reply` rejects a whole reply when any
-   instance names a non-participant (`SenderIsNotParticipant`) and adds an
-   override for an instance the organizer lacks
-   (`MergeAction::AddComponent`), while an attendee's copy keeps a
+2. Build the full current state for that one recipient. When the user organizes
+   the event: the full REQUEST for that attendee through the path the drain's
+   delegating merge uses for a new delegate (`organizer_request_full`, release
+   2 section 6.4), under the organizer's UID lease passed as the fence (release
+   2 section 6.3, step 5). The refusing fan-out already created the recipient's
+   token, so no minting is expected; the lease is cheap and keeps redelivery
+   consistent with the delegating merge. When the user is an attendee: the
+   refused instances' current participation, the fork helper's REPLY of the
+   recorded instances (all qualifying ones under `all`) that still exist and
+   pass the rules, ignoring RSVP as upstream's reply path does: local attendee
+   `is_server_scheduling` with the reply's `from` address (`handle_reply`
+   matches per instance by exact string), ORGANIZER not SCHEDULE-AGENT=CLIENT,
+   STATUS not CANCELLED; with the ATTENDEE, DELEGATED-FROM and DELEGATED-TO
+   lines as upstream exports them (section 13, item 3). A whole-copy export
+   would let an unchanged master's delegate line overwrite the delegate's newer
+   PARTSTAT; the filter holds, while the attendee's copy is current, because
+   `handle_reply` rejects a whole reply when any instance names a
+   non-participant (`SenderIsNotParticipant`) and adds an override the
+   organizer lacks (`MergeAction::AddComponent`), while a copy keeps a
    cancelled override naming the attendee after a partial CANCEL.
 3. Run `za_fan_out` with that message, the loaded event as the sender's
    tree, its current token pairs (`event_token_pairs`) and `redelivery`
@@ -726,13 +826,13 @@ Every outcome of an entry is one of these:
 | Outcome | When | Entry |
 |---|---|---|
 | `delivered` | the item is written and step 4 committed | retired under the rule |
-| `dropped` | step 1's conditions; the full REQUEST yields nothing for the address (it is DECLINED, RSVP=FALSE or SCHEDULE-AGENT=CLIENT); the REPLY helper yields nothing (the master is cancelled or no instance qualifies); the address no longer resolves to an internal key account (the next ordinary edit routes it as upstream does) | retired under the rule |
+| `dropped` | step 1's conditions; the full REQUEST yields nothing for the address (it is DECLINED without a stored SCHEDULE-FORCE-SEND, RSVP=FALSE, SCHEDULE-AGENT=CLIENT or NONE); the REPLY helper yields nothing (no recorded instance still exists and qualifies); the address no longer resolves to an internal key account (the next ordinary edit routes it as upstream does) | retired under the rule |
 | `failed` | the UID lease is busy; an item write fails | stays |
 | `remaining` | beyond the 32 of this call; re-armed during it; step 4 lost its archive assertion; an attendee-side entry after an incomplete drain | stays |
 
 Why current state: a full REQUEST covers every refused partial change and
 never reverts a newer delivery that bumped the SEQUENCE, and limit 7
-covers the rest, a current-participation REPLY included;
+covers the rest, the refused instances' current participation included;
 `contacts/pin` makes no change of its own, so it sends only the full state.
 Its losses are section 2, limit 6 (after a real key change the contact's
 old copy no longer exists, which the page says); its race is limit 7.
@@ -758,10 +858,10 @@ Purpose: remove a pin, or start over. Request: the shared fields and
 `totp`).
 
 - With an address: removes its pin, keeps its withheld entries; the next
-  delivery pins the served key as `FirstUse` and sends it item (1) and the
-  withheld full state (section 5.1). `forget` is for a contact no longer
-  needed; a mismatch is resolved by `pin` after a comparison, which the
-  page says. No pin: a no-op, still 200.
+  delivery pins the served key as `FirstUse` and sends it the withheld full
+  state and the change's messages (section 5.1). `forget` is for a contact
+  no longer needed; a mismatch is resolved by `pin` after a comparison,
+  which the page says. No pin: a no-op, still 200.
 - With null: writes an empty record (`key_repaired_at` kept), ending the
   fail-closed state, the wrap still pinned; over an unusable record it
   asserts those bytes (section 4.2). It is the last resort of section
@@ -799,7 +899,7 @@ returned; fingerprints and addresses go only to the record's owner.
 
 | Field | Stored value | Sealed under, associated data |
 |---|---|---|
-| `ZeroAccessPins` (151, new) | nonce (24) then XChaCha20-Poly1305 of: length (`u32`, big endian), rkyv `ZaPinRecord` (section 4.1; entries are `document_id`, `uid`, `address`, `since`, `refusal_id`), zero padding to a multiple of 256 bytes; tag (16) | MK, `aad("pins", account_id)` |
+| `ZeroAccessPins` (151, new) | nonce (24) then XChaCha20-Poly1305 of: length (`u32`, big endian), rkyv `ZaPinRecord` (section 4.1; entries are `document_id`, `uid`, `address`, `since`, `refusal_id` and, attendee-side, `instances`), zero padding to a multiple of 256 bytes; tag (16) | MK, `aad("pins", account_id)` |
 | `ZeroAccessVault` (150), `private_key_wrap` | unchanged layout and length (`nonce || ciphertext`, 72 bytes) | MK; `aad("private-key", account_id)` (legacy, release 2) until the first pin write, `aad("private-key/pins", account_id)` (pinned) from then on |
 
 `3.8` joins `1.2`, `5.1` and `5.3` inside the sender's sealed ORGANIZER
@@ -818,32 +918,47 @@ no key bytes, fingerprints or addresses.
 
 ## 9. Testing
 
-**Unit.** In `crates/vault`: `display_fingerprint` matches a fixed vector
-and the display form; a pin record round-trips through seal and open, fails
-under another account's associated data and under another MK, pads to 256
-bytes, and an unknown `version` reads as unusable; a pinned wrap does not
-open under the legacy associated data nor a legacy wrap under the pinned,
-and the reader's pinned-then-legacy order reports which one opened; every
-refusal changes an entry's `refusal_id`. In `fanout.rs`: `status_rank`
-ranks `3.8` above `5.1`, and `za_set_schedule_status` replaces a `3.8`
-with a later status. In `groupware`: the REPLY helper carries the master's
-and each qualifying override's PARTSTAT, omits cancelled instances, those
-where the attendee is not server-scheduled and those whose local attendee
-address differs from the reply's `from`, and yields nothing when the
-master is cancelled.
+**Unit.** In `crates/vault`: `display_fingerprint` matches a fixed vector and
+the display form; a pin record round-trips through seal and open, fails under
+another account's associated data and under another MK, pads to 256 bytes, and
+an unknown `version` reads as unusable; a pinned wrap does not open under the
+legacy associated data nor a legacy wrap under the pinned, and the reader's
+pinned-then-legacy order reports which one opened; every refusal changes an
+entry's `refusal_id`. In `fanout.rs`: `status_rank` ranks `3.8` above `5.1`,
+and `za_set_schedule_status` replaces a `3.8` with a later status; the
+reconciliation sets the committed component and every message's component, a
+CANCEL's included, to the highest value per instance. Its fixture has an
+instance whose committed value is the strict maximum (a CANCEL-only instance
+the client bumped by two), so leaving the committed component out of the max
+fails it; a CANCEL built from an old tree whose component order differs from
+the new tree's (an earlier override removed in the same PUT), so matching by
+component id fails; and one instance written with a TZID in the old tree and in
+UTC in the new, so matching by text fails (exports copy RECURRENCE-ID
+verbatim). The floor: a lower value is raised and a higher one kept; an absent
+SEQUENCE is written at the stored value; a component the stored tree lacks is
+left untouched and no removed component is re-added; matching is by instant.
+Recorded instances: two refusals on different instances union; a RECURRENCE-ID
+with a TZID matches by instant; the 65th key switches to `all`. In `groupware`:
+the REPLY helper exports only recorded instances (all qualifying ones under
+`all`) with their PARTSTAT, omitting cancelled ones, those where the attendee
+is not server-scheduled or has another address than the reply's `from`, and
+yields nothing when none qualifies.
 
 **Integration.** A new za sub-module, `tests/src/za/pinning.rs`, after the
 drain modules and before the leak tests, drain on (`DrainOn`). Helpers in
 `tests/src/utils/za.rs`: `substitute_public_key` (rewrites an account's
 `public_key` at the next revision, with or without cache invalidation, and
-returns the original) and a wrap helper (reports which associated data
-opens the wrap, saves and restores its bytes, rewraps it as legacy). Hooks
-in `crates/common/src/za/test_hooks.rs`: `PIN_DECIDE_PAUSE` (a fan-out
-after its reads), `RETIRE_PAUSE` (`za_fan_out` after a recipient's items,
-before phase 4, also reached by `contacts/pin`'s inner call),
-`REDELIVER_CLEANUP_PAUSE` (`contacts/pin` after its event commit, before
-cleanup) and `PIN_WRITE_FAIL_ONCE`. Cases, with alice, bob and carol as key
-accounts; "item order" is the recipient's inbox in document-id order:
+returns the original) and a wrap helper (reports which associated data opens
+the wrap, saves and restores its bytes, rewraps it as legacy). Hooks in
+`crates/common/src/za/test_hooks.rs`: `PIN_DECIDE_PAUSE` (a fan-out after its
+reads), `RETIRE_PAUSE` (`za_fan_out` after a recipient's items, before phase 4,
+also reached by `contacts/pin`'s inner call), `REDELIVER_CLEANUP_PAUSE`
+(`contacts/pin` after its event commit, before cleanup) and
+`PIN_WRITE_FAIL_ONCE`. Every PUT of an existing event is built from a GET of
+the stored event, with SEQUENCE set relative to the stored value where a case
+says "the client bumps" or "lower" (a fixed template would make those variants
+accidental). Cases, with alice, bob and carol as key accounts; "item order" is
+the recipient's inbox in document-id order:
 
 1. First use under a legacy wrap: alice, with no record, invites bob; the
    item is delivered, alice holds a `FirstUse` pin for bob, and her wrap
@@ -881,27 +996,54 @@ accounts; "item order" is the recipient's inbox in document-id order:
     legacy wrap, pin, change her password, restore only the wrap and delete
     the record: first use reopens while the new password keeps logging in.
     Restoring an earlier pin record reverts a `Confirmed` pin silently.
-11. Ordinary delivery with an entry, asserting item order. Reply: refuse
-    bob's DECLINED, restore alice's key; bob's ACCEPTED delivers the REPLY
-    then his current participation; `contacts/pin` finds no entry and alice
-    shows bob ACCEPTED. Organizer: refuse an update to occurrence A,
-    restore; alice adds an override of B with STATUS:CANCELLED; bob gets
-    B's partial CANCEL, then the full REQUEST with A's update, and the
-    entry is retired after both; a master change gives one item. DELETE:
+11. Ordinary delivery with an entry, asserting item order; each sub-case that
+    asserts an item count (a master change, master removal, Mixed) starts with
+    a fresh refusal, so that bob holds an entry. Reply: refuse bob's DECLINED,
+    restore alice's key; bob's ACCEPTED delivers his refused instances' current
+    participation, then the REPLY; `contacts/pin` finds no entry and alice
+    shows bob ACCEPTED. Organizer: refuse an update to A, restore; alice adds a
+    STATUS:CANCELLED override of B naming bob at NEEDS-ACTION (new overrides
+    message an attendee only at NEEDS-ACTION, `send_invite_messages`); bob gets
+    the full REQUEST with A's update, then B's CANCEL (A updated, B cancelled),
+    retired after both; a master change gives one item. Removal: an older
+    update withheld, key restored, alice removes bob from override X (carol
+    stays, bob keeps the master): the full REQUEST, then X's CANCEL; bob keeps
+    the update, X cancelled; the same with the client bumping X's SEQUENCE in
+    that PUT ends X cancelled. Mixed: bob holds an entry and attends existing
+    overrides X and Z but not the master, carol stays on X; in one PUT dave is
+    added to the master and bob is removed from X, the client bumping X; bob
+    gets the full REQUEST (he is on Z), then his CANCEL for X, and no extra
+    full state (two items); X ends cancelled (the CANCEL, built from the old
+    tree one below, is raised to the full REQUEST's value). With bob the
+    master's only attendee besides alice, the address removed from the master
+    while still on override Y gives one item (another update-eligible master
+    attendee would trigger the full update, reaching bob through Y). DELETE:
     refuse bob's ACCEPTED, restore, bob deletes: alice gets DECLINED and no
     full state, the source is gone, the entry retired after the decline.
     Already DECLINED: `itip_cancel` builds nothing, yet the fork variant of
     `attendee_decline` sends DECLINED.
-12. Partial changes: with bob's key substituted, alice changes occurrence A
-    and then occurrence B (two refused partial updates); after
-    `contacts/pin`, bob's event holds both changes.
+12. Partial changes, on A and B, existing overrides naming bob (a new override
+    copying his ACCEPTED master line would not message him at all,
+    `send_invite_messages`): with bob's key substituted, alice changes
+    occurrence A and then occurrence B (two refused partial updates); after
+    `contacts/pin`, bob's event holds both changes. Delivered partial: a move
+    of A reaches bob first, then a change to B is refused; after `contacts/pin`
+    bob's copy holds it (no `OutOfSequence`). Lowered, on the delivered-partial
+    variant: the second PUT lowers A (the component the delivered partial
+    raised) while the refused change is to B; after `contacts/pin` bob's copy
+    holds the B change and his drain recorded no `OutOfSequence` (lowering the
+    component the refused change bumps would be healed by the reconciliation
+    alone).
 13. Stated losses, one test each: an organizer DELETE retires the
     document's entries and bob keeps his copy; a refused removal CANCEL is
     dropped and bob keeps his copy; an occurrence bob declined by deleting
-    it is not reconstructed by the redelivered REPLY.
+    it is not reconstructed by the redelivered REPLY; a refused delegation
+    of the master, then an organizer master change (a full REQUEST) to bob
+    before the restore, then `contacts/pin`: alice gains no delegate.
 14. Delegate direction: bob delegates to carol, pinned by alice with
     carol's key substituted; alice's delegating merge gives carol `3.8`
-    and a withheld entry.
+    and a withheld entry. Attendee side (limit 7's residual): a refused
+    REPLY records the master; its redelivery carries bob's delegate line.
 15. Pre-pin: alice pins carol before any invitation; substitute carol's
     key; the first invitation to carol is refused.
 16. Pin before deliver: `PIN_WRITE_FAIL_ONCE` on an invitation to a new
@@ -923,6 +1065,13 @@ accounts; "item order" is the recipient's inbox in document-id order:
 20. Drain before build: refuse bob's master reply; deliver a partial
     REQUEST for occurrence X to bob's inbox without draining;
     `contacts/pin`: alice shows bob ACCEPTED on the master.
+21. Recorded instances: bob delegates the master to carol, carol accepts (bob
+    does not see it); alice adds override X naming only bob, at NEEDS-ACTION;
+    bob's ACCEPTED on X is refused; restore. Through `contacts/pin`, alice has
+    bob ACCEPTED on X; in a second run bob sets X to TENTATIVE (ordinary
+    recovery) and alice has bob TENTATIVE on X; carol stays ACCEPTED on the
+    master in both. Genuine delegation: a refused delegation of the master,
+    then `contacts/pin`: alice gains and invites carol.
 
 Cases restore keys, forget pins and delete events (`assert_is_empty` runs
 once at the suite's end); `tests/src/utils/cleanup.rs` exempts field 151
@@ -937,15 +1086,21 @@ no hit.
 
 **CalDAV client CI** (`tests/caldav_client/`): server suite only.
 
-**Mutation checks** (plan 7 style), each failing the named case: key
-equality forced true (2); the cached key (2, uninvalidated); pin write after
-the items (16); no vault assertion in the first-pin batch (8); entries keyed
-by UID alone (18); a counter for `refusal_id`, or retiring in phase 4 without
-the id check (17); legacy-only reads, or an
-absent record always first use (6); the self-check creating a record (7);
-no healing rewrap (9); only one of the two items (11); a partial message
-redelivered (12); no participation filter (19); no drain pass (20); no
-fingerprint check in `contacts/pin` (4).
+**Mutation checks** (plan 7 style), each failing the named case: key equality
+forced true (2); the cached key (2, uninvalidated); pin write after the items
+(16); no vault assertion in the first-pin batch (8); entries keyed by UID alone
+(18); a counter for `refusal_id`, or retiring in phase 4 without the id check
+(17); legacy-only reads, or an absent record always first use (6); the
+self-check creating a record (7); no healing rewrap (9); the full state or
+upstream's messages missing, or the full state after them (11, removal);
+messages left at upstream's SEQUENCE (11, client bump, and 11, mixed);
+the committed component left out of the max (unit); the floor setting the value
+to stored or copying stored components back (unit); a partial message
+redelivered (12, two refused partials); no SEQUENCE reconciliation (12,
+delivered partial); no SEQUENCE floor (12, lowered); no master-REQUEST skip
+(11, master change and mixed); no master-CANCEL skip (11, master removal); no
+participation filter (19); no drain pass (20); unrecorded instances exported
+(21); no fingerprint check in `contacts/pin` (4).
 
 ## 10. Invariants for implementers
 
@@ -971,11 +1126,11 @@ Release 1's ten and release 2's five (11 to 15) hold. This spec adds:
     `contacts/pin`) creates the account's first record, atomically with
     the rewrap, which is the moment the account becomes pinned. The
     self-check and the listing never create one.
-23. Entries are bound to the source document and never hold a message.
-    The next ordinary delivery sends upstream's message, then the full
-    current state while the relationship remains; `contacts/pin` drains
-    first and sends the full current state. An entry is retired only under
-    its consumed `refusal_id`.
+23. Entries are bound to the source document and never hold a message. The next
+    ordinary delivery sends the full current state (on the attendee side, the
+    recorded instances only) while the relationship remains, unless section 5.1
+    skips it, then upstream's messages; `contacts/pin` drains first and sends
+    the full state. An entry is retired only under its consumed `refusal_id`.
 
 ## 11. Alternatives considered
 
@@ -983,6 +1138,11 @@ Release 1's ten and release 2's five (11 to 15) hold. This spec adds:
   revision is the authentication generation, so every pin write would end
   every session of the account.
 - **Pins keyed by account id.** Rejected: section 4.3.
+- **A recipient-specific full state** (STATUS:CANCELLED on overrides it
+  does not attend). Rejected: it diverges from the organizer's tree and
+  upstream's REQUEST; the order with the reconciled SEQUENCE does the same.
+- **Redelivery at stored+1.** Rejected: it ratchets the recipient ahead
+  and fails the next ordinary partial.
 - **Comparing against the cached key** (`za_public_key`). Rejected: no
   TTL and no invalidation on a direct store write, so a changed key goes
   unseen while the entry lives (section 5.1).
@@ -1028,13 +1188,33 @@ unless the code says otherwise.
    Recommendation: 151; the next free unassigned value otherwise.
 3. **The REPLY helper's pieces.** Confirm which `pub(crate)` parts of
    upstream's attendee builder (`crates/groupware/src/scheduling/attendee.rs`)
-   and `itip_build_envelope` the fork helper of section 6.4 can call to
-   apply `attendee_handle_update`'s instance selection minus its "changed"
-   predicate (local attendee `is_server_scheduling`, ORGANIZER not
-   SCHEDULE-AGENT=CLIENT, STATUS not CANCELLED, local attendee address equal
-   to the reply's `from`, the DELEGATED-FROM and DELEGATED-TO lines
-   carried; RSVP not consulted). Recommendation: the helper lives in
+   and `itip_build_envelope` the fork helper of section 6.4 can call to export
+   the entry's recorded instances under `attendee_handle_update`'s selection
+   minus its "changed" predicate (local attendee `is_server_scheduling`,
+   ORGANIZER not SCHEDULE-AGENT=CLIENT, STATUS not CANCELLED, local attendee
+   address equal to the reply's `from`, the DELEGATED-FROM and DELEGATED-TO
+   lines carried; RSVP not consulted). Recommendation: the helper lives in
    `groupware`, with at most a one-word visibility edit upstream.
-4. **Client display of `3.8`.** How Apple Calendar, Thunderbird and DAVx5
+4. **The SEQUENCE shadowing** in `organizer.rs` (the partial branch's
+   local `increment_sequences`): section 5.1's post-pass versus fixing
+   upstream's bookkeeping for every account (upstream's REFRESH reply has
+   the same exposure; nothing is reported upstream by us). Fixing upstream
+   costs more than the shadow: CANCEL components are never recorded,
+   old-tree ids index the wrong tree, and in the mixed case the full branch
+   has pushed every component, so the stored value would reach `s+2`
+   against messages at `s+1`, making every REPLY stale. The re-review also
+   traced a panic in the same partial branch when one CANCEL groups a
+   removed override and a new STATUS:CANCELLED override for one attendee
+   and the new one sorts first (the loop's tree switch is permanent, and
+   the old override is then looked up in the new tree); to confirm in the
+   plan; upstream's, not reported by us. Jay's decision; recommendation:
+   the post-pass, keeping plain accounts on upstream code.
+5. **An organizer-side delegate guard** in the fork's drain merge (keep an
+   existing delegate's PARTSTAT, RSVP, SCHEDULE-STATUS and ROLE against a
+   REPLY, keep the DELEGATED-TO/FROM updates `Attendance::is_new` needs)
+   would close limit 7's gap and plan 11's deferred item for key accounts by
+   filtering upstream's merge actions: a release 2 decision for Jay.
+   Recommendation: decide it with plan 11's deferred item, outside this plan.
+6. **Client display of `3.8`.** How Apple Calendar, Thunderbird and DAVx5
    show a `3.8` SCHEDULE-STATUS. Recommendation: a manual-checklist item
    (`docs/zero-access/manual-checklist.md`), no code.
