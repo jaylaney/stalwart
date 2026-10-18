@@ -139,6 +139,7 @@ pub async fn za_tests() {
     inbox::test_sync(&mut test).await;
     inbox::test_expiry(&mut test).await;
     leak::test_drain(&mut test).await;
+    leak::test_pins(&mut test).await;
     leak::test(&mut test).await;
     leak::test_index_control(&mut test).await;
     index_task::test(&mut test).await;

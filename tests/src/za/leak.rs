@@ -10,7 +10,8 @@
 use super::{
     STRONG,
     dav_seal::{CANARIES, EVENT, mkcalendar_body, raw_event},
-    fanout::NO_REPLY,
+    fanout::{NO_REPLY, uid_copies},
+    pinning::{ALICE, drop_entries, forget, parties, refuse_once_at},
 };
 use crate::{
     utils::{
@@ -18,8 +19,8 @@ use crate::{
         webdav::DummyWebDavClient,
         za::{
             PlantedItem, copy_href, hold_task_consumer, inbox_ids, itip_tasks_for, new_inbox_items,
-            pending_ids, plant_inbox_item, plant_sealed_event, trigger_drain, wait_for_delivery,
-            za_unlock,
+            pending_ids, pin_record, plant_inbox_item, plant_sealed_event, substitute_public_key,
+            trigger_drain, wait_for_delivery, za_unlock,
         },
     },
     za::drain::{DrainOn, body, set_partstat},
@@ -101,6 +102,7 @@ const EXTRA_CANARIES: &[&str] = &[
     "draindesc-canary",
     "draincn-canary",
     "drainaddr-canary",
+    "pinaddr-canary",
 ];
 
 /// Plan 10: key1's invitation to key2 with every canary the drain handles,
@@ -844,6 +846,60 @@ pub async fn test_drain(test: &mut TestServer) {
             }
         }
     }
+    test.wait_for_tasks().await;
+}
+
+/// Key pinning spec 9, the leak scan: a pin record holding a pin and a
+/// withheld entry for a canary-bearing address leaves no canary in the
+/// clear in either account's records. A key account's own address is in
+/// the registry in the clear, so the canary rides in a sub-address, which
+/// pins separately (spec 4.3).
+pub async fn test_pins(test: &mut TestServer) {
+    println!("Running zero-access leak test of the pin record...");
+    const ADDRESS: &str = "key2+pinaddr-canary@example.com";
+    let _drain = DrainOn::new();
+    let (alice, bob, _) = parties(test);
+    let (key1_id, key2_id) = (alice.id, bob.id);
+    let bob_start = inbox_ids(test, key2_id).await;
+    // alice invites the sub-address (a `FirstUse` pin); key2's key is
+    // substituted with invalidation and alice's SUMMARY edit is refused
+    // (an entry for that address).
+    let (path, original, _) = refuse_once_at(test, &alice, &bob, ADDRESS, "pin-leak").await;
+    let record = pin_record(test, key1_id, STRONG).await.expect("the record");
+    assert!(
+        record.pin(ADDRESS).is_some() && record.withheld.len() >= 1,
+        "the positive control"
+    );
+    for account_id in [key1_id, key2_id] {
+        let found = scan(test, account_id).await;
+        assert!(
+            found.violations.is_empty(),
+            "pin record leaks:\n{}",
+            found.violations.join("\n")
+        );
+    }
+
+    // Cleanup: key2's key restored; the event deleted with `Schedule-Reply:
+    // F`; key2's new items deleted, and its copy if the drain made one (as
+    // `pinning`'s cleanup does: a sub-address invitation may leave none);
+    // `pin` for the sub-address drops the entry of the deleted event, then
+    // `forget` removes the pin.
+    substitute_public_key(test, key2_id, &original, true).await;
+    alice
+        .client
+        .request_with_headers("DELETE", &path, [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    if uid_copies(test, key2_id, "pin-leak").await > 0 {
+        let copy = copy_href(test, key2_id, "pin-leak").await;
+        bob.client
+            .request_with_headers("DELETE", &copy, [NO_REPLY], "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    bob.delete_items_since(test, &bob_start).await;
+    drop_entries(ALICE, ADDRESS).await;
+    forget(ALICE, Some(ADDRESS)).await.expect(200);
     test.wait_for_tasks().await;
 }
 
