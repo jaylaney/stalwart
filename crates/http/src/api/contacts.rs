@@ -66,8 +66,9 @@ use store::{
 use trc::AddContext;
 use types::collection::Collection;
 
-/// Withheld entries one `contacts/pin` call redelivers at most; the rest
-/// are `remaining` (spec 6.4). A constant, not a setting.
+/// Withheld entries one `contacts/pin` call attempts at most; the rest are
+/// `remaining` (spec 6.4), and an attendee-side entry waiting behind an
+/// incomplete drain is no attempt. A constant, not a setting.
 pub const REDELIVER_BATCH: usize = 32;
 
 #[derive(serde::Deserialize)]
@@ -404,6 +405,20 @@ enum Outcome {
     Failed,
     Dropped,
     Remaining,
+    /// An attendee-side entry after an incomplete drain: counted
+    /// `remaining`, without an attempt, so it spends none of the call's
+    /// budget.
+    Waiting,
+}
+
+/// `REDELIVER_BATCH`, or the test-mode override
+/// (`test_hooks::set_redeliver_batch_override`, through its forwarder).
+fn redeliver_batch() -> usize {
+    #[cfg(feature = "test_mode")]
+    if let Some(batch) = common::za::redeliver_batch_override() {
+        return batch;
+    }
+    REDELIVER_BATCH
 }
 
 /// Which side of the event the account is on, from its stored tree.
@@ -445,7 +460,7 @@ async fn za_redeliver(
         .iter()
         .filter(|entry| entry.address == address)
         .collect();
-    response.remaining += entries.len().saturating_sub(REDELIVER_BATCH);
+    let batch = redeliver_batch();
     let account_info = match server.account_info(account_id).await {
         Ok(account_info) => Some(account_info),
         Err(err) => {
@@ -459,7 +474,14 @@ async fn za_redeliver(
     };
     // The entries a delivery or a drop consumed, with their outcome.
     let mut consumed: Vec<(&ZaWithheld, Outcome)> = Vec::new();
-    for entry in entries.into_iter().take(REDELIVER_BATCH) {
+    // Every outcome but `Waiting` spends one of the call's `batch` slots;
+    // once they are spent, the rest are `remaining` without being loaded.
+    let mut spent = 0;
+    for entry in entries {
+        if spent >= batch {
+            response.remaining += 1;
+            continue;
+        }
         let outcome = match &account_info {
             Some(account_info) => {
                 match za_redeliver_entry(server, verified, account_info, entry, incomplete).await {
@@ -478,10 +500,15 @@ async fn za_redeliver(
             None => Outcome::Failed,
         };
         match outcome {
+            Outcome::Waiting => {
+                response.remaining += 1;
+                continue;
+            }
             Outcome::Delivered | Outcome::Dropped => consumed.push((entry, outcome)),
             Outcome::Failed => response.failed += 1,
             Outcome::Remaining => response.remaining += 1,
         }
+        spent += 1;
     }
     #[cfg(feature = "test_mode")]
     common::za::redeliver_cleanup_pause_point(account_id).await;
@@ -489,18 +516,28 @@ async fn za_redeliver(
     // Step 5: one conditional write retiring each consumed entry whose
     // stored refusal id is still the one read after the drain, checked on
     // every attempt; an entry re-armed meanwhile stays and is `remaining`.
-    let mut rearmed = vec![false; consumed.len()];
+    // `stays` flags the consumed entries still withheld afterwards.
+    let mut stays = vec![false; consumed.len()];
     if !consumed.is_empty() {
-        let retired = server
-            .za_pin_transact(&verified.keys, None, |state| {
-                za_retire(state, address, &consumed)
-            })
-            .await;
-        // A failed retirement leaves the entries withheld and undoes no
-        // delivery (spec 5.2).
+        #[cfg(feature = "test_mode")]
+        let fail = common::za::take_pin_write_fail(account_id);
+        #[cfg(not(feature = "test_mode"))]
+        let fail = false;
+        let retired = if fail {
+            Err(trc::StoreEvent::UnexpectedError
+                .into_err()
+                .details("zero-access test hook: pin record write failure")
+                .caused_by(trc::location!()))
+        } else {
+            server
+                .za_pin_transact(&verified.keys, None, |state| {
+                    za_retire(state, address, &consumed)
+                })
+                .await
+        };
         let failure = match retired {
             Ok(ZaPinTransact::Written { value, .. } | ZaPinTransact::Kept { value, .. }) => {
-                rearmed = value;
+                stays = value;
                 None
             }
             Ok(ZaPinTransact::Conflict) => Some(trc::StoreEvent::AssertValueFailed.into_err()),
@@ -512,10 +549,13 @@ async fn za_redeliver(
                     .details("zero-access: withheld entries not retired")
                     .caused_by(trc::location!())
             );
+            // A failed retirement leaves every consumed entry withheld,
+            // so each is `remaining`, and undoes no delivery (spec 5.2).
+            stays = vec![true; consumed.len()];
         }
     }
-    for ((_, outcome), rearmed) in consumed.iter().zip(rearmed) {
-        match (outcome, rearmed) {
+    for ((_, outcome), stays) in consumed.iter().zip(stays) {
+        match (outcome, stays) {
             (_, true) => response.remaining += 1,
             (Outcome::Delivered, false) => response.delivered += 1,
             (_, false) => response.dropped += 1,
@@ -621,8 +661,9 @@ async fn za_redeliver_entry(
                 Some(ZaUidLeaseGuard::new(server.store().clone(), lease)),
             )
         }
-        // The stale check would reject a REPLY behind a pending item.
-        Side::Attendee if incomplete => return Ok(Outcome::Remaining),
+        // The stale check would reject a REPLY behind a pending item: the
+        // entry waits for a complete drain, unattempted.
+        Side::Attendee if incomplete => return Ok(Outcome::Waiting),
         Side::Attendee => {
             let Some(message) = za_reply_from(tree, addresses, &entry.instances)
                 .and_then(|from| za_participation_reply(tree, addresses, &entry.instances, &from))

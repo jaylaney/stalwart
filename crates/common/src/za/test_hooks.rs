@@ -27,6 +27,9 @@
 //!   while it is held; global (`services::task_manager::manager`).
 //! - The lease-duration override: stands in for `ZA_UID_LEASE_SECS`, which
 //!   is read once per process.
+//! - The redelivery batch override: stands in for `REDELIVER_BATCH`, the
+//!   entries one `contacts/pin` call attempts (`http::api::contacts`,
+//!   through `common::za::redeliver_batch_override`).
 //! - `DRAIN_LOOKUP_PAUSE`: in the drain's import, after the first UID
 //!   lookup found nothing and before the creation lease, keyed by the
 //!   draining account (`groupware::calendar::drain`).
@@ -56,15 +59,18 @@
 //! - `RETIRE_PAUSE`: in the fan-out after phase 3's items and before the
 //!   phase 4 retirement, keyed by the sender; `contacts/pin`'s inner
 //!   fan-out reaches it too.
-//! - `PIN_WRITE_FAIL_ONCE`: the sender's next fan-out phase 2 pin-record
-//!   write fails once with an internal error.
+//! - `PIN_WRITE_FAIL_ONCE`: the account's next pin-record write by a
+//!   fan-out's phase 2 (as the sender) or by `contacts/pin`'s step 5
+//!   retirement (through `common::za::take_pin_write_fail`) fails once with
+//!   an internal error, whichever takes it first; set while `contacts/pin`
+//!   is parked at `REDELIVER_CLEANUP_PAUSE`, it reaches step 5.
 //! - `REDELIVER_CLEANUP_PAUSE`: in `contacts/pin` after its last event
 //!   commit, before the step 5 retirement, keyed by the account
 //!   (`http::api::contacts`, key pinning spec 6.4).
 
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicI64, AtomicU64, Ordering},
+    atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
 use tokio::sync::Notify;
 
@@ -115,7 +121,7 @@ pub static PIN_DECIDE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
 pub static RETIRE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
-/// The account whose next fan-out pin-record write fails.
+/// The account whose next fan-out or step 5 pin-record write fails.
 pub static PIN_WRITE_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
 
 pub static REDELIVER_CLEANUP_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
@@ -131,6 +137,9 @@ static DRAIN_RETRY_OVERRIDE: AtomicI64 = AtomicI64::new(-1);
 
 /// Seconds a new creation lease lasts; 0 when unset.
 static LEASE_SECS_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+
+/// Entries one `contacts/pin` call attempts; 0 when unset.
+static REDELIVER_BATCH_OVERRIDE: AtomicUsize = AtomicUsize::new(0);
 
 fn set_slot(slot: &Mutex<Option<Arc<Pause>>>, pause: Option<Arc<Pause>>) {
     *slot.lock().unwrap_or_else(|e| e.into_inner()) = pause;
@@ -162,6 +171,14 @@ pub fn set_lease_secs_override(secs: Option<u64>) {
 
 pub fn lease_secs_override() -> Option<u64> {
     Some(LEASE_SECS_OVERRIDE.load(Ordering::SeqCst)).filter(|secs| *secs > 0)
+}
+
+pub fn set_redeliver_batch_override(entries: Option<usize>) {
+    REDELIVER_BATCH_OVERRIDE.store(entries.unwrap_or(0), Ordering::SeqCst);
+}
+
+pub fn redeliver_batch_override() -> Option<usize> {
+    Some(REDELIVER_BATCH_OVERRIDE.load(Ordering::SeqCst)).filter(|entries| *entries > 0)
 }
 
 pub fn set_drain_lookup_pause(pause: Option<Arc<Pause>>) {
@@ -316,10 +333,10 @@ pub async fn redeliver_cleanup_pause_point(account_id: u32) {
     wait(take_for(&REDELIVER_CLEANUP_PAUSE, account_id)).await;
 }
 
-/// Whether the sender's fan-out pin-record write must fail now; clears the
-/// flag.
-pub fn take_pin_write_fail(sender_id: u32) -> bool {
-    take_flag(&PIN_WRITE_FAIL_ONCE, sender_id)
+/// Whether the account's fan-out or step 5 pin-record write must fail now;
+/// clears the flag.
+pub fn take_pin_write_fail(account_id: u32) -> bool {
+    take_flag(&PIN_WRITE_FAIL_ONCE, account_id)
 }
 
 /// Whether the drain commit of `account_id` must fail now; clears the flag.

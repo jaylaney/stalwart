@@ -86,6 +86,8 @@ pub async fn test(test: &mut TestServer) {
     rf_3_concurrent_first_use(test).await;
     rf_4_moved_source(test).await;
     rf_5_never_pinned(test).await;
+    fr_1_waiting_entry_spends_no_budget(test).await;
+    fr_2_failed_cleanup_counts_remaining(test).await;
 }
 
 /// Spec 9 case 1: alice, who never pinned, invites bob. The fan-out pins
@@ -2972,6 +2974,183 @@ async fn rf_5_never_pinned(test: &TestServer) {
     assert_eq!(wrap_mark(test, carol.id, STRONG).await, ZaMark::Legacy);
 }
 
+/// Final review F3 (spec 6.4): an attendee-side entry after an incomplete
+/// drain is `remaining` without spending the call's budget, so an
+/// organizer-side entry behind it in the record is still redelivered. bob
+/// holds both for alice, his refused answer to her invitation, then his
+/// refused invitation to her; carol's invitation, whose drain commit fails,
+/// keeps the drain incomplete; the batch is one entry. With the drain
+/// complete, the next call redelivers the answer.
+async fn fr_1_waiting_entry_spends_no_budget(test: &TestServer) {
+    let (alice, bob, carol) = parties(test);
+    let (alice_start, bob_start) = (
+        inbox_ids(test, alice.id).await,
+        inbox_ids(test, bob.id).await,
+    );
+    // bob pins alice first.
+    write_pin_record(
+        test,
+        bob.id,
+        STRONG,
+        &record_pinning(ALICE, served(test, alice.id).await),
+    )
+    .await;
+    let path_a = event_path(&alice, "pin-fr1a");
+    alice
+        .client
+        .request_with_headers(
+            "PUT",
+            &path_a,
+            [CONTENT_TYPE],
+            invite("pin-fr1a", START_A, &[BOB]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+    let copy = copy_href(test, bob.id, "pin-fr1a").await;
+    let original = substitute_public_key(test, alice.id, &writer_key(), true).await;
+    // The attendee-side entry first: bob's answer, refused.
+    assert_eq!(
+        rewrite(&bob.client, &copy, |body| with_bob_partstat(
+            &body,
+            Scope::Master,
+            "ACCEPTED"
+        ))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    // The organizer-side entry after it: bob's invitation, refused.
+    let path_b = event_path(&bob, "pin-fr1b");
+    bob.client
+        .request_with_headers(
+            "PUT",
+            &path_b,
+            [CONTENT_TYPE],
+            invite_from(BOB, "pin-fr1b", START_B, &[ALICE]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(
+        attendee_statuses(&bob.client, &path_b, ALICE).await,
+        ["3.8"]
+    );
+    let (copy_id, event_id) = (
+        document_id_of(test, bob.id, &copy).await,
+        document_id_of(test, bob.id, &path_b).await,
+    );
+    let documents = |entries: Vec<ZaWithheld>| -> Vec<u32> {
+        entries.iter().map(|entry| entry.document_id).collect()
+    };
+    assert_eq!(
+        documents(withheld(test, bob.id, ALICE).await),
+        [copy_id, event_id],
+        "the attendee-side entry ahead of the organizer-side one"
+    );
+    substitute_public_key(test, alice.id, &original, true).await;
+    // carol's invitation, pending in bob's inbox, fails to drain.
+    let path_c = event_path(&carol, "pin-fr1c");
+    carol
+        .client
+        .request_with_headers(
+            "PUT",
+            &path_c,
+            [CONTENT_TYPE],
+            invite_from(CAROL, "pin-fr1c", START_A, &[BOB]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let pending = pending_ids(test, bob.id).await;
+    assert_eq!(pending.len(), 1, "carol's invitation is pending");
+    let fingerprint = display_fingerprint(&served(test, alice.id).await);
+    test_hooks::set_drain_fail_item(Some((bob.id, pending[0])));
+    test_hooks::set_redeliver_batch_override(Some(1));
+    let reply = pin(BOB, ALICE, &fingerprint).await;
+    test_hooks::set_redeliver_batch_override(None);
+    test_hooks::set_drain_fail_item(None);
+    assert_eq!(
+        reply.expect(200),
+        json!({"ok": true, "delivered": 1, "failed": 0, "dropped": 0, "remaining": 1}),
+        "the waiting answer spends no budget: the invitation is delivered"
+    );
+    assert_eq!(
+        documents(withheld(test, bob.id, ALICE).await),
+        [copy_id],
+        "the answer stays withheld"
+    );
+    assert_eq!(
+        attendee_statuses(&bob.client, &path_b, ALICE).await,
+        ["1.2"]
+    );
+    assert_eq!(
+        pin(BOB, ALICE, &fingerprint).await.expect(200),
+        json!({"ok": true, "delivered": 1, "failed": 0, "dropped": 0, "remaining": 0}),
+        "the drain complete, the answer is redelivered"
+    );
+    assert!(withheld(test, bob.id, ALICE).await.is_empty());
+    assert_eq!(trigger_drain(ALICE, STRONG).await, 207);
+    assert_eq!(
+        partstat_of(&alice.client, &path_a, BOB).await.as_deref(),
+        Some("ACCEPTED")
+    );
+
+    // Cleanup.
+    delete_event(&alice, &path_a).await;
+    delete_event(&bob, &path_b).await;
+    delete_event(&carol, &path_c).await;
+    clear_recipient(test, &alice, &alice_start, "pin-fr1b").await;
+    clear_recipient(test, &bob, &bob_start, "pin-fr1a").await;
+    clear_recipient(test, &bob, &bob_start, "pin-fr1c").await;
+}
+
+/// Final review F5 (spec 5.2, 6.4 step 5): a failed cleanup leaves each
+/// consumed entry withheld and counts it `remaining`, not `delivered`; the
+/// delivery stands, and the next call delivers again and retires the
+/// entry. `PIN_WRITE_FAIL_ONCE` is set while `contacts/pin` is parked at
+/// `REDELIVER_CLEANUP_PAUSE`, after its inner fan-out (whose phase 2 would
+/// take it first), so the step 5 write fails.
+async fn fr_2_failed_cleanup_counts_remaining(test: &TestServer) {
+    let (alice, bob, _) = parties(test);
+    let bob_start = inbox_ids(test, bob.id).await;
+    let (path, original, _) = refuse_once(test, &alice, &bob, "pin-fr2").await;
+    substitute_public_key(test, bob.id, &original, true).await;
+    let fingerprint = display_fingerprint(&served(test, bob.id).await);
+    let before = inbox_ids(test, bob.id).await;
+    let parked = HookParked::start(
+        alice.id,
+        test_hooks::set_redeliver_cleanup_pause,
+        pin_request(ALICE, BOB, &fingerprint),
+    )
+    .await;
+    test_hooks::set_pin_write_fail(Some(alice.id));
+    let reply = parked.finish().await;
+    test_hooks::set_pin_write_fail(None);
+    assert_eq!(
+        reply.expect(200),
+        json!({"ok": true, "delivered": 0, "failed": 0, "dropped": 0, "remaining": 1}),
+        "a failed cleanup counts its entry remaining"
+    );
+    assert_eq!(
+        new_inbox_items(test, bob.id, &before).await.len(),
+        1,
+        "the delivery stands"
+    );
+    assert_eq!(withheld(test, alice.id, BOB).await.len(), 1);
+    assert_eq!(
+        listed(&contacts(ALICE).await, BOB)["withheld"],
+        1,
+        "the listing agrees with the counts"
+    );
+    assert_eq!(
+        pin(ALICE, BOB, &fingerprint).await.expect(200),
+        json!({"ok": true, "delivered": 1, "failed": 0, "dropped": 0, "remaining": 0})
+    );
+    assert!(withheld(test, alice.id, BOB).await.is_empty());
+
+    // Cleanup.
+    delete_event(&alice, &path).await;
+    clear_recipient(test, &bob, &bob_start, "pin-fr2").await;
+}
+
 /// alice, bob and carol, in that order.
 pub fn parties(test: &TestServer) -> (Party, Party, Party) {
     (
@@ -3004,18 +3183,21 @@ pub fn record_pinning(address: &str, key: [u8; 32]) -> ZaPinRecord {
 
 /// The withheld entries of the account's pin record for `address` (as
 /// stored, normalized), read under the MK `STRONG` unlocks; none when the
-/// record is absent or unusable.
+/// record is absent. A record that is stored but does not open panics, so
+/// an emptiness assertion cannot pass on an unusable record.
 pub async fn withheld(test: &TestServer, account_id: u32, address: &str) -> Vec<ZaWithheld> {
-    pin_record(test, account_id, STRONG)
-        .await
-        .map(|record| {
-            record
-                .withheld
-                .into_iter()
-                .filter(|entry| entry.address == address)
-                .collect()
-        })
-        .unwrap_or_default()
+    let Some(record) = pin_record(test, account_id, STRONG).await else {
+        assert!(
+            raw_pins(test, account_id).await.is_none(),
+            "the pin record of account {account_id} is stored but unusable"
+        );
+        return Vec::new();
+    };
+    record
+        .withheld
+        .into_iter()
+        .filter(|entry| entry.address == address)
+        .collect()
 }
 
 /// The account's served public key (key pinning spec 5.1); it must have one.
