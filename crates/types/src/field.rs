@@ -87,6 +87,9 @@ pub enum PrincipalField {
     /// 46 was `EncryptionKeys` and then `IdentityAddresses` (0.16.18) before
     /// that moved to 110, so leftover bytes there must not read as a record.
     ZeroAccessVault = 150,
+    /// Zero-access pin record. 151 has never been assigned to any field in
+    /// upstream's history, so leftover bytes there cannot read as a record.
+    ZeroAccessPins = 151,
 }
 
 impl From<ContactField> for u8 {
@@ -167,6 +170,7 @@ impl From<PrincipalField> for u8 {
             PrincipalField::ActiveScriptId => 49,
             PrincipalField::PushSubscriptions => 44,
             PrincipalField::ZeroAccessVault => 150,
+            PrincipalField::ZeroAccessPins => 151,
             PrincipalField::Archive => ARCHIVE_FIELD,
         }
     }

@@ -160,6 +160,14 @@ pub const AAD_PRIVATE_KEY: &str = "private-key";
 pub const AAD_PK_DEK: &str = "pk-dek";
 /// Length of an X25519 public key.
 pub const PUBLIC_KEY_LEN: usize = 32;
+/// AAD purpose of the pin record sealed under MK (key pinning spec 4.1).
+pub const AAD_PINS: &str = "pins";
+/// AAD purpose of the pinned wrap of the X25519 private key under MK: the
+/// account has pinned (key pinning spec 4.4). `AAD_PRIVATE_KEY` is the
+/// legacy wrap.
+pub const AAD_PRIVATE_KEY_PINNED: &str = "private-key/pins";
+/// Length of a public-key fingerprint: a SHA-256 prefix (key pinning spec 3.1).
+pub const FINGERPRINT_LEN: usize = 16;
 
 /// Associated data naming the purpose and the account, so a ciphertext
 /// cannot be replayed as a different wrap or on a different account.
@@ -239,6 +247,101 @@ pub fn generate_keypair() -> ([u8; 32], Secret) {
     let secret = x25519_dalek::StaticSecret::from(*private.as_bytes());
     let public = x25519_dalek::PublicKey::from(&secret);
     (public.to_bytes(), private)
+}
+
+/// The X25519 public key of `private_key`. An account's own fingerprint is
+/// computed from this, never from the stored `public_key` (key pinning spec
+/// 3.2).
+pub fn derive_public_key(private_key: &Secret) -> [u8; PUBLIC_KEY_LEN] {
+    let secret = x25519_dalek::StaticSecret::from(*private_key.as_bytes());
+    x25519_dalek::PublicKey::from(&secret).to_bytes()
+}
+
+/// Key pinning spec 3.1: the first 16 bytes of SHA-256 over the public key.
+pub fn fingerprint_bytes(public_key: &[u8; PUBLIC_KEY_LEN]) -> [u8; FINGERPRINT_LEN] {
+    let digest: [u8; 32] = Sha256::digest(public_key).into();
+    let mut out = [0u8; FINGERPRINT_LEN];
+    out.copy_from_slice(&digest[..FINGERPRINT_LEN]);
+    out
+}
+
+/// `fingerprint_bytes` as lowercase hex in 8 space-separated groups of 4,
+/// such as `3f0a 9c41 07be 22d8 e1f0 5a6c 0b93 77e2` (key pinning spec 3.1).
+pub fn display_fingerprint(public_key: &[u8; PUBLIC_KEY_LEN]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(FINGERPRINT_LEN * 2 + FINGERPRINT_LEN / 2 - 1);
+    for (index, byte) in fingerprint_bytes(public_key).into_iter().enumerate() {
+        if index > 0 && index % 2 == 0 {
+            out.push(' ');
+        }
+        out.push(HEX[usize::from(byte >> 4)] as char);
+        out.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    out
+}
+
+/// Parses a fingerprint in any case and spacing: whitespace is removed and
+/// exactly 32 hex digits must remain (key pinning spec 6.4).
+pub fn parse_fingerprint(text: &str) -> Option<[u8; FINGERPRINT_LEN]> {
+    fn hex_value(c: char) -> Option<u8> {
+        c.to_digit(16).and_then(|value| u8::try_from(value).ok())
+    }
+    let mut digits = text.chars().filter(|c| !c.is_whitespace());
+    let mut out = [0u8; FINGERPRINT_LEN];
+    for byte in out.iter_mut() {
+        let high = hex_value(digits.next()?)?;
+        let low = hex_value(digits.next()?)?;
+        *byte = (high << 4) | low;
+    }
+    digits.next().is_none().then_some(out)
+}
+
+/// The associated data a private-key wrap opened under (key pinning spec
+/// 4.4): whether the account has pinned is carried by it, not by a stored
+/// field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WrapMark {
+    /// `AAD_PRIVATE_KEY_PINNED`: the account has pinned.
+    Pinned,
+    /// `AAD_PRIVATE_KEY`, release 2's wrap: the account never pinned.
+    Legacy,
+}
+
+impl WrapMark {
+    fn purpose(self) -> &'static str {
+        match self {
+            WrapMark::Pinned => AAD_PRIVATE_KEY_PINNED,
+            WrapMark::Legacy => AAD_PRIVATE_KEY,
+        }
+    }
+}
+
+/// Wraps the X25519 private key under MK with the associated data of `mark`
+/// (`WRAP_LEN` bytes, the layout of release 2's wrap).
+pub fn wrap_private_key(
+    private_key: &Secret,
+    mk: &Secret,
+    account_id: u32,
+    mark: WrapMark,
+) -> Vec<u8> {
+    wrap_key(private_key, mk, &aad(mark.purpose(), account_id))
+}
+
+/// Opens a private-key wrap under the pinned associated data first, then the
+/// legacy (key pinning spec 4.4). `Err(KeyError::Aead)` when neither opens.
+pub fn unwrap_private_key(
+    wrap: &[u8],
+    mk: &Secret,
+    account_id: u32,
+) -> Result<(Secret, WrapMark), KeyError> {
+    [WrapMark::Pinned, WrapMark::Legacy]
+        .into_iter()
+        .find_map(|mark| {
+            unwrap_key(wrap, mk, &aad(mark.purpose(), account_id))
+                .ok()
+                .map(|key| (key, mark))
+        })
+        .ok_or(KeyError::Aead)
 }
 
 /// Wrapping key of a `pk` wrap: HKDF over the shared secret with the info
@@ -530,5 +633,62 @@ mod tests {
         assert_eq!(key.as_bytes(), hkdf_expand(&shared, &info).as_bytes());
         assert_ne!(key.as_bytes(), pk_wrapping_key(&shared, &p, &e).as_bytes());
         assert_ne!(key.as_bytes(), hkdf_expand(&shared, LABEL_PK).as_bytes());
+    }
+
+    /// RFC 7748 section 6.1, Alice's public key.
+    const RFC7748_ALICE: &str = "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a";
+
+    fn hex32(text: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (byte, pair) in out.iter_mut().zip(text.as_bytes().chunks(2)) {
+            *byte = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn display_fingerprint_is_the_sha256_prefix_in_eight_groups() {
+        let key: [u8; 32] = hex32(RFC7748_ALICE);
+        assert_eq!(
+            display_fingerprint(&key),
+            "300c 9c96 03b9 2a4b 39ed 3958 bf92 4011"
+        );
+        assert_eq!(
+            display_fingerprint(&[0u8; 32]),
+            "6668 7aad f862 bd77 6c8f c18b 8e9f 8e20"
+        );
+        assert_eq!(
+            parse_fingerprint("300C9C9603B92A4B 39ED 3958 BF92 4011"),
+            Some(fingerprint_bytes(&key))
+        );
+        for bad in [
+            "",
+            "300c 9c96",
+            "300c 9c96 03b9 2a4b 39ed 3958 bf92 40110",
+            "zz0c 9c96 03b9 2a4b 39ed 3958 bf92 4011",
+        ] {
+            assert_eq!(parse_fingerprint(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn pinned_and_legacy_wraps_open_only_under_their_own_purpose() {
+        let mk = Secret::random();
+        let (public, private) = generate_keypair();
+        let pinned = wrap_private_key(&private, &mk, 7, WrapMark::Pinned);
+        let legacy = wrap_private_key(&private, &mk, 7, WrapMark::Legacy);
+        assert_eq!((pinned.len(), legacy.len()), (WRAP_LEN, WRAP_LEN));
+        assert!(unwrap_key(&pinned, &mk, &aad(AAD_PRIVATE_KEY, 7)).is_err());
+        assert!(unwrap_key(&legacy, &mk, &aad(AAD_PRIVATE_KEY_PINNED, 7)).is_err());
+        let (key, mark) = unwrap_private_key(&pinned, &mk, 7).unwrap();
+        assert_eq!((mark, derive_public_key(&key)), (WrapMark::Pinned, public));
+        assert_eq!(
+            unwrap_private_key(&legacy, &mk, 7).unwrap().1,
+            WrapMark::Legacy
+        );
+        assert_eq!(
+            unwrap_private_key(&pinned, &mk, 8).err(),
+            Some(KeyError::Aead)
+        );
     }
 }

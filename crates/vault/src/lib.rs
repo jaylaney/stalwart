@@ -6,6 +6,7 @@
 
 pub mod cache;
 pub mod keys;
+pub mod pins;
 pub mod record;
 pub mod recovery;
 pub mod session;
