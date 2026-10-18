@@ -700,7 +700,7 @@ fn route(
 
 /// The event's ORGANIZER: the first one in a scheduling component,
 /// `is_local` when it is one of the sender's addresses.
-fn event_organizer(event: &ICalendar, sender_addresses: &[String]) -> Option<Email> {
+pub(crate) fn event_organizer(event: &ICalendar, sender_addresses: &[String]) -> Option<Email> {
     event
         .components
         .iter()

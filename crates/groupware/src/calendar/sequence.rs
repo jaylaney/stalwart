@@ -28,9 +28,12 @@
 //! resolves it, never by text or component id.
 
 use crate::{
-    calendar::drain::{InstanceKey, instance_key},
+    calendar::{
+        drain::{InstanceKey, instance_key},
+        fanout::event_organizer,
+    },
     scheduling::{
-        Email, InstanceId, ItipMessage, RecurrenceId, inbound::itip_method, snapshot::itip_snapshot,
+        InstanceId, ItipMessage, RecurrenceId, inbound::itip_method, snapshot::itip_snapshot,
     },
 };
 use ahash::AHashMap;
@@ -102,7 +105,7 @@ pub fn za_instance_keys(ical: &ICalendar) -> Vec<(u16, InstanceKey)> {
 /// SEQUENCE when its own is lower or absent; a higher one stays, and no
 /// component is added or removed. `true` when anything changed.
 pub fn za_sequence_floor(new: &mut ICalendar, stored: &ICalendar, addresses: &[String]) -> bool {
-    if !organizes(stored, addresses) {
+    if !event_organizer(stored, addresses).is_some_and(|organizer| organizer.is_local) {
         return false;
     }
     let mut floors: AHashMap<InstanceKey, i64> = AHashMap::new();
@@ -136,6 +139,8 @@ pub fn za_reconcile_sequences(
     messages: &mut [ItipMessage<ICalendar>],
     addresses: &[String],
 ) -> Vec<ZaSequence> {
+    // The snapshot's ORGANIZER is `event_organizer`'s whenever the snapshot
+    // exists (it rejects a second, different ORGANIZER).
     if !itip_snapshot(committed, addresses, false)
         .is_ok_and(|snapshots| snapshots.organizer.email.is_local)
     {
@@ -207,23 +212,6 @@ pub fn za_set_sequences(ical: &mut ICalendar, sequences: &[ZaSequence]) {
     }
 }
 
-/// Whether the tree's ORGANIZER (the first in a scheduling component) is
-/// one of `addresses`.
-fn organizes(ical: &ICalendar, addresses: &[String]) -> bool {
-    ical.components
-        .iter()
-        .filter(|comp| comp.component_type.is_scheduling_object())
-        .find_map(|comp| {
-            comp.entries
-                .iter()
-                .find(|entry| entry.name == ICalendarProperty::Organizer)
-                .and_then(|entry| entry.values.first())
-                .and_then(|value| value.as_text())
-                .and_then(|value| Email::new(value, addresses))
-        })
-        .is_some_and(|organizer| organizer.is_local)
-}
-
 /// The component's SEQUENCE as `itip_snapshot` reads it (the last integer
 /// value); `None` when absent.
 fn sequence_of(comp: &ICalendarComponent) -> Option<i64> {
@@ -291,11 +279,15 @@ mod tests {
 
     /// One VEVENT naming bob, organized by `organizer`: the master (daily)
     /// without `recurrence_id`, else an override with that RECURRENCE-ID
-    /// value (and its parameters); no SEQUENCE when `sequence` is `None`.
+    /// value (and its parameters, RANGE kept off DTSTART); no SEQUENCE
+    /// when `sequence` is `None`.
     fn vevent(recurrence_id: Option<&str>, sequence: Option<i64>, organizer: &str) -> String {
         let instance = match recurrence_id {
             None => "DTSTART:20990301T100000Z\r\nRRULE:FREQ=DAILY;COUNT=7\r\n".to_string(),
-            Some(id) => format!("RECURRENCE-ID{id}\r\nDTSTART{id}\r\n"),
+            Some(id) => format!(
+                "RECURRENCE-ID{id}\r\nDTSTART{}\r\n",
+                id.replace(";RANGE=THISANDFUTURE", "")
+            ),
         };
         let sequence = sequence
             .map(|sequence| format!("SEQUENCE:{sequence}\r\n"))
@@ -347,9 +339,9 @@ mod tests {
     /// bumped by two), Z at 2, after the VTIMEZONE (so no message's
     /// component ids line up with it). The messages: [0] a partial REQUEST
     /// for Z at 3; [1] a CANCEL from the old tree, W (an override removed in
-    /// the same PUT) then X in the TZID form at 5, its VTIMEZONE appended
-    /// as `itip_add_tz` appends it; [2] a CANCEL for W at 2; [3] bob's
-    /// REPLY for X at 0.
+    /// the same PUT) at 3 then X in the TZID form at 5, its VTIMEZONE
+    /// appended as `itip_add_tz` appends it; [2] a CANCEL for W at 2; [3]
+    /// bob's REPLY for X at 0.
     fn fixture() -> (ICalendar, Vec<ItipMessage<ICalendar>>) {
         let committed = calendar(
             None,
@@ -373,7 +365,7 @@ mod tests {
                 calendar(
                     Some("CANCEL"),
                     &[
-                        by_alice(Some(":20990301T100000Z"), Some(2)),
+                        by_alice(Some(":20990301T100000Z"), Some(3)),
                         by_alice(Some(";TZID=Etc/GMT-1:20990303T110000"), Some(5)),
                         TIMEZONE.to_string(),
                     ],
@@ -424,10 +416,12 @@ mod tests {
         );
         assert_eq!((seq(&committed, Z), seq(&messages[0].message, Z)), (3, 3));
         assert_eq!(
-            seq(&messages[2].message, W),
-            2,
-            "an instance the committed tree lacks"
+            (seq(&messages[1].message, W), seq(&messages[2].message, W)),
+            (3, 3),
+            "an instance the committed tree lacks: the messages' maximum"
         );
+        assert!(component(&committed, W).is_none(), "W is not added");
+        assert!(set.iter().all(|s| s.instance != W), "W is not returned");
         assert_eq!(committed.components.len(), before, "no component is added");
         assert_eq!(seq(&messages[3].message, X), 0, "replies are untouched");
         assert_eq!(
@@ -446,6 +440,58 @@ mod tests {
         let (mut applied, _) = fixture();
         za_set_sequences(&mut applied, &set);
         assert_eq!(applied, committed);
+    }
+
+    #[test]
+    fn applying_the_sequences_never_lowers_one() {
+        // contacts/pin's retry: a concurrent edit's higher value survives.
+        let mut tree = calendar(
+            None,
+            &[
+                by_alice(None, Some(1)),
+                by_alice(Some(":20990303T100000Z"), Some(9)),
+            ],
+        );
+        za_set_sequences(
+            &mut tree,
+            &[ZaSequence {
+                instance: X,
+                sequence: 6,
+            }],
+        );
+        assert_eq!(seq(&tree, X), 9);
+    }
+
+    #[test]
+    fn instance_keys_agree_with_itip_snapshot() {
+        // UTC, TZID, floating and RANGE=THISANDFUTURE RECURRENCE-IDs.
+        let tree = calendar(
+            None,
+            &[
+                TIMEZONE.to_string(),
+                by_alice(None, Some(0)),
+                by_alice(Some(":20990302T100000Z"), Some(0)),
+                by_alice(Some(";TZID=Etc/GMT-1:20990303T110000"), Some(0)),
+                by_alice(Some(":20990304T100000"), Some(0)),
+                by_alice(Some(";RANGE=THISANDFUTURE:20990305T100000Z"), Some(0)),
+            ],
+        );
+        let mut ours: Vec<InstanceKey> = za_instance_keys(&tree)
+            .into_iter()
+            .map(|(_, instance)| instance)
+            .collect();
+        let snapshots = itip_snapshot(&tree, &alice(), false).expect("a local ORGANIZER");
+        let mut upstream: Vec<InstanceKey> =
+            snapshots.components.keys().map(instance_key).collect();
+        ours.sort();
+        upstream.sort();
+        assert_eq!(ours, upstream);
+        assert_eq!(ours.len(), 5);
+        assert!(ours.contains(&X), "the TZID form resolves by instant");
+        assert!(
+            ours.contains(&Some((4_076_388_000, true))),
+            "RANGE=THISANDFUTURE"
+        );
     }
 
     /// stored: master 4, X 9 (TZID form), Y 5, R 1, organized by
