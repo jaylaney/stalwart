@@ -1073,6 +1073,10 @@ async fn case_17_cleanup_races(test: &TestServer) {
     let edited = body(&alice.client, &path)
         .await
         .replace("fo-title pin-17c v2", "fo-title pin-17c v3");
+    assert!(
+        pending_ids(test, alice.id).await.is_empty(),
+        "nothing pending: the pause parks the edit's fan-out, not a merge's"
+    );
     let parked = HookParked::start(
         alice.id,
         test_hooks::set_retire_pause,
@@ -1127,6 +1131,11 @@ async fn case_17_cleanup_races(test: &TestServer) {
         (entries.len(), entries[0].refusal_id),
         (1, newer),
         "the re-armed entry stays"
+    );
+    assert_eq!(
+        attendee_statuses(&alice.client, &path, SUB_D).await,
+        ["3.8"],
+        "the newer refusal's status survives"
     );
     delete_event(&alice, &path).await;
     drop_entries(ALICE, SUB_D).await;
