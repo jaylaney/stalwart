@@ -58,6 +58,9 @@
 //!   fan-out reaches it too.
 //! - `PIN_WRITE_FAIL_ONCE`: the sender's next fan-out phase 2 pin-record
 //!   write fails once with an internal error.
+//! - `REDELIVER_CLEANUP_PAUSE`: in `contacts/pin` after its last event
+//!   commit, before the step 5 retirement, keyed by the account
+//!   (`http::api::contacts`, key pinning spec 6.4).
 
 use std::sync::{
     Arc, Mutex,
@@ -114,6 +117,8 @@ pub static RETIRE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
 /// The account whose next fan-out pin-record write fails.
 pub static PIN_WRITE_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+
+pub static REDELIVER_CLEANUP_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
 /// Accounts whose drain does not run; `DRAIN_SKIP_ALL` stands for every
 /// account.
@@ -199,6 +204,10 @@ pub fn set_pin_decide_pause(pause: Option<Arc<Pause>>) {
 
 pub fn set_retire_pause(pause: Option<Arc<Pause>>) {
     set_slot(&RETIRE_PAUSE, pause);
+}
+
+pub fn set_redeliver_cleanup_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&REDELIVER_CLEANUP_PAUSE, pause);
 }
 
 pub fn set_pin_write_fail(account_id: Option<u32>) {
@@ -301,6 +310,10 @@ pub async fn pin_decide_pause_point(sender_id: u32) {
 
 pub async fn retire_pause_point(sender_id: u32) {
     wait(take_for(&RETIRE_PAUSE, sender_id)).await;
+}
+
+pub async fn redeliver_cleanup_pause_point(account_id: u32) {
+    wait(take_for(&REDELIVER_CLEANUP_PAUSE, account_id)).await;
 }
 
 /// Whether the sender's fan-out pin-record write must fail now; clears the

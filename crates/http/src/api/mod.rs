@@ -10,6 +10,7 @@
 #[cfg(feature = "enterprise")]
 pub mod telemetry;
 // SPDX-SnippetEnd
+pub mod contacts;
 pub mod diagnose;
 pub mod vault;
 
