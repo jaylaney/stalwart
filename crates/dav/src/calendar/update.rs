@@ -34,6 +34,7 @@ use groupware::{
         fanout::{ZaFanOut, ZaFanOutKind, ZaSource, za_set_schedule_status},
         itip::ItipSendStatus,
         seal::{event_token_pairs, seal_error, seal_event},
+        sequence::{za_sequence_floor, za_set_sequences},
     },
     scheduling::{
         ItipMessages, event_create::itip_create, event_update::itip_update,
@@ -111,7 +112,7 @@ impl CalendarUpdateRequestHandler for Server {
             )
         })?;
 
-        let ical = match Parser::new(ical_raw).entry() {
+        let mut ical = match Parser::new(ical_raw).entry() {
             Entry::ICalendar(ical) => ical,
             _ => {
                 return Err(DavError::Condition(
@@ -230,6 +231,11 @@ impl CalendarUpdateRequestHandler for Server {
                 .deserialize::<CalendarEvent>()
                 .caused_by(trc::location!())?;
             let old_ical = new_event.data.event;
+            // Key pinning spec 5.1: the SEQUENCE floor, on every PUT of an
+            // existing event of a key account, before the scheduling step.
+            if za_keys.is_some() {
+                za_sequence_floor(&mut ical, &old_ical, account_info.addresses());
+            }
             new_event.size = bytes.len() as u32;
             new_event.data = CalendarEventData::new_for(
                 ical,
@@ -363,6 +369,7 @@ impl CalendarUpdateRequestHandler for Server {
                         .await
                         .caused_by(trc::location!())?;
                     za_set_schedule_status(&mut new_event.data.event, &fan_out.statuses);
+                    za_set_sequences(&mut new_event.data.event, &fan_out.sequences);
                     pairs = fan_out.pairs;
                 }
                 seal_event(&mut new_event, keys, account_id, pairs.as_ref())
@@ -589,6 +596,7 @@ impl CalendarUpdateRequestHandler for Server {
                         Err(err) => return Err(err.caused_by(trc::location!()).into()),
                     };
                     za_set_schedule_status(&mut event.data.event, &fan_out.statuses);
+                    za_set_sequences(&mut event.data.event, &fan_out.sequences);
                     pairs = fan_out.pairs;
                 }
                 seal_event(&mut event, keys, account_id, pairs.as_ref())

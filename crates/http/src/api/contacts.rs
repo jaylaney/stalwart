@@ -50,6 +50,7 @@ use groupware::{
         itip::ItipSendStatus,
         pinning::{za_full_request_for, za_participation_reply, za_reply_from},
         seal::{TokenPairs, seal_error, seal_event, unseal_event_pairs},
+        sequence::{ZaSequence, za_set_sequences},
     },
     scheduling::{
         itip::{ITIP_STATUS_DELIVERED, ITIP_STATUS_NOT_ATTEMPTED},
@@ -686,6 +687,7 @@ async fn za_redeliver_entry(
         // archive; the schedule tag is unchanged.
         None => {
             za_set_schedule_status(&mut event.data.event, &fan_out.statuses);
+            za_set_sequences(&mut event.data.event, &fan_out.sequences);
             match za_reseal(
                 server,
                 verified,
@@ -698,11 +700,16 @@ async fn za_redeliver_entry(
             .await
             {
                 Ok(()) => Ok(Outcome::Delivered),
-                Err(err) if err.is_assertion_failure() => {
-                    za_reseal_again(server, verified, account_info, entry, &fan_out.statuses)
-                        .await
-                        .map(|()| Outcome::Remaining)
-                }
+                Err(err) if err.is_assertion_failure() => za_reseal_again(
+                    server,
+                    verified,
+                    account_info,
+                    entry,
+                    &fan_out.statuses,
+                    &fan_out.sequences,
+                )
+                .await
+                .map(|()| Outcome::Remaining),
                 Err(err) => Err(err),
             }
         }
@@ -789,14 +796,17 @@ async fn za_reseal(
 
 /// Step 4 after a lost archive assertion: once more from the fresh archive
 /// (its own token pairs, never those read at step 1), applying the status
-/// only while the fresh pin record still holds the consumed refusal id; a
-/// newer refusal, a gone document or a second loss writes nothing.
+/// and the sequences (raised only, so a concurrent edit's higher SEQUENCE
+/// survives) only while the fresh pin record still holds the consumed
+/// refusal id; a newer refusal, a gone document or a second loss writes
+/// nothing.
 async fn za_reseal_again(
     server: &Server,
     verified: &ZaVerified,
     account_info: &AccountInfo,
     entry: &ZaWithheld,
     statuses: &[ZaScheduleStatus],
+    sequences: &[ZaSequence],
 ) -> trc::Result<()> {
     let account_id = verified.account_id;
     let document_id = entry.document_id;
@@ -819,6 +829,7 @@ async fn za_reseal_again(
         return Ok(());
     }
     za_set_schedule_status(&mut event.data.event, statuses);
+    za_set_sequences(&mut event.data.event, sequences);
     match za_reseal(
         server,
         verified,

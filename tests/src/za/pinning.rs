@@ -59,6 +59,7 @@ pub async fn test(test: &mut TestServer) {
     case_08_stale_first_use(test).await;
     case_09_healing(test).await;
     case_10_replay(test).await;
+    case_12_partial_changes(test).await;
     case_14_delegates(test).await;
     case_15_pre_pin(test).await;
     case_16_pin_before_deliver(test).await;
@@ -755,6 +756,86 @@ async fn case_10_replay(test: &TestServer) {
     delete_event(&carol, &path_b).await;
     clear_recipient(test, &alice, &alice_start, "pin-10a").await;
     clear_recipient(test, &bob, &bob_start, "pin-10b").await;
+}
+
+/// Spec 9 case 12 (spec 5.1): partial changes to the existing overrides A
+/// (day 2) and B (day 3) of a daily event naming bob and carol, bob
+/// drained, each variant its own event. `pin-12a`: both moves refused;
+/// after `contacts/pin` bob's copy holds both. `pin-12b`: the move of A
+/// reaches bob, then the move of B is refused; the redelivered full state
+/// carries A at the partial's SEQUENCE (the reconciliation), so bob's copy
+/// does not reject it as `OutOfSequence`. `pin-12c`: as `pin-12b`, the
+/// second PUT also writing A's SEQUENCE one below the stored value (the
+/// floor).
+async fn case_12_partial_changes(test: &TestServer) {
+    const A_AT: &str = "DTSTART:20990302T100000Z";
+    const A_MOVED: &str = "DTSTART:20990302T120000Z";
+    const B_AT: &str = "DTSTART:20990303T100000Z";
+    const B_MOVED: &str = "DTSTART:20990303T120000Z";
+    let (alice, bob, carol) = parties(test);
+    for uid in ["pin-12a", "pin-12b", "pin-12c"] {
+        let (bob_start, carol_start) = (
+            inbox_ids(test, bob.id).await,
+            inbox_ids(test, carol.id).await,
+        );
+        let path = event_path(&alice, uid);
+        alice
+            .client
+            .request_with_headers("PUT", &path, [CONTENT_TYPE], partial_invite(uid))
+            .await
+            .with_status(StatusCode::CREATED);
+        assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+        let move_a = |body: String| body.replace(A_AT, A_MOVED);
+        let original = if uid == "pin-12a" {
+            let original = substitute_public_key(test, bob.id, &writer_key(), true).await;
+            assert_eq!(
+                rewrite(&alice.client, &path, move_a).await,
+                StatusCode::NO_CONTENT
+            );
+            original
+        } else {
+            // The delivered partial.
+            assert_eq!(
+                rewrite(&alice.client, &path, move_a).await,
+                StatusCode::NO_CONTENT
+            );
+            assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+            let copy = body(&bob.client, &copy_href(test, bob.id, uid).await).await;
+            assert!(copy.contains(A_MOVED), "{uid}: {copy}");
+            substitute_public_key(test, bob.id, &writer_key(), true).await
+        };
+        assert_eq!(
+            rewrite(&alice.client, &path, |body| {
+                let body = body.replace(B_AT, B_MOVED);
+                if uid == "pin-12c" {
+                    lower_sequence(&body, START_B)
+                } else {
+                    body
+                }
+            })
+            .await,
+            StatusCode::NO_CONTENT
+        );
+        substitute_public_key(test, bob.id, &original, true).await;
+        let fp = display_fingerprint(&served(test, bob.id).await);
+        assert_eq!(pin(ALICE, BOB, &fp).await.expect(200)["delivered"], 1);
+        assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+        assert!(pending_ids(test, bob.id).await.is_empty());
+        let copy = body(&bob.client, &copy_href(test, bob.id, uid).await).await;
+        if uid == "pin-12a" {
+            assert!(
+                copy.contains(A_MOVED) && copy.contains(B_MOVED),
+                "{uid}: {copy}"
+            );
+        } else {
+            assert!(copy.contains(B_MOVED), "{uid}: no OutOfSequence: {copy}");
+        }
+
+        // Cleanup.
+        delete_event(&alice, &path).await;
+        clear_recipient(test, &bob, &bob_start, uid).await;
+        clear_recipient(test, &carol, &carol_start, uid).await;
+    }
 }
 
 /// Spec 9 case 14 (spec 5.6): (organizer side) the drain's delegating
@@ -2114,6 +2195,40 @@ pub fn recurring_invite(uid: &str, attendees: &[&str], override_attendees: &[&st
             "DURATION:PT1H\r\nRRULE:FREQ=DAILY;COUNT=5\r\n",
         )
         .replace("END:VEVENT\r\nEND:VCALENDAR\r\n", &override_x)
+}
+
+/// `recurring_invite` naming bob and carol on the master and on override A
+/// (day 2, `START_B`), with a copy of A as override B (day 3).
+fn partial_invite(uid: &str) -> String {
+    let one = recurring_invite(uid, &[BOB, CAROL], &[BOB, CAROL]);
+    let start = one.rfind("BEGIN:VEVENT").unwrap();
+    let end = one.rfind("END:VCALENDAR").unwrap();
+    let b = one[start..end].replace(START_B, "20990303T100000Z");
+    format!("{}{b}{}", &one[..end], &one[end..])
+}
+
+/// `body` with the SEQUENCE of the override whose RECURRENCE-ID is
+/// `recurrence_id` (UTC) one below its stored value.
+fn lower_sequence(body: &str, recurrence_id: &str) -> String {
+    let target = format!("RECURRENCE-ID:{recurrence_id}");
+    let lowered = body
+        .split("BEGIN:VEVENT")
+        .map(|part| {
+            if !part.contains(&target) {
+                return part.to_string();
+            }
+            part.split("\r\n")
+                .map(|line| match line.strip_prefix("SEQUENCE:") {
+                    Some(value) => format!("SEQUENCE:{}", value.parse::<i64>().unwrap() - 1),
+                    None => line.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join("\r\n")
+        })
+        .collect::<Vec<_>>()
+        .join("BEGIN:VEVENT");
+    assert_ne!(lowered, body, "the override has a SEQUENCE: {body}");
+    lowered
 }
 
 /// Which components `edit_attendee` edits.

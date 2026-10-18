@@ -49,12 +49,18 @@
 //!    traced and undoes nothing.
 //!
 //! The pin-record writes carry no UID lease fence (5.5).
+//!
+//! Ahead of phase 1, unless the fan-out is a deletion, a clone of the
+//! sender's tree and the messages are reconciled (spec 5.1,
+//! `sequence::za_reconcile_sequences`); the phases build from that clone,
+//! and the committed values return for `za_set_sequences`.
 
 use crate::{
     calendar::{
         CalendarEventNotification, ChangedBy, EVENT_NOTIFICATION_ZA_PENDING,
         drain::instance_key,
         seal::{TOKEN_LEN, TokenPairs, seal_error, seal_pending_item},
+        sequence::{ZaSequence, za_reconcile_sequences},
     },
     scheduling::{
         Email, ItipMessage, ical_size,
@@ -114,6 +120,9 @@ pub struct ZaFanOutResult {
     /// For `za_set_schedule_status` on the sender's plaintext tree, before
     /// it is sealed.
     pub statuses: Vec<ZaScheduleStatus>,
+    /// The reconciliation's committed values (key pinning spec 5.1), for
+    /// `za_set_sequences` on the same tree, next to the statuses.
+    pub sequences: Vec<ZaSequence>,
 }
 
 /// A CANCEL (organizer) or declined REPLY (attendee) that a key account's
@@ -166,6 +175,9 @@ pub trait ZaFanOut: Sync + Send {
     /// the first write that finds it taken over fails the call (an
     /// assertion failure), so no item is written after the fence is lost.
     /// The pin-record writes carry no fence (key pinning spec 5.5).
+    /// Unless `kind` is `Deletion`, the messages and a clone of `event` are
+    /// first reconciled (key pinning spec 5.1); the result's `sequences`
+    /// are the clone's committed values.
     #[allow(clippy::too_many_arguments)]
     fn za_fan_out(
         &self,
@@ -186,7 +198,7 @@ impl ZaFanOut for Server {
         &self,
         sender: &AccountInfo,
         keys: &SessionKeys,
-        messages: Vec<ItipMessage<ICalendar>>,
+        mut messages: Vec<ItipMessage<ICalendar>>,
         stored_pairs: Option<TokenPairs>,
         event: &ICalendar,
         source: ZaSource<'_>,
@@ -201,6 +213,16 @@ impl ZaFanOut for Server {
                 .account_id(sender_id)
                 .caused_by(trc::location!()));
         }
+        // Key pinning spec 5.1: the SEQUENCE reconciliation, on a clone of
+        // the sender's tree; a deletion leaves its CANCEL as built.
+        let (reconciled, sequences) = if kind == ZaFanOutKind::Deletion {
+            (None, Vec::new())
+        } else {
+            let mut tree = event.clone();
+            let sequences = za_reconcile_sequences(&mut tree, &mut messages, sender.addresses());
+            (Some(tree), sequences)
+        };
+        let event = reconciled.as_ref().unwrap_or(event);
         let organizer = event_organizer(event, sender.addresses());
         let is_organizer = organizer
             .as_ref()
@@ -428,6 +450,7 @@ impl ZaFanOut for Server {
         Ok(ZaFanOutResult {
             pairs: pairs.filter(|pairs| !pairs.is_empty()),
             statuses,
+            sequences,
         })
     }
 }

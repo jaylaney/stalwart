@@ -68,6 +68,7 @@ use crate::{
             PendingCarriers, SealError, TOKEN_LEN, TokenPairs, archived_item_is_pending,
             open_pending_item, seal_drained_item, seal_error, seal_event, unseal_event_pairs,
         },
+        sequence::za_set_sequences,
         storage::ItipAutoExpunge,
     },
     scheduling::{
@@ -1149,6 +1150,7 @@ async fn merge(
                         Err(err) => return Err(err.caused_by(trc::location!())),
                     };
                     za_set_schedule_status(&mut event.data.event, &fan_out.statuses);
+                    za_set_sequences(&mut event.data.event, &fan_out.sequences);
                     pairs = fan_out.pairs;
                 }
                 Ok(None) => {}
