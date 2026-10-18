@@ -15,18 +15,45 @@
 //! invariant 13).
 //!
 //! A recipient is internal when its address resolves to another local
-//! account that is a key account, whose account cache entry holds a public
-//! key, and that holds `Permission::CalendarSchedulingReceive`. A REQUEST
-//! or CANCEL is attempted only when upstream marked it as the organizer's
-//! (`from_organizer`); a REPLY only to the event's ORGANIZER, and only when
-//! the replier's copy holds its token. Every other recipient is not
-//! attempted. `resolve_inner` builds, and so caches, the recipient's access
-//! token to read its permissions, as upstream's delivery does for its
-//! recipients.
+//! account that is a key account, holds
+//! `Permission::CalendarSchedulingReceive`, and whose vault record serves a
+//! public key (read fresh, key pinning spec 5.1; the account cache's
+//! `za_public_key` is not used). A REQUEST or CANCEL is attempted only when
+//! upstream marked it as the organizer's (`from_organizer`); a REPLY only
+//! to the event's ORGANIZER, and only when the replier's copy holds its
+//! token. Every other recipient is not attempted. `resolve_inner` builds,
+//! and so caches, the recipient's access token to read its permissions, as
+//! upstream's delivery does for its recipients.
+//!
+//! Key pinning spec 5: before sealing to an internal recipient, the fan-out
+//! compares its served key with the key the sender's pin record holds for
+//! the normalized address (4.3), and refuses a different one: no item, the
+//! recipient's property set to `3.8` (`ITIP_STATUS_KEY_REFUSED`) and a
+//! withheld entry for the source event (`ZaSource`) unless the fan-out is a
+//! deletion. It runs in four phases (5.2):
+//!
+//! 1. Resolve every attempted address once, reading its served key, then
+//!    read the pin record (and the wrap's mark when the record is absent or
+//!    unusable), keeping the refusal id of each entry a delivery consumes.
+//! 2. Decide every internal recipient against the record (5.1's table) and,
+//!    when a pin or an entry changed, write the record once, conditionally
+//!    and before any item (`za_pin_transact`; under a legacy wrap, the
+//!    batch with the rewrap, 4.4). Under a pinned wrap, or one that opens
+//!    under neither purpose, an absent or unusable record fails closed:
+//!    every internal recipient is refused and nothing is recorded. A read
+//!    or write failure is every internal recipient's `5.1`.
+//! 3. Write the items of the recipients decided "deliver", in message
+//!    order.
+//! 4. For a change, retire the entries whose recipients' items were all
+//!    written, each only under the refusal id phase 1 read; a failure is
+//!    traced and undoes nothing.
+//!
+//! The pin-record writes carry no UID lease fence (5.5).
 
 use crate::{
     calendar::{
         CalendarEventNotification, ChangedBy, EVENT_NOTIFICATION_ZA_PENDING,
+        drain::instance_key,
         seal::{TOKEN_LEN, TokenPairs, seal_error, seal_pending_item},
     },
     scheduling::{
@@ -36,22 +63,32 @@ use crate::{
             ITIP_STATUS_DELIVERED, ITIP_STATUS_DELIVERY_FAILED, ITIP_STATUS_INVALID_USER,
             ITIP_STATUS_NOT_ATTEMPTED,
         },
+        snapshot::itip_snapshot,
     },
 };
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use calcard::icalendar::{
     ICalendar, ICalendarMethod, ICalendarParameter, ICalendarParameterName, ICalendarProperty,
 };
 use common::{
     Server,
-    auth::{AccountInfo, BuildAccessToken},
+    auth::{
+        AccountInfo, BuildAccessToken,
+        vault::{ZaMark, ZaPinState, ZaPinStep, ZaPinTransact, za_normalize_address},
+    },
     za::lease::ZaUidLease,
 };
 use registry::schema::enums::Permission;
-use store::{rand, write::BatchBuilder};
+use store::{
+    rand,
+    write::{BatchBuilder, now},
+};
 use trc::AddContext;
 use types::collection::Collection;
-use vault::session::SessionKeys;
+use vault::{
+    pins::{PinSource, ZaInstances, ZaPinRecord},
+    session::SessionKeys,
+};
 use zeroize::Zeroizing;
 
 /// One SCHEDULE-STATUS the fan-out decided (spec 5.2, 5.3, 13). No `Debug`:
@@ -63,8 +100,8 @@ pub struct ZaScheduleStatus {
     /// On the ORGANIZER property (a reply to the organizer) instead of the
     /// recipient's ATTENDEE properties.
     pub on_organizer: bool,
-    /// `ITIP_STATUS_DELIVERED`, `ITIP_STATUS_NOT_ATTEMPTED` or
-    /// `ITIP_STATUS_DELIVERY_FAILED`.
+    /// `ITIP_STATUS_DELIVERED`, `ITIP_STATUS_NOT_ATTEMPTED`,
+    /// `ITIP_STATUS_DELIVERY_FAILED` or `ITIP_STATUS_KEY_REFUSED`.
     pub status: &'static str,
 }
 
@@ -88,21 +125,48 @@ pub struct ZaDeleteMessage {
     pub pairs: Option<TokenPairs>,
     /// The unsealed stored tree.
     pub event: ICalendar,
+    /// The deleted event's document id and UID, the fan-out's source (key
+    /// pinning spec 5.1).
+    pub document_id: u32,
+    pub uid: String,
+}
+
+/// The sender's event a fan-out delivers for (key pinning spec 5.1): its
+/// document id and UID, which a withheld entry records.
+#[derive(Clone, Copy)]
+pub struct ZaSource<'a> {
+    pub document_id: u32,
+    pub uid: &'a str,
+}
+
+/// What a fan-out delivers (key pinning spec 5.1, 5.2). A `Deletion`
+/// records no withheld entry and retires none here; a `Redelivery`
+/// (`contacts/pin`) sends only the message it was given and retires
+/// nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ZaFanOutKind {
+    Change,
+    Deletion,
+    Redelivery,
 }
 
 pub trait ZaFanOut: Sync + Send {
     /// Delivers `messages` (upstream's builders' output for `event`, the
-    /// sender's plaintext tree) to internal key recipients as pending items.
+    /// sender's plaintext tree) to internal key recipients as pending items,
+    /// in the four phases of key pinning spec 5.2 (see the module doc).
     /// `sender` is the account whose own request this is and `keys` its
     /// session keys; `stored_pairs` the token pairs of the sender's stored
-    /// event (`event_token_pairs`), `None` on a create. A lookup or write
-    /// failure for one recipient becomes that recipient's delivery-failed
-    /// status (spec 10); the call fails only when `keys` are not the
-    /// sender's, or when `fence` is lost. Plan 10's drain calls it for the
-    /// delegation fan-out (spec 6.4) with its per-UID lease as `fence`:
-    /// each item's write asserts the lease, and the first write that finds
-    /// it taken over fails the call (an assertion failure), so no item is
-    /// written after the fence is lost.
+    /// event (`event_token_pairs`), `None` on a create; `source` the event
+    /// whose change this is. A lookup, pin-record or item write failure for
+    /// a recipient becomes its delivery-failed status (invitations spec 10,
+    /// key pinning spec 5.4) and a refusal its `3.8`; the call fails only
+    /// when `keys` are not the sender's, or when `fence` is lost. Plan 10's
+    /// drain calls it for the delegation fan-out (spec 6.4) with its
+    /// per-UID lease as `fence`: each item's write asserts the lease, and
+    /// the first write that finds it taken over fails the call (an
+    /// assertion failure), so no item is written after the fence is lost.
+    /// The pin-record writes carry no fence (key pinning spec 5.5).
+    #[allow(clippy::too_many_arguments)]
     fn za_fan_out(
         &self,
         sender: &AccountInfo,
@@ -110,11 +174,14 @@ pub trait ZaFanOut: Sync + Send {
         messages: Vec<ItipMessage<ICalendar>>,
         stored_pairs: Option<TokenPairs>,
         event: &ICalendar,
+        source: ZaSource<'_>,
+        kind: ZaFanOutKind,
         fence: Option<&ZaUidLease>,
     ) -> impl Future<Output = trc::Result<ZaFanOutResult>> + Send;
 }
 
 impl ZaFanOut for Server {
+    #[allow(clippy::too_many_arguments)]
     async fn za_fan_out(
         &self,
         sender: &AccountInfo,
@@ -122,6 +189,8 @@ impl ZaFanOut for Server {
         messages: Vec<ItipMessage<ICalendar>>,
         stored_pairs: Option<TokenPairs>,
         event: &ICalendar,
+        source: ZaSource<'_>,
+        kind: ZaFanOutKind,
         fence: Option<&ZaUidLease>,
     ) -> trc::Result<ZaFanOutResult> {
         let sender_id = sender.account_id();
@@ -144,54 +213,208 @@ impl ZaFanOut for Server {
             stored_pairs.clone().unwrap_or_default()
         };
 
+        // Phase 1: route every (message, address); resolve each attempted
+        // address once, by its normalized form, with its served key; then
+        // read the pin record.
         let mut recipients: AHashMap<String, Recipient> = AHashMap::new();
-        let mut statuses = Vec::new();
+        let mut internal: Vec<(String, [u8; 32])> = Vec::new();
+        let mut attempts = Vec::new();
         for message in &messages {
             let method = itip_method(&message.message).ok();
+            let is_reply = matches!(method, Some(ICalendarMethod::Reply));
             for address in &message.to {
-                let (on_organizer, status) =
-                    match route(method, message, address, organizer.as_ref(), &union) {
-                        Route::NotAttempted { on_organizer } => {
-                            (on_organizer, ITIP_STATUS_NOT_ATTEMPTED)
+                let route = route(method, message, address, organizer.as_ref(), &union);
+                // An address that does not sanitize is not internal.
+                let key = match route {
+                    Route::Deliver { .. } => za_normalize_address(address),
+                    Route::NotAttempted { .. } => None,
+                };
+                if let Some(key) = &key
+                    && !recipients.contains_key(key)
+                {
+                    let recipient = resolve_recipient(self, sender_id, key).await;
+                    if let Recipient::Internal { public_key, .. } = recipient {
+                        internal.push((key.clone(), public_key));
+                    }
+                    recipients.insert(key.clone(), recipient);
+                }
+                attempts.push(Attempt {
+                    message,
+                    address,
+                    is_reply,
+                    route,
+                    key,
+                });
+            }
+        }
+        let read =
+            if !internal.is_empty() || (kind == ZaFanOutKind::Deletion && !messages.is_empty()) {
+                match self.za_pin_state(keys).await {
+                    Ok(state) => Some(state),
+                    Err(err) => {
+                        trc::error!(
+                            err.account_id(sender_id)
+                                .details("zero-access: pin record read failed")
+                                .caused_by(trc::location!())
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+        #[cfg(feature = "test_mode")]
+        common::za::test_hooks::pin_decide_pause_point(sender_id).await;
+
+        // Phase 2: decide every internal recipient against the record and,
+        // when a pin or an entry changed, write the record once, before any
+        // item (under a legacy wrap, the batch with the rewrap).
+        let mut verdicts: AHashMap<String, Verdict> = AHashMap::new();
+        let mut decided = None;
+        if let Some(state) = read.filter(|_| !internal.is_empty()) {
+            #[cfg(feature = "test_mode")]
+            let fail = common::za::test_hooks::take_pin_write_fail(sender_id);
+            #[cfg(not(feature = "test_mode"))]
+            let fail = false;
+            let outcome = if fail {
+                Err(trc::StoreEvent::UnexpectedError
+                    .into_err()
+                    .details("zero-access test hook: pin record write failure")
+                    .caused_by(trc::location!()))
+            } else {
+                let now = now() as i64;
+                let addresses = sender.addresses();
+                self.za_pin_transact(keys, Some(state), |state| {
+                    decide(state, &internal, &attempts, addresses, source, kind, now)
+                })
+                .await
+            };
+            let failure = match outcome {
+                Ok(
+                    ZaPinTransact::Written { state, value } | ZaPinTransact::Kept { state, value },
+                ) => {
+                    for ((address, _), verdict) in internal.iter().zip(value) {
+                        verdicts.insert(address.clone(), verdict);
+                    }
+                    decided = Some(state);
+                    None
+                }
+                // The eighth lost assertion (spec 4.2).
+                Ok(ZaPinTransact::Conflict) => Some(trc::StoreEvent::AssertValueFailed.into_err()),
+                Err(err) => Some(err),
+            };
+            if let Some(err) = failure {
+                trc::error!(
+                    err.account_id(sender_id)
+                        .details("zero-access: pin record write failed")
+                        .caused_by(trc::location!())
+                );
+            }
+        }
+        // Spec 5.4: without a decision (the read or the write failed) every
+        // internal recipient is `5.1` and nothing is written for it.
+        let refused = verdicts
+            .values()
+            .filter(|verdict| **verdict == Verdict::Refuse)
+            .count();
+        if refused > 0 {
+            trc::event!(
+                Security(trc::SecurityEvent::Unauthorized),
+                AccountId = sender_id,
+                Total = refused,
+                Details = "zero-access: delivery refused, the served key differs from the pin",
+            );
+        }
+
+        // Phase 3: the items of the recipients decided "deliver", in message
+        // order; a refused recipient's property gets `3.8`.
+        let mut statuses = Vec::new();
+        let mut not_written: AHashSet<&str> = AHashSet::new();
+        for attempt in &attempts {
+            let status = match &attempt.route {
+                Route::NotAttempted { .. } => ITIP_STATUS_NOT_ATTEMPTED,
+                Route::Deliver {
+                    pair, reply_token, ..
+                } => match attempt.key.as_deref().map(|key| (key, recipients.get(key))) {
+                    Some((
+                        key,
+                        Some(Recipient::Internal {
+                            account_id,
+                            public_key,
+                        }),
+                    )) => match verdicts.get(key) {
+                        Some(Verdict::Deliver(_)) => {
+                            let status = write_item(
+                                self,
+                                sender_id,
+                                *account_id,
+                                public_key,
+                                &attempt.message.message,
+                                pair.as_ref(),
+                                reply_token.as_deref(),
+                                fence,
+                            )
+                            .await
+                            .caused_by(trc::location!())?;
+                            if status != ITIP_STATUS_DELIVERED {
+                                not_written.insert(key);
+                            }
+                            status
                         }
-                        Route::Deliver {
-                            on_organizer,
-                            pair,
-                            reply_token,
-                        } => {
-                            let key = address.to_ascii_lowercase();
-                            let recipient = match recipients.get(&key) {
-                                Some(recipient) => *recipient,
-                                None => {
-                                    let recipient =
-                                        resolve_recipient(self, sender_id, address).await;
-                                    recipients.insert(key, recipient);
-                                    recipient
-                                }
-                            };
-                            let status = match recipient {
-                                Recipient::Internal {
-                                    account_id,
-                                    public_key,
-                                } => write_item(
-                                    self,
-                                    sender_id,
-                                    account_id,
-                                    &public_key,
-                                    &message.message,
-                                    pair.as_ref(),
-                                    reply_token.as_deref(),
-                                    fence,
-                                )
-                                .await
-                                .caused_by(trc::location!())?,
-                                Recipient::NotInternal => ITIP_STATUS_NOT_ATTEMPTED,
-                                Recipient::Failed => ITIP_STATUS_DELIVERY_FAILED,
-                            };
-                            (on_organizer, status)
-                        }
-                    };
-                record_status(&mut statuses, address, on_organizer, status);
+                        Some(Verdict::Refuse) => ITIP_STATUS_KEY_REFUSED,
+                        None => ITIP_STATUS_DELIVERY_FAILED,
+                    },
+                    Some((_, Some(Recipient::Failed))) => ITIP_STATUS_DELIVERY_FAILED,
+                    Some((_, Some(Recipient::NotInternal) | None)) | None => {
+                        ITIP_STATUS_NOT_ATTEMPTED
+                    }
+                },
+            };
+            record_status(
+                &mut statuses,
+                attempt.address,
+                attempt.route.on_organizer(),
+                status,
+            );
+        }
+        #[cfg(feature = "test_mode")]
+        common::za::test_hooks::retire_pause_point(sender_id).await;
+
+        // Phase 4: retire the entries this change's deliveries consumed,
+        // each only under the refusal id phase 1 read (spec 5.2). A failure
+        // undoes nothing: the items stand and the entry stays.
+        if kind == ZaFanOutKind::Change
+            && let Some(state) = decided
+        {
+            let consumed: Vec<(&str, u64)> = internal
+                .iter()
+                .filter_map(|(address, _)| match verdicts.get(address) {
+                    Some(Verdict::Deliver(Some(refusal_id)))
+                        if !not_written.contains(address.as_str()) =>
+                    {
+                        Some((address.as_str(), *refusal_id))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !consumed.is_empty() {
+                let outcome = self
+                    .za_pin_transact(keys, Some(state), |state| retire(state, &consumed, source))
+                    .await;
+                let failure = match outcome {
+                    Ok(ZaPinTransact::Written { .. } | ZaPinTransact::Kept { .. }) => None,
+                    Ok(ZaPinTransact::Conflict) => {
+                        Some(trc::StoreEvent::AssertValueFailed.into_err())
+                    }
+                    Err(err) => Some(err),
+                };
+                if let Some(err) = failure {
+                    trc::error!(
+                        err.account_id(sender_id)
+                            .details("zero-access: withheld entries not retired")
+                            .caused_by(trc::location!())
+                    );
+                }
             }
         }
 
@@ -207,6 +430,135 @@ impl ZaFanOut for Server {
             statuses,
         })
     }
+}
+
+/// One (message, address) of a fan-out, in message order (phase 1).
+struct Attempt<'m> {
+    message: &'m ItipMessage<ICalendar>,
+    address: &'m str,
+    is_reply: bool,
+    route: Route,
+    /// The normalized address (key pinning spec 4.3) of a `Deliver` route;
+    /// `None` otherwise, or when it does not sanitize.
+    key: Option<String>,
+}
+
+/// Phase 2's decision for an internal recipient (key pinning spec 5.1).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// Deliver; the refusal id of the entry for (source, address) in the
+    /// state decided on, which a complete delivery consumes (phase 4).
+    Deliver(Option<u64>),
+    /// No item; `3.8`.
+    Refuse,
+}
+
+/// Phase 2 over one state: each internal recipient against the record
+/// (spec 5.1's table). `Write` when a pin or an entry changed.
+fn decide(
+    state: &ZaPinState,
+    internal: &[(String, [u8; 32])],
+    attempts: &[Attempt<'_>],
+    addresses: &[String],
+    source: ZaSource<'_>,
+    kind: ZaFanOutKind,
+    now: i64,
+) -> ZaPinStep<Vec<Verdict>> {
+    let Some(stored) = &state.pins.record else {
+        // Absent or unusable: first use under a legacy wrap, in a fresh
+        // record written with the rewrap; under a pinned wrap (or one that
+        // opens under neither purpose) fail closed and record nothing (spec
+        // 4.4): any write would create a fresh record and end the state.
+        return if state
+            .mark
+            .as_ref()
+            .is_some_and(|mark| mark.mark == ZaMark::Legacy)
+        {
+            let mut record = ZaPinRecord::new();
+            for (address, served) in internal {
+                record.set_pin(address, *served, PinSource::FirstUse, now);
+            }
+            ZaPinStep::Write(record, vec![Verdict::Deliver(None); internal.len()])
+        } else {
+            ZaPinStep::Keep(vec![Verdict::Refuse; internal.len()])
+        };
+    };
+    let mut record = stored.clone();
+    let mut changed = false;
+    let mut verdicts = Vec::with_capacity(internal.len());
+    for (address, served) in internal {
+        let consumed = || {
+            stored
+                .entry(source.document_id, source.uid, address)
+                .map(|entry| entry.refusal_id)
+        };
+        let verdict = match stored.pin(address) {
+            Some(pin) if pin.public_key == *served => Verdict::Deliver(consumed()),
+            Some(_) => {
+                // A deletion records no entry: nothing can be redelivered
+                // from a deleted document.
+                if kind != ZaFanOutKind::Deletion {
+                    record.refuse(
+                        source.document_id,
+                        source.uid,
+                        address,
+                        now,
+                        reply_instances(attempts, address, addresses).as_ref(),
+                    );
+                    changed = true;
+                }
+                Verdict::Refuse
+            }
+            None => {
+                record.set_pin(address, *served, PinSource::FirstUse, now);
+                changed = true;
+                Verdict::Deliver(consumed())
+            }
+        };
+        verdicts.push(verdict);
+    }
+    if changed {
+        ZaPinStep::Write(record, verdicts)
+    } else {
+        ZaPinStep::Keep(verdicts)
+    }
+}
+
+/// Phase 4 over one state: removes each consumed entry whose refusal id is
+/// still the one consumed, checked on every attempt.
+fn retire(state: &ZaPinState, consumed: &[(&str, u64)], source: ZaSource<'_>) -> ZaPinStep<()> {
+    let Some(stored) = &state.pins.record else {
+        return ZaPinStep::Keep(());
+    };
+    let mut record = stored.clone();
+    let mut removed = false;
+    for (address, refusal_id) in consumed {
+        removed |= record.retire(source.document_id, source.uid, address, *refusal_id);
+    }
+    if removed {
+        ZaPinStep::Write(record, ())
+    } else {
+        ZaPinStep::Keep(())
+    }
+}
+
+/// The instances of the REPLYs refused for `key` (spec 4.1), `None` when no
+/// message to it is a REPLY (an organizer-side entry).
+fn reply_instances(
+    attempts: &[Attempt<'_>],
+    key: &str,
+    addresses: &[String],
+) -> Option<ZaInstances> {
+    let mut instances: Option<ZaInstances> = None;
+    for attempt in attempts
+        .iter()
+        .filter(|attempt| attempt.is_reply && attempt.key.as_deref() == Some(key))
+    {
+        instances
+            .get_or_insert_with(ZaInstances::default)
+            .union(&refused_instances(&attempt.message.message, addresses));
+    }
+    instances
 }
 
 /// Writes each status as the SCHEDULE-STATUS of the matching ORGANIZER or
@@ -272,6 +624,16 @@ enum Route {
         pair: Option<TokenPairs>,
         reply_token: Option<Zeroizing<[u8; TOKEN_LEN]>>,
     },
+}
+
+impl Route {
+    fn on_organizer(&self) -> bool {
+        match self {
+            Route::NotAttempted { on_organizer } | Route::Deliver { on_organizer, .. } => {
+                *on_organizer
+            }
+        }
+    }
 }
 
 /// Spec 5.2: whether `recipient` of `message` is attempted, and with which
@@ -391,8 +753,34 @@ fn current_attendee_pairs(
     pairs
 }
 
+/// Key pinning spec 5.3: the served key differs from the pin (RFC 5546 "no
+/// authority"), the bare code.
+pub const ITIP_STATUS_KEY_REFUSED: &str = "3.8";
+
+/// The instances a refused REPLY carries (key pinning spec 4.1): the master
+/// for a component without RECURRENCE-ID, else the drain's `instance_key`
+/// from the REPLY's own snapshot, its RECURRENCE-ID resolved with the
+/// REPLY's own VTIMEZONEs as `itip_snapshot` resolves it. A REPLY with no
+/// snapshot (upstream builds none such) records every instance.
+fn refused_instances(reply: &ICalendar, addresses: &[String]) -> ZaInstances {
+    let mut instances = ZaInstances::default();
+    match itip_snapshot(reply, addresses, false) {
+        Ok(snapshots) => {
+            for instance in snapshots.components.keys() {
+                instances.add(instance_key(instance));
+            }
+        }
+        Err(_) => {
+            instances.all = true;
+            instances.keys.clear();
+        }
+    }
+    instances
+}
+
 fn status_rank(status: &str) -> u8 {
     match status {
+        ITIP_STATUS_KEY_REFUSED => 3,
         ITIP_STATUS_DELIVERY_FAILED => 2,
         ITIP_STATUS_NOT_ATTEMPTED => 1,
         _ => 0,
@@ -423,8 +811,9 @@ fn record_status(
     }
 }
 
-/// Spec 5.2: whether `address` is an internal key account. A lookup error
-/// is that recipient's delivery failure, traced without the address.
+/// Spec 5.2: whether `address` (normalized) is an internal key account,
+/// with its served key. A lookup error, the served key's included, is that
+/// recipient's delivery failure, traced without the address.
 async fn resolve_recipient(server: &Server, sender_id: u32, address: &str) -> Recipient {
     match resolve_inner(server, sender_id, address).await {
         Ok(recipient) => recipient,
@@ -447,16 +836,14 @@ async fn resolve_inner(server: &Server, sender_id: u32, address: &str) -> trc::R
     if account_id == sender_id {
         return Ok(Recipient::NotInternal);
     }
-    // `za_is_key_account`'s lookup, which also yields the public key (spec
-    // 3.2): a pending setup has none.
-    let Some(public_key) = server
+    // `za_is_key_account`'s lookup.
+    if !server
         .try_account(account_id)
         .await?
-        .filter(|account| account.is_key_account())
-        .and_then(|account| account.za_public_key)
-    else {
+        .is_some_and(|account| account.is_key_account())
+    {
         return Ok(Recipient::NotInternal);
-    };
+    }
     if !server
         .access_token(account_id)
         .await?
@@ -465,6 +852,13 @@ async fn resolve_inner(server: &Server, sender_id: u32, address: &str) -> trc::R
     {
         return Ok(Recipient::NotInternal);
     }
+    // Key pinning spec 5.1: the served key, read fresh from the vault
+    // record, never the account cache's `za_public_key`. A missing,
+    // unusable or pending record serves none (not internal); a store error
+    // reaches `resolve_recipient`'s trace, which names the sender only.
+    let Some(public_key) = server.za_served_public_key(account_id).await? else {
+        return Ok(Recipient::NotInternal);
+    };
     Ok(Recipient::Internal {
         account_id,
         public_key,
@@ -873,5 +1267,100 @@ mod tests {
         assert_eq!(statuses[0].status, ITIP_STATUS_DELIVERY_FAILED);
         assert!(statuses[1].on_organizer);
         assert_eq!(statuses[1].status, ITIP_STATUS_NOT_ATTEMPTED);
+    }
+
+    /// An attendee-property status for `address`.
+    fn status_of(address: &str, status: &'static str) -> ZaScheduleStatus {
+        ZaScheduleStatus {
+            address: address.to_string(),
+            on_organizer: false,
+            status,
+        }
+    }
+
+    fn bob() -> Vec<String> {
+        vec!["bob@example.com".to_string()]
+    }
+
+    /// bob's REPLY to org@example.com for one instance: `recurrence_id` is
+    /// the RECURRENCE-ID line (none for the master), `timezone` any
+    /// VTIMEZONE ahead of the VEVENT.
+    fn reply(recurrence_id: Option<&str>, timezone: &str) -> ICalendar {
+        parse(&format!(
+            concat!(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nMETHOD:REPLY\r\n",
+                "{timezone}BEGIN:VEVENT\r\nUID:fo-unit\r\nDTSTAMP:20240101T000000Z\r\n",
+                "{recurrence_id}ORGANIZER:mailto:org@example.com\r\n",
+                "ATTENDEE;PARTSTAT=ACCEPTED:mailto:bob@example.com\r\n",
+                "END:VEVENT\r\nEND:VCALENDAR\r\n"
+            ),
+            timezone = timezone,
+            recurrence_id = recurrence_id
+                .map(|line| format!("{line}\r\n"))
+                .unwrap_or_default(),
+        ))
+    }
+
+    #[test]
+    fn a_key_refusal_outranks_every_other_status() {
+        let mut statuses = Vec::new();
+        for status in [
+            ITIP_STATUS_DELIVERY_FAILED,
+            ITIP_STATUS_KEY_REFUSED,
+            ITIP_STATUS_DELIVERED,
+            ITIP_STATUS_NOT_ATTEMPTED,
+        ] {
+            record_status(&mut statuses, "bob@example.com", false, status);
+        }
+        assert_eq!(statuses[0].status, "3.8");
+        assert!(status_rank(ITIP_STATUS_KEY_REFUSED) > status_rank(ITIP_STATUS_DELIVERY_FAILED));
+    }
+
+    #[test]
+    fn a_later_delivery_replaces_a_key_refusal() {
+        // EVENT's carol line already carries SCHEDULE-STATUS=3.7.
+        let mut event = parse(EVENT);
+        za_set_schedule_status(
+            &mut event,
+            &[status_of("bob@example.com", ITIP_STATUS_KEY_REFUSED)],
+        );
+        za_set_schedule_status(
+            &mut event,
+            &[status_of("bob@example.com", ITIP_STATUS_DELIVERED)],
+        );
+        let attendees = statuses_of(&event, ICalendarProperty::Attendee);
+        assert_eq!(attendees[1].1, ["1.2"]);
+        assert_eq!(attendees[2].1, ["3.7"], "upstream's 3.7 stays");
+    }
+
+    #[test]
+    fn refused_instances_are_recorded_by_instant() {
+        // bob's REPLYs: (a) RECURRENCE-ID;TZID=Etc/GMT-1:20990302T110000
+        // with a VTIMEZONE of one STANDARD at TZOFFSETTO:+0100; (b)
+        // RECURRENCE-ID:20990302T100000Z; (c) the master only.
+        // calcard resolves a VTIMEZONE by name, so the fixture uses a named fixed zone.
+        let tzid = reply(
+            Some("RECURRENCE-ID;TZID=Etc/GMT-1:20990302T110000"),
+            concat!(
+                "BEGIN:VTIMEZONE\r\nTZID:Etc/GMT-1\r\nBEGIN:STANDARD\r\n",
+                "DTSTART:19700101T000000\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0100\r\n",
+                "END:STANDARD\r\nEND:VTIMEZONE\r\n"
+            ),
+        );
+        let utc = reply(Some("RECURRENCE-ID:20990302T100000Z"), "");
+        let master = reply(None, "");
+        assert_eq!(
+            refused_instances(&tzid, &bob()).keys,
+            refused_instances(&utc, &bob()).keys
+        );
+        assert_eq!(refused_instances(&tzid, &bob()).keys.len(), 1);
+        assert_eq!(
+            refused_instances(&master, &bob()),
+            ZaInstances {
+                master: true,
+                keys: vec![],
+                all: false
+            }
+        );
     }
 }

@@ -49,6 +49,15 @@
 //!   its drain does not run; the za suite lists every account after setup
 //!   and the drain modules clear it for their duration.
 //! - The drain retry override: stands in for `DRAIN_RETRY_SECS`.
+//! - `PIN_DECIDE_PAUSE`: in the fan-out after its phase 1 reads (the
+//!   recipients' served keys and the sender's pin record), before the
+//!   phase 2 decision and write, keyed by the sender
+//!   (`groupware::calendar::fanout`, key pinning spec 5.2).
+//! - `RETIRE_PAUSE`: in the fan-out after phase 3's items and before the
+//!   phase 4 retirement, keyed by the sender; `contacts/pin`'s inner
+//!   fan-out reaches it too.
+//! - `PIN_WRITE_FAIL_ONCE`: the sender's next fan-out phase 2 pin-record
+//!   write fails once with an internal error.
 
 use std::sync::{
     Arc, Mutex,
@@ -98,6 +107,13 @@ pub static DRAIN_ENUMERATE_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
 pub static DRAIN_FAIL_ITEM: Mutex<Option<(u32, u32)>> = Mutex::new(None);
 
 pub static DRAIN_READ_FAIL_ITEM: Mutex<Option<(u32, u32)>> = Mutex::new(None);
+
+pub static PIN_DECIDE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
+pub static RETIRE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
+/// The account whose next fan-out pin-record write fails.
+pub static PIN_WRITE_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
 
 /// Accounts whose drain does not run; `DRAIN_SKIP_ALL` stands for every
 /// account.
@@ -175,6 +191,20 @@ pub fn set_drain_read_fail_item(item: Option<(u32, u32)>) {
     *DRAIN_READ_FAIL_ITEM
         .lock()
         .unwrap_or_else(|e| e.into_inner()) = item;
+}
+
+pub fn set_pin_decide_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&PIN_DECIDE_PAUSE, pause);
+}
+
+pub fn set_retire_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&RETIRE_PAUSE, pause);
+}
+
+pub fn set_pin_write_fail(account_id: Option<u32>) {
+    *PIN_WRITE_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = account_id;
 }
 
 pub fn set_drain_skip(account_id: u32) {
@@ -263,6 +293,20 @@ pub async fn drain_lookup_pause_point(account_id: u32) {
 
 pub async fn drain_lease_pause_point(account_id: u32) {
     wait(take_for(&DRAIN_LEASE_PAUSE, account_id)).await;
+}
+
+pub async fn pin_decide_pause_point(sender_id: u32) {
+    wait(take_for(&PIN_DECIDE_PAUSE, sender_id)).await;
+}
+
+pub async fn retire_pause_point(sender_id: u32) {
+    wait(take_for(&RETIRE_PAUSE, sender_id)).await;
+}
+
+/// Whether the sender's fan-out pin-record write must fail now; clears the
+/// flag.
+pub fn take_pin_write_fail(sender_id: u32) -> bool {
+    take_flag(&PIN_WRITE_FAIL_ONCE, sender_id)
 }
 
 /// Whether the drain commit of `account_id` must fail now; clears the flag.

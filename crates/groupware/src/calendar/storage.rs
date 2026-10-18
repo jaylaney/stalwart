@@ -591,10 +591,19 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
 
             if let Ok(messages) = itip_cancel(&event.data.event, account_info.addresses(), true) {
                 if za_keys.is_some() {
+                    let uid = event
+                        .data
+                        .event
+                        .uids()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string();
                     za_message = Some(ZaDeleteMessage {
                         message: messages,
                         pairs,
                         event: event.data.event,
+                        document_id,
+                        uid,
                     });
                 } else {
                     ItipMessages::new(vec![messages])

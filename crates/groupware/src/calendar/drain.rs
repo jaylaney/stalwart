@@ -63,7 +63,7 @@ use crate::{
     calendar::{
         CalendarEvent, CalendarEventData, CalendarEventNotification, ChangedBy,
         EVENT_NOTIFICATION_IS_CHANGE,
-        fanout::{ZaFanOut, za_set_schedule_status},
+        fanout::{ZaFanOut, ZaFanOutKind, ZaSource, za_set_schedule_status},
         seal::{
             PendingCarriers, SealError, TOKEN_LEN, TokenPairs, archived_item_is_pending,
             open_pending_item, seal_drained_item, seal_error, seal_event, unseal_event_pairs,
@@ -829,9 +829,9 @@ enum Step {
 /// An instance's identity across two snapshots of one event: `None` for
 /// the master, the RECURRENCE-ID's date and range for an override (never
 /// its entry id, which a merge may change).
-type InstanceKey = Option<(i64, bool)>;
+pub type InstanceKey = Option<(i64, bool)>;
 
-fn instance_key(instance: &InstanceId) -> InstanceKey {
+pub fn instance_key(instance: &InstanceId) -> InstanceKey {
     match instance {
         InstanceId::Main => None,
         InstanceId::Recurrence(recurrence) => Some((recurrence.date, recurrence.this_and_future)),
@@ -1124,6 +1124,11 @@ async fn merge(
                             messages,
                             pairs.take(),
                             &event.data.event,
+                            ZaSource {
+                                document_id: event_id,
+                                uid: &event_uid,
+                            },
+                            ZaFanOutKind::Change,
                             reply_lease.as_ref().map(|lease| lease.lease()),
                         )
                         .await
