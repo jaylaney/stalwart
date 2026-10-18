@@ -149,8 +149,31 @@ pub(crate) async fn vault_write_store(
             .ctx(trc::Key::To, record.revision)
             .caused_by(trc::location!()));
     }
+    vault_batch_write(store, account_id, record, previous, None).await
+}
 
-    let value = vault_value(record)?;
+/// The one vault batch, shared by the raw write (`vault_write_store`) and
+/// the commit (`vault_commit_store`), on Principal document 0: the vault
+/// assertion (the bytes `previous` read, or absence), then, with `pins`,
+/// field 151's assertion (`pins.previous.assertion()`), then the vault set,
+/// then field 151's set. Each key's assertion precedes its set (key pinning
+/// spec 4.4), and both assertions precede both sets, so a lost assertion
+/// writes nothing even on a store that applies sets as it goes (the
+/// ephemeral store does not roll back).
+async fn vault_batch_write(
+    store: &Store,
+    account_id: u32,
+    record: &VaultRecord,
+    previous: Option<&VaultRead>,
+    pins: Option<ZaPinWrite<'_>>,
+) -> trc::Result<()> {
+    let archive = Archiver::new(record.clone())
+        .serialize()
+        .caused_by(trc::location!())?;
+    let mut value = Vec::with_capacity(archive.len() + 1);
+    value.push(VAULT_RECORD_VERSION);
+    value.extend_from_slice(&archive);
+
     let mut batch = BatchBuilder::new();
     batch
         .with_account_id(account_id)
@@ -161,20 +184,15 @@ pub(crate) async fn vault_write_store(
             previous.map_or(AssertValue::None, |previous| {
                 AssertValue::Hash(previous.cas)
             }),
-        )
-        .set(PrincipalField::ZeroAccessVault, value);
+        );
+    if let Some(pins) = &pins {
+        batch.assert_value(PrincipalField::ZeroAccessPins, pins.previous.assertion());
+    }
+    batch.set(PrincipalField::ZeroAccessVault, value);
+    if let Some(pins) = pins {
+        batch.set(PrincipalField::ZeroAccessPins, pins.sealed);
+    }
     store.write(batch.build_all()).await.map(|_| ())
-}
-
-/// The stored form: one version byte followed by the record's archive.
-fn vault_value(record: &VaultRecord) -> trc::Result<Vec<u8>> {
-    let archive = Archiver::new(record.clone())
-        .serialize()
-        .caused_by(trc::location!())?;
-    let mut value = Vec::with_capacity(archive.len() + 1);
-    value.push(VAULT_RECORD_VERSION);
-    value.extend_from_slice(&archive);
-    Ok(value)
 }
 
 /// Attempts of one pin-record write, a single assertion or a vault batch
@@ -279,15 +297,7 @@ pub(crate) async fn pin_read_store(
     Ok(ZaPinRead { raw, record })
 }
 
-/// Field 151's assertion, then its set (spec 4.4: each assertion before the
-/// set of its key).
-fn push_pin_write(batch: &mut BatchBuilder, write: ZaPinWrite<'_>) {
-    batch
-        .assert_value(PrincipalField::ZeroAccessPins, write.previous.assertion())
-        .set(PrincipalField::ZeroAccessPins, write.sealed);
-}
-
-/// A pin-record write alone: the field 151 assertion and set only.
+/// A pin-record write alone: field 151's assertion, then its set.
 pub(crate) async fn pin_write_store(
     store: &Store,
     account_id: u32,
@@ -297,16 +307,18 @@ pub(crate) async fn pin_write_store(
     batch
         .with_account_id(account_id)
         .with_collection(Collection::Principal)
-        .with_document(0);
-    push_pin_write(&mut batch, write);
+        .with_document(0)
+        .assert_value(PrincipalField::ZeroAccessPins, write.previous.assertion())
+        .set(PrincipalField::ZeroAccessPins, write.sealed);
     store.write(batch.build_all()).await.map(|_| ())
 }
 
 /// Key pinning spec 4.4-4.5: sets `record.revision` to the previous revision
 /// plus one (1 when `previous` is `None`) and writes one batch on Principal
-/// document 0: the vault assertion (the bytes `previous` read, or absence)
-/// and set, then, with `pins`, the pin-record assertion and set. A lost
-/// assertion is `Err(e)` with `e.is_assertion_failure()` and nothing written.
+/// document 0, in this order: the vault assertion (the bytes `previous`
+/// read, or absence), with `pins` the pin-record assertion, the vault set,
+/// with `pins` the pin-record set (`vault_batch_write`). A lost assertion is
+/// `Err(e)` with `e.is_assertion_failure()` and nothing written.
 pub(crate) async fn vault_commit_store(
     store: &Store,
     account_id: u32,
@@ -315,23 +327,7 @@ pub(crate) async fn vault_commit_store(
     pins: Option<ZaPinWrite<'_>>,
 ) -> trc::Result<()> {
     record.revision = previous.map_or(1, |previous| previous.record.revision + 1);
-    let value = vault_value(record)?;
-    let mut batch = BatchBuilder::new();
-    batch
-        .with_account_id(account_id)
-        .with_collection(Collection::Principal)
-        .with_document(0)
-        .assert_value(
-            PrincipalField::ZeroAccessVault,
-            previous.map_or(AssertValue::None, |previous| {
-                AssertValue::Hash(previous.cas)
-            }),
-        )
-        .set(PrincipalField::ZeroAccessVault, value);
-    if let Some(pins) = pins {
-        push_pin_write(&mut batch, pins);
-    }
-    store.write(batch.build_all()).await.map(|_| ())
+    vault_batch_write(store, account_id, record, previous, pins).await
 }
 
 /// One vault read, the wrap opened pinned first, then legacy (spec 4.4). A
@@ -416,11 +412,12 @@ impl Server {
 
     /// Every vault write of product code (key pinning spec 4.5): sets the
     /// next revision, writes conditionally on `previous` (absence when
-    /// `None`), with `pins` in the same batch (spec 4.4), then invalidates
-    /// cached classification and authentication. A lost assertion is
-    /// `Err(e)` with `e.is_assertion_failure()`, nothing written. An
-    /// invalidation failure is logged, never returned, so a committed write
-    /// never reports an error.
+    /// `None`), with `pins` in the same batch (spec 4.4: the vault assertion,
+    /// the pin-record assertion, the vault set, the pin-record set), then
+    /// invalidates cached classification and authentication. A lost
+    /// assertion is `Err(e)` with `e.is_assertion_failure()`, nothing
+    /// written. An invalidation failure is logged, never returned, so a
+    /// committed write never reports an error.
     pub async fn za_vault_commit(
         &self,
         account_id: u32,
@@ -464,8 +461,11 @@ impl Server {
     /// gets the next record revision and is sealed under MK; under a legacy
     /// wrap it is the first-pin or heal batch (the rewrap to the pinned wrap
     /// and the record, asserted at the same vault read, spec 4.4), otherwise
-    /// a pin-record write alone. A lost assertion re-reads and decides again,
-    /// up to `ZA_PIN_WRITE_ATTEMPTS`; then `Conflict`.
+    /// a pin-record write alone. A `Write` with no usable record under a
+    /// wrap that opens under neither purpose writes nothing and is an error
+    /// (invariant 22: no record is created in that state). A lost assertion
+    /// re-reads and decides again, up to `ZA_PIN_WRITE_ATTEMPTS`; then
+    /// `Conflict`.
     pub async fn za_pin_transact<T: Send>(
         &self,
         keys: &SessionKeys,
@@ -483,17 +483,26 @@ impl Server {
                 ZaPinStep::Write(record, value) => (record, value),
             };
             let ZaPinState { pins, mark } = state;
-            record.revision = pins
-                .record
-                .as_ref()
-                .map_or(1, |previous| previous.revision + 1);
-            let sealed = seal_pin_record(&record, keys.mk(), account_id);
             // The same vault read throughout: the mark, the asserted hash
             // and the wrap the batch rewraps.
             let mark = match mark {
                 Some(mark) => mark,
                 None => self.za_mark_read(keys).await?,
             };
+            if mark.mark == ZaMark::Neither && !pins.is_usable() {
+                return Err(trc::StoreEvent::UnexpectedError
+                    .into_err()
+                    .details(
+                        "zero-access: no pin record is created under a wrap that opens under neither purpose",
+                    )
+                    .account_id(account_id)
+                    .caused_by(trc::location!()));
+            }
+            record.revision = pins
+                .record
+                .as_ref()
+                .map_or(1, |previous| previous.revision + 1);
+            let sealed = seal_pin_record(&record, keys.mk(), account_id);
             let write = ZaPinWrite {
                 previous: &pins,
                 sealed: sealed.clone(),
@@ -506,8 +515,10 @@ impl Server {
                     self.za_vault_commit(account_id, &mut rewrapped, Some(vault), Some(write))
                         .await
                 }
-                // Pinned, or a usable record under a wrap that opens under
-                // neither purpose.
+                // The pin record alone: under a pinned wrap (the record
+                // usable, absent or unusable), or a usable record under a
+                // wrap that opens under neither purpose (no usable record
+                // under neither was refused above).
                 _ => pin_write_store(self.store(), account_id, write).await,
             };
             match result {
@@ -1439,13 +1450,42 @@ mod tests {
             mark_read_store(&store, &keys).await.unwrap().mark,
             ZaMark::Legacy
         );
-        vault_commit_store(
+
+        // The other direction: the vault read is fresh, the pin read is
+        // stale (field 151 changed after it), so the batch loses on the pin
+        // assertion and neither field changes.
+        let changed = seal_pin_record(&two_pins(), &mk, 5);
+        write_raw_pins(&store, 5, changed.clone()).await;
+        let err = vault_commit_store(
             &store,
             5,
             &mut rewrapped(&fresh),
             Some(&fresh),
             Some(ZaPinWrite {
                 previous: &absent,
+                sealed: seal_pin_record(&one_pin(), &mk, 5),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.is_assertion_failure());
+        let mark = mark_read_store(&store, &keys).await.unwrap();
+        let vault = mark.vault.as_ref().unwrap();
+        assert_eq!(
+            (mark.mark, vault.record.revision, vault.cas),
+            (ZaMark::Legacy, 3, fresh.cas),
+            "no rewrap without the record"
+        );
+        let current = pin_read_store(&store, 5, &mk).await.unwrap();
+        assert_eq!(current.raw.as_deref(), Some(changed.as_slice()));
+
+        vault_commit_store(
+            &store,
+            5,
+            &mut rewrapped(&fresh),
+            Some(&fresh),
+            Some(ZaPinWrite {
+                previous: &current,
                 sealed: seal_pin_record(&one_pin(), &mk, 5),
             }),
         )
