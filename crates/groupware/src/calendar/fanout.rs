@@ -256,7 +256,10 @@ impl ZaFanOut for Server {
         // Spec 5.1 item (2): an attendee's DELETE that upstream built no
         // REPLY for declines to an internal ORGANIZER for which the copy
         // holds a withheld entry, routed with the rest (the stored pair's
-        // token). An entry means a usable record, which needs no mark.
+        // token). An entry means a usable record, which needs no mark. The
+        // ORGANIZER resolved here is used by the loop below, which adds it
+        // to the recipients only if the decline routes `Deliver`.
+        let mut resolved = None;
         if kind == ZaFanOutKind::Deletion
             && !is_organizer
             && !messages
@@ -265,7 +268,7 @@ impl ZaFanOut for Server {
             && let Some(key) = organizer
                 .as_ref()
                 .and_then(|organizer| za_normalize_address(&organizer.email))
-            && let recipient @ Recipient::Internal { public_key, .. } =
+            && let recipient @ Recipient::Internal { .. } =
                 resolve_recipient(self, sender_id, &key).await
         {
             match self.za_pin_read(keys).await {
@@ -275,8 +278,7 @@ impl ZaFanOut for Server {
                     }) && let Some(decline) = za_decline_all(event, sender.addresses())
                     {
                         messages.push(decline);
-                        recipients.insert(key.clone(), recipient);
-                        internal.push((key, public_key));
+                        resolved = Some((key, recipient));
                         read = Some(ZaPinState { pins, mark: None });
                     }
                 }
@@ -303,7 +305,10 @@ impl ZaFanOut for Server {
                 if let Some(key) = &key
                     && !recipients.contains_key(key)
                 {
-                    let recipient = resolve_recipient(self, sender_id, key).await;
+                    let recipient = match resolved.take_if(|(cached, _)| cached == key) {
+                        Some((_, recipient)) => recipient,
+                        None => resolve_recipient(self, sender_id, key).await,
+                    };
                     if let Recipient::Internal { public_key, .. } = recipient {
                         internal.push((key.clone(), public_key));
                     }
@@ -719,6 +724,8 @@ fn full_state(
         return None;
     }
     if is_organizer {
+        // Never changes the outcome (`za_full_request_for` yields nothing
+        // for an address the tree does not name); kept for spec 5.1's rule.
         if !scheduled_attendees(event, addresses)
             .iter()
             .any(|attendee| za_normalize_address(attendee).as_deref() == Some(key))

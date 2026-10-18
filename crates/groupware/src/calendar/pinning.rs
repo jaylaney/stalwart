@@ -158,7 +158,7 @@ pub fn za_reply_from(
 /// when it deletes its copy while holding a withheld entry for the
 /// organizer, built even where upstream builds nothing. A fork copy of
 /// upstream's `itip_cancel` attendee branch (`event_cancel.rs` lines
-/// 82-121, `is_deletion` true) over `decline_instance`, a fork copy of
+/// 82-127, `is_deletion` true) over `decline_instance`, a fork copy of
 /// `attendee_decline` (`attendee.rs` lines 279-364). The one difference is
 /// that copy's local-attendee gate: `is_server_scheduling` and the RSVP
 /// check without the PARTSTAT match of `attendee.rs` lines 301-308, so a
@@ -523,6 +523,7 @@ mod tests {
     fn the_fork_decline_ignores_partstat() {
         // bob's copy with bob DECLINED and no SCHEDULE-FORCE-SEND
         let declined = copy_with("PARTSTAT=DECLINED");
+        let needs_action = copy_with("PARTSTAT=NEEDS-ACTION;RSVP=TRUE");
         let rsvp_false = copy_with("PARTSTAT=DECLINED;RSVP=FALSE");
         let client_scheduled = parse(CLIENT_SCHEDULED);
         assert!(
@@ -535,6 +536,17 @@ mod tests {
             (BOB, false)
         );
         assert!(message.to.contains(&ALICE.to_string()));
+        assert_eq!(
+            reply_partstat(&message, None, BOB).as_deref(),
+            Some("DECLINED")
+        );
+        // A deletion skips NEEDS-ACTION upstream (`skip_needs_action`); the
+        // fork's gate has no PARTSTAT match at all.
+        assert!(
+            itip_cancel(&needs_action, &bob(), true).is_err(),
+            "upstream builds nothing at NEEDS-ACTION"
+        );
+        let message = za_decline_all(&needs_action, &bob()).expect("the fork declines");
         assert_eq!(
             reply_partstat(&message, None, BOB).as_deref(),
             Some("DECLINED")

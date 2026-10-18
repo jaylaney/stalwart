@@ -1710,7 +1710,15 @@ async fn case_13_stated_losses(test: &TestServer) {
         StatusCode::NO_CONTENT
     );
     assert_eq!(trigger_drain(BOB, STRONG).await, 207);
-    pin(BOB, ALICE, &alice_fingerprint).await.expect(200);
+    assert_eq!(
+        pin(BOB, ALICE, &alice_fingerprint).await.expect(200)["delivered"],
+        1,
+        "the reset participation is redelivered"
+    );
+    assert!(
+        withheld(test, bob.id, ALICE).await.is_empty(),
+        "and the entry retired"
+    );
     assert_eq!(trigger_drain(ALICE, STRONG).await, 207);
     assert!(
         !body(&alice.client, &path).await.contains(CAROL),
