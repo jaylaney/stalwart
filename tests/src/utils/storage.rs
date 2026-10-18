@@ -260,7 +260,7 @@ pub async fn assert_is_empty(server: &Server, include_registry: bool) {
                 .await
                 .unwrap()
                 .is_some(),
-            "Found a zero-access vault record of destroyed account {account_id}"
+            "Found a zero-access vault or pin record of destroyed account {account_id}"
         );
     }
     search_store_destroy(server.search_store()).await;

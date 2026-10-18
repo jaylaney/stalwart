@@ -53,7 +53,7 @@ Where the code lives:
 - `crates/vault`: key primitives (`keys`), the vault record (`record`), recovery key, `SessionKeys` (`session`), the key cache (`cache`). `ZA_MARKER = "$za$"`.
 - `crates/common/src/auth/vault.rs`: vault storage and verification (`PrincipalField::ZeroAccessVault = 150`; 46 is taken upstream). `crates/common/src/auth/authentication.rs`: the marker-credential diversion inside `route_auth_request`.
 - `crates/http/src/auth/authenticate.rs`: keyed-fingerprint auth cache, generation fence, test-mode pause hooks (`za_test`).
-- `crates/http/src/api/vault.rs`: the eight `/api/vault/*` endpoints (`setup-token`, `setup`, `password`, `recover`, `recovery-key`, `app-password`, `app-password/revoke`, `totp`) plus CORS helpers. Every vault write goes through `za_commit`; never call `za_vault_write` directly.
+- `crates/http/src/api/vault.rs`: the eight `/api/vault/*` endpoints (`setup-token`, `setup`, `password`, `recover`, `recovery-key`, `app-password`, `app-password/revoke`, `totp`) plus CORS helpers. Every vault write goes through `za_commit` or the common helper it wraps, `Server::za_vault_commit` (`crates/common/src/auth/vault.rs`, key-pinning spec 4.5); never call `za_vault_write` directly.
 - `crates/jmap/src/registry/mapping/{principal,account}.rs`: refusals of registry credential edits for key accounts.
 - `crates/groupware/src/calendar/drain.rs`: the drain (invitations spec 6).
 - Tests: `tests/src/za/`, helpers in `tests/src/utils/za.rs`.

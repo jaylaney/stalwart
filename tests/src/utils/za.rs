@@ -14,7 +14,7 @@ use calcard::{
     },
 };
 use common::{
-    auth::vault::ZaVerification,
+    auth::vault::{RawValue, VaultRead, ZaMark, ZaVerification},
     ipc::CacheInvalidation,
     storage::index::ObjectIndexBuilder,
     za::{
@@ -48,8 +48,16 @@ use store::{
 };
 use tokio::task::JoinHandle;
 use types::collection::{Collection, SyncCollection};
-use types::field::CalendarEventField;
-use vault::session::SessionKeys;
+use types::field::{CalendarEventField, PrincipalField};
+use vault::{
+    keys::{
+        AAD_PRIVATE_KEY, AAD_PRIVATE_KEY_PINNED, Secret, aad, generate_keypair, unwrap_key,
+        wrap_key,
+    },
+    pins::{ZaPinRecord, open_pin_record, seal_pin_record},
+    record::VaultRecord,
+    session::SessionKeys,
+};
 
 /// The suite's HTTPS listener.
 pub const SERVER_URL: &str = "https://127.0.0.1:8899";
@@ -1005,4 +1013,176 @@ pub async fn copy_href(test: &TestServer, account_id: u32, uid: &str) -> String 
         .format_resource_paths_by_id(ids.iter().next().unwrap())
         .find(|href| !href.ends_with('/'))
         .expect("the copy is in the resource cache")
+}
+
+// The store writer of key pinning spec 2: these helpers write the vault and
+// pin records directly, as a party with store access but without MK can (and,
+// where a password is given, as the owner would), so tests can put an account
+// into the state a case names. Product code never writes this way.
+
+/// A fresh X25519 public key, the kind a store writer substitutes.
+pub fn writer_key() -> [u8; 32] {
+    generate_keypair().0
+}
+
+/// The account's vault record as read now; it must exist.
+async fn vault_read(test: &TestServer, account_id: u32) -> VaultRead {
+    test.server
+        .za_vault_record(account_id)
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("no vault record for account {account_id}"))
+}
+
+/// `edit` applied to the vault record at the next revision, written
+/// conditionally on the read (`za_vault_write`, the raw write), then the
+/// account's caches invalidated when `invalidate`.
+async fn rewrite_vault(
+    test: &TestServer,
+    account_id: u32,
+    invalidate: bool,
+    edit: impl FnOnce(&mut VaultRecord),
+) {
+    let read = vault_read(test, account_id).await;
+    let mut record = read.record.clone();
+    edit(&mut record);
+    record.revision = read.record.revision + 1;
+    test.server
+        .za_vault_write(account_id, &record, Some(&read))
+        .await
+        .unwrap();
+    if invalidate {
+        test.server.za_invalidate_account(account_id).await.unwrap();
+    }
+}
+
+/// Writes `key` as the account's `public_key` at the next revision, with
+/// cache invalidation when `invalidate`, and returns the replaced bytes.
+/// Restoring is the same call with the original.
+pub async fn substitute_public_key(
+    test: &TestServer,
+    account_id: u32,
+    key: &[u8],
+    invalidate: bool,
+) -> Vec<u8> {
+    let mut replaced = Vec::new();
+    rewrite_vault(test, account_id, invalidate, |record| {
+        replaced = std::mem::replace(&mut record.public_key, key.to_vec());
+    })
+    .await;
+    replaced
+}
+
+/// Opens a private-key wrap with `unwrap_key` under each purpose, pinned
+/// first, independently of the product's `unwrap_private_key`, so a mutation
+/// there cannot blind the tests.
+fn open_wrap(wrap: &[u8], mk: &Secret, account_id: u32) -> Option<(Secret, ZaMark)> {
+    [
+        (AAD_PRIVATE_KEY_PINNED, ZaMark::Pinned),
+        (AAD_PRIVATE_KEY, ZaMark::Legacy),
+    ]
+    .into_iter()
+    .find_map(|(purpose, mark)| {
+        unwrap_key(wrap, mk, &aad(purpose, account_id))
+            .ok()
+            .map(|key| (key, mark))
+    })
+}
+
+/// The mark of the account's stored private-key wrap (key pinning spec 4.4),
+/// under the MK `password` unlocks.
+pub async fn wrap_mark(test: &TestServer, account_id: u32, password: &str) -> ZaMark {
+    let keys = za_unlock(test, account_id, password).await;
+    let wrap = saved_wrap(test, account_id).await;
+    open_wrap(&wrap, keys.mk(), account_id).map_or(ZaMark::Neither, |(_, mark)| mark)
+}
+
+/// The account's stored private-key wrap, for `restore_wrap`.
+pub async fn saved_wrap(test: &TestServer, account_id: u32) -> Vec<u8> {
+    vault_read(test, account_id).await.record.private_key_wrap
+}
+
+/// Writes `wrap` back as the account's private-key wrap at the next revision
+/// and invalidates its caches.
+pub async fn restore_wrap(test: &TestServer, account_id: u32, wrap: &[u8]) {
+    rewrite_vault(test, account_id, true, |record| {
+        record.private_key_wrap = wrap.to_vec();
+    })
+    .await;
+}
+
+/// Rewraps the account's private key under the legacy associated data, as
+/// release 2 wrapped it, at the next revision, and invalidates its caches.
+pub async fn rewrap_legacy(test: &TestServer, account_id: u32, password: &str) {
+    let keys = za_unlock(test, account_id, password).await;
+    let wrap = saved_wrap(test, account_id).await;
+    let (private_key, _) = open_wrap(&wrap, keys.mk(), account_id)
+        .unwrap_or_else(|| panic!("the private-key wrap of account {account_id} does not open"));
+    let legacy = wrap_key(&private_key, keys.mk(), &aad(AAD_PRIVATE_KEY, account_id));
+    restore_wrap(test, account_id, &legacy).await;
+}
+
+fn pins_key(account_id: u32) -> ValueKey<ValueClass> {
+    ValueKey::property(
+        account_id,
+        Collection::Principal,
+        0,
+        PrincipalField::ZeroAccessPins,
+    )
+}
+
+/// The account's pin record, opened under the MK `password` unlocks; `None`
+/// when absent or unusable.
+pub async fn pin_record(test: &TestServer, account_id: u32, password: &str) -> Option<ZaPinRecord> {
+    let keys = za_unlock(test, account_id, password).await;
+    let raw = raw_pins(test, account_id).await?;
+    open_pin_record(&raw, keys.mk(), account_id)
+}
+
+/// Seals `record` as given (its revision included) under the MK `password`
+/// unlocks and writes it unconditionally.
+pub async fn write_pin_record(
+    test: &TestServer,
+    account_id: u32,
+    password: &str,
+    record: &ZaPinRecord,
+) {
+    let keys = za_unlock(test, account_id, password).await;
+    let sealed = seal_pin_record(record, keys.mk(), account_id);
+    set_raw_pins(test, account_id, Some(&sealed)).await;
+}
+
+/// The stored bytes of the account's pin record (field 151).
+pub async fn raw_pins(test: &TestServer, account_id: u32) -> Option<Vec<u8>> {
+    test.server
+        .store()
+        .get_value::<RawValue>(pins_key(account_id))
+        .await
+        .unwrap()
+        .map(|raw| raw.0)
+}
+
+/// An unconditional set of field 151 to `raw`, or its removal with `None`.
+pub async fn set_raw_pins(test: &TestServer, account_id: u32, raw: Option<&[u8]>) {
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(account_id)
+        .with_collection(Collection::Principal)
+        .with_document(0);
+    match raw {
+        Some(raw) => batch.set(PrincipalField::ZeroAccessPins, raw.to_vec()),
+        None => batch.clear(PrincipalField::ZeroAccessPins),
+    };
+    test.server.store().write(batch.build_all()).await.unwrap();
+}
+
+/// The account's vault revision, its authentication generation.
+pub async fn vault_revision(test: &TestServer, account_id: u32) -> u64 {
+    vault_read(test, account_id).await.record.revision
+}
+
+/// The never-pinned state: a legacy wrap and no pin record.
+pub async fn za_unpin(test: &TestServer, account_id: u32, password: &str) {
+    rewrap_legacy(test, account_id, password).await;
+    set_raw_pins(test, account_id, None).await;
 }

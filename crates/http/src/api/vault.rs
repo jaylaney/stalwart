@@ -439,11 +439,13 @@ async fn za_prune(
     Ok(())
 }
 
-/// The only vault write path of this module: prunes orphans, sets the next
-/// revision, writes conditionally on `previous` (absence when `None`) and
-/// invalidates cached classification and authentication. A write on top of a
-/// state other than the verified generation (`expected_revision`, invariant
-/// 8) and a lost race are both 409.
+/// The only vault write path of this module: prunes orphans, then commits
+/// through the common helper `Server::za_vault_commit` (key pinning spec
+/// 4.5), which sets the next revision, writes conditionally on `previous`
+/// (absence when `None`) and invalidates cached classification and
+/// authentication. A write on top of a state other than the verified
+/// generation (`expected_revision`, invariant 8) and a lost race are both
+/// 409.
 async fn za_commit(
     server: &Server,
     account_id: u32,
@@ -458,14 +460,14 @@ async fn za_commit(
         return Ok(Err(conflict("vault changed since verification")));
     }
     za_prune(server, record, account_id, now).await?;
-    record.revision = previous.map_or(1, |p| p.record.revision + 1);
-    match server.za_vault_write(account_id, record, previous).await {
-        Ok(()) => (),
-        Err(err) if err.is_assertion_failure() => return Ok(Err(conflict("conflict"))),
-        Err(err) => return Err(err),
+    match server
+        .za_vault_commit(account_id, record, previous, None)
+        .await
+    {
+        Ok(()) => Ok(Ok(())),
+        Err(err) if err.is_assertion_failure() => Ok(Err(conflict("conflict"))),
+        Err(err) => Err(err),
     }
-    za_invalidate_after_commit(server, account_id).await;
-    Ok(Ok(()))
 }
 
 /// Invalidation after a committed write: a failure is logged, never turned

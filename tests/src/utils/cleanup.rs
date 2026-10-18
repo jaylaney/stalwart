@@ -382,10 +382,13 @@ pub async fn store_assert_is_empty_except_vaults(
                         SUBSPACE_PROPERTY
                             if key.len() == U32_LEN + 2 + U32_LEN
                                 && key[U32_LEN] == Collection::Principal as u8
-                                && key[U32_LEN + 1] == PrincipalField::ZeroAccessVault as u8 =>
+                                && (key[U32_LEN + 1] == PrincipalField::ZeroAccessVault as u8
+                                    || key[U32_LEN + 1]
+                                        == PrincipalField::ZeroAccessPins as u8) =>
                         {
-                            // Zero-access vault records persist for the life of the
-                            // account; the caller checks that the account exists.
+                            // Zero-access vault and pin records persist for the life
+                            // of the account; the caller checks that the account
+                            // exists.
                             vault_accounts.push(key.deserialize_be_u32(0).unwrap());
                             return Ok(true);
                         }

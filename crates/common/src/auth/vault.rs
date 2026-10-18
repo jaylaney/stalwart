@@ -8,9 +8,11 @@ use crate::{Server, cache::invalidate::CacheInvalidationBuilder, ipc::CacheInval
 use ::vault::{
     Zeroizing,
     keys::{
-        AAD_PASSWORD, AAD_PRIVATE_KEY, Argon2Params, KeyError, Secret, aad, app_aad,
-        derive_app_kek, derive_kek, derive_root, unwrap_key, verifier_matches,
+        AAD_PASSWORD, AAD_PRIVATE_KEY, Argon2Params, KeyError, Secret, WrapMark, aad, app_aad,
+        derive_app_kek, derive_kek, derive_root, unwrap_key, unwrap_private_key, verifier_matches,
+        wrap_private_key,
     },
+    pins::{ZaPinRecord, open_pin_record, seal_pin_record},
     record::{VAULT_RECORD_VERSION, VaultRecord, VaultState, WrapState},
     session::SessionKeys,
 };
@@ -22,6 +24,7 @@ use store::{
 };
 use trc::AddContext;
 use types::{collection::Collection, field::PrincipalField};
+use utils::{DomainPart, sanitize_email};
 use xxhash_rust::xxh3::xxh3_64;
 
 /// Raw stored bytes, so the revision hash can be computed exactly as the
@@ -46,6 +49,16 @@ fn vault_key(account_id: u32) -> ValueKey<ValueClass> {
         Collection::Principal,
         0,
         PrincipalField::ZeroAccessVault,
+    )
+}
+
+/// The pin record (key pinning spec 4.1), keyed like the vault record.
+fn pins_key(account_id: u32) -> ValueKey<ValueClass> {
+    ValueKey::property(
+        account_id,
+        Collection::Principal,
+        0,
+        PrincipalField::ZeroAccessPins,
     )
 }
 
@@ -137,13 +150,7 @@ pub(crate) async fn vault_write_store(
             .caused_by(trc::location!()));
     }
 
-    let archive = Archiver::new(record.clone())
-        .serialize()
-        .caused_by(trc::location!())?;
-    let mut value = Vec::with_capacity(archive.len() + 1);
-    value.push(VAULT_RECORD_VERSION);
-    value.extend_from_slice(&archive);
-
+    let value = vault_value(record)?;
     let mut batch = BatchBuilder::new();
     batch
         .with_account_id(account_id)
@@ -157,6 +164,217 @@ pub(crate) async fn vault_write_store(
         )
         .set(PrincipalField::ZeroAccessVault, value);
     store.write(batch.build_all()).await.map(|_| ())
+}
+
+/// The stored form: one version byte followed by the record's archive.
+fn vault_value(record: &VaultRecord) -> trc::Result<Vec<u8>> {
+    let archive = Archiver::new(record.clone())
+        .serialize()
+        .caused_by(trc::location!())?;
+    let mut value = Vec::with_capacity(archive.len() + 1);
+    value.push(VAULT_RECORD_VERSION);
+    value.extend_from_slice(&archive);
+    Ok(value)
+}
+
+/// Attempts of one pin-record write, a single assertion or a vault batch
+/// (key pinning spec 4.2); losing the last one is the failure.
+pub const ZA_PIN_WRITE_ATTEMPTS: usize = 8;
+
+/// Key pinning spec 4.3: the one normalization of pin addresses, for the
+/// fan-out (applied to what `Email::new` produced), the pins and the
+/// endpoints (applied to the string as given). No `mailto:` decoding and no
+/// addr-spec extraction, so those forms are `None`.
+pub fn za_normalize_address(address: &str) -> Option<String> {
+    sanitize_email(address).map(|address| address.to_canonical_address().into_owned())
+}
+
+/// One pin-record read (key pinning spec 4.2): the stored bytes, whatever
+/// they are, and the record they open to. No `Debug`: the record holds
+/// addresses.
+pub struct ZaPinRead {
+    pub raw: Option<Vec<u8>>,
+    /// `None` when absent or unusable (spec 4.4).
+    pub record: Option<ZaPinRecord>,
+}
+
+impl ZaPinRead {
+    /// What a write on top of this read asserts: the hash of the bytes read
+    /// whenever there were any, garbage included; absence only when the read
+    /// returned nothing (spec 4.2).
+    pub fn assertion(&self) -> AssertValue {
+        self.raw
+            .as_deref()
+            .map_or(AssertValue::None, |raw| AssertValue::Hash(xxh3_64(raw)))
+    }
+
+    /// The record opened, decoded and has version 1 (spec 4.4).
+    pub fn is_usable(&self) -> bool {
+        self.record.is_some()
+    }
+}
+
+/// The associated data the private-key wrap opened under (key pinning spec
+/// 4.4); `Neither` is tampered, corrupt or missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZaMark {
+    Pinned,
+    Legacy,
+    Neither,
+}
+
+/// The mark of one vault read (spec 4.4): the mark, the hash a batch asserts
+/// and the wrap it rewraps all come from `vault`. A missing or unusable
+/// record is `Neither` with `vault: None`; a record whose wrap opens under
+/// neither purpose is `Neither` with the read kept.
+pub struct ZaMarkRead {
+    pub vault: Option<VaultRead>,
+    pub mark: ZaMark,
+    /// The unwrapped private key, `Some` for `Pinned` and `Legacy`.
+    pub private_key: Option<Secret>,
+}
+
+/// The state a pin decision runs against. `mark` is read only when `pins` is
+/// not usable: a record that opens is proof enough (spec 4.4).
+pub struct ZaPinState {
+    pub pins: ZaPinRead,
+    pub mark: Option<ZaMarkRead>,
+}
+
+/// A pin-record write: `sealed` replaces the value `previous` read, asserted
+/// as `previous.assertion()`.
+pub struct ZaPinWrite<'a> {
+    pub previous: &'a ZaPinRead,
+    pub sealed: Vec<u8>,
+}
+
+/// A decision of `za_pin_transact`: write the record (its revision is set by
+/// the write) or keep the stored state.
+pub enum ZaPinStep<T> {
+    Write(ZaPinRecord, T),
+    Keep(T),
+}
+
+/// The outcome of `za_pin_transact`. `Written` carries the state as written
+/// (`mark: None`, the record usable); `Conflict` is the last attempt lost.
+pub enum ZaPinTransact<T> {
+    Written { state: ZaPinState, value: T },
+    Kept { state: ZaPinState, value: T },
+    Conflict,
+}
+
+pub(crate) async fn pin_read_store(
+    store: &Store,
+    account_id: u32,
+    mk: &Secret,
+) -> trc::Result<ZaPinRead> {
+    let raw = store
+        .get_value::<RawValue>(pins_key(account_id))
+        .await
+        .caused_by(trc::location!())?
+        .map(|raw| raw.0);
+    let record = raw
+        .as_deref()
+        .and_then(|raw| open_pin_record(raw, mk, account_id));
+    Ok(ZaPinRead { raw, record })
+}
+
+/// Field 151's assertion, then its set (spec 4.4: each assertion before the
+/// set of its key).
+fn push_pin_write(batch: &mut BatchBuilder, write: ZaPinWrite<'_>) {
+    batch
+        .assert_value(PrincipalField::ZeroAccessPins, write.previous.assertion())
+        .set(PrincipalField::ZeroAccessPins, write.sealed);
+}
+
+/// A pin-record write alone: the field 151 assertion and set only.
+pub(crate) async fn pin_write_store(
+    store: &Store,
+    account_id: u32,
+    write: ZaPinWrite<'_>,
+) -> trc::Result<()> {
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(account_id)
+        .with_collection(Collection::Principal)
+        .with_document(0);
+    push_pin_write(&mut batch, write);
+    store.write(batch.build_all()).await.map(|_| ())
+}
+
+/// Key pinning spec 4.4-4.5: sets `record.revision` to the previous revision
+/// plus one (1 when `previous` is `None`) and writes one batch on Principal
+/// document 0: the vault assertion (the bytes `previous` read, or absence)
+/// and set, then, with `pins`, the pin-record assertion and set. A lost
+/// assertion is `Err(e)` with `e.is_assertion_failure()` and nothing written.
+pub(crate) async fn vault_commit_store(
+    store: &Store,
+    account_id: u32,
+    record: &mut VaultRecord,
+    previous: Option<&VaultRead>,
+    pins: Option<ZaPinWrite<'_>>,
+) -> trc::Result<()> {
+    record.revision = previous.map_or(1, |previous| previous.record.revision + 1);
+    let value = vault_value(record)?;
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(account_id)
+        .with_collection(Collection::Principal)
+        .with_document(0)
+        .assert_value(
+            PrincipalField::ZeroAccessVault,
+            previous.map_or(AssertValue::None, |previous| {
+                AssertValue::Hash(previous.cas)
+            }),
+        )
+        .set(PrincipalField::ZeroAccessVault, value);
+    if let Some(pins) = pins {
+        push_pin_write(&mut batch, pins);
+    }
+    store.write(batch.build_all()).await.map(|_| ())
+}
+
+/// One vault read, the wrap opened pinned first, then legacy (spec 4.4). A
+/// missing or unusable record is `Neither` with `vault: None`; other store
+/// errors propagate. Logs nothing: callers trace their own outcome.
+pub(crate) async fn mark_read_store(store: &Store, keys: &SessionKeys) -> trc::Result<ZaMarkRead> {
+    let account_id = keys.account_id;
+    let vault = match vault_read_store(store, account_id).await {
+        Ok(read) => read,
+        Err(err) if is_vault_unusable(&err) => None,
+        Err(err) => return Err(err),
+    };
+    let opened = vault.as_ref().and_then(|read| {
+        unwrap_private_key(&read.record.private_key_wrap, keys.mk(), account_id).ok()
+    });
+    let (mark, private_key) = match opened {
+        Some((key, WrapMark::Pinned)) => (ZaMark::Pinned, Some(key)),
+        Some((key, WrapMark::Legacy)) => (ZaMark::Legacy, Some(key)),
+        None => (ZaMark::Neither, None),
+    };
+    Ok(ZaMarkRead {
+        vault,
+        mark,
+        private_key,
+    })
+}
+
+/// Key pinning spec 5.1: the recipient's `public_key` when its record reads,
+/// is `Active` and holds 32 bytes; `None` for a missing, unusable or pending
+/// record. Logs nothing (an unusable record is not traced here) and returns
+/// nothing else of the record.
+pub(crate) async fn served_public_key_store(
+    store: &Store,
+    account_id: u32,
+) -> trc::Result<Option<[u8; 32]>> {
+    match vault_read_store(store, account_id).await {
+        Ok(Some(read)) if read.record.state == VaultState::Active => {
+            Ok(<[u8; 32]>::try_from(read.record.public_key.as_slice()).ok())
+        }
+        Ok(_) => Ok(None),
+        Err(err) if is_vault_unusable(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 impl Server {
@@ -183,7 +401,10 @@ impl Server {
     /// `record.revision` to exceed `read.record.revision` (otherwise a
     /// `StoreEvent::UnexpectedError`, nothing written). A lost race surfaces
     /// as `StoreEvent::AssertValueFailed` (`err.is_assertion_failure()`),
-    /// which endpoints map to 409.
+    /// which endpoints map to 409. It neither sets the revision nor
+    /// invalidates: product code calls `za_vault_commit` (or the HTTP
+    /// module's `za_commit`, which wraps it); test helpers, acting as the
+    /// store writer, call this.
     pub async fn za_vault_write(
         &self,
         account_id: u32,
@@ -191,6 +412,128 @@ impl Server {
         previous: Option<&VaultRead>,
     ) -> trc::Result<()> {
         vault_write_store(self.store(), account_id, record, previous).await
+    }
+
+    /// Every vault write of product code (key pinning spec 4.5): sets the
+    /// next revision, writes conditionally on `previous` (absence when
+    /// `None`), with `pins` in the same batch (spec 4.4), then invalidates
+    /// cached classification and authentication. A lost assertion is
+    /// `Err(e)` with `e.is_assertion_failure()`, nothing written. An
+    /// invalidation failure is logged, never returned, so a committed write
+    /// never reports an error.
+    pub async fn za_vault_commit(
+        &self,
+        account_id: u32,
+        record: &mut VaultRecord,
+        previous: Option<&VaultRead>,
+        pins: Option<ZaPinWrite<'_>>,
+    ) -> trc::Result<()> {
+        vault_commit_store(self.store(), account_id, record, previous, pins).await?;
+        if let Err(err) = self.za_invalidate_account(account_id).await {
+            trc::error!(
+                err.account_id(account_id)
+                    .details("Zero-access cache invalidation failed after a committed write")
+            );
+        }
+        Ok(())
+    }
+
+    /// The session account's pin record, read fresh (key pinning spec 4.2).
+    pub async fn za_pin_read(&self, keys: &SessionKeys) -> trc::Result<ZaPinRead> {
+        pin_read_store(self.store(), keys.account_id, keys.mk()).await
+    }
+
+    /// The session account's mark, from one fresh vault read (spec 4.4).
+    pub async fn za_mark_read(&self, keys: &SessionKeys) -> trc::Result<ZaMarkRead> {
+        mark_read_store(self.store(), keys).await
+    }
+
+    /// The pin record, and the mark only when the record is not usable.
+    pub async fn za_pin_state(&self, keys: &SessionKeys) -> trc::Result<ZaPinState> {
+        let pins = self.za_pin_read(keys).await?;
+        let mark = if pins.is_usable() {
+            None
+        } else {
+            Some(self.za_mark_read(keys).await?)
+        };
+        Ok(ZaPinState { pins, mark })
+    }
+
+    /// Key pinning spec 4.2's attempts: `decide` runs against `start` on the
+    /// first attempt and a fresh `za_pin_state` on every later one. A `Write`
+    /// gets the next record revision and is sealed under MK; under a legacy
+    /// wrap it is the first-pin or heal batch (the rewrap to the pinned wrap
+    /// and the record, asserted at the same vault read, spec 4.4), otherwise
+    /// a pin-record write alone. A lost assertion re-reads and decides again,
+    /// up to `ZA_PIN_WRITE_ATTEMPTS`; then `Conflict`.
+    pub async fn za_pin_transact<T: Send>(
+        &self,
+        keys: &SessionKeys,
+        mut start: Option<ZaPinState>,
+        mut decide: impl FnMut(&ZaPinState) -> ZaPinStep<T> + Send,
+    ) -> trc::Result<ZaPinTransact<T>> {
+        let account_id = keys.account_id;
+        for _ in 0..ZA_PIN_WRITE_ATTEMPTS {
+            let state = match start.take() {
+                Some(state) => state,
+                None => self.za_pin_state(keys).await?,
+            };
+            let (mut record, value) = match decide(&state) {
+                ZaPinStep::Keep(value) => return Ok(ZaPinTransact::Kept { state, value }),
+                ZaPinStep::Write(record, value) => (record, value),
+            };
+            let ZaPinState { pins, mark } = state;
+            record.revision = pins
+                .record
+                .as_ref()
+                .map_or(1, |previous| previous.revision + 1);
+            let sealed = seal_pin_record(&record, keys.mk(), account_id);
+            // The same vault read throughout: the mark, the asserted hash
+            // and the wrap the batch rewraps.
+            let mark = match mark {
+                Some(mark) => mark,
+                None => self.za_mark_read(keys).await?,
+            };
+            let write = ZaPinWrite {
+                previous: &pins,
+                sealed: sealed.clone(),
+            };
+            let result = match (&mark.vault, &mark.private_key) {
+                (Some(vault), Some(private_key)) if mark.mark == ZaMark::Legacy => {
+                    let mut rewrapped = vault.record.clone();
+                    rewrapped.private_key_wrap =
+                        wrap_private_key(private_key, keys.mk(), account_id, WrapMark::Pinned);
+                    self.za_vault_commit(account_id, &mut rewrapped, Some(vault), Some(write))
+                        .await
+                }
+                // Pinned, or a usable record under a wrap that opens under
+                // neither purpose.
+                _ => pin_write_store(self.store(), account_id, write).await,
+            };
+            match result {
+                Ok(()) => {
+                    return Ok(ZaPinTransact::Written {
+                        state: ZaPinState {
+                            pins: ZaPinRead {
+                                raw: Some(sealed),
+                                record: Some(record),
+                            },
+                            mark: None,
+                        },
+                        value,
+                    });
+                }
+                Err(err) if err.is_assertion_failure() => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(ZaPinTransact::Conflict)
+    }
+
+    /// Key pinning spec 5.1: the served key of a recipient, read fresh; see
+    /// `served_public_key_store`.
+    pub async fn za_served_public_key(&self, account_id: u32) -> trc::Result<Option<[u8; 32]>> {
+        served_public_key_store(self.store(), account_id).await
     }
 
     /// After any successful vault write (spec 4.1): drops cached authentication
@@ -494,7 +837,10 @@ fn za_parse_origin(origin: Option<&str>) -> Option<hyper::header::HeaderValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ::vault::keys::{derive_kek, derive_verifier_hash, wrap_key};
+    use ::vault::{
+        keys::{derive_kek, derive_public_key, derive_verifier_hash, generate_keypair, wrap_key},
+        pins::PinSource,
+    };
     use store::backend::ephemeral::EphemeralStore;
 
     #[tokio::test]
@@ -966,5 +1312,251 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    fn one_pin() -> ZaPinRecord {
+        let mut record = ZaPinRecord::new();
+        record.set_pin("key2@example.com", [2; 32], PinSource::FirstUse, 100);
+        record
+    }
+
+    fn two_pins() -> ZaPinRecord {
+        let mut record = one_pin();
+        record.set_pin("key3@example.com", [3; 32], PinSource::Confirmed, 200);
+        record
+    }
+
+    async fn write_raw_pins(store: &Store, account_id: u32, value: Vec<u8>) {
+        let mut batch = BatchBuilder::new();
+        batch
+            .with_account_id(account_id)
+            .with_collection(Collection::Principal)
+            .with_document(0)
+            .set(PrincipalField::ZeroAccessPins, value);
+        store.write(batch.build_all()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pin_writes_assert_absence_or_the_stored_bytes() {
+        let (store, mk) = (EphemeralStore::open(), Secret::random());
+        let absent = pin_read_store(&store, 5, &mk).await.unwrap();
+        assert!(absent.raw.is_none() && matches!(absent.assertion(), AssertValue::None));
+        pin_write_store(
+            &store,
+            5,
+            ZaPinWrite {
+                previous: &absent,
+                sealed: seal_pin_record(&one_pin(), &mk, 5),
+            },
+        )
+        .await
+        .unwrap();
+        let err = pin_write_store(
+            &store,
+            5,
+            ZaPinWrite {
+                previous: &absent,
+                sealed: seal_pin_record(&one_pin(), &mk, 5),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.is_assertion_failure(), "a second create loses");
+        let first = pin_read_store(&store, 5, &mk).await.unwrap();
+        assert_eq!(first.record, Some(one_pin()));
+        write_raw_pins(&store, 5, b"garbage".to_vec()).await;
+        let garbage = pin_read_store(&store, 5, &mk).await.unwrap();
+        assert!(garbage.raw.is_some() && !garbage.is_usable());
+        let err = pin_write_store(
+            &store,
+            5,
+            ZaPinWrite {
+                previous: &first,
+                sealed: seal_pin_record(&two_pins(), &mk, 5),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.is_assertion_failure(), "the bytes read before are gone");
+        pin_write_store(
+            &store,
+            5,
+            ZaPinWrite {
+                previous: &garbage,
+                sealed: seal_pin_record(&two_pins(), &mk, 5),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            pin_read_store(&store, 5, &mk).await.unwrap().record,
+            Some(two_pins())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_pin_batch_writes_both_fields_or_neither() {
+        // A legacy-wrapped Active record at revision 3, read as `fresh`;
+        // `stale` is a read taken at revision 2.
+        let (store, mk) = (EphemeralStore::open(), Secret::random());
+        let keys = SessionKeys::new(5, 1, mk.clone());
+        let (public, private) = generate_keypair();
+        let mut record = record_with_private_key(5, &mk, &private);
+        record.public_key = public.to_vec();
+        record.revision = 2;
+        vault_write_store(&store, 5, &record, None).await.unwrap();
+        let stale = vault_read_store(&store, 5).await.unwrap().unwrap();
+        record.revision = 3;
+        vault_write_store(&store, 5, &record, Some(&stale))
+            .await
+            .unwrap();
+        let fresh = vault_read_store(&store, 5).await.unwrap().unwrap();
+        let absent = pin_read_store(&store, 5, &mk).await.unwrap();
+        let rewrapped = |read: &VaultRead| {
+            let mut record = read.record.clone();
+            record.private_key_wrap = wrap_private_key(&private, &mk, 5, WrapMark::Pinned);
+            record
+        };
+
+        let err = vault_commit_store(
+            &store,
+            5,
+            &mut rewrapped(&stale),
+            Some(&stale),
+            Some(ZaPinWrite {
+                previous: &absent,
+                sealed: seal_pin_record(&one_pin(), &mk, 5),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.is_assertion_failure());
+        assert!(
+            pin_read_store(&store, 5, &mk).await.unwrap().raw.is_none(),
+            "no record without the rewrap"
+        );
+        assert_eq!(
+            mark_read_store(&store, &keys).await.unwrap().mark,
+            ZaMark::Legacy
+        );
+        vault_commit_store(
+            &store,
+            5,
+            &mut rewrapped(&fresh),
+            Some(&fresh),
+            Some(ZaPinWrite {
+                previous: &absent,
+                sealed: seal_pin_record(&one_pin(), &mk, 5),
+            }),
+        )
+        .await
+        .unwrap();
+        let mark = mark_read_store(&store, &keys).await.unwrap();
+        assert_eq!(
+            (mark.mark, mark.vault.unwrap().record.revision),
+            (ZaMark::Pinned, 4)
+        );
+        assert!(pin_read_store(&store, 5, &mk).await.unwrap().is_usable());
+    }
+
+    #[tokio::test]
+    async fn the_mark_is_read_pinned_first_then_legacy() {
+        // Records with a pinned wrap, a legacy wrap, a wrap of other bytes,
+        // and no record.
+        let (store, mk) = (EphemeralStore::open(), Secret::random());
+        let (public, private) = generate_keypair();
+        let wraps = [
+            wrap_private_key(&private, &mk, 1, WrapMark::Pinned),
+            wrap_private_key(&private, &mk, 2, WrapMark::Legacy),
+            wrap_key(&private, &mk, &aad(AAD_PASSWORD, 3)),
+        ];
+        for (account_id, wrap) in (1..).zip(wraps) {
+            let mut record = record_with_private_key(account_id, &mk, &private);
+            record.private_key_wrap = wrap;
+            vault_write_store(&store, account_id, &record, None)
+                .await
+                .unwrap();
+        }
+        let read = |account_id| {
+            let keys = SessionKeys::new(account_id, 1, mk.clone());
+            let store = store.clone();
+            async move { mark_read_store(&store, &keys).await.unwrap() }
+        };
+        let (pinned, legacy, neither, missing) =
+            (read(1).await, read(2).await, read(3).await, read(4).await);
+        let marks = [pinned.mark, legacy.mark, neither.mark, missing.mark];
+        assert_eq!(
+            marks,
+            [
+                ZaMark::Pinned,
+                ZaMark::Legacy,
+                ZaMark::Neither,
+                ZaMark::Neither
+            ]
+        );
+        assert!(neither.private_key.is_none() && missing.vault.is_none());
+        assert_eq!(
+            derive_public_key(pinned.private_key.as_ref().unwrap()),
+            public
+        );
+        assert_eq!(
+            derive_public_key(legacy.private_key.as_ref().unwrap()),
+            public
+        );
+    }
+
+    #[tokio::test]
+    async fn the_served_key_is_a_usable_public_key_or_nothing() {
+        const ACTIVE: u32 = 1;
+        const PENDING: u32 = 2;
+        const MISSING: u32 = 3;
+        const UNUSABLE: u32 = 4;
+        const SHORT: u32 = 5;
+        let store = EphemeralStore::open();
+        let (public, _) = generate_keypair();
+        let mut active = VaultRecord::pending(vec![], 0);
+        active.state = VaultState::Active;
+        active.public_key = public.to_vec();
+        vault_write_store(&store, ACTIVE, &active, None)
+            .await
+            .unwrap();
+        let mut pending = VaultRecord::pending(vec![1; 32], 100);
+        pending.public_key = public.to_vec();
+        vault_write_store(&store, PENDING, &pending, None)
+            .await
+            .unwrap();
+        write_raw(&store, UNUSABLE, vec![VAULT_RECORD_VERSION + 1, 0, 0]).await;
+        let mut short = active.clone();
+        short.public_key.pop();
+        vault_write_store(&store, SHORT, &short, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            served_public_key_store(&store, ACTIVE).await.unwrap(),
+            Some(public)
+        );
+        for id in [PENDING, MISSING, UNUSABLE, SHORT] {
+            assert_eq!(
+                served_public_key_store(&store, id).await.unwrap(),
+                None,
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn addresses_normalize_as_pins_are_keyed() {
+        assert_eq!(
+            za_normalize_address(" Bob@Example.COM ").as_deref(),
+            Some("bob@example.com")
+        );
+        assert_eq!(
+            za_normalize_address("bob@bücher.test").as_deref(),
+            Some("bob@xn--bcher-kva.test")
+        );
+        for bad in ["mailto:bob@example.com", "Bob <bob@example.com>", "bob", ""] {
+            assert_eq!(za_normalize_address(bad), None, "{bad}");
+        }
     }
 }
