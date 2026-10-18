@@ -993,17 +993,20 @@ async fn case_16_pin_before_deliver(test: &TestServer) {
 /// refusal recreates it while the first is parked; (c) a newer refusal
 /// while an ordinary edit is parked before its phase 4; (d) a newer
 /// refusal while `contacts/pin`'s inner fan-out is parked before phase 4
-/// (its reseal then loses the archive assertion). A re-armed or recreated
-/// entry always stays.
+/// (its reseal then loses the archive assertion); (e) the same park with an
+/// edit that sends nothing, so the retried reseal applies `1.2` and the
+/// entry, its refusal id unchanged, stays. A re-armed or recreated entry
+/// always stays.
 async fn case_17_cleanup_races(test: &TestServer) {
     const SUB_A: &str = "key2+pin17a@example.com";
     const SUB_B: &str = "key2+pin17b@example.com";
     const SUB_C: &str = "key2+pin17c@example.com";
     const SUB_D: &str = "key2+pin17d@example.com";
+    const SUB_E: &str = "key2+pin17e@example.com";
     let (alice, bob, _) = parties(test);
     let bob_start = inbox_ids(test, bob.id).await;
     let fingerprint = display_fingerprint(&served(test, bob.id).await);
-    for sub in [SUB_A, SUB_B, SUB_C, SUB_D] {
+    for sub in [SUB_A, SUB_B, SUB_C, SUB_D, SUB_E] {
         let looked_up = lookup(ALICE, sub).await.str(200, "fingerprint");
         assert_eq!(looked_up, fingerprint, "{sub} resolves to bob");
         pin(ALICE, sub, &fingerprint).await.expect(200);
@@ -1100,6 +1103,10 @@ async fn case_17_cleanup_races(test: &TestServer) {
     // before phase 4.
     let (path, original, writer) = refuse_once_at(test, &alice, &bob, SUB_D, "pin-17d").await;
     substitute_public_key(test, bob.id, &original, true).await;
+    assert!(
+        pending_ids(test, alice.id).await.is_empty(),
+        "nothing pending: the pause parks the redelivery's fan-out, not a merge's"
+    );
     let parked = HookParked::start(
         alice.id,
         test_hooks::set_retire_pause,
@@ -1124,8 +1131,66 @@ async fn case_17_cleanup_races(test: &TestServer) {
     delete_event(&alice, &path).await;
     drop_entries(ALICE, SUB_D).await;
 
+    // (e) An edit that sends nothing (CATEGORIES is no scheduling property,
+    // so upstream builds no message and nothing fans out) commits while
+    // contacts/pin's inner fan-out is parked before phase 4: the reseal
+    // loses its archive assertion, the fresh pin record still holds the
+    // consumed refusal id, and `1.2` is applied on the fresh archive.
+    let (path, original, _) = refuse_once_at(test, &alice, &bob, SUB_E, "pin-17e").await;
+    substitute_public_key(test, bob.id, &original, true).await;
+    let consumed = withheld(test, alice.id, SUB_E).await[0].refusal_id;
+    let before = inbox_ids(test, bob.id).await;
+    assert!(
+        pending_ids(test, alice.id).await.is_empty(),
+        "nothing pending: the pause parks the redelivery's fan-out, not a merge's"
+    );
+    let parked = HookParked::start(
+        alice.id,
+        test_hooks::set_retire_pause,
+        pin_request(ALICE, SUB_E, &fingerprint),
+    )
+    .await;
+    assert_eq!(
+        rewrite(&alice.client, &path, |body| body.replacen(
+            "END:VEVENT",
+            "CATEGORIES:pin-17e\r\nEND:VEVENT",
+            1
+        ))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let reply = parked.finish().await.expect(200);
+    assert_eq!(
+        (reply["delivered"].clone(), reply["remaining"].clone()),
+        (json!(0), json!(1))
+    );
+    assert_eq!(
+        new_inbox_items(test, bob.id, &before).await.len(),
+        1,
+        "the redelivered item only: the edit sent nothing"
+    );
+    assert_eq!(
+        attendee_statuses(&alice.client, &path, SUB_E).await,
+        ["1.2"],
+        "applied once more on the fresh archive"
+    );
+    assert!(
+        body(&alice.client, &path)
+            .await
+            .contains("CATEGORIES:pin-17e"),
+        "the concurrent edit survives the retried reseal"
+    );
+    let entries = withheld(test, alice.id, SUB_E).await;
+    assert_eq!(
+        (entries.len(), entries[0].refusal_id),
+        (1, consumed),
+        "the entry stays withheld"
+    );
+    delete_event(&alice, &path).await;
+    drop_entries(ALICE, SUB_E).await;
+
     // Cleanup.
-    for uid in ["pin-17a", "pin-17b", "pin-17c", "pin-17d"] {
+    for uid in ["pin-17a", "pin-17b", "pin-17c", "pin-17d", "pin-17e"] {
         clear_recipient(test, &bob, &bob_start, uid).await;
     }
 }

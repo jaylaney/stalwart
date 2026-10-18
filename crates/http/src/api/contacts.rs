@@ -154,8 +154,11 @@ pub(super) async fn za_contacts(
         Ok(verified) => verified,
         Err(response) => return Ok(response),
     };
-    let pins = server.za_pin_read(&verified.keys).await?;
+    // The mark first: a first-use batch (record plus rewrap) committing
+    // between the reads then shows as a legacy mark or a usable record,
+    // never as a pinned mark over a missing record (`record_missing`).
     let mark = server.za_mark_read(&verified.keys).await?.mark;
+    let pins = server.za_pin_read(&verified.keys).await?;
     let mut listed = Vec::new();
     let mut key_repaired_at = None;
     if let Some(record) = &pins.record {
