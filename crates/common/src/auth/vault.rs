@@ -8,9 +8,9 @@ use crate::{Server, cache::invalidate::CacheInvalidationBuilder, ipc::CacheInval
 use ::vault::{
     Zeroizing,
     keys::{
-        AAD_PASSWORD, AAD_PRIVATE_KEY, Argon2Params, KeyError, Secret, WrapMark, aad, app_aad,
-        derive_app_kek, derive_kek, derive_root, unwrap_key, unwrap_private_key, verifier_matches,
-        wrap_private_key,
+        AAD_PASSWORD, Argon2Params, KeyError, Secret, WrapMark, aad, app_aad, derive_app_kek,
+        derive_kek, derive_public_key, derive_root, unwrap_key, unwrap_private_key,
+        verifier_matches, wrap_private_key,
     },
     pins::{ZaPinRecord, open_pin_record, seal_pin_record},
     record::{VAULT_RECORD_VERSION, VaultRecord, VaultState, WrapState},
@@ -20,7 +20,7 @@ use directory::core::secret::verify_totp_code;
 use std::sync::{Arc, LazyLock};
 use store::{
     Deserialize, IterateParams, Serialize, Store, ValueKey,
-    write::{AlignedBytes, Archive, Archiver, BatchBuilder, ValueClass, assert::AssertValue},
+    write::{AlignedBytes, Archive, Archiver, BatchBuilder, ValueClass, assert::AssertValue, now},
 };
 use trc::AddContext;
 use types::{collection::Collection, field::PrincipalField};
@@ -426,13 +426,19 @@ impl Server {
         pins: Option<ZaPinWrite<'_>>,
     ) -> trc::Result<()> {
         vault_commit_store(self.store(), account_id, record, previous, pins).await?;
+        self.za_invalidate_committed(account_id).await;
+        Ok(())
+    }
+
+    /// The invalidation after a committed vault write; a failure is logged,
+    /// never returned.
+    async fn za_invalidate_committed(&self, account_id: u32) {
         if let Err(err) = self.za_invalidate_account(account_id).await {
             trc::error!(
                 err.account_id(account_id)
                     .details("Zero-access cache invalidation failed after a committed write")
             );
         }
-        Ok(())
     }
 
     /// The session account's pin record, read fresh (key pinning spec 4.2).
@@ -671,43 +677,176 @@ fn corrupt(account_id: u32, what: &'static str) -> trc::Error {
         .caused_by(trc::location!())
 }
 
-/// Invitations spec 3.2: the session's X25519 private key, unwrapped from
-/// `private_key_wrap` under MK on first use and kept only in `keys`, which
-/// zeroes it on drop. The outcome is recorded:
-/// - a wrap that does not open, or a missing or unusable record, is traced
-///   once per session (account id and a `zero-access:` description only) and
-///   is an error on every call (spec 10);
-/// - a store error is not recorded, so a later call retries.
-pub(crate) async fn za_open_private_key<'k>(
+/// Key pinning spec 3.3: what the self-check found. No `Debug`: no key is
+/// ever traced (invariant 21).
+pub struct ZaSelfCheck {
+    /// Whether the stored `public_key` matched the derived key at the first
+    /// read, before any repair (spec 6.2).
+    pub stored_key_matches: bool,
+    /// Derived from the private key, never the stored copy: the source of
+    /// the account's own fingerprint (spec 3.2).
+    pub public_key: [u8; 32],
+}
+
+/// Key pinning spec 3.3, the self-check; it replaces release 2's
+/// legacy-only private-key reader (invitations spec 3.2). Each attempt is
+/// one vault read, the wrap opened pinned first, then legacy (spec 4.4),
+/// and one pin record read. The public key derived from the private key is
+/// compared with the record's. On a mismatch it traces once per call and
+/// commits one batch (`vault_commit_store`, asserted at the bytes read):
+/// the vault record with `public_key` rewritten from the derived key; with
+/// a usable pin record, that record at its next revision with
+/// `key_repaired_at` set; and, when that record sits under a legacy wrap,
+/// the heal's rewrap. With `heal` (the drain's first pass) a usable record
+/// under a legacy wrap is healed even when the key matches; without it
+/// only a repair heals. It never creates a pin record (invariant 22). A
+/// lost assertion re-reads and checks again, up to `ZA_PIN_WRITE_ATTEMPTS`
+/// attempts; after the last, the next session checks again. The `bool` is
+/// whether it committed a write.
+///
+/// The unwrap outcome is recorded in `keys`, the first one standing:
+/// - a wrap that opens under neither purpose, or a missing or unusable
+///   record, is a failure, traced once per session (account id and a
+///   `zero-access:` description only) and an error;
+/// - a store error after the key opened (the pin read, the write, a later
+///   attempt's read) records the key and returns the error; one on the
+///   first vault read records nothing, so a later call retries.
+///
+/// With `once` (the drain), a recorded outcome is returned without a store
+/// read: `stored_key_matches` true and the key derived from the recorded
+/// private key, or the recorded failure's error. Without it (the contacts
+/// endpoints) the check always runs and leaves a recorded outcome as it is.
+pub(crate) async fn self_check_store(
     store: &Store,
-    keys: &'k SessionKeys,
-) -> trc::Result<&'k Secret> {
-    if keys.private_key().is_none() {
-        let account_id = keys.account_id;
-        let outcome = match vault_read_store(store, account_id).await {
-            Ok(Some(read)) => unwrap_key(
-                &read.record.private_key_wrap,
-                keys.mk(),
-                &aad(AAD_PRIVATE_KEY, account_id),
-            ),
-            Ok(None) => Err(KeyError::Aead),
-            Err(err) if is_vault_unusable(&err) => Err(KeyError::Aead),
-            Err(err) => return Err(err),
-        };
-        #[cfg(feature = "test_mode")]
-        let outcome = if crate::za::test_hooks::take_private_key_fail(account_id) {
-            Err(KeyError::Aead)
-        } else {
-            outcome
-        };
-        let failed = outcome.is_err();
-        if keys.set_private_key(outcome) && failed {
-            trc::error!(private_key_unavailable(account_id));
+    keys: &SessionKeys,
+    heal: bool,
+    once: bool,
+) -> trc::Result<(ZaSelfCheck, bool)> {
+    let account_id = keys.account_id;
+    if once {
+        match keys.private_key() {
+            Some(Ok(private_key)) => {
+                let check = ZaSelfCheck {
+                    stored_key_matches: true,
+                    public_key: derive_public_key(private_key),
+                };
+                return Ok((check, false));
+            }
+            Some(Err(_)) => return Err(private_key_unavailable(account_id)),
+            None => {}
         }
     }
-    match keys.private_key() {
-        Some(Ok(key)) => Ok(key),
-        _ => Err(private_key_unavailable(keys.account_id)),
+    // The first attempt's comparison, and the key an earlier attempt opened.
+    let mut first_matches = None;
+    let mut opened = None;
+    let mut traced = false;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let read = match mark_read_store(store, keys).await {
+            Ok(read) => read,
+            Err(err) => {
+                record_private_key(keys, opened);
+                return Err(err);
+            }
+        };
+        // The hook fails a session's first unwrap only.
+        #[cfg(feature = "test_mode")]
+        let read = if keys.private_key().is_none()
+            && crate::za::test_hooks::take_private_key_fail(account_id)
+        {
+            ZaMarkRead {
+                mark: ZaMark::Neither,
+                private_key: None,
+                ..read
+            }
+        } else {
+            read
+        };
+        let ZaMarkRead {
+            vault,
+            mark,
+            private_key,
+        } = read;
+        let (Some(vault), Some(private_key)) = (vault, private_key) else {
+            if keys.set_private_key(Err(KeyError::Aead)) {
+                trc::error!(private_key_unavailable(account_id));
+            }
+            return Err(private_key_unavailable(account_id));
+        };
+        let derived = derive_public_key(&private_key);
+        let matches = vault.record.public_key.as_slice() == derived.as_slice();
+        let check = ZaSelfCheck {
+            stored_key_matches: *first_matches.get_or_insert(matches),
+            public_key: derived,
+        };
+        let pins = match pin_read_store(store, account_id, keys.mk()).await {
+            Ok(pins) => pins,
+            Err(err) => {
+                record_private_key(keys, Some(private_key));
+                return Err(err);
+            }
+        };
+        let rewrap = mark == ZaMark::Legacy && pins.is_usable() && (heal || !matches);
+        if matches && !rewrap {
+            record_private_key(keys, Some(private_key));
+            return Ok((check, false));
+        }
+        if !matches && !traced {
+            traced = true;
+            trc::event!(
+                Security(trc::SecurityEvent::Unauthorized),
+                AccountId = account_id,
+                Details = "zero-access: stored public key does not match the private key",
+            );
+        }
+        let mut record = vault.record.clone();
+        if !matches {
+            record.public_key = derived.to_vec();
+        }
+        if rewrap {
+            record.private_key_wrap =
+                wrap_private_key(&private_key, keys.mk(), account_id, WrapMark::Pinned);
+        }
+        // A usable record is rewritten at its next revision (spec 4.1);
+        // without one nothing is written to field 151 (invariant 22).
+        let write = pins.record.as_ref().map(|current| {
+            let mut next = current.clone();
+            next.revision = current.revision + 1;
+            if !matches {
+                next.key_repaired_at = Some(now() as i64);
+            }
+            ZaPinWrite {
+                previous: &pins,
+                sealed: seal_pin_record(&next, keys.mk(), account_id),
+            }
+        });
+        match vault_commit_store(store, account_id, &mut record, Some(&vault), write).await {
+            Ok(()) => {
+                record_private_key(keys, Some(private_key));
+                return Ok((check, true));
+            }
+            // The last attempt lost: the next session checks again.
+            Err(err) if err.is_assertion_failure() && attempt >= ZA_PIN_WRITE_ATTEMPTS => {
+                record_private_key(keys, Some(private_key));
+                return Ok((check, false));
+            }
+            // Re-read and check again: a key that now matches writes
+            // nothing.
+            Err(err) if err.is_assertion_failure() => opened = Some(private_key),
+            Err(err) => {
+                record_private_key(keys, Some(private_key));
+                return Err(err);
+            }
+        }
+    }
+}
+
+/// Records an opened private key in the session; a no-op when nothing
+/// opened or once an outcome is recorded (the first stands).
+fn record_private_key(keys: &SessionKeys, private_key: Option<Secret>) {
+    if let Some(private_key) = private_key {
+        keys.set_private_key(Ok(private_key));
     }
 }
 
@@ -821,13 +960,48 @@ impl Server {
         za_open_app_record(account_id, &read.record, credential_id, secret)
     }
 
-    /// Invitations spec 3.2: see `za_open_private_key`. The drain (plan 10)
-    /// is the caller; a recorded failure (the wrap does not open, the record
-    /// is missing or unusable) was traced once for the session; a propagated
-    /// store error was not traced and is not recorded, so the caller traces
-    /// it and a later call retries.
+    /// Key pinning spec 3.3: `self_check_store`, then, when it wrote, the
+    /// account's invalidation (the write's generation bump ends its cached
+    /// logins and resident keys); an invalidation failure is logged, never
+    /// returned. `heal` is the drain's first pass; the endpoints heal only
+    /// by writing the record (spec 4.4).
+    pub async fn za_self_check(
+        &self,
+        keys: &SessionKeys,
+        heal: bool,
+        once: bool,
+    ) -> trc::Result<ZaSelfCheck> {
+        let (check, wrote) = self_check_store(self.store(), keys, heal, once).await?;
+        if wrote {
+            self.za_invalidate_committed(keys.account_id).await;
+        }
+        Ok(check)
+    }
+
+    /// Invitations spec 3.2: the session's X25519 private key, from the
+    /// self-check (`za_self_check(keys, true, true)`, key pinning spec 3.3),
+    /// which runs once per session; a recorded outcome returns at once. The
+    /// drain is the caller. A recorded failure (the wrap does not open, the
+    /// record is missing or unusable) was traced once for the session and is
+    /// an error. A store error after the key opened is traced here and the
+    /// key returned (spec 8: the drain proceeds); one before it was not
+    /// traced and is not recorded, so the caller traces it and a later call
+    /// retries.
     pub async fn za_private_key<'k>(&self, keys: &'k SessionKeys) -> trc::Result<&'k Secret> {
-        za_open_private_key(self.store(), keys).await
+        if let Err(err) = self.za_self_check(keys, true, true).await {
+            if !matches!(keys.private_key(), Some(Ok(_))) {
+                return Err(err);
+            }
+            trc::error!(
+                err.account_id(keys.account_id)
+                    .details("zero-access: self-check failed")
+                    .caused_by(trc::location!())
+            );
+        }
+        match keys.private_key() {
+            Some(Ok(private_key)) => Ok(private_key),
+            _ => Err(private_key_unavailable(keys.account_id)),
+        }
     }
 }
 
@@ -849,7 +1023,7 @@ fn za_parse_origin(origin: Option<&str>) -> Option<hyper::header::HeaderValue> {
 mod tests {
     use super::*;
     use ::vault::{
-        keys::{derive_kek, derive_public_key, derive_verifier_hash, generate_keypair, wrap_key},
+        keys::{AAD_PRIVATE_KEY, derive_kek, derive_verifier_hash, generate_keypair, wrap_key},
         pins::PinSource,
     };
     use store::backend::ephemeral::EphemeralStore;
@@ -1261,18 +1435,22 @@ mod tests {
 
         let keys = SessionKeys::new(3, 1, mk.clone());
         assert!(keys.private_key().is_none());
-        let key = za_open_private_key(&store, &keys).await.unwrap();
-        assert_eq!(key.as_bytes(), private.as_bytes());
+        self_check_store(&store, &keys, false, true).await.unwrap();
+        assert_eq!(
+            keys.private_key().unwrap().unwrap().as_bytes(),
+            private.as_bytes()
+        );
         // Kept in the session: no second record read (the record is now
         // unusable, and the call still succeeds).
         write_raw(&store, 3, Vec::new()).await;
+        self_check_store(&store, &keys, false, true).await.unwrap();
         assert_eq!(
-            za_open_private_key(&store, &keys).await.unwrap().as_bytes(),
+            keys.private_key().unwrap().unwrap().as_bytes(),
             private.as_bytes()
         );
         // A new session reads the record again.
         assert!(
-            za_open_private_key(&store, &SessionKeys::new(3, 1, mk.clone()))
+            self_check_store(&store, &SessionKeys::new(3, 1, mk.clone()), false, true)
                 .await
                 .is_err()
         );
@@ -1288,7 +1466,10 @@ mod tests {
         vault_write_store(&store, 3, &record, None).await.unwrap();
 
         let keys = SessionKeys::new(3, 1, mk.clone());
-        let err = za_open_private_key(&store, &keys).await.err().unwrap();
+        let err = self_check_store(&store, &keys, false, true)
+            .await
+            .err()
+            .unwrap();
         assert!(err.matches(trc::EventType::Store(trc::StoreEvent::DataCorruption)));
         assert!(format!("{err:?}").contains("zero-access:"), "{err:?}");
         assert!(matches!(keys.private_key(), Some(Err(_))), "no key is kept");
@@ -1301,27 +1482,79 @@ mod tests {
         vault_write_store(&store, 3, &repaired, Some(&read))
             .await
             .unwrap();
-        assert!(za_open_private_key(&store, &keys).await.is_err());
+        assert!(self_check_store(&store, &keys, false, true).await.is_err());
+        let fresh = SessionKeys::new(3, 1, mk.clone());
+        self_check_store(&store, &fresh, false, true).await.unwrap();
         assert_eq!(
-            za_open_private_key(&store, &SessionKeys::new(3, 1, mk.clone()))
-                .await
-                .unwrap()
-                .as_bytes(),
+            fresh.private_key().unwrap().unwrap().as_bytes(),
             private.as_bytes()
         );
 
         // A missing record, and a wrap bound to another account.
         assert!(
-            za_open_private_key(&store, &SessionKeys::new(4, 1, mk.clone()))
+            self_check_store(&store, &SessionKeys::new(4, 1, mk.clone()), false, true)
                 .await
                 .is_err()
         );
         let moved = record_with_private_key(3, &mk, &private);
         vault_write_store(&store, 5, &moved, None).await.unwrap();
         assert!(
-            za_open_private_key(&store, &SessionKeys::new(5, 1, mk.clone()))
+            self_check_store(&store, &SessionKeys::new(5, 1, mk.clone()), false, true)
                 .await
                 .is_err()
+        );
+    }
+
+    /// The store writer replaces the record's `public_key` at the next
+    /// revision.
+    async fn write_public_key(store: &Store, account_id: u32, key: &[u8; 32]) {
+        let read = vault_read_store(store, account_id).await.unwrap().unwrap();
+        let mut record = read.record.clone();
+        record.public_key = key.to_vec();
+        record.revision += 1;
+        vault_write_store(store, account_id, &record, Some(&read))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_ungated_self_check_reads_the_store_again() {
+        // An Active record with a matching public key; keys recorded by a
+        // first gated call.
+        let store = EphemeralStore::open();
+        let mk = Secret::random();
+        let (public, private) = generate_keypair();
+        let (writer, _) = generate_keypair();
+        let mut record = record_with_private_key(3, &mk, &private);
+        record.public_key = public.to_vec();
+        vault_write_store(&store, 3, &record, None).await.unwrap();
+        let keys = SessionKeys::new(3, 1, mk.clone());
+
+        self_check_store(&store, &keys, false, true).await.unwrap();
+        write_public_key(&store, 3, &writer).await; // the stored key replaced at the next revision
+        let (check, wrote) = self_check_store(&store, &keys, false, true).await.unwrap();
+        assert!(
+            check.stored_key_matches && !wrote,
+            "gated: the recorded outcome, no read"
+        );
+        let (check, wrote) = self_check_store(&store, &keys, false, false).await.unwrap();
+        assert!(
+            !check.stored_key_matches && wrote,
+            "ungated: compared and repaired"
+        );
+        assert_eq!(
+            vault_read_store(&store, 3)
+                .await
+                .unwrap()
+                .unwrap()
+                .record
+                .public_key,
+            public.to_vec()
+        );
+        assert_eq!(
+            keys.private_key().unwrap().unwrap().as_bytes(),
+            private.as_bytes(),
+            "the recorded outcome stays"
         );
     }
 

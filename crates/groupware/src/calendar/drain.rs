@@ -7,7 +7,9 @@
 //! Invitations spec 6: the drain. A key account's own DAV request, which
 //! holds the account's session keys, opens the pending items of the
 //! account's scheduling inbox before the request's own work (6.1), so no
-//! background code needs a key. A pass (6.2-6.3) takes the session's lock,
+//! background code needs a key. The first pass of every session runs the
+//! self-check (key pinning spec 3.3) before enumerating, items pending or
+//! not. A pass (6.2-6.3) takes the session's lock,
 //! reads the inbox change id (the snapshot), enumerates the items whose
 //! pending bit is set in document id order, unwraps the private key once
 //! (3.2), and for each item: opens the `pk` wrap (the only place one is
@@ -125,16 +127,20 @@ enum ItemOutcome {
     Waiting,
 }
 
-/// What a pass left behind.
-enum PassOutcome {
-    /// Every item is done, skipped, or waiting behind a skipped one.
+/// What a pass left behind, as `za_drain` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassOutcome {
+    /// Every item is done, skipped, or waiting behind a skipped one; or the
+    /// cursor is at the snapshot.
     Complete,
-    /// An item stays pending for a reason a later pass can clear.
+    /// An item stays pending for a reason a later pass can clear; also an
+    /// error, a deferral in force and the test-mode drain skip.
     LeftPending,
     /// `DRAIN_PASS_CAP` items attempted, more remain: the next request
     /// continues.
     More,
-    /// The private key does not open: no later pass of this session.
+    /// The private key does not open: no later pass of this session (also
+    /// a pass that permanent deferral keeps out).
     Suspended,
 }
 
@@ -149,23 +155,28 @@ struct ItemFailure {
 
 pub trait ZaDrain: Sync + Send {
     /// Spec 6.1: drains the inbox of the account whose session keys these
-    /// are, before the request's own work. Never fails the request
-    /// (invariant 14): errors are traced here.
-    fn za_drain(&self, keys: &Arc<SessionKeys>) -> impl Future<Output = ()> + Send;
+    /// are, before the request's own work, and returns the pass's outcome.
+    /// Never fails the request (invariant 14): errors are traced here and
+    /// are `LeftPending`.
+    fn za_drain(&self, keys: &Arc<SessionKeys>) -> impl Future<Output = PassOutcome> + Send;
 }
 
 impl ZaDrain for Server {
-    async fn za_drain(&self, keys: &Arc<SessionKeys>) {
+    async fn za_drain(&self, keys: &Arc<SessionKeys>) -> PassOutcome {
         #[cfg(feature = "test_mode")]
         if common::za::test_hooks::drain_skipped(keys.account_id) {
-            return;
+            return PassOutcome::LeftPending;
         }
-        if let Err(err) = drain_pass(self, keys).await {
-            trc::error!(
-                err.account_id(keys.account_id)
-                    .details("zero-access: drain pass failed")
-                    .caused_by(trc::location!())
-            );
+        match drain_pass(self, keys).await {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                trc::error!(
+                    err.account_id(keys.account_id)
+                        .details("zero-access: drain pass failed")
+                        .caused_by(trc::location!())
+                );
+                PassOutcome::LeftPending
+            }
         }
     }
 }
@@ -179,14 +190,37 @@ fn drain_retry_secs() -> u64 {
 }
 
 /// Spec 6.2-6.3: one pass under the session's lock. Nothing runs while a
-/// deferral is in force or while the cursor is at the inbox's change id.
-async fn drain_pass(server: &Server, keys: &Arc<SessionKeys>) -> trc::Result<()> {
+/// deferral is in force (`LeftPending`, or `Suspended` when permanent) or
+/// while the cursor is at the inbox's change id (`Complete`). The session's
+/// first pass runs the self-check first (key pinning spec 3.3), items
+/// pending or not: a private key that does not open suspends the session's
+/// drain; any other error is traced and the pass goes on.
+async fn drain_pass(server: &Server, keys: &Arc<SessionKeys>) -> trc::Result<PassOutcome> {
     let account_id = keys.account_id;
     let state = keys.drain();
     let mut pass = state.lock().await;
     let now = now();
-    if state.retry_after() > now {
-        return Ok(());
+    let retry_after = state.retry_after();
+    if retry_after > now {
+        return Ok(if retry_after == PERMANENT_DEFERRAL {
+            PassOutcome::Suspended
+        } else {
+            PassOutcome::LeftPending
+        });
+    }
+    if keys.private_key().is_none()
+        && let Err(err) = server.za_private_key(keys).await
+    {
+        // A recorded failure was traced once for the session (spec 10).
+        if matches!(keys.private_key(), Some(Err(_))) {
+            state.defer_until(PERMANENT_DEFERRAL);
+            return Ok(PassOutcome::Suspended);
+        }
+        trc::error!(
+            err.account_id(account_id)
+                .details("zero-access: self-check failed")
+                .caused_by(trc::location!())
+        );
     }
     let Some((snapshot, mut pending)) = (match enumerate(server, account_id, state).await {
         Ok(enumerated) => enumerated,
@@ -196,7 +230,7 @@ async fn drain_pass(server: &Server, keys: &Arc<SessionKeys>) -> trc::Result<()>
             return Err(err);
         }
     }) else {
-        return Ok(());
+        return Ok(PassOutcome::Complete);
     };
     // Spec 6.2, "Skipped items": neither a skipped item nor one waiting
     // behind it holds the cursor, and neither is re-opened in this session
@@ -204,20 +238,23 @@ async fn drain_pass(server: &Server, keys: &Arc<SessionKeys>) -> trc::Result<()>
     pending.retain(|document_id| !pass.is_skipped(*document_id) && !pass.is_waiting(*document_id));
     if pending.is_empty() {
         state.complete(snapshot);
-        return Ok(());
+        return Ok(PassOutcome::Complete);
     }
-    match drain_items(server, keys, pending, &mut pass).await {
-        Ok(PassOutcome::Complete) => state.complete(snapshot),
-        Ok(PassOutcome::LeftPending) => state.defer_until(now + drain_retry_secs()),
-        // The next request continues from the cursor, at once.
-        Ok(PassOutcome::More) => {}
-        Ok(PassOutcome::Suspended) => state.defer_until(PERMANENT_DEFERRAL),
+    let outcome = match drain_items(server, keys, pending, &mut pass).await {
+        Ok(outcome) => outcome,
         Err(err) => {
             state.defer_until(now + drain_retry_secs());
             return Err(err);
         }
+    };
+    match outcome {
+        PassOutcome::Complete => state.complete(snapshot),
+        PassOutcome::LeftPending => state.defer_until(now + drain_retry_secs()),
+        // The next request continues from the cursor, at once.
+        PassOutcome::More => {}
+        PassOutcome::Suspended => state.defer_until(PERMANENT_DEFERRAL),
     }
-    Ok(())
+    Ok(outcome)
 }
 
 /// Spec 6.2: the snapshot and the pending items, oldest first; `None` when
@@ -301,8 +338,9 @@ async fn drain_items(
         Ok(key) => key,
         // A recorded failure (the wrap does not open, the record is missing
         // or unusable) was traced once for the session and suspends its
-        // drain (spec 10); a store error is not recorded, so it is traced
-        // by the caller and the next pass retries it.
+        // drain (spec 10); a store error before the key opened is not
+        // recorded, so it is traced by the caller and the next pass retries
+        // it.
         Err(err) => {
             return if keys.private_key().is_some() {
                 Ok(PassOutcome::Suspended)

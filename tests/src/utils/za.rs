@@ -52,7 +52,7 @@ use types::field::{CalendarEventField, PrincipalField};
 use vault::{
     keys::{
         AAD_PRIVATE_KEY, AAD_PRIVATE_KEY_PINNED, Secret, aad, generate_keypair, unwrap_key,
-        wrap_key,
+        unwrap_private_key, wrap_key,
     },
     pins::{ZaPinRecord, open_pin_record, seal_pin_record},
     record::VaultRecord,
@@ -576,10 +576,12 @@ pub fn envelope_wrap(ical: &ICalendar) -> Option<u8> {
 }
 
 /// Opens a pending item as the drain will (invitations spec 6.4 step 1):
-/// unlocks the recipient's keys from `password`, obtains its private key
-/// through `Server::za_private_key`, and opens the stored item's `pk` wrap.
-/// Returns the plaintext tree and what the item carries. In plan 9 only
-/// tests open pending items (invariant 11).
+/// unlocks the recipient's keys from `password`, opens the private-key wrap
+/// of its vault record read-only (`unwrap_private_key`: no outcome recorded
+/// and no write, so a test read never repairs or heals, key pinning spec
+/// 3.3), and opens the stored item's `pk` wrap. Returns the plaintext tree
+/// and what the item carries. In plan 9 only tests open pending items
+/// (invariant 11).
 pub async fn open_pending_item_as(
     test: &TestServer,
     recipient: u32,
@@ -587,7 +589,9 @@ pub async fn open_pending_item_as(
     document_id: u32,
 ) -> (ICalendar, PendingCarriers) {
     let keys = za_unlock(test, recipient, password).await;
-    let private_key = test.server.za_private_key(&keys).await.unwrap();
+    let wrap = saved_wrap(test, recipient).await;
+    let (private_key, _) = unwrap_private_key(&wrap, keys.mk(), recipient)
+        .unwrap_or_else(|_| panic!("the private-key wrap of account {recipient} does not open"));
     let stored = test
         .server
         .store()
@@ -600,7 +604,7 @@ pub async fn open_pending_item_as(
         .unwrap()
         .expect("inbox item");
     let mut item = stored.deserialize::<CalendarEventNotification>().unwrap();
-    let carriers = open_pending_item(&mut item.event, recipient, private_key)
+    let carriers = open_pending_item(&mut item.event, recipient, &private_key)
         .unwrap_or_else(|err| panic!("item {document_id} does not open: {err:?}"));
     (item.event, carriers)
 }

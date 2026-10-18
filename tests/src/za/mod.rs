@@ -29,6 +29,7 @@ pub mod index_task;
 pub mod leak;
 pub mod pairs;
 pub mod password;
+pub mod pinning;
 pub mod registry;
 pub mod reply;
 pub mod setup;
@@ -126,6 +127,7 @@ pub async fn za_tests() {
     drain::test_cursor(&mut test).await;
     drain::test_errors(&mut test).await;
     drain_limits::test(&mut test).await;
+    pinning::test(&mut test).await;
     sweep::test(&mut test).await;
     tracing::test(&mut test).await;
     expansion::test(&mut test).await;
