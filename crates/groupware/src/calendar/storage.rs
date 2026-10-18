@@ -550,7 +550,9 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
     /// `delete_all`. With `za_keys` (a key account, invitations spec 5.5)
     /// the stored tree is unsealed before `itip_cancel`, and the CANCEL (or
     /// an attendee's declined REPLY) is returned with the stored pairs for
-    /// the fan-out instead of queued.
+    /// the fan-out instead of queued; whenever the scheduling gate holds,
+    /// with no message when `itip_cancel` builds none (key pinning spec 5.1
+    /// item 2).
     #[allow(clippy::too_many_arguments)]
     pub fn delete_all_za(
         self,
@@ -589,27 +591,26 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
                 None => None,
             };
 
-            if let Ok(messages) = itip_cancel(&event.data.event, account_info.addresses(), true) {
-                if za_keys.is_some() {
-                    let uid = event
-                        .data
-                        .event
-                        .uids()
-                        .next()
-                        .unwrap_or_default()
-                        .to_string();
-                    za_message = Some(ZaDeleteMessage {
-                        message: messages,
-                        pairs,
-                        event: event.data.event,
-                        document_id,
-                        uid,
-                    });
-                } else {
-                    ItipMessages::new(vec![messages])
-                        .queue(batch)
-                        .caused_by(trc::location!())?;
-                }
+            let message = itip_cancel(&event.data.event, account_info.addresses(), true).ok();
+            if za_keys.is_some() {
+                let uid = event
+                    .data
+                    .event
+                    .uids()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                za_message = Some(ZaDeleteMessage {
+                    message,
+                    pairs,
+                    event: event.data.event,
+                    document_id,
+                    uid,
+                });
+            } else if let Some(messages) = message {
+                ItipMessages::new(vec![messages])
+                    .queue(batch)
+                    .caused_by(trc::location!())?;
             }
         }
 

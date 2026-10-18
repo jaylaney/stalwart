@@ -22,13 +22,21 @@ use crate::utils::{
     server::TestServer,
     webdav::DummyWebDavClient,
     za::{
-        HookParked, VaultReply, copy_href, inbox_ids, new_inbox_items, open_pending_item_as,
-        pending_ids, pin_record, raw_pins, restore_wrap, rewrap_legacy, saved_wrap, set_raw_pins,
-        substitute_public_key, trigger_drain, vault_revision, wrap_mark, write_pin_record,
-        writer_key, za_post, za_unpin,
+        HookParked, VaultReply, copy_href, inbox_ids, item_method, item_partstat, new_inbox_items,
+        open_pending_item_as, pending_ids, pin_record, raw_pins, restore_wrap, rewrap_legacy,
+        saved_wrap, set_raw_pins, substitute_public_key, trigger_drain, vault_revision, wrap_mark,
+        write_pin_record, writer_key, za_post, za_unpin,
     },
 };
-use calcard::icalendar::{ICalendarComponentType, ICalendarProperty};
+use ::registry::schema::{prelude::Property, structs::CalendarScheduling};
+use calcard::{
+    common::IanaString,
+    icalendar::{
+        ICalendar, ICalendarComponent, ICalendarComponentType, ICalendarMethod,
+        ICalendarParameterName, ICalendarParameterValue, ICalendarProperty, ICalendarStatus,
+        ICalendarValueType,
+    },
+};
 use common::{auth::vault::ZaMark, za::test_hooks};
 use groupware::cache::GroupwareCache;
 use hyper::{Method, StatusCode};
@@ -44,6 +52,8 @@ use vault::{
 pub const ALICE: &str = "key1@example.com";
 pub const BOB: &str = "key2@example.com";
 pub const CAROL: &str = "key3@example.com";
+/// Override X of `recurring_invite`, the second occurrence.
+const X: &str = START_B;
 /// carol's password in case 10, between its two password changes.
 pub const NEW: &str = "another horse battery staple 2";
 
@@ -54,12 +64,15 @@ pub async fn test(test: &mut TestServer) {
     case_02_refusal(test).await;
     case_03_repair(test).await;
     case_04_confirm_and_redeliver(test).await;
+    case_05_forget_keeps_entries(test).await;
     case_06_fail_closed(test).await;
     case_07_repair_keeps_fail_closed(test).await;
     case_08_stale_first_use(test).await;
     case_09_healing(test).await;
     case_10_replay(test).await;
+    case_11_ordinary_delivery(test).await;
     case_12_partial_changes(test).await;
+    case_13_stated_losses(test).await;
     case_14_delegates(test).await;
     case_15_pre_pin(test).await;
     case_16_pin_before_deliver(test).await;
@@ -67,6 +80,7 @@ pub async fn test(test: &mut TestServer) {
     case_18_event_identity(test).await;
     case_19_participation_filter(test).await;
     case_20_drain_before_build(test).await;
+    case_21_recorded_instances(test).await;
     rf_1_address_forms(test).await;
     rf_2_mixed_recipients(test).await;
     rf_3_concurrent_first_use(test).await;
@@ -347,6 +361,62 @@ async fn case_04_confirm_and_redeliver(test: &TestServer) {
     for uid in &uids {
         clear_recipient(test, &bob, &bob_start, uid).await;
     }
+}
+
+/// Spec 9 case 5: `contacts/forget` for bob removes his pin and keeps his
+/// entry (spec 6.5); alice's next edit pins bob as first use and drains the
+/// entry under the two-item rule (spec 5.1). The edit is a master REQUEST,
+/// so no separate full state goes ahead of it.
+async fn case_05_forget_keeps_entries(test: &TestServer) {
+    let (alice, bob, _) = parties(test);
+    let bob_start = inbox_ids(test, bob.id).await;
+    let (path, original, _) = refuse_once(test, &alice, &bob, "pin-05").await;
+    substitute_public_key(test, bob.id, &original, true).await;
+    assert_eq!(
+        forget(ALICE, Some(BOB)).await.expect(200),
+        json!({"ok": true})
+    );
+    assert!(
+        pin_record(test, alice.id, STRONG)
+            .await
+            .unwrap()
+            .pin(BOB)
+            .is_none()
+    );
+    assert_eq!(
+        withheld(test, alice.id, BOB).await.len(),
+        1,
+        "forget keeps the entry"
+    );
+    let before = inbox_ids(test, bob.id).await;
+    assert_eq!(
+        rewrite(&alice.client, &path, |body| body
+            .replace("fo-title pin-05 v2", "fo-title pin-05 v3"))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        pin_record(test, alice.id, STRONG)
+            .await
+            .unwrap()
+            .pin(BOB)
+            .unwrap()
+            .source,
+        PinSource::FirstUse
+    );
+    assert_eq!(
+        opened(test, bob.id, &before).await.len(),
+        1,
+        "a master REQUEST: no separate full state"
+    );
+    assert!(
+        withheld(test, alice.id, BOB).await.is_empty(),
+        "drained under the two-item rule"
+    );
+
+    // Cleanup.
+    delete_event(&alice, &path).await;
+    clear_recipient(test, &bob, &bob_start, "pin-05").await;
 }
 
 /// Spec 9 case 6: under the pinned wrap with the pin record deleted, the
@@ -758,6 +828,638 @@ async fn case_10_replay(test: &TestServer) {
     clear_recipient(test, &bob, &bob_start, "pin-10b").await;
 }
 
+/// Spec 9 case 11 (spec 5.1, the two-item rule): ordinary delivery to an
+/// address with a withheld entry writes the full current state, then
+/// upstream's messages for it, and retires the entry after both; the full
+/// state is skipped when upstream's messages carry the master (a REQUEST or
+/// a CANCEL), when the relationship ended, or when it yields nothing. Each
+/// sub-case that counts items starts from a fresh refusal.
+async fn case_11_ordinary_delivery(test: &TestServer) {
+    case_11_reply(test).await;
+    case_11_organizer(test).await;
+    case_11_removal(test).await;
+    case_11_failed_full_state(test).await;
+    case_11_mixed(test).await;
+    case_11_master_removal(test).await;
+    case_11_delete(test).await;
+    case_11_withheld_then_declined(test).await;
+}
+
+/// Case 11, Reply (`pin-11r`): bob's DECLINED refused; his ACCEPTED then
+/// delivers his refused instances' current participation, then the REPLY.
+async fn case_11_reply(test: &TestServer) {
+    let (alice, bob, _) = parties(test);
+    let (alice_start, bob_start) = (
+        inbox_ids(test, alice.id).await,
+        inbox_ids(test, bob.id).await,
+    );
+    // bob pins alice first.
+    write_pin_record(
+        test,
+        bob.id,
+        STRONG,
+        &record_pinning(ALICE, served(test, alice.id).await),
+    )
+    .await;
+    let fp = display_fingerprint(&served(test, alice.id).await);
+    let path = event_path(&alice, "pin-11r");
+    alice
+        .client
+        .request_with_headers(
+            "PUT",
+            &path,
+            [CONTENT_TYPE],
+            invite("pin-11r", START_A, &[BOB]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+    let copy = copy_href(test, bob.id, "pin-11r").await;
+    let original = substitute_public_key(test, alice.id, &writer_key(), true).await;
+    assert_eq!(
+        rewrite(&bob.client, &copy, |body| with_bob_partstat(
+            &body,
+            Scope::Master,
+            "DECLINED"
+        ))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(withheld(test, bob.id, ALICE).await.len(), 1);
+    substitute_public_key(test, alice.id, &original, true).await;
+    let before = inbox_ids(test, alice.id).await;
+    assert_eq!(
+        rewrite(&bob.client, &copy, |body| with_bob_partstat(
+            &body,
+            Scope::Master,
+            "ACCEPTED"
+        ))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let items = opened(test, alice.id, &before).await;
+    assert_eq!(items.len(), 2, "his current participation, then the REPLY");
+    assert!(
+        items
+            .iter()
+            .all(|item| item_partstat(item, BOB).as_deref() == Some("ACCEPTED"))
+    );
+    assert_eq!(
+        pin(BOB, ALICE, &fp).await.expect(200),
+        json!({"ok": true, "delivered": 0, "failed": 0, "dropped": 0, "remaining": 0})
+    );
+    assert_eq!(trigger_drain(ALICE, STRONG).await, 207);
+    assert_eq!(
+        partstat_of(&alice.client, &path, BOB).await.as_deref(),
+        Some("ACCEPTED")
+    );
+
+    // Cleanup.
+    delete_event(&alice, &path).await;
+    alice.delete_items_since(test, &alice_start).await;
+    clear_recipient(test, &bob, &bob_start, "pin-11r").await;
+}
+
+/// Case 11, Organizer (`pin-11o`): a daily event with override A naming
+/// bob; the move of A refused; the new STATUS:CANCELLED override B naming
+/// bob at NEEDS-ACTION (new overrides message an attendee only at
+/// NEEDS-ACTION) gives bob the full REQUEST, then B's CANCEL. Then a fresh
+/// refusal and a master change: one item.
+async fn case_11_organizer(test: &TestServer) {
+    const A_MOVED: &str = "DTSTART:20990302T120000Z";
+    const B: &str = "20990303T100000Z";
+    let (alice, bob, _) = parties(test);
+    let bob_start = inbox_ids(test, bob.id).await;
+    let path = event_path(&alice, "pin-11o");
+    alice
+        .client
+        .request_with_headers(
+            "PUT",
+            &path,
+            [CONTENT_TYPE],
+            recurring_invite("pin-11o", &[BOB], &[BOB]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+    let original = substitute_public_key(test, bob.id, &writer_key(), true).await;
+    assert_eq!(
+        rewrite(&alice.client, &path, |body| body
+            .replace(&format!("DTSTART:{START_B}"), A_MOVED))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(withheld(test, alice.id, BOB).await.len(), 1);
+    substitute_public_key(test, bob.id, &original, true).await;
+    let before = inbox_ids(test, bob.id).await;
+    assert_eq!(
+        rewrite(&alice.client, &path, |body| with_override(
+            &body,
+            "pin-11o",
+            B,
+            "STATUS:CANCELLED\r\n",
+            &[BOB]
+        ))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        methods(&opened(test, bob.id, &before).await),
+        [
+            Some(ICalendarMethod::Request),
+            Some(ICalendarMethod::Cancel)
+        ]
+    );
+    assert!(
+        withheld(test, alice.id, BOB).await.is_empty(),
+        "retired after both"
+    );
+    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+    let copy = body(&bob.client, &copy_href(test, bob.id, "pin-11o").await).await;
+    assert!(
+        copy.contains(A_MOVED) && copy.contains("STATUS:CANCELLED"),
+        "A updated, B cancelled: {copy}"
+    );
+
+    // A fresh refusal, then a master change.
+    let master_title = |from: &'static str, to: &'static str| {
+        move |body: String| body.replacen(&format!("{from}\r\n"), &format!("{to}\r\n"), 1)
+    };
+    let original = substitute_public_key(test, bob.id, &writer_key(), true).await;
+    assert_eq!(
+        rewrite(
+            &alice.client,
+            &path,
+            master_title("SUMMARY:fo-title pin-11o", "SUMMARY:fo-title pin-11o v2")
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(withheld(test, alice.id, BOB).await.len(), 1);
+    substitute_public_key(test, bob.id, &original, true).await;
+    let before_master = inbox_ids(test, bob.id).await;
+    assert_eq!(
+        rewrite(
+            &alice.client,
+            &path,
+            master_title("SUMMARY:fo-title pin-11o v2", "SUMMARY:fo-title pin-11o v3")
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        opened(test, bob.id, &before_master).await.len(),
+        1,
+        "a master change gives one item"
+    );
+    assert!(withheld(test, alice.id, BOB).await.is_empty());
+
+    // Cleanup.
+    delete_event(&alice, &path).await;
+    clear_recipient(test, &bob, &bob_start, "pin-11o").await;
+}
+
+/// Case 11, Removal (`pin-11x`, and `pin-11x2` with the client bumping X's
+/// SEQUENCE in the removal PUT): bob on the master and on override X with
+/// carol; an older update (DESCRIPTION) refused; alice removes bob from X:
+/// the full REQUEST, then X's CANCEL. bob keeps the update and X ends
+/// cancelled.
+async fn case_11_removal(test: &TestServer) {
+    const DESCRIPTION_V2: &str = "DESCRIPTION:fo-description v2";
+    let (alice, bob, carol) = parties(test);
+    for uid in ["pin-11x", "pin-11x2"] {
+        let (bob_start, carol_start) = (
+            inbox_ids(test, bob.id).await,
+            inbox_ids(test, carol.id).await,
+        );
+        let path = event_path(&alice, uid);
+        alice
+            .client
+            .request_with_headers(
+                "PUT",
+                &path,
+                [CONTENT_TYPE],
+                recurring_invite(uid, &[BOB], &[BOB, CAROL]),
+            )
+            .await
+            .with_status(StatusCode::CREATED);
+        assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+        assert_eq!(trigger_drain(CAROL, STRONG).await, 207);
+        let original = substitute_public_key(test, bob.id, &writer_key(), true).await;
+        let title = format!("SUMMARY:fo-title {uid}\r\n");
+        assert_eq!(
+            rewrite(&alice.client, &path, |body| body.replacen(
+                &title,
+                &format!("{title}{DESCRIPTION_V2}\r\n"),
+                1
+            ))
+            .await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(withheld(test, alice.id, BOB).await.len(), 1, "{uid}");
+        substitute_public_key(test, bob.id, &original, true).await;
+        let before = inbox_ids(test, bob.id).await;
+        assert_eq!(
+            rewrite(&alice.client, &path, |body| {
+                let body = edit_attendee(&body, BOB, Scope::Overrides, |_| None);
+                if uid == "pin-11x2" {
+                    bump_sequence(&body, X)
+                } else {
+                    body
+                }
+            })
+            .await,
+            StatusCode::NO_CONTENT
+        );
+        let items = opened(test, bob.id, &before).await;
+        assert_eq!(
+            methods(&items),
+            [
+                Some(ICalendarMethod::Request),
+                Some(ICalendarMethod::Cancel)
+            ],
+            "{uid}"
+        );
+        assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+        let copy = copy_href(test, bob.id, uid).await;
+        let copy_body = body(&bob.client, &copy).await;
+        assert!(
+            copy_body.contains(DESCRIPTION_V2),
+            "{uid}: bob keeps the update"
+        );
+        assert_eq!(
+            status_in(&bob.client, &copy, Some(X)).await,
+            Some(ICalendarStatus::Cancelled),
+            "{uid}: X cancelled for bob: {copy_body}"
+        );
+
+        // Cleanup.
+        delete_event(&alice, &path).await;
+        clear_recipient(test, &bob, &bob_start, uid).await;
+        clear_recipient(test, &carol, &carol_start, uid).await;
+    }
+}
+
+/// Case 11, a failed full state (`pin-11f`, spec 5.1 and 5.2 phase 4): as
+/// Removal, the refused older update a long DESCRIPTION and the inbound
+/// size limit set between the full REQUEST's size and the CANCEL's for the
+/// removal. The full state fails (`5.1`), X's CANCEL is still written, and
+/// the entry stays: it is retired only when every item was written.
+async fn case_11_failed_full_state(test: &TestServer) {
+    let (alice, bob, carol) = parties(test);
+    let admin = test.account("admin@example.com").clone();
+    let (bob_start, carol_start) = (
+        inbox_ids(test, bob.id).await,
+        inbox_ids(test, carol.id).await,
+    );
+    let path = event_path(&alice, "pin-11f");
+    alice
+        .client
+        .request_with_headers(
+            "PUT",
+            &path,
+            [CONTENT_TYPE],
+            recurring_invite("pin-11f", &[BOB], &[BOB, CAROL]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+    assert_eq!(trigger_drain(CAROL, STRONG).await, 207);
+    let original = substitute_public_key(test, bob.id, &writer_key(), true).await;
+    let description = format!("DESCRIPTION:{}\r\n", "pin-11f ".repeat(300));
+    assert_eq!(
+        rewrite(&alice.client, &path, |body| body.replacen(
+            "SUMMARY:fo-title pin-11f\r\n",
+            &format!("SUMMARY:fo-title pin-11f\r\n{description}"),
+            1
+        ))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(withheld(test, alice.id, BOB).await.len(), 1);
+    substitute_public_key(test, bob.id, &original, true).await;
+    let before = inbox_ids(test, bob.id).await;
+    // The full REQUEST carries the 2400-byte DESCRIPTION; X's CANCEL does
+    // not.
+    admin
+        .registry_update_setting(
+            CalendarScheduling {
+                itip_max_size: 1500,
+                ..Default::default()
+            },
+            &[Property::ItipMaxSize],
+        )
+        .await;
+    admin.reload_settings().await;
+    let status = rewrite(&alice.client, &path, |body| {
+        edit_attendee(&body, BOB, Scope::Overrides, |_| None)
+    })
+    .await;
+    admin
+        .registry_update_setting(CalendarScheduling::default(), &[Property::ItipMaxSize])
+        .await;
+    admin.reload_settings().await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        methods(&opened(test, bob.id, &before).await),
+        [Some(ICalendarMethod::Cancel)],
+        "the full state failed, the CANCEL was written"
+    );
+    assert_eq!(attendee_statuses(&alice.client, &path, BOB).await, ["5.1"]);
+    assert_eq!(
+        withheld(test, alice.id, BOB).await.len(),
+        1,
+        "not retired: the full state was not written"
+    );
+
+    // Cleanup.
+    delete_event(&alice, &path).await;
+    drop_entries(ALICE, BOB).await;
+    clear_recipient(test, &bob, &bob_start, "pin-11f").await;
+    clear_recipient(test, &carol, &carol_start, "pin-11f").await;
+}
+
+/// Case 11, Mixed (`pin-11m`): bob on overrides X and Z but not the master,
+/// carol on the master and X, bob holding an entry; one PUT adds dave to
+/// the master and removes bob from X, the client bumping X. bob gets the
+/// full REQUEST (he is on Z), then his CANCEL for X, and no extra full
+/// state; the CANCEL, built from the old tree one below, carries the full
+/// REQUEST's SEQUENCE for X.
+async fn case_11_mixed(test: &TestServer) {
+    const Z: &str = "20990304T100000Z";
+    const DAVE: &str = "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:dave@external.test\r\n";
+    let (alice, bob, carol) = parties(test);
+    let (bob_start, carol_start) = (
+        inbox_ids(test, bob.id).await,
+        inbox_ids(test, carol.id).await,
+    );
+    let path = event_path(&alice, "pin-11m");
+    alice
+        .client
+        .request_with_headers(
+            "PUT",
+            &path,
+            [CONTENT_TYPE],
+            with_override(
+                &recurring_invite("pin-11m", &[CAROL], &[BOB, CAROL]),
+                "pin-11m",
+                Z,
+                "",
+                &[BOB],
+            ),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+    assert_eq!(trigger_drain(CAROL, STRONG).await, 207);
+    // bob's entry: a refused change to Z.
+    let original = substitute_public_key(test, bob.id, &writer_key(), true).await;
+    assert_eq!(
+        rewrite(&alice.client, &path, |body| edit_override(
+            &body,
+            Z,
+            |line| {
+                Some(line.replace("SUMMARY:fo-title pin-11m", "SUMMARY:fo-title pin-11m Z v2"))
+            }
+        ))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(withheld(test, alice.id, BOB).await.len(), 1);
+    substitute_public_key(test, bob.id, &original, true).await;
+    let before = inbox_ids(test, bob.id).await;
+    assert_eq!(
+        rewrite(&alice.client, &path, |body| {
+            let body = edit_override(&body, X, |line| {
+                if line.starts_with("ATTENDEE")
+                    && line
+                        .to_ascii_lowercase()
+                        .ends_with(&format!("mailto:{BOB}"))
+                {
+                    None
+                } else {
+                    Some(bumped(line))
+                }
+            });
+            body.replacen("END:VEVENT", &format!("{DAVE}END:VEVENT"), 1)
+        })
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let items = opened(test, bob.id, &before).await;
+    assert_eq!(
+        methods(&items),
+        [
+            Some(ICalendarMethod::Request),
+            Some(ICalendarMethod::Cancel)
+        ],
+        "no extra full state"
+    );
+    assert!(
+        sequence_of(&items[0], X).is_some(),
+        "the full REQUEST holds X"
+    );
+    assert_eq!(
+        sequence_of(&items[1], X),
+        sequence_of(&items[0], X),
+        "the CANCEL raised to the full REQUEST's value"
+    );
+    assert!(withheld(test, alice.id, BOB).await.is_empty());
+
+    // Cleanup.
+    delete_event(&alice, &path).await;
+    clear_recipient(test, &bob, &bob_start, "pin-11m").await;
+    clear_recipient(test, &carol, &carol_start, "pin-11m").await;
+}
+
+/// Case 11, Master removal (`pin-11y`): bob the master's only attendee and
+/// also on override Y; after a fresh refusal, alice removes bob from the
+/// master: one item, the master CANCEL (another update-eligible master
+/// attendee would trigger the full update, reaching bob through Y).
+async fn case_11_master_removal(test: &TestServer) {
+    let (alice, bob, _) = parties(test);
+    let bob_start = inbox_ids(test, bob.id).await;
+    let path = event_path(&alice, "pin-11y");
+    alice
+        .client
+        .request_with_headers(
+            "PUT",
+            &path,
+            [CONTENT_TYPE],
+            recurring_invite("pin-11y", &[BOB], &[BOB]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+    let original = substitute_public_key(test, bob.id, &writer_key(), true).await;
+    assert_eq!(
+        rewrite(&alice.client, &path, |body| body.replacen(
+            "SUMMARY:fo-title pin-11y\r\n",
+            "SUMMARY:fo-title pin-11y v2\r\n",
+            1
+        ))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(withheld(test, alice.id, BOB).await.len(), 1);
+    substitute_public_key(test, bob.id, &original, true).await;
+    let before = inbox_ids(test, bob.id).await;
+    assert_eq!(
+        rewrite(&alice.client, &path, |body| edit_attendee(
+            &body,
+            BOB,
+            Scope::Master,
+            |_| None
+        ))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let items = opened(test, bob.id, &before).await;
+    assert_eq!(items.len(), 1);
+    assert_eq!(methods(&items), [Some(ICalendarMethod::Cancel)]);
+    assert!(withheld(test, alice.id, BOB).await.is_empty());
+
+    // Cleanup.
+    delete_event(&alice, &path).await;
+    clear_recipient(test, &bob, &bob_start, "pin-11y").await;
+}
+
+/// Case 11, DELETE (`pin-11d`): bob's ACCEPTED refused; bob deletes his
+/// copy: alice gets DECLINED and no full state (the source is gone), and
+/// the entry is retired after the decline. Already DECLINED (`pin-11d2`):
+/// `itip_cancel` builds nothing for a DECLINED attendee, yet the fork's
+/// variant of `attendee_decline` sends DECLINED.
+async fn case_11_delete(test: &TestServer) {
+    let (alice, bob, _) = parties(test);
+    for (uid, refused) in [("pin-11d", "ACCEPTED"), ("pin-11d2", "DECLINED")] {
+        let (alice_start, bob_start) = (
+            inbox_ids(test, alice.id).await,
+            inbox_ids(test, bob.id).await,
+        );
+        // bob pins alice first.
+        write_pin_record(
+            test,
+            bob.id,
+            STRONG,
+            &record_pinning(ALICE, served(test, alice.id).await),
+        )
+        .await;
+        let path = event_path(&alice, uid);
+        alice
+            .client
+            .request_with_headers("PUT", &path, [CONTENT_TYPE], invite(uid, START_A, &[BOB]))
+            .await
+            .with_status(StatusCode::CREATED);
+        assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+        let copy = copy_href(test, bob.id, uid).await;
+        let original = substitute_public_key(test, alice.id, &writer_key(), true).await;
+        assert_eq!(
+            rewrite(&bob.client, &copy, |body| with_bob_partstat(
+                &body,
+                Scope::Master,
+                refused
+            ))
+            .await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(withheld(test, bob.id, ALICE).await.len(), 1, "{uid}");
+        substitute_public_key(test, alice.id, &original, true).await;
+        let before = inbox_ids(test, alice.id).await;
+        bob.client
+            .request("DELETE", &copy, "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+        let items = opened(test, alice.id, &before).await;
+        assert_eq!(
+            (
+                items.len(),
+                items
+                    .first()
+                    .and_then(|item| item_partstat(item, BOB))
+                    .as_deref()
+            ),
+            (1, Some("DECLINED")),
+            "{uid}: no full state: the source is gone"
+        );
+        assert!(
+            withheld(test, bob.id, ALICE).await.is_empty(),
+            "{uid}: retired after the decline"
+        );
+
+        // Cleanup.
+        delete_event(&alice, &path).await;
+        alice.delete_items_since(test, &alice_start).await;
+        clear_recipient(test, &bob, &bob_start, uid).await;
+    }
+}
+
+/// Case 11, Withheld, then DECLINED (`pin-11w`): alice's SUMMARY edit
+/// refused (no SEQUENCE bump), bob then DECLINED; alice's next edit sends
+/// bob nothing (upstream's: a DECLINED attendee gets no update, and no fork
+/// mutant reaches it), and `contacts/pin` drops the entry (the fork's
+/// check: the full REQUEST yields nothing for a DECLINED attendee).
+async fn case_11_withheld_then_declined(test: &TestServer) {
+    let (alice, bob, _) = parties(test);
+    let (alice_start, bob_start) = (
+        inbox_ids(test, alice.id).await,
+        inbox_ids(test, bob.id).await,
+    );
+    let path = event_path(&alice, "pin-11w");
+    alice
+        .client
+        .request_with_headers(
+            "PUT",
+            &path,
+            [CONTENT_TYPE],
+            invite("pin-11w", START_A, &[BOB]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+    let original = substitute_public_key(test, bob.id, &writer_key(), true).await;
+    assert_eq!(
+        rewrite(&alice.client, &path, |body| body
+            .replace("fo-title pin-11w", "fo-title pin-11w v2"))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(withheld(test, alice.id, BOB).await.len(), 1);
+    substitute_public_key(test, bob.id, &original, true).await;
+    let copy = copy_href(test, bob.id, "pin-11w").await;
+    assert_eq!(
+        rewrite(&bob.client, &copy, |body| with_bob_partstat(
+            &body,
+            Scope::Master,
+            "DECLINED"
+        ))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(trigger_drain(ALICE, STRONG).await, 207);
+    assert_eq!(
+        partstat_of(&alice.client, &path, BOB).await.as_deref(),
+        Some("DECLINED")
+    );
+    let before_edit = inbox_ids(test, bob.id).await;
+    assert_eq!(
+        rewrite(&alice.client, &path, |body| body
+            .replace("fo-title pin-11w v2", "fo-title pin-11w v3"))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert!(
+        opened(test, bob.id, &before_edit).await.is_empty(),
+        "upstream sends a DECLINED attendee nothing"
+    );
+    let fp = display_fingerprint(&served(test, bob.id).await);
+    assert_eq!(pin(ALICE, BOB, &fp).await.expect(200)["dropped"], 1);
+
+    // Cleanup.
+    delete_event(&alice, &path).await;
+    alice.delete_items_since(test, &alice_start).await;
+    clear_recipient(test, &bob, &bob_start, "pin-11w").await;
+}
+
 /// Spec 9 case 12 (spec 5.1): partial changes to the existing overrides A
 /// (day 2) and B (day 3) of a daily event naming bob and carol, bob
 /// drained, each variant its own event. `pin-12a`: both moves refused;
@@ -836,6 +1538,192 @@ async fn case_12_partial_changes(test: &TestServer) {
         clear_recipient(test, &bob, &bob_start, uid).await;
         clear_recipient(test, &carol, &carol_start, uid).await;
     }
+}
+
+/// Spec 9 case 13 (spec 2, limit 6): the stated losses of redelivering
+/// current state, one sub-test each. (a) An organizer DELETE retires the
+/// document's entries and bob keeps his copy; (b) a refused removal CANCEL
+/// is dropped and bob keeps his copy; (c) an occurrence bob declined by
+/// deleting it is not reconstructed; (d) a refused delegation of the
+/// master, then an organizer master change that reaches bob first: alice
+/// gains no delegate.
+async fn case_13_stated_losses(test: &TestServer) {
+    let (alice, bob, carol) = parties(test);
+    let (alice_start, bob_start, carol_start) = (
+        inbox_ids(test, alice.id).await,
+        inbox_ids(test, bob.id).await,
+        inbox_ids(test, carol.id).await,
+    );
+    let bob_fingerprint = display_fingerprint(&served(test, bob.id).await);
+    let alice_fingerprint = display_fingerprint(&served(test, alice.id).await);
+
+    // (a) A refused edit, then alice deletes the event with scheduling (its
+    // CANCEL refused too).
+    let path = event_path(&alice, "pin-13a");
+    alice
+        .client
+        .request_with_headers(
+            "PUT",
+            &path,
+            [CONTENT_TYPE],
+            invite("pin-13a", START_A, &[BOB]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+    let copy = copy_href(test, bob.id, "pin-13a").await;
+    let original = substitute_public_key(test, bob.id, &writer_key(), true).await;
+    assert_eq!(
+        rewrite(&alice.client, &path, |body| body
+            .replace("fo-title pin-13a", "fo-title pin-13a v2"))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(withheld(test, alice.id, BOB).await.len(), 1);
+    alice
+        .client
+        .request("DELETE", &path, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    substitute_public_key(test, bob.id, &original, true).await;
+    assert!(
+        withheld(test, alice.id, BOB).await.is_empty(),
+        "the deletion retires the document's entries"
+    );
+    assert!(
+        !body(&bob.client, &copy).await.contains("STATUS:CANCELLED"),
+        "bob keeps his copy"
+    );
+
+    // (b) alice removes bob from the event: the CANCEL refused, an entry.
+    let path = event_path(&alice, "pin-13b");
+    alice
+        .client
+        .request_with_headers(
+            "PUT",
+            &path,
+            [CONTENT_TYPE],
+            invite("pin-13b", START_A, &[BOB]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+    let copy = copy_href(test, bob.id, "pin-13b").await;
+    let original = substitute_public_key(test, bob.id, &writer_key(), true).await;
+    assert_eq!(
+        rewrite(&alice.client, &path, |body| edit_attendee(
+            &body,
+            BOB,
+            Scope::Master,
+            |_| None
+        ))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(withheld(test, alice.id, BOB).await.len(), 1);
+    substitute_public_key(test, bob.id, &original, true).await;
+    assert_eq!(
+        pin(ALICE, BOB, &bob_fingerprint).await.expect(200)["dropped"],
+        1
+    );
+    assert!(!body(&bob.client, &copy).await.contains("STATUS:CANCELLED"));
+    delete_event(&alice, &path).await;
+
+    // (c) bob deletes occurrence X of his copy: a refused decline recording
+    // X.
+    // bob pins alice first.
+    write_pin_record(
+        test,
+        bob.id,
+        STRONG,
+        &record_pinning(ALICE, served(test, alice.id).await),
+    )
+    .await;
+    let path = event_path(&alice, "pin-13c");
+    alice
+        .client
+        .request_with_headers(
+            "PUT",
+            &path,
+            [CONTENT_TYPE],
+            recurring_invite("pin-13c", &[BOB], &[BOB]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+    let copy = copy_href(test, bob.id, "pin-13c").await;
+    let original = substitute_public_key(test, alice.id, &writer_key(), true).await;
+    assert_eq!(
+        rewrite(&bob.client, &copy, |body| without_override(&body, X)).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(withheld(test, bob.id, ALICE).await.len(), 1);
+    substitute_public_key(test, alice.id, &original, true).await;
+    assert_eq!(
+        pin(BOB, ALICE, &alice_fingerprint).await.expect(200)["dropped"],
+        1,
+        "X no longer exists in bob's copy"
+    );
+    assert_eq!(trigger_drain(ALICE, STRONG).await, 207);
+    assert!(
+        !body(&alice.client, &path)
+            .await
+            .contains("PARTSTAT=DECLINED"),
+        "the decline is not reconstructed"
+    );
+    delete_event(&alice, &path).await;
+
+    // (d) bob's delegation of the master to carol refused; alice's master
+    // change reaches bob first.
+    // bob pins alice first.
+    write_pin_record(
+        test,
+        bob.id,
+        STRONG,
+        &record_pinning(ALICE, served(test, alice.id).await),
+    )
+    .await;
+    let path = event_path(&alice, "pin-13d");
+    alice
+        .client
+        .request_with_headers(
+            "PUT",
+            &path,
+            [CONTENT_TYPE],
+            invite("pin-13d", START_A, &[BOB]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+    let copy = copy_href(test, bob.id, "pin-13d").await;
+    let original = substitute_public_key(test, alice.id, &writer_key(), true).await;
+    assert_eq!(
+        rewrite(&bob.client, &copy, delegate_to_carol).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(withheld(test, bob.id, ALICE).await.len(), 1);
+    substitute_public_key(test, alice.id, &original, true).await;
+    assert_eq!(
+        rewrite(&alice.client, &path, |body| body
+            .replace("fo-title pin-13d", "fo-title pin-13d v2"))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+    pin(BOB, ALICE, &alice_fingerprint).await.expect(200);
+    assert_eq!(trigger_drain(ALICE, STRONG).await, 207);
+    assert!(
+        !body(&alice.client, &path).await.contains(CAROL),
+        "alice gains no delegate"
+    );
+    delete_event(&alice, &path).await;
+
+    // Cleanup.
+    alice.delete_items_since(test, &alice_start).await;
+    for uid in ["pin-13a", "pin-13b", "pin-13c", "pin-13d"] {
+        clear_recipient(test, &bob, &bob_start, uid).await;
+    }
+    clear_recipient(test, &carol, &carol_start, "pin-13d").await;
 }
 
 /// Spec 9 case 14 (spec 5.6): (organizer side) the drain's delegating
@@ -1594,6 +2482,208 @@ async fn case_20_drain_before_build(test: &TestServer) {
     clear_recipient(test, &bob, &bob_start, "pin-20").await;
 }
 
+/// Spec 9 case 21 (spec 4.1, 6.4 step 2): a redelivered or ordinary REPLY
+/// exports only the recorded instances. bob delegated the master to carol,
+/// who accepted (bob does not see it); bob's ACCEPTED on override X is
+/// refused. Through `contacts/pin` (run 1) or bob's next ordinary change to
+/// X (run 2), alice has bob's answer on X and carol stays ACCEPTED on the
+/// master, which is not exported. A genuine delegation of the master,
+/// refused and redelivered, gives alice carol, and her invitation.
+async fn case_21_recorded_instances(test: &TestServer) {
+    let (alice, bob, carol) = parties(test);
+    let (alice_start, bob_start, carol_start) = (
+        inbox_ids(test, alice.id).await,
+        inbox_ids(test, bob.id).await,
+        inbox_ids(test, carol.id).await,
+    );
+    let fp = display_fingerprint(&served(test, alice.id).await);
+
+    // Run 1: contacts/pin.
+    let (path, _) = recorded_instance_setup(test, &alice, &bob, &carol, "pin-21").await;
+    assert_eq!(pin(BOB, ALICE, &fp).await.expect(200)["delivered"], 1);
+    assert_eq!(trigger_drain(ALICE, STRONG).await, 207);
+    assert_eq!(
+        partstat_in(&alice.client, &path, Some(X), BOB)
+            .await
+            .as_deref(),
+        Some("ACCEPTED")
+    );
+    assert_eq!(
+        partstat_in(&alice.client, &path, None, CAROL)
+            .await
+            .as_deref(),
+        Some("ACCEPTED"),
+        "the master is not exported"
+    );
+
+    // Run 2: bob sets X TENTATIVE (ordinary recovery).
+    let (path_b, copy_b) = recorded_instance_setup(test, &alice, &bob, &carol, "pin-21b").await;
+    assert_eq!(
+        rewrite(&bob.client, &copy_b, |body| with_bob_partstat(
+            &body,
+            Scope::Overrides,
+            "TENTATIVE"
+        ))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(trigger_drain(ALICE, STRONG).await, 207);
+    assert_eq!(
+        partstat_in(&alice.client, &path_b, Some(X), BOB)
+            .await
+            .as_deref(),
+        Some("TENTATIVE")
+    );
+    assert_eq!(
+        partstat_in(&alice.client, &path_b, None, CAROL)
+            .await
+            .as_deref(),
+        Some("ACCEPTED")
+    );
+
+    // Genuine delegation (pin-21c).
+    // bob pins alice first.
+    write_pin_record(
+        test,
+        bob.id,
+        STRONG,
+        &record_pinning(ALICE, served(test, alice.id).await),
+    )
+    .await;
+    let path_c = event_path(&alice, "pin-21c");
+    alice
+        .client
+        .request_with_headers(
+            "PUT",
+            &path_c,
+            [CONTENT_TYPE],
+            daily_invite("pin-21c", &[BOB]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+    let copy_c = copy_href(test, bob.id, "pin-21c").await;
+    let original = substitute_public_key(test, alice.id, &writer_key(), true).await;
+    assert_eq!(
+        rewrite(&bob.client, &copy_c, delegate_to_carol).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(withheld(test, bob.id, ALICE).await.len(), 1);
+    substitute_public_key(test, alice.id, &original, true).await;
+    let carol_before = inbox_ids(test, carol.id).await;
+    assert_eq!(pin(BOB, ALICE, &fp).await.expect(200)["delivered"], 1);
+    assert_eq!(trigger_drain(ALICE, STRONG).await, 207);
+    assert_eq!(
+        partstat_in(&alice.client, &path_c, None, CAROL)
+            .await
+            .as_deref(),
+        Some("NEEDS-ACTION"),
+        "alice gains carol"
+    );
+    assert_eq!(
+        opened(test, carol.id, &carol_before).await.len(),
+        1,
+        "and invites her"
+    );
+
+    // Cleanup.
+    for path in [&path, &path_b, &path_c] {
+        delete_event(&alice, path).await;
+    }
+    alice.delete_items_since(test, &alice_start).await;
+    for uid in ["pin-21", "pin-21b", "pin-21c"] {
+        clear_recipient(test, &bob, &bob_start, uid).await;
+        clear_recipient(test, &carol, &carol_start, uid).await;
+    }
+}
+
+/// Case 21's setup: bob pins alice first; alice's daily event `uid` naming
+/// bob; bob delegates the master to carol, carol accepts; alice adds
+/// override X naming only bob at NEEDS-ACTION and bob drains it; bob's
+/// ACCEPTED on X is refused; alice's key restored. Returns alice's href and
+/// bob's copy's.
+async fn recorded_instance_setup(
+    test: &TestServer,
+    alice: &Party,
+    bob: &Party,
+    carol: &Party,
+    uid: &str,
+) -> (String, String) {
+    write_pin_record(
+        test,
+        bob.id,
+        STRONG,
+        &record_pinning(ALICE, served(test, alice.id).await),
+    )
+    .await;
+    let path = event_path(alice, uid);
+    alice
+        .client
+        .request_with_headers("PUT", &path, [CONTENT_TYPE], daily_invite(uid, &[BOB]))
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+    let copy = copy_href(test, bob.id, uid).await;
+    assert_eq!(
+        rewrite(&bob.client, &copy, delegate_to_carol).await,
+        StatusCode::NO_CONTENT
+    );
+    // alice's delegating merge invites carol.
+    assert_eq!(trigger_drain(ALICE, STRONG).await, 207);
+    assert_eq!(trigger_drain(CAROL, STRONG).await, 207);
+    let carol_copy = copy_href(test, carol.id, uid).await;
+    assert_eq!(
+        rewrite(&carol.client, &carol_copy, |body| edit_attendee(
+            &body,
+            CAROL,
+            Scope::Master,
+            |line| Some(with_partstat(line, "ACCEPTED"))
+        ))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(trigger_drain(ALICE, STRONG).await, 207);
+    assert_eq!(
+        partstat_in(&alice.client, &path, None, CAROL)
+            .await
+            .as_deref(),
+        Some("ACCEPTED"),
+        "{uid}: carol accepted"
+    );
+    assert_eq!(
+        rewrite(&alice.client, &path, |body| with_override(
+            &body,
+            uid,
+            X,
+            "",
+            &[BOB]
+        ))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+    assert_eq!(
+        partstat_in(&bob.client, &copy, Some(X), BOB)
+            .await
+            .as_deref(),
+        Some("NEEDS-ACTION"),
+        "{uid}: bob holds X"
+    );
+    let original = substitute_public_key(test, alice.id, &writer_key(), true).await;
+    assert_eq!(
+        rewrite(&bob.client, &copy, |body| with_bob_partstat(
+            &body,
+            Scope::Overrides,
+            "ACCEPTED"
+        ))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(withheld(test, bob.id, ALICE).await.len(), 1, "{uid}");
+    substitute_public_key(test, alice.id, &original, true).await;
+    (path, copy)
+}
+
 /// Review Focus 1: the endpoints take an address as given and normalize it
 /// as the fan-out does (spec 4.3): `mailto:` and display-name forms are
 /// 400, case and whitespace are normalized, and pins are keyed by the
@@ -2294,4 +3384,216 @@ pub fn delegate_to_carol(body: String) -> String {
             with_partstat(line, &format!("DELEGATED;DELEGATED-TO=\"mailto:{CAROL}\""))
         ))
     })
+}
+
+/// The items written to the account's inbox since `before`, each opened as
+/// the drain would (`open_pending_item_as`), in document-id order.
+pub async fn opened(test: &TestServer, account_id: u32, before: &[u32]) -> Vec<ICalendar> {
+    let mut ids: Vec<u32> = new_inbox_items(test, account_id, before)
+        .await
+        .into_iter()
+        .map(|(document_id, _)| document_id)
+        .collect();
+    ids.sort_unstable();
+    let mut items = Vec::with_capacity(ids.len());
+    for document_id in ids {
+        items.push(
+            open_pending_item_as(test, account_id, STRONG, document_id)
+                .await
+                .0,
+        );
+    }
+    items
+}
+
+/// The METHOD of each item.
+fn methods(items: &[ICalendar]) -> Vec<Option<ICalendarMethod>> {
+    items.iter().map(item_method).collect()
+}
+
+/// The SEQUENCE of the component whose RECURRENCE-ID text is
+/// `recurrence_id` (UTC).
+fn sequence_of(ical: &ICalendar, recurrence_id: &str) -> Option<i64> {
+    instance_of(ical, Some(recurrence_id))?
+        .entries
+        .iter()
+        .find(|entry| entry.name == ICalendarProperty::Sequence)
+        .and_then(|entry| entry.values.first())
+        .and_then(|value| value.as_integer())
+}
+
+/// The PARTSTAT of `address` in the event at `href` as its owner reads it,
+/// in the component whose RECURRENCE-ID text is `recurrence_id` (UTC), or
+/// in the master for `None`.
+pub async fn partstat_in(
+    client: &DummyWebDavClient,
+    href: &str,
+    recurrence_id: Option<&str>,
+    address: &str,
+) -> Option<String> {
+    let ical = parse(&body(client, href).await);
+    instance_of(&ical, recurrence_id)?
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.name == ICalendarProperty::Attendee
+                && entry
+                    .values
+                    .first()
+                    .and_then(|value| value.as_text())
+                    .is_some_and(|value| {
+                        value
+                            .trim_start_matches("mailto:")
+                            .eq_ignore_ascii_case(address)
+                    })
+        })
+        .flat_map(|entry| entry.params.iter())
+        .find_map(|param| match (&param.name, &param.value) {
+            (ICalendarParameterName::Partstat, ICalendarParameterValue::Partstat(status)) => {
+                Some(status.as_str().to_string())
+            }
+            _ => None,
+        })
+}
+
+/// The STATUS of the component `partstat_in` reads.
+async fn status_in(
+    client: &DummyWebDavClient,
+    href: &str,
+    recurrence_id: Option<&str>,
+) -> Option<ICalendarStatus> {
+    let ical = parse(&body(client, href).await);
+    instance_of(&ical, recurrence_id)?.status().cloned()
+}
+
+/// The VEVENT whose RECURRENCE-ID text is `recurrence_id` (UTC), or the one
+/// without RECURRENCE-ID for `None`.
+fn instance_of<'x>(
+    ical: &'x ICalendar,
+    recurrence_id: Option<&str>,
+) -> Option<&'x ICalendarComponent> {
+    ical.components
+        .iter()
+        .filter(|comp| comp.component_type == ICalendarComponentType::VEvent)
+        .find(|comp| {
+            let text = comp
+                .entries
+                .iter()
+                .find(|entry| entry.name == ICalendarProperty::RecurrenceId)
+                .and_then(|entry| entry.values.first())
+                .and_then(|value| value.as_partial_date_time())
+                .map(|date| {
+                    let mut text = String::new();
+                    date.format_as_ical(&mut text, &ICalendarValueType::DateTime)
+                        .unwrap();
+                    text
+                });
+            text.as_deref() == recurrence_id
+        })
+}
+
+fn parse(text: &str) -> ICalendar {
+    match calcard::Parser::new(text).entry() {
+        calcard::Entry::ICalendar(ical) => ical,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// `fanout::invite` with `RRULE:FREQ=DAILY;COUNT=5` and no override.
+fn daily_invite(uid: &str, attendees: &[&str]) -> String {
+    invite(uid, START_A, attendees).replace(
+        "DURATION:PT1H\r\n",
+        "DURATION:PT1H\r\nRRULE:FREQ=DAILY;COUNT=5\r\n",
+    )
+}
+
+/// `body` with an override of `recurrence_id` (UTC) of alice's event `uid`
+/// appended: `extra` (whole lines), then an ATTENDEE at NEEDS-ACTION for
+/// each of `attendees`.
+fn with_override(
+    body: &str,
+    uid: &str,
+    recurrence_id: &str,
+    extra: &str,
+    attendees: &[&str],
+) -> String {
+    let mut component = format!(
+        concat!(
+            "BEGIN:VEVENT\r\nUID:{uid}\r\nDTSTAMP:20240101T000000Z\r\n",
+            "RECURRENCE-ID:{start}\r\nDTSTART:{start}\r\nDURATION:PT1H\r\nSEQUENCE:0\r\n",
+            "{extra}SUMMARY:fo-title {uid}\r\nORGANIZER:mailto:key1@example.com\r\n"
+        ),
+        uid = uid,
+        start = recurrence_id,
+        extra = extra
+    );
+    for attendee in attendees {
+        component.push_str(&format!(
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{attendee}\r\n"
+        ));
+    }
+    component.push_str("END:VEVENT\r\n");
+    let end = body.rfind("END:VCALENDAR").expect("a calendar");
+    format!("{}{component}{}", &body[..end], &body[end..])
+}
+
+/// `body` unfolded, with the lines of the override whose RECURRENCE-ID is
+/// `recurrence_id` (UTC) replaced by what `edit` returns (`None` removes
+/// one).
+fn edit_override(body: &str, recurrence_id: &str, edit: impl Fn(&str) -> Option<String>) -> String {
+    let target = format!("RECURRENCE-ID:{recurrence_id}");
+    assert!(
+        body.contains(&target),
+        "no override {recurrence_id}: {body}"
+    );
+    body.replace("\r\n ", "")
+        .split("BEGIN:VEVENT")
+        .map(|part| {
+            if !part.contains(&target) {
+                return part.to_string();
+            }
+            part.split("\r\n")
+                .filter_map(&edit)
+                .collect::<Vec<_>>()
+                .join("\r\n")
+        })
+        .collect::<Vec<_>>()
+        .join("BEGIN:VEVENT")
+}
+
+/// A SEQUENCE line one higher; any other line unchanged.
+fn bumped(line: &str) -> String {
+    match line.strip_prefix("SEQUENCE:") {
+        Some(value) => format!("SEQUENCE:{}", value.parse::<i64>().unwrap() + 1),
+        None => line.to_string(),
+    }
+}
+
+/// `body` with the SEQUENCE of the override whose RECURRENCE-ID is
+/// `recurrence_id` (UTC) one above its stored value, as a client bumps it.
+fn bump_sequence(body: &str, recurrence_id: &str) -> String {
+    let bumped_body = edit_override(body, recurrence_id, |line| Some(bumped(line)));
+    assert_ne!(
+        bumped_body,
+        body.replace("\r\n ", ""),
+        "the override has a SEQUENCE: {body}"
+    );
+    bumped_body
+}
+
+/// `body` without the override whose RECURRENCE-ID is `recurrence_id`
+/// (UTC), as a client deletes one occurrence.
+fn without_override(body: &str, recurrence_id: &str) -> String {
+    const END: &str = "END:VEVENT\r\n";
+    let at = body
+        .find(&format!("RECURRENCE-ID:{recurrence_id}"))
+        .unwrap_or_else(|| panic!("no override {recurrence_id}: {body}"));
+    let start = body[..at].rfind("BEGIN:VEVENT").unwrap();
+    let end = at + body[at..].find(END).unwrap() + END.len();
+    format!("{}{}", &body[..start], &body[end..])
+}
+
+/// `body` with bob's PARTSTAT set to `partstat` in the `scope` components.
+fn with_bob_partstat(body: &str, scope: Scope, partstat: &str) -> String {
+    edit_attendee(body, BOB, scope, |line| Some(with_partstat(line, partstat)))
 }

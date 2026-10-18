@@ -35,6 +35,9 @@
 //! 1. Resolve every attempted address once, reading its served key, then
 //!    read the pin record (and the wrap's mark when the record is absent or
 //!    unusable), keeping the refusal id of each entry a delivery consumes.
+//!    An attendee's DELETE without a REPLY of upstream's declines through
+//!    the fork's `za_decline_all` when its copy holds an entry for an
+//!    internal ORGANIZER (5.1 item 2).
 //! 2. Decide every internal recipient against the record (5.1's table) and,
 //!    when a pin or an entry changed, write the record once, conditionally
 //!    and before any item (`za_pin_transact`; under a legacy wrap, the
@@ -43,10 +46,13 @@
 //!    every internal recipient is refused and nothing is recorded. A read
 //!    or write failure is every internal recipient's `5.1`.
 //! 3. Write the items of the recipients decided "deliver", in message
-//!    order.
+//!    order. In a change, a recipient holding an entry for the source gets
+//!    the full current state first (5.1, the two-item rule).
 //! 4. For a change, retire the entries whose recipients' items were all
-//!    written, each only under the refusal id phase 1 read; a failure is
-//!    traced and undoes nothing.
+//!    written, each only under the refusal id of the state phase 2 decided
+//!    on; for a deletion with a message to send, every entry of the deleted
+//!    document, each under the refusal id phase 1 read. A failure is traced
+//!    and undoes nothing.
 //!
 //! The pin-record writes carry no UID lease fence (5.5).
 //!
@@ -59,6 +65,7 @@ use crate::{
     calendar::{
         CalendarEventNotification, ChangedBy, EVENT_NOTIFICATION_ZA_PENDING,
         drain::instance_key,
+        pinning::{za_decline_all, za_full_request_for, za_participation_reply},
         seal::{TOKEN_LEN, TokenPairs, seal_error, seal_pending_item},
         sequence::{ZaSequence, za_reconcile_sequences},
     },
@@ -92,7 +99,7 @@ use store::{
 use trc::AddContext;
 use types::collection::Collection;
 use vault::{
-    pins::{PinSource, ZaInstances, ZaPinRecord},
+    pins::{PinSource, ZaInstances, ZaPinRecord, ZaWithheld},
     session::SessionKeys,
 };
 use zeroize::Zeroizing;
@@ -129,7 +136,10 @@ pub struct ZaFanOutResult {
 /// DELETE built from the unsealed stored event (spec 5.5), with what the
 /// fan-out needs from that event.
 pub struct ZaDeleteMessage {
-    pub message: ItipMessage<ICalendar>,
+    /// `itip_cancel`'s message; `None` when it builds nothing, since an
+    /// attendee's DELETE enters the fan-out even then (key pinning spec
+    /// 5.1 item 2).
+    pub message: Option<ItipMessage<ICalendar>>,
     /// The stored event's token pairs.
     pub pairs: Option<TokenPairs>,
     /// The unsealed stored tree.
@@ -148,10 +158,12 @@ pub struct ZaSource<'a> {
     pub uid: &'a str,
 }
 
-/// What a fan-out delivers (key pinning spec 5.1, 5.2). A `Deletion`
-/// records no withheld entry and retires none here; a `Redelivery`
-/// (`contacts/pin`) sends only the message it was given and retires
-/// nothing.
+/// What a fan-out delivers (key pinning spec 5.1, 5.2). A `Change` sends
+/// the full current state ahead of a withheld recipient's own messages (the
+/// two-item rule); a `Deletion` records no withheld entry and, when it has a
+/// message to send, retires every entry of the deleted document; a
+/// `Redelivery` (`contacts/pin`) sends only the message it was given and
+/// retires nothing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ZaFanOutKind {
     Change,
@@ -240,6 +252,43 @@ impl ZaFanOut for Server {
         // read the pin record.
         let mut recipients: AHashMap<String, Recipient> = AHashMap::new();
         let mut internal: Vec<(String, [u8; 32])> = Vec::new();
+        let mut read = None;
+        // Spec 5.1 item (2): an attendee's DELETE that upstream built no
+        // REPLY for declines to an internal ORGANIZER for which the copy
+        // holds a withheld entry, routed with the rest (the stored pair's
+        // token). An entry means a usable record, which needs no mark.
+        if kind == ZaFanOutKind::Deletion
+            && !is_organizer
+            && !messages
+                .iter()
+                .any(|message| matches!(itip_method(&message.message), Ok(ICalendarMethod::Reply)))
+            && let Some(key) = organizer
+                .as_ref()
+                .and_then(|organizer| za_normalize_address(&organizer.email))
+            && let recipient @ Recipient::Internal { public_key, .. } =
+                resolve_recipient(self, sender_id, &key).await
+        {
+            match self.za_pin_read(keys).await {
+                Ok(pins) => {
+                    if pins.record.as_ref().is_some_and(|record| {
+                        record.entry(source.document_id, source.uid, &key).is_some()
+                    }) && let Some(decline) = za_decline_all(event, sender.addresses())
+                    {
+                        messages.push(decline);
+                        recipients.insert(key.clone(), recipient);
+                        internal.push((key, public_key));
+                        read = Some(ZaPinState { pins, mark: None });
+                    }
+                }
+                Err(err) => {
+                    trc::error!(
+                        err.account_id(sender_id)
+                            .details("zero-access: pin record read failed")
+                            .caused_by(trc::location!())
+                    );
+                }
+            }
+        }
         let mut attempts = Vec::new();
         for message in &messages {
             let method = itip_method(&message.message).ok();
@@ -269,22 +318,38 @@ impl ZaFanOut for Server {
                 });
             }
         }
-        let read =
-            if !internal.is_empty() || (kind == ZaFanOutKind::Deletion && !messages.is_empty()) {
-                match self.za_pin_state(keys).await {
-                    Ok(state) => Some(state),
-                    Err(err) => {
-                        trc::error!(
-                            err.account_id(sender_id)
-                                .details("zero-access: pin record read failed")
-                                .caused_by(trc::location!())
-                        );
-                        None
-                    }
+        if read.is_none()
+            && (!internal.is_empty() || (kind == ZaFanOutKind::Deletion && !messages.is_empty()))
+        {
+            read = match self.za_pin_state(keys).await {
+                Ok(state) => Some(state),
+                Err(err) => {
+                    trc::error!(
+                        err.account_id(sender_id)
+                            .details("zero-access: pin record read failed")
+                            .caused_by(trc::location!())
+                    );
+                    None
                 }
-            } else {
-                None
             };
+        }
+        // Spec 5.2 phase 4: a deletion with a message to send retires every
+        // entry of the deleted document, each under the refusal id read
+        // here.
+        let deleted: Vec<(String, u64)> = if kind == ZaFanOutKind::Deletion && !messages.is_empty()
+        {
+            read.as_ref()
+                .and_then(|state| state.pins.record.as_ref())
+                .map(|record| {
+                    record
+                        .entries_of(source.document_id, source.uid)
+                        .map(|entry| (entry.address.clone(), entry.refusal_id))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         #[cfg(feature = "test_mode")]
         common::za::test_hooks::pin_decide_pause_point(sender_id).await;
 
@@ -293,7 +358,9 @@ impl ZaFanOut for Server {
         // item (under a legacy wrap, the batch with the rewrap).
         let mut verdicts: AHashMap<String, Verdict> = AHashMap::new();
         let mut decided = None;
-        if let Some(state) = read.filter(|_| !internal.is_empty()) {
+        if !internal.is_empty()
+            && let Some(state) = read.take()
+        {
             #[cfg(feature = "test_mode")]
             let fail = common::za::test_hooks::take_pin_write_fail(sender_id);
             #[cfg(not(feature = "test_mode"))]
@@ -349,7 +416,32 @@ impl ZaFanOut for Server {
         }
 
         // Phase 3: the items of the recipients decided "deliver", in message
-        // order; a refused recipient's property gets `3.8`.
+        // order; a refused recipient's property gets `3.8`. In a change, a
+        // recipient holding an entry for the source gets the full current
+        // state ahead of its own messages (spec 5.1, the two-item rule),
+        // built from the reconciled committed tree.
+        let mut full_states: AHashMap<&str, ItipMessage<ICalendar>> = AHashMap::new();
+        if kind == ZaFanOutKind::Change
+            && let Some(record) = decided
+                .as_ref()
+                .and_then(|state| state.pins.record.as_ref())
+        {
+            for (key, _) in &internal {
+                if let Some(Verdict::Deliver(Some(_))) = verdicts.get(key)
+                    && let Some(entry) = record.entry(source.document_id, source.uid, key)
+                    && let Some(full) = full_state(
+                        event,
+                        sender.addresses(),
+                        is_organizer,
+                        &attempts,
+                        key,
+                        entry,
+                    )
+                {
+                    full_states.insert(key.as_str(), full);
+                }
+            }
+        }
         let mut statuses = Vec::new();
         let mut not_written: AHashSet<&str> = AHashSet::new();
         for attempt in &attempts {
@@ -366,6 +458,31 @@ impl ZaFanOut for Server {
                         }),
                     )) => match verdicts.get(key) {
                         Some(Verdict::Deliver(_)) => {
+                            // The full state first; a failed one (`5.1`)
+                            // never stops the recipient's own messages.
+                            if let Some(full) = full_states.remove(key) {
+                                let status = write_item(
+                                    self,
+                                    sender_id,
+                                    *account_id,
+                                    public_key,
+                                    &full.message,
+                                    pair.as_ref(),
+                                    reply_token.as_deref(),
+                                    fence,
+                                )
+                                .await
+                                .caused_by(trc::location!())?;
+                                if status != ITIP_STATUS_DELIVERED {
+                                    not_written.insert(key);
+                                }
+                                record_status(
+                                    &mut statuses,
+                                    attempt.address,
+                                    attempt.route.on_organizer(),
+                                    status,
+                                );
+                            }
                             let status = write_item(
                                 self,
                                 sender_id,
@@ -402,41 +519,54 @@ impl ZaFanOut for Server {
         #[cfg(feature = "test_mode")]
         common::za::test_hooks::retire_pause_point(sender_id).await;
 
-        // Phase 4: retire the entries this change's deliveries consumed,
-        // each only under the refusal id phase 1 read (spec 5.2). A failure
-        // undoes nothing: the items stand and the entry stays.
-        if kind == ZaFanOutKind::Change
-            && let Some(state) = decided
+        // Phase 4 (spec 5.2): retire each entry only under the refusal id
+        // the delivery consumed. A change retires the entries whose
+        // recipients' items, the full state included, were all written,
+        // under the state phase 2 decided on; a deletion with a message to
+        // send every entry of the deleted document, under the ids phase 1
+        // read, items written or not. A failure undoes nothing: the items
+        // stand and the entry stays.
+        let retirement = match kind {
+            ZaFanOutKind::Change => decided.map(|state| {
+                let consumed: Vec<(&str, u64)> = internal
+                    .iter()
+                    .filter_map(|(address, _)| match verdicts.get(address) {
+                        Some(Verdict::Deliver(Some(refusal_id)))
+                            if !not_written.contains(address.as_str()) =>
+                        {
+                            Some((address.as_str(), *refusal_id))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                (Some(state), consumed)
+            }),
+            ZaFanOutKind::Deletion => Some((
+                decided.or(read),
+                deleted
+                    .iter()
+                    .map(|(address, refusal_id)| (address.as_str(), *refusal_id))
+                    .collect(),
+            )),
+            ZaFanOutKind::Redelivery => None,
+        };
+        if let Some((start, consumed)) = retirement
+            && !consumed.is_empty()
         {
-            let consumed: Vec<(&str, u64)> = internal
-                .iter()
-                .filter_map(|(address, _)| match verdicts.get(address) {
-                    Some(Verdict::Deliver(Some(refusal_id)))
-                        if !not_written.contains(address.as_str()) =>
-                    {
-                        Some((address.as_str(), *refusal_id))
-                    }
-                    _ => None,
-                })
-                .collect();
-            if !consumed.is_empty() {
-                let outcome = self
-                    .za_pin_transact(keys, Some(state), |state| retire(state, &consumed, source))
-                    .await;
-                let failure = match outcome {
-                    Ok(ZaPinTransact::Written { .. } | ZaPinTransact::Kept { .. }) => None,
-                    Ok(ZaPinTransact::Conflict) => {
-                        Some(trc::StoreEvent::AssertValueFailed.into_err())
-                    }
-                    Err(err) => Some(err),
-                };
-                if let Some(err) = failure {
-                    trc::error!(
-                        err.account_id(sender_id)
-                            .details("zero-access: withheld entries not retired")
-                            .caused_by(trc::location!())
-                    );
-                }
+            let outcome = self
+                .za_pin_transact(keys, start, |state| retire(state, &consumed, source))
+                .await;
+            let failure = match outcome {
+                Ok(ZaPinTransact::Written { .. } | ZaPinTransact::Kept { .. }) => None,
+                Ok(ZaPinTransact::Conflict) => Some(trc::StoreEvent::AssertValueFailed.into_err()),
+                Err(err) => Some(err),
+            };
+            if let Some(err) = failure {
+                trc::error!(
+                    err.account_id(sender_id)
+                        .details("zero-access: withheld entries not retired")
+                        .caused_by(trc::location!())
+                );
             }
         }
 
@@ -563,6 +693,59 @@ fn retire(state: &ZaPinState, consumed: &[(&str, u64)], source: ZaSource<'_>) ->
     } else {
         ZaPinStep::Keep(())
     }
+}
+
+/// The two-item rule's full current state for `key`, which holds `entry`
+/// (spec 5.1 item 1), from the reconciled committed tree: an organizer's
+/// full REQUEST for the address, an attendee's refused instances' current
+/// participation from its own REPLY's address. `None` when it is skipped:
+/// one of the address's own messages is a REQUEST or a CANCEL carrying the
+/// master, the relationship ended (the organizer's tree names no ATTENDEE
+/// with the address), or the full state yields nothing.
+fn full_state(
+    event: &ICalendar,
+    addresses: &[String],
+    is_organizer: bool,
+    attempts: &[Attempt<'_>],
+    key: &str,
+    entry: &ZaWithheld,
+) -> Option<ItipMessage<ICalendar>> {
+    let own = || {
+        attempts
+            .iter()
+            .filter(move |attempt| attempt.key.as_deref() == Some(key))
+    };
+    if own().any(|attempt| carries_master(&attempt.message.message)) {
+        return None;
+    }
+    if is_organizer {
+        if !scheduled_attendees(event, addresses)
+            .iter()
+            .any(|attendee| za_normalize_address(attendee).as_deref() == Some(key))
+        {
+            return None;
+        }
+        za_full_request_for(event, addresses, key)
+    } else {
+        let from = &own().find(|attempt| attempt.is_reply)?.message.from;
+        za_participation_reply(event, addresses, &entry.instances, from)
+    }
+}
+
+/// A REQUEST or CANCEL holding a scheduling component without
+/// RECURRENCE-ID: upstream routes every master change to the full update,
+/// and a master CANCEL cancels every instance of the copy (spec 5.1).
+fn carries_master(message: &ICalendar) -> bool {
+    matches!(
+        itip_method(message),
+        Ok(ICalendarMethod::Request | ICalendarMethod::Cancel)
+    ) && message.components.iter().any(|comp| {
+        comp.component_type.is_scheduling_object()
+            && !comp
+                .entries
+                .iter()
+                .any(|entry| entry.name == ICalendarProperty::RecurrenceId)
+    })
 }
 
 /// The instances of the REPLYs refused for `key` (spec 4.1), `None` when no

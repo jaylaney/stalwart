@@ -258,7 +258,7 @@ impl CalendarDeleteRequestHandler for Server {
                 self.za_fan_out(
                     &account_info,
                     keys,
-                    vec![message.message],
+                    message.message.into_iter().collect(),
                     message.pairs,
                     &message.event,
                     ZaSource {
