@@ -15,7 +15,8 @@ Plan 12 builds the server side of key pinning (spec `2026-10-17-zero-access-key-
   - Task 7 `589d5485` (the full state before upstream's messages, the deletion's retirement), fix round `a84f7cf0` (the decline's organizer joins the recipients only when routed, a NEEDS-ACTION decline test, case 13d's retirement);
   - Task 8 `49447c1f` (the leak scan of pin records, pin records under key-mode `webdav_tests`, manual checklist item 15, CLAUDE.md), then the commit of this note (`043fe685`);
   - the final review's fix wave (see "Final review"): `43b93399` (redelivery's budget and cleanup counts, the `withheld` helper, the redelivery batch override), then the commit of this note's final-review update.
-  - In `jaylaney/circulo-account`: `8e8d6d4` "Contract: the contacts endpoints (key pinning)", `docs/api.md` only, on branch `contacts-api` cut from `main` at `97b5fb6`; then the fix wave's `940dd5d` "Contract: contacts/pin retry guidance and its losses", `docs/api.md` only. Not pushed, no pull request.
+  - PR #40's review round (see "PR #40 review"): `5eae6467` (failed entries rotate, a REPLY per local address, drain retries to the skip limit with the wait scoped to skipped UIDs; spec 6.4 amended), then the commit of that section.
+  - In `jaylaney/circulo-account`: `8e8d6d4` "Contract: the contacts endpoints (key pinning)", `docs/api.md` only, on branch `contacts-api` cut from `main` at `97b5fb6`; then the fix wave's `940dd5d` "Contract: contacts/pin retry guidance and its losses", `docs/api.md` only; then PR #40's review round's `cadaa4d` "Contract: contacts/pin rotates failed entries, replies per address, scoped waits", `docs/api.md` only. Not pushed, no pull request.
 - The suites run in Task 8 Step 7 on `49447c1f`, in order, one at a time:
   - The formatting check (`cargo fmt -p <crate> -- --check` for `vault`, `types`, `common`, `groupware`, `dav` and `tests`; `cargo fmt --manifest-path crates/http/Cargo.toml -- --check`): clean (1 s each).
   - The per-task compile check (`cargo check -p stalwart --no-default-features --features rocks`, filtered to the fork's files): `clean`; the upstream warning totals unchanged (`store` 1, `common` 18, `jmap` 3, `services` 2) (254 s).
@@ -35,7 +36,7 @@ Plan 12 builds the server side of key pinning (spec `2026-10-17-zero-access-key-
   - the self-check on every session's first drain pass and at the start of every contacts endpoint;
   - `POST /api/vault/contacts`, `contacts/lookup`, `contacts/pin` (pin, drain, redeliver up to 32 entries, guarded cleanup) and `contacts/forget`;
   - the hooks `PIN_DECIDE_PAUSE`, `RETIRE_PAUSE`, `PIN_WRITE_FAIL_ONCE`, `REDELIVER_CLEANUP_PAUSE`, and from the final review the redelivery batch override (`test_hooks::set_redeliver_batch_override`), with `PIN_WRITE_FAIL_ONCE` also reaching `contacts/pin`'s step 5;
-  - the za module `pinning` (cases 1-21, then `rf_1`-`rf_5`, then the final review's `fr_1` and `fr_2`), `leak::test_pins`, the key-mode `scheduling` variant's pin-record assertion, and unit tests in `vault` (`keys`, `pins`), `common` (`auth::vault`) and `groupware` (`fanout`, `pinning`, `sequence`).
+  - the za module `pinning` (cases 1-21, then `rf_1`-`rf_5`, then the final review's `fr_1` and `fr_2`, then PR #40's review's `pr_1`-`pr_3`), `leak::test_pins`, the key-mode `scheduling` variant's pin-record assertion, and unit tests in `vault` (`keys`, `pins`), `common` (`auth::vault`) and `groupware` (`fanout`, `pinning`, `sequence`).
 
 ## What changed and why
 
@@ -143,7 +144,7 @@ None. No existing za or webdav assertion changed in this plan: the first pin's g
 ## Deferred findings
 
 What stays open after this plan:
-- The final review's deferred minors (F4's product half, F8, F9) and its open spec questions (F1, F2, F6, F7, F11), under "Final review".
+- The final review's deferred minors (F4's product half, F9) and its open spec questions (F1, F6, F7, F11), under "Final review". F2 and F8 are resolved (see "PR #40 review").
 - (spec 13 item 5) An organizer-side delegate guard in the fork's drain merge (keep an existing delegate's PARTSTAT, RSVP, SCHEDULE-STATUS and ROLE against a REPLY, keep the DELEGATED-TO/FROM updates `Attendance::is_new` needs) would close limit 7's gap and plan 11's deferred delegate item for key accounts; a release 2 decision for Jay, to be taken with that item.
 - The plan 11 note's deferred findings stay open, unchanged; plan 12 resolves none of them. Its "What stays open" list:
   - (plan 10, pr-fix2-review.md M1) A delegate's PARTSTAT reset to NEEDS-ACTION without a DELEGATED-FROM gain (a decline followed by the delegator's per-occurrence accept, whose override copies the delegate's stale line): the delegate is not asked. An upstream merge-semantics question that upstream shares; see the plan 10 note.
@@ -284,19 +285,72 @@ The challenged rulings, verbatim; each challenge also stands beside the ruling i
 - Final review: rulings challenged, recorded in the note: Task 3's heal ruling costs nil (endpoint keys never reach a DAV session; only contacts/pin's own session, which heals by its pin write); Task 4's consumed-id ruling's loss also occurs with no retry (S2's refusal id retired by S1's delivery before S1 loses its ETag; spec 5.5); za_decline_all shows a refused delegator as DECLINED, not DELEGATED.
 
 Each finding's disposition:
-- F1, F2: open spec questions (below; the second ruling above).
+- F1: open spec question (below; the second ruling above).
+- F2: resolved in `5eae6467` (see "PR #40 review").
 - F3, F5, F12: fixed in `43b93399` (the first ruling above).
 - F4: the documentation half fixed in Circulo `940dd5d`; the product half deferred (the deferred line above: an oversize full state is a permanent `5.1`, and its entry never retires).
 - F6: deferred as a spec note (the third ruling above; below).
 - F7: deferred (the fourth ruling above; below).
-- F8, F9: deferred (the deferred line above).
+- F8: resolved in `5eae6467` (see "PR #40 review").
+- F9: deferred (the deferred line above).
 - F10: recorded in this note (the `carries_master` line under "Merge hotspots", where `crates/types/src/field.rs` already stood).
 - F11: stays as is (the fifth ruling above; below).
 
 ### Open spec questions
 
 - F1: the entries for an address that no longer resolves to a local key account can be dropped only by `forget(null)`: `contacts/pin` refuses such an address with `not a key account` before step 1 runs, and `forget(address)` keeps entries (spec 6.5). The reviewer's recommended fixes: let `forget(address)` drop the address's entries when it no longer resolves to a local key account, or let `contacts/pin` run step 1's drop logic without a pin. Either changes spec 6.4 or 6.5, which is Jay's call; until then the entries stay stranded.
-- F2: a deterministically failing inbox item keeps every `contacts/pin` call's drain incomplete, since each call's session is fresh and never reaches the skip limit, so the address's attendee-side entries stay `remaining` (since F3's fix they no longer hold back its organizer-side entries, and Circulo's api.md tells the page to stop calling when a call makes no progress). The reviewer's recommended fixes: inside `contacts/pin`, re-run passes after a counted item failure up to `DRAIN_ITEM_FAILURE_LIMIT`, or treat only the entries whose UID is behind a skipped item as incomplete. Either changes spec 6.4's incompleteness rule, which is Jay's call.
+- F2: resolved in `5eae6467`, with both of the reviewer's recommended fixes (see "PR #40 review").
 - F6, as recorded: fail-closed refusals are traced with "the served key differs from the pin"; deferred as a spec note, since the spec fixes the refusal's Details string verbatim and the constraints forbid inventing traces beyond it; the cost is an operator misreading a missing-record refusal as a key change.
 - F7, as recorded: `contacts/pin` builds the full REQUEST before it takes the UID lease; deferred, since the conforming fix needs a lease-then-re-read restructure of steps 1-2, and the race is already caught by step 4's archive assertion (counted `remaining`), leaving limit 7's transient; the cost is one stale full state delivered before the next ordinary delivery.
 - F11, as recorded: a store error on the pin read after the pin is written answers 200 with all-zero counts; it stays, since spec 6.4 says redelivery failures never fail the pin, so a 500 after a written pin would contradict it; the page shows nothing withheld until the next listing.
+
+## PR #40 review
+
+Jay's source review of `8a2e83e8` (PR #40) raised three P2 findings, all in `contacts/pin`'s drain and redelivery (`crates/http/src/api/contacts.rs`, spec 6.4). Each offered two remedies; the controller chose one per finding (the ledger's "PR #40: Ruling" line). The code commit `5eae6467` (code, tests and spec 6.4; the verification and kill checks below ran against it), then the commit of this section. In `jaylaney/circulo-account`, `cadaa4d` "Contract: contacts/pin rotates failed entries, replies per address, scoped waits", `docs/api.md` only, on `contacts-api` after `940dd5d`. Nothing pushed.
+
+### The three findings
+
+- **P2-1, failing entries starve later ones** (review comment on `contacts.rs:483`). `za_redeliver` walked the address's entries in record order on every call and a `failed` entry kept its place, so entries failing on every call (a full state over the recipient's size limit, F4) could hold every later entry `remaining` for good. Remedy chosen: rotate. Step 5's write (`za_cleanup`, `contacts.rs:577`, which replaces `za_retire`) also moves every entry the call counted `failed` (collected at `:475` and `:508`) to the end of the record, in call order, each only while it still holds the refusal id read after the drain (`za_retire`'s identity check); an entry re-armed meanwhile keeps its place, and moving changes no entry's contents. A call with failures and nothing consumed writes too (`:524`); the write is skipped when the record would not change (`:612`, the failed entries already last). A failed or lost cleanup write rotates nothing, its consumed entries `remaining` as the final fix wave made them. Only `Failed` moves: `Waiting` and `Remaining` keep their places. The 32-attempt bound is unchanged. This also resolves the fix-wave re-review's out-of-scope note (permanently failing entries spend slots and starve later ones); F4's product half otherwise stands (an oversize full state still never retires).
+- **P2-2, a second local address's instances retired unsent** (review comment on `contacts.rs:673`; F8). Remedy chosen: one REPLY per local sender address. `za_reply_from` is gone; `za_reply_addresses` (`crates/groupware/src/calendar/pinning.rs:145`) returns the local attendee of each recorded instance present (the first local one, as upstream's `attendee_handle_update` takes it), the master first, then in instance order, each address once. `za_redeliver_entry` builds `za_participation_reply` once per address (`contacts.rs:688`) and passes every message to the one `Redelivery` fan-out (`:704`). The fan-out keeps one status per address and property, the worst winning (`record_status`), so the entry goes on to step 4 only when every REPLY was delivered; a partly failed redelivery stays withheld and the next call resends every REPLY. No message at all is `dropped`, as before. `za_participation_reply`'s per-instance rules are unchanged.
+- **P2-3, a deterministically failing inbox item keeps every call incomplete** (review comment on `contacts.rs:280`; F2). Remedy chosen: both halves. (1) `ZaDrain::za_drain_settled` (`crates/groupware/src/calendar/drain.rs:223`), which `contacts/pin` now calls (`contacts.rs:276`), runs passes while one returns `More` or ends on an item's own counted failure below the limit (`PassError { counted: true }`, `drain.rs:153`, `:484`); the passes after the first pass the session's non-permanent deferral (`:298`). Any other `LeftPending` (a busy lease, a failure before the UID is known, an enumeration error, the test-mode drain skip) and `Suspended` end the loop. It is bounded: each retried pass recorded a new failure of an item not yet skipped, and a skipped item is never attempted again in the session. `za_drain` (the DAV trigger) runs one pass through the same `run_pass` (`:251`), with the deferral and the traces as before. (2) It returns `ZaHeldBack` (`:174`): after `Complete`, the UIDs of the session's skipped items, or `All` when one of them named no UID (`:241`); after anything else, `All`. An attendee-side entry waits only when `held_back.holds(uid)` (`contacts.rs:684`); organizer-side entries proceed regardless.
+
+### Tests
+
+In `tests/src/za/pinning.rs`, after `fr_2`:
+- `pr_1_failed_entries_rotate` (`:3173`): alice holds two organizer-side entries for bob, a refused update with a 2700-byte DESCRIPTION ahead of a plain refused update; with `itip_max_size` at 1500 (restored before any assertion) and the batch override at 1, the first call answers failed 1, remaining 1 and the record order becomes the second entry, then the first; the second call delivers the second entry (delivered 1, remaining 1) and the failing entry stays withheld.
+- `pr_2_a_reply_per_local_address` (`:3272`): bob gets an alias, `key2@pin-alias.test` (a new domain, removed at the end), and attends alice's daily event as `key2@example.com` on the master and as the alias on override X; his ACCEPTED on the master and his TENTATIVE on X are refused into one entry (master plus one instance key); `contacts/pin` answers delivered 1, the entry is retired, and alice's copy shows ACCEPTED on the master and TENTATIVE for the alias on X.
+- `pr_3_wait_scoped_to_skipped_uids` (`:3401`): bob holds refused answers to alice's X and Y, and alice's update of X is pending in bob's inbox. With the update's re-read failing (`DRAIN_READ_FAIL_ITEM`, uncounted) both answers wait (remaining 2); with its commit failing (`DRAIN_FAIL_ITEM`, counted) the call skips it, Y's answer is delivered and X's waits (delivered 1, remaining 1), X's entry stays withheld, the update stays pending, and alice shows ACCEPTED on Y and NEEDS-ACTION on X.
+- `fr_1` (`:2994`, hook at `:3075`): carol's invitation now fails its re-read (`DRAIN_READ_FAIL_ITEM`) instead of its commit, since a counted failure is now skipped within the call and would no longer keep the drain incomplete; its assertions are unchanged and its A1 kill check still holds (below).
+- Unit test `a_reply_per_local_address` (`crates/groupware/src/calendar/pinning.rs:517`).
+
+### Spec
+
+Section 6.4 amended in place, the revision number kept (revision 11; the header records that the history is in git, so there is no history line to add): the drain paragraph (the in-call retries to the skip limit past the deferral, DAV unchanged; the wait scoped to skipped UIDs, every attendee-side entry waiting on any other incomplete outcome), step 2's attendee branch (one REPLY per local address), step 3 (the worst status over the messages), step 5 (failed entries rotate to the end in the same write; a failed cleanup moves nothing), and the outcome table's `delivered`, `dropped`, `failed` and `remaining` rows. One sentence outside 6.4 became false and was fixed: section 6.1's "`contacts/pin` calls the drain itself (`za_drain` ...)" now names `za_drain_settled`.
+
+### Verification
+
+On `5eae6467`, one at a time:
+- The formatting check (`cargo fmt --manifest-path crates/http/Cargo.toml -- --check`, `cargo fmt -p tests -- --check`, `cargo fmt -p groupware -- --check`): clean.
+- The per-task compile check: `clean`; the upstream warning totals unchanged (`store` 1, `common` 18, `jmap` 3, `services` 2).
+- `cargo check -p tests --tests`: no warnings.
+- `cargo test -p groupware`: 94 passed. `cargo test -p http@0.16.26 --features test_mode`: 6 passed. (`vault` and `common` are untouched.)
+- `za_tests`: 1 passed in 83.66 s (leak scan: 4032 records, 53 archives, 8 blobs, 988 search index records (644 of the account, none calendar), 5 events, 3 calendars, 4 items, 4 emails; negative control caught 29 violations).
+- `za_tests` with `BLOB_STORE=FileSystem`: 1 passed in 83.34 s (leak scan: 3987 records, 53 archives, 8 blobs, 988 search index records (644 of the account, none calendar), 5 events, 3 calendars, 4 items, 4 emails; negative control caught 29 violations).
+- `webdav_tests`: 1 passed in 23.40 s, `cal_itip` on the first run; with `ZA_KEY_ACCOUNTS=1`: 1 passed in 22.46 s.
+
+### Kill checks
+
+Each mutant applied alone to `5eae6467`, the za suite run, then restored with `git checkout -- crates/` and followed by an empty `git status --short crates/`:
+- P2-1's rotation reverted (the failed entry is no longer moved: `rotated.push(record.withheld.remove(index))` replaced by a no-op, `contacts.rs:608`): fails `tests/src/za/pinning.rs:3241:5`, `the failed entry moved behind the other` (left `[154, 155]`, right `[155, 154]`).
+- P2-2's per-address REPLYs reverted (only the first address's REPLY, `.take(1)` after `za_reply_addresses`, as `za_reply_from` did): fails `pinning.rs:3374:5`, `X's answer, from the alias` (left `NEEDS-ACTION`, right `TENTATIVE`): the entry is retired after the master's REPLY alone.
+- P2-3's in-call retries reverted (the `(PassOutcome::LeftPending, true)` arm removed from `za_drain_settled`, `drain.rs:227`): fails `pinning.rs:3473:5`, `Y's answer is redelivered, X's waits behind the skipped update` (left delivered 0, remaining 2).
+- P2-3's UID scoping reverted (`Complete` holds nothing back, `drain.rs:243-244`): fails `pinning.rs:3473:5`, the same message (left delivered 2, remaining 0).
+- Beyond the brief, the deferral bypass reverted (the retried passes honour the session's deferral, `drain.rs:231`): fails `pinning.rs:3473:5`, the same message (left delivered 0, remaining 2).
+- `fr_1`'s kill check, re-run on the adjusted case: the final fix wave's A1 reverted (a waiting entry spends a slot: the `continue` in the `Waiting` arm removed, `contacts.rs:502-505`): fails `pinning.rs:3080:5`, `the waiting answer spends no budget: the invitation is delivered` (left delivered 0, remaining 2).
+
+The logs and mutant diffs are in the implementer's scratchpad (`pr40/kill/`), not in the repository.
+
+### Dispositions
+
+- F2 and F8 resolved here (they leave "Open spec questions" and the deferred list above, with pointers). The fix-wave re-review's out-of-scope starvation note is resolved by P2-1. Its residuals R1 (api.md's `failed` row said "not delivered in this call", false when step 4's reseal errs after delivery) and R3 (waiting entries described as not attempted, though step 1's drops run first and spend a slot) are fixed in Circulo's `cadaa4d`, this round's api.md change, ahead of the Circulo contacts plan the final review had carried them to.
+- Everything else the earlier reviews deferred is unchanged by this round.
