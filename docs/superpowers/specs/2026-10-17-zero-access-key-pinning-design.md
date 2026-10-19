@@ -774,11 +774,14 @@ yet skipped, so the loop is bounded; DAV requests keep one pass and the
 deferral. A drain ending `LeftPending` for any other reason (a busy lease,
 a failure before the item's UID is known, an enumeration error) or
 `Suspended` (`PassOutcome`; release 2 sections 6.2 and 10) means no REPLY
-is built: every attendee-side entry counts as `remaining`. A drain that
-completes with skipped items holds back only the attendee-side entries
-whose UID is the UID of a skipped item (the items waiting behind one share
-it), or every attendee-side entry when a skipped item's UID is unknown;
-the others proceed. REQUEST redelivery proceeds regardless, the stale
+is built: every attendee-side entry that passes step 1 counts as
+`remaining`, unattempted and outside the 32. A drain that completes with
+skipped items holds back only the attendee-side entries whose UID is the
+UID of a skipped item (the items waiting behind one share it), or every
+attendee-side entry when a skipped item's UID is unknown; the others
+proceed. Step 1 runs before the wait either way: an entry it drops is
+`dropped`, one whose archive read or unseal errs is `failed`, and both
+spend one of the 32. REQUEST redelivery proceeds regardless, the stale
 check not applying to it. Then up to 32 withheld entries for the address
 are redelivered, the rest left for the next call, each with its
 `refusal_id` read after the drain (whose delegating merge may re-arm or
@@ -858,8 +861,8 @@ Every outcome of an entry is one of these:
 |---|---|---|
 | `delivered` | the item is written (every REPLY, for an attendee-side entry) and step 4 committed | retired under the rule |
 | `dropped` | step 1's conditions; the full REQUEST yields nothing for the address (it is DECLINED without a stored SCHEDULE-FORCE-SEND, RSVP=FALSE, SCHEDULE-AGENT=CLIENT or NONE); the REPLY helper yields nothing for any local address (no recorded instance still exists and qualifies); the address no longer resolves to an internal key account (the next ordinary edit routes it as upstream does) | retired under the rule |
-| `failed` | the UID lease is busy; an item write fails | stays, moved to the end of the record |
-| `remaining` | beyond the 32 of this call; re-armed during it; step 4 lost its archive assertion; the cleanup write failed; an attendee-side entry the drain holds back (an incomplete drain, or a skipped item of its UID) | stays |
+| `failed` | step 1's archive read or unseal errs; the UID lease is busy; an item write fails; step 4's reseal errs after the delivery (the contact may already hold the state; the next call resends it) | stays, moved to the end of the record |
+| `remaining` | beyond the 32 of this call; re-armed during it; step 4 lost its archive assertion; the cleanup write failed; an attendee-side entry that passes step 1 and the drain holds back (an incomplete drain, or a skipped item of its UID) | stays |
 
 Why current state: a full REQUEST covers every refused partial change and
 never reverts a newer delivery that bumped the SEQUENCE, and limit 7

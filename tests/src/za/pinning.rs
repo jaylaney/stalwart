@@ -97,6 +97,7 @@ pub async fn test(test: &mut TestServer) {
     pr_1_failed_entries_rotate(test).await;
     pr_2_a_reply_per_local_address(test).await;
     pr_3_wait_scoped_to_skipped_uids(test).await;
+    pr_4_rotation_identity_and_failed_cleanup(test).await;
 }
 
 /// Spec 9 case 1: alice, who never pinned, invites bob. The fan-out pins
@@ -3172,68 +3173,19 @@ const BOB_ALIAS: &str = "key2@pin-alias.test";
 /// refused update; the batch is one entry.
 async fn pr_1_failed_entries_rotate(test: &TestServer) {
     let (alice, bob, _) = parties(test);
-    let admin = test.account("admin@example.com").clone();
     let bob_start = inbox_ids(test, bob.id).await;
-    let (path_a, path_b) = (
-        event_path(&alice, "pin-pr1a"),
-        event_path(&alice, "pin-pr1b"),
-    );
-    for (path, uid) in [(&path_a, "pin-pr1a"), (&path_b, "pin-pr1b")] {
-        alice
-            .client
-            .request_with_headers("PUT", path, [CONTENT_TYPE], invite(uid, START_A, &[BOB]))
-            .await
-            .with_status(StatusCode::CREATED);
-    }
-    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
-    let original = substitute_public_key(test, bob.id, &writer_key(), true).await;
-    let description = format!("DESCRIPTION:{}\r\n", "pin-pr1a ".repeat(300));
-    assert_eq!(
-        rewrite(&alice.client, &path_a, |body| body.replacen(
-            "SUMMARY:fo-title pin-pr1a\r\n",
-            &format!("SUMMARY:fo-title pin-pr1a\r\n{description}"),
-            1
-        ))
-        .await,
-        StatusCode::NO_CONTENT
-    );
-    assert_eq!(
-        rewrite(&alice.client, &path_b, |body| body
-            .replace("fo-title pin-pr1b", "fo-title pin-pr1b v2"))
-        .await,
-        StatusCode::NO_CONTENT
-    );
-    substitute_public_key(test, bob.id, &original, true).await;
-    let (id_a, id_b) = (
-        document_id_of(test, alice.id, &path_a).await,
-        document_id_of(test, alice.id, &path_b).await,
-    );
-    let documents = |entries: Vec<ZaWithheld>| -> Vec<u32> {
-        entries.iter().map(|entry| entry.document_id).collect()
-    };
-    assert_eq!(documents(withheld(test, alice.id, BOB).await), [id_a, id_b]);
+    let (path_a, path_b, id_a, id_b) =
+        oversize_ahead(test, &alice, &bob, "pin-pr1a", "pin-pr1b").await;
     let fingerprint = display_fingerprint(&served(test, bob.id).await);
     // The first entry's full REQUEST carries the DESCRIPTION; the second's
     // does not.
-    admin
-        .registry_update_setting(
-            CalendarScheduling {
-                itip_max_size: 1500,
-                ..Default::default()
-            },
-            &[Property::ItipMaxSize],
-        )
-        .await;
-    admin.reload_settings().await;
+    itip_max_size(test, Some(1500)).await;
     test_hooks::set_redeliver_batch_override(Some(1));
     let first = pin(ALICE, BOB, &fingerprint).await;
     let rotated = documents(withheld(test, alice.id, BOB).await);
     let second = pin(ALICE, BOB, &fingerprint).await;
     test_hooks::set_redeliver_batch_override(None);
-    admin
-        .registry_update_setting(CalendarScheduling::default(), &[Property::ItipMaxSize])
-        .await;
-    admin.reload_settings().await;
+    itip_max_size(test, None).await;
     assert_eq!(
         first.expect(200),
         json!({"ok": true, "delivered": 0, "failed": 1, "dropped": 0, "remaining": 1})
@@ -3502,6 +3454,167 @@ async fn pr_3_wait_scoped_to_skipped_uids(test: &TestServer) {
     clear_recipient(test, &bob, &bob_start, "pin-pr3x").await;
     clear_recipient(test, &bob, &bob_start, "pin-pr3y").await;
     drop_entries(BOB, ALICE).await;
+}
+
+/// PR #40 review, fix round 1 (spec 6.4 step 5, invariant 23): the
+/// rotation moves a failed entry only under the refusal id read after the
+/// drain, and a failed cleanup moves nothing. alice holds `oversize_ahead`'s
+/// two entries for bob; the batch is one entry, so each call fails the first
+/// and leaves the second `remaining`. (a) `contacts/pin` parked before step
+/// 5 while alice's edit re-arms the first entry: it keeps its place. (b)
+/// `PIN_WRITE_FAIL_ONCE`, set while the call is parked after its inner
+/// fan-out (whose phase 2 would take it first), fails the cleanup of a call
+/// with only a failure: the order is unchanged.
+async fn pr_4_rotation_identity_and_failed_cleanup(test: &TestServer) {
+    let (alice, bob, _) = parties(test);
+    let bob_start = inbox_ids(test, bob.id).await;
+    let (path_a, path_b, id_a, id_b) =
+        oversize_ahead(test, &alice, &bob, "pin-pr4a", "pin-pr4b").await;
+    let consumed = withheld(test, alice.id, BOB).await[0].refusal_id;
+    let fingerprint = display_fingerprint(&served(test, bob.id).await);
+    itip_max_size(test, Some(1500)).await;
+    test_hooks::set_redeliver_batch_override(Some(1));
+
+    // (a) A newer refusal of the failed entry before step 5.
+    let parked = HookParked::start(
+        alice.id,
+        test_hooks::set_redeliver_cleanup_pause,
+        pin_request(ALICE, BOB, &fingerprint),
+    )
+    .await;
+    let original = substitute_public_key(test, bob.id, &writer_key(), true).await;
+    let edit = rewrite(&alice.client, &path_a, |body| {
+        body.replace("fo-title pin-pr4a", "fo-title pin-pr4a v2")
+    })
+    .await;
+    substitute_public_key(test, bob.id, &original, true).await;
+    let rearmed = withheld(test, alice.id, BOB).await;
+    let first = parked.finish().await;
+    let after_rearm = documents(withheld(test, alice.id, BOB).await);
+
+    // (b) A failed cleanup of a call with only a failure.
+    let parked = HookParked::start(
+        alice.id,
+        test_hooks::set_redeliver_cleanup_pause,
+        pin_request(ALICE, BOB, &fingerprint),
+    )
+    .await;
+    test_hooks::set_pin_write_fail(Some(alice.id));
+    let second = parked.finish().await;
+    test_hooks::set_pin_write_fail(None);
+    let after_failure = documents(withheld(test, alice.id, BOB).await);
+    test_hooks::set_redeliver_batch_override(None);
+    itip_max_size(test, None).await;
+
+    assert_eq!(edit, StatusCode::NO_CONTENT);
+    assert_eq!(
+        (
+            documents(rearmed.clone()),
+            rearmed[0].refusal_id != consumed
+        ),
+        (vec![id_a, id_b], true),
+        "the edit re-armed the first entry in place"
+    );
+    assert_eq!(
+        first.expect(200),
+        json!({"ok": true, "delivered": 0, "failed": 1, "dropped": 0, "remaining": 1})
+    );
+    assert_eq!(
+        after_rearm,
+        [id_a, id_b],
+        "the re-armed entry keeps its place"
+    );
+    assert_eq!(
+        second.expect(200),
+        json!({"ok": true, "delivered": 0, "failed": 1, "dropped": 0, "remaining": 1})
+    );
+    assert_eq!(
+        after_failure,
+        [id_a, id_b],
+        "a failed cleanup moves nothing"
+    );
+
+    // Cleanup.
+    delete_event(&alice, &path_a).await;
+    delete_event(&alice, &path_b).await;
+    drop_entries(ALICE, BOB).await;
+    clear_recipient(test, &bob, &bob_start, "pin-pr4a").await;
+    clear_recipient(test, &bob, &bob_start, "pin-pr4b").await;
+}
+
+/// `pr_1`'s and `pr_4`'s entries: alice invites bob to `uid_a` and `uid_b`;
+/// with bob's key substituted, her update of `uid_a` adds a 2700-byte
+/// DESCRIPTION (a full REQUEST over a 1500-byte inbound limit, as case 11's
+/// failed full state) and her update of `uid_b` its title; bob's key
+/// restored. Returns the hrefs and document ids, the `uid_a` entry first in
+/// alice's record.
+async fn oversize_ahead(
+    test: &TestServer,
+    alice: &Party,
+    bob: &Party,
+    uid_a: &str,
+    uid_b: &str,
+) -> (String, String, u32, u32) {
+    let (path_a, path_b) = (event_path(alice, uid_a), event_path(alice, uid_b));
+    for (path, uid) in [(&path_a, uid_a), (&path_b, uid_b)] {
+        alice
+            .client
+            .request_with_headers("PUT", path, [CONTENT_TYPE], invite(uid, START_A, &[BOB]))
+            .await
+            .with_status(StatusCode::CREATED);
+    }
+    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+    let original = substitute_public_key(test, bob.id, &writer_key(), true).await;
+    let summary = format!("SUMMARY:fo-title {uid_a}\r\n");
+    let description = format!("DESCRIPTION:{}\r\n", format!("{uid_a} ").repeat(300));
+    assert_eq!(
+        rewrite(&alice.client, &path_a, |body| body.replacen(
+            &summary,
+            &format!("{summary}{description}"),
+            1
+        ))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        rewrite(&alice.client, &path_b, |body| body.replace(
+            &format!("fo-title {uid_b}"),
+            &format!("fo-title {uid_b} v2")
+        ))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    substitute_public_key(test, bob.id, &original, true).await;
+    let (id_a, id_b) = (
+        document_id_of(test, alice.id, &path_a).await,
+        document_id_of(test, alice.id, &path_b).await,
+    );
+    assert_eq!(documents(withheld(test, alice.id, BOB).await), [id_a, id_b]);
+    (path_a, path_b, id_a, id_b)
+}
+
+/// The document ids of `entries`, in record order.
+fn documents(entries: Vec<ZaWithheld>) -> Vec<u32> {
+    entries.iter().map(|entry| entry.document_id).collect()
+}
+
+/// Sets the inbound iTIP size limit (`CalendarScheduling::itip_max_size`)
+/// to `size`, or restores the default for `None`, and reloads.
+async fn itip_max_size(test: &TestServer, size: Option<u64>) {
+    let admin = test.account("admin@example.com");
+    admin
+        .registry_update_setting(
+            match size {
+                Some(itip_max_size) => CalendarScheduling {
+                    itip_max_size,
+                    ..Default::default()
+                },
+                None => CalendarScheduling::default(),
+            },
+            &[Property::ItipMaxSize],
+        )
+        .await;
+    admin.reload_settings().await;
 }
 
 /// alice, bob and carol, in that order.
