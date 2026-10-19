@@ -689,9 +689,10 @@ every other field from the re-read and change nothing login-relevant.
 Every other endpoint vault write keeps the verified-generation rule. Bodies
 and responses stay out of traces (release 1 section 10). Everything runs
 in this HTTP request, which holds plaintext while it redelivers, as any
-session request does; `contacts/pin` calls the drain itself (`za_drain`
-with the request's `SessionKeys`, section 6.4), and the DAV trigger in
-`handle_dav_request` (`crates/dav/src/request.rs`) is not involved.
+session request does; `contacts/pin` calls the drain itself
+(`za_drain_settled` with the request's `SessionKeys`, section 6.4), and the
+DAV trigger in `handle_dav_request` (`crates/dav/src/request.rs`) is not
+involved.
 
 ### 6.2 POST /api/vault/contacts
 
@@ -760,16 +761,28 @@ replacing any pin for the address. The served fingerprint is not in the
 refusal body; the page looks the address up again. The pin is written
 first, creating a fresh record when the read found none or an unusable one
 (asserted as section 4.2 states; under a legacy wrap, the batch with the
-rewrap). Then it drains the account (`za_drain` with the request's
-`SessionKeys`, looping while a pass returns `More`), as DAV paths do: the
-stale check rejects a whole REPLY when any instance it carries is behind
-the organizer, ordinary in a page-only flow. A pass ending
-`LeftPending` or `Suspended` (`PassOutcome` in `drain.rs`; release 2
-sections 6.2 and 10) means no REPLY is built (attendee-side entries count
-as `remaining`); REQUEST redelivery proceeds, the stale check not applying
-to it. Then up to 32 withheld entries for the address are redelivered, the
-rest left for the next call, each with its `refusal_id` read after the
-drain (whose delegating merge may re-arm or retire them):
+rewrap). Then it drains the account (`za_drain_settled` in `drain.rs`, with
+the request's `SessionKeys`), as DAV paths do: the stale check rejects a
+whole REPLY when any instance it carries is behind the organizer, ordinary
+in a page-only flow. Passes repeat while one returns `More` or ends on an
+item's own counted failure (release 2 section 6.2, "Skipped items") of an
+item not yet skipped, at once and past the session's retry deferral: the
+request's session is fresh, its failure counts empty, so this is how an
+item failing on every attempt reaches the skip limit (3) and is skipped
+within the call. Each retried pass records a new failure of an item not
+yet skipped, so the loop is bounded; DAV requests keep one pass and the
+deferral. A drain ending `LeftPending` for any other reason (a busy lease,
+a failure before the item's UID is known, an enumeration error) or
+`Suspended` (`PassOutcome`; release 2 sections 6.2 and 10) means no REPLY
+is built: every attendee-side entry counts as `remaining`. A drain that
+completes with skipped items holds back only the attendee-side entries
+whose UID is the UID of a skipped item (the items waiting behind one share
+it), or every attendee-side entry when a skipped item's UID is unknown;
+the others proceed. REQUEST redelivery proceeds regardless, the stale
+check not applying to it. Then up to 32 withheld entries for the address
+are redelivered, the rest left for the next call, each with its
+`refusal_id` read after the drain (whose delegating merge may re-arm or
+retire them):
 
 1. Load the source document by `document_id` and unseal it. Drop the entry
    if the document is gone, belongs to another account, or carries another
@@ -786,9 +799,15 @@ drain (whose delegating merge may re-arm or retire them):
    2 section 6.3, step 5). The refusing fan-out already created the recipient's
    token, so no minting is expected; the lease is cheap and keeps redelivery
    consistent with the delegating merge. When the user is an attendee: the
-   refused instances' current participation, the fork helper's REPLY of the
-   recorded instances (all qualifying ones under `all`) that still exist and
-   pass the rules, ignoring RSVP as upstream's reply path does: local attendee
+   refused instances' current participation, one REPLY per local address.
+   An entry can hold answers given from two of the account's addresses (the
+   master attended as the primary address, an override as an alias), so the
+   fork helper runs once for each distinct local attendee address of the
+   recorded instances present (each instance's first local attendee, as
+   upstream's attendee update takes it; the master's first, then in
+   instance order). Each REPLY carries the recorded instances (all
+   qualifying ones under `all`) that still exist and pass the rules,
+   ignoring RSVP as upstream's reply path does: local attendee
    `is_server_scheduling` with the reply's `from` address (`handle_reply`
    matches per instance by exact string), ORGANIZER not SCHEDULE-AGENT=CLIENT,
    STATUS not CANCELLED; with the ATTENDEE, DELEGATED-FROM and DELEGATED-TO
@@ -799,9 +818,13 @@ drain (whose delegating merge may re-arm or retire them):
    non-participant (`SenderIsNotParticipant`) and adds an override the
    organizer lacks (`MergeAction::AddComponent`), while a copy keeps a
    cancelled override naming the attendee after a partial CANCEL.
-3. Run `za_fan_out` with that message, the loaded event as the sender's
+3. Run `za_fan_out` with those messages, the loaded event as the sender's
    tree, its current token pairs (`event_token_pairs`) and `redelivery`
-   set (section 5.2); it finds the pin and delivers.
+   set (section 5.2); it finds the pin and delivers. The address's status
+   is the worst over the messages (section 5.3's one status per property),
+   so an attendee-side entry goes on to step 4 only when every REPLY was
+   delivered; a partly failed redelivery stays withheld, and the next call
+   resends every REPLY (a REPLY is idempotent).
 4. Write the status with `za_set_schedule_status` and reseal the event as
    the drain's merge does (`seal_event` with the returned pairs, under the
    assertion on the stored archive), with no schedule-tag change. On a lost
@@ -819,16 +842,24 @@ drain (whose delegating merge may re-arm or retire them):
 5. Cleanup, one conditional pin-record write under section 5.2's
    retirement rule (the `refusal_id` read after the drain, every attempt):
    an entry re-armed during the call stays and counts as `remaining`, not
-   as delivered. Failed entries stay withheld.
+   as delivered. Failed entries stay withheld and, in the same write, move
+   to the end of the record, in order, each only while it still holds the
+   `refusal_id` read after the drain (an entry re-armed meanwhile keeps its
+   place); moving changes no entry's contents. The next call then reaches
+   the entries behind a persistently failing one, the 32-attempt bound
+   unchanged. A call with failed entries writes even when it consumed none,
+   unless the order is already that; a call with neither writes nothing. A
+   failed or lost cleanup write retires and moves nothing, and its consumed
+   entries count as `remaining`.
 
 Every outcome of an entry is one of these:
 
 | Outcome | When | Entry |
 |---|---|---|
-| `delivered` | the item is written and step 4 committed | retired under the rule |
-| `dropped` | step 1's conditions; the full REQUEST yields nothing for the address (it is DECLINED without a stored SCHEDULE-FORCE-SEND, RSVP=FALSE, SCHEDULE-AGENT=CLIENT or NONE); the REPLY helper yields nothing (no recorded instance still exists and qualifies); the address no longer resolves to an internal key account (the next ordinary edit routes it as upstream does) | retired under the rule |
-| `failed` | the UID lease is busy; an item write fails | stays |
-| `remaining` | beyond the 32 of this call; re-armed during it; step 4 lost its archive assertion; an attendee-side entry after an incomplete drain | stays |
+| `delivered` | the item is written (every REPLY, for an attendee-side entry) and step 4 committed | retired under the rule |
+| `dropped` | step 1's conditions; the full REQUEST yields nothing for the address (it is DECLINED without a stored SCHEDULE-FORCE-SEND, RSVP=FALSE, SCHEDULE-AGENT=CLIENT or NONE); the REPLY helper yields nothing for any local address (no recorded instance still exists and qualifies); the address no longer resolves to an internal key account (the next ordinary edit routes it as upstream does) | retired under the rule |
+| `failed` | the UID lease is busy; an item write fails | stays, moved to the end of the record |
+| `remaining` | beyond the 32 of this call; re-armed during it; step 4 lost its archive assertion; the cleanup write failed; an attendee-side entry the drain holds back (an incomplete drain, or a skipped item of its UID) | stays |
 
 Why current state: a full REQUEST covers every refused partial change and
 never reverts a newer delivery that bumped the SEQUENCE, and limit 7

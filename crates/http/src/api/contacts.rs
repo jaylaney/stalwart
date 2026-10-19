@@ -18,10 +18,11 @@
 //! echoes its input, and traces carry ids and fixed strings only.
 //!
 //! `contacts/pin` pins the served key as `Confirmed`, drains the account
-//! (`za_drain` with the request's keys), then redelivers up to
+//! (`za_drain_settled` with the request's keys), then redelivers up to
 //! `REDELIVER_BATCH` withheld entries for the address as the full current
-//! state (spec 6.4) and retires the delivered and dropped ones under the
-//! refusal id it consumed.
+//! state (spec 6.4), retires the delivered and dropped ones under the
+//! refusal id it consumed and moves the failed ones to the end of the
+//! record.
 
 use crate::api::vault::{
     CredentialsRequest, ZaVerified, bad_request, conflict, deserialize_some, json, ok,
@@ -42,13 +43,13 @@ use common::{
 use groupware::{
     calendar::{
         CalendarEvent,
-        drain::{PassOutcome, ZaDrain},
+        drain::{ZaDrain, ZaHeldBack},
         fanout::{
             ITIP_STATUS_KEY_REFUSED, ZaFanOut, ZaFanOutKind, ZaScheduleStatus, ZaSource,
             za_set_schedule_status,
         },
         itip::ItipSendStatus,
-        pinning::{za_full_request_for, za_participation_reply, za_reply_from},
+        pinning::{za_full_request_for, za_participation_reply, za_reply_addresses},
         seal::{TokenPairs, seal_error, seal_event, unseal_event_pairs},
         sequence::{ZaSequence, za_set_sequences},
     },
@@ -67,8 +68,8 @@ use trc::AddContext;
 use types::collection::Collection;
 
 /// Withheld entries one `contacts/pin` call attempts at most; the rest are
-/// `remaining` (spec 6.4), and an attendee-side entry waiting behind an
-/// incomplete drain is no attempt. A constant, not a setting.
+/// `remaining` (spec 6.4), and an attendee-side entry waiting behind the
+/// drain is no attempt. A constant, not a setting.
 pub const REDELIVER_BATCH: usize = 32;
 
 #[derive(serde::Deserialize)]
@@ -270,16 +271,11 @@ pub(super) async fn za_contacts_pin(
     }
     // The drain first, as DAV paths do: its merges may re-arm or retire
     // entries, and a REPLY is built only from a copy no pending item is
-    // ahead of.
-    let outcome = loop {
-        let outcome = server.za_drain(keys).await;
-        if outcome != PassOutcome::More {
-            break outcome;
-        }
-    };
-    let incomplete = matches!(outcome, PassOutcome::LeftPending | PassOutcome::Suspended);
+    // ahead of. An item failing on every attempt is skipped within the call,
+    // holding back only the entries of its UID.
+    let held_back = server.za_drain_settled(keys).await;
     Ok(json(
-        za_redeliver(server, &verified, &address, incomplete).await,
+        za_redeliver(server, &verified, &address, &held_back).await,
     ))
 }
 
@@ -405,7 +401,7 @@ enum Outcome {
     Failed,
     Dropped,
     Remaining,
-    /// An attendee-side entry after an incomplete drain: counted
+    /// An attendee-side entry the drain holds back (`ZaHeldBack`): counted
     /// `remaining`, without an attempt, so it spends none of the call's
     /// budget.
     Waiting,
@@ -434,7 +430,7 @@ async fn za_redeliver(
     server: &Server,
     verified: &ZaVerified,
     address: &str,
-    incomplete: bool,
+    held_back: &ZaHeldBack,
 ) -> PinResponse {
     let account_id = verified.account_id;
     let mut response = PinResponse {
@@ -474,6 +470,9 @@ async fn za_redeliver(
     };
     // The entries a delivery or a drop consumed, with their outcome.
     let mut consumed: Vec<(&ZaWithheld, Outcome)> = Vec::new();
+    // The entries counted `failed`, which step 5 moves to the end of the
+    // record, so the next call reaches the entries behind them.
+    let mut failed: Vec<&ZaWithheld> = Vec::new();
     // Every outcome but `Waiting` spends one of the call's `batch` slots;
     // once they are spent, the rest are `remaining` without being loaded.
     let mut spent = 0;
@@ -484,7 +483,7 @@ async fn za_redeliver(
         }
         let outcome = match &account_info {
             Some(account_info) => {
-                match za_redeliver_entry(server, verified, account_info, entry, incomplete).await {
+                match za_redeliver_entry(server, verified, account_info, entry, held_back).await {
                     Ok(outcome) => outcome,
                     Err(err) => {
                         trc::error!(
@@ -505,7 +504,10 @@ async fn za_redeliver(
                 continue;
             }
             Outcome::Delivered | Outcome::Dropped => consumed.push((entry, outcome)),
-            Outcome::Failed => response.failed += 1,
+            Outcome::Failed => {
+                failed.push(entry);
+                response.failed += 1;
+            }
             Outcome::Remaining => response.remaining += 1,
         }
         spent += 1;
@@ -515,10 +517,11 @@ async fn za_redeliver(
 
     // Step 5: one conditional write retiring each consumed entry whose
     // stored refusal id is still the one read after the drain, checked on
-    // every attempt; an entry re-armed meanwhile stays and is `remaining`.
-    // `stays` flags the consumed entries still withheld afterwards.
+    // every attempt (an entry re-armed meanwhile stays and is `remaining`),
+    // and moving each failed entry to the end of the record under the same
+    // check. `stays` flags the consumed entries still withheld afterwards.
     let mut stays = vec![false; consumed.len()];
-    if !consumed.is_empty() {
+    if !consumed.is_empty() || !failed.is_empty() {
         #[cfg(feature = "test_mode")]
         let fail = common::za::take_pin_write_fail(account_id);
         #[cfg(not(feature = "test_mode"))]
@@ -531,7 +534,7 @@ async fn za_redeliver(
         } else {
             server
                 .za_pin_transact(&verified.keys, None, |state| {
-                    za_retire(state, address, &consumed)
+                    za_cleanup(state, address, &consumed, &failed)
                 })
                 .await
         };
@@ -549,8 +552,9 @@ async fn za_redeliver(
                     .details("zero-access: withheld entries not retired")
                     .caused_by(trc::location!())
             );
-            // A failed retirement leaves every consumed entry withheld,
-            // so each is `remaining`, and undoes no delivery (spec 5.2).
+            // A failed cleanup leaves every consumed entry withheld, so
+            // each is `remaining`, undoes no delivery (spec 5.2) and
+            // rotates nothing.
             stays = vec![true; consumed.len()];
         }
     }
@@ -565,25 +569,27 @@ async fn za_redeliver(
 }
 
 /// Step 5 over one state: removes each consumed entry whose refusal id is
-/// unchanged; the flags name the entries a newer refusal re-armed. An entry
-/// already gone keeps its outcome.
-fn za_retire(
+/// unchanged, then moves each failed entry still holding the refusal id read
+/// after the drain to the end of the record, in call order, its contents
+/// unchanged (an entry re-armed meanwhile keeps its place). The flags name
+/// the consumed entries a newer refusal re-armed; an entry already gone
+/// keeps its outcome. Writes only when the record changed.
+fn za_cleanup(
     state: &ZaPinState,
     address: &str,
     consumed: &[(&ZaWithheld, Outcome)],
+    failed: &[&ZaWithheld],
 ) -> ZaPinStep<Vec<bool>> {
     let Some(stored) = &state.pins.record else {
         return ZaPinStep::Keep(vec![false; consumed.len()]);
     };
     let mut record = stored.clone();
-    let mut removed = false;
     let rearmed = consumed
         .iter()
         .map(
             |(entry, _)| match stored.entry(entry.document_id, &entry.uid, address) {
                 Some(current) if current.refusal_id == entry.refusal_id => {
-                    removed |=
-                        record.retire(entry.document_id, &entry.uid, address, entry.refusal_id);
+                    record.retire(entry.document_id, &entry.uid, address, entry.refusal_id);
                     false
                 }
                 Some(_) => true,
@@ -591,7 +597,19 @@ fn za_retire(
             },
         )
         .collect();
-    if removed {
+    let mut rotated = Vec::with_capacity(failed.len());
+    for entry in failed {
+        if let Some(index) = record.withheld.iter().position(|current| {
+            current.document_id == entry.document_id
+                && current.uid == entry.uid
+                && current.address == address
+                && current.refusal_id == entry.refusal_id
+        }) {
+            rotated.push(record.withheld.remove(index));
+        }
+    }
+    record.withheld.extend(rotated);
+    if record != *stored {
         ZaPinStep::Write(record, rearmed)
     } else {
         ZaPinStep::Keep(rearmed)
@@ -606,7 +624,7 @@ async fn za_redeliver_entry(
     verified: &ZaVerified,
     account_info: &AccountInfo,
     entry: &ZaWithheld,
-    incomplete: bool,
+    held_back: &ZaHeldBack,
 ) -> trc::Result<Outcome> {
     let keys = &verified.keys;
     let account_id = verified.account_id;
@@ -644,7 +662,7 @@ async fn za_redeliver_entry(
 
     // Step 2: the full current state for this one recipient.
     let tree = &event.data.event;
-    let (message, lease) = match side {
+    let (messages, lease) = match side {
         Side::Organizer => {
             let Some(message) = za_full_request_for(tree, addresses, &entry.address) else {
                 return Ok(Outcome::Dropped);
@@ -657,29 +675,33 @@ async fn za_redeliver_entry(
                 return Ok(Outcome::Failed);
             };
             (
-                message,
+                vec![message],
                 Some(ZaUidLeaseGuard::new(server.store().clone(), lease)),
             )
         }
         // The stale check would reject a REPLY behind a pending item: the
-        // entry waits for a complete drain, unattempted.
-        Side::Attendee if incomplete => return Ok(Outcome::Waiting),
+        // entry waits, unattempted, while the drain holds back its UID.
+        Side::Attendee if held_back.holds(&entry.uid) => return Ok(Outcome::Waiting),
+        // One REPLY per local address the recorded instances are attended
+        // as: `handle_reply` matches each instance by exact string.
         Side::Attendee => {
-            let Some(message) = za_reply_from(tree, addresses, &entry.instances)
-                .and_then(|from| za_participation_reply(tree, addresses, &entry.instances, &from))
-            else {
+            let messages: Vec<_> = za_reply_addresses(tree, addresses, &entry.instances)
+                .iter()
+                .filter_map(|from| za_participation_reply(tree, addresses, &entry.instances, from))
+                .collect();
+            if messages.is_empty() {
                 return Ok(Outcome::Dropped);
-            };
-            (message, None)
+            }
+            (messages, None)
         }
     };
 
-    // Step 3: the fan-out sends only this message and retires nothing.
+    // Step 3: the fan-out sends only these messages and retires nothing.
     let fan_out = match server
         .za_fan_out(
             account_info,
             keys,
-            vec![message],
+            messages,
             pairs,
             tree,
             ZaSource {
@@ -713,9 +735,10 @@ async fn za_redeliver_entry(
                 && za_normalize_address(&status.address).as_deref() == Some(entry.address.as_str())
         })
         .map(|status| status.status);
-    // The address's status: `1.2` goes on; `3.8` is a newer refusal, which
-    // the fan-out recorded on the entry; `5.3` is no internal key account
-    // any more; `5.1` (or no status) is a failure.
+    // The address's status, the worst over the messages (`1.2` only when
+    // every one was delivered): `1.2` goes on; `3.8` is a newer refusal,
+    // which the fan-out recorded on the entry; `5.3` is no internal key
+    // account any more; `5.1` (or no status) is a failure.
     let outcome = match status {
         Some(ITIP_STATUS_DELIVERED) => None,
         Some(ITIP_STATUS_KEY_REFUSED) => Some(Outcome::Remaining),

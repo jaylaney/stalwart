@@ -47,6 +47,10 @@
 //! session, traced once, and later items of its UID wait with it; neither
 //! holds the cursor nor is re-opened in this session. A private key that
 //! does not open suspends the session's drain for good (spec 10).
+//! `contacts/pin` drains through `za_drain_settled` (key pinning spec 6.4),
+//! which runs the next pass at once, past the deferral, while a pass ends on
+//! an item's own counted failure, so a persistently failing item reaches the
+//! limit within the request; DAV requests run one pass (`za_drain`).
 //!
 //! Lease order: a drain holds its session lock and then may take a per-UID
 //! lease (an import, or a REPLY merge that fans out to delegates); the PUT
@@ -145,6 +149,43 @@ pub enum PassOutcome {
     Suspended,
 }
 
+/// A pass's error, traced by the caller.
+struct PassError {
+    err: trc::Error,
+    /// An item's own failure, counted toward `DRAIN_ITEM_FAILURE_LIMIT`
+    /// without reaching it: the item is not skipped yet, so a pass run at
+    /// once retries it (`za_drain_settled`).
+    counted: bool,
+}
+
+impl From<trc::Error> for PassError {
+    fn from(err: trc::Error) -> Self {
+        PassError {
+            err,
+            counted: false,
+        }
+    }
+}
+
+/// What a settled drain holds back from an attendee-side redelivery (key
+/// pinning spec 6.4): the UIDs of the items the session skipped, which the
+/// later items of each UID wait behind, or everything when the drain is
+/// incomplete or a skipped item named no UID.
+pub enum ZaHeldBack {
+    Uids(Vec<String>),
+    All,
+}
+
+impl ZaHeldBack {
+    /// Whether a REPLY for `uid` would be built behind a pending item.
+    pub fn holds(&self, uid: &str) -> bool {
+        match self {
+            ZaHeldBack::Uids(uids) => uids.iter().any(|held| held == uid),
+            ZaHeldBack::All => true,
+        }
+    }
+}
+
 /// An item's error with the UID it named, if the item got that far.
 struct ItemFailure {
     err: trc::Error,
@@ -160,24 +201,71 @@ pub trait ZaDrain: Sync + Send {
     /// Never fails the request (invariant 14): errors are traced here and
     /// are `LeftPending`.
     fn za_drain(&self, keys: &Arc<SessionKeys>) -> impl Future<Output = PassOutcome> + Send;
+
+    /// Key pinning spec 6.4: drains as `za_drain` does, pass after pass,
+    /// while a pass returns `More` or ends on an item's own counted failure
+    /// (an item not yet skipped), so a persistently failing item reaches
+    /// `DRAIN_ITEM_FAILURE_LIMIT` within the request and is skipped. The
+    /// first pass honours the session's deferral; the later ones are this
+    /// request's own and pass the deferral its failures set. Bounded: each
+    /// retried pass recorded a new failure of an item not yet skipped, and
+    /// an item stops counting once skipped. Any other `LeftPending`, and
+    /// `Suspended`, ends the loop and holds back everything; `Complete`
+    /// holds back the UIDs of the items the session skipped.
+    fn za_drain_settled(&self, keys: &Arc<SessionKeys>) -> impl Future<Output = ZaHeldBack> + Send;
 }
 
 impl ZaDrain for Server {
     async fn za_drain(&self, keys: &Arc<SessionKeys>) -> PassOutcome {
-        #[cfg(feature = "test_mode")]
-        if common::za::test_hooks::drain_skipped(keys.account_id) {
-            return PassOutcome::LeftPending;
-        }
-        match drain_pass(self, keys).await {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                trc::error!(
-                    err.account_id(keys.account_id)
-                        .details("zero-access: drain pass failed")
-                        .caused_by(trc::location!())
-                );
-                PassOutcome::LeftPending
+        run_pass(self, keys, true).await.0
+    }
+
+    async fn za_drain_settled(&self, keys: &Arc<SessionKeys>) -> ZaHeldBack {
+        let mut honour_deferral = true;
+        loop {
+            match run_pass(self, keys, honour_deferral).await {
+                (PassOutcome::More, _) | (PassOutcome::LeftPending, true) => {}
+                (PassOutcome::Complete, _) => break,
+                (PassOutcome::LeftPending | PassOutcome::Suspended, _) => return ZaHeldBack::All,
             }
+            honour_deferral = false;
+        }
+        // Items waiting behind a skipped one carry its UID.
+        match keys
+            .drain()
+            .lock()
+            .await
+            .skipped
+            .values()
+            .cloned()
+            .collect::<Option<Vec<String>>>()
+        {
+            Some(uids) => ZaHeldBack::Uids(uids),
+            None => ZaHeldBack::All,
+        }
+    }
+}
+
+/// One pass as `za_drain` reports it: an error is traced and is
+/// `LeftPending`, flagged when it was an item's own counted failure.
+async fn run_pass(
+    server: &Server,
+    keys: &Arc<SessionKeys>,
+    honour_deferral: bool,
+) -> (PassOutcome, bool) {
+    #[cfg(feature = "test_mode")]
+    if common::za::test_hooks::drain_skipped(keys.account_id) {
+        return (PassOutcome::LeftPending, false);
+    }
+    match drain_pass(server, keys, honour_deferral).await {
+        Ok(outcome) => (outcome, false),
+        Err(PassError { err, counted }) => {
+            trc::error!(
+                err.account_id(keys.account_id)
+                    .details("zero-access: drain pass failed")
+                    .caused_by(trc::location!())
+            );
+            (PassOutcome::LeftPending, counted)
         }
     }
 }
@@ -191,18 +279,23 @@ fn drain_retry_secs() -> u64 {
 }
 
 /// Spec 6.2-6.3: one pass under the session's lock. Nothing runs while a
-/// deferral is in force (`LeftPending`, or `Suspended` when permanent) or
-/// while the cursor is at the inbox's change id (`Complete`). The session's
-/// first pass runs the self-check first (key pinning spec 3.3), items
-/// pending or not: a private key that does not open suspends the session's
-/// drain; any other error is traced and the pass goes on.
-async fn drain_pass(server: &Server, keys: &Arc<SessionKeys>) -> trc::Result<PassOutcome> {
+/// deferral is in force (`LeftPending`, or `Suspended` when permanent;
+/// without `honour_deferral` only a permanent one counts) or while the
+/// cursor is at the inbox's change id (`Complete`). The session's first
+/// pass runs the self-check first (key pinning spec 3.3), items pending or
+/// not: a private key that does not open suspends the session's drain; any
+/// other error is traced and the pass goes on.
+async fn drain_pass(
+    server: &Server,
+    keys: &Arc<SessionKeys>,
+    honour_deferral: bool,
+) -> Result<PassOutcome, PassError> {
     let account_id = keys.account_id;
     let state = keys.drain();
     let mut pass = state.lock().await;
     let now = now();
     let retry_after = state.retry_after();
-    if retry_after > now {
+    if retry_after > now && (honour_deferral || retry_after == PERMANENT_DEFERRAL) {
         return Ok(if retry_after == PERMANENT_DEFERRAL {
             PassOutcome::Suspended
         } else {
@@ -228,7 +321,7 @@ async fn drain_pass(server: &Server, keys: &Arc<SessionKeys>) -> trc::Result<Pas
         // Spec 10: a store error before the match defers like one after it.
         Err(err) => {
             state.defer_until(now + drain_retry_secs());
-            return Err(err);
+            return Err(err.into());
         }
     }) else {
         return Ok(PassOutcome::Complete);
@@ -333,7 +426,7 @@ async fn drain_items(
     keys: &Arc<SessionKeys>,
     pending: Vec<u32>,
     pass: &mut PassState,
-) -> trc::Result<PassOutcome> {
+) -> Result<PassOutcome, PassError> {
     let account_id = keys.account_id;
     let private_key = match server.za_private_key(keys).await {
         Ok(key) => key,
@@ -346,7 +439,7 @@ async fn drain_items(
             return if keys.private_key().is_some() {
                 Ok(PassOutcome::Suspended)
             } else {
-                Err(err)
+                Err(err.into())
             };
         }
     };
@@ -374,7 +467,7 @@ async fn drain_items(
                 // A failure before the UID is known is a store error on an
                 // archive `enumerate` read: it defers the pass, uncounted.
                 if !counts {
-                    return Err(err);
+                    return Err(err.into());
                 }
                 // Only the item's own error counts: neither a busy lease
                 // (`LeftPending`) nor `Waiting` reaches this arm.
@@ -388,7 +481,7 @@ async fn drain_items(
                             .caused_by(trc::location!())
                     );
                 } else {
-                    return Err(err);
+                    return Err(PassError { err, counted: true });
                 }
             }
         }

@@ -137,21 +137,28 @@ pub fn za_participation_reply(
     })
 }
 
-/// The address `za_participation_reply` replies from: the local attendee
-/// of the first recorded instance present in `tree`, the master first.
-pub fn za_reply_from(
+/// The addresses `za_participation_reply` replies from, one REPLY each
+/// (spec 6.4 step 2): the local attendee of each recorded instance present
+/// in `tree` (the first local one, as upstream's attendee update takes it),
+/// the master first, then in instance order, each address once. Empty when
+/// the tree has no snapshot.
+pub fn za_reply_addresses(
     tree: &ICalendar,
     addresses: &[String],
     instances: &ZaInstances,
-) -> Option<String> {
-    let snapshots = itip_snapshot(tree, addresses, false).ok()?;
-    recorded_instances(&snapshots, instances)
-        .into_iter()
-        .find_map(|(_, instance)| {
-            instance
-                .local_attendee()
-                .map(|attendee| attendee.email.email.clone())
-        })
+) -> Vec<String> {
+    let Ok(snapshots) = itip_snapshot(tree, addresses, false) else {
+        return Vec::new();
+    };
+    let mut from: Vec<String> = Vec::new();
+    for (_, instance) in recorded_instances(&snapshots, instances) {
+        if let Some(attendee) = instance.local_attendee()
+            && !from.contains(&attendee.email.email)
+        {
+            from.push(attendee.email.email.clone());
+        }
+    }
+    from
 }
 
 /// Key pinning spec 5.1 item (2): an attendee's DECLINED of every instance
@@ -504,6 +511,32 @@ mod tests {
             [None, Some(A), Some(B)]
         );
         assert!(za_participation_reply(&copy, &bob(), &recorded(&[C, D, E]), BOB).is_none());
+    }
+
+    #[test]
+    fn a_reply_per_local_address() {
+        let copy = parse(COPY);
+        let every = ZaInstances {
+            master: false,
+            keys: vec![],
+            all: true,
+        };
+        let alias = "bob.alias@example.com";
+        assert_eq!(
+            za_reply_addresses(&copy, &bob(), &every),
+            [BOB, alias],
+            "the master's address first, each once"
+        );
+        assert_eq!(
+            za_reply_addresses(&copy, &bob(), &recorded(&[E, A])),
+            [BOB, alias]
+        );
+        assert_eq!(za_reply_addresses(&copy, &bob(), &recorded(&[E])), [alias]);
+        assert!(za_reply_addresses(&copy, &alice(), &every).is_empty());
+        let reply = za_participation_reply(&copy, &bob(), &recorded(&[A, E]), alias)
+            .expect("E qualifies under the alias");
+        assert_eq!(reply_instances(&reply), [Some(E)]);
+        assert_eq!(reply.from, alias);
     }
 
     #[test]

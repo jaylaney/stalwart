@@ -28,7 +28,13 @@ use crate::utils::{
         write_pin_record, writer_key, za_post, za_unpin,
     },
 };
-use ::registry::schema::{prelude::Property, structs::CalendarScheduling};
+use ::registry::{
+    schema::{
+        prelude::{ObjectType, Property},
+        structs::{CalendarScheduling, EmailAlias},
+    },
+    types::list::List,
+};
 use calcard::{
     common::IanaString,
     icalendar::{
@@ -88,6 +94,9 @@ pub async fn test(test: &mut TestServer) {
     rf_5_never_pinned(test).await;
     fr_1_waiting_entry_spends_no_budget(test).await;
     fr_2_failed_cleanup_counts_remaining(test).await;
+    pr_1_failed_entries_rotate(test).await;
+    pr_2_a_reply_per_local_address(test).await;
+    pr_3_wait_scoped_to_skipped_uids(test).await;
 }
 
 /// Spec 9 case 1: alice, who never pinned, invites bob. The fan-out pins
@@ -2978,8 +2987,9 @@ async fn rf_5_never_pinned(test: &TestServer) {
 /// drain is `remaining` without spending the call's budget, so an
 /// organizer-side entry behind it in the record is still redelivered. bob
 /// holds both for alice, his refused answer to her invitation, then his
-/// refused invitation to her; carol's invitation, whose drain commit fails,
-/// keeps the drain incomplete; the batch is one entry. With the drain
+/// refused invitation to her; carol's invitation, whose re-read fails (a
+/// failure the drain does not count, so no retry within the call skips
+/// it), keeps the drain incomplete; the batch is one entry. With the drain
 /// complete, the next call redelivers the answer.
 async fn fr_1_waiting_entry_spends_no_budget(test: &TestServer) {
     let (alice, bob, carol) = parties(test);
@@ -3047,7 +3057,7 @@ async fn fr_1_waiting_entry_spends_no_budget(test: &TestServer) {
         "the attendee-side entry ahead of the organizer-side one"
     );
     substitute_public_key(test, alice.id, &original, true).await;
-    // carol's invitation, pending in bob's inbox, fails to drain.
+    // carol's invitation, pending in bob's inbox, fails its re-read.
     let path_c = event_path(&carol, "pin-fr1c");
     carol
         .client
@@ -3062,11 +3072,11 @@ async fn fr_1_waiting_entry_spends_no_budget(test: &TestServer) {
     let pending = pending_ids(test, bob.id).await;
     assert_eq!(pending.len(), 1, "carol's invitation is pending");
     let fingerprint = display_fingerprint(&served(test, alice.id).await);
-    test_hooks::set_drain_fail_item(Some((bob.id, pending[0])));
+    test_hooks::set_drain_read_fail_item(Some((bob.id, pending[0])));
     test_hooks::set_redeliver_batch_override(Some(1));
     let reply = pin(BOB, ALICE, &fingerprint).await;
     test_hooks::set_redeliver_batch_override(None);
-    test_hooks::set_drain_fail_item(None);
+    test_hooks::set_drain_read_fail_item(None);
     assert_eq!(
         reply.expect(200),
         json!({"ok": true, "delivered": 1, "failed": 0, "dropped": 0, "remaining": 1}),
@@ -3149,6 +3159,349 @@ async fn fr_2_failed_cleanup_counts_remaining(test: &TestServer) {
     // Cleanup.
     delete_event(&alice, &path).await;
     clear_recipient(test, &bob, &bob_start, "pin-fr2").await;
+}
+
+/// bob's second address in `pr_2`, on a domain of its own.
+const BOB_ALIAS: &str = "key2@pin-alias.test";
+
+/// PR #40 review P2-1 (spec 6.4 step 5): an entry that fails on every call
+/// moves to the end of the record in the cleanup write, so the next call
+/// reaches the entry behind it. alice holds two organizer-side entries for
+/// bob: a refused update whose full REQUEST exceeds the inbound size limit
+/// (a 2700-byte DESCRIPTION, as case 11's failed full state), then a plain
+/// refused update; the batch is one entry.
+async fn pr_1_failed_entries_rotate(test: &TestServer) {
+    let (alice, bob, _) = parties(test);
+    let admin = test.account("admin@example.com").clone();
+    let bob_start = inbox_ids(test, bob.id).await;
+    let (path_a, path_b) = (
+        event_path(&alice, "pin-pr1a"),
+        event_path(&alice, "pin-pr1b"),
+    );
+    for (path, uid) in [(&path_a, "pin-pr1a"), (&path_b, "pin-pr1b")] {
+        alice
+            .client
+            .request_with_headers("PUT", path, [CONTENT_TYPE], invite(uid, START_A, &[BOB]))
+            .await
+            .with_status(StatusCode::CREATED);
+    }
+    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+    let original = substitute_public_key(test, bob.id, &writer_key(), true).await;
+    let description = format!("DESCRIPTION:{}\r\n", "pin-pr1a ".repeat(300));
+    assert_eq!(
+        rewrite(&alice.client, &path_a, |body| body.replacen(
+            "SUMMARY:fo-title pin-pr1a\r\n",
+            &format!("SUMMARY:fo-title pin-pr1a\r\n{description}"),
+            1
+        ))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        rewrite(&alice.client, &path_b, |body| body
+            .replace("fo-title pin-pr1b", "fo-title pin-pr1b v2"))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    substitute_public_key(test, bob.id, &original, true).await;
+    let (id_a, id_b) = (
+        document_id_of(test, alice.id, &path_a).await,
+        document_id_of(test, alice.id, &path_b).await,
+    );
+    let documents = |entries: Vec<ZaWithheld>| -> Vec<u32> {
+        entries.iter().map(|entry| entry.document_id).collect()
+    };
+    assert_eq!(documents(withheld(test, alice.id, BOB).await), [id_a, id_b]);
+    let fingerprint = display_fingerprint(&served(test, bob.id).await);
+    // The first entry's full REQUEST carries the DESCRIPTION; the second's
+    // does not.
+    admin
+        .registry_update_setting(
+            CalendarScheduling {
+                itip_max_size: 1500,
+                ..Default::default()
+            },
+            &[Property::ItipMaxSize],
+        )
+        .await;
+    admin.reload_settings().await;
+    test_hooks::set_redeliver_batch_override(Some(1));
+    let first = pin(ALICE, BOB, &fingerprint).await;
+    let rotated = documents(withheld(test, alice.id, BOB).await);
+    let second = pin(ALICE, BOB, &fingerprint).await;
+    test_hooks::set_redeliver_batch_override(None);
+    admin
+        .registry_update_setting(CalendarScheduling::default(), &[Property::ItipMaxSize])
+        .await;
+    admin.reload_settings().await;
+    assert_eq!(
+        first.expect(200),
+        json!({"ok": true, "delivered": 0, "failed": 1, "dropped": 0, "remaining": 1})
+    );
+    assert_eq!(
+        rotated,
+        [id_b, id_a],
+        "the failed entry moved behind the other"
+    );
+    assert_eq!(
+        second.expect(200),
+        json!({"ok": true, "delivered": 1, "failed": 0, "dropped": 0, "remaining": 1}),
+        "the next call reaches the entry behind the failing one"
+    );
+    assert_eq!(
+        documents(withheld(test, alice.id, BOB).await),
+        [id_a],
+        "the failing entry stays withheld"
+    );
+
+    // Cleanup.
+    delete_event(&alice, &path_a).await;
+    delete_event(&alice, &path_b).await;
+    drop_entries(ALICE, BOB).await;
+    clear_recipient(test, &bob, &bob_start, "pin-pr1a").await;
+    clear_recipient(test, &bob, &bob_start, "pin-pr1b").await;
+}
+
+/// PR #40 review P2-2 (spec 6.4 step 2): one attendee-side entry holding
+/// answers given from two local addresses is redelivered as one REPLY per
+/// address. bob, given a second address, attends alice's daily event as
+/// `key2@example.com` on the master and as the alias on override X; his
+/// ACCEPTED on the master and his TENTATIVE on X are refused into one
+/// entry. After `contacts/pin`, alice has both answers and the entry is
+/// retired.
+async fn pr_2_a_reply_per_local_address(test: &TestServer) {
+    let (alice, bob, _) = parties(test);
+    let admin = test.account("admin@example.com").clone();
+    let (alice_start, bob_start) = (
+        inbox_ids(test, alice.id).await,
+        inbox_ids(test, bob.id).await,
+    );
+    let domain_id = admin.find_or_create_domain("pin-alias.test").await;
+    let bob_account = test.account(BOB).id();
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            bob_account,
+            json!({
+                Property::Aliases: List::from_iter([EmailAlias {
+                    name: "key2".to_string(),
+                    domain_id,
+                    enabled: true,
+                    description: None,
+                }]),
+            }),
+        )
+        .await;
+    assert!(
+        test.server
+            .account_info(bob.id)
+            .await
+            .unwrap()
+            .addresses()
+            .iter()
+            .any(|address| address == BOB_ALIAS),
+        "bob's addresses include the alias"
+    );
+    // bob pins alice first.
+    write_pin_record(
+        test,
+        bob.id,
+        STRONG,
+        &record_pinning(ALICE, served(test, alice.id).await),
+    )
+    .await;
+    let path = event_path(&alice, "pin-pr2");
+    alice
+        .client
+        .request_with_headers(
+            "PUT",
+            &path,
+            [CONTENT_TYPE],
+            recurring_invite("pin-pr2", &[BOB], &[BOB_ALIAS]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+    let copy = copy_href(test, bob.id, "pin-pr2").await;
+    assert_eq!(
+        partstat_in(&bob.client, &copy, Some(X), BOB_ALIAS)
+            .await
+            .as_deref(),
+        Some("NEEDS-ACTION"),
+        "bob holds X under the alias"
+    );
+    let original = substitute_public_key(test, alice.id, &writer_key(), true).await;
+    assert_eq!(
+        rewrite(&bob.client, &copy, |body| with_bob_partstat(
+            &body,
+            Scope::Master,
+            "ACCEPTED"
+        ))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        rewrite(&bob.client, &copy, |body| edit_attendee(
+            &body,
+            BOB_ALIAS,
+            Scope::Overrides,
+            |line| Some(with_partstat(line, "TENTATIVE"))
+        ))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let entries = withheld(test, bob.id, ALICE).await;
+    assert_eq!(entries.len(), 1, "both answers in one entry");
+    assert!(
+        entries[0].instances.master && entries[0].instances.keys.len() == 1,
+        "the entry records the master and X"
+    );
+    substitute_public_key(test, alice.id, &original, true).await;
+    let fingerprint = display_fingerprint(&served(test, alice.id).await);
+    assert_eq!(
+        pin(BOB, ALICE, &fingerprint).await.expect(200),
+        json!({"ok": true, "delivered": 1, "failed": 0, "dropped": 0, "remaining": 0})
+    );
+    assert!(withheld(test, bob.id, ALICE).await.is_empty());
+    assert_eq!(trigger_drain(ALICE, STRONG).await, 207);
+    assert_eq!(
+        partstat_in(&alice.client, &path, None, BOB)
+            .await
+            .as_deref(),
+        Some("ACCEPTED"),
+        "the master's answer, from the primary address"
+    );
+    assert_eq!(
+        partstat_in(&alice.client, &path, Some(X), BOB_ALIAS)
+            .await
+            .as_deref(),
+        Some("TENTATIVE"),
+        "X's answer, from the alias"
+    );
+
+    // Cleanup.
+    delete_event(&alice, &path).await;
+    alice.delete_items_since(test, &alice_start).await;
+    clear_recipient(test, &bob, &bob_start, "pin-pr2").await;
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            bob_account,
+            json!({ Property::Aliases: List::<EmailAlias>::from_iter([]) }),
+        )
+        .await;
+}
+
+/// PR #40 review P2-3 (spec 6.4, the drain): a pending item that fails on
+/// every attempt is retried within the call until the drain skips it, and
+/// only the attendee-side entries of its UID wait; a failure the drain does
+/// not count (the item's re-read) holds every attendee-side entry back. bob
+/// holds two refused answers for alice, to X and to Y; alice's update of
+/// X is pending in bob's inbox.
+async fn pr_3_wait_scoped_to_skipped_uids(test: &TestServer) {
+    let (alice, bob, _) = parties(test);
+    let (alice_start, bob_start) = (
+        inbox_ids(test, alice.id).await,
+        inbox_ids(test, bob.id).await,
+    );
+    // bob pins alice first.
+    write_pin_record(
+        test,
+        bob.id,
+        STRONG,
+        &record_pinning(ALICE, served(test, alice.id).await),
+    )
+    .await;
+    let (path_x, path_y) = (
+        event_path(&alice, "pin-pr3x"),
+        event_path(&alice, "pin-pr3y"),
+    );
+    for (path, uid) in [(&path_x, "pin-pr3x"), (&path_y, "pin-pr3y")] {
+        alice
+            .client
+            .request_with_headers("PUT", path, [CONTENT_TYPE], invite(uid, START_A, &[BOB]))
+            .await
+            .with_status(StatusCode::CREATED);
+    }
+    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+    let original = substitute_public_key(test, alice.id, &writer_key(), true).await;
+    for uid in ["pin-pr3x", "pin-pr3y"] {
+        let copy = copy_href(test, bob.id, uid).await;
+        assert_eq!(
+            rewrite(&bob.client, &copy, |body| with_bob_partstat(
+                &body,
+                Scope::Master,
+                "ACCEPTED"
+            ))
+            .await,
+            StatusCode::NO_CONTENT
+        );
+    }
+    let uids = |entries: Vec<ZaWithheld>| -> Vec<String> {
+        entries.into_iter().map(|entry| entry.uid).collect()
+    };
+    assert_eq!(
+        uids(withheld(test, bob.id, ALICE).await),
+        ["pin-pr3x", "pin-pr3y"]
+    );
+    substitute_public_key(test, alice.id, &original, true).await;
+    assert_eq!(
+        rewrite(&alice.client, &path_x, |body| body
+            .replace("fo-title pin-pr3x", "fo-title pin-pr3x v2"))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let pending = pending_ids(test, bob.id).await;
+    assert_eq!(pending.len(), 1, "alice's update of X is pending");
+    let fingerprint = display_fingerprint(&served(test, alice.id).await);
+
+    // A failure the drain does not count: both answers wait.
+    test_hooks::set_drain_read_fail_item(Some((bob.id, pending[0])));
+    let reply = pin(BOB, ALICE, &fingerprint).await;
+    test_hooks::set_drain_read_fail_item(None);
+    assert_eq!(
+        reply.expect(200),
+        json!({"ok": true, "delivered": 0, "failed": 0, "dropped": 0, "remaining": 2}),
+        "an incomplete drain holds back every answer"
+    );
+
+    // A failure that counts: retried within the call until skipped; only
+    // X's answer waits.
+    test_hooks::set_drain_fail_item(Some((bob.id, pending[0])));
+    let reply = pin(BOB, ALICE, &fingerprint).await;
+    test_hooks::set_drain_fail_item(None);
+    assert_eq!(
+        reply.expect(200),
+        json!({"ok": true, "delivered": 1, "failed": 0, "dropped": 0, "remaining": 1}),
+        "Y's answer is redelivered, X's waits behind the skipped update"
+    );
+    assert_eq!(
+        uids(withheld(test, bob.id, ALICE).await),
+        ["pin-pr3x"],
+        "X's answer stays withheld"
+    );
+    assert_eq!(
+        pending_ids(test, bob.id).await,
+        pending,
+        "the update stays pending"
+    );
+    assert_eq!(trigger_drain(ALICE, STRONG).await, 207);
+    assert_eq!(
+        partstat_of(&alice.client, &path_y, BOB).await.as_deref(),
+        Some("ACCEPTED")
+    );
+    assert_eq!(
+        partstat_of(&alice.client, &path_x, BOB).await.as_deref(),
+        Some("NEEDS-ACTION")
+    );
+
+    // Cleanup.
+    delete_event(&alice, &path_x).await;
+    delete_event(&alice, &path_y).await;
+    alice.delete_items_since(test, &alice_start).await;
+    clear_recipient(test, &bob, &bob_start, "pin-pr3x").await;
+    clear_recipient(test, &bob, &bob_start, "pin-pr3y").await;
+    drop_entries(BOB, ALICE).await;
 }
 
 /// alice, bob and carol, in that order.
