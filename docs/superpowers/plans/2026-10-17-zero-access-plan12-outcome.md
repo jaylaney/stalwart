@@ -5,7 +5,7 @@ Plan 12 builds the server side of key pinning (spec `2026-10-17-zero-access-key-
 
 ## Where things stand
 
-- Commits on `plan12-key-pinning`, cut from `key-pinning-spec` at `f2ece889` (the plan, on top of the spec at `eb219e60`). Not pushed.
+- Commits on `plan12-key-pinning`, cut from `key-pinning-spec` at `f2ece889` (the plan, on top of the spec at `eb219e60`). Pushed to `origin` through `8a2e83e8` as PR #40 (https://github.com/jaylaney/stalwart/pull/40, base `main`); the PR #40 review's commits after it are local.
   - Task 1 `6c2cd598` (fingerprints, wrap marks, the sealed pin record, field 151);
   - Task 2 `d839411c` (the common vault commit helper, pin-record reads and conditional writes), fix round `5c98116c` (one vault batch writer, both assertions before both sets, no record under a neither mark);
   - Task 3 `7c6b6b2f` (the self-check on every session's first drain pass);
@@ -15,8 +15,8 @@ Plan 12 builds the server side of key pinning (spec `2026-10-17-zero-access-key-
   - Task 7 `589d5485` (the full state before upstream's messages, the deletion's retirement), fix round `a84f7cf0` (the decline's organizer joins the recipients only when routed, a NEEDS-ACTION decline test, case 13d's retirement);
   - Task 8 `49447c1f` (the leak scan of pin records, pin records under key-mode `webdav_tests`, manual checklist item 15, CLAUDE.md), then the commit of this note (`043fe685`);
   - the final review's fix wave (see "Final review"): `43b93399` (redelivery's budget and cleanup counts, the `withheld` helper, the redelivery batch override), then the commit of this note's final-review update.
-  - PR #40's review round (see "PR #40 review"): `5eae6467` (failed entries rotate, a REPLY per local address, drain retries to the skip limit with the wait scoped to skipped UIDs; spec 6.4 amended), then the commit of that section.
-  - In `jaylaney/circulo-account`: `8e8d6d4` "Contract: the contacts endpoints (key pinning)", `docs/api.md` only, on branch `contacts-api` cut from `main` at `97b5fb6`; then the fix wave's `940dd5d` "Contract: contacts/pin retry guidance and its losses", `docs/api.md` only; then PR #40's review round's `cadaa4d` "Contract: contacts/pin rotates failed entries, replies per address, scoped waits", `docs/api.md` only. Not pushed, no pull request.
+  - PR #40's review round (see "PR #40 review"): `5eae6467` (failed entries rotate, a REPLY per local address, drain retries to the skip limit with the wait scoped to skipped UIDs; spec 6.4 amended), then the commit of that section; its fix round 1, `a64dd963` (the wait after step 1 in spec 6.4, tests for the rotation's identity and a failed cleanup), then the commit of its note.
+  - In `jaylaney/circulo-account`: `8e8d6d4` "Contract: the contacts endpoints (key pinning)", `docs/api.md` only, on branch `contacts-api` cut from `main` at `97b5fb6`; then the fix wave's `940dd5d` "Contract: contacts/pin retry guidance and its losses", `docs/api.md` only; then PR #40's review round's `cadaa4d` "Contract: contacts/pin rotates failed entries, replies per address, scoped waits" and its fix round 1's `a114529` "Contract: contacts/pin, waiting events and failed checks", `docs/api.md` only. Not pushed, no pull request.
 - The suites run in Task 8 Step 7 on `49447c1f`, in order, one at a time:
   - The formatting check (`cargo fmt -p <crate> -- --check` for `vault`, `types`, `common`, `groupware`, `dav` and `tests`; `cargo fmt --manifest-path crates/http/Cargo.toml -- --check`): clean (1 s each).
   - The per-task compile check (`cargo check -p stalwart --no-default-features --features rocks`, filtered to the fork's files): `clean`; the upstream warning totals unchanged (`store` 1, `common` 18, `jmap` 3, `services` 2) (254 s).
@@ -36,7 +36,7 @@ Plan 12 builds the server side of key pinning (spec `2026-10-17-zero-access-key-
   - the self-check on every session's first drain pass and at the start of every contacts endpoint;
   - `POST /api/vault/contacts`, `contacts/lookup`, `contacts/pin` (pin, drain, redeliver up to 32 entries, guarded cleanup) and `contacts/forget`;
   - the hooks `PIN_DECIDE_PAUSE`, `RETIRE_PAUSE`, `PIN_WRITE_FAIL_ONCE`, `REDELIVER_CLEANUP_PAUSE`, and from the final review the redelivery batch override (`test_hooks::set_redeliver_batch_override`), with `PIN_WRITE_FAIL_ONCE` also reaching `contacts/pin`'s step 5;
-  - the za module `pinning` (cases 1-21, then `rf_1`-`rf_5`, then the final review's `fr_1` and `fr_2`, then PR #40's review's `pr_1`-`pr_3`), `leak::test_pins`, the key-mode `scheduling` variant's pin-record assertion, and unit tests in `vault` (`keys`, `pins`), `common` (`auth::vault`) and `groupware` (`fanout`, `pinning`, `sequence`).
+  - the za module `pinning` (cases 1-21, then `rf_1`-`rf_5`, then the final review's `fr_1` and `fr_2`, then PR #40's review's `pr_1`-`pr_4`), `leak::test_pins`, the key-mode `scheduling` variant's pin-record assertion, and unit tests in `vault` (`keys`, `pins`), `common` (`auth::vault`) and `groupware` (`fanout`, `pinning`, `sequence`).
 
 ## What changed and why
 
@@ -306,7 +306,7 @@ Each finding's disposition:
 
 ## PR #40 review
 
-Jay's source review of `8a2e83e8` (PR #40) raised three P2 findings, all in `contacts/pin`'s drain and redelivery (`crates/http/src/api/contacts.rs`, spec 6.4). Each offered two remedies; the controller chose one per finding (the ledger's "PR #40: Ruling" line). The code commit `5eae6467` (code, tests and spec 6.4; the verification and kill checks below ran against it), then the commit of this section. In `jaylaney/circulo-account`, `cadaa4d` "Contract: contacts/pin rotates failed entries, replies per address, scoped waits", `docs/api.md` only, on `contacts-api` after `940dd5d`. Nothing pushed.
+Jay's source review of `8a2e83e8` (PR #40) raised three P2 findings, all in `contacts/pin`'s drain and redelivery (`crates/http/src/api/contacts.rs`, spec 6.4). Each offered two remedies; the controller chose one per finding (the ledger's "PR #40: Ruling" line). The code commit `5eae6467` (code, tests and spec 6.4; the verification and kill checks below ran against it), then the commit of this section. In `jaylaney/circulo-account`, `cadaa4d` "Contract: contacts/pin rotates failed entries, replies per address, scoped waits", `docs/api.md` only, on `contacts-api` after `940dd5d`. Nothing in this round is pushed.
 
 ### The three findings
 
@@ -354,3 +354,22 @@ The logs and mutant diffs are in the implementer's scratchpad (`pr40/kill/`), no
 
 - F2 and F8 resolved here (they leave "Open spec questions" and the deferred list above, with pointers). The fix-wave re-review's out-of-scope starvation note is resolved by P2-1. Its residuals R1 (api.md's `failed` row said "not delivered in this call", false when step 4's reseal errs after delivery) and R3 (waiting entries described as not attempted, though step 1's drops run first and spend a slot) are fixed in Circulo's `cadaa4d`, this round's api.md change, ahead of the Circulo contacts plan the final review had carried them to.
 - Everything else the earlier reviews deferred is unchanged by this round.
+
+### Fix round 1
+
+The review of `8a2e83e8..cf740f63` (and Circulo `940dd5d..cadaa4d`) found all three findings addressed, with no Critical or Important finding and 8 Minor. The controller's ruling took Minor 1 with the out-of-scope `failed` row, Minor 6, Minor 5(a), Minor 5(c) and this note's stale "Not pushed" line. The code commit `a64dd963` (spec and tests only; the product code is unchanged since `5eae6467`), then the commit of this subsection; Circulo `a114529` "Contract: contacts/pin, waiting events and failed checks".
+
+- Spec 6.4 (Minor 1): an attendee-side entry waits only once it passes step 1. The drain paragraph now says every attendee-side entry that passes step 1 counts as `remaining` (unattempted, outside the 32), and that step 1 runs before the wait either way: an entry it drops is `dropped`, one whose archive read or unseal errs is `failed`, and both spend one of the 32. The `remaining` row says "an attendee-side entry that passes step 1 and the drain holds back". The `failed` row's "When" column now lists step 1's archive read or unseal error and step 4's reseal error after the delivery (the contact may already hold the state; the next call resends it), beside the busy lease and the item write failure.
+- Circulo `docs/api.md` (Minor 6): the "After pinning" paragraph says step 1's checks (the event still exists with the same UID, still names the contact as its organizer, the scheduling preconditions) run before an attended event can wait; only an event they drop (`dropped`) or whose stored copy cannot be read (`failed`, moved behind the others) counts toward the 32, and a waiting event is never dropped for "no answered occurrence still exists and qualifies", which is checked only once it no longer waits.
+- Tests (Minor 5(a), 5(c)), `tests/src/za/pinning.rs`: `pr_4_rotation_identity_and_failed_cleanup` after `pr_3`, on `oversize_ahead`, the setup now shared with `pr_1` (an oversize refused update ahead of a plain one; `pr_1`'s assertions unchanged), with the batch at one entry. (a) `contacts/pin` parked at `REDELIVER_CLEANUP_PAUSE` after the first entry failed; alice's edit re-arms that entry with bob's key substituted; released, the call answers failed 1, remaining 1 and the re-armed entry keeps its place. (b) Parked again, `PIN_WRITE_FAIL_ONCE` set while parked (as `fr_2` does) fails the cleanup of a call with only a failure: failed 1, remaining 1, and the record order is unchanged.
+- Kill checks, against `a64dd963`, each restored with `git checkout -- crates/` and followed by an empty `git status --short crates/`: the rotation's identity check removed (`&& current.refusal_id == entry.refusal_id`, `crates/http/src/api/contacts.rs:606`) fails `tests/src/za/pinning.rs:3522:5`, `the re-armed entry keeps its place` (left the second entry first); a failed cleanup retried as a rotation-only write (a second `za_pin_transact` with `za_cleanup(state, address, &[], &failed)` in the failure branch) fails `pinning.rs:3531:5`, `a failed cleanup moves nothing` (left the second entry first).
+- Verification on `a64dd963`, one at a time: the formatting check (`http`, `tests`, `groupware`) clean; the per-task compile check `clean`, the upstream warning totals unchanged (`store` 1, `common` 18, `jmap` 3, `services` 2); `cargo check -p tests --tests` with no warnings; `za_tests` 1 passed in 86.46 s (leak scan: 4015 records, 54 archives, 8 blobs, 988 search index records (644 of the account, none calendar), 5 events, 3 calendars, 4 items, 4 emails; negative control caught 29 violations); with `BLOB_STORE=FileSystem` 1 passed in 84.37 s (leak scan: 4032 records, 52 archives, 8 blobs, 988 search index records; negative control caught 29 violations); `webdav_tests` 1 passed in 18.17 s, `cal_itip` on the first run; with `ZA_KEY_ACCOUNTS=1` 1 passed in 21.99 s.
+- This note: the stale "Not pushed" line under "Where things stand" now says the branch is pushed through `8a2e83e8` as PR #40 and this review's commits are local.
+
+Deferred by the controller's ruling (the ledger's `PR #40: minor (deferred)` line, in substance):
+- Minor 2: an untokened alias REPLY makes a mixed `1.2` + `5.3` entry `dropped`, with `3.8` left on the copy; filtering the REPLYs to addresses holding a token is the fix if wanted.
+- Minor 3: a failing item's side effects repeat up to three times per call (about two extra passes per failing item), with no cap.
+- Minor 4: a delivered REPLY is resent on every call while its sibling fails.
+- Minor 5(b): the `None` to `All` arm (a skipped item with an unknown UID) has no separate kill check; such an item may not be constructible.
+- Minor 7: a cleanup failure on a rotation-only write traces "withheld entries not retired"; the spec fixes the string.
+- Minor 8: the api.md stop rule after a failed cleanup write.
