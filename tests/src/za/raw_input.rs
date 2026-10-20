@@ -26,7 +26,7 @@ use tokio_rustls::{
     rustls::{self, pki_types::ServerName},
 };
 use trc::{
-    Collector, EventType, ImapEvent, Key, ManageSieveEvent, Pop3Event, SmtpEvent,
+    AuthEvent, Collector, EventType, ImapEvent, Key, ManageSieveEvent, Pop3Event, SmtpEvent,
     ipc::subscriber::{Interests, SubscriberBuilder},
 };
 
@@ -47,6 +47,12 @@ pub const SUBMISSION_PORT: u16 = 4465;
 const IMAP_CONTROL: &str = "rawimapctl";
 const SIEVE_CONTROL: &str = "rawsievectl";
 const SMTP_CONTROL: &str = "rawsmtpctl.test";
+/// Sent after the line answering the MFA 334: traced, as the 334's masking
+/// ends with that line.
+const MFA_CONTROL: &str = "rawmfactl";
+/// A static diagnostic written before authentication (STARTTLS on an
+/// implicit-TLS port): it quotes no input and stays readable.
+const STATIC_DIAGNOSTIC: &str = "Already in TLS mode.";
 const MARKER: &str = "[redacted]";
 
 /// The SASL PLAIN message of `NAME` and `secret`, base64-encoded.
@@ -140,6 +146,7 @@ async fn imap(secret: &str) {
         conn.until(&["* OK"]).await;
         match flow {
             0 => {
+                conn.exchange("a9 STARTTLS\r\n", "a9 ").await;
                 conn.exchange(&format!("a1 LOGIN \"{NAME}\" \"{secret}\"\r\n"), "a1 OK")
                     .await
             }
@@ -199,15 +206,29 @@ async fn imap(secret: &str) {
 }
 
 /// USER and PASS, then AUTH PLAIN with the initial response and with a
-/// continuation; a post-authentication NOOP is the control.
+/// continuation; then USER, PASS and an AUTH whose mechanism is base64 of
+/// the secret, in one write (its parse error, quoting the mechanism, is
+/// written after the login); a post-authentication NOOP is the control.
+/// The first session sends STLS first, for the static diagnostic.
 async fn pop3(secret: &str) {
-    for flow in 0..3 {
+    for flow in 0..4 {
         let mut conn = Conn::open(POP3_PORT).await;
         conn.until(&["+OK"]).await;
         match flow {
             0 => {
+                conn.exchange("STLS\r\n", "-ERR").await;
                 conn.exchange(&format!("USER {NAME}\r\n"), "+OK").await;
                 conn.exchange(&format!("PASS {secret}\r\n"), "+OK").await;
+            }
+            3 => {
+                conn.send(&format!(
+                    "USER {NAME}\r\nPASS {secret}\r\nAUTH {}\r\n",
+                    STANDARD.encode(secret)
+                ))
+                .await;
+                conn.until(&["+OK"]).await;
+                conn.until(&["+OK"]).await;
+                conn.until(&["-ERR"]).await;
             }
             1 => {
                 conn.exchange(&format!("AUTH PLAIN {}\r\n", plain(secret)), "+OK")
@@ -224,11 +245,34 @@ async fn pop3(secret: &str) {
     }
 }
 
-/// AUTHENTICATE PLAIN with the initial response; a post-authentication
-/// HAVESPACE is the control.
-async fn sieve(secret: &str) {
+/// AUTHENTICATE PLAIN with the initial response, after STARTTLS (the static
+/// diagnostic) and an AUTHENTICATE whose mechanism is the base64 secret
+/// (refused without quoting it); a post-authentication HAVESPACE is the
+/// control. With `pipelined`, a second session sends the response pipelined
+/// ahead of the continuation (parsed as a command, refused), then answers
+/// the continuation.
+async fn sieve(secret: &str, pipelined: bool) {
+    if pipelined {
+        let mut conn = Conn::open(SIEVE_PORT).await;
+        conn.until(&["OK"]).await;
+        conn.send(&format!(
+            "AUTHENTICATE \"PLAIN\"\r\n\"{}\"\r\n",
+            plain(secret)
+        ))
+        .await;
+        conn.until(&["{0}"]).await;
+        conn.exchange(&format!("\"{}\"\r\n", plain(secret)), "OK")
+            .await;
+        conn.exchange("LOGOUT\r\n", "OK").await;
+    }
     let mut conn = Conn::open(SIEVE_PORT).await;
     conn.until(&["OK"]).await;
+    conn.exchange("STARTTLS\r\n", "NO").await;
+    conn.exchange(
+        &format!("AUTHENTICATE \"{}\"\r\n", STANDARD.encode(secret)),
+        "NO",
+    )
+    .await;
     conn.exchange(
         &format!("AUTHENTICATE \"PLAIN\" \"{}\"\r\n", plain(secret)),
         "OK",
@@ -255,14 +299,15 @@ async fn split_writes(conn: &mut Conn, writes: &[String], expected: &str) {
 /// The SMTP logins: AUTH PLAIN; AUTH LOGIN; an AUTH PLAIN line split across
 /// two writes and across three (`AU` / `TH PLAIN <head>` / `<tail>`); EHLO
 /// and AUTH PLAIN pipelined in one write; a lower-case `auth` after a
-/// space; and an AUTH command that starts mid-line, after a BDAT chunk.
+/// space; `AUTH`, a form feed and `PLAIN`; and an AUTH command that starts
+/// mid-line, after a BDAT chunk.
 /// Returns the writes that must each be a masked read of their own.
 /// The EHLO before each login is the control.
 async fn smtp(secret: &str) -> Vec<String> {
     let response = plain(secret);
     let (head, tail) = response.split_at(response.len() / 2);
     let mut own_reads = Vec::new();
-    for flow in 0..7 {
+    for flow in 0..8 {
         let mut conn = Conn::open_smtp().await;
         if flow != 4 {
             conn.send(&format!("EHLO {SMTP_CONTROL}\r\n")).await;
@@ -305,6 +350,11 @@ async fn smtp(secret: &str) -> Vec<String> {
                 conn.exchange(&format!(" auth plain {response}\r\n"), "235")
                     .await
             }
+            6 => {
+                // A form feed is a stop character of the command parser.
+                conn.exchange(&format!("AUTH\x0CPLAIN {response}\r\n"), "235")
+                    .await
+            }
             _ => {
                 // Mid-line: the refused BDAT's 5-byte chunk ends where the
                 // AUTH command starts, inside the line.
@@ -334,6 +384,8 @@ async fn smtp_mfa(answer: &str) -> Vec<String> {
     let writes = vec![head.to_string(), format!("{tail}\r\n")];
     // Parsed as a command once the exchange is left: refused.
     split_writes(&mut conn, &writes, "5").await;
+    conn.exchange(&format!("NOOP {MFA_CONTROL}\r\n"), "250")
+        .await;
     conn.exchange("QUIT\r\n", "221").await;
     writes
 }
@@ -377,8 +429,13 @@ pub async fn test(test: &mut TestServer) {
         EventType::Imap(ImapEvent::Error),
         EventType::Pop3(Pop3Event::RawInput),
         EventType::Pop3(Pop3Event::RawOutput),
+        EventType::Pop3(Pop3Event::Error),
         EventType::ManageSieve(ManageSieveEvent::RawInput),
         EventType::ManageSieve(ManageSieveEvent::RawOutput),
+        EventType::ManageSieve(ManageSieveEvent::Error),
+        EventType::Auth(AuthEvent::Error),
+        EventType::Auth(AuthEvent::Failed),
+        EventType::Auth(AuthEvent::MfaRequired),
         EventType::Smtp(SmtpEvent::RawInput),
         EventType::Smtp(SmtpEvent::RawOutput),
     ];
@@ -398,7 +455,8 @@ pub async fn test(test: &mut TestServer) {
     for secret in [PASSWORD, app_password.as_str()] {
         imap(secret).await;
         pop3(secret).await;
-        sieve(secret).await;
+        // Once: each pipelined response counts toward the scanner ban.
+        sieve(secret, secret == PASSWORD).await;
         own_reads.extend(smtp(secret).await);
         let response = plain(secret);
         let (head, tail) = response.split_at(response.len() / 2);
@@ -488,6 +546,35 @@ pub async fn test(test: &mut TestServer) {
     assert!(
         inputs(EventType::Imap(ImapEvent::Error)).any(|(_, values)| values.contains(MARKER)),
         "no redacted IMAP parse error captured"
+    );
+    // The queued POP3 parse error quoting the mechanism was traced redacted,
+    // though written after the login.
+    assert!(
+        inputs(EventType::Pop3(Pop3Event::Error)).any(|(_, values)| values.contains(MARKER)),
+        "no redacted POP3 parse error captured"
+    );
+    // ManageSieve refused the base64 mechanism without quoting it.
+    assert!(
+        inputs(EventType::Auth(AuthEvent::Error))
+            .any(|(_, values)| values.contains("Authentication mechanism not supported.")),
+        "no ManageSieve mechanism refusal captured"
+    );
+    // Static pre-authentication diagnostics stay readable.
+    for event_type in [
+        EventType::Imap(ImapEvent::Error),
+        EventType::Pop3(Pop3Event::Error),
+        EventType::ManageSieve(ManageSieveEvent::Error),
+    ] {
+        assert!(
+            inputs(event_type).any(|(_, values)| values.contains(STATIC_DIAGNOSTIC)),
+            "the static diagnostic of {event_type:?} was redacted"
+        );
+    }
+    // The 334's masking ended with the line answering it.
+    assert!(
+        inputs(EventType::Smtp(SmtpEvent::RawInput))
+            .any(|(_, values)| values.contains(MFA_CONTROL)),
+        "the command after the MFA answer was not traced"
     );
     // Positive controls: raw input outside the exchange is still traced.
     assert!(

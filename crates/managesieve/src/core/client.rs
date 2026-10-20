@@ -245,12 +245,13 @@ impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
 
     pub async fn write_error(&mut self, error: trc::Error) -> trc::Result<()> {
         let bytes = error.serialize();
-        // Issue #20: before authentication a protocol error can echo client
-        // input (a command name), so its trace redacts it. The receiver's
-        // errors are IMAP events.
+        // Issue #20: before authentication a syntax error can quote client
+        // input (a command name), so its trace redacts it. Those are the
+        // receiver's BAD errors, IMAP events; static diagnostics stay
+        // readable.
         let error = if matches!(self.state, State::NotAuthenticated { .. })
-            && (error.matches(trc::EventType::Imap(trc::ImapEvent::Error))
-                || error.matches(trc::EventType::ManageSieve(trc::ManageSieveEvent::Error)))
+            && error.matches(trc::EventType::Imap(trc::ImapEvent::Error))
+            && error.value_as_str(trc::Key::Type) == Some("BAD")
         {
             error.redact(&[trc::Key::Details, trc::Key::Id])
         } else {

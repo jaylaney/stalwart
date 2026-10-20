@@ -151,13 +151,19 @@ impl<T: SessionStream> Session<T> {
 
 impl<T: SessionStream> Session<T> {
     pub async fn write_bytes(&mut self, bytes: impl AsRef<[u8]>) -> trc::Result<()> {
+        self.write_bytes_masked(bytes, false).await
+    }
+
+    /// Issue #20: `mask` traces the bytes as the marker also after
+    /// authentication (a queued error quoting input read before it).
+    async fn write_bytes_masked(&mut self, bytes: impl AsRef<[u8]>, mask: bool) -> trc::Result<()> {
         let bytes = bytes.as_ref();
 
         trc::event!(
             Pop3(trc::Pop3Event::RawOutput),
             SpanId = self.session_id,
             Size = bytes.len(),
-            Contents = if matches!(self.state, State::NotAuthenticated { .. }) {
+            Contents = if mask || matches!(self.state, State::NotAuthenticated { .. }) {
                 trc::Value::redacted()
             } else {
                 trc::Value::from_maybe_string(bytes)
@@ -188,18 +194,19 @@ impl<T: SessionStream> Session<T> {
         let response = err.serialize();
         let write_err = err.should_write_err();
 
-        // Issue #20: before authentication a protocol error can echo client
-        // input (an unsupported mechanism), so its trace redacts it.
-        let err = if matches!(self.state, State::NotAuthenticated { .. })
-            && err.matches(trc::EventType::Pop3(trc::Pop3Event::Error))
-        {
+        // Issue #20: a BAD error is a parse error of input read before
+        // authentication (`ingest`), which can quote it: its traces are
+        // masked. Static diagnostics stay readable.
+        let mask = err.matches(trc::EventType::Pop3(trc::Pop3Event::Error))
+            && err.value_as_str(trc::Key::Type) == Some("BAD");
+        let err = if mask {
             err.redact(&[trc::Key::Details, trc::Key::Id])
         } else {
             err
         };
         trc::error!(err.span_id(self.session_id));
 
-        if write_err && let Err(err) = self.write_bytes(response).await {
+        if write_err && let Err(err) = self.write_bytes_masked(response, mask).await {
             trc::error!(err.span_id(self.session_id));
             return false;
         }

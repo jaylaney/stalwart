@@ -77,7 +77,19 @@ impl<T: SessionStream> Session<T> {
                             }
                         }
                     }
-                    requests.push(Err(trc::Pop3Event::Error.into_err().details(err)));
+                    // Issue #20: a parse error can quote client input (an
+                    // unsupported mechanism) and is written after the read's
+                    // earlier requests ran, which may authenticate: one read
+                    // before authentication is marked BAD here, and
+                    // `write_err` masks a BAD error's traces.
+                    let err = trc::Pop3Event::Error.into_err().details(err);
+                    requests.push(Err(
+                        if matches!(self.state, State::NotAuthenticated { .. }) {
+                            err.ctx(trc::Key::Type, "BAD")
+                        } else {
+                            err
+                        },
+                    ));
                 }
             }
         }

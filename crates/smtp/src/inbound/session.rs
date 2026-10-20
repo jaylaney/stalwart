@@ -669,14 +669,14 @@ fn is_auth_input(state: &mut State, bytes: &[u8]) -> bool {
     has_auth_command(partial.iter().chain(bytes))
 }
 
-/// Whether `AUTH` followed by a space or a tab occurs anywhere, in any case,
-/// ignoring CRs as the command parser does. A false positive only masks a
-/// read.
+/// Whether `AUTH` followed by ASCII whitespace (the parser's stop characters,
+/// a form feed included) occurs anywhere, in any case, ignoring CRs as the
+/// command parser does. A false positive only masks a read.
 fn has_auth_command<'x>(bytes: impl Iterator<Item = &'x u8>) -> bool {
     let mut matched = 0;
     for &ch in bytes.filter(|&&ch| ch != b'\r') {
         matched = match ch {
-            b' ' | b'\t' if matched == 4 => return true,
+            _ if matched == 4 && ch.is_ascii_whitespace() => return true,
             _ if matched < 4 && ch.eq_ignore_ascii_case(&b"AUTH"[matched]) => matched + 1,
             b'a' | b'A' => 1,
             _ => 0,

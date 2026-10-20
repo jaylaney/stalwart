@@ -279,11 +279,14 @@ impl<T: SessionStream> Session<T> {
         }
     }
 
-    /// Issue #20: before authentication a protocol error can echo client
-    /// input (a SASL response parsed as a tag), so its trace redacts it.
+    /// Issue #20: before authentication a syntax error can quote client
+    /// input (a SASL response parsed as a tag), so its trace redacts it. The
+    /// errors that quote input are the BAD ones (`Error::err`, `bad`,
+    /// `into_parse_error`); static diagnostics stay readable.
     fn traced_error(&self, err: trc::Error) -> trc::Error {
         if matches!(self.state, State::NotAuthenticated { .. })
             && err.matches(trc::EventType::Imap(trc::ImapEvent::Error))
+            && err.value_as_str(trc::Key::Type) == Some("BAD")
         {
             err.redact(&[trc::Key::Details, trc::Key::Id])
         } else {
