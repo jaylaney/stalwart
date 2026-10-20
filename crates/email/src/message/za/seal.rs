@@ -388,6 +388,41 @@ mod tests {
         assert_eq!(opened.rcvd_attach, full.rcvd_attach);
         assert_eq!(opened.contents.len(), full.contents.len());
         assert_eq!(opened.contents[0].parts.len(), full.contents[0].parts.len());
+        // Spec 7: the stub's time bits are authoritative, the attachment bit
+        // comes from the bundle.
+        let mut retimed = copy(&stub);
+        retimed.rcvd_attach = 1_800_000_000;
+        assert_eq!(
+            open_stub(&archive(&retimed), &keys, None, 7)
+                .unwrap()
+                .rcvd_attach,
+            MESSAGE_HAS_ATTACHMENT | 1_800_000_000
+        );
+    }
+
+    #[test]
+    fn a_stub_sealed_to_the_public_key_needs_the_private_key() {
+        let keys = SessionKeys::new(7, 1, Secret::random());
+        let (public, private) = generate_keypair();
+        let full = sample_metadata(BlobHash::generate(b"sealed bytes"));
+        let dek = new_dek();
+        let envelope = seal_mail_envelope(&dek, MailWrap::Public(&public), 7).unwrap();
+        let stub = archive(&seal_stub(copy(&full), &dek, &envelope, 7).unwrap());
+        assert!(stub_needs_private_key(&stub).unwrap());
+        assert!(matches!(
+            open_stub(&stub, &keys, None, 7),
+            Err(SealError::Structure("private key"))
+        ));
+        let opened = open_stub(&stub, &keys, Some(&private), 7).unwrap();
+        assert_eq!(opened.raw_headers, full.raw_headers);
+        assert_eq!(opened.preview, full.preview);
+        assert_eq!(opened.blob_body_offset, full.blob_body_offset);
+        assert_eq!(opened.rcvd_attach, full.rcvd_attach);
+        assert_eq!(opened.contents[0].parts.len(), full.contents[0].parts.len());
+        let dek = new_dek();
+        let envelope = seal_mail_envelope(&dek, MailWrap::Session(&keys), 7).unwrap();
+        let stub = archive(&seal_stub(copy(&full), &dek, &envelope, 7).unwrap());
+        assert!(!stub_needs_private_key(&stub).unwrap());
     }
 
     #[test]
@@ -459,6 +494,19 @@ mod tests {
             is_stub(&archive(&crafted)),
             "a header block starting with the format byte reads as a stub"
         );
+        assert!(matches!(
+            open_stub(
+                &archive(&crafted),
+                &SessionKeys::new(7, 1, Secret::random()),
+                None,
+                7
+            ),
+            Err(SealError::Format)
+        ));
+        // A `pk` envelope one byte short of its length.
+        let mut truncated = vec![MAIL_FORMAT_V1, POLICY_VERSION, WRAP_PK];
+        truncated.resize(truncated.len() + PUBLIC_KEY_LEN + WRAP_LEN - 1, 0);
+        crafted.raw_headers = truncated.into_boxed_slice();
         assert!(matches!(
             open_stub(
                 &archive(&crafted),

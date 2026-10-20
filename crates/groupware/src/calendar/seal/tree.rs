@@ -524,6 +524,14 @@ mod tests {
             open_padded(&dek, &aad, &raw[..raw.len() - 1]),
             Err(SealError::Aead)
         ));
+        // Authentic plaintext whose length prefix overruns what follows it,
+        // and one too short to hold the prefix.
+        for plain in [&[0xff, 0xff, 0, 0, 1, 2][..], &[1, 2, 3][..]] {
+            assert!(matches!(
+                open_padded(&dek, &aad, &seal(&dek, &aad, plain)),
+                Err(SealError::Format)
+            ));
+        }
         // The base64 wrapper still round-trips through the core.
         assert_eq!(
             open_bytes(&dek, &aad, &seal_bytes(&dek, &aad, b"hello"))
