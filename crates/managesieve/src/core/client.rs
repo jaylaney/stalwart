@@ -258,7 +258,11 @@ impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
             ManageSieve(trc::ManageSieveEvent::RawInput),
             SpanId = self.session_id,
             Size = len,
-            Contents = trc::Value::from_maybe_string(bytes.get(0..len).unwrap_or_default()),
+            Contents = if matches!(self.state, State::NotAuthenticated { .. }) {
+                trc::Value::redacted()
+            } else {
+                trc::Value::from_maybe_string(bytes.get(0..len).unwrap_or_default())
+            },
         );
 
         Ok(len)

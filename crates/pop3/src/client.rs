@@ -21,7 +21,11 @@ impl<T: SessionStream> Session<T> {
             Pop3(trc::Pop3Event::RawInput),
             SpanId = self.session_id,
             Size = bytes.len(),
-            Contents = trc::Value::from_maybe_string(bytes),
+            Contents = if matches!(self.state, State::NotAuthenticated { .. }) {
+                trc::Value::redacted()
+            } else {
+                trc::Value::from_maybe_string(bytes)
+            },
         );
 
         let mut bytes = bytes.iter();

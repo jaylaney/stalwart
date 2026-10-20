@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use http_proto::{HttpRequest, request::fetch_body};
+use http_proto::{HttpRequest, request::fetch_body_untraced};
 use hyper::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
 use utils::map::vec_map::VecMap;
@@ -189,17 +189,20 @@ pub struct FormData {
 }
 
 impl FormData {
+    /// Reads the form untraced (issue #20): the OAuth token and device forms
+    /// carry passwords, codes and tokens, so the body never reaches
+    /// `HttpEvent::RequestBody`.
     pub async fn from_request(
         req: &mut HttpRequest,
         max_len: usize,
-        session_id: u64,
+        _session_id: u64,
     ) -> trc::Result<Self> {
         match (
             req.headers()
                 .get(CONTENT_TYPE)
                 .and_then(|h| h.to_str().ok())
                 .and_then(|val| val.parse::<mime::Mime>().ok()),
-            fetch_body(req, max_len, session_id).await,
+            fetch_body_untraced(req, max_len).await,
         ) {
             (Some(content_type), Some(body)) => {
                 let mut fields = VecMap::new();

@@ -577,6 +577,14 @@ impl NetworkEvent {
 }
 
 impl Value {
+    /// The marker a raw-input event records in place of contents that may
+    /// carry the authentication exchange (issue #20): a password or app
+    /// password unlocks a zero-access account's data at rest. It applies to
+    /// every account, as the account is unknown before authentication.
+    pub fn redacted() -> Self {
+        Self::String("[redacted]".into())
+    }
+
     pub fn from_maybe_string(value: &[u8]) -> Self {
         if let Ok(value) = std::str::from_utf8(value) {
             Self::String(value.into())

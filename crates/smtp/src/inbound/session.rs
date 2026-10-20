@@ -545,7 +545,13 @@ impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
                     SpanId = self.data.session_id,
                     Size = len,
                     Contents =
-                        String::from_utf8_lossy(bytes.get(0..len).unwrap_or_default()).into_owned(),
+                        if is_auth_input(&mut self.state, bytes.get(0..len).unwrap_or_default()) {
+                            trc::Value::redacted()
+                        } else {
+                            String::from_utf8_lossy(bytes.get(0..len).unwrap_or_default())
+                                .into_owned()
+                                .into()
+                        },
                 );
 
                 Ok(len)
@@ -636,4 +642,35 @@ impl<T: SessionStream> ResolveVariable for Session<T> {
     fn resolve_global(&self, _: &str) -> Variable<'_> {
         Variable::Integer(0)
     }
+}
+
+/// Whether a read may carry the authentication exchange, so that its raw-input
+/// trace records the redaction marker (issue #20): the session is in a SASL
+/// exchange, a line of the read starts an AUTH command, or the read continues
+/// a request line that started one in an earlier read. Other traffic is traced
+/// as upstream traces it.
+fn is_auth_input(state: &mut State, bytes: &[u8]) -> bool {
+    let partial: &[u8] = match state {
+        State::Sasl(_) => return true,
+        // The unparsed start of the current request line; `buf` clears a line
+        // the receiver already parsed, as its next `ingest` would.
+        State::Request(receiver) => receiver.buf(),
+        _ => &[],
+    };
+    let mut lines = bytes.split(|&ch| ch == b'\n');
+    let first = lines.next().unwrap_or_default();
+    starts_auth(partial.iter().chain(first)) || lines.any(|line| starts_auth(line.iter()))
+}
+
+/// Whether a request line starts with the AUTH command, read as the command
+/// parser reads it: leading spaces skipped, CRs ignored, letters in any case.
+fn starts_auth<'x>(line: impl Iterator<Item = &'x u8>) -> bool {
+    let mut letters = line
+        .filter(|&&ch| ch != b'\r')
+        .skip_while(|&&ch| ch == b' ');
+    b"AUTH".iter().all(|expected| {
+        letters
+            .next()
+            .is_some_and(|ch| ch.eq_ignore_ascii_case(expected))
+    })
 }

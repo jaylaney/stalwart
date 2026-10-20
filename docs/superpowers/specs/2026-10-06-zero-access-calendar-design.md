@@ -748,12 +748,26 @@ body (shown as `[redacted]`), nor the value of an `Authorization`,
 `Proxy-Authorization` or `Cookie` header on any request. Vault API bodies
 are never traced. Login bodies and responses on `/api/auth` are never
 traced either, since the password arrives before any account is known.
-Non-key DAV and JMAP traffic is traced as upstream traces it. Mail-protocol
-raw-input traces (`imap.raw-input` and the POP3, ManageSieve and SMTP
-equivalents) are upstream's and still record the authentication exchange,
-so an operator who enables them can capture a key account's password or
-app password; release 1 records this as a limit, since the calendar is
-served over HTTP only.
+Non-key DAV and JMAP traffic is traced as upstream traces it. OAuth form
+bodies (the token, device and introspection endpoints, and with them the
+contact form, which shares the reader) are never traced. Mail-protocol
+raw-input traces record `[redacted]` in place of the read's contents
+wherever the read can carry the authentication exchange, for every
+account, since the account is unknown before authentication (issue #20):
+`imap.raw-input`, `pop3.raw-input` and `managesieve.raw-input` while the
+session is not authenticated (a ManageSieve UNAUTHENTICATE returns to that
+state), and `smtp.raw-input` (SMTP, LMTP and submission) for a read made
+during a SASL exchange, a read with a line that starts an `AUTH` command,
+and a read that continues a request line begun as `AUTH` in an earlier
+read. Raw input after authentication, and every other SMTP read, is traced
+as upstream traces it. The residual: an operator who runs a patched
+binary, terminates TLS at a proxy in front of the server, or enables a
+plain-text port can still read the exchange off the wire or out of
+process memory, which the trust model already concedes for a running
+session; and a client that sends a credential after authenticating (a
+second LOGIN on an authenticated IMAP session, which the server refuses)
+or an SMTP `AUTH` line longer than the protocol's 4096-byte line limit
+has the part outside the masked reads traced.
 
 ## 11. Testing
 
