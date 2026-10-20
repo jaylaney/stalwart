@@ -70,8 +70,11 @@ rest.
 ### 1.3 Assumptions
 
 - Issue #20 (the authentication exchange masked in the mail protocols'
-  raw-input traces) is merged before this release ships; the trace rules
-  of section 10 build on it.
+  raw-input traces) is merged before this release's plan starts. Its work
+  sits on branch `fix-20-raw-input-auth` (three commits, unmerged on
+  2026-10-20) and edits the same session functions section 10's
+  redactions extend, so the plan branches from it rather than writing the
+  redactions twice.
 - No shipped key account holds mail. Key accounts created before this
   release during development may hold plaintext messages; section 6.6
   states how they are treated.
@@ -247,10 +250,27 @@ error dialogs.
 SMTP submission by a key account works with every mechanism upstream
 offers, OAuth included: submission reads no stored mail (section 6.5).
 
-JMAP over HTTP is unchanged. JMAP requests over the WebSocket run with the
-stripped token (release 1), so a key account's mail methods over the
-WebSocket answer `accountNotSupportedByMethod`, as its calendar methods do.
-EventSource and WebSocket push carry state ids only and keep working.
+JMAP over HTTP is unchanged in how keys arrive. The mail methods split in
+two. **Keyless methods** read no message content and work with any token,
+over the WebSocket included: `Mailbox/*`, `Email/query` and
+`Email/queryChanges` on visible fields (section 8), `Email/changes`,
+`Thread/get` and `Thread/changes`, `Email/set` keyword and mailbox updates
+and destroys, `Identity/*`, `VacationResponse/*`, `SieveScript/*`,
+`PushSubscription/*`. **Key-needing methods** are gated in the JMAP
+dispatcher (`crates/jmap/src/api/request.rs`, next to
+`za_assert_calendar_allowed`) when the request's token holds no keys for
+the target account (`za_keys_for` is `None`: a WebSocket request, a Bearer
+or API-key token, a shared or impersonated account): `Email/get`,
+`Email/parse`, `SearchSnippet/get`, `Blob/get`, `Email/import`,
+`Email/copy`, `EmailSubmission/set`, and `Email/set` for its `create`
+argument at its own site. The gate answers the method error `forbidden`
+with a description naming zero access, traced as
+`SecurityEvent::Unauthorized` with details `zero-access: mail access
+without session keys`; each reader refuses the same way as defence in
+depth. So a key account's state-driven sync over the WebSocket (changes,
+queries, flags) works, and only content reads need an HTTP request with
+the credential; release 5's web client inherits that contract. EventSource
+and WebSocket push carry state ids only and keep working.
 
 A credential change does not end an open mail session beyond what
 upstream does for every account: the login-time token stays, and the
@@ -289,7 +309,7 @@ The `MessageMetadata` archive (`EmailField::Metadata`, field 71,
 
 | Field | Stub value | Why |
 |---|---|---|
-| `contents` | empty | the marker: upstream always writes at least the root entry (`build_metadata_contents`) |
+| `contents` | one root entry holding one part with no headers, body `Binary`, flags and offsets 0, empty body lists | a reader not yet converted sees "no headers" instead of indexing `contents[0].parts[0]` out of bounds (see below) |
 | `rcvd_attach` | arrival time, attachment bit clear | arrival time is visible; the bit is sealed |
 | `blob_hash` | the sealed blob's hash | keyless paths (unindex, account destruction, blob purge) need it |
 | `blob_body_offset` | 0 | unused |
@@ -310,10 +330,22 @@ decoded with a checked read, as release 1's bundles are (`FORMAT_V1`,
 sealing module lives in the email crate (`crates/email/src/message/za/`,
 new) and reuses `vault::keys`.
 
-A stub is recognised by `contents.is_empty()` together with the format
-byte at the head of `raw_headers`; a metadata archive with a non-empty
-`contents` is plaintext and passes through unchanged (section 6.6). A
-message whose stub or blob cannot be opened is unreadable (section 10).
+A stub is recognised by the format byte `0x01` at the head of
+`raw_headers`: a parsed header block never starts with a control byte,
+and the check runs only on key accounts' archives. A key account's archive
+whose `raw_headers` does not start with it is plaintext and passes through
+unchanged (section 6.6); a crafted legacy message whose header block did
+start with `0x01` would fail to open and be reported as unreadable
+(section 10), which is acceptable for data that should not exist. The stub
+deliberately keeps a well-formed empty root part rather than an empty
+`contents`: upstream's readers index `contents[0].parts[0]` unchecked
+(`root_part`, and a dozen sites in IMAP FETCH, Email/get, the snippet,
+submission and copy code), and an IMAP operation runs in a spawned task,
+so a reader missed by the conversion would panic and leave the command
+unanswered until the client's timeout. With the empty root part a missed
+reader degrades to a message with no headers and an empty body, which
+leaks nothing and is caught by the key-mode suites. A message whose stub
+or blob cannot be opened is unreadable (section 10).
 
 ### 5.3 Associated data
 
@@ -381,7 +413,15 @@ under the MWK in the same blob format (5.1), with a fresh DEK and the
 `mail-blob` associated data. Every `Reserved`-class blob of a key account
 is sealed; `Linked` blobs of its messages are opened through their stubs.
 `blob_download` (`crates/jmap/src/blob/download.rs`) unseals either with
-the request's keys. The upload quota counts plaintext.
+the request's keys, and it and the purge are the only readers of a key
+account's `Reserved` blobs. The consumers that take an upload's hash raw,
+`FileNode/set` create and update (which link the upload as a file's blob)
+and `Blob/upload` data sources that reference an existing upload, are
+refused for a key account with `forbidden` and the `zero-access:` trace:
+files are out of scope and plaintext in this release, and a sealed upload
+must not become a file's blob. `Email/import`, `Email/set` attachments and
+`Blob/get` go through `blob_download` and work. The upload quota counts
+plaintext.
 
 ## 6. Write paths
 
@@ -443,8 +483,14 @@ JMAP Email/copy, is refused when either side is a key account, with a
 `zero-access:` trace, as calendar COPY and MOVE across accounts are in
 release 1. `Blob/copy` is refused the same way. Mailbox sharing (IMAP
 SETACL, JMAP Mailbox `shareWith`) is refused on mailboxes owned by key
-accounts; a key account may still read mailboxes shared to it by non-key
-accounts, which hold plaintext and need no key.
+accounts, and a key account's mailboxes are never reachable through
+another session: they are left out of other accounts' LIST and
+`Mailbox/get` (the `is_member` and `access_to` routes release 1 closed for
+calendars), and a stub reached by a session holding no keys for that
+account, whatever the route, answers `NO [NOPERM]` or `forbidden` with the
+`zero-access:` trace, never an unreadable-message error. A key account may
+still read mailboxes shared to it by non-key accounts, which hold
+plaintext and need no key.
 
 ### 6.4 Flags, deletion and expunge
 
@@ -557,7 +603,6 @@ same words as the IMAP text.
 |---|---|
 | IMAP, POP3 login with Bearer/OAuth, API key, master user | refused at login, `NO [NOPERM]`, `zero-access:` trace (section 4) |
 | SMTP submission, ManageSieve | unchanged, keyless |
-| JMAP mail over WebSocket | `accountNotSupportedByMethod` |
 | Delivery to an account without a served key | temporary failure, retried by the sender's queue |
 | Spam training (delivery, autolearn, user actions) | never for a key account |
 | PGP/S/MIME encryption at rest | skipped |
@@ -565,7 +610,9 @@ same words as the IMAP text.
 | Full-text index | visible-field document only (5.5) |
 | Server search, sort, snippets on sealed fields | refused (section 8) |
 | Cross-account COPY/MOVE, Email/copy, Blob/copy | refused when either side is a key account |
-| Mailbox sharing (SETACL, `shareWith`) | refused on key-owned mailboxes |
+| Mailbox sharing (SETACL, `shareWith`), shared-mailbox listing, group and impersonation routes | refused on key-owned mailboxes; not listed; a keyless stub read answers `NO [NOPERM]` / `forbidden` |
+| JMAP key-needing methods on a keyless token (WebSocket, Bearer, API key, shared account) | `forbidden` at the dispatcher (section 4); keyless methods work |
+| `FileNode/set` from an upload, `Blob/upload` data sources on an upload | refused for key accounts (5.7) |
 | Push with email properties | state-only payload |
 | iMIP ingest | gated as in release 1 (release 4) |
 | Restore of a key account's message | refused if restore re-parses (6.7) |
@@ -583,10 +630,14 @@ same words as the IMAP text.
   messages it could serve; JMAP `Email/get` lists the id under `notFound`
   and `Blob/get` under `notFound`, so one damaged message does not block a
   mailbox listing; POP3 answers `-ERR` for that message.
-- **Keyless read of a key account's mail**: cannot happen on IMAP or POP3
-  (section 4); on JMAP it is refused with `forbidden` and the
-  `SecurityEvent::Unauthorized` trace with details prefixed `zero-access:`,
-  as calendar paths are. No new event type is added.
+- **Keyless read of a key account's mail**: a session of the account
+  itself always has keys (section 4); a stub reached through another
+  account's session (a shared mailbox, a group, impersonation) or a
+  keyless JMAP token answers `NO [NOPERM]` on IMAP and POP3, `forbidden`
+  on JMAP, with the `SecurityEvent::Unauthorized` trace with details
+  prefixed `zero-access:`, as calendar paths do. Such a read is distinct
+  from an unreadable message and never reports `SERVERBUG` or
+  `DataCorruption`. No new event type is added.
 - **Delivery without a served key**: temporary failure (6.1), traced with
   the account id and a fixed reason.
 - Search refusals are section 8's, not errors.
@@ -695,9 +746,9 @@ Added:
     whatever wrote it (delivery, Sieve, APPEND, Email/set, Email/import).
     No writer stores a plaintext blob or a plaintext metadata archive for
     a key account.
-25. The stub carries exactly the arrival time, the blob hash and the
-    sealed bundle; every other field is empty. The unsealed metadata is a
-    content view; the stored stub is what writes assert on and what
+25. The stub carries exactly the arrival time, the blob hash, the sealed
+    bundle and the empty root part; nothing else. The unsealed metadata is
+    a content view; the stored stub is what writes assert on and what
     keyless paths read.
 26. A mail session of a key account exists only with keys; every read of
     a key account's message holds the account's own keys or is refused.
@@ -717,11 +768,14 @@ Added:
 Each item is for planning to look up in code; the recommendation stands
 unless the code says otherwise.
 
-1. **`contents` never empty.** Confirm that no upstream writer stores a
-   `MessageMetadata` with an empty `contents` (`build_metadata_contents`
-   pushes the root unconditionally; `copy_message` re-serializes what it
-   read). Recommendation: the stub marker as in 5.2; add a second signal
-   only if a writer is found.
+1. **The stub's readers.** List every site that reads a `MessageMetadata`
+   archive of a message (`root_part` and the direct `contents[0]` indexes
+   in IMAP FETCH, Email/get, the snippet, submission, copy, the search
+   builder, blob download, push, unindex) and convert each to the unsealed
+   view or a refusal; the empty root part (5.2) is the safety net, not the
+   plan. Recommendation: one `za_metadata_view` helper in the email crate
+   returning `Cow<Archive<MessageMetadata>>`, as `za_event_view` does for
+   events, called at every site.
 2. **Restore.** Confirm whether `restore_item` re-parses exported bytes
    (6.7). Recommendation: refuse for key accounts in this release and note
    verbatim restore as a packaging-release item (issue #25).
@@ -787,7 +841,15 @@ unless the code says otherwise.
   is reused.
 - **Sealing uploads not at all** (a transient plaintext limit like the
   queue). Rejected: an upload sits for the TTL at rest and the session
-  that creates it holds the keys, so sealing it costs one code path.
+  that creates it holds the keys. The cost is one writer, the unseal in
+  `blob_download`, and the refusal of the two consumers that take an
+  upload's hash raw (5.7); the file consumers are refused rather than
+  converted because files are out of scope.
+- **An empty `contents` as the stub marker**, which would make a missed
+  reader fail loudly. Rejected: the loud failure is a panic inside a
+  spawned IMAP operation, which the client sees as a hang; the empty root
+  part fails closed (no headers, no body) and the key-mode suites catch
+  the missed site.
 
 ## 15. Release pointers
 
