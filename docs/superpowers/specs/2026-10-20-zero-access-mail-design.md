@@ -77,8 +77,9 @@ rest.
 - Enterprise paths (deleted-item retention, archived items) are excluded
   from the product build and are not gated.
 - Key accounts on PostgreSQL and MySQL (6.1): their assertion path cannot
-  fence provisioning against a delivery in flight; a later change to the
-  store crate lifts the restriction.
+  fence provisioning against a delivery in flight; the per-account
+  database lock described there is the follow-up that lifts the
+  restriction.
 
 ### 1.3 Assumptions
 
@@ -517,13 +518,27 @@ accounts on RocksDB, FoundationDB and SQLite (decided with Jay,
 2026-10-20): `POST /api/vault/setup-token`
 refuses issuance with 409 and a fixed reason when the data store is
 PostgreSQL or MySQL, so a deployment learns it at provisioning rather
-than from a leak. Lifting that restriction means running the
-assertion-carrying batches of those backends at an isolation that locks
-the gap (MySQL's repeatable read takes gap locks on a `FOR UPDATE` of a
-missing key; PostgreSQL's serializable level detects the write skew) with
-a retry on serialization failure, which is store-crate work with its own
-containers in CI and is a follow-up, not part of this release. The
-product build ships RocksDB.
+than from a leak. The follow-up that lifts the restriction (decided with
+Jay, 2026-10-20) is a **per-account database lock on the SQL backends**:
+a batch flag meaning "serialize on this account", set by the two parties
+to the race (the ingest and copy batches that carry the absence assertion,
+and the vault writes of `setup-token` and `setup`), which the PostgreSQL
+backend honours with a transaction-scoped advisory lock
+(`pg_advisory_xact_lock` keyed by a hash of the account id) and the MySQL
+backend with a named lock (`GET_LOCK`, released after commit or
+rollback), taken as the first statement of the transaction. Neither needs
+a row to exist, the absence assertion that follows then sees any
+committed vault record, and a provisioning write waits for an ingest in
+flight to commit, after which its own no-messages check refuses. The
+other stores are untouched. The alternatives, a gap-locking isolation
+level for those batches with a retry on serialization failure, or a lock
+on the account's registry row ordered before the assertion, were set
+aside as a new failure mode and a dependence on operation order. The
+follow-up's cost beyond the store crate is CI: the fence stress test and
+the key-mode suites on PostgreSQL and MySQL containers, and a check of the
+visible-field search document against those backends' own full-text
+implementations, which the leak scanner skips today. The product build
+ships RocksDB.
 
 **Persistence before the batch** (review F1b). A delivery that Sieve
 modified, and every ingest that arrives without a queue blob, writes its
@@ -1076,3 +1091,6 @@ unless the code says otherwise.
 - Product copy (Circulo): the visible-and-sealed list of section 2, the
   transit and connection-residency limits, the search behaviour and the
   spam-training note, written for the person, not the operator.
+- PostgreSQL and MySQL for key accounts: the per-account database lock
+  of section 6.1, with its CI containers, as its own small plan when a
+  deployment needs those stores.
