@@ -157,7 +157,11 @@ impl<T: SessionStream> Session<T> {
             Pop3(trc::Pop3Event::RawOutput),
             SpanId = self.session_id,
             Size = bytes.len(),
-            Contents = trc::Value::from_maybe_string(bytes),
+            Contents = if matches!(self.state, State::NotAuthenticated { .. }) {
+                trc::Value::redacted()
+            } else {
+                trc::Value::from_maybe_string(bytes)
+            },
         );
 
         self.stream.write_all(bytes.as_ref()).await.map_err(|err| {
@@ -184,6 +188,15 @@ impl<T: SessionStream> Session<T> {
         let response = err.serialize();
         let write_err = err.should_write_err();
 
+        // Issue #20: before authentication a protocol error can echo client
+        // input (an unsupported mechanism), so its trace redacts it.
+        let err = if matches!(self.state, State::NotAuthenticated { .. })
+            && err.matches(trc::EventType::Pop3(trc::Pop3Event::Error))
+        {
+            err.redact(&[trc::Key::Details, trc::Key::Id])
+        } else {
+            err
+        };
         trc::error!(err.span_id(self.session_id));
 
         if write_err && let Err(err) = self.write_bytes(response).await {

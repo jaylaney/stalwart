@@ -89,6 +89,18 @@ impl Error {
         self
     }
 
+    /// Replaces the values of `keys` with the redaction marker, for a trace
+    /// of an error that can echo client input before authentication (issue
+    /// #20). The client's response is serialized before redaction.
+    pub fn redact(mut self, keys: &[Key]) -> Self {
+        for (key, value) in self.0.keys.iter_mut() {
+            if keys.contains(key) {
+                *value = Value::redacted();
+            }
+        }
+        self
+    }
+
     #[inline(always)]
     pub fn ctx_opt(self, key: Key, value: Option<impl Into<Value>>) -> Self {
         match value {

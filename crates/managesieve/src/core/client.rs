@@ -220,7 +220,11 @@ impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
             ManageSieve(trc::ManageSieveEvent::RawOutput),
             SpanId = self.session_id,
             Size = bytes.len(),
-            Contents = trc::Value::from_maybe_string(bytes),
+            Contents = if matches!(self.state, State::NotAuthenticated { .. }) {
+                trc::Value::redacted()
+            } else {
+                trc::Value::from_maybe_string(bytes)
+            },
         );
 
         self.stream.write_all(bytes).await.map_err(|err| {
@@ -241,6 +245,17 @@ impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
 
     pub async fn write_error(&mut self, error: trc::Error) -> trc::Result<()> {
         let bytes = error.serialize();
+        // Issue #20: before authentication a protocol error can echo client
+        // input (a command name), so its trace redacts it. The receiver's
+        // errors are IMAP events.
+        let error = if matches!(self.state, State::NotAuthenticated { .. })
+            && (error.matches(trc::EventType::Imap(trc::ImapEvent::Error))
+                || error.matches(trc::EventType::ManageSieve(trc::ManageSieveEvent::Error)))
+        {
+            error.redact(&[trc::Key::Details, trc::Key::Id])
+        } else {
+            error
+        };
         trc::error!(error.span_id(self.session_id));
         self.write(&bytes).await
     }

@@ -12,8 +12,12 @@
 //! input outside the exchange is still traced.
 
 use super::{tracing::AcceptAnyCert, user_permissions};
-use crate::utils::{server::TestServer, za::za_app_password};
+use crate::utils::{
+    server::TestServer,
+    za::{za_app_password, za_post},
+};
 use base64::{Engine, engine::general_purpose::STANDARD};
+use serde_json::json;
 use std::{sync::Arc, time::Duration};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_rustls::{
@@ -123,12 +127,15 @@ impl Conn {
     }
 }
 
-/// The four IMAP logins: LOGIN, LOGIN with the password as a literal (sent
-/// on a read of its own), AUTHENTICATE PLAIN with the initial response and
-/// with a continuation. The first session then sends a command whose raw
-/// input must still be traced.
+/// The IMAP logins: LOGIN; LOGIN with the password as a synchronizing
+/// literal (sent on a read of its own) and as a LITERAL+ literal (in the
+/// same write); AUTHENTICATE PLAIN with the initial response, with a
+/// continuation, and with the response pipelined after the command (parsed
+/// as a tag and echoed by the parse error, issue #20 fix round 1); and a
+/// LOGIN after UNAUTHENTICATE. The first session then sends a command whose
+/// raw input must still be traced.
 async fn imap(secret: &str) {
-    for flow in 0..4 {
+    for flow in 0..7 {
         let mut conn = Conn::open(IMAP_PORT).await;
         conn.until(&["* OK"]).await;
         match flow {
@@ -146,14 +153,40 @@ async fn imap(secret: &str) {
             }
             2 => {
                 conn.exchange(
+                    &format!("a1 LOGIN \"{NAME}\" {{{}+}}\r\n{secret}\r\n", secret.len()),
+                    "a1 OK",
+                )
+                .await
+            }
+            3 => {
+                conn.exchange(
                     &format!("a1 AUTHENTICATE PLAIN {}\r\n", plain(secret)),
                     "a1 OK",
                 )
                 .await
             }
-            _ => {
+            4 => {
                 conn.exchange("a1 AUTHENTICATE PLAIN\r\n", "+").await;
                 conn.exchange(&format!("{}\r\n", plain(secret)), "a1 OK")
+                    .await;
+            }
+            5 => {
+                // The pipelined response is read before the continuation is
+                // sent, as a request of its own: a parse error that quotes
+                // it. The exchange then completes as a continuation.
+                conn.exchange(
+                    &format!("a1 AUTHENTICATE PLAIN\r\n{}\r\n", plain(secret)),
+                    "+",
+                )
+                .await;
+                conn.exchange(&format!("{}\r\n", plain(secret)), "a1 OK")
+                    .await;
+            }
+            _ => {
+                conn.exchange(&format!("a1 LOGIN \"{NAME}\" \"{secret}\"\r\n"), "a1 OK")
+                    .await;
+                conn.exchange("a3 UNAUTHENTICATE\r\n", "a3 OK").await;
+                conn.exchange(&format!("a4 LOGIN \"{NAME}\" \"{secret}\"\r\n"), "a4 OK")
                     .await;
             }
         }
@@ -208,16 +241,33 @@ async fn sieve(secret: &str) {
     conn.exchange("LOGOUT\r\n", "OK").await;
 }
 
-/// AUTH PLAIN, AUTH LOGIN, and an AUTH PLAIN line split across two writes
-/// (returned: the split's two writes). The EHLO before each is the control.
-async fn smtp(secret: &str) -> [String; 2] {
+/// Sends `writes` as separate writes, 300 ms apart so that the server reads
+/// each before the next exists, and expects a line starting with `expected`.
+async fn split_writes(conn: &mut Conn, writes: &[String], expected: &str) {
+    let (last, first) = writes.split_last().unwrap();
+    for write in first {
+        conn.send(write).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    conn.exchange(last, expected).await;
+}
+
+/// The SMTP logins: AUTH PLAIN; AUTH LOGIN; an AUTH PLAIN line split across
+/// two writes and across three (`AU` / `TH PLAIN <head>` / `<tail>`); EHLO
+/// and AUTH PLAIN pipelined in one write; a lower-case `auth` after a
+/// space; and an AUTH command that starts mid-line, after a BDAT chunk.
+/// Returns the writes that must each be a masked read of their own.
+/// The EHLO before each login is the control.
+async fn smtp(secret: &str) -> Vec<String> {
     let response = plain(secret);
     let (head, tail) = response.split_at(response.len() / 2);
-    let split = [format!("AUTH PLAIN {head}"), format!("{tail}\r\n")];
-    for flow in 0..3 {
+    let mut own_reads = Vec::new();
+    for flow in 0..7 {
         let mut conn = Conn::open_smtp().await;
-        conn.send(&format!("EHLO {SMTP_CONTROL}\r\n")).await;
-        conn.until(&["250 "]).await;
+        if flow != 4 {
+            conn.send(&format!("EHLO {SMTP_CONTROL}\r\n")).await;
+            conn.until(&["250 "]).await;
+        }
         match flow {
             0 => {
                 conn.exchange(&format!("AUTH PLAIN {response}\r\n"), "235")
@@ -230,16 +280,73 @@ async fn smtp(secret: &str) -> [String; 2] {
                 conn.exchange(&format!("{}\r\n", STANDARD.encode(secret)), "235")
                     .await;
             }
+            2 => {
+                let writes = [format!("AUTH PLAIN {head}"), format!("{tail}\r\n")];
+                split_writes(&mut conn, &writes, "235").await;
+                own_reads.extend(writes);
+            }
+            3 => {
+                let writes = [
+                    "AU".to_string(),
+                    format!("TH PLAIN {head}"),
+                    format!("{tail}\r\n"),
+                ];
+                split_writes(&mut conn, &writes, "235").await;
+                // `AU` alone carries nothing and is traced.
+                own_reads.extend(writes.into_iter().skip(1));
+            }
+            4 => {
+                conn.send(&format!("EHLO {SMTP_CONTROL}\r\nAUTH PLAIN {response}\r\n"))
+                    .await;
+                let line = conn.until(&["235", "4", "5"]).await;
+                assert!(line.starts_with("235"), "pipelined AUTH answered {line:?}");
+            }
+            5 => {
+                conn.exchange(&format!(" auth plain {response}\r\n"), "235")
+                    .await
+            }
             _ => {
-                conn.send(&split[0]).await;
-                // The server reads the first write before the second exists.
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                conn.exchange(&split[1], "235").await;
+                // Mid-line: the refused BDAT's 5-byte chunk ends where the
+                // AUTH command starts, inside the line.
+                conn.send(&format!("BDAT 5\r\nhelloAUTH PLAIN {response}\r\n"))
+                    .await;
+                let line = conn.until(&["235", "535", "454"]).await;
+                assert!(line.starts_with("235"), "mid-line AUTH answered {line:?}");
             }
         }
         conn.exchange("QUIT\r\n", "221").await;
     }
-    split
+    own_reads
+}
+
+/// The MFA reply (issue #20 fix round 1): once TOTP is enrolled, AUTH PLAIN
+/// with the password alone is answered with a 334 that leaves the exchange.
+/// The client answers it with a PLAIN response carrying a code, split
+/// across two writes; both are masked reads of their own. Returns the
+/// answer's writes.
+async fn smtp_mfa(answer: &str) -> Vec<String> {
+    let mut conn = Conn::open_smtp().await;
+    conn.send(&format!("EHLO {SMTP_CONTROL}\r\n")).await;
+    conn.until(&["250 "]).await;
+    conn.exchange(&format!("AUTH PLAIN {}\r\n", plain(PASSWORD)), "334")
+        .await;
+    let (head, tail) = answer.split_at(answer.len() / 2);
+    let writes = vec![head.to_string(), format!("{tail}\r\n")];
+    // Parsed as a command once the exchange is left: refused.
+    split_writes(&mut conn, &writes, "5").await;
+    conn.exchange("QUIT\r\n", "221").await;
+    writes
+}
+
+fn totp_url() -> String {
+    totp_rs::Builder::new()
+        .with_secret(store::rand::random::<[u8; 20]>())
+        .with_account_name("key12")
+        .with_issuer(Some("Stalwart"))
+        .build()
+        .unwrap()
+        .to_url()
+        .unwrap()
 }
 
 /// Every string in `value`, bytes read as UTF-8 (lossy).
@@ -267,6 +374,7 @@ pub async fn test(test: &mut TestServer) {
     let traced = [
         EventType::Imap(ImapEvent::RawInput),
         EventType::Imap(ImapEvent::RawOutput),
+        EventType::Imap(ImapEvent::Error),
         EventType::Pop3(Pop3Event::RawInput),
         EventType::Pop3(Pop3Event::RawOutput),
         EventType::ManageSieve(ManageSieveEvent::RawInput),
@@ -286,22 +394,39 @@ pub async fn test(test: &mut TestServer) {
     Collector::reload();
 
     let mut secrets = Vec::new();
-    let mut splits = Vec::new();
+    let mut own_reads = Vec::new();
     for secret in [PASSWORD, app_password.as_str()] {
         imap(secret).await;
         pop3(secret).await;
         sieve(secret).await;
-        let split = smtp(secret).await;
+        own_reads.extend(smtp(secret).await);
+        let response = plain(secret);
+        let (head, tail) = response.split_at(response.len() / 2);
         secrets.extend([
             secret.to_string(),
-            plain(secret),
             STANDARD.encode(secret),
-            // Each write of the split line, without the line break.
-            split[0].clone(),
-            split[1].trim_end().to_string(),
+            response.clone(),
+            // Each half of a split response.
+            head.to_string(),
+            tail.to_string(),
         ]);
-        splits.push(split);
     }
+    // Last: enrolling TOTP ends the password logins.
+    let url = totp_url();
+    let code = totp_rs::Totp::from_url(&url)
+        .unwrap()
+        .generate_current()
+        .to_string();
+    za_post(
+        "totp",
+        &json!({ "username": NAME, "password": PASSWORD, "otp_auth": url, "confirm": code }),
+    )
+    .await
+    .expect(200);
+    let answer = STANDARD.encode(format!("\0{NAME}\0{PASSWORD}${code}"));
+    let (head, tail) = answer.split_at(answer.len() / 2);
+    secrets.extend([answer.clone(), head.to_string(), tail.to_string()]);
+    own_reads.extend(smtp_mfa(&answer).await);
 
     tokio::time::sleep(Duration::from_millis(500)).await;
     // (type, size, every string of the event)
@@ -350,16 +475,20 @@ pub async fn test(test: &mut TestServer) {
             "no masked {event_type:?} captured"
         );
     }
-    // The split AUTH line reached the server as two reads, both masked.
-    for split in &splits {
-        for write in split {
-            assert!(
-                inputs(EventType::Smtp(SmtpEvent::RawInput))
-                    .any(|(size, values)| size == Some(write.len() as u64) && values == MARKER),
-                "the split write {write:?} was not a masked read of its own"
-            );
-        }
+    // Each write of a split AUTH line, and of the answer to the MFA 334,
+    // reached the server as a read of its own, masked.
+    for write in &own_reads {
+        assert!(
+            inputs(EventType::Smtp(SmtpEvent::RawInput))
+                .any(|(size, values)| size == Some(write.len() as u64) && values == MARKER),
+            "the write {write:?} was not a masked read of its own"
+        );
     }
+    // The pipelined IMAP response was echoed by a parse error, redacted.
+    assert!(
+        inputs(EventType::Imap(ImapEvent::Error)).any(|(_, values)| values.contains(MARKER)),
+        "no redacted IMAP parse error captured"
+    );
     // Positive controls: raw input outside the exchange is still traced.
     assert!(
         inputs(EventType::Imap(ImapEvent::RawInput))

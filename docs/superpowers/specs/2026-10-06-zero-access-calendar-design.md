@@ -750,24 +750,35 @@ are never traced. Login bodies and responses on `/api/auth` are never
 traced either, since the password arrives before any account is known.
 Non-key DAV and JMAP traffic is traced as upstream traces it. OAuth form
 bodies (the token, device and introspection endpoints, and with them the
-contact form, which shares the reader) are never traced. Mail-protocol
-raw-input traces record `[redacted]` in place of the read's contents
-wherever the read can carry the authentication exchange, for every
-account, since the account is unknown before authentication (issue #20):
-`imap.raw-input`, `pop3.raw-input` and `managesieve.raw-input` while the
-session is not authenticated (a ManageSieve UNAUTHENTICATE returns to that
-state), and `smtp.raw-input` (SMTP, LMTP and submission) for a read made
-during a SASL exchange, a read with a line that starts an `AUTH` command,
-and a read that continues a request line begun as `AUTH` in an earlier
-read. Raw input after authentication, and every other SMTP read, is traced
-as upstream traces it. The residual: an operator who runs a patched
-binary, terminates TLS at a proxy in front of the server, or enables a
-plain-text port can still read the exchange off the wire or out of
-process memory, which the trust model already concedes for a running
-session; and a client that sends a credential after authenticating (a
-second LOGIN on an authenticated IMAP session, which the server refuses)
-or an SMTP `AUTH` line longer than the protocol's 4096-byte line limit
-has the part outside the masked reads traced.
+contact form, which shares the reader) are never traced. The mail
+protocols mask the authentication exchange for every account, since the
+account is unknown before authentication (issue #20). IMAP, POP3 and
+ManageSieve record `[redacted]` as the contents of `imap.raw-input`,
+`pop3.raw-input` and `manage-sieve.raw-input` and of their `raw-output`
+events, and as the details and tag of their protocol errors (`imap.error`,
+`pop3.error`, `manage-sieve.error`, and the IMAP parser's errors in a
+ManageSieve session), while the session is not authenticated: a response
+pipelined ahead of its continuation is parsed as a command and quoted by
+the parse error. IMAP and ManageSieve UNAUTHENTICATE return to that state.
+`smtp.raw-input` (SMTP, LMTP and submission) records `[redacted]` for a
+read made during a SASL exchange; a read that, joined to the unparsed start
+of the current request line, holds `AUTH` followed by a space or a tab
+anywhere, in any case (the parser can start a request mid-line, after a
+BDAT chunk); and every read after the server writes a 334 until the line
+answering it ends, which covers the MFA reply, a 334 that leaves the
+exchange. A message line holding `auth ` is masked with its read. Raw
+input after authentication, and every other SMTP read, is traced as
+upstream traces it. The residual: an operator who runs a patched binary,
+terminates TLS at a proxy in front of the server, or enables a plain-text
+port can still read the exchange off the wire or out of process memory,
+which the trust model already concedes for a running session; a client
+that sends a credential on an authenticated session has it traced, since
+the read is traced as the session's state stands when it arrives: a LOGIN
+or AUTHENTICATE on an authenticated IMAP session, an AUTHENTICATE on an
+authenticated ManageSieve session, or a LOGIN or AUTHENTICATE pipelined
+in one read after an UNAUTHENTICATE (all refused); and an SMTP `AUTH`
+line longer than the protocol's 4096-byte line limit has the part read
+after the server gives up on the line traced.
 
 ## 11. Testing
 

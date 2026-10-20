@@ -241,7 +241,11 @@ impl<T: SessionStream> Session<T> {
             Imap(trc::ImapEvent::RawOutput),
             SpanId = self.session_id,
             Size = bytes.len(),
-            Contents = trc::Value::from_maybe_string(bytes),
+            Contents = if matches!(self.state, State::NotAuthenticated { .. }) {
+                trc::Value::redacted()
+            } else {
+                trc::Value::from_maybe_string(bytes)
+            },
         );
 
         let mut stream = self.stream_tx.lock().await;
@@ -260,7 +264,7 @@ impl<T: SessionStream> Session<T> {
         if err.should_write_err() {
             let disconnect = err.must_disconnect();
             let bytes = err.serialize();
-            trc::error!(err.span_id(self.session_id));
+            trc::error!(self.traced_error(err).span_id(self.session_id));
 
             if let Err(err) = self.write_bytes(bytes).await {
                 trc::error!(err.span_id(self.session_id));
@@ -269,9 +273,21 @@ impl<T: SessionStream> Session<T> {
                 !disconnect
             }
         } else {
-            trc::error!(err);
+            trc::error!(self.traced_error(err));
 
             false
+        }
+    }
+
+    /// Issue #20: before authentication a protocol error can echo client
+    /// input (a SASL response parsed as a tag), so its trace redacts it.
+    fn traced_error(&self, err: trc::Error) -> trc::Error {
+        if matches!(self.state, State::NotAuthenticated { .. })
+            && err.matches(trc::EventType::Imap(trc::ImapEvent::Error))
+        {
+            err.redact(&[trc::Key::Details, trc::Key::Id])
+        } else {
+            err
         }
     }
 }
