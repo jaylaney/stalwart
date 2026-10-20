@@ -396,3 +396,100 @@ Round 2 reviewed clean (no Critical or Important finding). One follow-up, ruled 
 - Spec: 5.1 item (1) (one REPLY per local address holding a token in the copy's pairs; an address without one gets none; the skip when the helper yields nothing for every such address), rewrapped to 79 columns; 5.2 phase 3 (`5.3` for an untokened REPLY no longer arises); 6.4 step 2 and the `dropped` row.
 - Kill checks, against `619f66aa`, each restored with `git checkout -- crates/` and an empty `git status --short crates/` after: the fan-out building REPLYs from every local address (the helper bypassed in `full_state`) fails `tests/src/za/pinning.rs:3351:5`, `the entry is retired`; `contacts/pin` doing the same fails `pinning.rs:3372:5` (left delivered 0, dropped 1; right delivered 1, dropped 0).
 - Verification on `619f66aa`, one at a time: formatting (`http`, `tests`, `groupware`) clean; the per-task compile check `clean`, the upstream warning totals unchanged; `cargo check -p tests --tests` with no warnings; `cargo test -p groupware` 95 passed; `cargo test -p http@0.16.26 --features test_mode` 6 passed; `za_tests` 1 passed in 83.18 s (leak scan: 4113 records, 88 archives, 8 blobs, 988 search index records (644 of the account, none calendar), 5 events, 3 calendars, 4 items, 4 emails; negative control caught 29 violations); with `BLOB_STORE=FileSystem` 1 passed in 83.72 s (leak scan: 4082 records, 71 archives; negative control caught 29 violations); `webdav_tests` 1 passed in 21.52 s, `cal_itip` on the first run; with `ZA_KEY_ACCOUNTS=1` 1 passed in 25.85 s.
+
+## Backlog triage
+
+On 2026-10-20 every open item of plans 10, 11 and 12 (this note's "Deferred findings", "Final review" and "PR #40 review", the plan 11 note's "What stays open" and task-review minors, and the plan 10 note's deferred findings not resolved since) was checked against `main` at `c3a2ac2d` and sorted: 24 to fix and 4 for the owner to decide, filed as issues; 59 closed below with the reason; 16 already fixed or decided. Notifications are tracked separately in #41. This section supersedes the open lists above and in the plan 10 and 11 notes: an item not in an issue is closed here.
+
+Filed on `jaylaney/stalwart`:
+
+- #42 Pin record and vault storage: unit tests for the stored format and `za_pin_transact`
+- #43 Key pinning's fail-closed paths and the self-check: integration tests and an independent test unwrap
+- #44 Withheld entries that never retire: stranded addresses and oversize full states (decision needed: F1, F4)
+- #45 Drain resilience: a corrupt inbox archive, `contacts/pin`'s unbounded drain, a test-session coupling (bug; decision needed: F9)
+- #46 Traces and comments: the fail-closed refusal trace and stale comments
+- #47 Fan-out and redelivery code structure
+- #48 Delegation in the drain merge: guard or re-ask delegates (decision needed)
+
+### Closed
+
+| # | Item | Source | Reason it is safe to close |
+|---|------|--------|----------------------------|
+| 1 | Untested record operations (`set_pin` replacing, `remove_pin`, `pin`, `entry`, `entries_of`, `refuse` with instances, `union` with `other.all`) | plan 12 T1 | Each is a few lines and the za pinning cases exercise all but `union` with `all` (case 4 replaces a first-use pin, cases 5/14/15 forget, case 13 retires per document, cases 11/19 refuse with instances); `union` with `all` is three lines that set a flag. |
+| 2 | A new refusal draws its id twice (`pins.rs:247-262`) | plan 12 T1 | Cosmetic; correct and cheap. |
+| 3 | `unwrap_private_key` maps a wrong-length wrap to `Aead` (`keys.rs:332-345`) | plan 12 T1 | Both mean "opens under neither purpose"; every caller treats them the same (`Neither`, 409, suspension). |
+| 4 | `archive.len() as u32` unchecked (`pins.rs:134`) | plan 12 T1 | A pin record of 4 GiB cannot exist (it rides in one registry value). |
+| 5 | `generate_keypair` could call `derive_public_key` (`keys.rs:245-258`) | plan 12 T1 | Refactor with no payoff. |
+| 6 | Report paraphrased the compile-check evidence | plan 12 T1 | Process note, already applied to later dispatches. |
+| 7 | Invalidation-failure `trc::error!` duplicated (`common/src/auth/vault.rs:439`, `http/src/api/vault.rs:491`) | plan 12 T2 | Two call sites, one string; no behaviour. |
+| 8 | Mark test does not assert `neither.vault.is_some()` / `pinned.vault.cas` | plan 12 T2 | A mark read without the vault would fall to the pin-only write on a heal, which case 9 (M57) catches. |
+| 9 | `pins_key` defined twice (`tests/src/utils/za.rs`, `vault.rs`) | plan 12 T2 | Defensible as an independent writer key (the note says so). |
+| 10 | Reported test output carries upstream warnings and the linker notice | plan 12 T2 | Process note; not in fork code. |
+| 11 | Normalization test uses `bob@example.com` | plan 12 T2 | No account involved; plan-mandated. |
+| 12 | Both-or-neither test's closing check no longer proves the pin set | plan 12 T2 | Integration case 1 ("the first pin creates the record") catches the mutant. |
+| 13 | Comment wording at `vault.rs:524-527` | plan 12 T2 | Accurate, merely dense. |
+| 14 | `za_private_key`'s fast path derives the public key every pass | plan 12 T3 | One X25519 per pass with pending items; negligible. |
+| 15 | Approved spec still names `za_open_private_key` (spec lines 209, 217, 356) | plan 12 T3 | Recorded under the outcome note's "Spec notes"; the approved revision is not edited for names. |
+| 16 | `update.rs:569` `map_or("", ..)` hides the lease invariant | plan 12 T4 | A key-account create always holds the lease; plan 11 m8 argues the opposite style for the same arm; no behaviour. |
+| 17 | Plan-mandated unit tests (`a_later_delivery_replaces_a_key_refusal` passed before; `refused_instances_are_recorded_by_instant` lacks THISANDFUTURE / several overrides) | plan 12 T4 | Instance keys are pinned by `instance_keys_agree_with_itip_snapshot` and M72; the extra fixtures guard nothing new. |
+| 18 | RED 2 showed only `case_01` failing; suite runs predate fmt | plan 12 T4 | Process note; every case has since run green and under the mutation table. |
+| 19 | The Task 3 ruling's 409 path (self-check `Err` with `Some(Ok)` then `Neither`) untested | plan 12 T5 | A mid-session race only; the outcome is a refusal either way (409 or 500), never a write. |
+| 20 | F11 / Task 5 minor: all-zero counts when the post-pin pin read fails (`contacts.rs:442-449`) | plan 12 T5, final review F11 | Ruled: spec 6.4 says redelivery failures never fail the pin; a store error only; the next listing corrects it. |
+| 21 | New trace string "withheld entry not redelivered" | plan 12 T5 | Recorded under "Spec notes"; the spec fixes no Details strings there. |
+| 22 | Case 4's 32-entry call vs `za_post`'s 5 s timeout | plan 12 T5 | Flake risk under load only, never a false pass; not observed in CI. |
+| 23 | `za_reseal_again`'s second-loss branch untested (`contacts.rs:907`) | plan 12 T5 | One match arm that writes nothing and leaves the entry `remaining`; the first loss is tested (case 17 (e)). |
+| 24 | Cases 17 (e) and (c) index `[0]` without asserting non-empty | plan 12 T5 | Only the panic text differs; the test still fails. |
+| 25 | calcard resolves only named zones (custom TZID floating) | plan 12 T6 | Upstream parity, on purpose (ruling); recorded under "Spec notes". |
+| 26 | `za_fan_out` clones the tree and runs `itip_snapshot` on every non-deletion fan-out | plan 12 T6 | One clone per scheduled PUT; no measurable cost against the sealing work around it. |
+| 27 | `update.rs:237` discards `za_sequence_floor`'s bool | plan 12 T6 | Upstream does the same for a SEQUENCE-only edit. |
+| 28 | `za_instance_keys` hand-mirrors `itip_snapshot` | plan 12 T6 | Recorded under "Merge hotspots"; guarded by `instance_keys_agree_with_itip_snapshot`. |
+| 29 | The floor's gate and the reconciliation's gate disagree on malformed or client-scheduled trees | plan 12 T6 | Such trees produce no server iTIP messages, so there is nothing to reconcile. |
+| 30 | Every key attendee DELETE pays a lookup and a pin read; a calendar DELETE pays it per event | plan 12 T7 | A cached account lookup plus one small record read per event, beside the event archive read and unseal the DELETE already does; the spec mandates resolve-then-read. |
+| 31 | The deletion retires entries before the delete batch commits | plan 12 T7 | Spec 5.4's order, a stated loss (outcome note "Spec notes"). |
+| 32 | `tests/src/za/pinning.rs` is 4459 lines; `parse` duplicates `inbox::parse`; generic helpers could move | plan 12 T7 | Test-module refactor with no guarded behaviour; do it when next touching the module. |
+| 33 | `case_11_failed_full_state`'s `itip_max_size` reset skipped by a panic | plan 12 T7 | A panic ends the suite anyway. |
+| 34 | `rkyv::to_bytes` may reallocate, leaving unzeroed copies of the pin archive | plan 12 extra concern (Task 1) | The pin record holds no secret key material (public keys, addresses, UIDs); the same plaintext passes through many unzeroed allocations (calcard parsing, iCalendar trees, request bodies) during a session, which the trust model accepts ("the running server holds plaintext during a session"); zeroing one buffer buys no guarantee. |
+| 35 | Task 3's first GREEN za run timed out at load 436 | plan 12 extra concern (Task 3) | Load-induced; the unchanged rerun and every later run passed. |
+| 36 | F7: `contacts/pin` builds the full REQUEST before taking the UID lease (`contacts.rs:667-671`) | plan 12 final review F7 | Ordinary update PUTs take no lease, so the reorder would not fence the race that matters; step 4's archive assertion already catches it (`remaining`), leaving limit 7's transient. |
+| 37 | PR #40 Minor 3: a failing item's side effects repeat up to three times per call | plan 12 PR #40 | Bounded by `DRAIN_ITEM_FAILURE_LIMIT`; the repeated items are idempotent deliveries. |
+| 38 | PR #40 Minor 4: a delivered REPLY is resent every call while its sibling fails | plan 12 PR #40 | Designed (spec 6.4 step 3: the entry stays until every REPLY was written); a repeated REPLY merges idempotently. |
+| 39 | PR #40 Minor 5(b): the `None` to `All` arm has no kill check (`drain.rs:240-246`) | plan 12 PR #40 | `All` is the safe direction (every attendee-side entry waits). |
+| 40 | PR #40 Minor 7: a failed rotation-only write traces "withheld entries not retired" (`contacts.rs:552`) | plan 12 PR #40 | Cosmetic; the trace still marks the failed cleanup write. |
+| 41 | PR #40 Minor 8: api.md stop rule after a failed cleanup write | plan 12 PR #40 | Lives in `jaylaney/circulo-account`'s api.md, outside this backlog (the Circulo exclusion). |
+| 42 | `replies_only_from_addresses_holding_a_token` has no recorded kill run (`groupware/src/calendar/pinning.rs:566`) | PR #40 last round (c) | Fix round 3's two kill checks bypass the same filter and fail `pr_6` on both paths, so the rule is pinned. |
+| 43 | Per-request since-query and a full inbox read on any change; the cap multiplies it | plan 10 T2, plan 11 m7 | Spec 6.2 accepts the cost; upstream's `expunge_scheduling_inbox_after` bounds the inbox; F9 (issue 4) covers the one place it compounds within a request. |
+| 44 | The drain test module is large enough to split | plan 10 T3, plan 11 | Test refactor with no guarded behaviour. |
+| 45 | Pruning `skipped` must also clear `waiting`; `skipped` is never pruned | plan 11 final review, plan 11 T3 | Only another session can drain a skipped item, and that session drains the items waiting behind it too; the stuck session's view clears at its end. |
+| 46 | `update.rs:585` `za_lease.take().expect(..)` cannot fire | plan 11 m8 | Unreachable by construction (the arm needs a fence, which needs the lease); the expect states the invariant. |
+| 47 | `record_failure` keeps the first UID; no test pins it (`vault/src/session.rs:66-79`) | plan 11 fix-wave re-review | An item's path to a counted failure is decided by its own bytes (decode fails with no UID, otherwise the UID), so an item's failures never name two UIDs. |
+| 48 | A deterministic failure before the UID is known stalls the session at that item | plan 11 fix-wave re-review | Accepted; a fresh session retries; the corrupt-archive case is issue 4. |
+| 49 | `MergeResult::None` sentence sits in spec 13's Names bullet | plan 11 T1 | Plan-mandated, no contradiction. |
+| 50 | The fan-out's own lost-fence diagnostic is discarded at the create (`update.rs:584-594`) | plan 11 T2 | `za_lost_create_fence` traces the outcome (`dav/src/calendar/mod.rs:238-242`); the extra detail adds nothing an operator acts on. |
+| 51 | `.map(\|_\| ())` vs `\|()\|` | plan 11 T2 | Cosmetic. |
+| 52 | Assertions without messages (`drain_limits.rs`, `drain.rs` tests) | plan 11 T3, T4 | The tests still fail; only the message differs. |
+| 53 | A lost assertion in `ItemCtx::commit` counts toward the failure limit | plan 11 T3 | Within ruling R2, self-limiting, a fresh session retries. |
+| 54 | Exactly 32 attempts followed only by unmarked waiting items return `More` | plan 11 T3 | One extra request, no deferral. |
+| 55 | `waiting`/`skipped` keyed by document id assume ids are never reused | plan 11 T3 | Ids come from `assign_document_ids`, never reused (`dav/src/calendar/update.rs:552-554` relies on the same). |
+| 56 | The lease-wait timing also spans the app password's first Argon2 | plan 11 T4 | The lower bound still discriminates. |
+| 57 | PR #36 M1: the lost-fence error path is defence in depth no test pins | plan 10 PR #36 | Every later delegate write asserts the same lease key, so a `5.1` regression delivers nothing more, and the commit's own fence ends the merge. |
+| 58 | PR #36 M4, M6, M9, M10 (two account ids in the error; case G's closing steps; any assertion read as lost fence; naming and allocations in `is_new`) | plan 10 PR #36 | Cosmetic, or true by construction (the fence is the batch's only assertion). |
+| 59 | Plan 10 leftovers: `maintenance.rs`'s `?`; the lost-fence extra trace; Step 1's "trigger 1" comment (`tests/src/za/drain.rs:112`); the repeated prelude, `set_partstat`'s suffix match, the module split; case E's redundancies; Task 5's test nits (`request_tree` positive control, step 4, the corruption closure, the quota restore, fixture split) | plan 10 deferred minors | Informational, accepted by ruling, or dropped by plan 10's own final-review triage; `set_partstat`'s match is anchored by `mailto:`; no behaviour guarded. |
+
+### Already fixed or decided
+
+- Plan 12 T2: CLAUDE.md said only vault records are exempted. Fixed in `49447c1f` (CLAUDE.md now names fields 150 and 151).
+- Plan 12 T3: CLAUDE.md's vault-write rule did not name `vault_commit_store`. Fixed in `49447c1f` (CLAUDE.md names `self_check_store` and `vault_commit_store`).
+- Plan 12 T4: the `fanout.rs` doc said "the refusal id phase 1 read". Fixed in `589d5485` (`Verdict`'s doc says "the state decided on").
+- Plan 12 T4: a deletion with no internal recipient read pin state unused. Resolved by Task 7 (`589d5485`), which consumes that read (`fanout.rs:323-345`); its cost is CLOSE row 30.
+- Plan 12 T5: a step 4 reseal error after delivery counted as `failed` beyond spec 6.4's list. Spec 6.4's `failed` row now lists it (`docs/superpowers/specs/2026-10-17-zero-access-key-pinning-design.md:873`, fix round 1 `a64dd963`).
+- Plan 12 final review F2 and F8, and PR #40 Minor 2. Resolved in `5eae6467` and `619f66aa` (the outcome note's "PR #40 review").
+- Plan 12 final review F3, F5, F12. Fixed in `43b93399`.
+- Plan 12 F4 documentation half. Fixed in Circulo `940dd5d`.
+- Plan 11 T1 spec minors (11's lease cases pointer, 5.4's other-reason commit failure, 6.2's counted failures, the hooks sentence, the Names bullet). Fixed in plan 11's documentation commit.
+- Plan 11 T3: an item skipped with `uid: None` blocked nothing. Fixed in `08eb37d3` (a prologue failure is no longer counted).
+- Plan 10 open items for Jay: F2 (the 412 after delivered items), the delegating merge's fan-out residual, and F1's spec 5.1 amendment. Decided on 2026-10-16 and recorded by plan 11 Task 1 (spec 5.1 follows the owner's key status; spec 5.4 accepts the bounded residual, rejects compensating deletion and has updates take no lease; the create's fan-out is fenced, `update.rs:579`).
+- Plan 10 follow-up minors 1-4, 6, 7, 9, and Task 1/3/4/5 test minors. Resolved by plan 11 (its Tasks 3-5; listed in the plan 10 note's pointer line).
+- Plan 10 follow-up minor 5 (`Step::Nothing` history vs `MergeResult::None`). Documented in spec 13's Names bullet (plan 11 Task 1).
+- Plan 10 follow-up minor 8 (CLAUDE.md status sentence). CLAUDE.md now has separate status and location paragraphs.
+- Plan 10 T2: a recorded private-key failure deferred 30 s. Fixed by plan 11 (`PERMANENT_DEFERRAL`, `drain.rs:310`, `:349`).
+- Plan 10 T2: `MissingUid` / `NoSchedulingInfo` as history against spec 6.5. Spec 6.5 amended by plan 11 Task 1.
