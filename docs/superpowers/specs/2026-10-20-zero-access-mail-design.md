@@ -1,9 +1,13 @@
 # Zero-access mail: encryption at rest (release 3) design spec
 
-Date: 2026-10-20. Status: revision 3, draft for review. Revision 3
-answers the review's second pass: the fence's backend rule and the
-compensating blob delete (6.1, F1a and F1b), the two download branches
-(7, F5) and the revocation wording (4, C1). Scope: release 3
+Date: 2026-10-20. Status: revision 4, draft for review. Revision 3
+answered the review's second pass: the fence's backend rule (6.1, F1a),
+the two download branches (7, F5) and the revocation wording (4, C1).
+Revision 4 answers its third: the compensating blob delete is withdrawn
+in favour of upstream's staging behaviour, stated as a limit (2, 6.1,
+12; F1b.1 and F1b.2), provisioning rechecks emptiness after the fence is
+up (6.1, F1c), and the refresh explanation is narrowed (4, C1). Scope:
+release 3
 of the zero-access fork (jaylaney/stalwart), item 3 of release 1 spec
 section 1.2; GitHub issue #19, milestone "Release 3: mail encryption"
 (issues #19, #20 and #21). Revision 2 incorporates the six findings and
@@ -116,11 +120,15 @@ administrator, and demands for stored data.
   acceptance until local delivery completes and the next blob purge; and
   of an outbound message from submission until it is relayed, which can be
   days for an undeliverable message. The queue is upstream's and is not
-  account-bound. A delivery that loses the provisioning race (6.1) may
-  leave its plaintext blob under a temporary link for at most the hold
-  plus one purge interval if the server crashes before the compensating
-  delete. The product copy must say that mail in transit is not covered,
-  and that the operator's logs record who sent mail to whom and when.
+  account-bound. A delivery that loses the provisioning race (6.1) is a
+  failed ordinary ingest and leaves what any failed ingest leaves: if it
+  had staged its blob before its batch (a message Sieve modified), that
+  plaintext blob stays under its 60-second temporary link until the first
+  blob purge after the link expires, provided no other link to the same
+  bytes exists (another account's link means another account's copy of
+  identical bytes). The product copy must say that mail in transit is not
+  covered, and that the operator's logs record who sent mail to whom and
+  when.
 - **Key residency on connections.** A mail client cannot be re-asked for
   its password, so a session's keys live as long as its authenticated
   connection (section 3.3). For an IMAP connection kept open with IDLE,
@@ -302,13 +310,13 @@ token that compares neither the password nor the vault generation, so it
 keeps its keys until it ends; a POP3 session has no refresh and keeps its
 keys until it ends whatever credential it used. A password change or
 recovery therefore leaves existing password sessions running until they
-close, as upstream leaves every account's sessions. A failed refresh does
-not end the connection either: an operation that refreshes (LIST, SELECT,
-APPEND, IDLE's change check) runs in a spawned task whose error is
-written to the client and logged without changing the session state, so
-an app-password IMAP session whose credential was revoked gets errors on
-those operations but may keep its keys, and a selected mailbox it can
-still fetch from, until the connection ends. The product copy therefore
+close, as upstream leaves every account's sessions. A failed refresh need
+not end the connection either: SELECT and APPEND refresh on the main
+session path, where an authorization failure can close it, but a spawned
+operation such as LIST logs the failure without changing the session
+state, so an app-password IMAP session whose credential was revoked may
+keep its keys, and a selected mailbox it can still fetch from, until the
+connection ends. The product copy therefore
 says that neither a password change nor an app-password revocation
 disconnects clients already connected, and that their sessions end when
 the client disconnects or the server's inactivity timeout closes them. A
@@ -501,6 +509,26 @@ assertion is one line in each batch for every account and is recorded as
 an invariant 9 exception (section 12). The key-account path asserts
 nothing on the record: the public key never changes once active.
 
+**The recheck** (review F1c). The assertion handles provisioning winning
+the race; the reverse order would strand the account: `setup-token`'s
+emptiness check passes, a delivery commits plaintext while the record is
+still absent (its assertion rightly succeeds), the record and marker are
+written, the token is returned, and `setup` then finds the message and
+answers 409 for an account that is now marked and pending. So
+`setup-token` rechecks, after writing the pending record and before
+writing the marker, that the account holds no mail and no calendar data.
+Once the record exists no ordinary writer can commit (the fence), and on
+the supported stores a writer that read the key as absent before the
+record's commit fails its own commit, so the recheck sees every message
+that could ever land. If it finds one, `setup-token` removes the pending
+record it wrote, conditional on the revision it wrote, and answers the
+409 the first check would have given; a crash between the record write
+and the recheck leaves a record without a marker, the state reissuance
+already repairs, and the reissue rechecks before it writes the marker.
+Only `setup-token` creates the record, so `setup` keeps its existing
+check as a backstop and the operator path issue #10 recorded stays the
+recovery for anything else.
+
 **What the assertion relies on, per store.** The fence is only as good as
 the backend's handling of an assertion on an absent key. RocksDB evaluates
 it with `get_for_update` inside an optimistic transaction taken on a
@@ -541,18 +569,26 @@ implementations, which the leak scanner skips today. The product build
 ships RocksDB.
 
 **Persistence before the batch** (review F1b). A delivery that Sieve
-modified, and every ingest that arrives without a queue blob, writes its
+modified, and every ingest that arrives without a queue blob, stages its
 blob through `put_temporary_blob` before the batch, under a 60-second
-temporary link. When the batch then fails the vault assertion, that blob
-is a plaintext copy outside the queue. `email_ingest` therefore remembers
-whether `put_temporary_blob` wrote the bytes (it skips the write when a
-blob with that hash already exists, in which case the bytes are another
-document's) and, on a failed vault assertion, deletes the blob it wrote
-and its temporary link before returning the temporary failure. The
-residual is a crash between the blob write and that delete, after which
-the blob is unlinked when its hold expires and removed by the next blob
-purge; the design states it next to the queue limit (section 2). A
-delivery that reuses the queue blob writes nothing before the batch.
+temporary link. When the batch then fails the vault assertion, or any
+other step after the staging fails (UID allocation, the batch write, a
+cancelled task), that blob is a plaintext copy outside the queue. The
+design does **not** compensate by deleting it: blobs are content-addressed
+and global, so a hash this delivery wrote may already be linked by
+another account that ingested identical bytes, a written flag cannot
+establish ownership, and a delete that left the commit marker behind
+would make a later ingest of the same bytes skip its write and store a
+message with no body. Instead the staged blob takes upstream's path for
+every failed ordinary ingest of every account: its temporary link expires
+after 60 seconds and the first blob purge after that removes the bytes
+and the commit marker, provided no document link and no unexpired
+temporary link of another writer exists; if another account linked the
+same bytes, the bytes stay as that account's copy. That lifetime holds
+for every exit after staging, crash included, and depends on the
+maintenance task running; it is stated as a limit next to the queue
+(section 2) and qualifies invariants 24 and 28. A delivery that reuses
+the queue blob stages nothing.
 
 For a key-account recipient:
 
@@ -641,8 +677,8 @@ copy to Sent is an APPEND (6.2).
 `POST /api/vault/setup-token` and `POST /api/vault/setup` refuse an
 account that holds any message, as they refuse one with calendar data
 (`za_has_documents` extended to `Collection::Email`), with the same 409;
-the fence of 6.1 closes the window between that check and a delivery in
-flight. A plaintext message found in a key account, recognised by the one
+the fence and the recheck of 6.1 close the window between that check and
+a delivery in flight in either order. A plaintext message found in a key account, recognised by the one
 discriminator of 5.2 (a `raw_headers` field that does not start with the
 format byte; `contents` is non-empty for stubs and plaintext alike), is
 served as plaintext: there is no write that would seal it, and refusing
@@ -762,7 +798,7 @@ same words as the IMAP text.
 | JMAP key-needing methods on a keyless token (WebSocket, Bearer, API key, shared account) | `forbidden` at the dispatcher (section 4); keyless methods work |
 | `/jmap/upload`, `Blob/upload` without the target account's keys | 403 / `forbidden` before any reservation (section 4) |
 | Raw consumers of a sealed source (`Blob/upload` data sources, `FileNode/set`, `FileNode/copy`) | refused for any key-account upload, message or section blob id (5.7) |
-| Ordinary delivery racing provisioning | the batch asserts no vault record; temporary failure, the early blob deleted, retry (6.1) |
+| Ordinary delivery racing provisioning | the batch asserts no vault record; temporary failure and retry; `setup-token` rechecks emptiness after the record write; a staged blob follows upstream's purge (6.1) |
 | Key accounts on PostgreSQL or MySQL | `setup-token` refuses issuance, 409 with a fixed reason (6.1) |
 | Milter, hook and filter events for a transaction delivering to a key account; IMAP and POP3 command events in a key-account session | contents redacted (section 10) |
 | Push with email properties | state-only payload |
@@ -878,15 +914,20 @@ legacy plaintext archive, both with non-empty `contents`, are told apart
 by the `raw_headers` marker alone; **the provisioning fence**: a delivery
 paused by a test hook after its account read, while `setup-token` and
 `setup` complete, then resumed, ends in a temporary failure and a sealed
-delivery on retry, with no plaintext archive stored and the blob a
-Sieve-modified variant of it wrote deleted before the failure returns;
-the same race for `copy_message` ends in the cross-account refusal; and,
-because the deterministic pause cannot sit inside the store's
-transaction, a stress test races ingest batches carrying the assertion
-against vault-record writes through the store API in a loop and asserts
-that no message batch ever commits after a record exists, run on RocksDB
-in CI and on FoundationDB and SQLite when those stores run; `setup-token`
-refused on PostgreSQL and MySQL; **offsets**: a delivered message with
+delivery on retry, with no plaintext archive stored; the Sieve-modified
+variant of it leaves its staged blob, which is unlinked after the hold
+and gone after a purge, and the identical bytes ingested meanwhile by a
+plain account stay readable there; the reverse order, `setup-token`
+paused after its first emptiness check while a delivery commits, ends in
+409 with no record and no marker, and a reissue after the mail is
+removed succeeds; the same race for `copy_message` ends in the
+cross-account refusal; and, because the deterministic pause cannot sit
+inside the store's transaction, a stress test races ingest batches
+carrying the assertion against vault-record writes through the store API
+in a loop and asserts that no message batch ever commits after a record
+exists, run on RocksDB in CI and on FoundationDB and SQLite when those
+stores run; `setup-token` refused on PostgreSQL and MySQL; **offsets**:
+a delivered message with
 the server's prepended headers, a MIME attachment and a nested message
 round-trips through FETCH `BODY[]`, `BODY[2]`, `BODY[HEADER.FIELDS]`,
 Email/get `bodyValues` and a section download, where the whole-message
@@ -950,7 +991,9 @@ Added:
     whatever wrote it (delivery, Sieve, APPEND, Email/set, Email/import,
     copy). No writer stores a plaintext blob or a plaintext metadata
     archive for a key account, and a writer that classified the account as
-    ordinary asserts in its batch that no vault record exists (6.1).
+    ordinary asserts in its batch that no vault record exists (6.1); the
+    blob such a writer staged before its failed batch is upstream's
+    transient of invariant 28, not a stored message.
 25. The stub carries exactly the arrival time, the blob hash, the sealed
     bundle and the empty root part; nothing else. The unsealed metadata is
     a content view; the stored stub is what writes assert on and what
@@ -962,7 +1005,9 @@ Added:
     search document holds arrival time and size only.
 28. Plaintext of a key account's mail exists outside process memory only
     in the SMTP queue, inbound until delivery completes and outbound until
-    relay, and this is stated to the user as a limit.
+    relay, and in the staged blob of an ordinary ingest that failed after
+    staging during provisioning, until its temporary link expires and the
+    next blob purge runs (6.1); both are stated to the user as limits.
 29. Delivery never reads a session key and never stores in the clear: a
     recipient without a served public key gets a temporary failure.
 30. Traces of a key account's mail sessions and of a transaction that
@@ -1025,12 +1070,12 @@ unless the code says otherwise.
     fits their fixtures; the plan sizes the variants from that.
 11. **The fence's plumbing.** Confirm that a failed `AssertValue::None`
     surfaces from `email_ingest` to `deliver_message` as a temporary
-    failure rather than a permanent one, that `put_temporary_blob` can
-    report whether it wrote the bytes (or ingest checks `blob_exists`
-    first), and how `setup-token` learns the data store's kind for the
-    PostgreSQL and MySQL refusal. Recommendation: a store-kind accessor on
-    `Storage`, and a `za_` wrapper around `put_temporary_blob` in the
-    email crate that returns the written flag.
+    failure rather than a permanent one, how `setup-token` learns the data
+    store's kind for the PostgreSQL and MySQL refusal, and that the
+    pending record can be removed conditional on its revision for the
+    recheck's abort (`za_vault_commit` or a sibling that deletes).
+    Recommendation: a store-kind accessor on `Storage`, and the delete as
+    one more conditional vault write through the common helper.
 12. **The structured-event inventory.** Enumerate the `trc::event!` sites
     of section 10's rule and the keys each carries; decide per site
     between `[redacted]` and dropping the key. Recommendation:
