@@ -5,7 +5,7 @@ Plan 12 builds the server side of key pinning (spec `2026-10-17-zero-access-key-
 
 ## Where things stand
 
-- Commits on `plan12-key-pinning`, cut from `key-pinning-spec` at `f2ece889` (the plan, on top of the spec at `eb219e60`). Pushed to `origin` through `8a2e83e8` as PR #40 (https://github.com/jaylaney/stalwart/pull/40, base `main`); the PR #40 review's commits after it are local.
+- Commits on `plan12-key-pinning`, cut from `key-pinning-spec` at `f2ece889` (the plan, on top of the spec at `eb219e60`). Merged into `main` through PR #40 (https://github.com/jaylaney/stalwart/pull/40) at `b1c29134` on 2026-10-20, branch head `f67654d2` (the PR #40 review's commits and `800fe5c2`, CLAUDE.md's hotspot and hook additions, included); the branch is deleted.
   - Task 1 `6c2cd598` (fingerprints, wrap marks, the sealed pin record, field 151);
   - Task 2 `d839411c` (the common vault commit helper, pin-record reads and conditional writes), fix round `5c98116c` (one vault batch writer, both assertions before both sets, no record under a neither mark);
   - Task 3 `7c6b6b2f` (the self-check on every session's first drain pass);
