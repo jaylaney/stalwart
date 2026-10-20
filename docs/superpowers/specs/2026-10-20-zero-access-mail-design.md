@@ -513,7 +513,8 @@ isolation (`crates/store/src/backend/{postgres,mysql}/write.rs`), which
 has no row to lock when the key is absent, does not block the concurrent
 insert, and is not re-checked at commit (review F1a). On those two
 stores the assertion is not a fence. This release therefore supports key
-accounts on RocksDB, FoundationDB and SQLite: `POST /api/vault/setup-token`
+accounts on RocksDB, FoundationDB and SQLite (decided with Jay,
+2026-10-20): `POST /api/vault/setup-token`
 refuses issuance with 409 and a fixed reason when the data store is
 PostgreSQL or MySQL, so a deployment learns it at provisioning rather
 than from a leak. Lifting that restriction means running the
