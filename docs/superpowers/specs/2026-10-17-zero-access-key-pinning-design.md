@@ -486,7 +486,11 @@ upstream's messages for it:
    `organizer_request_full(committed_tree, fresh_snapshot, None, false)` for
    that attendee, without a second `itip_finalize` (no second SEQUENCE bump);
    for an attendee, the refused instances' current participation (section 6.4's
-   helper). Both are built from the state being committed, reconciled (below),
+   helper), one REPLY per local address they are attended as, each routed and
+   carrying its own address's token as any REPLY (an address without a token
+   is not attempted, `5.3`), so that answers given from two of the account's
+   addresses are both sent; the entry is retired only when every one of them
+   and upstream's messages were written. Both are built from the state being committed, reconciled (below),
    never from a superseded tree: the deletion flag marks a pre-deletion one.
    Item (1) is skipped when any message of item (2) is a METHOD:REQUEST
    containing the master scheduling component (no RECURRENCE-ID): upstream
@@ -497,7 +501,8 @@ upstream's messages for it:
    METHOD:CANCEL with the master component (the address removed from the master
    while an override still names it; the CANCEL then cancels every instance of
    the copy, upstream's `cancel_all_instances`, parity), and when the full
-   state yields nothing for the address (the attendee's helper, or the full
+   state yields nothing for the address (the attendee's helper for every local
+   address, or the full
    REQUEST for a DECLINED, RSVP=FALSE, SCHEDULE-AGENT=CLIENT or NONE attendee).
    After any of the three skips the entry is retired with upstream's messages.
 2. Upstream's own messages for the address in this change, in upstream's order
@@ -587,8 +592,9 @@ runs in four phases, after section 5.1's reconciliation:
 3. Write the items of the recipients decided "deliver". Every recipient's
    items follow upstream's message order (the full REQUEST before a
    partial), entry or not; with an entry the full state comes first
-   (section 5.1). A failed full state (`5.1`) never stops upstream's
-   messages.
+   (section 5.1), every one of an attendee's full-state REPLYs. A failed
+   full state (`5.1`, or `5.3` for a REPLY whose address holds no token)
+   never stops upstream's messages.
 4. Retire, in one more conditional pin-record write asserting the bytes phase 2
    wrote (or those read in phase 1 when phase 2 wrote nothing): the entries of
    recipients whose items were all written, and for a deletion's fan-out every
@@ -603,7 +609,7 @@ runs in four phases, after section 5.1's reconciliation:
    included. Otherwise a newer refusal re-armed the entry, and it stays. A
    failed or skipped retirement leaves the entry and never undoes a written
    item. When `contacts/pin` sets `redelivery`, the fan-out sends only the
-   message it was given (already the full state), adds no other item and
+   messages it was given (already the full state), adds no other item and
    retires nothing: the endpoint's guarded step 5 is its only cleanup. A heal
    by this write is a generation bump after the items and before the sender's
    commit.

@@ -98,6 +98,7 @@ pub async fn test(test: &mut TestServer) {
     pr_2_a_reply_per_local_address(test).await;
     pr_3_wait_scoped_to_skipped_uids(test).await;
     pr_4_rotation_identity_and_failed_cleanup(test).await;
+    pr_5_ordinary_put_replies_per_local_address(test).await;
 }
 
 /// Spec 9 case 1: alice, who never pinned, invites bob. The fan-out pins
@@ -3223,38 +3224,138 @@ async fn pr_1_failed_entries_rotate(test: &TestServer) {
 /// retired.
 async fn pr_2_a_reply_per_local_address(test: &TestServer) {
     let (alice, bob, _) = parties(test);
-    let admin = test.account("admin@example.com").clone();
     let (alice_start, bob_start) = (
         inbox_ids(test, alice.id).await,
         inbox_ids(test, bob.id).await,
     );
-    let domain_id = admin.find_or_create_domain("pin-alias.test").await;
-    let bob_account = test.account(BOB).id();
+    bob_alias(test, true).await;
+    let (path, _) = two_address_answers(test, &alice, &bob, "pin-pr2").await;
+    let fingerprint = display_fingerprint(&served(test, alice.id).await);
+    assert_eq!(
+        pin(BOB, ALICE, &fingerprint).await.expect(200),
+        json!({"ok": true, "delivered": 1, "failed": 0, "dropped": 0, "remaining": 0})
+    );
+    assert!(withheld(test, bob.id, ALICE).await.is_empty());
+    assert_eq!(trigger_drain(ALICE, STRONG).await, 207);
+    assert_eq!(
+        partstat_in(&alice.client, &path, None, BOB)
+            .await
+            .as_deref(),
+        Some("ACCEPTED"),
+        "the master's answer, from the primary address"
+    );
+    assert_eq!(
+        partstat_in(&alice.client, &path, Some(X), BOB_ALIAS)
+            .await
+            .as_deref(),
+        Some("TENTATIVE"),
+        "X's answer, from the alias"
+    );
+
+    // Cleanup.
+    delete_event(&alice, &path).await;
+    alice.delete_items_since(test, &alice_start).await;
+    clear_recipient(test, &bob, &bob_start, "pin-pr2").await;
+    bob_alias(test, false).await;
+}
+
+/// PR #40 review, fix round 2 (spec 5.1 item 1): `pr_2`'s two refused
+/// answers recovered by an ordinary PUT instead of `contacts/pin`. With
+/// alice's key restored, bob changes only X (the alias) to ACCEPTED; the
+/// fan-out's full state is one REPLY per local address, so alice gets the
+/// master's answer too, and the entry is retired.
+async fn pr_5_ordinary_put_replies_per_local_address(test: &TestServer) {
+    let (alice, bob, _) = parties(test);
+    let (alice_start, bob_start) = (
+        inbox_ids(test, alice.id).await,
+        inbox_ids(test, bob.id).await,
+    );
+    bob_alias(test, true).await;
+    let (path, copy) = two_address_answers(test, &alice, &bob, "pin-pr5").await;
+    assert_eq!(
+        rewrite(&bob.client, &copy, |body| edit_attendee(
+            &body,
+            BOB_ALIAS,
+            Scope::Overrides,
+            |line| Some(with_partstat(line, "ACCEPTED"))
+        ))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert!(
+        withheld(test, bob.id, ALICE).await.is_empty(),
+        "the entry is retired"
+    );
+    assert_eq!(trigger_drain(ALICE, STRONG).await, 207);
+    assert_eq!(
+        partstat_in(&alice.client, &path, None, BOB)
+            .await
+            .as_deref(),
+        Some("ACCEPTED"),
+        "the master's refused answer, from the primary address"
+    );
+    assert_eq!(
+        partstat_in(&alice.client, &path, Some(X), BOB_ALIAS)
+            .await
+            .as_deref(),
+        Some("ACCEPTED"),
+        "X's new answer, from the alias"
+    );
+
+    // Cleanup.
+    delete_event(&alice, &path).await;
+    alice.delete_items_since(test, &alice_start).await;
+    clear_recipient(test, &bob, &bob_start, "pin-pr5").await;
+    bob_alias(test, false).await;
+}
+
+/// Gives bob the second address `BOB_ALIAS` (on its own `.test` domain), or
+/// takes it away.
+async fn bob_alias(test: &TestServer, on: bool) {
+    let admin = test.account("admin@example.com").clone();
+    let aliases = if on {
+        let domain_id = admin.find_or_create_domain("pin-alias.test").await;
+        List::from_iter([EmailAlias {
+            name: "key2".to_string(),
+            domain_id,
+            enabled: true,
+            description: None,
+        }])
+    } else {
+        List::<EmailAlias>::from_iter([])
+    };
     admin
         .registry_update_object(
             ObjectType::Account,
-            bob_account,
-            json!({
-                Property::Aliases: List::from_iter([EmailAlias {
-                    name: "key2".to_string(),
-                    domain_id,
-                    enabled: true,
-                    description: None,
-                }]),
-            }),
+            test.account(BOB).id(),
+            json!({ Property::Aliases: aliases }),
         )
         .await;
-    assert!(
+    let bob_id = test.account(BOB).id().document_id();
+    assert_eq!(
         test.server
-            .account_info(bob.id)
+            .account_info(bob_id)
             .await
             .unwrap()
             .addresses()
             .iter()
             .any(|address| address == BOB_ALIAS),
-        "bob's addresses include the alias"
+        on,
+        "bob's addresses and the alias"
     );
-    // bob pins alice first.
+}
+
+/// `pr_2`'s and `pr_5`'s entry: bob (holding `BOB_ALIAS`) pins alice first;
+/// alice's daily event `uid` names bob as `key2@example.com` on the master
+/// and as the alias on override X; with alice's key substituted, bob's
+/// ACCEPTED on the master and his TENTATIVE on X are refused into one
+/// entry; alice's key restored. Returns alice's href and bob's copy's.
+async fn two_address_answers(
+    test: &TestServer,
+    alice: &Party,
+    bob: &Party,
+    uid: &str,
+) -> (String, String) {
     write_pin_record(
         test,
         bob.id,
@@ -3262,19 +3363,19 @@ async fn pr_2_a_reply_per_local_address(test: &TestServer) {
         &record_pinning(ALICE, served(test, alice.id).await),
     )
     .await;
-    let path = event_path(&alice, "pin-pr2");
+    let path = event_path(alice, uid);
     alice
         .client
         .request_with_headers(
             "PUT",
             &path,
             [CONTENT_TYPE],
-            recurring_invite("pin-pr2", &[BOB], &[BOB_ALIAS]),
+            recurring_invite(uid, &[BOB], &[BOB_ALIAS]),
         )
         .await
         .with_status(StatusCode::CREATED);
     assert_eq!(trigger_drain(BOB, STRONG).await, 207);
-    let copy = copy_href(test, bob.id, "pin-pr2").await;
+    let copy = copy_href(test, bob.id, uid).await;
     assert_eq!(
         partstat_in(&bob.client, &copy, Some(X), BOB_ALIAS)
             .await
@@ -3309,39 +3410,7 @@ async fn pr_2_a_reply_per_local_address(test: &TestServer) {
         "the entry records the master and X"
     );
     substitute_public_key(test, alice.id, &original, true).await;
-    let fingerprint = display_fingerprint(&served(test, alice.id).await);
-    assert_eq!(
-        pin(BOB, ALICE, &fingerprint).await.expect(200),
-        json!({"ok": true, "delivered": 1, "failed": 0, "dropped": 0, "remaining": 0})
-    );
-    assert!(withheld(test, bob.id, ALICE).await.is_empty());
-    assert_eq!(trigger_drain(ALICE, STRONG).await, 207);
-    assert_eq!(
-        partstat_in(&alice.client, &path, None, BOB)
-            .await
-            .as_deref(),
-        Some("ACCEPTED"),
-        "the master's answer, from the primary address"
-    );
-    assert_eq!(
-        partstat_in(&alice.client, &path, Some(X), BOB_ALIAS)
-            .await
-            .as_deref(),
-        Some("TENTATIVE"),
-        "X's answer, from the alias"
-    );
-
-    // Cleanup.
-    delete_event(&alice, &path).await;
-    alice.delete_items_since(test, &alice_start).await;
-    clear_recipient(test, &bob, &bob_start, "pin-pr2").await;
-    admin
-        .registry_update_object(
-            ObjectType::Account,
-            bob_account,
-            json!({ Property::Aliases: List::<EmailAlias>::from_iter([]) }),
-        )
-        .await;
+    (path, copy)
 }
 
 /// PR #40 review P2-3 (spec 6.4, the drain): a pending item that fails on

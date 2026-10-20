@@ -65,7 +65,9 @@ use crate::{
     calendar::{
         CalendarEventNotification, ChangedBy, EVENT_NOTIFICATION_ZA_PENDING,
         drain::instance_key,
-        pinning::{za_decline_all, za_full_request_for, za_participation_reply},
+        pinning::{
+            za_decline_all, za_full_request_for, za_participation_reply, za_reply_addresses,
+        },
         seal::{TOKEN_LEN, TokenPairs, seal_error, seal_pending_item},
         sequence::{ZaSequence, za_reconcile_sequences},
     },
@@ -162,7 +164,7 @@ pub struct ZaSource<'a> {
 /// the full current state ahead of a withheld recipient's own messages (the
 /// two-item rule); a `Deletion` records no withheld entry and, when it has a
 /// message to send, retires every entry of the deleted document; a
-/// `Redelivery` (`contacts/pin`) sends only the message it was given and
+/// `Redelivery` (`contacts/pin`) sends only the messages it was given and
 /// retires nothing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ZaFanOutKind {
@@ -424,8 +426,10 @@ impl ZaFanOut for Server {
         // order; a refused recipient's property gets `3.8`. In a change, a
         // recipient holding an entry for the source gets the full current
         // state ahead of its own messages (spec 5.1, the two-item rule),
-        // built from the reconciled committed tree.
-        let mut full_states: AHashMap<&str, ItipMessage<ICalendar>> = AHashMap::new();
+        // built from the reconciled committed tree: one REQUEST for an
+        // organizer-side entry, one REPLY per local address for an
+        // attendee-side one.
+        let mut full_states: AHashMap<&str, Vec<ItipMessage<ICalendar>>> = AHashMap::new();
         if kind == ZaFanOutKind::Change
             && let Some(record) = decided
                 .as_ref()
@@ -464,20 +468,43 @@ impl ZaFanOut for Server {
                     )) => match verdicts.get(key) {
                         Some(Verdict::Deliver(_)) => {
                             // The full state first; a failed one (`5.1`)
-                            // never stops the recipient's own messages.
-                            if let Some(full) = full_states.remove(key) {
-                                let status = write_item(
-                                    self,
-                                    sender_id,
-                                    *account_id,
-                                    public_key,
-                                    &full.message,
-                                    pair.as_ref(),
-                                    reply_token.as_deref(),
-                                    fence,
-                                )
-                                .await
-                                .caused_by(trc::location!())?;
+                            // never stops the recipient's own messages. A
+                            // full-state REPLY carries the token of its own
+                            // `from`, routed as any REPLY (none: `5.3`).
+                            for full in full_states.remove(key).unwrap_or_default() {
+                                let full_route = if is_reply_message(&full) {
+                                    Some(route(
+                                        Some(&ICalendarMethod::Reply),
+                                        &full,
+                                        attempt.address,
+                                        organizer.as_ref(),
+                                        &union,
+                                    ))
+                                } else {
+                                    None
+                                };
+                                let carrier = match &full_route {
+                                    Some(Route::NotAttempted { .. }) => None,
+                                    Some(Route::Deliver {
+                                        pair, reply_token, ..
+                                    }) => Some((pair.as_ref(), reply_token.as_deref())),
+                                    None => Some((pair.as_ref(), reply_token.as_deref())),
+                                };
+                                let status = match carrier {
+                                    Some((pair, reply_token)) => write_item(
+                                        self,
+                                        sender_id,
+                                        *account_id,
+                                        public_key,
+                                        &full.message,
+                                        pair,
+                                        reply_token,
+                                        fence,
+                                    )
+                                    .await
+                                    .caused_by(trc::location!())?,
+                                    None => ITIP_STATUS_NOT_ATTEMPTED,
+                                };
                                 if status != ITIP_STATUS_DELIVERED {
                                     not_written.insert(key);
                                 }
@@ -702,8 +729,10 @@ fn retire(state: &ZaPinState, consumed: &[(&str, u64)], source: ZaSource<'_>) ->
 
 /// The two-item rule's full current state for `key`, which holds `entry`
 /// (spec 5.1 item 1), from the reconciled committed tree: an organizer's
-/// full REQUEST for the address, an attendee's refused instances' current
-/// participation from its own REPLY's address. `None` when it is skipped:
+/// full REQUEST for the address, or an attendee's refused instances'
+/// current participation, one REPLY per local address they are attended as
+/// (`za_reply_addresses`, as `contacts/pin` builds it). `None` when it is
+/// skipped:
 /// one of the address's own messages is a REQUEST or a CANCEL carrying the
 /// master, the relationship ended (the organizer's tree names no ATTENDEE
 /// with the address), or the full state yields nothing.
@@ -714,7 +743,7 @@ fn full_state(
     attempts: &[Attempt<'_>],
     key: &str,
     entry: &ZaWithheld,
-) -> Option<ItipMessage<ICalendar>> {
+) -> Option<Vec<ItipMessage<ICalendar>>> {
     let own = || {
         attempts
             .iter()
@@ -732,11 +761,23 @@ fn full_state(
         {
             return None;
         }
-        za_full_request_for(event, addresses, key)
+        za_full_request_for(event, addresses, key).map(|full| vec![full])
     } else {
-        let from = &own().find(|attempt| attempt.is_reply)?.message.from;
-        za_participation_reply(event, addresses, &entry.instances, from)
+        // Only alongside a REPLY of the change's own to the address.
+        if !own().any(|attempt| attempt.is_reply) {
+            return None;
+        }
+        let full: Vec<_> = za_reply_addresses(event, addresses, &entry.instances)
+            .iter()
+            .filter_map(|from| za_participation_reply(event, addresses, &entry.instances, from))
+            .collect();
+        (!full.is_empty()).then_some(full)
     }
+}
+
+/// Whether `message` is a REPLY.
+fn is_reply_message(message: &ItipMessage<ICalendar>) -> bool {
+    matches!(itip_method(&message.message), Ok(ICalendarMethod::Reply))
 }
 
 /// A REQUEST or CANCEL holding a scheduling component without
