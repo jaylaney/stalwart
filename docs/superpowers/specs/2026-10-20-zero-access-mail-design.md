@@ -115,9 +115,11 @@ administrator, and demands for stored data.
   acceptance until local delivery completes and the next blob purge; and
   of an outbound message from submission until it is relayed, which can be
   days for an undeliverable message. The queue is upstream's and is not
-  account-bound. The product copy must say that mail in transit is not
-  covered, and that the operator's logs record who sent mail to whom and
-  when.
+  account-bound. A delivery that loses the provisioning race (6.1) may
+  leave its plaintext blob under a temporary link for at most the hold
+  plus one purge interval if the server crashes before the compensating
+  delete. The product copy must say that mail in transit is not covered,
+  and that the operator's logs record who sent mail to whom and when.
 - **Key residency on connections.** A mail client cannot be re-asked for
   its password, so a session's keys live as long as its authenticated
   connection (section 3.3). For an IMAP connection kept open with IDLE,
