@@ -1,9 +1,16 @@
 # Zero-access mail: encryption at rest (release 3) design spec
 
-Date: 2026-10-20. Status: draft for review. Scope: release 3 of the
-zero-access fork (jaylaney/stalwart), item 3 of release 1 spec section 1.2;
-GitHub issue #19, milestone "Release 3: mail encryption" (issues #19, #20
-and #21). The revision history is in git.
+Date: 2026-10-20. Status: revision 2, draft for review. Scope: release 3
+of the zero-access fork (jaylaney/stalwart), item 3 of release 1 spec
+section 1.2; GitHub issue #19, milestone "Release 3: mail encryption"
+(issues #19, #20 and #21). Revision 2 incorporates the six findings and
+the clarification of the 2026-10-20 design review
+(`2026-10-20-zero-access-mail-design-review.md`): the provisioning fence
+on ordinary deliveries (6.1, F1), structured trace events (10, F2),
+uploads without keys (4 and 5.7, F3), raw consumers of sealed sources
+(5.7, F4), the message offset coordinates (7, F5), the one stub marker
+(6.6, F6) and which connections keep keys after a credential change (4,
+C1). The revision history is in git.
 
 The terms key account, master key (MK), data key (DEK), wrap type, session
 keys, key cache, generation and visible by structure are those of the
@@ -260,9 +267,14 @@ dispatcher (`crates/jmap/src/api/request.rs`, next to
 `za_assert_calendar_allowed`) when the request's token holds no keys for
 the target account (`za_keys_for` is `None`: a WebSocket request, a Bearer
 or API-key token, a shared or impersonated account): `Email/get`,
-`Email/parse`, `SearchSnippet/get`, `Blob/get`, `Email/import`,
-`Email/copy`, `EmailSubmission/set`, and `Email/set` for its `create`
-argument at its own site. The gate answers the method error `forbidden`
+`Email/parse`, `SearchSnippet/get`, `Blob/get`, `Blob/upload`,
+`Email/import`, `Email/copy`, `EmailSubmission/set`, and `Email/set` for
+its `create` argument at its own site. The HTTP upload endpoint
+(`/jmap/upload`, `crates/http/src/request.rs`) answers 403 before any blob
+reservation or write when the token holds no keys for the target account,
+whether the token is a Bearer token or belongs to another account; the
+sealing writer (5.7) takes the target account's keys as an argument and
+cannot be reached without them. The gate answers the method error `forbidden`
 with a description naming zero access, traced as
 `SecurityEvent::Unauthorized` with details `zero-access: mail access
 without session keys`; each reader refuses the same way as defence in
@@ -272,8 +284,19 @@ the credential; release 5's web client inherits that contract. EventSource
 and WebSocket push carry state ids only and keep working.
 
 A credential change does not end an open mail session beyond what
-upstream does for every account: the login-time token stays, and the
-periodic `refresh_access_token` fails once the credential is gone.
+upstream does for every account, and the keys follow the connection
+(section 3.3). Precisely: an IMAP session logged in with an app password
+fails at its next token refresh (`refresh_access_token`, which renews a
+scoped token and finds the credential gone) once that app password is
+revoked; an IMAP session logged in with the password renews an unscoped
+token that compares neither the password nor the vault generation, so it
+keeps its keys until it ends; a POP3 session has no refresh and keeps its
+keys until it ends whatever credential it used. A password change or
+recovery therefore leaves existing password sessions running until they
+close, as upstream leaves every account's sessions; the product copy
+states that changing the password does not disconnect clients already
+connected, and that an app password's revocation ends its IMAP sessions at
+their next command that refreshes and its POP3 sessions when they close.
 
 Directory logins, registry credential edits and the vault endpoints are
 release 1's, unchanged.
@@ -409,25 +432,58 @@ and the deletion timestamp are upstream's.
 
 A JMAP upload (`/jmap/upload`, `Blob/upload`) by a key account is sealed
 under the MWK in the same blob format (5.1), with a fresh DEK and the
-`mail-blob` associated data. Every `Reserved`-class blob of a key account
-is sealed; `Linked` blobs of its messages are opened through their stubs.
-`blob_download` (`crates/jmap/src/blob/download.rs`) unseals either with
-the request's keys, and it and the purge are the only readers of a key
-account's `Reserved` blobs. The consumers that take an upload's hash raw,
-`FileNode/set` create and update (which link the upload as a file's blob)
-and `Blob/upload` data sources that reference an existing upload, are
-refused for a key account with `forbidden` and the `zero-access:` trace:
-files are out of scope and plaintext in this release, and a sealed upload
-must not become a file's blob. `Email/import`, `Email/set` attachments and
-`Blob/get` go through `blob_download` and work. The upload quota counts
-plaintext.
+`mail-blob` associated data, by a writer that takes the account's keys
+(section 4 refuses the request before it when they are absent). A key
+account's blobs then fall in two kinds. **Sealed sources**: every
+`Reserved`-class blob (a sealed upload), every `Linked` blob of
+`Collection::Email` (a message, opened through its stub) and every
+section blob id of one (an attachment, located through the unsealed
+metadata). **Plaintext**: `Linked` blobs of other collections (file nodes,
+Sieve scripts), which are out of scope and read as upstream reads them.
+
+`blob_download` (`crates/jmap/src/blob/download.rs`) is the one plaintext
+read of a sealed source: with the request's keys it unseals an upload or a
+message and applies section offsets to the unsealed message (section 7);
+without them it refuses. `Email/import`, `Email/set` attachments,
+`Email/parse` and `Blob/get` go through it and work. Every consumer that
+reads a blob hash or section raw from storage is refused for any blob id
+that is a sealed source, whatever its class and whichever account's
+session asks, with `forbidden` and the `zero-access:` trace: `Blob/upload`
+data sources (`crates/jmap/src/blob/upload.rs`), `FileNode/set` create and
+update (which link the blob as a file's), and `FileNode/copy`'s replacement
+blob (`crates/jmap/src/file/copy.rs`). A sealed source must never become
+a file's blob, since file readers have no unsealing step, and must never
+be copied into a new upload as ciphertext. The rule is keyed by the
+blob's owning account and class, not by the requesting session. The
+purge reads nothing. The upload quota counts plaintext.
 
 ## 6. Write paths
 
 ### 6.1 Delivery
 
 `deliver_message` (`crates/email/src/message/delivery.rs`) runs with a
-keyless token, as today. For a key-account recipient:
+keyless token, as today.
+
+**The provisioning fence.** Ingest reads the account's classification near
+its start (`email_ingest`, the `account` read) and commits its batch at
+the end, with Sieve in between. A delivery to a credentialless account
+that reads "ordinary" before `POST /api/vault/setup-token` runs, and
+commits after it, would store a plaintext message in a now-key account
+(review F1). Setup-token issuance writes the vault record first and the
+marker second (release 1 section 4.1), so the record's presence is the
+fence: every batch that stores a message into an account it classified
+as ordinary carries `AssertValue::None` on that account's vault record key
+(`PrincipalField::ZeroAccessVault`, `crates/store/src/write/assert.rs`).
+If the record appeared in between, the commit fails, `email_ingest`
+returns a temporary failure, the queue retries, and the retry sees the
+marker and takes the key-account path (a temporary failure until the
+account is active, then a sealed delivery). The writers are `email_ingest`
+for every source and `copy_message`; the assertion is one line in each
+batch for every account and is recorded as an invariant 9 exception
+(section 12). The key-account path asserts nothing on the record: the
+public key never changes once active.
+
+For a key-account recipient:
 
 1. The served public key is read fresh from the vault record with
    `za_served_public_key` (`crates/common/src/auth/vault.rs`), as the
@@ -511,15 +567,19 @@ copy to Sent is an APPEND (6.2).
 
 ### 6.6 Pre-existing mail
 
-`POST /api/vault/setup` refuses an account that holds any message, as it
-refuses one with calendar data (`za_has_documents` extended to
-`Collection::Email`), with the same 409. A plaintext message found in a key
-account (a metadata archive with a non-empty `contents`) is served as
-plaintext: there is no write that would seal it, and refusing it would
-hide a bug behind an unreadable message. The leak test's negative control
-plants one and must flag it. Key accounts created during development that
-hold mail are emptied by their operator before this release is deployed;
-the release note says so.
+`POST /api/vault/setup-token` and `POST /api/vault/setup` refuse an
+account that holds any message, as they refuse one with calendar data
+(`za_has_documents` extended to `Collection::Email`), with the same 409;
+the fence of 6.1 closes the window between that check and a delivery in
+flight. A plaintext message found in a key account, recognised by the one
+discriminator of 5.2 (a `raw_headers` field that does not start with the
+format byte; `contents` is non-empty for stubs and plaintext alike), is
+served as plaintext: there is no write that would seal it, and refusing
+it would hide a bug behind an unreadable message. Readers, the index gate
+and the leak scanner share that discriminator. The leak test's negative
+control plants one and must flag it. Key accounts created during
+development that hold mail are emptied by their operator before this
+release is deployed; the release note says so.
 
 ### 6.7 Backup and restore
 
@@ -538,9 +598,20 @@ applies: the **unsealed metadata** is a content view built by opening the
 bundle and decoding the inner archive, with the stub's arrival time
 authoritative for `rcvd_attach`'s time bits and the inner archive's bit
 for the attachment flag; the **stored stub** remains the value every write
-asserts on and every keyless path reads. The unsealed blob is the raw
-message upstream would have stored, so every byte-offset in the unsealed
-metadata applies to it unchanged.
+asserts on and every keyless path reads. The unsealed metadata and the
+unsealed blob are byte for byte what upstream would have stored: the
+metadata with its own `raw_headers` (the delivery headers upstream
+prepends, `Delivered-To` and `X-Spam-Status`, followed by the message's
+header block), its `blob_body_offset` and its part offsets, which count in
+the coordinates of the **reconstructed message**, and the blob holding the
+original message as received. Sealing is transparent to upstream's two
+coordinate systems: readers reconstruct `raw_headers` followed by the
+blob from `blob_body_offset`, as IMAP FETCH does, and translate a part's
+offsets back to stored-blob coordinates when they build a section blob
+id, as Email/get does (`crates/email/src/message/body.rs`); neither
+computation changes, it only runs on the unsealed pair. Applying metadata
+offsets to the blob directly would start reads late by the length of the
+prepended headers (review F5).
 
 - **IMAP FETCH** (`crates/imap/src/op/fetch.rs`): the per-message metadata
   read becomes the unsealed view; `needs_blobs` reads the sealed blob and
@@ -611,7 +682,10 @@ same words as the IMAP text.
 | Cross-account COPY/MOVE, Email/copy, Blob/copy | refused when either side is a key account |
 | Mailbox sharing (SETACL, `shareWith`), shared-mailbox listing, group and impersonation routes | refused on key-owned mailboxes; not listed; a keyless stub read answers `NO [NOPERM]` / `forbidden` |
 | JMAP key-needing methods on a keyless token (WebSocket, Bearer, API key, shared account) | `forbidden` at the dispatcher (section 4); keyless methods work |
-| `FileNode/set` from an upload, `Blob/upload` data sources on an upload | refused for key accounts (5.7) |
+| `/jmap/upload`, `Blob/upload` without the target account's keys | 403 / `forbidden` before any reservation (section 4) |
+| Raw consumers of a sealed source (`Blob/upload` data sources, `FileNode/set`, `FileNode/copy`) | refused for any key-account upload, message or section blob id (5.7) |
+| Ordinary delivery racing provisioning | the batch asserts no vault record; temporary failure and retry (6.1) |
+| Milter, hook and filter events for a transaction delivering to a key account; IMAP and POP3 command events in a key-account session | contents redacted (section 10) |
 | Push with email properties | state-only payload |
 | iMIP ingest | gated as in release 1 (release 4) |
 | Restore of a key account's message | refused if restore re-parses (6.7) |
@@ -655,6 +729,28 @@ same words as the IMAP text.
   (submission). Envelope commands are traced as upstream traces them.
 - The ingest event (`MessageIngest`) carries `[redacted]` as `MessageId`
   for a key account; the blob hash, size, ids and timings stay.
+- **Structured events** (review F2). Raw-input masking leaves copies of
+  content in events that format what they handled. The contract covers
+  them: an event emitted while a key account's message is processed, or
+  inside a key account's session, carries no header name or value, body
+  text, search term or other client-supplied string. The plan inventories
+  every `trc::event!` on the mail paths (SMTP DATA and its filters, ingest,
+  Sieve, IMAP and POP3 operations, JMAP mail methods) whose keys (`Details`,
+  `Contents`, `Reason`, `Value`, `Name`, `Key`) can carry one, and redacts
+  it. The floor the review established: `MilterEvent::Write` and
+  `MilterEvent::Read` (`crates/smtp/src/inbound/milter/client.rs`), which
+  log every header a milter is sent and every mutation it returns, record
+  `[redacted]` as `Contents` for a transaction with a key-account
+  recipient (the milter itself still receives the plaintext, as the spam
+  filter does: that is transit); the MTA-hook and spam-filter events that
+  carry header values are treated the same; `ImapEvent::Fetch`, whose
+  `Details` is the `Debug` form of the requested attributes and so carries
+  the header names of a `HEADER.FIELDS` request, and every other `ImapEvent`
+  and `Pop3Event` whose `Details` or `Contents` echo the command
+  (`Search` criteria, `Append`, `Store`), record `[redacted]` there in a
+  key-account session; and the parser errors that quote client input,
+  which issue #20 sanitised before authentication for every account, are
+  sanitised after authentication too in a key-account session.
 - The vacation-response Sieve compile error no longer traces its reason
   with the message text (`crates/jmap/src/vacation/set.rs`, issue #21),
   for every account, as the fork removed the whole-iCalendar traces for
@@ -698,7 +794,27 @@ from a sealed message with Bcc stripped; a corrupted stub and a corrupted
 blob (the listing continues, the trace names ids only); keys gone after
 LOGOUT, UNAUTHENTICATE and a dropped connection (a `test_mode` counter of
 live `SessionKeys` per account); a plaintext message in a key account
-served as plaintext.
+served as plaintext, and the classification test that a sealed stub and a
+legacy plaintext archive, both with non-empty `contents`, are told apart
+by the `raw_headers` marker alone; **the provisioning fence**: a delivery
+paused by a test hook after its account read, while `setup-token` and
+`setup` complete, then resumed, ends in a temporary failure and a sealed
+delivery on retry, with no plaintext archive or blob ever stored (the
+same for `copy_message`); **offsets**: a delivered message with the
+server's prepended headers, a MIME attachment and a nested message
+round-trips through FETCH `BODY[]`, `BODY[2]`, `BODY[HEADER.FIELDS]`,
+Email/get `bodyValues` and a section download byte for byte against the
+original; **uploads**: `/jmap/upload` and `Blob/upload` refused on a
+Bearer token, over the WebSocket and into another account, accepted and
+sealed with the credential, and a sealed upload imported and attached;
+**raw consumers**: `Blob/upload` data sources, `FileNode/set` create and
+update and `FileNode/copy` refused for a whole-message blob id, an
+attachment section id and an upload id of a key account, from its own
+session and from another account's; **traces**: with a milter configured,
+a delivery to a key account leaves no header in the milter events; a
+FETCH of `HEADER.FIELDS (X-Private-Canary)` leaves no header name in the
+FETCH event; an authenticated malformed command leaves no quoted input;
+the same three against a plain account show upstream's behaviour.
 
 **Leak regression test.** `leak::scan` (`tests/src/za/leak.rs`) already
 decodes every cached message of an account and every blob through the
@@ -742,9 +858,10 @@ to 23 hold, with two amendments:
 Added:
 
 24. Every message stored for a key account is a stub plus a sealed blob,
-    whatever wrote it (delivery, Sieve, APPEND, Email/set, Email/import).
-    No writer stores a plaintext blob or a plaintext metadata archive for
-    a key account.
+    whatever wrote it (delivery, Sieve, APPEND, Email/set, Email/import,
+    copy). No writer stores a plaintext blob or a plaintext metadata
+    archive for a key account, and a writer that classified the account as
+    ordinary asserts in its batch that no vault record exists (6.1).
 25. The stub carries exactly the arrival time, the blob hash, the sealed
     bundle and the empty root part; nothing else. The unsealed metadata is
     a content view; the stored stub is what writes assert on and what
@@ -760,7 +877,17 @@ Added:
 29. Delivery never reads a session key and never stores in the clear: a
     recipient without a served public key gets a temporary failure.
 30. Traces of a key account's mail sessions and of a transaction that
-    delivers to one carry no message content, header value or Message-ID.
+    delivers to one carry no message content, header name or value,
+    Message-ID, search term or other client-supplied string, in raw and in
+    structured events alike.
+31. No consumer reads a key account's sealed source (an upload, a message
+    blob or a section of one) raw from storage: it reads through the
+    unsealing reader with the owner's keys, or it is refused.
+32. The vault-record assertion on ordinary writers (6.1) is the third
+    all-account change after release 1's REPORT prefix check and DAV
+    OPTIONS authentication, recorded as an invariant 9 exception with
+    them; the trace redactions of section 10 that apply to every account
+    (the vacation compile reason) join the release 1 list.
 
 ## 13. Open items for planning
 
@@ -807,6 +934,16 @@ unless the code says otherwise.
 10. **Key-mode harness for IMAP and JMAP.** Confirm how `imap_tests` and
     `jmap_tests` provision accounts and whether `create_key_user_account`
     fits their fixtures; the plan sizes the variants from that.
+11. **The fence's cost.** `AssertValue::None` on the vault record key in
+    every ordinary ingest and copy batch is one key read inside the write
+    transaction on every backend; confirm it is supported by the SQL
+    backends' assertion path as the calendar's `assert_value` is, and that
+    a failed assertion surfaces to `deliver_message` as a retryable error
+    rather than a permanent one.
+12. **The structured-event inventory.** Enumerate the `trc::event!` sites
+    of section 10's rule and the keys each carries; decide per site
+    between `[redacted]` and dropping the key. Recommendation:
+    `[redacted]`, so dashboards keep their event counts.
 
 ## 14. Alternatives considered
 
