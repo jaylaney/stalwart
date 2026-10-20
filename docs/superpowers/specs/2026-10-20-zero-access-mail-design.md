@@ -70,11 +70,10 @@ rest.
 ### 1.3 Assumptions
 
 - Issue #20 (the authentication exchange masked in the mail protocols'
-  raw-input traces) is merged before this release's plan starts. Its work
-  sits on branch `fix-20-raw-input-auth` (three commits, unmerged on
-  2026-10-20) and edits the same session functions section 10's
-  redactions extend, so the plan branches from it rather than writing the
-  redactions twice.
+  raw-input traces) is merged (PR #49, `ea667dd8`, 2026-10-20). Section
+  10's redactions extend the session functions it edited, and the plan
+  builds on its raw-input test (`tests/src/za/raw_input.rs`) and trace
+  collector.
 - No shipped key account holds mail. Key accounts created before this
   release during development may hold plaintext messages; section 6.6
   states how they are treated.
