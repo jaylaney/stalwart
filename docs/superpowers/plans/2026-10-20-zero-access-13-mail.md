@@ -41,7 +41,7 @@ The fork diff stays narrow: new modules (`email::message::za::{mod,seal,view}`, 
 - The spam-filter floor: `SpamFilterInput` gains `za_redact: bool`; with it set the DNSBL `Hostname`, the LLM `Details` and the `Eval` result events (through `za_eval_if`) are withheld, since each can carry a message-derived string. `Spam(Classify)`'s recipient list is transit metadata and stays.
 - The restore refusal and the "no served key" delivery failure are the ingest branch's own errors, so every caller of `email_ingest` sees one behaviour.
 
-**Execution:** subagent-driven development on a new branch `release3-mail` cut from `release3-mail-spec` (the spec at `589e7f02`, this plan committed on top); implementers run at `opus` (kernel work: sealing, ingest, the fence, the readers), reviewers at the session's model ceiling (`fable` today); ledger `.superpowers/sdd/2026-10-20-zero-access-13-mail/progress.md`.
+**Execution:** subagent-driven development on a new branch `release3-mail` cut from `release3-mail-spec` (the spec at `589e7f02`, this plan committed on top); implementers run at `opus` (kernel work: sealing, ingest, the fence, the readers), reviewers at the session's model ceiling (`opus` since the session moved to Opus 5.5 on 2026-10-20); ledger `.superpowers/sdd/2026-10-20-zero-access-13-mail/progress.md`.
 
 ## Global Constraints
 
@@ -81,7 +81,7 @@ Invariants and code rules:
 - Every vault write goes through `Server::za_vault_commit`, `za_commit` or the new `za_vault_delete`; never `za_vault_write` directly.
 - Traces: refusals are `trc::event!(Security(SecurityEvent::Unauthorized), AccountId = .., Details = "zero-access: ...")` plus the client-facing error; unreadable messages are `trc::error!(StoreEvent::DataCorruption ... AccountId, DocumentId, Reason = "zero-access: unreadable message")` through `groupware::calendar::seal::seal_error`'s shape; the delivery failure is `trc::error!` with `AccountId` and the fixed reason.
 - Test addresses: `key1@example.com` (alice) to `key6@example.com` exist from `setup::test`; new accounts under `tests/src/za/mail/` use `keymail<n>@example.com`; plain controls `plain@example.com` and new `plainmail<n>@example.com`; never `.example`.
-- Commit messages: subject, blank line, then exactly `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` and `Claude-Session: https://claude.ai/code/session_017qWFjNmU7xZ8ro8BdKrPpu`.
+- Commit messages: subject, blank line, then exactly `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>` and `Claude-Session: https://claude.ai/code/session_017qWFjNmU7xZ8ro8BdKrPpu` (the session's attribution reminder since 2026-10-20).
 - Never open issues, pull requests or reports against upstream `stalwartlabs/stalwart`; upstream bugs found here go in the outcome note only.
 
 Tests:
