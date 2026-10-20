@@ -18,7 +18,10 @@ use dav_proto::RequestHeaders;
 use groupware::{
     DestroyArchive,
     cache::GroupwareCache,
-    calendar::{Calendar, CalendarEvent, fanout::ZaFanOut},
+    calendar::{
+        Calendar, CalendarEvent,
+        fanout::{ZaFanOut, ZaFanOutKind, ZaSource},
+    },
 };
 use http_proto::HttpResponse;
 use hyper::StatusCode;
@@ -255,9 +258,14 @@ impl CalendarDeleteRequestHandler for Server {
                 self.za_fan_out(
                     &account_info,
                     keys,
-                    vec![message.message],
+                    message.message.into_iter().collect(),
                     message.pairs,
                     &message.event,
+                    ZaSource {
+                        document_id: message.document_id,
+                        uid: &message.uid,
+                    },
+                    ZaFanOutKind::Deletion,
                     None,
                 )
                 .await

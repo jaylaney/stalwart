@@ -11,7 +11,7 @@ use crate::utils::{
     server::TestServer,
     za::{
         copy_href, envelope_wrap, hold_task_consumer, inbox_ids, item_method, itip_tasks_for,
-        mail_count, new_inbox_items, pending_ids, plant_event, queued_recipients,
+        mail_count, new_inbox_items, pending_ids, plant_event, queued_recipients, raw_pins,
         schedule_statuses, wait_for_delivery,
     },
 };
@@ -398,6 +398,13 @@ pub async fn scheduling(test: &TestServer) {
         1,
         "jane's inbox holds {} new items",
         items.len()
+    );
+    // Key pinning spec 4.4: the delivery pinned jane at first use, so john
+    // holds a pin record (field 151), which `assert_is_empty` exempts while
+    // his account exists.
+    assert!(
+        raw_pins(test, john.account_id).await.is_some(),
+        "a first-use pin record exists when assert_is_empty runs"
     );
     let (_, item) = &items[0];
     assert_ne!(

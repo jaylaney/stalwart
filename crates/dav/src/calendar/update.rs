@@ -31,9 +31,10 @@ use groupware::{
     cache::GroupwareCache,
     calendar::{
         CalendarEvent, CalendarEventData,
-        fanout::{ZaFanOut, za_set_schedule_status},
+        fanout::{ZaFanOut, ZaFanOutKind, ZaSource, za_set_schedule_status},
         itip::ItipSendStatus,
         seal::{event_token_pairs, seal_error, seal_event},
+        sequence::{za_sequence_floor, za_set_sequences},
     },
     scheduling::{
         ItipMessages, event_create::itip_create, event_update::itip_update,
@@ -111,7 +112,7 @@ impl CalendarUpdateRequestHandler for Server {
             )
         })?;
 
-        let ical = match Parser::new(ical_raw).entry() {
+        let mut ical = match Parser::new(ical_raw).entry() {
             Entry::ICalendar(ical) => ical,
             _ => {
                 return Err(DavError::Condition(
@@ -230,6 +231,11 @@ impl CalendarUpdateRequestHandler for Server {
                 .deserialize::<CalendarEvent>()
                 .caused_by(trc::location!())?;
             let old_ical = new_event.data.event;
+            // Key pinning spec 5.1: the SEQUENCE floor, on every PUT of an
+            // existing event of a key account, before the scheduling step.
+            if za_keys.is_some() {
+                za_sequence_floor(&mut ical, &old_ical, account_info.addresses());
+            }
             new_event.size = bytes.len() as u32;
             new_event.data = CalendarEventData::new_for(
                 ical,
@@ -346,6 +352,9 @@ impl CalendarUpdateRequestHandler for Server {
                 // immediately before the sealed commit, the items go out; the
                 // fan-out decides the pairs the bundle keeps.
                 if let Some(messages) = za_messages {
+                    // The stored UID, which the new one was validated equal
+                    // to above.
+                    let uid = event.inner.data.event.uids().next().unwrap_or_default();
                     let fan_out = self
                         .za_fan_out(
                             &account_info,
@@ -353,11 +362,14 @@ impl CalendarUpdateRequestHandler for Server {
                             messages,
                             pairs,
                             &new_event.data.event,
+                            ZaSource { document_id, uid },
+                            ZaFanOutKind::Change,
                             None,
                         )
                         .await
                         .caused_by(trc::location!())?;
                     za_set_schedule_status(&mut new_event.data.event, &fan_out.statuses);
+                    za_set_sequences(&mut new_event.data.event, &fan_out.sequences);
                     pairs = fan_out.pairs;
                 }
                 seal_event(&mut new_event, keys, account_id, pairs.as_ref())
@@ -537,6 +549,14 @@ impl CalendarUpdateRequestHandler for Server {
                 .await?;
             }
 
+            // Key pinning spec 5.1: assigned before the fan-out, which
+            // records it as a withheld entry's source (a failed create's id
+            // is never used again).
+            let document_id = self
+                .store()
+                .assign_document_ids(account_id, Collection::CalendarEvent, 1)
+                .await
+                .caused_by(trc::location!())?;
             if let Some(keys) = &za_keys {
                 // Spec 5.3-5.4: after every check, immediately before the
                 // sealed commit; the fan-out hands out the attendees' tokens.
@@ -544,6 +564,9 @@ impl CalendarUpdateRequestHandler for Server {
                 // lease was taken over writes no item after its successor's.
                 let mut pairs = None;
                 if let Some(messages) = za_messages {
+                    // The lease's copy of the UID: the tree moved into the
+                    // event.
+                    let uid = za_lease.as_ref().map_or("", |(_, uid)| uid.as_str());
                     let fan_out = match self
                         .za_fan_out(
                             &account_info,
@@ -551,6 +574,8 @@ impl CalendarUpdateRequestHandler for Server {
                             messages,
                             None,
                             &event.data.event,
+                            ZaSource { document_id, uid },
+                            ZaFanOutKind::Change,
                             za_lease.as_ref().map(|(lease, _)| lease.lease()),
                         )
                         .await
@@ -571,6 +596,7 @@ impl CalendarUpdateRequestHandler for Server {
                         Err(err) => return Err(err.caused_by(trc::location!()).into()),
                     };
                     za_set_schedule_status(&mut event.data.event, &fan_out.statuses);
+                    za_set_sequences(&mut event.data.event, &fan_out.sequences);
                     pairs = fan_out.pairs;
                 }
                 seal_event(&mut event, keys, account_id, pairs.as_ref())
@@ -584,11 +610,6 @@ impl CalendarUpdateRequestHandler for Server {
             if let Some((lease, _)) = &za_lease {
                 lease.lease().assert_in(&mut batch);
             }
-            let document_id = self
-                .store()
-                .assign_document_ids(account_id, Collection::CalendarEvent, 1)
-                .await
-                .caused_by(trc::location!())?;
             let schedule_tag = event.schedule_tag;
             let etag = event
                 .insert(

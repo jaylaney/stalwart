@@ -12,3 +12,47 @@ pub mod lease;
 
 #[cfg(feature = "test_mode")]
 pub mod test_hooks;
+
+/// Key pinning spec 6.4: `contacts/pin`'s pause point after its last event
+/// commit, before the step 5 retirement (`test_hooks::REDELIVER_CLEANUP_PAUSE`).
+/// The HTTP crate calls it from its own test builds; it pauses only when
+/// this crate is built with `test_mode` and is a no-op otherwise, so the
+/// HTTP crate's test build does not need this crate's test mode (which
+/// does not build without `enterprise`).
+pub async fn redeliver_cleanup_pause_point(account_id: u32) {
+    #[cfg(feature = "test_mode")]
+    test_hooks::redeliver_cleanup_pause_point(account_id).await;
+    #[cfg(not(feature = "test_mode"))]
+    let _ = account_id;
+}
+
+/// Key pinning spec 6.4: whether `contacts/pin`'s step 5 retirement must
+/// fail now (`test_hooks::PIN_WRITE_FAIL_ONCE`, cleared when taken); a
+/// forwarder for the HTTP crate's test builds, as above, always `false`
+/// unless this crate is built with `test_mode`.
+pub fn take_pin_write_fail(account_id: u32) -> bool {
+    #[cfg(feature = "test_mode")]
+    {
+        test_hooks::take_pin_write_fail(account_id)
+    }
+    #[cfg(not(feature = "test_mode"))]
+    {
+        let _ = account_id;
+        false
+    }
+}
+
+/// Key pinning spec 6.4: the test-mode override of `contacts/pin`'s batch
+/// (`test_hooks::set_redeliver_batch_override`); a forwarder for the HTTP
+/// crate's test builds, as above, always `None` unless this crate is built
+/// with `test_mode`.
+pub fn redeliver_batch_override() -> Option<usize> {
+    #[cfg(feature = "test_mode")]
+    {
+        test_hooks::redeliver_batch_override()
+    }
+    #[cfg(not(feature = "test_mode"))]
+    {
+        None
+    }
+}

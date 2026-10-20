@@ -11,7 +11,9 @@ pub mod expand;
 pub mod fanout;
 pub mod index;
 pub mod itip;
+pub mod pinning;
 pub mod seal;
+pub mod sequence;
 pub mod storage;
 
 use calcard::icalendar::{

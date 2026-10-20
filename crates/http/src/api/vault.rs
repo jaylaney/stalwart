@@ -8,7 +8,7 @@
 //! write of the vault record; the registry is written only for the marker and
 //! for app-password hashes.
 
-use crate::auth::authenticate::Authenticator;
+use crate::{api::contacts, auth::authenticate::Authenticator};
 use ::vault::{
     ZA_MARKER,
     keys::{
@@ -24,7 +24,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use common::{
     Server,
     auth::{
-        AuthRequest, BuildAccessToken,
+        AccessToken, AuthRequest, BuildAccessToken,
         credential::AppPassword,
         vault::{VaultRead, za_argon2_params, za_derive_root},
     },
@@ -104,11 +104,11 @@ struct RecoverRequest {
 }
 
 #[derive(serde::Deserialize)]
-struct CredentialsRequest {
-    username: String,
-    password: String,
+pub(super) struct CredentialsRequest {
+    pub(super) username: String,
+    pub(super) password: String,
     #[serde(default)]
-    totp: Option<String>,
+    pub(super) totp: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -152,7 +152,7 @@ struct TotpRequest {
 }
 
 /// Double option: a present field, `null` included, becomes `Some`.
-fn deserialize_some<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+pub(super) fn deserialize_some<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: serde::Deserialize<'de>,
@@ -182,11 +182,11 @@ struct OkResponse {
     ok: bool,
 }
 
-fn ok() -> HttpResponse {
+pub(super) fn ok() -> HttpResponse {
     json(OkResponse { ok: true })
 }
 
-fn json<T: serde::Serialize>(value: T) -> HttpResponse {
+pub(super) fn json<T: serde::Serialize>(value: T) -> HttpResponse {
     json_with_status(StatusCode::OK, value)
 }
 
@@ -202,7 +202,7 @@ fn json_with_status<T: serde::Serialize>(status: StatusCode, value: T) -> HttpRe
 }
 
 /// 409: wrong state, ineligible account, or a lost revision check (spec 10).
-fn conflict(error: &'static str) -> HttpResponse {
+pub(super) fn conflict(error: &'static str) -> HttpResponse {
     json_with_status(StatusCode::CONFLICT, ErrorResponse { error })
 }
 
@@ -210,7 +210,7 @@ fn token_hash(token: &str) -> Vec<u8> {
     Sha256::digest(token.as_bytes()).to_vec()
 }
 
-fn bad_request(details: impl Into<String>) -> trc::Error {
+pub(super) fn bad_request(details: impl Into<String>) -> trc::Error {
     trc::ResourceEvent::BadParameters
         .into_err()
         .details(details.into())
@@ -305,6 +305,17 @@ impl VaultApi for Server {
                 za_app_password_revoke(self, session, parse(&body)?).await
             }
             ("totp", None) => za_totp(self, session, parse(&body)?).await,
+            // Key pinning spec 6.
+            ("contacts", None) => contacts::za_contacts(self, session, parse(&body)?).await,
+            ("contacts", Some("lookup")) => {
+                contacts::za_contacts_lookup(self, session, parse(&body)?).await
+            }
+            ("contacts", Some("pin")) => {
+                contacts::za_contacts_pin(self, session, parse(&body)?).await
+            }
+            ("contacts", Some("forget")) => {
+                contacts::za_contacts_forget(self, session, parse(&body)?).await
+            }
             _ => Err(trc::ResourceEvent::NotFound.into_err()),
         }
     }
@@ -439,11 +450,13 @@ async fn za_prune(
     Ok(())
 }
 
-/// The only vault write path of this module: prunes orphans, sets the next
-/// revision, writes conditionally on `previous` (absence when `None`) and
-/// invalidates cached classification and authentication. A write on top of a
-/// state other than the verified generation (`expected_revision`, invariant
-/// 8) and a lost race are both 409.
+/// The only vault write path of this module: prunes orphans, then commits
+/// through the common helper `Server::za_vault_commit` (key pinning spec
+/// 4.5), which sets the next revision, writes conditionally on `previous`
+/// (absence when `None`) and invalidates cached classification and
+/// authentication. A write on top of a state other than the verified
+/// generation (`expected_revision`, invariant 8) and a lost race are both
+/// 409.
 async fn za_commit(
     server: &Server,
     account_id: u32,
@@ -458,14 +471,14 @@ async fn za_commit(
         return Ok(Err(conflict("vault changed since verification")));
     }
     za_prune(server, record, account_id, now).await?;
-    record.revision = previous.map_or(1, |p| p.record.revision + 1);
-    match server.za_vault_write(account_id, record, previous).await {
-        Ok(()) => (),
-        Err(err) if err.is_assertion_failure() => return Ok(Err(conflict("conflict"))),
-        Err(err) => return Err(err),
+    match server
+        .za_vault_commit(account_id, record, previous, None)
+        .await
+    {
+        Ok(()) => Ok(Ok(())),
+        Err(err) if err.is_assertion_failure() => Ok(Err(conflict("conflict"))),
+        Err(err) => Err(err),
     }
-    za_invalidate_after_commit(server, account_id).await;
-    Ok(Ok(()))
 }
 
 /// Invalidation after a committed write: a failure is logged, never turned
@@ -513,15 +526,18 @@ async fn za_auth_failure(server: &Server, remote_ip: IpAddr, username: &str) -> 
         .await
 }
 
-struct ZaVerified {
-    account_id: u32,
-    keys: Arc<SessionKeys>,
+pub(super) struct ZaVerified {
+    pub(super) account_id: u32,
+    pub(super) keys: Arc<SessionKeys>,
+    /// The (keyless) token the verification returned, for the
+    /// `SendSealed` preconditions of `contacts/pin` (key pinning spec 6.4).
+    pub(super) access_token: AccessToken,
 }
 
 /// Fresh, full verification of the primary password and TOTP (spec 4.1).
 /// Cached CalDAV authentication is never consulted; app passwords and
 /// master logins are refused with 400.
-async fn za_verify_primary(
+pub(super) async fn za_verify_primary(
     server: &Server,
     session: &HttpSessionData,
     username: &str,
@@ -553,6 +569,7 @@ async fn za_verify_primary(
         Some(keys) if keys.account_id == token.account_id() => Ok(Ok(ZaVerified {
             account_id: token.account_id(),
             keys,
+            access_token: token,
         })),
         _ => Ok(Err(conflict("not a zero-access account"))),
     }
