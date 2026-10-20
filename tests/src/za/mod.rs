@@ -6,7 +6,7 @@
 
 use crate::utils::server::{TestServer, TestServerBuilder};
 use ::registry::schema::{
-    enums::Permission,
+    enums::{NetworkListenerProtocol, Permission},
     prelude::Property,
     structs::{Http, Imap, Rate},
 };
@@ -30,6 +30,7 @@ pub mod leak;
 pub mod pairs;
 pub mod password;
 pub mod pinning;
+pub mod raw_input;
 pub mod registry;
 pub mod reply;
 pub mod setup;
@@ -49,6 +50,14 @@ pub async fn za_tests() {
     let mut test = TestServerBuilder::new("za_tests")
         .await
         .with_default_listeners()
+        .await
+        // Submission over implicit TLS, for the raw-input trace tests.
+        .with_listener(
+            NetworkListenerProtocol::Smtp,
+            "submissions",
+            raw_input::SUBMISSION_PORT,
+            true,
+        )
         .await
         .build()
         .await;
@@ -130,6 +139,7 @@ pub async fn za_tests() {
     pinning::test(&mut test).await;
     sweep::test(&mut test).await;
     tracing::test(&mut test).await;
+    raw_input::test(&mut test).await;
     expansion::test(&mut test).await;
     gating::test(&mut test).await;
     gating::test_scheduling(&mut test).await;

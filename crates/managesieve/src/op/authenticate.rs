@@ -27,7 +27,12 @@ impl<T: SessionStream> Session<T> {
 
         let mut tokens = request.tokens.into_iter();
         let mechanism = Mechanism::parse(&tokens.next().unwrap().unwrap_bytes())
-            .map_err(|err| trc::AuthEvent::Error.into_err().details(err))?;
+            // Issue #20: the token is not quoted, as it can be a credential.
+            .map_err(|_| {
+                trc::AuthEvent::Error
+                    .into_err()
+                    .details("Authentication mechanism not supported.")
+            })?;
         let mut params: Vec<String> = tokens
             .filter_map(|token| token.unwrap_string().ok())
             .collect();
