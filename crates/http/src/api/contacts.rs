@@ -49,7 +49,7 @@ use groupware::{
             za_set_schedule_status,
         },
         itip::ItipSendStatus,
-        pinning::{za_full_request_for, za_participation_reply, za_reply_addresses},
+        pinning::{za_full_request_for, za_participation_replies},
         seal::{TokenPairs, seal_error, seal_event, unseal_event_pairs},
         sequence::{ZaSequence, za_set_sequences},
     },
@@ -683,12 +683,11 @@ async fn za_redeliver_entry(
         // entry waits, unattempted, while the drain holds back its UID.
         Side::Attendee if held_back.holds(&entry.uid) => return Ok(Outcome::Waiting),
         // One REPLY per local address the recorded instances are attended
-        // as: `handle_reply` matches each instance by exact string.
+        // as and whose token the copy holds: `handle_reply` matches each
+        // instance by exact string.
         Side::Attendee => {
-            let messages: Vec<_> = za_reply_addresses(tree, addresses, &entry.instances)
-                .iter()
-                .filter_map(|from| za_participation_reply(tree, addresses, &entry.instances, from))
-                .collect();
+            let messages =
+                za_participation_replies(tree, addresses, &entry.instances, pairs.as_ref());
             if messages.is_empty() {
                 return Ok(Outcome::Dropped);
             }

@@ -65,9 +65,7 @@ use crate::{
     calendar::{
         CalendarEventNotification, ChangedBy, EVENT_NOTIFICATION_ZA_PENDING,
         drain::instance_key,
-        pinning::{
-            za_decline_all, za_full_request_for, za_participation_reply, za_reply_addresses,
-        },
+        pinning::{za_decline_all, za_full_request_for, za_participation_replies},
         seal::{TOKEN_LEN, TokenPairs, seal_error, seal_pending_item},
         sequence::{ZaSequence, za_reconcile_sequences},
     },
@@ -445,6 +443,7 @@ impl ZaFanOut for Server {
                         &attempts,
                         key,
                         entry,
+                        &union,
                     )
                 {
                     full_states.insert(key.as_str(), full);
@@ -731,11 +730,11 @@ fn retire(state: &ZaPinState, consumed: &[(&str, u64)], source: ZaSource<'_>) ->
 /// (spec 5.1 item 1), from the reconciled committed tree: an organizer's
 /// full REQUEST for the address, or an attendee's refused instances'
 /// current participation, one REPLY per local address they are attended as
-/// (`za_reply_addresses`, as `contacts/pin` builds it). `None` when it is
-/// skipped:
-/// one of the address's own messages is a REQUEST or a CANCEL carrying the
-/// master, the relationship ended (the organizer's tree names no ATTENDEE
-/// with the address), or the full state yields nothing.
+/// whose token `pairs` holds (`za_participation_replies`, as `contacts/pin`
+/// builds it). `None` when it is skipped: one of the address's own messages
+/// is a REQUEST or a CANCEL carrying the master, the relationship ended (the
+/// organizer's tree names no ATTENDEE with the address), or the full state
+/// yields nothing.
 fn full_state(
     event: &ICalendar,
     addresses: &[String],
@@ -743,6 +742,7 @@ fn full_state(
     attempts: &[Attempt<'_>],
     key: &str,
     entry: &ZaWithheld,
+    pairs: &TokenPairs,
 ) -> Option<Vec<ItipMessage<ICalendar>>> {
     let own = || {
         attempts
@@ -767,10 +767,7 @@ fn full_state(
         if !own().any(|attempt| attempt.is_reply) {
             return None;
         }
-        let full: Vec<_> = za_reply_addresses(event, addresses, &entry.instances)
-            .iter()
-            .filter_map(|from| za_participation_reply(event, addresses, &entry.instances, from))
-            .collect();
+        let full = za_participation_replies(event, addresses, &entry.instances, Some(pairs));
         (!full.is_empty()).then_some(full)
     }
 }

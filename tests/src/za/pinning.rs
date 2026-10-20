@@ -99,6 +99,7 @@ pub async fn test(test: &mut TestServer) {
     pr_3_wait_scoped_to_skipped_uids(test).await;
     pr_4_rotation_identity_and_failed_cleanup(test).await;
     pr_5_ordinary_put_replies_per_local_address(test).await;
+    pr_6_untokened_address(test).await;
 }
 
 /// Spec 9 case 1: alice, who never pinned, invites bob. The fan-out pins
@@ -3307,6 +3308,140 @@ async fn pr_5_ordinary_put_replies_per_local_address(test: &TestServer) {
     alice.delete_items_since(test, &alice_start).await;
     clear_recipient(test, &bob, &bob_start, "pin-pr5").await;
     bob_alias(test, false).await;
+}
+
+/// PR #40 review, fix round 3 (spec 5.1 item 1, 6.4 step 2): a full-state
+/// REPLY is built only from an address whose token the attendee's copy
+/// holds. `two_address_answers`' entry, then bob's copy keeps only the pair
+/// of `key2@example.com` (a store-level reseal, `keep_only_pair`), so the
+/// alias's answer can never be authenticated. Run 1, an ordinary PUT: bob
+/// changes the master to TENTATIVE; the master's answer is delivered, the
+/// entry is retired and the ORGANIZER's status is `1.2`, not `5.3`. Run 2,
+/// `contacts/pin`: the entry counts `delivered` (not `dropped`) and step 4
+/// writes `1.2`.
+async fn pr_6_untokened_address(test: &TestServer) {
+    let (alice, bob, _) = parties(test);
+    let (alice_start, bob_start) = (
+        inbox_ids(test, alice.id).await,
+        inbox_ids(test, bob.id).await,
+    );
+    bob_alias(test, true).await;
+    // The distinct SCHEDULE-STATUS values of the copy's ORGANIZER
+    // properties (the master's and X's).
+    let organizer_status = |body: String| {
+        let mut statuses =
+            crate::utils::za::schedule_statuses(&body, ICalendarProperty::Organizer, ALICE);
+        statuses.sort();
+        statuses.dedup();
+        statuses
+    };
+
+    // Run 1: an ordinary PUT.
+    let (path_a, copy_a) = two_address_answers(test, &alice, &bob, "pin-pr6a").await;
+    keep_only_pair(test, bob.id, &copy_a, BOB).await;
+    assert_eq!(
+        rewrite(&bob.client, &copy_a, |body| with_bob_partstat(
+            &body,
+            Scope::Master,
+            "TENTATIVE"
+        ))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert!(
+        withheld(test, bob.id, ALICE).await.is_empty(),
+        "the entry is retired"
+    );
+    assert_eq!(
+        organizer_status(body(&bob.client, &copy_a).await),
+        ["1.2"],
+        "no 5.3 for the untokened alias"
+    );
+    assert_eq!(trigger_drain(ALICE, STRONG).await, 207);
+    assert_eq!(
+        partstat_in(&alice.client, &path_a, None, BOB)
+            .await
+            .as_deref(),
+        Some("TENTATIVE")
+    );
+
+    // Run 2: contacts/pin.
+    let (path_b, copy_b) = two_address_answers(test, &alice, &bob, "pin-pr6b").await;
+    keep_only_pair(test, bob.id, &copy_b, BOB).await;
+    let fingerprint = display_fingerprint(&served(test, alice.id).await);
+    assert_eq!(
+        pin(BOB, ALICE, &fingerprint).await.expect(200),
+        json!({"ok": true, "delivered": 1, "failed": 0, "dropped": 0, "remaining": 0})
+    );
+    assert_eq!(
+        organizer_status(body(&bob.client, &copy_b).await),
+        ["1.2"],
+        "step 4 wrote the delivered status"
+    );
+    assert_eq!(trigger_drain(ALICE, STRONG).await, 207);
+    assert_eq!(
+        partstat_in(&alice.client, &path_b, None, BOB)
+            .await
+            .as_deref(),
+        Some("ACCEPTED")
+    );
+
+    // Cleanup.
+    delete_event(&alice, &path_a).await;
+    delete_event(&alice, &path_b).await;
+    alice.delete_items_since(test, &alice_start).await;
+    clear_recipient(test, &bob, &bob_start, "pin-pr6a").await;
+    clear_recipient(test, &bob, &bob_start, "pin-pr6b").await;
+    bob_alias(test, false).await;
+}
+
+/// Reseals the account's event at `href` (unchanged plaintext) with only the
+/// token pair of `address` from its bundle, written straight to the store
+/// under the archive it was read from, as `contacts/pin`'s step 4 reseals.
+async fn keep_only_pair(test: &TestServer, account_id: u32, href: &str, address: &str) {
+    use groupware::calendar::{
+        CalendarEvent,
+        seal::{seal_event, unseal_event_pairs},
+    };
+    use store::{
+        ValueKey,
+        write::{AlignedBytes, Archive, BatchBuilder},
+    };
+    let keys = crate::utils::za::za_unlock(test, account_id, STRONG).await;
+    let document_id = document_id_of(test, account_id, href).await;
+    let archive = test
+        .server
+        .store()
+        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            account_id,
+            types::collection::Collection::CalendarEvent,
+            document_id,
+        ))
+        .await
+        .unwrap()
+        .expect("the event's archive");
+    let mut event = archive.deserialize::<CalendarEvent>().unwrap();
+    let pairs = unseal_event_pairs(&mut event, &keys, account_id)
+        .unwrap()
+        .expect("a pair bundle");
+    let kept = pairs.only(address).expect("a pair for the address");
+    assert!(pairs.len() > kept.len(), "the copy holds another pair");
+    seal_event(&mut event, &keys, account_id, Some(&kept)).unwrap();
+    let account_info = test.server.account_info(account_id).await.unwrap();
+    let mut batch = BatchBuilder::new();
+    event
+        .update(
+            account_info.account_tenant_ids(),
+            archive.to_unarchived::<CalendarEvent>().unwrap(),
+            account_id,
+            document_id,
+            &mut batch,
+        )
+        .unwrap();
+    test.server.commit_batch(batch).await.unwrap();
+    test.server
+        .invalidate_local_caches(&[common::ipc::CacheInvalidation::DavResources(account_id)])
+        .await;
 }
 
 /// Gives bob the second address `BOB_ALIAS` (on its own `.test` domain), or

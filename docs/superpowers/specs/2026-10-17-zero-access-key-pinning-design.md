@@ -486,23 +486,24 @@ upstream's messages for it:
    `organizer_request_full(committed_tree, fresh_snapshot, None, false)` for
    that attendee, without a second `itip_finalize` (no second SEQUENCE bump);
    for an attendee, the refused instances' current participation (section 6.4's
-   helper), one REPLY per local address they are attended as, each routed and
-   carrying its own address's token as any REPLY (an address without a token
-   is not attempted, `5.3`), so that answers given from two of the account's
-   addresses are both sent; the entry is retired only when every one of them
-   and upstream's messages were written. Both are built from the state being committed, reconciled (below),
-   never from a superseded tree: the deletion flag marks a pre-deletion one.
-   Item (1) is skipped when any message of item (2) is a METHOD:REQUEST
-   containing the master scheduling component (no RECURRENCE-ID): upstream
-   routes every master change to the full update, partial REQUESTs hold only
-   overrides, and `ItipSummary` cannot tell them apart (when the master has no
-   attendees the full REQUEST lacks it, the skip does not fire, and the full
-   state is a harmless duplicate). It is also skipped when one is a
-   METHOD:CANCEL with the master component (the address removed from the master
-   while an override still names it; the CANCEL then cancels every instance of
-   the copy, upstream's `cancel_all_instances`, parity), and when the full
-   state yields nothing for the address (the attendee's helper for every local
-   address, or the full
+   helper), one REPLY per local address they are attended as that holds a token
+   in the copy's pairs, each routed with its own address's token as any REPLY,
+   so that answers given from two of the account's addresses are both sent; an
+   address without a token gets none (its REPLY could never be authenticated).
+   The entry is retired only when every one of them and upstream's messages
+   were written. Both are built from the state being committed, reconciled
+   (below), never from a superseded tree: the deletion flag marks a
+   pre-deletion one. Item (1) is skipped when any message of item (2) is a
+   METHOD:REQUEST containing the master scheduling component (no
+   RECURRENCE-ID): upstream routes every master change to the full update,
+   partial REQUESTs hold only overrides, and `ItipSummary` cannot tell them
+   apart (when the master has no attendees the full REQUEST lacks it, the skip
+   does not fire, and the full state is a harmless duplicate). It is also
+   skipped when one is a METHOD:CANCEL with the master component (the address
+   removed from the master while an override still names it; the CANCEL then
+   cancels every instance of the copy, upstream's `cancel_all_instances`,
+   parity), and when the full state yields nothing for the address (the
+   attendee's helper for every local address holding a token, or the full
    REQUEST for a DECLINED, RSVP=FALSE, SCHEDULE-AGENT=CLIENT or NONE attendee).
    After any of the three skips the entry is retired with upstream's messages.
 2. Upstream's own messages for the address in this change, in upstream's order
@@ -593,8 +594,7 @@ runs in four phases, after section 5.1's reconciliation:
    items follow upstream's message order (the full REQUEST before a
    partial), entry or not; with an entry the full state comes first
    (section 5.1), every one of an attendee's full-state REPLYs. A failed
-   full state (`5.1`, or `5.3` for a REPLY whose address holds no token)
-   never stops upstream's messages.
+   full state (`5.1`) never stops upstream's messages.
 4. Retire, in one more conditional pin-record write asserting the bytes phase 2
    wrote (or those read in phase 1 when phase 2 wrote nothing): the entries of
    recipients whose items were all written, and for a deletion's fan-out every
@@ -808,11 +808,14 @@ retire them):
    2 section 6.3, step 5). The refusing fan-out already created the recipient's
    token, so no minting is expected; the lease is cheap and keeps redelivery
    consistent with the delegating merge. When the user is an attendee: the
-   refused instances' current participation, one REPLY per local address.
+   refused instances' current participation, one REPLY per local address
+   holding a token in the copy's pairs (a REPLY without its sender's token is
+   never attempted, and the organizer's drain would drop it as a forgery).
    An entry can hold answers given from two of the account's addresses (the
    master attended as the primary address, an override as an alias), so the
    fork helper runs once for each distinct local attendee address of the
-   recorded instances present (each instance's first local attendee, as
+   recorded instances present that holds a token (each instance's first
+   local attendee, as
    upstream's attendee update takes it; the master's first, then in
    instance order). Each REPLY carries the recorded instances (all
    qualifying ones under `all`) that still exist and pass the rules,
@@ -866,7 +869,7 @@ Every outcome of an entry is one of these:
 | Outcome | When | Entry |
 |---|---|---|
 | `delivered` | the item is written (every REPLY, for an attendee-side entry) and step 4 committed | retired under the rule |
-| `dropped` | step 1's conditions; the full REQUEST yields nothing for the address (it is DECLINED without a stored SCHEDULE-FORCE-SEND, RSVP=FALSE, SCHEDULE-AGENT=CLIENT or NONE); the REPLY helper yields nothing for any local address (no recorded instance still exists and qualifies); the address no longer resolves to an internal key account (the next ordinary edit routes it as upstream does) | retired under the rule |
+| `dropped` | step 1's conditions; the full REQUEST yields nothing for the address (it is DECLINED without a stored SCHEDULE-FORCE-SEND, RSVP=FALSE, SCHEDULE-AGENT=CLIENT or NONE); the REPLY helper yields nothing for any local address holding a token (no recorded instance still exists and qualifies, or no such address holds a token); the address no longer resolves to an internal key account (the next ordinary edit routes it as upstream does) | retired under the rule |
 | `failed` | step 1's archive read or unseal errs; the UID lease is busy; an item write fails; step 4's reseal errs after the delivery (the contact may already hold the state; the next call resends it) | stays, moved to the end of the record |
 | `remaining` | beyond the 32 of this call; re-armed during it; step 4 lost its archive assertion; the cleanup write failed; an attendee-side entry that passes step 1 and the drain holds back (an incomplete drain, or a skipped item of its UID) | stays |
 

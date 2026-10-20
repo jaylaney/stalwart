@@ -13,7 +13,7 @@
 //! 2, `za_decline_all`).
 
 use crate::{
-    calendar::drain::instance_key,
+    calendar::{drain::instance_key, seal::TokenPairs},
     scheduling::{
         Email, InstanceId, ItipMessage, ItipSnapshot, ItipSnapshots, ItipSummary,
         itip::{ItipExportAs, itip_add_tz, itip_build_envelope, itip_export_component},
@@ -159,6 +159,29 @@ pub fn za_reply_addresses(
         }
     }
     from
+}
+
+/// The refused instances' current participation as sent (spec 5.1 item 1,
+/// 6.4 step 2): one `za_participation_reply` per address of
+/// `za_reply_addresses` whose token the attendee's copy holds in `pairs`
+/// (the lookup the fan-out's route makes for a REPLY's `from`). A REPLY
+/// without its sender's token is never attempted and the organizer's drain
+/// would drop it as a forgery, so none is built. Empty when no address
+/// qualifies.
+pub fn za_participation_replies(
+    tree: &ICalendar,
+    addresses: &[String],
+    instances: &ZaInstances,
+    pairs: Option<&TokenPairs>,
+) -> Vec<ItipMessage<ICalendar>> {
+    let Some(pairs) = pairs else {
+        return Vec::new();
+    };
+    za_reply_addresses(tree, addresses, instances)
+        .iter()
+        .filter(|from| pairs.get(from).is_some())
+        .filter_map(|from| za_participation_reply(tree, addresses, instances, from))
+        .collect()
 }
 
 /// Key pinning spec 5.1 item (2): an attendee's DECLINED of every instance
@@ -537,6 +560,36 @@ mod tests {
             .expect("E qualifies under the alias");
         assert_eq!(reply_instances(&reply), [Some(E)]);
         assert_eq!(reply.from, alias);
+    }
+
+    #[test]
+    fn replies_only_from_addresses_holding_a_token() {
+        let copy = parse(COPY);
+        let every = ZaInstances {
+            master: false,
+            keys: vec![],
+            all: true,
+        };
+        let mut pairs = TokenPairs::new();
+        pairs.insert(BOB, [7; crate::calendar::seal::TOKEN_LEN]);
+        let replies = za_participation_replies(&copy, &bob(), &every, Some(&pairs));
+        assert_eq!(
+            replies
+                .iter()
+                .map(|reply| reply.from.as_str())
+                .collect::<Vec<_>>(),
+            [BOB],
+            "the alias holds no token"
+        );
+        pairs.insert(
+            "bob.alias@example.com",
+            [8; crate::calendar::seal::TOKEN_LEN],
+        );
+        assert_eq!(
+            za_participation_replies(&copy, &bob(), &every, Some(&pairs)).len(),
+            2
+        );
+        assert!(za_participation_replies(&copy, &bob(), &every, None).is_empty());
     }
 
     #[test]
