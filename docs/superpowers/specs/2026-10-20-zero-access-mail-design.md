@@ -1,6 +1,9 @@
 # Zero-access mail: encryption at rest (release 3) design spec
 
-Date: 2026-10-20. Status: revision 2, draft for review. Scope: release 3
+Date: 2026-10-20. Status: revision 3, draft for review. Revision 3
+answers the review's second pass: the fence's backend rule and the
+compensating blob delete (6.1, F1a and F1b), the two download branches
+(7, F5) and the revocation wording (4, C1). Scope: release 3
 of the zero-access fork (jaylaney/stalwart), item 3 of release 1 spec
 section 1.2; GitHub issue #19, milestone "Release 3: mail encryption"
 (issues #19, #20 and #21). Revision 2 incorporates the six findings and
@@ -73,6 +76,9 @@ rest.
   and server-side threading for key accounts (section 14).
 - Enterprise paths (deleted-item retention, archived items) are excluded
   from the product build and are not gated.
+- Key accounts on PostgreSQL and MySQL (6.1): their assertion path cannot
+  fence provisioning against a delivery in flight; a later change to the
+  store crate lifts the restriction.
 
 ### 1.3 Assumptions
 
@@ -293,10 +299,18 @@ token that compares neither the password nor the vault generation, so it
 keeps its keys until it ends; a POP3 session has no refresh and keeps its
 keys until it ends whatever credential it used. A password change or
 recovery therefore leaves existing password sessions running until they
-close, as upstream leaves every account's sessions; the product copy
-states that changing the password does not disconnect clients already
-connected, and that an app password's revocation ends its IMAP sessions at
-their next command that refreshes and its POP3 sessions when they close.
+close, as upstream leaves every account's sessions. A failed refresh does
+not end the connection either: an operation that refreshes (LIST, SELECT,
+APPEND, IDLE's change check) runs in a spawned task whose error is
+written to the client and logged without changing the session state, so
+an app-password IMAP session whose credential was revoked gets errors on
+those operations but may keep its keys, and a selected mailbox it can
+still fetch from, until the connection ends. The product copy therefore
+says that neither a password change nor an app-password revocation
+disconnects clients already connected, and that their sessions end when
+the client disconnects or the server's inactivity timeout closes them. A
+guaranteed disconnect on revocation would be a design of its own and is
+not part of this release.
 
 Directory logins, registry credential edits and the vault endpoints are
 release 1's, unchanged.
@@ -478,10 +492,49 @@ If the record appeared in between, the commit fails, `email_ingest`
 returns a temporary failure, the queue retries, and the retry sees the
 marker and takes the key-account path (a temporary failure until the
 account is active, then a sealed delivery). The writers are `email_ingest`
-for every source and `copy_message`; the assertion is one line in each
-batch for every account and is recorded as an invariant 9 exception
-(section 12). The key-account path asserts nothing on the record: the
-public key never changes once active.
+for every source and `copy_message` (whose retry into an account that has
+become a key account is then refused as a cross-account copy, 6.3); the
+assertion is one line in each batch for every account and is recorded as
+an invariant 9 exception (section 12). The key-account path asserts
+nothing on the record: the public key never changes once active.
+
+**What the assertion relies on, per store.** The fence is only as good as
+the backend's handling of an assertion on an absent key. RocksDB evaluates
+it with `get_for_update` inside an optimistic transaction taken on a
+snapshot, so a vault record written by another transaction in between
+conflicts at commit and the retried batch re-evaluates and fails;
+FoundationDB's non-snapshot read of the key adds a read conflict range,
+which the record's insert collides with; SQLite runs every batch under an
+immediate write transaction, so the two never overlap. PostgreSQL and
+MySQL evaluate assertions as `SELECT ... FOR UPDATE` at read-committed
+isolation (`crates/store/src/backend/{postgres,mysql}/write.rs`), which
+has no row to lock when the key is absent, does not block the concurrent
+insert, and is not re-checked at commit (review F1a). On those two
+stores the assertion is not a fence. This release therefore supports key
+accounts on RocksDB, FoundationDB and SQLite: `POST /api/vault/setup-token`
+refuses issuance with 409 and a fixed reason when the data store is
+PostgreSQL or MySQL, so a deployment learns it at provisioning rather
+than from a leak. Lifting that restriction means running the
+assertion-carrying batches of those backends at an isolation that locks
+the gap (MySQL's repeatable read takes gap locks on a `FOR UPDATE` of a
+missing key; PostgreSQL's serializable level detects the write skew) with
+a retry on serialization failure, which is store-crate work with its own
+containers in CI and is a follow-up, not part of this release. The
+product build ships RocksDB.
+
+**Persistence before the batch** (review F1b). A delivery that Sieve
+modified, and every ingest that arrives without a queue blob, writes its
+blob through `put_temporary_blob` before the batch, under a 60-second
+temporary link. When the batch then fails the vault assertion, that blob
+is a plaintext copy outside the queue. `email_ingest` therefore remembers
+whether `put_temporary_blob` wrote the bytes (it skips the write when a
+blob with that hash already exists, in which case the bytes are another
+document's) and, on a failed vault assertion, deletes the blob it wrote
+and its temporary link before returning the temporary failure. The
+residual is a crash between the blob write and that delete, after which
+the blob is unlinked when its hold expires and removed by the next blob
+purge; the design states it next to the queue limit (section 2). A
+delivery that reuses the queue blob writes nothing before the batch.
 
 For a key-account recipient:
 
@@ -623,8 +676,15 @@ prepended headers (review F5).
 - **JMAP Email/get, Email/parse, SearchSnippet/get, Blob/get,
   `/jmap/download`, EmailSubmission/set, Email/set (attachments by blob
   id)**: each reads through `blob_download` and the metadata read with the
-  request's keys; a section download applies the unsealed metadata's
-  offsets to the unsealed blob.
+  request's keys. `blob_download` keeps upstream's two branches on the
+  unsealed pair: a whole-message download reconstructs `raw_headers`
+  followed by the unsealed blob from `blob_body_offset`; a section
+  download applies the blob id's offset and size, which Email/get already
+  translated into stored-blob coordinates when it built the id, to the
+  unsealed original blob, then transfer-decodes the section
+  (`get_blob_section`, `crates/common/src/storage/blob.rs`). Neither
+  branch applies metadata offsets to the blob or stored-blob offsets to
+  the reconstructed message.
 - **Thread/get, Mailbox/*, Email/query** read no content.
 - **Server-initiated push with content** (`build_email_push_object`,
   `crates/services/src/state_manager/email_push.rs`, upstream's extension
@@ -684,7 +744,8 @@ same words as the IMAP text.
 | JMAP key-needing methods on a keyless token (WebSocket, Bearer, API key, shared account) | `forbidden` at the dispatcher (section 4); keyless methods work |
 | `/jmap/upload`, `Blob/upload` without the target account's keys | 403 / `forbidden` before any reservation (section 4) |
 | Raw consumers of a sealed source (`Blob/upload` data sources, `FileNode/set`, `FileNode/copy`) | refused for any key-account upload, message or section blob id (5.7) |
-| Ordinary delivery racing provisioning | the batch asserts no vault record; temporary failure and retry (6.1) |
+| Ordinary delivery racing provisioning | the batch asserts no vault record; temporary failure, the early blob deleted, retry (6.1) |
+| Key accounts on PostgreSQL or MySQL | `setup-token` refuses issuance, 409 with a fixed reason (6.1) |
 | Milter, hook and filter events for a transaction delivering to a key account; IMAP and POP3 command events in a key-account session | contents redacted (section 10) |
 | Push with email properties | state-only payload |
 | iMIP ingest | gated as in release 1 (release 4) |
@@ -799,12 +860,22 @@ legacy plaintext archive, both with non-empty `contents`, are told apart
 by the `raw_headers` marker alone; **the provisioning fence**: a delivery
 paused by a test hook after its account read, while `setup-token` and
 `setup` complete, then resumed, ends in a temporary failure and a sealed
-delivery on retry, with no plaintext archive or blob ever stored (the
-same for `copy_message`); **offsets**: a delivered message with the
-server's prepended headers, a MIME attachment and a nested message
+delivery on retry, with no plaintext archive stored and the blob a
+Sieve-modified variant of it wrote deleted before the failure returns;
+the same race for `copy_message` ends in the cross-account refusal; and,
+because the deterministic pause cannot sit inside the store's
+transaction, a stress test races ingest batches carrying the assertion
+against vault-record writes through the store API in a loop and asserts
+that no message batch ever commits after a record exists, run on RocksDB
+in CI and on FoundationDB and SQLite when those stores run; `setup-token`
+refused on PostgreSQL and MySQL; **offsets**: a delivered message with
+the server's prepended headers, a MIME attachment and a nested message
 round-trips through FETCH `BODY[]`, `BODY[2]`, `BODY[HEADER.FIELDS]`,
-Email/get `bodyValues` and a section download byte for byte against the
-original; **uploads**: `/jmap/upload` and `Blob/upload` refused on a
+Email/get `bodyValues` and a section download, where the whole-message
+reads equal upstream's reconstructed result for the same message in a
+plain account (the prepended delivery headers included) and the section
+reads equal the decoded original attachment; **uploads**: `/jmap/upload`
+and `Blob/upload` refused on a
 Bearer token, over the WebSocket and into another account, accepted and
 sealed with the credential, and a sealed upload imported and attached;
 **raw consumers**: `Blob/upload` data sources, `FileNode/set` create and
@@ -934,12 +1005,14 @@ unless the code says otherwise.
 10. **Key-mode harness for IMAP and JMAP.** Confirm how `imap_tests` and
     `jmap_tests` provision accounts and whether `create_key_user_account`
     fits their fixtures; the plan sizes the variants from that.
-11. **The fence's cost.** `AssertValue::None` on the vault record key in
-    every ordinary ingest and copy batch is one key read inside the write
-    transaction on every backend; confirm it is supported by the SQL
-    backends' assertion path as the calendar's `assert_value` is, and that
-    a failed assertion surfaces to `deliver_message` as a retryable error
-    rather than a permanent one.
+11. **The fence's plumbing.** Confirm that a failed `AssertValue::None`
+    surfaces from `email_ingest` to `deliver_message` as a temporary
+    failure rather than a permanent one, that `put_temporary_blob` can
+    report whether it wrote the bytes (or ingest checks `blob_exists`
+    first), and how `setup-token` learns the data store's kind for the
+    PostgreSQL and MySQL refusal. Recommendation: a store-kind accessor on
+    `Storage`, and a `za_` wrapper around `put_temporary_blob` in the
+    email crate that returns the written flag.
 12. **The structured-event inventory.** Enumerate the `trc::event!` sites
     of section 10's rule and the keys each carries; decide per site
     between `[redacted]` and dropping the key. Recommendation:
