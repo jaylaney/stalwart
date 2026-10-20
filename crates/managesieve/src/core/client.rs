@@ -220,7 +220,11 @@ impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
             ManageSieve(trc::ManageSieveEvent::RawOutput),
             SpanId = self.session_id,
             Size = bytes.len(),
-            Contents = trc::Value::from_maybe_string(bytes),
+            Contents = if matches!(self.state, State::NotAuthenticated { .. }) {
+                trc::Value::redacted()
+            } else {
+                trc::Value::from_maybe_string(bytes)
+            },
         );
 
         self.stream.write_all(bytes).await.map_err(|err| {
@@ -241,6 +245,18 @@ impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
 
     pub async fn write_error(&mut self, error: trc::Error) -> trc::Result<()> {
         let bytes = error.serialize();
+        // Issue #20: before authentication a syntax error can quote client
+        // input (a command name), so its trace redacts it. Those are the
+        // receiver's BAD errors, IMAP events; static diagnostics stay
+        // readable.
+        let error = if matches!(self.state, State::NotAuthenticated { .. })
+            && error.matches(trc::EventType::Imap(trc::ImapEvent::Error))
+            && error.value_as_str(trc::Key::Type) == Some("BAD")
+        {
+            error.redact(&[trc::Key::Details, trc::Key::Id])
+        } else {
+            error
+        };
         trc::error!(error.span_id(self.session_id));
         self.write(&bytes).await
     }
@@ -258,7 +274,11 @@ impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
             ManageSieve(trc::ManageSieveEvent::RawInput),
             SpanId = self.session_id,
             Size = len,
-            Contents = trc::Value::from_maybe_string(bytes.get(0..len).unwrap_or_default()),
+            Contents = if matches!(self.state, State::NotAuthenticated { .. }) {
+                trc::Value::redacted()
+            } else {
+                trc::Value::from_maybe_string(bytes.get(0..len).unwrap_or_default())
+            },
         );
 
         Ok(len)

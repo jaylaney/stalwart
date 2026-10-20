@@ -748,12 +748,48 @@ body (shown as `[redacted]`), nor the value of an `Authorization`,
 `Proxy-Authorization` or `Cookie` header on any request. Vault API bodies
 are never traced. Login bodies and responses on `/api/auth` are never
 traced either, since the password arrives before any account is known.
-Non-key DAV and JMAP traffic is traced as upstream traces it. Mail-protocol
-raw-input traces (`imap.raw-input` and the POP3, ManageSieve and SMTP
-equivalents) are upstream's and still record the authentication exchange,
-so an operator who enables them can capture a key account's password or
-app password; release 1 records this as a limit, since the calendar is
-served over HTTP only.
+Non-key DAV and JMAP traffic is traced as upstream traces it. OAuth form
+bodies (the token, device and introspection endpoints, and with them the
+contact form, which shares the reader) are never traced. The mail
+protocols mask the authentication exchange for every account, since the
+account is unknown before authentication (issue #20). IMAP, POP3 and
+ManageSieve record `[redacted]` as the contents of `imap.raw-input`,
+`pop3.raw-input` and `manage-sieve.raw-input` and of their `raw-output`
+events while the session is not authenticated, and as the details and tag
+of the syntax errors that can quote client input: a response pipelined
+ahead of its continuation is parsed as a command and quoted by the parse
+error. Those are the IMAP parser's BAD errors (`imap.error`, also raised in
+a ManageSieve session) written before authentication, and POP3's parse
+errors of a read that arrived before authentication (`pop3.error`, marked
+when queued, as the read's earlier requests may log in before they are
+written; their `raw-output` is masked too). Static diagnostics (`Already
+in TLS mode.`, `Cannot authenticate over plain-text.`) stay readable.
+ManageSieve refuses an unknown mechanism without quoting it. IMAP and
+ManageSieve UNAUTHENTICATE return to the unauthenticated state.
+`smtp.raw-input` (SMTP, LMTP and submission) records `[redacted]` for a
+read made during a SASL exchange; a read that, joined to the unparsed start
+of the current request line, holds `AUTH` followed by ASCII whitespace (the
+parser's stop characters, a form feed included) anywhere, in any case (the
+parser can start a request mid-line, after a BDAT chunk); and, after the
+server writes a 334 (the MFA reply among them, a 334 that leaves the
+exchange), every read up to and including the next read that contains a
+line end, so a pipelined answer can mask the read after it too. A message
+line holding `auth` and whitespace is masked with its read. Raw input
+after authentication, and every other SMTP read, is traced as upstream
+traces it. The residual: an operator who runs a patched binary, terminates
+TLS at a proxy in front of the server, or enables a plain-text port can
+still read the exchange off the wire or out of process memory, which the
+trust model already concedes for a running session; a client that sends a
+credential on an authenticated session has it traced, since a read is
+traced as the session's state stands when it arrives: a LOGIN or
+AUTHENTICATE on an authenticated IMAP session, an AUTHENTICATE on an
+authenticated ManageSieve session, a USER, PASS or AUTH on an authenticated
+POP3 session, or a LOGIN or AUTHENTICATE pipelined in one read after an
+UNAUTHENTICATE (all refused); an IMAP AUTHENTICATE pipelined behind a LOGIN
+in one read runs after the login, so an unknown mechanism name it carries
+is quoted by its error after authentication; and an SMTP `AUTH` line longer
+than the protocol's 4096-byte line limit has the part read after the
+server gives up on the line traced.
 
 ## 11. Testing
 

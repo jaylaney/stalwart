@@ -21,7 +21,11 @@ impl<T: SessionStream> Session<T> {
             Pop3(trc::Pop3Event::RawInput),
             SpanId = self.session_id,
             Size = bytes.len(),
-            Contents = trc::Value::from_maybe_string(bytes),
+            Contents = if matches!(self.state, State::NotAuthenticated { .. }) {
+                trc::Value::redacted()
+            } else {
+                trc::Value::from_maybe_string(bytes)
+            },
         );
 
         let mut bytes = bytes.iter();
@@ -73,7 +77,19 @@ impl<T: SessionStream> Session<T> {
                             }
                         }
                     }
-                    requests.push(Err(trc::Pop3Event::Error.into_err().details(err)));
+                    // Issue #20: a parse error can quote client input (an
+                    // unsupported mechanism) and is written after the read's
+                    // earlier requests ran, which may authenticate: one read
+                    // before authentication is marked BAD here, and
+                    // `write_err` masks a BAD error's traces.
+                    let err = trc::Pop3Event::Error.into_err().details(err);
+                    requests.push(Err(
+                        if matches!(self.state, State::NotAuthenticated { .. }) {
+                            err.ctx(trc::Key::Type, "BAD")
+                        } else {
+                            err
+                        },
+                    ));
                 }
             }
         }

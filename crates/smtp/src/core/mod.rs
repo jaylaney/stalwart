@@ -92,6 +92,10 @@ pub struct SessionData {
     pub spf_ehlo: Option<SpfOutput>,
     pub spf_mail_from: Option<SpfOutput>,
     pub dnsbl_error: Option<Vec<u8>>,
+
+    /// Issue #20: the session wrote a 334 and the client's answer, which can
+    /// carry a SASL response, has not ended its line yet.
+    pub za_answers_334: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -168,6 +172,7 @@ impl SessionData {
             spf_ehlo: None,
             spf_mail_from: None,
             dnsbl_error: None,
+            za_answers_334: false,
         }
     }
 }
@@ -291,6 +296,7 @@ impl SessionData {
             spf_ehlo: None,
             spf_mail_from: None,
             dnsbl_error: None,
+            za_answers_334: false,
         }
     }
 }
