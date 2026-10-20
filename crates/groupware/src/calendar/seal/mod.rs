@@ -26,4 +26,8 @@ pub use item::{
     unseal_item_archive,
 };
 pub use token::{TOKEN_LEN, TokenPairs, tokens_equal};
-pub use tree::{SealError, seal_error, tree_has_carriers};
+pub use tree::{
+    FORMAT_V1, PAD, SealError, WRAP_MK, WRAP_PK, decode_archive, open_key_envelope, open_padded,
+    open_pk_envelope, seal_error, seal_key_envelope, seal_padded, seal_pk_envelope,
+    tree_has_carriers,
+};

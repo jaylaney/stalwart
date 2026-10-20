@@ -13,3 +13,4 @@ pub mod headers;
 pub mod index;
 pub mod ingest;
 pub mod metadata;
+pub mod za;
