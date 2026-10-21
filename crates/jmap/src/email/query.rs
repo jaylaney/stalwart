@@ -4,8 +4,12 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::{api::query::QueryResponseBuilder, changes::state::JmapCacheState};
-use common::{MessageStoreCache, Server, auth::AccessToken};
+use crate::{
+    api::query::QueryResponseBuilder,
+    changes::state::JmapCacheState,
+    email::za::{first_refused_filter, first_refused_sort},
+};
+use common::{MessageStoreCache, Server, auth::AccessToken, za::ZA_MAIL_SEARCH_REFUSED};
 use email::cache::{MessageCacheFetch, email::MessageCacheAccess};
 use jmap_proto::{
     method::query::{Filter, QueryRequest, QueryResponse},
@@ -41,6 +45,24 @@ impl EmailQuery for Server {
         access_token: &AccessToken,
     ) -> trc::Result<QueryResponse> {
         let account_id = request.account_id.document_id();
+
+        // Mail spec 8: a key account's search index holds the arrival time
+        // and the size only; a filter or sort that needs content is refused
+        // before the query runs, rather than left to match nothing.
+        // `Email/queryChanges` reaches this method when the state has changes.
+        if self.za_is_key_account(account_id).await? {
+            if let Some(filter) = first_refused_filter(&request.filter) {
+                return Err(trc::JmapEvent::UnsupportedFilter
+                    .into_err()
+                    .details(format!("{filter}: {ZA_MAIL_SEARCH_REFUSED}")));
+            }
+            if let Some(sort) = first_refused_sort(request.sort.as_deref().unwrap_or_default()) {
+                return Err(trc::JmapEvent::UnsupportedSort
+                    .into_err()
+                    .details(format!("{sort}: {ZA_MAIL_SEARCH_REFUSED}")));
+            }
+        }
+
         let mut filters = Vec::with_capacity(request.filter.len());
         let cached_messages = self
             .get_cached_messages(account_id)

@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use common::{Server, auth::AccessToken};
+use common::{Server, auth::AccessToken, za::ZA_MAIL_SEARCH_REFUSED};
 use email::{
     cache::{MessageCacheFetch, email::MessageCacheAccess},
     message::{
@@ -97,6 +97,15 @@ impl EmailSearchSnippet for Server {
             }
         }
         let account_id = request.account_id.document_id();
+        // Mail spec 8: a snippet marks the matched terms in sealed content,
+        // which a search cannot find; a text term on a key account is
+        // refused before any message is read. Without terms the response
+        // carries bare snippets, as for any account.
+        if !terms.is_empty() && self.za_is_key_account(account_id).await? {
+            return Err(trc::JmapEvent::UnsupportedFilter
+                .into_err()
+                .details(format!("text: {ZA_MAIL_SEARCH_REFUSED}")));
+        }
         let cached_messages = self
             .get_cached_messages(account_id)
             .await

@@ -33,7 +33,7 @@ use base64::{
 };
 use common::{
     auth::AccessToken,
-    za::{ZA_MAIL_KEYLESS, ZA_MAIL_UNREADABLE, test_hooks},
+    za::{ZA_MAIL_KEYLESS, ZA_MAIL_SEARCH_REFUSED, ZA_MAIL_UNREADABLE, test_hooks},
 };
 use email::{
     mailbox::{DRAFTS_ID, SENT_ID},
@@ -428,7 +428,9 @@ async fn offsets_round_trip(key: &Account, plain: &Account) {
             ))
             .unwrap_or_else(|| panic!("Email/parse: {:?}", parsed.0))
             .clone();
-        // Until Task 8 refuses a key account's term searches (spec 8).
+        // Mail spec 8: a term snippet is refused for the key account
+        // (`search.rs` covers the refusals in full); the control still
+        // marks the term in its preview.
         let snippets = account
             .jmap_method_call(
                 "SearchSnippet/get",
@@ -439,16 +441,27 @@ async fn offsets_round_trip(key: &Account, plain: &Account) {
                 }),
             )
             .await;
-        let mut snippet = snippets.list()[0].clone();
-        snippet.as_object_mut().unwrap().remove("emailId");
-        assert!(
-            snippet["preview"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("canary"),
-            "{}: {snippet}",
-            account.name()
-        );
+        if account.name() == key.name() {
+            let error = &snippets.0["methodResponses"][0];
+            assert_eq!(error[0], "error", "{}: {error}", account.name());
+            assert_eq!(error[1]["type"], "unsupportedFilter", "{error}");
+            assert!(
+                error[1]["description"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(ZA_MAIL_SEARCH_REFUSED)),
+                "{error}"
+            );
+        } else {
+            let snippet = &snippets.list()[0];
+            assert!(
+                snippet["preview"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("canary"),
+                "{}: {snippet}",
+                account.name()
+            );
+        }
 
         let mut imap = imap_session(account, b"_r ").await;
         let mut fetched = Vec::new();
@@ -480,14 +493,12 @@ async fn offsets_round_trip(key: &Account, plain: &Account) {
             fetched,
             normalize_json(email, account.name()),
             whole,
-            snippet,
             normalize_json(parsed, account.name()),
         ));
     }
 
-    let (key_fetched, key_email, key_whole, key_snippet, key_parsed) = &answers[0];
-    let (plain_fetched, plain_email, plain_whole, plain_snippet, plain_parsed) = &answers[1];
-    assert_eq!(key_snippet, plain_snippet, "SearchSnippet/get");
+    let (key_fetched, key_email, key_whole, key_parsed) = &answers[0];
+    let (plain_fetched, plain_email, plain_whole, plain_parsed) = &answers[1];
     assert_eq!(key_parsed, plain_parsed, "Email/parse");
     assert_eq!(key_parsed["subject"], "reads corpus", "{key_parsed}");
     for (attribute, (key, plain)) in FETCH_ATTRIBUTES

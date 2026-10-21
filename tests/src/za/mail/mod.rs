@@ -42,6 +42,7 @@ pub mod fence;
 pub mod gates;
 pub mod login;
 pub mod reads;
+pub mod search;
 pub mod uploads;
 pub mod writes;
 

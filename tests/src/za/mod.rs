@@ -176,6 +176,7 @@ pub async fn za_tests() {
     mail::reads::test(&mut test).await;
     mail::uploads::test(&mut test).await;
     mail::gates::test(&mut test).await;
+    mail::search::test(&mut test).await;
 
     destroy_key_accounts(&test).await;
     test.assert_is_empty().await;

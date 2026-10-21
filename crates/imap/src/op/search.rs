@@ -9,7 +9,7 @@ use crate::{
     core::{ImapId, SavedSearch, SelectedMailbox, Session, SessionData},
     spawn_op,
 };
-use common::network::SessionStream;
+use common::{network::SessionStream, za::ZA_MAIL_SEARCH_REFUSED};
 use email::cache::{MessageCacheFetch, email::MessageCacheAccess};
 use imap_proto::{
     Command, ResponseCode, ResponseType, StatusResponse,
@@ -272,6 +272,23 @@ impl<T: SessionStream> SessionData<T> {
         self.server
             .za_assert_mail_route(&self.access_token, mailbox.id.account_id)
             .await?;
+
+        // Mail spec 8: a key account's search index holds the arrival time
+        // and the size only, so a filter or sort that needs a message's
+        // content is refused as a whole, not left to match nothing. Not a
+        // security event: the client must read the answer. The error holds
+        // the fixed text only, so the search term is not traced.
+        if self.server.za_is_key_account(mailbox.id.account_id).await?
+            && (imap_filter.iter().any(za_filter_needs_content)
+                || imap_comparator
+                    .iter()
+                    .any(|comparator| za_sort_needs_content(&comparator.sort)))
+        {
+            return Err(trc::ImapEvent::Error
+                .into_err()
+                .details(ZA_MAIL_SEARCH_REFUSED)
+                .code(ResponseCode::Cannot));
+        }
 
         // Obtain message ids
         let mut filters = Vec::with_capacity(imap_filter.len() + 1);
@@ -707,6 +724,72 @@ impl<T: SessionStream> SessionData<T> {
     }
 }
 
+/// Mail spec 8: true when the filter key needs a message's sealed content
+/// (header values, body text, the sent date). The match has no wildcard, so
+/// a key added upstream fails to compile here until it is classified.
+fn za_filter_needs_content(filter: &Filter) -> bool {
+    match filter {
+        Filter::Bcc(_)
+        | Filter::Body(_)
+        | Filter::Cc(_)
+        | Filter::From(_)
+        | Filter::Header(..)
+        | Filter::SentBefore(_)
+        | Filter::SentOn(_)
+        | Filter::SentSince(_)
+        | Filter::Subject(_)
+        | Filter::Text(_)
+        | Filter::To(_) => true,
+        Filter::Sequence(..)
+        | Filter::All
+        | Filter::Answered
+        | Filter::Before(_)
+        | Filter::Deleted
+        | Filter::Draft
+        | Filter::Flagged
+        | Filter::Keyword(_)
+        | Filter::Larger(_)
+        | Filter::On(_)
+        | Filter::Seen
+        | Filter::Since(_)
+        | Filter::Smaller(_)
+        | Filter::Unanswered
+        | Filter::Undeleted
+        | Filter::Undraft
+        | Filter::Unflagged
+        | Filter::Unkeyword(_)
+        | Filter::Unseen
+        | Filter::And
+        | Filter::Or
+        | Filter::Not
+        | Filter::End
+        | Filter::Recent
+        | Filter::New
+        | Filter::Old
+        | Filter::Older(_)
+        | Filter::Younger(_)
+        | Filter::ModSeq(_)
+        | Filter::EmailId(_)
+        | Filter::ThreadId(_)
+        | Filter::UidAfter(_)
+        | Filter::UidBefore(_) => false,
+    }
+}
+
+/// Mail spec 8: true when the sort key needs a message's sealed content.
+fn za_sort_needs_content(sort: &search::Sort) -> bool {
+    match sort {
+        search::Sort::Cc
+        | search::Sort::Date
+        | search::Sort::From
+        | search::Sort::DisplayFrom
+        | search::Sort::Subject
+        | search::Sort::To
+        | search::Sort::DisplayTo => true,
+        search::Sort::Arrival | search::Sort::Size => false,
+    }
+}
+
 impl SelectedMailbox {
     pub async fn get_saved_search(&self) -> Option<Arc<Vec<ImapId>>> {
         let mut rx = match &*self.saved_search.lock() {
@@ -790,6 +873,93 @@ impl SavedSearch {
             }
             SavedSearch::Results { items } => Some(items.clone()),
             SavedSearch::None => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use imap_proto::protocol::{Flag, search::ModSeqEntry};
+
+    /// Every `Filter` variant with its verdict (mail spec 8). The match in
+    /// `za_filter_needs_content` has no wildcard, so a new variant fails to
+    /// compile there; this table fails when one is added without a row.
+    fn filters() -> Vec<(Filter, bool)> {
+        let text = || "x".to_string();
+        vec![
+            (Filter::Sequence(Sequence::number(1), false), false),
+            (Filter::All, false),
+            (Filter::Answered, false),
+            (Filter::Bcc(text()), true),
+            (Filter::Before(0), false),
+            (Filter::Body(text()), true),
+            (Filter::Cc(text()), true),
+            (Filter::Deleted, false),
+            (Filter::Draft, false),
+            (Filter::Flagged, false),
+            (Filter::From(text()), true),
+            (Filter::Header(text(), text()), true),
+            (Filter::Keyword(Flag::Seen), false),
+            (Filter::Larger(1), false),
+            (Filter::On(0), false),
+            (Filter::Seen, false),
+            (Filter::SentBefore(0), true),
+            (Filter::SentOn(0), true),
+            (Filter::SentSince(0), true),
+            (Filter::Since(0), false),
+            (Filter::Smaller(1), false),
+            (Filter::Subject(text()), true),
+            (Filter::Text(text()), true),
+            (Filter::To(text()), true),
+            (Filter::Unanswered, false),
+            (Filter::Undeleted, false),
+            (Filter::Undraft, false),
+            (Filter::Unflagged, false),
+            (Filter::Unkeyword(Flag::Seen), false),
+            (Filter::Unseen, false),
+            (Filter::And, false),
+            (Filter::Or, false),
+            (Filter::Not, false),
+            (Filter::End, false),
+            (Filter::Recent, false),
+            (Filter::New, false),
+            (Filter::Old, false),
+            (Filter::Older(1), false),
+            (Filter::Younger(1), false),
+            (Filter::ModSeq((1, ModSeqEntry::None)), false),
+            (Filter::EmailId(text()), false),
+            (Filter::ThreadId(text()), false),
+            (Filter::UidAfter(1), false),
+            (Filter::UidBefore(1), false),
+        ]
+    }
+
+    #[test]
+    fn filter_table() {
+        for (filter, needs_content) in filters() {
+            assert_eq!(
+                za_filter_needs_content(&filter),
+                needs_content,
+                "{filter:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sort_table() {
+        for (sort, needs_content) in [
+            (search::Sort::Arrival, false),
+            (search::Sort::Cc, true),
+            (search::Sort::Date, true),
+            (search::Sort::From, true),
+            (search::Sort::DisplayFrom, true),
+            (search::Sort::Size, false),
+            (search::Sort::Subject, true),
+            (search::Sort::To, true),
+            (search::Sort::DisplayTo, true),
+        ] {
+            assert_eq!(za_sort_needs_content(&sort), needs_content, "{sort:?}");
         }
     }
 }
