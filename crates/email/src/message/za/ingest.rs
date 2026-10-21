@@ -18,7 +18,7 @@ use crate::message::{
 use common::{
     Server,
     auth::AccessToken,
-    za::{ZA_MAIL_KEYLESS, ZA_TRACE_MAIL_KEYLESS},
+    za::{ZA_TRACE_MAIL_KEYLESS, mail::za_keyless_refusal},
 };
 use groupware::calendar::seal::seal_error;
 use registry::schema::{
@@ -108,11 +108,7 @@ pub async fn za_ingest_wrap(
             AccountId = account_id,
             Details = ZA_TRACE_MAIL_KEYLESS,
         );
-        Err(trc::JmapEvent::Forbidden
-            .into_err()
-            .account_id(account_id)
-            .details(ZA_MAIL_KEYLESS)
-            .code("NOPERM"))
+        Err(za_keyless_refusal().account_id(account_id))
     }
 }
 

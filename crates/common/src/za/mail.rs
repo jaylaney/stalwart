@@ -5,12 +5,25 @@
  */
 
 //! Mail spec 3.3 and 4: the IMAP and POP3 login gate. A mail session of a
-//! key account exists only with the account's session keys.
+//! key account exists only with the account's session keys. Also the error
+//! a refused mail access answers with (spec 6.3, 10).
 
-use super::ZA_TRACE_MAIL_LOGIN;
+use super::{ZA_MAIL_KEYLESS, ZA_TRACE_MAIL_LOGIN};
 use crate::{Server, auth::AccessToken};
 use std::sync::Arc;
 use vault::session::SessionKeys;
+
+/// Mail spec 6.3, 10: the error of a mail write or read refused for a key
+/// account, one every caller writes to its client: IMAP answers
+/// `NO [NOPERM]` and JMAP `forbidden`, with `ZA_MAIL_KEYLESS`. A
+/// `SecurityEvent` error is never written, which would leave an IMAP client
+/// waiting, so the caller traces its refusal as its own event.
+pub fn za_keyless_refusal() -> trc::Error {
+    trc::JmapEvent::Forbidden
+        .into_err()
+        .details(ZA_MAIL_KEYLESS)
+        .code("NOPERM")
+}
 
 impl Server {
     /// The token an IMAP or POP3 session keeps after a successful login:

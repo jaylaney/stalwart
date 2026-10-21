@@ -34,7 +34,7 @@ use registry::{
 };
 use std::future::Future;
 use std::{borrow::Cow, cmp::Ordering, fmt::Write, time::Instant};
-use store::write::{AlignedBytes, Archive, RegistryClass};
+use store::write::{AlignedBytes, Archive, RegistryClass, assert::AssertValue};
 use store::{
     IndexKeyPrefix, IterateParams, SerializeInfallible, U32_LEN, ValueKey,
     ahash::AHashMap,
@@ -48,7 +48,7 @@ use types::{
     blob::{BlobClass, BlobId},
     blob_hash::BlobHash,
     collection::{Collection, SyncCollection},
-    field::{ContactField, EmailField, MailboxField},
+    field::{ContactField, EmailField, MailboxField, PrincipalField},
     id::Id,
     keyword::Keyword,
     special_use::SpecialUse,
@@ -149,6 +149,8 @@ impl EmailIngest for Server {
         let tenant_id = params.access_token.tenant_id();
         let mut raw_message_len = params.raw_message.len() as u64;
         let account = self.account(account_id).await.caused_by(trc::location!())?;
+        #[cfg(feature = "test_mode")]
+        common::za::ingest_pause_point(account_id).await;
         // Mail spec 6.1, 6.2: a key account's message is sealed, its key
         // wrapped as chosen here, before any write.
         let za_key = account.is_key_account();
@@ -731,6 +733,16 @@ impl EmailIngest for Server {
             ItipMessages::new(itip_messages)
                 .queue(&mut batch)
                 .caused_by(trc::location!())?;
+        }
+
+        // Mail spec 6.1, the provisioning fence: an account read as ordinary
+        // takes the message only while it holds no vault record. Last, so no
+        // earlier op inherits the context it selects.
+        if !za_key {
+            batch
+                .with_collection(Collection::Principal)
+                .with_document(0)
+                .assert_value(PrincipalField::ZeroAccessVault, AssertValue::None);
         }
 
         // Insert and obtain ids

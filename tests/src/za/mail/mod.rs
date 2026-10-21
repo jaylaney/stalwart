@@ -31,6 +31,7 @@ use types::{blob_hash::BlobHash, collection::Collection, field::EmailField};
 use utils::cheeky_hash::CheekyHash;
 
 pub mod delivery;
+pub mod fence;
 pub mod login;
 pub mod writes;
 
@@ -185,6 +186,18 @@ pub async fn assert_sealed(test: &TestServer, account_id: u32, document_id: u32,
         0,
         "a sealed message has no threading key"
     );
+}
+
+/// Mail spec 6.1: no message of the account is stored in the clear; every
+/// message archive (`stored_metadata`) is a stub.
+pub async fn assert_no_plaintext(test: &TestServer, account_id: u32) {
+    for document_id in message_ids(test, account_id).await {
+        let archive = stored_metadata(test, account_id, document_id).await;
+        assert!(
+            is_stub(archive.unarchive::<MessageMetadata>().unwrap()),
+            "message {account_id}/{document_id} is stored in the clear"
+        );
+    }
 }
 
 /// The message opened with the account's keys, unlocked from `password`:

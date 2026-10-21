@@ -152,6 +152,28 @@ pub(crate) async fn vault_write_store(
     vault_batch_write(store, account_id, record, previous, None).await
 }
 
+/// The recheck's abort (mail spec 6.1): one batch on Principal document 0
+/// asserting the bytes `previous` read, then clearing the record. A lost
+/// assertion is `Err(e)` with `e.is_assertion_failure()` and nothing
+/// removed.
+pub(crate) async fn vault_delete_store(
+    store: &Store,
+    account_id: u32,
+    previous: &VaultRead,
+) -> trc::Result<()> {
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(account_id)
+        .with_collection(Collection::Principal)
+        .with_document(0)
+        .assert_value(
+            PrincipalField::ZeroAccessVault,
+            AssertValue::Hash(previous.cas),
+        )
+        .clear(PrincipalField::ZeroAccessVault);
+    store.write(batch.build_all()).await.map(|_| ())
+}
+
 /// The one vault batch, shared by the raw write (`vault_write_store`) and
 /// the commit (`vault_commit_store`), on Principal document 0: the vault
 /// assertion (the bytes `previous` read, or absence), then, with `pins`,
@@ -426,6 +448,16 @@ impl Server {
         pins: Option<ZaPinWrite<'_>>,
     ) -> trc::Result<()> {
         vault_commit_store(self.store(), account_id, record, previous, pins).await?;
+        self.za_invalidate_committed(account_id).await;
+        Ok(())
+    }
+
+    /// The recheck's abort (mail spec 6.1): removes a pending record this
+    /// process wrote, conditional on the bytes it wrote (`previous`), then
+    /// invalidates as `za_vault_commit` does. A lost assertion is `Err(e)`
+    /// with `e.is_assertion_failure()`, nothing removed.
+    pub async fn za_vault_delete(&self, account_id: u32, previous: &VaultRead) -> trc::Result<()> {
+        vault_delete_store(self.store(), account_id, previous).await?;
         self.za_invalidate_committed(account_id).await;
         Ok(())
     }
@@ -1143,6 +1175,32 @@ mod tests {
         let after = vault_read_store(&store, 4).await.unwrap().unwrap();
         assert_eq!(after.cas, read.cas);
         assert_eq!(after.record, record);
+    }
+
+    /// Mail spec 6.1: the recheck's abort removes only the bytes it read.
+    #[tokio::test]
+    async fn a_pending_record_is_deleted_only_at_its_own_revision() {
+        let store = EphemeralStore::open();
+        let mut record = VaultRecord::pending(vec![1; 32], 0);
+        vault_commit_store(&store, 9, &mut record, None, None)
+            .await
+            .unwrap();
+        let read = vault_read_store(&store, 9).await.unwrap().unwrap();
+        let mut rotated = read.record.clone();
+        vault_commit_store(&store, 9, &mut rotated, Some(&read), None)
+            .await
+            .unwrap();
+        assert!(
+            vault_delete_store(&store, 9, &read)
+                .await
+                .unwrap_err()
+                .is_assertion_failure(),
+            "stale cas"
+        );
+        let read = vault_read_store(&store, 9).await.unwrap().unwrap();
+        assert_eq!(read.record.revision, 2, "the lost delete removed nothing");
+        vault_delete_store(&store, 9, &read).await.unwrap();
+        assert!(vault_read_store(&store, 9).await.unwrap().is_none());
     }
 
     fn test_totp_url() -> String {

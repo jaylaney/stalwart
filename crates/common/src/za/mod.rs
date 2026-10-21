@@ -76,3 +76,42 @@ pub fn redeliver_batch_override() -> Option<usize> {
         None
     }
 }
+
+/// Mail spec 6.1: the provisioning fence's pause points
+/// (`test_hooks::{INGEST_PAUSE, COPY_PAUSE, SETUP_TOKEN_PAUSE}`);
+/// forwarders for the email and HTTP crates' test builds, as above, no-ops
+/// unless this crate is built with `test_mode`.
+pub async fn ingest_pause_point(account_id: u32) {
+    #[cfg(feature = "test_mode")]
+    test_hooks::ingest_pause_point(account_id).await;
+    #[cfg(not(feature = "test_mode"))]
+    let _ = account_id;
+}
+
+pub async fn copy_pause_point(to_account_id: u32) {
+    #[cfg(feature = "test_mode")]
+    test_hooks::copy_pause_point(to_account_id).await;
+    #[cfg(not(feature = "test_mode"))]
+    let _ = to_account_id;
+}
+
+pub async fn setup_token_pause_point(account_id: u32) {
+    #[cfg(feature = "test_mode")]
+    test_hooks::setup_token_pause_point(account_id).await;
+    #[cfg(not(feature = "test_mode"))]
+    let _ = account_id;
+}
+
+/// Mail spec 6.1: whether `setup-token` must answer as on PostgreSQL or
+/// MySQL (`test_hooks::FORCE_SQL_STORE`); a forwarder as above, always
+/// `false` unless this crate is built with `test_mode`.
+pub fn force_sql_store() -> bool {
+    #[cfg(feature = "test_mode")]
+    {
+        test_hooks::force_sql_store()
+    }
+    #[cfg(not(feature = "test_mode"))]
+    {
+        false
+    }
+}

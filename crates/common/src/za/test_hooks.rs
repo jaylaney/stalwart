@@ -67,10 +67,20 @@
 //! - `REDELIVER_CLEANUP_PAUSE`: in `contacts/pin` after its last event
 //!   commit, before the step 5 retirement, keyed by the account
 //!   (`http::api::contacts`, key pinning spec 6.4).
+//! - `INGEST_PAUSE`: in `email_ingest` right after the account read (the
+//!   classification), keyed by the account (`email::message::ingest`, mail
+//!   spec 6.1's provisioning fence).
+//! - `COPY_PAUSE`: in `copy_message` right after the destination account
+//!   read, keyed by the destination (`email::message::copy`).
+//! - `SETUP_TOKEN_PAUSE`: in `setup-token` after its first emptiness check
+//!   and immediately before the pending record's write, keyed by the
+//!   account (`http::api::vault`, mail spec 6.1's recheck).
+//! - `FORCE_SQL_STORE`: `setup-token` answers as on PostgreSQL or MySQL
+//!   (mail spec 6.1).
 
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
 use tokio::sync::Notify;
 
@@ -125,6 +135,15 @@ pub static RETIRE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static PIN_WRITE_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
 
 pub static REDELIVER_CLEANUP_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
+pub static INGEST_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
+pub static COPY_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
+pub static SETUP_TOKEN_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
+/// Whether `setup-token` treats the data store as PostgreSQL or MySQL.
+pub static FORCE_SQL_STORE: AtomicBool = AtomicBool::new(false);
 
 /// Accounts whose drain does not run; `DRAIN_SKIP_ALL` stands for every
 /// account.
@@ -225,6 +244,26 @@ pub fn set_retire_pause(pause: Option<Arc<Pause>>) {
 
 pub fn set_redeliver_cleanup_pause(pause: Option<Arc<Pause>>) {
     set_slot(&REDELIVER_CLEANUP_PAUSE, pause);
+}
+
+pub fn set_ingest_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&INGEST_PAUSE, pause);
+}
+
+pub fn set_copy_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&COPY_PAUSE, pause);
+}
+
+pub fn set_setup_token_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SETUP_TOKEN_PAUSE, pause);
+}
+
+pub fn set_force_sql_store(force: bool) {
+    FORCE_SQL_STORE.store(force, Ordering::SeqCst);
+}
+
+pub fn force_sql_store() -> bool {
+    FORCE_SQL_STORE.load(Ordering::SeqCst)
 }
 
 pub fn set_pin_write_fail(account_id: Option<u32>) {
@@ -331,6 +370,18 @@ pub async fn retire_pause_point(sender_id: u32) {
 
 pub async fn redeliver_cleanup_pause_point(account_id: u32) {
     wait(take_for(&REDELIVER_CLEANUP_PAUSE, account_id)).await;
+}
+
+pub async fn ingest_pause_point(account_id: u32) {
+    wait(take_for(&INGEST_PAUSE, account_id)).await;
+}
+
+pub async fn copy_pause_point(to_account_id: u32) {
+    wait(take_for(&COPY_PAUSE, to_account_id)).await;
+}
+
+pub async fn setup_token_pause_point(account_id: u32) {
+    wait(take_for(&SETUP_TOKEN_PAUSE, account_id)).await;
 }
 
 /// Whether the account's fan-out or step 5 pin-record write must fail now;

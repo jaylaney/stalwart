@@ -669,6 +669,18 @@ async fn za_setup_token(
         ));
     }
 
+    // Mail spec 6.1: an absent-key assertion is no fence on PostgreSQL or
+    // MySQL, so key accounts are not supported there.
+    #[cfg(feature = "test_mode")]
+    let force_sql_store = common::za::force_sql_store();
+    #[cfg(not(feature = "test_mode"))]
+    let force_sql_store = false;
+    if server.store().is_pg_or_mysql() || force_sql_store {
+        return Ok(conflict(
+            "key accounts are not supported on PostgreSQL or MySQL",
+        ));
+    }
+
     // State first, so an active account is refused as such.
     let previous = server.za_vault_record(account_id).await?;
     if previous
@@ -686,7 +698,7 @@ async fn za_setup_token(
     let has_credentials = reg.account.credentials.values().next().is_some();
 
     // Data checks apply to initial issuance and to reissuance (spec 4.1).
-    if let Some(response) = za_assert_no_calendar_data(server, account_id).await? {
+    if let Some(response) = za_assert_no_data(server, account_id).await? {
         return Ok(response);
     }
 
@@ -714,6 +726,8 @@ async fn za_setup_token(
             record
         }
     };
+    #[cfg(feature = "test_mode")]
+    common::za::setup_token_pause_point(account_id).await;
     if let Err(response) = za_commit(
         server,
         account_id,
@@ -724,6 +738,27 @@ async fn za_setup_token(
     )
     .await?
     {
+        return Ok(response);
+    }
+
+    // The recheck (mail spec 6.1): an ordinary writer that read the record
+    // as absent may have committed since the check above; none can commit
+    // now. If one did, the pending record this call wrote is removed,
+    // conditional on its bytes (when another write replaced it, it is no
+    // longer ours to remove), and the first check's 409 is the answer. A
+    // reissue keeps its record: its marker already makes the account a key
+    // account.
+    if let Some(response) = za_assert_no_data(server, account_id).await? {
+        if !has_marker
+            && let Some(written) = server
+                .za_vault_record(account_id)
+                .await?
+                .filter(|read| read.record.revision == record.revision)
+            && let Err(err) = server.za_vault_delete(account_id, &written).await
+            && !err.is_assertion_failure()
+        {
+            return Err(err);
+        }
         return Ok(response);
     }
 
@@ -767,15 +802,12 @@ async fn za_assert_enabled(server: &Server, account_id: u32) -> trc::Result<()> 
     }
 }
 
-/// Refuses an account that already holds calendar data: setup would
-/// otherwise convert plaintext into a key account. A sole default calendar
-/// created by the server (`create_default_calendar`) with untouched
-/// preferences is not user data and is ignored; it is sealed by its first
-/// write (spec 7.3).
-async fn za_assert_no_calendar_data(
-    server: &Server,
-    account_id: u32,
-) -> trc::Result<Option<HttpResponse>> {
+/// Refuses an account that already holds calendar data or mail: setup would
+/// otherwise convert plaintext into a key account (mail spec 6.6). A sole
+/// default calendar created by the server (`create_default_calendar`) with
+/// untouched preferences is not user data and is ignored; it is sealed by
+/// its first write (spec 7.3).
+async fn za_assert_no_data(server: &Server, account_id: u32) -> trc::Result<Option<HttpResponse>> {
     for collection in [
         Collection::CalendarEvent,
         Collection::CalendarEventNotification,
@@ -786,6 +818,12 @@ async fn za_assert_no_calendar_data(
     }
     if za_has_user_calendars(server, account_id).await? {
         return Ok(Some(conflict("account already holds calendar data")));
+    }
+    if server
+        .za_has_documents(account_id, Collection::Email)
+        .await?
+    {
+        return Ok(Some(conflict("account already holds mail")));
     }
     Ok(None)
 }
@@ -883,7 +921,7 @@ async fn za_setup(
     za_assert_enabled(server, account_id).await?;
     za_check_new_password(server, &request.password, &request.username)?;
     // The token may be days old: data can have arrived since issuance.
-    if let Some(response) = za_assert_no_calendar_data(server, account_id).await? {
+    if let Some(response) = za_assert_no_data(server, account_id).await? {
         return Ok(response);
     }
 

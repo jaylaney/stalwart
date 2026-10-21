@@ -108,7 +108,7 @@ pub async fn test(test: &mut TestServer) {
 /// The local delivery schedule of one-second retries, selected for local
 /// recipients, and the classifier as `imap_tests` configures it (ruling
 /// R8), so samples are written for ordinary accounts.
-async fn configure(admin: &Account) -> Id {
+pub(super) async fn configure(admin: &Account) -> Id {
     let local_queue = admin
         .registry_get_all::<MtaVirtualQueue>()
         .await
@@ -167,7 +167,7 @@ async fn configure(admin: &Account) -> Id {
     schedule_id
 }
 
-async fn unconfigure(admin: &Account, schedule_id: Id) {
+pub(super) async fn unconfigure(admin: &Account, schedule_id: Id) {
     admin
         .registry_update_setting(MtaOutboundStrategy::default(), &[Property::Schedule])
         .await;
@@ -195,7 +195,7 @@ fn addressed(subject: &str, body: &str) -> String {
 
 /// Whether the queue holds a message for `address` whose last attempt
 /// failed temporarily.
-async fn temporarily_failed(test: &TestServer, address: &str) -> bool {
+pub(super) async fn temporarily_failed(test: &TestServer, address: &str) -> bool {
     test.read_queued_messages()
         .await
         .into_iter()
