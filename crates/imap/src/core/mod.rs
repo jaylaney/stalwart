@@ -192,6 +192,17 @@ impl<T: SessionStream> State<T> {
     }
 }
 
+impl<T: SessionStream> Session<T> {
+    /// Mail spec 3.3: whether this session is logged in with its account's
+    /// keys.
+    pub fn za_key_session(&self) -> bool {
+        match &self.state {
+            State::NotAuthenticated { .. } => false,
+            State::Authenticated { data } | State::Selected { data, .. } => data.za_key_session(),
+        }
+    }
+}
+
 impl<T: SessionStream> SessionData<T> {
     pub async fn refresh_access_token(&self) -> trc::Result<AccessToken> {
         self.server
@@ -201,6 +212,16 @@ impl<T: SessionStream> SessionData<T> {
                 AccessToken::renew(inner, self.access_token.credential_id(), self.remote_addr)
             })
             .caused_by(trc::location!())
+            // Mail spec 3.3: the renewed token carries the session's keys.
+            .map(|token| match self.access_token.session_keys() {
+                Some(keys) => token.with_session_keys(keys.clone()),
+                None => token,
+            })
+    }
+
+    /// Mail spec 3.3: whether this session holds its account's keys.
+    pub fn za_key_session(&self) -> bool {
+        self.access_token.session_keys().is_some()
     }
 
     pub fn replace_stream_tx<U: SessionStream>(

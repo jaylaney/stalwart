@@ -962,6 +962,55 @@ pub async fn za_app_password(name: &str, password: &str, description: &str) -> S
     .str(200, "app_password")
 }
 
+/// An OAuth access token of `name`, through the server's own flow: an
+/// authorization code from `/api/auth`, exchanged at `/auth/token` (the
+/// suite requires no client registration). The token holds no keys.
+pub async fn bearer_token(name: &str, password: &str) -> String {
+    const CLIENT_ID: &str = "za-bearer-test";
+    const REDIRECT_URI: &str = "https://client.example.com/callback";
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap();
+    let reply: Value = client
+        .post(format!("{SERVER_URL}/api/auth"))
+        .json(&json!({
+            "type": "authCode",
+            "accountName": name,
+            "accountSecret": password,
+            "clientId": CLIENT_ID,
+            "redirectUri": REDIRECT_URI,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let code = reply["client_code"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no authorization code: {reply}"));
+    let reply: Value = client
+        .post(format!("{SERVER_URL}/auth/token"))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("client_id", CLIENT_ID),
+            ("redirect_uri", REDIRECT_URI),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    reply["access_token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no access token: {reply}"))
+        .to_string()
+}
+
 /// Any DAV request of a key account drains its inbox first (invitations
 /// spec 6.2): a PROPFIND of the account's own principal, through the raw
 /// client (5 s), so a drain that waits on a lease or a pause is not cut off

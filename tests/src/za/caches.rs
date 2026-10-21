@@ -32,15 +32,16 @@ const HOME: &str = "/dav/cal/key3@example.com/";
 pub async fn test(test: &mut TestServer) {
     println!("Running zero-access cache tests...");
     residency_rules();
-    keys_only_over_http(test).await;
+    key_cache_only_over_http(test).await;
     live_caches(test).await;
 }
 
-/// Spec 2 and 5: session keys are attached by the HTTP layer only. An IMAP
-/// session holds its token for the connection's lifetime, so a key
-/// account's IMAP login leaves nothing resident, and `Server::authenticate`
-/// (the entry point of IMAP, POP3 and ManageSieve) returns keyless tokens.
-async fn keys_only_over_http(test: &TestServer) {
+/// Spec 2 and 5, amended by mail spec 3.3: the key cache serves the HTTP
+/// layer only. IMAP and POP3 sessions hold their keys for the connection
+/// (`mail::login`), but a mail login derives afresh and leaves nothing in
+/// the key cache; `Server::authenticate` (the entry point of SMTP and
+/// ManageSieve) returns keyless tokens by construction.
+async fn key_cache_only_over_http(test: &TestServer) {
     let id = test.account(NAME).id().document_id();
     let caches = &test.server.inner.cache;
     caches.za_keys.clear();
@@ -52,7 +53,7 @@ async fn keys_only_over_http(test: &TestServer) {
     imap.assert_read(Type::Tagged, ResponseType::Ok).await;
     assert!(
         !caches.za_keys.contains_account(id),
-        "an IMAP login leaves no resident keys"
+        "an IMAP login puts nothing in the key cache"
     );
 
     let request = AuthRequest::from_plain(NAME, STRONG, 0, IpAddr::from([127, 0, 0, 1]));

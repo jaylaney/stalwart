@@ -43,7 +43,7 @@ async fn za_fail(path: &str, body: &Value) -> VaultReply {
     za_post_from(FAIL_IP, path, body).await
 }
 
-fn totp_url() -> String {
+pub(crate) fn totp_url() -> String {
     totp_rs::Builder::new()
         .with_secret(store::rand::random::<[u8; 20]>())
         .with_account_name("key8")
@@ -54,7 +54,7 @@ fn totp_url() -> String {
         .unwrap()
 }
 
-fn code(url: &str) -> String {
+pub(crate) fn code(url: &str) -> String {
     totp_rs::Totp::from_url(url)
         .unwrap()
         .generate_current()

@@ -60,10 +60,19 @@ fn plain(secret: &str) -> String {
     STANDARD.encode(format!("\0{NAME}\0{secret}"))
 }
 
-struct Conn(BufReader<TlsStream<tokio::net::TcpStream>>);
+pub(crate) struct Conn(BufReader<TlsStream<tokio::net::TcpStream>>);
 
 impl Conn {
-    async fn open(port: u16) -> Self {
+    pub(crate) async fn open(port: u16) -> Self {
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        Conn::upgrade(tcp).await
+    }
+
+    /// The TLS handshake over `tcp`: a connection to an implicit-TLS port,
+    /// or one past a STARTTLS.
+    pub(crate) async fn upgrade(tcp: tokio::net::TcpStream) -> Self {
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let config = rustls::ClientConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
@@ -71,9 +80,6 @@ impl Conn {
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
             .with_no_client_auth();
-        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .unwrap();
         let tls = TlsConnector::from(Arc::new(config))
             .connect(ServerName::try_from("127.0.0.1").unwrap(), tcp)
             .await
@@ -83,7 +89,7 @@ impl Conn {
 
     /// One write, flushed: a read of its own on the server unless the
     /// server reads slower than the client writes.
-    async fn send(&mut self, data: &str) {
+    pub(crate) async fn send(&mut self, data: &str) {
         self.0.get_mut().write_all(data.as_bytes()).await.unwrap();
         self.0.get_mut().flush().await.unwrap();
     }
@@ -109,7 +115,7 @@ impl Conn {
     }
 
     /// Reads lines until one starts with any of `prefixes`, and returns it.
-    async fn until(&mut self, prefixes: &[&str]) -> String {
+    pub(crate) async fn until(&mut self, prefixes: &[&str]) -> String {
         loop {
             let mut line = String::new();
             let read = tokio::time::timeout(Duration::from_secs(10), self.0.read_line(&mut line))
@@ -124,7 +130,7 @@ impl Conn {
     }
 
     /// Sends `data` and expects a line starting with `expected`.
-    async fn exchange(&mut self, data: &str, expected: &str) {
+    pub(crate) async fn exchange(&mut self, data: &str, expected: &str) {
         self.send(data).await;
         let line = self
             .until(&[expected, "-ERR", "NO", "BAD", "a1 ", "5", "4"])
