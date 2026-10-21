@@ -10,7 +10,9 @@
 //! login that yields no keys for a key account (OAuth Bearer, master user)
 //! is refused with `NO [NOPERM]` and a fixed text, the connection kept open.
 
-use super::{deliver, key_mail_account, live_keys, message_ids, message_with, open_message};
+use super::{
+    Traced, deliver, key_mail_account, live_keys, message_ids, message_with, open_message,
+};
 use crate::{
     utils::{
         imap::{ImapConnection, Type},
@@ -21,7 +23,10 @@ use crate::{
     za::STRONG,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use common::{auth::credential::AppPassword, za::ZA_MAIL_LOGIN_REFUSED};
+use common::{
+    auth::credential::AppPassword,
+    za::{ZA_MAIL_LOGIN_REFUSED, ZA_TRACE_MAIL_LOGIN},
+};
 use imap_proto::ResponseType;
 use serde_json::json;
 use std::time::{Duration, Instant};
@@ -29,6 +34,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
 };
+use trc::{EventType, SecurityEvent};
 
 const NAME: &str = "keymail1@example.com";
 const NEW: &str = "a different long passphrase with 4 numbers";
@@ -212,6 +218,7 @@ async fn keyless_mechanisms_are_refused(test: &TestServer, id: u32) {
     let xoauth2 = STANDARD.encode(format!("user={NAME}\u{1}auth=Bearer {token}\u{1}\u{1}"));
     let master = plain_sasl(&format!("{NAME}%{MASTER}"), MASTER_SECRET);
 
+    let traced = Traced::start(&[EventType::Security(SecurityEvent::Unauthorized)]);
     let mut imap = Conn::open(IMAP_TLS_PORT).await;
     imap.until(&["* OK"]).await;
     for (mechanism, response) in [
@@ -235,7 +242,9 @@ async fn keyless_mechanisms_are_refused(test: &TestServer, id: u32) {
         );
     }
     imap.exchange("k3 LOGOUT\r\n", "k3 OK").await;
+    assert_login_refusals_traced(traced, id, 3, "IMAP").await;
 
+    let traced = Traced::start(&[EventType::Security(SecurityEvent::Unauthorized)]);
     let mut pop3 = Pop3Connection::connect().await;
     pop3.send(&format!("AUTH XOAUTH2 {xoauth2}")).await;
     let line = pop3.assert_read(Pop3Reply::Err).await.pop().unwrap();
@@ -243,6 +252,7 @@ async fn keyless_mechanisms_are_refused(test: &TestServer, id: u32) {
     assert_eq!(live_keys(id), base, "POP3: no keys after the refusal");
     pop3.send("QUIT").await;
     pop3.assert_read(Pop3Reply::Ok).await;
+    assert_login_refusals_traced(traced, id, 1, "POP3").await;
 
     // Control: an ordinary account's Bearer login takes upstream's path.
     let plain = test.account("plain@example.com");
@@ -259,6 +269,27 @@ async fn keyless_mechanisms_are_refused(test: &TestServer, id: u32) {
     )
     .await;
     imap.exchange("p2 LOGOUT\r\n", "p2 OK").await;
+}
+
+/// Ruling R49 of plan 13: each keyless login refusal of the key account
+/// `id` is traced once, as `Security(Unauthorized)` naming the account with
+/// `ZA_TRACE_MAIL_LOGIN`.
+async fn assert_login_refusals_traced(traced: Traced, id: u32, expected: usize, what: &str) {
+    let refusals = traced
+        .finish()
+        .await
+        .into_iter()
+        .filter(|e| {
+            e.typ == EventType::Security(SecurityEvent::Unauthorized)
+                && e.details == ZA_TRACE_MAIL_LOGIN
+        })
+        .map(|e| e.account_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        refusals,
+        vec![Some(u64::from(id)); expected],
+        "{what}: the keyless login refusals' traces"
+    );
 }
 
 /// A refusal is not an authentication failure: more refusals than the

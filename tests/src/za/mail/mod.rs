@@ -24,7 +24,10 @@ use email::{
 };
 use groupware::calendar::seal::WRAP_MK;
 use registry::schema::structs::SpamTrainingSample;
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 use store::{
     IterateParams, Serialize, ValueKey,
     write::{AlignedBytes, Archive, Archiver, BatchBuilder, IndexPropertyClass, ValueClass},
@@ -311,13 +314,18 @@ pub async fn spam_samples(test: &TestServer) -> usize {
         .len()
 }
 
-/// The subscriber `Traced` registers; the modules run one at a time.
-const TRACED_SUBSCRIBER_ID: &str = "za-mail-traced";
+/// Numbers the subscribers `Traced` registers. Each capture has an id of
+/// its own: the collector drops a closed subscriber without removing its id
+/// from the active list, so a capture dropped without `finish` (a panicking
+/// step) would otherwise let a later capture under the same id return
+/// before its own registration was applied (review F6).
+static TRACED_SUBSCRIBERS: AtomicU64 = AtomicU64::new(0);
 
 /// Events of the given types emitted while a step runs, captured as
 /// `raw_input.rs` captures them: the test server configures no tracer, so
 /// nothing is emitted until something declares interest.
 pub struct Traced {
+    id: String,
     _tx: mpsc::Sender<EventBatch>,
     rx: mpsc::Receiver<EventBatch>,
 }
@@ -343,14 +351,18 @@ impl Traced {
         for event_type in types {
             interests.set(*event_type);
         }
-        let (_tx, rx) = SubscriberBuilder::new(TRACED_SUBSCRIBER_ID.into())
+        let id = format!(
+            "za-mail-traced-{}",
+            TRACED_SUBSCRIBERS.fetch_add(1, Ordering::Relaxed)
+        );
+        let (_tx, rx) = SubscriberBuilder::new(id.clone())
             .set_interests(types.iter().copied())
             .with_lossy(false)
             .register();
         Collector::union_interests(interests);
         Collector::reload();
-        wait_for_subscriber(true);
-        Traced { _tx, rx }
+        wait_for_subscriber(&id, true);
+        Traced { id, _tx, rx }
     }
 
     pub async fn finish(mut self) -> Vec<TracedEvent> {
@@ -382,9 +394,9 @@ impl Traced {
                 captured.push(traced);
             }
         }
-        Collector::remove_subscriber(TRACED_SUBSCRIBER_ID.into());
+        Collector::remove_subscriber(self.id.clone());
         Collector::reload();
-        wait_for_subscriber(false);
+        wait_for_subscriber(&self.id, false);
         captured
     }
 }
@@ -394,11 +406,11 @@ impl Traced {
 /// pass, and an event it collects before then never reaches the subscriber:
 /// a step that acts in process right after `start` (`fence.rs` calls
 /// `copy_message`) would otherwise race it.
-fn wait_for_subscriber(present: bool) {
+fn wait_for_subscriber(subscriber_id: &str, present: bool) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while Collector::get_subscribers()
         .iter()
-        .any(|id| id == TRACED_SUBSCRIBER_ID)
+        .any(|id| id == subscriber_id)
         != present
     {
         assert!(
