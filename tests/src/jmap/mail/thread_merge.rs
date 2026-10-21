@@ -289,7 +289,7 @@ fn build_message(message: usize, in_reply_to: Option<usize>, thread_num: usize) 
     }
 }
 
-fn build_messages(
+pub(crate) fn build_messages(
     three: &ThreadTest,
     messages: &mut Vec<String>,
     total_messages: &mut usize,
@@ -334,7 +334,7 @@ pub enum ThreadTest {
     Root(Vec<ThreadTest>),
 }
 
-fn test_1() -> ThreadTest {
+pub(crate) fn test_1() -> ThreadTest {
     ThreadTest::Root(vec![
         ThreadTest::Message,
         ThreadTest::MessageWithReplies(vec![
@@ -380,7 +380,7 @@ fn test_1() -> ThreadTest {
     ])
 }
 
-fn test_2() -> ThreadTest {
+pub(crate) fn test_2() -> ThreadTest {
     ThreadTest::Root(vec![
         ThreadTest::MessageWithReplies(vec![
             ThreadTest::Message,
@@ -674,7 +674,7 @@ fn test_2() -> ThreadTest {
     ])
 }
 
-fn test_3() -> ThreadTest {
+pub(crate) fn test_3() -> ThreadTest {
     ThreadTest::Root(vec![
         ThreadTest::MessageWithReplies(vec![ThreadTest::Message, ThreadTest::Message]),
         ThreadTest::Message,

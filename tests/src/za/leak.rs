@@ -11,16 +11,22 @@ use super::{
     STRONG,
     dav_seal::{CANARIES, EVENT, mkcalendar_body, raw_event},
     fanout::{NO_REPLY, uid_copies},
+    mail::{Traced, key_mail_account, message_ids, stored_metadata},
     pinning::{ALICE, drop_entries, forget, parties, refuse_once_at},
+    raw_input::{SUBMISSION_PORT, strings},
 };
 use crate::{
     utils::{
+        imap::{ImapConnection, Type},
+        pop3::{Pop3Connection, ResponseType as Pop3Reply},
         server::TestServer,
+        smtp::SmtpConnection,
         webdav::DummyWebDavClient,
         za::{
-            PlantedItem, copy_href, hold_task_consumer, inbox_ids, itip_tasks_for, new_inbox_items,
-            pending_ids, pin_record, plant_inbox_item, plant_sealed_event, substitute_public_key,
-            trigger_drain, wait_for_delivery, za_unlock,
+            Conn, PlantedItem, copy_href, hold_task_consumer, inbox_ids, itip_tasks_for,
+            new_inbox_items, pending_ids, pin_record, plant_inbox_item, plant_plain_message,
+            plant_sealed_event, queued_recipients, substitute_public_key, trigger_drain,
+            wait_for_delivery, za_unlock,
         },
     },
     za::drain::{DrainOn, body, set_partstat},
@@ -30,7 +36,13 @@ use base64::{
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD},
 };
 use calcard::icalendar::{ICalendar, ICalendarEntry, ICalendarProperty};
-use email::cache::MessageCacheFetch;
+use email::{
+    cache::MessageCacheFetch,
+    message::{
+        metadata::{MESSAGE_HAS_ATTACHMENT, MessageMetadata, MetadataPartType},
+        za::MAIL_FORMAT_V1,
+    },
+};
 use groupware::{
     cache::GroupwareCache,
     calendar::{
@@ -47,7 +59,13 @@ use groupware::{
     },
 };
 use hyper::StatusCode;
+use imap_proto::ResponseType;
 use mail_parser::{DateTime, MessageParser};
+use registry::{
+    pickle::{Pickle, PickledStream},
+    schema::structs::SpamTrainingSample,
+};
+use serde_json::json;
 use store::{
     IterateParams, SUBSPACE_ACL, SUBSPACE_BLOB_LINK, SUBSPACE_BLOBS, SUBSPACE_COUNTER,
     SUBSPACE_DELETED_ITEMS, SUBSPACE_DIRECTORY, SUBSPACE_IN_MEMORY_COUNTER,
@@ -55,14 +73,17 @@ use store::{
     SUBSPACE_QUEUE_EVENT, SUBSPACE_QUEUE_MESSAGE, SUBSPACE_QUOTA, SUBSPACE_REGISTRY,
     SUBSPACE_REGISTRY_IDX, SUBSPACE_REGISTRY_PK, SUBSPACE_REPORT_IN, SUBSPACE_REPORT_OUT,
     SUBSPACE_SEARCH_INDEX, SUBSPACE_SPAM_SAMPLES, SUBSPACE_TASK_QUEUE, SUBSPACE_TELEMETRY_METRIC,
-    SUBSPACE_TELEMETRY_SPAN, U32_LEN, U64_LEN,
-    write::{AlignedBytes, AnyKey, Archive, SearchIndex},
+    SUBSPACE_TELEMETRY_SPAN, Serialize as _, U32_LEN, U64_LEN,
+    write::{AlignedBytes, AnyKey, Archive, Archiver, BatchBuilder, SearchIndex},
 };
+use trc::EventType;
 use types::{
     blob_hash::BLOB_HASH_LEN,
     collection::{Collection, SyncCollection},
-    field::Field,
+    field::{EmailField, Field},
+    id::Id,
 };
+use utils::cheeky_hash::CheekyHash;
 
 const CONTENT_TYPE: (&str, &str) = ("content-type", "text/calendar; charset=utf-8");
 const EVENT_PATH: &str = "/dav/cal/key2%40example.com/leak/e.ics";
@@ -103,7 +124,53 @@ const EXTRA_CANARIES: &[&str] = &[
     "draincn-canary",
     "drainaddr-canary",
     "pinaddr-canary",
+    // Mail spec 11: `test_mail`'s messages. `mail-sub` is the subject's
+    // first word (`mail-sub canary`, 15 bytes, the length a verbatim index
+    // key would hold whole).
+    "mail-sub",
+    "mailfrom-canary",
+    "mailname-canary",
+    "mailrcpt-canary",
+    "mailmsgid-canary",
+    "mailbody-canary",
+    "mailattach-canary",
+    "mailattname-canary",
+    "mailhdrname-canary",
+    "mailhdrval-canary",
+    "mailpreview-canary",
 ];
+
+/// Mail spec 5.6: a key account's keyword and mailbox names are visible by
+/// structure. The scan reports them in `Scan::found`, not as violations: the
+/// positive controls of `test_mail`.
+const VISIBLE_CANARIES: &[&str] = &["mailkw-canary", "mailbox-canary"];
+
+/// The search fields a key account's message documents hold (mail spec 5.5):
+/// `EmailSearchField::ReceivedAt` and `Size`, as `SearchField::u8_id`
+/// (`store/src/search/term.rs`, crate-private) numbers them.
+const SEARCH_FIELD_RECEIVED_AT: u8 = 10;
+const SEARCH_FIELD_SIZE: u8 = 12;
+
+/// The layout of the store's search document (`TermIndex`,
+/// `store/src/search/term.rs`, crate-private), mirrored to decode the value
+/// of a `Document`-layout search entry.
+#[derive(rkyv::Archive, rkyv::Deserialize, rkyv::Serialize)]
+struct ScannedDocument {
+    terms: Vec<ScannedTerm>,
+    fields: Vec<ScannedField>,
+}
+
+#[derive(rkyv::Archive, rkyv::Deserialize, rkyv::Serialize)]
+struct ScannedTerm {
+    hash: CheekyHash,
+    fields: u32,
+}
+
+#[derive(rkyv::Archive, rkyv::Deserialize, rkyv::Serialize)]
+struct ScannedField {
+    field_id: u8,
+    data: Vec<u8>,
+}
 
 /// Plan 10: key1's invitation to key2 with every canary the drain handles,
 /// plus an external attendee whose address is a canary.
@@ -221,6 +288,10 @@ pub struct Scan {
     pub item_keys: usize,
     pub item_extras: usize,
     pub emails: usize,
+    /// Message metadata archives of the account that are stubs.
+    pub stubs: usize,
+    /// Hits of `VISIBLE_CANARIES`, which are not violations.
+    pub found: Vec<String>,
 }
 
 fn all_canaries() -> Vec<&'static str> {
@@ -231,11 +302,104 @@ fn all_canaries() -> Vec<&'static str> {
         .collect()
 }
 
-fn find_canaries(bytes: &[u8], what: &str, how: &str, violations: &mut Vec<String>) {
+fn find_canaries(bytes: &[u8], what: &str, how: &str, scan: &mut Scan) {
     let text = String::from_utf8_lossy(bytes);
     for canary in all_canaries() {
         if text.contains(canary) {
-            violations.push(format!("{what}: {how} contains {canary}"));
+            scan.violations
+                .push(format!("{what}: {how} contains {canary}"));
+        }
+    }
+    for canary in VISIBLE_CANARIES {
+        if text.contains(canary) {
+            scan.found.push(format!("{what}: {how} contains {canary}"));
+        }
+    }
+}
+
+/// Mail spec 5.2 and 6.1: the metadata archive (`EmailField::Metadata`) of a
+/// key account's message is a stub: `raw_headers` opens with the format
+/// byte, and the visible fields are the arrival time, the blob hash and one
+/// empty root part. Counts the stubs.
+fn check_email(
+    archive: &Archive<AlignedBytes>,
+    what: &str,
+    violations: &mut Vec<String>,
+    stubs: &mut usize,
+) {
+    let metadata = match archive.deserialize::<MessageMetadata>() {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            violations.push(format!("{what}: metadata archive does not decode: {err:?}"));
+            return;
+        }
+    };
+    if metadata.raw_headers.first() != Some(&MAIL_FORMAT_V1) {
+        violations.push(format!("{what}: plaintext metadata archive"));
+        return;
+    }
+    *stubs += 1;
+    if !metadata.preview.is_empty() {
+        violations.push(format!("{what}: stub with a preview"));
+    }
+    if metadata.blob_body_offset != 0 || metadata.rcvd_attach & MESSAGE_HAS_ATTACHMENT != 0 {
+        violations.push(format!("{what}: stub with a body offset or attachment bit"));
+    }
+    let empty_root = matches!(metadata.contents.as_ref(), [contents]
+        if contents.html_body.is_empty()
+            && contents.text_body.is_empty()
+            && contents.attachments.is_empty()
+            && matches!(contents.parts.as_ref(), [part]
+                if part.headers.is_empty()
+                    && matches!(part.body, MetadataPartType::Binary)
+                    && part.flags == 0
+                    && part.offset_header == 0
+                    && part.offset_body == 0
+                    && part.offset_end == 0));
+    if !empty_root {
+        violations.push(format!("{what}: stub with content parts"));
+    }
+}
+
+/// Mail spec 5.5: a key account's Email search entries are one document per
+/// message holding the arrival time and the size, and those two fields'
+/// entries; no term. The class byte is the index, plus 0 for a term, 1 << 6
+/// for a field, 2 << 6 for a document (`store/src/write/key.rs`); a field
+/// key continues with the account id and the field id.
+fn check_email_search(key: &[u8], value: &[u8], what: &str, violations: &mut Vec<String>) {
+    let is_visible = |field: u8| matches!(field, SEARCH_FIELD_RECEIVED_AT | SEARCH_FIELD_SIZE);
+    match key[0] >> 6 {
+        0 => violations.push(format!("{what}: search term of the account")),
+        1 => {
+            if !key.get(1 + U32_LEN).is_some_and(|field| is_visible(*field)) {
+                violations.push(format!("{what}: search field of the account"));
+            }
+        }
+        _ => {
+            // A value that is not an archive holds no document (the index
+            // control plants empty ones).
+            let Some(archive) = try_archive(value) else {
+                return;
+            };
+            match archive.unarchive_untrusted::<ScannedDocument>() {
+                Ok(document) => {
+                    if !document.terms.is_empty() {
+                        violations.push(format!("{what}: search document with terms"));
+                    }
+                    if document
+                        .fields
+                        .iter()
+                        .any(|field| !is_visible(field.field_id))
+                    {
+                        violations.push(format!(
+                            "{what}: search document with fields other than the arrival time and the size"
+                        ));
+                    }
+                }
+                Err(err) => {
+                    violations.push(format!("{what}: search document does not decode: {err:?}"))
+                }
+            }
         }
     }
 }
@@ -466,8 +630,9 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
         for (key, value) in records {
             scan.records += 1;
             let what = format!("subspace {:?} key {:?}", char::from(subspace), key);
-            find_canaries(&key, &what, "key", &mut scan.violations);
-            find_canaries(&value, &what, "raw value", &mut scan.violations);
+            find_canaries(&key, &what, "key", &mut scan);
+            find_canaries(&value, &what, "raw value", &mut scan);
+            let of_account = key.get(..U32_LEN) == Some(account_id.to_be_bytes().as_slice());
 
             // Blob contents are decoded after the walk, through the server's
             // configured blob store: the data store's own blob subspace, or a
@@ -477,16 +642,51 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
                 blob_hashes.push(key.clone());
             } else if subspace == SUBSPACE_BLOB_LINK && key.len() >= BLOB_HASH_LEN {
                 blob_hashes.push(key[..BLOB_HASH_LEN].to_vec());
+                // Mail spec 11: once delivery completes the account holds no
+                // temporary link (hash | account id | until): no staged blob
+                // and no training sample's hold.
+                if key.len() == BLOB_HASH_LEN + U32_LEN + U64_LEN
+                    && key[BLOB_HASH_LEN..BLOB_HASH_LEN + U32_LEN] == account_id.to_be_bytes()
+                {
+                    scan.violations
+                        .push(format!("{what}: temporary blob link held by the account"));
+                }
+            }
+
+            // Mail spec 5.4: no threading key of the account (account id |
+            // collection | `EmailField::Threading` | hash | document id).
+            if (subspace == SUBSPACE_PROPERTY || subspace == SUBSPACE_INDEXES)
+                && of_account
+                && key.get(U32_LEN) == Some(&(Collection::Email as u8))
+                && key.get(U32_LEN + 1) == Some(&u8::from(EmailField::Threading))
+            {
+                scan.violations
+                    .push(format!("{what}: threading key of the account"));
+            }
+
+            // Mail spec 9: no spam training sample of the account.
+            if subspace == SUBSPACE_SPAM_SAMPLES {
+                match PickledStream::new(&value)
+                    .and_then(|mut stream| SpamTrainingSample::unpickle(&mut stream))
+                {
+                    Some(sample) if sample.account_id == Some(Id::from(account_id)) => scan
+                        .violations
+                        .push(format!("{what}: spam training sample of the account")),
+                    Some(_) => {}
+                    None => scan
+                        .violations
+                        .push(format!("{what}: spam training sample does not decode")),
+                }
             }
 
             // Term keys are hashes of tokens, so a canary never appears in
             // them whole: assert structurally that no calendar data of the
-            // account was indexed (spec 9). Key: class (index | type << 6),
-            // then the account id (u32 BE) for every index but tracing,
-            // which is global (`store/src/write/key.rs`). Only calendar
-            // indexing is gated: the account's mail (here the generic alarm
-            // email) is indexed as upstream does, and its entries prove the
-            // key layout is read correctly.
+            // account was indexed (spec 9) and that the account's mail is
+            // indexed by its visible fields only (mail spec 5.5). Key: class
+            // (index | type << 6), then the account id (u32 BE) for every
+            // index but tracing, which is global (`store/src/write/key.rs`).
+            // The account's Email entries prove the key layout is read
+            // correctly.
             if subspace == SUBSPACE_SEARCH_INDEX {
                 scan.search_records += 1;
                 if let Some(index) = key.first().and_then(|c| SearchIndex::try_from_u8(c & 0x3f))
@@ -498,6 +698,8 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
                         scan.violations.push(format!(
                             "{what}: calendar search index entry of the account"
                         ));
+                    } else if index == SearchIndex::Email {
+                        check_email_search(&key, &value, &what, &mut scan.violations);
                     }
                 }
             }
@@ -506,19 +708,19 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
                 continue;
             };
             scan.archives += 1;
-            find_canaries(
-                archive.as_bytes(),
-                &what,
-                "decoded archive",
-                &mut scan.violations,
-            );
+            find_canaries(archive.as_bytes(), &what, "decoded archive", &mut scan);
 
             // Property key: account_id (u32 BE) | collection | property | document_id (u32 BE).
-            if subspace != SUBSPACE_PROPERTY
-                || key.len() != U32_LEN + 2 + U32_LEN
-                || key[U32_LEN + 1] != archive_field
-                || u32::from_be_bytes(key[..U32_LEN].try_into().unwrap()) != account_id
+            if subspace != SUBSPACE_PROPERTY || key.len() != U32_LEN + 2 + U32_LEN || !of_account {
+                continue;
+            }
+            if key[U32_LEN] == Collection::Email as u8
+                && key[U32_LEN + 1] == u8::from(EmailField::Metadata)
             {
+                check_email(&archive, &what, &mut scan.violations, &mut scan.stubs);
+                continue;
+            }
+            if key[U32_LEN + 1] != archive_field {
                 continue;
             }
             let collection = key[U32_LEN];
@@ -575,7 +777,7 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
         {
             Ok(Some(blob)) => {
                 scan.blobs += 1;
-                find_canaries(&blob, &what, "decoded blob", &mut scan.violations);
+                find_canaries(&blob, &what, "decoded blob", &mut scan);
             }
             Ok(None) => {}
             Err(err) => scan
@@ -584,14 +786,18 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
         }
     }
 
-    // Generated alarm emails, decoded: transfer encodings would hide a
-    // canary from the raw scan.
+    // The account's messages as stored. A sealed blob (mail spec 5.1) is
+    // searched as the ciphertext it is; a plaintext one is decoded too, as
+    // transfer encodings would hide a canary from the raw search.
     if let Ok(messages) = test.server.get_cached_messages(account_id).await {
         for message in messages.emails.items.iter() {
             scan.emails += 1;
             let what = format!("email {}", message.document_id);
             let contents = test.fetch_email(account_id, message.document_id).await;
-            find_canaries(&contents, &what, "raw message", &mut scan.violations);
+            find_canaries(&contents, &what, "raw message", &mut scan);
+            if contents.first() == Some(&MAIL_FORMAT_V1) {
+                continue;
+            }
             let parsed = MessageParser::new()
                 .parse(&contents)
                 .unwrap_or_else(|| panic!("{what} does not parse"));
@@ -599,10 +805,34 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
                 parsed.subject().unwrap_or_default().as_bytes(),
                 &what,
                 "subject",
-                &mut scan.violations,
+                &mut scan,
             );
             for part in parsed.parts.iter() {
-                find_canaries(part.contents(), &what, "decoded part", &mut scan.violations);
+                find_canaries(part.contents(), &what, "decoded part", &mut scan);
+            }
+        }
+    }
+
+    // Mail spec 11: once delivery completes nothing for the account is
+    // queued (a sub-address is the account's).
+    if let Ok(info) = test.server.account_info(account_id).await {
+        let mut addresses = info
+            .addresses()
+            .iter()
+            .map(|address| address.to_lowercase())
+            .collect::<Vec<_>>();
+        addresses.push(info.name().to_lowercase());
+        for recipient in queued_recipients(test).await {
+            let recipient = recipient.to_lowercase();
+            let base = match recipient.split_once('@') {
+                Some((local, domain)) => {
+                    format!("{}@{domain}", local.split('+').next().unwrap_or(local))
+                }
+                None => recipient.clone(),
+            };
+            if addresses.contains(&base) {
+                scan.violations
+                    .push(format!("queued message for the account ({recipient})"));
             }
         }
     }
@@ -901,6 +1131,347 @@ pub async fn test_pins(test: &mut TestServer) {
     drop_entries(ALICE, ADDRESS).await;
     forget(ALICE, Some(ADDRESS)).await.expect(200);
     test.wait_for_tasks().await;
+}
+
+/// `test_mail`'s key account, the recipient of its submission (a key account
+/// too, so the submitted copy is sealed as well), and the sub-address that
+/// carries the recipient canary (the account's address is in the registry
+/// in the clear, as `test_pins` notes, so the canary rides in the detail).
+const MAIL_KEY: &str = "keymail12@example.com";
+const MAIL_RECIPIENT: &str = "keymail13@example.com";
+const MAIL_RCPT: &str = "keymail12+mailrcpt-canary@example.com";
+
+/// A message carrying every mail canary: the sender's name and address, the
+/// recipient, the subject (`mail-sub canary`, 15 bytes), the Message-ID, a
+/// custom header's name and value (the name in the canary's own case: the
+/// search is case-sensitive), the preview (the text's opening), the body
+/// text, and a base64 attachment's name and content.
+fn mail_canary_message(n: u32) -> String {
+    format!(
+        "From: mailname-canary <mailfrom-canary@example.com>\r\n\
+         To: <{MAIL_RCPT}>\r\n\
+         Subject: mail-sub canary\r\n\
+         Message-ID: <mailmsgid-canary.{n}@example.com>\r\n\
+         Date: Tue, 20 Oct 2026 10:00:00 +0000\r\n\
+         X-mailhdrname-canary: mailhdrval-canary\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: multipart/mixed; boundary=\"za-leak\"\r\n\
+         \r\n\
+         --za-leak\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         \r\n\
+         mailpreview-canary opens the text, which goes on to mailbody-canary.\r\n\
+         --za-leak\r\n\
+         Content-Type: text/plain; name=\"mailattname-canary.txt\"\r\n\
+         Content-Disposition: attachment; filename=\"mailattname-canary.txt\"\r\n\
+         Content-Transfer-Encoding: base64\r\n\
+         \r\n\
+         {}\r\n\
+         --za-leak--\r\n",
+        STANDARD.encode("mailattach-canary")
+    )
+}
+
+/// Deletes every unlinked blob, as the purge does: a delivered message's
+/// queue blob is unlinked once delivery completes (mail spec 11, "no queue
+/// blob linked after delivery") and stays in the blob store until then.
+async fn purge_blobs(test: &TestServer) {
+    test.server
+        .store()
+        .purge_blobs_all_shards(test.server.blob_store().clone())
+        .await
+        .unwrap();
+}
+
+/// The property-subspace key of a message's metadata archive.
+fn metadata_key(account_id: u32, document_id: u32) -> Vec<u8> {
+    let mut key = account_id.to_be_bytes().to_vec();
+    key.push(Collection::Email as u8);
+    key.push(u8::from(EmailField::Metadata));
+    key.extend_from_slice(&document_id.to_be_bytes());
+    key
+}
+
+/// Writes `metadata` as the message's metadata archive (field 71).
+async fn write_metadata(
+    test: &TestServer,
+    account_id: u32,
+    document_id: u32,
+    metadata: MessageMetadata,
+) {
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(account_id)
+        .with_collection(Collection::Email)
+        .with_document(document_id)
+        .set(
+            EmailField::Metadata,
+            Archiver::new(metadata).serialize().unwrap(),
+        );
+    test.server.store().write(batch.build_all()).await.unwrap();
+}
+
+/// Every string a captured event carries, lower-cased.
+fn event_text(keys: &[(trc::Key, trc::Value)]) -> String {
+    let mut out = Vec::new();
+    for (_, value) in keys {
+        strings(value, &mut out);
+    }
+    out.join(" ").to_lowercase()
+}
+
+/// Mail spec 11, the leak test's mail extension: a key account receives a
+/// message carrying every mail canary over LMTP and appends a second one
+/// over IMAP, and a session of the account FETCHes, RETRs and submits it.
+/// Then the account's records hold two stubs and no plaintext metadata
+/// archive, its blobs and every other record no canary, its search
+/// documents the arrival time and the size only, and nothing of it is
+/// threaded, queued, held or sampled; no IMAP, POP3 or SMTP event of the
+/// session carries a canary. Positive controls: the keyword and the mailbox
+/// name the account set are found, visible by structure. Negative controls:
+/// a planted plaintext message, and a stub rewritten with plaintext headers
+/// alone, are flagged.
+pub async fn test_mail(test: &mut TestServer) {
+    println!("Running zero-access leak test of mail...");
+    let key = key_mail_account(test, MAIL_KEY, STRONG).await;
+    let recipient = key_mail_account(test, MAIL_RECIPIENT, STRONG).await;
+    let id = key.id().document_id();
+    let recipient_id = recipient.id().document_id();
+
+    // Delivered over LMTP to a sub-address, and appended over IMAP.
+    SmtpConnection::connect()
+        .await
+        .ingest("sender@example.org", &[MAIL_RCPT], &mail_canary_message(1))
+        .await;
+    wait_for_delivery(test).await;
+    let mut imap = ImapConnection::connect(b"_l ").await;
+    imap.authenticate(MAIL_KEY, STRONG).await;
+    imap.append("INBOX", &mail_canary_message(2)).await;
+    imap.send("LOGOUT").await;
+    imap.assert_read(Type::Tagged, ResponseType::Ok).await;
+    let documents = message_ids(test, id).await;
+    assert_eq!(documents.len(), 2, "the delivery and the APPEND");
+
+    // The positive controls: a keyword and a mailbox name (spec 5.6).
+    let email_ids = key
+        .jmap_method_call("Email/query", json!({ "accountId": key.id_string() }))
+        .await
+        .ids()
+        .map(String::from)
+        .collect::<Vec<_>>();
+    let reply = key
+        .jmap_method_calls(json!([
+            ["Mailbox/set", {
+                "accountId": key.id_string(),
+                "create": { "m": { "name": "mailbox-canary" } }
+            }, "m"],
+            ["Email/set", {
+                "accountId": key.id_string(),
+                "update": { (email_ids[0].as_str()): { "keywords/$mailkw-canary": true } }
+            }, "e"],
+        ]))
+        .await;
+    assert!(
+        reply.pointer("/methodResponses/0/1/created/m/id").is_some()
+            && reply
+                .pointer(&format!("/methodResponses/1/1/updated/{}", email_ids[0]))
+                .is_some(),
+        "{reply:?}"
+    );
+
+    // A session that FETCHes, RETRs and submits the message, its IMAP, POP3
+    // and SMTP events captured.
+    let types = EventType::variants()
+        .iter()
+        .copied()
+        .filter(|typ| {
+            matches!(
+                typ,
+                EventType::Imap(_) | EventType::Pop3(_) | EventType::Smtp(_)
+            )
+        })
+        .collect::<Vec<_>>();
+    let traced = Traced::start(&types);
+    let mut imap = ImapConnection::connect(b"_l ").await;
+    imap.authenticate(MAIL_KEY, STRONG).await;
+    imap.send("SELECT INBOX").await;
+    imap.assert_read(Type::Tagged, ResponseType::Ok).await;
+    imap.send("FETCH 1:* (BODY.PEEK[])").await;
+    let fetched = imap
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .join("\n");
+    imap.send("LOGOUT").await;
+    imap.assert_read(Type::Tagged, ResponseType::Ok).await;
+    let mut pop3 = Pop3Connection::connect().await;
+    pop3.authenticate(MAIL_KEY, STRONG).await;
+    pop3.send("RETR 1").await;
+    let retrieved = pop3.assert_read(Pop3Reply::Multiline).await.join("\n");
+    pop3.send("QUIT").await;
+    pop3.assert_read(Pop3Reply::Ok).await;
+    let mut smtp = Conn::open_smtp(SUBMISSION_PORT).await;
+    smtp.send("EHLO submit.test\r\n").await;
+    smtp.until(&["250 "]).await;
+    smtp.exchange(
+        &format!(
+            "AUTH PLAIN {}\r\n",
+            STANDARD.encode(format!("\0{MAIL_KEY}\0{STRONG}"))
+        ),
+        "235",
+    )
+    .await;
+    smtp.exchange(&format!("MAIL FROM:<{MAIL_KEY}>\r\n"), "250")
+        .await;
+    smtp.exchange(&format!("RCPT TO:<{MAIL_RECIPIENT}>\r\n"), "250")
+        .await;
+    smtp.exchange("DATA\r\n", "354").await;
+    smtp.exchange(&format!("{}\r\n.\r\n", mail_canary_message(3)), "250")
+        .await;
+    smtp.exchange("QUIT\r\n", "221").await;
+    let events = traced.finish().await;
+    wait_for_delivery(test).await;
+    // The client receives everything.
+    for (what, answer) in [("FETCH", &fetched), ("RETR", &retrieved)] {
+        for canary in ["mail-sub canary", "mailhdrval-canary", "mailbody-canary"] {
+            assert!(answer.contains(canary), "the {what} answer: {answer}");
+        }
+    }
+    for protocol in ["Imap", "Pop3", "Smtp"] {
+        assert!(
+            events
+                .iter()
+                .any(|event| format!("{:?}", event.typ).starts_with(protocol)),
+            "no {protocol} event captured"
+        );
+    }
+    for event in &events {
+        let text = event_text(&event.keys);
+        for canary in all_canaries() {
+            assert!(
+                !text.contains(canary),
+                "{:?} carries {canary}: {}",
+                event.typ,
+                event.text
+            );
+        }
+    }
+
+    // The scan: two stubs, nothing in the clear, the controls found.
+    purge_blobs(test).await;
+    let result = scan(test, id).await;
+    println!(
+        "Mail leak scan: {} records, {} archives, {} blobs, {} search index records ({} of the account), {} emails, {} stubs, {} visible hits",
+        result.records,
+        result.archives,
+        result.blobs,
+        result.search_records,
+        result.search_account_records,
+        result.emails,
+        result.stubs,
+        result.found.len()
+    );
+    assert!(
+        result.violations.is_empty(),
+        "mail leaks:\n{}",
+        result.violations.join("\n")
+    );
+    assert_eq!(result.stubs, 2, "{result:?}");
+    assert_eq!(result.emails, 2, "{result:?}");
+    assert!(
+        result.search_account_records > 0,
+        "no search entry of the account: {result:?}"
+    );
+    for canary in VISIBLE_CANARIES {
+        assert!(
+            result.found.iter().any(|hit| hit.ends_with(canary)),
+            "the positive control {canary} was not found: {result:?}"
+        );
+    }
+    // The submitted copy is sealed for its recipient.
+    let submitted = scan(test, recipient_id).await;
+    assert!(
+        submitted.violations.is_empty(),
+        "leaks of the submitted copy:\n{}",
+        submitted.violations.join("\n")
+    );
+    assert_eq!(submitted.stubs, 1, "{submitted:?}");
+
+    // Negative control: a plaintext message, as an account that held mail
+    // before it became a key account holds one (spec 6.6).
+    let planted = plant_plain_message(
+        test,
+        id,
+        "From: Planted <planted@example.org>\r\nSubject: planted\r\n\r\nmailbody-canary, planted in the clear\r\n",
+    )
+    .await;
+    test.wait_for_tasks().await;
+    let found = scan(test, id).await;
+    let planted_key = format!("{:?}", metadata_key(id, planted));
+    let report = found.violations.join("\n");
+    assert!(
+        found
+            .violations
+            .iter()
+            .any(|v| v.contains(&planted_key) && v.ends_with("plaintext metadata archive")),
+        "the scanner must flag the planted metadata archive:\n{report}"
+    );
+    assert!(
+        found
+            .violations
+            .iter()
+            .any(|v| v.starts_with("blob ") && v.ends_with("decoded blob contains mailbody-canary")),
+        "the scanner must find the planted blob's canary:\n{report}"
+    );
+    let planted_id = Id::from_parts(planted, planted).to_string();
+    let reply = key
+        .jmap_method_call(
+            "Email/set",
+            json!({ "accountId": key.id_string(), "destroy": [&planted_id] }),
+        )
+        .await;
+    assert_eq!(
+        reply.method_response()["destroyed"],
+        json!([planted_id]),
+        "{reply:?}"
+    );
+    test.wait_for_tasks().await;
+    purge_blobs(test).await;
+
+    // Negative control: a stub rewritten with a plaintext header block alone
+    // (its blob still sealed) is flagged by structure.
+    let document = documents[0];
+    let original = stored_metadata(test, id, document)
+        .await
+        .deserialize::<MessageMetadata>()
+        .unwrap();
+    let mut rewritten = stored_metadata(test, id, document)
+        .await
+        .deserialize::<MessageMetadata>()
+        .unwrap();
+    rewritten.raw_headers = b"Subject: rewritten\r\n\r\n".to_vec().into_boxed_slice();
+    write_metadata(test, id, document, rewritten).await;
+    let found = scan(test, id).await;
+    let rewritten_key = format!("{:?}", metadata_key(id, document));
+    assert_eq!(
+        found.violations,
+        vec![format!(
+            "subspace {:?} key {rewritten_key}: plaintext metadata archive",
+            char::from(SUBSPACE_PROPERTY)
+        )],
+        "the scanner must flag the rewritten stub, and only it"
+    );
+    assert_eq!(found.stubs, 1);
+    write_metadata(test, id, document, original).await;
+    let restored = scan(test, id).await;
+    assert!(restored.violations.is_empty(), "{:?}", restored.violations);
+    assert_eq!(restored.stubs, 2);
+
+    // Cleanup: the messages and the mailbox, and their blobs.
+    for account in [&key, &recipient] {
+        test.destroy_all_mailboxes(account).await;
+    }
+    wait_for_delivery(test).await;
+    purge_blobs(test).await;
 }
 
 pub async fn test(test: &mut TestServer) {
