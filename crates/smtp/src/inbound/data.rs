@@ -550,8 +550,8 @@ impl<T: SessionStream> Session<T> {
                         )
                     });
                     // Mail spec 6.1 step 4: no autolearn sample, which stores
-                    // the subject and the message, for a key-account recipient.
-                    if self.data.za_key_rcpt {
+                    // the subject and the message, for a key account's message.
+                    if self.data.za_key_rcpt || self.data.za_key_sender() {
                         train_spam = None;
                     }
                     let scores = &self.server.core.spam.scores;
@@ -739,6 +739,14 @@ impl<T: SessionStream> Session<T> {
                     }
                 }
             }
+        }
+
+        // Mail spec 10 and 6.1 step 4: a recipient added after RCPT (a milter
+        // or MTA hook's `AddRcpt`, the script's `SetEnvelope`) is classified
+        // too.
+        if !self.data.za_key_rcpt && self.za_has_key_rcpt(0).await {
+            self.data.za_key_rcpt = true;
+            train_spam = None;
         }
 
         // Build message

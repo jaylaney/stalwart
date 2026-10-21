@@ -694,6 +694,24 @@ impl Server {
         self.account_id_from_email_inner(address, true, true).await
     }
 
+    /// Mail spec 10: whether the accepted recipient `address` is a key
+    /// account's, found as local delivery finds it
+    /// (`account_id_from_email(address, false)`), without cache events, so an
+    /// ordinary RCPT traces nothing new. `rcpt_resolve` has just cached the
+    /// account; `za_is_key_account` loads one that is not.
+    pub async fn za_is_key_rcpt(&self, address: &str) -> trc::Result<bool> {
+        let Some(account_id) = self
+            .account_id_from_email_inner(address, false, true)
+            .await?
+        else {
+            return Ok(false);
+        };
+        match self.inner.cache.accounts.get(&account_id) {
+            Some(account) => Ok(account.is_key_account()),
+            None => self.za_is_key_account(account_id).await,
+        }
+    }
+
     // Zero-access fork: `quiet` skips the cache events that carry the
     // address's domain or local part.
     async fn account_id_from_email_inner(

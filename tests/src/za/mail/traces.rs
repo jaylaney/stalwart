@@ -14,7 +14,7 @@
 //! of an ordinary account are the controls, traced as upstream traces them.
 //! The vacation compile error names a position only, for every account
 //! (issue #21), and a transaction with a key-account recipient adds no
-//! autolearn sample (6.1 step 4).
+//! autolearn sample (6.1 step 4). The sweeps subscribe to every event type.
 
 use super::{
     Traced, TracedEvent, assert_sealed, deliver, key_mail_account, message_ids, new_message,
@@ -44,17 +44,17 @@ use registry::{
         enums::{MilterVersion, MtaStage},
         prelude::{ObjectType, Property},
         structs::{
-            Expression, MemoryLookupKey, MtaMilter, MtaStageData, SpamClassifier, SpamTag,
-            SpamTagScore,
+            Expression, ExpressionMatch, MemoryLookupKey, MtaMilter, MtaStageData, SpamClassifier,
+            SpamRule, SpamRuleHeader, SpamTag, SpamTagScore,
         },
     },
-    types::{float::Float, map::Map},
+    types::{float::Float, list::List, map::Map},
 };
 use serde_json::json;
 use std::time::Duration;
 use trc::{
-    EvalEvent, EventType, ImapEvent, Key, MessageIngestEvent, MilterEvent, Pop3Event, SmtpEvent,
-    SpamEvent, StoreEvent,
+    EvalEvent, EventType, HttpEvent, ImapEvent, Key, MessageIngestEvent, MilterEvent, Pop3Event,
+    SmtpEvent, SpamEvent, StoreEvent,
 };
 use types::id::Id;
 
@@ -97,10 +97,13 @@ pub async fn test(test: &mut TestServer) {
 
     delivery_leaves_no_content_in_events(test).await;
     smtp_submission_by_a_key_account_is_redacted(test, &key, &plain).await;
+    pipelined_rcpt_and_bdat_are_redacted(test, &key).await;
+    key_rcpt_after_a_chunk_is_refused(test, &key, &plain).await;
     imap_session_is_redacted(&key, &plain).await;
     pop3_session_is_redacted(&key, &plain).await;
     vacation_compile_error_reason_is_fixed(&plain).await;
     autolearn_skips_key_transactions(test, &key).await;
+    late_recipients_are_classified(test, &key).await;
 
     unconfigure(&admin, settings).await;
     let _ = milter.send(false);
@@ -116,11 +119,13 @@ pub async fn test(test: &mut TestServer) {
 /// The module's settings: the mock milter at the DATA stage, as
 /// `milter_session` configures it; the spam trap of `imap_tests`, scored as
 /// spam, with the classifier learning from traps; the spam filter on for
-/// every transaction.
+/// every transaction; a header rule whose result is the canary header's
+/// value (its `Eval(Result)` trace is the redaction's case).
 struct Settings {
     milter: Id,
     trap_tag: Id,
     trap_key: Id,
+    header_rule: Id,
 }
 
 async fn configure(admin: &Account) -> Settings {
@@ -151,6 +156,21 @@ async fn configure(admin: &Account) -> Settings {
             namespace: "spam-traps".into(),
         })
         .await;
+    let header_rule = admin
+        .registry_create_object(SpamRule::Header(SpamRuleHeader {
+            condition: Expression {
+                else_: "false".into(),
+                match_: List::from_iter([ExpressionMatch {
+                    if_: "name_lower == 'x-hdr-name-canary'".into(),
+                    then: "value".into(),
+                }]),
+            },
+            name: "ZA_TRACES_CANARY_HEADER".into(),
+            description: None,
+            enable: true,
+            priority: 500,
+        }))
+        .await;
     admin
         .registry_update_setting(
             SpamClassifier {
@@ -178,6 +198,7 @@ async fn configure(admin: &Account) -> Settings {
         milter,
         trap_tag,
         trap_key,
+        header_rule,
     }
 }
 
@@ -186,6 +207,7 @@ async fn unconfigure(admin: &Account, settings: Settings) {
         (ObjectType::MtaMilter, settings.milter),
         (ObjectType::SpamTag, settings.trap_tag),
         (ObjectType::MemoryLookupKey, settings.trap_key),
+        (ObjectType::SpamRule, settings.header_rule),
     ] {
         admin
             .registry_destroy(object, [id])
@@ -219,31 +241,9 @@ fn canary_message() -> String {
     )
 }
 
-/// The events every step captures.
-fn traced_types() -> Vec<EventType> {
-    vec![
-        EventType::Imap(ImapEvent::RawInput),
-        EventType::Imap(ImapEvent::RawOutput),
-        EventType::Imap(ImapEvent::Error),
-        EventType::Imap(ImapEvent::Fetch),
-        EventType::Imap(ImapEvent::Store),
-        EventType::Pop3(Pop3Event::RawInput),
-        EventType::Pop3(Pop3Event::RawOutput),
-        EventType::Pop3(Pop3Event::Error),
-        EventType::Smtp(SmtpEvent::RawInput),
-        EventType::Smtp(SmtpEvent::RawOutput),
-        EventType::Milter(MilterEvent::Write),
-        EventType::Milter(MilterEvent::Read),
-        EventType::Spam(SpamEvent::Dnsbl),
-        EventType::Spam(SpamEvent::DnsblError),
-        EventType::Spam(SpamEvent::Classify),
-        EventType::MessageIngest(MessageIngestEvent::Ham),
-        EventType::MessageIngest(MessageIngestEvent::Spam),
-        EventType::MessageIngest(MessageIngestEvent::JmapAppend),
-        EventType::MessageIngest(MessageIngestEvent::ImapAppend),
-        EventType::Eval(EvalEvent::Result),
-        EventType::Store(StoreEvent::DataCorruption),
-    ]
+/// The events every step captures: all of them.
+fn traced_types() -> &'static [EventType] {
+    EventType::variants()
 }
 
 /// Every string of `value`, joined.
@@ -319,7 +319,7 @@ fn assert_any_contains(values: &[String], needle: &str, what: &str) {
 async fn delivery_leaves_no_content_in_events(test: &TestServer) {
     println!("delivery_leaves_no_content_in_events");
     for to in [KEY, PLAIN] {
-        let traced = Traced::start(&traced_types());
+        let traced = Traced::start(traced_types());
         deliver(test, SENDER, to, &canary_message()).await;
         let events = traced.finish().await;
         let writes = values(
@@ -348,6 +348,11 @@ async fn delivery_leaves_no_content_in_events(test: &TestServer) {
             );
             assert_any_contains(&message_ids, "msgid-canary@example.com", "control");
             assert_any_contains(&reads, "body-canary", "control: the DATA reads");
+            assert_any_contains(
+                &values(&events, EventType::Eval(EvalEvent::Result), Key::Result),
+                "hdr-value-canary",
+                "control: the header rule's result",
+            );
         }
     }
 }
@@ -388,7 +393,7 @@ async fn smtp_submission_by_a_key_account_is_redacted(
     println!("smtp_submission_by_a_key_account_is_redacted");
     let plain_id = u64::from(plain.id().document_id());
     for account in [key, plain] {
-        let traced = Traced::start(&traced_types());
+        let traced = Traced::start(traced_types());
         submit(account).await;
         let events = traced.finish().await;
         let reads = values(&events, EventType::Smtp(SmtpEvent::RawInput), Key::Contents);
@@ -425,7 +430,7 @@ async fn smtp_submission_by_a_key_account_is_redacted(
     }
     wait_for_delivery(test).await;
 
-    let traced = Traced::start(&traced_types());
+    let traced = Traced::start(traced_types());
     let mut lmtp = SmtpConnection::connect().await;
     lmtp.mail_from(SENDER, 2).await;
     lmtp.rcpt_to(KEY, 2).await;
@@ -443,6 +448,74 @@ async fn smtp_submission_by_a_key_account_is_redacted(
         !reads.iter().any(|read| read.contains("BDAT")),
         "a BDAT read is traced: {reads:?}"
     );
+}
+
+/// Ruling R41: an RCPT, a BDAT command and its chunk in one write are one read
+/// traced before the recipient is known, so it is masked (for every account);
+/// the MAIL FROM before it stays readable.
+async fn pipelined_rcpt_and_bdat_are_redacted(test: &TestServer, key: &Account) {
+    println!("pipelined_rcpt_and_bdat_are_redacted");
+    let key_id = key.id().document_id();
+    let before = message_ids(test, key_id).await;
+    let message = canary_message();
+    let traced = Traced::start(traced_types());
+    let mut lmtp = SmtpConnection::connect().await;
+    lmtp.mail_from(SENDER, 2).await;
+    lmtp.send_raw(&format!(
+        "RCPT TO:<{KEY}>\r\nBDAT {} LAST\r\n{message}",
+        message.len()
+    ))
+    .await;
+    // The RCPT's answer and the BDAT's, one per recipient.
+    lmtp.read(2, 2).await;
+    lmtp.quit().await;
+    wait_for_delivery(test).await;
+    let events = traced.finish().await;
+    assert_no_canary(&events, "a pipelined BDAT delivery to a key account");
+    let reads = values(&events, EventType::Smtp(SmtpEvent::RawInput), Key::Contents);
+    assert_any_contains(
+        &reads,
+        "MAIL FROM",
+        "the MAIL FROM before the pipelined read",
+    );
+    assert_any_contains(&reads, MARKER, "the pipelined read");
+    assert!(
+        !reads.iter().any(|read| read.contains("RCPT TO")),
+        "the pipelined read is traced: {reads:?}"
+    );
+    let document_id = new_message(test, key_id, &before).await;
+    assert_sealed(test, key_id, document_id, WRAP_PK).await;
+}
+
+/// Mail spec 10, RFC 3030 (RCPT precedes BDAT): a key recipient named after a
+/// BDAT chunk, which was traced in the clear, is refused with 503; the
+/// message reaches the earlier recipient only.
+async fn key_rcpt_after_a_chunk_is_refused(test: &TestServer, key: &Account, plain: &Account) {
+    println!("key_rcpt_after_a_chunk_is_refused");
+    let key_id = key.id().document_id();
+    let plain_id = plain.id().document_id();
+    let key_before = message_ids(test, key_id).await;
+    let plain_before = message_ids(test, plain_id).await;
+    let message = canary_message();
+    let (head, tail) = message.split_at(message.len() / 2);
+    let mut lmtp = SmtpConnection::connect().await;
+    lmtp.mail_from(SENDER, 2).await;
+    lmtp.rcpt_to(PLAIN, 2).await;
+    lmtp.bdat(head, 2).await;
+    let refused = lmtp.rcpt_to(KEY, 5).await;
+    assert!(
+        refused[0].starts_with("503 5.5.1"),
+        "a key recipient after a chunk: {refused:?}"
+    );
+    lmtp.bdat_last(tail, 1, 2).await;
+    lmtp.quit().await;
+    wait_for_delivery(test).await;
+    assert_eq!(
+        message_ids(test, key_id).await,
+        key_before,
+        "the refused key recipient got the message"
+    );
+    new_message(test, plain_id, &plain_before).await;
 }
 
 /// One IMAP session of `account`: SELECT, a FETCH of the canary header, a
@@ -486,7 +559,7 @@ async fn imap_session(account: &Account) -> String {
 async fn imap_session_is_redacted(key: &Account, plain: &Account) {
     println!("imap_session_is_redacted");
     for account in [key, plain] {
-        let traced = Traced::start(&traced_types());
+        let traced = Traced::start(traced_types());
         let fetched = imap_session(account).await;
         let events = traced.finish().await;
         assert!(
@@ -570,7 +643,7 @@ async fn pop3_session(account: &Account) -> String {
 async fn pop3_session_is_redacted(key: &Account, plain: &Account) {
     println!("pop3_session_is_redacted");
     for account in [key, plain] {
-        let traced = Traced::start(&traced_types());
+        let traced = Traced::start(traced_types());
         let retrieved = pop3_session(account).await;
         let events = traced.finish().await;
         assert!(
@@ -606,15 +679,15 @@ fn is_position_reason(reason: &str) -> bool {
 }
 
 /// Spec 10, issue #21: a vacation response whose script does not compile is
-/// traced with the error's position only, for every account. A raw NUL
-/// byte and an unbalanced quote in the text are the attempt; when the
-/// generated script compiles anyway, the unit test in
-/// `crates/jmap/src/vacation/set.rs` is the pin.
+/// traced with the error's position only, for every account. A text and an
+/// HTML body, each under the handler's 2048-byte limit, whose MIME-encoded
+/// body exceeds the untrusted compiler's string limit (4096 bytes by default)
+/// fail the handler's own compile; the unit test in
+/// `crates/jmap/src/vacation/set.rs` pins a compiler message that quotes the
+/// script.
 async fn vacation_compile_error_reason_is_fixed(plain: &Account) {
     println!("vacation_compile_error_reason_is_fixed");
-    let mut types = traced_types();
-    types.push(EventType::Store(StoreEvent::UnexpectedError));
-    let traced = Traced::start(&types);
+    let traced = Traced::start(traced_types());
     let reply = plain
         .jmap_method_call(
             "VacationResponse/set",
@@ -623,13 +696,26 @@ async fn vacation_compile_error_reason_is_fixed(plain: &Account) {
                 "update": { "singleton": {
                     "isEnabled": true,
                     "subject": VACATION_CANARY,
-                    "textBody": format!("nul \u{0} quote \" {VACATION_CANARY}"),
+                    "textBody": format!("{VACATION_CANARY} {}", "é".repeat(1000)),
+                    "htmlBody": format!("<p>{}</p>", "é".repeat(1000)),
                 } }
             }),
         )
         .await;
     let events = traced.finish().await;
-    for event in &events {
+    assert!(
+        reply.is_error_at(0),
+        "the vacation script compiled: {:?}",
+        reply.response_at(0)
+    );
+    // The HTTP body traces echo an ordinary account's own request, as upstream
+    // traces them (release 1 withholds them for key accounts).
+    for event in events.iter().filter(|event| {
+        !matches!(
+            event.typ,
+            EventType::Http(HttpEvent::RequestBody | HttpEvent::ResponseBody)
+        )
+    }) {
         assert!(
             !content(event).contains(VACATION_CANARY),
             "{:?} carries the vacation text: {}",
@@ -637,52 +723,14 @@ async fn vacation_compile_error_reason_is_fixed(plain: &Account) {
             event.text
         );
     }
-    if reply.is_error_at(0) {
-        let reasons = values(
-            &events,
-            EventType::Store(StoreEvent::UnexpectedError),
-            Key::Reason,
-        );
-        assert!(
-            !reasons.is_empty(),
-            "no compile error traced: {:?}",
-            reply.0
-        );
-        for reason in reasons {
-            assert!(is_position_reason(&reason), "the traced reason: {reason:?}");
-        }
-    } else {
-        println!("vacation_compile_error_reason_is_fixed: the generated script compiles");
-        // The script is removed: a later delivery would answer it.
-        plain
-            .jmap_method_call(
-                "VacationResponse/set",
-                json!({
-                    "accountId": plain.id_string(),
-                    "update": { "singleton": { "isEnabled": false } }
-                }),
-            )
-            .await;
-        let scripts = plain
-            .jmap_method_call(
-                "SieveScript/get",
-                json!({ "accountId": plain.id_string(), "ids": null, "properties": ["id"] }),
-            )
-            .await;
-        let ids = scripts
-            .list()
-            .iter()
-            .map(|script| script["id"].as_str().unwrap().to_string())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            plain
-                .jmap_destroy("SieveScript", &ids, Vec::<(&str, &str)>::new())
-                .await
-                .destroyed()
-                .count(),
-            ids.len(),
-            "the vacation script"
-        );
+    let reasons = values(
+        &events,
+        EventType::Store(StoreEvent::UnexpectedError),
+        Key::Reason,
+    );
+    assert!(!reasons.is_empty(), "no compile error traced");
+    for reason in reasons {
+        assert!(is_position_reason(&reason), "the traced reason: {reason:?}");
     }
 }
 
@@ -715,6 +763,40 @@ async fn autolearn_skips_key_transactions(test: &TestServer, key: &Account) {
         } else {
             assert_eq!(spam_samples(test).await, samples + 1, "control: the sample");
             assert_eq!(added, 1, "control: the sample event");
+        }
+    }
+}
+
+/// Mail spec 10 and 6.1 step 4: a recipient the DATA-stage milter adds
+/// (`AddRcpt`, from the mock's `add_rcpt.<name>@<domain>` sender) is
+/// classified too: a trap transaction that gains the key account adds no
+/// autolearn sample, and the key account's copy is sealed; one that gains the
+/// ordinary account adds the sample (the control).
+async fn late_recipients_are_classified(test: &TestServer, key: &Account) {
+    println!("late_recipients_are_classified");
+    let key_id = key.id().document_id();
+    for added in [KEY, PLAIN] {
+        let before = message_ids(test, key_id).await;
+        let samples = spam_samples(test).await;
+        SmtpConnection::connect()
+            .await
+            .ingest(&format!("add_rcpt.{added}"), &[TRAP], &canary_message())
+            .await;
+        wait_for_delivery(test).await;
+        if added == KEY {
+            assert_eq!(
+                spam_samples(test).await,
+                samples,
+                "a sample with a late key recipient"
+            );
+            let document_id = new_message(test, key_id, &before).await;
+            assert_sealed(test, key_id, document_id, WRAP_PK).await;
+        } else {
+            assert_eq!(
+                spam_samples(test).await,
+                samples + 1,
+                "control: the sample with a late ordinary recipient"
+            );
         }
     }
 }

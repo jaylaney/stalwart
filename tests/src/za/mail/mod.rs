@@ -342,6 +342,7 @@ impl Traced {
             .register();
         Collector::union_interests(interests);
         Collector::reload();
+        wait_for_subscriber(true);
         Traced { _tx, rx }
     }
 
@@ -376,6 +377,27 @@ impl Traced {
         }
         Collector::remove_subscriber(TRACED_SUBSCRIBER_ID.into());
         Collector::reload();
+        wait_for_subscriber(false);
         captured
+    }
+}
+
+/// Waits until the collector has applied the subscriber's registration
+/// (`present`) or its removal. It applies them on its own thread, once per
+/// pass, and an event it collects before then never reaches the subscriber:
+/// a step that acts in process right after `start` (`fence.rs` calls
+/// `copy_message`) would otherwise race it.
+fn wait_for_subscriber(present: bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while Collector::get_subscribers()
+        .iter()
+        .any(|id| id == TRACED_SUBSCRIBER_ID)
+        != present
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the collector did not apply the subscriber update"
+        );
+        std::thread::sleep(Duration::from_millis(1));
     }
 }

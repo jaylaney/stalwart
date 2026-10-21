@@ -4,8 +4,8 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::expression::SpamFilterResolver;
-use crate::{SpamFilterContext, analysis::rules::eval};
+use super::expression::{SpamFilterEval, SpamFilterResolver};
+use crate::SpamFilterContext;
 use common::{
     Server,
     config::mailstore::spamfilter::{DnsBlServer, Element, IpResolver, Location},
@@ -78,13 +78,13 @@ pub(crate) async fn check_dnsbl(
             .await
         {
             for code in codes.iter() {
-                let tag = eval::<String, _>(
-                    server,
-                    ctx,
-                    &dnsbl.tags,
-                    &SpamFilterResolver::new(ctx, code, location),
-                )
-                .await;
+                let tag = server
+                    .spam_eval_if::<String, _>(
+                        &dnsbl.tags,
+                        &SpamFilterResolver::new(ctx, code, location),
+                        ctx.input.span_id,
+                    )
+                    .await;
 
                 if let Some(tag) = tag {
                     ctx.result.add_tag(tag);
@@ -110,7 +110,9 @@ async fn dnsbl_codes(
     checks: &mut usize,
 ) -> Option<Arc<[IpResolver]>> {
     let time = Instant::now();
-    let zone = eval::<String, _>(server, resolver.ctx, &config.zone, &resolver).await?;
+    let zone = server
+        .spam_eval_if::<String, _>(&config.zone, &resolver, resolver.ctx.input.span_id)
+        .await?;
     // Mail spec 10: the zone names the checked address, domain or URL.
     let za_redact = resolver.ctx.input.za_redact;
 
@@ -140,11 +142,7 @@ async fn dnsbl_codes(
         Ok(DnsblAnswer::Listed { ips, expires }) => {
             trc::event!(
                 Spam(SpamEvent::Dnsbl),
-                Hostname = if za_redact {
-                    trc::Value::redacted()
-                } else {
-                    zone.clone().into()
-                },
+                Hostname = za_redacted(za_redact, zone.clone()),
                 Result = ips
                     .iter()
                     .map(|ip| trc::Value::from(ip.to_string()))
@@ -169,11 +167,7 @@ async fn dnsbl_codes(
         Ok(DnsblAnswer::NotListed { expires }) => {
             trc::event!(
                 Spam(SpamEvent::Dnsbl),
-                Hostname = if za_redact {
-                    trc::Value::redacted()
-                } else {
-                    zone.clone().into()
-                },
+                Hostname = za_redacted(za_redact, zone.clone()),
                 Result = trc::Value::None,
                 Details = element.as_str(),
                 Elapsed = time.elapsed()
@@ -192,18 +186,23 @@ async fn dnsbl_codes(
         Err(err) => {
             trc::event!(
                 Spam(SpamEvent::DnsblError),
-                Hostname = if za_redact {
-                    trc::Value::redacted()
-                } else {
-                    zone.into()
-                },
+                Hostname = za_redacted(za_redact, zone),
                 Elapsed = time.elapsed(),
                 Details = element.as_str(),
-                CausedBy = err
+                CausedBy = za_redacted(za_redact, err)
             );
 
             None
         }
+    }
+}
+
+/// Mail spec 10: `value`, or the redaction marker for a key account's message.
+fn za_redacted(redact: bool, value: impl Into<trc::Value>) -> trc::Value {
+    if redact {
+        trc::Value::redacted()
+    } else {
+        value.into()
     }
 }
 

@@ -250,6 +250,13 @@ impl SpamFilterAnalyzeUrl for Server {
                                 }
                                 Ok(None) => {}
                                 Err(err) => {
+                                    // Mail spec 10: the request's error names
+                                    // a URL of the message.
+                                    let err = if ctx.input.za_redact {
+                                        err.redact(&[trc::Key::Reason])
+                                    } else {
+                                        err
+                                    };
                                     trc::error!(err.span_id(ctx.input.span_id));
                                 }
                             }

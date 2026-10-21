@@ -506,7 +506,13 @@ impl SieveScriptIngest for Server {
                 Err(err) => {
                     trc::event!(
                         Sieve(SieveEvent::RuntimeError),
-                        Reason = err.to_string(),
+                        // Mail spec 10: a key account's script can quote its
+                        // message (`error "${header.subject}"`).
+                        Reason = if account_info.is_key_account() {
+                            trc::Value::redacted()
+                        } else {
+                            err.to_string().into()
+                        },
                         SpanId = session_id
                     );
 

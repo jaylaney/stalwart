@@ -107,7 +107,6 @@ async fn accept_milter(
             match receiver.read_frame(&buf[..br]) {
                 FrameResult::Frame(bytes) => {
                     let cmd = Command::deserialize(bytes.as_ref());
-                    println!("CMD: {cmd}");
 
                     let response = match cmd {
                         Command::Abort | Command::Macro { .. } => continue,
@@ -126,13 +125,23 @@ async fn accept_milter(
                         }),
                         Command::MailFrom { sender, .. } => {
                             let sender = std::str::from_utf8(sender).unwrap();
-                            action = match sender
-                                .strip_prefix('<')
-                                .unwrap()
-                                .split_once('@')
-                                .unwrap()
-                                .0
-                            {
+                            let (local, domain) =
+                                sender.strip_prefix('<').unwrap().split_once('@').unwrap();
+                            action = match local {
+                                // `add_rcpt.<name>@<domain>` adds the recipient
+                                // `<name>@<domain>` (the zero-access trace tests).
+                                local if local.starts_with("add_rcpt.") => {
+                                    modifications = vec![Modification::AddRcpt {
+                                        recipient: format!(
+                                            "<{}@{}>",
+                                            &local["add_rcpt.".len()..],
+                                            domain.trim_end_matches('>')
+                                        ),
+                                        args: String::new(),
+                                    }]
+                                    .into();
+                                    Action::Accept
+                                }
                                 "accept" => Action::Accept,
                                 "reject" => Action::Reject,
                                 "discard" => Action::Discard,
