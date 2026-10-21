@@ -1338,7 +1338,10 @@ fn import_order(messages: &[String], index: usize) -> Vec<&String> {
 /// reach them, R34), keep every message in a thread of its own (spec 5.4).
 /// The multi-threaded part ingests upstream's mailbox at server level, as
 /// SMTP with a keyless token, so every message is sealed under the account's
-/// public key: the messages are singletons and the task queue drains.
+/// public key: the messages are singletons. `wait_for_tasks` is the drain
+/// (it returns when the task range is empty), so the test asserts no queue
+/// state of its own (ruling R43); a scheduled `MergeThreads` that merged
+/// anything would break the singleton assertion.
 pub async fn thread_merge(test: &TestServer) {
     println!("Running key-account Email Merge Threads tests...");
     let admin = test.account("admin@example.com");
@@ -1853,8 +1856,13 @@ pub async fn acl(test: &TestServer) {
         vec![ACL::ReadItems]
     );
 
-    // Try to add items using import and copy: refused without AddItems, and
-    // still refused with it, as each would carry John's mail into the share.
+    // Try to add items using import and copy. Both are refused whether or
+    // not John holds AddItems: the keyless checks come before the ACL check
+    // (R31 refuses a sealed source of John's into another account in
+    // Email/import, and spec 6.3 refuses the cross-account copy), so the
+    // answer below says nothing about AddItems. AddItems is enforced and
+    // shown by the move step further down and by IMAP APPEND in the IMAP
+    // variant.
     let import = json!({
         "accountId": admin.id_string(),
         "emails": { "i": { "blobId": &upload, "mailboxIds": { &inbox_id: true } } }

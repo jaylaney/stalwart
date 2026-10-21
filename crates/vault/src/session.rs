@@ -13,7 +13,10 @@ use std::{
     },
 };
 
-/// Keys resident for one request (spec 5, "in-flight copies"). Cloned by
+/// Keys resident for one HTTP request (spec 5, "in-flight copies"), or for
+/// the life of an authenticated IMAP or POP3 connection (mail spec 3.3,
+/// which amends release 1's "only HTTP requests carry keys"). WebSocket,
+/// EventSource, ManageSieve and SMTP sessions never hold them. Cloned by
 /// `Arc`; the secrets are zeroed when the last reference drops.
 pub struct SessionKeys {
     pub account_id: u32,

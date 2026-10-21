@@ -697,8 +697,12 @@ impl Server {
     /// Mail spec 10: whether the accepted recipient `address` is a key
     /// account's, found as local delivery finds it
     /// (`account_id_from_email(address, false)`), without cache events, so an
-    /// ordinary RCPT traces nothing new. `rcpt_resolve` has just cached the
-    /// account; `za_is_key_account` loads one that is not.
+    /// ordinary RCPT traces nothing new. `rcpt_resolve` has usually cached
+    /// the account, but not always: list members and recipients added after
+    /// RCPT (a DATA-stage milter, an MTA hook, Sieve `SetEnvelope`) may not
+    /// be cached, and then `za_is_key_account` loads the account and its
+    /// lookup can emit Store `CacheMiss` / `CacheHit` events, which carry the
+    /// account id only, never the address.
     pub async fn za_is_key_rcpt(&self, address: &str) -> trc::Result<bool> {
         let Some(account_id) = self
             .account_id_from_email_inner(address, false, true)

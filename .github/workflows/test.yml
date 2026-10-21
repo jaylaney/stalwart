@@ -118,6 +118,23 @@ jobs:
         env:
           ZA_KEY_ACCOUNTS: "1"
 
+      - name: IMAP Tests (key accounts)
+        # Upstream's IMAP suite with its users provisioned as key accounts
+        # (the admin and the groups stay plain; mail spec 11): the variants in
+        # tests/src/imap/za_variants.rs assert the refusals, the rest runs
+        # unchanged against sealed mail.
+        run: cargo test -p tests imap::imap_tests -- --nocapture
+        env:
+          ZA_KEY_ACCOUNTS: "1"
+
+      - name: JMAP Tests (key accounts)
+        # The same for the JMAP suite (tests/src/jmap/za_variants.rs). Key
+        # mode runs the calendar modules as refusals, so upstream's
+        # timing-flaky calendar::notification sub-test does not run here.
+        run: cargo test -p tests jmap::jmap_tests -- --nocapture
+        env:
+          ZA_KEY_ACCOUNTS: "1"
+
   caldav-client:
     name: Independent CalDAV Client
     # Avoid the expensive release build when the cheaper suites fail.
