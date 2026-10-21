@@ -124,6 +124,33 @@ impl Server {
         Ok(!is_owner && self.za_is_key_account(account_id).await?)
     }
 
+    /// Mail ruling R36: whether an OAuth grant (an authorization or a device
+    /// code) is refused for the login `access_token`: an impersonation of a
+    /// key account. The code names only the account, so the Bearer token it
+    /// is exchanged for would not carry the impersonation marker and would
+    /// pass as the owner's (`za_foreign_key_account`). Traced as
+    /// `Security(Unauthorized)` naming the account, with
+    /// `ZA_TRACE_MAIL_KEYLESS`.
+    pub async fn za_oauth_grant_refused(
+        &self,
+        access_token: &AccessToken,
+        session_id: u64,
+    ) -> trc::Result<bool> {
+        if access_token.za_is_impersonated()
+            && self.za_is_key_account(access_token.account_id()).await?
+        {
+            trc::event!(
+                Security(trc::SecurityEvent::Unauthorized),
+                SpanId = session_id,
+                AccountId = access_token.account_id(),
+                Details = ZA_TRACE_MAIL_KEYLESS,
+            );
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Mail spec 6.3, ruling R34: refuses a mail access to a foreign key
     /// account (`za_foreign_key_account`), traced as `Security(Unauthorized)`
     /// naming it, with `ZA_TRACE_MAIL_KEYLESS`, and answered with the keyless

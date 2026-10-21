@@ -113,6 +113,7 @@ pub async fn test(test: &mut TestServer) {
     keyless_tokens_hit_the_dispatcher_gate(test, &key).await;
     impersonation_is_refused(&admin, &key, &plain).await;
     master_user_login_is_foreign(&admin, &key, &plain).await;
+    oauth_grant_refused_for_impersonation(&admin, &key).await;
     cross_account_copies_are_refused(test, &key, &plain, &other_plain).await;
     sharing_is_refused_on_key_mailboxes(&key, &plain).await;
     let stale = rf_2_stale_grant(test, &admin, &plain, &other_plain).await;
@@ -1532,8 +1533,10 @@ async fn master_user_login_is_foreign(admin: &Account, key: &Account, plain: &Ac
 
 /// Ruling R35: an IMAP master-user session opened while the account was
 /// plain is not the owner's once the account is provisioned: STORE and a
-/// flag FETCH answer `NO [NOPERM]`, and its NOOP completes without an
-/// update of the owner's flag change. Returns the provisioned account.
+/// flag FETCH answer `NO [NOPERM]`, its NOOP completes without an update of
+/// the owner's flag change, and DELETE, RENAME, CREATE and SUBSCRIBE on the
+/// account's mailbox names answer `NO [NOPERM]` and change nothing.
+/// Returns the provisioned account.
 async fn impersonated_session_is_foreign(test: &mut TestServer, admin: &Account) -> Account {
     println!("impersonated_session_is_foreign");
     let mut account = admin
@@ -1550,6 +1553,7 @@ async fn impersonated_session_is_foreign(test: &mut TestServer, admin: &Account)
     imap.authenticate(&format!("{IMPERSONATED}%{}", admin.name()), admin.secret())
         .await;
     imap.send_ok("SELECT INBOX").await;
+    imap.send_ok("CREATE \"gates folder\"").await;
 
     provision(test, admin, &mut account).await;
     deliver(
@@ -1563,7 +1567,8 @@ async fn impersonated_session_is_foreign(test: &mut TestServer, admin: &Account)
     keyed.authenticate(IMPERSONATED, STRONG).await;
     keyed.send_ok("SELECT INBOX").await;
     keyed.send_ok("STORE 1 +FLAGS (\\Flagged)").await;
-    keyed.send_ok("LOGOUT").await;
+    keyed.send(r#"LSUB "" "*""#).await;
+    let subscribed = keyed.assert_read(Type::Tagged, ResponseType::Ok).await;
 
     let traced = Traced::start(&[EventType::Security(SecurityEvent::Unauthorized)]);
     assert_imap_refused(&mut imap, "STORE 1 +FLAGS (\\Seen)").await;
@@ -1571,7 +1576,32 @@ async fn impersonated_session_is_foreign(test: &mut TestServer, admin: &Account)
     imap.send("NOOP").await;
     let lines = imap.assert_read(Type::Tagged, ResponseType::Ok).await;
     assert_eq!(lines.len(), 1, "an update after NOOP: {lines:?}");
+    // Review New 2: the by-name writes on the account's mailboxes.
+    for command in [
+        "DELETE \"gates folder\"",
+        "RENAME \"gates folder\" \"gates renamed\"",
+        "CREATE \"gates new\"",
+        "SUBSCRIBE \"gates folder\"",
+    ] {
+        assert_imap_refused(&mut imap, command).await;
+    }
     imap.send_ok("LOGOUT").await;
+    keyed.send(r#"LIST "" "*""#).await;
+    let listed = keyed.assert_read(Type::Tagged, ResponseType::Ok).await;
+    assert!(
+        listed.iter().any(|line| line.contains("\"gates folder\""))
+            && !listed
+                .iter()
+                .any(|line| line.contains("gates renamed") || line.contains("gates new")),
+        "a refused write changed the mailboxes: {listed:?}"
+    );
+    keyed.send(r#"LSUB "" "*""#).await;
+    assert_eq!(
+        keyed.assert_read(Type::Tagged, ResponseType::Ok).await,
+        subscribed,
+        "a refused write changed the subscriptions"
+    );
+    keyed.send_ok("LOGOUT").await;
     let refused = traced
         .finish()
         .await
@@ -1581,8 +1611,147 @@ async fn impersonated_session_is_foreign(test: &mut TestServer, admin: &Account)
         .collect::<Vec<_>>();
     assert_eq!(
         refused,
-        vec![Some(u64::from(account_id)); 2],
+        vec![Some(u64::from(account_id)); 6],
         "the refusals"
     );
     account
+}
+
+/// The OAuth client of `oauth_grant_refused_for_impersonation` (the suite
+/// requires no client registration, as `bearer_token`).
+const OAUTH_CLIENT: &str = "za-gates-test";
+const OAUTH_REDIRECT: &str = "https://client.example.com/callback";
+
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap()
+}
+
+/// `POST /api/auth` with `body`, a `LoginRequest`; its `LoginResponse`.
+async fn api_auth(base: &Account, body: Value) -> Value {
+    http_client()
+        .post(format!("{}/api/auth", base.base_url()))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// A device authorization: its device code and user code.
+async fn device_codes(base: &Account) -> (String, String) {
+    let reply: Value = http_client()
+        .post(format!("{}/auth/device", base.base_url()))
+        .form(&[("client_id", OAUTH_CLIENT)])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    (
+        reply["device_code"].as_str().unwrap().to_string(),
+        reply["user_code"].as_str().unwrap().to_string(),
+    )
+}
+
+/// The token endpoint's answer for `device_code`.
+async fn device_token(base: &Account, device_code: &str) -> Value {
+    http_client()
+        .post(format!("{}/auth/token", base.base_url()))
+        .form(&[
+            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ("device_code", device_code),
+            ("client_id", OAUTH_CLIENT),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// Ruling R36: an OAuth login by impersonation of a key account
+/// (`keymail8%admin` with the admin's password) is refused as a failed login
+/// and issues no code, an authorization code (`authCode`) or a device grant
+/// (`authDevice`, whose device code stays pending); the trace names the
+/// account. The same logins for a plain account are granted (the control).
+async fn oauth_grant_refused_for_impersonation(admin: &Account, key: &Account) {
+    println!("oauth_grant_refused_for_impersonation");
+    let key_id = key.id().document_id();
+    let traced = Traced::start(&[EventType::Security(SecurityEvent::Unauthorized)]);
+    for (account, refused) in [(KEY, true), (PLAIN, false)] {
+        let master = format!("{account}%{}", admin.name());
+        let reply = api_auth(
+            key,
+            json!({
+                "type": "authCode",
+                "accountName": &master,
+                "accountSecret": admin.secret(),
+                "clientId": OAUTH_CLIENT,
+                "redirectUri": OAUTH_REDIRECT,
+            }),
+        )
+        .await;
+        if refused {
+            assert_eq!(
+                reply,
+                json!({ "type": "failure" }),
+                "authCode for {account}"
+            );
+        } else {
+            assert!(
+                reply["client_code"].is_string(),
+                "control: authCode for {account}: {reply}"
+            );
+        }
+
+        let (device_code, user_code) = device_codes(key).await;
+        let reply = api_auth(
+            key,
+            json!({
+                "type": "authDevice",
+                "accountName": &master,
+                "accountSecret": admin.secret(),
+                "code": user_code,
+            }),
+        )
+        .await;
+        let token = device_token(key, &device_code).await;
+        if refused {
+            assert_eq!(
+                reply,
+                json!({ "type": "failure" }),
+                "authDevice for {account}"
+            );
+            assert_eq!(
+                token["error"], "authorization_pending",
+                "the refused device grant: {token}"
+            );
+        } else {
+            assert_eq!(
+                reply,
+                json!({ "type": "verified" }),
+                "control: authDevice for {account}"
+            );
+            assert!(
+                token["access_token"].is_string(),
+                "control: the device grant's token: {token}"
+            );
+        }
+    }
+    let refused = traced
+        .finish()
+        .await
+        .into_iter()
+        .filter(|e| e.details == KEYLESS_REFUSED)
+        .map(|e| e.account_id)
+        .collect::<Vec<_>>();
+    assert_eq!(refused, vec![Some(u64::from(key_id)); 2], "the refusals");
 }
