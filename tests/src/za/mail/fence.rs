@@ -22,15 +22,21 @@ use crate::{
         account::Account,
         server::TestServer,
         smtp::SmtpConnection,
-        za::{HookParked, wait_for_delivery, za_post_as, za_setup, za_setup_token},
+        za::{Conn, HookParked, wait_for_delivery, za_post_as, za_setup, za_setup_token},
     },
-    za::{STRONG, user_permissions},
+    za::{STRONG, raw_input::SUBMISSION_PORT, user_permissions},
 };
-use common::{Server, auth::AccessToken, za::test_hooks};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use common::{
+    Server,
+    auth::AccessToken,
+    za::{ZA_MAIL_KEYLESS, test_hooks},
+};
 use email::{
     cache::MessageCacheFetch,
     mailbox::INBOX_ID,
     message::{
+        copy::EmailCopy,
         delete::EmailDeletion,
         ingest::{EmailIngest, IngestEmail, IngestSource},
         metadata::MessageMetadata,
@@ -55,6 +61,11 @@ use store::{
     roaring::RoaringBitmap,
     write::{BatchBuilder, BlobLink, BlobOp, ValueClass, key::DeserializeBigEndian, now},
 };
+use tokio::sync::mpsc;
+use trc::{
+    Collector, EventType, Key, SecurityEvent, StoreEvent,
+    ipc::subscriber::{EventBatch, Interests, SubscriberBuilder},
+};
 use types::{
     blob::BlobClass,
     blob_hash::{BLOB_HASH_LEN, BlobHash},
@@ -72,8 +83,15 @@ const FENCE6: &str = "fence6@example.com";
 const FENCE7: &str = "fence7@example.com";
 const FENCE8: &str = "fence8@example.com";
 const FENCE9: &str = "fence9@example.com";
+const FENCE10: &str = "fence10@example.com";
 const PLAIN: &str = "plainmail3@example.com";
+/// The organizer of `forward_race_imip_side_write`'s invitation, which it
+/// sends through authenticated submission.
+const ORGANIZER: &str = "plainmail4@example.com";
 const SENDER: &str = "sender@example.com";
+const SUBSCRIBER_ID: &str = "za-fence-test";
+/// The trace details of `copy_message`'s refusal.
+const COPY_REFUSED: &str = "zero-access: mail copy across accounts";
 /// `stress_the_fence`'s runs.
 const RUNS: u64 = 64;
 /// The key path's temporary failure without a served public key (Task 3).
@@ -94,9 +112,11 @@ pub async fn test(test: &mut TestServer) {
 
     let fence1 = forward_race_delivery_loses(test, &admin).await;
     let (fence2, plain) = forward_race_with_a_staged_blob(test, &admin).await;
+    let (fence10, organizer) = forward_race_imip_side_write(test, &admin).await;
     let fence3 = reverse_race_setup_token_aborts(test, &admin).await;
     let fence4 = reverse_race_reissue_keeps_the_marker(test, &admin).await;
     let (fence5, fence6) = copy_message_race(test, &admin).await;
+    copy_message_refuses_key_accounts(test, &fence1, &fence5, &fence6).await;
     let fence7 = stress_the_fence(test, &admin).await;
     let fence8 = pg_and_mysql_are_refused(test, &admin).await;
     let fence9 = setup_refuses_existing_mail(test, &admin).await;
@@ -104,11 +124,14 @@ pub async fn test(test: &mut TestServer) {
     // The accounts that log in empty their own mailboxes; the others are
     // pending or credentialless, and the account's destruction removes
     // what they hold.
-    for account in [&fence1, &fence2, &plain, &fence3, &fence4, &fence5, &fence6] {
+    for account in [
+        &fence1, &fence2, &plain, &fence10, &organizer, &fence3, &fence4, &fence5, &fence6,
+    ] {
         test.destroy_all_mailboxes(account).await;
     }
     for account in [
-        fence1, fence2, plain, fence3, fence4, fence5, fence6, fence7, fence8, fence9,
+        fence1, fence2, plain, fence10, organizer, fence3, fence4, fence5, fence6, fence7, fence8,
+        fence9,
     ] {
         admin.destroy_account(account).await;
     }
@@ -245,6 +268,99 @@ async fn temporary_links(test: &TestServer, account_id: u32) -> Vec<BlobHash> {
     hashes
 }
 
+/// Events of the given types emitted while a step runs, captured as
+/// `raw_input.rs` captures them: the test server configures no tracer, so
+/// nothing is emitted until something declares interest.
+struct Traced {
+    _tx: mpsc::Sender<EventBatch>,
+    rx: mpsc::Receiver<EventBatch>,
+}
+
+/// (type, account id, details, reason) of one captured event.
+type TracedEvent = (EventType, Option<u64>, String, String);
+
+impl Traced {
+    fn start(types: &[EventType]) -> Self {
+        let mut interests = Interests::default();
+        for event_type in types {
+            interests.set(*event_type);
+        }
+        let (_tx, rx) = SubscriberBuilder::new(SUBSCRIBER_ID.into())
+            .set_interests(types.iter().copied())
+            .with_lossy(false)
+            .register();
+        Collector::union_interests(interests);
+        Collector::reload();
+        Traced { _tx, rx }
+    }
+
+    async fn finish(mut self) -> Vec<TracedEvent> {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut captured = Vec::new();
+        while let Ok(batch) = self.rx.try_recv() {
+            for event in batch {
+                let (mut account_id, mut details, mut reason) =
+                    (None, String::new(), String::new());
+                for (key, value) in event.keys.iter() {
+                    match (key, value) {
+                        (Key::AccountId, trc::Value::UInt(id)) => account_id = Some(*id),
+                        (Key::Details, trc::Value::String(text)) => details = text.to_string(),
+                        (Key::Reason, trc::Value::String(text)) => reason = text.to_string(),
+                        _ => {}
+                    }
+                }
+                captured.push((event.inner.typ, account_id, details, reason));
+            }
+        }
+        Collector::remove_subscriber(SUBSCRIBER_ID.into());
+        Collector::reload();
+        captured
+    }
+}
+
+/// `message` sent by `from` through the suite's authenticated submission
+/// listener, so local delivery sees an authenticated sender.
+async fn submit(from: &str, to: &str, message: &str) {
+    let mut conn = Conn::open_smtp(SUBMISSION_PORT).await;
+    conn.send("EHLO fence.example.com\r\n").await;
+    conn.until(&["250 "]).await;
+    let response = STANDARD.encode(format!("\0{from}\0{STRONG}"));
+    conn.exchange(&format!("AUTH PLAIN {response}\r\n"), "235")
+        .await;
+    conn.exchange(&format!("MAIL FROM:<{from}>\r\n"), "250")
+        .await;
+    conn.exchange(&format!("RCPT TO:<{to}>\r\n"), "250").await;
+    conn.exchange("DATA\r\n", "354").await;
+    conn.exchange(&format!("{message}\r\n.\r\n"), "250").await;
+    conn.send("QUIT\r\n").await;
+}
+
+/// The queued message for `address`, as local delivery reads it.
+async fn queued_blob(test: &TestServer, address: &str) -> Vec<u8> {
+    let hash = test
+        .read_queued_messages()
+        .await
+        .into_iter()
+        .find(|m| m.message.recipients.iter().any(|r| &*r.address == address))
+        .unwrap_or_else(|| panic!("nothing queued for {address}"))
+        .message
+        .blob_hash;
+    stored_blob(test, &hash).await
+}
+
+/// The purge as the scheduler runs it, once every temporary link expired.
+async fn expire_and_purge_blobs(test: &TestServer, admin: &Account) {
+    test.blob_expire_all().await;
+    admin
+        .registry_create_object(Task::StoreMaintenance(TaskStoreMaintenance {
+            maintenance_type: TaskStoreMaintenanceType::PurgeBlob,
+            shard_index: None,
+            status: TaskStatus::now(),
+        }))
+        .await;
+    test.wait_for_tasks().await;
+}
+
 /// The blob hash of the account's message `document_id`.
 async fn message_hash(test: &TestServer, account_id: u32, document_id: u32) -> BlobHash {
     BlobHash::from(
@@ -287,12 +403,12 @@ async fn forward_race_delivery_loses(test: &TestServer, admin: &Account) -> Acco
 
 /// Review F1b: a delivery Sieve modified stages its blob before the batch.
 /// When the batch then loses the assertion, the staged blob is left to its
-/// temporary link, never deleted: the plain account that ingested the
-/// identical bytes keeps them, and the purge removes only the key account's
-/// expired link. One transaction reaches both accounts, whose identical
-/// Sieve scripts make the identical bytes; the session delivers recipients
-/// in address order, so the plain account's ingest waits behind the parked
-/// one and links the hash the lost ingest staged.
+/// temporary link, never deleted: blobs are content-addressed, so the plain
+/// account that linked the identical bytes while the delivery was parked
+/// keeps them through the purge, which removes only the key account's
+/// expired link. The plain account imports (JMAP `Email/import`) the bytes
+/// the parked ingest is about to stage: the queued message with the
+/// script's header first, where sieve-rs's `addheader` puts it.
 async fn forward_race_with_a_staged_blob(test: &TestServer, admin: &Account) -> (Account, Account) {
     println!("forward_race_with_a_staged_blob");
     let account = passwordless(admin, FENCE2).await;
@@ -301,12 +417,6 @@ async fn forward_race_with_a_staged_blob(test: &TestServer, admin: &Account) -> 
         .create_user_account(PLAIN, STRONG, "Plain mail", &[], user_permissions())
         .await;
     let plain_id = plain.id().document_id();
-    plain
-        .jmap_client()
-        .await
-        .sieve_script_create("fence", SCRIPT, true)
-        .await
-        .unwrap();
     let mut client = admin.jmap_client().await;
     client.set_default_account_id(Id::from(id));
     client
@@ -318,40 +428,64 @@ async fn forward_race_with_a_staged_blob(test: &TestServer, admin: &Account) -> 
     let parked = HookParked::start(id, test_hooks::set_ingest_pause, async move {
         SmtpConnection::connect()
             .await
-            .ingest(SENDER, &[PLAIN, FENCE2], &message)
+            .ingest(SENDER, &[FENCE2], &message)
             .await;
     })
     .await;
+    let staged_bytes = [
+        b"X-Sieve-Fence: 1\r\n".as_slice(),
+        &queued_blob(test, FENCE2).await,
+    ]
+    .concat();
+    let staged = BlobHash::generate(&staged_bytes);
+    plain
+        .jmap_client()
+        .await
+        .email_import(
+            staged_bytes.clone(),
+            [Id::from(INBOX_ID).to_string()],
+            None::<Vec<&str>>,
+            None,
+        )
+        .await
+        .unwrap();
+    let plain_ids = message_ids(test, plain_id).await;
+    assert_eq!(plain_ids.len(), 1, "the plain account's import");
+    assert_eq!(
+        message_hash(test, plain_id, plain_ids[0]).await,
+        staged,
+        "the import links the uploaded bytes"
+    );
     let token = za_setup_token(admin, FENCE2).await;
     za_setup(FENCE2, &token, STRONG).await;
     parked.finish().await;
 
     assert_first_attempt_lost(test, FENCE2, id).await;
-    let plain_ids = message_ids(test, plain_id).await;
-    assert_eq!(plain_ids.len(), 1, "the plain account's copy");
-    let staged = message_hash(test, plain_id, plain_ids[0]).await;
     assert!(
         temporary_links(test, id).await.contains(&staged),
-        "the key account's lost ingest staged the plain copy's hash"
+        "the lost ingest did not stage the bytes the plain account linked"
     );
     let plain_link = BlobClass::Linked {
         account_id: plain_id,
         collection: Collection::Email.into(),
         document_id: plain_ids[0],
     };
-    assert!(
-        test.server
-            .store()
-            .blob_has_access(&staged, &plain_link)
-            .await
-            .unwrap(),
-        "the plain account links the staged hash"
-    );
-    let staged_bytes = stored_blob(test, &staged).await;
-    assert!(
-        staged_bytes.windows(16).any(|w| w == b"X-Sieve-Fence: 1"),
-        "the staged blob is the Sieve-modified message"
-    );
+    let linked_and_readable = async || {
+        assert!(
+            test.server
+                .store()
+                .blob_has_access(&staged, &plain_link)
+                .await
+                .unwrap(),
+            "the plain account no longer links the staged hash"
+        );
+        assert_eq!(
+            stored_blob(test, &staged).await,
+            staged_bytes,
+            "the plain account's copy"
+        );
+    };
+    linked_and_readable().await;
 
     wait_for_delivery(test).await;
     let ids = message_ids(test, id).await;
@@ -364,33 +498,94 @@ async fn forward_race_with_a_staged_blob(test: &TestServer, admin: &Account) -> 
     );
     assert_no_plaintext(test, id).await;
 
-    // The purge as the scheduler runs it, once every temporary link expired.
-    test.blob_expire_all().await;
-    admin
-        .registry_create_object(Task::StoreMaintenance(TaskStoreMaintenance {
-            maintenance_type: TaskStoreMaintenanceType::PurgeBlob,
-            shard_index: None,
-            status: TaskStatus::now(),
-        }))
-        .await;
-    test.wait_for_tasks().await;
-    assert_eq!(
-        stored_blob(test, &staged).await,
-        staged_bytes,
-        "the plain account's copy survives the purge"
-    );
-    assert!(
-        test.server
-            .store()
-            .blob_has_access(&staged, &plain_link)
-            .await
-            .unwrap()
-    );
+    expire_and_purge_blobs(test, admin).await;
+    linked_and_readable().await;
     assert!(
         temporary_links(test, id).await.is_empty(),
         "a temporary link of the key account survived the purge"
     );
     (account, plain)
+}
+
+/// Ruling R25 of plan 13: iMIP's side-write. A delivery whose ingest read
+/// the account as ordinary runs upstream's iMIP branch on that reading, and
+/// `itip_ingest` commits the event and its inbox item in a batch of its
+/// own; that batch takes the fence too, so provisioning in between leaves
+/// no plaintext calendar data. The invitation comes from a local organizer
+/// through authenticated submission, as upstream's iMIP gate requires (an
+/// authenticated sender; a local principal's invitation is auto-added).
+async fn forward_race_imip_side_write(test: &TestServer, admin: &Account) -> (Account, Account) {
+    println!("forward_race_imip_side_write");
+    let account = passwordless(admin, FENCE10).await;
+    let id = account.id().document_id();
+    let organizer = admin
+        .create_user_account(ORGANIZER, STRONG, "Organizer", &[], user_permissions())
+        .await;
+    let invitation = invitation();
+    let parked = HookParked::start(id, test_hooks::set_ingest_pause, async move {
+        submit(ORGANIZER, FENCE10, &invitation).await;
+    })
+    .await;
+    let token = za_setup_token(admin, FENCE10).await;
+    za_setup(FENCE10, &token, STRONG).await;
+    parked.finish().await;
+
+    assert_first_attempt_lost(test, FENCE10, id).await;
+    assert_no_calendar_data(test, id, "the stale delivery's iMIP processing").await;
+    wait_for_delivery(test).await;
+    let ids = message_ids(test, id).await;
+    assert_eq!(ids.len(), 1, "the queue's retry delivered the message");
+    assert_sealed(test, id, ids[0], WRAP_PK).await;
+    assert_no_plaintext(test, id).await;
+    assert_no_calendar_data(test, id, "the sealed retry").await;
+    (account, organizer)
+}
+
+/// The account holds no calendar event and no scheduling inbox item.
+async fn assert_no_calendar_data(test: &TestServer, account_id: u32, after: &str) {
+    for collection in [
+        Collection::CalendarEvent,
+        Collection::CalendarEventNotification,
+    ] {
+        assert!(
+            !test
+                .server
+                .za_has_documents(account_id, collection)
+                .await
+                .unwrap(),
+            "{after} stored a {collection:?} document"
+        );
+    }
+}
+
+/// An iMIP REQUEST from `ORGANIZER` inviting `FENCE10`, with a unique
+/// `Message-ID`.
+fn invitation() -> String {
+    format!(
+        "From: <{ORGANIZER}>\r\n\
+         To: <{FENCE10}>\r\n\
+         Subject: fence invitation\r\n\
+         Message-ID: <{:016x}.za-fence@example.com>\r\n\
+         Date: Tue, 20 Oct 2026 10:00:00 +0000\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: text/calendar; method=REQUEST; charset=utf-8\r\n\
+         \r\n\
+         BEGIN:VCALENDAR\r\n\
+         VERSION:2.0\r\n\
+         PRODID:-//za//fence//EN\r\n\
+         METHOD:REQUEST\r\n\
+         BEGIN:VEVENT\r\n\
+         UID:za-fence-imip\r\n\
+         DTSTAMP:20261020T100000Z\r\n\
+         DTSTART:20261120T100000Z\r\n\
+         DTEND:20261120T110000Z\r\n\
+         SUMMARY:fence-imip-canary\r\n\
+         ORGANIZER:mailto:{ORGANIZER}\r\n\
+         ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{FENCE10}\r\n\
+         END:VEVENT\r\n\
+         END:VCALENDAR",
+        store::rand::random::<u64>()
+    )
 }
 
 /// Review F1c: a delivery that commits while `setup-token` sits between its
@@ -448,8 +643,9 @@ async fn reverse_race_setup_token_aborts(test: &TestServer, admin: &Account) -> 
 /// Ruling R9 of plan 13: an account holding a marker and a pending record
 /// (a pending account whose first token expired, reissued) is a key
 /// account, so a delivery takes the key path and fails temporarily without
-/// a served public key; nothing is stored, the reissue's recheck finds no
-/// mail, answers 200 and keeps the marker, and setup lets the retry deliver.
+/// a served public key (that failure, traced, not the fence's); nothing is
+/// stored, the reissue's recheck finds no mail, answers 200 and keeps the
+/// marker, and setup lets the retry deliver.
 async fn reverse_race_reissue_keeps_the_marker(test: &TestServer, admin: &Account) -> Account {
     println!("reverse_race_reissue_keeps_the_marker");
     let account = passwordless(admin, FENCE4).await;
@@ -457,11 +653,30 @@ async fn reverse_race_reissue_keeps_the_marker(test: &TestServer, admin: &Accoun
     za_setup_token(admin, FENCE4).await;
     za_setup_token(admin, FENCE4).await;
 
+    let traced = Traced::start(&[
+        EventType::Store(StoreEvent::UnexpectedError),
+        EventType::Store(StoreEvent::AssertValueFailed),
+    ]);
     SmtpConnection::connect()
         .await
         .ingest(SENDER, &[FENCE4], &message_with("pending", "pending-body"))
         .await;
     wait_for_temporary_failure(test, FENCE4).await;
+    let failures = traced.finish().await;
+    assert!(
+        failures.iter().any(|(typ, account_id, _, reason)| {
+            *typ == EventType::Store(StoreEvent::UnexpectedError)
+                && *account_id == Some(u64::from(id.document_id()))
+                && reason == NO_SERVED_KEY
+        }),
+        "no no-served-key failure traced for the delivery: {failures:?}"
+    );
+    assert!(
+        !failures
+            .iter()
+            .any(|(typ, ..)| *typ == EventType::Store(StoreEvent::AssertValueFailed)),
+        "the fence refused the delivery: {failures:?}"
+    );
     assert!(
         message_ids(test, id.document_id()).await.is_empty(),
         "nothing is stored for a pending account"
@@ -540,6 +755,68 @@ async fn copy_message_race(test: &TestServer, admin: &Account) -> (Account, Acco
     (from, to)
 }
 
+/// Mail spec 6.3: `copy_message` itself refuses a key account on either
+/// side, before any read, with the error every caller writes
+/// (`za_keyless_refusal`) and its own `zero-access:` trace naming the key
+/// account; nothing is stored. `key` holds a sealed message, `plain` a
+/// plaintext one, `empty_key` nothing.
+async fn copy_message_refuses_key_accounts(
+    test: &TestServer,
+    key: &Account,
+    plain: &Account,
+    empty_key: &Account,
+) {
+    println!("copy_message_refuses_key_accounts");
+    let key_id = key.id().document_id();
+    let plain_id = plain.id().document_id();
+    let empty_id = empty_key.id().document_id();
+    let key_doc = message_ids(test, key_id).await[0];
+    let plain_before = message_ids(test, plain_id).await;
+    let traced = Traced::start(&[EventType::Security(SecurityEvent::Unauthorized)]);
+    for (from, document_id, to, what) in [
+        (plain_id, plain_before[0], empty_id, "into a key account"),
+        (key_id, key_doc, plain_id, "out of a key account"),
+    ] {
+        let err = match test
+            .server
+            .copy_message(from, document_id, to, vec![INBOX_ID], vec![], None, 0)
+            .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("a copy {what} was not refused"),
+        };
+        assert!(
+            err.matches(EventType::Jmap(trc::JmapEvent::Forbidden)) && err.should_write_err(),
+            "{what}: {err:?}"
+        );
+        assert_eq!(
+            err.value_as_str(Key::Details),
+            Some(ZA_MAIL_KEYLESS),
+            "{what}"
+        );
+    }
+    let mut refused = traced
+        .finish()
+        .await
+        .into_iter()
+        .filter(|(_, _, details, _)| details == COPY_REFUSED)
+        .map(|(_, account_id, ..)| account_id)
+        .collect::<Vec<_>>();
+    refused.sort_unstable();
+    let mut expected = vec![Some(u64::from(empty_id)), Some(u64::from(key_id))];
+    expected.sort_unstable();
+    assert_eq!(refused, expected, "one trace per refused copy");
+    assert!(
+        message_ids(test, empty_id).await.is_empty(),
+        "the copy into a key account stored a message"
+    );
+    assert_eq!(
+        message_ids(test, plain_id).await,
+        plain_before,
+        "the copy out of a key account stored a message"
+    );
+}
+
 /// Ruling R10 of plan 13: an ingest and a provisioning write race, many
 /// times. The writer follows `setup-token`'s order (the pending record, a
 /// store-level read for mail, the marker); the read is a one-sided order
@@ -548,7 +825,8 @@ async fn copy_message_race(test: &TestServer, admin: &Account) -> (Account, Acco
 /// ingest stored plaintext before the record (1), lost its assertion (2,
 /// the record came first and its classification was stale), or took the
 /// key path and failed without a served key (3, its classification fresh).
-/// The start of either side is delayed by 0-7 ms, alternately.
+/// The start of either side is delayed by 0-7 ms, alternately. The blobs
+/// the lost runs staged are linked by nobody, and the purge removes them.
 async fn stress_the_fence(test: &TestServer, admin: &Account) -> Account {
     println!("stress_the_fence");
     let account = passwordless(admin, FENCE7).await;
@@ -557,6 +835,7 @@ async fn stress_the_fence(test: &TestServer, admin: &Account) -> Account {
     // The system folders, before the runs race on their creation.
     message_ids(test, account_id).await;
     let mut outcomes = [0usize; 3];
+    let mut staged_only = Vec::new();
     for run in 0..RUNS {
         let (ingest_delay, writer_delay) = if run % 2 == 0 {
             (0, (run / 2) % 8)
@@ -568,7 +847,7 @@ async fn stress_the_fence(test: &TestServer, admin: &Account) -> Account {
             tokio::time::sleep(Duration::from_millis(ingest_delay)).await;
             let message = message_with("stress", "stress-body");
             let access_token = AccessToken::from_id_maybe_invalid(account_id);
-            server
+            let result = server
                 .email_ingest(IngestEmail {
                     raw_message: message.as_bytes(),
                     message: MessageParser::new().parse(message.as_bytes()),
@@ -585,7 +864,8 @@ async fn stress_the_fence(test: &TestServer, admin: &Account) -> Account {
                     session_id: 0,
                 })
                 .await
-                .map(|_| ())
+                .map(|_| ());
+            (result, BlobHash::generate(message.as_bytes()))
         });
         let server = test.server.clone();
         let writer = tokio::spawn(async move {
@@ -602,7 +882,7 @@ async fn stress_the_fence(test: &TestServer, admin: &Account) -> Account {
             set_marker(&server, id, true).await;
             saw_message
         });
-        let ingested = ingest.await.unwrap();
+        let (ingested, staged) = ingest.await.unwrap();
         let saw_message = writer.await.unwrap();
 
         let stored = message_ids(test, account_id).await;
@@ -622,6 +902,7 @@ async fn stress_the_fence(test: &TestServer, admin: &Account) -> Account {
             }
             Err(err) if err.is_assertion_failure() => {
                 assert!(stored.is_empty(), "run {run}: a lost assertion stored");
+                staged_only.push(staged);
                 outcomes[1] += 1;
             }
             Err(err) if err.value_as_str(trc::Key::Reason) == Some(NO_SERVED_KEY) => {
@@ -661,6 +942,25 @@ async fn stress_the_fence(test: &TestServer, admin: &Account) -> Account {
     );
     if outcomes[1] == 0 {
         println!("stress_the_fence: note: contention never produced a lost assertion");
+    }
+
+    let readable = async |hash: &BlobHash| {
+        test.server
+            .blob_store()
+            .get_blob(hash.as_slice(), 0..usize::MAX)
+            .await
+            .unwrap()
+            .is_some()
+    };
+    for hash in &staged_only {
+        assert!(readable(hash).await, "a lost run staged no blob");
+    }
+    expire_and_purge_blobs(test, admin).await;
+    for hash in &staged_only {
+        assert!(
+            !readable(hash).await,
+            "a lost run's staged blob survived the purge"
+        );
     }
     account
 }

@@ -744,20 +744,40 @@ async fn za_setup_token(
     // The recheck (mail spec 6.1): an ordinary writer that read the record
     // as absent may have committed since the check above; none can commit
     // now. If one did, the pending record this call wrote is removed,
-    // conditional on its bytes (when another write replaced it, it is no
-    // longer ours to remove), and the first check's 409 is the answer. A
+    // conditional on its bytes, and the first check's 409 is the answer. A
     // reissue keeps its record: its marker already makes the account a key
     // account.
     if let Some(response) = za_assert_no_data(server, account_id).await? {
+        // Ours: the revision and the token hash just written (a revision
+        // restarts at 1 after a delete; the hash is random per issuance),
+        // and still no marker in the registry.
         if !has_marker
-            && let Some(written) = server
-                .za_vault_record(account_id)
+            && let Some(written) = server.za_vault_record(account_id).await?.filter(|read| {
+                read.record.revision == record.revision
+                    && read.record.setup_token_hash == record.setup_token_hash
+            })
+            && !za_registry_account(server, account_id)
                 .await?
-                .filter(|read| read.record.revision == record.revision)
-            && let Err(err) = server.za_vault_delete(account_id, &written).await
-            && !err.is_assertion_failure()
+                .is_some_and(|reg| {
+                    reg.account
+                        .password_credential()
+                        .is_some_and(|c| c.secret == ZA_MARKER)
+                })
         {
-            return Err(err);
+            // Residual case: two concurrent issuances plus an unfenced
+            // calendar write can still put the other issuance's marker
+            // between this re-read and the delete.
+            match server.za_vault_delete(account_id, &written).await {
+                Ok(()) => (),
+                Err(err) if err.is_assertion_failure() => {
+                    trc::event!(
+                        Auth(trc::AuthEvent::Warning),
+                        AccountId = account_id,
+                        Details = "zero-access: the aborted issuance's pending record changed before its removal",
+                    );
+                }
+                Err(err) => return Err(err),
+            }
         }
         return Ok(response);
     }

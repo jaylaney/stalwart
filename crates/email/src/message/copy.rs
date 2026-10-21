@@ -27,7 +27,7 @@ use registry::{
     },
     types::map::Map,
 };
-use store::write::{BatchBuilder, IndexPropertyClass, ValueClass, assert::AssertValue};
+use store::write::{BatchBuilder, IndexPropertyClass, ValueClass};
 use store::{
     ValueKey,
     write::{AlignedBytes, Archive},
@@ -36,7 +36,7 @@ use trc::AddContext;
 use types::{
     blob::{BlobClass, BlobId},
     collection::{Collection, SyncCollection},
-    field::{EmailField, PrincipalField},
+    field::EmailField,
     keyword::Keyword,
 };
 use utils::cheeky_hash::CheekyHash;
@@ -256,10 +256,7 @@ impl EmailCopy for Server {
             .caused_by(trc::location!())?;
 
         // Mail spec 6.1, the provisioning fence, as in `email_ingest`.
-        batch
-            .with_collection(Collection::Principal)
-            .with_document(0)
-            .assert_value(PrincipalField::ZeroAccessVault, AssertValue::None);
+        self.za_provisioning_fence(&mut batch, to_account_id);
 
         // Insert and obtain ids
         let change_id = self

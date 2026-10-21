@@ -34,7 +34,7 @@ use registry::{
 };
 use std::future::Future;
 use std::{borrow::Cow, cmp::Ordering, fmt::Write, time::Instant};
-use store::write::{AlignedBytes, Archive, RegistryClass, assert::AssertValue};
+use store::write::{AlignedBytes, Archive, RegistryClass};
 use store::{
     IndexKeyPrefix, IterateParams, SerializeInfallible, U32_LEN, ValueKey,
     ahash::AHashMap,
@@ -48,7 +48,7 @@ use types::{
     blob::{BlobClass, BlobId},
     blob_hash::BlobHash,
     collection::{Collection, SyncCollection},
-    field::{ContactField, EmailField, MailboxField, PrincipalField},
+    field::{ContactField, EmailField, MailboxField},
     id::Id,
     keyword::Keyword,
     special_use::SpecialUse,
@@ -736,13 +736,9 @@ impl EmailIngest for Server {
         }
 
         // Mail spec 6.1, the provisioning fence: an account read as ordinary
-        // takes the message only while it holds no vault record. Last, so no
-        // earlier op inherits the context it selects.
+        // takes the message only while it holds no vault record.
         if !za_key {
-            batch
-                .with_collection(Collection::Principal)
-                .with_document(0)
-                .assert_value(PrincipalField::ZeroAccessVault, AssertValue::None);
+            self.za_provisioning_fence(&mut batch, account_id);
         }
 
         // Insert and obtain ids

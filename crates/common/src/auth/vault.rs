@@ -462,6 +462,22 @@ impl Server {
         Ok(())
     }
 
+    /// Mail spec 6.1, the provisioning fence: appended as the last ops of a
+    /// batch that stores into `account_id` read as an ordinary account, it
+    /// commits the batch only while the account holds no vault record. Last,
+    /// because the context it selects is not restored for later ops. Nothing
+    /// on PostgreSQL or MySQL: key accounts cannot exist there (`setup-token`
+    /// refuses) and the assertion would be no fence.
+    pub fn za_provisioning_fence(&self, batch: &mut BatchBuilder, account_id: u32) {
+        if !self.store().is_pg_or_mysql() {
+            batch
+                .with_account_id(account_id)
+                .with_collection(Collection::Principal)
+                .with_document(0)
+                .assert_value(PrincipalField::ZeroAccessVault, AssertValue::None);
+        }
+    }
+
     /// The invalidation after a committed vault write; a failure is logged,
     /// never returned.
     async fn za_invalidate_committed(&self, account_id: u32) {
