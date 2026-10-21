@@ -10,7 +10,7 @@
 //! login that yields no keys for a key account (OAuth Bearer, master user)
 //! is refused with `NO [NOPERM]` and a fixed text, the connection kept open.
 
-use super::{deliver, key_mail_account, live_keys, message_with};
+use super::{deliver, key_mail_account, live_keys, message_ids, message_with, open_message};
 use crate::{
     utils::{
         imap::{ImapConnection, Type},
@@ -428,7 +428,10 @@ async fn rf_4_password_change_mid_session(test: &TestServer) {
     .expect(200);
     first.send("FETCH 1 (BODY[])").await;
     let before = body_literal(&first.assert_read(Type::Tagged, ResponseType::Ok).await);
-    assert!(before.contains(BODY_CANARY), "{before}");
+    // Task 3 seals the delivery (mail spec 5.2) and the IMAP readers open it
+    // only from Task 5 on, so FETCH reads the stub until then: the canary is
+    // checked below by opening the stored message with the new password.
+    // Task 5 restores `assert!(before.contains(BODY_CANARY))` here.
 
     let mut second = ImapConnection::connect(b"_b ").await;
     let refused = imap_refused(&mut second, NAME, STRONG).await;
@@ -441,6 +444,15 @@ async fn rf_4_password_change_mid_session(test: &TestServer) {
     second.send("FETCH 1 (BODY[])").await;
     let after = body_literal(&second.assert_read(Type::Tagged, ResponseType::Ok).await);
     assert_eq!(after, before, "the new password reads the same bytes");
+    // The `pk`-sealed message opens with the new password's keys: the
+    // private key is unchanged by the password change.
+    let id = test.account(NAME).id().document_id();
+    let document_id = *message_ids(test, id).await.last().unwrap();
+    let (_, raw) = open_message(test, id, NEW, document_id).await;
+    assert!(
+        String::from_utf8_lossy(&raw).contains(BODY_CANARY),
+        "the message opened with the new password"
+    );
 
     za_post(
         "password",

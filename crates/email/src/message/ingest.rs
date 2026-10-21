@@ -10,13 +10,17 @@ use crate::{
     mailbox::{INBOX_ID, JUNK_ID, SENT_ID, TRASH_ID, UidMailbox},
     message::{
         crypto::EncryptionFlags,
-        index::{IndexMessage, extractors::VisitText},
+        index::{IndexMessage, build_message_metadata, extractors::VisitText},
         metadata::{MessageData, MessageMetadata},
+        za::{ingest::za_ingest_wrap, new_dek, seal_mail_blob, seal_mail_envelope, seal_stub},
     },
 };
 use common::{Server, auth::AccessToken};
 use groupware::{
-    calendar::itip::{ItipIngest, ItipIngestError},
+    calendar::{
+        itip::{ItipIngest, ItipIngestError},
+        seal::seal_error,
+    },
     scheduling::{ItipError, ItipMessages},
 };
 use mail_parser::{
@@ -148,6 +152,14 @@ impl EmailIngest for Server {
         let tenant_id = params.access_token.tenant_id();
         let mut raw_message_len = params.raw_message.len() as u64;
         let account = self.account(account_id).await.caused_by(trc::location!())?;
+        // Mail spec 6.1, 6.2: a key account's message is sealed, its key
+        // wrapped as chosen here, before any write.
+        let za_key = account.is_key_account();
+        let za_wrap = if za_key {
+            Some(za_ingest_wrap(self, params.access_token, account_id, params.source).await?)
+        } else {
+            None
+        };
         self.has_available_quota(&account, raw_message_len)
             .await
             .caused_by(trc::location!())?;
@@ -200,12 +212,25 @@ impl EmailIngest for Server {
             message_ids.sort_unstable();
             message_ids.dedup();
 
-            self.find_thread_id(account_id, subject, &message_ids)
-                .await?
+            if za_key {
+                // Mail spec 5.4: no thread lookup and no threading key; the
+                // thread-less arm below gives the message a thread of its
+                // own. The Message-ID stays out of the ingest event.
+                message_id = Some("[redacted]".into());
+                ThreadResult {
+                    thread_id: None,
+                    thread_hash: CheekyHash::NULL,
+                    merge_ids: vec![],
+                    duplicate_ids: vec![],
+                }
+            } else {
+                self.find_thread_id(account_id, subject, &message_ids)
+                    .await?
+            }
         };
 
         // Skip duplicate messages for SMTP ingestion
-        if !thread_result.duplicate_ids.is_empty() && params.source.is_smtp() {
+        if !thread_result.duplicate_ids.is_empty() && params.source.is_smtp() && !za_key {
             // Fetch cached messages
             let cache = self
                 .get_cached_messages(account_id)
@@ -496,6 +521,11 @@ impl EmailIngest for Server {
             _ => false,
         };
 
+        // Mail spec 6.1 step 4: no training sample for a key account.
+        if za_key {
+            train_spam = None;
+        }
+
         // Encrypt message
         let do_encrypt = match params.source {
             IngestSource::Jmap { .. } | IngestSource::Imap { .. } => {
@@ -506,6 +536,8 @@ impl EmailIngest for Server {
             IngestSource::Smtp { .. } => self.core.email.encrypt,
             IngestSource::Restore => false,
         };
+        // Mail spec 6.1 step 5: a key account's message is sealed instead.
+        let do_encrypt = do_encrypt && !za_key;
         let is_encrypted = if do_encrypt
             && !message.is_encrypted()
             && let Some(encrypt_keys) = &account.encryption_key
@@ -563,7 +595,22 @@ impl EmailIngest for Server {
         };
 
         // Store blob
-        let (blob_hash, blob_hold) = if !is_encrypted && let Some(blob_hash) = params.blob_hash {
+        let mut za_sealed = None;
+        let (blob_hash, blob_hold) = if let Some(wrap) = &za_wrap {
+            // Mail spec 5.1, 6.1 step 3: a fresh sealed blob, never the
+            // queue's or the upload's.
+            let dek = new_dek();
+            let envelope = seal_mail_envelope(&dek, wrap.mail_wrap(), account_id)
+                .map_err(|err| seal_error(err, account_id, u32::MAX))?;
+            let sealed = seal_mail_blob(&dek, &envelope, account_id, raw_message.as_ref());
+            let staged = self
+                .put_temporary_blob(account_id, &sealed, 60)
+                .await
+                .map(|(hash, op)| (hash, Some(op)))
+                .caused_by(trc::location!())?;
+            za_sealed = Some((dek, envelope));
+            staged
+        } else if !is_encrypted && let Some(blob_hash) = params.blob_hash {
             (blob_hash.clone(), None)
         } else {
             self.put_temporary_blob(account_id, raw_message.as_ref(), 60)
@@ -632,41 +679,64 @@ impl EmailIngest for Server {
 
         batch
             .with_collection(Collection::Email)
-            .with_document(document_id)
-            .index_message(
-                tenant_id,
-                message,
-                extra_headers.into_bytes(),
-                extra_headers_parsed,
-                blob_hash.clone(),
-                data,
-                params.received_at.unwrap_or_else(now),
+            .with_document(document_id);
+        if let Some((dek, envelope)) = za_sealed {
+            // Mail spec 5.2, 5.4: the full metadata sealed into the stub,
+            // bound to the sealed blob's hash; no threading key.
+            let stub = seal_stub(
+                build_message_metadata(
+                    message,
+                    extra_headers.into_bytes(),
+                    extra_headers_parsed,
+                    blob_hash.clone(),
+                    params.received_at.unwrap_or_else(now),
+                ),
+                &dek,
+                &envelope,
+                account_id,
             )
-            .caused_by(trc::location!())?
-            .set(
-                ValueClass::IndexProperty(IndexPropertyClass::Hash {
-                    property: EmailField::Threading.into(),
-                    hash: thread_result.thread_hash,
-                }),
-                ThreadInfo::serialize(thread_id, &message_ids),
-            )
-            .schedule_task(Task::IndexDocument(TaskIndexDocument {
-                account_id: account_id.into(),
-                document_id: document_id.into(),
-                document_type: IndexDocumentType::Email,
-                status: TaskStatus::now(),
-            }));
+            .map_err(|err| seal_error(err, account_id, document_id))?;
+            batch
+                .index_metadata(tenant_id, stub, data)
+                .caused_by(trc::location!())?;
+        } else {
+            batch
+                .index_message(
+                    tenant_id,
+                    message,
+                    extra_headers.into_bytes(),
+                    extra_headers_parsed,
+                    blob_hash.clone(),
+                    data,
+                    params.received_at.unwrap_or_else(now),
+                )
+                .caused_by(trc::location!())?
+                .set(
+                    ValueClass::IndexProperty(IndexPropertyClass::Hash {
+                        property: EmailField::Threading.into(),
+                        hash: thread_result.thread_hash,
+                    }),
+                    ThreadInfo::serialize(thread_id, &message_ids),
+                );
+        }
+        batch.schedule_task(Task::IndexDocument(TaskIndexDocument {
+            account_id: account_id.into(),
+            document_id: document_id.into(),
+            document_type: IndexDocumentType::Email,
+            status: TaskStatus::now(),
+        }));
 
         if let Some(blob_hold) = blob_hold {
             batch.clear(blob_hold);
         }
 
         // Merge threads if necessary
-        if !thread_result.merge_ids.is_empty()
+        if (!thread_result.merge_ids.is_empty()
             || matches!(
                 params.source,
                 IngestSource::Jmap { .. } | IngestSource::Imap { .. }
-            )
+            ))
+            && !za_key
         {
             batch.schedule_task(Task::MergeThreads(TaskMergeThreads {
                 account_id: account_id.into(),
@@ -881,6 +951,12 @@ impl EmailIngest for Server {
         is_spam: bool,
         span_id: u64,
     ) -> trc::Result<()> {
+        // Mail spec 6.4: no training sample for a key account, whichever
+        // caller (IMAP STORE, COPY and MOVE, Email/set, Email/copy).
+        if self.za_is_key_account(account_id).await? {
+            return Ok(());
+        }
+
         if self.core.spam.classifier.is_some()
             && let Some(archive) = self
                 .store()
