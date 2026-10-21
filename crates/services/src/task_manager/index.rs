@@ -491,11 +491,19 @@ async fn build_email_document(
                 let mut document = IndexDocument::new(SearchIndex::Email)
                     .with_account_id(account_id)
                     .with_document_id(document_id);
-                document.index_unsigned(
-                    EmailSearchField::ReceivedAt,
-                    metadata.rcvd_attach.to_native() & MESSAGE_RECEIVED_MASK,
-                );
-                document.index_unsigned(EmailSearchField::Size, size);
+                // As upstream's `index_document`, only the configured fields.
+                let indexed = |field| {
+                    index_fields.is_empty() || index_fields.contains(&SearchField::Email(field))
+                };
+                if indexed(EmailSearchField::ReceivedAt) {
+                    document.index_unsigned(
+                        EmailSearchField::ReceivedAt,
+                        metadata.rcvd_attach.to_native() & MESSAGE_RECEIVED_MASK,
+                    );
+                }
+                if indexed(EmailSearchField::Size) {
+                    document.index_unsigned(EmailSearchField::Size, size);
+                }
                 return Ok(BuildResult::Document(document));
             }
 

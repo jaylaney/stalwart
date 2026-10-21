@@ -25,7 +25,7 @@ use groupware::calendar::seal::{SealError, seal_error};
 use std::{borrow::Cow, future::Future, sync::Arc};
 use store::{
     Deserialize, Serialize,
-    write::{AlignedBytes, Archive, Archiver},
+    write::{AlignedBytes, Archive, ArchiveVersion, Archiver},
 };
 use trc::AddContext;
 use types::{
@@ -33,7 +33,8 @@ use types::{
     collection::Collection,
 };
 use vault::{keys::Secret, session::SessionKeys};
-use zeroize::Zeroizing;
+/// The opened blob's buffer, for readers outside this crate.
+pub use zeroize::Zeroizing;
 
 /// Mail spec 10: the trace reason of a message whose stub or blob does not
 /// open.
@@ -41,11 +42,11 @@ pub const ZA_REASON_UNREADABLE: &str = "zero-access: unreadable message";
 
 pub trait ZaMailView: Sync + Send {
     /// The keys a read of `account_id`'s mail uses: `Some` when the token
-    /// holds that account's keys, `None` when it is not a key account.
-    /// Otherwise the read is refused, traced as `Security(Unauthorized)`
-    /// with `ZA_TRACE_MAIL_KEYLESS`, with the error every caller writes
-    /// (ruling R22: IMAP `NO [NOPERM]`, POP3 `-ERR`, JMAP `forbidden`, all
-    /// with `ZA_MAIL_KEYLESS`).
+    /// holds that account's keys, `None` only when it is not a key account
+    /// (the view and the opener rely on it). Otherwise the read is refused,
+    /// traced as `Security(Unauthorized)` with `ZA_TRACE_MAIL_KEYLESS`, with
+    /// the error every caller writes (ruling R22: IMAP `NO [NOPERM]`, POP3
+    /// `-ERR`, JMAP `forbidden`, all with `ZA_MAIL_KEYLESS`).
     fn za_mail_keys(
         &self,
         access_token: &AccessToken,
@@ -53,15 +54,23 @@ pub trait ZaMailView: Sync + Send {
     ) -> impl Future<Output = trc::Result<Option<Arc<SessionKeys>>>> + Send;
 
     /// Mail spec 7: the metadata archive a reader uses in place of
-    /// `stored`. A plaintext archive is borrowed as it is; a stub is opened
-    /// with `keys` (the account's private key unwrapped only for a `pk`
-    /// envelope) into an owned archive of the full metadata whose `version`
-    /// is the stored one. A stub without keys is the keyless refusal of
-    /// `za_mail_keys`; one that does not open is unreadable.
+    /// `stored`. `keys` is `za_mail_keys`'s answer for the account, so
+    /// `None` means an ordinary account: the stub check runs only on key
+    /// accounts' archives (spec 5.2, ruling R29), and without keys `stored`
+    /// is borrowed as it is, whatever its first byte. With keys, a
+    /// plaintext archive (spec 6.6) is borrowed too, and a stub is opened
+    /// (the account's private key unwrapped only for a `pk` envelope) into
+    /// an owned archive of the full metadata; one that does not open is
+    /// unreadable. Contract: the result is `Cow::Owned` exactly when the
+    /// stored archive is a stub that was opened, so a reader passes
+    /// `matches!(view, Cow::Owned(_))` to `za_open_message_blob`.
     ///
     /// As `unseal_event_archive`'s view, this one is read-only: it is never
     /// written back, never passed to a write as its current value
     /// (`AssertValue`) and never cached; writes start from the stored stub.
+    /// Unlike the calendar view it does not carry the stored `version`: it
+    /// is `Unversioned`, so passing it to a write as the current value fails
+    /// the archive assertion instead of writing over the stub.
     fn za_metadata_view<'x>(
         &self,
         stored: &'x Archive<AlignedBytes>,
@@ -72,9 +81,11 @@ pub trait ZaMailView: Sync + Send {
 
     /// Mail spec 7: the message blob a reader uses in place of `bytes`, the
     /// blob read for a message whose stored archive is a stub
-    /// (`stored_is_stub`; a plaintext message's blob is returned as read).
-    /// The opened plaintext is moved into the returned buffer, which the
-    /// reader holds for the request as it holds a plaintext blob.
+    /// (`stored_is_stub`, the view's `Cow::Owned`), opened with `keys`
+    /// (`za_mail_keys`'s answer, as for the view). A plaintext message's
+    /// blob, or any blob read without keys, is returned as read. Either way
+    /// the bytes are held in a `Zeroizing` buffer for the request; a reader
+    /// takes the inner value only where the bytes leave the server.
     fn za_open_message_blob(
         &self,
         stored_is_stub: bool,
@@ -82,7 +93,7 @@ pub trait ZaMailView: Sync + Send {
         account_id: u32,
         document_id: u32,
         bytes: Vec<u8>,
-    ) -> impl Future<Output = trc::Result<Vec<u8>>> + Send;
+    ) -> impl Future<Output = trc::Result<Zeroizing<Vec<u8>>>> + Send;
 
     /// Mail spec 5.7: whether `blob_id` is a sealed source, by its owning
     /// account and class, not by the session asking: a key account's
@@ -120,13 +131,15 @@ impl ZaMailView for Server {
         account_id: u32,
         document_id: u32,
     ) -> trc::Result<Cow<'x, Archive<AlignedBytes>>> {
+        let Some(keys) = keys else {
+            return Ok(Cow::Borrowed(stored));
+        };
         let stub = stored
             .unarchive::<MessageMetadata>()
             .caused_by(trc::location!())?;
         if !is_stub(stub) {
             return Ok(Cow::Borrowed(stored));
         }
-        let keys = keys.ok_or_else(|| za_keyless(account_id))?;
         let private_key = if stub_needs_private_key(stub)
             .map_err(|err| za_unreadable(err, account_id, document_id))?
         {
@@ -144,11 +157,10 @@ impl ZaMailView for Server {
         account_id: u32,
         document_id: u32,
         bytes: Vec<u8>,
-    ) -> trc::Result<Vec<u8>> {
-        if !stored_is_stub {
-            return Ok(bytes);
-        }
-        let keys = keys.ok_or_else(|| za_keyless(account_id))?;
+    ) -> trc::Result<Zeroizing<Vec<u8>>> {
+        let (true, Some(keys)) = (stored_is_stub, keys) else {
+            return Ok(Zeroizing::new(bytes));
+        };
         let private_key = if blob_needs_private_key(&bytes)
             .map_err(|err| za_unreadable(err, account_id, document_id))?
         {
@@ -156,9 +168,8 @@ impl ZaMailView for Server {
         } else {
             None
         };
-        let mut opened = open_mail_blob(&bytes, keys, private_key, account_id)
-            .map_err(|err| za_unreadable(err, account_id, document_id))?;
-        Ok(std::mem::take(&mut *opened))
+        open_mail_blob(&bytes, keys, private_key, account_id)
+            .map_err(|err| za_unreadable(err, account_id, document_id))
     }
 
     async fn za_is_sealed_source(&self, blob_id: &BlobId) -> trc::Result<bool> {
@@ -178,8 +189,8 @@ impl ZaMailView for Server {
 
 /// Mail spec 5.2, 7: the stub `stored` opened into the view's archive: the
 /// full metadata, serialized as `index_message` serializes it and read back
-/// as the store reads an archive, with the stored `version`. Errors name the
-/// message only (`za_unreadable`), never its content.
+/// as the store reads an archive, `Unversioned` (see `za_metadata_view`).
+/// Errors name the message only (`za_unreadable`), never its content.
 pub fn za_open_stub_archive(
     stored: &Archive<AlignedBytes>,
     keys: &SessionKeys,
@@ -192,6 +203,8 @@ pub fn za_open_stub_archive(
         .unarchive::<MessageMetadata>()
         .caused_by(trc::location!())?;
     let metadata = open_stub(stub, keys, private_key, account_id).map_err(unreadable)?;
+    // Only the intermediate serialized buffer is zeroized; the decoded
+    // metadata and the view's own bytes are not.
     let bytes = Zeroizing::new(
         Archiver::new(metadata)
             .serialize()
@@ -199,7 +212,12 @@ pub fn za_open_stub_archive(
     );
     let mut view = <Archive<AlignedBytes> as Deserialize>::deserialize(&bytes)
         .map_err(|_| unreadable(SealError::Format))?;
-    view.version = stored.version;
+    view.version = ArchiveVersion::Unversioned;
+    // An unversioned archive is read with a checked access, whose error
+    // would quote the bytes: check it here, under the fixed error, so the
+    // reader's own access cannot fail.
+    view.unarchive::<MessageMetadata>()
+        .map_err(|_| unreadable(SealError::Format))?;
     Ok(view)
 }
 
@@ -357,9 +375,23 @@ mod tests {
             let envelope = seal_mail_envelope(&dek, MailWrap::Session(&keys), 7).unwrap();
             let stored = archive(seal_stub(full_metadata(raw), &dek, &envelope, 7).unwrap());
             let view = za_open_stub_archive(&stored, &keys, None, 7, 1).unwrap();
-            assert_eq!(view.version, stored.version, "message {index}");
+            assert_eq!(
+                view.version,
+                ArchiveVersion::Unversioned,
+                "message {index}: the view never matches the stub's version"
+            );
+            // The opened metadata is the full metadata, every field (preview,
+            // headers, body lists, `rcvd_attach`, contents): the same rkyv
+            // bytes.
+            assert_eq!(
+                view.as_bytes(),
+                full.as_bytes(),
+                "message {index}: the opened metadata"
+            );
+            assert_ne!(stored.as_bytes(), full.as_bytes());
             let view = view.unarchive::<MessageMetadata>().unwrap();
             let full = full.unarchive::<MessageMetadata>().unwrap();
+            assert!(!full.raw_headers.is_empty() && !full.contents[0].parts.is_empty());
 
             let message = reconstruct(view, raw);
             assert_eq!(

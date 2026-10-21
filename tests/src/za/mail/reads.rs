@@ -33,7 +33,7 @@ use base64::{
 };
 use common::{
     auth::AccessToken,
-    za::{ZA_MAIL_KEYLESS, ZA_MAIL_UNREADABLE},
+    za::{ZA_MAIL_KEYLESS, ZA_MAIL_UNREADABLE, test_hooks},
 };
 use email::{
     mailbox::{DRAFTS_ID, SENT_ID},
@@ -49,7 +49,10 @@ use jmap_proto::object::push_subscription::EmailPushProperty;
 use pop3::protocol::response::SerializeResponse as Pop3Response;
 use serde_json::{Value, json};
 use services::state_manager::email_push::build_email_push_object;
-use std::time::{Duration, Instant};
+use std::{
+    borrow::Cow,
+    time::{Duration, Instant},
+};
 use store::{Serialize, write::Archiver};
 use tokio::sync::mpsc;
 use trc::{
@@ -109,8 +112,10 @@ pub async fn test(test: &mut TestServer) {
     offsets_round_trip(&key, &plain).await;
     pop3_retr_and_top(&key, &plain).await;
     keyless_reads_are_refused(test, &key, corpus_doc).await;
+    content_free_reads_open_nothing(test, &key).await;
     corrupted_stub_and_blob(test, &key).await;
     legacy_plaintext_is_served_as_plaintext(test, &key, corpus_doc).await;
+    plain_header_block_with_the_format_byte(test, &plain).await;
     clear_messages(&key).await;
     threads_are_singletons(test, &key).await;
     submission_strips_bcc(test, &key, &plain, &bcc).await;
@@ -365,6 +370,64 @@ async fn offsets_round_trip(key: &Account, plain: &Account) {
         let whole = String::from_utf8(whole)
             .unwrap()
             .replace(account.name(), RCPT);
+        // Blob/get and Email/parse read through `blob_download` too.
+        let (message_blob, section_blob) = (&email["blobId"], &attachment["blobId"]);
+        let blobs = account
+            .jmap_method_call(
+                "Blob/get",
+                json!({
+                    "accountId": account.id_string(),
+                    "ids": [message_blob, section_blob],
+                    "properties": ["data:asBase64", "size"],
+                }),
+            )
+            .await;
+        let blob_data = |id: &Value| {
+            let blob = blobs
+                .list()
+                .iter()
+                .find(|blob| &blob["id"] == id)
+                .unwrap_or_else(|| panic!("Blob/get lacks {id}: {:?}", blobs.0));
+            STANDARD
+                .decode(blob["data:asBase64"].as_str().unwrap())
+                .unwrap()
+        };
+        assert_eq!(
+            blob_data(section_blob),
+            ATTACHMENT,
+            "{}: Blob/get of the section",
+            account.name()
+        );
+        let blob_whole = String::from_utf8(blob_data(message_blob))
+            .unwrap()
+            .replace(account.name(), RCPT);
+        assert_eq!(
+            blob_whole,
+            whole,
+            "{}: Blob/get of the message",
+            account.name()
+        );
+        let parsed = account
+            .jmap_method_call(
+                "Email/parse",
+                json!({
+                    "accountId": account.id_string(),
+                    "blobIds": [message_blob],
+                    "properties": [
+                        "subject", "from", "headers", "bodyValues", "textBody",
+                        "attachments", "preview", "size", "hasAttachment"
+                    ],
+                    "fetchAllBodyValues": true,
+                }),
+            )
+            .await;
+        let parsed = parsed
+            .pointer(&format!(
+                "/methodResponses/0/1/parsed/{}",
+                message_blob.as_str().unwrap()
+            ))
+            .unwrap_or_else(|| panic!("Email/parse: {:?}", parsed.0))
+            .clone();
         // Until Task 8 refuses a key account's term searches (spec 8).
         let snippets = account
             .jmap_method_call(
@@ -418,12 +481,15 @@ async fn offsets_round_trip(key: &Account, plain: &Account) {
             normalize_json(email, account.name()),
             whole,
             snippet,
+            normalize_json(parsed, account.name()),
         ));
     }
 
-    let (key_fetched, key_email, key_whole, key_snippet) = &answers[0];
-    let (plain_fetched, plain_email, plain_whole, plain_snippet) = &answers[1];
+    let (key_fetched, key_email, key_whole, key_snippet, key_parsed) = &answers[0];
+    let (plain_fetched, plain_email, plain_whole, plain_snippet, plain_parsed) = &answers[1];
     assert_eq!(key_snippet, plain_snippet, "SearchSnippet/get");
+    assert_eq!(key_parsed, plain_parsed, "Email/parse");
+    assert_eq!(key_parsed["subject"], "reads corpus", "{key_parsed}");
     for (attribute, (key, plain)) in FETCH_ATTRIBUTES
         .iter()
         .zip(key_fetched.iter().zip(plain_fetched))
@@ -508,8 +574,7 @@ async fn pop3_retr_and_top(key: &Account, plain: &Account) {
 /// Mail spec 10, ruling R22: a read of a key account's mail by a token
 /// without its keys (an OAuth Bearer token) is refused with the error every
 /// protocol writes, `ZA_MAIL_KEYLESS` as JMAP `forbidden`, IMAP
-/// `NO [NOPERM]` and POP3 `-ERR`; the view and the opener refuse a stub
-/// without keys alike.
+/// `NO [NOPERM]` and POP3 `-ERR`.
 async fn keyless_reads_are_refused(test: &TestServer, key: &Account, corpus_doc: u32) {
     println!("keyless_reads_are_refused");
     let key_id = key.id().document_id();
@@ -583,22 +648,142 @@ async fn keyless_reads_are_refused(test: &TestServer, key: &Account, corpus_doc:
         format!("-ERR {ZA_MAIL_KEYLESS}\r\n"),
         "the POP3 answer"
     );
+    assert!(
+        err.matches(EventType::Jmap(trc::JmapEvent::Forbidden)),
+        "{err:?}"
+    );
+    // Ruling R29: the refusal is `za_mail_keys`'s; without keys (an
+    // ordinary account's read) the view and the opener pass the stored
+    // archive and bytes through, even a stub's.
+    assert!(is_stub(stored.unarchive::<MessageMetadata>().unwrap()));
     let view = test
         .server
         .za_metadata_view(&stored, None, key_id, corpus_doc)
-        .await;
+        .await
+        .unwrap();
+    assert!(
+        matches!(&view, Cow::Borrowed(borrowed) if std::ptr::eq(*borrowed, &stored)),
+        "the stored archive, borrowed"
+    );
     let blob = test
         .server
-        .za_open_message_blob(true, None, key_id, corpus_doc, vec![1])
-        .await;
-    for err in [view.map(|_| ()), blob.map(|_| ())] {
-        let err = err.unwrap_err();
+        .za_open_message_blob(true, None, key_id, corpus_doc, vec![1, 2, 3])
+        .await
+        .unwrap();
+    assert_eq!(blob.as_slice(), [1, 2, 3], "the bytes as read");
+}
+
+/// Ruling R29 (spec 5.2): the stub check runs only on key accounts'
+/// archives. An ordinary account's message whose header block starts with
+/// the format byte reads as a stub by the discriminator, yet is served as
+/// plaintext, not refused.
+async fn plain_header_block_with_the_format_byte(test: &TestServer, plain: &Account) {
+    println!("plain_header_block_with_the_format_byte");
+    let plain_id = plain.id().document_id();
+    let crafted = format!(
+        "\u{1}X-Crafted: format byte\r\n{}",
+        message_with("crafted plain", "crafted body canary")
+    );
+    let document_id = plant_plain_message(test, plain_id, &crafted).await;
+    test.wait_for_tasks().await;
+    let archive = stored_metadata(test, plain_id, document_id).await;
+    assert!(
+        is_stub(archive.unarchive::<MessageMetadata>().unwrap()),
+        "the planted header block does not start with the format byte"
+    );
+
+    let mut imap = imap_session(plain, b"_p ").await;
+    let fetched = imap_answer(&mut imap, "FETCH * (BODY[])").await;
+    assert!(
+        fetched.contains("crafted body canary") && fetched.contains(&crafted),
+        "{fetched}"
+    );
+    imap.send_ok("LOGOUT").await;
+    let id = Id::from_parts(document_id, document_id).to_string();
+    let (list, not_found) = email_get(
+        plain,
+        Some(vec![id.clone()]),
+        &["id", "subject", "bodyValues"],
+    )
+    .await;
+    assert!(not_found.is_empty(), "{not_found:?}");
+    assert_eq!(list[0]["subject"], "crafted plain", "{list:?}");
+    assert!(
+        list[0]["bodyValues"]
+            .to_string()
+            .contains("crafted body canary"),
+        "{}",
+        list[0]
+    );
+    let destroyed = plain
+        .jmap_destroy("Email", [&id], Vec::<(&str, &str)>::new())
+        .await
+        .destroyed()
+        .count();
+    assert_eq!(destroyed, 1);
+}
+
+/// Review m1: the attributes and properties served from the cache and the
+/// stored stub open nothing: while the account's next private-key unwrap is
+/// armed to fail, a FLAGS-only FETCH and an Email/get of mailboxes,
+/// keywords, arrival time and size still answer; a content read then takes
+/// the armed failure (the positive control).
+async fn content_free_reads_open_nothing(test: &TestServer, key: &Account) {
+    println!("content_free_reads_open_nothing");
+    let key_id = key.id().document_id();
+    // HTTP logins share cached keys; a fresh set has not unwrapped the
+    // private key yet.
+    let fresh_keys = || {
+        test.server.inner.cache.za_keys.remove_account(key_id);
+        test.server.inner.cache.http_auth.clear();
+    };
+
+    let mut imap = imap_session(key, b"_f ").await;
+    test_hooks::set_private_key_fail(Some(key_id));
+    for command in [
+        "UID FETCH 1:* (FLAGS)",
+        "FETCH 1:* (FLAGS UID INTERNALDATE RFC822.SIZE)",
+    ] {
+        let answer = imap_answer(&mut imap, command).await;
         assert!(
-            err.matches(EventType::Jmap(trc::JmapEvent::Forbidden)),
-            "{err:?}"
+            answer.contains("* 1 FETCH (") && answer.contains("FLAGS ("),
+            "{answer}"
         );
-        assert_eq!(err.value_as_str(Key::Details), Some(ZA_MAIL_KEYLESS));
     }
+    imap.send("FETCH 1 (BODY.PEEK[TEXT])").await;
+    let lines = imap.assert_read(Type::Tagged, ResponseType::No).await;
+    assert_eq!(
+        lines.last().unwrap(),
+        &format!("_f NO [SERVERBUG] {ZA_MAIL_UNREADABLE}"),
+        "the armed failure was not taken by the content read"
+    );
+    imap.send_ok("LOGOUT").await;
+
+    fresh_keys();
+    test_hooks::set_private_key_fail(Some(key_id));
+    let (list, not_found) = email_get(
+        key,
+        None,
+        &[
+            "id",
+            "threadId",
+            "blobId",
+            "mailboxIds",
+            "keywords",
+            "receivedAt",
+            "size",
+        ],
+    )
+    .await;
+    assert!(not_found.is_empty() && list.len() == 1, "{list:?}");
+    let id = list[0]["id"].as_str().unwrap().to_string();
+    let (list, not_found) = email_get(key, Some(vec![id.clone()]), &["id", "preview"]).await;
+    assert!(
+        list.is_empty() && not_found == [id],
+        "the armed failure was not taken by the content read: {list:?}"
+    );
+    test_hooks::set_private_key_fail(None);
+    fresh_keys();
 }
 
 /// Mail spec 10: a stub or a blob that does not open fails its own read

@@ -150,8 +150,23 @@ impl EmailGet for Server {
                 break;
             }
         }
-        // Mail spec 7: the account's keys, once for the request.
+        // Mail spec 7: the account's keys, once for the request. Only these
+        // properties are served without the message's content (from the
+        // cache and the stored stub's visible fields, whose blob hash is the
+        // view's); any other opens the stub.
         let keys = self.za_mail_keys(access_token, account_id).await?;
+        let needs_content = !properties.iter().all(|property| {
+            matches!(
+                property,
+                EmailProperty::Id
+                    | EmailProperty::ThreadId
+                    | EmailProperty::BlobId
+                    | EmailProperty::MailboxIds
+                    | EmailProperty::Keywords
+                    | EmailProperty::Size
+                    | EmailProperty::ReceivedAt
+            )
+        });
 
         for id in ids {
             // Obtain the email object
@@ -175,15 +190,25 @@ impl EmailGet for Server {
                     continue;
                 }
             };
-            // Mail spec 7, 10: the unsealed view; an unreadable message is
-            // not found.
-            let Some(view) = za_readable(
-                self.za_metadata_view(&metadata_, keys.as_deref(), account_id, id.document_id())
+            // Mail spec 7, 10: the unsealed view, when the properties read
+            // content; an unreadable message is not found.
+            let view = if needs_content {
+                let Some(view) = za_readable(
+                    self.za_metadata_view(
+                        &metadata_,
+                        keys.as_deref(),
+                        account_id,
+                        id.document_id(),
+                    )
                     .await,
-            )?
-            else {
-                response.push_not_found(id);
-                continue;
+                )?
+                else {
+                    response.push_not_found(id);
+                    continue;
+                };
+                view
+            } else {
+                Cow::Borrowed(&metadata_)
             };
             let metadata = view
                 .unarchive::<MessageMetadata>()

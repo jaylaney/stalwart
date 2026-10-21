@@ -220,7 +220,7 @@ async fn za_download_message(
     else {
         return Ok(None);
     };
-    let Some(opened) = za_readable(
+    let Some(mut opened) = za_readable(
         server
             .za_open_message_blob(
                 matches!(view, Cow::Owned(_)),
@@ -248,7 +248,8 @@ async fn za_download_message(
                 .to_bytes(),
         ))
     } else {
-        Ok(Some(opened))
+        // The bytes leave in the HTTP body.
+        Ok(Some(std::mem::take(&mut *opened)))
     }
 }
 

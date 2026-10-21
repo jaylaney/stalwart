@@ -364,6 +364,20 @@ impl<T: SessionStream> SessionData<T> {
             .await
             .map_err(|err| err.id(arguments.tag.clone()))?;
         let mut unreadable = false;
+        // Only these attributes are served without the message's content
+        // (from the cache and the stored stub's visible fields); any other
+        // opens the stub.
+        let needs_content = !arguments.attributes.iter().all(|attribute| {
+            matches!(
+                attribute,
+                Attribute::Flags
+                    | Attribute::Uid
+                    | Attribute::InternalDate
+                    | Attribute::Rfc822Size
+                    | Attribute::ModSeq
+                    | Attribute::ObjectId
+            )
+        });
 
         for (seqnum, uid, id) in ids {
             // Obtain attributes and keywords
@@ -392,17 +406,22 @@ impl<T: SessionStream> SessionData<T> {
                 );
                 continue;
             };
-            // Mail spec 7, 10: the unsealed view; an unreadable message is
-            // skipped.
-            let Some(view) = za_readable(
-                self.server
-                    .za_metadata_view(&metadata_, keys.as_deref(), account_id, id)
-                    .await,
-            )
-            .imap_ctx(&arguments.tag, trc::location!())?
-            else {
-                unreadable = true;
-                continue;
+            // Mail spec 7, 10: the unsealed view, when the attributes read
+            // content; an unreadable message is skipped.
+            let view = if needs_content {
+                let Some(view) = za_readable(
+                    self.server
+                        .za_metadata_view(&metadata_, keys.as_deref(), account_id, id)
+                        .await,
+                )
+                .imap_ctx(&arguments.tag, trc::location!())?
+                else {
+                    unreadable = true;
+                    continue;
+                };
+                view
+            } else {
+                Cow::Borrowed(&metadata_)
             };
             let metadata = view
                 .unarchive::<MessageMetadata>()

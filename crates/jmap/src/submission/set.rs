@@ -16,7 +16,7 @@ use email::{
     identity::Identity,
     message::{
         metadata::{ArchivedMetadataHeaderName, ArchivedMetadataHeaderValue, MessageMetadata},
-        za::view::{ZaMailView, za_readable},
+        za::view::{ZaMailView, Zeroizing, za_readable},
     },
     submission::{Address, Delivered, DeliveryStatus, EmailSubmission, UndoStatus},
 };
@@ -707,7 +707,7 @@ impl EmailSubmissionSet for Server {
             let range = bcc_header.name_value_range();
             new_message.extend_from_slice(&message[..range.start]);
             new_message.extend_from_slice(&message[range.end..]);
-            message = new_message;
+            message = Zeroizing::new(new_message);
         }
 
         // Begin local SMTP session
@@ -750,7 +750,8 @@ impl EmailSubmissionSet for Server {
 
             // DATA
             if has_success {
-                session.data.message = message;
+                // The bytes leave for the queue (mail spec 6.5).
+                session.data.message = std::mem::take(&mut *message);
                 let response = session.queue_message().await;
                 if let smtp::core::State::Accepted(queue_id) = session.state {
                     Ok((responses, Some(queue_id)))
