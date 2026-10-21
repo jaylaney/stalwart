@@ -218,6 +218,14 @@ impl<T: SessionStream> SessionData<T> {
                 Some(keys) => token.with_session_keys(keys.clone()),
                 None => token,
             })
+            // Mail ruling R35: and an impersonated session stays one.
+            .map(|token| {
+                if self.access_token.za_is_impersonated() {
+                    token.with_za_impersonation()
+                } else {
+                    token
+                }
+            })
     }
 
     /// Mail spec 3.3: whether this session holds its account's keys.

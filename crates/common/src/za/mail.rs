@@ -109,17 +109,19 @@ impl Server {
         }
     }
 
-    /// Mail spec 6.3, ruling R34: whether `account_id` is a key account other
-    /// than the token's own. Its mail is reached only by its own sessions,
-    /// whatever route another token holds: a grant made before provisioning,
-    /// a group's grant, impersonation, a token cached or kept by a WebSocket
-    /// from before.
+    /// Mail spec 6.3, rulings R34 and R35: whether `account_id` is a key
+    /// account the token does not own. Its mail is reached only by its own
+    /// sessions, whatever route another token holds: a grant made before
+    /// provisioning, a group's grant, a token cached or kept by a WebSocket
+    /// from before, and impersonation, whose token names the account but is
+    /// not its owner's (`za_is_impersonated`).
     pub async fn za_foreign_key_account(
         &self,
         access_token: &AccessToken,
         account_id: u32,
     ) -> trc::Result<bool> {
-        Ok(!access_token.is_account_id(account_id) && self.za_is_key_account(account_id).await?)
+        let is_owner = access_token.is_account_id(account_id) && !access_token.za_is_impersonated();
+        Ok(!is_owner && self.za_is_key_account(account_id).await?)
     }
 
     /// Mail spec 6.3, ruling R34: refuses a mail access to a foreign key

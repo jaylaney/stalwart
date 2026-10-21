@@ -57,6 +57,9 @@ const OWNER: &str = "plainmail10@example.com";
 const GROUP_OWNER: &str = "plainmail11@example.com";
 const MEMBER: &str = "plainmail12@example.com";
 const GROUP: &str = "mailgroup1@example.com";
+/// `impersonated_session_is_foreign`'s account: a master-user session opens
+/// while it is plain, then it is provisioned.
+const IMPERSONATED: &str = "plainmail13@example.com";
 const SENDER: &str = "sender@example.org";
 /// In every message of the key accounts; no answer to another session and
 /// no trace carries it.
@@ -109,12 +112,14 @@ pub async fn test(test: &mut TestServer) {
 
     keyless_tokens_hit_the_dispatcher_gate(test, &key).await;
     impersonation_is_refused(&admin, &key, &plain).await;
+    master_user_login_is_foreign(&admin, &key, &plain).await;
     cross_account_copies_are_refused(test, &key, &plain, &other_plain).await;
     sharing_is_refused_on_key_mailboxes(&key, &plain).await;
     let stale = rf_2_stale_grant(test, &admin, &plain, &other_plain).await;
     revocation_is_allowed(&stale, &other_plain).await;
     let (group, shared, member) = group_member_stale_token(test, &admin).await;
     let owner = owner_stale_keyless_session(test, &admin).await;
+    let impersonated = impersonated_session_is_foreign(test, &admin).await;
 
     for account in [
         &key,
@@ -125,6 +130,7 @@ pub async fn test(test: &mut TestServer) {
         &shared,
         &member,
         &owner,
+        &impersonated,
     ] {
         test.destroy_all_mailboxes(account).await;
     }
@@ -1012,6 +1018,14 @@ async fn rf_2_stale_grant(
             .is_some(),
         "control: the drafts share"
     );
+    // A grantee WebSocket opened while the account is plain keeps its
+    // upgrade-time token.
+    let mut socket = Keyless::WebSocket(ws_connect(PLAIN, STRONG).await);
+    assert_eq!(
+        socket.call(plain, "Mailbox/get", mailbox_get.clone()).await[0],
+        "Mailbox/get",
+        "control: the share over the WebSocket before provisioning"
+    );
 
     provision(test, admin, &mut stale).await;
     deliver(
@@ -1030,8 +1044,29 @@ async fn rf_2_stale_grant(
     // Ruling R11: the session selected before provisioning reaches the
     // message and is refused (ruling R34's rule, before the stub opens).
     assert_imap_refused(&mut imap, "FETCH 1 (BODY[])").await;
-    for command in ["STORE 1 +FLAGS (\\Seen)", "EXPUNGE", "FETCH 1 (FLAGS)"] {
+    for command in [
+        "STORE 1 +FLAGS (\\Seen)",
+        "EXPUNGE",
+        "FETCH 1 (FLAGS)",
+        "SEARCH ALL",
+        "SORT (DATE) UTF-8 ALL",
+    ] {
         assert_imap_refused(&mut imap, command).await;
+    }
+    for (method, args) in [
+        ("Mailbox/get", mailbox_get.clone()),
+        (
+            "Email/query",
+            json!({ "accountId": stale.id_string(), "filter": { "inMailbox": inbox() } }),
+        ),
+    ] {
+        assert_refused(
+            &socket.call(plain, method, args).await,
+            &format!("{method} over the grantee's WebSocket"),
+        );
+    }
+    if let Keyless::WebSocket(socket) = socket {
+        ws_close(socket).await;
     }
     // The share is gone from the grantee's listing (ruling R34's listing,
     // the filter in `build_access_token` and the token rebuilt by ruling R5).
@@ -1041,7 +1076,9 @@ async fn rf_2_stale_grant(
         .assert_not_contains(STALE);
 
     // The owner changes its mail while the grantee session waits: NOOP and
-    // IDLE complete without an update.
+    // IDLE complete without an update of the owner's mailbox. The IDLE is
+    // woken by a delivery to the grantee itself (IDLE follows the grantee's
+    // own accounts), so it syncs, and reports only the grantee's inbox.
     let mut keyed = ImapConnection::connect(b"_m ").await;
     keyed.authenticate(STALE, STRONG).await;
     keyed.send_ok("SELECT INBOX").await;
@@ -1066,10 +1103,32 @@ async fn rf_2_stale_grant(
         &message_with(&format!("{CANARY} third"), "third canary"),
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    deliver(
+        test,
+        SENDER,
+        PLAIN,
+        &message_with("gates idle wake", "gates idle wake body"),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
     imap.send_untagged("DONE").await;
     let lines = imap.assert_read(Type::Tagged, ResponseType::Ok).await;
-    assert_eq!(lines.len(), 1, "an update during IDLE: {lines:?}");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("* STATUS") && line.contains("INBOX")),
+        "the IDLE did not wake on the grantee's own delivery: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|line| {
+            line.contains("EXISTS")
+                || line.contains("FETCH")
+                || line.contains("EXPUNGE")
+                || line.contains("VANISHED")
+                || line.contains(STALE)
+        }),
+        "an update of the owner's mailbox during IDLE: {lines:?}"
+    );
     keyed.send_ok("LOGOUT").await;
 
     imap.send(&format!("SELECT \"{shared_name}\"")).await;
@@ -1297,6 +1356,18 @@ async fn group_member_stale_token(
                 "destroy": [Id::from_parts(shared_doc, shared_doc).to_string()]
             }),
         ),
+        (
+            "Thread/get",
+            json!({ "accountId": shared.id_string(), "ids": [Id::from(shared_doc).to_string()] }),
+        ),
+        (
+            "Mailbox/set",
+            json!({ "accountId": shared.id_string(), "update": { inbox(): { "sortOrder": 7 } } }),
+        ),
+        (
+            "Mailbox/set",
+            json!({ "accountId": shared.id_string(), "destroy": [Id::from(DRAFTS_ID).to_string()] }),
+        ),
     ] {
         assert_refused(
             first(&member.jmap_method_call(method, args).await),
@@ -1366,4 +1437,152 @@ async fn owner_stale_keyless_session(test: &mut TestServer, admin: &Account) -> 
     assert_imap_refused(&mut imap, "FETCH 1 (BODY[])").await;
     imap.send_ok("LOGOUT").await;
     owner
+}
+
+/// A method call with Basic credentials `user` and `secret` (a master-user
+/// login, `account%master`); its first response.
+async fn basic_call(base: &Account, user: &str, secret: &str, method: &str, args: Value) -> Value {
+    let reply: Value = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap()
+        .post(base.api_url())
+        .basic_auth(user, Some(secret))
+        .body(json!({ "using": USING, "methodCalls": [[method, args, "c0"]] }).to_string())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    reply["methodResponses"][0].clone()
+}
+
+/// Ruling R35: a master-user login (`keymail8%admin` with the admin's
+/// password) yields a token that names the key account but is not its
+/// owner's: Mailbox/get, Email/query and Email/set destroy are refused with
+/// the keyless refusal and trace, and nothing is destroyed. The same login
+/// form for a plain account works, and the owner's own credential is not
+/// marked by the impersonation's.
+async fn master_user_login_is_foreign(admin: &Account, key: &Account, plain: &Account) {
+    println!("master_user_login_is_foreign");
+    let key_id = key.id().document_id();
+    let account = key.id_string();
+    let email_id = emails(key).await[0]["id"].as_str().unwrap().to_string();
+    let master = format!("{KEY}%{}", admin.name());
+    let traced = Traced::start(&[EventType::Security(SecurityEvent::Unauthorized)]);
+    for (method, args) in [
+        ("Mailbox/get", json!({ "accountId": account, "ids": null })),
+        (
+            "Email/query",
+            json!({ "accountId": account, "filter": { "inMailbox": inbox() } }),
+        ),
+        (
+            "Email/set",
+            json!({ "accountId": account, "destroy": [&email_id] }),
+        ),
+    ] {
+        assert_refused(
+            &basic_call(key, &master, admin.secret(), method, args).await,
+            &format!("{method} by a master-user login"),
+        );
+    }
+    let refused = traced
+        .finish()
+        .await
+        .into_iter()
+        .filter(|e| e.details == KEYLESS_REFUSED)
+        .map(|e| e.account_id)
+        .collect::<Vec<_>>();
+    assert_eq!(refused, vec![Some(u64::from(key_id)); 3], "the refusals");
+    assert_eq!(
+        emails(key).await.len(),
+        1,
+        "the refused destroy removed the message"
+    );
+
+    // The controls: the same login form for a plain account, twice (the
+    // second request is served from the HTTP authentication cache), and
+    // the owner's own credential.
+    let plain_master = format!("{PLAIN}%{}", admin.name());
+    for _ in 0..2 {
+        assert_eq!(
+            basic_call(
+                plain,
+                &plain_master,
+                admin.secret(),
+                "Mailbox/get",
+                json!({ "accountId": plain.id_string(), "ids": null }),
+            )
+            .await[0],
+            "Mailbox/get",
+            "control: a master-user login of a plain account"
+        );
+    }
+    assert_eq!(
+        first(
+            &key.jmap_method_call("Mailbox/get", json!({ "accountId": account, "ids": null }))
+                .await
+        )[0],
+        "Mailbox/get",
+        "control: the owner's own credential"
+    );
+}
+
+/// Ruling R35: an IMAP master-user session opened while the account was
+/// plain is not the owner's once the account is provisioned: STORE and a
+/// flag FETCH answer `NO [NOPERM]`, and its NOOP completes without an
+/// update of the owner's flag change. Returns the provisioned account.
+async fn impersonated_session_is_foreign(test: &mut TestServer, admin: &Account) -> Account {
+    println!("impersonated_session_is_foreign");
+    let mut account = admin
+        .create_user_account(
+            IMPERSONATED,
+            STRONG,
+            "Impersonated",
+            &[],
+            user_permissions(),
+        )
+        .await;
+    let account_id = account.id().document_id();
+    let mut imap = ImapConnection::connect(b"_i ").await;
+    imap.authenticate(&format!("{IMPERSONATED}%{}", admin.name()), admin.secret())
+        .await;
+    imap.send_ok("SELECT INBOX").await;
+
+    provision(test, admin, &mut account).await;
+    deliver(
+        test,
+        SENDER,
+        IMPERSONATED,
+        &message_with(&format!("{CANARY} impersonated"), "impersonated canary"),
+    )
+    .await;
+    let mut keyed = ImapConnection::connect(b"_y ").await;
+    keyed.authenticate(IMPERSONATED, STRONG).await;
+    keyed.send_ok("SELECT INBOX").await;
+    keyed.send_ok("STORE 1 +FLAGS (\\Flagged)").await;
+    keyed.send_ok("LOGOUT").await;
+
+    let traced = Traced::start(&[EventType::Security(SecurityEvent::Unauthorized)]);
+    assert_imap_refused(&mut imap, "STORE 1 +FLAGS (\\Seen)").await;
+    assert_imap_refused(&mut imap, "FETCH 1 (FLAGS)").await;
+    imap.send("NOOP").await;
+    let lines = imap.assert_read(Type::Tagged, ResponseType::Ok).await;
+    assert_eq!(lines.len(), 1, "an update after NOOP: {lines:?}");
+    imap.send_ok("LOGOUT").await;
+    let refused = traced
+        .finish()
+        .await
+        .into_iter()
+        .filter(|e| e.details == KEYLESS_REFUSED)
+        .map(|e| e.account_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        refused,
+        vec![Some(u64::from(account_id)); 2],
+        "the refusals"
+    );
+    account
 }

@@ -424,6 +424,7 @@ impl AccessToken {
             scope_idx,
             inner,
             session_keys: None,
+            za_impersonated: false,
         }
     }
 
@@ -475,6 +476,18 @@ impl AccessToken {
     pub fn without_session_keys(mut self) -> Self {
         self.session_keys = None;
         self
+    }
+
+    /// Mail ruling R35: this copy was obtained by impersonation; the account
+    /// it names is not its holder's (`za_foreign_key_account`).
+    pub fn with_za_impersonation(mut self) -> Self {
+        self.za_impersonated = true;
+        self
+    }
+
+    /// Mail ruling R35: whether this copy was obtained by impersonation.
+    pub fn za_is_impersonated(&self) -> bool {
+        self.za_impersonated
     }
 
     pub fn session_keys(&self) -> Option<&Arc<::vault::session::SessionKeys>> {
@@ -647,6 +660,7 @@ impl AccessToken {
                     scope_idx: access_token.scope_idx,
                     inner: Arc::new(inner),
                     session_keys: access_token.session_keys.take(),
+                    za_impersonated: access_token.za_impersonated,
                 };
             }
 

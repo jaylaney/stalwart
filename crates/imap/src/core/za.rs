@@ -15,7 +15,10 @@ use trc::AddContext;
 
 impl<T: SessionStream> SessionData<T> {
     /// Drops every foreign key account (`za_foreign_key_account`) from the
-    /// session's list, its mailboxes reported as deleted in `changes`.
+    /// session's list, its mailboxes reported as deleted in `changes`. The
+    /// session's own account stays listed (the list's first entry), an
+    /// impersonated key account included: every use of its mailboxes is
+    /// refused (ruling R35).
     pub(crate) async fn za_unlist_key_accounts(
         &self,
         access_token: &AccessToken,
@@ -26,6 +29,7 @@ impl<T: SessionStream> SessionData<T> {
             .lock()
             .iter()
             .map(|account| account.account_id)
+            .filter(|account_id| *account_id != self.account_id)
             .collect::<Vec<_>>();
         for account_id in listed {
             if self

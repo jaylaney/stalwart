@@ -147,6 +147,7 @@ impl Server {
                                 self.access_token(account_id)
                                     .await
                                     .and_then(|token| AccessToken::new(token, req.remote_ip))
+                                    .map(AccessToken::with_za_impersonation)
                             } else {
                                 Err(trc::AuthEvent::Failed
                                     .into_err()
@@ -368,6 +369,7 @@ impl Server {
                         self.access_token(account_id)
                             .await
                             .map(AccessToken::new_maybe_invalid)
+                            .map(AccessToken::with_za_impersonation)
                     } else {
                         Err(trc::AuthEvent::Failed
                             .into_err()

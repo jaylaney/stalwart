@@ -65,6 +65,11 @@ impl<T: SessionStream> SessionData<T> {
                     .code(ResponseCode::TryCreate)
                     .id(arguments.tag));
             };
+        // Mail spec 6.3, rulings R34 and R35: before the write.
+        self.server
+            .za_assert_mail_route(&self.access_token, account_id)
+            .await
+            .map_err(|err| err.id(arguments.tag.clone()))?;
 
         // Delete message
         let access_token = self

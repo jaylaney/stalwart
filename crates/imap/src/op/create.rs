@@ -299,6 +299,12 @@ impl<T: SessionStream> SessionData<T> {
             )
         };
 
+        // Mail spec 6.3, rulings R34 and R35: CREATE, and RENAME's target,
+        // in a key account only through its own sessions.
+        self.server
+            .za_assert_mail_route(&self.access_token, account_id)
+            .await?;
+
         // Validate ACLs
         if let Some(parent_mailbox_id) = parent_mailbox_id {
             if !self

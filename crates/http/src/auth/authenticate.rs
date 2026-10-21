@@ -36,11 +36,15 @@ impl Authenticator for Server {
             if let Some(http_cache) = self.inner.cache.http_auth.get(&fp) {
                 // Make sure the revision is still valid
                 if http_cache.expires > Instant::now() {
-                    let access_token = AccessToken::renew(
+                    let mut access_token = AccessToken::renew(
                         self.access_token(http_cache.account_id).await?,
                         http_cache.credential_id,
                         session.remote_ip,
                     )?;
+                    // Mail ruling R35: an impersonation stays one.
+                    if http_cache.za_impersonated {
+                        access_token = access_token.with_za_impersonation();
+                    }
 
                     if access_token.revision() == http_cache.revision {
                         if http_cache.generation == 0 {
@@ -170,6 +174,7 @@ async fn authenticate_uncached(
                         credential_id: access_token.credential_id(),
                         expires,
                         generation: 0,
+                        za_impersonated: access_token.za_is_impersonated(),
                     },
                 );
 
@@ -219,6 +224,7 @@ async fn authenticate_uncached(
                         credential_id: access_token.credential_id(),
                         expires,
                         generation: keys.generation,
+                        za_impersonated: access_token.za_is_impersonated(),
                     },
                 );
                 server

@@ -72,6 +72,11 @@ impl<T: SessionStream> SessionData<T> {
                     .caused_by(trc::location!()));
             }
         };
+        // Mail spec 6.3, rulings R34 and R35: before the write.
+        self.server
+            .za_assert_mail_route(&self.access_token, account_id)
+            .await
+            .map_err(|err| err.id(tag.clone()))?;
 
         // Verify if mailbox is already subscribed/unsubscribed
         for account in self.mailboxes.lock().iter_mut() {
