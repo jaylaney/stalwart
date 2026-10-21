@@ -1241,6 +1241,18 @@ async fn setup_refuses_a_pending_unindex(test: &TestServer, admin: &Account) -> 
         metadata_archive(test, id, ids[0]).await.is_some(),
         "the metadata archive was removed before the unindex task ran"
     );
+    // Ruling R51 would refuse on the message's search document too: it is
+    // removed here, ahead of the held unindex task, so field 71 alone
+    // carries the refusal (R46's pin on the internal search store).
+    let mut query = SearchQuery::new(SearchIndex::Email);
+    query
+        .add_filter(SearchFilter::eq(SearchField::AccountId, id))
+        .add_filter(SearchFilter::eq(SearchField::DocumentId, ids[0]));
+    test.server.search_store().unindex(query).await.unwrap();
+    assert!(
+        !test.server.za_has_email_search_documents(id).await.unwrap(),
+        "the message's search document is still stored"
+    );
     let reply = za_post_as(admin, "setup-token", &json!({ "account": PENDING_UNINDEX })).await;
     assert_eq!(
         reply.expect(409)["error"],

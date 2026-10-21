@@ -911,7 +911,9 @@ async fn za_assert_no_data(server: &Server, account_id: u32) -> trc::Result<Opti
         )));
     }
     // Mail ruling R51: an Email search document of the account outlived its
-    // message (internal search store only; an external one is not checked).
+    // message. Internal search store only: any search store other than the
+    // internal one (ElasticSearch, MeiliSearch, or a PostgreSQL or MySQL
+    // search store) is not checked, a recorded limit.
     if server.za_has_email_search_documents(account_id).await? {
         return Ok(Some(conflict("account already holds mail")));
     }

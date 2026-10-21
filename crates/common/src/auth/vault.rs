@@ -696,8 +696,9 @@ impl Server {
     /// Mail ruling R51: true when the internal search store holds an Email
     /// document of the account. Each indexed document has one `Document`
     /// key, the ground truth there; the unindex task deletes it in a write
-    /// after the one that clears the metadata archive. An external search
-    /// store (ElasticSearch, MeiliSearch) is not checked, a recorded limit.
+    /// after the one that clears the metadata archive. Any search store
+    /// other than the internal one (ElasticSearch, MeiliSearch, or a
+    /// PostgreSQL or MySQL search store) is not checked, a recorded limit.
     pub async fn za_has_email_search_documents(&self, account_id: u32) -> trc::Result<bool> {
         let Some(store) = self.search_store().internal_fts() else {
             return Ok(false);
