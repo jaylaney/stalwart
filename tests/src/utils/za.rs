@@ -25,7 +25,10 @@ use common::{
 use email::{
     cache::MessageCacheFetch,
     mailbox::{INBOX_ID, UidMailbox},
-    message::{index::build_message_metadata, ingest::EmailIngest, metadata::MessageData},
+    message::{
+        ingest::EmailIngest,
+        metadata::{MessageData, MessageMetadata},
+    },
 };
 use groupware::{
     cache::GroupwareCache,
@@ -552,7 +555,7 @@ pub async fn plant_plain_message(test: &TestServer, account_id: u32, raw: &str) 
         .unwrap();
     let document_id = ids.next().unwrap();
     let uid = ids.next().unwrap();
-    let metadata = build_message_metadata(
+    let metadata = MessageMetadata::build(
         MessageParser::new().parse(raw.as_bytes()).unwrap(),
         Vec::new(),
         Vec::new(),

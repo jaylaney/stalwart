@@ -16,8 +16,6 @@ pub mod extractors;
 pub mod metadata;
 pub mod search;
 
-pub use metadata::build_message_metadata;
-
 pub(super) const MAX_MESSAGE_PARTS: usize = 1000;
 pub const PREVIEW_LENGTH: usize = 256;
 

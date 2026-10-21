@@ -408,7 +408,6 @@ fn za_keyless(account_id: u32) -> trc::Error {
 mod tests {
     use super::*;
     use crate::message::{
-        index::build_message_metadata,
         metadata::ArchivedMessageMetadata,
         za::{MailWrap, new_dek, seal_mail_envelope, seal_stub},
     };
@@ -477,7 +476,7 @@ mod tests {
             offset_start: 13,
             offset_end: DELIVERED_TO.len() as u32,
         };
-        build_message_metadata(
+        MessageMetadata::build(
             message,
             DELIVERED_TO.to_vec(),
             vec![delivered_to],

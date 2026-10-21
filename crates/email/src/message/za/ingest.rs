@@ -13,9 +13,9 @@ use super::{
     MailWrap, new_dek, seal_mail_blob, seal_mail_envelope, seal_stub, view::za_sealing_error,
 };
 use crate::message::{
-    index::{IndexMessage, build_message_metadata},
+    index::IndexMessage,
     ingest::IngestSource,
-    metadata::MessageData,
+    metadata::{MessageData, MessageMetadata},
 };
 use common::{
     Server,
@@ -176,7 +176,7 @@ pub fn za_index_stub<'x>(
         blob_hash,
     } = sealed;
     let stub = seal_stub(
-        build_message_metadata(
+        MessageMetadata::build(
             message,
             extra_headers,
             extra_headers_parsed,
