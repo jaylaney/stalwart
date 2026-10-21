@@ -549,6 +549,11 @@ impl<T: SessionStream> Session<T> {
                             thread_name(parsed_message.subject().unwrap_or_default()).to_string(),
                         )
                     });
+                    // Mail spec 6.1 step 4: no autolearn sample, which stores
+                    // the subject and the message, for a key-account recipient.
+                    if self.data.za_key_rcpt {
+                        train_spam = None;
+                    }
                     let scores = &self.server.core.spam.scores;
                     spam_result = Some((score.score, scores.spam_percentage(score.score)));
 
@@ -739,6 +744,7 @@ impl<T: SessionStream> Session<T> {
         // Build message
         let mail_from = self.data.mail_from.clone().unwrap();
         let rcpt_to = std::mem::take(&mut self.data.rcpt_to);
+        self.data.za_key_rcpt = false;
         let source = if !self.is_authenticated() {
             let dmarc_pass = dmarc_result.is_some_and(|result| result == DmarcResult::Pass);
 

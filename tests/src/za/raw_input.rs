@@ -13,6 +13,7 @@
 
 use super::user_permissions;
 use crate::utils::{
+    account::Account,
     server::TestServer,
     za::{Conn, za_app_password, za_post},
 };
@@ -290,6 +291,33 @@ async fn smtp(secret: &str) -> Vec<String> {
     own_reads
 }
 
+/// The post-authentication positive controls of IMAP and POP3, in an
+/// ordinary account's sessions: mail spec 10 masks a key account's IMAP and
+/// POP3 sessions throughout, so its own controls are traced as the marker.
+async fn ordinary_controls(account: &Account) {
+    let mut conn = Conn::open(IMAP_PORT).await;
+    conn.until(&["* OK"]).await;
+    conn.exchange(
+        &format!(
+            "a1 LOGIN \"{}\" \"{}\"\r\n",
+            account.name(),
+            account.secret()
+        ),
+        "a1 OK",
+    )
+    .await;
+    conn.exchange(&format!("{IMAP_CONTROL} NOOP\r\n"), IMAP_CONTROL)
+        .await;
+    conn.exchange("a2 LOGOUT\r\n", "a2 OK").await;
+    let mut conn = Conn::open(POP3_PORT).await;
+    conn.until(&["+OK"]).await;
+    let response = STANDARD.encode(format!("\0{}\0{}", account.name(), account.secret()));
+    conn.exchange(&format!("AUTH PLAIN {response}\r\n"), "+OK")
+        .await;
+    conn.exchange("NOOP\r\n", "+OK").await;
+    conn.exchange("QUIT\r\n", "+OK").await;
+}
+
 /// The MFA reply (issue #20 fix round 1): once TOTP is enrolled, AUTH PLAIN
 /// with the password alone is answered with a 334 that leaves the exchange.
 /// The client answers it with a PLAIN response carrying a code, split
@@ -323,7 +351,7 @@ fn totp_url() -> String {
 }
 
 /// Every string in `value`, bytes read as UTF-8 (lossy).
-fn strings(value: &trc::Value, out: &mut Vec<String>) {
+pub(crate) fn strings(value: &trc::Value, out: &mut Vec<String>) {
     match value {
         trc::Value::String(s) => out.push(s.to_string()),
         trc::Value::Bytes(b) => out.push(String::from_utf8_lossy(b).into_owned()),
@@ -390,6 +418,7 @@ pub async fn test(test: &mut TestServer) {
             tail.to_string(),
         ]);
     }
+    ordinary_controls(test.account("plain@example.com")).await;
     // Last: enrolling TOTP ends the password logins.
     let url = totp_url();
     let code = totp_rs::Totp::from_url(&url)
@@ -497,7 +526,8 @@ pub async fn test(test: &mut TestServer) {
             .any(|(_, values)| values.contains(MFA_CONTROL)),
         "the command after the MFA answer was not traced"
     );
-    // Positive controls: raw input outside the exchange is still traced.
+    // Positive controls: raw input outside the exchange is still traced (the
+    // IMAP and POP3 ones in an ordinary account's sessions, mail spec 10).
     assert!(
         inputs(EventType::Imap(ImapEvent::RawInput))
             .any(|(_, values)| values.contains(IMAP_CONTROL)),

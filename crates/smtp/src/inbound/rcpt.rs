@@ -400,13 +400,34 @@ impl<T: SessionStream> Session<T> {
                 {
                     member_addr.dsn_info = list_addr.address_lcase.clone().into();
                     member_addr.flags = list_addr.flags;
+                    self.za_note_key_rcpt(&member_addr.address_lcase).await;
                     self.data.rcpt_to.push(member_addr);
                 }
             }
+        } else if let Some(rcpt) = self.data.rcpt_to.last() {
+            let address = rcpt.address_lcase.clone();
+            self.za_note_key_rcpt(&address).await;
         }
 
         self.data.rcpt_oks += 1;
         self.write(b"250 2.1.5 OK\r\n").await
+    }
+
+    /// Mail spec 10: notes whether `address`, an accepted recipient, is a key
+    /// account, so that the transaction's content is redacted from traces. A
+    /// lookup error counts as a key account (fail closed).
+    async fn za_note_key_rcpt(&mut self, address: &str) {
+        if !self.data.za_key_rcpt {
+            self.data.za_key_rcpt = match self.server.account_id_from_email(address, false).await {
+                Ok(Some(account_id)) => self
+                    .server
+                    .za_is_key_account(account_id)
+                    .await
+                    .unwrap_or(true),
+                Ok(None) => false,
+                Err(_) => true,
+            };
+        }
     }
 
     async fn rcpt_error(&mut self, response: &[u8], rcpt: String) -> Result<(), ()> {

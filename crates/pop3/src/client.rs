@@ -21,7 +21,10 @@ impl<T: SessionStream> Session<T> {
             Pop3(trc::Pop3Event::RawInput),
             SpanId = self.session_id,
             Size = bytes.len(),
-            Contents = if matches!(self.state, State::NotAuthenticated { .. }) {
+            // Mail spec 10: a key account's session is masked throughout.
+            Contents = if matches!(self.state, State::NotAuthenticated { .. })
+                || self.state.za_key_session()
+            {
                 trc::Value::redacted()
             } else {
                 trc::Value::from_maybe_string(bytes)
@@ -81,10 +84,13 @@ impl<T: SessionStream> Session<T> {
                     // unsupported mechanism) and is written after the read's
                     // earlier requests ran, which may authenticate: one read
                     // before authentication is marked BAD here, and
-                    // `write_err` masks a BAD error's traces.
+                    // `write_err` masks a BAD error's traces. Mail spec 10: so
+                    // is one in a key account's session.
                     let err = trc::Pop3Event::Error.into_err().details(err);
                     requests.push(Err(
-                        if matches!(self.state, State::NotAuthenticated { .. }) {
+                        if matches!(self.state, State::NotAuthenticated { .. })
+                            || self.state.za_key_session()
+                        {
                             err.ctx(trc::Key::Type, "BAD")
                         } else {
                             err

@@ -160,8 +160,14 @@ impl<T: SessionStream> Session<T> {
         milter: &Milter,
         message: Option<&AuthenticatedMessage<'_>>,
     ) -> Result<Vec<Modification>, Rejection> {
-        // Build client
-        let client = MilterClient::connect(milter, self.data.session_id).await?;
+        // Build client. Mail spec 10: the milter is sent the plaintext
+        // (transit), its traces are redacted for a key account's transaction.
+        let client = MilterClient::connect(
+            milter,
+            self.data.session_id,
+            self.data.za_key_rcpt || self.data.za_key_sender(),
+        )
+        .await?;
         if !milter.tls {
             self.run(client, message).await
         } else {

@@ -22,7 +22,7 @@ use super::{
 const MILTER_CHUNK_SIZE: usize = 65535;
 
 impl MilterClient<TcpStream> {
-    pub async fn connect(config: &Milter, session_id: u64) -> Result<Self> {
+    pub async fn connect(config: &Milter, session_id: u64, redact: bool) -> Result<Self> {
         tokio::time::timeout(config.timeout_command, async {
             let mut last_err = Error::Disconnected;
             for addr in &config.addrs {
@@ -50,6 +50,7 @@ impl MilterClient<TcpStream> {
                             ),
                             flags_protocol: config.flags_protocol.unwrap_or(0x42),
                             id: config.id,
+                            redact,
                         });
                     }
                     Err(err) => {
@@ -89,6 +90,7 @@ impl MilterClient<TcpStream> {
                 flags_actions: self.flags_actions,
                 flags_protocol: self.flags_protocol,
                 id: self.id,
+                redact: self.redact,
             })
         })
         .await
@@ -314,7 +316,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> MilterClient<T> {
             Milter(MilterEvent::Write),
             SpanId = self.session_id,
             Id = self.id.to_string(),
-            Contents = action.to_string(),
+            Contents = if self.redact {
+                trc::Value::redacted()
+            } else {
+                action.to_string().into()
+            },
         );
 
         tokio::time::timeout(self.timeout_cmd, async {
@@ -334,7 +340,11 @@ impl<T: AsyncRead + AsyncWrite + Unpin> MilterClient<T> {
                             Milter(MilterEvent::Read),
                             SpanId = self.session_id,
                             Id = self.id.to_string(),
-                            Contents = response.to_string(),
+                            Contents = if self.redact {
+                                trc::Value::redacted()
+                            } else {
+                                response.to_string().into()
+                            },
                         );
 
                         return Ok(response);

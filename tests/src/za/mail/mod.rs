@@ -43,6 +43,7 @@ pub mod gates;
 pub mod login;
 pub mod reads;
 pub mod search;
+pub mod traces;
 pub mod uploads;
 pub mod writes;
 
@@ -325,6 +326,8 @@ pub struct TracedEvent {
     pub to: String,
     /// Every key and value, for content checks.
     pub text: String,
+    /// The keys and values as emitted.
+    pub keys: Vec<(Key, trc::Value)>,
 }
 
 impl Traced {
@@ -354,6 +357,7 @@ impl Traced {
                     reason: String::new(),
                     to: String::new(),
                     text: String::new(),
+                    keys: event.keys.clone(),
                 };
                 for (key, value) in event.keys.iter() {
                     match (key, value) {

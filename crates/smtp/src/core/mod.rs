@@ -96,6 +96,9 @@ pub struct SessionData {
     /// Issue #20: the session wrote a 334 and the client's answer, which can
     /// carry a SASL response, has not ended its line yet.
     pub za_answers_334: bool,
+    /// Mail spec 10: a recipient of the current transaction is a key account;
+    /// the DATA and BDAT reads are redacted.
+    pub za_key_rcpt: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -173,7 +176,16 @@ impl SessionData {
             spf_mail_from: None,
             dnsbl_error: None,
             za_answers_334: false,
+            za_key_rcpt: false,
         }
+    }
+
+    /// Mail spec 10: the session is authenticated as a key account
+    /// (submission); its reads are redacted.
+    pub fn za_key_sender(&self) -> bool {
+        self.authenticated_as
+            .as_ref()
+            .is_some_and(|a| a.account.is_key_account())
     }
 }
 
@@ -297,6 +309,7 @@ impl SessionData {
             spf_mail_from: None,
             dnsbl_error: None,
             za_answers_334: false,
+            za_key_rcpt: false,
         }
     }
 }

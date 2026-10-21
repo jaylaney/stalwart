@@ -492,6 +492,7 @@ impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
         self.data.delivery_by = 0;
         self.data.future_release = 0;
         self.data.rcpt_oks = 0;
+        self.data.za_key_rcpt = false;
     }
 
     pub fn reset_tls(&mut self) {
@@ -553,7 +554,12 @@ impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
                     Size = len,
                     Contents = if answers_334
                         || is_auth_input(&mut self.state, bytes.get(0..len).unwrap_or_default())
-                    {
+                        || self.data.za_key_sender()
+                        || (self.data.za_key_rcpt
+                            && is_data_input(
+                                &mut self.state,
+                                bytes.get(0..len).unwrap_or_default(),
+                            )) {
                         trc::Value::redacted()
                     } else {
                         String::from_utf8_lossy(bytes.get(0..len).unwrap_or_default())
@@ -683,4 +689,79 @@ fn has_auth_command<'x>(bytes: impl Iterator<Item = &'x u8>) -> bool {
         };
     }
     false
+}
+
+/// Mail spec 10: whether a read of a transaction with a key-account recipient
+/// may carry message content: the session is in the DATA or BDAT phase, or
+/// the read, joined to the unparsed start of the current request line, holds
+/// a DATA or BDAT command (a BDAT chunk can follow its command in one read).
+fn is_data_input(state: &mut State, bytes: &[u8]) -> bool {
+    let partial: &[u8] = match state {
+        State::Data(_) | State::Bdat(_) | State::SkipData(..) => return true,
+        State::Request(receiver) => receiver.buf(),
+        _ => &[],
+    };
+    has_data_command(partial.iter().chain(bytes))
+}
+
+/// Whether `DATA` followed by CR or LF, or `BDAT` followed by a space or a
+/// tab, occurs at a line start or after whitespace, in any case. A false
+/// positive only masks a read.
+fn has_data_command<'x>(bytes: impl Iterator<Item = &'x u8>) -> bool {
+    let mut word = [0u8; 4];
+    // The length of the word since the last whitespace, `None` past four.
+    let mut len = Some(0);
+    for &ch in bytes {
+        if len == Some(4)
+            && match &word {
+                b"DATA" => ch == b'\r' || ch == b'\n',
+                b"BDAT" => ch == b' ' || ch == b'\t',
+                _ => false,
+            }
+        {
+            return true;
+        }
+        len = match len {
+            _ if ch.is_ascii_whitespace() => Some(0),
+            Some(n) if n < 4 => {
+                word[n] = ch.to_ascii_uppercase();
+                Some(n + 1)
+            }
+            _ => None,
+        };
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_data_command;
+
+    #[test]
+    fn has_data_command_finds_data_and_bdat() {
+        for bytes in [
+            &b"DATA\r\n"[..],
+            b"bdat 12\r\nxx",
+            b"RCPT TO:<a@b>\r\nDATA\r\n",
+            b" data\n",
+        ] {
+            assert!(
+                has_data_command(bytes.iter()),
+                "{:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+        for bytes in [
+            &b"RCPT TO:<data@b>\r\n"[..],
+            b"DATAX\r\n",
+            b"NOOP\r\n",
+            b"UPDATA\r\n",
+        ] {
+            assert!(
+                !has_data_command(bytes.iter()),
+                "{:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+    }
 }

@@ -708,11 +708,18 @@ impl<T: SessionStream> SessionData<T> {
             AccountId = account_id,
             MailboxId = mailbox.id.mailbox_id,
             DocumentId = fetched_ids,
-            Details = arguments
-                .attributes
-                .iter()
-                .map(|c| trc::Value::from(format!("{c:?}")))
-                .collect::<Vec<_>>(),
+            // Mail spec 10: the attributes name the headers a key account
+            // requested.
+            Details = if self.za_key_session() {
+                trc::Value::redacted()
+            } else {
+                arguments
+                    .attributes
+                    .iter()
+                    .map(|c| trc::Value::from(format!("{c:?}")))
+                    .collect::<Vec<_>>()
+                    .into()
+            },
             Elapsed = op_start.elapsed()
         );
 

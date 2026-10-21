@@ -9,12 +9,30 @@ use std::future::Future;
 use common::{
     Server,
     config::mailstore::spamfilter::{IpResolver, Location},
+    expr::{Variable, functions::ResolveVariable, if_block::IfBlock},
 };
 
 use crate::{
     SpamFilterContext, TextPart,
     modules::expression::{EmailHeader, SpamFilterResolver, StringResolver},
 };
+
+/// Mail spec 10: a rule evaluated for a key account's message does not trace
+/// its result, which can echo a header, the body or an address.
+pub(crate) async fn eval<'x, R: TryFrom<Variable<'x>>, V: ResolveVariable>(
+    server: &'x Server,
+    ctx: &SpamFilterContext<'_>,
+    if_block: &'x IfBlock,
+    resolver: &'x V,
+) -> Option<R> {
+    if ctx.input.za_redact {
+        server
+            .za_eval_if(if_block, resolver, ctx.input.span_id)
+            .await
+    } else {
+        server.eval_if(if_block, resolver, ctx.input.span_id).await
+    }
+}
 
 pub trait SpamFilterAnalyzeRules: Sync + Send {
     fn spam_filter_analyze_rules(
@@ -28,13 +46,13 @@ impl SpamFilterAnalyzeRules for Server {
         if !self.core.spam.rules.url.is_empty() {
             for url in &ctx.output.urls {
                 for rule in &self.core.spam.rules.url {
-                    if let Some(tag) = self
-                        .eval_if::<String, _>(
-                            rule,
-                            &SpamFilterResolver::new(ctx, &url.element, url.location),
-                            ctx.input.span_id,
-                        )
-                        .await
+                    if let Some(tag) = eval::<String, _>(
+                        self,
+                        ctx,
+                        rule,
+                        &SpamFilterResolver::new(ctx, &url.element, url.location),
+                    )
+                    .await
                     {
                         ctx.result.tags.insert(tag);
                     }
@@ -47,13 +65,13 @@ impl SpamFilterAnalyzeRules for Server {
                 let resolver = StringResolver(domain.element.as_str());
 
                 for rule in &self.core.spam.rules.domain {
-                    if let Some(tag) = self
-                        .eval_if::<String, _>(
-                            rule,
-                            &SpamFilterResolver::new(ctx, &resolver, domain.location),
-                            ctx.input.span_id,
-                        )
-                        .await
+                    if let Some(tag) = eval::<String, _>(
+                        self,
+                        ctx,
+                        rule,
+                        &SpamFilterResolver::new(ctx, &resolver, domain.location),
+                    )
+                    .await
                     {
                         ctx.result.tags.insert(tag);
                     }
@@ -64,13 +82,13 @@ impl SpamFilterAnalyzeRules for Server {
         if !self.core.spam.rules.email.is_empty() {
             for email in &ctx.output.emails {
                 for rule in &self.core.spam.rules.email {
-                    if let Some(tag) = self
-                        .eval_if::<String, _>(
-                            rule,
-                            &SpamFilterResolver::new(ctx, &email.element, email.location),
-                            ctx.input.span_id,
-                        )
-                        .await
+                    if let Some(tag) = eval::<String, _>(
+                        self,
+                        ctx,
+                        rule,
+                        &SpamFilterResolver::new(ctx, &email.element, email.location),
+                    )
+                    .await
                     {
                         ctx.result.tags.insert(tag);
                     }
@@ -84,13 +102,13 @@ impl SpamFilterAnalyzeRules for Server {
             ] {
                 for email in rcpt {
                     for rule in &self.core.spam.rules.email {
-                        if let Some(tag) = self
-                            .eval_if::<String, _>(
-                                rule,
-                                &SpamFilterResolver::new(ctx, email, location),
-                                ctx.input.span_id,
-                            )
-                            .await
+                        if let Some(tag) = eval::<String, _>(
+                            self,
+                            ctx,
+                            rule,
+                            &SpamFilterResolver::new(ctx, email, location),
+                        )
+                        .await
                         {
                             ctx.result.tags.insert(tag);
                         }
@@ -104,13 +122,13 @@ impl SpamFilterAnalyzeRules for Server {
                 let ip_resolver = IpResolver::new(ip.element);
 
                 for rule in &self.core.spam.rules.ip {
-                    if let Some(tag) = self
-                        .eval_if::<String, _>(
-                            rule,
-                            &SpamFilterResolver::new(ctx, &ip_resolver, ip.location),
-                            ctx.input.span_id,
-                        )
-                        .await
+                    if let Some(tag) = eval::<String, _>(
+                        self,
+                        ctx,
+                        rule,
+                        &SpamFilterResolver::new(ctx, &ip_resolver, ip.location),
+                    )
+                    .await
                     {
                         ctx.result.tags.insert(tag);
                     }
@@ -133,13 +151,13 @@ impl SpamFilterAnalyzeRules for Server {
                 };
 
                 for rule in &self.core.spam.rules.header {
-                    if let Some(tag) = self
-                        .eval_if::<String, _>(
-                            rule,
-                            &SpamFilterResolver::new(ctx, &header_resolver, Location::BodyText),
-                            ctx.input.span_id,
-                        )
-                        .await
+                    if let Some(tag) = eval::<String, _>(
+                        self,
+                        ctx,
+                        rule,
+                        &SpamFilterResolver::new(ctx, &header_resolver, Location::BodyText),
+                    )
+                    .await
                     {
                         ctx.result.tags.insert(tag);
                     }
@@ -165,13 +183,13 @@ impl SpamFilterAnalyzeRules for Server {
                 let string_resolver = StringResolver(text);
 
                 for rule in &self.core.spam.rules.body {
-                    if let Some(tag) = self
-                        .eval_if::<String, _>(
-                            rule,
-                            &SpamFilterResolver::new(ctx, &string_resolver, location),
-                            ctx.input.span_id,
-                        )
-                        .await
+                    if let Some(tag) = eval::<String, _>(
+                        self,
+                        ctx,
+                        rule,
+                        &SpamFilterResolver::new(ctx, &string_resolver, location),
+                    )
+                    .await
                     {
                         ctx.result.tags.insert(tag);
                     }
@@ -182,13 +200,13 @@ impl SpamFilterAnalyzeRules for Server {
         if !self.core.spam.rules.any.is_empty() {
             let dummy_resolver = StringResolver("");
             for rule in &self.core.spam.rules.any {
-                if let Some(tag) = self
-                    .eval_if::<String, _>(
-                        rule,
-                        &SpamFilterResolver::new(ctx, &dummy_resolver, Location::BodyText),
-                        ctx.input.span_id,
-                    )
-                    .await
+                if let Some(tag) = eval::<String, _>(
+                    self,
+                    ctx,
+                    rule,
+                    &SpamFilterResolver::new(ctx, &dummy_resolver, Location::BodyText),
+                )
+                .await
                 {
                     ctx.result.tags.insert(tag);
                 }

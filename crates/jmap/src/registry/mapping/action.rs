@@ -389,6 +389,8 @@ async fn classify_spam(server: &Server, mut request: SpamClassify) -> Option<Spa
         env_rcpt_rewritten_to: request.env_rcpt_to.iter().map(String::as_str).collect(),
         is_test: true,
         is_train: false,
+        // The administrator's test classification of a message it supplied.
+        za_redact: false,
     };
 
     // Classify

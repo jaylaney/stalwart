@@ -55,6 +55,10 @@ pub struct SpamFilterInput<'x> {
 
     pub is_train: bool,
     pub is_test: bool,
+
+    /// Mail spec 10: the message is a key account's (a recipient or the
+    /// sender); events that can echo its content are redacted.
+    pub za_redact: bool,
 }
 
 pub struct SpamFilterOutput<'x> {
@@ -166,6 +170,7 @@ impl<'x> SpamFilterInput<'x> {
             env_rcpt_orig_to: vec![],
             is_test: false,
             is_train: false,
+            za_redact: false,
         }
     }
 
