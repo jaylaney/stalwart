@@ -5,15 +5,12 @@
  */
 
 use super::get::ChangesLookup;
+use crate::email::za::za_refuse_content_query;
 use crate::{
-    api::request::resolve_account_id,
-    calendar_event::query::CalendarEventQuery,
+    api::request::resolve_account_id, calendar_event::query::CalendarEventQuery,
     calendar_event_notification::query::CalendarEventNotificationQuery,
-    contact::query::ContactCardQuery,
-    email::{query::EmailQuery, za::za_refuse_content_query},
-    file::query::FileNodeQuery,
-    mailbox::query::MailboxQuery,
-    share_notification::query::ShareNotificationQuery,
+    contact::query::ContactCardQuery, email::query::EmailQuery, file::query::FileNodeQuery,
+    mailbox::query::MailboxQuery, share_notification::query::ShareNotificationQuery,
     submission::query::EmailSubmissionQuery,
 };
 use common::{Server, auth::AccessToken};

@@ -372,6 +372,9 @@ impl<T: SessionStream> SessionData<T> {
                     | Attribute::ObjectId
             )
         });
+        // The content-free path borrows the stored stub: no attribute that
+        // reads the blob may take it.
+        debug_assert!(!needs_blobs || needs_content);
         // Mail spec 7, ruling R33: the account's keys, once for the command,
         // only when an attribute reads content; the owner's session opened
         // before its account was provisioned holds none and reads flags.
