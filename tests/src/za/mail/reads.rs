@@ -713,6 +713,20 @@ async fn plain_header_block_with_the_format_byte(test: &TestServer, plain: &Acco
         fetched.contains("crafted body canary") && fetched.contains(&crafted),
         "{fetched}"
     );
+    // Ruling R47 of plan 13: the index task built upstream's full document,
+    // so the message is found by its subject and body terms.
+    for search in ["SEARCH SUBJECT crafted", "SEARCH BODY crafted"] {
+        let answer = imap_answer(&mut imap, search).await;
+        let found = answer
+            .lines()
+            .find(|line| line.starts_with("* SEARCH"))
+            .unwrap_or_else(|| panic!("{search}: {answer}"));
+        assert_eq!(
+            found.trim_end().split(' ').count(),
+            3,
+            "{search}: the crafted message is not indexed by its content: {answer}"
+        );
+    }
     imap.send_ok("LOGOUT").await;
     let id = Id::from_parts(document_id, document_id).to_string();
     let (list, not_found) = email_get(

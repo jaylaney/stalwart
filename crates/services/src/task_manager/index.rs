@@ -468,10 +468,19 @@ async fn build_email_document(
                 .unarchive::<MessageMetadata>()
                 .caused_by(trc::location!())?;
 
-            // Mail spec 5.5: a key account's message, or a stub reached past
-            // the account check (the destroyed-account window), is indexed
-            // by its visible fields alone, read without a key; no blob.
-            if server.za_is_key_account(account_id).await? || is_stub(metadata) {
+            // Mail spec 5.5: a key account's message, or a stub of an account
+            // that no longer exists (the destroyed-account window), is
+            // indexed by its visible fields alone, read without a key; no
+            // blob. An existing ordinary account's message keeps upstream's
+            // document whatever its header block starts with (ruling R47).
+            if server.za_is_key_account(account_id).await?
+                || (is_stub(metadata)
+                    && server
+                        .try_account(account_id)
+                        .await
+                        .caused_by(trc::location!())?
+                        .is_none())
+            {
                 let Some(data) = server
                     .store()
                     .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
