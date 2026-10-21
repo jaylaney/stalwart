@@ -138,11 +138,18 @@ async fn configure(admin: &Account) -> Id {
         })
         .await;
     let mut strategy = MtaOutboundStrategy::default();
+    let mut rewritten = 0;
     for rule in strategy.schedule.match_.values_mut() {
         if rule.then == "'local'" {
             rule.then = format!("'{SCHEDULE}'");
+            rewritten += 1;
         }
     }
+    assert!(
+        rewritten > 0,
+        "no local rule in the default schedule expression: {:?}",
+        strategy.schedule
+    );
     admin
         .registry_update_setting(strategy, &[Property::Schedule])
         .await;
@@ -200,6 +207,53 @@ async fn temporarily_failed(test: &TestServer, address: &str) -> bool {
 /// its own before the terminating dot.
 fn received(message: &str) -> String {
     format!("{message}\r\n")
+}
+
+/// The header fields the receiving session may prepend to a message it
+/// queues: its trace and authentication headers (`write_received`,
+/// `add_auth_results`, `add_received_spf`, ARC, `Return-Path`, in
+/// `crates/smtp/src/inbound/data.rs`) and the spam filter's score headers.
+/// `Date` and `Message-ID` are added only when missing, and `message_with`
+/// writes both.
+const PREPENDED: &[&str] = &[
+    "Received",
+    "Return-Path",
+    "Authentication-Results",
+    "Received-SPF",
+    "ARC-Seal",
+    "ARC-Message-Signature",
+    "ARC-Authentication-Results",
+    "X-Spam-Result",
+    "X-Spam-Score",
+];
+
+/// `raw` is the delivered bytes behind a prefix made only of `PREPENDED`
+/// header fields (folded lines included).
+fn assert_received_as(raw: &[u8], message: &str) {
+    let prefix = raw
+        .strip_suffix(received(message).as_bytes())
+        .unwrap_or_else(|| {
+            panic!(
+                "the blob is not the delivered message: {}",
+                String::from_utf8_lossy(raw)
+            )
+        });
+    let prefix = std::str::from_utf8(prefix).expect("an ASCII header block");
+    assert!(prefix.is_empty() || prefix.ends_with("\r\n"), "{prefix:?}");
+    for (n, line) in prefix.split_terminator("\r\n").enumerate() {
+        if line.starts_with([' ', '\t']) {
+            assert!(n > 0, "a continuation line opens the prefix: {prefix:?}");
+            continue;
+        }
+        let name = line
+            .split_once(':')
+            .map(|(name, _)| name)
+            .unwrap_or_else(|| panic!("not a header line: {line:?}"));
+        assert!(
+            PREPENDED.iter().any(|h| h.eq_ignore_ascii_case(name)),
+            "the receiving session prepended {name:?}"
+        );
+    }
 }
 
 fn contains(haystack: &[u8], needle: &str) -> bool {
@@ -276,11 +330,7 @@ async fn delivery_is_sealed_under_pk(test: &TestServer, id: u32) {
     let (meta, raw) = open_message(test, id, STRONG, document_id).await;
     // The blob is the message as received: the queue's copy, whose head the
     // receiving session extended with its trace headers.
-    assert!(
-        raw.ends_with(received(&message).as_bytes()),
-        "{}",
-        String::from_utf8_lossy(&raw)
-    );
+    assert_received_as(&raw, &message);
     assert!(
         meta.raw_headers
             .starts_with(format!("Delivered-To: {KEY}\r\n").as_bytes()),

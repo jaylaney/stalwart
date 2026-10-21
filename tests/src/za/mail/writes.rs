@@ -23,12 +23,19 @@ use crate::{
     },
     za::{STRONG, user_permissions},
 };
+use common::{auth::AccessToken, za::ZA_MAIL_KEYLESS};
 use email::{
     mailbox::{INBOX_ID, JUNK_ID},
-    message::{metadata::MessageMetadata, za::is_stub},
+    message::{
+        ingest::{EmailIngest, IngestEmail, IngestSource},
+        metadata::MessageMetadata,
+        za::is_stub,
+    },
 };
 use groupware::calendar::seal::WRAP_MK;
-use imap_proto::ResponseType;
+use imap_proto::{ResponseType, protocol::SerializeResponse};
+use jmap_proto::error::method::MethodErrorWrapper;
+use mail_parser::MessageParser;
 use registry::schema::prelude::ObjectType;
 use serde_json::{Map, Value, json};
 use std::str::FromStr;
@@ -51,6 +58,7 @@ pub async fn test(test: &mut TestServer) {
     email_set_create_is_sealed_under_mk(test, &key, id).await;
     email_import_reseals_the_upload(test, &key, id).await;
     no_sample_on_session_writes(test, &key, id, appended).await;
+    keyless_session_writes_are_refused(test, id).await;
     rf_3_append_into_plain_share(test, plain_id).await;
 
     test.destroy_all_mailboxes(&key).await;
@@ -220,6 +228,57 @@ async fn no_sample_on_session_writes(test: &TestServer, key: &Account, id: u32, 
         samples,
         "a sample from a create into Junk"
     );
+}
+
+/// Ruling R22: a session write to a key account by a token without its keys
+/// (another account's APPEND into a shared mailbox builds one) is refused
+/// with an error every caller writes, IMAP as a tagged `NO [NOPERM]` and
+/// JMAP as `forbidden`, both with `ZA_MAIL_KEYLESS`, and stores nothing.
+async fn keyless_session_writes_are_refused(test: &TestServer, id: u32) {
+    println!("keyless_session_writes_are_refused");
+    let before = message_ids(test, id).await;
+    let message = message_with("keyless", "keyless body");
+    for source in [
+        IngestSource::Imap {
+            train_classifier: true,
+        },
+        IngestSource::Jmap {
+            train_classifier: true,
+        },
+    ] {
+        let err = test
+            .server
+            .email_ingest(IngestEmail {
+                raw_message: message.as_bytes(),
+                message: MessageParser::new().parse(message.as_bytes()),
+                blob_hash: None,
+                access_token: &AccessToken::from_id_maybe_invalid(id),
+                mailbox_ids: vec![INBOX_ID],
+                keywords: vec![],
+                received_at: None,
+                source,
+                session_id: 0,
+            })
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{source:?}: a keyless write was stored"));
+        assert!(
+            err.matches(trc::EventType::Jmap(trc::JmapEvent::Forbidden)) && err.should_write_err(),
+            "{source:?}: {err:?}"
+        );
+        assert_eq!(err.value_as_str(trc::Key::Details), Some(ZA_MAIL_KEYLESS));
+        assert_eq!(
+            String::from_utf8(err.clone().id("t1").serialize()).unwrap(),
+            format!("t1 NO [NOPERM] {ZA_MAIL_KEYLESS}\r\n"),
+            "the IMAP answer"
+        );
+        assert_eq!(
+            serde_json::to_value(MethodErrorWrapper::from(err)).unwrap(),
+            json!({ "type": "forbidden", "description": ZA_MAIL_KEYLESS }),
+            "the JMAP answer"
+        );
+        assert_eq!(message_ids(test, id).await, before, "{source:?}");
+    }
 }
 
 /// Review focus 3: the appender's token carries keys for its own account
