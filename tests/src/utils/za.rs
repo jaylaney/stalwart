@@ -4,10 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::{
-    utils::{account::Account, http::HttpRequest, server::TestServer},
-    za::tracing::AcceptAnyCert,
-};
+use crate::utils::{account::Account, http::HttpRequest, server::TestServer};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use calcard::{
     common::{IanaString, timezone::Tz},
@@ -68,7 +65,11 @@ use tokio::{
 use tokio_rustls::{
     TlsConnector,
     client::TlsStream,
-    rustls::{self, pki_types::ServerName},
+    rustls::{
+        self, DigitallySignedStruct, SignatureScheme,
+        client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+        pki_types::{CertificateDer, ServerName, UnixTime},
+    },
 };
 use types::collection::{Collection, SyncCollection};
 use types::field::{CalendarEventField, EmailField, PrincipalField};
@@ -84,6 +85,52 @@ use vault::{
 
 /// The suite's HTTPS listener.
 pub const SERVER_URL: &str = "https://127.0.0.1:8899";
+
+/// `ZA_KEY_ACCOUNTS=1`: every test user of the upstream suites that honour
+/// it (`webdav_tests`, `imap_tests`, `jmap_tests`) is a zero-access key
+/// account, provisioned through the account API (setup token, then setup).
+pub fn key_accounts_mode() -> bool {
+    std::env::var("ZA_KEY_ACCOUNTS").is_ok_and(|v| v == "1")
+}
+
+/// Accepts the test server's self-signed certificate.
+#[derive(Debug)]
+pub(crate) struct AcceptAnyCert(pub(crate) Arc<rustls::crypto::CryptoProvider>);
+
+impl ServerCertVerifier for AcceptAnyCert {
+    fn verify_server_cert(
+        &self,
+        _: &CertificateDer<'_>,
+        _: &[CertificateDer<'_>],
+        _: &ServerName<'_>,
+        _: &[u8],
+        _: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
 
 pub struct VaultReply {
     pub status: u16,

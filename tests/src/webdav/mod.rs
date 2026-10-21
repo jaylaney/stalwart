@@ -5,6 +5,7 @@
  */
 
 use crate::utils::server::TestServerBuilder;
+pub use crate::utils::za::key_accounts_mode;
 use ahash::AHashMap;
 use common::{DavResource, DavResources};
 use groupware::DavResourceName;
@@ -258,12 +259,6 @@ pub async fn webdav_tests() {
     if test.is_reset() {
         test.temp_dir.delete();
     }
-}
-
-/// `ZA_KEY_ACCOUNTS=1`: every test user is a zero-access key account,
-/// provisioned through the account API (setup token, then setup).
-pub fn key_accounts_mode() -> bool {
-    std::env::var("ZA_KEY_ACCOUNTS").is_ok_and(|v| v == "1")
 }
 
 pub trait DavResourcesTest {

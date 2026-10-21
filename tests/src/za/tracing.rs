@@ -12,7 +12,11 @@ use super::{
     STRONG,
     fanout::{START_A, attendee_statuses, invite},
 };
-use crate::utils::{server::TestServer, webdav::DummyWebDavClient, za::SERVER_URL};
+use crate::utils::{
+    server::TestServer,
+    webdav::DummyWebDavClient,
+    za::{AcceptAnyCert, SERVER_URL},
+};
 use ::registry::{
     schema::{
         prelude::ObjectType,
@@ -30,11 +34,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio_rustls::{
     TlsConnector,
-    rustls::{
-        self, DigitallySignedStruct, SignatureScheme,
-        client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-        pki_types::{CertificateDer, ServerName, UnixTime},
-    },
+    rustls::{self, pki_types::ServerName},
 };
 use trc::{
     AuthEvent, CalendarEvent, Collector, EvalEvent, EventType, HttpEvent, JmapEvent, StoreEvent,
@@ -254,45 +254,6 @@ async fn jmap_upload(user: &str, secret: &str, account_id: &str, canary: &str) {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-}
-
-/// Accepts the test server's self-signed certificate.
-#[derive(Debug)]
-pub(crate) struct AcceptAnyCert(pub(crate) Arc<rustls::crypto::CryptoProvider>);
-
-impl ServerCertVerifier for AcceptAnyCert {
-    fn verify_server_cert(
-        &self,
-        _: &CertificateDer<'_>,
-        _: &[CertificateDer<'_>],
-        _: &ServerName<'_>,
-        _: &[u8],
-        _: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _: &[u8],
-        _: &CertificateDer<'_>,
-        _: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _: &[u8],
-        _: &CertificateDer<'_>,
-        _: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
 }
 
 /// Write one masked client frame (RFC 6455 section 5.2).
