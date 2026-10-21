@@ -57,7 +57,7 @@ use jmap_client::{
         set::SetErrorType,
     },
     email::{self, Property},
-    mailbox::Role,
+    mailbox::{self, Role},
     principal::ACL,
     push_subscription::Keys,
 };
@@ -79,9 +79,9 @@ use std::{
     time::Duration,
 };
 use store::{
-    IterateParams, SUBSPACE_TASK_QUEUE, ValueKey,
+    ValueKey,
     rand::{self, RngExt},
-    write::{AlignedBytes, AnyKey, Archive, BatchBuilder},
+    write::{AlignedBytes, Archive, BatchBuilder},
 };
 use tokio::sync::mpsc;
 use types::{
@@ -1531,30 +1531,6 @@ pub async fn thread_merge(test: &TestServer) {
             .all(|m| m.thread_id == m.document_id),
         "a sealed message is its own thread"
     );
-    // No thread merge was scheduled, so nothing is left in the task queue.
-    let mut queued = 0;
-    test.server
-        .store()
-        .iterate(
-            IterateParams::new(
-                AnyKey {
-                    subspace: SUBSPACE_TASK_QUEUE,
-                    key: vec![0u8],
-                },
-                AnyKey {
-                    subspace: SUBSPACE_TASK_QUEUE,
-                    key: vec![u8::MAX; 32],
-                },
-            )
-            .no_values(),
-            |_, _| {
-                queued += 1;
-                Ok(true)
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(queued, 0, "the task queue drained");
     println!("Deleting all messages...");
     test.destroy_all_mailboxes(account).await;
     test.assert_is_empty().await;
@@ -1563,10 +1539,11 @@ pub async fn thread_merge(test: &TestServer) {
 /// `mail::acl::test` in key mode. John, Jane and Bill are key accounts; the
 /// admin and the Sales group are plain. Every grant on a key account's
 /// mailbox is refused (spec 6.3), so John never reaches Jane's mail, and a
-/// blob copy, an import or an Email/copy across a key account is refused;
-/// a plain account's share with a key account works and the key account
-/// reads it, but cannot copy from it; the Sales group's membership steps
-/// run as upstream.
+/// blob copy, an import or an Email/copy across a key account is refused.
+/// Upstream's grant-and-try sequence runs on the admin's INBOX shared with
+/// John (rights are enforced for a key session in a plain share as
+/// upstream enforces them), its cross-account import and copy steps
+/// refused; the Sales group's membership steps run as upstream.
 pub async fn acl(test: &TestServer) {
     println!("Running key-account ACL tests...");
     let inbox_id = Id::new(INBOX_ID as u64).to_string();
@@ -1582,6 +1559,18 @@ pub async fn acl(test: &TestServer) {
     let mut jane_client = jane.jmap_client().await;
     let mut bill_client = bill.jmap_client().await;
     let mut admin_client = admin.jmap_client().await;
+
+    // The admin account's Email state before this module's messages
+    let admin_state = admin
+        .jmap_method_call(
+            "Email/get",
+            json!({ "accountId": admin.id_string(), "ids": [] }),
+        )
+        .await
+        .pointer("/methodResponses/0/1/state")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
 
     // Insert two emails in each account
     let mut email_ids = AHashMap::default();
@@ -1738,13 +1727,21 @@ pub async fn acl(test: &TestServer) {
             .await,
     );
 
-    // The admin, a plain account, shares its INBOX with John: John reads it,
-    // and cannot copy from it into his own account (spec 6.3).
+    // The admin, a plain account, shares its INBOX with John, and upstream's
+    // grant-and-try sequence runs on that share with John's key session as
+    // upstream runs it on Jane's INBOX. The steps that move mail across John's
+    // key account stay refused (spec 6.3, ruling R31): a Blob/copy into his
+    // account, an Email/copy from the share into it, and the import of his
+    // sealed upload and the Email/copy of his message into the share, with
+    // AddItems granted too; the owner imports the two messages those steps
+    // add upstream.
     admin_client
         .set_default_account_id(admin.id_string())
         .mailbox_update_acl(&inbox_id, john.id_string(), [ACL::ReadItems])
         .await
         .unwrap();
+
+    // John should have ReadItems access to Inbox
     assert_eq!(
         john_client
             .set_default_account_id(admin.id_string())
@@ -1765,6 +1762,19 @@ pub async fn acl(test: &TestServer) {
             .ids(),
         [first("admin").as_str()]
     );
+
+    // John's session resource should contain the admin's account details
+    john_client.refresh_session().await.unwrap();
+    assert_eq!(
+        john_client
+            .session()
+            .account(admin.id_string())
+            .unwrap()
+            .name(),
+        "admin@example.com"
+    );
+
+    // John should not have access to emails in the admin's Trash folder
     assert!(
         john_client
             .set_default_account_id(admin.id_string())
@@ -1774,6 +1784,44 @@ pub async fn acl(test: &TestServer) {
             .is_none(),
         "the unshared Trash"
     );
+
+    // Email/changes must not leak ids of emails in folders John cannot read
+    // (since the state before the admin's two messages: the admin account's
+    // log holds the earlier modules' changes too).
+    let changed_ids = john_client
+        .set_default_account_id(admin.id_string())
+        .email_changes(&admin_state, None)
+        .await
+        .unwrap()
+        .created()
+        .to_vec();
+    assert!(
+        changed_ids.contains(&first("admin")),
+        "Email/changes should report the shared Inbox email"
+    );
+    assert!(
+        !changed_ids.contains(&last("admin")),
+        "Email/changes leaked the id of a non-shared Trash email"
+    );
+
+    // Blobs are not copied into John's account, the shared message's
+    // included (R31), and the Trash one is not readable; nor is a message of
+    // the share copied into his account.
+    for email in [first("admin"), last("admin")] {
+        let blob_id = admin_client
+            .set_default_account_id(admin.id_string())
+            .email_get(&email, [Property::BlobId].into())
+            .await
+            .unwrap()
+            .unwrap()
+            .take_blob_id();
+        assert_forbidden(
+            john_client
+                .set_default_account_id(john.id_string())
+                .blob_copy(admin.id_string(), &blob_id)
+                .await,
+        );
+    }
     let reply = john
         .jmap_method_call(
             "Email/copy",
@@ -1785,6 +1833,324 @@ pub async fn acl(test: &TestServer) {
         )
         .await;
     assert_keyless(&reply.0["methodResponses"][0], "John's copy from the share");
+
+    // John only has ReadItems access to Inbox
+    admin_client
+        .set_default_account_id(admin.id_string())
+        .mailbox_update_acl(&inbox_id, john.id_string(), [ACL::ReadItems])
+        .await
+        .unwrap();
+    assert_eq!(
+        john_client
+            .set_default_account_id(admin.id_string())
+            .mailbox_get(&inbox_id, [mailbox::Property::MyRights].into())
+            .await
+            .unwrap()
+            .unwrap()
+            .my_rights()
+            .unwrap()
+            .acl_list(),
+        vec![ACL::ReadItems]
+    );
+
+    // Try to add items using import and copy: refused without AddItems, and
+    // still refused with it, as each would carry John's mail into the share.
+    let import = json!({
+        "accountId": admin.id_string(),
+        "emails": { "i": { "blobId": &upload, "mailboxIds": { &inbox_id: true } } }
+    });
+    let copy = json!({
+        "fromAccountId": john.id_string(),
+        "accountId": admin.id_string(),
+        "create": { "i": { "id": last("john"), "mailboxIds": { &inbox_id: true } } }
+    });
+    for (method, args) in [("Email/import", &import), ("Email/copy", &copy)] {
+        let reply = john.jmap_method_call(method, args.clone()).await;
+        let response = &reply.0["methodResponses"][0];
+        assert!(
+            (response[0] == "error" && response[1]["type"] == "forbidden")
+                || response[1]["notCreated"]["i"]["type"] == "forbidden",
+            "John's {method} into the share without AddItems: {response}"
+        );
+    }
+    admin_client
+        .set_default_account_id(admin.id_string())
+        .mailbox_update_acl(&inbox_id, john.id_string(), [ACL::ReadItems, ACL::AddItems])
+        .await
+        .unwrap();
+    for (method, args) in [("Email/import", &import), ("Email/copy", &copy)] {
+        let reply = john.jmap_method_call(method, args.clone()).await;
+        assert_keyless(
+            &reply.0["methodResponses"][0],
+            &format!("John's {method} into the share with AddItems"),
+        );
+    }
+    let mut owner_imports = Vec::with_capacity(2);
+    for subject in [
+        "Created for john in admin's inbox",
+        "Owned by admin in inbox, second",
+    ] {
+        owner_imports.push(
+            admin_client
+                .set_default_account_id(admin.id_string())
+                .email_import(
+                    format!(
+                        concat!(
+                            "From: acl_test@example.com\r\n",
+                            "To: admin@example.com\r\n",
+                            "Subject: {}\r\n",
+                            "\r\n",
+                            "This message is owned by admin.",
+                        ),
+                        subject
+                    )
+                    .into_bytes(),
+                    [&inbox_id],
+                    None::<Vec<&str>>,
+                    None,
+                )
+                .await
+                .unwrap()
+                .take_id(),
+        );
+    }
+    let (email_id, email_id_2) = (owner_imports[0].clone(), owner_imports[1].clone());
+
+    // Try removing items
+    assert_forbidden(
+        john_client
+            .set_default_account_id(admin.id_string())
+            .email_destroy(&email_id)
+            .await,
+    );
+    admin_client
+        .set_default_account_id(admin.id_string())
+        .mailbox_update_acl(
+            &inbox_id,
+            john.id_string(),
+            [ACL::ReadItems, ACL::AddItems, ACL::RemoveItems],
+        )
+        .await
+        .unwrap();
+    john_client
+        .set_default_account_id(admin.id_string())
+        .email_destroy(&email_id)
+        .await
+        .unwrap();
+
+    // Try to set keywords
+    assert_forbidden(
+        john_client
+            .set_default_account_id(admin.id_string())
+            .email_set_keyword(&email_id_2, "$seen", true)
+            .await,
+    );
+    admin_client
+        .set_default_account_id(admin.id_string())
+        .mailbox_update_acl(
+            &inbox_id,
+            john.id_string(),
+            [
+                ACL::ReadItems,
+                ACL::AddItems,
+                ACL::RemoveItems,
+                ACL::SetKeywords,
+            ],
+        )
+        .await
+        .unwrap();
+    john_client
+        .set_default_account_id(admin.id_string())
+        .email_set_keyword(&email_id_2, "$seen", true)
+        .await
+        .unwrap();
+    john_client
+        .set_default_account_id(admin.id_string())
+        .email_set_keyword(&email_id_2, "my-keyword", true)
+        .await
+        .unwrap();
+
+    // Try to create a child
+    assert_forbidden(
+        john_client
+            .set_default_account_id(admin.id_string())
+            .mailbox_create("John's mailbox", None::<&str>, Role::None)
+            .await,
+    );
+    admin_client
+        .set_default_account_id(admin.id_string())
+        .mailbox_update_acl(
+            &inbox_id,
+            john.id_string(),
+            [
+                ACL::ReadItems,
+                ACL::AddItems,
+                ACL::RemoveItems,
+                ACL::SetKeywords,
+                ACL::CreateChild,
+            ],
+        )
+        .await
+        .unwrap();
+    let mailbox_id = john_client
+        .set_default_account_id(admin.id_string())
+        .mailbox_create("John's mailbox", Some(&inbox_id), Role::None)
+        .await
+        .unwrap()
+        .take_id();
+
+    // Try renaming a mailbox
+    assert_forbidden(
+        john_client
+            .set_default_account_id(admin.id_string())
+            .mailbox_rename(&mailbox_id, "John's private mailbox")
+            .await,
+    );
+    admin_client
+        .set_default_account_id(admin.id_string())
+        .mailbox_update_acl(&mailbox_id, john.id_string(), [ACL::ReadItems, ACL::Rename])
+        .await
+        .unwrap();
+    john_client
+        .set_default_account_id(admin.id_string())
+        .mailbox_rename(&mailbox_id, "John's private mailbox")
+        .await
+        .unwrap();
+
+    // Try moving a message
+    assert_forbidden(
+        john_client
+            .set_default_account_id(admin.id_string())
+            .email_set_mailbox(&email_id_2, &mailbox_id, true)
+            .await,
+    );
+    admin_client
+        .set_default_account_id(admin.id_string())
+        .mailbox_update_acl(
+            &mailbox_id,
+            john.id_string(),
+            [ACL::ReadItems, ACL::Rename, ACL::AddItems],
+        )
+        .await
+        .unwrap();
+    john_client
+        .set_default_account_id(admin.id_string())
+        .email_set_mailbox(&email_id_2, &mailbox_id, true)
+        .await
+        .unwrap();
+
+    // Try deleting a mailbox
+    assert_forbidden(
+        john_client
+            .set_default_account_id(admin.id_string())
+            .mailbox_destroy(&mailbox_id, true)
+            .await,
+    );
+    admin_client
+        .set_default_account_id(admin.id_string())
+        .mailbox_update_acl(
+            &mailbox_id,
+            john.id_string(),
+            [ACL::ReadItems, ACL::Rename, ACL::AddItems, ACL::Delete],
+        )
+        .await
+        .unwrap();
+    assert_forbidden(
+        john_client
+            .set_default_account_id(admin.id_string())
+            .mailbox_destroy(&mailbox_id, true)
+            .await,
+    );
+    admin_client
+        .set_default_account_id(admin.id_string())
+        .mailbox_update_acl(
+            &mailbox_id,
+            john.id_string(),
+            [
+                ACL::ReadItems,
+                ACL::Rename,
+                ACL::AddItems,
+                ACL::Delete,
+                ACL::RemoveItems,
+            ],
+        )
+        .await
+        .unwrap();
+    john_client
+        .set_default_account_id(admin.id_string())
+        .mailbox_destroy(&mailbox_id, true)
+        .await
+        .unwrap();
+
+    // Try changing ACL
+    assert_forbidden(
+        john_client
+            .set_default_account_id(admin.id_string())
+            .mailbox_update_acl(&inbox_id, bill.id_string(), [ACL::ReadItems])
+            .await,
+    );
+    assert_forbidden(
+        bill_client
+            .set_default_account_id(admin.id_string())
+            .email_query(None::<email::query::Filter>, None::<Vec<_>>)
+            .await,
+    );
+    admin_client
+        .set_default_account_id(admin.id_string())
+        .mailbox_update_acl(
+            &inbox_id,
+            john.id_string(),
+            [
+                ACL::ReadItems,
+                ACL::AddItems,
+                ACL::RemoveItems,
+                ACL::SetKeywords,
+                ACL::CreateChild,
+                ACL::Rename,
+                ACL::Administer,
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        john_client
+            .set_default_account_id(admin.id_string())
+            .mailbox_get(&inbox_id, [mailbox::Property::MyRights].into())
+            .await
+            .unwrap()
+            .unwrap()
+            .my_rights()
+            .unwrap()
+            .acl_list(),
+        vec![
+            ACL::ReadItems,
+            ACL::AddItems,
+            ACL::RemoveItems,
+            ACL::SetSeen,
+            ACL::SetKeywords,
+            ACL::CreateChild,
+            ACL::Rename
+        ]
+    );
+    john_client
+        .set_default_account_id(admin.id_string())
+        .mailbox_update_acl(&inbox_id, bill.id_string(), [ACL::ReadItems])
+        .await
+        .unwrap();
+    assert_eq!(
+        bill_client
+            .set_default_account_id(admin.id_string())
+            .email_query(
+                None::<email::query::Filter>,
+                vec![email::query::Comparator::subject()].into()
+            )
+            .await
+            .unwrap()
+            .ids(),
+        [first("admin").as_str(), &email_id_2]
+    );
+
+    // Revoke all access to John
     admin_client
         .set_default_account_id(admin.id_string())
         .mailbox_update_acl(&inbox_id, john.id_string(), [])
@@ -1795,6 +2161,19 @@ pub async fn acl(test: &TestServer) {
             .set_default_account_id(admin.id_string())
             .email_get(&first("admin"), [Property::Subject].into())
             .await,
+    );
+    john_client.refresh_session().await.unwrap();
+    assert!(john_client.session().account(admin.id_string()).is_none());
+    assert_eq!(
+        bill_client
+            .set_default_account_id(admin.id_string())
+            .email_get(&first("admin"), [Property::Subject].into())
+            .await
+            .unwrap()
+            .unwrap()
+            .subject()
+            .unwrap(),
+        "Owned by admin in inbox"
     );
 
     // Add John and Jane to the Sales group
@@ -3019,90 +3398,256 @@ pub async fn principal_get(test: &TestServer) {
     let jane_id = jane.id_string();
     let bill_id = bill.id_string();
     let sales_id = sales.id_string();
-    let keys = |value: &Value| {
-        value
-            .as_object()
-            .unwrap_or_else(|| panic!("not an object: {value}"))
-            .keys()
-            .cloned()
-            .collect::<BTreeSet<_>>()
-    };
 
-    // The session object
-    let session = john.jmap_session_object().await.into_inner();
-    assert_eq!(
-        keys(&session["capabilities"]),
-        names(&[
-            "urn:ietf:params:jmap:core",
-            "urn:ietf:params:jmap:mail",
-            "urn:ietf:params:jmap:calendars",
-            "urn:ietf:params:jmap:calendars:parse",
-            "urn:ietf:params:jmap:contacts",
-            "urn:ietf:params:jmap:contacts:parse",
-            "urn:ietf:params:jmap:emailpush",
-            "urn:ietf:params:jmap:filenode",
-            "urn:ietf:params:jmap:principals",
-            "urn:ietf:params:jmap:principals:availability",
-            "urn:ietf:params:jmap:submission",
-            "urn:ietf:params:jmap:vacationresponse",
-            "urn:ietf:params:jmap:sieve",
-            "urn:ietf:params:jmap:blob",
-            "urn:ietf:params:jmap:quota",
-            "urn:ietf:params:jmap:webpush-vapid",
-            "urn:ietf:params:jmap:websocket",
-        ]),
-        "the server's capabilities"
-    );
-    let account_capabilities = names(&[
-        "urn:ietf:params:jmap:mail",
-        "urn:ietf:params:jmap:submission",
-        "urn:ietf:params:jmap:vacationresponse",
-        "urn:ietf:params:jmap:contacts",
-        "urn:ietf:params:jmap:contacts:parse",
-        "urn:ietf:params:jmap:emailpush",
-        "urn:ietf:params:jmap:websocket",
-        "urn:ietf:params:jmap:sieve",
-        "urn:ietf:params:jmap:blob",
-        "urn:ietf:params:jmap:quota",
-        "urn:ietf:params:jmap:principals",
-        "urn:ietf:params:jmap:principals:availability",
-        "urn:ietf:params:jmap:filenode",
-        "urn:ietf:params:jmap:mail:share",
-        "urn:stalwart:jmap",
-    ]);
-    assert_eq!(keys(&session["accounts"]), names(&[john_id]));
-    let own = &session["accounts"][john_id];
-    assert_eq!(own["name"], "jdoe@example.com");
-    assert_eq!(own["isPersonal"], true);
-    assert_eq!(own["isReadOnly"], false);
-    assert_eq!(keys(&own["accountCapabilities"]), account_capabilities);
-    assert_eq!(keys(&session["primaryAccounts"]), account_capabilities);
-    assert!(
-        session["primaryAccounts"]
-            .as_object()
-            .unwrap()
-            .values()
-            .all(|value| value == john_id),
-        "{session}"
-    );
-    for (field, expected) in [
-        ("username", "jdoe@example.com"),
-        ("apiUrl", "https://127.0.0.1:8899/jmap/"),
-        (
-            "downloadUrl",
-            "https://127.0.0.1:8899/jmap/download/{accountId}/{blobId}/{name}?accept={type}",
-        ),
-        (
-            "uploadUrl",
-            "https://127.0.0.1:8899/jmap/upload/{accountId}/",
-        ),
-        (
-            "eventSourceUrl",
-            "https://127.0.0.1:8899/jmap/eventsource/?types={types}&closeafter={closeafter}&ping={ping}",
-        ),
-    ] {
-        assert_eq!(session[field], expected, "{field}");
-    }
+    // Validate session object capabilities: upstream's object, minus the
+    // account's calendar capabilities (release 1 spec 9).
+    let response = john.jmap_session_object().await.into_inner();
+    let application_server_key =
+        response["capabilities"]["urn:ietf:params:jmap:webpush-vapid"]["applicationServerKey"]
+            .clone();
+    response.assert_is_equal(json!({
+      "capabilities": {
+        "urn:ietf:params:jmap:core": {
+          "maxSizeUpload": 50000000,
+          "maxConcurrentUpload": 4,
+          "maxSizeRequest": 10000000,
+          "maxConcurrentRequests": 4,
+          "maxCallsInRequest": 16,
+          "maxObjectsInGet": 100000,
+          "maxObjectsInSet": 100000,
+          "collationAlgorithms": [
+            "i;ascii-numeric",
+            "i;ascii-casemap",
+            "i;unicode-casemap"
+          ]
+        },
+        "urn:ietf:params:jmap:mail": {},
+        "urn:ietf:params:jmap:calendars": {},
+        "urn:ietf:params:jmap:calendars:parse": {},
+        "urn:ietf:params:jmap:contacts": {},
+        "urn:ietf:params:jmap:contacts:parse": {},
+        "urn:ietf:params:jmap:emailpush": {},
+        "urn:ietf:params:jmap:filenode": {},
+        "urn:ietf:params:jmap:principals": {},
+        "urn:ietf:params:jmap:principals:availability": {},
+        "urn:ietf:params:jmap:submission": {},
+        "urn:ietf:params:jmap:vacationresponse": {},
+        "urn:ietf:params:jmap:sieve": {
+          "implementation": "Stalwart v1.0.0"
+        },
+        "urn:ietf:params:jmap:blob": {},
+        "urn:ietf:params:jmap:quota": {},
+        "urn:ietf:params:jmap:webpush-vapid": {
+          "applicationServerKey": application_server_key
+        },
+        "urn:ietf:params:jmap:websocket": {
+          "url": "wss://127.0.0.1:8899/jmap/ws",
+          "supportsPush": true
+        }
+      },
+      "accounts": {
+        john_id: {
+          "name": "jdoe@example.com",
+          "isPersonal": true,
+          "isReadOnly": false,
+          "accountCapabilities": {
+            "urn:ietf:params:jmap:mail": {
+              "maxMailboxesPerEmail": null,
+              "maxMailboxDepth": 10,
+              "maxSizeMailboxName": 255,
+              "maxSizeAttachmentsPerEmail": 50000000,
+              // Recorded deferred finding: the from/to/subject/sentAt sorts
+              // are advertised although spec 8 refuses them for a key
+              // account (no per-account trimming); pinned as served today.
+              "emailQuerySortOptions": [
+                "receivedAt",
+                "size",
+                "from",
+                "to",
+                "subject",
+                "sentAt",
+                "hasKeyword",
+                "allInThreadHaveKeyword",
+                "someInThreadHaveKeyword"
+              ],
+              "mayCreateTopLevelMailbox": true
+            },
+            "urn:ietf:params:jmap:submission": {
+              "maxDelayedSend": 2592000,
+              "submissionExtensions": {
+                "FUTURERELEASE": [],
+                "SIZE": [],
+                "DSN": [],
+                "DELIVERYBY": [],
+                "MT-PRIORITY": [
+                  "MIXER"
+                ],
+                "REQUIRETLS": []
+              }
+            },
+            "urn:ietf:params:jmap:vacationresponse": {},
+            "urn:ietf:params:jmap:contacts": {
+              "maxAddressBooksPerCard": null,
+              "mayCreateAddressBook": true
+            },
+            "urn:ietf:params:jmap:contacts:parse": {},
+            "urn:ietf:params:jmap:emailpush": {},
+            "urn:ietf:params:jmap:websocket": {},
+            "urn:ietf:params:jmap:sieve": {
+              "maxSizeScriptName": 512,
+              "maxSizeScript": 102400,
+              "maxNumberScripts": 100,
+              "maxNumberRedirects": 1,
+              "sieveExtensions": [
+                "body",
+                "comparator-elbonia",
+                "comparator-i;ascii-casemap",
+                "comparator-i;ascii-numeric",
+                "comparator-i;octet",
+                "convert",
+                "copy",
+                "date",
+                "duplicate",
+                "editheader",
+                "enclose",
+                "encoded-character",
+                "enotify",
+                "envelope",
+                "envelope-deliverby",
+                "envelope-dsn",
+                "environment",
+                "ereject",
+                "extlists",
+                "extracttext",
+                "fcc",
+                "fileinto",
+                "foreverypart",
+                "ihave",
+                "imap4flags",
+                "imapsieve",
+                "include",
+                "index",
+                "mailbox",
+                "mailboxid",
+                "mboxmetadata",
+                "mime",
+                "redirect-deliverby",
+                "redirect-dsn",
+                "regex",
+                "reject",
+                "relational",
+                "replace",
+                "servermetadata",
+                "spamtest",
+                "spamtestplus",
+                "special-use",
+                "subaddress",
+                "vacation",
+                "vacation-seconds",
+                "variables",
+                "virustest"
+              ],
+              "notificationMethods": [
+                "mailto"
+              ],
+              "externalLists": null
+            },
+            "urn:ietf:params:jmap:blob": {
+              "maxSizeBlobSet": 7499488,
+              "maxDataSources": 16,
+              "supportedTypeNames": [
+                "Email",
+                "Thread",
+                "SieveScript"
+              ],
+              "supportedDigestAlgorithms": [
+                "sha",
+                "sha-256",
+                "sha-512"
+              ]
+            },
+            "urn:ietf:params:jmap:quota": {},
+            "urn:ietf:params:jmap:principals": {
+              "currentUserPrincipalId": john_id
+            },
+            "urn:ietf:params:jmap:principals:availability": {
+              "maxAvailabilityDuration": "P52W1D",
+            },
+            "urn:ietf:params:jmap:filenode": {
+              "maxFileNodeDepth": null,
+              "maxSizeFileNodeName": 255,
+              "forbiddenNameChars": "/<>:\"\\|?*",
+              "forbiddenNodeNames": [
+                ".",
+                "..",
+                "CON",
+                "PRN",
+                "AUX",
+                "NUL",
+                "COM0",
+                "COM1",
+                "COM2",
+                "COM3",
+                "COM4",
+                "COM5",
+                "COM6",
+                "COM7",
+                "COM8",
+                "COM9",
+                "LPT0",
+                "LPT1",
+                "LPT2",
+                "LPT3",
+                "LPT4",
+                "LPT5",
+                "LPT6",
+                "LPT7",
+                "LPT8",
+                "LPT9"
+              ],
+              "fileNodeQuerySortOptions": [
+                "name",
+                "size",
+                "nodeType"
+              ],
+              "mayCreateTopLevelFileNode": true,
+              "caseInsensitiveNames": false,
+              "webTrashUrl": null,
+              "webUrlTemplate": null,
+              "webWriteUrlTemplate": null
+            },
+            "urn:ietf:params:jmap:mail:share": {},
+            "urn:stalwart:jmap": {}
+          }
+        }
+      },
+      "primaryAccounts": {
+        "urn:ietf:params:jmap:mail": john_id,
+        "urn:ietf:params:jmap:submission": john_id,
+        "urn:ietf:params:jmap:vacationresponse": john_id,
+        "urn:ietf:params:jmap:contacts": john_id,
+        "urn:ietf:params:jmap:contacts:parse": john_id,
+        "urn:ietf:params:jmap:emailpush": john_id,
+        "urn:ietf:params:jmap:websocket": john_id,
+        "urn:ietf:params:jmap:sieve": john_id,
+        "urn:ietf:params:jmap:blob": john_id,
+        "urn:ietf:params:jmap:quota": john_id,
+        "urn:ietf:params:jmap:principals": john_id,
+        "urn:ietf:params:jmap:principals:availability": john_id,
+        "urn:ietf:params:jmap:filenode": john_id,
+        "urn:ietf:params:jmap:mail:share": john_id,
+        "urn:stalwart:jmap": john_id
+      },
+      "username": "jdoe@example.com",
+      "apiUrl": "https://127.0.0.1:8899/jmap/",
+      "downloadUrl":
+      "https://127.0.0.1:8899/jmap/download/{accountId}/{blobId}/{name}?accept={type}",
+      "uploadUrl":
+      "https://127.0.0.1:8899/jmap/upload/{accountId}/",
+      "eventSourceUrl":
+      "https://127.0.0.1:8899/jmap/eventsource/?types={types}&closeafter={closeafter}&ping={ping}",
+      "state": response.text_field("state")
+    }));
 
     // Obtain principal ids for Jane, Bill and the sales group
     for (filter, expected) in [

@@ -208,8 +208,8 @@ pub async fn search(imap: &mut ImapConnection, imap_check: &mut ImapConnection) 
 }
 
 /// `fetch::test` in key mode: the session holds the account's keys, so every
-/// FETCH runs as upstream; only the saved search is rebuilt on `SEEN` (UID
-/// 10, set by the body FETCH before it) instead of `FROM`.
+/// FETCH runs as upstream; only the saved search is rebuilt on the UIDs
+/// upstream's refused `FROM` search finds (1, 4 and 6).
 pub async fn fetch(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
     println!("Running key-account FETCH tests...");
 
@@ -360,16 +360,21 @@ pub async fn fetch(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
         .assert_contains("* 10 FETCH (UID 10 ");
 
     // Fetch using a saved search: upstream's `FROM` search is refused (spec
-    // 8); the saved `SEEN` search holds UID 10.
+    // 8); a saved search on the UIDs it finds (1, 4 and 6) fetches upstream's
+    // three previews.
     assert_search_refused(imap, "UID SEARCH RETURN (SAVE) FROM \"nathaniel\"").await;
-    imap.send("UID SEARCH RETURN (SAVE) SEEN").await;
+    imap.send("UID SEARCH RETURN (SAVE) UID 1,4,6").await;
     imap.assert_read(Type::Tagged, ResponseType::Ok).await;
     imap.send("FETCH $ (UID PREVIEW)").await;
     imap.assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_contains("* 10 FETCH (UID 10 ")
-        .assert_count("FETCH (UID", 1)
-        .assert_contains("but then I thought, why not do both?");
+        .assert_contains("* 1 FETCH (UID 1 ")
+        .assert_contains("* 4 FETCH (UID 4 ")
+        .assert_contains("* 6 FETCH (UID 6 ")
+        .assert_count("FETCH (UID", 3)
+        .assert_contains("Some text appears here")
+        .assert_contains("plain text version of message goes here")
+        .assert_contains("This is implicitly typed plain US-ASCII text.");
 
     // A failing command in a pipelined batch does not swallow the tagged completion of the commands queued behind it
     imap.send_raw(concat!(
@@ -566,9 +571,10 @@ pub async fn thread(imap: &mut ImapConnection, test: &TestServer) {
 /// `acl::test` in key mode. John, Jane and Bill are key accounts and the
 /// Support group is plain: Jane reads and writes the group's shared folders
 /// as upstream; every grant on her own INBOX is refused (mail spec 6.3), so
-/// John and Bill never see it; and a copy or move between her mailboxes and
+/// John and Bill never see it; a copy or move between her mailboxes and
 /// the group's, in either direction, is refused while one inside the group
-/// works.
+/// works; and upstream's MYRIGHTS and i/t/e rights steps run on the admin's
+/// INBOX shared with John and Bill, as on a plain account's share.
 pub async fn acl(imap_john: &mut ImapConnection, test: &TestServer) {
     println!("Running key-account ACL tests...");
     let mut lmtp = SmtpConnection::connect().await;
@@ -728,6 +734,166 @@ pub async fn acl(imap_john: &mut ImapConnection, test: &TestServer) {
             .await
             .assert_count("Shared Folders", 0);
     }
+
+    // A plain account's share: upstream's grant, MYRIGHTS and i/t/e steps run
+    // on the admin's INBOX shared with John and Bill, key sessions in a plain
+    // account, as upstream runs them on Jane's.
+    let admin = test.account("admin@example.com");
+    let shared = format!("Shared Folders/{}/INBOX", admin.name());
+    let mut imap_admin = admin.imap_client().await;
+    imap_admin.send("SETACL INBOX jdoe@example.com lr").await;
+    imap_admin.assert_read(Type::Tagged, ResponseType::Ok).await;
+    imap_john.send("LIST \"\" \"*\"").await;
+    imap_john
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_equals("* LIST (\\NoSelect) \"/\" \"Shared Folders\"")
+        .assert_equals(&format!(
+            "* LIST (\\NoSelect) \"/\" \"Shared Folders/{}\"",
+            admin.name()
+        ))
+        .assert_equals(&format!("* LIST () \"/\" \"{shared}\""));
+
+    // Grant access to Bill and check ACLs
+    imap_admin.send("GETACL INBOX").await;
+    imap_admin
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_contains("\"jdoe@example.com\" rl");
+    imap_admin
+        .send("SETACL INBOX foobar@example.com lrxtws")
+        .await;
+    imap_admin.assert_read(Type::Tagged, ResponseType::Ok).await;
+    imap_admin.send("GETACL INBOX").await;
+    imap_admin
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_contains("\"jdoe@example.com\" rl")
+        .assert_contains("\"foobar@example.com\" tewsrxl");
+    imap_bill.send("LIST \"\" \"*\"").await;
+    imap_bill
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_contains(&shared);
+
+    // Namespace should now return the Shared Folders namespace
+    imap_john.send("NAMESPACE").await;
+    imap_john
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_equals("* NAMESPACE ((\"\" \"/\")) ((\"Shared Folders\" \"/\")) NIL");
+
+    // List John's right on the admin's Inbox
+    imap_john.send(&format!("MYRIGHTS \"{shared}\"")).await;
+    imap_john
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_equals(&format!("* MYRIGHTS \"{shared}\" rl"));
+
+    // John should not be able to append messages
+    assert_append_message(
+        imap_john,
+        &shared,
+        "From: john\n\ncontents",
+        ResponseType::No,
+    )
+    .await;
+
+    // Grant insert access to John on the admin's Inbox, and try inserting
+    // the message again.
+    imap_admin.send("SETACL INBOX jdoe@example.com +i").await;
+    imap_admin.assert_read(Type::Tagged, ResponseType::Ok).await;
+    imap_john.send(&format!("MYRIGHTS \"{shared}\"")).await;
+    imap_john
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_equals(&format!("* MYRIGHTS \"{shared}\" rli"));
+    let uid = assert_append_message(
+        imap_john,
+        &shared,
+        "From: john\n\ncontents",
+        ResponseType::Ok,
+    )
+    .await
+    .into_append_uid();
+
+    // Only Bill should be allowed to delete messages on the admin's Inbox
+    for imap in [&mut *imap_john, &mut imap_bill] {
+        imap.send(&format!("SELECT \"{shared}\"")).await;
+        imap.assert_read(Type::Tagged, ResponseType::Ok).await;
+    }
+    imap_john
+        .send(&format!("UID STORE {uid} +FLAGS (\\Deleted)"))
+        .await;
+    imap_john.assert_read(Type::Tagged, ResponseType::No).await;
+
+    imap_bill
+        .send(&format!("UID STORE {uid} +FLAGS (\\Deleted)"))
+        .await;
+    imap_bill.assert_read(Type::Tagged, ResponseType::Ok).await;
+
+    imap_john.send("UID EXPUNGE").await;
+    imap_john.assert_read(Type::Tagged, ResponseType::No).await;
+
+    imap_john.send(&format!("UID FETCH {uid} (PREVIEW)")).await;
+    imap_john
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_contains("contents");
+
+    imap_bill.send("UID EXPUNGE").await;
+    imap_bill.assert_read(Type::Tagged, ResponseType::Ok).await;
+
+    imap_bill.send(&format!("UID FETCH {uid} (PREVIEW)")).await;
+    imap_bill
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_count("contents", 0);
+
+    imap_bill
+        .send(&format!("STATUS \"{shared}\" (MESSAGES)"))
+        .await;
+    imap_bill
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_contains("(MESSAGES 0)");
+    imap_john.send("UNSELECT").await;
+    imap_john.assert_read(Type::Tagged, ResponseType::Ok).await;
+
+    // The admin stops sharing with Bill, and removes Insert access to John
+    imap_admin.send("DELETEACL INBOX foobar@example.com").await;
+    imap_admin.assert_read(Type::Tagged, ResponseType::Ok).await;
+    imap_admin.send("SETACL INBOX jdoe@example.com -i").await;
+    imap_admin.assert_read(Type::Tagged, ResponseType::Ok).await;
+    imap_admin.send("GETACL INBOX").await;
+    imap_admin
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_contains("\"jdoe@example.com\" rl")
+        .assert_count("foobar@example.com", 0);
+
+    // Bill should not have access to the admin's Inbox anymore
+    imap_bill.send("LIST \"\" \"*\"").await;
+    imap_bill
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_count("Shared Folders", 0);
+
+    // And John should still have access
+    imap_john.send("LIST \"\" \"*\"").await;
+    imap_john
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_count("Shared Folders", 3);
+
+    // The share is removed again: the later sub-modules ran without one.
+    imap_admin.send("DELETEACL INBOX jdoe@example.com").await;
+    imap_admin.assert_read(Type::Tagged, ResponseType::Ok).await;
+    imap_john.send("LIST \"\" \"*\"").await;
+    imap_john
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_count("Shared Folders", 0);
 }
 
 /// `antispam::test` in key mode. Spam training never happens for a key

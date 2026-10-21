@@ -1438,6 +1438,12 @@ pub async fn test_mail(test: &mut TestServer) {
             .any(|v| v.starts_with("blob ") && v.ends_with("decoded blob contains mailbody-canary")),
         "the scanner must find the planted blob's canary:\n{report}"
     );
+    assert!(
+        found
+            .violations
+            .contains(&format!("email {planted}: plaintext message blob")),
+        "the scanner must flag the planted message's plaintext blob:\n{report}"
+    );
     let planted_id = Id::from_parts(planted, planted).to_string();
     let reply = key
         .jmap_method_call(
@@ -1820,6 +1826,12 @@ pub async fn test(test: &mut TestServer) {
         result.violations.is_empty(),
         "leaks found:\n{}",
         result.violations.join("\n")
+    );
+    // The alarm email was delivered above: no held or queued mail remains.
+    assert!(
+        result.undelivered.is_empty(),
+        "held or queued mail after delivery:\n{}",
+        result.undelivered.join("\n")
     );
     // Not blind: e.ics, t.ics, alarm.ics and sched.ics (an in-account
     // collection COPY adds a name to each event document instead of
