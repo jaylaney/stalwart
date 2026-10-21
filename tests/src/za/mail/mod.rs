@@ -289,6 +289,13 @@ pub async fn corrupt_blob(test: &TestServer, hash: &BlobHash) {
     assert_eq!(blob[0], MAIL_FORMAT_V1, "not a sealed blob");
     let last = blob.len() - 1;
     blob[last] ^= 1;
+    // A filesystem blob store keeps a file whose length already matches (its
+    // blobs are content-addressed), so the old one goes first.
+    test.server
+        .blob_store()
+        .delete_blob(hash.as_slice())
+        .await
+        .unwrap();
     test.server
         .blob_store()
         .put_blob(hash.as_slice(), &blob, test.server.core.email.compression)
