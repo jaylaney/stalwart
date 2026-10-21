@@ -697,8 +697,14 @@ async fn za_setup_token(
     // Eligibility: no password credential of any kind (spec 4.1).
     let has_credentials = reg.account.credentials.values().next().is_some();
 
-    // Data checks apply to initial issuance and to reissuance (spec 4.1).
+    // Data checks apply to initial issuance and to reissuance (spec 4.1). A
+    // record without a marker next to data is an issuance that stopped
+    // between its record write and its recheck (mail spec 6.1): it is
+    // removed here as that recheck would have removed it.
     if let Some(response) = za_assert_no_data(server, account_id).await? {
+        if !has_marker && let Some(read) = &previous {
+            za_abort_issuance(server, account_id, read).await?;
+        }
         return Ok(response);
     }
 
@@ -749,35 +755,14 @@ async fn za_setup_token(
     // account.
     if let Some(response) = za_assert_no_data(server, account_id).await? {
         // Ours: the revision and the token hash just written (a revision
-        // restarts at 1 after a delete; the hash is random per issuance),
-        // and still no marker in the registry.
+        // restarts at 1 after a delete; the hash is random per issuance).
         if !has_marker
             && let Some(written) = server.za_vault_record(account_id).await?.filter(|read| {
                 read.record.revision == record.revision
                     && read.record.setup_token_hash == record.setup_token_hash
             })
-            && !za_registry_account(server, account_id)
-                .await?
-                .is_some_and(|reg| {
-                    reg.account
-                        .password_credential()
-                        .is_some_and(|c| c.secret == ZA_MARKER)
-                })
         {
-            // Residual case: two concurrent issuances plus an unfenced
-            // calendar write can still put the other issuance's marker
-            // between this re-read and the delete.
-            match server.za_vault_delete(account_id, &written).await {
-                Ok(()) => (),
-                Err(err) if err.is_assertion_failure() => {
-                    trc::event!(
-                        Auth(trc::AuthEvent::Warning),
-                        AccountId = account_id,
-                        Details = "zero-access: the aborted issuance's pending record changed before its removal",
-                    );
-                }
-                Err(err) => return Err(err),
-            }
+            za_abort_issuance(server, account_id, &written).await?;
         }
         return Ok(response);
     }
@@ -804,6 +789,41 @@ async fn za_setup_token(
     }
 
     Ok(json(SetupTokenResponse { token, expires }))
+}
+
+/// The abort of an issuance that found data (mail spec 6.1), for the
+/// recheck and for a reissue that finds an earlier issuance's record without
+/// its marker: removes the pending record `read`, conditional on its bytes,
+/// unless the marker, re-read here immediately before the delete, has
+/// appeared since. A lost delete (another write replaced the record) is
+/// traced and otherwise ignored; the caller answers its 409 either way.
+async fn za_abort_issuance(server: &Server, account_id: u32, read: &VaultRead) -> trc::Result<()> {
+    if za_registry_account(server, account_id)
+        .await?
+        .is_some_and(|reg| {
+            reg.account
+                .password_credential()
+                .is_some_and(|c| c.secret == ZA_MARKER)
+        })
+    {
+        return Ok(());
+    }
+    // Residual case: two concurrent issuances plus an unfenced calendar
+    // write can still put the other issuance's marker between this re-read
+    // and the delete.
+    match server.za_vault_delete(account_id, read).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.is_assertion_failure() => {
+            trc::event!(
+                Auth(trc::AuthEvent::Warning),
+                AccountId = account_id,
+                Details =
+                    "zero-access: the aborted issuance's pending record changed before its removal",
+            );
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// `setup` and `recover` verify their own credential without passing through

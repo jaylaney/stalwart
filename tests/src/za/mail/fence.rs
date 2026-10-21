@@ -84,6 +84,8 @@ const FENCE7: &str = "fence7@example.com";
 const FENCE8: &str = "fence8@example.com";
 const FENCE9: &str = "fence9@example.com";
 const FENCE10: &str = "fence10@example.com";
+const FENCE11: &str = "fence11@example.com";
+const FENCE12: &str = "fence12@example.com";
 const PLAIN: &str = "plainmail3@example.com";
 /// The organizer of `forward_race_imip_side_write`'s invitation, which it
 /// sends through authenticated submission.
@@ -113,8 +115,10 @@ pub async fn test(test: &mut TestServer) {
     let fence1 = forward_race_delivery_loses(test, &admin).await;
     let (fence2, plain) = forward_race_with_a_staged_blob(test, &admin).await;
     let (fence10, organizer) = forward_race_imip_side_write(test, &admin).await;
+    let fence12 = forward_race_imip_merge(test, &admin).await;
     let fence3 = reverse_race_setup_token_aborts(test, &admin).await;
     let fence4 = reverse_race_reissue_keeps_the_marker(test, &admin).await;
+    let fence11 = reissue_repairs_an_aborted_issuance(test, &admin).await;
     let (fence5, fence6) = copy_message_race(test, &admin).await;
     copy_message_refuses_key_accounts(test, &fence1, &fence5, &fence6).await;
     let fence7 = stress_the_fence(test, &admin).await;
@@ -125,13 +129,14 @@ pub async fn test(test: &mut TestServer) {
     // pending or credentialless, and the account's destruction removes
     // what they hold.
     for account in [
-        &fence1, &fence2, &plain, &fence10, &organizer, &fence3, &fence4, &fence5, &fence6,
+        &fence1, &fence2, &plain, &fence10, &organizer, &fence3, &fence4, &fence11, &fence5,
+        &fence6,
     ] {
         test.destroy_all_mailboxes(account).await;
     }
     for account in [
-        fence1, fence2, plain, fence10, organizer, fence3, fence4, fence5, fence6, fence7, fence8,
-        fence9,
+        fence1, fence2, plain, fence10, organizer, fence12, fence3, fence4, fence11, fence5,
+        fence6, fence7, fence8, fence9,
     ] {
         admin.destroy_account(account).await;
     }
@@ -160,9 +165,19 @@ async fn wait_for_temporary_failure(test: &TestServer, address: &str) {
 }
 
 /// The first attempt of a delivery to `address` whose ingest held a stale
-/// ordinary classification: waits until it either stored a message or left
-/// a temporary failure in the queue, then asserts the latter.
-async fn assert_first_attempt_lost(test: &TestServer, address: &str, account_id: u32) {
+/// ordinary classification, with `traced` started on
+/// `Store(AssertValueFailed)` before it was released: waits until it ended
+/// (a temporary failure in the queue, or a stored message), then asserts
+/// that the account holds no plaintext and that the attempt lost the fence
+/// (a delivery's error names its recipient). The queue may already have
+/// retried by then: a retry falls due a second after the attempt started,
+/// so a provisioning slower than that makes it immediate.
+async fn assert_first_attempt_lost(
+    test: &TestServer,
+    traced: Traced,
+    address: &str,
+    account_id: u32,
+) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !temporarily_failed(test, address).await && message_ids(test, account_id).await.is_empty()
     {
@@ -173,9 +188,12 @@ async fn assert_first_attempt_lost(test: &TestServer, address: &str, account_id:
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_no_plaintext(test, account_id).await;
+    let events = traced.finish().await;
     assert!(
-        message_ids(test, account_id).await.is_empty(),
-        "the stale delivery stored a message"
+        events
+            .iter()
+            .any(|e| e.typ == EventType::Store(StoreEvent::AssertValueFailed) && e.to == address),
+        "the stale delivery to {address} did not lose the fence: {events:?}"
     );
 }
 
@@ -276,8 +294,16 @@ struct Traced {
     rx: mpsc::Receiver<EventBatch>,
 }
 
-/// (type, account id, details, reason) of one captured event.
-type TracedEvent = (EventType, Option<u64>, String, String);
+/// One captured event.
+#[derive(Debug)]
+struct TracedEvent {
+    typ: EventType,
+    account_id: Option<u64>,
+    details: String,
+    reason: String,
+    /// The recipient a delivery's error names (`Key::To`).
+    to: String,
+}
 
 impl Traced {
     fn start(types: &[EventType]) -> Self {
@@ -299,17 +325,25 @@ impl Traced {
         let mut captured = Vec::new();
         while let Ok(batch) = self.rx.try_recv() {
             for event in batch {
-                let (mut account_id, mut details, mut reason) =
-                    (None, String::new(), String::new());
+                let mut traced = TracedEvent {
+                    typ: event.inner.typ,
+                    account_id: None,
+                    details: String::new(),
+                    reason: String::new(),
+                    to: String::new(),
+                };
                 for (key, value) in event.keys.iter() {
                     match (key, value) {
-                        (Key::AccountId, trc::Value::UInt(id)) => account_id = Some(*id),
-                        (Key::Details, trc::Value::String(text)) => details = text.to_string(),
-                        (Key::Reason, trc::Value::String(text)) => reason = text.to_string(),
+                        (Key::AccountId, trc::Value::UInt(id)) => traced.account_id = Some(*id),
+                        (Key::Details, trc::Value::String(text)) => {
+                            traced.details = text.to_string()
+                        }
+                        (Key::Reason, trc::Value::String(text)) => traced.reason = text.to_string(),
+                        (Key::To, trc::Value::String(text)) => traced.to = text.to_string(),
                         _ => {}
                     }
                 }
-                captured.push((event.inner.typ, account_id, details, reason));
+                captured.push(traced);
             }
         }
         Collector::remove_subscriber(SUBSCRIBER_ID.into());
@@ -390,9 +424,10 @@ async fn forward_race_delivery_loses(test: &TestServer, admin: &Account) -> Acco
     // The ingest holds the ordinary classification it read.
     let token = za_setup_token(admin, FENCE1).await;
     za_setup(FENCE1, &token, STRONG).await;
+    let traced = Traced::start(&[EventType::Store(StoreEvent::AssertValueFailed)]);
     parked.finish().await;
 
-    assert_first_attempt_lost(test, FENCE1, id).await;
+    assert_first_attempt_lost(test, traced, FENCE1, id).await;
     wait_for_delivery(test).await;
     let ids = message_ids(test, id).await;
     assert_eq!(ids.len(), 1, "the queue's retry delivered the message");
@@ -458,9 +493,10 @@ async fn forward_race_with_a_staged_blob(test: &TestServer, admin: &Account) -> 
     );
     let token = za_setup_token(admin, FENCE2).await;
     za_setup(FENCE2, &token, STRONG).await;
+    let traced = Traced::start(&[EventType::Store(StoreEvent::AssertValueFailed)]);
     parked.finish().await;
 
-    assert_first_attempt_lost(test, FENCE2, id).await;
+    assert_first_attempt_lost(test, traced, FENCE2, id).await;
     assert!(
         temporary_links(test, id).await.contains(&staged),
         "the lost ingest did not stage the bytes the plain account linked"
@@ -521,16 +557,17 @@ async fn forward_race_imip_side_write(test: &TestServer, admin: &Account) -> (Ac
     let organizer = admin
         .create_user_account(ORGANIZER, STRONG, "Organizer", &[], user_permissions())
         .await;
-    let invitation = invitation();
+    let invitation = invitation(FENCE10, "za-fence-imip", 0, "fence-imip-canary");
     let parked = HookParked::start(id, test_hooks::set_ingest_pause, async move {
         submit(ORGANIZER, FENCE10, &invitation).await;
     })
     .await;
     let token = za_setup_token(admin, FENCE10).await;
     za_setup(FENCE10, &token, STRONG).await;
+    let traced = Traced::start(&[EventType::Store(StoreEvent::AssertValueFailed)]);
     parked.finish().await;
 
-    assert_first_attempt_lost(test, FENCE10, id).await;
+    assert_first_attempt_lost(test, traced, FENCE10, id).await;
     assert_no_calendar_data(test, id, "the stale delivery's iMIP processing").await;
     wait_for_delivery(test).await;
     let ids = message_ids(test, id).await;
@@ -558,12 +595,12 @@ async fn assert_no_calendar_data(test: &TestServer, account_id: u32, after: &str
     }
 }
 
-/// An iMIP REQUEST from `ORGANIZER` inviting `FENCE10`, with a unique
-/// `Message-ID`.
-fn invitation() -> String {
+/// An iMIP REQUEST from `ORGANIZER` inviting `to` to the event `uid` at
+/// `sequence`, with a unique `Message-ID`.
+fn invitation(to: &str, uid: &str, sequence: u32, summary: &str) -> String {
     format!(
         "From: <{ORGANIZER}>\r\n\
-         To: <{FENCE10}>\r\n\
+         To: <{to}>\r\n\
          Subject: fence invitation\r\n\
          Message-ID: <{:016x}.za-fence@example.com>\r\n\
          Date: Tue, 20 Oct 2026 10:00:00 +0000\r\n\
@@ -575,17 +612,157 @@ fn invitation() -> String {
          PRODID:-//za//fence//EN\r\n\
          METHOD:REQUEST\r\n\
          BEGIN:VEVENT\r\n\
-         UID:za-fence-imip\r\n\
+         UID:{uid}\r\n\
+         SEQUENCE:{sequence}\r\n\
          DTSTAMP:20261020T100000Z\r\n\
          DTSTART:20261120T100000Z\r\n\
          DTEND:20261120T110000Z\r\n\
-         SUMMARY:fence-imip-canary\r\n\
+         SUMMARY:{summary}\r\n\
          ORGANIZER:mailto:{ORGANIZER}\r\n\
-         ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{FENCE10}\r\n\
+         ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{to}\r\n\
          END:VEVENT\r\n\
          END:VCALENDAR",
         store::rand::random::<u64>()
     )
+}
+
+/// The account's archives in `collection`, by document id, as stored.
+async fn archives(
+    test: &TestServer,
+    account_id: u32,
+    collection: Collection,
+) -> Vec<(u32, Vec<u8>)> {
+    let mut archives = Vec::new();
+    test.server
+        .store()
+        .iterate(
+            IterateParams::new(
+                ValueKey::archive(account_id, collection, 0),
+                ValueKey::archive(account_id, collection, u32::MAX),
+            ),
+            |key, value| {
+                archives.push((key.deserialize_be_u32(key.len() - U32_LEN)?, value.to_vec()));
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+    archives
+}
+
+/// Ruling R25 of plan 13, the merge side: an iMIP update for an event the
+/// account already holds goes through `commit_itip_merge`, whose batch takes
+/// the fence too. `setup-token` refuses an account holding calendar data,
+/// so the race's record is written directly, as an issuance writes it
+/// (`za_vault_commit` of a pending record): the stale attempt leaves the
+/// stored event and the scheduling inbox untouched, and once the record is
+/// gone the queue's retry merges the update (the control that the update
+/// takes the merge path).
+async fn forward_race_imip_merge(test: &TestServer, admin: &Account) -> Account {
+    println!("forward_race_imip_merge");
+    let account = passwordless(admin, FENCE12).await;
+    let id = account.id().document_id();
+    submit(
+        ORGANIZER,
+        FENCE12,
+        &invitation(FENCE12, "za-fence-merge", 0, "fence merge v1"),
+    )
+    .await;
+    wait_for_delivery(test).await;
+    let events = archives(test, id, Collection::CalendarEvent).await;
+    assert_eq!(events.len(), 1, "the first REQUEST is imported");
+    let items = archives(test, id, Collection::CalendarEventNotification).await;
+    let mails = message_ids(test, id).await;
+
+    let update = invitation(FENCE12, "za-fence-merge", 1, "fence merge v2");
+    let parked = HookParked::start(id, test_hooks::set_ingest_pause, async move {
+        submit(ORGANIZER, FENCE12, &update).await;
+    })
+    .await;
+    let mut record = VaultRecord::pending(vec![3; 32], now() as i64 + 3600);
+    test.server
+        .za_vault_commit(id, &mut record, None, None)
+        .await
+        .unwrap();
+    parked.finish().await;
+
+    wait_for_temporary_failure(test, FENCE12).await;
+    assert_eq!(
+        archives(test, id, Collection::CalendarEvent).await,
+        events,
+        "the stale merge changed the stored event"
+    );
+    assert_eq!(
+        archives(test, id, Collection::CalendarEventNotification).await,
+        items,
+        "the stale merge wrote a scheduling inbox item"
+    );
+    assert_eq!(
+        message_ids(test, id).await,
+        mails,
+        "the stale delivery stored"
+    );
+
+    let read = test.server.za_vault_record(id).await.unwrap().unwrap();
+    test.server.za_vault_delete(id, &read).await.unwrap();
+    wait_for_delivery(test).await;
+    let merged = archives(test, id, Collection::CalendarEvent).await;
+    assert_eq!(merged.len(), 1);
+    assert_eq!(merged[0].0, events[0].0, "the update merges into the event");
+    assert_ne!(
+        merged[0].1, events[0].1,
+        "control: the retry merged the update"
+    );
+    account
+}
+
+/// Ruling R28 of plan 13: an issuance that stopped between its record write
+/// and its recheck leaves a record without a marker; once mail arrived
+/// before it, every ordinary writer loses the fence. The reissue's first
+/// check finds the mail and removes that record as the recheck would have,
+/// answering the same 409, so later deliveries are stored again.
+async fn reissue_repairs_an_aborted_issuance(test: &TestServer, admin: &Account) -> Account {
+    println!("reissue_repairs_an_aborted_issuance");
+    let account = passwordless(admin, FENCE11).await;
+    let id = account.id().document_id();
+    deliver(
+        test,
+        SENDER,
+        FENCE11,
+        &message_with("before", "before-body"),
+    )
+    .await;
+    // The crash state: the pending record, no marker.
+    let mut record = VaultRecord::pending(vec![4; 32], now() as i64 + 3600);
+    test.server
+        .za_vault_commit(id, &mut record, None, None)
+        .await
+        .unwrap();
+
+    let reply = za_post_as(admin, "setup-token", &json!({ "account": FENCE11 })).await;
+    assert_eq!(reply.expect(409)["error"], "account already holds mail");
+    assert!(
+        test.server.za_vault_record(id).await.unwrap().is_none(),
+        "the reissue left the aborted issuance's record"
+    );
+    let before = message_ids(test, id).await;
+    deliver(test, SENDER, FENCE11, &message_with("after", "after-body")).await;
+    let after = super::new_message(test, id, &before).await;
+    assert!(
+        !is_stub(
+            stored_metadata(test, id, after)
+                .await
+                .unarchive::<MessageMetadata>()
+                .unwrap()
+        ),
+        "the ordinary account's delivery is plaintext"
+    );
+
+    admin.destroy_all_mailboxes_for_account(id).await;
+    test.wait_for_tasks().await;
+    let token = za_setup_token(admin, FENCE11).await;
+    za_setup(FENCE11, &token, STRONG).await;
+    account
 }
 
 /// Review F1c: a delivery that commits while `setup-token` sits between its
@@ -662,19 +839,24 @@ async fn reverse_race_reissue_keeps_the_marker(test: &TestServer, admin: &Accoun
         .ingest(SENDER, &[FENCE4], &message_with("pending", "pending-body"))
         .await;
     wait_for_temporary_failure(test, FENCE4).await;
-    let failures = traced.finish().await;
+    // This account's events: its id, or its address as a delivery's error
+    // names the recipient (a store error carries no account id).
+    let failures = traced
+        .finish()
+        .await
+        .into_iter()
+        .filter(|e| e.account_id == Some(u64::from(id.document_id())) || e.to == FENCE4)
+        .collect::<Vec<_>>();
     assert!(
-        failures.iter().any(|(typ, account_id, _, reason)| {
-            *typ == EventType::Store(StoreEvent::UnexpectedError)
-                && *account_id == Some(u64::from(id.document_id()))
-                && reason == NO_SERVED_KEY
+        failures.iter().any(|e| {
+            e.typ == EventType::Store(StoreEvent::UnexpectedError) && e.reason == NO_SERVED_KEY
         }),
         "no no-served-key failure traced for the delivery: {failures:?}"
     );
     assert!(
         !failures
             .iter()
-            .any(|(typ, ..)| *typ == EventType::Store(StoreEvent::AssertValueFailed)),
+            .any(|e| e.typ == EventType::Store(StoreEvent::AssertValueFailed)),
         "the fence refused the delivery: {failures:?}"
     );
     assert!(
@@ -799,8 +981,8 @@ async fn copy_message_refuses_key_accounts(
         .finish()
         .await
         .into_iter()
-        .filter(|(_, _, details, _)| details == COPY_REFUSED)
-        .map(|(_, account_id, ..)| account_id)
+        .filter(|e| e.details == COPY_REFUSED)
+        .map(|e| e.account_id)
         .collect::<Vec<_>>();
     refused.sort_unstable();
     let mut expected = vec![Some(u64::from(empty_id)), Some(u64::from(key_id))];
