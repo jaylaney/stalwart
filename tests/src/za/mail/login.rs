@@ -419,6 +419,9 @@ async fn rf_4_password_change_mid_session(test: &TestServer) {
     let mut first = ImapConnection::connect(b"_a ").await;
     first.authenticate(NAME, STRONG).await;
     first.send_ok("SELECT INBOX").await;
+    first.send("FETCH 1 (BODY[])").await;
+    let opened = body_literal(&first.assert_read(Type::Tagged, ResponseType::Ok).await);
+    assert!(opened.contains(BODY_CANARY), "{opened}");
 
     za_post(
         "password",
@@ -428,10 +431,8 @@ async fn rf_4_password_change_mid_session(test: &TestServer) {
     .expect(200);
     first.send("FETCH 1 (BODY[])").await;
     let before = body_literal(&first.assert_read(Type::Tagged, ResponseType::Ok).await);
-    // Task 3 seals the delivery (mail spec 5.2) and the IMAP readers open it
-    // only from Task 5 on, so FETCH reads the stub until then: the canary is
-    // checked below by opening the stored message with the new password.
-    // Task 5 restores `assert!(before.contains(BODY_CANARY))` here.
+    assert!(before.contains(BODY_CANARY), "{before}");
+    assert_eq!(before, opened, "the open session reads the same bytes");
 
     let mut second = ImapConnection::connect(b"_b ").await;
     let refused = imap_refused(&mut second, NAME, STRONG).await;

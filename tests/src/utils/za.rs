@@ -25,7 +25,11 @@ use common::{
         test_hooks::{self, Pause as HookPause},
     },
 };
-use email::cache::MessageCacheFetch;
+use email::{
+    cache::MessageCacheFetch,
+    mailbox::{INBOX_ID, UidMailbox},
+    message::{index::build_message_metadata, ingest::EmailIngest, metadata::MessageData},
+};
 use groupware::{
     cache::GroupwareCache,
     calendar::{
@@ -41,13 +45,20 @@ use groupware::{
 };
 use http::auth::authenticate::za_test::{self, Pause};
 use hyper::{Method, StatusCode};
-use registry::schema::structs::Task;
+use mail_parser::MessageParser;
+use registry::schema::{
+    enums::IndexDocumentType,
+    structs::{Task, TaskIndexDocument, TaskStatus},
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{future::Future, sync::Arc, time::Duration};
 use store::{
-    Deserialize, IterateParams, ValueKey,
-    write::{AlignedBytes, Archive, BatchBuilder, TaskQueueClass, ValueClass},
+    Deserialize, IterateParams, Serialize as _, ValueKey,
+    write::{
+        AlignedBytes, Archive, Archiver, BatchBuilder, BlobLink, BlobOp, TaskQueueClass,
+        ValueClass, now,
+    },
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -60,7 +71,7 @@ use tokio_rustls::{
     rustls::{self, pki_types::ServerName},
 };
 use types::collection::{Collection, SyncCollection};
-use types::field::{CalendarEventField, PrincipalField};
+use types::field::{CalendarEventField, EmailField, PrincipalField};
 use vault::{
     keys::{
         AAD_PRIVATE_KEY, AAD_PRIVATE_KEY_PINNED, Secret, aad, generate_keypair, unwrap_key,
@@ -473,6 +484,70 @@ async fn insert_event(
     test.server
         .invalidate_local_caches(&[CacheInvalidation::DavResources(account_id)])
         .await;
+    document_id
+}
+
+/// Mail spec 6.6: a plaintext message in INBOX, as an account that held
+/// mail before it became a key account would hold one. `email_ingest`
+/// seals every message of a key account, so the message is written here as
+/// its ordinary path writes one (`index_message`: the blob linked,
+/// `MessageData`, the metadata archive) with its thread container and index
+/// task, as `plant_event` writes an unsealed event. Returns the document id.
+pub async fn plant_plain_message(test: &TestServer, account_id: u32, raw: &str) -> u32 {
+    let server = &test.server;
+    let (blob_hash, blob_hold) = server
+        .put_temporary_blob(account_id, raw.as_bytes(), 60)
+        .await
+        .unwrap();
+    let mut ids = server
+        .assign_email_ids(account_id, [INBOX_ID], true)
+        .await
+        .unwrap();
+    let document_id = ids.next().unwrap();
+    let uid = ids.next().unwrap();
+    let metadata = build_message_metadata(
+        MessageParser::new().parse(raw.as_bytes()).unwrap(),
+        Vec::new(),
+        Vec::new(),
+        blob_hash.clone(),
+        now(),
+    );
+    let data = MessageData {
+        mailboxes: vec![UidMailbox::new(INBOX_ID, uid)].into_boxed_slice(),
+        keywords: Box::default(),
+        thread_id: document_id,
+        size: raw.len() as u32,
+    };
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(account_id)
+        .with_collection(Collection::Thread)
+        .with_document(document_id)
+        .log_container_insert(SyncCollection::Thread)
+        .with_collection(Collection::Email)
+        .with_document(document_id)
+        .set(
+            BlobOp::Link {
+                hash: blob_hash,
+                to: BlobLink::Document,
+            },
+            Vec::new(),
+        )
+        .custom(ObjectIndexBuilder::<(), _>::new().with_changes(data))
+        .unwrap()
+        .set(
+            EmailField::Metadata,
+            Archiver::new(metadata).serialize().unwrap(),
+        )
+        .schedule_task(Task::IndexDocument(TaskIndexDocument {
+            account_id: account_id.into(),
+            document_id: document_id.into(),
+            document_type: IndexDocumentType::Email,
+            status: TaskStatus::now(),
+        }))
+        .clear(blob_hold);
+    server.commit_batch(batch).await.unwrap();
+    server.notify_task_queue();
     document_id
 }
 

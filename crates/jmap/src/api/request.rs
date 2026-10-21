@@ -501,7 +501,7 @@ impl RequestHandler for Server {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_is_member(req.account_id)?;
 
-                    self.email_submission_set(*req, &session.instance, next_call)
+                    self.email_submission_set(*req, access_token, &session.instance, next_call)
                         .await?
                         .into()
                 }

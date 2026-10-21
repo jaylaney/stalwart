@@ -24,8 +24,8 @@ use email::{
 };
 use registry::schema::structs::SpamTrainingSample;
 use store::{
-    IterateParams, ValueKey,
-    write::{AlignedBytes, Archive, IndexPropertyClass, ValueClass},
+    IterateParams, Serialize, ValueKey,
+    write::{AlignedBytes, Archive, Archiver, BatchBuilder, IndexPropertyClass, ValueClass},
 };
 use types::{blob_hash::BlobHash, collection::Collection, field::EmailField};
 use utils::cheeky_hash::CheekyHash;
@@ -33,6 +33,7 @@ use utils::cheeky_hash::CheekyHash;
 pub mod delivery;
 pub mod fence;
 pub mod login;
+pub mod reads;
 pub mod writes;
 
 /// A fresh key account, registered with the test server.
@@ -218,6 +219,43 @@ pub async fn open_message(
     let raw = open_mail_blob(&blob, &keys, Some(private_key), account_id)
         .unwrap_or_else(|err| panic!("the blob does not open: {err}"));
     (metadata, raw.to_vec())
+}
+
+/// Mail spec 10: the stub rewritten with one byte flipped in its bundle's
+/// tag, at the end of `raw_headers`, as a well-formed archive: the archive
+/// reads, the bundle does not open.
+pub async fn corrupt_stub(test: &TestServer, account_id: u32, document_id: u32) {
+    let mut stub = stored_metadata(test, account_id, document_id)
+        .await
+        .deserialize::<MessageMetadata>()
+        .unwrap();
+    assert_eq!(stub.raw_headers[0], MAIL_FORMAT_V1, "not a stub");
+    let last = stub.raw_headers.len() - 1;
+    stub.raw_headers[last] ^= 1;
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(account_id)
+        .with_collection(Collection::Email)
+        .with_document(document_id)
+        .set(
+            EmailField::Metadata,
+            Archiver::new(stub).serialize().unwrap(),
+        );
+    test.server.store().write(batch.build_all()).await.unwrap();
+}
+
+/// Mail spec 10: the blob `hash` rewritten with one byte flipped in its
+/// sealed body's tag.
+pub async fn corrupt_blob(test: &TestServer, hash: &BlobHash) {
+    let mut blob = stored_blob(test, hash).await;
+    assert_eq!(blob[0], MAIL_FORMAT_V1, "not a sealed blob");
+    let last = blob.len() - 1;
+    blob[last] ^= 1;
+    test.server
+        .blob_store()
+        .put_blob(hash.as_slice(), &blob, test.server.core.email.compression)
+        .await
+        .unwrap();
 }
 
 /// Spam training samples (`RegistryClass::Item` records), every account's.

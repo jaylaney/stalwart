@@ -6,13 +6,18 @@
 
 use common::{
     Server,
+    auth::AccessToken,
     config::smtp::queue::QueueName,
     network::{ServerInstance, stream::NullIo},
     storage::index::ObjectIndexBuilder,
+    za::ZA_MAIL_UNREADABLE,
 };
 use email::{
     identity::Identity,
-    message::metadata::{ArchivedMetadataHeaderName, ArchivedMetadataHeaderValue, MessageMetadata},
+    message::{
+        metadata::{ArchivedMetadataHeaderName, ArchivedMetadataHeaderValue, MessageMetadata},
+        za::view::{ZaMailView, za_readable},
+    },
     submission::{Address, Delivered, DeliveryStatus, EmailSubmission, UndoStatus},
 };
 use jmap_proto::{
@@ -47,6 +52,7 @@ pub trait EmailSubmissionSet: Sync + Send {
     fn email_submission_set<'x>(
         &self,
         request: SetRequest<'x, email_submission::EmailSubmission>,
+        access_token: &AccessToken,
         instance: &Arc<ServerInstance>,
         next_call: &mut Option<Call<RequestMethod<'x>>>,
     ) -> impl Future<Output = trc::Result<SetResponse<email_submission::EmailSubmission>>> + Send;
@@ -54,6 +60,7 @@ pub trait EmailSubmissionSet: Sync + Send {
     fn send_message(
         &self,
         account_id: u32,
+        access_token: &AccessToken,
         response: &SetResponse<email_submission::EmailSubmission>,
         instance: &Arc<ServerInstance>,
         object: Value<'_, EmailSubmissionProperty, EmailSubmissionValue>,
@@ -66,6 +73,7 @@ impl EmailSubmissionSet for Server {
     async fn email_submission_set<'x>(
         &self,
         mut request: SetRequest<'x, email_submission::EmailSubmission>,
+        access_token: &AccessToken,
         instance: &Arc<ServerInstance>,
         next_call: &mut Option<Call<RequestMethod<'x>>>,
     ) -> trc::Result<SetResponse<email_submission::EmailSubmission>> {
@@ -79,7 +87,7 @@ impl EmailSubmissionSet for Server {
         let mut batch = BatchBuilder::new();
         for (id, object) in request.unwrap_create() {
             match self
-                .send_message(account_id, &response, instance, object)
+                .send_message(account_id, access_token, &response, instance, object)
                 .await?
             {
                 Ok(submission) => {
@@ -359,6 +367,7 @@ impl EmailSubmissionSet for Server {
     async fn send_message(
         &self,
         account_id: u32,
+        access_token: &AccessToken,
         response: &SetResponse<email_submission::EmailSubmission>,
         instance: &Arc<ServerInstance>,
         object: Value<'_, EmailSubmissionProperty, EmailSubmissionValue>,
@@ -563,7 +572,17 @@ impl EmailSubmissionSet for Server {
                 .with_property(EmailSubmissionProperty::EmailId)
                 .with_description("Email not found.")));
         };
-        let metadata = metadata_
+        // Mail spec 6.5, 7, 10: the unsealed view and blob; an unreadable
+        // message fails its submission.
+        let keys = self.za_mail_keys(access_token, account_id).await?;
+        let Some(view) = za_readable(
+            self.za_metadata_view(&metadata_, keys.as_deref(), account_id, submission.email_id)
+                .await,
+        )?
+        else {
+            return Ok(Err(za_unreadable_email()));
+        };
+        let metadata = view
             .unarchive::<MessageMetadata>()
             .caused_by(trc::location!())?;
 
@@ -654,6 +673,19 @@ impl EmailSubmissionSet for Server {
             .get_blob(metadata.blob_hash.0.as_slice(), 0..usize::MAX)
             .await?
         {
+            let Some(message) = za_readable(
+                self.za_open_message_blob(
+                    matches!(view, Cow::Owned(_)),
+                    keys.as_deref(),
+                    account_id,
+                    submission.email_id,
+                    message,
+                )
+                .await,
+            )?
+            else {
+                return Ok(Err(za_unreadable_email()));
+            };
             if message.len() > self.core.email.mail_max_size {
                 return Ok(Err(SetError::new(SetErrorType::InvalidEmail)
                     .with_description(format!(
@@ -870,4 +902,11 @@ fn rcpt_into_static(rcpt: RcptTo<Cow<'_, str>>) -> RcptTo<Cow<'static, str>> {
         rrvs: rcpt.rrvs,
         flags: rcpt.flags,
     }
+}
+
+/// Mail spec 10: the submission of a message that does not open.
+fn za_unreadable_email() -> SetError<EmailSubmissionProperty> {
+    SetError::invalid_properties()
+        .with_property(EmailSubmissionProperty::EmailId)
+        .with_description(ZA_MAIL_UNREADABLE)
 }

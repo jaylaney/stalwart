@@ -5,10 +5,13 @@
  */
 
 use crate::{Session, protocol::response::Response};
-use common::network::SessionStream;
-use email::message::metadata::MessageMetadata;
+use common::{network::SessionStream, za::ZA_MAIL_UNREADABLE};
+use email::message::{
+    metadata::MessageMetadata,
+    za::view::{ZaMailView, za_readable},
+};
 use registry::schema::enums::Permission;
-use std::time::Instant;
+use std::{borrow::Cow, time::Instant};
 use store::{
     ValueKey,
     write::{AlignedBytes, Archive},
@@ -39,7 +42,26 @@ impl<T: SessionStream> Session<T> {
                 .await
                 .caused_by(trc::location!())?
             {
-                let metadata = metadata_
+                // Mail spec 7, 10: the unsealed view and blob; an unreadable
+                // message answers -ERR.
+                let keys = self
+                    .server
+                    .za_mail_keys(self.state.access_token(), mailbox.account_id)
+                    .await?;
+                let Some(view) = za_readable(
+                    self.server
+                        .za_metadata_view(
+                            &metadata_,
+                            keys.as_deref(),
+                            mailbox.account_id,
+                            message.id,
+                        )
+                        .await,
+                )?
+                else {
+                    return Err(unreadable());
+                };
+                let metadata = view
                     .unarchive::<MessageMetadata>()
                     .caused_by(trc::location!())?;
                 if let Some(bytes) = self
@@ -49,6 +71,20 @@ impl<T: SessionStream> Session<T> {
                     .await
                     .caused_by(trc::location!())?
                 {
+                    let Some(bytes) = za_readable(
+                        self.server
+                            .za_open_message_blob(
+                                matches!(view, Cow::Owned(_)),
+                                keys.as_deref(),
+                                mailbox.account_id,
+                                message.id,
+                                bytes,
+                            )
+                            .await,
+                    )?
+                    else {
+                        return Err(unreadable());
+                    };
                     trc::event!(
                         Pop3(trc::Pop3Event::Fetch),
                         SpanId = self.session_id,
@@ -82,4 +118,9 @@ impl<T: SessionStream> Session<T> {
             Err(trc::Pop3Event::Error.into_err().details("No such message."))
         }
     }
+}
+
+/// Mail spec 10: the answer for a message that does not open.
+fn unreadable() -> trc::Error {
+    trc::Pop3Event::Error.into_err().details(ZA_MAIL_UNREADABLE)
 }

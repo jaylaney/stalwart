@@ -368,11 +368,17 @@ pub fn spawn_push_manager(inner: Arc<Inner>) -> mpsc::Sender<Event> {
                                         {
                                             if let PushNotification::EmailPush(email_push) =
                                                 &notification
-                                                && !subscription
+                                                && (!subscription
                                                     .server
                                                     .email_push
                                                     .iter()
                                                     .any(|ep| ep.account_id == account_id)
+                                                    // Mail spec 7: a key account's push
+                                                    // carries state changes only.
+                                                    || server
+                                                        .za_is_key_account(account_id)
+                                                        .await
+                                                        .unwrap_or(true))
                                             {
                                                 notification = PushNotification::StateChange(
                                                     email_push.to_state_change(),

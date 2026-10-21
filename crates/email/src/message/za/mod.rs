@@ -8,6 +8,7 @@
 
 pub mod ingest;
 pub mod seal;
+pub mod view;
 
 pub use seal::*;
 

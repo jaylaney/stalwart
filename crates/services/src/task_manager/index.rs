@@ -6,7 +6,13 @@
 
 use crate::task_manager::{Task, TaskDetails, TaskFailureType, TaskResult, deferred_retry_time};
 use common::Server;
-use email::{cache::MessageCacheFetch, message::metadata::MessageMetadata};
+use email::{
+    cache::MessageCacheFetch,
+    message::{
+        metadata::{MESSAGE_RECEIVED_MASK, MessageData, MessageMetadata},
+        za::is_stub,
+    },
+};
 use groupware::{
     cache::GroupwareCache,
     calendar::{CalendarEvent, seal::archived_event_is_sealed},
@@ -25,7 +31,7 @@ use store::{
     IterateParams, ValueKey,
     ahash::AHashMap,
     rand::{self, RngExt},
-    search::{IndexDocument, SearchField, SearchFilter, SearchQuery},
+    search::{EmailSearchField, IndexDocument, SearchField, SearchFilter, SearchQuery},
     write::{
         AlignedBytes, Archive, BatchBuilder, SearchIndex, TelemetryClass, ValueClass,
         key::DeserializeBigEndian, now,
@@ -461,6 +467,37 @@ async fn build_email_document(
             let metadata = metadata_
                 .unarchive::<MessageMetadata>()
                 .caused_by(trc::location!())?;
+
+            // Mail spec 5.5: a key account's message, or a stub reached past
+            // the account check (the destroyed-account window), is indexed
+            // by its visible fields alone, read without a key; no blob.
+            if server.za_is_key_account(account_id).await? || is_stub(metadata) {
+                let Some(data) = server
+                    .store()
+                    .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                        account_id,
+                        Collection::Email,
+                        document_id,
+                    ))
+                    .await?
+                else {
+                    return Ok(BuildResult::NotFound);
+                };
+                let size = data
+                    .unarchive::<MessageData>()
+                    .caused_by(trc::location!())?
+                    .size
+                    .to_native();
+                let mut document = IndexDocument::new(SearchIndex::Email)
+                    .with_account_id(account_id)
+                    .with_document_id(document_id);
+                document.index_unsigned(
+                    EmailSearchField::ReceivedAt,
+                    metadata.rcvd_attach.to_native() & MESSAGE_RECEIVED_MASK,
+                );
+                document.index_unsigned(EmailSearchField::Size, size);
+                return Ok(BuildResult::Document(document));
+            }
 
             let raw_message = server
                 .blob_store()
