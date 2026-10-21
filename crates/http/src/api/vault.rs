@@ -58,7 +58,7 @@ use store::{
 };
 use subtle::ConstantTimeEq;
 use trc::AddContext;
-use types::{collection::Collection, id::Id};
+use types::{collection::Collection, field::EmailField, id::Id};
 
 /// Lifetime of a setup token (spec 4.1).
 pub const SETUP_TOKEN_TTL_SECS: i64 = 7 * 86400;
@@ -886,9 +886,15 @@ async fn za_assert_no_data(server: &Server, account_id: u32) -> trc::Result<Opti
     if za_has_user_calendars(server, account_id).await? {
         return Ok(Some(conflict("account already holds calendar data")));
     }
+    // Mail ruling R46: a destroyed message's metadata archive (field 71),
+    // blob link and search document stay until its unindex task runs, so
+    // until then the account still holds that message's plaintext.
     if server
         .za_has_documents(account_id, Collection::Email)
         .await?
+        || server
+            .za_has_property(account_id, Collection::Email, EmailField::Metadata)
+            .await?
     {
         return Ok(Some(conflict("account already holds mail")));
     }

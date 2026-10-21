@@ -23,7 +23,10 @@ use store::{
     write::{AlignedBytes, Archive, Archiver, BatchBuilder, ValueClass, assert::AssertValue, now},
 };
 use trc::AddContext;
-use types::{collection::Collection, field::PrincipalField};
+use types::{
+    collection::Collection,
+    field::{Field, PrincipalField},
+};
 use utils::{DomainPart, sanitize_email};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -620,12 +623,27 @@ impl Server {
         account_id: u32,
         collection: Collection,
     ) -> trc::Result<bool> {
+        self.za_has_property(account_id, collection, Field::ARCHIVE)
+            .await
+    }
+
+    /// True when any document of `collection` in the account holds the
+    /// property `field`. Mail ruling R46: a destroyed message's metadata
+    /// archive (`EmailField::Metadata`) outlives its archive until the
+    /// scheduled unindex task runs.
+    pub async fn za_has_property(
+        &self,
+        account_id: u32,
+        collection: Collection,
+        field: impl Into<u8>,
+    ) -> trc::Result<bool> {
+        let field = field.into();
         let mut found = false;
         self.store()
             .iterate(
                 IterateParams::new(
-                    ValueKey::archive(account_id, collection, 0),
-                    ValueKey::archive(account_id, collection, u32::MAX),
+                    ValueKey::property(account_id, collection, 0, field),
+                    ValueKey::property(account_id, collection, u32::MAX, field),
                 )
                 .no_values()
                 .only_first(),

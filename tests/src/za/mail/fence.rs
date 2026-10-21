@@ -22,7 +22,10 @@ use crate::{
         account::Account,
         server::TestServer,
         smtp::SmtpConnection,
-        za::{Conn, HookParked, wait_for_delivery, za_post_as, za_setup, za_setup_token},
+        za::{
+            Conn, HookParked, hold_task_consumer, wait_for_delivery, za_post_as, za_setup,
+            za_setup_token,
+        },
     },
     za::{STRONG, raw_input::SUBMISSION_PORT, user_permissions},
 };
@@ -59,13 +62,17 @@ use store::{
     IterateParams, U32_LEN, U64_LEN, ValueKey,
     registry::write::{RegistryWrite, RegistryWriteResult},
     roaring::RoaringBitmap,
-    write::{BatchBuilder, BlobLink, BlobOp, ValueClass, key::DeserializeBigEndian, now},
+    write::{
+        AlignedBytes, Archive, BatchBuilder, BlobLink, BlobOp, ValueClass,
+        key::DeserializeBigEndian, now,
+    },
 };
 use trc::{EventType, Key, SecurityEvent, StoreEvent};
 use types::{
     blob::BlobClass,
     blob_hash::{BLOB_HASH_LEN, BlobHash},
     collection::Collection,
+    field::EmailField,
     id::Id,
 };
 use vault::{ZA_MARKER, record::VaultRecord};
@@ -82,6 +89,8 @@ const FENCE9: &str = "fence9@example.com";
 const FENCE10: &str = "fence10@example.com";
 const FENCE11: &str = "fence11@example.com";
 const FENCE12: &str = "fence12@example.com";
+/// `setup_refuses_a_pending_unindex`'s account (ruling R46).
+const PENDING_UNINDEX: &str = "keymail14@example.com";
 const PLAIN: &str = "plainmail3@example.com";
 /// The organizer of `forward_race_imip_side_write`'s invitation, which it
 /// sends through authenticated submission.
@@ -121,6 +130,7 @@ pub async fn test(test: &mut TestServer) {
     let fence7 = stress_the_fence(test, &admin).await;
     let fence8 = pg_and_mysql_are_refused(test, &admin).await;
     let fence9 = setup_refuses_existing_mail(test, &admin).await;
+    let pending_unindex = setup_refuses_a_pending_unindex(test, &admin).await;
 
     // The accounts that log in empty their own mailboxes; the others are
     // pending or credentialless, and the account's destruction removes
@@ -132,8 +142,21 @@ pub async fn test(test: &mut TestServer) {
         test.destroy_all_mailboxes(account).await;
     }
     for account in [
-        fence1, fence2, plain, fence10, organizer, fence12, fence3, fence4, fence11, fence5,
-        fence6, fence7, fence8, fence9,
+        fence1,
+        fence2,
+        plain,
+        fence10,
+        organizer,
+        fence12,
+        fence3,
+        fence4,
+        fence11,
+        fence5,
+        fence6,
+        fence7,
+        fence8,
+        fence9,
+        pending_unindex,
     ] {
         admin.destroy_account(account).await;
     }
@@ -1147,5 +1170,80 @@ async fn setup_refuses_existing_mail(test: &TestServer, admin: &Account) -> Acco
     admin.destroy_all_mailboxes_for_account(id).await;
     test.wait_for_tasks().await;
     za_setup_token(admin, FENCE9).await;
+    account
+}
+
+/// The metadata archive (field 71) of message `document_id`, if stored.
+async fn metadata_archive(
+    test: &TestServer,
+    account_id: u32,
+    document_id: u32,
+) -> Option<Archive<AlignedBytes>> {
+    test.server
+        .store()
+        .get_value::<Archive<AlignedBytes>>(ValueKey::property(
+            account_id,
+            Collection::Email,
+            document_id,
+            EmailField::Metadata,
+        ))
+        .await
+        .unwrap()
+}
+
+/// Ruling R46 of plan 13 (review F1): destroying a message removes its
+/// `MessageData` (field 50) at once and leaves its plaintext metadata
+/// archive (field 71), blob link and search document to the scheduled
+/// unindex task. While that task has not run, issuance answers the same 409
+/// as for mail present (spec 6.6's "empty the mailbox, then provision"); it
+/// succeeds once the task has run.
+async fn setup_refuses_a_pending_unindex(test: &TestServer, admin: &Account) -> Account {
+    println!("setup_refuses_a_pending_unindex");
+    let account = passwordless(admin, PENDING_UNINDEX).await;
+    let id = account.id().document_id();
+    deliver(
+        test,
+        SENDER,
+        PENDING_UNINDEX,
+        &message_with("pending unindex", "pending-unindex-body"),
+    )
+    .await;
+    let ids = message_ids(test, id).await;
+    assert_eq!(ids.len(), 1, "{ids:?}");
+
+    let held = hold_task_consumer(test).await;
+    admin.destroy_all_mailboxes_for_account(id).await;
+    // The window: the message's `MessageData` is gone, its metadata archive
+    // is not.
+    assert!(
+        !test
+            .server
+            .za_has_documents(id, Collection::Email)
+            .await
+            .unwrap(),
+        "the destroy left the message's MessageData"
+    );
+    assert!(
+        metadata_archive(test, id, ids[0]).await.is_some(),
+        "the metadata archive was removed before the unindex task ran"
+    );
+    let reply = za_post_as(admin, "setup-token", &json!({ "account": PENDING_UNINDEX })).await;
+    assert_eq!(
+        reply.expect(409)["error"],
+        "account already holds mail",
+        "issuance while the destroyed message's metadata archive is stored"
+    );
+    assert!(
+        test.server.za_vault_record(id).await.unwrap().is_none(),
+        "the refused issuance wrote a record"
+    );
+
+    drop(held);
+    test.wait_for_tasks().await;
+    assert!(
+        metadata_archive(test, id, ids[0]).await.is_none(),
+        "the unindex task left the metadata archive"
+    );
+    za_setup_token(admin, PENDING_UNINDEX).await;
     account
 }
