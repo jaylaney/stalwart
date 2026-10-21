@@ -6,12 +6,18 @@
 
 //! Mail spec 3.3 and 4: the IMAP and POP3 login gate. A mail session of a
 //! key account exists only with the account's session keys. Also the error
-//! a refused mail access answers with (spec 6.3, 10), and the refusals of a
-//! copy across accounts and of sharing a key account's mailbox (spec 6.3).
+//! a refused mail access answers with (spec 6.3, 10), the refusals of a
+//! copy across accounts and of sharing a key account's mailbox, and the
+//! rule that a key account's mail is reached only by its own sessions (spec
+//! 6.3).
 
-use super::{ZA_MAIL_KEYLESS, ZA_TRACE_MAIL_COPY, ZA_TRACE_MAIL_LOGIN, ZA_TRACE_MAIL_SHARING};
+use super::{
+    ZA_MAIL_KEYLESS, ZA_TRACE_MAIL_COPY, ZA_TRACE_MAIL_KEYLESS, ZA_TRACE_MAIL_LOGIN,
+    ZA_TRACE_MAIL_SHARING,
+};
 use crate::{Server, auth::AccessToken};
 use std::sync::Arc;
+use types::acl::AclGrant;
 use vault::session::SessionKeys;
 
 /// Mail spec 6.3, 10: the error of a mail write or read refused for a key
@@ -24,6 +30,19 @@ pub fn za_keyless_refusal() -> trc::Error {
         .into_err()
         .details(ZA_MAIL_KEYLESS)
         .code("NOPERM")
+}
+
+/// Mail spec 6.3, ruling I3: whether `new` grants any account a right that
+/// `current` does not, an addition or a widening, which a key account's
+/// mailbox refuses; a removal or a narrowing only reduces access and passes.
+pub fn za_acl_widens(new: &[AclGrant], current: &[AclGrant]) -> bool {
+    new.iter().any(|grant| {
+        let held = current
+            .iter()
+            .find(|held| held.account_id == grant.account_id)
+            .map_or(0, |held| held.grants.bitmap);
+        grant.grants.bitmap & !held != 0
+    })
 }
 
 /// Whether `err` is `za_keyless_refusal`'s error, for a caller that answers
@@ -85,6 +104,43 @@ impl Server {
                 Details = ZA_TRACE_MAIL_COPY,
             );
             Err(za_keyless_refusal().account_id(from_account_id))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Mail spec 6.3, ruling R34: whether `account_id` is a key account other
+    /// than the token's own. Its mail is reached only by its own sessions,
+    /// whatever route another token holds: a grant made before provisioning,
+    /// a group's grant, impersonation, a token cached or kept by a WebSocket
+    /// from before.
+    pub async fn za_foreign_key_account(
+        &self,
+        access_token: &AccessToken,
+        account_id: u32,
+    ) -> trc::Result<bool> {
+        Ok(!access_token.is_account_id(account_id) && self.za_is_key_account(account_id).await?)
+    }
+
+    /// Mail spec 6.3, ruling R34: refuses a mail access to a foreign key
+    /// account (`za_foreign_key_account`), traced as `Security(Unauthorized)`
+    /// naming it, with `ZA_TRACE_MAIL_KEYLESS`, and answered with the keyless
+    /// refusal. Any other account passes.
+    pub async fn za_assert_mail_route(
+        &self,
+        access_token: &AccessToken,
+        account_id: u32,
+    ) -> trc::Result<()> {
+        if self
+            .za_foreign_key_account(access_token, account_id)
+            .await?
+        {
+            trc::event!(
+                Security(trc::SecurityEvent::Unauthorized),
+                AccountId = account_id,
+                Details = ZA_TRACE_MAIL_KEYLESS,
+            );
+            Err(za_keyless_refusal().account_id(account_id))
         } else {
             Ok(())
         }

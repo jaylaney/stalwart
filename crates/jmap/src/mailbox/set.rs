@@ -9,8 +9,11 @@ use crate::{
     changes::state::JmapCacheState,
 };
 use common::{
-    Server, auth::AccessToken, sharing::EffectiveAcl, storage::index::ObjectIndexBuilder,
-    za::ZA_MAIL_KEYLESS,
+    Server,
+    auth::AccessToken,
+    sharing::EffectiveAcl,
+    storage::index::ObjectIndexBuilder,
+    za::{ZA_MAIL_KEYLESS, mail::za_acl_widens},
 };
 #[allow(unused_imports)]
 use email::mailbox::{INBOX_ID, JUNK_ID, TRASH_ID, UidMailbox};
@@ -612,8 +615,15 @@ impl MailboxSet for Server {
         // Refresh ACLs
         let current = update.map(|(_, current)| current);
         if has_acl_changes {
-            // Mail spec 6.3: a key account's mailboxes are not shared.
-            if self.za_mail_sharing_refused(ctx.account_id).await? {
+            // Mail spec 6.3, ruling I3: no grant is added to or widened on a
+            // key account's mailbox; a removal or a narrowing passes.
+            if za_acl_widens(
+                &changes.acls,
+                current
+                    .as_ref()
+                    .map_or(&[][..], |m| m.inner.acls.as_slice()),
+            ) && self.za_mail_sharing_refused(ctx.account_id).await?
+            {
                 return Ok(Err(SetError::forbidden().with_description(ZA_MAIL_KEYLESS)));
             }
             if !changes.acls.is_empty()

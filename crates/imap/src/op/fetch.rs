@@ -357,12 +357,6 @@ impl<T: SessionStream> SessionData<T> {
             .get_cached_messages(account_id)
             .await
             .imap_ctx(&arguments.tag, trc::location!())?;
-        // Mail spec 7: the account's keys, once for the command.
-        let keys = self
-            .server
-            .za_mail_keys(&self.access_token, account_id)
-            .await
-            .map_err(|err| err.id(arguments.tag.clone()))?;
         let mut unreadable = false;
         // Only these attributes are served without the message's content
         // (from the cache and the stored stub's visible fields); any other
@@ -378,6 +372,17 @@ impl<T: SessionStream> SessionData<T> {
                     | Attribute::ObjectId
             )
         });
+        // Mail spec 7, ruling R33: the account's keys, once for the command,
+        // only when an attribute reads content; the owner's session opened
+        // before its account was provisioned holds none and reads flags.
+        let keys = if needs_content {
+            self.server
+                .za_mail_keys(&self.access_token, account_id)
+                .await
+                .map_err(|err| err.id(arguments.tag.clone()))?
+        } else {
+            None
+        };
 
         for (seqnum, uid, id) in ids {
             // Obtain attributes and keywords

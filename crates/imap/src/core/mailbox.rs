@@ -55,6 +55,15 @@ impl<T: SessionStream> SessionData<T> {
 
         // Fetch shared mailboxes
         for &account_id in session.access_token.shared_accounts(Collection::Mailbox) {
+            // Mail spec 6.3, ruling R34: not a key account's.
+            if session
+                .server
+                .za_foreign_key_account(&session.access_token, account_id)
+                .await
+                .caused_by(trc::location!())?
+            {
+                continue;
+            }
             let prefix: String = format!(
                 "{}/{}",
                 session.server.core.email.shared_folder,
@@ -257,6 +266,15 @@ impl<T: SessionStream> SessionData<T> {
 
             // Fetch mailboxes for each new shared account
             for account_id in added_account_ids {
+                // Mail spec 6.3, ruling R34: not a key account's.
+                if self
+                    .server
+                    .za_foreign_key_account(&access_token, account_id)
+                    .await
+                    .caused_by(trc::location!())?
+                {
+                    continue;
+                }
                 let prefix: String = format!(
                     "{}/{}",
                     self.server.core.email.shared_folder,
@@ -276,6 +294,9 @@ impl<T: SessionStream> SessionData<T> {
             // Update state
             self.state.store(state, Ordering::Relaxed);
         }
+        // Mail spec 6.3, ruling R34: whatever the token still grants.
+        self.za_unlist_key_accounts(&access_token, &mut changes)
+            .await?;
 
         // Fetch mailbox changes for all accounts
         let mut changed_accounts = Vec::new();
@@ -405,6 +426,11 @@ impl<T: SessionStream> SessionData<T> {
         document_id: u32,
         item: Acl,
     ) -> trc::Result<bool> {
+        // Mail spec 6.3, ruling R34: a key account's mailbox is used only by
+        // its own sessions.
+        self.server
+            .za_assert_mail_route(&self.access_token, account_id)
+            .await?;
         let access_token = self.refresh_access_token().await?;
         Ok(access_token.is_member(account_id)
             || self

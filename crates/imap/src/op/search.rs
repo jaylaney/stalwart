@@ -267,6 +267,12 @@ impl<T: SessionStream> SessionData<T> {
         mailbox: &SelectedMailbox,
         prev_saved_search: &Option<Option<Arc<Vec<ImapId>>>>,
     ) -> trc::Result<(Vec<u32>, bool)> {
+        // Mail spec 6.3, ruling R34: SEARCH, SORT and THREAD read a key
+        // account's mailbox only in its own sessions.
+        self.server
+            .za_assert_mail_route(&self.access_token, mailbox.id.account_id)
+            .await?;
+
         // Obtain message ids
         let mut filters = Vec::with_capacity(imap_filter.len() + 1);
         let cache = self

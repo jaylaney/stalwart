@@ -77,6 +77,12 @@ impl<T: SessionStream> SessionData<T> {
     }
 
     pub async fn synchronize_messages(&self, mailbox: &SelectedMailbox) -> trc::Result<u64> {
+        // Mail spec 6.3, ruling R34: a key account's selected mailbox is read
+        // only by its own sessions (FETCH, STORE, SEARCH, SORT, THREAD,
+        // UIDBATCHES, the source of COPY and MOVE).
+        self.server
+            .za_assert_mail_route(&self.access_token, mailbox.id.account_id)
+            .await?;
         // Obtain current modseq
         let mut current_modseq = mailbox.state.lock().modseq;
         if let Some(new_state) = self

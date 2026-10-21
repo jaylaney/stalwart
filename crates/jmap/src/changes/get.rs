@@ -119,6 +119,19 @@ impl ChangesLookup for Server {
                 return Err(trc::JmapEvent::CannotCalculateChanges.into_err());
             }
         };
+        // Mail spec 6.3, ruling R34: a key account's mail changes are read only
+        // by its own sessions (Email, Mailbox, Thread and EmailSubmission
+        // `/changes`, and the `/queryChanges` built on them).
+        if matches!(
+            object,
+            MethodObject::Email
+                | MethodObject::Mailbox
+                | MethodObject::Thread
+                | MethodObject::EmailSubmission
+        ) {
+            self.za_assert_mail_route(access_token, request.account_id.document_id())
+                .await?;
+        }
         let max_changes = std::cmp::min(
             request
                 .max_changes

@@ -8,9 +8,11 @@
 //! JMAP dispatcher refuses the key-needing methods to a token without the
 //! account's keys and serves the keyless ones; copies and moves across
 //! accounts, and a sealed source read into another account (ruling R31),
-//! are refused when either side is a key account; a key account's
-//! mailboxes cannot be shared, and a grant made before the account was
-//! provisioned stops routing (ruling R5).
+//! are refused when either side is a key account; no grant is added to or
+//! widened on a key account's mailbox, while one is removed or narrowed
+//! (ruling I3); and a key account's mail is reached only by its own sessions
+//! whatever the route (ruling R34): a grant made before provisioning (ruling
+//! R5), a group's grant, impersonation.
 
 use super::{Traced, deliver, fence::set_marker, key_mail_account, message_ids, message_with};
 use crate::{
@@ -29,12 +31,18 @@ use crate::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use common::za::ZA_MAIL_KEYLESS;
-use email::mailbox::{INBOX_ID, TRASH_ID};
+use email::mailbox::{DRAFTS_ID, INBOX_ID, TRASH_ID};
 use imap_proto::ResponseType;
+use registry::schema::prelude::ObjectType;
 use serde_json::{Value, json};
 use std::time::Duration;
 use trc::{EventType, SecurityEvent, StoreEvent};
-use types::id::Id;
+use types::{
+    blob::{BlobClass, BlobId},
+    blob_hash::BlobHash,
+    collection::Collection,
+    id::Id,
+};
 
 const KEY: &str = "keymail8@example.com";
 const OTHER_KEY: &str = "keymail9@example.com";
@@ -42,6 +50,13 @@ const PLAIN: &str = "plainmail7@example.com";
 const OTHER_PLAIN: &str = "plainmail8@example.com";
 /// `rf_2_stale_grant`'s account: plain when it shares, then provisioned.
 const STALE: &str = "plainmail9@example.com";
+/// `owner_stale_keyless_session`'s account: logged in plain, then provisioned.
+const OWNER: &str = "plainmail10@example.com";
+/// `group_member_stale_token`'s accounts: the one that shares with the group
+/// and is then provisioned, the group's member, and the group.
+const GROUP_OWNER: &str = "plainmail11@example.com";
+const MEMBER: &str = "plainmail12@example.com";
+const GROUP: &str = "mailgroup1@example.com";
 const SENDER: &str = "sender@example.org";
 /// In every message of the key accounts; no answer to another session and
 /// no trace carries it.
@@ -93,13 +108,31 @@ pub async fn test(test: &mut TestServer) {
     }
 
     keyless_tokens_hit_the_dispatcher_gate(test, &key).await;
+    impersonation_is_refused(&admin, &key, &plain).await;
     cross_account_copies_are_refused(test, &key, &plain, &other_plain).await;
     sharing_is_refused_on_key_mailboxes(&key, &plain).await;
-    let stale = rf_2_stale_grant(test, &admin, &plain).await;
+    let stale = rf_2_stale_grant(test, &admin, &plain, &other_plain).await;
+    revocation_is_allowed(&stale, &other_plain).await;
+    let (group, shared, member) = group_member_stale_token(test, &admin).await;
+    let owner = owner_stale_keyless_session(test, &admin).await;
 
-    for account in [&key, &other_key, &plain, &other_plain, &stale] {
+    for account in [
+        &key,
+        &other_key,
+        &plain,
+        &other_plain,
+        &stale,
+        &shared,
+        &member,
+        &owner,
+    ] {
         test.destroy_all_mailboxes(account).await;
     }
+    // A member's session lists its group's own mailboxes, which creates
+    // them.
+    admin
+        .destroy_all_mailboxes_for_account(group.id().document_id())
+        .await;
     // Uploads are temporary links: expired here, as the purge would.
     test.blob_expire_all().await;
     wait_for_delivery(test).await;
@@ -199,6 +232,29 @@ fn created_email(mailbox_id: u32, subject: &str, attachments: Value) -> Value {
     })
 }
 
+/// The account's email state, read with its own credential.
+async fn email_state(account: &Account) -> String {
+    account
+        .jmap_method_call(
+            "Email/get",
+            json!({ "accountId": account.id_string(), "ids": [] }),
+        )
+        .await
+        .state()
+        .to_string()
+}
+
+/// Provisions `account`, a plain account created with a password: setup
+/// requires an account without credentials (spec 4.1), so they are removed
+/// first; the new password is `STRONG`. The account is registered with the
+/// test server, whose suite end destroys key accounts.
+async fn provision(test: &mut TestServer, admin: &Account, account: &mut Account) {
+    set_marker(&test.server, account.id(), false).await;
+    let token = za_setup_token(admin, account.name()).await;
+    account.recovery_key = Some(za_setup(account.name(), &token, STRONG).await);
+    test.insert_account(account.clone());
+}
+
 /// A keyless channel of the key account: its OAuth Bearer token over HTTP,
 /// or a WebSocket (which never holds keys, spec 3.3).
 enum Keyless {
@@ -254,7 +310,10 @@ impl Keyless {
 /// the key-needing methods answer `forbidden` with `ZA_MAIL_KEYLESS` at the
 /// dispatcher, traced once per call as `Security(Unauthorized)` naming the
 /// account, with no method or argument in the trace; the keyless methods,
-/// Email/set's updates and destroys among them, succeed.
+/// Email/set's updates and destroys among them, succeed for the owner.
+/// Review M2: the refused calls carry arguments the method itself would
+/// answer otherwise (a blob, identity or mailbox that does not exist, too
+/// many ids, equal accounts), so only the gate answers `forbidden`.
 async fn keyless_tokens_hit_the_dispatcher_gate(test: &TestServer, key: &Account) {
     println!("keyless_tokens_hit_the_dispatcher_gate");
     let key_id = key.id().document_id();
@@ -262,7 +321,6 @@ async fn keyless_tokens_hit_the_dispatcher_gate(test: &TestServer, key: &Account
     let list = emails(key).await;
     assert_eq!(list.len(), 1, "{list:?}");
     let email_id = list[0]["id"].as_str().unwrap().to_string();
-    let blob_id = list[0]["blobId"].as_str().unwrap().to_string();
     let thread_id = list[0]["threadId"].as_str().unwrap().to_string();
     // A message per channel for its keyless destroy, created with the
     // account's keys.
@@ -279,11 +337,7 @@ async fn keyless_tokens_hit_the_dispatcher_gate(test: &TestServer, key: &Account
             .await;
         destroy_ids.push(accepted(&reply, "/created/d/id", "a message to destroy").to_string());
     }
-    let email_state = key
-        .jmap_method_call("Email/get", json!({ "accountId": account, "ids": [] }))
-        .await
-        .state()
-        .to_string();
+    let email_state = email_state(key).await;
     let thread_state = key
         .jmap_method_call("Thread/get", json!({ "accountId": account, "ids": [] }))
         .await
@@ -301,6 +355,19 @@ async fn keyless_tokens_hit_the_dispatcher_gate(test: &TestServer, key: &Account
         .unwrap()
         .to_string();
 
+    // A blob id of the account that does not exist, and a missing identity
+    // or mailbox.
+    let missing_blob = BlobId {
+        hash: BlobHash::generate(b"gates missing blob"),
+        class: BlobClass::Linked {
+            account_id: key_id,
+            collection: Collection::Email.into(),
+            document_id: 9999,
+        },
+        section: None,
+    }
+    .to_string();
+    let missing = Id::from(9999u32).to_string();
     // The gate answers before the method reads its arguments: an Email/get
     // of more ids than `maxObjectsInGet` is refused, not too large.
     let max_objects = key.jmap_session_object().await.0["capabilities"]["urn:ietf:params:jmap:core"]
@@ -318,7 +385,7 @@ async fn keyless_tokens_hit_the_dispatcher_gate(test: &TestServer, key: &Account
         ),
         (
             "Email/parse",
-            json!({ "accountId": account, "blobIds": [&blob_id] }),
+            json!({ "accountId": account, "blobIds": [&missing_blob] }),
         ),
         (
             "SearchSnippet/get",
@@ -326,15 +393,15 @@ async fn keyless_tokens_hit_the_dispatcher_gate(test: &TestServer, key: &Account
         ),
         (
             "Blob/get",
-            json!({ "accountId": account, "ids": [&blob_id] }),
+            json!({ "accountId": account, "ids": [&missing_blob] }),
         ),
         (
             "Blob/upload",
-            json!({ "accountId": account, "create": { "b": { "data": [{ "data:asText": CANARY }] } } }),
+            json!({ "accountId": account, "create": { "b": { "data": [{ "blobId": &missing_blob }] } } }),
         ),
         (
             "Email/import",
-            json!({ "accountId": account, "emails": { "i": { "blobId": &blob_id, "mailboxIds": { inbox(): true } } } }),
+            json!({ "accountId": account, "emails": { "i": { "blobId": &missing_blob, "mailboxIds": { &missing: true } } } }),
         ),
         (
             "Email/copy",
@@ -342,11 +409,11 @@ async fn keyless_tokens_hit_the_dispatcher_gate(test: &TestServer, key: &Account
         ),
         (
             "EmailSubmission/set",
-            json!({ "accountId": account, "create": { "s": { "emailId": &email_id, "identityId": Id::from(0u32).to_string() } } }),
+            json!({ "accountId": account, "create": { "s": { "emailId": &email_id, "identityId": &missing } } }),
         ),
         (
             "Email/set",
-            json!({ "accountId": account, "create": { "e": created_email(INBOX_ID, "keyless create", json!([])) } }),
+            json!({ "accountId": account, "create": { "e": created_email(9999, "keyless create", json!([])) } }),
         ),
     ];
 
@@ -464,13 +531,71 @@ async fn keyless_tokens_hit_the_dispatcher_gate(test: &TestServer, key: &Account
     );
 }
 
+/// Ruling R34: an Impersonate holder (the admin) passes upstream's access
+/// checks for every account, a key account's mail included; the keyless
+/// mail methods refuse it there, and nothing changes.
+async fn impersonation_is_refused(admin: &Account, key: &Account, plain: &Account) {
+    println!("impersonation_is_refused");
+    let key_id = key.id().document_id();
+    let account = key.id_string();
+    // The control: the admin reads a plain account's mailboxes.
+    assert_eq!(
+        first(
+            &admin
+                .jmap_method_call(
+                    "Mailbox/get",
+                    json!({ "accountId": plain.id_string(), "ids": null }),
+                )
+                .await
+        )[0],
+        "Mailbox/get",
+        "control: the admin's impersonation"
+    );
+    let email_id = emails(key).await[0]["id"].as_str().unwrap().to_string();
+    let state = email_state(key).await;
+    let traced = Traced::start(&[EventType::Security(SecurityEvent::Unauthorized)]);
+    for (method, args) in [
+        ("Mailbox/get", json!({ "accountId": account, "ids": null })),
+        (
+            "Email/query",
+            json!({ "accountId": account, "filter": { "inMailbox": inbox() } }),
+        ),
+        (
+            "Email/changes",
+            json!({ "accountId": account, "sinceState": state }),
+        ),
+        (
+            "Email/set",
+            json!({ "accountId": account, "destroy": [&email_id] }),
+        ),
+    ] {
+        assert_refused(
+            first(&admin.jmap_method_call(method, args).await),
+            &format!("{method} by an Impersonate holder"),
+        );
+    }
+    let refused = traced
+        .finish()
+        .await
+        .into_iter()
+        .filter(|e| e.details == KEYLESS_REFUSED)
+        .map(|e| e.account_id)
+        .collect::<Vec<_>>();
+    assert_eq!(refused, vec![Some(u64::from(key_id)); 4], "the refusals");
+    assert_eq!(
+        emails(key).await.len(),
+        1,
+        "the refused destroy removed the message"
+    );
+}
+
 /// Mail spec 6.3, 9, ruling R31: a copy or move across accounts is refused
 /// when either side is a key account, over IMAP (`NO [NOPERM]`) and JMAP
-/// (`forbidden`), and so is `Blob/copy`; a key account's sealed upload or
-/// section does not become another account's message through Email/import
-/// or an Email/set attachment. Between plain accounts the copy works, and
-/// within the key account the import and the attachment do. Nothing is
-/// stored by a refused call.
+/// (`forbidden`), in both directions (review M3), and so is `Blob/copy`; a
+/// key account's sealed upload or section does not become another
+/// account's message through Email/import or an Email/set attachment.
+/// Between plain accounts the copy works, and within the key account the
+/// import and the attachment do. Nothing is stored by a refused call.
 async fn cross_account_copies_are_refused(
     test: &TestServer,
     key: &Account,
@@ -489,7 +614,8 @@ async fn cross_account_copies_are_refused(
     let plain_before = message_ids(test, plain_id).await;
     let traced = Traced::start(&[EventType::Security(SecurityEvent::Unauthorized)]);
 
-    // IMAP: the key account's COPY and UID MOVE into the plain share.
+    // IMAP: the key account's COPY and UID MOVE into the plain share, and
+    // its COPY out of the share into its own inbox.
     let mut imap = ImapConnection::connect(b"_k ").await;
     imap.authenticate(KEY, STRONG).await;
     imap.send(r#"LIST "" "*""#).await;
@@ -507,6 +633,12 @@ async fn cross_account_copies_are_refused(
             .assert_response_code("NOPERM")
             .assert_contains(ZA_MAIL_KEYLESS);
     }
+    imap.send_ok(&format!("SELECT \"{shared_name}\"")).await;
+    imap.send("COPY 1 INBOX").await;
+    imap.assert_read(Type::Tagged, ResponseType::No)
+        .await
+        .assert_response_code("NOPERM")
+        .assert_contains(ZA_MAIL_KEYLESS);
     imap.send_ok("LOGOUT").await;
     // The plain account cannot name the key account's mailbox.
     owner.send(r#"LIST "" "*""#).await;
@@ -523,7 +655,8 @@ async fn cross_account_copies_are_refused(
         .await
         .assert_response_code("TRYCREATE");
 
-    // JMAP Email/copy, both directions.
+    // JMAP Email/copy, both directions, and into the key account from the
+    // key account's own client.
     let key_email = emails(key).await[0]["id"].as_str().unwrap().to_string();
     let plain_list = emails(plain).await;
     let plain_email = plain_list[0]["id"].as_str().unwrap().to_string();
@@ -542,6 +675,13 @@ async fn cross_account_copies_are_refused(
                 .await,
         ),
         "Email/copy out of the key account",
+    );
+    assert_refused(
+        first(
+            &key.jmap_method_call("Email/copy", copy(plain, key, &plain_email))
+                .await,
+        ),
+        "Email/copy into the key account by its own client",
     );
     assert_forbidden(
         first(
@@ -626,22 +766,23 @@ async fn cross_account_copies_are_refused(
     assert_eq!(
         message_ids(test, key_id).await,
         key_before,
-        "a refused move changed the key account"
+        "a refused copy or move changed the key account"
     );
     let events = traced.finish().await;
-    let copies = events
+    let mut copies = events
         .iter()
         .filter(|e| e.details == COPY_REFUSED)
         .map(|e| e.account_id)
         .collect::<Vec<_>>();
+    copies.sort_unstable();
     // IMAP COPY and MOVE and JMAP Email/copy name the source account,
     // Blob/copy the key account, the R31 refusals the source's owner: the
-    // key account every time.
-    assert_eq!(
-        copies,
-        vec![Some(u64::from(key_id)); 7],
-        "the copy refusals' traces: {events:?}"
-    );
+    // key account seven times, the plain account for the two copies into
+    // the key account.
+    let mut expected = vec![Some(u64::from(key_id)); 7];
+    expected.extend([Some(u64::from(plain_id)); 2]);
+    expected.sort_unstable();
+    assert_eq!(copies, expected, "the copy refusals' traces: {events:?}");
     for event in &events {
         assert!(!event.text.contains(CANARY), "{event:?}");
     }
@@ -686,10 +827,11 @@ async fn cross_account_copies_are_refused(
     owner.send_ok("LOGOUT").await;
 }
 
-/// Mail spec 6.3, 9: a key account's mailboxes cannot be shared, over IMAP
-/// (SETACL and DELETEACL, `NO [NOPERM]`) or JMAP (`shareWith`, `forbidden`),
-/// with a `zero-access:` trace; reading its own rights still works. A plain
-/// account shares with a key account, which reads the share's plaintext.
+/// Mail spec 6.3, 9, ruling I3: no grant is added to a key account's
+/// mailbox, over IMAP (SETACL, `NO [NOPERM]`) or JMAP (`shareWith`,
+/// `forbidden`), with a `zero-access:` trace; reading its own rights still
+/// works. A plain account shares with a key account, which reads the
+/// share's plaintext.
 async fn sharing_is_refused_on_key_mailboxes(key: &Account, plain: &Account) {
     println!("sharing_is_refused_on_key_mailboxes");
     let key_id = key.id().document_id();
@@ -699,7 +841,6 @@ async fn sharing_is_refused_on_key_mailboxes(key: &Account, plain: &Account) {
     for command in [
         format!("SETACL INBOX {PLAIN} lr"),
         format!("SETACL INBOX {OTHER_KEY} lr"),
-        format!("DELETEACL INBOX {PLAIN}"),
     ] {
         imap.send(&command).await;
         imap.assert_read(Type::Tagged, ResponseType::No)
@@ -769,7 +910,7 @@ async fn sharing_is_refused_on_key_mailboxes(key: &Account, plain: &Account) {
         .collect::<Vec<_>>();
     assert_eq!(
         refused,
-        vec![Some(u64::from(key_id)); 5],
+        vec![Some(u64::from(key_id)); 4],
         "one trace per refused share"
     );
 
@@ -795,14 +936,37 @@ async fn sharing_is_refused_on_key_mailboxes(key: &Account, plain: &Account) {
     owner.send_ok("LOGOUT").await;
 }
 
-/// Review focus 2, rulings R5 and R11: a plain account shares its inbox,
-/// then is provisioned. Its grantee no longer lists, selects, appends to or
-/// reads the mailbox (IMAP and JMAP, its session object included); a
-/// grantee session that had selected the mailbox before reads a message
-/// delivered after with `NO [NOPERM]` and the `zero-access:` trace, never
-/// an unreadable-message error, and no plaintext. Returns the provisioned
-/// account.
-async fn rf_2_stale_grant(test: &mut TestServer, admin: &Account, plain: &Account) -> Account {
+/// Asserts the IMAP command's answer is `NO [NOPERM]` with the keyless
+/// text and no content.
+async fn assert_imap_refused(imap: &mut ImapConnection, command: &str) {
+    imap.send(command).await;
+    let lines = imap
+        .assert_read(Type::Tagged, ResponseType::No)
+        .await
+        .assert_response_code("NOPERM")
+        .assert_contains(ZA_MAIL_KEYLESS);
+    assert!(
+        !lines.iter().any(|line| line.contains("canary")),
+        "{command}: {lines:?}"
+    );
+}
+
+/// Review focus 2, rulings R5, R11 and R34: a plain account shares its
+/// inbox, then is provisioned. A grantee session that had selected the
+/// mailbox before reads a message delivered after with `NO [NOPERM]` and
+/// the `zero-access:` trace, never an unreadable-message error, and no
+/// plaintext; its STORE, EXPUNGE and flag FETCH are refused as well, and its
+/// NOOP and IDLE complete without an update while the owner's mail changes.
+/// The grantee no longer lists, selects, appends to or reads the mailbox
+/// (IMAP and JMAP, its session object included). Returns the provisioned
+/// account, which still holds a grant to `plain` on its inbox and one to
+/// `other_plain` on its drafts.
+async fn rf_2_stale_grant(
+    test: &mut TestServer,
+    admin: &Account,
+    plain: &Account,
+    other_plain: &Account,
+) -> Account {
     println!("rf_2_stale_grant");
     let mut stale = admin
         .create_user_account(STALE, STRONG, "Stale grant", &[], user_permissions())
@@ -812,6 +976,9 @@ async fn rf_2_stale_grant(test: &mut TestServer, admin: &Account, plain: &Accoun
     let mut owner = ImapConnection::connect(b"_o ").await;
     owner.authenticate(STALE, STRONG).await;
     owner.send_ok(&format!("SETACL INBOX {PLAIN} lrswi")).await;
+    owner
+        .send_ok(&format!("SETACL Drafts {OTHER_PLAIN} lr"))
+        .await;
     owner.send_ok("LOGOUT").await;
 
     // The grantee's sessions, opened while the account is plain: an IMAP
@@ -839,12 +1006,14 @@ async fn rf_2_stale_grant(test: &mut TestServer, admin: &Account, plain: &Accoun
             .is_some(),
         "control: the session object lists the share's account"
     );
+    assert!(
+        other_plain.jmap_session_object().await.0["accounts"]
+            .get(stale.id_string())
+            .is_some(),
+        "control: the drafts share"
+    );
 
-    // Provisioning: setup requires an account without credentials.
-    set_marker(&test.server, stale.id(), false).await;
-    let token = za_setup_token(admin, STALE).await;
-    stale.recovery_key = Some(za_setup(STALE, &token, STRONG).await);
-    test.insert_account(stale.clone());
+    provision(test, admin, &mut stale).await;
     deliver(
         test,
         SENDER,
@@ -858,26 +1027,54 @@ async fn rf_2_stale_grant(test: &mut TestServer, admin: &Account, plain: &Accoun
         EventType::Security(SecurityEvent::Unauthorized),
         EventType::Store(StoreEvent::DataCorruption),
     ]);
-    // Ruling R11: the session selected before provisioning reaches the stub
-    // and is refused without its owner's keys.
-    imap.send("FETCH 1 (BODY[])").await;
-    let lines = imap
-        .assert_read(Type::Tagged, ResponseType::No)
-        .await
-        .assert_response_code("NOPERM")
-        .assert_contains(ZA_MAIL_KEYLESS);
-    assert!(
-        !lines.iter().any(|line| line.contains("canary")),
-        "{lines:?}"
-    );
-    // The share is gone from the grantee's listing (the filter in
-    // `build_access_token`, the token rebuilt by ruling R5).
+    // Ruling R11: the session selected before provisioning reaches the
+    // message and is refused (ruling R34's rule, before the stub opens).
+    assert_imap_refused(&mut imap, "FETCH 1 (BODY[])").await;
+    for command in ["STORE 1 +FLAGS (\\Seen)", "EXPUNGE", "FETCH 1 (FLAGS)"] {
+        assert_imap_refused(&mut imap, command).await;
+    }
+    // The share is gone from the grantee's listing (ruling R34's listing,
+    // the filter in `build_access_token` and the token rebuilt by ruling R5).
     imap.send(r#"LIST "" "*""#).await;
     imap.assert_read(Type::Tagged, ResponseType::Ok)
         .await
         .assert_not_contains(STALE);
+
+    // The owner changes its mail while the grantee session waits: NOOP and
+    // IDLE complete without an update.
+    let mut keyed = ImapConnection::connect(b"_m ").await;
+    keyed.authenticate(STALE, STRONG).await;
+    keyed.send_ok("SELECT INBOX").await;
+    keyed.send_ok("STORE 1 +FLAGS (\\Flagged)").await;
+    deliver(
+        test,
+        SENDER,
+        STALE,
+        &message_with(&format!("{CANARY} second"), "second canary"),
+    )
+    .await;
+    imap.send("NOOP").await;
+    let lines = imap.assert_read(Type::Tagged, ResponseType::Ok).await;
+    assert_eq!(lines.len(), 1, "an update after NOOP: {lines:?}");
+    imap.send("IDLE").await;
+    imap.assert_read(Type::Continuation, ResponseType::Ok).await;
+    keyed.send_ok("STORE 1 -FLAGS (\\Flagged)").await;
+    deliver(
+        test,
+        SENDER,
+        STALE,
+        &message_with(&format!("{CANARY} third"), "third canary"),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    imap.send_untagged("DONE").await;
+    let lines = imap.assert_read(Type::Tagged, ResponseType::Ok).await;
+    assert_eq!(lines.len(), 1, "an update during IDLE: {lines:?}");
+    keyed.send_ok("LOGOUT").await;
+
     imap.send(&format!("SELECT \"{shared_name}\"")).await;
     imap.assert_read(Type::Tagged, ResponseType::No).await;
+    let before_append = message_ids(test, stale_id).await;
     let message = message_with("stale append", "stale append body");
     imap.send(&format!(
         "APPEND \"{shared_name}\" {{{}+}}\r\n{message}",
@@ -913,7 +1110,7 @@ async fn rf_2_stale_grant(test: &mut TestServer, admin: &Account, plain: &Accoun
     );
     assert_eq!(
         message_ids(test, stale_id).await,
-        vec![stale_doc],
+        before_append,
         "the refused APPEND stored a message"
     );
 
@@ -934,4 +1131,239 @@ async fn rf_2_stale_grant(test: &mut TestServer, admin: &Account, plain: &Accoun
         assert!(!event.text.contains("canary"), "{event:?}");
     }
     stale
+}
+
+/// Ruling I3: the owner of a key account removes or narrows the grants its
+/// mailboxes carry from before provisioning, over IMAP (DELETEACL, SETACL
+/// with `-rights`) and JMAP (`shareWith` removal); adding or widening one
+/// stays refused. `stale` holds a grant to plainmail7 on its inbox and one
+/// to `other_plain` on its drafts.
+async fn revocation_is_allowed(stale: &Account, other_plain: &Account) {
+    println!("revocation_is_allowed");
+    let stale_id = stale.id().document_id();
+    let traced = Traced::start(&[EventType::Security(SecurityEvent::Unauthorized)]);
+    let mut imap = ImapConnection::connect(b"_r ").await;
+    imap.authenticate(STALE, STRONG).await;
+    imap.send_ok(&format!("SETACL INBOX {PLAIN} -w")).await;
+    imap.send("GETACL INBOX").await;
+    let lines = imap.assert_read(Type::Tagged, ResponseType::Ok).await;
+    let rights = lines
+        .iter()
+        .find_map(|line| line.split_once(PLAIN).map(|(_, rights)| rights.to_string()))
+        .unwrap_or_else(|| panic!("the narrowed grant: {lines:?}"));
+    assert!(
+        rights.contains('r') && !rights.contains('w'),
+        "the narrowed grant: {lines:?}"
+    );
+    for command in [
+        format!("SETACL INBOX {PLAIN} +w"),
+        format!("SETACL INBOX {OTHER_PLAIN} lr"),
+    ] {
+        imap.send(&command).await;
+        imap.assert_read(Type::Tagged, ResponseType::No)
+            .await
+            .assert_response_code("NOPERM");
+    }
+    imap.send_ok(&format!("DELETEACL INBOX {PLAIN}")).await;
+    imap.send("GETACL INBOX").await;
+    imap.assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_not_contains(PLAIN);
+
+    let reply = stale
+        .jmap_method_call(
+            "Mailbox/set",
+            json!({
+                "accountId": stale.id_string(),
+                "update": {
+                    Id::from(DRAFTS_ID).to_string(): {
+                        format!("shareWith/{}", other_plain.id_string()): null
+                    },
+                    inbox(): {
+                        format!("shareWith/{}", other_plain.id_string()): { "mayReadItems": true }
+                    }
+                }
+            }),
+        )
+        .await;
+    assert!(
+        reply
+            .pointer(&format!(
+                "/methodResponses/0/1/updated/{}",
+                Id::from(DRAFTS_ID)
+            ))
+            .is_some(),
+        "the shareWith removal: {:?}",
+        reply.0
+    );
+    assert_eq!(
+        reply.pointer(&format!("/methodResponses/0/1/notUpdated/{}", inbox())),
+        Some(&json!({ "type": "forbidden", "description": ZA_MAIL_KEYLESS })),
+        "the shareWith addition: {:?}",
+        reply.0
+    );
+    imap.send("GETACL Drafts").await;
+    imap.assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_not_contains(OTHER_PLAIN);
+    imap.send_ok("LOGOUT").await;
+    let refused = traced
+        .finish()
+        .await
+        .into_iter()
+        .filter(|e| e.details == SHARING_REFUSED)
+        .map(|e| e.account_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        refused,
+        vec![Some(u64::from(stale_id)); 3],
+        "one trace per refused widening or addition, none for a removal"
+    );
+}
+
+/// Ruling R34: a group's member whose access token predates the
+/// provisioning of an account that shared with the group (the token cache
+/// keeps it; ruling R5 invalidates the group's own entry) no longer reaches
+/// the account's mail: JMAP Mailbox/get, Email/query and Email/set destroy
+/// are refused, its IMAP session's STORE is refused and its LIST and SELECT
+/// no longer find the mailbox. Returns the group, the provisioned account
+/// and the member.
+async fn group_member_stale_token(
+    test: &mut TestServer,
+    admin: &Account,
+) -> (Account, Account, Account) {
+    println!("group_member_stale_token");
+    let group = admin.create_group_account(GROUP, "Gates group", &[]).await;
+    let member = admin
+        .create_user_account(MEMBER, STRONG, "Group member", &[], user_permissions())
+        .await;
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            member.id(),
+            json!({ "memberGroupIds": { group.id_string(): true } }),
+        )
+        .await;
+    let mut shared = admin
+        .create_user_account(GROUP_OWNER, STRONG, "Group share", &[], user_permissions())
+        .await;
+    let shared_id = shared.id().document_id();
+    let shared_name = format!("Shared Folders/{GROUP_OWNER}/INBOX");
+    let mut owner = ImapConnection::connect(b"_o ").await;
+    owner.authenticate(GROUP_OWNER, STRONG).await;
+    owner.send_ok(&format!("SETACL INBOX {GROUP} lrswi")).await;
+    owner.send_ok("LOGOUT").await;
+
+    // The member's sessions, opened while the account is plain.
+    let mut imap = ImapConnection::connect(b"_n ").await;
+    imap.authenticate(MEMBER, STRONG).await;
+    imap.send(r#"LIST "" "*""#).await;
+    imap.assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_contains(&shared_name);
+    imap.send_ok(&format!("SELECT \"{shared_name}\"")).await;
+    let mailbox_get = json!({ "accountId": shared.id_string(), "ids": null });
+    assert_eq!(
+        first(
+            &member
+                .jmap_method_call("Mailbox/get", mailbox_get.clone())
+                .await
+        )[0],
+        "Mailbox/get",
+        "control: the group's share before provisioning"
+    );
+
+    provision(test, admin, &mut shared).await;
+    deliver(
+        test,
+        SENDER,
+        GROUP_OWNER,
+        &message_with(&format!("{CANARY} group"), "group canary"),
+    )
+    .await;
+    let shared_doc = message_ids(test, shared_id).await[0];
+
+    let traced = Traced::start(&[EventType::Security(SecurityEvent::Unauthorized)]);
+    for (method, args) in [
+        ("Mailbox/get", mailbox_get),
+        (
+            "Email/query",
+            json!({ "accountId": shared.id_string(), "filter": { "inMailbox": inbox() } }),
+        ),
+        (
+            "Email/set",
+            json!({
+                "accountId": shared.id_string(),
+                "destroy": [Id::from_parts(shared_doc, shared_doc).to_string()]
+            }),
+        ),
+    ] {
+        assert_refused(
+            first(&member.jmap_method_call(method, args).await),
+            &format!("{method} by the group's member"),
+        );
+    }
+    assert_imap_refused(&mut imap, "STORE 1 +FLAGS (\\Seen)").await;
+    imap.send(r#"LIST "" "*""#).await;
+    imap.assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_not_contains(GROUP_OWNER);
+    imap.send(&format!("SELECT \"{shared_name}\"")).await;
+    imap.assert_read(Type::Tagged, ResponseType::No).await;
+    imap.send_ok("LOGOUT").await;
+    assert_eq!(
+        message_ids(test, shared_id).await,
+        vec![shared_doc],
+        "the refused destroy removed the message"
+    );
+    let events = traced.finish().await;
+    assert!(
+        events
+            .iter()
+            .filter(|e| e.details == KEYLESS_REFUSED)
+            .all(|e| e.account_id == Some(u64::from(shared_id)))
+            && events.iter().any(|e| e.details == KEYLESS_REFUSED),
+        "the refusals: {events:?}"
+    );
+    (group, shared, member)
+}
+
+/// Ruling R33: the owner's IMAP session opened while its account was plain
+/// holds no keys (the login derived none). Once the account is provisioned
+/// it still reads flags, its NOOP reports another session's flag change,
+/// and a content FETCH answers `NO [NOPERM]`.
+async fn owner_stale_keyless_session(test: &mut TestServer, admin: &Account) -> Account {
+    println!("owner_stale_keyless_session");
+    let mut owner = admin
+        .create_user_account(OWNER, STRONG, "Stale owner", &[], user_permissions())
+        .await;
+    let mut imap = ImapConnection::connect(b"_w ").await;
+    imap.authenticate(OWNER, STRONG).await;
+    imap.send_ok("SELECT INBOX").await;
+
+    provision(test, admin, &mut owner).await;
+    deliver(
+        test,
+        SENDER,
+        OWNER,
+        &message_with(&format!("{CANARY} owner"), "owner canary"),
+    )
+    .await;
+    let mut keyed = ImapConnection::connect(b"_x ").await;
+    keyed.authenticate(OWNER, STRONG).await;
+    keyed.send_ok("SELECT INBOX").await;
+    keyed.send_ok("STORE 1 +FLAGS (\\Flagged)").await;
+    keyed.send_ok("LOGOUT").await;
+
+    imap.send("NOOP").await;
+    imap.assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_contains("\\Flagged");
+    imap.send("FETCH 1 (FLAGS)").await;
+    imap.assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_contains("\\Flagged");
+    assert_imap_refused(&mut imap, "FETCH 1 (BODY[])").await;
+    imap.send_ok("LOGOUT").await;
+    owner
 }

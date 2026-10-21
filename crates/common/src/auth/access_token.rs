@@ -121,17 +121,21 @@ impl Server {
                         }
                     }
                 }
-                // Mail spec 6.3: a key account's mailboxes are never reachable
-                // through another account's grant, one made before it was
-                // provisioned included; they are left out of the listing.
+                // Mail spec 6.3: a key account's mailboxes are left out of
+                // another account's listing, a grant made before it was
+                // provisioned included. The rule of ruling R34 enforces this
+                // at use time, so a failed lookup is logged and lists the
+                // account (review M6).
                 for entry in access_to.iter_mut() {
-                    if self
-                        .za_is_key_account(entry.account_id)
-                        .await
-                        .caused_by(trc::location!())?
-                    {
-                        entry.collections.remove(Collection::Mailbox);
-                        entry.collections.remove(Collection::Email);
+                    match self.za_is_key_account(entry.account_id).await {
+                        Ok(true) => {
+                            entry.collections.remove(Collection::Mailbox);
+                            entry.collections.remove(Collection::Email);
+                        }
+                        Ok(false) => {}
+                        Err(err) => {
+                            trc::error!(err.caused_by(trc::location!()));
+                        }
                     }
                 }
                 access_to.retain(|a| !a.collections.is_empty());
