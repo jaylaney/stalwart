@@ -221,7 +221,7 @@ impl<T: SessionStream> SessionData<T> {
 
     /// Mail spec 3.3: whether this session holds its account's keys.
     pub fn za_key_session(&self) -> bool {
-        self.access_token.session_keys().is_some()
+        self.access_token.za_keys_for(self.account_id).is_some()
     }
 
     pub fn replace_stream_tx<U: SessionStream>(

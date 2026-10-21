@@ -5,11 +5,13 @@
  */
 
 //! Zero-access helpers shared by the request paths and the background
-//! services: the UID creation lease (invitations spec 6.3), the mail
-//! protocols' fixed client texts and trace details (mail spec 4, 8, 10)
-//! and, in test builds, the pause and failure hooks of spec 11.
+//! services: the UID creation lease (invitations spec 6.3), the mail login
+//! gate, the mail protocols' fixed client texts and trace details (mail
+//! spec 4, 8, 10) and, in test builds, the pause and failure hooks of spec
+//! 11.
 
 pub mod lease;
+pub mod mail;
 
 #[cfg(feature = "test_mode")]
 pub mod test_hooks;

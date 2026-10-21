@@ -141,7 +141,8 @@ pub struct PermissionsGroup {
 pub struct AccessToken {
     scope_idx: usize,
     inner: Arc<AccessTokenInner>,
-    /// Resident keys for this request only (spec 5, "in-flight copies").
+    /// Resident keys for this request or mail session only (spec 5,
+    /// "in-flight copies"; mail spec 3.3).
     session_keys: Option<Arc<::vault::session::SessionKeys>>,
 }
 

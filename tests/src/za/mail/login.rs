@@ -16,13 +16,9 @@ use crate::{
         imap::{ImapConnection, Type},
         pop3::{Pop3Connection, ResponseType as Pop3Reply},
         server::TestServer,
-        za::{bearer_token, wait_for_delivery, za_app_password, za_post},
+        za::{Conn, bearer_token, code, totp_url, wait_for_delivery, za_app_password, za_post},
     },
-    za::{
-        STRONG,
-        raw_input::Conn,
-        totp::{code, totp_url},
-    },
+    za::STRONG,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use common::{auth::credential::AppPassword, za::ZA_MAIL_LOGIN_REFUSED};
@@ -58,6 +54,7 @@ pub async fn test(test: &mut TestServer) {
     two_sessions_are_independent(test, id).await;
     pop3_logins(test, id, &app).await;
     keyless_mechanisms_are_refused(test, id).await;
+    refusals_are_not_auth_failures(test, id).await;
     totp_account_needs_an_app_password(test, id, &app).await;
     starttls_keeps_keys(test, id).await;
     rf_4_password_change_mid_session(test).await;
@@ -209,8 +206,8 @@ async fn pop3_logins(test: &TestServer, id: u32, app: &str) {
 
 async fn keyless_mechanisms_are_refused(test: &TestServer, id: u32) {
     println!("keyless_mechanisms_are_refused");
-    let base = baseline(test, id);
     let token = bearer_token(NAME, STRONG).await;
+    let base = baseline(test, id);
     let oauthbearer = STANDARD.encode(format!("n,a={NAME},\u{1}auth=Bearer {token}\u{1}\u{1}"));
     let xoauth2 = STANDARD.encode(format!("user={NAME}\u{1}auth=Bearer {token}\u{1}\u{1}"));
     let master = plain_sasl(&format!("{NAME}%{MASTER}"), MASTER_SECRET);
@@ -262,6 +259,48 @@ async fn keyless_mechanisms_are_refused(test: &TestServer, id: u32) {
     )
     .await;
     imap.exchange("p2 LOGOUT\r\n", "p2 OK").await;
+}
+
+/// A refusal is not an authentication failure: more refusals than the
+/// failure limit on one connection leave a password login on it possible,
+/// on IMAP and on POP3 (both count against `core.imap.max_auth_failures`).
+async fn refusals_are_not_auth_failures(test: &TestServer, id: u32) {
+    println!("refusals_are_not_auth_failures");
+    let token = bearer_token(NAME, STRONG).await;
+    let base = baseline(test, id);
+    let refusals = test.server.core.imap.max_auth_failures + 1;
+    let oauthbearer = STANDARD.encode(format!("n,a={NAME},\u{1}auth=Bearer {token}\u{1}\u{1}"));
+    let xoauth2 = STANDARD.encode(format!("user={NAME}\u{1}auth=Bearer {token}\u{1}\u{1}"));
+
+    let mut imap = Conn::open(IMAP_TLS_PORT).await;
+    imap.until(&["* OK"]).await;
+    for _ in 0..refusals {
+        imap.exchange(
+            &format!("f1 AUTHENTICATE OAUTHBEARER {oauthbearer}\r\n"),
+            "f1 NO [NOPERM]",
+        )
+        .await;
+    }
+    imap.exchange(
+        &format!("f2 AUTHENTICATE PLAIN {}\r\n", plain_sasl(NAME, STRONG)),
+        "f2 OK",
+    )
+    .await;
+    assert_eq!(live_keys(id), base + 1, "the password still logs in");
+    imap.exchange("f3 LOGOUT\r\n", "f3 OK").await;
+    assert_keys_within(id, base, LOGOUT_DROP, "LOGOUT drops the keys").await;
+
+    let mut pop3 = Pop3Connection::connect().await;
+    for _ in 0..refusals {
+        pop3.send(&format!("AUTH XOAUTH2 {xoauth2}")).await;
+        let line = pop3.assert_read(Pop3Reply::Err).await.pop().unwrap();
+        assert_eq!(line, format!("-ERR {ZA_MAIL_LOGIN_REFUSED}"));
+    }
+    pop3.authenticate(NAME, STRONG).await;
+    assert_eq!(live_keys(id), base + 1, "the password still logs in");
+    pop3.send("QUIT").await;
+    pop3.assert_read(Pop3Reply::Ok).await;
+    assert_keys_within(id, base, LOGOUT_DROP, "QUIT drops the keys").await;
 }
 
 async fn totp_account_needs_an_app_password(test: &TestServer, id: u32, app: &str) {

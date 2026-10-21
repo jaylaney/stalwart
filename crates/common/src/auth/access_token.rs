@@ -399,7 +399,8 @@ impl Server {
 
 impl AccessToken {
     /// The one constructor: every token starts without session keys, which
-    /// only the HTTP authentication layer attaches (spec 5).
+    /// only the HTTP authentication layer (spec 5) and the IMAP and POP3
+    /// logins, for the session's own token (mail spec 3.3), attach.
     pub(crate) fn from_parts(scope_idx: usize, inner: Arc<AccessTokenInner>) -> Self {
         AccessToken {
             scope_idx,

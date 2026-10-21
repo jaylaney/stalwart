@@ -11,7 +11,7 @@ use crate::{
 use common::{
     auth::AuthRequest,
     network::{SessionStream, limiter::LimiterResult},
-    za::{ZA_MAIL_LOGIN_REFUSED, ZA_TRACE_MAIL_LOGIN},
+    za::ZA_MAIL_LOGIN_REFUSED,
 };
 use directory::Credentials;
 use mail_parser::decoders::base64::base64_decode;
@@ -98,24 +98,14 @@ impl<T: SessionStream> Session<T> {
             })?;
 
         // Mail spec 4: a key account's session exists only with its keys.
-        let access_token = match session_keys {
-            Some(keys) => access_token.with_session_keys(keys),
-            None if self
-                .server
-                .za_is_key_account(access_token.account_id())
-                .await? =>
-            {
-                trc::event!(
-                    Security(trc::SecurityEvent::Unauthorized),
-                    SpanId = self.session_id,
-                    AccountId = access_token.account_id(),
-                    Details = ZA_TRACE_MAIL_LOGIN,
-                );
-                return Err(trc::Pop3Event::Error
-                    .into_err()
-                    .details(ZA_MAIL_LOGIN_REFUSED));
-            }
-            None => access_token,
+        let Some(access_token) = self
+            .server
+            .za_mail_login(access_token, session_keys, self.session_id)
+            .await?
+        else {
+            return Err(trc::Pop3Event::Error
+                .into_err()
+                .details(ZA_MAIL_LOGIN_REFUSED));
         };
 
         // Enforce concurrency limits

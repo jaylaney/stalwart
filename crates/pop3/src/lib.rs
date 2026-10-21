@@ -84,7 +84,9 @@ impl State {
     /// keys.
     pub fn za_key_session(&self) -> bool {
         match self {
-            State::Authenticated { access_token, .. } => access_token.session_keys().is_some(),
+            State::Authenticated { access_token, .. } => access_token
+                .za_keys_for(access_token.account_id())
+                .is_some(),
             State::NotAuthenticated { .. } => false,
         }
     }

@@ -258,7 +258,7 @@ async fn jmap_upload(user: &str, secret: &str, account_id: &str, canary: &str) {
 
 /// Accepts the test server's self-signed certificate.
 #[derive(Debug)]
-pub(super) struct AcceptAnyCert(pub(super) Arc<rustls::crypto::CryptoProvider>);
+pub(crate) struct AcceptAnyCert(pub(crate) Arc<rustls::crypto::CryptoProvider>);
 
 impl ServerCertVerifier for AcceptAnyCert {
     fn verify_server_cert(

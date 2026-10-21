@@ -11,20 +11,14 @@
 //! captured event may carry either secret or a base64 form of it, while raw
 //! input outside the exchange is still traced.
 
-use super::{tracing::AcceptAnyCert, user_permissions};
+use super::user_permissions;
 use crate::utils::{
     server::TestServer,
-    za::{za_app_password, za_post},
+    za::{Conn, za_app_password, za_post},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::json;
-use std::{sync::Arc, time::Duration};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio_rustls::{
-    TlsConnector,
-    client::TlsStream,
-    rustls::{self, pki_types::ServerName},
-};
+use std::time::Duration;
 use trc::{
     AuthEvent, Collector, EventType, ImapEvent, Key, ManageSieveEvent, Pop3Event, SmtpEvent,
     ipc::subscriber::{Interests, SubscriberBuilder},
@@ -58,85 +52,6 @@ const MARKER: &str = "[redacted]";
 /// The SASL PLAIN message of `NAME` and `secret`, base64-encoded.
 fn plain(secret: &str) -> String {
     STANDARD.encode(format!("\0{NAME}\0{secret}"))
-}
-
-pub(crate) struct Conn(BufReader<TlsStream<tokio::net::TcpStream>>);
-
-impl Conn {
-    pub(crate) async fn open(port: u16) -> Self {
-        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .unwrap();
-        Conn::upgrade(tcp).await
-    }
-
-    /// The TLS handshake over `tcp`: a connection to an implicit-TLS port,
-    /// or one past a STARTTLS.
-    pub(crate) async fn upgrade(tcp: tokio::net::TcpStream) -> Self {
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        let config = rustls::ClientConfig::builder_with_provider(provider.clone())
-            .with_safe_default_protocol_versions()
-            .unwrap()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
-            .with_no_client_auth();
-        let tls = TlsConnector::from(Arc::new(config))
-            .connect(ServerName::try_from("127.0.0.1").unwrap(), tcp)
-            .await
-            .unwrap();
-        Conn(BufReader::new(tls))
-    }
-
-    /// One write, flushed: a read of its own on the server unless the
-    /// server reads slower than the client writes.
-    pub(crate) async fn send(&mut self, data: &str) {
-        self.0.get_mut().write_all(data.as_bytes()).await.unwrap();
-        self.0.get_mut().flush().await.unwrap();
-    }
-
-    /// A submission session past its greeting. The default inbound
-    /// throttle admits 5 connections a second from one address, LMTP
-    /// deliveries included, and drops the rest before the greeting: a
-    /// dropped connection is retried after the throttle's window.
-    async fn open_smtp() -> Self {
-        for _ in 0..5 {
-            let mut conn = Conn::open(SUBMISSION_PORT).await;
-            let mut line = String::new();
-            if let Ok(Ok(read)) =
-                tokio::time::timeout(Duration::from_secs(10), conn.0.read_line(&mut line)).await
-                && read > 0
-            {
-                assert!(line.starts_with("220"), "SMTP greeting {line:?}");
-                return conn;
-            }
-            tokio::time::sleep(Duration::from_millis(1100)).await;
-        }
-        panic!("the submission listener dropped every connection");
-    }
-
-    /// Reads lines until one starts with any of `prefixes`, and returns it.
-    pub(crate) async fn until(&mut self, prefixes: &[&str]) -> String {
-        loop {
-            let mut line = String::new();
-            let read = tokio::time::timeout(Duration::from_secs(10), self.0.read_line(&mut line))
-                .await
-                .unwrap_or_else(|_| panic!("timed out waiting for {prefixes:?}"))
-                .unwrap_or_else(|err| panic!("read failed waiting for {prefixes:?}: {err}"));
-            assert!(read > 0, "connection closed waiting for {prefixes:?}");
-            if prefixes.iter().any(|prefix| line.starts_with(prefix)) {
-                return line;
-            }
-        }
-    }
-
-    /// Sends `data` and expects a line starting with `expected`.
-    pub(crate) async fn exchange(&mut self, data: &str, expected: &str) {
-        self.send(data).await;
-        let line = self
-            .until(&[expected, "-ERR", "NO", "BAD", "a1 ", "5", "4"])
-            .await;
-        assert!(line.starts_with(expected), "{data:?} answered {line:?}");
-    }
 }
 
 /// The IMAP logins: LOGIN; LOGIN with the password as a synchronizing
@@ -314,7 +229,7 @@ async fn smtp(secret: &str) -> Vec<String> {
     let (head, tail) = response.split_at(response.len() / 2);
     let mut own_reads = Vec::new();
     for flow in 0..8 {
-        let mut conn = Conn::open_smtp().await;
+        let mut conn = Conn::open_smtp(SUBMISSION_PORT).await;
         if flow != 4 {
             conn.send(&format!("EHLO {SMTP_CONTROL}\r\n")).await;
             conn.until(&["250 "]).await;
@@ -381,7 +296,7 @@ async fn smtp(secret: &str) -> Vec<String> {
 /// across two writes; both are masked reads of their own. Returns the
 /// answer's writes.
 async fn smtp_mfa(answer: &str) -> Vec<String> {
-    let mut conn = Conn::open_smtp().await;
+    let mut conn = Conn::open_smtp(SUBMISSION_PORT).await;
     conn.send(&format!("EHLO {SMTP_CONTROL}\r\n")).await;
     conn.until(&["250 "]).await;
     conn.exchange(&format!("AUTH PLAIN {}\r\n", plain(PASSWORD)), "334")
