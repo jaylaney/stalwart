@@ -13,7 +13,7 @@
 //! is refused on PostgreSQL and MySQL, where the assertion is no fence.
 
 use super::{
-    assert_no_plaintext, assert_sealed, deliver,
+    Traced, assert_no_plaintext, assert_sealed, deliver,
     delivery::{configure, temporarily_failed, unconfigure},
     message_ids, message_with, stored_blob, stored_metadata,
 };
@@ -61,11 +61,7 @@ use store::{
     roaring::RoaringBitmap,
     write::{BatchBuilder, BlobLink, BlobOp, ValueClass, key::DeserializeBigEndian, now},
 };
-use tokio::sync::mpsc;
-use trc::{
-    Collector, EventType, Key, SecurityEvent, StoreEvent,
-    ipc::subscriber::{EventBatch, Interests, SubscriberBuilder},
-};
+use trc::{EventType, Key, SecurityEvent, StoreEvent};
 use types::{
     blob::BlobClass,
     blob_hash::{BLOB_HASH_LEN, BlobHash},
@@ -91,7 +87,6 @@ const PLAIN: &str = "plainmail3@example.com";
 /// sends through authenticated submission.
 const ORGANIZER: &str = "plainmail4@example.com";
 const SENDER: &str = "sender@example.com";
-const SUBSCRIBER_ID: &str = "za-fence-test";
 /// The trace details of `copy_message`'s refusal.
 const COPY_REFUSED: &str = "zero-access: mail copy across accounts";
 /// `stress_the_fence`'s runs.
@@ -284,72 +279,6 @@ async fn temporary_links(test: &TestServer, account_id: u32) -> Vec<BlobHash> {
         .await
         .unwrap();
     hashes
-}
-
-/// Events of the given types emitted while a step runs, captured as
-/// `raw_input.rs` captures them: the test server configures no tracer, so
-/// nothing is emitted until something declares interest.
-struct Traced {
-    _tx: mpsc::Sender<EventBatch>,
-    rx: mpsc::Receiver<EventBatch>,
-}
-
-/// One captured event.
-#[derive(Debug)]
-struct TracedEvent {
-    typ: EventType,
-    account_id: Option<u64>,
-    details: String,
-    reason: String,
-    /// The recipient a delivery's error names (`Key::To`).
-    to: String,
-}
-
-impl Traced {
-    fn start(types: &[EventType]) -> Self {
-        let mut interests = Interests::default();
-        for event_type in types {
-            interests.set(*event_type);
-        }
-        let (_tx, rx) = SubscriberBuilder::new(SUBSCRIBER_ID.into())
-            .set_interests(types.iter().copied())
-            .with_lossy(false)
-            .register();
-        Collector::union_interests(interests);
-        Collector::reload();
-        Traced { _tx, rx }
-    }
-
-    async fn finish(mut self) -> Vec<TracedEvent> {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let mut captured = Vec::new();
-        while let Ok(batch) = self.rx.try_recv() {
-            for event in batch {
-                let mut traced = TracedEvent {
-                    typ: event.inner.typ,
-                    account_id: None,
-                    details: String::new(),
-                    reason: String::new(),
-                    to: String::new(),
-                };
-                for (key, value) in event.keys.iter() {
-                    match (key, value) {
-                        (Key::AccountId, trc::Value::UInt(id)) => traced.account_id = Some(*id),
-                        (Key::Details, trc::Value::String(text)) => {
-                            traced.details = text.to_string()
-                        }
-                        (Key::Reason, trc::Value::String(text)) => traced.reason = text.to_string(),
-                        (Key::To, trc::Value::String(text)) => traced.to = text.to_string(),
-                        _ => {}
-                    }
-                }
-                captured.push(traced);
-            }
-        }
-        Collector::remove_subscriber(SUBSCRIBER_ID.into());
-        Collector::reload();
-        captured
-    }
 }
 
 /// `message` sent by `from` through the suite's authenticated submission

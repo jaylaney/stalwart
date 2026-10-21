@@ -234,7 +234,7 @@ impl ZaMailView for Server {
     ) -> trc::Result<BlobId> {
         let dek = new_dek();
         let envelope = seal_mail_envelope(&dek, MailWrap::Session(keys), account_id)
-            .map_err(|err| za_upload_error(err, account_id))?;
+            .map_err(|err| za_sealing_error(err, account_id))?;
         let sealed = seal_mail_blob(&dek, &envelope, account_id, data);
         self.put_jmap_blob(account_id, &sealed)
             .await
@@ -248,7 +248,7 @@ impl ZaMailView for Server {
         bytes: Vec<u8>,
     ) -> trc::Result<Zeroizing<Vec<u8>>> {
         let unreadable =
-            |err| za_upload_error(err, account_id).ctx(trc::Key::Reason, ZA_REASON_UNREADABLE);
+            |err| za_sealing_error(err, account_id).ctx(trc::Key::Reason, ZA_REASON_UNREADABLE);
         let private_key = if blob_needs_private_key(&bytes).map_err(unreadable)? {
             Some(za_private_key(self, keys, None).await?)
         } else {
@@ -272,9 +272,9 @@ impl ZaMailView for Server {
     }
 }
 
-/// `seal_error`'s shape for an upload, which has no document id (as the
-/// staging of a delivery builds it).
-fn za_upload_error(err: SealError, account_id: u32) -> trc::Error {
+/// `seal_error`'s shape for a sealed object without a document id: an
+/// upload, or a delivered message whose blob is staged before its id.
+pub(crate) fn za_sealing_error(err: SealError, account_id: u32) -> trc::Error {
     trc::StoreEvent::DataCorruption
         .into_err()
         .details(format!("zero-access sealing error: {err}"))

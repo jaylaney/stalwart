@@ -12,8 +12,8 @@
 //! reads it, whichever account's session asks (rulings R30, R32).
 
 use super::{
-    assert_sealed, assert_sealed_upload, deliver, key_mail_account, message_ids, message_with,
-    new_message, open_message, stored_metadata,
+    Traced, assert_sealed, assert_sealed_upload, deliver, key_mail_account, message_ids,
+    message_with, new_message, open_message, stored_metadata,
 };
 use crate::{
     utils::{
@@ -36,11 +36,7 @@ use registry::schema::{enums::Permission, prelude::ObjectType};
 use serde_json::{Value, json};
 use std::{str::FromStr, time::Duration};
 use store::{IterateParams, SUBSPACE_BLOB_LINK, U32_LEN, U64_LEN, write::AnyKey};
-use tokio::sync::mpsc;
-use trc::{
-    Collector, EventType, Key, SecurityEvent,
-    ipc::subscriber::{EventBatch, Interests, SubscriberBuilder},
-};
+use trc::{EventType, SecurityEvent};
 use types::{
     blob::BlobId,
     blob_hash::{BLOB_HASH_LEN, BlobHash},
@@ -52,7 +48,6 @@ const OTHER_KEY: &str = "keymail7@example.com";
 const PLAIN: &str = "plainmail5@example.com";
 const OTHER_PLAIN: &str = "plainmail6@example.com";
 const SENDER: &str = "sender@example.org";
-const SUBSCRIBER_ID: &str = "za-mail-uploads-test";
 /// In every upload and message of the key account; no trace carries it.
 const CANARY: &str = "upload canary";
 /// The key account's uploaded attachment.
@@ -60,6 +55,11 @@ const ATTACHMENT: &[u8] = b"upload canary attachment \x00\x01\x02\xfe\xff bytes"
 /// The attachment of the key account's delivered message.
 const DELIVERED_ATTACHMENT: &[u8] = b"upload canary delivered \x00\xff attachment";
 const RAW_REFUSED: &str = "zero-access: raw read of a sealed source";
+const KEYLESS_REFUSED: &str = "zero-access: mail access without session keys";
+/// The key account's sealed upload in `raw_consumers_are_refused`: a valid
+/// Sieve script, which `SieveScript/set` opens and stores (ruling R32 as
+/// amended).
+const SCRIPT_UPLOAD: &[u8] = b"# upload canary script\r\nkeep;\r\n";
 const COPY_REFUSED: &str = "zero-access: mail copy across accounts";
 
 pub async fn test(test: &mut TestServer) {
@@ -82,7 +82,13 @@ pub async fn test(test: &mut TestServer) {
 
     // The key account's delivered message, with an attachment: its blob
     // and the attachment's section are sealed sources.
-    deliver(test, SENDER, KEY, &message_with_attachment()).await;
+    deliver(
+        test,
+        SENDER,
+        KEY,
+        &message_with_attachment(DELIVERED_ATTACHMENT),
+    )
+    .await;
     let delivered = *message_ids(test, key.id().document_id())
         .await
         .first()
@@ -98,7 +104,8 @@ pub async fn test(test: &mut TestServer) {
         &key,
         &plain,
         &other_plain,
-        [&message_blob, &section_blob, &upload],
+        &message_blob,
+        &section_blob,
     )
     .await;
 
@@ -114,9 +121,9 @@ pub async fn test(test: &mut TestServer) {
     wait_for_delivery(test).await;
 }
 
-/// A multipart/mixed message to the key account: a text part and a base64
-/// attachment.
-fn message_with_attachment() -> String {
+/// A multipart/mixed message to the key account: a text part and
+/// `attachment`, base64-encoded.
+fn message_with_attachment(attachment: &[u8]) -> String {
     format!(
         "From: Sender <{SENDER}>\r\n\
          To: <{KEY}>\r\n\
@@ -138,7 +145,7 @@ fn message_with_attachment() -> String {
          {}\r\n\
          --za--\r\n",
         store::rand::random::<u64>(),
-        STANDARD.encode(DELIVERED_ATTACHMENT)
+        STANDARD.encode(attachment)
     )
 }
 
@@ -332,6 +339,32 @@ async fn upload_with_the_credential_is_sealed(test: &TestServer, key: &Account) 
         "the download of a Blob/upload"
     );
     assert_eq!(blob_get(key, &text_id).await, text.as_bytes());
+
+    // `blob_download`'s upload branch with a section: `Email/parse` of a
+    // sealed upload names its parts by section ids of the upload, cut from
+    // the opened bytes.
+    let parsed_id = upload(key, message_with_attachment(ATTACHMENT).as_bytes()).await;
+    let reply = key
+        .jmap_method_call(
+            "Email/parse",
+            json!({
+                "accountId": key.id_string(),
+                "blobIds": [&parsed_id],
+                "properties": ["attachments"],
+            }),
+        )
+        .await;
+    let section = accepted(
+        &reply,
+        &format!("/parsed/{parsed_id}/attachments/0/blobId"),
+        "Email/parse of a sealed upload",
+    )
+    .as_str()
+    .unwrap()
+    .to_string();
+    let (status, bytes) = download(key, &section).await;
+    assert_eq!(status, 200, "the download of a parsed upload's part");
+    assert_eq!(bytes, ATTACHMENT, "the parsed upload's part");
     blob_id
 }
 
@@ -353,6 +386,7 @@ async fn upload_without_keys_is_refused(
     let other_links = temporary_links(test, other_id).await;
 
     let token = bearer_token(KEY, STRONG).await;
+    let traced = Traced::start(&[EventType::Security(SecurityEvent::Unauthorized)]);
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(Duration::from_secs(5))
@@ -420,6 +454,22 @@ async fn upload_without_keys_is_refused(
             .await;
         assert_forbidden_http(response.status, &response.text(), what);
     }
+
+    // One `Security(Unauthorized)` refusal per request, naming the target
+    // account: the three uploads' (`/jmap/upload`'s gate), the two
+    // downloads' and the WebSocket call's (`za_mail_keys`).
+    let mut refused = traced
+        .finish()
+        .await
+        .into_iter()
+        .filter(|event| event.details == KEYLESS_REFUSED)
+        .map(|event| event.account_id)
+        .collect::<Vec<_>>();
+    refused.sort_unstable();
+    let mut expected = vec![Some(u64::from(id)); 5];
+    expected.push(Some(u64::from(other_id)));
+    expected.sort_unstable();
+    assert_eq!(refused, expected, "the keyless refusals' traces");
 
     assert_eq!(temporary_links(test, id).await, links, "a reservation");
     assert_eq!(
@@ -527,14 +577,6 @@ async fn sealed_upload_imported_and_attached(test: &TestServer, key: &Account, s
         assert_eq!(status, 200, "{what}");
         assert_eq!(bytes, expected, "{what}: the attachment's bytes");
     }
-}
-
-/// One captured event.
-struct TracedEvent {
-    details: String,
-    account_id: Option<u64>,
-    /// Every value, for the content check.
-    text: String,
 }
 
 /// The raw consumers of mail spec 5.7 and ruling R32, as `session` with
@@ -665,20 +707,27 @@ async fn file_node(session: &Account, account: &Account, node: Value) -> String 
         .to_string()
 }
 
-/// Mail spec 5.7, rulings R30, R32: a key account's message, section and
-/// upload ids (`sources`) are refused by every raw consumer, from the key
-/// account's own session and from a plain account's, and so is a blob copy
-/// into or out of the key account; a plain account's own blobs pass every
-/// one of them. No trace carries content.
+/// Mail spec 5.7, rulings R30, R32: a key account's message and section ids
+/// are refused by every raw consumer, and its upload by every one but
+/// `SieveScript/set` (ruling R32 as amended: Sieve scripts are plaintext and
+/// the upload is opened with the request's keys), from the key account's
+/// own session and from a plain account's; so is a blob copy into or out of
+/// the key account, and a refused call writes nothing before it. A plain
+/// account's blobs pass every one of them, from either session. No trace
+/// carries content.
 async fn raw_consumers_are_refused(
     test: &TestServer,
     key: &Account,
     plain: &Account,
     other_plain: &Account,
-    sources: [&str; 3],
+    message_blob: &str,
+    section_blob: &str,
 ) {
     println!("raw_consumers_are_refused");
     let key_id = key.id().document_id();
+    let plain_id = plain.id().document_id();
+    let script_upload = upload(key, SCRIPT_UPLOAD).await;
+    let sources = [message_blob, section_blob, script_upload.as_str()];
 
     // The plain account's own blobs: its message and three uploads (a
     // message, the replacement content, a Sieve script).
@@ -716,13 +765,29 @@ async fn raw_consumers_are_refused(
         )
         .await;
     accepted(&reply, &format!("/updated/{shared_folder}"), "the share");
-    let shared_upload = upload(other_plain, b"plain control shared").await;
+    let shared_content: &[u8] = b"plain control shared";
+    let shared_upload = upload(other_plain, shared_content).await;
     let shared_file = file_node(
         other_plain,
         other_plain,
         json!({ "name": "shared.bin", "parentId": &shared_folder, "blobId": &shared_upload }),
     )
     .await;
+    // The shared file's blob, as the key account reads it through the share.
+    let reply = key
+        .jmap_method_call(
+            "FileNode/get",
+            json!({
+                "accountId": other_plain.id_string(),
+                "ids": [&shared_file],
+                "properties": ["blobId"],
+            }),
+        )
+        .await;
+    let shared_blob = accepted(&reply, "/list/0/blobId", "the shared file's blob")
+        .as_str()
+        .unwrap()
+        .to_string();
     // The sessions' own nodes: a folder of the key account (none of its
     // uploads can become a file's blob), a file of the plain account (the
     // `FileNode/set` create control).
@@ -743,7 +808,9 @@ async fn raw_consumers_are_refused(
         EventType::Store(trc::StoreEvent::DataCorruption),
     ]);
     let mut raw_refusals = 0;
+    let mut key_script = None;
     for source in sources {
+        let is_upload = source == script_upload;
         for (what, reply) in raw_consumers(
             key,
             source,
@@ -753,8 +820,19 @@ async fn raw_consumers_are_refused(
         )
         .await
         {
-            assert_refused(&reply, &format!("{what} of {source} by the key account"));
-            raw_refusals += 1;
+            if what == "SieveScript/set" && is_upload {
+                // Ruling R32 as amended: the account's own upload, opened
+                // with the session's keys, compiles into a script.
+                key_script = Some(
+                    accepted(&reply, "/created/v/id", "the key account's script upload")
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                );
+            } else {
+                assert_refused(&reply, &format!("{what} of {source} by the key account"));
+                raw_refusals += 1;
+            }
         }
         // The rule is keyed by the blob's owning account and class, not by
         // the session asking.
@@ -767,8 +845,17 @@ async fn raw_consumers_are_refused(
         )
         .await
         {
-            assert_refused(&reply, &format!("{what} of {source} by a plain account"));
-            raw_refusals += 1;
+            if what == "SieveScript/set" && is_upload {
+                // Upstream's answer for a blob the session cannot read.
+                assert_eq!(
+                    accepted(&reply, "/notCreated/v/type", what),
+                    "blobNotFound",
+                    "{what} of the key account's upload by a plain account"
+                );
+            } else {
+                assert_refused(&reply, &format!("{what} of {source} by a plain account"));
+                raw_refusals += 1;
+            }
         }
         // A plain `fromAccountId` does not hide the blob's owner.
         assert_refused(
@@ -788,7 +875,57 @@ async fn raw_consumers_are_refused(
         "Blob/copy into the key account",
     );
 
-    // The controls: the plain account's own blobs pass every consumer.
+    // A sealed source anywhere in the call refuses it before its first
+    // write: no upload of an earlier create, no earlier copy's link.
+    let key_links = temporary_links(test, key_id).await;
+    let reply = key
+        .jmap_method_call(
+            "Blob/upload",
+            json!({
+                "accountId": key.id_string(),
+                "create": {
+                    "a": { "data": [{ "data:asText": "upload canary before" }] },
+                    "b": { "data": [{ "blobId": message_blob }] }
+                }
+            }),
+        )
+        .await;
+    assert_refused(&reply, "Blob/upload with a later sealed source");
+    raw_refusals += 1;
+    assert_eq!(
+        temporary_links(test, key_id).await,
+        key_links,
+        "an upload before the refused data source"
+    );
+    let plain_links = temporary_links(test, plain_id).await;
+    assert_refused(
+        &blob_copy(plain, other_plain, plain, &[&plain_upload, message_blob]).await,
+        "Blob/copy with a later sealed source",
+    );
+    raw_refusals += 1;
+    assert_eq!(
+        temporary_links(test, plain_id).await,
+        plain_links,
+        "a link before the refused copy"
+    );
+    // A reference to an upload of the same call is refused at its turn.
+    let reply = key
+        .jmap_method_call(
+            "Blob/upload",
+            json!({
+                "accountId": key.id_string(),
+                "create": {
+                    "a": { "data": [{ "data:asText": "upload canary referenced" }] },
+                    "b": { "data": [{ "blobId": "#a" }] }
+                }
+            }),
+        )
+        .await;
+    assert_refused(&reply, "Blob/upload of a reference to a sealed upload");
+    raw_refusals += 1;
+
+    // The controls: plain blobs pass every consumer, the plain account's own
+    // from its session, and a shared plain file's from the key account's.
     let reply = plain
         .jmap_method_call(
             "Blob/upload",
@@ -799,6 +936,25 @@ async fn raw_consumers_are_refused(
         )
         .await;
     accepted(&reply, "/created/b/id", "control: Blob/upload data sources");
+    let shared_copy = blob_upload(key, json!([{ "blobId": &shared_blob }])).await;
+    let reply = key
+        .jmap_method_call(
+            "FileNode/set",
+            json!({
+                "accountId": other_plain.id_string(),
+                "create": { "n": {
+                    "name": "from-key.bin",
+                    "parentId": &shared_folder,
+                    "blobId": &shared_blob
+                } }
+            }),
+        )
+        .await;
+    accepted(
+        &reply,
+        "/created/n/id",
+        "control: FileNode/set create by the key account",
+    );
     let reply = plain
         .jmap_method_call(
             "FileNode/set",
@@ -832,12 +988,19 @@ async fn raw_consumers_are_refused(
         &format!("/created/{plain_file}/id"),
         "control: FileNode/copy",
     );
-    // `Blob/copy` writes into an account the session is a member of; the
-    // source account is the plain `plainmail6`.
+    // `Blob/copy` writes into an account the session is a member of: the
+    // plain account's own blobs with a plain `fromAccountId`, and the shared
+    // file's blob of `plainmail6`, read through the share.
     let reply = blob_copy(plain, other_plain, plain, &[&plain_upload, &plain_message]).await;
     for blob_id in [&plain_upload, &plain_message] {
         accepted(&reply, &format!("/copied/{blob_id}"), "control: Blob/copy");
     }
+    let reply = blob_copy(plain, other_plain, plain, &[&shared_blob]).await;
+    accepted(
+        &reply,
+        &format!("/copied/{shared_blob}"),
+        "control: Blob/copy of a shared plain blob",
+    );
     let reply = plain
         .jmap_method_call(
             "x:SpamTrainingSample/set",
@@ -888,7 +1051,29 @@ async fn raw_consumers_are_refused(
         "one trace per refused blob copy"
     );
 
-    // Cleanup: the file nodes and the script; the uploads expire.
+    // The key account's copy of the shared plain blob is its own upload,
+    // sealed; its script holds the upload's plaintext.
+    assert_sealed_upload(test, key_id, STRONG, &shared_copy, shared_content).await;
+    let key_script = key_script.unwrap();
+    let reply = key
+        .jmap_method_call(
+            "SieveScript/get",
+            json!({
+                "accountId": key.id_string(),
+                "ids": [&key_script],
+                "properties": ["blobId"],
+            }),
+        )
+        .await;
+    let script_blob = accepted(&reply, "/list/0/blobId", "the key account's script")
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, bytes) = download(key, &script_blob).await;
+    assert_eq!(status, 200, "the key account's script");
+    assert_eq!(bytes, SCRIPT_UPLOAD, "the key account's script");
+
+    // Cleanup: the file nodes and the scripts; the uploads expire.
     let reply = other_plain
         .jmap_method_call(
             "FileNode/set",
@@ -899,7 +1084,7 @@ async fn raw_consumers_are_refused(
             }),
         )
         .await;
-    assert_eq!(reply.destroyed().count(), 3, "{:?}", reply.0);
+    assert_eq!(reply.destroyed().count(), 4, "{:?}", reply.0);
     for (account, node) in [(plain, &plain_file), (key, &key_folder)] {
         assert_eq!(
             account
@@ -912,63 +1097,16 @@ async fn raw_consumers_are_refused(
             account.name()
         );
     }
-    assert_eq!(
-        plain
-            .jmap_destroy("SieveScript", [&script], Vec::<(&str, &str)>::new())
-            .await
-            .destroyed()
-            .count(),
-        1
-    );
-}
-
-/// Captures the named event types (the test server configures no tracer,
-/// so nothing is emitted until something declares interest).
-struct Traced {
-    _tx: mpsc::Sender<EventBatch>,
-    rx: mpsc::Receiver<EventBatch>,
-}
-
-impl Traced {
-    fn start(types: &[EventType]) -> Self {
-        let mut interests = Interests::default();
-        for event_type in types {
-            interests.set(*event_type);
-        }
-        let (_tx, rx) = SubscriberBuilder::new(SUBSCRIBER_ID.into())
-            .set_interests(types.iter().copied())
-            .with_lossy(false)
-            .register();
-        Collector::union_interests(interests);
-        Collector::reload();
-        Traced { _tx, rx }
-    }
-
-    async fn finish(mut self) -> Vec<TracedEvent> {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let mut captured = Vec::new();
-        while let Ok(batch) = self.rx.try_recv() {
-            for event in batch {
-                let mut traced = TracedEvent {
-                    details: String::new(),
-                    account_id: None,
-                    text: String::new(),
-                };
-                for (key, value) in event.keys.iter() {
-                    match (key, value) {
-                        (Key::AccountId, trc::Value::UInt(id)) => traced.account_id = Some(*id),
-                        (Key::Details, trc::Value::String(text)) => {
-                            traced.details = text.to_string()
-                        }
-                        _ => {}
-                    }
-                    traced.text.push_str(&format!("{key:?}={value:?} "));
-                }
-                captured.push(traced);
-            }
-        }
-        Collector::remove_subscriber(SUBSCRIBER_ID.into());
-        Collector::reload();
-        captured
+    for (account, script) in [(plain, &script), (key, &key_script)] {
+        assert_eq!(
+            account
+                .jmap_destroy("SieveScript", [script], Vec::<(&str, &str)>::new())
+                .await
+                .destroyed()
+                .count(),
+            1,
+            "{}",
+            account.name()
+        );
     }
 }

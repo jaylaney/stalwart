@@ -32,6 +32,9 @@ pub const ZA_MAIL_UNREADABLE: &str = "Message could not be read.";
 pub const ZA_TRACE_MAIL_LOGIN: &str = "zero-access: mail login without session keys";
 /// Mail spec 4, 10: the trace details of a content read refused without keys.
 pub const ZA_TRACE_MAIL_KEYLESS: &str = "zero-access: mail access without session keys";
+/// Mail spec 6.3, 9: the trace details of a message or blob copy refused
+/// because one side is a key account.
+pub const ZA_TRACE_MAIL_COPY: &str = "zero-access: mail copy across accounts";
 
 /// Key pinning spec 6.4: `contacts/pin`'s pause point after its last event
 /// commit, before the step 5 retirement (`test_hooks::REDELIVER_CLEANUP_PAUSE`).

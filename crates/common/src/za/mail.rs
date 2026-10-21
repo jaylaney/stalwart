@@ -25,6 +25,13 @@ pub fn za_keyless_refusal() -> trc::Error {
         .code("NOPERM")
 }
 
+/// Whether `err` is `za_keyless_refusal`'s error, for a caller that answers
+/// it outside its protocol's error mapping (`/jmap/download`, ruling R30).
+pub fn za_is_keyless_refusal(err: &trc::Error) -> bool {
+    err.matches(trc::EventType::Jmap(trc::JmapEvent::Forbidden))
+        && err.value_as_str(trc::Key::Details) == Some(ZA_MAIL_KEYLESS)
+}
+
 impl Server {
     /// The token an IMAP or POP3 session keeps after a successful login:
     /// with `session_keys` attached when the login derived them, unchanged

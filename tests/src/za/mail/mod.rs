@@ -24,9 +24,15 @@ use email::{
 };
 use groupware::calendar::seal::WRAP_MK;
 use registry::schema::structs::SpamTrainingSample;
+use std::time::Duration;
 use store::{
     IterateParams, Serialize, ValueKey,
     write::{AlignedBytes, Archive, Archiver, BatchBuilder, IndexPropertyClass, ValueClass},
+};
+use tokio::sync::mpsc;
+use trc::{
+    Collector, EventType, Key,
+    ipc::subscriber::{EventBatch, Interests, SubscriberBuilder},
 };
 use types::{blob::BlobId, blob_hash::BlobHash, collection::Collection, field::EmailField};
 use utils::cheeky_hash::CheekyHash;
@@ -293,4 +299,77 @@ pub async fn spam_samples(test: &TestServer) -> usize {
         .registry_get_all::<SpamTrainingSample>()
         .await
         .len()
+}
+
+/// The subscriber `Traced` registers; the modules run one at a time.
+const TRACED_SUBSCRIBER_ID: &str = "za-mail-traced";
+
+/// Events of the given types emitted while a step runs, captured as
+/// `raw_input.rs` captures them: the test server configures no tracer, so
+/// nothing is emitted until something declares interest.
+pub struct Traced {
+    _tx: mpsc::Sender<EventBatch>,
+    rx: mpsc::Receiver<EventBatch>,
+}
+
+/// One captured event.
+#[derive(Debug)]
+pub struct TracedEvent {
+    pub typ: EventType,
+    pub account_id: Option<u64>,
+    pub details: String,
+    pub reason: String,
+    /// The recipient a delivery's error names (`Key::To`).
+    pub to: String,
+    /// Every key and value, for content checks.
+    pub text: String,
+}
+
+impl Traced {
+    pub fn start(types: &[EventType]) -> Self {
+        let mut interests = Interests::default();
+        for event_type in types {
+            interests.set(*event_type);
+        }
+        let (_tx, rx) = SubscriberBuilder::new(TRACED_SUBSCRIBER_ID.into())
+            .set_interests(types.iter().copied())
+            .with_lossy(false)
+            .register();
+        Collector::union_interests(interests);
+        Collector::reload();
+        Traced { _tx, rx }
+    }
+
+    pub async fn finish(mut self) -> Vec<TracedEvent> {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut captured = Vec::new();
+        while let Ok(batch) = self.rx.try_recv() {
+            for event in batch {
+                let mut traced = TracedEvent {
+                    typ: event.inner.typ,
+                    account_id: None,
+                    details: String::new(),
+                    reason: String::new(),
+                    to: String::new(),
+                    text: String::new(),
+                };
+                for (key, value) in event.keys.iter() {
+                    match (key, value) {
+                        (Key::AccountId, trc::Value::UInt(id)) => traced.account_id = Some(*id),
+                        (Key::Details, trc::Value::String(text)) => {
+                            traced.details = text.to_string()
+                        }
+                        (Key::Reason, trc::Value::String(text)) => traced.reason = text.to_string(),
+                        (Key::To, trc::Value::String(text)) => traced.to = text.to_string(),
+                        _ => {}
+                    }
+                    traced.text.push_str(&format!("{key:?}={value:?} "));
+                }
+                captured.push(traced);
+            }
+        }
+        Collector::remove_subscriber(TRACED_SUBSCRIBER_ID.into());
+        Collector::reload();
+        captured
+    }
 }

@@ -54,10 +54,25 @@ impl BlobUpload for Server {
 
         // Mail spec 4, 5.7: a key account's uploads are sealed with its
         // keys; a token without them is refused before anything is read.
-        self.za_mail_keys(access_token, account_id).await?;
+        let za_keys = self.za_mail_keys(access_token, account_id).await?;
 
         if request.create.len() > self.core.jmap.set_max_objects {
             return Err(trc::JmapEvent::RequestTooLarge.into_err());
+        }
+
+        // Mail spec 5.7: a sealed source among the literal data sources
+        // refuses the call before its first write (a reference to an upload
+        // of this call is checked at its turn, below).
+        for upload_object in request.create.values() {
+            for data_source in &upload_object.data {
+                if let DataSourceObject::Id {
+                    id: MaybeIdReference::Id(id),
+                    ..
+                } = data_source
+                {
+                    self.za_refuse_raw_source(id).await?;
+                }
+            }
         }
 
         'outer: for (create_id, upload_object) in request.create {
@@ -91,7 +106,8 @@ impl BlobUpload for Server {
                             }
                         };
 
-                        // Mail spec 5.7: never a sealed source's stored bytes.
+                        // Mail spec 5.7: never a sealed source's stored bytes,
+                        // a reference to an upload of this call included.
                         self.za_refuse_raw_source(&id).await?;
                         if !self.has_access_blob(&id, access_token).await? {
                             response.not_created.append(
@@ -194,7 +210,7 @@ impl BlobUpload for Server {
                 create_id,
                 BlobUploadResponseObject {
                     // Mail spec 5.7: a key account's upload is sealed.
-                    id: match access_token.za_keys_for(account_id) {
+                    id: match &za_keys {
                         Some(keys) => self.za_put_sealed_upload(account_id, keys, &data).await?,
                         None => self.put_jmap_blob(account_id, &data).await?,
                     },
@@ -218,6 +234,13 @@ impl BlobUpload for Server {
         let _in_flight = self
             .is_upload_allowed(access_token)
             .caused_by(trc::location!())?;
+
+        // Mail spec 4, 5.7: a key account's upload is sealed with its keys;
+        // a token without them is refused here too, whatever the caller
+        // checked (`/jmap/upload` answers 403 before this call).
+        let za_keys = self
+            .za_mail_keys(access_token, account_id.document_id())
+            .await?;
 
         #[cfg(feature = "test_mode")]
         {
@@ -252,9 +275,8 @@ impl BlobUpload for Server {
 
         Ok(UploadResponse {
             account_id,
-            // Mail spec 5.7: a key account's upload is sealed (`/jmap/upload`
-            // refuses a token without its keys before this call).
-            blob_id: match access_token.za_keys_for(account_id.document_id()) {
+            // Mail spec 5.7: a key account's upload is sealed.
+            blob_id: match &za_keys {
                 Some(keys) => {
                     self.za_put_sealed_upload(account_id.document_id(), keys, data)
                         .await

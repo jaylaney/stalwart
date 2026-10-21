@@ -9,7 +9,9 @@
 //! sealed blob staged in place of the queue's or the upload's; the stub
 //! written in place of the metadata archive.
 
-use super::{MailWrap, new_dek, seal_mail_blob, seal_mail_envelope, seal_stub};
+use super::{
+    MailWrap, new_dek, seal_mail_blob, seal_mail_envelope, seal_stub, view::za_sealing_error,
+};
 use crate::message::{
     index::{IndexMessage, build_message_metadata},
     ingest::IngestSource,
@@ -132,14 +134,9 @@ pub async fn za_stage_sealed(
     raw_message: &[u8],
 ) -> trc::Result<(ZaSealed, (BlobHash, Option<BlobOp>))> {
     let dek = new_dek();
-    let envelope = seal_mail_envelope(&dek, wrap.mail_wrap(), account_id).map_err(|err| {
-        // `seal_error`'s shape: the message has no document id yet.
-        trc::StoreEvent::DataCorruption
-            .into_err()
-            .details(format!("zero-access sealing error: {err}"))
-            .account_id(account_id)
-            .caused_by(trc::location!())
-    })?;
+    // The message has no document id yet.
+    let envelope = seal_mail_envelope(&dek, wrap.mail_wrap(), account_id)
+        .map_err(|err| za_sealing_error(err, account_id))?;
     let sealed = seal_mail_blob(&dek, &envelope, account_id, raw_message);
     let (blob_hash, hold) = server
         .put_temporary_blob(account_id, &sealed, 60)

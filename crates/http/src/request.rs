@@ -24,7 +24,7 @@ use common::{
     ipc::PushEvent,
     manager::application::Resource,
     network::{SessionData, SessionManager, SessionStream},
-    za::{ZA_MAIL_KEYLESS, ZA_TRACE_MAIL_KEYLESS},
+    za::{ZA_MAIL_KEYLESS, ZA_TRACE_MAIL_KEYLESS, mail::za_is_keyless_refusal},
 };
 use dav::{DavMethod, request::DavRequestHandler};
 use groupware::DavResourceName;
@@ -48,8 +48,10 @@ use jmap::{
     blob::{download::BlobDownload, upload::BlobUpload},
     websocket::upgrade::WebSocketUpgrade,
 };
-use jmap_proto::error::request::RequestError;
-use jmap_proto::request::{Request, capability::Session};
+use jmap_proto::{
+    error::request::RequestError,
+    request::{Request, capability::Session},
+};
 // SPDX-SnippetBegin
 // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
 // SPDX-License-Identifier: LicenseRef-SEL
@@ -1073,12 +1075,6 @@ fn za_keyless_response() -> HttpResponse {
     RequestError::blank(StatusCode::FORBIDDEN.as_u16(), "Forbidden", ZA_MAIL_KEYLESS)
         .into_http_response()
         .with_untraced_body()
-}
-
-/// Whether `err` is the keyless refusal (`za::mail::za_keyless_refusal`).
-fn za_is_keyless_refusal(err: &trc::Error) -> bool {
-    err.matches(trc::EventType::Jmap(trc::JmapEvent::Forbidden))
-        && err.value_as_str(trc::Key::Details) == Some(ZA_MAIL_KEYLESS)
 }
 
 #[cfg(test)]

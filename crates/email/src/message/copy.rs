@@ -18,7 +18,11 @@ use crate::{
         },
     },
 };
-use common::{Server, storage::index::ObjectIndexBuilder, za::mail::za_keyless_refusal};
+use common::{
+    Server,
+    storage::index::ObjectIndexBuilder,
+    za::{ZA_TRACE_MAIL_COPY, mail::za_keyless_refusal},
+};
 use mail_parser::parsers::fields::thread::thread_name;
 use registry::{
     schema::{
@@ -82,7 +86,7 @@ impl EmailCopy for Server {
                     Security(trc::SecurityEvent::Unauthorized),
                     SpanId = session_id,
                     AccountId = account_id,
-                    Details = "zero-access: mail copy across accounts",
+                    Details = ZA_TRACE_MAIL_COPY,
                 );
                 return Err(za_keyless_refusal().account_id(account_id));
             }
