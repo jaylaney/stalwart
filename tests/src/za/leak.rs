@@ -292,6 +292,12 @@ pub struct Scan {
     pub stubs: usize,
     /// Hits of `VISIBLE_CANARIES`, which are not violations.
     pub found: Vec<String>,
+    /// Temporary blob links held by the account and queued messages for it
+    /// (mail spec 11: no staged blob, sample hold or queue blob once
+    /// delivery completes). Violations only once the caller has waited for
+    /// delivery (`wait_for_delivery`), which the scan cannot know: a scan
+    /// taken while mail is in flight sees them legitimately.
+    pub undelivered: Vec<String>,
 }
 
 fn all_canaries() -> Vec<&'static str> {
@@ -648,7 +654,7 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
                 if key.len() == BLOB_HASH_LEN + U32_LEN + U64_LEN
                     && key[BLOB_HASH_LEN..BLOB_HASH_LEN + U32_LEN] == account_id.to_be_bytes()
                 {
-                    scan.violations
+                    scan.undelivered
                         .push(format!("{what}: temporary blob link held by the account"));
                 }
             }
@@ -798,6 +804,9 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
             if contents.first() == Some(&MAIL_FORMAT_V1) {
                 continue;
             }
+            // Mail spec 5.1, 11: every message blob opens only with the keys.
+            scan.violations
+                .push(format!("{what}: plaintext message blob"));
             let parsed = MessageParser::new()
                 .parse(&contents)
                 .unwrap_or_else(|| panic!("{what} does not parse"));
@@ -831,7 +840,7 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
                 None => recipient.clone(),
             };
             if addresses.contains(&base) {
-                scan.violations
+                scan.undelivered
                     .push(format!("queued message for the account ({recipient})"));
             }
         }
@@ -1375,6 +1384,12 @@ pub async fn test_mail(test: &mut TestServer) {
         "mail leaks:\n{}",
         result.violations.join("\n")
     );
+    // Delivery has completed (`wait_for_delivery` above).
+    assert!(
+        result.undelivered.is_empty(),
+        "held or queued after delivery:\n{}",
+        result.undelivered.join("\n")
+    );
     assert_eq!(result.stubs, 2, "{result:?}");
     assert_eq!(result.emails, 2, "{result:?}");
     assert!(
@@ -1390,9 +1405,10 @@ pub async fn test_mail(test: &mut TestServer) {
     // The submitted copy is sealed for its recipient.
     let submitted = scan(test, recipient_id).await;
     assert!(
-        submitted.violations.is_empty(),
-        "leaks of the submitted copy:\n{}",
-        submitted.violations.join("\n")
+        submitted.violations.is_empty() && submitted.undelivered.is_empty(),
+        "leaks of the submitted copy:\n{}\n{}",
+        submitted.violations.join("\n"),
+        submitted.undelivered.join("\n")
     );
     assert_eq!(submitted.stubs, 1, "{submitted:?}");
 
