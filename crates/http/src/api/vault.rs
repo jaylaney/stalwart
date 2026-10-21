@@ -869,8 +869,9 @@ async fn za_assert_enabled(server: &Server, account_id: u32) -> trc::Result<()> 
     }
 }
 
-/// Refuses an account that already holds calendar data or mail: setup would
-/// otherwise convert plaintext into a key account (mail spec 6.6). A sole
+/// Refuses an account that already holds calendar data, mail or spam
+/// training samples: setup would otherwise convert plaintext into a key
+/// account (mail spec 6.6). A sole
 /// default calendar created by the server (`create_default_calendar`) with
 /// untouched preferences is not user data and is ignored; it is sealed by
 /// its first write (spec 7.3).
@@ -897,6 +898,14 @@ async fn za_assert_no_data(server: &Server, account_id: u32) -> trc::Result<Opti
             .await?
     {
         return Ok(Some(conflict("account already holds mail")));
+    }
+    // Mail ruling R52: a sample written while the account was plain keeps
+    // the message's blob linked and its sender and subject in the registry
+    // until it expires; the operator deletes the account's samples first.
+    if server.za_has_spam_samples(account_id).await? {
+        return Ok(Some(conflict(
+            "account already holds spam training samples",
+        )));
     }
     Ok(None)
 }

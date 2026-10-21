@@ -17,10 +17,17 @@ use ::vault::{
     session::SessionKeys,
 };
 use directory::core::secret::verify_totp_code;
+use registry::{
+    schema::prelude::{ObjectType, Property},
+    types::EnumImpl,
+};
 use std::sync::{Arc, LazyLock};
 use store::{
-    Deserialize, IterateParams, Serialize, Store, ValueKey,
-    write::{AlignedBytes, Archive, Archiver, BatchBuilder, ValueClass, assert::AssertValue, now},
+    Deserialize, IterateParams, Serialize, SerializeInfallible, Store, ValueKey,
+    write::{
+        AlignedBytes, Archive, Archiver, BatchBuilder, RegistryClass, ValueClass,
+        assert::AssertValue, now,
+    },
 };
 use trc::AddContext;
 use types::{
@@ -647,6 +654,35 @@ impl Server {
                 )
                 .no_values()
                 .only_first(),
+                |_, _| {
+                    found = true;
+                    Ok(false)
+                },
+            )
+            .await
+            .caused_by(trc::location!())?;
+        Ok(found)
+    }
+
+    /// Mail ruling R52: true when any spam training sample is indexed under
+    /// the account (the `AccountId` index the trainer's `delete_samples`
+    /// clears). A sample keeps its message's blob linked and its sender and
+    /// subject in the registry until it expires.
+    pub async fn za_has_spam_samples(&self, account_id: u32) -> trc::Result<bool> {
+        let index = |item_id| {
+            ValueKey::from(ValueClass::Registry(RegistryClass::Index {
+                index_id: Property::AccountId.to_id(),
+                object_id: ObjectType::SpamTrainingSample.to_id(),
+                item_id,
+                key: (account_id as u64).serialize(),
+            }))
+        };
+        let mut found = false;
+        self.store()
+            .iterate(
+                IterateParams::new(index(0), index(u64::MAX))
+                    .no_values()
+                    .only_first(),
                 |_, _| {
                     found = true;
                     Ok(false)

@@ -20,6 +20,7 @@ use super::{
 use crate::{
     utils::{
         account::Account,
+        imap::ImapConnection,
         server::TestServer,
         smtp::SmtpConnection,
         za::{
@@ -52,7 +53,10 @@ use registry::{
     schema::{
         enums::TaskStoreMaintenanceType,
         prelude::{Object, ObjectInner, ObjectType},
-        structs::{self, Credential, PasswordCredential, Task, TaskStatus, TaskStoreMaintenance},
+        structs::{
+            self, Credential, PasswordCredential, SpamTrainingSample, Task, TaskStatus,
+            TaskStoreMaintenance,
+        },
     },
     types::id::ObjectId,
 };
@@ -91,6 +95,8 @@ const FENCE11: &str = "fence11@example.com";
 const FENCE12: &str = "fence12@example.com";
 /// `setup_refuses_a_pending_unindex`'s account (ruling R46).
 const PENDING_UNINDEX: &str = "keymail14@example.com";
+/// `setup_refuses_spam_samples`'s account (ruling R52).
+const SAMPLED: &str = "keymail15@example.com";
 const PLAIN: &str = "plainmail3@example.com";
 /// The organizer of `forward_race_imip_side_write`'s invitation, which it
 /// sends through authenticated submission.
@@ -131,6 +137,7 @@ pub async fn test(test: &mut TestServer) {
     let fence8 = pg_and_mysql_are_refused(test, &admin).await;
     let fence9 = setup_refuses_existing_mail(test, &admin).await;
     let pending_unindex = setup_refuses_a_pending_unindex(test, &admin).await;
+    let sampled = setup_refuses_spam_samples(test, &admin).await;
 
     // The accounts that log in empty their own mailboxes; the others are
     // pending or credentialless, and the account's destruction removes
@@ -157,6 +164,7 @@ pub async fn test(test: &mut TestServer) {
         fence8,
         fence9,
         pending_unindex,
+        sampled,
     ] {
         admin.destroy_account(account).await;
     }
@@ -1245,5 +1253,73 @@ async fn setup_refuses_a_pending_unindex(test: &TestServer, admin: &Account) -> 
         "the unindex task left the metadata archive"
     );
     za_setup_token(admin, PENDING_UNINDEX).await;
+    account
+}
+
+/// The ids of the spam training samples indexed under `account_id`.
+async fn account_samples(admin: &Account, account_id: u32) -> Vec<Id> {
+    admin
+        .registry_get_all::<SpamTrainingSample>()
+        .await
+        .into_iter()
+        .filter(|(_, sample)| sample.account_id == Some(Id::from(account_id)))
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// Ruling R52 of plan 13 (re-review N2): a spam training sample written
+/// while the account was plain keeps the message's blob linked and its
+/// sender and subject in the registry until it expires, so issuance is
+/// refused while one is indexed under the account, also once the mailbox is
+/// emptied and unindexed; it succeeds once the sample is destroyed.
+async fn setup_refuses_spam_samples(test: &TestServer, admin: &Account) -> Account {
+    println!("setup_refuses_spam_samples");
+    let account = passwordless(admin, SAMPLED).await;
+    let id = account.id().document_id();
+    // A master-user session of the credentialless account trains one sample
+    // with an APPEND into Junk.
+    let mut imap = ImapConnection::connect(b"_s ").await;
+    imap.authenticate(&format!("{SAMPLED}%{}", admin.name()), admin.secret())
+        .await;
+    imap.append("Junk Mail", &message_with("sampled junk", "sampled-body"))
+        .await;
+    imap.send_ok("LOGOUT").await;
+    let samples = account_samples(admin, id).await;
+    assert_eq!(samples.len(), 1, "the APPEND into Junk trained no sample");
+
+    admin.destroy_all_mailboxes_for_account(id).await;
+    test.wait_for_tasks().await;
+    // Only the sample is left: no message, no metadata archive.
+    assert!(
+        !test
+            .server
+            .za_has_documents(id, Collection::Email)
+            .await
+            .unwrap()
+            && !test
+                .server
+                .za_has_property(id, Collection::Email, EmailField::Metadata)
+                .await
+                .unwrap(),
+        "the emptied mailbox still holds mail"
+    );
+    let reply = za_post_as(admin, "setup-token", &json!({ "account": SAMPLED })).await;
+    assert_eq!(
+        reply.expect(409)["error"],
+        "account already holds spam training samples",
+        "issuance while a sample of the account is stored"
+    );
+    assert!(
+        test.server.za_vault_record(id).await.unwrap().is_none(),
+        "the refused issuance wrote a record"
+    );
+
+    let destroyed = admin
+        .registry_destroy(ObjectType::SpamTrainingSample, &samples)
+        .await
+        .destroyed()
+        .count();
+    assert_eq!(destroyed, samples.len(), "the sample was not destroyed");
+    za_setup_token(admin, SAMPLED).await;
     account
 }
