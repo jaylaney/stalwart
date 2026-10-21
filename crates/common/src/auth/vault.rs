@@ -25,8 +25,8 @@ use std::sync::{Arc, LazyLock};
 use store::{
     Deserialize, IterateParams, Serialize, SerializeInfallible, Store, ValueKey,
     write::{
-        AlignedBytes, Archive, Archiver, BatchBuilder, RegistryClass, ValueClass,
-        assert::AssertValue, now,
+        AlignedBytes, Archive, Archiver, BatchBuilder, RegistryClass, SearchIndex,
+        SearchIndexClass, SearchIndexId, SearchIndexType, ValueClass, assert::AssertValue, now,
     },
 };
 use trc::AddContext;
@@ -681,6 +681,41 @@ impl Server {
         self.store()
             .iterate(
                 IterateParams::new(index(0), index(u64::MAX))
+                    .no_values()
+                    .only_first(),
+                |_, _| {
+                    found = true;
+                    Ok(false)
+                },
+            )
+            .await
+            .caused_by(trc::location!())?;
+        Ok(found)
+    }
+
+    /// Mail ruling R51: true when the internal search store holds an Email
+    /// document of the account. Each indexed document has one `Document`
+    /// key, the ground truth there; the unindex task deletes it in a write
+    /// after the one that clears the metadata archive. An external search
+    /// store (ElasticSearch, MeiliSearch) is not checked, a recorded limit.
+    pub async fn za_has_email_search_documents(&self, account_id: u32) -> trc::Result<bool> {
+        let Some(store) = self.search_store().internal_fts() else {
+            return Ok(false);
+        };
+        let document = |document_id| {
+            ValueKey::from(ValueClass::SearchIndex(SearchIndexClass {
+                index: SearchIndex::Email,
+                id: SearchIndexId::Account {
+                    account_id,
+                    document_id,
+                },
+                typ: SearchIndexType::Document,
+            }))
+        };
+        let mut found = false;
+        store
+            .iterate(
+                IterateParams::new(document(0), document(u32::MAX))
                     .no_values()
                     .only_first(),
                 |_, _| {

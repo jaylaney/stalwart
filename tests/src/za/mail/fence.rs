@@ -49,6 +49,7 @@ use email::{
 };
 use groupware::calendar::seal::WRAP_PK;
 use mail_parser::MessageParser;
+use nlp::language::Language;
 use registry::{
     schema::{
         enums::TaskStoreMaintenanceType,
@@ -66,8 +67,9 @@ use store::{
     IterateParams, U32_LEN, U64_LEN, ValueKey,
     registry::write::{RegistryWrite, RegistryWriteResult},
     roaring::RoaringBitmap,
+    search::{EmailSearchField, IndexDocument, SearchField, SearchFilter, SearchQuery},
     write::{
-        AlignedBytes, Archive, BatchBuilder, BlobLink, BlobOp, ValueClass,
+        AlignedBytes, Archive, BatchBuilder, BlobLink, BlobOp, SearchIndex, ValueClass,
         key::DeserializeBigEndian, now,
     },
 };
@@ -97,6 +99,8 @@ const FENCE12: &str = "fence12@example.com";
 const PENDING_UNINDEX: &str = "keymail14@example.com";
 /// `setup_refuses_spam_samples`'s account (ruling R52).
 const SAMPLED: &str = "keymail15@example.com";
+/// `setup_refuses_an_orphaned_search_document`'s account (ruling R51).
+const ORPHANED: &str = "keymail16@example.com";
 const PLAIN: &str = "plainmail3@example.com";
 /// The organizer of `forward_race_imip_side_write`'s invitation, which it
 /// sends through authenticated submission.
@@ -138,6 +142,7 @@ pub async fn test(test: &mut TestServer) {
     let fence9 = setup_refuses_existing_mail(test, &admin).await;
     let pending_unindex = setup_refuses_a_pending_unindex(test, &admin).await;
     let sampled = setup_refuses_spam_samples(test, &admin).await;
+    let orphaned = setup_refuses_an_orphaned_search_document(test, &admin).await;
 
     // The accounts that log in empty their own mailboxes; the others are
     // pending or credentialless, and the account's destruction removes
@@ -165,6 +170,7 @@ pub async fn test(test: &mut TestServer) {
         fence9,
         pending_unindex,
         sampled,
+        orphaned,
     ] {
         admin.destroy_account(account).await;
     }
@@ -1321,5 +1327,65 @@ async fn setup_refuses_spam_samples(test: &TestServer, admin: &Account) -> Accou
         .count();
     assert_eq!(destroyed, samples.len(), "the sample was not destroyed");
     za_setup_token(admin, SAMPLED).await;
+    account
+}
+
+/// Ruling R51 of plan 13 (re-review N1): the unindex task deletes a
+/// message's search document in a write after the one that clears its
+/// metadata archive, and that write can fail or be skipped, leaving an
+/// Email search document that outlived its message. Issuance is refused
+/// while the internal search store holds one for the account (planted here
+/// through the search store, with no Email archive and no metadata archive)
+/// and succeeds once it is removed.
+async fn setup_refuses_an_orphaned_search_document(test: &TestServer, admin: &Account) -> Account {
+    println!("setup_refuses_an_orphaned_search_document");
+    let account = passwordless(admin, ORPHANED).await;
+    let id = account.id().document_id();
+    let search = test.server.search_store();
+    assert!(
+        search.internal_fts().is_some(),
+        "the suite runs on the internal search store"
+    );
+    let mut document = IndexDocument::new(SearchIndex::Email)
+        .with_account_id(id)
+        .with_document_id(0);
+    document.index_text(
+        EmailSearchField::Subject,
+        "orphaned search document",
+        Language::English,
+    );
+    document.index_unsigned(EmailSearchField::ReceivedAt, now());
+    search.index(vec![document]).await.unwrap();
+    assert!(
+        !test
+            .server
+            .za_has_documents(id, Collection::Email)
+            .await
+            .unwrap()
+            && !test
+                .server
+                .za_has_property(id, Collection::Email, EmailField::Metadata)
+                .await
+                .unwrap(),
+        "the account holds a message"
+    );
+
+    let reply = za_post_as(admin, "setup-token", &json!({ "account": ORPHANED })).await;
+    assert_eq!(
+        reply.expect(409)["error"],
+        "account already holds mail",
+        "issuance while an Email search document of the account is stored"
+    );
+    assert!(
+        test.server.za_vault_record(id).await.unwrap().is_none(),
+        "the refused issuance wrote a record"
+    );
+
+    let mut query = SearchQuery::new(SearchIndex::Email);
+    query
+        .add_filter(SearchFilter::eq(SearchField::AccountId, id))
+        .add_filter(SearchFilter::eq(SearchField::DocumentId, 0u32));
+    search.unindex(query).await.unwrap();
+    za_setup_token(admin, ORPHANED).await;
     account
 }

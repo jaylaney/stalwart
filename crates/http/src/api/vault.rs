@@ -889,7 +889,10 @@ async fn za_assert_no_data(server: &Server, account_id: u32) -> trc::Result<Opti
     }
     // Mail ruling R46: a destroyed message's metadata archive (field 71),
     // blob link and search document stay until its unindex task runs, so
-    // until then the account still holds that message's plaintext.
+    // until then the account still holds that message's plaintext. The
+    // search document is deleted in a separate, later write, which can fail
+    // or be skipped after field 71 is gone; ruling R51 checks it below by
+    // its `Document` key, the ground truth on the internal search store.
     if server
         .za_has_documents(account_id, Collection::Email)
         .await?
@@ -906,6 +909,11 @@ async fn za_assert_no_data(server: &Server, account_id: u32) -> trc::Result<Opti
         return Ok(Some(conflict(
             "account already holds spam training samples",
         )));
+    }
+    // Mail ruling R51: an Email search document of the account outlived its
+    // message (internal search store only; an external one is not checked).
+    if server.za_has_email_search_documents(account_id).await? {
+        return Ok(Some(conflict("account already holds mail")));
     }
     Ok(None)
 }
