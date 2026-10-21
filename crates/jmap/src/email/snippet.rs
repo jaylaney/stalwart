@@ -4,7 +4,8 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use common::{Server, auth::AccessToken, za::ZA_MAIL_SEARCH_REFUSED};
+use crate::email::za::za_refuse_snippet_terms;
+use common::{Server, auth::AccessToken};
 use email::{
     cache::{MessageCacheFetch, email::MessageCacheAccess},
     message::{
@@ -48,6 +49,11 @@ impl EmailSearchSnippet for Server {
         request: GetSearchSnippetRequest,
         access_token: &AccessToken,
     ) -> trc::Result<GetSearchSnippetResponse> {
+        // Mail spec 8: snippets mark terms in sealed content, which a search
+        // cannot find; a key account's request carrying a text, subject or
+        // body property is refused before any message is read, whatever the
+        // property tokenises to.
+        za_refuse_snippet_terms(self, request.account_id.document_id(), &request.filter).await?;
         let mut filter_stack = vec![];
         let mut include_term = true;
         let mut terms = vec![];
@@ -97,15 +103,6 @@ impl EmailSearchSnippet for Server {
             }
         }
         let account_id = request.account_id.document_id();
-        // Mail spec 8: a snippet marks the matched terms in sealed content,
-        // which a search cannot find; a text term on a key account is
-        // refused before any message is read. Without terms the response
-        // carries bare snippets, as for any account.
-        if !terms.is_empty() && self.za_is_key_account(account_id).await? {
-            return Err(trc::JmapEvent::UnsupportedFilter
-                .into_err()
-                .details(format!("text: {ZA_MAIL_SEARCH_REFUSED}")));
-        }
         let cached_messages = self
             .get_cached_messages(account_id)
             .await
@@ -128,7 +125,9 @@ impl EmailSearchSnippet for Server {
             return Err(trc::JmapEvent::RequestTooLarge.into_err());
         }
         // Mail spec 7, 8: the account's keys, once for the request; without
-        // terms nothing is read.
+        // terms nothing is read. Defence in depth: a key account's request
+        // with terms is refused above, so this branch and the sealed reads
+        // below are unreachable for one.
         let keys = if terms.is_empty() {
             None
         } else {

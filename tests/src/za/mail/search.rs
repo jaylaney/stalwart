@@ -398,8 +398,8 @@ fn refused_commands() -> Vec<(String, &'static str)> {
 
 /// Mail spec 8: a content filter or sort, alone or mixed with a served one,
 /// answers `NO [CANNOT]` with the fixed text, no result line, and leaves the
-/// connection open. The refusal is an `ImapEvent::Error` and no security
-/// event, and the search term is not traced.
+/// connection open. The refusal is an `ImapEvent::Error` and no
+/// `SecurityEvent::Unauthorized`, and the search term is not traced.
 async fn imap_refused_keys(key: &Fixture, plain: &Fixture) {
     println!("imap_refused_keys");
     const TERM: &str = "search-term-canary";
@@ -437,8 +437,8 @@ async fn imap_refused_keys(key: &Fixture, plain: &Fixture) {
     assert!(
         !events
             .iter()
-            .any(|event| matches!(event.typ, EventType::Security(_))),
-        "a refused search is no security event: {events:?}"
+            .any(|event| matches!(event.typ, EventType::Security(SecurityEvent::Unauthorized))),
+        "a refused search is no SecurityEvent::Unauthorized: {events:?}"
     );
     let errors = events
         .iter()
@@ -709,6 +709,18 @@ async fn jmap_served_filters_and_sorts(key: &mut Fixture, plain: &mut Fixture) {
     }
 }
 
+/// `Email/queryChanges` of the `filter` and `sort` since `state`.
+async fn query_changes(
+    account: &Account,
+    filter: Value,
+    sort: Option<Value>,
+    state: &str,
+) -> JmapResponse {
+    let mut args = query_args(account, Some(filter), sort, false);
+    args["sinceQueryState"] = json!(state);
+    account.jmap_method_call("Email/queryChanges", args).await
+}
+
 /// A method error of `kind`, with the description `"{what}: {text}"`.
 fn assert_refusal(reply: &JmapResponse, kind: &str, what: &str, context: &str) {
     let response = &reply.0["methodResponses"][0];
@@ -764,8 +776,28 @@ async fn jmap_refused_filters_and_sorts(key: &Fixture, plain: &Fixture) {
                     "{context}: {property}: {:?}",
                     reply.0
                 );
-                assert!(reply.ids().count() <= 5, "{context}: {property}");
             }
+        }
+        if !is_key {
+            // The control finds content: one message by its subject.
+            let reply = fixture
+                .account
+                .jmap_method_call(
+                    "Email/query",
+                    query_args(
+                        &fixture.account,
+                        Some(json!({ "subject": "bravo" })),
+                        None,
+                        false,
+                    ),
+                )
+                .await;
+            assert_eq!(
+                reply.ids().collect::<Vec<_>>(),
+                [fixture.emails[0].as_str()],
+                "{context}: {:?}",
+                reply.0
+            );
         }
         let mixed = json!({
             "operator": "AND",
@@ -809,52 +841,63 @@ async fn jmap_refused_filters_and_sorts(key: &Fixture, plain: &Fixture) {
             }
         }
 
-        // Email/queryChanges reaches the same refusal: the message imported
-        // after the stale state is a change.
-        let mut args = query_args(&fixture.account, Some(json!({ "from": "x" })), None, false);
-        args["sinceQueryState"] = json!(fixture.stale_state);
-        let reply = fixture
+        // Email/queryChanges refuses with a stale state (the message imported
+        // after it is a change) and with the current one (nothing to report).
+        let current = fixture
             .account
-            .jmap_method_call("Email/queryChanges", args)
+            .jmap_method_call(
+                "Email/query",
+                query_args(&fixture.account, None, None, false),
+            )
+            .await
+            .method_response()["queryState"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for (state_name, state) in [("stale", &fixture.stale_state), ("current", &current)] {
+            let context = format!("{context}: {state_name} state");
+            let reply = query_changes(&fixture.account, json!({ "from": "x" }), None, state).await;
+            if is_key {
+                assert_refusal(&reply, "unsupportedFilter", "from", &context);
+            } else {
+                assert_eq!(
+                    reply.name_at(0),
+                    "Email/queryChanges",
+                    "{context}: {:?}",
+                    reply.0
+                );
+            }
+            let reply = query_changes(
+                &fixture.account,
+                json!({ "inMailbox": inbox() }),
+                Some(json!([{ "property": "subject", "isAscending": true }])),
+                state,
+            )
             .await;
-        if is_key {
-            assert_refusal(&reply, "unsupportedFilter", "from", context);
-        } else {
-            assert_eq!(
-                reply.name_at(0),
-                "Email/queryChanges",
-                "{context}: {:?}",
-                reply.0
-            );
-        }
-        let mut args = query_args(
-            &fixture.account,
-            Some(json!({ "inMailbox": inbox() })),
-            Some(json!([{ "property": "subject", "isAscending": true }])),
-            false,
-        );
-        args["sinceQueryState"] = json!(fixture.stale_state);
-        let reply = fixture
-            .account
-            .jmap_method_call("Email/queryChanges", args)
-            .await;
-        if is_key {
-            assert_refusal(&reply, "unsupportedSort", "subject", context);
-        } else {
-            assert_eq!(
-                reply.name_at(0),
-                "Email/queryChanges",
-                "{context}: {:?}",
-                reply.0
-            );
+            if is_key {
+                assert_refusal(&reply, "unsupportedSort", "subject", &context);
+            } else {
+                assert_eq!(
+                    reply.name_at(0),
+                    "Email/queryChanges",
+                    "{context}: {:?}",
+                    reply.0
+                );
+            }
         }
 
-        // SearchSnippet/get: a text term is refused; without one the
-        // snippets are bare.
-        for filter in [
-            json!({ "text": "x" }),
-            json!({ "subject": "x" }),
-            json!({ "body": "x" }),
+        // SearchSnippet/get: a text, subject or body property is refused and
+        // named, even one that tokenises to nothing or sits under NOT;
+        // without one the snippets are bare.
+        for (property, filter) in [
+            ("text", json!({ "text": "x" })),
+            ("subject", json!({ "subject": "x" })),
+            ("body", json!({ "body": "x" })),
+            ("text", json!({ "text": "!!!" })),
+            (
+                "text",
+                json!({ "operator": "NOT", "conditions": [{ "text": "x" }] }),
+            ),
         ] {
             let reply = fixture
                 .account
@@ -868,7 +911,7 @@ async fn jmap_refused_filters_and_sorts(key: &Fixture, plain: &Fixture) {
                 )
                 .await;
             if is_key {
-                assert_refusal(&reply, "unsupportedFilter", "text", context);
+                assert_refusal(&reply, "unsupportedFilter", property, context);
             } else {
                 assert_eq!(
                     reply.name_at(0),

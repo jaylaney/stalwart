@@ -278,11 +278,13 @@ impl<T: SessionStream> SessionData<T> {
         // content is refused as a whole, not left to match nothing. Not a
         // security event: the client must read the answer. The error holds
         // the fixed text only, so the search term is not traced.
-        if self.server.za_is_key_account(mailbox.id.account_id).await?
-            && (imap_filter.iter().any(za_filter_needs_content)
-                || imap_comparator
-                    .iter()
-                    .any(|comparator| za_sort_needs_content(&comparator.sort)))
+        // The request is read first: an account whose request needs no
+        // content is not looked up.
+        if (imap_filter.iter().any(za_filter_needs_content)
+            || imap_comparator
+                .iter()
+                .any(|comparator| za_sort_needs_content(&comparator.sort)))
+            && self.server.za_is_key_account(mailbox.id.account_id).await?
         {
             return Err(trc::ImapEvent::Error
                 .into_err()
@@ -882,9 +884,9 @@ mod tests {
     use super::*;
     use imap_proto::protocol::{Flag, search::ModSeqEntry};
 
-    /// Every `Filter` variant with its verdict (mail spec 8). The match in
-    /// `za_filter_needs_content` has no wildcard, so a new variant fails to
-    /// compile there; this table fails when one is added without a row.
+    /// Every `Filter` variant with its verdict (mail spec 8). The table pins
+    /// today's verdicts; the compile-time guard against a new variant is the
+    /// exhaustive match in `za_filter_needs_content`.
     fn filters() -> Vec<(Filter, bool)> {
         let text = || "x".to_string();
         vec![

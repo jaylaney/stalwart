@@ -5,21 +5,23 @@
  */
 
 //! Mail spec 8: the filters and sorts of `Email/query` that need a message's
-//! content, which a key account's search index does not hold (spec 5.5; the
-//! stub carries the arrival time and the size only). `email_query` refuses
-//! them up front with `unsupportedFilter` or `unsupportedSort` rather than
-//! leaving them to the store's silence on a missing field. The matches carry
-//! no wildcard arm, so a variant added upstream fails to compile here until
-//! it is classified.
+//! content, which a key account's search index does not hold (spec 5.5: the
+//! index holds the arrival time and the size only). `email_query` and
+//! `Email/queryChanges` refuse them up front with `unsupportedFilter` or
+//! `unsupportedSort` rather than leaving them to the store's silence on a
+//! missing field. The matches carry no wildcard arm, so a variant added
+//! upstream fails to compile here until it is classified.
 
+use common::{Server, za::ZA_MAIL_SEARCH_REFUSED};
 use jmap_proto::{
     method::query::{Comparator, Filter},
     object::email::{EmailComparator, EmailFilter},
 };
 
 /// True when answering the filter needs a message's sealed content (header
-/// values, body text, attachment presence, the sent date) or is unknown, in
-/// which case it is refused as well.
+/// values, body text, attachment presence, the sent date). An unknown
+/// property is left to upstream, which names it in its own
+/// `unsupportedFilter`.
 pub fn filter_needs_content(filter: &EmailFilter) -> bool {
     match filter {
         EmailFilter::Text(_)
@@ -32,8 +34,7 @@ pub fn filter_needs_content(filter: &EmailFilter) -> bool {
         | EmailFilter::Header(_)
         | EmailFilter::HasAttachment(_)
         | EmailFilter::SentBefore(_)
-        | EmailFilter::SentAfter(_)
-        | EmailFilter::_T(_) => true,
+        | EmailFilter::SentAfter(_) => true,
         EmailFilter::InMailbox(_)
         | EmailFilter::InMailboxOtherThan(_)
         | EmailFilter::Before(_)
@@ -46,7 +47,8 @@ pub fn filter_needs_content(filter: &EmailFilter) -> bool {
         | EmailFilter::HasKeyword(_)
         | EmailFilter::NotKeyword(_)
         | EmailFilter::InThread(_)
-        | EmailFilter::Id(_) => false,
+        | EmailFilter::Id(_)
+        | EmailFilter::_T(_) => false,
     }
 }
 
@@ -86,6 +88,64 @@ pub fn first_refused_sort(sorts: &[Comparator<EmailComparator>]) -> Option<&Emai
         .find(|property| sort_needs_content(property))
 }
 
+/// The first `text`, `subject` or `body` condition of a `SearchSnippet/get`
+/// filter, wherever it sits in the tree (under `NOT` as well): the
+/// properties whose terms the snippets mark.
+pub fn first_snippet_term(filters: &[Filter<EmailFilter>]) -> Option<&EmailFilter> {
+    filters.iter().find_map(|filter| match filter {
+        Filter::Property(
+            condition @ (EmailFilter::Text(_) | EmailFilter::Subject(_) | EmailFilter::Body(_)),
+        ) => Some(condition),
+        _ => None,
+    })
+}
+
+/// Refuses an `Email/query` or `Email/queryChanges` of a key account whose
+/// filter or sort needs content: `unsupportedFilter` or `unsupportedSort`,
+/// naming the property and carrying `ZA_MAIL_SEARCH_REFUSED`. The request is
+/// read first, so an account whose request needs no content is not looked up.
+pub async fn za_refuse_content_query(
+    server: &Server,
+    account_id: u32,
+    filters: &[Filter<EmailFilter>],
+    sorts: &[Comparator<EmailComparator>],
+) -> trc::Result<()> {
+    let filter = first_refused_filter(filters);
+    let sort = first_refused_sort(sorts);
+    if (filter.is_some() || sort.is_some()) && server.za_is_key_account(account_id).await? {
+        if let Some(filter) = filter {
+            return Err(trc::JmapEvent::UnsupportedFilter
+                .into_err()
+                .details(format!("{filter}: {ZA_MAIL_SEARCH_REFUSED}")));
+        }
+        if let Some(sort) = sort {
+            return Err(trc::JmapEvent::UnsupportedSort
+                .into_err()
+                .details(format!("{sort}: {ZA_MAIL_SEARCH_REFUSED}")));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a `SearchSnippet/get` of a key account whose filter carries a
+/// `text`, `subject` or `body` property, even one that tokenises to nothing
+/// or sits under `NOT`: `unsupportedFilter`, naming the property. Snippets
+/// mark terms in sealed content, which the server does not search.
+pub async fn za_refuse_snippet_terms(
+    server: &Server,
+    account_id: u32,
+    filters: &[Filter<EmailFilter>],
+) -> trc::Result<()> {
+    if let Some(term) = first_snippet_term(filters)
+        && server.za_is_key_account(account_id).await?
+    {
+        return Err(trc::JmapEvent::UnsupportedFilter
+            .into_err()
+            .details(format!("{term}: {ZA_MAIL_SEARCH_REFUSED}")));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,9 +164,9 @@ mod tests {
         }
     }
 
-    /// Every `EmailFilter` variant with its verdict (spec 8). The match in
-    /// `filter_needs_content` has no wildcard, so a new variant fails to
-    /// compile there; this table fails when one is added without a row.
+    /// Every `EmailFilter` variant with its verdict (mail spec 8). The table
+    /// pins today's verdicts; the compile-time guard against a new variant
+    /// is the exhaustive match in `filter_needs_content`.
     fn filters() -> Vec<(EmailFilter, bool)> {
         vec![
             (EmailFilter::InMailbox(Id::default()), false),
@@ -133,7 +193,7 @@ mod tests {
             (EmailFilter::SentAfter(UTCDate::default()), true),
             (EmailFilter::InThread(Id::default()), false),
             (EmailFilter::Id(vec![Id::default()]), false),
-            (EmailFilter::_T("x-unknown".into()), true),
+            (EmailFilter::_T("x-unknown".into()), false),
         ]
     }
 
@@ -193,6 +253,42 @@ mod tests {
             ]),
             None
         );
+    }
+
+    #[test]
+    fn first_snippet_term_finds_the_marked_properties_anywhere() {
+        let under_not = vec![
+            Filter::And,
+            Filter::Property(EmailFilter::InMailbox(Id::default())),
+            Filter::Not,
+            Filter::Property(EmailFilter::Body("x".into())),
+            Filter::Close,
+            Filter::Close,
+        ];
+        assert_eq!(
+            first_snippet_term(&under_not),
+            Some(&EmailFilter::Body("x".into()))
+        );
+        for term in [
+            EmailFilter::Text("!!!".into()),
+            EmailFilter::Subject("x".into()),
+            EmailFilter::Body("x".into()),
+        ] {
+            assert_eq!(
+                first_snippet_term(&[Filter::Property(term.clone())]),
+                Some(&term)
+            );
+        }
+        // The other content properties are not marked in a snippet.
+        assert_eq!(
+            first_snippet_term(&[
+                Filter::Property(EmailFilter::From("x".into())),
+                Filter::Property(EmailFilter::HasAttachment(true)),
+                Filter::Property(EmailFilter::InMailbox(Id::default())),
+            ]),
+            None
+        );
+        assert_eq!(first_snippet_term(&[]), None);
     }
 
     #[test]
