@@ -14,7 +14,10 @@
 //! `DataCorruption` the reader turns into its protocol's per-message failure
 //! (`za_readable`).
 
-use super::{blob_needs_private_key, is_stub, open_mail_blob, open_stub, stub_needs_private_key};
+use super::{
+    MailWrap, blob_needs_private_key, is_stub, new_dek, open_mail_blob, open_stub, seal_mail_blob,
+    seal_mail_envelope, stub_needs_private_key,
+};
 use crate::message::metadata::MessageMetadata;
 use common::{
     Server,
@@ -39,6 +42,9 @@ pub use zeroize::Zeroizing;
 /// Mail spec 10: the trace reason of a message whose stub or blob does not
 /// open.
 pub const ZA_REASON_UNREADABLE: &str = "zero-access: unreadable message";
+/// Mail spec 5.7, 9: the trace details of a refused raw read of a sealed
+/// source (`za_refuse_raw_source`).
+pub const ZA_TRACE_RAW_SOURCE: &str = "zero-access: raw read of a sealed source";
 
 pub trait ZaMailView: Sync + Send {
     /// The keys a read of `account_id`'s mail uses: `Some` when the token
@@ -103,6 +109,40 @@ pub trait ZaMailView: Sync + Send {
         &self,
         blob_id: &BlobId,
     ) -> impl Future<Output = trc::Result<bool>> + Send;
+
+    /// Mail spec 5.7: an upload into a key account, sealed as the blob of
+    /// 5.1 under a fresh DEK wrapped to the session's mail wrapping key
+    /// (`mk`), then reserved as upstream reserves an upload. The callers
+    /// check the size and the quota on `data.len()`, the plaintext, first.
+    fn za_put_sealed_upload(
+        &self,
+        account_id: u32,
+        keys: &SessionKeys,
+        data: &[u8],
+    ) -> impl Future<Output = trc::Result<BlobId>> + Send;
+
+    /// Mail spec 5.7, 7: a key account's upload (a `Reserved` blob, always
+    /// sealed) opened whole with `keys`, `za_mail_keys`'s answer for the
+    /// account, the private key unwrapped only for a `pk` envelope. One
+    /// that does not open is unreadable (`za_readable`), as a message is,
+    /// without a document id.
+    fn za_open_upload_blob(
+        &self,
+        keys: &SessionKeys,
+        account_id: u32,
+        bytes: Vec<u8>,
+    ) -> impl Future<Output = trc::Result<Zeroizing<Vec<u8>>>> + Send;
+
+    /// Mail spec 5.7, 9: refuses a consumer that reads `blob_id`'s stored
+    /// bytes, or a section of them, without unsealing, when the id is a
+    /// sealed source (`za_is_sealed_source`), whichever session asks:
+    /// traced as `Security(Unauthorized)` naming the owning account, with
+    /// `ZA_TRACE_RAW_SOURCE`, and answered with the keyless refusal, an
+    /// error every caller writes (ruling R22).
+    fn za_refuse_raw_source(
+        &self,
+        blob_id: &BlobId,
+    ) -> impl Future<Output = trc::Result<()>> + Send;
 }
 
 impl ZaMailView for Server {
@@ -143,7 +183,7 @@ impl ZaMailView for Server {
         let private_key = if stub_needs_private_key(stub)
             .map_err(|err| za_unreadable(err, account_id, document_id))?
         {
-            Some(za_private_key(self, keys, document_id).await?)
+            Some(za_private_key(self, keys, Some(document_id)).await?)
         } else {
             None
         };
@@ -164,7 +204,7 @@ impl ZaMailView for Server {
         let private_key = if blob_needs_private_key(&bytes)
             .map_err(|err| za_unreadable(err, account_id, document_id))?
         {
-            Some(za_private_key(self, keys, document_id).await?)
+            Some(za_private_key(self, keys, Some(document_id)).await?)
         } else {
             None
         };
@@ -185,6 +225,61 @@ impl ZaMailView for Server {
             BlobClass::Linked { .. } => Ok(false),
         }
     }
+
+    async fn za_put_sealed_upload(
+        &self,
+        account_id: u32,
+        keys: &SessionKeys,
+        data: &[u8],
+    ) -> trc::Result<BlobId> {
+        let dek = new_dek();
+        let envelope = seal_mail_envelope(&dek, MailWrap::Session(keys), account_id)
+            .map_err(|err| za_upload_error(err, account_id))?;
+        let sealed = seal_mail_blob(&dek, &envelope, account_id, data);
+        self.put_jmap_blob(account_id, &sealed)
+            .await
+            .caused_by(trc::location!())
+    }
+
+    async fn za_open_upload_blob(
+        &self,
+        keys: &SessionKeys,
+        account_id: u32,
+        bytes: Vec<u8>,
+    ) -> trc::Result<Zeroizing<Vec<u8>>> {
+        let unreadable =
+            |err| za_upload_error(err, account_id).ctx(trc::Key::Reason, ZA_REASON_UNREADABLE);
+        let private_key = if blob_needs_private_key(&bytes).map_err(unreadable)? {
+            Some(za_private_key(self, keys, None).await?)
+        } else {
+            None
+        };
+        open_mail_blob(&bytes, keys, private_key, account_id).map_err(unreadable)
+    }
+
+    async fn za_refuse_raw_source(&self, blob_id: &BlobId) -> trc::Result<()> {
+        if self.za_is_sealed_source(blob_id).await? {
+            let account_id = blob_id.class.account_id();
+            trc::event!(
+                Security(trc::SecurityEvent::Unauthorized),
+                AccountId = account_id,
+                Details = ZA_TRACE_RAW_SOURCE,
+            );
+            Err(za_keyless_refusal().account_id(account_id))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// `seal_error`'s shape for an upload, which has no document id (as the
+/// staging of a delivery builds it).
+fn za_upload_error(err: SealError, account_id: u32) -> trc::Error {
+    trc::StoreEvent::DataCorruption
+        .into_err()
+        .details(format!("zero-access sealing error: {err}"))
+        .account_id(account_id)
+        .caused_by(trc::location!())
 }
 
 /// Mail spec 5.2, 7: the stub `stored` opened into the view's archive: the
@@ -248,16 +343,20 @@ pub fn za_readable<T>(result: trc::Result<T>) -> trc::Result<Option<T>> {
 }
 
 /// The account's private key for a `pk` envelope; a key that does not open
-/// (a `DataCorruption`) makes the message unreadable.
+/// (a `DataCorruption`) makes the message (`document_id`) or the upload
+/// (`None`) unreadable.
 async fn za_private_key<'k>(
     server: &Server,
     keys: &'k SessionKeys,
-    document_id: u32,
+    document_id: Option<u32>,
 ) -> trc::Result<&'k Secret> {
     server.za_private_key(keys).await.map_err(|err| {
         if err.matches(trc::EventType::Store(trc::StoreEvent::DataCorruption)) {
-            err.document_id(document_id)
-                .ctx(trc::Key::Reason, ZA_REASON_UNREADABLE)
+            match document_id {
+                Some(document_id) => err.document_id(document_id),
+                None => err,
+            }
+            .ctx(trc::Key::Reason, ZA_REASON_UNREADABLE)
         } else {
             err
         }

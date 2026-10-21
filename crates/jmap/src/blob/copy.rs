@@ -5,7 +5,8 @@
  */
 
 use super::download::BlobDownload;
-use common::{Server, auth::AccessToken};
+use common::{Server, auth::AccessToken, za::mail::za_keyless_refusal};
+use email::message::za::view::ZaMailView;
 use jmap_proto::{
     error::set::{SetError, SetErrorType},
     method::copy::{CopyBlobRequest, CopyBlobResponse},
@@ -40,6 +41,18 @@ impl BlobCopy for Server {
         };
         let account_id = request.account_id.document_id();
 
+        // Mail spec 6.3, 9: no blob copy into or out of a key account.
+        for za_account_id in [account_id, request.from_account_id.document_id()] {
+            if self.za_is_key_account(za_account_id).await? {
+                trc::event!(
+                    Security(trc::SecurityEvent::Unauthorized),
+                    AccountId = za_account_id,
+                    Details = "zero-access: mail copy across accounts",
+                );
+                return Err(za_keyless_refusal().account_id(za_account_id));
+            }
+        }
+
         for blob_id in request.blob_ids {
             let blob_id = match blob_id {
                 MaybeInvalid::Value(blob_id) => blob_id,
@@ -53,6 +66,9 @@ impl BlobCopy for Server {
                     continue;
                 }
             };
+            // Mail spec 5.7: never a sealed source's hash, whatever the
+            // accounts named.
+            self.za_refuse_raw_source(&blob_id).await?;
             if self.has_access_blob(&blob_id, access_token).await? {
                 // Enforce quota
                 if !access_token.has_permission(Permission::UnlimitedUploads)

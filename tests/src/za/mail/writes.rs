@@ -11,8 +11,8 @@
 //! reads (review focus 3).
 
 use super::{
-    assert_sealed, key_mail_account, message_ids, message_with, new_message, open_message,
-    spam_samples, stored_metadata,
+    assert_sealed, assert_sealed_upload, key_mail_account, message_ids, message_with, new_message,
+    open_message, spam_samples, stored_metadata,
 };
 use crate::{
     utils::{
@@ -39,7 +39,7 @@ use mail_parser::MessageParser;
 use registry::schema::prelude::ObjectType;
 use serde_json::{Map, Value, json};
 use std::str::FromStr;
-use types::{blob_hash::BlobHash, id::Id};
+use types::{blob::BlobId, blob_hash::BlobHash, id::Id};
 
 const NAME: &str = "keymail4@example.com";
 const PLAIN: &str = "plainmail2@example.com";
@@ -150,33 +150,47 @@ async fn email_set_create_is_sealed_under_mk(test: &TestServer, key: &Account, i
     assert!(meta.preview.contains("created body"), "{}", meta.preview);
 }
 
-/// Mail spec 6.2: the upload's hash is not reused; the message blob is a
-/// fresh sealed blob. Task 6 seals the upload itself.
+/// Mail spec 5.7, 6.2: the upload is sealed under `mk`; the imported
+/// message's blob is a fresh sealed blob, whose hash is neither the
+/// upload's nor the plaintext's, and it opens under `mk`.
 async fn email_import_reseals_the_upload(test: &TestServer, key: &Account, id: u32) {
     println!("email_import_reseals_the_upload");
     let before = message_ids(test, id).await;
     let message = message_with("imported", "import body");
-    let mut email = key
+    let upload = key
         .jmap_client()
         .await
-        .email_import(
-            message.clone().into_bytes(),
-            [Id::from(INBOX_ID).to_string()],
-            None::<Vec<&str>>,
-            None,
-        )
+        .upload(None, message.clone().into_bytes(), None)
         .await
-        .unwrap();
+        .unwrap()
+        .take_blob_id();
+    assert_sealed_upload(test, id, STRONG, &upload, message.as_bytes()).await;
+    let reply = key
+        .jmap_method_call(
+            "Email/import",
+            json!({
+                "accountId": key.id_string(),
+                "emails": { "i": { "blobId": &upload, "mailboxIds": mailbox_ids(INBOX_ID) } }
+            }),
+        )
+        .await;
+    let email_id = reply
+        .pointer("/methodResponses/0/1/created/i/id")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("Email/import: {:?}", reply.0));
     let document_id = new_message(test, id, &before).await;
-    assert_eq!(
-        Id::from_str(&email.take_id()).unwrap().document_id(),
-        document_id
-    );
+    assert_eq!(Id::from_str(email_id).unwrap().document_id(), document_id);
     assert_sealed(test, id, document_id, WRAP_MK).await;
+    let blob_hash = blob_hash_of(test, id, document_id).await;
     assert_ne!(
-        blob_hash_of(test, id, document_id).await,
-        BlobHash::generate(message.as_bytes()),
+        blob_hash,
+        BlobId::from_base32(&upload).unwrap().hash,
         "the upload's blob was reused"
+    );
+    assert_ne!(
+        blob_hash,
+        BlobHash::generate(message.as_bytes()),
+        "the message is stored in the clear"
     );
     let (_, raw) = open_message(test, id, STRONG, document_id).await;
     assert_eq!(raw, message.as_bytes());

@@ -8,7 +8,7 @@ use common::{Server, auth::AccessToken};
 use email::cache::MessageCacheFetch;
 use email::cache::email::MessageCacheAccess;
 use email::message::metadata::MessageMetadata;
-use email::message::za::view::{ZaMailView, za_readable};
+use email::message::za::view::{ZaMailView, Zeroizing, za_readable};
 use groupware::cache::GroupwareCache;
 use mail_parser::{
     Encoding,
@@ -47,19 +47,22 @@ impl BlobDownload for Server {
         access_token: &AccessToken,
     ) -> trc::Result<Option<Vec<u8>>> {
         if self.has_access_blob(blob_id, access_token).await? {
-            // Mail spec 5.7, 7: a key account's message, opened with the
-            // request's keys. An upload (`Reserved`) stays plaintext until
-            // its sealing writer (plan 13, Task 6).
-            if let BlobClass::Linked {
-                account_id,
-                collection,
-                document_id,
-            } = blob_id.class
-                && collection == u8::from(Collection::Email)
-                && self.za_is_sealed_source(blob_id).await?
-            {
-                return za_download_message(self, blob_id, access_token, account_id, document_id)
-                    .await;
+            // Mail spec 5.7, 7: a key account's message or upload, opened
+            // with the request's keys.
+            if self.za_is_sealed_source(blob_id).await? {
+                return match blob_id.class {
+                    BlobClass::Linked {
+                        account_id,
+                        document_id,
+                        ..
+                    } => {
+                        za_download_message(self, blob_id, access_token, account_id, document_id)
+                            .await
+                    }
+                    BlobClass::Reserved { account_id, .. } => {
+                        za_download_upload(self, blob_id, access_token, account_id).await
+                    }
+                };
             }
             if let Some(section) = &blob_id.section {
                 self.get_blob_section(&blob_id.hash, section)
@@ -251,6 +254,45 @@ async fn za_download_message(
         // The bytes leave in the HTTP body.
         Ok(Some(std::mem::take(&mut *opened)))
     }
+}
+
+/// Mail spec 5.7, 7: a key account's upload, opened whole with the
+/// request's keys; a section id is cut from the opened bytes and
+/// transfer-decoded, as upstream reads a stored one. An unreadable upload
+/// is not found (spec 10).
+async fn za_download_upload(
+    server: &Server,
+    blob_id: &BlobId,
+    access_token: &AccessToken,
+    account_id: u32,
+) -> trc::Result<Option<Vec<u8>>> {
+    let keys = server.za_mail_keys(access_token, account_id).await?;
+    let Some(blob) = server
+        .blob_store()
+        .get_blob(blob_id.hash.as_slice(), 0..usize::MAX)
+        .await
+        .caused_by(trc::location!())?
+    else {
+        return Ok(None);
+    };
+    let mut opened = match keys {
+        Some(keys) => {
+            let Some(opened) =
+                za_readable(server.za_open_upload_blob(&keys, account_id, blob).await)?
+            else {
+                return Ok(None);
+            };
+            opened
+        }
+        // `za_mail_keys` answers `None` only for an account that is not a
+        // key account (any longer): the bytes as stored.
+        None => Zeroizing::new(blob),
+    };
+    Ok(match &blob_id.section {
+        Some(section) => decode_section(&opened, section),
+        // The bytes leave in the HTTP body.
+        None => Some(std::mem::take(&mut *opened)),
+    })
 }
 
 /// `get_blob_section` on bytes in memory: the blob store's range read (from

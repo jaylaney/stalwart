@@ -20,6 +20,7 @@ use crate::{
         account::Account,
         imap::{ImapConnection, Type},
         server::TestServer,
+        sieve::SieveConnection,
         smtp::SmtpConnection,
         za::{queued_recipients, wait_for_delivery, za_setup, za_setup_token},
     },
@@ -409,12 +410,15 @@ async fn sieve_fileinto_vacation_redirect(
     plain_id: u32,
 ) {
     println!("sieve_fileinto_vacation_redirect");
-    let client = key.jmap_client().await;
-    let script_id = client
-        .sieve_script_create("za-mail", SCRIPT, true)
-        .await
-        .unwrap()
-        .take_id();
+    // Mail spec 5.7, ruling R32: the account's upload is a sealed source,
+    // which `SieveScript/set` refuses, so the script is put over ManageSieve
+    // (spec 9: unchanged, keyless) rather than uploaded through JMAP.
+    let mut sieve = sieve_session(key).await;
+    sieve.send_literal("PUTSCRIPT \"za-mail\" ", SCRIPT).await;
+    sieve.assert_read(ResponseType::Ok).await;
+    sieve.send("SETACTIVE \"za-mail\"").await;
+    sieve.assert_read(ResponseType::Ok).await;
+    sieve.send("LOGOUT").await;
     let key_before = message_ids(test, key_id).await;
     let plain_before = message_ids(test, plain_id).await;
     for subject in ["file-me sieve", "redirect-me sieve", "kept sieve"] {
@@ -487,8 +491,20 @@ async fn sieve_fileinto_vacation_redirect(
     received.sort_unstable();
     assert_eq!(received, ["redirect", "vacation"]);
 
-    client.sieve_script_deactivate().await.unwrap();
-    client.sieve_script_destroy(&script_id).await.unwrap();
+    let mut sieve = sieve_session(key).await;
+    sieve.send("SETACTIVE \"\"").await;
+    sieve.assert_read(ResponseType::Ok).await;
+    sieve.send("DELETESCRIPT \"za-mail\"").await;
+    sieve.assert_read(ResponseType::Ok).await;
+    sieve.send("LOGOUT").await;
+}
+
+/// A ManageSieve session of `account`, logged in with its password.
+async fn sieve_session(account: &Account) -> SieveConnection {
+    let mut sieve = SieveConnection::connect().await;
+    sieve.assert_read(ResponseType::Ok).await;
+    sieve.authenticate(account.name(), account.secret()).await;
+    sieve
 }
 
 /// The message's UID in `mailbox_id`, from the message cache.

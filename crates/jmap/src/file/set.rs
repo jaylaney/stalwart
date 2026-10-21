@@ -10,6 +10,7 @@ use crate::{
     changes::state::JmapCacheState,
 };
 use common::{DavResourceMetadata, DavResources, Server, auth::AccessToken, sharing::EffectiveAcl};
+use email::message::za::view::ZaMailView;
 use groupware::{DestroyArchive, cache::GroupwareCache, file::FileNode};
 use http_proto::HttpSessionData;
 use jmap_proto::{
@@ -95,6 +96,8 @@ impl FileNodeSet for Server {
                 match update_file_node(None, object, &mut file_node, true, &response) {
                     Ok(result) => {
                         if let Some(blob_id) = result.blob_id {
+                            // Mail spec 5.7: a sealed source is never a file's blob.
+                            self.za_refuse_raw_source(&blob_id).await?;
                             let file_details = file_node.file.get_or_insert_default();
                             if !self.has_access_blob(&blob_id, access_token).await? {
                                 response.not_created.append(
@@ -357,6 +360,8 @@ impl FileNodeSet for Server {
                     Ok(result) => {
                         let modified_set = result.modified_set;
                         if let Some(blob_id) = result.blob_id {
+                            // Mail spec 5.7: a sealed source is never a file's blob.
+                            self.za_refuse_raw_source(&blob_id).await?;
                             let file_details = new_file_node.file.get_or_insert_default();
                             if !self.has_access_blob(&blob_id, access_token).await? {
                                 response.not_updated.append(

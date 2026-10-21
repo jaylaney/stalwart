@@ -6,6 +6,7 @@
 
 use super::{UploadResponse, download::BlobDownload};
 use common::{Server, auth::AccessToken};
+use email::message::za::view::ZaMailView;
 use jmap_proto::{
     error::set::SetError,
     method::upload::{
@@ -51,6 +52,10 @@ impl BlobUpload for Server {
         };
         let account_id = request.account_id.document_id();
 
+        // Mail spec 4, 5.7: a key account's uploads are sealed with its
+        // keys; a token without them is refused before anything is read.
+        self.za_mail_keys(access_token, account_id).await?;
+
         if request.create.len() > self.core.jmap.set_max_objects {
             return Err(trc::JmapEvent::RequestTooLarge.into_err());
         }
@@ -86,6 +91,8 @@ impl BlobUpload for Server {
                             }
                         };
 
+                        // Mail spec 5.7: never a sealed source's stored bytes.
+                        self.za_refuse_raw_source(&id).await?;
                         if !self.has_access_blob(&id, access_token).await? {
                             response.not_created.append(
                                 create_id,
@@ -186,7 +193,11 @@ impl BlobUpload for Server {
             response.created.insert(
                 create_id,
                 BlobUploadResponseObject {
-                    id: self.put_jmap_blob(account_id, &data).await?,
+                    // Mail spec 5.7: a key account's upload is sealed.
+                    id: match access_token.za_keys_for(account_id) {
+                        Some(keys) => self.za_put_sealed_upload(account_id, keys, &data).await?,
+                        None => self.put_jmap_blob(account_id, &data).await?,
+                    },
                     type_: upload_object.type_,
                     size: data.len(),
                 },
@@ -241,10 +252,16 @@ impl BlobUpload for Server {
 
         Ok(UploadResponse {
             account_id,
-            blob_id: self
-                .put_jmap_blob(account_id.document_id(), data)
-                .await
-                .caused_by(trc::location!())?,
+            // Mail spec 5.7: a key account's upload is sealed (`/jmap/upload`
+            // refuses a token without its keys before this call).
+            blob_id: match access_token.za_keys_for(account_id.document_id()) {
+                Some(keys) => {
+                    self.za_put_sealed_upload(account_id.document_id(), keys, data)
+                        .await
+                }
+                None => self.put_jmap_blob(account_id.document_id(), data).await,
+            }
+            .caused_by(trc::location!())?,
             c_type: content_type.to_string(),
             size: data.len(),
         })

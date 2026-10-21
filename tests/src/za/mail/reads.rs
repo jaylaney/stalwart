@@ -622,12 +622,16 @@ async fn keyless_reads_are_refused(test: &TestServer, key: &Account, corpus_doc:
         .send()
         .await
         .unwrap();
-    // Upstream answers a JMAP error outside a method call, `forbidden`
-    // included, as 400 "Invalid Parameters" (`jmap/src/api/mod.rs`).
+    // Ruling R30 (mail spec 10): the keyless refusal answers 403 at
+    // `/jmap/download`, where upstream answers a JMAP error outside a method
+    // call as 400 (`jmap/src/api/mod.rs`).
     let status = download.status().as_u16();
     let body = download.text().await.unwrap();
     assert!(
-        status == 400 && !body.contains("corpus") && !body.contains("canary"),
+        status == 403
+            && body.contains(ZA_MAIL_KEYLESS)
+            && !body.contains("corpus")
+            && !body.contains("canary"),
         "{status}: {body}"
     );
 

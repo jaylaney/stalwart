@@ -22,18 +22,20 @@ use email::{
         za::{MAIL_FORMAT_V1, is_stub, open_mail_blob, open_stub},
     },
 };
+use groupware::calendar::seal::WRAP_MK;
 use registry::schema::structs::SpamTrainingSample;
 use store::{
     IterateParams, Serialize, ValueKey,
     write::{AlignedBytes, Archive, Archiver, BatchBuilder, IndexPropertyClass, ValueClass},
 };
-use types::{blob_hash::BlobHash, collection::Collection, field::EmailField};
+use types::{blob::BlobId, blob_hash::BlobHash, collection::Collection, field::EmailField};
 use utils::cheeky_hash::CheekyHash;
 
 pub mod delivery;
 pub mod fence;
 pub mod login;
 pub mod reads;
+pub mod uploads;
 pub mod writes;
 
 /// A fresh key account, registered with the test server.
@@ -187,6 +189,33 @@ pub async fn assert_sealed(test: &TestServer, account_id: u32, document_id: u32,
         0,
         "a sealed message has no threading key"
     );
+}
+
+/// Mail spec 5.7: the upload `blob_id` is stored as a sealed blob under the
+/// session's mail wrapping key (`mk`) that holds none of `plain` and opens,
+/// with the account's keys unlocked from `password`, into `plain`.
+pub async fn assert_sealed_upload(
+    test: &TestServer,
+    account_id: u32,
+    password: &str,
+    blob_id: &str,
+    plain: &[u8],
+) {
+    let hash = BlobId::from_base32(blob_id)
+        .unwrap_or_else(|| panic!("invalid blob id {blob_id}"))
+        .hash;
+    let blob = stored_blob(test, &hash).await;
+    assert_eq!(blob[0], MAIL_FORMAT_V1, "the upload is stored in the clear");
+    // `0x01 || policy || wrap || ..`
+    assert_eq!(blob[2], WRAP_MK, "the upload's envelope wrap");
+    assert!(
+        !blob.windows(plain.len()).any(|w| w == plain),
+        "the sealed upload holds its plaintext"
+    );
+    let keys = za_unlock(test, account_id, password).await;
+    let opened = open_mail_blob(&blob, &keys, None, account_id)
+        .unwrap_or_else(|err| panic!("the upload does not open: {err}"));
+    assert_eq!(opened.as_slice(), plain, "the opened upload");
 }
 
 /// Mail spec 6.1: no message of the account is stored in the clear; every
