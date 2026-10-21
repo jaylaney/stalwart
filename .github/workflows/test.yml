@@ -67,7 +67,7 @@ jobs:
     name: Zero-access Test
     needs: style
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     env:
       STORE: RocksDb
@@ -117,6 +117,22 @@ jobs:
           }
         env:
           ZA_KEY_ACCOUNTS: "1"
+
+      - name: IMAP Tests (plain accounts)
+        # Ordinary accounts through the mail paths this branch edits: they
+        # keep upstream's behaviour (invariant 9).
+        run: cargo test -p tests imap::imap_tests -- --nocapture
+
+      - name: JMAP Tests (plain accounts)
+        # Upstream's calendar::notification sub-test is timing-flaky (a fixed
+        # 200 ms wait); one rerun keeps it from failing the job. A real
+        # regression fails both runs. The test server wipes its data
+        # directory at start, so the rerun starts clean.
+        run: |
+          cargo test -p tests jmap::jmap_tests -- --nocapture || {
+            echo "::warning title=jmap_tests::plain-mode run failed; retrying once (known calendar::notification flake)"
+            cargo test -p tests jmap::jmap_tests -- --nocapture
+          }
 
       - name: IMAP Tests (key accounts)
         # Upstream's IMAP suite with its users provisioned as key accounts

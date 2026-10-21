@@ -13,11 +13,13 @@ use std::{
     },
 };
 
-/// Keys resident for one HTTP request (spec 5, "in-flight copies"), or for
-/// the life of an authenticated IMAP or POP3 connection (mail spec 3.3,
-/// which amends release 1's "only HTTP requests carry keys"). WebSocket,
-/// EventSource, ManageSieve and SMTP sessions never hold them. Cloned by
-/// `Arc`; the secrets are zeroed when the last reference drops.
+/// Keys attached for one HTTP request (spec 5, "in-flight copies"; the HTTP
+/// key cache keeps them between requests under its idle and age limits,
+/// `ZA_KEY_IDLE_SECS` and `ZA_KEY_MAX_AGE_SECS`), or for the life of an
+/// authenticated IMAP or POP3 connection (mail spec 3.3, which amends
+/// release 1's "only HTTP requests carry keys"). WebSocket, EventSource,
+/// ManageSieve and SMTP sessions never hold them. Cloned by `Arc`; the
+/// secrets are zeroed when the last reference drops.
 pub struct SessionKeys {
     pub account_id: u32,
     pub generation: u64,
