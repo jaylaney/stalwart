@@ -5,7 +5,7 @@ Plan 13 builds release 3 (spec `2026-10-20-zero-access-mail-design.md`, revision
 
 ## Where things stand
 
-- Commits on `release3-mail`, cut from `release3-mail-spec` at `6016d792` (the plan, on top of the spec at `589e7f02`). Not pushed, not merged; the branch's commits carry the session's `Co-Authored-By` and `Claude-Session` trailers, which Jay may strip before the first push.
+- Commits on `release3-mail`, cut from `release3-mail-spec` at `6016d792` (the plan, on top of the spec at `589e7f02`). Not merged; the branch's commits carry the session's `Co-Authored-By` and `Claude-Session` trailers, kept in the public history by Jay's decision of 2026-10-21 (the spec and plan commits name Claude Fable 5.1, the model of the session when they were written).
   - the plan's amendment `9b2efeca` (reviewer tier and trailers follow the session's Opus 5.5 model, ruling R0);
   - Task 1 `435d02c3` (the mail wrapping key, the raw bundle helpers, the sealed blob and the stub), fix round `7d042edb`;
   - Task 2 `dda62fda` (session keys on IMAP and POP3, the refusal of keyless logins), fix round `f6c53df9`;
@@ -20,7 +20,7 @@ Plan 13 builds release 3 (spec `2026-10-20-zero-access-mail-design.md`, revision
   - Task 10b: the commit of this note with the mail checklist, CLAUDE.md, README-dev, the key-mode CI steps and four comment fixes (no behaviour change).
   - Task 10b fix round 1: the commit of the review's follow-ups (names, sources, residuals, hotspots, plain mail suites in CI; docs, one comment and CI only).
   - the final review's fix wave: `0f36df75` (R46), `e874cfd0` (R47), `00507e8a` (F7), `31fbdeea` (T5 N1, T8), `efd42ae4` (R49, F6) and the commits of the "Final review" section and of R48's revision (no code change; see that section).
-  - the re-review's round 2: `bf63a453` (R52), `042451d5` (its docs), `98c8ec07` (R51, as revised) and the commit of R51's docs (see "Final review").
+  - the re-review's round 2: `bf63a453` (R52), `042451d5` (its docs), `98c8ec07` (R51, as revised) and the commit of R51's docs, then the follow-up `cfa6749e` (the R46 pin, R51's limit wording) and the commit of its docs (R53; see "Final review").
 - The suites of Task 10b Step 6, run on the final tree, one cargo command at a time:
   - The compile check (`cargo check -p stalwart --no-default-features --features rocks`, filtered to the fork's files): exit 0; the filter matches exactly the nine baseline warnings of ruling R13 and nothing else; the crate totals are store 1, common 18, jmap 3, services 2, as in the plan 12 note (20 s, cached).
   - The product build (`CARGO_PROFILE_RELEASE_LTO=thin CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 cargo build --release -p stalwart --no-default-features --features rocks`): finished in 6m 15s; the same upstream warning totals (the two in `crates/common/src/cache/principals.rs` predate the branch).
