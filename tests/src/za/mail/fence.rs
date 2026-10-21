@@ -89,6 +89,8 @@ const ORGANIZER: &str = "plainmail4@example.com";
 const SENDER: &str = "sender@example.com";
 /// The trace details of `copy_message`'s refusal.
 const COPY_REFUSED: &str = "zero-access: mail copy across accounts";
+/// The trace details of the JMAP dispatcher's keyless refusal.
+const KEYLESS_REFUSED: &str = "zero-access: mail access without session keys";
 /// `stress_the_fence`'s runs.
 const RUNS: u64 = 64;
 /// The key path's temporary failure without a served public key (Task 3).
@@ -208,8 +210,9 @@ async fn registry_user(server: &Server, id: Id) -> (Object, structs::UserAccount
 }
 
 /// Adds or removes the marker credential directly in the registry, as
-/// `setup-token` writes it, then invalidates the account's caches.
-async fn set_marker(server: &Server, id: Id, marker: bool) {
+/// `setup-token` writes it, then invalidates the account's caches. Removing
+/// it leaves the account without any credential.
+pub(super) async fn set_marker(server: &Server, id: Id, marker: bool) {
     let (object, mut user) = registry_user(server, id).await;
     if marker {
         let credential_id = Id::from(user.next_credential_id());
@@ -832,23 +835,20 @@ async fn copy_message_race(test: &TestServer, admin: &Account) -> (Account, Acco
         Id::from_parts(item.thread_id, item.document_id).to_string()
     };
 
+    let copy = json!({
+        "fromAccountId": Id::from(from_id).to_string(),
+        "accountId": Id::from(to_id).to_string(),
+        "create": {
+            "c1": {
+                "id": email_id,
+                "mailboxIds": { Id::from(INBOX_ID).to_string(): true }
+            }
+        }
+    });
     let caller = admin.clone();
+    let parked_copy = copy.clone();
     let parked = HookParked::start(to_id, test_hooks::set_copy_pause, async move {
-        caller
-            .jmap_method_call(
-                "Email/copy",
-                json!({
-                    "fromAccountId": Id::from(from_id).to_string(),
-                    "accountId": Id::from(to_id).to_string(),
-                    "create": {
-                        "c1": {
-                            "id": email_id,
-                            "mailboxIds": { Id::from(INBOX_ID).to_string(): true }
-                        }
-                    }
-                }),
-            )
-            .await
+        caller.jmap_method_call("Email/copy", parked_copy).await
     })
     .await;
     let token = za_setup_token(admin, FENCE6).await;
@@ -863,6 +863,34 @@ async fn copy_message_race(test: &TestServer, admin: &Account) -> (Account, Acco
         "the stale copy stored a message"
     );
     assert_no_plaintext(test, to_id).await;
+
+    // Ruling R3 of plan 13: the same copy retried, its destination now a key
+    // account, is refused before `copy_message`: the caller's token holds no
+    // keys for the destination (mail spec 4, the dispatcher's gate).
+    println!("copy_message_race_status");
+    let traced = Traced::start(&[EventType::Security(SecurityEvent::Unauthorized)]);
+    let response = admin.jmap_method_call("Email/copy", copy).await;
+    assert_eq!(
+        response.0["methodResponses"][0][1],
+        json!({ "type": "forbidden", "description": ZA_MAIL_KEYLESS }),
+        "the retried copy: {:?}",
+        response.0
+    );
+    let events = traced.finish().await;
+    assert!(
+        events
+            .iter()
+            .any(|e| e.details == KEYLESS_REFUSED && e.account_id == Some(u64::from(to_id))),
+        "the retried copy's refusal: {events:?}"
+    );
+    assert!(
+        events.iter().all(|e| e.details != COPY_REFUSED),
+        "the retried copy reached copy_message: {events:?}"
+    );
+    assert!(
+        message_ids(test, to_id).await.is_empty(),
+        "the retried copy stored a message"
+    );
     (from, to)
 }
 

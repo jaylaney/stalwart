@@ -39,6 +39,7 @@ use utils::cheeky_hash::CheekyHash;
 
 pub mod delivery;
 pub mod fence;
+pub mod gates;
 pub mod login;
 pub mod reads;
 pub mod uploads;

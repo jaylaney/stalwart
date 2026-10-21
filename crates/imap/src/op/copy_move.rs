@@ -241,6 +241,16 @@ impl<T: SessionStream> SessionData<T> {
         let mut did_move = false;
         let mut copied_ids = Vec::with_capacity(ids.len());
 
+        // Mail spec 6.3: no copy or move into or out of a key account.
+        self.server
+            .za_assert_mail_copy(
+                src_mailbox.id.account_id,
+                dest_mailbox.account_id,
+                self.session_id,
+            )
+            .await
+            .map_err(|err| err.id(arguments.tag.clone()))?;
+
         if src_mailbox.id.account_id == dest_mailbox.account_id {
             // Mailboxes are in the same account
             let account_id = src_mailbox.id.account_id;

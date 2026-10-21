@@ -11,7 +11,7 @@ use crate::{
 };
 use common::{
     auth::AccessToken, ipc::CacheInvalidation, network::SessionStream, sharing::EffectiveAcl,
-    storage::index::ObjectIndexBuilder,
+    storage::index::ObjectIndexBuilder, za::mail::za_keyless_refusal,
 };
 use compact_str::ToCompactString;
 use imap_proto::{
@@ -268,6 +268,15 @@ impl<T: SessionStream> Session<T> {
                 .get_acl_mailbox(&arguments, true)
                 .await
                 .imap_ctx(&arguments.tag, trc::location!())?;
+            // Mail spec 6.3: a key account's mailboxes are not shared.
+            if data
+                .server
+                .za_mail_sharing_refused(mailbox_id.account_id)
+                .await
+                .imap_ctx(&arguments.tag, trc::location!())?
+            {
+                return Err(za_keyless_refusal().id(arguments.tag));
+            }
             let current_mailbox = current_mailbox
                 .into_deserialized::<email::mailbox::Mailbox>()
                 .imap_ctx(&arguments.tag, trc::location!())?;

@@ -6,9 +6,10 @@
 
 //! Mail spec 3.3 and 4: the IMAP and POP3 login gate. A mail session of a
 //! key account exists only with the account's session keys. Also the error
-//! a refused mail access answers with (spec 6.3, 10).
+//! a refused mail access answers with (spec 6.3, 10), and the refusals of a
+//! copy across accounts and of sharing a key account's mailbox (spec 6.3).
 
-use super::{ZA_MAIL_KEYLESS, ZA_TRACE_MAIL_LOGIN};
+use super::{ZA_MAIL_KEYLESS, ZA_TRACE_MAIL_COPY, ZA_TRACE_MAIL_LOGIN, ZA_TRACE_MAIL_SHARING};
 use crate::{Server, auth::AccessToken};
 use std::sync::Arc;
 use vault::session::SessionKeys;
@@ -58,6 +59,51 @@ impl Server {
             Ok(None)
         } else {
             Ok(Some(access_token))
+        }
+    }
+
+    /// Mail spec 6.3, 9: a copy or move of messages from `from_account_id`
+    /// into another account is refused when either is a key account, before
+    /// anything is read: traced as `Security(Unauthorized)` naming the
+    /// source account, with `ZA_TRACE_MAIL_COPY`, and answered with the
+    /// keyless refusal (IMAP `NO [NOPERM]`, JMAP `forbidden`). A copy within
+    /// one account passes.
+    pub async fn za_assert_mail_copy(
+        &self,
+        from_account_id: u32,
+        to_account_id: u32,
+        session_id: u64,
+    ) -> trc::Result<()> {
+        if from_account_id != to_account_id
+            && (self.za_is_key_account(from_account_id).await?
+                || self.za_is_key_account(to_account_id).await?)
+        {
+            trc::event!(
+                Security(trc::SecurityEvent::Unauthorized),
+                SpanId = session_id,
+                AccountId = from_account_id,
+                Details = ZA_TRACE_MAIL_COPY,
+            );
+            Err(za_keyless_refusal().account_id(from_account_id))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Mail spec 6.3, 9: whether a change to the sharing of `account_id`'s
+    /// mailboxes is refused, `account_id` being a key account; traced as
+    /// `Security(Unauthorized)` with `ZA_TRACE_MAIL_SHARING` when it is. The
+    /// caller answers with its protocol's refusal.
+    pub async fn za_mail_sharing_refused(&self, account_id: u32) -> trc::Result<bool> {
+        if self.za_is_key_account(account_id).await? {
+            trc::event!(
+                Security(trc::SecurityEvent::Unauthorized),
+                AccountId = account_id,
+                Details = ZA_TRACE_MAIL_SHARING,
+            );
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
 }

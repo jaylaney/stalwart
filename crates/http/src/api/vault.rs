@@ -28,11 +28,14 @@ use common::{
         credential::AppPassword,
         vault::{VaultRead, za_argon2_params, za_derive_root},
     },
+    cache::invalidate::CacheInvalidationBuilder,
+    ipc::CacheInvalidation,
 };
 use directory::{
     Credentials,
     core::secret::{hash_secret, verify_totp_code},
 };
+use email::message::za::sharing::za_mailbox_grantees;
 use groupware::calendar::{ArchivedTimezone, Calendar};
 use http_proto::{HttpRequest, HttpResponse, HttpSessionData};
 use hyper::{
@@ -493,6 +496,27 @@ async fn za_invalidate_after_commit(server: &Server, account_id: u32) {
     }
 }
 
+/// Mail spec 6.3, ruling R5: the access tokens of the accounts named in the
+/// account's mailbox grants, which still list its mailboxes, are rebuilt
+/// without them, as `refresh_acls` invalidates a changed grant's. A failure
+/// is traced, not returned: the marker is written.
+async fn za_invalidate_mailbox_grantees(server: &Server, account_id: u32) {
+    let result = async {
+        let mut changes = CacheInvalidationBuilder::default();
+        for grantee in za_mailbox_grantees(server, account_id).await? {
+            changes.invalidate(CacheInvalidation::AccessToken(grantee));
+        }
+        server.invalidate_caches(changes).await
+    }
+    .await;
+    if let Err(err) = result {
+        trc::error!(
+            err.account_id(account_id)
+                .details("Zero-access grantee invalidation failed after the marker write")
+        );
+    }
+}
+
 /// Refusal with a status other than 401 (e.g. 409 on an active account):
 /// counted like a failed attempt, so probing for account states is delayed,
 /// rate-limited and banned like guessing credentials. A ban or a fail2ban
@@ -786,6 +810,9 @@ async fn za_setup_token(
         // (3) Invalidate classification and cached authentication again: the
         // marker is what classifies the account.
         za_invalidate_after_commit(server, account_id).await;
+        // Mail spec 6.3, ruling R5: a grant made while the account was plain
+        // stops routing once its grantees' tokens are rebuilt.
+        za_invalidate_mailbox_grantees(server, account_id).await;
     }
 
     Ok(json(SetupTokenResponse { token, expires }))

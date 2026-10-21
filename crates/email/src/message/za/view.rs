@@ -22,7 +22,7 @@ use crate::message::metadata::MessageMetadata;
 use common::{
     Server,
     auth::AccessToken,
-    za::{ZA_TRACE_MAIL_KEYLESS, mail::za_keyless_refusal},
+    za::{ZA_TRACE_MAIL_COPY, ZA_TRACE_MAIL_KEYLESS, mail::za_keyless_refusal},
 };
 use groupware::calendar::seal::{SealError, seal_error};
 use std::{borrow::Cow, future::Future, sync::Arc};
@@ -143,6 +143,18 @@ pub trait ZaMailView: Sync + Send {
         &self,
         blob_id: &BlobId,
     ) -> impl Future<Output = trc::Result<()>> + Send;
+
+    /// Ruling R31 (mail spec 6.3): whether `blob_id` is a sealed source
+    /// (`za_is_sealed_source`) owned by an account other than
+    /// `to_account_id`, which it must not enter as a message or a part of
+    /// one (Email/import, an Email/set attachment), the server-side copy
+    /// across accounts; traced as `Security(Unauthorized)` naming the owning
+    /// account, with `ZA_TRACE_MAIL_COPY`, when it is. The caller refuses.
+    fn za_foreign_sealed_source(
+        &self,
+        blob_id: &BlobId,
+        to_account_id: u32,
+    ) -> impl Future<Output = trc::Result<bool>> + Send;
 }
 
 impl ZaMailView for Server {
@@ -268,6 +280,24 @@ impl ZaMailView for Server {
             Err(za_keyless_refusal().account_id(account_id))
         } else {
             Ok(())
+        }
+    }
+
+    async fn za_foreign_sealed_source(
+        &self,
+        blob_id: &BlobId,
+        to_account_id: u32,
+    ) -> trc::Result<bool> {
+        let account_id = blob_id.class.account_id();
+        if account_id != to_account_id && self.za_is_sealed_source(blob_id).await? {
+            trc::event!(
+                Security(trc::SecurityEvent::Unauthorized),
+                AccountId = account_id,
+                Details = ZA_TRACE_MAIL_COPY,
+            );
+            Ok(true)
+        } else {
+            Ok(false)
         }
     }
 }

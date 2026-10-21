@@ -35,6 +35,9 @@ pub const ZA_TRACE_MAIL_KEYLESS: &str = "zero-access: mail access without sessio
 /// Mail spec 6.3, 9: the trace details of a message or blob copy refused
 /// because one side is a key account.
 pub const ZA_TRACE_MAIL_COPY: &str = "zero-access: mail copy across accounts";
+/// Mail spec 6.3, 9: the trace details of a share refused on a key
+/// account's mailbox.
+pub const ZA_TRACE_MAIL_SHARING: &str = "zero-access: sharing refused on a key account's mailbox";
 
 /// Key pinning spec 6.4: `contacts/pin`'s pause point after its last event
 /// commit, before the step 5 retirement (`test_hooks::REDELIVER_CLEANUP_PAUSE`).

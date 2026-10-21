@@ -8,6 +8,7 @@
 
 pub mod ingest;
 pub mod seal;
+pub mod sharing;
 pub mod view;
 
 pub use seal::*;

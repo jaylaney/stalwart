@@ -121,6 +121,20 @@ impl Server {
                         }
                     }
                 }
+                // Mail spec 6.3: a key account's mailboxes are never reachable
+                // through another account's grant, one made before it was
+                // provisioned included; they are left out of the listing.
+                for entry in access_to.iter_mut() {
+                    if self
+                        .za_is_key_account(entry.account_id)
+                        .await
+                        .caused_by(trc::location!())?
+                    {
+                        entry.collections.remove(Collection::Mailbox);
+                        entry.collections.remove(Collection::Email);
+                    }
+                }
+                access_to.retain(|a| !a.collections.is_empty());
 
                 let now = now();
                 let mut credential_version = 0;
