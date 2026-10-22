@@ -5,7 +5,7 @@ Plan 13 builds release 3 (spec `2026-10-20-zero-access-mail-design.md`, revision
 
 ## Where things stand
 
-- Commits on `release3-mail`, cut from `release3-mail-spec` at `6016d792` (the plan, on top of the spec at `589e7f02`). Not merged; the branch's commits carry the session's `Co-Authored-By` and `Claude-Session` trailers, kept in the public history by Jay's decision of 2026-10-21 (the spec and plan commits name Claude Fable 5.1, the model of the session when they were written; Tasks 1-10 and the final review's first two fix rounds name Claude Opus 5.5; round 3, the PR review's fix wave `f39bfe46`..`a955f76b`, names Claude Fable 5.1 again, the session's model by then; rounds 4 and 5, from `70210b1c`, name Claude Opus 5.5, the model of their fix waves).
+- Commits on `release3-mail`, cut from `release3-mail-spec` at `6016d792` (the plan, on top of the spec at `589e7f02`). Merged into `main` through PR #51 at `a829b479` on 2026-10-22; the branch's commits carry the session's `Co-Authored-By` and `Claude-Session` trailers, kept in the public history by Jay's decision of 2026-10-21 (the spec and plan commits name Claude Fable 5.1, the model of the session when they were written; Tasks 1-10 and the final review's first two fix rounds name Claude Opus 5.5; round 3, the PR review's fix wave `f39bfe46`..`a955f76b`, names Claude Fable 5.1 again, the session's model by then; rounds 4 and 5, from `70210b1c`, name Claude Opus 5.5, the model of their fix waves).
   - the plan's amendment `9b2efeca` (reviewer tier and trailers follow the session's Opus 5.5 model, ruling R0);
   - Task 1 `435d02c3` (the mail wrapping key, the raw bundle helpers, the sealed blob and the stub), fix round `7d042edb`;
   - Task 2 `dda62fda` (session keys on IMAP and POP3, the refusal of keyless logins), fix round `f6c53df9`;
@@ -90,7 +90,7 @@ How each item of spec section 13 resolved, as built. The plan's header resolved 
 
 ## Rulings
 
-The decisions block of the plan's header (D1-D6), then every ruling of the plan's ledger (R0-R45, in ledger order, amendments and clarifications kept with their ruling), each condensed to what was decided, why, and the cost if wrong; the final review's rulings R46-R63 are in its section. The ledger holds the full texts (`.superpowers/sdd/2026-10-20-zero-access-13-mail/progress.md`, untracked).
+The decisions block of the plan's header (D1-D6), then every ruling of the plan's ledger (R0-R45, in ledger order, amendments and clarifications kept with their ruling), each condensed to what was decided, why, and the cost if wrong; the final review's rulings R46-R63 are in its section. The ledger held the full texts (`.superpowers/sdd/2026-10-20-zero-access-13-mail/progress.md`, untracked). That git-ignored workspace (the ledger, the briefs and the review reports the review sections cite) was removed after the merge, and this note keeps their substance.
 
 The plan's decisions:
 - **D1.** The inner (sealed) metadata archive's `blob_hash` names the sealed blob, the same hash the stub carries, so the view's `blob_hash` is what readers fetch and the `mail-meta` associated data binds the stub to that blob. Cost if wrong: readers would fetch the wrong blob; none found.
