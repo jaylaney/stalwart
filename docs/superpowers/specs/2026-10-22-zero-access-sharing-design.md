@@ -216,7 +216,7 @@ those principals.
   trust in them is the grantee's. The authority for a delegated message is
   upstream's ACL at the time of the write; the recipient's drain checks
   only that the message is consistent with its sender, as defence in depth
-  against planted items and server bugs, not as an authorization. So an
+  against server bugs, not as an authorization. So an
   item written while the grant stood is delivered after a revoke, and an
   edit grant on one calendar of the owner lets a delegated REQUEST reuse
   the UID of an event in another of the owner's calendars and rewrite its
@@ -1363,7 +1363,7 @@ fan-out in the grantee's session, on the owner's behalf:
    resource's account, and that write passed upstream's ACL check
    (`has_access_to_container` before each `PUT` branch in `update.rs` and
    before `delete_za` in `delete.rs`) and 5.2's resolver. The drain's check
-   is defence in depth against planted items and server bugs, not the
+   is defence in depth against server bugs, not the
    authorization, and it reads nothing of the owner's account. So an item
    written while the grant stood is delivered after a revoke, since the
    write was authorized when it was made, and the window between a
@@ -2069,7 +2069,7 @@ adds:
     account whose shared calendar the session's account holds an edit
     grant on. The authority for the second case is the write-time ACL, as
     upstream's; the recipient's drain checks, as defence in depth against
-    planted items and server bugs and not as the authorization, that the
+    server bugs and not as the authorization, that the
     `SENT-BY` resolves to the item's `changed_by`, a key account other than
     the named one. The fan-out seals with the session's own keys and pins,
     computes token locality against the event account's own addresses and
