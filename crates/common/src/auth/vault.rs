@@ -779,12 +779,34 @@ impl Server {
     /// other than the internal one (ElasticSearch, MeiliSearch, or a
     /// PostgreSQL or MySQL search store) is not checked, a recorded limit.
     pub async fn za_has_email_search_documents(&self, account_id: u32) -> trc::Result<bool> {
+        self.za_has_search_documents(account_id, SearchIndex::Email)
+            .await
+    }
+
+    /// Mail ruling R60: R51's scan for `SearchIndex::Calendar`. A calendar
+    /// event's document holds its summary, description, location and
+    /// participants, and its index write can land after the event's unindex
+    /// (P2-1's interleaving), so the document scan after R54's queue term
+    /// covers calendar documents too. The same recorded limit as R51.
+    pub async fn za_has_calendar_search_documents(&self, account_id: u32) -> trc::Result<bool> {
+        self.za_has_search_documents(account_id, SearchIndex::Calendar)
+            .await
+    }
+
+    /// True when the internal search store holds a document of the account
+    /// in `index` (one `only_first`, `no_values` iteration of its
+    /// `Document` keys); false without an internal search store.
+    async fn za_has_search_documents(
+        &self,
+        account_id: u32,
+        index: SearchIndex,
+    ) -> trc::Result<bool> {
         let Some(store) = self.search_store().internal_fts() else {
             return Ok(false);
         };
         let document = |document_id| {
             ValueKey::from(ValueClass::SearchIndex(SearchIndexClass {
-                index: SearchIndex::Email,
+                index,
                 id: SearchIndexId::Account {
                     account_id,
                     document_id,

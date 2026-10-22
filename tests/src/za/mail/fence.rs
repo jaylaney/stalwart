@@ -24,8 +24,8 @@ use crate::{
         server::TestServer,
         smtp::SmtpConnection,
         za::{
-            Conn, HookParked, hold_task_consumer, wait_for_delivery, za_post_as, za_setup,
-            za_setup_token,
+            Conn, HookParked, hold_task_consumer, plant_event, wait_for_delivery, za_post_as,
+            za_setup, za_setup_token,
         },
     },
     za::{STRONG, raw_input::SUBMISSION_PORT, user_permissions},
@@ -47,7 +47,10 @@ use email::{
         za::is_stub,
     },
 };
-use groupware::calendar::seal::WRAP_PK;
+use groupware::{
+    DestroyArchive,
+    calendar::{CalendarEvent, seal::WRAP_PK},
+};
 use mail_parser::MessageParser;
 use nlp::language::Language;
 use registry::{
@@ -107,6 +110,22 @@ const SAMPLED: &str = "keymail15@example.com";
 const ORPHANED: &str = "keymail16@example.com";
 /// `setup_refuses_an_in_flight_index_write`'s account (ruling R54).
 const IN_FLIGHT: &str = "keymail17@example.com";
+/// `setup_refuses_an_in_flight_calendar_index_write`'s account (ruling R60).
+const IN_FLIGHT_EVENT: &str = "keymail21@example.com";
+/// That test's event: no alarm, no organizer, so its only tasks are its
+/// index and unindex tasks.
+const IN_FLIGHT_ICAL: &str = "BEGIN:VCALENDAR\r\n\
+VERSION:2.0\r\n\
+PRODID:-//Stalwart Labs//za fence//EN\r\n\
+BEGIN:VEVENT\r\n\
+UID:in-flight-event@example.com\r\n\
+DTSTAMP:20261020T100000Z\r\n\
+DTSTART:20261021T100000Z\r\n\
+DTEND:20261021T110000Z\r\n\
+SUMMARY:in-flight summary\r\n\
+LOCATION:in-flight location\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
 /// `setup_refuses_a_failed_merge_task`'s account (ruling R54).
 const FAILED_MERGE: &str = "keymail18@example.com";
 /// `superseded_index_write_loses_to_provisioning`'s account (ruling R58).
@@ -161,6 +180,7 @@ pub async fn test(test: &mut TestServer) {
     let sampled = setup_refuses_spam_samples(test, &admin).await;
     let orphaned = setup_refuses_an_orphaned_search_document(test, &admin).await;
     let in_flight = setup_refuses_an_in_flight_index_write(test, &admin).await;
+    let in_flight_event = setup_refuses_an_in_flight_calendar_index_write(test, &admin).await;
     let failed_merge = setup_refuses_a_failed_merge_task(test, &admin).await;
     let (superseded, superseded_control) =
         superseded_index_write_loses_to_provisioning(test, &admin).await;
@@ -195,6 +215,7 @@ pub async fn test(test: &mut TestServer) {
         sampled,
         orphaned,
         in_flight,
+        in_flight_event,
         failed_merge,
         superseded,
         superseded_control,
@@ -1615,6 +1636,116 @@ async fn setup_refuses_an_in_flight_index_write(test: &TestServer, admin: &Accou
         .add_filter(SearchFilter::eq(SearchField::DocumentId, ids[0]));
     test.server.search_store().unindex(query).await.unwrap();
     za_setup_token(admin, IN_FLIGHT).await;
+    account
+}
+
+/// Ruling R60 of plan 13 (PR #51 review 2, the adjacent gap): the calendar
+/// twin of `setup_refuses_an_in_flight_index_write`. An ordinary event's
+/// index task builds its full document (summary, description, location,
+/// participants) and parks; the event is deleted and its unindex task, in a
+/// worker of its own, finds nothing to delete. Issuance is refused while the
+/// index task's record is in the queue (R54); once the document is written
+/// and the task cleared, R51's scan, which covers calendar documents too,
+/// refuses on it; after it is removed, issuance succeeds.
+async fn setup_refuses_an_in_flight_calendar_index_write(
+    test: &TestServer,
+    admin: &Account,
+) -> Account {
+    println!("setup_refuses_an_in_flight_calendar_index_write");
+    test.wait_for_tasks().await;
+    let account = passwordless(admin, IN_FLIGHT_EVENT).await;
+    let id = account.id().document_id();
+    // The event is planted while the consumer is held; released with the
+    // pause set, the consumer dispatches its index task, which builds the
+    // document and parks.
+    let held = hold_task_consumer(test).await;
+    let event_id = plant_event(test, id, "default", "in-flight.ics", IN_FLIGHT_ICAL, None).await;
+    let parked = HookParked::start(id, test_hooks::set_index_write_pause, async move {
+        drop(held);
+    })
+    .await;
+
+    // The event is deleted: an unindex task, which runs and clears its
+    // record while the index task stays parked.
+    let account_info = test.server.account_info(id).await.unwrap();
+    let archive = test
+        .server
+        .store()
+        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            id,
+            Collection::CalendarEvent,
+            event_id,
+        ))
+        .await
+        .unwrap()
+        .expect("the event's archive");
+    let mut batch = BatchBuilder::new();
+    DestroyArchive(archive.to_unarchived::<CalendarEvent>().unwrap())
+        .delete_all(&account_info, id, event_id, false, &mut batch)
+        .unwrap();
+    test.server.commit_batch(batch).await.unwrap();
+    test.server.notify_task_queue();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let tasks = account_tasks(test, id).await;
+        if matches!(tasks.as_slice(), [Task::IndexDocument(_)]) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the unindex task did not finish: {tasks:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !test
+            .server
+            .za_has_documents(id, Collection::CalendarEvent)
+            .await
+            .unwrap()
+            && !test
+                .server
+                .za_has_calendar_search_documents(id)
+                .await
+                .unwrap(),
+        "the account still holds the event or its search document"
+    );
+    let reply = za_post_as(admin, "setup-token", &json!({ "account": IN_FLIGHT_EVENT })).await;
+    assert_eq!(
+        reply.expect(409)["error"],
+        "account has unfinished tasks",
+        "issuance while a calendar index write of the account is in flight"
+    );
+    assert!(
+        test.server.za_vault_record(id).await.unwrap().is_none(),
+        "the refused issuance wrote a record"
+    );
+
+    parked.finish().await;
+    test.wait_for_tasks().await;
+    assert!(
+        test.server
+            .za_has_calendar_search_documents(id)
+            .await
+            .unwrap(),
+        "the released index task wrote no document"
+    );
+    let reply = za_post_as(admin, "setup-token", &json!({ "account": IN_FLIGHT_EVENT })).await;
+    assert_eq!(
+        reply.expect(409)["error"],
+        "account already holds calendar data",
+        "issuance while the late calendar document is stored"
+    );
+    assert!(
+        test.server.za_vault_record(id).await.unwrap().is_none(),
+        "the refused issuance wrote a record"
+    );
+    let mut query = SearchQuery::new(SearchIndex::Calendar);
+    query
+        .add_filter(SearchFilter::eq(SearchField::AccountId, id))
+        .add_filter(SearchFilter::eq(SearchField::DocumentId, event_id));
+    test.server.search_store().unindex(query).await.unwrap();
+    za_setup_token(admin, IN_FLIGHT_EVENT).await;
     account
 }
 

@@ -927,6 +927,13 @@ async fn za_assert_no_data(server: &Server, account_id: u32) -> trc::Result<Opti
     if server.za_has_email_search_documents(account_id).await? {
         return Ok(Some(conflict("account already holds mail")));
     }
+    // Mail ruling R60: R51's scan for calendar documents, in the same
+    // position after R54's queue term, so R54's ordering argument holds for
+    // a calendar event's index write too (its document holds the summary,
+    // description, location and participants). The same recorded limit.
+    if server.za_has_calendar_search_documents(account_id).await? {
+        return Ok(Some(conflict("account already holds calendar data")));
+    }
     Ok(None)
 }
 
