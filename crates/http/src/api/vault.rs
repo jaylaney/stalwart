@@ -935,8 +935,8 @@ async fn za_assert_no_data(server: &Server, account_id: u32) -> trc::Result<Opti
         return Ok(Some(conflict("account already holds calendar data")));
     }
     // Mail ruling R62: a Term or Index key of the account outlived its search
-    // document (R51's `Document` key is not the whole index). Same position as
-    // R51 and R60, after R54's queue term; same recorded limit.
+    // document (R51's `Document` key is not the whole index). After R60's (so
+    // after R54's queue term); same recorded limit.
     if server.za_has_email_search_terms(account_id).await? {
         return Ok(Some(conflict("account already holds mail")));
     }
