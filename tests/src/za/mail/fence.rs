@@ -70,10 +70,14 @@ use store::{
     Deserialize, IterateParams, SUBSPACE_SEARCH_INDEX, U32_LEN, U64_LEN, ValueKey,
     registry::write::{RegistryWrite, RegistryWriteResult},
     roaring::RoaringBitmap,
-    search::{EmailSearchField, IndexDocument, SearchField, SearchFilter, SearchQuery},
+    search::{
+        CalendarSearchField, EmailSearchField, IndexDocument, SearchField, SearchFilter,
+        SearchQuery,
+    },
     write::{
-        AlignedBytes, AnyKey, Archive, BatchBuilder, BlobLink, BlobOp, SearchIndex, TaskQueueClass,
-        ValueClass, key::DeserializeBigEndian, now,
+        AlignedBytes, AnyKey, Archive, BatchBuilder, BlobLink, BlobOp, SearchIndex,
+        SearchIndexClass, SearchIndexId, SearchIndexType, TaskQueueClass, ValueClass,
+        key::DeserializeBigEndian, now,
     },
 };
 use trc::{EventType, Key, SecurityEvent, StoreEvent};
@@ -132,6 +136,8 @@ const FAILED_MERGE: &str = "keymail18@example.com";
 const SUPERSEDED: &str = "keymail20@example.com";
 /// Its ordinary control, whose index write passes the fence.
 const SUPERSEDED_CONTROL: &str = "plainmail17@example.com";
+/// `setup_refuses_orphaned_search_terms`'s account (ruling R62).
+const ORPHANED_TERMS: &str = "keymail22@example.com";
 /// `unindex_between_index_chunks_leaves_no_terms`'s account (ruling R62).
 const CHUNKED: &str = "keymail23@example.com";
 /// `unindex_between_calendar_index_chunks_leaves_no_terms`'s account
@@ -197,6 +203,7 @@ pub async fn test(test: &mut TestServer) {
     let failed_merge = setup_refuses_a_failed_merge_task(test, &admin).await;
     let (superseded, superseded_control) =
         superseded_index_write_loses_to_provisioning(test, &admin).await;
+    let orphaned_terms = setup_refuses_orphaned_search_terms(test, &admin).await;
     let chunked = unindex_between_index_chunks_leaves_no_terms(test, &admin).await;
     let chunked_event = unindex_between_calendar_index_chunks_leaves_no_terms(test, &admin).await;
     let (superseded_tail, superseded_tail_control) =
@@ -236,6 +243,7 @@ pub async fn test(test: &mut TestServer) {
         failed_merge,
         superseded,
         superseded_control,
+        orphaned_terms,
         chunked,
         chunked_event,
         superseded_tail,
@@ -2145,6 +2153,182 @@ async fn wait_for_the_unindex(test: &TestServer, account_id: u32, message_id: Op
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Indexes `document` for the account straight into the search store, then
+/// clears its `Document` key, leaving the `Term` and `Index` keys it wrote
+/// unlisted: the shape of an orphaned tail, of a calendar merge that lost
+/// its clears and of an Email re-index whose terms changed.
+async fn plant_orphaned_keys(
+    test: &TestServer,
+    account_id: u32,
+    index: SearchIndex,
+    document: IndexDocument,
+) {
+    let search = test.server.search_store();
+    search.index(vec![document]).await.unwrap();
+    let mut batch = BatchBuilder::new();
+    batch.clear(ValueClass::SearchIndex(SearchIndexClass {
+        index,
+        id: SearchIndexId::Account {
+            account_id,
+            document_id: 0,
+        },
+        typ: SearchIndexType::Document,
+    }));
+    search
+        .internal_fts()
+        .expect("the suite runs on the internal search store")
+        .write(batch.build_all())
+        .await
+        .unwrap();
+}
+
+/// `setup-token` for the account `name` (id `id`) answers 409 with
+/// `reason` and writes no record.
+async fn assert_refused(
+    test: &TestServer,
+    admin: &Account,
+    (name, id): (&str, u32),
+    reason: &str,
+    what: &str,
+) {
+    let reply = za_post_as(admin, "setup-token", &json!({ "account": name })).await;
+    assert_eq!(reply.expect(409)["error"], reason, "issuance while {what}");
+    assert!(
+        test.server.za_vault_record(id).await.unwrap().is_none(),
+        "the refused issuance wrote a record"
+    );
+}
+
+/// Ruling R62 of plan 13 (PR #51 review 3, P2-8): a search document's
+/// `Term` and `Index` keys can outlive its `Document` key (a later chunk
+/// written before R62's guard, a calendar merge that lost its clears, an
+/// Email re-index whose terms changed), and R51's and R60's scans read the
+/// `Document` keys only. Issuance is refused while the internal search
+/// store holds any `Term` or `Index` key of the account in the Email index
+/// (as for mail) or the Calendar index (as for calendar data); each case is
+/// planted alone, and issuance succeeds once the account-wide unindex has
+/// removed the keys.
+async fn setup_refuses_orphaned_search_terms(test: &TestServer, admin: &Account) -> Account {
+    println!("setup_refuses_orphaned_search_terms");
+    let account = passwordless(admin, ORPHANED_TERMS).await;
+    let id = account.id().document_id();
+    let search = test.server.search_store();
+    assert!(
+        search.internal_fts().is_some(),
+        "the suite runs on the internal search store"
+    );
+
+    // Email `Term` keys only: Body is a text field, not an indexed one.
+    let mut document = IndexDocument::new(SearchIndex::Email)
+        .with_account_id(id)
+        .with_document_id(0);
+    document.index_text(EmailSearchField::Body, "orphanterm", Language::English);
+    plant_orphaned_keys(test, id, SearchIndex::Email, document).await;
+    let keys = search_keys(test, id, SearchIndex::Email).await;
+    assert!(
+        keys.documents == 0 && keys.terms > 0 && keys.fields == 0,
+        "Email terms alone were not planted: {keys:?}"
+    );
+    assert!(
+        !test.server.za_has_email_search_documents(id).await.unwrap()
+            && test.server.za_has_email_search_terms(id).await.unwrap(),
+        "the scans do not see the orphaned Email terms alone"
+    );
+    assert_refused(
+        test,
+        admin,
+        (ORPHANED_TERMS, id),
+        "account already holds mail",
+        "an orphaned Email term of the account is stored",
+    )
+    .await;
+    search
+        .unindex(SearchQuery::new(SearchIndex::Email).with_account_id(id))
+        .await
+        .unwrap();
+    assert!(
+        !test.server.za_has_email_search_terms(id).await.unwrap(),
+        "the account-wide unindex left Email terms"
+    );
+
+    // An Email `Index` key only: ReceivedAt is indexed and not text.
+    let mut document = IndexDocument::new(SearchIndex::Email)
+        .with_account_id(id)
+        .with_document_id(0);
+    document.index_unsigned(EmailSearchField::ReceivedAt, now());
+    plant_orphaned_keys(test, id, SearchIndex::Email, document).await;
+    let keys = search_keys(test, id, SearchIndex::Email).await;
+    assert!(
+        keys.documents == 0 && keys.terms == 0 && keys.fields == 1,
+        "an Email field alone was not planted: {keys:?}"
+    );
+    assert!(
+        test.server.za_has_email_search_terms(id).await.unwrap(),
+        "the scan does not see the orphaned Email field"
+    );
+    assert_refused(
+        test,
+        admin,
+        (ORPHANED_TERMS, id),
+        "account already holds mail",
+        "an orphaned Email field of the account is stored",
+    )
+    .await;
+    search
+        .unindex(SearchQuery::new(SearchIndex::Email).with_account_id(id))
+        .await
+        .unwrap();
+    assert!(
+        !test.server.za_has_email_search_terms(id).await.unwrap(),
+        "the account-wide unindex left an Email field"
+    );
+
+    // Calendar `Term` keys only: Title is a text field, not an indexed one.
+    let mut document = IndexDocument::new(SearchIndex::Calendar)
+        .with_account_id(id)
+        .with_document_id(0);
+    document.index_text(
+        CalendarSearchField::Title,
+        "orphaned title",
+        Language::English,
+    );
+    plant_orphaned_keys(test, id, SearchIndex::Calendar, document).await;
+    let keys = search_keys(test, id, SearchIndex::Calendar).await;
+    assert!(
+        keys.documents == 0 && keys.terms > 0 && keys.fields == 0,
+        "Calendar terms alone were not planted: {keys:?}"
+    );
+    assert!(
+        !test
+            .server
+            .za_has_calendar_search_documents(id)
+            .await
+            .unwrap()
+            && test.server.za_has_calendar_search_terms(id).await.unwrap()
+            && !test.server.za_has_email_search_terms(id).await.unwrap(),
+        "the scans do not see the orphaned Calendar terms alone"
+    );
+    assert_refused(
+        test,
+        admin,
+        (ORPHANED_TERMS, id),
+        "account already holds calendar data",
+        "an orphaned Calendar term of the account is stored",
+    )
+    .await;
+    search
+        .unindex(SearchQuery::new(SearchIndex::Calendar).with_account_id(id))
+        .await
+        .unwrap();
+    assert!(
+        !test.server.za_has_calendar_search_terms(id).await.unwrap(),
+        "the account-wide unindex left Calendar terms"
+    );
+
+    za_setup_token(admin, ORPHANED_TERMS).await;
+    account
 }
 
 /// Ruling R62 of plan 13 (PR #51 review 3, P2-8): `Store::index` writes a

@@ -499,12 +499,15 @@ impl Server {
     /// vault record, asserted in the document's first commit chunk (the one
     /// with its `Document` key). A superseded execution (a worker that
     /// outlived its task lease) therefore cannot write after provisioning,
-    /// and a write that commits first is seen by the recheck's document scan
-    /// (R51). Nothing on PostgreSQL or MySQL, as `za_provisioning_fence`, or
-    /// without an internal search store. On a search store other than the
-    /// data store (a separate FoundationDB store among them) the assertion
-    /// reads the search store's key space and passes vacuously: R51's
-    /// recorded limit.
+    /// and a first chunk that commits first is seen by the recheck's
+    /// document scan (R51). Ruling R62 conditions every later chunk on that
+    /// `Document` key (`Store::index`), so a chunk that commits after the
+    /// document's unindex writes nothing. Nothing on PostgreSQL or MySQL,
+    /// as `za_provisioning_fence`, or without an internal search store. On
+    /// a search store other than the data store (a separate FoundationDB
+    /// store among them) the assertion reads the search store's key space
+    /// and passes vacuously: R51's recorded limit. R62's guard holds there,
+    /// since the `Document` key lives in the search store.
     pub fn za_index_fence(&self, document: IndexDocument, account_id: u32) -> IndexDocument {
         if self.store().is_pg_or_mysql() || self.search_store().internal_fts().is_none() {
             document
@@ -775,7 +778,9 @@ impl Server {
     /// Mail ruling R51: true when the internal search store holds an Email
     /// document of the account. Each indexed document has one `Document`
     /// key, the ground truth there; the unindex task deletes it in a write
-    /// after the one that clears the metadata archive. Any search store
+    /// after the one that clears the metadata archive. The `Document` keys
+    /// are not the whole index: ruling R62 also scans the account's `Term`
+    /// and `Index` keys (`za_has_email_search_terms`). Any search store
     /// other than the internal one (ElasticSearch, MeiliSearch, or a
     /// PostgreSQL or MySQL search store) is not checked, a recorded limit.
     pub async fn za_has_email_search_documents(&self, account_id: u32) -> trc::Result<bool> {
@@ -828,6 +833,35 @@ impl Server {
             .await
             .caused_by(trc::location!())?;
         Ok(found)
+    }
+
+    /// Mail ruling R62: true when the internal search store holds a `Term`
+    /// or `Index` key of the account in the Email index.
+    pub async fn za_has_email_search_terms(&self, account_id: u32) -> trc::Result<bool> {
+        self.za_has_search_terms(account_id, SearchIndex::Email)
+            .await
+    }
+
+    /// Mail ruling R62: `za_has_email_search_terms` for
+    /// `SearchIndex::Calendar`.
+    pub async fn za_has_calendar_search_terms(&self, account_id: u32) -> trc::Result<bool> {
+        self.za_has_search_terms(account_id, SearchIndex::Calendar)
+            .await
+    }
+
+    /// Mail ruling R62: a document's `Term` and `Index` keys can outlive its
+    /// `Document` key (a calendar merge that lost its clears, an Email
+    /// re-index whose terms changed, a tail written before R62's guard), so
+    /// R51's ground truth is incomplete; the same recorded limit as R51.
+    /// False without an internal search store.
+    async fn za_has_search_terms(&self, account_id: u32, index: SearchIndex) -> trc::Result<bool> {
+        let Some(store) = self.search_store().internal_fts() else {
+            return Ok(false);
+        };
+        store
+            .has_account_search_terms(index, account_id)
+            .await
+            .caused_by(trc::location!())
     }
 }
 

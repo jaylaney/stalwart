@@ -410,4 +410,77 @@ impl Store {
 
         Ok(())
     }
+
+    /// Zero-access fork (mail ruling R62): whether any `Term` or `Index` key
+    /// of the account is stored in `index`, with the ranges of `unindex`'s
+    /// account-wide delete.
+    pub async fn has_account_search_terms(
+        &self,
+        index: SearchIndex,
+        account_id: u32,
+    ) -> trc::Result<bool> {
+        let key = |document_id, typ| {
+            ValueKey::from(ValueClass::SearchIndex(SearchIndexClass {
+                index,
+                id: SearchIndexId::Account {
+                    account_id,
+                    document_id,
+                },
+                typ,
+            }))
+        };
+        for (from, to) in [
+            (
+                key(
+                    0,
+                    SearchIndexType::Term {
+                        hash: CheekyHash::NULL,
+                        field: 0,
+                    },
+                ),
+                key(
+                    u32::MAX,
+                    SearchIndexType::Term {
+                        hash: CheekyHash::FULL,
+                        field: u8::MAX,
+                    },
+                ),
+            ),
+            (
+                key(
+                    0,
+                    SearchIndexType::Index {
+                        field: SearchIndexField {
+                            field_id: 0,
+                            data: vec![0u8],
+                        },
+                    },
+                ),
+                key(
+                    u32::MAX,
+                    SearchIndexType::Index {
+                        field: SearchIndexField {
+                            field_id: u8::MAX,
+                            data: vec![u8::MAX; SEARCH_INDEX_MAX_FIELD_LEN],
+                        },
+                    },
+                ),
+            ),
+        ] {
+            let mut found = false;
+            self.iterate(
+                IterateParams::new(from, to).no_values().only_first(),
+                |_, _| {
+                    found = true;
+                    Ok(false)
+                },
+            )
+            .await
+            .caused_by(trc::location!())?;
+            if found {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
