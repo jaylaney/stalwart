@@ -1,11 +1,16 @@
 # Zero-access calendar: sharing between key accounts (release 4) design spec
 
-Date: 2026-10-22. Status: revision 2, draft for review. Scope: release 4
+Date: 2026-10-22. Status: revision 3, draft for review. Scope: release 4
 of the zero-access fork (jaylaney/stalwart); GitHub issue #24, milestone
 "Release 4: calendar sharing". Revision 2 answers the builder check and
 the adversarial review of revision 1: the shared bundle (3.3), the
 destroyed owner (8.6), the grantee's scheduling rule (6.2), the conversion
 of plaintext entries and events (3.5), and the precisions listed in 13.1.
+Revision 3 replaces revision 2's refusal of a grantee's scheduling writes
+with delegate sending (6.2), by Jay's decision that a grantee may do what
+Stalwart lets a grantee do today. It also records two decisions of
+2026-10-22 that were open items: a grant accepts either pin source (4.3),
+and the single-parent rule stands as written (5.6).
 
 The terms key account, master key (MK), event wrapping key (EWK), data key
 (DEK), `X-ZA-KEY`, `X-ZA-SEALED`, `X-ZA-EXTRA`, wrap type, collection
@@ -58,9 +63,10 @@ sessions of the owner and of the current grantees can open.
 - The DAV gate resolving keys per calendar instead of per account, so that
   a grantee's own session reads and writes the owner's calendar
   (section 5).
-- Invitations from a shared calendar as release 2 delivers them, with only
-  the owner organizing; a grantee's write that would send scheduling
-  messages is refused (section 6).
+- Invitations from a shared calendar as release 2 delivers them. A
+  grantee schedules from the owner's calendar as upstream lets it, in the
+  owner's name, and the messages it sends are marked `SENT-BY` the grantee
+  and verified by the recipient's drain against the grant (section 6).
 - Revocation, rotating the collection key for future writes (section 7).
 - Tests, the leak scanner's sharing rules and a real-device check with
   Apple Calendar (section 11).
@@ -198,6 +204,12 @@ those principals.
   invitation inherits that pin's exposure (key pinning section 2, limit
   1); a pin confirmed on the page after an out-of-band comparison does not
   (4.3).
+- **A grantee acts for the owner.** An edit grantee sends invitations,
+  updates, cancellations and replies in the owner's name, as upstream lets
+  it, marked `SENT-BY` the grantee (6.2). The recipients of a delegated
+  message are sealed to under the grantee's pins, not the owner's, so the
+  trust in them is the grantee's. A grant revoked between a delegated
+  write and a recipient's drain makes that recipient refuse the message.
 - **Integrity** is release 1's: a store writer can drop, swap or delete
   wraps, entries, grants and events (availability), can add an ACL entry
   or flip a grant's bits, and can plant a calendar entry that names any
@@ -224,6 +236,12 @@ those principals.
 - Which principal wrote each change (upstream's change log records
   `changed_by`), and the paths a grantee's client requests under the
   owner's URLs (request logs; paths are visible by structure).
+- Who acts for whom. A delegated message's `SENT-BY` (6.2) shows its
+  recipients that the grantee sent it in the owner's name. The parameter
+  is sealed with its property, so the operator does not read it, but the
+  operator sees each item's `changed_by` (the grantee, as release 2 records
+  any sender) and can match the item's visible UID with an event of the
+  owner's calendar.
 - The sizes of the shared form's parts: rings grow by a fixed amount per
   generation and per grantee, and bundles keep release 1's 256-byte size
   classes.
@@ -262,10 +280,12 @@ events.
   generations is recorded as optional hardening (13.2).
 - **A compromised grantee account** (an attacker holds the grantee's
   password or an app password) reads every calendar shared to it and, with
-  edit, changes and deletes its events, as the grantee could. It cannot
-  delete the calendar or re-share it, and it can neither send invitations
-  in the owner's name nor plant attendees for the owner's next edit to
-  announce (6.2). The owner's remedy is a revoke.
+  edit, changes and deletes its events, as the grantee could. It can send
+  invitations, updates, cancellations and replies in the owner's name,
+  marked `SENT-BY` the grantee, as upstream allows an edit grantee (6.2).
+  It cannot delete the calendar, re-share it or change its ACL. The owner's
+  remedy is a revoke. The operator still reads no content, and no key
+  crosses between the accounts.
 - **A compromised owner account** is release 1's case: the attacker reads
   the owner's calendars anyway, and can grant them to a key account it
   controls (after pinning it) or revoke grants.
@@ -580,10 +600,13 @@ needs it, because a grantee exists only after phase 3.
   `event_token_pairs`), so an edit grantee's session that rewrites an event
   of the owner's opens the owner's pairs, the organizer's list of attendee
   tokens or the owner's own attendee token. They are held in that request's
-  memory only and are never returned to a client. A forged REPLY built from
-  them would still fail: the drain requires the replying address to
-  resolve to the item's `changed_by` principal (release 2 section 6.4,
-  step 2), which is the writer, never the attendee whose token it carries.
+  memory only and are never returned to a client. The server uses them as
+  the owner's session would: a delegated REQUEST hands out tokens from the
+  owner's event, and a delegated REPLY carries the owner's own token (6.2).
+  No client can use them to forge a reply: items are written only by the
+  fan-out, and a recipient's drain accepts an item in the owner's name only
+  from the item's `changed_by` principal holding a grant on the event's
+  calendar (6.2).
 - **The share endpoints** build their own request-scoped `SessionKeys`
   (4.1), dropped with the request.
 - **IMAP and POP3 sessions** hold `SessionKeys` for the connection (mail
@@ -671,6 +694,7 @@ Each object in `grants`:
 | `level` | string | `"view"` or `"edit"`. |
 | `fingerprint` | string | The fingerprint (key pinning section 3.1) of the key the grant is wrapped to. |
 | `granted_at` | integer | Unix seconds of the grant or of its last re-key. |
+| `pin_source` | string or null | The source of the owner's current pin for `address` (key pinning section 4.1): `"first-use"` or `"confirmed"`; null when the address is no longer pinned. A page can suggest confirming a first-use pin on the contacts screen (4.3). |
 | `state` | string | `"active"`; `"key changed"` when the grant's account now serves a key other than the recorded one (the person started over, or storage access replaced the served key; only an out-of-band comparison tells them apart, 7.4); `"gone"` when the account no longer exists or is no longer a key account (7.5). |
 
 Each object in `shared_with_me`:
@@ -707,8 +731,10 @@ The endpoint:
    public-key helper. It reads the pin record fresh (key pinning section
    4.2) and, when the record is absent or unusable, the wrap mark. The
    grantee must not be the caller. It requires a pin for the normalized
-   address, of either source, first use or confirmed (author's call, and a
-   question for Jay, 13.1), whose key equals the served key.
+   address, of either source, whose key equals the served key: a first-use
+   pin from an earlier invitation is enough, as a pin confirmed on the
+   page is (decided 2026-10-22), and the listing shows the pin's source
+   (`pin_source`, 4.2) so that the page can suggest confirming it.
 2. Decides:
    - **A new grantee.** It refuses when the calendar already holds
      `maxShares` grants (`max_shares_per_item`, which upstream's JMAP path
@@ -885,17 +911,24 @@ fingerprint, key bytes or a calendar name (key pinning invariant 21).
   replaced the key the server serves, and the grant is safe as it is.
 - **A grant shown `gone`.** `shares/revoke`; any grant or revoke on the
   calendar also removes it.
+- **A grant with `pin_source` `"first-use"`.** The grant stands; the page
+  may suggest comparing the person's fingerprint and confirming the pin
+  (`contacts/lookup`, then `contacts/pin`).
 
 The page shows, for each of the caller's calendars, its name, whether it
-is shared, and each grant with its address, level, state and recorded
-fingerprint; and, for each calendar shared with the caller, its owner,
-name and level. It explains that Apple devices show shared calendars by
-themselves and that Thunderbird and DAVx5 find them at their next
-discovery, offering `href` for a client set up by hand; that the first
-share of a calendar makes the owner's devices resync it once; and, for an
-edit grant, that invitations to other people go from one's own calendars
-(6.2). api.md's "What the page never sees" is unchanged: no key material is
-returned, and fingerprints and addresses go only to the record's owner.
+is shared, and each grant with its address, level, state, pin source and
+recorded fingerprint; and, for each calendar shared with the caller, its
+owner, name and level. It explains that Apple devices show shared
+calendars by themselves and that Thunderbird and DAVx5 find them at their
+next discovery, offering `href` for a client set up by hand; that the
+first share of a calendar makes the owner's devices resync it once; that
+an edit grantee's invitations, updates, cancellations and replies from the
+shared calendar go out in the owner's name, marked as sent by the grantee,
+as Stalwart sends them for any grantee (6.2); and that a person invited to
+an event of a calendar shared with them answers from their own copy of the
+invitation, not from the shared calendar (6.3). api.md's "What the page
+never sees" is unchanged: no key material is returned, and fingerprints
+and addresses go only to the record's owner.
 
 ## 5. Access and keys at use time
 
@@ -998,9 +1031,9 @@ unchanged apart from the key domain, 5.5):
 | `GET`, `HEAD` of an event | served | served |
 | `REPORT` `calendar-query`, `calendar-multiget`, `sync-collection` | served; candidates unsealed before the content filters, as release 1 section 8.2 runs them | same |
 | `REPORT` `free-busy-query` on a granted calendar | no busy periods (below) | same |
-| `PUT` creating an event | 403 (`AddItems`) | stored sealed under the CK, under the owner's UID lease (6.4); 412 when it touches scheduling properties or would schedule (6.2) |
-| `PUT` over an event | 403 (`ModifyItems`) | stored sealed under the newest generation; 412 as for a create |
-| `DELETE` of an event | 403 (`RemoveItems`) | deleted; 412 when the event carries scheduling properties (6.2) |
+| `PUT` creating an event | 403 (`AddItems`) | stored sealed under the CK, under the owner's UID lease (6.4); schedules as upstream, messages in the owner's name delegated with `SENT-BY` (6.2) |
+| `PUT` over an event | 403 (`ModifyItems`) | stored sealed under the newest generation; schedules as upstream, delegated with `SENT-BY` |
+| `DELETE` of an event | 403 (`RemoveItems`) | deleted; a CANCEL or declining REPLY as upstream, delegated with `SENT-BY` |
 | `PROPPATCH` of an event | 403 (`ModifyItems`) | stored sealed (it changes no scheduling property) |
 | `PROPPATCH` of the calendar | 403 (`Modify`), the colour and order included | writes the grantee's own personal bundle (name, description, time zone) through upstream's `personal_id`, and the calendar's dead properties (colour and order among them, shared by every principal) into the shared bundle (5.5) |
 | `MKCOL`, `MKCALENDAR` in the owner's home | 403 (upstream's member check, before any calendar exists to resolve) | 403 |
@@ -1120,8 +1153,10 @@ parents: an event `COPY` adds a name to the same document (`copy_event` in
 to each of its events (`copy_container`). An event wrapped under one
 calendar's CK and also listed in another calendar would leave the second
 calendar's readers with the wrong key, or none. Release 4 therefore keeps
-the **single-parent rule** (author's call): an event of a shared calendar
-has that calendar as its only parent.
+the **single-parent rule** (decided 2026-10-22, as revision 1 proposed it):
+an event of a shared calendar has that calendar as its only parent. The
+real-device check (11.5) records what Apple Calendar sends when an event is
+dragged between calendars.
 
 - An event `COPY` whose source or destination calendar is shared answers
   403, with the trace `zero-access: copy into or out of a shared calendar`.
@@ -1138,9 +1173,8 @@ has that calendar as its only parent.
   grantee moves only between two calendars granted to it at the edit level
   (upstream's checks: `RemoveItems` on the source, `AddItems` on the
   destination) and holds both CKs. A `MOVE` within one domain copies the
-  stored bytes, as release 1 does. A grantee's `MOVE` is also judged by
-  6.2's rule: a move keeps the event's scheduling properties, but a move
-  that overwrites a destination event is that event's `DELETE`.
+  stored bytes, as release 1 does. A `MOVE` that overwrites a destination
+  event deletes it, and that deletion schedules as a `DELETE` does (6.2).
 - The first grant refuses a calendar any of whose events already has a
   second parent (`calendar has linked events`, 4.3). Deleting the event in
   the other calendar removes just that name (`DestroyArchive::delete_za`
@@ -1160,7 +1194,10 @@ the calendar capabilities (`crates/jmap/src/api/session.rs`). Release 6.
 
 ## 6. Invitations and scheduling with a shared calendar
 
-In a shared calendar only the owner organizes.
+In a shared calendar the owner organizes as in any of its calendars, and
+an edit grantee schedules as upstream lets a grantee schedule, on the
+owner's behalf, with every such message marked and verified (release 4's
+rule, following upstream).
 
 ### 6.1 The owner organizes
 
@@ -1173,116 +1210,149 @@ into that event, its import of an invitation into a default calendar that
 happens to be shared, and `contacts/pin`'s redelivery all run in the
 owner's session and reseal under the calendar's domain (5.5).
 
-### 6.2 Scheduling properties are the owner's
+### 6.2 A grantee schedules for the owner: delegate sending
 
-Upstream lets a grantee write into another account's calendar with
-`ORGANIZER` set to the owner's address and send in the owner's name, with
-nothing but the ACL authorizing it: `scheduling_account_info`
-(`crates/common/src/cache/principals.rs`) merges the writer's and the
-owner's addresses, so both count as local to `itip_create`, `itip_update`
-and `itip_cancel`, and `ItipSendStatus::resolve`
-(`crates/groupware/src/calendar/itip.rs`) looks only at the writer's
-token. The fork cannot do that honestly: the fan-out seals and pins as the
-writer and requires the session's keys to be the sender's
-(`keys.account_id != sender_id` is an error,
-`crates/groupware/src/calendar/fanout.rs`), and a recipient's drain
-rejects an invitation whose ORGANIZER does not resolve to the item's
-`changed_by` principal (`SenderIsNotOrganizerNorAttendee`,
-`crates/groupware/src/calendar/drain.rs`).
+**Upstream's behaviour, which release 4 mirrors.** Scheduling runs for
+whoever writes, and the organizer is a set of addresses, the writer's plus
+the owner's (`scheduling_account_info`,
+`crates/common/src/cache/principals.rs:813-833`), all of which
+`itip_create`, `itip_update` and `itip_cancel` count as local, while
+`ItipSendStatus::resolve` (`crates/groupware/src/calendar/itip.rs`) looks
+only at the writer's token. An edit grantee writing into the owner's
+calendar can therefore:
 
-So the scheduling properties of a key account's calendar are the owner's.
-A grantee's write into a key account's shared calendar (a `PUT`; a
-`DELETE`; a `MOVE`, judged as the write of the moved event, an overwritten
-destination event being judged as its `DELETE`) is refused when either
-test below holds. Everything else a grantee writes is stored as upstream
-stores it.
+- create an event with ORGANIZER set to the owner's address and with
+  attendees: upstream sends the REQUESTs from the owner's address
+  (`crates/groupware/src/scheduling/organizer.rs:390-396`, and the iMIP
+  task sends as the account that address resolves to,
+  `crates/services/src/task_manager/imip.rs:125-139`);
+- change such an event: upstream sends the update as the owner;
+- delete it: a CANCEL as the owner;
+- change the owner's own ATTENDEE line on an invitation organized by
+  someone else: a REPLY as the owner;
+- organize under its own address from the owner's calendar.
 
-1. **It touches a scheduling property**, whatever upstream's sending state.
-   In each component (the master and each override, matched by
-   RECURRENCE-ID), an address is local when it is the owner's or the
-   writer's (the merged list of `scheduling_account_info`). Compared with
-   the stored event, or with nothing for a create, the write is refused
-   when it
-   - adds, removes or replaces the ORGANIZER of a component that carries
-     an ATTENDEE before or after the write;
-   - adds, removes or changes any ATTENDEE line, any of its parameters
-     included (PARTSTAT, ROLE, RSVP, SCHEDULE-AGENT, SCHEDULE-FORCE-SEND),
-     of a component whose ORGANIZER, before or after the write, is local;
-     or
-   - adds, removes or changes the ATTENDEE line of a local address in a
-     component whose ORGANIZER is not local: the owner's (or the writer's)
-     own attendance in an invitation organized by someone else, which
-     upstream answers with a REPLY in that address's name (author's call:
-     the same property rule on the attendee side).
+Only the ACL authorizes this, and upstream does not mark the messages as
+sent on anyone's behalf.
 
-   So a create with a local ORGANIZER and any ATTENDEE is refused, as is a
-   `DELETE` of a component whose lines the rule protects (upstream would
-   cancel or decline in the owner's name). Lines are compared as a set
-   within each component, so a client that reorders them is not refused,
-   and the `SCHEDULE-STATUS` parameter, which the server sets and clients
-   echo or drop, is left out of the comparison (author's call). The test is
-   independent of `ItipSendStatus::resolve`: a past event, a writer without
-   `CalendarSchedulingSend` or scheduling turned off would otherwise let a
-   planted ATTENDEE through, stored without a message, for the owner's next
-   edit of the event to announce in the owner's name (`itip_update` sends
-   to every attendee it finds).
-2. **Upstream would send a message for it**: the sending state builds
-   messages (`SendSealed`, release 2 section 5.1) and `itip_create`,
-   `itip_update` or, for a `DELETE`, `delete_za`
-   (`crates/groupware/src/calendar/storage.rs`, with the `send_itip` flag
-   `crates/dav/src/calendar/delete.rs` computes) returns any. This catches
-   a write test 1 lets through, such as a grantee moving the owner's
-   meeting to another time with its attendees untouched: upstream would
-   send the update REQUEST from the owner's address, through a fan-out
-   whose key check passes, since its keys and its sender are both the
-   grantee's (author's call: revision 1's rule, kept beside test 1).
+**Release 4's rule: delegate sending, marked.** A grantee's write into a
+key account's shared calendar (a `PUT`, a `DELETE`, a `MOVE` that
+overwrites an event) schedules as upstream decides, and runs release 2's
+fan-out in the grantee's session, on the owner's behalf:
 
-- **Answer.** 412 with the precondition
-  `CALDAV:allowed-organizer-scheduling-object-change`
-  (`CalCondition::AllowedOrganizerObjectChange`,
-  `crates/dav-proto/src/schema/response.rs`), which upstream defines and
-  never produces, for both tests and for organizer and attendee lines alike
-  (author's call: one condition that only this refusal produces, so
-  clients and tests can tell it apart from upstream's attendee-change
-  conditions). Nothing is stored, deleted or delivered: test 1 compares the
-  incoming tree with the stored event's view before upstream's scheduling
-  step, test 2 runs after upstream's builders return, and both run before
-  the quota check, the fan-out, the seal and the commit.
-- **Stored as usual** is every other grantee write: an event without
-  attendees, or with attendees and no ORGANIZER (`NoSchedulingInfo`), a
-  change that leaves every protected line as it was and that upstream would
-  not announce (an alarm, a description, a past event's time), with
-  upstream's schedule-tag handling. Upstream's own 412s
-  (`valid-organizer`, `allowed-attendee-scheduling-object-change` and the
-  rest) answer as they do today.
-- **`PROPPATCH`** of an event changes no scheduling property and runs no
-  scheduling upstream (`crates/dav/src/calendar/proppatch.rs`), so the rule
-  never refuses one.
-- **Traced** with `CalendarEvent::ItipMessageError` (as the `PUT` path
-  traces its other scheduling outcomes), the owner's account id, the
-  document id and the fixed reason `zero-access: scheduling by a grantee
-  refused` (author's call).
+1. **Identity in the message.** In every component the fan-out sends, the
+   property that names the sending party (the ORGANIZER of a REQUEST, an
+   update or a CANCEL; the acting ATTENDEE of a REPLY, the line of the
+   address the REPLY answers for) carries
+   `SENT-BY="mailto:<writer's address>"` (RFC 5545 section 3.2.18) when
+   that address is the owner's and the writer is a grantee. The server sets
+   it at fan-out time, from the writer's primary calendar address (the
+   first of the writer's own addresses in `scheduling_account_info`'s
+   list), and replaces any `SENT-BY` the client wrote on that property, so
+   a grantee cannot name a sender of its choosing. When the property names
+   the writer's own address (the writer organizing in its own name from the
+   owner's calendar, which upstream also allows), no `SENT-BY` is added,
+   any the client wrote is removed, and the fan-out runs exactly as release
+   2's; the owner's own writes are treated the same way. The stored event
+   keeps its lines as the client wrote them; only the messages carry the
+   server's value (author's call).
+2. **Keys and pins.** The fan-out uses the writer's session keys and the
+   writer's pin record for the recipients' public keys: the owner's pin
+   record is sealed under the owner's master key, which a grantee never
+   holds, so the trust in a delegated message's recipients is the
+   writer's, with key pinning's first-use pins and `3.8` refusals applying
+   to the writer's record as for any of its fan-outs (the statuses land on
+   the owner's event). The event in the owner's calendar is sealed under
+   the calendar's CK, as any grantee write is (5.5), and its token pairs
+   come from and return to it (3.6). The pending item in each recipient's
+   inbox is sealed to the recipient's pinned public key exactly as release
+   2's, with `changed_by` the writer, as upstream's change log also records
+   it. Release 2's check that the session's keys are the sender's
+   (`keys.account_id == sender_id`, `crates/groupware/src/calendar/
+   fanout.rs:220-227`) holds with the writer as the sender. The fan-out
+   takes the event's account, the owner's, as a separate parameter: the UID
+   lease of a create is keyed by it (`crates/dav/src/calendar/
+   update.rs:448-453`), the SEQUENCE floor and reconciliation run on the
+   merged addresses (`update.rs:236-238`), and the event is sealed in it.
+   Section 13.1 names that parameter as a planning item. A delegated
+   fan-out neither records nor consumes key pinning's withheld entries
+   (author's call): an entry is bound to a document of the sender's own
+   account (key pinning section 4.1), and the writer's `contacts/pin`
+   could not redeliver from the owner's event. A refused delegated delivery
+   keeps its `3.8` on the owner's event until a later message for the
+   event delivers to the address.
+3. **The recipient's drain accepts a delegated item.** Release 2's step 2
+   (`crates/groupware/src/calendar/drain.rs:644-661`) requires the address
+   an item names, the ORGANIZER of a REQUEST or CANCEL or the acting
+   ATTENDEE of a REPLY, to resolve to the item's `changed_by` principal.
+   That rule stays for every item without `SENT-BY`. An item whose naming
+   property carries `SENT-BY` passes instead when:
+   - the `SENT-BY` address resolves to the `changed_by` principal; and
+   - the account the named address resolves to (the owner) holds an event
+     of the item's UID in a calendar whose `acls` grant the `changed_by`
+     principal's own account id the bits the write needed: `AddItems` for
+     a REQUEST the recipient imports (it holds no copy of the UID),
+     `ModifyItems` for a REQUEST it merges or for a REPLY, and `RemoveItems`
+     or `ModifyItems` for a CANCEL. Every edit grant holds all four, so in
+     release 4 the test is an edit grant on the calendar holding the event.
 
-Consequences:
+   The drain checks this from stored data, without any key: the owner's
+   UID index (`document_ids_matching` on the owner's `CalendarEvent` UID
+   field), each hit's parent calendars (`CalendarEvent.names`, visible by
+   structure) and those calendars' `acls`. When the owner's account holds
+   no event of the UID (author's call on the first two branches):
+   - a REQUEST whose create is still in flight, so that the owner
+     account's UID lease for the UID is held (a create holds it through its
+     commit, and its fan-out runs under it, release 2 sections 5.4 and
+     6.3), stays pending, as an item behind a busy lease does (release 2
+     section 6.2: not counted as a failure), and is decided at a later
+     pass;
+   - a CANCEL, or a REPLY declining by deletion, sent by a `DELETE` that
+     has since committed, passes when the `changed_by` principal holds an
+     edit grant on any calendar of the owner, since the deleted event's
+     calendar can no longer be read;
+   - anything else is refused.
 
-- A grantee RSVPs from its own copy (6.3): a change of its PARTSTAT in the
-  shared copy is refused, neither stored silently nor sent.
-- The drain and a pin redelivery are never a grantee's write: each runs in
-  an account's own session and writes only into that account. The drain
-  looks a UID up and imports only in the recipient's own account
-  (`find_event(server, account_id, uid)` and
-  `get_or_create_default_calendar(account_id, account_id)`,
-  `crates/groupware/src/calendar/drain.rs:665, 825, 864-867`), and
-  `contacts/pin` reseals only the caller's own source event, so neither
-  ever writes into a calendar another account shares with it. When an
-  account's own default calendar is shared, the drain's import into it is
-  the owner's own write and seals under that calendar's CK (5.5).
-- No write of a grantee reaches the fan-out, so 2.1's compromised-grantee
-  case and invariant 38 hold as written.
+   Two cases are refused. A grant revoked between the write and the
+   recipient's drain: the recipient does not get that message until a later
+   message for the event, the owner's next update for instance, reaches it,
+   as release 2 section 5.4's lost deliveries heal; a recorded, rare limit.
+   A `SENT-BY` whose sender holds no such grant is refused as a forgery.
+   Both are release 2's iTIP-level rejection
+   (`SenderIsNotOrganizerNorAttendee`, the item kept as history with its
+   trace, release 2 section 6.4 step 4).
+4. **Replies.** A reply to a delegated REQUEST goes to the ORGANIZER's
+   address, the owner, into the owner's inbox, and the owner's drain merges
+   it into the shared calendar's event as into any of its own (the event is
+   in the owner's account). A reply to an event the grantee organized under
+   its own address goes to the grantee's inbox and is not merged: the
+   grantee's drain looks a UID up in the grantee's own account only
+   (`drain.rs:665, 825`), as upstream's ingest does
+   (`crates/groupware/src/calendar/itip.rs:171-183`), and files the reply
+   as history (`EventNotFound`). An inherited limit; section 13.1 records
+   the later refinement.
+5. **What a grantee cannot do** stays what upstream's bits refuse: a view
+   grantee writes nothing; no grantee deletes the calendar, re-shares it or
+   changes its ACL, since release 4 never grants those bits; `MKCOL` in the
+   owner's account is member-only; and the single-parent rule (5.6)
+   stands. A writer without `CalendarSchedulingSend`, or a write upstream
+   does not announce (no attendees, no ORGANIZER, a past event, a change
+   without scheduling content), sends nothing and is stored as upstream
+   stores it, and a `PROPPATCH` of an event runs no scheduling
+   (`crates/dav/src/calendar/proppatch.rs`).
 
-A grantee who wants to invite people does it from its own calendar, as
-today: its own session organizes there under its own address, keys and
-pins. Section 13 records the delegate-send alternative.
+The drain and a pin redelivery are never a grantee's write: each runs in
+an account's own session and writes only into that account. The drain
+looks a UID up and imports only in the recipient's own account
+(`find_event(server, account_id, uid)` and
+`get_or_create_default_calendar(account_id, account_id)`, `drain.rs:665,
+825, 864-867`), and `contacts/pin` reseals only the caller's own source
+event, so neither writes into a calendar another account shares with it.
+When an account's own default calendar is shared, the drain's import into
+it is the owner's own write and seals under that calendar's CK (5.5).
+Delegated sending adds no trace event; a drain's refusal of a delegated
+item is traced as release 2 traces an iTIP-level rejection, without
+content.
 
 ### 6.3 An attendee who is also a grantee
 
@@ -1299,13 +1369,17 @@ drain do the same (the fan-out skips only the sender's own account, and the
 drain's `find_event` looks only in the recipient's account before
 importing into `get_or_create_default_calendar`). The grantee's answer
 travels as any reply does (release 2 section 4.4) and updates the owner's
-event, which the grantee then also sees in the shared calendar. A grantee
-that changes its own participation in the owner's copy instead of its own
-is refused with 412 (6.2): its ATTENDEE line in an event the owner
-organizes is a scheduling property, whatever upstream would have done
-with the change (sent REQUESTs to the other attendees, or, when the
-grantee is the only one, stored it with no REPLY, leaving the owner's copy
-and the grantee's own disagreeing). It answers from its own copy.
+event, which the grantee then also sees in the shared calendar.
+
+A grantee that changes its own participation in the owner's copy instead
+of its own gets upstream's behaviour: under the merged addresses the
+owner's event is organized locally, so the change is an organizer-side
+update, sent to the other attendees as the owner with `SENT-BY` the
+grantee (6.2), or nothing to send when the grantee is the only attendee.
+No REPLY is built, so the grantee's own delivered copy stays
+NEEDS-ACTION while the owner's copy shows the new status. The page (4.8)
+and the real-device check (11.5) say that an attendee answers from its own
+copy.
 
 ### 6.4 The SEQUENCE floor and the UID lease
 
@@ -1318,7 +1392,10 @@ import into the owner's default calendar takes it too. The SEQUENCE floor
 (key pinning section 5.1) applies to every `PUT` of an existing event in a
 key account's calendar, the grantee's included, with the merged address
 list. Release 2 section 5.1's rule that the sending state follows the
-calendar's owner stands, and only the owner's writes reach the fan-out.
+calendar's owner stands (a key owner's calendar resolves to `SendSealed`
+under the writer's permissions), and a grantee's write reaches the
+fan-out in the grantee's session with the owner's account as the event's
+account (6.2).
 
 ## 7. Revocation and rotation
 
@@ -1422,17 +1499,22 @@ request, whatever account the request targets
 the account's default calendar, which may be shared, and merges into
 events that may live in a shared calendar; both seal under the calendar's
 domain and assert the calendar archive, and a lost assertion is a transient
-item error (5.5). The fan-out is reached only by the owner's writes (6.2)
-and is unchanged: items are sealed to the recipients' public keys (`0x02`),
-never under a CK.
+item error (5.5). Its sender check (release 2 section 6.4, step 2) gains
+the delegated branch of 6.2: an item whose ORGANIZER or acting ATTENDEE
+carries `SENT-BY` passes on the sender's grant on the owner's calendar,
+checked keylessly; every other item is checked as before. The fan-out runs
+for the owner's writes and, delegated, for a grantee's (6.2), with the
+event's account as a parameter beside the sender; its items are sealed to
+the recipients' public keys (`0x02`) as before, never under a CK.
 
 ### 8.3 Key pinning
 
 A grant requires a pin whose key equals the served key, and wraps to it
 (4.3); rotations wrap to the keys the ledger recorded (7.2);
 `contacts/pin`'s redelivery reseals its source event under that event's
-domain (5.5). Pins, withheld entries and the pin record's format are
-unchanged.
+domain (5.5). A delegated fan-out uses the writer's pin record and neither
+records nor consumes withheld entries (6.2). Pins, withheld entries and the
+pin record's format are unchanged.
 
 ### 8.4 The leak scanner
 
@@ -1519,7 +1601,7 @@ calendar cannot be deleted (upstream).
 | JMAP `Calendar/set` `shareWith`, JMAP calendars | `accountNotSupportedByMethod`; not advertised | unchanged (release 6) |
 | Grants to non-key accounts and groups; `Share`, `Delete`, free/busy-only and the unenforced bits | n/a | refused by the endpoint (`not a key account`; levels only) |
 | A grantee's `PROPFIND`, `GET`, `HEAD` and `REPORT` (`calendar-query`, `calendar-multiget`, `sync-collection`) | 403 at the URI gate | served, unsealed with the grantee's CK (5.3) |
-| A grantee's `PUT`, `DELETE`, `MOVE` and `PROPPATCH` | 403 | per level; sealed under the CK; 412 when it touches a scheduling property or upstream would schedule (6.2) |
+| A grantee's `PUT`, `DELETE`, `MOVE` and `PROPPATCH` | 403 | per level; sealed under the CK; scheduling as upstream, with `SENT-BY` (6.2) |
 | A grantee's `PROPPATCH` of the calendar's colour or order | 403 | upstream's: shared dead properties, 403 at view, recolours for every principal at edit (1.2) |
 | `MKCOL`, `MKCALENDAR`, calendar `DELETE`, `ACL` by a grantee | 403 | 403 (upstream: no membership, no `Delete`, no `Share`) |
 | `calendar-home-set` and assisted discovery for a grantee | the key owner's calendars unreachable | listed, with the grantee's names (5.4) |
@@ -1530,7 +1612,9 @@ calendar cannot be deleted (upstream).
 | Cross-account `COPY` and `MOVE` | 403 | 403 (unchanged) |
 | Impersonation, master user, group membership, `is_member` | 403 | 403: a grant to the token's own account and its own grant ring are required (5.1, 5.2) |
 | Invitations from the owner in a shared calendar | n/a | release 2's, sealed under the CK; a grantee who is an attendee also gets its own copy (6.3) |
-| A grantee's write that touches a scheduling property or would schedule | n/a | 412 `allowed-organizer-scheduling-object-change` (6.2) |
+| A grantee's invitations, updates, cancellations and replies in the owner's name | n/a | as upstream, with `SENT-BY` the grantee, under the grantee's keys and pins (6.2) |
+| A delegated item at the recipient's drain | n/a | accepted when its sender holds an edit grant on the owner's calendar holding the event; refused as a forgery otherwise (6.2) |
+| A grantee organizing under its own address from the owner's calendar | n/a | as upstream, sent as the grantee; replies to it are not merged (6.2) |
 | A grantee's discovery after its owner's account is destroyed | n/a | the dead owner is dropped from a key account's `access_to` at its next token build (8.6) |
 | The owner's `DELETE` of a shared calendar | n/a | upstream's, plus the grantees' caches invalidated after the commit (8.8) |
 | Provisioning an account whose calendars carry grants | 409 | 409 (unchanged) |
@@ -1552,8 +1636,10 @@ calendar cannot be deleted (upstream).
   without a collection key` at use (5.2; inside a listing the calendar is
   skipped instead), and `zero-access: copy into or out of a shared
   calendar` for 5.6's refusals.
-- **A grantee's scheduling write**: 412 with
-  `allowed-organizer-scheduling-object-change`, traced as 6.2 states.
+- **Delegated sending** adds no error and no trace of its own; a drain
+  that refuses a delegated item traces it as release 2 traces any
+  iTIP-level rejection (`SenderIsNotOrganizerNorAttendee`), with ids and no
+  content (6.2).
 - **Unseal failures** under a CK (a ring, wrap, envelope or bundle that
   does not open, an unknown wrap type or ring version, a `0x03` envelope
   naming another calendar or an unlisted generation, a grant ring whose
@@ -1583,11 +1669,17 @@ converts straight into the shared form, and a plaintext event is sealed
 under the CK; a grantee's view of a calendar never opens the owner's ring
 nor the owner's personal bundle, and a grantee's write of a dead property
 rewrites the shared bundle and leaves the owner's ring and personal bundle
-bytes unchanged. In `dav`: 6.2's scheduling-property comparison, on a
-corpus of organizer and attendee changes per component (an ORGANIZER
-added, removed or replaced, an ATTENDEE added, removed or reparametered, a
-local attendee's PARTSTAT under a foreign ORGANIZER, reordered lines, a
-changed or dropped `SCHEDULE-STATUS`, an override added with attendees).
+bytes unchanged. In the fan-out: 6.2's `SENT-BY` placement, per method and
+component (set on the ORGANIZER of a delegated REQUEST, update and CANCEL
+and on the acting ATTENDEE of a delegated REPLY; a client's `SENT-BY`
+replaced; none, and a client's removed, when the property names the
+writer's own address or the writer is the owner). In the drain: 6.2's
+delegated sender check against fixture data (an edit grant on the
+calendar holding the event passes; no grant, a view grant, a grant on
+another calendar of the owner and a `SENT-BY` that does not resolve to
+`changed_by` are refused; a create in flight under a held lease waits; a
+CANCEL after the event's deletion passes on an edit grant on any of the
+owner's calendars).
 
 ### 11.2 Integration: the za suite
 
@@ -1642,23 +1734,45 @@ accounts:
 8. Re-key: bob starts over with a new keypair (a test helper replaces
    it); alice's list shows `key changed`; after `contacts/pin` and a grant,
    bob reads every event again and the calendar has a new generation.
-9. Scheduling (6.2), each refusal a 412 with the precondition that stores
-   and deletes nothing and puts no item in any inbox: bob's `PUT` creating
-   an event with attendees and a local ORGANIZER (alice's address, and in a
-   second run his own); an ATTENDEE planted on alice's past event, which
-   upstream would store without a message (and, in a second run, by a bob
-   lacking `CalendarSchedulingSend`), after which alice's next edit sends
-   nothing to the planted address; bob's PARTSTAT change from the shared
-   copy of an event alice organizes; bob's `DELETE` of an event alice
-   organizes; bob's move of alice's future meeting to another time (test
-   2); bob's change of alice's PARTSTAT in an invitation from carol. Stored:
-   bob's event without attendees, his alarm added to alice's scheduled
-   event (its `SCHEDULE-STATUS` echoed or dropped by the client), and his
-   `PROPPATCH` of an event.
-10. The owner organizes: alice invites bob from the shared calendar; bob's
-    drain imports his own copy into his default calendar (two copies,
-    6.3); bob's reply applies to alice's event, which bob then reads in the
-    shared calendar with his participation.
+9. Delegate sending (6.2), with bob an edit grantee of alice's calendar,
+   carol a key account bob has pinned, and dave a key account without a
+   grant:
+   - a delegated REQUEST: bob creates an event in alice's calendar with
+     ORGANIZER alice and carol as attendee; carol's drain imports it, her
+     copy's ORGANIZER carries `SENT-BY` bob, and the item's `changed_by` is
+     bob; a `SENT-BY` naming dave that bob's client wrote is replaced by
+     bob's;
+   - a delegated update: bob moves the event's time, and carol's copy
+     follows, `SENT-BY` bob;
+   - a delegated CANCEL: bob deletes the event; carol's drain, after the
+     deletion committed, applies the CANCEL;
+   - a delegated REPLY: bob changes alice's PARTSTAT on an invitation from
+     carol held in the shared calendar; carol's drain accepts it (`SENT-BY`
+     bob on alice's ATTENDEE line, alice's token) and applies it;
+   - carol's reply to the delegated REQUEST reaches alice's inbox and
+     alice's drain merges it into the event in the shared calendar;
+   - bob organizes under his own address from alice's calendar: the
+     REQUEST is sent as bob with no `SENT-BY`, and carol's reply lands in
+     bob's inbox as history (`EventNotFound`), the inherited limit;
+   - a forged `SENT-BY`: an item planted in carol's inbox by a fixture
+     with ORGANIZER alice, `SENT-BY` dave and `changed_by` dave is refused
+     and kept as history;
+   - a revoke in between: with carol's drain skipped, bob writes, alice
+     revokes bob, and carol's next drain refuses the item;
+   - a create in flight: with `COMMIT_PAUSE` holding bob's create after its
+     fan-out, carol's drain leaves the item pending without counting a
+     failure, and imports it once the create commits; alice's own create of
+     the same UID meanwhile waits on the UID lease of her account;
+   - a write that schedules nothing (an event without attendees, an alarm
+     on alice's scheduled event) and a `PROPPATCH` of an event are stored
+     and send nothing.
+10. The owner organizes: alice invites bob and carol from the shared
+    calendar; bob's drain imports his own copy into his default calendar
+    (two copies, 6.3); bob's reply from his own copy applies to alice's
+    event, which bob then reads in the shared calendar with his
+    participation. Bob's PARTSTAT change from the shared copy instead is an
+    update sent to carol as alice with `SENT-BY` bob, and bob's own copy
+    stays NEEDS-ACTION (6.3).
 11. The gate: a token with its own keys but no grant, an impersonation
     copy, a Bearer token, and a grant to a group planted in the store by a
     fixture are refused on the shared calendar; a grantee whose token
@@ -1777,10 +1891,14 @@ it; a view grant is read-only; an edit grant's changes reach the owner's
 devices and back; an edit grantee's colour change recolours the calendar
 on the owner's devices too (shared, as upstream), and a view grantee's
 colour change is refused with 403, recording what Apple does with it
-(keeps it locally, reverts it, or shows an error); adding invitees to an
-event in the shared calendar, and answering an invitation from the shared
-copy instead of the grantee's own, are refused, recording what Apple shows
-for the 412; an alarm the grantee adds to the owner's scheduled event is
+(keeps it locally, reverts it, or shows an error); the grantee adds
+invitees to an event in the shared calendar and they receive it as the
+owner's invitation, recording whether Apple offers invitees there at all
+and how the recipient's Apple Calendar shows the `SENT-BY`; the grantee
+answers an invitation from the shared copy instead of its own, recording
+what Apple shows (the owner's copy changes, the grantee's own copy stays
+unanswered, 6.3), while the checklist tells an attendee to answer from its
+own copy; an alarm the grantee adds to the owner's scheduled event is
 stored; dragging an event between the shared calendar and the grantee's
 own calendars, and between the owner's shared and unshared calendars,
 recording what Apple sends and shows; a revoke removes the calendar at the
@@ -1799,14 +1917,16 @@ wrapping to the served key instead of the ledger's (8, with a remaining
 grantee's served key substituted during a revoke); the resolver honouring
 `is_member` or skipping its bit check (11); a refusal inside a listing
 failing the request instead of skipping the calendar (11); the gate
-accepting a token without its own keys (11); no 412 refusal (9); the
-property test made dependent on the sending state, which lets the planted
-ATTENDEE on a past event through (9); the property test alone, without the
-message test, which stores bob's reschedule of alice's meeting (9); no
-single-parent rule (12); a new grantee given only the newest generation
-(7); no drop of a dead owner from `access_to` (14); a grantee's dead
-property written into the owner's personal bundle (2, with the unit test
-of 11.1); a plaintext event skipped by the conversion (3).
+accepting a token without its own keys (11); no grant check in the
+drain's delegated branch, which lets the forged `SENT-BY` through (9); no
+`SENT-BY` placement, which makes the delegated REQUEST fail release 2's
+sender check at carol's drain (9); the fan-out without the event-account
+parameter, which takes the create's UID lease on bob's account so that
+alice's create of the same UID does not wait (9); no single-parent rule
+(12); a new grantee given only the newest generation (7); no drop of a
+dead owner from `access_to` (14); a grantee's dead property written into
+the owner's personal bundle (2, with the unit test of 11.1); a plaintext
+event skipped by the conversion (3).
 
 ## 12. Invariants for implementers
 
@@ -1814,7 +1934,13 @@ Release 1's ten, release 2's five (11 to 15), key pinning's eight (16 to
 23) and mail's nine (24 to 32), with mail's two amendments, hold. Release
 2's invariant 11 is unchanged: it governs `pk` key envelopes (`X-ZA-KEY`
 wrap type `0x02`), and the grant wraps of this release are a different
-object under their own purpose and rule (34). This spec adds:
+object under their own purpose and rule (34). Release 2's rule on who
+sends, the drain's sender check that invariant 15 counts among the drain's
+own checks (release 2 section 6.4, step 2: an item's ORGANIZER or acting
+ATTENDEE resolves to its `changed_by` principal), is qualified, not
+relaxed: it holds unchanged for every item without `SENT-BY`, and an item
+whose naming property carries `SENT-BY` passes only by 38's grant check.
+This spec adds:
 
 33. A collection key exists in plaintext only in process memory, in a
     request or session that holds the session keys of the calendar's owner
@@ -1848,14 +1974,14 @@ object under their own purpose and rule (34). This spec adds:
     is sealed under a generation the removed grantee held. Ciphertext
     already stored is never resealed by a revoke, and no generation is
     dropped while the calendar exists.
-38. A grantee never sends scheduling messages in the owner's name and
-    never changes a scheduling property the owner's next edit would
-    announce: a grantee write that touches an ORGANIZER, an ATTENDEE line
-    of a locally organized component or a local address's attendance, or
-    that upstream would schedule, is refused with 412 before anything is
-    stored, deleted or delivered, whatever the sending state. No grantee
-    write reaches the fan-out; the fan-out, the pins, the SEQUENCE floor
-    and the UID lease of a shared calendar are the owner's.
+38. Every scheduling message a session sends names, in ORGANIZER or the
+    acting ATTENDEE, either an address of the session's account or, with
+    `SENT-BY` an address of the session's account, an address of an
+    account whose shared calendar containing the event the session's
+    account holds an edit grant on; the recipient's drain verifies the
+    second case from the grant. The fan-out seals with the session's own
+    keys and pins; the UID lease and the SEQUENCE floor of a shared
+    calendar's event are keyed by the calendar's account.
 39. Sharing never yields another account's account keys: a session holds
     only its own MK, EWK, mail wrapping key and private key, and the
     collection keys of the calendars it owns or is granted. A grantee never
@@ -1936,25 +2062,33 @@ stands unless the code says otherwise.
    grantee's account is destroyed; the controller files them in the
    private tracker. Note that the grantee's discovery recovers only at its
    next token build, which nothing triggers at the owner's destruction.
-8. **Client behaviour** for the real-device check (11.5): what Apple
-   Calendar shows on the 412, whether it offers invitees in a shared
-   calendar at all, what it sends when an event is dragged between
+8. **Client behaviour** for the real-device check (11.5): whether Apple
+   Calendar offers invitees in a shared calendar at all, how it shows a
+   received invitation's `SENT-BY`, what it does when a grantee answers
+   from the shared copy, what it sends when an event is dragged between
    calendars, how it treats `write` without `bind` and `unbind`, and what
    it does with a view grantee's colour change, which upstream refuses
    (`PROPPATCH` needs `Modify`). Recommendation: checklist items, no code.
 9. **A grant's request time** on a large calendar (3.5): measure the
    conversion on a calendar of a few thousand events and state the figure
    in api.md.
-10. **The pin a grant requires** (4.3): either source (chosen), or only a
-    `confirmed` pin from `contacts/pin`, which would make every grant
-    follow an out-of-band comparison. Jay's decision; recommendation:
-    either source, with the list showing the pin's source so the page can
-    suggest confirming first.
-11. **The single-parent rule's product limits** (5.6): refused event
-    `COPY` into or out of a shared calendar and refused collection `COPY`
-    and `MOVE` of one. Jay's decision whether they are acceptable;
-    recommendation: yes, pending the real-device check's finding of what
-    Apple sends when an event is dragged between calendars.
+10. **The fan-out's event account** (6.2): `za_fan_out`
+    (`crates/groupware/src/calendar/fanout.rs`) today derives everything
+    from `sender: &AccountInfo` and `keys`; a delegated write needs the
+    event's account (the owner's) passed beside them, for the source
+    document (`ZaSource`), the UID lease fence of a create, the SEQUENCE
+    reconciliation's stored values and the statuses written back into the
+    owner's event, while the pins, the private key and `changed_by` stay
+    the sender's. The parameter's name and the call sites (`update.rs`,
+    `delete.rs`, the calendar `DELETE` per event) are planning's; the
+    owner's and a plain writer's calls pass their own account.
+11. **The drain's delegated branch** (6.2): where the step-2 check reads
+    the owner's UID index, archives and `acls` (keyless store reads of
+    another account, beside the existing quiet address lookup), how it
+    reads the owner account's UID lease for a create in flight (the lease
+    key of release 2 section 6.3, read without taking it), and the `SENT-BY`
+    parsing (a `mailto:` URI, compared after key pinning section 4.3's
+    normalization).
 12. **Per-user colour and order for Apple's namespace**, a later
     refinement: release 4 keeps upstream's shared dead properties (1.2).
     Giving each principal its own `calendar-color` and `calendar-order`
@@ -1964,21 +2098,25 @@ stands unless the code says otherwise.
     caller's set on the shared one; and a decision whether a view grantee,
     which lacks `Modify`, may write its own set. It invents behaviour
     upstream does not have, so it waits for a product reason.
+13. **Replies to a grantee-organized event**, a later refinement: the
+    drain could look a REPLY's UID up, after the session's own account,
+    in the calendars shared to the session's account with edit, and merge
+    it into the event there under that calendar's CK, so that a grantee
+    organizing under its own address from the owner's calendar receives its
+    attendees' answers (6.2, point 4). Release 4 keeps upstream's lookup in
+    the recipient's own account.
 
 ### 13.2 Alternatives considered
 
-- **Delegate-send.** A grantee organizes events in the shared calendar
-  under its own address, and replies are routed into the shared calendar
-  by a drain lookup across the calendars the grantee holds a CK for.
-  Rejected for release 4. It needs the drain's `find_event` (which looks up
-  a UID only in the recipient's own account) to search other accounts'
-  shared calendars with their CKs; the `changed_by` rule (an item's
-  ORGANIZER must resolve to its `changed_by` principal) kept, or given a
-  `SENT-BY` allowance; the fan-out to seal the organizer's copy into a
-  calendar the writer does not own while pinning and leasing as the
-  writer; a decision on whose UID lease and SEQUENCE floor govern an event
-  two accounts can organize; and token pairs kept in a calendar the
-  organizer does not own, readable by every CK holder.
+- **Refusing a grantee's scheduling writes** (revision 2's rule): a
+  grantee's write that touched an ORGANIZER or a protected ATTENDEE line,
+  or that upstream would announce, answered 412
+  `allowed-organizer-scheduling-object-change`, so only the owner ever
+  organized from a shared calendar. Not taken: it refused what upstream
+  allows an edit grantee, which is what users expect of a shared calendar.
+  What it saved is what delegate sending costs: the fan-out's event-account
+  parameter, the drain's delegated sender check with its keyless reads of
+  the owner's account, the `SENT-BY` placement, and their tests.
 - **Groups through a group keypair** (the sketch's section 6): a group
   private key wrapped to each member and rewrapped by a member session on
   every membership change, since the server cannot do it alone. A feature
@@ -2047,9 +2185,18 @@ Merge hotspots this release adds (fork insertions in upstream files):
   assisted-discovery block);
   `crates/dav/src/calendar/{update,delete,proppatch,copy_move,get,mkcol,
   freebusy}.rs` (the resolver at each re-check, the calendar assertion, the
-  412 refusal in `update.rs` and `delete.rs`, the single-parent rule and
-  the rewrap in `copy_move.rs`, the cache invalidation after a shared
-  calendar's `DELETE` in `delete.rs`).
+  single-parent rule and the rewrap in `copy_move.rs`, the cache
+  invalidation after a shared calendar's `DELETE` in `delete.rs`). In
+  `update.rs` and `delete.rs` the fan-out calls now pass the event's
+  account beside the writer's `account_info` and keys (6.2).
+- `crates/groupware/src/calendar/fanout.rs` (fork-owned: the event-account
+  parameter, the `SENT-BY` placement, no withheld entries for a delegated
+  fan-out) and `crates/groupware/src/calendar/drain.rs` (fork-owned: the
+  delegated branch of the step-2 sender check). The delegate path depends
+  on `scheduling_account_info`'s merged addresses (the writer's first, then
+  the owner's), on the drain's step-2 rule that an item's ORGANIZER or
+  acting ATTENDEE resolves to `changed_by`, and on `changed_by` being the
+  writer in every item the fan-out writes.
 - `crates/common/src/auth/access_token.rs`, already a hotspot: the
   token-build loop's drop of `access_to` entries whose account no longer
   exists (8.6), beside its stripping of a key account's mailboxes.
@@ -2064,13 +2211,14 @@ Merge hotspots this release adds (fork insertions in upstream files):
 Upstream code the design depends on without editing it, to re-read when a
 merge touches it:
 
-- The scheduling decision the 412 rule's second test reuses:
-  `itip_create`, `itip_update`, `itip_cancel` and
-  `ItipSendStatus::resolve`, and `scheduling_account_info`'s merged
-  address list (`crates/common/src/cache/principals.rs`), which also
-  defines a local address for the first test; a change to when they return
-  messages, or to which parameters upstream itself writes on ATTENDEE
-  lines, changes what a grantee may store.
+- The scheduling decision delegate sending mirrors: `itip_create`,
+  `itip_update`, `itip_cancel` and `ItipSendStatus::resolve`, and
+  `scheduling_account_info`'s merged address list
+  (`crates/common/src/cache/principals.rs:813-833`); a change to who
+  counts as local, or to when they return messages, changes what a grantee
+  sends in the owner's name. Upstream's iMIP sender resolution
+  (`crates/services/src/task_manager/imip.rs`) is the behaviour mirrored
+  for plain accounts and is not on the key path.
 - In-account `COPY` and collection `COPY`, which add names to one document
   (`copy_event`, `copy_container`), and `DestroyArchive::delete_za`'s
   unlink of a document with several names: the single-parent rule exists
