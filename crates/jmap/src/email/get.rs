@@ -15,6 +15,7 @@ use email::{
             ArchivedMetadataPartType, MESSAGE_HAS_ATTACHMENT, MESSAGE_RECEIVED_MASK,
             MessageMetadata, MetadataHeaderName, PART_ENCODING_PROBLEM,
         },
+        za::view::{ZaMailView, za_readable},
     },
 };
 use jmap_proto::{
@@ -25,7 +26,7 @@ use jmap_proto::{
 };
 use jmap_tools::{Key, Map, Value};
 use mail_parser::HeaderValue;
-use std::future::Future;
+use std::{borrow::Cow, future::Future};
 use store::{
     ValueKey,
     write::{AlignedBytes, Archive},
@@ -149,6 +150,23 @@ impl EmailGet for Server {
                 break;
             }
         }
+        // Mail spec 7: the account's keys, once for the request. Only these
+        // properties are served without the message's content (from the
+        // cache and the stored stub's visible fields, whose blob hash is the
+        // view's); any other opens the stub.
+        let keys = self.za_mail_keys(access_token, account_id).await?;
+        let needs_content = !properties.iter().all(|property| {
+            matches!(
+                property,
+                EmailProperty::Id
+                    | EmailProperty::ThreadId
+                    | EmailProperty::BlobId
+                    | EmailProperty::MailboxIds
+                    | EmailProperty::Keywords
+                    | EmailProperty::Size
+                    | EmailProperty::ReceivedAt
+            )
+        });
 
         for id in ids {
             // Obtain the email object
@@ -172,7 +190,27 @@ impl EmailGet for Server {
                     continue;
                 }
             };
-            let metadata = metadata_
+            // Mail spec 7, 10: the unsealed view, when the properties read
+            // content; an unreadable message is not found.
+            let view = if needs_content {
+                let Some(view) = za_readable(
+                    self.za_metadata_view(
+                        &metadata_,
+                        keys.as_deref(),
+                        account_id,
+                        id.document_id(),
+                    )
+                    .await,
+                )?
+                else {
+                    response.push_not_found(id);
+                    continue;
+                };
+                view
+            } else {
+                Cow::Borrowed(&metadata_)
+            };
+            let metadata = view
                 .unarchive::<MessageMetadata>()
                 .caused_by(trc::location!())?;
 
@@ -190,10 +228,31 @@ impl EmailGet for Server {
             let raw_body;
             let mut raw_message = ChainedBytes::new(metadata.raw_headers.as_ref());
             if needs_body {
-                raw_body = self
+                raw_body = match self
                     .blob_store()
                     .get_blob(blob_hash.as_slice(), 0..usize::MAX)
-                    .await?;
+                    .await?
+                {
+                    // Mail spec 7, 10: the opened blob (a view opened a stub).
+                    Some(bytes) => {
+                        let Some(bytes) = za_readable(
+                            self.za_open_message_blob(
+                                matches!(view, Cow::Owned(_)),
+                                keys.as_deref(),
+                                account_id,
+                                id.document_id(),
+                                bytes,
+                            )
+                            .await,
+                        )?
+                        else {
+                            response.push_not_found(id);
+                            continue;
+                        };
+                        Some(bytes)
+                    }
+                    None => None,
+                };
 
                 if let Some(raw_body) = &raw_body {
                     raw_message.append(

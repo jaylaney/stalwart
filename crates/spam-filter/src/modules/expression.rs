@@ -5,13 +5,15 @@
  */
 
 use common::{
+    Server,
     config::mailstore::spamfilter::*,
-    expr::{StringCow, Variable, functions::ResolveVariable},
+    expr::{StringCow, Variable, functions::ResolveVariable, if_block::IfBlock},
 };
 use compact_str::{CompactString, ToCompactString, format_compact};
 use mail_parser::{Header, HeaderValue};
 use nlp::tokenizers::types::TokenType;
 use registry::schema::enums::ExpressionVariable;
+use std::future::Future;
 
 use crate::{Recipient, SpamFilterContext, TextPart, analysis::url::UrlParts};
 
@@ -27,6 +29,33 @@ impl<'x, T: ResolveVariable> SpamFilterResolver<'x, T> {
             ctx,
             item,
             location,
+        }
+    }
+}
+
+/// Mail spec 10: `eval_if` of a rule on a message, without the trace of its
+/// result (which can echo a header, the body or an address) for a key
+/// account's message (`SpamFilterInput::za_redact`).
+pub(crate) trait SpamFilterEval: Sync + Send {
+    fn spam_eval_if<'x, R: TryFrom<Variable<'x>>, T: ResolveVariable>(
+        &'x self,
+        if_block: &'x IfBlock,
+        resolver: &'x SpamFilterResolver<'_, T>,
+        session_id: u64,
+    ) -> impl Future<Output = Option<R>> + Send;
+}
+
+impl SpamFilterEval for Server {
+    async fn spam_eval_if<'x, R: TryFrom<Variable<'x>>, T: ResolveVariable>(
+        &'x self,
+        if_block: &'x IfBlock,
+        resolver: &'x SpamFilterResolver<'_, T>,
+        session_id: u64,
+    ) -> Option<R> {
+        if resolver.ctx.input.za_redact {
+            self.za_eval_if(if_block, resolver, session_id).await
+        } else {
+            self.eval_if(if_block, resolver, session_id).await
         }
     }
 }

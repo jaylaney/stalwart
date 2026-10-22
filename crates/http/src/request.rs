@@ -24,6 +24,7 @@ use common::{
     ipc::PushEvent,
     manager::application::Resource,
     network::{SessionData, SessionManager, SessionStream},
+    za::{ZA_MAIL_KEYLESS, ZA_TRACE_MAIL_KEYLESS, mail::za_is_keyless_refusal},
 };
 use dav::{DavMethod, request::DavRequestHandler};
 use groupware::DavResourceName;
@@ -47,7 +48,10 @@ use jmap::{
     blob::{download::BlobDownload, upload::BlobUpload},
     websocket::upgrade::WebSocketUpgrade,
 };
-use jmap_proto::request::{Request, capability::Session};
+use jmap_proto::{
+    error::request::RequestError,
+    request::{Request, capability::Session},
+};
 // SPDX-SnippetBegin
 // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
 // SPDX-License-Identifier: LicenseRef-SEL
@@ -200,7 +204,14 @@ impl ParseHttp for Server {
                             path.next().and_then(BlobId::from_base32),
                             path.next(),
                         ) {
-                            return match self.blob_download(&blob_id, &access_token).await? {
+                            // Ruling R30: the keyless refusal answers 403.
+                            let blob = match self.blob_download(&blob_id, &access_token).await {
+                                Err(err) if za_is_keyless_refusal(&err) => {
+                                    return Ok(za_keyless_response());
+                                }
+                                blob => blob?,
+                            };
+                            return match blob {
                                 Some(blob) => Ok(DownloadResponse {
                                     filename: name.to_string(),
                                     content_type: req
@@ -225,6 +236,20 @@ impl ParseHttp for Server {
                             self.authenticate_headers(&req, &session).await?;
 
                         if let Some(account_id) = path.next().and_then(|p| Id::from_str(p).ok()) {
+                            // Mail spec 4, 5.7: an upload into a key account
+                            // is sealed with its keys; a token without them
+                            // is refused before the body is read.
+                            if self.za_is_key_account(account_id.document_id()).await?
+                                && access_token.za_keys_for(account_id.document_id()).is_none()
+                            {
+                                trc::event!(
+                                    Security(SecurityEvent::Unauthorized),
+                                    SpanId = session.session_id,
+                                    AccountId = account_id.document_id(),
+                                    Details = ZA_TRACE_MAIL_KEYLESS,
+                                );
+                                return Ok(za_keyless_response());
+                            }
                             if za_jmap_untraced(self, access_token.account_id()).await {
                                 return match fetch_body_untraced(
                                     &mut req,
@@ -1041,6 +1066,15 @@ impl SessionManager for HttpSessionManager {
 /// withhold when in doubt.
 async fn za_jmap_untraced(server: &Server, account_id: u32) -> bool {
     server.za_is_key_account(account_id).await.unwrap_or(true)
+}
+
+/// Mail spec 4, 10, ruling R30: the answer to an upload or a download of a
+/// key account's mail without its keys, 403 with `ZA_MAIL_KEYLESS`, where
+/// upstream answers a JMAP error outside a method call as 400.
+fn za_keyless_response() -> HttpResponse {
+    RequestError::blank(StatusCode::FORBIDDEN.as_u16(), "Forbidden", ZA_MAIL_KEYLESS)
+        .into_http_response()
+        .with_untraced_body()
 }
 
 #[cfg(test)]

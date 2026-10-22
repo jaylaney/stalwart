@@ -4,11 +4,15 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use crate::email::za::za_refuse_snippet_terms;
 use common::{Server, auth::AccessToken};
 use email::{
     cache::{MessageCacheFetch, email::MessageCacheAccess},
-    message::metadata::{
-        ArchivedMetadataPartType, DecodedPartContent, MessageMetadata, MetadataHeaderName,
+    message::{
+        metadata::{
+            ArchivedMetadataPartType, DecodedPartContent, MessageMetadata, MetadataHeaderName,
+        },
+        za::view::{ZaMailView, za_readable},
     },
 };
 use jmap_proto::{
@@ -21,7 +25,7 @@ use jmap_proto::{
 };
 use mail_parser::decoders::html::html_to_text;
 use nlp::language::{Language, search_snippet::generate_snippet, stemmer::Stemmer};
-use std::future::Future;
+use std::{borrow::Cow, future::Future};
 use store::{
     ValueKey,
     backend::MAX_TOKEN_LENGTH,
@@ -45,6 +49,11 @@ impl EmailSearchSnippet for Server {
         request: GetSearchSnippetRequest,
         access_token: &AccessToken,
     ) -> trc::Result<GetSearchSnippetResponse> {
+        // Mail spec 8: snippets mark terms in sealed content, which a search
+        // cannot find; a key account's request carrying a text, subject or
+        // body property is refused before any message is read, whatever the
+        // property tokenises to.
+        za_refuse_snippet_terms(self, request.account_id.document_id(), &request.filter).await?;
         let mut filter_stack = vec![];
         let mut include_term = true;
         let mut terms = vec![];
@@ -115,6 +124,15 @@ impl EmailSearchSnippet for Server {
         if email_ids.len() > self.core.jmap.snippet_max_results {
             return Err(trc::JmapEvent::RequestTooLarge.into_err());
         }
+        // Mail spec 7, 8: the account's keys, once for the request; without
+        // terms nothing is read. Defence in depth: a key account's request
+        // with terms is refused above, so this branch and the sealed reads
+        // below are unreachable for one.
+        let keys = if terms.is_empty() {
+            None
+        } else {
+            self.za_mail_keys(access_token, account_id).await?
+        };
 
         for email_id in email_ids {
             let email_id = match email_id {
@@ -153,7 +171,17 @@ impl EmailSearchSnippet for Server {
                     continue;
                 }
             };
-            let metadata = metadata_
+            // Mail spec 7, 10: the unsealed view; an unreadable message is
+            // not found.
+            let Some(view) = za_readable(
+                self.za_metadata_view(&metadata_, keys.as_deref(), account_id, document_id)
+                    .await,
+            )?
+            else {
+                not_found.push(MaybeInvalid::Value(email_id));
+                continue;
+            };
+            let metadata = view
                 .unarchive::<MessageMetadata>()
                 .caused_by(trc::location!())?;
 
@@ -174,6 +202,20 @@ impl EmailSearchSnippet for Server {
                 .get_blob(metadata.blob_hash.0.as_slice(), 0..usize::MAX)
                 .await?
             {
+                let Some(raw_body) = za_readable(
+                    self.za_open_message_blob(
+                        matches!(view, Cow::Owned(_)),
+                        keys.as_deref(),
+                        account_id,
+                        document_id,
+                        raw_body,
+                    )
+                    .await,
+                )?
+                else {
+                    not_found.push(MaybeInvalid::Value(email_id));
+                    continue;
+                };
                 raw_body
             } else {
                 trc::event!(

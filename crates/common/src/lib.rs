@@ -284,6 +284,9 @@ pub struct HttpAuthCache {
     pub expires: Instant,
     /// Authentication generation at verification time; 0 for non-key accounts.
     pub generation: u64,
+    /// Mail ruling R35: the credential is an impersonation's, whose token is
+    /// marked on every hit; an account's own credential never is.
+    pub za_impersonated: bool,
 }
 
 impl Caches {

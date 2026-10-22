@@ -11,7 +11,23 @@ impl IndexDocument {
         Self {
             fields: Default::default(),
             index,
+            assert_absent: None,
         }
+    }
+
+    /// Zero-access fork (mail ruling R58): the internal search store writes
+    /// the document only while `class` of (`account_id`, `collection`,
+    /// `document_id`) is absent, asserted in the document's first commit
+    /// chunk, the one that holds its `Document` key.
+    pub fn with_assert_absent(
+        mut self,
+        account_id: u32,
+        collection: Collection,
+        document_id: u32,
+        class: impl Into<ValueClass>,
+    ) -> Self {
+        self.assert_absent = Some((account_id, collection, document_id, class.into()));
+        self
     }
 
     pub fn with_account_id(mut self, account_id: u32) -> Self {

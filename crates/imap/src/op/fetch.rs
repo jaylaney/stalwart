@@ -10,13 +10,16 @@ use crate::{
     spawn_op,
 };
 use ahash::AHashMap;
-use common::{network::SessionStream, storage::index::ObjectIndexBuilder};
+use common::{network::SessionStream, storage::index::ObjectIndexBuilder, za::ZA_MAIL_UNREADABLE};
 use email::{
     cache::{MessageCacheFetch, email::MessageCacheAccess},
-    message::metadata::{
-        ArchivedMessageMetadata, ArchivedMessageMetadataContents, ArchivedMetadataHeaderValue,
-        ArchivedMetadataPartType, DecodedParts, MESSAGE_RECEIVED_MASK, MessageData,
-        MessageMetadata, MetadataHeaderName, PART_ENCODING_PROBLEM,
+    message::{
+        metadata::{
+            ArchivedMessageMetadata, ArchivedMessageMetadataContents, ArchivedMetadataHeaderValue,
+            ArchivedMetadataPartType, DecodedParts, MESSAGE_RECEIVED_MASK, MessageData,
+            MessageMetadata, MetadataHeaderName, PART_ENCODING_PROBLEM,
+        },
+        za::view::{ZaMailView, za_readable},
     },
 };
 use imap_proto::{
@@ -354,6 +357,35 @@ impl<T: SessionStream> SessionData<T> {
             .get_cached_messages(account_id)
             .await
             .imap_ctx(&arguments.tag, trc::location!())?;
+        let mut unreadable = false;
+        // Only these attributes are served without the message's content
+        // (from the cache and the stored stub's visible fields); any other
+        // opens the stub.
+        let needs_content = !arguments.attributes.iter().all(|attribute| {
+            matches!(
+                attribute,
+                Attribute::Flags
+                    | Attribute::Uid
+                    | Attribute::InternalDate
+                    | Attribute::Rfc822Size
+                    | Attribute::ModSeq
+                    | Attribute::ObjectId
+            )
+        });
+        // The content-free path borrows the stored stub: no attribute that
+        // reads the blob may take it.
+        debug_assert!(!needs_blobs || needs_content);
+        // Mail spec 7, ruling R33: the account's keys, once for the command,
+        // only when an attribute reads content; the owner's session opened
+        // before its account was provisioned holds none and reads flags.
+        let keys = if needs_content {
+            self.server
+                .za_mail_keys(&self.access_token, account_id)
+                .await
+                .map_err(|err| err.id(arguments.tag.clone()))?
+        } else {
+            None
+        };
 
         for (seqnum, uid, id) in ids {
             // Obtain attributes and keywords
@@ -382,7 +414,24 @@ impl<T: SessionStream> SessionData<T> {
                 );
                 continue;
             };
-            let metadata = metadata_
+            // Mail spec 7, 10: the unsealed view, when the attributes read
+            // content; an unreadable message is skipped.
+            let view = if needs_content {
+                let Some(view) = za_readable(
+                    self.server
+                        .za_metadata_view(&metadata_, keys.as_deref(), account_id, id)
+                        .await,
+                )
+                .imap_ctx(&arguments.tag, trc::location!())?
+                else {
+                    unreadable = true;
+                    continue;
+                };
+                view
+            } else {
+                Cow::Borrowed(&metadata_)
+            };
+            let metadata = view
                 .unarchive::<MessageMetadata>()
                 .imap_ctx(&arguments.tag, trc::location!())?;
             let raw_body;
@@ -391,12 +440,35 @@ impl<T: SessionStream> SessionData<T> {
             let mut raw_message = ChainedBytes::new(metadata.raw_headers.as_ref());
             if needs_blobs {
                 // Retrieve raw message if needed
-                raw_body = self
+                raw_body = match self
                     .server
                     .blob_store()
                     .get_blob(metadata.blob_hash.0.as_slice(), 0..usize::MAX)
                     .await
-                    .imap_ctx(&arguments.tag, trc::location!())?;
+                    .imap_ctx(&arguments.tag, trc::location!())?
+                {
+                    // Mail spec 7, 10: the opened blob (a view opened a stub).
+                    Some(bytes) => {
+                        let Some(bytes) = za_readable(
+                            self.server
+                                .za_open_message_blob(
+                                    matches!(view, Cow::Owned(_)),
+                                    keys.as_deref(),
+                                    account_id,
+                                    id,
+                                    bytes,
+                                )
+                                .await,
+                        )
+                        .imap_ctx(&arguments.tag, trc::location!())?
+                        else {
+                            unreadable = true;
+                            continue;
+                        };
+                        Some(bytes)
+                    }
+                    None => None,
+                };
 
                 if let Some(raw_body) = &raw_body {
                     raw_message.append(
@@ -639,11 +711,18 @@ impl<T: SessionStream> SessionData<T> {
             AccountId = account_id,
             MailboxId = mailbox.id.mailbox_id,
             DocumentId = fetched_ids,
-            Details = arguments
-                .attributes
-                .iter()
-                .map(|c| trc::Value::from(format!("{c:?}")))
-                .collect::<Vec<_>>(),
+            // Mail spec 10: the attributes name the headers a key account
+            // requested.
+            Details = if self.za_key_session() {
+                trc::Value::redacted()
+            } else {
+                arguments
+                    .attributes
+                    .iter()
+                    .map(|c| trc::Value::from(format!("{c:?}")))
+                    .collect::<Vec<_>>()
+                    .into()
+            },
             Elapsed = op_start.elapsed()
         );
 
@@ -655,6 +734,13 @@ impl<T: SessionStream> SessionData<T> {
                     .into_bytes(),
             )
             .await?;
+        }
+
+        // Mail spec 10: the command ends NO after the messages it served.
+        if unreadable {
+            return Ok(StatusResponse::no(ZA_MAIL_UNREADABLE)
+                .with_code(ResponseCode::ServerBug)
+                .with_tag(arguments.tag));
         }
 
         let response = StatusResponse::completed(Command::Fetch(is_uid)).with_tag(arguments.tag);

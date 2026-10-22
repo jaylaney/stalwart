@@ -10,6 +10,7 @@ use common::{
     auth::{AccessToken, AccountCache},
     storage::index::ObjectIndexBuilder,
 };
+use email::message::za::view::ZaMailView;
 use email::sieve::{
     ArchivedSieveScript, SieveScript, delete::SieveScriptDelete, ingest::SieveScriptIngest,
 };
@@ -517,6 +518,15 @@ impl SieveScriptSet for Server {
             if update.as_ref().is_none_or( |(document_id, _)| {
                 !matches!(blob_id.class, BlobClass::Linked { account_id, collection, document_id: d } if account_id == ctx.account_id && collection == u8::from(Collection::SieveScript) && *document_id == d)
             }) {
+                // Mail spec 5.7, ruling R32 (amended): a key account's message or
+                // section never becomes a script; its upload is read through
+                // `blob_download`, opened with the request's keys.
+                if matches!(
+                    blob_id.class,
+                    BlobClass::Linked { collection, .. } if collection == u8::from(Collection::Email)
+                ) {
+                    self.za_refuse_raw_source(&blob_id).await?;
+                }
                 // Check access
                 if let Some(mut bytes) = self.blob_download(&blob_id, ctx.access_token).await? {
                     // Check quota

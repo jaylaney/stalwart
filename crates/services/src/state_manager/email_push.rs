@@ -64,6 +64,15 @@ pub async fn build_email_push_object(
     config: &EmailPush,
     max_size: usize,
 ) -> trc::Result<Option<(Value<'static, EmailProperty, EmailValue>, usize)>> {
+    // Mail spec 7: no content leaves a key account in a push (the manager
+    // already sends its state changes only).
+    if server
+        .za_is_key_account(account_id)
+        .await
+        .caused_by(trc::location!())?
+    {
+        return Ok(None);
+    }
     let properties = &config.properties;
     let Some(data) = server
         .store()

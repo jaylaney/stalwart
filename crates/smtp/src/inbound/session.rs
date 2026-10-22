@@ -492,6 +492,7 @@ impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
         self.data.delivery_by = 0;
         self.data.future_release = 0;
         self.data.rcpt_oks = 0;
+        self.data.za_key_rcpt = false;
     }
 
     pub fn reset_tls(&mut self) {
@@ -553,7 +554,12 @@ impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
                     Size = len,
                     Contents = if answers_334
                         || is_auth_input(&mut self.state, bytes.get(0..len).unwrap_or_default())
-                    {
+                        || self.data.za_key_sender()
+                        || is_data_input(
+                            &mut self.state,
+                            bytes.get(0..len).unwrap_or_default(),
+                            self.data.za_key_rcpt,
+                        ) {
                         trc::Value::redacted()
                     } else {
                         String::from_utf8_lossy(bytes.get(0..len).unwrap_or_default())
@@ -673,14 +679,104 @@ fn is_auth_input(state: &mut State, bytes: &[u8]) -> bool {
 /// a form feed included) occurs anywhere, in any case, ignoring CRs as the
 /// command parser does. A false positive only masks a read.
 fn has_auth_command<'x>(bytes: impl Iterator<Item = &'x u8>) -> bool {
+    has_command(bytes, b"AUTH")
+}
+
+/// Mail spec 10: whether a read may carry a key-account recipient's message
+/// content. With such a recipient (`key_rcpt`), the session is in the DATA or
+/// BDAT phase, or the read, joined to the unparsed start of the current
+/// request line, holds a DATA or BDAT command (a BDAT chunk can follow its
+/// command in one read). Ruling R41: the same read joined to the same start,
+/// also holding an RCPT command not yet processed, is masked for every
+/// account, as the recipient is unknown when the read is traced (an AUTH is
+/// masked for the same reason, issue #20).
+fn is_data_input(state: &mut State, bytes: &[u8], key_rcpt: bool) -> bool {
+    let partial: &[u8] = match state {
+        State::Data(_) | State::Bdat(_) | State::SkipData(..) if key_rcpt => return true,
+        State::Request(receiver) => receiver.buf(),
+        _ => &[],
+    };
+    let joined = partial.iter().chain(bytes);
+    has_data_command(joined.clone()) && (key_rcpt || has_command(joined, b"RCPT"))
+}
+
+/// Whether a DATA or a BDAT command occurs, as `has_command` finds one.
+fn has_data_command<'x>(bytes: impl Iterator<Item = &'x u8> + Clone) -> bool {
+    has_command(bytes.clone(), b"DATA") || has_command(bytes, b"BDAT")
+}
+
+/// Whether `command` (no proper prefix of which is also its suffix) followed by
+/// ASCII whitespace (the parser's stop characters, a form feed and the line
+/// end included) occurs anywhere, in any case, ignoring CRs as the command
+/// parser does: the parser can start a request mid-line, after a BDAT chunk.
+/// A false positive only masks a read.
+fn has_command<'x>(bytes: impl Iterator<Item = &'x u8>, command: &[u8; 4]) -> bool {
     let mut matched = 0;
     for &ch in bytes.filter(|&&ch| ch != b'\r') {
         matched = match ch {
             _ if matched == 4 && ch.is_ascii_whitespace() => return true,
-            _ if matched < 4 && ch.eq_ignore_ascii_case(&b"AUTH"[matched]) => matched + 1,
-            b'a' | b'A' => 1,
+            _ if matched < 4 && ch.eq_ignore_ascii_case(&command[matched]) => matched + 1,
+            _ if ch.eq_ignore_ascii_case(&command[0]) => 1,
             _ => 0,
         };
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{has_data_command, is_data_input};
+    use crate::core::State;
+
+    #[test]
+    fn has_data_command_finds_data_and_bdat() {
+        for bytes in [
+            &b"DATA\r\n"[..],
+            b"bdat 12\r\nxx",
+            b"RCPT TO:<a@b>\r\nDATA\r\n",
+            b" data\n",
+            b"DATA \r\n",
+            b"DATA\t\r\n",
+            b"DATA\x0c\r\n",
+            b"DA\rTA\r\n",
+            b"BDAT\x0c12 LAST\r\n",
+            b"BD\rAT 12 LAST\r\n",
+            // A DATA starting mid-line, after a parameter error.
+            b"MAIL FROM:<a@b> SIZE=xDATA\r\n",
+            // Matched anywhere: after a BDAT chunk the parser starts a request
+            // mid-word (`BDAT 2\r\nUPDATA\r\n` is the chunk `UP`, then DATA).
+            b"UPDATA\r\n",
+        ] {
+            assert!(
+                has_data_command(bytes.iter()),
+                "{:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+        for bytes in [&b"RCPT TO:<data@b>\r\n"[..], b"DATAX\r\n", b"NOOP\r\n"] {
+            assert!(
+                !has_data_command(bytes.iter()),
+                "{:?}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn has_data_command_masks_an_unclassified_recipient() {
+        let pipelined = b"RCPT TO:<a@b>\r\nBDAT 3 LAST\r\nabc";
+        // Ruling R41: masked whether or not a key recipient is known.
+        assert!(is_data_input(&mut State::default(), pipelined, false));
+        assert!(is_data_input(&mut State::default(), pipelined, true));
+        // A chunk without a pipelined recipient: masked for a key recipient.
+        let chunk = b"BDAT 3 LAST\r\nabc";
+        assert!(!is_data_input(&mut State::default(), chunk, false));
+        assert!(is_data_input(&mut State::default(), chunk, true));
+        // An envelope command alone is traced.
+        assert!(!is_data_input(
+            &mut State::default(),
+            b"RCPT TO:<a@b>\r\n",
+            true
+        ));
+    }
 }

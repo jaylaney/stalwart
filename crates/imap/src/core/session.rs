@@ -241,11 +241,13 @@ impl<T: SessionStream> Session<T> {
             Imap(trc::ImapEvent::RawOutput),
             SpanId = self.session_id,
             Size = bytes.len(),
-            Contents = if matches!(self.state, State::NotAuthenticated { .. }) {
-                trc::Value::redacted()
-            } else {
-                trc::Value::from_maybe_string(bytes)
-            },
+            // Mail spec 10: a key account's session is masked throughout.
+            Contents =
+                if matches!(self.state, State::NotAuthenticated { .. }) || self.za_key_session() {
+                    trc::Value::redacted()
+                } else {
+                    trc::Value::from_maybe_string(bytes)
+                },
         );
 
         let mut stream = self.stream_tx.lock().await;
@@ -280,18 +282,27 @@ impl<T: SessionStream> Session<T> {
     }
 
     /// Issue #20: before authentication a syntax error can quote client
-    /// input (a SASL response parsed as a tag), so its trace redacts it. The
-    /// errors that quote input are the BAD ones (`Error::err`, `bad`,
-    /// `into_parse_error`); static diagnostics stay readable.
+    /// input (a SASL response parsed as a tag), so its trace redacts it; mail
+    /// spec 10: so does a key account's session, throughout.
     fn traced_error(&self, err: trc::Error) -> trc::Error {
-        if matches!(self.state, State::NotAuthenticated { .. })
-            && err.matches(trc::EventType::Imap(trc::ImapEvent::Error))
-            && err.value_as_str(trc::Key::Type) == Some("BAD")
-        {
-            err.redact(&[trc::Key::Details, trc::Key::Id])
+        if matches!(self.state, State::NotAuthenticated { .. }) || self.za_key_session() {
+            redact_bad(err)
         } else {
             err
         }
+    }
+}
+
+/// The errors that quote client input are the BAD ones (`Error::err`, `bad`,
+/// `into_parse_error`): their traces redact it. Static diagnostics stay
+/// readable.
+fn redact_bad(err: trc::Error) -> trc::Error {
+    if err.matches(trc::EventType::Imap(trc::ImapEvent::Error))
+        && err.value_as_str(trc::Key::Type) == Some("BAD")
+    {
+        err.redact(&[trc::Key::Details, trc::Key::Id])
+    } else {
+        err
     }
 }
 
@@ -303,7 +314,12 @@ impl<T: SessionStream> super::SessionData<T> {
             Imap(trc::ImapEvent::RawOutput),
             SpanId = self.session_id,
             Size = bytes.len(),
-            Contents = trc::Value::from_maybe_string(bytes),
+            // Mail spec 10: a key account's session is masked throughout.
+            Contents = if self.za_key_session() {
+                trc::Value::redacted()
+            } else {
+                trc::Value::from_maybe_string(bytes)
+            },
         );
 
         let mut stream = self.stream_tx.lock().await;
@@ -321,11 +337,21 @@ impl<T: SessionStream> super::SessionData<T> {
     pub async fn write_error(&self, err: trc::Error) -> trc::Result<()> {
         if err.should_write_err() {
             let bytes = err.serialize();
-            trc::error!(err.span_id(self.session_id));
+            trc::error!(self.traced_error(err).span_id(self.session_id));
             self.write_bytes(bytes).await
         } else {
-            trc::error!(err.span_id(self.session_id));
+            trc::error!(self.traced_error(err).span_id(self.session_id));
             Ok(())
+        }
+    }
+
+    /// Mail spec 10: in a key account's session a BAD error is traced
+    /// redacted, as `Session::traced_error` traces one before authentication.
+    fn traced_error(&self, err: trc::Error) -> trc::Error {
+        if self.za_key_session() {
+            redact_bad(err)
+        } else {
+            err
         }
     }
 }

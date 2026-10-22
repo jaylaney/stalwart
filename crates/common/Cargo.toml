@@ -93,7 +93,7 @@ sd-notify = "0.5"
 socket2 = "0.6"
 
 [features]
-test_mode = []
+test_mode = ["store/test_mode"]
 dev_mode = []
 enterprise = []
 foundation = []

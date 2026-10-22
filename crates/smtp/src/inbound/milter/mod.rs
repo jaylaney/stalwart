@@ -30,6 +30,9 @@ pub struct MilterClient<T: AsyncRead + AsyncWrite> {
     flags_protocol: u32,
     id: ObjectId,
     session_id: u64,
+    /// Mail spec 10: the transaction's content is redacted from the write
+    /// and read traces (a key-account recipient or sender).
+    redact: bool,
 }
 
 #[derive(Debug)]

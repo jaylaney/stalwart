@@ -545,6 +545,12 @@ pub async fn test_data_check(test: &mut TestServer) {
         .unwrap();
         test.server.commit_batch(batch).await.unwrap();
     }
+    // The event's index task runs while the event exists: run after its
+    // deletion, it would retry the missing document for many seconds, and
+    // setup waits for it below (mail ruling R54). A direct batch does not
+    // wake the task queue.
+    test.server.notify_task_queue();
+    test.wait_for_tasks().await;
     let reply = za_post("setup", &body).await.expect(409);
     assert_eq!(reply["error"], "account already holds calendar data");
     {
@@ -574,7 +580,10 @@ pub async fn test_data_check(test: &mut TestServer) {
     }
 
     // 4. Sole untouched default calendar (document 2): the setup below
-    //    succeeds; the calendar is destroyed with the account.
+    //    succeeds once the stray event's unindex task has run (mail ruling
+    //    R54); the calendar is destroyed with the account.
+    test.server.notify_task_queue();
+    test.wait_for_tasks().await;
     let mut key6 = key6;
     key6.recovery_key = Some(za_setup("key6@example.com", &token, STRONG).await);
     admin.destroy_account(key6).await;

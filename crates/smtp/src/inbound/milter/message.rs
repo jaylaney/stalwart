@@ -39,6 +39,9 @@ impl<T: SessionStream> Session<T> {
             return Ok(Vec::new());
         }
 
+        // Mail spec 10: the milter is sent the plaintext (transit); its traces
+        // are redacted for a key account's transaction.
+        let za_redact = self.data.za_key_rcpt || self.data.za_key_sender();
         let mut modifications = Vec::new();
         for milter in milters {
             if !milter.run_on_stage.contains(&stage)
@@ -52,7 +55,7 @@ impl<T: SessionStream> Session<T> {
             }
 
             let time = Instant::now();
-            match self.connect_and_run(milter, message).await {
+            match self.connect_and_run(milter, message, za_redact).await {
                 Ok(new_modifications) => {
                     trc::event!(
                         Milter(MilterEvent::ActionAccept),
@@ -136,6 +139,17 @@ impl<T: SessionStream> Session<T> {
                         Error::TLSInvalidName => (MilterEvent::TlsInvalidName, trc::Value::None),
                         Error::Disconnected => (MilterEvent::Disconnected, trc::Value::None),
                     };
+                    // Mail spec 10: an invalid frame or an unexpected response
+                    // can carry a header the milter returned.
+                    let details = if za_redact
+                        && matches!(
+                            code,
+                            MilterEvent::FrameInvalid | MilterEvent::UnexpectedResponse
+                        ) {
+                        trc::Value::redacted()
+                    } else {
+                        details
+                    };
 
                     trc::event!(
                         Milter(code),
@@ -159,9 +173,10 @@ impl<T: SessionStream> Session<T> {
         &self,
         milter: &Milter,
         message: Option<&AuthenticatedMessage<'_>>,
+        za_redact: bool,
     ) -> Result<Vec<Modification>, Rejection> {
         // Build client
-        let client = MilterClient::connect(milter, self.data.session_id).await?;
+        let client = MilterClient::connect(milter, self.data.session_id, za_redact).await?;
         if !milter.tls {
             self.run(client, message).await
         } else {

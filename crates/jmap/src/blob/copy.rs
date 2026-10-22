@@ -5,7 +5,12 @@
  */
 
 use super::download::BlobDownload;
-use common::{Server, auth::AccessToken};
+use common::{
+    Server,
+    auth::AccessToken,
+    za::{ZA_TRACE_MAIL_COPY, mail::za_keyless_refusal},
+};
+use email::message::za::view::ZaMailView;
 use jmap_proto::{
     error::set::{SetError, SetErrorType},
     method::copy::{CopyBlobRequest, CopyBlobResponse},
@@ -39,6 +44,25 @@ impl BlobCopy for Server {
             not_copied: VecMap::new(),
         };
         let account_id = request.account_id.document_id();
+
+        // Mail spec 6.3, 9: no blob copy into or out of a key account.
+        for za_account_id in [account_id, request.from_account_id.document_id()] {
+            if self.za_is_key_account(za_account_id).await? {
+                trc::event!(
+                    Security(trc::SecurityEvent::Unauthorized),
+                    AccountId = za_account_id,
+                    Details = ZA_TRACE_MAIL_COPY,
+                );
+                return Err(za_keyless_refusal().account_id(za_account_id));
+            }
+        }
+        // Mail spec 5.7: never a sealed source's hash, whatever the accounts
+        // named; checked for every id before the first link is written.
+        for blob_id in &request.blob_ids {
+            if let MaybeInvalid::Value(blob_id) = blob_id {
+                self.za_refuse_raw_source(blob_id).await?;
+            }
+        }
 
         for blob_id in request.blob_ids {
             let blob_id = match blob_id {

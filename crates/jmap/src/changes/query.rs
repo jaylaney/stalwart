@@ -5,6 +5,7 @@
  */
 
 use super::get::ChangesLookup;
+use crate::email::za::za_refuse_content_query;
 use crate::{
     api::request::resolve_account_id, calendar_event::query::CalendarEventQuery,
     calendar_event_notification::query::CalendarEventNotificationQuery,
@@ -56,6 +57,15 @@ impl QueryChanges for Server {
                     )
                     .await?
                     .response;
+                // Mail spec 8: refused here as well, since an unchanged state
+                // returns below without running the query.
+                za_refuse_content_query(
+                    self,
+                    request.account_id.document_id(),
+                    &request.filter,
+                    request.sort.as_deref().unwrap_or_default(),
+                )
+                .await?;
                 let calculate_total = request.calculate_total.unwrap_or(false);
                 has_changes = changes.has_changes();
                 response = build_query_changes_response(&request, &changes);

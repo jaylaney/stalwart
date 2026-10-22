@@ -738,7 +738,7 @@ impl SpamClassifier for Server {
                 || !is_trusted_domain(
                     self,
                     email.element.email.domain_part.sld_or_default(),
-                    ctx.input.span_id,
+                    &ctx.input,
                 )
                 .await
             {
@@ -749,7 +749,7 @@ impl SpamClassifier for Server {
         // Add URLs
         for url in &ctx.output.urls {
             if let Some(url) = &url.element.url_parsed
-                && !is_trusted_domain(self, url.host.sld_or_default(), ctx.input.span_id).await
+                && !is_trusted_domain(self, url.host.sld_or_default(), &ctx.input).await
             {
                 if let Some(host) = &url.host.sld {
                     tokens.insert(Token::Url { value: host.into() });
@@ -788,7 +788,7 @@ impl SpamClassifier for Server {
                 let host = Hostname::new(&domain.element);
                 let host_sld = host.sld_or_default();
 
-                if !is_trusted_domain(self, host_sld, ctx.input.span_id).await {
+                if !is_trusted_domain(self, host_sld, &ctx.input).await {
                     if !host_sld.is_empty() && host_sld != host.fqdn {
                         tokens.insert(Token::Hostname {
                             value: host_sld.to_string().into(),

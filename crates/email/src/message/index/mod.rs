@@ -6,7 +6,7 @@
 
 use crate::{
     mailbox::{JUNK_ID, TRASH_ID},
-    message::metadata::{ArchivedMessageData, MessageData},
+    message::metadata::{ArchivedMessageData, MessageData, MessageMetadata},
 };
 use common::storage::index::{IndexItem, IndexValue, IndexableObject};
 use store::write::now;
@@ -107,5 +107,14 @@ pub(super) trait IndexMessage {
         blob_hash: BlobHash,
         data: MessageData,
         received_at: u64,
+    ) -> trc::Result<&mut Self>;
+
+    /// The blob link, `MessageData` and the metadata archive of
+    /// `index_message`, for a metadata archive built by the caller.
+    fn index_metadata(
+        &mut self,
+        tenant_id: Option<u32>,
+        metadata: MessageMetadata,
+        data: MessageData,
     ) -> trc::Result<&mut Self>;
 }

@@ -163,7 +163,11 @@ impl<T: SessionStream> Session<T> {
             Pop3(trc::Pop3Event::RawOutput),
             SpanId = self.session_id,
             Size = bytes.len(),
-            Contents = if mask || matches!(self.state, State::NotAuthenticated { .. }) {
+            // Mail spec 10: a key account's session is masked throughout.
+            Contents = if mask
+                || matches!(self.state, State::NotAuthenticated { .. })
+                || self.state.za_key_session()
+            {
                 trc::Value::redacted()
             } else {
                 trc::Value::from_maybe_string(bytes)

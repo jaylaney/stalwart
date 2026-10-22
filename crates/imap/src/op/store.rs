@@ -206,11 +206,17 @@ impl<T: SessionStream> SessionData<T> {
                 AccountId = mailbox.id.account_id,
                 MailboxId = mailbox.id.mailbox_id,
                 Type = format!("{:?}", arguments.operation),
-                Details = arguments
-                    .keywords
-                    .iter()
-                    .map(|c| trc::Value::from(format!("{c:?}")))
-                    .collect::<Vec<_>>(),
+                // Mail spec 10: a key account's keywords are its client's.
+                Details = if self.za_key_session() {
+                    trc::Value::redacted()
+                } else {
+                    arguments
+                        .keywords
+                        .iter()
+                        .map(|c| trc::Value::from(format!("{c:?}")))
+                        .collect::<Vec<_>>()
+                        .into()
+                },
                 Elapsed = op_start.elapsed()
             );
 
@@ -452,11 +458,17 @@ impl<T: SessionStream> SessionData<T> {
                 .map(|id| trc::Value::from(*id.0))
                 .collect::<Vec<_>>(),
             Type = format!("{:?}", arguments.operation),
-            Details = arguments
-                .keywords
-                .iter()
-                .map(|c| trc::Value::from(format!("{c:?}")))
-                .collect::<Vec<_>>(),
+            // Mail spec 10: a key account's keywords are its client's.
+            Details = if self.za_key_session() {
+                trc::Value::redacted()
+            } else {
+                arguments
+                    .keywords
+                    .iter()
+                    .map(|c| trc::Value::from(format!("{c:?}")))
+                    .collect::<Vec<_>>()
+                    .into()
+            },
             Elapsed = op_start.elapsed()
         );
 

@@ -19,6 +19,7 @@ pub mod parse;
 pub mod query;
 pub mod set;
 pub mod snippet;
+pub mod za;
 
 fn ingested_into_object(email: IngestedEmail) -> Map<'static, EmailProperty, EmailValue> {
     Map::with_capacity(3)

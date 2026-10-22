@@ -121,6 +121,24 @@ impl Server {
                         }
                     }
                 }
+                // Mail spec 6.3: a key account's mailboxes are left out of
+                // another account's listing, a grant made before it was
+                // provisioned included. The rule of ruling R34 enforces this
+                // at use time, so a failed lookup is logged and lists the
+                // account (review M6).
+                for entry in access_to.iter_mut() {
+                    match self.za_is_key_account(entry.account_id).await {
+                        Ok(true) => {
+                            entry.collections.remove(Collection::Mailbox);
+                            entry.collections.remove(Collection::Email);
+                        }
+                        Ok(false) => {}
+                        Err(err) => {
+                            trc::error!(err.caused_by(trc::location!()));
+                        }
+                    }
+                }
+                access_to.retain(|a| !a.collections.is_empty());
 
                 let now = now();
                 let mut credential_version = 0;
@@ -399,12 +417,14 @@ impl Server {
 
 impl AccessToken {
     /// The one constructor: every token starts without session keys, which
-    /// only the HTTP authentication layer attaches (spec 5).
+    /// only the HTTP authentication layer (spec 5) and the IMAP and POP3
+    /// logins, for the session's own token (mail spec 3.3), attach.
     pub(crate) fn from_parts(scope_idx: usize, inner: Arc<AccessTokenInner>) -> Self {
         AccessToken {
             scope_idx,
             inner,
             session_keys: None,
+            za_impersonated: false,
         }
     }
 
@@ -456,6 +476,18 @@ impl AccessToken {
     pub fn without_session_keys(mut self) -> Self {
         self.session_keys = None;
         self
+    }
+
+    /// Mail ruling R35: this copy was obtained by impersonation; the account
+    /// it names is not its holder's (`za_foreign_key_account`).
+    pub fn with_za_impersonation(mut self) -> Self {
+        self.za_impersonated = true;
+        self
+    }
+
+    /// Mail ruling R35: whether this copy was obtained by impersonation.
+    pub fn za_is_impersonated(&self) -> bool {
+        self.za_impersonated
     }
 
     pub fn session_keys(&self) -> Option<&Arc<::vault::session::SessionKeys>> {
@@ -628,6 +660,7 @@ impl AccessToken {
                     scope_idx: access_token.scope_idx,
                     inner: Arc::new(inner),
                     session_keys: access_token.session_keys.take(),
+                    za_impersonated: access_token.za_impersonated,
                 };
             }
 

@@ -8,14 +8,19 @@ use common::{Server, auth::AccessToken};
 use email::cache::MessageCacheFetch;
 use email::cache::email::MessageCacheAccess;
 use email::message::metadata::MessageMetadata;
+use email::message::za::view::{ZaMailView, Zeroizing, za_readable};
 use groupware::cache::GroupwareCache;
+use mail_parser::{
+    Encoding,
+    decoders::{base64::base64_decode, quoted_printable::quoted_printable_decode},
+};
 use registry::schema::enums::Permission;
-use std::future::Future;
+use std::{borrow::Cow, future::Future};
 use store::ValueKey;
 use store::write::{AlignedBytes, Archive};
 use trc::AddContext;
 use types::acl::Acl;
-use types::blob::{BlobClass, BlobId};
+use types::blob::{BlobClass, BlobId, BlobSection};
 use types::collection::{Collection, SyncCollection};
 use types::field::EmailField;
 use utils::chained_bytes::ChainedBytes;
@@ -42,6 +47,23 @@ impl BlobDownload for Server {
         access_token: &AccessToken,
     ) -> trc::Result<Option<Vec<u8>>> {
         if self.has_access_blob(blob_id, access_token).await? {
+            // Mail spec 5.7, 7: a key account's message or upload, opened
+            // with the request's keys.
+            if self.za_is_sealed_source(blob_id).await? {
+                return match blob_id.class {
+                    BlobClass::Linked {
+                        account_id,
+                        document_id,
+                        ..
+                    } => {
+                        za_download_message(self, blob_id, access_token, account_id, document_id)
+                            .await
+                    }
+                    BlobClass::Reserved { account_id, .. } => {
+                        za_download_upload(self, blob_id, access_token, account_id).await
+                    }
+                };
+            }
             if let Some(section) = &blob_id.section {
                 self.get_blob_section(&blob_id.hash, section)
                     .await
@@ -155,5 +177,137 @@ impl BlobDownload for Server {
                         }
                     }),
         )
+    }
+}
+
+/// Mail spec 5.7, 7: a key account's message, or a section of it, read
+/// through the unsealed pair as upstream reads the stored one: a section id
+/// applies its offsets, which Email/get translated to stored-blob
+/// coordinates, to the opened blob and transfer-decodes the section; a
+/// whole-message id reconstructs `raw_headers || opened[blob_body_offset..]`.
+/// An unreadable message is not found (spec 10).
+async fn za_download_message(
+    server: &Server,
+    blob_id: &BlobId,
+    access_token: &AccessToken,
+    account_id: u32,
+    document_id: u32,
+) -> trc::Result<Option<Vec<u8>>> {
+    let keys = server.za_mail_keys(access_token, account_id).await?;
+    let Some(stored) = server
+        .store()
+        .get_value::<Archive<AlignedBytes>>(ValueKey::property(
+            account_id,
+            Collection::Email,
+            document_id,
+            EmailField::Metadata,
+        ))
+        .await
+        .caused_by(trc::location!())?
+    else {
+        return Ok(None);
+    };
+    let Some(view) = za_readable(
+        server
+            .za_metadata_view(&stored, keys.as_deref(), account_id, document_id)
+            .await,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(blob) = server
+        .blob_store()
+        .get_blob(blob_id.hash.as_slice(), 0..usize::MAX)
+        .await
+        .caused_by(trc::location!())?
+    else {
+        return Ok(None);
+    };
+    let Some(mut opened) = za_readable(
+        server
+            .za_open_message_blob(
+                matches!(view, Cow::Owned(_)),
+                keys.as_deref(),
+                account_id,
+                document_id,
+                blob,
+            )
+            .await,
+    )?
+    else {
+        return Ok(None);
+    };
+    if let Some(section) = &blob_id.section {
+        return Ok(decode_section(&opened, section));
+    }
+    let metadata = view
+        .unarchive::<MessageMetadata>()
+        .caused_by(trc::location!())?;
+    let body_offset = metadata.blob_body_offset.to_native();
+    if metadata.root_part().offset_body.to_native() != body_offset {
+        Ok(Some(
+            ChainedBytes::new(metadata.raw_headers.as_ref())
+                .with_last(opened.get(body_offset as usize..).unwrap_or_default())
+                .to_bytes(),
+        ))
+    } else {
+        // The bytes leave in the HTTP body.
+        Ok(Some(std::mem::take(&mut *opened)))
+    }
+}
+
+/// Mail spec 5.7, 7: a key account's upload, opened whole with the
+/// request's keys; a section id is cut from the opened bytes and
+/// transfer-decoded, as upstream reads a stored one. An unreadable upload
+/// is not found (spec 10).
+async fn za_download_upload(
+    server: &Server,
+    blob_id: &BlobId,
+    access_token: &AccessToken,
+    account_id: u32,
+) -> trc::Result<Option<Vec<u8>>> {
+    let keys = server.za_mail_keys(access_token, account_id).await?;
+    let Some(blob) = server
+        .blob_store()
+        .get_blob(blob_id.hash.as_slice(), 0..usize::MAX)
+        .await
+        .caused_by(trc::location!())?
+    else {
+        return Ok(None);
+    };
+    let mut opened = match keys {
+        Some(keys) => {
+            let Some(opened) =
+                za_readable(server.za_open_upload_blob(&keys, account_id, blob).await)?
+            else {
+                return Ok(None);
+            };
+            opened
+        }
+        // `za_mail_keys` answers `None` only for an account that is not a
+        // key account (any longer): the bytes as stored.
+        None => Zeroizing::new(blob),
+    };
+    Ok(match &blob_id.section {
+        Some(section) => decode_section(&opened, section),
+        // The bytes leave in the HTTP body.
+        None => Some(std::mem::take(&mut *opened)),
+    })
+}
+
+/// `get_blob_section` on bytes in memory: the blob store's range read (from
+/// offset 0 a range is cut at the end of the blob, any other range out of
+/// it reads empty), then the section's transfer decoding.
+fn decode_section(bytes: &[u8], section: &BlobSection) -> Option<Vec<u8>> {
+    let end = section.offset_start.saturating_add(section.size);
+    let bytes = if section.offset_start == 0 {
+        &bytes[..end.min(bytes.len())]
+    } else {
+        bytes.get(section.offset_start..end).unwrap_or_default()
+    };
+    match Encoding::from(section.encoding) {
+        Encoding::None => Some(bytes.to_vec()),
+        Encoding::Base64 => base64_decode(bytes),
+        Encoding::QuotedPrintable => quoted_printable_decode(bytes),
     }
 }

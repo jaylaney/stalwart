@@ -15,7 +15,10 @@ use crate::utils::{
         schedule_statuses, wait_for_delivery,
     },
 };
-use crate::za::fanout::{stored_sequence, uid_copies};
+use crate::za::{
+    fanout::{stored_sequence, uid_copies},
+    mail::open_message,
+};
 use calcard::common::timezone::Tz;
 use calcard::icalendar::{ICalendarMethod, ICalendarProperty};
 use email::cache::MessageCacheFetch;
@@ -288,9 +291,15 @@ pub async fn alarm(test: &TestServer) {
         DateStyle::Short,
     );
     for message in messages.emails.items.iter() {
-        let contents = test
-            .fetch_email(client.account_id, message.document_id)
-            .await;
+        // Mail spec 5.1: a key account's message is stored sealed, so it is
+        // read opened with the account's keys.
+        let (_, contents) = open_message(
+            test,
+            client.account_id,
+            account.secret(),
+            message.document_id,
+        )
+        .await;
         let message = MessageParser::new().parse(&contents).unwrap();
         let to = message
             .to()
@@ -670,9 +679,14 @@ pub async fn alarm_override(test: &TestServer) {
         1,
         "exactly one email reached the account"
     );
-    let contents = test
-        .fetch_email(id, messages.emails.items[0].document_id)
-        .await;
+    // Mail spec 5.1: opened with the account's keys, as `alarm` reads it.
+    let (_, contents) = open_message(
+        test,
+        id,
+        account.secret(),
+        messages.emails.items[0].document_id,
+    )
+    .await;
     let message = MessageParser::new().parse(&contents).unwrap();
     // The email is the alarm itself, not a delivery-failure bounce.
     let from = message

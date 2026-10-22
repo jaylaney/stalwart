@@ -434,12 +434,23 @@ impl VacationResponseSet for Server {
 
                 Ok(script)
             }
-            Err(err) => Err(trc::StoreEvent::UnexpectedError
-                .caused_by(trc::location!())
-                .reason(err)
-                .details("Vacation Sieve Script failed to compile.")),
+            Err(err) => Err(compile_error(&err)),
         }
     }
+}
+
+/// Issue #21 (mail spec 10), for every account: the compile error names its
+/// position only, as the compiler's message can quote the script, which
+/// holds the response's text.
+fn compile_error(err: &sieve::compiler::CompileError) -> trc::Error {
+    trc::StoreEvent::UnexpectedError
+        .caused_by(trc::location!())
+        .reason(format!(
+            "compile error at line {}, column {}",
+            err.line_num(),
+            err.line_pos()
+        ))
+        .details("Vacation Sieve Script failed to compile.")
 }
 
 fn set_error(
@@ -453,4 +464,37 @@ fn set_error(
         response.not_updated.append(Id::singleton(), err);
     }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compile_error;
+
+    /// Issue #21: the traced reason of a script that does not compile names
+    /// the position only, while the compiler's own message quotes the text.
+    #[test]
+    fn vacation_compile_error_reason_is_fixed() {
+        let script =
+            b"require [\"vacation\"];\r\nvacation :subject \"s\" \"body\" \"vacation-canary\";\r\n";
+        let err = sieve::Compiler::new()
+            .compile(script)
+            .expect_err("the script compiles");
+        assert!(
+            err.to_string().contains("vacation-canary"),
+            "the compiler's message: {err}"
+        );
+        let traced = compile_error(&err);
+        let reason = traced.value_as_str(trc::Key::Reason).unwrap();
+        let (line, column) = reason
+            .strip_prefix("compile error at line ")
+            .and_then(|rest| rest.split_once(", column "))
+            .unwrap_or_else(|| panic!("the reason: {reason:?}"));
+        assert_eq!(line.parse::<usize>().ok(), Some(err.line_num()), "{reason}");
+        assert_eq!(
+            column.parse::<usize>().ok(),
+            Some(err.line_pos()),
+            "{reason}"
+        );
+        assert!(!reason.contains("vacation-canary"), "{reason}");
+    }
 }

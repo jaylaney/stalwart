@@ -11,6 +11,7 @@ use crate::{
 use common::{
     auth::AuthRequest,
     network::{SessionStream, limiter::LimiterResult},
+    za::ZA_MAIL_LOGIN_REFUSED,
 };
 use directory::Credentials;
 use mail_parser::decoders::base64::base64_decode;
@@ -62,9 +63,9 @@ impl<T: SessionStream> Session<T> {
 
     pub async fn handle_auth(&mut self, credentials: Credentials) -> trc::Result<()> {
         // Authenticate
-        let access_token = self
+        let (access_token, session_keys) = self
             .server
-            .authenticate(&AuthRequest::from_credentials(
+            .authenticate_with_keys(&AuthRequest::from_credentials(
                 credentials,
                 self.session_id,
                 self.remote_addr,
@@ -90,7 +91,22 @@ impl<T: SessionStream> Session<T> {
 
                 err
             })
-            .and_then(|token| token.assert_has_permission(Permission::Pop3Authenticate))?;
+            .and_then(|(token, keys)| {
+                token
+                    .assert_has_permission(Permission::Pop3Authenticate)
+                    .map(|token| (token, keys))
+            })?;
+
+        // Mail spec 4: a key account's session exists only with its keys.
+        let Some(access_token) = self
+            .server
+            .za_mail_login(access_token, session_keys, self.session_id)
+            .await?
+        else {
+            return Err(trc::Pop3Event::Error
+                .into_err()
+                .details(ZA_MAIL_LOGIN_REFUSED));
+        };
 
         // Enforce concurrency limits
         let in_flight = match access_token.is_imap_request_allowed() {

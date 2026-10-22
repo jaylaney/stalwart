@@ -89,6 +89,11 @@ impl<T: SessionStream> SessionData<T> {
                     .id(arguments.tag));
             }
         };
+        // Mail spec 6.3, rulings R34 and R35: before the write.
+        self.server
+            .za_assert_mail_route(&self.access_token, params.account_id)
+            .await
+            .map_err(|err| err.id(arguments.tag.clone()))?;
 
         // Obtain mailbox
         let mailbox_ = self

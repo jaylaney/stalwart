@@ -10,8 +10,12 @@ use crate::{
     spawn_op,
 };
 use common::{
-    auth::AccessToken, ipc::CacheInvalidation, network::SessionStream, sharing::EffectiveAcl,
+    auth::AccessToken,
+    ipc::CacheInvalidation,
+    network::SessionStream,
+    sharing::EffectiveAcl,
     storage::index::ObjectIndexBuilder,
+    za::mail::{za_acl_widens, za_keyless_refusal},
 };
 use compact_str::ToCompactString;
 use imap_proto::{
@@ -339,6 +343,18 @@ impl<T: SessionStream> Session<T> {
                 }
             }
 
+            // Mail spec 6.3, ruling I3: no grant is added to or widened on a key
+            // account's mailbox; a removal or a narrowing passes.
+            if za_acl_widens(&mailbox.acls, &current_mailbox.inner.acls)
+                && data
+                    .server
+                    .za_mail_sharing_refused(mailbox_id.account_id)
+                    .await
+                    .imap_ctx(&arguments.tag, trc::location!())?
+            {
+                return Err(za_keyless_refusal().id(arguments.tag));
+            }
+
             if mailbox.acls.len() > data.server.core.groupware.max_shares_per_item {
                 return Err(trc::ImapEvent::Error
                     .into_err()
@@ -454,6 +470,11 @@ impl<T: SessionStream> SessionData<T> {
         validate: bool,
     ) -> trc::Result<(MailboxId, Archive<AlignedBytes>, AccessToken)> {
         if let Some(mailbox) = self.get_mailbox_by_name(&arguments.mailbox_name) {
+            // Mail spec 6.3, ruling R34: GETACL, MYRIGHTS, SETACL and
+            // DELETEACL name a key account's mailbox only in its own sessions.
+            self.server
+                .za_assert_mail_route(&self.access_token, mailbox.account_id)
+                .await?;
             if let Some(values) = self
                 .server
                 .store()

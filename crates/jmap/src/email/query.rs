@@ -4,7 +4,10 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::{api::query::QueryResponseBuilder, changes::state::JmapCacheState};
+use crate::{
+    api::query::QueryResponseBuilder, changes::state::JmapCacheState,
+    email::za::za_refuse_content_query,
+};
 use common::{MessageStoreCache, Server, auth::AccessToken};
 use email::cache::{MessageCacheFetch, email::MessageCacheAccess};
 use jmap_proto::{
@@ -41,6 +44,20 @@ impl EmailQuery for Server {
         access_token: &AccessToken,
     ) -> trc::Result<QueryResponse> {
         let account_id = request.account_id.document_id();
+
+        // Mail spec 8: a key account's search index holds the arrival time
+        // and the size only; a filter or sort that needs content is refused
+        // before the query runs, rather than left to match nothing.
+        // `Email/queryChanges` makes the same check itself, because it
+        // returns before this method when nothing has changed.
+        za_refuse_content_query(
+            self,
+            account_id,
+            &request.filter,
+            request.sort.as_deref().unwrap_or_default(),
+        )
+        .await?;
+
         let mut filters = Vec::with_capacity(request.filter.len());
         let cached_messages = self
             .get_cached_messages(account_id)

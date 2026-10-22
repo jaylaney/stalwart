@@ -64,6 +64,9 @@ impl JmapEmailCopy for Server {
                 .into_err()
                 .details("From accountId is equal to fromAccountId"));
         }
+        // Mail spec 6.3: no copy into or out of a key account.
+        self.za_assert_mail_copy(from_account_id, account_id, session.session_id)
+            .await?;
         let cache = self.get_cached_messages(account_id).await?;
         let old_state = cache.assert_state(false, &request.if_in_state)?;
         let mut response = CopyResponse {
@@ -240,6 +243,9 @@ impl JmapEmailCopy for Server {
                         )
                         .await
                         .caused_by(trc::location!())?;
+                        // Mail ruling R55: each chunk commits only while the
+                        // source account holds no vault record.
+                        self.za_provisioning_fence(&mut train_batch, from_account_id);
                         train_batch.commit_point();
                         did_train = true;
                     }

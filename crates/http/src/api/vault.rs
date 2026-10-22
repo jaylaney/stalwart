@@ -28,11 +28,14 @@ use common::{
         credential::AppPassword,
         vault::{VaultRead, za_argon2_params, za_derive_root},
     },
+    cache::invalidate::CacheInvalidationBuilder,
+    ipc::CacheInvalidation,
 };
 use directory::{
     Credentials,
     core::secret::{hash_secret, verify_totp_code},
 };
+use email::message::za::sharing::za_mailbox_grantees;
 use groupware::calendar::{ArchivedTimezone, Calendar};
 use http_proto::{HttpRequest, HttpResponse, HttpSessionData};
 use hyper::{
@@ -55,7 +58,7 @@ use store::{
 };
 use subtle::ConstantTimeEq;
 use trc::AddContext;
-use types::{collection::Collection, id::Id};
+use types::{collection::Collection, field::EmailField, id::Id};
 
 /// Lifetime of a setup token (spec 4.1).
 pub const SETUP_TOKEN_TTL_SECS: i64 = 7 * 86400;
@@ -493,6 +496,27 @@ async fn za_invalidate_after_commit(server: &Server, account_id: u32) {
     }
 }
 
+/// Mail spec 6.3, ruling R5: the access tokens of the accounts named in the
+/// account's mailbox grants, which still list its mailboxes, are rebuilt
+/// without them, as `refresh_acls` invalidates a changed grant's. A failure
+/// is traced, not returned: the marker is written.
+async fn za_invalidate_mailbox_grantees(server: &Server, account_id: u32) {
+    let result = async {
+        let mut changes = CacheInvalidationBuilder::default();
+        for grantee in za_mailbox_grantees(server, account_id).await? {
+            changes.invalidate(CacheInvalidation::AccessToken(grantee));
+        }
+        server.invalidate_caches(changes).await
+    }
+    .await;
+    if let Err(err) = result {
+        trc::error!(
+            err.account_id(account_id)
+                .details("Zero-access grantee invalidation failed after the marker write")
+        );
+    }
+}
+
 /// Refusal with a status other than 401 (e.g. 409 on an active account):
 /// counted like a failed attempt, so probing for account states is delayed,
 /// rate-limited and banned like guessing credentials. A ban or a fail2ban
@@ -669,6 +693,18 @@ async fn za_setup_token(
         ));
     }
 
+    // Mail spec 6.1: an absent-key assertion is no fence on PostgreSQL or
+    // MySQL, so key accounts are not supported there.
+    #[cfg(feature = "test_mode")]
+    let force_sql_store = common::za::force_sql_store();
+    #[cfg(not(feature = "test_mode"))]
+    let force_sql_store = false;
+    if server.store().is_pg_or_mysql() || force_sql_store {
+        return Ok(conflict(
+            "key accounts are not supported on PostgreSQL or MySQL",
+        ));
+    }
+
     // State first, so an active account is refused as such.
     let previous = server.za_vault_record(account_id).await?;
     if previous
@@ -685,8 +721,14 @@ async fn za_setup_token(
     // Eligibility: no password credential of any kind (spec 4.1).
     let has_credentials = reg.account.credentials.values().next().is_some();
 
-    // Data checks apply to initial issuance and to reissuance (spec 4.1).
-    if let Some(response) = za_assert_no_calendar_data(server, account_id).await? {
+    // Data checks apply to initial issuance and to reissuance (spec 4.1). A
+    // record without a marker next to data is an issuance that stopped
+    // between its record write and its recheck (mail spec 6.1): it is
+    // removed here as that recheck would have removed it.
+    if let Some(response) = za_assert_no_data(server, account_id).await? {
+        if !has_marker && let Some(read) = &previous {
+            za_abort_issuance(server, account_id, read).await?;
+        }
         return Ok(response);
     }
 
@@ -714,6 +756,8 @@ async fn za_setup_token(
             record
         }
     };
+    #[cfg(feature = "test_mode")]
+    common::za::setup_token_pause_point(account_id).await;
     if let Err(response) = za_commit(
         server,
         account_id,
@@ -724,6 +768,26 @@ async fn za_setup_token(
     )
     .await?
     {
+        return Ok(response);
+    }
+
+    // The recheck (mail spec 6.1): an ordinary writer that read the record
+    // as absent may have committed since the check above; none can commit
+    // now. If one did, the pending record this call wrote is removed,
+    // conditional on its bytes, and the first check's 409 is the answer. A
+    // reissue keeps its record: its marker already makes the account a key
+    // account.
+    if let Some(response) = za_assert_no_data(server, account_id).await? {
+        // Ours: the revision and the token hash just written (a revision
+        // restarts at 1 after a delete; the hash is random per issuance).
+        if !has_marker
+            && let Some(written) = server.za_vault_record(account_id).await?.filter(|read| {
+                read.record.revision == record.revision
+                    && read.record.setup_token_hash == record.setup_token_hash
+            })
+        {
+            za_abort_issuance(server, account_id, &written).await?;
+        }
         return Ok(response);
     }
 
@@ -746,9 +810,47 @@ async fn za_setup_token(
         // (3) Invalidate classification and cached authentication again: the
         // marker is what classifies the account.
         za_invalidate_after_commit(server, account_id).await;
+        // Mail spec 6.3, ruling R5: a grant made while the account was plain
+        // stops routing once its grantees' tokens are rebuilt.
+        za_invalidate_mailbox_grantees(server, account_id).await;
     }
 
     Ok(json(SetupTokenResponse { token, expires }))
+}
+
+/// The abort of an issuance that found data (mail spec 6.1), for the
+/// recheck and for a reissue that finds an earlier issuance's record without
+/// its marker: removes the pending record `read`, conditional on its bytes,
+/// unless the marker, re-read here immediately before the delete, has
+/// appeared since. A lost delete (another write replaced the record) is
+/// traced and otherwise ignored; the caller answers its 409 either way.
+async fn za_abort_issuance(server: &Server, account_id: u32, read: &VaultRead) -> trc::Result<()> {
+    if za_registry_account(server, account_id)
+        .await?
+        .is_some_and(|reg| {
+            reg.account
+                .password_credential()
+                .is_some_and(|c| c.secret == ZA_MARKER)
+        })
+    {
+        return Ok(());
+    }
+    // Residual case: two concurrent issuances plus an unfenced calendar
+    // write can still put the other issuance's marker between this re-read
+    // and the delete.
+    match server.za_vault_delete(account_id, read).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.is_assertion_failure() => {
+            trc::event!(
+                Auth(trc::AuthEvent::Warning),
+                AccountId = account_id,
+                Details =
+                    "zero-access: the aborted issuance's pending record changed before its removal",
+            );
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// `setup` and `recover` verify their own credential without passing through
@@ -767,15 +869,13 @@ async fn za_assert_enabled(server: &Server, account_id: u32) -> trc::Result<()> 
     }
 }
 
-/// Refuses an account that already holds calendar data: setup would
-/// otherwise convert plaintext into a key account. A sole default calendar
-/// created by the server (`create_default_calendar`) with untouched
-/// preferences is not user data and is ignored; it is sealed by its first
-/// write (spec 7.3).
-async fn za_assert_no_calendar_data(
-    server: &Server,
-    account_id: u32,
-) -> trc::Result<Option<HttpResponse>> {
+/// Refuses an account that already holds calendar data, mail, unfinished
+/// tasks or spam training samples: setup would otherwise convert plaintext
+/// into a key account (mail spec 6.6). A sole
+/// default calendar created by the server (`create_default_calendar`) with
+/// untouched preferences is not user data and is ignored; it is sealed by
+/// its first write (spec 7.3).
+async fn za_assert_no_data(server: &Server, account_id: u32) -> trc::Result<Option<HttpResponse>> {
     for collection in [
         Collection::CalendarEvent,
         Collection::CalendarEventNotification,
@@ -785,6 +885,62 @@ async fn za_assert_no_calendar_data(
         }
     }
     if za_has_user_calendars(server, account_id).await? {
+        return Ok(Some(conflict("account already holds calendar data")));
+    }
+    // Mail ruling R46: a destroyed message's metadata archive (field 71),
+    // blob link and search document stay until its unindex task runs, so
+    // until then the account still holds that message's plaintext. The
+    // search document is deleted in a separate, later write, which can fail
+    // or be skipped after field 71 is gone; ruling R51 checks it below by
+    // its `Document` key, the ground truth on the internal search store.
+    if server
+        .za_has_documents(account_id, Collection::Email)
+        .await?
+        || server
+            .za_has_property(account_id, Collection::Email, EmailField::Metadata)
+            .await?
+    {
+        return Ok(Some(conflict("account already holds mail")));
+    }
+    // Mail ruling R54: an index, unindex, thread-merge or iTIP task of the
+    // account is still in the queue (pending, retrying, in flight or
+    // failed). An index write in flight lands after the scans below, and a
+    // retained merge task holds a short subject verbatim. Before R51's scan
+    // on purpose: a worker that writes its document and clears its task
+    // between the two scans would otherwise pass both. Setup never deletes
+    // a task; the operator waits for pending ones and destroys failed ones.
+    if server.za_has_tasks(account_id).await? {
+        return Ok(Some(conflict("account has unfinished tasks")));
+    }
+    // Mail ruling R52: a sample written while the account was plain keeps
+    // the message's blob linked and its sender and subject in the registry
+    // until it expires; the operator deletes the account's samples first.
+    if server.za_has_spam_samples(account_id).await? {
+        return Ok(Some(conflict(
+            "account already holds spam training samples",
+        )));
+    }
+    // Mail ruling R51: an Email search document of the account outlived its
+    // message. Internal search store only: any search store other than the
+    // internal one (ElasticSearch, MeiliSearch, or a PostgreSQL or MySQL
+    // search store) is not checked, a recorded limit.
+    if server.za_has_email_search_documents(account_id).await? {
+        return Ok(Some(conflict("account already holds mail")));
+    }
+    // Mail ruling R60: R51's scan for calendar documents, in the same
+    // position after R54's queue term, so R54's ordering argument holds for
+    // a calendar event's index write too (its document holds the summary,
+    // description, location and participants). The same recorded limit.
+    if server.za_has_calendar_search_documents(account_id).await? {
+        return Ok(Some(conflict("account already holds calendar data")));
+    }
+    // Mail ruling R62: a Term or Index key of the account outlived its search
+    // document (R51's `Document` key is not the whole index). After R60's (so
+    // after R54's queue term); same recorded limit.
+    if server.za_has_email_search_terms(account_id).await? {
+        return Ok(Some(conflict("account already holds mail")));
+    }
+    if server.za_has_calendar_search_terms(account_id).await? {
         return Ok(Some(conflict("account already holds calendar data")));
     }
     Ok(None)
@@ -883,7 +1039,7 @@ async fn za_setup(
     za_assert_enabled(server, account_id).await?;
     za_check_new_password(server, &request.password, &request.username)?;
     // The token may be days old: data can have arrived since issuance.
-    if let Some(response) = za_assert_no_calendar_data(server, account_id).await? {
+    if let Some(response) = za_assert_no_data(server, account_id).await? {
         return Ok(response);
     }
 

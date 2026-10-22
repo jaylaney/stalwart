@@ -46,7 +46,13 @@ impl SpamFilterAnalyzeLlm for Server {
                     trc::event!(
                         Ai(AiEvent::LlmResponse),
                         Id = config.model.id.clone(),
-                        Details = response.clone(),
+                        // Mail spec 10: the answer can quote a key account's
+                        // message.
+                        Details = if ctx.input.za_redact {
+                            trc::Value::redacted()
+                        } else {
+                            response.clone().into()
+                        },
                         Elapsed = time.elapsed(),
                         SpanId = ctx.input.span_id,
                     );

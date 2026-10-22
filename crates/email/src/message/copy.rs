@@ -18,7 +18,11 @@ use crate::{
         },
     },
 };
-use common::{Server, storage::index::ObjectIndexBuilder};
+use common::{
+    Server,
+    storage::index::ObjectIndexBuilder,
+    za::{ZA_TRACE_MAIL_COPY, mail::za_keyless_refusal},
+};
 use mail_parser::parsers::fields::thread::thread_name;
 use registry::{
     schema::{
@@ -73,6 +77,21 @@ impl EmailCopy for Server {
         received_at: Option<u64>,
         session_id: u64,
     ) -> trc::Result<Result<IngestedEmail, CopyMessageError>> {
+        // Mail spec 6.3: no copy into or out of a key account. The callers
+        // answer their client first; this refuses a classification that
+        // changed since, before any read.
+        for account_id in [from_account_id, to_account_id] {
+            if self.za_is_key_account(account_id).await? {
+                trc::event!(
+                    Security(trc::SecurityEvent::Unauthorized),
+                    SpanId = session_id,
+                    AccountId = account_id,
+                    Details = ZA_TRACE_MAIL_COPY,
+                );
+                return Err(za_keyless_refusal().account_id(account_id));
+            }
+        }
+
         // Obtain metadata
         let mut metadata = if let Some(metadata) = self
             .store()
@@ -94,6 +113,8 @@ impl EmailCopy for Server {
         // Check quota
         let size = metadata.root_part().offset_end;
         let to_account = self.account(to_account_id).await?;
+        #[cfg(feature = "test_mode")]
+        common::za::copy_pause_point(to_account_id).await;
         match self.has_available_quota(&to_account, size as u64).await {
             Ok(_) => (),
             Err(err) => {
@@ -237,6 +258,9 @@ impl EmailCopy for Server {
         metadata
             .index(&mut batch, true)
             .caused_by(trc::location!())?;
+
+        // Mail spec 6.1, the provisioning fence, as in `email_ingest`.
+        self.za_provisioning_fence(&mut batch, to_account_id);
 
         // Insert and obtain ids
         let change_id = self

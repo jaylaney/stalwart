@@ -351,6 +351,7 @@ impl<T: SessionStream> Session<T> {
         }
 
         // Expand list
+        let za_added = self.data.rcpt_to.len().saturating_sub(1);
         if let Some(members) = rcpt_members {
             let list_addr = self.data.rcpt_to.pop().unwrap();
             for member in members.as_ref() {
@@ -405,8 +406,38 @@ impl<T: SessionStream> Session<T> {
             }
         }
 
+        // Mail spec 10: a key account among this command's recipients (the
+        // address or the list's members) redacts the transaction's content
+        // from traces. RFC 3030 orders RCPT before BDAT: one named after a
+        // chunk, which was traced, is refused.
+        if !self.data.za_key_rcpt && self.za_has_key_rcpt(za_added).await {
+            if !self.data.message.is_empty() {
+                self.data.rcpt_to.truncate(za_added);
+                return self
+                    .write(b"503 5.5.1 Recipients must precede message data.\r\n")
+                    .await;
+            }
+            self.data.za_key_rcpt = true;
+        }
+
         self.data.rcpt_oks += 1;
         self.write(b"250 2.1.5 OK\r\n").await
+    }
+
+    /// Mail spec 10: whether a recipient from `rcpt_to[first..]` is a key
+    /// account; a lookup error counts as one (fail closed).
+    pub(crate) async fn za_has_key_rcpt(&self, first: usize) -> bool {
+        for rcpt in self.data.rcpt_to.get(first..).unwrap_or_default() {
+            if self
+                .server
+                .za_is_key_rcpt(&rcpt.address_lcase)
+                .await
+                .unwrap_or(true)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     async fn rcpt_error(&mut self, response: &[u8], rcpt: String) -> Result<(), ()> {

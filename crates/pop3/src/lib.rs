@@ -79,4 +79,15 @@ impl State {
             _ => unreachable!(),
         }
     }
+
+    /// Mail spec 3.3: whether this session is logged in with its account's
+    /// keys.
+    pub fn za_key_session(&self) -> bool {
+        match self {
+            State::Authenticated { access_token, .. } => access_token
+                .za_keys_for(access_token.account_id())
+                .is_some(),
+            State::NotAuthenticated { .. } => false,
+        }
+    }
 }

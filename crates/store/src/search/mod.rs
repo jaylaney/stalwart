@@ -14,7 +14,7 @@ pub mod query;
 pub mod split;
 pub mod term;
 
-use crate::write::SearchIndex;
+use crate::write::{SearchIndex, ValueClass};
 use ahash::AHashMap;
 use nlp::language::Language;
 use roaring::RoaringBitmap;
@@ -22,6 +22,7 @@ use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::fmt::Display;
 use std::ops::{BitAndAssign, BitOrAssign, BitXorAssign};
+use types::collection::Collection;
 use utils::map::vec_map::VecMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +159,11 @@ pub enum SearchComparator {
 pub struct IndexDocument {
     pub(crate) index: SearchIndex,
     pub(crate) fields: AHashMap<SearchField, SearchValue>,
+    /// Zero-access fork (mail ruling R58): a key that must be absent when
+    /// the internal search store writes the document (account id,
+    /// collection, document id, class), asserted in the document's first
+    /// commit chunk. Other search backends ignore it.
+    pub(crate) assert_absent: Option<(u32, Collection, u32, ValueClass)>,
 }
 
 #[derive(Debug)]

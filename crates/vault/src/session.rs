@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::keys::{KeyError, Secret, derive_event_key};
+use crate::keys::{KeyError, Secret, derive_event_key, derive_mail_key};
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -13,13 +13,20 @@ use std::{
     },
 };
 
-/// Keys resident for one request (spec 5, "in-flight copies"). Cloned by
-/// `Arc`; the secrets are zeroed when the last reference drops.
+/// Keys attached for one HTTP request (spec 5, "in-flight copies"; the HTTP
+/// key cache keeps them between requests under its idle and age limits,
+/// `ZA_KEY_IDLE_SECS` and `ZA_KEY_MAX_AGE_SECS`), or for the life of an
+/// authenticated IMAP or POP3 connection (mail spec 3.3, which amends
+/// release 1's "only HTTP requests carry keys"). WebSocket, EventSource,
+/// ManageSieve and SMTP sessions never hold them. Cloned by `Arc`; the
+/// secrets are zeroed when the last reference drops.
 pub struct SessionKeys {
     pub account_id: u32,
     pub generation: u64,
     mk: Secret,
     ewk: Secret,
+    /// Mail spec 3.1: the mail wrapping key, derived from MK next to the EWK.
+    mwk: Secret,
     /// Invitations spec 3.2: the X25519 private key, unwrapped from the
     /// vault record on first use. Holds the outcome, so a wrap that does not
     /// open is traced once per session.
@@ -139,11 +146,15 @@ impl ZaDrainState {
 impl SessionKeys {
     pub fn new(account_id: u32, generation: u64, mk: Secret) -> Self {
         let ewk = derive_event_key(&mk);
+        let mwk = derive_mail_key(&mk);
+        #[cfg(feature = "test_mode")]
+        live::created(account_id);
         SessionKeys {
             account_id,
             generation,
             mk,
             ewk,
+            mwk,
             private_key: OnceLock::new(),
             drain: ZaDrainState::new(),
         }
@@ -155,6 +166,10 @@ impl SessionKeys {
 
     pub fn ewk(&self) -> &Secret {
         &self.ewk
+    }
+
+    pub fn mwk(&self) -> &Secret {
+        &self.mwk
     }
 
     /// `None` until the first unwrap was attempted.
@@ -175,6 +190,49 @@ impl SessionKeys {
     }
 }
 
+/// Counts the `SessionKeys` alive in this process, so a test can show that a
+/// session's keys were dropped. The secrets zero themselves through
+/// `Zeroizing`; this `Drop` only counts.
+#[cfg(feature = "test_mode")]
+impl Drop for SessionKeys {
+    fn drop(&mut self) {
+        live::dropped(self.account_id);
+    }
+}
+
+#[cfg(feature = "test_mode")]
+pub mod live {
+    use std::{
+        collections::HashMap,
+        sync::{LazyLock, Mutex, MutexGuard, PoisonError},
+    };
+
+    static LIVE: LazyLock<Mutex<HashMap<u32, usize>>> = LazyLock::new(Default::default);
+
+    fn live() -> MutexGuard<'static, HashMap<u32, usize>> {
+        LIVE.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The number of `SessionKeys` of `account_id` alive in this process.
+    pub fn session_keys(account_id: u32) -> usize {
+        live().get(&account_id).copied().unwrap_or(0)
+    }
+
+    pub(super) fn created(account_id: u32) {
+        *live().entry(account_id).or_insert(0) += 1;
+    }
+
+    pub(super) fn dropped(account_id: u32) {
+        let mut live = live();
+        if let Some(count) = live.get_mut(&account_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                live.remove(&account_id);
+            }
+        }
+    }
+}
+
 impl std::fmt::Debug for SessionKeys {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -188,7 +246,7 @@ impl std::fmt::Debug for SessionKeys {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keys::{KeyError, Secret, derive_event_key};
+    use crate::keys::{KeyError, Secret, derive_event_key, derive_mail_key};
 
     #[test]
     fn session_keys_derive_ewk_and_print_nothing() {
@@ -249,5 +307,30 @@ mod tests {
         drop(held);
         assert!(drain.pass.try_lock().is_ok());
         assert_eq!(format!("{keys:?}"), "SessionKeys(account 3, generation 11)");
+    }
+
+    #[test]
+    fn session_keys_carry_the_mail_key() {
+        let mk = Secret::random();
+        let keys = SessionKeys::new(7, 3, mk.clone());
+        assert_eq!(keys.mwk().as_bytes(), derive_mail_key(&mk).as_bytes());
+        assert_eq!(format!("{keys:?}"), "SessionKeys(account 7, generation 3)");
+    }
+
+    #[cfg(feature = "test_mode")]
+    #[test]
+    fn the_live_counter_follows_construction_and_drop() {
+        let before = live::session_keys(99);
+        let keys = std::sync::Arc::new(SessionKeys::new(99, 1, Secret::random()));
+        let clone = keys.clone();
+        assert_eq!(live::session_keys(99), before + 1);
+        drop(keys);
+        assert_eq!(
+            live::session_keys(99),
+            before + 1,
+            "a clone keeps the keys alive"
+        );
+        drop(clone);
+        assert_eq!(live::session_keys(99), before);
     }
 }

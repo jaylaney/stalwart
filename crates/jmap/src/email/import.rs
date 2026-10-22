@@ -7,11 +7,14 @@
 use crate::{
     blob::download::BlobDownload, changes::state::JmapCacheState, email::ingested_into_object,
 };
-use common::{Server, auth::AccessToken, ipc::PushNotification};
+use common::{Server, auth::AccessToken, ipc::PushNotification, za::mail::za_keyless_refusal};
 use email::{
     cache::{MessageCacheFetch, mailbox::MailboxCacheAccess},
     mailbox::JUNK_ID,
-    message::ingest::{EmailIngest, IngestEmail, IngestSource},
+    message::{
+        ingest::{EmailIngest, IngestEmail, IngestSource},
+        za::view::ZaMailView,
+    },
 };
 use http_proto::HttpSessionData;
 use jmap_proto::{
@@ -85,6 +88,17 @@ impl EmailImport for Server {
             created: VecMap::with_capacity(request.emails.len()),
             not_created: VecMap::new(),
         };
+
+        // Ruling R31 (mail spec 6.3): no sealed source of another account
+        // becomes this account's message; every id is checked before the
+        // first import.
+        for email in request.emails.values() {
+            if let MaybeIdReference::Id(blob_id) = &email.blob_id
+                && self.za_foreign_sealed_source(blob_id, account_id).await?
+            {
+                return Err(za_keyless_refusal().account_id(blob_id.class.account_id()));
+            }
+        }
 
         let mut last_change_id = None;
         'outer: for (id, email) in request.emails {

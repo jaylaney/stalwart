@@ -46,6 +46,7 @@ use crate::{
     vacation::{get::VacationResponseGet, set::VacationResponseSet},
 };
 use common::{Server, auth::AccessToken};
+use email::message::za::view::ZaMailView;
 use http_proto::HttpSessionData;
 use jmap_proto::{
     request::{
@@ -255,18 +256,23 @@ impl RequestHandler for Server {
                 GetRequestMethod::Email(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_has_access(req.account_id, Collection::Email)?;
+                    za_assert_mail_keys(self, access_token, req.account_id).await?;
 
                     self.email_get(*req, access_token).await?.into()
                 }
                 GetRequestMethod::Mailbox(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_has_access(req.account_id, Collection::Mailbox)?;
+                    self.za_assert_mail_route(access_token, req.account_id.document_id())
+                        .await?;
 
                     self.mailbox_get(*req, access_token).await?.into()
                 }
                 GetRequestMethod::Thread(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_has_access(req.account_id, Collection::Email)?;
+                    self.za_assert_mail_route(access_token, req.account_id.document_id())
+                        .await?;
 
                     self.thread_get(*req, access_token).await?.into()
                 }
@@ -279,6 +285,8 @@ impl RequestHandler for Server {
                 GetRequestMethod::EmailSubmission(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_is_member(req.account_id)?;
+                    self.za_assert_mail_route(access_token, req.account_id.document_id())
+                        .await?;
 
                     self.email_submission_get(*req).await?.into()
                 }
@@ -310,6 +318,7 @@ impl RequestHandler for Server {
                 GetRequestMethod::Blob(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_is_member(req.account_id)?;
+                    za_assert_mail_keys(self, access_token, req.account_id).await?;
 
                     self.blob_get(*req, access_token).await?.into()
                 }
@@ -388,18 +397,24 @@ impl RequestHandler for Server {
                 QueryRequestMethod::Email(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_has_access(req.account_id, Collection::Email)?;
+                    self.za_assert_mail_route(access_token, req.account_id.document_id())
+                        .await?;
 
                     self.email_query(*req, access_token).await?.into()
                 }
                 QueryRequestMethod::Mailbox(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_has_access(req.account_id, Collection::Mailbox)?;
+                    self.za_assert_mail_route(access_token, req.account_id.document_id())
+                        .await?;
 
                     self.mailbox_query(*req, access_token).await?.into()
                 }
                 QueryRequestMethod::EmailSubmission(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_is_member(req.account_id)?;
+                    self.za_assert_mail_route(access_token, req.account_id.document_id())
+                        .await?;
 
                     self.email_submission_query(*req).await?.into()
                 }
@@ -482,12 +497,16 @@ impl RequestHandler for Server {
                 SetRequestMethod::Email(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_has_access(req.account_id, Collection::Email)?;
+                    self.za_assert_mail_route(access_token, req.account_id.document_id())
+                        .await?;
 
                     self.email_set(*req, access_token, session).await?.into()
                 }
                 SetRequestMethod::Mailbox(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_has_access(req.account_id, Collection::Mailbox)?;
+                    self.za_assert_mail_route(access_token, req.account_id.document_id())
+                        .await?;
 
                     self.mailbox_set(*req, access_token).await?.into()
                 }
@@ -500,8 +519,9 @@ impl RequestHandler for Server {
                 SetRequestMethod::EmailSubmission(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_is_member(req.account_id)?;
+                    za_assert_mail_keys(self, access_token, req.account_id).await?;
 
-                    self.email_submission_set(*req, &session.instance, next_call)
+                    self.email_submission_set(*req, access_token, &session.instance, next_call)
                         .await?
                         .into()
                 }
@@ -614,6 +634,8 @@ impl RequestHandler for Server {
                     access_token
                         .assert_has_access(req.account_id, Collection::Email)?
                         .assert_has_access(req.from_account_id, Collection::Email)?;
+                    za_assert_mail_keys(self, access_token, req.account_id).await?;
+                    za_assert_mail_keys(self, access_token, req.from_account_id).await?;
 
                     self.email_copy(*req, access_token, next_call, session)
                         .await?
@@ -622,6 +644,7 @@ impl RequestHandler for Server {
                 CopyRequestMethod::Blob(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_is_member(req.account_id)?;
+                    za_assert_mail_keys(self, access_token, req.account_id).await?;
 
                     self.blob_copy(*req, access_token).await?.into()
                 }
@@ -667,6 +690,7 @@ impl RequestHandler for Server {
             RequestMethod::ImportEmail(mut req) => {
                 resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                 access_token.assert_has_access(req.account_id, Collection::Email)?;
+                za_assert_mail_keys(self, access_token, req.account_id).await?;
 
                 self.email_import(*req, access_token, session).await?.into()
             }
@@ -674,6 +698,7 @@ impl RequestHandler for Server {
                 ParseRequestMethod::Email(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_has_access(req.account_id, Collection::Email)?;
+                    za_assert_mail_keys(self, access_token, req.account_id).await?;
 
                     self.email_parse(*req, access_token).await?.into()
                 }
@@ -695,6 +720,7 @@ impl RequestHandler for Server {
             RequestMethod::SearchSnippet(mut req) => {
                 resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                 access_token.assert_has_access(req.account_id, Collection::Email)?;
+                za_assert_mail_keys(self, access_token, req.account_id).await?;
 
                 self.email_search_snippet(*req, access_token).await?.into()
             }
@@ -707,12 +733,15 @@ impl RequestHandler for Server {
             RequestMethod::LookupBlob(mut req) => {
                 resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                 access_token.assert_is_member(req.account_id)?;
+                self.za_assert_mail_route(access_token, req.account_id.document_id())
+                    .await?;
 
                 self.blob_lookup(*req).await?.into()
             }
             RequestMethod::UploadBlob(mut req) => {
                 resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                 access_token.assert_is_member(req.account_id)?;
+                za_assert_mail_keys(self, access_token, req.account_id).await?;
 
                 self.blob_upload_many(*req, access_token).await?.into()
             }
@@ -740,6 +769,28 @@ pub(crate) async fn za_assert_calendar_allowed(server: &Server, account_id: Id) 
     } else {
         Ok(())
     }
+}
+
+/// Mail spec 4: the key-needing mail methods (Email/get, Email/parse,
+/// SearchSnippet/get, Blob/get, Blob/upload, Email/import, Email/copy,
+/// EmailSubmission/set, and Email/set's `create` at its own site) need the
+/// target account's session keys when it is a key account. A token without
+/// them (a WebSocket, a Bearer or API-key token, another account's) is
+/// refused with the keyless refusal, traced as `Security(Unauthorized)` with
+/// `ZA_TRACE_MAIL_KEYLESS` (`za_mail_keys`). An account that is not a key
+/// account passes. Keys are only ever the token's own account's, so this
+/// also holds ruling R34 for these arms; the keyless mail arms (and
+/// `changes`, which serves the `/changes` and `/queryChanges` methods) call
+/// `za_assert_mail_route` instead.
+pub(crate) async fn za_assert_mail_keys(
+    server: &Server,
+    access_token: &AccessToken,
+    account_id: Id,
+) -> trc::Result<()> {
+    server
+        .za_mail_keys(access_token, account_id.document_id())
+        .await
+        .map(|_| ())
 }
 
 /// Spec section 10, "Traces": a key account's JMAP request and response

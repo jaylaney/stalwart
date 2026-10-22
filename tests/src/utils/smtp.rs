@@ -146,7 +146,7 @@ impl SmtpConnection {
     pub async fn read(&mut self, mut num_responses: usize, code: u8) -> Vec<String> {
         let mut lines = Vec::new();
         loop {
-            match tokio::time::timeout(Duration::from_millis(1500), self.reader.next_line()).await {
+            match tokio::time::timeout(Duration::from_secs(10), self.reader.next_line()).await {
                 Ok(Ok(Some(line))) => {
                     let is_done = line.as_bytes()[3] == b' ';
                     //let c = println!("<- {:?}", line);

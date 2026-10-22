@@ -24,3 +24,24 @@ For each client:
 
 Server-side, after the run: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests` passes against the same build, and the admin
 can read nothing meaningful in the stored records (spot-check with the leak scanner's output).
+
+## Mail
+
+Release 3 (mail encryption at rest; spec `docs/superpowers/specs/2026-10-20-zero-access-mail-design.md`, section 11). Run once per release against a server built from this branch, with TOTP enrolled on one of the two key accounts used.
+
+Clients: Apple Mail on macOS and on iOS, Thunderbird, and an Android client (FairEmail or Thunderbird for Android).
+
+For each client:
+1. Add the account with the password (TOTP-enabled account: with an app password instead), then add it again with an app password. A client that offers OAuth or a master-user login must be refused with `Zero-access accounts log in to mail with the password or an app password.`, not with a bare wrong-password error; record how each client shows the refusal.
+2. On the TOTP account, confirm the password alone is refused and an app password works (the mail protocols carry no TOTP code).
+3. Receive a message from an outside sender (plain text, HTML, and one with an attachment); confirm each reads in the client, the attachment included.
+4. Reply to a message; confirm the reply is delivered and a copy appears in Sent.
+5. Forward a message with an attachment; confirm the recipient gets the attachment intact.
+6. Move a message to another folder, flag it, and delete it (expunge or empty the Trash).
+7. Create a folder and rename it.
+8. Search on the server for a word in a subject and in a body (observe the refusal, `Mail in this account is encrypted at rest; the server cannot search message content. Search your local copy instead.`, or an empty server result, and record which each client shows), then confirm the client's local search over its downloaded messages finds the message. A search on flags, size or date still works on the server.
+9. IDLE push: leave the client open on the inbox and send the account a message from outside; confirm it appears without a manual refresh.
+10. Change the password through the account page; a connected client keeps running until its session closes (mail spec 4), so reconnect it with the new password and confirm mail reads again. Revoke an app password and confirm the client using it is refused at its next connection.
+11. Turn the vacation response on (through the client's vacation or ManageSieve setting, or JMAP `VacationResponse`), send the account a message from outside and confirm the sender receives the auto-reply and the message still reads in the client; turn it off and confirm no reply follows.
+
+Server-side, after the run: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests` passes against the same build, as do `imap::imap_tests` and `jmap::jmap_tests` with `ZA_KEY_ACCOUNTS=1`, and the `Mail leak scan` line of that `za_tests` run (an automated check on the test server, not on the server exercised by hand) shows only stubs for the key accounts' messages.

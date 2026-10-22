@@ -5,12 +5,14 @@
  */
 
 use crate::{
+    api::request::za_assert_mail_keys,
     blob::download::BlobDownload,
     changes::state::JmapCacheState,
     email::{PatchResult, handle_email_patch, ingested_into_object},
 };
 use common::{
     Server, auth::AccessToken, ipc::PushNotification, storage::index::ObjectIndexBuilder,
+    za::ZA_MAIL_KEYLESS,
 };
 use email::message::headers::{BuildHeader, ValueToHeader};
 use email::{
@@ -20,6 +22,7 @@ use email::{
         delete::EmailDeletion,
         ingest::{EmailIngest, IngestEmail, IngestSource},
         metadata::MessageData,
+        za::view::ZaMailView,
     },
 };
 use http_proto::HttpSessionData;
@@ -118,6 +121,16 @@ impl EmailSet for Server {
 
         let mut last_change_id = None;
         let will_destroy = response.collect_will_destroy(request.unwrap_destroy());
+
+        // Mail spec 4: a create needs the account's keys; updates and
+        // destroys do not.
+        if request
+            .create
+            .as_ref()
+            .is_some_and(|create| !create.is_empty())
+        {
+            za_assert_mail_keys(self, access_token, request.account_id).await?;
+        }
 
         // Process creates
         'create: for (id, object) in request.unwrap_create() {
@@ -574,6 +587,15 @@ impl EmailSet for Server {
                                     headers,
                                     contents: if !is_multipart {
                                         if let Some(blob_id) = blob_id {
+                                            // Ruling R31 (mail spec 6.3): no sealed source of
+                                            // another account in this account's message.
+                                            if self.za_foreign_sealed_source(&blob_id, account_id).await? {
+                                                response.not_created.append(
+                                                    id,
+                                                    SetError::forbidden().with_description(ZA_MAIL_KEYLESS),
+                                                );
+                                                continue 'create;
+                                            }
                                             match self.blob_download(&blob_id, access_token).await? {
                                                 Some(contents) => {
                                                     BodyPart::Binary(contents.into())

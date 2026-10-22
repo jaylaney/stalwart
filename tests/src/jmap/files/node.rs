@@ -338,6 +338,14 @@ pub async fn test(test: &TestServer) {
         .collect::<AHashSet<_>>()
     );
 
+    test_options(test).await;
+}
+
+/// The cases that upload nothing (fetchParents, onExists, case-insensitive
+/// names, WebDAV hrefs), which the key-account variant runs as they are.
+pub async fn test_options(test: &TestServer) {
+    let account = test.account("jdoe@example.com");
+
     // fetchParents: requesting a leaf should return its ancestors too
     let response = account
         .jmap_create(

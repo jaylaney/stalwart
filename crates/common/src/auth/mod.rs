@@ -141,8 +141,13 @@ pub struct PermissionsGroup {
 pub struct AccessToken {
     scope_idx: usize,
     inner: Arc<AccessTokenInner>,
-    /// Resident keys for this request only (spec 5, "in-flight copies").
+    /// Resident keys for this request or mail session only (spec 5,
+    /// "in-flight copies"; mail spec 3.3).
     session_keys: Option<Arc<::vault::session::SessionKeys>>,
+    /// Mail ruling R35: obtained by impersonation (a master-user login, the
+    /// recovery admin's `%` form). Kept on this copy, as `session_keys` is,
+    /// never in the shared inner: the account's own logins stay unmarked.
+    za_impersonated: bool,
 }
 
 #[derive(Debug, Default, Clone)]

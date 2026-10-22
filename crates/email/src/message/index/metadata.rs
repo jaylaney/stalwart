@@ -97,17 +97,18 @@ impl ArchivedMessageMetadata {
     }
 }
 
-impl IndexMessage for BatchBuilder {
-    fn index_message<'x>(
-        &mut self,
-        tenant_id: Option<u32>,
+impl MessageMetadata {
+    /// The metadata archive upstream stores for `message`: every part, the
+    /// parsed headers with `extra_headers` prepended to the root part, the
+    /// preview, the raw header block and the attachment bit. The first half
+    /// of `index_message`, shared with the key-account stub (mail spec 5.2).
+    pub fn build<'x>(
         mut message: mail_parser::Message<'x>,
         extra_headers: Vec<u8>,
         mut extra_headers_parsed: Vec<mail_parser::Header<'x>>,
         blob_hash: BlobHash,
-        data: MessageData,
         received_at: u64,
-    ) -> trc::Result<&mut Self> {
+    ) -> Self {
         let mut has_attachments = false;
         let mut preview = None;
         let preview_part_id = message
@@ -213,7 +214,7 @@ impl IndexMessage for BatchBuilder {
         };
 
         // Build metadata
-        let metadata = MessageMetadata {
+        MessageMetadata {
             preview: preview.unwrap_or_default().into_owned().into_boxed_str(),
             raw_headers: raw_headers.into_boxed_slice(),
             contents: build_metadata_contents(message),
@@ -224,8 +225,37 @@ impl IndexMessage for BatchBuilder {
             } else {
                 0
             }) | (received_at & MESSAGE_RECEIVED_MASK),
-        };
+        }
+    }
+}
 
+impl IndexMessage for BatchBuilder {
+    fn index_message<'x>(
+        &mut self,
+        tenant_id: Option<u32>,
+        message: mail_parser::Message<'x>,
+        extra_headers: Vec<u8>,
+        extra_headers_parsed: Vec<mail_parser::Header<'x>>,
+        blob_hash: BlobHash,
+        data: MessageData,
+        received_at: u64,
+    ) -> trc::Result<&mut Self> {
+        let metadata = MessageMetadata::build(
+            message,
+            extra_headers,
+            extra_headers_parsed,
+            blob_hash,
+            received_at,
+        );
+        self.index_metadata(tenant_id, metadata, data)
+    }
+
+    fn index_metadata(
+        &mut self,
+        tenant_id: Option<u32>,
+        metadata: MessageMetadata,
+        data: MessageData,
+    ) -> trc::Result<&mut Self> {
         self.set(
             BlobOp::Link {
                 hash: metadata.blob_hash.clone(),

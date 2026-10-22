@@ -7,7 +7,10 @@
 use super::{STRONG, user_permissions};
 use crate::utils::{
     server::TestServer,
-    za::{VaultReply, assert_nothing_cached, caldav_from, park_login, za_post, za_post_from},
+    za::{
+        VaultReply, assert_nothing_cached, caldav_from, code, park_login, totp_url, za_post,
+        za_post_from,
+    },
 };
 use common::ipc::CacheInvalidation;
 use http::api::vault::MAX_OTP_AUTH_URL;
@@ -41,24 +44,6 @@ async fn caldav(secret: &str, status: StatusCode) {
 /// Deliberate failure: sent from `FAIL_IP`.
 async fn za_fail(path: &str, body: &Value) -> VaultReply {
     za_post_from(FAIL_IP, path, body).await
-}
-
-fn totp_url() -> String {
-    totp_rs::Builder::new()
-        .with_secret(store::rand::random::<[u8; 20]>())
-        .with_account_name("key8")
-        .with_issuer(Some("Stalwart"))
-        .build()
-        .unwrap()
-        .to_url()
-        .unwrap()
-}
-
-fn code(url: &str) -> String {
-    totp_rs::Totp::from_url(url)
-        .unwrap()
-        .generate_current()
-        .to_string()
 }
 
 /// The codes `check_current` could accept now, including the next step in

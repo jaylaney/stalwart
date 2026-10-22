@@ -23,10 +23,12 @@ pub mod store;
 pub mod thread;
 pub mod uidbatches;
 pub mod uidonly;
+pub mod za_variants;
 
 use crate::utils::{
     imap::{AssertResult, ImapConnection, Type},
     server::TestServerBuilder,
+    za::key_accounts_mode,
 };
 use ahash::AHashSet;
 use imap_proto::ResponseType;
@@ -96,15 +98,18 @@ pub async fn imap_tests() {
             &[][..],
         ),
     ] {
-        let account = admin
-            .create_user_account(
-                name,
-                secret,
-                description,
-                aliases,
-                vec![Permission::UnlimitedRequests, Permission::UnlimitedUploads],
-            )
-            .await;
+        let permissions = vec![Permission::UnlimitedRequests, Permission::UnlimitedUploads];
+        // Key mode (mail spec 11): every user is a zero-access key account;
+        // the group and the admin stay plain, as in `webdav_tests`.
+        let account = if key_accounts_mode() {
+            admin
+                .create_key_user_account(name, secret, description, aliases, permissions)
+                .await
+        } else {
+            admin
+                .create_user_account(name, secret, description, aliases, permissions)
+                .await
+        };
         test.insert_account(account);
     }
 
@@ -251,15 +256,32 @@ pub async fn imap_tests() {
 
     mailbox::test(&mut imap, &mut imap_check, &test).await;
     append::test(&mut imap, &mut imap_check, &test).await;
-    search::test(&mut imap, &mut imap_check, &test).await;
-    fetch::test(&mut imap, &mut imap_check).await;
+    if key_accounts_mode() {
+        za_variants::search(&mut imap, &mut imap_check).await;
+        za_variants::fetch(&mut imap, &mut imap_check).await;
+    } else {
+        search::test(&mut imap, &mut imap_check, &test).await;
+        fetch::test(&mut imap, &mut imap_check).await;
+    }
     objectid::test(&test).await;
-    store::test(&mut imap, &mut imap_check, &test).await;
+    if key_accounts_mode() {
+        za_variants::store(&mut imap, &test).await;
+    } else {
+        store::test(&mut imap, &mut imap_check, &test).await;
+    }
     copy_move::test(&mut imap, &mut imap_check).await;
-    thread::test(&mut imap, &mut imap_check, &test).await;
+    if key_accounts_mode() {
+        za_variants::thread(&mut imap, &test).await;
+    } else {
+        thread::test(&mut imap, &mut imap_check, &test).await;
+    }
     idle::test(&mut imap, &mut imap_check, false).await;
     condstore::test(&mut imap, &mut imap_check).await;
-    acl::test(&mut imap, &mut imap_check, &test).await;
+    if key_accounts_mode() {
+        za_variants::acl(&mut imap, &test).await;
+    } else {
+        acl::test(&mut imap, &mut imap_check, &test).await;
+    }
     uidbatches::test(&mut imap, &mut imap_check).await;
     messagelimit::test(&mut imap, &mut imap_check).await;
 
@@ -276,7 +298,11 @@ pub async fn imap_tests() {
     }
 
     // Antispam training
-    antispam::test(&test).await;
+    if key_accounts_mode() {
+        za_variants::antispam(&test).await;
+    } else {
+        antispam::test(&test).await;
+    }
 
     // Run ManageSieve tests
     managesieve::test(&test).await;

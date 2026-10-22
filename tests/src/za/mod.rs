@@ -8,7 +8,7 @@ use crate::utils::server::{TestServer, TestServerBuilder};
 use ::registry::schema::{
     enums::{NetworkListenerProtocol, Permission},
     prelude::Property,
-    structs::{Http, Imap, Rate},
+    structs::{Expression, Http, Imap, MtaStageAuth, Rate},
 };
 use ::registry::types::duration::Duration;
 use common::za::test_hooks;
@@ -27,6 +27,7 @@ pub mod gating;
 pub mod inbox;
 pub mod index_task;
 pub mod leak;
+pub mod mail;
 pub mod pairs;
 pub mod password;
 pub mod pinning;
@@ -100,6 +101,20 @@ pub async fn za_tests() {
             &[Property::AllowPlainTextAuth],
         )
         .await;
+    // The mail modules deliver over the LMTP listener without authenticating
+    // (`mail::deliver`); every other listener keeps upstream's requirement.
+    admin
+        .registry_update_setting(
+            MtaStageAuth {
+                require: Expression {
+                    else_: "local_port != 25 && local_port != 11200".to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            &[Property::Require],
+        )
+        .await;
     admin.reload_settings().await;
     test.insert_account(plain);
     test.insert_account(admin);
@@ -150,10 +165,20 @@ pub async fn za_tests() {
     inbox::test_expiry(&mut test).await;
     leak::test_drain(&mut test).await;
     leak::test_pins(&mut test).await;
+    leak::test_mail(&mut test).await;
     leak::test(&mut test).await;
     leak::test_index_control(&mut test).await;
     index_task::test(&mut test).await;
     index_task::test_sealed_archive(&mut test).await;
+    mail::login::test(&mut test).await;
+    mail::delivery::test(&mut test).await;
+    mail::writes::test(&mut test).await;
+    mail::fence::test(&mut test).await;
+    mail::reads::test(&mut test).await;
+    mail::uploads::test(&mut test).await;
+    mail::gates::test(&mut test).await;
+    mail::search::test(&mut test).await;
+    mail::traces::test(&mut test).await;
 
     destroy_key_accounts(&test).await;
     test.assert_is_empty().await;

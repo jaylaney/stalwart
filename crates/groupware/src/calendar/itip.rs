@@ -335,6 +335,9 @@ impl ItipIngest for Server {
                     &mut batch,
                 )
                 .caused_by(trc::location!())?;
+            // Mail spec 6.1: iMIP is reached only for an account read as
+            // ordinary; its writes take the ingest's provisioning fence.
+            self.za_provisioning_fence(&mut batch, account_id);
             self.commit_batch(batch).await.caused_by(trc::location!())?;
 
             Ok(None)
@@ -861,6 +864,9 @@ async fn commit_itip_merge(
             &mut batch,
         )
         .caused_by(trc::location!())?;
+    // Mail spec 6.1: as the import's batch in `itip_ingest`; the RSVP
+    // handler, the other caller, refuses key accounts' links before this.
+    server.za_provisioning_fence(&mut batch, account_id);
     server
         .commit_batch(batch)
         .await

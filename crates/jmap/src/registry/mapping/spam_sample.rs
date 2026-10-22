@@ -12,6 +12,7 @@ use crate::{
         query::RegistryQueryFilters,
     },
 };
+use email::message::za::view::ZaMailView;
 use jmap_proto::{error::set::SetError, types::state::State};
 use jmap_tools::JsonPointer;
 use mail_parser::{MessageParser, parsers::fields::thread::thread_name};
@@ -81,6 +82,8 @@ pub(crate) async fn spam_sample_set(
             continue;
         }
 
+        // Mail spec 5.7, ruling R32: a sealed source never becomes a sample.
+        set.server.za_refuse_raw_source(&sample.blob_id).await?;
         let Some(bytes) = set
             .server
             .blob_download(&sample.blob_id, set.access_token)

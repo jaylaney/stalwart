@@ -26,6 +26,7 @@ const LABEL_RKEK: &[u8] = b"za/v1/rkek";
 const LABEL_AKEK_PREFIX: &[u8] = b"za/v1/akek/";
 const LABEL_EVENTS: &[u8] = b"za/v1/events";
 const LABEL_PK: &[u8] = b"za/v1/pk";
+const LABEL_MAIL: &[u8] = b"za/v1/mail";
 const AAD_PREFIX: &[u8] = b"za/v1|";
 
 /// A 32-byte secret that is zeroed on drop and never printed.
@@ -147,6 +148,12 @@ pub fn derive_app_kek(secret: &[u8], credential_id: u32) -> Secret {
 
 pub fn derive_event_key(mk: &Secret) -> Secret {
     hkdf_expand(mk.as_bytes(), LABEL_EVENTS)
+}
+
+/// The mail wrapping key (mail spec 3.1): wraps the per-message DEK of every
+/// message written during a session.
+pub fn derive_mail_key(mk: &Secret) -> Secret {
+    hkdf_expand(mk.as_bytes(), LABEL_MAIL)
 }
 
 /// AAD purpose of the primary-password wrap of MK.
@@ -377,8 +384,9 @@ pub fn pk_wrap(
     Ok((ephemeral_public, wrap_key(dek, &wrapping, aad)))
 }
 
-/// Opens a `pk_wrap` with the recipient's private key. Only the drain calls
-/// this (invariant 11).
+/// Opens a `pk_wrap` with the recipient's private key. The drain and a mail
+/// session holding the owner's keys call this (invariant 11 as amended by the
+/// mail spec, section 12).
 pub fn pk_unwrap(
     ephemeral: &[u8; PUBLIC_KEY_LEN],
     wrapped: &[u8],
@@ -535,6 +543,24 @@ mod tests {
         assert_eq!(
             derive_event_key(&mk).as_bytes(),
             derive_event_key(&mk).as_bytes()
+        );
+    }
+
+    #[test]
+    fn the_mail_key_is_deterministic_and_independent_of_the_event_key() {
+        let mk = Secret::random();
+        assert_eq!(
+            derive_mail_key(&mk).as_bytes(),
+            derive_mail_key(&mk).as_bytes()
+        );
+        assert_ne!(
+            derive_mail_key(&mk).as_bytes(),
+            derive_event_key(&mk).as_bytes()
+        );
+        assert_ne!(derive_mail_key(&mk).as_bytes(), mk.as_bytes());
+        assert_ne!(
+            derive_mail_key(&mk).as_bytes(),
+            derive_mail_key(&Secret::random()).as_bytes()
         );
     }
 

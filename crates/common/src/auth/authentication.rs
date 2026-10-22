@@ -40,10 +40,12 @@ pub struct Username {
 }
 
 impl Server {
-    /// Authenticates a request. The token never carries session keys: IMAP,
-    /// POP3, ManageSieve and long-lived HTTP streams hold their token for the
-    /// connection's lifetime, past the key residency bound (spec 2, 5). A
-    /// key account's keys, derived to verify the password, are dropped here.
+    /// Authenticates a request. The token never carries session keys: SMTP,
+    /// ManageSieve and long-lived HTTP streams hold their token for the
+    /// connection's lifetime, past the key residency bound (spec 2, 5), and
+    /// need no keys. A key account's keys, derived to verify the password,
+    /// are dropped here. IMAP and POP3 sessions, which hold the keys for the
+    /// connection (mail spec 3.3), use `authenticate_with_keys`.
     pub async fn authenticate(&self, req: &AuthRequest) -> trc::Result<AccessToken> {
         self.authenticate_with_keys(req)
             .await
@@ -51,9 +53,11 @@ impl Server {
     }
 
     /// As `authenticate`, with a key account's session keys returned beside
-    /// the (keyless) token. Only the HTTP authentication layer and the vault
-    /// endpoints' fresh verification use this; the HTTP layer attaches the
-    /// keys to the request's token under the residency rules (spec 5).
+    /// the (keyless) token. The HTTP authentication layer, the vault
+    /// endpoints' fresh verification and the IMAP and POP3 logins use this:
+    /// the HTTP layer attaches the keys to the request's token under the
+    /// residency rules (spec 5), and an IMAP or POP3 session attaches them to
+    /// its own token for the connection (mail spec 3.3).
     pub async fn authenticate_with_keys(
         &self,
         req: &AuthRequest,
@@ -143,6 +147,7 @@ impl Server {
                                 self.access_token(account_id)
                                     .await
                                     .and_then(|token| AccessToken::new(token, req.remote_ip))
+                                    .map(AccessToken::with_za_impersonation)
                             } else {
                                 Err(trc::AuthEvent::Failed
                                     .into_err()
@@ -364,6 +369,7 @@ impl Server {
                         self.access_token(account_id)
                             .await
                             .map(AccessToken::new_maybe_invalid)
+                            .map(AccessToken::with_za_impersonation)
                     } else {
                         Err(trc::AuthEvent::Failed
                             .into_err()

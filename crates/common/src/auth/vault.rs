@@ -17,13 +17,28 @@ use ::vault::{
     session::SessionKeys,
 };
 use directory::core::secret::verify_totp_code;
+use registry::{
+    schema::{
+        prelude::{ObjectType, Property},
+        structs::Task,
+    },
+    types::EnumImpl,
+};
 use std::sync::{Arc, LazyLock};
 use store::{
-    Deserialize, IterateParams, Serialize, Store, ValueKey,
-    write::{AlignedBytes, Archive, Archiver, BatchBuilder, ValueClass, assert::AssertValue, now},
+    Deserialize, IterateParams, Serialize, SerializeInfallible, Store, ValueKey,
+    search::IndexDocument,
+    write::{
+        AlignedBytes, Archive, Archiver, BatchBuilder, RegistryClass, SearchIndex,
+        SearchIndexClass, SearchIndexId, SearchIndexType, TaskQueueClass, ValueClass,
+        assert::AssertValue, now,
+    },
 };
 use trc::AddContext;
-use types::{collection::Collection, field::PrincipalField};
+use types::{
+    collection::Collection,
+    field::{Field, PrincipalField},
+};
 use utils::{DomainPart, sanitize_email};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -150,6 +165,28 @@ pub(crate) async fn vault_write_store(
             .caused_by(trc::location!()));
     }
     vault_batch_write(store, account_id, record, previous, None).await
+}
+
+/// The recheck's abort (mail spec 6.1): one batch on Principal document 0
+/// asserting the bytes `previous` read, then clearing the record. A lost
+/// assertion is `Err(e)` with `e.is_assertion_failure()` and nothing
+/// removed.
+pub(crate) async fn vault_delete_store(
+    store: &Store,
+    account_id: u32,
+    previous: &VaultRead,
+) -> trc::Result<()> {
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(account_id)
+        .with_collection(Collection::Principal)
+        .with_document(0)
+        .assert_value(
+            PrincipalField::ZeroAccessVault,
+            AssertValue::Hash(previous.cas),
+        )
+        .clear(PrincipalField::ZeroAccessVault);
+    store.write(batch.build_all()).await.map(|_| ())
 }
 
 /// The one vault batch, shared by the raw write (`vault_write_store`) and
@@ -430,6 +467,60 @@ impl Server {
         Ok(())
     }
 
+    /// The recheck's abort (mail spec 6.1): removes a pending record this
+    /// process wrote, conditional on the bytes it wrote (`previous`), then
+    /// invalidates as `za_vault_commit` does. A lost assertion is `Err(e)`
+    /// with `e.is_assertion_failure()`, nothing removed.
+    pub async fn za_vault_delete(&self, account_id: u32, previous: &VaultRead) -> trc::Result<()> {
+        vault_delete_store(self.store(), account_id, previous).await?;
+        self.za_invalidate_committed(account_id).await;
+        Ok(())
+    }
+
+    /// Mail spec 6.1, the provisioning fence: appended as the last ops of a
+    /// batch that stores into `account_id` read as an ordinary account, it
+    /// commits the batch only while the account holds no vault record. Last,
+    /// because the context it selects is not restored for later ops. Nothing
+    /// on PostgreSQL or MySQL: key accounts cannot exist there (`setup-token`
+    /// refuses) and the assertion would be no fence.
+    pub fn za_provisioning_fence(&self, batch: &mut BatchBuilder, account_id: u32) {
+        if !self.store().is_pg_or_mysql() {
+            batch
+                .with_account_id(account_id)
+                .with_collection(Collection::Principal)
+                .with_document(0)
+                .assert_value(PrincipalField::ZeroAccessVault, AssertValue::None);
+        }
+    }
+
+    /// Mail ruling R58, spec 12's rule 32 for the index worker: a search
+    /// document built from `account_id` read as an ordinary account is
+    /// written by the internal search store only while the account holds no
+    /// vault record, asserted in the document's first commit chunk (the one
+    /// with its `Document` key). A superseded execution (a worker that
+    /// outlived its task lease) therefore cannot write after provisioning,
+    /// and a first chunk that commits first is seen by the recheck's
+    /// document scan (R51). Ruling R62 conditions every later chunk on that
+    /// `Document` key (`Store::index`), so a chunk that commits after the
+    /// document's unindex writes nothing. Nothing on PostgreSQL or MySQL,
+    /// as `za_provisioning_fence`, or without an internal search store. On
+    /// a search store other than the data store (a separate FoundationDB
+    /// store among them) the assertion reads the search store's key space
+    /// and passes vacuously: R51's recorded limit. R62's guard holds there,
+    /// since the `Document` key lives in the search store.
+    pub fn za_index_fence(&self, document: IndexDocument, account_id: u32) -> IndexDocument {
+        if self.store().is_pg_or_mysql() || self.search_store().internal_fts().is_none() {
+            document
+        } else {
+            document.with_assert_absent(
+                account_id,
+                Collection::Principal,
+                0,
+                PrincipalField::ZeroAccessVault,
+            )
+        }
+    }
+
     /// The invalidation after a committed vault write; a failure is logged,
     /// never returned.
     async fn za_invalidate_committed(&self, account_id: u32) {
@@ -572,12 +663,27 @@ impl Server {
         account_id: u32,
         collection: Collection,
     ) -> trc::Result<bool> {
+        self.za_has_property(account_id, collection, Field::ARCHIVE)
+            .await
+    }
+
+    /// True when any document of `collection` in the account holds the
+    /// property `field`. Mail ruling R46: a destroyed message's metadata
+    /// archive (`EmailField::Metadata`) outlives its archive until the
+    /// scheduled unindex task runs.
+    pub async fn za_has_property(
+        &self,
+        account_id: u32,
+        collection: Collection,
+        field: impl Into<u8>,
+    ) -> trc::Result<bool> {
+        let field = field.into();
         let mut found = false;
         self.store()
             .iterate(
                 IterateParams::new(
-                    ValueKey::archive(account_id, collection, 0),
-                    ValueKey::archive(account_id, collection, u32::MAX),
+                    ValueKey::property(account_id, collection, 0, field),
+                    ValueKey::property(account_id, collection, u32::MAX, field),
                 )
                 .no_values()
                 .only_first(),
@@ -589,6 +695,173 @@ impl Server {
             .await
             .caused_by(trc::location!())?;
         Ok(found)
+    }
+
+    /// Mail ruling R52: true when any spam training sample is indexed under
+    /// the account (the `AccountId` index the trainer's `delete_samples`
+    /// clears). A sample keeps its message's blob linked and its sender and
+    /// subject in the registry until it expires.
+    pub async fn za_has_spam_samples(&self, account_id: u32) -> trc::Result<bool> {
+        let index = |item_id| {
+            ValueKey::from(ValueClass::Registry(RegistryClass::Index {
+                index_id: Property::AccountId.to_id(),
+                object_id: ObjectType::SpamTrainingSample.to_id(),
+                item_id,
+                key: (account_id as u64).serialize(),
+            }))
+        };
+        let mut found = false;
+        self.store()
+            .iterate(
+                IterateParams::new(index(0), index(u64::MAX))
+                    .no_values()
+                    .only_first(),
+                |_, _| {
+                    found = true;
+                    Ok(false)
+                },
+            )
+            .await
+            .caused_by(trc::location!())?;
+        Ok(found)
+    }
+
+    /// Mail ruling R54: true when the task queue holds an `IndexDocument`,
+    /// `UnindexDocument`, `MergeThreads` or `CalendarItipMessage` task of the
+    /// account, pending, retrying, in flight or failed. A task's record stays
+    /// in the queue from the batch that schedules it until the worker's
+    /// `update_tasks`, so an index write still in flight is seen here before
+    /// it lands; a retained merge task holds a subject of up to 15 bytes
+    /// verbatim (`CheekyHash`). The queue has no per-account range: one pass
+    /// over every task record, stopping at the first hit.
+    pub async fn za_has_tasks(&self, account_id: u32) -> trc::Result<bool> {
+        let task = |id| ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task { id }));
+        let mut found = false;
+        self.store()
+            .iterate(
+                IterateParams::new(task(0), task(u64::MAX)).ascending(),
+                |_, value| {
+                    let owner = match Task::deserialize(value)? {
+                        Task::IndexDocument(task) | Task::UnindexDocument(task) => {
+                            Some(task.account_id)
+                        }
+                        Task::MergeThreads(task) => Some(task.account_id),
+                        Task::CalendarItipMessage(task) => Some(task.account_id),
+                        // Content-free (ids and times) and possibly due days
+                        // ahead.
+                        Task::CalendarAlarmEmail(_) | Task::CalendarAlarmNotification(_) => None,
+                        // Scheduled for every account by the store's purge and
+                        // reindex sweeps.
+                        Task::AccountMaintenance(_) => None,
+                        // Not a provisioning state.
+                        Task::DestroyAccount(_) | Task::RestoreArchivedItem(_) => None,
+                        // No account.
+                        Task::IndexTrace(_)
+                        | Task::DmarcReport(_)
+                        | Task::TlsReport(_)
+                        | Task::TenantMaintenance(_)
+                        | Task::StoreMaintenance(_)
+                        | Task::SpamFilterMaintenance(_)
+                        | Task::AcmeRenewal(_)
+                        | Task::DkimManagement(_)
+                        | Task::DnsManagement(_) => None,
+                    };
+                    found = owner.is_some_and(|owner| owner.document_id() == account_id);
+                    Ok(!found)
+                },
+            )
+            .await
+            .caused_by(trc::location!())?;
+        Ok(found)
+    }
+
+    /// Mail ruling R51: true when the internal search store holds an Email
+    /// document of the account. Each indexed document has one `Document`
+    /// key, the ground truth there; the unindex task deletes it in a write
+    /// after the one that clears the metadata archive. The `Document` keys
+    /// are not the whole index: ruling R62 also scans the account's `Term`
+    /// and `Index` keys (`za_has_email_search_terms`). Any search store
+    /// other than the internal one (ElasticSearch, MeiliSearch, or a
+    /// PostgreSQL or MySQL search store) is not checked, a recorded limit.
+    pub async fn za_has_email_search_documents(&self, account_id: u32) -> trc::Result<bool> {
+        self.za_has_search_documents(account_id, SearchIndex::Email)
+            .await
+    }
+
+    /// Mail ruling R60: R51's scan for `SearchIndex::Calendar`. A calendar
+    /// event's document holds its summary, description, location and
+    /// participants, and its index write can land after the event's unindex
+    /// (P2-1's interleaving), so the document scan after R54's queue term
+    /// covers calendar documents too. The same recorded limit as R51.
+    pub async fn za_has_calendar_search_documents(&self, account_id: u32) -> trc::Result<bool> {
+        self.za_has_search_documents(account_id, SearchIndex::Calendar)
+            .await
+    }
+
+    /// True when the internal search store holds a document of the account
+    /// in `index` (one `only_first`, `no_values` iteration of its
+    /// `Document` keys); false without an internal search store.
+    async fn za_has_search_documents(
+        &self,
+        account_id: u32,
+        index: SearchIndex,
+    ) -> trc::Result<bool> {
+        let Some(store) = self.search_store().internal_fts() else {
+            return Ok(false);
+        };
+        let document = |document_id| {
+            ValueKey::from(ValueClass::SearchIndex(SearchIndexClass {
+                index,
+                id: SearchIndexId::Account {
+                    account_id,
+                    document_id,
+                },
+                typ: SearchIndexType::Document,
+            }))
+        };
+        let mut found = false;
+        store
+            .iterate(
+                IterateParams::new(document(0), document(u32::MAX))
+                    .no_values()
+                    .only_first(),
+                |_, _| {
+                    found = true;
+                    Ok(false)
+                },
+            )
+            .await
+            .caused_by(trc::location!())?;
+        Ok(found)
+    }
+
+    /// Mail ruling R62: true when the internal search store holds a `Term`
+    /// or `Index` key of the account in the Email index.
+    pub async fn za_has_email_search_terms(&self, account_id: u32) -> trc::Result<bool> {
+        self.za_has_search_terms(account_id, SearchIndex::Email)
+            .await
+    }
+
+    /// Mail ruling R62: `za_has_email_search_terms` for
+    /// `SearchIndex::Calendar`.
+    pub async fn za_has_calendar_search_terms(&self, account_id: u32) -> trc::Result<bool> {
+        self.za_has_search_terms(account_id, SearchIndex::Calendar)
+            .await
+    }
+
+    /// Mail ruling R62: a document's `Term` and `Index` keys can outlive its
+    /// `Document` key (a calendar merge that lost its clears, an Email
+    /// re-index whose terms changed, a tail written before R62's guard), so
+    /// R51's ground truth is incomplete; the same recorded limit as R51.
+    /// False without an internal search store.
+    async fn za_has_search_terms(&self, account_id: u32, index: SearchIndex) -> trc::Result<bool> {
+        let Some(store) = self.search_store().internal_fts() else {
+            return Ok(false);
+        };
+        store
+            .has_account_search_terms(index, account_id)
+            .await
+            .caused_by(trc::location!())
     }
 }
 
@@ -1143,6 +1416,32 @@ mod tests {
         let after = vault_read_store(&store, 4).await.unwrap().unwrap();
         assert_eq!(after.cas, read.cas);
         assert_eq!(after.record, record);
+    }
+
+    /// Mail spec 6.1: the recheck's abort removes only the bytes it read.
+    #[tokio::test]
+    async fn a_pending_record_is_deleted_only_at_its_own_revision() {
+        let store = EphemeralStore::open();
+        let mut record = VaultRecord::pending(vec![1; 32], 0);
+        vault_commit_store(&store, 9, &mut record, None, None)
+            .await
+            .unwrap();
+        let read = vault_read_store(&store, 9).await.unwrap().unwrap();
+        let mut rotated = read.record.clone();
+        vault_commit_store(&store, 9, &mut rotated, Some(&read), None)
+            .await
+            .unwrap();
+        assert!(
+            vault_delete_store(&store, 9, &read)
+                .await
+                .unwrap_err()
+                .is_assertion_failure(),
+            "stale cas"
+        );
+        let read = vault_read_store(&store, 9).await.unwrap().unwrap();
+        assert_eq!(read.record.revision, 2, "the lost delete removed nothing");
+        vault_delete_store(&store, 9, &read).await.unwrap();
+        assert!(vault_read_store(&store, 9).await.unwrap().is_none());
     }
 
     fn test_totp_url() -> String {

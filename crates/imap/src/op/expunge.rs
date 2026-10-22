@@ -139,6 +139,18 @@ impl<T: SessionStream> SessionData<T> {
         message_limit: u32,
         op_start: Instant,
     ) -> trc::Result<Option<u32>> {
+        // Mail spec 6.3, ruling R34: nothing is expunged from a key account's
+        // mailbox through another account's session. EXPUNGE is refused
+        // before (`check_mailbox_acl`); CLOSE deselects without expunging.
+        if self
+            .server
+            .za_foreign_key_account(&self.access_token, mailbox.id.account_id)
+            .await
+            .caused_by(trc::location!())?
+        {
+            return Ok(None);
+        }
+
         // Obtain message ids
         let account_id = mailbox.id.account_id;
         let mut deleted_ids = RoaringBitmap::from_iter(

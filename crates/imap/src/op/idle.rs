@@ -200,6 +200,17 @@ impl<T: SessionStream> SessionData<T> {
         if check_emails {
             // Synchronize emails
             if let Some(mailbox) = mailbox {
+                // Mail spec 6.3, ruling R34: another account's session gets no
+                // update of a key account's mailbox it still has selected; the
+                // calling command completes.
+                if self
+                    .server
+                    .za_foreign_key_account(&self.access_token, mailbox.id.account_id)
+                    .await
+                    .caused_by(trc::location!())?
+                {
+                    return Ok(());
+                }
                 // Obtain changes since last sync
                 let modseq = mailbox.state.lock().modseq;
                 let new_state = self

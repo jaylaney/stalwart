@@ -6,7 +6,13 @@
 
 use crate::task_manager::{Task, TaskDetails, TaskFailureType, TaskResult, deferred_retry_time};
 use common::Server;
-use email::{cache::MessageCacheFetch, message::metadata::MessageMetadata};
+use email::{
+    cache::MessageCacheFetch,
+    message::{
+        metadata::{MESSAGE_RECEIVED_MASK, MessageData, MessageMetadata},
+        za::is_stub,
+    },
+};
 use groupware::{
     cache::GroupwareCache,
     calendar::{CalendarEvent, seal::archived_event_is_sealed},
@@ -25,7 +31,7 @@ use store::{
     IterateParams, ValueKey,
     ahash::AHashMap,
     rand::{self, RngExt},
-    search::{IndexDocument, SearchField, SearchFilter, SearchQuery},
+    search::{EmailSearchField, IndexDocument, SearchField, SearchFilter, SearchQuery},
     write::{
         AlignedBytes, Archive, BatchBuilder, SearchIndex, TelemetryClass, ValueClass,
         key::DeserializeBigEndian, now,
@@ -248,6 +254,15 @@ impl SearchIndexTask for Server {
             return results;
         }
 
+        // Mail ruling R54's test: the documents are built, not yet written.
+        #[cfg(feature = "test_mode")]
+        for task in tasks {
+            if let Task::IndexDocument(task) = &task.task {
+                common::za::test_hooks::index_write_pause_point(task.account_id.document_id())
+                    .await;
+            }
+        }
+
         // Index documents
         if !document_insertions.is_empty()
             && let Err(err) = self.search_store().index(document_insertions).await
@@ -462,6 +477,54 @@ async fn build_email_document(
                 .unarchive::<MessageMetadata>()
                 .caused_by(trc::location!())?;
 
+            // Mail spec 5.5: a key account's message, or a stub of an account
+            // that no longer exists (the destroyed-account window), is
+            // indexed by its visible fields alone, read without a key; no
+            // blob. An existing ordinary account's message keeps upstream's
+            // document whatever its header block starts with (ruling R47).
+            if server.za_is_key_account(account_id).await?
+                || (is_stub(metadata)
+                    && server
+                        .try_account(account_id)
+                        .await
+                        .caused_by(trc::location!())?
+                        .is_none())
+            {
+                let Some(data) = server
+                    .store()
+                    .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                        account_id,
+                        Collection::Email,
+                        document_id,
+                    ))
+                    .await?
+                else {
+                    return Ok(BuildResult::NotFound);
+                };
+                let size = data
+                    .unarchive::<MessageData>()
+                    .caused_by(trc::location!())?
+                    .size
+                    .to_native();
+                let mut document = IndexDocument::new(SearchIndex::Email)
+                    .with_account_id(account_id)
+                    .with_document_id(document_id);
+                // As upstream's `index_document`, only the configured fields.
+                let indexed = |field| {
+                    index_fields.is_empty() || index_fields.contains(&SearchField::Email(field))
+                };
+                if indexed(EmailSearchField::ReceivedAt) {
+                    document.index_unsigned(
+                        EmailSearchField::ReceivedAt,
+                        metadata.rcvd_attach.to_native() & MESSAGE_RECEIVED_MASK,
+                    );
+                }
+                if indexed(EmailSearchField::Size) {
+                    document.index_unsigned(EmailSearchField::Size, size);
+                }
+                return Ok(BuildResult::Document(document));
+            }
+
             let raw_message = server
                 .blob_store()
                 .get_blob(metadata.blob_hash.0.as_slice(), 0..usize::MAX)
@@ -473,12 +536,16 @@ async fn build_email_document(
                         .details("Blob not found")
                 })?;
 
-            Ok(BuildResult::Document(metadata.index_document(
+            // Mail ruling R58: written only while no vault record exists.
+            Ok(BuildResult::Document(server.za_index_fence(
+                metadata.index_document(
+                    account_id,
+                    document_id,
+                    &raw_message,
+                    index_fields,
+                    server.core.email.default_language,
+                ),
                 account_id,
-                document_id,
-                &raw_message,
-                index_fields,
-                server.core.email.default_language,
             )))
         }
         None => Ok(BuildResult::NotFound),
@@ -518,11 +585,15 @@ async fn build_calendar_document(
             if archived_event_is_sealed(event) {
                 return Ok(BuildResult::NotIndexed);
             }
-            Ok(BuildResult::Document(event.index_document(
+            // Mail ruling R58: written only while no vault record exists.
+            Ok(BuildResult::Document(server.za_index_fence(
+                event.index_document(
+                    account_id,
+                    document_id,
+                    index_fields,
+                    server.core.email.default_language,
+                ),
                 account_id,
-                document_id,
-                index_fields,
-                server.core.email.default_language,
             )))
         }
         None => Ok(BuildResult::NotFound),

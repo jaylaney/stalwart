@@ -296,6 +296,16 @@ impl OAuthApiHandler for Server {
                     .await
                 {
                     Ok(access_token) => {
+                        // Mail ruling R36: no code for an impersonated login
+                        // of a key account.
+                        if self
+                            .za_oauth_grant_refused(&access_token, session.session_id)
+                            .await?
+                        {
+                            return Ok(JsonResponse::new(LoginResponse::Failure)
+                                .no_cache()
+                                .into_http_response());
+                        }
                         // Registry-backed clients are validated once the account is known
                         if stateless_client.is_none()
                             && self
@@ -400,6 +410,16 @@ impl OAuthApiHandler for Server {
                             .await
                         {
                             Ok(access_token) => {
+                                // Mail ruling R36: no code for an impersonated
+                                // login of a key account.
+                                if self
+                                    .za_oauth_grant_refused(&access_token, session.session_id)
+                                    .await?
+                                {
+                                    return Ok(JsonResponse::new(LoginResponse::Failure)
+                                        .no_cache()
+                                        .into_http_response());
+                                }
                                 let new_oauth_code = OAuthCode {
                                     status: OAuthStatus::Authorized,
                                     account_id: access_token.account_id(),

@@ -67,28 +67,40 @@
 //! - `REDELIVER_CLEANUP_PAUSE`: in `contacts/pin` after its last event
 //!   commit, before the step 5 retirement, keyed by the account
 //!   (`http::api::contacts`, key pinning spec 6.4).
+//! - `INGEST_PAUSE`: in `email_ingest` right after the account read (the
+//!   classification), keyed by the account (`email::message::ingest`, mail
+//!   spec 6.1's provisioning fence).
+//! - `COPY_PAUSE`: in `copy_message` right after the destination account
+//!   read, keyed by the destination (`email::message::copy`).
+//! - `SETUP_TOKEN_PAUSE`: in `setup-token` after its first emptiness check
+//!   and immediately before the pending record's write, keyed by the
+//!   account (`http::api::vault`, mail spec 6.1's recheck).
+//! - `FORCE_SQL_STORE`: `setup-token` answers as on PostgreSQL or MySQL
+//!   (mail spec 6.1).
+//! - `INDEX_WRITE_PAUSE`: in the index worker after its documents are built
+//!   and immediately before the search store's write, keyed by the account
+//!   of an `IndexDocument` task of the batch
+//!   (`services::task_manager::index`, mail ruling R54).
+//! - `TRAIN_PAUSE`: in `add_account_spam_sample` after the message's
+//!   metadata read and before the sample is added to the batch, keyed by
+//!   the sample's account (`email::message::ingest`, mail ruling R55).
+//! - `INDEX_CHUNK_PAUSE`: in `Store::index` after a multi-chunk document's
+//!   first commit chunk and before its second, keyed by the document's
+//!   account (`store::search::index`, mail ruling R62); defined in
+//!   `store::za_test` and re-exported here.
+//! - `INDEX_GUARD_FAIL_ONCE`: the account's next later commit chunk of a
+//!   guarded search document is not written and fails with
+//!   `AssertValueFailed`, as FoundationDB reports a read error at the
+//!   guard's assertion (`store::search::index`, mail ruling R63); defined in
+//!   `store::za_test` and re-exported here.
 
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
-use tokio::sync::Notify;
-
-pub struct Pause {
-    pub account_id: u32,
-    pub arrived: Notify,
-    pub release: Notify,
-}
-
-impl Pause {
-    pub fn new(account_id: u32) -> Self {
-        Pause {
-            account_id,
-            arrived: Notify::new(),
-            release: Notify::new(),
-        }
-    }
-}
+pub use store::za_test::{
+    INDEX_GUARD_FAIL_ONCE, Pause, set_index_chunk_pause, set_index_guard_fail_once,
+};
 
 pub static FAN_OUT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
@@ -125,6 +137,19 @@ pub static RETIRE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static PIN_WRITE_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
 
 pub static REDELIVER_CLEANUP_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
+pub static INGEST_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
+pub static COPY_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
+pub static SETUP_TOKEN_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
+pub static INDEX_WRITE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
+pub static TRAIN_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
+/// Whether `setup-token` treats the data store as PostgreSQL or MySQL.
+pub static FORCE_SQL_STORE: AtomicBool = AtomicBool::new(false);
 
 /// Accounts whose drain does not run; `DRAIN_SKIP_ALL` stands for every
 /// account.
@@ -225,6 +250,34 @@ pub fn set_retire_pause(pause: Option<Arc<Pause>>) {
 
 pub fn set_redeliver_cleanup_pause(pause: Option<Arc<Pause>>) {
     set_slot(&REDELIVER_CLEANUP_PAUSE, pause);
+}
+
+pub fn set_ingest_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&INGEST_PAUSE, pause);
+}
+
+pub fn set_copy_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&COPY_PAUSE, pause);
+}
+
+pub fn set_setup_token_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SETUP_TOKEN_PAUSE, pause);
+}
+
+pub fn set_index_write_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&INDEX_WRITE_PAUSE, pause);
+}
+
+pub fn set_train_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&TRAIN_PAUSE, pause);
+}
+
+pub fn set_force_sql_store(force: bool) {
+    FORCE_SQL_STORE.store(force, Ordering::SeqCst);
+}
+
+pub fn force_sql_store() -> bool {
+    FORCE_SQL_STORE.load(Ordering::SeqCst)
 }
 
 pub fn set_pin_write_fail(account_id: Option<u32>) {
@@ -331,6 +384,26 @@ pub async fn retire_pause_point(sender_id: u32) {
 
 pub async fn redeliver_cleanup_pause_point(account_id: u32) {
     wait(take_for(&REDELIVER_CLEANUP_PAUSE, account_id)).await;
+}
+
+pub async fn ingest_pause_point(account_id: u32) {
+    wait(take_for(&INGEST_PAUSE, account_id)).await;
+}
+
+pub async fn copy_pause_point(to_account_id: u32) {
+    wait(take_for(&COPY_PAUSE, to_account_id)).await;
+}
+
+pub async fn setup_token_pause_point(account_id: u32) {
+    wait(take_for(&SETUP_TOKEN_PAUSE, account_id)).await;
+}
+
+pub async fn index_write_pause_point(account_id: u32) {
+    wait(take_for(&INDEX_WRITE_PAUSE, account_id)).await;
+}
+
+pub async fn train_pause_point(account_id: u32) {
+    wait(take_for(&TRAIN_PAUSE, account_id)).await;
 }
 
 /// Whether the account's fan-out or step 5 pin-record write must fail now;

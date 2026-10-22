@@ -43,6 +43,9 @@ pub struct ScriptParameters<'x> {
     access_token: Option<&'x AccessToken>,
     spam_status: Option<SpamStatus>,
     session_id: u64,
+    /// Mail ruling R57: the transaction is a key account's (a recipient or
+    /// the sender); the script's content-evaluated diagnostics are redacted.
+    za_redact: bool,
 }
 
 impl<'x> ScriptParameters<'x> {
@@ -59,6 +62,7 @@ impl<'x> ScriptParameters<'x> {
             access_token: None,
             spam_status: None,
             session_id: Default::default(),
+            za_redact: false,
         }
     }
 
@@ -125,6 +129,11 @@ impl<'x> ScriptParameters<'x> {
 
     pub fn with_session_id(mut self, session_id: u64) -> Self {
         self.session_id = session_id;
+        self
+    }
+
+    pub fn with_za_redact(mut self, redact: bool) -> Self {
+        self.za_redact = redact;
         self
     }
 }

@@ -694,6 +694,36 @@ impl Server {
         self.account_id_from_email_inner(address, true, true).await
     }
 
+    /// Mail ruling R56: `domain(domain)` without the cache events that carry
+    /// the name, for the spam filter's lookups of the domains a key
+    /// account's message names. A hit still reads `domain_by_id`, whose
+    /// cache events carry the domain id only.
+    pub async fn za_domain(&self, domain: &str) -> trc::Result<Option<Arc<DomainCache>>> {
+        self.domain_inner(domain, true).await
+    }
+
+    /// Mail spec 10: whether the accepted recipient `address` is a key
+    /// account's, found as local delivery finds it
+    /// (`account_id_from_email(address, false)`), without cache events, so an
+    /// ordinary RCPT traces nothing new. `rcpt_resolve` has usually cached
+    /// the account, but not always: list members and recipients added after
+    /// RCPT (a DATA-stage milter, an MTA hook, Sieve `SetEnvelope`) may not
+    /// be cached, and then `za_is_key_account` loads the account and its
+    /// lookup can emit Store `CacheMiss` / `CacheHit` events, which carry the
+    /// account id only, never the address.
+    pub async fn za_is_key_rcpt(&self, address: &str) -> trc::Result<bool> {
+        let Some(account_id) = self
+            .account_id_from_email_inner(address, false, true)
+            .await?
+        else {
+            return Ok(false);
+        };
+        match self.inner.cache.accounts.get(&account_id) {
+            Some(account) => Ok(account.is_key_account()),
+            None => self.za_is_key_account(account_id).await,
+        }
+    }
+
     // Zero-access fork: `quiet` skips the cache events that carry the
     // address's domain or local part.
     async fn account_id_from_email_inner(

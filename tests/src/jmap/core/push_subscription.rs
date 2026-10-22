@@ -4,22 +4,9 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::{
-    AssertConfig,
-    utils::{server::TestServer, smtp::SmtpConnection},
-};
+use crate::utils::{push::spawn_mock_push_server, server::TestServer, smtp::SmtpConnection};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use common::{config::server::Listeners, network::SessionData};
-use ece::EcKeyComponents;
 use email::push::{EmailPush, Urgency};
-use http_proto::{HtmlResponse, ToHttpResponse, request::fetch_body};
-use hyper::{
-    StatusCode, body,
-    header::{AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE},
-    server::conn::http1,
-    service::service_fn,
-};
-use hyper_util::rt::TokioIo;
 use jmap_client::{mailbox::Role, push_subscription::Keys};
 use jmap_proto::{
     method::query::Filter,
@@ -27,32 +14,18 @@ use jmap_proto::{
     request::capability::{Capabilities, Capability},
     types::state::State,
 };
-use registry::{
-    schema::{
-        enums::NetworkListenerProtocol,
-        prelude::{ObjectType, SocketAddr},
-        structs::{NetworkListener, SystemSettings},
-    },
-    types::{id::ObjectId, map::Map},
-};
-use serde_json::json;
+use serde_json::{Value, json};
 use services::state_manager::ece::ece_encrypt;
 use services::state_manager::email_push::build_email_push_object;
-use std::{
-    str::FromStr,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
-use store::{
-    ahash::AHashSet,
-    registry::{RegistryObject, bootstrap::Bootstrap},
-};
+use std::{str::FromStr, sync::atomic::Ordering, time::Duration};
+use store::ahash::AHashSet;
 use tokio::sync::mpsc;
 use types::{id::Id, keyword::Keyword, type_state::DataType};
 use utils::map::vec_map::VecMap;
+
+/// The mock push server, lifted into `utils::push` for the zero-access
+/// suite's push test.
+pub use crate::utils::push::{PushServer, SessionManager};
 
 pub async fn test(test: &TestServer) {
     println!("Running Push Subscription tests...");
@@ -63,14 +36,6 @@ pub async fn test(test: &TestServer) {
     // Create test account
     let account = test.account("robert@example.com");
     let client = account.jmap_client().await;
-
-    // Create channels
-    let (event_tx, mut event_rx) = mpsc::channel::<PushMessage>(100);
-
-    // Create subscription keys
-    let (keypair, auth_secret) = ece::generate_keypair_and_auth_secret().unwrap();
-    let pubkey = keypair.pub_as_raw().unwrap();
-    let keys = Keys::new(&pubkey, &auth_secret);
 
     // The server must expose a VAPID key and advertise it in the session capabilities
     let vapid_public_key = test
@@ -103,49 +68,14 @@ pub async fn test(test: &TestServer) {
         "The advertised applicationServerKey must match the signing key"
     );
 
-    let push_server = Arc::new(PushServer {
-        keypair: keypair.raw_components().unwrap(),
-        auth_secret: auth_secret.to_vec(),
-        vapid_public_key,
-        endpoint_origin: "https://127.0.0.1:19000".to_string(),
-        tx: event_tx,
-        fail_requests: false.into(),
-    });
-
     // Start mock push server
-    let mut bp = Bootstrap::new_uninitialized(test.server.registry().clone());
-    let mut servers = Listeners::default();
-    servers.parse_server(
-        &mut bp,
-        RegistryObject {
-            id: ObjectId::new(ObjectType::NetworkListener, 0u64.into()),
-            object: NetworkListener {
-                name: "mock-push".into(),
-                bind: Map::new(vec![SocketAddr::from_str("127.0.0.1:19000").unwrap()]),
-                protocol: NetworkListenerProtocol::Http,
-                tls_implicit: true,
-                use_tls: true,
-                socket_reuse_address: true,
-                socket_reuse_port: true,
-                ..Default::default()
-            },
-            revision: 0,
-        },
-        &SystemSettings::default(),
-    );
-    servers
-        .parse_tcp_acceptors(&mut bp, test.server.inner.clone())
-        .await;
-    servers.bind_and_drop_priv(&mut bp);
-    bp.assert_no_errors();
-    let _shutdown_tx = servers.spawn(|server, acceptor, shutdown_rx| {
-        server.spawn(
-            SessionManager::from(push_server.clone()),
-            test.server.inner.clone(),
-            acceptor,
-            shutdown_rx,
-        );
-    });
+    let (mut event_rx, push) = spawn_mock_push_server(test).await;
+    let push_server = push.server.clone();
+
+    // Create subscription keys
+    let pubkey = push.public_key.clone();
+    let auth_secret = push.auth_secret.clone();
+    let keys = Keys::new(&pubkey, &auth_secret);
 
     // Register push notification (no encryption)
     let push_id = client
@@ -532,25 +462,6 @@ async fn test_email_push_object(test: &TestServer) {
     );
 }
 
-#[derive(Clone)]
-pub struct SessionManager {
-    pub inner: Arc<PushServer>,
-}
-
-impl From<Arc<PushServer>> for SessionManager {
-    fn from(inner: Arc<PushServer>) -> Self {
-        SessionManager { inner }
-    }
-}
-pub struct PushServer {
-    keypair: EcKeyComponents,
-    auth_secret: Vec<u8>,
-    vapid_public_key: String,
-    endpoint_origin: String,
-    tx: mpsc::Sender<PushMessage>,
-    fail_requests: AtomicBool,
-}
-
 #[derive(serde::Deserialize, Debug)]
 #[serde(untagged)]
 enum PushMessage {
@@ -628,144 +539,17 @@ struct PushVerification {
     pub verification_code: String,
 }
 
-impl common::network::SessionManager for SessionManager {
-    #[allow(clippy::manual_async_fn)]
-    fn handle<T: common::network::SessionStream>(
-        self,
-        session: SessionData<T>,
-    ) -> impl std::future::Future<Output = ()> + Send {
-        async move {
-            let push = self.inner;
-            let _ = http1::Builder::new()
-                .keep_alive(false)
-                .serve_connection(
-                    TokioIo::new(session.stream),
-                    service_fn(|mut req: hyper::Request<body::Incoming>| {
-                        let push = push.clone();
-
-                        async move {
-                            if push.fail_requests.load(Ordering::Relaxed) {
-                                return Ok(HtmlResponse::with_status(
-                                    StatusCode::TOO_MANY_REQUESTS,
-                                    "too many requests".to_string(),
-                                )
-                                .into_http_response()
-                                .build());
-                            }
-
-                            // Every push POST must be authenticated with a VAPID token (RFC 9749)
-                            let authorization = req
-                                .headers()
-                                .get(AUTHORIZATION)
-                                .map(|value| value.to_str().unwrap().to_string())
-                                .expect("Push POST must carry a VAPID Authorization header");
-                            assert_vapid_authorization(
-                                &authorization,
-                                &push.vapid_public_key,
-                                &push.endpoint_origin,
-                            );
-
-                            let is_encrypted = req
-                                .headers()
-                                .get(CONTENT_ENCODING)
-                                .is_some_and(|encoding| encoding.to_str().unwrap() == "aes128gcm");
-
-                            let content_type = req
-                                .headers()
-                                .get(CONTENT_TYPE)
-                                .map(|value| value.to_str().unwrap())
-                                .expect("Push POST must carry a Content-Type header");
-                            assert_eq!(
-                                content_type,
-                                if is_encrypted {
-                                    "application/octet-stream"
-                                } else {
-                                    "application/json"
-                                },
-                                "unexpected Content-Type for encrypted={is_encrypted} push"
-                            );
-                            let body = fetch_body(&mut req, 1024 * 1024, 0).await.unwrap();
-                            let message = serde_json::from_slice::<PushMessage>(&if is_encrypted {
-                                ece::decrypt(&push.keypair, &push.auth_secret, &body).unwrap()
-                            } else {
-                                body
-                            })
-                            .unwrap();
-
-                            //println!("Push received ({}): {:?}", is_encrypted, message);
-
-                            push.tx.send(message).await.unwrap();
-
-                            Ok::<_, hyper::Error>(
-                                HtmlResponse::new("ok".to_string())
-                                    .into_http_response()
-                                    .build(),
-                            )
-                        }
-                    }),
-                )
-                .await;
-        }
-    }
-
-    #[allow(clippy::manual_async_fn)]
-    fn shutdown(&self) -> impl std::future::Future<Output = ()> + Send {
-        async {}
-    }
-}
-
-fn assert_vapid_authorization(header: &str, expected_key: &str, expected_origin: &str) {
-    let (token, key) = header
-        .strip_prefix("vapid ")
-        .and_then(|rest| rest.split_once(", "))
-        .expect("VAPID header must be 'vapid t=<jwt>, k=<key>'");
-    let jwt = token.strip_prefix("t=").expect("Missing t= parameter");
-    let key = key.strip_prefix("k=").expect("Missing k= parameter");
-    assert_eq!(
-        key, expected_key,
-        "The k= parameter must match the advertised applicationServerKey"
-    );
-
-    let parts = jwt.split('.').collect::<Vec<_>>();
-    assert_eq!(parts.len(), 3, "A JWT must have three parts");
-    let decode = |part: &str| {
-        URL_SAFE_NO_PAD
-            .decode(part)
-            .expect("Each JWT part must be base64url encoded")
-    };
-    assert_eq!(
-        decode(parts[0]),
-        br#"{"typ":"JWT","alg":"ES256"}"#,
-        "The JWT header must declare typ JWT and alg ES256"
-    );
-
-    let claims: serde_json::Value = serde_json::from_slice(&decode(parts[1])).unwrap();
-    assert_eq!(
-        claims["aud"], expected_origin,
-        "The aud claim must be the push endpoint origin"
-    );
-    let now = store::write::now();
-    let exp = claims["exp"]
-        .as_u64()
-        .expect("The exp claim must be a number");
-    assert!(
-        exp > now && exp <= now + 24 * 3600,
-        "The exp claim must be no more than 24 hours in the future (exp={exp}, now={now})"
-    );
-}
-
-async fn expect_push(event_rx: &mut mpsc::Receiver<PushMessage>) -> PushMessage {
+async fn expect_push(event_rx: &mut mpsc::Receiver<Value>) -> PushMessage {
     expect_push_within(event_rx, Duration::from_millis(1500)).await
 }
 
-async fn expect_push_within(
-    event_rx: &mut mpsc::Receiver<PushMessage>,
-    wait: Duration,
-) -> PushMessage {
+async fn expect_push_within(event_rx: &mut mpsc::Receiver<Value>, wait: Duration) -> PushMessage {
     match tokio::time::timeout(wait, event_rx.recv()).await {
         Ok(Some(push)) => {
             //println!("Push received: {:?}", push);
-            push
+            // Parsed from text, as the mock server parsed the body: the
+            // untagged `PushMessage` does not deserialize from a `Value`.
+            serde_json::from_str(&push.to_string()).unwrap()
         }
         result => {
             panic!("Timeout waiting for push: {:?}", result);
@@ -773,7 +557,7 @@ async fn expect_push_within(
     }
 }
 
-async fn expect_nothing(event_rx: &mut mpsc::Receiver<PushMessage>) {
+async fn expect_nothing(event_rx: &mut mpsc::Receiver<Value>) {
     match tokio::time::timeout(Duration::from_millis(1000), event_rx.recv()).await {
         Err(_) => {}
         message => {
@@ -782,7 +566,7 @@ async fn expect_nothing(event_rx: &mut mpsc::Receiver<PushMessage>) {
     }
 }
 
-async fn assert_state(event_rx: &mut mpsc::Receiver<PushMessage>, id: Id, state: &[DataType]) {
+async fn assert_state(event_rx: &mut mpsc::Receiver<Value>, id: Id, state: &[DataType]) {
     assert_eq!(
         expect_push(event_rx)
             .await

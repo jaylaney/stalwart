@@ -8,6 +8,7 @@ use crate::core::{Session, SessionData, State};
 use common::{
     auth::AuthRequest,
     network::{SessionStream, limiter::LimiterResult},
+    za::ZA_MAIL_LOGIN_REFUSED,
 };
 use directory::Credentials;
 use imap_proto::{
@@ -68,9 +69,9 @@ impl<T: SessionStream> Session<T> {
 
     pub async fn authenticate(&mut self, credentials: Credentials, tag: String) -> trc::Result<()> {
         // Authenticate
-        let access_token = self
+        let (access_token, session_keys) = self
             .server
-            .authenticate(&AuthRequest::from_credentials(
+            .authenticate_with_keys(&AuthRequest::from_credentials(
                 credentials,
                 self.session_id,
                 self.remote_addr,
@@ -93,7 +94,25 @@ impl<T: SessionStream> Session<T> {
 
                 err.id(tag.clone())
             })
-            .and_then(|token| token.assert_has_permission(Permission::ImapAuthenticate))?;
+            .and_then(|(token, keys)| {
+                token
+                    .assert_has_permission(Permission::ImapAuthenticate)
+                    .map(|token| (token, keys))
+            })?;
+
+        // Mail spec 4: a key account's session exists only with its keys.
+        let Some(access_token) = self
+            .server
+            .za_mail_login(access_token, session_keys, self.session_id)
+            .await
+            .map_err(|err| err.id(tag.clone()))?
+        else {
+            return Err(trc::ImapEvent::Error
+                .into_err()
+                .details(ZA_MAIL_LOGIN_REFUSED)
+                .code(ResponseCode::NoPerm)
+                .id(tag));
+        };
 
         // Enforce concurrency limits
         let in_flight = match access_token.is_imap_request_allowed() {
