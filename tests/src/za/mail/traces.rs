@@ -44,8 +44,8 @@ use registry::{
         enums::{MilterVersion, MtaStage},
         prelude::{ObjectType, Property},
         structs::{
-            Expression, ExpressionMatch, MemoryLookupKey, MtaMilter, MtaStageData, SpamClassifier,
-            SpamRule, SpamRuleHeader, SpamTag, SpamTagScore,
+            Expression, ExpressionMatch, MemoryLookupKey, MtaMilter, MtaStageData,
+            SieveSystemScript, SpamClassifier, SpamRule, SpamRuleHeader, SpamTag, SpamTagScore,
         },
     },
     types::{float::Float, list::List, map::Map},
@@ -54,7 +54,7 @@ use serde_json::json;
 use std::time::Duration;
 use trc::{
     EvalEvent, EventType, HttpEvent, ImapEvent, Key, MessageIngestEvent, MilterEvent, Pop3Event,
-    SmtpEvent, SpamEvent, StoreEvent,
+    SieveEvent, SmtpEvent, SpamEvent, StoreEvent,
 };
 use types::id::Id;
 
@@ -123,13 +123,21 @@ pub async fn test(test: &mut TestServer) {
 /// `milter_session` configures it; the spam trap of `imap_tests`, scored as
 /// spam, with the classifier learning from traps; the spam filter on for
 /// every transaction; a header rule whose result is the canary header's
-/// value (its `Eval(Result)` trace is the redaction's case).
+/// value (its `Eval(Result)` trace is the redaction's case); a trusted
+/// DATA-stage script whose `error` quotes the subject (its
+/// `Sieve(RuntimeError)` trace is ruling R57's case; the error ends the
+/// script with an implicit keep, so delivery proceeds).
 struct Settings {
     milter: Id,
     trap_tag: Id,
     trap_key: Id,
     header_rule: Id,
+    script: Id,
 }
+
+/// The trusted DATA-stage script. `ihave` is the one capability the trusted
+/// compiler still checks, and `error` is part of it.
+const ERROR_SCRIPT: &str = "require [\"ihave\", \"variables\"];\nerror \"${header.subject}\";\n";
 
 async fn configure(admin: &Account) -> Settings {
     let milter = admin
@@ -183,6 +191,14 @@ async fn configure(admin: &Account) -> Settings {
             &[Property::LearnSpamFromTraps],
         )
         .await;
+    let script = admin
+        .registry_create_object(SieveSystemScript {
+            name: "za-traces-error".into(),
+            description: None,
+            is_active: true,
+            contents: ERROR_SCRIPT.into(),
+        })
+        .await;
     admin
         .registry_update_setting(
             MtaStageData {
@@ -190,9 +206,13 @@ async fn configure(admin: &Account) -> Settings {
                     else_: "true".into(),
                     ..Default::default()
                 },
+                script: Expression {
+                    else_: "'za-traces-error'".into(),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
-            &[Property::EnableSpamFilter],
+            &[Property::EnableSpamFilter, Property::Script],
         )
         .await;
     admin.reload_settings().await;
@@ -202,6 +222,7 @@ async fn configure(admin: &Account) -> Settings {
         trap_tag,
         trap_key,
         header_rule,
+        script,
     }
 }
 
@@ -211,6 +232,7 @@ async fn unconfigure(admin: &Account, settings: Settings) {
         (ObjectType::SpamTag, settings.trap_tag),
         (ObjectType::MemoryLookupKey, settings.trap_key),
         (ObjectType::SpamRule, settings.header_rule),
+        (ObjectType::SieveSystemScript, settings.script),
     ] {
         admin
             .registry_destroy(object, [id])
@@ -221,7 +243,10 @@ async fn unconfigure(admin: &Account, settings: Settings) {
         .registry_update_setting(SpamClassifier::default(), &[Property::LearnSpamFromTraps])
         .await;
     admin
-        .registry_update_setting(MtaStageData::default(), &[Property::EnableSpamFilter])
+        .registry_update_setting(
+            MtaStageData::default(),
+            &[Property::EnableSpamFilter, Property::Script],
+        )
         .await;
     admin.reload_settings().await;
     admin.reload_lookup_stores().await;
@@ -325,7 +350,9 @@ fn assert_any_contains(values: &[String], needle: &str, what: &str) {
 /// events record the marker; the DATA reads are masked while the envelope
 /// stays readable; the ingest event names no Message-ID; the spam filter's
 /// lookups of the domains the body names emit no cache event carrying them
-/// (ruling R56). The same delivery to the ordinary account is the control.
+/// (ruling R56); the trusted DATA-stage script's runtime error, which quotes
+/// the subject, records the marker (ruling R57). The same delivery to the
+/// ordinary account is the control.
 async fn delivery_leaves_no_content_in_events(test: &TestServer) {
     println!("delivery_leaves_no_content_in_events");
     for to in [KEY, PLAIN] {
@@ -343,10 +370,19 @@ async fn delivery_leaves_no_content_in_events(test: &TestServer) {
             Key::MessageId,
         );
         let reads = values(&events, EventType::Smtp(SmtpEvent::RawInput), Key::Contents);
+        let script_errors = values(
+            &events,
+            EventType::Sieve(SieveEvent::RuntimeError),
+            Key::Reason,
+        );
         assert_eq!(message_ids.len(), 1, "{to}: one ingest event");
         assert_any_contains(&reads, "RCPT TO", to);
         if to == KEY {
             assert_no_canary(&events, "a delivery to a key account");
+            assert_all_redacted(
+                &script_errors,
+                "the trusted script's runtime error of a key delivery",
+            );
             assert_all_redacted(&writes, "the milter writes of a key delivery");
             assert_eq!(message_ids[0], MARKER, "the key ingest's Message-ID");
             assert_any_contains(&reads, MARKER, "the DATA reads of a key delivery");
@@ -362,6 +398,11 @@ async fn delivery_leaves_no_content_in_events(test: &TestServer) {
                 &values(&events, EventType::Eval(EvalEvent::Result), Key::Result),
                 "hdr-value-canary",
                 "control: the header rule's result",
+            );
+            assert_any_contains(
+                &script_errors,
+                "subject-canary",
+                "control: the trusted script's runtime error",
             );
             // Ruling R56's control: the spam filter looked up the domains
             // the body names, and the ordinary lookup traces them (the URL's

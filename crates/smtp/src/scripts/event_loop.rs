@@ -69,6 +69,9 @@ impl RunScript for Server {
         let mut input = Input::script("__script", script);
         let mut messages: Vec<Vec<u8>> = Vec::new();
         let session_id = params.session_id;
+        // Mail ruling R57: a key account's transaction; the diagnostics the
+        // runtime evaluates from the message are redacted.
+        let za_redact = params.za_redact;
 
         let mut reject_reason = None;
         let mut modifications = vec![];
@@ -345,7 +348,11 @@ impl RunScript for Server {
                             Id = script_id.clone(),
                             SpanId = session_id,
                             Reason = "Unsupported event",
-                            Details = format!("{unsupported:?}"),
+                            Details = if za_redact {
+                                trc::Value::redacted()
+                            } else {
+                                format!("{unsupported:?}").into()
+                            },
                         );
                         break;
                     }
@@ -355,7 +362,11 @@ impl RunScript for Server {
                         Sieve(SieveEvent::RuntimeError),
                         Id = script_id.clone(),
                         SpanId = session_id,
-                        Reason = err.to_string(),
+                        Reason = if za_redact {
+                            trc::Value::redacted()
+                        } else {
+                            err.to_string().into()
+                        },
                     );
                     break;
                 }
@@ -381,7 +392,11 @@ impl RunScript for Server {
                 Sieve(SieveEvent::ActionReject),
                 Id = script_id,
                 SpanId = session_id,
-                Details = reject_reason.clone(),
+                Details = if za_redact {
+                    trc::Value::redacted()
+                } else {
+                    reject_reason.clone().into()
+                },
                 Elapsed = time.elapsed(),
             );
 

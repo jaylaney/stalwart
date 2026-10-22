@@ -164,6 +164,8 @@ impl<T: SessionStream> Session<T> {
                 script,
                 params
                     .with_session_id(self.data.session_id)
+                    // Mail ruling R57.
+                    .with_za_redact(self.data.za_key_rcpt || self.data.za_key_sender())
                     .with_envelope(&self.server, self, self.data.session_id)
                     .await,
             ),
