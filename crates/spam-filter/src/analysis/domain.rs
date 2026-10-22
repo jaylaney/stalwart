@@ -219,12 +219,8 @@ impl SpamFilterAnalyzeDomain for Server {
             for email in &emails {
                 // Skip trusted domains
                 if !email.element.email.is_valid()
-                    || is_trusted_domain(
-                        self,
-                        &email.element.email.domain_part.fqdn,
-                        ctx.input.span_id,
-                    )
-                    .await
+                    || is_trusted_domain(self, &email.element.email.domain_part.fqdn, &ctx.input)
+                        .await
                 {
                     continue;
                 }
@@ -241,7 +237,7 @@ impl SpamFilterAnalyzeDomain for Server {
             // Validate domains
             for domain in &domains {
                 // Skip trusted domains
-                if !is_trusted_domain(self, &domain.element, ctx.input.span_id).await {
+                if !is_trusted_domain(self, &domain.element, &ctx.input).await {
                     // Check Domain DNSBL
                     check_dnsbl(
                         self,

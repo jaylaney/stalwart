@@ -694,6 +694,14 @@ impl Server {
         self.account_id_from_email_inner(address, true, true).await
     }
 
+    /// Mail ruling R56: `domain(domain)` without the cache events that carry
+    /// the name, for the spam filter's lookups of the domains a key
+    /// account's message names. A hit still reads `domain_by_id`, whose
+    /// cache events carry the domain id only.
+    pub async fn za_domain(&self, domain: &str) -> trc::Result<Option<Arc<DomainCache>>> {
+        self.domain_inner(domain, true).await
+    }
+
     /// Mail spec 10: whether the accepted recipient `address` is a key
     /// account's, found as local delivery finds it
     /// (`account_id_from_email(address, false)`), without cache events, so an

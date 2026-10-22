@@ -66,13 +66,16 @@ const TRAP: &str = "spamtrap@example.com";
 const SENDER: &str = "sender@example.org";
 const MARKER: &str = "[redacted]";
 /// What a trace of a key account must not carry: a header's name and value,
-/// the subject, the body and the Message-ID of `canary_message`; an IMAP
-/// keyword, search term and malformed attribute; a POP3 mechanism.
+/// the subject, the body, the domains of the body's address and URL and the
+/// Message-ID of `canary_message`; an IMAP keyword, search term and
+/// malformed attribute; a POP3 mechanism.
 const CANARIES: &[&str] = &[
     "hdr-name-canary",
     "hdr-value-canary",
     "subject-canary",
     "body-canary",
+    "domain-canary",
+    "url-canary",
     "msgid-canary",
     "kw-canary",
     "search-canary",
@@ -225,19 +228,25 @@ async fn unconfigure(admin: &Account, settings: Settings) {
 }
 
 /// A message holding every content canary: a header of its own (name and
-/// value), the subject, the body and the Message-ID, which is unique per
-/// call (an ordinary account drops a duplicate).
+/// value), the subject, the body with an address and a URL whose domains are
+/// canaries, and the Message-ID. All are unique per call: an ordinary
+/// account drops a duplicate Message-ID, and the spam filter's domain
+/// lookup of each new name is a cache miss. The domains are under a public
+/// suffix (`.net`): the spam filter skips an address whose domain has no
+/// registrable part, as under `.example`.
 fn canary_message() -> String {
+    let unique = store::rand::random::<u64>();
     format!(
         "From: Sender <sender@example.org>\r\n\
          To: Recipient <recipient@example.com>\r\n\
          Subject: subject-canary\r\n\
-         Message-ID: <{:016x}.msgid-canary@example.com>\r\n\
+         Message-ID: <{unique:016x}.msgid-canary@example.com>\r\n\
          Date: Tue, 20 Oct 2026 10:00:00 +0000\r\n\
          X-Hdr-Name-Canary: hdr-value-canary\r\n\
          \r\n\
-         body-canary\r\n",
-        store::rand::random::<u64>()
+         body-canary\r\n\
+         Write to addr@{unique:016x}.domain-canary.net or see \
+         https://{unique:016x}.url-canary.net/x for more.\r\n"
     )
 }
 
@@ -314,8 +323,9 @@ fn assert_any_contains(values: &[String], needle: &str, what: &str) {
 /// Spec 10 (review F2): a delivery over LMTP to a key account leaves no
 /// content in any event. The milter is sent the plaintext (transit) but its
 /// events record the marker; the DATA reads are masked while the envelope
-/// stays readable; the ingest event names no Message-ID. The same delivery
-/// to the ordinary account is the control.
+/// stays readable; the ingest event names no Message-ID; the spam filter's
+/// lookups of the domains the body names emit no cache event carrying them
+/// (ruling R56). The same delivery to the ordinary account is the control.
 async fn delivery_leaves_no_content_in_events(test: &TestServer) {
     println!("delivery_leaves_no_content_in_events");
     for to in [KEY, PLAIN] {
@@ -352,6 +362,23 @@ async fn delivery_leaves_no_content_in_events(test: &TestServer) {
                 &values(&events, EventType::Eval(EvalEvent::Result), Key::Result),
                 "hdr-value-canary",
                 "control: the header rule's result",
+            );
+            // Ruling R56's control: the spam filter looked up the domains
+            // the body names, and the ordinary lookup traces them (the URL's
+            // registrable domain may already be in the negative cache).
+            assert_any_contains(
+                &values(&events, EventType::Store(StoreEvent::CacheMiss), Key::Key),
+                "domain-canary",
+                "control: the domain lookup of the body's address",
+            );
+            let lookups = [StoreEvent::CacheMiss, StoreEvent::CacheHit]
+                .into_iter()
+                .flat_map(|event| values(&events, EventType::Store(event), Key::Key))
+                .collect::<Vec<_>>();
+            assert_any_contains(
+                &lookups,
+                "url-canary",
+                "control: the domain lookup of the body's URL",
             );
         }
     }

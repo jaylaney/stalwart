@@ -155,7 +155,7 @@ impl SpamFilterAnalyzeUrl for Server {
                     if let Some(url_parsed) = &url.element.url_parsed {
                         let host_sld = url_parsed.host.sld_or_default();
                         if checked_domains.insert(host_sld)
-                            && is_trusted_domain(self, host_sld, ctx.input.span_id).await
+                            && is_trusted_domain(self, host_sld, &ctx.input).await
                         {
                             trusted_domains.insert(host_sld.into());
                         }
@@ -232,7 +232,7 @@ impl SpamFilterAnalyzeUrl for Server {
                                             if is_trusted_domain(
                                                 self,
                                                 location_parsed.host.sld_or_default(),
-                                                ctx.input.span_id,
+                                                &ctx.input,
                                             )
                                             .await
                                             {

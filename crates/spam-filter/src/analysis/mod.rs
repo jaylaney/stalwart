@@ -119,21 +119,42 @@ impl<T> ElementLocation<T> {
     }
 }
 
-pub(crate) async fn is_trusted_domain(server: &Server, domain: &str, span_id: u64) -> bool {
+pub(crate) async fn is_trusted_domain(
+    server: &Server,
+    domain: &str,
+    input: &SpamFilterInput<'_>,
+) -> bool {
+    let span_id = input.span_id;
+    // Mail ruling R56: a key account's message names domains in its body and
+    // attachments, so their lookup is the quiet one (no cache event carrying
+    // the name) and an error that may quote the key is redacted.
+    let za_redact = input.za_redact;
+    let traced = |err: trc::Error| {
+        if za_redact {
+            err.redact(&[trc::Key::Key, trc::Key::Value])
+        } else {
+            err
+        }
+    };
     if let Some(store) = server.get_lookup_store("trusted-domains") {
         match store.key_exists(domain).await {
             Ok(true) => return true,
             Ok(false) => (),
             Err(err) => {
-                trc::error!(err.span_id(span_id).caused_by(trc::location!()));
+                trc::error!(traced(err).span_id(span_id).caused_by(trc::location!()));
             }
         }
     }
 
-    match server.domain(domain).await {
+    let result = if za_redact {
+        server.za_domain(domain).await
+    } else {
+        server.domain(domain).await
+    };
+    match result {
         Ok(result) => result.is_some(),
         Err(err) => {
-            trc::error!(err.span_id(span_id).caused_by(trc::location!()));
+            trc::error!(traced(err).span_id(span_id).caused_by(trc::location!()));
             false
         }
     }
