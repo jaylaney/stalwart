@@ -954,6 +954,8 @@ impl EmailIngest for Server {
                 .await
                 .caused_by(trc::location!())?
         {
+            #[cfg(feature = "test_mode")]
+            common::za::train_pause_point(account_id).await;
             let metadata = archive
                 .to_unarchived::<MessageMetadata>()
                 .caused_by(trc::location!())?;

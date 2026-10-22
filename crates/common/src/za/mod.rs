@@ -108,6 +108,16 @@ pub async fn setup_token_pause_point(account_id: u32) {
     let _ = account_id;
 }
 
+/// Mail ruling R55: the training sample's pause point
+/// (`test_hooks::TRAIN_PAUSE`); a forwarder for the email crate's test
+/// builds, as above.
+pub async fn train_pause_point(account_id: u32) {
+    #[cfg(feature = "test_mode")]
+    test_hooks::train_pause_point(account_id).await;
+    #[cfg(not(feature = "test_mode"))]
+    let _ = account_id;
+}
+
 /// Mail spec 6.1: whether `setup-token` must answer as on PostgreSQL or
 /// MySQL (`test_hooks::FORCE_SQL_STORE`); a forwarder as above, always
 /// `false` unless this crate is built with `test_mode`.

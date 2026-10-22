@@ -604,6 +604,10 @@ impl<T: SessionStream> SessionData<T> {
                         )
                         .await
                         .imap_ctx(&arguments.tag, trc::location!())?;
+                    // Mail ruling R55: each chunk commits only while the
+                    // source account holds no vault record.
+                    self.server
+                        .za_provisioning_fence(&mut train_batch, src_account_id);
                     train_batch.commit_point();
                     did_train = true;
                 }

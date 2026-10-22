@@ -38,7 +38,7 @@ use common::{
 };
 use email::{
     cache::MessageCacheFetch,
-    mailbox::INBOX_ID,
+    mailbox::{INBOX_ID, JUNK_ID},
     message::{
         copy::EmailCopy,
         delete::EmailDeletion,
@@ -106,6 +106,10 @@ const ORPHANED: &str = "keymail16@example.com";
 const IN_FLIGHT: &str = "keymail17@example.com";
 /// `setup_refuses_a_failed_merge_task`'s account (ruling R54).
 const FAILED_MERGE: &str = "keymail18@example.com";
+/// `train_batch_loses_to_provisioning`'s source account (ruling R55).
+const TRAINED: &str = "keymail19@example.com";
+/// `train_batch_loses_to_provisioning`'s destination, an ordinary account.
+const TRAIN_DESTINATION: &str = "plainmail16@example.com";
 const PLAIN: &str = "plainmail3@example.com";
 /// The organizer of `forward_race_imip_side_write`'s invitation, which it
 /// sends through authenticated submission.
@@ -142,6 +146,7 @@ pub async fn test(test: &mut TestServer) {
     let fence11 = reissue_repairs_an_aborted_issuance(test, &admin).await;
     let (fence5, fence6) = copy_message_race(test, &admin).await;
     copy_message_refuses_key_accounts(test, &fence1, &fence5, &fence6).await;
+    let (trained, train_destination) = train_batch_loses_to_provisioning(test, &admin).await;
     let fence7 = stress_the_fence(test, &admin).await;
     let fence8 = pg_and_mysql_are_refused(test, &admin).await;
     let fence9 = setup_refuses_existing_mail(test, &admin).await;
@@ -172,6 +177,8 @@ pub async fn test(test: &mut TestServer) {
         fence11,
         fence5,
         fence6,
+        trained,
+        train_destination,
         fence7,
         fence8,
         fence9,
@@ -1000,6 +1007,83 @@ async fn copy_message_refuses_key_accounts(
         plain_before,
         "the copy out of a key account stored a message"
     );
+}
+
+/// Ruling R55 of plan 13 (PR #51 review 1, P2-2): a cross-account
+/// `Email/copy` into Junk trains a sample of the source account in a batch
+/// of its own, committed after the copies, with no message assertion to
+/// fail. A sample whose sender and subject were read from an ordinary source
+/// that is emptied and provisioned before that commit loses the provisioning
+/// fence each of the batch's chunks carries: the method fails after the copy
+/// committed, and no sample or temporary blob link lands under the now key
+/// account.
+async fn train_batch_loses_to_provisioning(
+    test: &TestServer,
+    admin: &Account,
+) -> (Account, Account) {
+    println!("train_batch_loses_to_provisioning");
+    let from = passwordless(admin, TRAINED).await;
+    let from_id = from.id().document_id();
+    deliver(
+        test,
+        SENDER,
+        TRAINED,
+        &message_with("trained", "trained-body"),
+    )
+    .await;
+    let to = passwordless(admin, TRAIN_DESTINATION).await;
+    let to_id = to.id().document_id();
+    // The destination's system folders, so the copy has a Junk to name.
+    message_ids(test, to_id).await;
+    let (email_id, document_id) = {
+        let cache = test.server.get_cached_messages(from_id).await.unwrap();
+        let item = &cache.emails.items[0];
+        (
+            Id::from_parts(item.thread_id, item.document_id).to_string(),
+            item.document_id,
+        )
+    };
+    let hash = message_hash(test, from_id, document_id).await;
+    test.wait_for_tasks().await;
+
+    let copy = json!({
+        "fromAccountId": Id::from(from_id).to_string(),
+        "accountId": Id::from(to_id).to_string(),
+        "create": {
+            "c1": {
+                "id": email_id,
+                "mailboxIds": { Id::from(JUNK_ID).to_string(): true }
+            }
+        }
+    });
+    let caller = admin.clone();
+    // The copy committed; the sample's sender and subject are read.
+    let parked = HookParked::start(from_id, test_hooks::set_train_pause, async move {
+        caller.jmap_method_call("Email/copy", copy).await
+    })
+    .await;
+    admin.destroy_all_mailboxes_for_account(from_id).await;
+    test.wait_for_tasks().await;
+    let token = za_setup_token(admin, TRAINED).await;
+    za_setup(TRAINED, &token, STRONG).await;
+    let response = parked.finish().await;
+
+    let method = &response.0["methodResponses"][0];
+    assert_eq!(method[0], "error", "the stale training commit: {method}");
+    assert_eq!(
+        message_ids(test, to_id).await.len(),
+        1,
+        "the copy committed before the training batch"
+    );
+    assert!(
+        !test.server.za_has_spam_samples(from_id).await.unwrap(),
+        "the stale training batch stored a sample under the key account"
+    );
+    assert!(
+        !temporary_links(test, from_id).await.contains(&hash),
+        "the stale training batch linked the plaintext blob under the key account"
+    );
+    (from, to)
 }
 
 /// Ruling R10 of plan 13: an ingest and a provisioning write race, many

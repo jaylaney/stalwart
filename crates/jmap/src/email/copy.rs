@@ -243,6 +243,9 @@ impl JmapEmailCopy for Server {
                         )
                         .await
                         .caused_by(trc::location!())?;
+                        // Mail ruling R55: each chunk commits only while the
+                        // source account holds no vault record.
+                        self.za_provisioning_fence(&mut train_batch, from_account_id);
                         train_batch.commit_point();
                         did_train = true;
                     }
