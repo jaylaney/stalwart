@@ -157,6 +157,17 @@ const MERGE_UNINDEXED: &str = "keymail26@example.com";
 /// `multi_chunk_calendar_merge_is_written_whole`'s account, an ordinary one
 /// (ruling R63).
 const MERGE_CONTROL: &str = "plainmail20@example.com";
+/// `stopped_document_leaves_its_batch_written`'s account whose document
+/// stops (ruling R63).
+const BATCH_STOPPED: &str = "plainmail21@example.com";
+/// The account of that batch's other document, which the pause does not
+/// park.
+const BATCH_OTHER: &str = "plainmail22@example.com";
+/// Under the smallest deferral of an index task's failed first attempt:
+/// the default retry strategy (exponential backoff from a 60 s initial
+/// delay, a jitter factor from 0.5 to 1.5) defers it by at least 30 s from
+/// the whole second of the failure, so by more than 29 s.
+const UNDER_THE_DEFERRAL: Duration = Duration::from_secs(15);
 /// The token the merge tests' updated DESCRIPTION ends with: 13 bytes, so
 /// stored verbatim, and new to the event.
 const MERGE_CANARY: &str = "zzmergecanary";
@@ -224,6 +235,8 @@ pub async fn test(test: &mut TestServer) {
     let guard_failed = failed_guard_with_its_document_stored_defers_the_task(test, &admin).await;
     let merge_unindexed = unindex_between_calendar_merge_chunks_leaves_no_terms(test, &admin).await;
     let merge_control = multi_chunk_calendar_merge_is_written_whole(test, &admin).await;
+    let (batch_stopped, batch_other) =
+        stopped_document_leaves_its_batch_written(test, &admin).await;
 
     // The accounts that log in empty their own mailboxes; the others are
     // pending or credentialless, and the account's destruction removes
@@ -267,6 +280,8 @@ pub async fn test(test: &mut TestServer) {
         guard_failed,
         merge_unindexed,
         merge_control,
+        batch_stopped,
+        batch_other,
     ] {
         admin.destroy_account(account).await;
     }
@@ -2234,7 +2249,8 @@ async fn assert_refused(
 /// store holds any `Term` or `Index` key of the account in the Email index
 /// (as for mail) or the Calendar index (as for calendar data); each case is
 /// planted alone, and issuance succeeds once the account-wide unindex has
-/// removed the keys.
+/// removed the keys. Neither scan reads the other index's keys or another
+/// account's (ruling R63).
 async fn setup_refuses_orphaned_search_terms(test: &TestServer, admin: &Account) -> Account {
     println!("setup_refuses_orphaned_search_terms");
     let account = passwordless(admin, ORPHANED_TERMS).await;
@@ -2258,7 +2274,8 @@ async fn setup_refuses_orphaned_search_terms(test: &TestServer, admin: &Account)
     );
     assert!(
         !test.server.za_has_email_search_documents(id).await.unwrap()
-            && test.server.za_has_email_search_terms(id).await.unwrap(),
+            && test.server.za_has_email_search_terms(id).await.unwrap()
+            && !test.server.za_has_calendar_search_terms(id).await.unwrap(),
         "the scans do not see the orphaned Email terms alone"
     );
     assert_refused(
@@ -2290,8 +2307,9 @@ async fn setup_refuses_orphaned_search_terms(test: &TestServer, admin: &Account)
         "an Email field alone was not planted: {keys:?}"
     );
     assert!(
-        test.server.za_has_email_search_terms(id).await.unwrap(),
-        "the scan does not see the orphaned Email field"
+        test.server.za_has_email_search_terms(id).await.unwrap()
+            && !test.server.za_has_calendar_search_terms(id).await.unwrap(),
+        "the scans do not see the orphaned Email field alone"
     );
     assert_refused(
         test,
@@ -2352,6 +2370,62 @@ async fn setup_refuses_orphaned_search_terms(test: &TestServer, admin: &Account)
         "the account-wide unindex left Calendar terms"
     );
 
+    // Ruling R63: orphans of another account, at the adjacent id above
+    // (account ids are assigned in order, so none holds it yet), are not
+    // the account's: its scans stay false.
+    let neighbour = id + 1;
+    let mut document = IndexDocument::new(SearchIndex::Email)
+        .with_account_id(neighbour)
+        .with_document_id(0);
+    document.index_text(EmailSearchField::Body, "orphanterm", Language::English);
+    document.index_unsigned(EmailSearchField::ReceivedAt, now());
+    plant_orphaned_keys(test, neighbour, SearchIndex::Email, document).await;
+    let mut document = IndexDocument::new(SearchIndex::Calendar)
+        .with_account_id(neighbour)
+        .with_document_id(0);
+    document.index_text(
+        CalendarSearchField::Title,
+        "orphaned title",
+        Language::English,
+    );
+    plant_orphaned_keys(test, neighbour, SearchIndex::Calendar, document).await;
+    assert!(
+        test.server
+            .za_has_email_search_terms(neighbour)
+            .await
+            .unwrap()
+            && test
+                .server
+                .za_has_calendar_search_terms(neighbour)
+                .await
+                .unwrap(),
+        "the adjacent account's orphans were not planted"
+    );
+    assert!(
+        !test.server.za_has_email_search_terms(id).await.unwrap()
+            && !test.server.za_has_calendar_search_terms(id).await.unwrap(),
+        "the account's scans see the adjacent account's orphans"
+    );
+    for index in [SearchIndex::Email, SearchIndex::Calendar] {
+        search
+            .unindex(SearchQuery::new(index).with_account_id(neighbour))
+            .await
+            .unwrap();
+    }
+    assert!(
+        !test
+            .server
+            .za_has_email_search_terms(neighbour)
+            .await
+            .unwrap()
+            && !test
+                .server
+                .za_has_calendar_search_terms(neighbour)
+                .await
+                .unwrap(),
+        "the account-wide unindex left the adjacent account's orphans"
+    );
+
     za_setup_token(admin, ORPHANED_TERMS).await;
     account
 }
@@ -2365,7 +2439,8 @@ async fn setup_refuses_orphaned_search_terms(test: &TestServer, admin: &Account)
 /// verbatim), the task cleared, and issuance passed R51's document scan.
 /// With R62's guard every later chunk of a fenced document asserts that its
 /// `Document` key is stored, so the rest of the document is not written,
-/// the task ends without a retry, and the account provisions cleanly.
+/// the task ends without a retry (ruling R63: within `UNDER_THE_DEFERRAL`
+/// of the release), and the account provisions cleanly.
 async fn unindex_between_index_chunks_leaves_no_terms(
     test: &TestServer,
     admin: &Account,
@@ -2407,8 +2482,14 @@ async fn unindex_between_index_chunks_leaves_no_terms(
         "the refused issuance wrote a record"
     );
 
+    let released = Instant::now();
     parked.finish().await;
     test.wait_for_tasks().await;
+    let elapsed = released.elapsed();
+    assert!(
+        elapsed < UNDER_THE_DEFERRAL,
+        "the index task ended {elapsed:?} after the release: deferred, not ended without an error"
+    );
     let keys = search_keys(test, id, SearchIndex::Email).await;
     assert!(
         keys.is_empty(),
@@ -2901,4 +2982,89 @@ async fn multi_chunk_calendar_merge_is_written_whole(
     delete_event(test, id, event_id).await;
     test.wait_for_tasks().await;
     account
+}
+
+/// Ruling R63 of plan 13 (opus F2): a document that stops at a later
+/// chunk's failed guard ends without an error, and the batch's other
+/// documents are still written. One `Store::index` call holds two fenced
+/// multi-chunk Email documents of two ordinary accounts, fenced as the
+/// index worker fences them (`za_index_fence`); the worker's own batches
+/// cannot be made to hold both deterministically, since its dispatcher
+/// locks each task between two sends. The first document parks after its
+/// chunk 0 and is unindexed before it resumes: the call returns `Ok`, the
+/// first document leaves nothing, and the second, of an account the pause
+/// does not park, is written whole.
+async fn stopped_document_leaves_its_batch_written(
+    test: &TestServer,
+    admin: &Account,
+) -> (Account, Account) {
+    println!("stopped_document_leaves_its_batch_written");
+    test.wait_for_tasks().await;
+    let stopped = passwordless(admin, BATCH_STOPPED).await;
+    let stopped_id = stopped.id().document_id();
+    let other = passwordless(admin, BATCH_OTHER).await;
+    let other_id = other.id().document_id();
+    let document = |account_id: u32| {
+        let mut document = IndexDocument::new(SearchIndex::Email)
+            .with_account_id(account_id)
+            .with_document_id(0);
+        document.index_text(
+            EmailSearchField::Body,
+            &large_body(TAIL_CANARY),
+            Language::English,
+        );
+        document.index_unsigned(EmailSearchField::ReceivedAt, now());
+        test.server.za_index_fence(document, account_id)
+    };
+    let documents = vec![document(stopped_id), document(other_id)];
+    let search = test.server.search_store().clone();
+    let parked = HookParked::start(stopped_id, test_hooks::set_index_chunk_pause, async move {
+        search.index(documents).await
+    })
+    .await;
+    let keys = search_keys(test, stopped_id, SearchIndex::Email).await;
+    assert!(
+        keys.documents == 1 && keys.terms > 0 && !keys.holds_term(TAIL_CANARY),
+        "chunk 0 alone was not written: {keys:?}"
+    );
+    let keys = search_keys(test, other_id, SearchIndex::Email).await;
+    assert!(
+        keys.is_empty(),
+        "the batch's other document was written first: {keys:?}"
+    );
+
+    // The first document's unindex, as its task runs it.
+    let mut query = SearchQuery::new(SearchIndex::Email);
+    query
+        .add_filter(SearchFilter::eq(SearchField::AccountId, stopped_id))
+        .add_filter(SearchFilter::eq(SearchField::DocumentId, 0u32));
+    test.server.search_store().unindex(query).await.unwrap();
+    let keys = search_keys(test, stopped_id, SearchIndex::Email).await;
+    assert!(keys.is_empty(), "the unindex left chunk 0's keys: {keys:?}");
+
+    let result = parked.finish().await;
+    assert!(
+        result.is_ok(),
+        "the stopped document ended its batch with an error: {result:?}"
+    );
+    let keys = search_keys(test, stopped_id, SearchIndex::Email).await;
+    assert!(
+        keys.is_empty(),
+        "the stopped document's later chunks were written: {keys:?}"
+    );
+    let keys = search_keys(test, other_id, SearchIndex::Email).await;
+    assert!(
+        keys.documents == 1
+            && keys.terms > 2000
+            && keys.holds_term(TAIL_CANARY)
+            && keys.fields == 1,
+        "the batch's other document was not written whole: {keys:?}"
+    );
+
+    test.server
+        .search_store()
+        .unindex(SearchQuery::new(SearchIndex::Email).with_account_id(other_id))
+        .await
+        .unwrap();
+    (stopped, other)
 }
