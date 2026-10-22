@@ -55,22 +55,22 @@ use registry::{
         enums::TaskStoreMaintenanceType,
         prelude::{Object, ObjectInner, ObjectType},
         structs::{
-            self, Credential, PasswordCredential, SpamTrainingSample, Task, TaskStatus,
-            TaskStoreMaintenance,
+            self, Credential, PasswordCredential, SpamTrainingSample, Task, TaskMergeThreads,
+            TaskStatus, TaskStatusFailed, TaskStoreMaintenance,
         },
     },
-    types::id::ObjectId,
+    types::{datetime::UTCDateTime, id::ObjectId, map::Map},
 };
 use serde_json::json;
 use std::time::{Duration, Instant};
 use store::{
-    IterateParams, U32_LEN, U64_LEN, ValueKey,
+    Deserialize, IterateParams, U32_LEN, U64_LEN, ValueKey,
     registry::write::{RegistryWrite, RegistryWriteResult},
     roaring::RoaringBitmap,
     search::{EmailSearchField, IndexDocument, SearchField, SearchFilter, SearchQuery},
     write::{
-        AlignedBytes, Archive, BatchBuilder, BlobLink, BlobOp, SearchIndex, ValueClass,
-        key::DeserializeBigEndian, now,
+        AlignedBytes, Archive, BatchBuilder, BlobLink, BlobOp, SearchIndex, TaskQueueClass,
+        ValueClass, key::DeserializeBigEndian, now,
     },
 };
 use trc::{EventType, Key, SecurityEvent, StoreEvent};
@@ -81,6 +81,7 @@ use types::{
     field::EmailField,
     id::Id,
 };
+use utils::{cheeky_hash::CheekyHash, snowflake::SnowflakeIdGenerator};
 use vault::{ZA_MARKER, record::VaultRecord};
 
 const FENCE1: &str = "fence1@example.com";
@@ -101,6 +102,10 @@ const PENDING_UNINDEX: &str = "keymail14@example.com";
 const SAMPLED: &str = "keymail15@example.com";
 /// `setup_refuses_an_orphaned_search_document`'s account (ruling R51).
 const ORPHANED: &str = "keymail16@example.com";
+/// `setup_refuses_an_in_flight_index_write`'s account (ruling R54).
+const IN_FLIGHT: &str = "keymail17@example.com";
+/// `setup_refuses_a_failed_merge_task`'s account (ruling R54).
+const FAILED_MERGE: &str = "keymail18@example.com";
 const PLAIN: &str = "plainmail3@example.com";
 /// The organizer of `forward_race_imip_side_write`'s invitation, which it
 /// sends through authenticated submission.
@@ -143,6 +148,8 @@ pub async fn test(test: &mut TestServer) {
     let pending_unindex = setup_refuses_a_pending_unindex(test, &admin).await;
     let sampled = setup_refuses_spam_samples(test, &admin).await;
     let orphaned = setup_refuses_an_orphaned_search_document(test, &admin).await;
+    let in_flight = setup_refuses_an_in_flight_index_write(test, &admin).await;
+    let failed_merge = setup_refuses_a_failed_merge_task(test, &admin).await;
 
     // The accounts that log in empty their own mailboxes; the others are
     // pending or credentialless, and the account's destruction removes
@@ -171,6 +178,8 @@ pub async fn test(test: &mut TestServer) {
         pending_unindex,
         sampled,
         orphaned,
+        in_flight,
+        failed_merge,
     ] {
         admin.destroy_account(account).await;
     }
@@ -1399,5 +1408,178 @@ async fn setup_refuses_an_orphaned_search_document(test: &TestServer, admin: &Ac
         .add_filter(SearchFilter::eq(SearchField::DocumentId, 0u32));
     search.unindex(query).await.unwrap();
     za_setup_token(admin, ORPHANED).await;
+    account
+}
+
+/// The task records of `account_id` that ruling R54 counts (index, unindex,
+/// thread merge, iTIP), in queue order.
+async fn account_tasks(test: &TestServer, account_id: u32) -> Vec<Task> {
+    let key = |id| ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task { id }));
+    let mut tasks = Vec::new();
+    test.server
+        .store()
+        .iterate(
+            IterateParams::new(key(0), key(u64::MAX)).ascending(),
+            |_, value| {
+                let task = Task::deserialize(value)?;
+                let owner = match &task {
+                    Task::IndexDocument(task) | Task::UnindexDocument(task) => {
+                        Some(task.account_id)
+                    }
+                    Task::MergeThreads(task) => Some(task.account_id),
+                    Task::CalendarItipMessage(task) => Some(task.account_id),
+                    _ => None,
+                };
+                if owner.is_some_and(|owner| owner.document_id() == account_id) {
+                    tasks.push(task);
+                }
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+    tasks
+}
+
+/// Ruling R54 of plan 13 (PR #51 review 1, P2-1): the index worker builds an
+/// ordinary message's full document, then writes it; the message's unindex
+/// task runs in a worker of its own and can finish in between, so neither
+/// the metadata archive (R46) nor the search document (R51) is there when
+/// issuance checks, and the document lands afterwards. Issuance is refused
+/// while the index task's record is in the queue; once the document is
+/// written, R51's scan refuses on it; after it is removed, issuance succeeds.
+async fn setup_refuses_an_in_flight_index_write(test: &TestServer, admin: &Account) -> Account {
+    println!("setup_refuses_an_in_flight_index_write");
+    test.wait_for_tasks().await;
+    let account = passwordless(admin, IN_FLIGHT).await;
+    let id = account.id().document_id();
+    let message = message_with("in flight", "in-flight-body");
+    // The delivery commits; its index task builds the document and parks.
+    let parked = HookParked::start(id, test_hooks::set_index_write_pause, async move {
+        SmtpConnection::connect()
+            .await
+            .ingest(SENDER, &[IN_FLIGHT], &message)
+            .await;
+    })
+    .await;
+    let ids = message_ids(test, id).await;
+    assert_eq!(ids.len(), 1, "{ids:?}");
+
+    admin.destroy_all_mailboxes_for_account(id).await;
+    // The unindex task runs and clears its record while the index task
+    // stays parked: only the index task's record is left.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let tasks = account_tasks(test, id).await;
+        if metadata_archive(test, id, ids[0]).await.is_none()
+            && matches!(tasks.as_slice(), [Task::IndexDocument(_)])
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the unindex task did not finish: {tasks:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !test
+            .server
+            .za_has_documents(id, Collection::Email)
+            .await
+            .unwrap()
+            && !test.server.za_has_email_search_documents(id).await.unwrap(),
+        "the account still holds the message or its search document"
+    );
+    let reply = za_post_as(admin, "setup-token", &json!({ "account": IN_FLIGHT })).await;
+    assert_eq!(
+        reply.expect(409)["error"],
+        "account has unfinished tasks",
+        "issuance while an index write of the account is in flight"
+    );
+    assert!(
+        test.server.za_vault_record(id).await.unwrap().is_none(),
+        "the refused issuance wrote a record"
+    );
+
+    parked.finish().await;
+    test.wait_for_tasks().await;
+    assert!(
+        test.server.za_has_email_search_documents(id).await.unwrap(),
+        "the released index task wrote no document"
+    );
+    let reply = za_post_as(admin, "setup-token", &json!({ "account": IN_FLIGHT })).await;
+    assert_eq!(
+        reply.expect(409)["error"],
+        "account already holds mail",
+        "issuance while the late document is stored"
+    );
+    let mut query = SearchQuery::new(SearchIndex::Email);
+    query
+        .add_filter(SearchFilter::eq(SearchField::AccountId, id))
+        .add_filter(SearchFilter::eq(SearchField::DocumentId, ids[0]));
+    test.server.search_store().unindex(query).await.unwrap();
+    za_setup_token(admin, IN_FLIGHT).await;
+    account
+}
+
+/// Ruling R54 of plan 13 (PR #51 review 1, P2-3): an ordinary APPEND or JMAP
+/// create schedules a thread-merge task whose `thread_name` and
+/// `message_ids` are `CheekyHash` strings, which hold an input of up to 15
+/// bytes verbatim; a task that exhausted its retries is kept as failed and
+/// never runs again, and destroying the message leaves it. Issuance is
+/// refused while one of the account's is in the queue (planted here as
+/// failed, so the consumer never takes it) and succeeds once the operator
+/// destroys it through `x:Task/set`.
+async fn setup_refuses_a_failed_merge_task(test: &TestServer, admin: &Account) -> Account {
+    println!("setup_refuses_a_failed_merge_task");
+    let account = passwordless(admin, FAILED_MERGE).await;
+    let id = account.id().document_id();
+    let task_id = SnowflakeIdGenerator::global_id().unwrap();
+    let now = UTCDateTime::now();
+    let mut batch = BatchBuilder::new();
+    batch.schedule_task_with_id(
+        task_id,
+        Task::MergeThreads(TaskMergeThreads {
+            account_id: Id::from(id),
+            thread_name: CheekyHash::new(b"canary-subject").to_string(),
+            message_ids: Map::new(vec![
+                CheekyHash::new(b"<a@example.org>").to_string(),
+                CheekyHash::new(b"<b@example.org>").to_string(),
+            ]),
+            status: TaskStatus::Failed(TaskStatusFailed {
+                created_at: now,
+                failed_at: now,
+                failed_attempt_number: 3,
+                failure_reason: "planted".into(),
+            }),
+        }),
+    );
+    test.server.store().write(batch.build_all()).await.unwrap();
+    assert_eq!(account_tasks(test, id).await.len(), 1, "the planted task");
+
+    let reply = za_post_as(admin, "setup-token", &json!({ "account": FAILED_MERGE })).await;
+    assert_eq!(
+        reply.expect(409)["error"],
+        "account has unfinished tasks",
+        "issuance while a failed merge task of the account is retained"
+    );
+    assert!(
+        test.server.za_vault_record(id).await.unwrap().is_none(),
+        "the refused issuance wrote a record"
+    );
+
+    // The operator's remedy for a failed task.
+    let destroyed = admin
+        .registry_destroy(ObjectType::Task, [Id::from(task_id)])
+        .await
+        .destroyed()
+        .count();
+    assert_eq!(destroyed, 1, "the failed task was not destroyed");
+    assert!(
+        account_tasks(test, id).await.is_empty(),
+        "the destroyed task is still queued"
+    );
+    za_setup_token(admin, FAILED_MERGE).await;
     account
 }

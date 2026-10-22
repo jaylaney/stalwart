@@ -869,9 +869,9 @@ async fn za_assert_enabled(server: &Server, account_id: u32) -> trc::Result<()> 
     }
 }
 
-/// Refuses an account that already holds calendar data, mail or spam
-/// training samples: setup would otherwise convert plaintext into a key
-/// account (mail spec 6.6). A sole
+/// Refuses an account that already holds calendar data, mail, unfinished
+/// tasks or spam training samples: setup would otherwise convert plaintext
+/// into a key account (mail spec 6.6). A sole
 /// default calendar created by the server (`create_default_calendar`) with
 /// untouched preferences is not user data and is ignored; it is sealed by
 /// its first write (spec 7.3).
@@ -901,6 +901,16 @@ async fn za_assert_no_data(server: &Server, account_id: u32) -> trc::Result<Opti
             .await?
     {
         return Ok(Some(conflict("account already holds mail")));
+    }
+    // Mail ruling R54: an index, unindex, thread-merge or iTIP task of the
+    // account is still in the queue (pending, retrying, in flight or
+    // failed). An index write in flight lands after the scans below, and a
+    // retained merge task holds a short subject verbatim. Before R51's scan
+    // on purpose: a worker that writes its document and clears its task
+    // between the two scans would otherwise pass both. Setup never deletes
+    // a task; the operator waits for pending ones and destroys failed ones.
+    if server.za_has_tasks(account_id).await? {
+        return Ok(Some(conflict("account has unfinished tasks")));
     }
     // Mail ruling R52: a sample written while the account was plain keeps
     // the message's blob linked and its sender and subject in the registry

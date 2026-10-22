@@ -77,6 +77,10 @@
 //!   account (`http::api::vault`, mail spec 6.1's recheck).
 //! - `FORCE_SQL_STORE`: `setup-token` answers as on PostgreSQL or MySQL
 //!   (mail spec 6.1).
+//! - `INDEX_WRITE_PAUSE`: in the index worker after its documents are built
+//!   and immediately before the search store's write, keyed by the account
+//!   of an `IndexDocument` task of the batch
+//!   (`services::task_manager::index`, mail ruling R54).
 
 use std::sync::{
     Arc, Mutex,
@@ -141,6 +145,8 @@ pub static INGEST_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static COPY_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
 pub static SETUP_TOKEN_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+
+pub static INDEX_WRITE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
 /// Whether `setup-token` treats the data store as PostgreSQL or MySQL.
 pub static FORCE_SQL_STORE: AtomicBool = AtomicBool::new(false);
@@ -256,6 +262,10 @@ pub fn set_copy_pause(pause: Option<Arc<Pause>>) {
 
 pub fn set_setup_token_pause(pause: Option<Arc<Pause>>) {
     set_slot(&SETUP_TOKEN_PAUSE, pause);
+}
+
+pub fn set_index_write_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&INDEX_WRITE_PAUSE, pause);
 }
 
 pub fn set_force_sql_store(force: bool) {
@@ -382,6 +392,10 @@ pub async fn copy_pause_point(to_account_id: u32) {
 
 pub async fn setup_token_pause_point(account_id: u32) {
     wait(take_for(&SETUP_TOKEN_PAUSE, account_id)).await;
+}
+
+pub async fn index_write_pause_point(account_id: u32) {
+    wait(take_for(&INDEX_WRITE_PAUSE, account_id)).await;
 }
 
 /// Whether the account's fan-out or step 5 pin-record write must fail now;

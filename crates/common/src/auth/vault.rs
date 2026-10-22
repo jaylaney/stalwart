@@ -18,7 +18,10 @@ use ::vault::{
 };
 use directory::core::secret::verify_totp_code;
 use registry::{
-    schema::prelude::{ObjectType, Property},
+    schema::{
+        prelude::{ObjectType, Property},
+        structs::Task,
+    },
     types::EnumImpl,
 };
 use std::sync::{Arc, LazyLock};
@@ -26,7 +29,8 @@ use store::{
     Deserialize, IterateParams, Serialize, SerializeInfallible, Store, ValueKey,
     write::{
         AlignedBytes, Archive, Archiver, BatchBuilder, RegistryClass, SearchIndex,
-        SearchIndexClass, SearchIndexId, SearchIndexType, ValueClass, assert::AssertValue, now,
+        SearchIndexClass, SearchIndexId, SearchIndexType, TaskQueueClass, ValueClass,
+        assert::AssertValue, now,
     },
 };
 use trc::AddContext;
@@ -686,6 +690,55 @@ impl Server {
                 |_, _| {
                     found = true;
                     Ok(false)
+                },
+            )
+            .await
+            .caused_by(trc::location!())?;
+        Ok(found)
+    }
+
+    /// Mail ruling R54: true when the task queue holds an `IndexDocument`,
+    /// `UnindexDocument`, `MergeThreads` or `CalendarItipMessage` task of the
+    /// account, pending, retrying, in flight or failed. A task's record stays
+    /// in the queue from the batch that schedules it until the worker's
+    /// `update_tasks`, so an index write still in flight is seen here before
+    /// it lands; a retained merge task holds a subject of up to 15 bytes
+    /// verbatim (`CheekyHash`). The queue has no per-account range: one pass
+    /// over every task record, stopping at the first hit.
+    pub async fn za_has_tasks(&self, account_id: u32) -> trc::Result<bool> {
+        let task = |id| ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task { id }));
+        let mut found = false;
+        self.store()
+            .iterate(
+                IterateParams::new(task(0), task(u64::MAX)).ascending(),
+                |_, value| {
+                    let owner = match Task::deserialize(value)? {
+                        Task::IndexDocument(task) | Task::UnindexDocument(task) => {
+                            Some(task.account_id)
+                        }
+                        Task::MergeThreads(task) => Some(task.account_id),
+                        Task::CalendarItipMessage(task) => Some(task.account_id),
+                        // Content-free (ids and times) and possibly due days
+                        // ahead.
+                        Task::CalendarAlarmEmail(_) | Task::CalendarAlarmNotification(_) => None,
+                        // Scheduled for every account by the store's purge and
+                        // reindex sweeps.
+                        Task::AccountMaintenance(_) => None,
+                        // Not a provisioning state.
+                        Task::DestroyAccount(_) | Task::RestoreArchivedItem(_) => None,
+                        // No account.
+                        Task::IndexTrace(_)
+                        | Task::DmarcReport(_)
+                        | Task::TlsReport(_)
+                        | Task::TenantMaintenance(_)
+                        | Task::StoreMaintenance(_)
+                        | Task::SpamFilterMaintenance(_)
+                        | Task::AcmeRenewal(_)
+                        | Task::DkimManagement(_)
+                        | Task::DnsManagement(_) => None,
+                    };
+                    found = owner.is_some_and(|owner| owner.document_id() == account_id);
+                    Ok(!found)
                 },
             )
             .await

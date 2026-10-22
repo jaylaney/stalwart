@@ -254,6 +254,15 @@ impl SearchIndexTask for Server {
             return results;
         }
 
+        // Mail ruling R54's test: the documents are built, not yet written.
+        #[cfg(feature = "test_mode")]
+        for task in tasks {
+            if let Task::IndexDocument(task) = &task.task {
+                common::za::test_hooks::index_write_pause_point(task.account_id.document_id())
+                    .await;
+            }
+        }
+
         // Index documents
         if !document_insertions.is_empty()
             && let Err(err) = self.search_store().index(document_insertions).await
