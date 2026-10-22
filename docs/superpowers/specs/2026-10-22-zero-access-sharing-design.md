@@ -1,6 +1,6 @@
 # Zero-access calendar: sharing between key accounts (release 4) design spec
 
-Date: 2026-10-22. Status: revision 7, draft for review. Scope: release 4
+Date: 2026-10-22. Status: revision 8, draft for review. Scope: release 4
 of the zero-access fork (jaylaney/stalwart); GitHub issue #24, milestone
 "Release 4: calendar sharing". Revision 2 answers the builder check and
 the adversarial review of revision 1: the shared bundle (3.3), the
@@ -30,7 +30,11 @@ and 8) are complete. Revision 7 answers the re-review of revision 6: the
 key-domain id (3.1, 3.2, 3.6), the sync boundary on a rename (5.2, 5.6),
 self-delivery for every delegated message (6.2) and per-address self items
 (6.2). With it re-review findings 3 and 4, which the review of revision 6
-marked partly addressed, are complete.
+marked partly addressed, are complete. Revision 8 answers the re-review
+of revision 7: the rename boundary recorded in two fenced steps (5.2, 5.6)
+and the self-message builder (6.2, 6.3). With it re-review findings 2 and
+3 of revision 6, which the review of revision 7 marked partly addressed,
+are complete.
 
 The terms key account, master key (MK), event wrapping key (EWK), data key
 (DEK), `X-ZA-KEY`, `X-ZA-SEALED`, `X-ZA-EXTRA`, wrap type, collection
@@ -464,14 +468,16 @@ gain, since the CKs the removed grantees held are already retired).
 
 **Owner ring** (`0x04`): policy version (1 byte) || `0x04` || calendar
 document id (4) || key-domain id (16) || rename change id (8) ||
-generation count `n` (2) || the `n` generation numbers (4 each,
-ascending) || nonce (24) || XChaCha20-Poly1305 ciphertext and tag of the
-rkyv `ZaOwnerRing`, length-prefixed and padded to a multiple of 256 bytes
-as release 1 pads bundles, decoded with a checked rkyv read. The
-generation numbers stay visible so that the leak scanner can check events
-against them; the associated data binds them. The key-domain id is the
-conversion's (3.1); the rename change id is the owner's calendar change id
-of the calendar's last slug change, zero until one (5.2, 5.6).
+boundary-pending flag (1) || generation count `n` (2) || the `n` generation
+numbers (4 each, ascending) || nonce (24) || XChaCha20-Poly1305 ciphertext
+and tag of the rkyv `ZaOwnerRing`, length-prefixed and padded to a multiple
+of 256 bytes as release 1 pads bundles, decoded with a checked rkyv read.
+The generation numbers stay visible so that the leak scanner can check
+events against them; the associated data binds them. The key-domain id is
+the conversion's (3.1); the rename change id is the change id the store
+assigned to the commit of the calendar's last slug change, zero until one
+(5.2, 5.6); the boundary-pending flag (`0` or `1`, any other value a parse
+failure) is set while a rename's boundary is not yet recorded (5.2).
 
 | Struct | Field | Type | Meaning |
 |---|---|---|---|
@@ -495,15 +501,17 @@ have a silent `Debug` (they hold keys and addresses).
 
 **Grant ring** (`0x05`): policy version || `0x05` || calendar document id
 (4) || key-domain id (16) || grantee account id (4) || grant change id (8)
-|| rename change id (8) || count `n` (2) || `n` records of generation (4)
-|| ephemeral public key (32) || wrapped CK (72). It is not sealed as a
-whole: each record is a `pk_wrap` whose associated data binds the owner,
-the calendar, the key-domain id, the grantee and the generation (3.2). The
-grantee account id in the header must equal the entry's `account_id`, and
-the key-domain id the owner ring's. The grant change id is the owner's
-calendar change id at which the grant was written and the rename change id
-the owner ring's; the greater of the two is the grantee's sync boundary
-(5.2).
+|| rename change id (8) || boundary-pending flag (1) || count `n` (2) || `n`
+records of generation (4) || ephemeral public key (32) || wrapped CK (72).
+It is not sealed as a whole: each record is a `pk_wrap` whose associated
+data binds the owner, the calendar, the key-domain id, the grantee and the
+generation (3.2). The grantee account id in the header must equal the
+entry's `account_id`, and the key-domain id the owner ring's. The grant
+change id is the change id the store assigned to the grant's own commit
+(zero until it is recorded) and the rename change id the owner ring's; the
+greater of the two is the grantee's sync boundary (5.2). The flag is set
+while either is not yet recorded, and while it is set the grantee's syncs of
+the calendar are full syncs (5.2).
 
 **Bundle envelope**: policy version || `0x03` || calendar document id (4)
 || generation (4) || the entry's bundle DEK wrapped under that generation's
@@ -996,6 +1004,17 @@ grantee's account beyond what upstream's index builder writes for any
 grant (the ACL index key and the share notification under the grantee's
 id).
 
+The sync boundary (5.2; re-review finding 1, revision 7) adds one write
+to a grant and one duty to the others. A grant's batch creates the grant
+ring with its boundary-pending flag set and its grant change id zero;
+right after the commit, the request records the grant's own change id
+(the one the commit's result reports) in a completion write of its own,
+which asserts the calendar archive as the grant left it and, on a lost
+assertion, re-reads the archive and retries. A level change, re-key,
+revoke or sweep whose batch finds a flag set in the archive it read
+completes the boundary in that same batch, with the owner account's last
+change id read after that archive read.
+
 ### 4.6 Caches after the commit
 
 After the commit, and only then, the endpoint invalidates the cached
@@ -1268,14 +1287,18 @@ change id (`DavQuery::changes`, `crates/dav/src/common/mod.rs:253`;
 `Urn::parse`, `crates/dav/src/common/uri.rs:197`). A grantee syncing from a
 token older than its grant could therefore receive the tombstones of a
 deleted private calendar that once had the granted calendar's slug. So each
-grant records the change id of the owner's calendar log at which it was
-written: the last change id read before the grant's commit, kept in the
-grant ring's visible header, where the grantee's session reads it, and in
-the ledger (author's call on both: the ledger is sealed under the owner's
-EWK, which a grantee's session never opens, and the commit's own change id
-is assigned by the store at commit, so the id read just before stands for
-it). A re-key or a level change keeps the recorded id; a revoke and a new
-grant start a new one.
+grant records the change id the store assigned to its own commit, kept in
+the grant ring's visible header, where the grantee's session reads it, and
+in the ledger (author's call on both: the ledger is sealed under the
+owner's EWK, which a grantee's session never opens). The id is read back
+after the commit (re-review finding 1, revision 7), never read before it:
+the grant's commit creates the grant ring with its boundary-pending flag
+set and its grant change id zero, and the same request then records the
+commit's own id by a completion (below), a lost assertion retrying it.
+That suffices for a grant, with no first step of its own: before the
+grant's commit the grantee has no access at all, so its ring is born
+pending and no earlier state needs fencing. A re-key or a level change
+keeps the recorded id; a revoke and a new grant start a new one.
 
 **The sync boundary** (re-review finding 2, revision 6). A grant's change
 id alone does not cover a calendar that is already granted and is then
@@ -1287,14 +1310,66 @@ calendar's tombstones under that slug among them (`rename_container`,
 sync boundary of a shared calendar for a grantee is the greater of that
 grantee's grant change id and the change id of the calendar's last slug
 change. A rename of a shared calendar (the owner's `MOVE` to another slug,
-5.6) records its change id, the last one read before the rename's commit,
-in the owner ring's header and in every grant ring's header, in the same
-assertion-fenced write that renames the calendar (the owner's session
-reseals the owner ring's payload, whose associated data binds the header).
-A grantee's `sync-collection` whose token is at or below its boundary is
-refused with 403 and the `DAV:valid-sync-token` precondition (RFC 6578
-section 3.2), so the client runs a full sync; a later token is served with
-the vanished filter above.
+5.6) records the change id of its own commit as the rename change id in
+the owner ring's header and in every grant ring's header, in the two steps
+below (the owner's session reseals the owner ring's payload at each, since
+its associated data binds the header). A grantee's `sync-collection` whose
+token is at or below its boundary is refused with 403 and the
+`DAV:valid-sync-token` precondition (RFC 6578 section 3.2), so the client
+runs a full sync; a later token is served with the vanished filter above.
+
+**The boundary is recorded after its commit, in two fenced steps**
+(re-review finding 1, revision 7). A change id read before the rename's
+commit does not stand for it: the rename's assertion fences only the renamed
+calendar's archive (`crates/common/src/storage/index.rs:349-351`),
+`get_last_change_id` is an independent log scan
+(`crates/store/src/query/log.rs:192`), and the store assigns the commit's
+change id inside its transaction
+(`crates/store/src/backend/rocksdb/write.rs:174-189`). Another session can
+therefore create a private calendar at the vacant destination, create and
+delete an event in it and delete it between that read and the commit; a
+token above the recorded id but below that history would pass the boundary
+and admit the private tombstone under the new prefix. So a rename of a
+shared calendar is two fenced writes:
+
+- **Step 1**, the rename itself (the archive with the new slug, in the same
+  transaction as today, `rename_container`), also sets the boundary-pending
+  flag in the owner ring's header and in every grant ring's header. While a
+  grant ring's flag is set, every `sync-collection` of that grantee on the
+  calendar, and on a home whose eligible calendars include it, is answered
+  with 403 `DAV:valid-sync-token` whatever token it carries: a full sync,
+  which reads no vanished list, is always safe.
+- **Step 2**, run by the same request right after step 1 commits, takes the
+  rename's own change id from the commit's result
+  (`AssignedIds::last_change_id`, `crates/store/src/write/mod.rs:430`,
+  which `commit_batch` returns,
+  `crates/common/src/storage/transaction.rs:21`: the id the store assigned
+  inside step 1's transaction, the one the calendar's log entry carries)
+  and completes the boundary with it.
+
+A **completion** with a change id `X` writes, in every ring whose flag is
+set, `X` for a grant change id that is still zero (and into that grant's
+ledger record), and, while the owner ring's flag is set (a rename is
+pending), `X` for the rename change id of the owner ring and of every grant
+ring; it clears every flag and asserts the calendar archive as it read it.
+`X` is the request's own commit id when the completion is the step 2 of a
+rename or of a grant and its assertion holds (the archive as that commit
+left it), and otherwise the owner account's last change id read after the
+archive read that saw the flags. Either is at or above the commit of every
+write that set a flag it clears, which is all the boundary needs: a boundary
+at or above the rename's own commit refuses every token from before the
+rename, the destination's earlier history included, and a higher one costs
+only a full sync. A
+step 2 whose assertion is lost re-reads the archive and retries as a
+completion of the second kind. A request that dies between the steps leaves
+the flags set, so the grantees get full syncs and nothing is exposed until a
+later owner write on the calendar completes the boundary: the next rename's
+or grant's step 2, a level change, re-key or revoke (each completes in its
+own batch, 4.5), or the repair the owner's session runs as a write of its
+own when its resolver next reads the calendar with a flag set. So no
+boundary is ever derived from a value read before the commit it bounds: a
+step 2 uses the id the store assigned to that commit, and every other
+completion a change id read after it.
 
 ### 5.3 Method by method
 
@@ -1307,7 +1382,7 @@ unchanged apart from the key domain, 5.5):
 | `PROPFIND` of a granted calendar or of its events | served, unsealed with the CK | same |
 | `GET`, `HEAD` of an event | served | served |
 | `REPORT` `calendar-query`, `calendar-multiget` | served; candidates unsealed before the content filters, as release 1 section 8.2 runs them | same |
-| `REPORT` `sync-collection` | served from a token newer than the sync boundary, the later of the grant and the calendar's last rename (an older one is refused with 403 `valid-sync-token`, so the client runs a full sync); vanished entries limited to the requested collection and to paths under the current path of an eligible calendar, so a granted calendar that was deleted or renamed gets no 404 of its own and the client rediscovers it from the home listing (5.2) | same |
+| `REPORT` `sync-collection` | served from a token newer than the sync boundary, the later of the grant and the calendar's last rename (an older one, and any token while the boundary is pending, is refused with 403 `valid-sync-token`, so the client runs a full sync); vanished entries limited to the requested collection and to paths under the current path of an eligible calendar, so a granted calendar that was deleted or renamed gets no 404 of its own and the client rediscovers it from the home listing (5.2) | same |
 | `REPORT` `free-busy-query` on a granted calendar | no busy periods (below) | same |
 | `PUT` creating an event | 403 (`AddItems`) | stored sealed under the CK, under the owner's UID lease (6.4); schedules as upstream, messages in the owner's name delegated with `SENT-BY` (6.2) |
 | `PUT` over an event | 403 (`ModifyItems`) | stored sealed under the newest generation; schedules as upstream, delegated with `SENT-BY` |
@@ -1493,9 +1568,12 @@ dragged between calendars.
   in the owner's home, which upstream implements as a rename that keeps the
   document id (`rename_container`). The wraps bind the document id, so the
   rename needs no rewrap, but it is no longer a bare name change: in the
-  same write it records its change id as the rename change id in the owner
-  ring's header and every grant ring's header, advancing the grantees' sync
-  boundary (5.2; re-review finding 2, revision 6). A grantee never copies
+  same write it sets the boundary-pending flag in the owner ring's header
+  and every grant ring's header, and a second write right after its commit
+  records the change id the store assigned to that commit as the rename
+  change id there and clears the flags, advancing the grantees' sync
+  boundary (5.2; re-review finding 2, revision 6; re-review finding 1,
+  revision 7). A grantee never copies
   or moves a collection: upstream requires membership of the destination
   account, and the gate refuses the one grantee token that would be a
   member, one carrying `Impersonate` (5.1).
@@ -1630,36 +1708,74 @@ fan-out in the grantee's session, on the owner's behalf:
      writer's later reply from its own copy would be refused as from a
      non-participant.
    - **The writer's own attendance: self-delivery** (re-review finding 4;
-     re-review findings 3 and 4, revision 6). In a delegated write the
-     writer's own attending addresses are recipients of the same messages
-     the other attendees receive. For each message upstream's builders
-     produce (a REQUEST for a create or an update, a CANCEL for a deletion
-     or an attendee's removal), the fan-out also delivers it to each of the
-     writer's addresses that attends a component the message carries,
-     carrying the message's own SEQUENCE; the local-recipient filter that
-     excludes the writer's lines under the merged list
-     (`send_update_messages`, `crates/groupware/src/scheduling/mod.rs:221`)
-     is bypassed for those lines in the delegated case. So an update that
-     changes no SEQUENCE (a SUMMARY edit: SUMMARY and DESCRIPTION are not
-     among the fields that increment it, `organizer.rs:35`, and the fork's
-     floor only prevents a decrease, `sequence.rs:103`) reaches the
-     writer's own copy, and a deletion's CANCEL (`itip_cancel` builds it
-     from the source tree before the delete, incrementing only the outgoing
-     SEQUENCE, `event_cancel.rs:22`, `:47`) cancels the writer's own copy
-     as any CANCEL does. When the builders produce nothing that reaches
-     the writer but the writer's own line changed (a decline: upstream's
-     builders drop a declined attendee and return `NothingToSend` when no
-     recipient remains, `organizer.rs:58`, `:133`), the fan-out builds the
-     REQUEST from the committed tree, the full state with the new
-     SEQUENCE, and the PUT calls the fan-out for it even when upstream
-     built nothing (`update.rs:304`, `:354` call it only when messages
-     exist).
+     re-review findings 3 and 4, revision 6; re-review finding 2, revision
+     7). In a delegated write that upstream's builders treat as the
+     organizer's (the event's ORGANIZER is the owner's address, point 1),
+     the fan-out runs a **self-message builder** for the writer: fork code
+     beside upstream's builders, which stay unchanged. It derives the
+     writer's messages from the writer's attendance before and after the
+     write, before any recipient filtering and independent of what
+     upstream's builders produced, because those builders count the
+     writer's addresses as local under the merged list and suppress the
+     writer's message in cases its copy must still see:
+     `send_update_messages` excludes every local attendee
+     (`crates/groupware/src/scheduling/mod.rs:221`); an update with no
+     recipient left returns `NothingToSend` (`organizer.rs:77`, `:133`),
+     as a sole attendee's SUMMARY edit does; the CANCEL builder needs a
+     non-empty recipient set (`event_cancel.rs:47`, `:60`), so a sole
+     attendee's deletion builds none; and cancellation discovery counts
+     external attendees only (`organizer.rs:58`), so the writer's removal
+     of its own line builds no CANCEL for it, while the other attendees'
+     REQUEST no longer names the writer and the writer's drain would
+     refuse it, a tree with no local attendee (`snapshot.rs:353`, checked
+     before the merge, `drain.rs:1061`).
 
-     **One self item per address** (re-review finding 4, revision 6).
-     Tokens belong to addresses, not accounts, and a pending item carries
-     exactly one address and its token (`seal/item.rs:152`, `:210`), so the
-     fan-out sends one self item per distinct attending address of the
-     writer, each with that address's pair, in the existing pending format;
+     An address's attendance is the set of the event's components, the
+     master and each override, whose ATTENDEE lines name it: before the
+     write in the stored tree the handler already holds (`update.rs:233`
+     takes it for the diff; `delete.rs:199-208` reads the event before
+     the delete), after it in the committed tree. For each of the writer's
+     addresses the builder makes:
+     - when the address attends after the write, one REQUEST of the
+       committed tree's full state, the components that address attends,
+       with the write's SEQUENCE (the committed tree's, after upstream's
+       increment and the floor), whenever a component it attends changed
+       in anything its copy shows, SEQUENCE or not, its own line included
+       (a decline, a creation);
+     - when the address attended a component before the write and no
+       longer attends it after (its line removed, the event deleted, an
+       override it attended removed), one CANCEL of those components,
+       built from the prior tree, with the SEQUENCE upstream builds for a
+       CANCEL (`itip_cancel` takes the prior master's plus one,
+       `event_cancel.rs:56`, for a deletion; for a removal or a removed
+       override, the committed tree's, which upstream's update already
+       incremented, `organizer.rs:74`, `:126`);
+     - nothing, when the write changes no component the address attends.
+
+     None of upstream's per-attendee conditions (locality,
+     `SCHEDULE-AGENT`, `RSVP`, a declined PARTSTAT without
+     `SCHEDULE-FORCE-SEND`) suppresses a self-message: they decide what is
+     sent to others, and a self-message only keeps the writer's own copy
+     in step with the owner's event (author's call). The writer's
+     addresses stay out of upstream's recipient map (being local, the
+     builders never name them, and the fan-out drops any a builder's list
+     still names), so no message reaches the writer twice. The PUT and the
+     DELETE call the fan-out whenever the self-message builder built
+     something, even when upstream built nothing (`update.rs:304`, `:354`
+     call it only when messages exist; the DELETE's call, `delete.rs:255`,
+     already runs with no message when `itip_cancel` built none,
+     `crates/groupware/src/calendar/storage.rs:594`). A delegated write on
+     the attendee side (the owner's ATTENDEE line of an invitation
+     organized elsewhere, a REPLY as the owner) builds no self-message:
+     the writer's copy of that invitation is its organizer's to update
+     (author's call).
+
+     **One self item per address** (re-review finding 4, revision 6). Tokens
+     belong to addresses, not accounts, and a pending item carries exactly
+     one address and its token (`seal/item.rs:152`, `:210`), so the fan-out
+     sends each self-message as one self item per address it is built for
+     (an attending address for a REQUEST, a formerly attending one for a
+     CANCEL), each with that address's pair, in the existing pending format;
      the drain's REQUEST merge keeps pairs arriving for different addresses
      (`drain.rs:1128`). A writer attending the master as one alias and an
      override as another therefore holds both pairs, and a later reply from
@@ -1806,21 +1922,22 @@ of its own gets upstream's behaviour: under the merged addresses the
 owner's event is organized locally, so the change is an organizer-side
 update, sent to the other attendees as the owner with `SENT-BY` the
 grantee (6.2), and no REPLY is built. Self-delivery (6.2, point 2) keeps
-the grantee's own copy consistent with the owner's in three cases
-(re-review finding 3, revision 6):
+the grantee's own copy consistent with the owner's (re-review finding 3,
+revision 6; re-review finding 2, revision 7). The self-message builder
+guarantees these cases whatever upstream's builders produce, the grantee
+the event's only attendee included:
 
-- **an update**, its own line's change or any other that upstream
-  announces, a SUMMARY edit that changes no SEQUENCE included: the update
-  REQUEST the other attendees receive also reaches the grantee's own
-  inbox, with its SEQUENCE and the grantee's token for each of its
+- **an update** of a component the grantee attends, in any field its copy
+  shows, SEQUENCE or not (its own line's change, a SUMMARY edit): a
+  REQUEST of the committed full state, with its token for each of its
   attending addresses;
-- **a deletion** of the shared event, or the grantee's removal from it:
-  the CANCEL the other attendees receive also reaches the grantee's own
-  inbox and cancels its own copy;
-- **a decline** that upstream's builders do not announce (the grantee the
-  event's only attendee, declining without `SCHEDULE-FORCE-SEND`, where
-  they send nothing at all, re-review finding 4): the REQUEST built from
-  the committed tree.
+- **a decline**, whether upstream announces it or not (re-review finding
+  4): the same REQUEST;
+- **a deletion** of the shared event: a CANCEL built from the prior tree;
+- **the removal of the grantee's own line**, other attendees remaining or
+  not: a CANCEL of the components it attended, from the prior tree;
+- **the deletion of an override** the grantee attends: a CANCEL of that
+  instance.
 
 In each, the grantee's drain merges the item into its own copy, the
 server keeps both copies consistent either way, and the grantee's later
@@ -2041,9 +2158,10 @@ the `Calendar` collections that grants now legitimately produce.
   section 7.1 counts a sealed collection's stored bytes: a few hundred
   bytes per principal, one more padded bundle per shared calendar in the
   owner's entry (the shared bundle), a fixed header per ring (the 16-byte
-  key-domain id and the 8-byte rename change id in each, and the 8-byte
-  grant change id in each grant ring), plus 108 bytes per generation in
-  each grant ring and 36 in the owner ring, before padding and base64.
+  key-domain id, the 8-byte rename change id and the 1-byte
+  boundary-pending flag in each, and the 8-byte grant change id in each
+  grant ring), plus 108 bytes per generation in each grant ring and 36 in
+  the owner ring, before padding and base64.
 
 ### 8.8 Deleting a shared calendar
 
@@ -2076,7 +2194,7 @@ calendar cannot be deleted (upstream).
 | In-account `COPY` and `MOVE` touching a shared calendar | n/a | event `MOVE` rewraps; event `COPY` 403; collection `COPY` and `MOVE` 403 except a rename (5.6) |
 | Cross-account `COPY` and `MOVE` | 403 | 403 (unchanged) |
 | Impersonation, master user, group membership, `is_member` | 403 | 403: a grant to the token's own account and its own grant ring are required, and a token carrying `Impersonate` is refused at the gate (5.1, 5.2) |
-| A grantee's `LOCK`, `UNLOCK`, and `sync-collection` vanished entries | 403 at the URI gate | `LOCK` and `UNLOCK` upstream's 403; a sync token older than the sync boundary (the later of the grant and the calendar's last rename) refused with `valid-sync-token`; vanished entries limited to the requested collection and the eligible calendars' paths (5.2, 5.3) |
+| A grantee's `LOCK`, `UNLOCK`, and `sync-collection` vanished entries | 403 at the URI gate | `LOCK` and `UNLOCK` upstream's 403; a sync token older than the sync boundary (the later of the grant and the calendar's last rename), or any token while the boundary is pending, refused with `valid-sync-token`; vanished entries limited to the requested collection and the eligible calendars' paths (5.2, 5.3) |
 | Foreign calendars in a grantee's own-home listing (assisted discovery, `propname`) | the key owner's calendars unreachable | listed only when eligible: the token's own account in the calendar's `acls` with `Read`, no `Impersonate` (5.2) |
 | Invitations from the owner in a shared calendar | n/a | release 2's, sealed under the CK; a grantee who is an attendee also gets its own copy (6.3) |
 | A grantee's invitations, updates, cancellations and replies in the name of an account whose shared calendar it holds an edit grant on | n/a | as upstream, with `SENT-BY` the grantee, under the grantee's keys and pins, authorized by the write-time ACL (6.2) |
@@ -2155,23 +2273,25 @@ the delegated reason string).
 
 ### 11.2 Integration: the za suite
 
-New sub-modules under `tests/src/za/`, after the pinning module (grants
-need pins) and before the leak tests, so that the scan covers shared
-calendars: `sharing.rs` for the behaviour and `sharing_races.rs` for the
-concurrency cases (author's call on the split). They pin through the
-contacts endpoints, write through CalDAV as each account, remove what they
-create (`assert_is_empty` runs once at the suite's end), and use account
-names unique across modules. New test hooks in
+New sub-modules under `tests/src/za/`, after the pinning module (grants need
+pins) and before the leak tests, so that the scan covers shared calendars:
+`sharing.rs` for the behaviour and `sharing_races.rs` for the concurrency
+cases (author's call on the split). They pin through the contacts endpoints,
+write through CalDAV as each account, remove what they create
+(`assert_is_empty` runs once at the suite's end), and use account names
+unique across modules. New test hooks in
 `crates/common/src/za/test_hooks.rs`, compiled only under `test_mode`:
 `SHARE_COMMIT_PAUSE` (an endpoint after its decision, before its commit),
 `SHARE_PRECHECK_PAUSE` (a first grant after its linked-event precheck,
 before phase 1), `SHARE_REWRAP_PAUSE` (a conversion after phase 1, before
 its parentage walk, and between two rewrap batches) and
-`SHARE_REWRAP_FAIL_ONCE` (a conversion cut after phase 1), beside the
+`SHARE_REWRAP_FAIL_ONCE` (a conversion cut after phase 1) and
+`SHARE_BOUNDARY_PAUSE` (a rename of a shared calendar after its destination
+lookup, before step 1's commit, and between its two steps, 5.2), beside the
 existing `COMMIT_PAUSE`, which case 22 also places before an event
-`DELETE`'s commit. Test helpers open rings and envelopes with an
-account's password-derived keys to assert generations; they are test code
-and never part of the product build.
+`DELETE`'s commit. Test helpers open rings and envelopes with an account's
+password-derived keys to assert generations; they are test code and never
+part of the product build.
 
 Cases, with alice and bob (and carol and dave where named) as key
 accounts:
@@ -2195,7 +2315,17 @@ accounts:
    `/family/` and removes that calendar, then renames the granted calendar
    to `/family/`; bob's sync from the kept token answers 403
    `valid-sync-token`, and his full sync shows nothing of the old
-   calendar.
+   calendar. The paused rename (re-review finding 1, revision 7): bob
+   holds a grant on alice's calendar at `/other/` and keeps a token; alice
+   renames it to the vacant `/family/` with `SHARE_BOUNDARY_PAUSE` holding
+   the rename before step 1's commit, while another session of alice's
+   creates a private calendar at `/family/`, creates and deletes an event
+   in it and deletes the calendar; at the second pause, between the steps,
+   bob's sync answers 403 `valid-sync-token` with the kept token and with a
+   numeric token above every change id so far; after the rename completes,
+   a numeric token one above the last change id before the private writes
+   answers 403 `valid-sync-token`, and neither bob's full sync nor any
+   later token admitted afterwards returns the private event's tombstone.
 2. Grant, edit: bob creates, changes and deletes events and sets his own
    name, which alice's view does not show; his `calendar-color` change
    recolours the calendar in alice's view too (shared dead properties, as
@@ -2295,7 +2425,16 @@ accounts:
     edits only the SUMMARY of alice's event through the shared calendar (no
     SEQUENCE change), and his own copy shows the new summary after his
     drain and a refresh; bob deletes the shared event, and his own copy is
-    cancelled after his drain and a refresh. Aliases (re-review finding 4,
+    cancelled after his drain and a refresh. The sole-attendee and removal
+    cases (re-review finding 2, revision 7), each checked on bob's own copy
+    after his drain and a refresh: in an event alice organizes whose only
+    attendee is bob, bob edits only its SUMMARY through the shared calendar
+    (upstream's builder returns `NothingToSend`), and his copy shows the new
+    summary; bob then deletes that event through the shared calendar
+    (upstream's CANCEL builder builds nothing), and his copy is cancelled;
+    in an event alice organizes with bob and carol, bob removes his own
+    ATTENDEE line through the shared calendar, carol's copy loses bob's
+    line, and bob's copy is cancelled. Aliases (re-review finding 4,
     revision 6): bob creates through the shared calendar an event alice
     organizes, attending the master as `bob@` and an override as
     `bob-work@`; his inbox receives one self item per address, his own copy
@@ -2486,42 +2625,44 @@ through its second home-set href. DAVx5 is optional.
 
 ### 11.6 Mutation checks
 
-In the style of plan 7, each failing the named case: invalidating before
-the commit (16); no access-token invalidation (17); no vault assertion
-(18); no pin-record assertion (19); no calendar assertion on the
-endpoint's write (20); no calendar assertion on event writes (21 and 22);
-no rewrap in the conversion (3); no rotation on revoke (6); rotation
-wrapping to the served key instead of the ledger's (8, with a remaining
-grantee's served key substituted during a revoke); the resolver honouring
-`is_member` or skipping its bit check (11); a refusal inside a listing
-failing the request instead of skipping the calendar (11); the gate
-accepting a token without its own keys (11); no `SENT-BY`-to-`changed_by`
-check in the drain's delegated branch, which lets the planted item naming
-bob with `changed_by` dave through (9); no `SENT-BY` placement, which
-makes the delegated REQUEST fail release 2's sender check at carol's drain
-(9); attendee locality judged by the merged list, which drops bob's pair
-from alice's event so that his later reply is refused (10); the writer's
-own inbox excluded from a delegated fan-out, which leaves bob's own copy
-at the old SEQUENCE so that his later reply is stale (10); no
-single-parent rule (12); a `MOVE` into a shared calendar that keeps the
-event's other names (12); the
-share batch without the registry Account assertion (14, the race); the
-endpoint's invalidation through `refresh_acls` alone, which misses the
-same-level re-key (17); an event `DELETE` without the calendar assertion
-(22); revoke resolving an address through the directory before the ledger
-(5); the gate admitting a token with `Impersonate` (11); `sync-collection`
-without the vanished-path filter (1); phase 2 rewrapping before its
-parentage walk (24); the write rule dropped (24, second run); assisted
-discovery without the eligibility check (11); the token bound check
-removed (1, slug reuse); self-delivery only when the builders produced
-messages (10, sole-attendee decline); the cache keyed without the
-key-domain id (24, third run); the rename not advancing the boundary (1,
-rename into a former slug); self-delivery on a SEQUENCE change only (10,
-SUMMARY edit); no self-CANCEL (10, deletion); one self item for all
-aliases (10, aliases); a new grantee given only the newest
-generation (7); a grantee's dead property written into the owner's
-personal bundle (2, with the unit test of 11.1); a plaintext event skipped
-by the conversion (3).
+In the style of plan 7, each failing the named case: invalidating before the
+commit (16); no access-token invalidation (17); no vault assertion (18); no
+pin-record assertion (19); no calendar assertion on the endpoint's write
+(20); no calendar assertion on event writes (21 and 22); no rewrap in the
+conversion (3); no rotation on revoke (6); rotation wrapping to the served
+key instead of the ledger's (8, with a remaining grantee's served key
+substituted during a revoke); the resolver honouring `is_member` or skipping
+its bit check (11); a refusal inside a listing failing the request instead
+of skipping the calendar (11); the gate accepting a token without its own
+keys (11); no `SENT-BY`-to-`changed_by` check in the drain's delegated
+branch, which lets the planted item naming bob with `changed_by` dave
+through (9); no `SENT-BY` placement, which makes the delegated REQUEST fail
+release 2's sender check at carol's drain (9); attendee locality judged by
+the merged list, which drops bob's pair from alice's event so that his later
+reply is refused (10); the writer's own inbox excluded from a delegated
+fan-out, which leaves bob's own copy at the old SEQUENCE so that his later
+reply is stale (10); no single-parent rule (12); a `MOVE` into a shared
+calendar that keeps the event's other names (12); the share batch without
+the registry Account assertion (14, the race); the endpoint's invalidation
+through `refresh_acls` alone, which misses the same-level re-key (17); an
+event `DELETE` without the calendar assertion (22); revoke resolving an
+address through the directory before the ledger (5); the gate admitting a
+token with `Impersonate` (11); `sync-collection` without the vanished-path
+filter (1); phase 2 rewrapping before its parentage walk (24); the write
+rule dropped (24, second run); assisted discovery without the eligibility
+check (11); the token bound check removed (1, slug reuse); self-delivery
+only when the builders produced messages (10, sole-attendee decline); the
+cache keyed without the key-domain id (24, third run); the rename not
+advancing the boundary (1, rename into a former slug); the boundary taken
+from a change id read before the rename's commit (1, paused rename); no full
+sync while the boundary is pending (1, paused rename); self-delivery on a
+SEQUENCE change only (10, SUMMARY edit); no self-CANCEL (10, deletion);
+self-messages taken from upstream's builders' output only (10, the
+sole-attendee SUMMARY edit and deletion); no self-CANCEL on the writer's
+removal (10, self-removal); one self item for all aliases (10, aliases); a
+new grantee given only the newest generation (7); a grantee's dead property
+written into the owner's personal bundle (2, with the unit test of 11.1); a
+plaintext event skipped by the conversion (3).
 
 ## 12. Invariants for implementers
 
@@ -2558,8 +2699,11 @@ adds:
     other key, and only the principal's own session opens it.
 35. The share endpoints are the only writers of a key account's calendar
     `acls` and of collection-key wraps (apart from deleting the calendar or
-    the account). Each grant, level change, re-key, revoke and sweep is one
-    conditional write in the owner's freshly verified request, asserting
+    the account, and from the sync boundary's writes, which rewrite ring
+    headers and reseal the owner ring's payload with its keys unchanged,
+    5.2). Each grant, level change, re-key, revoke and sweep is one
+    conditional write in the owner's freshly verified request (a grant
+    followed by its boundary's completion write, 4.5), asserting
     the calendar archive, the owner's vault record at the verified
     revision and the owner's registry Account item, and the pin record for
     a grant or re-key; the caches of every grantee whose entry it wrote,
@@ -2588,9 +2732,10 @@ adds:
     `SENT-BY` resolves to the item's `changed_by`, a key account other than
     the named one. The fan-out seals with the session's own keys and pins,
     computes token locality against the event account's own addresses and
-    delivers to the writer's own attendee lines; the UID lease and the
-    SEQUENCE floor of a shared calendar's event are keyed by the calendar's
-    account.
+    builds the writer's own messages from the writer's attendance before
+    and after the write, one self item per address (6.2); the UID lease and
+    the SEQUENCE floor of a shared calendar's event are keyed by the
+    calendar's account.
 39. Sharing never yields another account's account keys: a session holds
     only its own MK, EWK, mail wrapping key and private key, and the
     collection keys of the calendars it owns or is granted. A grantee never
@@ -2646,8 +2791,10 @@ stands unless the code says otherwise.
    trace strings; the 409 reasons revision 5 adds (`account deleted`,
    `address is ambiguous, revoke by grant`); the `reverting` flag, the
    grant change id's width and place in the grant ring's header, and the
-   write rule's trace string (revision 6); the test hooks, among them
-   `SHARE_PRECHECK_PAUSE`.
+   write rule's trace string (revision 6); the boundary-pending flag's
+   place in both ring headers and the request point of the owner's
+   boundary repair (revision 8); the test hooks, among them
+   `SHARE_PRECHECK_PAUSE` and `SHARE_BOUNDARY_PAUSE`.
 2. **The calendar assertion on event writes** (5.5): the assertion class
    (the archive's version, as upstream's `update` asserts it, or a hash of
    the bytes read) and its place before the set on PostgreSQL and MySQL.
@@ -2700,17 +2847,21 @@ stands unless the code says otherwise.
    `SENT-BY` decision; and the writer's self-delivery, with
    `resolve_inner`'s exclusion of the sender's own inbox carved out for it.
    How the writer's lines are served is decided (re-review finding 4;
-   re-review findings 3 and 4, revision 6): every message upstream's
-   builders produce is also delivered to each of the writer's addresses
-   that attends a component it carries, one self item per address with its
-   own pair, the local-recipient filter bypassed for those lines; and when
-   nothing reaches the writer but its own line changed, the fan-out builds
-   the REQUEST from the committed tree, `NothingToSend` included (6.2,
-   point 2). Planning places the extra recipients in the fan-out's
-   recipient map rather than in upstream's builders. The parameter's name
-   and the call sites (`update.rs`, `delete.rs`, the calendar `DELETE` per
-   event) are planning's; the owner's and a plain writer's calls pass
-   their own account.
+   re-review findings 3 and 4, revision 6; re-review finding 2, revision
+   7): a self-message builder, fork code beside upstream's builders, which
+   stay unchanged, derives the writer's messages from its attendance
+   before and after the write, before any recipient filtering and
+   whatever those builders return: a REQUEST of the committed full state
+   for each address that attends after a change it would see, a CANCEL
+   built from the prior tree for each address that stopped attending a
+   component, one self item per address with its own pair (6.2, point 2).
+   The writer's addresses stay out of upstream's recipient map, so no
+   message reaches the writer twice, and the fan-out takes the prior tree
+   beside the committed one (the PUT holds it for the diff, the DELETE
+   reads it before the delete). The parameters' names and the call sites
+   (`update.rs`, `delete.rs`, the calendar `DELETE` per event) are
+   planning's; the owner's and a plain writer's calls pass their own
+   account and build no self-message.
 10. **The drain's delegated branch** (6.2, point 3): the `SENT-BY` parsing
     (a `mailto:` URI, compared after key pinning section 4.3's
     normalization) and its resolution to `changed_by`, the key-account test
@@ -2840,12 +2991,13 @@ Merge hotspots this release adds (fork insertions in upstream files):
   linked `MOVE` and the rewrap in `copy_move.rs`, the cache invalidation
   after a shared calendar's `DELETE` in `delete.rs`). In `update.rs` and
   `delete.rs` the fan-out calls now pass the event's account beside the
-  writer's `account_info` and keys (6.2), and `update.rs` calls the
-  fan-out for a writer's self-delivery even when upstream built no
-  message.
+  writer's `account_info` and keys (6.2), and both pass the prior tree and
+  call the fan-out for the writer's self-messages even when upstream built
+  no message; `copy_move.rs` also holds the rename's two boundary writes
+  (5.2).
 - `crates/groupware/src/calendar/fanout.rs` (fork-owned: the event-account
-  parameter, the owner-address token locality, the writer's self-delivery
-  built from the committed tree and `resolve_inner`'s carve-out, the
+  parameter, the owner-address token locality, the self-message builder
+  and `resolve_inner`'s carve-out, the
   `SENT-BY` placement, no withheld entries for a delegated fan-out) and
   `crates/groupware/src/calendar/drain.rs` (fork-owned: the delegated
   branch of the step-2 sender check and its reason string). The delegate
@@ -2853,9 +3005,10 @@ Merge hotspots this release adds (fork insertions in upstream files):
   writer's first, then the owner's), on the drain's step-2 rule that an
   item's ORGANIZER or acting ATTENDEE resolves to `changed_by`, on
   `changed_by` being the writer in every item the fan-out writes, on
-  upstream's organizer builders dropping declined attendees and returning
-  `NothingToSend` (`send_update_messages`, `organizer.rs`), which the
-  self-delivery works around, on the REQUEST merge's `AddComponent` and the
+  upstream's builders never addressing a local address
+  (`send_update_messages`, `organizer.rs`, `event_cancel.rs`), which keeps
+  each self-message single while the self-message builder runs beside
+  them, on the REQUEST merge's `AddComponent` and the
   CANCEL merge's ORGANIZER copy (`inbound.rs`), which 6.2's per-component
   `SENT-BY` statement describes, and on
   upstream's write-time ACL checks in `update.rs` and `delete.rs`, which
@@ -2896,7 +3049,11 @@ merge touches it:
   only while its path exists) and the bare change id of a sync token
   (`DavQuery::changes`), on which the vanished filter and the grantee's
   sync-token bound rely; `shared_containers`, which the filter no longer
-  uses for its prefixes.
+  uses for its prefixes. The change id a commit's result reports
+  (`AssignedIds::last_change_id`, returned by `commit_batch`), which the
+  store assigns inside the commit's transaction
+  (`crates/store/src/backend/rocksdb/write.rs:174-189`): the boundary's
+  step 2 records it (5.2).
 - `Calendar::preferences` and `preferences_mut`
   (`crates/groupware/src/calendar/mod.rs`), whose behaviour the grantee's
   entry follows, and the resource cache's per-entry reads of flags and time
