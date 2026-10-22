@@ -1,6 +1,6 @@
 # Zero-access calendar: sharing between key accounts (release 4) design spec
 
-Date: 2026-10-22. Status: revision 5, draft for review. Scope: release 4
+Date: 2026-10-22. Status: revision 6, draft for review. Scope: release 4
 of the zero-access fork (jaylaney/stalwart); GitHub issue #24, milestone
 "Release 4: calendar sharing". Revision 2 answers the builder check and
 the adversarial review of revision 1: the shared bundle (3.3), the
@@ -20,7 +20,13 @@ single-parent check (3.5), MOVE into a shared calendar (5.6), revoke by
 grant id (4.4), the paths that bypass the resolver (5.1, 5.2), a grant
 racing the owner's destruction (8.6), the same-level re-key's
 invalidation (4.6), DELETE's calendar fence (5.5), and two corrections
-(6.2, 11.5).
+(6.2, 11.5). Revision 6 answers the re-review of revision 5 (the same
+review file, updated): the conversion's abort and the linked-event write
+rule (3.5, 5.5), foreign-path eligibility in the grantee's own home (5.2,
+5.4), the grantee's sync token (5.2), the writer's self-delivery (6.2,
+6.3), the alias rule (4.4) and `SENT-BY` per component (6.2). With it the
+three earlier findings the re-review marked partial (review findings 1, 4
+and 8) are complete.
 
 The terms key account, master key (MK), event wrapping key (EWK), data key
 (DEK), `X-ZA-KEY`, `X-ZA-SEALED`, `X-ZA-EXTRA`, wrap type, collection
@@ -257,13 +263,14 @@ those principals.
   `changed_by`), and the paths a grantee's client requests under the
   owner's URLs (request logs; paths are visible by structure).
 - Who acts for whom. A delegated message's `SENT-BY` (6.2) shows its
-  recipients that the grantee sent it in the owner's name. A recipient's
-  stored copy carries the `SENT-BY` set by the import that created it and
-  by any CANCEL merged into it since (a CANCEL merge copies the incoming
-  ORGANIZER), never by a REQUEST update; the copy keeps it after a revoke,
-  and the recipient's REPLY echoes it (review finding 8). The parameter is
-  sealed with its
-  property, so the operator does not read it, but the operator sees each
+  recipients that the grantee sent it in the owner's name. Each component
+  of a recipient's stored copy carries the `SENT-BY` of the message that
+  set its ORGANIZER: the import that created the copy, a later REQUEST
+  that added the component, or a CANCEL merged into it; a REQUEST update
+  of a component the copy already holds leaves it as stored. The copy keeps
+  it after a revoke, and the recipient's REPLY echoes it (review finding 8,
+  re-review finding 6). The parameter is sealed with its property, so the
+  operator does not read it, but the operator sees each
   item's `changed_by` (the grantee, as release 2 records any sender) and
   can match the item's visible UID with an event of the owner's calendar.
 - The sizes of the shared form's parts: rings grow by a fixed amount per
@@ -448,12 +455,14 @@ against them; the associated data binds them.
 | `ZaOwnerRing` | `version` | `u8` | `1`; any other value is an unseal failure. |
 | | `keys` | `Vec<[u8; 32]>` | The CK of each generation, in header order. |
 | | `converted` | `bool` | Every event of the calendar carries a `0x03` envelope (3.5). |
+| | `reverting` | `bool` | A conversion that found a linked event is being undone: writes seal under the EWK while it is set (3.5). |
 | | `grants` | `Vec<ZaGrant>` | The ledger: one per current grantee, unique by account id. |
 | `ZaGrant` | `account_id` | `u32` | The grantee's account, as `acls` names it. |
 | | `address` | `String` | The address the grant was made to, normalized as key pinning section 4.3 normalizes pins. |
 | | `public_key` | `[u8; 32]` | The key every generation is wrapped to for this grantee: the pin's key, equal to the served key, when the grant or its last re-key was made. |
 | | `level` | `u8` | `1` view, `2` edit, kept equal to the `acls` bits by every write. |
 | | `granted_at` | `i64` | Unix seconds of the grant or of its last re-key. |
+| | `change_id` | `u64` | The grant change id, as the grant ring's header carries it (5.2); kept by a re-key and a level change. |
 
 The ledger is the owner's own record of whom it trusted with which key,
 sealed under the owner's EWK so that neither a store writer nor a grantee
@@ -462,11 +471,14 @@ endpoint reports its addresses (4.2), never the directory's. The structs
 have a silent `Debug` (they hold keys and addresses).
 
 **Grant ring** (`0x05`): policy version || `0x05` || calendar document id
-(4) || grantee account id (4) || count `n` (2) || `n` records of
-generation (4) || ephemeral public key (32) || wrapped CK (72). It is not
-sealed as a whole: each record is a `pk_wrap` whose associated data binds
-the owner, the calendar, the grantee and the generation (3.2). The grantee
-account id in the header must equal the entry's `account_id`.
+(4) || grantee account id (4) || grant change id (8) || count `n` (2) ||
+`n` records of generation (4) || ephemeral public key (32) || wrapped CK
+(72). It is not sealed as a whole: each record is a `pk_wrap` whose
+associated data binds the owner, the calendar, the grantee and the
+generation (3.2). The grantee account id in the header must equal the
+entry's `account_id`. The grant change id is the owner's calendar change
+id at which the grant was written, which binds the grantee's sync tokens
+to the grant (5.2).
 
 **Bundle envelope**: policy version || `0x03` || calendar document id (4)
 || generation (4) || the entry's bundle DEK wrapped under that generation's
@@ -567,13 +579,15 @@ owner's grant request, in three phases (author's call):
    (plaintext, which release 1 section 7.3 tolerates until its next write,
    `seal/event.rs` and `dav_seal::test_legacy`) is sealed under the CK in
    full, as a PUT would seal it, and counted separately as `sealed`.
-   Before each rewrite the phase checks the event's current parentage:
-   exactly one parent, this calendar. Rewrites commit in batches of 100
-   events (author's call), each event asserting its own stored archive; an
-   event that loses its assertion is re-read (a concurrent writer has
-   sealed it under the CK, 5.5, or linked it) and skipped when it already
-   carries `0x03`. The phase ends with a scan that finds no event of the
-   calendar without a `0x03` envelope and no event with a second parent.
+   The phase scans before it rewraps (re-review finding 1): it first walks
+   every event of the calendar checking its parentage (exactly one parent,
+   this calendar), and only when the walk is clean does it start
+   rewrapping. Rewrites commit in batches of 100 events (author's call),
+   each event asserting its own stored archive; an event that loses its
+   assertion is re-read (a concurrent writer has sealed it under the CK,
+   5.5) and skipped when it already carries `0x03`. The phase ends with a
+   scan that finds no event of the calendar without a `0x03` envelope and
+   no event with a second parent.
 3. **The grant.** One batch: the `acls` entry, the grantee's entry with its
    ring holding every generation, the ledger record and `converted` set,
    asserting the calendar archive, the vault record, the pin record and the
@@ -587,14 +601,33 @@ a second parent to an event of the calendar (a `COPY` appends a name and
 updates only the event, `crates/dav/src/calendar/copy_move.rs:507-523`),
 which phase 1's assertions do not see. Once phase 1 has committed the
 shared form no new link can form, since the single-parent rule refuses a
-`COPY` into or out of a shared calendar (5.6), so the window is the
-precheck's alone, and phase 2's per-event check and closing scan close it.
-An event found linked there aborts the conversion with the precheck's 409,
-`calendar has linked events`, and writes no grant: the calendar stays in
-the shared form with `converted` unset, which is complete for the owner
-and invisible to anyone else, and a later grant resumes phase 2 and
-checks again. The owner removes the link (deletes the other calendar's
-copy of the event) and grants again.
+`COPY` of an event with a shared parent and a `MOVE` that would leave one
+linked (5.6), so the window is the precheck's alone, and phase 2's walk
+closes it. A linked event found by the walk aborts the conversion before
+any rewrap, and the same request reverts phase 1 in the owner's session,
+so that no request that runs to its end leaves a partly converted
+calendar behind (re-review finding 1):
+
+1. it rewrites the owner ring marked `reverting`, so that writes into the
+   calendar seal under the EWK again while the ring still holds the CK
+   (5.5);
+2. it rewraps back to the EWK every event that a concurrent write sealed
+   under the CK since phase 1 (the owner's session holds both keys; a
+   concurrent write that read the ring before step 1 loses its calendar
+   assertion and seals again under the EWK);
+3. it rewrites the owner's entry in its unshared form, the ring gone,
+
+each step asserting the calendar archive as read, and then answers the
+precheck's 409, `calendar has linked events` (author's call on the
+`reverting` step: without it, an event sealed under the CK between phase 1
+and the revert would be left unreadable once the ring went). A request that
+dies between phase 1 and the end of the revert leaves the shared form with
+`converted` unset and no grant, a state the owner reads in full (every
+event is `0x01` or `0x03` under its own ring) and the write rule of 5.5
+keeps safe; the next grant resumes there: it finishes a revert that was
+under way, or walks again and either reverts or continues. The owner
+removes the link (deletes the other calendar's copy of the event, which
+unlinks without resealing, 5.5) and grants again.
 
 **Cost.** For a sealed event, a DEK rewrap, not a content reseal (a
 plaintext event costs one seal, as its next write would have): per event,
@@ -612,7 +645,8 @@ of the calendar skip phases 1 and 2, since `converted` is set.
 and dropped the connection) leaves the calendar in the shared form with no
 grantee and some events still `0x01` or plaintext. That state is complete
 for the owner, who holds both the EWK and the CK, and invisible to anyone
-else. The next
+else, and 5.5's write rule keeps a linked event in it from being sealed
+under the CK. The next
 grant of the calendar finishes phase 2 before its own write; nothing else
 needs it, because a grantee exists only after phase 3.
 
@@ -844,15 +878,17 @@ key-account update restriction refuses credential changes only,
 move from one grantee to another, and a revoke that resolved the displayed
 address through the directory would remove the wrong grant. With `grant`,
 the endpoint revokes exactly that `acls` entry, its grant ring and its
-ledger record. An `address` is a convenience: it is matched against the
-ledger's recorded addresses first (exact, after key pinning section 4.3's
-normalization), then resolved through the directory, and when the two
-name different grants, or the directory resolves it to an account whose
-grant records another address, the request is refused with the 409 below
-so that the page revokes by id. A grant to an account that is gone or no
-longer a key account is revoked by its id or its recorded address. The
-endpoint removes the grant and rotates (7.1, 7.2), sweeping gone grantees
-in the same write.
+ledger record. An `address` is a convenience (re-review finding 5): the
+endpoint matches it against the ledger's recorded addresses (exact, after
+key pinning section 4.3's normalization) and resolves it through the
+directory. When only one of the two names a grant, or both name the same
+one, that grant is revoked: an alternate alias of a grantee whose account
+holds exactly one grant on the calendar revokes it whatever address the
+ledger recorded, and a recorded address of a gone account revokes its
+grant. When the ledger's exact match and the resolved account name
+different grants (the reassigned-alias case), the request is refused with
+the 409 below so that the page revokes by id. The endpoint removes the
+grant and rotates (7.1, 7.2), sweeping gone grantees in the same write.
 
 Success (200): `{"ok": true, "changed": <bool>}`; `changed` is false when
 the calendar holds no such grant (a no-op, still 200, as `contacts/forget`
@@ -865,7 +901,7 @@ answers for an address without a pin).
 | 401, 402, 429 | As in the shared table | |
 | 403 | The account may not share calendars (`DavCalAcl`) | problem body |
 | 409 | No calendar with that slug in the account | `{"error": "unknown calendar"}` |
-| 409 | The ledger and the directory name different grants for `address` | `{"error": "address is ambiguous, revoke by grant"}` |
+| 409 | The ledger's exact match for `address` and the account it resolves to name different grants (an alias reassigned from one grantee to another) | `{"error": "address is ambiguous, revoke by grant"}` |
 | 409 | The caller's account was deleted from the registry while the request ran (4.5) | `{"error": "account deleted"}` |
 | 409 | The write lost its eighth attempt (4.5) | `{"error": "conflict"}` |
 | 409 | Other shared 409s | as in the shared table |
@@ -1113,6 +1149,28 @@ needs, it yields:
   refused calendar and its events are skipped instead, so the listing
   shows only what the token's own grant covers and the request succeeds.
 
+**Foreign calendar eligibility** (re-review finding 2). The gate of 5.1
+sees only a request that addresses the owner's URI. A grantee's
+`PROPFIND /dav/cal/<own>/` passes the owner arm, and the
+assisted-discovery block then loads the owner's resources through
+`data.resources` with no gate and appends their paths under `is_member`
+(`crates/dav/src/common/propfind.rs:1500`, `:1705`), and a `propname`
+request emits those paths before the loader's view (`:370`, `:424`);
+`shared_containers` (`crates/common/src/sharing/resources.rs:13`) accepts
+a grant through group membership. So one check decides whether a calendar
+of another key account may appear in anything a session emits: the
+calendar is eligible only when the token carries no `Impersonate`, and the
+calendar's `acls` holds the token's own account id with `Read`; group
+membership and `is_member` never count. It runs before the assisted block
+appends a foreign path, before a `propname` response lists one, in the
+resolver's grantee arm (so a token carrying `Impersonate` opens no foreign
+calendar there either), and inside the vanished filter below. An
+ineligible calendar is omitted from an otherwise valid listing of the
+grantee's own home, never an error, and the direct-URI gate of 5.1 stays as
+the second line. Calendars of plain accounts keep upstream's listing
+(release 1 invariant 9; a key account may read them, release 1 section
+9) (author's call on that scope).
+
 The resolver checks the grant's bits itself, against the `acls` entry for
 the token's own account id, and never honours `is_member` (author's call).
 Upstream's handlers skip their container checks for `is_member`, which is
@@ -1155,12 +1213,36 @@ the owner's deleted or renamed calendars, `/dav/cal/<owner>/<slug>/<file>`:
 client-chosen names release 1 lists as visible to the operator, not to
 another user. A fork branch in `get` right after the vanished fetch, for a
 non-member token on a key account, keeps only the vanished paths under the
-current path of a calendar the grant covers, the prefix set taken from
-`shared_containers` before its intersection with the change log (the
-intersected `display_containers` would drop a granted calendar that lost
-an event but saw no container change). A granted calendar that was itself
-deleted or renamed has no current path, so its own 404 is dropped, and the
-client rediscovers from the home listing (5.3).
+current path of an eligible calendar (above), the prefix set built from
+the calendars that pass the eligibility check rather than from
+`shared_containers` (which accepts a grant through a group) and before
+any intersection with the change log (the intersected
+`display_containers` would drop a granted calendar that lost an event but
+saw no container change). It also respects the requested collection: a
+`REPORT` on one calendar returns only that calendar's tombstones, and one
+on the home only the eligible calendars'. A granted calendar that was
+itself deleted or renamed has no current path, so its own 404 is dropped,
+and the client rediscovers from the home listing (5.3).
+
+**The grantee's sync token is bound to its grant** (re-review finding 3).
+Vanished paths carry no calendar identity (`Store::vanished`), a slug can
+be reused once its calendar is gone (`crates/dav/src/calendar/mkcol.rs:63`
+refuses a slug only while its path exists), and a sync position is a bare
+change id (`DavQuery::changes`, `crates/dav/src/common/mod.rs:253`;
+`Urn::parse`, `crates/dav/src/common/uri.rs:197`). A grantee syncing from a
+token older than its grant could therefore receive the tombstones of a
+deleted private calendar that once had the granted calendar's slug. So each
+grant records the change id of the owner's calendar log at which it was
+written: the last change id read before the grant's commit, kept in the
+grant ring's visible header, where the grantee's session reads it, and in
+the ledger (author's call on both: the ledger is sealed under the owner's
+EWK, which a grantee's session never opens, and the commit's own change id
+is assigned by the store at commit, so the id read just before stands for
+it). A grantee's `sync-collection` whose token is at or below that id is
+refused with 403 and the `DAV:valid-sync-token` precondition (RFC 6578
+section 3.2), so the client runs a full sync; a later token is served with
+the vanished filter above. A re-key or a level change keeps the recorded
+id; a revoke and a new grant start a new one.
 
 ### 5.3 Method by method
 
@@ -1173,7 +1255,7 @@ unchanged apart from the key domain, 5.5):
 | `PROPFIND` of a granted calendar or of its events | served, unsealed with the CK | same |
 | `GET`, `HEAD` of an event | served | served |
 | `REPORT` `calendar-query`, `calendar-multiget` | served; candidates unsealed before the content filters, as release 1 section 8.2 runs them | same |
-| `REPORT` `sync-collection` | served; vanished entries limited to paths under the current path of a granted calendar, so a granted calendar that was deleted or renamed gets no 404 of its own and the client rediscovers it from the home listing (5.2) | same |
+| `REPORT` `sync-collection` | served from a token newer than the grant (an older one is refused with 403 `valid-sync-token`, so the client runs a full sync); vanished entries limited to the requested collection and to paths under the current path of an eligible calendar, so a granted calendar that was deleted or renamed gets no 404 of its own and the client rediscovers it from the home listing (5.2) | same |
 | `REPORT` `free-busy-query` on a granted calendar | no busy periods (below) | same |
 | `PUT` creating an event | 403 (`AddItems`) | stored sealed under the CK, under the owner's UID lease (6.4); schedules as upstream, messages in the owner's name delegated with `SENT-BY` (6.2) |
 | `PUT` over an event | 403 (`ModifyItems`) | stored sealed under the newest generation; schedules as upstream, delegated with `SENT-BY` |
@@ -1226,19 +1308,38 @@ deployment with Apple clients keeps `enableAssistedDiscovery` on, as it is
 by default (an operator who turned it off turns it back on); the
 real-device check (11.5) verifies an Apple device syncing a shared
 calendar through the fork's gate. Thunderbird and other multi-home clients
-work either way. Discovery needs no code change beyond the resolver.
+work either way. Discovery needs the foreign calendar eligibility check of
+5.2 (re-review finding 2): the assisted block and a `propname` response
+list a foreign calendar only when it is eligible, and omit it otherwise.
 
 ### 5.5 Writes: the key domain and the calendar assertion
 
 Every write of a key account's event, by the owner or by a grantee, reads
 the archive of the calendar the event belongs to (both calendars for a
 MOVE), seals under that calendar's key domain (the newest generation of a
-shared calendar's CK, otherwise the owner's EWK) and asserts that calendar
-archive as read in the event's batch (author's call). This covers `PUT`,
-`PROPPATCH` of an event, `COPY` and `MOVE`, the drain's import and merge
-(release 2 section 6.4), `contacts/pin`'s reseal (key pinning section
-6.4), and an event `DELETE`, which seals nothing but asserts the calendar
-too (below).
+shared calendar's CK, otherwise the owner's EWK; the EWK again while a
+conversion is `reverting`, 3.5) and asserts that calendar archive as read
+in the event's batch (author's call). This covers `PUT`, `PROPPATCH` of an
+event, `COPY` and `MOVE`, the drain's import and merge (release 2 section
+6.4), `contacts/pin`'s reseal (key pinning section 6.4), and an event
+`DELETE`, which seals nothing but asserts the calendar too (below).
+
+**The write rule for linked events** (re-review finding 1). Any write that
+would seal or rewrap an event whose names include a shared calendar and at
+least one other calendar is refused with 409, traced as `zero-access:
+event linked into a shared calendar` (the single-parent refusal; CalDAV
+defines no precondition element for it, so the body is upstream's plain
+conflict): a `PUT` or `PROPPATCH` of the event through any of its paths,
+the drain's merge into it (the recipient's default calendar being shared
+and the event linked; the item stays pending as an item error, release 2
+section 6.5, until the link is gone), a reseal by `contacts/pin` (the entry
+counts `failed`), and the conversion's rewrap. It is the single-parent
+invariant enforced at write time, so it also covers the window 3.5's
+abort and revert leave. Recovery is unlink-only: a `DELETE` through the
+other calendar's path removes that name without resealing
+(`DestroyArchive::delete_za`, `crates/groupware/src/calendar/
+storage.rs:491`), after which the event has one parent and is written as
+any other.
 
 - **What it closes.** A write that read the calendar before a first
   grant's conversion committed would otherwise store a `0x01` event in a
@@ -1332,7 +1433,9 @@ real-device check (11.5) records what Apple Calendar sends when an event is
 dragged between calendars.
 
 - An event `COPY` whose source or destination calendar is shared answers
-  403, with the trace `zero-access: copy into or out of a shared calendar`.
+  403, with the trace `zero-access: copy into or out of a shared calendar`,
+  and so does a `COPY` of an event with a shared parent through any of its
+  paths, an unshared calendar's included (re-review finding 1).
 - A collection `COPY` or `MOVE` whose source or destination is a shared
   calendar answers 403 with the same trace, except a `MOVE` to a new name
   in the owner's home, which upstream implements as a rename that keeps the
@@ -1471,16 +1574,23 @@ fan-out in the grantee's session, on the owner's behalf:
      would drop the writer's own pair from the owner's event, and the
      writer's later reply from its own copy would be refused as from a
      non-participant.
-   - **The writer's own attendance.** The writer's own ATTENDEE lines are
-     recipients like any other attendee's: the messages are delivered to
-     the writer's own addresses as to a non-local attendee, as an item in
-     the writer's own inbox sealed to its own public key, which its drain
-     merges into its own copy (a merge builds no message, so nothing
-     loops). The item carries the new SEQUENCE and the writer's token, so
-     the writer's own copy stays current and its later reply is neither
-     stale nor unauthenticated. `resolve_inner`'s rule that a fan-out never
-     writes into the sender's own inbox (`fanout.rs`) is carved out for the
-     delegated case.
+   - **The writer's own attendance: a self-delivery built directly**
+     (re-review finding 4). When the writer attends the event and a
+     delegated write changes the writer's own ATTENDEE line or the event's
+     SEQUENCE, the fan-out always builds one REQUEST item for the writer's
+     own inbox from the committed tree: the full state, with the writer's
+     token and the new SEQUENCE, sealed to the writer's own public key,
+     which its drain merges into its own copy (a merge builds no message,
+     so nothing loops). It is built independently of upstream's builders,
+     which drop a declined attendee (`send_update_messages`,
+     `crates/groupware/src/scheduling/mod.rs:221`) and return
+     `NothingToSend` when no recipient remains (`organizer.rs:58`, `:133`),
+     so the PUT calls the fan-out for it even when upstream built nothing
+     (`update.rs:304`, `:354` call it only when messages exist). The
+     writer's own copy therefore stays current, a decline included, and its
+     later reply is neither stale nor unauthenticated. `resolve_inner`'s
+     rule that a fan-out never writes into the sender's own inbox
+     (`fanout.rs`) is carved out for this item.
    - **The `SENT-BY` decision**, which splits the merged list into the
      owner's addresses and the writer's (point 1).
 
@@ -1563,17 +1673,22 @@ fan-out in the grantee's session, on the owner's behalf:
   the invitation the REPLY is built for the owner's line or the writer's,
   nondeterministically (a REPLY for the writer's own line is not attempted,
   or upstream answers 412 `CannotModifyAddress`).
-- **`SENT-BY` in stored copies** (review finding 8). A recipient's stored
-  copy carries the `SENT-BY` set by the import that created it (an import
-  keeps the tree) and by any CANCEL merged into it since, never by a
-  REQUEST update: the CANCEL merge removes ORGANIZER and copies it from the
-  incoming message (`crates/groupware/src/scheduling/inbound.rs:198-229`,
-  and a master cancellation does the same for the instances it covers,
-  `:269-301`), while a REQUEST merge leaves ORGANIZER as stored. So a copy
-  the owner created gains the grantee's `SENT-BY` from a delegated
-  cancellation, and a copy a delegated REQUEST created loses it at the
-  owner's cancellation. A copy keeps its `SENT-BY` after a revoke, and the
-  recipient's REPLY echoes it (`itip_export_component`).
+- **`SENT-BY` in stored copies, per component** (review finding 8,
+  re-review finding 6). Each component of a recipient's stored copy takes
+  its ORGANIZER line, `SENT-BY` included, from the message that last set
+  it: an import takes every component's from the incoming REQUEST (an
+  import keeps the tree), and so does a component a later REQUEST adds to
+  the copy (the merge's `AddComponent` copies every property of the new
+  component, `crates/groupware/src/scheduling/inbound.rs:138`); a
+  component the copy already holds keeps its ORGANIZER through REQUEST
+  updates; and a CANCEL replaces it (the CANCEL merge removes ORGANIZER and
+  copies it from the incoming message, `inbound.rs:198-229`, and a master
+  cancellation does the same for the instances it covers, `:269-301`). So
+  a copy the owner created gains the grantee's `SENT-BY` on an override the
+  grantee adds and on what a delegated cancellation covers, and a copy a
+  delegated REQUEST created loses it at the owner's cancellation. A copy
+  keeps its `SENT-BY` after a revoke, and the recipient's REPLY echoes it
+  (`itip_export_component`).
 
 The drain and a pin redelivery are never a grantee's write: each runs in
 an account's own session and writes only into that account. The drain
@@ -1609,12 +1724,15 @@ A grantee that changes its own participation in the owner's copy instead
 of its own gets upstream's behaviour: under the merged addresses the
 owner's event is organized locally, so the change is an organizer-side
 update, sent to the other attendees as the owner with `SENT-BY` the
-grantee (6.2), and no REPLY is built. Because the writer's own attendee
-lines are recipients of a delegated fan-out (6.2, point 2), the update
-also reaches the grantee's own inbox, and its drain merges it into the
-grantee's own copy, with the new status, SEQUENCE and token: the server
-keeps both copies consistent either way, and the grantee's later reply
-from its own copy is neither stale nor refused. The page (4.8) and the
+grantee (6.2), and no REPLY is built. Because a delegated write that
+changes the writer's own line builds the writer a self-delivery from the
+committed tree (6.2, point 2), the new state also reaches the grantee's
+own inbox, and its drain merges it into the grantee's own copy, with the
+new status, SEQUENCE and token: the server keeps both copies consistent
+either way, and the grantee's later reply from its own copy is neither
+stale nor refused. That holds when the grantee is the event's only
+attendee and declines without `SCHEDULE-FORCE-SEND`, where upstream's
+builders send nothing at all (re-review finding 4). The page (4.8) and the
 real-device check (11.5) still say that an attendee answers from its own
 copy, the path every client expects.
 
@@ -1864,7 +1982,8 @@ calendar cannot be deleted (upstream).
 | In-account `COPY` and `MOVE` touching a shared calendar | n/a | event `MOVE` rewraps; event `COPY` 403; collection `COPY` and `MOVE` 403 except a rename (5.6) |
 | Cross-account `COPY` and `MOVE` | 403 | 403 (unchanged) |
 | Impersonation, master user, group membership, `is_member` | 403 | 403: a grant to the token's own account and its own grant ring are required, and a token carrying `Impersonate` is refused at the gate (5.1, 5.2) |
-| A grantee's `LOCK`, `UNLOCK`, and `sync-collection` vanished entries | 403 at the URI gate | `LOCK` and `UNLOCK` upstream's 403; vanished entries limited to the granted calendars' paths (5.2, 5.3) |
+| A grantee's `LOCK`, `UNLOCK`, and `sync-collection` vanished entries | 403 at the URI gate | `LOCK` and `UNLOCK` upstream's 403; a sync token older than the grant refused with `valid-sync-token`; vanished entries limited to the requested collection and the eligible calendars' paths (5.2, 5.3) |
+| Foreign calendars in a grantee's own-home listing (assisted discovery, `propname`) | the key owner's calendars unreachable | listed only when eligible: the token's own account in the calendar's `acls` with `Read`, no `Impersonate` (5.2) |
 | Invitations from the owner in a shared calendar | n/a | release 2's, sealed under the CK; a grantee who is an attendee also gets its own copy (6.3) |
 | A grantee's invitations, updates, cancellations and replies in the name of an account whose shared calendar it holds an edit grant on | n/a | as upstream, with `SENT-BY` the grantee, under the grantee's keys and pins, authorized by the write-time ACL (6.2) |
 | A delegated item at the recipient's drain | n/a | accepted when its `SENT-BY` resolves to its `changed_by`, a key account other than the named one; refused otherwise, with a reason of its own (6.2, 10) |
@@ -1969,7 +2088,13 @@ accounts:
    `MKCALENDAR`, `LOCK`, deleting the calendar and `ACL`. While bob syncs
    the granted calendar incrementally, alice deletes an event from an
    ungranted calendar (bob's sync shows no 404 for it) and one from the
-   granted calendar (its 404 is present) (5.2).
+   granted calendar (its 404 is present); a `REPORT` on the granted
+   calendar returns only its own tombstones (5.2). Slug reuse (re-review
+   finding 3): alice deletes an event from her private calendar at
+   `/family/`, deletes that calendar, creates a new one at the same slug
+   and grants it to bob; bob's sync from a token taken before the deletion
+   answers 403 `valid-sync-token`, and his full sync shows nothing of the
+   old calendar.
 2. Grant, edit: bob creates, changes and deletes events and sets his own
    name, which alice's view does not show; his `calendar-color` change
    recolours the calendar in alice's view too (shared dead properties, as
@@ -1988,8 +2113,10 @@ accounts:
    level change takes effect at bob's next request without a rotation; a
    revoke of an address without a grant answers `changed: false`; a grant
    to bob's alias (pinned separately) changes his level and leaves the
-   ledger's address as recorded, and a revoke by the alias removes his
-   grant. The alias transfer (4.4): bob's grant records `family@` (an
+   ledger's address as recorded, and a revoke by that alternate alias, which
+   resolves to bob's account and its one grant, removes his grant
+   (re-review finding 5). The alias transfer (4.4): bob's grant records
+   `family@` (an
    alias of bob's), carol also holds a grant, and the alias moves from bob
    to carol; a revoke by bob's grant id removes bob's grant and leaves
    carol's, and a revoke by the address `family@` answers 409 `address is
@@ -2013,8 +2140,13 @@ accounts:
      bob's;
    - a delegated update: bob moves the event's time; carol's inbox item
      carries `SENT-BY` bob, and her stored copy, imported from the
-     delegated REQUEST, keeps its `SENT-BY` (a stored copy follows only on
-     import, 6.2);
+     delegated REQUEST, keeps its `SENT-BY` (an existing component keeps
+     its ORGANIZER through a REQUEST update, 6.2);
+   - `SENT-BY` per component (re-review finding 6): carol holds a copy of
+     a recurring event of alice's, imported from alice's own REQUEST; bob
+     adds a recurrence override through the shared calendar; carol's
+     merged copy holds the new override with `SENT-BY` bob on its ORGANIZER
+     while the master keeps alice's line without one;
    - a delegated CANCEL: bob deletes the event; carol's drain, after the
      deletion committed, applies the CANCEL;
    - `SENT-BY` across cancellations (6.2): a copy of carol's that alice's
@@ -2054,18 +2186,26 @@ accounts:
     organizer-side write of bob's on an event he attends, bob still holds
     his pair in alice's event, his own copy carries the new SEQUENCE, and
     his next reply from his own copy applies (neither refused as from a
-    non-participant nor stale).
+    non-participant nor stale). The sole-attendee decline (re-review
+    finding 4): in an event alice organizes whose only attendee is bob, bob
+    declines through the shared copy without `SCHEDULE-FORCE-SEND`; upstream
+    builds no message, yet bob's own copy converges to DECLINED after his
+    drain.
 11. The gate: a token with its own keys but no grant, an impersonation
     copy, a Bearer token, and a grant to a group planted in the store by a
     fixture are refused on the shared calendar; the group member's
     `PROPFIND` of alice's home succeeds and lists nothing (the resolver
-    skips the refused calendar, 5.2). A grantee whose token
-    carries the `Impersonate` permission (a role granting it) is refused at
-    the gate on every request to alice's calendars, `PROPFIND propname`,
-    `LOCK`, `UNLOCK`, a collection `MOVE`, a rename and a collection `COPY`
-    included, and alice's calendars are absent from the assisted listing of
-    its own home (5.1). Bob reaches none of alice's unshared calendars (403
-    when addressed, absent from listings).
+    skips the refused calendar, 5.2). A grantee whose token carries the
+    `Impersonate` permission (a role granting it) is refused at the gate on
+    every request to alice's calendars, `PROPFIND propname`, `LOCK`,
+    `UNLOCK`, a collection `MOVE`, a rename and a collection `COPY`
+    included (5.1). Through each grantee's own home (re-review finding 2),
+    with both a `propname` request and ordinary properties and with
+    assisted discovery on: the `Impersonate` token lists nothing of
+    alice's, nor does the group member of the planted group grant, while
+    bob's own listing shows exactly his granted calendar. Bob reaches none
+    of alice's unshared calendars (403 when addressed, absent from
+    listings).
 12. `COPY` and `MOVE`: an event `COPY` into or out of the shared calendar,
     and a collection `COPY` of it, answer 403; a rename keeps the grant;
     alice's event `MOVE` from an unshared calendar into the shared one is
@@ -2133,7 +2273,15 @@ Concurrency, in `sharing_races.rs`:
     other device copies an event of the calendar into another of her
     calendars; the grant resumes and answers 409 `calendar has linked
     events` with no `acls` entry, grant ring or ledger record written and
-    `converted` unset; after alice deletes the other copy, a new grant
+    the calendar back in its unshared form (3.5's revert), an event alice's
+    other device wrote between phase 1 and the revert back under the EWK
+    and readable; an ordinary `PUT` of the linked event then succeeds under
+    the EWK and both links stay readable. In a second run the conversion is
+    cut right after phase 1 (`SHARE_REWRAP_FAIL_ONCE`), leaving the shared
+    form with `converted` unset and the linked event under the EWK: an
+    ordinary `PUT` or `PROPPATCH` of that event through either of its paths
+    answers the write rule's 409 (5.5, re-review finding 1), both links stay
+    readable, and after alice's `DELETE` of the other copy a new grant
     completes.
 
 ### 11.3 Key-mode CalDAV suite
@@ -2204,7 +2352,10 @@ answers an invitation from the shared copy instead of its own, and after
 the grantee's drain and a client refresh both copies, the owner's and the
 grantee's own, show the new status (6.3; review finding 9), with the
 client's immediate presentation before the refresh recorded separately,
-while the checklist still tells an attendee to answer from its own copy;
+and the same for a grantee who is the event's only attendee and declines
+from the shared copy without `SCHEDULE-FORCE-SEND` (its own copy ends
+DECLINED, re-review finding 4), while the checklist still tells an
+attendee to answer from its own copy;
 an alarm the grantee adds to the owner's scheduled event is
 stored; dragging an event between the shared calendar and the grantee's
 own calendars, and between the owner's shared and unshared calendars,
@@ -2233,13 +2384,17 @@ from alice's event so that his later reply is refused (10); the writer's
 own inbox excluded from a delegated fan-out, which leaves bob's own copy
 at the old SEQUENCE so that his later reply is stale (10); no
 single-parent rule (12); a `MOVE` into a shared calendar that keeps the
-event's other names (12); phase 2 without the parentage check (24); the
+event's other names (12); the
 share batch without the registry Account assertion (14, the race); the
 endpoint's invalidation through `refresh_acls` alone, which misses the
 same-level re-key (17); an event `DELETE` without the calendar assertion
 (22); revoke resolving an address through the directory before the ledger
 (5); the gate admitting a token with `Impersonate` (11); `sync-collection`
-without the vanished-path filter (1); a new grantee given only the newest
+without the vanished-path filter (1); phase 2 rewrapping before its
+parentage walk (24); the write rule dropped (24, second run); assisted
+discovery without the eligibility check (11); the token bound check
+removed (1, slug reuse); self-delivery only when the builders produced
+messages (10, sole-attendee decline); a new grantee given only the newest
 generation (7); a grantee's dead property written into the owner's
 personal bundle (2, with the unit test of 11.1); a plaintext event skipped
 by the conversion (3).
@@ -2290,7 +2445,10 @@ adds:
     its DEK wrapped under a generation that calendar lists; an event of an
     unshared calendar is wrapped under the owner's EWK. Every write of a
     key account's event seals under the newest generation of its
-    calendar's key domain and asserts the calendar archive it read.
+    calendar's key domain and asserts the calendar archive it read, and no
+    write seals or rewraps an event whose names include a shared calendar
+    and another calendar; a conversion that finds such an event rewraps
+    nothing and is undone in the same request.
 37. A revoke rotates in the same write: no write committed after a revoke
     is sealed under a generation the removed grantee held. Ciphertext
     already stored is never resealed by a revoke, and no generation is
@@ -2361,7 +2519,9 @@ stands unless the code says otherwise.
    `ck-shared-dek` and `ck-shared-bundle`; `ZaOwnerRing` and `ZaGrant`;
    the rewrap batch size (100); the attempt count (8, key pinning's); the
    trace strings; the 409 reasons revision 5 adds (`account deleted`,
-   `address is ambiguous, revoke by grant`); the test hooks, among them
+   `address is ambiguous, revoke by grant`); the `reverting` flag, the
+   grant change id's width and place in the grant ring's header, and the
+   write rule's trace string (revision 6); the test hooks, among them
    `SHARE_PRECHECK_PAUSE`.
 2. **The calendar assertion on event writes** (5.5): the assertion class
    (the archive's version, as upstream's `update` asserts it, or a hash of
@@ -2412,16 +2572,17 @@ stands unless the code says otherwise.
    passed beside `sender` for three things: the token union and the
    persisted pairs computed against the owner's own addresses; the split of
    the merged list into the owner's addresses and the writer's, for the
-   `SENT-BY` decision; and the writer's own attendee lines as recipients,
-   with `resolve_inner`'s exclusion of the sender's own inbox carved out
-   for the delegated case. Planning settles how the writer's lines become
-   recipients where upstream's merged-list builder addresses none of them
-   (when the writer is the only other attendee, for instance): by extending
-   the recipient lists of the messages built, or by running the builder
-   once more for those lines with the owner's addresses as the local ones.
-   The parameter's name and the call sites (`update.rs`, `delete.rs`, the
-   calendar `DELETE` per event) are planning's; the owner's and a plain
-   writer's calls pass their own account.
+   `SENT-BY` decision; and the writer's self-delivery, with
+   `resolve_inner`'s exclusion of the sender's own inbox carved out for it.
+   How the writer's lines are served is decided (re-review finding 4): the
+   fan-out builds the self-delivery REQUEST directly from the committed
+   tree whenever a delegated write changes the writer's own line or the
+   event's SEQUENCE, whatever upstream's builders produced, `NothingToSend`
+   included (6.2, point 2), so neither extending the built recipient lists
+   nor running the builder again is needed. The parameter's name and the
+   call sites (`update.rs`, `delete.rs`, the calendar `DELETE` per event)
+   are planning's; the owner's and a plain writer's calls pass their own
+   account.
 10. **The drain's delegated branch** (6.2, point 3): the `SENT-BY` parsing
     (a `mailto:` URI, compared after key pinning section 4.3's
     normalization) and its resolution to `changed_by`, the key-account test
@@ -2532,25 +2693,35 @@ Merge hotspots this release adds (fork insertions in upstream files):
 - `crates/dav/src/common/uri.rs` (the gate's grantee branch, its refusal
   of a token carrying `Impersonate`) and `crates/dav/src/common/za.rs`
   (fork-owned: the resolver); `crates/dav/src/common/propfind.rs` (the
-  loader's view, which serves the assisted-discovery block, and the
-  vanished-path filter in `get` after its `vanished` fetch);
+  loader's view, which serves the assisted-discovery block; the foreign
+  calendar eligibility check in that block and in the `propname` branch;
+  the vanished-path filter and the grantee's sync-token bound in `get`
+  after its `vanished` fetch);
   `crates/dav/src/calendar/{update,delete,proppatch,copy_move,get,
   freebusy}.rs` (the resolver at each re-check, the calendar assertion of
-  event writes and of the event `DELETE`, the single-parent rule, the
-  refused linked `MOVE` and the rewrap in `copy_move.rs`, the cache
-  invalidation after a shared calendar's `DELETE` in `delete.rs`). In
-  `update.rs` and `delete.rs` the fan-out calls now pass the event's
-  account beside the writer's `account_info` and keys (6.2).
+  event writes and of the event `DELETE`, the linked-event write rule in
+  `update.rs` and `proppatch.rs`, the single-parent rule, the refused
+  linked `MOVE` and the rewrap in `copy_move.rs`, the cache invalidation
+  after a shared calendar's `DELETE` in `delete.rs`). In `update.rs` and
+  `delete.rs` the fan-out calls now pass the event's account beside the
+  writer's `account_info` and keys (6.2), and `update.rs` calls the
+  fan-out for a writer's self-delivery even when upstream built no
+  message.
 - `crates/groupware/src/calendar/fanout.rs` (fork-owned: the event-account
-  parameter, the owner-address token locality, the writer's own attendee
-  lines as recipients and `resolve_inner`'s carve-out, the `SENT-BY`
-  placement, no withheld entries for a delegated fan-out) and
+  parameter, the owner-address token locality, the writer's self-delivery
+  built from the committed tree and `resolve_inner`'s carve-out, the
+  `SENT-BY` placement, no withheld entries for a delegated fan-out) and
   `crates/groupware/src/calendar/drain.rs` (fork-owned: the delegated
   branch of the step-2 sender check and its reason string). The delegate
   path depends on `scheduling_account_info`'s merged addresses (the
   writer's first, then the owner's), on the drain's step-2 rule that an
   item's ORGANIZER or acting ATTENDEE resolves to `changed_by`, on
-  `changed_by` being the writer in every item the fan-out writes, and on
+  `changed_by` being the writer in every item the fan-out writes, on
+  upstream's organizer builders dropping declined attendees and returning
+  `NothingToSend` (`send_update_messages`, `organizer.rs`), which the
+  self-delivery works around, on the REQUEST merge's `AddComponent` and the
+  CANCEL merge's ORGANIZER copy (`inbound.rs`), which 6.2's per-component
+  `SENT-BY` statement describes, and on
   upstream's write-time ACL checks in `update.rs` and `delete.rs`, which
   are the authority for a delegated message.
 - `crates/groupware/src/calendar/seal/{event,collection,tree}.rs` (fork)
@@ -2580,10 +2751,16 @@ merge touches it:
 - `is_member`'s `Impersonate` arm and every handler that trusts it ahead
   of a container check (`PROPFIND propname`, `LOCK` and `UNLOCK` in
   `crates/dav/src/common/lock.rs`, collection `COPY`, `MOVE` and
-  `rename_container`): the gate's `Impersonate` refusal covers them, so a
-  new handler of that shape needs the same reading. `Store::vanished`
-  (`crates/store/src/query/log.rs`) and `shared_containers`, which the
-  vanished-path filter relies on.
+  `rename_container`) on a direct URI, and the assisted-discovery block
+  and the `propname` branch on the grantee's own home: the gate's
+  `Impersonate` refusal and the foreign calendar eligibility check cover
+  them, so a new handler or listing of that shape needs the same reading.
+  `Store::vanished` (`crates/store/src/query/log.rs`), which returns paths
+  without a calendar identity, the slug rule of `mkcol.rs` (a slug refused
+  only while its path exists) and the bare change id of a sync token
+  (`DavQuery::changes`), on which the vanished filter and the grantee's
+  sync-token bound rely; `shared_containers`, which the filter no longer
+  uses for its prefixes.
 - `Calendar::preferences` and `preferences_mut`
   (`crates/groupware/src/calendar/mod.rs`), whose behaviour the grantee's
   entry follows, and the resource cache's per-entry reads of flags and time
