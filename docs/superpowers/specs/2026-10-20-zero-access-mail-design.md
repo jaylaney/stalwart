@@ -7,21 +7,10 @@ Revision 4 answers its third: the compensating blob delete is withdrawn
 in favour of upstream's staging behaviour, stated as a limit (2, 6.1,
 12; F1b.1 and F1b.2), provisioning rechecks emptiness after the fence is
 up (6.1, F1c), and the refresh explanation is narrowed (4, C1).
-Revision 5 (2026-10-22) records the plan 13 outcome, following the
-decisions and rulings in `../plans/2026-10-20-zero-access-plan13-outcome.md`:
-the release numbers, since calendar sharing became release 4 (1.1, 1.2,
-2, 4, 5.4, 6.1, 9, 14, 15); no conversion of an account that held data
-(1.3, 6.1, 6.6); the limits of section 2 (what an account held while it
-was plain, other search stores, sessions opened before provisioning,
-forged messages); the login, OAuth and download refusals (4); the stub,
-index-document and raw-consumer rules (5.2, 5.5, 5.7); the fenced
-writers, the recheck's repairs and the index-write fence (6.1); the
-keyless session write (6.2); the copy refusal's method error, sharing
-and the ownership rule (6.3); the provisioning checks in their order
-(6.6); restore (6.7); FETCH's lazy keys (7); the search refusals as
-built (8); the table (9); the refusal kinds and the trace rules as built
-(10); the invariants (12); the open items' outcome (13); and two
-alternatives (14). Scope: release 3 of the zero-access fork
+Revision 5 (2026-10-22) records the plan 13 outcome as built, following
+its outcome note (`../plans/2026-10-20-zero-access-plan13-outcome.md`),
+and the release renumbering of the same day that made calendar sharing
+release 4. Scope: release 3 of the zero-access fork
 (jaylaney/stalwart), item 3 of release 1 spec section 1.2; GitHub
 issue #19, milestone "Release 3: mail encryption" (issues #19, #20 and
 #21). Revision 2 incorporates the six findings and the clarification of
@@ -151,12 +140,11 @@ administrator, and demands for stored data.
 - **What an account held while it was still plain.** Mail reaches an
   account before its provisioning only in the window between its creation
   and its `setup-token`, and the provisioning refusals (6.6) keep an
-  account that holds mail, calendar data, unfinished index tasks, spam
-  training samples or keys in the internal search index from becoming a
-  key account. What they cannot see stays as upstream leaves it: the
-  plaintext blobs of messages
-  deleted before provisioning, unlinked, until the next blob purge; a JMAP
-  upload or `Blob/copy` made while the account was plain, under its
+  account that holds mail, calendar data, unfinished tasks, spam training
+  samples or keys in the internal search index from becoming a key account.
+  What they cannot see stays as upstream leaves it: the plaintext blobs of
+  messages deleted before provisioning, unlinked, until the next blob purge;
+  a JMAP upload or `Blob/copy` made while the account was plain, under its
   temporary link for the upload TTL (one hour by default); and a
   server-wide training sample that SMTP autolearn took from mail
   delivered to the account while it was plain, which keeps the queued
@@ -662,43 +650,45 @@ deleted (issue #10's operator path) and created again (6.6).
 
 **The index write** (plan 13, R58, R62, R63). The index task builds an
 ordinary message's or event's search document from the plaintext and
-writes it later, in commit chunks of at most 1,000 operations, the first
-holding the document's `Document` key, the one key that lists all the
-others. Two interleavings would leave that content in an account that is
-then provisioned: an execution that outlived its one-hour task lease on a
-cluster, while another node's execution cleared its task record, writing
-after setup; and an unindex that lands between two chunks of one
-document, deleting the `Document` key and what it lists, before the later
-chunks write keys that nothing lists. So the internal search store writes
-every Email or Calendar document built for an account classified as
-ordinary under two assertions. Its first chunk asserts that the account
-holds no vault record (R58): a document whose first chunk loses it is not
-written, the batch's other documents are, and the task is retried; a
-first chunk that commits first is seen by the recheck's scans (6.6).
-Every later chunk asserts that the document's own `Document` key is still
-stored (R62): an unindex deletes that key and every key it lists in one
-write, so a later chunk that commits after the unindex writes nothing,
-and the document stops there without an error. FoundationDB reports a
-read error at an assertion as a mismatch, so a failed guard is confirmed
-by a read of the `Document` key outside the transaction (R63): absent,
-the document stops and its remaining clears (a calendar merge's removal
-of the previous version's keys, which no other document lists) are
-written without the guard, its new keys dropped; stored, or the read
+writes it later, in commit chunks split above 1,000 operations or 5 MB,
+the first holding the document's `Document` key, the one key that lists
+all the others. Two interleavings would leave that content in an account
+that is then provisioned: an execution that outlived its one-hour task
+lease on a cluster, while another node's execution cleared its task
+record, writing after setup; and an unindex that lands between two chunks
+of one document, deleting the `Document` key and what it lists, before
+the later chunks write keys that nothing lists. So the internal search
+store writes every Email or Calendar document built for an account
+classified as ordinary under two assertions. Its first chunk asserts that
+the account holds no vault record (R58): a document whose first chunk
+loses it is not written, the batch's other documents are, and the task is
+retried; a first chunk that commits first is seen by the recheck's scans
+(6.6). Every later chunk asserts that the document's own `Document` key
+is still stored (R62): an unindex deletes that key and every key it lists
+in one write, so a later chunk that commits after the unindex writes
+nothing, and the document stops there without an error. FoundationDB
+reports a read error at an assertion as a mismatch, so a failed guard is
+confirmed by a read of the `Document` key outside the transaction (R63):
+absent, the document stops and its remaining clears (a calendar merge's
+removal of the previous version's keys, which no other document lists)
+are written without the guard, its new keys dropped; stored, or the read
 failing, the error is returned and the batch is retried. Nothing is
 attached on PostgreSQL or MySQL, or without an internal search store. A
 key account's visible-field document (5.5) and contact cards, which are
 not sealed, are written unfenced.
 
 For an ordinary account the fence costs one assertion per document, and
-the guard one read per later chunk of a document of two or more chunks.
-A pending record left without its marker beside plain mail (the crash
-above) holds that account's index tasks in retry until `setup-token` is
-issued again and repairs it; the mail is unsearchable meanwhile and
-nothing is exposed. On a FoundationDB cluster the guard can leave an
-ordinary document's index incomplete, never an orphan: a confirmation
-read served from an older read version can stop a first index, and a
-clear can race another execution's re-created document and remove a key
-it lists (plan 13, R63).
+the guard one read per later chunk of a document of two or more chunks
+(on FoundationDB that read is of the document's archive, quadratic in
+its term count; a cheaper sentinel key is deferred, R62). A pending
+record left without its marker beside plain mail (the crash above)
+holds that account's index tasks in retry until `setup-token` is issued
+again and repairs it; the mail is unsearchable meanwhile and nothing is
+exposed. On a FoundationDB cluster the guard can leave an ordinary
+document's index incomplete, never an orphan: a confirmation read
+served from an older read version can stop a first index, and a clear
+can race another execution's re-created document and remove a key it
+lists (plan 13, R63).
 
 **What the assertion relies on, per store.** The fence is only as good as
 the backend's handling of an assertion on an absent key. RocksDB evaluates
@@ -720,9 +710,9 @@ store is PostgreSQL or MySQL, so a deployment learns it at provisioning
 rather than from a leak. The follow-up that lifts the restriction
 (decided with Jay, 2026-10-20) is a **per-account database lock on the
 SQL backends**: a batch flag meaning "serialize on this account", set by
-the two parties
-to the race (the ingest and copy batches that carry the absence assertion,
-and the vault writes of `setup-token` and `setup`), which the PostgreSQL
+the two parties to the race (the batches that carry the absence
+assertion, the fenced writers above, and the vault writes of
+`setup-token` and `setup`), which the PostgreSQL backend honours with a
 backend honours with a transaction-scoped advisory lock
 (`pg_advisory_xact_lock` keyed by a hash of the account id) and the MySQL
 backend with a named lock (`GET_LOCK`, released after commit or
@@ -919,42 +909,43 @@ order:
    document (plan 13, R46).
 3. `account has unfinished tasks`: an `IndexDocument`, `UnindexDocument`,
    `MergeThreads` or `CalendarItipMessage` task of the account in the
-   task queue, pending, retrying, in flight or failed (plan 13, R54). A
-   task's record stays in the queue from the batch that schedules it
-   until its worker records the outcome, so this term sees an index write
-   in flight, which lands after any scan of stored output, and a retained
-   thread-merge task, whose hashed strings hold an input of up to 15
-   bytes (a short subject or Message-ID) verbatim. It precedes the scans
-   of terms 5 to 7 on purpose: a worker that writes its document and
-   clears its task between two scans would otherwise pass both. Setup
-   never deletes a task: a pending one is waited for, and only a failed
-   one may be destroyed, since destroying the record of a pending or
-   in-flight task does not stop its worker.
+   task queue, pending, retrying, in flight or failed. A task's record
+   stays in the queue from the batch that schedules it until its worker
+   records the outcome, so this term sees an index write in flight, which
+   lands after any scan of stored output, and a retained thread-merge
+   task, whose hashed strings hold an input of up to 15 bytes (a short
+   subject or Message-ID) verbatim. It precedes the scans of terms 5 to 7
+   on purpose: a worker that writes its document and clears its task
+   between two scans would otherwise pass both. Setup never deletes a
+   task: a pending one is waited for, and only a failed one may be
+   destroyed, since destroying the record of a pending or in-flight task
+   does not stop its worker (plan 13, R54).
 4. `account already holds spam training samples`: a training sample
-   indexed under the account (plan 13, R52). One written while the
-   account was plain keeps its message's plaintext blob linked and its
-   sender and subject in the registry until it expires; setup refuses
-   rather than deleting it.
+   indexed under the account. One written while the account was plain
+   keeps its message's plaintext blob linked and its sender and
+   subject in the registry until it expires; setup refuses rather than
+   deleting it (plan 13, R52).
 5. `account already holds mail`: an Email search document of the account
    in the internal search store, found by its `Document` key, of which
-   each indexed document has exactly one (plan 13, R51). The unindex task
-   deletes the search document in a write of its own after the one that
-   clears the metadata archive, and that write can fail or be skipped.
+   each indexed document has exactly one. The unindex task deletes the
+   search document in a write of its own after the one that clears the
+   metadata archive, and that write can fail or be skipped (plan 13,
+   R51).
 6. `account already holds calendar data`: a Calendar search document of
    the account, in the same position after term 3, so that term 3's
    ordering argument holds for an event's index write too (plan 13, R60).
 7. `account already holds mail`, then `account already holds calendar
    data`: any `Term` or `Index` key of the account in the Email index,
-   then in the Calendar index, of the internal search store (plan 13,
-   R62). A document's keys can outlive its `Document` key where the
-   guard of 6.1 does not reach: an unindex that straddles a rewrite's
-   first chunk, a multi-chunk calendar merge that fails after its first
-   chunk, an Email re-index whose output changed since the first index,
-   and, on a cluster, two executions of one document whose listings
-   differ, or archive reads up to 4 s stale on FoundationDB. Each is
-   upstream behaviour that leaves keys no `Document` key lists, and this
-   term refuses the account. The Contacts index is neither fenced nor
-   scanned: contact cards are not sealed.
+   then in the Calendar index, of the internal search store. A
+   document's keys can outlive its `Document` key where the guard of 6.1
+   does not reach: an unindex that straddles a rewrite's first chunk, a
+   multi-chunk calendar merge that fails after its first chunk, an Email
+   re-index whose output changed since the first index, and, on a
+   cluster, two executions of one document whose listings differ, or
+   archive reads up to 4 s stale on FoundationDB. Each is upstream
+   behaviour that leaves keys no `Document` key lists, and this term
+   refuses the account. The Contacts index is neither fenced nor
+   scanned: contact cards are not sealed (plan 13, R62).
 
 Terms 5 to 7 read the internal search store only (section 2, "Other
 search stores"). The fence and the recheck of 6.1 close the window
@@ -1098,7 +1089,7 @@ an open question of the plan 13 outcome.
 | Raw consumers of a sealed source (`Blob/upload` data sources, `FileNode/set`, `FileNode/copy`, `Blob/copy`, `x:SpamTrainingSample/set`; `SieveScript/set` for a message or a section) | refused for any key-account upload, message or section blob id (5.7) |
 | Ordinary writers racing provisioning (ingest, copy, iMIP, a cross-account copy's training batch, the index write) | the batch asserts no vault record; temporary failure and retry; `setup-token` rechecks emptiness after the record write; a staged blob follows upstream's purge (6.1) |
 | Key accounts on PostgreSQL or MySQL | `setup-token` refuses issuance, 409 with a fixed reason (6.1) |
-| Milter, hook, spam-filter and trusted-script events for a transaction delivering to or submitted by a key account; IMAP and POP3 command events in a key-account session | contents redacted (section 10) |
+| Milter, spam-filter and trusted-script events for a transaction delivering to or submitted by a key account; IMAP and POP3 command events in a key-account session | contents redacted (section 10) |
 | Push with email properties | state-only payload |
 | iMIP ingest | gated as in release 1 (release 5) |
 | Restore of a key account's message | refused, a permanent failure (6.7) |
@@ -1175,7 +1166,8 @@ an open question of the plan 13 outcome.
   refused with `503 5.5.1 Recipients must precede message data.` (RFC
   3030 orders RCPT before BDAT). Envelope commands are otherwise traced
   as upstream traces them, and so is SMTP raw output, whose replies are
-  fixed or operator-configured.
+  fixed or operator-configured, with the one exception below (a trusted
+  script's reject text).
 - The ingest event (`MessageIngest`) carries `[redacted]` as `MessageId`
   for a key account; the blob hash, size, ids and timings stay. A key
   account's own Sieve script traces a runtime error at delivery with the
@@ -1226,8 +1218,9 @@ an open question of the plan 13 outcome.
   `Details` carries keyword names, visible by structure but redacted with
   `Fetch`'s (plan 13, D4), record `[redacted]` there; mailbox names in
   `MailboxName` keys are routing structure and stay, and the `Search`,
-  `Sort` and `Append` events carry ids, counts and times only. The parser
-  errors that quote client input, which issue #20 sanitised before
+  `Sort` and `Append` events carry ids, counts and times only (`Append`
+  its mailbox name too, routing structure as above). The parser errors
+  that quote client input, which issue #20 sanitised before
   authentication for every account, are sanitised after authentication
   too in a key-account session.
 
@@ -1381,9 +1374,14 @@ Added:
     keyless paths read.
 26. A mail session of a key account exists only with keys; every read of
     a key account's message holds the account's own keys or is refused.
-27. No threading index, no full-text term, no spam sample and no push
-    payload with content is ever written or sent for a key account; its
-    search document holds arrival time and size only.
+    A session opened while the account was still plain is the
+    transitional exception of section 2: it holds no keys, every content
+    read it makes is refused, and it ends when the client reconnects.
+27. No threading index, no full-text term on the internal search store,
+    no spam sample and no push payload with content is ever written or
+    sent for a key account; its search document holds arrival time and
+    size only. Section 2 states what another search store can hold; the
+    fence and the scans of 6.1 and 6.6 do not reach it.
 28. Plaintext of a key account's mail exists outside process memory only
     in the SMTP queue, inbound until delivery completes and outbound until
     relay, and in the staged blob of an ordinary ingest that failed after
@@ -1421,23 +1419,11 @@ Added:
     have served them, and redacts an SMTP transaction's DATA traces (plan
     13, R12).
 
-## 13. Open items for planning
+## 13. Open items, as resolved by plan 13
 
 Each item is for planning to look up in code; the recommendation stands
-unless the code says otherwise.
-
-Plan 13 resolved each item (its outcome note, "Spec 13, the open
-items"), and the sections above state the outcome: one view helper at
-every reader (1); restore re-parses and is refused (2, section 6.7); the
-search document built in the index task (3); the IMAP refusal reaches
-the client as `NO [NOPERM]` once it is not a security error, which is
-never written (4, section 10); one read site and two flags for the SMTP
-redaction (5, section 10); push confirmed (6); the `duplicate` test
-stores a hash, never the Message-ID, so nothing is visible (7); the
-`Threading` clear of a stub harmless and kept (8); one upload writer,
-its raw readers refused (9, section 5.7); the key-mode harness fits
-(10); the fence's plumbing confirmed (11); and every site of the event
-inventory recording `[redacted]` (12, section 10).
+unless the code says otherwise. Plan 13 resolved each one (its outcome note,
+"Spec 13, the open items"), and the outcome stands under the item.
 
 1. **The stub's readers.** List every site that reads a `MessageMetadata`
    archive of a message (`root_part` and the direct `contents[0]` indexes
@@ -1447,38 +1433,53 @@ inventory recording `[redacted]` (12, section 10).
    plan. Recommendation: one `za_metadata_view` helper in the email crate
    returning `Cow<Archive<MessageMetadata>>`, as `za_event_view` does for
    events, called at every site.
+   Outcome: one view helper at every reader.
 2. **Restore.** Confirm whether `restore_item` re-parses exported bytes
    (6.7). Recommendation: refuse for key accounts in this release and note
    verbatim restore as a packaging-release item (issue #25).
+   Outcome: restore re-parses, and is refused for key accounts (section
+   6.7).
 3. **The search document.** Build it in the index task (reading
    `MessageData` for the size, one extra get) or write it synchronously at
    ingest and skip the task for key accounts. Recommendation: the task,
    with the extra read, to keep ingest's batch upstream's.
+   Outcome: the search document is built in the index task.
 4. **Where the stub-side refusal lives in IMAP.** Confirm that a
    `ImapEvent::Error` with `ResponseCode::NoPerm` reaches the client from
    `Session::authenticate` (security events close the connection
    silently). Recommendation: `NoPerm` with the fixed text; `[CANNOT]` for
    search refusals.
+   Outcome: the refusal reaches the client as `NO [NOPERM]` once it is not a
+   security error, which is never written (section 10).
 5. **SMTP DATA redaction.** The session knows its recipients at DATA time;
    confirm the point where the raw-input trace decision is made relative to
    RCPT resolution (issue #20's masking lives in the same session code).
+   Outcome: one read site and two flags carry the SMTP redaction (section
+   10).
 6. **Push payloads.** Confirm the gate point in
    `crates/services/src/state_manager/http.rs` that calls
    `build_email_push_object`, and that a state-only payload is what the
    subscription receives when properties were requested.
+   Outcome: confirmed.
 7. **The `duplicate` Sieve test.** It records Message-IDs in the lookup
    store (`KV_SIEVE_ID`); confirm whether the key is hashed. If not, it is a
    visible-by-structure item for scripts that use it, to be listed in
    section 2 rather than gated.
+   Outcome: the test stores a hash, never the Message-ID, so nothing is
+   visible.
 8. **`Threading` clear on unindex** for a stub (5.5): confirm a clear of a
    never-written key is harmless on every backend, or skip it.
+   Outcome: the clear of a stub's `Threading` key is harmless, and kept.
 9. **Upload sealing coverage.** Confirm that `put_jmap_blob` is the single
    write path for `Reserved` blobs of an account (including
    `blob_upload_many`) and that no keyless reader of a `Reserved` blob
    exists besides the purge.
+   Outcome: there is one upload writer, and its raw readers are refused
+   (section 5.7).
 10. **Key-mode harness for IMAP and JMAP.** Confirm how `imap_tests` and
     `jmap_tests` provision accounts and whether `create_key_user_account`
     fits their fixtures; the plan sizes the variants from that.
+    Outcome: the key-mode harness fits.
 11. **The fence's plumbing.** Confirm that a failed `AssertValue::None`
     surfaces from `email_ingest` to `deliver_message` as a temporary
     failure rather than a permanent one, how `setup-token` learns the data
@@ -1487,10 +1488,12 @@ inventory recording `[redacted]` (12, section 10).
     recheck's abort (`za_vault_commit` or a sibling that deletes).
     Recommendation: a store-kind accessor on `Storage`, and the delete as
     one more conditional vault write through the common helper.
+    Outcome: the fence's plumbing is confirmed.
 12. **The structured-event inventory.** Enumerate the `trc::event!` sites
     of section 10's rule and the keys each carries; decide per site
     between `[redacted]` and dropping the key. Recommendation:
     `[redacted]`, so dashboards keep their event counts.
+    Outcome: every site of the inventory records `[redacted]` (section 10).
 
 ## 14. Alternatives considered
 
