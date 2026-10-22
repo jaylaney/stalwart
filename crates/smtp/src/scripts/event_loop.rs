@@ -69,8 +69,9 @@ impl RunScript for Server {
         let mut input = Input::script("__script", script);
         let mut messages: Vec<Vec<u8>> = Vec::new();
         let session_id = params.session_id;
-        // Mail ruling R57: a key account's transaction; the diagnostics the
-        // runtime evaluates from the message are redacted.
+        // Mail rulings R57 and R59: a key account's transaction; every value
+        // the runtime evaluated (from the message, possibly) is redacted in
+        // these events and in the plugin traces they reach.
         let za_redact = params.za_redact;
 
         let mut reject_reason = None;
@@ -91,7 +92,11 @@ impl RunScript for Server {
                                 Sieve(SieveEvent::ScriptNotFound),
                                 Id = script_id.clone(),
                                 SpanId = session_id,
-                                Details = name.as_str().to_string(),
+                                Details = if za_redact {
+                                    trc::Value::redacted()
+                                } else {
+                                    name.as_str().to_string().into()
+                                },
                             );
                             break;
                         }
@@ -122,7 +127,11 @@ impl RunScript for Server {
                                     Sieve(SieveEvent::ListNotFound),
                                     Id = script_id.clone(),
                                     SpanId = session_id,
-                                    Details = list,
+                                    Details = if za_redact {
+                                        trc::Value::redacted()
+                                    } else {
+                                        list.into()
+                                    },
                                 );
                             }
                         }
@@ -139,6 +148,7 @@ impl RunScript for Server {
                                     modifications: &mut modifications,
                                     access_token: params.access_token,
                                     arguments,
+                                    za_redact,
                                 },
                             )
                             .await;
@@ -182,7 +192,11 @@ impl RunScript for Server {
                                     Sieve(SieveEvent::NotSupported),
                                     Id = script_id.clone(),
                                     SpanId = session_id,
-                                    Details = list,
+                                    Details = if za_redact {
+                                        trc::Value::redacted()
+                                    } else {
+                                        list.into()
+                                    },
                                     Reason = "Sending to lists is not supported.",
                                 );
                             }
@@ -319,12 +333,18 @@ impl RunScript for Server {
                                     SpanId = session_id,
                                     Id = script_id.clone(),
                                     From = message.message.return_path,
-                                    To = message
-                                        .message
-                                        .recipients
-                                        .into_iter()
-                                        .map(|r| trc::Value::from(r.address().to_string()))
-                                        .collect::<Vec<_>>(),
+                                    To = if za_redact {
+                                        trc::Value::redacted()
+                                    } else {
+                                        trc::Value::from(
+                                            message
+                                                .message
+                                                .recipients
+                                                .into_iter()
+                                                .map(|r| trc::Value::from(r.address().to_string()))
+                                                .collect::<Vec<_>>(),
+                                        )
+                                    },
                                 );
                             }
                         }

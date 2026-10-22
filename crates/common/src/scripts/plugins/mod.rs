@@ -29,6 +29,9 @@ pub struct PluginContext<'x> {
     pub message: &'x Message<'x>,
     pub modifications: &'x mut Vec<ScriptModification>,
     pub arguments: Vec<Variable>,
+    /// Mail ruling R59: a key account's message or transaction; the plugin
+    /// traces carry no value the script evaluated.
+    pub za_redact: bool,
 }
 
 const PLUGINS_REGISTER: [RegisterPluginFnc; 13] = [
@@ -79,6 +82,7 @@ impl Core {
         }
 
         let session_id = ctx.session_id;
+        let za_redact = ctx.za_redact;
         let result = match id {
             0 => query::exec(ctx).await,
             1 => exec::exec(ctx).await,
@@ -99,6 +103,14 @@ impl Core {
         match result {
             Ok(result) => result.into(),
             Err(err) => {
+                // Mail ruling R59: a plugin's error can carry its arguments
+                // (a store name, a command, a URL) or a value a backend
+                // quotes, so under `za_redact` only its type is traced.
+                let err = if za_redact {
+                    trc::Error::new(err.event_type())
+                } else {
+                    err
+                };
                 trc::error!(err.span_id(session_id).details("Sieve runtime error"));
                 Input::FncResult(Variable::default())
             }

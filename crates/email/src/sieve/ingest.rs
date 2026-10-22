@@ -483,6 +483,7 @@ impl SieveScriptIngest for Server {
                                     modifications: &mut Vec::new(),
                                     access_token: access_token.into(),
                                     arguments,
+                                    za_redact: account_info.is_key_account(),
                                 },
                             )
                             .await;

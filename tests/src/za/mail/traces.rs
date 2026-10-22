@@ -99,6 +99,7 @@ pub async fn test(test: &mut TestServer) {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     delivery_leaves_no_content_in_events(test).await;
+    trusted_script_include_name_is_redacted(test).await;
     smtp_submission_by_a_key_account_is_redacted(test, &key, &plain).await;
     pipelined_rcpt_and_bdat_are_redacted(test, &key).await;
     key_rcpt_after_a_chunk_is_refused(test, &key, &plain).await;
@@ -124,9 +125,10 @@ pub async fn test(test: &mut TestServer) {
 /// spam, with the classifier learning from traps; the spam filter on for
 /// every transaction; a header rule whose result is the canary header's
 /// value (its `Eval(Result)` trace is the redaction's case); a trusted
-/// DATA-stage script whose `error` quotes the subject (its
-/// `Sieve(RuntimeError)` trace is ruling R57's case; the error ends the
-/// script with an implicit keep, so delivery proceeds).
+/// DATA-stage script that evaluates the subject into a list name, a plugin's
+/// arguments, an include name and an `error` (rulings R57 and R59; the
+/// error, or the missing include, ends the script with an implicit keep, so
+/// delivery proceeds).
 struct Settings {
     milter: Id,
     trap_tag: Id,
@@ -136,8 +138,18 @@ struct Settings {
 }
 
 /// The trusted DATA-stage script. `ihave` is the one capability the trusted
-/// compiler still checks, and `error` is part of it.
-const ERROR_SCRIPT: &str = "require [\"ihave\", \"variables\"];\nerror \"${header.subject}\";\n";
+/// compiler still checks, and `error` is part of it. Each test names the
+/// subject: a list (`ListNotFound`), a domain (`is_local_domain`'s cache
+/// events), a lookup store (the plugin error funnel's `Id`) and, when
+/// `X-Za-Include: 1` is present, a script to include (`ScriptNotFound`). No
+/// list, domain, store or script of that name exists, so no `keep` runs.
+const ERROR_SCRIPT: &str = r#"require ["ihave", "include", "variables", "extlists", "vnd.stalwart.expressions"];
+if string :list "probe" "${header.subject}" { keep; }
+if eval "is_local_domain(header.subject + '.net')" { keep; }
+if eval "key_exists(header.subject, 'probe')" { keep; }
+if header :is "x-za-include" "1" { include "${header.subject}"; }
+error "${header.subject}";
+"#;
 
 async fn configure(admin: &Account) -> Settings {
     let milter = admin
@@ -260,6 +272,11 @@ async fn unconfigure(admin: &Account, settings: Settings) {
 /// suffix (`.net`): the spam filter skips an address whose domain has no
 /// registrable part, as under `.example`.
 fn canary_message() -> String {
+    canary_message_with("")
+}
+
+/// `canary_message` with `extra` (whole header lines) after its headers.
+fn canary_message_with(extra: &str) -> String {
     let unique = store::rand::random::<u64>();
     format!(
         "From: Sender <sender@example.org>\r\n\
@@ -268,6 +285,7 @@ fn canary_message() -> String {
          Message-ID: <{unique:016x}.msgid-canary@example.com>\r\n\
          Date: Tue, 20 Oct 2026 10:00:00 +0000\r\n\
          X-Hdr-Name-Canary: hdr-value-canary\r\n\
+         {extra}\
          \r\n\
          body-canary\r\n\
          Write to addr@{unique:016x}.domain-canary.net or see \
@@ -351,8 +369,10 @@ fn assert_any_contains(values: &[String], needle: &str, what: &str) {
 /// stays readable; the ingest event names no Message-ID; the spam filter's
 /// lookups of the domains the body names emit no cache event carrying them
 /// (ruling R56); the trusted DATA-stage script's runtime error, which quotes
-/// the subject, records the marker (ruling R57). The same delivery to the
-/// ordinary account is the control.
+/// the subject, records the marker (ruling R57), and so do the list name it
+/// evaluated from the subject, its plugin call's error and that call's
+/// domain lookup (ruling R59). The same delivery to the ordinary account is
+/// the control.
 async fn delivery_leaves_no_content_in_events(test: &TestServer) {
     println!("delivery_leaves_no_content_in_events");
     for to in [KEY, PLAIN] {
@@ -370,10 +390,20 @@ async fn delivery_leaves_no_content_in_events(test: &TestServer) {
             Key::MessageId,
         );
         let reads = values(&events, EventType::Smtp(SmtpEvent::RawInput), Key::Contents);
-        let script_errors = values(
+        // The interpreter's runtime error carries a `Reason`; the plugin
+        // error funnel's event, of the same type, does not (ruling R59).
+        let (script_errors, plugin_errors): (Vec<_>, Vec<_>) = events
+            .iter()
+            .filter(|event| event.typ == EventType::Sieve(SieveEvent::RuntimeError))
+            .partition(|event| value(event, Key::Reason).is_some());
+        let script_errors = script_errors
+            .into_iter()
+            .map(|event| value(event, Key::Reason).unwrap_or_default())
+            .collect::<Vec<_>>();
+        let list_names = values(
             &events,
-            EventType::Sieve(SieveEvent::RuntimeError),
-            Key::Reason,
+            EventType::Sieve(SieveEvent::ListNotFound),
+            Key::Details,
         );
         assert_eq!(message_ids.len(), 1, "{to}: one ingest event");
         assert_any_contains(&reads, "RCPT TO", to);
@@ -382,6 +412,11 @@ async fn delivery_leaves_no_content_in_events(test: &TestServer) {
             assert_all_redacted(
                 &script_errors,
                 "the trusted script's runtime error of a key delivery",
+            );
+            assert_all_redacted(&list_names, "the list name of a key delivery");
+            assert!(
+                !plugin_errors.is_empty(),
+                "the plugin error of a key delivery was not traced"
             );
             assert_all_redacted(&writes, "the milter writes of a key delivery");
             assert_eq!(message_ids[0], MARKER, "the key ingest's Message-ID");
@@ -404,6 +439,15 @@ async fn delivery_leaves_no_content_in_events(test: &TestServer) {
                 "subject-canary",
                 "control: the trusted script's runtime error",
             );
+            assert_any_contains(&list_names, "subject-canary", "control: the list name");
+            assert_any_contains(
+                &plugin_errors
+                    .iter()
+                    .map(|event| value(event, Key::Id).unwrap_or_default())
+                    .collect::<Vec<_>>(),
+                "subject-canary",
+                "control: the plugin error's store name",
+            );
             // Ruling R56's control: the spam filter looked up the domains
             // the body names, and the ordinary lookup traces them (the URL's
             // registrable domain may already be in the negative cache).
@@ -420,6 +464,49 @@ async fn delivery_leaves_no_content_in_events(test: &TestServer) {
                 &lookups,
                 "url-canary",
                 "control: the domain lookup of the body's URL",
+            );
+            // Ruling R59's control: the script's `is_local_domain` lookup
+            // (the key delivery's quiet lookup may have filled the negative
+            // cache, so a hit or a miss).
+            assert_any_contains(
+                &lookups,
+                "subject-canary.net",
+                "control: the script's domain lookup",
+            );
+        }
+    }
+}
+
+/// Ruling R59: the trusted script's `include` of a name it evaluated from
+/// the subject (taken when `X-Za-Include: 1` is present) names no script;
+/// a key delivery's `Sieve(ScriptNotFound)` records the marker, the
+/// ordinary control the name. The missing include ends the script with an
+/// implicit keep, so both deliveries proceed.
+async fn trusted_script_include_name_is_redacted(test: &TestServer) {
+    println!("trusted_script_include_name_is_redacted");
+    for to in [KEY, PLAIN] {
+        let traced = Traced::start(traced_types());
+        deliver(
+            test,
+            SENDER,
+            to,
+            &canary_message_with("X-Za-Include: 1\r\n"),
+        )
+        .await;
+        let events = traced.finish().await;
+        let include_names = values(
+            &events,
+            EventType::Sieve(SieveEvent::ScriptNotFound),
+            Key::Details,
+        );
+        if to == KEY {
+            assert_no_canary(&events, "a key delivery whose script includes the subject");
+            assert_all_redacted(&include_names, "the include name of a key delivery");
+        } else {
+            assert_any_contains(
+                &include_names,
+                "subject-canary",
+                "control: the include name",
             );
         }
     }

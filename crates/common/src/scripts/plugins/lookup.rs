@@ -102,10 +102,14 @@ pub async fn exec_local_domain(ctx: PluginContext<'_>) -> trc::Result<Variable> 
     let domain = ctx.arguments[0].to_string();
 
     if !domain.is_empty() {
-        ctx.server
-            .domain(domain.as_ref())
-            .await
-            .map(|result| Variable::from(result.is_some()))
+        // Mail ruling R59: the quiet lookup of R56, whose cache events do
+        // not carry the name.
+        if ctx.za_redact {
+            ctx.server.za_domain(domain.as_ref()).await
+        } else {
+            ctx.server.domain(domain.as_ref()).await
+        }
+        .map(|result| Variable::from(result.is_some()))
     } else {
         Ok(Variable::default())
     }
