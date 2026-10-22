@@ -13,7 +13,7 @@ use crate::{
     write::{
         AlignedBytes, Archive, Batch, BatchBuilder, Operation, SEARCH_INDEX_MAX_FIELD_LEN,
         SearchIndex, SearchIndexClass, SearchIndexField, SearchIndexId, SearchIndexType,
-        ValueClass, assert::AssertValue, key::DeserializeBigEndian,
+        ValueClass, ValueOp, assert::AssertValue, key::DeserializeBigEndian,
     },
 };
 use ahash::AHashMap;
@@ -104,7 +104,23 @@ impl Store {
             }
 
             let mut commit_points = batch.commit_points();
+            // R63: set once a later chunk's failed guard is confirmed; the
+            // document's remaining chunks then write their clears only.
+            let mut stopped = false;
             for (chunk, commit_point) in commit_points.iter().enumerate() {
+                if stopped {
+                    let built = batch.build_one(commit_point);
+                    if let Some(mut clears) = take_clears(built.ops) {
+                        self.write(Batch {
+                            changes: built.changes,
+                            ops: &mut clears,
+                        })
+                        .await
+                        .caused_by(trc::location!())?;
+                    }
+                    continue;
+                }
+
                 // Mail ruling R62's test: chunk 0 is written, the rest is not.
                 #[cfg(feature = "test_mode")]
                 if chunk == 1
@@ -113,17 +129,17 @@ impl Store {
                     crate::za_test::index_chunk_pause_point(account_id).await;
                 }
 
-                // R62: a later chunk is written only while chunk 0's
-                // `Document` key is stored; a concurrent unindex deleted it
-                // and every key it lists, so the rest of this document is
-                // not written. The assertion goes first; a `SearchIndex`
-                // class serializes its own ids, so the context ops after it
-                // do not matter to it.
-                let mut guarded: Vec<Operation>;
-                let batch = match &document_guard {
+                match &document_guard {
+                    // R62: a later chunk is written only while chunk 0's
+                    // `Document` key is stored; a concurrent unindex deleted
+                    // it and every key it lists, so the rest of this
+                    // document is not written. The assertion goes first; a
+                    // `SearchIndex` class serializes its own ids, so the
+                    // context ops after it do not matter to it.
                     Some(document_key) if chunk > 0 => {
                         let built = batch.build_one(commit_point);
-                        guarded = Vec::with_capacity(built.ops.len() + 1);
+                        let changes = built.changes;
+                        let mut guarded = Vec::with_capacity(built.ops.len() + 1);
                         guarded.push(Operation::AssertValue {
                             class: document_key.clone(),
                             assert_value: AssertValue::Some,
@@ -131,29 +147,83 @@ impl Store {
                         guarded.extend(built.ops.iter_mut().map(|op| {
                             std::mem::replace(op, Operation::DocumentId { document_id: 0 })
                         }));
-                        Batch {
-                            changes: built.changes,
-                            ops: &mut guarded,
+                        // Mail ruling R63's test: the guard fails unwritten,
+                        // as FoundationDB reports a read error at the
+                        // assertion.
+                        #[cfg(feature = "test_mode")]
+                        let result = if let SearchIndexId::Account { account_id, .. } =
+                            term_index_builder.id
+                            && crate::za_test::take_index_guard_fail(account_id)
+                        {
+                            Err(trc::StoreEvent::AssertValueFailed.into_err())
+                        } else {
+                            self.write(Batch {
+                                changes,
+                                ops: &mut guarded,
+                            })
+                            .await
+                        };
+                        #[cfg(not(feature = "test_mode"))]
+                        let result = self
+                            .write(Batch {
+                                changes,
+                                ops: &mut guarded,
+                            })
+                            .await;
+                        match result {
+                            Ok(_) => {}
+                            // R63: FoundationDB reports a read error at the
+                            // assertion as a mismatch, so the failure is
+                            // confirmed by a read outside the transaction.
+                            // Absent: the document stops without an error
+                            // (the unindex is the later intent and already
+                            // removed what chunk 0 wrote), its remaining
+                            // clears are written, its sets dropped, and the
+                            // batch's other documents still are written.
+                            // Stored, or the read failing: the error is
+                            // returned and the caller defers the batch.
+                            Err(err) if err.is_assertion_failure() => {
+                                match self.key_exists(ValueKey::from(document_key.clone())).await {
+                                    Ok(false) => {
+                                        stopped = true;
+                                        if let Some(mut clears) = take_clears(&mut guarded[1..]) {
+                                            self.write(Batch {
+                                                changes,
+                                                ops: &mut clears,
+                                            })
+                                            .await
+                                            .caused_by(trc::location!())?;
+                                        }
+                                    }
+                                    Ok(true) => {
+                                        return Err(err.caused_by(trc::location!()).details(
+                                            "Search document's later chunk lost its guard \
+                                             while its Document key is stored",
+                                        ));
+                                    }
+                                    Err(read_err) => {
+                                        return Err(read_err.caused_by(trc::location!()).details(
+                                            "Failed to confirm a search document's lost guard",
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(err) => return Err(err.caused_by(trc::location!())),
                         }
                     }
-                    _ => batch.build_one(commit_point),
-                };
-                match self.write(batch).await {
-                    Ok(_) => {}
-                    // R58: a fenced document whose first chunk lost its
-                    // assertion is not written at all; the batch's other
-                    // documents still are, and the caller gets the failure.
-                    // R62: one whose later chunk lost its guard stops there
-                    // without an error (the unindex is the later intent and
-                    // already removed what chunk 0 wrote); the batch's other
-                    // documents still are written.
-                    Err(err) if assert_absent.is_some() && err.is_assertion_failure() => {
-                        if chunk == 0 {
+                    _ => match self.write(batch.build_one(commit_point)).await {
+                        Ok(_) => {}
+                        // R58: a fenced document whose first chunk lost its
+                        // assertion is not written at all; the batch's other
+                        // documents still are, and the caller gets the
+                        // failure. A fenced document's later chunks take the
+                        // arm above.
+                        Err(err) if assert_absent.is_some() && err.is_assertion_failure() => {
                             fenced_out = true;
+                            break;
                         }
-                        break;
-                    }
-                    Err(err) => return Err(err.caused_by(trc::location!())),
+                        Err(err) => return Err(err.caused_by(trc::location!())),
+                    },
                 }
             }
         }
@@ -483,4 +553,29 @@ impl Store {
         }
         Ok(false)
     }
+}
+
+/// Zero-access fork (mail ruling R63): the `Clear` operations of a stopped
+/// document's chunk, with the context operations of the chunk, moved out of
+/// `ops`; `None` when the chunk holds no clear. Only `merge_index` emits
+/// clears, and it emits them last.
+fn take_clears(ops: &mut [Operation]) -> Option<Vec<Operation>> {
+    let mut clears = Vec::new();
+    let mut has_clear = false;
+    for op in ops {
+        match op {
+            Operation::AccountId { .. }
+            | Operation::Collection { .. }
+            | Operation::DocumentId { .. } => {}
+            Operation::Value {
+                op: ValueOp::Clear, ..
+            } => has_clear = true,
+            _ => continue,
+        }
+        clears.push(std::mem::replace(
+            op,
+            Operation::DocumentId { document_id: 0 },
+        ));
+    }
+    has_clear.then_some(clears)
 }

@@ -31,6 +31,7 @@ use crate::{
     za::{STRONG, raw_input::SUBMISSION_PORT, user_permissions},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
+use calcard::common::timezone::Tz;
 use common::{
     Server,
     auth::AccessToken,
@@ -49,7 +50,7 @@ use email::{
 };
 use groupware::{
     DestroyArchive,
-    calendar::{CalendarEvent, seal::WRAP_PK},
+    calendar::{CalendarEvent, CalendarEventData, seal::WRAP_PK},
 };
 use mail_parser::MessageParser;
 use nlp::language::Language;
@@ -147,6 +148,18 @@ const CHUNKED_EVENT: &str = "keymail24@example.com";
 const SUPERSEDED_TAIL: &str = "keymail25@example.com";
 /// Its ordinary control, whose multi-chunk index write passes the guard.
 const SUPERSEDED_TAIL_CONTROL: &str = "plainmail18@example.com";
+/// `failed_guard_with_its_document_stored_defers_the_task`'s account, an
+/// ordinary one (ruling R63).
+const GUARD_FAILED: &str = "plainmail19@example.com";
+/// `unindex_between_calendar_merge_chunks_leaves_no_terms`'s account
+/// (ruling R63).
+const MERGE_UNINDEXED: &str = "keymail26@example.com";
+/// `multi_chunk_calendar_merge_is_written_whole`'s account, an ordinary one
+/// (ruling R63).
+const MERGE_CONTROL: &str = "plainmail20@example.com";
+/// The token the merge tests' updated DESCRIPTION ends with: 13 bytes, so
+/// stored verbatim, and new to the event.
+const MERGE_CANARY: &str = "zzmergecanary";
 /// The token `large_body` ends with: 12 bytes, so stored verbatim in its
 /// `Term` key (`CheekyHash`), and longer than the body's five-byte tokens,
 /// so written in a later commit chunk than the first.
@@ -208,6 +221,9 @@ pub async fn test(test: &mut TestServer) {
     let chunked_event = unindex_between_calendar_index_chunks_leaves_no_terms(test, &admin).await;
     let (superseded_tail, superseded_tail_control) =
         superseded_index_tail_loses_to_provisioning(test, &admin).await;
+    let guard_failed = failed_guard_with_its_document_stored_defers_the_task(test, &admin).await;
+    let merge_unindexed = unindex_between_calendar_merge_chunks_leaves_no_terms(test, &admin).await;
+    let merge_control = multi_chunk_calendar_merge_is_written_whole(test, &admin).await;
 
     // The accounts that log in empty their own mailboxes; the others are
     // pending or credentialless, and the account's destruction removes
@@ -248,6 +264,9 @@ pub async fn test(test: &mut TestServer) {
         chunked_event,
         superseded_tail,
         superseded_tail_control,
+        guard_failed,
+        merge_unindexed,
+        merge_control,
     ] {
         admin.destroy_account(account).await;
     }
@@ -2104,10 +2123,16 @@ fn large_body(canary: &str) -> String {
 /// tasks), and a DESCRIPTION of `large_body`'s tokens and the canary,
 /// folded at 70 octets.
 fn chunked_ical() -> String {
-    let description = format!(
-        "DESCRIPTION:{}",
-        large_body(TAIL_CANARY).replace("\r\n", " ")
-    );
+    event_ical(
+        "chunked-event@example.com",
+        &large_body(TAIL_CANARY).replace("\r\n", " "),
+    )
+}
+
+/// An event with `uid` and `description`, folded at 70 octets: no alarm,
+/// no organizer, so its only tasks are its index and unindex tasks.
+fn event_ical(uid: &str, description: &str) -> String {
+    let description = format!("DESCRIPTION:{description}");
     let folded = description
         .as_bytes()
         .chunks(70)
@@ -2119,7 +2144,7 @@ fn chunked_ical() -> String {
          VERSION:2.0\r\n\
          PRODID:-//Stalwart Labs//za fence//EN\r\n\
          BEGIN:VEVENT\r\n\
-         UID:chunked-event@example.com\r\n\
+         UID:{uid}\r\n\
          DTSTAMP:20261020T100000Z\r\n\
          DTSTART:20261021T100000Z\r\n\
          DTEND:20261021T110000Z\r\n\
@@ -2603,4 +2628,277 @@ async fn superseded_index_tail_loses_to_provisioning(
 
     admin.destroy_all_mailboxes_for_account(control_id).await;
     (account, control)
+}
+
+/// Replaces the stored event's iCalendar data as a PUT does
+/// (`CalendarEvent::update`), which schedules its index task: a merge with
+/// the event's stored `Document` key.
+async fn update_event(test: &TestServer, account_id: u32, event_id: u32, ical: &str) {
+    let archive = test
+        .server
+        .store()
+        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            account_id,
+            Collection::CalendarEvent,
+            event_id,
+        ))
+        .await
+        .unwrap()
+        .expect("the event's archive");
+    let current = archive.to_unarchived::<CalendarEvent>().unwrap();
+    let mut event = current.deserialize::<CalendarEvent>().unwrap();
+    let parsed = match calcard::Parser::new(ical).entry() {
+        calcard::Entry::ICalendar(ical) => ical,
+        other => panic!("{other:?}"),
+    };
+    let mut next_alarm = None;
+    event.size = ical.len() as u32;
+    event.data = CalendarEventData::new(parsed, Tz::Floating, 100, &mut next_alarm);
+    let account_info = test.server.account_info(account_id).await.unwrap();
+    let mut batch = BatchBuilder::new();
+    event
+        .update(
+            account_info.account_tenant_ids(),
+            current,
+            account_id,
+            event_id,
+            &mut batch,
+        )
+        .unwrap();
+    test.server.commit_batch(batch).await.unwrap();
+    test.server.notify_task_queue();
+}
+
+/// Deletes the stored event, which schedules its unindex task.
+async fn delete_event(test: &TestServer, account_id: u32, event_id: u32) {
+    let account_info = test.server.account_info(account_id).await.unwrap();
+    let archive = test
+        .server
+        .store()
+        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            account_id,
+            Collection::CalendarEvent,
+            event_id,
+        ))
+        .await
+        .unwrap()
+        .expect("the event's archive");
+    let mut batch = BatchBuilder::new();
+    DestroyArchive(archive.to_unarchived::<CalendarEvent>().unwrap())
+        .delete_all(&account_info, account_id, event_id, false, &mut batch)
+        .unwrap();
+    test.server.commit_batch(batch).await.unwrap();
+    test.server.notify_task_queue();
+}
+
+/// The merge tests' updated DESCRIPTION: a few tokens, none of the large
+/// one's, ending with `MERGE_CANARY`.
+fn short_description() -> String {
+    format!("short merged text {MERGE_CANARY}")
+}
+
+/// Ruling R63 of plan 13 (round 5's re-reviews, opus F1 and fable F1):
+/// FoundationDB evaluates an assertion's read error as a mismatch
+/// (`AssertValueFailed`), so a transient read error at a later chunk's
+/// guard stopped an ordinary document as R62 stops one whose `Document`
+/// key an unindex deleted: its later chunks were never written and its
+/// task cleared. `Store::index` now re-reads the `Document` key after a
+/// later chunk's failed guard and returns the error while the key is
+/// stored, so the worker defers the batch and the retry writes the
+/// document whole. The read error is simulated by `INDEX_GUARD_FAIL_ONCE`
+/// (the suites run no FoundationDB): an ordinary account's multi-chunk
+/// message whose second chunk is not written and fails its guard. The
+/// retry waits out the default deferral (at least 30 s).
+async fn failed_guard_with_its_document_stored_defers_the_task(
+    test: &TestServer,
+    admin: &Account,
+) -> Account {
+    println!("failed_guard_with_its_document_stored_defers_the_task");
+    test.wait_for_tasks().await;
+    let account = passwordless(admin, GUARD_FAILED).await;
+    let id = account.id().document_id();
+    test_hooks::set_index_guard_fail_once(Some(id));
+    SmtpConnection::connect()
+        .await
+        .ingest(
+            SENDER,
+            &[GUARD_FAILED],
+            &message_with("guard failed", &large_body(TAIL_CANARY)),
+        )
+        .await;
+
+    // The message and its index task commit together; the task writes chunk
+    // 0, fails chunk 1's guard and ends deferred, or cleared if the
+    // failure stopped the document.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let deferred = loop {
+        let index_tasks = account_tasks(test, id)
+            .await
+            .into_iter()
+            .filter(|task| matches!(task, Task::IndexDocument(_)))
+            .collect::<Vec<_>>();
+        match index_tasks.as_slice() {
+            [task] if matches!(task.status(), TaskStatus::Retry(_)) => break true,
+            [] if !message_ids(test, id).await.is_empty() => break false,
+            _ => {}
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the index task did not end: {index_tasks:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        deferred,
+        "the failed guard stopped the document and its task was cleared"
+    );
+    assert!(
+        test_hooks::INDEX_GUARD_FAIL_ONCE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_none(),
+        "the guard failure was not taken"
+    );
+    let keys = search_keys(test, id, SearchIndex::Email).await;
+    assert!(
+        keys.documents == 1 && keys.terms > 0 && !keys.holds_term(TAIL_CANARY),
+        "chunk 0 alone was not written: {keys:?}"
+    );
+
+    // The retry, once due, writes the document whole.
+    test.wait_for_tasks().await;
+    let keys = search_keys(test, id, SearchIndex::Email).await;
+    assert!(
+        keys.documents == 1 && keys.terms > 2000 && keys.holds_term(TAIL_CANARY) && keys.fields > 0,
+        "the retry did not write the document whole: {keys:?}"
+    );
+    assert!(
+        account_tasks(test, id).await.is_empty(),
+        "the index task is still queued"
+    );
+
+    admin.destroy_all_mailboxes_for_account(id).await;
+    account
+}
+
+/// Ruling R63 of plan 13 (opus F4, fable F3): a calendar update's index
+/// write merges with the stored document: chunk 0 sets the new `Document`
+/// key and the new-only keys, then come the clears of the old-only keys,
+/// in later chunks when there are many. An unindex between two of those
+/// chunks deletes the new `Document` key and what it lists; R62's guard
+/// then stopped the rest, clears included, so the old version's keys that
+/// the later chunks clear stayed, listed by nothing, and issuance answered
+/// 409 for good. `Store::index` now writes a stopped document's remaining
+/// clears without the guard and drops its sets, so nothing of the account
+/// is left in the Calendar index and the account provisions.
+async fn unindex_between_calendar_merge_chunks_leaves_no_terms(
+    test: &TestServer,
+    admin: &Account,
+) -> Account {
+    println!("unindex_between_calendar_merge_chunks_leaves_no_terms");
+    test.wait_for_tasks().await;
+    let account = passwordless(admin, MERGE_UNINDEXED).await;
+    let id = account.id().document_id();
+    let uid = "merge-unindexed@example.com";
+    let event_id = plant_event(
+        test,
+        id,
+        "default",
+        "merged.ics",
+        &event_ical(uid, &large_body(TAIL_CANARY).replace("\r\n", " ")),
+        None,
+    )
+    .await;
+    test.wait_for_tasks().await;
+    let keys = search_keys(test, id, SearchIndex::Calendar).await;
+    assert!(
+        keys.documents == 1 && keys.terms > 2000 && keys.holds_term(TAIL_CANARY),
+        "the event was not indexed whole: {keys:?}"
+    );
+
+    // The update is committed while the consumer is held; released with the
+    // pause set, its merge writes chunk 0 (the new `Document` key, the
+    // new-only keys, the first clears) and parks before the second.
+    let held = hold_task_consumer(test).await;
+    update_event(test, id, event_id, &event_ical(uid, &short_description())).await;
+    let parked = HookParked::start(id, test_hooks::set_index_chunk_pause, async move {
+        drop(held);
+    })
+    .await;
+    let keys = search_keys(test, id, SearchIndex::Calendar).await;
+    assert!(
+        keys.documents == 1 && keys.holds_term(MERGE_CANARY) && keys.terms > 1000,
+        "chunk 0 of a merge whose clears span later chunks was not written alone: {keys:?}"
+    );
+
+    // The event is deleted: its unindex removes the new `Document` key and
+    // what it lists, and leaves the old-only keys not yet cleared.
+    delete_event(test, id, event_id).await;
+    wait_for_the_unindex(test, id, None).await;
+    let keys = search_keys(test, id, SearchIndex::Calendar).await;
+    assert!(
+        keys.documents == 0 && !keys.holds_term(MERGE_CANARY) && keys.terms > 0,
+        "the unindex left no old-only key for the later chunks to clear: {keys:?}"
+    );
+
+    parked.finish().await;
+    test.wait_for_tasks().await;
+    let keys = search_keys(test, id, SearchIndex::Calendar).await;
+    assert!(
+        keys.is_empty(),
+        "the stopped merge's old-only keys outlived the unindex: {keys:?}"
+    );
+    assert!(
+        account_tasks(test, id).await.is_empty(),
+        "the index task is still queued"
+    );
+    za_setup_token(admin, MERGE_UNINDEXED).await;
+    account
+}
+
+/// Ruling R63 of plan 13 (fable F5): the merge path's positive control. An
+/// ordinary event whose description fills three commit chunks is indexed,
+/// then updated to a short description; its merge (the new `Document` key
+/// and the new-only keys in chunk 0, the old-only keys' clears in later
+/// chunks, each later chunk past the guard) leaves one `Document` key, the
+/// new tokens, and none of the old-only ones.
+async fn multi_chunk_calendar_merge_is_written_whole(
+    test: &TestServer,
+    admin: &Account,
+) -> Account {
+    println!("multi_chunk_calendar_merge_is_written_whole");
+    test.wait_for_tasks().await;
+    let account = passwordless(admin, MERGE_CONTROL).await;
+    let id = account.id().document_id();
+    let uid = "merge-control@example.com";
+    let event_id = plant_event(
+        test,
+        id,
+        "default",
+        "merged.ics",
+        &event_ical(uid, &large_body(TAIL_CANARY).replace("\r\n", " ")),
+        None,
+    )
+    .await;
+    test.wait_for_tasks().await;
+    let keys = search_keys(test, id, SearchIndex::Calendar).await;
+    assert!(
+        keys.documents == 1 && keys.terms > 2000 && keys.holds_term(TAIL_CANARY),
+        "the event was not indexed whole: {keys:?}"
+    );
+
+    update_event(test, id, event_id, &event_ical(uid, &short_description())).await;
+    test.wait_for_tasks().await;
+    let keys = search_keys(test, id, SearchIndex::Calendar).await;
+    assert!(
+        keys.documents == 1
+            && keys.holds_term(MERGE_CANARY)
+            && !keys.holds_term(TAIL_CANARY)
+            && (0..2400).all(|token| !keys.holds_term(&format!("c{token:04}"))),
+        "the multi-chunk merge was not written whole: {keys:?}"
+    );
+
+    delete_event(test, id, event_id).await;
+    test.wait_for_tasks().await;
+    account
 }

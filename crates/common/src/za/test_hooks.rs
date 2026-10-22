@@ -88,12 +88,19 @@
 //!   first commit chunk and before its second, keyed by the document's
 //!   account (`store::search::index`, mail ruling R62); defined in
 //!   `store::za_test` and re-exported here.
+//! - `INDEX_GUARD_FAIL_ONCE`: the account's next later commit chunk of a
+//!   guarded search document is not written and fails with
+//!   `AssertValueFailed`, as FoundationDB reports a read error at the
+//!   guard's assertion (`store::search::index`, mail ruling R63); defined in
+//!   `store::za_test` and re-exported here.
 
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
-pub use store::za_test::{Pause, set_index_chunk_pause};
+pub use store::za_test::{
+    INDEX_GUARD_FAIL_ONCE, Pause, set_index_chunk_pause, set_index_guard_fail_once,
+};
 
 pub static FAN_OUT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 

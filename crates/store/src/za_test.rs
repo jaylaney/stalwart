@@ -14,6 +14,10 @@
 //! - `INDEX_CHUNK_PAUSE`: in `Store::index` after a multi-chunk document's
 //!   first commit chunk and before its second, keyed by the document's
 //!   account (`store::search::index`, mail ruling R62).
+//! - `INDEX_GUARD_FAIL_ONCE`: the account's next later commit chunk (the
+//!   second or after) of a guarded search document is not written and
+//!   fails with `AssertValueFailed`, as FoundationDB reports a read error
+//!   at the guard's assertion (`store::search::index`, mail ruling R63).
 
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
@@ -59,4 +63,26 @@ async fn wait(pause: Option<Arc<Pause>>) {
 
 pub async fn index_chunk_pause_point(account_id: u32) {
     wait(take_for(&INDEX_CHUNK_PAUSE, account_id)).await;
+}
+
+/// The account whose next guarded later chunk fails its guard unwritten.
+pub static INDEX_GUARD_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+
+pub fn set_index_guard_fail_once(account_id: Option<u32>) {
+    *INDEX_GUARD_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+/// Whether `INDEX_GUARD_FAIL_ONCE` names `account_id`; clears it if so.
+pub fn take_index_guard_fail(account_id: u32) -> bool {
+    let mut slot = INDEX_GUARD_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if *slot == Some(account_id) {
+        *slot = None;
+        true
+    } else {
+        false
+    }
 }
