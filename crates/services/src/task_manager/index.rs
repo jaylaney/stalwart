@@ -536,12 +536,16 @@ async fn build_email_document(
                         .details("Blob not found")
                 })?;
 
-            Ok(BuildResult::Document(metadata.index_document(
+            // Mail ruling R58: written only while no vault record exists.
+            Ok(BuildResult::Document(server.za_index_fence(
+                metadata.index_document(
+                    account_id,
+                    document_id,
+                    &raw_message,
+                    index_fields,
+                    server.core.email.default_language,
+                ),
                 account_id,
-                document_id,
-                &raw_message,
-                index_fields,
-                server.core.email.default_language,
             )))
         }
         None => Ok(BuildResult::NotFound),
@@ -581,11 +585,15 @@ async fn build_calendar_document(
             if archived_event_is_sealed(event) {
                 return Ok(BuildResult::NotIndexed);
             }
-            Ok(BuildResult::Document(event.index_document(
+            // Mail ruling R58: written only while no vault record exists.
+            Ok(BuildResult::Document(server.za_index_fence(
+                event.index_document(
+                    account_id,
+                    document_id,
+                    index_fields,
+                    server.core.email.default_language,
+                ),
                 account_id,
-                document_id,
-                index_fields,
-                server.core.email.default_language,
             )))
         }
         None => Ok(BuildResult::NotFound),

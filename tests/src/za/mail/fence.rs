@@ -82,7 +82,10 @@ use types::{
     id::Id,
 };
 use utils::{cheeky_hash::CheekyHash, snowflake::SnowflakeIdGenerator};
-use vault::{ZA_MARKER, record::VaultRecord};
+use vault::{
+    ZA_MARKER,
+    record::{VaultRecord, VaultState},
+};
 
 const FENCE1: &str = "fence1@example.com";
 const FENCE2: &str = "fence2@example.com";
@@ -106,6 +109,10 @@ const ORPHANED: &str = "keymail16@example.com";
 const IN_FLIGHT: &str = "keymail17@example.com";
 /// `setup_refuses_a_failed_merge_task`'s account (ruling R54).
 const FAILED_MERGE: &str = "keymail18@example.com";
+/// `superseded_index_write_loses_to_provisioning`'s account (ruling R58).
+const SUPERSEDED: &str = "keymail20@example.com";
+/// Its ordinary control, whose index write passes the fence.
+const SUPERSEDED_CONTROL: &str = "plainmail17@example.com";
 /// `train_batch_loses_to_provisioning`'s source account (ruling R55).
 const TRAINED: &str = "keymail19@example.com";
 /// `train_batch_loses_to_provisioning`'s destination, an ordinary account.
@@ -155,6 +162,8 @@ pub async fn test(test: &mut TestServer) {
     let orphaned = setup_refuses_an_orphaned_search_document(test, &admin).await;
     let in_flight = setup_refuses_an_in_flight_index_write(test, &admin).await;
     let failed_merge = setup_refuses_a_failed_merge_task(test, &admin).await;
+    let (superseded, superseded_control) =
+        superseded_index_write_loses_to_provisioning(test, &admin).await;
 
     // The accounts that log in empty their own mailboxes; the others are
     // pending or credentialless, and the account's destruction removes
@@ -187,6 +196,8 @@ pub async fn test(test: &mut TestServer) {
         orphaned,
         in_flight,
         failed_merge,
+        superseded,
+        superseded_control,
     ] {
         admin.destroy_account(account).await;
     }
@@ -1666,4 +1677,143 @@ async fn setup_refuses_a_failed_merge_task(test: &TestServer, admin: &Account) -
     );
     za_setup_token(admin, FAILED_MERGE).await;
     account
+}
+
+/// Ruling R58 of plan 13 (PR #51 review 2, P2-6): an index worker (A) that
+/// built an ordinary message's full document and stalled past its task
+/// lease is superseded on a cluster by another node's execution (B), which
+/// finds the message gone and clears the task's record; R54 and R51 then
+/// pass, and the account is provisioned. When A resumes, the internal search
+/// store's write of its document asserts in its first commit chunk that the
+/// account holds no vault record, so nothing of it lands; A's update is
+/// dropped (its task record is gone) and nothing is rescheduled. B is
+/// simulated by clearing the task's `Due` and `Task` records, what its
+/// `Ignored` update clears; the harness has one task manager. An ordinary
+/// account's document passes the same fence (the control), and its task
+/// clearing shows that A's batch ended: the index worker runs one batch at a
+/// time.
+async fn superseded_index_write_loses_to_provisioning(
+    test: &TestServer,
+    admin: &Account,
+) -> (Account, Account) {
+    println!("superseded_index_write_loses_to_provisioning");
+    test.wait_for_tasks().await;
+    let account = passwordless(admin, SUPERSEDED).await;
+    let id = account.id().document_id();
+    let control = passwordless(admin, SUPERSEDED_CONTROL).await;
+    let control_id = control.id().document_id();
+    let message = message_with("superseded", "superseded-body");
+    // A: the delivery commits; its index task classifies the account as
+    // ordinary, builds the full document and parks before the write.
+    let parked = HookParked::start(id, test_hooks::set_index_write_pause, async move {
+        SmtpConnection::connect()
+            .await
+            .ingest(SENDER, &[SUPERSEDED], &message)
+            .await;
+    })
+    .await;
+    let ids = message_ids(test, id).await;
+    assert_eq!(ids.len(), 1, "{ids:?}");
+
+    admin.destroy_all_mailboxes_for_account(id).await;
+    // The unindex task runs and clears its record while A stays parked.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let tasks = account_tasks(test, id).await;
+        if metadata_archive(test, id, ids[0]).await.is_none()
+            && matches!(tasks.as_slice(), [Task::IndexDocument(_)])
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the unindex task did not finish: {tasks:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // B, after A's lease expired: its retries find no message, and its
+    // `Ignored` update clears the task's `Due` and `Task` records.
+    let mut records = Vec::new();
+    test.server
+        .store()
+        .iterate(
+            IterateParams::new(
+                ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task { id: 0 })),
+                ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task { id: u64::MAX })),
+            )
+            .ascending(),
+            |key, value| {
+                if let Task::IndexDocument(task) = Task::deserialize(value)?
+                    && task.account_id.document_id() == id
+                {
+                    let due = Task::IndexDocument(task).due_timestamp();
+                    records.push((key.deserialize_be_u64(U64_LEN)?, due));
+                }
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1, "A's task record: {records:?}");
+    let mut batch = BatchBuilder::new();
+    for (task_id, due) in records {
+        batch
+            .clear(ValueClass::TaskQueue(TaskQueueClass::Due {
+                id: task_id,
+                due,
+            }))
+            .clear(ValueClass::TaskQueue(TaskQueueClass::Task { id: task_id }));
+    }
+    test.server.store().write(batch.build_all()).await.unwrap();
+    assert!(
+        account_tasks(test, id).await.is_empty(),
+        "B's update left the task record"
+    );
+
+    // Every term passes: no message, no metadata archive, no task, no
+    // sample, no search document.
+    let token = za_setup_token(admin, SUPERSEDED).await;
+    za_setup(SUPERSEDED, &token, STRONG).await;
+    assert_eq!(
+        test.server
+            .za_vault_record(id)
+            .await
+            .unwrap()
+            .expect("the vault record")
+            .record
+            .state,
+        VaultState::Active,
+        "setup did not complete"
+    );
+
+    // A resumes and attempts its write; the control's index task runs after
+    // A's batch and its update.
+    parked.finish().await;
+    deliver(
+        test,
+        SENDER,
+        SUPERSEDED_CONTROL,
+        &message_with("superseded control", "superseded-control-body"),
+    )
+    .await;
+    test.wait_for_tasks().await;
+    assert!(
+        test.server
+            .za_has_email_search_documents(control_id)
+            .await
+            .unwrap(),
+        "the control's document was not written"
+    );
+    assert!(
+        !test.server.za_has_email_search_documents(id).await.unwrap(),
+        "the superseded write landed in the key account's index"
+    );
+    assert!(
+        account_tasks(test, id).await.is_empty(),
+        "the superseded execution was rescheduled"
+    );
+
+    admin.destroy_all_mailboxes_for_account(control_id).await;
+    (account, control)
 }

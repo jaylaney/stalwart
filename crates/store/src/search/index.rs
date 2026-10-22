@@ -13,7 +13,7 @@ use crate::{
     write::{
         AlignedBytes, Archive, BatchBuilder, SEARCH_INDEX_MAX_FIELD_LEN, SearchIndex,
         SearchIndexClass, SearchIndexField, SearchIndexId, SearchIndexType, ValueClass,
-        key::DeserializeBigEndian,
+        assert::AssertValue, key::DeserializeBigEndian,
     },
 };
 use ahash::AHashMap;
@@ -23,11 +23,24 @@ use utils::cheeky_hash::CheekyHash;
 impl Store {
     pub(crate) async fn index(&self, documents: Vec<IndexDocument>) -> trc::Result<()> {
         let truncate_at = if self.is_foundationdb() { 1_048_576 } else { 0 };
+        let mut fenced_out = false;
 
-        for document in documents {
+        for mut document in documents {
             let mut batch = BatchBuilder::new();
             let index = document.index;
             let mut old_term_index = None;
+
+            // Zero-access fork (mail ruling R58): the absent-key assertion
+            // opens the batch, so it lands in the first commit chunk, with the
+            // `Document` key that `write_index` and `merge_index` set first.
+            let assert_absent = document.assert_absent.take();
+            if let Some((account_id, collection, document_id, class)) = assert_absent.clone() {
+                batch
+                    .with_account_id(account_id)
+                    .with_collection(collection)
+                    .with_document(document_id)
+                    .assert_value(class, AssertValue::None);
+            }
 
             if matches!(index, SearchIndex::Calendar | SearchIndex::Contacts) {
                 let mut account_id = None;
@@ -82,12 +95,31 @@ impl Store {
             }
 
             let mut commit_points = batch.commit_points();
-            for commit_point in commit_points.iter() {
+            for (chunk, commit_point) in commit_points.iter().enumerate() {
                 let batch = batch.build_one(commit_point);
-                self.write(batch).await.caused_by(trc::location!())?;
+                match self.write(batch).await {
+                    Ok(_) => {}
+                    // R58: a fenced document whose first chunk lost its
+                    // assertion is not written at all; the batch's other
+                    // documents still are, and the caller gets the failure.
+                    Err(err)
+                        if chunk == 0 && assert_absent.is_some() && err.is_assertion_failure() =>
+                    {
+                        fenced_out = true;
+                        break;
+                    }
+                    Err(err) => return Err(err.caused_by(trc::location!())),
+                }
             }
         }
-        Ok(())
+
+        if fenced_out {
+            Err(trc::StoreEvent::AssertValueFailed
+                .into_err()
+                .details("Search document fenced out by its absent-key assertion"))
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) async fn unindex(&self, query: SearchQuery) -> trc::Result<()> {

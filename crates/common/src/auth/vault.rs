@@ -27,6 +27,7 @@ use registry::{
 use std::sync::{Arc, LazyLock};
 use store::{
     Deserialize, IterateParams, Serialize, SerializeInfallible, Store, ValueKey,
+    search::IndexDocument,
     write::{
         AlignedBytes, Archive, Archiver, BatchBuilder, RegistryClass, SearchIndex,
         SearchIndexClass, SearchIndexId, SearchIndexType, TaskQueueClass, ValueClass,
@@ -489,6 +490,31 @@ impl Server {
                 .with_collection(Collection::Principal)
                 .with_document(0)
                 .assert_value(PrincipalField::ZeroAccessVault, AssertValue::None);
+        }
+    }
+
+    /// Mail ruling R58, spec 12's rule 32 for the index worker: a search
+    /// document built from `account_id` read as an ordinary account is
+    /// written by the internal search store only while the account holds no
+    /// vault record, asserted in the document's first commit chunk (the one
+    /// with its `Document` key). A superseded execution (a worker that
+    /// outlived its task lease) therefore cannot write after provisioning,
+    /// and a write that commits first is seen by the recheck's document scan
+    /// (R51). Nothing on PostgreSQL or MySQL, as `za_provisioning_fence`, or
+    /// without an internal search store. On a search store other than the
+    /// data store (a separate FoundationDB store among them) the assertion
+    /// reads the search store's key space and passes vacuously: R51's
+    /// recorded limit.
+    pub fn za_index_fence(&self, document: IndexDocument, account_id: u32) -> IndexDocument {
+        if self.store().is_pg_or_mysql() || self.search_store().internal_fts().is_none() {
+            document
+        } else {
+            document.with_assert_absent(
+                account_id,
+                Collection::Principal,
+                0,
+                PrincipalField::ZeroAccessVault,
+            )
         }
     }
 
