@@ -13,6 +13,8 @@ pub mod query;
 pub mod registry;
 pub mod search;
 pub mod write;
+#[cfg(feature = "test_mode")]
+pub mod za_test;
 
 use ::registry::schema::enums::CompressionAlgo;
 pub use ahash;

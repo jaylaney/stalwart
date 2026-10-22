@@ -11,9 +11,9 @@ use crate::{
         term::{TermIndex, TermIndexBuilder},
     },
     write::{
-        AlignedBytes, Archive, BatchBuilder, SEARCH_INDEX_MAX_FIELD_LEN, SearchIndex,
-        SearchIndexClass, SearchIndexField, SearchIndexId, SearchIndexType, ValueClass,
-        assert::AssertValue, key::DeserializeBigEndian,
+        AlignedBytes, Archive, Batch, BatchBuilder, Operation, SEARCH_INDEX_MAX_FIELD_LEN,
+        SearchIndex, SearchIndexClass, SearchIndexField, SearchIndexId, SearchIndexType,
+        ValueClass, assert::AssertValue, key::DeserializeBigEndian,
     },
 };
 use ahash::AHashMap;
@@ -79,6 +79,15 @@ impl Store {
             }
 
             let term_index_builder = TermIndexBuilder::build(document, truncate_at);
+            // Zero-access fork (mail ruling R62): the `Document` key chunk 0
+            // writes, which every later chunk of a fenced document asserts.
+            let document_guard = assert_absent.is_some().then(|| {
+                ValueClass::SearchIndex(SearchIndexClass {
+                    index,
+                    id: term_index_builder.id,
+                    typ: SearchIndexType::Document,
+                })
+            });
             if let Some(old_term_index) = old_term_index {
                 let old_term_index = old_term_index
                     .unarchive::<TermIndex>()
@@ -96,16 +105,52 @@ impl Store {
 
             let mut commit_points = batch.commit_points();
             for (chunk, commit_point) in commit_points.iter().enumerate() {
-                let batch = batch.build_one(commit_point);
+                // Mail ruling R62's test: chunk 0 is written, the rest is not.
+                #[cfg(feature = "test_mode")]
+                if chunk == 1
+                    && let SearchIndexId::Account { account_id, .. } = term_index_builder.id
+                {
+                    crate::za_test::index_chunk_pause_point(account_id).await;
+                }
+
+                // R62: a later chunk is written only while chunk 0's
+                // `Document` key is stored; a concurrent unindex deleted it
+                // and every key it lists, so the rest of this document is
+                // not written. The assertion goes first; a `SearchIndex`
+                // class serializes its own ids, so the context ops after it
+                // do not matter to it.
+                let mut guarded: Vec<Operation>;
+                let batch = match &document_guard {
+                    Some(document_key) if chunk > 0 => {
+                        let built = batch.build_one(commit_point);
+                        guarded = Vec::with_capacity(built.ops.len() + 1);
+                        guarded.push(Operation::AssertValue {
+                            class: document_key.clone(),
+                            assert_value: AssertValue::Some,
+                        });
+                        guarded.extend(built.ops.iter_mut().map(|op| {
+                            std::mem::replace(op, Operation::DocumentId { document_id: 0 })
+                        }));
+                        Batch {
+                            changes: built.changes,
+                            ops: &mut guarded,
+                        }
+                    }
+                    _ => batch.build_one(commit_point),
+                };
                 match self.write(batch).await {
                     Ok(_) => {}
                     // R58: a fenced document whose first chunk lost its
                     // assertion is not written at all; the batch's other
                     // documents still are, and the caller gets the failure.
-                    Err(err)
-                        if chunk == 0 && assert_absent.is_some() && err.is_assertion_failure() =>
-                    {
-                        fenced_out = true;
+                    // R62: one whose later chunk lost its guard stops there
+                    // without an error (the unindex is the later intent and
+                    // already removed what chunk 0 wrote); the batch's other
+                    // documents still are written.
+                    Err(err) if assert_absent.is_some() && err.is_assertion_failure() => {
+                        if chunk == 0 {
+                            fenced_out = true;
+                        }
                         break;
                     }
                     Err(err) => return Err(err.caused_by(trc::location!())),

@@ -84,28 +84,16 @@
 //! - `TRAIN_PAUSE`: in `add_account_spam_sample` after the message's
 //!   metadata read and before the sample is added to the batch, keyed by
 //!   the sample's account (`email::message::ingest`, mail ruling R55).
+//! - `INDEX_CHUNK_PAUSE`: in `Store::index` after a multi-chunk document's
+//!   first commit chunk and before its second, keyed by the document's
+//!   account (`store::search::index`, mail ruling R62); defined in
+//!   `store::za_test` and re-exported here.
 
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
-use tokio::sync::Notify;
-
-pub struct Pause {
-    pub account_id: u32,
-    pub arrived: Notify,
-    pub release: Notify,
-}
-
-impl Pause {
-    pub fn new(account_id: u32) -> Self {
-        Pause {
-            account_id,
-            arrived: Notify::new(),
-            release: Notify::new(),
-        }
-    }
-}
+pub use store::za_test::{Pause, set_index_chunk_pause};
 
 pub static FAN_OUT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 

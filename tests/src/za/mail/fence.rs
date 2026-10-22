@@ -67,12 +67,12 @@ use registry::{
 use serde_json::json;
 use std::time::{Duration, Instant};
 use store::{
-    Deserialize, IterateParams, U32_LEN, U64_LEN, ValueKey,
+    Deserialize, IterateParams, SUBSPACE_SEARCH_INDEX, U32_LEN, U64_LEN, ValueKey,
     registry::write::{RegistryWrite, RegistryWriteResult},
     roaring::RoaringBitmap,
     search::{EmailSearchField, IndexDocument, SearchField, SearchFilter, SearchQuery},
     write::{
-        AlignedBytes, Archive, BatchBuilder, BlobLink, BlobOp, SearchIndex, TaskQueueClass,
+        AlignedBytes, AnyKey, Archive, BatchBuilder, BlobLink, BlobOp, SearchIndex, TaskQueueClass,
         ValueClass, key::DeserializeBigEndian, now,
     },
 };
@@ -132,6 +132,19 @@ const FAILED_MERGE: &str = "keymail18@example.com";
 const SUPERSEDED: &str = "keymail20@example.com";
 /// Its ordinary control, whose index write passes the fence.
 const SUPERSEDED_CONTROL: &str = "plainmail17@example.com";
+/// `unindex_between_index_chunks_leaves_no_terms`'s account (ruling R62).
+const CHUNKED: &str = "keymail23@example.com";
+/// `unindex_between_calendar_index_chunks_leaves_no_terms`'s account
+/// (ruling R62).
+const CHUNKED_EVENT: &str = "keymail24@example.com";
+/// `superseded_index_tail_loses_to_provisioning`'s account (ruling R62).
+const SUPERSEDED_TAIL: &str = "keymail25@example.com";
+/// Its ordinary control, whose multi-chunk index write passes the guard.
+const SUPERSEDED_TAIL_CONTROL: &str = "plainmail18@example.com";
+/// The token `large_body` ends with: 12 bytes, so stored verbatim in its
+/// `Term` key (`CheekyHash`), and longer than the body's five-byte tokens,
+/// so written in a later commit chunk than the first.
+const TAIL_CANARY: &str = "zztailcanary";
 /// `train_batch_loses_to_provisioning`'s source account (ruling R55).
 const TRAINED: &str = "keymail19@example.com";
 /// `train_batch_loses_to_provisioning`'s destination, an ordinary account.
@@ -184,6 +197,10 @@ pub async fn test(test: &mut TestServer) {
     let failed_merge = setup_refuses_a_failed_merge_task(test, &admin).await;
     let (superseded, superseded_control) =
         superseded_index_write_loses_to_provisioning(test, &admin).await;
+    let chunked = unindex_between_index_chunks_leaves_no_terms(test, &admin).await;
+    let chunked_event = unindex_between_calendar_index_chunks_leaves_no_terms(test, &admin).await;
+    let (superseded_tail, superseded_tail_control) =
+        superseded_index_tail_loses_to_provisioning(test, &admin).await;
 
     // The accounts that log in empty their own mailboxes; the others are
     // pending or credentialless, and the account's destruction removes
@@ -219,6 +236,10 @@ pub async fn test(test: &mut TestServer) {
         failed_merge,
         superseded,
         superseded_control,
+        chunked,
+        chunked_event,
+        superseded_tail,
+        superseded_tail_control,
     ] {
         admin.destroy_account(account).await;
     }
@@ -1939,6 +1960,457 @@ async fn superseded_index_write_loses_to_provisioning(
     assert!(
         !test.server.za_has_email_search_documents(id).await.unwrap(),
         "the superseded write landed in the key account's index"
+    );
+    assert!(
+        account_tasks(test, id).await.is_empty(),
+        "the superseded execution was rescheduled"
+    );
+
+    admin.destroy_all_mailboxes_for_account(control_id).await;
+    (account, control)
+}
+
+/// The account's raw keys in one search index of the internal search store
+/// (`store/src/write/key.rs`): its `Document` keys, its `Term` keys and its
+/// `Index` keys, and each `Term` key's `CheekyHash` payload, which is the
+/// token itself for one of up to 15 bytes.
+#[derive(Default)]
+struct SearchKeys {
+    documents: usize,
+    terms: usize,
+    fields: usize,
+    term_payloads: Vec<Vec<u8>>,
+}
+
+impl SearchKeys {
+    fn is_empty(&self) -> bool {
+        self.documents == 0 && self.terms == 0 && self.fields == 0
+    }
+
+    fn holds_term(&self, token: &str) -> bool {
+        self.term_payloads
+            .iter()
+            .any(|payload| payload == token.as_bytes())
+    }
+}
+
+/// Counts only: the payloads of a large document would flood a failure.
+impl std::fmt::Debug for SearchKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} document, {} term ({} canary) and {} field keys",
+            self.documents,
+            self.terms,
+            if self.holds_term(TAIL_CANARY) {
+                "with the"
+            } else {
+                "no"
+            },
+            self.fields
+        )
+    }
+}
+
+/// The keys of `account_id` in `index`, read raw from the search index
+/// subspace. Key layout: the class (the index code, Email 0 and Calendar 1,
+/// with the type in its top bits: `Term` 0, `Index` 0x40, `Document` 0x80),
+/// the account id (u32 BE), then for a `Term` key the payload, its length
+/// byte, the field and the document id (u32 BE).
+async fn search_keys(test: &TestServer, account_id: u32, index: SearchIndex) -> SearchKeys {
+    let store = test
+        .server
+        .search_store()
+        .internal_fts()
+        .expect("the suite runs on the internal search store");
+    let code = match index {
+        SearchIndex::Email => 0u8,
+        SearchIndex::Calendar => 1u8,
+        _ => panic!("no account keys are read for this index"),
+    };
+    let mut keys = SearchKeys::default();
+    for class in [code, code | 0x40, code | 0x80] {
+        let mut from = vec![class];
+        from.extend_from_slice(&account_id.to_be_bytes());
+        let mut to = from.clone();
+        to.extend_from_slice(&[u8::MAX; 64]);
+        let mut found: Vec<Vec<u8>> = Vec::new();
+        store
+            .iterate(
+                IterateParams::new(
+                    AnyKey {
+                        subspace: SUBSPACE_SEARCH_INDEX,
+                        key: from,
+                    },
+                    AnyKey {
+                        subspace: SUBSPACE_SEARCH_INDEX,
+                        key: to,
+                    },
+                )
+                .no_values(),
+                |key, _| {
+                    found.push(key.to_vec());
+                    Ok(true)
+                },
+            )
+            .await
+            .unwrap();
+        match class & 0xC0 {
+            0x00 => {
+                keys.terms += found.len();
+                keys.term_payloads
+                    .extend(found.into_iter().filter_map(|key| {
+                        key.get(1 + U32_LEN..key.len().checked_sub(2 + U32_LEN)?)
+                            .map(<[u8]>::to_vec)
+                    }));
+            }
+            0x40 => keys.fields += found.len(),
+            _ => keys.documents += found.len(),
+        }
+    }
+    keys
+}
+
+/// 2,400 distinct five-byte tokens (`c0000` to `c2399`, 16 to a line) and
+/// then `canary`: with the headers indexed in test mode, about 2,500 index
+/// operations, so three commit chunks (`BatchBuilder::commit_point` splits
+/// above 1,000). `write_index` writes the terms in `CheekyHash` order, by
+/// length first, so a canary longer than five bytes lands in a later chunk
+/// than the first, and the `Index` keys (the subject and the addresses) in
+/// the last.
+fn large_body(canary: &str) -> String {
+    let mut body = String::new();
+    for line in 0..150 {
+        let tokens = (0..16)
+            .map(|token| format!("c{:04}", line * 16 + token))
+            .collect::<Vec<_>>();
+        body.push_str(&tokens.join(" "));
+        body.push_str("\r\n");
+    }
+    body.push_str(canary);
+    body
+}
+
+/// `unindex_between_calendar_index_chunks_leaves_no_terms`'s event: no
+/// alarm, no organizer (so its only tasks are its index and unindex
+/// tasks), and a DESCRIPTION of `large_body`'s tokens and the canary,
+/// folded at 70 octets.
+fn chunked_ical() -> String {
+    let description = format!(
+        "DESCRIPTION:{}",
+        large_body(TAIL_CANARY).replace("\r\n", " ")
+    );
+    let folded = description
+        .as_bytes()
+        .chunks(70)
+        .map(|line| std::str::from_utf8(line).unwrap())
+        .collect::<Vec<_>>()
+        .join("\r\n ");
+    format!(
+        "BEGIN:VCALENDAR\r\n\
+         VERSION:2.0\r\n\
+         PRODID:-//Stalwart Labs//za fence//EN\r\n\
+         BEGIN:VEVENT\r\n\
+         UID:chunked-event@example.com\r\n\
+         DTSTAMP:20261020T100000Z\r\n\
+         DTSTART:20261021T100000Z\r\n\
+         DTEND:20261021T110000Z\r\n\
+         SUMMARY:chunked summary\r\n\
+         {folded}\r\n\
+         END:VEVENT\r\n\
+         END:VCALENDAR\r\n"
+    )
+}
+
+/// Waits (at most 10 s) until the account's unindex task has run and
+/// cleared its record while its index task stays parked: the message's
+/// metadata archive is gone, when `message_id` names one, and only the
+/// index task's record is left.
+async fn wait_for_the_unindex(test: &TestServer, account_id: u32, message_id: Option<u32>) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let tasks = account_tasks(test, account_id).await;
+        let unindexed = match message_id {
+            Some(message_id) => metadata_archive(test, account_id, message_id)
+                .await
+                .is_none(),
+            None => true,
+        };
+        if unindexed && matches!(tasks.as_slice(), [Task::IndexDocument(_)]) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the unindex task did not finish: {tasks:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Ruling R62 of plan 13 (PR #51 review 3, P2-8): `Store::index` writes a
+/// large document in several commit chunks, its `Document` key in the
+/// first, and the message's unindex task, in a worker of its own, can run
+/// between two of them: it deletes the `Document` key and every key that
+/// key lists. Before R62 the later chunks then wrote `Term` and `Index`
+/// keys that nothing lists (short tokens, the subject and the addresses
+/// verbatim), the task cleared, and issuance passed R51's document scan.
+/// With R62's guard every later chunk of a fenced document asserts that its
+/// `Document` key is stored, so the rest of the document is not written,
+/// the task ends without a retry, and the account provisions cleanly.
+async fn unindex_between_index_chunks_leaves_no_terms(
+    test: &TestServer,
+    admin: &Account,
+) -> Account {
+    println!("unindex_between_index_chunks_leaves_no_terms");
+    test.wait_for_tasks().await;
+    let account = passwordless(admin, CHUNKED).await;
+    let id = account.id().document_id();
+    let message = message_with("chunked subject", &large_body(TAIL_CANARY));
+    // The delivery commits; its index task writes the document's first
+    // chunk and parks before the second.
+    let parked = HookParked::start(id, test_hooks::set_index_chunk_pause, async move {
+        SmtpConnection::connect()
+            .await
+            .ingest(SENDER, &[CHUNKED], &message)
+            .await;
+    })
+    .await;
+    let keys = search_keys(test, id, SearchIndex::Email).await;
+    assert!(
+        keys.documents == 1 && keys.terms > 0 && !keys.holds_term(TAIL_CANARY),
+        "chunk 0 alone was not written: {keys:?}"
+    );
+    let ids = message_ids(test, id).await;
+    assert_eq!(ids.len(), 1, "{ids:?}");
+
+    admin.destroy_all_mailboxes_for_account(id).await;
+    wait_for_the_unindex(test, id, Some(ids[0])).await;
+    let keys = search_keys(test, id, SearchIndex::Email).await;
+    assert!(keys.is_empty(), "the unindex left chunk 0's keys: {keys:?}");
+    let reply = za_post_as(admin, "setup-token", &json!({ "account": CHUNKED })).await;
+    assert_eq!(
+        reply.expect(409)["error"],
+        "account has unfinished tasks",
+        "issuance while the index write of the account is between chunks"
+    );
+    assert!(
+        test.server.za_vault_record(id).await.unwrap().is_none(),
+        "the refused issuance wrote a record"
+    );
+
+    parked.finish().await;
+    test.wait_for_tasks().await;
+    let keys = search_keys(test, id, SearchIndex::Email).await;
+    assert!(
+        keys.is_empty(),
+        "the later chunks outlived the unindex: {keys:?}"
+    );
+    assert!(
+        account_tasks(test, id).await.is_empty(),
+        "the index task is still queued"
+    );
+    za_setup_token(admin, CHUNKED).await;
+    account
+}
+
+/// Ruling R62 of plan 13: the calendar twin of
+/// `unindex_between_index_chunks_leaves_no_terms`, built like
+/// `setup_refuses_an_in_flight_calendar_index_write`. An ordinary event
+/// whose description fills three commit chunks is indexed; its first chunk
+/// is written, and the event is deleted before the second, so its unindex
+/// task removes the `Document` key and what it lists. The later chunks
+/// (the description's other tokens, the canary, the `Uid` verbatim in an
+/// `Index` key) are not written.
+async fn unindex_between_calendar_index_chunks_leaves_no_terms(
+    test: &TestServer,
+    admin: &Account,
+) -> Account {
+    println!("unindex_between_calendar_index_chunks_leaves_no_terms");
+    test.wait_for_tasks().await;
+    let account = passwordless(admin, CHUNKED_EVENT).await;
+    let id = account.id().document_id();
+    // The event is planted while the consumer is held; released with the
+    // pause set, the consumer dispatches its index task, which writes the
+    // document's first chunk and parks before the second.
+    let held = hold_task_consumer(test).await;
+    let event_id = plant_event(test, id, "default", "chunked.ics", &chunked_ical(), None).await;
+    let parked = HookParked::start(id, test_hooks::set_index_chunk_pause, async move {
+        drop(held);
+    })
+    .await;
+    let keys = search_keys(test, id, SearchIndex::Calendar).await;
+    assert!(
+        keys.documents == 1 && keys.terms > 0 && !keys.holds_term(TAIL_CANARY),
+        "chunk 0 alone was not written: {keys:?}"
+    );
+
+    // The event is deleted: an unindex task, which runs and clears its
+    // record while the index task stays parked.
+    let account_info = test.server.account_info(id).await.unwrap();
+    let archive = test
+        .server
+        .store()
+        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            id,
+            Collection::CalendarEvent,
+            event_id,
+        ))
+        .await
+        .unwrap()
+        .expect("the event's archive");
+    let mut batch = BatchBuilder::new();
+    DestroyArchive(archive.to_unarchived::<CalendarEvent>().unwrap())
+        .delete_all(&account_info, id, event_id, false, &mut batch)
+        .unwrap();
+    test.server.commit_batch(batch).await.unwrap();
+    test.server.notify_task_queue();
+    wait_for_the_unindex(test, id, None).await;
+    let keys = search_keys(test, id, SearchIndex::Calendar).await;
+    assert!(keys.is_empty(), "the unindex left chunk 0's keys: {keys:?}");
+    let reply = za_post_as(admin, "setup-token", &json!({ "account": CHUNKED_EVENT })).await;
+    assert_eq!(
+        reply.expect(409)["error"],
+        "account has unfinished tasks",
+        "issuance while the calendar index write of the account is between chunks"
+    );
+    assert!(
+        test.server.za_vault_record(id).await.unwrap().is_none(),
+        "the refused issuance wrote a record"
+    );
+
+    parked.finish().await;
+    test.wait_for_tasks().await;
+    let keys = search_keys(test, id, SearchIndex::Calendar).await;
+    assert!(
+        keys.is_empty(),
+        "the later calendar chunks outlived the unindex: {keys:?}"
+    );
+    assert!(
+        account_tasks(test, id).await.is_empty(),
+        "the index task is still queued"
+    );
+    za_setup_token(admin, CHUNKED_EVENT).await;
+    account
+}
+
+/// Ruling R62 of plan 13 (P2-8's second route): on a cluster, an index
+/// worker (A) that wrote a large document's first chunk and stalled past
+/// its task lease before the second is superseded by another node's
+/// execution (B), which finds the message gone and clears the task's
+/// record; the message's unindex has removed the `Document` key and what it
+/// lists, so every term passes and the account is provisioned. R58's
+/// assertion is in the first chunk only; when A resumes, its later chunks
+/// assert that the `Document` key is stored (R62), so nothing of them lands
+/// in the key account's index. B is simulated as in
+/// `superseded_index_write_loses_to_provisioning`. An ordinary account's
+/// multi-chunk document passes the guard (the control), and its task
+/// clearing shows that A's batch ended.
+async fn superseded_index_tail_loses_to_provisioning(
+    test: &TestServer,
+    admin: &Account,
+) -> (Account, Account) {
+    println!("superseded_index_tail_loses_to_provisioning");
+    test.wait_for_tasks().await;
+    let account = passwordless(admin, SUPERSEDED_TAIL).await;
+    let id = account.id().document_id();
+    let control = passwordless(admin, SUPERSEDED_TAIL_CONTROL).await;
+    let control_id = control.id().document_id();
+    let message = message_with("superseded tail", &large_body(TAIL_CANARY));
+    // A: the delivery commits; its index task writes the document's first
+    // chunk and parks before the second.
+    let parked = HookParked::start(id, test_hooks::set_index_chunk_pause, async move {
+        SmtpConnection::connect()
+            .await
+            .ingest(SENDER, &[SUPERSEDED_TAIL], &message)
+            .await;
+    })
+    .await;
+    let ids = message_ids(test, id).await;
+    assert_eq!(ids.len(), 1, "{ids:?}");
+
+    admin.destroy_all_mailboxes_for_account(id).await;
+    wait_for_the_unindex(test, id, Some(ids[0])).await;
+    let keys = search_keys(test, id, SearchIndex::Email).await;
+    assert!(keys.is_empty(), "the unindex left chunk 0's keys: {keys:?}");
+
+    // B, after A's lease expired: its retries find no message, and its
+    // `Ignored` update clears the task's `Due` and `Task` records.
+    let mut records = Vec::new();
+    test.server
+        .store()
+        .iterate(
+            IterateParams::new(
+                ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task { id: 0 })),
+                ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task { id: u64::MAX })),
+            )
+            .ascending(),
+            |key, value| {
+                if let Task::IndexDocument(task) = Task::deserialize(value)?
+                    && task.account_id.document_id() == id
+                {
+                    let due = Task::IndexDocument(task).due_timestamp();
+                    records.push((key.deserialize_be_u64(U64_LEN)?, due));
+                }
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1, "A's task record: {records:?}");
+    let mut batch = BatchBuilder::new();
+    for (task_id, due) in records {
+        batch
+            .clear(ValueClass::TaskQueue(TaskQueueClass::Due {
+                id: task_id,
+                due,
+            }))
+            .clear(ValueClass::TaskQueue(TaskQueueClass::Task { id: task_id }));
+    }
+    test.server.store().write(batch.build_all()).await.unwrap();
+    assert!(
+        account_tasks(test, id).await.is_empty(),
+        "B's update left the task record"
+    );
+
+    // Every term passes: no message, no metadata archive, no task, no
+    // sample, no search key.
+    let token = za_setup_token(admin, SUPERSEDED_TAIL).await;
+    za_setup(SUPERSEDED_TAIL, &token, STRONG).await;
+    assert_eq!(
+        test.server
+            .za_vault_record(id)
+            .await
+            .unwrap()
+            .expect("the vault record")
+            .record
+            .state,
+        VaultState::Active,
+        "setup did not complete"
+    );
+
+    // A resumes and attempts its later chunks; the control's index task
+    // runs after A's batch and its update.
+    parked.finish().await;
+    deliver(
+        test,
+        SENDER,
+        SUPERSEDED_TAIL_CONTROL,
+        &message_with("superseded tail control", &large_body(TAIL_CANARY)),
+    )
+    .await;
+    test.wait_for_tasks().await;
+    let control_keys = search_keys(test, control_id, SearchIndex::Email).await;
+    assert!(
+        control_keys.documents == 1
+            && control_keys.terms > 2000
+            && control_keys.holds_term(TAIL_CANARY)
+            && control_keys.fields > 0,
+        "the control's multi-chunk document was not written whole: {control_keys:?}"
+    );
+    let keys = search_keys(test, id, SearchIndex::Email).await;
+    assert!(
+        keys.is_empty(),
+        "the superseded tail landed in the key account's index: {keys:?}"
     );
     assert!(
         account_tasks(test, id).await.is_empty(),
