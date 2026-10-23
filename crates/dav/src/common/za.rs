@@ -9,18 +9,20 @@ use common::{Server, auth::AccessToken};
 use groupware::calendar::{
     CalendarEventNotification,
     seal::{
-        archived_item_is_pending, seal_error, unseal_calendar_archive, unseal_event_archive,
-        unseal_item_archive,
+        SealError, archived_item_is_pending, calendar_view_in_domain, event_view_in_domain,
+        seal_error, unseal_event_archive, unseal_item_archive,
     },
+    sharing::resolve::{ZaCalendarContext, ZaCalendarError, za_calendar_context},
 };
 use hyper::StatusCode;
-use std::{borrow::Cow, future::Future, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, future::Future, sync::Arc};
 use store::{
     ValueKey,
     write::{AlignedBytes, Archive},
 };
 use trc::AddContext;
-use types::collection::Collection;
+use types::{acl::Acl, collection::Collection};
+use utils::map::bitmap::Bitmap;
 use vault::session::SessionKeys;
 
 /// What a free-busy computation may read from an account (ruling R6).
@@ -148,21 +150,6 @@ pub(crate) fn za_event_view<'x>(
     }
 }
 
-/// The collection counterpart of [`za_event_view`], same contract.
-pub(crate) fn za_calendar_view<'x>(
-    stored: &'x Archive<AlignedBytes>,
-    keys: Option<&Arc<SessionKeys>>,
-    account_id: u32,
-    document_id: u32,
-) -> trc::Result<Cow<'x, Archive<AlignedBytes>>> {
-    match keys {
-        Some(keys) => unseal_calendar_archive(stored, keys, account_id)
-            .map(Cow::Owned)
-            .map_err(|err| seal_error(err, account_id, document_id)),
-        None => Ok(Cow::Borrowed(stored)),
-    }
-}
-
 /// Invitations spec 6.6: the inbox counterpart of [`za_event_view`], same
 /// contract. A drained item is unsealed under the account's keys; a pending
 /// (`pk`) item reached here is an unseal failure (spec 10): the caller
@@ -252,6 +239,77 @@ fn stored_item_is_pending(stored: &Archive<AlignedBytes>) -> crate::Result<bool>
     ))
 }
 
+/// This map belongs to one read request only. Writers never consume it.
+pub(crate) type ZaReadMemo = HashMap<(u32, u32), Arc<ZaCalendarContext>>;
+
+pub(crate) async fn za_read_context(
+    server: &Server,
+    token: &AccessToken,
+    owner_id: u32,
+    calendar_id: u32,
+    required: Bitmap<Acl>,
+    memo: &mut ZaReadMemo,
+) -> Result<Option<Arc<ZaCalendarContext>>, ZaCalendarError> {
+    if let Some(context) = memo.get(&(owner_id, calendar_id)) {
+        context.check_access(token, required)?;
+        return Ok(Some(context.clone()));
+    }
+    let context = za_calendar_context(server, token, owner_id, calendar_id, required)
+        .await?
+        .map(Arc::new);
+    if let Some(context) = &context {
+        memo.insert((owner_id, calendar_id), context.clone());
+    }
+    Ok(context)
+}
+
+/// Refusals fail the request; corrupt content and general store errors fail an
+/// individual listing item. Only the precise missing-resource error becomes 404.
+fn calendar_item_error(
+    error: ZaCalendarError,
+    owner_id: u32,
+    document_id: u32,
+) -> crate::Result<trc::Error> {
+    match error {
+        ZaCalendarError::Forbidden => Err(DavError::Code(StatusCode::FORBIDDEN)),
+        ZaCalendarError::LinkedEvent => Err(DavError::Code(StatusCode::CONFLICT)),
+        ZaCalendarError::Seal(error) => Ok(seal_error(error, owner_id, document_id)),
+        ZaCalendarError::Store(error)
+            if error.matches(trc::EventType::Store(trc::StoreEvent::NotFound)) =>
+        {
+            Err(DavError::Code(StatusCode::NOT_FOUND))
+        }
+        ZaCalendarError::Store(error) => Ok(error),
+    }
+}
+
+pub(crate) async fn za_read_event_view<'x>(
+    server: &Server,
+    token: &AccessToken,
+    owner_id: u32,
+    document_id: u32,
+    calendar_id: u32,
+    stored: &'x Archive<AlignedBytes>,
+    memo: &mut ZaReadMemo,
+) -> crate::Result<trc::Result<Cow<'x, Archive<AlignedBytes>>>> {
+    match za_read_context(
+        server,
+        token,
+        owner_id,
+        calendar_id,
+        Bitmap::new().with_item(Acl::ReadItems),
+        memo,
+    )
+    .await
+    {
+        Ok(Some(context)) => Ok(event_view_in_domain(stored, &context.domain)
+            .map(Cow::Owned)
+            .map_err(|error| seal_error(error, owner_id, document_id))),
+        Ok(None) => Ok(Ok(Cow::Borrowed(stored))),
+        Err(error) => Ok(Err(calendar_item_error(error, owner_id, document_id)?)),
+    }
+}
+
 /// The PROPFIND loader's per-item view: only calendar collections, events
 /// and inbox items consult the gate (outer `Err` is the 403 that fails the
 /// request); an unseal failure (inner `Err`) fails one item. Other
@@ -263,15 +321,51 @@ pub(crate) async fn za_archive_view<'x>(
     document_id: u32,
     collection: Collection,
     stored: &'x Archive<AlignedBytes>,
+    addressed_calendar: Option<u32>,
+    memo: &mut ZaReadMemo,
 ) -> crate::Result<trc::Result<Cow<'x, Archive<AlignedBytes>>>> {
     Ok(match collection {
         Collection::Calendar => {
-            let keys = server.za_session_keys(access_token, account_id).await?;
-            za_calendar_view(stored, keys.as_ref(), account_id, document_id)
+            match za_read_context(
+                server,
+                access_token,
+                account_id,
+                document_id,
+                Bitmap::new().with_item(Acl::Read),
+                memo,
+            )
+            .await
+            {
+                Ok(Some(context)) => {
+                    calendar_view_in_domain(&context.stored, &context.domain, context.personal_id)
+                        .map(Cow::Owned)
+                        .map_err(|error| seal_error(error, account_id, document_id))
+                }
+                Ok(None) => Ok(Cow::Borrowed(stored)),
+                Err(error) => Err(calendar_item_error(error, account_id, document_id)?),
+            }
         }
         Collection::CalendarEvent => {
-            let keys = server.za_session_keys(access_token, account_id).await?;
-            za_event_view(stored, keys.as_ref(), account_id, document_id)
+            let calendar_id = match addressed_calendar {
+                Some(calendar_id) => calendar_id,
+                None => {
+                    return Ok(Err(seal_error(
+                        SealError::Structure("event calendar"),
+                        account_id,
+                        document_id,
+                    )));
+                }
+            };
+            return za_read_event_view(
+                server,
+                access_token,
+                account_id,
+                document_id,
+                calendar_id,
+                stored,
+                memo,
+            )
+            .await;
         }
         Collection::CalendarEventNotification => {
             let keys = server.za_session_keys(access_token, account_id).await?;
@@ -286,4 +380,35 @@ pub(crate) async fn is_key_account(server: &Server, account_id: u32) -> crate::R
         .za_is_key_account(account_id)
         .await
         .caused_by(trc::location!())?)
+}
+
+#[cfg(test)]
+mod sharing_read_tests {
+    use super::*;
+    use groupware::calendar::{seal::SealError, sharing::resolve::ZaCalendarError};
+
+    #[test]
+    fn read_errors_keep_their_scope() {
+        assert!(matches!(
+            calendar_item_error(ZaCalendarError::Forbidden, 1, 2),
+            Err(DavError::Code(StatusCode::FORBIDDEN))
+        ));
+        assert!(matches!(
+            calendar_item_error(ZaCalendarError::LinkedEvent, 1, 2),
+            Err(DavError::Code(StatusCode::CONFLICT))
+        ));
+        assert!(calendar_item_error(ZaCalendarError::Seal(SealError::Aead), 1, 2).is_ok());
+        assert!(matches!(
+            calendar_item_error(ZaCalendarError::Store(trc::StoreEvent::DataCorruption.into_err()), 1, 2),
+            Ok(error) if error.matches(trc::EventType::Store(trc::StoreEvent::DataCorruption))
+        ));
+        assert!(matches!(
+            calendar_item_error(
+                ZaCalendarError::Store(trc::StoreEvent::NotFound.into_err()),
+                1,
+                2
+            ),
+            Err(DavError::Code(StatusCode::NOT_FOUND))
+        ));
+    }
 }

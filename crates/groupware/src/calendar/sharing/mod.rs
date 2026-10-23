@@ -7,3 +7,8 @@
 //! Collection-key rings for zero-access calendar sharing.
 
 pub mod format;
+
+pub mod resolve;
+
+#[cfg(feature = "test_mode")]
+pub mod test;

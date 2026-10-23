@@ -24,7 +24,7 @@ use crate::{
         DavQueryResource,
         acl::current_user_privilege_set,
         uri::DavUriResource,
-        za::{za_archive_view, za_cached_item_hidden, za_item_hidden},
+        za::{ZaReadMemo, za_archive_view, za_cached_item_hidden, za_item_hidden},
     },
     file::{FILE_CONTAINER_PROPS, FILE_ITEM_PROPS},
     principal::{
@@ -102,6 +102,7 @@ pub(crate) trait PropFindRequestHandler: Sync + Send {
 }
 
 pub(crate) struct PropFindData {
+    pub calendar_memo: ZaReadMemo,
     pub accounts: AHashMap<u32, PropFindAccountData>,
 }
 
@@ -307,6 +308,9 @@ impl PropFindRequestHandler for Server {
         let mut is_propfind = false;
         let mut ical_instances_limit = self.core.groupware.max_ical_instances;
 
+        // An otherwise valid home listing omits individual refused calendars.
+        // Directly addressed resources and reports retain request-level refusals.
+        let za_home_listing = matches!(&query.resource, DavQueryResource::Uri(resource) if resource.resource.is_none());
         let paths = match std::mem::take(&mut query.resource) {
             DavQueryResource::Uri(resource) => {
                 collection_container = resource.collection;
@@ -485,8 +489,20 @@ impl PropFindRequestHandler for Server {
                     document_id,
                     collection,
                     &stored_,
+                    item.parent_id,
+                    &mut data.calendar_memo,
                 )
-                .await?;
+                .await;
+                let view = match view {
+                    Ok(view) => view,
+                    Err(DavError::Code(StatusCode::FORBIDDEN)) if za_home_listing => continue,
+                    Err(DavError::Code(StatusCode::NOT_FOUND)) => {
+                        response
+                            .add_response(Response::new_status([item.name], StatusCode::NOT_FOUND));
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 archive_ = match view {
                     Ok(archive) => archive,
                     Err(err) => {
@@ -1666,6 +1682,7 @@ impl PropFindData {
     pub fn new() -> Self {
         Self {
             accounts: AHashMap::with_capacity(2),
+            calendar_memo: ZaReadMemo::new(),
         }
     }
 

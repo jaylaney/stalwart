@@ -10,7 +10,7 @@ use crate::{
     calendar::query::is_resource_in_time_range,
     common::{
         uri::DavUriResource,
-        za::{ZaFreeBusy, ZeroAccessGate, za_event_view},
+        za::{ZaFreeBusy, ZaReadMemo, ZeroAccessGate, za_read_event_view},
     },
 };
 use calcard::{
@@ -179,6 +179,7 @@ impl CalendarFreebusyRequestHandler for Server {
             let max_instances = self.core.groupware.max_ical_instances;
             let mut total_instances: usize = 0;
 
+            let mut za_memo = ZaReadMemo::new();
             for document_id in document_ids {
                 let Some(archive) = self
                     .store()
@@ -192,7 +193,20 @@ impl CalendarFreebusyRequestHandler for Server {
                 else {
                     continue;
                 };
-                let view_ = za_event_view(&archive, za_keys.as_ref(), account_id, document_id)?;
+                let view_ = if za_keys.is_some() {
+                    za_read_event_view(
+                        self,
+                        access_token,
+                        account_id,
+                        document_id,
+                        resource.document_id(),
+                        &archive,
+                        &mut za_memo,
+                    )
+                    .await??
+                } else {
+                    std::borrow::Cow::Borrowed(&archive)
+                };
                 let event = view_
                     .unarchive::<CalendarEvent>()
                     .caused_by(trc::location!())?;

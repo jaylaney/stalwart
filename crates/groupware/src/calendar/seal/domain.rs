@@ -42,8 +42,6 @@ impl ZaKeyDomain {
         }
     }
 
-    // Consumed by the resolver/converter introduced in subsequent tasks.
-    #[allow(dead_code)]
     pub(crate) fn shared(
         owner_id: u32,
         principal_id: u32,
