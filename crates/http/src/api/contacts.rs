@@ -50,8 +50,9 @@ use groupware::{
         },
         itip::ItipSendStatus,
         pinning::{za_full_request_for, za_participation_replies},
-        seal::{TokenPairs, seal_error, seal_event, unseal_event_pairs},
+        seal::{TokenPairs, seal_error, seal_event_in_domain, unseal_event_in_domain},
         sequence::{ZaSequence, za_set_sequences},
+        sharing::resolve::za_owned_event_contexts,
     },
     scheduling::{
         itip::{ITIP_STATUS_DELIVERED, ITIP_STATUS_NOT_ATTEMPTED},
@@ -640,7 +641,19 @@ async fn za_redeliver_entry(
     let mut event = archive
         .deserialize::<CalendarEvent>()
         .caused_by(trc::location!())?;
-    let pairs = unseal_event_pairs(&mut event, keys, account_id)
+    let contexts = za_owned_event_contexts(
+        server,
+        keys,
+        &event,
+        event
+            .names
+            .first()
+            .ok_or_else(|| trc::StoreEvent::DataCorruption.into_err())?
+            .parent_id,
+    )
+    .await
+    .map_err(|error| error.into_store_error(account_id, document_id))?;
+    let pairs = unseal_event_in_domain(&mut event, &contexts[0].domain)
         .map_err(|err| seal_error(err, account_id, document_id))?;
     if event.data.event.uids().next() != Some(entry.uid.as_str()) {
         return Ok(Outcome::Dropped);
@@ -835,12 +848,27 @@ async fn za_reseal(
     document_id: u32,
 ) -> trc::Result<()> {
     let account_id = verified.account_id;
-    seal_event(&mut event, &verified.keys, account_id, pairs)
+    let contexts = za_owned_event_contexts(
+        server,
+        &verified.keys,
+        &event,
+        event
+            .names
+            .first()
+            .ok_or_else(|| trc::StoreEvent::DataCorruption.into_err())?
+            .parent_id,
+    )
+    .await
+    .map_err(|error| error.into_store_error(account_id, document_id))?;
+    seal_event_in_domain(&mut event, &contexts[0].domain, pairs)
         .map_err(|err| seal_error(err, account_id, document_id))?;
     let current = archive
         .to_unarchived::<CalendarEvent>()
         .caused_by(trc::location!())?;
     let mut batch = BatchBuilder::new();
+    for context in &contexts {
+        context.assert_in(&mut batch);
+    }
     event
         .update(
             account_info.account_tenant_ids(),
@@ -879,7 +907,19 @@ async fn za_reseal_again(
     let mut event = archive
         .deserialize::<CalendarEvent>()
         .caused_by(trc::location!())?;
-    let pairs = unseal_event_pairs(&mut event, &verified.keys, account_id)
+    let contexts = za_owned_event_contexts(
+        server,
+        &verified.keys,
+        &event,
+        event
+            .names
+            .first()
+            .ok_or_else(|| trc::StoreEvent::DataCorruption.into_err())?
+            .parent_id,
+    )
+    .await
+    .map_err(|error| error.into_store_error(account_id, document_id))?;
+    let pairs = unseal_event_in_domain(&mut event, &contexts[0].domain)
         .map_err(|err| seal_error(err, account_id, document_id))?;
     let unchanged = server
         .za_pin_read(&verified.keys)

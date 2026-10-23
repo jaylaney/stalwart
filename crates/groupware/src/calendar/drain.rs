@@ -70,9 +70,11 @@ use crate::{
         fanout::{ZaFanOut, ZaFanOutKind, ZaSource, za_set_schedule_status},
         seal::{
             PendingCarriers, SealError, TOKEN_LEN, TokenPairs, archived_item_is_pending,
-            open_pending_item, seal_drained_item, seal_error, seal_event, unseal_event_pairs,
+            open_pending_item, seal_drained_item, seal_error, seal_event_in_domain,
+            unseal_event_in_domain,
         },
         sequence::za_set_sequences,
+        sharing::resolve::{za_owned_calendar_context, za_owned_event_contexts},
         storage::ItipAutoExpunge,
     },
     scheduling::{
@@ -888,7 +890,10 @@ async fn import(
         ..Default::default()
     };
     // Spec 3.3, "Attendee side": the copy takes the pair the item carried.
-    seal_event(&mut event, ctx.keys, account_id, pair.as_ref())
+    let context = za_owned_calendar_context(server, ctx.keys, parent_id)
+        .await
+        .map_err(|error| error.into_store_error(account_id, parent_id))?;
+    seal_event_in_domain(&mut event, &context.domain, pair.as_ref())
         .map_err(|err| seal_error(err, account_id, u32::MAX))?;
     let document_id = server
         .store()
@@ -901,6 +906,7 @@ async fn import(
     // Spec 6.3 step 3: fenced on the lease, with the item rewrite ahead of
     // the insert (one write; see the module doc).
     lease.lease().assert_in(&mut batch);
+    context.assert_in(&mut batch);
     ctx.rewrite_in(&mut batch, tree, Some(document_id), 0)?;
     event
         .insert(
@@ -1020,7 +1026,15 @@ async fn merge(
     let mut event = event_
         .deserialize::<CalendarEvent>()
         .caused_by(trc::location!())?;
-    let mut pairs = unseal_event_pairs(&mut event, ctx.keys, account_id)
+    let parent_id = event
+        .names
+        .first()
+        .ok_or_else(|| trc::StoreEvent::DataCorruption.into_err())?
+        .parent_id;
+    let contexts = za_owned_event_contexts(server, ctx.keys, &event, parent_id)
+        .await
+        .map_err(|error| error.into_store_error(account_id, event_id))?;
+    let mut pairs = unseal_event_in_domain(&mut event, &contexts[0].domain)
         .map_err(|err| seal_error(err, account_id, event_id))?;
     // Spec 3.3, "Verification": a REPLY is authenticated by the replier's
     // token in this event's bundle, matched by address. A sender none of
@@ -1277,12 +1291,15 @@ async fn merge(
             None => event.schedule_tag = Some(1),
         }
     }
-    seal_event(&mut event, ctx.keys, account_id, pairs.as_ref())
+    seal_event_in_domain(&mut event, &contexts[0].domain, pairs.as_ref())
         .map_err(|err| seal_error(err, account_id, event_id))?;
     let mut batch = BatchBuilder::new();
     // A delegating REPLY is fenced on its lease first, as `import` is.
     if let Some(lease) = &reply_lease {
         lease.lease().assert_in(&mut batch);
+    }
+    for context in &contexts {
+        context.assert_in(&mut batch);
     }
     // The item rewrite first, ahead of the event update (one write; see
     // the module doc).

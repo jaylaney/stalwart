@@ -4,13 +4,13 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use super::za_calendar_error;
 use crate::{
     DavError, DavMethod,
     common::{
         ETag,
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
-        za::ZeroAccessGate,
     },
 };
 use common::{Server, auth::AccessToken, sharing::EffectiveAcl};
@@ -21,6 +21,7 @@ use groupware::{
     calendar::{
         Calendar, CalendarEvent,
         fanout::{ZaFanOut, ZaFanOutKind, ZaSource},
+        sharing::resolve::{calendars_changed, za_calendar_context},
     },
 };
 use http_proto::HttpResponse;
@@ -85,11 +86,13 @@ impl CalendarDeleteRequestHandler for Server {
             && access_token.has_permission(Permission::CalendarSchedulingSend);
         // Invitations spec 5.5: a key account's CANCELs and declines are
         // built from the unsealed stored tree and go to the fan-out.
-        let za_keys = self.za_session_keys(access_token, account_id).await?;
+        let za_keys = super::za_writer_keys(self, access_token, account_id).await?;
         let mut za_messages = Vec::new();
 
         // Fetch entry
         let mut batch = BatchBuilder::new();
+        let mut retry_event = None;
+        let mut contexts = Vec::new();
         if delete_resource.is_container() {
             // Deleting the default calendar is not allowed
             #[cfg(not(any(feature = "dev_mode", feature = "test_mode")))]
@@ -131,6 +134,19 @@ impl CalendarDeleteRequestHandler for Server {
             {
                 return Err(DavError::Code(StatusCode::FORBIDDEN));
             }
+
+            // Even collection deletion uses the fresh exact-principal grant.
+            za_calendar_context(
+                self,
+                access_token,
+                account_id,
+                document_id,
+                utils::map::bitmap::Bitmap::new()
+                    .with_item(Acl::Delete)
+                    .with_item(Acl::RemoveItems),
+            )
+            .await
+            .map_err(|error| za_calendar_error(error, account_id, document_id))?;
 
             // Validate headers
             self.validate_headers(
@@ -235,10 +251,25 @@ impl CalendarDeleteRequestHandler for Server {
                 return Err(DavError::Code(StatusCode::PRECONDITION_FAILED));
             }
 
+            if let Some(context) = za_calendar_context(
+                self,
+                access_token,
+                account_id,
+                calendar_id,
+                utils::map::bitmap::Bitmap::new().with_item(Acl::RemoveItems),
+            )
+            .await
+            .map_err(|error| za_calendar_error(error, account_id, calendar_id))?
+            {
+                context.assert_in(&mut batch);
+                contexts.push(context);
+            }
+            let cutoff = store::write::now() as i64;
+            retry_event = Some((event_.clone(), calendar_id, cutoff));
             // Delete event
             za_messages.extend(
                 DestroyArchive(event)
-                    .delete_za(
+                    .delete_za_at(
                         &account_info,
                         account_id,
                         document_id,
@@ -246,6 +277,8 @@ impl CalendarDeleteRequestHandler for Server {
                         resources.format_resource(delete_resource).into(),
                         send_itip,
                         za_keys.as_deref(),
+                        contexts.first().map(|context| &context.domain),
+                        cutoff,
                         &mut batch,
                     )
                     .caused_by(trc::location!())?,
@@ -273,7 +306,48 @@ impl CalendarDeleteRequestHandler for Server {
             }
         }
 
-        self.commit_batch(batch).await.caused_by(trc::location!())?;
+        #[cfg(feature = "test_mode")]
+        if retry_event.is_some() {
+            common::za::test_hooks::delete_commit_pause_point(account_id).await;
+        }
+        match self.commit_batch(batch).await {
+            Ok(_) => {}
+            Err(error) if error.is_assertion_failure() && !contexts.is_empty() => {
+                let (original, calendar_id, cutoff) = retry_event.as_ref().unwrap();
+                let fresh = za_calendar_context(
+                    self,
+                    access_token,
+                    account_id,
+                    *calendar_id,
+                    utils::map::bitmap::Bitmap::new().with_item(Acl::RemoveItems),
+                )
+                .await
+                .map_err(|error| za_calendar_error(error, account_id, *calendar_id))?
+                .into_iter()
+                .collect::<Vec<_>>();
+                if !calendars_changed(&contexts, &fresh) {
+                    return Err(error.into());
+                }
+                let mut batch = BatchBuilder::new();
+                for context in &fresh {
+                    context.assert_in(&mut batch);
+                }
+                DestroyArchive(original.to_unarchived::<CalendarEvent>()?).delete_za_at(
+                    &account_info,
+                    account_id,
+                    document_id,
+                    *calendar_id,
+                    resources.format_resource(delete_resource).into(),
+                    false,
+                    za_keys.as_deref(),
+                    fresh.first().map(|context| &context.domain),
+                    *cutoff,
+                    &mut batch,
+                )?;
+                self.commit_batch(batch).await?;
+            }
+            Err(error) => return Err(error.into()),
+        }
         self.notify_task_queue();
 
         Ok(HttpResponse::new(StatusCode::NO_CONTENT))

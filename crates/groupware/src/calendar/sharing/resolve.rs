@@ -42,6 +42,22 @@ pub enum ZaCalendarError {
     Store(trc::Error),
 }
 
+impl ZaCalendarError {
+    pub fn into_store_error(self, owner_id: u32, document_id: u32) -> trc::Error {
+        match self {
+            Self::Store(error) => error,
+            Self::Seal(error) => crate::calendar::seal::seal_error(error, owner_id, document_id),
+            Self::Forbidden => trc::SecurityEvent::Unauthorized
+                .into_err()
+                .account_id(owner_id),
+            Self::LinkedEvent => trc::StoreEvent::AssertValueFailed
+                .into_err()
+                .account_id(owner_id)
+                .details("zero-access: event linked into a shared calendar"),
+        }
+    }
+}
+
 impl From<SealError> for ZaCalendarError {
     fn from(value: SealError) -> Self {
         Self::Seal(value)
@@ -89,6 +105,16 @@ impl ZaCalendarContext {
         let calendar = self.stored.deserialize::<Calendar>()?;
         authorize_calendar(token, self.owner_id, &calendar, required)
     }
+}
+
+/// Compare full archive versions, including change ids as well as hashes.
+pub fn calendars_changed(before: &[ZaCalendarContext], after: &[ZaCalendarContext]) -> bool {
+    before.len() != after.len()
+        || before.iter().zip(after).any(|(before, after)| {
+            before.owner_id != after.owner_id
+                || before.calendar_id != after.calendar_id
+                || before.stored.version != after.stored.version
+        })
 }
 
 /// Only the authenticated principal's own grant can make a foreign calendar visible.
@@ -438,7 +464,22 @@ pub async fn za_event_contexts(
     }
     let parents = event_parents(event, addressed_calendar)?;
     let mut contexts = Vec::with_capacity(parents.len());
-    for parent in parents {
+    // Authorize the requested path first. An authorized shared path plus
+    // another stored name is already a linked-write refusal; opening a
+    // private other parent must not replace that 409 with an unrelated 403.
+    if let Some(context) =
+        za_calendar_context(server, token, owner_id, addressed_calendar, required).await?
+    {
+        let linked_shared = event.names.len() > 1 && context.domain.calendar_id().is_some();
+        contexts.push(context);
+        if linked_shared {
+            return check_event_domains(contexts, true);
+        }
+    }
+    for parent in parents
+        .into_iter()
+        .filter(|parent| *parent != addressed_calendar)
+    {
         if let Some(context) =
             za_calendar_context(server, token, owner_id, parent, required).await?
         {
@@ -482,6 +523,11 @@ fn check_event_domains(
             .iter()
             .any(|context| context.domain.calendar_id().is_some())
     {
+        trc::event!(
+            Security(trc::SecurityEvent::Unauthorized),
+            AccountId = contexts[0].owner_id,
+            Details = "zero-access: event linked into a shared calendar"
+        );
         Err(ZaCalendarError::LinkedEvent)
     } else {
         Ok(contexts)
@@ -605,6 +651,30 @@ mod tests {
             ..Default::default()
         };
         (owner, reader, private, calendar)
+    }
+
+    #[test]
+    fn calendar_change_detection_includes_version_change_id() {
+        let (keys, _, _, calendar) = fixture([71; 16]);
+        let mut before = resolve_owner_stored(archive(&calendar), &keys, CALENDAR).unwrap();
+        let mut after = resolve_owner_stored(archive(&calendar), &keys, CALENDAR).unwrap();
+        before.stored.version = store::write::ArchiveVersion::Versioned {
+            change_id: 9,
+            hash: 42,
+        };
+        after.stored.version = before.stored.version;
+        assert!(!calendars_changed(
+            std::slice::from_ref(&before),
+            std::slice::from_ref(&after)
+        ));
+        after.stored.version = store::write::ArchiveVersion::Versioned {
+            change_id: 10,
+            hash: 42,
+        };
+        assert!(calendars_changed(
+            std::slice::from_ref(&before),
+            std::slice::from_ref(&after)
+        ));
     }
 
     #[test]

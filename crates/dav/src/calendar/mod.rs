@@ -235,26 +235,59 @@ pub(crate) async fn za_lost_create_fence(
     calendar_id: u32,
     uid: &str,
 ) -> crate::Result<HttpResponse> {
+    za_finish_create_loss(
+        server,
+        resources,
+        lease,
+        account_id,
+        calendar_id,
+        uid,
+        CreateLoss::ConfirmedLease,
+    )
+    .await
+}
+
+enum CreateLoss {
+    ConfirmedLease,
+    OpaqueSecondCommit,
+}
+
+async fn za_finish_create_loss(
+    server: &Server,
+    resources: &DavResources,
+    lease: ZaUidLeaseGuard,
+    account_id: u32,
+    calendar_id: u32,
+    uid: &str,
+    loss: CreateLoss,
+) -> crate::Result<HttpResponse> {
     trc::event!(
         Store(trc::StoreEvent::AssertValueFailed),
         AccountId = account_id,
-        Details = "zero-access: UID creation lease lost before the commit",
+        Details = match &loss {
+            CreateLoss::ConfirmedLease => "zero-access: UID creation lease lost before the commit",
+            CreateLoss::OpaqueSecondCommit => "zero-access: create retry lost its assertion",
+        },
     );
-    lease.abandon();
+    match loss {
+        CreateLoss::ConfirmedLease => lease.abandon(),
+        CreateLoss::OpaqueSecondCommit => {
+            // The second failure may still be the calendar assertion. Release
+            // only our exact fence before the existing UID retake. A false
+            // result is inconclusive; it does not prove successor ownership.
+            let _ = lease.release().await;
+        }
+    }
     let retry = za_take_uid_lease(server, resources, account_id, calendar_id, uid).await?;
     retry.release().await;
-    // Reached only when another creator took the lease and did not store
-    // the UID in this calendar (a PUT into another calendar, or a drain
-    // that failed).
+    // The retake found no copy in this calendar. Keep the existing resend
+    // answer for either a confirmed lease loss or an opaque second loss.
     Err(DavError::Code(StatusCode::SERVICE_UNAVAILABLE))
 }
 
-/// Invitations spec 6.3 steps 3-4: commits a key account's create batch,
-/// which carries the lease's fenced-commit assertion, then releases the
-/// lease. If the lease was taken over while the request ran, the commit
-/// loses its assertion: the request takes the lease again and re-checks
-/// current archives (`NoUidConflict` on a hit), and otherwise answers 503 so
-/// the client resends.
+/// The bounded second create commit. Its assertion loss is opaque: release
+/// our fenced lease before the existing UID retake/outcome, without another
+/// calendar read, archive retry or fan-out.
 pub(crate) async fn za_commit_create(
     server: &Server,
     resources: &DavResources,
@@ -273,16 +306,24 @@ pub(crate) async fn za_commit_create(
             .caused_by(trc::location!())
             .into());
     }
+    #[cfg(feature = "test_mode")]
+    common::za::test_hooks::commit_pause_point(account_id).await;
     match server.commit_batch(batch).await {
         Ok(_) => {
             lease.release().await;
             Ok(())
         }
-        Err(err) if err.is_assertion_failure() => {
-            za_lost_create_fence(server, resources, lease, account_id, calendar_id, uid)
-                .await
-                .map(|_| ())
-        }
+        Err(err) if err.is_assertion_failure() => za_finish_create_loss(
+            server,
+            resources,
+            lease,
+            account_id,
+            calendar_id,
+            uid,
+            CreateLoss::OpaqueSecondCommit,
+        )
+        .await
+        .map(|_| ()),
         Err(err) => {
             lease.release().await;
             Err(err.caused_by(trc::location!()).into())
@@ -316,4 +357,84 @@ impl ItipPrecondition for ItipError {
             _ => None,
         }
     }
+}
+
+/// Mutation adapters always resolve fresh state; response memos are read-only.
+pub(crate) fn za_calendar_error(
+    error: groupware::calendar::sharing::resolve::ZaCalendarError,
+    owner_id: u32,
+    document_id: u32,
+) -> DavError {
+    use groupware::calendar::sharing::resolve::ZaCalendarError;
+    match error {
+        ZaCalendarError::Forbidden => DavError::Code(StatusCode::FORBIDDEN),
+        ZaCalendarError::LinkedEvent => DavError::Code(StatusCode::CONFLICT),
+        ZaCalendarError::Store(error)
+            if error.matches(trc::EventType::Store(trc::StoreEvent::NotFound)) =>
+        {
+            DavError::Code(StatusCode::NOT_FOUND)
+        }
+        error => error.into_store_error(owner_id, document_id).into(),
+    }
+}
+
+pub(crate) async fn za_write_contexts(
+    server: &Server,
+    token: &common::auth::AccessToken,
+    owner_id: u32,
+    event: &CalendarEvent,
+    calendar_id: u32,
+    required: types::acl::Acl,
+) -> crate::Result<Vec<groupware::calendar::sharing::resolve::ZaCalendarContext>> {
+    groupware::calendar::sharing::resolve::za_event_contexts(
+        server,
+        token,
+        owner_id,
+        event,
+        calendar_id,
+        utils::map::bitmap::Bitmap::new().with_item(required),
+    )
+    .await
+    .map_err(|error| za_calendar_error(error, owner_id, calendar_id))
+}
+
+/// Called once after an ambiguous assertion loss. Keep the original event
+/// assertion and already-sealed payload; only its key envelope can change.
+pub(crate) async fn za_refresh_event(
+    server: &Server,
+    token: &common::auth::AccessToken,
+    owner_id: u32,
+    calendar_id: u32,
+    required: types::acl::Acl,
+    before: &[groupware::calendar::sharing::resolve::ZaCalendarContext],
+    sealed: &mut CalendarEvent,
+) -> crate::Result<Option<Vec<groupware::calendar::sharing::resolve::ZaCalendarContext>>> {
+    if before.is_empty() {
+        return Ok(None);
+    }
+    let after = za_write_contexts(server, token, owner_id, sealed, calendar_id, required).await?;
+    if !groupware::calendar::sharing::resolve::calendars_changed(before, &after) {
+        return Ok(None);
+    }
+    groupware::calendar::seal::rewrap_event(sealed, &before[0].domain, &after[0].domain)
+        .map_err(|error| groupware::calendar::seal::seal_error(error, owner_id, calendar_id))?;
+    Ok(Some(after))
+}
+
+/// Event writers keep the authenticated writer's keys. The fresh calendar
+/// resolver below decides whether those keys authorize this owner's calendar.
+pub(crate) async fn za_writer_keys(
+    server: &Server,
+    token: &common::auth::AccessToken,
+    owner_id: u32,
+) -> crate::Result<Option<std::sync::Arc<vault::session::SessionKeys>>> {
+    if !server.za_is_key_account(owner_id).await? {
+        return Ok(None);
+    }
+    token
+        .session_keys()
+        .filter(|keys| keys.account_id == token.account_id() && !token.za_is_impersonated())
+        .cloned()
+        .map(Some)
+        .ok_or(DavError::Code(StatusCode::FORBIDDEN))
 }

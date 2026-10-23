@@ -4,13 +4,13 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use super::{za_refresh_event, za_write_contexts};
 use crate::{
     DavError, DavMethod, PropStatBuilder,
     common::{
         ETag, ExtractETag,
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
-        za::ZeroAccessGate,
     },
 };
 use calcard::common::timezone::Tz;
@@ -29,7 +29,8 @@ use groupware::{
     calendar::{
         Calendar, CalendarEvent, SupportedComponent, Timezone,
         seal::{
-            event_token_pairs, seal_calendar, seal_error, seal_event, unseal_calendar, unseal_event,
+            event_pairs_in_domain, seal_calendar, seal_error, seal_event_in_domain,
+            unseal_calendar, unseal_event_in_domain,
         },
     },
 };
@@ -88,7 +89,7 @@ impl CalendarPropPatchRequestHandler for Server {
             .into_owned_uri()?;
         let uri = headers.uri;
         let account_id = resource_.account_id;
-        let za_keys = self.za_session_keys(access_token, account_id).await?;
+        let za_keys = super::za_writer_keys(self, access_token, account_id).await?;
         let resources = self
             .fetch_dav_resources(
                 access_token.account_id(),
@@ -158,7 +159,8 @@ impl CalendarPropPatchRequestHandler for Server {
         let mut batch = BatchBuilder::new();
         let mut items = PropStatBuilder::default();
 
-        let etag = if resource.is_container() {
+        let mut retry_event = None;
+        let mut etag = if resource.is_container() {
             // Deserialize
             let calendar = archive
                 .to_unarchived::<Calendar>()
@@ -229,8 +231,17 @@ impl CalendarPropPatchRequestHandler for Server {
                 .deserialize::<CalendarEvent>()
                 .caused_by(trc::location!())?;
             // Spec 8.1: edit the plaintext; `event` (stored) stays current.
-            if let Some(keys) = &za_keys {
-                unseal_event(&mut new_event, keys, account_id)
+            let contexts = za_write_contexts(
+                self,
+                access_token,
+                account_id,
+                &new_event,
+                resource.parent_id().unwrap(),
+                Acl::ModifyItems,
+            )
+            .await?;
+            if let Some(context) = contexts.first() {
+                unseal_event_in_domain(&mut new_event, &context.domain)
                     .map_err(|err| seal_error(err, account_id, document_id))?;
             }
 
@@ -252,19 +263,25 @@ impl CalendarPropPatchRequestHandler for Server {
             }
 
             if is_success {
-                if let Some(keys) = &za_keys {
-                    // Invitations spec 3.3: every rewrite carries the stored pairs.
-                    let pairs = event_token_pairs(&archive, keys, account_id)
+                if let Some(context) = contexts.first() {
+                    // Every rewrite carries the stored pairs.
+                    let pairs = event_pairs_in_domain(&archive, &context.domain)
                         .map_err(|err| seal_error(err, account_id, document_id))?;
-                    seal_event(&mut new_event, keys, account_id, pairs.as_ref())
+                    seal_event_in_domain(&mut new_event, &context.domain, pairs.as_ref())
                         .map_err(|err| seal_error(err, account_id, document_id))?;
                 }
+                let timestamp = store::write::now() as i64;
+                for context in &contexts {
+                    context.assert_in(&mut batch);
+                }
+                retry_event = Some((new_event.clone(), contexts, timestamp));
                 new_event
-                    .update(
+                    .update_at(
                         access_token.account_tenant_ids(),
                         event,
                         account_id,
                         document_id,
+                        timestamp,
                         &mut batch,
                     )
                     .caused_by(trc::location!())?
@@ -275,7 +292,41 @@ impl CalendarPropPatchRequestHandler for Server {
         };
 
         if is_success {
-            self.commit_batch(batch).await.caused_by(trc::location!())?;
+            match self.commit_batch(batch).await {
+                Ok(_) => {}
+                Err(error) if error.is_assertion_failure() && retry_event.is_some() => {
+                    let (mut sealed, contexts, timestamp) = retry_event.take().unwrap();
+                    let Some(fresh) = za_refresh_event(
+                        self,
+                        access_token,
+                        account_id,
+                        resource.parent_id().unwrap(),
+                        Acl::ModifyItems,
+                        &contexts,
+                        &mut sealed,
+                    )
+                    .await?
+                    else {
+                        return Err(error.into());
+                    };
+                    let mut batch = BatchBuilder::new();
+                    for context in &fresh {
+                        context.assert_in(&mut batch);
+                    }
+                    etag = sealed
+                        .update_at(
+                            access_token.account_tenant_ids(),
+                            archive.to_unarchived::<CalendarEvent>()?,
+                            account_id,
+                            document_id,
+                            timestamp,
+                            &mut batch,
+                        )?
+                        .etag();
+                    self.commit_batch(batch).await?;
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
 
         if headers.ret != Return::Minimal || !is_success {

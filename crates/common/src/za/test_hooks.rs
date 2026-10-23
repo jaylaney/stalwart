@@ -20,6 +20,10 @@
 //! - `COMMIT_PAUSE`: in the CalDAV PUT handler immediately before the key
 //!   account's leased create commits (`za_commit_create`), after the fan-out
 //!   and the seal.
+//! - `UPDATE_COMMIT_PAUSE`: immediately before an event PUT update commit,
+//!   after fan-out and sealing, keyed by the event owner.
+//! - `DELETE_COMMIT_PAUSE`: immediately before an event DELETE commit,
+//!   after fan-out, keyed by the event owner.
 //! - `COMMIT_FAIL_ONCE`: the commit of a key account's PUT create fails once
 //!   with an internal error after its fan-out, keyed by the account
 //!   (`dav::calendar::za_commit_create`).
@@ -107,6 +111,8 @@ pub static FAN_OUT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static PUT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
 pub static COMMIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static UPDATE_COMMIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static DELETE_COMMIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
 /// Global: its `account_id` is ignored.
 pub static TASK_CONSUMER_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
@@ -180,6 +186,13 @@ pub fn set_put_pause(pause: Option<Arc<Pause>>) {
 
 pub fn set_commit_pause(pause: Option<Arc<Pause>>) {
     set_slot(&COMMIT_PAUSE, pause);
+}
+
+pub fn set_update_commit_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&UPDATE_COMMIT_PAUSE, pause);
+}
+pub fn set_delete_commit_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&DELETE_COMMIT_PAUSE, pause);
 }
 
 pub fn set_task_consumer_pause(pause: Option<Arc<Pause>>) {
@@ -356,6 +369,13 @@ pub async fn put_pause_point(account_id: u32) {
 
 pub async fn commit_pause_point(account_id: u32) {
     wait(take_for(&COMMIT_PAUSE, account_id)).await;
+}
+
+pub async fn update_commit_pause_point(account_id: u32) {
+    wait(take_for(&UPDATE_COMMIT_PAUSE, account_id)).await;
+}
+pub async fn delete_commit_pause_point(account_id: u32) {
+    wait(take_for(&DELETE_COMMIT_PAUSE, account_id)).await;
 }
 
 pub async fn task_consumer_pause_point() {

@@ -36,6 +36,7 @@ pub mod registry;
 pub mod reply;
 pub mod setup;
 pub mod sharing;
+pub mod sharing_races;
 pub mod sweep;
 pub mod totp;
 pub mod tracing;
@@ -154,6 +155,7 @@ pub async fn za_tests() {
     drain_limits::test(&mut test).await;
     pinning::test(&mut test).await;
     sharing::test(&mut test).await;
+    sharing_races::test(&mut test).await;
     sweep::test(&mut test).await;
     tracing::test(&mut test).await;
     raw_input::test(&mut test).await;

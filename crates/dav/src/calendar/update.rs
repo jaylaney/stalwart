@@ -4,7 +4,10 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::{assert_is_unique_uid, za_commit_create, za_lost_create_fence, za_take_uid_lease};
+use super::{
+    assert_is_unique_uid, za_commit_create, za_lost_create_fence, za_refresh_event,
+    za_take_uid_lease, za_write_contexts,
+};
 use crate::{
     DavError, DavErrorCondition, DavMethod,
     calendar::ItipPrecondition,
@@ -12,7 +15,7 @@ use crate::{
         ETag, ExtractETag,
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
-        za::{ZeroAccessGate, za_event_view},
+        za::za_event_view,
     },
     file::DavFileResource,
     fix_percent_encoding,
@@ -33,7 +36,7 @@ use groupware::{
         CalendarEvent, CalendarEventData,
         fanout::{ZaFanOut, ZaFanOutKind, ZaSource, za_set_schedule_status},
         itip::ItipSendStatus,
-        seal::{event_token_pairs, seal_error, seal_event},
+        seal::{event_pairs_in_domain, event_view_in_domain, seal_error, seal_event_in_domain},
         sequence::{za_sequence_floor, za_set_sequences},
     },
     scheduling::{
@@ -79,7 +82,7 @@ impl CalendarUpdateRequestHandler for Server {
             .await?
             .into_owned_uri()?;
         let account_id = resource.account_id;
-        let za_keys = self.za_session_keys(access_token, account_id).await?;
+        let za_keys = super::za_writer_keys(self, access_token, account_id).await?;
         let resources = self
             .fetch_dav_resources(
                 access_token.account_id(),
@@ -161,7 +164,22 @@ impl CalendarUpdateRequestHandler for Server {
             // Spec 8.1: the stored sealed archive stays `current` for the
             // index builder; the unsealed view is used for comparison, editing
             // and response bodies only.
-            let view_ = za_event_view(&event_, za_keys.as_ref(), account_id, document_id)?;
+            let mut contexts = za_write_contexts(
+                self,
+                access_token,
+                account_id,
+                &event_.deserialize::<CalendarEvent>()?,
+                parent_id,
+                Acl::ModifyItems,
+            )
+            .await?;
+            let view_ = match contexts.first() {
+                Some(context) => std::borrow::Cow::Owned(
+                    event_view_in_domain(&event_, &context.domain)
+                        .map_err(|error| seal_error(error, account_id, document_id))?,
+                ),
+                None => za_event_view(&event_, None, account_id, document_id)?,
+            };
             let view = view_
                 .to_unarchived::<CalendarEvent>()
                 .caused_by(trc::location!())?;
@@ -346,7 +364,7 @@ impl CalendarUpdateRequestHandler for Server {
 
             if let Some(keys) = &za_keys {
                 // Invitations spec 3.3: every rewrite carries the stored pairs.
-                let mut pairs = event_token_pairs(&event_, keys, account_id)
+                let mut pairs = event_pairs_in_domain(&event_, &contexts[0].domain)
                     .map_err(|err| seal_error(err, account_id, document_id))?;
                 // Spec 5.3-5.4: after every check of the request and
                 // immediately before the sealed commit, the items go out; the
@@ -372,42 +390,73 @@ impl CalendarUpdateRequestHandler for Server {
                     za_set_sequences(&mut new_event.data.event, &fan_out.sequences);
                     pairs = fan_out.pairs;
                 }
-                seal_event(&mut new_event, keys, account_id, pairs.as_ref())
+                seal_event_in_domain(&mut new_event, &contexts[0].domain, pairs.as_ref())
                     .map_err(|err| seal_error(err, account_id, document_id))?;
             }
 
-            // Prepare write batch
-            let mut batch = BatchBuilder::new();
+            // The same event/index/alarm intent is rebuilt once, without scheduling.
             let schedule_tag = new_event.schedule_tag;
-            let etag = new_event
-                .update(
-                    access_token.account_tenant_ids(),
-                    event,
-                    account_id,
-                    document_id,
-                    &mut batch,
-                )
-                .caused_by(trc::location!())?
-                .etag();
-            if prev_email_alarm != next_email_alarm {
-                if let Some(prev_alarm) = prev_email_alarm {
-                    prev_alarm.delete_task(&mut batch);
+            let timestamp = store::write::now() as i64;
+            let mut etag;
+            for attempt in 0..=1 {
+                let mut batch = BatchBuilder::new();
+                for context in &contexts {
+                    context.assert_in(&mut batch);
                 }
-                if let Some(next_alarm) = next_email_alarm {
-                    next_alarm.write_task(&mut batch);
+                etag = new_event
+                    .clone()
+                    .update_at(
+                        access_token.account_tenant_ids(),
+                        event_.to_unarchived::<CalendarEvent>()?,
+                        account_id,
+                        document_id,
+                        timestamp,
+                        &mut batch,
+                    )?
+                    .etag();
+                if prev_email_alarm != next_email_alarm {
+                    if let Some(prev_alarm) = &prev_email_alarm {
+                        prev_alarm.delete_task(&mut batch);
+                    }
+                    if let Some(next_alarm) = &next_email_alarm {
+                        next_alarm.write_task(&mut batch);
+                    }
+                }
+                if let Some(messages) = itip_messages.take() {
+                    messages.queue(&mut batch)?;
+                }
+                #[cfg(feature = "test_mode")]
+                common::za::test_hooks::update_commit_pause_point(account_id).await;
+                match self.commit_batch(batch).await {
+                    Ok(_) => {
+                        return Ok({
+                            self.notify_task_queue();
+                            HttpResponse::new(StatusCode::NO_CONTENT)
+                                .with_etag_opt(etag)
+                                .with_schedule_tag_opt(schedule_tag)
+                        });
+                    }
+                    Err(error) if error.is_assertion_failure() && attempt == 0 => {
+                        if let Some(fresh) = za_refresh_event(
+                            self,
+                            access_token,
+                            account_id,
+                            parent_id,
+                            Acl::ModifyItems,
+                            &contexts,
+                            &mut new_event,
+                        )
+                        .await?
+                        {
+                            contexts = fresh;
+                        } else {
+                            return Err(error.into());
+                        }
+                    }
+                    Err(error) => return Err(error.into()),
                 }
             }
-            if let Some(itip_messages) = itip_messages {
-                itip_messages
-                    .queue(&mut batch)
-                    .caused_by(trc::location!())?;
-            }
-            self.commit_batch(batch).await.caused_by(trc::location!())?;
-            self.notify_task_queue();
-
-            Ok(HttpResponse::new(StatusCode::NO_CONTENT)
-                .with_etag_opt(etag)
-                .with_schedule_tag_opt(schedule_tag))
+            unreachable!("bounded event retry always returns")
         } else if let Some((Some(parent), name)) = resources.map_parent(resource_name.as_ref()) {
             if !parent.is_container() {
                 return Err(DavError::Code(StatusCode::METHOD_NOT_ALLOWED));
@@ -480,6 +529,16 @@ impl CalendarUpdateRequestHandler for Server {
                 size: bytes.len() as u32,
                 ..Default::default()
             };
+
+            let mut contexts = za_write_contexts(
+                self,
+                access_token,
+                account_id,
+                &event,
+                parent.document_id(),
+                Acl::AddItems,
+            )
+            .await?;
 
             // Scheduling
             let mut itip_messages = None;
@@ -599,48 +658,98 @@ impl CalendarUpdateRequestHandler for Server {
                     za_set_sequences(&mut event.data.event, &fan_out.sequences);
                     pairs = fan_out.pairs;
                 }
-                seal_event(&mut event, keys, account_id, pairs.as_ref())
+                seal_event_in_domain(&mut event, &contexts[0].domain, pairs.as_ref())
                     .map_err(|err| seal_error(err, account_id, u32::MAX))?;
             }
 
-            // Prepare write batch
-            let mut batch = BatchBuilder::new();
-            // Spec 6.3 step 3: the insert is fenced on the lease, in the same
-            // transaction (ahead of the insert, so no commit point splits them).
-            if let Some((lease, _)) = &za_lease {
-                lease.lease().assert_in(&mut batch);
-            }
+            let timestamp = now() as i64;
             let schedule_tag = event.schedule_tag;
-            let etag = event
-                .insert(
-                    access_token.account_tenant_ids(),
-                    account_id,
-                    document_id,
-                    next_email_alarm,
-                    &mut batch,
-                )
-                .caused_by(trc::location!())?
-                .etag();
-            if let Some(itip_messages) = itip_messages {
-                itip_messages
-                    .queue(&mut batch)
-                    .caused_by(trc::location!())?;
-            }
-            if let Some((lease, uid)) = za_lease {
+            let mut build =
+                |event: &CalendarEvent,
+                 contexts: &[groupware::calendar::sharing::resolve::ZaCalendarContext]|
+                 -> trc::Result<(BatchBuilder, Option<String>)> {
+                    let mut batch = BatchBuilder::new();
+                    if let Some((lease, _)) = &za_lease {
+                        lease.lease().assert_in(&mut batch);
+                    }
+                    for context in contexts {
+                        context.assert_in(&mut batch);
+                    }
+                    let etag = event
+                        .clone()
+                        .insert_at(
+                            access_token.account_tenant_ids(),
+                            account_id,
+                            document_id,
+                            next_email_alarm.clone(),
+                            timestamp,
+                            &mut batch,
+                        )?
+                        .etag();
+                    if let Some(messages) = itip_messages.take() {
+                        messages.queue(&mut batch)?;
+                    }
+                    Ok((batch, etag))
+                };
+            let (batch, mut etag) = build(&event, &contexts)?;
+            if za_lease.is_some() {
                 #[cfg(feature = "test_mode")]
                 common::za::test_hooks::commit_pause_point(account_id).await;
-                za_commit_create(
-                    self,
-                    &resources,
-                    batch,
-                    lease,
-                    account_id,
-                    parent.document_id(),
-                    &uid,
-                )
-                .await?;
+                #[cfg(feature = "test_mode")]
+                if common::za::test_hooks::take_commit_fail(account_id) {
+                    za_lease.take().unwrap().0.release().await;
+                    return Err(trc::StoreEvent::UnexpectedError
+                        .into_err()
+                        .details("zero-access test hook: sender commit failure")
+                        .into());
+                }
+                match self.commit_batch(batch).await {
+                    Ok(_) => {
+                        za_lease.take().unwrap().0.release().await;
+                    }
+                    Err(error) if error.is_assertion_failure() => {
+                        if let Some(fresh) = za_refresh_event(
+                            self,
+                            access_token,
+                            account_id,
+                            parent.document_id(),
+                            Acl::AddItems,
+                            &contexts,
+                            &mut event,
+                        )
+                        .await?
+                        {
+                            contexts = fresh;
+                            let (batch, retry_etag) = build(&event, &contexts)?;
+                            etag = retry_etag;
+                            let (lease, uid) = za_lease.take().unwrap();
+                            za_commit_create(
+                                self,
+                                &resources,
+                                batch,
+                                lease,
+                                account_id,
+                                parent.document_id(),
+                                &uid,
+                            )
+                            .await?;
+                        } else {
+                            let (lease, uid) = za_lease.take().unwrap();
+                            return za_lost_create_fence(
+                                self,
+                                &resources,
+                                lease,
+                                account_id,
+                                parent.document_id(),
+                                &uid,
+                            )
+                            .await;
+                        }
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             } else {
-                self.commit_batch(batch).await.caused_by(trc::location!())?;
+                self.commit_batch(batch).await?;
             }
             self.notify_task_queue();
 
