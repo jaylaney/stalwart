@@ -1,6 +1,6 @@
 # Zero-access calendar: sharing between key accounts (release 4) design spec
 
-Date: 2026-10-22. Status: revision 10, draft for review. Scope: release 4
+Date: 2026-10-22. Status: revision 11, draft for review. Scope: release 4
 of the zero-access fork (jaylaney/stalwart); GitHub issue #24, milestone
 "Release 4: calendar sharing". Revision 2 answers the builder check and
 the adversarial review of revision 1: the shared bundle (3.3), the
@@ -43,7 +43,10 @@ the behaviours the writer's copy inherits from upstream are recorded (6.2),
 and a differential lifecycle test is the stopping rule (11.2). With it
 revision 9's re-review finding 1 is accepted as inherited (6.2's table, row
 1), not fixed, and its clarification is answered by parity (row 3);
-revisions 8 and 9's self-message builder is withdrawn.
+revisions 8 and 9's self-message builder is withdrawn. Revision 11 answers
+the lifecycle review of revision 10: the exception narrowed to RSVP and
+PARTSTAT (6.2) and the committed tree finalized when only the second run
+built (6.2).
 
 The terms key account, master key (MK), event wrapping key (EWK), data key
 (DEK), `X-ZA-KEY`, `X-ZA-SEALED`, `X-ZA-EXTRA`, wrap type, collection
@@ -1777,33 +1780,47 @@ fan-out in the grantee's session, on the owner's behalf:
        (`event_update.rs:30-32`), so the second run is placed before
        `update.rs:259` for an update and `:495` for a create. It snapshots
        the prior and the committed trees under the owner-only list
-       (`itip_snapshot`, `snapshot.rs:17`); on every ATTENDEE entry of
-       both snapshots whose address is the writer's and not the owner's it
-       sets the three routing-only fields `force_send = Some(Request)`,
-       `rsvp = None` and `is_server_scheduling = true` (public fields,
-       `scheduling/mod.rs:34-49`, `:92-105`; outside `Attendee`'s equality
-       and hash, `:277-301`; read by no payload, `organizer.rs:259-267`,
-       `:338-345`, `event_cancel.rs:61-67`); and it calls upstream's inner
-       builders, unchanged, from fork code in
+       (`itip_snapshot`, `snapshot.rs:17`); on every ATTENDEE entry of both
+       snapshots whose address is the writer's and not the owner's it sets
+       two routing-only fields, `force_send = Some(Request)` and
+       `rsvp = None` (public fields, `scheduling/mod.rs:34-49`, `:92-105`;
+       outside `Attendee`'s equality and hash, `:277-301`; read by no
+       payload, `organizer.rs:259-267`, `:338-345`,
+       `event_cancel.rs:61-67`), and leaves `is_server_scheduling` as the
+       line says (lifecycle review finding 1, revision 10; the exception
+       below); and it calls upstream's inner builders, unchanged, from fork
+       code in
        `crates/groupware/src/calendar/` (they are `pub(crate)`). An update
        calls `organizer_handle_update(old, new, old_itip, new_itip, &mut
-       scratch)` (`organizer.rs:22-28`), mirroring `itip_update`'s
-       organizer check, mismatch check and cancel fallback
-       (`event_update.rs:18-48`); a create calls
-       `organizer_request_full(ical, &itip, None, true)`
+       scratch)` (`organizer.rs:22-28`), mirroring `itip_update`'s organizer
+       check, mismatch check and cancel fallback (`event_update.rs:18-48`);
+       a create calls `organizer_request_full(ical, &itip, None, true)`
        (`organizer.rs:309-314`), mirroring `itip_create`'s checks
        (`event_create.rs:17-25`); a deletion calls the organizer branch of
        `itip_cancel` (`event_cancel.rs:34-81`), which has no seam today (it
        snapshots at `:28`), so upstream's function is split into a
        snapshot-taking `pub(crate)` function behind the existing entry
        point, with no behaviour change (the three-line split, not a fork
-       copy; 14 lists it). The scratch vector of increments is discarded:
-       the committed tree is incremented by the first run's finalize or by
-       the reconciliation below, never by the second run. The first run
-       ends `Ok` (the tree finalized), `NothingToSend` (the tree untouched,
-       neither stripped nor incremented, `organizer.rs:133-135`,
-       `:400-402`) or with another error (untouched). An error that
-       `failed_precondition()` maps
+       copy; 14 lists it). The first run ends `Ok` (the tree finalized),
+       `NothingToSend` (the tree untouched by it, neither stripped nor
+       incremented, `organizer.rs:133-135`, `:400-402`) or with another
+       error (untouched). When the first run returned `NothingToSend` and
+       the second run built, the committed tree is finalized exactly as the
+       first run's success would have finalized it (lifecycle review finding
+       2, revision 10): `itip_finalize` with the second run's increments for
+       an update (the scratch vector is kept for this case; both runs
+       compute the same increments, the SEQUENCE bullet) and with none for a
+       create (`itip_create` finalizes with `&[]`, `event_create.rs:23-25`),
+       so `SCHEDULE-FORCE-SEND` is stripped from every ORGANIZER and
+       ATTENDEE line of every scheduling component (`itip.rs:355-369`) and
+       the listed components are incremented (`:371-389`). Exactly one
+       increment results, since `NothingToSend` returns before the first
+       run's finalize. In every other case the scratch vector is discarded:
+       the first run's finalize has done both, or upstream leaves the tree
+       unfinalized and so does the fork. The cancel fallback
+       (`event_update.rs:34-46`, taken when the committed snapshot fails and
+       the prior organizer is local) stays unfinalized in both runs, as
+       upstream leaves it. An error that `failed_precondition()` maps
        (`crates/dav/src/calendar/mod.rs:298-318`) aborts the PUT with 412
        and discards both runs; the other errors behave as upstream's
        (traced, the tag bumped, the write proceeds). On the organizer side
@@ -1828,15 +1845,20 @@ fan-out in the grantee's session, on the owner's behalf:
        instances, `organizer.rs:33-131`, and `Attendee` equality ignores
        locality) and read the same tree before finalize, so the writer's
        SEQUENCE equals the other recipients'. The second run's kept
-       messages are appended to the first run's list, so one
+       messages are appended to the first run's list, and one
        `za_reconcile_sequences`
        (`crates/groupware/src/calendar/fanout.rs:233-235`;
-       `sequence.rs:161-198`) raises the stored tree (`za_set_sequences`,
-       `update.rs:372`, `:599`) as finalize would have when the first run
-       returned `NothingToSend`: a sole-attendee writer's DTSTART edit
-       sends itself n+1 and the stored tree becomes n+1; its SUMMARY edit
-       sends n and raises nothing, upstream's own rule
-       (`organizer.rs:41-53`). Deletions skip the reconciliation as today
+       `sequence.rs:161-198`) runs over the combined list
+       (`za_set_sequences`, `update.rs:372`, `:599`) for the reasons it
+       exists, the floor and the increments upstream's partial branch
+       loses. When only the second run built, the finalize above has
+       already applied the increment, so the reconciliation finds nothing
+       to raise (revision 10 said it stood in for finalize; lifecycle
+       review finding 2, revision 10, corrects that): a sole-attendee
+       writer's DTSTART edit sends itself n+1 and the finalized tree is
+       n+1; its SUMMARY edit sends n and increments nothing, upstream's
+       own rule (`organizer.rs:41-53`). Deletions skip the reconciliation
+       as today
        (`fanout.rs:230-231`). The floor (`sequence.rs:107-127`, applied at
        `update.rs:236-238` before either run) raises the incoming tree
        only, so both runs see the same tree. A CANCEL's SEQUENCE is
@@ -1876,25 +1898,41 @@ fan-out in the grantee's session, on the owner's behalf:
        `SCHEDULE-STATUS` (`event_cancel.rs:147-179`), carries the same line
        under both paths.
 
-     **The one exception: no per-attendee filter suppresses a message to
-     the writer** (author's call of revision 8, kept). Under the owner-only
-     list the writer is not local, and only three things still drop it:
-     `is_server_scheduling` (false for `SCHEDULE-AGENT=CLIENT` or `NONE`,
-     `snapshot.rs:152-153`), `rsvp == Some(false)` (`mod.rs:214`, `:224`)
-     and the PARTSTAT clauses: `send_update_messages` drops DECLINED, and
-     `send_invite_messages`, which runs on a create and on a new override
-     (`organizer.rs:97-103`, `:368`) and in `itip_create`, drops anything
-     but NEEDS-ACTION. The three routing fields lift them all, so a
-     decline or a status set through the shared calendar still reaches the
-     writer's own copy, a writer creating the event with its own line
-     ACCEPTED included. It is the only designed divergence from parity.
-     The override is made on the snapshots, not in the trees: rewriting
-     the writer's lines in cloned trees would change the payloads
+     **The one exception: RSVP and PARTSTAT never suppress a message to the
+     writer** (author's call of revision 8, kept; narrowed by lifecycle
+     review finding 1, revision 10). Under the owner-only list the writer is
+     not local, and three things still drop it: `is_server_scheduling`
+     (false for `SCHEDULE-AGENT=CLIENT` or `NONE`, `snapshot.rs:152-153`),
+     `rsvp == Some(false)` (`mod.rs:214`, `:224`) and the PARTSTAT clauses:
+     `send_update_messages` drops DECLINED, and `send_invite_messages`,
+     which runs on a create and on a new override (`organizer.rs:97-103`,
+     `:368`) and in `itip_create`, drops anything but NEEDS-ACTION. The two
+     routing fields lift the last two, so `RSVP=FALSE` and any PARTSTAT (a
+     DECLINED line on an update; an ACCEPTED or DECLINED line on a create or
+     a new override) still reach the writer's own copy, and the writer's
+     drain accepts their REQUESTs and CANCELs: its incoming check counts a
+     local line by locality and scheduling agent only (`snapshot.rs:217`,
+     `has_local_emails |= is_local && (force || is_server_scheduling)`). The
+     scheduling agent is not overridden. A line with `SCHEDULE-AGENT=CLIENT`
+     or `NONE` declares that the server does not schedule for that attendee;
+     upstream sends it nothing, and the drain refuses for every account a
+     message whose only local line is not server-scheduled
+     (`snapshot.rs:217`, `:353-361`; `drain.rs:584`). A forced REQUEST would
+     import a copy (export strips the parameter, `itip.rs:252-256`) whose
+     later CANCEL, which clones the line with the parameter
+     (`event_cancel.rs:147-179`), the writer's drain would refuse, and
+     carrying an exception through that check would weaken the incoming
+     validation for one path. Such a writer line therefore gets no
+     self-message, as the owner's own write gives it none: parity, with no
+     copy to maintain and no refusal; revision 11 withdraws revision 10's
+     inclusion of `SCHEDULE-AGENT=CLIENT` and `NONE` in the exception. The
+     exception, so narrowed, is the only designed divergence from parity.
+     The override is made on the snapshots, not in the trees: rewriting the
+     writer's lines in cloned trees would change the payloads
      (`itip_export_component` keeps every parameter but `SCHEDULE-STATUS`,
      `SCHEDULE-AGENT` and `SCHEDULE-FORCE-SEND`, `itip.rs:254-272`, RSVP
      included, and a CANCEL clones lines verbatim), and `force_send` alone
-     leaves `rsvp` and `is_server_scheduling` blocking (`mod.rs:213-214`,
-     `:223-224`).
+     leaves `rsvp` blocking (`mod.rs:214`, `:224`).
 
      **One self item per address** (re-review finding 4, revision 6).
      Tokens belong to addresses, not accounts, and a pending item carries
@@ -2606,6 +2644,10 @@ accounts:
     through the shared calendar an event alice organizes whose only
     attendee is bob, then edits its SUMMARY and deletes it; his own copy is
     created, updated and cancelled, each after his drain and a refresh.
+    With `SCHEDULE-FORCE-SEND=REQUEST` on bob's line (lifecycle review
+    finding 2, revision 10), alice's stored event no longer carries the
+    parameter after the create, and the deletion's CANCEL merged into
+    bob's copy carries none.
     Revision 9's alias-payload and CANCEL-SEQUENCE cases are replaced by
     case 25's differential form (re-review finding 1, revision 9).
 11. The gate: a token with its own keys but no grant, an impersonation
@@ -2742,11 +2784,22 @@ Concurrency, in `sharing_races.rs`:
       from the master while `bob-work@` attends the override, `bob@`
       replaced by `bob-work@` on the master), in the same differential
       form, asserting equality only.
+    - A fixture of its own runs a line of bob's with
+      `SCHEDULE-AGENT=CLIENT` and one with `NONE` (lifecycle review finding
+      1, revision 10), each through create, drain, DELETE, drain: nothing
+      is delivered in either run and bob holds no copy; equality is
+      asserted.
+    - A sole-attendee fixture (lifecycle review finding 2, revision 10),
+      without carol, so that the first run returns `NothingToSend` (the
+      main fixture's third attendee makes the first run succeed and hides
+      this path): bob's line carries `SCHEDULE-FORCE-SEND=REQUEST`, and
+      the create, drain, DELETE and drain steps compare every ATTENDEE
+      parameter of bob's copy.
     - A separate run asserts the delta of 6.2's one exception: bob's line
-      DECLINED, `RSVP=FALSE`, `SCHEDULE-AGENT=CLIENT` and `NONE`, and a
-      line not NEEDS-ACTION on a create and on a new override: run B
-      delivers and run A does not, and bob's copy in run B shows the
-      change.
+      DECLINED, `RSVP=FALSE`, and a line not NEEDS-ACTION on a create and
+      on a new override: run B delivers and run A does not, and bob's copy
+      in run B shows the change (revision 11 withdraws `CLIENT` and `NONE`
+      from this run).
     - Harness: `DrainOn` (`tests/src/za/drain.rs:51-66`; the suite skips
       drains by default, `tests/src/za/mod.rs:121-124`); the fan-out is
       synchronous inside the PUT and the DELETE (`update.rs:354-374`,
@@ -2894,9 +2947,14 @@ side, which builds a delegate invitation the fan-out never sends
 (`attendee.rs:256-271`, `fanout.rs:902-911`; 9, the delegation through the
 shared copy, and planning records it as equivalent if nothing of it is
 observable); the differential test's SEQUENCE normalized, which lets the n+2
-mutation through (25); a new grantee given only the newest generation (7); a
-grantee's dead property written into the owner's personal bundle (2, with
-the unit test of 11.1); a plaintext event skipped by the conversion (3).
+mutation through (25); the scheduling agent overridden (25, the `CLIENT` and
+`NONE` fixture: a `CLIENT` line gets a REQUEST in run B and no copy in run
+A, so the create step fails); the reconciliation without the finalize (25,
+the sole-attendee fixture, and 10, sole-attendee create: the stored line
+keeps `SCHEDULE-FORCE-SEND`, so the deletion's CANCEL differs between the
+runs); a new grantee given only the newest generation (7); a grantee's dead
+property written into the owner's personal bundle (2, with the unit test of
+11.1); a plaintext event skipped by the conversion (3).
 
 ## 12. Invariants for implementers
 
@@ -2969,8 +3027,9 @@ adds:
     and gives the writer's own copy exactly the messages upstream's
     organizer builders would address to the writer's addresses had the
     owner made the same write in her own session, with the writer an
-    ordinary attendee, the per-attendee filters lifted for the writer
-    alone and one self item per address as its token carrier (6.2); the
+    ordinary attendee, the RSVP and PARTSTAT filters lifted for the
+    writer alone and one self item per address as its token carrier
+    (6.2); the
     UID lease and the SEQUENCE floor of a shared calendar's event are
     keyed by the calendar's account.
 39. Sharing never yields another account's account keys: a session holds
@@ -3090,13 +3149,17 @@ stands unless the code says otherwise.
    which replaces revisions 8 and 9's self-message builder. Planning
    carries out: the second run in fork code in
    `crates/groupware/src/calendar/`, calling upstream's `pub(crate)`
-   builders on snapshots taken under the owner's addresses, with the three
-   routing fields set on the writer's entries; the split of `itip_cancel`
+   builders on snapshots taken under the owner's addresses, with two
+   routing fields (`force_send`, `rsvp`) set on the writer's entries and
+   `is_server_scheduling` left as the line says (revision 11); the split
+   of `itip_cancel`
    into a snapshot-taking `pub(crate)` function behind the existing entry
    point, with no behaviour change; the owner's addresses fetched at the
    three sites (the update and the create in `update.rs`, the DELETE loop
-   in `delete.rs`); the "either run built" rule at the fan-out's call and
-   at the schedule tag; and the normalizing comparison helper of 11.2's
+   in `delete.rs`); the "either run built" rule at the fan-out's call, at
+   the schedule tag and, when only the second run built, at the committed
+   tree's finalize (revision 11); and the normalizing comparison helper of
+   11.2's
    case 25, modelled on upstream's private `normalize_ical`
    (`tests/src/webdav/cal_itip.rs:420-451`), as new test code. Case 25's
    stopping criterion (11.2) decides whether a later finding is a defect
@@ -3266,11 +3329,14 @@ Merge hotspots this release adds (fork insertions in upstream files):
   message. The second run (revision 10) depends on
   `organizer_handle_update`, `organizer_request_full` and the split
   `itip_cancel` staying reachable and pure apart from their increments
-  vector, on the three routing fields (`force_send`, `rsvp`,
-  `is_server_scheduling`) staying outside `Attendee`'s equality and hash
-  and outside every payload, on `itip_finalize` running only on `Ok`, and
-  on `build_cancel_component`'s recipient filter; an upstream change to
-  any of them needs a re-read of 6.2's mechanism.
+  vector, on the two routing fields (`force_send`, `rsvp`) staying
+  outside `Attendee`'s equality and hash and outside every payload, on
+  the incoming snapshot counting a local line by locality and scheduling
+  agent only (`snapshot.rs:217`), on `itip_finalize`'s two operations
+  (stripping `SCHEDULE-FORCE-SEND`, then the increments) and on its
+  running only on `Ok`, with `NothingToSend` returning before it, and on
+  `build_cancel_component`'s recipient filter; an upstream change to any
+  of them needs a re-read of 6.2's mechanism.
 - `crates/groupware/src/calendar/seal/{event,collection,tree}.rs` (fork)
   and `crates/groupware/src/calendar/{drain,storage}.rs` (the key domain).
 - `crates/http/src/api/mod.rs` and `vault.rs` (routing), the new
