@@ -369,3 +369,33 @@ the scanner's new rules land. (Lens B finding 10.)
   the fresh read and the own-id check precede any hit, and a reconversion's new domain id
   misses by key. The identity split: a group address shared with the owner gets no self
   item (row 4); the carve-out admits only second-run items once keyed by provenance (D2).
+
+## Revision 13 independent re-review, 2026-10-23
+
+Reviewed the current uncommitted revision 13 spec and plan in `release3-mail-spec`, branch
+`release4-sharing-spec-r1`, against source at `5fa7ebd4`. Three bounded read-only reviewers
+covered calendar transactions (Tasks 1–7), delegated scheduling (Tasks 8–10), and interfaces,
+fixtures and qualification (Tasks 11–12). The first two used `gpt-6.1-sol` with `xhigh`
+reasoning; the third used `gpt-6-sol` with `high` reasoning. The primary checked the retained
+finding against source. No edits, builds, tests or runtime probes ran during that review.
+
+**R19. [P2] Preserve quiet lookup through catch-all resolution.** Task 9 (plan 822–825)
+uses `za_account_id_from_email` as a quiet dependency, but its catch-all branch calls the
+ordinary `rcpt_id_from_email(catch_all)` (`crates/common/src/cache/principals.rs:786–790`).
+That helper calls non-quiet `domain()` and `rcpt_id_from_parts()` (`:360–364`), which can emit
+domain-name and local-part cache events (`:254–276`, `:347–352`, and `domain_inner`). The
+planned fixed recipient-lookup failure trace does not suppress these successful lookup events.
+
+Configure a local domain's catch-all to resolve to Bob, then make a delegated write with an
+unlisted attendee in that domain. Computing R follows the fallback and can trace the catch-all
+address's components, even when RSVP/PARTSTAT filters suppress delivery. The delegated sender
+check uses the same dependency. This conflicts with plan 66–67 and spec §10 (2482–2486), which
+permit ids, levels and counts but no addresses or content.
+
+Correction: give Task 9 ownership of preserving `quiet` through catch-all resolution in
+`principals.rs`, while keeping ordinary callers' behavior. Add captured cache-hit and
+cache-miss trace fixtures for both R classification and delegated sender verification, using
+catch-all address components as canaries.
+
+Result: one P2 finding; no other actionable residual finding. The finding is a source-backed
+plan dependency gap, not a claim that the future source fix or regression tests have run.
