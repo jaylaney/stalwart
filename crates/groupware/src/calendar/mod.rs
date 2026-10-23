@@ -14,6 +14,7 @@ pub mod itip;
 pub mod pinning;
 pub mod seal;
 pub mod sequence;
+pub mod sharing;
 pub mod storage;
 
 use calcard::icalendar::{
