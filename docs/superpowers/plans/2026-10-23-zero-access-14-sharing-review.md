@@ -1095,8 +1095,9 @@ S-N5 needs a factual qualification: the R19 plan edits did receive a focused ind
 `gpt-6-sol` high review in this chat before the later Opus review; that reviewer reported
 no findings. That narrow result does not dispose of the broader S1–S20 findings. Commit
 `5fa7ebd4` contains one review pass by two reviewers, not two separate review passes. The
-revision 13 spec and later historical review sections remain pre-existing uncommitted work;
-this pass does not stage or commit them.
+revision 13 spec and later historical review sections were pre-existing uncommitted work
+preserved by that pass. The corrected documents were subsequently committed together at
+`09ba2858`.
 
 The plan corrections were written by `gpt-6.1-sol` with `high` reasoning and the spec
 corrections by `gpt-6-sol` with `high` reasoning, in separate owned files. The primary
@@ -1111,8 +1112,8 @@ findings; this is source/document evidence only.
 Documentation checks cover whitespace, Markdown fence balance, final newlines, intended
 file scope, preservation of the historical review text and the unrelated mail review, and
 the unchanged HEAD/index. Product implementation, builds, tests, runtime probes, mutation
-execution and native acceptance remain unperformed. The three corrected documents remain
-uncommitted.
+execution and native acceptance remained unperformed. The three corrected documents were
+uncommitted at the end of that pass, then committed together at `09ba2858`.
 
 ## Recheck of revision 14, 2026-10-23
 
@@ -1261,3 +1262,43 @@ at 932-941 and 1287; spec 2018-2020, 2619-2625, 3213-3214, 3625-3636. S20 (spec 
 1388-1391). `HookParked` takes the `Pause` shape (`tests/src/utils/za.rs:836-845`);
 `DrainOn` (`tests/src/za/drain.rs:54`), `Traced` (`tests/src/za/mail/mod.rs:327`),
 `plant_inbox_item` (`:971`) and `schedule_statuses` (`:813`) exist.
+
+## Final fixture and assertion-seam correction disposition, 2026-10-23
+
+This pass addresses the final asks in the recheck committed at `9ae3715d`. It keeps spec
+revision 14 and the accepted architecture, and clarifies how the future tests reach and
+observe each required behavior. The table below supersedes the earlier correction table
+where the recheck identified an incomplete fixture or observable. No product implementation
+or runtime acceptance is claimed.
+
+| Item | Documentation correction |
+|---|---|
+| V1 | Task 6 and spec 11.2 name separate assertion-failure injections for initialization, forward rewrap, mark-reverting, rollback rewrap and final restore. Each is scoped by owner/calendar, defaults off and supports a configured remaining count. Inject `AssertValueFailed` after the asserted reads and batch assembly, at the corresponding commit boundary, through the normal typed-conflict handling. The existing cut hook remains a distinct non-assertion interruption. |
+| V2 | `MOVE_OVERWRITE_OBSERVATION` records the actual outer `Option<ZaDeleteMessage>::is_some()`, not its inner message. A future tagged overwrite with scheduling incorrectly enabled returns an outer result even when Bob's account info cannot build the inner CANCEL. The seam lives in `common::za::test_hooks`; queue and pending counts remain additional checks. |
+| V3 | Task 2 owns a named stored-event classifier distinguishing strict no-carrier legacy input from structurally sealed input and malformed/partial carriers. Conversion, MOVE and domain-aware owner reads use it before opening stored archives. It does not validate new client PUT plaintext or restored plaintext after unsealing, so client-supplied X-ZA properties still round-trip inside sealed bundles. Normal opening retains all cryptographic checks. |
+| V4 | Task 5's test step owns the legacy MOVE and overwrite-seam regressions. It names a staged shared-form destination available before the share endpoints, limits ciphertext equality to already sealed input, and checks the full-seal path's sole parent, envelope, raw-secret absence, reads and no scheduling. |
+| V5 | Case 25's exception fixture explicitly includes a failed directly owned alias: the delegated run attempts `5.1` without an item, while the owner run remains suppressed. Both mutation ledgers add the corresponding successful-lookup-only alias-classification mutation. |
+| V6 | Task 9's direct fixtures and Task 10's HTTP activation separately own shared-group ATTENDEE and ORGANIZER cases, including omitted SENT-BY and the organizer's unchanged drain rejection. |
+| V7 | Task 7 owns the HTTP forms of cases 3, 23 and 24, including grant counts, conflicts and resume. Task 10 owns the grantee reads and activation; Task 6 remains the direct converter-contract test stage. |
+| V-N1 | S20 is labelled an accepted fork limitation, since the owner run does not produce the same inbox outcome. The stopping criterion explicitly permits the documented limits. |
+| V-N2 | A cold catch-all fixture invalidates both source and target domain ids, the account cache and the negative caches. |
+| V-N3 | Spec 3.5 includes rollback event chunks among conflicting writes and dispatches interrupted requests by their journal state, including reverting. |
+| V-N4 | The previous correction's commit status above now records the subsequent `09ba2858` commit. This new documentation pass was uncommitted at the end of the correction review. |
+| V-N5 | The revision 14 header includes section 12 among the corrected contracts. |
+| V-N6 | An existing-event PUT taking the create branch sets an absent schedule tag to 1 when only the second run builds. An existing-tag update keeps its success-arm bump when the first run succeeds, or its single error-arm bump when the first returns `NothingToSend` and only the second builds. |
+| V-N7 | Task 5's file ownership includes `common/propfind.rs` for replacing the request memo after boundary repair. |
+
+The plan corrections were written by `gpt-6.1-sol` with `high` reasoning and the spec
+corrections by `gpt-6-sol` with `high` reasoning, in separate owned files. A fresh
+independent `gpt-6.1-sol` reviewer with `xhigh` reasoning inspected the combined working-tree
+delta over `9ae3715d` and relevant source/harness interfaces. It identified one narrow
+schedule-tag wording issue: the successful first run bumps in `update.rs:281–287`, while
+the first-`NothingToSend`/second-built case retains `:323–325`'s existing error-arm bump.
+The primary corrected spec 6.2, and the reviewer rechecked it and reported no remaining
+actionable findings in the focused scope.
+
+Documentation verification covers whitespace, balanced Markdown fences, final newlines,
+the 57-entry mutation ledger, intended file scope, the unchanged HEAD/index, and preservation
+of the unrelated mail review. This is source/document evidence only: no product changes,
+builds, tests, runtime probes, mutation execution or native checks were performed. The three
+corrected documents were uncommitted at the end of the correction review.

@@ -74,9 +74,10 @@ not start implementation or authorize a push. Preserve the unrelated untracked m
   `override_aliases` (A), the directly owned listed writer aliases within L; routing uses
   the broader recipient set R (Shared contracts). Never change
   `is_server_scheduling`, payload parameters, or receiver validation.
-- Accepted inherited behaviors in §6.2 remain accepted. A difference between the owner and
-  delegated lifecycle runs beyond the RSVP/PARTSTAT exception and those recorded limitations
-  is a defect.
+- The accepted limits in §6.2 include inherited behavior and the documented fork limitation
+  for attendee-side owner-subaddress REPLY delivery. The lifecycle oracle permits only those
+  listed limits and the RSVP/PARTSTAT exception; any other owner/delegated difference is
+  a defect.
 - Ordinary accounts, JMAP calendar refusals, CalDAV ACL refusal, scheduling inbox ownership,
   mail-sharing refusal and cross-account COPY/MOVE refusal retain their current behavior.
 - Every Cargo command starts with `export PATH="/opt/homebrew/opt/rustup/bin:$PATH"`.
@@ -98,8 +99,8 @@ spec's numbered cases:
    from a post-commit change id (Tasks 5, 7 and 10).
 4. A MOVE overwrites a scheduled destination in another domain: authorize/fence both
    calendars, pass domain plus writer keys to `delete_za` with `send_itip=false`, and observe
-   its returned message at the actual overwrite call. Rewrap sealed input only; full-seal
-   valid no-carrier legacy plaintext under the destination domain (Tasks 4–5).
+   its returned outer delete-result Option at the actual overwrite call. Rewrap sealed
+   input only; full-seal valid no-carrier plaintext under the destination domain (Tasks 4–5).
 5. A multi-calendar response contains an inaccessible calendar and a corrupt accessible
    one: omit the former, retain the latter's item error, and serve the healthy items
    without leaking foreign paths (Tasks 3 and 10).
@@ -189,7 +190,7 @@ follow symbols if implementation moves them.
 | `crates/common/src/cache/principals.rs` | Quiet address resolution through the catch-all fallback | 9 |
 | `crates/groupware/src/scheduling/event_cancel.rs` | Snapshot-taking cancel seam | 8 |
 | `crates/groupware/src/calendar/fanout.rs`; `crates/dav/src/calendar/{update,delete}.rs` | Event-owner identity and message integration | 9 |
-| `crates/dav/src/common/propfind.rs` | Request read memo, discovery and safe sync | 3, 10 |
+| `crates/dav/src/common/propfind.rs` | Request read memo, boundary-repair memo replacement, discovery and safe sync | 3, 5, 10 |
 | `crates/dav/src/{common/uri,principal/propfind}.rs` | Foreign admission and discovery | 10 |
 | `crates/common/src/za/test_hooks.rs` | Existing-feature-only pause/failure/overwrite-observation helpers | 4–7, 9 |
 | `tests/src/za/{sharing,sharing_races,mod,leak}.rs`; `tests/src/utils/za.rs` | Behavioral/race harness, cleanup and leak rules | All |
@@ -317,7 +318,7 @@ integration tasks. Do not pretend `sharing::test` is a Cargo-selectable test.
 Foreign DAV activation is deliberately last. Before Task 10, owner HTTP tests and direct
 resolver/codec/transaction/fan-out tests prove the new internals using disposable store
 fixtures; a grantee HTTP request still gets the existing gate's 403. Do not park such a
-request at a downstream hook it cannot reach. Tasks 4, 5, 7 and 9 prepare the corresponding
+request at a downstream hook it cannot reach. Tasks 4, 5, 6, 7 and 9 prepare the corresponding
 grantee HTTP cases for activation in Task 10; keep their test definitions with that task's
 activation commit rather than adding permanently ignored tests or weakening the gate.
 Task 10 must run every specified HTTP variant after access opens.
@@ -399,6 +400,20 @@ pairs: Option<&TokenPairs>) -> Result<(), SealError>`,
 -> Result<Archive<AlignedBytes>, SealError>` and
 `rewrap_event(event: &mut CalendarEvent, from: &ZaKeyDomain, to: &ZaKeyDomain)
 -> Result<(), SealError>`.
+In `seal/event.rs`, define and export through `seal/mod.rs`
+`ZaEventStorageKind::{LegacyPlaintext, Sealed}` and
+`classify_event_storage(event: &CalendarEvent) -> Result<ZaEventStorageKind, SealError>`.
+`LegacyPlaintext` requires zero recognized `X-ZA-KEY`, `X-ZA-SEALED` or `X-ZA-EXTRA`
+carriers anywhere in any component. Otherwise validate the complete sealed carrier placement
+and format; partial, stray, misplaced or malformed carriers are errors. Reuse existing
+structural helpers, not only the root-last-key predicate. `Sealed` is structural classification,
+not cryptographic proof: the normal envelope/AEAD opening must still succeed. Its input is
+only a stored/deserialized archive before opening, for legacy-versus-sealed routing. Never
+apply this as plaintext validation to a new client PUT tree or after unsealing: client
+`X-ZA-*` properties legitimately round-trip inside encrypted bundles (`tree.rs:590–607`).
+Keep `seal_event`'s current client-property round-trip behavior. Conversion
+phase 2, cross-domain MOVE and domain-aware owner reads consume this classifier;
+`archived_event_is_sealed` may remain an indexing hint, never the authority for these paths.
 For collections expose `calendar_view_in_domain(stored: &Archive<AlignedBytes>, domain: &ZaKeyDomain,
 personal_id: u32) -> Result<Archive<AlignedBytes>, SealError>`, and
 `seal_calendar_changes(stored: &Calendar, edited: &Calendar, domain: &ZaKeyDomain,
@@ -407,7 +422,13 @@ personal_id: u32) -> Result<Calendar, SealError>`. These retain unopened parts f
 - [ ] **1. Add failing unit tests** `rewrap_changes_only_the_envelope`,
   `shared_collection_uses_two_three_and_five_part_forms`,
   `grantee_view_never_opens_foreign_personal_material`,
-  `shared_property_write_preserves_owner_parts` and `plaintext_converts_under_ck`.
+  `shared_property_write_preserves_owner_parts`, `plaintext_converts_under_ck` and
+  `event_storage_classifier_rejects_partial_carriers`. Classifier fixtures cover no carriers,
+  valid sealed input, stray root/nested carriers, misplaced keys, partial sets and malformed
+  envelope format; structurally valid but unauthentic ciphertext still fails normal opening.
+  Add `client_x_za_properties_round_trip_in_bundles`: seal a new client tree containing
+  client `X-ZA-*` properties, classify the stored sealed archive before opening, and verify
+  normal unseal restores those properties without applying the classifier to the opened tree.
   Compare ciphertext carriers directly, not just decrypted equivalence:
   ~~~rust
   assert_eq!(before_encrypted_content, after_encrypted_content);
@@ -420,7 +441,9 @@ personal_id: u32) -> Result<Calendar, SealError>`. These retain unopened parts f
 - [ ] **2. Run groupware tests and observe the unsupported-format failures.**
 - [ ] **3. Implement envelope selection and selective collection views/writes.** `0x03`
   is exactly 82 bytes (policy/type + calendar + generation + 72-byte wrap). Get domain id
-  from the fresh ring. Owner mixed-state reads accept legacy/plaintext during conversion;
+  from the fresh ring. On stored/deserialized input before opening, use
+  `classify_event_storage` to choose legacy/full-seal versus sealed/open/rewrap paths.
+  Owner mixed-state reads accept valid no-carrier plaintext during conversion;
   a grantee encountering an account-wrapped event fails that item. New bundle writes draw
   fresh DEKs. Read only the requesting principal's personal bundle and the shared bundle
   for a DAV view; other entries remain sealed. Preserve tree order and all token bytes.
@@ -554,7 +577,7 @@ event's domain before unsealing.
 
 **Files:** Create `crates/groupware/src/calendar/sharing/boundary.rs` ; modify
 `crates/dav/src/calendar/copy_move.rs` ,
-`crates/groupware/src/calendar/sharing/resolve.rs`, `crates/dav/src/common/za.rs`,
+`crates/groupware/src/calendar/sharing/resolve.rs`, `crates/dav/src/common/{za,propfind}.rs`,
 `crates/groupware/src/calendar/sharing/mod.rs`, `crates/common/src/za/test_hooks.rs`
 and `tests/src/za/{sharing,sharing_races}.rs`.
 
@@ -571,6 +594,14 @@ preserving every key. Only an owner with its EWK may repair. On a lost repair as
 return the previously read pending archive and let the read proceed safely; do not retry
 indefinitely or claim the boundary is complete. Other store/seal failures retain their normal
 error handling. `shares` listing does not call repair and writes nothing beyond its self-check.
+Define test-only `MOVE_OVERWRITE_OBSERVATION` in `common::za::test_hooks`, with
+`record_move_overwrite_message(owner_id: u32, event_id: u32, has_delete_result: bool)` and
+`take_move_overwrite_message(owner_id: u32, event_id: u32) -> Option<bool>`. The boolean records the
+actual returned outer `Option<ZaDeleteMessage>::is_some()`, never its inner `message` field;
+Bob's CANCEL builder may return `Some(ZaDeleteMessage { message: None })`. Observe immediately
+after the actual overwrite `delete_za` invocation returns successfully, before its result is
+discarded. Normal scheduling-off yields `Some(false)`; the true-flag mutation on a future
+tagged event yields `Some(true)` even when the inner message is absent.
 
 - [ ] **1. Add failing tests** for case 12, case 24's post-precheck link and
   `boundary_completion_cannot_clear_a_newer_pending_write`. Cover event rename, collection
@@ -578,10 +609,27 @@ error handling. `shares` listing does not call repair and writes nothing beyond 
   ~~~rust
   assert_eq!(forbidden_copy_status, 403);
   assert_eq!(moved_parent_ids, vec![destination_id]);
-  assert_eq!(moved_encrypted_payload, original_encrypted_payload);
+  assert_eq!(moved_sealed_input_payload, original_sealed_input_payload);
   assert!(completed_boundary >= committed_rename_change_id);
   assert_eq!(repaired_archive.version, subsequently_read_archive.version);
   ~~~
+  Payload equality applies only to already sealed rewrap input, never the full-seal path.
+  Define `stage_shared_calendar` in `sharing.rs`: use Task 1 ring assembly, Task 2 codecs and
+  direct store fixtures to install a valid converted shared-form owner calendar before
+  Tasks 6–7 exist, following Task 4's staged/rotated-fixture pattern.
+  Add the owner HTTP R20 regression: `plant_event` puts valid no-carrier legacy plaintext in
+  an unshared source; MOVE into that already converted destination. Assert sole destination
+  parent, `0x03` envelope, raw secret absence, successful owner destination read and no new
+  queue/pending scheduling items. Test malformed carrier refusal through Task 2's classifier.
+  Task 10 activates the grantee HTTP variant and its destination read.
+  Add scheduled overwrite fixtures for owner and ordinary control, with Bob's HTTP variant
+  activated in Task 10. At the actual overwrite call, `take_move_overwrite_message` must be
+  `Some(false)` normally and `Some(true)` under the temporary false-to-true mutation, including
+  Bob's fixture when the returned delete result has no inner CANCEL. Restore/reset the seam.
+  As additional checks, hold `TASK_CONSUMER_PAUSE` via `hold_task_consumer`/`ConsumerHeld`;
+  compare `itip_tasks_for`, `pending_ids` and `inbox_ids` for owner and recipient before/after
+  MOVE, and retain the overwritten event's active recipient copies (`fanout.rs:948–1001`).
+  Queue/pending counts alone do not detect a discarded return value.
 - [ ] **2. Run za suite and observe missing parent/domain/boundary protection.**
 - [ ] **3. Implement COPY/MOVE fences and restrictions.** Read/assert source, destination
   and other existing parents before link changes, including unshared COPY racing conversion.
@@ -592,26 +640,13 @@ error handling. `shares` listing does not call repair and writes nothing beyond 
   rename keeps ciphertext. Valid no-carrier legacy plaintext moved across domains is fully
   sealed with a fresh DEK under the destination domain: newest CK generation when shared,
   or EWK when unshared or reverting.
-  Refuse malformed partial carriers. Both calendar/event fences, no scheduling and the sole
-  parent rule apply to either path. Add an owner HTTP regression in `sharing.rs`: plant a
-  legacy plaintext source with `plant_event`, MOVE into an already converted shared
-  destination, assert raw plaintext absence and `0x03`, and read the destination as owner.
-  Prepare its grantee HTTP counterpart for Task 10 activation.
+  Use Task 2's `classify_event_storage`; refuse malformed/partial carriers. Both calendar/
+  event fences, no scheduling and the sole parent rule apply to either storage kind.
   At the actual key-account overwrite invocation, use Task 4's domain-aware `delete_za`
-  with writer keys and `send_itip=false`; the returned message is otherwise discarded by
-  the caller. Add test-only `MOVE_OVERWRITE_OBSERVATION` with
-  `record_move_overwrite_message(owner_id, event_id, has_inner_message)` immediately after
-  that invocation returns, and `take_move_overwrite_message(owner_id, event_id)
-  -> Option<bool>`: a genuinely scheduled future fixture must observe `Some(false)`.
-  A temporary false-to-true mutation must observe `Some(true)`, proving the seam ran and
-  killing the mutation even when no task is queued. Restore/reset the observation fixture.
-  In-account MOVE unlinks by removing a name (`copy_move.rs:678`) and performs no source
-  DELETE. Neither schedules. Cross-account source deletion stays unreachable for key accounts.
-  Additional case 12 checks compare owner and ordinary-account no-CANCEL behavior, no new
-  queued/pending items and the overwritten event's active recipient copies. Hold
-  `TASK_CONSUMER_PAUSE` via `hold_task_consumer`/`ConsumerHeld`; compare `itip_tasks_for`,
-  `pending_ids` and `inbox_ids` for both owner and recipient before/after MOVE, following
-  `fanout.rs:948–1001`. Counts alone do not prove the overwrite flag stayed false.
+  with writer keys and `send_itip=false`; record the returned outer Option at the named
+  observation seam before the caller discards it. In-account MOVE unlinks by removing a
+  name (`copy_move.rs:678`) and performs no source DELETE. Neither schedules. Cross-account
+  source deletion stays unreachable for key accounts. Satisfy the explicit step 1 fixtures.
 - [ ] **4. Implement two-step shared rename.** Step 1 writes slug and pending flag in owner
   and every grant header with the calendar assertion; reseal owner payload AAD. Step 2
   takes `AssignedIds::last_change_id(owner)`, verifies read-back change-id identity and
@@ -649,6 +684,28 @@ which assertion failed.
 No groupware code calls HTTP's `za_reread_verified`. Each invocation reports only counts it
 committed; HTTP accumulates them once and keeps the conversion-loss budget across resumes.
 
+Add deterministic test-mode assertion injections in `common::za::test_hooks` with
+`ShareAssertFailure { owner_id: u32, calendar_id: u32, remaining: u32 }`. Each setter takes
+`Option<ShareAssertFailure>`; each taker takes `(owner_id: u32, calendar_id: u32) -> bool`.
+Unset or zero is off. Consume/decrement once per matching write, without consuming another
+owner/calendar's configuration. Tests use an RAII guard to reset every slot on exit.
+
+| Static / setter / taker | Matching write and assertions assembled before injection |
+|---|---|
+| `SHARE_INIT_ASSERT_FAIL` / `set_share_init_assert_fail` / `take_share_init_assert_fail` | Phase 1: original unshared calendar archive plus guards |
+| `SHARE_REWRAP_ASSERT_FAIL` / `set_share_rewrap_assert_fail` / `take_share_rewrap_assert_fail` | Forward rewrap chunk: current ring/calendar and event archives plus guards |
+| `SHARE_REVERT_ASSERT_FAIL` / `set_share_revert_assert_fail` / `take_share_revert_assert_fail` | Mark reverting: current ring/calendar plus guards |
+| `SHARE_ROLLBACK_ASSERT_FAIL` / `set_share_rollback_assert_fail` / `take_share_rollback_assert_fail` | Rollback chunk: reverting ring/calendar and event archives plus guards |
+| `SHARE_RESTORE_ASSERT_FAIL` / `set_share_restore_assert_fail` / `take_share_restore_assert_fail` | Final restore: fresh reverting ring/calendar after final scan plus guards |
+
+At each class, consume its hook after the read and batch/assertion assembly, immediately
+before that write's commit. On injection perform no store write; produce the actual
+`trc::StoreEvent::AssertValueFailed` result into the **same commit-result match** used for a
+real assertion loss. The normal `ConversionConflict`, counts and progress handoff must run;
+never short-circuit around it. Configure `remaining=1` for class contract tests and `8` for
+Task 7's HTTP exhaustion test. Existing pauses still cover real calendar/event races;
+`SHARE_REWRAP_FAIL_ONCE` remains a cut returning `UnexpectedError`, not an assertion loss.
+
 - [ ] **1. Add failing tests** for cases 3, 21, 23 and all three runs of 24:
   sealed+plaintext conversion, token-preserving rewrap, crash/resume, raced-in link,
   concurrent CK write rolled back to EWK, linked-event write refusal and resident-session
@@ -665,13 +722,19 @@ committed; HTTP accumulates them once and keeps the conversion-loss budget acros
   Inject calendar/event losses alone, combined with vault/Account changes and with unchanged
   progress. Each returns typed `ConversionConflict` with only committed counts and the
   correct `progress_changed`; resume from no ring, unconverted, converted and reverting.
+  For each of the five named assertion slots, inject one matching failure and assert the
+  owner's exact state after failure: init leaves no ring; forward rewrap or mark-reverting
+  leaves safe unconverted state; rollback or restore leaves reverting state. Assert no
+  grant, only committed counts, expected progress and successful direct resume. Cover case
+  23's typed handoff for every class, with no store write from the injected attempt.
   Terminal precedence, eighth-loss 409 and successful 3,000-event budget behavior belong
   to Task 7 step 1.
 - [ ] **2. Run za suite and observe the absent state machine's failures.**
 - [ ] **3. Implement the three phases and their fences.** Precheck is a fast refusal;
   phase 1 installs a fresh owner ring with no grants and `converted=false`. Complete the
   parentage walk before rewrapping anything. Rewrap at most 100 events per logical batch,
-  preserving sealed bytes and token carriers; fully seal plaintext. Each independently
+  preserving sealed bytes and token carriers; fully seal only classifier-confirmed
+  `LegacyPlaintext`, rejecting partial carriers. Each independently
   committed chunk has its calendar/vault/account and per-event assertions. Re-read changed
   events and skip only when they are valid in the current domain. Finish with a complete
   parentage/envelope scan before returning grant-ready state.
@@ -702,7 +765,8 @@ committed; HTTP accumulates them once and keeps the conversion-loss budget acros
   They do not use the PROPPATCH-only `seal_calendar_changes` entry-set invariant.
   Add `SHARE_PRECHECK_PAUSE`, `SHARE_REWRAP_PAUSE` and `SHARE_REWRAP_FAIL_ONCE` statics and
   functions in `common::za::test_hooks`, called directly from `convert.rs` under `test_mode`,
-  including between rewrap batches.
+  including between rewrap batches. Wire the five counted assertion injections exactly at
+  the write-class boundaries defined in Interfaces, separate from this interruption cut.
 - [ ] **5. Run za/groupware/product gates.** No grant, ACL key or grant ledger entry may
   appear before the final valid scan. Check retry counts against actually committed work.
 - [ ] **6. Commit:** `Convert calendars to collection keys with safe rollback`.
@@ -738,13 +802,17 @@ request: CredentialsRequest) -> trc::Result<HttpResponse>`, and `za_shares_grant
 `ShareRevokeRequest` respectively. DTOs flatten the existing credential fields and add
 exactly §4.3/4.4 fields; validate revoke id/address exclusivity before authentication.
 
-- [ ] **1. Add failing endpoint/race tests** for cases 4–8, 13–14 and 16–20. Cover every
+- [ ] **1. Add failing endpoint/race tests** for cases 3–8, 13–14, 16–20, 23 and 24. Cover every
   §4 response row, exact stable-id/alias-transfer semantics, sorted lists, all-generation
   grants, gone sweep, ledger-key rotation and same-level re-key invalidation.
   Own the conversion coordinator tests here: calendar/event losses combined with vault/
   Account loss choose terminal errors first; the eighth conversion loss gives 409 `conflict`
   only after fresh guard classification; thirty successful chunks over 3,000 events exhaust
-  neither budget. Resume safely after terminal/budget exits from unconverted and reverting.
+  neither budget. Use the counted class hooks (`remaining=8`) for deterministic exhaustion;
+  retain real-loss race coverage. Resume safely after terminal/budget exits from no-ring,
+  unconverted and reverting states. Own HTTP case 3's grant `rewrapped`/`sealed` counts, case 23's next-grant
+  completion after every typed handoff, and case 24's 409 `calendar has linked events` and
+  rollback/resume runs. Task 6 owns their direct contracts; Task 10 activates Bob's reads.
   Assert exact public outcomes:
   ~~~rust
   assert_eq!(ambiguous_error["error"], "address is ambiguous, revoke by grant");
@@ -986,8 +1054,13 @@ merge and token matching. Keep original verification when `sent_by` is absent.
   (`5.1`, first-run attempt retained). Test sub-address overlap without duplicate items or a
   false refusal, writer-only groups (normal `5.3`, no redirect; no forced status when
   declined/RSVP-false), owner-resolving unlisted attendees (excluded on gated path), and
-  writer-organizer attendee-side paths. Inherited attendee-side owner-subaddress REPLY may
-  reach the owner's inbox; record it without expanding the gated exclusion.
+  writer-organizer attendee-side paths. Explicitly own two distinct shared-group fixtures:
+  shared-group ATTENDEE owner-local exclusion from L/R and no self-message, and a distinct
+  shared-group ORGANIZER gate success,
+  omitted SENT-BY and unchanged drain rejection, using direct server fixtures. The latter
+  tests inherited group-organizer rejection without promising delivery.
+  Attendee-side owner-subaddress REPLY may reach the owner's inbox only in the delegated
+  run: record this documented fork limitation without expanding the gated exclusion.
   HTTP-only stored source statuses/pairs, force-send parameter absence, schedule tag and
   DAV case 9/10 flows are prepared for Task 10 step 5, where grantee admission opens.
   Add `catch_all_resolution_is_quiet` with Bob alias on a dedicated canary domain (never
@@ -996,7 +1069,8 @@ merge and token matching. Keep original verification when `sent_by` is absent.
   `registry_update_object(ObjectType::Domain, id, json!({"catchAllAddress": ... | null}))`.
   Capture `EventType::variants()` with public `Traced` (the mail helper's `traced_types` is
   private) during R classification and delegated sender verification, cold and warm.
-  Cold means `invalidate_local_caches(&[Domain(..), Account(bob)])` plus
+  Cold means `invalidate_local_caches(&[Domain(source_domain_id), Domain(target_domain_id),
+  Account(bob)])` plus
   `invalidate_all_local_negative_caches()`. A suppressed RSVP/PARTSTAT catch-all attendee
   must still classify quietly: prove its lookup ran through `emails_negative` original and
   `emails` target cache population, or a positive companion self item. Plant the drain's
@@ -1023,8 +1097,10 @@ merge and token matching. Keep original verification when `sent_by` is absent.
   mutates/finalizes the tree internally. Treat either run's raw success as built for fan-out
   and schedule tag. If first returns `NothingToSend` and second built in its normal path,
   call Task 8's public `za_finalize` once, with second update increments or `[]` for create.
-  Update's existing `NothingToSend` error arm already bumps schedule tag: bump exactly once
-  and retain its upstream `ItipMessageError` trace, without adding a second bump.
+  For an existing-event PUT's create branch with `schedule_tag=None` and only the second
+  run built, set the schedule tag to 1. For its update branch with `schedule_tag=Some`, the
+  existing `NothingToSend` error arm already bumps it: bump exactly once. Retain upstream's
+  `ItipMessageError` trace and never add a second bump.
   Keep cancel fallback unfinalized. Mapped 412 errors
   discard both runs. Apply the existing SEQUENCE floor before both and one reconciliation
   over their combined output. Keep deletion reconciliation disabled as today. Keep
@@ -1058,8 +1134,8 @@ merge and token matching. Keep original verification when `sent_by` is absent.
   on this path too, recording the same `5.3` as the owner's own send. Check provenance per
   message/address attempt; cache raw
   account resolution, never self-inbox permission by address. Elsewhere retain the original
-  own-inbox exclusion. Record inherited attendee-side owner-subaddress REPLY delivery
-  (including an unlisted owner ORGANIZER) in the acceptance notes; do not broaden exclusion.
+  own-inbox exclusion. Record the documented fork limitation of attendee-side
+  owner-subaddress REPLY delivery (including an unlisted owner ORGANIZER) in the acceptance notes; do not broaden exclusion.
   Preserve receive/send permission, event-future and tag gates. Record self delivery status
   on the writer's attendee line. Delegated pin decisions may create first-use pins, but
   never create, consume, refresh or retire withheld entries for the owner's source event.
@@ -1120,11 +1196,14 @@ address-presence sets for stored token pairs; do not normalize their absence awa
   below max(grant, rename); allow initial sync. Filter by requested calendar/home and
   eligible current prefixes before emitting/counting responses. Include paused rename,
   token above every prior change id, later-token, slug-reuse and owner-repair tests.
-- [ ] **5. Activate all prepared grantee HTTP cases from Tasks 4, 5, 7 and 9, then add and
+- [ ] **5. Activate all prepared grantee HTTP cases from Tasks 4, 5, 6, 7 and 9, then add and
   run case 25's differential test.** Same lifecycle twice, separate UIDs:
   Alice writes versus Bob writes as edit grantee, with Carol attending both. After each
   of the eleven spec steps drain/fetch Bob and compare normalized copies. Include the
-  listed-alias fixture, distinct sub-address fixture, shared and writer-only group fixtures,
+  listed-alias fixture, distinct sub-address fixture, shared-group ATTENDEE fixture
+  (owner-local, no self-message),
+  distinct shared-group ORGANIZER fixture (gate, omitted SENT-BY, unchanged drain rejection),
+  writer-only group fixture,
   writer-own unlisted ORGANIZER attendee-side fixture,
   CLIENT/NONE create-delete fixture,
   sole-attendee ForceSend fixture and
@@ -1144,15 +1223,19 @@ address-presence sets for stored token pairs; do not normalize their absence awa
   keeps `5.3` and never redirects to Bob; with that group alone, first-run `NothingToSend`
   and second-run success still finalize once and set the tag. An unlisted owner-resolving
   attendee gets `5.3` and no owner inbox item on the delegated-organizer path. Record the
-  inherited attendee-side owner-subaddress REPLY behavior separately. The exception run
-  applies to A only; include directly owned listed aliases, failed lookup with declined/
-  RSVP-false aliases (`5.1`, no item), and negative group/unlisted/custom/catch-all variants
+  documented fork limitation for attendee-side owner-subaddress REPLY separately.
+  The exception run applies to A only; include directly owned listed aliases and failed
+  lookup with declined/RSVP-false aliases: Run B records `5.1` and creates no item, while Run A is suppressed
+  and records no attempted status. This is case 25's failed-direct-alias exception fixture.
+  Include negative group/unlisted/custom/catch-all variants
   whose RSVP/PARTSTAT filters remain intact. Use dedicated canary domains for catch-all and
   custom-rule variants; restore `catchAllAddress`, custom rules and caches after each fixture.
   Keep the eligible ordinary-RSVP sole-group finalize fixture and receiver validation intact.
   Activate Task 9's HTTP-only stored source status/tag/pair/parameter assertions and cases
   9/10, Task 5's MOVE-overwrite observation plus legacy plaintext MOVE regression, and all
-  prepared Tasks 4/7 races. No downstream hook is parked before its foreign gate opens.
+  prepared Tasks 4/7 races and Task 6/7 cases 3, 23 and 24's Bob reads. Observe the outer
+  overwrite Option in both owner and Bob HTTP variants. No downstream hook is parked before
+  its foreign gate opens.
   ~~~rust
   assert_eq!(normalized_owner_run, normalized_delegated_run);
   assert_eq!(owner_token_addresses, delegated_token_addresses);
@@ -1165,7 +1248,8 @@ address-presence sets for stored token pairs; do not normalize their absence awa
   ~~~
   Use `DrainOn`, future events and synchronous fan-out completion; never
   `wait_for_delivery`. Drain each step within the 32-item cap; account for a deferred
-  pending pass explicitly. Record accepted owner-run behaviors without changing the oracle.
+  pending pass explicitly. Preserve the owner-run oracle except for the explicit §6.2
+  limits list (including the documented fork limitation) and the RSVP/PARTSTAT exception.
 - [ ] **6. Extend the key-mode ACL variant.** Keep raw ACL refusal and group-calendar
   half; pin/grant via endpoint, prove view refusal, edit success and revoked access.
   Run za then WebDAV baseline and key mode sequentially.
@@ -1205,7 +1289,8 @@ cross-record checks while preserving unshared rules and pending-item `0x02` rule
 - [ ] **5. Run the unmutated za suite and affected units after restoring all mutations.**
 - [ ] **6. Commit:** `Qualify calendar sharing leak and race protections`.
 
-Required mutation-to-case ledger (all §11.6 checks; grouped only for readability):
+Required mutation-to-case ledger (57 §11.6 entries including the attendee-side equivalence;
+grouped only for readability):
 
 | Mutation(s), tested separately | Required detecting case |
 |---|---|
@@ -1233,7 +1318,8 @@ Required mutation-to-case ledger (all §11.6 checks; grouped only for readabilit
 | Self-inbox admission by account match without provenance | Task 9 server-backed negative routing fixture |
 | Catch-all fallback drops the quiet flag | Task 9 catch-all trace fixture, R classification and delegated sender verification |
 | Exception uses L/R rather than A; writer-only group omitted from R | 25 group/unlisted/custom/catch-all negative exception and failed direct-alias attempt; 25 group status and eligible sole-group finalize |
-| MOVE overwrite schedules | 12 actual returned-message seam: normal Some(false), flag mutation Some(true); owner/recipient queue/pending/inbox counts and active copies are additional checks |
+| MOVE overwrite schedules | 12 actual outer delete-result Option seam in owner/Bob runs: normal Some(false), flag mutation Some(true), even when inner message is None; counts/copies are additional checks |
+| A derived only from successful recipient lookup | 25 failed direct-alias exception: Run B 5.1 and no item; Run A suppressed |
 | Grantee dead property overwrites owner's personal bundle | 2 and §11.1 |
 
 ### Task 12: Final acceptance, API handoff and native qualification
@@ -1282,8 +1368,8 @@ repository as part of this task.
   If devices/access are unavailable, mark these gates pending with the exact missing evidence;
   automated success cannot substitute for them.
 - [ ] **5. Update documentation and outcome.** Record implementations of invariants 33–40,
-  automated and native evidence separately, remaining accepted inherited behaviors, cluster
-  pubsub/residency limitation and pending downstream page work. Update merge hotspots,
+  automated and native evidence separately, accepted inherited behaviors, the documented
+  fork limitation, cluster pubsub/residency limitation and pending downstream page work. Update merge hotspots,
   including `common/src/cache/principals.rs` catch-all quiet propagation, the cancel-builder
   seam and finalize dependencies. Keep unrelated inherited
   upstream issues out of public issue reports/docs except the accepted design behaviors.
@@ -1298,13 +1384,13 @@ repository as part of this task.
 |---|---|
 | §1 scope, levels and non-goals; §9 feature matrix | 7, 10; cases 1, 2, 4, 11, 12, 15 and preserved refusals |
 | §2 trust/metadata; notifications and traces | 1, 7, 9, 11, 12; scanner, empty notification names, trace assertions |
-| §3.1–3.4 formats/domain/bundles | 1–3; §11.1 and cases 2, 3 |
-| §3.5 conversion and rollback | 4–7; cases 3, 21, 23, 24; Task 6 typed contract and Task 7 HTTP budgets/terminal precedence |
+| §3.1–3.4 formats/domain/bundles | 1–3; §11.1 and cases 2, 3; Task 2 strict event-storage classifier consumed by owner reads, conversion and MOVE |
+| §3.5 conversion and rollback | 4–7, 10; cases 3, 21, 23, 24; Task 6 direct class contracts, Task 7 HTTP counts/409/resume/budgets, Task 10 Bob reads |
 | §3.6 residency and token-pair handling | 1, 3, 4, 7, 9; cases 10, 17, 24 |
 | §4 API, atomicity, alias identity, invalidation, page handoff | 7, 12; cases 4–8, 14, 16–20 |
 | §5.1–5.4 authorization, views, discovery and sync | 3, 5, 10; cases 1, 2, 11, 15 |
 | §5.5 every event writer and calendar properties | 2–4, 9–10; cases 2, 21, 22, 24 |
-| §5.6 COPY/MOVE, linked state and rename | 5, 10; cases 1, 12, 24, legacy no-carrier plaintext full-seal and actual overwrite-message observation |
+| §5.6 COPY/MOVE, linked state and rename | 5, 10; cases 1, 12, 24, legacy no-carrier plaintext full-seal and actual outer delete-result observation |
 | §5.7 JMAP unchanged | 12; existing refusal tests |
 | §6 scheduling, parity and accepted limits | 8–10; cases 9, 10, 25 |
 | §7 rotation, re-key and gone sweep | 7; cases 5–8, 14, 17 |
@@ -1313,7 +1399,7 @@ repository as part of this task.
 | §11.3 key WebDAV; §11.4 scanner; §11.5 native; §11.6 kills | 10; 11; 12; 11 |
 | Invariants 33, 34, 39 | 1–3, 7, 11 |
 | Invariants 35–37 | 4–7, 11 |
-| Invariant 38 | 8–10, 11; A-only alias override, group retention and provenance-bound self admission |
+| Invariant 38 | 8–10, 11; A-only alias override independent of lookup success, distinct group-attendee/organizer fixtures, provenance-bound self admission and documented fork limitation |
 | Invariant 40 | 3, 7, 10–11 |
 | §13 implementation choices; §14 merge guidance | Decisions above, 8–9 and 12 |
 
@@ -1355,3 +1441,13 @@ combined correction and relevant source, identified two stale conversion-state c
 rechecked their corrections with no remaining findings in the focused scope. Implementation
 and native acceptance remain future gates. See the review file for findings, dispositions
 and evidence boundaries.
+
+The revision 14 recheck of `09ba2858`, recorded at `9ae3715d`, identified V1–V7 and
+V-N1–V-N7. This final focused documentation pass names deterministic assertion-loss seams for
+each conversion write class,
+clarifies the outer overwrite observation and strict carrier classifier, and assigns the
+remaining direct/HTTP fixtures and documented fork limitation explicitly. It leaves the spec
+at revision 14 and adds no implementation or current runtime acceptance claim. A fresh
+independent `gpt-6.1-sol` `xhigh` source/document review identified one schedule-tag wording
+issue, rechecked its correction, and reported no remaining actionable findings in the focused
+scope. This documentation pass was uncommitted at the end of the correction review.

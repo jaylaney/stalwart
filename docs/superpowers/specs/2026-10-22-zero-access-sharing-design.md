@@ -64,7 +64,7 @@ clarifications: the routing override is limited to directly owned listed
 aliases, delegated identity roles and quiet catch-all lookup are explicit,
 conversion conflicts remain safe and resumable, and MOVE covers legacy
 plaintext input and an observable no-scheduling overwrite check (3.5,
-5.6, 6.2, 11 and 14).
+5.6, 6.2, 11, 12 and 14).
 
 The terms key account, master key (MK), event wrapping key (EWK), data key
 (DEK), `X-ZA-KEY`, `X-ZA-SEALED`, `X-ZA-EXTRA`, wrap type, collection
@@ -643,8 +643,22 @@ owner's grant request, in three phases (author's call):
    `0x01` envelope is rewritten with its DEK opened under the EWK and
    rewrapped under the newest generation as a `0x03` envelope. Nothing
    else changes: the sealed trees, bundles and token pairs stay as they
-   are, because the DEK does not change. An event with no carriers at all
-   (plaintext, which release 1 section 7.3 tolerates until its next write,
+   are, because the DEK does not change. A strict storage classifier
+   (`ZaEventStorageKind::{LegacyPlaintext, Sealed}` via
+   `classify_event_storage(&CalendarEvent) -> Result<ZaEventStorageKind,
+   SealError>`) recognizes legacy plaintext only when no recognized
+   `X-ZA-KEY`, `X-ZA-SEALED` or `X-ZA-EXTRA` carrier occurs anywhere in
+   the tree. Otherwise it requires valid sealed-carrier placement and
+   format or returns `SealError`; opening a valid sealed form still makes
+   its normal AEAD checks. The old root-last-marker `is_sealed` check is
+   only a hint, not this classification. Conversion, MOVE and domain-aware
+   owner reads use this classifier only on stored deserialized archives
+   before opening them. New client PUT trees and trees after unsealing do
+   not pass through this legacy-versus-sealed check: client-supplied
+   `X-ZA-*` properties remain ordinary properties sealed inside bundles
+   and restored on read, as the existing `seal_event` behavior requires.
+   An event with no carriers at all (plaintext, which release 1 section
+   7.3 tolerates until its next write,
    `seal/event.rs` and `dav_seal::test_legacy`) is sealed under the CK in
    full, as a PUT would seal it, and counted separately as `sealed`.
    The phase scans before it rewraps (re-review finding 1): it first walks
@@ -654,8 +668,9 @@ owner's grant request, in three phases (author's call):
    each event asserting its own stored archive; an event that loses its
    assertion is re-read (a concurrent writer has sealed it under the CK,
    5.5) and skipped when it already carries `0x03`. An opaque assertion
-   loss on a phase-1, phase-2, `reverting`-ring or final unshared rewrite
-   returns a typed conversion conflict to the HTTP coordinator, with
+   loss on a phase-1, phase-2, `reverting`-ring, rollback event chunk or
+   final unshared rewrite returns a typed conversion conflict to the HTTP
+   coordinator, with
    committed counts and progress information; the coordinator reapplies
    fresh vault, account, calendar and request-budget guards before retry.
    The phase ends with a
@@ -725,14 +740,13 @@ no background job takes part (release 1 invariant 6). Every client of the
 owner refetches the calendar's events at its next sync, once. Later grants
 of the calendar skip phases 1 and 2, since `converted` is set.
 
-**An interrupted first grant** (a timeout, a crash, a client that gave up
-and dropped the connection) leaves the calendar in the shared form with no
-grantee and some events still `0x01` or plaintext. That state is complete
-for the owner, who holds both the EWK and the CK, and invisible to anyone
-else, and 5.5's write rule keeps a linked event in it from being sealed
-under the CK. The next
-grant of the calendar finishes phase 2 before its own write; nothing else
-needs it, because a grantee exists only after phase 3.
+**An interrupted first grant** (a timeout, crash or dropped connection)
+may leave a safe journal with no grantee and some events still `0x01` or
+valid legacy plaintext. The owner holds both EWK and CK for an unconverted
+ring, and 5.5's write rule protects linked events. The next grant follows
+the state dispatch above: it finishes rollback first if `reverting`, repeats
+the full parentage walk before resuming phase 2 if `converted=false`, or
+skips conversion if already converted. No grantee exists before phase 3.
 
 ### 3.6 What sessions hold, and for how long
 
@@ -1644,8 +1658,9 @@ dragged between calendars.
   domain: its newest CK generation for an active shared calendar, or the
   EWK for an unshared or reverting destination;
   malformed or partial carrier sets are refused as corruption, never
-  treated as plaintext. The owner holds every domain of its account; a
-  grantee moves only between two calendars granted to it at the edit level
+  treated as plaintext, by 3.5's strict classifier. The owner holds every
+  domain of its account; a grantee moves only between two calendars granted
+  to it at the edit level
   (upstream's checks: `RemoveItems` on the source, `AddItems` on the
   destination) and holds both CKs. A `MOVE` within one domain copies the
   stored bytes, as release 1 does. A `MOVE` that overwrites a destination
@@ -1966,8 +1981,12 @@ fan-out in the grantee's session, on the owner's behalf:
        since the builder applies that rule itself.
      - *Either run built* is the success rule for the fan-out call and
        `za_messages` (`update.rs:292-296`, `:354`, `:503-505`, `:566`) and
-       for the schedule tag, set to 1 on a create (`update.rs:500`) or
-       bumped on an update when either run built. A sole-attendee
+       for the schedule tag, set to 1 on a create (`update.rs:500`) or an
+       existing-event PUT taking the create branch when only the second
+       run built. For an update with an existing tag, a successful first
+       run keeps its success-arm bump; if the first returns
+       `NothingToSend` and only the second builds, keep the single
+       existing error-arm bump. A sole-attendee
        writer's create that left the tag `None` (`:515-531`) would send
        every later PUT through `itip_create`, which has no cancellation
        discovery, and make the DELETE skip scheduling
@@ -2197,7 +2216,7 @@ the writer alone.
 - **An attendee-side REPLY to an unlisted owner sub-address.** The second
   run is skipped on this side. An unlisted owner sub-address may resolve to
   the event owner's inbox and reach it, whereas the owner's own write would
-  record `5.3`. This inherited limitation does not change the delegated-
+  record `5.3`. This documented fork limitation does not change the delegated-
   organizer owner-inbox exclusion above or incoming validation.
 - **`SENT-BY` in stored copies, per component** (review finding 8,
   re-review finding 6). Each component of a recipient's stored copy takes
@@ -2595,9 +2614,12 @@ grantee's three-part names and release 1's two-part names are told apart,
 and any other shape is refused; a conversion's rewrap leaves the trees,
 bundles and token pairs byte for byte unchanged, a plaintext owner entry
 converts straight into the shared form, and a plaintext event is sealed
-under the CK, with both calendar and event assertions; a grantee's view of
-a calendar never opens the owner's ring
-nor the owner's personal bundle, and a grantee's write of a dead property
+under the CK, with both calendar and event assertions. Classifier units
+cover valid legacy plaintext, valid sealed form, and stray, nested,
+partial, misplaced or malformed carriers in stored archives, and client-
+supplied `X-ZA-*` properties that round-trip through ordinary sealing;
+a grantee's view of a calendar never opens the owner's ring nor the owner's
+personal bundle, and a grantee's write of a dead property
 rewrites the shared bundle and leaves the owner's ring and personal bundle
 bytes unchanged. In the fan-out: 6.2's `SENT-BY` placement, per method and
 component (set on the ORGANIZER of a delegated REQUEST, update and CANCEL
@@ -2617,8 +2639,9 @@ address injects one failure before resolver or ordinary `resolve_inner`
 lookup, reusing the request's `Failed` result. A listed L alias, including
 declined or `RSVP=FALSE`, records `5.1` with no item; an unlisted failed
 lookup retains its first-run attempt and records `5.1`. A separate quiet
-catch-all fixture uses a dedicated canary domain, restores
-`catchAllAddress` and custom rules, and checks public `Traced` output
+catch-all fixture uses dedicated canary source and target domains, resets
+both domains for the cold run, restores `catchAllAddress` and custom rules,
+and checks public `Traced` output
 against `EventType::variants()`; its cold control checks both local parts,
 its warm control checks domain names and both local parts. The quiet runs
 show classification ran through cache population or a positive companion,
@@ -2629,8 +2652,10 @@ check against fixture data (a `SENT-BY` resolving to `changed_by`, a key
 account other than the named one, passes; a `SENT-BY` that does not
 resolve to `changed_by`, a plain `changed_by`, a named address that
 resolves to no account or to `changed_by` itself are refused, each with
-the delegated reason string); a shared group ORGANIZER without `SENT-BY`
-is refused by the inherited ordinary sender check.
+the delegated reason string). Task 9's direct fixture uses a shared group
+ORGANIZER, separate from its shared-group ATTENDEE fixture: the owner-local
+gate runs, no `SENT-BY` is added, and the inherited ordinary sender check
+rejects the item.
 
 ### 11.2 Integration: the za suite
 
@@ -2658,6 +2683,26 @@ account: `UPDATE_COMMIT_PAUSE` (update PUT after fan-out and seal, before
 before `delete.rs:276`). Test helpers open rings and envelopes with an account's
 password-derived keys to assert generations; they are test code and never
 part of the product build.
+
+Five further test-mode counted assertion-failure hooks cover conversion's
+write classes: `SHARE_INIT_ASSERT_FAIL`, `SHARE_REWRAP_ASSERT_FAIL`,
+`SHARE_REVERT_ASSERT_FAIL`, `SHARE_ROLLBACK_ASSERT_FAIL`, and
+`SHARE_RESTORE_ASSERT_FAIL`. Each uses
+`ShareAssertFailure { owner_id, calendar_id, remaining }`, defaults off,
+and has a `set_share_<init|rewrap|revert|rollback|restore>_assert_fail`
+setter taking `Option<ShareAssertFailure>` and a matching `take` returning
+`bool`. The test resets every setting with an RAII guard. A configured
+hook injects `trc::StoreEvent::AssertValueFailed` immediately before its
+class's commit, after the read and assertion assembly, through the normal
+commit-result match and `ConversionConflict`, with no store write. The
+init write asserts the original unshared calendar; rewrap chunks assert
+the current ring and events; the revert write asserts the current ring;
+rollback chunks assert the reverting ring and events; restore asserts the
+fresh reverting ring after its final scan. All vault, Account, calendar and
+budget guards remain active. One remaining failure exercises each class;
+eight exercise HTTP's retry budget. `SHARE_REWRAP_FAIL_ONCE` remains a
+conversion cut, not an assertion failure, and pause hooks exercise real
+races separately.
 
 Cases, with alice and bob (and carol and dave where named) as key
 accounts:
@@ -2843,23 +2888,29 @@ accounts:
     between two calendars granted to him rewraps. The linked move (5.6):
     alice copies an event between her unshared calendars A and B, then
     moves its A link into the shared C; the `MOVE` answers 403, and the
-    event keeps its names A and B under the EWK. A valid planted legacy
-    plaintext event moves from an unshared source into an already converted
-    shared destination: the stored tree and event are asserted together,
+    event keeps its names A and B under the EWK. A staged already-converted
+    shared destination permits Task 5 to plant a valid legacy plaintext
+    event in an unshared source before the share endpoints exist. Its MOVE
+    sends no scheduling message: the stored tree and event are asserted
+    together,
     the destination is its sole parent, its envelope is `0x03`, raw
     plaintext is absent from stored bytes, and owner and grantee can read
     it. Moving that now sealed event back to an unshared calendar rewraps
-    its existing DEK under the EWK. A same-domain MOVE preserves its
-    accepted stored bytes;
-    partial or malformed carrier inputs are refused as corruption.
+    its existing DEK under the EWK. Payload-byte equality applies to
+    already-sealed input's DEK-only rewrap, not this plaintext full seal.
+    A same-domain MOVE preserves its accepted stored bytes; partial or
+    malformed carrier inputs are refused as corruption.
     In a separate future scheduled-event fixture, bob's MOVE between two edit-
     granted calendars overwrites an event in the destination: no CANCEL is
     built, queued iMIP task or pending item written, and its attendees' existing copies stay
     active, as in alice's own MOVE. A test-only
-    `MOVE_OVERWRITE_OBSERVATION` records the actual overwrite deletion's
-    returned inner scheduling-message boolean by owner and event id:
-    normal overwrite is `Some(false)`, while the mutation that flips only
-    `send_itip` to true must produce `Some(true)` for this scheduled fixture.
+    `MOVE_OVERWRITE_OBSERVATION` in `common::za::test_hooks`, through
+    `record_move_overwrite_message` and `take_move_overwrite_message`,
+    records the actual overwrite deletion's outer
+    `Option<ZaDeleteMessage>::is_some()` by owner and event id. Normal
+    overwrite records `Some(false)`; flipping only `send_itip` to true
+    records `Some(true)` for this future, tagged fixture, even if Bob's
+    unmerged info leaves the inner `message` empty.
     Compare both runs' unchanged pending-item counts and queued scheduling
     tasks for owner and bob after synchronous MOVE completion, holding
     `TASK_CONSUMER_PAUSE` through `hold_task_consumer` and checking
@@ -2925,12 +2976,16 @@ Concurrency, in `sharing_races.rs`:
 23. An interrupted conversion: `SHARE_REWRAP_FAIL_ONCE` cuts the first
     grant; alice reads every event; the next grant completes the rewrap
     and the grant. Direct converter tests inject opaque assertion loss into
-    phase 1, calendar and event chunks, the `reverting` ring and final
-    unshared rewrite, both with unchanged guards and raced vault/Account
-    guards; each reports typed conflict, committed counts and progress,
-    and the next request resumes from its journal state. HTTP coordinator
-    tests own terminal-guard precedence, the eighth-loss 409 `conflict`,
-    and the 3,000-event budget succeeding across later chunks.
+    phase 1, calendar and event chunks, the `reverting` ring, rollback
+    chunks and final unshared rewrite through the five counted hooks above,
+    with unchanged and raced vault/Account guards; each reports typed
+    conflict, committed counts and progress, and resumes from its journal
+    state. The hooks inject after assertion assembly without a store write;
+    a one-failure run covers each class. Task 6 owns those direct converter
+    fixtures. Task 7's HTTP coordinator tests own terminal-guard precedence,
+    the eighth-loss 409 `conflict`, the 3,000-event budget succeeding across
+    later chunks, and the endpoint runs of cases 3, 23 and 24. Task 10
+    activates Bob's grantee reads for those cases.
 24. A link made after the precheck (3.5): with `SHARE_PRECHECK_PAUSE`
     holding alice's first grant after its linked-event precheck, alice's
     other device copies an event of the calendar into another of her
@@ -3018,11 +3073,12 @@ Concurrency, in `sharing_races.rs`:
       finalize runs once. Also compare a listed Bob plus unlisted owner
       `alice+y@` fixture: the owner-resolving address records `5.3` and
       receives no item in both runs.
-      A separate ORGANIZER fixture uses a group both alice and bob hold:
-      it enters the delegated-organizer path, has no `SENT-BY`, and its
+      A separate HTTP ORGANIZER fixture, owned by Task 10, uses a group
+      both alice and bob hold: it enters the delegated-organizer path, has
+      no `SENT-BY`, and its
       delivered item is refused by the ordinary sender check because the
       named group id differs from bob's `changed_by`. An attendee-side
-      REPLY for unlisted `alice+y@` records the inherited owner-inbox
+      REPLY for unlisted `alice+y@` records the fork's owner-inbox
       delivery difference without changing the delegated-organizer rule.
     - A fixture of its own runs a line of bob's with
       `SCHEDULE-AGENT=CLIENT` and one with `NONE` (lifecycle review finding
@@ -3040,8 +3096,12 @@ Concurrency, in `sharing_races.rs`:
       on a new override: run B delivers and run A does not, and bob's copy
       in run B shows the change (revision 11 withdraws `CLIENT` and `NONE`
       from this run).
-      This exception fixture uses directly owned listed A aliases only. Separate
-      unlisted sub-address, custom-rule and catch-all addresses resolving
+      This exception fixture uses directly owned listed A aliases only.
+      Inject a lookup failure for a declined or `RSVP=FALSE` direct alias:
+      run B attempts it, records `5.1` and writes no self item; run A
+      suppresses it. A remains classified by listed ownership even when
+      that lookup fails. Separate unlisted sub-address, custom-rule and
+      catch-all addresses resolving
       to bob run the same DECLINED/RSVP=FALSE and non-NEEDS-ACTION cases:
       both runs suppress those recipients equally. Compare target-specific
       attempts/statuses, not unrelated listed attendees' REQUESTs. A
@@ -3062,10 +3122,12 @@ Concurrency, in `sharing_races.rs`:
     **The stopping criterion** (re-review recommendation, revision 9):
     the self-message design is complete when no edit sequence
     demonstrates a difference between the two runs beyond 6.2's one
-    exception, and every behaviour the owner's own write also produces is
-    recorded in 6.2's inherited table. A later review's finding is judged
-    against it: a divergence between the runs is a defect; an inherited
-    behaviour is a row of the table.
+    designed exception and its documented fork limitation, and every
+    behaviour the owner's own write also produces is recorded in 6.2's
+    inherited table. A later review's finding is judged
+    against it: a divergence is a defect unless it is the designed
+    exception or an explicitly documented fork limitation in 6.2; an
+    inherited behaviour is a row of the table.
 
 ### 11.3 Key-mode CalDAV suite
 
@@ -3209,10 +3271,12 @@ admission based on account resolution without retained-second-run
 provenance (a server-backed negative routing za fixture with an ordinary-provenance item to
 the writer's own account); exception applied to R or all L instead of A
 (25, unlisted sub-address/custom/catch-all and declined writer-only group
-negative exception runs); writer-only group omitted from R (25, `team@`
-owner status and sole-group finalize); quiet catch-all fallback replaced
+negative exception runs); A derived only from successful recipient
+resolution (25, failed direct-alias exception fixture); writer-only group
+omitted from R (25, `team@` owner status and sole-group finalize); quiet
+catch-all fallback replaced
 by a traced lookup (11.1, cold and warm canary controls and cache proof);
-MOVE overwrite scheduling enabled (12, the returned-message observation
+MOVE overwrite scheduling enabled (12, the outer returned-message observation
 plus pending-item and queued-task counts).
 
 ## 12. Invariants for implementers
@@ -3641,9 +3705,10 @@ merge touches it:
 - COPY/MOVE overwrite deletions keep `send_itip=false`
   (`copy_move.rs:747-756`, `:931-943`; 5.6). The key-account overwrite
   passes its resolved domain and writer keys so a future scheduled event
-  could build a CANCEL if that flag were flipped; the return observation
-  in case 12 detects such a mutation even when callers discard the
-  returned message. The no-key queue path can queue an iMIP message only
+  could build a CANCEL if that flag were flipped; the outer
+  `Option<ZaDeleteMessage>::is_some()` observation in case 12 detects that
+  flag even when Bob's inner message is absent and callers discard the
+  returned value. The no-key queue path can queue an iMIP message only
   for a plaintext scheduling tree. Case 12 also checks pending items and
   queued tasks while the consumer is held, with an ordinary control.
 - The scheduling decision delegate sending mirrors: `itip_create`,
