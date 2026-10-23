@@ -1,6 +1,6 @@
 # Zero-access calendar: sharing between key accounts (release 4) design spec
 
-Date: 2026-10-22. Status: revision 9, draft for review. Scope: release 4
+Date: 2026-10-22. Status: revision 10, draft for review. Scope: release 4
 of the zero-access fork (jaylaney/stalwart); GitHub issue #24, milestone
 "Release 4: calendar sharing". Revision 2 answers the builder check and
 the adversarial review of revision 1: the shared bundle (3.3), the
@@ -36,7 +36,14 @@ and the self-message builder (6.2, 6.3). With it re-review findings 2 and
 3 of revision 6, which the review of revision 7 marked partly addressed,
 are complete. Revision 9 answers the re-review of revision 8: self-message
 payloads for the account's single copy (6.2), and two handoff precisions
-(5.2, 6.2).
+(5.2, 6.2). Revision 10 answers the re-review of revision 9 and the
+reviewers' recommendation of a bounded lifecycle pass: the writer's
+self-messages are upstream's builders run under the owner's addresses (6.2),
+the behaviours the writer's copy inherits from upstream are recorded (6.2),
+and a differential lifecycle test is the stopping rule (11.2). With it
+revision 9's re-review finding 1 is accepted as inherited (6.2's table, row
+1), not fixed, and its clarification is answered by parity (row 3);
+revisions 8 and 9's self-message builder is withdrawn.
 
 The terms key account, master key (MK), event wrapping key (EWK), data key
 (DEK), `X-ZA-KEY`, `X-ZA-SEALED`, `X-ZA-EXTRA`, wrap type, collection
@@ -1719,130 +1726,195 @@ fan-out in the grantee's session, on the owner's behalf:
      would drop the writer's own pair from the owner's event, and the
      writer's later reply from its own copy would be refused as from a
      non-participant.
-   - **The writer's own attendance: self-delivery** (re-review finding 4;
-     re-review findings 3 and 4, revision 6; re-review finding 2, revision
-     7). In a delegated write that upstream's builders treat as the
-     organizer's (the event's ORGANIZER is the owner's address, point 1),
-     the fan-out runs a **self-message builder** for the writer: fork code
-     beside upstream's builders, which stay unchanged. It derives the
-     writer's messages from the writer's attendance before and after the
-     write, before any recipient filtering and independent of what
-     upstream's builders produced, because those builders count the
-     writer's addresses as local under the merged list and suppress the
-     writer's message in cases its copy must still see:
-     `send_update_messages` excludes every local attendee
-     (`crates/groupware/src/scheduling/mod.rs:221`); an update with no
-     recipient left returns `NothingToSend` (`organizer.rs:77`, `:133`),
-     as a sole attendee's SUMMARY edit does; the CANCEL builder needs a
-     non-empty recipient set (`event_cancel.rs:47`, `:60`), so a sole
-     attendee's deletion builds none; and cancellation discovery counts
-     external attendees only (`organizer.rs:58`), so the writer's removal
-     of its own line builds no CANCEL for it, while the other attendees'
-     REQUEST no longer names the writer and the writer's drain would
-     refuse it, a tree with no local attendee (`snapshot.rs:353`, checked
-     before the merge, `drain.rs:1061`).
+   - **The writer's own attendance: self-delivery, by parity** (re-review
+     finding 4; re-review findings 3 and 4, revision 6; re-review finding
+     2, revision 7; re-review finding 1, revision 8; re-review finding 1
+     and recommendation, revision 9). Under the merged list upstream's
+     builders count the writer's addresses as local and address nothing to
+     them (`send_update_messages`,
+     `crates/groupware/src/scheduling/mod.rs:221`; `NothingToSend` when no
+     recipient remains, `organizer.rs:133`; cancellation discovery over
+     external attendees only, `organizer.rs:58`; `itip_cancel`'s
+     non-empty recipient set, `event_cancel.rs:47`, `:60`), so without a
+     rule of its own the writer's copy would never see a delegated write.
 
-     The writer's attendance is the set of the event's components, the
-     master and each override, whose ATTENDEE lines name any of the
-     writer's addresses: before the write in the stored tree the handler
-     already holds (`update.rs:233` takes it for the diff;
-     `delete.rs:199-208` reads the event before the delete), after it in
-     the committed tree. The builder plans its payloads for the writer's
-     account's one copy of the event (re-review finding 1, revision 8):
-     the drain merges every item of a UID into the account's single copy
-     whatever address the item names (`drain.rs:662`), and upstream's
-     merge, unchanged, treats a REQUEST that carries the master as a full
-     update that removes every stored component the message omits
-     (`crates/groupware/src/scheduling/inbound.rs:94`, `:157`) and a master
-     CANCEL as the series' cancellation, omitted overrides included
-     (`:231`, `:265`). So:
-     - **A REQUEST of the full committed tree**, the master and every
-       override, as upstream's full update carries them
-       (`organizer_request_full`, `organizer.rs:308`), is built when a
-       component the writer attended before the write or attends after it
-       changed in anything the copy shows (SEQUENCE or not; a line of the
-       writer's included: a decline, a creation, an alias removed or
-       replaced on a component the writer still attends under another),
-       provided the writer attends some component after the write. Its
-       SEQUENCE is the committed tree's (upstream's increment applies only
-       where its builders sent something, `event_update.rs:30` finalizing
-       on success alone, and the floor applies). The same payload goes to
-       each of the writer's addresses that attends a component after the
-       write.
-     - **A CANCEL per lost component**: a component the writer attended
-       before the write, under any of its addresses, and attends after it
-       under none gets a CANCEL built from the prior tree, delivered to
-       each address that attended it. While the writer still attends some
-       component after the write, a lost override gets an instance CANCEL
-       carrying its RECURRENCE-ID, and a lost master gets none (the
-       REQUEST above carries it, and a master CANCEL would cancel the
-       overrides the writer still attends). A master CANCEL, cancelling
-       the series, is built only when the writer attends no component
-       after the write, the event's deletion included, and goes to each
-       address that attended a component before it.
-     - **Nothing**, when the write changes no component the writer
-       attended or attends.
+     **The contract.** After a delegated write, the writer's personal copy
+     receives exactly the messages upstream's organizer builders would
+     address to the writer's addresses had the owner made the same write
+     in her own session, with the writer an ordinary attendee, with one
+     deliberate exception (below). Whatever the owner's own write would do
+     to the writer's copy, the delegated write does; a behaviour the
+     owner's own write also produces is inherited, recorded in the table
+     after point 5, and is not a defect of this design. The fork may fix
+     an inherited behaviour later for every attendee, never for the writer
+     alone, since that would break the oracle of the differential test
+     (11.2, case 25). This replaces revisions 8 and 9's hand-derived
+     self-message builder (its full-tree REQUEST trigger, per-component
+     CANCELs, prior-tree SEQUENCE rule, empty case, REQUEST-before-CANCEL
+     order and alias rule), which this revision withdraws.
 
-     So a write that removes one alias from a component the writer still
-     attends under another builds the REQUEST, not a CANCEL. A CANCEL's
-     SEQUENCE is the builder's own (re-review clarifications, revision 8):
-     that component's SEQUENCE in the prior tree plus one, upstream's own
-     rule for the CANCELs it builds (the prior tree chosen for a CANCEL,
-     `organizer.rs:221`, and the per-component increment, `:247`; for a
-     deletion, `itip_cancel` takes the prior master's,
-     `event_cancel.rs:56`), then raised to the SEQUENCE of the matching
-     component of the committed tree when that survives with a higher one.
-     The committed tree alone does not give it: upstream's increment is
-     never applied when its builders return `NothingToSend`
-     (`organizer.rs:133`, before `event_update.rs:30`), a removed override
-     has no component there, and the fork's reconciliation
-     (`za_reconcile_sequences`, its matching at `sequence.rs:161`) takes the
-     committed tree and the built messages, never the prior tree, so it can
-     raise a SEQUENCE but not supply this one. The fan-out writes a write's
-     self REQUEST items before its CANCEL items, and the drain applies a
-     UID's items in that order (`drain.rs:33`, `:417`), so a lost override
-     that the full tree still carries for the other attendees ends cancelled
-     in the writer's copy (author's call on the order).
+     **The mechanism.**
+     - *The gate.* A delegated write (the resource's account is not the
+       authenticated account) whose ORGANIZER is an address of the owner's
+       and not of the writer's. The owner's addresses are
+       `account_info(owner)`
+       (`crates/common/src/cache/principals.rs:808-811`); the merged list
+       upstream builds for the write (`scheduling_account_info`,
+       `:813-829`) is the writer's addresses followed by the owner's that
+       the writer lacks, so the writer's addresses are the merged list
+       minus the owner's. An address both accounts hold (a group's) stays
+       local and gets no self-message (the table, row 4). On the attendee
+       side (the ORGANIZER external under both lists) there is no second
+       run: both runs would take `attendee_handle_update`
+       (`crates/groupware/src/scheduling/event_update.rs:25-28`) and build
+       the same REPLY for the owner's line.
+     - *The second run* is upstream's organizer builders run once more,
+       under the owner's addresses alone, before the first run (upstream's
+       own, under the merged list) finalizes the committed tree:
+       `itip_finalize` (`crates/groupware/src/scheduling/itip.rs:355-389`:
+       it strips `SCHEDULE-FORCE-SEND`, then increments the listed
+       SEQUENCEs) runs only on the first run's `Ok`
+       (`event_update.rs:30-32`), so the second run is placed before
+       `update.rs:259` for an update and `:495` for a create. It snapshots
+       the prior and the committed trees under the owner-only list
+       (`itip_snapshot`, `snapshot.rs:17`); on every ATTENDEE entry of
+       both snapshots whose address is the writer's and not the owner's it
+       sets the three routing-only fields `force_send = Some(Request)`,
+       `rsvp = None` and `is_server_scheduling = true` (public fields,
+       `scheduling/mod.rs:34-49`, `:92-105`; outside `Attendee`'s equality
+       and hash, `:277-301`; read by no payload, `organizer.rs:259-267`,
+       `:338-345`, `event_cancel.rs:61-67`); and it calls upstream's inner
+       builders, unchanged, from fork code in
+       `crates/groupware/src/calendar/` (they are `pub(crate)`). An update
+       calls `organizer_handle_update(old, new, old_itip, new_itip, &mut
+       scratch)` (`organizer.rs:22-28`), mirroring `itip_update`'s
+       organizer check, mismatch check and cancel fallback
+       (`event_update.rs:18-48`); a create calls
+       `organizer_request_full(ical, &itip, None, true)`
+       (`organizer.rs:309-314`), mirroring `itip_create`'s checks
+       (`event_create.rs:17-25`); a deletion calls the organizer branch of
+       `itip_cancel` (`event_cancel.rs:34-81`), which has no seam today (it
+       snapshots at `:28`), so upstream's function is split into a
+       snapshot-taking `pub(crate)` function behind the existing entry
+       point, with no behaviour change (the three-line split, not a fork
+       copy; 14 lists it). The scratch vector of increments is discarded:
+       the committed tree is incremented by the first run's finalize or by
+       the reconciliation below, never by the second run. The first run
+       ends `Ok` (the tree finalized), `NothingToSend` (the tree untouched,
+       neither stripped nor incremented, `organizer.rs:133-135`,
+       `:400-402`) or with another error (untouched). An error that
+       `failed_precondition()` maps
+       (`crates/dav/src/calendar/mod.rs:298-318`) aborts the PUT with 412
+       and discards both runs; the other errors behave as upstream's
+       (traced, the tag bumped, the write proceeds). On the organizer side
+       the second run's errors equal the first run's, `NothingToSend`
+       excepted, the only error that depends on the address list.
+     - *What is kept from the second run*: the messages whose `to` names a
+       writer address, in upstream's order (the full REQUEST first, then
+       the partials, `organizer.rs:181-205`, `:207-304`), delivered to the
+       writer's addresses only, one self item per address. Every other
+       recipient is served by the first run. The second run's full and
+       partial REQUESTs equal the first run's apart from DTSTAMP (each
+       builder calls `PartialDateTime::now()`, `organizer.rs:220`, `:316`;
+       `event_cancel.rs:29`), but a partial CANCEL whose recipient group
+       includes the writer also carries the writer's line
+       (`build_cancel_component` keeps the group's ATTENDEE lines,
+       `event_cancel.rs:164-176`), and the `to` grouping and the partials'
+       hash order differ, so nothing of the second run goes to anyone
+       else. The first run never names a writer address (they are local
+       under the merged list), so each message reaches the writer once.
+     - *SEQUENCE.* Both runs compute the same `increment_sequence` (it
+       depends on entry changes, attendee-set changes and added or removed
+       instances, `organizer.rs:33-131`, and `Attendee` equality ignores
+       locality) and read the same tree before finalize, so the writer's
+       SEQUENCE equals the other recipients'. The second run's kept
+       messages are appended to the first run's list, so one
+       `za_reconcile_sequences`
+       (`crates/groupware/src/calendar/fanout.rs:233-235`;
+       `sequence.rs:161-198`) raises the stored tree (`za_set_sequences`,
+       `update.rs:372`, `:599`) as finalize would have when the first run
+       returned `NothingToSend`: a sole-attendee writer's DTSTART edit
+       sends itself n+1 and the stored tree becomes n+1; its SUMMARY edit
+       sends n and raises nothing, upstream's own rule
+       (`organizer.rs:41-53`). Deletions skip the reconciliation as today
+       (`fanout.rs:230-231`). The floor (`sequence.rs:107-127`, applied at
+       `update.rs:236-238` before either run) raises the incoming tree
+       only, so both runs see the same tree. A CANCEL's SEQUENCE is
+       whatever upstream's builder gives it: the prior component's plus
+       one (`organizer.rs:222-226`, `:247-248`), for a deletion the
+       master's (`event_cancel.rs:55-57`); revision 9's prior-tree
+       SEQUENCE rule (re-review clarifications, revision 8) is withdrawn,
+       since the builder applies that rule itself.
+     - *Either run built* is the success rule for the fan-out call and
+       `za_messages` (`update.rs:292-296`, `:354`, `:503-505`, `:566`) and
+       for the schedule tag, set to 1 on a create (`update.rs:500`) or
+       bumped on an update when either run built. A sole-attendee
+       writer's create that left the tag `None` (`:515-531`) would send
+       every later PUT through `itip_create`, which has no cancellation
+       discovery, and make the DELETE skip scheduling
+       (`crates/groupware/src/calendar/storage.rs:581-584`), so the
+       writer's copy would never be updated or cancelled.
+     - *DELETE.* The second run sits in the `delete.rs:257` loop over
+       `ZaDeleteMessage.event` (the prior tree unsealed in `delete_all_za`,
+       `storage.rs:585-592`, `:603-609`, under the gate `send_itip`, a
+       schedule tag and an event ending in the future, `:581-584`; the
+       container delete, `delete.rs:153-170`, feeds the same loop, but
+       only the owner deletes a calendar, so the second run's gate never
+       passes there) and appends the
+       writer-only CANCEL to `message.message` (`:261`); the owner's
+       addresses are fetched there too (`delete.rs:79-81` holds the merged
+       list). The deletion's pin read and the retirement of withheld
+       entries (`fanout.rs:326-357`) stay off for a delegated fan-out, as
+       this point rules below, so a message list that is non-empty only
+       because of the second run does not switch them on.
+     - *Delivery details that stay*: the token union over the owner's
+       addresses (`fanout.rs:244-248`, `:948-969`; token locality above);
+       the self-inbox carve-out in `resolve_inner` (`fanout.rs:1086-1089`);
+       and the self item's delivery status recorded on the writer's line
+       of the owner's event exactly as any recipient's (`update.rs:371`),
+       so a later CANCEL, which clones ATTENDEE lines verbatim with their
+       `SCHEDULE-STATUS` (`event_cancel.rs:147-179`), carries the same line
+       under both paths.
 
-     None of upstream's per-attendee conditions (locality,
-     `SCHEDULE-AGENT`, `RSVP`, a declined PARTSTAT without
-     `SCHEDULE-FORCE-SEND`) suppresses a self-message: they decide what is
-     sent to others, and a self-message only keeps the writer's own copy
-     in step with the owner's event (author's call). The writer's
-     addresses stay out of upstream's recipient map (being local, the
-     builders never name them, and the fan-out drops any a builder's list
-     still names), so no message reaches the writer twice. The PUT and the
-     DELETE call the fan-out whenever the self-message builder built
-     something, even when upstream built nothing (`update.rs:304`, `:354`
-     call it only when messages exist; the DELETE's call, `delete.rs:255`,
-     already runs with no message when `itip_cancel` built none,
-     `crates/groupware/src/calendar/storage.rs:594`). A delegated write on
-     the attendee side (the owner's ATTENDEE line of an invitation
-     organized elsewhere, a REPLY as the owner) builds no self-message:
-     the writer's copy of that invitation is its organizer's to update
-     (author's call).
+     **The one exception: no per-attendee filter suppresses a message to
+     the writer** (author's call of revision 8, kept). Under the owner-only
+     list the writer is not local, and only three things still drop it:
+     `is_server_scheduling` (false for `SCHEDULE-AGENT=CLIENT` or `NONE`,
+     `snapshot.rs:152-153`), `rsvp == Some(false)` (`mod.rs:214`, `:224`)
+     and the PARTSTAT clauses: `send_update_messages` drops DECLINED, and
+     `send_invite_messages`, which runs on a create and on a new override
+     (`organizer.rs:97-103`, `:368`) and in `itip_create`, drops anything
+     but NEEDS-ACTION. The three routing fields lift them all, so a
+     decline or a status set through the shared calendar still reaches the
+     writer's own copy, a writer creating the event with its own line
+     ACCEPTED included. It is the only designed divergence from parity.
+     The override is made on the snapshots, not in the trees: rewriting
+     the writer's lines in cloned trees would change the payloads
+     (`itip_export_component` keeps every parameter but `SCHEDULE-STATUS`,
+     `SCHEDULE-AGENT` and `SCHEDULE-FORCE-SEND`, `itip.rs:254-272`, RSVP
+     included, and a CANCEL clones lines verbatim), and `force_send` alone
+     leaves `rsvp` and `is_server_scheduling` blocking (`mod.rs:213-214`,
+     `:223-224`).
 
-     **One self item per address** (re-review finding 4, revision 6;
-     re-review finding 1, revision 8). Tokens belong to addresses, not
-     accounts, and a pending item carries exactly one address and its
-     token (`seal/item.rs:152`, `:210`), so the fan-out sends each
-     self-message as one self item per address it goes to (an attending
-     address for a REQUEST, a formerly attending one for a CANCEL), each
-     with that address's pair, in the existing pending format; the drain's
-     REQUEST merge keeps pairs arriving for different addresses
-     (`drain.rs:1128`). A self item's address is a token carrier and never
-     an independent copy: every item of the UID merges into the account's
-     one copy, the payloads of one write's items for different addresses
-     are the same, so their arrival order does not change the copy, and the
-     merge is upstream's, unchanged. A writer attending the master as one
-     alias and an override as another therefore holds both pairs and both
-     components, and a later reply from either address is attempted
-     (`fanout.rs:915`).
+     **One self item per address** (re-review finding 4, revision 6).
+     Tokens belong to addresses, not accounts, and a pending item carries
+     exactly one address and its token (`seal/item.rs:152`, `:210`), so the
+     fan-out sends each kept message as one self item per writer address
+     its `to` names, each with that address's pair, in the existing
+     pending format; the drain's REQUEST merge keeps pairs arriving for
+     different addresses (`drain.rs:1128`). A self item's address is a
+     token carrier and never an independent copy: every item of the UID
+     merges into the account's one copy by upstream's merge, unchanged
+     (two addresses of one account are two attendees to the builders and
+     one copy to the drain: the table after point 5, row 2). A writer
+     attending the master as one alias and an override as another
+     therefore holds both pairs, and a later reply from either address is
+     attempted (`fanout.rs:915`).
 
      Each self item is sealed to the writer's own public key and merged by
      its drain into its own copy (a merge builds no message, so nothing
-     loops), so the writer's own copy stays current, a decline and a
-     cancellation included, and its later replies are neither stale nor
+     loops), so the writer's own copy follows the owner's event as an
+     ordinary attendee's would, and its later replies are neither stale nor
      unauthenticated. `resolve_inner`'s rule that a fan-out never writes
      into the sender's own inbox (`fanout.rs`) is carved out for these
      items.
@@ -1910,6 +1982,21 @@ fan-out in the grantee's session, on the owner's behalf:
    stores it, and a `PROPPATCH` of an event runs no scheduling
    (`crates/dav/src/calendar/proppatch.rs`).
 
+**What the writer's copy inherits from upstream** (re-review
+recommendation, revision 9). Each row is a behaviour the owner's own write
+produces in an ordinary attendee's copy, so by point 2's contract the
+writer's copy shows it too. The differential test (11.2, case 25) asserts
+equality, not the behaviour; a fix would be for every attendee, never for
+the writer alone.
+
+| Behaviour | Upstream's cause | Disposition |
+|---|---|---|
+| 1. A later full REQUEST reactivates an override an instance CANCEL had cancelled (re-review finding 1, revision 9) | The full REQUEST carries every component with attendees to every attendee of any component (`organizer.rs:325-329`, `:366-373`); the CANCEL merge removes SEQUENCE and STATUS and adds back `STATUS:CANCELLED` without a SEQUENCE (`inbound.rs:198-230`); the REQUEST merge accepts `>=` against the absent SEQUENCE and replaces STATUS (`inbound.rs:101-133`; STATUS is a snapshot entry, `snapshot.rs:299`). If the override lost its last attendee the REQUEST omits it and the merge removes it (`inbound.rs:157-166`): active either way. The plain inbox path uses the same merge (`crates/groupware/src/calendar/itip.rs:204-212`, `:788`) as the drain (`drain.rs:1075-1081`, `:1099`). | Inherited; accepted, not fixed. |
+| 2. Two addresses of one account are two attendees to the builders and one copy to the drain | Removing alias A from the master while alias B attends an override emits the full REQUEST (to B among others) and a partial CANCEL of the main instance to A, in that order; the single copy (`drain.rs:702-714`) applies the REQUEST, then the master CANCEL cancels the series, the override included (`inbound.rs:231-232`, `:265-305`). The fork's delivery keeps the emitted order (items written in message order, `fanout.rs:455-549`, applied in id order, `drain.rs:417-423`), so the outcome is deterministic; upstream's own plain path is not (the queue shuffles scans of more than three messages, `crates/smtp/src/queue/manager.rs:157-159`). | Inherited; accepted. Revision 9's alias rules (the whole-event payload per alias, the account-level CANCEL) are withdrawn by this revision; revision 6's one self item per address stands. |
+| 3. An override-only writer's copy stays active after the event's deletion (re-review clarification, revision 9) | `itip_cancel` collects recipients over every component (`event_cancel.rs:41-52`) but builds a master-only CANCEL with the master's ATTENDEE lines (`:55-67`, `:164-165`); the writer's drain finds no local line and refuses it (`snapshot.rs:353-361`; `drain.rs:584-589`), as a plain account's ingest does (`crates/groupware/src/calendar/itip.rs:157`). | Inherited; accepted: answered by parity, with no component retained in the CANCEL. |
+| 4. A group address both accounts hold gets no self-message | The address is local under the owner-only list too (6.2's gate), as it is for the owner's own write. | Inherited; accepted. |
+| 5. A REPLY as the owner when the writer also attends (the limits below) | `local_attendee()`, the first local line of a hash set under the merged list (below). | Inherited; accepted. The second run is skipped there (6.2's gate). |
+
 **Upstream limits delegate sending inherits** (recorded, not fixed):
 
 - **UID collision across the owner's calendars.** The recipient's copy is
@@ -1927,7 +2014,8 @@ fan-out in the grantee's session, on the owner's behalf:
   hash set under the merged list, so when the writer is also an attendee of
   the invitation the REPLY is built for the owner's line or the writer's,
   nondeterministically (a REPLY for the writer's own line is not attempted,
-  or upstream answers 412 `CannotModifyAddress`).
+  or upstream answers 412 `CannotModifyAddress`). No second run happens
+  on this side (6.2's gate; the table above, row 5).
 - **`SENT-BY` in stored copies, per component** (review finding 8,
   re-review finding 6). Each component of a recipient's stored copy takes
   its ORGANIZER line, `SENT-BY` included, from the message that last set
@@ -1979,33 +2067,41 @@ A grantee that changes its own participation in the owner's copy instead
 of its own gets upstream's behaviour: under the merged addresses the
 owner's event is organized locally, so the change is an organizer-side
 update, sent to the other attendees as the owner with `SENT-BY` the
-grantee (6.2), and no REPLY is built. Self-delivery (6.2, point 2) keeps
-the grantee's own copy consistent with the owner's (re-review finding 3,
-revision 6; re-review finding 2, revision 7). The self-message builder
-guarantees these cases whatever upstream's builders produce, the grantee
-the event's only attendee included:
+grantee (6.2), and no REPLY is built. Self-delivery (6.2, point 2) gives
+the grantee's own copy what upstream sends an ordinary attendee when the
+owner makes the same write (re-review finding 3, revision 6; re-review
+finding 2, revision 7; re-review finding 1, revision 9), the grantee the
+event's only attendee included:
 
 - **an update** of a component the grantee attends, in any field its copy
-  shows, SEQUENCE or not (its own line's change, a SUMMARY edit): a
-  REQUEST of the full committed tree, the same for each of its attending
-  addresses, each carrying that address's token (re-review finding 1,
-  revision 8);
-- **a decline**, whether upstream announces it or not (re-review finding
-  4): the same REQUEST;
-- **a deletion** of the shared event: a CANCEL built from the prior tree;
+  shows: upstream's update REQUEST, the full one when a master change
+  reaches the grantee (`organizer_request_full` from
+  `organizer_handle_update`, `organizer.rs:181-205`), a partial one
+  otherwise (`:207-304`); a sole attendee's SUMMARY edit gets the full
+  REQUEST at the unchanged SEQUENCE (`organizer.rs:41-53`);
+- **a decline**: the update REQUEST as for any change of the grantee's
+  line, by 6.2's one exception (upstream drops a DECLINED attendee,
+  `send_update_messages`, `mod.rs:221`; re-review finding 4);
+- **a deletion** of the shared event: `itip_cancel`'s CANCEL
+  (`event_cancel.rs:34-81`), the sole attendee's included;
 - **the removal of the grantee's own line**, other attendees remaining or
-  not: a master CANCEL from the prior tree when the grantee attends no
-  component afterwards, an instance CANCEL for an override it no longer
-  attends under any address, and the REQUEST, never a CANCEL, when it
-  still attends the component under another alias;
-- **the deletion of an override** the grantee attends: an instance CANCEL
-  of it, its SEQUENCE the override's prior one plus one.
+  not: the partial CANCEL of each instance it no longer attends, the main
+  instance's when its line left the master (`organizer.rs:58-74`,
+  `:207-304`);
+- **the deletion of an override** the grantee attends: the partial CANCEL
+  of that instance (`organizer.rs:111-131`), at the override's prior
+  SEQUENCE plus one.
 
-In each, the grantee's drain merges the item into its own copy, the
-server keeps both copies consistent either way, and the grantee's later
-reply from its own copy is neither stale nor refused. The page (4.8) and the
-real-device check (11.5) still say that an attendee answers from its own
-copy, the path every client expects.
+When the same write also sends the grantee the full update, that update
+governs and the partials are dropped, as upstream drops them for any
+attendee (`organizer.rs:136-168`).
+
+In each, the grantee's drain merges the item into its own copy as an
+ordinary attendee's copy would merge it, the behaviours of 6.2's
+inherited table included, and the grantee's later reply from its own copy
+is neither stale nor refused. The page (4.8) and the real-device check
+(11.5) still say that an attendee answers from its own copy, the path
+every client expects.
 
 ### 6.4 The SEQUENCE floor and the UID lease
 
@@ -2450,7 +2546,10 @@ accounts:
    - a delegated REPLY: bob, who is not an attendee of it, changes alice's
      PARTSTAT on an invitation from carol held in the shared calendar;
      carol's drain accepts it (`SENT-BY` bob on alice's ATTENDEE line,
-     alice's token) and applies it;
+     alice's token) and applies it; when bob instead sets alice's line to
+     `DELEGATED-TO` bob, carol receives one REPLY as alice and bob's inbox
+     receives nothing from that write (no second run on the attendee
+     side, 6.2's gate);
    - carol's reply to the delegated REQUEST reaches alice's inbox and
      alice's drain merges it into the event in the shared calendar;
    - bob organizes under his own address from alice's calendar: the
@@ -2503,26 +2602,12 @@ accounts:
     `bob-work@`; his inbox receives one self item per address, his own copy
     holds both pairs, and replies from both aliases apply at alice's drain,
     both after the self-import and after a later REQUEST replaced the
-    tokens. Alias payloads (re-review finding 1, revision 8), in a
-    recurring event alice organizes where bob attends the master as `bob@`
-    and an override as `bob-work@`, each case asserting on bob's own copy,
-    after his drain and a refresh, its final set of components, which of
-    them are cancelled, and both token pairs: bob edits only the master's
-    SUMMARY through the shared calendar, and the override survives with
-    both pairs kept; bob removes `bob@` from the master while `bob-work@`
-    still attends the unchanged override, and nothing is cancelled and the
-    override survives; with bob's drain skipped, the two alias items of
-    one write are applied in each order (a fixture reorders the pending
-    items), and the copy ends the same; bob replaces `bob@` by `bob-work@`
-    on the master, nothing is cancelled, the master names `bob-work@`, and
-    a reply from `bob-work@` applies at alice's drain. The CANCEL's
-    SEQUENCE (re-review clarifications, revision 8): in an event alice
-    organizes whose only attendee is bob, with the master at SEQUENCE 1
-    and an override bob attends at SEQUENCE 3, bob removes the override
-    through the shared calendar, for which upstream returns
-    `NothingToSend`; the instance CANCEL in bob's inbox carries SEQUENCE
-    4, and bob's copy no longer shows the override's own version after his
-    drain and a refresh.
+    tokens. A sole-attendee create (6.2's success rule): bob creates
+    through the shared calendar an event alice organizes whose only
+    attendee is bob, then edits its SUMMARY and deletes it; his own copy is
+    created, updated and cancelled, each after his drain and a refresh.
+    Revision 9's alias-payload and CANCEL-SEQUENCE cases are replaced by
+    case 25's differential form (re-review finding 1, revision 9).
 11. The gate: a token with its own keys but no grant, an impersonation
     copy, a Bearer token, and a grant to a group planted in the store by a
     fixture are refused on the shared calendar; the group member's
@@ -2624,6 +2709,63 @@ Concurrency, in `sharing_races.rs`:
     with a new key-domain id and a new generation-1 CK; the same session
     then reads the calendar and creates a new event, and a freshly
     authenticated session of alice's reads that event and the calendar.
+25. The differential lifecycle test (re-review recommendation, revision
+    9; 6.2's contract; it replaces case 10's revision 9 alias and
+    CANCEL-SEQUENCE cases), in `sharing.rs` though numbered after the
+    concurrency cases, so that the earlier numbers stay. The same edit
+    sequence runs twice, against two fixtures with separate UIDs: in run A
+    alice writes in her own session and bob, a key account, is an ordinary
+    invited attendee; in run B bob writes through his edit grant on
+    alice's shared calendar. Carol, a third key account, attends in both.
+    After every step the test drains bob (`trigger_drain`,
+    `tests/src/utils/za.rs:1254-1267`), fetches bob's copy in both runs
+    (`copy_href`, `:1281-1305`), normalizes both and compares them.
+    - Normalized: DTSTAMP, UID and href; `SENT-BY` on ORGANIZER (per
+      component, delegated messages only); LAST-MODIFIED and CREATED
+      unless both runs PUT identical bodies.
+    - Compared: the component set, the RECURRENCE-IDs, SEQUENCE (never
+      normalized: comparing it is the point), STATUS, every ATTENDEE line
+      with its parameters (PARTSTAT and `SCHEDULE-STATUS` included), RRULE
+      and the dates; the token pairs at store level, by presence per
+      address only (tokens are minted fresh, `fanout.rs:977-990`).
+    - The steps, each asserting equality: a create with bob on the master
+      and on an override; a master SUMMARY edit; a DTSTART edit; an
+      override added that bob attends; bob removed from that override
+      while carol stays; a master SUMMARY edit again (6.2's inherited
+      table, row 1, shows in both runs: the test asserts equality, not
+      cancellation); bob re-added to the override; an override bob
+      attends deleted; bob's line removed from the master while carol
+      stays; bob re-invited; the event deleted.
+    - A second fixture runs the alias steps of revision 9's case 10, with
+      bob attending as `bob@` and `bob-work@` (a master-only SUMMARY edit
+      with the override attended through the other alias, `bob@` removed
+      from the master while `bob-work@` attends the override, `bob@`
+      replaced by `bob-work@` on the master), in the same differential
+      form, asserting equality only.
+    - A separate run asserts the delta of 6.2's one exception: bob's line
+      DECLINED, `RSVP=FALSE`, `SCHEDULE-AGENT=CLIENT` and `NONE`, and a
+      line not NEEDS-ACTION on a create and on a new override: run B
+      delivers and run A does not, and bob's copy in run B shows the
+      change.
+    - Harness: `DrainOn` (`tests/src/za/drain.rs:51-66`; the suite skips
+      drains by default, `tests/src/za/mod.rs:121-124`); the fan-out is
+      synchronous inside the PUT and the DELETE (`update.rs:354-374`,
+      `delete.rs:255-273`), so no `wait_for_delivery`, which hangs on an
+      alarm not yet due (`tests/src/utils/za.rs:625-647`); the events end
+      in the future (`crates/groupware/src/calendar/itip.rs:1092-1093`); a
+      pass that leaves an item pending defers the next by 30 s, and a
+      pass is capped at 32 items; everything created is deleted for
+      `assert_is_empty`. The comparison helper, modelled on upstream's
+      private `normalize_ical` (`tests/src/webdav/cal_itip.rs:420-451`),
+      is new test code (13.1).
+
+    **The stopping criterion** (re-review recommendation, revision 9):
+    the self-message design is complete when no edit sequence
+    demonstrates a difference between the two runs beyond 6.2's one
+    exception, and every behaviour the owner's own write also produces is
+    recorded in 6.2's inherited table. A later review's finding is judged
+    against it: a divergence between the runs is a defect; an inherited
+    behaviour is a row of the table.
 
 ### 11.3 Key-mode CalDAV suite
 
@@ -2737,15 +2879,22 @@ only when the builders produced messages (10, sole-attendee decline); the
 cache keyed without the key-domain id (24, third run); the rename not
 advancing the boundary (1, rename into a former slug); the boundary taken
 from a change id read before the rename's commit (1, paused rename); no full
-sync while the boundary is pending (1, paused rename); self-delivery on a
-SEQUENCE change only (10, SUMMARY edit); no self-CANCEL (10, deletion);
-self-messages taken from upstream's builders' output only (10, the
-sole-attendee SUMMARY edit and deletion); no self-CANCEL on the writer's
-removal (10, self-removal); one self item for all aliases (10, aliases);
-per-address payloads (10, alias payloads, the master-only SUMMARY edit); a
-master CANCEL while an alias still attends (10, alias payloads, the removal
-of `bob@`); the CANCEL's SEQUENCE taken from the committed tree (10, the
-CANCEL's SEQUENCE); a new grantee given only the newest generation (7); a
+sync while the boundary is pending (1, paused rename); no self-CANCEL (10,
+deletion); one self item for all aliases (10, aliases); the second run under
+the merged list, which delivers nothing to bob (25, every step); the second
+run placed after the first run's finalize, which sends bob SEQUENCE n+2 (25,
+the DTSTART edit); upstream's public entry point run on the real tree for
+the second run, a double increment (25, the DTSTART edit); `force_send` set
+alone, so that an `RSVP=FALSE` writer gets nothing (25, the exception's
+run); the schedule tag left unset when only the second run built, so that
+the sole-attendee create's later deletion builds nothing (10, sole-attendee
+create); bob delivered from the first run's output, which gives him nothing
+or a foreign partial group's lines (25); the second run on the attendee
+side, which builds a delegate invitation the fan-out never sends
+(`attendee.rs:256-271`, `fanout.rs:902-911`; 9, the delegation through the
+shared copy, and planning records it as equivalent if nothing of it is
+observable); the differential test's SEQUENCE normalized, which lets the n+2
+mutation through (25); a new grantee given only the newest generation (7); a
 grantee's dead property written into the owner's personal bundle (2, with
 the unit test of 11.1); a plaintext event skipped by the conversion (3).
 
@@ -2816,12 +2965,14 @@ adds:
     server bugs and not as the authorization, that the
     `SENT-BY` resolves to the item's `changed_by`, a key account other than
     the named one. The fan-out seals with the session's own keys and pins,
-    computes token locality against the event account's own addresses and
-    builds the writer's own messages from the writer's attendance before
-    and after the write for the account's one copy, one self item per
-    address as its token carrier (6.2); the UID lease and the SEQUENCE
-    floor of a shared calendar's event are keyed by the calendar's
-    account.
+    computes token locality against the event account's own addresses,
+    and gives the writer's own copy exactly the messages upstream's
+    organizer builders would address to the writer's addresses had the
+    owner made the same write in her own session, with the writer an
+    ordinary attendee, the per-attendee filters lifted for the writer
+    alone and one self item per address as its token carrier (6.2); the
+    UID lease and the SEQUENCE floor of a shared calendar's event are
+    keyed by the calendar's account.
 39. Sharing never yields another account's account keys: a session holds
     only its own MK, EWK, mail wrapping key and private key, and the
     collection keys of the calendars it owns or is granted. A grantee never
@@ -2934,24 +3085,25 @@ stands unless the code says otherwise.
    `resolve_inner`'s exclusion of the sender's own inbox carved out for it.
    How the writer's lines are served is decided (re-review finding 4;
    re-review findings 3 and 4, revision 6; re-review finding 2, revision
-   7; re-review finding 1, revision 8): a self-message builder, fork code
-   beside upstream's builders, which stay unchanged, derives the writer's
-   messages from its attendance under any of its addresses before and
-   after the write, before any recipient filtering and whatever those
-   builders return: a REQUEST of the full committed tree when a component
-   the writer attended or attends changed, a CANCEL built from the prior
-   tree per component the writer no longer attends under any address (a
-   master CANCEL only when it attends nothing), its SEQUENCE the prior
-   component's plus one, raised to a surviving component's, and one self
-   item per address as the token carrier, never an independent copy (6.2,
-   point 2).
-   The writer's addresses stay out of upstream's recipient map, so no
-   message reaches the writer twice, and the fan-out takes the prior tree
-   beside the committed one (the PUT holds it for the diff, the DELETE
-   reads it before the delete). The parameters' names and the call sites
-   (`update.rs`, `delete.rs`, the calendar `DELETE` per event) are
+   7; re-review finding 1, revision 8; re-review finding 1 and
+   recommendation, revision 9): by parity, the second run of 6.2, point 2,
+   which replaces revisions 8 and 9's self-message builder. Planning
+   carries out: the second run in fork code in
+   `crates/groupware/src/calendar/`, calling upstream's `pub(crate)`
+   builders on snapshots taken under the owner's addresses, with the three
+   routing fields set on the writer's entries; the split of `itip_cancel`
+   into a snapshot-taking `pub(crate)` function behind the existing entry
+   point, with no behaviour change; the owner's addresses fetched at the
+   three sites (the update and the create in `update.rs`, the DELETE loop
+   in `delete.rs`); the "either run built" rule at the fan-out's call and
+   at the schedule tag; and the normalizing comparison helper of 11.2's
+   case 25, modelled on upstream's private `normalize_ical`
+   (`tests/src/webdav/cal_itip.rs:420-451`), as new test code. Case 25's
+   stopping criterion (11.2) decides whether a later finding is a defect
+   or a row of 6.2's inherited table. The parameters' names and the call
+   sites (`update.rs`, `delete.rs`, the calendar `DELETE` per event) are
    planning's; the owner's and a plain writer's calls pass their own
-   account and build no self-message.
+   account and make no second run.
 10. **The drain's delegated branch** (6.2, point 3): the `SENT-BY` parsing
     (a `mailto:` URI, compared after key pinning section 4.3's
     normalization) and its resolution to `changed_by`, the key-account test
@@ -3081,14 +3233,21 @@ Merge hotspots this release adds (fork insertions in upstream files):
   linked `MOVE` and the rewrap in `copy_move.rs`, the cache invalidation
   after a shared calendar's `DELETE` in `delete.rs`). In `update.rs` and
   `delete.rs` the fan-out calls now pass the event's account beside the
-  writer's `account_info` and keys (6.2), and both pass the prior tree and
-  call the fan-out for the writer's self-messages even when upstream built
-  no message; `copy_move.rs` also holds the rename's two boundary writes
-  (5.2).
+  writer's `account_info` and keys (6.2), both make the second run of
+  6.2 (the update and the create before the first run's finalize, the
+  DELETE in its message loop), and the fan-out call and the schedule tag
+  follow "either run built"; `copy_move.rs` also holds the rename's two
+  boundary writes (5.2).
+- `crates/groupware/src/scheduling/event_cancel.rs` (upstream's file:
+  `itip_cancel` split into a snapshot-taking `pub(crate)` function behind
+  the existing entry point, with no behaviour change, for the second
+  run's deletion; revision 10).
 - `crates/groupware/src/calendar/fanout.rs` (fork-owned: the event-account
-  parameter, the owner-address token locality, the self-message builder
-  and `resolve_inner`'s carve-out, the
-  `SENT-BY` placement, no withheld entries for a delegated fan-out) and
+  parameter, the owner-address token locality, the delivery of the
+  second run's kept messages to the writer's addresses and
+  `resolve_inner`'s carve-out, the `SENT-BY` placement, no withheld
+  entries for a delegated fan-out), the second run's own fork module in
+  `crates/groupware/src/calendar/`, and
   `crates/groupware/src/calendar/drain.rs` (fork-owned: the delegated
   branch of the step-2 sender check and its reason string). The delegate
   path depends on `scheduling_account_info`'s merged addresses (the
@@ -3096,17 +3255,22 @@ Merge hotspots this release adds (fork insertions in upstream files):
   item's ORGANIZER or acting ATTENDEE resolves to `changed_by`, on
   `changed_by` being the writer in every item the fan-out writes, on
   upstream's builders never addressing a local address
-  (`send_update_messages`, `organizer.rs`, `event_cancel.rs`), which keeps
-  each self-message single while the self-message builder runs beside
-  them, on the REQUEST merge's `AddComponent` and the
-  CANCEL merge's ORGANIZER copy (`inbound.rs`), which 6.2's per-component
-  `SENT-BY` statement describes, on that merge's full update and master
-  cancellation (a REQUEST carrying the master removes the components it
-  omits, a master CANCEL cancels the omitted overrides, `inbound.rs:94`,
-  `:157`, `:231`, `:265`) and the drain's one copy per UID
-  (`drain.rs:662`), for which the self-message builder plans its payloads
-  (revision 9), and on upstream's write-time ACL checks in `update.rs` and
-  `delete.rs`, which are the authority for a delegated message.
+  (`send_update_messages`, `organizer.rs`, `event_cancel.rs`), so that the
+  first run never reaches the writer, on the REQUEST merge's
+  `AddComponent` and the CANCEL merge's ORGANIZER copy (`inbound.rs`),
+  which 6.2's per-component `SENT-BY` statement describes, on that merge's
+  full update and master cancellation (`inbound.rs:94`, `:157`, `:231`,
+  `:265`) and the drain's one copy per UID (`drain.rs:662`), which 6.2's
+  inherited table records, and on upstream's write-time ACL checks in
+  `update.rs` and `delete.rs`, which are the authority for a delegated
+  message. The second run (revision 10) depends on
+  `organizer_handle_update`, `organizer_request_full` and the split
+  `itip_cancel` staying reachable and pure apart from their increments
+  vector, on the three routing fields (`force_send`, `rsvp`,
+  `is_server_scheduling`) staying outside `Attendee`'s equality and hash
+  and outside every payload, on `itip_finalize` running only on `Ok`, and
+  on `build_cancel_component`'s recipient filter; an upstream change to
+  any of them needs a re-read of 6.2's mechanism.
 - `crates/groupware/src/calendar/seal/{event,collection,tree}.rs` (fork)
   and `crates/groupware/src/calendar/{drain,storage}.rs` (the key domain).
 - `crates/http/src/api/mod.rs` and `vault.rs` (routing), the new
