@@ -1113,3 +1113,151 @@ file scope, preservation of the historical review text and the unrelated mail re
 the unchanged HEAD/index. Product implementation, builds, tests, runtime probes, mutation
 execution and native acceptance remain unperformed. The three corrected documents remain
 uncommitted.
+
+## Recheck of revision 14, 2026-10-23
+
+- Reviewed: commit `09ba2858` (spec revision 14, the plan and this file, committed
+  together; the paragraph above predates that commit) against the "Focused correction
+  disposition, revision 14" table, D5, S1-S20, R19, R20 and the code. One independent
+  read-only reviewer at the Opus tier, adjudicated by the session's controller. No build,
+  test or edit.
+- Result: every row of the disposition table has implementing text in the spec and the plan,
+  and the four departures the table declares (one lookup-failure boundary; the overwrite
+  seam observing the returned message rather than queue counts; S20 recorded rather than
+  the exclusion widened; the unmerged writer list rebuilt from the merged record) are sound
+  against the code. The mutation ledger and spec 11.6 agree at 56 entries each, the
+  catch-all kill now in the spec; the commands, task order, coverage table and Global
+  Constraints are intact; every named hook and helper exists. No P1; one P2; six P3; seven
+  notes. Nothing architectural remains: the P2 and the P3s are test seams and fixture
+  placement. The plan can start executing once the P2 is written into Task 6; the P3s can
+  be folded into the same pass or fixed before their owning tasks.
+
+### P2
+
+**V1. [P2] Task 6 cannot inject the conversion losses case 23 requires.** Spec case 23
+(2927-2931) requires opaque assertion losses in phase 1, in the calendar and event chunks,
+in the `reverting` ring write and in the final unshared rewrite; plan Task 6 step 1
+(664-667) repeats it "through direct store-backed fixtures". The only conversion hooks are
+`SHARE_PRECHECK_PAUSE`, `SHARE_REWRAP_PAUSE` and `SHARE_REWRAP_FAIL_ONCE` (plan 703-705; spec
+2643-2658): the rewrap pause can produce chunk losses; phase 1 loses only if its archive
+read precedes the precheck pause, which neither document says; nothing sits between the
+read and the commit of the mark-reverting write, the rollback chunks or the final restore;
+and the fail-once hook is a cut, not an `AssertValueFailed` (the existing pattern returns
+`UnexpectedError`, `crates/dav/src/calendar/mod.rs:267-275`). Fix: name one injection per
+write class, a pause slot placed after that write's read or a fail-once hook that returns
+`AssertValueFailed`; state which archive each write asserts relative to its pause; add the
+hooks to 11.2's list.
+
+### P3
+
+**V2. [P3] The overwrite seam does not show the flipped flag in Bob's fixture.** Spec case 12
+(2855-2862) expects `Some(true)` "for this scheduled fixture", Bob's MOVE, and plan 602-607
+records `has_inner_message`. The overwrite passes the mover's own unmerged info
+(`copy_move.rs:655-658`); when Bob is neither organizer nor attendee the CANCEL builder
+fails (`storage.rs:594`, `event_cancel.rs:28`, `snapshot.rs:353-360`) and the return is
+`Some(ZaDeleteMessage { message: None })`, so the inner flag stays false under the
+mutation. Task 5's owner fixture does kill it. Fix: record `delete_za`'s outer
+`Option::is_some()`, true exactly when `send_itip && schedule_tag && future`
+(`storage.rs:581-584`), whoever moves; or require the observation in the owner run and
+correct the spec's claim. Name the seam's home (`common::za::test_hooks`) where it is
+defined, not only in Task 5's Files.
+
+**V3. [P3] R20's "valid no-carrier" versus "partial carriers" has no classifier.**
+`is_sealed` checks only that the root's last entry is `X-ZA-KEY` (`seal/event.rs:151-161`);
+`unseal_event` treats everything else as plaintext, stray `X-ZA-SEALED` or `X-ZA-EXTRA`
+entries included (`:271-278`); `seal_event` has no already-sealed check (`:187-189`). Spec
+5.6 (1646-1647) and 3.5 (646) are stricter than the reader, and plan 591-595 names no
+classifier while `seal/*` belongs to Task 2. Fix: define one classifier in Task 2 and use it
+in conversion phase 2, MOVE and owner reads; or adopt `is_sealed` and define "partial" as
+sealed input whose envelope fails to open.
+
+**V4. [P3] R20's regression and the overwrite observation sit in Task 5's implementation
+step.** Plan 596-607 are in step 3; step 1 (575-584) lists only "case 12", and its snippet
+`assert_eq!(moved_encrypted_payload, original_encrypted_payload)` (581) is false on the
+full-seal path. The regression sentence omits sole parent and no scheduling (R20 asked for
+both; spec case 12 asserts sole parent but not no scheduling), and nothing says how an
+"already converted shared destination" exists before Tasks 6-7 (Task 4 uses staged
+shared-form fixtures, 507). Fix: move both tests into step 1 with the full assertion list,
+limit the payload-equality snippet to sealed input, name the staged fixture.
+
+**V5. [P3] D5's failed direct-alias fixture is not in case 25.** Case 25 has the suppressed
+group (3013-3015) and the exception run (3043-3049) but no failed direct alias; it appears
+in 11.1 (2614-2619) and 6.2 (2014-2016) while plan Task 10 (1148-1149) and ledger row 1235
+attribute it to case 25, and no 11.6 mutation covers D5's second clause (alias identity
+independent of lookup success). Fix: add it to case 25's exception run (run B records
+`5.1` and writes no item; run A sends nothing) or re-attribute it to 11.1 and Task 9;
+optionally add the mutation.
+
+**V6. [P3] The shared-group ORGANIZER fixture (inherited row 7) has no explicit test owner.**
+Task 8 (863-865) hands "omitted SENT-BY and inherited drain rejection" to Task 9's direct
+fixtures, which never name it (967-1007); Task 10's "shared and writer-only group fixtures"
+(1127) could mean row 4 or row 7. Fix: name both fixtures in Task 9 step 1 and Task 10.
+
+**V7. [P3] The HTTP forms of cases 3, 23 and 24 have no owning step.** Task 6's tests are
+now "direct store-backed" (664); case 24's 409 `calendar has linked events`, case 3's grant
+counts and Bob's reads, and case 23's "next grant completes" need Task 7's endpoint or Task
+10's admission, but Task 7 step 1 (741) lists cases 4-8, 13-14 and 16-20 and the activation
+lists (320, 1123) omit Task 6. Fix: give the end-to-end runs to Task 7 step 1 and Bob's
+reads to Task 10, or add Task 6 to the activation lists.
+
+### Notes
+
+- **V-N1.** S20 is labelled "inherited" (spec 2197-2201) but only the delegated write
+  produces it; the owner's own write records `5.3` by self-exclusion. The stopping
+  criterion (3062-3068) admits only what the owner's write also produces. Acceptable as
+  Jay's recorded limitation: call it a fork limitation and let the stopping criterion cite
+  the limits list.
+- **V-N2.** The catch-all cold reset (plan 999) invalidates one domain, but the fixture uses
+  distinct source and target domains (994); `Domain(id)` clears only that id
+  (`invalidate.rs:392-396`), so the other stays warm and emits a `domainName` hit. Invalidate
+  both.
+- **V-N3.** Two spec 3.5 clauses lag the plan: the list of conflicting writes (656-657) omits
+  the rollback's per-event rewrap chunks, which the plan includes (679-680); the
+  "interrupted first grant" paragraph (728-735) still says the next grant "finishes phase 2"
+  and ignores `reverting`, against 707-712.
+- **V-N4.** The paragraph above this section says the three documents remain uncommitted;
+  `09ba2858` holds all three.
+- **V-N5.** The revision 14 header (62-67) omits section 12, though invariant 36 (3270-3274)
+  and invariant 38's clause (3293-3295) changed.
+- **V-N6.** S-N1's wording (plan 1026-1027) covers the update branch only; at an
+  existing-event PUT that takes the create branch (`update.rs:259-266`) the error arm's
+  `if let Some(schedule_tag)` (`:323-325`) does nothing, so the tag must be set to 1 when
+  only the second run built (spec 1967-1975), which plan 1023-1024 states only generically.
+- **V-N7.** Task 5 replaces the read memo (621-622), which lives in `PropFindData`
+  (`crates/dav/src/common/propfind.rs:104`), a file not in Task 5's Files; fine if Task 3
+  exposes a replace API through `common/za.rs`.
+
+### Verified in this recheck
+
+D5 (spec 1834-1844, 2023-2025, 2053-2059, 3293-3295; plan 72-76, 257-264, 828-830,
+862-866, 880, 915-919): `AccountInfo.addresses` is flattened (`principals.rs:835-871`), so
+the resolver rebuilds the direct aliases from the account record's own addresses, as the
+plan says; a failed lookup on a direct alias yields `5.1` with no item (`fanout.rs:537`).
+S1 (spec 1743-1746, 1771-1778, 1816-1826, row 7 at 2173; plan 246-253, 847-850, 863-865,
+901-903, 910-912, 960-962, 1010-1013): the merged info keeps the writer's record
+(`principals.rs:818-819`); groups are their own accounts, so a shared-group ORGANIZER
+resolves to the group's id, not `changed_by`, and both runs are refused alike. S2 (spec
+2614-2619; plan 925-931, 984-986, 893, row 194): one boundary suffices because the
+resolver does every lookup on the delegated path and the fan-out reuses its results
+(`fanout.rs:305-315`). S3 (plan 99-102, 600-614, ledger 1236; spec 1651-1656,
+3646-3647): with keys the CANCEL is returned and discarded, not queued
+(`storage.rs:595-614`), and the seam calls `delete_za` directly, avoiding the discard at
+`storage.rs:466`. S4 with S13-S15: `za_share_precheck` and `ZaSharePrecheck {
+needs_conversion }` in `sharing/mutations.rs` (plan 729-734, 768-771); all conflicting
+writes (679-680); the four resume states (685-687; spec 707-712); bounded exits (spec
+705-707, invariant 36); Task 7 owns precedence, the eighth-loss 409 and the budget test
+(741-747). S5 with S11-S12 (plan 967-992, 1123, 1153-1155, 320; spec 2611-2614). S6-S7
+(plan 993-1007, 1150-1151; spec 2620-2625; the cold and warm expectations match
+`principals.rs:68-75`, `:158-172`, `:254-277`, `:346-353`). S8-S10 and S19:
+`ZaSenderCandidate` (962-965, 1073; spec 2106-2108); the combinator alone removes R
+(948-949, 1052-1054; spec 1930-1931); the gate's tree versus both-tree collection (254,
+910-916; spec 1826-1827); private fields with accessors (823-827); a mismatched identity
+returns `Unauthorized`; a reused failure is traced once (956-959). S16-S18 and R19:
+ownership table 170-198; Files 440, 555-559, 712-716; setters 623-626; the quiet catch-all
+at 932-941 and 1287; spec 2018-2020, 2619-2625, 3213-3214, 3625-3636. S20 (spec 2197-2201,
+3025-3026; plan 989-990, 1061-1062, 1146-1147). R20 (spec 642-649, 703-704, 1639-1647,
+2846-2854; plan 101-102, 591-599, 1154, 1307). S-N1 to S-N4 and S-N6 (plan 1026-1027,
+140-142, 484-486, 619-622, 701, 106-108, 1128, 1037-1039; spec 1909-1911, 699-701,
+1388-1391). `HookParked` takes the `Pause` shape (`tests/src/utils/za.rs:836-845`);
+`DrainOn` (`tests/src/za/drain.rs:54`), `Traced` (`tests/src/za/mail/mod.rs:327`),
+`plant_inbox_item` (`:971`) and `schedule_statuses` (`:813`) exist.
