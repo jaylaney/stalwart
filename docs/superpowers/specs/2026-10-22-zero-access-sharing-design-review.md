@@ -1,131 +1,142 @@
 # Zero-access sharing design review
 
-Re-reviewed 2026-10-22 in `release3-mail-spec`, on branch `release4-sharing-spec-r1`.
+Re-reviewed 2026-10-23 in `release3-mail-spec`, on branch `release4-sharing-spec-r1`.
 
-- Spec: revision 7, draft for review.
-- Source HEAD: `4c2211d45fa8f9c98153566c510c7a8980144a1a`.
-- Spec SHA-256: `e4dd3cec86608ec3720a6878f6958f45aa702e05151bb2244f3f1143663e1cde`.
-- Result: two P2 findings below. The previous P1 key-cache finding is addressed in the design.
-- Previous review: revision 6 at `52ebb3f7588d24a925cfdf664839893516811573`,
-  committed as `b4d5c79d469bcf1f765e73197d7b0c9a50994c33`.
-  This report supersedes that finding list; each earlier finding's disposition follows.
-- Method: static review of the revision 6-to-7 spec changes against current Rust source.
-  Between the committed previous review and this HEAD, only the spec changed. Three independent
-  reviewers covered keys/conversion, DAV sync/rename, and scheduling; the primary reviewer
-  checked the evidence and adjudicated findings. Reviewers continued on their inherited parent
-  route at `xhigh`; the exact parent model identity and capability ceiling were not exposed.
-- Validation boundary: no builds, tests, server runs, client probes, or implementation edits.
-  “Addressed” means addressed in the design, not implemented or verified at runtime.
-  Proposed regression cases have not been executed.
+- Spec: revision 10, draft for review.
+- Source HEAD: `ca2ed1ff6d2432dd96912213317d19ae7057d74d`.
+- Spec SHA-256: `447eb90527963d931417448b48a59d62cf26f508a552c1c739325c8f37bc47c2`.
+- Result: two P2 findings in the new second-run mechanism. The revision 9 recurrence
+  finding is explicitly accepted under the revised contract, not fixed.
+- Previous review: revision 9 at `50dc7ad8cbc09dc719ebe517ffd84d5d4a329c57`,
+  recorded in this file but not committed. This report supersedes it.
+- Scope: bounded owner/delegated lifecycle comparison, the routing exception, and case 25's
+  oracle. Three independent reviewers covered builder parity, routing through recipient
+  processing, and the test contract; the primary independently checked the source evidence.
+  Reviewers deliberately inherited the parent model and effort because the exact originating
+  model identity and capability ceiling were not exposed.
+- Validation boundary: source inspection only. No builds, tests, server runs, client probes,
+  or implementation edits. Proposed regressions have not been executed.
 
-## Disposition of the revision 6 findings
+## Disposition of the previous review
 
-| Previous finding | Revision 7 disposition |
+| Item | Revision 10 disposition |
 |---|---|
-| 1. [P1] Cached CK survives rollback/reconversion under the same identity | Addressed: each conversion draws a fresh key-domain ID, the cache includes it, every lookup reads the current ring's ID, and associated data binds it ([§3.1](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/docs/superpowers/specs/2026-10-22-zero-access-sharing-design.md:374); [§3.6](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/docs/superpowers/specs/2026-10-22-zero-access-sharing-design.md:686)). The regression preserves one DAV session across rollback and reconversion ([case 24](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/docs/superpowers/specs/2026-10-22-zero-access-sharing-design.md:2396)). |
-| 2. [P2] Rename into another calendar's slug exposes its history | Partially addressed: rename advances a boundary in every ring, which closes the sequential example. Reading that boundary before the committing transaction leaves a race; see current finding 1. |
-| 3. [P2] Self-delivery misses ordinary updates and cancellations | Partially addressed: existing messages now reach the writer, including same-SEQUENCE REQUESTs and CANCELs. The builders can suppress the message before fan-out receives it; see current finding 2. |
-| 4. [P2] One self item cannot carry tokens for multiple aliases | Addressed: the contract now requires one self item per distinct attending address, preserving the one-pair pending format and address-specific merge ([§6.2](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/docs/superpowers/specs/2026-10-22-zero-access-sharing-design.md:1658)). |
+| Revision 9 P2: a later full update reactivates a cancelled override | Explicitly inherited and accepted in [table row 1](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/docs/superpowers/specs/2026-10-22-zero-access-sharing-design.md:1994). It is no longer a defect against the revised parity contract; it has not been fixed. |
+| Override-only attendee cannot consume a master-only deletion CANCEL | Explicitly inherited and accepted in [table row 3](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/docs/superpowers/specs/2026-10-22-zero-access-sharing-design.md:1996). The prior payload clarification is withdrawn; adding a component solely for the writer would violate the new contract. |
+| Revision 8/9 account-level alias and hand-derived CANCEL rules | Withdrawn by [the new contract](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/docs/superpowers/specs/2026-10-22-zero-access-sharing-design.md:1741). The alias outcome is accepted in [table row 2](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/docs/superpowers/specs/2026-10-22-zero-access-sharing-design.md:1995) and compared differentially rather than required to preserve the series. |
 
-No additional actionable issue was established in the revised key-domain/associated-data
-contract or per-address token rule. Earlier resolved findings are not repeated below.
+These accepted behaviors are not reopened below. Both findings concern the fork's proposed
+mechanism or its deliberate exception.
 
-## 1. [P2] Bind the rename sync boundary to the committing transaction
+## 1. [P2] Carry the CLIENT/NONE exception through recipient processing
 
-Location: [§5.2, recording the rename boundary](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/docs/superpowers/specs/2026-10-22-zero-access-sharing-design.md:1289)
-and [§5.6, rename write](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/docs/superpowers/specs/2026-10-22-zero-access-sharing-design.md:1494).
+Location: [snapshot-only routing exception](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/docs/superpowers/specs/2026-10-22-zero-access-sharing-design.md:1879) and
+[self-item merge promise](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/docs/superpowers/specs/2026-10-22-zero-access-sharing-design.md:1914).
 
-The new rename boundary is the last calendar change ID read before the commit, rather than
-the ID assigned atomically to that commit. Asserting the renamed calendar does not fence
-unrelated calendar history written after that read.
+Setting `is_server_scheduling = true` in the builder's snapshots makes a self-CANCEL
+addressable, but does not make its payload acceptable to the writer's drain. Unlike REQUEST
+export, the CANCEL builder preserves the original ATTENDEE's `SCHEDULE-AGENT` parameter.
 
-A concrete interleaving is:
+A concrete lifecycle:
 
-1. Alice starts renaming granted Q from `/other/` to vacant `/family/`. The request reads
-   the last calendar change ID B, then pauses before writing.
-2. Another Alice session creates private P at `/family/`, creates and deletes
-   `medical-visit.ics` at D > B+1, then deletes P.
-3. Q's rename resumes. P's writes changed neither Q's archive nor Alice's vault, and the
-   destination is free again, so the calendar assertion passes. The new ring headers record
-   B even though the rename's actual commit ID R is greater than D.
-4. Bob submits numeric sync position S=B+1. It is newer than Q's grant and recorded rename
-   boundaries, so the request passes. Q's current `/family/` prefix admits P's tombstone at
-   D, exposing a filename from a private calendar Bob was never granted.
+1. Bob creates an event through Alice's shared calendar, with Alice as ORGANIZER and Bob
+   as the sole attendee on the **master**, using `SCHEDULE-AGENT=CLIENT` or `NONE`.
+2. The second run sends Bob the REQUEST. REQUEST export strips `SCHEDULE-AGENT`, so his
+   drain imports the active personal copy
+   ([REQUEST export](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/groupware/src/scheduling/itip.rs:252)).
+3. Bob deletes that shared event. The overridden snapshot selects Bob as a recipient, but
+   the master CANCEL clones his original ATTENDEE line, including `CLIENT`/`NONE`
+   ([CANCEL construction](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/groupware/src/scheduling/event_cancel.rs:60);
+   [verbatim property copying](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/groupware/src/scheduling/event_cancel.rs:147)).
+4. The drain parses the incoming message with `itip_snapshot(..., false)` before its
+   delegated sender check ([incoming snapshot](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/groupware/src/calendar/drain.rs:584)).
+   Alice's ORGANIZER is external to Bob; Bob's ATTENDEE is local but not server scheduled,
+   so it does not satisfy `has_local_emails`
+   ([local attendee condition](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/groupware/src/scheduling/snapshot.rs:217)).
+   The snapshot returns `NotOrganizerNorAttendee`
+   ([snapshot result](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/groupware/src/scheduling/snapshot.rs:353)).
+   The CANCEL is rejected and Bob's personal event remains active.
 
-The current destination lookup occurs before the rename
-([copy_move.rs](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/dav/src/calendar/copy_move.rs:124)),
-and creation permits a currently vacant slug
-([mkcol.rs](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/dav/src/calendar/mkcol.rs:63)).
-[rename_container](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/dav/src/calendar/copy_move.rs:1085)
-updates Q through the index builder, which asserts Q's archive
-([index.rs](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/common/src/storage/index.rs:349)).
-It does not assert the separately read account-log position.
+This is not inherited table row 3: Bob's master ATTENDEE line is present. It is a failure to
+deliver the behavior promised by the deliberate filter exception. An ordinary owner write
+would suppress this recipient, while this design intentionally creates and maintains his copy.
 
-[get_last_change_id](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/store/src/query/log.rs:192)
-is an independent log scan. RocksDB allocates the actual per-account change ID inside the
-later write transaction
-([rocksdb/write.rs](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/store/src/backend/rocksdb/write.rs:174)).
-The token parser accepts numeric positions without proof of issuance
-([Urn::parse](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/dav/src/common/uri.rs:197)),
-and vanished lookup returns account-wide paths after that position
-([Store::vanished](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/store/src/query/log.rs:136)).
+Specify how that exception remains effective through incoming and stored-event snapshotting,
+without relaxing ordinary-message checks. Merely changing the first parse to `true` is
+insufficient: that option also bypasses the ORGANIZER's scheduling-agent check
+([organizer check](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/groupware/src/scheduling/snapshot.rs:107)), and later merges parse both
+stored and incoming trees with `false`
+([merge snapshots](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/groupware/src/calendar/drain.rs:1057)). A successful CANCEL merge would
+itself store the copied ATTENDEE parameters
+([CANCEL merge](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/groupware/src/scheduling/inbound.rs:209)).
+Keep any exception scoped to the authorized self-delivery path and preserve the specified
+sender, organizer and token validation.
 
-Derive the stored boundary from the rename's transaction-assigned change ID, or use an
-equivalent atomic fence that forces retry when intervening relevant changes occur. Merely
-moving an unfenced read closer to the commit leaves the same window.
+Extend [case 25's exception run](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/docs/superpowers/specs/2026-10-22-zero-access-sharing-design.md:2745) through create, drain, DELETE, drain
+for each of CLIENT and NONE, asserting the personal copy is cancelled. Include a subsequent
+update/reinvitation where applicable so accepting the cancellation cannot leave the stored
+copy unparseable.
 
-Extend the rename regression with a pause after reading the proposed boundary. Create and
-delete a private calendar and event at the destination while paused, finish the rename, and
-verify that no token admitted afterward can return the private tombstone.
+## 2. [P2] Preserve finalize cleanup when only the second run builds
 
-## 2. [P2] Build self-messages when normal scheduling suppresses the writer's message
+Location: [first-run NothingToSend behavior](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/docs/superpowers/specs/2026-10-22-zero-access-sharing-design.md:1800) and
+[reconciliation substituted for finalization](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/docs/superpowers/specs/2026-10-22-zero-access-sharing-design.md:1831).
 
-Location: [§6.2, reuse of built messages and fallback](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/docs/superpowers/specs/2026-10-22-zero-access-sharing-design.md:1635)
-and [planning handoff, extra recipients placed in fan-out](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/docs/superpowers/specs/2026-10-22-zero-access-sharing-design.md:2703).
+The combined SEQUENCE reconciliation repairs the missing increments, but it does not perform
+`itip_finalize`'s other operation: stripping `SCHEDULE-FORCE-SEND` from the committed
+ORGANIZER and ATTENDEE lines. The spec explicitly leaves that tree unstripped when the first
+run returns `NothingToSend`.
 
-Adding the writer to the fan-out recipient map works only when an appropriate message already
-exists. The revised handoff explicitly leaves the upstream builders unchanged, and the only
-independent fallback is a REQUEST when the writer's own ATTENDEE line changed. It cannot
-fulfill the update, deletion, and removal promises in [§6.3](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/docs/superpowers/specs/2026-10-22-zero-access-sharing-design.md:1812) in these cases:
+A concrete comparison outside the routing exception:
 
-1. **Sole-attendee edit.** Alice organizes an event whose only attendee is edit-grantee Bob,
-   who already has his personal invitation copy. Bob changes only SUMMARY through Alice's
-   shared calendar. Under the merged addresses Bob is local, so the builder finds no recipient
-   and returns `NothingToSend`. There is no message to augment, and Bob's ATTENDEE line did
-   not change, so the fallback does not run. His personal summary stays stale.
-2. **Sole-attendee deletion.** Bob deletes that shared event. The CANCEL builder applies the
-   same local-recipient filter and returns `NothingToSend`. The new rule has no CANCEL to
-   copy and defines only a REQUEST fallback; Bob's personal copy stays active.
-3. **Removing the writer.** Bob removes his own ATTENDEE line while Carol remains invited.
-   Upstream's cancellation discovery excludes local Bob, so it emits no CANCEL for him.
-   Carol's REQUEST no longer contains Bob. Building a fallback REQUEST from that committed
-   tree cannot cancel his copy; with no Bob address, the recipient's snapshot rejects it.
+1. Alice is ORGANIZER; Bob is the sole attendee, with ordinary NEEDS-ACTION participation
+   and `SCHEDULE-FORCE-SEND=REQUEST` on his ATTENDEE line.
+2. In run A, Alice creates the event. Upstream builds Bob's REQUEST and finalizes the
+   committed tree, removing that parameter
+   ([create finalization](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/groupware/src/scheduling/event_create.rs:23);
+   [parameter cleanup](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/groupware/src/scheduling/itip.rs:354)).
+3. In run B, Bob submits the same create through his grant. Bob is local under the merged
+   list, so the first run has no recipients and returns `NothingToSend`
+   ([recipient selection](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/groupware/src/scheduling/organizer.rs:366);
+   [empty result](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/groupware/src/scheduling/organizer.rs:389)).
+   The second run builds his REQUEST, but neither run cleans the committed tree.
+4. After the initial drain, the corresponding owner/delegated DELETE copies the stored
+   attendee parameters into its CANCEL. Run B includes `SCHEDULE-FORCE-SEND`; run A
+   does not. The CANCEL merge copies that difference into Bob's personal event
+   ([CANCEL payload](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/groupware/src/scheduling/event_cancel.rs:147);
+   [copied merge entries](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/groupware/src/scheduling/inbound.rs:209)).
 
-The common filter excludes local attendees
-([send_update_messages](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/groupware/src/scheduling/mod.rs:221)).
-The organizer update collects recipients at
-[organizer.rs](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/groupware/src/scheduling/organizer.rs:77)
-and returns `NothingToSend` when none remain
-([empty-message result](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/groupware/src/scheduling/organizer.rs:133)).
-The cancellation builder likewise requires a nonempty recipient set
-([event_cancel.rs](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/groupware/src/scheduling/event_cancel.rs:47)).
-DELETE can still invoke fan-out with an empty message list; that does not supply the missing
-CANCEL
-([delete_all_za](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/groupware/src/calendar/storage.rs:594);
-[DELETE fan-out](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/dav/src/calendar/delete.rs:255)).
+The initial REQUESTs hide the difference because export strips the parameter.
+[SEQUENCE reconciliation](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/groupware/src/calendar/sequence.rs:161) changes sequence values
+only, so it cannot prevent the later payload and personal-copy divergence. NEEDS-ACTION
+was already deliverable in run A; none of the deliberate filter exceptions is needed here.
 
-For removal, cancellation discovery uses only external attendees
-([organizer.rs](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/groupware/src/scheduling/organizer.rs:58)).
-The drain validates the incoming snapshot before merging
-([drain.rs](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/groupware/src/calendar/drain.rs:1061)),
-and a tree with no local organizer or attendee is rejected
-([snapshot.rs](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/groupware/src/scheduling/snapshot.rs:353)).
+Require owner-equivalent cleanup when only the second create/update run succeeds, while
+retaining exactly one sequence increment. Preserve upstream's distinction between normal
+successful update finalization and the cancellation fallback, which does not finalize the
+new tree ([update branches](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/crates/groupware/src/scheduling/event_update.rs:30)).
 
-Derive writer-directed scheduling from old and new attendance before recipient filtering,
-either within the builders or through an independent self-message builder. Require REQUESTs
-for relevant updates even without another recipient, and CANCELs derived from prior attendance
-for deletion/removal. Preserve the per-address item and token rule.
+Add this sole-attendee create-to-delete comparison to
+[the existing sole-attendee case](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/docs/superpowers/specs/2026-10-22-zero-access-sharing-design.md:2605) / case 25, retaining all ATTENDEE
+parameters in the comparison. Case 25 already correctly requires those parameters to be
+compared ([comparison fields](/Users/jay/Development/stalwart/.worktrees/release3-mail-spec/docs/superpowers/specs/2026-10-22-zero-access-sharing-design.md:2726)); its main fixture's additional Carol
+recipient can make the first run succeed and therefore conceal this particular path.
 
-Extend case 10 with explicit sole-attendee SUMMARY and DELETE cases, plus removal of the
-writer while another attendee remains. Check the personal copy after drain and refresh;
-covering the sole-attendee decline alone does not exercise these branches.
+## Bounded review conclusions
+
+The move to upstream parity supplies a usable stopping criterion. The second run's
+pre-finalize placement, combined SEQUENCE reconciliation, either-run schedule tag, and
+DELETE-loop placement are source-consistent apart from the cleanup omission above.
+No additional actionable finding was established in the inspected create, SUMMARY, DTSTART,
+override addition/removal, reinvitation, alias and deletion paths.
+
+Case 25 has an implementable comparison oracle: it retains SEQUENCE, component identity,
+attendee parameters and token-address presence while normalizing the stated incidental
+differences. No independent defect was established in its harness or normalization contract.
+Keeping its number after the concurrency cases is harmless. Recording the attendee-side
+mutation as equivalent when unobservable is appropriate; it should not count as a killed
+mutation without an observable assertion.
+
+The review does not require a new self-message architecture or fixes to the inherited table.
+The remaining work is the two concrete gaps above, followed by verification of their scoped
+changes against the same contract. Implementation and runtime validation remain outstanding.
