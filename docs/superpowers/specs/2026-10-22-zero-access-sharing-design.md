@@ -1,6 +1,6 @@
 # Zero-access calendar: sharing between key accounts (release 4) design spec
 
-Date: 2026-10-22. Status: revision 11, draft for review. Scope: release 4
+Date: 2026-10-22. Status: revision 14, draft for review. Scope: release 4
 of the zero-access fork (jaylaney/stalwart); GitHub issue #24, milestone
 "Release 4: calendar sharing". Revision 2 answers the builder check and
 the adversarial review of revision 1: the shared bundle (3.3), the
@@ -46,7 +46,25 @@ revision 9's re-review finding 1 is accepted as inherited (6.2's table, row
 revisions 8 and 9's self-message builder is withdrawn. Revision 11 answers
 the lifecycle review of revision 10: the exception narrowed to RSVP and
 PARTSTAT (6.2) and the committed tree finalized when only the second run
-built (6.2).
+built (6.2). Revision 12 incorporates Jay's decisions on the implementation
+plan review: MOVE overwrite/source-unlink keeps upstream's no-scheduling
+behaviour (5.6, 6.2); self-message recipients are classified by account
+resolution, with a provenance-based self-inbox exception (6.2, case 25).
+Revision 13 incorporates Jay's D3/D4 decisions on that recheck: listed
+writer addresses alone get the RSVP/PARTSTAT exception; routing retains
+both writer-only listed addresses and addresses resolving to the writer
+(6.2). It completes the hook definitions, distinguishes builder success
+from recipient filtering, mirrors both update-site builder branches,
+and makes the overwrite, sub-address, group and owner-status assertions
+explicit (11.1–11.2, 11.6), including the payload-locality limit in 6.2's
+inherited table. Invariant 38 and the merge dependencies follow
+these rules; incoming validation remains unchanged.
+Revision 14 incorporates D5 and the revision 13 plan review's accepted
+clarifications: the routing override is limited to directly owned listed
+aliases, delegated identity roles and quiet catch-all lookup are explicit,
+conversion conflicts remain safe and resumable, and MOVE covers legacy
+plaintext input and an observable no-scheduling overwrite check (3.5,
+5.6, 6.2, 11 and 14).
 
 The terms key account, master key (MK), event wrapping key (EWK), data key
 (DEK), `X-ZA-KEY`, `X-ZA-SEALED`, `X-ZA-EXTRA`, wrap type, collection
@@ -621,7 +639,7 @@ owner's grant request, in three phases (author's call):
    From this commit on, every write into the calendar seals under the CK
    (5.5). A grant that finds the calendar already in the shared form reuses
    its ring.
-2. **The DEK rewrap.** Every event of the calendar that still carries a
+2. **The DEK rewrap.** Every already-sealed event of the calendar that still carries a
    `0x01` envelope is rewritten with its DEK opened under the EWK and
    rewrapped under the newest generation as a `0x03` envelope. Nothing
    else changes: the sealed trees, bundles and token pairs stay as they
@@ -635,7 +653,12 @@ owner's grant request, in three phases (author's call):
    rewrapping. Rewrites commit in batches of 100 events (author's call),
    each event asserting its own stored archive; an event that loses its
    assertion is re-read (a concurrent writer has sealed it under the CK,
-   5.5) and skipped when it already carries `0x03`. The phase ends with a
+   5.5) and skipped when it already carries `0x03`. An opaque assertion
+   loss on a phase-1, phase-2, `reverting`-ring or final unshared rewrite
+   returns a typed conversion conflict to the HTTP coordinator, with
+   committed counts and progress information; the coordinator reapplies
+   fresh vault, account, calendar and request-budget guards before retry.
+   The phase ends with a
    scan that finds no event of the calendar without a `0x03` envelope and
    no event with a second parent.
 3. **The grant.** One batch: the `acls` entry, the grantee's entry with its
@@ -654,9 +677,8 @@ shared form no new link can form, since the single-parent rule refuses a
 `COPY` of an event with a shared parent and a `MOVE` that would leave one
 linked (5.6), so the window is the precheck's alone, and phase 2's walk
 closes it. A linked event found by the walk aborts the conversion before
-any rewrap, and the same request reverts phase 1 in the owner's session,
-so that no request that runs to its end leaves a partly converted
-calendar behind (re-review finding 1):
+any rewrap, and the request begins reverting phase 1 in the owner's
+session (re-review finding 1):
 
 1. it rewrites the owner ring marked `reverting`, so that writes into the
    calendar seal under the EWK again while the ring still holds the CK
@@ -670,14 +692,24 @@ calendar behind (re-review finding 1):
    conversion draws a new one),
 
 each step asserting the calendar archive as read, and then answers the
-precheck's 409, `calendar has linked events` (author's call on the
+precheck's 409, `calendar has linked events` once rollback completes
+(author's call on the
 `reverting` step: without it, an event sealed under the CK between phase 1
-and the revert would be left unreadable once the ring went). A request that
-dies between phase 1 and the end of the revert leaves the shared form with
-`converted` unset and no grant, a state the owner reads in full (every
-event is `0x01` or `0x03` under its own ring) and the write rule of 5.5
-keeps safe; the next grant resumes there: it finishes a revert that was
-under way, or walks again and either reverts or continues. The owner
+and the revert would be left unreadable once the ring went).
+Ring-only changes to mark `reverting` assemble the same entry set with
+rewritten headers and unchanged sealed bundles; they cannot go through a
+bundle sealer that only retains unopened entries. A request that dies
+between phase 1 and the end of the revert leaves the shared form with
+`converted` unset and no grant, a state the owner reads in full (valid
+no-carrier legacy plaintext, `0x01`, or `0x03` under its own ring), which the write rule of 5.5
+keeps safe. A terminal guard, exhausted retry budget or store error may
+also end a request in that safe `converted=false` or `reverting` journal
+state. The next grant dispatches by state: without a ring it starts phase 1
+with a fresh domain id; with `converted=true` it skips conversion; with
+`converted=false` it resumes phase 2 and repeats the complete parentage
+walk for this request before any rewrap; with `reverting` it finishes
+rollback before beginning any new conversion. It does not start another
+phase 1 while a ring remains. The owner
 removes the link (deletes the other calendar's copy of the event, which
 unlinks without resealing, 5.5) and grants again.
 
@@ -717,7 +749,9 @@ needs it, because a grantee exists only after phase 3.
   `Server::za_private_key`, which runs key pinning's self-check once per
   `SessionKeys` (its section 3.3). The cache's size is bounded by the
   calendar generations the account can open (author's call: no separate
-  bound).
+  bound). Read-only operations may memoize the resolved calendar context
+  by (owner, calendar) for one request, within 4.6's accepted in-flight
+  read window; every write reads afresh and never uses that read memo.
 - **Residency is the session keys' own** (release 1 section 5): the key
   cache's 15-minute idle timeout and 60-minute cap, the sweep, LRU
   eviction, zeroing when the last reference drops, and removal by any
@@ -1351,7 +1385,10 @@ shared calendar is two fenced writes:
 
 - **Step 1**, the rename itself (the archive with the new slug, in the same
   transaction as today, `rename_container`), also sets the boundary-pending
-  flag in the owner ring's header and in every grant ring's header. While a
+  flag in the owner ring's header and in every grant ring's header. This
+  ring-only rewrite assembles the same entry set with changed headers and
+  unchanged sealed bundles; a bundle sealer that retains only unopened
+  parts cannot perform it. While a
   grant ring's flag is set, every incremental `sync-collection` of that
   grantee (`SyncType::From`, whatever its token) on the calendar, and on a
   home whose eligible calendars include it, is refused with 403
@@ -1600,14 +1637,27 @@ dragged between calendars.
   account, and the gate refuses the one grantee token that would be a
   member, one carrying `Impersonate` (5.1).
 - An event `MOVE` between calendars of different key domains (an unshared
-  and a shared calendar, or two shared calendars) rewraps the event's DEK
-  under the destination's domain in the mover's session and asserts both
-  calendar archives (5.5). The owner holds every domain of its account; a
+  and a shared calendar, or two shared calendars) rewraps an already-sealed
+  event's DEK under the destination's domain in the mover's session and
+  asserts both calendar archives (5.5). A valid legacy plaintext event
+  with no carrier is fully sealed under a fresh DEK and the destination's
+  domain: its newest CK generation for an active shared calendar, or the
+  EWK for an unshared or reverting destination;
+  malformed or partial carrier sets are refused as corruption, never
+  treated as plaintext. The owner holds every domain of its account; a
   grantee moves only between two calendars granted to it at the edit level
   (upstream's checks: `RemoveItems` on the source, `AddItems` on the
   destination) and holds both CKs. A `MOVE` within one domain copies the
   stored bytes, as release 1 does. A `MOVE` that overwrites a destination
-  event deletes it, and that deletion schedules as a `DELETE` does (6.2).
+  event deletes it without scheduling, as upstream does: the key-account
+  overwrite passes the resolved destination domain and writer keys to
+  `delete_za` with `send_itip=false`; source-unlink and any collection
+  overwrite also retain that flag and never enter fan-out
+  (`copy_move.rs:747-756`; collection overwrite `:931-943`). An
+  in-account event MOVE removes its source name with `names.swap_remove`
+  (`:678`), not a source-event DELETE. The cross-account source-deletion
+  paths are unreachable for key accounts under the existing cross-account
+  refusal (`:122`).
 - An event `MOVE` into a shared calendar must leave that calendar the
   event's only parent (review finding 2). Upstream's `MOVE` removes the
   source name and adds the destination one (`move_event`,
@@ -1677,8 +1727,8 @@ Only the ACL authorizes this, and upstream does not mark the messages as
 sent on anyone's behalf.
 
 **Release 4's rule: delegate sending, marked.** A grantee's write into a
-key account's shared calendar (a `PUT`, a `DELETE`, a `MOVE` that
-overwrites an event) schedules as upstream decides, and runs release 2's
+key account's shared calendar (a `PUT` or a `DELETE`; MOVE overwrite and
+source-unlink do not schedule) schedules as upstream decides, and runs release 2's
 fan-out in the grantee's session, on the owner's behalf:
 
 1. **Identity in the message.** In every component the fan-out sends, the
@@ -1688,11 +1738,11 @@ fan-out in the grantee's session, on the owner's behalf:
    `SENT-BY="mailto:<writer's address>"` (RFC 5545 section 3.2.18) when
    that address is the owner's and the writer is a grantee. The server sets
    it at fan-out time, from the writer's primary calendar address (the
-   first of the writer's own addresses in `scheduling_account_info`'s
-   list), and replaces any `SENT-BY` the client wrote on that property, so
+   first of the writer's own addresses in its unmerged account info), and
+   replaces any `SENT-BY` the client wrote on that property, so
    a grantee cannot name a sender of its choosing. When the property names
-   the writer's own address (the writer organizing in its own name from the
-   owner's calendar, which upstream also allows), no `SENT-BY` is added,
+   the writer's own address (including a group address both owner and
+   writer hold), no `SENT-BY` is added,
    any the client wrote is removed, and the fan-out runs exactly as release
    2's; the owner's own writes are treated the same way. The placement
    scrubs the naming property only: a client's `SENT-BY` on any other line
@@ -1720,7 +1770,12 @@ fan-out in the grantee's session, on the owner's behalf:
    (`crates/dav/src/calendar/update.rs:448-453` and `:236-238`), and only
    the lease's fence reaches the fan-out. What the fan-out needs beside the
    writer's merged `account_info` is the event's account, the owner's, as a
-   separate parameter (13.1 names it), for three things:
+   separate parameter (13.1 names it), for three things. The merged sender
+   remains upstream's scheduling identity; the unmerged writer info,
+   reconstructed separately if needed, supplies the writer's own addresses
+   including groups for `SENT-BY`; owner-only info supplies locality and
+   snapshots. The override's directly owned alias set expands the writer's
+   listed aliases without groups (6.2's mechanism):
    - **Token locality.** The token union and the pairs persisted in the
      owner's event are computed against the owner's own addresses, not the
      merged list, so every attendee that is not the owner holds a pair, the
@@ -1733,7 +1788,7 @@ fan-out in the grantee's session, on the owner's behalf:
      finding 4; re-review findings 3 and 4, revision 6; re-review finding
      2, revision 7; re-review finding 1, revision 8; re-review finding 1
      and recommendation, revision 9). Under the merged list upstream's
-     builders count the writer's addresses as local and address nothing to
+     builders count the writer's listed addresses as local and address nothing to
      them (`send_update_messages`,
      `crates/groupware/src/scheduling/mod.rs:221`; `NothingToSend` when no
      recipient remains, `organizer.rs:133`; cancellation discovery over
@@ -1743,7 +1798,7 @@ fan-out in the grantee's session, on the owner's behalf:
 
      **The contract.** After a delegated write, the writer's personal copy
      receives exactly the messages upstream's organizer builders would
-     address to the writer's addresses had the owner made the same write
+     address to the writer recipients defined below had the owner made the same write
      in her own session, with the writer an ordinary attendee, with one
      deliberate exception (below). Whatever the owner's own write would do
      to the writer's copy, the delegated write does; a behaviour the
@@ -1758,14 +1813,39 @@ fan-out in the grantee's session, on the owner's behalf:
 
      **The mechanism.**
      - *The gate.* A delegated write (the resource's account is not the
-       authenticated account) whose ORGANIZER is an address of the owner's
-       and not of the writer's. The owner's addresses are
+       authenticated account) whose ORGANIZER in the new tree for a create,
+       or the prior tree for an update or delete, is local under the owner's
+       own addresses. A group address both accounts hold counts as owner-
+       local for this gate and as writer-owned for the `SENT-BY` decision.
+       The owner's addresses are
        `account_info(owner)`
        (`crates/common/src/cache/principals.rs:808-811`); the merged list
        upstream builds for the write (`scheduling_account_info`,
        `:813-829`) is the writer's addresses followed by the owner's that
-       the writer lacks, so the writer's addresses are the merged list
-       minus the owner's. An address both accounts hold (a group's) stays
+       the writer lacks. The unmerged writer info is required to distinguish
+       shared owner/writer addresses. Define two sets over the ATTENDEE
+       addresses of every scheduling component of both supplied trees.
+       **Listed writer addresses (L)** are the merged-list
+       addresses that are not local under the owner's list, including a
+       writer-only group's address. **Writer recipients (R)** are L union
+       addresses resolving to the writer's account through delivery's quiet
+       `za_account_id_from_email` lookup, always excluding owner-local
+       addresses. Thus R includes sub-addresses, custom-rule and catch-all
+       matches. **Override aliases (A)** are L intersected with the writer's
+       directly owned listed aliases (the account's own addresses expanded
+       over domain names, without membership groups). A is classified from
+       listed identity, independently of recipient lookup success. Failure
+       to prepare that listed identity or expand domain names propagates as
+       a normal identity-preparation error for the write; per-recipient
+       delivery lookup failures instead stay in the request's `Failed` map
+       and yield `5.1` attempts. Only A
+       gets the RSVP/PARTSTAT exception (D3/D4/D5); writer-only groups stay
+       in L and R for ordinary retention and removal, without forced send
+       or an added status when RSVP/PARTSTAT suppresses them.
+       Apply upstream's owner-local exclusion first; compare set keys using
+       `za_normalize_address(&attendee.email.email)` and the same normalization
+       for message recipients. Payload addresses are unchanged. An address
+       both accounts hold (a group's) stays
        local and gets no self-message (the table, row 4). On the attendee
        side (the ORGANIZER external under both lists) there is no second
        run: both runs would take `attendee_handle_update`
@@ -1781,7 +1861,7 @@ fan-out in the grantee's session, on the owner's behalf:
        `update.rs:259` for an update and `:495` for a create. It snapshots
        the prior and the committed trees under the owner-only list
        (`itip_snapshot`, `snapshot.rs:17`); on every ATTENDEE entry of both
-       snapshots whose address is the writer's and not the owner's it sets
+       snapshots whose address is in A it sets
        two routing-only fields, `force_send = Some(Request)` and
        `rsvp = None` (public fields, `scheduling/mod.rs:34-49`, `:92-105`;
        outside `Attendee`'s equality and hash, `:277-301`; read by no
@@ -1790,11 +1870,15 @@ fan-out in the grantee's session, on the owner's behalf:
        line says (lifecycle review finding 1, revision 10; the exception
        below); and it calls upstream's inner builders, unchanged, from fork
        code in
-       `crates/groupware/src/calendar/` (they are `pub(crate)`). An update
+       `crates/groupware/src/calendar/` (they are `pub(crate)`). At the
+       existing-event PUT site, mirror upstream's actual branch
+       (`update.rs:259-266`): when `schedule_tag.is_some()`, the second run
        calls `organizer_handle_update(old, new, old_itip, new_itip, &mut
        scratch)` (`organizer.rs:22-28`), mirroring `itip_update`'s organizer
        check, mismatch check and cancel fallback (`event_update.rs:18-48`);
-       a create calls `organizer_request_full(ical, &itip, None, true)`
+       otherwise it takes the create branch, just as the first run does.
+       A create-branch call (including a new-event PUT) calls
+       `organizer_request_full(ical, &itip, None, true)`
        (`organizer.rs:309-314`), mirroring `itip_create`'s checks
        (`event_create.rs:17-25`); a deletion calls the organizer branch of
        `itip_cancel` (`event_cancel.rs:34-81`), which has no seam today (it
@@ -1808,9 +1892,9 @@ fan-out in the grantee's session, on the owner's behalf:
        the second run built, the committed tree is finalized exactly as the
        first run's success would have finalized it (lifecycle review finding
        2, revision 10): `itip_finalize` with the second run's increments for
-       an update (the scratch vector is kept for this case; both runs
+       the update-builder branch (the scratch vector is kept for this case; both runs
        compute the same increments, the SEQUENCE bullet) and with none for a
-       create (`itip_create` finalizes with `&[]`, `event_create.rs:23-25`),
+       create-builder branch (`itip_create` finalizes with `&[]`, `event_create.rs:23-25`),
        so `SCHEDULE-FORCE-SEND` is stripped from every ORGANIZER and
        ATTENDEE line of every scheduling component (`itip.rs:355-369`) and
        the listed components are incremented (`:371-389`). Exactly one
@@ -1823,13 +1907,14 @@ fan-out in the grantee's session, on the owner's behalf:
        upstream leaves it. An error that `failed_precondition()` maps
        (`crates/dav/src/calendar/mod.rs:298-318`) aborts the PUT with 412
        and discards both runs; the other errors behave as upstream's
-       (traced, the tag bumped, the write proceeds). On the organizer side
+       (the first run keeps its trace and the tag is bumped once even when
+       the second run built). On the organizer side
        the second run's errors equal the first run's, `NothingToSend`
        excepted, the only error that depends on the address list.
      - *What is kept from the second run*: the messages whose `to` names a
-       writer address, in upstream's order (the full REQUEST first, then
+       writer recipient, in upstream's order (the full REQUEST first, then
        the partials, `organizer.rs:181-205`, `:207-304`), delivered to the
-       writer's addresses only, one self item per address. Every other
+       writer recipients only, one attempted item per emitted message/address. Every other
        recipient is served by the first run. The second run's full and
        partial REQUESTs equal the first run's apart from DTSTAMP (each
        builder calls `PartialDateTime::now()`, `organizer.rs:220`, `:316`;
@@ -1838,8 +1923,20 @@ fan-out in the grantee's session, on the owner's behalf:
        (`build_cancel_component` keeps the group's ATTENDEE lines,
        `event_cancel.rs:164-176`), and the `to` grouping and the partials'
        hash order differ, so nothing of the second run goes to anyone
-       else. The first run never names a writer address (they are local
-       under the merged list), so each message reaches the writer once.
+       else. Listed writer addresses are local under the merged list, but
+       an unlisted sub-address can also appear in the first run. Remove
+       all writer-recipient addresses from first-run recipient lists on
+       this delegated-organizer path, dropping empty messages, before
+       appending the retained second-run messages. The combinator alone
+       removes R; fan-out consumes the resulting disjoint provenance keys.
+       Do not submit the removed
+       attempts to fan-out or record a refusal for them. Thus every writer
+       recipient is served solely by the second run, once per emitted
+       message/address, even when both builders addressed it.
+       L's writer-only group addresses remain normal delivery targets: a
+       plain group records the ordinary `5.3` status when attempted, never an item
+       redirected into the writer's inbox. R determines retention, not
+       permission to bypass delivery checks.
      - *SEQUENCE.* Both runs compute the same `increment_sequence` (it
        depends on entry changes, attendee-set changes and added or removed
        instances, `organizer.rs:33-131`, and `Attendee` equality ignores
@@ -1876,14 +1973,24 @@ fan-out in the grantee's session, on the owner's behalf:
        discovery, and make the DELETE skip scheduling
        (`crates/groupware/src/calendar/storage.rs:581-584`), so the
        writer's copy would never be updated or cancelled.
+       Here "built" means the builder returned `Ok`, before recipient
+       filtering. An `Ok` first run remains built and finalized even if
+       filtering empties it; do not finalize it again. An `Ok` second run
+       stays built even if no R recipient remains when the first run also
+       built. Under the R union, when the first run returns `NothingToSend`
+       and the second returns `Ok`, at least one second-run recipient is
+       retained. Test that implication rather than redefining an `Ok`
+       result as `NothingToSend` after filtering.
      - *DELETE.* The second run sits in the `delete.rs:257` loop over
        `ZaDeleteMessage.event` (the prior tree unsealed in `delete_all_za`,
        `storage.rs:585-592`, `:603-609`, under the gate `send_itip`, a
        schedule tag and an event ending in the future, `:581-584`; the
        container delete, `delete.rs:153-170`, feeds the same loop, but
        only the owner deletes a calendar, so the second run's gate never
-       passes there) and appends the
-       writer-only CANCEL to `message.message` (`:261`); the owner's
+       passes there). The loop already converts `message.message`
+       (`:261`, an `Option`) into a vector; remove R recipients from the
+       first-run CANCEL, drop it if emptied, then append the retained
+       second-run CANCEL with its provenance. The owner's
        addresses are fetched there too (`delete.rs:79-81` holds the merged
        list). The deletion's pin read and the retirement of withheld
        entries (`fanout.rs:326-357`) stay off for a delegated fan-out, as
@@ -1891,15 +1998,31 @@ fan-out in the grantee's session, on the owner's behalf:
        because of the second run does not switch them on.
      - *Delivery details that stay*: the token union over the owner's
        addresses (`fanout.rs:244-248`, `:948-969`; token locality above);
-       the self-inbox carve-out in `resolve_inner` (`fanout.rs:1086-1089`);
+       the self-inbox carve-out in `resolve_inner` (`fanout.rs:1086-1089`),
+       admitted only by the item's retained-second-run provenance on this
+       delegated-organizer path, never just because an address resolves to
+       the writer; admission also requires resolution to the writer and
+       all receive permissions and key checks. On this path exclude the
+       event owner's inbox too: an unlisted owner address resolving to that
+       account records `5.3`, as the owner's own write would, even though
+       the authenticated sender is the grantee;
        and the self item's delivery status recorded on the writer's line
        of the owner's event exactly as any recipient's (`update.rs:371`),
        so a later CANCEL, which clones ATTENDEE lines verbatim with their
        `SCHEDULE-STATUS` (`event_cancel.rs:147-179`), carries the same line
-       under both paths.
+       under both paths. Account-resolution results used to classify
+       recipients are request-local and shared with fan-out; a lookup error
+       for a listed L alias, including a declined or `RSVP=FALSE` member of
+       A, remains a `5.1` attempted failure with no item. An unlisted failed
+       lookup remains a first-run attempt and also records `5.1`; neither
+       failure permits a self-inbox item. The quiet lookup stays quiet
+       through configured catch-all fallback as well as direct lookup
+       (R19). Incoming snapshot locality and validation are
+       unchanged: delivery to an inbox alone does not guarantee an import.
 
-     **The one exception: RSVP and PARTSTAT never suppress a message to the
-     writer** (author's call of revision 8, kept; narrowed by lifecycle
+     **The one exception: RSVP and PARTSTAT never suppress a message to A's
+     directly owned listed writer aliases** (author's call of revision 8,
+     kept; narrowed by lifecycle
      review finding 1, revision 10). Under the owner-only list the writer is
      not local, and three things still drop it: `is_server_scheduling`
      (false for `SCHEDULE-AGENT=CLIENT` or `NONE`, `snapshot.rs:152-153`),
@@ -1927,6 +2050,13 @@ fan-out in the grantee's session, on the owner's behalf:
      copy to maintain and no refusal; revision 11 withdraws revision 10's
      inclusion of `SCHEDULE-AGENT=CLIENT` and `NONE` in the exception. The
      exception, so narrowed, is the only designed divergence from parity.
+     Revision 13 confines it to listed addresses; revision 14 confines it
+     further to A. An unlisted sub-address, custom-rule
+     target or catch-all address in R but not A retains upstream's RSVP
+     and PARTSTAT filters. Account resolution does not turn such a line
+     into a listed identity, and does not authorize a forced REQUEST. A
+     writer-only group in L likewise retains those filters; ordinary
+     server-scheduled group delivery and sole-group finalize still apply.
      The override is made on the snapshots, not in the trees: rewriting the
      writer's lines in cloned trees would change the payloads
      (`itip_export_component` keeps every parameter but `SCHEDULE-STATUS`,
@@ -1937,8 +2067,10 @@ fan-out in the grantee's session, on the owner's behalf:
      **One self item per address** (re-review finding 4, revision 6).
      Tokens belong to addresses, not accounts, and a pending item carries
      exactly one address and its token (`seal/item.rs:152`, `:210`), so the
-     fan-out sends each kept message as one self item per writer address
-     its `to` names, each with that address's pair, in the existing
+     fan-out attempts each kept message once per writer recipient its `to`
+     names. A recipient resolving to the writer gets one self item with
+     that address's pair; other retained targets, such as a writer-only
+     group, follow normal delivery/status checks. Self items use the existing
      pending format; the drain's REQUEST merge keeps pairs arriving for
      different addresses (`drain.rs:1128`). A self item's address is a
      token carrier and never an independent copy: every item of the UID
@@ -1970,7 +2102,10 @@ fan-out in the grantee's session, on the owner's behalf:
    (`crates/groupware/src/calendar/drain.rs:644-661`) requires the address
    an item names, the ORGANIZER of a REQUEST or CANCEL or the acting
    ATTENDEE of a REPLY, to resolve to the item's `changed_by` principal.
-   That rule stays for every item without `SENT-BY`. An item whose naming
+   That rule stays for every item without `SENT-BY`. The drain carries the
+   candidate as `ZaSenderCandidate { named, sent_by }`: `named` supplies
+   the merge sender and reply-token match, while `sent_by` supplies the
+   delegated consistency check. An item whose naming
    property carries `SENT-BY` passes instead when its `SENT-BY` address
    resolves to an address of the item's `changed_by` principal,
    `changed_by` is a key account, and the named address resolves to a
@@ -2034,9 +2169,14 @@ the writer alone.
 | 3. An override-only writer's copy stays active after the event's deletion (re-review clarification, revision 9) | `itip_cancel` collects recipients over every component (`event_cancel.rs:41-52`) but builds a master-only CANCEL with the master's ATTENDEE lines (`:55-67`, `:164-165`); the writer's drain finds no local line and refuses it (`snapshot.rs:353-361`; `drain.rs:584-589`), as a plain account's ingest does (`crates/groupware/src/calendar/itip.rs:157`). | Inherited; accepted: answered by parity, with no component retained in the CANCEL. |
 | 4. A group address both accounts hold gets no self-message | The address is local under the owner-only list too (6.2's gate), as it is for the owner's own write. | Inherited; accepted. |
 | 5. A REPLY as the owner when the writer also attends (the limits below) | `local_attendee()`, the first local line of a hash set under the merged list (below). | Inherited; accepted. The second run is skipped there (6.2's gate). |
+| 6. A message whose payload has no listed, server-scheduled line of the recipient can reach its inbox but fail incoming validation | `Email::new` uses exact local-address membership (`scheduling/mod.rs:244-250`); the incoming snapshot requires some local server-scheduled line (`snapshot.rs:217`, `:353-361`). Account resolution for delivery does not change that snapshot rule. | Inherited; accepted in both runs. Case 25 separately checks transport parity and receiver rejection; no self-only validation exception. |
+| 7. A shared owner/writer group as ORGANIZER enters the delegated-organizer path, then its item is refused at the recipient's drain | The shared group is owner-local for the gate and writer-owned for `SENT-BY`, so the fan-out adds no `SENT-BY`; the named group resolves to the group id rather than the writer's `changed_by`, and the ordinary sender check rejects it. | Inherited; accepted. Case 25 checks the gate, omitted `SENT-BY` and receiver rejection. |
 
 **Upstream limits delegate sending inherits** (recorded, not fixed):
 
+- **MOVE overwrite.** The overwritten event's attendees, including any
+  personal copy of the writer's, keep their active copies: MOVE sends no
+  CANCEL, as the owner's own MOVE sends none (5.6; case 12).
 - **UID collision across the owner's calendars.** The recipient's copy is
   matched by UID, and upstream refuses a duplicate UID only within the
   target calendar (`assert_is_unique_uid`, a rule the fork's
@@ -2054,6 +2194,11 @@ the writer alone.
   nondeterministically (a REPLY for the writer's own line is not attempted,
   or upstream answers 412 `CannotModifyAddress`). No second run happens
   on this side (6.2's gate; the table above, row 5).
+- **An attendee-side REPLY to an unlisted owner sub-address.** The second
+  run is skipped on this side. An unlisted owner sub-address may resolve to
+  the event owner's inbox and reach it, whereas the owner's own write would
+  record `5.3`. This inherited limitation does not change the delegated-
+  organizer owner-inbox exclusion above or incoming validation.
 - **`SENT-BY` in stored copies, per component** (review finding 8,
   re-review finding 6). Each component of a recipient's stored copy takes
   its ORGANIZER line, `SENT-BY` included, from the message that last set
@@ -2380,7 +2525,7 @@ calendar cannot be deleted (upstream).
 | JMAP `Calendar/set` `shareWith`, JMAP calendars | `accountNotSupportedByMethod`; not advertised | unchanged (release 6) |
 | Grants to non-key accounts and groups; `Share`, `Delete`, free/busy-only and the unenforced bits | n/a | refused by the endpoint (`not a key account`; levels only) |
 | A grantee's `PROPFIND`, `GET`, `HEAD` and `REPORT` (`calendar-query`, `calendar-multiget`, `sync-collection`) | 403 at the URI gate | served, unsealed with the grantee's CK (5.3) |
-| A grantee's `PUT`, `DELETE`, `MOVE` and `PROPPATCH` | 403 | per level; sealed under the CK; scheduling as upstream, with `SENT-BY` (6.2) |
+| A grantee's `PUT`, `DELETE`, `MOVE` and `PROPPATCH` | 403 | per level; sealed under the CK; scheduling as upstream, with `SENT-BY` (6.2); MOVE and PROPPATCH send nothing |
 | A grantee's `PROPPATCH` of the calendar's colour or order | 403 | upstream's: shared dead properties, 403 at view, recolours for every principal at edit (1.2) |
 | `MKCOL`, `MKCALENDAR`, calendar `DELETE`, `ACL` by a grantee | 403 | 403 (upstream: no membership, no `Delete`, no `Share`) |
 | `calendar-home-set` and assisted discovery for a grantee | the key owner's calendars unreachable | listed, with the grantee's names (5.4) |
@@ -2450,7 +2595,8 @@ grantee's three-part names and release 1's two-part names are told apart,
 and any other shape is refused; a conversion's rewrap leaves the trees,
 bundles and token pairs byte for byte unchanged, a plaintext owner entry
 converts straight into the shared form, and a plaintext event is sealed
-under the CK; a grantee's view of a calendar never opens the owner's ring
+under the CK, with both calendar and event assertions; a grantee's view of
+a calendar never opens the owner's ring
 nor the owner's personal bundle, and a grantee's write of a dead property
 rewrites the shared bundle and leaves the owner's ring and personal bundle
 bytes unchanged. In the fan-out: 6.2's `SENT-BY` placement, per method and
@@ -2459,13 +2605,32 @@ and on the acting ATTENDEE of a delegated REPLY; a client's `SENT-BY`
 replaced; none, and a client's removed, when the property names the
 writer's own address or the writer is the owner; a client's `SENT-BY` on
 another line left as it is); the token union computed against the
-owner's addresses, so that the writer holds a pair; the writer's own
-attendee lines among the recipients. In the drain: 6.2's delegated sender
+owner's addresses, so that the writer holds a pair; L, R and A classification
+including writer-only groups, directly owned aliases, sub-addresses, custom
+rules and catch-all; the RSVP/PARTSTAT exception applies to A only. The
+ordinary-provenance self-inbox refusal needs a server-backed za fixture:
+an ordinary item addressed to the sender's listed alias or sub-address is
+not delivered even with a served key; only retained-second-run provenance,
+writer-account resolution and ordinary checks admit it. A deterministic
+test-mode `DELEGATION_LOOKUP_FAIL_ONCE` keyed by sender id and normalized
+address injects one failure before resolver or ordinary `resolve_inner`
+lookup, reusing the request's `Failed` result. A listed L alias, including
+declined or `RSVP=FALSE`, records `5.1` with no item; an unlisted failed
+lookup retains its first-run attempt and records `5.1`. A separate quiet
+catch-all fixture uses a dedicated canary domain, restores
+`catchAllAddress` and custom rules, and checks public `Traced` output
+against `EventType::variants()`; its cold control checks both local parts,
+its warm control checks domain names and both local parts. The quiet runs
+show classification ran through cache population or a positive companion,
+and leak none of the canaries. An unlisted owner address on a delegated
+organizer write records `5.3` and never reaches the owner's inbox. In the
+drain: 6.2's delegated sender
 check against fixture data (a `SENT-BY` resolving to `changed_by`, a key
 account other than the named one, passes; a `SENT-BY` that does not
 resolve to `changed_by`, a plain `changed_by`, a named address that
 resolves to no account or to `changed_by` itself are refused, each with
-the delegated reason string).
+the delegated reason string); a shared group ORGANIZER without `SENT-BY`
+is refused by the inherited ordinary sender check.
 
 ### 11.2 Integration: the za suite
 
@@ -2482,10 +2647,15 @@ unique across modules. New test hooks in
 before phase 1), `SHARE_REWRAP_PAUSE` (a conversion after phase 1, before
 its parentage walk, and between two rewrap batches) and
 `SHARE_REWRAP_FAIL_ONCE` (a conversion cut after phase 1) and
-`SHARE_BOUNDARY_PAUSE` (a rename of a shared calendar after its destination
-lookup, before step 1's commit, and between its two steps, 5.2), beside the
-existing `COMMIT_PAUSE`, which case 22 also places before an event
-`DELETE`'s commit. Test helpers open rings and envelopes with an account's
+`SHARE_RENAME_PAUSE` (a rename of a shared calendar after its destination
+lookup, before its commit) and `SHARE_BOUNDARY_PAUSE` (after the rename
+commit, before boundary completion, 5.2), as independent pause hooks with
+setters compatible with `HookParked`, beside the
+existing `COMMIT_PAUSE` (a leased create, `update.rs:631`) and two new
+one-shot pauses using the same `Pause` shape, keyed by the resource's
+account: `UPDATE_COMMIT_PAUSE` (update PUT after fan-out and seal, before
+`update.rs:405`) and `DELETE_COMMIT_PAUSE` (event DELETE after fan-out,
+before `delete.rs:276`). Test helpers open rings and envelopes with an account's
 password-derived keys to assert generations; they are test code and never
 part of the product build.
 
@@ -2513,10 +2683,11 @@ accounts:
    `valid-sync-token`, and his full sync shows nothing of the old
    calendar. The paused rename (re-review finding 1, revision 7): bob
    holds a grant on alice's calendar at `/other/` and keeps a token; alice
-   renames it to the vacant `/family/` with `SHARE_BOUNDARY_PAUSE` holding
+   renames it to the vacant `/family/` with `SHARE_RENAME_PAUSE` holding
    the rename before step 1's commit, while another session of alice's
    creates a private calendar at `/family/`, creates and deletes an event
-   in it and deletes the calendar; at the second pause, between the steps,
+   in it and deletes the calendar; `SHARE_BOUNDARY_PAUSE` then holds the
+   request between the steps, when
    bob's sync answers 403 `valid-sync-token` with the kept token and with a
    numeric token above every change id so far, and his initial sync (no
    token) is served; after the rename completes, a numeric token one above
@@ -2672,7 +2843,28 @@ accounts:
     between two calendars granted to him rewraps. The linked move (5.6):
     alice copies an event between her unshared calendars A and B, then
     moves its A link into the shared C; the `MOVE` answers 403, and the
-    event keeps its names A and B under the EWK.
+    event keeps its names A and B under the EWK. A valid planted legacy
+    plaintext event moves from an unshared source into an already converted
+    shared destination: the stored tree and event are asserted together,
+    the destination is its sole parent, its envelope is `0x03`, raw
+    plaintext is absent from stored bytes, and owner and grantee can read
+    it. Moving that now sealed event back to an unshared calendar rewraps
+    its existing DEK under the EWK. A same-domain MOVE preserves its
+    accepted stored bytes;
+    partial or malformed carrier inputs are refused as corruption.
+    In a separate future scheduled-event fixture, bob's MOVE between two edit-
+    granted calendars overwrites an event in the destination: no CANCEL is
+    built, queued iMIP task or pending item written, and its attendees' existing copies stay
+    active, as in alice's own MOVE. A test-only
+    `MOVE_OVERWRITE_OBSERVATION` records the actual overwrite deletion's
+    returned inner scheduling-message boolean by owner and event id:
+    normal overwrite is `Some(false)`, while the mutation that flips only
+    `send_itip` to true must produce `Some(true)` for this scheduled fixture.
+    Compare both runs' unchanged pending-item counts and queued scheduling
+    tasks for owner and bob after synchronous MOVE completion, holding
+    `TASK_CONSUMER_PAUSE` through `hold_task_consumer` and checking
+    `itip_tasks_for`, `pending_ids` and `inbox_ids`; include an ordinary
+    account control. These counts complement the return observation.
 13. Recovery: alice recovers her account and bob changes his password;
     both keep reading.
 14. Destruction: a destroyed grantee is listed as `gone` and removed by
@@ -2716,17 +2908,29 @@ Concurrency, in `sharing_races.rs`:
 21. A `PUT` across a conversion: with `SHARE_REWRAP_PAUSE` holding the
     first grant after phase 1, alice's other device writes an event; in a
     second run, a `PUT` that read the calendar before phase 1 is held by
-    `COMMIT_PAUSE` until after it. Every event ends `0x03`.
-22. A `PUT` across a revoke: alice's and bob's `PUT`s held by
-    `COMMIT_PAUSE` while alice revokes carol both commit under the new
+    `COMMIT_PAUSE` for a create, then in a separate variant by
+    `UPDATE_COMMIT_PAUSE` for an update, until after it. Both variants run;
+    every event ends `0x03`.
+22. A `PUT` across a revoke: in two independent runs, alice's and bob's
+    updates are each held by `UPDATE_COMMIT_PAUSE` while alice revokes carol
+    and each commits under the new
     generation; when bob is the one revoked, his held `PUT` answers 403
     and stores nothing. A `DELETE` across a revoke (5.5): bob's `DELETE` of
-    an event, held by `COMMIT_PAUSE` before its commit while alice revokes
+    an event, held by `DELETE_COMMIT_PAUSE` before its commit while alice revokes
     bob, answers 403 and the event stays; a `DELETE` held across a calendar
     `PROPPATCH` by alice commits on its retry.
+    Both hooks run after fan-out: items already delivered by a held write
+    remain delivered when its commit is later refused with 403 (4.6).
+    Assert no event mutation, not an empty recipient inbox.
 23. An interrupted conversion: `SHARE_REWRAP_FAIL_ONCE` cuts the first
     grant; alice reads every event; the next grant completes the rewrap
-    and the grant.
+    and the grant. Direct converter tests inject opaque assertion loss into
+    phase 1, calendar and event chunks, the `reverting` ring and final
+    unshared rewrite, both with unchanged guards and raced vault/Account
+    guards; each reports typed conflict, committed counts and progress,
+    and the next request resumes from its journal state. HTTP coordinator
+    tests own terminal-guard precedence, the eighth-loss 409 `conflict`,
+    and the 3,000-event budget succeeding across later chunks.
 24. A link made after the precheck (3.5): with `SHARE_PRECHECK_PAUSE`
     holding alice's first grant after its linked-event precheck, alice's
     other device copies an event of the calendar into another of her
@@ -2784,6 +2988,42 @@ Concurrency, in `sharing_races.rs`:
       from the master while `bob-work@` attends the override, `bob@`
       replaced by `bob-work@` on the master), in the same differential
       form, asserting equality only.
+    - A distinct sub-address fixture has `bob@` and carol on the master,
+      and `bob@`, unlisted `bob+x@`, and carol on override O1. Confirm the
+      configured resolver maps `bob+x@` to bob. Steps in both runs:
+      create; master SUMMARY edit; DTSTART edit; remove `bob+x@` from O1;
+      re-add it to O1; delete O1; delete the event. The re-add makes both
+      Bob lines present in the prior O1 when that override is deleted.
+      Preserve upstream payloads: removal's partial CANCEL has only the
+      unlisted line and is rejected in both runs; O1 deletion's CANCEL has
+      both lines and is accepted. Do not add lines to exported messages.
+      Compare per-step inbox message/address counts as multisets (partial
+      groups iterate in hash order), token-address presence and copies.
+      Also compare `SCHEDULE-STATUS` on every R line in the owner's stored
+      event after each surviving write, including before DELETE, using
+      `schedule_statuses` (`tests/src/utils/za.rs:813`). REQUEST export
+      strips that status, so the recipient's copy cannot expose a refused
+      first-run duplicate attempt. After DELETE, compare absence instead.
+      A sub-address-only variant compares inbox delivery and the identical
+      incoming rejection when neither payload has any listed local line;
+      it does not broaden receiver validation. A group address shared with
+      alice stays local and gets no self item in either run.
+    - A writer-only `team@` group fixture (bob a member, alice not) is
+      server-scheduled with ordinary RSVP/PARTSTAT. Compare the owner's
+      stored `5.3` status in both runs and no item redirected to bob. With
+      DECLINED or `RSVP=FALSE`, both runs suppress it: no override and no
+      added status. A
+      sole-group create exercises first-run `NothingToSend` and second-run
+      `Ok`: the group attempt is retained, the schedule tag is set and
+      finalize runs once. Also compare a listed Bob plus unlisted owner
+      `alice+y@` fixture: the owner-resolving address records `5.3` and
+      receives no item in both runs.
+      A separate ORGANIZER fixture uses a group both alice and bob hold:
+      it enters the delegated-organizer path, has no `SENT-BY`, and its
+      delivered item is refused by the ordinary sender check because the
+      named group id differs from bob's `changed_by`. An attendee-side
+      REPLY for unlisted `alice+y@` records the inherited owner-inbox
+      delivery difference without changing the delegated-organizer rule.
     - A fixture of its own runs a line of bob's with
       `SCHEDULE-AGENT=CLIENT` and one with `NONE` (lifecycle review finding
       1, revision 10), each through create, drain, DELETE, drain: nothing
@@ -2800,6 +3040,13 @@ Concurrency, in `sharing_races.rs`:
       on a new override: run B delivers and run A does not, and bob's copy
       in run B shows the change (revision 11 withdraws `CLIENT` and `NONE`
       from this run).
+      This exception fixture uses directly owned listed A aliases only. Separate
+      unlisted sub-address, custom-rule and catch-all addresses resolving
+      to bob run the same DECLINED/RSVP=FALSE and non-NEEDS-ACTION cases:
+      both runs suppress those recipients equally. Compare target-specific
+      attempts/statuses, not unrelated listed attendees' REQUESTs. A
+      writer-organizer unlisted sub-address remains on upstream's attendee
+      path with no second run, and keeps the ordinary own-inbox exclusion.
     - Harness: `DrainOn` (`tests/src/za/drain.rs:51-66`; the suite skips
       drains by default, `tests/src/za/mod.rs:121-124`); the fan-out is
       synchronous inside the PUT and the DELETE (`update.rs:354-374`,
@@ -2954,7 +3201,19 @@ the sole-attendee fixture, and 10, sole-attendee create: the stored line
 keeps `SCHEDULE-FORCE-SEND`, so the deletion's CANCEL differs between the
 runs); a new grantee given only the newest generation (7); a grantee's dead
 property written into the owner's personal bundle (2, with the unit test of
-11.1); a plaintext event skipped by the conversion (3).
+11.1); a plaintext event skipped by the conversion (3); writer recipients
+classified by exact listed-address membership (25, sub-address item counts
+and token presence); first-run writer recipients left in the combined
+output (25, the owner's stored per-line `SCHEDULE-STATUS`); self-inbox
+admission based on account resolution without retained-second-run
+provenance (a server-backed negative routing za fixture with an ordinary-provenance item to
+the writer's own account); exception applied to R or all L instead of A
+(25, unlisted sub-address/custom/catch-all and declined writer-only group
+negative exception runs); writer-only group omitted from R (25, `team@`
+owner status and sole-group finalize); quiet catch-all fallback replaced
+by a traced lookup (11.1, cold and warm canary controls and cache proof);
+MOVE overwrite scheduling enabled (12, the returned-message observation
+plus pending-item and queued-task counts).
 
 ## 12. Invariants for implementers
 
@@ -3008,8 +3267,11 @@ adds:
     key account's event seals under the newest generation of its
     calendar's key domain and asserts the calendar archive it read, and no
     write seals or rewraps an event whose names include a shared calendar
-    and another calendar; a conversion that finds such an event rewraps
-    nothing and is undone in the same request.
+    and another calendar. Conversion completes its full parentage walk
+    before any CK rewrap; finding a linked event starts rollback. A
+    terminal guard, exhausted retry budget or store error may leave a
+    safe readable unconverted/reverting journal, which the next grant
+    re-evaluates and resumes under 3.5 before any grant is published.
 37. A revoke rotates in the same write: no write committed after a revoke
     is sealed under a generation the removed grantee held. Ciphertext
     already stored is never resealed by a revoke, and no generation is
@@ -3025,11 +3287,17 @@ adds:
     the named one. The fan-out seals with the session's own keys and pins,
     computes token locality against the event account's own addresses,
     and gives the writer's own copy exactly the messages upstream's
-    organizer builders would address to the writer's addresses had the
+    organizer builders would address to writer recipients R had the
     owner made the same write in her own session, with the writer an
-    ordinary attendee, the RSVP and PARTSTAT filters lifted for the
-    writer alone and one self item per address as its token carrier
-    (6.2); the
+    ordinary attendee, the RSVP and PARTSTAT filters lifted for A alone.
+    R is L union addresses resolving to the writer, excluding owner-local
+    addresses; A is L intersected with directly owned listed writer
+    aliases, excluding membership groups and independent of lookup success.
+    Only retained-second-run provenance plus writer-account
+    resolution and normal delivery checks admits a self item, one per
+    address as its token carrier (6.2). Other retained recipients keep
+    normal routing, and the event owner's inbox stays excluded on the
+    delegated-organizer path. The
     UID lease and the SEQUENCE floor of a shared calendar's event are
     keyed by the calendar's account.
 39. Sharing never yields another account's account keys: a session holds
@@ -3090,7 +3358,8 @@ stands unless the code says otherwise.
    write rule's trace string (revision 6); the boundary-pending flag's
    place in both ring headers and the request point of the owner's
    boundary repair (revision 8); the test hooks, among them
-   `SHARE_PRECHECK_PAUSE` and `SHARE_BOUNDARY_PAUSE`.
+   `SHARE_PRECHECK_PAUSE`, `SHARE_RENAME_PAUSE` and
+   `SHARE_BOUNDARY_PAUSE`.
 2. **The calendar assertion on event writes** (5.5): the assertion class
    (the archive's version, as upstream's `update` asserts it, or a hash of
    the bytes read) and its place before the set on PostgreSQL and MySQL.
@@ -3139,8 +3408,10 @@ stands unless the code says otherwise.
    fan-out. A delegated write needs the event's account, the owner's,
    passed beside `sender` for three things: the token union and the
    persisted pairs computed against the owner's own addresses; the split of
-   the merged list into the owner's addresses and the writer's, for the
-   `SENT-BY` decision; and the writer's self-delivery, with
+   merged sender for upstream routing, unmerged writer addresses for
+   `SENT-BY` (including groups) and direct alias expansion for A (without
+   groups), plus owner-only addresses for locality and snapshots; and the
+   writer's self-delivery, with
    `resolve_inner`'s exclusion of the sender's own inbox carved out for it.
    How the writer's lines are served is decided (re-review finding 4;
    re-review findings 3 and 4, revision 6; re-review finding 2, revision
@@ -3150,7 +3421,7 @@ stands unless the code says otherwise.
    carries out: the second run in fork code in
    `crates/groupware/src/calendar/`, calling upstream's `pub(crate)`
    builders on snapshots taken under the owner's addresses, with two
-   routing fields (`force_send`, `rsvp`) set on the writer's entries and
+   routing fields (`force_send`, `rsvp`) set on A entries only and
    `is_server_scheduling` left as the line says (revision 11); the split
    of `itip_cancel`
    into a snapshot-taking `pub(crate)` function behind the existing entry
@@ -3158,7 +3429,10 @@ stands unless the code says otherwise.
    three sites (the update and the create in `update.rs`, the DELETE loop
    in `delete.rs`); the "either run built" rule at the fan-out's call, at
    the schedule tag and, when only the second run built, at the committed
-   tree's finalize (revision 11); and the normalizing comparison helper of
+   tree's finalize (revision 11); writer recipients R (the listed and
+   resolved union), their removal from first-run output, and a
+   provenance-keyed self-inbox carve-out with writer-account resolution
+   and the ordinary checks (revision 13); and the normalizing comparison helper of
    11.2's
    case 25, modelled on upstream's private `normalize_ical`
    (`tests/src/webdav/cal_itip.rs:420-451`), as new test code. Case 25's
@@ -3296,7 +3570,8 @@ Merge hotspots this release adds (fork insertions in upstream files):
   linked `MOVE` and the rewrap in `copy_move.rs`, the cache invalidation
   after a shared calendar's `DELETE` in `delete.rs`). In `update.rs` and
   `delete.rs` the fan-out calls now pass the event's account beside the
-  writer's `account_info` and keys (6.2), both make the second run of
+  merged writer `account_info`, separately reconstructed unmerged writer
+  identity, and keys (6.2), both make the second run of
   6.2 (the update and the create before the first run's finalize, the
   DELETE in its message loop), and the fan-out call and the schedule tag
   follow "either run built"; `copy_move.rs` also holds the rename's two
@@ -3307,8 +3582,10 @@ Merge hotspots this release adds (fork insertions in upstream files):
   run's deletion; revision 10).
 - `crates/groupware/src/calendar/fanout.rs` (fork-owned: the event-account
   parameter, the owner-address token locality, the delivery of the
-  second run's kept messages to the writer's addresses and
-  `resolve_inner`'s carve-out, the `SENT-BY` placement, no withheld
+  second run's kept messages to writer recipients R (listed plus resolved),
+  filtering those recipients from the first run, and `resolve_inner`'s
+  provenance-based carve-out, the A-only routing override, the `SENT-BY`
+  placement, no withheld
   entries for a delegated fan-out), the second run's own fork module in
   `crates/groupware/src/calendar/`, and
   `crates/groupware/src/calendar/drain.rs` (fork-owned: the delegated
@@ -3318,8 +3595,9 @@ Merge hotspots this release adds (fork insertions in upstream files):
   item's ORGANIZER or acting ATTENDEE resolves to `changed_by`, on
   `changed_by` being the writer in every item the fan-out writes, on
   upstream's builders never addressing a local address
-  (`send_update_messages`, `organizer.rs`, `event_cancel.rs`), so that the
-  first run never reaches the writer, on the REQUEST merge's
+  (`send_update_messages`, `organizer.rs`, `event_cancel.rs`), with explicit
+  R filtering for listed and resolved writer recipients in the
+  first run (revisions 12–13), on the REQUEST merge's
   `AddComponent` and the CANCEL merge's ORGANIZER copy (`inbound.rs`),
   which 6.2's per-component `SENT-BY` statement describes, on that merge's
   full update and master cancellation (`inbound.rs:94`, `:157`, `:231`,
@@ -3344,16 +3622,39 @@ Merge hotspots this release adds (fork insertions in upstream files):
   domain).
 - `crates/vault/src/session.rs` (the CK cache) and `keys.rs` (the
   purposes).
+- Delivery's account resolution in
+  `crates/common/src/cache/principals.rs` is a merge hotspot for R19:
+  `account_id_from_email_inner`'s catch-all fallback must pass its quiet
+  flag through a new composing `rcpt_id_from_email_inner` helper. The
+  existing `domain_inner` and `rcpt_id_from_parts_inner` carry that flag;
+  ordinary callers keep their result and trace behavior. R uses quiet
+  Account-only results after canonical address handling, configured `+`
+  stripping, custom rules and catch-all fallback. L uses the scheduling
+  address list including writer-only groups; A uses directly owned listed
+  aliases expanded over domain names, excluding membership groups. Neither
+  changes the incoming snapshot's exact locality check. Re-read L/R/A if
+  those upstream rules change.
 
 Upstream code the design depends on without editing it, to re-read when a
 merge touches it:
 
+- COPY/MOVE overwrite deletions keep `send_itip=false`
+  (`copy_move.rs:747-756`, `:931-943`; 5.6). The key-account overwrite
+  passes its resolved domain and writer keys so a future scheduled event
+  could build a CANCEL if that flag were flipped; the return observation
+  in case 12 detects such a mutation even when callers discard the
+  returned message. The no-key queue path can queue an iMIP message only
+  for a plaintext scheduling tree. Case 12 also checks pending items and
+  queued tasks while the consumer is held, with an ordinary control.
 - The scheduling decision delegate sending mirrors: `itip_create`,
   `itip_update`, `itip_cancel` and `ItipSendStatus::resolve`, and
   `scheduling_account_info`'s merged address list
   (`crates/common/src/cache/principals.rs:813-833`); a change to who
   counts as local, or to when they return messages, changes what a grantee
-  sends in the owner's name. Upstream's iMIP sender resolution
+  sends in the owner's name. The existing-event PUT chooses update versus
+  create by `schedule_tag` (`update.rs:259-266`); the second run must mirror
+  that branch and keep both builders' raw success outcomes through filtering.
+  Upstream's iMIP sender resolution
   (`crates/services/src/task_manager/imip.rs`) is the behaviour mirrored
   for plain accounts and is not on the key path.
 - In-account `COPY` and collection `COPY`, which add names to one document
