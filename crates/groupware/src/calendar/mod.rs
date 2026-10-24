@@ -6,6 +6,7 @@
 
 pub mod alarm;
 pub mod dates;
+pub mod delegation;
 pub mod drain;
 pub mod expand;
 pub mod fanout;
