@@ -242,6 +242,7 @@ fn generation(event: &CalendarEvent) -> u32 {
 }
 
 pub async fn test(test: &mut TestServer) {
+    task5_boundary_and_copy_races(test).await;
     println!("Running calendar write-fence races...");
     let owner = test
         .account("admin@example.com")
@@ -1359,4 +1360,991 @@ async fn delete_retry_keeps_due_alarm(test: &TestServer, owner: u32, calendar: u
         "A1 after retry while consumer held: originalTask={task_present}, originalDue(T)={due_present} (both expectedfalse)"
     );
     !task_present && !due_present
+}
+
+/// Task 5 uses dedicated calendars rather than grant endpoints, which arrive later.
+async fn task5_boundary_and_copy_races(test: &mut TestServer) {
+    use groupware::calendar::sharing::boundary::{
+        ZaBoundaryCommit, mark_boundary_pending, za_complete_boundary, za_repair_owned_context,
+    };
+    use std::sync::Arc;
+    const USER: &str = "share-boundary@example.com";
+    const HOME: &str = "/dav/cal/share-boundary%40example.com/";
+    let owner = test
+        .account("admin@example.com")
+        .create_key_user_account(USER, STRONG, "Boundary owner", &[], user_permissions())
+        .await;
+    let owner_id = owner.id().document_id();
+    test.insert_account(owner);
+    let client = DummyWebDavClient::new(owner_id, USER, STRONG, USER);
+    let keys = za_unlock(test, owner_id, STRONG).await;
+    for slug in ["a", "b", "shared"] {
+        client
+            .request("MKCALENDAR", &format!("{HOME}{slug}/"), MKCAL)
+            .await
+            .with_status(StatusCode::CREATED);
+    }
+    let resources = test
+        .server
+        .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+        .await
+        .unwrap();
+    let a = resources.by_path("a").unwrap().document_id();
+    let b = resources.by_path("b").unwrap().document_id();
+    let shared = resources.by_path("shared").unwrap().document_id();
+    super::sharing::stage_shared_calendar(test, owner_id, shared, None).await;
+    async fn pending(test: &TestServer, keys: &vault::session::SessionKeys, id: u32) -> u64 {
+        let context = za_owned_calendar_context(&test.server, keys, id)
+            .await
+            .unwrap();
+        let mut calendar = context.stored.deserialize::<Calendar>().unwrap();
+        mark_boundary_pending(&mut calendar, &context.domain).unwrap();
+        let mut batch = BatchBuilder::new();
+        calendar
+            .update(
+                test.server
+                    .account_info(keys.account_id)
+                    .await
+                    .unwrap()
+                    .account_tenant_ids(),
+                context.stored.to_unarchived::<Calendar>().unwrap(),
+                keys.account_id,
+                id,
+                &mut batch,
+            )
+            .unwrap();
+        test.server
+            .commit_batch(batch)
+            .await
+            .unwrap()
+            .last_change_id(keys.account_id)
+            .unwrap()
+    }
+    // An interrupted second write stays pending until an explicit owner read adapter repairs it.
+    let committed = pending(test, &keys, shared).await;
+    assert!(
+        za_owned_calendar_context(&test.server, &keys, shared)
+            .await
+            .unwrap()
+            .boundary
+            .unwrap()
+            .pending,
+        "resolver must remain read-only"
+    );
+    let response = client
+        .request_with_headers(
+            "PROPFIND",
+            &format!("{HOME}shared/"),
+            [("depth", "0")],
+            "<D:propfind xmlns:D=\"DAV:\"><D:prop><D:displayname/><D:getetag/></D:prop></D:propfind>",
+        )
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    let repaired = za_owned_calendar_context(&test.server, &keys, shared)
+        .await
+        .unwrap();
+    let etag = format!("\"{}\"", repaired.stored.version.hash().unwrap());
+    assert!(
+        response
+            .xml
+            .iter()
+            .any(|(path, value)| path.ends_with(":getetag") && value == &etag),
+        "PROPFIND must emit repaired archive ETag: {:?}",
+        response.xml
+    );
+    assert!(!repaired.boundary.unwrap().pending);
+    assert!(repaired.boundary.unwrap().rename_change_id >= committed);
+    let committed = pending(test, &keys, shared).await;
+    let context = za_owned_calendar_context(&test.server, &keys, shared)
+        .await
+        .unwrap();
+    let repaired = za_repair_owned_context(&test.server, &keys, context)
+        .await
+        .unwrap();
+    assert_eq!(
+        repaired.stored.version,
+        za_owned_calendar_context(&test.server, &keys, shared)
+            .await
+            .unwrap()
+            .stored
+            .version
+    );
+    assert!(repaired.boundary.unwrap().rename_change_id >= committed);
+    // Losing own-commit assertion must reread archive then log; X cannot clear a newer flag.
+    let first = pending(test, &keys, shared).await;
+    let server = test.server.clone();
+    let request_keys = keys.clone();
+    let parked = HookParked::start(owner_id, test_hooks::set_share_boundary_pause, async move {
+        za_complete_boundary(
+            &server,
+            &request_keys,
+            shared,
+            Some(ZaBoundaryCommit { change_id: first }),
+        )
+        .await
+        .unwrap()
+    })
+    .await;
+    let newer = pending(test, &keys, shared).await;
+    let returned = parked.finish().await;
+    let current = za_owned_calendar_context(&test.server, &keys, shared)
+        .await
+        .unwrap();
+    assert_eq!(returned.version, current.stored.version);
+    assert!(!current.boundary.unwrap().pending);
+    assert!(current.boundary.unwrap().rename_change_id >= newer);
+    // Both losses are bounded. In particular the old own commit cannot clear the third flag.
+    let first = pending(test, &keys, shared).await;
+    let server = test.server.clone();
+    let request_keys = keys.clone();
+    let parked = HookParked::start(owner_id, test_hooks::set_share_boundary_pause, async move {
+        za_complete_boundary(
+            &server,
+            &request_keys,
+            shared,
+            Some(ZaBoundaryCommit { change_id: first }),
+        )
+        .await
+        .unwrap()
+    })
+    .await;
+    pending(test, &keys, shared).await;
+    let fallback = Arc::new(test_hooks::Pause::new(owner_id));
+    test_hooks::set_share_boundary_pause(Some(fallback.clone()));
+    let finishing = tokio::spawn(parked.finish());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fallback.arrived.notified(),
+    )
+    .await
+    .unwrap();
+    let newest = pending(test, &keys, shared).await;
+    fallback.release.notify_one();
+    finishing.await.unwrap();
+    let current = za_owned_calendar_context(&test.server, &keys, shared)
+        .await
+        .unwrap();
+    assert!(current.boundary.unwrap().pending);
+    za_complete_boundary(&test.server, &keys, shared, None)
+        .await
+        .unwrap();
+    assert!(
+        za_owned_calendar_context(&test.server, &keys, shared)
+            .await
+            .unwrap()
+            .boundary
+            .unwrap()
+            .rename_change_id
+            >= newest
+    );
+    // Opportunistic repair gets only one attempt and preserves pending when its CAS loses.
+    pending(test, &keys, shared).await;
+    let server = test.server.clone();
+    let request_keys = keys.clone();
+    let parked = HookParked::start(owner_id, test_hooks::set_share_boundary_pause, async move {
+        za_complete_boundary(&server, &request_keys, shared, None)
+            .await
+            .unwrap()
+    })
+    .await;
+    pending(test, &keys, shared).await;
+    let returned = parked.finish().await;
+    let text = returned.deserialize::<Calendar>().unwrap().preferences[0]
+        .name
+        .clone();
+    let header = groupware::calendar::sharing::format::parse_owner_header(
+        &STANDARD
+            .decode(
+                text.strip_prefix("$za$")
+                    .unwrap()
+                    .split('|')
+                    .next()
+                    .unwrap(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(header.boundary_pending);
+    assert!(
+        za_owned_calendar_context(&test.server, &keys, shared)
+            .await
+            .unwrap()
+            .boundary
+            .unwrap()
+            .pending
+    );
+    za_complete_boundary(&test.server, &keys, shared, None)
+        .await
+        .unwrap();
+    // Independent rename and boundary slots: the first commits nothing while held;
+    // after release the second observes a new slug and durable pending header.
+    let moving = async move {
+        DummyWebDavClient::new(owner_id, USER, STRONG, USER)
+            .request_with_headers(
+                "MOVE",
+                &format!("{HOME}shared/"),
+                [("destination", format!("{HOME}renamed/").as_str())],
+                "",
+            )
+            .await
+            .status
+    };
+    let parked = HookParked::start(owner_id, test_hooks::set_share_rename_pause, moving).await;
+    assert_eq!(
+        za_owned_calendar_context(&test.server, &keys, shared)
+            .await
+            .unwrap()
+            .stored
+            .deserialize::<Calendar>()
+            .unwrap()
+            .name,
+        "shared"
+    );
+    let completion = Arc::new(test_hooks::Pause::new(owner_id));
+    test_hooks::set_share_boundary_pause(Some(completion.clone()));
+    let finishing = tokio::spawn(parked.finish());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        completion.arrived.notified(),
+    )
+    .await
+    .unwrap();
+    let during = za_owned_calendar_context(&test.server, &keys, shared)
+        .await
+        .unwrap();
+    assert_eq!(
+        during.stored.deserialize::<Calendar>().unwrap().name,
+        "renamed"
+    );
+    assert!(during.boundary.unwrap().pending);
+    let committed_rename_change_id = during.stored.version.change_id().unwrap();
+    completion.release.notify_one();
+    assert_eq!(finishing.await.unwrap(), StatusCode::CREATED);
+    let completed = za_owned_calendar_context(&test.server, &keys, shared)
+        .await
+        .unwrap();
+    assert!(!completed.boundary.unwrap().pending);
+    assert!(completed.boundary.unwrap().rename_change_id >= committed_rename_change_id);
+    // COPY parked after its precheck cannot link into a source that converted meanwhile.
+    client
+        .request_with_headers(
+            "PUT",
+            &format!("{HOME}a/race.ics"),
+            [("content-type", "text/calendar")],
+            EVENT.replace("race-create", "copy-conversion"),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let event_id = test
+        .server
+        .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+        .await
+        .unwrap()
+        .by_path("a/race.ics")
+        .unwrap()
+        .document_id();
+    let copying = async move {
+        DummyWebDavClient::new(owner_id, USER, STRONG, USER)
+            .request_with_headers(
+                "COPY",
+                &format!("{HOME}a/race.ics"),
+                [("destination", format!("{HOME}b/copied.ics").as_str())],
+                "",
+            )
+            .await
+            .status
+    };
+    let parked = HookParked::start(owner_id, test_hooks::set_copy_pause, copying).await;
+    super::sharing::stage_converting_calendar(test, owner_id, a).await;
+    assert_eq!(parked.finish().await, StatusCode::FORBIDDEN);
+    assert_eq!(
+        event_archive(test, owner_id, event_id)
+            .await
+            .deserialize::<CalendarEvent>()
+            .unwrap()
+            .names
+            .len(),
+        1
+    );
+    // Another stored parent is shared: COPY through the unshared path and collection COPY both refuse.
+    let stored = event_archive(test, owner_id, event_id).await;
+    let mut event = stored.deserialize::<CalendarEvent>().unwrap();
+    event.names.push(common::DavName {
+        name: "linked.ics".into(),
+        parent_id: b,
+    });
+    save_event(test, owner_id, event_id, &stored, event).await;
+    for (from, to) in [("b/linked.ics", "b/forbidden.ics"), ("b/", "copied/")] {
+        client
+            .request_with_headers(
+                "COPY",
+                &format!("{HOME}{from}"),
+                [("destination", format!("{HOME}{to}").as_str())],
+                "",
+            )
+            .await
+            .with_status(StatusCode::FORBIDDEN);
+    }
+    // The decisive pause is the first child's assembled batch, after destination
+    // read-back. A conversion must lose its destination assertion before any link.
+    // Checking every original version catches an unsafe first commit followed by403.
+    client
+        .request("MKCALENDAR", &format!("{HOME}split-source/"), MKCAL)
+        .await
+        .with_status(StatusCode::CREATED);
+    for n in 0..48 {
+        client
+            .request_with_headers(
+                "PUT",
+                &format!("{HOME}split-source/{n}.ics"),
+                [("content-type", "text/calendar")],
+                EVENT.replace("race-create", &format!("split-{n}")),
+            )
+            .await
+            .with_status(StatusCode::CREATED);
+    }
+    let source_resources = test
+        .server
+        .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+        .await
+        .unwrap();
+    let mut original_children = Vec::new();
+    for resource in source_resources
+        .subtree("split-source")
+        .filter(|r| !r.is_container())
+    {
+        let stored = event_archive(test, owner_id, resource.document_id()).await;
+        original_children.push((
+            resource.document_id(),
+            stored.version,
+            stored.deserialize::<CalendarEvent>().unwrap().names,
+        ));
+    }
+    let copying = async move {
+        DummyWebDavClient::new(owner_id, USER, STRONG, USER)
+            .request_with_headers(
+                "COPY",
+                &format!("{HOME}split-source/"),
+                [("destination", format!("{HOME}split-target/").as_str())],
+                "",
+            )
+            .await
+            .status
+    };
+    let parked = HookParked::start(owner_id, test_hooks::set_copy_pause, copying).await;
+    let resources = test
+        .server
+        .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+        .await
+        .unwrap();
+    let target = resources.by_path("split-target").unwrap().document_id();
+    assert_eq!(
+        resources.children(target).count(),
+        0,
+        "calendar phase must precede child links"
+    );
+    super::sharing::stage_shared_calendar(test, owner_id, target, None).await;
+    assert_eq!(parked.finish().await, StatusCode::FORBIDDEN);
+    for (id, version, names) in original_children {
+        let stored = event_archive(test, owner_id, id).await;
+        assert_eq!(
+            stored.version, version,
+            "COPY committed a child despite destination conversion"
+        );
+        assert_eq!(
+            stored.deserialize::<CalendarEvent>().unwrap().names,
+            names,
+            "COPY left a forbidden destination link"
+        );
+    }
+    let resources = test
+        .server
+        .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+        .await
+        .unwrap();
+    assert_eq!(
+        resources.by_path("split-target").unwrap().document_id(),
+        target,
+        "creation must not be replayed"
+    );
+    assert_eq!(resources.children(target).count(), 0);
+    assert_eq!(
+        resources
+            .subtree("split-source")
+            .filter(|r| !r.is_container())
+            .count(),
+        48
+    );
+    // Successful collection COPY and MOVE overwrite preserve names and remove
+    // their source only after every child move completes.
+    client
+        .request("MKCALENDAR", &format!("{HOME}collection-source/"), MKCAL)
+        .await
+        .with_status(StatusCode::CREATED);
+    client
+        .request_with_headers(
+            "PUT",
+            &format!("{HOME}collection-source/one.ics"),
+            [("content-type", "text/calendar")],
+            EVENT.replace("race-create", "collection-one"),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    client
+        .request_with_headers(
+            "COPY",
+            &format!("{HOME}collection-source/"),
+            [("destination", format!("{HOME}collection-target/").as_str())],
+            "",
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    client
+        .request("DELETE", &format!("{HOME}collection-target/one.ics"), "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    client
+        .request_with_headers(
+            "MOVE",
+            &format!("{HOME}collection-source/"),
+            [("destination", format!("{HOME}collection-target/").as_str())],
+            "",
+        )
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    client
+        .request("GET", &format!("{HOME}collection-target/one.ics"), "")
+        .await
+        .with_status(StatusCode::OK);
+    let resources = test
+        .server
+        .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+        .await
+        .unwrap();
+    assert!(resources.by_path("collection-source").is_none());
+    for slug in ["split-source", "split-target", "collection-target"] {
+        client
+            .request_with_headers(
+                "DELETE",
+                &format!("{HOME}{slug}/"),
+                [super::fanout::NO_REPLY],
+                "",
+            )
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    overwrite_grantee_unlink_authority(test, owner_id, &client).await;
+    overwrite_other_parent_fences(test, owner_id, &client).await;
+    collection_move_conversion_policy(test, owner_id, &client).await;
+    for slug in ["a", "b", "renamed"] {
+        client
+            .request_with_headers(
+                "DELETE",
+                &format!("{HOME}{slug}/"),
+                [super::fanout::NO_REPLY],
+                "",
+            )
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    test_hooks::set_share_rename_pause(None);
+    test_hooks::set_share_boundary_pause(None);
+    test_hooks::set_copy_pause(None);
+}
+
+async fn overwrite_other_parent_fences(test: &TestServer, owner: u32, client: &DummyWebDavClient) {
+    use std::sync::Arc;
+    const USER: &str = "share-boundary@example.com";
+    const HOME: &str = "/dav/cal/share-boundary%40example.com/";
+    for slug in [
+        "ow-source",
+        "ow-target",
+        "ow-other",
+        "oc-source",
+        "oc-target",
+        "oc-other",
+    ] {
+        client
+            .request("MKCALENDAR", &format!("{HOME}{slug}/"), MKCAL)
+            .await
+            .with_status(StatusCode::CREATED);
+    }
+    for (slug, uid) in [
+        ("ow-source", "ow-source"),
+        ("ow-target", "ow-target"),
+        ("oc-source", "oc-source"),
+        ("oc-target", "oc-target"),
+    ] {
+        client
+            .request_with_headers(
+                "PUT",
+                &format!("{HOME}{slug}/event.ics"),
+                [("content-type", "text/calendar")],
+                EVENT.replace("race-create", uid),
+            )
+            .await
+            .with_status(StatusCode::CREATED);
+    }
+    for (from, to) in [("ow-target", "ow-other"), ("oc-target", "oc-other")] {
+        client
+            .request_with_headers(
+                "COPY",
+                &format!("{HOME}{from}/event.ics"),
+                [("destination", format!("{HOME}{to}/event.ics").as_str())],
+                "",
+            )
+            .await
+            .with_status(StatusCode::CREATED);
+    }
+    let resources = test
+        .server
+        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .await
+        .unwrap();
+    let ow_other = resources.by_path("ow-other").unwrap().document_id();
+    let ow_target = resources
+        .by_path("ow-target/event.ics")
+        .unwrap()
+        .document_id();
+    let ow_original = event_archive(test, owner, ow_target).await;
+    let oc_other = resources.by_path("oc-other").unwrap().document_id();
+    let oc_target = resources
+        .by_path("oc-target/event.ics")
+        .unwrap()
+        .document_id();
+    let oc_original = event_archive(test, owner, oc_target).await;
+    let moving = async move {
+        DummyWebDavClient::new(owner, USER, STRONG, USER)
+            .request_with_headers(
+                "MOVE",
+                &format!("{HOME}ow-source/event.ics"),
+                [("destination", format!("{HOME}ow-target/event.ics").as_str())],
+                "",
+            )
+            .await
+            .status
+    };
+    let parked = HookParked::start(owner, test_hooks::set_copy_pause, moving).await;
+    super::sharing::stage_converting_calendar(test, owner, ow_other).await;
+    let second = Arc::new(test_hooks::Pause::new(owner));
+    test_hooks::set_copy_pause(Some(second.clone()));
+    let finishing = tokio::spawn(parked.finish());
+    let retried =
+        tokio::time::timeout(std::time::Duration::from_secs(5), second.arrived.notified())
+            .await
+            .is_ok();
+    if retried {
+        assert_eq!(
+            event_archive(test, owner, ow_target).await.version,
+            ow_original.version,
+            "first lost attempt must not unlink overwrite target"
+        );
+        second.release.notify_one();
+    }
+    let moved = finishing.await.unwrap();
+    test_hooks::set_copy_pause(None);
+    assert_eq!(
+        test_hooks::take_move_overwrite_message(owner, ow_target),
+        Some(false)
+    );
+    assert_eq!(moved, StatusCode::NO_CONTENT);
+    let survivor = event_archive(test, owner, ow_target)
+        .await
+        .deserialize::<CalendarEvent>()
+        .unwrap();
+    assert_eq!(survivor.names.len(), 1);
+    assert_eq!(survivor.names[0].parent_id, ow_other);
+    // Collection overwrite has no replay of creation; its pre-creation unlink
+    // chunk must lose the other parent's assertion before changing any name.
+    let copying = async move {
+        DummyWebDavClient::new(owner, USER, STRONG, USER)
+            .request_with_headers(
+                "COPY",
+                &format!("{HOME}oc-source/"),
+                [("destination", format!("{HOME}oc-target/").as_str())],
+                "",
+            )
+            .await
+            .status
+    };
+    let parked = HookParked::start(owner, test_hooks::set_delete_commit_pause, copying).await;
+    super::sharing::stage_converting_calendar(test, owner, oc_other).await;
+    let copied = parked.finish().await;
+    let unchanged = event_archive(test, owner, oc_target).await.version == oc_original.version;
+    println!(
+        "Task5 overwrite other-parent fences: event_retried={retried}, collection_status={copied}, original_unchanged={unchanged}"
+    );
+    assert!(
+        retried && copied == StatusCode::CONFLICT && unchanged,
+        "overwrite escaped other-parent calendar fence"
+    );
+    for slug in [
+        "ow-source",
+        "ow-target",
+        "ow-other",
+        "oc-source",
+        "oc-target",
+        "oc-other",
+    ] {
+        client
+            .request_with_headers(
+                "DELETE",
+                &format!("{HOME}{slug}/"),
+                [super::fanout::NO_REPLY],
+                "",
+            )
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    test_hooks::set_delete_commit_pause(None);
+}
+
+async fn collection_move_conversion_policy(
+    test: &TestServer,
+    owner: u32,
+    client: &DummyWebDavClient,
+) {
+    const USER: &str = "share-boundary@example.com";
+    const HOME: &str = "/dav/cal/share-boundary%40example.com/";
+    let mut results = Vec::new();
+    for convert_source in [false, true] {
+        let label = if convert_source {
+            "cm-source"
+        } else {
+            "cm-destination"
+        };
+        let source_slug = format!("{label}-from");
+        let target_slug = format!("{label}-to");
+        for slug in [&source_slug, &target_slug] {
+            client
+                .request("MKCALENDAR", &format!("{HOME}{slug}/"), MKCAL)
+                .await
+                .with_status(StatusCode::CREATED);
+        }
+        for n in 0..3 {
+            client
+                .request_with_headers(
+                    "PUT",
+                    &format!("{HOME}{source_slug}/{n}.ics"),
+                    [("content-type", "text/calendar")],
+                    EVENT.replace("race-create", &format!("{label}-{n}")),
+                )
+                .await
+                .with_status(StatusCode::CREATED);
+        }
+        let resources = test
+            .server
+            .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+            .await
+            .unwrap();
+        let source_id = resources.by_path(&source_slug).unwrap().document_id();
+        let target_id = resources.by_path(&target_slug).unwrap().document_id();
+        let mut originals = Vec::new();
+        for event in resources.children(source_id) {
+            let stored = event_archive(test, owner, event.document_id()).await;
+            originals.push((
+                event.document_id(),
+                stored.version,
+                stored.deserialize::<CalendarEvent>().unwrap().names,
+            ));
+        }
+        let from = format!("{HOME}{source_slug}/");
+        let to = format!("{HOME}{target_slug}/");
+        let moving = async move {
+            DummyWebDavClient::new(owner, USER, STRONG, USER)
+                .request_with_headers("MOVE", &from, [("destination", to.as_str())], "")
+                .await
+                .status
+        };
+        let parked = HookParked::start(owner, test_hooks::set_copy_pause, moving).await;
+        if convert_source {
+            super::sharing::stage_converting_calendar(test, owner, source_id).await;
+        } else {
+            super::sharing::stage_shared_calendar(test, owner, target_id, None).await;
+        }
+        let status = parked.finish().await;
+        let mut unchanged = true;
+        for (id, version, names) in originals {
+            let stored = event_archive(test, owner, id).await;
+            unchanged &= stored.version == version
+                && stored.deserialize::<CalendarEvent>().unwrap().names == names;
+        }
+        let resources = test
+            .server
+            .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+            .await
+            .unwrap();
+        let source_retained = resources
+            .by_path(&source_slug)
+            .is_some_and(|r| r.document_id() == source_id);
+        println!(
+            "Task5 collection MOVE {label} conversion: status={status}, all_original_versions_names_unchanged={unchanged}, source_retained={source_retained}"
+        );
+        results.push(status == StatusCode::FORBIDDEN && unchanged && source_retained);
+        for slug in [&source_slug, &target_slug] {
+            client
+                .request_with_headers(
+                    "DELETE",
+                    &format!("{HOME}{slug}/"),
+                    [super::fanout::NO_REPLY],
+                    "",
+                )
+                .await
+                .with_status(StatusCode::NO_CONTENT);
+        }
+    }
+    assert!(
+        results.iter().all(|ok| *ok),
+        "collection MOVE used event-MOVE policy after a calendar conversion"
+    );
+}
+
+/// The old destination is an admitted legacy/interrupted linked recovery state:
+/// B later became shared while its old B+C event and private C link survived.
+/// No healthy shared COPY is claimed to have produced it. Foreign HTTP admission
+/// remains Task10; this invokes the actual private MOVE with a real writer token.
+async fn overwrite_grantee_unlink_authority(
+    test: &mut TestServer,
+    owner: u32,
+    client: &DummyWebDavClient,
+) {
+    use std::sync::Arc;
+    use types::acl::Acl;
+    const HOME: &str = "/dav/cal/share-boundary%40example.com/";
+    let writer = test
+        .account("admin@example.com")
+        .create_key_user_account(
+            "share-overwrite-writer@example.com",
+            STRONG,
+            "Overwrite writer",
+            &[],
+            user_permissions(),
+        )
+        .await;
+    let writer_id = writer.id().document_id();
+    test.insert_account(writer);
+    let writer_keys = za_unlock(test, writer_id, STRONG).await;
+    let owner_keys = za_unlock(test, owner, STRONG).await;
+    for retry in [false, true] {
+        let label = if retry {
+            "grantee-retry"
+        } else {
+            "grantee-control"
+        };
+        let slugs = [
+            format!("{label}-a"),
+            format!("{label}-b"),
+            format!("{label}-c"),
+        ];
+        for slug in &slugs {
+            client
+                .request("MKCALENDAR", &format!("{HOME}{slug}/"), MKCAL)
+                .await
+                .with_status(StatusCode::CREATED);
+        }
+        for slug in &slugs[..2] {
+            client
+                .request_with_headers(
+                    "PUT",
+                    &format!("{HOME}{slug}/event.ics"),
+                    [("content-type", "text/calendar")],
+                    EVENT.replace("race-create", slug),
+                )
+                .await
+                .with_status(StatusCode::CREATED);
+        }
+        client
+            .request_with_headers(
+                "COPY",
+                &format!("{HOME}{}/event.ics", slugs[1]),
+                [(
+                    "destination",
+                    format!("{HOME}{}/event.ics", slugs[2]).as_str(),
+                )],
+                "",
+            )
+            .await
+            .with_status(StatusCode::CREATED);
+        let resources = test
+            .server
+            .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+            .await
+            .unwrap();
+        let a = resources.by_path(&slugs[0]).unwrap().document_id();
+        let b = resources.by_path(&slugs[1]).unwrap().document_id();
+        let c = resources.by_path(&slugs[2]).unwrap().document_id();
+        let source = resources
+            .by_path(&format!("{}/event.ics", slugs[0]))
+            .unwrap()
+            .document_id();
+        let target = resources
+            .by_path(&format!("{}/event.ics", slugs[1]))
+            .unwrap()
+            .document_id();
+        let old_a = za_owned_calendar_context(&test.server, &owner_keys, a)
+            .await
+            .unwrap();
+        super::sharing::stage_shared_calendar(test, owner, a, Some(writer_id)).await;
+        super::sharing::stage_shared_calendar(test, owner, b, Some(writer_id)).await;
+        let new_a = za_owned_calendar_context(&test.server, &owner_keys, a)
+            .await
+            .unwrap();
+        // Direct staged grants precede a fresh legitimate token, just as a new
+        // authenticated request must observe collection access after granting.
+        test.server.inner.cache.access_tokens.remove(&writer_id);
+        let token = common::auth::AccessToken::new_maybe_invalid(
+            test.server.access_token(writer_id).await.unwrap(),
+        )
+        .with_session_keys(writer_keys.clone());
+        assert!(token.has_shared_access(owner, Collection::Calendar));
+        for (calendar, required) in [
+            (
+                a,
+                utils::map::bitmap::Bitmap::new().with_item(Acl::RemoveItems),
+            ),
+            (
+                b,
+                utils::map::bitmap::Bitmap::new()
+                    .with_item(Acl::AddItems)
+                    .with_item(Acl::RemoveItems),
+            ),
+        ] {
+            assert!(
+                za_calendar_context(&test.server, &token, owner, calendar, required)
+                    .await
+                    .is_ok_and(|context| context.is_some()),
+                "addressed A/B authority must pass"
+            );
+        }
+
+        let source_stored = event_archive(test, owner, source).await;
+        let mut source_event = source_stored.deserialize::<CalendarEvent>().unwrap();
+        rewrap_event(&mut source_event, &old_a.domain, &new_a.domain).unwrap();
+        save_event(test, owner, source, &source_stored, source_event).await;
+        assert!(
+            matches!(
+                za_calendar_context(
+                    &test.server,
+                    &token,
+                    owner,
+                    c,
+                    utils::map::bitmap::Bitmap::new().with_item(Acl::ReadItems)
+                )
+                .await,
+                Err(ZaCalendarError::Forbidden)
+            ),
+            "writer must have no normal access to surviving private C"
+        );
+        let original_source = event_archive(test, owner, source).await;
+        let original_target = event_archive(test, owner, target).await;
+        let old_target = original_target.deserialize::<CalendarEvent>().unwrap();
+        let server = test.server.clone();
+        let moving_token = token.clone();
+        let moving = async move {
+            dav::calendar::za_test_move_event(&server, &moving_token, owner, source, a, target, b)
+                .await
+        };
+        let response = if retry {
+            let parked = HookParked::start(owner, test_hooks::set_copy_pause, moving).await;
+            let private: Archive<AlignedBytes> = test
+                .server
+                .store()
+                .get_value(ValueKey::archive(owner, Collection::Calendar, c))
+                .await
+                .unwrap()
+                .unwrap();
+            let mut changed = private.deserialize::<Calendar>().unwrap();
+            // Calendar::update sets modified itself, so change a preserved
+            // public field to force an actual raw archive assertion loss.
+            changed.preferences[0].sort_order += 1;
+            let mut batch = BatchBuilder::new();
+            changed
+                .update(
+                    test.server
+                        .account_info(owner)
+                        .await
+                        .unwrap()
+                        .account_tenant_ids(),
+                    private.to_unarchived::<Calendar>().unwrap(),
+                    owner,
+                    c,
+                    &mut batch,
+                )
+                .unwrap();
+            test.server.commit_batch(batch).await.unwrap();
+            let fresh_private: Archive<AlignedBytes> = test
+                .server
+                .store()
+                .get_value(ValueKey::archive(owner, Collection::Calendar, c))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(
+                private.version.hash(),
+                fresh_private.version.hash(),
+                "retry fixture must change stored calendar content before releasing MOVE"
+            );
+            let second = Arc::new(test_hooks::Pause::new(owner));
+            test_hooks::set_copy_pause(Some(second.clone()));
+            let finishing = tokio::spawn(parked.finish());
+            tokio::time::timeout(std::time::Duration::from_secs(5), second.arrived.notified())
+                .await
+                .expect("private surviving parent change must cause a calendar retry");
+            assert_eq!(
+                event_archive(test, owner, source).await.version,
+                original_source.version
+            );
+            assert_eq!(
+                event_archive(test, owner, target).await.version,
+                original_target.version
+            );
+            second.release.notify_one();
+            finishing.await.unwrap()
+        } else {
+            moving.await
+        };
+        test_hooks::set_copy_pause(None);
+        let response = response
+            .expect("authorized grantee overwrite may unlink B without private C authority");
+        assert_eq!(response, StatusCode::NO_CONTENT);
+        let surviving = event_archive(test, owner, target)
+            .await
+            .deserialize::<CalendarEvent>()
+            .unwrap();
+        assert_eq!(surviving.names.len(), 1);
+        assert_eq!(surviving.names[0].parent_id, c);
+        assert_eq!(
+            surviving.data.event.to_string(),
+            old_target.data.event.to_string()
+        );
+        assert_eq!(surviving.created, old_target.created);
+        assert_eq!(surviving.modified, old_target.modified);
+        let moved = event_archive(test, owner, source)
+            .await
+            .deserialize::<CalendarEvent>()
+            .unwrap();
+        assert_eq!(moved.names.len(), 1);
+        assert_eq!(moved.names[0].parent_id, b);
+        assert_eq!(
+            moved.created,
+            original_source
+                .deserialize::<CalendarEvent>()
+                .unwrap()
+                .created
+        );
+        println!(
+            "Task5 grantee overwrite private parent: retry={retry}, status204, private access denied, payload preserved"
+        );
+        for slug in &slugs {
+            client
+                .request_with_headers(
+                    "DELETE",
+                    &format!("{HOME}{slug}/"),
+                    [super::fanout::NO_REPLY],
+                    "",
+                )
+                .await
+                .with_status(StatusCode::NO_CONTENT);
+        }
+    }
 }

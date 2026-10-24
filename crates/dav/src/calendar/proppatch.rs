@@ -155,6 +155,24 @@ impl CalendarPropPatchRequestHandler for Server {
         )
         .await?;
 
+        // Repair only the authenticated owner's pending boundary, then use that actual
+        // stored archive for the property write. Full shared-property integration is separate.
+        let archive = if resource.is_container() {
+            crate::common::za::za_mutation_context(
+                self,
+                access_token,
+                account_id,
+                document_id,
+                utils::map::bitmap::Bitmap::new().with_item(Acl::Modify),
+            )
+            .await
+            .map_err(|error| super::za_calendar_error(error, account_id, document_id))?
+            .map(|context| context.stored)
+            .unwrap_or(archive)
+        } else {
+            archive
+        };
+
         let is_success;
         let mut batch = BatchBuilder::new();
         let mut items = PropStatBuilder::default();

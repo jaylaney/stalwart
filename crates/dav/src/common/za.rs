@@ -242,6 +242,25 @@ fn stored_item_is_pending(stored: &Archive<AlignedBytes>) -> crate::Result<bool>
 /// This map belongs to one read request only. Writers never consume it.
 pub(crate) type ZaReadMemo = HashMap<(u32, u32), Arc<ZaCalendarContext>>;
 
+/// Explicit owner-session repair; the groupware resolver remains read-only.
+pub(crate) async fn za_mutation_context(
+    server: &Server,
+    token: &AccessToken,
+    owner_id: u32,
+    calendar_id: u32,
+    required: Bitmap<Acl>,
+) -> Result<Option<ZaCalendarContext>, ZaCalendarError> {
+    let context = za_calendar_context(server, token, owner_id, calendar_id, required).await?;
+    match (context, token.session_keys()) {
+        (Some(context), Some(keys)) => {
+            groupware::calendar::sharing::boundary::za_repair_owned_context(server, keys, context)
+                .await
+                .map(Some)
+        }
+        (context, _) => Ok(context),
+    }
+}
+
 pub(crate) async fn za_read_context(
     server: &Server,
     token: &AccessToken,
@@ -254,7 +273,7 @@ pub(crate) async fn za_read_context(
         context.check_access(token, required)?;
         return Ok(Some(context.clone()));
     }
-    let context = za_calendar_context(server, token, owner_id, calendar_id, required)
+    let context = za_mutation_context(server, token, owner_id, calendar_id, required)
         .await?
         .map(Arc::new);
     if let Some(context) = &context {

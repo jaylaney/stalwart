@@ -386,7 +386,7 @@ pub(crate) async fn za_write_contexts(
     calendar_id: u32,
     required: types::acl::Acl,
 ) -> crate::Result<Vec<groupware::calendar::sharing::resolve::ZaCalendarContext>> {
-    groupware::calendar::sharing::resolve::za_event_contexts(
+    let contexts = groupware::calendar::sharing::resolve::za_event_contexts(
         server,
         token,
         owner_id,
@@ -395,7 +395,14 @@ pub(crate) async fn za_write_contexts(
         utils::map::bitmap::Bitmap::new().with_item(required),
     )
     .await
-    .map_err(|error| za_calendar_error(error, owner_id, calendar_id))
+    .map_err(|error| za_calendar_error(error, owner_id, calendar_id))?;
+    if let Some(keys) = token.session_keys() {
+        groupware::calendar::sharing::boundary::za_repair_owned_contexts(server, keys, contexts)
+            .await
+            .map_err(|error| za_calendar_error(error, owner_id, calendar_id))
+    } else {
+        Ok(contexts)
+    }
 }
 
 /// Called once after an ambiguous assertion loss. Keep the original event
@@ -437,4 +444,40 @@ pub(crate) async fn za_writer_keys(
         .cloned()
         .map(Some)
         .ok_or(DavError::Code(StatusCode::FORBIDDEN))
+}
+
+/// Exercise the actual private event MOVE helper before foreign DAV URI admission
+/// is enabled. This bridge exists only in disposable test-mode builds.
+#[cfg(feature = "test_mode")]
+pub async fn za_test_move_event(
+    server: &common::Server,
+    token: &common::auth::AccessToken,
+    owner: u32,
+    event: u32,
+    source: u32,
+    overwritten: u32,
+    target: u32,
+) -> Result<hyper::StatusCode, hyper::StatusCode> {
+    copy_move::za_copy_move_event(
+        server,
+        token,
+        token.session_keys().expect("test writer session keys"),
+        owner,
+        event,
+        source,
+        Some(overwritten),
+        target,
+        "event.ics",
+        None,
+        None,
+        true,
+    )
+    .await
+    .map(|response| response.status())
+    .map_err(|error| match error {
+        crate::DavError::Code(code) => code,
+        crate::DavError::Condition(condition) => condition.code,
+        crate::DavError::Parse(_) => hyper::StatusCode::BAD_REQUEST,
+        crate::DavError::Internal(_) => hyper::StatusCode::INTERNAL_SERVER_ERROR,
+    })
 }

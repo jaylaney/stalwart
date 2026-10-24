@@ -238,6 +238,22 @@ pub fn parse_grant_header(bytes: &[u8]) -> Result<GrantRingHeader, SealError> {
     })
 }
 
+/// Rewrite only unauthenticated boundary metadata after validating the entire ring.
+/// Identity, generations, ephemeral public keys and wrapped records stay byte-identical.
+pub(crate) fn rewrite_grant_boundary(
+    bytes: &[u8],
+    grant_change_id: u64,
+    rename_change_id: u64,
+    pending: bool,
+) -> Result<Vec<u8>, SealError> {
+    parse_grant_header(bytes)?;
+    let mut changed = bytes.to_vec();
+    changed[26..34].copy_from_slice(&grant_change_id.to_be_bytes());
+    changed[34..42].copy_from_slice(&rename_change_id.to_be_bytes());
+    changed[42] = u8::from(pending);
+    Ok(changed)
+}
+
 fn encode_owner_header(header: &OwnerRingHeader) -> Result<Vec<u8>, SealError> {
     validate_generations(&header.generations)?;
     let mut bytes = Vec::with_capacity(OWNER_FIXED + header.generations.len() * 4);

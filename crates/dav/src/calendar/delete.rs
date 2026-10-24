@@ -21,7 +21,7 @@ use groupware::{
     calendar::{
         Calendar, CalendarEvent,
         fanout::{ZaFanOut, ZaFanOutKind, ZaSource},
-        sharing::resolve::{calendars_changed, za_calendar_context},
+        sharing::resolve::calendars_changed,
     },
 };
 use http_proto::HttpResponse;
@@ -136,7 +136,7 @@ impl CalendarDeleteRequestHandler for Server {
             }
 
             // Even collection deletion uses the fresh exact-principal grant.
-            za_calendar_context(
+            let repaired = crate::common::za::za_mutation_context(
                 self,
                 access_token,
                 account_id,
@@ -147,6 +147,11 @@ impl CalendarDeleteRequestHandler for Server {
             )
             .await
             .map_err(|error| za_calendar_error(error, account_id, document_id))?;
+
+            let calendar_ = repaired.map(|context| context.stored).unwrap_or(calendar_);
+            let calendar = calendar_
+                .to_unarchived::<Calendar>()
+                .caused_by(trc::location!())?;
 
             // Validate headers
             self.validate_headers(
@@ -251,7 +256,7 @@ impl CalendarDeleteRequestHandler for Server {
                 return Err(DavError::Code(StatusCode::PRECONDITION_FAILED));
             }
 
-            if let Some(context) = za_calendar_context(
+            if let Some(context) = crate::common::za::za_mutation_context(
                 self,
                 access_token,
                 account_id,
@@ -314,7 +319,7 @@ impl CalendarDeleteRequestHandler for Server {
             Ok(_) => {}
             Err(error) if error.is_assertion_failure() && !contexts.is_empty() => {
                 let (original, calendar_id, cutoff) = retry_event.as_ref().unwrap();
-                let fresh = za_calendar_context(
+                let fresh = crate::common::za::za_mutation_context(
                     self,
                     access_token,
                     account_id,

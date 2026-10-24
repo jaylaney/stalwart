@@ -464,3 +464,36 @@ pub fn drain_read_fails(account_id: u32, document_id: u32) -> bool {
         .unwrap_or_else(|e| e.into_inner())
         == Some((account_id, document_id))
 }
+
+/// Independent calendar rename and completion hooks, keyed by the owner account.
+pub static SHARE_RENAME_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SHARE_BOUNDARY_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub fn set_share_rename_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SHARE_RENAME_PAUSE, pause);
+}
+pub fn set_share_boundary_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SHARE_BOUNDARY_PAUSE, pause);
+}
+pub async fn share_rename_pause_point(owner: u32) {
+    wait(take_for(&SHARE_RENAME_PAUSE, owner)).await;
+}
+pub async fn share_boundary_pause_point(owner: u32) {
+    wait(take_for(&SHARE_BOUNDARY_PAUSE, owner)).await;
+}
+pub static MOVE_OVERWRITE_OBSERVATION: Mutex<Vec<(u32, u32, bool)>> = Mutex::new(Vec::new());
+pub fn record_move_overwrite_message(owner: u32, event: u32, has_delete_result: bool) {
+    let mut values = MOVE_OVERWRITE_OBSERVATION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    values.retain(|(o, e, _)| (*o, *e) != (owner, event));
+    values.push((owner, event, has_delete_result));
+}
+pub fn take_move_overwrite_message(owner: u32, event: u32) -> Option<bool> {
+    let mut values = MOVE_OVERWRITE_OBSERVATION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let idx = values
+        .iter()
+        .position(|(o, e, _)| (*o, *e) == (owner, event))?;
+    Some(values.swap_remove(idx).2)
+}

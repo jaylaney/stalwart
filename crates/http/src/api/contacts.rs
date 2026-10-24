@@ -653,6 +653,10 @@ async fn za_redeliver_entry(
     )
     .await
     .map_err(|error| error.into_store_error(account_id, document_id))?;
+    let contexts =
+        groupware::calendar::sharing::boundary::za_repair_owned_contexts(server, keys, contexts)
+            .await
+            .map_err(|error| error.into_store_error(account_id, document_id))?;
     let pairs = unseal_event_in_domain(&mut event, &contexts[0].domain)
         .map_err(|err| seal_error(err, account_id, document_id))?;
     if event.data.event.uids().next() != Some(entry.uid.as_str()) {
@@ -860,6 +864,13 @@ async fn za_reseal(
     )
     .await
     .map_err(|error| error.into_store_error(account_id, document_id))?;
+    let contexts = groupware::calendar::sharing::boundary::za_repair_owned_contexts(
+        server,
+        &verified.keys,
+        contexts,
+    )
+    .await
+    .map_err(|error| error.into_store_error(account_id, document_id))?;
     seal_event_in_domain(&mut event, &contexts[0].domain, pairs)
         .map_err(|err| seal_error(err, account_id, document_id))?;
     let current = archive
@@ -916,6 +927,13 @@ async fn za_reseal_again(
             .first()
             .ok_or_else(|| trc::StoreEvent::DataCorruption.into_err())?
             .parent_id,
+    )
+    .await
+    .map_err(|error| error.into_store_error(account_id, document_id))?;
+    let contexts = groupware::calendar::sharing::boundary::za_repair_owned_contexts(
+        server,
+        &verified.keys,
+        contexts,
     )
     .await
     .map_err(|error| error.into_store_error(account_id, document_id))?;

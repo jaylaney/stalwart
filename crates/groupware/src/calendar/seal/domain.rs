@@ -95,7 +95,7 @@ impl ZaKeyDomain {
     pub(super) fn is_owner(&self) -> bool {
         self.ewk.is_some()
     }
-    pub(super) fn ewk(&self) -> Result<&Secret, SealError> {
+    pub(crate) fn ewk(&self) -> Result<&Secret, SealError> {
         self.ewk.as_ref().ok_or(SealError::NotSealed)
     }
 

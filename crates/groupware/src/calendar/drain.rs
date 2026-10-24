@@ -893,6 +893,10 @@ async fn import(
     let context = za_owned_calendar_context(server, ctx.keys, parent_id)
         .await
         .map_err(|error| error.into_store_error(account_id, parent_id))?;
+    let context =
+        crate::calendar::sharing::boundary::za_repair_owned_context(server, ctx.keys, context)
+            .await
+            .map_err(|error| error.into_store_error(account_id, parent_id))?;
     seal_event_in_domain(&mut event, &context.domain, pair.as_ref())
         .map_err(|err| seal_error(err, account_id, u32::MAX))?;
     let document_id = server
@@ -1034,6 +1038,10 @@ async fn merge(
     let contexts = za_owned_event_contexts(server, ctx.keys, &event, parent_id)
         .await
         .map_err(|error| error.into_store_error(account_id, event_id))?;
+    let contexts =
+        crate::calendar::sharing::boundary::za_repair_owned_contexts(server, ctx.keys, contexts)
+            .await
+            .map_err(|error| error.into_store_error(account_id, event_id))?;
     let mut pairs = unseal_event_in_domain(&mut event, &contexts[0].domain)
         .map_err(|err| seal_error(err, account_id, event_id))?;
     // Spec 3.3, "Verification": a REPLY is authenticated by the replier's

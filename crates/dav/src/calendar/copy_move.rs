@@ -281,6 +281,7 @@ impl CalendarCopyMoveRequestHandler for Server {
                             access_token,
                             from_account_id,
                             from_resource.document_id(),
+                            from_calendar_id,
                             to_account_id,
                             to_resource.document_id().into(),
                             to_calendar_id,
@@ -361,6 +362,7 @@ impl CalendarCopyMoveRequestHandler for Server {
                         access_token,
                         from_account_id,
                         from_resource.document_id(),
+                        from_calendar_id,
                         to_account_id,
                         None,
                         to_calendar_id,
@@ -464,11 +466,29 @@ async fn copy_event(
     access_token: &AccessToken,
     from_account_id: u32,
     from_document_id: u32,
+    from_calendar_id: u32,
     to_account_id: u32,
     to_document_id: Option<u32>,
     to_calendar_id: u32,
     new_name: &str,
 ) -> crate::Result<HttpResponse> {
+    if let Some(keys) = super::za_writer_keys(server, access_token, from_account_id).await? {
+        return za_copy_move_event(
+            server,
+            access_token,
+            &keys,
+            from_account_id,
+            from_document_id,
+            from_calendar_id,
+            to_document_id,
+            to_calendar_id,
+            new_name,
+            None,
+            None,
+            false,
+        )
+        .await;
+    }
     // Fetch event
     let event_ = server
         .store()
@@ -607,6 +627,23 @@ async fn move_event(
     new_name: &str,
     if_schedule_tag: Option<u32>,
 ) -> crate::Result<HttpResponse> {
+    if let Some(keys) = super::za_writer_keys(server, access_token, from_account_id).await? {
+        return za_copy_move_event(
+            server,
+            access_token,
+            &keys,
+            from_account_id,
+            from_document_id,
+            from_calendar_id,
+            to_document_id,
+            to_calendar_id,
+            new_name,
+            Some(from_resource_path),
+            if_schedule_tag,
+            true,
+        )
+        .await;
+    }
     // Fetch event
     let event_ = server
         .store()
@@ -781,6 +818,23 @@ async fn rename_event(
     new_name: &str,
     from_resource_path: String,
 ) -> crate::Result<HttpResponse> {
+    if let Some(keys) = super::za_writer_keys(server, access_token, account_id).await? {
+        return za_copy_move_event(
+            server,
+            access_token,
+            &keys,
+            account_id,
+            document_id,
+            calendar_id,
+            None,
+            calendar_id,
+            new_name,
+            Some(from_resource_path),
+            None,
+            true,
+        )
+        .await;
+    }
     // Fetch event
     let event_ = server
         .store()
@@ -841,6 +895,22 @@ async fn copy_container(
     new_name: &str,
     remove_source: bool,
 ) -> crate::Result<HttpResponse> {
+    if let Some(keys) = super::za_writer_keys(server, access_token, from_account_id).await? {
+        return za_copy_container(
+            server,
+            access_token,
+            &keys,
+            from_account_id,
+            from_document_id,
+            from_children_ids,
+            from_resource_path,
+            to_document_id,
+            to_children_ids,
+            new_name,
+            remove_source,
+        )
+        .await;
+    }
     // Fetch calendar
     let calendar_ = server
         .store()
@@ -1082,6 +1152,15 @@ async fn rename_container(
     new_name: &str,
     from_resource_path: String,
 ) -> crate::Result<HttpResponse> {
+    let context = crate::common::za::za_mutation_context(
+        server,
+        access_token,
+        account_id,
+        document_id,
+        utils::map::bitmap::Bitmap::new().with_item(Acl::Modify),
+    )
+    .await
+    .map_err(|error| super::za_calendar_error(error, account_id, document_id))?;
     // Fetch calendar
     let calendar_ = server
         .store()
@@ -1093,6 +1172,10 @@ async fn rename_container(
         .await
         .caused_by(trc::location!())?
         .ok_or(DavError::Code(StatusCode::NOT_FOUND))?;
+    let calendar_ = context
+        .as_ref()
+        .map(|context| context.stored.clone())
+        .unwrap_or(calendar_);
     let calendar = calendar_
         .to_unarchived::<Calendar>()
         .caused_by(trc::location!())?;
@@ -1100,6 +1183,16 @@ async fn rename_container(
         .deserialize::<Calendar>()
         .caused_by(trc::location!())?;
     new_calendar.name = new_name.to_string();
+    let shared = context
+        .as_ref()
+        .is_some_and(|context| context.domain.calendar_id().is_some());
+    if shared {
+        groupware::calendar::sharing::boundary::mark_boundary_pending(
+            &mut new_calendar,
+            &context.as_ref().unwrap().domain,
+        )
+        .map_err(|error| groupware::calendar::seal::seal_error(error, account_id, document_id))?;
+    }
 
     let mut batch = BatchBuilder::new();
     new_calendar
@@ -1112,11 +1205,686 @@ async fn rename_container(
         )
         .caused_by(trc::location!())?;
     batch.log_vanished_item(VanishedCollection::Calendar, from_resource_path);
-    server
+    #[cfg(feature = "test_mode")]
+    common::za::test_hooks::share_rename_pause_point(account_id).await;
+    let assigned = server
         .commit_batch(batch)
         .await
         .caused_by(trc::location!())?;
+    if shared {
+        groupware::calendar::sharing::boundary::za_complete_boundary(
+            server,
+            access_token
+                .session_keys()
+                .ok_or(DavError::Code(StatusCode::FORBIDDEN))?,
+            document_id,
+            Some(groupware::calendar::sharing::boundary::ZaBoundaryCommit {
+                change_id: assigned.last_change_id(account_id)?,
+            }),
+        )
+        .await
+        .map_err(|error| super::za_calendar_error(error, account_id, document_id))?;
+    }
     server.notify_task_queue();
 
     Ok(HttpResponse::new(StatusCode::CREATED))
+}
+
+fn shared_copy_refusal(owner_id: u32) -> DavError {
+    trc::event!(
+        Security(trc::SecurityEvent::Unauthorized),
+        AccountId = owner_id,
+        Details = "zero-access: copy into or out of a shared calendar"
+    );
+    DavError::Code(StatusCode::FORBIDDEN)
+}
+fn linked_move_refusal(owner_id: u32) -> DavError {
+    trc::event!(
+        Security(trc::SecurityEvent::Unauthorized),
+        AccountId = owner_id,
+        Details = "zero-access: event linked into a shared calendar"
+    );
+    DavError::Code(StatusCode::FORBIDDEN)
+}
+
+/// COPY has an operation-specific 403 contract. Do not pass it through the
+/// seal/write resolver helper, whose shared-linked refusal is a PUT's 409.
+async fn za_move_contexts(
+    server: &Server,
+    token: &AccessToken,
+    owner: u32,
+    event: &CalendarEvent,
+    source: u32,
+    target: u32,
+    is_move: bool,
+    overwrite: bool,
+    is_collection: bool,
+) -> crate::Result<Vec<groupware::calendar::sharing::resolve::ZaCalendarContext>> {
+    use crate::common::za::za_mutation_context;
+    use utils::map::bitmap::Bitmap;
+    let source_required = Bitmap::new().with_item(if is_move {
+        Acl::RemoveItems
+    } else {
+        Acl::ReadItems
+    });
+    let mut contexts = Vec::new();
+    let source_context = za_mutation_context(server, token, owner, source, source_required)
+        .await
+        .map_err(|error| super::za_calendar_error(error, owner, source))?
+        .ok_or(DavError::Code(StatusCode::FORBIDDEN))?;
+    if !event.names.iter().any(|name| name.parent_id == source) {
+        return Err(DavError::Code(StatusCode::NOT_FOUND));
+    }
+    if source_context.domain.calendar_id().is_some() {
+        if !is_move || is_collection {
+            return Err(shared_copy_refusal(owner));
+        }
+        if event.names.len() != 1 {
+            return Err(linked_move_refusal(owner));
+        }
+    }
+    contexts.push(source_context);
+    for parent in event
+        .names
+        .iter()
+        .map(|name| name.parent_id)
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        if parent == source {
+            continue;
+        }
+        let context = za_mutation_context(server, token, owner, parent, source_required)
+            .await
+            .map_err(|error| super::za_calendar_error(error, owner, parent))?
+            .ok_or(DavError::Code(StatusCode::FORBIDDEN))?;
+        if context.domain.calendar_id().is_some() {
+            return Err(if is_move && !is_collection {
+                linked_move_refusal(owner)
+            } else {
+                shared_copy_refusal(owner)
+            });
+        }
+        contexts.push(context);
+    }
+    let mut required = Bitmap::new().with_item(Acl::AddItems);
+    if overwrite {
+        required = required.with_item(Acl::RemoveItems);
+    }
+    let target_context = za_mutation_context(server, token, owner, target, required)
+        .await
+        .map_err(|error| super::za_calendar_error(error, owner, target))?
+        .ok_or(DavError::Code(StatusCode::FORBIDDEN))?;
+    if target_context.domain.calendar_id().is_some() {
+        if !is_move || is_collection {
+            return Err(shared_copy_refusal(owner));
+        }
+        if event.names.len() != 1 {
+            return Err(linked_move_refusal(owner));
+        }
+    }
+    // Keep a separate target entry even for a same-calendar rename: its operation
+    // bits were freshly checked and callers have a stable destination position.
+    contexts.push(target_context);
+    Ok(contexts)
+}
+
+/// Raw surviving-parent fences carry no authority or collection keys: unlinking
+/// the addressed destination does not change the other parent's link or payload.
+struct ZaOverwriteFence {
+    calendar_id: u32,
+    stored: Option<Archive<AlignedBytes>>,
+}
+
+impl ZaOverwriteFence {
+    fn assert_in(&self, owner: u32, batch: &mut BatchBuilder) {
+        batch
+            .with_account_id(owner)
+            .with_collection(Collection::Calendar)
+            .with_document(self.calendar_id);
+        if let Some(stored) = &self.stored {
+            batch.assert_value(types::field::Field::ARCHIVE, stored);
+        } else {
+            batch.assert_value(types::field::Field::ARCHIVE, ());
+        }
+    }
+}
+
+fn overwrite_calendars_changed(before: &[ZaOverwriteFence], after: &[ZaOverwriteFence]) -> bool {
+    before.len() != after.len()
+        || before.iter().zip(after).any(|(before, after)| {
+            before.calendar_id != after.calendar_id
+                || before.stored.as_ref().map(|stored| stored.version)
+                    != after.stored.as_ref().map(|stored| stored.version)
+        })
+}
+
+/// Authorize the addressed destination first. Surviving parents need fresh raw
+/// archive (or absence) fences, without requiring their keys or operation bits.
+async fn za_overwrite_fences(
+    server: &Server,
+    token: &AccessToken,
+    owner: u32,
+    event: &CalendarEvent,
+    target: u32,
+) -> crate::Result<Vec<ZaOverwriteFence>> {
+    let target_context = crate::common::za::za_mutation_context(
+        server,
+        token,
+        owner,
+        target,
+        utils::map::bitmap::Bitmap::new().with_item(Acl::RemoveItems),
+    )
+    .await
+    .map_err(|error| super::za_calendar_error(error, owner, target))?
+    .ok_or(DavError::Code(StatusCode::FORBIDDEN))?;
+    let mut fences = vec![ZaOverwriteFence {
+        calendar_id: target,
+        stored: Some(target_context.stored),
+    }];
+    for parent in event
+        .names
+        .iter()
+        .map(|name| name.parent_id)
+        .filter(|parent| *parent != target)
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        fences.push(ZaOverwriteFence {
+            calendar_id: parent,
+            stored: server
+                .store()
+                .get_value(ValueKey::archive(owner, Collection::Calendar, parent))
+                .await?,
+        });
+    }
+    Ok(fences)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn za_copy_move_event(
+    server: &Server,
+    token: &AccessToken,
+    keys: &vault::session::SessionKeys,
+    owner: u32,
+    event_id: u32,
+    source: u32,
+    overwrite: Option<u32>,
+    target: u32,
+    new_name: &str,
+    vanished: Option<String>,
+    schedule_tag: Option<u32>,
+    is_move: bool,
+) -> crate::Result<HttpResponse> {
+    let original: Archive<AlignedBytes> = server
+        .store()
+        .get_value(ValueKey::archive(
+            owner,
+            Collection::CalendarEvent,
+            event_id,
+        ))
+        .await?
+        .ok_or(DavError::Code(StatusCode::NOT_FOUND))?;
+    za_copy_move_stored_event(
+        server,
+        token,
+        keys,
+        owner,
+        event_id,
+        source,
+        overwrite,
+        target,
+        new_name,
+        vanished,
+        schedule_tag,
+        is_move,
+        false,
+        original,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn za_copy_move_stored_event(
+    server: &Server,
+    token: &AccessToken,
+    keys: &vault::session::SessionKeys,
+    owner: u32,
+    event_id: u32,
+    source: u32,
+    overwrite: Option<u32>,
+    target: u32,
+    new_name: &str,
+    vanished: Option<String>,
+    schedule_tag: Option<u32>,
+    is_move: bool,
+    is_collection: bool,
+    original: Archive<AlignedBytes>,
+) -> crate::Result<HttpResponse> {
+    use groupware::calendar::{
+        seal::{classify_event_storage, rewrap_event, seal_error},
+        sharing::resolve::calendars_changed,
+    };
+    let event = original.deserialize::<CalendarEvent>()?;
+    if schedule_tag.is_some() && event.schedule_tag != schedule_tag {
+        return Err(DavError::Code(StatusCode::PRECONDITION_FAILED));
+    }
+    let mut contexts = za_move_contexts(
+        server,
+        token,
+        owner,
+        &event,
+        source,
+        target,
+        is_move,
+        overwrite.is_some(),
+        is_collection,
+    )
+    .await?;
+    classify_event_storage(&event).map_err(|error| seal_error(error, owner, event_id))?;
+    if source != target || (!is_move && overwrite.is_none()) {
+        assert_is_unique_uid(
+            server,
+            server
+                .fetch_dav_resources(token.account_id(), owner, SyncCollection::Calendar)
+                .await?
+                .as_ref(),
+            owner,
+            target,
+            event.data.event.uids().next(),
+        )
+        .await?;
+    }
+    let overwritten: Option<Archive<AlignedBytes>> = if let Some(id) = overwrite {
+        server
+            .store()
+            .get_value(ValueKey::archive(owner, Collection::CalendarEvent, id))
+            .await?
+    } else {
+        None
+    };
+    let mut overwrite_fences = if let Some(stored) = &overwritten {
+        za_overwrite_fences(
+            server,
+            token,
+            owner,
+            &stored.deserialize::<CalendarEvent>()?,
+            target,
+        )
+        .await?
+    } else {
+        Vec::new()
+    };
+    let account = server.account_info(token.account_id()).await?;
+    let cutoff = now() as i64;
+    for attempt in 0..2 {
+        let mut changed = event.clone();
+        let from = &contexts[0].domain;
+        let to = &contexts.last().unwrap().domain;
+        // A reverting shared domain still owns old CK envelopes. Its write
+        // mode selects the new wrap only after the original DEK is opened.
+        let domain_changes =
+            (from.calendar_id(), from.domain_id()) != (to.calendar_id(), to.domain_id());
+        if is_move && domain_changes {
+            rewrap_event(&mut changed, from, to)
+                .map_err(|error| seal_error(error, owner, event_id))?;
+        }
+        if is_move {
+            let index = changed
+                .names
+                .iter()
+                .position(|name| name.parent_id == source)
+                .unwrap();
+            changed.names.swap_remove(index);
+        }
+        changed.names.push(DavName {
+            name: new_name.to_owned(),
+            parent_id: target,
+        });
+        let mut batch = BatchBuilder::new();
+        for context in &contexts {
+            context.assert_in(&mut batch);
+        }
+        for fence in &overwrite_fences {
+            fence.assert_in(owner, &mut batch);
+        }
+        changed.update_at(
+            token.account_tenant_ids(),
+            original.to_unarchived::<CalendarEvent>()?,
+            owner,
+            event_id,
+            cutoff,
+            &mut batch,
+        )?;
+        if let Some(path) = &vanished {
+            batch.log_vanished_item(VanishedCollection::Calendar, path.clone());
+        }
+        if let (Some(id), Some(stored)) = (overwrite, &overwritten) {
+            // update_at can end a large chunk; fence the overwrite's chunk too.
+            for context in &contexts {
+                context.assert_in(&mut batch);
+            }
+            for fence in &overwrite_fences {
+                fence.assert_in(owner, &mut batch);
+            }
+            let result = DestroyArchive(stored.to_unarchived::<CalendarEvent>()?).delete_za_at(
+                &account,
+                owner,
+                id,
+                target,
+                None,
+                false,
+                Some(keys),
+                Some(to),
+                cutoff,
+                &mut batch,
+            )?;
+            #[cfg(feature = "test_mode")]
+            common::za::test_hooks::record_move_overwrite_message(owner, id, result.is_some());
+            let _ = result;
+        }
+        #[cfg(feature = "test_mode")]
+        common::za::test_hooks::copy_pause_point(owner).await;
+        match server.commit_batch(batch).await {
+            Ok(_) => {
+                server.notify_task_queue();
+                return Ok(HttpResponse::new(if overwrite.is_some() {
+                    StatusCode::NO_CONTENT
+                } else {
+                    StatusCode::CREATED
+                }));
+            }
+            Err(error) if error.is_assertion_failure() && attempt == 0 => {
+                let fresh = za_move_contexts(
+                    server,
+                    token,
+                    owner,
+                    &event,
+                    source,
+                    target,
+                    is_move,
+                    overwrite.is_some(),
+                    is_collection,
+                )
+                .await?;
+                let fresh_overwrite_fences = if let Some(stored) = &overwritten {
+                    za_overwrite_fences(
+                        server,
+                        token,
+                        owner,
+                        &stored.deserialize::<CalendarEvent>()?,
+                        target,
+                    )
+                    .await?
+                } else {
+                    Vec::new()
+                };
+                if !calendars_changed(&contexts, &fresh)
+                    && !overwrite_calendars_changed(&overwrite_fences, &fresh_overwrite_fences)
+                {
+                    return Err(error.into());
+                }
+                contexts = fresh;
+                overwrite_fences = fresh_overwrite_fences;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    unreachable!()
+}
+
+/// Key collection copies create the destination first, then use its actual
+/// read-back archive in each physical child transaction. Collection operations
+/// retain upstream partial-progress semantics: a conflict never replays creation.
+#[allow(clippy::too_many_arguments)]
+async fn za_copy_container(
+    server: &Server,
+    token: &AccessToken,
+    keys: &vault::session::SessionKeys,
+    owner: u32,
+    source: u32,
+    children: Vec<u32>,
+    source_path: String,
+    overwrite: Option<u32>,
+    overwritten_children: Vec<u32>,
+    new_name: &str,
+    is_move: bool,
+) -> crate::Result<HttpResponse> {
+    use crate::common::za::za_mutation_context;
+    use utils::map::bitmap::Bitmap;
+    let required = Bitmap::new().with_item(if is_move {
+        Acl::RemoveItems
+    } else {
+        Acl::ReadItems
+    });
+    let source_context = za_mutation_context(server, token, owner, source, required)
+        .await
+        .map_err(|error| super::za_calendar_error(error, owner, source))?
+        .ok_or(DavError::Code(StatusCode::FORBIDDEN))?;
+    if source_context.domain.calendar_id().is_some() {
+        return Err(shared_copy_refusal(owner));
+    }
+    let mut contexts = vec![source_context];
+    let mut events = Vec::with_capacity(children.len());
+    for child in children {
+        if let Some(stored) = server
+            .store()
+            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                owner,
+                Collection::CalendarEvent,
+                child,
+            ))
+            .await?
+        {
+            let event = stored.deserialize::<CalendarEvent>()?;
+            groupware::calendar::seal::classify_event_storage(&event)
+                .map_err(|error| groupware::calendar::seal::seal_error(error, owner, child))?;
+            for parent in event
+                .names
+                .iter()
+                .map(|name| name.parent_id)
+                .collect::<std::collections::BTreeSet<_>>()
+            {
+                if contexts.iter().any(|context| context.calendar_id == parent) {
+                    continue;
+                }
+                let context = za_mutation_context(server, token, owner, parent, required)
+                    .await
+                    .map_err(|error| super::za_calendar_error(error, owner, parent))?
+                    .ok_or(DavError::Code(StatusCode::FORBIDDEN))?;
+                if context.domain.calendar_id().is_some() {
+                    return Err(shared_copy_refusal(owner));
+                }
+                contexts.push(context);
+            }
+            if let Some(name) = event.names.iter().find(|name| name.parent_id == source) {
+                events.push((child, name.name.clone(), stored));
+            }
+        }
+    }
+    let mut calendar = contexts[0].stored.deserialize::<Calendar>()?;
+    calendar.name = new_name.to_owned();
+    calendar.acls.clear();
+    // The source is unshared; preserve its owner's complete encrypted entry.
+    let preference = calendar
+        .preferences
+        .into_iter()
+        .find(|entry| entry.account_id == owner)
+        .ok_or(DavError::Code(StatusCode::FORBIDDEN))?;
+    calendar.preferences = vec![CalendarPreferences {
+        account_id: owner,
+        name: preference.name,
+        description: preference.description,
+        default_alerts: preference.default_alerts,
+        sort_order: 0,
+        color: preference.color,
+        flags: 0,
+        time_zone: Timezone::Default,
+    }];
+    let account = server.account_info(token.account_id()).await?;
+    let cutoff = now() as i64;
+    let target = if let Some(id) = overwrite {
+        let context = za_mutation_context(
+            server,
+            token,
+            owner,
+            id,
+            Bitmap::new().with_item(Acl::RemoveItems),
+        )
+        .await
+        .map_err(|error| super::za_calendar_error(error, owner, id))?
+        .ok_or(DavError::Code(StatusCode::FORBIDDEN))?;
+        if context.domain.calendar_id().is_some() {
+            return Err(shared_copy_refusal(owner));
+        }
+        // Each overwrite chunk fences the old destination and all source parents.
+        // Its events use the same scheduling-off cutoff throughout this request.
+        for child in overwritten_children {
+            if let Some(stored) = server
+                .store()
+                .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                    owner,
+                    Collection::CalendarEvent,
+                    child,
+                ))
+                .await?
+            {
+                let unlink_fences = za_overwrite_fences(
+                    server,
+                    token,
+                    owner,
+                    &stored.deserialize::<CalendarEvent>()?,
+                    id,
+                )
+                .await?;
+                let mut batch = BatchBuilder::new();
+                for source in &contexts {
+                    source.assert_in(&mut batch);
+                }
+                for parent in &unlink_fences {
+                    parent.assert_in(owner, &mut batch);
+                }
+                context.assert_in(&mut batch);
+                DestroyArchive(stored.to_unarchived::<CalendarEvent>()?).delete_za_at(
+                    &account,
+                    owner,
+                    child,
+                    id,
+                    None,
+                    false,
+                    Some(keys),
+                    Some(&context.domain),
+                    cutoff,
+                    &mut batch,
+                )?;
+                #[cfg(feature = "test_mode")]
+                common::za::test_hooks::delete_commit_pause_point(owner).await;
+                server.commit_batch(batch).await?;
+            }
+        }
+        let mut batch = BatchBuilder::new();
+        for source in &contexts {
+            source.assert_in(&mut batch);
+        }
+        context.assert_in(&mut batch);
+        DestroyArchive(context.stored.to_unarchived::<Calendar>()?).delete(
+            token.account_tenant_ids(),
+            owner,
+            id,
+            None,
+            &mut batch,
+        )?;
+        for source in &contexts {
+            source.assert_in(&mut batch);
+        }
+        calendar.insert(token.account_tenant_ids(), owner, id, &mut batch)?;
+        server.commit_batch(batch).await?;
+        id
+    } else {
+        let id = server
+            .store()
+            .assign_document_ids(owner, Collection::Calendar, 1)
+            .await?;
+        let mut batch = BatchBuilder::new();
+        for context in &contexts {
+            context.assert_in(&mut batch);
+        }
+        calendar.insert(token.account_tenant_ids(), owner, id, &mut batch)?;
+        server.commit_batch(batch).await?;
+        id
+    };
+    let target_context = za_mutation_context(
+        server,
+        token,
+        owner,
+        target,
+        Bitmap::new().with_item(Acl::AddItems),
+    )
+    .await
+    .map_err(|error| super::za_calendar_error(error, owner, target))?
+    .ok_or(DavError::Code(StatusCode::FORBIDDEN))?;
+    if target_context.domain.calendar_id().is_some() {
+        return Err(shared_copy_refusal(owner));
+    }
+    for (child, name, stored) in events {
+        // The original preflight archive is the event assertion, even across a
+        // calendar retry. Each child reads/fences the actual destination anew.
+        za_copy_move_stored_event(
+            server, token, keys, owner, child, source, None, target, &name, None, None, is_move,
+            true, stored,
+        )
+        .await?;
+    }
+    if is_move {
+        let current = za_mutation_context(server, token, owner, source, required)
+            .await
+            .map_err(|error| super::za_calendar_error(error, owner, source))?
+            .ok_or(DavError::Code(StatusCode::FORBIDDEN))?;
+        if current.domain.calendar_id().is_some() {
+            return Err(shared_copy_refusal(owner));
+        }
+        let target_context = za_mutation_context(
+            server,
+            token,
+            owner,
+            target,
+            Bitmap::new().with_item(Acl::AddItems),
+        )
+        .await
+        .map_err(|error| super::za_calendar_error(error, owner, target))?
+        .ok_or(DavError::Code(StatusCode::FORBIDDEN))?;
+        if target_context.domain.calendar_id().is_some() {
+            return Err(shared_copy_refusal(owner));
+        }
+        let mut batch = BatchBuilder::new();
+        target_context.assert_in(&mut batch);
+        DestroyArchive(contexts[0].stored.to_unarchived::<Calendar>()?).delete(
+            token.account_tenant_ids(),
+            owner,
+            source,
+            Some(source_path),
+            &mut batch,
+        )?;
+        let default = server
+            .store()
+            .get_value::<u32>(ValueKey {
+                account_id: owner,
+                collection: Collection::Principal.into(),
+                document_id: 0,
+                class: ValueClass::Property(PrincipalField::DefaultCalendarId.into()),
+            })
+            .await?;
+        if default == Some(source) {
+            batch
+                .with_account_id(owner)
+                .with_collection(Collection::Principal)
+                .with_document(0)
+                .clear(PrincipalField::DefaultCalendarId);
+        }
+        server.commit_batch(batch).await?;
+    }
+    server.notify_task_queue();
+    Ok(HttpResponse::new(if overwrite.is_some() {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::CREATED
+    }))
 }

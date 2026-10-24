@@ -288,7 +288,7 @@ fn validate_sealed_entries(
     Ok(())
 }
 
-fn resolve_owner_stored(
+pub(super) fn resolve_owner_stored(
     stored: Archive<AlignedBytes>,
     keys: &SessionKeys,
     calendar_id: u32,
@@ -651,6 +651,119 @@ mod tests {
             ..Default::default()
         };
         (owner, reader, private, calendar)
+    }
+
+    #[test]
+    fn boundary_headers_complete_without_changing_keys_or_bundles() {
+        let (owner, _, private, mut calendar) = fixture([91; 16]);
+        let before = calendar.clone();
+        let context = resolve_owner_stored(archive(&calendar), &owner, CALENDAR).unwrap();
+        super::super::boundary::mark_boundary_pending(&mut calendar, &context.domain).unwrap();
+        let pending = resolve_owner_stored(archive(&calendar), &owner, CALENDAR).unwrap();
+        assert!(
+            pending.boundary.unwrap().pending,
+            "rename must durably mark boundary pending"
+        );
+        super::super::boundary::complete_boundary(&mut calendar, &context.domain, 87).unwrap();
+        let complete = resolve_owner_stored(archive(&calendar), &owner, CALENDAR).unwrap();
+        assert!(!complete.boundary.unwrap().pending);
+        assert_eq!(complete.boundary.unwrap().rename_change_id, 87);
+        for (old, new) in before.preferences.iter().zip(&calendar.preferences) {
+            let old = old
+                .name
+                .strip_prefix(COLLECTION_MARKER)
+                .unwrap()
+                .split('|')
+                .collect::<Vec<_>>();
+            let new = new
+                .name
+                .strip_prefix(COLLECTION_MARKER)
+                .unwrap()
+                .split('|')
+                .collect::<Vec<_>>();
+            assert_eq!(&old[1..], &new[1..], "sealed bundle bytes changed");
+            let old = STANDARD.decode(old[0]).unwrap();
+            let new = STANDARD.decode(new[0]).unwrap();
+            if old[1] == 5 {
+                assert_eq!(&old[45..], &new[45..], "grant wrapped records changed");
+                let (header, keys) =
+                    open_grant_ring(&new, OWNER, CALENDAR, READER, [91; 16], &private).unwrap();
+                assert_eq!(header.grant_change_id, 30);
+                assert_eq!(header.rename_change_id, 87);
+                assert_eq!(keys[&1].as_bytes(), &[34; 32]);
+                assert_eq!(keys[&2].as_bytes(), &[35; 32]);
+            } else {
+                let (_, old) = open_owner_ring(&old, OWNER, CALENDAR, owner.ewk()).unwrap();
+                let (_, new) = open_owner_ring(&new, OWNER, CALENDAR, owner.ewk()).unwrap();
+                assert_eq!(old, new);
+            }
+        }
+    }
+
+    #[test]
+    fn boundary_completes_grant_only_pending_and_refuses_grantee_material() {
+        use super::super::{boundary::complete_boundary, format::rewrite_grant_boundary};
+        let (owner, _, private, mut calendar) = fixture([92; 16]);
+        let owner_parts = calendar.preferences[0]
+            .name
+            .strip_prefix(COLLECTION_MARKER)
+            .unwrap()
+            .split('|')
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let bytes = STANDARD.decode(&owner_parts[0]).unwrap();
+        let (header, mut ring) = open_owner_ring(&bytes, OWNER, CALENDAR, owner.ewk()).unwrap();
+        ring.grants[0].change_id = 0;
+        let mut parts = owner_parts;
+        parts[0] = STANDARD.encode(seal_owner_ring(&header, &ring, OWNER, owner.ewk()).unwrap());
+        calendar.preferences[0].name = format!("{COLLECTION_MARKER}{}", parts.join("|"));
+        let mut parts = calendar.preferences[1]
+            .name
+            .strip_prefix(COLLECTION_MARKER)
+            .unwrap()
+            .split('|')
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let bytes = STANDARD.decode(&parts[0]).unwrap();
+        parts[0] = STANDARD.encode(rewrite_grant_boundary(&bytes, 0, 40, true).unwrap());
+        calendar.preferences[1].name = format!("{COLLECTION_MARKER}{}", parts.join("|"));
+        let context = resolve_owner_stored(archive(&calendar), &owner, CALENDAR).unwrap();
+        assert!(context.boundary.unwrap().pending);
+        complete_boundary(&mut calendar, &context.domain, 91).unwrap();
+        let bytes = STANDARD
+            .decode(
+                calendar.preferences[0]
+                    .name
+                    .strip_prefix(COLLECTION_MARKER)
+                    .unwrap()
+                    .split('|')
+                    .next()
+                    .unwrap(),
+            )
+            .unwrap();
+        let (header, ring) = open_owner_ring(&bytes, OWNER, CALENDAR, owner.ewk()).unwrap();
+        assert_eq!(header.rename_change_id, 40);
+        assert_eq!(ring.grants[0].change_id, 91);
+        let bytes = STANDARD
+            .decode(
+                calendar.preferences[1]
+                    .name
+                    .strip_prefix(COLLECTION_MARKER)
+                    .unwrap()
+                    .split('|')
+                    .next()
+                    .unwrap(),
+            )
+            .unwrap();
+        let (header, keys) =
+            open_grant_ring(&bytes, OWNER, CALENDAR, READER, [92; 16], &private).unwrap();
+        assert_eq!(header.grant_change_id, 91);
+        assert_eq!(header.rename_change_id, 40);
+        assert!(!header.boundary_pending);
+        let foreign =
+            ZaKeyDomain::shared(OWNER, READER, None, CALENDAR, [92; 16], keys, false).unwrap();
+        assert!(complete_boundary(&mut calendar, &foreign, 100).is_err());
+        assert!(rewrite_grant_boundary(&bytes[..bytes.len() - 1], 1, 2, false).is_err());
     }
 
     #[test]

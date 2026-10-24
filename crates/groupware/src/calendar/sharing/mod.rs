@@ -12,3 +12,5 @@ pub mod resolve;
 
 #[cfg(feature = "test_mode")]
 pub mod test;
+
+pub mod boundary;
