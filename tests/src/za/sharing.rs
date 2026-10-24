@@ -37,6 +37,27 @@ const CAL: &str = "/dav/cal/share-owner-read%40example.com/share-read/";
 const MKCAL: &str = "<C:mkcalendar xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:set><D:prop><D:displayname>Shared owner private name</D:displayname></D:prop></D:set></C:mkcalendar>";
 const EVENT: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//share-tests//EN\r\nBEGIN:VEVENT\r\nUID:share-read-UID\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20240102T090000Z\r\nDTEND:20240102T100000Z\r\nSUMMARY:share-read-private-summary\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 
+// The calendar and generation a stored event's root `X-ZA-KEY` names when
+// it is a CK envelope (spec 3.4: policy version, `0x03`, calendar (4),
+// generation (4), wrapped DEK (72)); `None` for any other wrap or shape.
+fn ck_envelope(event: &CalendarEvent) -> Option<(u32, u32)> {
+    use groupware::calendar::{
+        seal::tree::{KEY_PROP, entry_text, is_carrier},
+        sharing::format::WRAP_CK,
+    };
+    let entry = event.data.event.components.first()?.entries.last()?;
+    if !is_carrier(entry, KEY_PROP) {
+        return None;
+    }
+    let bytes = STANDARD.decode(entry_text(entry)?.trim()).ok()?;
+    (bytes.len() == 82 && bytes[..2] == [1, WRAP_CK]).then(|| {
+        (
+            u32::from_be_bytes(bytes[2..6].try_into().unwrap()),
+            u32::from_be_bytes(bytes[6..10].try_into().unwrap()),
+        )
+    })
+}
+
 async fn event_archive(test: &TestServer, owner_id: u32, event_id: u32) -> Archive<AlignedBytes> {
     test.server
         .store()
@@ -1387,6 +1408,79 @@ async fn conversion_contract_tests(test: &mut TestServer) {
     }
     let other = make(test, &client, owner_id, home, "other").await;
     calendars.push("other".to_string());
+    // Mutation34: the earlier sole-parent EWK row must remain untouched when
+    // the complete post-phase-1 walk finds a later linked row. Observe before
+    // the injected revert failure can be retried or rollback can hide a write.
+    {
+        let id = make(test, &client, owner_id, home, "walk-before-write").await;
+        calendars.push("walk-before-write".into());
+        let early = plant_sealed_event(
+            test,
+            owner_id,
+            "walk-before-write",
+            "early.ics",
+            &EVENT.replace("share-read-UID", "walk-early"),
+            STRONG,
+            &TokenPairs::default(),
+        )
+        .await;
+        let late = plant_sealed_event(
+            test,
+            owner_id,
+            "walk-before-write",
+            "late.ics",
+            &EVENT.replace("share-read-UID", "walk-late"),
+            STRONG,
+            &TokenPairs::default(),
+        )
+        .await;
+        assert!(
+            early < late,
+            "archive walk fixture must place the unlinked candidate first"
+        );
+        let before = event_archive(test, owner_id, early).await;
+        let pause = Arc::new(Pause::new(owner_id));
+        set_share_precheck_pause(Some(pause.clone()));
+        set_share_revert_assert_fail(Some(ShareAssertFailure {
+            owner_id,
+            calendar_id: id,
+            remaining: 1,
+        }));
+        let server = test.server.clone();
+        let resident = keys.clone();
+        let guards = conversion_guards(test, &keys).await;
+        let handle =
+            tokio::spawn(async move { za_convert_calendar(&server, &resident, id, &guards).await });
+        conversion_wait(&pause).await;
+        conversion_link(test, owner_id, late, other, true).await;
+        pause.release.notify_one();
+        let result = handle.await.unwrap();
+        let after = event_archive(test, owner_id, early).await;
+        assert_eq!(
+            after.version, before.version,
+            "mutation34: earlier unlinked EWK candidate changed before failed revert"
+        );
+        let raw = after.deserialize::<CalendarEvent>().unwrap();
+        let key = raw.data.event.components[0].entries.last().unwrap().values[0]
+            .as_text()
+            .unwrap();
+        let envelope = STANDARD.decode(key).unwrap();
+        assert!(
+            envelope.len() == 74 && envelope[..2] == [1, 1],
+            "mutation34: earlier candidate must still have account envelope at failed revert"
+        );
+        conversion_conflict(result, 0, 0, false);
+        println!(
+            "Mutation34 oracle: earlier unlinked candidate archive unchanged and account envelope at failed revert, before rollback"
+        );
+        set_share_precheck_pause(None);
+        set_share_revert_assert_fail(None);
+        conversion_link(test, owner_id, late, other, false).await;
+        let guards = conversion_guards(test, &keys).await;
+        za_convert_calendar(&test.server, &keys, id, &guards)
+            .await
+            .unwrap();
+    }
     for class in ["init", "rewrap", "revert", "rollback", "restore"] {
         let slug = format!("assert-{class}");
         let id = make(test, &client, owner_id, home, &slug).await;
@@ -2214,6 +2308,31 @@ async fn conversion_contract_tests(test: &mut TestServer) {
             assert_eq!(event.created, before.created);
             assert_eq!(event.modified, before.modified);
         }
+        // Spec 11.2 case 21: every event ends 0x03. The unseal below also
+        // opens an EWK (0x01) row through the owner's legacy read path, so it
+        // cannot tell a held write that committed under the pre-conversion
+        // key domain: the stored envelope itself must be a CK envelope naming
+        // this calendar and a generation its owner ring lists.
+        let listed = sharing_http_ring(test, &keys, id)
+            .await
+            .expect("case 21: the converted calendar holds an owner ring")
+            .0
+            .generations;
+        assert_eq!(
+            crate::utils::za::envelope_wrap(&event.data.event),
+            Some(groupware::calendar::sharing::format::WRAP_CK),
+            "{slug}: case 21 requires the held write's event to end under a 0x03 envelope"
+        );
+        let (calendar, generation) =
+            ck_envelope(&event).unwrap_or_else(|| panic!("{slug}: malformed 0x03 envelope"));
+        assert_eq!(
+            calendar, id,
+            "{slug}: the 0x03 envelope must name this calendar"
+        );
+        assert!(
+            listed.contains(&generation),
+            "{slug}: envelope generation {generation} is not listed in {listed:?}"
+        );
         unseal_event_in_domain(&mut event, &context.domain).unwrap();
         if updating {
             assert!(
@@ -3212,11 +3331,70 @@ async fn sharing_rotation_contracts(test: &mut TestServer, owner: u32, reader: u
         grants.iter().find(|g| g["grant"] == second_id).unwrap()["state"],
         "key changed"
     );
+    // Spec 11.2 case 6: keep the reader's grant ring as stored before its
+    // revoke, beside the owner ring's generations at that moment.
+    let generations_before = sharing_http_ring(test, &owner_keys, id)
+        .await
+        .unwrap()
+        .0
+        .generations;
+    let reader_calendar = za_owned_calendar_context(&test.server, &owner_keys, id)
+        .await
+        .unwrap()
+        .stored
+        .deserialize::<Calendar>()
+        .unwrap();
+    let saved_reader_ring = STANDARD
+        .decode(
+            reader_calendar
+                .preferences
+                .iter()
+                .find(|p| p.account_id == reader)
+                .expect("case 6: the reader holds a grant before its revoke")
+                .name
+                .strip_prefix("$za$")
+                .unwrap()
+                .split('|')
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        parse_grant_header(&saved_reader_ring).unwrap().generations,
+        generations_before,
+        "case 6: the reader's ring lists every generation before its revoke"
+    );
     let revoke =
         json!({"username":USER,"password":STRONG,"calendar":"http-sharing","grant":reader});
     assert_eq!(
         za_post("shares/revoke", &revoke).await.expect(200)["changed"],
         true
+    );
+    // The revoke rotates in its own write (spec 7.2, invariant 37): exactly one
+    // new generation, every earlier one kept, and the revoked reader's saved
+    // ring never lists the new one.
+    let generations_after = sharing_http_ring(test, &owner_keys, id)
+        .await
+        .unwrap()
+        .0
+        .generations;
+    assert_eq!(
+        generations_after.len(),
+        generations_before.len() + 1,
+        "case 6: a revoke must add exactly one generation"
+    );
+    assert_eq!(
+        generations_after[..generations_before.len()],
+        generations_before[..],
+        "case 6: a revoke keeps every earlier generation"
+    );
+    let newest = *generations_after.last().unwrap();
+    assert!(
+        !parse_grant_header(&saved_reader_ring)
+            .unwrap()
+            .generations
+            .contains(&newest),
+        "case 6: the revoked reader's saved ring must not list the new generation"
     );
     let context = za_owned_calendar_context(&test.server, &owner_keys, id)
         .await
@@ -3255,6 +3433,34 @@ async fn sharing_rotation_contracts(test: &mut TestServer, owner: u32, reader: u
             .0
             .generations
     );
+    // Spec 11.2 case 6: an owner event written after the revoke is sealed under
+    // the new generation, which the revoked reader never held.
+    let owner_client = DummyWebDavClient::new(owner, USER, STRONG, USER);
+    let post_revoke = "/dav/cal/shares-http-owner%40example.com/http-sharing/post-revoke.ics";
+    owner_client
+        .request_with_headers(
+            "PUT",
+            post_revoke,
+            [("content-type", "text/calendar")],
+            sharing_event("share-rotation-post-revoke"),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let post_revoke_id = resource_id(test, owner, "http-sharing/post-revoke.ics").await;
+    assert_eq!(
+        ck_envelope(
+            &event_archive(test, owner, post_revoke_id)
+                .await
+                .deserialize::<CalendarEvent>()
+                .unwrap()
+        ),
+        Some((id, newest)),
+        "case 6: the owner event written after the revoke must carry the new generation"
+    );
+    owner_client
+        .request("DELETE", post_revoke, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
     // Same-level re-key rotates once, preserves the grant id/time boundary/address,
     // and must evict the grantee's resident keys despite unchanged ACL bits.
     super::pinning::pin(USER, SECOND, &display_fingerprint(&replacement))
@@ -6914,11 +7120,97 @@ async fn grantee_sync_boundaries(
             !hrefs.iter().any(|path| path.contains("/private/")),
             "private tombstone counted or emitted: {hrefs:?}"
         );
+        // R11-29: a counted private tombstone exceeds the limit and truncates this
+        // response into a continuation, even when the one slot went to the granted one.
+        let next = response.sync_token();
+        assert!(
+            next.strip_prefix("urn:stalwart:davsync:")
+                .is_some_and(|id| !id.contains(':')),
+            "limit-1 sync of {target} answered continuation {next}: private tombstone counted"
+        );
+        assert!(
+            !response.expect_body().contains("HTTP/1.1 507"),
+            "limit-1 sync of {target} reported truncation: private tombstone counted"
+        );
+        let unlimited =
+            sharing_sync_report(bob, target, &later, Depth::Infinity, None, ["D:getetag"])
+                .await
+                .with_status(StatusCode::MULTI_STATUS);
+        let hrefs = unlimited.hrefs();
+        assert!(
+            hrefs
+                .iter()
+                .any(|path| path == &format!("{shared}deleted.ics")),
+            "unlimited sync of {target} is missing the granted tombstone: {hrefs:?}"
+        );
+        assert!(
+            !hrefs.iter().any(|path| path.contains("/private/")),
+            "unlimited sync of {target} emitted a private tombstone: {hrefs:?}"
+        );
     }
     // The destination is vacant when rename pauses. Its entire private history is
     // then committed before the rename: only the rename's own assigned id may fence it.
     let home_owned = home.to_string();
     let shared_owned = shared.to_string();
+    // R11-31, case 1's rename into a former slug, unpaused: bob keeps a token of the
+    // granted calendar, alice deletes an event of a private calendar and then that
+    // calendar, and renames the granted calendar into the freed slug. The rename's
+    // boundary must fence the kept token; the slug is restored before the paused rename.
+    println!("Task11 rename into a former slug, unpaused");
+    let former = format!("{home}former-slug/");
+    let former_event = format!("{former}former-history.ics");
+    alice
+        .request("MKCALENDAR", &former, MKCAL)
+        .await
+        .with_status(StatusCode::CREATED);
+    alice
+        .request_with_headers(
+            "PUT",
+            &former_event,
+            [("content-type", "text/calendar")],
+            EVENT.replace("share-read-UID", "sync-former-history"),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let kept = sharing_sync_report(bob, shared, "", Depth::Infinity, None, ["D:getetag"])
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .sync_token()
+        .to_string();
+    alice
+        .request("DELETE", &former_event, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    alice
+        .request("DELETE", &former, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    alice
+        .request_with_headers("MOVE", shared, [("destination", former.as_str())], "")
+        .await
+        .with_status(StatusCode::CREATED);
+    for target in [home, former.as_str()] {
+        let response =
+            sharing_sync_report(bob, target, &kept, Depth::Infinity, None, ["D:getetag"])
+                .await
+                .with_status(StatusCode::FORBIDDEN);
+        assert!(
+            response.body.unwrap().contains("valid-sync-token"),
+            "{target}: a token kept before a rename into a former slug must be fenced"
+        );
+        let response = sharing_sync_report(bob, target, "", Depth::Infinity, None, ["D:getetag"])
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+        let hrefs = response.hrefs();
+        assert!(
+            !hrefs.iter().any(|path| path.contains("former-history")),
+            "{target}: full sync shows the former slug's private calendar: {hrefs:?}"
+        );
+    }
+    alice
+        .request_with_headers("MOVE", &former, [("destination", shared)], "")
+        .await
+        .with_status(StatusCode::CREATED);
     let parked = HookParked::start(owner, test_hooks::set_share_rename_pause, async move {
         DummyWebDavClient::new(
             owner,
@@ -7591,6 +7883,15 @@ async fn sharing_lifecycle_differential(test: &mut TestServer) {
     use crate::utils::za::za_post;
     use serde_json::json;
     println!("Running case25 HTTP owner/delegated lifecycle differential...");
+    // The differential oracle must retain an exact SEQUENCE difference of n+2.
+    let n = sharing_tree(&EVENT.replace("SUMMARY:", "SEQUENCE:7\r\nSUMMARY:"));
+    let n_plus_two = sharing_tree(&EVENT.replace("SUMMARY:", "SEQUENCE:9\r\nSUMMARY:"));
+    assert!(
+        crate::utils::za::normalize_sharing_copy(n, "same-uid")
+            != crate::utils::za::normalize_sharing_copy(n_plus_two, "same-uid"),
+        "mutation45: normalization must preserve an n+2 SEQUENCE difference"
+    );
+
     let _drain = DrainOn::new();
     let admin = test.account("admin@example.com").clone();
     for name in [LIFE_ALICE, LIFE_BOB, LIFE_CAROL] {
@@ -8146,6 +8447,32 @@ async fn grantee_gate_controls(
         .request("PROPFIND", home, "")
         .await
         .with_status(StatusCode::MULTI_STATUS);
+    // Case11: group membership is not an own-id grant. Assisted propname must
+    // omit the foreign calendar even though upstream shared_containers finds it.
+    let grace_home = format!("/dav/cal/{}/", GRACE.replace('@', "%40"));
+    let discovered = grace
+        .request_with_headers(
+            "PROPFIND",
+            &grace_home,
+            [("depth", "1")],
+            "<D:propfind xmlns:D=\"DAV:\"><D:propname/></D:propfind>",
+        )
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    assert!(
+        discovered
+            .hrefs()
+            .contains(&format!("{grace_home}default/").as_str()),
+        "case11: assisted propname retains Grace's own calendar: {:?}",
+        discovered.body
+    );
+    assert!(
+        !discovered
+            .hrefs()
+            .contains(&format!("{home}private/").as_str()),
+        "case11: assisted propname must omit the group-only foreign calendar: {:?}",
+        discovered.body
+    );
     let key = test
         .server
         .za_served_public_key(imp_id)
@@ -8159,6 +8486,26 @@ async fn grantee_gate_controls(
     imp.request("PROPFIND", "/dav/cal/sharing-gate-imp%40example.com/", "")
         .await
         .with_status(StatusCode::MULTI_STATUS);
+    // A downstream event resolver also refuses these tokens. Check the URI
+    // admission seam itself on the foreign home root and its fixed trace.
+    for (client, label) in [(&keyless, "keyless"), (&imp, "Impersonate")] {
+        let traced = super::mail::Traced::start(trc::EventType::variants());
+        let response = client.request("PROPFIND", home, "").await;
+        let events = traced.finish().await;
+        assert_eq!(
+            response.status,
+            StatusCode::FORBIDDEN,
+            "{label}: foreign home must be refused at URI gate"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.account_id == Some(alice.account_id as u64)
+                    && event.details == "zero-access: calendar access without session keys"),
+            "{label}: URI gate refusal must precede collection resolution"
+        );
+    }
+
     for (method, target, body) in [
         ("GET", format!("{shared}event.ics"), ""),
         (
@@ -8214,6 +8561,59 @@ async fn grantee_gate_controls(
                 .find(|entry| entry.account_id == personal.account_id),
             Some(personal),
             "unopened personal/ring entry must be byte-for-byte unchanged"
+        );
+    }
+    // Spec 5.2: the resolver checks the grant's own bits on every operation.
+    // Upstream's container check reads the request's DAV resource snapshot, so
+    // only a level change made after that snapshot leaves the resolver's fresh
+    // read as the deciding check: park Bob's update right after the snapshot
+    // (PUT_PAUSE), downgrade him to view, and require the refusal with the
+    // stored event unchanged.
+    {
+        use crate::utils::{http::HttpRequest, za::HookParked};
+        let event_id = resource_id(test, alice.account_id, "shared/event.ics").await;
+        let stored = event_archive(test, alice.account_id, event_id).await;
+        let request = HttpRequest::with_credentials(8899, bob.name, STRONG);
+        let path = format!("{shared}event.ics");
+        let text = EVENT
+            .replace("share-read-UID", "sharing-dav-admission")
+            .replace("share-read-private-summary", "gate-downgraded-write");
+        let held = HookParked::start(
+            alice.account_id,
+            common::za::test_hooks::set_put_pause,
+            async move {
+                request
+                    .send_full(
+                        hyper::Method::PUT,
+                        &path,
+                        Some(text.into_bytes()),
+                        Some("text/calendar"),
+                    )
+                    .await
+            },
+        )
+        .await;
+        let mut level = json!({"username":alice.name,"password":STRONG,"calendar":"shared","address":bob.name,"level":"view"});
+        assert_eq!(
+            za_post("shares/grant", &level).await.expect(200)["changed"],
+            true
+        );
+        assert_eq!(
+            held.finish().await.status,
+            403,
+            "case 11: a grant downgraded after the request snapshot must be refused by the resolver's bit check"
+        );
+        let unchanged = event_archive(test, alice.account_id, event_id).await;
+        assert_eq!(unchanged.version, stored.version);
+        assert_eq!(
+            unchanged.as_bytes(),
+            stored.as_bytes(),
+            "case 11: the refused update must leave the event archive byte-identical"
+        );
+        level["level"] = json!("edit");
+        assert_eq!(
+            za_post("shares/grant", &level).await.expect(200)["changed"],
+            true
         );
     }
     let assisted_before = test.server.core.groupware.assisted_discovery;
@@ -8489,6 +8889,30 @@ async fn grantee_unrelated_corruption(
     bob.request("PROPFIND", home, "")
         .await
         .with_status(StatusCode::INTERNAL_SERVER_ERROR);
+    // Corruption remains an error in either valid DAV packaging: a request500
+    // or a207 with a500 item for this exact eligible calendar (spec10).
+    assert!(
+        test.server.core.groupware.assisted_discovery,
+        "the suite runs with assisted discovery on"
+    );
+    let own_home = format!("/dav/cal/{}/", bob.name.replace('@', "%40"));
+    for prop in ["<D:allprop/>", "<D:prop><D:displayname/></D:prop>"] {
+        let response = bob
+            .request_with_headers(
+                "PROPFIND",
+                &own_home,
+                [("depth", "1")],
+                format!("<D:propfind xmlns:D=\"DAV:\">{prop}</D:propfind>"),
+            )
+            .await;
+        if response.status != StatusCode::INTERNAL_SERVER_ERROR {
+            response
+                .with_status(StatusCode::MULTI_STATUS)
+                .into_propfind_response(None)
+                .properties(&path)
+                .with_status(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
     let current = test
         .server
         .store()
@@ -8788,9 +9212,40 @@ async fn sharing_http_schedule_contracts(test: &mut TestServer) {
         .request_with_headers("MOVE", &imported, [("destination", held.as_str())], "")
         .await
         .with_status(StatusCode::CREATED);
+    // Oracle 46 (RFC 6638 3.2.10): an attendee's changes to its own participation
+    // do not change the Schedule-Tag its scheduling object resource is served with.
+    let served_tag = async |client: &DummyWebDavClient| {
+        client
+            .request("GET", &held, "")
+            .await
+            .with_status(StatusCode::OK)
+            .headers
+            .get("schedule-tag")
+            .cloned()
+    };
+    let held_tag = served_tag(&alice.client).await;
+    assert!(
+        held_tag.is_some(),
+        "oracle46: the held invitation is served a Schedule-Tag"
+    );
+    assert_eq!(
+        served_tag(&bob.client).await,
+        held_tag,
+        "oracle46: the writer is served the owner's Schedule-Tag"
+    );
     let before = inbox_ids(test, carol.id).await;
     let bob_before = inbox_ids(test, bob.id).await;
     set_partstat(&bob.client, &held, LIFE_ALICE, "ACCEPTED").await;
+    assert_eq!(
+        served_tag(&alice.client).await,
+        held_tag,
+        "oracle46: Bob's ACCEPTED write as Alice keeps the owner's Schedule-Tag"
+    );
+    assert_eq!(
+        served_tag(&bob.client).await,
+        held_tag,
+        "oracle46: Bob's ACCEPTED write as Alice keeps the writer's Schedule-Tag"
+    );
     let replies = new_inbox_items(test, carol.id, &before).await;
     assert_eq!(replies.len(), 1);
     let (reply, carriers) = open_pending_item_as(test, carol.id, STRONG, replies[0].0).await;
@@ -8817,6 +9272,16 @@ async fn sharing_http_schedule_contracts(test: &mut TestServer) {
         .request_with_headers("PUT", &held, [CONTENT_TYPE], changed)
         .await
         .with_status(StatusCode::NO_CONTENT);
+    assert_eq!(
+        served_tag(&alice.client).await,
+        held_tag,
+        "oracle46: Bob's DELEGATED write as Alice keeps the owner's Schedule-Tag"
+    );
+    assert_eq!(
+        served_tag(&bob.client).await,
+        held_tag,
+        "oracle46: Bob's DELEGATED write as Alice keeps the writer's Schedule-Tag"
+    );
     let replies = new_inbox_items(test, carol.id, &before).await;
     assert_eq!(replies.len(), 1);
     assert_eq!(
@@ -9079,7 +9544,8 @@ async fn sharing_http_schedule_contracts(test: &mut TestServer) {
             );
         }
     }
-    // Sole attendee paths: ordinary decline and Bob create/summary/delete without ForceSend.
+    // Sole attendee paths: ordinary decline and Bob create/summary/delete.
+    // The delegated create uses ForceSend so second-only finalize has a stored effect.
     for delegated_create in [false, true] {
         let uid = if delegated_create {
             "case10-sole-delegated"
@@ -9093,10 +9559,29 @@ async fn sharing_http_schedule_contracts(test: &mut TestServer) {
         } else {
             &alice.client
         };
+        let source = make(uid, &[LIFE_BOB]);
+        let source = if delegated_create {
+            source.replace("ATTENDEE;", "ATTENDEE;SCHEDULE-FORCE-SEND=REQUEST;")
+        } else {
+            source
+        };
         creator
-            .request_with_headers("PUT", &path, [CONTENT_TYPE], make(uid, &[LIFE_BOB]))
+            .request_with_headers("PUT", &path, [CONTENT_TYPE], source)
             .await
             .with_status(StatusCode::CREATED);
+        if delegated_create {
+            use calcard::icalendar::ICalendarParameterName;
+            let stored_source = sharing_tree(&body(&bob.client, &path).await);
+            assert!(
+                !stored_source
+                    .components
+                    .iter()
+                    .flat_map(|component| &component.entries)
+                    .flat_map(|entry| &entry.params)
+                    .any(|parameter| parameter.name == ICalendarParameterName::ScheduleForceSend),
+                "case10-sole-delegated: second-only finalize removes stored SCHEDULE-FORCE-SEND"
+            );
+        }
         sharing_drain_step(test, &bob).await;
         let own = copy_href(test, bob.id, uid).await;
         if !delegated_create {
