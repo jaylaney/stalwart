@@ -80,3 +80,54 @@ Regression net after a merge, in this order: `cargo test -p vault`,
 product build warning-free in `vault`, `groupware`, `dav` and `http`. The
 key-account mode of the upstream suite is the real guard: it runs upstream's
 own tests against sealed data.
+
+## Sharing key calendars
+
+Two setup-complete key accounts can share an owner calendar at `view` or `edit` through
+`POST /api/vault/shares`, `/api/vault/shares/grant` and `/api/vault/shares/revoke`.
+See [the sharing API](../../zero-access/calendar-sharing-api.md) for request bodies, pinning,
+exact refusals, measurement conditions and the privacy boundary. The owner pins the grantee's
+current public key before granting; a first-use pin is accepted, with out-of-band comparison
+recommended when confirming it. Revoke by the stable grant id because aliases can move.
+The first grant converts all historical events; later grants use the converted ring.
+Revocation rotates future-write keys and does not reseal existing ciphertext.
+Apple assisted discovery is on by default; Thunderbird can use a second home-set href with
+it off. Pubsub must reach every node for prompt cache invalidation. Missed broadcasts can
+leave resident keys until the existing hard cap, although current ACL/ring checks reject
+fresh revoked access. Use disposable accounts for the manual checklist.
+
+Release qualification runs the following commands sequentially; suites share listener ports.
+The benchmark and native checklist are separate gates. The key-mode JMAP gate must actually
+reach `za_variants::calendars`, including its seven calendar-method refusals and empty
+availability assertion. `RUST_TEST_NOCAPTURE=1` can expose its existing progress marker while
+retaining the exact Cargo arguments below.
+
+```sh
+export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
+cargo fmt --all --check
+cargo test -p vault -p groupware -p common
+cargo test -p http@0.16.26 --features test_mode
+STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests -- --nocapture
+STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests webdav::webdav_tests
+STORE=RocksDb RUST_MIN_STACK=16777216 ZA_KEY_ACCOUNTS=1 cargo test -p tests webdav::webdav_tests
+STORE=RocksDb RUST_MIN_STACK=16777216 ZA_KEY_ACCOUNTS=1 cargo test -p tests jmap::jmap_tests
+cargo build --release -p stalwart --no-default-features --features rocks
+```
+
+The [plan 14 outcome](2026-10-23-zero-access-plan14-outcome.md) records actual automated
+results, temporary measurement instrumentation, limitations and pending native/review gates.
+No passing automated suite establishes native client behavior, SQL or multi-node execution.
+
+Release-4 merge dependencies: preserve the strict carrier/domain codecs and complete ring
+identity checks before resolver/cache use; every event/link physical write must retain its
+fresh calendar/vault/Account/event fences before conversion or grant publication. Conversion
+keeps O(N) ids and at most 100 payload snapshots, commits each event separately and counts
+only acknowledged work. Endpoint invalidation/boundary completion follows acknowledged writes.
+Recheck `crates/common/src/cache/principals.rs` quiet catch-all propagation;
+`crates/groupware/src/scheduling/event_cancel.rs`'s `itip_cancel_from_snapshot` seam;
+`calendar/delegation.rs`'s pre-finalize owner-only second run and `za_finalize`;
+`crates/dav/src/calendar/update.rs`'s two finalize branches and retained writer/owner identity;
+DAV URI admission, discovery, sync/rename boundaries and all event writers; and
+`crates/http/src/api/{vault,shares}.rs` dispatch, authentication, guards and mutation ordering.
+Upstream changes to snapshot/finalize, cancel payloads or raw NothingToSend/empty distinctions
+need the owner/delegated lifecycle differential suite and transparent mutation qualification.

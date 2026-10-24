@@ -25,6 +25,19 @@ For each client:
 Server-side, after the run: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests` passes against the same build, and the admin
 can read nothing meaningful in the stored records (spot-check with the leak scanner's output).
 
+## Calendar sharing (release 4)
+
+Use two disposable, setup-complete key accounts, an owner and grantee, with app passwords for Apple Calendar. Record OS/client versions and server build. Turn `enableAssistedDiscovery` on for Apple checks. For each observation record what the client shows immediately, then what owner and grantee show after drain and refresh; those are distinct results.
+
+1. Grant `view` using the vault API after confirming the grantee's pin. On Apple Calendar for macOS and iOS, confirm the owner's calendar appears under the grantee account, its events read, and the client treats it as read-only; attempt a write and capture the 403/UI response.
+2. Change the grant to `edit`. Edit from each Apple platform and confirm owner and grantee round trips. Change colour/order as grantee: they are shared calendar dead properties, so confirm the owner sees the colour change. Downgrade to `view`, attempt colour change, and record whether Apple keeps a local colour, reverts it, or reports the 403.
+3. From the shared calendar, have the grantee invite someone and change/cancel the event. Record whether Apple offers invitees, how the recipient displays the owner's invitation and `SENT-BY` grantee, and the final recipient status. Have the grantee reply from its own invitation copy and, separately, from the shared copy; after drain and refresh, check both copies. Repeat with the grantee as sole attendee declining from the shared copy without `SCHEDULE-FORCE-SEND`; its own copy should end DECLINED. Record immediate UI separately.
+4. Add a display alarm to the owner's scheduled event from the edit grantee. Drag an event in both directions between shared and grantee-owned calendars, and between owner shared and unshared calendars. Record the actual requests, response and resulting copies rather than assuming the client sends `MOVE`.
+5. Revoke by the grant id listed by `shares`. Confirm the grantee loses it on the next refresh; grant again and confirm it reappears. Rename the owner's calendar and confirm discovery/sync after the boundary. Compare initial sync and incremental sync behavior where the client exposes it.
+6. Turn assisted discovery off and confirm Thunderbird finds the shared calendar through the second `calendar-home-set` href. DAVx5 is optional. A recipient who is also a grantee should answer an invitation from their own copy.
+
+Native status for this outcome: **pending** for macOS Apple Calendar, iOS Apple Calendar and Thunderbird. No native-client session was exercised in Task 12; qualified disposable native sessions and trusted-TLS setup remain pending. This checklist is not a completed native acceptance record. Record any unavailable device, credentials, certificate, network reachability or missing observation as pending.
+
 ## Mail
 
 Release 3 (mail encryption at rest; spec `docs/superpowers/specs/2026-10-20-zero-access-mail-design.md`, section 11). Run once per release against a server built from this branch, with TOTP enrolled on one of the two key accounts used.
