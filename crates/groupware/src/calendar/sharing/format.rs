@@ -551,7 +551,6 @@ fn sealed_timezone(entry: &CalendarPreferences) -> Result<(), SealError> {
 /// Assembles prepared sealed entries, with no key access, authorization or store write.
 /// The caller verifies the decrypted ledger before calling this, then uses Calendar::update.
 // Task 1 introduces this crate-private writer; conversion and mutations consume it in Tasks 6-7.
-#[allow(dead_code)]
 pub(crate) fn za_replace_calendar_entries(
     calendar: &mut Calendar,
     owner_id: u32,

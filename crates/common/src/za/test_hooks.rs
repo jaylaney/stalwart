@@ -497,3 +497,93 @@ pub fn take_move_overwrite_message(owner: u32, event: u32) -> Option<bool> {
         .position(|(o, e, _)| (*o, *e) == (owner, event))?;
     Some(values.swap_remove(idx).2)
 }
+
+/// First-grant conversion seams, independent of ordinary DAV write hooks.
+pub static SHARE_PRECHECK_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SHARE_REWRAP_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SHARE_REWRAP_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+pub fn set_share_precheck_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SHARE_PRECHECK_PAUSE, pause);
+}
+pub fn set_share_rewrap_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SHARE_REWRAP_PAUSE, pause);
+}
+pub fn set_share_rewrap_fail_once(owner: Option<u32>) {
+    *SHARE_REWRAP_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = owner;
+}
+pub async fn share_precheck_pause_point(owner: u32) {
+    wait(take_for(&SHARE_PRECHECK_PAUSE, owner)).await;
+}
+pub async fn share_rewrap_pause_point(owner: u32) {
+    wait(take_for(&SHARE_REWRAP_PAUSE, owner)).await;
+}
+pub fn take_share_rewrap_fail_once(owner: u32) -> bool {
+    take_flag(&SHARE_REWRAP_FAIL_ONCE, owner)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShareAssertFailure {
+    pub owner_id: u32,
+    pub calendar_id: u32,
+    pub remaining: u32,
+}
+fn take_share_assert(slot: &Mutex<Option<ShareAssertFailure>>, owner: u32, calendar: u32) -> bool {
+    let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(failure) = slot.as_mut()
+        && failure.owner_id == owner
+        && failure.calendar_id == calendar
+        && failure.remaining > 0
+    {
+        failure.remaining -= 1;
+        true
+    } else {
+        false
+    }
+}
+pub static SHARE_INIT_ASSERT_FAIL: Mutex<Option<ShareAssertFailure>> = Mutex::new(None);
+pub fn set_share_init_assert_fail(failure: Option<ShareAssertFailure>) {
+    *SHARE_INIT_ASSERT_FAIL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = failure;
+}
+pub fn take_share_init_assert_fail(owner_id: u32, calendar_id: u32) -> bool {
+    take_share_assert(&SHARE_INIT_ASSERT_FAIL, owner_id, calendar_id)
+}
+pub static SHARE_REWRAP_ASSERT_FAIL: Mutex<Option<ShareAssertFailure>> = Mutex::new(None);
+pub fn set_share_rewrap_assert_fail(failure: Option<ShareAssertFailure>) {
+    *SHARE_REWRAP_ASSERT_FAIL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = failure;
+}
+pub fn take_share_rewrap_assert_fail(owner_id: u32, calendar_id: u32) -> bool {
+    take_share_assert(&SHARE_REWRAP_ASSERT_FAIL, owner_id, calendar_id)
+}
+pub static SHARE_REVERT_ASSERT_FAIL: Mutex<Option<ShareAssertFailure>> = Mutex::new(None);
+pub fn set_share_revert_assert_fail(failure: Option<ShareAssertFailure>) {
+    *SHARE_REVERT_ASSERT_FAIL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = failure;
+}
+pub fn take_share_revert_assert_fail(owner_id: u32, calendar_id: u32) -> bool {
+    take_share_assert(&SHARE_REVERT_ASSERT_FAIL, owner_id, calendar_id)
+}
+pub static SHARE_ROLLBACK_ASSERT_FAIL: Mutex<Option<ShareAssertFailure>> = Mutex::new(None);
+pub fn set_share_rollback_assert_fail(failure: Option<ShareAssertFailure>) {
+    *SHARE_ROLLBACK_ASSERT_FAIL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = failure;
+}
+pub fn take_share_rollback_assert_fail(owner_id: u32, calendar_id: u32) -> bool {
+    take_share_assert(&SHARE_ROLLBACK_ASSERT_FAIL, owner_id, calendar_id)
+}
+pub static SHARE_RESTORE_ASSERT_FAIL: Mutex<Option<ShareAssertFailure>> = Mutex::new(None);
+pub fn set_share_restore_assert_fail(failure: Option<ShareAssertFailure>) {
+    *SHARE_RESTORE_ASSERT_FAIL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = failure;
+}
+pub fn take_share_restore_assert_fail(owner_id: u32, calendar_id: u32) -> bool {
+    take_share_assert(&SHARE_RESTORE_ASSERT_FAIL, owner_id, calendar_id)
+}

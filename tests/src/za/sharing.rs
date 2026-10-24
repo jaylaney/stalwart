@@ -366,6 +366,8 @@ pub async fn test(test: &mut TestServer) {
         .await
         .with_status(StatusCode::NO_CONTENT);
     test.wait_for_tasks().await;
+    conversion_test(test).await;
+    conversion_contract_tests(test).await;
     copy_move_test(test).await;
 }
 
@@ -1019,4 +1021,1502 @@ async fn copy_move_test(test: &mut TestServer) {
     crate::utils::za::set_raw_pins(test, owner_id, None).await;
     crate::utils::za::set_raw_pins(test, reader_id, None).await;
     test.wait_for_tasks().await;
+}
+
+// Catches a missing conversion, content reseal, lost tokens or metadata drift.
+async fn conversion_test(test: &mut TestServer) {
+    use crate::utils::za::plant_sealed_event;
+    use groupware::calendar::seal::TokenPairs;
+    use groupware::calendar::{
+        seal::{event_pairs_in_domain, unseal_event_in_domain},
+        sharing::convert::{ZaShareGuards, za_convert_calendar},
+    };
+    println!("Running direct first-grant conversion tests...");
+    let address = "share-converter@example.com";
+    let owner = test
+        .account("admin@example.com")
+        .create_key_user_account(address, STRONG, "Converter", &[], user_permissions())
+        .await;
+    let owner_id = owner.id().document_id();
+    test.insert_account(owner);
+    let client = DummyWebDavClient::new(owner_id, address, STRONG, address);
+    let path = "/dav/cal/share-converter%40example.com/converter/";
+    client
+        .request("MKCALENDAR", path, MKCAL)
+        .await
+        .with_status(StatusCode::CREATED);
+    let calendar_id = test
+        .server
+        .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+        .await
+        .unwrap()
+        .by_path("converter")
+        .unwrap()
+        .document_id();
+    let mut pairs = TokenPairs::default();
+    pairs.insert("attendee@example.org", [0x51; 16]);
+    let sealed_id = plant_sealed_event(
+        test,
+        owner_id,
+        "converter",
+        "sealed.ics",
+        &EVENT.replace("share-read-UID", "converter-sealed"),
+        STRONG,
+        &pairs,
+    )
+    .await;
+    let plain_id = plant_event(
+        test,
+        owner_id,
+        "converter",
+        "plain.ics",
+        &EVENT.replace("share-read-UID", "converter-plain"),
+        None,
+    )
+    .await;
+    let before = event_archive(test, owner_id, sealed_id)
+        .await
+        .deserialize::<CalendarEvent>()
+        .unwrap();
+    let keys = za_unlock(test, owner_id, STRONG).await;
+    let guards = ZaShareGuards {
+        owner_id,
+        verified_generation: keys.generation,
+        vault_cas: test
+            .server
+            .za_vault_record(owner_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .cas,
+        pin_assertion: None,
+    };
+    let counts = za_convert_calendar(&test.server, &keys, calendar_id, &guards)
+        .await
+        .unwrap();
+    assert_eq!(counts.rewrapped, 1, "sealed event must be rewrapped");
+    assert_eq!(counts.sealed, 1, "plaintext event must be sealed");
+    let context = za_owned_calendar_context(&test.server, &keys, calendar_id)
+        .await
+        .unwrap();
+    assert!(context.domain.domain_id().is_some());
+    let calendar = context.stored.deserialize::<Calendar>().unwrap();
+    assert!(calendar.acls.is_empty());
+    let mut after = event_archive(test, owner_id, sealed_id)
+        .await
+        .deserialize::<CalendarEvent>()
+        .unwrap();
+    assert_eq!(payload(after.clone()), payload(before.clone()));
+    assert_eq!(after.created, before.created);
+    assert_eq!(after.modified, before.modified);
+    assert!(
+        event_pairs_in_domain(
+            &event_archive(test, owner_id, sealed_id).await,
+            &context.domain
+        )
+        .unwrap()
+        .unwrap()
+        .matches("attendee@example.org", &[0x51; 16])
+    );
+    for id in [sealed_id, plain_id] {
+        after = event_archive(test, owner_id, id)
+            .await
+            .deserialize::<CalendarEvent>()
+            .unwrap();
+        unseal_event_in_domain(&mut after, &context.domain).unwrap();
+        assert!(
+            after
+                .data
+                .event
+                .to_string()
+                .contains("share-read-private-summary")
+        );
+    }
+    let resumed = za_convert_calendar(&test.server, &keys, calendar_id, &guards)
+        .await
+        .unwrap();
+    assert_eq!(resumed.rewrapped, 0);
+    assert_eq!(resumed.sealed, 0);
+    client
+        .request("DELETE", path, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    // Provisioning may create defaults when the first collection is requested.
+    let default_status = client
+        .request(
+            "DELETE",
+            "/dav/cal/share-converter%40example.com/default/",
+            "",
+        )
+        .await
+        .status;
+    assert!(matches!(
+        default_status,
+        StatusCode::NO_CONTENT | StatusCode::NOT_FOUND
+    ));
+    test.wait_for_tasks().await;
+}
+
+struct ConversionHooksReset;
+impl Drop for ConversionHooksReset {
+    fn drop(&mut self) {
+        use common::za::test_hooks::*;
+        set_share_precheck_pause(None);
+        set_share_rewrap_pause(None);
+        set_share_rewrap_fail_once(None);
+        set_share_init_assert_fail(None);
+        set_share_rewrap_assert_fail(None);
+        set_share_revert_assert_fail(None);
+        set_share_rollback_assert_fail(None);
+        set_share_restore_assert_fail(None);
+    }
+}
+async fn conversion_guards(
+    test: &TestServer,
+    keys: &vault::session::SessionKeys,
+) -> groupware::calendar::sharing::convert::ZaShareGuards {
+    groupware::calendar::sharing::convert::ZaShareGuards {
+        owner_id: keys.account_id,
+        verified_generation: keys.generation,
+        vault_cas: test
+            .server
+            .za_vault_record(keys.account_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .cas,
+        pin_assertion: None,
+    }
+}
+async fn conversion_ring(
+    test: &TestServer,
+    keys: &vault::session::SessionKeys,
+    id: u32,
+) -> Option<(OwnerRingHeader, ZaOwnerRing)> {
+    let context = za_owned_calendar_context(&test.server, keys, id)
+        .await
+        .unwrap();
+    let calendar = context.stored.deserialize::<Calendar>().unwrap();
+    assert!(
+        calendar.acls.is_empty(),
+        "conversion must never publish an ACL"
+    );
+    assert_eq!(calendar.preferences.len(), 1);
+    if context.domain.domain_id().is_none() {
+        return None;
+    }
+    let encoded = calendar.preferences[0]
+        .name
+        .strip_prefix("$za$")
+        .unwrap()
+        .split('|')
+        .next()
+        .unwrap();
+    let result = groupware::calendar::sharing::format::open_owner_ring(
+        &STANDARD.decode(encoded).unwrap(),
+        keys.account_id,
+        id,
+        keys.ewk(),
+    )
+    .unwrap();
+    assert!(!result.1.converted);
+    assert!(
+        result.1.grants.is_empty(),
+        "conversion must never publish a ledger or grant"
+    );
+    Some(result)
+}
+fn conversion_conflict(
+    result: Result<
+        groupware::calendar::sharing::convert::ZaConversionCounts,
+        groupware::calendar::sharing::convert::ZaShareError,
+    >,
+    rewrapped: usize,
+    sealed: usize,
+    progress: bool,
+) {
+    use groupware::calendar::sharing::convert::ZaShareError;
+    match result {
+        Err(ZaShareError::ConversionConflict {
+            committed,
+            progress_changed,
+        }) => {
+            assert_eq!(committed.rewrapped, rewrapped);
+            assert_eq!(committed.sealed, sealed);
+            assert_eq!(progress_changed, progress);
+        }
+        other => panic!("expected opaque conversion conflict, got {other:?}"),
+    }
+}
+async fn conversion_link(test: &TestServer, owner: u32, event: u32, other_parent: u32, add: bool) {
+    let stored = event_archive(test, owner, event).await;
+    let mut value = stored.deserialize::<CalendarEvent>().unwrap();
+    if add {
+        value.names.push(common::DavName {
+            name: format!("linked-{event}.ics"),
+            parent_id: other_parent,
+        });
+    } else {
+        value.names.retain(|name| name.parent_id != other_parent);
+    }
+    update_event(test, owner, event, &stored, value).await;
+    test.server
+        .invalidate_local_caches(&[common::ipc::CacheInvalidation::DavResources(owner)])
+        .await;
+}
+async fn conversion_wait(pause: &common::za::test_hooks::Pause) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), pause.arrived.notified())
+        .await
+        .expect("conversion pause not reached");
+}
+
+// Each case names a distinct persistence failure: an injected attempt must not
+// write, drop its journal, count uncommitted work, or publish an early grant.
+async fn conversion_contract_tests(test: &mut TestServer) {
+    use crate::utils::za::{HookParked, plant_sealed_event};
+    use common::za::test_hooks::*;
+    use groupware::calendar::{
+        CalendarPreferences,
+        seal::{
+            TokenPairs, calendar_view_in_domain, event_pairs_in_domain, seal_calendar,
+            unseal_event_in_domain,
+        },
+        sharing::convert::{ZaConversionCounts, ZaShareError, za_convert_calendar},
+    };
+    use std::sync::Arc;
+    use vault::session::CollectionKeyId;
+    let _reset = ConversionHooksReset;
+    println!("Running conversion assertion, rollback, resume and cache contracts...");
+    let address = "share-conversion-contract@example.com";
+    let home = "/dav/cal/share-conversion-contract%40example.com/";
+    let owner = test
+        .account("admin@example.com")
+        .create_key_user_account(
+            address,
+            STRONG,
+            "Conversion contract",
+            &[],
+            user_permissions(),
+        )
+        .await;
+    let owner_id = owner.id().document_id();
+    test.insert_account(owner);
+    let client = DummyWebDavClient::new(owner_id, address, STRONG, address);
+    let mut keys = za_unlock(test, owner_id, STRONG).await;
+    let mut calendars = Vec::new();
+    async fn make(
+        test: &TestServer,
+        client: &DummyWebDavClient,
+        owner: u32,
+        home: &str,
+        slug: &str,
+    ) -> u32 {
+        client
+            .request("MKCALENDAR", &format!("{home}{slug}/"), MKCAL)
+            .await
+            .with_status(StatusCode::CREATED);
+        test.server
+            .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+            .await
+            .unwrap()
+            .by_path(slug)
+            .unwrap()
+            .document_id()
+    }
+    let other = make(test, &client, owner_id, home, "other").await;
+    calendars.push("other".to_string());
+    for class in ["init", "rewrap", "revert", "rollback", "restore"] {
+        let slug = format!("assert-{class}");
+        let id = make(test, &client, owner_id, home, &slug).await;
+        calendars.push(slug.clone());
+        let mut pairs = TokenPairs::default();
+        pairs.insert("token@example.org", [0x62; 16]);
+        let event_id = plant_sealed_event(
+            test,
+            owner_id,
+            &slug,
+            "ewk.ics",
+            &EVENT.replace("share-read-UID", &slug),
+            STRONG,
+            &pairs,
+        )
+        .await;
+        let current = za_owned_calendar_context(&test.server, &keys, id)
+            .await
+            .unwrap();
+        let mut original_plain =
+            calendar_view_in_domain(&current.stored, &current.domain, owner_id)
+                .unwrap()
+                .deserialize::<Calendar>()
+                .unwrap();
+        use types::dead_property::{DeadElementTag, DeadProperty, DeadPropertyTag as Tag};
+        original_plain.dead_properties = DeadProperty(vec![
+            Tag::ElementStart(DeadElementTag {
+                name: "http://apple.com/ns/ical/ calendar-color".into(),
+                attrs: None,
+            }),
+            Tag::Text("#ABCDEF77".into()),
+            Tag::ElementEnd,
+            Tag::ElementStart(DeadElementTag {
+                name: "http://apple.com/ns/ical/ calendar-order".into(),
+                attrs: None,
+            }),
+            Tag::Text("71".into()),
+            Tag::ElementEnd,
+        ]);
+        let original_properties = original_plain.dead_properties.clone();
+        seal_calendar(&mut original_plain, &keys, owner_id).unwrap();
+        update_calendar(test, owner_id, id, &current.stored, original_plain).await;
+        let before_event = event_archive(test, owner_id, event_id).await;
+        let before_calendar = za_owned_calendar_context(&test.server, &keys, id)
+            .await
+            .unwrap()
+            .stored;
+        let failure = Some(ShareAssertFailure {
+            owner_id,
+            calendar_id: id,
+            remaining: 1,
+        });
+        if class == "init" || class == "rewrap" {
+            if class == "init" {
+                set_share_init_assert_fail(failure);
+            } else {
+                set_share_rewrap_assert_fail(failure);
+            }
+            let guards = conversion_guards(test, &keys).await;
+            conversion_conflict(
+                za_convert_calendar(&test.server, &keys, id, &guards).await,
+                0,
+                0,
+                false,
+            );
+            assert_eq!(
+                event_archive(test, owner_id, event_id).await.version,
+                before_event.version
+            );
+            let state = conversion_ring(test, &keys, id).await;
+            if class == "init" {
+                assert!(state.is_none());
+                assert_eq!(
+                    za_owned_calendar_context(&test.server, &keys, id)
+                        .await
+                        .unwrap()
+                        .stored
+                        .version,
+                    before_calendar.version
+                );
+            } else {
+                assert!(!state.unwrap().1.reverting);
+            }
+            let guards = conversion_guards(test, &keys).await;
+            let counts = za_convert_calendar(&test.server, &keys, id, &guards)
+                .await
+                .unwrap();
+            assert_eq!(
+                counts,
+                ZaConversionCounts {
+                    rewrapped: 1,
+                    sealed: 0
+                }
+            );
+            let domain = za_owned_calendar_context(&test.server, &keys, id)
+                .await
+                .unwrap();
+            assert!(
+                event_pairs_in_domain(
+                    &event_archive(test, owner_id, event_id).await,
+                    &domain.domain
+                )
+                .unwrap()
+                .unwrap()
+                .matches("token@example.org", &[0x62; 16])
+            );
+            continue;
+        }
+        // Force the real unfenced precheck window, and create a CK event after
+        // phase 1 through the ordinary owner writer before rollback starts.
+        let precheck = Arc::new(Pause::new(owner_id));
+        let rewrap = Arc::new(Pause::new(owner_id));
+        set_share_precheck_pause(Some(precheck.clone()));
+        set_share_rewrap_pause(Some(rewrap.clone()));
+        let server = test.server.clone();
+        let resident = keys.clone();
+        let guards = conversion_guards(test, &keys).await;
+        let handle =
+            tokio::spawn(async move { za_convert_calendar(&server, &resident, id, &guards).await });
+        conversion_wait(&precheck).await;
+        conversion_link(test, owner_id, event_id, other, true).await;
+        precheck.release.notify_one();
+        conversion_wait(&rewrap).await;
+        let first = za_owned_calendar_context(&test.server, &keys, id)
+            .await
+            .unwrap();
+        let first_domain = *first.domain.domain_id().unwrap();
+        let first_cache = CollectionKeyId {
+            owner_id,
+            calendar_id: id,
+            domain_id: first_domain,
+            generation: 1,
+        };
+        let first_key = keys.collection_key(&first_cache).unwrap();
+        let original = event_archive(test, owner_id, event_id).await;
+        client
+            .request_with_headers(
+                "PUT",
+                &format!("{home}{slug}/ck.ics"),
+                [("content-type", "text/calendar")],
+                &EVENT.replace("share-read-UID", &format!("{slug}-ck")),
+            )
+            .await
+            .with_status(StatusCode::CREATED);
+        let ck_id = test
+            .server
+            .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+            .await
+            .unwrap()
+            .by_path(&format!("{slug}/ck.ics"))
+            .unwrap()
+            .document_id();
+        let ck_before = event_archive(test, owner_id, ck_id).await;
+        match class {
+            "revert" => set_share_revert_assert_fail(failure),
+            "rollback" => set_share_rollback_assert_fail(failure),
+            _ => set_share_restore_assert_fail(failure),
+        }
+        rewrap.release.notify_one();
+        conversion_conflict(
+            handle.await.unwrap(),
+            usize::from(class == "restore"),
+            0,
+            false,
+        );
+        let state = conversion_ring(test, &keys, id).await.unwrap();
+        assert_eq!(state.0.domain_id, first_domain);
+        assert_eq!(state.1.reverting, class != "revert");
+        assert_eq!(
+            event_archive(test, owner_id, event_id).await.version,
+            original.version,
+            "complete walk must precede rewrap"
+        );
+        let ck_after = event_archive(test, owner_id, ck_id).await;
+        if class != "restore" {
+            assert_eq!(
+                ck_after.version, ck_before.version,
+                "injected rollback attempt wrote nothing"
+            );
+        } else {
+            let mut event = ck_after.deserialize::<CalendarEvent>().unwrap();
+            groupware::calendar::seal::unseal_event(&mut event, &keys, owner_id).unwrap();
+            assert_eq!(
+                payload(ck_after.deserialize::<CalendarEvent>().unwrap()),
+                payload(ck_before.deserialize::<CalendarEvent>().unwrap())
+            );
+        }
+        if class == "revert" {
+            let guards = conversion_guards(test, &keys).await;
+            assert!(matches!(
+                za_convert_calendar(&test.server, &keys, id, &guards).await,
+                Err(ZaShareError::LinkedEvents)
+            ));
+            assert!(conversion_ring(test, &keys, id).await.is_none());
+            let restored = za_owned_calendar_context(&test.server, &keys, id)
+                .await
+                .unwrap();
+            assert_eq!(
+                calendar_view_in_domain(&restored.stored, &restored.domain, owner_id)
+                    .unwrap()
+                    .deserialize::<Calendar>()
+                    .unwrap()
+                    .dead_properties,
+                original_properties
+            );
+            // Link-preserving writes are ordinary EWK writes again after restore.
+            client
+                .request_with_headers(
+                    "PUT",
+                    &format!("{home}{slug}/ewk.ics"),
+                    [("content-type", "text/calendar")],
+                    &EVENT.replace("share-read-UID", &slug),
+                )
+                .await
+                .with_status(StatusCode::NO_CONTENT);
+        }
+        conversion_link(test, owner_id, event_id, other, false).await;
+        let guards = conversion_guards(test, &keys).await;
+        let counts = za_convert_calendar(&test.server, &keys, id, &guards)
+            .await
+            .unwrap();
+        // T6-N: resumed rollback + new conversion counts both actual writes.
+        assert_eq!(counts.rewrapped, if class == "rollback" { 3 } else { 2 });
+        assert_eq!(counts.sealed, 0);
+        let new = za_owned_calendar_context(&test.server, &keys, id)
+            .await
+            .unwrap();
+        let new_domain = *new.domain.domain_id().unwrap();
+        assert_ne!(first_domain, new_domain);
+        let next_cache = CollectionKeyId {
+            domain_id: new_domain,
+            ..first_cache
+        };
+        let next_key = keys.collection_key(&next_cache).unwrap();
+        assert!(
+            first_key.as_bytes() != next_key.as_bytes(),
+            "new domain must publish a fresh CK"
+        );
+        assert!(
+            keys.collection_key(&first_cache).unwrap().as_bytes() == first_key.as_bytes(),
+            "old cache identity must retain its key"
+        );
+        let text = EVENT.replace("share-read-UID", &format!("{slug}-resident"));
+        let calcard::Entry::ICalendar(tree) = calcard::Parser::new(&text).entry() else {
+            panic!()
+        };
+        let mut next_alarm = None;
+        let mut event = CalendarEvent {
+            names: vec![common::DavName {
+                name: "resident.ics".into(),
+                parent_id: id,
+            }],
+            data: groupware::calendar::CalendarEventData::new(
+                tree,
+                calcard::common::timezone::Tz::Floating,
+                100,
+                &mut next_alarm,
+            ),
+            size: text.len() as u32,
+            ..Default::default()
+        };
+        groupware::calendar::seal::seal_event_in_domain(&mut event, &new.domain, None).unwrap();
+        let resident_id = test
+            .server
+            .store()
+            .assign_document_ids(owner_id, Collection::CalendarEvent, 1)
+            .await
+            .unwrap();
+        let mut batch = BatchBuilder::new();
+        new.assert_in(&mut batch);
+        event
+            .insert(
+                test.server
+                    .account_info(owner_id)
+                    .await
+                    .unwrap()
+                    .account_tenant_ids(),
+                owner_id,
+                resident_id,
+                next_alarm,
+                &mut batch,
+            )
+            .unwrap();
+        test.server.commit_batch(batch).await.unwrap();
+        test.server.notify_task_queue();
+        test.server
+            .invalidate_local_caches(&[common::ipc::CacheInvalidation::DavResources(owner_id)])
+            .await;
+        let fresh_keys = za_unlock(test, owner_id, STRONG).await;
+        let fresh = za_owned_calendar_context(&test.server, &fresh_keys, id)
+            .await
+            .unwrap();
+        let mut event = event_archive(test, owner_id, resident_id)
+            .await
+            .deserialize::<CalendarEvent>()
+            .unwrap();
+        unseal_event_in_domain(&mut event, &fresh.domain).unwrap();
+        assert!(
+            event
+                .data
+                .event
+                .to_string()
+                .contains("share-read-private-summary")
+        );
+    }
+
+    // Repeat every counted write class with both stale vault and absent Account
+    // guards in dedicated fixtures, separate from the resident-session oracle.
+    for class in ["init", "rewrap", "revert", "rollback", "restore"] {
+        let slug = format!("guarded-{class}");
+        let id = make(test, &client, owner_id, home, &slug).await;
+        calendars.push(slug.clone());
+        let event_id = plant_sealed_event(
+            test,
+            owner_id,
+            &slug,
+            "ewk.ics",
+            &EVENT.replace("share-read-UID", &slug),
+            STRONG,
+            &TokenPairs::default(),
+        )
+        .await;
+        if class != "init" {
+            stage_converting_calendar(test, owner_id, id).await;
+        }
+        if matches!(class, "revert" | "rollback" | "restore") {
+            conversion_link(test, owner_id, event_id, other, true).await;
+        }
+        if class == "rollback" {
+            client
+                .request_with_headers(
+                    "PUT",
+                    &format!("{home}{slug}/ck.ics"),
+                    [("content-type", "text/calendar")],
+                    &EVENT.replace("share-read-UID", &format!("{slug}-ck")),
+                )
+                .await
+                .with_status(StatusCode::CREATED);
+        }
+        if matches!(class, "rollback" | "restore") {
+            let failure = Some(ShareAssertFailure {
+                owner_id,
+                calendar_id: id,
+                remaining: 1,
+            });
+            if class == "rollback" {
+                set_share_rollback_assert_fail(failure);
+            } else {
+                set_share_restore_assert_fail(failure);
+            }
+            let guards = conversion_guards(test, &keys).await;
+            conversion_conflict(
+                za_convert_calendar(&test.server, &keys, id, &guards).await,
+                0,
+                0,
+                false,
+            );
+        }
+        keys = conversion_guarded_class_loss(test, &keys, id, class).await;
+        if matches!(class, "revert" | "rollback" | "restore") {
+            conversion_link(test, owner_id, event_id, other, false).await;
+        }
+        let guards = conversion_guards(test, &keys).await;
+        za_convert_calendar(&test.server, &keys, id, &guards)
+            .await
+            .unwrap();
+    }
+    // Unmarked defaults with zero or one preference retain their owner-facing
+    // values; actual Apple dead properties remain exact across both domains.
+    for empty in [true, false] {
+        let slug = if empty {
+            "empty-default"
+        } else {
+            "single-default"
+        };
+        let id = make(test, &client, owner_id, home, slug).await;
+        calendars.push(slug.to_string());
+        let context = za_owned_calendar_context(&test.server, &keys, id)
+            .await
+            .unwrap();
+        let mut plain = context.stored.deserialize::<Calendar>().unwrap();
+        plain.preferences = if empty {
+            vec![]
+        } else {
+            vec![CalendarPreferences {
+                account_id: owner_id,
+                name: "Plain owner name".into(),
+                description: Some("Plain owner description".into()),
+                sort_order: 17,
+                color: Some("legacy JMAP-only".into()),
+                ..Default::default()
+            }]
+        };
+        use types::dead_property::{DeadElementTag, DeadProperty, DeadPropertyTag as Tag};
+        plain.dead_properties = DeadProperty(vec![
+            Tag::ElementStart(DeadElementTag {
+                name: "http://apple.com/ns/ical/ calendar-color".into(),
+                attrs: None,
+            }),
+            Tag::Text("#123456FF".into()),
+            Tag::ElementEnd,
+            Tag::ElementStart(DeadElementTag {
+                name: "http://apple.com/ns/ical/ calendar-order".into(),
+                attrs: None,
+            }),
+            Tag::Text("23".into()),
+            Tag::ElementEnd,
+        ]);
+        let expected = plain.dead_properties.clone();
+        update_calendar(test, owner_id, id, &context.stored, plain).await;
+        let guards = conversion_guards(test, &keys).await;
+        assert_eq!(
+            za_convert_calendar(&test.server, &keys, id, &guards)
+                .await
+                .unwrap(),
+            ZaConversionCounts::default()
+        );
+        let converted = za_owned_calendar_context(&test.server, &keys, id)
+            .await
+            .unwrap();
+        let view = calendar_view_in_domain(&converted.stored, &converted.domain, owner_id)
+            .unwrap()
+            .deserialize::<Calendar>()
+            .unwrap();
+        assert_eq!(view.dead_properties, expected);
+        assert_eq!(
+            view.preferences[0].name,
+            if empty { "default" } else { "Plain owner name" }
+        );
+        assert!(
+            view.preferences[0].color.is_none(),
+            "shared format excludes JMAP personal color"
+        );
+        if !empty {
+            assert_eq!(
+                view.preferences[0].description.as_deref(),
+                Some("Plain owner description")
+            );
+            assert_eq!(view.preferences[0].sort_order, 17);
+        }
+        // Restore a legacy owner field only to exercise a subsequent fresh domain.
+        let mut restored = view;
+        seal_calendar(&mut restored, &keys, owner_id).unwrap();
+        update_calendar(test, owner_id, id, &converted.stored, restored).await;
+    }
+    // Crash immediately after phase 1 leaves no grants and owner reads work.
+    let id = make(test, &client, owner_id, home, "interrupted").await;
+    calendars.push("interrupted".to_string());
+    let event_id = plant_sealed_event(
+        test,
+        owner_id,
+        "interrupted",
+        "ewk.ics",
+        &EVENT.replace("share-read-UID", "interrupted"),
+        STRONG,
+        &TokenPairs::default(),
+    )
+    .await;
+    set_share_rewrap_fail_once(Some(owner_id));
+    let guards = conversion_guards(test, &keys).await;
+    assert!(
+        matches!(za_convert_calendar(&test.server, &keys, id, &guards).await, Err(ZaShareError::Store(error)) if error.matches(trc::EventType::Store(trc::StoreEvent::UnexpectedError)))
+    );
+    assert!(!conversion_ring(test, &keys, id).await.unwrap().1.reverting);
+    let context = za_owned_calendar_context(&test.server, &keys, id)
+        .await
+        .unwrap();
+    let mut event = event_archive(test, owner_id, event_id)
+        .await
+        .deserialize::<CalendarEvent>()
+        .unwrap();
+    unseal_event_in_domain(&mut event, &context.domain).unwrap();
+    assert_eq!(
+        za_convert_calendar(&test.server, &keys, id, &guards)
+            .await
+            .unwrap()
+            .rewrapped,
+        1
+    );
+
+    // A calendar archive hash change after the precheck must be handed off as
+    // opaque progress, including when the supplied vault guard is stale too.
+    for stale_vault in [false, true] {
+        let slug = if stale_vault {
+            "calendar-and-vault"
+        } else {
+            "calendar-race"
+        };
+        let id = make(test, &client, owner_id, home, slug).await;
+        calendars.push(slug.into());
+        let server = test.server.clone();
+        let resident = keys.clone();
+        let guards = conversion_guards(test, &keys).await;
+        let parked = HookParked::start(owner_id, set_share_precheck_pause, async move {
+            za_convert_calendar(&server, &resident, id, &guards).await
+        })
+        .await;
+        let current = za_owned_calendar_context(&test.server, &keys, id)
+            .await
+            .unwrap();
+        let mut calendar = current.stored.deserialize::<Calendar>().unwrap();
+        calendar.supported_components ^= 1;
+        update_calendar(test, owner_id, id, &current.stored, calendar).await;
+        if stale_vault {
+            let vault = test
+                .server
+                .za_vault_record(owner_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut next_record = vault.record.clone();
+            next_record.revision += 1;
+            test.server
+                .za_vault_write(owner_id, &next_record, Some(&vault))
+                .await
+                .unwrap();
+        }
+        conversion_conflict(parked.finish().await, 0, 0, true);
+        assert!(conversion_ring(test, &keys, id).await.is_none());
+        keys = za_unlock(test, owner_id, STRONG).await;
+        let guards = conversion_guards(test, &keys).await;
+        za_convert_calendar(&test.server, &keys, id, &guards)
+            .await
+            .unwrap();
+    }
+    // A cut journal with a raced-in EWK link must refuse both PUT and PROPPATCH
+    // while preserving reads, then resume after unlink without starting phase 1 twice.
+    let id = make(test, &client, owner_id, home, "linked-cut").await;
+    calendars.push("linked-cut".into());
+    let event_id = plant_sealed_event(
+        test,
+        owner_id,
+        "linked-cut",
+        "ewk.ics",
+        &EVENT.replace("share-read-UID", "linked-cut"),
+        STRONG,
+        &TokenPairs::default(),
+    )
+    .await;
+    let precheck = Arc::new(Pause::new(owner_id));
+    set_share_precheck_pause(Some(precheck.clone()));
+    set_share_rewrap_fail_once(Some(owner_id));
+    let server = test.server.clone();
+    let resident = keys.clone();
+    let guards = conversion_guards(test, &keys).await;
+    let handle =
+        tokio::spawn(async move { za_convert_calendar(&server, &resident, id, &guards).await });
+    conversion_wait(&precheck).await;
+    conversion_link(test, owner_id, event_id, other, true).await;
+    precheck.release.notify_one();
+    assert!(matches!(handle.await.unwrap(), Err(ZaShareError::Store(_))));
+    let old_domain = conversion_ring(test, &keys, id).await.unwrap().0.domain_id;
+    for path in [
+        format!("{home}linked-cut/ewk.ics"),
+        format!("{home}other/linked-{event_id}.ics"),
+    ] {
+        client
+            .request("GET", &path, "")
+            .await
+            .with_status(StatusCode::OK);
+        client
+            .request_with_headers(
+                "PUT",
+                &path,
+                [("content-type", "text/calendar")],
+                &EVENT.replace("share-read-UID", "linked-cut"),
+            )
+            .await
+            .with_status(StatusCode::CONFLICT);
+        client.request("PROPPATCH", &path, "<D:propertyupdate xmlns:D=\"DAV:\" xmlns:X=\"urn:conversion:test\"><D:set><D:prop><X:test>refused</X:test></D:prop></D:set></D:propertyupdate>").await.with_status(StatusCode::CONFLICT);
+    }
+    conversion_link(test, owner_id, event_id, other, false).await;
+    let guards = conversion_guards(test, &keys).await;
+    assert_eq!(
+        za_convert_calendar(&test.server, &keys, id, &guards)
+            .await
+            .unwrap()
+            .rewrapped,
+        1
+    );
+    assert_eq!(
+        conversion_ring(test, &keys, id).await.unwrap().0.domain_id,
+        old_domain
+    );
+
+    // Real event assertion losses after one logical 100-row group, including
+    // disappearance and simultaneous vault/Account loss, count only the prefix.
+    for race in [
+        "event-update",
+        "event-delete",
+        "event-guards",
+        "between-cut",
+    ] {
+        let id = make(test, &client, owner_id, home, race).await;
+        calendars.push(race.into());
+        let mut ids = Vec::new();
+        for index in 0..101 {
+            ids.push(
+                plant_event(
+                    test,
+                    owner_id,
+                    race,
+                    &format!("{index}.ics"),
+                    &EVENT.replace("share-read-UID", &format!("{race}-{index}")),
+                    None,
+                )
+                .await,
+            );
+        }
+        let initial = Arc::new(Pause::new(owner_id));
+        let between = Arc::new(Pause::new(owner_id));
+        set_share_rewrap_pause(Some(initial.clone()));
+        let server = test.server.clone();
+        let resident = keys.clone();
+        let guards = conversion_guards(test, &keys).await;
+        let handle =
+            tokio::spawn(async move { za_convert_calendar(&server, &resident, id, &guards).await });
+        conversion_wait(&initial).await;
+        set_share_rewrap_pause(Some(between.clone()));
+        initial.release.notify_one();
+        conversion_wait(&between).await;
+        let context = za_owned_calendar_context(&test.server, &keys, id)
+            .await
+            .unwrap();
+        let mut ck_count = 0;
+        for event in &ids {
+            let stored = event_archive(test, owner_id, *event).await;
+            if groupware::calendar::seal::classify_event_storage(
+                &stored.deserialize::<CalendarEvent>().unwrap(),
+            )
+            .unwrap()
+                == groupware::calendar::seal::ZaEventStorageKind::Sealed
+            {
+                ck_count += 1;
+            }
+        }
+        assert_eq!(ck_count, 100, "pause must occur between bounded groups");
+        let last = *ids.last().unwrap();
+        let mut account_restore = None;
+        if race == "event-delete" {
+            client
+                .request("DELETE", &format!("{home}{race}/100.ics"), "")
+                .await
+                .with_status(StatusCode::NO_CONTENT);
+        } else if race == "between-cut" {
+            set_share_rewrap_fail_once(Some(owner_id));
+        } else {
+            // A concurrent writer seals the last row under the current CK.
+            let stored = event_archive(test, owner_id, last).await;
+            let mut event = stored.deserialize::<CalendarEvent>().unwrap();
+            groupware::calendar::seal::seal_event_in_domain(&mut event, &context.domain, None)
+                .unwrap();
+            update_event(test, owner_id, last, &stored, event).await;
+            if race == "event-guards" {
+                let vault = test
+                    .server
+                    .za_vault_record(owner_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut record = vault.record.clone();
+                record.revision += 1;
+                test.server
+                    .za_vault_write(owner_id, &record, Some(&vault))
+                    .await
+                    .unwrap();
+                account_restore = Some(conversion_remove_account(test, owner_id).await);
+            }
+        }
+        between.release.notify_one();
+        let result = handle.await.unwrap();
+        if race == "between-cut" {
+            assert!(matches!(result, Err(ZaShareError::Store(_))));
+        } else {
+            conversion_conflict(result, 0, 100, true);
+        }
+        if let Some((class, bytes)) = account_restore {
+            let mut batch = BatchBuilder::new();
+            batch.set(class, bytes);
+            test.server.store().write(batch.build_all()).await.unwrap();
+        }
+        keys = za_unlock(test, owner_id, STRONG).await;
+        let guards = conversion_guards(test, &keys).await;
+        let counts = za_convert_calendar(&test.server, &keys, id, &guards)
+            .await
+            .unwrap();
+        assert_eq!(counts.rewrapped, 0);
+        assert_eq!(counts.sealed, usize::from(race == "between-cut"));
+        conversion_ring(test, &keys, id).await.unwrap();
+    }
+
+    // Guard-only losses have unchanged progress and remain opaque. Neither a
+    // stale vault CAS, absent Account item nor optional pin assertion can write.
+    for lost_guard in ["vault-only", "account-only", "pin-only"] {
+        let id = make(test, &client, owner_id, home, lost_guard).await;
+        calendars.push(lost_guard.into());
+        let server = test.server.clone();
+        let resident = keys.clone();
+        let mut guards = conversion_guards(test, &keys).await;
+        if lost_guard == "pin-only" {
+            guards.pin_assertion = Some(store::write::assert::AssertValue::Hash(1));
+        }
+        let parked = HookParked::start(owner_id, set_share_precheck_pause, async move {
+            za_convert_calendar(&server, &resident, id, &guards).await
+        })
+        .await;
+        let mut account_restore = None;
+        if lost_guard == "vault-only" {
+            let vault = test
+                .server
+                .za_vault_record(owner_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut record = vault.record.clone();
+            record.revision += 1;
+            test.server
+                .za_vault_write(owner_id, &record, Some(&vault))
+                .await
+                .unwrap();
+        } else if lost_guard == "account-only" {
+            account_restore = Some(conversion_remove_account(test, owner_id).await);
+        }
+        conversion_conflict(parked.finish().await, 0, 0, false);
+        if let Some((class, bytes)) = account_restore {
+            let mut batch = BatchBuilder::new();
+            batch.set(class, bytes);
+            test.server.store().write(batch.build_all()).await.unwrap();
+        }
+        assert!(conversion_ring(test, &keys, id).await.is_none());
+        keys = za_unlock(test, owner_id, STRONG).await;
+        let guards = conversion_guards(test, &keys).await;
+        za_convert_calendar(&test.server, &keys, id, &guards)
+            .await
+            .unwrap();
+    }
+
+    // A delayed create or update that read the old calendar retries its actual
+    // DAV commit under the real phase-1 ring, rather than leaving an EWK row.
+    for updating in [false, true] {
+        let slug = if updating {
+            "held-update"
+        } else {
+            "held-create"
+        };
+        let id = make(test, &client, owner_id, home, slug).await;
+        calendars.push(slug.into());
+        if updating {
+            plant_sealed_event(
+                test,
+                owner_id,
+                slug,
+                "held.ics",
+                &EVENT.replace("share-read-UID", slug),
+                STRONG,
+                &TokenPairs::default(),
+            )
+            .await;
+        }
+        let before = if updating {
+            let event = test
+                .server
+                .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+                .await
+                .unwrap()
+                .by_path(&format!("{slug}/held.ics"))
+                .unwrap()
+                .document_id();
+            Some(
+                event_archive(test, owner_id, event)
+                    .await
+                    .deserialize::<CalendarEvent>()
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let request = crate::utils::http::HttpRequest::with_credentials(8899, address, STRONG);
+        let path = format!("{home}{slug}/held.ics");
+        let text = EVENT
+            .replace("share-read-UID", slug)
+            .replace("share-read-private-summary", "held conversion write");
+        let set = if updating {
+            set_update_commit_pause
+        } else {
+            set_commit_pause
+        };
+        let held = HookParked::start(owner_id, set, async move {
+            request
+                .send_full(
+                    hyper::Method::PUT,
+                    &path,
+                    Some(text.into_bytes()),
+                    Some("text/calendar"),
+                )
+                .await
+        })
+        .await;
+        let guards = conversion_guards(test, &keys).await;
+        assert_eq!(
+            za_convert_calendar(&test.server, &keys, id, &guards)
+                .await
+                .unwrap()
+                .rewrapped,
+            usize::from(updating)
+        );
+        assert_eq!(held.finish().await.status, if updating { 409 } else { 201 });
+        let event = test
+            .server
+            .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+            .await
+            .unwrap()
+            .by_path(&format!("{slug}/held.ics"))
+            .unwrap()
+            .document_id();
+        let context = za_owned_calendar_context(&test.server, &keys, id)
+            .await
+            .unwrap();
+        let mut event = event_archive(test, owner_id, event)
+            .await
+            .deserialize::<CalendarEvent>()
+            .unwrap();
+        if let Some(before) = before {
+            assert_eq!(payload(event.clone()), payload(before.clone()));
+            assert_eq!(event.created, before.created);
+            assert_eq!(event.modified, before.modified);
+        }
+        unseal_event_in_domain(&mut event, &context.domain).unwrap();
+        if updating {
+            assert!(
+                !event
+                    .data
+                    .event
+                    .to_string()
+                    .contains("held conversion write")
+            );
+        }
+        assert!(event.data.event.to_string().contains(if updating {
+            "share-read-private-summary"
+        } else {
+            "held conversion write"
+        }));
+    }
+
+    // T6-U: when only the calendar changed, the held UPDATE retries successfully
+    // before the converter reads the event, and conversion authenticates/skips it.
+    let id = make(test, &client, owner_id, home, "held-calendar-only").await;
+    calendars.push("held-calendar-only".into());
+    let event_id = plant_sealed_event(
+        test,
+        owner_id,
+        "held-calendar-only",
+        "held.ics",
+        &EVENT.replace("share-read-UID", "held-calendar-only"),
+        STRONG,
+        &TokenPairs::default(),
+    )
+    .await;
+    let request = crate::utils::http::HttpRequest::with_credentials(8899, address, STRONG);
+    let path = format!("{home}held-calendar-only/held.ics");
+    let text = EVENT
+        .replace("share-read-UID", "held-calendar-only")
+        .replace(
+            "share-read-private-summary",
+            "calendar-only successful retry",
+        );
+    let held = HookParked::start(owner_id, set_update_commit_pause, async move {
+        request
+            .send_full(
+                hyper::Method::PUT,
+                &path,
+                Some(text.into_bytes()),
+                Some("text/calendar"),
+            )
+            .await
+    })
+    .await;
+    let server = test.server.clone();
+    let resident = keys.clone();
+    let guards = conversion_guards(test, &keys).await;
+    let converter = HookParked::start(owner_id, set_share_rewrap_pause, async move {
+        za_convert_calendar(&server, &resident, id, &guards).await
+    })
+    .await;
+    assert_eq!(held.finish().await.status, 204);
+    assert_eq!(
+        converter.finish().await.unwrap(),
+        ZaConversionCounts::default()
+    );
+    let context = za_owned_calendar_context(&test.server, &keys, id)
+        .await
+        .unwrap();
+    let mut event = event_archive(test, owner_id, event_id)
+        .await
+        .deserialize::<CalendarEvent>()
+        .unwrap();
+    unseal_event_in_domain(&mut event, &context.domain).unwrap();
+    assert!(
+        event
+            .data
+            .event
+            .to_string()
+            .contains("calendar-only successful retry")
+    );
+
+    // Calendar absence is progress too: the failed phase-1 write must not
+    // resurrect a collection that an ordinary concurrent DELETE removed.
+    let id = make(test, &client, owner_id, home, "deleted-calendar").await;
+    let server = test.server.clone();
+    let resident = keys.clone();
+    let guards = conversion_guards(test, &keys).await;
+    let converter = HookParked::start(owner_id, set_share_precheck_pause, async move {
+        za_convert_calendar(&server, &resident, id, &guards).await
+    })
+    .await;
+    client
+        .request("DELETE", &format!("{home}deleted-calendar/"), "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    conversion_conflict(converter.finish().await, 0, 0, true);
+    assert!(
+        test.server
+            .store()
+            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                owner_id,
+                Collection::Calendar,
+                id
+            ))
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // Ring-only journals preserve every generation, key and pending rename flag.
+    let id = make(test, &client, owner_id, home, "journal-preservation").await;
+    calendars.push("journal-preservation".into());
+    let event_id = plant_sealed_event(
+        test,
+        owner_id,
+        "journal-preservation",
+        "ewk.ics",
+        &EVENT.replace("share-read-UID", "journal-preservation"),
+        STRONG,
+        &TokenPairs::default(),
+    )
+    .await;
+    let context = za_owned_calendar_context(&test.server, &keys, id)
+        .await
+        .unwrap();
+    let plain = calendar_view_in_domain(&context.stored, &context.domain, owner_id)
+        .unwrap()
+        .deserialize::<Calendar>()
+        .unwrap();
+    let header = OwnerRingHeader {
+        calendar_id: id,
+        domain_id: [0x37; 16],
+        rename_change_id: 731,
+        boundary_pending: true,
+        generations: vec![1, 7],
+    };
+    let ring = ZaOwnerRing {
+        version: 1,
+        keys: vec![[0x38; 32], [0x39; 32]],
+        converted: false,
+        reverting: false,
+        grants: vec![],
+    };
+    let encoded = seal_owner_ring(&header, &ring, owner_id, keys.ewk()).unwrap();
+    let shared = prepare_shared_calendar(&keys, id, plain, &encoded, &BTreeMap::new()).unwrap();
+    update_calendar(test, owner_id, id, &context.stored, shared).await;
+    conversion_link(test, owner_id, event_id, other, true).await;
+    set_share_restore_assert_fail(Some(ShareAssertFailure {
+        owner_id,
+        calendar_id: id,
+        remaining: 1,
+    }));
+    let guards = conversion_guards(test, &keys).await;
+    conversion_conflict(
+        za_convert_calendar(&test.server, &keys, id, &guards).await,
+        0,
+        0,
+        false,
+    );
+    let (after_header, after_ring) = conversion_ring(test, &keys, id).await.unwrap();
+    assert_eq!(after_header, header);
+    assert!(after_ring.keys == ring.keys);
+    assert!(after_ring.reverting);
+    conversion_link(test, owner_id, event_id, other, false).await;
+    assert_eq!(
+        za_convert_calendar(&test.server, &keys, id, &guards)
+            .await
+            .unwrap()
+            .rewrapped,
+        1
+    );
+
+    // Strict storage classification must refuse a partial recognized carrier,
+    // while a converted ring dispatch skips all conversion writes entirely.
+    let id = make(test, &client, owner_id, home, "partial-carrier").await;
+    calendars.push("partial-carrier".into());
+    let event = plant_event(
+        test,
+        owner_id,
+        "partial-carrier",
+        "bad.ics",
+        &EVENT
+            .replace("share-read-UID", "partial-carrier")
+            .replace("SUMMARY:", "X-ZA-SEALED:malformed\r\nSUMMARY:"),
+        None,
+    )
+    .await;
+    let original = event_archive(test, owner_id, event).await;
+    let guards = conversion_guards(test, &keys).await;
+    assert!(matches!(
+        za_convert_calendar(&test.server, &keys, id, &guards).await,
+        Err(ZaShareError::Seal(_))
+    ));
+    assert_eq!(
+        event_archive(test, owner_id, event).await.version,
+        original.version
+    );
+    conversion_ring(test, &keys, id).await.unwrap();
+
+    let id = make(test, &client, owner_id, home, "invalid-ck").await;
+    calendars.push("invalid-ck".into());
+    let event_id = plant_sealed_event(
+        test,
+        owner_id,
+        "invalid-ck",
+        "bad.ics",
+        &EVENT.replace("share-read-UID", "invalid-ck"),
+        STRONG,
+        &TokenPairs::default(),
+    )
+    .await;
+    let guards = conversion_guards(test, &keys).await;
+    assert_eq!(
+        za_convert_calendar(&test.server, &keys, id, &guards)
+            .await
+            .unwrap()
+            .rewrapped,
+        1
+    );
+    let stored = event_archive(test, owner_id, event_id).await;
+    let mut corrupted = stored.deserialize::<CalendarEvent>().unwrap();
+    let carrier = corrupted
+        .data
+        .event
+        .components
+        .iter_mut()
+        .flat_map(|c| &mut c.entries)
+        .find(|entry| groupware::calendar::seal::tree::is_carrier(entry, "X-ZA-SEALED"))
+        .unwrap();
+    let calcard::icalendar::ICalendarValue::Text(encoded) = &mut carrier.values[0] else {
+        panic!()
+    };
+    let mut bytes = STANDARD.decode(&*encoded).unwrap();
+    *bytes.last_mut().unwrap() ^= 1;
+    *encoded = STANDARD.encode(bytes);
+    update_event(test, owner_id, event_id, &stored, corrupted).await;
+    let before = event_archive(test, owner_id, event_id).await;
+    assert!(matches!(
+        za_convert_calendar(&test.server, &keys, id, &guards).await,
+        Err(ZaShareError::Seal(_))
+    ));
+    assert_eq!(
+        event_archive(test, owner_id, event_id).await.version,
+        before.version
+    );
+    let id = make(test, &client, owner_id, home, "already-converted").await;
+    calendars.push("already-converted".into());
+    stage_shared_calendar(test, owner_id, id, None).await;
+    let before = za_owned_calendar_context(&test.server, &keys, id)
+        .await
+        .unwrap()
+        .stored;
+    set_share_rewrap_assert_fail(Some(ShareAssertFailure {
+        owner_id,
+        calendar_id: id,
+        remaining: 1,
+    }));
+    let guards = conversion_guards(test, &keys).await;
+    assert_eq!(
+        za_convert_calendar(&test.server, &keys, id, &guards)
+            .await
+            .unwrap(),
+        ZaConversionCounts::default()
+    );
+    assert_eq!(
+        za_owned_calendar_context(&test.server, &keys, id)
+            .await
+            .unwrap()
+            .stored
+            .version,
+        before.version
+    );
+    assert!(
+        take_share_rewrap_assert_fail(owner_id, id),
+        "converted dispatch must not attempt an event write"
+    );
+    for slug in calendars {
+        client
+            .request("DELETE", &format!("{home}{slug}/"), "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    let default_status = client
+        .request("DELETE", &format!("{home}default/"), "")
+        .await
+        .status;
+    assert!(matches!(
+        default_status,
+        StatusCode::NO_CONTENT | StatusCode::NOT_FOUND
+    ));
+    test.wait_for_tasks().await;
+}
+
+async fn conversion_remove_account(
+    test: &TestServer,
+    owner: u32,
+) -> (store::write::ValueClass, Vec<u8>) {
+    use registry::{schema::prelude::ObjectType, types::EnumImpl};
+    use store::write::{RegistryClass, ValueClass};
+    let class = ValueClass::Registry(RegistryClass::Item {
+        object_id: ObjectType::Account.to_id(),
+        item_id: types::id::Id::from(owner).id(),
+    });
+    let bytes = test
+        .server
+        .store()
+        .get_value::<common::auth::vault::RawValue>(ValueKey::from(class.clone()))
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    let mut batch = BatchBuilder::new();
+    batch.clear(class.clone());
+    test.server.store().write(batch.build_all()).await.unwrap();
+    (class, bytes)
+}
+
+// Repeat the exact class from its first-loss journal with both externally
+// verified guards now lost. The injected commit shares the real error match;
+// changed terminal records cannot be mistaken for a safe calendar-only retry.
+async fn conversion_guarded_class_loss(
+    test: &TestServer,
+    keys: &std::sync::Arc<vault::session::SessionKeys>,
+    id: u32,
+    class: &str,
+) -> std::sync::Arc<vault::session::SessionKeys> {
+    use common::za::test_hooks::*;
+    use groupware::calendar::sharing::convert::za_convert_calendar;
+    let owner = keys.account_id;
+    let before = za_owned_calendar_context(&test.server, keys, id)
+        .await
+        .unwrap()
+        .stored;
+    let guards = conversion_guards(test, keys).await;
+    let vault = test.server.za_vault_record(owner).await.unwrap().unwrap();
+    let mut record = vault.record.clone();
+    record.revision += 1;
+    test.server
+        .za_vault_write(owner, &record, Some(&vault))
+        .await
+        .unwrap();
+    let (account_class, account_bytes) = conversion_remove_account(test, owner).await;
+    let failure = Some(ShareAssertFailure {
+        owner_id: owner,
+        calendar_id: id,
+        remaining: 1,
+    });
+    match class {
+        "init" => set_share_init_assert_fail(failure),
+        "rewrap" => set_share_rewrap_assert_fail(failure),
+        "revert" => set_share_revert_assert_fail(failure),
+        "rollback" => set_share_rollback_assert_fail(failure),
+        "restore" => set_share_restore_assert_fail(failure),
+        _ => panic!(),
+    }
+    let result = za_convert_calendar(&test.server, keys, id, &guards).await;
+    let mut batch = BatchBuilder::new();
+    batch.set(account_class, account_bytes);
+    test.server.store().write(batch.build_all()).await.unwrap();
+    conversion_conflict(result, 0, 0, false);
+    let fresh = za_unlock(test, owner, STRONG).await;
+    assert_eq!(
+        za_owned_calendar_context(&test.server, &fresh, id)
+            .await
+            .unwrap()
+            .stored
+            .version,
+        before.version
+    );
+    fresh
 }
