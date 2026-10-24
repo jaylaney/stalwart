@@ -34,13 +34,17 @@ use groupware::{
     cache::GroupwareCache,
     calendar::{
         CalendarEvent, CalendarEventData,
-        fanout::{ZaFanOut, ZaFanOutKind, ZaSource, za_set_schedule_status},
+        delegation::{
+            ZaSelfOperation, za_combine_delegated, za_finalize, za_resolve_delegation,
+            za_self_create, za_self_update,
+        },
+        fanout::{ZaFanOut, ZaFanOutKind, ZaFanOutMessage, ZaSource, za_set_schedule_status},
         itip::ItipSendStatus,
         seal::{event_pairs_in_domain, event_view_in_domain, seal_error, seal_event_in_domain},
         sequence::{za_sequence_floor, za_set_sequences},
     },
     scheduling::{
-        ItipMessages, event_create::itip_create, event_update::itip_update,
+        ItipError, ItipMessages, event_create::itip_create, event_update::itip_update,
         itip::itip_set_unreachable_status,
     },
 };
@@ -132,6 +136,19 @@ impl CalendarUpdateRequestHandler for Server {
             .scheduling_account_info(access_token.account_id(), account_id)
             .await
             .caused_by(trc::location!())?;
+        let roles = if account_info.account_id != account_id {
+            Some((
+                self.build_account_info(account_info.account.clone())
+                    .await?,
+                self.account_info(account_id).await?,
+            ))
+        } else {
+            None
+        };
+        let (writer_account, event_account) = roles
+            .as_ref()
+            .map(|(writer, owner)| (writer, owner))
+            .unwrap_or((&account_info, &account_info));
 
         if let Some(resource) = resources.by_path(resource_name.as_ref()) {
             if resource.is_container() {
@@ -266,6 +283,7 @@ impl CalendarUpdateRequestHandler for Server {
             // Scheduling
             let mut itip_messages = None;
             let mut za_messages = None;
+            let mut za_resolution = None;
             let itip_status = ItipSendStatus::resolve(
                 self,
                 access_token,
@@ -274,7 +292,45 @@ impl CalendarUpdateRequestHandler for Server {
                 za_keys.is_some(),
             );
             if itip_status.builds_messages() {
-                let result = if new_event.schedule_tag.is_some() {
+                let is_update = new_event.schedule_tag.is_some();
+                if itip_status.is_send_sealed() {
+                    za_resolution = za_resolve_delegation(
+                        self,
+                        &account_info,
+                        writer_account,
+                        event_account,
+                        if is_update {
+                            ZaSelfOperation::Update
+                        } else {
+                            ZaSelfOperation::Create
+                        },
+                        Some(&old_ical),
+                        Some(&new_event.data.event),
+                    )
+                    .await?;
+                }
+                // The second run sees the pre-finalize trees.
+                let second = za_resolution.as_ref().and_then(|resolution| {
+                    if is_update {
+                        za_self_update(
+                            &old_ical,
+                            &new_event.data.event,
+                            writer_account,
+                            event_account,
+                            resolution,
+                        )
+                    } else {
+                        za_self_create(
+                            &new_event.data.event,
+                            writer_account,
+                            event_account,
+                            resolution,
+                        )
+                    }
+                    .ok()
+                    .flatten()
+                });
+                let result = if is_update {
                     itip_update(
                         &mut new_event.data.event,
                         &old_ical,
@@ -283,42 +339,10 @@ impl CalendarUpdateRequestHandler for Server {
                 } else {
                     itip_create(&mut new_event.data.event, account_info.addresses())
                 };
-
-                match result {
-                    Ok(messages) => {
-                        let mut is_organizer = false;
-                        if messages
-                            .iter()
-                            .map(|r| {
-                                is_organizer = r.from_organizer;
-                                r.to.len()
-                            })
-                            .sum::<usize>()
-                            < self.core.groupware.itip_outbound_max_recipients
-                        {
-                            // Only update schedule tag if the user is the organizer
-                            if is_organizer {
-                                if let Some(schedule_tag) = &mut new_event.schedule_tag {
-                                    *schedule_tag += 1;
-                                } else {
-                                    new_event.schedule_tag = Some(1);
-                                }
-                            }
-
-                            // Invitations spec 5.1: a key account's messages
-                            // go to the fan-out, never to the task queue.
-                            if itip_status.is_send_sealed() {
-                                za_messages = Some(messages);
-                            } else {
-                                itip_messages = Some(ItipMessages::new(messages));
-                            }
-                        } else {
-                            return Err(DavError::Condition(DavErrorCondition::new(
-                                StatusCode::PRECONDITION_FAILED,
-                                CalCondition::MaxAttendeesPerInstance,
-                            )));
-                        }
-                    }
+                let first_built = result.is_ok();
+                let first_nothing = matches!(&result, Err(ItipError::NothingToSend));
+                let first = match result {
+                    Ok(messages) => Some(messages),
                     Err(err) => {
                         if let Some(failed_precondition) = err.failed_precondition() {
                             return Err(DavError::Condition(
@@ -329,18 +353,70 @@ impl CalendarUpdateRequestHandler for Server {
                                 .with_details(err.to_string()),
                             ));
                         }
-
                         trc::event!(
                             Calendar(trc::CalendarEvent::ItipMessageError),
                             AccountId = account_id,
                             DocumentId = document_id,
-                            Reason = err.to_string(),
+                            Reason = err.to_string()
                         );
-
-                        // Event changed, but there are no iTIP messages to send
+                        // Preserve the original error-arm bump exactly once.
                         if let Some(schedule_tag) = &mut new_event.schedule_tag {
                             *schedule_tag += 1;
                         }
+                        None
+                    }
+                };
+                if first_built || second.is_some() {
+                    if first_nothing
+                        && let Some(second) = &second
+                        && second.finalize()
+                    {
+                        za_finalize(&mut new_event.data.event, second.increments());
+                    }
+                    let is_organizer = second.is_some()
+                        || first.as_ref().is_some_and(|messages| {
+                            messages.iter().any(|message| message.from_organizer)
+                        });
+                    if is_organizer {
+                        if first_built {
+                            if let Some(schedule_tag) = &mut new_event.schedule_tag {
+                                *schedule_tag += 1;
+                            } else {
+                                new_event.schedule_tag = Some(1);
+                            }
+                        } else if new_event.schedule_tag.is_none() {
+                            new_event.schedule_tag = Some(1);
+                        }
+                    }
+                    let first = first.unwrap_or_default();
+                    if itip_status.is_send_sealed() {
+                        let messages = if let Some(resolution) = &za_resolution {
+                            za_combine_delegated(first, second, resolution)
+                        } else {
+                            first.into_iter().map(ZaFanOutMessage::upstream).collect()
+                        };
+                        if messages
+                            .iter()
+                            .map(ZaFanOutMessage::recipient_count)
+                            .sum::<usize>()
+                            >= self.core.groupware.itip_outbound_max_recipients
+                        {
+                            return Err(DavError::Condition(DavErrorCondition::new(
+                                StatusCode::PRECONDITION_FAILED,
+                                CalCondition::MaxAttendeesPerInstance,
+                            )));
+                        }
+                        za_messages = Some(messages);
+                    } else {
+                        if first.iter().map(|message| message.to.len()).sum::<usize>()
+                            >= self.core.groupware.itip_outbound_max_recipients
+                        {
+                            return Err(DavError::Condition(DavErrorCondition::new(
+                                StatusCode::PRECONDITION_FAILED,
+                                CalCondition::MaxAttendeesPerInstance,
+                            )));
+                        }
+                        itip_messages = Some(ItipMessages::new(first));
                     }
                 }
 
@@ -376,6 +452,8 @@ impl CalendarUpdateRequestHandler for Server {
                     let fan_out = self
                         .za_fan_out(
                             &account_info,
+                            writer_account,
+                            event_account,
                             keys,
                             messages,
                             pairs,
@@ -383,6 +461,7 @@ impl CalendarUpdateRequestHandler for Server {
                             ZaSource { document_id, uid },
                             ZaFanOutKind::Change,
                             None,
+                            za_resolution.as_ref(),
                         )
                         .await
                         .caused_by(trc::location!())?;
@@ -543,6 +622,7 @@ impl CalendarUpdateRequestHandler for Server {
             // Scheduling
             let mut itip_messages = None;
             let mut za_messages = None;
+            let mut za_resolution = None;
             let itip_status = ItipSendStatus::resolve(
                 self,
                 access_token,
@@ -551,26 +631,28 @@ impl CalendarUpdateRequestHandler for Server {
                 za_keys.is_some(),
             );
             if itip_status.builds_messages() {
-                match itip_create(&mut event.data.event, account_info.addresses()) {
-                    Ok(messages) => {
-                        if messages.iter().map(|r| r.to.len()).sum::<usize>()
-                            < self.core.groupware.itip_outbound_max_recipients
-                        {
-                            event.schedule_tag = Some(1);
-                            // Invitations spec 5.1: a key account's messages
-                            // go to the fan-out, never to the task queue.
-                            if itip_status.is_send_sealed() {
-                                za_messages = Some(messages);
-                            } else {
-                                itip_messages = Some(ItipMessages::new(messages));
-                            }
-                        } else {
-                            return Err(DavError::Condition(DavErrorCondition::new(
-                                StatusCode::PRECONDITION_FAILED,
-                                CalCondition::MaxAttendeesPerInstance,
-                            )));
-                        }
-                    }
+                if itip_status.is_send_sealed() {
+                    za_resolution = za_resolve_delegation(
+                        self,
+                        &account_info,
+                        writer_account,
+                        event_account,
+                        ZaSelfOperation::Create,
+                        None,
+                        Some(&event.data.event),
+                    )
+                    .await?;
+                }
+                let second = za_resolution.as_ref().and_then(|resolution| {
+                    za_self_create(&event.data.event, writer_account, event_account, resolution)
+                        .ok()
+                        .flatten()
+                });
+                let result = itip_create(&mut event.data.event, account_info.addresses());
+                let first_built = result.is_ok();
+                let first_nothing = matches!(&result, Err(ItipError::NothingToSend));
+                let first = match result {
+                    Ok(messages) => messages,
                     Err(err) => {
                         if let Some(failed_precondition) = err.failed_precondition() {
                             return Err(DavError::Condition(
@@ -581,12 +663,50 @@ impl CalendarUpdateRequestHandler for Server {
                                 .with_details(err.to_string()),
                             ));
                         }
-
                         trc::event!(
                             Calendar(trc::CalendarEvent::ItipMessageError),
                             AccountId = account_id,
-                            Reason = err.to_string(),
+                            Reason = err.to_string()
                         );
+                        Vec::new()
+                    }
+                };
+                if first_built || second.is_some() {
+                    if first_nothing
+                        && let Some(second) = &second
+                        && second.finalize()
+                    {
+                        za_finalize(&mut event.data.event, second.increments());
+                    }
+                    event.schedule_tag = Some(1);
+                    if itip_status.is_send_sealed() {
+                        let messages = if let Some(resolution) = &za_resolution {
+                            za_combine_delegated(first, second, resolution)
+                        } else {
+                            first.into_iter().map(ZaFanOutMessage::upstream).collect()
+                        };
+                        if messages
+                            .iter()
+                            .map(ZaFanOutMessage::recipient_count)
+                            .sum::<usize>()
+                            >= self.core.groupware.itip_outbound_max_recipients
+                        {
+                            return Err(DavError::Condition(DavErrorCondition::new(
+                                StatusCode::PRECONDITION_FAILED,
+                                CalCondition::MaxAttendeesPerInstance,
+                            )));
+                        }
+                        za_messages = Some(messages);
+                    } else {
+                        if first.iter().map(|message| message.to.len()).sum::<usize>()
+                            >= self.core.groupware.itip_outbound_max_recipients
+                        {
+                            return Err(DavError::Condition(DavErrorCondition::new(
+                                StatusCode::PRECONDITION_FAILED,
+                                CalCondition::MaxAttendeesPerInstance,
+                            )));
+                        }
+                        itip_messages = Some(ItipMessages::new(first));
                     }
                 }
 
@@ -629,6 +749,8 @@ impl CalendarUpdateRequestHandler for Server {
                     let fan_out = match self
                         .za_fan_out(
                             &account_info,
+                            writer_account,
+                            event_account,
                             keys,
                             messages,
                             None,
@@ -636,6 +758,7 @@ impl CalendarUpdateRequestHandler for Server {
                             ZaSource { document_id, uid },
                             ZaFanOutKind::Change,
                             za_lease.as_ref().map(|(lease, _)| lease.lease()),
+                            za_resolution.as_ref(),
                         )
                         .await
                     {

@@ -64,6 +64,7 @@
 use crate::{
     calendar::{
         CalendarEventNotification, ChangedBy, EVENT_NOTIFICATION_ZA_PENDING,
+        delegation::{ZaDelegationResolution, ZaResolvedAccount},
         drain::instance_key,
         pinning::{za_decline_all, za_full_request_for, za_participation_replies},
         seal::{TOKEN_LEN, TokenPairs, seal_error, seal_pending_item},
@@ -81,7 +82,8 @@ use crate::{
 };
 use ahash::{AHashMap, AHashSet};
 use calcard::icalendar::{
-    ICalendar, ICalendarMethod, ICalendarParameter, ICalendarParameterName, ICalendarProperty,
+    ICalendar, ICalendarMethod, ICalendarParameter, ICalendarParameterName,
+    ICalendarParameterValue, ICalendarProperty,
 };
 use common::{
     Server,
@@ -171,6 +173,80 @@ pub enum ZaFanOutKind {
     Redelivery,
 }
 
+/// An in-memory scheduling payload with trusted, request-local provenance.
+pub struct ZaFanOutMessage {
+    pub(crate) message: ItipMessage<ICalendar>,
+    pub(crate) provenance: ZaMessageProvenance,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ZaMessageProvenance {
+    Upstream,
+    DelegatedSelf,
+}
+
+impl ZaFanOutMessage {
+    pub fn upstream(message: ItipMessage<ICalendar>) -> Self {
+        Self {
+            message,
+            provenance: ZaMessageProvenance::Upstream,
+        }
+    }
+    pub fn recipient_count(&self) -> usize {
+        self.message.to.len()
+    }
+    pub(crate) fn delegated_self(message: ItipMessage<ICalendar>) -> Self {
+        Self {
+            message,
+            provenance: ZaMessageProvenance::DelegatedSelf,
+        }
+    }
+}
+
+/// Set the authenticated writer on only the property naming the sender.
+/// Stored source trees are never passed here.
+pub fn za_mark_sent_by(
+    message: &mut ItipMessage<ICalendar>,
+    writer: &AccountInfo,
+    event_account: &AccountInfo,
+) {
+    let property = if message.from_organizer {
+        ICalendarProperty::Organizer
+    } else {
+        ICalendarProperty::Attendee
+    };
+    let delegated = writer.account_id != event_account.account_id
+        && !writer.addresses.contains(&message.from)
+        && event_account.addresses.contains(&message.from);
+    for component in &mut message.message.components {
+        if !component.component_type.is_scheduling_object() {
+            continue;
+        }
+        for entry in &mut component.entries {
+            if entry.name == property
+                && entry
+                    .values
+                    .first()
+                    .and_then(|value| value.as_text())
+                    .and_then(|value| Email::new(value, &[]))
+                    .is_some_and(|email| email.email == message.from)
+            {
+                entry
+                    .params
+                    .retain(|param| param.name != ICalendarParameterName::SentBy);
+                if delegated && let Some(primary) = writer.addresses.first() {
+                    entry.params.push(ICalendarParameter {
+                        name: ICalendarParameterName::SentBy,
+                        value: ICalendarParameterValue::Uri(calcard::icalendar::Uri::Location(
+                            format!("mailto:{primary}"),
+                        )),
+                    });
+                }
+            }
+        }
+    }
+}
+
 pub trait ZaFanOut: Sync + Send {
     /// Delivers `messages` (upstream's builders' output for `event`, the
     /// sender's plaintext tree) to internal key recipients as pending items,
@@ -194,13 +270,16 @@ pub trait ZaFanOut: Sync + Send {
     fn za_fan_out(
         &self,
         sender: &AccountInfo,
+        writer_account: &AccountInfo,
+        event_account: &AccountInfo,
         keys: &SessionKeys,
-        messages: Vec<ItipMessage<ICalendar>>,
+        messages: Vec<ZaFanOutMessage>,
         stored_pairs: Option<TokenPairs>,
         event: &ICalendar,
         source: ZaSource<'_>,
         kind: ZaFanOutKind,
         fence: Option<&ZaUidLease>,
+        resolution: Option<&ZaDelegationResolution>,
     ) -> impl Future<Output = trc::Result<ZaFanOutResult>> + Send;
 }
 
@@ -209,22 +288,35 @@ impl ZaFanOut for Server {
     async fn za_fan_out(
         &self,
         sender: &AccountInfo,
+        writer_account: &AccountInfo,
+        event_account: &AccountInfo,
         keys: &SessionKeys,
-        mut messages: Vec<ItipMessage<ICalendar>>,
+        messages: Vec<ZaFanOutMessage>,
         stored_pairs: Option<TokenPairs>,
         event: &ICalendar,
         source: ZaSource<'_>,
         kind: ZaFanOutKind,
         fence: Option<&ZaUidLease>,
+        resolution: Option<&ZaDelegationResolution>,
     ) -> trc::Result<ZaFanOutResult> {
         let sender_id = sender.account_id();
-        if keys.account_id != sender_id {
+        if keys.account_id != sender_id
+            || writer_account.account_id != sender_id
+            || resolution.is_some_and(|resolution| {
+                resolution.writer_id != sender_id || resolution.owner_id != event_account.account_id
+            })
+        {
             return Err(trc::SecurityEvent::Unauthorized
                 .into_err()
                 .details("zero-access: fan-out without the sender's session keys")
                 .account_id(sender_id)
                 .caused_by(trc::location!()));
         }
+        let delegated = writer_account.account_id != event_account.account_id;
+        let (mut messages, provenances): (Vec<_>, Vec<_>) = messages
+            .into_iter()
+            .map(|tagged| (tagged.message, tagged.provenance))
+            .unzip();
         // Key pinning spec 5.1: the SEQUENCE reconciliation, on a clone of
         // the sender's tree; a deletion leaves its CANCEL as built.
         let (reconciled, sequences) = if kind == ZaFanOutKind::Deletion {
@@ -234,6 +326,19 @@ impl ZaFanOut for Server {
             let sequences = za_reconcile_sequences(&mut tree, &mut messages, sender.addresses());
             (Some(tree), sequences)
         };
+        // Reconciliation changes neither length nor order: zip the original
+        // tags back onto precisely the same payload positions.
+        let mut messages: Vec<_> = messages
+            .into_iter()
+            .zip(provenances)
+            .map(|(mut message, provenance)| {
+                za_mark_sent_by(&mut message, writer_account, event_account);
+                ZaFanOutMessage {
+                    message,
+                    provenance,
+                }
+            })
+            .collect();
         let event = reconciled.as_ref().unwrap_or(event);
         let organizer = event_organizer(event, sender.addresses());
         let is_organizer = organizer
@@ -242,7 +347,7 @@ impl ZaFanOut for Server {
         // Spec 3.3, "Maintenance": only the organizer hands out tokens; an
         // attendee's copy holds its own pair.
         let union = if is_organizer {
-            token_union(stored_pairs.as_ref(), event, sender.addresses())
+            token_union(stored_pairs.as_ref(), event, event_account.addresses())
         } else {
             stored_pairs.clone().unwrap_or_default()
         };
@@ -260,24 +365,29 @@ impl ZaFanOut for Server {
         // ORGANIZER resolved here is used by the loop below, which adds it
         // to the recipients only if the decline routes `Deliver`.
         let mut resolved = None;
-        if kind == ZaFanOutKind::Deletion
+        if !delegated
+            && kind == ZaFanOutKind::Deletion
             && !is_organizer
-            && !messages
-                .iter()
-                .any(|message| matches!(itip_method(&message.message), Ok(ICalendarMethod::Reply)))
+            && !messages.iter().any(|message| {
+                matches!(
+                    itip_method(&message.message.message),
+                    Ok(ICalendarMethod::Reply)
+                )
+            })
             && let Some(key) = organizer
                 .as_ref()
                 .and_then(|organizer| za_normalize_address(&organizer.email))
             && let recipient @ Recipient::Internal { .. } =
-                resolve_recipient(self, sender_id, &key).await
+                resolve_recipient(self, sender_id, &key, None, false, None).await
         {
             match self.za_pin_read(keys).await {
                 Ok(pins) => {
                     if pins.record.as_ref().is_some_and(|record| {
                         record.entry(source.document_id, source.uid, &key).is_some()
-                    }) && let Some(decline) = za_decline_all(event, sender.addresses())
+                    }) && let Some(mut decline) = za_decline_all(event, sender.addresses())
                     {
-                        messages.push(decline);
+                        za_mark_sent_by(&mut decline, writer_account, event_account);
+                        messages.push(ZaFanOutMessage::upstream(decline));
                         resolved = Some((key, recipient));
                         read = Some(ZaPinState { pins, mark: None });
                     }
@@ -292,7 +402,8 @@ impl ZaFanOut for Server {
             }
         }
         let mut attempts = Vec::new();
-        for message in &messages {
+        for tagged in &messages {
+            let message = &tagged.message;
             let method = itip_method(&message.message).ok();
             let is_reply = matches!(method, Some(ICalendarMethod::Reply));
             for address in &message.to {
@@ -307,7 +418,24 @@ impl ZaFanOut for Server {
                 {
                     let recipient = match resolved.take_if(|(cached, _)| cached == key) {
                         Some((_, recipient)) => recipient,
-                        None => resolve_recipient(self, sender_id, key).await,
+                        None => {
+                            let allow_self = resolution.is_some()
+                                && messages.iter().any(|candidate| {
+                                    candidate.provenance == ZaMessageProvenance::DelegatedSelf
+                                        && candidate.message.to.iter().any(|address| {
+                                            za_normalize_address(address).as_ref() == Some(key)
+                                        })
+                                });
+                            resolve_recipient(
+                                self,
+                                sender_id,
+                                key,
+                                resolution.and_then(|resolution| resolution.accounts.get(key)),
+                                allow_self,
+                                resolution.map(|_| event_account.account_id),
+                            )
+                            .await
+                        }
                     };
                     if let Recipient::Internal { public_key, .. } = recipient {
                         internal.push((key.clone(), public_key));
@@ -320,11 +448,14 @@ impl ZaFanOut for Server {
                     is_reply,
                     route,
                     key,
+                    self_allowed: resolution.is_some()
+                        && tagged.provenance == ZaMessageProvenance::DelegatedSelf,
                 });
             }
         }
         if read.is_none()
-            && (!internal.is_empty() || (kind == ZaFanOutKind::Deletion && !messages.is_empty()))
+            && (!internal.is_empty()
+                || (!delegated && kind == ZaFanOutKind::Deletion && !messages.is_empty()))
         {
             read = match self.za_pin_state(keys).await {
                 Ok(state) => Some(state),
@@ -341,20 +472,20 @@ impl ZaFanOut for Server {
         // Spec 5.2 phase 4: a deletion with a message to send retires every
         // entry of the deleted document, each under the refusal id read
         // here.
-        let deleted: Vec<(String, u64)> = if kind == ZaFanOutKind::Deletion && !messages.is_empty()
-        {
-            read.as_ref()
-                .and_then(|state| state.pins.record.as_ref())
-                .map(|record| {
-                    record
-                        .entries_of(source.document_id, source.uid)
-                        .map(|entry| (entry.address.clone(), entry.refusal_id))
-                        .collect()
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let deleted: Vec<(String, u64)> =
+            if !delegated && kind == ZaFanOutKind::Deletion && !messages.is_empty() {
+                read.as_ref()
+                    .and_then(|state| state.pins.record.as_ref())
+                    .map(|record| {
+                        record
+                            .entries_of(source.document_id, source.uid)
+                            .map(|entry| (entry.address.clone(), entry.refusal_id))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
         #[cfg(feature = "test_mode")]
         common::za::test_hooks::pin_decide_pause_point(sender_id).await;
 
@@ -379,7 +510,9 @@ impl ZaFanOut for Server {
                 let now = now() as i64;
                 let addresses = sender.addresses();
                 self.za_pin_transact(keys, Some(state), |state| {
-                    decide(state, &internal, &attempts, addresses, source, kind, now)
+                    decide(
+                        state, &internal, &attempts, addresses, source, kind, now, !delegated,
+                    )
                 })
                 .await
             };
@@ -428,7 +561,8 @@ impl ZaFanOut for Server {
         // organizer-side entry, one REPLY per local address for an
         // attendee-side one.
         let mut full_states: AHashMap<&str, Vec<ItipMessage<ICalendar>>> = AHashMap::new();
-        if kind == ZaFanOutKind::Change
+        if !delegated
+            && kind == ZaFanOutKind::Change
             && let Some(record) = decided
                 .as_ref()
                 .and_then(|state| state.pins.record.as_ref())
@@ -464,80 +598,84 @@ impl ZaFanOut for Server {
                             account_id,
                             public_key,
                         }),
-                    )) => match verdicts.get(key) {
-                        Some(Verdict::Deliver(_)) => {
-                            // The full state first; a failed one (`5.1`)
-                            // never stops the recipient's own messages. A
-                            // full-state REPLY carries the token of its own
-                            // `from`, routed as any REPLY (none: `5.3`).
-                            for full in full_states.remove(key).unwrap_or_default() {
-                                let full_route = if is_reply_message(&full) {
-                                    Some(route(
-                                        Some(&ICalendarMethod::Reply),
-                                        &full,
+                    )) if (*account_id != sender_id || attempt.self_allowed)
+                        && !(resolution.is_some() && *account_id == event_account.account_id) =>
+                    {
+                        match verdicts.get(key) {
+                            Some(Verdict::Deliver(_)) => {
+                                // The full state first; a failed one (`5.1`)
+                                // never stops the recipient's own messages. A
+                                // full-state REPLY carries the token of its own
+                                // `from`, routed as any REPLY (none: `5.3`).
+                                for mut full in full_states.remove(key).unwrap_or_default() {
+                                    za_mark_sent_by(&mut full, writer_account, event_account);
+                                    let full_route = if is_reply_message(&full) {
+                                        Some(route(
+                                            Some(&ICalendarMethod::Reply),
+                                            &full,
+                                            attempt.address,
+                                            organizer.as_ref(),
+                                            &union,
+                                        ))
+                                    } else {
+                                        None
+                                    };
+                                    let carrier = match &full_route {
+                                        Some(Route::NotAttempted { .. }) => None,
+                                        Some(Route::Deliver {
+                                            pair, reply_token, ..
+                                        }) => Some((pair.as_ref(), reply_token.as_deref())),
+                                        None => Some((pair.as_ref(), reply_token.as_deref())),
+                                    };
+                                    let status = match carrier {
+                                        Some((pair, reply_token)) => write_item(
+                                            self,
+                                            sender_id,
+                                            *account_id,
+                                            public_key,
+                                            &full.message,
+                                            pair,
+                                            reply_token,
+                                            fence,
+                                        )
+                                        .await
+                                        .caused_by(trc::location!())?,
+                                        None => ITIP_STATUS_NOT_ATTEMPTED,
+                                    };
+                                    if status != ITIP_STATUS_DELIVERED {
+                                        not_written.insert(key);
+                                    }
+                                    record_status(
+                                        &mut statuses,
                                         attempt.address,
-                                        organizer.as_ref(),
-                                        &union,
-                                    ))
-                                } else {
-                                    None
-                                };
-                                let carrier = match &full_route {
-                                    Some(Route::NotAttempted { .. }) => None,
-                                    Some(Route::Deliver {
-                                        pair, reply_token, ..
-                                    }) => Some((pair.as_ref(), reply_token.as_deref())),
-                                    None => Some((pair.as_ref(), reply_token.as_deref())),
-                                };
-                                let status = match carrier {
-                                    Some((pair, reply_token)) => write_item(
-                                        self,
-                                        sender_id,
-                                        *account_id,
-                                        public_key,
-                                        &full.message,
-                                        pair,
-                                        reply_token,
-                                        fence,
-                                    )
-                                    .await
-                                    .caused_by(trc::location!())?,
-                                    None => ITIP_STATUS_NOT_ATTEMPTED,
-                                };
+                                        attempt.route.on_organizer(),
+                                        status,
+                                    );
+                                }
+                                let status = write_item(
+                                    self,
+                                    sender_id,
+                                    *account_id,
+                                    public_key,
+                                    &attempt.message.message,
+                                    pair.as_ref(),
+                                    reply_token.as_deref(),
+                                    fence,
+                                )
+                                .await
+                                .caused_by(trc::location!())?;
                                 if status != ITIP_STATUS_DELIVERED {
                                     not_written.insert(key);
                                 }
-                                record_status(
-                                    &mut statuses,
-                                    attempt.address,
-                                    attempt.route.on_organizer(),
-                                    status,
-                                );
+                                status
                             }
-                            let status = write_item(
-                                self,
-                                sender_id,
-                                *account_id,
-                                public_key,
-                                &attempt.message.message,
-                                pair.as_ref(),
-                                reply_token.as_deref(),
-                                fence,
-                            )
-                            .await
-                            .caused_by(trc::location!())?;
-                            if status != ITIP_STATUS_DELIVERED {
-                                not_written.insert(key);
-                            }
-                            status
+                            Some(Verdict::Refuse) => ITIP_STATUS_KEY_REFUSED,
+                            None => ITIP_STATUS_DELIVERY_FAILED,
                         }
-                        Some(Verdict::Refuse) => ITIP_STATUS_KEY_REFUSED,
-                        None => ITIP_STATUS_DELIVERY_FAILED,
-                    },
-                    Some((_, Some(Recipient::Failed))) => ITIP_STATUS_DELIVERY_FAILED,
-                    Some((_, Some(Recipient::NotInternal) | None)) | None => {
-                        ITIP_STATUS_NOT_ATTEMPTED
                     }
+                    Some((_, Some(Recipient::Failed))) => ITIP_STATUS_DELIVERY_FAILED,
+                    Some((_, Some(Recipient::NotInternal | Recipient::Internal { .. }) | None))
+                    | None => ITIP_STATUS_NOT_ATTEMPTED,
                 },
             };
             record_status(
@@ -557,29 +695,33 @@ impl ZaFanOut for Server {
         // send every entry of the deleted document, under the ids phase 1
         // read, items written or not. A failure undoes nothing: the items
         // stand and the entry stays.
-        let retirement = match kind {
-            ZaFanOutKind::Change => decided.map(|state| {
-                let consumed: Vec<(&str, u64)> = internal
-                    .iter()
-                    .filter_map(|(address, _)| match verdicts.get(address) {
-                        Some(Verdict::Deliver(Some(refusal_id)))
-                            if !not_written.contains(address.as_str()) =>
-                        {
-                            Some((address.as_str(), *refusal_id))
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                (Some(state), consumed)
-            }),
-            ZaFanOutKind::Deletion => Some((
-                decided.or(read),
-                deleted
-                    .iter()
-                    .map(|(address, refusal_id)| (address.as_str(), *refusal_id))
-                    .collect(),
-            )),
-            ZaFanOutKind::Redelivery => None,
+        let retirement = if delegated {
+            None
+        } else {
+            match kind {
+                ZaFanOutKind::Change => decided.map(|state| {
+                    let consumed: Vec<(&str, u64)> = internal
+                        .iter()
+                        .filter_map(|(address, _)| match verdicts.get(address) {
+                            Some(Verdict::Deliver(Some(refusal_id)))
+                                if !not_written.contains(address.as_str()) =>
+                            {
+                                Some((address.as_str(), *refusal_id))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    (Some(state), consumed)
+                }),
+                ZaFanOutKind::Deletion => Some((
+                    decided.or(read),
+                    deleted
+                        .iter()
+                        .map(|(address, refusal_id)| (address.as_str(), *refusal_id))
+                        .collect(),
+                )),
+                ZaFanOutKind::Redelivery => None,
+            }
         };
         if let Some((start, consumed)) = retirement
             && !consumed.is_empty()
@@ -604,7 +746,11 @@ impl ZaFanOut for Server {
         // Spec 3.3: the organizer's bundle keeps the pairs of current
         // attendees only.
         let pairs = if is_organizer {
-            Some(current_attendee_pairs(&union, event, sender.addresses()))
+            Some(current_attendee_pairs(
+                &union,
+                event,
+                event_account.addresses(),
+            ))
         } else {
             stored_pairs
         };
@@ -625,6 +771,7 @@ struct Attempt<'m> {
     /// The normalized address (key pinning spec 4.3) of a `Deliver` route;
     /// `None` otherwise, or when it does not sanitize.
     key: Option<String>,
+    self_allowed: bool,
 }
 
 /// Phase 2's decision for an internal recipient (key pinning spec 5.1).
@@ -647,6 +794,7 @@ fn decide(
     source: ZaSource<'_>,
     kind: ZaFanOutKind,
     now: i64,
+    record_source: bool,
 ) -> ZaPinStep<Vec<Verdict>> {
     let Some(stored) = &state.pins.record else {
         // Absent or unusable: first use under a legacy wrap, in a fresh
@@ -672,16 +820,20 @@ fn decide(
     let mut verdicts = Vec::with_capacity(internal.len());
     for (address, served) in internal {
         let consumed = || {
-            stored
-                .entry(source.document_id, source.uid, address)
-                .map(|entry| entry.refusal_id)
+            record_source
+                .then(|| {
+                    stored
+                        .entry(source.document_id, source.uid, address)
+                        .map(|entry| entry.refusal_id)
+                })
+                .flatten()
         };
         let verdict = match stored.pin(address) {
             Some(pin) if pin.public_key == *served => Verdict::Deliver(consumed()),
             Some(_) => {
                 // A deletion records no entry: nothing can be redelivered
                 // from a deleted document.
-                if kind != ZaFanOutKind::Deletion {
+                if record_source && kind != ZaFanOutKind::Deletion {
                     record.refuse(
                         source.document_id,
                         source.uid,
@@ -1065,8 +1217,15 @@ fn record_status(
 /// Spec 5.2: whether `address` (normalized) is an internal key account,
 /// with its served key. A lookup error, the served key's included, is that
 /// recipient's delivery failure, traced without the address.
-async fn resolve_recipient(server: &Server, sender_id: u32, address: &str) -> Recipient {
-    match resolve_inner(server, sender_id, address).await {
+async fn resolve_recipient(
+    server: &Server,
+    sender_id: u32,
+    address: &str,
+    raw: Option<&ZaResolvedAccount>,
+    allow_self: bool,
+    excluded_owner: Option<u32>,
+) -> Recipient {
+    match resolve_inner(server, sender_id, address, raw, allow_self, excluded_owner).await {
         Ok(recipient) => recipient,
         Err(err) => {
             trc::error!(
@@ -1079,12 +1238,35 @@ async fn resolve_recipient(server: &Server, sender_id: u32, address: &str) -> Re
     }
 }
 
-async fn resolve_inner(server: &Server, sender_id: u32, address: &str) -> trc::Result<Recipient> {
-    let Some(account_id) = server.za_account_id_from_email(address).await? else {
-        return Ok(Recipient::NotInternal);
+async fn resolve_inner(
+    server: &Server,
+    sender_id: u32,
+    address: &str,
+    raw: Option<&ZaResolvedAccount>,
+    allow_self: bool,
+    excluded_owner: Option<u32>,
+) -> trc::Result<Recipient> {
+    let account_id = match raw {
+        Some(ZaResolvedAccount::Account(id)) => *id,
+        Some(ZaResolvedAccount::NotFound) => return Ok(Recipient::NotInternal),
+        // The producer already traced this lookup failure; reuse it unchanged.
+        Some(ZaResolvedAccount::Failed) => return Ok(Recipient::Failed),
+        None => {
+            #[cfg(feature = "test_mode")]
+            if common::za::test_hooks::take_delegation_lookup_fail_once(sender_id, address) {
+                return Err(trc::StoreEvent::UnexpectedError.into_err());
+            }
+            let Some(id) = server.za_account_id_from_email(address).await? else {
+                return Ok(Recipient::NotInternal);
+            };
+            id
+        }
     };
-    // Never the sender's own inbox (an alias or sub-address of its own).
-    if account_id == sender_id {
+    // Self-inbox authority belongs to each tagged attempt, never this cache.
+    // Known owner recipients on the delegated-organizer path have the
+    // owner's ordinary self-inbox exclusion before any key/permission I/O.
+    // A raw Failed result above remains unknown and keeps its 5.1 status.
+    if (account_id == sender_id && !allow_self) || excluded_owner == Some(account_id) {
         return Ok(Recipient::NotInternal);
     }
     // `za_is_key_account`'s lookup.
@@ -1612,6 +1794,135 @@ mod tests {
                 keys: vec![],
                 all: false
             }
+        );
+    }
+
+    #[test]
+    fn sent_by_marks_only_each_components_naming_property() {
+        use common::auth::AccountCache;
+        use std::sync::Arc;
+        let owner = AccountInfo {
+            account_id: 1,
+            account: Arc::new(AccountCache::default()),
+            addresses: vec!["org@example.com".into(), "shared@example.com".into()],
+        };
+        let writer = AccountInfo {
+            account_id: 2,
+            account: Arc::new(AccountCache::default()),
+            addresses: vec!["writer@example.com".into(), "shared@example.com".into()],
+        };
+        let mut request = message("org@example.com", true, "REQUEST");
+        let tree = EVENT
+            .replace(
+                "ORGANIZER:",
+                "ORGANIZER;SENT-BY=\"mailto:forged@example.com\":",
+            )
+            .replace(
+                "ATTENDEE;PARTSTAT=NEEDS-ACTION:",
+                "ATTENDEE;SENT-BY=\"mailto:unrelated@example.com\";PARTSTAT=NEEDS-ACTION:",
+            );
+        request.message = parse(&tree);
+        request
+            .message
+            .components
+            .push(request.message.components[1].clone());
+        let unchanged = request.message.clone();
+        za_mark_sent_by(&mut request, &writer, &owner);
+        let names = request
+            .message
+            .components
+            .iter()
+            .flat_map(|component| &component.entries)
+            .filter(|entry| entry.name == ICalendarProperty::Organizer)
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 2);
+        assert!(names.iter().all(|entry| {
+            entry
+                .params
+                .iter()
+                .filter(|parameter| parameter.name == ICalendarParameterName::SentBy)
+                .count()
+                == 1
+        }));
+        assert!(names.iter().all(|entry| {
+            entry
+                .params
+                .iter()
+                .any(|parameter| parameter.value.as_text() == Some("mailto:writer@example.com"))
+        }));
+        for (original, marked) in unchanged.components.iter().zip(&request.message.components) {
+            assert_eq!(
+                original
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.name != ICalendarProperty::Organizer)
+                    .collect::<Vec<_>>(),
+                marked
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.name != ICalendarProperty::Organizer)
+                    .collect::<Vec<_>>()
+            );
+        }
+        for named in ["writer@example.com", "shared@example.com"] {
+            let mut own = message(named, true, "CANCEL");
+            own.message = parse(&tree.replace("org@example.com", named));
+            za_mark_sent_by(&mut own, &writer, &owner);
+            assert!(
+                own.message
+                    .components
+                    .iter()
+                    .flat_map(|component| &component.entries)
+                    .filter(|entry| entry.name == ICalendarProperty::Organizer)
+                    .all(|entry| entry
+                        .params
+                        .iter()
+                        .all(|parameter| parameter.name != ICalendarParameterName::SentBy))
+            );
+        }
+        let mut reply = message("org@example.com", false, "REPLY");
+        reply.message = parse(&tree.replace(
+            "ATTENDEE:mailto:org@example.com",
+            "ATTENDEE;SENT-BY=\"mailto:forged@example.com\":mailto:org@example.com",
+        ));
+        let organizer = reply.message.components[1]
+            .entries
+            .iter()
+            .find(|entry| entry.name == ICalendarProperty::Organizer)
+            .unwrap()
+            .clone();
+        za_mark_sent_by(&mut reply, &writer, &owner);
+        assert_eq!(
+            reply.message.components[1]
+                .entries
+                .iter()
+                .find(|entry| entry.name == ICalendarProperty::Organizer),
+            Some(&organizer)
+        );
+        assert!(
+            reply.message.components[1]
+                .entries
+                .iter()
+                .filter(|entry| entry.name == ICalendarProperty::Attendee
+                    && entry.values.first().and_then(|value| value.as_text())
+                        == Some("mailto:org@example.com"))
+                .all(|entry| entry.params.iter().any(
+                    |parameter| parameter.value.as_text() == Some("mailto:writer@example.com")
+                ))
+        );
+        let mut own = message("org@example.com", true, "REQUEST");
+        own.message = parse(&tree);
+        za_mark_sent_by(&mut own, &owner, &owner);
+        assert!(
+            own.message
+                .components
+                .iter()
+                .flat_map(|component| &component.entries)
+                .filter(|entry| entry.name == ICalendarProperty::Organizer)
+                .all(|entry| entry
+                    .params
+                    .iter()
+                    .all(|parameter| parameter.name != ICalendarParameterName::SentBy))
         );
     }
 }

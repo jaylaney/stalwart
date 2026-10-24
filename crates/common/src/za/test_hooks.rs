@@ -612,3 +612,27 @@ pub async fn share_pin_mark_pause_point(owner: u32) {
 pub async fn share_conflict_pause_point(owner: u32) {
     wait(take_for(&SHARE_CONFLICT_PAUSE, owner)).await;
 }
+
+/// One request-local recipient lookup failure, matched by sender and normalized address.
+pub static DELEGATION_LOOKUP_FAIL_ONCE: Mutex<Option<(u32, String)>> = Mutex::new(None);
+
+pub fn set_delegation_lookup_fail_once(value: Option<(u32, String)>) {
+    *DELEGATION_LOOKUP_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = value;
+}
+
+pub fn take_delegation_lookup_fail_once(sender_id: u32, address: &str) -> bool {
+    let mut slot = DELEGATION_LOOKUP_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if slot
+        .as_ref()
+        .is_some_and(|(id, key)| *id == sender_id && key == address)
+    {
+        slot.take();
+        true
+    } else {
+        false
+    }
+}

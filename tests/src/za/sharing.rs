@@ -94,6 +94,9 @@ async fn update_calendar(
 }
 
 pub async fn test(test: &mut TestServer) {
+    delegated_receiver_consistency(test).await;
+    delegated_receiver_rejections_and_reply(test).await;
+    delegated_scheduling_tests(test).await;
     sharing_endpoint_tests(test).await;
     println!("Running sharing resolver and owner mixed-state read tests...");
     let owner = test
@@ -4235,4 +4238,2231 @@ async fn sharing_scan_transition_contracts(test: &TestServer, owner: u32, reader
         .request("DELETE", path, "")
         .await
         .with_status(StatusCode::NO_CONTENT);
+}
+
+/// Direct receiver seam: an owner's name authenticated by its writer's SENT-BY.
+async fn delegated_receiver_consistency(test: &TestServer) {
+    use super::{
+        drain::DrainOn,
+        fanout::{NO_REPLY, Party, START_A, invite, uid_copies},
+    };
+    use crate::utils::za::{PlantedItem, copy_href, inbox_ids, plant_inbox_item, trigger_drain};
+    let _drain = DrainOn::new();
+    let writer = Party::new(test, "key2@example.com");
+    let before = inbox_ids(test, writer.id).await;
+    let tree = invite("sharing-delegated-direct", START_A, &[writer.name])
+        .replace("VERSION:2.0", "VERSION:2.0\r\nMETHOD:REQUEST")
+        .replace(
+            "ORGANIZER:mailto:",
+            "ORGANIZER;SENT-BY=\"mailto:key2@example.com\":mailto:",
+        );
+    plant_inbox_item(
+        test,
+        writer.id,
+        &tree,
+        PlantedItem::Pending {
+            pair: Some((writer.name, [0x39; 16])),
+            reply_token: None,
+        },
+        writer.id,
+        None,
+    )
+    .await;
+    trigger_drain(writer.name, STRONG).await;
+    assert_eq!(
+        uid_copies(test, writer.id, "sharing-delegated-direct").await,
+        1,
+        "a validated owner-named delegated REQUEST must import into the writer inbox"
+    );
+    let href = copy_href(test, writer.id, "sharing-delegated-direct").await;
+    {
+        writer
+            .client
+            .request_with_headers("DELETE", &href, [NO_REPLY], "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    writer.delete_items_since(test, &before).await;
+}
+
+const DELEGATE_OWNER: &str = "task9-alice@example.com";
+const DELEGATE_WRITER: &str = "task9-bob@example.com";
+const DELEGATE_ALIAS: &str = "task9-bob@delegation-alias.test";
+
+fn delegated_tree(uid: &str, attendees: &[&str]) -> calcard::icalendar::ICalendar {
+    let text = super::fanout::invite(uid, super::fanout::START_A, attendees)
+        .replace("key1@example.com", DELEGATE_OWNER);
+    match calcard::Parser::new(&text).entry() {
+        calcard::Entry::ICalendar(tree) => tree,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Public producer/builders/combinator/fan-out seam, before Task 10 opens DAV admission.
+async fn delegated_run(
+    test: &TestServer,
+    owner: &common::auth::AccountInfo,
+    writer: &common::auth::AccountInfo,
+    keys: &vault::session::SessionKeys,
+    kind: u8,
+    old: Option<&calcard::icalendar::ICalendar>,
+    mut new: calcard::icalendar::ICalendar,
+    pairs: Option<groupware::calendar::seal::TokenPairs>,
+) -> (
+    calcard::icalendar::ICalendar,
+    groupware::calendar::fanout::ZaFanOutResult,
+    Vec<usize>,
+) {
+    use groupware::{
+        calendar::{delegation::*, fanout::*},
+        scheduling::{
+            ItipError, event_cancel::itip_cancel, event_create::itip_create,
+            event_update::itip_update,
+        },
+    };
+    let sender = test
+        .server
+        .scheduling_account_info(writer.account_id, owner.account_id)
+        .await
+        .unwrap();
+    let operation = match kind {
+        0 => ZaSelfOperation::Create,
+        1 => ZaSelfOperation::Update,
+        _ => ZaSelfOperation::Delete,
+    };
+    let resolution = za_resolve_delegation(
+        &test.server,
+        &sender,
+        writer,
+        owner,
+        operation,
+        old,
+        Some(&new),
+    )
+    .await
+    .unwrap()
+    .expect("owner-organized delegated gate");
+    let second = match kind {
+        0 => za_self_create(&new, writer, owner, &resolution),
+        1 => za_self_update(old.unwrap(), &new, writer, owner, &resolution),
+        _ => za_self_cancel(old.unwrap(), writer, owner, &resolution),
+    };
+    let second = match second {
+        Ok(second) => second,
+        Err(ItipError::NothingToSend) => None,
+        Err(err) => panic!("{err:?}"),
+    };
+    let self_counts = second
+        .as_ref()
+        .map(|second| {
+            second
+                .messages()
+                .iter()
+                .map(|message| message.to.len())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut cloned_finalized_tree = new.clone();
+    if let Some(second) = &second
+        && second.finalize()
+    {
+        za_finalize(&mut cloned_finalized_tree, second.increments());
+    }
+    let first = match kind {
+        0 => itip_create(&mut new, sender.addresses()),
+        1 => itip_update(&mut new, old.unwrap(), sender.addresses()),
+        _ => itip_cancel(old.unwrap(), sender.addresses(), true).map(|message| vec![message]),
+    };
+    let first = match first {
+        Ok(messages) => messages,
+        Err(ItipError::NothingToSend) => {
+            if let Some(second) = &second
+                && second.finalize()
+            {
+                za_finalize(&mut new, second.increments());
+            }
+            vec![]
+        }
+        Err(err) => panic!("{err:?}"),
+    };
+    if second.as_ref().is_some_and(|second| second.finalize()) {
+        assert_eq!(
+            new, cloned_finalized_tree,
+            "exactly one finalize on the committed clone"
+        );
+    }
+    let messages = za_combine_delegated(first, second, &resolution);
+    let result = test
+        .server
+        .za_fan_out(
+            &sender,
+            writer,
+            owner,
+            keys,
+            messages,
+            pairs,
+            &new,
+            ZaSource {
+                document_id: 900_001,
+                uid: "task9-source",
+            },
+            if kind == 2 {
+                ZaFanOutKind::Deletion
+            } else {
+                ZaFanOutKind::Change
+            },
+            None,
+            Some(&resolution),
+        )
+        .await
+        .unwrap();
+    za_set_schedule_status(&mut new, &result.statuses);
+    groupware::calendar::sequence::za_set_sequences(&mut new, &result.sequences);
+    (new, result, self_counts)
+}
+
+struct DelegationLookupReset;
+impl Drop for DelegationLookupReset {
+    fn drop(&mut self) {
+        common::za::test_hooks::set_delegation_lookup_fail_once(None);
+    }
+}
+
+async fn delegated_scheduling_tests(test: &mut TestServer) {
+    use super::{
+        drain::{DrainOn, body},
+        fanout::{NO_REPLY, Party, uid_copies},
+    };
+    use crate::utils::za::{
+        copy_href, inbox_ids, new_inbox_items, open_pending_item_as, trigger_drain,
+    };
+    use calcard::icalendar::{ICalendarParameterName, ICalendarProperty};
+    use groupware::{
+        calendar::{ChangedBy, delegation::*, fanout::*},
+        scheduling::event_create::itip_create,
+    };
+    println!("Running direct delegated scheduling producer and lifecycle fixtures...");
+    let admin = test.account("admin@example.com").clone();
+    let owner_account = admin
+        .create_key_user_account(
+            DELEGATE_OWNER,
+            STRONG,
+            "Task 9 owner",
+            &[],
+            user_permissions(),
+        )
+        .await;
+    let writer_account = admin
+        .create_key_user_account(
+            DELEGATE_WRITER,
+            STRONG,
+            "Task 9 writer",
+            &[
+                DELEGATE_ALIAS,
+                "task9-target-local-canary@task9-target-canary.test",
+            ],
+            user_permissions(),
+        )
+        .await;
+    test.insert_account(owner_account);
+    test.insert_account(writer_account);
+    let writer = Party::new(test, DELEGATE_WRITER);
+    let owner = test
+        .server
+        .account_info(test.account(DELEGATE_OWNER).id().document_id())
+        .await
+        .unwrap();
+    let writer_info = test.server.account_info(writer.id).await.unwrap();
+    let sender = test
+        .server
+        .scheduling_account_info(writer.id, owner.account_id)
+        .await
+        .unwrap();
+    let keys = za_unlock(test, writer.id, STRONG).await;
+    delegated_owner_exclusion_precedes_eligibility(test, &owner, &writer_info, &keys).await;
+    let before = inbox_ids(test, writer.id).await;
+    let initial = delegated_tree("task9-sole", &[DELEGATE_WRITER]);
+    let resolution = za_resolve_delegation(
+        &test.server,
+        &sender,
+        &writer_info,
+        &owner,
+        ZaSelfOperation::Create,
+        None,
+        Some(&initial),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    // Public upstream provenance never acquires self-inbox authority merely
+    // because a valid request-local resolution is supplied beside it.
+    let mut reference = initial.clone();
+    let ordinary = itip_create(&mut reference, owner.addresses()).unwrap();
+    let refused = test
+        .server
+        .za_fan_out(
+            &sender,
+            &writer_info,
+            &owner,
+            &keys,
+            ordinary
+                .into_iter()
+                .map(ZaFanOutMessage::upstream)
+                .collect(),
+            None,
+            &reference,
+            ZaSource {
+                document_id: 900_001,
+                uid: "task9-source",
+            },
+            ZaFanOutKind::Change,
+            None,
+            Some(&resolution),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refused.statuses.len(), 1);
+    assert_eq!(refused.statuses[0].status, "5.3");
+    assert!(new_inbox_items(test, writer.id, &before).await.is_empty());
+    let mut pairs = None;
+    let mut current = initial;
+    let _drain = DrainOn::new();
+    for (step, kind) in [
+        ("create", 0),
+        ("summary", 1),
+        ("dtstart", 1),
+        ("decline", 1),
+        ("delete", 2),
+    ] {
+        let old = current.clone();
+        let mut next = old.clone();
+        for component in &mut next.components {
+            for entry in &mut component.entries {
+                if (step == "summary" && entry.name == ICalendarProperty::Summary)
+                    || (step == "dtstart" && entry.name == ICalendarProperty::Dtstart)
+                {
+                    let text = if step == "summary" {
+                        "task9 changed summary"
+                    } else {
+                        "20990302T100000Z"
+                    };
+                    if step == "summary" {
+                        entry.values = vec![calcard::icalendar::ICalendarValue::Text(text.into())];
+                    } else {
+                        *entry = delegated_tree("x", &[]).components[1]
+                            .entries
+                            .iter()
+                            .find(|entry| entry.name == ICalendarProperty::Dtstart)
+                            .unwrap()
+                            .clone();
+                        // Parse DTSTART so its date representation remains valid.
+                        let source = super::fanout::invite("x", super::fanout::START_B, &[]);
+                        let calcard::Entry::ICalendar(parsed) =
+                            calcard::Parser::new(&source).entry()
+                        else {
+                            unreachable!()
+                        };
+                        *entry = parsed.components[1]
+                            .entries
+                            .iter()
+                            .find(|entry| entry.name == ICalendarProperty::Dtstart)
+                            .unwrap()
+                            .clone();
+                    }
+                }
+                if step == "decline" && entry.name == ICalendarProperty::Attendee {
+                    entry.params.retain(|parameter| {
+                        parameter.name != ICalendarParameterName::Partstat
+                            && parameter.name != ICalendarParameterName::Rsvp
+                    });
+                    entry.params.push(calcard::icalendar::ICalendarParameter {
+                        name: ICalendarParameterName::Partstat,
+                        value: calcard::icalendar::ICalendarParameterValue::Partstat(
+                            calcard::icalendar::ICalendarParticipationStatus::Declined,
+                        ),
+                    });
+                    entry.params.push(calcard::icalendar::ICalendarParameter {
+                        name: ICalendarParameterName::Rsvp,
+                        value: calcard::icalendar::ICalendarParameterValue::Bool(false),
+                    });
+                }
+            }
+        }
+        let item_start = inbox_ids(test, writer.id).await;
+        let (tree, result, counts) = delegated_run(
+            test,
+            &owner,
+            &writer_info,
+            &keys,
+            kind,
+            (kind != 0).then_some(&old),
+            next,
+            pairs,
+        )
+        .await;
+        assert_eq!(counts, vec![1], "one self attempt for {step}");
+        assert_eq!(result.statuses.len(), 1);
+        assert_eq!(result.statuses[0].status, "1.2", "{step}");
+        assert!(
+            result
+                .pairs
+                .as_ref()
+                .unwrap()
+                .get(DELEGATE_WRITER)
+                .is_some()
+        );
+        let items = new_inbox_items(test, writer.id, &item_start).await;
+        assert_eq!(items.len(), 1, "{step}");
+        assert!(matches!(items[0].1.changed_by,ChangedBy::PrincipalId(id) if id == writer.id));
+        let (payload, carriers) = open_pending_item_as(test, writer.id, STRONG, items[0].0).await;
+        assert_eq!(carriers.pair.as_ref().unwrap().len(), 1);
+        let names: Vec<_> = payload
+            .components
+            .iter()
+            .flat_map(|component| &component.entries)
+            .filter(|entry| entry.name == ICalendarProperty::Organizer)
+            .collect();
+        assert!(names.iter().all(|entry| {
+            entry.params.iter().any(|parameter| {
+                parameter.name == ICalendarParameterName::SentBy
+                    && parameter.value.as_text() == Some("mailto:task9-bob@example.com")
+            })
+        }));
+        trigger_drain(writer.name, STRONG).await;
+        assert_eq!(uid_copies(test, writer.id, "task9-sole").await, 1);
+        let href = copy_href(test, writer.id, "task9-sole").await;
+        let personal = body(&writer.client, &href).await;
+        if step == "summary" {
+            assert!(personal.contains("task9 changed summary"));
+        }
+        if step == "delete" {
+            assert!(personal.contains("STATUS:CANCELLED"));
+        }
+        pairs = result.pairs;
+        current = tree;
+    }
+    let href = copy_href(test, writer.id, "task9-sole").await;
+    writer
+        .client
+        .request_with_headers("DELETE", &href, [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    writer.delete_items_since(test, &before).await;
+
+    // The broader R set removes a sub-address from the first run without
+    // creating duplicate items; each listed alias gets its own token carrier.
+    let aliases = delegated_tree(
+        "task9-aliases",
+        &[DELEGATE_WRITER, DELEGATE_ALIAS, "task9-bob+tag@example.com"],
+    );
+    let start = inbox_ids(test, writer.id).await;
+    let (_, result, counts) =
+        delegated_run(test, &owner, &writer_info, &keys, 0, None, aliases, None).await;
+    assert_eq!(counts, vec![3]);
+    assert_eq!(result.statuses.len(), 3);
+    assert!(result.statuses.iter().all(|status| status.status == "1.2"));
+    assert_eq!(new_inbox_items(test, writer.id, &start).await.len(), 3);
+    for (id, _) in new_inbox_items(test, writer.id, &start).await {
+        let (_, carriers) = open_pending_item_as(test, writer.id, STRONG, id).await;
+        assert_eq!(carriers.pair.unwrap().len(), 1);
+    }
+    trigger_drain(writer.name, STRONG).await;
+    assert_eq!(uid_copies(test, writer.id, "task9-aliases").await, 1);
+    let href = copy_href(test, writer.id, "task9-aliases").await;
+    writer
+        .client
+        .request_with_headers("DELETE", &href, [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    writer.delete_items_since(test, &before).await;
+
+    let _reset = DelegationLookupReset;
+    for (address, suppressed) in [
+        (DELEGATE_ALIAS, false),
+        (DELEGATE_ALIAS, true),
+        ("task9-bob+failure@example.com", false),
+    ] {
+        common::za::test_hooks::set_delegation_lookup_fail_once(Some((writer.id, address.into())));
+        let mut tree = delegated_tree("task9-failure", &[address]);
+        if suppressed {
+            let text = tree.to_string().replace(
+                "PARTSTAT=NEEDS-ACTION;RSVP=TRUE",
+                "PARTSTAT=DECLINED;RSVP=FALSE",
+            );
+            let calcard::Entry::ICalendar(parsed) = calcard::Parser::new(&text).entry() else {
+                unreachable!()
+            };
+            tree = parsed;
+        }
+        let start = inbox_ids(test, writer.id).await;
+        let traced = super::mail::Traced::start(trc::EventType::variants());
+        let (_, result, counts) =
+            delegated_run(test, &owner, &writer_info, &keys, 0, None, tree, None).await;
+        let lookup_traces = traced.finish().await;
+        assert_eq!(
+            lookup_traces
+                .iter()
+                .filter(|event| event.details == "zero-access: fan-out recipient lookup failed")
+                .count(),
+            1,
+            "one raw recipient failure is traced once by the producer and reused by fan-out"
+        );
+        assert_eq!(result.statuses.len(), 1);
+        assert_eq!(result.statuses[0].status, "5.1");
+        assert_eq!(
+            counts,
+            if address == DELEGATE_ALIAS {
+                vec![1]
+            } else {
+                vec![]
+            }
+        );
+        assert!(new_inbox_items(test, writer.id, &start).await.is_empty());
+        assert!(!common::za::test_hooks::take_delegation_lookup_fail_once(
+            writer.id, address
+        ));
+    }
+    common::za::test_hooks::set_delegation_lookup_fail_once(None);
+    delegated_identity_and_groups(test, owner.account_id, writer.id).await;
+    delegated_schedule_agents_remain_authoritative(test, &owner, &writer_info, &keys).await;
+    delegated_attendee_and_alias_edges(test, owner.account_id, writer.id).await;
+    delegated_collection_lifecycle(test, owner.account_id, writer.id).await;
+    catch_all_resolution_is_quiet(test, owner.account_id, writer.id).await;
+    println!(
+        "Direct delegated sole-attendee lifecycle, alias/sub-address and failed-lookup fixtures passed"
+    );
+    writer.delete_items_since(test, &before).await;
+    // No source event was stored; remove the receiver's disposable calendar.
+    writer
+        .client
+        .request_with_headers(
+            "DELETE",
+            "/dav/cal/task9-bob%40example.com/default/",
+            [NO_REPLY],
+            "",
+        )
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    crate::utils::za::set_raw_pins(test, writer.id, None).await;
+    test.wait_for_tasks().await;
+}
+
+async fn delegated_identity_and_groups(test: &mut TestServer, owner_id: u32, writer_id: u32) {
+    use super::fanout::Party;
+    use crate::utils::za::{
+        inbox_ids, new_inbox_items, open_pending_item_as, pin_record, trigger_drain,
+        write_pin_record,
+    };
+    use groupware::{calendar::delegation::*, scheduling::event_create::itip_create};
+    use registry::{
+        schema::prelude::{ObjectType, Property},
+        types::EnumImpl,
+    };
+    use serde_json::json;
+    let admin = test.account("admin@example.com").clone();
+    let owner = test.server.account_info(owner_id).await.unwrap();
+    let writer = test.server.account_info(writer_id).await.unwrap();
+    let sender = test
+        .server
+        .scheduling_account_info(writer_id, owner_id)
+        .await
+        .unwrap();
+    let keys = za_unlock(test, writer_id, STRONG).await;
+    let before = inbox_ids(test, writer_id).await;
+
+    // A corrupt dedicated alias-domain record exercises the normal outer
+    // preparation error without inventing a second recipient fault hook.
+    let domain = admin.find_or_create_domain("delegation-alias.test").await;
+    let class = store::write::ValueClass::Registry(store::write::RegistryClass::Item {
+        object_id: ObjectType::Domain.to_id(),
+        item_id: domain.id(),
+    });
+    let bytes = test
+        .server
+        .store()
+        .get_value::<common::auth::vault::RawValue>(ValueKey::from(class.clone()))
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    let mut batch = BatchBuilder::new();
+    batch.set(class.clone(), vec![0xffu8]);
+    test.server.store().write(batch.build_all()).await.unwrap();
+    test.server
+        .invalidate_local_caches(&[common::ipc::CacheInvalidation::Domain(domain.document_id())])
+        .await;
+    let tree = delegated_tree("task9-identity-error", &[DELEGATE_ALIAS]);
+    let result = za_resolve_delegation(
+        &test.server,
+        &sender,
+        &writer,
+        &owner,
+        ZaSelfOperation::Create,
+        None,
+        Some(&tree),
+    )
+    .await;
+    let mut batch = BatchBuilder::new();
+    batch.set(class, bytes);
+    test.server.store().write(batch.build_all()).await.unwrap();
+    test.server
+        .invalidate_local_caches(&[common::ipc::CacheInvalidation::Domain(domain.document_id())])
+        .await;
+    assert!(
+        result.is_err(),
+        "identity preparation errors are outer errors, not Failed recipient outcomes"
+    );
+
+    // Unlisted owner-resolving attendees stay out of the owner's inbox on
+    // the gated organizer path, even though the authenticated writer differs.
+    let owner_start = inbox_ids(test, owner_id).await;
+    let tree = delegated_tree(
+        "task9-owner-overlap",
+        &["task9-alice+tag@example.com", DELEGATE_WRITER],
+    );
+    let (_, result, _) = delegated_run(test, &owner, &writer, &keys, 0, None, tree, None).await;
+    assert_eq!(
+        result
+            .statuses
+            .iter()
+            .find(|status| status.address == "task9-alice+tag@example.com")
+            .unwrap()
+            .status,
+        "5.3"
+    );
+    assert!(
+        new_inbox_items(test, owner_id, &owner_start)
+            .await
+            .is_empty()
+    );
+    Party::new(test, DELEGATE_WRITER)
+        .delete_items_since(test, &before)
+        .await;
+
+    // First-use pins still run, but every source-bound withheld operation is
+    // disabled for a delegated event, including a colliding numeric source id.
+    let mut record = pin_record(test, writer_id, STRONG).await.unwrap();
+    record.refuse(900_001, "task9-source", DELEGATE_ALIAS, 123, None);
+    let entry = record
+        .entry(900_001, "task9-source", DELEGATE_ALIAS)
+        .unwrap()
+        .clone();
+    write_pin_record(test, writer_id, STRONG, &record).await;
+    let tree = delegated_tree("task9-withheld-collision", &[DELEGATE_ALIAS]);
+    let (_, result, _) =
+        delegated_run(test, &owner, &writer, &keys, 0, None, tree.clone(), None).await;
+    assert_eq!(result.statuses[0].status, "1.2");
+    assert_eq!(
+        new_inbox_items(test, writer_id, &before).await.len(),
+        1,
+        "no full-state message from the writer's colliding source"
+    );
+    assert!(
+        pin_record(test, writer_id, STRONG).await.unwrap().entry(
+            900_001,
+            "task9-source",
+            DELEGATE_ALIAS
+        ) == Some(&entry)
+    );
+    Party::new(test, DELEGATE_WRITER)
+        .delete_items_since(test, &before)
+        .await;
+    delegated_run(
+        test,
+        &owner,
+        &writer,
+        &keys,
+        2,
+        Some(&tree),
+        tree.clone(),
+        result.pairs,
+    )
+    .await;
+    assert!(
+        pin_record(test, writer_id, STRONG).await.unwrap().entry(
+            900_001,
+            "task9-source",
+            DELEGATE_ALIAS
+        ) == Some(&entry)
+    );
+    Party::new(test, DELEGATE_WRITER)
+        .delete_items_since(test, &before)
+        .await;
+    let mut record = pin_record(test, writer_id, STRONG).await.unwrap();
+    let original_key = record.pin(DELEGATE_ALIAS).unwrap().public_key;
+    record.set_pin(
+        DELEGATE_ALIAS,
+        [0x6d; 32],
+        vault::pins::PinSource::Confirmed,
+        124,
+    );
+    write_pin_record(test, writer_id, STRONG, &record).await;
+    let (_, result, _) = delegated_run(test, &owner, &writer, &keys, 0, None, tree, None).await;
+    assert_eq!(result.statuses[0].status, "3.8");
+    assert!(new_inbox_items(test, writer_id, &before).await.is_empty());
+    let mut record = pin_record(test, writer_id, STRONG).await.unwrap();
+    assert!(record.entry(900_001, "task9-source", DELEGATE_ALIAS) == Some(&entry));
+    record.set_pin(
+        DELEGATE_ALIAS,
+        original_key,
+        vault::pins::PinSource::Confirmed,
+        125,
+    );
+    record.withheld.clear();
+    write_pin_record(test, writer_id, STRONG, &record).await;
+
+    // Two distinct shared groups own the attendee exclusion and organizer
+    // gate cases; a third belongs only to the writer and remains an ordinary
+    // plain-group target rather than a redirect into its inbox.
+    const ATT_GROUP: &str = "task9-attendee-group@example.com";
+    const ORG_GROUP: &str = "task9-organizer-group@example.com";
+    const WRITER_GROUP: &str = "task9-writer-group@example.com";
+    let ag = admin
+        .create_group_account(ATT_GROUP, "Task9 attendee group", &[])
+        .await;
+    let og = admin
+        .create_group_account(ORG_GROUP, "Task9 organizer group", &[])
+        .await;
+    let wg = admin
+        .create_group_account(WRITER_GROUP, "Task9 writer group", &[])
+        .await;
+    let (agid, ogid, wgid) = (ag.id(), og.id(), wg.id());
+    test.insert_account(ag);
+    test.insert_account(og);
+    test.insert_account(wg);
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            test.account(DELEGATE_OWNER).id(),
+            json!({Property::MemberGroupIds:{agid:true,ogid:true}}),
+        )
+        .await;
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            test.account(DELEGATE_WRITER).id(),
+            json!({Property::MemberGroupIds:{agid:true,ogid:true,wgid:true}}),
+        )
+        .await;
+    let owner = test.server.account_info(owner_id).await.unwrap();
+    let writer = test.server.account_info(writer_id).await.unwrap();
+    let sender = test
+        .server
+        .scheduling_account_info(writer_id, owner_id)
+        .await
+        .unwrap();
+    let tree = delegated_tree("task9-shared-attendee", &[ATT_GROUP]);
+    let resolution = za_resolve_delegation(
+        &test.server,
+        &sender,
+        &writer,
+        &owner,
+        ZaSelfOperation::Create,
+        None,
+        Some(&tree),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        za_self_create(&tree, &writer, &owner, &resolution),
+        Err(groupware::scheduling::ItipError::NothingToSend)
+    ));
+    let (_, result, counts) =
+        delegated_run(test, &owner, &writer, &keys, 0, None, tree, None).await;
+    assert!(counts.is_empty() && result.statuses.is_empty());
+    let tree = delegated_tree("task9-writer-group", &[WRITER_GROUP]);
+    let (_, result, counts) =
+        delegated_run(test, &owner, &writer, &keys, 0, None, tree, None).await;
+    assert_eq!(counts, vec![1]);
+    assert_eq!(result.statuses[0].status, "5.3");
+    let text = delegated_tree("task9-writer-group-suppressed", &[WRITER_GROUP])
+        .to_string()
+        .replace(
+            "PARTSTAT=NEEDS-ACTION;RSVP=TRUE",
+            "PARTSTAT=DECLINED;RSVP=FALSE",
+        );
+    let calcard::Entry::ICalendar(tree) = calcard::Parser::new(&text).entry() else {
+        unreachable!()
+    };
+    let (_, result, counts) =
+        delegated_run(test, &owner, &writer, &keys, 0, None, tree, None).await;
+    assert!(counts.is_empty() && result.statuses.is_empty());
+    let text = delegated_tree("task9-shared-organizer", &[DELEGATE_WRITER])
+        .to_string()
+        .replace(DELEGATE_OWNER, ORG_GROUP);
+    let calcard::Entry::ICalendar(tree) = calcard::Parser::new(&text).entry() else {
+        unreachable!()
+    };
+    let (_, result, counts) =
+        delegated_run(test, &owner, &writer, &keys, 0, None, tree, None).await;
+    assert_eq!(counts, vec![1]);
+    assert_eq!(result.statuses[0].status, "1.2");
+    let items = new_inbox_items(test, writer_id, &before).await;
+    assert_eq!(items.len(), 1);
+    let (payload, _) = open_pending_item_as(test, writer_id, STRONG, items[0].0).await;
+    assert!(
+        payload
+            .components
+            .iter()
+            .flat_map(|component| &component.entries)
+            .filter(|entry| entry.name == calcard::icalendar::ICalendarProperty::Organizer)
+            .all(|entry| entry
+                .params
+                .iter()
+                .all(|parameter| parameter.name
+                    != calcard::icalendar::ICalendarParameterName::SentBy))
+    );
+    trigger_drain(DELEGATE_WRITER, STRONG).await;
+    assert_eq!(
+        super::fanout::uid_copies(test, writer_id, "task9-shared-organizer").await,
+        0,
+        "shared group organizer retains ordinary receiver rejection"
+    );
+    Party::new(test, DELEGATE_WRITER)
+        .delete_items_since(test, &before)
+        .await;
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            test.account(DELEGATE_OWNER).id(),
+            json!({Property::MemberGroupIds:{agid:false,ogid:false}}),
+        )
+        .await;
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            test.account(DELEGATE_WRITER).id(),
+            json!({Property::MemberGroupIds:{agid:false,ogid:false,wgid:false}}),
+        )
+        .await;
+    // An inapplicable writer-organizer gate does no injected attendee lookup.
+    let text = delegated_tree("task9-writer-organizer", &[DELEGATE_ALIAS])
+        .to_string()
+        .replace(DELEGATE_OWNER, DELEGATE_WRITER);
+    let calcard::Entry::ICalendar(mut tree) = calcard::Parser::new(&text).entry() else {
+        unreachable!()
+    };
+    common::za::test_hooks::set_delegation_lookup_fail_once(Some((
+        writer_id,
+        DELEGATE_ALIAS.into(),
+    )));
+    let _reset = DelegationLookupReset;
+    assert!(
+        za_resolve_delegation(
+            &test.server,
+            &sender,
+            &writer,
+            &owner,
+            ZaSelfOperation::Create,
+            None,
+            Some(&tree)
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert!(common::za::test_hooks::take_delegation_lookup_fail_once(
+        writer_id,
+        DELEGATE_ALIAS
+    ));
+    let messages = itip_create(&mut tree, sender.addresses());
+    assert!(matches!(
+        messages,
+        Err(groupware::scheduling::ItipError::NothingToSend)
+    ));
+    // Task10 owns actual foreign DAV admission and stored status/tag assertions.
+    println!(
+        "Direct delegated identity preparation, owner exclusion, pin collision and shared-group fixtures passed"
+    );
+}
+
+/// All-event trace canaries exercise both catch-all domains, cold and warm,
+/// through recipient classification and the receiver's delegated verification.
+async fn catch_all_resolution_is_quiet(test: &TestServer, owner_id: u32, writer_id: u32) {
+    use super::{
+        fanout::{NO_REPLY, Party, uid_copies},
+        mail::Traced,
+    };
+    use crate::utils::za::{PlantedItem, copy_href, inbox_ids, plant_inbox_item, trigger_drain};
+    use common::{auth::EmailAddressRef, ipc::CacheInvalidation};
+    use groupware::calendar::delegation::*;
+    use registry::schema::{prelude::ObjectType, structs::Domain};
+    use serde_json::json;
+    const SOURCE_DOMAIN: &str = "task9-source-canary.test";
+    const TARGET_DOMAIN: &str = "task9-target-canary.test";
+    const SOURCE_LOCAL: &str = "task9-source-local-canary";
+    const TARGET_LOCAL: &str = "task9-target-local-canary";
+    const SOURCE: &str = "task9-source-local-canary@task9-source-canary.test";
+    const TARGET: &str = "task9-target-local-canary@task9-target-canary.test";
+    let admin = test.account("admin@example.com").clone();
+    let source = admin.find_or_create_domain(SOURCE_DOMAIN).await;
+    let target = admin.find_or_create_domain(TARGET_DOMAIN).await;
+    let saved_source = test
+        .server
+        .registry()
+        .object::<Domain>(source)
+        .await
+        .unwrap()
+        .unwrap();
+    let saved_target = test
+        .server
+        .registry()
+        .object::<Domain>(target)
+        .await
+        .unwrap()
+        .unwrap();
+    admin
+        .registry_update_object(
+            ObjectType::Domain,
+            source,
+            json!({"catchAllAddress":TARGET,"subAddressing":{"@type":"Disabled"}}),
+        )
+        .await;
+    admin
+        .registry_update_object(
+            ObjectType::Domain,
+            target,
+            json!({"catchAllAddress":null,"subAddressing":{"@type":"Disabled"}}),
+        )
+        .await;
+    let owner = test.server.account_info(owner_id).await.unwrap();
+    let writer = test.server.account_info(writer_id).await.unwrap();
+    let sender = test
+        .server
+        .scheduling_account_info(writer_id, owner_id)
+        .await
+        .unwrap();
+    let party = Party::new(test, DELEGATE_WRITER);
+    let before = inbox_ids(test, writer_id).await;
+    let cold = async || {
+        test.server
+            .invalidate_local_caches(&[
+                CacheInvalidation::Domain(source.document_id()),
+                CacheInvalidation::Domain(target.document_id()),
+                CacheInvalidation::Account(writer_id),
+            ])
+            .await;
+        test.server.invalidate_all_local_negative_caches();
+    };
+    let text = delegated_tree("task9-quiet-classification", &[SOURCE])
+        .to_string()
+        .replace(
+            "PARTSTAT=NEEDS-ACTION;RSVP=TRUE",
+            "PARTSTAT=DECLINED;RSVP=FALSE",
+        );
+    let calcard::Entry::ICalendar(tree) = calcard::Parser::new(&text).entry() else {
+        unreachable!()
+    };
+    for is_cold in [true, false] {
+        if is_cold {
+            cold().await;
+        }
+        let traced = Traced::start(trc::EventType::variants());
+        let resolution = za_resolve_delegation(
+            &test.server,
+            &sender,
+            &writer,
+            &owner,
+            ZaSelfOperation::Create,
+            None,
+            Some(&tree),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            za_self_create(&tree, &writer, &owner, &resolution),
+            Err(groupware::scheduling::ItipError::NothingToSend)
+        ));
+        assert!(
+            test.server
+                .inner
+                .cache
+                .emails_negative
+                .get(&EmailAddressRef::new(SOURCE_LOCAL, source.document_id()))
+                .is_some()
+        );
+        assert!(
+            test.server
+                .inner
+                .cache
+                .emails
+                .get(&EmailAddressRef::new(TARGET_LOCAL, target.document_id()))
+                .is_some()
+        );
+        let events = traced.finish().await;
+        let all = events
+            .iter()
+            .map(|event| event.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for canary in [SOURCE_DOMAIN, TARGET_DOMAIN, SOURCE_LOCAL, TARGET_LOCAL] {
+            assert!(
+                !all.contains(canary),
+                "quiet classification leaked {canary}, cold={is_cold}: {all}"
+            );
+        }
+    }
+    // Fan-out uses writer primary; explicitly plant catch-all SENT-BY to
+    // reach the receiver's independent named-sender verification branch.
+    for is_cold in [true, false] {
+        let uid = if is_cold {
+            "task9-quiet-drain-cold"
+        } else {
+            "task9-quiet-drain-warm"
+        };
+        let text = super::fanout::invite(uid, super::fanout::START_A, &[DELEGATE_WRITER])
+            .replace("key1@example.com", DELEGATE_OWNER)
+            .replace("VERSION:2.0", "VERSION:2.0\r\nMETHOD:REQUEST")
+            .replace(
+                "ORGANIZER:mailto:",
+                &format!("ORGANIZER;SENT-BY=\"mailto:{SOURCE}\":mailto:"),
+            );
+        plant_inbox_item(
+            test,
+            writer_id,
+            &text,
+            PlantedItem::Pending {
+                pair: Some((DELEGATE_WRITER, [0x51; 16])),
+                reply_token: None,
+            },
+            writer_id,
+            None,
+        )
+        .await;
+        if is_cold {
+            cold().await;
+        }
+        let traced = Traced::start(trc::EventType::variants());
+        trigger_drain(DELEGATE_WRITER, STRONG).await;
+        let events = traced.finish().await;
+        let all = events
+            .iter()
+            .map(|event| event.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for canary in [SOURCE_DOMAIN, TARGET_DOMAIN, SOURCE_LOCAL, TARGET_LOCAL] {
+            assert!(
+                !all.contains(canary),
+                "quiet sender verification leaked {canary}, cold={is_cold}: {all}"
+            );
+        }
+        assert_eq!(uid_copies(test, writer_id, uid).await, 1);
+        let href = copy_href(test, writer_id, uid).await;
+        party
+            .client
+            .request_with_headers("DELETE", &href, [NO_REPLY], "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    cold().await;
+    for is_cold in [true, false] {
+        let traced = Traced::start(trc::EventType::variants());
+        assert_eq!(
+            test.server
+                .account_id_from_email(SOURCE, true)
+                .await
+                .unwrap(),
+            Some(writer_id)
+        );
+        let events = traced.finish().await;
+        let all = events
+            .iter()
+            .map(|event| event.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for canary in [SOURCE_LOCAL, TARGET_LOCAL] {
+            assert!(
+                all.contains(canary),
+                "ordinary capture missing {canary}, cold={is_cold}: {all}"
+            );
+        }
+        for canary in [SOURCE_DOMAIN, TARGET_DOMAIN] {
+            assert_eq!(
+                all.contains(canary),
+                !is_cold,
+                "ordinary domain capture, cold={is_cold}: {all}"
+            );
+        }
+    }
+    party.delete_items_since(test, &before).await;
+    admin.registry_update_object(ObjectType::Domain,source,json!({"catchAllAddress":saved_source.catch_all_address,"subAddressing":saved_source.sub_addressing})).await;
+    admin.registry_update_object(ObjectType::Domain,target,json!({"catchAllAddress":saved_target.catch_all_address,"subAddressing":saved_target.sub_addressing})).await;
+    cold().await;
+    common::za::test_hooks::set_delegation_lookup_fail_once(None);
+    println!(
+        "catch_all_resolution_is_quiet: cold/warm classification, receiver and ordinary controls passed"
+    );
+}
+
+async fn delegated_receiver_rejections_and_reply(test: &TestServer) {
+    use super::{
+        drain::{DrainOn, body},
+        fanout::{NO_REPLY, Party, START_A, invite, uid_copies},
+        mail::Traced,
+    };
+    use crate::utils::za::{
+        PlantedItem, copy_href, inbox_ids, inbox_items, plant_inbox_item, plant_sealed_event,
+        trigger_drain,
+    };
+    use groupware::calendar::{ChangedBy, EVENT_NOTIFICATION_ZA_PENDING, seal::TokenPairs};
+    let _drain = DrainOn::new();
+    let owner = Party::new(test, "key1@example.com");
+    let writer = Party::new(test, "key2@example.com");
+    let recipient = Party::new(test, "key3@example.com");
+    let before = inbox_ids(test, writer.id).await;
+    for (label, named, sent_by, changed_by, expected) in [
+        ("missing", "key1@example.com", None, writer.id, false),
+        (
+            "wrong",
+            "key1@example.com",
+            Some("mailto:key3@example.com"),
+            writer.id,
+            false,
+        ),
+        (
+            "nonmailto",
+            "key1@example.com",
+            Some("https:key2@example.com"),
+            writer.id,
+            false,
+        ),
+        (
+            "malformed",
+            "key1@example.com",
+            Some("mailto:invalid-address"),
+            writer.id,
+            false,
+        ),
+        (
+            "data-uri",
+            "key1@example.com",
+            Some("data:mailto:key2@example.com;base64,YQ=="),
+            writer.id,
+            false,
+        ),
+        (
+            "same",
+            "key2@example.com",
+            Some("mailto:key2@example.com"),
+            writer.id,
+            false,
+        ),
+        (
+            "plain",
+            "admin@example.com",
+            Some("mailto:key2@example.com"),
+            writer.id,
+            false,
+        ),
+        (
+            "nonlocal",
+            "task9-unknown@not-local.test",
+            Some("mailto:key2@example.com"),
+            writer.id,
+            false,
+        ),
+        (
+            "changed-by",
+            "key1@example.com",
+            Some("mailto:key2@example.com"),
+            owner.id,
+            false,
+        ),
+        (
+            "encoded",
+            "key1@example.com",
+            Some("MAILTO:key%32%40example.com"),
+            writer.id,
+            true,
+        ),
+    ] {
+        let uid = format!("task9-receiver-{label}");
+        let tree = invite(&uid, START_A, &[writer.name])
+            .replace("VERSION:2.0", "VERSION:2.0\r\nMETHOD:REQUEST")
+            .replace(
+                "ORGANIZER:mailto:key1@example.com",
+                &format!(
+                    "ORGANIZER{}:mailto:{named}",
+                    sent_by
+                        .map(|sent_by| format!(";SENT-BY=\"{sent_by}\""))
+                        .unwrap_or_default()
+                ),
+            );
+        let id = plant_inbox_item(
+            test,
+            writer.id,
+            &tree,
+            PlantedItem::Pending {
+                pair: Some((writer.name, [0x44; 16])),
+                reply_token: None,
+            },
+            changed_by,
+            None,
+        )
+        .await;
+        let traced = Traced::start(trc::EventType::variants());
+        trigger_drain(writer.name, STRONG).await;
+        let events = traced.finish().await;
+        assert_eq!(
+            uid_copies(test, writer.id, &uid).await,
+            u64::from(expected),
+            "{label}"
+        );
+        let item = inbox_items(test, writer.id)
+            .await
+            .into_iter()
+            .find(|(item_id, _)| *item_id == id)
+            .unwrap()
+            .1;
+        assert_eq!(
+            item.flags & EVENT_NOTIFICATION_ZA_PENDING,
+            0,
+            "{label}: history or imported item is drained"
+        );
+        assert!(matches!(item.changed_by,ChangedBy::PrincipalId(id) if id==changed_by));
+        if !expected && sent_by.is_some() {
+            let refused = events
+                .iter()
+                .filter(|event| event.reason == "zero-access: delegated sender not verified")
+                .collect::<Vec<_>>();
+            assert_eq!(refused.len(), 1, "{label}: {events:?}");
+            for event in refused {
+                for forbidden in [
+                    named,
+                    "key1@example.com",
+                    "key2@example.com",
+                    "key3@example.com",
+                    &uid,
+                    "SUMMARY",
+                    "BEGIN:VCALENDAR",
+                ] {
+                    assert!(
+                        !event.text.contains(forbidden),
+                        "fixed delegated refusal leaks content: {}",
+                        event.text
+                    );
+                }
+            }
+        }
+        if expected {
+            let href = copy_href(test, writer.id, &uid).await;
+            writer
+                .client
+                .request_with_headers("DELETE", &href, [NO_REPLY], "")
+                .await
+                .with_status(StatusCode::NO_CONTENT);
+        }
+    }
+    writer.delete_items_since(test, &before).await;
+
+    // A delegated REPLY must merge the named owner's attendee line and match
+    // that line's token, while SENT-BY authenticates the writer separately.
+    test.server
+        .get_or_create_default_calendar(recipient.id, recipient.id)
+        .await
+        .unwrap();
+    let uid = "task9-owner-named-reply";
+    let text = invite(uid, START_A, &[owner.name]).replace(
+        "ORGANIZER:mailto:key1@example.com",
+        "ORGANIZER:mailto:key3@example.com",
+    );
+    let mut pairs = TokenPairs::new();
+    pairs.insert(owner.name, [0x72; 16]);
+    plant_sealed_event(
+        test,
+        recipient.id,
+        "default",
+        "task9-reply.ics",
+        &text,
+        STRONG,
+        &pairs,
+    )
+    .await;
+    let reply = text
+        .replace("VERSION:2.0", "VERSION:2.0\r\nMETHOD:REPLY")
+        .replace(
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:",
+            "ATTENDEE;PARTSTAT=ACCEPTED;SENT-BY=\"mailto:key2@example.com\":",
+        );
+    let recipient_start = inbox_ids(test, recipient.id).await;
+    plant_inbox_item(
+        test,
+        recipient.id,
+        &reply,
+        PlantedItem::Pending {
+            pair: None,
+            reply_token: Some([0x72; 16]),
+        },
+        writer.id,
+        None,
+    )
+    .await;
+    trigger_drain(recipient.name, STRONG).await;
+    let href = copy_href(test, recipient.id, uid).await;
+    let merged = body(&recipient.client, &href).await;
+    assert_eq!(
+        super::drain::partstat_of(&recipient.client, &href, owner.name)
+            .await
+            .as_deref(),
+        Some("ACCEPTED")
+    );
+    assert!(!merged.contains("ATTENDEE;PARTSTAT=ACCEPTED:mailto:key2@example.com"));
+    recipient
+        .client
+        .request_with_headers("DELETE", &href, [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    recipient.delete_items_since(test, &recipient_start).await;
+    println!(
+        "Direct delegated receiver malformed/identity refusals, encoded mailto and owner-named REPLY passed"
+    );
+}
+
+async fn delegated_collection_lifecycle(test: &TestServer, owner_id: u32, writer_id: u32) {
+    use super::{
+        drain::body,
+        fanout::{MKCALENDAR, NO_REPLY, Party, uid_copies},
+    };
+    use crate::utils::za::{copy_href, inbox_ids, trigger_drain, za_post};
+    use common::auth::BuildAccessToken;
+    use serde_json::json;
+    const CALENDAR: &str = "task9-lifecycle";
+    const PATH: &str = "/dav/cal/task9-alice%40example.com/task9-lifecycle/";
+    let owner_client = Party::new(test, DELEGATE_OWNER);
+    let writer_client = Party::new(test, DELEGATE_WRITER);
+    let outside = Party::new(test, "key3@example.com");
+    owner_client
+        .client
+        .request("MKCALENDAR", PATH, MKCALENDAR)
+        .await
+        .with_status(StatusCode::CREATED);
+    let writer_key = test
+        .server
+        .za_served_public_key(writer_id)
+        .await
+        .unwrap()
+        .unwrap();
+    super::pinning::pin(
+        DELEGATE_OWNER,
+        DELEGATE_WRITER,
+        &vault::keys::display_fingerprint(&writer_key),
+    )
+    .await
+    .expect(200);
+    let grant = json!({"username":DELEGATE_OWNER,"password":STRONG,"calendar":CALENDAR,"address":DELEGATE_WRITER,"level":"edit"});
+    let revoke =
+        json!({"username":DELEGATE_OWNER,"password":STRONG,"calendar":CALENDAR,"grant":writer_id});
+    za_post("shares/grant", &grant).await.expect(200);
+    let owner = test.server.account_info(owner_id).await.unwrap();
+    let writer = test.server.account_info(writer_id).await.unwrap();
+    let keys = za_unlock(test, writer_id, STRONG).await;
+    let before = inbox_ids(test, writer_id).await;
+    let tree = delegated_tree("task9-after-revoke", &[DELEGATE_WRITER]);
+    let (_, result, _) =
+        delegated_run(test, &owner, &writer, &keys, 0, None, tree.clone(), None).await;
+    za_post("shares/revoke", &revoke).await.expect(200);
+    trigger_drain(DELEGATE_WRITER, STRONG).await;
+    assert_eq!(
+        uid_copies(test, writer_id, "task9-after-revoke").await,
+        1,
+        "authorized queued item imports after revoke"
+    );
+    za_post("shares/grant", &grant).await.expect(200);
+    // Store a real source under its current collection key via the owner PUT;
+    // the direct sender below queues its CANCEL before that source disappears.
+    owner_client
+        .client
+        .request_with_headers(
+            "PUT",
+            &format!("{PATH}source.ics"),
+            [super::fanout::CONTENT_TYPE],
+            tree.to_string(),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let (_, _, _) = delegated_run(
+        test,
+        &owner,
+        &writer,
+        &keys,
+        2,
+        Some(&tree),
+        tree.clone(),
+        result.pairs,
+    )
+    .await;
+    owner_client
+        .client
+        .request_with_headers("DELETE", &format!("{PATH}source.ics"), [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    za_post("shares/revoke", &revoke).await.expect(200);
+    trigger_drain(DELEGATE_WRITER, STRONG).await;
+    let href = copy_href(test, writer_id, "task9-after-revoke").await;
+    assert!(
+        body(&writer_client.client, &href)
+            .await
+            .contains("STATUS:CANCELLED"),
+        "queued delegated CANCEL survives source deletion and revoke"
+    );
+    writer_client
+        .client
+        .request_with_headers("DELETE", &href, [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    writer_client.delete_items_since(test, &before).await;
+
+    // An own-name organizer's reply has no source in the writer account and
+    // remains EventNotFound history, the accepted inherited limitation.
+    test.server
+        .get_or_create_default_calendar(writer_id, writer_id)
+        .await
+        .unwrap();
+    let own = delegated_tree("task9-own-name-reply", &["key3@example.com"])
+        .to_string()
+        .replace(DELEGATE_OWNER, DELEGATE_WRITER);
+    owner_client
+        .client
+        .request_with_headers(
+            "PUT",
+            &format!("{PATH}own-name.ics"),
+            [super::fanout::CONTENT_TYPE],
+            &own,
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let reply = own
+        .replace("VERSION:2.0", "VERSION:2.0\r\nMETHOD:REPLY")
+        .replace("PARTSTAT=NEEDS-ACTION", "PARTSTAT=ACCEPTED");
+    let own_reply_id = crate::utils::za::plant_inbox_item(
+        test,
+        writer_id,
+        &reply,
+        crate::utils::za::PlantedItem::Pending {
+            pair: None,
+            reply_token: Some([0x32; 16]),
+        },
+        outside.id,
+        None,
+    )
+    .await;
+    trigger_drain(DELEGATE_WRITER, STRONG).await;
+    assert_eq!(uid_copies(test, writer_id, "task9-own-name-reply").await, 0);
+    let own_reply = crate::utils::za::inbox_items(test, writer_id)
+        .await
+        .into_iter()
+        .find(|(id, _)| *id == own_reply_id)
+        .expect("own-name EventNotFound reply remains history")
+        .1;
+    assert_eq!(
+        own_reply.flags & groupware::calendar::EVENT_NOTIFICATION_ZA_PENDING,
+        0
+    );
+    assert!(own_reply.event_id.is_none());
+    owner_client
+        .client
+        .request_with_headers("DELETE", &format!("{PATH}own-name.ics"), [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    writer_client.delete_items_since(test, &before).await;
+
+    za_post("shares/grant", &grant).await.expect(200);
+    let container_uid = "task9-container-active";
+    owner_client
+        .client
+        .request_with_headers(
+            "PUT",
+            &format!("{PATH}container.ics"),
+            [super::fanout::CONTENT_TYPE],
+            delegated_tree(container_uid, &[DELEGATE_WRITER]).to_string(),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    // Both caches must be resident immediately before the real owner
+    // collection DELETE; unrelated key sessions are the precision control.
+    writer_client
+        .client
+        .request("PROPFIND", "/dav/cal/task9-bob%40example.com/", "")
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    outside
+        .client
+        .request("PROPFIND", "/dav/cal/key3%40example.com/", "")
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    let token = test.server.access_token(writer_id).await.unwrap().build();
+    assert!(test.server.inner.cache.za_keys.contains_account(writer_id));
+    assert!(
+        test.server
+            .inner
+            .cache
+            .access_tokens
+            .get(&writer_id)
+            .is_some()
+    );
+    assert!(test.server.inner.cache.za_keys.contains_account(outside.id));
+    owner_client
+        .client
+        .request_with_headers(
+            "DELETE",
+            PATH,
+            [NO_REPLY, ("if-match", "\"task9-not-current\"")],
+            "",
+        )
+        .await
+        .with_status(StatusCode::PRECONDITION_FAILED);
+    assert!(
+        test.server.inner.cache.za_keys.contains_account(writer_id),
+        "a rejected collection DELETE must not evict a grantee"
+    );
+    assert!(
+        test.server
+            .inner
+            .cache
+            .access_tokens
+            .get(&writer_id)
+            .is_some()
+    );
+    owner_client
+        .client
+        .request("DELETE", PATH, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    assert!(
+        !test.server.inner.cache.za_keys.contains_account(writer_id),
+        "owner shared-calendar DELETE must evict resident grantee keys after commit"
+    );
+    assert!(
+        test.server
+            .inner
+            .cache
+            .access_tokens
+            .get(&writer_id)
+            .is_none(),
+        "owner shared-calendar DELETE invalidates grantee access tokens"
+    );
+    assert!(
+        test.server.inner.cache.za_keys.contains_account(outside.id),
+        "unaffected account's key cache remains resident"
+    );
+    trigger_drain(DELEGATE_WRITER, STRONG).await;
+    let href = copy_href(test, writer_id, container_uid).await;
+    assert!(
+        body(&writer_client.client, &href)
+            .await
+            .contains("STATUS:CANCELLED"),
+        "owner container DELETE delivers its queued cancellation after the shared source is gone"
+    );
+    writer_client
+        .client
+        .request_with_headers("DELETE", &href, [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    drop(token);
+    writer_client.delete_items_since(test, &before).await;
+    println!(
+        "Direct revoke/source-deletion delivery, own-name reply history and owner collection DELETE cache eviction passed"
+    );
+}
+
+async fn delegated_attendee_and_alias_edges(test: &TestServer, owner_id: u32, writer_id: u32) {
+    use super::{
+        drain::{body, partstat_of},
+        fanout::{NO_REPLY, Party, uid_copies},
+    };
+    use crate::utils::za::{
+        copy_href, inbox_ids, new_inbox_items, open_pending_item_as, plant_sealed_event,
+        trigger_drain,
+    };
+    use calcard::icalendar::{
+        ICalendarParameter, ICalendarParameterName, ICalendarParameterValue,
+        ICalendarParticipationStatus, ICalendarProperty,
+    };
+    use groupware::{
+        calendar::{delegation::*, fanout::*, itip::ItipSendStatus, seal::TokenPairs},
+        scheduling::{ItipError, event_update::itip_update},
+    };
+    let owner = test.server.account_info(owner_id).await.unwrap();
+    let writer = test.server.account_info(writer_id).await.unwrap();
+    let sender = test
+        .server
+        .scheduling_account_info(writer_id, owner_id)
+        .await
+        .unwrap();
+    let keys = za_unlock(test, writer_id, STRONG).await;
+    let writer_client = Party::new(test, DELEGATE_WRITER);
+    let owner_client = Party::new(test, DELEGATE_OWNER);
+    let recipient = Party::new(test, "key3@example.com");
+    let before = inbox_ids(test, writer_id).await;
+    let set_declined = |tree: &mut calcard::icalendar::ICalendar| {
+        for entry in tree
+            .components
+            .iter_mut()
+            .flat_map(|component| &mut component.entries)
+            .filter(|entry| entry.name == ICalendarProperty::Attendee)
+        {
+            entry.params.retain(|parameter| {
+                !matches!(
+                    parameter.name,
+                    ICalendarParameterName::Partstat | ICalendarParameterName::Rsvp
+                )
+            });
+            entry.params.push(ICalendarParameter {
+                name: ICalendarParameterName::Partstat,
+                value: ICalendarParameterValue::Partstat(ICalendarParticipationStatus::Declined),
+            });
+            entry.params.push(ICalendarParameter {
+                name: ICalendarParameterName::Rsvp,
+                value: ICalendarParameterValue::Bool(false),
+            });
+        }
+    };
+    for remove in [true, false] {
+        let uid = if remove {
+            "task9-declined-alias-remove"
+        } else {
+            "task9-declined-alias-delete"
+        };
+        let mut tree = delegated_tree(uid, &[DELEGATE_ALIAS]);
+        set_declined(&mut tree);
+        let (old, result, counts) =
+            delegated_run(test, &owner, &writer, &keys, 0, None, tree, None).await;
+        assert_eq!(counts, vec![1]);
+        assert_eq!(result.statuses[0].status, "1.2");
+        trigger_drain(DELEGATE_WRITER, STRONG).await;
+        assert_eq!(uid_copies(test, writer_id, uid).await, 1);
+        let new = if remove {
+            delegated_tree(uid, &[])
+        } else {
+            old.clone()
+        };
+        let (_, result, counts) = delegated_run(
+            test,
+            &owner,
+            &writer,
+            &keys,
+            if remove { 1 } else { 2 },
+            Some(&old),
+            new,
+            result.pairs,
+        )
+        .await;
+        assert_eq!(counts, vec![1]);
+        assert_eq!(result.statuses[0].status, "1.2");
+        trigger_drain(DELEGATE_WRITER, STRONG).await;
+        let href = copy_href(test, writer_id, uid).await;
+        assert!(
+            body(&writer_client.client, &href)
+                .await
+                .contains("STATUS:CANCELLED")
+        );
+        writer_client
+            .client
+            .request_with_headers("DELETE", &href, [NO_REPLY], "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+        writer_client.delete_items_since(test, &before).await;
+    }
+    let old = delegated_tree("task9-no-message", &[DELEGATE_WRITER]);
+    let resolution = za_resolve_delegation(
+        &test.server,
+        &sender,
+        &writer,
+        &owner,
+        ZaSelfOperation::Update,
+        Some(&old),
+        Some(&old),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        za_self_update(&old, &old, &writer, &owner, &resolution),
+        Err(ItipError::NothingToSend)
+    ));
+    let (_, result, counts) = delegated_run(
+        test,
+        &owner,
+        &writer,
+        &keys,
+        1,
+        Some(&old),
+        old.clone(),
+        None,
+    )
+    .await;
+    assert!(counts.is_empty() && result.statuses.is_empty());
+    assert!(new_inbox_items(test, writer_id, &before).await.is_empty());
+    let no_permission = common::auth::AccessToken::from_permissions(writer_id, []);
+    assert!(matches!(
+        ItipSendStatus::resolve(&test.server, &no_permission, &sender, i64::MAX, true),
+        ItipSendStatus::NoPermission
+    ));
+
+    // A retained self message still needs the writer's receive permission.
+    let admin = test.account("admin@example.com").clone();
+    let writer_account_id = test.account(DELEGATE_WRITER).id();
+    let registry::schema::structs::Account::User(original) = test
+        .server
+        .registry()
+        .object::<registry::schema::structs::Account>(writer_account_id)
+        .await
+        .unwrap()
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    let denied =
+        registry::schema::structs::Permissions::Merge(registry::schema::structs::PermissionsList {
+            enabled_permissions: registry::types::map::Map::new(user_permissions()),
+            disabled_permissions: registry::types::map::Map::new(vec![
+                registry::schema::enums::Permission::CalendarSchedulingReceive,
+            ]),
+        });
+    admin
+        .registry_update_object(
+            registry::schema::prelude::ObjectType::Account,
+            writer_account_id,
+            serde_json::json!({"permissions":denied}),
+        )
+        .await;
+    let (_, denied_result, counts) = delegated_run(
+        test,
+        &owner,
+        &writer,
+        &keys,
+        0,
+        None,
+        delegated_tree("task9-no-receive", &[DELEGATE_WRITER]),
+        None,
+    )
+    .await;
+    admin
+        .registry_update_object(
+            registry::schema::prelude::ObjectType::Account,
+            writer_account_id,
+            serde_json::json!({"permissions":original.permissions}),
+        )
+        .await;
+    assert_eq!(counts, vec![1]);
+    assert_eq!(denied_result.statuses[0].status, "5.3");
+    assert!(new_inbox_items(test, writer_id, &before).await.is_empty());
+
+    // Empty attendee-delete fallback must not inspect a colliding writer
+    // withheld source or synthesize an additional delegated decline.
+    let mut record = crate::utils::za::pin_record(test, writer_id, STRONG)
+        .await
+        .unwrap();
+    record.refuse(900_001, "task9-fallback", "key3@example.com", 22, None);
+    let entry = record
+        .entry(900_001, "task9-fallback", "key3@example.com")
+        .unwrap()
+        .clone();
+    crate::utils::za::write_pin_record(test, writer_id, STRONG, &record).await;
+    let fallback_text = delegated_tree("task9-fallback", &[DELEGATE_OWNER])
+        .to_string()
+        .replace(
+            &format!("ORGANIZER:mailto:{DELEGATE_OWNER}"),
+            "ORGANIZER:mailto:key3@example.com",
+        );
+    let calcard::Entry::ICalendar(fallback) = calcard::Parser::new(&fallback_text).entry() else {
+        unreachable!()
+    };
+    let mut fallback_pairs = TokenPairs::new();
+    fallback_pairs.insert(DELEGATE_OWNER, [0x38; 16]);
+    let fallback_result = test
+        .server
+        .za_fan_out(
+            &sender,
+            &writer,
+            &owner,
+            &keys,
+            vec![],
+            Some(fallback_pairs),
+            &fallback,
+            ZaSource {
+                document_id: 900_001,
+                uid: "task9-fallback",
+            },
+            ZaFanOutKind::Deletion,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(fallback_result.statuses.is_empty());
+    let mut record = crate::utils::za::pin_record(test, writer_id, STRONG)
+        .await
+        .unwrap();
+    assert!(record.entry(900_001, "task9-fallback", "key3@example.com") == Some(&entry));
+    record.withheld.clear();
+    crate::utils::za::write_pin_record(test, writer_id, STRONG, &record).await;
+
+    // Combined upstream and delegated-self messages both survive one
+    // reconciliation; writer delivery proves its tag stayed on its payload.
+    let mixed_uid = "task9-mixed-provenance";
+    let old = delegated_tree(mixed_uid, &[DELEGATE_WRITER, "key3@example.com"]);
+    let mut changed = old.clone();
+    for entry in changed
+        .components
+        .iter_mut()
+        .flat_map(|component| &mut component.entries)
+    {
+        if entry.name == ICalendarProperty::Summary {
+            entry.values = vec![calcard::icalendar::ICalendarValue::Text(
+                "task9 mixed changed".into(),
+            )];
+        }
+    }
+    let recipient_before = inbox_ids(test, recipient.id).await;
+    let (_, mixed_result, counts) =
+        delegated_run(test, &owner, &writer, &keys, 1, Some(&old), changed, None).await;
+    assert_eq!(counts, vec![1]);
+    assert_eq!(mixed_result.statuses.len(), 2);
+    assert!(
+        mixed_result
+            .statuses
+            .iter()
+            .all(|status| status.status == "1.2")
+    );
+    assert_eq!(new_inbox_items(test, writer_id, &before).await.len(), 1);
+    assert_eq!(
+        new_inbox_items(test, recipient.id, &recipient_before)
+            .await
+            .len(),
+        1
+    );
+    for party in [&writer_client, &recipient] {
+        trigger_drain(party.name, STRONG).await;
+        let href = copy_href(test, party.id, mixed_uid).await;
+        party
+            .client
+            .request_with_headers("DELETE", &href, [NO_REPLY], "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    writer_client.delete_items_since(test, &before).await;
+    recipient.delete_items_since(test, &recipient_before).await;
+
+    // The attendee side has no second run. It sends the owner's named REPLY
+    // with the writer marked separately, and merges against the owner's pair.
+    test.server
+        .get_or_create_default_calendar(recipient.id, recipient.id)
+        .await
+        .unwrap();
+    let uid = "task9-attendee-delegation";
+    let text = delegated_tree(uid, &[DELEGATE_OWNER]).to_string().replace(
+        &format!("ORGANIZER:mailto:{DELEGATE_OWNER}"),
+        "ORGANIZER:mailto:key3@example.com",
+    );
+    let calcard::Entry::ICalendar(old) = calcard::Parser::new(&text).entry() else {
+        unreachable!()
+    };
+    let calcard::Entry::ICalendar(mut new) =
+        calcard::Parser::new(&text.replace("PARTSTAT=NEEDS-ACTION", "PARTSTAT=ACCEPTED")).entry()
+    else {
+        unreachable!()
+    };
+    assert!(
+        za_resolve_delegation(
+            &test.server,
+            &sender,
+            &writer,
+            &owner,
+            ZaSelfOperation::Update,
+            Some(&old),
+            Some(&new)
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    let messages = itip_update(&mut new, &old, sender.addresses()).unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].from, DELEGATE_OWNER);
+    let mut pairs = TokenPairs::new();
+    pairs.insert(DELEGATE_OWNER, [0x37; 16]);
+    plant_sealed_event(
+        test,
+        recipient.id,
+        "default",
+        "task9-attendee.ics",
+        &text,
+        STRONG,
+        &pairs,
+    )
+    .await;
+    let recipient_before = inbox_ids(test, recipient.id).await;
+    let result = test
+        .server
+        .za_fan_out(
+            &sender,
+            &writer,
+            &owner,
+            &keys,
+            messages
+                .into_iter()
+                .map(ZaFanOutMessage::upstream)
+                .collect(),
+            Some(pairs.clone()),
+            &new,
+            ZaSource {
+                document_id: 900_001,
+                uid,
+            },
+            ZaFanOutKind::Change,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.statuses[0].status, "1.2");
+    assert!(result.statuses[0].on_organizer);
+    let items = new_inbox_items(test, recipient.id, &recipient_before).await;
+    assert_eq!(items.len(), 1);
+    let (payload, _) = open_pending_item_as(test, recipient.id, STRONG, items[0].0).await;
+    assert!(
+        payload
+            .components
+            .iter()
+            .flat_map(|component| &component.entries)
+            .filter(|entry| entry.name == ICalendarProperty::Attendee
+                && entry.values.first().and_then(|value| value.as_text())
+                    == Some("mailto:task9-alice@example.com"))
+            .all(|entry| entry
+                .params
+                .iter()
+                .any(|parameter| parameter.name == ICalendarParameterName::SentBy
+                    && parameter.value.as_text() == Some("mailto:task9-bob@example.com")))
+    );
+    trigger_drain(recipient.name, STRONG).await;
+    let href = copy_href(test, recipient.id, uid).await;
+    assert_eq!(
+        partstat_of(&recipient.client, &href, DELEGATE_OWNER)
+            .await
+            .as_deref(),
+        Some("ACCEPTED")
+    );
+    recipient
+        .client
+        .request_with_headers("DELETE", &href, [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    recipient.delete_items_since(test, &recipient_before).await;
+
+    // Accepted fork limitation: attendee-side owner-subaddress delivery is
+    // outside the organizer gate. The owner's own send would exclude itself.
+    let text = text
+        .replace(
+            "task9-attendee-delegation",
+            "task9-attendee-owner-subaddress",
+        )
+        .replace(
+            "ORGANIZER:mailto:key3@example.com",
+            "ORGANIZER:mailto:task9-alice+reply@example.com",
+        );
+    let calcard::Entry::ICalendar(old) = calcard::Parser::new(&text).entry() else {
+        unreachable!()
+    };
+    let calcard::Entry::ICalendar(mut new) =
+        calcard::Parser::new(&text.replace("PARTSTAT=NEEDS-ACTION", "PARTSTAT=ACCEPTED")).entry()
+    else {
+        unreachable!()
+    };
+    assert!(
+        za_resolve_delegation(
+            &test.server,
+            &sender,
+            &writer,
+            &owner,
+            ZaSelfOperation::Update,
+            Some(&old),
+            Some(&new)
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    let messages = itip_update(&mut new, &old, sender.addresses()).unwrap();
+    let owner_before = inbox_ids(test, owner_id).await;
+    let result = test
+        .server
+        .za_fan_out(
+            &sender,
+            &writer,
+            &owner,
+            &keys,
+            messages
+                .into_iter()
+                .map(ZaFanOutMessage::upstream)
+                .collect(),
+            Some(pairs.clone()),
+            &new,
+            ZaSource {
+                document_id: 900_001,
+                uid: "task9-subaddress",
+            },
+            ZaFanOutKind::Change,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.statuses[0].status, "1.2");
+    assert_eq!(
+        new_inbox_items(test, owner_id, &owner_before).await.len(),
+        1
+    );
+    let mut control = new.clone();
+    let messages = itip_update(&mut control, &old, owner.addresses()).unwrap();
+    let owner_keys = za_unlock(test, owner_id, STRONG).await;
+    let result = test
+        .server
+        .za_fan_out(
+            &owner,
+            &owner,
+            &owner,
+            &owner_keys,
+            messages
+                .into_iter()
+                .map(ZaFanOutMessage::upstream)
+                .collect(),
+            Some(pairs),
+            &control,
+            ZaSource {
+                document_id: 900_001,
+                uid: "task9-subaddress",
+            },
+            ZaFanOutKind::Change,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.statuses[0].status, "5.3");
+    owner_client.delete_items_since(test, &owner_before).await;
+    println!(
+        "Direct declined alias removal/delete, no-message/send permission and attendee-side owner-named/subaddress fixtures passed"
+    );
+}
+
+async fn delegated_owner_exclusion_precedes_eligibility(
+    test: &TestServer,
+    owner: &common::auth::AccountInfo,
+    writer: &common::auth::AccountInfo,
+    keys: &vault::session::SessionKeys,
+) {
+    use common::auth::BuildAccessToken;
+    use groupware::{
+        calendar::{delegation::*, fanout::*},
+        scheduling::event_create::itip_create,
+    };
+    const ADDRESS: &str = "task9-alice+store-canary@example.com";
+    let sender = test
+        .server
+        .scheduling_account_info(writer.account_id, owner.account_id)
+        .await
+        .unwrap();
+    let input = delegated_tree("task9-owner-store-failure", &[ADDRESS]);
+    let resolution = za_resolve_delegation(
+        &test.server,
+        &sender,
+        writer,
+        owner,
+        ZaSelfOperation::Create,
+        None,
+        Some(&input),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    // Keep all identity and access-token caches warm. Only the clone's data
+    // Store is unavailable; it must never be needed for a known owner target.
+    test.server
+        .access_token(owner.account_id)
+        .await
+        .unwrap()
+        .build();
+    let mut broken = test.server.clone();
+    std::sync::Arc::make_mut(&mut broken.core).storage.data = store::Store::None;
+    let second = za_self_create(&input, writer, owner, &resolution).unwrap();
+    let mut tree = input.clone();
+    let first = itip_create(&mut tree, sender.addresses()).unwrap();
+    let result = broken
+        .za_fan_out(
+            &sender,
+            writer,
+            owner,
+            keys,
+            za_combine_delegated(first, second, &resolution),
+            None,
+            &tree,
+            ZaSource {
+                document_id: 900_001,
+                uid: "task9-owner-store-failure",
+            },
+            ZaFanOutKind::Change,
+            None,
+            Some(&resolution),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.statuses.len(), 1);
+    assert_eq!(
+        result.statuses[0].status, "5.3",
+        "known owner exclusion must precede receive/key eligibility reads"
+    );
+    let _reset = DelegationLookupReset;
+    common::za::test_hooks::set_delegation_lookup_fail_once(Some((
+        writer.account_id,
+        ADDRESS.into(),
+    )));
+    let resolution = za_resolve_delegation(
+        &test.server,
+        &sender,
+        writer,
+        owner,
+        ZaSelfOperation::Create,
+        None,
+        Some(&input),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let second = za_self_create(&input, writer, owner, &resolution).unwrap();
+    let mut tree = input.clone();
+    let first = itip_create(&mut tree, sender.addresses()).unwrap();
+    let result = broken
+        .za_fan_out(
+            &sender,
+            writer,
+            owner,
+            keys,
+            za_combine_delegated(first, second, &resolution),
+            None,
+            &tree,
+            ZaSource {
+                document_id: 900_001,
+                uid: "task9-owner-store-failure",
+            },
+            ZaFanOutKind::Change,
+            None,
+            Some(&resolution),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.statuses[0].status, "5.1",
+        "a raw Failed lookup has no known owner identity and retains failure"
+    );
+    assert!(
+        broken
+            .za_fan_out(
+                &sender,
+                writer,
+                writer,
+                keys,
+                vec![],
+                None,
+                &tree,
+                ZaSource {
+                    document_id: 900_001,
+                    uid: "task9-owner-store-failure"
+                },
+                ZaFanOutKind::Change,
+                None,
+                Some(&resolution)
+            )
+            .await
+            .is_err(),
+        "mismatched owner resolution is unauthorized before effects"
+    );
+    println!(
+        "Known owner 5.3 exclusion precedes unavailable eligibility store; unknown Failed remains 5.1"
+    );
+}
+
+async fn delegated_schedule_agents_remain_authoritative(
+    test: &TestServer,
+    owner: &common::auth::AccountInfo,
+    writer: &common::auth::AccountInfo,
+    keys: &vault::session::SessionKeys,
+) {
+    use super::fanout::{Party, uid_copies};
+    use crate::utils::za::{
+        PlantedItem, inbox_ids, inbox_items, new_inbox_items, plant_inbox_item, trigger_drain,
+    };
+    use calcard::icalendar::{
+        ICalendarParameter, ICalendarParameterName, ICalendarParameterValue, ICalendarProperty,
+        ICalendarScheduleAgentValue,
+    };
+    let party = Party::new(test, DELEGATE_WRITER);
+    let before = inbox_ids(test, writer.account_id).await;
+    for (agent, label) in [
+        (ICalendarScheduleAgentValue::Client, "client"),
+        (ICalendarScheduleAgentValue::None, "none"),
+    ] {
+        let uid = format!("task9-agent-{label}");
+        let mut tree = delegated_tree(&uid, &[DELEGATE_ALIAS]);
+        for entry in tree
+            .components
+            .iter_mut()
+            .flat_map(|component| &mut component.entries)
+            .filter(|entry| entry.name == ICalendarProperty::Attendee)
+        {
+            entry.params.push(ICalendarParameter {
+                name: ICalendarParameterName::ScheduleAgent,
+                value: ICalendarParameterValue::ScheduleAgent(agent.clone()),
+            });
+        }
+        let (_, result, counts) =
+            delegated_run(test, owner, writer, keys, 0, None, tree.clone(), None).await;
+        assert!(counts.is_empty() && result.statuses.is_empty());
+        assert!(
+            new_inbox_items(test, writer.account_id, &before)
+                .await
+                .is_empty()
+        );
+        let text = tree
+            .to_string()
+            .replace("VERSION:2.0", "VERSION:2.0\r\nMETHOD:REQUEST")
+            .replace(
+                "ORGANIZER:mailto:",
+                "ORGANIZER;SENT-BY=\"mailto:task9-bob@example.com\":mailto:",
+            );
+        let id = plant_inbox_item(
+            test,
+            writer.account_id,
+            &text,
+            PlantedItem::Pending {
+                pair: Some((DELEGATE_ALIAS, [0x41; 16])),
+                reply_token: None,
+            },
+            writer.account_id,
+            None,
+        )
+        .await;
+        trigger_drain(DELEGATE_WRITER, STRONG).await;
+        assert_eq!(
+            uid_copies(test, writer.account_id, &uid).await,
+            0,
+            "incoming scheduling-agent validation remains unchanged"
+        );
+        let item = inbox_items(test, writer.account_id)
+            .await
+            .into_iter()
+            .find(|(item_id, _)| *item_id == id)
+            .unwrap()
+            .1;
+        assert_eq!(
+            item.flags & groupware::calendar::EVENT_NOTIFICATION_ZA_PENDING,
+            0
+        );
+        party.delete_items_since(test, &before).await;
+    }
+    println!(
+        "Direct CLIENT/NONE listed aliases remain unsent; incoming snapshot validation rejects planted copies"
+    );
 }

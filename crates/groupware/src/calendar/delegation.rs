@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use super::fanout::ZaFanOutMessage;
 use crate::scheduling::{
     Email, ItipError, ItipMessage, ItipSnapshots,
     event_cancel::itip_cancel_from_snapshot,
@@ -12,7 +13,10 @@ use crate::scheduling::{
 };
 use ahash::{AHashMap, AHashSet};
 use calcard::icalendar::{ICalendar, ICalendarProperty, ICalendarScheduleForceSendValue};
-use common::auth::{AccountInfo, vault::za_normalize_address};
+use common::{
+    Server,
+    auth::{AccountInfo, vault::za_normalize_address},
+};
 
 pub struct ZaSelfMessages {
     pub(crate) messages: Vec<ItipMessage<ICalendar>>,
@@ -38,7 +42,6 @@ pub enum ZaSelfOperation {
     Delete,
 }
 
-#[allow(dead_code)] // The request-local lookup outcomes are consumed by Task 9 fan-out.
 pub(crate) enum ZaResolvedAccount {
     Account(u32),
     NotFound,
@@ -48,12 +51,147 @@ pub(crate) enum ZaResolvedAccount {
 pub struct ZaDelegationResolution {
     pub(crate) writer_id: u32,
     pub(crate) owner_id: u32,
-    #[allow(dead_code)] // Classified by Task 9's resolver for fan-out routing.
     pub(crate) listed: AHashSet<String>,
     pub(crate) recipients: AHashSet<String>,
     pub(crate) override_aliases: AHashSet<String>,
-    #[allow(dead_code)] // Consumed by the Task 9 fan-out, not by the pure builders.
     pub(crate) accounts: AHashMap<String, ZaResolvedAccount>,
+}
+
+/// Prepare the shared organizer path once, including all raw recipient results.
+/// Identity expansion errors abort the write; recipient errors remain attempted failures.
+#[allow(clippy::too_many_arguments)]
+pub async fn za_resolve_delegation(
+    server: &Server,
+    sender: &AccountInfo,
+    writer_account: &AccountInfo,
+    owner: &AccountInfo,
+    operation: ZaSelfOperation,
+    old: Option<&ICalendar>,
+    new: Option<&ICalendar>,
+) -> trc::Result<Option<ZaDelegationResolution>> {
+    let mut resolution = ZaDelegationResolution {
+        writer_id: writer_account.account_id,
+        owner_id: owner.account_id,
+        listed: AHashSet::new(),
+        recipients: AHashSet::new(),
+        override_aliases: AHashSet::new(),
+        accounts: AHashMap::new(),
+    };
+    let gate_tree = match operation {
+        ZaSelfOperation::Create => new,
+        ZaSelfOperation::Update | ZaSelfOperation::Delete => old,
+    };
+    if !gate_tree.is_some_and(|tree| delegated_organizer(tree, writer_account, owner, &resolution))
+    {
+        return Ok(None);
+    }
+    let mut aliases = AHashSet::new();
+    for address in &writer_account.account.addresses {
+        if let Some(domain) = server.domain_by_id(address.domain_id).await? {
+            for name in &domain.names {
+                if let Some(address) =
+                    za_normalize_address(&format!("{}@{}", address.local_part, name))
+                {
+                    aliases.insert(address);
+                }
+            }
+        }
+    }
+    for tree in old.into_iter().chain(new) {
+        for component in &tree.components {
+            if !component.component_type.is_scheduling_object() {
+                continue;
+            }
+            for entry in &component.entries {
+                if entry.name != ICalendarProperty::Attendee {
+                    continue;
+                }
+                let Some(email) = entry
+                    .values
+                    .first()
+                    .and_then(|v| v.as_text())
+                    .and_then(|v| Email::new(v, &owner.addresses))
+                else {
+                    continue;
+                };
+                if email.is_local {
+                    continue;
+                }
+                let Some(key) = za_normalize_address(&email.email) else {
+                    continue;
+                };
+                if sender.addresses.contains(&email.email) {
+                    resolution.listed.insert(key.clone());
+                    resolution.recipients.insert(key.clone());
+                    if aliases.contains(&key) {
+                        resolution.override_aliases.insert(key.clone());
+                    }
+                }
+                if resolution.accounts.contains_key(&key) {
+                    continue;
+                }
+                #[cfg(feature = "test_mode")]
+                let fail = common::za::test_hooks::take_delegation_lookup_fail_once(
+                    writer_account.account_id,
+                    &key,
+                );
+                #[cfg(not(feature = "test_mode"))]
+                let fail = false;
+                let result = if fail {
+                    Err(trc::StoreEvent::UnexpectedError.into_err())
+                } else {
+                    server.za_account_id_from_email(&key).await
+                };
+                let result = match result {
+                    Ok(Some(id)) => {
+                        if id == writer_account.account_id {
+                            resolution.recipients.insert(key.clone());
+                        }
+                        ZaResolvedAccount::Account(id)
+                    }
+                    Ok(None) => ZaResolvedAccount::NotFound,
+                    Err(err) => {
+                        trc::error!(
+                            err.account_id(writer_account.account_id)
+                                .details("zero-access: fan-out recipient lookup failed")
+                                .caused_by(trc::location!())
+                        );
+                        ZaResolvedAccount::Failed
+                    }
+                };
+                resolution.accounts.insert(key, result);
+            }
+        }
+    }
+    Ok(Some(resolution))
+}
+
+/// Remove writer recipients from the first run exactly once, then append the
+/// owner-locality run. Only this function can create delegated-self provenance.
+pub fn za_combine_delegated(
+    first: Vec<ItipMessage<ICalendar>>,
+    second: Option<ZaSelfMessages>,
+    resolution: &ZaDelegationResolution,
+) -> Vec<ZaFanOutMessage> {
+    let mut combined = first
+        .into_iter()
+        .filter_map(|mut message| {
+            message.to.retain(|address| {
+                !za_normalize_address(address)
+                    .is_some_and(|key| resolution.recipients.contains(&key))
+            });
+            (!message.to.is_empty()).then(|| ZaFanOutMessage::upstream(message))
+        })
+        .collect::<Vec<_>>();
+    if let Some(second) = second {
+        combined.extend(
+            second
+                .messages
+                .into_iter()
+                .map(ZaFanOutMessage::delegated_self),
+        );
+    }
+    combined
 }
 
 pub fn za_finalize(tree: &mut ICalendar, increments: &[u16]) {

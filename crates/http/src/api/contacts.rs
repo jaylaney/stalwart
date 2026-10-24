@@ -45,8 +45,8 @@ use groupware::{
         CalendarEvent,
         drain::{ZaDrain, ZaHeldBack},
         fanout::{
-            ITIP_STATUS_KEY_REFUSED, ZaFanOut, ZaFanOutKind, ZaScheduleStatus, ZaSource,
-            za_set_schedule_status,
+            ITIP_STATUS_KEY_REFUSED, ZaFanOut, ZaFanOutKind, ZaFanOutMessage, ZaScheduleStatus,
+            ZaSource, za_set_schedule_status,
         },
         itip::ItipSendStatus,
         pinning::{za_full_request_for, za_participation_replies},
@@ -729,8 +729,13 @@ async fn za_redeliver_entry(
     let fan_out = match server
         .za_fan_out(
             account_info,
+            account_info,
+            account_info,
             keys,
-            messages,
+            messages
+                .into_iter()
+                .map(ZaFanOutMessage::upstream)
+                .collect(),
             pairs,
             tree,
             ZaSource {
@@ -739,6 +744,7 @@ async fn za_redeliver_entry(
             },
             ZaFanOutKind::Redelivery,
             lease.as_ref().map(|lease| lease.lease()),
+            None,
         )
         .await
     {
