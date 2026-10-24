@@ -386,13 +386,26 @@ fn za_address(address: &str) -> trc::Result<String> {
 /// resolves a recipient (spec 5.1) but without the receive permission.
 /// `None` for unknown addresses, plain accounts and accounts pending setup.
 async fn za_resolve(server: &Server, address: &str) -> trc::Result<Option<[u8; 32]>> {
+    Ok(za_resolve_key_account(server, address)
+        .await?
+        .map(|(_, key)| key))
+}
+
+/// Quiet local-account resolution shared with the sharing endpoints.
+pub(super) async fn za_resolve_key_account(
+    server: &Server,
+    address: &str,
+) -> trc::Result<Option<(u32, [u8; 32])>> {
     let Some(account_id) = server.za_account_id_from_email(address).await? else {
         return Ok(None);
     };
     if !server.za_is_key_account(account_id).await? {
         return Ok(None);
     }
-    server.za_served_public_key(account_id).await
+    Ok(server
+        .za_served_public_key(account_id)
+        .await?
+        .map(|key| (account_id, key)))
 }
 
 /// An entry's outcome (spec 6.4's table).

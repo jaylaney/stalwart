@@ -131,3 +131,17 @@ pub fn force_sql_store() -> bool {
         false
     }
 }
+
+/// Sharing test seams for HTTP builds; no-ops unless common's test hooks are enabled.
+pub async fn share_pin_mark_pause_point(account_id: u32) {
+    #[cfg(feature = "test_mode")]
+    test_hooks::share_pin_mark_pause_point(account_id).await;
+    #[cfg(not(feature = "test_mode"))]
+    let _ = account_id;
+}
+pub async fn share_conflict_pause_point(account_id: u32) {
+    #[cfg(feature = "test_mode")]
+    test_hooks::share_conflict_pause_point(account_id).await;
+    #[cfg(not(feature = "test_mode"))]
+    let _ = account_id;
+}

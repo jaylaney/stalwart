@@ -52,6 +52,9 @@ pub struct ZaShareGuards {
 pub enum ZaShareError {
     LinkedEvents,
     Forbidden,
+    TooManyShares,
+    AmbiguousAddress,
+    NotReady,
     Seal(crate::calendar::seal::SealError),
     Store(trc::Error),
     ConversionConflict {
@@ -65,6 +68,9 @@ impl std::fmt::Debug for ZaShareError {
         match self {
             Self::LinkedEvents => f.write_str("LinkedEvents"),
             Self::Forbidden => f.write_str("Forbidden"),
+            Self::TooManyShares => f.write_str("TooManyShares"),
+            Self::AmbiguousAddress => f.write_str("AmbiguousAddress"),
+            Self::NotReady => f.write_str("NotReady"),
             Self::Seal(_) => f.write_str("Seal(..)"),
             Self::Store(_) => f.write_str("Store(..)"),
             Self::ConversionConflict {
@@ -141,6 +147,19 @@ pub async fn za_convert_calendar(
     calendar_id: u32,
     guards: &ZaShareGuards,
 ) -> Result<ZaConversionCounts, ZaShareError> {
+    let mut wrote = false;
+    za_convert_calendar_tracked(server, keys, calendar_id, guards, &mut wrote).await
+}
+
+/// HTTP retains this monotonic witness across resumes. Ring-only writes count as
+/// changes too; observed progress or a failed assertion never establishes attribution.
+pub async fn za_convert_calendar_tracked(
+    server: &Server,
+    keys: &SessionKeys,
+    calendar_id: u32,
+    guards: &ZaShareGuards,
+    wrote: &mut bool,
+) -> Result<ZaConversionCounts, ZaShareError> {
     if guards.owner_id != keys.account_id || guards.verified_generation != keys.generation {
         return Err(ZaShareError::Forbidden);
     }
@@ -183,10 +202,20 @@ pub async fn za_convert_calendar(
                     counts,
                 )
                 .await?;
+                *wrote = true;
                 conversion_cut(keys.account_id).await?;
             }
             Some((_header, ring)) if ring.reverting => {
-                rollback(server, keys, guards, changed_by, &context, &mut counts).await?;
+                rollback(
+                    server,
+                    keys,
+                    guards,
+                    changed_by,
+                    &context,
+                    &mut counts,
+                    wrote,
+                )
+                .await?;
                 if linked {
                     return Err(ZaShareError::LinkedEvents);
                 }
@@ -210,6 +239,7 @@ pub async fn za_convert_calendar(
                         counts,
                     )
                     .await?;
+                    *wrote = true;
                     continue;
                 }
                 for (index, ids) in ids.chunks(100).enumerate() {
@@ -246,6 +276,7 @@ pub async fn za_convert_calendar(
                             counts,
                         )
                         .await?;
+                        *wrote = true;
                         match kind {
                             ZaEventStorageKind::LegacyPlaintext => counts.sealed += 1,
                             ZaEventStorageKind::Sealed => counts.rewrapped += 1,
@@ -261,7 +292,7 @@ pub async fn za_convert_calendar(
     }
 }
 
-fn owner_ring(
+pub(super) fn owner_ring(
     context: &ZaCalendarContext,
     keys: &SessionKeys,
 ) -> Result<Option<(OwnerRingHeader, ZaOwnerRing)>, ZaShareError> {
@@ -383,6 +414,7 @@ async fn rollback(
     changed_by: AccountTenantIds,
     context: &ZaCalendarContext,
     counts: &mut ZaConversionCounts,
+    wrote: &mut bool,
 ) -> Result<(), ZaShareError> {
     let owner = ZaKeyDomain::owner(keys);
     let (ids, _) = event_ids(server, keys.account_id, context.calendar_id).await?;
@@ -417,6 +449,7 @@ async fn rollback(
                 *counts,
             )
             .await?;
+            *wrote = true;
             counts.rewrapped += 1;
         }
     }
@@ -447,11 +480,13 @@ async fn rollback(
         WriteClass::Restore,
         *counts,
     )
-    .await
+    .await?;
+    *wrote = true;
+    Ok(())
 }
 
 /// The complete parentage walk retains only document ids, never every payload.
-async fn event_ids(
+pub(super) async fn event_ids(
     server: &Server,
     owner: u32,
     calendar: u32,
@@ -499,7 +534,7 @@ async fn read_chunk(
 
 /// Stream final validation, retaining only the current archive and any fixed
 /// typed error. Store read errors retain precedence over an incomplete scan.
-async fn validate_scan(
+pub(super) async fn validate_scan(
     server: &Server,
     context: &ZaCalendarContext,
     forward: bool,

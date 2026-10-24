@@ -94,6 +94,7 @@ async fn update_calendar(
 }
 
 pub async fn test(test: &mut TestServer) {
+    sharing_endpoint_tests(test).await;
     println!("Running sharing resolver and owner mixed-state read tests...");
     let owner = test
         .account("admin@example.com")
@@ -2442,7 +2443,7 @@ async fn conversion_contract_tests(test: &mut TestServer) {
     test.wait_for_tasks().await;
 }
 
-async fn conversion_remove_account(
+pub(super) async fn conversion_remove_account(
     test: &TestServer,
     owner: u32,
 ) -> (store::write::ValueClass, Vec<u8>) {
@@ -2519,4 +2520,1719 @@ async fn conversion_guarded_class_loss(
         before.version
     );
     fresh
+}
+
+/// Catches missing sharing routes and authentication-before-validation regressions.
+async fn sharing_endpoint_tests(test: &mut TestServer) {
+    use crate::utils::za::{plant_sealed_event, za_post};
+    use serde_json::json;
+    use vault::keys::display_fingerprint;
+    println!("Running transactional sharing endpoint tests...");
+    for (endpoint, extra) in [
+        (
+            "shares/grant",
+            json!({"address":"key2@example.com", "level":"view"}),
+        ),
+        ("shares/grant", json!({"calendar":"x", "level":"view"})),
+        (
+            "shares/grant",
+            json!({"calendar":"x", "address":"key2@example.com"}),
+        ),
+        ("shares/revoke", json!({"calendar":"x", "address":null})),
+        (
+            "shares/revoke",
+            json!({"calendar":"x", "address":"mailto:bad@example.com"}),
+        ),
+        ("shares/revoke", json!({"calendar":"", "grant":1})),
+        (
+            "shares/grant",
+            json!({"calendar":"", "address":"bad", "level":"view"}),
+        ),
+        ("shares/revoke", json!({"calendar":"x"})),
+        ("shares/revoke", json!({"calendar":"x", "grant":null})),
+        ("shares/revoke", json!({"calendar":"x", "grant":-1})),
+        ("shares/revoke", json!({"calendar":"x", "grant":1.5})),
+        (
+            "shares/revoke",
+            json!({"calendar":"x", "grant":4294967296u64}),
+        ),
+        (
+            "shares/revoke",
+            json!({"calendar":"x", "grant":1, "address":"key2@example.com"}),
+        ),
+    ] {
+        let mut request = extra;
+        request["username"] = json!("missing-sharing-user@example.com");
+        request["password"] = json!("wrong");
+        za_post(endpoint, &request).await.expect(400);
+    }
+    let owner_name = "shares-http-owner@example.com";
+    let reader_name = "shares-http-reader@example.com";
+    let owner = test
+        .account("admin@example.com")
+        .create_key_user_account(owner_name, STRONG, "Owner", &[], user_permissions())
+        .await;
+    let owner_id = owner.id().document_id();
+    test.insert_account(owner);
+    let reader = test
+        .account("admin@example.com")
+        .create_key_user_account(reader_name, STRONG, "Reader", &[], user_permissions())
+        .await;
+    let reader_id = reader.id().document_id();
+    test.insert_account(reader);
+    let client = DummyWebDavClient::new(owner_id, owner_name, STRONG, owner_name);
+    let path = "/dav/cal/shares-http-owner%40example.com/http-sharing/";
+    client
+        .request("MKCALENDAR", path, MKCAL)
+        .await
+        .with_status(StatusCode::CREATED);
+    plant_sealed_event(
+        test,
+        owner_id,
+        "http-sharing",
+        "sealed.ics",
+        &EVENT.replace("share-read-UID", "http-sharing-sealed"),
+        STRONG,
+        &Default::default(),
+    )
+    .await;
+    plant_event(
+        test,
+        owner_id,
+        "http-sharing",
+        "plain.ics",
+        &EVENT.replace("share-read-UID", "http-sharing-plain"),
+        None,
+    )
+    .await;
+    let request = json!({"username":owner_name,"password":STRONG,"calendar":"http-sharing","address":reader_name,"level":"view"});
+    assert_eq!(
+        za_post("shares/grant", &request).await.expect(409)["error"],
+        "contact not pinned"
+    );
+    let key = test
+        .server
+        .za_served_public_key(reader_id)
+        .await
+        .unwrap()
+        .unwrap();
+    super::pinning::pin(owner_name, reader_name, &display_fingerprint(&key))
+        .await
+        .expect(200);
+    assert_eq!(
+        za_post("shares/grant", &request).await.expect(200),
+        json!({"ok":true,"changed":true,"rewrapped":1,"sealed":1})
+    );
+    assert_eq!(
+        za_post("shares/grant", &request).await.expect(200),
+        json!({"ok":true,"changed":false,"rewrapped":0,"sealed":0})
+    );
+    let own_keys = za_unlock(test, owner_id, STRONG).await;
+    let raw = za_owned_calendar_context(
+        &test.server,
+        &own_keys,
+        resource_id(test, owner_id, "http-sharing").await,
+    )
+    .await
+    .unwrap()
+    .stored
+    .deserialize::<Calendar>()
+    .unwrap();
+    assert_eq!(raw.acls[0].grants.bitmap, 9);
+    let listed = za_post("shares", &json!({"username":owner_name,"password":STRONG}))
+        .await
+        .expect(200);
+    let calendar = listed["calendars"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["calendar"] == "http-sharing")
+        .unwrap();
+    assert_eq!(calendar["shared"], true);
+    assert_eq!(calendar["name"], "Shared owner private name");
+    assert_eq!(calendar["grants"][0]["grant"], reader_id);
+    assert_eq!(calendar["grants"][0]["address"], reader_name);
+    assert_eq!(calendar["grants"][0]["state"], "active");
+    assert_eq!(calendar["grants"][0]["pin_source"], "confirmed");
+    let shared = za_post("shares", &json!({"username":reader_name,"password":STRONG}))
+        .await
+        .expect(200);
+    assert_eq!(shared["shared_with_me"][0]["href"], path);
+    assert_eq!(
+        shared["shared_with_me"][0]["name"],
+        "Shared owner private name"
+    );
+    sharing_default_and_sort_contracts(test, owner_id, reader_id).await;
+    sharing_response_contracts(test, owner_id, reader_id).await;
+    sharing_pin_contracts(test, owner_id, reader_id).await;
+    sharing_scan_transition_contracts(test, owner_id, reader_id).await;
+    sharing_rotation_contracts(test, owner_id, reader_id).await;
+    sharing_trace_contracts(test, owner_id, reader_id).await;
+    sharing_recovery_contracts(test, owner_id, reader_id).await;
+    let mut edit = request.clone();
+    edit["level"] = json!("edit");
+    assert_eq!(
+        za_post("shares/grant", &edit).await.expect(200)["changed"],
+        true
+    );
+    let revoke = json!({"username":owner_name,"password":STRONG,"calendar":"http-sharing","grant":reader_id});
+    assert_eq!(
+        za_post("shares/revoke", &revoke).await.expect(200),
+        json!({"ok":true,"changed":true})
+    );
+    assert_eq!(
+        za_post("shares/revoke", &revoke).await.expect(200),
+        json!({"ok":true,"changed":false})
+    );
+    assert_eq!(za_post("shares/revoke",&json!({"username":owner_name,"password":STRONG,"calendar":"http-sharing","address":"no-sharing-grant@example.com"})).await.expect(200)["changed"],false);
+    assert_eq!(
+        za_post("shares", &json!({"username":reader_name,"password":STRONG}))
+            .await
+            .expect(200)["shared_with_me"],
+        json!([])
+    );
+    client
+        .request("DELETE", path, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    let _ = client
+        .request(
+            "DELETE",
+            "/dav/cal/shares-http-owner%40example.com/default/",
+            "",
+        )
+        .await;
+    test.wait_for_tasks().await;
+}
+
+/// Exact pin classifications are read-only, even with an unavailable private wrap.
+async fn sharing_pin_contracts(test: &TestServer, owner: u32, reader: u32) {
+    use crate::utils::za::*;
+    use serde_json::json;
+    use vault::{
+        keys::display_fingerprint,
+        pins::{PinSource, ZaPinRecord},
+    };
+    const USER: &str = "shares-http-owner@example.com";
+    const TARGET: &str = "shares-http-reader@example.com";
+    let request = json!({"username":USER,"password":STRONG,"calendar":"http-sharing","address":TARGET,"level":"view"});
+    let original_pins = raw_pins(test, owner).await.unwrap();
+    let original_wrap = saved_wrap(test, owner).await;
+    let original_public = test
+        .server
+        .za_served_public_key(owner)
+        .await
+        .unwrap()
+        .unwrap();
+    let substituted_public = writer_key();
+    substitute_public_key(test, owner, &substituted_public, true).await;
+    let id = resource_id(test, owner, "http-sharing").await;
+    let keys = za_unlock(test, owner, STRONG).await;
+    let before = za_owned_calendar_context(&test.server, &keys, id)
+        .await
+        .unwrap()
+        .stored;
+    for (mark, expected) in [
+        ("pinned", "pin record missing"),
+        ("legacy", "contact not pinned"),
+        ("neither", "vault record missing"),
+    ] {
+        match mark {
+            "pinned" => restore_wrap(test, owner, &original_wrap).await,
+            "legacy" => rewrap_legacy(test, owner, STRONG).await,
+            _ => restore_wrap(test, owner, &[0; 72]).await,
+        }
+        let mut wrong_version = ZaPinRecord::new();
+        wrong_version.version = 99;
+        write_pin_record(test, owner, STRONG, &wrong_version).await;
+        let invalid_version = raw_pins(test, owner).await.unwrap();
+        let malformed = vault::keys::seal(
+            keys.mk(),
+            &vault::keys::aad(vault::keys::AAD_PINS, owner),
+            &[0; 256],
+        );
+        for raw in [
+            None,
+            Some(vec![0x7f; 32]),
+            Some(invalid_version),
+            Some(malformed),
+        ] {
+            set_raw_pins(test, owner, raw.as_deref()).await;
+            let revision = vault_revision(test, owner).await;
+            http::api::shares::test::take_private_outcomes(owner);
+            common::za::test_hooks::set_private_key_fail(Some(owner));
+            assert_eq!(
+                za_post("shares/grant", &request).await.expect(409)["error"],
+                expected
+            );
+            let outcomes = http::api::shares::test::take_private_outcomes(owner);
+            assert!(
+                !outcomes.is_empty() && outcomes.iter().all(|has_private| !has_private),
+                "fresh sharing keys published a lazy private-key outcome"
+            );
+            assert_eq!(raw_pins(test, owner).await, raw);
+            assert_eq!(vault_revision(test, owner).await, revision);
+            assert_eq!(
+                test.server.za_served_public_key(owner).await.unwrap(),
+                Some(substituted_public),
+                "grant refusal must not repair the owner public key"
+            );
+            // This proves no self-check admission, not zero transient mark unwraps.
+            assert!(common::za::test_hooks::take_private_key_fail(owner));
+            let fresh = za_unlock(test, owner, STRONG).await;
+            assert!(fresh.private_key().is_none());
+            assert_eq!(
+                za_owned_calendar_context(&test.server, &fresh, id)
+                    .await
+                    .unwrap()
+                    .stored
+                    .version,
+                before.version
+            );
+        }
+    }
+    // Usable matching pins need neither the mark nor a private-key self-check.
+    restore_wrap(test, owner, &[0; 72]).await;
+    for source in [PinSource::FirstUse, PinSource::Confirmed] {
+        let mut pins = ZaPinRecord::new();
+        pins.set_pin(
+            TARGET,
+            test.server
+                .za_served_public_key(reader)
+                .await
+                .unwrap()
+                .unwrap(),
+            source,
+            1,
+        );
+        write_pin_record(test, owner, STRONG, &pins).await;
+        common::za::test_hooks::set_private_key_fail(Some(owner));
+        assert_eq!(
+            za_post("shares/grant", &request).await.expect(200)["changed"],
+            false
+        );
+        assert!(common::za::test_hooks::take_private_key_fail(owner));
+    }
+    // Revoke has no pin or mark precondition and can rotate using only the ledger.
+    set_raw_pins(test, owner, None).await;
+    common::za::test_hooks::set_private_key_fail(Some(owner));
+    assert_eq!(
+        za_post(
+            "shares/revoke",
+            &json!({"username":USER,"password":STRONG,"calendar":"http-sharing","grant":reader})
+        )
+        .await
+        .expect(200)["changed"],
+        true
+    );
+    assert!(common::za::test_hooks::take_private_key_fail(owner));
+    set_raw_pins(test, owner, Some(&original_pins)).await;
+    common::za::test_hooks::set_private_key_fail(Some(owner));
+    assert_eq!(
+        za_post("shares/grant", &request).await.expect(200)["changed"],
+        true
+    );
+    assert!(common::za::test_hooks::take_private_key_fail(owner));
+    restore_wrap(test, owner, &original_wrap).await;
+    substitute_public_key(test, owner, &original_public, true).await;
+    set_raw_pins(test, owner, Some(&original_pins)).await;
+    super::pinning::pin(
+        USER,
+        TARGET,
+        &display_fingerprint(
+            &test
+                .server
+                .za_served_public_key(reader)
+                .await
+                .unwrap()
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect(200);
+    za_post("shares/grant", &request).await.expect(200);
+}
+
+async fn sharing_rotation_contracts(test: &mut TestServer, owner: u32, reader: u32) {
+    use crate::utils::za::{saved_wrap, substitute_public_key, za_post, za_post_from};
+    use groupware::calendar::sharing::format::{open_grant_ring, parse_grant_header};
+    use registry::{
+        schema::{
+            prelude::{ObjectType, Property},
+            structs::EmailAlias,
+        },
+        types::list::List,
+    };
+    use serde_json::{Value, json};
+    use vault::keys::{display_fingerprint, generate_keypair, unwrap_private_key};
+    const USER: &str = "shares-http-owner@example.com";
+    const READER: &str = "shares-http-reader@example.com";
+    const SECOND: &str = "shares-http-second@example.com";
+    const ALIAS: &str = "sharing-alias@share-alias.test";
+    let second = test
+        .account("admin@example.com")
+        .create_key_user_account(SECOND, STRONG, "Second reader", &[], user_permissions())
+        .await;
+    let second_id = second.id().document_id();
+    test.insert_account(second);
+    let key = test
+        .server
+        .za_served_public_key(second_id)
+        .await
+        .unwrap()
+        .unwrap();
+    super::pinning::pin(USER, SECOND, &display_fingerprint(&key))
+        .await
+        .expect(200);
+    let request = |address: &str, level: &str| json!({"username":USER,"password":STRONG,"calendar":"http-sharing","address":address,"level":level});
+    let list = |name: &str| json!({"username":name,"password":STRONG});
+    let id = resource_id(test, owner, "http-sharing").await;
+    let owner_keys = za_unlock(test, owner, STRONG).await;
+    let mut event_versions = Vec::new();
+    for name in ["sealed.ics", "plain.ics"] {
+        let event_id = resource_id(test, owner, &format!("http-sharing/{name}")).await;
+        event_versions.push((event_id, event_archive(test, owner, event_id).await));
+    }
+    let previous = sharing_http_ring(test, &owner_keys, id).await.unwrap();
+    let original = previous
+        .1
+        .grants
+        .iter()
+        .find(|g| g.account_id == reader)
+        .unwrap()
+        .clone();
+    // A separately pinned alias identifies the stable account id; address and time stay recorded.
+    let domain = test
+        .account("admin@example.com")
+        .find_or_create_domain("share-alias.test")
+        .await;
+    let aliases = List::from_iter([EmailAlias {
+        name: "sharing-alias".into(),
+        domain_id: domain,
+        enabled: true,
+        description: None,
+    }]);
+    test.account("admin@example.com")
+        .registry_update_object(
+            ObjectType::Account,
+            test.account(READER).id(),
+            json!({Property::Aliases:aliases}),
+        )
+        .await;
+    let reader_key = test
+        .server
+        .za_served_public_key(reader)
+        .await
+        .unwrap()
+        .unwrap();
+    super::pinning::pin(USER, ALIAS, &display_fingerprint(&reader_key))
+        .await
+        .expect(200);
+    assert_eq!(
+        za_post("shares/grant", &request(ALIAS, "edit"))
+            .await
+            .expect(200)["changed"],
+        true
+    );
+    let current = sharing_http_ring(test, &owner_keys, id).await.unwrap();
+    let stored = za_owned_calendar_context(&test.server, &owner_keys, id)
+        .await
+        .unwrap()
+        .stored
+        .deserialize::<Calendar>()
+        .unwrap();
+    assert_eq!(
+        stored
+            .acls
+            .iter()
+            .find(|a| a.account_id == reader)
+            .unwrap()
+            .grants
+            .bitmap,
+        123
+    );
+    assert_eq!(
+        current.0.generations, previous.0.generations,
+        "level changes must not rotate"
+    );
+    let aliased = current
+        .1
+        .grants
+        .iter()
+        .find(|g| g.account_id == reader)
+        .unwrap();
+    assert_eq!(
+        (
+            aliased.address.as_str(),
+            aliased.granted_at,
+            aliased.change_id
+        ),
+        (
+            original.address.as_str(),
+            original.granted_at,
+            original.change_id
+        )
+    );
+    za_post("shares/grant", &request(SECOND, "view"))
+        .await
+        .expect(200);
+    // Reassigned recorded address and a separately granted account must refuse ambiguity.
+    let recorded_alias = request(ALIAS, "view");
+    // First make the reader's recorded address the alias by revoke and new grant.
+    za_post(
+        "shares/revoke",
+        &json!({"username":USER,"password":STRONG,"calendar":"http-sharing","grant":reader}),
+    )
+    .await
+    .expect(200);
+    za_post("shares/grant", &recorded_alias).await.expect(200);
+    assert_eq!(
+        za_post(
+            "shares/revoke",
+            &json!({"username":USER,"password":STRONG,"calendar":"http-sharing","address":READER})
+        )
+        .await
+        .expect(200)["changed"],
+        true
+    );
+    za_post("shares/grant", &recorded_alias).await.expect(200);
+    test.account("admin@example.com")
+        .registry_update_object(
+            ObjectType::Account,
+            test.account(READER).id(),
+            json!({Property::Aliases:List::<EmailAlias>::from_iter([])}),
+        )
+        .await;
+    let aliases = List::from_iter([EmailAlias {
+        name: "sharing-alias".into(),
+        domain_id: domain,
+        enabled: true,
+        description: None,
+    }]);
+    test.account("admin@example.com")
+        .registry_update_object(
+            ObjectType::Account,
+            test.account(SECOND).id(),
+            json!({Property::Aliases:aliases}),
+        )
+        .await;
+    let before = sharing_http_ring(test, &owner_keys, id)
+        .await
+        .unwrap()
+        .0
+        .generations;
+    let ambiguous = za_post(
+        "shares/revoke",
+        &json!({"username":USER,"password":STRONG,"calendar":"http-sharing","address":ALIAS}),
+    )
+    .await
+    .expect(409);
+    assert_eq!(ambiguous["error"], "address is ambiguous, revoke by grant");
+    assert_eq!(
+        sharing_http_ring(test, &owner_keys, id)
+            .await
+            .unwrap()
+            .0
+            .generations,
+        before
+    );
+    // Alias cycle: both grants may legitimately record the same address. A
+    // move back to the first ledger row must not make .find() pick that row.
+    za_post(
+        "shares/revoke",
+        &json!({"username":USER,"password":STRONG,"calendar":"http-sharing","grant":second_id}),
+    )
+    .await
+    .expect(200);
+    super::pinning::pin(USER, ALIAS, &display_fingerprint(&key))
+        .await
+        .expect(200);
+    za_post("shares/grant", &request(ALIAS, "view"))
+        .await
+        .expect(200);
+    test.account("admin@example.com")
+        .registry_update_object(
+            ObjectType::Account,
+            test.account(SECOND).id(),
+            json!({Property::Aliases:List::<EmailAlias>::from_iter([])}),
+        )
+        .await;
+    let aliases = List::from_iter([EmailAlias {
+        name: "sharing-alias".into(),
+        domain_id: domain,
+        enabled: true,
+        description: None,
+    }]);
+    test.account("admin@example.com")
+        .registry_update_object(
+            ObjectType::Account,
+            test.account(READER).id(),
+            json!({Property::Aliases:aliases}),
+        )
+        .await;
+    let duplicate_before = za_owned_calendar_context(&test.server, &owner_keys, id)
+        .await
+        .unwrap()
+        .stored
+        .version;
+    assert_eq!(
+        za_post(
+            "shares/revoke",
+            &json!({"username":USER,"password":STRONG,"calendar":"http-sharing","address":ALIAS})
+        )
+        .await
+        .expect(409)["error"],
+        "address is ambiguous, revoke by grant"
+    );
+    assert_eq!(
+        za_owned_calendar_context(&test.server, &owner_keys, id)
+            .await
+            .unwrap()
+            .stored
+            .version,
+        duplicate_before
+    );
+    test.account("admin@example.com")
+        .registry_update_object(
+            ObjectType::Account,
+            test.account(READER).id(),
+            json!({Property::Aliases:List::<EmailAlias>::from_iter([])}),
+        )
+        .await;
+    let aliases = List::from_iter([EmailAlias {
+        name: "sharing-alias".into(),
+        domain_id: domain,
+        enabled: true,
+        description: None,
+    }]);
+    test.account("admin@example.com")
+        .registry_update_object(
+            ObjectType::Account,
+            test.account(SECOND).id(),
+            json!({Property::Aliases:aliases}),
+        )
+        .await;
+    za_post(
+        "shares/revoke",
+        &json!({"username":USER,"password":STRONG,"calendar":"http-sharing","grant":second_id}),
+    )
+    .await
+    .expect(200);
+    za_post("shares/grant", &request(SECOND, "view"))
+        .await
+        .expect(200);
+    // Rotation must use the second grantee's ledger key, even if directory key changed.
+    let reader_keys = za_unlock(test, second_id, STRONG).await;
+    let original_wrap = saved_wrap(test, second_id).await;
+    let (private, original_mark) =
+        unwrap_private_key(&original_wrap, reader_keys.mk(), second_id).unwrap();
+    let (replacement, replacement_private) = generate_keypair();
+    substitute_public_key(test, second_id, &replacement, true).await;
+    let listed = za_post("shares", &list(USER)).await.expect(200);
+    let grants = listed["calendars"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["calendar"] == "http-sharing")
+        .unwrap()["grants"]
+        .as_array()
+        .unwrap();
+    assert_eq!(
+        grants.iter().find(|g| g["grant"] == second_id).unwrap()["state"],
+        "key changed"
+    );
+    let revoke =
+        json!({"username":USER,"password":STRONG,"calendar":"http-sharing","grant":reader});
+    assert_eq!(
+        za_post("shares/revoke", &revoke).await.expect(200)["changed"],
+        true
+    );
+    let context = za_owned_calendar_context(&test.server, &owner_keys, id)
+        .await
+        .unwrap();
+    let cal = context.stored.deserialize::<Calendar>().unwrap();
+    let entry = cal
+        .preferences
+        .iter()
+        .find(|p| p.account_id == second_id)
+        .unwrap();
+    let bytes = STANDARD
+        .decode(
+            entry
+                .name
+                .strip_prefix("$za$")
+                .unwrap()
+                .split('|')
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+    let (header, _) = open_grant_ring(
+        &bytes,
+        owner,
+        id,
+        second_id,
+        *context.domain.domain_id().unwrap(),
+        &private,
+    )
+    .unwrap();
+    assert_eq!(
+        header.generations,
+        sharing_http_ring(test, &owner_keys, id)
+            .await
+            .unwrap()
+            .0
+            .generations
+    );
+    // Same-level re-key rotates once, preserves the grant id/time boundary/address,
+    // and must evict the grantee's resident keys despite unchanged ACL bits.
+    super::pinning::pin(USER, SECOND, &display_fingerprint(&replacement))
+        .await
+        .expect(200);
+    let second_client = DummyWebDavClient::new(second_id, SECOND, STRONG, SECOND);
+    second_client
+        .request("PROPFIND", "/dav/cal/shares-http-second%40example.com/", "")
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    assert_eq!(
+        test.server.za_served_public_key(second_id).await.unwrap(),
+        Some(key),
+        "assisted listing repaired the intentionally mismatched served key"
+    );
+    assert!(
+        !test.server.inner.cache.za_keys.contains_account(second_id),
+        "self-check repair invalidates the just-authenticated cache entry"
+    );
+    // A real reset changes both pieces of the keypair. Seed residency using an
+    // owned EWK-only event read, which never tries to open the old incoming ring.
+    crate::utils::za::restore_wrap(
+        test,
+        second_id,
+        &vault::keys::wrap_private_key(
+            &replacement_private,
+            reader_keys.mk(),
+            second_id,
+            original_mark,
+        ),
+    )
+    .await;
+    substitute_public_key(test, second_id, &replacement, true).await;
+    let own_path = "/dav/cal/shares-http-second%40example.com/rekey-private/";
+    second_client
+        .request("MKCALENDAR", own_path, MKCAL)
+        .await
+        .with_status(StatusCode::CREATED);
+    crate::utils::za::plant_sealed_event(
+        test,
+        second_id,
+        "rekey-private",
+        "own.ics",
+        &sharing_event("rekey-private"),
+        STRONG,
+        &Default::default(),
+    )
+    .await;
+    let revision = crate::utils::za::vault_revision(test, second_id).await;
+    second_client
+        .request("GET", &format!("{own_path}own.ics"), "")
+        .await
+        .with_status(StatusCode::OK);
+    assert_eq!(
+        test.server.za_served_public_key(second_id).await.unwrap(),
+        Some(replacement)
+    );
+    assert_eq!(
+        crate::utils::za::vault_revision(test, second_id).await,
+        revision
+    );
+    assert!(test.server.inner.cache.za_keys.contains_account(second_id));
+    super::pinning::pin(USER, SECOND, &display_fingerprint(&replacement))
+        .await
+        .expect(200);
+    let live_before = vault::session::live::session_keys(second_id);
+    let before = sharing_http_ring(test, &owner_keys, id).await.unwrap();
+    let old = before
+        .1
+        .grants
+        .iter()
+        .find(|g| g.account_id == second_id)
+        .unwrap()
+        .clone();
+    za_post("shares/grant", &request(SECOND, "view"))
+        .await
+        .expect(200);
+    assert!(!test.server.inner.cache.za_keys.contains_account(second_id));
+    assert!(vault::session::live::session_keys(second_id) < live_before);
+    let after = sharing_http_ring(test, &owner_keys, id).await.unwrap();
+    assert_eq!(after.0.generations.len(), before.0.generations.len() + 1);
+    let new = after
+        .1
+        .grants
+        .iter()
+        .find(|g| g.account_id == second_id)
+        .unwrap();
+    assert_eq!(
+        (new.address.as_str(), new.change_id),
+        (old.address.as_str(), old.change_id)
+    );
+    let cal = za_owned_calendar_context(&test.server, &owner_keys, id)
+        .await
+        .unwrap()
+        .stored
+        .deserialize::<Calendar>()
+        .unwrap();
+    let bytes = STANDARD
+        .decode(
+            cal.preferences
+                .iter()
+                .find(|p| p.account_id == second_id)
+                .unwrap()
+                .name
+                .strip_prefix("$za$")
+                .unwrap()
+                .split('|')
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        open_grant_ring(
+            &bytes,
+            owner,
+            id,
+            second_id,
+            after.0.domain_id,
+            &replacement_private
+        )
+        .unwrap()
+        .0
+        .generations,
+        after.0.generations
+    );
+    assert_eq!(
+        parse_grant_header(&bytes).unwrap().grant_change_id,
+        old.change_id
+    );
+    // Business refusals after valid authentication do not spend the fail2ban budget.
+    for _ in 0..12 {
+        assert_eq!(
+            za_post_from(
+                "10.0.40.1",
+                "shares/grant",
+                &request("missing-sharing-contact@example.com", "view")
+            )
+            .await
+            .expect(409)["error"],
+            "not a key account"
+        );
+    }
+    za_post_from("10.0.40.1", "shares", &list(USER))
+        .await
+        .expect(200);
+    assert_eq!(
+        za_post("shares", &list(SECOND)).await.expect(200)["shared_with_me"][0]["name"],
+        "Shared owner private name"
+    );
+    // Remove the alternate alias grant via the account's primary address.
+    assert_eq!(
+        za_post(
+            "shares/revoke",
+            &json!({"username":USER,"password":STRONG,"calendar":"http-sharing","address":SECOND})
+        )
+        .await
+        .expect(200)["changed"],
+        true
+    );
+    second_client
+        .request("DELETE", own_path, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    crate::utils::za::restore_wrap(test, second_id, &original_wrap).await;
+    substitute_public_key(test, second_id, &key, true).await;
+    // A fresh later grant receives every surviving generation.
+    za_post("shares/grant", &request(READER, "view"))
+        .await
+        .expect(200);
+    let after = sharing_http_ring(test, &owner_keys, id).await.unwrap();
+    let cal = za_owned_calendar_context(&test.server, &owner_keys, id)
+        .await
+        .unwrap()
+        .stored
+        .deserialize::<Calendar>()
+        .unwrap();
+    let bytes = STANDARD
+        .decode(
+            cal.preferences
+                .iter()
+                .find(|p| p.account_id == reader)
+                .unwrap()
+                .name
+                .strip_prefix("$za$")
+                .unwrap()
+                .split('|')
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        parse_grant_header(&bytes).unwrap().generations,
+        after.0.generations
+    );
+    let _: Value = za_post("shares", &list(USER)).await.expect(200);
+    for (event_id, before) in event_versions {
+        let after = event_archive(test, owner, event_id).await;
+        assert_eq!(after.version, before.version);
+        assert_eq!(after.as_bytes(), before.as_bytes());
+    }
+}
+
+pub(super) fn sharing_event(uid: &str) -> String {
+    EVENT.replace("share-read-UID", uid)
+}
+
+async fn sharing_http_ring(
+    test: &TestServer,
+    keys: &vault::session::SessionKeys,
+    id: u32,
+) -> Option<(OwnerRingHeader, ZaOwnerRing)> {
+    let context = za_owned_calendar_context(&test.server, keys, id)
+        .await
+        .unwrap();
+    if context.domain.calendar_id().is_none() {
+        return None;
+    }
+    let calendar = context.stored.deserialize::<Calendar>().unwrap();
+    let entry = calendar
+        .preferences
+        .iter()
+        .find(|p| p.account_id == keys.account_id)
+        .unwrap();
+    Some(
+        groupware::calendar::sharing::format::open_owner_ring(
+            &STANDARD
+                .decode(
+                    entry
+                        .name
+                        .strip_prefix("$za$")
+                        .unwrap()
+                        .split('|')
+                        .next()
+                        .unwrap(),
+                )
+                .unwrap(),
+            keys.account_id,
+            id,
+            keys.ewk(),
+        )
+        .unwrap(),
+    )
+}
+
+async fn sharing_response_contracts(test: &mut TestServer, owner: u32, reader: u32) {
+    use crate::utils::za::{SERVER_URL, code, totp_url, za_app_password, za_post, za_post_from};
+    use registry::schema::{enums::Permission, prelude::Property, structs::Sharing};
+    use serde_json::json;
+    const USER: &str = "shares-http-owner@example.com";
+    let credentials = json!({"username":USER,"password":STRONG});
+    let base = json!({"username":USER,"password":STRONG,"calendar":"http-sharing","address":"shares-http-reader@example.com","level":"view"});
+    for (field, value) in [
+        ("calendar", json!("bad/slug")),
+        ("calendar", json!("x".repeat(256))),
+        ("calendar", json!("é".repeat(128))),
+        ("address", json!("mailto:bad@example.com")),
+        ("level", json!("owner")),
+    ] {
+        let mut body = base.clone();
+        body[field] = value;
+        body["password"] = json!("invalid");
+        assert_eq!(
+            za_post_from("10.0.40.2", "shares/grant", &body)
+                .await
+                .expect(400)["status"],
+            400
+        );
+    }
+    for slug in [
+        "missing".to_owned(),
+        "x".repeat(255),
+        "é".repeat(127),
+        "inbox".to_owned(),
+        "outbox".to_owned(),
+    ] {
+        let mut body = base.clone();
+        body["calendar"] = json!(slug);
+        assert_eq!(
+            za_post("shares/grant", &body).await.expect(409)["error"],
+            "unknown calendar"
+        );
+    }
+    for address in ["plain@example.com", "not-known-sharing@example.com"] {
+        let mut body = base.clone();
+        body["address"] = json!(address);
+        assert_eq!(
+            za_post("shares/grant", &body).await.expect(409)["error"],
+            "not a key account"
+        );
+    }
+    let group = test
+        .account("admin@example.com")
+        .create_group_account("share-refusal-group@example.com", "Share group", &[])
+        .await;
+    test.insert_account(group);
+    let pending = test
+        .account("admin@example.com")
+        .create_passwordless_user_account(
+            "share-refusal-pending@example.com",
+            STRONG,
+            "Pending",
+            &[],
+            user_permissions(),
+        )
+        .await;
+    test.insert_account(pending);
+    for address in [
+        "share-refusal-group@example.com",
+        "share-refusal-pending@example.com",
+    ] {
+        let mut body = base.clone();
+        body["address"] = json!(address);
+        assert_eq!(
+            za_post("shares/grant", &body).await.expect(409)["error"],
+            "not a key account"
+        );
+    }
+    let mut own = base.clone();
+    own["address"] = json!(USER);
+    assert_eq!(
+        za_post("shares/grant", &own).await.expect(409)["error"],
+        "cannot share with yourself"
+    );
+    assert_eq!(
+        za_post(
+            "shares",
+            &json!({"username":"plain@example.com","password":"plain secret with entropy 9"})
+        )
+        .await
+        .expect(409)["error"],
+        "not a zero-access account"
+    );
+    let mut master = credentials.clone();
+    master["username"] = json!("admin%shares-http-owner@example.com");
+    za_post("shares", &master).await.expect(400);
+    let app = za_app_password(USER, STRONG, "sharing request refusal").await;
+    let mut app_body = credentials.clone();
+    app_body["password"] = json!(app);
+    za_post("shares", &app_body).await.expect(400);
+    let mut wrong = credentials.clone();
+    wrong["password"] = json!("wrong");
+    za_post_from("10.0.40.3", "shares", &wrong)
+        .await
+        .expect(401);
+    // TOTP preserves the inherited 402/401 path, including successful current-code login.
+    let url = totp_url();
+    za_post(
+        "totp",
+        &json!({"username":USER,"password":STRONG,"otp_auth":url,"confirm":code(&url)}),
+    )
+    .await
+    .expect(200);
+    za_post_from("10.0.40.4", "shares", &credentials)
+        .await
+        .expect(402);
+    za_post(
+        "shares",
+        &json!({"username":USER,"password":STRONG,"totp":code(&url)}),
+    )
+    .await
+    .expect(200);
+    za_post(
+        "totp",
+        &json!({"username":USER,"password":STRONG,"totp":code(&url),"otp_auth":null}),
+    )
+    .await
+    .expect(200);
+    let restricted = test
+        .account("admin@example.com")
+        .create_key_user_account(
+            "sharing-no-acl@example.com",
+            STRONG,
+            "No ACL",
+            &[],
+            vec![Permission::UnlimitedRequests, Permission::UnlimitedUploads],
+        )
+        .await;
+    test.insert_account(restricted);
+    test.account("admin@example.com").registry_update_object(registry::schema::prelude::ObjectType::Account,test.account("sharing-no-acl@example.com").id(),json!({Property::Permissions:registry::schema::structs::Permissions::Merge(registry::schema::structs::PermissionsList {disabled_permissions:registry::types::map::Map::new(vec![Permission::DavCalAcl]),..Default::default()})})).await;
+
+    let mut denied = base.clone();
+    denied["username"] = json!("sharing-no-acl@example.com");
+    assert_eq!(
+        za_post("shares/grant", &denied).await.expect(403)["status"],
+        403
+    );
+    let no_permission = za_post(
+        "shares",
+        &json!({"username":"sharing-no-acl@example.com","password":STRONG}),
+    )
+    .await
+    .expect(200);
+    assert_eq!(
+        no_permission["calendars"],
+        json!([]),
+        "list must not create a default calendar"
+    );
+    // The anonymous request budget is inherited by all three sharing routes.
+    test.reload_core();
+    let previous_rate = test.server.core.network.http.rate_anonymous.clone();
+    test.account("admin@example.com")
+        .registry_update_setting(
+            registry::schema::structs::Http {
+                rate_limit_anonymous: Some(registry::schema::structs::Rate {
+                    count: 1,
+                    period: registry::types::duration::Duration::from_millis(60000),
+                }),
+                ..Default::default()
+            },
+            &[Property::RateLimitAnonymous],
+        )
+        .await;
+    test.account("admin@example.com").reload_settings().await;
+    test.reload_core();
+    za_post_from("10.0.40.6", "shares", &credentials)
+        .await
+        .expect(200);
+    assert_eq!(
+        za_post_from("10.0.40.6", "shares", &credentials)
+            .await
+            .expect(429)["status"],
+        429
+    );
+    test.account("admin@example.com")
+        .registry_update_setting(
+            registry::schema::structs::Http {
+                rate_limit_anonymous: previous_rate,
+                ..Default::default()
+            },
+            &[Property::RateLimitAnonymous],
+        )
+        .await;
+    test.account("admin@example.com").reload_settings().await;
+    test.reload_core();
+    // Existing vault response machinery supplies no-store and both body shapes.
+    test.server
+        .inner
+        .cache
+        .set_za_account_page_origin(Some(super::ACCOUNT_PAGE_ORIGIN.parse().unwrap()));
+    for (endpoint, body, status) in [
+        ("shares", credentials.clone(), 200),
+        ("shares/grant", own, 409),
+    ] {
+        let response = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap()
+            .post(format!("{SERVER_URL}/api/vault/{endpoint}"))
+            .header("Origin", super::ACCOUNT_PAGE_ORIGIN)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), status);
+        assert_eq!(
+            response.headers().get("cache-control").unwrap(),
+            "no-store, no-cache, must-revalidate"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap(),
+            super::ACCOUNT_PAGE_ORIGIN
+        );
+    }
+    test.server.inner.cache.set_za_account_page_origin(None);
+    // maxShares refuses before conversion, so no journal/DEK work is published.
+    let previous = test.server.core.groupware.max_shares_per_item;
+    test.account("admin@example.com")
+        .registry_update_setting(
+            Sharing {
+                max_shares: 1,
+                ..Default::default()
+            },
+            &[Property::MaxShares],
+        )
+        .await;
+    test.account("admin@example.com").reload_settings().await;
+    test.reload_core();
+    let existing = resource_id(test, owner, "http-sharing").await;
+    let before = za_owned_calendar_context(
+        &test.server,
+        &*za_unlock(test, owner, STRONG).await,
+        existing,
+    )
+    .await
+    .unwrap()
+    .stored
+    .version;
+    let target = test.account("key2@example.com").id().document_id();
+    super::pinning::pin(
+        USER,
+        "key2@example.com",
+        &vault::keys::display_fingerprint(
+            &test
+                .server
+                .za_served_public_key(target)
+                .await
+                .unwrap()
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect(200);
+    let mut limited = base.clone();
+    limited["address"] = json!("key2@example.com");
+    assert_eq!(
+        za_post("shares/grant", &limited).await.expect(409)["error"],
+        "too many shares"
+    );
+    assert_eq!(
+        za_owned_calendar_context(
+            &test.server,
+            &*za_unlock(test, owner, STRONG).await,
+            existing
+        )
+        .await
+        .unwrap()
+        .stored
+        .version,
+        before
+    );
+    test.account("admin@example.com")
+        .registry_update_setting(
+            Sharing {
+                max_shares: previous as u64,
+                ..Default::default()
+            },
+            &[Property::MaxShares],
+        )
+        .await;
+    test.account("admin@example.com").reload_settings().await;
+    test.reload_core();
+    let keys = za_unlock(test, owner, STRONG).await;
+    // A pending boundary in a list remains pending and leaves the archive untouched.
+    let id = resource_id(test, owner, "http-sharing").await;
+    let context = za_owned_calendar_context(&test.server, &keys, id)
+        .await
+        .unwrap();
+    let mut calendar = context.stored.deserialize::<Calendar>().unwrap();
+    groupware::calendar::sharing::boundary::mark_boundary_pending(&mut calendar, &context.domain)
+        .unwrap();
+    update_calendar(test, owner, id, &context.stored, calendar).await;
+    let pending = za_owned_calendar_context(&test.server, &keys, id)
+        .await
+        .unwrap();
+    assert!(pending.boundary.unwrap().pending);
+    za_post("shares", &credentials).await.expect(200);
+    let after = za_owned_calendar_context(&test.server, &keys, id)
+        .await
+        .unwrap();
+    assert_eq!(after.stored.version, pending.stored.version);
+    assert!(after.boundary.unwrap().pending);
+    assert_eq!(
+        za_post("shares/grant", &base).await.expect(200)["changed"],
+        true,
+        "a boundary-only completion is a write"
+    );
+    assert!(
+        !za_owned_calendar_context(&test.server, &keys, id)
+            .await
+            .unwrap()
+            .boundary
+            .unwrap()
+            .pending
+    );
+    http::api::shares::test::take_private_outcomes(owner);
+    let _ = reader;
+}
+
+async fn sharing_trace_contracts(test: &TestServer, owner: u32, reader: u32) {
+    use crate::utils::za::{plant_event, za_post, za_post_from};
+    use serde_json::json;
+    const USER: &str = "shares-http-owner@example.com";
+    const TARGET: &str = "shares-http-reader@example.com";
+    let client = DummyWebDavClient::new(owner, USER, STRONG, USER);
+    let path = "/dav/cal/shares-http-owner%40example.com/trace/";
+    client
+        .request(
+            "MKCALENDAR",
+            path,
+            MKCAL.replace("Shared owner private name", "share-display-canary-7"),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    plant_event(
+        test,
+        owner,
+        "trace",
+        "old.ics",
+        &EVENT
+            .replace("share-read-UID", "share-trace-uid-canary-7")
+            .replace("share-read-private-summary", "share-trace-summary-canary-7"),
+        None,
+    )
+    .await;
+    let request = json!({"username":USER,"password":STRONG,"calendar":"trace","address":TARGET,"level":"view"});
+    let captured = super::mail::Traced::start(trc::EventType::variants());
+    za_post("shares/grant", &request).await.expect(200);
+    za_post(
+        "shares/revoke",
+        &json!({"username":USER,"password":STRONG,"calendar":"trace","grant":reader}),
+    )
+    .await
+    .expect(200);
+    let mut bad = request.clone();
+    bad["password"] = json!("share-wrong-password-canary-7");
+    za_post_from("10.0.40.5", "shares/grant", &bad)
+        .await
+        .expect(401);
+    let mut events = captured.finish().await;
+    super::pinning::forget(USER, Some(TARGET)).await.expect(200);
+    let captured = super::mail::Traced::start(trc::EventType::variants());
+    assert_eq!(
+        za_post("shares/grant", &request).await.expect(409)["error"],
+        "contact not pinned"
+    );
+    events.extend(captured.finish().await);
+    let public = test
+        .server
+        .za_served_public_key(reader)
+        .await
+        .unwrap()
+        .unwrap();
+    let fingerprint = vault::keys::display_fingerprint(&public);
+    let mut inherited_success = false;
+    for event in &events {
+        for (key, value) in &event.keys {
+            let text = format!("{value:?}");
+            if text.contains(USER) {
+                assert!(
+                    *key == trc::Key::AccountName
+                        && matches!(
+                            event.typ,
+                            trc::EventType::Auth(trc::AuthEvent::Success | trc::AuthEvent::Failed)
+                        ),
+                    "owner address escaped inherited auth field: {event:?}"
+                );
+                inherited_success |= event.typ == trc::EventType::Auth(trc::AuthEvent::Success);
+            }
+        }
+        for canary in [
+            TARGET,
+            "sharing-alias@share-alias.test",
+            "share-display-canary-7",
+            "share-trace-uid-canary-7",
+            "share-trace-summary-canary-7",
+            "share-wrong-password-canary-7",
+            fingerprint.as_str(),
+            STANDARD.encode(public).as_str(),
+        ] {
+            assert!(
+                !event.text.contains(canary),
+                "trace exposed {canary}: {event:?}"
+            );
+        }
+    }
+    assert!(
+        inherited_success,
+        "capture must observe inherited auth identity positive control"
+    );
+    let completed = events
+        .iter()
+        .find(|e| e.details == "zero-access: calendar sharing completed")
+        .unwrap();
+    assert_eq!(completed.account_id, Some(owner as u64));
+    assert!(
+        completed
+            .keys
+            .iter()
+            .any(|(k, v)| *k == trc::Key::Size && matches!(v, trc::Value::UInt(1)))
+    );
+    assert!(events.iter().any(|e| {
+        e.details == "zero-access: calendar share entry committed"
+            && e.keys.iter().any(|(k, v)| {
+                *k == trc::Key::Id && matches!(v,trc::Value::UInt(id) if *id==reader as u64)
+            })
+    }));
+    super::pinning::pin(USER, TARGET, &fingerprint)
+        .await
+        .expect(200);
+    client
+        .request("DELETE", path, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+}
+
+async fn sharing_recovery_contracts(test: &mut TestServer, owner: u32, reader: u32) {
+    use crate::utils::za::za_post;
+    use serde_json::json;
+    const USER: &str = "shares-http-owner@example.com";
+    const READER: &str = "shares-http-reader@example.com";
+    const OTHER: &str = "another sharing long passphrase with 77 numbers";
+    let before = za_post("shares", &json!({"username":USER,"password":STRONG}))
+        .await
+        .expect(200);
+    let recovery = test.account(USER).recovery_key.as_ref().unwrap().clone();
+    let renewed = za_post(
+        "recover",
+        &json!({"username":USER,"recovery_key":recovery,"new_password":OTHER}),
+    )
+    .await
+    .str(200, "recovery_key");
+    test.accounts.get_mut(USER).unwrap().recovery_key = Some(renewed);
+    assert_eq!(
+        za_post("shares", &json!({"username":USER,"password":OTHER}))
+            .await
+            .expect(200),
+        before
+    );
+    let owner_client = DummyWebDavClient::new(owner, USER, OTHER, USER);
+    owner_client
+        .request(
+            "GET",
+            "/dav/cal/shares-http-owner%40example.com/http-sharing/sealed.ics",
+            "",
+        )
+        .await
+        .with_status(StatusCode::OK);
+    za_post(
+        "password",
+        &json!({"username":READER,"password":STRONG,"new_password":OTHER}),
+    )
+    .await
+    .expect(200);
+    let listed = za_post("shares", &json!({"username":READER,"password":OTHER}))
+        .await
+        .expect(200);
+    assert_eq!(
+        listed["shared_with_me"][0]["name"],
+        "Shared owner private name"
+    );
+    za_post(
+        "password",
+        &json!({"username":READER,"password":OTHER,"new_password":STRONG}),
+    )
+    .await
+    .expect(200);
+    za_post(
+        "password",
+        &json!({"username":USER,"password":OTHER,"new_password":STRONG}),
+    )
+    .await
+    .expect(200);
+    let _ = reader;
+}
+
+async fn sharing_default_and_sort_contracts(test: &TestServer, owner: u32, reader: u32) {
+    use crate::utils::za::{plant_event, za_post};
+    use serde_json::json;
+    const USER: &str = "shares-http-owner@example.com";
+    const TARGET: &str = "shares-http-reader@example.com";
+    const HOME: &str = "/dav/cal/shares-http-owner%40example.com/";
+    let request = |slug: &str| json!({"username":USER,"password":STRONG,"calendar":slug,"address":TARGET,"level":"view"});
+    let keys = za_unlock(test, owner, STRONG).await;
+    let id = resource_id(test, owner, "default").await;
+    let original = za_owned_calendar_context(&test.server, &keys, id)
+        .await
+        .unwrap()
+        .stored
+        .deserialize::<Calendar>()
+        .unwrap();
+    assert!(!original.preferences[0].name.starts_with("$za$"));
+    plant_event(
+        test,
+        owner,
+        "default",
+        "legacy.ics",
+        &sharing_event("http-default-legacy"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        za_post("shares/grant", &request("default"))
+            .await
+            .expect(200),
+        json!({"ok":true,"changed":true,"rewrapped":0,"sealed":1})
+    );
+    let client = DummyWebDavClient::new(owner, USER, STRONG, USER);
+    client
+        .request("GET", &format!("{HOME}default/legacy.ics"), "")
+        .await
+        .with_status(StatusCode::OK);
+    za_post(
+        "shares/revoke",
+        &json!({"username":USER,"password":STRONG,"calendar":"default","grant":reader}),
+    )
+    .await
+    .expect(200);
+    let own = za_post("shares", &json!({"username":USER,"password":STRONG}))
+        .await
+        .expect(200);
+    let default = own["calendars"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["calendar"] == "default")
+        .unwrap();
+    assert_eq!(default["shared"], true);
+    assert_eq!(default["grants"], json!([]));
+    client
+        .request("DELETE", &format!("{HOME}default/legacy.ics"), "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    // Deliberately create reverse lexical order; listing order cannot pass by id order.
+    for slug in ["sort-z", "sort-a", "sort%20space"] {
+        client
+            .request("MKCALENDAR", &format!("{HOME}{slug}/"), MKCAL)
+            .await
+            .with_status(StatusCode::CREATED);
+        za_post("shares/grant", &request(slug)).await.expect(200);
+    }
+    let own = za_post("shares", &json!({"username":USER,"password":STRONG}))
+        .await
+        .expect(200);
+    let names = own["calendars"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["calendar"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "default",
+            "http-sharing",
+            "sort%20space",
+            "sort-a",
+            "sort-z"
+        ]
+    );
+    let shared = za_post("shares", &json!({"username":TARGET,"password":STRONG}))
+        .await
+        .expect(200);
+    let names = shared["shared_with_me"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["calendar"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec!["http-sharing", "sort%20space", "sort-a", "sort-z"]
+    );
+    assert_eq!(
+        shared["shared_with_me"][1]["href"],
+        format!("{HOME}sort%20space/")
+    );
+    for slug in ["sort-z", "sort-a", "sort%20space"] {
+        client
+            .request("DELETE", &format!("{HOME}{slug}/"), "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+}
+
+async fn sharing_scan_transition_contracts(test: &TestServer, owner: u32, reader: u32) {
+    use crate::utils::za::{plant_sealed_event, za_post};
+    use groupware::calendar::sharing::{
+        convert::ZaShareError,
+        mutations::{ZaShareChange, ZaShareLevel, za_share_apply},
+    };
+    use serde_json::json;
+    const USER: &str = "shares-http-owner@example.com";
+    const READER: &str = "shares-http-reader@example.com";
+    const SLUG: &str = "scan-transition";
+    let path = "/dav/cal/shares-http-owner%40example.com/scan-transition/";
+    let client = DummyWebDavClient::new(owner, USER, STRONG, USER);
+    client
+        .request("MKCALENDAR", path, MKCAL)
+        .await
+        .with_status(StatusCode::CREATED);
+    let id = resource_id(test, owner, SLUG).await;
+    let event = plant_sealed_event(
+        test,
+        owner,
+        SLUG,
+        "history.ics",
+        &sharing_event("scan-transition"),
+        STRONG,
+        &Default::default(),
+    )
+    .await;
+    stage_converting_calendar(test, owner, id).await;
+    let keys = za_unlock(test, owner, STRONG).await;
+    let context = za_owned_calendar_context(&test.server, &keys, id)
+        .await
+        .unwrap();
+    let original = event_archive(test, owner, event).await;
+    let mut valid = original.deserialize::<CalendarEvent>().unwrap();
+    rewrap_event(&mut valid, &context.domain, &context.domain).unwrap();
+    update_event(test, owner, event, &original, valid.clone()).await;
+    let damage = |event: &mut CalendarEvent| {
+        let carrier = event
+            .data
+            .event
+            .components
+            .iter_mut()
+            .flat_map(|c| &mut c.entries)
+            .find(|entry| groupware::calendar::seal::tree::is_carrier(entry, "X-ZA-SEALED"))
+            .unwrap();
+        let calcard::icalendar::ICalendarValue::Text(encoded) = &mut carrier.values[0] else {
+            panic!()
+        };
+        let mut bytes = STANDARD.decode(&*encoded).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        *encoded = STANDARD.encode(bytes);
+    };
+    let good = event_archive(test, owner, event).await;
+    let mut invalid = valid.clone();
+    damage(&mut invalid);
+    update_event(test, owner, event, &good, invalid).await;
+    let damaged = event_archive(test, owner, event).await;
+    client
+        .request("GET", &format!("{path}history.ics"), "")
+        .await
+        .with_status(StatusCode::INTERNAL_SERVER_ERROR);
+    let vault = test.server.za_vault_record(owner).await.unwrap().unwrap();
+    assert_eq!(vault.record.revision, keys.generation);
+    let public_key = test
+        .server
+        .za_served_public_key(reader)
+        .await
+        .unwrap()
+        .unwrap();
+    let pins = test.server.za_pin_read(&keys).await.unwrap();
+    assert_eq!(
+        pins.record
+            .as_ref()
+            .unwrap()
+            .pin(READER)
+            .unwrap()
+            .public_key,
+        public_key
+    );
+    let mut guards = conversion_guards(test, &keys).await;
+    guards.pin_assertion = Some(pins.assertion());
+    assert!(
+        matches!(
+            za_share_apply(
+                &test.server,
+                &keys,
+                id,
+                ZaShareChange::Grant {
+                    account_id: reader,
+                    address: READER.into(),
+                    public_key,
+                    level: ZaShareLevel::View,
+                },
+                &guards
+            )
+            .await,
+            Err(ZaShareError::Seal(_))
+        ),
+        "an invalid unconverted journal cannot publish"
+    );
+    assert_eq!(
+        za_owned_calendar_context(&test.server, &keys, id)
+            .await
+            .unwrap()
+            .stored
+            .version,
+        context.stored.version
+    );
+    assert_eq!(
+        event_archive(test, owner, event).await.version,
+        damaged.version
+    );
+    conversion_ring(test, &keys, id).await.unwrap();
+    update_event(test, owner, event, &damaged, valid.clone()).await;
+    let request =
+        json!({"username":USER,"password":STRONG,"calendar":SLUG,"address":READER,"level":"view"});
+    let first = za_post("shares/grant", &request).await;
+    assert_eq!(
+        first.status, 200,
+        "valid initial publication must succeed: {}",
+        first.body
+    );
+    assert_eq!(
+        first.body,
+        json!({"ok":true,"changed":true,"rewrapped":0,"sealed":0})
+    );
+    assert!(
+        sharing_http_ring(test, &keys, id)
+            .await
+            .unwrap()
+            .1
+            .converted
+    );
+    let good = event_archive(test, owner, event).await;
+    let mut invalid = valid.clone();
+    damage(&mut invalid);
+    update_event(test, owner, event, &good, invalid).await;
+    let damaged = event_archive(test, owner, event).await;
+    client
+        .request("GET", &format!("{path}history.ics"), "")
+        .await
+        .with_status(StatusCode::INTERNAL_SERVER_ERROR);
+    let before = za_owned_calendar_context(&test.server, &keys, id)
+        .await
+        .unwrap()
+        .stored
+        .version;
+    println!(
+        "round1 scan controls: invalid unconverted apply refused without mutation; restored initial publication200; authenticated converted=true; corrupted historical GET500"
+    );
+    let noop = za_post("shares/grant", &request).await;
+    assert_eq!(
+        noop.status, 200,
+        "converted same-key same-level no-op must skip historical payload: {}",
+        noop.body
+    );
+    assert_eq!(
+        noop.body,
+        json!({"ok":true,"changed":false,"rewrapped":0,"sealed":0})
+    );
+    assert_eq!(
+        za_owned_calendar_context(&test.server, &keys, id)
+            .await
+            .unwrap()
+            .stored
+            .version,
+        before
+    );
+    let mut edit = request;
+    edit["level"] = json!("edit");
+    assert_eq!(
+        za_post("shares/grant", &edit).await.expect(200),
+        json!({"ok":true,"changed":true,"rewrapped":0,"sealed":0})
+    );
+    let after = event_archive(test, owner, event).await;
+    assert_eq!(after.version, damaged.version);
+    assert_eq!(after.as_bytes(), damaged.as_bytes());
+    assert_eq!(
+        za_owned_calendar_context(&test.server, &keys, id)
+            .await
+            .unwrap()
+            .stored
+            .deserialize::<Calendar>()
+            .unwrap()
+            .acls[0]
+            .grants
+            .bitmap,
+        123
+    );
+    update_event(test, owner, event, &after, valid).await;
+    client
+        .request("DELETE", path, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
 }

@@ -827,7 +827,10 @@ exactly §4.3/4.4 fields; validate revoke id/address exclusivity before authenti
   no-store, anonymous rate limit, JSON/problem bodies and auth accounting. Expose
   `za_reread_verified` narrowly; additionally compare its record revision with
   `verified.keys.generation` before appending its CAS assertion. Require `DavCalAcl` for
-  mutations. Grant/revoke never open the owner's private key. Share contacts' quiet
+  mutations. Grant/revoke never use the owner's private key for sharing, call its self-check/lazy
+  publication, or repair its public key; only an absent/unusable grant pin permits a transient
+  authenticated wrap-mark unwrap, whose zeroizing Secret is immediately dropped before any further
+  await (accepted T7-M clarification). Share contacts' quiet
   account/key resolution with a helper returning account id plus current served key.
   Preserve primary-password/TOTP failure accounting. Post-verification sharing conflicts,
   including `not a key account`, `contact not pinned`, calendar/alias/state conflicts and

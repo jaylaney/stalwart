@@ -587,3 +587,28 @@ pub fn set_share_restore_assert_fail(failure: Option<ShareAssertFailure>) {
 pub fn take_share_restore_assert_fail(owner_id: u32, calendar_id: u32) -> bool {
     take_share_assert(&SHARE_RESTORE_ASSERT_FAIL, owner_id, calendar_id)
 }
+
+/// One authoritative sharing mutation, after all decisions and before commit.
+pub static SHARE_COMMIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub fn set_share_commit_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SHARE_COMMIT_PAUSE, pause);
+}
+pub async fn share_commit_pause_point(owner: u32) {
+    wait(take_for(&SHARE_COMMIT_PAUSE, owner)).await;
+}
+
+/// Sharing adapter seams for authenticated mark ordering and terminal-loss classification.
+pub static SHARE_PIN_MARK_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SHARE_CONFLICT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub fn set_share_pin_mark_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SHARE_PIN_MARK_PAUSE, pause);
+}
+pub fn set_share_conflict_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SHARE_CONFLICT_PAUSE, pause);
+}
+pub async fn share_pin_mark_pause_point(owner: u32) {
+    wait(take_for(&SHARE_PIN_MARK_PAUSE, owner)).await;
+}
+pub async fn share_conflict_pause_point(owner: u32) {
+    wait(take_for(&SHARE_CONFLICT_PAUSE, owner)).await;
+}
