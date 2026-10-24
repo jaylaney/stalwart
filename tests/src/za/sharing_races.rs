@@ -242,6 +242,7 @@ fn generation(event: &CalendarEvent) -> u32 {
 }
 
 pub async fn test(test: &mut TestServer) {
+    grantee_http_write_races(test).await;
     sharing_http_races(test).await;
     sharing_destruction_contracts(test).await;
     task5_boundary_and_copy_races(test).await;
@@ -2240,11 +2241,24 @@ async fn overwrite_grantee_unlink_authority(
         let original_source = event_archive(test, owner, source).await;
         let original_target = event_archive(test, owner, target).await;
         let old_target = original_target.deserialize::<CalendarEvent>().unwrap();
-        let server = test.server.clone();
-        let moving_token = token.clone();
+        let moving_slugs = slugs.clone();
         let moving = async move {
-            dav::calendar::za_test_move_event(&server, &moving_token, owner, source, a, target, b)
-                .await
+            let response = crate::utils::za::sharing_dav_request(
+                "share-overwrite-writer@example.com",
+                "MOVE",
+                &format!("{HOME}{}/event.ics", moving_slugs[0]),
+                &[(
+                    "destination",
+                    &format!("{HOME}{}/event.ics", moving_slugs[1]),
+                )],
+                "",
+            )
+            .await;
+            if response.status == StatusCode::NO_CONTENT {
+                Ok(response.status)
+            } else {
+                Err(response.status)
+            }
         };
         let response = if retry {
             let parked = HookParked::start(owner, test_hooks::set_copy_pause, moving).await;
@@ -2309,6 +2323,11 @@ async fn overwrite_grantee_unlink_authority(
         let response = response
             .expect("authorized grantee overwrite may unlink B without private C authority");
         assert_eq!(response, StatusCode::NO_CONTENT);
+        assert_eq!(
+            test_hooks::take_move_overwrite_message(owner, target),
+            Some(false),
+            "Bob HTTP overwrite must preserve the outer no-CANCEL Option"
+        );
         let surviving = event_archive(test, owner, target)
             .await
             .deserialize::<CalendarEvent>()
@@ -2472,6 +2491,10 @@ async fn sharing_http_races(test: &mut TestServer) {
         .request("PROPFIND", "/dav/cal/shares-http-reader%40example.com/", "")
         .await
         .with_status(StatusCode::MULTI_STATUS);
+    reader_client
+        .request("PROPFIND", &format!("{HOME}race/"), "")
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
     assert!(test.server.inner.cache.za_keys.contains_account(reader));
     let mut level_change = request("race", SECOND);
     level_change["level"] = json!("edit");
@@ -2495,6 +2518,14 @@ async fn sharing_http_races(test: &mut TestServer) {
         "rotation also evicts remaining grantees"
     );
     assert!(vault::session::live::session_keys(second) < second_live_before);
+    reader_client
+        .request("PROPFIND", &format!("{HOME}race/"), "")
+        .await
+        .with_status(StatusCode::FORBIDDEN);
+    second_client
+        .request("PROPFIND", &format!("{HOME}race/"), "")
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
     let survived = za_owned_calendar_context(&test.server, &keys, race)
         .await
         .unwrap()
@@ -2771,6 +2802,10 @@ async fn sharing_http_races(test: &mut TestServer) {
                 2
             }
         );
+        reader_client
+            .request("GET", &format!("{HOME}{class}/old.ics"), "")
+            .await
+            .with_status(StatusCode::OK);
         if matches!(class, "revert" | "rollback" | "restore") {
             let fresh =
                 za_owned_calendar_context(&test.server, &*za_unlock(test, owner, STRONG).await, id)
@@ -2778,6 +2813,10 @@ async fn sharing_http_races(test: &mut TestServer) {
                     .unwrap();
             assert_ne!(fresh.domain.domain_id(), current.domain.domain_id());
             client
+                .request("GET", &format!("{HOME}{class}/new.ics"), "")
+                .await
+                .with_status(StatusCode::OK);
+            reader_client
                 .request("GET", &format!("{HOME}{class}/new.ics"), "")
                 .await
                 .with_status(StatusCode::OK);
@@ -2811,6 +2850,10 @@ async fn sharing_http_races(test: &mut TestServer) {
             .expect(200)["sealed"],
         1
     );
+    reader_client
+        .request("GET", &format!("{HOME}cut/plain.ics"), "")
+        .await
+        .with_status(StatusCode::OK);
     // Thirty successful logical groups consume neither request-wide loss budget.
     for index in 0..3000 {
         plant_event(
@@ -3959,10 +4002,264 @@ async fn sharing_dav_copy_after_precheck_contract(
         .request("GET", &format!("{HOME}copy-after-precheck/new.ics"), "")
         .await
         .with_status(StatusCode::OK);
+    let reader = test
+        .account("shares-http-reader@example.com")
+        .id()
+        .document_id();
+    let reader_client = DummyWebDavClient::new(
+        reader,
+        "shares-http-reader@example.com",
+        STRONG,
+        "shares-http-reader@example.com",
+    );
+    for name in ["old.ics", "new.ics"] {
+        reader_client
+            .request("GET", &format!("{HOME}copy-after-precheck/{name}"), "")
+            .await
+            .with_status(StatusCode::OK);
+    }
     for slug in ["copy-after-precheck", "copy-second-calendar"] {
         client
             .request("DELETE", &format!("{HOME}{slug}/"), "")
             .await
             .with_status(StatusCode::NO_CONTENT);
     }
+}
+
+/// Real Bob HTTP writes held only after their foreign calendar gate has admitted them.
+/// Keep original event CAS binding while testing calendar-only rotations and revocations.
+async fn grantee_http_write_races(test: &mut TestServer) {
+    use crate::utils::za::{sharing_dav_request, za_post};
+    use serde_json::json;
+    use vault::keys::display_fingerprint;
+    const USER: &str = "sharing-http-race-owner@example.com";
+    const BOB: &str = "sharing-http-race-bob@example.com";
+    const CAROL: &str = "sharing-http-race-carol@example.com";
+    const HOME: &str = "/dav/cal/sharing-http-race-owner%40example.com/";
+    const PATH: &str = "/dav/cal/sharing-http-race-owner%40example.com/shared/";
+    let admin = test.account("admin@example.com").clone();
+    for name in [USER, BOB, CAROL] {
+        let account = admin
+            .create_key_user_account(name, STRONG, name, &[], user_permissions())
+            .await;
+        test.insert_account(account);
+    }
+    let owner = test.account(USER).id().document_id();
+    let bob = test.account(BOB).id().document_id();
+    let carol = test.account(CAROL).id().document_id();
+    let client = DummyWebDavClient::new(owner, USER, STRONG, USER);
+    client
+        .request("MKCALENDAR", PATH, MKCAL)
+        .await
+        .with_status(StatusCode::CREATED);
+    for (name, id) in [(BOB, bob), (CAROL, carol)] {
+        let key = test.server.za_served_public_key(id).await.unwrap().unwrap();
+        super::pinning::pin(USER, name, &display_fingerprint(&key))
+            .await
+            .expect(200);
+    }
+    let grant = |name| json!({"username":USER,"password":STRONG,"calendar":"shared","address":name,"level":"edit"});
+    za_post("shares/grant", &grant(BOB)).await.expect(200);
+    let keys = za_unlock(test, owner, STRONG).await;
+    let calendar = test
+        .server
+        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .await
+        .unwrap()
+        .by_path("shared")
+        .unwrap()
+        .document_id();
+    for revoked in [false, true] {
+        for operation in ["CREATE", "UPDATE", "DELETE"] {
+            za_post("shares/grant", &grant(BOB)).await.expect(200);
+            za_post("shares/grant", &grant(CAROL)).await.expect(200);
+            let name = format!(
+                "{}-{}.ics",
+                if revoked { "revoked" } else { "rotated" },
+                operation.to_ascii_lowercase()
+            );
+            let path = format!("{PATH}{name}");
+            let initial = super::sharing::sharing_event(&format!("grantee-{name}"));
+            if operation != "CREATE" {
+                client
+                    .request_with_headers(
+                        "PUT",
+                        &path,
+                        [("content-type", "text/calendar")],
+                        &initial,
+                    )
+                    .await
+                    .with_status(StatusCode::CREATED);
+            }
+            // A fresh foreign GET/PROPFIND proves admission before parking any downstream hook.
+            DummyWebDavClient::new(bob, BOB, STRONG, BOB)
+                .request("PROPFIND", PATH, "")
+                .await
+                .with_status(StatusCode::MULTI_STATUS);
+            let event_id = if operation != "CREATE" {
+                Some(
+                    test.server
+                        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+                        .await
+                        .unwrap()
+                        .by_path(&format!("shared/{name}"))
+                        .unwrap()
+                        .document_id(),
+                )
+            } else {
+                None
+            };
+            let original = if let Some(id) = event_id {
+                Some(event_archive(test, owner, id).await)
+            } else {
+                None
+            };
+            let updating_path = path.clone();
+            let body = initial.replace("SUMMARY:", "SUMMARY:Bob race ");
+            let method = if operation == "DELETE" {
+                "DELETE"
+            } else {
+                "PUT"
+            };
+            let hook = match operation {
+                "CREATE" => test_hooks::set_commit_pause,
+                "UPDATE" => test_hooks::set_update_commit_pause,
+                _ => test_hooks::set_delete_commit_pause,
+            };
+            let parked = HookParked::start(owner, hook, async move {
+                sharing_dav_request(
+                    BOB,
+                    method,
+                    &updating_path,
+                    &[("content-type", "text/calendar")],
+                    if method == "PUT" { &body } else { "" },
+                )
+                .await
+            })
+            .await;
+            let before = za_owned_calendar_context(&test.server, &keys, calendar)
+                .await
+                .unwrap();
+            let generation_before = current_ring_generation(&before);
+            za_post("shares/revoke",&json!({"username":USER,"password":STRONG,"calendar":"shared","grant":if revoked {bob} else {carol}})).await.expect(200);
+            let after = za_owned_calendar_context(&test.server, &keys, calendar)
+                .await
+                .unwrap();
+            assert!(current_ring_generation(&after) > generation_before);
+            let response = parked.finish().await;
+            if revoked {
+                assert_eq!(
+                    response.status,
+                    StatusCode::FORBIDDEN,
+                    "revoked Bob {operation}: {}",
+                    response.body
+                );
+                if let (Some(id), Some(original)) = (event_id, original.as_ref()) {
+                    assert_eq!(
+                        event_archive(test, owner, id).await.as_bytes(),
+                        original.as_bytes()
+                    );
+                } else {
+                    client
+                        .request("GET", &path, "")
+                        .await
+                        .with_status(StatusCode::NOT_FOUND);
+                }
+            } else {
+                assert_eq!(
+                    response.status,
+                    if operation == "CREATE" {
+                        StatusCode::CREATED
+                    } else {
+                        StatusCode::NO_CONTENT
+                    },
+                    "rotated Bob {operation}: {}",
+                    response.body
+                );
+                if operation != "DELETE" {
+                    let resources = test
+                        .server
+                        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+                        .await
+                        .unwrap();
+                    let id = resources
+                        .by_path(&format!("shared/{name}"))
+                        .unwrap()
+                        .document_id();
+                    let stored = event_archive(test, owner, id).await;
+                    let mut opened = stored.deserialize::<CalendarEvent>().unwrap();
+                    assert_eq!(generation(&opened), current_ring_generation(&after));
+                    unseal_event_in_domain(&mut opened, &after.domain).unwrap();
+                    DummyWebDavClient::new(bob, BOB, STRONG, BOB)
+                        .request("GET", &path, "")
+                        .await
+                        .with_status(StatusCode::OK);
+                }
+            }
+            if operation != "DELETE" || revoked {
+                let _ = client.request("DELETE", &path, "").await;
+            }
+        }
+    }
+    // Calendar PROPPATCH keeps an immediate409 instead of the event one-retry path.
+    za_post("shares/grant", &grant(BOB)).await.expect(200);
+    za_post("shares/grant", &grant(CAROL)).await.expect(200);
+    let parked=HookParked::start(owner,test_hooks::set_update_commit_pause,async {
+        sharing_dav_request(BOB,"PROPPATCH",PATH,&[],"<D:propertyupdate xmlns:D=\"DAV:\"><D:set><D:prop><D:displayname>must-conflict</D:displayname></D:prop></D:set></D:propertyupdate>").await
+    }).await;
+    za_post(
+        "shares/revoke",
+        &json!({"username":USER,"password":STRONG,"calendar":"shared","grant":carol}),
+    )
+    .await
+    .expect(200);
+    assert_eq!(parked.finish().await.status, StatusCode::CONFLICT);
+    let body = DummyWebDavClient::new(bob, BOB, STRONG, BOB)
+        .request("PROPFIND", PATH, "")
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .body
+        .unwrap();
+    assert!(!body.contains("must-conflict"));
+    client
+        .request("DELETE", PATH, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    client
+        .request("DELETE", &format!("{HOME}default/"), "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    for name in [BOB, CAROL] {
+        DummyWebDavClient::new(test.account(name).id().document_id(), name, STRONG, name)
+            .delete_default_containers()
+            .await;
+    }
+    test.wait_for_tasks().await;
+}
+
+fn current_ring_generation(
+    context: &groupware::calendar::sharing::resolve::ZaCalendarContext,
+) -> u32 {
+    let calendar = context.stored.deserialize::<Calendar>().unwrap();
+    let entry = calendar
+        .preferences
+        .iter()
+        .find(|entry| entry.account_id == context.owner_id)
+        .unwrap();
+    let bytes = STANDARD
+        .decode(
+            entry
+                .name
+                .strip_prefix("$za$")
+                .unwrap()
+                .split('|')
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+    *groupware::calendar::sharing::format::parse_owner_header(&bytes)
+        .unwrap()
+        .generations
+        .last()
+        .unwrap()
 }

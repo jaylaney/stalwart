@@ -104,12 +104,11 @@ impl DavUriResource for Server {
                 return Err(DavError::Code(StatusCode::FORBIDDEN));
             }
 
-            // Zero-access gate (spec 9): a key account's calendar and
-            // scheduling data is reachable only with that account's keys.
-            if matches!(
-                resource.collection,
-                Collection::Calendar | Collection::CalendarEventNotification
-            ) {
+            // Calendar sharing admits only an authenticated grantee's own session.
+            // Scheduling remains confined to the account whose keys are held.
+            if resource.collection == Collection::Calendar {
+                self.za_calendar_gate(access_token, account_id).await?;
+            } else if resource.collection == Collection::CalendarEventNotification {
                 self.za_session_keys(access_token, account_id).await?;
             }
 

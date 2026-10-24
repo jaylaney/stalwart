@@ -15,6 +15,7 @@ use groupware::calendar::{
     sharing::resolve::{ZaCalendarContext, ZaCalendarError, za_calendar_context},
 };
 use hyper::StatusCode;
+use registry::schema::enums::Permission;
 use std::{borrow::Cow, collections::HashMap, future::Future, sync::Arc};
 use store::{
     ValueKey,
@@ -37,6 +38,13 @@ pub(crate) enum ZaFreeBusy {
 }
 
 pub(crate) trait ZeroAccessGate: Sync + Send {
+    /// Calendar URI admission. The per-calendar resolver still checks every operation bit.
+    fn za_calendar_gate(
+        &self,
+        token: &AccessToken,
+        owner_id: u32,
+    ) -> impl Future<Output = crate::Result<()>> + Send;
+
     /// `None` for a non-key account (unchanged upstream path). For a key
     /// account, the keys of that account held by this session, or 403.
     fn za_session_keys(
@@ -63,6 +71,27 @@ pub(crate) trait ZeroAccessGate: Sync + Send {
 }
 
 impl ZeroAccessGate for Server {
+    async fn za_calendar_gate(&self, token: &AccessToken, owner_id: u32) -> crate::Result<()> {
+        if !is_key_account(self, owner_id).await? || token.za_keys_for(owner_id).is_some() {
+            return Ok(());
+        }
+        if token
+            .session_keys()
+            .is_some_and(|keys| keys.account_id == token.account_id())
+            && !token.za_is_impersonated()
+            && !token.has_permission(Permission::Impersonate)
+            && token.has_shared_access(owner_id, Collection::Calendar)
+        {
+            return Ok(());
+        }
+        trc::event!(
+            Security(trc::SecurityEvent::Unauthorized),
+            AccountId = owner_id,
+            Details = "zero-access: calendar access without session keys",
+        );
+        Err(DavError::Code(StatusCode::FORBIDDEN))
+    }
+
     async fn za_session_keys(
         &self,
         access_token: &AccessToken,

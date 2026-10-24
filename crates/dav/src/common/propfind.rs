@@ -29,7 +29,7 @@ use crate::{
     file::{FILE_CONTAINER_PROPS, FILE_ITEM_PROPS},
     principal::{
         CurrentUserPrincipal,
-        propfind::{PrincipalPropFind, build_home_set},
+        propfind::{PrincipalPropFind, build_home_set, foreign_home_visible},
     },
 };
 use calcard::{common::timezone::Tz, icalendar::ICalendarComponentType};
@@ -55,14 +55,17 @@ use dav_proto::{
         },
     },
 };
-use groupware::calendar::{SCHEDULE_INBOX_ID, SupportedComponent};
+use groupware::calendar::{
+    Calendar, SCHEDULE_INBOX_ID, SupportedComponent,
+    sharing::resolve::{ZaCalendarContext, ZaCalendarError, za_calendar_context},
+};
 use groupware::{
     DavCalendarResource, DavResourceName, cache::GroupwareCache, calendar::ArchivedTimezone,
 };
 use http_proto::HttpResponse;
 use hyper::StatusCode;
 use registry::schema::{enums::Permission, prelude::ObjectType};
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 use store::{
     ValueKey,
     registry::RegistryQuery,
@@ -275,10 +278,21 @@ impl PropFindRequestHandler for Server {
                     RoaringBitmap::from_iter(access_token.all_ids())
                 };
 
+                // A root discovery omits foreign key-account homes without an
+                // eligible own-id calendar. An explicitly addressed home still
+                // returns its root and207 even when every calendar is omitted.
+                let mut visible_ids = Vec::new();
+                for account_id in ids {
+                    if resource.collection != Collection::Calendar
+                        || foreign_home_visible(self, access_token, account_id).await?
+                    {
+                        visible_ids.push(account_id);
+                    }
+                }
                 self.prepare_principal_propfind_response(
                     access_token,
                     resource.collection,
-                    ids.into_iter(),
+                    visible_ids.into_iter(),
                     &request,
                     &mut response,
                 )
@@ -391,6 +405,43 @@ impl PropFindRequestHandler for Server {
                 }
 
                 for item in paths {
+                    if collection_container == Collection::Calendar
+                        && item.account_id != access_token.account_id()
+                        && self
+                            .za_is_key_account(item.account_id)
+                            .await
+                            .caused_by(trc::location!())?
+                    {
+                        let calendar_id = if item.is_container {
+                            item.document_id
+                        } else {
+                            item.parent_id.unwrap()
+                        };
+                        match crate::common::za::za_read_context(
+                            self,
+                            access_token,
+                            item.account_id,
+                            calendar_id,
+                            Bitmap::new().with_item(if item.is_container {
+                                Acl::Read
+                            } else {
+                                Acl::ReadItems
+                            }),
+                            &mut data.calendar_memo,
+                        )
+                        .await
+                        {
+                            Ok(_) => (),
+                            Err(ZaCalendarError::Forbidden) if za_home_listing => continue,
+                            Err(error) => {
+                                return Err(crate::calendar::za_calendar_error(
+                                    error,
+                                    item.account_id,
+                                    calendar_id,
+                                ));
+                            }
+                        }
+                    }
                     // Invitations spec 6.6: a pending inbox item is not listed.
                     if !item.is_container
                         && za_cached_item_hidden(
@@ -1252,6 +1303,45 @@ fn dav_query_response(
     }
 }
 
+/// Resolve fresh own-id grants before any foreign path is emitted. Corrupt eligible
+/// archives remain errors; only an actual access refusal or deleted calendar is omitted.
+async fn foreign_calendar_contexts(
+    server: &Server,
+    token: &AccessToken,
+    owner_id: u32,
+    resources: &DavResources,
+    requested: Option<u32>,
+) -> crate::Result<BTreeMap<u32, Arc<ZaCalendarContext>>> {
+    let mut eligible = BTreeMap::new();
+    for id in resources
+        .document_ids(true)
+        .filter(|id| requested.is_none_or(|requested| requested == *id))
+    {
+        match za_calendar_context(
+            server,
+            token,
+            owner_id,
+            id,
+            Bitmap::new().with_item(Acl::Read),
+        )
+        .await
+        {
+            Ok(Some(context)) => {
+                eligible.insert(id, Arc::new(context));
+            }
+            Ok(None) => (),
+            Err(ZaCalendarError::Forbidden) => (),
+            Err(ZaCalendarError::Store(error))
+                if error.matches(trc::EventType::Store(trc::StoreEvent::NotFound)) =>
+            {
+                ()
+            }
+            Err(error) => return Err(crate::calendar::za_calendar_error(error, owner_id, id)),
+        }
+    }
+    Ok(eligible)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn get(
     server: &Server,
@@ -1275,8 +1365,118 @@ async fn get(
         .await
         .caused_by(trc::location!())?;
 
+    // Vanished paths have no calendar identity. Fetch them before reading the fresh
+    // archives whose current slug and boundary jointly authorize their disclosure.
+    let foreign_key_calendars = collection_container == Collection::Calendar
+        && account_id != access_token.account_id()
+        && server
+            .za_is_key_account(account_id)
+            .await
+            .caused_by(trc::location!())?;
+    let mut foreign_vanished: Option<Vec<String>> = if foreign_key_calendars {
+        if let SyncType::From { id, .. } = query.sync_type {
+            Some(
+                server
+                    .store()
+                    .vanished(
+                        account_id,
+                        sync_collection.vanished_collection().unwrap().into(),
+                        Query::Since(id),
+                    )
+                    .await
+                    .caused_by(trc::location!())?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let requested_calendar = resource
+        .resource
+        .and_then(|path| resources.by_path(path))
+        .map(|item| {
+            if item.is_container() {
+                item.document_id()
+            } else {
+                item.parent_id().unwrap()
+            }
+        });
+    let eligible = if foreign_key_calendars {
+        if resource.resource.is_some() && requested_calendar.is_none() {
+            return Err(DavError::Code(StatusCode::NOT_FOUND));
+        }
+        Some(
+            foreign_calendar_contexts(
+                server,
+                access_token,
+                account_id,
+                &resources,
+                requested_calendar,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    if let Some(eligible) = &eligible {
+        let addressed_id = resource
+            .resource
+            .and_then(|path| resources.by_path(path))
+            .map(|item| {
+                if item.is_container() {
+                    item.document_id()
+                } else {
+                    item.parent_id().unwrap()
+                }
+            });
+        if resource.resource.is_some() && addressed_id.is_some_and(|id| !eligible.contains_key(&id))
+        {
+            return Err(DavError::Code(StatusCode::FORBIDDEN));
+        }
+        if let SyncType::From { id, .. } = query.sync_type {
+            for (&calendar_id, context) in eligible {
+                if addressed_id.is_none_or(|id| id == calendar_id)
+                    && context.boundary.is_some_and(|boundary| {
+                        boundary.pending
+                            || id <= boundary.grant_change_id.max(boundary.rename_change_id)
+                    })
+                {
+                    return Err(DavErrorCondition::new(
+                        StatusCode::FORBIDDEN,
+                        BaseCondition::ValidSyncToken,
+                    )
+                    .into());
+                }
+            }
+        }
+        let mut prefixes = Vec::new();
+        for (&calendar_id, context) in eligible {
+            if addressed_id.is_none_or(|id| id == calendar_id) {
+                let calendar = context
+                    .stored
+                    .deserialize::<Calendar>()
+                    .caused_by(trc::location!())?;
+                prefixes.push(format!(
+                    "{}{}/",
+                    resources.base_path,
+                    percent_encoding::utf8_percent_encode(&calendar.name, groupware::RFC_3986)
+                ));
+            }
+        }
+        if let Some(vanished) = &mut foreign_vanished {
+            vanished.retain(|path| prefixes.iter().any(|prefix| path.starts_with(prefix)));
+        }
+        // Reuse precisely these freshly read archives for the rest of this response.
+        for (&id, context) in eligible {
+            data.calendar_memo.insert((account_id, id), context.clone());
+        }
+    }
+
     // Obtain document ids
-    let mut display_containers = if !access_token.is_member(account_id) {
+    let mut display_containers = if let Some(eligible) = &eligible {
+        Some(RoaringBitmap::from_iter(eligible.keys().copied()))
+    } else if !access_token.is_member(account_id) {
         resources
             .shared_containers(
                 access_token,
@@ -1305,6 +1505,30 @@ async fn get(
                 }
             }))
         });
+
+    if eligible.is_some()
+        && let Some(path) = resource.resource
+    {
+        let subtree = resources
+            .subtree_with_depth(path, query.depth)
+            .collect::<Vec<_>>();
+        if let Some(containers) = &mut display_containers {
+            *containers &= RoaringBitmap::from_iter(
+                subtree
+                    .iter()
+                    .filter(|item| item.is_container())
+                    .map(|item| item.document_id()),
+            );
+        }
+        if let Some(children) = &mut display_children {
+            *children &= RoaringBitmap::from_iter(
+                subtree
+                    .iter()
+                    .filter(|item| !item.is_container())
+                    .map(|item| item.document_id()),
+            );
+        }
+    }
 
     // Filter by changelog
     let is_sync = match query.sync_type {
@@ -1382,7 +1606,10 @@ async fn get(
                 }
             }
 
-            if maybe_has_vanished
+            if let Some(filtered) = foreign_vanished.take() {
+                vanished = filtered;
+                total_changes += vanished.len();
+            } else if maybe_has_vanished
                 && let Some(vanished_collection) = sync_collection.vanished_collection()
             {
                 vanished = server
@@ -1529,7 +1756,28 @@ async fn get(
                         .resources(server, access_token, shared_account_id, sync_collection)
                         .await
                         .caused_by(trc::location!())?;
-                    let shared_containers =
+                    let foreign_eligible = if sync_collection == SyncCollection::Calendar
+                        && server
+                            .za_is_key_account(shared_account_id)
+                            .await
+                            .caused_by(trc::location!())?
+                    {
+                        Some(
+                            foreign_calendar_contexts(
+                                server,
+                                access_token,
+                                shared_account_id,
+                                &shared_resources,
+                                None,
+                            )
+                            .await?,
+                        )
+                    } else {
+                        None
+                    };
+                    let shared_containers = if let Some(eligible) = &foreign_eligible {
+                        Some(RoaringBitmap::from_iter(eligible.keys().copied()))
+                    } else {
                         (!access_token.is_member(shared_account_id)).then(|| {
                             shared_resources.shared_containers(
                                 access_token,
@@ -1540,7 +1788,8 @@ async fn get(
                                 }],
                                 true,
                             )
-                        });
+                        })
+                    };
                     if shared_containers
                         .as_ref()
                         .is_none_or(|containers| !containers.is_empty())

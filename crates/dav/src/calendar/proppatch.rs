@@ -29,8 +29,8 @@ use groupware::{
     calendar::{
         Calendar, CalendarEvent, SupportedComponent, Timezone,
         seal::{
-            event_pairs_in_domain, seal_calendar, seal_error, seal_event_in_domain,
-            unseal_calendar, unseal_event_in_domain,
+            calendar_view_in_domain, event_pairs_in_domain, seal_calendar_changes, seal_error,
+            seal_event_in_domain, unseal_event_in_domain,
         },
     },
 };
@@ -89,7 +89,7 @@ impl CalendarPropPatchRequestHandler for Server {
             .into_owned_uri()?;
         let uri = headers.uri;
         let account_id = resource_.account_id;
-        let za_keys = super::za_writer_keys(self, access_token, account_id).await?;
+        super::za_writer_keys(self, access_token, account_id).await?;
         let resources = self
             .fetch_dav_resources(
                 access_token.account_id(),
@@ -155,23 +155,25 @@ impl CalendarPropPatchRequestHandler for Server {
         )
         .await?;
 
-        // Repair only the authenticated owner's pending boundary, then use that actual
-        // stored archive for the property write. Full shared-property integration is separate.
-        let archive = if resource.is_container() {
+        // Calendar properties write only this principal's personal bundle and shared dead
+        // properties. The codec retains every unopened personal bundle and ring verbatim.
+        let calendar_context = if resource.is_container() {
             crate::common::za::za_mutation_context(
                 self,
                 access_token,
                 account_id,
                 document_id,
-                utils::map::bitmap::Bitmap::new().with_item(Acl::Modify),
+                Bitmap::new().with_item(Acl::Modify),
             )
             .await
             .map_err(|error| super::za_calendar_error(error, account_id, document_id))?
-            .map(|context| context.stored)
-            .unwrap_or(archive)
         } else {
-            archive
+            None
         };
+        let archive = calendar_context
+            .as_ref()
+            .map(|context| &context.stored)
+            .unwrap_or(&archive);
 
         let is_success;
         let mut batch = BatchBuilder::new();
@@ -183,15 +185,23 @@ impl CalendarPropPatchRequestHandler for Server {
             let calendar = archive
                 .to_unarchived::<Calendar>()
                 .caused_by(trc::location!())?;
-            let mut new_calendar = archive
+            let stored_calendar = archive
                 .deserialize::<Calendar>()
                 .caused_by(trc::location!())?;
-            // Spec 8.1: edit the plaintext; `calendar` (stored) stays current.
-            if let Some(keys) = &za_keys {
-                unseal_calendar(&mut new_calendar, keys, account_id)
-                    .map_err(|err| seal_error(err, account_id, document_id))?;
-            }
-            let personal_id = access_token.personal_id(account_id, Collection::Calendar);
+            let (mut new_calendar, personal_id) = if let Some(context) = &calendar_context {
+                (
+                    calendar_view_in_domain(&context.stored, &context.domain, context.personal_id)
+                        .map_err(|err| seal_error(err, account_id, document_id))?
+                        .deserialize::<Calendar>()
+                        .caused_by(trc::location!())?,
+                    context.personal_id,
+                )
+            } else {
+                (
+                    stored_calendar.clone(),
+                    access_token.personal_id(account_id, Collection::Calendar),
+                )
+            };
 
             // Remove properties
             if !request.set_first && !request.remove.is_empty() {
@@ -223,9 +233,14 @@ impl CalendarPropPatchRequestHandler for Server {
             }
 
             if is_success {
-                if let Some(keys) = &za_keys {
-                    seal_calendar(&mut new_calendar, keys, account_id)
-                        .map_err(|err| seal_error(err, account_id, document_id))?;
+                if let Some(context) = &calendar_context {
+                    new_calendar = seal_calendar_changes(
+                        &stored_calendar,
+                        &new_calendar,
+                        &context.domain,
+                        personal_id,
+                    )
+                    .map_err(|err| seal_error(err, account_id, document_id))?;
                 }
                 new_calendar
                     .update(
@@ -310,6 +325,8 @@ impl CalendarPropPatchRequestHandler for Server {
         };
 
         if is_success {
+            #[cfg(feature = "test_mode")]
+            common::za::test_hooks::update_commit_pause_point(account_id).await;
             match self.commit_batch(batch).await {
                 Ok(_) => {}
                 Err(error) if error.is_assertion_failure() && retry_event.is_some() => {

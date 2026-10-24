@@ -94,6 +94,8 @@ async fn update_calendar(
 }
 
 pub async fn test(test: &mut TestServer) {
+    grantee_dav_admission(test).await;
+    sharing_lifecycle_differential(test).await;
     delegated_receiver_consistency(test).await;
     delegated_receiver_rejections_and_reply(test).await;
     delegated_scheduling_tests(test).await;
@@ -716,6 +718,10 @@ async fn copy_move_test(test: &mut TestServer) {
             .contains("share-read-private-summary")
     );
     assert_eq!(move_queue_state(test, owner_id, reader_id).await, before);
+    DummyWebDavClient::new(reader_id, READER, STRONG, READER)
+        .request("GET", &format!("{HOME}c/legacy.ics"), "")
+        .await
+        .with_status(StatusCode::OK);
     drop(held);
     // A pre-conversion COPY produces two names under the EWK; moving either into CK is refused.
     put(format!("{HOME}a/linked.ics"), put_body("move-linked")).await;
@@ -829,6 +835,58 @@ async fn copy_move_test(test: &mut TestServer) {
         overwrite_observation,
         Some(false),
         "MOVE overwrite must not build a CANCEL"
+    );
+    // Bob's independently tagged future overwrite exercises the outer Option even
+    // when the inner CANCEL would be empty for the unmerged writer identity.
+    put(
+        format!("{HOME}c/bob-overwrite.ics"),
+        super::fanout::invite("move-bob-overwritten", "20990102T090000Z", &[READER])
+            .replace("key1@example.com", USER),
+    )
+    .await;
+    put(
+        format!("{HOME}d/bob-source.ics"),
+        put_body("move-bob-source"),
+    )
+    .await;
+    let _drain = super::drain::DrainOn::new();
+    assert_eq!(crate::utils::za::trigger_drain(READER, STRONG).await, 207);
+    let bob_copy = crate::utils::za::copy_href(test, reader_id, "move-bob-overwritten").await;
+    let bob_copy_before = recipient
+        .request("GET", &bob_copy, "")
+        .await
+        .with_status(StatusCode::OK)
+        .body
+        .unwrap();
+    drop(_drain);
+    let bob_target = resource_id(test, owner_id, "c/bob-overwrite.ics").await;
+    test.server.notify_task_queue();
+    let held = hold_task_consumer(test).await;
+    let before = move_queue_state(test, owner_id, reader_id).await;
+    recipient
+        .request_with_headers(
+            "MOVE",
+            &format!("{HOME}d/bob-source.ics"),
+            [("destination", format!("{HOME}c/bob-overwrite.ics").as_str())],
+            "",
+        )
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    assert_eq!(
+        test_hooks::take_move_overwrite_message(owner_id, bob_target),
+        Some(false),
+        "Bob future scheduled overwrite outer Option"
+    );
+    assert_eq!(move_queue_state(test, owner_id, reader_id).await, before);
+    drop(held);
+    assert_eq!(
+        recipient
+            .request("GET", &bob_copy, "")
+            .await
+            .with_status(StatusCode::OK)
+            .body
+            .unwrap(),
+        bob_copy_before
     );
     // A reverting calendar still reads old CK ciphertext, even though new
     // writes use EWK. Moving that ciphertext out must open its original CK.
@@ -2630,6 +2688,16 @@ async fn sharing_endpoint_tests(test: &mut TestServer) {
         za_post("shares/grant", &request).await.expect(200),
         json!({"ok":true,"changed":false,"rewrapped":0,"sealed":0})
     );
+    let reader_client = DummyWebDavClient::new(reader_id, reader_name, STRONG, reader_name);
+    for name in ["sealed.ics", "plain.ics"] {
+        let body = reader_client
+            .request("GET", &format!("{path}{name}"), "")
+            .await
+            .with_status(StatusCode::OK)
+            .body
+            .unwrap();
+        assert!(body.contains("share-read-private-summary") && !body.contains("X-ZA-"));
+    }
     let own_keys = za_unlock(test, owner_id, STRONG).await;
     let raw = za_owned_calendar_context(
         &test.server,
@@ -3316,6 +3384,16 @@ async fn sharing_rotation_contracts(test: &mut TestServer, owner: u32, reader: u
         parse_grant_header(&bytes).unwrap().grant_change_id,
         old.change_id
     );
+    for name in ["sealed.ics", "plain.ics"] {
+        second_client
+            .request(
+                "GET",
+                &format!("/dav/cal/shares-http-owner%40example.com/http-sharing/{name}"),
+                "",
+            )
+            .await
+            .with_status(StatusCode::OK);
+    }
     // Business refusals after valid authentication do not spend the fail2ban budget.
     for _ in 0..12 {
         assert_eq!(
@@ -3920,6 +3998,14 @@ async fn sharing_recovery_contracts(test: &mut TestServer, owner: u32, reader: u
         listed["shared_with_me"][0]["name"],
         "Shared owner private name"
     );
+    DummyWebDavClient::new(reader, READER, OTHER, READER)
+        .request(
+            "GET",
+            "/dav/cal/shares-http-owner%40example.com/http-sharing/sealed.ics",
+            "",
+        )
+        .await
+        .with_status(StatusCode::OK);
     za_post(
         "password",
         &json!({"username":READER,"password":OTHER,"new_password":STRONG}),
@@ -6464,5 +6550,2663 @@ async fn delegated_schedule_agents_remain_authoritative(
     }
     println!(
         "Direct CLIENT/NONE listed aliases remain unsent; incoming snapshot validation rejects planted copies"
+    );
+}
+
+/// Public endpoint grant followed by real DAV reads: this must fail at the old owner-only gate.
+async fn grantee_dav_admission(test: &mut TestServer) {
+    use crate::utils::za::za_post;
+    use serde_json::json;
+    use vault::keys::display_fingerprint;
+    println!("Running Task 10 grantee DAV admission and method matrix...");
+    const ALICE: &str = "sharing-dav-alice@example.com";
+    const BOB: &str = "sharing-dav-bob@example.com";
+    const HOME: &str = "/dav/cal/sharing-dav-alice%40example.com/";
+    const SHARED: &str = "/dav/cal/sharing-dav-alice%40example.com/shared/";
+    let mut ids = Vec::new();
+    for name in [ALICE, BOB] {
+        let account = test
+            .account("admin@example.com")
+            .create_key_user_account(name, STRONG, name, &[], user_permissions())
+            .await;
+        ids.push(account.id().document_id());
+        test.insert_account(account);
+    }
+    let alice = DummyWebDavClient::new(ids[0], ALICE, STRONG, ALICE);
+    let bob = DummyWebDavClient::new(ids[1], BOB, STRONG, BOB);
+    for slug in ["shared", "private"] {
+        alice
+            .request("MKCALENDAR", &format!("{HOME}{slug}/"), MKCAL)
+            .await
+            .with_status(StatusCode::CREATED);
+    }
+    let event = EVENT.replace("share-read-UID", "sharing-dav-admission");
+    alice
+        .request_with_headers(
+            "PUT",
+            &format!("{SHARED}event.ics"),
+            [("content-type", "text/calendar")],
+            &event,
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let key = test
+        .server
+        .za_served_public_key(ids[1])
+        .await
+        .unwrap()
+        .unwrap();
+    super::pinning::pin(ALICE, BOB, &display_fingerprint(&key))
+        .await
+        .expect(200);
+    let mut grant = json!({"username": ALICE, "password": STRONG, "calendar": "shared", "address": BOB, "level": "view"});
+    za_post("shares/grant", &grant).await.expect(200);
+    // Behavior RED: the reviewed collection grant exists, but the old URI gate answers 403.
+    let got = bob
+        .request("GET", &format!("{SHARED}event.ics"), "")
+        .await
+        .with_status(StatusCode::OK);
+    assert!(got.body.unwrap().contains("share-read-private-summary"));
+    for method in ["HEAD", "PROPFIND"] {
+        bob.request(method, &format!("{SHARED}event.ics"), "")
+            .await
+            .with_status(if method == "HEAD" {
+                StatusCode::OK
+            } else {
+                StatusCode::MULTI_STATUS
+            });
+    }
+    for prop in ["<D:allprop/>", "<D:propname/>"] {
+        let body = format!("<D:propfind xmlns:D=\"DAV:\">{prop}</D:propfind>");
+        for home in [HOME, "/dav/cal/sharing-dav-bob%40example.com/"] {
+            let response = bob
+                .request_with_headers("PROPFIND", home, [("depth", "1")], &body)
+                .await
+                .with_status(StatusCode::MULTI_STATUS);
+            let body = response.body.unwrap();
+            assert!(
+                body.contains("/shared/"),
+                "missing eligible calendar: {body}"
+            );
+            assert!(
+                !body.contains("/private/"),
+                "private calendar leaked: {body}"
+            );
+        }
+    }
+    for method in ["PUT", "DELETE", "PROPPATCH"] {
+        bob.request_with_headers(method, &format!("{SHARED}event.ics"), [("content-type", if method == "PROPPATCH" { "application/xml" } else { "text/calendar" })], if method == "PUT" { event.as_str() } else if method == "PROPPATCH" { "<D:propertyupdate xmlns:D=\"DAV:\"><D:set><D:prop><D:displayname>Bob event</D:displayname></D:prop></D:set></D:propertyupdate>" } else { "" }).await.with_status(StatusCode::FORBIDDEN);
+    }
+    for target in [
+        format!("{HOME}private/"),
+        "/dav/itip/sharing-dav-alice%40example.com/inbox/".into(),
+        "/dav/itip/sharing-dav-alice%40example.com/outbox/".into(),
+    ] {
+        bob.request("PROPFIND", &target, "")
+            .await
+            .with_status(StatusCode::FORBIDDEN);
+    }
+    let patch = "<D:propertyupdate xmlns:D=\"DAV:\" xmlns:A=\"http://apple.com/ns/ical/\"><D:set><D:prop><D:displayname>Bob personal name</D:displayname><A:calendar-color>#123456FF</A:calendar-color></D:prop></D:set></D:propertyupdate>";
+    bob.request("PROPPATCH", SHARED, patch)
+        .await
+        .with_status(StatusCode::FORBIDDEN);
+    for report in [
+        "<C:calendar-query xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:prop><D:getetag/><C:calendar-data/></D:prop><C:filter><C:comp-filter name=\"VCALENDAR\"><C:comp-filter name=\"VEVENT\"/></C:comp-filter></C:filter></C:calendar-query>".to_string(),
+        format!("<C:calendar-multiget xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:prop><D:getetag/><C:calendar-data/></D:prop><D:href>{SHARED}event.ics</D:href></C:calendar-multiget>"),
+    ] {
+        let response = bob.request("REPORT", SHARED, report).await.with_status(StatusCode::MULTI_STATUS);
+        assert!(response.body.unwrap().contains("share-read-private-summary"));
+    }
+    let freebusy = bob.request("REPORT", SHARED, "<C:free-busy-query xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><C:time-range start=\"20240101T000000Z\" end=\"20240103T000000Z\"/></C:free-busy-query>").await.with_status(StatusCode::OK);
+    assert!(!freebusy.body.unwrap().contains("FREEBUSY:"));
+    bob.request_with_headers(
+        "PUT",
+        &format!("{SHARED}view-create.ics"),
+        [("content-type", "text/calendar")],
+        event.replace("sharing-dav-admission", "view-refused-create"),
+    )
+    .await
+    .with_status(StatusCode::FORBIDDEN);
+    bob.request_with_headers(
+        "MOVE",
+        &format!("{SHARED}event.ics"),
+        [("destination", format!("{SHARED}view-move.ics").as_str())],
+        "",
+    )
+    .await
+    .with_status(StatusCode::FORBIDDEN);
+    grant["level"] = json!("edit");
+    za_post("shares/grant", &grant).await.expect(200);
+    bob.request_with_headers(
+        "PUT",
+        &format!("{SHARED}event.ics"),
+        [("content-type", "text/calendar")],
+        event.replace("private-summary", "bob-edit"),
+    )
+    .await
+    .with_status(StatusCode::NO_CONTENT);
+    alice
+        .request("GET", &format!("{SHARED}event.ics"), "")
+        .await
+        .with_status(StatusCode::OK);
+    for (method, body) in [
+        ("ACL", "<D:acl xmlns:D=\"DAV:\"/>"),
+        (
+            "LOCK",
+            "<D:lockinfo xmlns:D=\"DAV:\"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>",
+        ),
+        ("UNLOCK", ""),
+        ("DELETE", ""),
+    ] {
+        bob.request_with_headers(
+            method,
+            SHARED,
+            [(
+                "lock-token",
+                "<urn:uuid:00000000-0000-0000-0000-000000000000>",
+            )],
+            body,
+        )
+        .await
+        .with_status(StatusCode::FORBIDDEN);
+    }
+    for method in ["MKCOL", "MKCALENDAR"] {
+        bob.request(method, &format!("{HOME}bob-created/"), "")
+            .await
+            .with_status(StatusCode::FORBIDDEN);
+    }
+    let properties = "<D:propfind xmlns:D=\"DAV:\" xmlns:A=\"http://apple.com/ns/ical/\"><D:prop><D:displayname/><A:calendar-color/></D:prop></D:propfind>";
+    let owner_before = alice
+        .request_with_headers("PROPFIND", SHARED, [("depth", "0")], properties)
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .body
+        .unwrap();
+    bob.request("PROPPATCH", SHARED, patch)
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    let owner_after = alice
+        .request_with_headers("PROPFIND", SHARED, [("depth", "0")], properties)
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .body
+        .unwrap();
+    let bob_after = bob
+        .request_with_headers("PROPFIND", SHARED, [("depth", "0")], properties)
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .body
+        .unwrap();
+    assert!(owner_before.contains("Shared owner private name"));
+    assert!(owner_after.contains("Shared owner private name"));
+    assert!(!owner_after.contains("Bob personal name"));
+    assert!(bob_after.contains("Bob personal name"));
+    assert!(owner_after.contains("#123456FF") && bob_after.contains("#123456FF"));
+    bob.request_with_headers(
+        "PUT",
+        &format!("{SHARED}new.ics"),
+        [("content-type", "text/calendar")],
+        event.replace("sharing-dav-admission", "sharing-dav-new"),
+    )
+    .await
+    .with_status(StatusCode::CREATED);
+    bob.request("PROPPATCH", &format!("{SHARED}new.ics"), "<D:propertyupdate xmlns:D=\"DAV:\"><D:set><D:prop><D:displayname>Bob event</D:displayname></D:prop></D:set></D:propertyupdate>").await.with_status(StatusCode::MULTI_STATUS);
+    bob.request("DELETE", &format!("{SHARED}new.ics"), "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    for method in ["COPY", "MOVE"] {
+        bob.request_with_headers(
+            method,
+            &format!("{SHARED}event.ics"),
+            [(
+                "destination",
+                "/dav/cal/sharing-dav-bob%40example.com/default/cross.ics",
+            )],
+            "",
+        )
+        .await
+        .with_status(StatusCode::FORBIDDEN);
+    }
+    for (source, destination) in [
+        (format!("{SHARED}event.ics"), format!("{SHARED}copied.ics")),
+        (SHARED.to_string(), format!("{HOME}copied/")),
+    ] {
+        bob.request_with_headers("COPY", &source, [("destination", destination.as_str())], "")
+            .await
+            .with_status(StatusCode::FORBIDDEN);
+    }
+    grantee_pending_grant_and_slug_reuse(test, &alice, &bob, HOME).await;
+    grantee_sync_boundaries(test, &alice, &bob, HOME, SHARED).await;
+    grantee_unrelated_corruption(test, &alice, &bob, HOME, SHARED).await;
+    grantee_gate_controls(test, &alice, &bob, HOME, SHARED).await;
+    za_post(
+        "shares/revoke",
+        &json!({"username": ALICE, "password": STRONG, "calendar": "shared", "grant": ids[1]}),
+    )
+    .await
+    .expect(200);
+    bob.request("GET", &format!("{SHARED}event.ics"), "")
+        .await
+        .with_status(StatusCode::FORBIDDEN);
+    for slug in ["shared", "private", "default"] {
+        alice
+            .request("DELETE", &format!("{HOME}{slug}/"), "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    let _ = bob
+        .request(
+            "DELETE",
+            "/dav/cal/sharing-dav-bob%40example.com/default/",
+            "",
+        )
+        .await;
+    test.wait_for_tasks().await;
+}
+
+/// Grant/rename fencing and tombstone filtering use the real REPORT handler.
+async fn grantee_sync_boundaries(
+    test: &TestServer,
+    alice: &DummyWebDavClient,
+    bob: &DummyWebDavClient,
+    home: &str,
+    shared: &str,
+) {
+    use crate::utils::za::HookParked;
+    use common::za::test_hooks;
+    use dav_proto::Depth;
+    use groupware::calendar::sharing::boundary::mark_boundary_pending;
+    use std::sync::Arc;
+    println!("Running Task 10 sync boundary, rename and private tombstone controls...");
+    let owner = alice.account_id;
+    let calendar = resource_id(test, owner, "shared").await;
+    let keys = za_unlock(test, owner, STRONG).await;
+    let context = za_owned_calendar_context(&test.server, &keys, calendar)
+        .await
+        .unwrap();
+    let token = format!(
+        "urn:stalwart:davsync:{:x}",
+        context.stored.version.change_id().unwrap()
+    );
+    let old = sharing_sync_report(
+        bob,
+        shared,
+        "urn:stalwart:davsync:0",
+        Depth::Infinity,
+        None,
+        ["D:getetag"],
+    )
+    .await
+    .with_status(StatusCode::FORBIDDEN);
+    assert!(old.body.unwrap().contains("valid-sync-token"));
+    let mut pending = context.stored.deserialize::<Calendar>().unwrap();
+    mark_boundary_pending(&mut pending, &context.domain).unwrap();
+    update_calendar(test, owner, calendar, &context.stored, pending).await;
+    for target in [shared, home] {
+        for token in [&token, "urn:stalwart:davsync:fffffffffffffffe"] {
+            let response =
+                sharing_sync_report(bob, target, token, Depth::Infinity, None, ["D:getetag"])
+                    .await
+                    .with_status(StatusCode::FORBIDDEN);
+            assert!(response.body.unwrap().contains("valid-sync-token"));
+        }
+        sharing_sync_report(bob, target, "", Depth::Infinity, None, ["D:getetag"])
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+    }
+    assert!(
+        za_owned_calendar_context(&test.server, &keys, calendar)
+            .await
+            .unwrap()
+            .boundary
+            .unwrap()
+            .pending,
+        "grantee must never repair the pending boundary"
+    );
+    alice
+        .request("PROPFIND", shared, "")
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    assert!(
+        !za_owned_calendar_context(&test.server, &keys, calendar)
+            .await
+            .unwrap()
+            .boundary
+            .unwrap()
+            .pending
+    );
+    println!("Task10 sync after repair / rename: initial token");
+    let later = sharing_sync_report(bob, home, "", Depth::Infinity, None, ["D:getetag"])
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .sync_token()
+        .to_string();
+    for slug in ["shared", "private"] {
+        let path = format!("{home}{slug}/deleted.ics");
+        alice
+            .request_with_headers(
+                "PUT",
+                &path,
+                [("content-type", "text/calendar")],
+                EVENT.replace("share-read-UID", &format!("sync-{slug}")),
+            )
+            .await
+            .with_status(StatusCode::CREATED);
+        alice
+            .request("DELETE", &path, "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    println!("Task10 sync filtered tombstones token={later}");
+    for target in [home, shared] {
+        let response =
+            sharing_sync_report(bob, target, &later, Depth::Infinity, Some(1), ["D:getetag"])
+                .await
+                .with_status(StatusCode::MULTI_STATUS);
+        let hrefs = response.hrefs();
+        assert!(
+            hrefs
+                .iter()
+                .any(|path| path == &format!("{shared}deleted.ics")),
+            "missing granted tombstone: {hrefs:?}"
+        );
+        assert!(
+            !hrefs.iter().any(|path| path.contains("/private/")),
+            "private tombstone counted or emitted: {hrefs:?}"
+        );
+    }
+    // The destination is vacant when rename pauses. Its entire private history is
+    // then committed before the rename: only the rename's own assigned id may fence it.
+    let home_owned = home.to_string();
+    let shared_owned = shared.to_string();
+    let parked = HookParked::start(owner, test_hooks::set_share_rename_pause, async move {
+        DummyWebDavClient::new(
+            owner,
+            "sharing-dav-alice@example.com",
+            STRONG,
+            "sharing-dav-alice@example.com",
+        )
+        .request_with_headers(
+            "MOVE",
+            &shared_owned,
+            [("destination", format!("{home_owned}reused/").as_str())],
+            "",
+        )
+        .await
+        .status
+    })
+    .await;
+    let prior = test
+        .server
+        .store()
+        .get_last_change_id(owner, SyncCollection::Calendar.into())
+        .await
+        .unwrap()
+        .unwrap_or_default();
+    let above_prior = prior.checked_add(1).unwrap();
+    let precommit_token = format!("urn:stalwart:davsync:{above_prior:x}");
+    let reused = format!("{home}reused/");
+    alice
+        .request("MKCALENDAR", &reused, MKCAL)
+        .await
+        .with_status(StatusCode::CREATED);
+    alice
+        .request_with_headers(
+            "PUT",
+            &format!("{reused}private-history.ics"),
+            [("content-type", "text/calendar")],
+            EVENT.replace("share-read-UID", "sync-private-history"),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    alice
+        .request("DELETE", &reused, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    let private_history = test
+        .server
+        .store()
+        .get_last_change_id(owner, SyncCollection::Calendar.into())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(above_prior > prior && above_prior < private_history);
+    let completion = Arc::new(test_hooks::Pause::new(owner));
+    test_hooks::set_share_boundary_pause(Some(completion.clone()));
+    let finishing = tokio::spawn(parked.finish());
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        completion.arrived.notified(),
+    )
+    .await
+    .unwrap();
+    for target in [home, reused.as_str()] {
+        let response = sharing_sync_report(
+            bob,
+            target,
+            "urn:stalwart:davsync:fffffffffffffffe",
+            Depth::Infinity,
+            None,
+            ["D:getetag"],
+        )
+        .await
+        .with_status(StatusCode::FORBIDDEN);
+        assert!(response.body.unwrap().contains("valid-sync-token"));
+        let response = sharing_sync_report(bob, target, "", Depth::Infinity, None, ["D:getetag"])
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+        assert!(
+            !response
+                .hrefs()
+                .iter()
+                .any(|path| path.contains("private-history"))
+        );
+    }
+    completion.release.notify_one();
+    assert_eq!(finishing.await.unwrap(), StatusCode::CREATED);
+    test_hooks::set_share_boundary_pause(None);
+    let renamed = za_owned_calendar_context(&test.server, &keys, calendar)
+        .await
+        .unwrap();
+    assert!(renamed.boundary.unwrap().rename_change_id > private_history);
+    for target in [home, reused.as_str()] {
+        let response = sharing_sync_report(
+            bob,
+            target,
+            &precommit_token,
+            Depth::Infinity,
+            None,
+            ["D:getetag"],
+        )
+        .await
+        .with_status(StatusCode::FORBIDDEN);
+        assert!(
+            response.body.unwrap().contains("valid-sync-token"),
+            "numeric token above all pre-rename IDs must still be fenced after completion"
+        );
+    }
+    let refused = sharing_sync_report(bob, home, &later, Depth::Infinity, None, ["D:getetag"])
+        .await
+        .with_status(StatusCode::FORBIDDEN);
+    assert!(refused.body.unwrap().contains("valid-sync-token"));
+    println!("Task10 sync after repair / rename: initial token");
+    let later = sharing_sync_report(bob, home, "", Depth::Infinity, None, ["D:getetag"])
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .sync_token()
+        .to_string();
+    println!("Task10 sync after rename later token={later}");
+    let response = sharing_sync_report(bob, home, &later, Depth::Infinity, None, ["D:getetag"])
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    assert!(
+        !response
+            .hrefs()
+            .iter()
+            .any(|path| path.contains("private-history"))
+    );
+    // Restore the fixture's public slug for the caller's revoke and cleanup.
+    alice
+        .request_with_headers("MOVE", &reused, [("destination", shared)], "")
+        .await
+        .with_status(StatusCode::CREATED);
+}
+
+const LIFE_ALICE: &str = "sharing-life-alice@example.com";
+const LIFE_BOB: &str = "sharing-life-bob@example.com";
+const LIFE_ALIAS: &str = "sharing-life-work@example.com";
+const LIFE_CAROL: &str = "sharing-life-carol@example.com";
+const LIFE_PATH: &str = "/dav/cal/sharing-life-alice%40example.com/lifecycle/";
+
+fn sharing_lifecycle_body(
+    uid: &str,
+    summary: &str,
+    start: &str,
+    master: &[&str],
+    overrides: &[(&str, &[&str])],
+) -> String {
+    let mut result = format!(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//sharing-lifecycle//EN\r\nBEGIN:VEVENT\r\nUID:{uid}\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:{start}\r\nDTEND:20990301T120000Z\r\nRRULE:FREQ=DAILY;COUNT=5\r\nSUMMARY:{summary}\r\nORGANIZER:mailto:{LIFE_ALICE}\r\n"
+    );
+    for address in master {
+        result.push_str(&format!(
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{address}\r\n"
+        ));
+    }
+    result.push_str("END:VEVENT\r\n");
+    for (rid, attendees) in overrides {
+        result.push_str(&format!("BEGIN:VEVENT\r\nUID:{uid}\r\nRECURRENCE-ID:{rid}\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:{rid}\r\nDTEND:{}\r\nSUMMARY:override-{rid}\r\nORGANIZER:mailto:{LIFE_ALICE}\r\n", rid.replace("100000", "120000")));
+        for address in *attendees {
+            result.push_str(&format!(
+                "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{address}\r\n"
+            ));
+        }
+        result.push_str("END:VEVENT\r\n");
+    }
+    result.push_str("END:VCALENDAR\r\n");
+    result
+}
+
+async fn sharing_drain_step(test: &TestServer, party: &super::fanout::Party) {
+    use crate::utils::za::{pending_ids, trigger_drain};
+    assert_eq!(trigger_drain(party.name, STRONG).await, 207);
+    if !pending_ids(test, party.id).await.is_empty() {
+        // A transient pass defers the next pass for30s. Do not mistake that deferral
+        // for completed delivery or use the alarm-task wait_for_delivery helper.
+        tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+        assert_eq!(trigger_drain(party.name, STRONG).await, 207);
+    }
+    assert!(
+        pending_ids(test, party.id).await.is_empty(),
+        "pending pass after explicit retry"
+    );
+}
+
+/// Same accepted HTTP lifecycle, two UIDs. No expected copy shape is rewritten to
+/// manufacture parity: only the spec's timestamps/UID/delegated SENT-BY are normalized.
+async fn sharing_compare_lifecycle(
+    test: &TestServer,
+    label: &str,
+    templates: &[Option<String>],
+    addresses: &[&str],
+    expect_equal: bool,
+) {
+    use super::{
+        drain::{body, relative},
+        fanout::{NO_REPLY, Party, stored_pairs, uid_copies},
+    };
+    use crate::utils::za::{
+        copy_href, inbox_ids, inbox_items, item_attendees, new_inbox_items, normalize_sharing_copy,
+        open_pending_item_as, schedule_statuses,
+    };
+    use calcard::{
+        Entry, Parser,
+        icalendar::{ICalendarParameterName, ICalendarProperty},
+    };
+    use std::collections::BTreeSet;
+    let alice = Party::new(test, LIFE_ALICE);
+    let bob = Party::new(test, LIFE_BOB);
+    let carol = Party::new(test, LIFE_CAROL);
+    let keys = za_unlock(test, bob.id, STRONG).await;
+    let uids = [
+        format!("sharing-{label}-owner"),
+        format!("sharing-{label}-delegated"),
+    ];
+    let paths = [
+        format!("{LIFE_PATH}{label}-owner.ics"),
+        format!("{LIFE_PATH}{label}-delegated.ics"),
+    ];
+    let mut created = [false; 2];
+    for (step, template) in templates.iter().enumerate() {
+        let rejection_reason = match label {
+            "shared-organizer" => Some("SenderIsNotOrganizerNorAttendee"),
+            "subaddress-only" => Some("NotOrganizerNorAttendee"),
+            _ => None,
+        };
+        let rejection_trace =
+            rejection_reason.map(|_| super::mail::Traced::start(trc::EventType::variants()));
+        let mut rejected_items = Vec::new();
+        let mut messages = Vec::new();
+        let mut source_statuses = Vec::new();
+        let mut source_pair_sets = Vec::new();
+        for run in 0..2 {
+            if label.starts_with("failed-direct-alias") && run == 1 {
+                common::za::test_hooks::set_delegation_lookup_fail_once(Some((
+                    bob.id,
+                    LIFE_ALIAS.into(),
+                )));
+            }
+            let before = inbox_ids(test, bob.id).await;
+            let owner_inbox_before = inbox_ids(test, alice.id).await;
+            let client = if run == 0 { &alice.client } else { &bob.client };
+            if let Some(template) = template {
+                let calendar = template.replace("LIFECYCLE-UID", &uids[run]);
+                client
+                    .request_with_headers(
+                        "PUT",
+                        &paths[run],
+                        [super::fanout::CONTENT_TYPE],
+                        calendar,
+                    )
+                    .await
+                    .with_status(if created[run] {
+                        StatusCode::NO_CONTENT
+                    } else {
+                        StatusCode::CREATED
+                    });
+                created[run] = true;
+            } else {
+                client
+                    .request("DELETE", &paths[run], "")
+                    .await
+                    .with_status(StatusCode::NO_CONTENT);
+                created[run] = false;
+            }
+            common::za::test_hooks::set_delegation_lookup_fail_once(None);
+            if label == "owner-unlisted" {
+                assert_eq!(
+                    inbox_ids(test, alice.id).await,
+                    owner_inbox_before,
+                    "an owner-resolving unlisted attendee must get5.3 without an owner inbox item"
+                );
+            }
+            let mut sent = Vec::new();
+            let pending = new_inbox_items(test, bob.id, &before).await;
+            assert!(
+                pending.len() < 32,
+                "each step must fit within the drain cap"
+            );
+            if rejection_reason.is_some() {
+                assert_eq!(pending.len(), 1, "{label} step{step} run{run}: delivery");
+                rejected_items.push(pending[0].0);
+            }
+            for (id, _) in pending {
+                let (tree, _) = open_pending_item_as(test, bob.id, STRONG, id).await;
+                if rejection_reason.is_some() {
+                    let organizers = tree
+                        .components
+                        .iter()
+                        .flat_map(|component| &component.entries)
+                        .filter(|entry| entry.name == ICalendarProperty::Organizer)
+                        .flat_map(|entry| &entry.values)
+                        .map(|value| value.as_text().unwrap().to_string())
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        organizers,
+                        vec![format!(
+                            "mailto:{}",
+                            if label == "shared-organizer" {
+                                "sharing-life-shared-organizer@example.com"
+                            } else {
+                                LIFE_ALICE
+                            }
+                        )],
+                        "{label}: delivered organizer identity"
+                    );
+                    assert_eq!(
+                        item_attendees(&tree),
+                        vec![if label == "shared-organizer" {
+                            LIFE_BOB.to_string()
+                        } else {
+                            "sharing-life-bob+x@example.com".to_string()
+                        }],
+                        "{label}: delivered attendee identity"
+                    );
+                }
+                for organizer in tree
+                    .components
+                    .iter()
+                    .flat_map(|component| &component.entries)
+                    .filter(|entry| {
+                        entry.name == ICalendarProperty::Organizer
+                            && entry
+                                .values
+                                .first()
+                                .and_then(|value| value.as_text())
+                                .is_some_and(|address| {
+                                    address.trim_start_matches("mailto:") == LIFE_ALICE
+                                })
+                    })
+                {
+                    let sent_by = organizer
+                        .params
+                        .iter()
+                        .find(|parameter| parameter.name == ICalendarParameterName::SentBy)
+                        .and_then(|parameter| parameter.value.as_text());
+                    assert_eq!(
+                        sent_by,
+                        if run == 1 {
+                            Some("mailto:sharing-life-bob@example.com")
+                        } else {
+                            None
+                        },
+                        "HTTP delegated ORGANIZER must carry its writer's SENT-BY"
+                    );
+                }
+                if label.contains("subaddress") {
+                    println!("Case25 exported {label} step{step} run{run}:\n{tree}");
+                }
+                if label == "subaddress"
+                    && (step == 3 || step == 5)
+                    && crate::utils::za::item_method(&tree)
+                        == Some(calcard::icalendar::ICalendarMethod::Cancel)
+                {
+                    let attendee_addresses = item_attendees(&tree);
+                    assert!(
+                        attendee_addresses
+                            .iter()
+                            .any(|address| address == "sharing-life-bob+x@example.com")
+                    );
+                    assert_eq!(
+                        attendee_addresses.iter().any(|address| address == LIFE_BOB),
+                        step == 5,
+                        "partial removal CANCEL lacks the listed line; override deletion includes it"
+                    );
+                }
+                if label == "shared-organizer" {
+                    assert!(
+                        !tree
+                            .components
+                            .iter()
+                            .flat_map(|component| &component.entries)
+                            .filter(|entry| entry.name == ICalendarProperty::Organizer)
+                            .flat_map(|entry| &entry.params)
+                            .any(|parameter| parameter.name == ICalendarParameterName::SentBy)
+                    );
+                }
+                sent.push((
+                    item_attendees(&tree),
+                    normalize_sharing_copy(tree, "same-uid"),
+                ));
+            }
+            sent.sort_unstable_by_key(|(addresses, tree)| (addresses.clone(), tree.to_string()));
+            messages.push(sent);
+            if created[run] {
+                let source = body(&alice.client, &paths[run]).await;
+                let statuses = addresses
+                    .iter()
+                    .map(|address| {
+                        (
+                            address.to_string(),
+                            schedule_statuses(&source, ICalendarProperty::Attendee, address),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                source_statuses.push(Some(statuses));
+                let id = resource_id(
+                    test,
+                    alice.id,
+                    &format!(
+                        "lifecycle/{label}-{}.ics",
+                        if run == 0 { "owner" } else { "delegated" }
+                    ),
+                )
+                .await;
+                let raw = event_archive(test, alice.id, id)
+                    .await
+                    .deserialize::<CalendarEvent>()
+                    .unwrap();
+                let owner_keys = za_unlock(test, alice.id, STRONG).await;
+                let calendar_id = resource_id(test, alice.id, "lifecycle").await;
+                let context = za_owned_calendar_context(&test.server, &owner_keys, calendar_id)
+                    .await
+                    .unwrap();
+                let stored = event_archive(test, alice.id, id).await;
+                let pairs =
+                    groupware::calendar::seal::event_pairs_in_domain(&stored, &context.domain)
+                        .unwrap();
+                let present = pairs.as_ref().map(|pairs| {
+                    let addresses = addresses
+                        .iter()
+                        .filter(|address| pairs.get(address).is_some())
+                        .map(|address| address.to_string())
+                        .collect::<BTreeSet<_>>();
+                    assert_eq!(
+                        pairs.len(),
+                        addresses.len(),
+                        "source pair addresses must be exhaustively enumerated"
+                    );
+                    (pairs.len(), addresses)
+                });
+                source_pair_sets.push(Some(present));
+                if label.contains("sole-group") {
+                    assert!(
+                        statuses_for(&source_statuses[run], "sharing-life-team@example.com")
+                            .iter()
+                            .all(|status| status == "5.3")
+                    );
+                    assert!(
+                        !statuses_for(&source_statuses[run], "sharing-life-team@example.com")
+                            .is_empty()
+                    );
+                }
+                if label == "owner-unlisted" {
+                    assert_eq!(
+                        statuses_for(&source_statuses[run], "sharing-life-alice+y@example.com"),
+                        vec!["5.3".to_string()]
+                    );
+                }
+                if label.starts_with("failed-direct-alias") {
+                    assert_eq!(
+                        statuses_for(&source_statuses[run], LIFE_ALIAS),
+                        if run == 0 {
+                            Vec::<String>::new()
+                        } else {
+                            vec!["5.1".to_string()]
+                        }
+                    );
+                }
+                if label.starts_with("negative-") {
+                    for address in addresses {
+                        assert!(
+                            statuses_for(&source_statuses[run], address).is_empty(),
+                            "suppressed negative recipient must have no attempted status"
+                        );
+                    }
+                }
+                if label.contains("force") || label.contains("sole-group") {
+                    assert!(
+                        raw.schedule_tag.is_some(),
+                        "self-only scheduling must finalize and set a tag"
+                    );
+                    let Entry::ICalendar(parsed) = Parser::new(&source).entry() else {
+                        panic!("source iCalendar")
+                    };
+                    assert!(
+                        !parsed
+                            .components
+                            .iter()
+                            .flat_map(|component| &component.entries)
+                            .flat_map(|entry| &entry.params)
+                            .any(|parameter| parameter.name
+                                == ICalendarParameterName::ScheduleForceSend)
+                    );
+                }
+            } else {
+                source_statuses.push(None);
+                source_pair_sets.push(None);
+                alice
+                    .client
+                    .request("GET", &paths[run], "")
+                    .await
+                    .with_status(StatusCode::NOT_FOUND);
+            }
+        }
+        if expect_equal {
+            assert_eq!(
+                messages[0], messages[1],
+                "{label} step{step}: inbox payload/address multisets"
+            );
+            assert_eq!(
+                source_pair_sets[0], source_pair_sets[1],
+                "{label} step{step}: owner-stored token pair presence"
+            );
+            assert_eq!(
+                source_statuses[0], source_statuses[1],
+                "{label} step{step}: owner-stored recipient statuses"
+            );
+        }
+        sharing_drain_step(test, &bob).await;
+        sharing_drain_step(test, &carol).await;
+        if let Some(trace) = rejection_trace {
+            let events = trace.finish().await;
+            let history = inbox_items(test, bob.id).await;
+            assert_eq!(rejected_items.len(), 2);
+            for id in rejected_items {
+                let item = &history
+                    .iter()
+                    .find(|(item_id, _)| *item_id == id)
+                    .unwrap()
+                    .1;
+                assert_eq!(item.flags, 0, "{label}: rejected item is drained history");
+                assert_eq!(item.event_id, None, "{label}: rejected item has no copy");
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| {
+                            event.account_id == Some(u64::from(bob.id))
+                                && event.reason == rejection_reason.unwrap()
+                                && event.keys.iter().any(|(key, value)| {
+                                    *key == trc::Key::DocumentId
+                                        && matches!(value, trc::Value::UInt(value) if *value == u64::from(id))
+                                })
+                        })
+                        .count(),
+                    1,
+                    "{label} step{step}: each incoming item must hit its exact rejection"
+                );
+            }
+        }
+        let mut copies = Vec::new();
+        let mut token_sets = Vec::new();
+        for uid in &uids {
+            if uid_copies(test, bob.id, uid).await == 0 {
+                copies.push(None);
+                token_sets.push(None);
+            } else {
+                let href = copy_href(test, bob.id, uid).await;
+                let Entry::ICalendar(copy) = Parser::new(&body(&bob.client, &href).await).entry()
+                else {
+                    panic!("recipient iCalendar")
+                };
+                copies.push(Some(normalize_sharing_copy(copy, "same-uid")));
+                let pairs = stored_pairs(test, &keys, bob.id, &relative(&href)).await;
+                let present = addresses
+                    .iter()
+                    .filter(|address| {
+                        pairs
+                            .as_ref()
+                            .is_some_and(|pairs| pairs.get(address).is_some())
+                    })
+                    .map(|address| address.to_string())
+                    .collect::<BTreeSet<_>>();
+                let count = pairs.as_ref().map_or(0, |pairs| pairs.len());
+                assert_eq!(
+                    count,
+                    present.len(),
+                    "fixture must enumerate every token address"
+                );
+                token_sets.push(pairs.as_ref().map(|_| (count, present)));
+            }
+        }
+        if label.starts_with("agent-")
+            || label.starts_with("negative-")
+            || label.contains("sole-group")
+            || label == "shared-attendee"
+            || label == "shared-organizer"
+            || label == "subaddress-only"
+            || label == "writer-unlisted-organizer"
+            || label.starts_with("failed-direct-alias")
+        {
+            assert!(
+                copies.iter().all(Option::is_none),
+                "{label}: no self copy may be manufactured"
+            );
+        }
+        if label.starts_with("failed-direct-alias")
+            || label.starts_with("negative-")
+            || label.starts_with("agent-")
+            || label == "shared-attendee"
+            || label.contains("sole-group")
+        {
+            assert!(
+                messages.iter().all(Vec::is_empty),
+                "{label}: must create no Bob inbox item, including refused items"
+            );
+        }
+        if label.starts_with("exception-") {
+            assert!(
+                copies[0].is_none(),
+                "ordinary owner run suppresses direct listed aliases"
+            );
+            let copy = copies[1]
+                .as_ref()
+                .expect("delegated exception delivers the direct listed alias");
+            let expected = label.strip_prefix("exception-").unwrap();
+            assert_eq!(
+                crate::utils::za::item_partstat(copy, LIFE_ALIAS).as_deref(),
+                Some(expected)
+            );
+            assert!(messages[0].is_empty());
+            assert!(!messages[1].is_empty());
+        }
+        if label.contains("force") {
+            for copy in copies.iter().flatten() {
+                assert!(
+                    !copy
+                        .components
+                        .iter()
+                        .flat_map(|component| &component.entries)
+                        .flat_map(|entry| &entry.params)
+                        .any(
+                            |parameter| parameter.name == ICalendarParameterName::ScheduleForceSend
+                        )
+                );
+            }
+        }
+        if expect_equal {
+            assert_eq!(copies[0], copies[1], "{label} step{step}: recipient copies");
+            assert_eq!(
+                token_sets[0], token_sets[1],
+                "{label} step{step}: token-address presence"
+            );
+        }
+        println!(
+            "Case25 {label} step{step}: owner/delegated copies {:?}, messages {:?}, source statuses {:?}",
+            copies.iter().map(Option::is_some).collect::<Vec<_>>(),
+            messages.iter().map(Vec::len).collect::<Vec<_>>(),
+            source_statuses
+        );
+    }
+    for (run, uid) in uids.iter().enumerate() {
+        if created[run] {
+            alice
+                .client
+                .request_with_headers("DELETE", &paths[run], [NO_REPLY], "")
+                .await
+                .with_status(StatusCode::NO_CONTENT);
+        }
+        for party in [&bob, &carol] {
+            if uid_copies(test, party.id, uid).await != 0 {
+                party
+                    .client
+                    .request_with_headers(
+                        "DELETE",
+                        &copy_href(test, party.id, uid).await,
+                        [NO_REPLY],
+                        "",
+                    )
+                    .await
+                    .with_status(StatusCode::NO_CONTENT);
+            }
+        }
+    }
+    for party in [&alice, &bob, &carol] {
+        party.delete_items(inbox_ids(test, party.id).await).await;
+    }
+}
+
+async fn sharing_lifecycle_differential(test: &mut TestServer) {
+    use super::drain::DrainOn;
+    use crate::utils::za::za_post;
+    use serde_json::json;
+    println!("Running case25 HTTP owner/delegated lifecycle differential...");
+    let _drain = DrainOn::new();
+    let admin = test.account("admin@example.com").clone();
+    for name in [LIFE_ALICE, LIFE_BOB, LIFE_CAROL] {
+        let account = admin
+            .create_key_user_account(
+                name,
+                STRONG,
+                name,
+                if name == LIFE_BOB {
+                    &[LIFE_ALIAS, "sharing-life-custom@sharing-neg-custom.test"][..]
+                } else {
+                    &[]
+                },
+                user_permissions(),
+            )
+            .await;
+        test.insert_account(account);
+    }
+    let alice = super::fanout::Party::new(test, LIFE_ALICE);
+    let bob = super::fanout::Party::new(test, LIFE_BOB);
+    alice
+        .client
+        .request("MKCALENDAR", LIFE_PATH, MKCAL)
+        .await
+        .with_status(StatusCode::CREATED);
+    let key = test
+        .server
+        .za_served_public_key(bob.id)
+        .await
+        .unwrap()
+        .unwrap();
+    super::pinning::pin(
+        LIFE_ALICE,
+        LIFE_BOB,
+        &vault::keys::display_fingerprint(&key),
+    )
+    .await
+    .expect(200);
+    za_post("shares/grant", &json!({"username":LIFE_ALICE,"password":STRONG,"calendar":"lifecycle","address":LIFE_BOB,"level":"edit"})).await.expect(200);
+    let both = [LIFE_BOB, LIFE_CAROL];
+    let carol = [LIFE_CAROL];
+    let rid1 = "20990302T100000Z";
+    let rid2 = "20990303T100000Z";
+    let body = |summary, start, master: &[&str], overrides: &[(&str, &[&str])]| {
+        Some(sharing_lifecycle_body(
+            "LIFECYCLE-UID",
+            summary,
+            start,
+            master,
+            overrides,
+        ))
+    };
+    let main = [
+        body("create", "20990301T100000Z", &both, &[(rid1, &both)]),
+        body("summary", "20990301T100000Z", &both, &[(rid1, &both)]),
+        body("summary", "20990301T110000Z", &both, &[(rid1, &both)]),
+        body(
+            "summary",
+            "20990301T110000Z",
+            &both,
+            &[(rid1, &both), (rid2, &both)],
+        ),
+        body(
+            "summary",
+            "20990301T110000Z",
+            &both,
+            &[(rid1, &carol), (rid2, &both)],
+        ),
+        body(
+            "summary-again",
+            "20990301T110000Z",
+            &both,
+            &[(rid1, &carol), (rid2, &both)],
+        ),
+        body(
+            "summary-again",
+            "20990301T110000Z",
+            &both,
+            &[(rid1, &both), (rid2, &both)],
+        ),
+        body("summary-again", "20990301T110000Z", &both, &[(rid2, &both)]),
+        body(
+            "summary-again",
+            "20990301T110000Z",
+            &carol,
+            &[(rid2, &both)],
+        ),
+        body("summary-again", "20990301T110000Z", &both, &[(rid2, &both)]),
+        None,
+    ];
+    sharing_compare_lifecycle(
+        test,
+        "eleven",
+        &main,
+        &[LIFE_BOB, LIFE_ALIAS, LIFE_CAROL],
+        true,
+    )
+    .await;
+    let alias = [LIFE_ALIAS, LIFE_CAROL];
+    sharing_compare_lifecycle(
+        test,
+        "listed-alias",
+        &[
+            body("alias", "20990301T100000Z", &both, &[(rid1, &alias)]),
+            body(
+                "alias-summary",
+                "20990301T100000Z",
+                &both,
+                &[(rid1, &alias)],
+            ),
+            body(
+                "alias-summary",
+                "20990301T100000Z",
+                &carol,
+                &[(rid1, &alias)],
+            ),
+            body(
+                "alias-summary",
+                "20990301T100000Z",
+                &alias,
+                &[(rid1, &alias)],
+            ),
+            None,
+        ],
+        &[LIFE_BOB, LIFE_ALIAS, LIFE_CAROL],
+        true,
+    )
+    .await;
+    let sub = "sharing-life-bob+x@example.com";
+    assert_eq!(
+        test.server.account_id_from_email(sub, true).await.unwrap(),
+        Some(bob.id)
+    );
+    let sub_attendees = [LIFE_BOB, sub, LIFE_CAROL];
+    sharing_compare_lifecycle(
+        test,
+        "subaddress",
+        &[
+            body("sub", "20990301T100000Z", &both, &[(rid1, &sub_attendees)]),
+            body(
+                "sub-summary",
+                "20990301T100000Z",
+                &both,
+                &[(rid1, &sub_attendees)],
+            ),
+            body(
+                "sub-summary",
+                "20990301T110000Z",
+                &both,
+                &[(rid1, &sub_attendees)],
+            ),
+            body("sub-summary", "20990301T110000Z", &both, &[(rid1, &both)]),
+            body(
+                "sub-summary",
+                "20990301T110000Z",
+                &both,
+                &[(rid1, &sub_attendees)],
+            ),
+            body("sub-summary", "20990301T110000Z", &both, &[]),
+            None,
+        ],
+        &[LIFE_BOB, LIFE_ALIAS, sub, LIFE_CAROL],
+        true,
+    )
+    .await;
+    sharing_compare_lifecycle(
+        test,
+        "subaddress-only",
+        &[body("sub-only", "20990301T100000Z", &[sub], &[]), None],
+        &[sub],
+        true,
+    )
+    .await;
+    for agent in ["CLIENT", "NONE"] {
+        let value = sharing_lifecycle_body(
+            "LIFECYCLE-UID",
+            "agent",
+            "20990301T100000Z",
+            &[LIFE_BOB],
+            &[],
+        )
+        .replace("ATTENDEE;", &format!("ATTENDEE;SCHEDULE-AGENT={agent};"));
+        sharing_compare_lifecycle(
+            test,
+            &format!("agent-{agent}"),
+            &[Some(value), None],
+            &[LIFE_BOB],
+            true,
+        )
+        .await;
+    }
+    let value = sharing_lifecycle_body(
+        "LIFECYCLE-UID",
+        "force",
+        "20990301T100000Z",
+        &[LIFE_BOB],
+        &[],
+    )
+    .replace("ATTENDEE;", "ATTENDEE;SCHEDULE-FORCE-SEND=REQUEST;");
+    sharing_compare_lifecycle(test, "force-sole", &[Some(value), None], &[LIFE_BOB], true).await;
+    sharing_http_schedule_contracts(test).await;
+    sharing_lifecycle_negative_and_exception(test).await;
+    alice
+        .client
+        .request("DELETE", LIFE_PATH, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    for name in [LIFE_ALICE, LIFE_BOB, LIFE_CAROL] {
+        super::fanout::Party::new(test, name)
+            .client
+            .delete_default_containers()
+            .await;
+    }
+    test.wait_for_tasks().await;
+}
+
+/// Raw sync REPORT used for both success and negative precondition assertions.
+/// DummyWebDavClient::sync_collection asserts207 internally and cannot inspect403.
+async fn sharing_sync_report(
+    client: &DummyWebDavClient,
+    path: &str,
+    token: &str,
+    depth: dav_proto::Depth,
+    limit: Option<usize>,
+    _properties: [&str; 1],
+) -> crate::utils::webdav::DavResponse {
+    let limit = limit
+        .map(|limit| format!("<D:limit><D:nresults>{limit}</D:nresults></D:limit>"))
+        .unwrap_or_default();
+    client.request("REPORT", path, format!("<D:sync-collection xmlns:D=\"DAV:\"><D:prop><D:getetag/></D:prop><D:sync-token>{token}</D:sync-token><D:sync-level>{}</D:sync-level>{limit}</D:sync-collection>", if depth == dav_proto::Depth::Infinity { "infinite" } else { "1" })).await
+}
+
+fn statuses_for(statuses: &Option<Vec<(String, Vec<String>)>>, address: &str) -> Vec<String> {
+    statuses
+        .as_ref()
+        .and_then(|statuses| statuses.iter().find(|(key, _)| key == address))
+        .map(|(_, values)| values.clone())
+        .unwrap_or_default()
+}
+
+async fn sharing_lifecycle_negative_and_exception(test: &mut TestServer) {
+    use common::ipc::CacheInvalidation;
+    use registry::schema::{
+        prelude::{ObjectType, Property},
+        structs::{Domain, Expression, ExpressionMatch, SubAddressing, SubAddressingCustom},
+    };
+    use registry::types::list::List;
+    use serde_json::json;
+    let admin = test.account("admin@example.com").clone();
+    let owner = test.account(LIFE_ALICE).id();
+    let writer = test.account(LIFE_BOB).id();
+    let shared_attendee = admin
+        .create_group_account(
+            "sharing-life-shared-attendee@example.com",
+            "Shared attendee",
+            &[],
+        )
+        .await;
+    let shared_organizer = admin
+        .create_group_account(
+            "sharing-life-shared-organizer@example.com",
+            "Shared organizer",
+            &[],
+        )
+        .await;
+    let team = admin
+        .create_group_account("sharing-life-team@example.com", "Writer only", &[])
+        .await;
+    let (ag, og, wg) = (shared_attendee.id(), shared_organizer.id(), team.id());
+    test.insert_account(shared_attendee);
+    test.insert_account(shared_organizer);
+    test.insert_account(team);
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            owner,
+            json!({Property::MemberGroupIds:{ag:true,og:true}}),
+        )
+        .await;
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            writer,
+            json!({Property::MemberGroupIds:{ag:true,og:true,wg:true}}),
+        )
+        .await;
+    let make = |addresses: &[&str]| {
+        sharing_lifecycle_body("LIFECYCLE-UID", "edge", "20990301T100000Z", addresses, &[])
+    };
+    sharing_compare_lifecycle(
+        test,
+        "shared-attendee",
+        &[
+            Some(make(&["sharing-life-shared-attendee@example.com"])),
+            None,
+        ],
+        &["sharing-life-shared-attendee@example.com"],
+        true,
+    )
+    .await;
+    let organized =
+        make(&[LIFE_BOB]).replace(LIFE_ALICE, "sharing-life-shared-organizer@example.com");
+    sharing_compare_lifecycle(
+        test,
+        "shared-organizer",
+        &[Some(organized), None],
+        &[LIFE_BOB],
+        true,
+    )
+    .await;
+    println!(
+        "Case25 shared-group ORGANIZER: delegated gate, no SENT-BY, inherited receiver group-id/changed_by rejection preserved"
+    );
+    sharing_compare_lifecycle(
+        test,
+        "sole-group",
+        &[Some(make(&["sharing-life-team@example.com"])), None],
+        &["sharing-life-team@example.com"],
+        true,
+    )
+    .await;
+    sharing_compare_lifecycle(
+        test,
+        "owner-unlisted",
+        &[
+            Some(make(&[LIFE_BOB, "sharing-life-alice+y@example.com"])),
+            None,
+        ],
+        &[LIFE_BOB, "sharing-life-alice+y@example.com"],
+        true,
+    )
+    .await;
+    let unlisted = make(&[LIFE_BOB]).replace(LIFE_ALICE, "sharing-life-bob+x@example.com");
+    sharing_compare_lifecycle(
+        test,
+        "writer-unlisted-organizer",
+        &[Some(unlisted), None],
+        &[LIFE_BOB],
+        true,
+    )
+    .await;
+    for (expected, flags) in [
+        ("DECLINED", "PARTSTAT=DECLINED;RSVP=TRUE"),
+        ("NEEDS-ACTION", "PARTSTAT=NEEDS-ACTION;RSVP=FALSE"),
+        ("ACCEPTED", "PARTSTAT=ACCEPTED;RSVP=TRUE"),
+    ] {
+        let initial = make(&[LIFE_ALIAS]).replace("PARTSTAT=NEEDS-ACTION;RSVP=TRUE", flags);
+        let added = sharing_lifecycle_body(
+            "LIFECYCLE-UID",
+            "edge",
+            "20990301T100000Z",
+            &[LIFE_ALIAS],
+            &[("20990302T100000Z", &[LIFE_ALIAS])],
+        )
+        .replace("PARTSTAT=NEEDS-ACTION;RSVP=TRUE", flags);
+        sharing_compare_lifecycle(
+            test,
+            &format!("exception-{expected}"),
+            &[Some(initial), Some(added), None],
+            &[LIFE_ALIAS],
+            false,
+        )
+        .await;
+        if expected != "ACCEPTED" {
+            let failed = make(&[LIFE_ALIAS]).replace("PARTSTAT=NEEDS-ACTION;RSVP=TRUE", flags);
+            sharing_compare_lifecycle(
+                test,
+                &format!("failed-direct-alias-{expected}"),
+                &[Some(failed), None],
+                &[LIFE_ALIAS],
+                false,
+            )
+            .await;
+        }
+        for (label, address) in [
+            ("group", "sharing-life-team@example.com"),
+            ("unlisted", "sharing-life-bob+x@example.com"),
+        ] {
+            let initial = make(&[address]).replace("PARTSTAT=NEEDS-ACTION;RSVP=TRUE", flags);
+            sharing_compare_lifecycle(
+                test,
+                &format!("negative-{label}-{expected}"),
+                &[Some(initial), None],
+                &[address],
+                true,
+            )
+            .await;
+        }
+        // Isolated domains exercise the broader resolver without making the
+        // resulting address a directly owned listed alias. Restore both policy
+        // fields and positive/negative caches after every individual fixture.
+        for (kind, domain_name, address) in [
+            (
+                "custom",
+                "sharing-neg-custom.test",
+                "sharing-life-custom.topic@sharing-neg-custom.test",
+            ),
+            (
+                "catchall",
+                "sharing-neg-catchall.test",
+                "nobody@sharing-neg-catchall.test",
+            ),
+        ] {
+            let domain = admin.find_or_create_domain(domain_name).await;
+            let saved = test
+                .server
+                .registry()
+                .object::<Domain>(domain)
+                .await
+                .unwrap()
+                .unwrap();
+            let settings = if kind == "custom" {
+                json!({"catchAllAddress":null,"subAddressing":SubAddressing::Custom(SubAddressingCustom{custom_rule:Expression{else_:"false".into(),match_:List::from_iter([ExpressionMatch{if_:"matches('^([^.]+)\\.([^.]+)', rcpt)".into(),then:"$1".into()}])}})})
+            } else {
+                json!({"catchAllAddress":LIFE_BOB,"subAddressing":{"@type":"Disabled"}})
+            };
+            admin
+                .registry_update_object(ObjectType::Domain, domain, settings)
+                .await;
+            test.server
+                .invalidate_local_caches(&[
+                    CacheInvalidation::Domain(domain.document_id()),
+                    CacheInvalidation::Account(writer.document_id()),
+                ])
+                .await;
+            test.server.invalidate_all_local_negative_caches();
+            assert_eq!(
+                test.server
+                    .account_id_from_email(address, true)
+                    .await
+                    .unwrap(),
+                Some(writer.document_id())
+            );
+            let initial = make(&[address]).replace("PARTSTAT=NEEDS-ACTION;RSVP=TRUE", flags);
+            sharing_compare_lifecycle(
+                test,
+                &format!("negative-{kind}-{expected}"),
+                &[Some(initial), None],
+                &[address],
+                true,
+            )
+            .await;
+            admin.registry_update_object(ObjectType::Domain, domain, json!({"catchAllAddress":saved.catch_all_address,"subAddressing":saved.sub_addressing})).await;
+            test.server
+                .invalidate_local_caches(&[
+                    CacheInvalidation::Domain(domain.document_id()),
+                    CacheInvalidation::Account(writer.document_id()),
+                ])
+                .await;
+            test.server.invalidate_all_local_negative_caches();
+        }
+    }
+}
+
+async fn grantee_gate_controls(
+    test: &mut TestServer,
+    alice: &DummyWebDavClient,
+    bob: &DummyWebDavClient,
+    home: &str,
+    shared: &str,
+) {
+    use crate::utils::za::za_post;
+    use common::auth::oauth::GrantType;
+    use registry::schema::{
+        enums::Permission,
+        prelude::{ObjectType, Property},
+    };
+    use serde_json::json;
+    use types::acl::{Acl, AclGrant};
+    const GRACE: &str = "sharing-gate-grace@example.com";
+    const IMP: &str = "sharing-gate-imp@example.com";
+    let admin = test.account("admin@example.com").clone();
+    let grace = admin
+        .create_key_user_account(GRACE, STRONG, "Group member", &[], user_permissions())
+        .await;
+    let grace_id = grace.id();
+    test.insert_account(grace);
+    let mut permissions = user_permissions();
+    permissions.push(Permission::Impersonate);
+    let imp = admin
+        .create_key_user_account(IMP, STRONG, "Impersonate permission", &[], permissions)
+        .await;
+    let imp_id = imp.id().document_id();
+    test.insert_account(imp);
+    let grace = DummyWebDavClient::new(grace_id.document_id(), GRACE, STRONG, GRACE);
+    let imp = DummyWebDavClient::new(imp_id, IMP, STRONG, IMP);
+    grace
+        .request("GET", &format!("{shared}event.ics"), "")
+        .await
+        .with_status(StatusCode::FORBIDDEN);
+    let bearer = test
+        .server
+        .encode_access_token(
+            GrantType::AccessToken,
+            bob.account_id,
+            bob.name,
+            3600,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let mut keyless = DummyWebDavClient::new(bob.account_id, bob.name, STRONG, bob.name);
+    keyless.credentials = format!("Bearer {bearer}");
+    keyless
+        .request("PROPFIND", &format!("/dav/card/{}/", bob.name), "")
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    keyless
+        .request("GET", &format!("{shared}event.ics"), "")
+        .await
+        .with_status(StatusCode::FORBIDDEN);
+    let master: &'static str = Box::leak(format!("{}%{}", bob.name, admin.name()).into_boxed_str());
+    DummyWebDavClient::new(bob.account_id, master, admin.secret(), bob.name)
+        .request("PROPFIND", shared, "")
+        .await
+        .with_status(StatusCode::FORBIDDEN);
+    let group = admin
+        .create_group_account("sharing-gate-group@example.com", "Planted group grant", &[])
+        .await;
+    let group_id = group.id();
+    test.insert_account(group);
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            grace_id,
+            json!({Property::MemberGroupIds:{group_id:true}}),
+        )
+        .await;
+    let keys = za_unlock(test, alice.account_id, STRONG).await;
+    let private_id = resource_id(test, alice.account_id, "private").await;
+    let context = za_owned_calendar_context(&test.server, &keys, private_id)
+        .await
+        .unwrap();
+    let mut calendar = context.stored.deserialize::<Calendar>().unwrap();
+    calendar.acls.push(AclGrant {
+        account_id: group_id.document_id(),
+        grants: [Acl::Read, Acl::ReadItems].into_iter().collect(),
+    });
+    update_calendar(
+        test,
+        alice.account_id,
+        private_id,
+        &context.stored,
+        calendar,
+    )
+    .await;
+    grace
+        .request("PROPFIND", &format!("{home}private/"), "")
+        .await
+        .with_status(StatusCode::FORBIDDEN);
+    grace
+        .request("PROPFIND", home, "")
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    let key = test
+        .server
+        .za_served_public_key(imp_id)
+        .await
+        .unwrap()
+        .unwrap();
+    super::pinning::pin(alice.name, IMP, &vault::keys::display_fingerprint(&key))
+        .await
+        .expect(200);
+    za_post("shares/grant", &json!({"username":alice.name,"password":STRONG,"calendar":"shared","address":IMP,"level":"edit"})).await.expect(200);
+    imp.request("PROPFIND", "/dav/cal/sharing-gate-imp%40example.com/", "")
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    for (method, target, body) in [
+        ("GET", format!("{shared}event.ics"), ""),
+        (
+            "PROPFIND",
+            shared.into(),
+            "<D:propfind xmlns:D=\"DAV:\"><D:propname/></D:propfind>",
+        ),
+        (
+            "LOCK",
+            shared.into(),
+            "<D:lockinfo xmlns:D=\"DAV:\"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>",
+        ),
+        ("UNLOCK", shared.into(), ""),
+        ("COPY", shared.into(), ""),
+        ("MOVE", shared.into(), ""),
+    ] {
+        imp.request_with_headers(
+            method,
+            &target,
+            [
+                ("destination", format!("{home}forbidden/").as_str()),
+                ("lock-token", "<urn:stalwart:davlock:1234>"),
+            ],
+            body,
+        )
+        .await
+        .with_status(StatusCode::FORBIDDEN);
+    }
+    // Owner EWK/personal bundle and the other grantee's entire entry survive Bob's patch.
+    let id = resource_id(test, alice.account_id, "shared").await;
+    let before = za_owned_calendar_context(&test.server, &keys, id)
+        .await
+        .unwrap()
+        .stored
+        .deserialize::<Calendar>()
+        .unwrap();
+    bob.request("PROPPATCH", shared, "<D:propertyupdate xmlns:D=\"DAV:\"><D:set><D:prop><D:displayname>Bob final personal name</D:displayname></D:prop></D:set></D:propertyupdate>").await.with_status(StatusCode::MULTI_STATUS);
+    let after = za_owned_calendar_context(&test.server, &keys, id)
+        .await
+        .unwrap()
+        .stored
+        .deserialize::<Calendar>()
+        .unwrap();
+    for personal in before
+        .preferences
+        .iter()
+        .filter(|entry| entry.account_id != bob.account_id)
+    {
+        assert_eq!(
+            after
+                .preferences
+                .iter()
+                .find(|entry| entry.account_id == personal.account_id),
+            Some(personal),
+            "unopened personal/ring entry must be byte-for-byte unchanged"
+        );
+    }
+    let assisted_before = test.server.core.groupware.assisted_discovery;
+    for enabled in [false, true] {
+        admin
+            .registry_update_setting(
+                registry::schema::structs::WebDav {
+                    enable_assisted_discovery: enabled,
+                    ..Default::default()
+                },
+                &[Property::EnableAssistedDiscovery],
+            )
+            .await;
+        admin.reload_settings().await;
+        test.reload_core();
+        for client in [bob, &grace, &imp] {
+            for prop in ["<D:allprop/>", "<D:propname/>"] {
+                let body = format!("<D:propfind xmlns:D=\"DAV:\">{prop}</D:propfind>");
+                for path in [
+                    format!("/dav/cal/{}/", client.name.replace('@', "%40")),
+                    "/dav/cal/".into(),
+                ] {
+                    let result = client
+                        .request_with_headers("PROPFIND", &path, [("depth", "1")], &body)
+                        .await
+                        .with_status(StatusCode::MULTI_STATUS)
+                        .body
+                        .unwrap();
+                    if client.account_id != bob.account_id {
+                        assert!(
+                            !result.contains("sharing-dav-alice"),
+                            "ineligible discovery: {result}"
+                        );
+                    } else if enabled && path != "/dav/cal/" {
+                        assert!(result.contains("/shared/"));
+                    } else if !enabled && path != "/dav/cal/" {
+                        assert!(!result.contains("sharing-dav-alice"));
+                        assert!(!result.contains("/shared/"));
+                    }
+                    assert!(!result.contains("/private/"));
+                }
+                if !enabled && client.account_id == bob.account_id {
+                    let foreign = client
+                        .request_with_headers("PROPFIND", home, [("depth", "1")], &body)
+                        .await
+                        .with_status(StatusCode::MULTI_STATUS)
+                        .body
+                        .unwrap();
+                    assert!(foreign.contains("/shared/"));
+                    assert!(!foreign.contains("/private/"));
+                }
+            }
+            let response = client.request("PROPFIND", &format!("/dav/pal/{}/", client.name.replace('@',"%40")), "<D:propfind xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:prop><C:calendar-home-set/></D:prop></D:propfind>").await.with_status(StatusCode::MULTI_STATUS).body.unwrap();
+            assert_eq!(
+                response.contains("sharing-dav-alice"),
+                client.account_id == bob.account_id && !enabled
+            );
+        }
+    }
+    admin
+        .registry_update_setting(
+            registry::schema::structs::WebDav {
+                enable_assisted_discovery: assisted_before,
+                ..Default::default()
+            },
+            &[Property::EnableAssistedDiscovery],
+        )
+        .await;
+    admin.reload_settings().await;
+    test.reload_core();
+    // Eligible corrupt events stay visible as500 items, rather than disappearing.
+    let event_id = resource_id(test, alice.account_id, "shared/event.ics").await;
+    let stored = event_archive(test, alice.account_id, event_id).await;
+    let valid = stored.deserialize::<CalendarEvent>().unwrap();
+    let mut corrupt = valid.clone();
+    let carrier = corrupt.data.event.components[0].entries.last_mut().unwrap();
+    let calcard::icalendar::ICalendarValue::Text(encoded) = &mut carrier.values[0] else {
+        panic!("envelope")
+    };
+    *encoded = "not-base64".into();
+    update_event(test, alice.account_id, event_id, &stored, corrupt).await;
+    bob.request("GET", &format!("{shared}event.ics"), "")
+        .await
+        .with_status(StatusCode::INTERNAL_SERVER_ERROR);
+    let response = bob
+        .request_with_headers("PROPFIND", home, [("depth", "infinity")], "")
+        .await;
+    // Home infinity is the upstream finite-depth refusal. A calendar depth1 visits the corrupt item.
+    assert_eq!(response.status, StatusCode::FORBIDDEN);
+    let response = bob
+        .request_with_headers("PROPFIND", shared, [("depth", "1")], "")
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    assert!(
+        response
+            .hrefs()
+            .iter()
+            .any(|path| path.ends_with("event.ics"))
+    );
+    assert!(response.body.unwrap().contains("500 Internal Server Error"));
+    let damaged = event_archive(test, alice.account_id, event_id).await;
+    update_event(test, alice.account_id, event_id, &damaged, valid).await;
+    let current = test
+        .server
+        .store()
+        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            alice.account_id,
+            Collection::Calendar,
+            private_id,
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let original_private = context.stored.deserialize::<Calendar>().unwrap();
+    update_calendar(
+        test,
+        alice.account_id,
+        private_id,
+        &current,
+        original_private,
+    )
+    .await;
+    // Root discovery materializes the ordinary group's default calendar.
+    // Group membership grants the same cleanup authority as the ordinary DAV controls.
+    grace
+        .request(
+            "DELETE",
+            "/dav/cal/sharing-gate-group%40example.com/default/",
+            "",
+        )
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    for client in [&grace, &imp] {
+        client.delete_default_containers().await;
+    }
+}
+
+async fn grantee_pending_grant_and_slug_reuse(
+    _test: &TestServer,
+    alice: &DummyWebDavClient,
+    bob: &DummyWebDavClient,
+    home: &str,
+) {
+    use crate::utils::za::{HookParked, za_post};
+    use dav_proto::Depth;
+    use serde_json::json;
+    let pending_path = format!("{home}pending-grant/");
+    alice
+        .request("MKCALENDAR", &pending_path, MKCAL)
+        .await
+        .with_status(StatusCode::CREATED);
+    let request = json!({"username":alice.name,"password":STRONG,"calendar":"pending-grant","address":bob.name,"level":"view"});
+    let parked = HookParked::start(
+        alice.account_id,
+        common::za::test_hooks::set_share_boundary_pause,
+        async move { za_post("shares/grant", &request).await },
+    )
+    .await;
+    for path in [&pending_path, home] {
+        for token in [
+            "urn:stalwart:davsync:0",
+            "urn:stalwart:davsync:fffffffffffffffe",
+        ] {
+            let result =
+                sharing_sync_report(bob, path, token, Depth::Infinity, None, ["D:getetag"])
+                    .await
+                    .with_status(StatusCode::FORBIDDEN);
+            assert!(result.body.unwrap().contains("valid-sync-token"));
+        }
+        sharing_sync_report(bob, path, "", Depth::Infinity, None, ["D:getetag"])
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+    }
+    parked.finish().await.expect(200);
+    alice
+        .request("DELETE", &pending_path, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    let old = sharing_sync_report(bob, home, "", Depth::Infinity, None, ["D:getetag"])
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .sync_token()
+        .to_string();
+    let path = format!("{home}reused-grant/");
+    alice
+        .request("MKCALENDAR", &path, MKCAL)
+        .await
+        .with_status(StatusCode::CREATED);
+    alice
+        .request_with_headers(
+            "PUT",
+            &format!("{path}private-history.ics"),
+            [("content-type", "text/calendar")],
+            EVENT.replace("share-read-UID", "grant-private-history"),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    alice
+        .request("DELETE", &path, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    alice
+        .request("MKCALENDAR", &path, MKCAL)
+        .await
+        .with_status(StatusCode::CREATED);
+    za_post("shares/grant",&json!({"username":alice.name,"password":STRONG,"calendar":"reused-grant","address":bob.name,"level":"view"})).await.expect(200);
+    let refused = sharing_sync_report(bob, &path, &old, Depth::Infinity, None, ["D:getetag"])
+        .await
+        .with_status(StatusCode::FORBIDDEN);
+    assert!(refused.body.unwrap().contains("valid-sync-token"));
+    let initial = sharing_sync_report(bob, &path, "", Depth::Infinity, None, ["D:getetag"])
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    assert!(
+        !initial
+            .hrefs()
+            .iter()
+            .any(|href| href.contains("private-history"))
+    );
+    alice
+        .request("DELETE", &path, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+}
+
+/// A direct healthy request must not open another granted calendar's corrupt ring.
+async fn grantee_unrelated_corruption(
+    test: &TestServer,
+    alice: &DummyWebDavClient,
+    bob: &DummyWebDavClient,
+    home: &str,
+    shared: &str,
+) {
+    use crate::utils::za::za_post;
+    use serde_json::json;
+    let path = format!("{home}other-eligible/");
+    alice
+        .request("MKCALENDAR", &path, MKCAL)
+        .await
+        .with_status(StatusCode::CREATED);
+    za_post("shares/grant",&json!({"username":alice.name,"password":STRONG,"calendar":"other-eligible","address":bob.name,"level":"view"})).await.expect(200);
+    let id = resource_id(test, alice.account_id, "other-eligible").await;
+    let keys = za_unlock(test, alice.account_id, STRONG).await;
+    let context = za_owned_calendar_context(&test.server, &keys, id)
+        .await
+        .unwrap();
+    let valid = context.stored.deserialize::<Calendar>().unwrap();
+    let mut corrupted = valid.clone();
+    let entry = corrupted
+        .preferences
+        .iter_mut()
+        .find(|entry| entry.account_id == bob.account_id)
+        .unwrap();
+    let mut parts = entry
+        .name
+        .strip_prefix("$za$")
+        .unwrap()
+        .split('|')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    parts[0] = "invalid-grant-ring".into();
+    entry.name = format!("$za${}", parts.join("|"));
+    update_calendar(test, alice.account_id, id, &context.stored, corrupted).await;
+    println!(
+        "Task10 requested scope: healthy calendar with separately eligible corrupt grant ring"
+    );
+    bob.request("PROPFIND", shared, "")
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    bob.request("PROPFIND", &path, "")
+        .await
+        .with_status(StatusCode::INTERNAL_SERVER_ERROR);
+    bob.request("PROPFIND", home, "")
+        .await
+        .with_status(StatusCode::INTERNAL_SERVER_ERROR);
+    let current = test
+        .server
+        .store()
+        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            alice.account_id,
+            Collection::Calendar,
+            id,
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    update_calendar(test, alice.account_id, id, &current, valid).await;
+    alice
+        .request("DELETE", &path, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+}
+
+fn sharing_tree(text: &str) -> calcard::icalendar::ICalendar {
+    let calcard::Entry::ICalendar(tree) = calcard::Parser::new(text).entry() else {
+        panic!("expected iCalendar")
+    };
+    tree
+}
+
+fn sharing_sent_by(
+    tree: &calcard::icalendar::ICalendar,
+    property: calcard::icalendar::ICalendarProperty,
+    address: &str,
+) -> Vec<Option<String>> {
+    use calcard::icalendar::ICalendarParameterName;
+    tree.components
+        .iter()
+        .flat_map(|component| &component.entries)
+        .filter(|entry| {
+            entry.name == property
+                && entry
+                    .values
+                    .first()
+                    .and_then(|value| value.as_text())
+                    .is_some_and(|value| value.trim_start_matches("mailto:") == address)
+        })
+        .map(|entry| {
+            entry
+                .params
+                .iter()
+                .find(|parameter| parameter.name == ICalendarParameterName::SentBy)
+                .and_then(|parameter| parameter.value.as_text())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// Cases9/10 exercise the actual foreign-DAV scheduling caller and ordinary receiver.
+async fn sharing_http_schedule_contracts(test: &mut TestServer) {
+    use super::{
+        drain::{body, partstat_of, set_partstat},
+        fanout::{CONTENT_TYPE, NO_REPLY, Party, stored_pairs, uid_copies},
+    };
+    use crate::utils::za::{
+        copy_href, inbox_ids, item_method, item_partstat, item_sequence, new_inbox_items,
+        open_pending_item_as, za_post,
+    };
+    use calcard::icalendar::{ICalendarMethod, ICalendarProperty};
+    use groupware::calendar::ChangedBy;
+    use serde_json::json;
+    const DAVE: &str = "sharing-life-dave@example.com";
+    let admin = test.account("admin@example.com").clone();
+    let account = admin
+        .create_key_user_account(DAVE, STRONG, "No grant", &[], user_permissions())
+        .await;
+    test.insert_account(account);
+    let alice = Party::new(test, LIFE_ALICE);
+    let bob = Party::new(test, LIFE_BOB);
+    let carol = Party::new(test, LIFE_CAROL);
+    let dave = Party::new(test, DAVE);
+    let carol_key = test
+        .server
+        .za_served_public_key(carol.id)
+        .await
+        .unwrap()
+        .unwrap();
+    super::pinning::pin(
+        LIFE_BOB,
+        LIFE_CAROL,
+        &vault::keys::display_fingerprint(&carol_key),
+    )
+    .await
+    .expect(200);
+    let make = |uid, attendees: &[&str]| {
+        sharing_lifecycle_body(uid, "HTTP schedule", "20990301T100000Z", attendees, &[])
+    };
+    let writer_marker = Some(format!("mailto:{LIFE_BOB}"));
+    let mut uids = Vec::new();
+    // Delegated create replaces a client-supplied false SENT-BY, and records actual changed_by.
+    let uid = "case9-delegated";
+    uids.push(uid);
+    let path = format!("{LIFE_PATH}{uid}.ics");
+    let before = inbox_ids(test, carol.id).await;
+    bob.client
+        .request_with_headers(
+            "PUT",
+            &path,
+            [CONTENT_TYPE],
+            make(uid, &[LIFE_CAROL]).replace(
+                "ORGANIZER:mailto:",
+                &format!("ORGANIZER;SENT-BY=\"mailto:{DAVE}\":mailto:"),
+            ),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let delivered = new_inbox_items(test, carol.id, &before).await;
+    assert_eq!(delivered.len(), 1);
+    assert!(matches!(delivered[0].1.changed_by,ChangedBy::PrincipalId(id) if id==bob.id));
+    let (message, _) = open_pending_item_as(test, carol.id, STRONG, delivered[0].0).await;
+    assert_eq!(
+        sharing_sent_by(&message, ICalendarProperty::Organizer, LIFE_ALICE),
+        vec![writer_marker.clone()]
+    );
+    sharing_drain_step(test, &carol).await;
+    let carol_copy = copy_href(test, carol.id, uid).await;
+    assert_eq!(
+        sharing_sent_by(
+            &sharing_tree(&body(&carol.client, &carol_copy).await),
+            ICalendarProperty::Organizer,
+            LIFE_ALICE
+        ),
+        vec![writer_marker.clone()]
+    );
+    let before = inbox_ids(test, carol.id).await;
+    let changed = body(&bob.client, &path)
+        .await
+        .replace("20990301T100000Z", "20990301T110000Z");
+    bob.client
+        .request_with_headers("PUT", &path, [CONTENT_TYPE], changed)
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    let delivered = new_inbox_items(test, carol.id, &before).await;
+    assert_eq!(delivered.len(), 1);
+    let (message, _) = open_pending_item_as(test, carol.id, STRONG, delivered[0].0).await;
+    assert_eq!(
+        sharing_sent_by(&message, ICalendarProperty::Organizer, LIFE_ALICE),
+        vec![writer_marker.clone()]
+    );
+    sharing_drain_step(test, &carol).await;
+    assert_eq!(
+        sharing_sent_by(
+            &sharing_tree(&body(&carol.client, &carol_copy).await),
+            ICalendarProperty::Organizer,
+            LIFE_ALICE
+        ),
+        vec![writer_marker.clone()]
+    );
+    set_partstat(&carol.client, &carol_copy, LIFE_CAROL, "ACCEPTED").await;
+    sharing_drain_step(test, &alice).await;
+    assert_eq!(
+        partstat_of(&bob.client, &path, LIFE_CAROL).await.as_deref(),
+        Some("ACCEPTED")
+    );
+    bob.client
+        .request("DELETE", &path, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    sharing_drain_step(test, &carol).await;
+    assert!(
+        body(&carol.client, &carol_copy)
+            .await
+            .contains("STATUS:CANCELLED")
+    );
+    // Cross-origin cancellation must replace, rather than inherit, organizer markers.
+    for delegated_create in [false, true] {
+        let uid = if delegated_create {
+            "case9-cancel-loss"
+        } else {
+            "case9-cancel-gain"
+        };
+        uids.push(uid);
+        let path = format!("{LIFE_PATH}{uid}.ics");
+        let creator = if delegated_create {
+            &bob.client
+        } else {
+            &alice.client
+        };
+        creator
+            .request_with_headers("PUT", &path, [CONTENT_TYPE], make(uid, &[LIFE_CAROL]))
+            .await
+            .with_status(StatusCode::CREATED);
+        sharing_drain_step(test, &carol).await;
+        let copy = copy_href(test, carol.id, uid).await;
+        assert_eq!(
+            sharing_sent_by(
+                &sharing_tree(&body(&carol.client, &copy).await),
+                ICalendarProperty::Organizer,
+                LIFE_ALICE
+            ),
+            vec![if delegated_create {
+                writer_marker.clone()
+            } else {
+                None
+            }]
+        );
+        let deleter = if delegated_create {
+            &alice.client
+        } else {
+            &bob.client
+        };
+        deleter
+            .request("DELETE", &path, "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+        sharing_drain_step(test, &carol).await;
+        let tree = sharing_tree(&body(&carol.client, &copy).await);
+        assert!(tree.to_string().contains("STATUS:CANCELLED"));
+        assert_eq!(
+            sharing_sent_by(&tree, ICalendarProperty::Organizer, LIFE_ALICE),
+            vec![if delegated_create {
+                None
+            } else {
+                writer_marker.clone()
+            }]
+        );
+    }
+    // A new override gets Bob's marker; a master imported from Alice keeps Alice's line.
+    let uid = "case9-per-component";
+    uids.push(uid);
+    let path = format!("{LIFE_PATH}{uid}.ics");
+    alice
+        .client
+        .request_with_headers("PUT", &path, [CONTENT_TYPE], make(uid, &[LIFE_CAROL]))
+        .await
+        .with_status(StatusCode::CREATED);
+    sharing_drain_step(test, &carol).await;
+    let mut changed = body(&bob.client, &path).await;
+    let override_body = format!(
+        "BEGIN:VEVENT\r\nUID:{uid}\r\nRECURRENCE-ID:20990302T100000Z\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20990302T100000Z\r\nDTEND:20990302T120000Z\r\nSUMMARY:New override\r\nORGANIZER:mailto:{LIFE_ALICE}\r\nATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{LIFE_CAROL}\r\nEND:VEVENT\r\nEND:VCALENDAR"
+    );
+    changed = changed.replace("END:VCALENDAR", &override_body);
+    bob.client
+        .request_with_headers("PUT", &path, [CONTENT_TYPE], changed)
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    sharing_drain_step(test, &carol).await;
+    let tree = sharing_tree(&body(&carol.client, &copy_href(test, carol.id, uid).await).await);
+    for component in tree.components.iter().filter(|component| {
+        component
+            .entries
+            .iter()
+            .any(|entry| entry.name == ICalendarProperty::Organizer)
+    }) {
+        let is_override = component
+            .entries
+            .iter()
+            .any(|entry| entry.name == ICalendarProperty::RecurrenceId);
+        let organizer = component
+            .entries
+            .iter()
+            .find(|entry| entry.name == ICalendarProperty::Organizer)
+            .unwrap();
+        let sent_by = organizer
+            .params
+            .iter()
+            .find(|parameter| parameter.name == calcard::icalendar::ICalendarParameterName::SentBy)
+            .and_then(|parameter| parameter.value.as_text());
+        assert_eq!(
+            sent_by,
+            if is_override {
+                Some("mailto:sharing-life-bob@example.com")
+            } else {
+                None
+            }
+        );
+    }
+    // External invitation held in Alice's shared calendar: Bob sends a REPLY as Alice.
+    let uid = "case9-attendee-reply";
+    uids.push(uid);
+    let external = format!("/dav/cal/sharing-life-carol%40example.com/default/{uid}.ics");
+    carol
+        .client
+        .request_with_headers(
+            "PUT",
+            &external,
+            [CONTENT_TYPE],
+            make(uid, &[LIFE_ALICE])
+                .replace(LIFE_ALICE, LIFE_CAROL)
+                .replace(
+                    &format!("ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{LIFE_CAROL}"),
+                    &format!("ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{LIFE_ALICE}"),
+                ),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    sharing_drain_step(test, &alice).await;
+    let imported = copy_href(test, alice.id, uid).await;
+    let held = format!("{LIFE_PATH}{uid}.ics");
+    alice
+        .client
+        .request_with_headers("MOVE", &imported, [("destination", held.as_str())], "")
+        .await
+        .with_status(StatusCode::CREATED);
+    let before = inbox_ids(test, carol.id).await;
+    let bob_before = inbox_ids(test, bob.id).await;
+    set_partstat(&bob.client, &held, LIFE_ALICE, "ACCEPTED").await;
+    let replies = new_inbox_items(test, carol.id, &before).await;
+    assert_eq!(replies.len(), 1);
+    let (reply, carriers) = open_pending_item_as(test, carol.id, STRONG, replies[0].0).await;
+    assert_eq!(item_method(&reply), Some(ICalendarMethod::Reply));
+    assert!(carriers.reply_token.is_some());
+    assert_eq!(
+        sharing_sent_by(&reply, ICalendarProperty::Attendee, LIFE_ALICE),
+        vec![writer_marker.clone()]
+    );
+    assert_eq!(inbox_ids(test, bob.id).await, bob_before);
+    sharing_drain_step(test, &carol).await;
+    assert_eq!(
+        partstat_of(&carol.client, &external, LIFE_ALICE)
+            .await
+            .as_deref(),
+        Some("ACCEPTED")
+    );
+    let before = inbox_ids(test, carol.id).await;
+    let changed = body(&bob.client, &held).await.replace(
+        "PARTSTAT=ACCEPTED",
+        "PARTSTAT=DELEGATED;DELEGATED-TO=\"mailto:sharing-life-bob@example.com\"",
+    );
+    bob.client
+        .request_with_headers("PUT", &held, [CONTENT_TYPE], changed)
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    let replies = new_inbox_items(test, carol.id, &before).await;
+    assert_eq!(replies.len(), 1);
+    assert_eq!(
+        inbox_ids(test, bob.id).await,
+        bob_before,
+        "attendee-side delegation has no self run"
+    );
+    let (reply, _) = open_pending_item_as(test, carol.id, STRONG, replies[0].0).await;
+    assert_eq!(
+        item_partstat(&reply, LIFE_ALICE).as_deref(),
+        Some("DELEGATED")
+    );
+    sharing_drain_step(test, &carol).await;
+    assert_eq!(
+        partstat_of(&carol.client, &external, LIFE_ALICE)
+            .await
+            .as_deref(),
+        Some("DELEGATED")
+    );
+    // Bob organizes under his own address from Alice's calendar: Carol replies to Bob's history.
+    let uid = "case9-own-organizer";
+    uids.push(uid);
+    let path = format!("{LIFE_PATH}{uid}.ics");
+    bob.client
+        .request_with_headers(
+            "PUT",
+            &path,
+            [CONTENT_TYPE],
+            make(uid, &[LIFE_CAROL]).replace(LIFE_ALICE, LIFE_BOB),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    sharing_drain_step(test, &carol).await;
+    let copy = copy_href(test, carol.id, uid).await;
+    assert_eq!(
+        sharing_sent_by(
+            &sharing_tree(&body(&carol.client, &copy).await),
+            ICalendarProperty::Organizer,
+            LIFE_BOB
+        ),
+        vec![None]
+    );
+    let before = inbox_ids(test, bob.id).await;
+    set_partstat(&carol.client, &copy, LIFE_CAROL, "ACCEPTED").await;
+    assert_eq!(new_inbox_items(test, bob.id, &before).await.len(), 1);
+    sharing_drain_step(test, &bob).await;
+    assert_eq!(uid_copies(test, bob.id, uid).await, 0);
+    assert_eq!(
+        partstat_of(&alice.client, &path, LIFE_CAROL)
+            .await
+            .as_deref(),
+        Some("NEEDS-ACTION")
+    );
+    println!(
+        "Case9 own-name organizer: reply stays Bob inbox history, source in Alice remains unchanged (inherited EventNotFound)"
+    );
+    // Dave cannot acquire delegate authority by spelling Alice's organizer in his own calendar.
+    let uid = "case9-spoof";
+    uids.push(uid);
+    let before = inbox_ids(test, carol.id).await;
+    dave.client
+        .request_with_headers(
+            "PUT",
+            &format!("/dav/cal/sharing-life-dave%40example.com/default/{uid}.ics"),
+            [CONTENT_TYPE],
+            make(uid, &[LIFE_CAROL]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert!(new_inbox_items(test, carol.id, &before).await.is_empty());
+    dave.client
+        .request("PROPFIND", LIFE_PATH, "")
+        .await
+        .with_status(StatusCode::FORBIDDEN);
+    // Owner-organized replies and subsequent shared writes keep Bob's self token usable.
+    let uid = "case10-participation";
+    uids.push(uid);
+    let path = format!("{LIFE_PATH}{uid}.ics");
+    alice
+        .client
+        .request_with_headers(
+            "PUT",
+            &path,
+            [CONTENT_TYPE],
+            make(uid, &[LIFE_BOB, LIFE_CAROL]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    sharing_drain_step(test, &bob).await;
+    sharing_drain_step(test, &carol).await;
+    let own = copy_href(test, bob.id, uid).await;
+    set_partstat(&bob.client, &own, LIFE_BOB, "ACCEPTED").await;
+    sharing_drain_step(test, &alice).await;
+    assert_eq!(
+        partstat_of(&bob.client, &path, LIFE_BOB).await.as_deref(),
+        Some("ACCEPTED")
+    );
+    set_partstat(&bob.client, &path, LIFE_BOB, "DECLINED").await;
+    sharing_drain_step(test, &bob).await;
+    sharing_drain_step(test, &carol).await;
+    assert_eq!(
+        partstat_of(&bob.client, &own, LIFE_BOB).await.as_deref(),
+        Some("DECLINED")
+    );
+    assert_eq!(
+        item_sequence(&sharing_tree(&body(&bob.client, &own).await)),
+        item_sequence(&sharing_tree(&body(&alice.client, &path).await))
+    );
+    let owner_keys = za_unlock(test, alice.id, STRONG).await;
+    let context = za_owned_calendar_context(
+        &test.server,
+        &owner_keys,
+        resource_id(test, alice.id, "lifecycle").await,
+    )
+    .await
+    .unwrap();
+    let archive = event_archive(
+        test,
+        alice.id,
+        resource_id(test, alice.id, "lifecycle/case10-participation.ics").await,
+    )
+    .await;
+    assert!(
+        groupware::calendar::seal::event_pairs_in_domain(&archive, &context.domain)
+            .unwrap()
+            .unwrap()
+            .get(LIFE_BOB)
+            .is_some()
+    );
+    set_partstat(&bob.client, &own, LIFE_BOB, "ACCEPTED").await;
+    sharing_drain_step(test, &alice).await;
+    assert_eq!(
+        partstat_of(&alice.client, &path, LIFE_BOB).await.as_deref(),
+        Some("ACCEPTED")
+    );
+    // Alarm-only edits and event properties schedule nothing through the actual Bob handler.
+    let before = (
+        inbox_ids(test, alice.id).await,
+        inbox_ids(test, bob.id).await,
+        inbox_ids(test, carol.id).await,
+    );
+    let alarm=body(&bob.client,&path).await.replacen("END:VEVENT","BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nDESCRIPTION:Bob personal alarm\r\nEND:VALARM\r\nEND:VEVENT",1);
+    bob.client
+        .request_with_headers("PUT", &path, [CONTENT_TYPE], alarm)
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    bob.client.request("PROPPATCH",&path,"<D:propertyupdate xmlns:D=\"DAV:\"><D:set><D:prop><D:displayname>Bob event property</D:displayname></D:prop></D:set></D:propertyupdate>").await.with_status(StatusCode::MULTI_STATUS);
+    assert_eq!(
+        (
+            inbox_ids(test, alice.id).await,
+            inbox_ids(test, bob.id).await,
+            inbox_ids(test, carol.id).await
+        ),
+        before
+    );
+    let uid = "case9-no-attendees";
+    uids.push(uid);
+    bob.client
+        .request_with_headers(
+            "PUT",
+            &format!("{LIFE_PATH}{uid}.ics"),
+            [CONTENT_TYPE],
+            make(uid, &[]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(
+        (
+            inbox_ids(test, alice.id).await,
+            inbox_ids(test, bob.id).await,
+            inbox_ids(test, carol.id).await
+        ),
+        before
+    );
+    // Both aliases reply after self import and after REQUEST token replacement.
+    let uid = "case10-alias-replies";
+    uids.push(uid);
+    let path = format!("{LIFE_PATH}{uid}.ics");
+    bob.client
+        .request_with_headers(
+            "PUT",
+            &path,
+            [CONTENT_TYPE],
+            sharing_lifecycle_body(
+                uid,
+                "alias replies",
+                "20990301T100000Z",
+                &[LIFE_BOB],
+                &[("20990302T100000Z", &[LIFE_ALIAS])],
+            ),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    sharing_drain_step(test, &bob).await;
+    let own = copy_href(test, bob.id, uid).await;
+    let bob_keys = za_unlock(test, bob.id, STRONG).await;
+    let pairs = stored_pairs(test, &bob_keys, bob.id, &super::drain::relative(&own))
+        .await
+        .unwrap();
+    assert!(pairs.get(LIFE_BOB).is_some() && pairs.get(LIFE_ALIAS).is_some());
+    for round in 0..2 {
+        if round == 1 {
+            // Normal REQUESTs retain source tokens. Remove both aliases, then
+            // re-add them so this HTTP round really exercises newly minted pairs.
+            bob.client
+                .request_with_headers(
+                    "PUT",
+                    &path,
+                    [CONTENT_TYPE],
+                    sharing_lifecycle_body(
+                        uid,
+                        "retoken prune",
+                        "20990301T100000Z",
+                        &[LIFE_CAROL],
+                        &[],
+                    ),
+                )
+                .await
+                .with_status(StatusCode::NO_CONTENT);
+            sharing_drain_step(test, &bob).await;
+            bob.client
+                .request_with_headers(
+                    "PUT",
+                    &path,
+                    [CONTENT_TYPE],
+                    sharing_lifecycle_body(
+                        uid,
+                        "alias replies retoken",
+                        "20990301T100000Z",
+                        &[LIFE_BOB],
+                        &[("20990302T100000Z", &[LIFE_ALIAS])],
+                    ),
+                )
+                .await
+                .with_status(StatusCode::NO_CONTENT);
+            sharing_drain_step(test, &bob).await;
+            sharing_drain_step(test, &carol).await;
+            let replaced = stored_pairs(test, &bob_keys, bob.id, &super::drain::relative(&own))
+                .await
+                .unwrap();
+            for address in [LIFE_BOB, LIFE_ALIAS] {
+                assert!(
+                    replaced.get(address) != pairs.get(address),
+                    "remove/re-add must mint a fresh token for {address}"
+                );
+            }
+        }
+        for address in [LIFE_BOB, LIFE_ALIAS] {
+            set_partstat(
+                &bob.client,
+                &own,
+                address,
+                if round == 0 { "ACCEPTED" } else { "DECLINED" },
+            )
+            .await;
+            sharing_drain_step(test, &alice).await;
+            assert_eq!(
+                partstat_of(&alice.client, &path, address).await.as_deref(),
+                Some(if round == 0 { "ACCEPTED" } else { "DECLINED" })
+            );
+        }
+    }
+    // Sole attendee paths: ordinary decline and Bob create/summary/delete without ForceSend.
+    for delegated_create in [false, true] {
+        let uid = if delegated_create {
+            "case10-sole-delegated"
+        } else {
+            "case10-sole-decline"
+        };
+        uids.push(uid);
+        let path = format!("{LIFE_PATH}{uid}.ics");
+        let creator = if delegated_create {
+            &bob.client
+        } else {
+            &alice.client
+        };
+        creator
+            .request_with_headers("PUT", &path, [CONTENT_TYPE], make(uid, &[LIFE_BOB]))
+            .await
+            .with_status(StatusCode::CREATED);
+        sharing_drain_step(test, &bob).await;
+        let own = copy_href(test, bob.id, uid).await;
+        if !delegated_create {
+            set_partstat(&bob.client, &path, LIFE_BOB, "DECLINED").await;
+            sharing_drain_step(test, &bob).await;
+            assert_eq!(
+                partstat_of(&bob.client, &own, LIFE_BOB).await.as_deref(),
+                Some("DECLINED")
+            );
+        }
+        let changed = body(&bob.client, &path)
+            .await
+            .replace("SUMMARY:HTTP schedule", "SUMMARY:sole updated");
+        bob.client
+            .request_with_headers("PUT", &path, [CONTENT_TYPE], changed)
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+        sharing_drain_step(test, &bob).await;
+        assert!(
+            body(&bob.client, &own)
+                .await
+                .contains("SUMMARY:sole updated")
+        );
+        bob.client
+            .request("DELETE", &path, "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+        sharing_drain_step(test, &bob).await;
+        assert!(body(&bob.client, &own).await.contains("STATUS:CANCELLED"));
+    }
+    let uid = "case10-remove-self";
+    uids.push(uid);
+    let path = format!("{LIFE_PATH}{uid}.ics");
+    alice
+        .client
+        .request_with_headers(
+            "PUT",
+            &path,
+            [CONTENT_TYPE],
+            make(uid, &[LIFE_BOB, LIFE_CAROL]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    sharing_drain_step(test, &bob).await;
+    sharing_drain_step(test, &carol).await;
+    let own = copy_href(test, bob.id, uid).await;
+    let changed = body(&bob.client, &path)
+        .await
+        .replace("\r\n ", "")
+        .split("\r\n")
+        .filter(|line| {
+            !(line.starts_with("ATTENDEE") && line.ends_with(&format!("mailto:{LIFE_BOB}")))
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    bob.client
+        .request_with_headers("PUT", &path, [CONTENT_TYPE], changed)
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    sharing_drain_step(test, &bob).await;
+    sharing_drain_step(test, &carol).await;
+    assert!(body(&bob.client, &own).await.contains("STATUS:CANCELLED"));
+    assert!(
+        !crate::utils::za::item_attendees(&sharing_tree(
+            &body(&carol.client, &copy_href(test, carol.id, uid).await).await
+        ))
+        .iter()
+        .any(|address| address == LIFE_BOB)
+    );
+    // Delivery authority is fixed by the authorized write, not a later grant lookup in drain.
+    let uid = "case9-queued-revoke";
+    uids.push(uid);
+    let path = format!("{LIFE_PATH}{uid}.ics");
+    common::za::test_hooks::set_drain_skip(carol.id);
+    bob.client
+        .request_with_headers("PUT", &path, [CONTENT_TYPE], make(uid, &[LIFE_CAROL]))
+        .await
+        .with_status(StatusCode::CREATED);
+    za_post(
+        "shares/revoke",
+        &json!({"username":LIFE_ALICE,"password":STRONG,"calendar":"lifecycle","grant":bob.id}),
+    )
+    .await
+    .expect(200);
+    common::za::test_hooks::clear_drain_skip(carol.id);
+    sharing_drain_step(test, &carol).await;
+    assert_eq!(uid_copies(test, carol.id, uid).await, 1);
+    za_post("shares/grant",&json!({"username":LIFE_ALICE,"password":STRONG,"calendar":"lifecycle","address":LIFE_BOB,"level":"edit"})).await.expect(200);
+    // All synthetic source/copy/inbox rows are removed before the legacy leak scan.
+    for uid in uids {
+        for party in [&alice, &bob, &carol, &dave] {
+            if uid_copies(test, party.id, uid).await > 0 {
+                party
+                    .client
+                    .request_with_headers(
+                        "DELETE",
+                        &copy_href(test, party.id, uid).await,
+                        [NO_REPLY],
+                        "",
+                    )
+                    .await
+                    .with_status(StatusCode::NO_CONTENT);
+            }
+        }
+    }
+    for party in [&alice, &bob, &carol, &dave] {
+        party.delete_items(inbox_ids(test, party.id).await).await;
+    }
+    dave.client.delete_default_containers().await;
+    println!(
+        "Cases9/10 actual HTTP delegated requests, component markers, cross-origin cancellations, replies, alias retokens, no-message writes and queued revoke passed"
     );
 }
