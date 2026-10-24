@@ -12,7 +12,10 @@ on the exactly restored implementation. The release build finished successfully 
 The 3,000-event first-grant and interrupted/resumed measurement completed with full Alice/Bob
 readback and exact temporary-source restoration. The scanner/mutation qualification is
 recorded in the committed [Task 11 evidence](2026-10-23-zero-access-plan14-mutations.md).
-**Fresh whole-branch review is pending**, owned by the primary with a clean-context reviewer.
+**Whole-branch approval is pending.** A fresh clean-context review of `7c0a0f8a` found one
+Important conditional calendar-PROPPATCH defect (I1). The early-interval HTTP regression now
+reproduces it for owner displayname and grantee shared colour. The correction agent stopped
+at an automated cybersecurity filter before implementing the production fix; see Appendix E.
 **Native qualification is pending** for macOS Apple Calendar, iOS Apple Calendar and
 Thunderbird. This outcome therefore does not claim complete release or native readiness.
 No SQL backend, multi-node cluster, production deployment or real-account test was run.
@@ -20,7 +23,7 @@ No SQL backend, multi-node cluster, production deployment or real-account test w
 Task 12 scoped independent documentation review (`gpt-6-sol`, high) approved the six-file
 freeze with 0 Critical, 0 Important and 1 Minor: inherited warning disclosure remains for
 the relevant source owner. Raw benchmark/seven completed gate receipts and durable patch
-restoration were independently checked. This scoped approval leaves fresh whole-branch review and native qualification pending.
+restoration were independently checked. This scoped approval leaves clean whole-branch approval and native qualification pending.
 
 Tasks 1–10 implemented collection-key formats/cache, codecs, fresh resolver authority,
 event/link fences, conversion/rollback, endpoints, delegated scheduling and DAV lifecycle.
@@ -331,7 +334,7 @@ all external R11 decisions/statuses; the linked mutation note holds exact patche
 
 | Gate | Status and exact missing evidence |
 |---|---|
-| Fresh whole-branch review | Pending primary dispatch of a clean-context read-only reviewer across combined authorization, key identity, ordering, persistence, conversion/revoke fences, boundaries and scheduling; then adjudication/affected rechecks |
+| Fresh whole-branch review | Completed at `7c0a0f8a`: C0/I1/M0; approval pending I1 correction and scoped rereview, with affected verification |
 | Apple Calendar macOS | Pending disposable-account/client observations for assisted discovery, view/edit, colour/order, invite/SENT-BY, own/shared replies, sole-attendee decline, display alarm, drag requests/results, revoke/regrant and rename; this Mac host has no recorded qualified disposable native session/trusted-TLS setup or these client observations |
 | Apple Calendar iOS | Pending the same observations on a physical iOS client; device/client observations, qualified reachable-TLS setup and disposable native credentials remain unexercised |
 | Thunderbird | Pending assisted-discovery-off second-home-href discovery and shared access on an actual client |
@@ -1378,3 +1381,68 @@ separately from the successful run. Source restoration and command results:
   ]
 }
 ```
+
+
+## Appendix E: final review finding and correction handoff
+
+The fresh `gpt-6.1-sol` xhigh reviewer inspected `cd48a8f1..7c0a0f8a` with clean context
+and without prior finding lists. It reported **0 Critical, 1 Important, 0 Minor**. The
+primary independently validated I1 against calendar PROPPATCH and the conditional-header
+helper. This is the remaining implementation correction; Task 11 is complete.
+
+I1: calendar PROPPATCH validates its conditional ETag against the initial archive
+(`crates/dav/src/calendar/proppatch.rs:128-156`), then selects a freshly resolved calendar
+archive (`:160-176`) and uses that later archive for its update CAS (`:245-251`). A competing
+authorized write between the reads can therefore be overwritten despite the older If-Match.
+Header validation must remain bound to the archive actually selected for mutation and CAS.
+The existing later-commit409 fixture covers another interval and must be retained.
+
+A standard test_mode-only, owner-keyed one-shot `CALENDAR_PROPPATCH_READ_PAUSE` and an HTTP
+regression were added as **uncommitted correction work**. The runtime implementation is still
+unfixed. With the same source, the authorized disposable-listener RED run completed exit101,
+77.25 s suite time (78.47 s command time):
+
+```text
+D:displayname: stale status=207 Multi-Status, competing preserved=false
+D:displayname: current-ETag and unconditional controls passed
+A:calendar-color: stale status=207 Multi-Status, competing preserved=false
+A:calendar-color: current-ETag and unconditional controls passed
+```
+
+The raw RED log SHA256 is `0ea9f8d2efd38cc68bbac14dcd1fcf529d80cb3fc6fdd2c0f840c9d9469e3dee`.
+An earlier sandbox invocation stopped at listener/DNS setup and is retained as setup-only
+evidence. No corrected GREEN run, scoped correction approval or corrected-source release
+build has occurred. The earlier full acceptance table remains evidence for its named
+pre-correction source. No new mutation qualification is claimed.
+
+The correction agent encountered the automated cybersecurity filter while the existing RED
+command was active; that command then completed as recorded above. The primary did not retry it and prepared a focused handoff for a user-dispatched coordinator. The handoff
+owns only I1 implementation, its existing regression and affected checks; final integration,
+independent scoped rereview, remaining verification and native/Circulo ownership stay with
+the primary. The receiving coordinator uses its own model/routing policy.
+
+The added pause's purpose is deterministic observation of the earlier archive/context interval;
+it is absent from shipping DAV code and inert while unset in test_mode. Its cost is removable
+test-only plumbing. No persisted layout, dependency or runtime permission change is intended.
+
+### Post-finder deferred-observation triage
+
+| Observation | Disposition and reason | Cost if deferred/wrong |
+|---|---|---|
+| Task4 synthetic generation reset | Keep isolated direct-store oracle; no event requires omitted keys, no production retention change | Reduced fixture lifecycle realism; monotonic/isolated fixture follow-up |
+| Strict one stored DavName wording | Withdrawn defect; codecs require one stored name and MOVE one destination | Any format expansion requires its own review |
+| T5-V pub(super) bridge | Approved internal lexical test bridge, no cross-crate/public authority | Removable internal visibility/test plumbing |
+| T6-P legacy JMAP-only colour | Keep binding format exclusion; actual DAV colour/order preserved and tested | Rare legacy personal color normalizes to None; migration would require a separate format decision |
+| Task6 large async fixture | Concrete assertions remain; organizational improvement only | Harder fixture diagnosis/maintenance |
+| Task7 owner/calendar sorting coverage | Source shares.rs549-554 explicitly sorts owner then calendar; fixture directly checks secondary axis | Primary-axis multiowner regression is less directly isolated |
+| Task8 direct OrganizerMismatch assertion | Existing code is correct on source review; no production defect established | That exact pure-helper failure branch lacks a dedicated direct assertion |
+| Task8 alias old-instance CANCEL override | Retain optional direct-case breadth gap | Old-snapshot alias/group cancel edge is less directly isolated |
+| Task9 multi-component direct union fixture | delegation.rs100-101 traverses both old/new trees and every component | Correct loop has less direct multicomponent union coverage |
+| Task11 row35 changed-body PUT | Existing early409 is a valid required kill | Changed-summary intent via each name would broaden coverage |
+| Inherited warnings across tasks | Keep exact disclosure; no touched-line warning regression established | Noisier tool output; unrelated cleanup remains separate |
+
+These are not represented as fixed or as proofs of omitted tests. No optional fixture churn
+is added to the sole load-bearing I1 fix. Fresh whole-branch declined-to-judge items align
+with explicitly accepted old-key/pubsub residency, write-time scheduling, upstream lifecycle,
+collection snapshot/partial-prefix contracts and evidence boundaries. No broader SQL/native/
+cluster/cryptographic guarantee is inferred. Native and Circulo evidence remain pending.

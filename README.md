@@ -24,8 +24,8 @@ by the user's credentials. The current work focuses on:
   key-account mail sharing remain refused or deferred. Calendar full-text search stays gated.
 
 Ordinary accounts continue to use Stalwart's existing behavior. The fork also encrypts
-key-account mail at rest (release 3); contacts and files retain upstream storage behavior. Calendar sharing native-client qualification and fresh whole-branch
-review remain pending; see the [outcome](docs/superpowers/plans/2026-10-23-zero-access-plan14-outcome.md).
+key-account mail at rest (release 3); contacts and files retain upstream storage behavior. Calendar sharing native-client qualification and clean whole-branch
+approval remain pending; see the [outcome](docs/superpowers/plans/2026-10-23-zero-access-plan14-outcome.md).
 
 An account becomes zero-access through a setup token issued by an administrator, completed on
 an account web page that lives in a separate repository and is not part of this one.

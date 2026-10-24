@@ -5,7 +5,7 @@ revision 14 of the [sharing design](../superpowers/specs/2026-10-22-zero-access-
 The separate Circulo page and its `docs/api.md` integration remain pending. Automated evidence and
 measurement conditions are recorded in the [release
 outcome](../superpowers/plans/2026-10-23-zero-access-plan14-outcome.md); native-client qualification
-and fresh whole-branch review remain pending.
+and clean whole-branch approval remain pending.
 
 ## Common request and error contract
 
