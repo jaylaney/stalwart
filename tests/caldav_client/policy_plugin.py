@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from runner import HERE, check_outcomes, validate_policy
+from runner import HERE, check_outcomes, read_collection, validate_policy
 
 _outcomes = {}
 _keys = {}
@@ -14,7 +14,7 @@ _records = {}
 
 
 def test_key(item):
-    if item.path.name == "test_flows.py":
+    if item.path.name in ("test_flows.py", "test_sharing.py"):
         kind = "flows/"
     elif item.cls and item.cls.__name__.startswith("TestSchedulingForServerStalwart"):
         kind = "scheduling/"
@@ -29,7 +29,10 @@ def test_key(item):
 def pytest_collection_modifyitems(session, config, items):
     if any(config.getoption(option) for option in ("keyword", "markexpr", "collectonly")):
         raise pytest.UsageError("Filtering or collection-only is forbidden for the pinned suite")
-    expected = set(json.loads((HERE / "collection.json").read_text()))
+    try:
+        expected = read_collection(os.environ["CALDAV_CI_MODE"], HERE / "collection.json")
+    except (ValueError, KeyError, TypeError, OSError) as error:
+        raise pytest.UsageError(f"Invalid collection manifest: {error}") from None
     _keys.update({item.nodeid: test_key(item) for item in items})
     if len(items) != len(expected) or set(_keys.values()) != expected:
         raise pytest.UsageError("Incomplete or unexpected pinned class/strict-flow collection")
@@ -92,7 +95,7 @@ def pytest_sessionfinish(session, exitstatus):
     if not hasattr(session.config, "_caldav_policy"):
         return
     policy = session.config._caldav_policy
-    expected = set(json.loads((HERE / "collection.json").read_text()))
+    expected = read_collection(os.environ["CALDAV_CI_MODE"], HERE / "collection.json")
     problems = check_outcomes(_outcomes, policy["outcomes"])
     if set(_outcomes) != expected:
         problems.append("Pinned test reports missing or unexpected")

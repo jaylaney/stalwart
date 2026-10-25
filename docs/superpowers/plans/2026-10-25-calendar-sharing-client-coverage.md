@@ -61,34 +61,34 @@ pytest, existing normal-mode RocksDB product fixture.
   test_shared_calendar_delegated_invitation_update_cancel
   test_shared_calendar_own_and_shared_replies_and_sole_decline
 
-- [ ] **1. Add harness-unit RED coverage.** Test per-mode72/77 manifests, key-only selection, missing/extra
+- [x] **1. Add harness-unit RED coverage.** Test per-mode72/77 manifests, key-only selection, missing/extra
   sharing cases, unknown/missing modes, duplicates/invalid shapes, forbidden strict exceptions/filtering,
   and safe public-API error handling. Preserve all existing harness failure-boundary assertions.
   Observe a meaningful failure before adding the new loader/selection behavior.
-- [ ] **2. Implement the mode-aware loader/collector.** Keep the old72 IDs unchanged in each mode;
+- [x] **2. Implement the mode-aware loader/collector.** Keep the old72 IDs unchanged in each mode;
   add five key IDs. Fail cleanly before execution on incomplete/malformed collection or reports.
   Preserve both-mode runtime-failure cleanup and the existing compatibility policy verbatim.
-- [ ] **3. Implement the five actual client flows.** Follow the approved design's assertions. Pin through
+- [x] **3. Implement the five actual client flows.** Follow the approved design's assertions. Pin through
   contacts/lookup then contacts/pin, grant/revoke through the public sharing API, and use each actor's
   own CalDAV client for access, edits, replies and readbacks. Assert the exact requested property/status
   and recipient component fields. Use owned-calendar polling for Bob/Carol; principal-wide UID search
   can incorrectly return the shared source. Keep cleanup and15-second bounded polling explicit.
   A new client flow may pass initially because the product already implements the behavior;
   do not manufacture backend mutations or relabel it as I1's precise race reproduction.
-- [ ] **4. Run all harness tests.** Python3.12:
+- [x] **4. Run all harness tests.** Python3.12:
   `python -m unittest discover -s tests/caldav_client -p test_runner.py -v`.
   Run against the pinned dependency environment; preserve failures and command output.
-- [ ] **5. Run the complete pinned production-client matrix.** Use the existing verified release binary
+- [x] **5. Run the complete pinned production-client matrix.** Use the existing verified release binary
   if its current Rust source/binary provenance matches the prior final release; rebuild only if needed.
   `python tests/caldav_client/runner.py --binary target/release/stalwart --caldav-source PINNED_SOURCE
   --log-dir NEW_PRIVATE_ABSOLUTE_LOG_DIRECTORY` (both modes, no filters). Require72 plain/77 key
   cases, all five new flows passed and only existing precisely recorded compatibility outcomes.
   No Rust suite,57-mutation,3,000-event benchmark or native run is required for Python-only changes.
-- [ ] **6. Record evidence and docs.** Retain exact interpreter/client pin/binary identity, observed
+- [x] **6. Record evidence and docs.** Retain exact interpreter/client pin/binary identity, observed
   counts and outcomes, first failures plus diagnoses/reruns, sanitized logs and cleanup results.
   Keep native acceptance pending. A production mismatch is reported to the primary with concrete
   request/state evidence; do not edit Rust, loosen assertions or expand exception/polling policy.
-- [ ] **7. Independent review and integration.** Primary reviews actual diff/evidence, obtains one
+- [x] **7. Independent review and integration.** Primary reviews actual diff/evidence, obtains one
   strongest-permitted independent review of this complete bounded coverage change, resolves confirmed
   issues with scoped fix/review, then commits/pushes the coverage and updates the existing draft PR.
 

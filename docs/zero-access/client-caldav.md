@@ -46,10 +46,11 @@ The upstream documented external-server JSON configuration is generated in a pri
 materialized with `git archive` from the pinned commit. Modified tracked files and untracked local
 configuration in the source checkout never enter the executed suite.
 `PYTHON_CALDAV_TEST_EMBEDDED=0`, `PYTHON_CALDAV_TEST_DOCKER=0`, and `PYTHON_CALDAV_TEST_EXTERNAL=1`
-select only the disposable server. Explicit pytest class selectors and a checked-in 72-case manifest
-reject missing classes, individual tests, parameter cases, strict flows, reports, or
-filtered/deselected runs. The runner clears caller pytest options and third-party plugin
-autoloading.
+select only the disposable server. Explicit pytest class selectors and checked-in per-mode
+manifests require 72 cases for ordinary accounts and 77 for key accounts. The five additional
+key cases live in `test_sharing.py`, which the runner selects only for key mode. The plugin rejects
+missing classes, individual tests, parameter cases, strict flows, reports, or filtered/deselected
+runs. The runner clears caller pytest options and third-party plugin autoloading.
 
 `tests/caldav_client/compatibility.json` is the reviewed exception policy. Every feature change and
 expected skip/xfail needs an explanation. The per-mode policies intentionally duplicate the same
@@ -59,20 +60,35 @@ exceptions that start passing. It does not inherit the upstream `stalwart` profi
 Upstream's `testCheckCompatibility` intentionally skips because the optional server tester's
 released feature matrix does not cover this pin (see upstream `pyproject.toml`).
 
-Key-account sharing, cross-user free/busy and external iMIP are outside release 2's accepted
-contract; local invitation, reply, cancellation and three-account delegation are covered.
+The release 4 key-account sharing flows now require client discovery and view/edit CRUD,
+principal-specific display names and shared colour, sequential stale/fresh/unconditional
+calendar-property ETag behavior, revoke/regrant/rename/sync, delegated scheduling to Carol,
+and Bob's own-copy and shared-source replies. Public contact lookup/pin and grant/revoke APIs
+establish the fixtures; each actor's python-caldav client performs DAV operations. Recipient
+polling reads Bob's or Carol's exact own default calendar, so a same-UID shared source cannot
+satisfy an invitation assertion. The stale ETag check is sequential client coverage; the Rust
+pause test remains the deterministic I1 race proof. Cross-user free/busy and external iMIP remain
+outside this client matrix. The earlier local invitation, reply, cancellation and three-account
+delegation flows remain mandatory in both modes.
 Key-account delegation follows the attendee-token visibility rules in invitations design section
 3.3. The strict tests assert read-back event data, client-side recurring exceptions and adjacent
 instances, attendee `PARTSTAT` after authenticated drains, and organizer-mediated delegation.
 Upstream's automatic scheduling invitation test returns early once an event appears, so these
 additional assertions are necessary. The 15-second polling limit intentionally stays below the
 drain's 30-second retry deferral, so a failed initial drain cannot hide behind a later retry.
+The sharing polls reject a state observed at or after their monotonic deadline and temporarily
+set each client's HTTP inactivity timeout to the remaining budget, restoring its prior setting
+afterward. This does not guarantee absolute socket cancellation at the deadline.
 Server-side all-day and exception expansion remain known gaps tracked by the precise upstream
 expected failures; the mandatory client-side recurrence flow does not cover or compensate for those
 gaps. vdirsyncer and native/physical client acceptance remain separate work.
 
-Validation commands and results are recorded in the pull request description; a local run does not
-claim that GitHub Actions has executed.
+The pinned local run on 2026-10-25 passed the 72-case ordinary manifest (66 passed, one skipped,
+five xfailed) and 77-case key manifest (71 passed, one skipped, five xfailed). All five new strict
+sharing flows passed without compatibility exceptions. The exact commands, identities, earlier
+failed attempts and sanitized logs are recorded in the
+[coverage outcome](../superpowers/plans/2026-10-25-calendar-sharing-client-coverage-outcome.md).
+Native/physical client acceptance and GitHub Actions results remain separate evidence.
 
 ## Compatibility findings
 
