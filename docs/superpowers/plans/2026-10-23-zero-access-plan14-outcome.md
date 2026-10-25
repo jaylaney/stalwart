@@ -1,21 +1,27 @@
 # Calendar sharing implementation and qualification outcome
 
-Dated 2026-10-24. Plan 14, revision 14 sharing design. Implementation/Task 11 head:
+Original outcome dated 2026-10-24; final correction verified 2026-10-25.
+Plan 14, revision 14 sharing design. Original implementation/Task 11 head:
 `e88b5c1e16487e7bcc385f952f9162ecc43b49ba`; implementation commits begin after `cd48a8f1` (the accepted plan/interface
-clarification). Task 12 changes only the six documentation files named by its brief.
-No production source, persisted struct layout, dependency or generated schema changed here.
+clarification). Task 12 documentation commit `7c0a0f8a` changed the six files named by its brief.
+The final-review correction is code commit `8fe2aec7efbe9af8ab112715f1fd45538aeff87a`. It changes calendar conditional-write
+ordering and adds deterministic regression coverage; no persisted layout, dependency or generated
+schema changed.
 
 ## Status and evidence boundary
 
-The complete final automated net, including the shipping release build, passed sequentially
-on the exactly restored implementation. The release build finished successfully in 1145.87 s.
+The pre-review final automated net, including the shipping release build, passed sequentially
+on the exactly restored implementation (original release build 1145.87 s). After the final I1
+correction, affected checks and a fresh shipping release build passed; that build took 972.40 s.
+The ordinary WebDAV check required a recorded diagnostic rerun after one unexplained PUT/GET
+failure. Appendix F preserves both attempts and the corrected-source evidence.
 The 3,000-event first-grant and interrupted/resumed measurement completed with full Alice/Bob
 readback and exact temporary-source restoration. The scanner/mutation qualification is
 recorded in the committed [Task 11 evidence](2026-10-23-zero-access-plan14-mutations.md).
-**Whole-branch approval is pending.** A fresh clean-context review of `7c0a0f8a` found one
-Important conditional calendar-PROPPATCH defect (I1). The early-interval HTTP regression now
-reproduces it for owner displayname and grantee shared colour. The correction agent stopped
-at an automated cybersecurity filter before implementing the production fix; see Appendix E.
+**The whole-branch finding is closed.** The fresh review of `7c0a0f8a` found one Important
+issue, I1. Its correction passed one scoped independent re-review with no new Critical,
+Important or Minor finding. The original review and scoped re-review together leave no
+unresolved Critical/Important finding; scope and execution limits remain explicit below.
 **Native qualification is pending** for macOS Apple Calendar, iOS Apple Calendar and
 Thunderbird. This outcome therefore does not claim complete release or native readiness.
 No SQL backend, multi-node cluster, production deployment or real-account test was run.
@@ -23,7 +29,8 @@ No SQL backend, multi-node cluster, production deployment or real-account test w
 Task 12 scoped independent documentation review (`gpt-6-sol`, high) approved the six-file
 freeze with 0 Critical, 0 Important and 1 Minor: inherited warning disclosure remains for
 the relevant source owner. Raw benchmark/seven completed gate receipts and durable patch
-restoration were independently checked. This scoped approval leaves clean whole-branch approval and native qualification pending.
+restoration were independently checked. That documentation approval preceded the final whole-branch finding and its scoped closure;
+native qualification remains pending.
 
 Tasks 1–10 implemented collection-key formats/cache, codecs, fresh resolver authority,
 event/link fences, conversion/rollback, endpoints, delegated scheduling and DAV lifecycle.
@@ -49,7 +56,7 @@ structural checks of visible carriers, parentage and correspondence; they do not
 CKs, encrypted ledgers or associated data. Runtime readers/codecs provide separate crypto
 checks. Native UI behavior remains a separate gate.
 
-## Final automated verification
+## Pre-review final automated verification
 
 Every Cargo command used `export PATH="/opt/homebrew/opt/rustup/bin:$PATH"`; stable Rust
 1.99.0/Cargo 1.99.0. All integration suites ran sequentially with disposable reset state.
@@ -334,13 +341,13 @@ all external R11 decisions/statuses; the linked mutation note holds exact patche
 
 | Gate | Status and exact missing evidence |
 |---|---|
-| Fresh whole-branch review | Completed at `7c0a0f8a`: C0/I1/M0; approval pending I1 correction and scoped rereview, with affected verification |
+| Fresh whole-branch review | Original C0/I1/M0; I1 fixed and one scoped re-review passed C0/I0/M0; affected verification is in Appendix F |
 | Apple Calendar macOS | Pending disposable-account/client observations for assisted discovery, view/edit, colour/order, invite/SENT-BY, own/shared replies, sole-attendee decline, display alarm, drag requests/results, revoke/regrant and rename; this Mac host has no recorded qualified disposable native session/trusted-TLS setup or these client observations |
 | Apple Calendar iOS | Pending the same observations on a physical iOS client; device/client observations, qualified reachable-TLS setup and disposable native credentials remain unexercised |
 | Thunderbird | Pending assisted-discovery-off second-home-href discovery and shared access on an actual client |
 | DAVx5 | Optional; not run |
 | Circulo | Sharing UI and its separate docs/api.md update pending separate repository work |
-| Shipping release build | Passed; prescribed no-default-features rocks command, exit 0, 1145.87 s |
+| Shipping release build | Corrected-source build passed, exit0,972.40s; original pre-review build1145.87s is historical above |
 | Deployment/release | Not performed; requires separate authorization |
 
 Record immediate UI and post-drain/refresh state separately on owner and grantee. Automated
@@ -1383,7 +1390,10 @@ separately from the successful run. Source restoration and command results:
 ```
 
 
-## Appendix E: final review finding and correction handoff
+## Appendix E: initial final-review finding and correction handoff
+
+This section preserves the initial blocked handoff state. Current correction/closure is in
+Appendix F.
 
 The fresh `gpt-6.1-sol` xhigh reviewer inspected `cd48a8f1..7c0a0f8a` with clean context
 and without prior finding lists. It reported **0 Critical, 1 Important, 0 Minor**. The
@@ -1446,3 +1456,136 @@ is added to the sole load-bearing I1 fix. Fresh whole-branch declined-to-judge i
 with explicitly accepted old-key/pubsub residency, write-time scheduling, upstream lifecycle,
 collection snapshot/partial-prefix contracts and evidence boundaries. No broader SQL/native/
 cluster/cryptographic guarantee is inferred. Native and Circulo evidence remain pending.
+
+
+## Appendix F: I1 correction and final acceptance
+
+Final correction code commit: `8fe2aec7efbe9af8ab112715f1fd45538aeff87a`. The production change resolves/selects the
+calendar archive before conditional-header validation, then preserves that same archive for
+mutation and CAS. The test-mode-only pause and HTTP regression are unchanged from behavioral
+RED. The source diff is confined to common test hooks, calendar PROPPATCH and sharing races.
+
+The original whole-branch review found one Important issue at `7c0a0f8a`. The single scoped
+Sol6.1/xhigh re-review marked I1 ADDRESSED with no new Critical/Important/Minor finding.
+This closes the finding without representing the scoped pass as another whole-branch scan.
+Raw RED/GREEN logs and current source hashes were independently checked by the reviewer and
+primary. Receipts do not embed per-run source hashes; continuity during the external runs
+also relies on the reported freeze and matching handback hashes. The primary executed the
+release build on the frozen corrected source, then verified the committed blobs match it.
+
+### Corrected-source evidence
+
+| Gate | Exact command/environment | Actual result | Command time |
+|---|---|---|---|
+| Format | `cargo fmt --all --check` | exit 0; clean | 3.26 s |
+| Whole ZA | `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests -- --nocapture` | exit 0; 1 passed/0 failed, 368.33 s; both stale 412/B preserved cases and controls pass | 550.74 s |
+| Ordinary WebDAV, first attempt | `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests webdav::webdav_tests` | exit 101; 0 passed/1 failed, expected 412/got 201 in PUT/GET; unexplained | 8.92 s |
+| Ordinary WebDAV, diagnostic rerun | `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests webdav::webdav_tests` | exit 0; 1 passed/0 failed, 21.29 s; RUST_BACKTRACE=1 reported, outside receipt allowlist | 22.79 s |
+| Key WebDAV | `STORE=RocksDb RUST_MIN_STACK=16777216 ZA_KEY_ACCOUNTS=1 cargo test -p tests webdav::webdav_tests` | exit 0; 1 passed/0 failed, 21.74 s | 22.39 s |
+| Shipping check | `cargo check -p stalwart --no-default-features --features rocks` | exit 0; finished successfully | 93.39 s |
+| Common/DAV units | `cargo test -p common -p dav` | exit 0; common 121, DAV 1 passed; 0 failed | 104.37 s |
+| Corrected-source release build | `cargo build --release -p stalwart --no-default-features --features rocks` | exit 0; release profile finished, 16m 12s | 972.40 s |
+
+The behavioral regression now returns 412 for stale owner displayname and grantee shared
+Apple-colour writes and preserves each competing value. Current-ETag and unconditional
+controls pass. The earlier, distinct later commit 409 fixture and strict ZA ending cleanup
+remain in the successful whole-suite run. The first ordinary WebDAV attempt failed in
+upstream PUT/GET (expected 412, got 201); its unchanged-source diagnostic rerun passed with
+RUST_BACKTRACE=1 reported as added (outside the receipt environment allowlist). The failing request/cause is still unidentified. No known-flake,
+uninterrupted-green or bridge-causality claim is made. The scoped review found no source
+path from the PROPPATCH-only correction to that PUT/GET mismatch; it did not establish the
+failure's cause or formally exclude timing effects.
+
+### Accepted repair and refusal ordering
+
+Ruling Final-I1: use the resolver-selected/owner-repaired archive for header validation and
+CAS. An authenticated owner's existing boundary maintenance can commit before the property
+request subsequently returns 412. The requested property edit is not applied on 412; the
+maintenance is the same owner-only, fenced metadata repair already used by owner reads.
+Cost if wrong: extra optimistic client retries after repair, and 412 cannot promise that no
+internal boundary metadata write occurred. No dedicated runtime test of the pending-repair
+plus stale-If-Match combination is claimed; this consequence was checked in source.
+
+Fresh resolver errors can precede 412; ordinary classification lookup also occurs earlier.
+Ordinary healthy calendars still use the original archive and event PROPPATCH is unchanged.
+This normal-error precedence agrees with [RFC 9110 section 13.2.1](https://www.rfc-editor.org/rfc/rfc9110.html#section-13.2.1), which evaluates preconditions after normal request checks.
+No retry, admission rule, repair rule, domain, personal/shared bundle codec, or stored format
+was expanded by the fix. The new one-shot pause is test-only and unset/inert by default.
+
+### Provenance and remaining gates
+
+```json
+{
+  "code_commit": "8fe2aec7efbe9af8ab112715f1fd45538aeff87a",
+  "release_build_head_before_commit": "2f5c9af7d46eab0fc0ff9564101ff9dede4fb96e",
+  "review_package_sha256": "46e5b6f30affd9f79a4db363e86aef5c0aee1add2b6b99baa3037a0eca9e6f03",
+  "source_sha256": {
+    "crates/dav/src/calendar/proppatch.rs": "1f2c72e429466af288f54aa89f58f2de7d0e26f006b8aeb9e884981b0c2e5e94",
+    "crates/common/src/za/test_hooks.rs": "28fc6c1a87c8a1f3e2e6b1f735e1fc70b22fdc7f3f469e576960ce15017bf564",
+    "tests/src/za/sharing_races.rs": "aa649c3aac7dbd3ce764c5d08911e4af8ba86e0d3376b3009affa6643d682a21"
+  },
+  "red_log_sha256": "0ea9f8d2efd38cc68bbac14dcd1fcf529d80cb3fc6fdd2c0f840c9d9469e3dee",
+  "external_fix_report_sha256": "781a6447f036ae13276ac303dcab679547b9a4fd43e1ecb76be679419c3cc53d",
+  "scoped_review_sha256": "2e6c6b0c9a5eca56d363c96ae8ea20be8dea6369e84e8988c1bc604052e27edf",
+  "records": [
+    {
+      "gate": "green-fmt",
+      "exit": 0,
+      "elapsed_seconds": 3.2559604170382954,
+      "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "gate": "green-za",
+      "exit": 0,
+      "elapsed_seconds": 550.7364419169608,
+      "log_sha256": "41575e451e901716e550e214352a308053ab44bd535e08ef10e7fb21632a29b7"
+    },
+    {
+      "gate": "green-webdav",
+      "exit": 101,
+      "elapsed_seconds": 8.924152708030306,
+      "log_sha256": "f83281538a5e602f4cc68eb85ac0676508f6f79aef1a6bd04551e189fd2129f3"
+    },
+    {
+      "gate": "green-webdav-diag",
+      "exit": 0,
+      "elapsed_seconds": 22.785994999983814,
+      "log_sha256": "ed39c90bc986ad85ed8affddffb396094ccdbd905231494ba34c855326821a68"
+    },
+    {
+      "gate": "green-webdav-key",
+      "exit": 0,
+      "elapsed_seconds": 22.386533791024704,
+      "log_sha256": "4de9a4dc8092fc6d41eb2d0ef11a1892961e972b1554bebe1368c6ed7110b94e"
+    },
+    {
+      "gate": "green-check",
+      "exit": 0,
+      "elapsed_seconds": 93.39173516602023,
+      "log_sha256": "950ef61bc9ceb4b5bbeb3026442ad162acf52a7c32b23097c3ab7eebc189af50"
+    },
+    {
+      "gate": "green-units",
+      "exit": 0,
+      "elapsed_seconds": 104.37372620898532,
+      "log_sha256": "19ce354e5964120090df519b85e32c00fbde532aefb380d94f0eba01c80fa12e"
+    },
+    {
+      "gate": "final-release",
+      "exit": 0,
+      "elapsed_seconds": 972.404619541,
+      "log_sha256": "ac1df4f4623fcd982cea8dd277a0ae247e61fcc4ca8e2f2f58236c052d910cc5"
+    }
+  ]
+}
+```
+
+The original complete net, 3,000-event measurements, scanner and 57 mutation qualifications
+remain historical evidence at their named source revisions. They were not repeated or
+relabeled as executions on this correction. No new changed-code warning was identified;
+inherited linker and non-enterprise warnings remain disclosed. Native macOS/iOS/Thunderbird,
+SQL/multi-node execution and separate Circulo page work remain unexecuted/pending.
+
+The branch/worktree and raw qualification workspace are retained for the pending native
+observations and unexplained ordinary-test investigation. Cost: local disk retention.
+No merge, push, deployment, new integration task or destructive cleanup is part of this close.

@@ -4,8 +4,8 @@ This handoff describes the implementation at `e88b5c1e16487e7bcc385f952f9162ecc4
 revision 14 of the [sharing design](../superpowers/specs/2026-10-22-zero-access-sharing-design.md).
 The separate Circulo page and its `docs/api.md` integration remain pending. Automated evidence and
 measurement conditions are recorded in the [release
-outcome](../superpowers/plans/2026-10-23-zero-access-plan14-outcome.md); native-client qualification
-and clean whole-branch approval remain pending.
+outcome](../superpowers/plans/2026-10-23-zero-access-plan14-outcome.md).
+Native-client qualification remains pending.
 
 ## Common request and error contract
 
