@@ -136,11 +136,14 @@ impl CalendarUpdateRequestHandler for Server {
             .scheduling_account_info(access_token.account_id(), account_id)
             .await
             .caused_by(trc::location!())?;
-        let roles = if account_info.account_id != account_id {
+        let roles = if za_keys.is_some() && account_info.account_id != account_id {
             Some((
                 self.build_account_info(account_info.account.clone())
-                    .await?,
-                self.account_info(account_id).await?,
+                    .await
+                    .caused_by(trc::location!())?,
+                self.account_info(account_id)
+                    .await
+                    .caused_by(trc::location!())?,
             ))
         } else {
             None
@@ -181,15 +184,21 @@ impl CalendarUpdateRequestHandler for Server {
             // Spec 8.1: the stored sealed archive stays `current` for the
             // index builder; the unsealed view is used for comparison, editing
             // and response bodies only.
-            let mut contexts = za_write_contexts(
-                self,
-                access_token,
-                account_id,
-                &event_.deserialize::<CalendarEvent>()?,
-                parent_id,
-                Acl::ModifyItems,
-            )
-            .await?;
+            let mut contexts = if za_keys.is_some() {
+                za_write_contexts(
+                    self,
+                    access_token,
+                    account_id,
+                    &event_
+                        .deserialize::<CalendarEvent>()
+                        .caused_by(trc::location!())?,
+                    parent_id,
+                    Acl::ModifyItems,
+                )
+                .await?
+            } else {
+                Vec::new()
+            };
             let view_ = match contexts.first() {
                 Some(context) => std::borrow::Cow::Owned(
                     event_view_in_domain(&event_, &context.domain)
@@ -486,12 +495,15 @@ impl CalendarUpdateRequestHandler for Server {
                     .clone()
                     .update_at(
                         access_token.account_tenant_ids(),
-                        event_.to_unarchived::<CalendarEvent>()?,
+                        event_
+                            .to_unarchived::<CalendarEvent>()
+                            .caused_by(trc::location!())?,
                         account_id,
                         document_id,
                         timestamp,
                         &mut batch,
-                    )?
+                    )
+                    .caused_by(trc::location!())?
                     .etag();
                 if prev_email_alarm != next_email_alarm {
                     if let Some(prev_alarm) = &prev_email_alarm {
@@ -501,8 +513,10 @@ impl CalendarUpdateRequestHandler for Server {
                         next_alarm.write_task(&mut batch);
                     }
                 }
+                // Retries are sealed/key-only; plain itip_messages cannot be
+                // consumed on a reachable retry path.
                 if let Some(messages) = itip_messages.take() {
-                    messages.queue(&mut batch)?;
+                    messages.queue(&mut batch).caused_by(trc::location!())?;
                 }
                 #[cfg(feature = "test_mode")]
                 common::za::test_hooks::update_commit_pause_point(account_id).await;
@@ -529,10 +543,10 @@ impl CalendarUpdateRequestHandler for Server {
                         {
                             contexts = fresh;
                         } else {
-                            return Err(error.into());
+                            return Err(error.caused_by(trc::location!()).into());
                         }
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => return Err(error.caused_by(trc::location!()).into()),
                 }
             }
             unreachable!("bounded event retry always returns")
@@ -807,10 +821,13 @@ impl CalendarUpdateRequestHandler for Server {
                             next_email_alarm.clone(),
                             timestamp,
                             &mut batch,
-                        )?
+                        )
+                        .caused_by(trc::location!())?
                         .etag();
+                    // Retries are sealed/key-only; plain itip_messages cannot be
+                    // consumed on a reachable retry path.
                     if let Some(messages) = itip_messages.take() {
-                        messages.queue(&mut batch)?;
+                        messages.queue(&mut batch).caused_by(trc::location!())?;
                     }
                     Ok((batch, etag))
                 };
@@ -869,10 +886,10 @@ impl CalendarUpdateRequestHandler for Server {
                             .await;
                         }
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => return Err(error.caused_by(trc::location!()).into()),
                 }
             } else {
-                self.commit_batch(batch).await?;
+                self.commit_batch(batch).await.caused_by(trc::location!())?;
             }
             self.notify_task_queue();
 

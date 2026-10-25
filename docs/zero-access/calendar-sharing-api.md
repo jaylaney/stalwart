@@ -1,7 +1,7 @@
 # Calendar sharing API
 
-This handoff describes the implementation at `e88b5c1e16487e7bcc385f952f9162ecc43b49ba`, against
-revision 14 of the [sharing design](../superpowers/specs/2026-10-22-zero-access-sharing-design.md).
+This handoff describes the release 4 implementation against revision 14 of the
+[sharing design](../superpowers/specs/2026-10-22-zero-access-sharing-design.md).
 The separate Circulo page and its `docs/api.md` integration remain pending. Automated evidence and
 measurement conditions are recorded in the [release
 outcome](../superpowers/plans/2026-10-23-zero-access-plan14-outcome.md).
@@ -25,6 +25,12 @@ reason>"}`. A missing or stale vault gives the shared fixed reasons `vault recor
 is not active`, or `vault changed since verification`; a non-key caller gets `not a zero-access
 account`. Corrupt sealed data/store failures are server errors, not normalized to a sharing 409.
 
+A grant or revoke error does not prove that nothing changed: conversion work or the mutation
+batch can commit before a later boundary-completion error. Re-list to check current state and
+retry the same operation as needed, using the stable grant id for revoke. Retries are idempotent;
+work counts still describe only that HTTP request's acknowledged work. A pending sync boundary
+continues to refuse old tokens until a later owner operation completes its repair.
+
 `calendar` in grant/revoke is the caller's own calendar URL slug, excluding inbox/outbox. Empty,
 over 255 bytes, or `/` is 400 `invalid calendar` through the generic problem adapter. An `address`
 must be a normalizable bare address or is 400 `invalid address`. Input and enum validation precedes
@@ -46,7 +52,11 @@ and stays true after the last revoke. `grant` is the stable grantee account id. 
 of the key recorded in the grant, and `granted_at` is Unix seconds of grant or last re-key.
 `shared_with_me` covers eligible foreign key-account calendars only and sorts by owner then
 calendar. `href` is the encoded CalDAV path. `name` can be null if the caller's grant ring will not
-open; it otherwise comes from the caller's personal entry. Plain-account shares are omitted. List
+open at the grant-ring AEAD step; it otherwise comes from the caller's personal entry. Failure to
+open the caller's own private key, or a vault/store failure before that step, can fail the whole
+list instead of returning a partial own-calendar list. An assisted own-home DAV listing can
+likewise fail at request level for an eligible corrupt foreign calendar; the accepted error
+contract permits request or item 500. Plain-account shares are omitted. List
 may perform the existing private-key self-check/owner public-key repair while opening a caller's
 foreign grants; that possible side effect is distinct from a grant/revoke.
 
@@ -158,3 +168,29 @@ aliases. Persistent shared content is encrypted; the server handles plaintext, c
 session keys during authenticated use. Logout alone is not an immediate key-erasure guarantee:
 existing cache residency and its hard cap still apply. Current stored old-generation ciphertext
 remains accessible to someone who already held its key.
+
+Addressed PROPFIND retains an existence residual: a caller with some grant from an owner can
+distinguish an absent guessed calendar slug or event filename (404) from an existing path in a
+calendar the resolver refuses (403). This confirms guesses; it does not enumerate names or expose
+event content. A foreign caller without any grant from that owner is refused uniformly at the URI
+gate. The vanished-path filter separately prevents bulk disclosure of ungranted deletion paths.
+
+## Corrupt sharing state
+
+A mismatch between a calendar's encrypted grant ledger and its plaintext ACL makes grant,
+revoke and gone-grantee sweeping fail closed with a server error. No sharing API repairs the
+encrypted ledger from the plaintext ACL. Own reads or listing may still work when the remaining
+archive is valid, but arbitrary corruption can also prevent them.
+
+Preserve readable content before destructive recovery. Use a verified consistent backup of the
+encrypted calendar and grant state, or, where the owner can still read/export, an owner-controlled
+export, recreation and regrant to verified recipients. Verify the replacement's content and access
+before deleting the damaged calendar. Blind deletion is not a general recovery procedure.
+
+
+Collection COPY/MOVE retains committed-prefix behavior on a later conflict. In particular, an
+overwrite MOVE copies source properties before moving the children, then retains the original
+source-version fence for its final deletion. A concurrent source property edit can therefore
+produce409 after children moved; the newer source properties remain on the source collection.
+Inspect and reconcile both collections before retrying or deleting either. Refreshing only the
+final delete snapshot would lose those properties and conditional-request protection.

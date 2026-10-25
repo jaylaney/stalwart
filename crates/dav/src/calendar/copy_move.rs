@@ -1856,6 +1856,8 @@ async fn za_copy_container(
         }
         let mut batch = BatchBuilder::new();
         target_context.assert_in(&mut batch);
+        // The destination holds the preflight source metadata. Keep that
+        // original source CAS so a newer property or slug survives a conflict.
         DestroyArchive(contexts[0].stored.to_unarchived::<Calendar>()?).delete(
             token.account_tenant_ids(),
             owner,
@@ -1879,6 +1881,8 @@ async fn za_copy_container(
                 .with_document(0)
                 .clear(PrincipalField::DefaultCalendarId);
         }
+        #[cfg(feature = "test_mode")]
+        common::za::test_hooks::calendar_move_delete_pause_point(owner).await;
         server.commit_batch(batch).await?;
     }
     server.notify_task_queue();

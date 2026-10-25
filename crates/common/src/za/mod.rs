@@ -145,3 +145,24 @@ pub async fn share_conflict_pause_point(account_id: u32) {
     #[cfg(not(feature = "test_mode"))]
     let _ = account_id;
 }
+
+/// Sharing review observations and listing pauses for standalone HTTP test builds.
+/// Like the other HTTP forwarders, these are no-ops without common's test mode.
+pub fn record_share_conversion_loss(account_id: u32) {
+    #[cfg(feature = "test_mode")]
+    test_hooks::record_share_conversion_loss(account_id);
+    #[cfg(not(feature = "test_mode"))]
+    let _ = account_id;
+}
+pub async fn share_list_own_pause_point(account_id: u32) {
+    #[cfg(feature = "test_mode")]
+    test_hooks::share_list_own_pause_point(account_id).await;
+    #[cfg(not(feature = "test_mode"))]
+    let _ = account_id;
+}
+pub async fn share_list_foreign_pause_point(account_id: u32) {
+    #[cfg(feature = "test_mode")]
+    test_hooks::share_list_foreign_pause_point(account_id).await;
+    #[cfg(not(feature = "test_mode"))]
+    let _ = account_id;
+}

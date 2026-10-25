@@ -894,6 +894,13 @@ Calendars of plain accounts shared with the caller (which release 1 lets a
 key account read) are not listed (author's call): they are upstream's
 shares, and the page cannot manage them.
 
+The nullable name describes the grant-ring AEAD failure after the caller's
+private key is available. Failure opening the caller's own private key,
+or a vault/store failure before grant-ring opening, may fail the request
+instead of yielding a partial list. This retains section 10's error
+contract; it does not normalize unrelated corruption or I/O failures to
+an absent name.
+
 | Code | When | Body |
 |---|---|---|
 | 200 | Listed | the object above |
@@ -1315,6 +1322,10 @@ Other grantees' bundles stay sealed in either view, and no grantee's view
 ever opens the owner's ring. A grantee whose
 private key does not open (key pinning's "neither" mark) fails the shared
 calendar's items as unseal failures (500), with release 1's logged error.
+The preliminary eligibility scan can surface this as a request-level 500
+under section 10's request-or-item error contract. With assisted discovery,
+that can fail the caller's whole own-home listing, including own calendars;
+successful partial listing is not promised for this degraded vault state.
 
 **Vanished paths in `sync-collection`** (review finding 4). One listing
 path answers before any archive is loaded, so neither the loader's view nor
@@ -1339,6 +1350,16 @@ saw no container change). It also respects the requested collection: a
 on the home only the eligible calendars'. A granted calendar that was
 itself deleted or renamed has no current path, so its own 404 is dropped,
 and the client rediscovers from the home listing (5.3).
+
+**Addressed-path existence residual.** The specified 403 for an existing
+calendar refused by the resolver differs from 404 for a missing path. A
+caller already holding some grant from that owner can therefore confirm
+guessed private calendar slugs or event filenames through PROPFIND. A
+foreign caller without such a grant gets the URI gate's uniform refusal.
+This does not enumerate unknown names or expose event content, and it does not
+relax the vanished-path filter above. Other methods retain their existing
+status distinctions. This is an accepted metadata residual of the current
+addressed-request contract, separate from bulk tombstone disclosure.
 
 **The grantee's sync token is bound to its grant** (re-review finding 3).
 Vanished paths carry no calendar identity (`Store::vanished`), a slug can
@@ -2683,6 +2704,21 @@ account: `UPDATE_COMMIT_PAUSE` (update PUT after fan-out and seal, before
 before `delete.rs:276`). Test helpers open rings and envelopes with an account's
 password-derived keys to assert generations; they are test code and never
 part of the product build.
+
+PR-review regressions also use `SHARE_LIST_OWN_PAUSE` after own-calendar
+id enumeration and `SHARE_LIST_FOREIGN_PAUSE` after one foreign owner's
+candidate enumeration, before fresh resolver reads. Both use the listing
+caller's account id and the existing one-shot `Pause` shape. The owner-scoped
+`CALENDAR_MOVE_DELETE_PAUSE` holds collection MOVE immediately before its
+final prepared indexed-delete commit, after fresh source/target reads, to
+prove a later source write still loses the source CAS. Test-only
+`record_share_conversion_loss` / `take_share_conversion_losses` observe
+conversion assertion losses by owner, separately from final grant-decision
+losses; they prove a pin-only write does not cause a conversion assertion
+loss while the final grant's pin assertion remains enforced. A final grant
+decision loss may still require a successful repeated walk before the
+converted flag is published. These seams record ids/counts only and do not
+enter the shipping build.
 
 Five further test-mode counted assertion-failure hooks cover conversion's
 write classes: `SHARE_INIT_ASSERT_FAIL`, `SHARE_REWRAP_ASSERT_FAIL`,

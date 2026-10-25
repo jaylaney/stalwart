@@ -85,12 +85,17 @@ impl CalendarDeleteRequestHandler for Server {
         let document_id = delete_resource.document_id();
         let account_info = self
             .scheduling_account_info(access_token.account_id(), account_id)
-            .await?;
-        let roles = if account_info.account_id != account_id {
+            .await
+            .caused_by(trc::location!())?;
+        let za_keys = super::za_writer_keys(self, access_token, account_id).await?;
+        let roles = if za_keys.is_some() && account_info.account_id != account_id {
             Some((
                 self.build_account_info(account_info.account.clone())
-                    .await?,
-                self.account_info(account_id).await?,
+                    .await
+                    .caused_by(trc::location!())?,
+                self.account_info(account_id)
+                    .await
+                    .caused_by(trc::location!())?,
             ))
         } else {
             None
@@ -105,7 +110,6 @@ impl CalendarDeleteRequestHandler for Server {
             && access_token.has_permission(Permission::CalendarSchedulingSend);
         // Invitations spec 5.5: a key account's CANCELs and declines are
         // built from the unsealed stored tree and go to the fan-out.
-        let za_keys = super::za_writer_keys(self, access_token, account_id).await?;
         let mut za_messages = Vec::new();
 
         // Fetch entry
@@ -391,13 +395,18 @@ impl CalendarDeleteRequestHandler for Server {
                 .into_iter()
                 .collect::<Vec<_>>();
                 if !calendars_changed(&contexts, &fresh) {
-                    return Err(error.into());
+                    return Err(error.caused_by(trc::location!()).into());
                 }
                 let mut batch = BatchBuilder::new();
                 for context in &fresh {
                     context.assert_in(&mut batch);
                 }
-                DestroyArchive(original.to_unarchived::<CalendarEvent>()?).delete_za_at(
+                DestroyArchive(
+                    original
+                        .to_unarchived::<CalendarEvent>()
+                        .caused_by(trc::location!())?,
+                )
+                .delete_za_at(
                     &account_info,
                     account_id,
                     document_id,
@@ -408,10 +417,11 @@ impl CalendarDeleteRequestHandler for Server {
                     fresh.first().map(|context| &context.domain),
                     *cutoff,
                     &mut batch,
-                )?;
-                self.commit_batch(batch).await?;
+                )
+                .caused_by(trc::location!())?;
+                self.commit_batch(batch).await.caused_by(trc::location!())?;
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(error.caused_by(trc::location!()).into()),
         }
         // The committed deletion retires every grant. Evict the grantees'
         // resident collection-key sessions and authorization only after that

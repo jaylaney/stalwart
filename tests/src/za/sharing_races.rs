@@ -965,12 +965,10 @@ async fn grantee_commit_seams(test: &mut TestServer, owner: u32, calendar: u32, 
                 .unwrap_err()
                 .is_assertion_failure()
         );
-        let status =
-            match za_calendar_context(&test.server, &token, owner, calendar, required).await {
-                Err(ZaCalendarError::Forbidden) => 403,
-                _ => panic!("revoked writer still authorized"),
-            };
-        assert_eq!(status, 403);
+        match za_calendar_context(&test.server, &token, owner, calendar, required).await {
+            Err(ZaCalendarError::Forbidden) => (),
+            _ => panic!("revoked writer still authorized"),
+        }
         assert!(
             matches!(
                 groupware::calendar::sharing::resolve::za_event_contexts(
@@ -2460,7 +2458,7 @@ async fn sharing_http_races(test: &mut TestServer) {
         }
     };
     let race = calendar("race").await;
-    // Real calendar-archive assertion loss: two grants must both survive, once each.
+    // Concurrent grant requests must both survive, once each; their phase order is unspecified.
     let answers = za_post_concurrent(
         "shares/grant",
         &[request("race", READER), request("race", SECOND)],
@@ -2891,9 +2889,14 @@ async fn sharing_http_races(test: &mut TestServer) {
             .await
             .with_status(StatusCode::NO_CONTENT);
     }
-    let _ = client
+    let default_status = client
         .request("DELETE", &format!("{HOME}default/"), "")
-        .await;
+        .await
+        .status;
+    assert!(matches!(
+        default_status,
+        StatusCode::NO_CONTENT | StatusCode::NOT_FOUND
+    ));
     test.wait_for_tasks().await;
 }
 

@@ -646,3 +646,45 @@ pub fn set_calendar_proppatch_read_pause(pause: Option<Arc<Pause>>) {
 pub async fn calendar_proppatch_read_pause_point(owner: u32) {
     wait(take_for(&CALENDAR_PROPPATCH_READ_PAUSE, owner)).await;
 }
+
+/// Share listing after enumeration, before fresh archive resolution.
+pub static SHARE_LIST_OWN_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SHARE_LIST_FOREIGN_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub fn set_share_list_own_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SHARE_LIST_OWN_PAUSE, pause);
+}
+pub fn set_share_list_foreign_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SHARE_LIST_FOREIGN_PAUSE, pause);
+}
+pub async fn share_list_own_pause_point(owner: u32) {
+    wait(take_for(&SHARE_LIST_OWN_PAUSE, owner)).await;
+}
+pub async fn share_list_foreign_pause_point(reader: u32) {
+    wait(take_for(&SHARE_LIST_FOREIGN_PAUSE, reader)).await;
+}
+
+/// Owner-scoped conversion assertion losses, excluding final grant decision losses.
+static SHARE_CONVERSION_LOSSES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+pub fn record_share_conversion_loss(owner: u32) {
+    SHARE_CONVERSION_LOSSES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(owner);
+}
+pub fn take_share_conversion_losses(owner: u32) -> usize {
+    let mut losses = SHARE_CONVERSION_LOSSES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let count = losses.iter().filter(|id| **id == owner).count();
+    losses.retain(|id| *id != owner);
+    count
+}
+
+/// Collection MOVE after final fresh source/target resolution and delete assembly.
+pub static CALENDAR_MOVE_DELETE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub fn set_calendar_move_delete_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&CALENDAR_MOVE_DELETE_PAUSE, pause);
+}
+pub async fn calendar_move_delete_pause_point(owner: u32) {
+    wait(take_for(&CALENDAR_MOVE_DELETE_PAUSE, owner)).await;
+}

@@ -302,11 +302,17 @@ async fn mutate(
             Err(error) => return share_error(error, verified.account_id, id),
         };
         if precheck.needs_conversion {
+            // Conversion does not decide the grant. Keep the pin CAS for the
+            // final grant batch, alongside the original decision guard.
+            let conversion_guard = ZaShareGuards {
+                pin_assertion: None,
+                ..guard
+            };
             match za_convert_calendar_tracked(
                 server,
                 &verified.keys,
                 id,
-                &guard,
+                &conversion_guard,
                 &mut conversion_wrote,
             )
             .await
@@ -321,6 +327,8 @@ async fn mutate(
                 }) => {
                     counts.rewrapped += committed.rewrapped;
                     counts.sealed += committed.sealed;
+                    #[cfg(feature = "test_mode")]
+                    common::za::record_share_conversion_loss(verified.account_id);
                     conversion_losses += 1;
                     if !progress_changed {
                         decision_losses += 1;
@@ -420,10 +428,18 @@ pub(super) async fn za_shares(
         )
         .await?;
     let mut calendars = Vec::new();
+    #[cfg(feature = "test_mode")]
+    common::za::share_list_own_pause_point(verified.account_id).await;
     for id in ids {
-        let context = za_owned_calendar_context(server, &verified.keys, id)
-            .await
-            .map_err(|e| e.into_store_error(verified.account_id, id))?;
+        let context = match za_owned_calendar_context(server, &verified.keys, id).await {
+            Ok(context) => context,
+            Err(ZaCalendarError::Store(error))
+                if error.matches(trc::EventType::Store(trc::StoreEvent::NotFound)) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error.into_store_error(verified.account_id, id)),
+        };
         let view = calendar_view_in_domain(&context.stored, &context.domain, verified.account_id)
             .map_err(|e| seal_error(e, verified.account_id, id))?
             .deserialize::<Calendar>()?;
@@ -510,6 +526,8 @@ pub(super) async fn za_shares(
                 },
             )
             .await?;
+        #[cfg(feature = "test_mode")]
+        common::za::share_list_foreign_pause_point(verified.account_id).await;
         for (id, slug, level) in candidates {
             let name = match za_calendar_context(
                 server,
@@ -532,6 +550,11 @@ pub(super) async fn za_shares(
                         .iter()
                         .find(|p| p.account_id == verified.account_id)
                         .map(|p| p.name.clone())
+                }
+                Err(ZaCalendarError::Store(error))
+                    if error.matches(trc::EventType::Store(trc::StoreEvent::NotFound)) =>
+                {
+                    continue;
                 }
                 Err(ZaCalendarError::Seal(SealError::Aead)) => None,
                 Err(ZaCalendarError::Forbidden) | Ok(None) => continue,

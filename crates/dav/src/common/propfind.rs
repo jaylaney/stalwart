@@ -1420,23 +1420,14 @@ async fn get(
         None
     };
     if let Some(eligible) = &eligible {
-        let addressed_id = resource
-            .resource
-            .and_then(|path| resources.by_path(path))
-            .map(|item| {
-                if item.is_container() {
-                    item.document_id()
-                } else {
-                    item.parent_id().unwrap()
-                }
-            });
-        if resource.resource.is_some() && addressed_id.is_some_and(|id| !eligible.contains_key(&id))
+        if resource.resource.is_some()
+            && requested_calendar.is_some_and(|id| !eligible.contains_key(&id))
         {
             return Err(DavError::Code(StatusCode::FORBIDDEN));
         }
         if let SyncType::From { id, .. } = query.sync_type {
             for (&calendar_id, context) in eligible {
-                if addressed_id.is_none_or(|id| id == calendar_id)
+                if requested_calendar.is_none_or(|id| id == calendar_id)
                     && context.boundary.is_some_and(|boundary| {
                         boundary.pending
                             || id <= boundary.grant_change_id.max(boundary.rename_change_id)
@@ -1452,7 +1443,7 @@ async fn get(
         }
         let mut prefixes = Vec::new();
         for (&calendar_id, context) in eligible {
-            if addressed_id.is_none_or(|id| id == calendar_id) {
+            if requested_calendar.is_none_or(|id| id == calendar_id) {
                 let calendar = context
                     .stored
                     .deserialize::<Calendar>()
@@ -1460,7 +1451,7 @@ async fn get(
                 prefixes.push(format!(
                     "{}{}/",
                     resources.base_path,
-                    percent_encoding::utf8_percent_encode(&calendar.name, groupware::RFC_3986)
+                    groupware::encode_path_segment(&calendar.name)
                 ));
             }
         }
@@ -1775,6 +1766,12 @@ async fn get(
                     } else {
                         None
                     };
+                    if let Some(eligible) = &foreign_eligible {
+                        for (&id, context) in eligible {
+                            data.calendar_memo
+                                .insert((shared_account_id, id), context.clone());
+                        }
+                    }
                     let shared_containers = if let Some(eligible) = &foreign_eligible {
                         Some(RoaringBitmap::from_iter(eligible.keys().copied()))
                     } else {
