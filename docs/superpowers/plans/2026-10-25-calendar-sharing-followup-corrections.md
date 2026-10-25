@@ -74,5 +74,7 @@
 
 - [x] Inspect actual diffs and source-backed reports. Obtain fresh independent Astra xhigh review of the branch against the accepted contract, plus bounded fix reviews when changes require them.
 - [x] Address the whole-branch review's CK-vector growth finding without changing the archived representation: wipe retired key storage while owned before release; verify the decoded full-capacity growth path and key preservation. Use one bounded fix wave and scoped Astra re-review.
-- [ ] Run formatting; core unit tests; HTTP test-mode tests if hooks affect that crate; full ZA and WebDAV in plain/key modes sequentially. Build the shipping RocksDB product without test mode, then run the pinned client matrix against that exact binary. Record source identity and distinct evidence limits.
-- [ ] Commit only intended files, push the existing draft branch, verify the PR head/draft state and report checks that are still pending. Do not post replies or resolve review threads.
+- [x] Run formatting; core unit tests; HTTP test-mode tests if hooks affect that crate; full ZA and WebDAV in plain/key modes sequentially. Build the shipping RocksDB product without test mode, then run the pinned client matrix against that exact binary. Record source identity and distinct evidence limits.
+- [x] Commit only intended files, push the existing draft branch, verify the PR head/draft state and report checks that are still pending. Do not post replies or resolve review threads.
+
+Qualification results and exact source/artifact identities are in the [follow-up disposition](2026-10-25-calendar-sharing-followup-disposition.md). The PR remains a draft; local acceptance does not establish current-head CI, optional-backend runtime or native-client acceptance.

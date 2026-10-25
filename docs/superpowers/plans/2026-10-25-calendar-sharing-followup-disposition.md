@@ -2,7 +2,7 @@
 
 Review input: seven new threads in review [5645121295](https://github.com/jaylaney/stalwart/pull/58#pullrequestreview-5645121295), against `ee7ebbe4e616fd09a117a801f22a59d60fe91f14`. The preceding disposition remains historical evidence for the earlier 17 threads. The predecessor's GitHub Actions run 40222683663 completed successfully; these new cases require additional regressions.
 
-This pass follows the [correction plan](2026-10-25-calendar-sharing-followup-corrections.md). The seven-comment implementation, focused reviews, whole-branch Astra review/fix and amended-source Rust/harness checks below passed. Shipping-binary client qualification remains pending. Keep the PR in draft.
+This pass follows the [correction plan](2026-10-25-calendar-sharing-followup-corrections.md). The seven-comment implementation, focused reviews, whole-branch Astra review/fix, amended-source Rust/harness checks and shipping-binary client matrix below passed. Current-head GitHub Actions and native-client acceptance remain separate gates. Keep the PR in draft.
 
 | Thread | Adjudication | Required correction |
 | --- | --- | --- |
@@ -32,8 +32,11 @@ All commands used the required rustup PATH, stable Rust 1.99.0 and Cargo 1.99.0.
 | Whole `za::za_tests` | Passed: 393.32 seconds; includes MOVE, identity/collision/history, retention, ordinary-owner, rotation and repaired quota controls. |
 | Whole `webdav::webdav_tests`, plain then key | Passed; full command durations 22.43 / 22.37 seconds. |
 | Pinned Python harness unit tests | Passed: 30 tests. |
-| Shipping release build and full client matrix | First build intentionally interrupted for the key-erasure fix; no new artifact qualified yet. |
+| Shipping release build | Passed: `cargo build --release -p stalwart --no-default-features --features rocks`, 961.23 seconds; no enterprise or `test_mode`. The first build was intentionally interrupted for the key-erasure fix and is not qualified. |
+| Full pinned client matrix against that binary | Passed: ordinary 66 passed / one skipped / five xfailed (72 cases); key 71 passed / one skipped / five xfailed (77 cases). All five strict sharing flows passed; dependency pins and compatibility policy unchanged. |
 | Fresh Astra xhigh whole-branch review | Completed at `f28143ec`; its sole Important key-erasure finding was fixed and closed by one scoped re-review, with no new actionable finding. |
+
+The qualified release artifact is 71,701,152 bytes, SHA-256 `5a07296561bb25eb29a18c611786e27a0e440172cc3c5ee9bb6bf5c31ad557ce`, built from code commit `807dd709cba0ef14538f86cae2b0ac1106e3df62`. The client wrapper verified both the frozen source identity above and this binary hash before and after its 23.44-second run. The client used Python 3.12.15 and python-caldav 3.3.1, source commit `111ae14b875f40d100d5259820f10210f00e20f9`; requirements SHA-256 `2f864695d6c3d3bf230bec2a7bf1912612b952c4e8aef73acfd723454462bde3`. Build/client receipts and sanitized logs are retained in the local evidence workspace `.superpowers/sdd/2026-10-25-calendar-sharing-followup-corrections/`. Subsequent integration edits are documentation-only.
 
 The first primary ZA run failed a new ordinary-client fixture that took its token before PUT and DELETE; the ordinary change reader correctly coalesced both operations. The corrected control first proves the client observed the event, then deletes it and checks the legacy raw bytes and matching identity record. Its post-fix full run is the passing result above. Earlier inert/log-ID, decimal-token, property-404 and raw-reader activation fixture failures are retained in local evidence and excluded as meaningful negative controls. The meaningful quota, destructive-MOVE/orphan, legacy disclosure and retention-gap negative controls were separately observed before their fixes.
 
