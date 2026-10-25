@@ -57,7 +57,7 @@ use trc::AddContext;
 use types::{
     acl::Acl,
     blob::BlobId,
-    collection::{Collection, SyncCollection, VanishedCollection},
+    collection::{Collection, SyncCollection},
     id::Id,
 };
 
@@ -563,7 +563,9 @@ impl CalendarEventSet for Server {
             let vanished_paths = new_calendar_event
                 .removed_calendar_ids(calendar_event.inner)
                 .filter_map(|calendar_id| {
-                    cache.format_resource_path_by_parent(document_id, calendar_id)
+                    cache
+                        .format_resource_path_by_parent(document_id, calendar_id)
+                        .map(|path| (calendar_id, path))
                 })
                 .collect::<Vec<_>>();
             new_calendar_event
@@ -575,8 +577,8 @@ impl CalendarEventSet for Server {
                     &mut batch,
                 )
                 .caused_by(trc::location!())?;
-            for path in vanished_paths {
-                batch.log_vanished_item(VanishedCollection::Calendar, path);
+            for (calendar_id, path) in vanished_paths {
+                batch.log_calendar_vanished(calendar_id, path);
             }
             if prev_email_alarm != next_email_alarm {
                 if let Some(prev_alarm) = prev_email_alarm {
@@ -669,6 +671,19 @@ impl CalendarEventSet for Server {
                 );
             }
 
+            // Retain each source link before consuming the archive. The path
+            // cannot be used to reconstruct identity when calendar names collide.
+            let vanished_paths = calendar_event
+                .inner
+                .names
+                .iter()
+                .filter_map(|name| {
+                    let calendar_id = name.parent_id.to_native();
+                    cache
+                        .format_resource_path_by_parent(document_id, calendar_id)
+                        .map(|path| (calendar_id, path))
+                })
+                .collect::<Vec<_>>();
             // Delete event
             DestroyArchive(calendar_event)
                 .delete_all(
@@ -680,8 +695,8 @@ impl CalendarEventSet for Server {
                 )
                 .caused_by(trc::location!())?;
 
-            for path in cache.format_resource_paths_by_id(document_id) {
-                batch.log_vanished_item(VanishedCollection::Calendar, path);
+            for (calendar_id, path) in vanished_paths {
+                batch.log_calendar_vanished(calendar_id, path);
             }
 
             response.destroyed.push(id);

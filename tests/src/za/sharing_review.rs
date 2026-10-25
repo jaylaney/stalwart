@@ -22,10 +22,7 @@ use store::{
     ValueKey,
     write::{AlignedBytes, Archive, BatchBuilder},
 };
-use types::{
-    collection::{Collection, SyncCollection},
-    field::Field,
-};
+use types::collection::{Collection, SyncCollection};
 
 const OWNER: &str = "sharing-review-owner@example.com";
 const READER: &str = "sharing-review-reader@example.com";
@@ -166,7 +163,7 @@ pub async fn test(test: &mut TestServer) {
             "private tombstone disclosure: {hrefs:?}"
         );
         if !response.expect_body().contains("404") {
-            failures.push(format!("missing404 tombstone status from {target}"));
+            failures.push(format!("missing 404 tombstone status from {target}"));
         }
     }
     // Assisted discovery must reuse each fresh eligible archive, with per-item admission retained.
@@ -195,7 +192,7 @@ pub async fn test(test: &mut TestServer) {
     let delta = groupware::calendar::sharing::test::calendar_reads(owner, shared) - before;
     if delta != 1 {
         failures.push(format!(
-            "assisted discovery resolved eligible calendar {delta} times instead of1"
+            "assisted discovery resolved eligible calendar {delta} times instead of 1"
         ));
     }
     bob.request_with_headers("PROPFIND", &format!("{HOME}private/"), [("depth", "0")], "")
@@ -258,8 +255,8 @@ pub async fn test(test: &mut TestServer) {
         .unwrap();
     assert_eq!(pin_cal["grants"][0]["level"], "view");
 
-    // The destination has preflight metadata A; a later source property B must
-    // survive a409, with or without the original source If-Match condition.
+    // A later source property B must survive a 409 without publishing a child
+    // prefix, with or without the original source If-Match condition.
     for scenario in ["unconditional", "conditional", "rename"] {
         let rename = scenario == "rename";
         let slug = format!("move-{scenario}-source");
@@ -331,7 +328,7 @@ pub async fn test(test: &mut TestServer) {
         let result = parked.finish().await;
         if result != StatusCode::CONFLICT {
             failures.push(format!(
-                "collection MOVE {scenario}: expected409, got {result}"
+                "collection MOVE {scenario}: expected 409, got {result}"
             ));
         }
         let resources = test
@@ -339,16 +336,19 @@ pub async fn test(test: &mut TestServer) {
             .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
             .await
             .unwrap();
+        let retained_source = if rename { "renamed-during-move" } else { &slug };
         assert!(
-            resources.by_path(&format!("{target}/one.ics")).is_some(),
-            "committed child missing"
+            resources
+                .by_path(&format!("{retained_source}/one.ics"))
+                .is_some(),
+            "atomic conflict must retain source child"
         );
         assert_eq!(
             resources
                 .subtree(&target)
                 .filter(|r| !r.is_container())
                 .count(),
-            1
+            0
         );
         if rename {
             assert!(
@@ -392,7 +392,7 @@ pub async fn test(test: &mut TestServer) {
         }
     }
 
-    // A source write after final fresh resolution still loses the indexed source CAS.
+    // A source-calendar metadata write after preparation loses the original source CAS.
     for slug in ["move-late-source", "move-late-target"] {
         alice
             .request("MKCALENDAR", &format!("{HOME}{slug}/"), MKCAL)
@@ -439,13 +439,13 @@ pub async fn test(test: &mut TestServer) {
         .await
         .unwrap();
     assert!(resources.by_path("move-late-source").is_some());
-    assert!(resources.by_path("move-late-target/one.ics").is_some());
+    assert!(resources.by_path("move-late-source/one.ics").is_some());
     assert_eq!(
         resources
             .subtree("move-late-target")
             .filter(|r| !r.is_container())
             .count(),
-        1
+        0
     );
 
     // Only a precise missing archive is omitted after enumeration, in both lists.
@@ -465,18 +465,6 @@ pub async fn test(test: &mut TestServer) {
                 grant(&slug, "view").await.expect(200);
             }
             let calendar = id(test, owner, &slug).await;
-            let raw = test
-                .server
-                .store()
-                .get_value::<common::auth::vault::RawValue>(ValueKey::archive(
-                    owner,
-                    Collection::Calendar,
-                    calendar,
-                ))
-                .await
-                .unwrap()
-                .unwrap()
-                .0;
             let caller = if foreign { READER } else { OWNER };
             let caller_id = if foreign { reader } else { owner };
             let hook = if foreign {
@@ -488,11 +476,17 @@ pub async fn test(test: &mut TestServer) {
                 za_post("shares", &json!({"username":caller,"password":STRONG})).await
             })
             .await;
-            if corrupt {
+            let quota_before = if corrupt {
+                Some(test.server.get_used_quota_account(owner).await.unwrap())
+            } else {
+                None
+            };
+            let original = if corrupt {
                 // Keep the rkyv archive structurally valid: corrupt only the authenticated
                 // collection entry, so the real resolver reports a non-NotFound failure.
                 let stored = archive(test, owner, calendar).await;
-                let mut broken = stored.deserialize::<Calendar>().unwrap();
+                let original = stored.deserialize::<Calendar>().unwrap();
+                let mut broken = original.clone();
                 broken
                     .preferences
                     .iter_mut()
@@ -514,25 +508,42 @@ pub async fn test(test: &mut TestServer) {
                     )
                     .unwrap();
                 test.server.commit_batch(batch).await.unwrap();
+                Some(original)
             } else {
                 alice
                     .request("DELETE", &path, "")
                     .await
                     .with_status(StatusCode::NO_CONTENT);
-            }
+                None
+            };
             let answer = parked.finish().await;
             if corrupt {
                 assert_eq!(
                     answer.status, 500,
                     "non-NotFound archive failure was hidden"
                 );
+                let broken = archive(test, owner, calendar).await;
                 let mut batch = BatchBuilder::new();
-                batch
-                    .with_account_id(owner)
-                    .with_collection(Collection::Calendar)
-                    .with_document(calendar)
-                    .set(Field::ARCHIVE, raw);
-                test.server.store().write(batch.build_all()).await.unwrap();
+                original
+                    .unwrap()
+                    .update(
+                        test.server
+                            .account_info(owner)
+                            .await
+                            .unwrap()
+                            .account_tenant_ids(),
+                        broken.to_unarchived::<Calendar>().unwrap(),
+                        owner,
+                        calendar,
+                        &mut batch,
+                    )
+                    .unwrap();
+                test.server.commit_batch(batch).await.unwrap();
+                assert_eq!(
+                    test.server.get_used_quota_account(owner).await.unwrap(),
+                    quota_before.unwrap(),
+                    "corrupt calendar restoration must preserve owner quota"
+                );
                 alice
                     .request("DELETE", &path, "")
                     .await

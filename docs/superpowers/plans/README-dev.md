@@ -66,7 +66,9 @@ fields and moves with them):
 - Numeric collisions: `PrincipalField::ZeroAccessVault = 150`
   (`crates/types/src/field.rs`) and `ACCOUNT_IS_KEY_ACCOUNT = 1 << 9`
   (`crates/common/src/auth/mod.rs`) sit in gaps upstream has not used; confirm
-  the merge did not take either.
+  the merge did not take either. `VanishedCollection::CalendarIdentity = 250`
+  (`crates/types/src/collection.rs`) separately reserves a log-collection byte;
+  preserve existing 251–254 and check this reservation at the same merge gate.
 - Visibility policy: upstream migrations that recompute derived data (time
   ranges, alarms, the UID index) read only properties the policy keeps
   visible; a merge that adds a new derived value must be checked against

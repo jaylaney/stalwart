@@ -69,7 +69,7 @@ use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 use store::{
     ValueKey,
     registry::RegistryQuery,
-    write::{AlignedBytes, Archive},
+    write::{AlignedBytes, Archive, log::CalendarTombstone},
 };
 use store::{
     ahash::AHashMap,
@@ -79,7 +79,7 @@ use store::{
 use trc::AddContext;
 use types::{
     acl::Acl,
-    collection::{Collection, SyncCollection},
+    collection::{Collection, SyncCollection, VanishedCollection},
     dead_property::DeadProperty,
 };
 use utils::map::bitmap::Bitmap;
@@ -1342,6 +1342,58 @@ async fn foreign_calendar_contexts(
     Ok(eligible)
 }
 
+fn invalid_calendar_sync_token() -> DavError {
+    DavErrorCondition::new(StatusCode::FORBIDDEN, BaseCondition::ValidSyncToken).into()
+}
+
+/// Coverage is a multiset of physical commit id plus exact original path.
+/// Private identities cover raw entries but never authorize disclosure.
+fn authorize_calendar_tombstones(
+    raw: Vec<(u64, String)>,
+    identities: Vec<(u64, String)>,
+    prefixes: &[(u32, String)],
+) -> crate::Result<Vec<String>> {
+    let relevant = |path: &str| prefixes.iter().any(|(_, prefix)| path.starts_with(prefix));
+    let mut coverage = BTreeMap::<(u64, String), usize>::new();
+    for (change_id, path) in raw {
+        if relevant(&path) {
+            *coverage.entry((change_id, path)).or_default() += 1;
+        }
+    }
+    let mut authorized = Vec::new();
+    for (change_id, encoded) in identities {
+        // Parse after scoping: malformed unrelated history must not expand a
+        // direct calendar request's error or ring-resolution scope.
+        let path = encoded
+            .split_once(':')
+            .map(|(_, path)| path)
+            .unwrap_or(&encoded);
+        if !relevant(path) {
+            continue;
+        }
+        let identity =
+            CalendarTombstone::decode(&encoded).ok_or_else(invalid_calendar_sync_token)?;
+        let key = (change_id, identity.path.clone());
+        let count = coverage
+            .get_mut(&key)
+            .ok_or_else(invalid_calendar_sync_token)?;
+        *count -= 1;
+        if *count == 0 {
+            coverage.remove(&key);
+        }
+        if prefixes
+            .iter()
+            .any(|(id, prefix)| *id == identity.calendar_id && identity.path.starts_with(prefix))
+        {
+            authorized.push(identity.path);
+        }
+    }
+    if !coverage.is_empty() {
+        return Err(invalid_calendar_sync_token());
+    }
+    Ok(authorized)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn get(
     server: &Server,
@@ -1365,33 +1417,46 @@ async fn get(
         .await
         .caused_by(trc::location!())?;
 
-    // Vanished paths have no calendar identity. Fetch them before reading the fresh
-    // archives whose current slug and boundary jointly authorize their disclosure.
+    // Read both streams before fresh authorization. Independent store scans do
+    // not form a snapshot: a relevant mismatch conservatively requires resync.
+    // resources was fetched before either scan, so keep its existing cursor;
+    // never issue a new cursor from the independently observed log tails.
     let foreign_key_calendars = collection_container == Collection::Calendar
         && account_id != access_token.account_id()
         && server
             .za_is_key_account(account_id)
             .await
             .caused_by(trc::location!())?;
-    let mut foreign_vanished: Option<Vec<String>> = if foreign_key_calendars {
+    let foreign_history = if foreign_key_calendars {
         if let SyncType::From { id, .. } = query.sync_type {
-            Some(
-                server
-                    .store()
-                    .vanished(
-                        account_id,
-                        sync_collection.vanished_collection().unwrap().into(),
-                        Query::Since(id),
-                    )
-                    .await
-                    .caused_by(trc::location!())?,
-            )
+            let raw = server
+                .store()
+                .vanished_with_change_id::<String>(
+                    account_id,
+                    VanishedCollection::Calendar.into(),
+                    Query::Since(id),
+                )
+                .await
+                .caused_by(trc::location!())?;
+            #[cfg(feature = "test_mode")]
+            common::za::test_hooks::calendar_sync_log_pause_point(account_id).await;
+            let identities = server
+                .store()
+                .vanished_with_change_id::<String>(
+                    account_id,
+                    VanishedCollection::CalendarIdentity.into(),
+                    Query::Since(id),
+                )
+                .await
+                .caused_by(trc::location!())?;
+            Some((raw, identities))
         } else {
             None
         }
     } else {
         None
     };
+    let mut foreign_vanished: Option<Vec<String>> = None;
     let requested_calendar = resource
         .resource
         .and_then(|path| resources.by_path(path))
@@ -1448,15 +1513,18 @@ async fn get(
                     .stored
                     .deserialize::<Calendar>()
                     .caused_by(trc::location!())?;
-                prefixes.push(format!(
-                    "{}{}/",
-                    resources.base_path,
-                    groupware::encode_path_segment(&calendar.name)
+                prefixes.push((
+                    calendar_id,
+                    format!(
+                        "{}{}/",
+                        resources.base_path,
+                        groupware::encode_path_segment(&calendar.name)
+                    ),
                 ));
             }
         }
-        if let Some(vanished) = &mut foreign_vanished {
-            vanished.retain(|path| prefixes.iter().any(|prefix| path.starts_with(prefix)));
+        if let Some((raw, identities)) = foreign_history {
+            foreign_vanished = Some(authorize_calendar_tombstones(raw, identities, &prefixes)?);
         }
         // Reuse precisely these freshly read archives for the rest of this response.
         for (&id, context) in eligible {
@@ -1529,6 +1597,9 @@ async fn get(
                 .changes(account_id, sync_collection.into(), Query::Since(id))
                 .await
                 .caused_by(trc::location!())?;
+            if foreign_key_calendars && changes.is_truncated {
+                return Err(invalid_calendar_sync_token());
+            }
             let mut vanished: Vec<String> = Vec::new();
 
             // Merge changes

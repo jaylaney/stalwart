@@ -294,21 +294,25 @@ impl CalendarDeleteRequestHandler for Server {
                 return Err(DavError::Code(StatusCode::PRECONDITION_FAILED));
             }
 
-            if let Some(context) = crate::common::za::za_mutation_context(
-                self,
-                access_token,
-                account_id,
-                calendar_id,
-                utils::map::bitmap::Bitmap::new().with_item(Acl::RemoveItems),
-            )
-            .await
-            .map_err(|error| za_calendar_error(error, account_id, calendar_id))?
-            {
-                context.assert_in(&mut batch);
-                contexts.push(context);
+            if za_keys.is_some() {
+                if let Some(context) = crate::common::za::za_mutation_context(
+                    self,
+                    access_token,
+                    account_id,
+                    calendar_id,
+                    utils::map::bitmap::Bitmap::new().with_item(Acl::RemoveItems),
+                )
+                .await
+                .map_err(|error| za_calendar_error(error, account_id, calendar_id))?
+                {
+                    context.assert_in(&mut batch);
+                    contexts.push(context);
+                }
             }
             let cutoff = store::write::now() as i64;
-            retry_event = Some((event_.clone(), calendar_id, cutoff));
+            if za_keys.is_some() {
+                retry_event = Some((event_.clone(), calendar_id, cutoff));
+            }
             // Delete event
             za_messages.extend(
                 DestroyArchive(event)

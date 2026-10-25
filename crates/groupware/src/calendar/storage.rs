@@ -38,11 +38,7 @@ use store::{
     },
 };
 use trc::AddContext;
-use types::{
-    collection::{Collection, VanishedCollection},
-    field::CalendarNotificationField,
-    id::Id,
-};
+use types::{collection::Collection, field::CalendarNotificationField, id::Id};
 use vault::session::SessionKeys;
 
 pub trait ItipAutoExpunge: Sync + Send {
@@ -483,7 +479,7 @@ impl DestroyArchive<Archive<&ArchivedCalendar>> {
             )
             .caused_by(trc::location!())?;
         if let Some(delete_path) = delete_path {
-            batch.log_vanished_item(VanishedCollection::Calendar, delete_path);
+            batch.log_calendar_vanished(document_id, delete_path);
         }
         batch.commit_point();
 
@@ -601,7 +597,7 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
             }
 
             if let Some(delete_path) = delete_path {
-                batch.log_vanished_item(VanishedCollection::Calendar, delete_path);
+                batch.log_calendar_vanished(calendar_id, delete_path);
             }
 
             batch.commit_point();

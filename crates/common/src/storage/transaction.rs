@@ -12,7 +12,7 @@ use store::{
 };
 use trc::AddContext;
 use types::{
-    collection::SyncCollection,
+    collection::{SyncCollection, VanishedCollection},
     type_state::{DataType, StateChange},
 };
 use utils::{map::bitmap::Bitmap, snowflake::SnowflakeIdGenerator};
@@ -111,6 +111,29 @@ impl Server {
                     .caused_by(trc::location!())?;
 
                 if num_changes > max_entries {
+                    // Prepare the truncation entry without changing other collections' order.
+                    let mut batch = BatchBuilder::new();
+                    batch.with_account_id(account_id).set(
+                        ValueClass::Any(AnyClass {
+                            subspace: SUBSPACE_LOGS,
+                            key: LogKey {
+                                account_id,
+                                collection,
+                                change_id: first_change_id,
+                            }
+                            .serialize(0),
+                        }),
+                        Vec::new(),
+                    );
+                    if sync_collection == SyncCollection::Calendar {
+                        // Publish a durable fence before removing any Calendar history.
+                        // An awaited write failure aborts before all three delete ranges.
+                        self.store()
+                            .write(batch.build_all())
+                            .await
+                            .caused_by(trc::location!())?;
+                    }
+
                     self.store()
                         .delete_range(
                             LogKey {
@@ -131,41 +154,40 @@ impl Server {
                     if let Some(vanished_collection) =
                         sync_collection.vanished_collection().map(u8::from)
                     {
+                        for vanished_collection in std::iter::once(vanished_collection).chain(
+                            (sync_collection == SyncCollection::Calendar)
+                                .then_some(u8::from(VanishedCollection::CalendarIdentity)),
+                        ) {
+                            self.store()
+                                .delete_range(
+                                    LogKey {
+                                        account_id,
+                                        collection: vanished_collection,
+                                        change_id: 0,
+                                    },
+                                    LogKey {
+                                        account_id,
+                                        collection: vanished_collection,
+                                        change_id: first_change_id,
+                                    },
+                                )
+                                .await
+                                .caused_by(trc::location!())?;
+                        }
+                    }
+
+                    #[cfg(feature = "test_mode")]
+                    if sync_collection == SyncCollection::Calendar {
+                        crate::za::test_hooks::calendar_history_purge_pause_point(account_id).await;
+                    }
+
+                    // Other collections retain their existing late publication order.
+                    if sync_collection != SyncCollection::Calendar {
                         self.store()
-                            .delete_range(
-                                LogKey {
-                                    account_id,
-                                    collection: vanished_collection,
-                                    change_id: 0,
-                                },
-                                LogKey {
-                                    account_id,
-                                    collection: vanished_collection,
-                                    change_id: first_change_id,
-                                },
-                            )
+                            .write(batch.build_all())
                             .await
                             .caused_by(trc::location!())?;
                     }
-
-                    // Write truncation entry for cache
-                    let mut batch = BatchBuilder::new();
-                    batch.with_account_id(account_id).set(
-                        ValueClass::Any(AnyClass {
-                            subspace: SUBSPACE_LOGS,
-                            key: LogKey {
-                                account_id,
-                                collection,
-                                change_id: first_change_id,
-                            }
-                            .serialize(0),
-                        }),
-                        Vec::new(),
-                    );
-                    self.store()
-                        .write(batch.build_all())
-                        .await
-                        .caused_by(trc::location!())?;
                 }
             }
         }

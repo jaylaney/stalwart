@@ -110,15 +110,19 @@ scheduling carries `SENT-BY`. See `docs/zero-access/calendar-sharing-api.md`, re
 `docs/superpowers/specs/2026-10-22-zero-access-sharing-design.md`, and the actual/pending
 qualification record in `docs/superpowers/plans/2026-10-23-zero-access-plan14-outcome.md`.
 
-The ZA suite runs pinning, then `sharing::test` and `sharing_races::test`, then sweep/trace/
-other existing calendar modules, leak checks and mail modules.
+The ZA suite runs pinning, then `sharing_move_atomic::test`, `sharing_tombstones::test`,
+`sharing_review::test`, `sharing::test` and `sharing_races::test`, then sweep, trace, other
+existing calendar modules, leak checks and mail modules.
 Reserve named `share-*`, `shares-http-*`, `race-*`, `sharing-dav-*`, `sharing-life-*`,
-`sharing-gate-*` and `sharing-http-race-*` fixture families for these modules. Existing named
-allocations include `share-owner-read`, `share-converter`, `share-conversion-contract`,
+`sharing-gate-*`, `sharing-http-race-*`, `sharing-review-*` and `sharing-tombstone-*` fixture
+families for these modules.
+Existing named allocations include `share-owner-read`, `share-converter`, `share-conversion-contract`,
 `share-moves`, `share-move-reader`, `share-move-plain`, `shares-http-owner`,
 `shares-http-reader`, `shares-http-second`, `race-owner`, `race-reader`, `race-fanout`,
 `race-drain`, `share-boundary`, `share-http-races`, `share-destroy-owner`,
-`share-destroy-grantee`, and `share-overwrite-writer` (all at example.com).
+`share-destroy-grantee`, `share-overwrite-writer`, `sharing-review-owner`,
+`sharing-review-reader`, `sharing-move-atomic`, `sharing-tombstone-owner`,
+`sharing-tombstone-reader` and `sharing-tombstone-plain` (all at example.com).
 `sharing-*` also generates lifecycle scenario labels; use a new descriptive scenario suffix
 and check both sharing files rather than inventing a numeric next-free name. Temporary Task
 12 calendars `benchmark-full`/`benchmark-resume` used the existing HTTP owner/reader and were

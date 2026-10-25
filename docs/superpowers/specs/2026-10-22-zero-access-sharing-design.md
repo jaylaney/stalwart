@@ -1327,29 +1327,46 @@ under section 10's request-or-item error contract. With assisted discovery,
 that can fail the caller's whole own-home listing, including own calendars;
 successful partial listing is not promised for this degraded vault state.
 
-**Vanished paths in `sync-collection`** (review finding 4). One listing
-path answers before any archive is loaded, so neither the loader's view nor
-the resolver sees it: for a non-member token a `REPORT sync-collection`
-fetches the vanished list account-wide (`server.store().vanished(account_id,
-..)` in `get`, `crates/dav/src/common/propfind.rs:1374`; `Store::vanished`
-is keyed by account and collection only,
-`crates/store/src/query/log.rs:136-175`) and writes each entry as a 404
-(`:1386`, `:1421`). A view grantee of one calendar would receive the URLs
-of events deleted, moved or renamed in the owner's other calendars, and of
-the owner's deleted or renamed calendars, `/dav/cal/<owner>/<slug>/<file>`:
-client-chosen names release 1 lists as visible to the operator, not to
-another user. A fork branch in `get` right after the vanished fetch, for a
-non-member token on a key account, keeps only the vanished paths under the
-current path of an eligible calendar (above), the prefix set built from
-the calendars that pass the eligibility check rather than from
-`shared_containers` (which accepts a grant through a group) and before
-any intersection with the change log (the intersected
-`display_containers` would drop a granted calendar that lost an event but
-saw no container change). It also respects the requested collection: a
-`REPORT` on one calendar returns only that calendar's tombstones, and one
-on the home only the eligible calendars'. A granted calendar that was
-itself deleted or renamed has no current path, so its own 404 is dropped,
-and the client rediscovers from the home listing (5.3).
+**Identity-bound tombstones in `sync-collection`** (PR 58 follow-up correction).
+The original Calendar path log remains collection 252 with byte-for-byte unchanged
+NUL-terminated path strings. Every new calendar tombstone producer also appends
+`<eight-hex-digit source calendar ID>:<absolute original path>` to the separate
+vanished-log collection 250, through one dual-log helper before any commit point.
+This explicit reservation does not shift existing collection numbers, change any
+archived struct/ring layout, or introduce new token grammar. Source identity is
+retained from the original calendar/link, including each JMAP event parent and
+retried DELETE/MOVE; it is never inferred from the path or MOVE destination.
+
+For foreign key-account incremental sync, fetch both logs before fresh eligible
+calendar contexts, retaining each physical commit change ID. Scope required
+coverage to raw paths under the requested eligible current prefixes, and compare
+multisets of `(change ID, exact original path)` with counts for duplicate entries.
+Relevant private source identities cover raw entries without requiring their rings.
+Missing, extra or malformed relevant identity coverage returns 403
+`DAV:valid-sync-token`, as does truncated Calendar history. Never output a raw-log
+path. After coverage succeeds, emit only sidecar records whose source calendar ID
+is freshly eligible and whose original path is under that same context's fresh
+current prefix. A private current, deleted or renamed collider cannot become the
+granted identity merely by sharing its spelling. Live-item authorization remains
+by calendar ID. Direct calendar sync does not resolve unrelated rings or widen its
+error scope to irrelevant history. Authorization and coverage precede pagination.
+A granted calendar that itself disappeared from its current path has no eligible
+prefix; its 404 is omitted and the client rediscovers from the home listing (5.3).
+
+Independent collection scans are not a shared snapshot. A relevant mismatch from
+an intervening dual write or purge conservatively requires resync. Keep the existing
+resource cursor loaded before the scans; do not issue a cursor from a vanished-log
+tail. Calendar retention durably publishes its cutoff truncation marker before
+removing any Calendar sync, raw-path or identity range; marker-write failure aborts
+before those deletions. It prunes 250 at exactly the same cutoff as 252, while
+other collections retain their existing purge order. Whole-account log-prefix
+destruction includes both. A legacy/mixed-version raw-only
+range requires initial sync, but an old raw tail above the latest Calendar resource
+cursor may continue requiring resync after that initial sync. Do not promise exactly
+one resync or guess a safe issuance floor. Initial sync emits no tombstones. Ordinary
+owner/self readers retain their original raw response path and formats. The accepted
+cost is extra identity/path storage and batch bytes for all calendar writers, plus
+an additional scan and in-memory keyed coverage for foreign incremental readers.
 
 **Addressed-path existence residual.** The specified 403 for an existing
 calendar refused by the resolver differs from 404 for a missing path. A
@@ -1362,7 +1379,8 @@ status distinctions. This is an accepted metadata residual of the current
 addressed-request contract, separate from bulk tombstone disclosure.
 
 **The grantee's sync token is bound to its grant** (re-review finding 3).
-Vanished paths carry no calendar identity (`Store::vanished`), a slug can
+The legacy path log carries no calendar identity; the additive sidecar above now
+binds newly written records. A slug can
 be reused once its calendar is gone (`crates/dav/src/calendar/mkcol.rs:63`
 refuses a slug only while its path exists), and a sync position is a bare
 change id (`DavQuery::changes`, `crates/dav/src/common/mod.rs:253`;
@@ -1400,7 +1418,7 @@ token is at or below its boundary is refused with 403 and the
 `DAV:valid-sync-token` precondition (RFC 6578 section 3.2), so the client
 runs a full sync; a later token is served with the vanished filter above.
 For an incremental sync, the calendar's current path and its boundary are
-read together, from the archive read after the vanished fetch, never a
+read together, from the archive read after both vanished-log fetches, never a
 path retained in the resource cache combined with a newer ring
 (re-review clarifications, revision 8).
 
@@ -1710,6 +1728,43 @@ dragged between calendars.
 Clients rarely use `COPY`: Apple Calendar duplicates an event with a new
 `PUT`. The real-device check records what Apple does when an event is
 dragged between a shared and an unshared calendar (11.5).
+
+**Bounded personal collection overwrite MOVE (2026-10-25 correction).**
+For a key account moving an unshared collection over an existing unshared
+collection, prepare destination-child removals, destination replacement,
+source-child name changes, original-source deletion, vanished-path log and
+default-calendar clear in one builder. A document linked into both collections
+has one combined update, preserving all other names. Scheduling stays off.
+Retain the original source, target, other-parent and event archive conditions;
+changed metadata never authorizes a fresh destructive replay. A condition loss
+publishes no prefix, so an identical unconditional retry cannot erase children
+moved by the failed request. Shared conversion remains a terminal 403.
+
+After the original source/target shared-domain 403 checks, refuse this new route
+with 409 on FoundationDB, SQLReadReplica and Ephemeral before sampling the counter,
+scanning membership or planning mutations. FoundationDB's cached read versions can
+regress between independent reads; independently selected SQL replicas likewise
+cannot ensure a scan at least as new as its counter sample. Ephemeral applies
+operations without rollback. This exception changes no generic backend semantics
+or other COPY/MOVE/rename route. Direct RocksDB, SQLite, PostgreSQL and MySQL keep
+the bounded route; this correction's runtime qualification is RocksDB only.
+
+Sample the nonnegative signed account change counter before directly scanning
+current source/destination event membership. In the physical transaction,
+require its newly assigned account change id to equal the checked sample plus
+one. Normal indexed membership additions either invalidate this predicate or,
+when the MOVE commits first, lose their original parent-calendar assertion.
+Unrelated indexed account writes can conservatively cause 409. Refuse counter
+overflow; arbitrary raw store surgery is outside this normal-writer fence.
+
+Materialize every change log, require exactly one physical slice, and refuse
+with 409 before mutation above 1,000 structural operations or 5,000,000 accounted
+bytes. Count the complete operation vector, serialized key/payload and callback
+parameter bytes with conservative fixed overhead. The only generated callbacks
+copy versioned archive input without expansion or return `Skip`; this does not
+bound arbitrary callback output. COPY, event MOVE, ordinary accounts and the
+absent-destination calendar rename keep their prior routes. Large overwrites
+now refuse without progress instead of publishing a recoverable child prefix.
 
 ### 5.7 JMAP
 
@@ -2705,13 +2760,22 @@ before `delete.rs:276`). Test helpers open rings and envelopes with an account's
 password-derived keys to assert generations; they are test code and never
 part of the product build.
 
+Identity-history regressions also use owner-scoped `CALENDAR_SYNC_LOG_PAUSE`
+(set by `set_calendar_sync_log_pause`) between the raw and identity scans, and
+`CALENDAR_HISTORY_PURGE_PAUSE` (set by `set_calendar_history_purge_pause`) after
+retention has removed both Calendar vanished ranges. The latter lets a reader
+start both scans after deletion while the durable truncation fence must already
+exist. Both are one-shot, `test_mode`-only `Pause` hooks compatible with `HookParked`;
+only the owner account ID enters them, never a path or payload.
+
 PR-review regressions also use `SHARE_LIST_OWN_PAUSE` after own-calendar
 id enumeration and `SHARE_LIST_FOREIGN_PAUSE` after one foreign owner's
 candidate enumeration, before fresh resolver reads. Both use the listing
 caller's account id and the existing one-shot `Pause` shape. The owner-scoped
 `CALENDAR_MOVE_DELETE_PAUSE` holds collection MOVE immediately before its
-final prepared indexed-delete commit, after fresh source/target reads, to
-prove a later source write still loses the source CAS. Test-only
+prepared atomic commit, after the fresh membership scan, to prove a later
+source-calendar metadata write loses the original source CAS and a later
+membership addition loses the account-counter predicate. Test-only
 `record_share_conversion_loss` / `take_share_conversion_losses` observe
 conversion assertion losses by owner, separately from final grant-decision
 losses; they prove a pin-only write does not cause a conversion assertion

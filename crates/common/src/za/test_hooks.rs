@@ -688,3 +688,47 @@ pub fn set_calendar_move_delete_pause(pause: Option<Arc<Pause>>) {
 pub async fn calendar_move_delete_pause_point(owner: u32) {
     wait(take_for(&CALENDAR_MOVE_DELETE_PAUSE, owner)).await;
 }
+
+/// Admission metrics contain only owner/counts, never paths or archive payloads.
+static CALENDAR_MOVE_PLANS: Mutex<Vec<(u32, usize, usize, usize)>> = Mutex::new(Vec::new());
+pub fn record_calendar_move_plan(owner: u32, operations: usize, bytes: usize, slices: usize) {
+    CALENDAR_MOVE_PLANS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((owner, operations, bytes, slices));
+}
+pub fn take_calendar_move_plans(owner: u32) -> Vec<(usize, usize, usize)> {
+    let mut plans = CALENDAR_MOVE_PLANS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut result = Vec::new();
+    plans.retain(|(id, operations, bytes, slices)| {
+        if *id == owner {
+            result.push((*operations, *bytes, *slices));
+            false
+        } else {
+            true
+        }
+    });
+    result
+}
+
+/// Foreign calendar sync after raw log read, before identity sidecar read.
+/// Only owner id is retained; paths and content never enter the hook.
+pub static CALENDAR_SYNC_LOG_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub fn set_calendar_sync_log_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&CALENDAR_SYNC_LOG_PAUSE, pause);
+}
+pub async fn calendar_sync_log_pause_point(owner: u32) {
+    wait(take_for(&CALENDAR_SYNC_LOG_PAUSE, owner)).await;
+}
+
+/// Calendar retention after both vanished ranges have been removed.
+/// Only owner ID enters this test-mode-only publication-order seam.
+pub static CALENDAR_HISTORY_PURGE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub fn set_calendar_history_purge_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&CALENDAR_HISTORY_PURGE_PAUSE, pause);
+}
+pub async fn calendar_history_purge_pause_point(owner: u32) {
+    wait(take_for(&CALENDAR_HISTORY_PURGE_PAUSE, owner)).await;
+}

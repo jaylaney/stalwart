@@ -623,15 +623,19 @@ impl CalendarUpdateRequestHandler for Server {
                 ..Default::default()
             };
 
-            let mut contexts = za_write_contexts(
-                self,
-                access_token,
-                account_id,
-                &event,
-                parent.document_id(),
-                Acl::AddItems,
-            )
-            .await?;
+            let mut contexts = if za_keys.is_some() {
+                za_write_contexts(
+                    self,
+                    access_token,
+                    account_id,
+                    &event,
+                    parent.document_id(),
+                    Acl::AddItems,
+                )
+                .await?
+            } else {
+                Vec::new()
+            };
 
             // Scheduling
             let mut itip_messages = None;

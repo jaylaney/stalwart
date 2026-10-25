@@ -64,6 +64,8 @@ pub enum SyncCollection {
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 #[repr(u8)]
 pub enum VanishedCollection {
+    // Fork reservation: identity-bound Calendar paths; never renumber legacy logs.
+    CalendarIdentity = 250,
     Email = 251,
     Calendar = 252,
     AddressBook = 253,

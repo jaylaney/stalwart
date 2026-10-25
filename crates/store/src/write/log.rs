@@ -24,6 +24,35 @@ pub enum VanishedItem {
     IdPair(u32, u32),
 }
 
+/// Transient identity sidecar; encoded only in CalendarIdentity log strings.
+/// This is not an archived storage type and does not alter Calendar path records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CalendarTombstone {
+    pub calendar_id: u32,
+    pub path: String,
+}
+
+impl CalendarTombstone {
+    pub fn encode(calendar_id: u32, path: &str) -> String {
+        format!("{calendar_id:08x}:{path}")
+    }
+
+    pub fn decode(value: &str) -> Option<Self> {
+        let (id, path) = value.split_once(':')?;
+        if id.len() != 8
+            || !id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || !path.starts_with('/')
+            || path.contains('\0')
+        {
+            return None;
+        }
+        Some(Self {
+            calendar_id: u32::from_str_radix(id, 16).ok()?,
+            path: path.to_owned(),
+        })
+    }
+}
+
 #[derive(Default, Debug)]
 pub(crate) struct VanishedItems(Vec<VanishedItem>);
 

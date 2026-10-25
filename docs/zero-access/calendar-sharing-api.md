@@ -175,6 +175,28 @@ calendar the resolver refuses (403). This confirms guesses; it does not enumerat
 event content. A foreign caller without any grant from that owner is refused uniformly at the URI
 gate. The vanished-path filter separately prevents bulk disclosure of ungranted deletion paths.
 
+## Calendar sync compatibility
+
+Foreign incremental calendar sync authorizes deletions by source calendar ID and that same
+calendar's fresh current path prefix. Current live items retain calendar-ID authorization.
+Every new Calendar tombstone writes its original path to collection 252 and an identity/path
+sidecar to reserved log collection 250 in the same physical transaction. Ordinary readers keep
+using the unchanged original path format. Calendar retention and account destruction remove
+both logs; calendar, ring and token formats do not change.
+
+Relevant raw and identity history must match as multisets of `(commit change ID, exact path)`
+before any deletion response or pagination count. Private identities cover their raw history
+but never authorize a response. Missing, extra or malformed relevant identity coverage, or
+truncated Calendar history, returns 403 `DAV:valid-sync-token`; initial sync emits no tombstones.
+Unrelated history does not widen a direct-calendar request's authorization/error scope.
+Independent log scans can conservatively require resync if a write or purge falls between them.
+The existing resource cursor is retained, never advanced to an independently observed log tail.
+Legacy or mixed-version writers can leave relevant raw-only history. A raw tail above the latest
+Calendar resource cursor can continue requiring resync after an initial sync; exactly one full
+sync is not guaranteed to clear that condition. No path-only fallback or guessed cursor floor
+is used. This additive correction increases ordinary Calendar log storage, write-batch byte
+accounting, and foreign sync scan/memory costs.
+
 ## Corrupt sharing state
 
 A mismatch between a calendar's encrypted grant ledger and its plaintext ACL makes grant,
@@ -187,10 +209,27 @@ encrypted calendar and grant state, or, where the owner can still read/export, a
 export, recreation and regrant to verified recipients. Verify the replacement's content and access
 before deleting the damaged calendar. Blind deletion is not a general recovery procedure.
 
+## Collection COPY/MOVE conflicts
 
-Collection COPY/MOVE retains committed-prefix behavior on a later conflict. In particular, an
-overwrite MOVE copies source properties before moving the children, then retains the original
-source-version fence for its final deletion. A concurrent source property edit can therefore
-produce409 after children moved; the newer source properties remain on the source collection.
-Inspect and reconcile both collections before retrying or deleting either. Refreshing only the
-final delete snapshot would lose those properties and conditional-request protection.
+Key-account collection MOVE over an existing destination commits the overwrite, children, source
+deletion and default-calendar change in one physical transaction. An original calendar/event
+condition loss leaves both collections unchanged by that request. A fresh membership scan is
+fenced by the account change counter; any concurrent indexed change in that account can
+conservatively return 409. Refresh before retrying. An identical unconditional retry starts from
+the still-readable source; no moved prefix was published by the failed request.
+
+This key-account existing-destination collection MOVE route returns 409 before planning
+mutations on FoundationDB, SQLReadReplica and Ephemeral stores. FoundationDB's cached read
+versions and independently selected SQL replicas cannot guarantee the membership scan is at
+least as new as its counter sample; Ephemeral does not roll back failed batches. Existing
+source/target shared-domain checks still return 403 first. Direct RocksDB, SQLite, PostgreSQL
+and MySQL retain the bounded route. Runtime qualification recorded for this correction is
+RocksDB only; the other backend dispositions are source-based.
+
+This route refuses with 409 before mutation if its prepared transaction splits, exceeds 1,000
+structural operations, or exceeds 5,000,000 accounted bytes. Accounting includes materialized
+logs, keys/scalars and callback archive parameters; it bounds the known archive-copy callbacks,
+not arbitrary callback output. Oversized operations require smaller client operations.
+Collection COPY retains its existing committed-prefix behavior, so inspect both collections on
+a conflict. Event COPY/MOVE, ordinary accounts and an absent-destination calendar rename retain
+their existing routes. Shared collection COPY/MOVE remains refused except the allowed rename.

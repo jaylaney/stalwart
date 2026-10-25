@@ -726,6 +726,19 @@ impl Store {
         matches!(self, Self::Ephemeral(_))
     }
 
+    #[inline(always)]
+    pub fn is_read_replica(&self) -> bool {
+        match self {
+            // SPDX-SnippetBegin
+            // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+            // SPDX-License-Identifier: LicenseRef-SEL
+            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
+            Self::SQLReadReplica(_) => true,
+            // SPDX-SnippetEnd
+            _ => false,
+        }
+    }
+
     // SPDX-SnippetBegin
     // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
     // SPDX-License-Identifier: LicenseRef-SEL
