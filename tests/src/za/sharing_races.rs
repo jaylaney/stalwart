@@ -4221,6 +4221,7 @@ async fn grantee_http_write_races(test: &mut TestServer) {
         .body
         .unwrap();
     assert!(!body.contains("must-conflict"));
+    calendar_conditional_proppatch_races(owner, bob, USER, BOB, PATH).await;
     client
         .request("DELETE", PATH, "")
         .await
@@ -4262,4 +4263,151 @@ fn current_ring_generation(
         .generations
         .last()
         .unwrap()
+}
+
+/// A conditional write must validate the resolver-selected archive, not its earlier read.
+/// Hold A before resolution, commit B through HTTP, then retain B on A's stale If-Match.
+async fn calendar_conditional_proppatch_races(
+    owner: u32,
+    grantee: u32,
+    owner_name: &'static str,
+    grantee_name: &'static str,
+    path: &'static str,
+) {
+    use crate::utils::za::sharing_dav_request;
+
+    let mut failures = Vec::new();
+    for (principal, id, property, initial, competing, stale, current, unconditional) in [
+        (
+            owner_name,
+            owner,
+            "D:displayname",
+            "Initial personal name",
+            "Competing personal name",
+            "Stale personal name",
+            "Current personal name",
+            "Unconditional personal name",
+        ),
+        (
+            grantee_name,
+            grantee,
+            "A:calendar-color",
+            "#111111FF",
+            "#222222FF",
+            "#333333FF",
+            "#444444FF",
+            "#555555FF",
+        ),
+    ] {
+        let client = DummyWebDavClient::new(id, principal, STRONG, principal);
+        let patch = |value: &str| {
+            format!(
+                "<D:propertyupdate xmlns:D=\"DAV:\" xmlns:A=\"http://apple.com/ns/ical/\"><D:set><D:prop><{property}>{value}</{property}></D:prop></D:set></D:propertyupdate>"
+            )
+        };
+        let properties = format!(
+            "<D:propfind xmlns:D=\"DAV:\" xmlns:A=\"http://apple.com/ns/ical/\"><D:prop><{property}/><D:getetag/></D:prop></D:propfind>"
+        );
+        client
+            .request("PROPPATCH", path, patch(initial))
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+        let before = client
+            .request_with_headers("PROPFIND", path, [("depth", "0")], &properties)
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+        assert!(before.xml.iter().any(|(_, value)| value == initial));
+        let old_etag = before
+            .xml
+            .iter()
+            .find(|(name, _)| name.ends_with(":getetag"))
+            .unwrap()
+            .1
+            .clone();
+        let body = patch(stale);
+        let parked = HookParked::start(
+            owner,
+            test_hooks::set_calendar_proppatch_read_pause,
+            async move {
+                sharing_dav_request(
+                    principal,
+                    "PROPPATCH",
+                    path,
+                    &[("if-match", &old_etag)],
+                    &body,
+                )
+                .await
+            },
+        )
+        .await;
+        client
+            .request("PROPPATCH", path, patch(competing))
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+        let response = parked.finish().await;
+        let after = client
+            .request_with_headers("PROPFIND", path, [("depth", "0")], &properties)
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+        let preserved = after.xml.iter().any(|(_, value)| value == competing);
+        println!(
+            "Calendar conditional PROPPATCH {property}: stale status={}, competing preserved={preserved}",
+            response.status
+        );
+        if response.status != StatusCode::PRECONDITION_FAILED || !preserved {
+            failures.push(format!(
+                "{property}: expected stale If-Match 412 and B preserved, got {} and preserved={preserved}",
+                response.status
+            ));
+        }
+
+        // Restore B before controls, including the intentionally failing RED run.
+        client
+            .request("PROPPATCH", path, patch(competing))
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+        let fresh = client
+            .request_with_headers("PROPFIND", path, [("depth", "0")], &properties)
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+        let current_etag = fresh
+            .xml
+            .iter()
+            .find(|(name, _)| name.ends_with(":getetag"))
+            .unwrap()
+            .1
+            .clone();
+        client
+            .request_with_headers(
+                "PROPPATCH",
+                path,
+                [("if-match", current_etag.as_str())],
+                patch(current),
+            )
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+        let fresh = client
+            .request_with_headers("PROPFIND", path, [("depth", "0")], &properties)
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+        assert!(fresh.xml.iter().any(|(_, value)| value == current));
+        client
+            .request("PROPPATCH", path, patch(unconditional))
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+        let final_view = client
+            .request_with_headers("PROPFIND", path, [("depth", "0")], &properties)
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+        assert!(
+            final_view
+                .xml
+                .iter()
+                .any(|(_, value)| value == unconditional)
+        );
+        println!(
+            "Calendar conditional PROPPATCH {property}: current-ETag and unconditional controls passed"
+        );
+    }
+    assert!(failures.is_empty(), "{}", failures.join("; "));
 }

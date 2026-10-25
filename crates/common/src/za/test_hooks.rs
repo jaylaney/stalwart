@@ -636,3 +636,13 @@ pub fn take_delegation_lookup_fail_once(sender_id: u32, address: &str) -> bool {
         false
     }
 }
+
+/// Calendar PROPPATCH after its initial archive read, before fresh mutation resolution.
+/// One-shot and owner-keyed, so a competing request can commit during that interval.
+pub static CALENDAR_PROPPATCH_READ_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub fn set_calendar_proppatch_read_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&CALENDAR_PROPPATCH_READ_PAUSE, pause);
+}
+pub async fn calendar_proppatch_read_pause_point(owner: u32) {
+    wait(take_for(&CALENDAR_PROPPATCH_READ_PAUSE, owner)).await;
+}

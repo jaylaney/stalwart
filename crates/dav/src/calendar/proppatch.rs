@@ -138,22 +138,10 @@ impl CalendarPropPatchRequestHandler for Server {
             .caused_by(trc::location!())?
             .ok_or(DavError::Code(StatusCode::NOT_FOUND))?;
 
-        // Validate headers
-        self.validate_headers(
-            access_token,
-            headers,
-            vec![ResourceState {
-                account_id,
-                collection,
-                document_id: document_id.into(),
-                etag: archive.etag().into(),
-                path: resource_.resource.unwrap(),
-                ..Default::default()
-            }],
-            Default::default(),
-            DavMethod::PROPPATCH,
-        )
-        .await?;
+        #[cfg(feature = "test_mode")]
+        if resource.is_container() {
+            common::za::test_hooks::calendar_proppatch_read_pause_point(account_id).await;
+        }
 
         // Calendar properties write only this principal's personal bundle and shared dead
         // properties. The codec retains every unopened personal bundle and ring verbatim.
@@ -170,10 +158,28 @@ impl CalendarPropPatchRequestHandler for Server {
         } else {
             None
         };
+        // The conditional headers are evaluated against the archive the final write asserts.
         let archive = calendar_context
             .as_ref()
             .map(|context| &context.stored)
             .unwrap_or(&archive);
+
+        // Validate headers
+        self.validate_headers(
+            access_token,
+            headers,
+            vec![ResourceState {
+                account_id,
+                collection,
+                document_id: document_id.into(),
+                etag: archive.etag().into(),
+                path: resource_.resource.unwrap(),
+                ..Default::default()
+            }],
+            Default::default(),
+            DavMethod::PROPPATCH,
+        )
+        .await?;
 
         let is_success;
         let mut batch = BatchBuilder::new();
