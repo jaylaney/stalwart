@@ -664,8 +664,11 @@ owner's grant request, in three phases (author's call):
    The phase scans before it rewraps (re-review finding 1): it first walks
    every event of the calendar checking its parentage (exactly one parent,
    this calendar), and only when the walk is clean does it start
-   rewrapping. Rewrites commit in batches of 100 events (author's call),
-   each event asserting its own stored archive; an event that loses its
+   rewrapping. Rewrites retain at most 100 payload snapshots per logical
+   group; each fenced event commits separately and counts advance only
+   after acknowledgement (the accepted T6-C/T6-M execution rulings in the
+   [plan 14 outcome](../plans/2026-10-23-zero-access-plan14-outcome.md)).
+   Each event asserts its own stored archive; an event that loses its
    assertion is re-read (a concurrent writer has sealed it under the CK,
    5.5) and skipped when it already carries `0x03`. An opaque assertion
    loss on a phase-1, phase-2, `reverting`-ring, rollback event chunk or
@@ -772,7 +775,9 @@ skips conversion if already converted. No grantee exists before phase 3.
   access-token invalidation of the account, which grants and revokes
   trigger for the grantee (4.6). A CK is never cached outside
   `SessionKeys`, never shared across nodes and never written to the shared
-  lookup store.
+  lookup store. Owner-ring key-vector storage is wiped before its allocation is
+  released, including initialized and spare storage replaced during
+  generation rotation.
 - **The current generation is read, never cached**: every write reads the
   calendar archive and seals under the newest generation its ring lists
   (5.5). The cache only spares repeated unwraps.
@@ -3515,7 +3520,8 @@ stands unless the code says otherwise.
    (`0x03` envelope, `0x04` owner ring, `0x05` grant ring); the purposes
    `ck-owner`, `ck-grant`, `ck-dek`, `ck-bundle`, `ck-calendar-bundle`,
    `ck-shared-dek` and `ck-shared-bundle`; `ZaOwnerRing` and `ZaGrant`;
-   the rewrap batch size (100); the attempt count (8, key pinning's); the
+   the logical rewrap group limit (100, with per-event commits); the
+   attempt count (8, key pinning's); the
    trace strings; the 409 reasons revision 5 adds (`account deleted`,
    `address is ambiguous, revoke by grant`); the `reverting` flag, the
    grant change id's width and place in the grant ring's header, and the

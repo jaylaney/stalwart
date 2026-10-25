@@ -2,7 +2,7 @@
 
 Review input: seven new threads in review [5645121295](https://github.com/jaylaney/stalwart/pull/58#pullrequestreview-5645121295), against `ee7ebbe4e616fd09a117a801f22a59d60fe91f14`. The preceding disposition remains historical evidence for the earlier 17 threads. The predecessor's GitHub Actions run 40222683663 completed successfully; these new cases require additional regressions.
 
-This pass follows the [correction plan](2026-10-25-calendar-sharing-followup-corrections.md). Implementation, focused independent reviews and the local Rust/harness checks below passed. A fresh whole-branch Astra review and shipping-binary client qualification remain pending; keep the PR in draft.
+This pass follows the [correction plan](2026-10-25-calendar-sharing-followup-corrections.md). The seven-comment implementation, focused reviews, whole-branch Astra review/fix and amended-source Rust/harness checks below passed. Shipping-binary client qualification remains pending. Keep the PR in draft.
 
 | Thread | Adjudication | Required correction |
 | --- | --- | --- |
@@ -22,19 +22,27 @@ The sync review also found a retention publication gap: deleting both history st
 
 ## Fresh verification
 
-All commands used the required rustup PATH, stable Rust 1.99.0 and Cargo 1.99.0. Integration commands used RocksDB and `RUST_MIN_STACK=16777216`, sequentially. The 1,781 compile/runtime inputs were frozen at SHA-256 `486369fcfb25b6ee6774aa4847b41379b5f559ad594381662181ab3926003b98`, including both new regression modules. Each command verified unchanged inputs before and after execution; documentation/outcome updates are outside this compile/runtime identity.
+All commands used the required rustup PATH, stable Rust 1.99.0 and Cargo 1.99.0. Integration commands used RocksDB and `RUST_MIN_STACK=16777216`, sequentially. After the key-erasure fix, the 1,781 compile/runtime inputs were frozen at SHA-256 `8ef2fca8d7b42ac405a0972f50cf8059d6575d048e5ce0b789e04e573e9a964c`, including both new regression modules. Each command verified unchanged inputs before and after execution; documentation/outcome updates are outside this compile/runtime identity. The earlier complete passing net at `486369fc...` remains historical evidence; the results below are the repeated amended-source checks.
 
 | Check | Result |
 | --- | --- |
 | `cargo fmt --all --check` | Passed. |
-| `cargo test -p vault -p groupware -p common -p store -p dav` | Passed: vault 45, groupware 146, common 121, store 5, DAV 1; no failures. |
+| `cargo test -p vault -p groupware -p common -p store -p dav` | Passed: vault 45, groupware 149, common 121, store 5, DAV 1; no failures. |
 | `cargo test -p http@0.16.26 --features test_mode` | Passed: six tests, including standalone feature handling. |
-| Whole `za::za_tests` | Passed: 433.29 seconds; includes MOVE, identity/collision/history, retention, ordinary-owner and repaired quota controls. |
-| Whole `webdav::webdav_tests`, plain then key | Passed; full command durations 20.28 / 22.68 seconds. |
+| Whole `za::za_tests` | Passed: 393.32 seconds; includes MOVE, identity/collision/history, retention, ordinary-owner, rotation and repaired quota controls. |
+| Whole `webdav::webdav_tests`, plain then key | Passed; full command durations 22.43 / 22.37 seconds. |
 | Pinned Python harness unit tests | Passed: 30 tests. |
-| Shipping release build and full client matrix | Pending fresh artifact. |
-| Fresh Astra xhigh whole-branch review | Pending immutable correction commit. |
+| Shipping release build and full client matrix | First build intentionally interrupted for the key-erasure fix; no new artifact qualified yet. |
+| Fresh Astra xhigh whole-branch review | Completed at `f28143ec`; its sole Important key-erasure finding was fixed and closed by one scoped re-review, with no new actionable finding. |
 
 The first primary ZA run failed a new ordinary-client fixture that took its token before PUT and DELETE; the ordinary change reader correctly coalesced both operations. The corrected control first proves the client observed the event, then deletes it and checks the legacy raw bytes and matching identity record. Its post-fix full run is the passing result above. Earlier inert/log-ID, decimal-token, property-404 and raw-reader activation fixture failures are retained in local evidence and excluded as meaningful negative controls. The meaningful quota, destructive-MOVE/orphan, legacy disclosure and retention-gap negative controls were separately observed before their fixes.
 
 Scoped reviewers used `gpt-6-sol/high` for the hygiene changes and `gpt-6.1-sol/xhigh` for the MOVE/identity contracts and fix reviews; implementers used Sol 6.1 or lower. All confirmed focused findings are addressed. The conditional JMAP duplicate-parent alias concern has no established ordinary-account producer path and remains unconfirmed; no broad rewrite was made. Optional backend feature/runtime checks, native clients, multi-node qualification, deployment and merge are not established by these local results. Earlier mutation and 3,000-event measurements remain historical evidence at their recorded source revisions.
+
+## Whole-branch review follow-up
+
+Fresh `gpt-6-astra/xhigh` reviewed the full range from `2440b674` to `f28143ec` without inheriting implementer reports or prior findings. It confirmed that rotating a decoded owner ring grows a full `Vec<[u8; 32]>`; a relocating allocation can release its old CK bytes unwiped, beyond the reach of the ring's eventual Drop. The bounded fix allocates an empty Zeroizing replacement, copies within its final capacity, wipes the owned original initialized/spare storage and swaps without allocation. Stored fields, wire format and key order are unchanged. The first release build was stopped before qualification so the final client run uses the corrected artifact.
+
+The safe pre-release observer's negative control detected omission of the explicit wipe (two intended failures). Three focused tests then passed, covering decoded exact-capacity growth, ordered keys/archive compatibility, spare capacity and controlled unwind. The observer is test-only and reads owned initialized storage; it does not probe released or uninitialized memory. The full groupware suite passed 149 tests. Astra checked the exact two Rust-file hashes and zeroize implementation, closed the finding in the five-file scoped diff and found no new actionable defect. The full local net was then repeated at the amended-source identity above.
+
+The review also noted the previously accepted T6-C/T6-M conversion granularity: at most 100 payload snapshots per logical group, with separately acknowledged event commits. The spec now states that existing ruling accurately; conversion behavior was not redesigned. This clarification does not qualify additional backend or native behavior.

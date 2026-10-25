@@ -96,6 +96,38 @@ impl Drop for ZaOwnerRing {
     }
 }
 
+impl ZaOwnerRing {
+    /// Append without reallocating storage that already contains collection keys.
+    pub(crate) fn append_key(&mut self, key: &Secret) {
+        append_owner_key(
+            &mut self.keys,
+            key,
+            #[cfg(test)]
+            |_| {},
+        );
+    }
+}
+
+fn append_owner_key(
+    keys: &mut Vec<[u8; 32]>,
+    key: &Secret,
+    #[cfg(test)] before_release: impl FnOnce(&[[u8; 32]]),
+) {
+    // Allocate before copying any keys. Neither write can exceed this capacity;
+    // Zeroizing owns the replacement until it belongs to the ring, including unwind.
+    let mut replacement = Zeroizing::new(Vec::with_capacity(keys.len() + 1));
+    replacement.extend_from_slice(keys);
+    replacement.push(*key.as_bytes());
+    // Keep initialized storage observable until the wipe is complete. Wipe spare
+    // capacity too, then swap without allocation. The retired Vec remains under
+    // Zeroizing ownership until release; the ring owns the new keys from the swap.
+    keys.iter_mut().for_each(Zeroize::zeroize);
+    keys.spare_capacity_mut().zeroize();
+    #[cfg(test)]
+    before_release(keys);
+    std::mem::swap(keys, &mut replacement);
+}
+
 impl Zeroize for ZaGrant {
     fn zeroize(&mut self) {
         self.account_id.zeroize();
@@ -696,6 +728,99 @@ mod tests {
             boundary_pending: false,
             generations: vec![1, 2],
         }
+    }
+
+    #[test]
+    fn owner_key_growth_wipes_decoded_storage_before_release() {
+        let ewk = Secret::random();
+        let sealed = seal_owner_ring(&header(), &ring(), 7, &ewk).unwrap();
+        let (mut header, mut decoded) = open_owner_ring(&sealed, 7, 23, &ewk).unwrap();
+        assert_eq!(decoded.keys.capacity(), decoded.keys.len());
+        let old_pointer = decoded.keys.as_ptr();
+        let mut observed = false;
+        append_owner_key(
+            &mut decoded.keys,
+            &Secret::from_bytes([0x12; 32]),
+            |retired| {
+                observed = true;
+                assert_eq!(retired.as_ptr(), old_pointer);
+                assert_eq!(retired.len(), 2);
+                assert!(
+                    retired.iter().flatten().all(|byte| *byte == 0),
+                    "retired live key storage must be wiped before release"
+                );
+            },
+        );
+        assert!(observed, "the retired allocation was inspected while owned");
+        assert!(decoded.keys.as_ptr() != old_pointer);
+        assert!(decoded.keys == [[0xAB; 32], [0xCD; 32], [0x12; 32]]);
+        header.generations.push(header.next_generation().unwrap());
+        assert_eq!(header.generations, [1, 2, 3]);
+        let mut expected = ring();
+        expected.keys = vec![[0xAB; 32], [0xCD; 32], [0x12; 32]];
+        assert_eq!(decoded, expected);
+
+        // Synthetic keys only: the established rkyv serializer is the compatibility oracle.
+        let mut expected_archive = rkyv::to_bytes::<rkyv::rancor::Error>(&expected).unwrap();
+        let sealed = seal_owner_ring(&header, &decoded, 7, &ewk).unwrap();
+        let encoded_header = encode_owner_header(&header).unwrap();
+        let plain = open_padded(
+            &ewk,
+            &owner_aad(7, &header, &encoded_header),
+            &sealed[encoded_header.len()..],
+        )
+        .unwrap();
+        assert!(plain.as_slice() == expected_archive.as_slice());
+        expected_archive.as_mut_slice().zeroize();
+        assert_eq!(
+            open_owner_ring(&sealed, 7, 23, &ewk).unwrap(),
+            (header, expected)
+        );
+    }
+
+    #[test]
+    fn owner_key_growth_wipes_spare_storage_before_unwind() {
+        let mut owner = ring();
+        // Allocate while empty; never reserve or grow a populated secret buffer.
+        let mut spare = Zeroizing::new(Vec::with_capacity(8));
+        spare.extend_from_slice(&owner.keys);
+        std::mem::swap(&mut owner.keys, &mut spare);
+        assert!(owner.keys.capacity() > owner.keys.len());
+        let old_pointer = owner.keys.as_ptr();
+        let mut observed = false;
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            append_owner_key(
+                &mut owner.keys,
+                &Secret::from_bytes([0x12; 32]),
+                |retired| {
+                    observed = true;
+                    assert_eq!(retired.as_ptr(), old_pointer);
+                    assert_eq!(retired.len(), 2);
+                    assert!(
+                        retired.iter().flatten().all(|byte| *byte == 0),
+                        "retired live key storage must be wiped before unwind"
+                    );
+                    panic!("controlled pre-release unwind");
+                },
+            );
+        }));
+        assert!(unwound.is_err());
+        assert!(observed);
+        // The original allocation still belongs to the ring after the observer unwinds.
+        assert_eq!(owner.keys.as_ptr(), old_pointer);
+        assert_eq!(owner.keys.len(), 2);
+        assert!(owner.keys.iter().flatten().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn owner_key_growth_preserves_keys_with_spare_capacity() {
+        let mut owner = ring();
+        let mut spare = Zeroizing::new(Vec::with_capacity(8));
+        spare.extend_from_slice(&owner.keys);
+        std::mem::swap(&mut owner.keys, &mut spare);
+        assert!(owner.keys.capacity() > owner.keys.len());
+        owner.append_key(&Secret::from_bytes([0x12; 32]));
+        assert!(owner.keys == [[0xAB; 32], [0xCD; 32], [0x12; 32]]);
     }
 
     #[test]

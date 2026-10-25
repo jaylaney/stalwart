@@ -339,7 +339,7 @@ pub async fn za_share_apply(
     }
     if applied.rotated {
         header.generations.push(header.next_generation()?);
-        ring.keys.push(*Secret::random().as_bytes());
+        ring.append_key(&Secret::random());
         applied
             .affected_grantees
             .extend(ring.grants.iter().map(|g| g.account_id));
