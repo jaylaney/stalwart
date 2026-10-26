@@ -1,0 +1,86 @@
+name: Product build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag, or commit to build (defaults to the selected workflow ref)
+        required: false
+        type: string
+  push:
+    # Independent fork releases, distinct from upstream version tags.
+    tags: ["fork-v*.*.*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build x86_64-unknown-linux-gnu
+    runs-on: ubuntu-26.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_NET_RETRY: "10"
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+      AWS_LC_SYS_PREBUILT_NASM: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Record source commit
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang libclang-dev cmake pkg-config
+
+      - name: Install stable Rust toolchain
+        run: |
+          rustup set profile minimal
+          rustup toolchain install stable-x86_64-unknown-linux-gnu --no-self-update
+          rustup default stable-x86_64-unknown-linux-gnu
+          rustup target add x86_64-unknown-linux-gnu
+          rustc --version
+
+      - name: Build shipping binary
+        run: cargo build --release -p stalwart --no-default-features --features rocks
+
+      - name: Generate checksum and job summary
+        working-directory: target/release
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.sha }}
+        run: |
+          sha256sum stalwart > stalwart.sha256
+          {
+            printf '### Product build\n\n'
+            printf 'Commit: %s\n\n' "$SOURCE_COMMIT"
+            printf 'Target: x86_64-unknown-linux-gnu\n\n'
+            printf 'SHA-256:\n\n```text\n'
+            cat stalwart.sha256
+            printf '```\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest binary provenance
+        uses: actions/attest-build-provenance@e4d4f7c39adfa4c260fb5c147f0622000aa14b99 # v4.0.0
+        with:
+          subject-path: target/release/stalwart
+
+      - name: Upload product binary and checksum
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stalwart-x86_64-unknown-linux-gnu-${{ steps.source.outputs.sha }}
+          if-no-files-found: error
+          path: |
+            target/release/stalwart
+            target/release/stalwart.sha256
