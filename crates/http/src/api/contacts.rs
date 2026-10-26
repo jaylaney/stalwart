@@ -45,13 +45,14 @@ use groupware::{
         CalendarEvent,
         drain::{ZaDrain, ZaHeldBack},
         fanout::{
-            ITIP_STATUS_KEY_REFUSED, ZaFanOut, ZaFanOutKind, ZaScheduleStatus, ZaSource,
-            za_set_schedule_status,
+            ITIP_STATUS_KEY_REFUSED, ZaFanOut, ZaFanOutKind, ZaFanOutMessage, ZaScheduleStatus,
+            ZaSource, za_set_schedule_status,
         },
         itip::ItipSendStatus,
         pinning::{za_full_request_for, za_participation_replies},
-        seal::{TokenPairs, seal_error, seal_event, unseal_event_pairs},
+        seal::{TokenPairs, seal_error, seal_event_in_domain, unseal_event_in_domain},
         sequence::{ZaSequence, za_set_sequences},
+        sharing::resolve::za_owned_event_contexts,
     },
     scheduling::{
         itip::{ITIP_STATUS_DELIVERED, ITIP_STATUS_NOT_ATTEMPTED},
@@ -385,13 +386,26 @@ fn za_address(address: &str) -> trc::Result<String> {
 /// resolves a recipient (spec 5.1) but without the receive permission.
 /// `None` for unknown addresses, plain accounts and accounts pending setup.
 async fn za_resolve(server: &Server, address: &str) -> trc::Result<Option<[u8; 32]>> {
+    Ok(za_resolve_key_account(server, address)
+        .await?
+        .map(|(_, key)| key))
+}
+
+/// Quiet local-account resolution shared with the sharing endpoints.
+pub(super) async fn za_resolve_key_account(
+    server: &Server,
+    address: &str,
+) -> trc::Result<Option<(u32, [u8; 32])>> {
     let Some(account_id) = server.za_account_id_from_email(address).await? else {
         return Ok(None);
     };
     if !server.za_is_key_account(account_id).await? {
         return Ok(None);
     }
-    server.za_served_public_key(account_id).await
+    Ok(server
+        .za_served_public_key(account_id)
+        .await?
+        .map(|key| (account_id, key)))
 }
 
 /// An entry's outcome (spec 6.4's table).
@@ -640,7 +654,23 @@ async fn za_redeliver_entry(
     let mut event = archive
         .deserialize::<CalendarEvent>()
         .caused_by(trc::location!())?;
-    let pairs = unseal_event_pairs(&mut event, keys, account_id)
+    let contexts = za_owned_event_contexts(
+        server,
+        keys,
+        &event,
+        event
+            .names
+            .first()
+            .ok_or_else(|| trc::StoreEvent::DataCorruption.into_err())?
+            .parent_id,
+    )
+    .await
+    .map_err(|error| error.into_store_error(account_id, document_id))?;
+    let contexts =
+        groupware::calendar::sharing::boundary::za_repair_owned_contexts(server, keys, contexts)
+            .await
+            .map_err(|error| error.into_store_error(account_id, document_id))?;
+    let pairs = unseal_event_in_domain(&mut event, &contexts[0].domain)
         .map_err(|err| seal_error(err, account_id, document_id))?;
     if event.data.event.uids().next() != Some(entry.uid.as_str()) {
         return Ok(Outcome::Dropped);
@@ -699,8 +729,13 @@ async fn za_redeliver_entry(
     let fan_out = match server
         .za_fan_out(
             account_info,
+            account_info,
+            account_info,
             keys,
-            messages,
+            messages
+                .into_iter()
+                .map(ZaFanOutMessage::upstream)
+                .collect(),
             pairs,
             tree,
             ZaSource {
@@ -709,6 +744,7 @@ async fn za_redeliver_entry(
             },
             ZaFanOutKind::Redelivery,
             lease.as_ref().map(|lease| lease.lease()),
+            None,
         )
         .await
     {
@@ -835,12 +871,34 @@ async fn za_reseal(
     document_id: u32,
 ) -> trc::Result<()> {
     let account_id = verified.account_id;
-    seal_event(&mut event, &verified.keys, account_id, pairs)
+    let contexts = za_owned_event_contexts(
+        server,
+        &verified.keys,
+        &event,
+        event
+            .names
+            .first()
+            .ok_or_else(|| trc::StoreEvent::DataCorruption.into_err())?
+            .parent_id,
+    )
+    .await
+    .map_err(|error| error.into_store_error(account_id, document_id))?;
+    let contexts = groupware::calendar::sharing::boundary::za_repair_owned_contexts(
+        server,
+        &verified.keys,
+        contexts,
+    )
+    .await
+    .map_err(|error| error.into_store_error(account_id, document_id))?;
+    seal_event_in_domain(&mut event, &contexts[0].domain, pairs)
         .map_err(|err| seal_error(err, account_id, document_id))?;
     let current = archive
         .to_unarchived::<CalendarEvent>()
         .caused_by(trc::location!())?;
     let mut batch = BatchBuilder::new();
+    for context in &contexts {
+        context.assert_in(&mut batch);
+    }
     event
         .update(
             account_info.account_tenant_ids(),
@@ -879,7 +937,26 @@ async fn za_reseal_again(
     let mut event = archive
         .deserialize::<CalendarEvent>()
         .caused_by(trc::location!())?;
-    let pairs = unseal_event_pairs(&mut event, &verified.keys, account_id)
+    let contexts = za_owned_event_contexts(
+        server,
+        &verified.keys,
+        &event,
+        event
+            .names
+            .first()
+            .ok_or_else(|| trc::StoreEvent::DataCorruption.into_err())?
+            .parent_id,
+    )
+    .await
+    .map_err(|error| error.into_store_error(account_id, document_id))?;
+    let contexts = groupware::calendar::sharing::boundary::za_repair_owned_contexts(
+        server,
+        &verified.keys,
+        contexts,
+    )
+    .await
+    .map_err(|error| error.into_store_error(account_id, document_id))?;
+    let pairs = unseal_event_in_domain(&mut event, &contexts[0].domain)
         .map_err(|err| seal_error(err, account_id, document_id))?;
     let unchanged = server
         .za_pin_read(&verified.keys)

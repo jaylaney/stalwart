@@ -23,6 +23,20 @@ PIN = "111ae14b875f40d100d5259820f10210f00e20f9"
 HERE = Path(__file__).resolve().parent
 
 
+def read_collection(mode: str, path: Path | None = None) -> set[str]:
+    if mode not in ("plain", "key"):
+        raise ValueError("Unknown CalDAV client account mode")
+    collection = json.loads((path or HERE / "collection.json").read_text())
+    if not isinstance(collection, dict) or set(collection) != {"plain", "key"}:
+        raise ValueError("Collection manifest must have exactly plain and key lists")
+    for name, cases in collection.items():
+        if (not isinstance(cases, list) or not cases
+                or any(not isinstance(case, str) or not case.strip() for case in cases)
+                or len(cases) != len(set(cases))):
+            raise ValueError(f"Invalid {name} collection manifest")
+    return set(collection[mode])
+
+
 def response_string(response, field, context):
     value = response.get(field) if isinstance(response, dict) else None
     if not isinstance(value, str) or not value:
@@ -326,7 +340,7 @@ class ProductServer:
 
 def run_suite(source, users, mode, work):
     policy = json.loads((HERE / "compatibility.json").read_text())[mode]
-    features = validate_policy(policy, set(json.loads((HERE / "collection.json").read_text())))
+    features = validate_policy(policy, read_collection(mode))
     name = "Stalwart" + mode.capitalize()
     config = {"test-servers": {name: {"type": "external", "enabled": True, **users[0],
                                      "features": features, "scheduling_users": [
@@ -353,7 +367,10 @@ def run_suite(source, users, mode, work):
     env["PYTHONPATH"] = os.pathsep.join([str(HERE), str(suite)])
     with open(work / "pytest.log", "xb") as output:
         os.chmod(work / "pytest.log", 0o600)
-        result = subprocess.run(command + selection + [str(HERE / "test_flows.py")],
+        strict_files = [str(HERE / "test_flows.py")]
+        if mode == "key":
+            strict_files.append(str(HERE / "test_sharing.py"))
+        result = subprocess.run(command + selection + strict_files,
                                 cwd=suite, env=env, stdout=output, stderr=subprocess.STDOUT)
     if result.returncode:
         raise RuntimeError(f"{mode}: third-party client tests failed (exit {result.returncode})")
@@ -420,10 +437,9 @@ def main():
     modes = ("plain", "key") if args.mode == "both" else (args.mode,)
     try:
         policies = json.loads((HERE / "compatibility.json").read_text())
-        expected = set(json.loads((HERE / "collection.json").read_text()))
         for mode in modes:
-            validate_policy(policies[mode], expected)
-    except (ValueError, KeyError, TypeError, AttributeError) as error:
+            validate_policy(policies[mode], read_collection(mode))
+    except (ValueError, KeyError, TypeError, AttributeError, OSError) as error:
         parser.error(f"Invalid compatibility policy: {error}")
     return run_modes(args.binary, args.caldav_source, modes, args.log_dir)
 

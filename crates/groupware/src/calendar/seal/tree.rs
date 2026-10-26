@@ -158,6 +158,27 @@ pub(super) fn has_stray_carriers(ical: &ICalendar) -> bool {
     })
 }
 
+/// Structural validation only; authentication remains mandatory when opening.
+pub(super) fn validate_bundle_carrier(
+    entry: &ICalendarEntry,
+    formats: &[u8],
+) -> Result<(), SealError> {
+    let [ICalendarValue::Text(text)] = entry.values.as_slice() else {
+        return Err(SealError::Format);
+    };
+    if !entry.params.is_empty() {
+        return Err(SealError::Format);
+    }
+    let raw = STANDARD.decode(text).map_err(|_| SealError::Decode)?;
+    if raw.len() < 1 + 24 + 16 + PAD
+        || !formats.contains(&raw[0])
+        || (raw.len() - 1 - 24 - 16) % PAD != 0
+    {
+        return Err(SealError::Format);
+    }
+    Ok(())
+}
+
 /// A key envelope: `policy version || wrap type || wrapped DEK`, the DEK
 /// wrapped under `wrapping`, the account's event wrapping key (spec 7.1,
 /// 7.2) or its mail wrapping key (mail spec 3.2).

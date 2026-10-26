@@ -308,6 +308,13 @@ impl VaultApi for Server {
                 za_app_password_revoke(self, session, parse(&body)?).await
             }
             ("totp", None) => za_totp(self, session, parse(&body)?).await,
+            ("shares", None) => super::shares::za_shares(self, session, parse(&body)?).await,
+            ("shares", Some("grant")) => {
+                super::shares::za_shares_grant(self, session, parse(&body)?).await
+            }
+            ("shares", Some("revoke")) => {
+                super::shares::za_shares_revoke(self, session, parse(&body)?).await
+            }
             // Key pinning spec 6.
             ("contacts", None) => contacts::za_contacts(self, session, parse(&body)?).await,
             ("contacts", Some("lookup")) => {
@@ -602,7 +609,7 @@ pub(super) async fn za_verify_primary(
 /// Second record read after `za_verify_primary`: the `previous` of the
 /// commit, which checks it against the verified generation. Missing record
 /// or a state other than Active is 409.
-async fn za_reread_verified(
+pub(super) async fn za_reread_verified(
     server: &Server,
     verified: &ZaVerified,
 ) -> trc::Result<Result<VaultRead, HttpResponse>> {

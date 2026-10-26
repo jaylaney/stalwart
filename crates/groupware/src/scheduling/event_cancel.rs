@@ -5,7 +5,7 @@
  */
 
 use crate::scheduling::{
-    InstanceId, ItipError, ItipMessage, ItipSummary,
+    InstanceId, ItipError, ItipMessage, ItipSnapshots, ItipSummary,
     attendee::attendee_decline,
     itip::{itip_add_tz, itip_build_envelope},
     snapshot::itip_snapshot,
@@ -26,6 +26,14 @@ pub fn itip_cancel(
 ) -> Result<ItipMessage<ICalendar>, ItipError> {
     // Prepare iTIP message
     let itip = itip_snapshot(ical, account_emails, false)?;
+    itip_cancel_from_snapshot(ical, itip, is_deletion)
+}
+
+pub(crate) fn itip_cancel_from_snapshot(
+    ical: &ICalendar,
+    itip: ItipSnapshots<'_>,
+    is_deletion: bool,
+) -> Result<ItipMessage<ICalendar>, ItipError> {
     let dt_stamp = PartialDateTime::now();
     let mut message = ICalendar {
         components: Vec::with_capacity(2),

@@ -1475,3 +1475,84 @@ pub async fn za_unpin(test: &TestServer, account_id: u32, password: &str) {
     rewrap_legacy(test, account_id, password).await;
     set_raw_pins(test, account_id, None).await;
 }
+
+/// Case 25's narrow equality oracle: keep SEQUENCE, STATUS, recurrence/date rules
+/// and every ATTENDEE parameter. Only server timestamps, fixture UID and delegated
+/// ORGANIZER SENT-BY are allowed to differ between the two independently written runs.
+pub fn normalize_sharing_copy(mut ical: ICalendar, uid: &str) -> ICalendar {
+    for component in &mut ical.components {
+        component.entries.retain(|entry| {
+            !matches!(
+                entry.name,
+                ICalendarProperty::Dtstamp
+                    | ICalendarProperty::Created
+                    | ICalendarProperty::LastModified
+            )
+        });
+        for entry in &mut component.entries {
+            if entry.name == ICalendarProperty::Uid {
+                entry.values = vec![ICalendarValue::Text(uid.into())];
+            } else if entry.name == ICalendarProperty::Organizer {
+                entry
+                    .params
+                    .retain(|parameter| parameter.name != ICalendarParameterName::SentBy);
+            }
+        }
+        component.entries.sort_unstable();
+    }
+    // Component indices are parser-internal. Rebuild them in semantic component order.
+    let mut order: Vec<usize> = (1..ical.components.len()).collect();
+    order.sort_by(|&a, &b| ical.components[a].cmp(&ical.components[b]));
+    order.insert(0, 0);
+    let mut mapped = vec![0u32; order.len()];
+    for (new, &old) in order.iter().enumerate() {
+        mapped[old] = new as u32;
+    }
+    let original = ical.components.clone();
+    ical.components = order
+        .into_iter()
+        .map(|old| {
+            let mut component = original[old].clone();
+            for child in &mut component.component_ids {
+                *child = mapped[*child as usize];
+            }
+            component.component_ids.sort_unstable();
+            component
+        })
+        .collect();
+    ical
+}
+
+/// A complete public DAV request with enough timeout for deliberate commit pauses.
+/// This helper carries only disposable fixture credentials.
+pub async fn sharing_dav_request(
+    username: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> crate::utils::http::HttpResponseFull {
+    let mut request = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap()
+        .request(
+            Method::from_bytes(method.as_bytes()).unwrap(),
+            format!("{SERVER_URL}{path}"),
+        )
+        .basic_auth(username, Some(crate::za::STRONG))
+        .body(body.to_string());
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = request.send().await.unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.text().await.unwrap();
+    crate::utils::http::HttpResponseFull {
+        status,
+        headers,
+        body,
+    }
+}

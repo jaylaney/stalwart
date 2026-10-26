@@ -7,6 +7,7 @@
 //! Zero-access sealing of calendar data (spec 6, 7).
 
 pub mod collection;
+pub mod domain;
 pub mod event;
 pub mod item;
 pub mod policy;
@@ -30,4 +31,11 @@ pub use tree::{
     FORMAT_V1, PAD, SealError, WRAP_MK, WRAP_PK, decode_archive, open_key_envelope, open_padded,
     open_pk_envelope, seal_error, seal_key_envelope, seal_padded, seal_pk_envelope,
     tree_has_carriers,
+};
+
+pub use collection::{calendar_view_in_domain, seal_calendar_changes};
+pub use domain::ZaKeyDomain;
+pub use event::{
+    ZaEventStorageKind, classify_event_storage, event_pairs_in_domain, event_view_in_domain,
+    rewrap_event, seal_event_in_domain, unseal_event_in_domain,
 };

@@ -6,6 +6,7 @@
 
 pub mod alarm;
 pub mod dates;
+pub mod delegation;
 pub mod drain;
 pub mod expand;
 pub mod fanout;
@@ -14,6 +15,7 @@ pub mod itip;
 pub mod pinning;
 pub mod seal;
 pub mod sequence;
+pub mod sharing;
 pub mod storage;
 
 use calcard::icalendar::{

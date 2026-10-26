@@ -358,10 +358,19 @@ impl Server {
     }
 
     pub async fn rcpt_id_from_email(&self, address: &str) -> trc::Result<Option<EmailCache>> {
+        self.rcpt_id_from_email_inner(address, false).await
+    }
+
+    async fn rcpt_id_from_email_inner(
+        &self,
+        address: &str,
+        quiet: bool,
+    ) -> trc::Result<Option<EmailCache>> {
         let address = address.to_canonical_address();
         if let Some((local_part, domain)) = address.split_once('@') {
-            if let Some(domain) = self.domain(domain).await? {
-                self.rcpt_id_from_parts(local_part, domain.id).await
+            if let Some(domain) = self.domain_inner(domain, quiet).await? {
+                self.rcpt_id_from_parts_inner(local_part, domain.id, quiet)
+                    .await
             } else {
                 Ok(None)
             }
@@ -787,7 +796,7 @@ impl Server {
                     && result.is_none()
                     && let Some(catch_all) = &domain.catch_all
                 {
-                    result = self.rcpt_id_from_email(catch_all).await?;
+                    result = self.rcpt_id_from_email_inner(catch_all, quiet).await?;
                 }
 
                 Ok(result.and_then(|result| {

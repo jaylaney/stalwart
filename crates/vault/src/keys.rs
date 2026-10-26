@@ -425,6 +425,34 @@ mod tests {
     }
 
     #[test]
+    fn grant_and_pk_dek_purposes_are_disjoint() {
+        let (public, private) = generate_keypair();
+        let key = Secret::random();
+        // Literal sharing 3.2 vector: owner 7, calendar 23, domain A*16, grantee 31, generation 1.
+        let grant_aad =
+            b"za/v1|ck-grant|\0\0\0\x07|\0\0\0\x17|AAAAAAAAAAAAAAAA|\0\0\0\x1f|\0\0\0\x01";
+        let invitation_aad = b"za/v1|pk-dek|\0\0\0\x07";
+        let (ephemeral, wrapped) = pk_wrap(&key, &public, grant_aad).unwrap();
+        assert_eq!(
+            pk_unwrap(&ephemeral, &wrapped, &private, grant_aad)
+                .unwrap()
+                .as_bytes(),
+            key.as_bytes()
+        );
+        assert!(pk_unwrap(&ephemeral, &wrapped, &Secret::random(), grant_aad).is_err());
+        for offset in [17, 22, 25, 44, 49] {
+            let mut wrong = grant_aad.to_vec();
+            wrong[offset] ^= 1;
+            assert!(pk_unwrap(&ephemeral, &wrapped, &private, &wrong).is_err());
+        }
+        let grant_as_invitation = pk_unwrap(&ephemeral, &wrapped, &private, invitation_aad);
+        assert!(grant_as_invitation.is_err());
+        let (ephemeral, wrapped) = pk_wrap(&key, &public, invitation_aad).unwrap();
+        let invitation_as_grant = pk_unwrap(&ephemeral, &wrapped, &private, grant_aad);
+        assert!(invitation_as_grant.is_err());
+    }
+
+    #[test]
     fn root_derivation_is_deterministic_and_salt_dependent() {
         let a = derive_root(b"correct horse", &SALT, fast_params()).unwrap();
         let b = derive_root(b"correct horse", &SALT, fast_params()).unwrap();

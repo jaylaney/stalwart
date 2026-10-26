@@ -14,11 +14,12 @@
 //! `X-ZA-KEY`.
 
 use super::{
+    domain::{ZaKeyDomain, validate_event_envelope},
     token::{TOKEN_LEN, TokenPairs},
     tree::{
         EXTRA_PROP, FORMAT_V1, FORMAT_V2, KEY_PROP, SealError, decode_archive, entry_text,
-        has_stray_carriers, is_carrier, open_bytes_as, open_key_envelope, seal_bytes,
-        seal_bytes_as, seal_key_envelope, seal_tree, text_entry, unseal_tree,
+        has_stray_carriers, is_carrier, open_bytes_as, seal_bytes, seal_bytes_as, seal_tree,
+        text_entry, unseal_tree,
     },
 };
 use crate::calendar::{ArchivedCalendarEvent, CalendarEvent};
@@ -121,6 +122,7 @@ pub(super) fn open_extra(dek: &Secret, aad: &[u8], text: &str) -> Result<OpenedE
 }
 
 /// `za/v1|event-key|<account>|<uid>`
+#[cfg(test)]
 fn key_aad(account_id: u32, uid: &str) -> Vec<u8> {
     let mut out = aad("event-key", account_id);
     out.push(b'|');
@@ -193,6 +195,19 @@ pub fn seal_event(
     account_id: u32,
     pairs: Option<&TokenPairs>,
 ) -> Result<(), SealError> {
+    if keys.account_id != account_id {
+        return Err(SealError::Structure("keys of another account"));
+    }
+    seal_event_in_domain(event, &ZaKeyDomain::owner(keys), pairs)
+}
+
+/// Seals client plaintext exactly once. Client X-ZA properties are content;
+/// the storage classifier must never run at this boundary.
+pub fn seal_event_in_domain(
+    event: &mut CalendarEvent,
+    domain: &ZaKeyDomain,
+    pairs: Option<&TokenPairs>,
+) -> Result<(), SealError> {
     let root = event
         .data
         .event
@@ -202,9 +217,8 @@ pub fn seal_event(
     if root.component_type != ICalendarComponentType::VCalendar {
         return Err(SealError::Structure("root is not VCALENDAR"));
     }
-    if keys.account_id != account_id {
-        return Err(SealError::Structure("keys of another account"));
-    }
+    check_domain_parent(event, domain)?;
+    let account_id = domain.owner_id();
     let uid = uid_of(event);
     let dek = Secret::random();
     seal_tree(&mut event.data.event, &dek, account_id, &uid);
@@ -221,7 +235,7 @@ pub fn seal_event(
             .push(text_entry(EXTRA_PROP, text));
     }
 
-    let envelope = seal_key_envelope(&dek, keys.ewk(), &key_aad(account_id, &uid));
+    let envelope = domain.seal_event_key(&dek, &uid)?;
     event.data.event.components[0]
         .entries
         .push(text_entry(KEY_PROP, STANDARD.encode(envelope)));
@@ -236,6 +250,17 @@ fn open_root(
     keys: &SessionKeys,
     account_id: u32,
 ) -> Result<(Secret, String, Option<OpenedExtra>), SealError> {
+    if keys.account_id != account_id {
+        return Err(SealError::Aead);
+    }
+    open_root_in_domain(event, &ZaKeyDomain::owner(keys))
+}
+
+fn open_root_in_domain(
+    event: &mut CalendarEvent,
+    domain: &ZaKeyDomain,
+) -> Result<(Secret, String, Option<OpenedExtra>), SealError> {
+    let account_id = domain.owner_id();
     let uid = uid_of(event);
     let root = &mut event.data.event.components[0];
     let key_entry = root
@@ -245,7 +270,7 @@ fn open_root(
     let envelope = STANDARD
         .decode(entry_text(&key_entry).ok_or(SealError::Format)?)
         .map_err(|_| SealError::Decode)?;
-    let dek = open_key_envelope(&envelope, keys.ewk(), &key_aad(account_id, &uid))?;
+    let dek = domain.open_event_key(&envelope, &uid)?;
     let extra = root.entries.pop_if(|e| is_carrier(e, EXTRA_PROP));
     if has_stray_carriers(&event.data.event) {
         return Err(SealError::Structure("misplaced carrier"));
@@ -359,6 +384,215 @@ pub fn unseal_event_archive(
     Ok(view)
 }
 
+/// Classifies stored, deserialized input before opening. This is structural
+/// validation only and must never be applied to an opened or client tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZaEventStorageKind {
+    LegacyPlaintext,
+    Sealed,
+}
+
+pub fn classify_event_storage(event: &CalendarEvent) -> Result<ZaEventStorageKind, SealError> {
+    use super::tree::{SEALED_PROP, validate_bundle_carrier};
+    let recognized = event.data.event.components.iter().any(|c| {
+        c.entries.iter().any(|e| {
+            [KEY_PROP, SEALED_PROP, EXTRA_PROP]
+                .iter()
+                .any(|name| is_carrier(e, name))
+        })
+    });
+    if !recognized {
+        return Ok(ZaEventStorageKind::LegacyPlaintext);
+    }
+    let mut tree = event.data.event.clone();
+    let root = tree
+        .components
+        .first_mut()
+        .filter(|c| c.component_type == ICalendarComponentType::VCalendar)
+        .ok_or(SealError::Structure("root is not VCALENDAR"))?;
+    let key = root
+        .entries
+        .pop()
+        .filter(|e| is_carrier(e, KEY_PROP))
+        .ok_or(SealError::Structure("key envelope"))?;
+    if !key.params.is_empty() || key.values.len() != 1 {
+        return Err(SealError::Format);
+    }
+    validate_event_envelope(
+        &STANDARD
+            .decode(entry_text(&key).ok_or(SealError::Format)?)
+            .map_err(|_| SealError::Decode)?,
+    )?;
+    if let Some(extra) = root.entries.pop_if(|e| is_carrier(e, EXTRA_PROP)) {
+        validate_bundle_carrier(&extra, &[FORMAT_V1, FORMAT_V2])?;
+    }
+    if has_stray_carriers(&tree) {
+        return Err(SealError::Structure("misplaced carrier"));
+    }
+    for component in &tree.components {
+        for entry in &component.entries {
+            if !is_carrier(entry, SEALED_PROP)
+                && (!super::policy::is_visible_property(&component.component_type, &entry.name)
+                    || entry
+                        .params
+                        .iter()
+                        .any(|p| !super::policy::is_visible_parameter(&p.name)))
+            {
+                return Err(SealError::Structure("unsealed event property"));
+            }
+        }
+        if let Some(carrier) = component
+            .entries
+            .last()
+            .filter(|e| is_carrier(e, SEALED_PROP))
+        {
+            validate_bundle_carrier(carrier, &[FORMAT_V1])?;
+        }
+    }
+    Ok(ZaEventStorageKind::Sealed)
+}
+
+fn check_domain_parent(event: &CalendarEvent, domain: &ZaKeyDomain) -> Result<(), SealError> {
+    if let Some(calendar) = domain.calendar_id() {
+        if !matches!(event.names.as_slice(), [name] if name.parent_id == calendar) {
+            return Err(SealError::Structure("collection key event parent"));
+        }
+    }
+    Ok(())
+}
+
+/// Read parentage follows the stored envelope, independently of write rules.
+/// A pre-conversion COPY may leave legitimate linked legacy/EWK rows in an
+/// owner's conversion journal. The requested calendar must remain a parent;
+/// CK rows always require their exact sole parent, including during rollback.
+fn classify_domain_read(
+    event: &CalendarEvent,
+    domain: &ZaKeyDomain,
+) -> Result<ZaEventStorageKind, SealError> {
+    let storage = classify_event_storage(event)?;
+    let owner_legacy = domain.is_owner()
+        && (storage == ZaEventStorageKind::LegacyPlaintext || {
+            // Structural classification already validated the trailing key.
+            let carrier = event.data.event.components[0].entries.last().unwrap();
+            let envelope = STANDARD
+                .decode(entry_text(carrier).ok_or(SealError::Format)?)
+                .map_err(|_| SealError::Decode)?;
+            envelope[1] == super::tree::WRAP_MK
+        });
+    if owner_legacy {
+        if domain
+            .calendar_id()
+            .is_some_and(|calendar| !event.names.iter().any(|name| name.parent_id == calendar))
+        {
+            return Err(SealError::Structure("collection key event parent"));
+        }
+    } else {
+        check_domain_parent(event, domain)?;
+    }
+    Ok(storage)
+}
+
+/// Stored-input boundary. Owner conversion reads may pass through no-carrier
+/// legacy rows; a domain with no owner EWK may only read CK-sealed rows.
+pub fn unseal_event_in_domain(
+    event: &mut CalendarEvent,
+    domain: &ZaKeyDomain,
+) -> Result<Option<TokenPairs>, SealError> {
+    if classify_domain_read(event, domain)? == ZaEventStorageKind::LegacyPlaintext {
+        return if domain.is_owner() {
+            Ok(None)
+        } else {
+            Err(SealError::NotSealed)
+        };
+    }
+    let (dek, uid, extra) = open_root_in_domain(event, domain)?;
+    let mut pairs = None;
+    if let Some(extra) = extra {
+        event.display_name = extra.display_name;
+        event.dead_properties = extra.dead_properties;
+        pairs = extra.pairs;
+    }
+    unseal_tree(&mut event.data.event, &dek, domain.owner_id(), &uid)?;
+    Ok(pairs)
+}
+
+pub fn event_pairs_in_domain(
+    stored: &Archive<AlignedBytes>,
+    domain: &ZaKeyDomain,
+) -> Result<Option<TokenPairs>, SealError> {
+    let mut event = stored
+        .deserialize::<CalendarEvent>()
+        .map_err(|_| SealError::Format)?;
+    if classify_domain_read(&event, domain)? == ZaEventStorageKind::LegacyPlaintext {
+        return if domain.is_owner() {
+            Ok(None)
+        } else {
+            Err(SealError::NotSealed)
+        };
+    }
+    let (_, _, extra) = open_root_in_domain(&mut event, domain)?;
+    Ok(extra.and_then(|e| e.pairs))
+}
+
+/// Read-only response archive. Never use its bytes as an update assertion.
+pub fn event_view_in_domain(
+    stored: &Archive<AlignedBytes>,
+    domain: &ZaKeyDomain,
+) -> Result<Archive<AlignedBytes>, SealError> {
+    let mut event = stored
+        .deserialize::<CalendarEvent>()
+        .map_err(|_| SealError::Format)?;
+    unseal_event_in_domain(&mut event, domain)?;
+    let bytes = Archiver::new(event)
+        .serialize()
+        .map_err(|_| SealError::Format)?;
+    let mut view = <Archive<AlignedBytes> as Deserialize>::deserialize(&bytes)
+        .map_err(|_| SealError::Format)?;
+    view.version = stored.version;
+    Ok(view)
+}
+
+/// Rewraps a stored event without changing its content, token carriers or DEK.
+/// Legacy plaintext is sealed in full; malformed partial carriers never are.
+/// Caller updates parent metadata for a cross-domain MOVE after this call.
+pub fn rewrap_event(
+    event: &mut CalendarEvent,
+    from: &ZaKeyDomain,
+    to: &ZaKeyDomain,
+) -> Result<(), SealError> {
+    if from.owner_id() != to.owner_id() {
+        return Err(SealError::Structure("cross-account event rewrap"));
+    }
+    check_domain_parent(event, from)?;
+    if to.calendar_id().is_some() && event.names.len() != 1 {
+        return Err(SealError::Structure("collection key event parent"));
+    }
+    if classify_event_storage(event)? == ZaEventStorageKind::LegacyPlaintext {
+        // MOVE may still name the source calendar while sealing for the target.
+        let mut changed = event.clone();
+        let names = changed.names.clone();
+        if let Some(calendar) = to.calendar_id() {
+            if changed.names.len() != 1 {
+                return Err(SealError::Structure("collection key event parent"));
+            }
+            changed.names[0].parent_id = calendar;
+        }
+        seal_event_in_domain(&mut changed, to, None)?;
+        changed.names = names;
+        *event = changed;
+        return Ok(());
+    }
+    let uid = uid_of(event);
+    let key = event.data.event.components[0].entries.last_mut().unwrap();
+    let envelope = STANDARD
+        .decode(entry_text(key).ok_or(SealError::Format)?)
+        .map_err(|_| SealError::Decode)?;
+    let dek = from.open_event_key(&envelope, &uid)?;
+    key.values[0] =
+        calcard::icalendar::ICalendarValue::Text(STANDARD.encode(to.seal_event_key(&dek, &uid)?));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +641,391 @@ mod tests {
     fn archive(event: &CalendarEvent) -> Archive<AlignedBytes> {
         let bytes = Archiver::new(event.clone()).serialize().unwrap();
         <Archive<AlignedBytes> as store::Deserialize>::deserialize(&bytes).unwrap()
+    }
+
+    // These regressions catch DEK/content resealing during conversion, lax stored routing,
+    // and accidentally treating restored client properties as storage carriers.
+    fn ck_domain(ewk: Option<Secret>, generation: u32) -> super::super::domain::ZaKeyDomain {
+        super::super::domain::ZaKeyDomain::shared(
+            9,
+            if ewk.is_some() { 9 } else { 8 },
+            ewk,
+            42,
+            [7; 16],
+            (1..=generation)
+                .map(|g| (g, Secret::from_bytes([3; 32])))
+                .collect(),
+            false,
+        )
+        .unwrap()
+    }
+
+    fn parented_event() -> CalendarEvent {
+        let mut e = event();
+        e.names.push(common::DavName {
+            parent_id: 42,
+            name: "e.ics".into(),
+        });
+        e
+    }
+
+    #[test]
+    fn rewrap_changes_only_the_envelope() {
+        let keys = keys();
+        let owner = super::super::domain::ZaKeyDomain::owner(&keys);
+        let ck = ck_domain(Some(keys.ewk().clone()), 1);
+        let pairs = two_pairs();
+        let mut e = parented_event();
+        seal_event(&mut e, &keys, 9, Some(&pairs)).unwrap();
+        let before = e.clone();
+        rewrap_event(&mut e, &owner, &ck).unwrap();
+        assert_ne!(
+            root_entries(&mut e).last(),
+            root_entries(&mut before.clone()).last()
+        );
+        let mut a = e.clone();
+        let mut b = before.clone();
+        root_entries(&mut a).pop();
+        root_entries(&mut b).pop();
+        assert_eq!(
+            a, b,
+            "all ciphertext, token bundle and metadata bytes stay identical"
+        );
+        let stored = archive(&e);
+        let returned = event_pairs_in_domain(&stored, &ck).unwrap().unwrap();
+        assert_eq!(returned.len(), 2);
+        assert_eq!(returned.get("a@example.com"), pairs.get("a@example.com"));
+        assert_eq!(returned.get("b@example.com"), pairs.get("b@example.com"));
+        let view = event_view_in_domain(&stored, &ck).unwrap();
+        assert_eq!(view.version, stored.version);
+        assert_eq!(
+            view.deserialize::<CalendarEvent>().unwrap(),
+            parented_event()
+        );
+        rewrap_event(&mut e, &ck, &owner).unwrap();
+        unseal_event(&mut e, &keys, 9).unwrap();
+        assert_eq!(e, parented_event());
+    }
+
+    #[test]
+    fn rewrap_preserves_the_existing_key_carrier_name() {
+        let keys = keys();
+        let mut e = parented_event();
+        seal_event(&mut e, &keys, 9, None).unwrap();
+        root_entries(&mut e).last_mut().unwrap().name =
+            calcard::icalendar::ICalendarProperty::Other("x-za-key".into());
+        rewrap_event(&mut e, &ZaKeyDomain::owner(&keys), &ck_domain(None, 1)).unwrap();
+        assert_eq!(
+            root_entries(&mut e).last().unwrap().name,
+            calcard::icalendar::ICalendarProperty::Other("x-za-key".into())
+        );
+    }
+
+    #[test]
+    fn plaintext_converts_under_ck() {
+        let mut e = parented_event();
+        assert_eq!(
+            classify_event_storage(&e).unwrap(),
+            ZaEventStorageKind::LegacyPlaintext
+        );
+        let ck = ck_domain(None, 1);
+        rewrap_event(&mut e, &ck, &ck).unwrap();
+        assert_eq!(
+            classify_event_storage(&e).unwrap(),
+            ZaEventStorageKind::Sealed
+        );
+        let bytes = STANDARD
+            .decode(entry_text(root_entries(&mut e).last().unwrap()).unwrap())
+            .unwrap();
+        assert_eq!(bytes.len(), 82);
+        assert_eq!(&bytes[..10], &[1, 3, 0, 0, 0, 42, 0, 0, 0, 1]);
+        unseal_event_in_domain(&mut e, &ck).unwrap();
+        assert_eq!(e, parented_event());
+    }
+
+    #[test]
+    fn event_storage_classifier_rejects_partial_carriers() {
+        let keys = keys();
+        let mut sealed = parented_event();
+        seal_event(&mut sealed, &keys, 9, None).unwrap();
+        let sealed = archive(&sealed).deserialize::<CalendarEvent>().unwrap();
+        assert_eq!(
+            classify_event_storage(&sealed).unwrap(),
+            ZaEventStorageKind::Sealed
+        );
+        let mut partial = sealed.clone();
+        root_entries(&mut partial).pop();
+        let mut misplaced = sealed.clone();
+        let key = root_entries(&mut misplaced).pop().unwrap();
+        misplaced.data.event.components[1].entries.push(key);
+        let mut moved = sealed.clone();
+        let n = root_entries(&mut moved).len();
+        root_entries(&mut moved).swap(n - 1, n - 2);
+        let bad_envelope = with_envelope(&sealed, |e| {
+            e.pop();
+        });
+        let mut bad_text = sealed.clone();
+        bad_text.data.event.components[1]
+            .entries
+            .last_mut()
+            .unwrap()
+            .values = vec![ICalendarValue::Text("AQ==".into())];
+        for bad in [partial, misplaced, moved, bad_envelope, bad_text] {
+            let bad = archive(&bad).deserialize::<CalendarEvent>().unwrap();
+            assert!(classify_event_storage(&bad).is_err());
+        }
+        for component in [0, 1] {
+            for carrier in [KEY_PROP, EXTRA_PROP, SEALED_PROP] {
+                let mut stray = parented_event();
+                stray.data.event.components[component]
+                    .entries
+                    .push(text_entry(carrier, "AQ==".into()));
+                let stray = archive(&stray).deserialize::<CalendarEvent>().unwrap();
+                assert!(classify_event_storage(&stray).is_err());
+            }
+        }
+        let fake = with_envelope(&sealed, |e| e[10] ^= 1);
+        let mut fake = archive(&fake).deserialize::<CalendarEvent>().unwrap();
+        assert_eq!(
+            classify_event_storage(&fake).unwrap(),
+            ZaEventStorageKind::Sealed
+        );
+        assert!(
+            unseal_event_in_domain(&mut fake, &super::super::domain::ZaKeyDomain::owner(&keys))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn owner_reads_conversion_mix_grantee_requires_ck_and_move_requires_new_parent() {
+        let keys = keys();
+        let account = ZaKeyDomain::owner(&keys);
+        let owner = ck_domain(Some(keys.ewk().clone()), 1);
+        let grantee = ck_domain(None, 1);
+        let mut plain = parented_event();
+        assert!(
+            unseal_event_in_domain(&mut plain, &owner)
+                .unwrap()
+                .is_none()
+        );
+        assert!(unseal_event_in_domain(&mut parented_event(), &grantee).is_err());
+        let mut old = parented_event();
+        seal_event(&mut old, &keys, 9, None).unwrap();
+        assert!(unseal_event_in_domain(&mut old.clone(), &owner).is_ok());
+        assert!(unseal_event_in_domain(&mut old.clone(), &grantee).is_err());
+        rewrap_event(&mut old, &account, &owner).unwrap();
+        let destination = ZaKeyDomain::shared(
+            9,
+            8,
+            None,
+            43,
+            [8; 16],
+            std::collections::BTreeMap::from([(1, Secret::from_bytes([6; 32]))]),
+            false,
+        )
+        .unwrap();
+        let before = old.clone();
+        rewrap_event(&mut old, &owner, &destination).unwrap();
+        let mut before_content = before;
+        let mut after_content = old.clone();
+        root_entries(&mut before_content).pop();
+        root_entries(&mut after_content).pop();
+        assert_eq!(before_content, after_content);
+        assert!(unseal_event_in_domain(&mut old.clone(), &destination).is_err());
+        old.names[0].parent_id = 43;
+        unseal_event_in_domain(&mut old, &destination).unwrap();
+        let mut expected = parented_event();
+        expected.names[0].parent_id = 43;
+        assert_eq!(old, expected);
+    }
+
+    fn journal_domain(keys: &SessionKeys, reverting: bool) -> ZaKeyDomain {
+        ZaKeyDomain::shared(
+            9,
+            9,
+            Some(keys.ewk().clone()),
+            42,
+            [7; 16],
+            std::collections::BTreeMap::from([(1, Secret::from_bytes([3; 32]))]),
+            reverting,
+        )
+        .unwrap()
+    }
+
+    fn linked_event() -> CalendarEvent {
+        let mut event = parented_event();
+        event.names.push(common::DavName {
+            parent_id: 51,
+            name: "copy.ics".into(),
+        });
+        event
+    }
+
+    fn assert_journal_read(reverting: bool, ewk_wrapped: bool) {
+        let keys = keys();
+        let domain = journal_domain(&keys, reverting);
+        let original = linked_event();
+        let mut input = original.clone();
+        let pairs = two_pairs();
+        if ewk_wrapped {
+            seal_event(&mut input, &keys, 9, Some(&pairs)).unwrap();
+        }
+        let stored = archive(&input);
+        let mut opened = stored.deserialize::<CalendarEvent>().unwrap();
+        let returned = unseal_event_in_domain(&mut opened, &domain).unwrap();
+        assert_eq!(opened, original);
+        let extracted = event_pairs_in_domain(&stored, &domain).unwrap();
+        for actual in [returned, extracted] {
+            if ewk_wrapped {
+                let actual = actual.unwrap();
+                assert_eq!(actual.len(), 2);
+                assert_eq!(actual.get("a@example.com"), Some(&[1; TOKEN_LEN]));
+                assert_eq!(actual.get("b@example.com"), Some(&[2; TOKEN_LEN]));
+            } else {
+                assert!(actual.is_none());
+            }
+        }
+        let view = event_view_in_domain(&stored, &domain).unwrap();
+        assert_eq!(view.version, stored.version);
+        assert_eq!(view.deserialize::<CalendarEvent>().unwrap(), original);
+        assert_eq!(stored.deserialize::<CalendarEvent>().unwrap(), input);
+    }
+
+    #[test]
+    fn unconverted_owner_reads_linked_legacy_archive() {
+        assert_journal_read(false, false);
+    }
+    #[test]
+    fn unconverted_owner_reads_linked_ewk_archive() {
+        assert_journal_read(false, true);
+    }
+    #[test]
+    fn reverting_owner_reads_linked_legacy_archive() {
+        assert_journal_read(true, false);
+    }
+    #[test]
+    fn reverting_owner_reads_linked_ewk_archive() {
+        assert_journal_read(true, true);
+    }
+
+    fn assert_domain_reads_refused(input: &CalendarEvent, domain: &ZaKeyDomain) {
+        let stored = archive(input);
+        assert!(
+            unseal_event_in_domain(&mut stored.deserialize::<CalendarEvent>().unwrap(), domain)
+                .is_err()
+        );
+        assert!(event_pairs_in_domain(&stored, domain).is_err());
+        assert!(event_view_in_domain(&stored, domain).is_err());
+    }
+
+    #[test]
+    fn journal_reads_require_requested_parent_and_grantees_require_ck() {
+        let keys = keys();
+        let grantee = ck_domain(None, 1);
+        for reverting in [false, true] {
+            let owner = journal_domain(&keys, reverting);
+            for ewk_wrapped in [false, true] {
+                let mut input = linked_event();
+                if ewk_wrapped {
+                    seal_event(&mut input, &keys, 9, Some(&two_pairs())).unwrap();
+                }
+                assert_domain_reads_refused(&input, &grantee);
+                let mut sole = input.clone();
+                sole.names.pop();
+                assert_domain_reads_refused(&sole, &grantee);
+                input.names[0].parent_id = 43;
+                assert_domain_reads_refused(&input, &owner);
+            }
+        }
+    }
+
+    #[test]
+    fn linked_ck_reads_and_all_linked_shared_writes_remain_refused() {
+        let keys = keys();
+        let account = ZaKeyDomain::owner(&keys);
+        let owner = journal_domain(&keys, false);
+        let grantee = ck_domain(None, 1);
+        let mut ck = parented_event();
+        seal_event_in_domain(&mut ck, &owner, None).unwrap();
+        ck.names.push(common::DavName {
+            parent_id: 51,
+            name: "copy.ics".into(),
+        });
+        let mut ewk = linked_event();
+        seal_event(&mut ewk, &keys, 9, Some(&two_pairs())).unwrap();
+        for reverting in [false, true] {
+            let domain = journal_domain(&keys, reverting);
+            assert_domain_reads_refused(&ck, &domain);
+            assert_domain_reads_refused(&ck, &grantee);
+            let mut plain = linked_event();
+            let before = plain.clone();
+            assert!(seal_event_in_domain(&mut plain, &domain, None).is_err());
+            assert_eq!(plain, before);
+            for input in [linked_event(), ewk.clone(), ck.clone()] {
+                let stored = archive(&input);
+                for (from, to) in [(&domain, &account), (&domain, &domain), (&account, &domain)] {
+                    let mut changed = stored.deserialize::<CalendarEvent>().unwrap();
+                    assert!(rewrap_event(&mut changed, from, to).is_err());
+                    assert_eq!(changed, input);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn classifier_rejects_plaintext_mixed_with_a_valid_key_carrier() {
+        let mut sealed = parented_event();
+        seal_event(&mut sealed, &keys(), 9, None).unwrap();
+        let mut mixed = parented_event();
+        mixed.data.event.components[0].entries.push(
+            sealed.data.event.components[0]
+                .entries
+                .last()
+                .unwrap()
+                .clone(),
+        );
+        assert!(classify_event_storage(&mixed).is_err());
+    }
+
+    #[test]
+    fn rewrap_into_shared_refuses_linked_sources() {
+        let keys = keys();
+        let mut sealed = parented_event();
+        sealed.names.push(common::DavName {
+            parent_id: 51,
+            name: "copy.ics".into(),
+        });
+        seal_event(&mut sealed, &keys, 9, None).unwrap();
+        assert!(
+            rewrap_event(
+                &mut sealed,
+                &super::super::domain::ZaKeyDomain::owner(&keys),
+                &ck_domain(None, 1)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn client_x_za_properties_round_trip_in_bundles() {
+        let mut e = parented_event();
+        for component in [0, 1] {
+            for carrier in [KEY_PROP, EXTRA_PROP, SEALED_PROP] {
+                e.data.event.components[component]
+                    .entries
+                    .push(text_entry(carrier, "client value".into()));
+            }
+        }
+        let original = e.clone();
+        let ck = ck_domain(None, 1);
+        seal_event_in_domain(&mut e, &ck, None).unwrap();
+        let mut e = archive(&e).deserialize::<CalendarEvent>().unwrap();
+        assert_eq!(
+            classify_event_storage(&e).unwrap(),
+            ZaEventStorageKind::Sealed
+        );
+        unseal_event_in_domain(&mut e, &ck).unwrap();
+        assert_eq!(e, original);
     }
 
     #[test]

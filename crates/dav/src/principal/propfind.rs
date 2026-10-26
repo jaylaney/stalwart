@@ -24,10 +24,15 @@ use dav_proto::schema::{
 };
 use groupware::RFC_3986;
 use groupware::cache::GroupwareCache;
+use groupware::calendar::{Calendar, sharing::resolve::za_foreign_calendar_eligible};
 use hyper::StatusCode;
 use std::borrow::Cow;
+use store::{
+    ValueKey,
+    write::{AlignedBytes, Archive},
+};
 use trc::AddContext;
-use types::collection::Collection;
+use types::collection::{Collection, SyncCollection};
 
 pub(crate) trait PrincipalPropFind: Sync + Send {
     fn prepare_principal_propfind_response(
@@ -390,6 +395,33 @@ impl PrincipalPropFind for Server {
     }
 }
 
+/// Discovery must obey the same fresh, exact own-id eligibility as calendar listings.
+pub(crate) async fn foreign_home_visible(
+    server: &Server,
+    token: &AccessToken,
+    owner: u32,
+) -> trc::Result<bool> {
+    if owner == token.account_id() || !server.za_is_key_account(owner).await? {
+        return Ok(true);
+    }
+    let resources = server
+        .fetch_dav_resources(token.account_id(), owner, SyncCollection::Calendar)
+        .await?;
+    for id in resources.document_ids(true) {
+        if let Some(stored) = server
+            .store()
+            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(owner, Collection::Calendar, id))
+            .await?
+        {
+            let calendar = stored.deserialize::<Calendar>()?;
+            if za_foreign_calendar_eligible(token, &calendar.acls) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) async fn build_home_set(
     server: &Server,
     access_token: &AccessToken,
@@ -413,6 +445,9 @@ pub(crate) async fn build_home_set(
     if !server.core.groupware.assisted_discovery && account_id == access_token.account_id() {
         for account_id in access_token.all_ids_by_collection(collection) {
             if account_id != access_token.account_id() {
+                if is_calendar && !foreign_home_visible(server, access_token, account_id).await? {
+                    continue;
+                }
                 let other = server
                     .account(account_id)
                     .await

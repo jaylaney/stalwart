@@ -554,6 +554,15 @@ impl AccessToken {
             }))
     }
 
+    /// Inspect only explicit collection access; group membership and the
+    /// Impersonate shortcut are not an authorization grant.
+    pub fn has_shared_access(&self, account_id: u32, collection: Collection) -> bool {
+        self.inner
+            .access_to
+            .iter()
+            .any(|entry| entry.account_id == account_id && entry.collections.contains(collection))
+    }
+
     pub fn is_member(&self, account_id: u32) -> bool {
         self.inner.account_id == account_id
             || self.inner.member_of.contains(&account_id)
@@ -1016,5 +1025,30 @@ fn hash_credential_permissions(hasher: &mut AHasher, permissions: &structs::Cred
             3u8.hash(hasher);
             permissions.permissions.as_slice().hash(hasher);
         }
+    }
+}
+
+#[cfg(test)]
+mod sharing_access_tests {
+    use super::*;
+
+    #[test]
+    fn shared_access_never_uses_membership_or_impersonate() {
+        let admin = AccessToken::new_admin();
+        assert!(admin.is_member(9201));
+        assert!(!admin.has_shared_access(9201, Collection::Calendar));
+        let mut inner = AccessTokenInner::from_id(9202);
+        inner.member_of.push(9201);
+        let token = AccessToken::new_maybe_invalid(Arc::new(inner.clone()));
+        assert!(!token.has_shared_access(9201, Collection::Calendar));
+        inner.access_to = vec![AccessTo {
+            account_id: 9201,
+            collections: Bitmap::new().with_item(Collection::Calendar),
+        }]
+        .into_boxed_slice();
+        let token = AccessToken::new_maybe_invalid(Arc::new(inner));
+        assert!(token.has_shared_access(9201, Collection::Calendar));
+        assert!(!token.has_shared_access(9201, Collection::CalendarEvent));
+        assert!(!token.has_shared_access(9202, Collection::Calendar));
     }
 }

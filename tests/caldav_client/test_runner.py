@@ -8,14 +8,230 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import patch
 import sys
 import unittest
 
+import pytest
 import runner
 
 
 class RunnerTests(unittest.TestCase):
+    def test_collection_requires_exact_mode_lists_and_unique_nonempty_ids(self):
+        existing = json.loads((runner.HERE / "collection.json").read_text())["plain"]
+        self.assertEqual(len(existing), 72)
+        names = [
+            "flows/test_shared_calendar_view_and_edit",
+            "flows/test_shared_calendar_properties_and_etags",
+            "flows/test_shared_calendar_revoke_regrant_rename_and_sync",
+            "flows/test_shared_calendar_delegated_invitation_update_cancel",
+            "flows/test_shared_calendar_own_and_shared_replies_and_sole_decline",
+        ]
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "collection.json"
+            valid = {"plain": existing, "key": existing + names}
+            path.write_text(json.dumps(valid))
+            self.assertEqual(runner.read_collection("plain", path), set(existing))
+            self.assertEqual(runner.read_collection("key", path), set(existing + names))
+            for bad in ([], {"plain": existing}, {"plain": [], "key": names},
+                        {"plain": existing, "key": existing + names, "other": []},
+                        {"plain": existing + [existing[0]], "key": existing + names},
+                        {"plain": existing, "key": existing + [""]},
+                        {"plain": existing, "key": existing + [3]}):
+                with self.subTest(bad=type(bad).__name__):
+                    path.write_text(json.dumps(bad))
+                    with self.assertRaises(ValueError):
+                        runner.read_collection("plain", path)
+            path.write_text(json.dumps(valid))
+            with self.assertRaises(ValueError):
+                runner.read_collection("missing", path)
+
+    def test_checked_in_collection_requires_72_plain_and_77_key_cases(self):
+        plain = runner.read_collection("plain")
+        key = runner.read_collection("key")
+        self.assertEqual(len(plain), 72)
+        self.assertEqual(len(key), 77)
+        self.assertEqual(key - plain, {
+            "flows/test_shared_calendar_view_and_edit",
+            "flows/test_shared_calendar_properties_and_etags",
+            "flows/test_shared_calendar_revoke_regrant_rename_and_sync",
+            "flows/test_shared_calendar_delegated_invitation_update_cancel",
+            "flows/test_shared_calendar_own_and_shared_replies_and_sole_decline",
+        })
+
+    def test_runner_selects_sharing_file_only_for_key_mode(self):
+        users = [{"url": "http://127.0.0.1/dav/cal/alice/", "username": "alice",
+                  "password": "fixture"}] * 3
+        selections = []
+
+        def fake_run(command, **kwargs):
+            selections.append((command, kwargs["env"]["CALDAV_CI_MODE"]))
+            return subprocess.CompletedProcess(command, 0)
+
+        with tempfile.TemporaryDirectory() as raw, \
+                patch.object(runner, "materialize_source") as materialize, \
+                patch.object(runner.subprocess, "run", fake_run):
+            def create_suite(source, destination):
+                (destination / "tests").mkdir(parents=True)
+            materialize.side_effect = create_suite
+            for mode in ("plain", "key"):
+                work = Path(raw) / mode
+                work.mkdir()
+                runner.run_suite(Path(raw), users, mode, work)
+        self.assertEqual(len(selections), 2)
+        for command, mode in selections:
+            self.assertIn(str(runner.HERE / "test_flows.py"), command)
+            self.assertEqual(str(runner.HERE / "test_sharing.py") in command, mode == "key")
+
+    def test_public_sharing_api_error_does_not_disclose_response_or_credentials(self):
+        import test_sharing
+        user = {"url": "http://127.0.0.1:1234/dav/cal/alice/",
+                "username": "alice", "password": "sentinel-password"}
+        failure = runner.urllib.error.HTTPError(
+            "http://127.0.0.1:1234/api/vault/shares/grant", 409, "conflict", {},
+            io.BytesIO(b'{"error":"sentinel-response"}'))
+        with patch.object(test_sharing.request, "build_opener") as opener:
+            opener.return_value.open.side_effect = failure
+            with self.assertRaisesRegex(AssertionError, "HTTP 409") as raised:
+                test_sharing.api(user, "shares/grant", calendar="fixture", address="bob",
+                                 level="view")
+        self.assertNotIn("sentinel-password", str(raised.exception))
+        self.assertNotIn("sentinel-response", str(raised.exception))
+
+    def test_public_sharing_api_returns_only_selected_response_fields(self):
+        import test_sharing
+        user = {"url": "http://127.0.0.1:1234/dav/cal/alice/",
+                "username": "alice", "password": "fixture"}
+        response = io.BytesIO(b'{"fingerprint":"display-value","other":"secret"}')
+        response.status = 200
+        with patch.object(test_sharing.request, "build_opener") as opener:
+            opener.return_value.open.return_value = response
+            result = test_sharing.api(user, "contacts/lookup", address="bob")
+        self.assertEqual(result, {"fingerprint": "display-value"})
+
+    def test_public_sharing_api_failures_do_not_expose_decoded_sentinels_under_pytest(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            test = root / "test_api_failures.py"
+            test.write_text('''
+import io
+import json
+import os
+from types import SimpleNamespace
+import pytest
+import test_sharing
+
+USER = {"url": "http://127.0.0.1:1234/dav/cal/alice/",
+        "username": "alice", "password": "fixture"}
+RECIPIENT = {"username": "bob"}
+
+@pytest.mark.parametrize("case", ["nonobject", "pin", "grant", "revoke"])
+def test_safe_failure(case, monkeypatch):
+    secret = os.environ["API_RESPONSE_SENTINEL"]
+    if case == "nonobject":
+        reply = io.BytesIO(json.dumps([secret]).encode())
+        reply.status = 200
+        opener = SimpleNamespace(open=lambda *args, **kwargs: reply)
+        monkeypatch.setattr(test_sharing.request, "build_opener", lambda *args: opener)
+        test_sharing.api(USER, "contacts/lookup", address="bob")
+    else:
+        payloads = {"pin": {"fingerprint": [secret]},
+                    "grant": {"ok": [secret], "changed": True},
+                    "revoke": {"ok": True, "changed": [secret]}}
+        monkeypatch.setattr(test_sharing, "api", lambda *args, **kwargs: payloads[case])
+        if case == "pin":
+            test_sharing.pin(USER, RECIPIENT)
+        elif case == "grant":
+            test_sharing.grant(USER, "shared", RECIPIENT, "view")
+        else:
+            test_sharing.revoke(USER, "shared", RECIPIENT)
+''')
+            secret = "runtime-response-sentinel"
+            env = {**os.environ, "PYTHONPATH": str(runner.HERE),
+                   "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "PYTEST_ADDOPTS": "",
+                   "API_RESPONSE_SENTINEL": secret}
+            result = subprocess.run([sys.executable, "-m", "pytest", "-q", str(test)],
+                                    cwd=root, env=env, text=True, capture_output=True)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 1, output)
+            self.assertIn("4 failed", output)
+            self.assertNotIn(secret, output)
+
+    def test_owned_poll_rejects_matching_event_observed_after_deadline(self):
+        import test_sharing
+        now = [0.0]
+        client = SimpleNamespace(timeout=None)
+        event = SimpleNamespace(url="http://fixture/dav/cal/bob/default/x.ics",
+                                load=lambda: None)
+
+        def late_event(uid):
+            now[0] = 16.0
+            return event
+
+        calendar = SimpleNamespace(url="http://fixture/dav/cal/bob/default/",
+                                   event_by_uid=late_event)
+        principal = SimpleNamespace(client=client, calendars=lambda: [calendar])
+        with patch.object(test_sharing.time, "monotonic", side_effect=lambda: now[0]), \
+                self.assertRaises(pytest.fail.Exception):
+            test_sharing.poll_owned(principal, "bob", "x")
+        self.assertIsNone(client.timeout)
+
+    def test_source_poll_rejects_late_match_and_restores_transport_timeout(self):
+        import test_sharing
+        now = [0.0]
+        client = SimpleNamespace(timeout=27)
+
+        def late_read():
+            self.assertEqual(client.timeout, 15)
+            now[0] = 16.0
+            return "accepted"
+
+        with patch.object(test_sharing.time, "monotonic", side_effect=lambda: now[0]), \
+                self.assertRaises(pytest.fail.Exception):
+            test_sharing.poll_state(client, late_read, lambda value: value == "accepted",
+                                    "source state")
+        self.assertEqual(client.timeout, 27)
+
+    def test_source_poll_timeout_is_fatal_and_restores_transport_timeout(self):
+        import test_sharing
+        client = SimpleNamespace(timeout=None)
+        seen = []
+
+        def timed_out():
+            seen.append(client.timeout)
+            raise TimeoutError("fixture timeout")
+
+        with self.assertRaises(TimeoutError):
+            test_sharing.poll_state(client, timed_out, lambda value: True, "source state")
+        self.assertEqual(len(seen), 1)
+        self.assertGreater(seen[0], 0)
+        self.assertLessEqual(seen[0], 15)
+        self.assertIsNone(client.timeout)
+
+    def test_actor_discovery_matches_encoded_owner_to_literal_at_href(self):
+        import test_sharing
+        from types import SimpleNamespace
+        owner = "http://127.0.0.1/dav/cal/alice%40example.test/shared/"
+        discovered = SimpleNamespace(url="http://127.0.0.1/dav/cal/alice@example.test/shared/")
+        private = SimpleNamespace(url="http://127.0.0.1/dav/cal/alice@example.test/private/")
+        principal = SimpleNamespace(calendars=lambda: [discovered, private])
+        self.assertIs(test_sharing.actor_calendar(principal, owner), discovered)
+
+    def test_dav_status_helper_distinguishes_401_from_403(self):
+        import test_sharing
+        from types import SimpleNamespace
+        for status in (401, 403):
+            with self.subTest(status=status):
+                response = SimpleNamespace(status_code=status)
+                session = SimpleNamespace(request=lambda *args, **kwargs: response)
+                client = SimpleNamespace(auth=object(), session=session, timeout=10,
+                                         ssl_verify_cert=True, ssl_cert=None,
+                                         _prepare_request=lambda *args: ("http://fixture", {}))
+                with patch.object(test_sharing, "DAVResponse", return_value=response):
+                    observed, _ = test_sharing.dav(client, "http://fixture")
+                self.assertEqual(observed, status)
+
     def test_jmap_partial_error_is_fatal_and_does_not_disclose_response(self):
         response = {"methodResponses": [["x:Account/set", {
             "created": {"a": {"id": "1"}},
@@ -186,7 +402,8 @@ class RunnerTests(unittest.TestCase):
                     "outcome": "xfailed", "exception": "AssertionError", "reason": "fixture",
                     "source": "fixture", "failure": {"file": "test_sample.py", "line": line}}}}}
                 (root / "policy.json").write_text(json.dumps(policy))
-                (root / "collection.json").write_text('["calendar/testKnown"]')
+                (root / "collection.json").write_text(json.dumps({
+                    "plain": ["calendar/testKnown"], "key": ["calendar/testKnown"]}))
                 (root / "conftest.py").write_text(
                     "from pathlib import Path\nimport policy_plugin\n"
                     "policy_plugin.HERE = Path(__file__).parent\n")
@@ -238,17 +455,20 @@ class RunnerTests(unittest.TestCase):
                     self.assertIn("forbidden", result.stdout + result.stderr)
                     self.assertFalse(sentinel.exists())
 
-    def policy_case(self, root, source, outcomes=None, features=None, expected=None):
-        test = root / "test_sample.py"
+    def policy_case(self, root, source, outcomes=None, features=None, expected=None,
+                    mode="plain", filename="test_sample.py"):
+        test = root / filename
         test.write_text(source)
-        (root / "policy.json").write_text(json.dumps({"plain": {
+        (root / "policy.json").write_text(json.dumps({mode: {
             "features": features or {}, "outcomes": outcomes or {}}}))
-        (root / "collection.json").write_text(json.dumps(
-            expected if expected is not None else ["calendar/testKnown"]))
+        cases = expected if expected is not None else ["calendar/testKnown"]
+        (root / "collection.json").write_text(json.dumps({
+            "plain": cases if mode == "plain" else ["calendar/testKnown"],
+            "key": cases if mode == "key" else ["calendar/testKnown"]}))
         (root / "conftest.py").write_text(
             "from pathlib import Path\nimport policy_plugin\n"
             "policy_plugin.HERE = Path(__file__).parent\n")
-        env = {**os.environ, "PYTHONPATH": str(runner.HERE), "CALDAV_CI_MODE": "plain",
+        env = {**os.environ, "PYTHONPATH": str(runner.HERE), "CALDAV_CI_MODE": mode,
                "CALDAV_CI_POLICY": str(root / "policy.json"),
                "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1", "PYTEST_ADDOPTS": ""}
         return subprocess.run([sys.executable, "-m", "pytest", "-p", "policy_plugin", "-q",
@@ -298,6 +518,18 @@ class RunnerTests(unittest.TestCase):
                 result = self.policy_case(root, "class TestForServerStalwartPlain:\n"
                                          "    def testKnown(self):\n"
                                          "        open('ran', 'w').close()\n", expected=expected)
+                self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+                self.assertFalse((root / "ran").exists())
+
+    def test_key_sharing_manifest_rejects_missing_and_extra_cases_before_execution(self):
+        name = "flows/test_shared_calendar_view_and_edit"
+        source = ("def test_shared_calendar_view_and_edit():\n"
+                  "    open('ran', 'w').close()\n")
+        for cases in (["calendar/testKnown"], [name, "flows/test_unexpected_sharing"]):
+            with self.subTest(cases=cases), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                result = self.policy_case(root, source, expected=cases, mode="key",
+                                          filename="test_sharing.py")
                 self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
                 self.assertFalse((root / "ran").exists())
 

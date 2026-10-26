@@ -206,6 +206,53 @@ pub async fn acl(test: &TestServer) {
     jane.request("PROPFIND", "/dav/cal/john@example.com/default/", "")
         .await
         .with_status(StatusCode::FORBIDDEN);
+    // The public pin/grant endpoint is the only path to a collection grant.
+    let owner = test.account("john@example.com");
+    let reader = test.account("jane@example.com");
+    let key = test
+        .server
+        .za_served_public_key(reader.id().document_id())
+        .await
+        .unwrap()
+        .unwrap();
+    crate::utils::za::za_post("contacts/pin", &serde_json::json!({"username":owner.name(),"password":owner.secret(),"address":reader.name(),"fingerprint":vault::keys::display_fingerprint(&key)})).await.expect(200);
+    let mut sharing = serde_json::json!({"username":owner.name(),"password":owner.secret(),"calendar":"default","address":reader.name(),"level":"view"});
+    crate::utils::za::za_post("shares/grant", &sharing)
+        .await
+        .expect(200);
+    jane.request("PROPFIND", "/dav/cal/john@example.com/default/", "")
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    jane.request_with_headers(
+        "PUT",
+        "/dav/cal/john@example.com/default/shared.ics",
+        [("content-type", "text/calendar")],
+        TEST_ICAL_1,
+    )
+    .await
+    .with_status(StatusCode::FORBIDDEN);
+    sharing["level"] = serde_json::json!("edit");
+    crate::utils::za::za_post("shares/grant", &sharing)
+        .await
+        .expect(200);
+    jane.request_with_headers(
+        "PUT",
+        "/dav/cal/john@example.com/default/shared.ics",
+        [("content-type", "text/calendar")],
+        TEST_ICAL_1,
+    )
+    .await
+    .with_status(StatusCode::CREATED);
+    john.request("GET", "/dav/cal/john@example.com/default/shared.ics", "")
+        .await
+        .with_status(StatusCode::OK);
+    crate::utils::za::za_post("shares/revoke", &serde_json::json!({"username":owner.name(),"password":owner.secret(),"calendar":"default","grant":reader.id().document_id()})).await.expect(200);
+    jane.request("GET", "/dav/cal/john@example.com/default/shared.ics", "")
+        .await
+        .with_status(StatusCode::FORBIDDEN);
+    john.request("DELETE", "/dav/cal/john@example.com/default/shared.ics", "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
     // A key account that is a group member reads the group's calendar (Review Focus 1).
     jane.request_with_headers(
         "PUT",

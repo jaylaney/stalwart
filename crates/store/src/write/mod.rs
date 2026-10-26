@@ -345,6 +345,18 @@ pub enum Param {
 #[repr(transparent)]
 pub struct Params(Vec<Param>);
 
+impl Params {
+    fn accounted_input_bytes(&self) -> usize {
+        self.0.iter().fold(0usize, |total, parameter| {
+            total.saturating_add(16).saturating_add(match parameter {
+                Param::String(value) => value.len(),
+                Param::Bytes(value) => value.len(),
+                Param::I64(_) | Param::U64(_) | Param::Bool(_) => 0,
+            })
+        })
+    }
+}
+
 pub type SetFnc = fn(&Params, &AssignedIds) -> trc::Result<Vec<u8>>;
 pub type MergeFnc = fn(&Params, &AssignedIds, Option<&[u8]>) -> trc::Result<MergeResult>;
 

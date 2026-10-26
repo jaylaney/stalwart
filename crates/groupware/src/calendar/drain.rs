@@ -67,12 +67,14 @@ use crate::{
     calendar::{
         CalendarEvent, CalendarEventData, CalendarEventNotification, ChangedBy,
         EVENT_NOTIFICATION_IS_CHANGE,
-        fanout::{ZaFanOut, ZaFanOutKind, ZaSource, za_set_schedule_status},
+        fanout::{ZaFanOut, ZaFanOutKind, ZaFanOutMessage, ZaSource, za_set_schedule_status},
         seal::{
             PendingCarriers, SealError, TOKEN_LEN, TokenPairs, archived_item_is_pending,
-            open_pending_item, seal_drained_item, seal_error, seal_event, unseal_event_pairs,
+            open_pending_item, seal_drained_item, seal_error, seal_event_in_domain,
+            unseal_event_in_domain,
         },
         sequence::za_set_sequences,
+        sharing::resolve::{za_owned_calendar_context, za_owned_event_contexts},
         storage::ItipAutoExpunge,
     },
     scheduling::{
@@ -630,7 +632,7 @@ async fn apply(
     carriers: PendingCarriers,
     method: Method,
     uid: &str,
-    candidates: Vec<String>,
+    candidates: Vec<ZaSenderCandidate>,
 ) -> trc::Result<bool> {
     let server = ctx.server;
     let account_id = ctx.keys.account_id;
@@ -642,22 +644,49 @@ async fn apply(
     // delegators, so the sender's addresses are the candidates that
     // resolve to `changed_by`. The lookup is the quiet one (spec 10).
     let mut sender_addresses = Vec::new();
+    let has_delegation = candidates
+        .iter()
+        .any(|candidate| candidate.sent_by.is_some());
     if let ChangedBy::PrincipalId(sender_id) = &ctx.changed_by {
-        for address in candidates {
-            if server
-                .za_account_id_from_email(&address)
-                .await
-                .caused_by(trc::location!())?
-                == Some(*sender_id)
-            {
-                sender_addresses.push(address);
+        for candidate in candidates {
+            let verified = if let Some(sent_by) = &candidate.sent_by {
+                // Empty is the private invalid-present sentinel. Never treat
+                // malformed or non-mailto SENT-BY as ordinary absence.
+                if sent_by.is_empty() {
+                    false
+                } else {
+                    let sent_by_id = server
+                        .za_account_id_from_email(sent_by)
+                        .await
+                        .caused_by(trc::location!())?;
+                    let named_id = server
+                        .za_account_id_from_email(&candidate.named)
+                        .await
+                        .caused_by(trc::location!())?;
+                    sent_by_id == Some(*sender_id)
+                        && named_id.is_some_and(|named_id| named_id != *sender_id)
+                        && server.za_is_key_account(*sender_id).await?
+                        && server.za_is_key_account(named_id.unwrap()).await?
+                }
+            } else {
+                server
+                    .za_account_id_from_email(&candidate.named)
+                    .await
+                    .caused_by(trc::location!())?
+                    == Some(*sender_id)
+            };
+            if verified && !sender_addresses.contains(&candidate.named) {
+                sender_addresses.push(candidate.named);
             }
         }
     }
     if sender_addresses.is_empty() {
-        return ctx
-            .reject(tree, None, &ItipError::SenderIsNotOrganizerNorAttendee)
-            .await;
+        return if has_delegation {
+            ctx.reject_delegated(tree).await
+        } else {
+            ctx.reject(tree, None, &ItipError::SenderIsNotOrganizerNorAttendee)
+                .await
+        };
     }
     // Step 3, by METHOD. The UID lookup is upstream's (the fresh index);
     // the lowest document id is the copy that merges, as `itip_ingest`
@@ -719,20 +748,71 @@ async fn find_event(server: &Server, account_id: u32, uid: &str) -> trc::Result<
 /// its delegates' and delegators' (`attendee.rs`, `attendee_entry_uids`)
 /// and a set's iteration order says nothing about which one replied.
 /// Deduplicated case-insensitively, first occurrence kept.
-fn sender_candidates(snapshots: &ItipSnapshots<'_>, method: Method) -> Vec<String> {
-    match method {
-        Method::Reply => {
-            let mut seen = AHashSet::new();
-            snapshots
-                .components
-                .values()
-                .flat_map(|instance| instance.attendees.iter())
-                .map(|attendee| attendee.email.email.clone())
-                .filter(|address| seen.insert(address.to_ascii_lowercase()))
-                .collect()
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+struct ZaSenderCandidate {
+    named: String,
+    // Some("") records present but invalid input, distinct from actual absence.
+    sent_by: Option<String>,
+}
+
+fn sender_candidates(snapshots: &ItipSnapshots<'_>, method: Method) -> Vec<ZaSenderCandidate> {
+    use calcard::icalendar::{ICalendarParameterName, ICalendarProperty};
+    let mut seen = AHashSet::new();
+    let mut candidates = Vec::new();
+    for snapshot in snapshots.components.values() {
+        for entry in &snapshot.comp.entries {
+            let property = match method {
+                Method::Reply => ICalendarProperty::Attendee,
+                Method::Request | Method::Cancel => ICalendarProperty::Organizer,
+            };
+            if entry.name != property {
+                continue;
+            }
+            let Some(named) = entry
+                .values
+                .first()
+                .and_then(|value| value.as_text())
+                .and_then(|value| crate::scheduling::Email::new(value, &[]))
+            else {
+                continue;
+            };
+            let sent_by = entry
+                .params
+                .iter()
+                .find(|param| param.name == ICalendarParameterName::SentBy)
+                .map(|param| {
+                    // Only a location URI can assert a mailto sender. A
+                    // data URI's as_text() is its content type, not its URI.
+                    let uri = match &param.value {
+                        calcard::icalendar::ICalendarParameterValue::Uri(
+                            calcard::icalendar::Uri::Location(value),
+                        ) => Some(value.as_str()),
+                        _ => None,
+                    };
+                    uri.filter(|value| {
+                        value
+                            .split_once(':')
+                            .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("mailto"))
+                    })
+                    .and_then(|value| {
+                        common::auth::vault::za_normalize_address(&crate::decode_mailto_address(
+                            value,
+                        ))
+                    })
+                    .unwrap_or_default()
+                });
+            let candidate = ZaSenderCandidate {
+                named: named.email,
+                sent_by,
+            };
+            // Distinct SENT-BY assertions are distinct candidates, even for
+            // the same named attendee across multiple components.
+            if seen.insert(candidate.clone()) {
+                candidates.push(candidate);
+            }
         }
-        Method::Request | Method::Cancel => vec![snapshots.organizer.email.email.clone()],
     }
+    candidates
 }
 
 /// Spec 6.4, REPLY: stale when any instance of the reply carries a
@@ -888,7 +968,14 @@ async fn import(
         ..Default::default()
     };
     // Spec 3.3, "Attendee side": the copy takes the pair the item carried.
-    seal_event(&mut event, ctx.keys, account_id, pair.as_ref())
+    let context = za_owned_calendar_context(server, ctx.keys, parent_id)
+        .await
+        .map_err(|error| error.into_store_error(account_id, parent_id))?;
+    let context =
+        crate::calendar::sharing::boundary::za_repair_owned_context(server, ctx.keys, context)
+            .await
+            .map_err(|error| error.into_store_error(account_id, parent_id))?;
+    seal_event_in_domain(&mut event, &context.domain, pair.as_ref())
         .map_err(|err| seal_error(err, account_id, u32::MAX))?;
     let document_id = server
         .store()
@@ -901,6 +988,7 @@ async fn import(
     // Spec 6.3 step 3: fenced on the lease, with the item rewrite ahead of
     // the insert (one write; see the module doc).
     lease.lease().assert_in(&mut batch);
+    context.assert_in(&mut batch);
     ctx.rewrite_in(&mut batch, tree, Some(document_id), 0)?;
     event
         .insert(
@@ -1020,7 +1108,19 @@ async fn merge(
     let mut event = event_
         .deserialize::<CalendarEvent>()
         .caused_by(trc::location!())?;
-    let mut pairs = unseal_event_pairs(&mut event, ctx.keys, account_id)
+    let parent_id = event
+        .names
+        .first()
+        .ok_or_else(|| trc::StoreEvent::DataCorruption.into_err())?
+        .parent_id;
+    let contexts = za_owned_event_contexts(server, ctx.keys, &event, parent_id)
+        .await
+        .map_err(|error| error.into_store_error(account_id, event_id))?;
+    let contexts =
+        crate::calendar::sharing::boundary::za_repair_owned_contexts(server, ctx.keys, contexts)
+            .await
+            .map_err(|error| error.into_store_error(account_id, event_id))?;
+    let mut pairs = unseal_event_in_domain(&mut event, &contexts[0].domain)
         .map_err(|err| seal_error(err, account_id, event_id))?;
     // Spec 3.3, "Verification": a REPLY is authenticated by the replier's
     // token in this event's bundle, matched by address. A sender none of
@@ -1214,8 +1314,13 @@ async fn merge(
                     let fan_out = match server
                         .za_fan_out(
                             ctx.account_info,
+                            ctx.account_info,
+                            ctx.account_info,
                             ctx.keys,
-                            messages,
+                            messages
+                                .into_iter()
+                                .map(ZaFanOutMessage::upstream)
+                                .collect(),
                             pairs.take(),
                             &event.data.event,
                             ZaSource {
@@ -1224,6 +1329,7 @@ async fn merge(
                             },
                             ZaFanOutKind::Change,
                             reply_lease.as_ref().map(|lease| lease.lease()),
+                            None,
                         )
                         .await
                     {
@@ -1277,12 +1383,15 @@ async fn merge(
             None => event.schedule_tag = Some(1),
         }
     }
-    seal_event(&mut event, ctx.keys, account_id, pairs.as_ref())
+    seal_event_in_domain(&mut event, &contexts[0].domain, pairs.as_ref())
         .map_err(|err| seal_error(err, account_id, event_id))?;
     let mut batch = BatchBuilder::new();
     // A delegating REPLY is fenced on its lease first, as `import` is.
     if let Some(lease) = &reply_lease {
         lease.lease().assert_in(&mut batch);
+    }
+    for context in &contexts {
+        context.assert_in(&mut batch);
     }
     // The item rewrite first, ahead of the event update (one write; see
     // the module doc).
@@ -1401,6 +1510,17 @@ impl ItemCtx<'_> {
             Details = "zero-access: inbox item kept as history",
         );
         self.rewrite_only(tree, event_id, 0).await
+    }
+
+    async fn reject_delegated(&self, tree: ICalendar) -> trc::Result<bool> {
+        trc::event!(
+            Calendar(trc::CalendarEvent::ItipMessageError),
+            AccountId = self.keys.account_id,
+            DocumentId = self.document_id,
+            Reason = "zero-access: delegated sender not verified",
+            Details = "zero-access: inbox item kept as history",
+        );
+        self.rewrite_only(tree, None, 0).await
     }
 
     /// Spec 6.5, permanent: the item is deleted, since nothing can ever
@@ -1604,24 +1724,36 @@ mod tests {
         let request = event(Some(0));
         let snapshots = itip_snapshot(&request, &org, false).unwrap();
         assert_eq!(
-            sender_candidates(&snapshots, Method::Request),
+            sender_candidates(&snapshots, Method::Request)
+                .into_iter()
+                .map(|candidate| candidate.named)
+                .collect::<Vec<_>>(),
             ["org@example.com"]
         );
         assert_eq!(
-            sender_candidates(&snapshots, Method::Cancel),
+            sender_candidates(&snapshots, Method::Cancel)
+                .into_iter()
+                .map(|candidate| candidate.named)
+                .collect::<Vec<_>>(),
             ["org@example.com"]
         );
         let reply = reply(Some(0));
         let snapshots = itip_snapshot(&reply, &org, false).unwrap();
         assert_eq!(
-            sender_candidates(&snapshots, Method::Reply),
+            sender_candidates(&snapshots, Method::Reply)
+                .into_iter()
+                .map(|candidate| candidate.named)
+                .collect::<Vec<_>>(),
             ["att@example.com"]
         );
         // Both the delegator and the delegate are candidates: which one
         // replied is decided by `changed_by` and the token, never by order.
         let delegation = delegation_reply();
         let snapshots = itip_snapshot(&delegation, &org, false).unwrap();
-        let mut candidates = sender_candidates(&snapshots, Method::Reply);
+        let mut candidates = sender_candidates(&snapshots, Method::Reply)
+            .into_iter()
+            .map(|candidate| candidate.named)
+            .collect::<Vec<_>>();
         candidates.sort();
         assert_eq!(candidates, ["att@example.com", "del@example.com"]);
     }
@@ -1733,5 +1865,67 @@ mod tests {
         );
         assert_eq!(seal_reason(&SealError::Aead), "unseal failure");
         assert_eq!(DRAIN_RETRY_SECS, 30);
+    }
+
+    #[test]
+    fn candidates_preserve_sent_by_assertions_and_invalid_presence() {
+        let org = vec!["org@example.com".to_string()];
+        for (sent_by, expected) in [
+            ("MAILTO:%77riter%40example.com", "writer@example.com"),
+            ("https:writer@example.com", ""),
+            ("data:mailto:writer@example.com;base64,YQ==", ""),
+            ("mailto:invalid", ""),
+        ] {
+            let tree = event(Some(0))
+                .to_string()
+                .replace("ORGANIZER:", &format!("ORGANIZER;SENT-BY=\"{sent_by}\":"));
+            let calcard::Entry::ICalendar(tree) = calcard::Parser::new(&tree).entry() else {
+                unreachable!()
+            };
+            let snapshots = itip_snapshot(&tree, &org, false).unwrap();
+            let candidates = sender_candidates(&snapshots, Method::Request);
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].named, "org@example.com");
+            assert_eq!(candidates[0].sent_by.as_deref(), Some(expected));
+        }
+        let mut tree = recurring_event(1, Some(1), false);
+        let mut assertion = 0;
+        for component in &mut tree.components {
+            for entry in &mut component.entries {
+                if entry.name == calcard::icalendar::ICalendarProperty::Attendee {
+                    entry.params.push(calcard::icalendar::ICalendarParameter {
+                        name: calcard::icalendar::ICalendarParameterName::SentBy,
+                        value: calcard::icalendar::ICalendarParameterValue::Uri(
+                            calcard::icalendar::Uri::Location(format!(
+                                "mailto:writer{assertion}@example.com"
+                            )),
+                        ),
+                    });
+                    assertion += 1;
+                }
+            }
+        }
+        let snapshots = itip_snapshot(&tree, &org, false).unwrap();
+        let candidates = sender_candidates(&snapshots, Method::Reply);
+        assert_eq!(
+            candidates.len(),
+            2,
+            "same named address retains two SENT-BY assertions"
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.named == "att@example.com")
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.sent_by.as_deref() == Some("writer0@example.com"))
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.sent_by.as_deref() == Some("writer1@example.com"))
+        );
     }
 }

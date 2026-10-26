@@ -6,7 +6,8 @@
 
 use super::{
     Batch, BatchBuilder, ChangedCollection, IntoOperations, Operation, ValueClass, ValueOp,
-    assert::ToAssertValue, log::VanishedItem,
+    assert::ToAssertValue,
+    log::{CalendarTombstone, VanishedItem},
 };
 use crate::{
     SerializeInfallible, U32_LEN,
@@ -324,6 +325,14 @@ impl BatchBuilder {
         self
     }
 
+    /// Both log records remain in this builder until the same commit point.
+    /// Keep the legacy path bytes unchanged; only the separate log carries identity.
+    pub fn log_calendar_vanished(&mut self, calendar_id: u32, path: String) -> &mut Self {
+        let identity = CalendarTombstone::encode(calendar_id, &path);
+        self.log_vanished_item(VanishedCollection::Calendar, path)
+            .log_vanished_item(VanishedCollection::CalendarIdentity, identity)
+    }
+
     pub fn log_share_notification(
         &mut self,
         notification_id: u64,
@@ -463,6 +472,35 @@ impl BatchBuilder {
 
     pub fn ops(&self) -> &[Operation] {
         self.ops.as_slice()
+    }
+
+    /// Account the materialized operation inputs, including callback parameters.
+    ///
+    /// This is not a bound on arbitrary callback outputs. Callers imposing a
+    /// transaction payload limit must separately establish that their callbacks
+    /// do not expand these inputs. Materialize pending logs before using this.
+    pub fn accounted_input_bytes(&self) -> usize {
+        self.ops.iter().fold(0usize, |total, operation| {
+            // Reserve fixed key/tag/scalar overhead even for selector operations.
+            let bytes = 64usize.saturating_add(match operation {
+                Operation::Value { class, op } => {
+                    class.serialized_size().saturating_add(match op {
+                        ValueOp::Set(bytes) => bytes.len(),
+                        ValueOp::SetFnc(operation) => operation.params.accounted_input_bytes(),
+                        ValueOp::MergeFnc(operation) => operation.params.accounted_input_bytes(),
+                        ValueOp::AtomicAdd(_) | ValueOp::AddAndGet(_) => 16,
+                        ValueOp::Clear => 0,
+                    })
+                }
+                Operation::AssertValue { class, .. } => class.serialized_size(),
+                Operation::Index { key, .. } => key.len(),
+                Operation::Log { set, .. } => set.len(),
+                Operation::AccountId { .. }
+                | Operation::Collection { .. }
+                | Operation::DocumentId { .. } => 0,
+            });
+            total.saturating_add(bytes)
+        })
     }
 
     pub fn len(&self) -> usize {

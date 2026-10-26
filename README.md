@@ -15,10 +15,18 @@ by the user's credentials. The current work focuses on:
 - Zero-access accounts with password, recovery key, TOTP and app-password support.
 - Encryption of private event, task and journal content, plus calendar names, descriptions, colours and custom time zones.
 - Decryption during authenticated CalDAV requests so clients can use ordinary calendar data.
-- Closing features that would need a key the server does not hold: key accounts have no calendar sharing, no invitations or scheduling, no JMAP calendar access and no full-text search of calendar data in this release.
+- Local invitations and scheduling between key accounts, with delegated `SENT-BY` delivery
+  when an edit grantee schedules from the owner's calendar.
+- View/edit calendar grants to another setup-complete key account on this server, using
+  pinned recipient keys and the [vault sharing API](docs/zero-access/calendar-sharing-api.md).
+  CalDAV access uses the grantee's own credentials: view grants read, edit grants also write.
+- JMAP calendars, calendar re-sharing, free/busy-only grants, cross-server sharing and
+  key-account mail sharing remain refused or deferred. Calendar full-text search stays gated.
 
-Ordinary accounts continue to use Stalwart's existing behavior. The zero-access work covers
-calendars only. Mail, contacts and files are stored as upstream stores them.
+Ordinary accounts continue to use Stalwart's existing behavior. The fork also encrypts
+key-account mail at rest (release 3); contacts and files retain upstream storage behavior.
+Calendar sharing native-client qualification remains pending; see the
+[outcome](docs/superpowers/plans/2026-10-23-zero-access-plan14-outcome.md).
 
 An account becomes zero-access through a setup token issued by an administrator, completed on
 an account web page that lives in a separate repository and is not part of this one.
@@ -33,10 +41,16 @@ handles plaintext while serving requests, and unlocked keys remain in a bounded 
 cache. A compromised running server can capture those credentials or keys, so this model does
 not provide end-to-end encryption against the server itself.
 
-Upstream's mail-protocol raw-input traces (IMAP, POP3, ManageSieve and SMTP) record the
-authentication exchange. An operator who enables them can capture a key account's password or
-app password at login. This release records that as a known limit; the calendar is served over
-HTTP, where credentials are never traced.
+The fork redacts authentication exchanges in mail-protocol raw traces and keeps key-account
+IMAP/POP3 sessions redacted. Sharing request/response bodies and key material are not traced;
+existing authentication account-name metadata remains. These trace controls do not protect
+against a compromised running server. Logout alone does not promise immediate key erasure:
+bounded cache residency and its hard cap still apply.
+
+Removing a grantee stops fresh authorized access and rotates keys for future writes. Existing
+events are not resealed, and material the grantee could already read may have been copied.
+Cluster pubsub is required for prompt invalidation; a missed broadcast is not synchronous
+eviction of already resident keys.
 
 Some metadata remains visible, including event times, recurrence rules, identifiers, plaintext sizes,
 filenames and sync history. The

@@ -6,12 +6,22 @@
 
 use crate::keys::{KeyError, Secret, derive_event_key, derive_mail_key};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{
-        OnceLock,
+        Mutex, OnceLock, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
 };
+
+/// Identity of one collection key. A new conversion uses a fresh domain,
+/// even when its calendar and generation numbers are reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CollectionKeyId {
+    pub owner_id: u32,
+    pub calendar_id: u32,
+    pub domain_id: [u8; 16],
+    pub generation: u32,
+}
 
 /// Keys attached for one HTTP request (spec 5, "in-flight copies"; the HTTP
 /// key cache keeps them between requests under its idle and age limits,
@@ -34,6 +44,16 @@ pub struct SessionKeys {
     /// Invitations spec 6.2-6.3: what this session remembers about its
     /// drain. In memory only, dropped with the key-cache entry.
     drain: ZaDrainState,
+    /// Only unwrap results are cached; authorization and the current generation
+    /// always come from the freshly read calendar. Secrets zero themselves on drop.
+    collection_keys: Mutex<HashMap<CollectionKeyId, CachedCollectionKey>>,
+}
+
+// A witness belongs to these exact cached bytes, under the same mutex.
+// It records successful grant-ring authentication, never authorization.
+struct CachedCollectionKey {
+    key: Secret,
+    grant_ring_digest: Option<[u8; 32]>,
 }
 
 /// The drain's per-session state (invitations spec 6.2, "The cursor", and
@@ -157,6 +177,7 @@ impl SessionKeys {
             mwk,
             private_key: OnceLock::new(),
             drain: ZaDrainState::new(),
+            collection_keys: Mutex::new(HashMap::new()),
         }
     }
 
@@ -183,6 +204,86 @@ impl SessionKeys {
     /// first stands).
     pub fn set_private_key(&self, outcome: Result<Secret, KeyError>) -> bool {
         self.private_key.set(outcome).is_ok()
+    }
+
+    /// Clones the zeroizing key while holding only a short synchronous guard.
+    pub fn collection_key(&self, id: &CollectionKeyId) -> Option<Secret> {
+        self.collection_keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id)
+            .map(|cached| cached.key.clone())
+    }
+
+    pub fn cache_collection_key(&self, id: CollectionKeyId, key: Secret) {
+        self.collection_keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                id,
+                CachedCollectionKey {
+                    key,
+                    grant_ring_digest: None,
+                },
+            );
+    }
+
+    /// Returns a complete set only when every key was authenticated by these
+    /// exact whole grant-ring bytes. Callers first validate fresh ACLs, identity,
+    /// structure and the complete current generation list. No guard crosses await.
+    pub fn authenticated_collection_keys(
+        &self,
+        ids: &[CollectionKeyId],
+        ring: &[u8],
+    ) -> Option<BTreeMap<u32, Secret>> {
+        let first = ids.first()?;
+        let digest = *blake3::hash(ring).as_bytes();
+        let cache = self
+            .collection_keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut keys = BTreeMap::new();
+        for id in ids {
+            if (id.owner_id, id.calendar_id, id.domain_id)
+                != (first.owner_id, first.calendar_id, first.domain_id)
+            {
+                return None;
+            }
+            let entry = cache.get(id)?;
+            if entry.grant_ring_digest != Some(digest)
+                || keys.insert(id.generation, entry.key.clone()).is_some()
+            {
+                return None;
+            }
+        }
+        Some(keys)
+    }
+
+    /// Publish only after authenticating the whole ring. Keys and witness are
+    /// replaced atomically; a plain single-key replacement clears its witness.
+    pub fn cache_authenticated_collection_keys(
+        &self,
+        ids: &[CollectionKeyId],
+        ring: &[u8],
+        keys: &BTreeMap<u32, Secret>,
+    ) {
+        if ids.is_empty() || ids.iter().any(|id| !keys.contains_key(&id.generation)) {
+            return;
+        }
+        let digest = *blake3::hash(ring).as_bytes();
+        let mut cache = self
+            .collection_keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for id in ids {
+            cache.insert(
+                *id,
+                CachedCollectionKey {
+                    key: keys[&id.generation].clone(),
+                    grant_ring_digest: Some(digest),
+                },
+            );
+        }
     }
 
     pub fn drain(&self) -> &ZaDrainState {
@@ -247,6 +348,193 @@ impl std::fmt::Debug for SessionKeys {
 mod tests {
     use super::*;
     use crate::keys::{KeyError, Secret, derive_event_key, derive_mail_key};
+
+    #[test]
+    fn collection_cache_separates_reconversions() {
+        let keys = SessionKeys::new(7, 3, Secret::random());
+        let id = CollectionKeyId {
+            owner_id: 7,
+            calendar_id: 23,
+            domain_id: [0x41; 16],
+            generation: 1,
+        };
+        let secret = Secret::from_bytes([0xAB; 32]);
+        assert!(keys.collection_key(&id).is_none());
+        keys.cache_collection_key(id, secret.clone());
+        assert_eq!(
+            keys.collection_key(&id).unwrap().as_bytes(),
+            secret.as_bytes()
+        );
+        for different in [
+            CollectionKeyId { owner_id: 8, ..id },
+            CollectionKeyId {
+                calendar_id: 24,
+                ..id
+            },
+            CollectionKeyId {
+                domain_id: [0x42; 16],
+                ..id
+            },
+            CollectionKeyId {
+                generation: 2,
+                ..id
+            },
+        ] {
+            assert!(keys.collection_key(&different).is_none());
+        }
+        keys.cache_collection_key(id, Secret::from_bytes([0xCD; 32]));
+        assert_eq!(keys.collection_key(&id).unwrap().as_bytes(), &[0xCD; 32]);
+        assert_eq!(format!("{keys:?}"), "SessionKeys(account 7, generation 3)");
+        assert_eq!(
+            format!("{:?}", keys.collection_key(&id).unwrap()),
+            "Secret(..)"
+        );
+        drop(keys);
+        assert_eq!(secret.as_bytes(), &[0xAB; 32], "cache owns its clone");
+    }
+
+    #[test]
+    fn grant_cache_requires_one_authenticated_ring_for_every_key() {
+        let session = SessionKeys::new(710, 1, Secret::random());
+        let id = CollectionKeyId {
+            owner_id: 711,
+            calendar_id: 712,
+            domain_id: [4; 16],
+            generation: 1,
+        };
+        let ids = [
+            id,
+            CollectionKeyId {
+                generation: 2,
+                ..id
+            },
+        ];
+        let secrets = std::collections::BTreeMap::from([
+            (1, Secret::from_bytes([11; 32])),
+            (2, Secret::from_bytes([22; 32])),
+        ]);
+        session.cache_collection_key(id, secrets[&1].clone());
+        assert!(
+            session
+                .authenticated_collection_keys(&ids, b"ring-a")
+                .is_none()
+        );
+        session.cache_authenticated_collection_keys(&ids, b"ring-a", &secrets);
+        let hit = session
+            .authenticated_collection_keys(&ids, b"ring-a")
+            .unwrap();
+        assert_eq!(hit[&1].as_bytes(), &[11; 32]);
+        assert_eq!(hit[&2].as_bytes(), &[22; 32]);
+        assert!(
+            session
+                .authenticated_collection_keys(&ids, b"ring-b")
+                .is_none()
+        );
+        session.cache_collection_key(ids[1], Secret::from_bytes([33; 32]));
+        assert!(
+            session
+                .authenticated_collection_keys(&ids, b"ring-a")
+                .is_none()
+        );
+        session.cache_authenticated_collection_keys(&ids, b"ring-a", &secrets);
+        session.cache_authenticated_collection_keys(&ids[..1], b"ring-b", &secrets);
+        assert!(
+            session
+                .authenticated_collection_keys(&ids, b"ring-a")
+                .is_none()
+        );
+        assert!(
+            session
+                .authenticated_collection_keys(&ids, b"ring-b")
+                .is_none()
+        );
+        assert!(
+            session
+                .authenticated_collection_keys(&[], b"ring-a")
+                .is_none()
+        );
+        assert!(
+            session
+                .authenticated_collection_keys(&[ids[0], ids[0]], b"ring-b")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn authenticated_grant_snapshots_do_not_mix_concurrent_publications() {
+        use std::sync::{Arc, Barrier};
+        let session = Arc::new(SessionKeys::new(720, 1, Secret::random()));
+        let id = CollectionKeyId {
+            owner_id: 721,
+            calendar_id: 722,
+            domain_id: [7; 16],
+            generation: 1,
+        };
+        let ids = [
+            id,
+            CollectionKeyId {
+                generation: 2,
+                ..id
+            },
+        ];
+        let barrier = Arc::new(Barrier::new(3));
+        let handles = [11u8, 22u8].map(|value| {
+            let session = session.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let secrets = BTreeMap::from([
+                    (1, Secret::from_bytes([value; 32])),
+                    (2, Secret::from_bytes([value + 1; 32])),
+                ]);
+                barrier.wait();
+                for _ in 0..500 {
+                    session.cache_authenticated_collection_keys(&ids, &[value], &secrets);
+                    if let Some(hit) = session.authenticated_collection_keys(&ids, &[value]) {
+                        assert_eq!(hit[&1].as_bytes(), &[value; 32]);
+                        assert_eq!(hit[&2].as_bytes(), &[value + 1; 32]);
+                    }
+                }
+            })
+        });
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert!(
+            SessionKeys::new(723, 1, Secret::random())
+                .authenticated_collection_keys(&ids, &[11])
+                .is_none()
+        );
+        for other in [
+            CollectionKeyId {
+                owner_id: 724,
+                ..id
+            },
+            CollectionKeyId {
+                calendar_id: 725,
+                ..id
+            },
+            CollectionKeyId {
+                domain_id: [8; 16],
+                ..id
+            },
+            CollectionKeyId {
+                generation: 3,
+                ..id
+            },
+        ] {
+            assert!(
+                session
+                    .authenticated_collection_keys(&[other], &[11])
+                    .is_none()
+            );
+            assert!(
+                session
+                    .authenticated_collection_keys(&[other], &[22])
+                    .is_none()
+            );
+        }
+    }
 
     #[test]
     fn session_keys_derive_ewk_and_print_nothing() {

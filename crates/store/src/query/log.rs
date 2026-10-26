@@ -139,6 +139,22 @@ impl Store {
         collection: LogCollection,
         query: Query,
     ) -> trc::Result<Vec<T>> {
+        Ok(self
+            .vanished_with_change_id::<T>(account_id, collection, query)
+            .await?
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect())
+    }
+
+    /// Preserve the physical log key for identity coverage. Equal paths from
+    /// different commits and repeated paths within a commit are distinct entries.
+    pub async fn vanished_with_change_id<T: DeserializeVanished>(
+        &self,
+        account_id: u32,
+        collection: LogCollection,
+        query: Query,
+    ) -> trc::Result<Vec<(u64, T)>> {
         let collection = u8::from(collection);
         let (is_inclusive, from_change_id, to_change_id) = match query {
             Query::All => (true, 0, u64::MAX),
@@ -170,7 +186,7 @@ impl Store {
 
                     while iter.peek().is_some() {
                         if let Some(item) = T::deserialize_vanished(&mut iter) {
-                            vanished.push(item);
+                            vanished.push((change_id, item));
                         } else {
                             return Err(trc::Error::corrupted_key(
                                 key,

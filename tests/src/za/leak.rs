@@ -91,6 +91,9 @@ const EVENT_PATH: &str = "/dav/cal/key2%40example.com/leak/e.ics";
 /// Canaries written by this module, on top of `dav_seal::CANARIES` (which
 /// `EVENT` carries).
 const EXTRA_CANARIES: &[&str] = &[
+    "shared-owner-name-canary",
+    "shared-grantee-name-canary",
+    "shared-colour-canary",
     "leakcal-canary",
     "leakdesc-canary",
     "leakcolor-canary",
@@ -520,6 +523,13 @@ fn check_item(item: &CalendarEventNotification, what: &str, violations: &mut Vec
     if !has_key {
         violations.push(format!("{what}: missing {KEY_PROP}"));
     } else {
+        let pending = item.flags & EVENT_NOTIFICATION_ZA_PENDING != 0;
+        let expected = if pending { (2, 106) } else { (1, 74) };
+        if !key_envelope(&item.event)
+            .is_some_and(|b| b.len() == expected.1 && b[..2] == [1, expected.0])
+        {
+            violations.push(format!("{what}: inbox envelope state mismatch"));
+        }
         let root = &mut tree.components[0].entries;
         root.pop();
         let carrier = root.last().and_then(|e| {
@@ -543,37 +553,211 @@ fn check_item(item: &CalendarEventNotification, what: &str, violations: &mut Vec
     has_key
 }
 
-fn check_calendar(calendar: &Calendar, account_id: u32, what: &str, violations: &mut Vec<String>) {
-    if calendar.preferences.is_empty() {
-        violations.push(format!("{what}: collection without preferences"));
-        return;
+/// Keyless correspondence only: this does not authenticate encrypted ring payloads,
+/// the owner ledger, keys, or associated data.
+type CalendarHeaders =
+    std::collections::BTreeMap<u32, Option<groupware::calendar::sharing::format::OwnerRingHeader>>;
+
+fn key_envelope(tree: &ICalendar) -> Option<Vec<u8>> {
+    let entry = tree.components.first()?.entries.last()?;
+    if carrier_kind(entry) != Some(KEY_PROP) || entry.values.len() != 1 {
+        return None;
     }
-    let pref = calendar.preferences(account_id);
+    STANDARD.decode(entry.values[0].as_text()?).ok()
+}
+
+fn check_event_domain(
+    event: &CalendarEvent,
+    calendars: &CalendarHeaders,
+    what: &str,
+    violations: &mut Vec<String>,
+) {
+    let envelope = key_envelope(&event.data.event);
+    if event.names.is_empty() {
+        violations.push(format!("{what}: event parent calendar missing"));
+    }
+    for name in &event.names {
+        let Some(header) = calendars.get(&name.parent_id) else {
+            violations.push(format!("{what}: event parent calendar missing"));
+            continue;
+        };
+        if let Some(header) = header {
+            if event.names.len() != 1 {
+                violations.push(format!("{what}: shared event must have one parent"));
+            }
+            match envelope.as_deref() {
+                Some(bytes) if bytes.len() == 82 && bytes[..2] == [1, 3] => {
+                    let calendar = u32::from_be_bytes(bytes[2..6].try_into().unwrap());
+                    let generation = u32::from_be_bytes(bytes[6..10].try_into().unwrap());
+                    if calendar != name.parent_id {
+                        violations.push(format!("{what}: shared event calendar mismatch"));
+                    }
+                    if !header.generations.contains(&generation) {
+                        violations.push(format!("{what}: shared event generation not listed"));
+                    }
+                }
+                _ => violations.push(format!("{what}: shared event requires CK envelope")),
+            }
+        } else if !envelope
+            .as_deref()
+            .is_some_and(|bytes| bytes.len() == 74 && bytes[..2] == [1, 1])
+        {
+            violations.push(format!("{what}: unshared event requires account envelope"));
+        }
+    }
+}
+
+fn check_calendar(
+    calendar: &Calendar,
+    account_id: u32,
+    calendar_id: u32,
+    key_accounts: &std::collections::BTreeSet<u32>,
+    what: &str,
+    violations: &mut Vec<String>,
+) -> Option<groupware::calendar::sharing::format::OwnerRingHeader> {
+    use groupware::calendar::sharing::{
+        format::{parse_grant_header, parse_owner_header},
+        mutations::ZaShareLevel,
+    };
+    let mut principals = std::collections::BTreeSet::new();
+    for p in &calendar.preferences {
+        if !principals.insert(p.account_id) {
+            violations.push(format!("{what}: duplicate preference principal"));
+        }
+    }
+    let Some(pref) = calendar
+        .preferences
+        .iter()
+        .find(|p| p.account_id == account_id)
+    else {
+        violations.push(format!("{what}: collection without owner preferences"));
+        return None;
+    };
     if !pref.name.starts_with(COLLECTION_MARKER) {
-        // Plaintext collections are allowed only if nothing user-supplied is in them.
         if calendar.preferences.iter().any(|p| {
             p.description.is_some()
                 || p.color.is_some()
                 || matches!(p.time_zone, Timezone::Custom(_))
         }) || !calendar.dead_properties.0.is_empty()
+            || calendar.preferences.len() != 1
+            || !calendar.acls.is_empty()
         {
             violations.push(format!("{what}: unsealed collection with user data"));
         }
-        return;
+        return None;
     }
-    // Spec 7.2: a sealed collection holds only the owner's entry.
-    if calendar.preferences.len() != 1 || calendar.preferences[0].account_id != account_id {
-        violations.push(format!(
-            "{what}: sealed collection with preferences other than the owner's"
-        ));
-    }
-    if pref.description.is_some() || pref.color.is_some() || !calendar.dead_properties.0.is_empty()
+    if calendar
+        .preferences
+        .iter()
+        .any(|p| p.description.is_some() || p.color.is_some())
+        || !calendar.dead_properties.0.is_empty()
     {
         violations.push(format!("{what}: sealed collection with plaintext fields"));
     }
-    if let Timezone::Custom(tz) = &pref.time_zone {
-        check_tree(tz, what, false, violations);
+    for p in &calendar.preferences {
+        if let Timezone::Custom(tz) = &p.time_zone {
+            check_tree(tz, what, false, violations);
+        }
     }
+    let parts = pref
+        .name
+        .strip_prefix(COLLECTION_MARKER)
+        .unwrap()
+        .split('|')
+        .collect::<Vec<_>>();
+    let bytes = STANDARD.decode(parts[0]).unwrap_or_default();
+    if parts.len() == 2 && bytes.len() == 74 && bytes[..2] == [1, 1] {
+        if calendar.preferences.len() != 1 || !calendar.acls.is_empty() {
+            violations.push(format!(
+                "{what}: unshared collection with foreign preferences or ACL"
+            ));
+        }
+        return None;
+    }
+    if parts.len() != 5 {
+        violations.push(format!("{what}: owner carrier shape"));
+        return None;
+    }
+    let header = match parse_owner_header(&bytes) {
+        Ok(h) => h,
+        Err(_) => {
+            violations.push(format!("{what}: owner ring header malformed"));
+            return None;
+        }
+    };
+    if header.calendar_id != calendar_id {
+        violations.push(format!("{what}: owner ring calendar mismatch"));
+    }
+    let mut acl_principals = std::collections::BTreeSet::new();
+    for acl in &calendar.acls {
+        if !acl_principals.insert(acl.account_id) {
+            violations.push(format!("{what}: duplicate ACL principal"));
+        }
+        if !key_accounts.contains(&acl.account_id) {
+            violations.push(format!(
+                "{what}: ACL principal is not a current key account"
+            ));
+        }
+        if acl.account_id == account_id || ZaShareLevel::from_bitmap(acl.grants).is_none() {
+            violations.push(format!("{what}: shared ACL bits"));
+        }
+    }
+    principals.remove(&account_id);
+    if principals != acl_principals {
+        violations.push(format!("{what}: shared preference/ACL mismatch"));
+    }
+    for entry in &calendar.preferences {
+        let Some(text) = entry.name.strip_prefix(COLLECTION_MARKER) else {
+            violations.push(format!("{what}: grant carrier shape"));
+            continue;
+        };
+        let entry_parts = text.split('|').collect::<Vec<_>>();
+        if entry.account_id != account_id {
+            if entry_parts.len() != 3 {
+                violations.push(format!("{what}: grant carrier shape"));
+                continue;
+            }
+            let grant = STANDARD
+                .decode(entry_parts[0])
+                .ok()
+                .and_then(|b| parse_grant_header(&b).ok());
+            if !grant.is_some_and(|g| {
+                g.calendar_id == calendar_id
+                    && g.domain_id == header.domain_id
+                    && g.grantee_id == entry.account_id
+                    && g.generations == header.generations
+                    && g.rename_change_id == header.rename_change_id
+                    && (!header.boundary_pending || g.boundary_pending)
+            }) {
+                violations.push(format!("{what}: grant header mismatch"));
+            }
+        }
+        for index in if entry.account_id == account_id {
+            vec![1, 3]
+        } else {
+            vec![1]
+        } {
+            let envelope = entry_parts.get(index).and_then(|p| STANDARD.decode(p).ok());
+            if !envelope.is_some_and(|b| {
+                b.len() == 82
+                    && b[..2] == [1, 3]
+                    && u32::from_be_bytes(b[2..6].try_into().unwrap()) == calendar_id
+                    && header
+                        .generations
+                        .contains(&u32::from_be_bytes(b[6..10].try_into().unwrap()))
+            }) {
+                violations.push(format!("{what}: shared bundle envelope mismatch"));
+            }
+            if !entry_parts
+                .get(index + 1)
+                .and_then(|p| STANDARD.decode(p).ok())
+                .is_some_and(|b| b.len() >= 41 && b[0] == 1)
+            {
+                violations.push(format!("{what}: sealed bundle shape"));
+            }
+        }
+    }
+    Some(header)
 }
 
 /// Decodes a value as a stored archive if it carries the archive marker.
@@ -612,6 +796,71 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
     let archive_field = u8::from(Field::ARCHIVE);
     let mut scan = Scan::default();
     let mut blob_hashes: Vec<Vec<u8>> = Vec::new();
+    // Build the complete owner/calendar/header map before validating any event.
+    let mut calendar_records = Vec::new();
+    store
+        .iterate(
+            IterateParams::new(
+                AnyKey {
+                    subspace: SUBSPACE_PROPERTY,
+                    key: archive_key(account_id, Collection::Calendar, 0),
+                },
+                AnyKey {
+                    subspace: SUBSPACE_PROPERTY,
+                    key: archive_key(account_id, Collection::Calendar, u32::MAX),
+                },
+            ),
+            |key, value| {
+                calendar_records.push((key.to_vec(), value.to_vec()));
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+    let mut stored_calendars = Vec::new();
+    for (key, value) in calendar_records {
+        let id = u32::from_be_bytes(key[key.len() - U32_LEN..].try_into().unwrap());
+        // A malformed archive is scanner evidence, not a reason to panic before
+        // the negative-control owner can restore its exact bytes.
+        let calendar = try_archive(&value)
+            .and_then(|archive| archive.deserialize_untrusted::<Calendar>().ok());
+        if let Some(calendar) = calendar {
+            stored_calendars.push((id, calendar));
+        } else {
+            scan.violations.push(format!(
+                "calendar {account_id}/{id}: calendar archive does not decode"
+            ));
+        }
+    }
+    let mut key_accounts = std::collections::BTreeSet::new();
+    for (_, calendar) in &stored_calendars {
+        for acl in &calendar.acls {
+            if groupware::calendar::sharing::mutations::za_share_key_account(
+                &test.server,
+                acl.account_id,
+            )
+            .await
+            .unwrap()
+            {
+                key_accounts.insert(acl.account_id);
+            }
+        }
+    }
+    let mut calendar_headers = CalendarHeaders::new();
+    for (id, calendar) in &stored_calendars {
+        let what = format!("calendar {account_id}/{id}");
+        calendar_headers.insert(
+            *id,
+            check_calendar(
+                calendar,
+                account_id,
+                *id,
+                &key_accounts,
+                &what,
+                &mut scan.violations,
+            ),
+        );
+    }
 
     for &subspace in SUBSPACES {
         if subspace == SUBSPACE_SEARCH_INDEX && store.is_pg_or_mysql() {
@@ -733,17 +982,18 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
             if collection == Collection::CalendarEvent as u8 {
                 scan.events += 1;
                 match archive.deserialize::<CalendarEvent>() {
-                    Ok(event) => check_event(&event, &what, &mut scan.violations),
+                    Ok(event) => {
+                        check_event(&event, &what, &mut scan.violations);
+                        check_event_domain(&event, &calendar_headers, &what, &mut scan.violations);
+                    }
                     Err(err) => scan
                         .violations
                         .push(format!("{what}: event archive does not decode: {err:?}")),
                 }
             } else if collection == Collection::Calendar as u8 {
                 scan.calendars += 1;
-                match archive.deserialize::<Calendar>() {
-                    Ok(calendar) => {
-                        check_calendar(&calendar, account_id, &what, &mut scan.violations)
-                    }
+                match archive.deserialize_untrusted::<Calendar>() {
+                    Ok(_) => {}
                     Err(err) => scan
                         .violations
                         .push(format!("{what}: calendar archive does not decode: {err:?}")),
@@ -1498,6 +1748,7 @@ pub async fn test_mail(test: &mut TestServer) {
 
 pub async fn test(test: &mut TestServer) {
     println!("Running zero-access leak regression test...");
+    test_shared_structure(test).await;
     let name = "key2@example.com";
     let id = test.account(name).id().document_id();
     let client = DummyWebDavClient::new(id, name, STRONG, name);
@@ -2139,4 +2390,447 @@ mod tests {
         // Unversioned and long enough: must not panic, result is irrelevant.
         let _ = try_archive(&[0, 0, 0, 0, 0x80]);
     }
+}
+
+/// Keep a real multi-generation shared calendar alive while inspecting storage.
+/// Each bad archive is restored before any assertion can abort this fixture.
+async fn test_shared_structure(test: &mut TestServer) {
+    use crate::utils::za::za_post;
+    use calcard::icalendar::ICalendarValue;
+    use store::ValueKey;
+    use types::{
+        acl::AclGrant,
+        dead_property::{DeadProperty, DeadPropertyTag},
+    };
+    const OWNER: &str = "leak-shared-owner@example.com";
+    const BOB: &str = "leak-shared-bob@example.com";
+    const CAROL: &str = "leak-shared-carol@example.com";
+    const HOME: &str = "/dav/cal/leak-shared-owner%40example.com/";
+    const PATH: &str = "/dav/cal/leak-shared-owner%40example.com/shared/";
+    for name in [OWNER, BOB, CAROL] {
+        let account = test
+            .account("admin@example.com")
+            .create_key_user_account(name, STRONG, "Leak sharing", &[], super::user_permissions())
+            .await;
+        test.insert_account(account);
+    }
+    let owner = test.account(OWNER).id().document_id();
+    let bob = test.account(BOB).id().document_id();
+    let carol = test.account(CAROL).id().document_id();
+    let alice = DummyWebDavClient::new(owner, OWNER, STRONG, OWNER);
+    let reader = DummyWebDavClient::new(bob, BOB, STRONG, BOB);
+    alice.request("MKCALENDAR", PATH, "<A:mkcalendar xmlns:A=\"urn:ietf:params:xml:ns:caldav\" xmlns:D=\"DAV:\" xmlns:I=\"http://apple.com/ns/ical/\"><D:set><D:prop><D:displayname>shared-owner-name-canary</D:displayname><I:calendar-color>shared-colour-canary</I:calendar-color></D:prop></D:set></A:mkcalendar>").await.with_status(StatusCode::CREATED);
+    for (name, id) in [(BOB, bob), (CAROL, carol)] {
+        let public = test.server.za_served_public_key(id).await.unwrap().unwrap();
+        super::pinning::pin(OWNER, name, &vault::keys::display_fingerprint(&public))
+            .await
+            .expect(200);
+        za_post("shares/grant", &json!({"username":OWNER,"password":STRONG,"calendar":"shared","address":name,"level":"edit"})).await.expect(200);
+    }
+    alice
+        .request_with_headers(
+            "PUT",
+            &format!("{PATH}g1.ics"),
+            [CONTENT_TYPE],
+            EVENT.replace("UID:", "UID:shared-g1-"),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    za_post(
+        "shares/revoke",
+        &json!({"username":OWNER,"password":STRONG,"calendar":"shared","grant":carol}),
+    )
+    .await
+    .expect(200);
+    alice
+        .request_with_headers(
+            "PUT",
+            &format!("{PATH}g2.ics"),
+            [CONTENT_TYPE],
+            EVENT.replace("UID:", "UID:shared-g2-"),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    reader
+        .proppatch(
+            PATH,
+            [("D:displayname", "shared-grantee-name-canary")],
+            [],
+            [],
+        )
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    for (client, name) in [
+        (&alice, "shared-owner-name-canary"),
+        (&reader, "shared-grantee-name-canary"),
+    ] {
+        let response = client.request("PROPFIND", PATH, "<D:propfind xmlns:D=\"DAV:\" xmlns:I=\"http://apple.com/ns/ical/\"><D:prop><D:displayname/><I:calendar-color/></D:prop></D:propfind>").await.with_status(StatusCode::MULTI_STATUS);
+        let body = response.body.unwrap();
+        assert!(
+            body.contains(name)
+                && body.contains("shared-colour-canary")
+                && body.contains("http://apple.com/ns/ical/"),
+            "personal name and actual Apple shared colour must be returned"
+        );
+    }
+    let resources = test
+        .server
+        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .await
+        .unwrap();
+    let calendar = resources.by_path("shared").unwrap().document_id();
+    let event_id = resources.by_path("shared/g1.ics").unwrap().document_id();
+    let original: Calendar = test
+        .server
+        .store()
+        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            owner,
+            Collection::Calendar,
+            calendar,
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .deserialize()
+        .unwrap();
+    let original_event: CalendarEvent = test
+        .server
+        .store()
+        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            owner,
+            Collection::CalendarEvent,
+            event_id,
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .deserialize()
+        .unwrap();
+    // A malformed archive must return diagnostics and permit exact restoration.
+    shared_control(
+        test,
+        owner,
+        Collection::Calendar,
+        calendar,
+        Archiver::new(1u8).untrusted().serialize().unwrap(),
+        "malformed calendar archive",
+        "calendar archive does not decode",
+    )
+    .await;
+    alice
+        .request(
+            "MKCALENDAR",
+            &format!("{HOME}unshared/"),
+            mkcalendar_body(&[("D:displayname", "Unshared control")]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let unshared = test
+        .server
+        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .await
+        .unwrap()
+        .by_path("unshared")
+        .unwrap()
+        .document_id();
+    let mut controls = Vec::new();
+    let mut c = original.clone();
+    c.acls.clear();
+    controls.push(("stale grant entry", c, "shared preference/ACL mismatch"));
+    let mut c = original.clone();
+    c.preferences.retain(|p| p.account_id != bob);
+    controls.push(("ACL without ring", c, "shared preference/ACL mismatch"));
+    let owner_index = original
+        .preferences
+        .iter()
+        .position(|p| p.account_id == owner)
+        .unwrap();
+    let bob_index = original
+        .preferences
+        .iter()
+        .position(|p| p.account_id == bob)
+        .unwrap();
+    for (label, index, byte, expected) in [
+        (
+            "owner calendar identity",
+            owner_index,
+            5,
+            "owner ring calendar mismatch",
+        ),
+        (
+            "grant calendar identity",
+            bob_index,
+            5,
+            "grant header mismatch",
+        ),
+        (
+            "grant domain identity",
+            bob_index,
+            6,
+            "grant header mismatch",
+        ),
+        (
+            "grant principal identity",
+            bob_index,
+            25,
+            "grant header mismatch",
+        ),
+    ] {
+        let mut c = original.clone();
+        let mut parts = c.preferences[index]
+            .name
+            .strip_prefix(COLLECTION_MARKER)
+            .unwrap()
+            .split('|')
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let mut ring = STANDARD.decode(&parts[0]).unwrap();
+        ring[byte] ^= 0x40;
+        parts[0] = STANDARD.encode(ring);
+        c.preferences[index].name = format!("{COLLECTION_MARKER}{}", parts.join("|"));
+        controls.push((label, c, expected));
+    }
+    for (label, index, expected) in [
+        ("owner carrier", owner_index, "owner carrier shape"),
+        ("grant carrier", bob_index, "grant carrier shape"),
+    ] {
+        let mut c = original.clone();
+        c.preferences[index].name.push_str("|extra");
+        controls.push((label, c, expected));
+    }
+    let mut c = original.clone();
+    let mut parts = c.preferences[bob_index]
+        .name
+        .strip_prefix(COLLECTION_MARKER)
+        .unwrap()
+        .split('|')
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut ring = STANDARD.decode(&parts[0]).unwrap();
+    assert_eq!(u16::from_be_bytes(ring[43..45].try_into().unwrap()), 2);
+    ring[43..45].copy_from_slice(&1u16.to_be_bytes());
+    ring.truncate(45 + 108);
+    parts[0] = STANDARD.encode(ring);
+    c.preferences[bob_index].name = format!("{COLLECTION_MARKER}{}", parts.join("|"));
+    controls.push(("missing generation", c, "grant header mismatch"));
+    let mut c = original.clone();
+    c.acls[0].grants.bitmap |= 1 << 20;
+    controls.push(("ACL bits", c, "shared ACL bits"));
+    let mut c = original.clone();
+    c.preferences.push(c.preferences[bob_index].clone());
+    controls.push(("duplicate preference", c, "duplicate preference principal"));
+    let mut c = original.clone();
+    c.acls.push(c.acls[0].clone());
+    controls.push(("duplicate ACL", c, "duplicate ACL principal"));
+    let mut c = original.clone();
+    c.acls.push(AclGrant {
+        account_id: u32::MAX - 1,
+        grants: c.acls[0].grants,
+    });
+    controls.push((
+        "gone ACL principal",
+        c,
+        "ACL principal is not a current key account",
+    ));
+    for field in ["description", "color", "dead_properties"] {
+        let mut c = original.clone();
+        match field {
+            "description" => c.preferences[bob_index].description = Some("plain".into()),
+            "color" => c.preferences[bob_index].color = Some("plain".into()),
+            _ => c.dead_properties = DeadProperty(vec![DeadPropertyTag::Text("plain".into())]),
+        }
+        controls.push((field, c, "sealed collection with plaintext fields"));
+    }
+    for (label, bad, expected) in controls {
+        shared_control(
+            test,
+            owner,
+            Collection::Calendar,
+            calendar,
+            Archiver::new(bad).serialize().unwrap(),
+            label,
+            expected,
+        )
+        .await;
+    }
+    let mut events = Vec::new();
+    let mut e = original_event.clone();
+    let mut second = e.names[0].clone();
+    second.parent_id = unshared;
+    e.names.push(second);
+    events.push((
+        "two distinct parents",
+        e,
+        "shared event must have one parent",
+    ));
+    let mut e = original_event.clone();
+    e.names[0].parent_id = unshared;
+    events.push((
+        "CK on unshared event",
+        e,
+        "unshared event requires account envelope",
+    ));
+    let mut e = original_event.clone();
+    e.names[0].parent_id = u32::MAX;
+    events.push(("missing parent", e, "event parent calendar missing"));
+    for (label, envelope, expected) in [
+        (
+            "account envelope",
+            vec![1, 1].into_iter().chain([0u8; 72]).collect::<Vec<_>>(),
+            "shared event requires CK envelope",
+        ),
+        (
+            "unlisted generation",
+            {
+                let mut v = vec![1, 3];
+                v.extend(calendar.to_be_bytes());
+                v.extend(999u32.to_be_bytes());
+                v.extend([0u8; 72]);
+                v
+            },
+            "shared event generation not listed",
+        ),
+        (
+            "pending envelope",
+            vec![1, 2].into_iter().chain([0u8; 104]).collect::<Vec<_>>(),
+            "shared event requires CK envelope",
+        ),
+    ] {
+        let mut e = original_event.clone();
+        e.data.event.components[0]
+            .entries
+            .last_mut()
+            .unwrap()
+            .values = vec![ICalendarValue::Text(STANDARD.encode(envelope))];
+        events.push((label, e, expected));
+    }
+    for (label, bad, expected) in events {
+        shared_control(
+            test,
+            owner,
+            Collection::CalendarEvent,
+            event_id,
+            Archiver::new(bad).serialize().unwrap(),
+            label,
+            expected,
+        )
+        .await;
+    }
+    let healthy = scan(test, owner).await;
+    assert!(
+        healthy.violations.is_empty(),
+        "healthy shared fixture: {:?}",
+        healthy.violations
+    );
+    assert!(healthy.calendars > 0 && healthy.events == 2);
+    println!(
+        "Task11 healthy multi-generation shared fixture and all isolated structural controls passed"
+    );
+    alice
+        .request("DELETE", PATH, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    alice
+        .request("DELETE", &format!("{HOME}unshared/"), "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    for (client, root) in [
+        (&alice, HOME),
+        (&reader, "/dav/cal/leak-shared-bob%40example.com/"),
+    ] {
+        let _ = client
+            .request("DELETE", &format!("{root}default/"), "")
+            .await;
+    }
+    // ACL notifications are independent disposable inbox records.
+    for (name, id) in [(BOB, bob), (CAROL, carol)] {
+        let client = DummyWebDavClient::new(id, name, STRONG, name);
+        for item in inbox_ids(test, id).await {
+            client
+                .request(
+                    "DELETE",
+                    &format!("/dav/itip/{}/inbox/{item}.ics", name.replace('@', "%40")),
+                    "",
+                )
+                .await
+                .with_status(StatusCode::NO_CONTENT);
+        }
+    }
+    test.wait_for_tasks().await;
+    let clean = scan(test, owner).await;
+    assert!(
+        clean.violations.is_empty(),
+        "shared fixture cleanup: {:?}",
+        clean.violations
+    );
+}
+
+async fn shared_control(
+    test: &TestServer,
+    owner: u32,
+    collection: Collection,
+    document: u32,
+    bad: Vec<u8>,
+    label: &str,
+    expected: &str,
+) {
+    let original = test
+        .server
+        .store()
+        .get_value::<common::auth::vault::RawValue>(store::ValueKey::archive(
+            owner, collection, document,
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    async fn write(
+        test: &TestServer,
+        owner: u32,
+        collection: Collection,
+        document: u32,
+        bytes: Vec<u8>,
+    ) {
+        let mut batch = BatchBuilder::new();
+        batch
+            .with_account_id(owner)
+            .with_collection(collection)
+            .with_document(document)
+            .set(Field::ARCHIVE, bytes);
+        test.server.store().write(batch.build_all()).await.unwrap();
+    }
+    write(test, owner, collection, document, bad).await;
+    use futures::FutureExt;
+    let bad_scan = std::panic::AssertUnwindSafe(scan(test, owner))
+        .catch_unwind()
+        .await;
+    write(test, owner, collection, document, original.clone()).await;
+    let restored_bytes = test
+        .server
+        .store()
+        .get_value::<common::auth::vault::RawValue>(store::ValueKey::archive(
+            owner, collection, document,
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    assert_eq!(original, restored_bytes, "{label}: raw archive restoration");
+    let restored = scan(test, owner).await;
+    assert!(
+        bad_scan.is_ok(),
+        "{label}: scanner must return violations instead of panicking"
+    );
+    let bad_scan = bad_scan.unwrap();
+    assert!(
+        bad_scan.violations.iter().any(|v| v.contains(expected)),
+        "{label}: expected {expected}: {:?}",
+        bad_scan.violations
+    );
+    assert!(
+        restored.violations.is_empty(),
+        "{label}: restored fixture: {:?}",
+        restored.violations
+    );
+    println!("Task11 corruption control {label}: {expected}; exact raw restoration and clean scan");
 }

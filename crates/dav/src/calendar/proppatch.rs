@@ -4,13 +4,13 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use super::{za_refresh_event, za_write_contexts};
 use crate::{
     DavError, DavMethod, PropStatBuilder,
     common::{
         ETag, ExtractETag,
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
-        za::ZeroAccessGate,
     },
 };
 use calcard::common::timezone::Tz;
@@ -29,7 +29,8 @@ use groupware::{
     calendar::{
         Calendar, CalendarEvent, SupportedComponent, Timezone,
         seal::{
-            event_token_pairs, seal_calendar, seal_error, seal_event, unseal_calendar, unseal_event,
+            calendar_view_in_domain, event_pairs_in_domain, seal_calendar_changes, seal_error,
+            seal_event_in_domain, unseal_event_in_domain,
         },
     },
 };
@@ -88,7 +89,7 @@ impl CalendarPropPatchRequestHandler for Server {
             .into_owned_uri()?;
         let uri = headers.uri;
         let account_id = resource_.account_id;
-        let za_keys = self.za_session_keys(access_token, account_id).await?;
+        super::za_writer_keys(self, access_token, account_id).await?;
         let resources = self
             .fetch_dav_resources(
                 access_token.account_id(),
@@ -137,6 +138,32 @@ impl CalendarPropPatchRequestHandler for Server {
             .caused_by(trc::location!())?
             .ok_or(DavError::Code(StatusCode::NOT_FOUND))?;
 
+        #[cfg(feature = "test_mode")]
+        if resource.is_container() {
+            common::za::test_hooks::calendar_proppatch_read_pause_point(account_id).await;
+        }
+
+        // Calendar properties write only this principal's personal bundle and shared dead
+        // properties. The codec retains every unopened personal bundle and ring verbatim.
+        let calendar_context = if resource.is_container() {
+            crate::common::za::za_mutation_context(
+                self,
+                access_token,
+                account_id,
+                document_id,
+                Bitmap::new().with_item(Acl::Modify),
+            )
+            .await
+            .map_err(|error| super::za_calendar_error(error, account_id, document_id))?
+        } else {
+            None
+        };
+        // The conditional headers are evaluated against the archive the final write asserts.
+        let archive = calendar_context
+            .as_ref()
+            .map(|context| &context.stored)
+            .unwrap_or(&archive);
+
         // Validate headers
         self.validate_headers(
             access_token,
@@ -158,20 +185,29 @@ impl CalendarPropPatchRequestHandler for Server {
         let mut batch = BatchBuilder::new();
         let mut items = PropStatBuilder::default();
 
-        let etag = if resource.is_container() {
+        let mut retry_event = None;
+        let mut etag = if resource.is_container() {
             // Deserialize
             let calendar = archive
                 .to_unarchived::<Calendar>()
                 .caused_by(trc::location!())?;
-            let mut new_calendar = archive
+            let stored_calendar = archive
                 .deserialize::<Calendar>()
                 .caused_by(trc::location!())?;
-            // Spec 8.1: edit the plaintext; `calendar` (stored) stays current.
-            if let Some(keys) = &za_keys {
-                unseal_calendar(&mut new_calendar, keys, account_id)
-                    .map_err(|err| seal_error(err, account_id, document_id))?;
-            }
-            let personal_id = access_token.personal_id(account_id, Collection::Calendar);
+            let (mut new_calendar, personal_id) = if let Some(context) = &calendar_context {
+                (
+                    calendar_view_in_domain(&context.stored, &context.domain, context.personal_id)
+                        .map_err(|err| seal_error(err, account_id, document_id))?
+                        .deserialize::<Calendar>()
+                        .caused_by(trc::location!())?,
+                    context.personal_id,
+                )
+            } else {
+                (
+                    stored_calendar.clone(),
+                    access_token.personal_id(account_id, Collection::Calendar),
+                )
+            };
 
             // Remove properties
             if !request.set_first && !request.remove.is_empty() {
@@ -203,9 +239,14 @@ impl CalendarPropPatchRequestHandler for Server {
             }
 
             if is_success {
-                if let Some(keys) = &za_keys {
-                    seal_calendar(&mut new_calendar, keys, account_id)
-                        .map_err(|err| seal_error(err, account_id, document_id))?;
+                if let Some(context) = &calendar_context {
+                    new_calendar = seal_calendar_changes(
+                        &stored_calendar,
+                        &new_calendar,
+                        &context.domain,
+                        personal_id,
+                    )
+                    .map_err(|err| seal_error(err, account_id, document_id))?;
                 }
                 new_calendar
                     .update(
@@ -229,8 +270,17 @@ impl CalendarPropPatchRequestHandler for Server {
                 .deserialize::<CalendarEvent>()
                 .caused_by(trc::location!())?;
             // Spec 8.1: edit the plaintext; `event` (stored) stays current.
-            if let Some(keys) = &za_keys {
-                unseal_event(&mut new_event, keys, account_id)
+            let contexts = za_write_contexts(
+                self,
+                access_token,
+                account_id,
+                &new_event,
+                resource.parent_id().unwrap(),
+                Acl::ModifyItems,
+            )
+            .await?;
+            if let Some(context) = contexts.first() {
+                unseal_event_in_domain(&mut new_event, &context.domain)
                     .map_err(|err| seal_error(err, account_id, document_id))?;
             }
 
@@ -252,19 +302,25 @@ impl CalendarPropPatchRequestHandler for Server {
             }
 
             if is_success {
-                if let Some(keys) = &za_keys {
-                    // Invitations spec 3.3: every rewrite carries the stored pairs.
-                    let pairs = event_token_pairs(&archive, keys, account_id)
+                if let Some(context) = contexts.first() {
+                    // Every rewrite carries the stored pairs.
+                    let pairs = event_pairs_in_domain(&archive, &context.domain)
                         .map_err(|err| seal_error(err, account_id, document_id))?;
-                    seal_event(&mut new_event, keys, account_id, pairs.as_ref())
+                    seal_event_in_domain(&mut new_event, &context.domain, pairs.as_ref())
                         .map_err(|err| seal_error(err, account_id, document_id))?;
                 }
+                let timestamp = store::write::now() as i64;
+                for context in &contexts {
+                    context.assert_in(&mut batch);
+                }
+                retry_event = Some((new_event.clone(), contexts, timestamp));
                 new_event
-                    .update(
+                    .update_at(
                         access_token.account_tenant_ids(),
                         event,
                         account_id,
                         document_id,
+                        timestamp,
                         &mut batch,
                     )
                     .caused_by(trc::location!())?
@@ -275,7 +331,43 @@ impl CalendarPropPatchRequestHandler for Server {
         };
 
         if is_success {
-            self.commit_batch(batch).await.caused_by(trc::location!())?;
+            #[cfg(feature = "test_mode")]
+            common::za::test_hooks::update_commit_pause_point(account_id).await;
+            match self.commit_batch(batch).await {
+                Ok(_) => {}
+                Err(error) if error.is_assertion_failure() && retry_event.is_some() => {
+                    let (mut sealed, contexts, timestamp) = retry_event.take().unwrap();
+                    let Some(fresh) = za_refresh_event(
+                        self,
+                        access_token,
+                        account_id,
+                        resource.parent_id().unwrap(),
+                        Acl::ModifyItems,
+                        &contexts,
+                        &mut sealed,
+                    )
+                    .await?
+                    else {
+                        return Err(error.into());
+                    };
+                    let mut batch = BatchBuilder::new();
+                    for context in &fresh {
+                        context.assert_in(&mut batch);
+                    }
+                    etag = sealed
+                        .update_at(
+                            access_token.account_tenant_ids(),
+                            archive.to_unarchived::<CalendarEvent>()?,
+                            account_id,
+                            document_id,
+                            timestamp,
+                            &mut batch,
+                        )?
+                        .etag();
+                    self.commit_batch(batch).await?;
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
 
         if headers.ret != Return::Minimal || !is_success {

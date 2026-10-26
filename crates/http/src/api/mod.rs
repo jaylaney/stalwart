@@ -12,6 +12,7 @@ pub mod telemetry;
 // SPDX-SnippetEnd
 pub mod contacts;
 pub mod diagnose;
+pub mod shares;
 pub mod vault;
 
 use crate::{

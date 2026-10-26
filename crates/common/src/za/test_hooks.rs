@@ -20,6 +20,10 @@
 //! - `COMMIT_PAUSE`: in the CalDAV PUT handler immediately before the key
 //!   account's leased create commits (`za_commit_create`), after the fan-out
 //!   and the seal.
+//! - `UPDATE_COMMIT_PAUSE`: immediately before an event PUT update commit,
+//!   after fan-out and sealing, keyed by the event owner.
+//! - `DELETE_COMMIT_PAUSE`: immediately before an event DELETE commit,
+//!   after fan-out, keyed by the event owner.
 //! - `COMMIT_FAIL_ONCE`: the commit of a key account's PUT create fails once
 //!   with an internal error after its fan-out, keyed by the account
 //!   (`dav::calendar::za_commit_create`).
@@ -107,6 +111,8 @@ pub static FAN_OUT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 pub static PUT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
 pub static COMMIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static UPDATE_COMMIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static DELETE_COMMIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
 /// Global: its `account_id` is ignored.
 pub static TASK_CONSUMER_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
@@ -180,6 +186,13 @@ pub fn set_put_pause(pause: Option<Arc<Pause>>) {
 
 pub fn set_commit_pause(pause: Option<Arc<Pause>>) {
     set_slot(&COMMIT_PAUSE, pause);
+}
+
+pub fn set_update_commit_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&UPDATE_COMMIT_PAUSE, pause);
+}
+pub fn set_delete_commit_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&DELETE_COMMIT_PAUSE, pause);
 }
 
 pub fn set_task_consumer_pause(pause: Option<Arc<Pause>>) {
@@ -358,6 +371,13 @@ pub async fn commit_pause_point(account_id: u32) {
     wait(take_for(&COMMIT_PAUSE, account_id)).await;
 }
 
+pub async fn update_commit_pause_point(account_id: u32) {
+    wait(take_for(&UPDATE_COMMIT_PAUSE, account_id)).await;
+}
+pub async fn delete_commit_pause_point(account_id: u32) {
+    wait(take_for(&DELETE_COMMIT_PAUSE, account_id)).await;
+}
+
 pub async fn task_consumer_pause_point() {
     let pause = TASK_CONSUMER_PAUSE
         .lock()
@@ -443,4 +463,272 @@ pub fn drain_read_fails(account_id: u32, document_id: u32) -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         == Some((account_id, document_id))
+}
+
+/// Independent calendar rename and completion hooks, keyed by the owner account.
+pub static SHARE_RENAME_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SHARE_BOUNDARY_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub fn set_share_rename_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SHARE_RENAME_PAUSE, pause);
+}
+pub fn set_share_boundary_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SHARE_BOUNDARY_PAUSE, pause);
+}
+pub async fn share_rename_pause_point(owner: u32) {
+    wait(take_for(&SHARE_RENAME_PAUSE, owner)).await;
+}
+pub async fn share_boundary_pause_point(owner: u32) {
+    wait(take_for(&SHARE_BOUNDARY_PAUSE, owner)).await;
+}
+pub static MOVE_OVERWRITE_OBSERVATION: Mutex<Vec<(u32, u32, bool)>> = Mutex::new(Vec::new());
+pub fn record_move_overwrite_message(owner: u32, event: u32, has_delete_result: bool) {
+    let mut values = MOVE_OVERWRITE_OBSERVATION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    values.retain(|(o, e, _)| (*o, *e) != (owner, event));
+    values.push((owner, event, has_delete_result));
+}
+pub fn take_move_overwrite_message(owner: u32, event: u32) -> Option<bool> {
+    let mut values = MOVE_OVERWRITE_OBSERVATION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let idx = values
+        .iter()
+        .position(|(o, e, _)| (*o, *e) == (owner, event))?;
+    Some(values.swap_remove(idx).2)
+}
+
+/// First-grant conversion seams, independent of ordinary DAV write hooks.
+pub static SHARE_PRECHECK_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SHARE_REWRAP_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SHARE_REWRAP_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+pub fn set_share_precheck_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SHARE_PRECHECK_PAUSE, pause);
+}
+pub fn set_share_rewrap_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SHARE_REWRAP_PAUSE, pause);
+}
+pub fn set_share_rewrap_fail_once(owner: Option<u32>) {
+    *SHARE_REWRAP_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = owner;
+}
+pub async fn share_precheck_pause_point(owner: u32) {
+    wait(take_for(&SHARE_PRECHECK_PAUSE, owner)).await;
+}
+pub async fn share_rewrap_pause_point(owner: u32) {
+    wait(take_for(&SHARE_REWRAP_PAUSE, owner)).await;
+}
+pub fn take_share_rewrap_fail_once(owner: u32) -> bool {
+    take_flag(&SHARE_REWRAP_FAIL_ONCE, owner)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShareAssertFailure {
+    pub owner_id: u32,
+    pub calendar_id: u32,
+    pub remaining: u32,
+}
+fn take_share_assert(slot: &Mutex<Option<ShareAssertFailure>>, owner: u32, calendar: u32) -> bool {
+    let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(failure) = slot.as_mut()
+        && failure.owner_id == owner
+        && failure.calendar_id == calendar
+        && failure.remaining > 0
+    {
+        failure.remaining -= 1;
+        true
+    } else {
+        false
+    }
+}
+pub static SHARE_INIT_ASSERT_FAIL: Mutex<Option<ShareAssertFailure>> = Mutex::new(None);
+pub fn set_share_init_assert_fail(failure: Option<ShareAssertFailure>) {
+    *SHARE_INIT_ASSERT_FAIL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = failure;
+}
+pub fn take_share_init_assert_fail(owner_id: u32, calendar_id: u32) -> bool {
+    take_share_assert(&SHARE_INIT_ASSERT_FAIL, owner_id, calendar_id)
+}
+pub static SHARE_REWRAP_ASSERT_FAIL: Mutex<Option<ShareAssertFailure>> = Mutex::new(None);
+pub fn set_share_rewrap_assert_fail(failure: Option<ShareAssertFailure>) {
+    *SHARE_REWRAP_ASSERT_FAIL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = failure;
+}
+pub fn take_share_rewrap_assert_fail(owner_id: u32, calendar_id: u32) -> bool {
+    take_share_assert(&SHARE_REWRAP_ASSERT_FAIL, owner_id, calendar_id)
+}
+pub static SHARE_REVERT_ASSERT_FAIL: Mutex<Option<ShareAssertFailure>> = Mutex::new(None);
+pub fn set_share_revert_assert_fail(failure: Option<ShareAssertFailure>) {
+    *SHARE_REVERT_ASSERT_FAIL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = failure;
+}
+pub fn take_share_revert_assert_fail(owner_id: u32, calendar_id: u32) -> bool {
+    take_share_assert(&SHARE_REVERT_ASSERT_FAIL, owner_id, calendar_id)
+}
+pub static SHARE_ROLLBACK_ASSERT_FAIL: Mutex<Option<ShareAssertFailure>> = Mutex::new(None);
+pub fn set_share_rollback_assert_fail(failure: Option<ShareAssertFailure>) {
+    *SHARE_ROLLBACK_ASSERT_FAIL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = failure;
+}
+pub fn take_share_rollback_assert_fail(owner_id: u32, calendar_id: u32) -> bool {
+    take_share_assert(&SHARE_ROLLBACK_ASSERT_FAIL, owner_id, calendar_id)
+}
+pub static SHARE_RESTORE_ASSERT_FAIL: Mutex<Option<ShareAssertFailure>> = Mutex::new(None);
+pub fn set_share_restore_assert_fail(failure: Option<ShareAssertFailure>) {
+    *SHARE_RESTORE_ASSERT_FAIL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = failure;
+}
+pub fn take_share_restore_assert_fail(owner_id: u32, calendar_id: u32) -> bool {
+    take_share_assert(&SHARE_RESTORE_ASSERT_FAIL, owner_id, calendar_id)
+}
+
+/// One authoritative sharing mutation, after all decisions and before commit.
+pub static SHARE_COMMIT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub fn set_share_commit_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SHARE_COMMIT_PAUSE, pause);
+}
+pub async fn share_commit_pause_point(owner: u32) {
+    wait(take_for(&SHARE_COMMIT_PAUSE, owner)).await;
+}
+
+/// Sharing adapter seams for authenticated mark ordering and terminal-loss classification.
+pub static SHARE_PIN_MARK_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SHARE_CONFLICT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub fn set_share_pin_mark_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SHARE_PIN_MARK_PAUSE, pause);
+}
+pub fn set_share_conflict_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SHARE_CONFLICT_PAUSE, pause);
+}
+pub async fn share_pin_mark_pause_point(owner: u32) {
+    wait(take_for(&SHARE_PIN_MARK_PAUSE, owner)).await;
+}
+pub async fn share_conflict_pause_point(owner: u32) {
+    wait(take_for(&SHARE_CONFLICT_PAUSE, owner)).await;
+}
+
+/// One request-local recipient lookup failure, matched by sender and normalized address.
+pub static DELEGATION_LOOKUP_FAIL_ONCE: Mutex<Option<(u32, String)>> = Mutex::new(None);
+
+pub fn set_delegation_lookup_fail_once(value: Option<(u32, String)>) {
+    *DELEGATION_LOOKUP_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = value;
+}
+
+pub fn take_delegation_lookup_fail_once(sender_id: u32, address: &str) -> bool {
+    let mut slot = DELEGATION_LOOKUP_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if slot
+        .as_ref()
+        .is_some_and(|(id, key)| *id == sender_id && key == address)
+    {
+        slot.take();
+        true
+    } else {
+        false
+    }
+}
+
+/// Calendar PROPPATCH after its initial archive read, before fresh mutation resolution.
+/// One-shot and owner-keyed, so a competing request can commit during that interval.
+pub static CALENDAR_PROPPATCH_READ_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub fn set_calendar_proppatch_read_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&CALENDAR_PROPPATCH_READ_PAUSE, pause);
+}
+pub async fn calendar_proppatch_read_pause_point(owner: u32) {
+    wait(take_for(&CALENDAR_PROPPATCH_READ_PAUSE, owner)).await;
+}
+
+/// Share listing after enumeration, before fresh archive resolution.
+pub static SHARE_LIST_OWN_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub static SHARE_LIST_FOREIGN_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub fn set_share_list_own_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SHARE_LIST_OWN_PAUSE, pause);
+}
+pub fn set_share_list_foreign_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&SHARE_LIST_FOREIGN_PAUSE, pause);
+}
+pub async fn share_list_own_pause_point(owner: u32) {
+    wait(take_for(&SHARE_LIST_OWN_PAUSE, owner)).await;
+}
+pub async fn share_list_foreign_pause_point(reader: u32) {
+    wait(take_for(&SHARE_LIST_FOREIGN_PAUSE, reader)).await;
+}
+
+/// Owner-scoped conversion assertion losses, excluding final grant decision losses.
+static SHARE_CONVERSION_LOSSES: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+pub fn record_share_conversion_loss(owner: u32) {
+    SHARE_CONVERSION_LOSSES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(owner);
+}
+pub fn take_share_conversion_losses(owner: u32) -> usize {
+    let mut losses = SHARE_CONVERSION_LOSSES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let count = losses.iter().filter(|id| **id == owner).count();
+    losses.retain(|id| *id != owner);
+    count
+}
+
+/// Collection MOVE after final fresh source/target resolution and delete assembly.
+pub static CALENDAR_MOVE_DELETE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub fn set_calendar_move_delete_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&CALENDAR_MOVE_DELETE_PAUSE, pause);
+}
+pub async fn calendar_move_delete_pause_point(owner: u32) {
+    wait(take_for(&CALENDAR_MOVE_DELETE_PAUSE, owner)).await;
+}
+
+/// Admission metrics contain only owner/counts, never paths or archive payloads.
+static CALENDAR_MOVE_PLANS: Mutex<Vec<(u32, usize, usize, usize)>> = Mutex::new(Vec::new());
+pub fn record_calendar_move_plan(owner: u32, operations: usize, bytes: usize, slices: usize) {
+    CALENDAR_MOVE_PLANS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((owner, operations, bytes, slices));
+}
+pub fn take_calendar_move_plans(owner: u32) -> Vec<(usize, usize, usize)> {
+    let mut plans = CALENDAR_MOVE_PLANS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut result = Vec::new();
+    plans.retain(|(id, operations, bytes, slices)| {
+        if *id == owner {
+            result.push((*operations, *bytes, *slices));
+            false
+        } else {
+            true
+        }
+    });
+    result
+}
+
+/// Foreign calendar sync after raw log read, before identity sidecar read.
+/// Only owner id is retained; paths and content never enter the hook.
+pub static CALENDAR_SYNC_LOG_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub fn set_calendar_sync_log_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&CALENDAR_SYNC_LOG_PAUSE, pause);
+}
+pub async fn calendar_sync_log_pause_point(owner: u32) {
+    wait(take_for(&CALENDAR_SYNC_LOG_PAUSE, owner)).await;
+}
+
+/// Calendar retention after both vanished ranges have been removed.
+/// Only owner ID enters this test-mode-only publication-order seam.
+pub static CALENDAR_HISTORY_PURGE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub fn set_calendar_history_purge_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&CALENDAR_HISTORY_PURGE_PAUSE, pause);
+}
+pub async fn calendar_history_purge_pause_point(owner: u32) {
+    wait(take_for(&CALENDAR_HISTORY_PURGE_PAUSE, owner)).await;
 }
