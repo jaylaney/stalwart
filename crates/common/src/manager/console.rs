@@ -12,8 +12,7 @@ use store::write::{AnyClass, AnyKey, BatchBuilder, ValueClass};
 use store::{Deserialize, IterateParams, SUBSPACE_INDEXES, SUBSPACE_REGISTRY_IDX, Store};
 
 const HELP: &str = concat!(
-    "Stalwart Server v",
-    env!("CARGO_PKG_VERSION"),
+    env!("STALWART_BUILD_IDENTITY"),
     r#" Data Store CLI
 
 Enter commands (type 'help' for available commands).

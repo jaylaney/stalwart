@@ -3,6 +3,9 @@ use std::env;
 use std::fs;
 use std::path::Path;
 
+#[path = "build_support/release.rs"]
+mod release;
+
 fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
     let dest_path = Path::new(&out_dir).join("locales.rs");
@@ -10,6 +13,7 @@ fn main() {
     // Read the YAML file
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let repo_root = Path::new(&manifest_dir).parent().unwrap().parent().unwrap();
+    release::emit(repo_root);
     let yaml_path = repo_root.join("resources/locales/i18n.yml");
     let yaml_content =
         fs::read_to_string(&yaml_path).unwrap_or_else(|_| panic!("Failed to read {yaml_path:?}"));

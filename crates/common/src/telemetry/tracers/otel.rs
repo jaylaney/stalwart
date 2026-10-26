@@ -28,11 +28,11 @@ pub(crate) fn spawn_otel_tracer(builder: SubscriberBuilder, mut otel: OtelTracer
     tokio::spawn(async move {
         let resource = Resource::builder()
             .with_service_name("stalwart")
-            .with_attribute(KeyValue::new(SERVICE_VERSION, env!("CARGO_PKG_VERSION")))
+            .with_attribute(KeyValue::new(SERVICE_VERSION, crate::version::FORK_VERSION))
             .build();
 
         let instrumentation = InstrumentationScope::builder("stalwart")
-            .with_version(env!("CARGO_PKG_VERSION"))
+            .with_version(crate::version::FORK_VERSION)
             .build();
 
         otel.log_exporter.set_resource(&resource);
