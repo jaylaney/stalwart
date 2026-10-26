@@ -83,10 +83,49 @@ its upstream updates during merges; do not insert fork release entries there.
 - Publish the immutable release tag, notes, and artifacts only after the applicable gates
   pass and publication is authorized. Keep previews marked as prereleases.
 
-## Adoption status
+## Release implementation
 
-This policy does not itself release `0.1.0`. Package manifests and runtime version strings
-still use the upstream numbering. Before the first independent release, implement and verify
-the fork version/provenance output and adapt the inherited release workflow: it currently
-matches `v*.*.*` tags and extracts release notes from upstream's `CHANGELOG.md`. It must handle
-the fork tag prefix, fork changelog, and preview status before publishing fork releases.
+The first preview is `0.1.0-beta.1`, tagged `fork-v0.1.0-beta.1` and titled
+`release-0.1.0-beta-1`. `fork-release.toml` is the fork identity source: it records the fork
+version and upstream base tag/full commit. The shipping `stalwart` package version must match
+it. Internal crate versions and numeric upstream compatibility checks retain `0.16.26`.
+
+The build generates the operator identity used by `--version`, help, startup logs and console.
+It includes the full fork source commit and clean/dirty checkout state. In a source archive
+without its own Git checkout it reports `unknown`; a distributor can explicitly supply
+`STALWART_BUILD_SOURCE_COMMIT` as a full hexadecimal commit, which is labelled `provided`.
+A supplied value that conflicts with checkout HEAD is refused. Official artifacts require a
+clean Git checkout, and must not use unknown/provided provenance.
+
+`.github/workflows/product-build.yml` builds the shipping Linux x86_64 GNU binary, either
+from a `fork-v*.*.*` tag or a manually selected ref. It validates the actual binary's
+`--version` and help against the checked-out commit, the shipping manifest and release
+metadata. For tag builds it also requires the exact `fork-v<version>` tag. The release
+validator requires Python 3.11 or later; it removes `CONFIG_PATH` when invoking the binary.
+
+Each Actions artifact contains `stalwart`, `stalwart.provenance.json` and `stalwart.sha256`.
+The checksum file covers both the binary and provenance file; the workflow attests both.
+Provenance records the fork/upstream/source identity, target, shipping feature configuration,
+CPU baseline, build host and highest referenced GLIBC symbol version. Preserve those records
+when packaging the GitHub prerelease. Actions ZIP downloads do not preserve executable bits;
+restore `chmod +x stalwart` before packaging. A versioned tar archive may contain the binary,
+its checksum and provenance; publish a separate archive checksum. The attestation covers the
+raw binary and provenance file, not a subsequently created tar archive. Extract the archive
+before running `./stalwart --version` or installing the binary. The workflow only uploads
+build artifacts; it does not create or publish GitHub releases. The disabled inherited CI
+release jobs are not the fork publication route.
+
+This GNU/Linux build uses `x86-64-v2` from `.cargo/config.toml`; it is not a musl/static build
+or a promise of compatibility with every x86_64 distribution. Check the actual artifact's
+GLIBC requirement and runtime dependencies before installation. The build-host libc version
+is provenance, not a substitute for testing on the deployment system.
+
+Release source identity is resolved after the preparation commit exists. Changelog entries
+name the immutable release tag; published notes and the shipped provenance file record its
+full commit. This avoids embedding a self-referential commit hash in the changelog commit.
+
+For each preview, the final release notes must state exactly which automated gates ran and
+which native/client/store/cluster gates remain pending. The
+[manual checklist](zero-access/manual-checklist.md) is a procedure, not evidence that those
+clients passed. A preview with pending native gates
+must remain a prerelease and must not claim general client or production qualification.

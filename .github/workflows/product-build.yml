@@ -39,11 +39,14 @@ jobs:
         id: source
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      - name: Verify release tooling
+        run: python3 -B -m unittest discover -s scripts/release -p 'test_*.py' -v
+
       - name: Install system build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential clang libclang-dev cmake pkg-config
+            build-essential binutils clang libclang-dev cmake pkg-config
 
       - name: Install stable Rust toolchain
         run: |
@@ -54,29 +57,43 @@ jobs:
           rustc --version
 
       - name: Build shipping binary
-        run: cargo build --release -p stalwart --no-default-features --features rocks
+        run: cargo build --locked --release -p stalwart --no-default-features --features rocks
+
+      - name: Verify shipping identity and record provenance
+        env:
+          SOURCE_COMMIT: ${{ steps.source.outputs.sha }}
+          BUILD_REF: ${{ inputs.ref || github.ref }}
+        run: |
+          python3 scripts/release/verify_product.py \
+            --binary target/release/stalwart \
+            --source-commit "$SOURCE_COMMIT" --ref "$BUILD_REF" \
+            --inspect-elf --output target/release/stalwart.provenance.json
 
       - name: Generate checksum and job summary
         working-directory: target/release
         env:
           SOURCE_COMMIT: ${{ steps.source.outputs.sha }}
         run: |
-          sha256sum stalwart > stalwart.sha256
+          sha256sum stalwart stalwart.provenance.json > stalwart.sha256
           {
             printf '### Product build\n\n'
             printf 'Commit: %s\n\n' "$SOURCE_COMMIT"
             printf 'Target: x86_64-unknown-linux-gnu\n\n'
             printf 'SHA-256:\n\n```text\n'
             cat stalwart.sha256
+            printf '```\n\nProvenance:\n\n```json\n'
+            cat stalwart.provenance.json
             printf '```\n'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Attest binary provenance
         uses: actions/attest-build-provenance@e4d4f7c39adfa4c260fb5c147f0622000aa14b99 # v4.0.0
         with:
-          subject-path: target/release/stalwart
+          subject-path: |
+            target/release/stalwart
+            target/release/stalwart.provenance.json
 
-      - name: Upload product binary and checksum
+      - name: Upload product binary, checksum and provenance
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: stalwart-x86_64-unknown-linux-gnu-${{ steps.source.outputs.sha }}
@@ -84,3 +101,4 @@ jobs:
           path: |
             target/release/stalwart
             target/release/stalwart.sha256
+            target/release/stalwart.provenance.json
