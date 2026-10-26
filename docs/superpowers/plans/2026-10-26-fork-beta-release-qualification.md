@@ -17,6 +17,7 @@ Executed in the isolated release worktree on 2026-10-26 with stable Rust via
 | `cargo fmt --all --check` | exit 0 |
 | `git diff --check` | exit 0 |
 | `cargo test -p vault -p groupware -p common` | exit 0; common 121, groupware 149, vault 45 passed; 0 failed; doc tests 0 |
+| `cargo test -p http@0.16.26 --features test_mode` | exit 0; 6 passed, 0 failed; doc tests 0 |
 
 The first core-unit attempt failed in the new build helper because array-valued package
 metadata preceded the version field. A regression reproduced that real manifest layout;

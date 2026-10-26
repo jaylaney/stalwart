@@ -101,7 +101,9 @@ def main():
         binary_environment = os.environ.copy()
         binary_environment.pop("CONFIG_PATH", None)
         version = command_output([str(binary), "--version"], env=binary_environment)
-        help_text = command_output([str(binary), "--help"], env=binary_environment)
+        help_text = command_output(
+            [str(binary), "--help"], env=binary_environment, stderr=subprocess.STDOUT
+        )
         validate_identity(metadata, version, help_text, args.source_commit, args.ref)
         glibc = minimum_glibc(binary, root) if args.inspect_elf else None
         libc_name, libc_version = platform.libc_ver()

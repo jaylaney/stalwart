@@ -119,7 +119,7 @@ class VerifyProductTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     verify_product.minimum_glibc(root / "binary", root)
 
-    def test_cli_executes_binary_without_config_and_writes_provenance(self):
+    def test_cli_reads_help_on_stderr_without_config_and_writes_provenance(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.write_metadata(root)
@@ -135,9 +135,10 @@ class VerifyProductTests(unittest.TestCase):
             ).strip()
             binary = root / "stalwart"
             binary.write_text(
-                f"#!{sys.executable}\nimport os\n"
+                f"#!{sys.executable}\nimport os, sys\n"
                 "assert 'CONFIG_PATH' not in os.environ\n"
-                f"print({identity(source)!r})\n"
+                "stream = sys.stderr if sys.argv[1] == '--help' else sys.stdout\n"
+                f"print({identity(source)!r}, file=stream)\n"
             )
             binary.chmod(0o755)
             output = root / "stalwart.provenance.json"
