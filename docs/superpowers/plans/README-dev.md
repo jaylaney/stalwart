@@ -1,5 +1,9 @@
 # Building and testing the zero-access fork
 
+See the [release policy](../../releases.md) for independent versioning, tags, upstream
+provenance, and the release checklist. Record fork release changes in the
+[fork changelog](../../../CHANGELOG-fork.md); the root `CHANGELOG.md` remains upstream history.
+
 - Toolchain: stable Rust via rustup. Xcode command line tools for RocksDB.
 - On this machine rustup is installed via Homebrew (keg-only): `export PATH="/opt/homebrew/opt/rustup/bin:$PATH"` before using cargo. The curl installer in the plan is not needed.
 - Build (tests): `STORE=RocksDb RUST_MIN_STACK=16777216 cargo build -p tests`

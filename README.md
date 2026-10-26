@@ -77,6 +77,8 @@ The product build excludes enterprise features. Do not deploy builds with the `t
 feature, which weakens password hashing for tests.
 
 - [Developer notes](docs/superpowers/plans/README-dev.md): build, test and account setup details.
+- [Release policy](docs/releases.md): independent versions, upstream provenance and release checks.
+- [Fork changelog](CHANGELOG-fork.md): changes and upgrade notes for fork releases.
 - [Manual client checklist](docs/zero-access/manual-checklist.md): CalDAV client verification.
 - [Designs](docs/superpowers/specs/) and [plans and outcomes](docs/superpowers/plans/): scope,
   decisions and implementation records.
