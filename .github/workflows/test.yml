@@ -6,6 +6,15 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: "0 7 * * 1"
+
+# A newer push to a pull request cancels that pull request's run in progress.
+# Every other trigger (push to main, schedule, manual dispatch) gets a group of
+# its own, keyed on the run id, so those runs never cancel or hold each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   style:
@@ -21,10 +30,16 @@ jobs:
   test:
     name: Test
     needs: style
-    # Upstream's full suite runs only when dispatched by hand; pushes and pull
-    # requests to main run the style check and the zero-access job.
-    if: github.event_name == 'workflow_dispatch'
+    # Upstream's full suite checks the paths the fork shares with ordinary
+    # accounts. It runs on pull requests to main, weekly and on manual
+    # dispatch (dispatch it on any branch that merges an upstream release
+    # tag); a push to main skips it, since the pull request run covered the
+    # same code before the merge. The timeout is generous (a healthy run takes
+    # about 30 minutes) but keeps a hang from running to GitHub's 6-hour
+    # default.
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     env:
       STORE: RocksDb
@@ -55,13 +70,56 @@ jobs:
         run: cargo test -p tests directory -- --nocapture
 
       - name: SMTP Tests
-        run: cargo test -p tests smtp -- --nocapture
+        # The antispam test fetches the spam filter rules from the URL in
+        # SPAM_RULES_URL. Without it the test falls back to a file path on
+        # upstream's developer machine (file:///Users/me/code/spam-filter/...),
+        # the UpdateRules task fails three times and stays in the queue as
+        # Failed, and the test waits for it forever. The URL pins a rules
+        # release (v3.0.3, the latest when this was written); raise it
+        # deliberately. Four SMTP tests are timing-flaky when the whole filter
+        # runs in parallel (dkim2_dsn_is_signed, lmtp_delivery, queue_retry,
+        # manage_reports) and pass when rerun by name. The step reruns the
+        # failed ones once, taking their names from libtest's final failures
+        # list (with --nocapture the per-test FAILED lines can interleave with
+        # test output). A real regression fails both runs. The explicit bash
+        # shell sets pipefail, so the pipeline through tee reports cargo's
+        # status.
+        shell: bash
+        run: |
+          status=0
+          cargo test -p tests smtp -- --nocapture 2>&1 | tee "$RUNNER_TEMP/smtp-tests.log" || status=$?
+          if [ "$status" -eq 0 ]; then
+            exit 0
+          fi
+          failed=$(awk '
+            /^failures:$/ { collecting = 1; names = ""; next }
+            collecting && /^    [A-Za-z_][A-Za-z0-9_:]*$/ { sub(/^    /, ""); names = names " " $0; next }
+            collecting && (/^---- / || /^test result:/) { collecting = 0 }
+            END { print names }
+          ' "$RUNNER_TEMP/smtp-tests.log")
+          if [ -z "$failed" ]; then
+            echo "::error title=SMTP tests::run failed (status $status) and no failed test names were found; not retrying"
+            exit "$status"
+          fi
+          echo "::warning title=SMTP tests::retrying once:$failed"
+          # shellcheck disable=SC2086
+          cargo test -p tests -- --exact --nocapture $failed
+        env:
+          SPAM_RULES_URL: https://github.com/stalwartlabs/spam-filter/releases/download/v3.0.3/spam-filter-rules.json.gz
 
       - name: IMAP Tests
         run: cargo test -p tests imap -- --nocapture
 
       - name: JMAP Tests
-        run: cargo test -p tests jmap -- --nocapture
+        # Upstream's calendar::notification sub-test is timing-flaky (a fixed
+        # 200 ms wait); one rerun keeps it from failing the job. A real
+        # regression fails both runs. The test server wipes its data
+        # directory at start, so the rerun starts clean.
+        run: |
+          cargo test -p tests jmap -- --nocapture || {
+            echo "::warning title=jmap::run failed; retrying once (known calendar::notification flake)"
+            cargo test -p tests jmap -- --nocapture
+          }
 
   zero-access:
     name: Zero-access Test
