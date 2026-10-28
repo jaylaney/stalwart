@@ -9,9 +9,9 @@ This is documentation disposition, not implementation or runtime acceptance.
 ## Reviewed versions and evidence boundary
 
 - [Current design](2026-10-27-stalwart-01627-upgrade-design.md), SHA-256
-  `8470ed525dc84290a1279f1df5e82a67c2d2cf71c9037e03a83e30fd35190570`.
+  `aeb6223c4eefda0470ccfbd0c916cbfb508174584d3814b6e81285317dea9585`.
 - [Current plan](../plans/2026-10-27-stalwart-01627-upgrade.md), SHA-256
-  `b111cda1d45c03daf4b4d09ed791e13f3a901ddddac1b6079f5a6473616fcc3e`.
+  `1cf41feffd8727ce58bb35d75f13aa4d815e6737ace255fe620dd9cae451eacf`.
 - Original design SHA-256:
   `b4d9e18599a0e926d3ee5f2e1f3b363d9ec4deec63b5bffe0604c9bb153b3647`.
 - Original plan SHA-256:
@@ -179,3 +179,135 @@ CI dispatch, deployment or implementation is authorized by these documentation c
   remain available; the separate 1.0 private-test transition is not part of this update.
 - The beta.2 naming proposal follows the release policy. Actual candidate results, Linux
   artifact provenance and native-client status remain future implementation/release gates.
+
+## Re-review of the revised drafts
+
+Re-reviewed 2026-10-28 by the original reviewer.
+
+- Reviewed: the design at SHA-256 `8470ed52…0570`, the plan at `b111cda1…cc3e`, and this
+  record as it stood before this section (`080109b3…2c21`).
+- Method: checked every disposition and correction above against source. Sources: the
+  calcard 0.3.14 crate source, the three lockfiles' full package blocks, the vault and
+  release tests, and the DAV query, drain and iTIP builder code. Then read the revised plan
+  for new gaps.
+- Validation boundary: static review. No cargo command, build or test.
+- Result: every disposition holds. The four corrections to the original review are right,
+  and those original claims are withdrawn. The re-review adds one P3 and one nit. Nothing
+  blocks approving the plan; the P3 is a fixture detail an implementer can take as a note.
+
+### Corrections to the original review, confirmed
+
+- **Lockfile.** Comparing full package blocks, not just versions, gives the 12 names listed
+  above. The extra entries are new `zeroize` edges on `argon2`, `chacha20` and
+  `chacha20poly1305`, plus `vault`, `totp-rs`, `subtle`, `base64` and `zeroize` edges on
+  the workspace crates. The original two-package rule would have discarded them.
+- **RFC 7748 constant.** It feeds `display_fingerprint_is_the_sha256_prefix_in_eight_groups`
+  ([keys.rs](../../../crates/vault/src/keys.rs:703)), a fixed SHA-256 expectation. It is not
+  an X25519 known-answer test, as the original review said.
+- **Timezone resolution.** calcard's `ICalendarComponent::timezone`
+  (`calcard-0.3.14/src/icalendar/timezone.rs:84-111`) resolves a definition through its TZID
+  name, `X-LIC-LOCATION` or `X-MICROSOFT-CDO-TZID`, and never reads the observances. The
+  original arbitrary-offset fixture would therefore resolve identically on .26 and .27. The
+  `X-LIC-LOCATION:Europe/Paris` fixture gives the intended difference.
+- **Derived times.** These are recomputed in the drain from the merged plaintext, with a
+  floating default ([drain.rs](../../../crates/groupware/src/calendar/drain.rs:1373)), not
+  by a background index.
+- **Release fixture.** `test_release_metadata.py` copies the real main manifest and asserts
+  its `VERSION` ([line 88](../../../scripts/tests/test_release_metadata.py:88)), so it must
+  follow the bump. `test_verify_product.py` is self-contained.
+- **Push wording.** "Can only pass" was too strong. The new sites cannot leak content, but a
+  state assertion can catch a missing or misrouted notification.
+
+### Revised plan checks that hold
+
+- **The drain receives the custom definition.** The organizer's outgoing REQUEST copies every
+  VTIMEZONE from its event
+  ([organizer.rs](../../../crates/groupware/src/scheduling/organizer.rs:376)). An organizer
+  PUT therefore drives the regression, and no planted item is needed.
+- **The REPORT exercises the merged definition.**
+  - A VEVENT comp-filter time range is checked against the expansion stored at write time
+    ([query.rs](../../../crates/dav/src/calendar/query.rs:234)). The drain builds that
+    expansion from the event's own definitions.
+  - The name-only `Tz::from_str` lookup
+    ([query.rs](../../../crates/dav/src/calendar/query.rs:297)) serves only property-filter
+    time ranges.
+  - The resource prefilter
+    ([is_resource_in_time_range](../../../crates/dav/src/calendar/query.rs:131)) uses the
+    resource's cached overall range. The fixture must bracket the moved day with earlier
+    and later instances and verify that both windows fit inside that range on both
+    versions; merely choosing the moved instance's day does not establish this.
+- **Red and green.** On .26 the unresolved TZID stays floating and is read in the calendar
+  timezone at query time (UTC per the fixture); on .27 it resolves to Europe/Paris. This
+  matches the floating behaviour that
+  [dav_seal.rs](../../../tests/src/za/dav_seal.rs:683) documents. Established by reading,
+  not run.
+- **Search variant.** Under the variant's own convention (UID *n* carries `Flag_00<n-1>`),
+  the four keywords select UIDs 1, 3, 4 and 6, so the expected `1 3 4 6` is right. The new
+  SAVE leaves `$` holding the same set, so the variant's later `$` assertions still hold.
+
+### New findings
+
+#### [P3] Choose the time-range windows so each overlaps only one candidate instance
+
+A VEVENT matches a time range on interval overlap (`start < DTEND && end > DTSTART`,
+[types/src/lib.rs](../../../crates/types/src/lib.rs:37)). The correct and fallback start
+times of the moved instance differ by exactly the Paris winter offset, one hour.
+
+With an instance of an hour or longer, a narrow window centred on the fallback start
+overlaps the correct instance's tail. For example, an instance at 13:00–14:00Z and a window
+at 13:55–14:05Z overlap, so "the fallback window does not match" fails after a correct merge.
+
+Fix:
+
+- Give the moved instance a duration well under an hour (for example 30 minutes).
+- Place each window strictly inside its own candidate interval (start + 5 min to
+  start + 10 min). This is the new fixture's choice; `dav_seal.rs` instead uses broader
+  windows to accommodate its different cached-range precondition.
+- Keep other instances off the moved day, with at least one earlier and one later day,
+  and verify that both candidate windows pass the overall-range prefilter.
+
+Confidence: high, by reading the overlap rule and the plan's fixture description.
+
+Disposition 2026-10-28: the design and Task 2 now specify a 30-minute middle occurrence in
+a January 10/17/24 weekly series, moved to 14:00 Europe/Paris on January 17. The candidate
+UTC starts are 13:00/14:00 and the windows are 13:05–13:10/14:05–14:10. Earlier and later
+instances bracket both windows; implementation must verify the cached-range precondition.
+This is a documentation correction; the regression has not been executed.
+
+#### Nit
+
+- The new edited-crate gate (`cargo test -p imap -p jmap -p dav -p dav-proto`) came from the
+  original review and was not compiled for it. The test modules are plain `#[cfg(test)]`
+  with no feature gates, but upstream's CI runs none of these crates' units either. If one
+  fails to compile, run the other crates separately and record the affected gate as failed/
+  pending. Label it pre-existing only with a matching baseline failure or equivalent
+  conclusive source evidence. Diagnose test configuration before proposing a narrow
+  correction; neither speculative feature additions nor a silent gate waiver is justified.
+
+Disposition 2026-10-28: Task 4 records this qualified handling. No unit harness was compiled
+or run while correcting the documentation.
+
+### Closure check
+
+Checked 2026-10-28 by the original reviewer against the design at SHA-256 `aeb6223c…9585` and
+the plan at `1cf41fef…eacf`. Static review; nothing was run.
+
+- **The P3 is closed.** With the custom zone resolving to Paris (UTC+1 in January), the
+  30-minute override at custom-zone 14:00 is 13:00–13:30Z on .27. On .26 it stays floating
+  and is read in the UTC calendar timezone, giving 14:00–14:30Z. Under the overlap rule:
+  - the 13:05–13:10Z window matches only the .27 instance;
+  - the 14:05–14:10Z window matches only the .26 instance.
+
+  So the regression is red on .26 and green on .27. The second window also catches a
+  duplicate: if the override failed to replace the January 17 master instance
+  (14:00–14:30Z), that instance would match it on .27. The January 10 and 24 instances
+  bracket both windows, and the plan requires the implementer to verify the cached-range
+  precondition.
+- **The amendments to the re-review text above are accepted.**
+  - The prefilter bullet now states the precise condition: bracketing instances, not just
+    choosing the moved day.
+  - The `dav_seal.rs` remark is corrected: that test's broad window serves its own
+    cached-range precondition.
+  - The nit's failure handling is stricter than the original suggestion and is sound.
+- **No open findings remain** in the design or plan. Implementation, the red/green receipts
+  and every qualification gate remain future work.

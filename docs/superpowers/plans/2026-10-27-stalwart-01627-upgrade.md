@@ -114,11 +114,18 @@ mail state-only push interfaces remain unchanged.
 - [ ] Before the merge, extend the existing timezone fixture and sealed-drain regression.
   Use the established `DrainOn`/pending-item helpers and existing account fixtures. A recurring
   REQUEST update moves one occurrence into a newly referenced custom TZID with its supplied
-  VTIMEZONE and `X-LIC-LOCATION:Europe/Paris`. Set the fixture default to UTC and use a winter
-  date; arbitrary custom offsets alone are not interpreted by calcard. Assert correct
-  recurrence/moved time, one definition and no duplicate after repeated delivery. Add a
-  calendar-query time-range REPORT matching the correct moved UTC time and excluding the
-  fallback-time window. The no-new-timezone control already defines every referenced TZID.
+  VTIMEZONE and `X-LIC-LOCATION:Europe/Paris`. Set the fixture default to UTC; arbitrary
+  custom offsets alone are not interpreted by calcard. Use a weekly series at 14:00Z on
+  2099-01-10, 2099-01-17 and 2099-01-24, with a 30-minute duration on both master and
+  override. Move the middle instance's DTSTART to custom-zone 14:00 on January 17 while
+  retaining its original recurrence identity. Correct .27 time is 13:00Z; fallback is
+  14:00Z. Assert recurrence/time, one definition and no duplicate after repeated delivery.
+  Use VEVENT component-filter REPORT windows `20990117T130500Z`–`20990117T131000Z` (match)
+  and `20990117T140500Z`–`20990117T141000Z` (no match). These lie strictly inside their own
+  candidate intervals. Keep the other instances on the earlier/later days and verify both
+  windows fit inside the cached overall range on both versions, exercising instance
+  expansion rather than a negative from the resource prefilter. The no-new-timezone
+  control already defines every referenced TZID.
   Run the relevant whole ZA/WebDAV suites once on .26 for the behavioral red receipt;
   unrelated failures do not establish the regression.
 - [ ] Primary commits the regression fixture/test changes on the isolated integration branch
@@ -220,6 +227,13 @@ to `1` only for key runs, and use `BLOB_STORE=FileSystem` only on its named ZA v
   named new-case completion, failures and retries; zero selected tests fails the gate.
   Do not remove test modules or broaden skips to obtain green results. Do not repeat passing
   checks without intervening changes, failures or new evidence.
+- [ ] If the edited-crate unit command fails to compile, run unaffected package harnesses
+  separately and retain the failed crate's receipt. Call the failure pre-existing only
+  after reproducing the same command/environment on the relevant unchanged baseline or
+  establishing equivalent conclusive source evidence. The affected gate remains failed/
+  pending; other passing crates do not satisfy it. Diagnose any required test configuration
+  before proposing a narrow command correction. Do not add speculative features or silently
+  waive the gate to obtain green results.
 
 | Gate | Command or existing workflow |
 |---|---|

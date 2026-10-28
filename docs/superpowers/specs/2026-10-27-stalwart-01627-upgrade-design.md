@@ -74,9 +74,15 @@ sender and write-fence checks unchanged.
 
 Calcard 0.3.14 resolves timezone names and recognized aliases; it does not execute arbitrary
 STANDARD/DAYLIGHT rules to resolve an unknown custom TZID. Use a custom TZID with
-`X-LIC-LOCATION:Europe/Paris`, a UTC fixture default and a winter date for the time-range
-regression. After drain, query a narrow window around the moved occurrence's correct UTC
-time and an incorrect fallback-time window; the first matches and the second does not.
+`X-LIC-LOCATION:Europe/Paris` and a UTC fixture default. Use a three-occurrence weekly
+series on 2099-01-10, 2099-01-17 and 2099-01-24, initially at 14:00Z. Give the master and
+moved override a 30-minute duration. Move the middle occurrence to 14:00 in the custom
+timezone, keeping its original recurrence identity: .27 resolves it to 13:00Z, whereas the
+unresolved .26 value falls back to 14:00Z. After drain, use VEVENT component time-range
+windows 13:05–13:10Z and 14:05–14:10Z on January 17. The first matches and the second does
+not; neither interval overlaps both candidate occurrences. Earlier and later series
+instances bracket both windows within the cached overall range, so that the query reaches
+instance expansion instead of succeeding through prefilter rejection.
 This checks stored derived times and calendar-query behavior. The drain computes those
 times before sealing; background calendar content indexing remains refused for key accounts.
 Record the developer guide's visibility-policy check: TZID and X-LIC-LOCATION remain visible.
