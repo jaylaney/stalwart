@@ -1,4 +1,4 @@
 # Independent product identity; internal crates retain the upstream compatibility version.
-version = "0.1.0-beta.1"
-upstream_tag = "v0.16.26"
-upstream_commit = "18f4e9505027d790fd7e9fdad7f922be6719101d"
+version = "0.1.0-beta.2"
+upstream_tag = "v0.16.27"
+upstream_commit = "aa47d8ef7bfba7200d3293198ac2592747b20e73"
