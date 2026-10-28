@@ -17,7 +17,8 @@ use registry::{
     types::datetime::UTCDateTime,
 };
 use serde_json::json;
-use store::write::now;
+use services::task_manager::manager::next_retry_time;
+use store::write::{BatchBuilder, now};
 use types::id::Id;
 
 const TASK_WAIT_ATTEMPTS: usize = 100;
@@ -29,6 +30,7 @@ const TASK_PERM_FAIL: u64 = 2;
 
 pub async fn test(test: &mut TestServer) {
     println!("Running Task manager tests...");
+    retry_time_boundaries();
     let admin = test.account("admin@example.org");
 
     // Make sure there are no existing tasks
@@ -101,7 +103,7 @@ pub async fn test(test: &mut TestServer) {
         .await
         .assert_destroyed(&[task.id]);
 
-    // Test attempt limits strategy
+    // Test the terminal deadline transition independently of worker scheduling latency.
     admin
         .registry_update_setting(
             TaskManager {
@@ -116,19 +118,37 @@ pub async fn test(test: &mut TestServer) {
         .await;
     admin.reload_settings().await;
 
-    // Create a temporary failure task for immediate execution
-    admin.schedule_test_task(TASK_TEMP_FAIL, 0).await;
-    let task = admin.assert_has_retried_task().await;
-    let task_status = task.task.status().unwrap_retry();
-    assert_eq!(task_status.failure_reason, "Simulated temporary failure");
-    assert_eq!(task_status.attempt_number, 1);
+    // Seed a retry whose deadline has already passed. created_at is server-set,
+    // so plant this test-local fixture directly instead of through the registry API.
+    let seeded_at = now() as i64;
+    let retry_created_at = UTCDateTime::from_timestamp(seeded_at - 10);
+    let deadline_task_id = test.server.registry().assign_id();
+    let mut batch = BatchBuilder::new();
+    batch.schedule_task_with_id(
+        deadline_task_id,
+        Task::StoreMaintenance(TaskStoreMaintenance {
+            maintenance_type: TaskStoreMaintenanceType::RemoveLockDav,
+            shard_index: Some(TASK_TEMP_FAIL),
+            status: TaskStatus::Retry(TaskStatusRetry {
+                created_at: retry_created_at,
+                due: UTCDateTime::from_timestamp(seeded_at - 1),
+                attempt_number: 1,
+                failure_reason: "Seeded temporary failure".to_string(),
+            }),
+        }),
+    );
+    test.server.store().write(batch.build_all()).await.unwrap();
+    test.server.notify_task_queue();
 
-    // Wait until 2 seconds deadline is reached
-    test.wait_for_tasks_skip_failures().await;
+    // The worker must execute the temporary failure and refuse another retry.
     let task = admin.assert_has_failed_task().await;
+    assert_eq!(task.id, Id::from(deadline_task_id));
     let task_status = task.task.status().unwrap_failed();
     assert_eq!(task_status.failure_reason, "Simulated temporary failure");
-    assert_eq!(task_status.failed_attempt_number, 2);
+    assert_eq!(task_status.failed_attempt_number, 1);
+    assert_eq!(task_status.created_at, retry_created_at);
+    assert!(task_status.failed_at.timestamp() > retry_created_at.timestamp() + 2);
+    assert_eq!(task.task.due_timestamp(), u64::MAX);
     admin
         .registry_destroy(ObjectType::Task, [task.id])
         .await
@@ -137,6 +157,52 @@ pub async fn test(test: &mut TestServer) {
     pagination_test(test).await;
 
     test.cleanup().await;
+}
+
+fn retry_time_boundaries() {
+    let manager = TaskManager {
+        max_attempts: 100,
+        strategy: TaskRetryStrategy::FixedDelay(TaskRetryStrategyFixed {
+            delay: 1_000u64.into(),
+        }),
+        total_deadline: 2_000u64.into(),
+    };
+    assert_eq!(
+        next_retry_time(&manager, None, 100, 0, 100),
+        Some(101),
+        "the initial temporary failure schedules a retry after the fixed delay"
+    );
+    assert_eq!(
+        next_retry_time(&manager, None, 100, 1, 101),
+        Some(102),
+        "a retry exactly at the deadline is allowed"
+    );
+    assert_eq!(
+        next_retry_time(&manager, None, 100, 2, 102),
+        None,
+        "a retry beyond the deadline is refused"
+    );
+    assert_eq!(
+        next_retry_time(&manager, None, 100, 1, 102),
+        None,
+        "a delayed execution cannot schedule another retry beyond the deadline"
+    );
+
+    let manager = TaskManager {
+        max_attempts: 3,
+        total_deadline: 86_400_000u64.into(),
+        ..manager
+    };
+    assert_eq!(
+        next_retry_time(&manager, None, 100, 2, 102),
+        Some(103),
+        "an attempt below the maximum is allowed with a generous deadline"
+    );
+    assert_eq!(
+        next_retry_time(&manager, None, 100, 3, 102),
+        None,
+        "the maximum attempt limit refuses another retry"
+    );
 }
 
 async fn pagination_test(test: &mut TestServer) {

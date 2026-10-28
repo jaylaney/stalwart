@@ -14,7 +14,9 @@ use crate::utils::{
 use base64::{Engine, engine::general_purpose};
 use biscuit::{JWT, SingleOrMultiple, jwk::JWKSet};
 use bytes::Bytes;
+use common::BuildServer;
 use common::auth::oauth::{
+    GrantType,
     introspect::OAuthIntrospect,
     oidc::StandardClaims,
     registration::{
@@ -66,6 +68,8 @@ pub struct ProtectedResourceMetadata {
 const PKCE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 const PKCE_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 const PROFILE_SCOPE: &str = "urn:ietf:params:oauth:scope:mail offline_access";
+const REFRESH_TOKEN_LIFETIME: u64 = 10;
+const REFRESH_TOKEN_RENEWAL: u64 = 4;
 
 #[derive(Debug, serde::Deserialize)]
 pub struct OpenIdMetadata {
@@ -98,8 +102,12 @@ pub async fn test(test: &mut TestServer) {
         auth_code_expiry: registry::schema::prelude::Duration::from_millis(1000),
         auth_code_max_attempts: 1,
         user_code_expiry: registry::schema::prelude::Duration::from_millis(1000),
-        refresh_token_expiry: registry::schema::prelude::Duration::from_millis(3000),
-        refresh_token_renewal: registry::schema::prelude::Duration::from_millis(2000),
+        refresh_token_expiry: registry::schema::prelude::Duration::from_millis(
+            REFRESH_TOKEN_LIFETIME * 1000,
+        ),
+        refresh_token_renewal: registry::schema::prelude::Duration::from_millis(
+            REFRESH_TOKEN_RENEWAL * 1000,
+        ),
         anonymous_client_registration: true,
         require_client_registration: true,
         signature_algorithm: JwtSignatureAlgorithm::Rs256,
@@ -774,6 +782,28 @@ pub async fn test(test: &mut TestServer) {
     let (token, refresh_token, _) =
         unwrap_token_response(post(&metadata.token_endpoint, &token_params).await);
     let refresh_token = refresh_token.unwrap();
+    let (refresh_issued_at, refresh_expiry, refresh_expires_in) = match test
+        .server
+        .inner
+        .build_server()
+        .validate_access_token(Some(GrantType::RefreshToken), &refresh_token)
+        .await
+    {
+        Ok(info) => (info.issued_at, info.expiry, info.expires_in),
+        Err(err) => panic!(
+            "Refresh metadata validation failed: event_type={}",
+            err.event_type().to_id()
+        ),
+    };
+    assert_eq!(
+        refresh_expiry.checked_sub(refresh_issued_at),
+        Some(REFRESH_TOKEN_LIFETIME),
+        "issued_at={refresh_issued_at} expiry={refresh_expiry}"
+    );
+    assert!(
+        refresh_expires_in > REFRESH_TOKEN_RENEWAL && refresh_expires_in <= REFRESH_TOKEN_LIFETIME,
+        "issued_at={refresh_issued_at} expiry={refresh_expiry} expires_in={refresh_expires_in}"
+    );
 
     // Authorization codes can only be used once
     assert_eq!(
@@ -826,31 +856,39 @@ pub async fn test(test: &mut TestServer) {
         ("grant_type".to_string(), "refresh_token".to_string()),
         ("refresh_token".to_string(), refresh_token),
     ]);
-    let time_before_post: Instant = Instant::now();
+    let early_now = store::write::now();
+    let early_remaining = refresh_expiry.saturating_sub(early_now);
+    assert!(
+        early_remaining > REFRESH_TOKEN_RENEWAL,
+        "now={early_now} expiry={refresh_expiry} remaining={early_remaining} elapsed_ms={}",
+        time_first_token.elapsed().as_millis()
+    );
     let (token, new_refresh_token, _) =
         unwrap_token_response(post(&metadata.token_endpoint, &refresh_params).await);
-    assert_eq!(
-        new_refresh_token,
-        None,
-        "Refreshed token in {:?}, since start {:?}",
-        time_before_post.elapsed(),
-        time_first_token.elapsed()
+    assert!(
+        new_refresh_token.is_none(),
+        "Early refresh renewed: now={early_now} expiry={refresh_expiry} remaining={early_remaining} elapsed_ms={}",
+        time_first_token.elapsed().as_millis()
     );
 
-    // Wait 1 second and make sure the access token expired
+    // The access token still has a one-second lifetime, independent of refresh renewal.
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_unauthorized("https://127.0.0.1:8899", &token).await;
 
-    // Wait another second for the refresh token to be about to expire
-    // and expect a new refresh token
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Enter the renewal window with three seconds left on the original refresh token.
+    let late_now = wait_until_epoch(refresh_expiry - 3).await;
+    let late_remaining = refresh_expiry.saturating_sub(late_now);
+    assert!(
+        late_remaining > 0 && late_remaining <= REFRESH_TOKEN_RENEWAL,
+        "now={late_now} expiry={refresh_expiry} remaining={late_remaining} renewal={REFRESH_TOKEN_RENEWAL} elapsed_ms={}",
+        time_first_token.elapsed().as_millis()
+    );
     let (_, new_refresh_token, _) =
         unwrap_token_response(post(&metadata.token_endpoint, &refresh_params).await);
-    //println!("New refresh token: {:?}", new_refresh_token);
-    assert_ne!(new_refresh_token, None);
+    assert!(new_refresh_token.is_some());
 
-    // Wait another second and make sure the refresh token expired
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Reject the original refresh token at its recorded absolute expiry.
+    wait_until_epoch(refresh_expiry).await;
     assert_eq!(
         post::<TokenResponse>(&metadata.token_endpoint, &refresh_params).await,
         TokenResponse::Error {
@@ -862,6 +900,22 @@ pub async fn test(test: &mut TestServer) {
     admin.registry_destroy_all(ObjectType::OAuthClient).await;
     admin.destroy_account(user).await;
     test.cleanup().await;
+}
+
+async fn wait_until_epoch(target: u64) -> u64 {
+    // Bound wall-clock waits even if the clock stops advancing or moves backwards.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let now = store::write::now();
+        if now >= target {
+            return now;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Timed out waiting for epoch: now={now} target={target}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 async fn post_bytes(
@@ -1054,6 +1108,7 @@ async fn assert_unauthorized(base_url: &str, token: &str) {
     }
 }
 
+#[track_caller]
 fn unwrap_token_response(response: TokenResponse) -> (String, Option<String>, u64) {
     match response {
         TokenResponse::Granted(granted) => {
@@ -1068,6 +1123,7 @@ fn unwrap_token_response(response: TokenResponse) -> (String, Option<String>, u6
     }
 }
 
+#[track_caller]
 fn unwrap_oidc_token_response(response: TokenResponse) -> (String, Option<String>, String) {
     match response {
         TokenResponse::Granted(granted) => {

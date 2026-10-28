@@ -2,6 +2,13 @@
 
 ## Status and evidence boundary
 
+The [system-suite follow-up](#system-suite-follow-up-on-2026-10-28) records the later
+fixture corrections, two passing complete system runs and fresh CalDAV qualification.
+Docker-dependent directory, Linux release-artifact and native-client qualification remain
+pending. The initial candidate snapshot below retains its original failures and source attribution.
+
+### Initial candidate snapshot
+
 Task 1 source inventory was recorded on 2026-10-28; the retained source inventory below is
 historical context. The .27 merge and beta.2 preparation are integrated. Candidate
 `51bbecce06cd0875d09639b6fbe427253856a379` passed the recorded style, 412 unit tests and eight
@@ -532,3 +539,80 @@ unestablished. Historical outcomes are contracts, not new candidate evidence. Th
 maintenance source is prepared locally with the qualification limits above. There has been
 no push, PR, CI dispatch, publication, deployment, old-data access/reset, system installation
 or worktree cleanup. Reviewer-owned design-review and historical outcomes remain untouched.
+
+## System-suite follow-up on 2026-10-28
+
+The user reopened the failed system gate, requested the full CalDAV end-to-end suite and
+a pull request to the fork. The follow-up code changes are confined to four system-test
+fixtures. Product source, dependency versions, stored layouts, credentials/key handling,
+CalDAV collection manifests and compatibility policies are unchanged from `0d03497f3`.
+
+The fixture corrections preserve the original behavioral checks:
+
+- OAuth refresh checks use the original token's recorded expiry, a ten-second fixture
+  lifetime and a four-second renewal window. Early refresh must omit renewal, late refresh
+  must renew, and the original token must fail at expiry. Access-token expiry and the
+  existing grant, refusal, one-use-code and loopback checks remain.
+- The temporary-ban phase isolates login/IP counters, reuses a client and requires 100
+  failures with 401, the triggering 429, correct-credential 403 while the five-second ban
+  is active, and 200 after recorded expiry and reload. Permanent-ban and concurrency checks
+  remain.
+- Temporary upload limits are captured before quota checks, restored through exactly
+  `UploadTtl`, `UploadQuota` and `MaxUploadCount`, reloaded and read back before later
+  imports. TTL readback compares milliseconds. Upload count/bytes/expiry and account disk
+  quota checks remain.
+- Task tests retain live retries through the exact maximum of three. Explicit timestamps
+  check initial scheduling, deadline equality, delayed/beyond-deadline rejection and the
+  attempt limit. An already-expired retry fixture still traverses the real queue, lock and
+  worker, then must retain its identity/origin, fail at attempt one with the simulated
+  failure reason, become terminal and be removed.
+
+Local diagnostics captured both authentication checks running at an expired deadline. A
+new restoration assertion also failed deterministically before the upload-setting fix,
+showing `(50000, 3, 1)` instead of `(50000000, 1000, 3600)` in its original seconds-based
+readback. The earlier task-count failure lacks its original timing data; deterministic
+boundary checks establish the valid delayed-retry semantics. The missing blob's reservation
+expiry was consistent with the failure time, with no exact server access-check timestamp.
+
+All commands below ran sequentially on macOS with stable Rust 1.99.0, locked dependencies,
+fresh worktree-specific state, `STORE=RocksDb`, `RUST_MIN_STACK=16777216`, and secrets/source
+identity overrides unset. Each system/WebDAV selector selected one complete Cargo test suite.
+Normal mode left `ZA_KEY_ACCOUNTS` unset; the encrypted WebDAV row set it to `1`.
+
+| Gate | Result | Command seconds | Receipt |
+| --- | --- | ---: | --- |
+| `cargo fmt --all --check` | exit 0 | 3.44 | `style-final.log` |
+| `system::system_tests`, repeat 1 | 1 passed, 0 failed; exit 0 | 114.25 | `system-final1.log` |
+| `system::system_tests`, repeat 2 | 1 passed, 0 failed; exit 0 | 66.32 | `system-final2.log` |
+| `webdav::webdav_tests`, ordinary | 1 passed, 0 failed; exit 0 | 17.03 | `webdav-plain.log` |
+| `webdav::webdav_tests`, key accounts | 1 passed, 0 failed; exit 0 | 20.86 | `webdav-key.log` |
+| `cargo test --locked -p vault -p groupware -p common` | 317 unit tests passed; exit 0 | 12.90 | `core-units.log` |
+| CalDAV harness | 30 passed; exit 0 | 5.23 | `caldav-harness.log` |
+| Full pinned CalDAV runner, both modes | ordinary 66 passed / 1 skipped / 5 xfailed; key 71 passed / 1 skipped / 5 xfailed; exit 0 | 23.73 | `caldav-client.log` |
+
+The 317 core units are common 123, groupware 149 and vault 45; zero-test doctests are
+excluded. CalDAV still requires all 72 ordinary and 77 key-account cases, including strict
+flows. Existing skips/expected failures remain distinct from passes.
+
+The Rust rows identify parent `0d03497f3325c363288b8ff820ed660d8b1b23ee` plus frozen patch
+SHA-256 `6f1d211974d4a64059c6122d913c2d472f9aa90a0b4c216fb4c9182ec4318e3f`.
+The subsequent TTL readback precision correction changes only two `as_secs()` calls to
+`as_millis()` and their assertion label. A final committed-head system check is required before
+opening the PR; retain its exact-source receipt in the follow-up execution record.
+
+The independent CalDAV run reused the verified clean OSS binary from
+`0d03497f3325c363288b8ff820ed660d8b1b23ee`, SHA-256
+`ed24c2e3196a475e3d1bae20040ad83aed0ce3450ae2d14a038eb27c1cf6878d`.
+Its `--version`/`--help` identity and checksum were checked again; shipping inputs and the
+client runner are unchanged by these test-only corrections. Python 3.15.2 executed the
+existing pinned client commit `111ae14b875f40d100d5259820f10210f00e20f9`. This run establishes
+fresh local CalDAV behavior for that artifact; it is not a rebuilt artifact for the later
+PR head or Linux release provenance.
+
+Exact commands, environments, source patches, initial failures and sanitized client logs
+remain under `.superpowers/sdd/2026-10-28-system-suite-repair/` and
+`.run/system-suite-repair/caldav-client-logs/`. A fresh independent review covered the
+four test-file corrections; the originating model tier was unavailable, so delegated work
+inherited the parent model with high reasoning for implementation and xhigh for review.
+Review files remain untouched. Publication/deployment and native, Docker-dependent directory
+or Linux release-artifact acceptance are separate gates.
