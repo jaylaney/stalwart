@@ -36,17 +36,22 @@ use ::registry::{
     },
     types::EnumImpl,
 };
-use calcard::icalendar::{ICalendarMethod, ICalendarValue};
+use calcard::{
+    common::timezone::Tz,
+    icalendar::{ICalendarMethod, ICalendarValue},
+};
 use common::{
     auth::credential::AppPassword,
     za::test_hooks::{self, DRAIN_SKIP_ALL},
 };
+use groupware::cache::GroupwareCache;
 use groupware::calendar::{
     CalendarEvent, ChangedBy, EVENT_NOTIFICATION_IS_CHANGE, EVENT_NOTIFICATION_ZA_PENDING,
 };
 use hyper::{Method, StatusCode};
 use serde_json::json;
 use std::time::Duration;
+use types::{TimeRange, collection::SyncCollection};
 
 /// The suite skips every account's drain (`za_tests` sets `DRAIN_SKIP_ALL`
 /// after setup, so the plan 8 and 9 modules keep reading pending items);
@@ -356,6 +361,8 @@ pub async fn test(test: &mut TestServer) {
     );
     assert_eq!(uid_copies(test, key2.id, uid6).await, 1);
 
+    test_timezone_merge(test).await;
+
     // Cleanup: the copies with `Schedule-Reply: F` (no declined REPLY), the
     // organizer's events the same way, every item written here.
     for uid in [uid, uid2, uid3, uid6] {
@@ -375,6 +382,241 @@ pub async fn test(test: &mut TestServer) {
     key1.delete_items_since(test, &start1).await;
     assert_eq!(za_uid_leases(test).await, 0);
     test.wait_for_tasks_skip_not_due().await;
+}
+
+/// .27 must retain newly referenced incoming zones before deriving times and sealing.
+/// Run the already-defined-zone control first; collect semantic results through repeated
+/// delivery so the .26 RED still exercises the sealing, cache and REPORT preconditions.
+async fn test_timezone_merge(test: &mut TestServer) {
+    println!("Running zero-access drain timezone merge regression...");
+    let key1 = Party::new(test, "key1@example.com");
+    let key2 = Party::new(test, "key2@example.com");
+    let keys1 = za_unlock(test, key1.id, STRONG).await;
+    let before1 = inbox_ids(test, key1.id).await;
+    let before2 = inbox_ids(test, key2.id).await;
+    let calendar = "/dav/cal/key2%40example.com/default/";
+    let utc = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VTIMEZONE\r\nTZID:UTC\r\nEND:VTIMEZONE\r\nEND:VCALENDAR\r\n";
+    key2.client
+        .proppatch(calendar, [("A:calendar-timezone", utc)], [], [])
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    let calendar_archive = super::dav_seal::raw_calendar(test, key2.id, "default").await;
+    assert_eq!(
+        calendar_archive
+            .unarchive::<groupware::calendar::Calendar>()
+            .unwrap()
+            .preferences(key2.id)
+            .time_zone
+            .tz(),
+        Some(Tz::UTC)
+    );
+    let zone = concat!(
+        "BEGIN:VTIMEZONE\r\nTZID:za-drain-paris\r\nX-LIC-LOCATION:Europe/Paris\r\n",
+        "BEGIN:STANDARD\r\nDTSTART:19700101T000000\r\nTZOFFSETFROM:+0100\r\n",
+        "TZOFFSETTO:+0100\r\nTZNAME:drain-tzname-canary\r\n",
+        "COMMENT:drain-tzcomment-canary\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\n"
+    );
+    let stamp = |value: &str| {
+        chrono::NaiveDateTime::parse_from_str(value, "%Y%m%dT%H%M%SZ")
+            .unwrap()
+            .and_utc()
+            .timestamp()
+    };
+    let windows = [
+        ("20990117T130500Z", "20990117T131000Z"),
+        ("20990117T140500Z", "20990117T141000Z"),
+    ];
+    let mut results = Vec::new();
+    for predefined in [true, false] {
+        let uid = if predefined {
+            "za-drain-tz-control"
+        } else {
+            "za-drain-tz-new"
+        };
+        let organizer = format!("{KEY1_CAL}{uid}.ics");
+        let master = invite(uid, "20990110T140000Z", &["key2@example.com"]).replace(
+            "DURATION:PT1H",
+            "DURATION:PT30M\r\nRRULE:FREQ=WEEKLY;COUNT=3",
+        );
+        key1.client
+            .request_with_headers("PUT", &organizer, [CONTENT_TYPE], master.clone())
+            .await
+            .with_status(StatusCode::CREATED);
+        assert_eq!(pending_ids(test, key2.id).await.len(), 1);
+        assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+        let href = copy_href(test, key2.id, uid).await;
+        let rel = relative(&href);
+        if predefined {
+            // An unreferenced definition is omitted from the outbound invitation.
+            // Seed the control's existing copy through its owner's ordinary PUT.
+            let existing = body(&key2.client, &href).await;
+            key2.client
+                .request_with_headers(
+                    "PUT",
+                    &href,
+                    [CONTENT_TYPE],
+                    existing.replace("BEGIN:VEVENT", &format!("{zone}BEGIN:VEVENT")),
+                )
+                .await
+                .with_status(StatusCode::NO_CONTENT);
+        }
+        let token = *stored_pairs(test, &keys1, key1.id, &format!("default/{uid}.ics"))
+            .await
+            .unwrap()
+            .get("key2@example.com")
+            .unwrap();
+        // calcard associates overrides with the master's SEQUENCE.
+        let master_update = master
+            .split_once("BEGIN:VEVENT")
+            .unwrap()
+            .1
+            .trim_end_matches("END:VCALENDAR\r\n")
+            .replace("SEQUENCE:0", "SEQUENCE:1");
+        let master_update = format!("BEGIN:VEVENT{master_update}");
+        let update = format!(
+            concat!(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\nMETHOD:REQUEST\r\n{zone}{master_update}",
+                "BEGIN:VEVENT\r\nUID:{uid}\r\nDTSTAMP:20240101T000000Z\r\nSEQUENCE:1\r\n",
+                "RECURRENCE-ID:20990117T140000Z\r\nDTSTART;TZID=za-drain-paris:20990117T140000\r\n",
+                "DURATION:PT30M\r\nSUMMARY:drain-tz-summary-canary\r\n",
+                "ORGANIZER:mailto:key1@example.com\r\nATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:key2@example.com\r\n",
+                "END:VEVENT\r\nEND:VCALENDAR\r\n"
+            ),
+            zone = zone,
+            master_update = master_update,
+            uid = uid
+        );
+        for delivery in 0..2 {
+            let item_id = plant_inbox_item(
+                test,
+                key2.id,
+                &update,
+                PlantedItem::Pending {
+                    pair: Some(("key2@example.com", token)),
+                    reply_token: None,
+                },
+                key1.id,
+                None,
+            )
+            .await;
+            assert_eq!(pending_ids(test, key2.id).await, [item_id]);
+            assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+            assert!(pending_ids(test, key2.id).await.is_empty());
+            assert_eq!(uid_copies(test, key2.id, uid).await, 1);
+            let shown = body(&key2.client, &href).await;
+            assert_eq!(
+                shown.matches("BEGIN:VEVENT").count(),
+                2,
+                "duplicate occurrence"
+            );
+            assert_eq!(shown.matches("RECURRENCE-ID:20990117T140000Z").count(), 1);
+            assert!(shown.contains("DTSTART;TZID=za-drain-paris:20990117T140000"));
+            let definitions = shown.matches("TZID:za-drain-paris\r\n").count();
+            let (archive, _) = raw_event(test, key2.id, &rel).await;
+            let stored = archive.unarchive::<CalendarEvent>().unwrap();
+            let sealed = stored.data.event.to_string();
+            assert!(sealed.contains("X-ZA-KEY:") && sealed.contains("X-ZA-SEALED:"));
+            let item = stored_item(test, key2.id, item_id).await;
+            assert_eq!(envelope_wrap(&item.event), Some(1));
+            for canary in [
+                "drain-tz-summary-canary",
+                "drain-tzname-canary",
+                "drain-tzcomment-canary",
+            ] {
+                assert!(
+                    !String::from_utf8_lossy(archive.as_bytes()).contains(canary),
+                    "event leaked {canary}"
+                );
+                assert!(
+                    !item.event.to_string().contains(canary),
+                    "item leaked {canary}"
+                );
+            }
+            let resources = test
+                .server
+                .fetch_dav_resources(key2.id, key2.id, SyncCollection::Calendar)
+                .await
+                .unwrap();
+            let cached = resources
+                .by_path(&rel)
+                .unwrap()
+                .resource
+                .event_time_range()
+                .unwrap();
+            for (start, end) in windows {
+                assert!(
+                    cached.0 < stamp(start) && cached.1 > stamp(end),
+                    "REPORT window must lie strictly inside cached overall range"
+                );
+            }
+            let mut expanded = stored
+                .data
+                .expand(
+                    Tz::UTC,
+                    TimeRange::new(stamp("20990101T000000Z"), stamp("20990201T000000Z")),
+                )
+                .unwrap();
+            expanded.sort_unstable_by_key(|instance| instance.start);
+            assert_eq!(
+                expanded.len(),
+                3,
+                "three weekly instances after repeated delivery"
+            );
+            assert_eq!(expanded[0].start, stamp("20990110T140000Z"));
+            assert_eq!(expanded[2].start, stamp("20990124T140000Z"));
+            assert_eq!(expanded[1].recurrence_id().utc, stamp("20990117T140000Z"));
+            assert!(
+                expanded
+                    .iter()
+                    .all(|instance| instance.end - instance.start == 1800)
+            );
+            let mut matches = Vec::new();
+            for (start, end) in windows {
+                let report = format!(
+                    "<C:calendar-query xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:prop><D:getetag/></D:prop><C:filter><C:comp-filter name=\"VCALENDAR\"><C:comp-filter name=\"VEVENT\"><C:time-range start=\"{start}\" end=\"{end}\"/></C:comp-filter></C:comp-filter></C:filter></C:calendar-query>"
+                );
+                let response = key2
+                    .client
+                    .request_with_headers("REPORT", calendar, [("depth", "1")], report)
+                    .await
+                    .with_status(StatusCode::MULTI_STATUS);
+                matches.push(response.hrefs().contains(&href.as_str()));
+            }
+            println!(
+                "timezone merge: predefined={predefined} delivery={delivery} definitions={definitions} middle_start={} reports={matches:?} cached={cached:?}",
+                expanded[1].start
+            );
+            results.push((
+                predefined,
+                delivery,
+                definitions,
+                expanded[1].start,
+                matches,
+            ));
+        }
+        key2.client
+            .request_with_headers("DELETE", &href, [NO_REPLY], "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+        key1.client
+            .request_with_headers("DELETE", &organizer, [NO_REPLY], "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    key2.client
+        .proppatch(calendar, [], ["A:calendar-timezone"], [])
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    key1.delete_items_since(test, &before1).await;
+    key2.delete_items_since(test, &before2).await;
+    assert_eq!(za_uid_leases(test).await, 0);
+    for (predefined, delivery, definitions, start, matches) in results {
+        assert_eq!(
+            (definitions, start, matches),
+            (1, stamp("20990117T130000Z"), vec![true, false]),
+            "incoming timezone lost: predefined={predefined}, delivery={delivery}"
+        );
+    }
 }
 
 /// PUTs `href` back with `address`'s PARTSTAT set to `partstat`, keeping
