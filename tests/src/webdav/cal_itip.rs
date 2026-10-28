@@ -277,7 +277,11 @@ pub fn test() {
                                                     ) {
                                                         Ok(result) => match result {
                                                             MergeResult::Actions(changes) => {
-                                                                itip_merge_changes(ical, changes);
+                                                                itip_merge_changes(
+                                                                    ical,
+                                                                    &message.message,
+                                                                    changes,
+                                                                );
                                                                 Ok(None)
                                                             }
                                                             MergeResult::Message(message) => {
