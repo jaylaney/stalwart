@@ -2,11 +2,21 @@
 
 ## Status and evidence boundary
 
-Task 1 source inventory recorded 2026-10-28. Integration, regressions, dependency resolution,
-builds, tests, binary identity, independent final review and release qualification are **pending**.
-Task 1 adds source inspection only; the separate primary-run baseline receipt below is not
-target qualification. Historical outcomes supply contracts, not candidate results. No runtime
-or client qualification is claimed.
+Task 1 source inventory was recorded on 2026-10-28; the retained source inventory below is
+historical context. The .27 merge and beta.2 preparation are integrated. Candidate
+`51bbecce06cd0875d09639b6fbe427253856a379` passed the recorded style, 412 unit tests and eight
+whole integration-suite rows. SMTP met its existing bounded retry contract. The complete
+system suite remains failed/pending after its one permitted unchanged-source diagnostic
+retry; this is a bounded local qualification, not an all-green branch or release acceptance.
+The exact locked OSS release build, clean candidate macOS identity, independent harness
+and both pinned CalDAV modes passed with the retained skip/xfail policy.
+Docker-dependent directory, Linux artifact and native-client gates remain pending.
+
+Implementation and the authorized bounded local execution are complete. The complete system
+gate and external/native qualifications remain outstanding; this is not full release
+qualification. A later outcome-only commit requires a fresh clean-final-HEAD identity
+build/check. Earlier tests keep their exact source attribution, and no final SHA or final
+identity result is implied here.
 
 Execution scope is the pinned .16.27 maintenance update and required fork adaptations,
 regressions, identity and documentation. No 1.0 code or private-test infrastructure, migration,
@@ -25,8 +35,8 @@ installation, CI dispatch, push, publication or deployment is included.
 | Integration branch | `codex/stalwart-01627-update` |
 | Checkout | `/Users/jay/.codex/worktrees/stalwart-01627-update/stalwart` |
 
-Primary created/reused the native isolated worktree and fetched the tag by URL. This task
-read `git rev-parse HEAD v0.16.27^{}` and confirmed the values above; no fetch, merge or Git
+Primary created/reused the native isolated worktree and fetched the tag by URL.
+Task 1 historical inspection read `git rev-parse HEAD v0.16.27^{}` and confirmed the values above; no fetch, merge or Git
 mutation was repeated. The local v0.16.26 tag is absent, so comparisons use its pinned commit.
 The start HEAD differs from the runtime baseline only in the three approved .27 planning
 files (design, design-review and implementation plan); product source is unchanged.
@@ -36,7 +46,7 @@ in the original checkout remains outside this task and was not copied or inspect
 Isolated locations (the target cache was APFS-cloned by primary; this inventory created no state):
 
 - `CARGO_TARGET_DIR=/Users/jay/.codex/worktrees/stalwart-01627-update/stalwart/target`
-- `ZA_RUN_DIR=/Users/jay/.codex/worktrees/stalwart-01627-update/stalwart/.run/upgrade-01627/state`
+- Actual Task 4 per-row `TMPDIR=/Users/jay/.codex/worktrees/stalwart-01627-update/stalwart/.run/upgrade-01627/state/<row>`; Task 2 used `.run/task2-red/` and `.run/task2-green/` as its receipts record
 - retained command receipts: `.superpowers/sdd/2026-10-27-stalwart-01627-upgrade/receipts/`
 - independent client source/venv/logs: `.run/upgrade-01627/caldav-client/`
 
@@ -56,7 +66,7 @@ warning-free claim. The log's test counts were inspected by Task 1. This is base
 only and does not satisfy post-integration candidate gates. Primary reports Docker CLI/app
 unavailable; related qualification remains pending unless an existing permitted route works.
 
-## Upstream delta and merge map
+## Task 1 historical source inventory — upstream delta and merge map
 
 `git diff --name-only 18f4e9505027d790fd7e9fdad7f922be6719101d aa47d8ef7bfba7200d3293198ac2592747b20e73` lists 53 paths. The upstream test tree and
 `.github/workflows/test.yml` remain present, and tests still enable public `test_mode` gates.
@@ -64,8 +74,8 @@ The target changes neither `crates/store/src`, `crates/types/src`, `crates/migra
 `crates/registry/src/schema/structs.rs`; generated serialization helpers change separately.
 No stored-struct/schema migration is supplied by this patch.
 
-The approved design's dry merge identified these three conflict paths. This task did not
-rerun a merge or manufacture merge results; primary must record actual integration conflicts:
+The approved design's dry merge identified these three conflict paths. Task 1 did not
+rerun a merge; the later actual integration dispositions are recorded below:
 
 - `Cargo.lock`: reconcile .27 package movement with the complete fork graph.
 - `crates/main/Cargo.toml`: keep the independent shipping identity and build helper.
@@ -73,7 +83,7 @@ rerun a merge or manufacture merge results; primary must record actual integrati
   fork admission, request-local memo, pending filtering, decrypted views and stored ETags.
 
 There are 18 paths changed by both the runtime fork and the upstream patch. Excluding those
-three expected conflicts, all 15 overlapping expected auto-merges must still be reviewed:
+three expected conflicts, the 15 overlapping auto-merges requiring later review were:
 
 - `crates/common/Cargo.toml`
 - `crates/dav/Cargo.toml`
@@ -143,12 +153,12 @@ lookup, owner-only pre-finalize snapshots and separate routing overrides. Every 
 event/link mutation retains current calendar/event/vault/Account/pin fences; grant/rename
 boundary retries and acknowledged counts cannot be simplified during this patch.
 
-Untouched high-risk fork seams still need the final combined-branch review:
+The inventory identified these untouched high-risk fork seams for the later combined review:
 `common/src/cache/principals.rs`, `scheduling/event_cancel.rs`, `calendar/delegation.rs`,
 both DAV `calendar/update.rs` finalize sites, cancel/SENT-BY lifecycle in `delete.rs`, DAV
 URI admission/discovery/sync and `http/src/api/{vault,shares}.rs` mutation ordering.
 
-## Changed upstream tests and key-mode equivalents (R44)
+## Task 1 historical inventory — changed upstream tests and key-mode equivalents (R44)
 
 | Changed upstream file | Current execution/replacement and assertions to preserve |
 |---|---|
@@ -161,8 +171,8 @@ Plain search adds four SAVE regressions on its content predicate: SAVE MIN MAX A
 `1 3 4 6 8 10` and reports MIN1/MAX10/ALL1,3:4,6,8,10; SAVE MIN COUNT saves the same full
 set and reports COUNT6/MIN1; SAVE MIN MAX saves `1 10`; UID8 saves a single `8` with MIN8/MAX8.
 The existing key variant already refuses the content predicate and uses allowed keyword
-UIDs 1/3/4/6 for SAVE ALL, NOT $, size-filtered $, and MIN/MAX NOT $. It lacks the new
-SAVE MIN MAX ALL regression. Task 2 must add the approved keyword expression using Flag_000,
+UIDs 1/3/4/6 for SAVE ALL, NOT $, size-filtered $, and MIN/MAX NOT $. At inventory time it lacked the new
+SAVE MIN MAX ALL regression. The Task 2 requirement was to add the approved keyword expression using Flag_000,
 Flag_002, Flag_003, Flag_005, asserting MIN1/MAX6/ALL1,3:4,6 and `UID SEARCH $` = `1 3 4 6`.
 Preserve FROM/SUBJECT refusal coverage. The approved required addition is SAVE/MIN/MAX/ALL;
 the upstream SAVE+COUNT/extremes/singleton assertions remain active in plain mode.
@@ -174,14 +184,13 @@ and latest-URL configurations are redirected to that pin. Take those source/test
 Generated `registry/schema/{prelude,structs_impl}.rs` routes secrets through `secret_value`;
 normal unset `STALWART_INCLUDE_SECRETS` returns masked values. Do not hand-edit or enable it.
 
-## Archive, numeric and dependency inventory
+## Task 1 historical inventory — archive, numeric and dependency inventory
 
 The baseline fork and target locks both contain calcard 0.3.14 and rkyv/rkyv_derive 0.8.18.
 Their calcard/rkyv lock dependency blocks are identical; rkyv_derive's syn edge changes
 3.0.6 → 3.0.9. Common/groupware calcard manifests retain feature `rkyv`; rkyv consumers
-retain `little_endian`. The tag does not change these declarations. Resolved Cargo feature
-closure is **pending** post-merge `cargo tree`/lock reconciliation; static manifests do not
-prove the resulting feature resolution.
+retain `little_endian`. The tag does not change these declarations. At inventory time, resolved Cargo feature closure was pending; the later lock/metadata
+resolution is recorded below. Static manifests alone did not prove that resolution.
 
 Upstream still leaves Principal fields 150/151 unused, account flags stop at `1 << 8`, and
 VanishedCollection occupies 251–254 only. The fork's `ZeroAccessVault=150`,
@@ -320,53 +329,206 @@ risk is accepted for this undeployed preview's scope. Fixed SHA-256 fingerprint 
 not X25519 known-answer tests. No cross-version read, KDF/AEAD compatibility or rollback
 claim follows; no mandatory new crypto project or old-store migration gate is added.
 
-## Qualification receipts — pending
+## Integration, regressions and dependency disposition
 
-All rows below are unexecuted for this candidate. Prefix every Cargo command with the PATH
-line above and use the isolated CARGO_TARGET_DIR. Set STORE=RocksDb and
-RUST_MIN_STACK=16777216 for integration; clear ZA_KEY_ACCOUNTS for plain mode and set 1 only
-for key mode. Set BLOB_STORE=FileSystem only for the named ZA variant. Keep commands sequential.
-Record source SHA, environment, selected nonzero counts, named-case completion and retained
-failure/retry receipts before changing any row to passed.
+The primary committed Task 1 inventory as `65c6fd54d`, the expected-failing regression
+checkpoint as `f8e00a3d5`, the pinned target merge as
+`4a4b124382dcecb07101a8784d4f323f7338c648`, and beta.2 preparation as
+`51bbecce06cd0875d09639b6fbe427253856a379`. Actual conflicts were exactly `Cargo.lock`,
+`crates/main/Cargo.toml` and `crates/dav/src/common/propfind.rs`. DAV retained the combined
+Cow/BTreeMap/Arc import and fork admission/memo/filter/decrypted-view/stored-ETag paths.
+The primary inspected the supplied auto-merges and required fork adaptations; focused
+Task 1, 2 and 3 reviews approved their scopes with no findings.
 
-| Gate | Exact selector/command after integration | Status |
+All three incoming-calendar callers now pass the appropriate calendar: upstream `&itip`,
+fork drain `&tree`, fixture helper `&message.message`. The new regression's accepted .26
+RED receipts show repeated existing-zone controls at 13:00Z with REPORT `[true,false]`,
+and repeated missing-zone delivery at 14:00Z with REPORT `[false,true]`. Both REPORT
+windows lie strictly inside each cached resource interval. ZA failed only at the delayed
+semantic assertion after recurrence, sealing and cleanup observations; WebDAV failed only
+on the missing expected VTIMEZONE. Earlier setup/compile failures are retained separately
+and do not count as RED. Receipts: `task2-red-za-final.log`, `task2-red-webdav.log`; exact
+argv/environments and setup corrections are retained in `task-2-report.md` and
+`receipts/task2-red-commands.md`.
+
+Task 2 GREEN whole ZA and WebDAV plain/key suites passed against the uncommitted merged
+source before the merge commit. All repeated deliveries have one timezone definition,
+13:00Z, REPORT `[true,false]`, one master/override, three expanded 30-minute instances,
+original recurrence identity, resealing and protected-canary absence. Shared discovery
+executes displayname, empty allprop, include and PropName with single-read assertions,
+private omission/direct refusal and authenticated-reader principal. Task 4's eight whole
+suite passes below reran this behavior on the beta.2 candidate. The plain IMAP upstream
+SAVE/COUNT/extremes/singleton cases and new key flag SAVE MIN MAX ALL/saved-set case ran;
+content predicate refusals remain active. Both JMAP modes execute the supplied import
+EmailDelivery state test. Common's WebUI version guard executed in core units. OIDC,
+including .27 portless loopback registration, completed on the diagnostic system retry;
+this submodule completion does not pass the complete system gate.
+
+Task 2 product `cargo check --locked -p stalwart --no-default-features --features rocks`
+passed (1m59s); `cargo test --locked -p tests --no-run` passed (3m25s). Task 2 GREEN receipts
+are `task2-check-product.log`, `task2-tests-no-run.log`, `task2-green-za.log`,
+`task2-green-webdav-plain.log`, `task2-green-webdav-key.log` and `task2-format-final.log`.
+Their source attribution remains the evolving merge at checkpoint `f8e00a3d5`, not beta.2.
+
+Lock reconciliation retained the fork graph. One offline metadata normalization advanced
+vault's sha2 edge to the target's supplied 0.11.1; final locked metadata succeeded.
+Normalized package blocks show exactly the twelve preexisting fork package-name deviations
+listed in the inventory, with no extra registry version/source/checksum deviation from .27.
+Resolved calcard/rkyv archive features and argon2/chacha20/chacha20poly1305/hmac zeroize,
+x25519-dalek static_secrets+zeroize/default-features-off remain present. Vault stays
+0.16.25; shipping package alone advances independently to 0.1.0-beta.2. See
+`task2-lock-normalized-final.json`, `task2-resolved-features.json`,
+`task2-lock-validation-final.log`, `task2-lock-assertions.txt`. These are graph/source and
+functional evidence, not cross-version archive/KDF/AEAD compatibility or migration proof.
+
+## Qualification receipts and exact source attribution
+
+Receipt paths below are relative to
+`.superpowers/sdd/2026-10-27-stalwart-01627-upgrade/receipts/` in the isolated checkout.
+Task 4 JSON records source SHA, exact argv, duration, result counts, warning-line counts
+and log paths. Each log begins with its command/environment receipt. All completed Task 4
+rows below ran at `51bbecce06cd0875d09639b6fbe427253856a379`; no source changes intervened.
+Every Cargo invocation prepended `export PATH="/opt/homebrew/opt/rustup/bin:$PATH"` and used
+worktree-local target/state. `STALWART_INCLUDE_SECRETS`, `STALWART_BUILD_SOURCE_COMMIT`,
+`CONFIG_PATH`, `ZA_KEY_ACCOUNTS` and `BLOB_STORE` were cleared before named overrides.
+Integration rows used `STORE=RocksDb RUST_MIN_STACK=16777216`; key rows alone set
+`ZA_KEY_ACCOUNTS=1`, and filesystem ZA alone set `BLOB_STORE=FileSystem`.
+TMPDIR paths are unique row directories under `.run/upgrade-01627/state/`; Task 3's final
+Python metadata run instead uses outside-workspace `/private/tmp` fixture isolation.
+Commands ran sequentially. No zero-selected row is counted as a passed gate.
+
+### Task 4 units and style
+
+| Gate | Exact argv | Result | Seconds | Raw warning lines | Receipt |
+|---|---|---|---:|---:|---|
+| style-diff | `git diff --check f9bc65b3d4f4be5acfae4737eb5fb3957d6f0857 HEAD` | exit 0 | 0.05 | 0 | `task4-style-diff.log` |
+| style-fmt | `cargo fmt --all --check` | exit 0 | 3.41 | 0 | `task4-style-fmt.log` |
+| core | `cargo test --locked -p vault -p groupware -p common` | 317 passed, 0 failed | 46.35 | 22 | `task4-core.log` |
+| http | `cargo test --locked -p http@0.16.27 --features test_mode` | 6 passed, 0 failed | 61.57 | 28 | `task4-http.log` |
+| edited-crates | `cargo test --locked -p imap -p jmap -p dav -p dav-proto` | 23 passed, 0 failed | 54.34 | 29 | `task4-edited-crates.log` |
+| jmap-proto | `cargo test --locked -p jmap_proto` | 16 passed, 0 failed | 27.77 | 0 | `task4-jmap-proto.log` |
+| imap-proto | `cargo test --locked -p imap_proto` | 45 passed, 0 failed | 9.52 | 0 | `task4-imap-proto.log` |
+| store | `cargo test --locked -p store` | 5 passed, 0 failed | 23.77 | 3 | `task4-store.log` |
+
+Total: 412 actual unit tests. The zero-test doctest rows in the raw JSON are excluded
+from this total and do not provide additional coverage. Warning figures count raw output
+lines per command, including repeated diagnostics/summaries; they are not unique warning
+counts and do not establish a warning-free build. Machine summary: `task4-unit-results.json`.
+
+### Task 4 whole integration rows and bounded retries
+
+All whole-suite commands use `cargo test --locked -p tests SELECTOR -- --exact --nocapture`.
+The SMTP filter and exact failed-name retry deliberately retain their existing workflow argv.
+
+| Gate | Selector / overrides | Result | Seconds | Raw warning lines | Receipt |
+|---|---|---|---:|---:|---|
+| za-embedded | `za::za_tests` | 1 passed, 0 failed; exit 0 | 438.92 | 2 | `task4-za-embedded.log` |
+| za-filesystem | `za::za_tests; BLOB_STORE=FileSystem` | 1 passed, 0 failed; exit 0 | 399.72 | 2 | `task4-za-filesystem.log` |
+| webdav-plain | `webdav::webdav_tests` | 1 passed, 0 failed; exit 0 | 69.8 | 2 | `task4-webdav-plain.log` |
+| webdav-key | `webdav::webdav_tests; ZA_KEY_ACCOUNTS=1` | 1 passed, 0 failed; exit 0 | 21.02 | 2 | `task4-webdav-key.log` |
+| imap-plain | `imap::imap_tests` | 1 passed, 0 failed; exit 0 | 10.44 | 2 | `task4-imap-plain.log` |
+| imap-key | `imap::imap_tests; ZA_KEY_ACCOUNTS=1` | 1 passed, 0 failed; exit 0 | 12.34 | 2 | `task4-imap-key.log` |
+| jmap-plain | `jmap::jmap_tests` | 1 passed, 0 failed; exit 0 | 185.34 | 2 | `task4-jmap-plain.log` |
+| jmap-key | `jmap::jmap_tests; ZA_KEY_ACCOUNTS=1` | 1 passed, 0 failed; exit 0 | 171.82 | 2 | `task4-jmap-key.log` |
+| system | `system::system_tests` | 0 passed, 1 failed; exit 101 | 11.76 | 2 | `task4-system.log` |
+| system-retry1 | `system::system_tests; RUST_BACKTRACE=1` | 0 passed, 1 failed; exit 101 | 20.95 | 2 | `task4-system-retry1.log` |
+| smtp | `cargo test --locked -p tests smtp -- --nocapture; SPAM_RULES_URL=https://github.com/stalwartlabs/spam-filter/releases/download/v3.0.3/spam-filter-rules.json.gz` | 71 passed, 5 failed; exit 101 | 67.17 | 2 | `task4-smtp.log` |
+| smtp-retry1 | `cargo test --locked -p tests -- --exact --nocapture smtp::inbound::dkim2::dkim2_all_undisclosed_do_not_leak smtp::outbound::lmtp::lmtp_delivery smtp::queue::retry::queue_retry smtp::reporting::analyze::report_analyze smtp::reporting::dmarc::report_dmarc` | 5 passed, 0 failed; exit 0 | 9.09 | 2 | `task4-smtp-retry1.log` |
+
+Eight complete ZA/WebDAV/IMAP/JMAP rows passed, each selecting one whole suite; their
+internal cases are not miscounted as individual Cargo-selected tests. Both system attempts
+selected one suite and failed. The first failed in OIDC; the sole permitted diagnostic
+retry (additional `RUST_BACKTRACE=1`) completed OIDC then failed in security. Full system
+qualification remains failed/pending and later submodules remain unqualified. No further
+candidate rerun, skip, feature or assertion change was used. Relevant unchanged source is
+not an unchanged-baseline runtime reproduction; no runtime root cause or upgrade attribution
+is claimed. The accepted bounded disposition preserves these receipts without broadening
+this maintenance update into fixture repair or an upstream bug-report project.
+
+SMTP initially passed 71/76 and failed five; its single existing-workflow failed-name retry
+passed all 5/5 unchanged-source cases. This meets the existing retry contract, not a claim
+that the complete filter passed in one attempt. The five exact names and argv remain in
+`task4-integration-results.json` and `task4-smtp-retry1.log`. Both SMTP runs use pinned
+`SPAM_RULES_URL=https://github.com/stalwartlabs/spam-filter/releases/download/v3.0.3/spam-filter-rules.json.gz`.
+Original failures and local-only diagnostic disposition are retained. No test source changed.
+
+### Identity, independent client and outstanding gates
+
+| Gate | Evidence / exact command or requirement | Status |
 |---|---|---|
-| Pre-merge timezone red | Complete `za::za_tests` with approved fixture; fail at semantic assertion, not setup | Pending |
-| Component compile | `cargo check -p stalwart --no-default-features --features rocks`; `cargo test -p tests --no-run` | Pending |
-| Style | baseline/working/index `git diff --check`; `cargo fmt --all --check` | Pending |
-| Core units | `cargo test -p vault -p groupware -p common` | Pending |
-| HTTP | `cargo test -p http@0.16.27 --features test_mode` | Pending |
-| Edited crates | `cargo test -p imap -p jmap -p dav -p dav-proto` | Pending |
-| Protocol/store | `cargo test -p jmap_proto`; `cargo test -p imap_proto`; `cargo test -p store` | Pending |
-| ZA embedded | `cargo test -p tests za::za_tests -- --exact --nocapture` | Pending |
-| ZA filesystem | Same selector with BLOB_STORE=FileSystem | Pending |
-| WebDAV | `cargo test -p tests webdav::webdav_tests -- --exact --nocapture`, plain/key | Pending |
-| IMAP | `cargo test -p tests imap::imap_tests -- --exact --nocapture`, plain/key | Pending |
-| JMAP | `cargo test -p tests jmap::jmap_tests -- --exact --nocapture`, plain/key | Pending |
-| OAuth/OIDC | `cargo test -p tests system::system_tests -- --exact --nocapture` | Pending |
-| Directory/SMTP | Existing workflow setup/selectors/pinned SPAM_RULES_URL; no invented smtp_tests suite | Pending |
-| OSS product | `cargo build --locked --release -p stalwart --no-default-features --features rocks` | Pending |
-| Release metadata | `python3 -B scripts/tests/test_release_metadata.py` | Pending |
-| Verifier units | `python3 -B -m unittest discover -s scripts/release -p 'test_*.py' -v` | Pending |
-| Independent CalDAV harness | `python3 -B -m unittest discover -s tests/caldav_client -p test_runner.py -v` | Pending |
-| Independent CalDAV | Existing runner.py, exact pinned python-caldav 111ae14b875f40d100d5259820f10210f00e20f9, default two modes, isolated logs | Pending |
-| Actual macOS binary identity | Existing load_metadata/verify_checkout/validate_identity helpers, clean committed source and clear CONFIG_PATH; never Linux CLI on macOS | Pending |
-| Final whole-branch review | Fresh independent read-only agent, pinned base/head and accepted contract | Pending |
+| Release metadata | `python3 -B scripts/tests/test_release_metadata.py`; `task3-metadata.log` | Passed 8/8 before metadata commit; 5.776s |
+| Product verifier units | `python3 -B -m unittest discover -s scripts/release -p 'test_*.py' -v`; `task3-verifier.log` | Passed 13/13 before metadata commit; 0.363s |
+| OSS product | `cargo build --locked --release -p stalwart --no-default-features --features rocks` | Passed, exit 0; 1165.46s; 28 raw warning lines; `task4-release-build.log` |
+| Actual initial macOS identity | Existing `load_metadata`, `verify_checkout`, `validate_identity` against actual clean candidate HEAD/branch; clear CONFIG_PATH and combine help stdout/stderr | Passed at clean candidate `51bbecce06cd0875d09639b6fbe427253856a379`; Mach-O arm64; `task4-initial-identity.json` |
+| Independent harness | `python3 -B -m unittest discover -s tests/caldav_client -p test_runner.py -v` in isolated venv | Passed 30/30; 5.223s suite / 5.62s command; `task4-caldav-harness.log` |
+| Independent CalDAV | `python3 -B tests/caldav_client/runner.py --binary PATH --caldav-source PATH --log-dir PATH`; unfiltered existing runner, both default modes | Passed both modes; plain 66 passed / 1 skipped / 5 xfailed (6.19s), key 71 passed / 1 skipped / 5 xfailed (7.56s); 21.41s command; `task4-caldav-client.log` |
+| Directory workflow | Existing Docker/testcontainers environment | Pending; Docker CLI/app/standard sockets unavailable, DOCKER_HOST unset |
+| Whole-branch review | Fresh clean-context read-only review of `9de38e09498447d23d60b52724ab8fdead91b86b..51bbecce06cd0875d09639b6fbe427253856a379` | No actionable source blocker; separate from runtime proof |
+| Final handoff identity | Rebuild exact locked OSS product after the outcome-only commit, then validate actual clean final HEAD/branch using macOS helpers | Required; pending `task4-final-identity.json`; no final SHA invented |
+| Exact-source Linux artifact | Existing shipping workflow, ELF ABI/CPU/GLIBC inspection, checksum/attestation | Pending; no CI dispatch authorized |
+| Native Calendar/Mail/Thunderbird | Disposable-state manual checklist, macOS/iOS where applicable | Pending; automated results do not qualify native clients |
 
-Preserve one documented unchanged-source retry for cal_itip/plain JMAP timing flakes and the
-system diagnostic rerun, retaining failures. Unit compile failures remain failed/pending until
-an equivalent baseline reproduction or conclusive source evidence; unaffected units cannot
-satisfy failed gates. No passing suite may be relabeled as execution on a later changed source.
+Task 3's first metadata invocation used a worktree-contained TMPDIR and produced one fixture
+isolation error out of eight; `task3-metadata-in-workspace-tmp.log` is retained. The corrected
+full run used unique outside-workspace `/private/tmp` state and passed without code change.
+The Python passes establish metadata/verifier behavior on that Task 3 source; they are not
+relabeled as executions after future source changes or as actual product-binary identity.
 
-Native Apple Calendar macOS/iOS, Thunderbird and Mail observations remain pending on disposable
-state under the manual checklist. SQL/other stores, multi-node, additional platforms, exact-source
-Linux shipping artifact verification, CI and publication remain separate pending gates.
+The primary completed the product/client batch against clean source
+`51bbecce06cd0875d09639b6fbe427253856a379`. Machine summary:
+`task4-product-client-results.json`. The pinned python-caldav checkout HEAD is exactly
+`111ae14b875f40d100d5259820f10210f00e20f9`; the unfiltered collection manifests and existing
+compatibility/skip/xfail policies were unchanged. Both default modes passed under those
+policies; skipped and expected-failure cases are not counted as passes.
 
-## Integration and final handoff placeholders
+Exact product/client argv from the completed receipt (absolute paths preserve the actual
+isolated interpreter, product, client source and retained client-log directories):
 
-- Actual merge commit/conflicts and reviewed auto-merges: pending.
-- Red fixture receipt, three caller changes, timezone/DAV/search regressions: pending.
-- Reconciled lock/feature graph and dependency disposition: pending.
-- beta.2 metadata, upstream .27 identity and clean source/binary agreement: pending.
-- Commands, counts, warnings, failures/retries and final review adjudication: pending.
-- Reviewed locally qualified branch and remaining gates: pending.
+```sh
+cargo build --locked --release -p stalwart --no-default-features --features rocks
+/Users/jay/.codex/worktrees/stalwart-01627-update/stalwart/.run/upgrade-01627/caldav-client/venv/bin/python -B -m unittest discover -s tests/caldav_client -p test_runner.py -v
+/Users/jay/.codex/worktrees/stalwart-01627-update/stalwart/.run/upgrade-01627/caldav-client/venv/bin/python -B tests/caldav_client/runner.py --binary /Users/jay/.codex/worktrees/stalwart-01627-update/stalwart/target/release/stalwart --caldav-source /Users/jay/.codex/worktrees/stalwart-01627-update/stalwart/.run/upgrade-01627/caldav-client/source --log-dir /Users/jay/.codex/worktrees/stalwart-01627-update/stalwart/.run/upgrade-01627/caldav-client/candidate-51bbecce0-logs
+```
+
+Each command used its named `.run/upgrade-01627/state/<row>` TMPDIR; secrets opt-in and
+release-profile environment overrides were unset. The release command used the required
+Cargo PATH and normal release optimization, with no test-mode/enterprise features.
+The release log contains 28 raw warning lines, not 28 unique diagnostics or a warning-free
+claim. The harness/client command logs contain zero raw warning-prefix lines; their
+skip/xfail counts are separately retained above.
+
+`task4-initial-identity.json` records the actual candidate binary's validated version and
+help first line, clean checkout, branch `refs/heads/codex/stalwart-01627-update`, fork
+`0.1.0-beta.2`, upstream tag `v0.16.27` and pinned upstream commit. It identifies a Darwin
+Mach-O 64-bit arm64 executable with SHA-256
+`1c9f51dfc203916294a2cbe1cee9d9f55b82bfa7bbf8505dd0b6b3918a082c63`.
+The primary used `load_metadata(root)`, `verify_checkout(root, source_commit)` and
+`validate_identity(metadata, version_output, help_output, source_commit, branch_ref)`;
+CONFIG_PATH was cleared and help stderr captured with stdout. This is macOS identity only,
+not Linux artifact/ABI/CPU/GLIBC/provenance qualification.
+
+The outcome-only commit will change embedded identity even though runtime source is
+unchanged. Primary must rebuild the exact locked OSS product against its actual clean
+final HEAD/branch and retain `task4-final-identity.json`. That final commit SHA and identity
+result remain pending at this record's preparation; no completed candidate runtime result
+is relabeled as execution on that future documentation commit.
+
+## Review, routing and handoff boundary
+
+The fresh final reviewer independently inspected the whole branch with base/head refs and
+accepted contracts, without implementer reports or previous findings. No actionable source
+blocker was found. Focused Task 1/2/3 reviews likewise approved their scopes. Primary owns
+actual-diff adjudication and final receipt verification. Source review does not establish
+native/platform behavior or cure the failed system gate.
+
+The originating model identity/capability ceiling was unavailable. Agents deliberately
+inherited the parent route rather than guessing a ranking, with medium/high/xhigh reasoning
+for evidence/implementation/adversarial roles as supported. This is the routing limitation;
+no max/ultra route or nested delegation was used during this implementation run.
+
+SQL/other stores, multi-node, additional platforms, new crypto or cross-version archive
+compatibility, old-store readers/migrations and binary-only rollback safety remain
+unestablished. Historical outcomes are contracts, not new candidate evidence. The reviewed
+maintenance source is prepared locally with the qualification limits above. There has been
+no push, PR, CI dispatch, publication, deployment, old-data access/reset, system installation
+or worktree cleanup. Reviewer-owned design-review and historical outcomes remain untouched.
