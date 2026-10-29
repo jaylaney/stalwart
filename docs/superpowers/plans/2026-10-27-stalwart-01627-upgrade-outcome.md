@@ -655,3 +655,26 @@ environments and receipts remain in `.superpowers/sdd/2026-10-29-fork-review-fix
 Runtime receipts identify parent `cdbc668d6bf5552f780fa848a6351f4e1c33471a` plus source patch
 SHA-256 `4a344c825937d78c9bb373093635e7e6b6eb339c7aab22eae4723c602adbbb38`.
 An independent focused source review passed for conformance and test correctness.
+
+## OpenTelemetry source follow-up on 2026-10-29
+
+The four OpenTelemetry Git declarations now use the original project's
+`https://github.com/open-telemetry/opentelemetry-rust` URL and explicitly pin the existing
+commit `ae66e97b140f70e477ab710686aafce665cc2f8b`. Six lockfile source identities change to
+match. All 942 package records, versions, checksums, dependency edges and manifest features
+are otherwise unchanged. The fork-specific OpenTelemetry source remains identical.
+
+A fresh anonymous Git fetch and a complete `cargo fetch --locked` from an initially empty
+Cargo home retrieved that commit, including its protobuf submodule. The dependency's Git
+tree is `2741d63ab90f580e29f781180abebca90c1ce22b`, matching the previously tested cached
+source; its tracked checkout is clean. The Cargo fetch passed in 19.64s, followed by locked
+offline Cargo metadata in 0.46s. The fetch and metadata left Cargo.lock unchanged.
+Workspace formatting and exact normalized manifest/lock comparisons passed.
+An independent focused review of the manifest/lock patch passed for conformance and
+correctness with no findings.
+
+These checks establish source retrieval and dependency resolution. Earlier runtime and
+artifact results retain their recorded source identities; no shipping binary is rebuilt by
+this source-URL correction. Commands, downloaded-source identity and comparison receipts
+are retained under `.superpowers/sdd/2026-10-29-otel-source-fix/`. The updated PR runs the
+existing CI workflow; no test scope, manifest exception policy or workflow is changed.

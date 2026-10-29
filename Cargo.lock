@@ -5456,7 +5456,7 @@ dependencies = [
 [[package]]
 name = "opentelemetry"
 version = "0.33.0"
-source = "git+https://github.com/stalwartlabs/opentelemetry-rust#ae66e97b140f70e477ab710686aafce665cc2f8b"
+source = "git+https://github.com/open-telemetry/opentelemetry-rust?rev=ae66e97b140f70e477ab710686aafce665cc2f8b#ae66e97b140f70e477ab710686aafce665cc2f8b"
 dependencies = [
  "futures-core",
  "futures-sink",
@@ -5469,7 +5469,7 @@ dependencies = [
 [[package]]
 name = "opentelemetry-http"
 version = "0.33.0"
-source = "git+https://github.com/stalwartlabs/opentelemetry-rust#ae66e97b140f70e477ab710686aafce665cc2f8b"
+source = "git+https://github.com/open-telemetry/opentelemetry-rust?rev=ae66e97b140f70e477ab710686aafce665cc2f8b#ae66e97b140f70e477ab710686aafce665cc2f8b"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5481,7 +5481,7 @@ dependencies = [
 [[package]]
 name = "opentelemetry-otlp"
 version = "0.33.0"
-source = "git+https://github.com/stalwartlabs/opentelemetry-rust#ae66e97b140f70e477ab710686aafce665cc2f8b"
+source = "git+https://github.com/open-telemetry/opentelemetry-rust?rev=ae66e97b140f70e477ab710686aafce665cc2f8b#ae66e97b140f70e477ab710686aafce665cc2f8b"
 dependencies = [
  "http 1.5.0",
  "httpdate",
@@ -5500,7 +5500,7 @@ dependencies = [
 [[package]]
 name = "opentelemetry-proto"
 version = "0.33.0"
-source = "git+https://github.com/stalwartlabs/opentelemetry-rust#ae66e97b140f70e477ab710686aafce665cc2f8b"
+source = "git+https://github.com/open-telemetry/opentelemetry-rust?rev=ae66e97b140f70e477ab710686aafce665cc2f8b#ae66e97b140f70e477ab710686aafce665cc2f8b"
 dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
@@ -5512,12 +5512,12 @@ dependencies = [
 [[package]]
 name = "opentelemetry-semantic-conventions"
 version = "0.33.0"
-source = "git+https://github.com/stalwartlabs/opentelemetry-rust#ae66e97b140f70e477ab710686aafce665cc2f8b"
+source = "git+https://github.com/open-telemetry/opentelemetry-rust?rev=ae66e97b140f70e477ab710686aafce665cc2f8b#ae66e97b140f70e477ab710686aafce665cc2f8b"
 
 [[package]]
 name = "opentelemetry_sdk"
 version = "0.33.0"
-source = "git+https://github.com/stalwartlabs/opentelemetry-rust#ae66e97b140f70e477ab710686aafce665cc2f8b"
+source = "git+https://github.com/open-telemetry/opentelemetry-rust?rev=ae66e97b140f70e477ab710686aafce665cc2f8b#ae66e97b140f70e477ab710686aafce665cc2f8b"
 dependencies = [
  "futures-channel",
  "futures-executor",
