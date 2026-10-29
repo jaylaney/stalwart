@@ -35,8 +35,9 @@ jobs:
     # dispatch (dispatch it on any branch that merges an upstream release
     # tag); a push to main skips it, since the pull request run covered the
     # same code before the merge. The timeout is generous (a healthy run takes
-    # about 30 minutes) but keeps a hang from running to GitHub's 6-hour
-    # default.
+    # about 25 minutes) but keeps a hang from running to GitHub's 6-hour
+    # default. The unit tests run in the unit-tests job and the other upstream
+    # suites in the upstream-suites job, so this job stays well inside it.
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -56,15 +57,6 @@ jobs:
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
-
-      - name: JMAP Protocol Tests
-        run: cargo test -p jmap_proto -- --nocapture
-
-      - name: IMAP Protocol Tests
-        run: cargo test -p imap_proto -- --nocapture
-
-      - name: Full-text search Tests
-        run: cargo test -p store -- --nocapture
 
       - name: Directory Tests
         run: cargo test -p tests directory -- --nocapture
@@ -121,6 +113,125 @@ jobs:
             cargo test -p tests jmap -- --nocapture
           }
 
+  unit-tests:
+    name: Unit Tests
+    needs: style
+    # Every unit test of crates/* except the Enterprise-licensed scim and
+    # scim-proto crates (514 at the 0.16.27 base, two of them #[ignore]d). It
+    # runs on every trigger, a push to main included: it holds the fork's own
+    # unit tests in common, email, http and the other crates, which no other
+    # job runs, and the protocol and store unit tests that the Test job used
+    # to run on pull requests only. The one doctest in the workspace (store,
+    # with its sqlite feature) imports r2d2_sqlite, which is not a dependency,
+    # so it does not compile at the base and has no step.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      STORE: RocksDb
+      RUST_MIN_STACK: "16777216"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Workspace Unit Tests
+        # The tests crate stays out of the build, so cargo does not unify its
+        # dev-dependency features across the workspace; the list below enables
+        # them by hand: the test_mode and enterprise features of
+        # tests/Cargo.toml's dev-dependencies and its sqlite store, plus
+        # dns-update's test_provider (common's test build needs it) and the
+        # test_mode of smtp (its test build needs mail-auth's test feature).
+        # stalwart's default features (rocks, enterprise) apply as they do in
+        # a plain `cargo test --workspace`. The list selects the same unit
+        # tests as `cargo test --workspace --lib --bins` does with the tests
+        # crate in the build, less the tests crate's own functions, scim and
+        # scim-proto: after a change to tests/Cargo.toml, compare the two
+        # `-- --list` outputs and update the list.
+        run: |
+          cargo test --workspace --exclude tests --exclude scim --exclude scim-proto \
+            --lib --bins --features "$UNIT_TEST_FEATURES"
+        env:
+          UNIT_TEST_FEATURES: >-
+            common/test_mode common/enterprise
+            coordinator/test_mode coordinator/enterprise
+            dav/test_mode dav-proto/test_mode
+            directory/test_mode directory/enterprise directory/sqlite
+            dns-update/test_provider
+            email/test_mode email/enterprise
+            groupware/test_mode
+            http/test_mode http/enterprise http_proto/test_mode
+            imap/test_mode
+            jmap/test_mode jmap/enterprise
+            managesieve/test_mode managesieve/enterprise
+            pop3/test_mode
+            services/test_mode services/enterprise
+            smtp/test_mode smtp/enterprise
+            spam-filter/test_mode spam-filter/enterprise
+            store/test_mode store/enterprise store/rocks store/sqlite
+            trc/enterprise
+            utils/test_mode
+            vault/test_mode
+
+  upstream-suites:
+    name: Upstream Suites
+    needs: style
+    # Upstream suites that the Test job does not select: system, the store
+    # family (store, blob, lookup, search), telemetry, automation (ACME and
+    # DNS against Docker test servers) and the webdav::cal_query tests. Same
+    # triggers as the Test job: a push to main skips it, since the pull
+    # request run covered the same code before the merge.
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      STORE: RocksDb
+      RUST_MIN_STACK: "16777216"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # External services (the ACME and PowerDNS test servers) are provisioned
+      # on demand by the test suite via testcontainers using the Docker daemon
+      # available on the runner; see tests/src/utils/containers.rs.
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: CalDAV Query Expansion Tests
+        # The filter also lists ical_roundtrip_expansion, which is #[ignore]d
+        # and so skipped.
+        run: cargo test -p tests 'webdav::cal_query::' -- --nocapture
+
+      - name: Store Tests
+        run: cargo test -p tests store::store_tests -- --nocapture
+
+      - name: Blob Tests
+        run: cargo test -p tests store::blob::blob_tests -- --nocapture
+
+      - name: Lookup Tests
+        run: cargo test -p tests store::lookup::lookup_tests -- --nocapture
+
+      - name: Search Tests
+        run: cargo test -p tests store::search_tests -- --nocapture
+
+      - name: Telemetry Tests
+        run: cargo test -p tests telemetry::telemetry_tests -- --nocapture
+
+      - name: System Tests
+        # Includes the SEL-only tenant and archiving sub-tests, which run because the build enables enterprise.
+        run: cargo test -p tests system::system_tests -- --nocapture
+
+      - name: Automation Tests
+        # Needs Docker: ensure_acme and ensure_powerdns build and start the
+        # Pebble, challtestsrv and PowerDNS test servers.
+        run: cargo test -p tests automation::automation_tests -- --nocapture
+
   zero-access:
     name: Zero-access Test
     needs: style
@@ -139,7 +250,14 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Vault and Groupware Unit Tests
-        run: cargo test -p vault -p groupware -- --nocapture
+        # vault's test_mode feature adds a test (the live key counter) that a
+        # plain `-p vault` run does not build.
+        run: cargo test -p vault -p groupware --features vault/test_mode -- --nocapture
+
+      - name: Zero-access Leak Scanner Unit Test
+        # A plain unit test of the leak scanner (tests/src/za/leak.rs) that the
+        # za_tests filter below does not select.
+        run: cargo test -p tests za::leak::tests::try_archive_short_values_are_not_archives -- --exact --nocapture
 
       - name: Zero-access Tests
         run: cargo test -p tests za::za_tests -- --nocapture
