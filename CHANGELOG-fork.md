@@ -6,7 +6,27 @@ The inherited [CHANGELOG.md](CHANGELOG.md) records upstream Stalwart history.
 
 ## Unreleased
 
-No changes recorded after the first beta preparation.
+Preparing `0.1.1-beta.1`, independently versioned from the integrated upstream base
+Stalwart `v0.16.27`, commit `aa47d8ef7bfba7200d3293198ac2592747b20e73`.
+Publication and release qualification remain separate gates; the published
+`0.1.0-beta.1` tag and artifacts retain their original identity.
+
+- Integrates the [.27 fixes](https://github.com/stalwartlabs/stalwart/releases/tag/v0.16.27):
+  iTIP updates retain incoming timezone definitions for moved occurrences; OAuth accepts
+  registered loopback redirects without a path; WebDAV `allprop` omits
+  `DAV:current-user-principal`; IMAP `APPEND` and cross-account `COPY`/`MOVE` update
+  `EmailDelivery` state, and combined `SEARCH RETURN` options retain all matching results
+  where requested. Key-account refusal and sealed-data boundaries remain in force.
+- Pins WebUI downloads to `v1.0.11` and checks the version before installation, avoiding
+  incompatible WebUI updates on the .27 server base.
+- Uses the public repository's tests for qualification, including fork regressions and
+  public upstream suites; no private upstream test suite is required. Exact candidate
+  results and outstanding gates must be recorded before publication.
+- Adds no stored-format migration or legacy reader. Existing backup and restoration
+  requirements still apply; replacing only the binary is not a rollback guarantee.
+  This update establishes no new backend, cluster, platform or native-client qualification.
+- The upstream 1.0 port remains deferred. This .27 integration does not promise ongoing
+  upstream .16 maintenance or support.
 
 ## 0.1.0-beta.1 — 2026-10-26
 

@@ -33,6 +33,13 @@ pub async fn test(test: &mut TestServer) {
     let admin = test.account("admin@example.org");
     let domain_id = admin.find_or_create_domain("example.org").await;
 
+    let original_jmap = admin.registry_get::<Jmap>(Id::singleton()).await;
+    let original_upload_limits = (
+        original_jmap.upload_quota,
+        original_jmap.max_upload_count,
+        original_jmap.upload_ttl.as_millis(),
+    );
+
     // Set test settings
     admin
         .registry_update_setting(
@@ -206,6 +213,29 @@ pub async fn test(test: &mut TestServer) {
     );
     test.blob_expire_all().await;
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    // Restore temporary-upload fixture settings before testing account-storage quotas.
+    admin
+        .registry_update_setting(
+            original_jmap,
+            &[
+                Property::UploadTtl,
+                Property::UploadQuota,
+                Property::MaxUploadCount,
+            ],
+        )
+        .await;
+    admin.reload_settings().await;
+    let current_jmap = admin.registry_get::<Jmap>(Id::singleton()).await;
+    assert_eq!(
+        (
+            current_jmap.upload_quota,
+            current_jmap.max_upload_count,
+            current_jmap.upload_ttl.as_millis(),
+        ),
+        original_upload_limits,
+        "temporary-upload settings leaked: (upload_quota, max_upload_count, upload_ttl_millis)"
+    );
 
     // Test JMAP Quotas extension
     let response = account

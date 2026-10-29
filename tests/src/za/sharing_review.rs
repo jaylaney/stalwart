@@ -168,36 +168,67 @@ pub async fn test(test: &mut TestServer) {
     }
     // Assisted discovery must reuse each fresh eligible archive, with per-item admission retained.
     let shared = id(test, owner, "family&friends").await;
-    let before = groupware::calendar::sharing::test::calendar_reads(owner, shared);
-    let discovery = bob
-        .request_with_headers(
-            "PROPFIND",
-            READER_HOME,
-            [("depth", "1")],
+    for (kind, request) in [
+        (
+            "explicit",
             "<D:propfind xmlns:D=\"DAV:\"><D:prop><D:displayname/></D:prop></D:propfind>",
+        ),
+        ("empty allprop", ""),
+        (
+            "allprop include",
+            "<D:propfind xmlns:D=\"DAV:\"><D:allprop/><D:include><D:current-user-principal/></D:include></D:propfind>",
+        ),
+        (
+            "propname",
+            "<D:propfind xmlns:D=\"DAV:\"><D:propname/></D:propfind>",
+        ),
+    ] {
+        let before = groupware::calendar::sharing::test::calendar_reads(owner, shared);
+        let discovery = bob
+            .request_with_headers("PROPFIND", READER_HOME, [("depth", "1")], request)
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+        assert!(
+            discovery
+                .hrefs()
+                .contains(&format!("{HOME}family&friends/").as_str()),
+            "granted calendar omitted from {kind}"
+        );
+        assert!(
+            !discovery
+                .hrefs()
+                .iter()
+                .any(|href| href.contains("/private/")),
+            "private calendar disclosed in {kind}"
+        );
+        let delta = groupware::calendar::sharing::test::calendar_reads(owner, shared) - before;
+        if delta != 1 {
+            failures.push(format!(
+                "assisted discovery {kind} resolved eligible calendar {delta} times instead of 1"
+            ));
+        }
+        if kind == "allprop include" {
+            let principal = format!(
+                "D:href:{}/sharing-review-reader%40example.com/",
+                groupware::DavResourceName::Principal.base_path()
+            );
+            let response = discovery.into_propfind_response(None);
+            for href in [READER_HOME.to_string(), format!("{HOME}family&friends/")] {
+                response
+                    .properties(&href)
+                    .get("D:current-user-principal")
+                    .with_values([principal.as_str()]);
+            }
+        }
+        bob.request_with_headers(
+            "PROPFIND",
+            &format!("{HOME}private/"),
+            [("depth", "0")],
+            request,
         )
         .await
-        .with_status(StatusCode::MULTI_STATUS);
-    assert!(
-        discovery
-            .hrefs()
-            .contains(&format!("{HOME}family&friends/").as_str())
-    );
-    assert!(
-        !discovery
-            .hrefs()
-            .iter()
-            .any(|href| href.contains("/private/"))
-    );
-    let delta = groupware::calendar::sharing::test::calendar_reads(owner, shared) - before;
-    if delta != 1 {
-        failures.push(format!(
-            "assisted discovery resolved eligible calendar {delta} times instead of 1"
-        ));
-    }
-    bob.request_with_headers("PROPFIND", &format!("{HOME}private/"), [("depth", "0")], "")
-        .await
         .with_status(StatusCode::FORBIDDEN);
+    }
 
     // A pin-only write must not spend a conversion retry; final grant still checks its decision pin.
     put(

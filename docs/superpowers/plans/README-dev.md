@@ -17,7 +17,7 @@ provenance, and the release checklist. Record fork release changes in the
 - Full verification: `cargo test -p vault -p groupware -p common`, then `za::za_tests`, then `webdav::webdav_tests` in both modes.
 - Manual client checklist: `docs/zero-access/manual-checklist.md`.
 - Known limits (spec 2): the running server holds plaintext while serving a request and receives the password on every CalDAV request; the authentication cache and the key cache are process-local and bounded (15 minutes idle, 60 minutes hard cap).
-- rustfmt: `cargo fmt -p <crate> -- --check` works for most crates; for http use `cargo fmt --manifest-path crates/http/Cargo.toml -- --check` (cargo rejects `-p http@0.16.26` for fmt).
+- rustfmt: `cargo fmt -p <crate> -- --check` works for most crates; for http use `cargo fmt --manifest-path crates/http/Cargo.toml -- --check` (cargo rejects `-p http@0.16.27` for fmt).
 - Never open upstream issues or PRs from this fork (see AGENTS.md).
 - Zero-access account API tests: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests`
 - CalDAV suite against key accounts: `STORE=RocksDb RUST_MIN_STACK=16777216 ZA_KEY_ACCOUNTS=1 cargo test -p tests webdav_tests`. In that mode the `acl`, `cal_alarm`, `cal_scheduling` and `copy_move` modules run the four key-mode variants in `tests/src/webdav/za_variants.rs` (`acl`, `alarm`, `scheduling`, `copy_move`) instead of skipping.
@@ -35,11 +35,29 @@ provenance, and the release checklist. Record fork release changes in the
 
 ## Merging upstream
 
-The fork tracks Stalwart's tagged releases (base 0.16.26). Merge a release
-tag, not the tip of `main`, about once per upstream minor version, with
-`git merge upstream/vX.Y.Z`; never rebase the published branch. Treat each
-merge as a small plan: scan what upstream changed in the hotspot files, merge,
-run the full net below, and have the conflict resolutions reviewed.
+The current integrated upstream base is Stalwart `v0.16.27`, commit
+`aa47d8ef7bfba7200d3293198ac2592747b20e73`; the proposed fork preview is
+`0.1.1-beta.1`. The upstream 1.0 port remains deferred. This integration does not
+promise ongoing upstream .16 maintenance or support.
+
+Plan each future upstream integration separately. Merge a verified release tag, never the
+tip of `main`, in an isolated branch/worktree; never rebase the published branch or add an
+`upstream` remote. For example, from the isolated branch prepared for the .27 integration:
+
+```sh
+git fetch https://github.com/stalwartlabs/stalwart.git tag v0.16.27 --no-tags
+git rev-parse 'v0.16.27^{commit}'
+# Verify the result equals aa47d8ef7bfba7200d3293198ac2592747b20e73 before merging.
+git merge --no-ff v0.16.27
+```
+
+Scan upstream changes in the hotspot files before merging, run the full net below,
+and have the conflict resolutions reviewed. Qualification uses public upstream and fork
+tests, with no private upstream suite dependency. Record exact candidate commands/results;
+this .27 update adds no stored-format migration or legacy reader and establishes no new
+backend, cluster, platform or native-client qualification. Back up the database, blob store
+and configuration and verify restoration before testing existing data; replacing only the
+binary is not a rollback guarantee.
 
 Merge hotspots (fork insertions inside upstream files; everything else lives
 in fork-owned modules and merges cleanly):
@@ -57,9 +75,8 @@ in fork-owned modules and merges cleanly):
   are upstream's; silence them when those files are touched by a merge, not
   before.
 
-Storage checks at every merge (the fork never changes a stored struct's
-layout, so upstream migrations keep working; ciphertext rides in existing
-fields and moves with them):
+Storage checks at every merge (preserve stored struct layouts and verify upstream
+migration effects explicitly; ciphertext rides in existing fields and moves with them):
 
 - calcard version: sealed bundles embed calcard's rkyv layout for
   `ICalendarEntry` and `ICalendarParameter`, and `X-ZA-EXTRA` embeds
@@ -81,7 +98,7 @@ fields and moves with them):
   enums.rs`) carry no fork edits; take upstream's version outright.
 
 Regression net after a merge, in this order: `cargo test -p vault`,
-`-p groupware`, `-p common`, `-p http@0.16.26 --features test_mode`;
+`-p groupware`, `-p common`, `-p http@0.16.27 --features test_mode`;
 `za_tests`; `webdav_tests` in baseline and `ZA_KEY_ACCOUNTS=1` mode; the
 product build warning-free in `vault`, `groupware`, `dav` and `http`. The
 key-account mode of the upstream suite is the real guard: it runs upstream's
@@ -112,7 +129,7 @@ retaining the exact Cargo arguments below.
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
 cargo fmt --all --check
 cargo test -p vault -p groupware -p common
-cargo test -p http@0.16.26 --features test_mode
+cargo test -p http@0.16.27 --features test_mode
 STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests -- --nocapture
 STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests webdav::webdav_tests
 STORE=RocksDb RUST_MIN_STACK=16777216 ZA_KEY_ACCOUNTS=1 cargo test -p tests webdav::webdav_tests

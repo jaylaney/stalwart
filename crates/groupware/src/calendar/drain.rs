@@ -1196,7 +1196,7 @@ async fn merge(
         Step::Nothing => return ctx.rewrite_only(tree, Some(event_id), 0).await,
         Step::Merge(changes) => changes,
     };
-    itip_merge_changes(&mut event.data.event, changes);
+    itip_merge_changes(&mut event.data.event, &tree, changes);
     event.size = ical_size(&event.data.event) as u32;
     if event.size > server.core.groupware.max_ical_size as u32 {
         return ctx
