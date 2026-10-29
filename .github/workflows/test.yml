@@ -176,12 +176,17 @@ jobs:
         env:
           ZA_KEY_ACCOUNTS: "1"
 
+      # Test covers these plain-mail suites on pull_request, schedule and
+      # workflow_dispatch; zero-access retains them on main pushes because
+      # Test skips push.
       - name: IMAP Tests (plain accounts)
+        if: github.event_name == 'push'
         # Ordinary accounts through the mail paths this branch edits: they
         # keep upstream's behaviour (invariant 9).
         run: cargo test -p tests imap::imap_tests -- --nocapture
 
       - name: JMAP Tests (plain accounts)
+        if: github.event_name == 'push'
         # Upstream's calendar::notification sub-test is timing-flaky (a fixed
         # 200 ms wait); one rerun keeps it from failing the job. A real
         # regression fails both runs. The test server wipes its data
