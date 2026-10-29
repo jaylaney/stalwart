@@ -197,6 +197,54 @@ pub async fn search(imap: &mut ImapConnection, imap_check: &mut ImapConnection) 
         .await
         .assert_equals("* SEARCH 1 3 4 6");
 
+    // COUNT retains every saved flag match even when MIN is requested.
+    imap_check
+        .send(concat!(
+            "UID SEARCH RETURN (SAVE MIN COUNT) OR OR KEYWORD Flag_000 KEYWORD Flag_002 ",
+            "OR KEYWORD Flag_003 KEYWORD Flag_005"
+        ))
+        .await;
+    imap_check
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_contains("COUNT 4 MIN 1");
+    imap_check.send("UID SEARCH $").await;
+    imap_check
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_equals("* SEARCH 1 3 4 6");
+
+    // Saved search with only MIN and MAX saves the extremes.
+    imap_check
+        .send(concat!(
+            "UID SEARCH RETURN (SAVE MIN MAX) OR OR KEYWORD Flag_000 KEYWORD Flag_002 ",
+            "OR KEYWORD Flag_003 KEYWORD Flag_005"
+        ))
+        .await;
+    imap_check
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_contains("MIN 1 MAX 6");
+    imap_check.send("UID SEARCH $").await;
+    imap_check
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_equals("* SEARCH 1 6");
+
+    // Saved search with MIN and MAX on a single match saves it once.
+    imap_check
+        .send("UID SEARCH RETURN (SAVE MIN MAX) UID 8")
+        .await;
+    imap_check
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_contains("MIN 8 MAX 8");
+    imap_check.send("UID SEARCH $").await;
+    imap_check
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_equals("* SEARCH 8");
+
     // Sort: by subject, date or sender is refused; by size and arrival is
     // served, the size order matching the messages' sizes.
     assert_search_refused(

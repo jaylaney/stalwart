@@ -633,3 +633,25 @@ offline Cargo metadata and workspace formatting. The earlier system and CalDAV r
 keep their recorded source/artifact identities. A shipping binary has not been rebuilt for
 this version-only change; its exact version/commit/provenance must be verified when built
 before publication. The published `fork-v0.1.0-beta.1` tag and artifacts remain immutable.
+
+## Fork-owned review follow-up on 2026-10-29
+
+The user limited this follow-up to fork-owned review findings. Key-account IMAP coverage
+now includes SAVE/MIN/COUNT, SAVE/MIN/MAX extrema and singleton deduplication, in addition
+to the existing SAVE/MIN/MAX/ALL case. Each asserts the exact saved UID set using allowed
+keyword/UID predicates; existing content-search refusals remain.
+
+The seeded deadline test drops its redundant elapsed-time assertion and retains task
+identity, changed failure reason, retry count, creation time, terminal state and cleanup.
+Test wording now explains upstream's existing convention of three retries after the initial
+execution. Production code, version/provenance metadata and review files are unchanged by
+this follow-up; inherited upstream findings were left outside its scope.
+
+Formatting and the complete IMAP key-account, ordinary-account and System suites passed.
+Each suite selected one whole Cargo test with zero failures. Command durations were 12.41s,
+10.03s and 62.96s respectively. The first sandboxed IMAP attempt failed during listener
+setup; the same source passed after local-listener permissions were granted. Exact commands,
+environments and receipts remain in `.superpowers/sdd/2026-10-29-fork-review-fixes/`.
+Runtime receipts identify parent `cdbc668d6bf5552f780fa848a6351f4e1c33471a` plus source patch
+SHA-256 `4a344c825937d78c9bb373093635e7e6b6eb339c7aab22eae4723c602adbbb38`.
+An independent focused source review passed for conformance and test correctness.
