@@ -12,7 +12,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 UPSTREAM = "18f4e9505027d790fd7e9fdad7f922be6719101d"
-VERSION = "0.1.0-beta.2"
+VERSION = "0.1.1-beta.1"
 
 
 class ReleaseMetadata(unittest.TestCase):

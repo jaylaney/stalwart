@@ -2,6 +2,10 @@
 
 ## Status and evidence boundary
 
+The current candidate version is `0.1.1-beta.1`; see the
+[version follow-up](#version-follow-up-on-2026-10-29). Earlier binary identities and runtime
+results below retain their original versions and source commits.
+
 The [system-suite follow-up](#system-suite-follow-up-on-2026-10-28) records the later
 fixture corrections, two passing complete system runs and fresh CalDAV qualification.
 Docker-dependent directory, Linux release-artifact and native-client qualification remain
@@ -616,3 +620,16 @@ four test-file corrections; the originating model tier was unavailable, so deleg
 inherited the parent model with high reasoning for implementation and xhigh for review.
 Review files remain untouched. Publication/deployment and native, Docker-dependent directory
 or Linux release-artifact acceptance are separate gates.
+
+## Version follow-up on 2026-10-29
+
+The user selected `0.1.1-beta.1` for the current .27 candidate. Release metadata, the
+shipping manifest/lock entry, metadata test expectation and current candidate documentation
+now agree on that version. Upstream provenance remains `v0.16.27` /
+`aa47d8ef7bfba7200d3293198ac2592747b20e73`; other lockfile package blocks are unchanged.
+
+Fresh checks passed: eight release-metadata tests, thirteen product-verifier tests, locked
+offline Cargo metadata and workspace formatting. The earlier system and CalDAV results
+keep their recorded source/artifact identities. A shipping binary has not been rebuilt for
+this version-only change; its exact version/commit/provenance must be verified when built
+before publication. The published `fork-v0.1.0-beta.1` tag and artifacts remain immutable.

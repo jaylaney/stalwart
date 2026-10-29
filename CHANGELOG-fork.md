@@ -6,10 +6,10 @@ The inherited [CHANGELOG.md](CHANGELOG.md) records upstream Stalwart history.
 
 ## Unreleased
 
-Preparing `0.1.0-beta.2`, independently versioned from the integrated upstream base
+Preparing `0.1.1-beta.1`, independently versioned from the integrated upstream base
 Stalwart `v0.16.27`, commit `aa47d8ef7bfba7200d3293198ac2592747b20e73`.
-Publication and release qualification remain separate gates; the published beta.1 tag and
-artifacts retain their original identity.
+Publication and release qualification remain separate gates; the published
+`0.1.0-beta.1` tag and artifacts retain their original identity.
 
 - Integrates the [.27 fixes](https://github.com/stalwartlabs/stalwart/releases/tag/v0.16.27):
   iTIP updates retain incoming timezone definitions for moved occurrences; OAuth accepts

@@ -37,7 +37,7 @@ provenance, and the release checklist. Record fork release changes in the
 
 The current integrated upstream base is Stalwart `v0.16.27`, commit
 `aa47d8ef7bfba7200d3293198ac2592747b20e73`; the proposed fork preview is
-`0.1.0-beta.2`. The upstream 1.0 port remains deferred. This integration does not
+`0.1.1-beta.1`. The upstream 1.0 port remains deferred. This integration does not
 promise ongoing upstream .16 maintenance or support.
 
 Plan each future upstream integration separately. Merge a verified release tag, never the

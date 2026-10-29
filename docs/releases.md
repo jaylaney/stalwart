@@ -88,10 +88,10 @@ its upstream updates during merges; do not insert fork release entries there.
 The first preview is `0.1.0-beta.1`, tagged `fork-v0.1.0-beta.1` and titled
 `release-0.1.0-beta-1`. `fork-release.toml` is the fork identity source: it records the fork
 version and upstream base tag/full commit. The shipping `stalwart` package version must match
-it. The current candidate is `0.1.0-beta.2`, with fully integrated upstream `v0.16.27`
+it. The current candidate is `0.1.1-beta.1`, with fully integrated upstream `v0.16.27`
 (`aa47d8ef7bfba7200d3293198ac2592747b20e73`). Internal upstream crate versions and numeric
 compatibility checks follow `0.16.27`; the fork-owned `vault` crate retains `0.16.25`.
-The beta.1 tag and artifacts remain immutable.
+The published `fork-v0.1.0-beta.1` tag and artifacts remain immutable.
 
 This candidate uses public upstream and fork tests for qualification and adds no private-test
 dependency, stored-format migration or legacy reader. Record fresh candidate results before
