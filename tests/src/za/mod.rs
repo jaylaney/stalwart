@@ -22,6 +22,8 @@ pub mod disabled;
 pub mod drain;
 pub mod drain_limits;
 pub mod expansion;
+#[cfg(feature = "sqlite")]
+pub mod external_directory;
 pub mod fanout;
 pub mod gating;
 pub mod inbox;
@@ -135,6 +137,8 @@ pub async fn za_tests() {
     app_password::test(&mut test).await;
     totp::test(&mut test).await;
     registry::test(&mut test).await;
+    #[cfg(feature = "sqlite")]
+    external_directory::test(&mut test).await;
     cors::test(&mut test).await;
     caches::test(&mut test).await;
     dav_gate::test(&mut test).await;
