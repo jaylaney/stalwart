@@ -4146,6 +4146,286 @@ Lines are the worktree's after part 3b.
     under C4: the alternative would serve a key account's entry unclassified. Cost if wrong:
     a registry outage refuses cached logins it could have served.
 
+## Task 4
+
+### Part 4a: `groupware`
+
+Part 4a resolved `groupware`'s six conflicted files and ported every fork module of the crate
+onto 1.0.1's split calendar records (commit `a92064a43`). The DAV, dead-property and HTTP
+shares call sites are part 4b's; the new za tests are part 4c's. `cargo check -p groupware`
+and `cargo check -p groupware --tests --features test_mode` are warning-free, and
+`cargo test -p groupware --lib` passes 162 tests (with or without `test_mode`).
+
+The shape of the port:
+
+- **The event pair.** At 1.0 an event is a metadata row (`CalendarEvent`) and a content record
+  (`CalendarEventContent`). The seal codec works on an in-memory pair,
+  `seal::ZaEvent { meta, content }`, which callers split back into the two records upstream's
+  writers take. `seal_event_in_domain` seals the content's tree in place and moves the row's
+  `display_name` into `X-ZA-EXTRA` (ruling 15: a key account's row holds `None`). It runs
+  before upstream's builders, so `refresh_from_content` and the index see only the sealed
+  tree. Read views return `ZaEventView { content, display_name }`: the unsealed content with
+  the stored content archive's version, and the bundle's display name.
+- **Extras.** `Extra` and `ExtraV2` lose `dead_properties` (format 1 and 2 otherwise
+  unchanged). The calendar `Bundle` loses `dead_properties` too; a shared calendar keeps its
+  five-part ring format, with a shared bundle that is now always empty.
+- **Per-user data.** `seal_event_in_domain` refuses content whose `preferences` are not empty
+  (`SealError::Structure("event preferences")`), so a key account's per-user event data can
+  never be stored, sealed or not.
+- **Conflicts.** `calendar/mod.rs` takes 1.0.1's module list plus the fork's
+  (`sequence_floor` per ruling 25) and moves `EVENT_NOTIFICATION_ZA_PENDING` to `1 << 15`
+  with a compile-time check against every upstream notification flag (ruling 30).
+  `dates.rs` adds `CalendarEventData::new_for(…, &DefaultAlerts, key_account)`: for a key
+  account the rule-expansion trace names each error's kind and drops 1.0.1's new `Contents`
+  value (the whole tree). `itip.rs` keeps `SendSealed` and the RSVP refusals, and puts the
+  provisioning fence in every commit chunk of the iMIP import and merge (before the event
+  write, before the notification quota's eviction, before the notification insert and at the
+  end). `event_cancel.rs` keeps `itip_cancel_from_snapshot`, which returns the raw message
+  before upstream's per-recipient split; `itip_cancel` splits as upstream does. `storage.rs`
+  is 1.0.1's with the hooks below.
+
+#### Notification mapping (ruling 13)
+
+- **Direct changes.** `notify_direct_change` returns early when `za_is_key_account(account_id)`
+  (`storage.rs`, the one fork call). `notify_calendar_addition` and `notify_calendar_removal`
+  go through it, as do the DAV and JMAP callers.
+- **Sealed inbox items** (`seal::item::sealed_item_record`), built without reading plaintext:
+
+  | Field | Value |
+  |---|---|
+  | `event_id` | the linked event when known (an import records the new event's slot, through `into_builder`'s pending id), else `None` |
+  | `changed_by` | the sender, `ChangedBy::PrincipalId` |
+  | `calendar_ids` | empty |
+  | `flags` | `EVENT_NOTIFICATION_PRIVATE` (upstream's `NotificationAudience::Members`: only the owner's members see it), plus `EVENT_NOTIFICATION_ZA_PENDING` while pending, plus `EVENT_NOTIFICATION_IS_CHANGE` on a drained merge |
+  | `size`, `etag` | upstream's builder: `refresh_from_content` sums the sealed snapshot's size, and the etag hashes the sealed content archive |
+  | `created`, `modified` | upstream's insert; the drain's rewrite keeps `created` |
+  | content | `CalendarEventNotificationContent::Itip { message: <the sealed tree>, previous: None, current: None }` |
+
+- **The drain's mirror** rewrites the item row with `SplitUpdate::full` over the stored row and
+  content (both asserted), with the drained tree resealed under the master key and no
+  snapshot. Upstream's import creates a notification next to the event; the drain's item row
+  is that record, so it writes none.
+- **Hiding.** `NotificationViewer::can_view` (`notification.rs`) refuses an item with the
+  pending bit (spec 6.6), so JMAP's notification views never list one. DAV's inbox listing
+  does not go through `can_view`; its filter is part 4b's.
+- **Deletion before the drain sees an item.**
+  - The reaper (`reap_calendar_notifications`) selects only rows whose non-empty
+    `calendar_ids` all lie in the deleted calendars, so it never selects a fork item.
+  - Quota eviction (`NotificationQuota::reserve`) deletes the account's oldest notification on
+    two paths only. `notify_direct_change` returns early for a key account before it reserves.
+    `itip_ingest` and `commit_itip_merge` reach only accounts read as ordinary, and every
+    commit chunk of their batch carries the provisioning fence, so on a key account nothing
+    commits, eviction included. The fan-out's item writes do not reserve. JMAP's calendar
+    copy reserves, but JMAP calendars are refused for key accounts.
+  - `itip_auto_expunge` expunges notifications older than the hold period, pending or not,
+    as 0.16 did. Recorded as parity, not new.
+
+#### Ruling 14: the create's id before the fan-out
+
+**The property holds.** An id reserved by a batch that commits is never reused:
+
+- `BatchBuilder::reserve_document_id` adds a `ReservationClass::DocumentId` reservation
+  (`store/src/write/batch.rs:105`). Its key is the per-account, per-collection counter
+  `ValueClass::DocumentId` (`CounterKind::DocumentId`, `Subspace::Counter`;
+  `store/src/write/mod.rs:906-916`, `key.rs:493`).
+- At commit each backend reads that counter inside the transaction, writes `counter + count`
+  and assigns `last - count + 1 ..= last` (RocksDB `backend/rocksdb/write.rs:221-246`, SQLite
+  `backend/sqlite/write.rs:69-76`, FoundationDB `allocate_counters`;
+  `AssignedIds::fill_slots`, `write/mod.rs:1570`). A transaction that aborts allocates
+  nothing.
+- The counter only grows. No code decrements it; `purge_store` deletes only zero-valued
+  counters, and a `DocumentId` counter is at least 1 after its first allocation;
+  `danger_destroy_account` clears it with the account.
+- A batch with reservations and no operations is still written: `write_batch` always runs
+  the final commit point (`batch.rs:1072-1092`), and `commit_batch` does not skip it.
+- 0.16's `assign_document_ids` was an `add_and_get` on the same counter
+  (0.16.27 `store/src/dispatch/store.rs:197-215`), so the property is the one key pinning
+  spec 5.2 relied on.
+
+Use (part 4b): commit a batch holding only `reserve_document_id(account_id,
+Collection::CalendarEvent)`, read `AssignedIds::slot(slot)`, pass it as `ZaSource.document_id`
+to the fan-out, then create the event with `PendingId::Assigned(id)`. In `groupware`, the
+fan-out's item writes and the drain's import reserve their ids in their own batch, since
+nothing before their commit needs the id.
+
+#### Ruling 25: the sequence re-read
+
+- **The floor stays.** Upstream's `ICalendarSequence` (`has_scheduling_changes`,
+  `increment_sequence`) is called only by JMAP's `CalendarEvent/set`
+  (`jmap/src/calendar_event/set.rs:899-919`), never by DAV PUT. It raises a lowered
+  SEQUENCE to the previous value plus one, matching components by type and recurrence
+  instant at floating time. DAV PUT therefore still needs `za_sequence_floor`
+  (`sequence_floor.rs`, part 4b's call site).
+- **The reconciliation stays.** 1.0.1's `organizer_handle_update` shares one
+  `SequenceIncrement` between the full and partial updates, returns `increment_sequences` to
+  the caller, and builds each CANCEL at the highest of old+1, the increment and the main
+  sequence (`scheduling/organizer.rs:260-470`). As far as the source shows, that fixes the
+  0.16 defect the reconciliation compensated (a shadowing local that lost a partial's
+  increments). The reconciliation only raises values to each instance's maximum, so on
+  1.0.1's output it is a no-op where messages and the committed tree agree. Kept unchanged;
+  a test that it is a no-op on 1.0.1's output would let a later task retire it.
+- **`carries_master`** (`fanout.rs`) still holds: 1.0.1 keeps the partial-drop block that
+  sends a master REQUEST as the full update and drops that recipient's partials
+  (`organizer.rs:225-249`).
+- **Identifiers.** The five fork units move from `calendar::sequence::tests::*` to
+  `calendar::sequence_floor::tests::*` (Task 7's baseline mapping).
+
+#### `delete_changes` and `CalendarIdentity`
+
+- `delete_changes` (`common/src/storage/transaction.rs:116-170`) clears
+  `VanishedCollection::CalendarIdentity` (250) over the same range as a Calendar truncation
+  of 252. Confirmed by source.
+- `CalendarIdentity`'s change group is Calendar's: `sync_collection()` maps it to
+  `SyncCollection::Calendar` and `change_group()` follows (`types/src/collection.rs:114-139`),
+  so both records of one deletion share the change id and the log key's group.
+- `storage.rs` logs calendar deletions and event unlinks with `log_calendar_vanished`
+  (calendar delete: its own id; event: its calendar's id). The other callers (DAV COPY and
+  MOVE, JMAP set) are part 4b's and Task 6's.
+- `store/src/query/log.rs` needs nothing more from `groupware`; the paged sync tokens at the
+  consumer (inventory finding 3) are part 4b's.
+
+#### Field policy 2
+
+- `seal::policy::is_visible_entry(component, entry)` replaces `is_visible_property`, which is
+  now private to the module. CLASS is visible on VEVENT, VTODO and VJOURNAL when its one value
+  is `Classification(Public | Private | Confidential)`; any other value, a second value or
+  another component seals it. Callers: `seal/tree.rs` (`seal_component` and its test),
+  `seal/event.rs` (`classify_event_storage`), `sharing/format.rs` (`sealed_timezone`). The leak
+  scanner (`tests/src/za/leak.rs:457`) must switch to it (part 4c).
+- `POLICY_VERSION` stays 1.
+- No fork code computes `EVENT_PRIVATE` or `EVENT_SECRET`. The drain's merge keeps the stored
+  classification exactly as `commit_itip_merge` does (`EventPrivacy::from_flags` on the
+  stored row, `set_privacy` when a scheduling component's merged CLASS differs).
+- Units: `standard_class_is_visible_on_event_task_and_journal`,
+  `other_class_values_and_components_stay_sealed`, `a_parsed_extension_class_stays_sealed`,
+  and `drain::tests::standard_class_stays_visible_and_derives_the_flags` (a merged, sealed
+  tree through upstream's `refresh_from_content`: PRIVATE and CONFIDENTIAL set their flag,
+  `X-SOMETHING` is sealed and leaves both clear, the recorded limit).
+
+#### Dead-property containers (rulings 16, 23 and 29)
+
+`seal/container.rs` holds the codec. The wrapper is built with upstream's
+`MetadataBuilder::set_dav` and `encode`: header `[FORMAT_VERSION, DAV, 1]`, one DAV entry
+`{urn:x-zero-access:sealed}container`, a text-only value. The text is base64 of:
+
+```text
+payload  = 1 (version) || bound (0 or 1) || envelope || sealed
+envelope = the event shape: 1 || 1 || wrapped DEK (event wrapping key, AAD
+           za/v1|container-key|<owner>|<scope>), or 1 || 3 || calendar id ||
+           generation || wrapped DEK (collection key, purpose ck-container-dek)
+sealed   = seal_padded(DEK, za/v1|dead-container|<owner>|<scope>, container bytes)
+scope    = <collection byte> | <bound> | <event UID>        (an event)
+           <collection byte> | <bound> | <calendar id, BE>  (a calendar, bound 1)
+           <collection byte> | 0 |                           (a calendar sealed at MKCOL)
+```
+
+Each container has its own data key. A calendar's container binds its document id when the id
+is assigned at sealing; one sealed by MKCOL (a pending slot) does not, until its next property
+write. That is ruling 16's recorded limit: under the owner's event wrapping key, such a
+container could be moved between the account's own unshared calendars by someone with store
+write access (integrity only; under a collection key the envelope binds the calendar id
+anyway). An event's container binds its UID, which COPY and MOVE keep.
+
+**The conversion journal's identity rule for containers (ruling 29).** A container is
+identified by its document: owner account, collection and document id. Conversion records
+nothing per container; the container's own envelope class (event wrapping key or collection
+key) is its state, as an event's envelope is.
+
+- An event's container is rewrapped in the same commit chunk as the event's own rewrap, ahead
+  of `update_full_at` under the context and guard assertions, and conditional on the stored
+  container's hash (upstream's `MetadataWrite`).
+- The calendar's container moves with the ring write: owner key to collection key at `Init`,
+  collection key to owner key at `Restore`.
+- An event that is already in the target class but whose container is not gets a
+  container-only write (a resume after an interruption).
+- Forward validation requires every container of the calendar's events to be under the
+  collection key and to open in the domain; rollback validation refuses one that still is.
+- Rotation needs no container rewrite: readers hold every generation and writers use the
+  newest, as for events.
+
+#### Primitives for part 4b
+
+- **Seal API** (`calendar::seal`): `ZaEvent`, `ZaEventView`; `seal_event(&mut ZaEvent, keys,
+  account_id, pairs)`, `seal_event_in_domain(&mut ZaEvent, domain, pairs)`,
+  `unseal_event`, `unseal_event_pairs`, `unseal_event_in_domain(&mut ZaEvent, domain)`,
+  `rewrap_event(&mut ZaEvent, from, to)`; on stored archives `event_token_pairs(&content,
+  keys, account_id)`, `unseal_event_archive(&meta, &content, keys, account_id)`,
+  `event_pairs_in_domain(&meta, &content, domain)`, `event_view_in_domain(&meta, &content,
+  domain)` (`meta` is the deserialized row, `content` the content archive);
+  `classify_event_storage(&CalendarEventContent)`,
+  `archived_event_is_sealed(&ArchivedCalendarEventContent)`, `za_event_uid(&content)`.
+- **Ruling 15.** `reseal_event_in_domain(&mut ZaEvent, domain, edit)` unseals the stored pair,
+  applies `edit` (set `meta.display_name`), and seals again under a fresh data key with the
+  same token pairs. A displayname PROPPATCH then writes `CalendarEvent::update_full` with the
+  result; the row keeps `display_name: None`.
+- **Writes** (`storage.rs`): `update_full_at`, `update_meta_at`, `insert_at` (fenced rebuilds
+  keep their timestamps); `delete_with_events_za(…, za_keys) -> Vec<ZaDeleteMessage>` (asserts
+  the calendar's context in every event's chunk and before the calendar delete);
+  `delete_za_at(…, domain, cutoff) -> Option<ZaDeleteMessage>`; `remove_all_za_at`. The caller
+  asserts the event's context in the chunk of `delete_za_at`. `ZaDeleteMessage.messages` is
+  `Option<Vec<ItipMessage>>`, upstream's `itip_cancel` after its per-recipient split.
+- **Scheduling**: `ItipSendStatus::resolve(…, owner_is_key)` (JMAP passes `false`);
+  `itip_cancel(…, policy)` is upstream's; `itip_cancel_from_snapshot` returns the raw message.
+- **Containers**: `seal_container(plain, domain, ZaContainerScope)`, `open_container(sealed,
+  domain, ZaContainerOf)`, `rewrap_container`, `reseal_container`, `is_sealed_container`,
+  `container_is_ck`, `CONTAINER_NAMESPACE`, `CONTAINER_NAME`. At the DAV sites: PROPPATCH opens
+  the stored container for the edit's view, compares plaintext, and seals `next` with
+  `Calendar(Some(id))` for an existing calendar, `Calendar(None)` at MKCOL and `Event(uid)`
+  for an event, before `ContainerChange::new`; PROPFIND opens into an owned buffer; COPY and
+  MOVE reseal with `reseal_container` when the key domain changes (an event's scope, its UID,
+  is unchanged).
+- **Sealed items**: `seal::item::{sealed_item_record, item_message, into_item_message}`;
+  `unseal_item_archive` now takes the item's content archive.
+- `CalendarEventData::new_for(ical, tz, max, &DefaultAlerts, key_account)`.
+
+#### The viewer-side readers
+
+- `privacy.rs`: `EventPrivacy::from_flags` reads flags upstream derives from the visible
+  CLASS, keyless, as upstream does. `check_access`, `may_be_set_by` and `into_private_view`
+  run in DAV on the unsealed view (part 4b).
+- `hidden.rs`: used only by JMAP, which refuses key accounts' calendars.
+- `participants.rs`: used by `index.rs` (the calendar search document, Task 6), `identity.rs`,
+  `instance_filter.rs` and the alarm task (`services`, Task 6). On a sealed tree they find no
+  participants: no leak, less function. DAV runs them on the unsealed view (part 4b).
+- `overlap.rs`: used by `dates.rs` from TRANSP and STATUS, both visible, so the same on a
+  sealed tree.
+- `notification.rs`: `can_view` hides pending items; the reaper is safe (above).
+- `alerts.rs`: `DefaultAlertsResolver` runs on the plaintext view in the drain and in
+  `storage.rs`, and reads the calendar's default alerts, which are visible. DAV GET and COPY
+  are part 4b's.
+
+#### Deferred, by owner
+
+**Part 4b**
+- Every DAV and HTTP call site of the seal API, the storage `_za` variants,
+  `ZaDeleteMessage.messages`, the containers, `reseal_event_in_domain`, ruling 14's id and the
+  floor. `http/src/api/contacts.rs`'s redelivery (`seal_event_in_domain` and
+  `unseal_event_in_domain` on `ZaEvent`, `sequence` to `sequence_floor`) and `shares.rs`.
+- DAV's inbox listing must leave out items with `EVENT_NOTIFICATION_ZA_PENDING`
+  (`can_view` covers JMAP only).
+- The dead-property PROPPATCH, PROPFIND, COPY, MOVE and MKCOL sites (above).
+- `za_eval_if`'s arena argument (Task 3a's handoff): `groupware` has no call site; the fan-out's
+  callers are in `dav`.
+
+**Part 4c**
+- Every za test listed in Task 4's brief, the differential sharee test and the store scan;
+  `tests/src/za/leak.rs` switches to `is_visible_entry`.
+
+**Task 6**
+- `build_calendar_document` and the alarm task read participants from the stored tree; on a
+  sealed tree they see none, which must stay so (C6).
+- `ShareRevokeCleanup` must skip key-account owners (the design's decision).
+
+**Recorded, no owner**
+- Delegated-self messages (`delegation.rs`) go only to the writer's own addresses and are not
+  split per recipient for `EVENT_HIDE_ATTENDEES`; the writer already sees every attendee.
+- The fan-out and the drain no longer treat `LimitEvent::TenantQuota` as "over quota": the
+  variant exists only in enterprise builds and the fork names no SEL-only variant (ruling 26).
+  In an enterprise build a tenant-quota refusal is a delivery failure (the fan-out) or a
+  counted item failure (the drain).
+- `clippy` reports five warnings in fork code that predate the port (`fanout.rs:790`,
+  `seal/domain.rs:297`, `sequence_floor.rs:218`, `sharing/resolve.rs:141` and `:1006`).
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
@@ -4197,7 +4477,7 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/common/src/lib.rs` | content | Task 3 | resolved (Task 3a): v1.0.1's KV constants as supplied (row 3: `KV_LOCK_ZA_UID` is gone; the lease uses `store::ZA_UID_LEASE_PREFIX` in `Subspace::System`, ruling 24); `Caches` gains the four fork fields (row 4); `HttpAuthCache` is upstream's 40-byte struct with no fork field (row 5, ruling 10); the fork's `impl Caches` (`za_fingerprint`, `za_insert_keys`, `za_sweep_keys`, the account-page origin) follows it. `za_insert_keys` and `za_sweep_keys` no longer remove HTTP entries (1.0's keys are not caller-chosen); the HTTP hit rule (part 3b) refuses a key-account entry without resident keys instead. |
 | `crates/common/src/manager/boot.rs` | content | Task 3 | resolved (Task 3a): v1.0.1's events (recovery-mode port, `CompactString` hostnames) with `Version = crate::version::BUILD_IDENTITY`; rows 2-3 kept (the startup identity line and the key-cache settings event). |
 | `crates/common/src/scripts/plugins/mod.rs` | content | Task 5 | resolved (Task 3a, ruling 41): rows 1-3 ported: `PluginContext.za_redact` beside 1.0's `arguments: Vec<Variable<'x>>`; the type-only error funnel in `run_plugin`. Task 2's handoff (`:57`, `:76`, `:109`) ported too: the `print` plugin is registered and dispatched under `test_mode`, with a fork-owned `test_print` written from 0.16's. Nothing deferred; Task 5 sets `za_redact` at the `PluginContext` constructors in `smtp` and `email`. |
-| `crates/common/src/storage/transaction.rs` | content | Task 4 | resolved (Task 3a, ruling 41): v1.0.1's `delete_changes`, whose `truncate_change_log` already writes the truncation entry before any delete for every collection (0.16's Calendar-only early publication is now upstream's behaviour, so rows 2-3's ordering needs no fork code); a Calendar truncation also clears `VanishedCollection::CalendarIdentity` (250) over the same range, then calls `calendar_history_purge_pause_point` under `test_mode`. Nothing deferred to Task 4. |
+| `crates/common/src/storage/transaction.rs` | content | Task 4 | resolved (Task 3a, ruling 41): v1.0.1's `delete_changes`, whose `truncate_change_log` already writes the truncation entry before any delete for every collection (0.16's Calendar-only early publication is now upstream's behaviour, so rows 2-3's ordering needs no fork code); a Calendar truncation also clears `VanishedCollection::CalendarIdentity` (250) over the same range, then calls `calendar_history_purge_pause_point` under `test_mode`. Nothing deferred to Task 4. Task 4a re-read: confirmed, and `CalendarIdentity`'s change group is Calendar's (see Task 4, "`delete_changes` and `CalendarIdentity`"). |
 | `crates/common/src/telemetry/tracers/otel.rs` | content | Task 9 (compiles in Task 3) | resolved (Task 3a, ruling 41): v1.0.1's file as supplied (the exporter moved to the `telemetry` crate). Deferred to Task 9: row 1, at `crates/telemetry/src/otlp/resource.rs` (see `config/telemetry.rs`). |
 | `crates/dav/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies (local `calcard`, hashify 0.3, hyper 1.12) plus `vault` (row 1); `test_mode = ["common/test_mode"]` (row 2). |
 | `crates/dav/src/calendar/copy_move.rs` | content | Task 4 | open |
@@ -4223,12 +4503,12 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/email/src/message/mod.rs` | content | Task 5 | open |
 | `crates/email/src/sieve/ingest.rs` | content | Task 5 | open |
 | `crates/groupware/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies and `enterprise` list plus `vault`, `base64`, `subtle` and `zeroize` (row 1); `test_mode = ["common/test_mode"]` (row 2). |
-| `crates/groupware/src/calendar/dates.rs` | content | Task 4 | open |
-| `crates/groupware/src/calendar/itip.rs` | content | Task 4 | open |
-| `crates/groupware/src/calendar/mod.rs` | content | Task 4 | open |
-| `crates/groupware/src/calendar/sequence.rs` | add/add | Task 4 (ruling 25: the fork's file becomes `sequence_floor.rs`; upstream's is taken as supplied) | open |
-| `crates/groupware/src/calendar/storage.rs` | content | Task 4 | open |
-| `crates/groupware/src/scheduling/event_cancel.rs` | content | Task 4 | open |
+| `crates/groupware/src/calendar/dates.rs` | content | Task 4 | resolved (Task 4a): v1.0.1's file plus `new_for(…, &DefaultAlerts, key_account)`, which traces each expansion error's kind and no `Contents` for a key account (rows 2, 3, 5); the fork unit module keeps its name `tests` and covers 1.0.1's new `ExpansionLimitReached`. |
+| `crates/groupware/src/calendar/itip.rs` | content | Task 4 | resolved (Task 4a): v1.0.1's file plus `SendSealed`, `resolve(…, owner_is_key)`, the RSVP refusals (rows 3, 4) and the provisioning fence in every commit chunk of the iMIP import and merge (rows 2, 5): before the event write, before the notification quota's eviction, before the notification insert and at the end. |
+| `crates/groupware/src/calendar/mod.rs` | content | Task 4 | resolved (Task 4a): v1.0.1's module list plus the fork's, with `sequence_floor` (ruling 25); `EVENT_NOTIFICATION_ZA_PENDING = 1 << 15` with a compile-time check against every upstream notification flag (ruling 30). |
+| `crates/groupware/src/calendar/sequence.rs` | add/add | Task 4 (ruling 25: the fork's file becomes `sequence_floor.rs`; upstream's is taken as supplied) | resolved (Task 4a): v1.0.1's file as supplied; the fork's is `calendar/sequence_floor.rs` (see "Ruling 25: the sequence re-read"). |
+| `crates/groupware/src/calendar/storage.rs` | content | Task 4 | resolved (Task 4a): v1.0.1's file plus `update_full_at`, `update_meta_at`, `insert_at` (rows 3, 4), `delete_with_events_za`, `delete_za_at`, `remove_all_za_at` and `ZaDeleteMessage` (rows 5-7, 9-14), `log_calendar_vanished` (row 8) and `notify_direct_change`'s early return for a key-account owner (ruling 13). |
+| `crates/groupware/src/scheduling/event_cancel.rs` | content | Task 4 | resolved (Task 4a): v1.0.1's file; `itip_cancel_from_snapshot` returns the message before upstream's per-recipient split, and `itip_cancel` splits as upstream does (row 2). |
 | `crates/http-proto/src/request.rs` | content | Task 3 | resolved (Task 3b): rows 1-3 on 1.0's `fetch_body`: `fetch_body` and `fetch_body_untraced` share `fetch_body_inner`, which keeps 1.0's declared-size allocation; `traced_header` redacts the credential headers. `cargo check -p http_proto --tests` passes. |
 | `crates/http/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies plus `vault` (row 1) and `subtle` (row 2); `test_mode = []`, the fork's 0.16.27 declaration (the `za_test` hooks of `auth/authenticate.rs`). |
 | `crates/http/src/api/mod.rs` | content | Task 3 (shares route: Task 4) | resolved (Task 3b): 1.0's imports plus `vault::VaultApi`; rows 1, 3 and 5 merged as written. Row 4 (`with_untraced_body`) had been placed by the merge on the `auth/client` arm; it is moved back to the login POST arm, whose response it covers, and the client-info arm is upstream's again. The shares routes live in `vault.rs`'s dispatcher (Task 4's `shares.rs`). |
@@ -4288,7 +4568,7 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/spam-filter/src/modules/expression.rs` | content | Task 5 | open |
 | `crates/store/src/dispatch/lookup.rs` | content | Task 2 (lease home: Task 3/Task 4) | resolved (Task 2a): v1.0.1's file as supplied (both blocks). Row 2's purge skip is moot, not deferred. Evidence (paths in `v1.0.1-src/crates/`): v1.0.1 has no `purge_in_memory_store`, and `InMemoryStore` (`store/src/lib.rs:426-439`) has no data-store variant: it is `Sql`, `Local`, `Redis`, `Http`, `Static` and the SEL `Sharded`, and `Sql` answers `NotSupported` to key writes (`store/src/dispatch/lookup.rs:61` and the arms after it). So nothing sweeps expired keys out of the data store. Its other bulk deletions of data-store keys are: `Store::purge_store`, which only clears zero counters in `Shape::Counter` subspaces (`store/src/backend/{rocksdb,sqlite,foundationdb}/write.rs`); `danger_destroy_account` (`store/src/dispatch/store.rs:415-476`: the account's `Counter` kinds, its `Logs`, `Indexes`, `Property`, `Immutable` and `IndexProperty` prefixes, and its ACLs); the change-log truncation (`delete_changes` and `truncate_change_log`, `common/src/storage/transaction.rs:116-235`, `Logs`); the private-metadata cleanup (`common/src/storage/metadata/cleanup.rs:228-265`, an owner's private metadata and private logs); the telemetry purges (`TelemetrySpan`, `TelemetryMetric`); the reindex and search-queue clears (search subspaces); and the console's operator-driven range delete. Ruling 24's guarantee (only the asserting sweep clears a lease) therefore rests on Task 3's choice of a `Shape::Value` subspace and key range for `ValueClass::Any` that none of these reaches. `ZA_UID_LEASE_PREFIX` stays in `store/src/lib.rs` as the first byte of the lease key in it. |
 | `crates/store/src/lib.rs` | content | Task 2 (is_read_replica consumer: Task 4) | resolved (Task 2a): v1.0.1's `Subspace` block as supplied, without the 0.16 `LEGACY_SUBSPACE_BITMAP_*` constants (no user). Row 1: `za_test` declared under `test_mode`. Row 2: `ZA_UID_LEASE_PREFIX = 27` kept (ruling 24), its comment rewritten for a `ValueClass::Any` key. Row 3 (ruling 26): the only caller of `Store::is_read_replica` is the fork's move route (`dav/src/calendar/copy_move.rs:2324`), and v1.0.1 still has the SEL `SQLReadReplica` variant, so the function stays, rewritten without the SEL arm: an SQL store (`is_sql`) that is neither SQLite nor `is_pg_or_mysql`, which at v1.0.1 is exactly the replica, and fails closed for any SQL variant upstream adds. |
-| `crates/store/src/query/log.rs` | content | Task 4 | resolved to compile (Task 2a, ruling 34): rows 1 and 2 ported. `vanished` wraps `vanished_with_change_id` as at 0.16, and each record is decoded with v1.0.1's `deserialize_vanished(bytes, &mut items)` into a per-record buffer, then tagged with that record's change id (the `String` decoder's prefix sharing is per record). Nothing deferred; finding 3 (paged sync tokens at the consumer) stays Task 4's. |
+| `crates/store/src/query/log.rs` | content | Task 4 | resolved to compile (Task 2a, ruling 34): rows 1 and 2 ported. `vanished` wraps `vanished_with_change_id` as at 0.16, and each record is decoded with v1.0.1's `deserialize_vanished(bytes, &mut items)` into a per-record buffer, then tagged with that record's change id (the `String` decoder's prefix sharing is per record). Nothing deferred; finding 3 (paged sync tokens at the consumer) stays Task 4's. Task 4a re-read: nothing in `groupware` consumes it; the paged consumer is part 4b's. |
 | `crates/store/src/search/index.rs` | content | Task 6 (`has_account_search_terms`: Task 2) | resolved to compile (Task 2a, ruling 34): v1.0.1's imports and `index_account_documents` as supplied; 0.16's `Store::index` is gone. Deferred to Task 6: R58 placement, row 2 (the carrier `IndexDocument::assert_absent` and `with_assert_absent` in `search/{mod,document}.rs` compile unchanged and nothing reads them yet); R62's per-chunk guard, row 3; R63's confirmation read and its `take_clears` helper, row 4 (both removed from the file; the 0.16 code is at `9601038de`). Row 5 kept (ruling 19): `has_account_search_terms` is re-derived over v1.0.1's layout as one `only_first` scan of the account's term range in `Subspace::SearchTerm`, the range `unindex_account` deletes (`codec::account_region_range`); v1.0.1 has no separate `Index` keys. `za_test`'s `INDEX_CHUNK_PAUSE` and `INDEX_GUARD_FAIL_ONCE` stay, with no call site until rows 3 and 4 are decided. |
 | `crates/store/src/write/batch.rs` | content | Task 6 (consumer: Task 4) | resolved to compile (Task 2a, ruling 34): v1.0.1's imports plus `CalendarTombstone`. Row 2 (`log_calendar_vanished`) kept; `types` gives `VanishedCollection::CalendarIdentity` Calendar's change group, so both records of one deletion share a change id. Deferred to Task 6: `accounted_input_bytes`, row 3 (removed: v1.0.1's `SetValue` and boxed `MergeFnc` closures have no countable `Params`). Ruling 17's `FORCE_COMMIT_SPLIT` call is in `commit_point()`. |
 | `crates/store/src/write/mod.rs` | content | Task 6 (consumer: Task 4) | resolved to compile (Task 2a, ruling 34): v1.0.1's code as supplied. Deferred to Task 6: `Params::accounted_input_bytes`, row 1 (`Params` is gone; `MergeFnc` is a closure, so the move route's payload bound must be re-derived). The commit-retry constants are back under `test_mode` (test-hook table rows `store/src/write/mod.rs:105-112`), with `PRODUCTION_MAX_COMMIT_ATTEMPTS` gated to non-test builds, where it is used. |
@@ -4341,6 +4621,16 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `za::caches` (`live_caches`, fork) | After the idle sweep the HTTP entry is asserted present (0.16 asserted it gone with its keys), and the next request is asserted to re-verify; a full verification is detected by new resident keys (a new `Arc`), where 0.16 compared the entry's expiry `Instant`. The case "a stale generation in the authentication entry" becomes "keys evicted while the entry stays", "stale-generation keys" and "another account's keys", each re-verified. Entries are counted and inspected through `HttpAuthEntries::retain`. | `common/src/cache/http_auth.rs`: entries are keyed by a SipHash of the raw token (no removal by fingerprint, no iterator); `HttpAuthCache` has no generation (40-byte assertion, ruling 12), so the hit rule reads the account's; `TtlClock` expiry has one-second resolution (`utils/src/cache.rs:369-391`). |
 | `za::caches` (`assert_holds_no_credential`, fork) | No longer checks the HTTP cache's keys against the fingerprints of known tokens; it checks each entry's `Debug` and the key cache's fingerprints of the known tokens. | 1.0's HTTP cache keys are an internal keyed hash, not exposed and not caller-chosen (interface sheet 2: non-reversible, C3). |
 | `za::mail::login` (`keyless_mechanisms_are_refused`, `refusals_are_not_auth_failures`, fork) | The Bearer tokens are minted in-process (`utils::za::za_bearer_token`, `za_grant_token`), where 0.16 ran the `/api/auth` and `/auth/token` flow; the ordinary account's grant is revoked at the end. Assertions unchanged. | 1.0 binds every access token to a grant (`authenticate_oauth_token`, `common/src/auth/authentication.rs:603-607`) and resolves only registered, stateless or metadata-document clients (`common/src/auth/oauth/client.rs:80-130`); its login request takes an authorization `query` (`http/src/auth/oauth/auth.rs:126-159`). |
+| `calendar::expand::tests::this_and_future_instances_get_distinct_keys` (restored) | The keys of the two instances a RANGE=THISANDFUTURE override shifts are 09:00 (the series' recurrence id), where 0.16 keyed them at 10:00 (the shifted start); a new assertion checks that the 10:00 key finds nothing. The expected starts are unchanged. | `groupware/src/calendar/expand.rs` (`expand_from_ids`, `ThisAndFutureShifts`): a shifted instance keeps the series' recurrence id (RFC 5545 3.8.4.4). |
+| `calendar::expand::tests::*` (restored) | `naive` computes its timestamps with `jiff` instead of `chrono`, and `CalendarEventData::new` takes three arguments. No assertion changes. | `chrono` is no longer a dependency of `groupware`; `CalendarEventData::new` lost its alarm out-parameter. |
+| `cache::file::tests::nested_hierarchy_percent_encodes_paths` (restored) | The folder named `My%20Folder` and its file are expected at `My%2520Folder…`. The test is rebuilt on 1.0's resource store (`push_file`, `ResourceStore`, `PathIndex`) and masks `CONTAINER_FLAG` out of `hierarchy_seq`. | `common/src/storage/dav/mod.rs`: `canonical_path_segment` always percent-encodes a stored name (Task 2's handoff); 0.16 passed an encoded segment through. |
+| `cache::file::tests::*` (restored) | Rebuilt on 1.0's resource store; the paths and ordering assertions are unchanged. | `groupware/src/cache/file.rs`: `DavResources`, `DavResource` and `DavResourceMetadata` became `GroupwareResources`, `ResourceStore` and `PathIndex`. |
+| `calendar::seal::collection::tests::shared_property_write_preserves_owner_parts` (fork) | The grantee's personal write now leaves every part of the owner's entry as stored; the check that the shared bundle is rewritten under a fresh data key is gone, and the fixture has no dead properties. | Dead properties left `Calendar` at 1.0 (`types::DeadProperty` is gone); a calendar's are a sealed metadata container (`seal::container`), so the shared bundle carries nothing. |
+| `calendar::seal::{event,collection}::tests::*` (fork) | The fixtures lose their dead-property canaries and the assertions on `dead_properties`; the event tests run on the `ZaEvent` pair, and the views' version and display name are checked on `ZaEventView`. | The split `CalendarEvent`/`CalendarEventContent` records and the removal of `DeadProperty` (interface sheet 4 and 5). |
+| `calendar::seal::policy::tests::event_allowlist_matches_spec_section_6` (fork) | `Class` leaves the sealed list; a standard CLASS is asserted visible through `is_visible_entry` and `CLASS:X-SOMETHING` sealed. | Field policy 2 (calendar spec revision 8, design "Privacy flags"): a fork change made for 1.0's privacy filters. |
+| `calendar::seal::item::tests::item_views_pending_drained_and_plaintext` (fork) | Items are stored as a row and an `Itip` content archive (`sealed_item_record`); the view is of the content, and upstream's own content with a snapshot passes through as stored. | 1.0.1's split `CalendarEventNotification` / `CalendarEventNotificationContent` (ruling 13). |
+| `calendar::delegation::tests::*`, `calendar::pinning::tests::the_fork_decline_ignores_partstat` (fork) | Upstream's builders are called with a `RecipientPolicy` that shows every attendee; `cancel_split_preserves_public_behavior` asserts that `itip_cancel` then returns one message and compares it with `itip_cancel_from_snapshot`'s. | 1.0.1's `itip_create`, `itip_update` and `itip_cancel` take a `RecipientPolicy` and return per-recipient messages (`scheduling/recipient.rs`). |
+| `calendar::sequence::tests::*` (fork) | Renamed `calendar::sequence_floor::tests::*`; bodies unchanged. | Ruling 25: upstream's `calendar/sequence.rs` takes the module's name. |
 
 ## Task 1 check
 
