@@ -3441,8 +3441,8 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/store/src/search/index.rs` | content | Task 6 (`has_account_search_terms`: Task 2) | open |
 | `crates/store/src/write/batch.rs` | content | Task 6 (consumer: Task 4) | open |
 | `crates/store/src/write/mod.rs` | content | Task 6 (consumer: Task 4) | open |
-| `README.md` | content | primary (keep the fork's text) | open |
-| `SECURITY.md` | content | primary (keep the fork's text) | open |
+| `README.md` | content | primary (keep the fork's text) | resolved: the fork's text ("Keep the fork's README and SECURITY") |
+| `SECURITY.md` | content | primary (keep the fork's text) | resolved: the fork's text ("Keep the fork's README and SECURITY") |
 
 ## Expectation ledger
 
