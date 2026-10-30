@@ -328,4 +328,18 @@ fn parse_fetch() {
             command
         );
     }
+
+    // 0.16's input, with 1.0's outcome: a MIME section without a part number
+    // is refused.
+    assert!(
+        receiver
+            .parse(
+                &mut "A001 FETCH 1 (BODY[MIME] BODY[TEXT] PREVIEW)\r\n"
+                    .as_bytes()
+                    .iter()
+            )
+            .unwrap()
+            .parse_fetch()
+            .is_err()
+    );
 }

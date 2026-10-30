@@ -19,7 +19,7 @@ use store::{
 use trc::AddContext;
 use types::{
     blob_hash::{BLOB_HASH_LEN, BlobHash},
-    collection::Collection,
+    collection::{Collection, SyncCollection},
     field::PrincipalField,
 };
 
@@ -57,8 +57,10 @@ enum Rule {
     /// except on PostgreSQL and MySQL, which keep the search index in tables
     /// of their own and create no such subspace (`Subspace::is_internal_fts`).
     InternalSearch,
-    /// The change logs (and share notifications), deleted after the check as
-    /// at 0.16.
+    /// The change logs, deleted after the check as at 0.16. 1.0 also keeps
+    /// share notifications here, as log entries of
+    /// `SyncCollection::ShareNotification`; a share notification left behind is
+    /// a leftover.
     Logs,
 }
 
@@ -266,10 +268,10 @@ pub async fn store_assert_is_empty_except_vaults(
     for subspace in Subspace::ALL.iter().copied() {
         let rule = subspace_rule(subspace);
         let with_values = match rule {
-            Rule::Logs => continue,
             Rule::InternalSearch if store.is_pg_or_mysql() => continue,
             Rule::Leftover { with_values } => with_values,
             Rule::RegistryIndex => false,
+            Rule::Logs => true,
             Rule::Counters
             | Rule::RegistryItems
             | Rule::RegistryPrimaryKey
@@ -356,6 +358,13 @@ pub async fn store_assert_is_empty_except_vaults(
                                 "Found registry primary key or reference for object type {:?}: {:?}",
                                 object_id, key
                             );
+                        }
+                        Rule::Logs
+                            if !(key.len() == U32_LEN + 1 + U64_LEN
+                                && key[U32_LEN] == u8::from(SyncCollection::ShareNotification)) =>
+                        {
+                            // A change-log entry, deleted below
+                            return Ok(true);
                         }
                         Rule::Properties
                             if key.len() == U32_LEN + 2 + U32_LEN

@@ -11,11 +11,27 @@ use sha1::Digest;
 use sha1::Sha1;
 use utils::HexEncode;
 
-use super::pyzor_create_message;
 use super::pyzor_send_message;
-use super::{PyzorDigest, html_to_text, pyzor_digest};
+use super::{PyzorWrite, html_to_text, pyzor_digest};
 
 use super::PyzorResponse;
+use crate::{MessageTexts, SpamFilterInput};
+use common::config::mailstore::spamfilter::SpamTextLimits;
+
+// 1.0 removed the `PyzorDigest` trait: the message digest and the check
+// message are `SpamFilterInput` methods over the message's extracted texts.
+// These two helpers give the 0.16 calls that shape.
+fn message_digest<W: PyzorWrite>(raw: &str, writer: W) -> Option<W> {
+    let message = MessageParser::new().parse(raw).unwrap();
+    let texts = MessageTexts::new(&message, SpamTextLimits::default());
+    SpamFilterInput::from_message(&message, &texts, 0).pyzor_digest(writer)
+}
+
+fn pyzor_create_message(raw: &str, time: u64, thread: u16) -> Option<String> {
+    let message = MessageParser::new().parse(raw).unwrap();
+    let texts = MessageTexts::new(&message, SpamTextLimits::default());
+    SpamFilterInput::from_message(&message, &texts, 0).pyzor_create_message(time, thread)
+}
 
 #[ignore]
 #[tokio::test]
@@ -46,12 +62,7 @@ async fn send_message() {
 
 #[test]
 fn message_pyzor() {
-    let message = pyzor_create_message(
-        &MessageParser::new().parse(HTML_TEXT_STYLE_SCRIPT).unwrap(),
-        1697468672,
-        49005,
-    )
-    .unwrap();
+    let message = pyzor_create_message(HTML_TEXT_STYLE_SCRIPT, 1697468672, 49005).unwrap();
 
     assert_eq!(
         message,
@@ -156,14 +167,7 @@ fn digest_pyzor() {
         (TEXT_ATTACHMENT_W_CONTENTTYPE_NULL, "Thisisatestmailing"),
     ] {
         assert_eq!(
-            String::from_utf8(
-                MessageParser::new()
-                    .parse(input)
-                    .unwrap()
-                    .pyzor_digest(Vec::new())
-                    .unwrap()
-            )
-            .unwrap(),
+            String::from_utf8(message_digest(input, Vec::new()).unwrap()).unwrap(),
             expected,
             "failed for {input}"
         )
@@ -171,10 +175,7 @@ fn digest_pyzor() {
 
     // Test SHA hash
     assert_eq!(
-        MessageParser::new()
-            .parse(HTML_TEXT_STYLE_SCRIPT)
-            .unwrap()
-            .pyzor_digest(Sha1::new())
+        message_digest(HTML_TEXT_STYLE_SCRIPT, Sha1::new())
             .unwrap()
             .finalize()
             .hex_encode(),

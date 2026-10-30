@@ -206,8 +206,9 @@ async fn build_search_store(typ: SearchStoreType, _path: &str) -> SearchStore {
 /// - Scheduled tasks (`TaskQueueClass::Task`): a task due later is skipped
 ///   with `skip_not_due`, a failed one with `skip_permanent_failures`.
 /// - The search index queue (subspace `SearchQueue`): its entries
-///   (`SearchIndexClass::Queue`), the claim markers of the partitions being
-///   indexed (`QueueIndex`) and the status keys of failed partitions
+///   (`SearchIndexClass::Queue`), the markers of the partitions that hold
+///   queued work (`QueueIndex`, set when an entry is queued and cleared when
+///   the partition drains) and the status keys of failed partitions
 ///   (`QueueStatus`, written while they wait for a retry). A partition whose
 ///   retry is due later is skipped with `skip_not_due`, entries included. The
 ///   index queue has no permanent failure: a failed partition is retried.
@@ -266,7 +267,7 @@ pub async fn wait_for_tasks(server: &Server, skip_not_due: bool, skip_permanent_
 }
 
 /// The search index partitions, as (index, partition), that still hold
-/// queue entries, a claim marker or a failure status.
+/// queue entries, a queued-work marker or a failure status.
 async fn pending_search_index_partitions(
     server: &Server,
     skip_not_due: bool,

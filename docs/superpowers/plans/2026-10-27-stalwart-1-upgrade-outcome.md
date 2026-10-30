@@ -1801,6 +1801,163 @@ These go dead even in a crate's own unit tests, and the restored inline modules 
 | `dav-proto/src/parser/mod.rs:146-147` | `impl PartialEq for Token` | `dav-proto/src/parser/mod.rs:159-160` `cfg(all(test, stalwart_tests))` | `dav-proto`'s restored tokenizer and request tests, which compare tokens | **Flag.** Restore `cfg(test)`; without it the restored modules do not compile |
 | `dav-proto/src/responses/propstat.rs:36-37` | `PropStat::new` | `dav-proto/src/responses/propstat.rs:36-37` `cfg(all(test, stalwart_tests))` | `dav-proto`'s restored response tests (0.16.27 `responses/mod.rs:262`, `:266`) | **Flag.** Restore `cfg(test)`; same reason |
 
+**1.0.1's other test-gated sites (Task 2 fix round 1, review I2).** The table above covers
+the sites 0.16.27 gated on `test_mode`. 1.0.1 also gates 522 sites that it has no row for on
+its private test cfg (`stalwart_tests`, `any(…, stalwart_tests)` or `all(test,
+stalwart_tests)`), not counting the 562 private-slot module declarations. They were found
+by a scan of `v1.0.1-src/crates` for every `stalwart_tests` line that is not a slot's `cfg`,
+less the table's rows; the per-file list follows the table. Paths are under `crates/`.
+
+| Sites | What they do in tests | Retained test that relies on them | Disposition |
+|---|---|---|---|
+| `common/src/storage/index/build.rs:464`, `:466` | `REVOKE_CLEANUP_WINDOW` is 1 s instead of 300 s, so the `ShareRevokeCleanup` task that a grant removal schedules is due 2–3 s later, not 10 minutes | every suite that revokes a grant and then checks emptiness (`assert_is_empty` waits for tasks not yet due): webdav `acl`, jmap `mail::acl`, imap `acl`, the za sharing modules | **restored** under `feature = "test_mode"` (fix round 1) |
+| `types/src/metadata/xml/mod.rs:38`, `:45`, `:53`, `:62`, `:69` | serde derives on `XmlName`, `XmlValue`, `XmlElement`, `XmlAttribute`, `XmlNode` | `dav-proto`'s restored request and response tests (the subject of 0.16's `types/src/dead_property.rs` rows) | **restored** under `feature = "test_mode"` (part 2b) |
+| `utils/src/outbound.rs:246`, `:269` | `localhost` and loopback addresses pass the outbound policy (not in unit tests) | jmap `push_subscription`, `za::mail::reads` and every suite that calls a local test server through `OutboundPolicy` (the 1.0 home of 0.16's `jmap/src/push/set.rs:445` row) | **restored** under `all(feature = "test_mode", not(test))` (part 2b) |
+| `dav-proto/src/{lib,schema/collation,schema/mod,schema/property,schema/request,schema/response}.rs`, 99 sites | serde derives and `serde(…)` attributes on the request and response schema | `dav-proto`'s restored request and response tests | **restored** under `cfg_attr(test, …)`, as at 0.16 (part 2b) |
+| `common/src/network/acme/http.rs:31`, `common/src/network/dns/update.rs:1331`, `smtp/src/outbound/mta_sts/lookup.rs:28` | the second half of a hook the table restores (the invalid-certificate client, the in-memory DNS propagation skip, the policy fetch's imports) | as the table's rows | **restored** with their rows (part 2b) |
+| `common/src/config/smtp/mod.rs:37` | a commented-out `cfg_attr` | none | not needed (no effect; the table's row) |
+| `common/src/auth/oauth/cimd.rs:332` | the client-ID metadata document fetch accepts invalid certificates | none: no retained test fetches a CIMD document (new in 1.0) | not needed |
+| `spam-filter/src/modules/classifier.rs:40`, `:213`, `:215` | training samples are shuffled with a seeded RNG | none needs it: 0.16 shuffled them unseeded in test builds too (`samples.shuffle(&mut rand::rng())`), and the retained suites passed | not needed (the file is Task 5's, conflicted) |
+| `common/src/cache/swap/mod.rs:149`, `:446`, `:477` | a read counter on the cache swap tier | none; ruling 20's swap suite uses the public aids (`flush`, `snapshots_written`) | not needed (Task 6 may restore it if its swap suite wants a read count) |
+| `services/src/task_manager/tasks/merge_threads.rs:56` | a thread name `bench-transient` fails as a transient error | none (an upstream benchmark) | not needed |
+| `smtp/src/outbound/delivery.rs:49`, `:146`; `telemetry/src/proto/writer.rs:210`, `:226`; `nlp/src/tokenizers/types.rs:22`, `:172`; `nlp/src/language/detect.rs:16`, `:80` | counters and probes (`DispatchProbe`, `BODY_SHIFTS`, `TOKENIZED_BYTES`, `DETECT_CALLS`) read by upstream's private tests; `DispatchProbe` lives in a private support slot | none | not needed |
+| `types/src/metadata/registry.rs:123`; `imap/src/op/fetch/source.rs:72`; `common/src/cache/email.rs:823`; `common/src/expr/if_block.rs:258`; `common/src/expr/guard.rs:104`; `email/src/cache/mailbox.rs:432`; `groupware/src/calendar/dates.rs:26`; `jmap/src/email/query/window.rs`, 7 sites; `nlp/src/tokenizers/types.rs:52`, `:57`; `nlp/src/tokenizers/types/scan.rs:60`, `:95`, `:169`; `utils/src/memory.rs`, 7 sites | `all(test, …)` helpers, imports and fixtures for upstream's private unit tests of the same crate (`memory.rs` also builds the Linux cgroup reader in them) | none: no restored module uses them (checked by grep over every restored file and `tests/src`) | not needed |
+| `store/src/dispatch/{store,lookup,blob,search,mod}.rs`, 44 sites | the `StoreOps` operation counters, latency waits, row counters and the RocksDB skip probe | none: they read support modules (`ops`, `rocksdb_skips`) that live in private slots | not needed (part 2a's concern 7) |
+| `store/src/write/mod.rs:172`, `:199`, `:223`, `:237`, `:433` | the contention tests' module cfg, the `commit_limits` path switch, the commit-retry counter and the `record_retry` re-export from a private slot | none (the commit limits themselves are the table's rows, restored in part 2a) | not needed |
+| `store/src/backend/{rocksdb,postgres,mysql,sqlite,foundationdb,azure,local}/…` and `store/src/backend/mod.rs:155`, 65 sites | backend probes (`RocksDbProbe`, the PostgreSQL statement and flight probes, the FoundationDB conflict and throttle probes), the `record_retry` calls, the SQL fault injector (`sql_fault`), the blocking-call hook (`block_hook`), the PostgreSQL search query log, a second Azure container client and a local-entry counter accessor | none: every one reads a private support module, and no CI step runs the SQL, FoundationDB or Azure store suites | not needed |
+| `calcard`, 98 sites in 10 files; `sieve`, 123 sites in 44 files; `text-extract`, 33 sites in 16 files | serde derives under `any(all(test, …), feature = "serde")`, and `all(test, …)` helpers, fixtures and fixed boundaries, dates and message ids for each crate's own unit tests | none: these crates were external at 0.16.27 and the fork restores no unit test of theirs; the integration suites run them in their production form, as they ran the crates.io versions | not needed |
+
+Every site, by file (v1.0.1 lines):
+
+```
+common/src/auth/oauth/cimd.rs: 332
+common/src/cache/email.rs: 823
+common/src/cache/swap/mod.rs: 149, 446, 477
+common/src/config/smtp/mod.rs: 37
+common/src/expr/guard.rs: 104
+common/src/expr/if_block.rs: 258
+common/src/network/acme/http.rs: 31
+common/src/network/dns/update.rs: 1331
+common/src/storage/index/build.rs: 464, 466
+email/src/cache/mailbox.rs: 432
+groupware/src/calendar/dates.rs: 26
+imap/src/op/fetch/source.rs: 72
+jmap/src/email/query/window.rs: 33, 51, 74, 86, 116, 121, 145
+nlp/src/language/detect.rs: 16, 80
+nlp/src/tokenizers/types.rs: 22, 52, 57, 172
+nlp/src/tokenizers/types/scan.rs: 60, 95, 169
+services/src/task_manager/tasks/merge_threads.rs: 56
+smtp/src/outbound/delivery.rs: 49, 146
+smtp/src/outbound/mta_sts/lookup.rs: 28
+spam-filter/src/modules/classifier.rs: 40, 213, 215
+telemetry/src/proto/writer.rs: 210, 226
+types/src/metadata/registry.rs: 123
+types/src/metadata/xml/mod.rs: 38, 45, 53, 62, 69
+utils/src/memory.rs: 7, 9, 11, 13, 70, 78, 109
+utils/src/outbound.rs: 246, 269
+dav-proto/src/lib.rs: 92, 95, 105
+dav-proto/src/schema/collation.rs: 13, 24
+dav-proto/src/schema/mod.rs: 18, 28, 41, 103
+dav-proto/src/schema/property.rs: 24, 27, 38, 41, 75, 78, 86, 93, 104, 107, 129, 132, 149, 161, 172, 180, 204, 215, 234, 241, 251, 265, 272, 279, 288, 295, 305, 315, 325
+dav-proto/src/schema/request.rs: 21, 24, 34, 43, 53, 63, 73, 84, 87, 104, 113, 123, 134, 144, 155, 158, 167, 176, 186, 198, 209, 212, 220, 230, 241, 251, 261, 264, 272, 282, 292, 302, 313, 321, 327, 336, 345, 355, 365, 377
+dav-proto/src/schema/response.rs: 24, 37, 51, 59, 70, 78, 92, 104, 129, 141, 154, 164, 180, 192, 206, 216, 231, 242, 275, 285, 317
+store/src/backend/azure/mod.rs: 48, 155
+store/src/backend/foundationdb/blob.rs: 208, 232
+store/src/backend/foundationdb/read.rs: 170
+store/src/backend/foundationdb/window.rs: 310, 404
+store/src/backend/foundationdb/write.rs: 76, 345, 353, 363, 388, 415, 422, 538, 559
+store/src/backend/local/entry.rs: 193
+store/src/backend/mod.rs: 155
+store/src/backend/mysql/read.rs: 557, 576, 582
+store/src/backend/mysql/write.rs: 117
+store/src/backend/postgres/blob.rs: 22, 52, 66
+store/src/backend/postgres/pool.rs: 67, 73, 86
+store/src/backend/postgres/read.rs: 43, 64, 108, 141, 151, 243, 322, 349, 485, 520, 554, 600, 621
+store/src/backend/postgres/search.rs: 64, 262, 266
+store/src/backend/postgres/write.rs: 107, 139, 221, 602
+store/src/backend/postgres/write/flight.rs: 27, 202, 343, 347, 356, 366, 368, 379
+store/src/backend/rocksdb/main.rs: 156, 181
+store/src/backend/rocksdb/mod.rs: 65
+store/src/backend/rocksdb/write.rs: 47, 62, 69, 189, 377
+store/src/backend/sqlite/write.rs: 39
+store/src/dispatch/blob.rs: 44, 53, 160, 214, 291
+store/src/dispatch/lookup.rs: 48, 73, 94, 115, 141, 168, 202, 255, 285, 321, 348, 369
+store/src/dispatch/mod.rs: 20, 28
+store/src/dispatch/search.rs: 43, 194, 271, 292, 313
+store/src/dispatch/store.rs: 19, 47, 83, 120, 122, 124, 126, 128, 154, 158, 194, 196, 198, 200, 225, 241, 300, 319, 352, 389
+store/src/write/mod.rs: 172, 199, 223, 237, 433
+calcard/src/common/mod.rs: 53, 75, 79, 104, 132, 136
+calcard/src/common/timezone.rs: 527
+calcard/src/common/writer.rs: 557
+calcard/src/datecalc/error.rs: 15, 24
+calcard/src/datecalc/weekdate.rs: 66
+calcard/src/icalendar/dates.rs: 29, 40, 51, 61
+calcard/src/icalendar/mod.rs: 34, 48, 64, 81, 85, 118, 147, 164, 179, 192, 214, 234, 238, 259, 263, 280, 284, 302, 306, 322, 352, 356, 373, 377, 397, 401, 418, 422, 443, 458, 462, 493, 543, 562, 566, 581, 596, 600, 623, 627, 645, 649, 672, 676, 697, 701, 793, 797, 814, 818, 844, 848, 865, 869, 885, 889, 904, 908, 938, 942
+calcard/src/jscalendar/mod.rs: 499
+calcard/src/jscontact/mod.rs: 393
+calcard/src/vcard/mod.rs: 31, 54, 72, 76, 142, 146, 169, 184, 188, 212, 227, 268, 272, 297, 316, 320, 337, 341, 386, 405, 423
+sieve/src/compiler/emit.rs: 711, 1034
+sieve/src/compiler/grammar/actions/action_convert.rs: 17
+sieve/src/compiler/grammar/actions/action_editheader.rs: 20, 38
+sieve/src/compiler/grammar/actions/action_fileinto.rs: 18
+sieve/src/compiler/grammar/actions/action_flags.rs: 15, 26
+sieve/src/compiler/grammar/actions/action_include.rs: 22, 34
+sieve/src/compiler/grammar/actions/action_keep.rs: 18
+sieve/src/compiler/grammar/actions/action_mime.rs: 17, 27, 39, 50, 61
+sieve/src/compiler/grammar/actions/action_notify.rs: 31
+sieve/src/compiler/grammar/actions/action_redirect.rs: 18, 32, 44, 56, 77, 97
+sieve/src/compiler/grammar/actions/action_reject.rs: 14
+sieve/src/compiler/grammar/actions/action_require.rs: 101
+sieve/src/compiler/grammar/actions/action_set.rs: 21, 39, 65, 76
+sieve/src/compiler/grammar/actions/action_vacation.rs: 22, 35, 47
+sieve/src/compiler/grammar/expr/mod.rs: 14, 54, 78
+sieve/src/compiler/grammar/expr/parser.rs: 243
+sieve/src/compiler/grammar/expr/tokenizer.rs: 36
+sieve/src/compiler/grammar/instruction.rs: 39, 102, 842, 1264
+sieve/src/compiler/grammar/mod.rs: 25, 83, 98, 114, 129, 143, 154, 165, 464
+sieve/src/compiler/grammar/test.rs: 40, 103, 107, 110, 505, 691
+sieve/src/compiler/grammar/tests/test_address.rs: 17
+sieve/src/compiler/grammar/tests/test_body.rs: 17, 31
+sieve/src/compiler/grammar/tests/test_date.rs: 17, 34, 48, 60
+sieve/src/compiler/grammar/tests/test_duplicate.rs: 17, 30
+sieve/src/compiler/grammar/tests/test_envelope.rs: 20
+sieve/src/compiler/grammar/tests/test_exists.rs: 17
+sieve/src/compiler/grammar/tests/test_extlists.rs: 15
+sieve/src/compiler/grammar/tests/test_hasflag.rs: 23
+sieve/src/compiler/grammar/tests/test_header.rs: 21
+sieve/src/compiler/grammar/tests/test_ihave.rs: 16, 26
+sieve/src/compiler/grammar/tests/test_mailbox.rs: 23, 33, 52
+sieve/src/compiler/grammar/tests/test_mailboxid.rs: 15
+sieve/src/compiler/grammar/tests/test_notify.rs: 17, 31
+sieve/src/compiler/grammar/tests/test_size.rs: 17
+sieve/src/compiler/grammar/tests/test_spamtest.rs: 22, 35
+sieve/src/compiler/grammar/tests/test_specialuse.rs: 18
+sieve/src/compiler/grammar/tests/test_string.rs: 17
+sieve/src/compiler/mod.rs: 83, 115, 137, 146, 151, 160, 176, 186, 191, 200, 210, 223, 241, 253, 275, 287, 341
+sieve/src/lib.rs: 147, 184, 197
+sieve/src/runtime/actions/action_mime.rs: 26, 28, 175, 177, 305, 309, 316, 322, 344, 347, 352
+sieve/src/runtime/context.rs: 766, 775, 1253
+sieve/src/runtime/mod.rs: 169
+sieve/src/runtime/platform.rs: 8, 21
+sieve/src/runtime/variable.rs: 12, 423, 430
+text-extract/src/pdf/content/ops.rs: 181
+text-extract/src/pdf/content/state.rs: 78, 104
+text-extract/src/pdf/crypt/mod.rs: 80, 108, 128, 133
+text-extract/src/pdf/document/mod.rs: 127, 132, 137
+text-extract/src/pdf/font/cache.rs: 66
+text-extract/src/pdf/font/program/cff.rs: 51, 127
+text-extract/src/pdf/font/program/cmap.rs: 117
+text-extract/src/pdf/font/program/mod.rs: 59
+text-extract/src/pdf/font/program/truetype.rs: 19, 57, 70, 75, 142, 148, 153
+text-extract/src/pdf/font/ranges.rs: 123
+text-extract/src/pdf/pages.rs: 26, 36
+text-extract/src/pdf/source.rs: 127
+text-extract/src/pdf/tables/cid.rs: 189
+text-extract/src/pdf/tables/cid_data.rs: 11, 15, 19, 23
+text-extract/src/pdf/tables/cmaps.rs: 80
+text-extract/src/pdf/tables/glyphs.rs: 289
+```
+
 ### Moved hook targets: check against the known answer
 
 The brief's call-site counts equal the number of lines that mention `za_` in the fork's
@@ -3334,6 +3491,12 @@ Moved modules (the baseline mapping is updated for the three whose file moved):
 | `imap_proto::utf7::tests` | the external `encodify::utf7::IMAP` | `imap-proto/src/utf7_restored_tests.rs`, declared from `lib.rs` as `mod utf7` with an inline `tests` | unchanged, `imap_proto::utf7::tests::*` |
 | `utils::codec::base32_custom::tests` | the external `encodify::base32::STALWART` | `utils/src/codec/base32_custom_restored_tests.rs`, declared from `codec/mod.rs` as `mod base32_custom` with an inline `tests` | unchanged |
 
+The last two have no in-tree subject left, which the brief's rule would call "subject
+deleted". They test a third-party dependency, the `encodify` crate, by choice: the fork
+depends on its behaviour (mailbox names decoded with `IMAP.lenient()`, the STALWART
+alphabet in blob ids, state tokens and blob-store paths), and keeping them keeps their
+libtest identifiers.
+
 The `common::storage::dav` equivalent was run against a copy of 1.0's functions in a scratch
 crate (3 passed), since `common` does not compile yet.
 
@@ -3348,7 +3511,11 @@ replace `Operator`), `jmap-proto` references (`AHashMap`), `imap-proto` receiver
 (`Token::Argument` takes `ArgumentBytes`), `imap-proto` list and select (`ListItem`'s
 `objectid` and `metadata`, `permanent_flags`), `imap-proto` fetch's `serialize_fetch`
 (`FetchItem::serialize`, `ChainedBytes`), `dav-proto` tokenizer (`Namespace` import) and
-responses (lock owners built as `XmlValue`, 1.0's replacement of `DeadProperty`).
+responses (lock owners built as `XmlValue`, 1.0's replacement of `DeadProperty`), and
+`spam-filter` pyzor (fix round 1: 1.0 removed the `PyzorDigest` trait, so two local helpers
+build a `SpamFilterInput::from_message` over the message's `MessageTexts` with default text
+limits and call its `pyzor_digest` and `pyzor_create_message`; `spam-filter` first compiles at
+Task 5's check, which confirms the adaptation).
 
 The `dav-proto` request and response tests read 114 fixtures under `dav-proto/resources/`,
 which the merge deleted; they are restored from the fork side. Upstream's `parse_requests`
@@ -3372,7 +3539,9 @@ Of the table's 121 "restore" rows:
   - `common`: `config/mailstore/scripts.rs`, `config/network.rs`, `config/smtp/resolver.rs`,
     `manager/defaults.rs` (4 of 6), `network/acme/http.rs`, `network/dns/update.rs` (with
     1.0's second propagation skip, `:1331`, part of the same in-memory DNS hook),
-    `network/security.rs`, `scripts/plugins/{dns,http}.rs`;
+    `network/security.rs`, `scripts/plugins/{dns,http}.rs`, and (fix round 1, outside the
+    table) `storage/index/build.rs`'s `REVOKE_CLEANUP_WINDOW`, listed in the second inventory
+    table next to the test-hook table;
   - `network/dns/records.rs`: 0.16's test provider domain, `pebble.letsencrypt.org`,
     restored in `provider_domain` (1.0 removed the branch);
   - `email`: `mailbox/{destroy,manage}.rs`, `message/index/search.rs`;
@@ -3478,8 +3647,10 @@ checked by `rustfmt` only.
 - `wait_for_tasks` keeps its signature. It waits for the scheduled tasks
   (`TaskQueueClass::Task`, now keyed by `TaskId`) and for the search index queue: every key
   of subspace `SearchQueue` (`y`), that is, the entries (`SearchIndexClass::Queue`, grouped
-  by partition through `SearchIndexClass::queue_partition`), the claim markers
-  (`QueueIndex`) and the failure statuses (`QueueStatus`, a `SearchIndexStatus`). With
+  by partition through `SearchIndexClass::queue_partition`), the markers of the partitions
+  that hold queued work (`QueueIndex`, set by `queue_index_task` when an entry is queued and
+  cleared when the partition drains) and the failure statuses (`QueueStatus`, a
+  `SearchIndexStatus`). With
   `skip_not_due`, a partition whose retry is due later is skipped, entries included. The
   index queue has no permanent failure, so `skip_permanent_failures` applies to tasks only.
 - `cleanup.rs` matches 1.0's `Subspace` enum exhaustively in `subspace_rule`, with no
@@ -3498,7 +3669,10 @@ checked by `rustfmt` only.
   - `System`: the schema version and node-id claims kept, anything else a leftover;
   - `SearchTerm`, `SearchDocument`: leftovers, except on PostgreSQL and MySQL, which create
     no such table (`Subspace::is_internal_fts`);
-  - `Logs`: deleted after the check, as at 0.16 (share notifications live there now too).
+  - `Logs`: change-log entries are deleted after the check, as at 0.16. 1.0 also keeps
+    share notifications there, as log entries of `SyncCollection::ShareNotification` (key:
+    account id, `9`, notification id), and every grant removal writes one; a share
+    notification left behind is reported as a leftover (fix round 1).
 - `store_lookup_expire_all` is gone: its subject, in-memory values in the data store, does
   not exist at 1.0. `store_destroy` and `search_store_destroy` cover 1.0's subspaces and
   search stores; resetting an ElasticSearch or MeiliSearch store panics, since 1.0 moved
@@ -3522,9 +3696,10 @@ checked by `rustfmt` only.
     (checked with grep), and `http/enterprise` still enables `scim/enterprise`.
 
   They stay in git history and come back only with a bought licence, in a private
-  repository. Left in place, now unused: the `scim-proto` dev-dependency, and the
-  SCIM-tester container helpers (`ensure_scim_tester`, `scim_tester_exec` in
-  `tests/src/utils/containers.rs`, with `tests/docker/scim/`).
+  repository. Fix round 1 also removed the SCIM tooling only that suite used: the
+  `scim-proto` dev-dependency (with its lockfile line), the SCIM-tester container helpers
+  (`ensure_scim_tester`, `scim_tester_exec` and their `OnceCell` in
+  `tests/src/utils/containers.rs`) and `tests/docker/scim/` (its Dockerfile and driver).
 - `get_token_for_client`, which the dual-licensed `tests/src/directory/issuer.rs` imported
   from the SEL-only `oidc.rs`, is written in `issuer.rs` from RFC 6749: the resource owner
   password credentials grant (4.3) against the token endpoint of the issuer's discovery
@@ -3621,15 +3796,17 @@ written, right after upstream's private slot.
   - `spam-filter/src/analysis/url.rs:440`;
   - `spam-filter/src/modules/dnsbl.rs:16`, `:28`, `:158`, `:245`, and the test resolver that
     1.0 moved into a private slot (`:309`), written fork-owned from 0.16.
-- The imap-proto fetch test's six ENVELOPE, BODY and BODYSTRUCTURE cases need an equivalent
-  test in the imap crate: 1.0 writes those items from the message metadata
-  (`imap/src/op/fetch/structure.rs`, `write_envelope`, `write_structure`). The 0.16 cases
-  and their expected strings are in `9601038de:crates/imap-proto/src/protocol/fetch.rs`'s
-  test module.
-- `spam-filter`'s restored pyzor test: 1.0 removed the `PyzorDigest` trait; the message
-  digest and `pyzor_create_message` are methods of `SpamFilterInput`
-  (`spam-filter/src/modules/pyzor.rs:158`, `:185`). Its message-level cases need that call
-  shape.
+- **Task 2 work that Task 5 inherits, and that Task 5's review checks:** an equivalent test
+  in the imap crate for the imap-proto fetch test's six ENVELOPE, BODY and BODYSTRUCTURE
+  cases. They are public protocol behaviour, which the brief gives to Task 2, but 1.0 writes
+  those items from the message metadata (`imap/src/op/fetch/structure.rs`,
+  `write_envelope`, `write_structure`), in a crate that compiles only with Task 5's work.
+  The 0.16 cases and their expected strings are in
+  `9601038de:crates/imap-proto/src/protocol/fetch.rs`'s test module.
+- `spam-filter`'s restored pyzor test was adapted in fix round 1 to 1.0's call shape (the
+  digest and `pyzor_create_message` are `SpamFilterInput` methods,
+  `spam-filter/src/modules/pyzor.rs:158`, `:185`); Task 5's check is its first compile, and a
+  failure there goes back to Task 2's part.
 - The restored modules of `email`'s neighbours (`smtp`, `spam-filter`, `pop3`,
   `managesieve`) compile first at Task 5's check.
 - `TestServer::all_queued_messages` (see "Harness").
@@ -3820,8 +3997,8 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `imap_proto::protocol::fetch::tests::serialize_fetch_data_item` | Its six ENVELOPE, BODY and BODYSTRUCTURE cases are removed; the BINARY, BODY[section], FLAGS and INTERNALDATE cases stay. Their equivalent goes to the imap crate (Task 5 handoff). | `imap-proto/src/protocol/fetch.rs`: `DataItem::{Envelope, Body, BodyStructure}`, `Envelope` and `BodyPart` are gone; `imap/src/op/fetch/structure.rs` writes those items from the message metadata. |
 | `imap_proto::protocol::list::tests::serialize_list_item` | The rev2 expectations of the two non-ASCII names lose their `OLDNAME` tag. | `imap-proto/src/protocol/list.rs:263-266`: a rev2 or UTF8=ACCEPT client gets the name as stored; OLDNAME is kept for RENAME (RFC 9051 5.1, 6.3.9.7). |
 | `imap_proto::protocol::select::tests::serialize_select` | The rev2 LIST line of the second case loses its `OLDNAME` tag. | The same change. |
-| `imap_proto::parser::select::tests::parse_select_objectid` | The object id `abc` becomes `bcd` in the inputs and expectations of three cases. | `imap-proto/src/protocol/mod.rs:80-85`: `ObjectId::decode_id` refuses an id that starts with the zero symbol `a` followed by more symbols (a non-canonical encoding); the parser then drops the MAILBOXID. |
-| `imap_proto::parser::fetch::tests::parse_fetch` | `BODY[MIME]` becomes `BODY[1.MIME]`, with `Section::Part { num: 1 }` before `Section::Mime`. | `imap-proto/src/parser/fetch.rs:374-377`: MIME needs a part number before it, as RFC 3501's section-spec says. |
+| `imap_proto::parser::select::tests::parse_select_objectid` | The object id `abc` becomes `bcd` in the inputs and expectations of three cases, which keep testing that MAILBOXID and ACCOUNTID values are parsed. 0.16's three inputs stay as cases of their own with 1.0's outcome: MAILBOXID `abc` is dropped (ACCOUNTID `xyz` kept). | `imap-proto/src/protocol/mod.rs:80-85`: `ObjectId::decode_id` refuses an id that starts with the zero symbol `a` followed by more symbols (a non-canonical encoding); the parser then drops the MAILBOXID. |
+| `imap_proto::parser::fetch::tests::parse_fetch` | `BODY[MIME]` becomes `BODY[1.MIME]`, with `Section::Part { num: 1 }` before `Section::Mime`. 0.16's input stays as a case of its own, asserted to be refused (`parse_fetch` returns an error). | `imap-proto/src/parser/fetch.rs:374-377`: MIME needs a part number before it, as RFC 3501's section-spec says. |
 | `imap_proto::parser::search::tests::parse_search` | Two expectations with `NOT (…)` gain an `And` after `Not` and an `End` closing it. | `imap-proto/src/parser/search.rs` (`parse_filters`): a parenthesised group merges into its parent only when the parent is AND, so NOT applies to the whole conjunction. |
 | `imap_proto::utf7::tests::utf7_decode` | Decodes with `IMAP.lenient()`. With the strict decoder, five of the eleven cases fail. | 0.16's in-tree codec moved to `encodify::utf7::IMAP`, whose default decoder refuses non-canonical input; 1.0 decodes mailbox names with `IMAP.lenient()` (`imap-proto/src/receiver.rs:752-763`), as 0.16's codec did. |
 | `dav_proto::parser::tokenizer::tests::test_tokenizer` | A `Token::Content` arm panics. | `dav-proto/src/parser/mod.rs`: the new `Token::Content`, returned only in raw-content mode, which the test never turns on. |
@@ -3832,6 +4009,9 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `system::directory::test` | The masked email's creation, its `account_id_from_email` and `rcpt_resolve` checks and its destroy are removed. | The same. |
 | `system::delivery::test` | The masked emails' creation, their domain and quota refusals, their two VRFY checks and their destroy are removed. The two spam cases that were delivered to them (GTUBE to Junk, the CardDAV `card-exists` override) are delivered to john's alias `john.doe@example.org` instead. | The same. The spam filtering is OSS, so those cases stay. |
 | `smtp::inbound::antispam::antispam` | The `llm` case is removed from its case list. | Ruling 33: the LLM analysis needs a licence (AI models are off while `core.enterprise` is `None`). |
+| `directory::issuer::test` | `get_token_for_client` is a new fork helper in `issuer.rs` (RFC 6749 4.3 against the issuer's discovered token endpoint); it adds an assertion that the token request answers 200, where 0.16's helper sat in an SEL-only file. | The SEL-only `tests/src/directory/oidc.rs` is not carried (design Decision 1); the helper is written from RFC 6749, not from that file. |
+| Any suite with an ElasticSearch or MeiliSearch search store (harness) | `search_store_destroy` panics for these stores, where 0.16 dropped and recreated their indexes. No CI step uses them. | 1.0 moved their `drop_indexes` into upstream's private test support (`store/src/backend/elastic/main.rs:134`, `meili/main.rs:314`, test-hook table rows "not needed"). |
+| Every suite (harness) | The emptiness check reports a share notification left in `Logs`, where it deletes the rest of `Logs` as at 0.16. | 1.0 stores share notifications as `Logs` entries of `SyncCollection::ShareNotification` (`store/src/write/key.rs:519-525`, `:860`), and every grant removal writes one (`common/src/storage/index/build.rs`); 0.16 had none. |
 | `directory::directory_tests` | The `oidc::test` call is removed. | SEL-only file `tests/src/directory/oidc.rs` (design Decision 1). |
 | `system::system_tests` | The `tenant::test` and `archiving::test` calls are removed. | SEL-only files (design Decision 1). |
 | `scim::scim_tests` | Removed, with the SEL-only `tests/src/scim/mod.rs` that held it and the three dual-licensed files only it declared. | Ruling 38: SEL-only disposition (its entry and its only subject, the `scim` crate, are SEL-only); see "SEL-only removals and ruling 33". |

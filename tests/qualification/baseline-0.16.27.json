@@ -33766,8 +33766,8 @@
       "subject": "tests::cluster::stress::stress_tests"
     },
     {
-      "evidence": "no CI step selects it; its file `tests/src/scim/mod.rs` is also SEL-only; design Decision 1, ungated as today: keeps compiling, outside the required set",
-      "kind": "ungated_as_today",
+      "evidence": "no CI step selects it; its entry function sits in the SEL-only `tests/src/scim/mod.rs` and its only subject is the SEL-only `scim` crate; ruling 38 and the amended design Decision 1: SEL-only, removed with its module (the three dual-licensed files only it declared included)",
+      "kind": "sel_only",
       "scope": "libtest",
       "subject": "tests::scim::scim_tests"
     }

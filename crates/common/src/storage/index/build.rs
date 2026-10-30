@@ -461,9 +461,9 @@ fn parent_property(value: Vec<u8>, pending_id: Option<Slot>) -> SizedSetValue {
     }
 }
 
-#[cfg(not(stalwart_tests))]
+#[cfg(not(feature = "test_mode"))]
 pub(crate) const REVOKE_CLEANUP_WINDOW: u64 = 300;
-#[cfg(stalwart_tests)]
+#[cfg(feature = "test_mode")]
 pub(crate) const REVOKE_CLEANUP_WINDOW: u64 = 1;
 
 pub(crate) fn revoke_cleanup_schedule(now: u64) -> (u64, u64) {

@@ -89,6 +89,42 @@ fn parse_select_objectid() {
                 objectid: Some(ObjectId::default()),
             },
         ),
+        // 0.16's inputs, with 1.0's outcome: `abc` starts with the zero
+        // symbol, a non-canonical id that `ObjectId::decode_id` refuses, so
+        // the MAILBOXID is dropped.
+        (
+            "A2 SELECT \"foo\" (OBJECTID (MAILBOXID abc ACCOUNTID xyz))\r\n",
+            select::Arguments {
+                mailbox_name: "foo".into(),
+                tag: "A2".into(),
+                condstore: false,
+                qresync: None,
+                objectid: Some(ObjectId {
+                    account_id: Some(Id::from_str("xyz").unwrap()),
+                    ..Default::default()
+                }),
+            },
+        ),
+        (
+            "A3 EXAMINE \"foo\" (OBJECTID (MAILBOXID abc))\r\n",
+            select::Arguments {
+                mailbox_name: "foo".into(),
+                tag: "A3".into(),
+                condstore: false,
+                qresync: None,
+                objectid: Some(ObjectId::default()),
+            },
+        ),
+        (
+            "A5 SELECT \"foo\" (OBJECTID (FOOBAR baz MAILBOXID abc))\r\n",
+            select::Arguments {
+                mailbox_name: "foo".into(),
+                tag: "A5".into(),
+                condstore: false,
+                qresync: None,
+                objectid: Some(ObjectId::default()),
+            },
+        ),
     ] {
         assert_eq!(
             receiver
