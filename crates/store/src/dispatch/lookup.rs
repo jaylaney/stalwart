@@ -13,25 +13,6 @@ use registry::schema::structs::Rate;
 use std::borrow::Cow;
 use trc::AddContext;
 
-<<<<<<< HEAD
-#[allow(unused_imports)]
-use crate::{
-    Deserialize, InMemoryStore, IterateParams, QueryResult, Store, U64_LEN, Value, ValueKey,
-    ZA_UID_LEASE_PREFIX,
-    write::{
-        BatchBuilder, Operation, ValueClass, ValueOp,
-        key::{DeserializeBigEndian, KeySerializer},
-        now,
-    },
-};
-use crate::{
-    SerializeInfallible,
-    backend::{http::lookup::HttpStoreGet, memory::StaticMemoryStore},
-    write::{InMemoryClass, assert::AssertValue},
-};
-
-=======
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 pub struct KeyValue<T> {
     pub key: Vec<u8>,
     pub value: T,
@@ -408,110 +389,7 @@ impl InMemoryStore {
     pub async fn remove_lock(&self, prefix: u8, key: &[u8]) -> trc::Result<()> {
         self.key_delete(KeyValue::<()>::build_key(prefix, key))
             .await
-<<<<<<< HEAD
-    }
-
-    pub async fn purge_in_memory_store(&self) -> trc::Result<()> {
-        match self {
-            InMemoryStore::Store(store) => {
-                // Delete expired keys and counters
-                let from_key = ValueKey::from(ValueClass::InMemory(InMemoryClass::Key(vec![0u8])));
-                let to_key =
-                    ValueKey::from(ValueClass::InMemory(InMemoryClass::Key(vec![u8::MAX; 10])));
-
-                let current_time = now();
-                let mut expired_keys = Vec::new();
-                let mut expired_counters = Vec::new();
-                store
-                    .iterate(IterateParams::new(from_key, to_key), |key, value| {
-                        // Zero-access fork: the unconditional clear races a replacement
-                        // lease; `common::za::lease::sweep_expired_uid_leases` clears
-                        // these with an assertion.
-                        if key.first() == Some(&ZA_UID_LEASE_PREFIX) {
-                            return Ok(true);
-                        }
-                        let expiry = value.deserialize_be_u64(0).caused_by(trc::location!())?;
-                        if expiry == 0 {
-                            if value
-                                .deserialize_be_u64(U64_LEN)
-                                .caused_by(trc::location!())?
-                                <= current_time
-                            {
-                                expired_counters.push(key.to_vec());
-                            }
-                        } else if expiry <= current_time {
-                            expired_keys.push(key.to_vec());
-                        }
-                        Ok(true)
-                    })
-                    .await
-                    .caused_by(trc::location!())?;
-
-                if !expired_keys.is_empty() {
-                    let mut batch = BatchBuilder::new();
-                    for key in expired_keys {
-                        batch.any_op(Operation::Value {
-                            class: ValueClass::InMemory(InMemoryClass::Key(key)),
-                            op: ValueOp::Clear,
-                        });
-                        if batch.is_large_batch() {
-                            store
-                                .write(batch.build_all())
-                                .await
-                                .caused_by(trc::location!())?;
-                            batch = BatchBuilder::new();
-                        }
-                    }
-                    if !batch.is_empty() {
-                        store
-                            .write(batch.build_all())
-                            .await
-                            .caused_by(trc::location!())?;
-                    }
-                }
-
-                if !expired_counters.is_empty() {
-                    let mut batch = BatchBuilder::new();
-                    for key in expired_counters {
-                        batch.any_op(Operation::Value {
-                            class: ValueClass::InMemory(InMemoryClass::Counter(key.clone())),
-                            op: ValueOp::Clear,
-                        });
-                        batch.any_op(Operation::Value {
-                            class: ValueClass::InMemory(InMemoryClass::Key(key)),
-                            op: ValueOp::Clear,
-                        });
-                        if batch.is_large_batch() {
-                            store
-                                .write(batch.build_all())
-                                .await
-                                .caused_by(trc::location!())?;
-                            batch = BatchBuilder::new();
-                        }
-                    }
-                    if !batch.is_empty() {
-                        store
-                            .write(batch.build_all())
-                            .await
-                            .caused_by(trc::location!())?;
-                    }
-                }
-            }
-            #[cfg(feature = "redis")]
-            InMemoryStore::Redis(_) => {}
-            // SPDX-SnippetBegin
-            // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
-            // SPDX-License-Identifier: LicenseRef-SEL
-            #[cfg(feature = "enterprise")]
-            InMemoryStore::Sharded(_) => {}
-            // SPDX-SnippetEnd
-            InMemoryStore::Static(_) | InMemoryStore::Http(_) => {}
-        }
-
-        Ok(())
-=======
             .map(|_| ())
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
     }
 
     pub fn is_sql(&self) -> bool {

@@ -227,36 +227,23 @@ impl Store {
         };
 
         let mut vanished = Vec::default();
+        // One record's items at a time: `deserialize_vanished` decodes a
+        // record against the items it pushed for that record only.
+        let mut items = Vec::new();
 
         self.iterate(
             IterateParams::new(from_key, to_key).ascending(),
             |key, value| {
                 let change_id = key.deserialize_be_u64(key.len() - U64_LEN)?;
-<<<<<<< HEAD
                 if is_inclusive || change_id != from_change_id {
-                    let mut iter = value.iter().peekable();
-
-                    while iter.peek().is_some() {
-                        if let Some(item) = T::deserialize_vanished(&mut iter) {
-                            vanished.push((change_id, item));
-                        } else {
-                            return Err(trc::Error::corrupted_key(
-                                key,
-                                value.into(),
-                                trc::location!(),
-                            ));
-                        }
+                    if T::deserialize_vanished(value, &mut items).is_none() {
+                        return Err(trc::Error::corrupted_key(
+                            key,
+                            value.into(),
+                            trc::location!(),
+                        ));
                     }
-=======
-                if (is_inclusive || change_id != from_change_id)
-                    && T::deserialize_vanished(value, &mut vanished).is_none()
-                {
-                    return Err(trc::Error::corrupted_key(
-                        key,
-                        value.into(),
-                        trc::location!(),
-                    ));
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+                    vanished.extend(items.drain(..).map(|item| (change_id, item)));
                 }
                 Ok(true)
             },

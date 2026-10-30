@@ -178,8 +178,8 @@ pub struct IndexDocument {
     pub(crate) fields: AHashMap<SearchField, SearchValue>,
     /// Zero-access fork (mail ruling R58): a key that must be absent when
     /// the internal search store writes the document (account id,
-    /// collection, document id, class), asserted in the document's first
-    /// commit chunk. Other search backends ignore it.
+    /// collection, document id, class), asserted in the batch of the index
+    /// pass that writes it. Other search backends ignore it.
     pub(crate) assert_absent: Option<(u32, Collection, u32, ValueClass)>,
 }
 

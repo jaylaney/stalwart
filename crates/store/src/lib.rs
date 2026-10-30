@@ -134,19 +134,15 @@ const _: () = {
     }
 };
 
-<<<<<<< HEAD
-/// Zero-access fork: the first byte of the UID creation lease keys
-/// (`common::KV_LOCK_ZA_UID`, `common::za::lease`) inside the in-memory
-/// subspace, not a subspace byte. `purge_in_memory_store` skips keys that
-/// start with it; a key written without a prefix byte (expression and
-/// Sieve `key_set`) that happens to start with 27 is skipped too, as
-/// upstream's own prefixes 0-26 are ambiguous in the same way.
+/// Zero-access fork: the first byte of every UID creation lease key
+/// (`common::KV_LOCK_ZA_UID`, `common::za::lease`). The lease is a
+/// `ValueClass::Any` value in the data store, and this byte starts its key
+/// inside the subspace that holds it, not a subspace byte, so every lease
+/// sits in one key range. The asserting sweep
+/// (`common::za::lease::sweep_expired_uid_leases`) scans that range and is
+/// the only cleanup of lease keys.
 pub const ZA_UID_LEASE_PREFIX: u8 = 27;
 
-// TODO: Remove in v1.0
-pub const LEGACY_SUBSPACE_BITMAP_TEXT: u8 = b'v';
-pub const LEGACY_SUBSPACE_BITMAP_TAG: u8 = b'c';
-=======
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum Subspace {
@@ -364,7 +360,6 @@ pub(crate) enum Fetch {
     Expect(u32),
     Limit(u32),
 }
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
 #[derive(Clone)]
 pub struct IterateParams<T: Key> {
@@ -1001,17 +996,19 @@ impl Store {
         matches!(self, Self::Ephemeral(_))
     }
 
+    /// Zero-access fork: whether this store is an SQL store other than the
+    /// SQLite, PostgreSQL and MySQL backends, which at 1.0.1 means a read
+    /// replica in an enterprise build. `is_sql` counts every SQL store and
+    /// `is_pg_or_mysql` only those two backends, so whatever `is_sql` adds
+    /// beyond the three counts here: the zero-access move route refuses it
+    /// (fail closed).
     #[inline(always)]
     pub fn is_read_replica(&self) -> bool {
-        match self {
-            // SPDX-SnippetBegin
-            // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
-            // SPDX-License-Identifier: LicenseRef-SEL
-            #[cfg(all(feature = "enterprise", any(feature = "postgres", feature = "mysql")))]
-            Self::SQLReadReplica(_) => true,
-            // SPDX-SnippetEnd
-            _ => false,
+        #[cfg(feature = "sqlite")]
+        if matches!(self, Store::SQLite(_)) {
+            return false;
         }
+        self.is_sql() && !self.is_pg_or_mysql()
     }
 
     // SPDX-SnippetBegin

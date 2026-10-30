@@ -21,8 +21,8 @@ impl IndexDocument {
 
     /// Zero-access fork (mail ruling R58): the internal search store writes
     /// the document only while `class` of (`account_id`, `collection`,
-    /// `document_id`) is absent, asserted in the document's first commit
-    /// chunk, the one that holds its `Document` key.
+    /// `document_id`) is absent, asserted in the batch of the index pass
+    /// that writes it.
     pub fn with_assert_absent(
         mut self,
         account_id: u32,

@@ -38,7 +38,7 @@ impl HttpStoreGet for Arc<HttpStore> {
     }
 
     fn contains(&self, key: &str) -> bool {
-        #[cfg(stalwart_tests)]
+        #[cfg(feature = "test_mode")]
         {
             if self.config.url.contains("phishtank.com")
                 || self.config.url.contains("openphish.com")

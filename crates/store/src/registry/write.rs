@@ -222,10 +222,10 @@ impl RegistryStore {
             .map(|id| id.id())
             .or_else(|| (object_type == ObjectType::Account).then_some(item_id));
 
-        #[cfg(not(stalwart_tests))]
+        #[cfg(not(feature = "test_mode"))]
         let set_keys = &set_index.keys;
 
-        #[cfg(stalwart_tests)]
+        #[cfg(feature = "test_mode")]
         let set_keys = set_index
             .keys
             .iter()

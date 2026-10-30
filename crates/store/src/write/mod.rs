@@ -203,16 +203,17 @@ mod commit_limits {
     use rand::RngExt;
     use std::time::Duration;
 
+    #[cfg(not(feature = "test_mode"))]
     const PRODUCTION_MAX_COMMIT_ATTEMPTS: u32 = 24;
 
-    #[cfg(not(stalwart_tests))]
+    #[cfg(not(feature = "test_mode"))]
     pub(crate) const MAX_COMMIT_ATTEMPTS: u32 = PRODUCTION_MAX_COMMIT_ATTEMPTS;
-    #[cfg(not(stalwart_tests))]
+    #[cfg(not(feature = "test_mode"))]
     pub(crate) const MAX_COMMIT_TIME: Duration = Duration::from_secs(10);
 
-    #[cfg(stalwart_tests)]
+    #[cfg(feature = "test_mode")]
     pub(crate) const MAX_COMMIT_ATTEMPTS: u32 = 1000;
-    #[cfg(stalwart_tests)]
+    #[cfg(feature = "test_mode")]
     pub(crate) const MAX_COMMIT_TIME: Duration = Duration::from_secs(3600);
 
     const MIN_COMMIT_BACKOFF_US: u64 = 250;
@@ -1149,33 +1150,11 @@ pub trait SerializeWithIds: Send + Sync {
 #[repr(transparent)]
 pub struct SerializeOperation(pub(crate) Box<dyn SerializeWithIds>);
 
-<<<<<<< HEAD
-impl Params {
-    fn accounted_input_bytes(&self) -> usize {
-        self.0.iter().fold(0usize, |total, parameter| {
-            total.saturating_add(16).saturating_add(match parameter {
-                Param::String(value) => value.len(),
-                Param::Bytes(value) => value.len(),
-                Param::I64(_) | Param::U64(_) | Param::Bool(_) => 0,
-            })
-        })
-    }
-}
-
-pub type SetFnc = fn(&Params, &AssignedIds) -> trc::Result<Vec<u8>>;
-pub type MergeFnc = fn(&Params, &AssignedIds, Option<&[u8]>) -> trc::Result<MergeResult>;
-
-#[derive(Debug, Clone)]
-pub struct MergeOperation {
-    pub(crate) fnc: MergeFnc,
-    pub(crate) params: Params,
-=======
 #[derive(Debug)]
 pub enum SetValue {
     Fixed(Vec<u8>),
     Patched(Vec<u8>, Box<[Patch]>),
     Serializable(SerializeOperation),
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 }
 
 #[derive(Debug)]

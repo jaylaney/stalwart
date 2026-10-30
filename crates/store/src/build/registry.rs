@@ -133,6 +133,43 @@ impl RegistryStore {
         inner.store = store;
         inner
     }
+
+    /// Zero-access fork: the test harness's constructors (0.16.27's, with
+    /// 1.0.1's process nonce).
+    #[cfg(feature = "test_mode")]
+    pub fn clone_with_public_url(&self, url: String) -> Self {
+        let mut inner = self.0.as_ref().clone();
+        inner.env_public_url = Some(url);
+        Self(inner.into())
+    }
+
+    #[cfg(feature = "test_mode")]
+    pub async fn new(
+        path: &str,
+        store: Store,
+        hostname: String,
+        push_shard_id: u32,
+        cluster_role: Option<String>,
+    ) -> Self {
+        Self::from_inner(
+            RegistryStoreInner {
+                local_path: PathBuf::from(path),
+                store,
+                node_id: 0,
+                env_recovery_mode: false,
+                env_recovery_admin: Some(("admin".to_string(), "popolna_zapora".to_string())),
+                env_cluster_role: cluster_role,
+                env_push_shard_id: push_shard_id,
+                env_hostname: hostname,
+                env_public_url: None,
+                id_generator: utils::snowflake::SnowflakeIdGenerator::new(),
+                process_nonce: rand::random(),
+            },
+            true,
+        )
+        .await
+        .unwrap()
+    }
 }
 
 #[cfg(stalwart_tests)]

@@ -5,15 +5,11 @@
  */
 
 use super::{
-<<<<<<< HEAD
-    Batch, BatchBuilder, ChangedCollection, IntoOperations, Operation, ValueClass, ValueOp,
-    assert::ToAssertValue,
-    log::{CalendarTombstone, VanishedItem},
-=======
     AccountCounter, Batch, BatchBuilder, ChangedCollection, CommitPriority, IntoOperations,
-    Operation, QueueCounter, QueueNotify, ValueClass, ValueOp, assert::ToAssertValue,
-    counter::CounterKey, log::VanishedItem,
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+    Operation, QueueCounter, QueueNotify, ValueClass, ValueOp,
+    assert::ToAssertValue,
+    counter::CounterKey,
+    log::{CalendarTombstone, VanishedItem},
 };
 use crate::{
     Deserialize, Shape, Subspace, U32_LEN,
@@ -668,6 +664,10 @@ impl BatchBuilder {
 
     #[inline]
     pub fn commit_point(&mut self) -> &mut Self {
+        #[cfg(feature = "test_mode")]
+        if self.batch_ops > 0 && crate::za_test::force_commit_split(self.current_account_id) {
+            return self.add_commit_point();
+        }
         if self.is_large_batch() {
             self.add_commit_point()
         } else {
@@ -881,35 +881,6 @@ impl BatchBuilder {
 
     pub fn ops(&self) -> &[Operation] {
         self.ops.as_slice()
-    }
-
-    /// Account the materialized operation inputs, including callback parameters.
-    ///
-    /// This is not a bound on arbitrary callback outputs. Callers imposing a
-    /// transaction payload limit must separately establish that their callbacks
-    /// do not expand these inputs. Materialize pending logs before using this.
-    pub fn accounted_input_bytes(&self) -> usize {
-        self.ops.iter().fold(0usize, |total, operation| {
-            // Reserve fixed key/tag/scalar overhead even for selector operations.
-            let bytes = 64usize.saturating_add(match operation {
-                Operation::Value { class, op } => {
-                    class.serialized_size().saturating_add(match op {
-                        ValueOp::Set(bytes) => bytes.len(),
-                        ValueOp::SetFnc(operation) => operation.params.accounted_input_bytes(),
-                        ValueOp::MergeFnc(operation) => operation.params.accounted_input_bytes(),
-                        ValueOp::AtomicAdd(_) | ValueOp::AddAndGet(_) => 16,
-                        ValueOp::Clear => 0,
-                    })
-                }
-                Operation::AssertValue { class, .. } => class.serialized_size(),
-                Operation::Index { key, .. } => key.len(),
-                Operation::Log { set, .. } => set.len(),
-                Operation::AccountId { .. }
-                | Operation::Collection { .. }
-                | Operation::DocumentId { .. } => 0,
-            });
-            total.saturating_add(bytes)
-        })
     }
 
     pub fn len(&self) -> usize {

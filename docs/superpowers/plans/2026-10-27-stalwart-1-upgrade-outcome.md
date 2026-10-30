@@ -3331,9 +3331,9 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 
 | Path | Conflict | Owner | Resolution |
 |---|---|---|---|
-| `Cargo.lock` | content | Task 2 (regenerated) | open |
-| `Cargo.toml` | content | Task 2 | open |
-| `crates/common/Cargo.toml` | content | Task 2 | open |
+| `Cargo.lock` | content | Task 2 (regenerated) | resolved (Task 2a): regenerated from v1.0.1's lockfile (`git show 23b69755c:Cargo.lock`) with `cargo metadata` once the manifests resolved. No v1.0.1 package changed version; `stalwart` is now `0.1.1-beta.1`; 72 packages were added: `vault`, `tests` and 70 crates that only `tests`' dev-dependencies pull (`jmap-client`, `testcontainers`, `rust-s3`, `ece`, `biscuit`, `serial_test`, `csv` and their dependencies). `cargo tree -d --workspace -e normal,build` lists the same 157 entries as v1.0.1's tree. With dev edges, the extra duplicates are internal to test-only clients: `quick-xml` 0.41, `reqwest` 0.12 and `hashbrown` 0.14 under `rust-s3`; `tungstenite` 0.29, `rand` 0.9 and `sha1` 0.10 under `jmap-client`; `darling` 0.24 under `testcontainers`. None sits at a server crate's API. |
+| `Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's file plus rows 1-3. `crates/vault` is in `members` and `default-members`; `tests` is back in `members` only (like `crates/s3`, it is built with `-p`); `crates/migration` stays removed. The dev profile keeps v1.0.1's argon2 and blake2 blocks with the fork's comment; `[profile.test.package.argon2]` stays. |
+| `crates/common/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies plus `vault` (row 1); `test_mode = ["store/test_mode"]` (row 3); the dev-dependency `totp-rs` (used by `auth/vault.rs`'s tests). Row 2 (the pinned opentelemetry git rev) has no subject: v1.0.1 dropped opentelemetry, prometheus and chrono from `common` (OTLP is in the new `telemetry` crate), so nothing is pinned. The `[target.'cfg(stalwart_tests)'.dependencies]` table (dns-update `test_provider`) is left as supplied and is dead in fork builds; the tests manifest enables `test_provider` itself. |
 | `crates/common/src/auth/access_token.rs` | content | Task 3 | open |
 | `crates/common/src/auth/authentication.rs` | content | Task 3 | open |
 | `crates/common/src/auth/mod.rs` | content | Task 3 | open |
@@ -3348,7 +3348,7 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/common/src/scripts/plugins/mod.rs` | content | Task 5 | open |
 | `crates/common/src/storage/transaction.rs` | content | Task 4 | open |
 | `crates/common/src/telemetry/tracers/otel.rs` | content | Task 9 (compiles in Task 3) | open |
-| `crates/dav/Cargo.toml` | content | Task 2 | open |
+| `crates/dav/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies (local `calcard`, hashify 0.3, hyper 1.12) plus `vault` (row 1); `test_mode = ["common/test_mode"]` (row 2). |
 | `crates/dav/src/calendar/copy_move.rs` | content | Task 4 | open |
 | `crates/dav/src/calendar/delete.rs` | content | Task 4 | open |
 | `crates/dav/src/calendar/freebusy.rs` | content | Task 4 | open |
@@ -3364,14 +3364,14 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/dav/src/common/uri.rs` | content | Task 4 | open |
 | `crates/dav/src/request.rs` | content | Task 4 | open |
 | `crates/directory/src/core/secret.rs` | content | Task 3 | open |
-| `crates/email/Cargo.toml` | content | Task 2 | open |
+| `crates/email/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies (mail-parser 1.0, mail-builder 2.0, local `sieve-rs` and `text-extract`, workspace rkyv) plus `vault` (row 1) and `zeroize` (row 2); `test_mode = []`, the fork's 0.16.27 declaration, for the tests manifest. |
 | `crates/email/src/message/copy.rs` | content | Task 5 | open |
 | `crates/email/src/message/index/metadata.rs` | content | Task 5 | open |
 | `crates/email/src/message/index/mod.rs` | content | Task 5 | open |
 | `crates/email/src/message/ingest.rs` | content | Task 5 | open |
 | `crates/email/src/message/mod.rs` | content | Task 5 | open |
 | `crates/email/src/sieve/ingest.rs` | content | Task 5 | open |
-| `crates/groupware/Cargo.toml` | content | Task 2 | open |
+| `crates/groupware/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies and `enterprise` list plus `vault`, `base64`, `subtle` and `zeroize` (row 1); `test_mode = ["common/test_mode"]` (row 2). |
 | `crates/groupware/src/calendar/dates.rs` | content | Task 4 | open |
 | `crates/groupware/src/calendar/itip.rs` | content | Task 4 | open |
 | `crates/groupware/src/calendar/mod.rs` | content | Task 4 | open |
@@ -3379,7 +3379,7 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/groupware/src/calendar/storage.rs` | content | Task 4 | open |
 | `crates/groupware/src/scheduling/event_cancel.rs` | content | Task 4 | open |
 | `crates/http-proto/src/request.rs` | content | Task 3 | open |
-| `crates/http/Cargo.toml` | content | Task 2 | open |
+| `crates/http/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies plus `vault` (row 1) and `subtle` (row 2); `test_mode = []`, the fork's 0.16.27 declaration (the `za_test` hooks of `auth/authenticate.rs`). |
 | `crates/http/src/api/mod.rs` | content | Task 3 (shares route: Task 4) | open |
 | `crates/http/src/auth/authenticate.rs` | content | Task 3 | open |
 | `crates/http/src/auth/oauth/auth.rs` | content | Task 3 | open |
@@ -3397,7 +3397,7 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/imap/src/op/idle.rs` | content | Task 5 | open |
 | `crates/imap/src/op/search.rs` | content | Task 5 (search: Task 6) | open |
 | `crates/imap/src/op/store.rs` | content | Task 5 | open |
-| `crates/jmap/Cargo.toml` | content | Task 2 | open |
+| `crates/jmap/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies (local `calcard`, `smtp-proto`, `sieve-rs`, `jmap-tools`; mail-parser 1.0 without `rkyv`) plus `vault` (row 1); `test_mode = []`, the fork's 0.16.27 declaration. |
 | `crates/jmap/src/api/request.rs` | content | Task 5 (calendar refusal: Task 4) | open |
 | `crates/jmap/src/api/session.rs` | content | Task 6 | open |
 | `crates/jmap/src/blob/copy.rs` | content | Task 5 | open |
@@ -3418,11 +3418,11 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/jmap/src/registry/mapping/spam_sample.rs` | content | Task 5 | open |
 | `crates/jmap/src/submission/set.rs` | content | Task 5 | open |
 | `crates/jmap/src/websocket/stream.rs` | content | Task 3 | open |
-| `crates/main/Cargo.toml` | content | Task 2 (identity: Task 9) | open |
+| `crates/main/Cargo.toml` | content | Task 2 (identity: Task 9) | resolved (Task 2a): v1.0.1's file with the fork's `version = "0.1.1-beta.1"` (row 1); the rest of the identity is Task 9's. |
 | `crates/managesieve/src/op/authenticate.rs` | content | Task 3 | open |
 | `crates/pop3/src/op/authenticate.rs` | content | Task 3 | open |
 | `crates/pop3/src/op/fetch.rs` | content | Task 5 | open |
-| `crates/services/Cargo.toml` | content | Task 2 | open |
+| `crates/services/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's `enterprise` list plus `test_mode = ["common/test_mode"]` (row 1). |
 | `crates/services/src/task_manager/index.rs` | modify/delete | Task 6 | open |
 | `crates/services/src/task_manager/manager.rs` | content | Task 6 | open |
 | `crates/services/src/task_manager/tasks/maintenance.rs` | content | Task 6 (lease: Task 3/Task 4); renamed from `task_manager/maintenance.rs`, whose file group it is | open |
@@ -3435,12 +3435,12 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/spam-filter/src/modules/classifier.rs` | content | Task 5 | open |
 | `crates/spam-filter/src/modules/dnsbl.rs` | content | Task 5 | open |
 | `crates/spam-filter/src/modules/expression.rs` | content | Task 5 | open |
-| `crates/store/src/dispatch/lookup.rs` | content | Task 2 (lease home: Task 3/Task 4) | open |
-| `crates/store/src/lib.rs` | content | Task 2 (is_read_replica consumer: Task 4) | open |
-| `crates/store/src/query/log.rs` | content | Task 4 | open |
-| `crates/store/src/search/index.rs` | content | Task 6 (`has_account_search_terms`: Task 2) | open |
-| `crates/store/src/write/batch.rs` | content | Task 6 (consumer: Task 4) | open |
-| `crates/store/src/write/mod.rs` | content | Task 6 (consumer: Task 4) | open |
+| `crates/store/src/dispatch/lookup.rs` | content | Task 2 (lease home: Task 3/Task 4) | resolved (Task 2a): v1.0.1's file as supplied (both blocks). Row 2's purge skip is moot, not deferred. Evidence (paths in `v1.0.1-src/crates/`): v1.0.1 has no `purge_in_memory_store`, and `InMemoryStore` (`store/src/lib.rs:426-439`) has no data-store variant: it is `Sql`, `Local`, `Redis`, `Http`, `Static` and the SEL `Sharded`, and `Sql` answers `NotSupported` to key writes (`store/src/dispatch/lookup.rs:61` and the arms after it). So nothing sweeps expired keys out of the data store. Its other bulk deletions of data-store keys are: `Store::purge_store`, which only clears zero counters in `Shape::Counter` subspaces (`store/src/backend/{rocksdb,sqlite,foundationdb}/write.rs`); `danger_destroy_account` (`store/src/dispatch/store.rs:415-476`: the account's `Counter` kinds, its `Logs`, `Indexes`, `Property`, `Immutable` and `IndexProperty` prefixes, and its ACLs); the change-log truncation (`delete_changes` and `truncate_change_log`, `common/src/storage/transaction.rs:116-235`, `Logs`); the private-metadata cleanup (`common/src/storage/metadata/cleanup.rs:228-265`, an owner's private metadata and private logs); the telemetry purges (`TelemetrySpan`, `TelemetryMetric`); the reindex and search-queue clears (search subspaces); and the console's operator-driven range delete. Ruling 24's guarantee (only the asserting sweep clears a lease) therefore rests on Task 3's choice of a `Shape::Value` subspace and key range for `ValueClass::Any` that none of these reaches. `ZA_UID_LEASE_PREFIX` stays in `store/src/lib.rs` as the first byte of the lease key in it. |
+| `crates/store/src/lib.rs` | content | Task 2 (is_read_replica consumer: Task 4) | resolved (Task 2a): v1.0.1's `Subspace` block as supplied, without the 0.16 `LEGACY_SUBSPACE_BITMAP_*` constants (no user). Row 1: `za_test` declared under `test_mode`. Row 2: `ZA_UID_LEASE_PREFIX = 27` kept (ruling 24), its comment rewritten for a `ValueClass::Any` key. Row 3 (ruling 26): the only caller of `Store::is_read_replica` is the fork's move route (`dav/src/calendar/copy_move.rs:2324`), and v1.0.1 still has the SEL `SQLReadReplica` variant, so the function stays, rewritten without the SEL arm: an SQL store (`is_sql`) that is neither SQLite nor `is_pg_or_mysql`, which at v1.0.1 is exactly the replica, and fails closed for any SQL variant upstream adds. |
+| `crates/store/src/query/log.rs` | content | Task 4 | resolved to compile (Task 2a, ruling 34): rows 1 and 2 ported. `vanished` wraps `vanished_with_change_id` as at 0.16, and each record is decoded with v1.0.1's `deserialize_vanished(bytes, &mut items)` into a per-record buffer, then tagged with that record's change id (the `String` decoder's prefix sharing is per record). Nothing deferred; finding 3 (paged sync tokens at the consumer) stays Task 4's. |
+| `crates/store/src/search/index.rs` | content | Task 6 (`has_account_search_terms`: Task 2) | resolved to compile (Task 2a, ruling 34): v1.0.1's imports and `index_account_documents` as supplied; 0.16's `Store::index` is gone. Deferred to Task 6: R58 placement, row 2 (the carrier `IndexDocument::assert_absent` and `with_assert_absent` in `search/{mod,document}.rs` compile unchanged and nothing reads them yet); R62's per-chunk guard, row 3; R63's confirmation read and its `take_clears` helper, row 4 (both removed from the file; the 0.16 code is at `9601038de`). Row 5 kept (ruling 19): `has_account_search_terms` is re-derived over v1.0.1's layout as one `only_first` scan of the account's term range in `Subspace::SearchTerm`, the range `unindex_account` deletes (`codec::account_region_range`); v1.0.1 has no separate `Index` keys. `za_test`'s `INDEX_CHUNK_PAUSE` and `INDEX_GUARD_FAIL_ONCE` stay, with no call site until rows 3 and 4 are decided. |
+| `crates/store/src/write/batch.rs` | content | Task 6 (consumer: Task 4) | resolved to compile (Task 2a, ruling 34): v1.0.1's imports plus `CalendarTombstone`. Row 2 (`log_calendar_vanished`) kept; `types` gives `VanishedCollection::CalendarIdentity` Calendar's change group, so both records of one deletion share a change id. Deferred to Task 6: `accounted_input_bytes`, row 3 (removed: v1.0.1's `SetValue` and boxed `MergeFnc` closures have no countable `Params`). Ruling 17's `FORCE_COMMIT_SPLIT` call is in `commit_point()`. |
+| `crates/store/src/write/mod.rs` | content | Task 6 (consumer: Task 4) | resolved to compile (Task 2a, ruling 34): v1.0.1's code as supplied. Deferred to Task 6: `Params::accounted_input_bytes`, row 1 (`Params` is gone; `MergeFnc` is a closure, so the move route's payload bound must be re-derived). The commit-retry constants are back under `test_mode` (test-hook table rows `store/src/write/mod.rs:105-112`), with `PRODUCTION_MAX_COMMIT_ATTEMPTS` gated to non-test builds, where it is used. |
 | `README.md` | content | primary (keep the fork's text) | resolved: the fork's text ("Keep the fork's README and SECURITY") |
 | `SECURITY.md` | content | primary (keep the fork's text) | resolved: the fork's text ("Keep the fork's README and SECURITY") |
 

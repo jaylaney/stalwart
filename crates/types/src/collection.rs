@@ -115,6 +115,7 @@ impl VanishedCollection {
         match self {
             VanishedCollection::Email => false,
             VanishedCollection::Calendar
+            | VanishedCollection::CalendarIdentity
             | VanishedCollection::AddressBook
             | VanishedCollection::FileNode => true,
         }
@@ -124,6 +125,9 @@ impl VanishedCollection {
         match self {
             VanishedCollection::Email => SyncCollection::Email,
             VanishedCollection::Calendar => SyncCollection::Calendar,
+            // The identity record shares Calendar's change id, so both
+            // records of one deletion land under the same log key.
+            VanishedCollection::CalendarIdentity => SyncCollection::Calendar,
             VanishedCollection::AddressBook => SyncCollection::AddressBook,
             VanishedCollection::FileNode => SyncCollection::FileNode,
         }

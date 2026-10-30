@@ -50,6 +50,29 @@ impl SqliteStore {
         })))
     }
 
+    /// Zero-access fork: a one-connection store in memory with its tables
+    /// created, for the test suites (0.16.27's `open_memory`).
+    #[cfg(feature = "test_mode")]
+    pub fn open_memory() -> trc::Result<Self> {
+        let pool_workers = worker::pool_workers(None);
+        let db = Self {
+            conn_pool: Pool::builder()
+                .max_size(1)
+                .build(SqliteConnectionManager::memory())
+                .map_err(into_error)?,
+            worker_pool: rayon::ThreadPoolBuilder::new()
+                .num_threads(pool_workers)
+                .build()
+                .map_err(|err| {
+                    into_error(err).ctx(trc::Key::Reason, "Failed to build worker pool")
+                })?,
+            blocking: BlockingPermits::new(pool_workers),
+            sql: Arc::new(SqlStatements::new()),
+        };
+        db.create_tables()?;
+        Ok(db)
+    }
+
     pub(crate) fn create_tables(&self) -> trc::Result<()> {
         let conn = self.conn_pool.get().map_err(into_error)?;
 
