@@ -3531,6 +3531,42 @@ checked by `rustfmt` only.
   document, with HTTP Basic client authentication over form-urlencoded credentials (2.3.1).
 - Ruling 33's licensed parts are listed in the expectation ledger.
 
+### Task 2 rulings
+
+The primary's decisions during Task 2, numbered on from Task 1's.
+
+34. **Task 2 resolves every conflict in `store`, `types` and `vault`,** because its check
+    is `cargo check -p types -p store -p vault`. That includes the files Tasks 4 and 6 own
+    (`store/src/query/log.rs`, `search/index.rs`, `write/batch.rs` and `write/mod.rs`):
+    - upstream's code is taken as supplied;
+    - each fork hook is kept only where it compiles without a design its owner must still
+      make;
+    - every deferred hook is recorded in the conflict ledger with its owner.
+
+    Cost if wrong: an owner re-ports a hook from `9601038de`, guided by its inventory row.
+35. **Conflicted files of Tasks 3–6 stay with their owners.** Test-hook sites and
+    restored-module `#[path]` declarations inside them are handed off (see "Handoffs from
+    Task 2"), so no task edits inside another task's conflict markers. Ruling 9's regate of
+    the failed-login delay therefore lands with Task 3. Cost if wrong: the owners carry a
+    short extra list.
+36. **Task 2 ran as two sequential dispatches,** 2a (the workspace, manifests, lockfile and
+    the `types`, `store` and `vault` hooks) and 2b (the test infrastructure), each
+    committing, with one task review at the end.
+37. **Every task's crate check also builds that crate's test targets:**
+    `cargo check -p <crates> --tests`, with `--features test_mode` where the crate has it.
+    Restored unit modules and test hooks then compile with their crate before Task 7. Cost
+    if wrong: longer checks.
+38. **`scim_tests` takes the SEL-only disposition.** Its entry function is in the SEL-only
+    `tests/src/scim/mod.rs`, and its subject is the SEL-only `scim` crate. Its three
+    dual-licensed sibling files and the `tests` crate's `scim` dependency are removed, and
+    design Decision 1 is amended. Cost if wrong: they come back from history, with a bought
+    licence, in a private repository.
+39. **The default telemetry stores inside an SEL snippet.** The bootstrap inserts a default
+    `TracingStore` and `MetricsStore` inside an SEL snippet (`defaults.rs:498`, `:506`). The
+    fork doesn't edit it, and adds no cleanup exemption. Task 7 shows whether they write
+    anything without a licence. If they do, the harness removes them after bootstrap
+    through the registry API. Cost if wrong: one harness step at Task 7.
+
 ### Handoffs from Task 2
 
 Grouped by owner. Each restored file already exists; the owner adds the declaration as

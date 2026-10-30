@@ -1034,4 +1034,5 @@ Changes made from what Task 1 measured. The
 | 19 shared directories, not 20; five inline test modules aren't named `tests` | Counts corrected; a restored module keeps its own name. Design "Decisions"; Task 2. |
 | `account_batch` splits a pass into commit chunks, with the `Document` keys last | R58 is asserted in every chunk; R62's guard and R63 retire only once Task 6 confirms the per-partition ordering; R62's term scans stay. Design "Indexing"; Task 6. |
 | `jmap` depends on `services`; no task checked `http`, `managesieve` or `spam-filter` | The crate checks are reordered, and a failure goes back to the file's owner. "File ownership and dependencies". |
+| `scim_tests`'s entry function is in the SEL-only `tests/src/scim/mod.rs`, so it can't keep compiling | It takes the SEL-only disposition with its three dual-licensed siblings (Task 2's ruling 38). Design Decision 1. |
 | Further corrections to cited paths, lines and signatures, and decisions on the shared interfaces | The outcome note's interface sheet and Task 1's rulings 9–33 amend Tasks 2–7. Where they correct a cite in this plan or the design, they win, and each task's brief carries them. |

@@ -526,9 +526,12 @@ reduced form.
      - `tests/src/directory/oidc.rs`, the SEL-only `tests/src/scim/*` files,
        `tests/src/system/archiving.rs` and `tests/src/system/tenant.rs`;
      - the sub-test calls to them, including `system::tenant::test` and
-       `system::archiving::test`.
-   - **Ungated as today:** `cluster_tests`, `stress_tests` and `scim_tests` keep compiling
-     but stay out of the required set.
+       `system::archiving::test`;
+     - the `scim_tests` suite, whose entry function sits in the SEL-only
+       `tests/src/scim/mod.rs` and whose subject is the SEL-only `scim` crate, with its
+       three dual-licensed sibling files (Task 2's ruling 38).
+   - **Ungated as today:** `cluster_tests` and `stress_tests` keep compiling but stay out
+     of the required set.
    - **Ignored as today:** the six `#[ignore]`d tests stay ignored and keep compiling.
 2. **Restore everything at merge time.**
    - Right after `git merge --no-commit`, restore `tests/` and `.github/workflows/test.yml`
