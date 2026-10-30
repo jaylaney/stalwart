@@ -3830,19 +3830,19 @@ written, right after upstream's private slot.
 - `services`', `jmap`'s and `http`'s restored modules compile first at Task 6's check.
 - If `automation::acme` needs fast retries now that ACME retries go through the task queue,
   that is a task-manager retry policy under `test_mode`.
-- When `common::za::test_hooks` re-exports the `FORCE_COMMIT_SPLIT` setter, give it a drop
-  guard (like `DrainOn`), so that a test that panics while the hook is set does not leave
-  every later batch splitting. While set, it also splits batches that carry no account (other
-  accounts' index passes, the index queue's bookkeeping batch, registry-mapping batches); say
-  so in the module doc.
+- Done (Task 3a): `common::za::test_hooks` re-exports `FORCE_COMMIT_SPLIT` with the drop
+  guard `ForceCommitSplit::new(account_id)`, so a test that panics while the hook is set does
+  not leave every later batch splitting. The module doc says that, while set, it also splits
+  batches that carry no account (other accounts' index passes, the index queue's bookkeeping
+  batch, registry-mapping batches).
 - Ruling 18's tests: `store::za_test::FORCE_COMMIT_SPLIT` splits an index pass after each
   `Document` key, because it also splits batches with no current account, which
   `AccountIndexer::build_batch` never sets (unit test
   `za_test::tests::force_commit_split_splits_the_named_account_and_index_passes`). It does not
   govern `build_batch`'s own `add_commit_point()` after every 1000 term merges
   (`search/term.rs:364-368`); a fixture document with more than 1000 distinct terms crosses
-  that point without the hook. Re-export the setter through `common::za::test_hooks` with
-  the other store hooks.
+  that point without the hook. The setter is re-exported through `common::za::test_hooks`
+  (done, Task 3a).
 
 **Task 7**
 - The tests crate's first compile: the harness items above, and the `SUBSPACE_*` constants
@@ -3853,6 +3853,175 @@ written, right after upstream's private slot.
 
 **Task 8**
 - The workflow's `UNIT_TEST_FEATURES` and the separate `http` step (see above).
+
+## Task 3
+
+### Part 3a: `directory`, `common` and `vault`
+
+Part 3a resolved the fifteen conflicted files of `common` and `directory` (cells in the
+conflict ledger, including Task 4's `storage/transaction.rs`, Task 5's
+`scripts/plugins/mod.rs` and Task 9's two OTEL files under ruling 41), and ported the fork's
+hooks in those crates. `vault` needed no change: Task 2 had it compiling, and its 45 tests
+pass. The shape of the port follows interface sheet items 1-3 and rulings 9-12 and 24:
+
+- `Server::authenticate` keeps upstream's signature and returns a keyless `Authenticated`.
+  The fork's `authenticate_with_keys` holds upstream's body and returns
+  `(Authenticated, Option<Arc<SessionKeys>>)`; the keys are detached from the token after
+  the `Authenticate` permission check. Keys come only from the marker diversion and from a
+  key account's app-password wrap; `authenticate_bearer` never yields them.
+- `AccessToken` keeps upstream's `token_scope` and adds `session_keys` and
+  `za_impersonated`, all defaulted by `AccessToken::from_parts`, the one constructor.
+  `renew_access_token` and `refresh_access_token` carry R35's marker
+  (`za_carry_impersonation`, ruling 11) and never carry keys.
+- The authentication generation lives in the boxed `AccountStorage` (ruling 12), with the
+  public key, which `tests/src/za/setup.rs:145` reads; `AccountCache` is unchanged.
+- The vault record is written as `VAULT_RECORD_VERSION || Archiver` output, uncompressed
+  and hashed, and read with checked decoding (`deserialize_untrusted`), errors reduced to
+  `vault_corrupted` without the stored bytes. No 0.16 reader is kept (fresh stores). Its key
+  is unchanged: `Subspace::Property`, `account id || Principal || field 150 || document 0`
+  (151 for pins), so the cleanup's vault and pin exemption keeps its rule (Task 2 handoff).
+
+#### Deferred, by owner
+
+**Part 3b**
+- `http/src/auth/authenticate.rs`: the hit rule of interface sheet 2 is now load-bearing.
+  `Caches::za_insert_keys` and `za_sweep_keys` no longer remove HTTP entries (1.0's
+  `HttpAuthEntries` keys on a SipHash of the token, not on the fork's fingerprint), so a key
+  account's cached entry must be served only while `za_keys.get(&fp, now)` holds keys with
+  `keys.account_id == id`, `keys.generation != 0` and
+  `keys.generation == account.za_generation()`, and removed otherwise. Until 3b lands this
+  rule, nothing else stops a key-account entry whose keys were evicted from being served
+  keyless. The generation is now the method `AccountCache::za_generation()`, not a field.
+  Also ruling 10 (marker re-derived on a hit), ruling 28 (no raw Authorization value in
+  errors), the three regression cases and the `za_test` hooks.
+- `http/src/api/vault.rs` and `contacts.rs`: `authenticate_with_keys` now returns
+  `(Authenticated, keys)`: use `.access_token`. `Server::authentication_failure` is kept
+  (delay, then upstream's `auth_failure`, which now also applies `details_to_reason`).
+- IMAP and POP3 logins: call `authenticate_with_keys` (`imap/src/op/authenticate.rs:140`,
+  `pop3/src/op/authenticate.rs:118` at v1.0.1) and attach the keys before the session is
+  built. IMAP's renewal (`imap/src/core/mod.rs:280`) carries the keys at the call site; the
+  marker is already carried by `renew_access_token`.
+- EventSource and WebSocket (`http/src/request.rs`): `.without_session_keys()` after the
+  scope assertion.
+- `services/src/task_manager/scheduler.rs`'s `ZaKeySweep` calls `Caches::za_sweep_keys`,
+  which keeps its signature and return value.
+- `jmap/src/registry/mapping/account.rs:239` verifies the current password for a
+  self-service change with `verify_mfa_secret_hash`; it is one of the registry refusal
+  sites (a marker credential never verifies there).
+- Tests read `account.za_generation()` and `account.za_public_key()` (methods now).
+
+**Task 4**
+- `za_eval_if` takes 1.0's `arena: &mut Bump` like `eval_if` (the fan-out's call sites).
+- Nothing of `storage/transaction.rs` is deferred (see its ledger cell).
+
+**Task 5**
+- The `PluginContext` constructors in `smtp/src/scripts/event_loop.rs` and
+  `email/src/sieve/ingest.rs` set `za_redact`; `za_eval_if`'s new arena argument at the
+  spam filter's call sites.
+
+**Task 6**
+- The lease sweep's call site in the maintenance task's purge step
+  (`services/src/task_manager/tasks/maintenance.rs`):
+  `common::za::lease::sweep_expired_uid_leases(server.store())`, unchanged signature.
+- `INDEX_WRITE_PAUSE` has no call site (0.16's `services::task_manager::index` is gone);
+  `INDEX_CHUNK_PAUSE` and `INDEX_GUARD_FAIL_ONCE` still compile, without call sites.
+- R51, R60 and R62's scans in `auth/vault.rs` (`za_has_*_search_documents`,
+  `za_has_*_search_terms`) were ported mechanically onto 1.0's
+  `SearchIndexClass::Document { index, account_id, document_id }` and Task 2's
+  `has_account_search_terms`, so that the vault module compiles; whether they stay, and
+  their semantics over 1.0's index layout, are Task 6's (inventory finding 10).
+
+**Task 7 and Task 2**
+- The emptiness check must know the lease's home (below): a lease key left in
+  `Subspace::System` under prefix 27 is reported.
+
+**Task 9**
+- The OTEL service version: v1.0.1 builds the OTLP resource in the `telemetry` crate
+  (`crates/telemetry/src/otlp/resource.rs:10`, `SERVER_VERSION`); the two `common` files
+  were taken as supplied.
+
+#### The UID lease's subspace (ruling 24)
+
+The lease is `ValueClass::Any(AnyClass { subspace: Subspace::System, key })` in the data
+store, with `key = ZA_UID_LEASE_PREFIX (27) || account id (u32 BE) || SHA-256(uid)`
+(`common::za::lease::LEASE_SUBSPACE`). Evidence (paths in the worktree):
+- `Subspace::System` (`store/src/lib.rs:174`) is a `Shape::Value` subspace. Its only other
+  keys are the schema version (`SystemKind::SchemaVersion = 0x00`,
+  `common/src/manager/schema.rs:26`, `:62`) and the cluster's node-id leases
+  (`SystemKind::NodeId = 0x01 || u16`, `store/src/write/key.rs:516`, `:1063-1066`). Byte 27
+  collides with neither, and the one iteration of the subspace, `NodeSlot::list`
+  (`store/src/build/cluster.rs:160-197`), scans `ValueClass::NodeId(0)..NodeId(u16::MAX)`,
+  which a lease key never falls in.
+- None of the bulk deletions listed in the `store/src/dispatch/lookup.rs` ledger cell reaches
+  it: `Store::purge_store` clears only zero counters in `Shape::Counter` subspaces;
+  `danger_destroy_account` deletes per-account prefixes in `Counter`, `Logs`, `Indexes`,
+  `Property`, `Immutable`, `IndexProperty` and the ACLs; the change-log truncation,
+  the private-metadata cleanup, the telemetry purges and the search-queue clears work in
+  their own subspaces. The console's range delete is operator-driven.
+- `is_new_install` (`common/src/manager/schema.rs:75-100`) does not scan `System`. A restore
+  into a store holding a live lease would count it as data (`common/src/manager/restore.rs:96`);
+  leases last seconds, so only a restore during traffic meets it.
+- The unit test `za::lease::tests::the_generic_purge_leaves_lease_keys` now runs
+  `Store::purge_store` over expired and live leases (expectation ledger).
+
+C7 is unchanged: fenced writes assert the lease (`ZaUidLease::assert_in`), and
+`sweep_expired_uid_leases` is still the only cleanup, clearing each expired key with an
+assertion on the value it read.
+
+#### R54's classification (ruling 22)
+
+`Server::za_has_tasks` first scans the index queue of each account-partitioned index
+(`SearchIndexClass::queue_range(index, account_id)` for Email, Calendar, Contacts and File,
+in the data store): any entry, an index (`1`) or an unindex (`0`), counts. 1.0's index work
+has no `Task` variant, so this scan replaces 0.16's `IndexDocument` and `UnindexDocument`
+arms; Tracing is left out because its partitions are span-id buckets, not accounts. It then
+makes one pass over the task queue, matching every 1.0.1 `Task` variant exhaustively:
+
+| `Task` variant | Counted | Reason |
+|---|---|---|
+| `MergeThreads` | yes | Writes the account's threading data; a retained one holds a subject of up to 15 bytes verbatim. |
+| `CalendarItipMessage` | yes | Writes an iTIP message into the account. |
+| `CalendarAlarmEmail`, `CalendarAlarmNotification` | no | Content-free (ids and times), and possibly due days ahead. |
+| `AccountMaintenance` | no | Scheduled for every account by the purge and reindex sweeps; any index work it causes goes through the index queue, which the first scan covers. |
+| `DestroyAccount` | no | Not a provisioning state. |
+| `ShareRevokeCleanup` (new in 1.0) | no | Purges grantee references after a revoked share of the owner's object (`GranteeCleanup` with `Purge::LostAccess`, guarded on the object's archive version, `services/src/task_manager/tasks/grantee_cleanup.rs:127-158`); it writes no message, event or index document of its own, and an owner with a shared object already fails the emptiness checks. Its skip for key accounts is Task 6's (interface sheet 3). |
+| `DmarcReport`, `TlsReport`, `DmarcReportWindow`, `TlsReportWindow` (the windows are new in 1.0) | no | No account. |
+| `StoreMaintenance`, `SpamFilterMaintenance`, `AcmeRenewal`, `DkimManagement`, `DnsManagement` | no | No account. |
+| `RestoreArchivedItem`, `TenantMaintenance` (enterprise only) | no | Absent from the OSS product; one `cfg(feature = "enterprise")` wildcard arm covers them without naming an SEL-only variant (ruling 26's rule), and the product build stays exhaustive. |
+
+The 409 "account has unfinished tasks" refusal is kept; its order before R51's scan is the
+caller's (`http/src/api/vault.rs`, part 3b).
+
+#### Authentication entrypoints, 0.16.27 to 1.0.1
+
+Every route into `Server::authenticate` at v1.0.1, and where the fork's hooks sit now.
+Lines are v1.0.1's (`v1.0.1-src/crates/`).
+
+| Entrypoint (v1.0.1) | 0.16.27 route | Fork hooks at 1.0.1 | Keys |
+|---|---|---|---|
+| `Server::authenticate` (`common/src/auth/authentication.rs:52`) | `authenticate` over `route_auth_request` | wraps `authenticate_with_keys`; the delay regated in `authentication_failure` (ruling 9) | dropped |
+| `authenticate_with_keys` (fork) | same | upstream's body, then the detach | returned beside the token |
+| `authenticate_basic`, recovery admin (`:133-183`) | `route_auth_request` Basic, fallback admin | R35 marker on the `%` impersonation return | none |
+| `authenticate_basic`, app password (`:199`) to `validate_credential` (`:544`) | same | app-password wrap after a successful verification (`za_open_app_wrap`); no wrap: refused | from the wrap |
+| `authenticate_basic`, external directory (`:228-250`) | same | `za_refuse_directory_login` before `directory.authenticate`; `za_refuse_directory_account` before `assert_account_directory`; `merge_directory_secret` in `synchronize_account` (`common/src/cache/directory.rs:30`) | none |
+| `authenticate_basic`, internal password (`:269`) | same | marker diversion to `za_verify_password`; `NoRecord` refused with `ZA_REASON_VAULT_MISSING` | from the vault |
+| `authenticate_basic`, master user (`:322-337`) | same | R35 marker on `new_maybe_invalid` | none |
+| `authenticate_bearer`, API key (`:364`) | Bearer, API key | none (an API key is not an app password) | none |
+| `authenticate_bearer`, internal OAuth (`:389`, `authenticate_oauth_token` `:493`) | Bearer, `validate_access_token` | a key account's `credential_version` follows the vault revision (`build_access_token`), checked by `assert_credential_version` | none |
+| `authenticate_bearer`, external directory (`:399-404`) | Bearer, directory | `za_refuse_directory_account` before `assert_account_directory` (needs an OIDC provider; not covered by a local test) | none |
+| `renew_access_token`, `refresh_access_token` (`common/src/auth/oauth/grant.rs:195-230`) | IMAP's `refresh_access_token` | R35 marker carried (ruling 11) | never carried (IMAP's call site, part 3b) |
+| HTTP `authenticate_headers` (`http/src/auth/authenticate.rs:106`) | `authenticate_with_keys` (`:149`) | part 3b: `authenticate_with_keys`, the hit and miss rules, ruling 10's marker, ruling 28 | one request |
+| IMAP `authenticate` (`imap/src/op/authenticate.rs:140`) | `authenticate_with_keys` (`:74`) | part 3b | the connection |
+| POP3 `authenticate` (`pop3/src/op/authenticate.rs:118`) | `authenticate_with_keys` (`:68`) | part 3b | the connection |
+| SMTP AUTH (`smtp/src/inbound/auth.rs:226`) | `authenticate` (`:114`) | keyless `authenticate`, unchanged | none |
+| ManageSieve (`managesieve/src/op/authenticate.rs:93`) | `authenticate` (`:76`) | keyless `authenticate`, unchanged | none |
+| OAuth login (`http/src/auth/oauth/auth.rs:609`) | `authenticate` (`:287`, `:401`) | keyless; R36's impersonation refusal is part 3b's | none |
+| Vault and contacts endpoints (`http/src/api/vault.rs`) | `authenticate_with_keys` (`:589`) | part 3b | one request |
+
+Credential checks outside `authenticate`: `jmap/src/registry/mapping/account.rs:239`
+(`verify_mfa_secret_hash` for a self-service password change; a registry refusal site, part
+3b), the SQL and LDAP directories' own `verify_secret_hash` (behind the directory refusals)
+and `http/src/auth/oauth/registration.rs:313` (OAuth client secrets, not account logins).
 
 ## Conflict ledger
 
@@ -3893,20 +4062,20 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `Cargo.lock` | content | Task 2 (regenerated) | resolved (Task 2a): regenerated from v1.0.1's lockfile (`git show 23b69755c:Cargo.lock`) with `cargo metadata` once the manifests resolved. No v1.0.1 package changed version; `stalwart` is now `0.1.1-beta.1`; 72 packages were added: `vault`, `tests` and 70 crates that only `tests`' dev-dependencies pull (`jmap-client`, `testcontainers`, `rust-s3`, `ece`, `biscuit`, `serial_test`, `csv` and their dependencies). `cargo tree -d --workspace -e normal,build` lists the same 157 entries as v1.0.1's tree. With dev edges, the extra duplicates are internal to test-only clients: `quick-xml` 0.41, `reqwest` 0.12 and `hashbrown` 0.14 under `rust-s3`; `tungstenite` 0.29, `rand` 0.9 and `sha1` 0.10 under `jmap-client`; `darling` 0.24 under `testcontainers`. None sits at a server crate's API. |
 | `Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's file plus rows 1-3. `crates/vault` is in `members` and `default-members`; `tests` is back in `members` only (like `crates/s3`, it is built with `-p`); `crates/migration` stays removed. The dev profile keeps v1.0.1's argon2 and blake2 blocks with the fork's comment; `[profile.test.package.argon2]` stays. |
 | `crates/common/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies plus `vault` (row 1); `test_mode = ["store/test_mode", "dns-update/test_provider"]` (row 3; the provider since Task 2's fix round 1: the restored `test_mode` code in `network/dns/update.rs` calls `DnsUpdater::new_pebble`, `new_in_memory` and `NamedDnsRecord`, which dns-update gates on it, as upstream's `stalwart_tests` dependency table does); the dev-dependency `totp-rs` (used by `auth/vault.rs`'s tests). Row 2 (the pinned opentelemetry git rev) has no subject: v1.0.1 dropped opentelemetry, prometheus and chrono from `common` (OTLP is in the new `telemetry` crate), so nothing is pinned. The `[target.'cfg(stalwart_tests)'.dependencies]` table is left as supplied and is dead in fork builds; `test_mode` now does its job. |
-| `crates/common/src/auth/access_token.rs` | content | Task 3 | open |
-| `crates/common/src/auth/authentication.rs` | content | Task 3 | open |
-| `crates/common/src/auth/mod.rs` | content | Task 3 | open |
-| `crates/common/src/cache/directory.rs` | content | Task 3 | open |
-| `crates/common/src/cache/invalidate.rs` | content | Task 3 | open |
-| `crates/common/src/cache/principals.rs` | content | Task 3 | open |
-| `crates/common/src/config/inner.rs` | content | Task 3 | open |
-| `crates/common/src/config/telemetry.rs` | content | Task 9 (compiles in Task 3) | open |
-| `crates/common/src/expr/eval.rs` | content | Task 3 | open |
-| `crates/common/src/lib.rs` | content | Task 3 | open |
-| `crates/common/src/manager/boot.rs` | content | Task 3 | open |
-| `crates/common/src/scripts/plugins/mod.rs` | content | Task 5 | open |
-| `crates/common/src/storage/transaction.rs` | content | Task 4 | open |
-| `crates/common/src/telemetry/tracers/otel.rs` | content | Task 9 (compiles in Task 3) | open |
+| `crates/common/src/auth/access_token.rs` | content | Task 3 | resolved (Task 3a): v1.0.1's file plus rows 3-16. Row 3's `access_to` filter is `Server::za_filter_access_to` (`auth/vault.rs`) after `AccessTo::from_acl_items`, keeping the sorted order 1.0's binary search needs; rows 4-5 merged; rows 6-7 the epoch fence on `access_token`, and the same fence added to `access_token_from_account`'s insert and stale update (interface sheet 3); rows 8-15 through `AccessToken::from_parts`, which defaults `token_scope`, `session_keys` and `za_impersonated` (`renew` adds the scope with `with_token_scope`); row 12 keeps the keys and marker across `assert_is_valid`; row 16's `sharing_access_tests` kept after upstream's private slot, adapted to `member_of: Box<[u32]>` and `AccessTo.is_writable`. New `za_carry_impersonation` for ruling 11. |
+| `crates/common/src/auth/authentication.rs` | content | Task 3 | resolved (Task 3a): rebuilt from v1.0.1's file with rows 3-12: `authenticate` wraps the fork's `authenticate_with_keys`, which holds upstream's body and returns `(Authenticated, Option<Arc<SessionKeys>>)`, the token keyless; `authentication_failure` (the delay, regated `cfg(not(any(stalwart_tests, feature = "test_mode")))` per ruling 9, then upstream's `auth_failure`); the R35 marker on both impersonation returns; `za_refuse_directory_login` before the directory sees the password; `za_refuse_directory_account` before `assert_account_directory` in the Basic and Bearer arms; the marker diversion at the internal password check (`NoRecord` keeps `ZA_REASON_VAULT_MISSING`); the app-password wrap in `validate_credential`; the two refusal helpers beside `add_missing_domain`. The restored module is declared after the private slot (Task 2 handoff). |
+| `crates/common/src/auth/mod.rs` | content | Task 3 | resolved (Task 3a): `pub mod vault` beside 1.0's `pub mod sasl`; ruling 12: `za_generation` and `za_public_key` in the boxed `AccountStorage` (upstream `boxed` fills them with `..Default::default()`), built by the fork helper `AccountStorage::za_boxed`, read with `AccountCache::za_generation()` and `za_public_key()`. `za_public_key` is kept because `tests/src/za/setup.rs:145` reads it; `AccountCache` itself is unchanged, inside its 112-byte assertion. `AccessToken` keeps upstream's `token_scope` plus `session_keys` and `za_impersonated`; `is_key_account` in a fork-owned `impl AccountCache` block. |
+| `crates/common/src/cache/directory.rs` | content | Task 3 | resolved (Task 3a): v1.0.1's `sync_account` with the marker check as `directory_secret(current_user, account.secret)` (none for a key account's marker) in place of upstream's secret filter, applied with `merge_directory_secret`; rows 1 and 3 merged; the fork unit module unchanged and passing. |
+| `crates/common/src/cache/invalidate.rs` | content | Task 3 | resolved (Task 3a): rows 1-4 on 1.0's batched invalidation: the epoch bump before the clears and at the top of the `AccessToken` and `Account` arms; `za_keys.remove_account` in both arms; the `Account` arm adds the account to `http_auth_accounts` (upstream's single batched retain); `invalidate_all_local_caches` keeps upstream's `directory_recipients` clear and adds `za_keys.clear()` (upstream already drops `http_auth` through `grant_revocations.clear`). |
+| `crates/common/src/cache/principals.rs` | content | Task 3 | resolved (Task 3a): rows 3-16: the quiet cache-trace hunks take 1.0's `Cache(CacheEvent::…)` events inside `if !quiet`; the loader's classification and vault read (merged) feed `AccountStorage::za_boxed` (rows 9, 13); the insert keeps the 0.16 epoch fence (row 14); the quiet sub-addressing evaluation calls `za_eval_if` with 1.0's arena. |
+| `crates/common/src/config/inner.rs` | content | Task 3 | resolved (Task 3a): v1.0.1's `Caches::parse` (`HttpAuthEntries`, `GrantRevocations`) plus the fork's four fields (`za_keys`, `za_fingerprint_key`, `account_epoch`, `za_account_page_origin`); the fork's `Cache<[u8; 32], HttpAuthCache>` is dropped for upstream's keyed entries (interface sheet 2). |
+| `crates/common/src/config/telemetry.rs` | content | Task 9 (compiles in Task 3) | resolved (Task 3a, ruling 41): v1.0.1's code as supplied. Deferred to Task 9: row 1 (OTEL service version). v1.0.1 builds the OTLP resource in the new `telemetry` crate (`crates/telemetry/src/otlp/resource.rs:10`, `SERVER_VERSION = env!("CARGO_PKG_VERSION")`, used at `:82` and `:132`), which is where the fork version now goes. |
+| `crates/common/src/expr/eval.rs` | content | Task 3 | resolved (Task 3a): v1.0.1's evaluator with rows 1-3 as a `quiet` flag through `eval_program`, `eval_suspending` and `IfBlock::finish_eval`; `za_eval_if` passes `true` and now takes 1.0's `arena: &mut Bump` (consumers: the fan-out, Task 4; the spam filter, Task 5). |
+| `crates/common/src/lib.rs` | content | Task 3 | resolved (Task 3a): v1.0.1's KV constants as supplied (row 3: `KV_LOCK_ZA_UID` is gone; the lease uses `store::ZA_UID_LEASE_PREFIX` in `Subspace::System`, ruling 24); `Caches` gains the four fork fields (row 4); `HttpAuthCache` is upstream's 40-byte struct with no fork field (row 5, ruling 10); the fork's `impl Caches` (`za_fingerprint`, `za_insert_keys`, `za_sweep_keys`, the account-page origin) follows it. `za_insert_keys` and `za_sweep_keys` no longer remove HTTP entries (1.0's keys are not caller-chosen); the HTTP hit rule (part 3b) refuses a key-account entry without resident keys instead. |
+| `crates/common/src/manager/boot.rs` | content | Task 3 | resolved (Task 3a): v1.0.1's events (recovery-mode port, `CompactString` hostnames) with `Version = crate::version::BUILD_IDENTITY`; rows 2-3 kept (the startup identity line and the key-cache settings event). |
+| `crates/common/src/scripts/plugins/mod.rs` | content | Task 5 | resolved (Task 3a, ruling 41): rows 1-3 ported: `PluginContext.za_redact` beside 1.0's `arguments: Vec<Variable<'x>>`; the type-only error funnel in `run_plugin`. Task 2's handoff (`:57`, `:76`, `:109`) ported too: the `print` plugin is registered and dispatched under `test_mode`, with a fork-owned `test_print` written from 0.16's. Nothing deferred; Task 5 sets `za_redact` at the `PluginContext` constructors in `smtp` and `email`. |
+| `crates/common/src/storage/transaction.rs` | content | Task 4 | resolved (Task 3a, ruling 41): v1.0.1's `delete_changes`, whose `truncate_change_log` already writes the truncation entry before any delete for every collection (0.16's Calendar-only early publication is now upstream's behaviour, so rows 2-3's ordering needs no fork code); a Calendar truncation also clears `VanishedCollection::CalendarIdentity` (250) over the same range, then calls `calendar_history_purge_pause_point` under `test_mode`. Nothing deferred to Task 4. |
+| `crates/common/src/telemetry/tracers/otel.rs` | content | Task 9 (compiles in Task 3) | resolved (Task 3a, ruling 41): v1.0.1's file as supplied (the exporter moved to the `telemetry` crate). Deferred to Task 9: row 1, at `crates/telemetry/src/otlp/resource.rs` (see `config/telemetry.rs`). |
 | `crates/dav/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies (local `calcard`, hashify 0.3, hyper 1.12) plus `vault` (row 1); `test_mode = ["common/test_mode"]` (row 2). |
 | `crates/dav/src/calendar/copy_move.rs` | content | Task 4 | open |
 | `crates/dav/src/calendar/delete.rs` | content | Task 4 | open |
@@ -3922,7 +4091,7 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/dav/src/common/propfind.rs` | modify/delete | Task 4 | open |
 | `crates/dav/src/common/uri.rs` | content | Task 4 | open |
 | `crates/dav/src/request.rs` | content | Task 4 | open |
-| `crates/directory/src/core/secret.rs` | content | Task 3 | open |
+| `crates/directory/src/core/secret.rs` | content | Task 3 | resolved (Task 3a): v1.0.1's `CryptScheme` plus row 1, `verify_totp_code`; the restored module is declared after the private slot (Task 2 handoff), its base64 helper moved to `encodify`. |
 | `crates/email/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies (mail-parser 1.0, mail-builder 2.0, local `sieve-rs` and `text-extract`, workspace rkyv) plus `vault` (row 1) and `zeroize` (row 2); `test_mode = []`, the fork's 0.16.27 declaration, for the tests manifest. |
 | `crates/email/src/message/copy.rs` | content | Task 5 | open |
 | `crates/email/src/message/index/metadata.rs` | content | Task 5 | open |
@@ -4035,6 +4204,17 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `scim::scim_tests` | Removed, with the SEL-only `tests/src/scim/mod.rs` that held it and the three dual-licensed files only it declared. | Ruling 38: SEL-only disposition (its entry and its only subject, the `scim` crate, are SEL-only); see "SEL-only removals and ruling 33". |
 | Every suite (harness) | Telemetry is enabled with `core.is_enterprise_edition()`, false without a licence, where 0.16 passed `true`. | Ruling 33: no test licence; boot does the same (`common/src/manager/boot.rs`). |
 | Every suite (harness) | The emptiness check no longer expires in-memory keys (`store_lookup_expire_all`). | 1.0 keeps no in-memory values in the data store (`InMemoryStore` has no data-store variant). |
+| `za::lease::tests::the_generic_purge_leaves_lease_keys` (common) | Runs `Store::purge_store` where 0.16 ran `InMemoryStore::purge_in_memory_store`; the control is a zero counter the purge clears, where 0.16's was an expired key of another in-memory prefix. The lease assertions are unchanged. | 1.0 has no `purge_in_memory_store` and no in-memory class in the data store (ruling 24); its generic data-store purge is `purge_store` (`store/src/dispatch/store.rs:364`). |
+| `manager::application::tests::bundles_newer_than_the_supported_major_version_are_rejected` (common, restored) | Checks `verify_manifest` on bundles with a `stalwart-app.json` manifest: no manifest, web UI 1.x, 3.x, 10.x and an unparsable version are refused; 2.x is accepted. 0.16 checked a `VERSION` file with `unsupported_bundle_version`, accepting none or 1.x. | `common/src/manager/application.rs:652-717`: bundles carry a manifest, and the web UI's major version must be 2. |
+| `manager::application::tests::*` fixture (common, restored) | The fixture builds `AppRoutes` with prerendered `index_pages` and no client template; served contents compare as `Bytes`. Assertions unchanged. | `AppRoutes` (`application.rs:76-81`) renders index pages at unpack time; `Resource<Bytes>`. |
+| `manager::application::tests::dropping_the_routes_removes_the_bundle_directory` (common, restored) | Unchanged; fails (the directory still exists right after the drop). | `TempDir`'s drop removes the directory in `spawn_blocking` when a runtime is running (`application.rs:620-631`), so the removal is not done when the test looks. |
+| `auth::oauth::registration::tests::loopback_matches_any_port` (common, restored) | Unchanged; fails (`http://127.0.0.1` does not match `http://127.0.0.1:45678`). | `loopback_redirect_parts` (`registration.rs:223-240`) needs a `/` after the host or port; a loopback URI without a path no longer matches. |
+| `auth::oauth::token::tests::*` (common, restored) | Local `seal_token` and `open_token` wrappers build a `SymmetricEncrypt` from the test key and seal with a random nonce; `RawToken` gains `grant: None`. Assertions unchanged. | `token.rs:230-310`: sealing takes a cipher and a caller-chosen nonce, and the token carries an optional grant. |
+| `auth::oauth::client_id::tests::*` (common, restored) | `scope_mask: u64` becomes `scopes: OAuthScopes`, with local scope-name constants and `OAuthScopes::parse` in place of `scopes_to_mask`; base64 from `encodify`. Assertions unchanged. | `client_id.rs:17-21`; `oauth/scope.rs`. |
+| `network::dkim::tests::*`, `auth::authentication::tests::*`, `core::secret::tests::*` (restored) | Date and base64 helpers moved to `jiff` and `encodify`. Assertions unchanged. | chrono and the base64 crate are no longer dependencies of `common` and `directory`. |
+| `auth::access_token::sharing_access_tests::shared_access_never_uses_membership_or_impersonate` (fork) | Builds `member_of` as a boxed slice and `AccessTo` with `is_writable: false`. Assertions unchanged. | `AccessTokenInner.member_of: Box<[u32]>`; `AccessTo.is_writable` (`auth/mod.rs:256-260`). |
+| `auth::vault::tests::unknown_layout_and_corruption_are_rejected_without_payload` (fork) | Serializes its archive with `Archiver::with_compression(.., Compression::None)`, as the vault now writes. Assertions unchanged. | 1.0's `Archiver::new` needs `ArchiveCompression`, which the vault crate does not implement (it does not depend on `store`). |
+| `backend::oidc::lookup::tests::extract_string_list_distinguishes_absent_from_empty` (directory, restored) | Unchanged; fails (`{"groups": []}` yields `Some(["groups"])`). | `extract_string_list` (`directory/src/backend/oidc/lookup.rs:508-519`) returns an object's keys. |
 
 ## Task 1 check
 

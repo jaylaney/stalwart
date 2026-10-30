@@ -823,8 +823,9 @@ impl Server {
                         Task::AccountMaintenance(_) => None,
                         // Not a provisioning state.
                         Task::DestroyAccount(_) => None,
-                        // A grant's cleanup on its owner's shared object:
-                        // removes data, never writes a message or an event.
+                        // Purges grantee references after a revoked share
+                        // of the owner's object; writes no message, event
+                        // or index document of its own.
                         Task::ShareRevokeCleanup(_) => None,
                         // No account.
                         Task::DmarcReport(_)
