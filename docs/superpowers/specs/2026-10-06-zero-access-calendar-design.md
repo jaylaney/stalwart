@@ -33,8 +33,9 @@ Jay's decision for the Stalwart 1.0 port
 (`2026-10-27-stalwart-1-upgrade-design.md`, "Privacy flags"): sharers can
 hide events by CLASS, as upstream 1.0 lets them, and the operator may learn
 each event's classification. Field-policy version 2 makes CLASS visible
-when its value is PUBLIC, PRIVATE or CONFIDENTIAL (sections 2 and 6). It
-takes effect with the 1.0 port; until then the fork writes version 1.
+when its value is PUBLIC, PRIVATE or CONFIDENTIAL (sections 2, 6, 11 and
+12). It takes effect with the 1.0 port, whose stores are created fresh; the
+policy version byte recorded with each object stays 1 (section 6).
 
 ## 1. Purpose
 
@@ -490,7 +491,8 @@ the request timeout. Tokens built for background tasks have none.
 Policy version 1, and version 2 from the Stalwart 1.0 port (revision 8),
 which differs from version 1 only in CLASS (below). Visibility is an
 **allowlist at three levels**:
-components, properties, and parameters of visible properties. Anything not
+components, properties, and parameters of visible properties; under
+version 2, CLASS is also allowed by its value. Anything not
 listed is sealed, including extension properties and extension parameters.
 The policy applies to every iCalendar tree the server stores: events, tasks,
 journals, and the custom timezone trees stored in collection preferences.
@@ -549,6 +551,15 @@ and a collection's display name, description, colour and dead properties.
 The policy version is recorded with each sealed object. Moving an item
 between sets is a new version applied to objects written from then on; old
 objects are never rewritten without the user's key.
+
+Version 2 is the exception: the recorded byte stays 1. That byte opens every
+key-wrap envelope (this spec's, and those of invitations, sharing rings and
+mail) and is bound into the associated data (section 7). Version 2 changes
+none of those formats. It is instead a property of the store: it applies to
+the Stalwart 1.0 port, whose stores are created fresh, so every object in
+such a store is written under version 2 and no store mixes the two. A later
+change that moves an item between sets on a store that already holds data
+needs a per-object marker again, which is a format change of its own.
 
 ## 7. Sealed storage format
 
@@ -826,7 +837,8 @@ sealed properties, repeated properties, extension parameters on DTSTART,
 comments and `X-` properties inside VTIMEZONE, and custom collection
 timezones with comments: seal then unseal reproduces every entry at its
 original index; visible properties and parameters match the allowlists
-exactly; bundle sizes are on 256-byte boundaries; component order and
+exactly (under version 2, a standard CLASS is visible and any other CLASS
+sealed); bundle sizes are on 256-byte boundaries; component order and
 `component_ids` are untouched. The caches: a key-cache entry inserted and
 never looked up again is gone after the idle timeout plus one sweep, with no
 credential presented in between; the hard cap evicts an entry that is used
@@ -899,7 +911,8 @@ one account.
 2. Sealing never adds, removes or reorders components or `component_ids`,
    and unsealing restores entries and parameters at their original indices.
 3. Visibility is an allowlist at component, property and parameter level,
-   applied to every stored iCalendar tree. Unknown items are sealed.
+   and under policy version 2 at value level for CLASS, applied to every
+   stored iCalendar tree. Unknown items are sealed.
 4. A sealed property never reaches a client. Every read site unseals or
    fails.
 5. The index builder only ever sees the stored sealed archive as `current`,

@@ -25,7 +25,10 @@ with the calendar spec at revision 8 (field-policy version 2).
 **Status:** Revision 5, proposed, 2026-10-30. It adopts
 [Fable's check of revision 4](../specs/2026-10-27-stalwart-1-upgrade-design-review-r4.md)
 and Jay's answers to its two questions; the Codex review's "Revision 4 re-review" found no
-new finding. Revision 4 adopted both re-reviews of revision 3
+new finding. The findings of
+[Fable's check of revision 5](../specs/2026-10-27-stalwart-1-upgrade-design-review-r5.md),
+none critical or high, are fixed in place, and the reviews stop there. Revision 4 adopted
+both re-reviews of revision 3
 ([Fable](../specs/2026-10-27-stalwart-1-upgrade-design-review-r3.md), and the "Revision 3
 re-review" section of the
 [Codex review](2026-10-27-stalwart-1-upgrade-codex-review-2026-10-30.md)) and Jay's answers
@@ -400,12 +403,14 @@ sharing_move_atomic,sharing_races,sharing_review,sharing_tombstones}.rs`, seal/s
     parses every container's header (`types/src/metadata/view.rs:62-69`, which also checks
     that the header's kinds equal the entries'). Its header carries `MetadataKinds::DAV`,
     and its one entry is a `Dav` entry (`EntryKind::Dav`, `view.rs:111-135`) under a
-    fork-reserved namespace and name. The entry's value holds the fork's payload version
-    byte, then the ciphertext of the original container, in an encoding that both
-    `MetadataView::from_trusted` and the checked validator accept. Fix the encoding in
-    this checkpoint's reviewed interface sheet.
-  - **Sites:** seal `next` in `dav/src/common/dead/patch.rs` (`prepare`) before
-    `change.into_write(…)`. Unseal after `.view()` in `dav/src/common/propfind/dead.rs`
+    fork-reserved namespace and name. The entry's value is a text-only DAV value (no
+    attributes or children) whose text is the base64 of the fork's payload version byte
+    followed by the ciphertext of the original container; both
+    `MetadataView::from_trusted` and the checked XML validator accept it. Record the exact
+    layout in this checkpoint's reviewed interface sheet.
+  - **Sites:** in `dav/src/common/dead/patch.rs`, `prepare` builds the edit from the stored
+    container's view (`patch.rs:132-141`). Unseal the stored container there, before the
+    edit is built, and seal `next` before `change.into_write(…)`. Unseal after `.view()` in `dav/src/common/propfind/dead.rs`
     (`dead_properties`, `dead_property_names`) and `dav/src/common/dead/containers.rs`
     (`get`, `stored_entries`). Each site is a one-line call into a fork module.
     `common/src/storage/metadata/` and `store/src/write/metadata.rs` stay upstream's and
@@ -449,20 +454,28 @@ sharing_move_atomic,sharing_races,sharing_review,sharing_tombstones}.rs`, seal/s
 - [ ] Field-policy version 2 (design: "Privacy flags"; calendar spec revision 8, Jay's
   decision): make `CLASS` visible in `seal/policy.rs` on `VEVENT`, `VTODO` and `VJOURNAL`
   when its value is `ICalendarClassification::{Public, Private, Confidential}`. Any other
-  value stays sealed, and its parameters follow the level-3 rule. Set `POLICY_VERSION = 2`;
-  the unseal path accepts 1 and 2. Upstream's `refresh_from_content`
+  value stays sealed, and its parameters follow the level-3 rule. Replace
+  `is_visible_property` with a predicate that takes the entry, so the build names each
+  caller (at main `seal/tree.rs:366, 482`, `seal/event.rs:435`, `sharing/format.rs:569` and
+  `tests/src/za/leak.rs:457`). `POLICY_VERSION` stays 1: it is the format byte of every
+  key-wrap envelope and of the associated data, and field policy 2 is a property of the
+  fresh store (design: "Version"). Upstream's `refresh_from_content`
   (`calendar/index.rs:247`) then derives the two flags from the stored tree; add no fork
-  code that computes or overrides them. Update the allowlist units
-  (`event_allowlist_matches_spec_section_6` lists `Class` as sealed today) and the leak
-  scanner's allowlist. Add these tests:
+  code that computes or overrides them. Carry `itip_ingest`'s preservation of the stored
+  classification (`calendar/itip.rs:854-875`) into the drain's hand-mirrored merge. Update
+  the allowlist units (`event_allowlist_matches_spec_section_6` lists `Class` as sealed
+  today) and the leak scanner's allowlist. Add these tests:
   - a differential sharee test: the same GET, PROPFIND, REPORT (calendar-query and
-    multiget), free-busy, COPY and LOCK requests by a sharee against a key account's shared
-    calendar and an ordinary account's, for events with `CLASS:PUBLIC`, `CLASS:PRIVATE` and
-    `CLASS:CONFIDENTIAL`, give the same status codes and the same served properties; the
-    owner sees all three in full;
+    multiget), free-busy, COPY, MOVE, LOCK, PUT, PROPPATCH and DELETE requests by a sharee
+    against a key account's shared calendar and an ordinary account's, for events with
+    `CLASS:PUBLIC`, `CLASS:PRIVATE` and `CLASS:CONFIDENTIAL`, give the same status codes
+    and the same served properties; the owner sees all three in full;
   - a store scan: each stored event's `EVENT_PRIVATE`/`EVENT_SECRET` bits match its `CLASS`
     after a PUT, a PROPPATCH, a COPY, a MOVE, a drain import and merge, and a sharee's
-    write, and after a `CLASS` change from PRIVATE to PUBLIC;
+    write, and after a `CLASS` change from PRIVATE to PUBLIC. Include an inbound update
+    whose `CLASS` differs from the stored one, through `itip_ingest` and through the
+    drain's merge: the classification it keeps and its flags both match an ordinary
+    account's;
   - the recorded limit: an event with `CLASS:X-SOMETHING` stores the value sealed, keeps
     both bits clear, and is served to the sharee in full.
 - [ ] Port all physical event/link assertions, assigned parent/document identity, conversion
@@ -963,3 +976,21 @@ closed by the rows named: R3-H1 by R4-M1 to M3, R3-M5 by R4-M4, C3-2 by R4-H1.
 | R4-L5: "region that ends at the closing brace" | Adopted: the exit region whose start and end lie on the brace, not the outer region. Design "Gates"; Tasks 1 and 7. |
 | R4-L6: keyless paths untested | Adopted: keyless reads, deletes, account destruction and quota over sealed containers. Task 4. |
 | Stopping rule | One high finding (R4-H1) was a policy choice, now made. By Jay's answer, one narrow check covers the lines revision 5 changes, then reviews stop. |
+
+### Fixed in place after the revision 5 check
+
+Findings of [Fable's check of revision 5](../specs/2026-10-27-stalwart-1-upgrade-design-review-r5.md)
+(R5): none critical or high, so by the agreed rule they are fixed here without another
+review. Its one partly resolved verdict, R4-M2, is closed by R5-M4.
+
+| Finding | Disposition |
+|---|---|
+| R5-M1: `POLICY_VERSION` is the envelope and associated-data byte | Adopted, option "separate": `POLICY_VERSION` stays 1, so no envelope, ring, inbox-item or mail format changes; field policy 2 is a property of the fresh 1.0 store. Design "Version"; calendar spec sections 6 and 7; Task 4. |
+| R5-M2: five name-only allowlist callers | Adopted: an entry-aware predicate replaces `is_visible_property`, so the build names every caller; the five at main are listed. Design; Task 4. |
+| R5-M3: calendar spec sections 7, 10, 11 and 12 | Adopted: sections 6, 11 and 12 (invariant 3) name the value rule; sections 7 and 10 stay true, since the recorded byte stays 1, and section 6 now says so. |
+| R5-M4: PROPPATCH edits the stored container | Adopted: `prepare` unseals the stored container before the edit is built. Design; Task 4. |
+| R5-L: site count | Adopted: the count is dropped; `assert_event_privacy_access`'s callers are named, and the differential test adds MOVE, PUT, PROPPATCH and DELETE. |
+| R5-L: wrapper value encoding | Adopted: a text-only DAV value holding base64 of the version byte and ciphertext. |
+| R5-L: per-document flags versus per-component `CLASS` | Adopted: the design says the flags hold the maximum over components, as upstream computes. |
+| R5-L: where the classification lands | Adopted: the tree, the row's flags, the resource cache and its swap snapshots. |
+| R5-L: the drain's mirror of `set_privacy` | Adopted: the drain's merge carries `itip_ingest`'s preservation, and the store scan includes an inbound update whose `CLASS` differs. Task 4. |

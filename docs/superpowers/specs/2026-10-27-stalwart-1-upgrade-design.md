@@ -7,7 +7,9 @@ Jay's answers to its two questions; the "Revision 4 re-review" section of the
 new finding. The main change is a visibility-policy decision: sharers can hide events by
 `CLASS`, so `CLASS` becomes visible under field-policy version 2 (calendar spec revision 8)
 and upstream's privacy filters work unchanged for key accounts. The dead-property wrapper,
-its seal sites and the COPY/MOVE re-key are now specified.
+its seal sites and the COPY/MOVE re-key are now specified. The findings of
+[Fable's check of revision 5](2026-10-27-stalwart-1-upgrade-design-review-r5.md), which
+found nothing critical or high, are fixed in place, and the reviews stop there, as agreed.
 
 Revision 4 (2026-10-30) adopted both re-reviews of revision 3
 ([Fable's](2026-10-27-stalwart-1-upgrade-design-review-r3.md) and the Codex review's
@@ -193,11 +195,16 @@ exactly the unit upstream stores.
   paths. The header `[FORMAT_VERSION, kinds, count]` (`types/src/metadata/view.rs:62-69`)
   must match the entries it holds, so the wrapper's header carries `MetadataKinds::DAV`
   (the only kind DAV writes), and its one entry is a `Dav` entry under a fork-reserved
-  namespace and name. That entry's value holds the fork's payload version byte and then the
-  ciphertext of the original container, encoded so that both the trusted and the checked
-  parsers accept it. The presence derivation reads the same header and is unchanged.
-- **Seal and unseal sites:** DAV's consumers, which hold the request's keys. Seal `next` in
-  `dav/src/common/dead/patch.rs` before `into_write`. Unseal after `.view()` in
+  namespace and name. That entry's value is a text-only DAV value, with no attributes or
+  children, whose text is the base64 of the fork's payload version byte followed by the
+  ciphertext of the original container. Both the trusted span reader and the checked XML
+  validator (`types/src/metadata/xml/view.rs`) accept that. The checked path has no
+  production caller at 1.0.1, but the format does not rely on that. The presence derivation
+  reads the same header and is unchanged.
+- **Seal and unseal sites:** DAV's consumers, which hold the request's keys. In
+  `dav/src/common/dead/patch.rs`, `prepare` reads the stored container and builds the edit
+  from its view (`patch.rs:132-141`): unseal it there, before the edit is built, and seal
+  `next` before `into_write`. Unseal after `.view()` in
   `dav/src/common/propfind/dead.rs` (`dead_properties`, `dead_property_names`) and in
   `dav/src/common/dead/containers.rs` (`get`, `stored_entries`). Each is a one-line call
   into a fork module. `common/src/storage/metadata/` and `store/src/write/metadata.rs`
@@ -312,9 +319,12 @@ the privacy check, which reads the stored flags (below) wherever upstream reads 
 `EventPrivacy` maps PUBLIC to public, CONFIDENTIAL to secret and any other value to private
 (`calendar/privacy.rs`). `refresh_from_content` stores the result as `EVENT_PRIVATE` or
 `EVENT_SECRET` in the metadata flags (`calendar/index.rs:247`), on every full write
-(`GroupwareWrite::full`). Fourteen DAV sites read those flags from the keyless resource
-cache (`dav/src/calendar/{copy_move,freebusy,get,mod,query}.rs`,
-`dav/src/common/{lock,propfind/dead,propfind/item,propfind/get}.rs`). Calendar spec
+(`GroupwareWrite::full`). DAV reads those flags from the keyless resource cache, through
+`EventPrivacy::from_flags` and `& EVENT_SECRET`
+(`dav/src/calendar/{copy_move,freebusy,get,mod,query}.rs`,
+`dav/src/common/{lock,propfind/dead,propfind/item,propfind/get}.rs`) and through the
+callers of `assert_event_privacy_access` (`dav/src/calendar/mod.rs:289`) in
+`copy_move.rs`, `delete.rs`, `proppatch.rs` and `update.rs`. Calendar spec
 revision 7 seals `CLASS`, so on a sealed tree the flags would stay clear, and the hiding
 would do nothing. 0.16.27 has no such hiding, for any account.
 
@@ -326,17 +336,31 @@ sealed. A `CLASS` with any other value stays sealed. Upstream's `refresh_from_co
 derives both flags from the stored, sealed tree on every write path, foreground or
 background, and upstream's filters read them unchanged. No fork code computes, overrides or
 re-derives the flags, so no write path can drift from the stored tree.
-- **Change:** one value-conditional entry in `groupware/src/calendar/seal/policy.rs` and
-  `POLICY_VERSION = 2`. Writers record 2. The unseal path accepts 1 and 2: a fresh 1.0 store
-  holds only version 2, but the version check stays.
-- **What the operator learns:** for each event component, whether it is public, private or
-  confidential, and when that changes.
+- **Change:** the allowlist in `groupware/src/calendar/seal/policy.rs` becomes value-aware
+  for `CLASS`. `is_visible_property(component, property)` gives way to a predicate that
+  takes the entry, so the build names every caller. At main they are `seal/tree.rs:366,
+  482`, `seal/event.rs:435`, `sharing/format.rs:569` and the leak scanner
+  (`tests/src/za/leak.rs:457`).
+- **Version:** `POLICY_VERSION` stays 1. That byte opens every key-wrap envelope (calendar,
+  invitation, sharing ring and mail) and is bound into the tree and timezone associated
+  data. The checks compare it for equality, and the bundle records no other version.
+  Bumping it would change formats that five specs describe, while field policy 2 changes no
+  format. So field policy 2 is a property of the store: a 1.0 store starts fresh, and every
+  object in it is written under policy 2. A later allowlist change on a store that holds
+  data would need a per-object marker, a format change of its own.
+- **What the operator learns:** for each event, task and journal component, whether it is
+  public, private or confidential, and when that changes. The value sits in the stored
+  tree. The most restrictive value over the components (upstream takes the maximum) also
+  sits in the metadata row's flags, the resource cache and its swap snapshots, as for an
+  ordinary account.
 - **Limits:** a `CLASS` with an extension or other non-standard value stays sealed, so its
   event is served to sharees as public, where upstream would treat it as private. Common
   clients write only the three standard values. The hiding is enforced by the server, not by
   the encryption: a grantee holds the collection key.
-- `EventPrivacy::may_be_set_by` and `set_privacy`, which stop a sharee from changing an
-  owner's classification, run on the unsealed view in the write path, before sealing.
+- `EventPrivacy::may_be_set_by`, which stops a sharee from changing an owner's
+  classification, runs on the submitted tree, and `set_privacy` on incoming iTIP content,
+  both in the keyed write path before sealing. The drain's hand-mirrored merge must carry
+  `itip_ingest`'s preservation of the stored classification (`calendar/itip.rs:854-875`).
 - **Acceptance:** the same sharee requests against a key account's shared calendar and an
   ordinary account's give the same answers, for PUBLIC, PRIVATE, CONFIDENTIAL and a
   non-standard value (the recorded limit aside). Every stored event's flags match its
