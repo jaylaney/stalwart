@@ -56,11 +56,12 @@ Usage:
 the baseline's `cohort.files` lists, the test-support files among them being those it marks
 `runtime_excluded`.
 
-`self-check` recomputes every function and compares it with the baseline:
+`self-check` recomputes the coverage-derived parts of the baseline from the exports, the merged export
+and the sources, and compares them with what the baseline records:
   - every recorded `last_statement` region (sub-test calls, helper functions, tail blocks), every
     loop-body region, every per-step count and every executed flag, in both directions for helpers
     and tail blocks (a positive body count that the baseline does not record is a mismatch);
-  - the derived fields the gates read: each call's `executed` (per step), `expected_steps` (from its
+  - the coverage-derived fields the gates read: each call's `executed` (per step), `expected_steps` (from its
     mode, env and other conditions, its cfg flag and its suite's steps and their modes), each loop
     body's `positive_at_0_16_27` and `required_in`, each helper's identity data (line, span, async,
     symbol), and the aggregate counts (`subtests.counts` and `helpers.counts`);
@@ -68,6 +69,22 @@ the baseline's `cohort.files` lists, the test-support files among them being tho
   - the cohort: every file's full and runtime-only figures and test-module spans, and both gate
     fractions (`cohort.reference.threshold` and `threshold_runtime`).
 It prints each mismatch and exits 1 if there is one.
+
+It does not check the parts of the baseline that come from elsewhere (rechecking them would need the
+cargo listings or the scan tooling, which live outside this directory):
+  - `libtest` (identifiers, status, CI selection, `net_5b914ddb5`): from the `cargo test ... -- --list`
+    and `-- --ignored --list` listings (relisted at 9a7574203 for the tests crate, the unified workspace
+    and every CI step; reused from 5b914ddb5 for the per-crate feature sets), the static test scan and
+    the 0.16.27 net's steps.tsv;
+  - `restored_tests`: from the static scan of the 9a7574203 sources, compared with v0.16.27 and v1.0.1;
+  - `dispositions`: from the design's decisions, the SPDX census, steps.tsv and the --ignored listings;
+  - the sub-test call list and each call's guards (`mode`, `cfg`, `cfg_enabled_with_default_features`,
+    `env`, `other_conditions`, `target`): from the static sub-test scan at 9a7574203 (`expected_steps`
+    is checked against them, but they are not rescanned), and `subtests.steps` and `suites`, from
+    steps.tsv;
+  - `cohort.per_crate`, `cohort.groups`, the files' region counts and `cohort.totals` beyond the two
+    fractions: from merged.files.tsv and tables.json;
+  - `provenance` and `schema`, which are text.
 """
 import argparse
 import glob

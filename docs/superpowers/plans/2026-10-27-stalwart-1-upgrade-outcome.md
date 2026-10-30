@@ -3238,21 +3238,7 @@ sheet's proposals and the inventory's findings, and 30–33 come from the task r
     `tests/qualification/tools/`. It has a self-check that reproduces every recorded
     `last_statement` region on the `5b914ddb5` sources, so Task 7 builds on the method
     rather than reimplementing it.
-33. **The test licence key is not restored** (inventory fix round 1; revised after the
-    re-review's N1). Its two `test_mode` sites sit in the SEL-only
-    `common/src/enterprise/config.rs` (`:87`, `:90` at 0.16.27). The fork doesn't edit SEL
-    code, and a licence minted by fork code would get around the licence check.
-    - **What breaks without one.** At 1.0.1 an enterprise-built server refuses `MaskedEmail`,
-      `ArchivedItem`, `Metric` and `Trace` without a licence (`assert_enterprise_object`,
-      `jmap/src/registry/mod.rs:18-42`), while the OSS build allows them. Five retained
-      non-SEL sub-tests use those objects: `system::delivery`, `system::authorization`,
-      `system::directory`, `telemetry::tracing` and `telemetry::metrics`.
-    - **What Task 2 does.** It establishes whether the retained suite builds and runs
-      without the `enterprise` feature. If it does, the harness drops the feature, which
-      matches the shipping product and also answers Review Focus 5. A retained test that
-      needs an enterprise feature gets a disposition with evidence. If the suite can't drop
-      the feature, Task 2 stops and brings the five sub-tests to the primary.
-    - No test is adapted to expect the refusal.
+
     Recorded limits of the helper gate (the re-review's N3 and N6):
     - **Locator refinements.** The locator refines the rule in four ways, none of which can
       pass a body that skipped a last statement holding code:
@@ -3270,9 +3256,30 @@ sheet's proposals and the inventory's findings, and 30–33 come from the task r
       block (six request builders that drive the race tests and six `SessionManager`
       methods) are also required to run that block's own record (`tail_block`) where it
       ran at 0.16.27, so a future that is built but never run fails.
+33. **No test licence; licensed enterprise objects take the SEL disposition** (inventory
+    fix round 1; rewritten after the re-reviews' N1 and R2-1).
+    - **No licence.** The test licence's two `test_mode` sites sit in the SEL-only
+      `common/src/enterprise/config.rs` (`:87`, `:90` at 0.16.27). The fork doesn't edit SEL
+      code, and a licence minted by fork code would get around the licence check.
+    - **What changes.** At 1.0.1 an enterprise-built server refuses `MaskedEmail`,
+      `ArchivedItem`, `Metric` and `Trace` without a licence (`assert_enterprise_object`,
+      `jmap/src/registry/mod.rs:18-42`). These objects exist only in enterprise builds, so
+      the OSS product has none of them. Five retained non-SEL sub-tests use them:
+      `system::delivery`, `system::authorization`, `system::directory`,
+      `telemetry::tracing` and `telemetry::metrics`.
+    - **The harness keeps the `enterprise` feature**, as CLAUDE.md says. Dropping it would
+      stop those five from compiling, and with them the telemetry suite, `za::disabled`'s
+      disabled-tenant case, `za::mail::delivery`'s restore-refusal case,
+      `smtp::inbound::antispam` and `scim_tests`, which design Decision 1 keeps compiling.
+    - **The licensed parts take the SEL-only disposition,** in line with Jay's decision on
+      SEL tests: they come back only if a licence is bought, and then only in a private
+      repository. Task 2 identifies each part of the five sub-tests that needs a licensed
+      object. It skips that part with an expectation-ledger entry giving this evidence, and
+      keeps the rest of each sub-test running. No part is adapted to expect the refusal.
+      If a part's subject also exists in the OSS product, Task 2 stops and brings it to the
+      primary.
 
-    Cost if wrong: if the feature can't go, the five sub-tests, or their licensed parts,
-    need a decision from Jay.
+    Cost if wrong: lost coverage of enterprise objects the OSS product doesn't ship.
 
 The inventory's findings 3–7 and 11–14 are directives to their owner tasks and need no
 choice. The baseline's observation that imap `uidbatches::test` reaches its final loop with

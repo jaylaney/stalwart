@@ -6,7 +6,9 @@ These tools compute two things for the C10 gates (rulings 7, 8, 31 and 32 in
 - the executed-sub-test rule;
 - the fork-owned cohort's coverage fractions.
 
-They read the same inputs as the committed baseline, `../baseline-0.16.27.json`, and reproduce it.
+They read the same inputs as the coverage-derived parts of the committed baseline,
+`../baseline-0.16.27.json`, and reproduce those parts. "Not checked" below lists the parts that come
+from elsewhere.
 
 - `strict_rule.py`: the command-line tool.
 - `rustscan.py`: the source scanner it uses. It finds functions, their bodies, and the top-level
@@ -130,7 +132,7 @@ python3 -I tests/qualification/tools/strict_rule.py self-check \
   - every per-step count and executed flag.
 - **Both directions** for helpers and tail blocks: a positive body count the baseline does not
   record is a mismatch.
-- **The derived fields the gates read:**
+- **The coverage-derived fields the gates read:**
   - each call's `executed`, per step;
   - each call's `expected_steps`, derived from its mode, env, other conditions and cfg flag, and
     from its suite's steps and their modes;
@@ -141,6 +143,20 @@ python3 -I tests/qualification/tools/strict_rule.py self-check \
 - **The cohort:**
   - every file's full and runtime-only figures and its test-module spans;
   - both gate fractions, `cohort.reference.threshold` and `threshold_runtime`.
+
+**Not checked.** These parts of the baseline come from elsewhere, so `self-check` does not
+recompute them. Rechecking them would need the cargo listings or the scan tooling, which live
+outside this directory.
+
+| Section | Comes from |
+|---|---|
+| `libtest`: identifiers, status, CI selection, `net_5b914ddb5` | The `cargo test ... -- --list` and `-- --ignored --list` listings (relisted at 9a7574203 for the tests crate, the unified workspace and every CI step; reused from 5b914ddb5 for the per-crate feature sets), the static test scan, and the 0.16.27 net's `steps.tsv` |
+| `restored_tests` | The static scan of the 9a7574203 sources, compared with v0.16.27 and v1.0.1 |
+| `dispositions` | The design's decisions, the SPDX census, `steps.tsv` and the `--ignored` listings |
+| The sub-test call list and each call's guards (`mode`, `cfg`, `env`, `other_conditions`, `target`) | The static sub-test scan at 9a7574203. `expected_steps` is checked against these guards, but they are not rescanned. |
+| `subtests.steps` and `subtests.suites` | `steps.tsv` |
+| `cohort.per_crate`, `cohort.groups`, each file's region counts, and `cohort.totals` beyond the two fractions | `merged.files.tsv` and `tables.json` |
+| `provenance` and `schema` | Text |
 
 It prints each mismatch and exits 1 if there is one. On the 0.16.27 inputs it takes about 50
 seconds and prints:
