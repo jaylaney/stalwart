@@ -188,7 +188,7 @@ impl<T: SessionStream> Session<T> {
                                         );
 
                                         self.write(b"220 2.0.0 Ready to start TLS.\r\n").await?;
-                                        #[cfg(any(test, stalwart_tests))]
+                                        #[cfg(any(test, feature = "test_mode"))]
                                         if self.data.helo_domain.contains("badtls") {
                                             return Err(());
                                         }
@@ -648,7 +648,6 @@ impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
                     Smtp(SmtpEvent::RawInput),
                     SpanId = self.data.session_id,
                     Size = len,
-<<<<<<< HEAD
                     Contents = if answers_334
                         || is_auth_input(&mut self.state, bytes.get(0..len).unwrap_or_default())
                         || self.data.za_key_sender()
@@ -659,15 +658,10 @@ impl<T: AsyncWrite + AsyncRead + Unpin> Session<T> {
                         ) {
                         trc::Value::redacted()
                     } else {
-                        String::from_utf8_lossy(bytes.get(0..len).unwrap_or_default())
-                            .into_owned()
-                            .into()
+                        trc::Value::from(CompactString::from(String::from_utf8_lossy(
+                            bytes.get(0..len).unwrap_or_default(),
+                        )))
                     },
-=======
-                    Contents = CompactString::from(String::from_utf8_lossy(
-                        bytes.get(0..len).unwrap_or_default()
-                    )),
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                 );
 
                 Ok(len)
@@ -794,7 +788,7 @@ fn has_auth_command<'x>(bytes: impl Iterator<Item = &'x u8>) -> bool {
 /// masked for the same reason, issue #20).
 fn is_data_input(state: &mut State, bytes: &[u8], key_rcpt: bool) -> bool {
     let partial: &[u8] = match state {
-        State::Data(_) | State::Bdat(_) | State::SkipData(..) if key_rcpt => return true,
+        State::Data(_) | State::Bdat { .. } | State::SkipData(..) if key_rcpt => return true,
         State::Request(receiver) => receiver.buf(),
         _ => &[],
     };

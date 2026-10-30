@@ -93,17 +93,6 @@ impl<T: SessionStream> Session<T> {
         }
     }
 
-<<<<<<< HEAD
-    pub async fn authenticate(&mut self, credentials: Credentials, tag: String) -> trc::Result<()> {
-        // Authenticate
-        let (access_token, session_keys) = self
-            .server
-            .authenticate_with_keys(&AuthRequest::from_credentials(
-                credentials,
-                self.session_id,
-                self.remote_addr,
-            ))
-=======
     async fn bearer_challenge(
         &mut self,
         mechanism: BearerMechanism,
@@ -127,7 +116,6 @@ impl<T: SessionStream> Session<T> {
             },
         );
         self.write_bytes(format!("+ {challenge}\r\n").into_bytes())
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
             .await
     }
 
@@ -150,54 +138,35 @@ impl<T: SessionStream> Session<T> {
     ) -> trc::Result<()> {
         // Authenticate
         let request = AuthRequest::from_credentials(credentials, self.session_id, self.remote_addr);
-        let access_token = match self.server.authenticate(&request).await {
-            Ok(authenticated) => match bearer {
-                Some(mechanism) => {
-                    match authenticated
-                        .access_token
-                        .assert_allows_oauth_scopes(OAuthScopes::MAIL)
-                    {
-                        Ok(access_token) => access_token,
-                        Err(err) => {
-                            return self
-                                .bearer_challenge(
-                                    mechanism,
-                                    BearerFailure::InsufficientScope,
-                                    Some(&request.credentials),
-                                    BearerFailure::insufficient_scope(err).id(tag.clone()),
-                                    tag,
-                                )
-                                .await;
+        let (access_token, session_keys) = match self.server.authenticate_with_keys(&request).await
+        {
+            Ok((authenticated, session_keys)) => (
+                match bearer {
+                    Some(mechanism) => {
+                        match authenticated
+                            .access_token
+                            .assert_allows_oauth_scopes(OAuthScopes::MAIL)
+                        {
+                            Ok(access_token) => access_token,
+                            Err(err) => {
+                                return self
+                                    .bearer_challenge(
+                                        mechanism,
+                                        BearerFailure::InsufficientScope,
+                                        Some(&request.credentials),
+                                        BearerFailure::insufficient_scope(err).id(tag.clone()),
+                                        tag,
+                                    )
+                                    .await;
+                            }
                         }
                     }
+                    None => authenticated.access_token,
                 }
-<<<<<<< HEAD
-
-                err.id(tag.clone())
-            })
-            .and_then(|(token, keys)| {
-                token
-                    .assert_has_permission(Permission::ImapAuthenticate)
-                    .map(|token| (token, keys))
-            })?;
-
-        // Mail spec 4: a key account's session exists only with its keys.
-        let Some(access_token) = self
-            .server
-            .za_mail_login(access_token, session_keys, self.session_id)
-            .await
-            .map_err(|err| err.id(tag.clone()))?
-        else {
-            return Err(trc::ImapEvent::Error
-                .into_err()
-                .details(ZA_MAIL_LOGIN_REFUSED)
-                .code(ResponseCode::NoPerm)
-                .id(tag));
-=======
-                None => authenticated.access_token,
-            }
-            .assert_has_permission(Permission::ImapAuthenticate)
-            .map_err(|err| err.id(tag.clone()))?,
+                .assert_has_permission(Permission::ImapAuthenticate)
+                .map_err(|err| err.id(tag.clone()))?,
+                session_keys,
+            ),
             Err(err) => {
                 let err = self.register_auth_failure(err, &tag);
                 return match (bearer, BearerFailure::from_error(&err)) {
@@ -214,7 +183,21 @@ impl<T: SessionStream> Session<T> {
                     _ => Err(err),
                 };
             }
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+        };
+
+        // Mail spec 4: a key account's session exists only with its keys,
+        // which it holds for the connection (mail spec 3.3).
+        let Some(access_token) = self
+            .server
+            .za_mail_login(access_token, session_keys, self.session_id)
+            .await
+            .map_err(|err| err.id(tag.clone()))?
+        else {
+            return Err(trc::ImapEvent::Error
+                .into_err()
+                .details(ZA_MAIL_LOGIN_REFUSED)
+                .code(ResponseCode::NoPerm)
+                .id(tag));
         };
 
         // Enforce concurrency limits

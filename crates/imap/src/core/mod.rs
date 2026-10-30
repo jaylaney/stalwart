@@ -33,13 +33,10 @@ pub mod client;
 pub mod mailbox;
 pub mod rights;
 pub mod session;
-<<<<<<< HEAD
-mod za;
-=======
 pub mod view;
+mod za;
 
 pub use view::{ItemChanges, MailboxView, Resolved, Row};
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
 #[derive(Clone)]
 pub struct ImapSessionManager {
@@ -295,18 +292,11 @@ impl<T: SessionStream> SessionData<T> {
             .renew_access_token(&self.access_token, self.remote_addr)
             .await
             .caused_by(trc::location!())
-            // Mail spec 3.3: the renewed token carries the session's keys.
+            // Mail spec 3.3, ruling 11: the renewed token carries the
+            // session's keys (R35's marker is carried by `renew_access_token`).
             .map(|token| match self.access_token.session_keys() {
                 Some(keys) => token.with_session_keys(keys.clone()),
                 None => token,
-            })
-            // Mail ruling R35: and an impersonated session stays one.
-            .map(|token| {
-                if self.access_token.za_is_impersonated() {
-                    token.with_za_impersonation()
-                } else {
-                    token
-                }
             })
     }
 

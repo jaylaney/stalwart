@@ -265,13 +265,8 @@ impl<T: SessionStream> Session<T> {
     pub async fn write_error(&self, err: trc::Error) -> bool {
         if err.should_write_err() {
             let disconnect = err.must_disconnect();
-<<<<<<< HEAD
-            let bytes = err.serialize();
-            trc::error!(self.traced_error(err).span_id(self.session_id));
-=======
             let bytes = error_response(&err);
-            trc::error!(err.span_id(self.session_id));
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+            trc::error!(self.traced_error(err).span_id(self.session_id));
 
             if let Err(err) = self.write_bytes(bytes).await {
                 trc::error!(err.span_id(self.session_id));
@@ -375,13 +370,8 @@ impl<T: SessionStream> super::SessionData<T> {
 
     pub async fn write_error(&self, err: trc::Error) -> trc::Result<()> {
         if err.should_write_err() {
-<<<<<<< HEAD
-            let bytes = err.serialize();
-            trc::error!(self.traced_error(err).span_id(self.session_id));
-=======
             let bytes = error_response(&err);
-            trc::error!(err.span_id(self.session_id));
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+            trc::error!(self.traced_error(err).span_id(self.session_id));
             self.write_bytes(bytes).await
         } else {
             trc::error!(self.traced_error(err).span_id(self.session_id));

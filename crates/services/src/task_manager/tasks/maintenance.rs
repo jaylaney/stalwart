@@ -184,10 +184,10 @@ async fn store_maintenance(server: &Server, task: &TaskStoreMaintenance) -> trc:
                 .query::<RoaringBitmap>(RegistryQuery::new(ObjectType::Account))
                 .await?
             {
-                #[cfg(stalwart_tests)]
+                #[cfg(feature = "test_mode")]
                 let status = TaskStatus::at(now);
 
-                #[cfg(not(stalwart_tests))]
+                #[cfg(not(feature = "test_mode"))]
                 let status =
                     TaskStatus::at(now + rand::RngExt::random_range(&mut rand::rng(), 0..=300));
 
@@ -274,23 +274,15 @@ async fn store_maintenance(server: &Server, task: &TaskStoreMaintenance) -> trc:
                 .await
                 .caused_by(trc::location!())?;
 
-            server
-<<<<<<< HEAD:crates/services/src/task_manager/maintenance.rs
-                .in_memory_store()
-                .purge_in_memory_store()
-                .await
-                .caused_by(trc::location!())?;
-
-            // Zero-access fork, invitations spec 6.3 step 4: the generic purge
-            // above skips UID creation leases (`KV_LOCK_ZA_UID`), so this
-            // asserting sweep is their only cleanup.
+            // Zero-access fork, invitations spec 6.3 step 4: no generic purge
+            // reaches the UID creation leases (`ZA_UID_LEASE_PREFIX` keys in
+            // `Subspace::System`, ruling 24), so this asserting sweep is their
+            // only cleanup.
             common::za::lease::sweep_expired_uid_leases(server.store())
                 .await
                 .caused_by(trc::location!())?;
 
             server
-=======
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184:crates/services/src/task_manager/tasks/maintenance.rs
                 .registry()
                 .purge_dead_nodes()
                 .await
@@ -374,7 +366,7 @@ async fn store_maintenance(server: &Server, task: &TaskStoreMaintenance) -> trc:
         | TaskStoreMaintenanceType::ResetRateLimiters
         | TaskStoreMaintenanceType::ResetBlobQuotas
         | TaskStoreMaintenanceType::RemoveAuthTokens => {
-            #[cfg(stalwart_tests)]
+            #[cfg(feature = "test_mode")]
             if let Some(test_var) = task.shard_index {
                 use crate::task_manager::outcome::{Failure, RetryClass};
 

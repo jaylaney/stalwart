@@ -77,53 +77,6 @@ impl<T: SessionStream> Session<T> {
         }
     }
 
-<<<<<<< HEAD
-    pub async fn handle_auth(&mut self, credentials: Credentials) -> trc::Result<()> {
-        // Authenticate
-        let (access_token, session_keys) = self
-            .server
-            .authenticate_with_keys(&AuthRequest::from_credentials(
-                credentials,
-                self.session_id,
-                self.remote_addr,
-            ))
-            .await
-            .map_err(|err| {
-                if err.matches(trc::EventType::Auth(trc::AuthEvent::Failed)) {
-                    match &self.state {
-                        State::NotAuthenticated {
-                            auth_failures,
-                            username,
-                        } if *auth_failures < self.server.core.imap.max_auth_failures => {
-                            self.state = State::NotAuthenticated {
-                                auth_failures: auth_failures + 1,
-                                username: username.clone(),
-                            };
-                        }
-                        _ => {
-                            return trc::AuthEvent::TooManyAttempts.into_err().caused_by(err);
-                        }
-                    }
-                }
-
-                err
-            })
-            .and_then(|(token, keys)| {
-                token
-                    .assert_has_permission(Permission::Pop3Authenticate)
-                    .map(|token| (token, keys))
-            })?;
-
-        // Mail spec 4: a key account's session exists only with its keys.
-        let Some(access_token) = self
-            .server
-            .za_mail_login(access_token, session_keys, self.session_id)
-            .await?
-        else {
-            return Err(trc::Pop3Event::Error
-                .into_err()
-                .details(ZA_MAIL_LOGIN_REFUSED));
-=======
     async fn bearer_challenge(
         &mut self,
         mechanism: BearerMechanism,
@@ -163,29 +116,33 @@ impl<T: SessionStream> Session<T> {
     ) -> trc::Result<()> {
         // Authenticate
         let request = AuthRequest::from_credentials(credentials, self.session_id, self.remote_addr);
-        let access_token = match self.server.authenticate(&request).await {
-            Ok(authenticated) => match bearer {
-                Some(mechanism) => {
-                    match authenticated
-                        .access_token
-                        .assert_allows_oauth_scopes(OAuthScopes::MAIL)
-                    {
-                        Ok(access_token) => access_token,
-                        Err(err) => {
-                            return self
-                                .bearer_challenge(
-                                    mechanism,
-                                    BearerFailure::InsufficientScope,
-                                    Some(&request.credentials),
-                                    BearerFailure::insufficient_scope(err),
-                                )
-                                .await;
+        let (access_token, session_keys) = match self.server.authenticate_with_keys(&request).await
+        {
+            Ok((authenticated, session_keys)) => (
+                match bearer {
+                    Some(mechanism) => {
+                        match authenticated
+                            .access_token
+                            .assert_allows_oauth_scopes(OAuthScopes::MAIL)
+                        {
+                            Ok(access_token) => access_token,
+                            Err(err) => {
+                                return self
+                                    .bearer_challenge(
+                                        mechanism,
+                                        BearerFailure::InsufficientScope,
+                                        Some(&request.credentials),
+                                        BearerFailure::insufficient_scope(err),
+                                    )
+                                    .await;
+                            }
                         }
                     }
+                    None => authenticated.access_token,
                 }
-                None => authenticated.access_token,
-            }
-            .assert_has_permission(Permission::Pop3Authenticate)?,
+                .assert_has_permission(Permission::Pop3Authenticate)?,
+                session_keys,
+            ),
             Err(err) => {
                 let err = self.register_auth_failure(err);
                 return match (bearer, BearerFailure::from_error(&err)) {
@@ -196,7 +153,19 @@ impl<T: SessionStream> Session<T> {
                     _ => Err(err),
                 };
             }
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+        };
+
+        // Mail spec 4: a key account's session exists only with its keys,
+        // held in `State::Authenticated` until the connection drops (mail
+        // spec 3.3).
+        let Some(access_token) = self
+            .server
+            .za_mail_login(access_token, session_keys, self.session_id)
+            .await?
+        else {
+            return Err(trc::Pop3Event::Error
+                .into_err()
+                .details(ZA_MAIL_LOGIN_REFUSED));
         };
 
         // Enforce concurrency limits

@@ -5,13 +5,8 @@
  */
 
 use crate::api::{
-<<<<<<< HEAD
     ToRequestError, notifications_into_push_objects,
     request::{RequestHandler, za_jmap_untraced},
-};
-use common::{Server, auth::AccessToken, ipc::PushNotification};
-=======
-    ToRequestError, notifications_into_push_objects, request::RequestHandler,
     session::allowed_capabilities,
 };
 use common::{
@@ -22,7 +17,6 @@ use common::{
     network::memory::MemoryClass,
 };
 use compact_str::ToCompactString;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 use futures_util::{SinkExt, StreamExt};
 use http_proto::HttpSessionData;
 use hyper::upgrade::Upgraded;
