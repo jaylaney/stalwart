@@ -82,7 +82,8 @@ Fork hooks sit in four upstream files that 1.0.1 deleted or split:
 - `crates/dav/src/common/propfind.rs` (15 call sites) became `propfind/`;
 - `crates/imap/src/op/fetch.rs` (7) became `op/fetch/`;
 - `crates/imap/src/core/message.rs` (1) became `core/view.rs`;
-- `crates/spam-filter/src/analysis/llm.rs` (1) moved into the SEL-only `common/src/enterprise/ai/`.
+- `crates/spam-filter/src/analysis/llm.rs` (1) moved into the SEL-only
+  `crates/spam-filter/src/analysis/ai/`, which calls `common/src/enterprise/ai/`.
 
 ## Scope exclusions
 
@@ -428,16 +429,18 @@ pause hook. Then:
   failed-task remedy for index work.
 - **R58's vault-absence assertion** moves to the batch the worker commits, `account_batch`
   (`store/src/search/index.rs`), not to the queue entry, which the producer writes. The
-  layering is the same as at 0.16. `store` cannot call into `common`, so the worker
-  (`services/src/index_queue/index.rs`) attaches the assertion through a store-side field on
-  the documents it passes to `index_account_documents`, and `account_batch` places it in
+  layering is the same as at 0.16. `store` cannot call into `common`, so the worker's
+  document builders (`services/src/index_queue/document.rs`, at the plain returns of
+  `build_email_document` and `build_calendar_document`) attach the assertion through a
+  store-side field on the documents that reach `index_account_documents`, and `account_batch` places it in
   every commit chunk of the batch. Task 1 found that `account_batch` does split a pass:
   `AccountIndexer::build_batch` (`store/src/search/term.rs:276-388`) adds a commit point
-  every 1000 term merges and after each `Document` key, which comes last, and
+  every 1000 term merges, and a `commit_point()` after each `Document` key, which comes
+  last and splits once the batch is large (`store/src/write/batch.rs:656-662`), and
   `write_batch` commits each chunk as its own transaction. `add_commit_point` re-emits only
   the account and collection, so one assertion would cover only the first chunk. One fork
   call after `build_batch` adds the assertion to each chunk.
-- **R62's guard and R63 retire, on corrected evidence.** At 1.0.1 the `Document` keys are
+- **R62's guard and R63 retire if Task 6 confirms the ordering.** At 1.0.1 the `Document` keys are
   written last, not in chunk 0. One partition worker runs an account's index and un-index
   entries in order, so an un-index between two chunks needs a lost cluster lease, and R58
   in every chunk then stops a superseded tail after setup. Task 6 confirms the ordering
@@ -475,10 +478,10 @@ reduced form.
     `.github/workflows/test.yml`.
   - Upstream links its tests through 562 `#[path = "…/stalwart-tests/…"]` slots that point to
     a private sibling checkout (560 at 1.0.0).
-  - 534 of the slots compile only when that crate's own tests are built. 27 are support
+  - 535 of the slots compile only when that crate's own tests are built. 27 are support
     modules compiled once the flag is set, two of them only with a store feature.
 - **What the fork has at 0.16.27:** 795 test functions.
-  - 697 are unit tests in `crates/`: 466 from upstream, 183 of those in the SEL-only scim
+  - 697 are unit tests in `crates/`: 465 from upstream, 183 of those in the SEL-only scim
     crates.
   - 98 are in the `tests` crate. Its suites make 197 sub-test calls.
   - Six tests were already `#[ignore]`d: `nlp`'s `text_classifier`, `spam-filter`'s pyzor
@@ -540,7 +543,9 @@ reduced form.
      shared file name would collide wherever sibling modules share a directory: 19
      directories at 0.16.27, `common/src/auth/oauth/` among them. The module keeps its own
      name, so its libtest identifiers are unchanged. That name is `tests`, except for five
-     modules: four named `test`, and the fork's `sharing_access_tests`. As a child module it sees the
+     modules: four named `test`, and the fork's `sharing_access_tests`. The test-support module
+     `serde_impl` (`dav-proto/src/schema/response.rs`, no tests of its own) is restored the
+     same way under its own name. As a child module it sees the
      parent's private items, as the inline module did. Task 1 records the mapping from each
      source module to its restored file.
    - A module whose subject moved follows its subject.
@@ -581,7 +586,7 @@ reduced form.
   - It fails on any status change that lacks a disposition.
   - A test ignored at 0.16.27 that is still ignored passes.
 - **Executed sub-tests.** Rerun the baseline's 19-step coverage net on the candidate. A
-  sub-test call counts as executed in a mode only if three things hold in that step's
+  sub-test call counts as executed in a step only if three things hold in that step's
   export, by llvm-cov's region counts:
   - **The body record has a positive count.** For an `async fn` sub-test, the body record
     is the async body's own record, whose first region starts after the signature. The
@@ -599,7 +604,10 @@ reduced form.
     Since a failed assertion panics, reaching the last statement and the exit region
     means every assertion before them passed.
 
-  Each call must execute in every mode where it did at 0.16.27, under the same rule. When
+  Each call must execute in every step where it did at 0.16.27, under the same rule. So
+  must every `tests/src` function that ran at 0.16.27, so that an unawaited helper future or
+  a helper's early return fails too, and a loop-tailed body's loop body must run where it
+  did (Task 1's ruling 31). When
   Task 1 recomputes the baseline, it reports every sub-test that completed at 0.16.27 but
   fails the rule, for example one whose body ends in a diverging or branching tail. Such a
   sub-test gets an explicit completion marker; the rule is not loosened.
@@ -645,8 +653,9 @@ integrated gate. `common` depends on `store` and `types`, and every later crate 
   and collection, `ZA_UID_LEASE_PREFIX`, `za_test.rs` and `has_account_search_terms`;
 - Task 3 closes with `common`;
 - Task 4 with `groupware` and `dav`;
-- Task 5 with `email`, `imap`, `jmap`, `smtp` and `pop3`;
-- Task 6 with `services` and `store`.
+- Task 5 with `email`, `imap`, `pop3`, `smtp` and `spam-filter`;
+- Task 6 with `services`, `store`, `jmap`, `http` and `managesieve`, since `jmap` depends
+  on `services` (Task 1's ruling 21).
 
 1. Approve this design and the plan.
 2. Merge the pinned release in an isolated worktree, restore the tests and the test

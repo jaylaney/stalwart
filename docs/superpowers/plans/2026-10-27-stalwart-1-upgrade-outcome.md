@@ -126,6 +126,13 @@ The merge also removes `tests` and `crates/migration` from the root workspace `m
 without a conflict, and keeps the fork's `crates/vault` member. Restoring `tests/` does not
 restore its membership, so Task 2 must add `tests` back.
 
+**Upstream changes the merge applies cleanly to fork-modified files outside `crates/`**
+(`git diff 0ddbbc1a3 df7eab1ff -- .github/ .gitignore`):
+- `.github/workflows/ci.yml`: the Docker image tags gain `type=semver,pattern=v{{major}}`
+  (near `:275`, after `v{{major}}.{{minor}}`). That is a release-identity change (C11),
+  for **Task 9**: decide whether the fork's images take a major-only tag.
+- `.gitignore`: `/target` becomes `target/`. Harmless; no owner needed.
+
 ### Hook inventory
 
 A hook is the fork's change to an upstream-owned runtime file, meaning one that exists at
@@ -134,8 +141,11 @@ that changes code. Hunks that only change `use` lines are counted separately, be
 file's category, and are not hooks. Fork-owned new files are not hooks; the module
 declarations and calls that reach them from upstream files are.
 
-Under `crates/` there are **483 hooks in 154 files**, plus 81 import-only hunks. The root
-`Cargo.toml` adds 3 more (Task 2; listed at the end of the file table).
+Under `crates/` there are **485 hooks in 154 files**, plus 81 import-only hunks. 483 are
+diff hunks. The other 2 are ruling 28's C3 hooks: the raw Authorization value that
+0.16.27 put into two errors of `http/src/auth/authenticate.rs`, which the fork removed. They
+sit inside that file's first hunk and get rows of their own (1a and 1b). The root
+`Cargo.toml` adds 3 more (Task 2; listed at the end of the file table), for 488 in all.
 
 Categories, per hook:
 - **(a)** merges clean and needs no re-read. Two kinds: `a`, the file is unchanged
@@ -143,7 +153,7 @@ Categories, per hook:
   enclosing item (41 hooks).
 - **(b)** the file changed upstream and merges clean in text, but upstream changed the
   hook's enclosing item, or lines within six of it. Needs a re-read (177 hooks).
-- **(c)** a textual conflict, with the hook's upstream item still in place (210 hooks).
+- **(c)** a textual conflict, with the hook's upstream item still in place (212 hooks).
 - **(d)** the target was deleted, split, moved or renamed (54 hooks):
   - 31 in the 5 modify/delete files;
   - 5 in the 2 renamed files (4 clean, 1 in conflict);
@@ -164,12 +174,12 @@ listed under its first-named owner):
 | Owner | Files | Hooks | (a) | (b) | (c) | (d) |
 |---|---|---|---|---|---|---|
 | Task 2 | 17 | 28 | 6 | 7 | 13 | 2 |
-| Task 3 | 31 | 116 | 19 | 38 | 50 | 9 |
+| Task 3 | 31 | 118 | 19 | 38 | 52 | 9 |
 | Task 4 | 27 | 127 | 8 | 47 | 49 | 23 |
 | Task 5 | 67 | 188 | 9 | 80 | 90 | 9 |
 | Task 6 | 9 | 21 | 0 | 4 | 6 | 11 |
 | Task 9 (identity; compiles in Task 3) | 3 | 3 | 0 | 1 | 2 | 0 |
-| **total** | **154** | **483** | **42** | **177** | **210** | **54** |
+| **total** | **154** | **485** | **42** | **177** | **212** | **54** |
 
 Files by their worst hook: 1 `a`, 11 `a*`, 44 `b`, 83 `c`, 15 `d`.
 
@@ -233,7 +243,7 @@ Every hook lands in exactly one row below. Owner, contract and guarding tests ar
 | `groupware/Cargo.toml` | 2 | top level | `vault` and crypto dependencies; `test_mode` forwards to `common` | C6, C10 | Task 2 | build | **c** (c2) |
 | `groupware/src/calendar/dates.rs` | 4 | `new`, `tz` | expansion errors traced by kind, not value; fork unit module `tests` | C3 | Task 4 | za::expansion; unit `calendar::dates::tests` | **c** (c2 b1 a*1; imports 1 (1 in conflict)) |
 | `groupware/src/calendar/itip.rs` | 9 | `pub enum ItipSendStatus`, `itip_ingest`, `http_rsvp_handle`, `http_rsvp_attendee_copy` +4 | `SendSealed` status; provisioning fence on iMIP batches; RSVP refusal for key accounts | C5, C7 | Task 4 | za::fanout, za::reply, mail::fence | **c** (c2 b2 a*5) |
-| `groupware/src/calendar/mod.rs` | 2 | `pub mod itip;`, `pub const EVENT_NOTIFICATION_IS_CHANGE: ` | fork module declarations (`seal`, `sharing`, `drain`, `fanout`, `delegation`, `pinning`, `sequence`); sealed-inbox notification flag | C6, C7 | Task 4 | build; za::inbox | **c** (c2) |
+| `groupware/src/calendar/mod.rs` | 2 | `pub mod itip;`, `pub const EVENT_NOTIFICATION_IS_CHANGE: ` | fork module declarations (`seal`, `sharing`, `drain`, `fanout`, `delegation`, `pinning`, `sequence`); the sealed-inbox flag `EVENT_NOTIFICATION_ZA_PENDING = 1 << 2`, which is 1.0.1's `EVENT_NOTIFICATION_IS_DESTROY` bit (ruling 30) | C6, C7, C9 | Task 4 | build; za::inbox, za::drain | **c** (c2) |
 | `groupware/src/calendar/storage.rs` | 12 | `update`, `insert`, `delete_with_events`, `delete` +1 | fenced rebuilds keep timestamps; key-account deletes build sealed CANCELs (`ZaDeleteMessage`) | C6, C7 | Task 4 | za::fanout, za::sharing_races, sharing_tombstones, pinning | **c** (c10 b2; imports 2 (2 in conflict)) |
 | `groupware/src/scheduling/event_cancel.rs` | 1 | `itip_cancel` | `itip_cancel_from_snapshot` split out of `itip_cancel` | C7 | Task 4 | za::sharing (delegated cancel), za::fanout | **b** (b1; imports 1 (1 in conflict)) |
 | `groupware/src/scheduling/itip.rs` | 1 | `pub(crate) const ITIP_STATUS_INVALID_USE` | status text for a recipient whose pending item was written | C7 | Task 4 | za::fanout | **a*** (a*1) |
@@ -242,7 +252,7 @@ Every hook lands in exactly one row below. Owner, contract and guarding tests ar
 | `http-proto/src/response.rs` | 2 | `new`, `body` | untraced response bodies | C3 | Task 3 | za::tracing | **a*** (a*2) |
 | `http/Cargo.toml` | 2 | top level | `vault` and `subtle` dependencies | C1 | Task 2 | build | **c** (c2) |
 | `http/src/api/mod.rs` | 4 | `pub mod diagnose;`, `handle_api_request` | routes `vault`, `contacts`, `shares`; vault and login bodies untraced | C1, C3, C7 | Task 3 (shares route: Task 4) | za::setup, password, pinning, sharing (HTTP), tracing | **c** (c1 b3; imports 1) |
-| `http/src/auth/authenticate.rs` | 2 | `authenticate_headers` | keyed-fingerprint auth cache, generation fence, key residency, impersonation marker on cached tokens; fork unit module `tests` | C1, C2, C3 | Task 3 | za::caches, za::tracing, mail::gates; unit `auth::authenticate::tests` | **c** (c1 b1) |
+| `http/src/auth/authenticate.rs` | 4 | `authenticate_headers` | keyed-fingerprint auth cache, generation fence, key residency, impersonation marker on cached tokens; no raw Authorization value in errors (ruling 28's two hooks, 1a and 1b); fork unit module `tests` | C1, C2, C3 | Task 3 | za::caches, za::tracing, mail::gates; unit `auth::authenticate::tests` | **c** (c3 b1) |
 | `http/src/auth/oauth/auth.rs` | 2 | `handle_login_request` | R36: no OAuth code for an impersonated login | C4 | Task 3 | za::mail::gates | **c** (c2) |
 | `http/src/auth/oauth/mod.rs` | 1 | `from_request` | OAuth forms read untraced (issue #20) | C3 | Task 3 | za::raw_input, za::tracing | **a*** (a*1; imports 1 (1 in conflict)) |
 | `http/src/request.rs` | 9 | `parse_http_request`, `handle_session`, `shutdown` | untraced key-account JMAP; keyless refusal 403; upload gate; streams drop keys; vault CORS | C2, C3, C5 | Task 3 (upload gate: Task 5) | za::tracing, cors, websocket, mail::uploads, mail::gates | **c** (c4 b5; imports 3 (1 in conflict)) |
@@ -350,8 +360,13 @@ Every hook lands in exactly one row below. Owner, contract and guarding tests ar
 One row per hook, grouped by file:
 - "Fork site" is the hook's first changed line at `9a7574203`.
 - "Upstream item" is the nearest enclosing or preceding item in the 0.16.27 file.
-- "v1.0.1 site" is that item's line in `v1.0.1-src/`. For (d) hooks it is the replacement
-  site, found by hand.
+- "v1.0.1 site" is that item's line in `v1.0.1-src/`, always an implementation, never a
+  trait method's declaration. 179 rows first cited a declaration; all now cite the impl,
+  in another file of the crate where the impl lives there. Where the hook's own
+  unchanged context line occurs exactly once in that impl, the site adds the insertion
+  point: "inserted after :N" (the context line just above the hunk) or "inserted before
+  :N" (the one just below). 219 rows carry one. For (d) hooks, and R36's two rows in
+  `http/src/auth/oauth/auth.rs`, the site was found by hand.
 - The preserve text is the hook's own comment where it has one; for (d) rows and thin
   hunks it was written by hand.
 
@@ -359,7 +374,7 @@ One row per hook, grouped by file:
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/common/Cargo.toml:12` | top level | b | v1.0.1-src/crates/common/Cargo.toml:1 | `vault = { path = "../vault" }` |
+| 1 | `crates/common/Cargo.toml:12` | top level | b | v1.0.1-src/crates/common/Cargo.toml:1, inserted after :15 | `vault = { path = "../vault" }` |
 | 2 | `crates/common/Cargo.toml:43` | top level | c | v1.0.1-src/crates/common/Cargo.toml:1 | `opentelemetry = { git = "https://github.com/open-telemetry/opentelemetry-rust", rev = "ae66e97b140f7` in place of `opentelemetry = { git = "https://github.com/stalwartlabs/opentelemetry-rust" }` |
 | 3 | `crates/common/Cargo.toml:93` | top level | c | v1.0.1-src/crates/common/Cargo.toml:1 | `test_mode = ["store/test_mode"]` in place of `test_mode = []` |
 
@@ -367,24 +382,24 @@ One row per hook, grouped by file:
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/common/build.rs:3` | top level | b | v1.0.1-src/crates/common/build.rs:1 | `#[path = "build_support/release.rs"]` |
+| 1 | `crates/common/build.rs:3` | top level | b | v1.0.1-src/crates/common/build.rs:1, inserted after :4 | `#[path = "build_support/release.rs"]` |
 
 #### `crates/common/src/auth/access_token.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 3 | `crates/common/src/auth/access_token.rs:121` | `build_access_token` | c | v1.0.1-src/crates/common/src/auth/access_token.rs:46 | Mail spec 6.3: a key account's mailboxes are left out of another account's listing, a grant made before it was provisioned included. The rule of ruling R34 enforces this ... |
-| 4 | `crates/common/src/auth/access_token.rs:151` | `build_access_token` | b | v1.0.1-src/crates/common/src/auth/access_token.rs:46 | `is_marker.get_or_insert(credential.secret == ::vault::ZA_MARKER);` |
+| 3 | `crates/common/src/auth/access_token.rs:121` | `build_access_token` | c | v1.0.1-src/crates/common/src/auth/access_token.rs:46, inserted before :105 | Mail spec 6.3: a key account's mailboxes are left out of another account's listing, a grant made before it was provisioned included. The rule of ruling R34 enforces this ... |
+| 4 | `crates/common/src/auth/access_token.rs:151` | `build_access_token` | b | v1.0.1-src/crates/common/src/auth/access_token.rs:46, inserted after :111 | `is_marker.get_or_insert(credential.secret == ::vault::ZA_MARKER);` |
 | 5 | `crates/common/src/auth/access_token.rs:205` | `build_access_token` | b | v1.0.1-src/crates/common/src/auth/access_token.rs:46 | A marker secret is constant, so OAuth token revocation on password change must follow the vault generation instead. |
-| 6 | `crates/common/src/auth/access_token.rs:317` | `access_token` | b | v1.0.1-src/crates/common/src/auth/access_token.rs:302 | `let epoch = self.inner.cache.account_epoch.load(Ordering::SeqCst);` |
-| 7 | `crates/common/src/auth/access_token.rs:336` | `access_token` | c | v1.0.1-src/crates/common/src/auth/access_token.rs:302 | As in `try_account`: an invalidation during the load cannot evict the placeholder, so a stale token is returned uncached. |
+| 6 | `crates/common/src/auth/access_token.rs:317` | `access_token` | b | v1.0.1-src/crates/common/src/auth/access_token.rs:302, inserted before :326 | `let epoch = self.inner.cache.account_epoch.load(Ordering::SeqCst);` |
+| 7 | `crates/common/src/auth/access_token.rs:336` | `access_token` | c | v1.0.1-src/crates/common/src/auth/access_token.rs:302, inserted after :341 | As in `try_account`: an invalidation during the load cannot evict the placeholder, so a stale token is returned uncached. |
 | 8 | `crates/common/src/auth/access_token.rs:416` | `new` | c | v1.0.1-src/crates/common/src/auth/access_token.rs:416 | The one constructor: every token starts without session keys, which only the HTTP authentication layer (spec 5) and the IMAP and POP3 logins, for the session's own token ... |
-| 9 | `crates/common/src/auth/access_token.rs:452` | `new_scoped` | c | v1.0.1-src/crates/common/src/auth/access_token.rs:433 | `.map(\|scope_idx\| AccessToken::from_parts(scope_idx, inner))` in place of `.map(\|scope_idx\| AccessToken { scope_idx, inner })` |
-| 10 | `crates/common/src/auth/access_token.rs:464` | `renew` | c | v1.0.1-src/crates/common/src/auth/access_token.rs:457 | Mail ruling R35: this copy was obtained by impersonation; the account it names is not its holder's (`za_foreign_key_account`). |
-| 12 | `crates/common/src/auth/access_token.rs:668` | `assert_is_valid` | c | v1.0.1-src/crates/common/src/auth/access_token.rs:623 | `session_keys: access_token.session_keys.take(),` |
-| 13 | `crates/common/src/auth/access_token.rs:849` | `new_admin` | c | v1.0.1-src/crates/common/src/auth/access_token.rs:872 | `AccessToken::from_parts(0, Arc::new(AccessTokenInner::new_admin()))` in place of `AccessToken {` |
-| 14 | `crates/common/src/auth/access_token.rs:860` | `from_permissions` | c | v1.0.1-src/crates/common/src/auth/access_token.rs:880 | `AccessToken::from_parts(` in place of `AccessToken {` |
-| 15 | `crates/common/src/auth/access_token.rs:876` | `from_permissions` | b | v1.0.1-src/crates/common/src/auth/access_token.rs:880 | `from_permissions` built through `AccessToken::from_parts` (the one constructor, no session keys) |
+| 9 | `crates/common/src/auth/access_token.rs:452` | `new_scoped` | c | v1.0.1-src/crates/common/src/auth/access_token.rs:433, inserted after :447 | `.map(\|scope_idx\| AccessToken::from_parts(scope_idx, inner))` in place of `.map(\|scope_idx\| AccessToken { scope_idx, inner })` |
+| 10 | `crates/common/src/auth/access_token.rs:464` | `renew` | c | v1.0.1-src/crates/common/src/auth/access_token.rs:457, inserted after :464 | Mail ruling R35: this copy was obtained by impersonation; the account it names is not its holder's (`za_foreign_key_account`). |
+| 12 | `crates/common/src/auth/access_token.rs:668` | `assert_is_valid` | c | v1.0.1-src/crates/common/src/auth/access_token.rs:623, inserted after :713 | `session_keys: access_token.session_keys.take(),` |
+| 13 | `crates/common/src/auth/access_token.rs:849` | `new_admin` | c | v1.0.1-src/crates/common/src/auth/access_token.rs:872, inserted after :872 | `AccessToken::from_parts(0, Arc::new(AccessTokenInner::new_admin()))` in place of `AccessToken {` |
+| 14 | `crates/common/src/auth/access_token.rs:860` | `from_permissions` | c | v1.0.1-src/crates/common/src/auth/access_token.rs:880, inserted after :886 | `AccessToken::from_parts(` in place of `AccessToken {` |
+| 15 | `crates/common/src/auth/access_token.rs:876` | `from_permissions` | b | v1.0.1-src/crates/common/src/auth/access_token.rs:880, inserted after :906 | `from_permissions` built through `AccessToken::from_parts` (the one constructor, no session keys) |
 | 16 | `crates/common/src/auth/access_token.rs:1027` | `hash_credential_permissions` | c | v1.0.1-src/crates/common/src/auth/access_token.rs:1183 | fork unit module `sharing_access_tests` (shared access never uses membership or impersonation); restore with the file |
 
 #### `crates/common/src/auth/authentication.rs`
@@ -398,55 +413,55 @@ One row per hook, grouped by file:
 | 7 | `crates/common/src/auth/authentication.rs:261` | `route_auth_request` | d (target moved, conflict) | v1.0.1-src/crates/common/src/auth/authentication.rs:269 (internal password check) | marker diversion: `ZA_MARKER` secret -> `za_verify_password`; `NoRecord` -> `ZA_REASON_VAULT_MISSING`; keys attached to the token for `authenticate_with_keys` |
 | 8 | `crates/common/src/auth/authentication.rs:369` | `route_auth_request` | d (target moved, conflict) | v1.0.1-src/crates/common/src/auth/authentication.rs:322-337 (master impersonation, second path) | impersonation marker on `new_maybe_invalid` tokens |
 | 9 | `crates/common/src/auth/authentication.rs:425` | `route_auth_request` | d (target moved, conflict) | v1.0.1-src/crates/common/src/auth/authentication.rs:404 (`authenticate_bearer`, before `assert_account_directory`) | `za_refuse_directory_account` on the external directory's account |
-| 10 | `crates/common/src/auth/authentication.rs:490` | `validate_credential` | b | v1.0.1-src/crates/common/src/auth/authentication.rs:544 | `let mut authenticated_as_app_password = false;` |
-| 11 | `crates/common/src/auth/authentication.rs:536` | `validate_credential` | b | v1.0.1-src/crates/common/src/auth/authentication.rs:544 | `let session_keys = if authenticated_as_app_password` |
+| 10 | `crates/common/src/auth/authentication.rs:490` | `validate_credential` | b | v1.0.1-src/crates/common/src/auth/authentication.rs:544, inserted after :559 | `let mut authenticated_as_app_password = false;` |
+| 11 | `crates/common/src/auth/authentication.rs:536` | `validate_credential` | b | v1.0.1-src/crates/common/src/auth/authentication.rs:544, inserted before :622 | `let session_keys = if authenticated_as_app_password` |
 | 12 | `crates/common/src/auth/authentication.rs:616` | `add_missing_domain` | b | v1.0.1-src/crates/common/src/auth/authentication.rs:640 (beside `resolve_domain`) or `common/src/auth/vault.rs` | the two refusal helpers; the account lookup must match `synchronize_account`'s |
 
 #### `crates/common/src/auth/mod.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/common/src/auth/mod.rs:31` | `pub mod rate_limit;` | c | v1.0.1-src/crates/common/src/auth/mod.rs:42 | fork module declaration `pub mod vault` (vault storage and verification) |
-| 2 | `crates/common/src/auth/mod.rs:90` | `pub struct AccountCache` | c | v1.0.1-src/crates/common/src/auth/mod.rs:96 | Authentication generation (vault record revision); 0 for non-key accounts. |
-| 4 | `crates/common/src/auth/mod.rs:141` | `pub struct AccessToken` | c | v1.0.1-src/crates/common/src/auth/mod.rs:182 | Resident keys for this request or mail session only (spec 5, "in-flight copies"; mail spec 3.3). |
-| 5 | `crates/common/src/auth/mod.rs:312` | `build` | c | v1.0.1-src/crates/common/src/auth/mod.rs:390 | `AccessToken::from_parts(0, self)` in place of `AccessToken {` |
-| 6 | `crates/common/src/auth/mod.rs:338` | `domain_id` | c | v1.0.1-src/crates/common/src/auth/mod.rs:431 | `pub fn is_key_account(&self) -> bool {` |
+| 1 | `crates/common/src/auth/mod.rs:31` | `pub mod rate_limit;` | c | v1.0.1-src/crates/common/src/auth/mod.rs:42, inserted after :42 | fork module declaration `pub mod vault` (vault storage and verification) |
+| 2 | `crates/common/src/auth/mod.rs:90` | `pub struct AccountCache` | c | v1.0.1-src/crates/common/src/auth/mod.rs:96, inserted after :111 | Authentication generation (vault record revision); 0 for non-key accounts. |
+| 4 | `crates/common/src/auth/mod.rs:141` | `pub struct AccessToken` | c | v1.0.1-src/crates/common/src/auth/mod.rs:182, inserted after :184 | Resident keys for this request or mail session only (spec 5, "in-flight copies"; mail spec 3.3). |
+| 5 | `crates/common/src/auth/mod.rs:312` | `build` | c | v1.0.1-src/crates/common/src/auth/mod.rs:394, inserted after :394 | `AccessToken::from_parts(0, self)` in place of `AccessToken {` |
+| 6 | `crates/common/src/auth/mod.rs:338` | `domain_id` | c | v1.0.1-src/crates/common/src/auth/mod.rs:431, inserted after :432 | `pub fn is_key_account(&self) -> bool {` |
 
 #### `crates/common/src/cache/directory.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/common/src/cache/directory.rs:20` | top level | b | v1.0.1-src/crates/common/src/cache/directory.rs:1 | Applies a directory-supplied secret to an existing account, as upstream does, except that a key account's marker is never replaced (spec 4.2): classification derives ... |
+| 1 | `crates/common/src/cache/directory.rs:20` | top level | b | v1.0.1-src/crates/common/src/cache/directory.rs:1, inserted after :22 | Applies a directory-supplied secret to an existing account, as upstream does, except that a key account's marker is never replaced (spec 4.2): classification derives ... |
 | 2 | `crates/common/src/cache/directory.rs:102` | `synchronize_account` | c | v1.0.1-src/crates/common/src/cache/directory.rs:30 | `let mut has_changes = merge_directory_secret(&mut updated_account, account.secret);` in place of `let mut has_changes = false;` |
-| 3 | `crates/common/src/cache/directory.rs:480` | `validate_address` | b | v1.0.1-src/crates/common/src/cache/directory.rs:525 | `pub(crate) async fn validate_address<'x>(` in place of `async fn validate_address<'x>(` |
+| 3 | `crates/common/src/cache/directory.rs:480` | `validate_address` | b | v1.0.1-src/crates/common/src/cache/directory.rs:525, inserted before :527 | `pub(crate) async fn validate_address<'x>(` in place of `async fn validate_address<'x>(` |
 
 #### `crates/common/src/cache/invalidate.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/common/src/cache/invalidate.rs:327` | `invalidate_all_local_caches` | b | v1.0.1-src/crates/common/src/cache/invalidate.rs:505 | Before the clears: a loader in flight must not republish (see `try_account`). |
-| 2 | `crates/common/src/cache/invalidate.rs:345` | `invalidate_all_local_caches` | c | v1.0.1-src/crates/common/src/cache/invalidate.rs:505 | Cached authentication is trusted only up to a generation; a global invalidation must drop it together with the resident keys. |
-| 3 | `crates/common/src/cache/invalidate.rs:376` | `invalidate_local_caches` | c | v1.0.1-src/crates/common/src/cache/invalidate.rs:549 | bump `account_epoch` before a local `Account`/`AccessToken` invalidation |
-| 4 | `crates/common/src/cache/invalidate.rs:395` | `invalidate_local_caches` | c | v1.0.1-src/crates/common/src/cache/invalidate.rs:549 | Set order is arbitrary: drop HTTP auth here too, or an entry cached between the AccessToken and Account arms survives. |
+| 1 | `crates/common/src/cache/invalidate.rs:327` | `invalidate_all_local_caches` | b | v1.0.1-src/crates/common/src/cache/invalidate.rs:505, inserted after :506 | Before the clears: a loader in flight must not republish (see `try_account`). |
+| 2 | `crates/common/src/cache/invalidate.rs:345` | `invalidate_all_local_caches` | c | v1.0.1-src/crates/common/src/cache/invalidate.rs:505, inserted after :526 | Cached authentication is trusted only up to a generation; a global invalidation must drop it together with the resident keys. |
+| 3 | `crates/common/src/cache/invalidate.rs:376` | `invalidate_local_caches` | c | v1.0.1-src/crates/common/src/cache/invalidate.rs:549, inserted after :567 | bump `account_epoch` before a local `Account`/`AccessToken` invalidation |
+| 4 | `crates/common/src/cache/invalidate.rs:395` | `invalidate_local_caches` | c | v1.0.1-src/crates/common/src/cache/invalidate.rs:549, inserted after :588 | Set order is arbitrary: drop HTTP auth here too, or an entry cached between the AccessToken and Account arms survives. |
 
 #### `crates/common/src/cache/principals.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 3 | `crates/common/src/cache/principals.rs:50` | `domain` | b | v1.0.1-src/crates/common/src/cache/principals.rs:70 | Zero-access fork: `quiet` skips the cache events that carry the name. |
-| 4 | `crates/common/src/cache/principals.rs:66` | `domain` | c | v1.0.1-src/crates/common/src/cache/principals.rs:70 | the trace `Store(StoreEvent::CacheHit)` is emitted only when not `quiet` (fork quiet resolution) |
-| 5 | `crates/common/src/cache/principals.rs:123` | `domain` | c | v1.0.1-src/crates/common/src/cache/principals.rs:70 | the trace `Store(StoreEvent::CacheMiss)` is emitted only when not `quiet` (fork quiet resolution) |
-| 6 | `crates/common/src/cache/principals.rs:236` | `rcpt_id_from_parts` | c | v1.0.1-src/crates/common/src/cache/principals.rs:229 | Zero-access fork: `quiet` skips the cache events that carry the local part. |
-| 7 | `crates/common/src/cache/principals.rs:268` | `rcpt_id_from_parts` | c | v1.0.1-src/crates/common/src/cache/principals.rs:229 | the trace `Store(StoreEvent::CacheMiss)` is emitted only when not `quiet` (fork quiet resolution) |
+| 3 | `crates/common/src/cache/principals.rs:50` | `domain` | b | v1.0.1-src/crates/common/src/cache/principals.rs:70, inserted after :70 | Zero-access fork: `quiet` skips the cache events that carry the name. |
+| 4 | `crates/common/src/cache/principals.rs:66` | `domain` | c | v1.0.1-src/crates/common/src/cache/principals.rs:70, inserted after :77 | the trace `Store(StoreEvent::CacheHit)` is emitted only when not `quiet` (fork quiet resolution) |
+| 5 | `crates/common/src/cache/principals.rs:123` | `domain` | c | v1.0.1-src/crates/common/src/cache/principals.rs:70, inserted after :122 | the trace `Store(StoreEvent::CacheMiss)` is emitted only when not `quiet` (fork quiet resolution) |
+| 6 | `crates/common/src/cache/principals.rs:236` | `rcpt_id_from_parts` | c | v1.0.1-src/crates/common/src/cache/principals.rs:229, inserted after :232 | Zero-access fork: `quiet` skips the cache events that carry the local part. |
+| 7 | `crates/common/src/cache/principals.rs:268` | `rcpt_id_from_parts` | c | v1.0.1-src/crates/common/src/cache/principals.rs:229, inserted after :248 | the trace `Store(StoreEvent::CacheMiss)` is emitted only when not `quiet` (fork quiet resolution) |
 | 8 | `crates/common/src/cache/principals.rs:344` | `rcpt_id_from_parts` | c | v1.0.1-src/crates/common/src/cache/principals.rs:229 | the trace `Store(StoreEvent::CacheHit)` is emitted only when not `quiet` (fork quiet resolution) |
-| 9 | `crates/common/src/cache/principals.rs:400` | `account` | c | v1.0.1-src/crates/common/src/cache/principals.rs:349 | `AccountCache` built with `za_generation: 0` and no public key for a plain account |
-| 10 | `crates/common/src/cache/principals.rs:436` | `try_account` | b | v1.0.1-src/crates/common/src/cache/principals.rs:385 | `let epoch = self.inner.cache.account_epoch.load(Ordering::SeqCst);` |
+| 9 | `crates/common/src/cache/principals.rs:400` | `account` | c | v1.0.1-src/crates/common/src/cache/principals.rs:349, inserted after :373 | `AccountCache` built with `za_generation: 0` and no public key for a plain account |
+| 10 | `crates/common/src/cache/principals.rs:436` | `try_account` | b | v1.0.1-src/crates/common/src/cache/principals.rs:385, inserted before :401 | `let epoch = self.inner.cache.account_epoch.load(Ordering::SeqCst);` |
 | 11 | `crates/common/src/cache/principals.rs:461` | `try_account` | b | v1.0.1-src/crates/common/src/cache/principals.rs:385 | Before `account` is partially moved below. |
-| 12 | `crates/common/src/cache/principals.rs:502` | `try_account` | b | v1.0.1-src/crates/common/src/cache/principals.rs:385 | loader sets `ACCOUNT_IS_KEY_ACCOUNT` (`1 << 9`) from the vault record |
-| 13 | `crates/common/src/cache/principals.rs:588` | `try_account` | c | v1.0.1-src/crates/common/src/cache/principals.rs:385 | loader carries `za_generation` and `za_public_key` into the cached account |
-| 14 | `crates/common/src/cache/principals.rs:649` | `try_account` | c | v1.0.1-src/crates/common/src/cache/principals.rs:385 | quick_cache's `remove` is a no-op on a pending placeholder, so an invalidation during this load cannot evict what we would publish: if one ran since the read, return the ... |
-| 15 | `crates/common/src/cache/principals.rs:692` | `account_id_from_email` | c | v1.0.1-src/crates/common/src/cache/principals.rs:632 | Zero-access fan-out: `account_id_from_email(address, true)` without the cache events that carry the address (invitations spec 10). |
-| 16 | `crates/common/src/cache/principals.rs:790` | `account_id_from_email` | b | v1.0.1-src/crates/common/src/cache/principals.rs:632 | `.rcpt_id_from_parts_inner(local_part.as_ref(), domain.id, quiet)` in place of `.rcpt_id_from_parts(local_part.as_ref(), domain.id)` |
+| 12 | `crates/common/src/cache/principals.rs:502` | `try_account` | b | v1.0.1-src/crates/common/src/cache/principals.rs:385, inserted after :437 | loader sets `ACCOUNT_IS_KEY_ACCOUNT` (`1 << 9`) from the vault record |
+| 13 | `crates/common/src/cache/principals.rs:588` | `try_account` | c | v1.0.1-src/crates/common/src/cache/principals.rs:385, inserted before :544 | loader carries `za_generation` and `za_public_key` into the cached account |
+| 14 | `crates/common/src/cache/principals.rs:649` | `try_account` | c | v1.0.1-src/crates/common/src/cache/principals.rs:385, inserted before :611 | quick_cache's `remove` is a no-op on a pending placeholder, so an invalidation during this load cannot evict what we would publish: if one ran since the read, return the ... |
+| 15 | `crates/common/src/cache/principals.rs:692` | `account_id_from_email` | c | v1.0.1-src/crates/common/src/cache/principals.rs:632, inserted after :635 | Zero-access fan-out: `account_id_from_email(address, true)` without the cache events that carry the address (invitations spec 10). |
+| 16 | `crates/common/src/cache/principals.rs:790` | `account_id_from_email` | b | v1.0.1-src/crates/common/src/cache/principals.rs:632, inserted after :685 | `.rcpt_id_from_parts_inner(local_part.as_ref(), domain.id, quiet)` in place of `.rcpt_id_from_parts(local_part.as_ref(), domain.id)` |
 
 #### `crates/common/src/config/inner.rs`
 
@@ -464,7 +479,7 @@ One row per hook, grouped by file:
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/common/src/expr/eval.rs:26` | `eval_if` | c | v1.0.1-src/crates/common/src/expr/eval.rs:25 | Zero-access fan-out: `eval_if` without the trace that carries the evaluation result (invitations spec 10). |
+| 1 | `crates/common/src/expr/eval.rs:26` | `eval_if` | c | v1.0.1-src/crates/common/src/expr/eval.rs:25, inserted after :30 | Zero-access fan-out: `eval_if` without the trace that carries the evaluation result (invitations spec 10). |
 | 2 | `crates/common/src/expr/eval.rs:78` | `eval_if` | c | v1.0.1-src/crates/common/src/expr/eval.rs:25 | the trace `Eval(EvalEvent::Result)` is emitted only when not `quiet` (fork quiet resolution) |
 | 3 | `crates/common/src/expr/eval.rs:104` | `eval_if` | c | v1.0.1-src/crates/common/src/expr/eval.rs:25 | the trace `Eval(EvalEvent::Error)` is emitted only when not `quiet` (fork quiet resolution) |
 
@@ -480,35 +495,35 @@ One row per hook, grouped by file:
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/common/src/manager/boot.rs:86` | `init` | b | v1.0.1-src/crates/common/src/manager/boot.rs:70 | `println!("{}", crate::version::BUILD_IDENTITY);` in place of `println!("{}", env!("CARGO_PKG_VERSION"));` |
+| 2 | `crates/common/src/manager/boot.rs:86` | `init` | b | v1.0.1-src/crates/common/src/manager/boot.rs:70, inserted after :93 | `println!("{}", crate::version::BUILD_IDENTITY);` in place of `println!("{}", env!("CARGO_PKG_VERSION"));` |
 | 3 | `crates/common/src/manager/boot.rs:170` | `init` | c | v1.0.1-src/crates/common/src/manager/boot.rs:70 | Effective zero-access key cache settings (no secrets). |
 
 #### `crates/common/src/manager/console.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/common/src/manager/console.rs:12` | `const HELP: &str = concat!(` | b | v1.0.1-src/crates/common/src/manager/console.rs:14 | `env!("STALWART_BUILD_IDENTITY"),` in place of `Stalwart Server v,` |
+| 1 | `crates/common/src/manager/console.rs:12` | `const HELP: &str = concat!(` | b | v1.0.1-src/crates/common/src/manager/console.rs:14, inserted after :14 | `env!("STALWART_BUILD_IDENTITY"),` in place of `Stalwart Server v,` |
 
 #### `crates/common/src/scripts/plugins/lookup.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/common/src/scripts/plugins/lookup.rs:102` | `exec_local_domain` | b | v1.0.1-src/crates/common/src/scripts/plugins/lookup.rs:111 | Mail ruling R59: the quiet lookup of R56, whose cache events do not carry the name. |
+| 1 | `crates/common/src/scripts/plugins/lookup.rs:102` | `exec_local_domain` | b | v1.0.1-src/crates/common/src/scripts/plugins/lookup.rs:111, inserted after :114 | Mail ruling R59: the quiet lookup of R56, whose cache events do not carry the name. |
 
 #### `crates/common/src/scripts/plugins/mod.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/common/src/scripts/plugins/mod.rs:29` | `pub struct PluginContext<'x>` | c | v1.0.1-src/crates/common/src/scripts/plugins/mod.rs:25 | Mail ruling R59: a key account's message or transaction; the plugin traces carry no value the script evaluated. |
-| 2 | `crates/common/src/scripts/plugins/mod.rs:82` | `run_plugin` | b | v1.0.1-src/crates/common/src/scripts/plugins/mod.rs:75 | `let za_redact = ctx.za_redact;` |
-| 3 | `crates/common/src/scripts/plugins/mod.rs:103` | `run_plugin` | b | v1.0.1-src/crates/common/src/scripts/plugins/mod.rs:75 | Mail ruling R59: a plugin's error can carry its arguments (a store name, a command, a URL) or a value a backend quotes, so under `za_redact` only its type is traced. |
+| 1 | `crates/common/src/scripts/plugins/mod.rs:29` | `pub struct PluginContext<'x>` | c | v1.0.1-src/crates/common/src/scripts/plugins/mod.rs:25, inserted before :34 | Mail ruling R59: a key account's message or transaction; the plugin traces carry no value the script evaluated. |
+| 2 | `crates/common/src/scripts/plugins/mod.rs:82` | `run_plugin` | b | v1.0.1-src/crates/common/src/scripts/plugins/mod.rs:75, inserted after :81 | `let za_redact = ctx.za_redact;` |
+| 3 | `crates/common/src/scripts/plugins/mod.rs:103` | `run_plugin` | b | v1.0.1-src/crates/common/src/scripts/plugins/mod.rs:75, inserted after :101 | Mail ruling R59: a plugin's error can carry its arguments (a store name, a command, a URL) or a value a backend quotes, so under `za_redact` only its type is traced. |
 
 #### `crates/common/src/storage/transaction.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
 | 2 | `crates/common/src/storage/transaction.rs:111` | `delete_changes` | c | v1.0.1-src/crates/common/src/storage/transaction.rs:116 | Prepare the truncation entry without changing other collections' order. |
-| 3 | `crates/common/src/storage/transaction.rs:154` | `delete_changes` | c | v1.0.1-src/crates/common/src/storage/transaction.rs:116 | Other collections retain their existing late publication order. |
+| 3 | `crates/common/src/storage/transaction.rs:154` | `delete_changes` | c | v1.0.1-src/crates/common/src/storage/transaction.rs:116, inserted after :142 | Other collections retain their existing late publication order. |
 
 #### `crates/common/src/telemetry/tracers/otel.rs`
 
@@ -520,121 +535,121 @@ One row per hook, grouped by file:
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/dav/Cargo.toml:14` | top level | c | v1.0.1-src/crates/dav/Cargo.toml:1 | `vault = { path = "../vault" }` |
-| 2 | `crates/dav/Cargo.toml:26` | top level | c | v1.0.1-src/crates/dav/Cargo.toml:1 | `test_mode = ["common/test_mode"]` in place of `test_mode = []` |
+| 1 | `crates/dav/Cargo.toml:14` | top level | c | v1.0.1-src/crates/dav/Cargo.toml:1, inserted after :17 | `vault = { path = "../vault" }` |
+| 2 | `crates/dav/Cargo.toml:26` | top level | c | v1.0.1-src/crates/dav/Cargo.toml:1, inserted after :26 | `test_mode = ["common/test_mode"]` in place of `test_mode = []` |
 
 #### `crates/dav/src/calendar/copy_move.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 3 | `crates/dav/src/calendar/copy_move.rs:119` | `handle_calendar_copy_move_request` | c | v1.0.1-src/crates/dav/src/calendar/copy_move.rs:59 | `self.za_refuse_cross_account(from_account_id, to_account_id)` |
-| 4 | `crates/dav/src/calendar/copy_move.rs:281` | `handle_calendar_copy_move_request` | b | v1.0.1-src/crates/dav/src/calendar/copy_move.rs:59 | `from_calendar_id` passed to `copy_event` (the source calendar's key for reseal) |
-| 5 | `crates/dav/src/calendar/copy_move.rs:362` | `handle_calendar_copy_move_request` | b | v1.0.1-src/crates/dav/src/calendar/copy_move.rs:59 | `from_calendar_id` passed to `move_event` |
-| 6 | `crates/dav/src/calendar/copy_move.rs:466` | `copy_event` | b | v1.0.1-src/crates/dav/src/calendar/copy_move.rs:597 | `if let Some(keys) = super::za_writer_keys(server, access_token, from_account_id).await? {` |
-| 7 | `crates/dav/src/calendar/copy_move.rs:627` | `move_event` | b | v1.0.1-src/crates/dav/src/calendar/copy_move.rs:860 | `if let Some(keys) = super::za_writer_keys(server, access_token, from_account_id).await? {` |
+| 3 | `crates/dav/src/calendar/copy_move.rs:119` | `handle_calendar_copy_move_request` | c | v1.0.1-src/crates/dav/src/calendar/copy_move.rs:68, inserted before :159 | `self.za_refuse_cross_account(from_account_id, to_account_id)` |
+| 4 | `crates/dav/src/calendar/copy_move.rs:281` | `handle_calendar_copy_move_request` | b | v1.0.1-src/crates/dav/src/calendar/copy_move.rs:68 | `from_calendar_id` passed to `copy_event` (the source calendar's key for reseal) |
+| 5 | `crates/dav/src/calendar/copy_move.rs:362` | `handle_calendar_copy_move_request` | b | v1.0.1-src/crates/dav/src/calendar/copy_move.rs:68 | `from_calendar_id` passed to `move_event` |
+| 6 | `crates/dav/src/calendar/copy_move.rs:466` | `copy_event` | b | v1.0.1-src/crates/dav/src/calendar/copy_move.rs:597, inserted after :602 | `if let Some(keys) = super::za_writer_keys(server, access_token, from_account_id).await? {` |
+| 7 | `crates/dav/src/calendar/copy_move.rs:627` | `move_event` | b | v1.0.1-src/crates/dav/src/calendar/copy_move.rs:860, inserted after :873 | `if let Some(keys) = super::za_writer_keys(server, access_token, from_account_id).await? {` |
 | 8 | `crates/dav/src/calendar/copy_move.rs:726` | `move_event` | b | v1.0.1-src/crates/dav/src/calendar/copy_move.rs:860 | `batch.log_calendar_vanished(from_calendar_id, from_resource_path);` in place of `batch.log_vanished_item(VanishedCollection::Calendar, from_resource_path);` |
-| 9 | `crates/dav/src/calendar/copy_move.rs:818` | `rename_event` | b | v1.0.1-src/crates/dav/src/calendar/copy_move.rs:1193 | `if let Some(keys) = super::za_writer_keys(server, access_token, account_id).await? {` |
-| 10 | `crates/dav/src/calendar/copy_move.rs:871` | `rename_event` | b | v1.0.1-src/crates/dav/src/calendar/copy_move.rs:1193 | `batch.log_calendar_vanished(calendar_id, from_resource_path);` in place of `batch.log_vanished_item(VanishedCollection::Calendar, from_resource_path);` |
-| 11 | `crates/dav/src/calendar/copy_move.rs:895` | `copy_container` | b | v1.0.1-src/crates/dav/src/calendar/copy_move.rs:1249 | `if let Some(keys) = super::za_writer_keys(server, access_token, from_account_id).await? {` |
-| 12 | `crates/dav/src/calendar/copy_move.rs:1152` | `rename_container` | b | v1.0.1-src/crates/dav/src/calendar/copy_move.rs:1712 | `let context = crate::common::za::za_mutation_context(` |
-| 13 | `crates/dav/src/calendar/copy_move.rs:1172` | `rename_container` | b | v1.0.1-src/crates/dav/src/calendar/copy_move.rs:1712 | rename uses the context's freshly read calendar archive, not the cached one |
-| 14 | `crates/dav/src/calendar/copy_move.rs:1183` | `rename_container` | b | v1.0.1-src/crates/dav/src/calendar/copy_move.rs:1712 | `groupware::calendar::sharing::boundary::mark_boundary_pending(` |
+| 9 | `crates/dav/src/calendar/copy_move.rs:818` | `rename_event` | b | v1.0.1-src/crates/dav/src/calendar/copy_move.rs:1193, inserted after :1201 | `if let Some(keys) = super::za_writer_keys(server, access_token, account_id).await? {` |
+| 10 | `crates/dav/src/calendar/copy_move.rs:871` | `rename_event` | b | v1.0.1-src/crates/dav/src/calendar/copy_move.rs:1193, inserted before :1241 | `batch.log_calendar_vanished(calendar_id, from_resource_path);` in place of `batch.log_vanished_item(VanishedCollection::Calendar, from_resource_path);` |
+| 11 | `crates/dav/src/calendar/copy_move.rs:895` | `copy_container` | b | v1.0.1-src/crates/dav/src/calendar/copy_move.rs:1249, inserted after :1263 | `if let Some(keys) = super::za_writer_keys(server, access_token, from_account_id).await? {` |
+| 12 | `crates/dav/src/calendar/copy_move.rs:1152` | `rename_container` | b | v1.0.1-src/crates/dav/src/calendar/copy_move.rs:1712, inserted after :1719 | `let context = crate::common::za::za_mutation_context(` |
+| 13 | `crates/dav/src/calendar/copy_move.rs:1172` | `rename_container` | b | v1.0.1-src/crates/dav/src/calendar/copy_move.rs:1712, inserted after :1730 | rename uses the context's freshly read calendar archive, not the cached one |
+| 14 | `crates/dav/src/calendar/copy_move.rs:1183` | `rename_container` | b | v1.0.1-src/crates/dav/src/calendar/copy_move.rs:1712, inserted after :1737 | `groupware::calendar::sharing::boundary::mark_boundary_pending(` |
 | 15 | `crates/dav/src/calendar/copy_move.rs:1204` | `rename_container` | c | v1.0.1-src/crates/dav/src/calendar/copy_move.rs:1712 | COPY has an operation-specific 403 contract. Do not pass it through the seal/write resolver helper, whose shared-linked refusal is a PUT's 409. |
 
 #### `crates/dav/src/calendar/delete.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 3 | `crates/dav/src/calendar/delete.rs:85` | `handle_calendar_delete_request` | c | v1.0.1-src/crates/dav/src/calendar/delete.rs:46 | Invitations spec 5.5: a key account's CANCELs and declines are built from the unsealed stored tree and go to the fan-out. |
-| 4 | `crates/dav/src/calendar/delete.rs:159` | `handle_calendar_delete_request` | b | v1.0.1-src/crates/dav/src/calendar/delete.rs:46 | Even collection deletion uses the fresh exact-principal grant. |
-| 5 | `crates/dav/src/calendar/delete.rs:209` | `handle_calendar_delete_request` | c | v1.0.1-src/crates/dav/src/calendar/delete.rs:46 | `za_messages = DestroyArchive(calendar)` in place of `DestroyArchive(calendar)` |
-| 6 | `crates/dav/src/calendar/delete.rs:222` | `handle_calendar_delete_request` | b | v1.0.1-src/crates/dav/src/calendar/delete.rs:46 | session keys passed to `delete_with_events_za` (sealed CANCELs) |
-| 7 | `crates/dav/src/calendar/delete.rs:294` | `handle_calendar_delete_request` | c | v1.0.1-src/crates/dav/src/calendar/delete.rs:46 | Spec 5.4: the items first, immediately before the commit. |
+| 3 | `crates/dav/src/calendar/delete.rs:85` | `handle_calendar_delete_request` | c | v1.0.1-src/crates/dav/src/calendar/delete.rs:54, inserted before :91 | Invitations spec 5.5: a key account's CANCELs and declines are built from the unsealed stored tree and go to the fan-out. |
+| 4 | `crates/dav/src/calendar/delete.rs:159` | `handle_calendar_delete_request` | b | v1.0.1-src/crates/dav/src/calendar/delete.rs:54 | Even collection deletion uses the fresh exact-principal grant. |
+| 5 | `crates/dav/src/calendar/delete.rs:209` | `handle_calendar_delete_request` | c | v1.0.1-src/crates/dav/src/calendar/delete.rs:54, inserted after :156 | `za_messages = DestroyArchive(calendar)` in place of `DestroyArchive(calendar)` |
+| 6 | `crates/dav/src/calendar/delete.rs:222` | `handle_calendar_delete_request` | b | v1.0.1-src/crates/dav/src/calendar/delete.rs:54 | session keys passed to `delete_with_events_za` (sealed CANCELs) |
+| 7 | `crates/dav/src/calendar/delete.rs:294` | `handle_calendar_delete_request` | c | v1.0.1-src/crates/dav/src/calendar/delete.rs:54, inserted after :291 | Spec 5.4: the items first, immediately before the commit. |
 
 #### `crates/dav/src/calendar/freebusy.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/dav/src/calendar/freebusy.rs:165` | `build_freebusy_object` | c | v1.0.1-src/crates/dav/src/calendar/freebusy.rs:57 | Ruling R6: a key account's busy times come from unsealed events, or are not reported at all when this session lacks its keys. |
-| 3 | `crates/dav/src/calendar/freebusy.rs:193` | `build_freebusy_object` | c | v1.0.1-src/crates/dav/src/calendar/freebusy.rs:57 | `let view_ = if za_keys.is_some() {` in place of `let event = archive` |
-| 4 | `crates/dav/src/calendar/freebusy.rs:238` | `build_freebusy_object` | c | v1.0.1-src/crates/dav/src/calendar/freebusy.rs:57 | `let events = CalendarQueryHandler::new(` in place of `let events =` |
+| 2 | `crates/dav/src/calendar/freebusy.rs:165` | `build_freebusy_object` | c | v1.0.1-src/crates/dav/src/calendar/freebusy.rs:140 | Ruling R6: a key account's busy times come from unsealed events, or are not reported at all when this session lacks its keys. |
+| 3 | `crates/dav/src/calendar/freebusy.rs:193` | `build_freebusy_object` | c | v1.0.1-src/crates/dav/src/calendar/freebusy.rs:140 | `let view_ = if za_keys.is_some() {` in place of `let event = archive` |
+| 4 | `crates/dav/src/calendar/freebusy.rs:238` | `build_freebusy_object` | c | v1.0.1-src/crates/dav/src/calendar/freebusy.rs:140 | `let events = CalendarQueryHandler::new(` in place of `let events =` |
 
 #### `crates/dav/src/calendar/get.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/dav/src/calendar/get.rs:91` | `handle_calendar_get_request` | c | v1.0.1-src/crates/dav/src/calendar/get.rs:39 | `let view_ = za_read_event_view(` in place of `let event = event_` |
+| 2 | `crates/dav/src/calendar/get.rs:91` | `handle_calendar_get_request` | c | v1.0.1-src/crates/dav/src/calendar/get.rs:48, inserted after :74 | `let view_ = za_read_event_view(` in place of `let event = event_` |
 
 #### `crates/dav/src/calendar/mkcol.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 3 | `crates/dav/src/calendar/mkcol.rs:54` | `handle_calendar_mkcol_request` | b | v1.0.1-src/crates/dav/src/calendar/mkcol.rs:37 | `let za_keys = self.za_session_keys(access_token, account_id).await?;` |
-| 4 | `crates/dav/src/calendar/mkcol.rs:127` | `handle_calendar_mkcol_request` | b | v1.0.1-src/crates/dav/src/calendar/mkcol.rs:37 | `if let Some(keys) = &za_keys {` |
+| 3 | `crates/dav/src/calendar/mkcol.rs:54` | `handle_calendar_mkcol_request` | b | v1.0.1-src/crates/dav/src/calendar/mkcol.rs:46, inserted after :57 | `let za_keys = self.za_session_keys(access_token, account_id).await?;` |
+| 4 | `crates/dav/src/calendar/mkcol.rs:127` | `handle_calendar_mkcol_request` | b | v1.0.1-src/crates/dav/src/calendar/mkcol.rs:46 | `if let Some(keys) = &za_keys {` |
 
 #### `crates/dav/src/calendar/mod.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
 | 2 | `crates/dav/src/calendar/mod.rs:128` | `assert_is_unique_uid` | b | v1.0.1-src/crates/dav/src/calendar/mod.rs:115 | Invitations spec 5.1, 6.3 step 1: takes the UID creation lease for a key account's PUT create, then checks the UID against current archives (`za_assert_is_unique_uid`) ... |
-| 3 | `crates/dav/src/calendar/mod.rs:358` | `failed_precondition` | b | v1.0.1-src/crates/dav/src/calendar/mod.rs:479 | Mutation adapters always resolve fresh state; response memos are read-only. |
+| 3 | `crates/dav/src/calendar/mod.rs:358` | `failed_precondition` | b | v1.0.1-src/crates/dav/src/calendar/mod.rs:483 | Mutation adapters always resolve fresh state; response memos are read-only. |
 
 #### `crates/dav/src/calendar/proppatch.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 3 | `crates/dav/src/calendar/proppatch.rs:89` | `handle_calendar_proppatch_request` | b | v1.0.1-src/crates/dav/src/calendar/proppatch.rs:56 | `super::za_writer_keys(self, access_token, account_id).await?;` |
-| 4 | `crates/dav/src/calendar/proppatch.rs:138` | `handle_calendar_proppatch_request` | b | v1.0.1-src/crates/dav/src/calendar/proppatch.rs:56 | Calendar properties write only this principal's personal bundle and shared dead properties. The codec retains every unopened personal bundle and ring verbatim. |
-| 5 | `crates/dav/src/calendar/proppatch.rs:185` | `handle_calendar_proppatch_request` | c | v1.0.1-src/crates/dav/src/calendar/proppatch.rs:56 | `let mut retry_event = None;` in place of `let etag = if resource.is_container() {` |
-| 6 | `crates/dav/src/calendar/proppatch.rs:239` | `handle_calendar_proppatch_request` | c | v1.0.1-src/crates/dav/src/calendar/proppatch.rs:56 | `if let Some(context) = &calendar_context {` |
-| 7 | `crates/dav/src/calendar/proppatch.rs:269` | `handle_calendar_proppatch_request` | b | v1.0.1-src/crates/dav/src/calendar/proppatch.rs:56 | Spec 8.1: edit the plaintext; `event` (stored) stays current. |
-| 8 | `crates/dav/src/calendar/proppatch.rs:302` | `handle_calendar_proppatch_request` | c | v1.0.1-src/crates/dav/src/calendar/proppatch.rs:56 | Every rewrite carries the stored pairs. |
-| 9 | `crates/dav/src/calendar/proppatch.rs:331` | `handle_calendar_proppatch_request` | c | v1.0.1-src/crates/dav/src/calendar/proppatch.rs:56 | `common::za::test_hooks::update_commit_pause_point(account_id).await;` in place of `self.commit_batch(batch).await.caused_by(trc::location!())?;` |
+| 3 | `crates/dav/src/calendar/proppatch.rs:89` | `handle_calendar_proppatch_request` | b | v1.0.1-src/crates/dav/src/calendar/proppatch.rs:81, inserted after :93 | `super::za_writer_keys(self, access_token, account_id).await?;` |
+| 4 | `crates/dav/src/calendar/proppatch.rs:138` | `handle_calendar_proppatch_request` | b | v1.0.1-src/crates/dav/src/calendar/proppatch.rs:81, inserted before :164 | Calendar properties write only this principal's personal bundle and shared dead properties. The codec retains every unopened personal bundle and ring verbatim. |
+| 5 | `crates/dav/src/calendar/proppatch.rs:185` | `handle_calendar_proppatch_request` | c | v1.0.1-src/crates/dav/src/calendar/proppatch.rs:81, inserted after :184 | `let mut retry_event = None;` in place of `let etag = if resource.is_container() {` |
+| 6 | `crates/dav/src/calendar/proppatch.rs:239` | `handle_calendar_proppatch_request` | c | v1.0.1-src/crates/dav/src/calendar/proppatch.rs:81, inserted after :372 | `if let Some(context) = &calendar_context {` |
+| 7 | `crates/dav/src/calendar/proppatch.rs:269` | `handle_calendar_proppatch_request` | b | v1.0.1-src/crates/dav/src/calendar/proppatch.rs:81 | Spec 8.1: edit the plaintext; `event` (stored) stays current. |
+| 8 | `crates/dav/src/calendar/proppatch.rs:302` | `handle_calendar_proppatch_request` | c | v1.0.1-src/crates/dav/src/calendar/proppatch.rs:81, inserted after :372 | Every rewrite carries the stored pairs. |
+| 9 | `crates/dav/src/calendar/proppatch.rs:331` | `handle_calendar_proppatch_request` | c | v1.0.1-src/crates/dav/src/calendar/proppatch.rs:81, inserted after :372 | `common::za::test_hooks::update_commit_pause_point(account_id).await;` in place of `self.commit_batch(batch).await.caused_by(trc::location!())?;` |
 
 #### `crates/dav/src/calendar/query.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/dav/src/calendar/query.rs:222` | `new` | b | v1.0.1-src/crates/dav/src/calendar/query.rs:258 | `CalendarQueryHandler` takes account and document ids for expansion traces |
+| 1 | `crates/dav/src/calendar/query.rs:222` | `new` | b | v1.0.1-src/crates/dav/src/calendar/query.rs:258, inserted after :261 | `CalendarQueryHandler` takes account and document ids for expansion traces |
 | 2 | `crates/dav/src/calendar/query.rs:236` | `new` | c | v1.0.1-src/crates/dav/src/calendar/query.rs:258 | `AccountId = account_id,` in place of `Details = event.data.event.to_string(),` |
 
 #### `crates/dav/src/calendar/scheduling.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/dav/src/calendar/scheduling.rs:114` | `handle_scheduling_get_request` | b | v1.0.1-src/crates/dav/src/calendar/scheduling.rs:56 | Release 1 spec 10: the gate inside `za_item_hidden` refuses a key account read without its keys (403) before the pending bit is read. Invitations spec 6.6: a pending ... |
-| 3 | `crates/dav/src/calendar/scheduling.rs:395` | `handle_scheduling_post_request` | c | v1.0.1-src/crates/dav/src/calendar/scheduling.rs:69 | Spec 9: a key account's free-busy is not offered; answer as for an unknown or unpermitted calendar user. |
+| 2 | `crates/dav/src/calendar/scheduling.rs:114` | `handle_scheduling_get_request` | b | v1.0.1-src/crates/dav/src/calendar/scheduling.rs:78, inserted before :126 | Release 1 spec 10: the gate inside `za_item_hidden` refuses a key account read without its keys (403) before the pending bit is read. Invitations spec 6.6: a pending ... |
+| 3 | `crates/dav/src/calendar/scheduling.rs:395` | `handle_scheduling_post_request` | c | v1.0.1-src/crates/dav/src/calendar/scheduling.rs:263 | Spec 9: a key account's free-busy is not offered; answer as for an unknown or unpermitted calendar user. |
 
 #### `crates/dav/src/calendar/update.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 4 | `crates/dav/src/calendar/update.rs:86` | `handle_calendar_update_request` | b | v1.0.1-src/crates/dav/src/calendar/update.rs:69 | `let za_keys = super::za_writer_keys(self, access_token, account_id).await?;` |
-| 5 | `crates/dav/src/calendar/update.rs:95` | `handle_calendar_update_request` | c | v1.0.1-src/crates/dav/src/calendar/update.rs:69 | `common::za::test_hooks::put_pause_point(account_id).await;` |
-| 6 | `crates/dav/src/calendar/update.rs:119` | `handle_calendar_update_request` | b | v1.0.1-src/crates/dav/src/calendar/update.rs:69 | `let mut ical = match Parser::new(ical_raw).entry() {` in place of `let ical = match Parser::new(ical_raw).entry() {` |
-| 7 | `crates/dav/src/calendar/update.rs:136` | `handle_calendar_update_request` | b | v1.0.1-src/crates/dav/src/calendar/update.rs:69 | `let roles = if za_keys.is_some() && account_info.account_id != account_id {` |
-| 8 | `crates/dav/src/calendar/update.rs:181` | `handle_calendar_update_request` | c | v1.0.1-src/crates/dav/src/calendar/update.rs:69 | Spec 8.1: the stored sealed archive stays `current` for the index builder; the unsealed view is used for comparison, editing and response bodies only. |
-| 9 | `crates/dav/src/calendar/update.rs:239` | `handle_calendar_update_request` | c | v1.0.1-src/crates/dav/src/calendar/update.rs:69 | `.with_binary_body(view.inner.data.event.to_string()));` in place of `.with_binary_body(event.inner.data.event.to_string()));` |
-| 10 | `crates/dav/src/calendar/update.rs:271` | `handle_calendar_update_request` | c | v1.0.1-src/crates/dav/src/calendar/update.rs:69 | Key pinning spec 5.1: the SEQUENCE floor, on every PUT of an existing event of a key account, before the scheduling step. |
-| 11 | `crates/dav/src/calendar/update.rs:348` | `handle_calendar_update_request` | b | v1.0.1-src/crates/dav/src/calendar/update.rs:69 | `let first_built = result.is_ok();` in place of `match result {` |
-| 12 | `crates/dav/src/calendar/update.rs:362` | `handle_calendar_update_request` | c | v1.0.1-src/crates/dav/src/calendar/update.rs:69 | Preserve the original error-arm bump exactly once. |
-| 13 | `crates/dav/src/calendar/update.rs:447` | `handle_calendar_update_request` | c | v1.0.1-src/crates/dav/src/calendar/update.rs:69 | Invitations spec 3.3: every rewrite carries the stored pairs. |
-| 14 | `crates/dav/src/calendar/update.rs:583` | `handle_calendar_update_request` | c | v1.0.1-src/crates/dav/src/calendar/update.rs:69 | Invitations spec 5.1, 6.3: a key account's create holds the UID creation lease from here through the insert, and checks current archives instead of the snapshot. |
-| 15 | `crates/dav/src/calendar/update.rs:612` | `handle_calendar_update_request` | c | v1.0.1-src/crates/dav/src/calendar/update.rs:69 | `za_keys.is_some(),` in place of `data: CalendarEventData::new(` |
-| 16 | `crates/dav/src/calendar/update.rs:681` | `handle_calendar_update_request` | c | v1.0.1-src/crates/dav/src/calendar/update.rs:69 | `za_finalize(&mut event.data.event, second.increments());` in place of `Reason = err.to_string(),` |
-| 17 | `crates/dav/src/calendar/update.rs:746` | `handle_calendar_update_request` | c | v1.0.1-src/crates/dav/src/calendar/update.rs:69 | Key pinning spec 5.1: assigned before the fan-out, which records it as a withheld entry's source (a failed create's id is never used again). |
+| 4 | `crates/dav/src/calendar/update.rs:86` | `handle_calendar_update_request` | b | v1.0.1-src/crates/dav/src/calendar/update.rs:79, inserted after :91 | `let za_keys = super::za_writer_keys(self, access_token, account_id).await?;` |
+| 5 | `crates/dav/src/calendar/update.rs:95` | `handle_calendar_update_request` | c | v1.0.1-src/crates/dav/src/calendar/update.rs:79 | `common::za::test_hooks::put_pause_point(account_id).await;` |
+| 6 | `crates/dav/src/calendar/update.rs:119` | `handle_calendar_update_request` | b | v1.0.1-src/crates/dav/src/calendar/update.rs:79, inserted before :121 | `let mut ical = match Parser::new(ical_raw).entry() {` in place of `let ical = match Parser::new(ical_raw).entry() {` |
+| 7 | `crates/dav/src/calendar/update.rs:136` | `handle_calendar_update_request` | b | v1.0.1-src/crates/dav/src/calendar/update.rs:79 | `let roles = if za_keys.is_some() && account_info.account_id != account_id {` |
+| 8 | `crates/dav/src/calendar/update.rs:181` | `handle_calendar_update_request` | c | v1.0.1-src/crates/dav/src/calendar/update.rs:79 | Spec 8.1: the stored sealed archive stays `current` for the index builder; the unsealed view is used for comparison, editing and response bodies only. |
+| 9 | `crates/dav/src/calendar/update.rs:239` | `handle_calendar_update_request` | c | v1.0.1-src/crates/dav/src/calendar/update.rs:79, inserted after :241 | `.with_binary_body(view.inner.data.event.to_string()));` in place of `.with_binary_body(event.inner.data.event.to_string()));` |
+| 10 | `crates/dav/src/calendar/update.rs:271` | `handle_calendar_update_request` | c | v1.0.1-src/crates/dav/src/calendar/update.rs:79, inserted before :446 | Key pinning spec 5.1: the SEQUENCE floor, on every PUT of an existing event of a key account, before the scheduling step. |
+| 11 | `crates/dav/src/calendar/update.rs:348` | `handle_calendar_update_request` | b | v1.0.1-src/crates/dav/src/calendar/update.rs:79 | `let first_built = result.is_ok();` in place of `match result {` |
+| 12 | `crates/dav/src/calendar/update.rs:362` | `handle_calendar_update_request` | c | v1.0.1-src/crates/dav/src/calendar/update.rs:79 | Preserve the original error-arm bump exactly once. |
+| 13 | `crates/dav/src/calendar/update.rs:447` | `handle_calendar_update_request` | c | v1.0.1-src/crates/dav/src/calendar/update.rs:79 | Invitations spec 3.3: every rewrite carries the stored pairs. |
+| 14 | `crates/dav/src/calendar/update.rs:583` | `handle_calendar_update_request` | c | v1.0.1-src/crates/dav/src/calendar/update.rs:79, inserted after :670 | Invitations spec 5.1, 6.3: a key account's create holds the UID creation lease from here through the insert, and checks current archives instead of the snapshot. |
+| 15 | `crates/dav/src/calendar/update.rs:612` | `handle_calendar_update_request` | c | v1.0.1-src/crates/dav/src/calendar/update.rs:79, inserted after :705 | `za_keys.is_some(),` in place of `data: CalendarEventData::new(` |
+| 16 | `crates/dav/src/calendar/update.rs:681` | `handle_calendar_update_request` | c | v1.0.1-src/crates/dav/src/calendar/update.rs:79 | `za_finalize(&mut event.data.event, second.increments());` in place of `Reason = err.to_string(),` |
+| 17 | `crates/dav/src/calendar/update.rs:746` | `handle_calendar_update_request` | c | v1.0.1-src/crates/dav/src/calendar/update.rs:79 | Key pinning spec 5.1: assigned before the fan-out, which records it as a withheld entry's source (a failed create's id is never used again). |
 
 #### `crates/dav/src/common/acl.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/dav/src/common/acl.rs:126` | `handle_acl_request` | c | v1.0.1-src/crates/dav/src/common/acl.rs:48 | Spec 9: sharing is refused on calendars owned by key accounts. |
+| 1 | `crates/dav/src/common/acl.rs:126` | `handle_acl_request` | c | v1.0.1-src/crates/dav/src/common/acl.rs:80 | Spec 9: sharing is refused on calendars owned by key accounts. |
 
 #### `crates/dav/src/common/mod.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/dav/src/common/mod.rs:40` | `pub mod uri;` | b | v1.0.1-src/crates/dav/src/common/mod.rs:53 | fork module declaration `pub mod za` (DAV adapters) |
+| 1 | `crates/dav/src/common/mod.rs:40` | `pub mod uri;` | b | v1.0.1-src/crates/dav/src/common/mod.rs:53, inserted after :53 | fork module declaration `pub mod za` (DAV adapters) |
 
 #### `crates/dav/src/common/propfind.rs`
 
@@ -664,25 +679,25 @@ One row per hook, grouped by file:
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/dav/src/common/uri.rs:104` | `validate_uri_with_status` | c | v1.0.1-src/crates/dav/src/common/uri.rs:87 | Calendar sharing admits only an authenticated grantee's own session. Scheduling remains confined to the account whose keys are held. |
+| 2 | `crates/dav/src/common/uri.rs:104` | `validate_uri_with_status` | c | v1.0.1-src/crates/dav/src/common/uri.rs:117, inserted after :128 | Calendar sharing admits only an authenticated grantee's own session. Scheduling remains confined to the account whose keys are held. |
 
 #### `crates/dav/src/principal/propfind.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/dav/src/principal/propfind.rs:395` | `owner_href` | b | v1.0.1-src/crates/dav/src/principal/propfind.rs:53 | Discovery must obey the same fresh, exact own-id eligibility as calendar listings. |
+| 2 | `crates/dav/src/principal/propfind.rs:395` | `owner_href` | b | v1.0.1-src/crates/dav/src/principal/propfind.rs:395 | Discovery must obey the same fresh, exact own-id eligibility as calendar listings. |
 
 #### `crates/dav/src/request.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 3 | `crates/dav/src/request.rs:280` | `dispatch_dav_request` | b | v1.0.1-src/crates/dav/src/request.rs:81 | `za_calendar_report_uri(resource)?;` |
-| 4 | `crates/dav/src/request.rs:289` | `dispatch_dav_request` | b | v1.0.1-src/crates/dav/src/request.rs:81 | `za_calendar_report_uri(resource)?;` |
-| 5 | `crates/dav/src/request.rs:301` | `dispatch_dav_request` | b | v1.0.1-src/crates/dav/src/request.rs:81 | `za_calendar_report_uri(resource)?;` |
-| 6 | `crates/dav/src/request.rs:603` | `handle_dav_request` | b | v1.0.1-src/crates/dav/src/request.rs:70 | Spec section 10, "Traces": a key account's DAV traffic never reaches the HTTP body traces. A failed lookup is treated as a key account. |
-| 7 | `crates/dav/src/request.rs:617` | `handle_dav_request` | b | v1.0.1-src/crates/dav/src/request.rs:70 | `let max = if !access_token.has_permission(Permission::UnlimitedUploads) {` in place of `if let Some(body) = fetch_body(` |
-| 8 | `crates/dav/src/request.rs:648` | `handle_dav_request` | b | v1.0.1-src/crates/dav/src/request.rs:70 | Invitations spec 6.1-6.2: a key account's own request drains its pending inbox items first. The token holds keys only for the account that authenticated, so a request ... |
-| 9 | `crates/dav/src/request.rs:675` | `handle_dav_request` | b | v1.0.1-src/crates/dav/src/request.rs:70 | `if untraced {` in place of `response` |
+| 3 | `crates/dav/src/request.rs:280` | `dispatch_dav_request` | b | v1.0.1-src/crates/dav/src/request.rs:92, inserted after :264 | `za_calendar_report_uri(resource)?;` |
+| 4 | `crates/dav/src/request.rs:289` | `dispatch_dav_request` | b | v1.0.1-src/crates/dav/src/request.rs:92, inserted after :272 | `za_calendar_report_uri(resource)?;` |
+| 5 | `crates/dav/src/request.rs:301` | `dispatch_dav_request` | b | v1.0.1-src/crates/dav/src/request.rs:92, inserted after :291 | `za_calendar_report_uri(resource)?;` |
+| 6 | `crates/dav/src/request.rs:603` | `handle_dav_request` | b | v1.0.1-src/crates/dav/src/request.rs:585, inserted after :592 | Spec section 10, "Traces": a key account's DAV traffic never reaches the HTTP body traces. A failed lookup is treated as a key account. |
+| 7 | `crates/dav/src/request.rs:617` | `handle_dav_request` | b | v1.0.1-src/crates/dav/src/request.rs:585, inserted after :599 | `let max = if !access_token.has_permission(Permission::UnlimitedUploads) {` in place of `if let Some(body) = fetch_body(` |
+| 8 | `crates/dav/src/request.rs:648` | `handle_dav_request` | b | v1.0.1-src/crates/dav/src/request.rs:585, inserted after :645 | Invitations spec 6.1-6.2: a key account's own request drains its pending inbox items first. The token holds keys only for the account that authenticated, so a request ... |
+| 9 | `crates/dav/src/request.rs:675` | `handle_dav_request` | b | v1.0.1-src/crates/dav/src/request.rs:585 | `if untraced {` in place of `response` |
 
 #### `crates/directory/src/core/secret.rs`
 
@@ -694,16 +709,16 @@ One row per hook, grouped by file:
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/email/Cargo.toml:14` | top level | c | v1.0.1-src/crates/email/Cargo.toml:1 | `vault = { path = "../vault" }` |
+| 1 | `crates/email/Cargo.toml:14` | top level | c | v1.0.1-src/crates/email/Cargo.toml:1, inserted after :16 | `vault = { path = "../vault" }` |
 | 2 | `crates/email/Cargo.toml:31` | top level | c | v1.0.1-src/crates/email/Cargo.toml:1 | `zeroize` for plaintext buffers |
 
 #### `crates/email/src/message/copy.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/email/src/message/copy.rs:77` | `copy_message` | c | v1.0.1-src/crates/email/src/message/copy.rs:63 | Mail spec 6.3: no copy into or out of a key account. The callers answer their client first; this refuses a classification that changed since, before any read. |
-| 3 | `crates/email/src/message/copy.rs:113` | `copy_message` | c | v1.0.1-src/crates/email/src/message/copy.rs:63 | `#[cfg(feature = "test_mode")]` |
-| 4 | `crates/email/src/message/copy.rs:259` | `copy_message` | b | v1.0.1-src/crates/email/src/message/copy.rs:63 | Mail spec 6.1, the provisioning fence, as in `email_ingest`. |
+| 2 | `crates/email/src/message/copy.rs:77` | `copy_message` | c | v1.0.1-src/crates/email/src/message/copy.rs:82, inserted after :96 | Mail spec 6.3: no copy into or out of a key account. The callers answer their client first; this refuses a classification that changed since, before any read. |
+| 3 | `crates/email/src/message/copy.rs:113` | `copy_message` | c | v1.0.1-src/crates/email/src/message/copy.rs:82 | `#[cfg(feature = "test_mode")]` |
+| 4 | `crates/email/src/message/copy.rs:259` | `copy_message` | b | v1.0.1-src/crates/email/src/message/copy.rs:82 | Mail spec 6.1, the provisioning fence, as in `email_ingest`. |
 
 #### `crates/email/src/message/index/metadata.rs`
 
@@ -717,20 +732,20 @@ One row per hook, grouped by file:
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/email/src/message/index/mod.rs:108` | `index_message` | b | v1.0.1-src/crates/email/src/message/index/mod.rs:163 | The blob link, `MessageData` and the metadata archive of `index_message`, for a metadata archive built by the caller. |
+| 2 | `crates/email/src/message/index/mod.rs:108` | `index_message` | b | v1.0.1-src/crates/email/src/message/index/metadata.rs:62 | The blob link, `MessageData` and the metadata archive of `index_message`, for a metadata archive built by the caller. |
 
 #### `crates/email/src/message/ingest.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/email/src/message/ingest.rs:149` | `email_ingest` | c | v1.0.1-src/crates/email/src/message/ingest.rs:127 | Mail spec 6.1, 6.2: a key account's message is sealed, its key wrapped as chosen here, before any write. |
-| 3 | `crates/email/src/message/ingest.rs:211` | `email_ingest` | c | v1.0.1-src/crates/email/src/message/ingest.rs:127 | Mail spec 5.4: no thread lookup and no threading key; the thread-less arm below gives the message a thread of its own. The Message-ID stays out of the ingest event. |
-| 4 | `crates/email/src/message/ingest.rs:388` | `email_ingest` | c | v1.0.1-src/crates/email/src/message/ingest.rs:127 | `&& !account.is_key_account()` |
-| 5 | `crates/email/src/message/ingest.rs:520` | `email_ingest` | b | v1.0.1-src/crates/email/src/message/ingest.rs:127 | Mail spec 6.1 step 4: no training sample for a key account. |
-| 6 | `crates/email/src/message/ingest.rs:535` | `email_ingest` | b | v1.0.1-src/crates/email/src/message/ingest.rs:127 | Mail spec 6.1 step 5: a key account's message is sealed instead. |
-| 7 | `crates/email/src/message/ingest.rs:594` | `email_ingest` | b | v1.0.1-src/crates/email/src/message/ingest.rs:127 | `let mut za_sealed = None;` in place of `let (blob_hash, blob_hold) = if !is_encrypted && let Some(blob_hash) = params.bl` |
-| 8 | `crates/email/src/message/ingest.rs:667` | `email_ingest` | c | v1.0.1-src/crates/email/src/message/ingest.rs:127 | `if let Some(sealed) = za_sealed {` in place of `batch` |
-| 9 | `crates/email/src/message/ingest.rs:735` | `email_ingest` | c | v1.0.1-src/crates/email/src/message/ingest.rs:127 | Mail spec 6.1, the provisioning fence: an account read as ordinary takes the message only while it holds no vault record. |
+| 2 | `crates/email/src/message/ingest.rs:149` | `email_ingest` | c | v1.0.1-src/crates/email/src/message/ingest.rs:235 | Mail spec 6.1, 6.2: a key account's message is sealed, its key wrapped as chosen here, before any write. |
+| 3 | `crates/email/src/message/ingest.rs:211` | `email_ingest` | c | v1.0.1-src/crates/email/src/message/ingest.rs:235 | Mail spec 5.4: no thread lookup and no threading key; the thread-less arm below gives the message a thread of its own. The Message-ID stays out of the ingest event. |
+| 4 | `crates/email/src/message/ingest.rs:388` | `email_ingest` | c | v1.0.1-src/crates/email/src/message/ingest.rs:235 | `&& !account.is_key_account()` |
+| 5 | `crates/email/src/message/ingest.rs:520` | `email_ingest` | b | v1.0.1-src/crates/email/src/message/ingest.rs:235 | Mail spec 6.1 step 4: no training sample for a key account. |
+| 6 | `crates/email/src/message/ingest.rs:535` | `email_ingest` | b | v1.0.1-src/crates/email/src/message/ingest.rs:235 | Mail spec 6.1 step 5: a key account's message is sealed instead. |
+| 7 | `crates/email/src/message/ingest.rs:594` | `email_ingest` | b | v1.0.1-src/crates/email/src/message/ingest.rs:235 | `let mut za_sealed = None;` in place of `let (blob_hash, blob_hold) = if !is_encrypted && let Some(blob_hash) = params.bl` |
+| 8 | `crates/email/src/message/ingest.rs:667` | `email_ingest` | c | v1.0.1-src/crates/email/src/message/ingest.rs:235 | `if let Some(sealed) = za_sealed {` in place of `batch` |
+| 9 | `crates/email/src/message/ingest.rs:735` | `email_ingest` | c | v1.0.1-src/crates/email/src/message/ingest.rs:235, inserted after :249 | Mail spec 6.1, the provisioning fence: an account read as ordinary takes the message only while it holds no vault record. |
 | 10 | `crates/email/src/message/ingest.rs:940` | `add_account_spam_sample` | d (target moved, conflict) | v1.0.1-src/crates/email/src/message/ingest.rs:1034 (`add_account_spam_samples`) | no training sample for a key account, whichever path adds one |
 | 11 | `crates/email/src/message/ingest.rs:954` | `add_account_spam_sample` | d (target moved, conflict) | v1.0.1-src/crates/email/src/message/ingest.rs:1034 | the `TRAIN_PAUSE` test hook |
 
@@ -738,20 +753,20 @@ One row per hook, grouped by file:
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/email/src/message/mod.rs:13` | `pub mod headers;` | c | v1.0.1-src/crates/email/src/message/mod.rs:12 | fork module declaration `pub mod za` (seal, ingest, view, sharing) |
+| 1 | `crates/email/src/message/mod.rs:13` | `pub mod headers;` | c | v1.0.1-src/crates/email/src/message/mod.rs:12, inserted after :18 | fork module declaration `pub mod za` (seal, ingest, view, sharing) |
 
 #### `crates/email/src/sieve/ingest.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/email/src/sieve/ingest.rs:483` | `sieve_script_ingest` | c | v1.0.1-src/crates/email/src/sieve/ingest.rs:501 | `za_redact: account_info.is_key_account(),` |
-| 2 | `crates/email/src/sieve/ingest.rs:507` | `sieve_script_ingest` | c | v1.0.1-src/crates/email/src/sieve/ingest.rs:501 | Mail spec 10: a key account's script can quote its message (`error "${header.subject}"`). |
+| 1 | `crates/email/src/sieve/ingest.rs:483` | `sieve_script_ingest` | c | v1.0.1-src/crates/email/src/sieve/ingest.rs:548, inserted after :694 | `za_redact: account_info.is_key_account(),` |
+| 2 | `crates/email/src/sieve/ingest.rs:507` | `sieve_script_ingest` | c | v1.0.1-src/crates/email/src/sieve/ingest.rs:548, inserted after :765 | Mail spec 10: a key account's script can quote its message (`error "${header.subject}"`). |
 
 #### `crates/groupware/Cargo.toml`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/groupware/Cargo.toml:11` | top level | c | v1.0.1-src/crates/groupware/Cargo.toml:1 | `vault = { path = "../vault" }` |
+| 1 | `crates/groupware/Cargo.toml:11` | top level | c | v1.0.1-src/crates/groupware/Cargo.toml:1, inserted after :13 | `vault = { path = "../vault" }` |
 | 2 | `crates/groupware/Cargo.toml:31` | top level | c | v1.0.1-src/crates/groupware/Cargo.toml:1 | `test_mode = ["common/test_mode"]` in place of `test_mode = []` |
 
 #### `crates/groupware/src/calendar/dates.rs`
@@ -766,31 +781,31 @@ One row per hook, grouped by file:
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/groupware/src/calendar/itip.rs:335` | `itip_ingest` | c | v1.0.1-src/crates/groupware/src/calendar/itip.rs:79 | Mail spec 6.1: iMIP is reached only for an account read as ordinary; its writes take the ingest's provisioning fence. |
-| 3 | `crates/groupware/src/calendar/itip.rs:387` | `http_rsvp_handle` | b | v1.0.1-src/crates/groupware/src/calendar/itip.rs:95 | `.za_is_key_account(rsvp.account_id)` |
-| 4 | `crates/groupware/src/calendar/itip.rs:670` | `http_rsvp_attendee_copy` | b | v1.0.1-src/crates/groupware/src/calendar/itip.rs:720 | A key account's copy is sealed: it is never rewritten without its keys. |
-| 5 | `crates/groupware/src/calendar/itip.rs:864` | `commit_itip_merge` | c | v1.0.1-src/crates/groupware/src/calendar/itip.rs:832 | Mail spec 6.1: as the import's batch in `itip_ingest`; the RSVP handler, the other caller, refuses key accounts' links before this. |
+| 2 | `crates/groupware/src/calendar/itip.rs:335` | `itip_ingest` | c | v1.0.1-src/crates/groupware/src/calendar/itip.rs:104, inserted before :394 | Mail spec 6.1: iMIP is reached only for an account read as ordinary; its writes take the ingest's provisioning fence. |
+| 3 | `crates/groupware/src/calendar/itip.rs:387` | `http_rsvp_handle` | b | v1.0.1-src/crates/groupware/src/calendar/itip.rs:433, inserted before :444 | `.za_is_key_account(rsvp.account_id)` |
+| 4 | `crates/groupware/src/calendar/itip.rs:670` | `http_rsvp_attendee_copy` | b | v1.0.1-src/crates/groupware/src/calendar/itip.rs:720, inserted before :739 | A key account's copy is sealed: it is never rewritten without its keys. |
+| 5 | `crates/groupware/src/calendar/itip.rs:864` | `commit_itip_merge` | c | v1.0.1-src/crates/groupware/src/calendar/itip.rs:832, inserted before :1022 | Mail spec 6.1: as the import's batch in `itip_ingest`; the RSVP handler, the other caller, refuses key accounts' links before this. |
 
 #### `crates/groupware/src/calendar/mod.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/groupware/src/calendar/mod.rs:6` | `pub mod itip;` | c | v1.0.1-src/crates/groupware/src/calendar/mod.rs:18 | fork module declarations `delegation`, `drain`, `fanout`, `pinning`, `seal`, `sequence`, `sharing`; `sequence` collides with upstream's new `calendar/sequence.rs` (add/add) |
-| 2 | `crates/groupware/src/calendar/mod.rs:119` | `pub const EVENT_NOTIFICATION_IS_CHANGE: ` | c | v1.0.1-src/crates/groupware/src/calendar/mod.rs:157 | Invitations spec 9: an inbox item still sealed to the recipient's public key. Set by the fan-out (plan 9), cleared by the drain (plan 10); hidden from clients meanwhile ... |
+| 1 | `crates/groupware/src/calendar/mod.rs:6` | `pub mod itip;` | c | v1.0.1-src/crates/groupware/src/calendar/mod.rs:18, inserted before :26 | fork module declarations `delegation`, `drain`, `fanout`, `pinning`, `seal`, `sequence`, `sharing`; `sequence` collides with upstream's new `calendar/sequence.rs` (add/add) |
+| 2 | `crates/groupware/src/calendar/mod.rs:119` | `pub const EVENT_NOTIFICATION_IS_CHANGE: ` | c | v1.0.1-src/crates/groupware/src/calendar/mod.rs:156-161 (the notification flags) | `EVENT_NOTIFICATION_ZA_PENDING = 1 << 2` (a sealed inbox item waiting for the drain). **Bit collision:** 1.0.1's `EVENT_NOTIFICATION_IS_DESTROY` is also `1 << 2` (`mod.rs:158`; read in `jmap/src/calendar_event_notification/mod.rs:23`, set in `groupware/src/calendar/storage.rs:1031`), and `NotificationAudience` holds bits 4 and 5. Keeping both constants compiles. Move the fork flag to a bit no 1.0.1 notification flag uses (ruling 30) |
 
 #### `crates/groupware/src/calendar/storage.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 3 | `crates/groupware/src/calendar/storage.rs:179` | `update` | c | v1.0.1-src/crates/groupware/src/calendar/storage.rs:274 | Rebuild a fenced event write without advancing its original timestamp. |
+| 3 | `crates/groupware/src/calendar/storage.rs:179` | `update` | c | v1.0.1-src/crates/groupware/src/calendar/storage.rs:274, inserted after :281 | Rebuild a fenced event write without advancing its original timestamp. |
 | 4 | `crates/groupware/src/calendar/storage.rs:224` | `insert` | c | v1.0.1-src/crates/groupware/src/calendar/storage.rs:201 | Rebuild a fenced create using its initially assigned timestamps. |
-| 5 | `crates/groupware/src/calendar/storage.rs:371` | `delete_with_events` | c | v1.0.1-src/crates/groupware/src/calendar/storage.rs:355 | `delete_with_events`. With `za_keys` (a key account, invitations spec 5.5) each event's CANCEL is built from its unsealed tree and returned for the fan-out instead of ... |
+| 5 | `crates/groupware/src/calendar/storage.rs:371` | `delete_with_events` | c | v1.0.1-src/crates/groupware/src/calendar/storage.rs:355, inserted after :368 | `delete_with_events`. With `za_keys` (a key account, invitations spec 5.5) each event's CANCEL is built from its unsealed tree and returned for the fan-out instead of ... |
 | 6 | `crates/groupware/src/calendar/storage.rs:415` | `delete_with_events` | c | v1.0.1-src/crates/groupware/src/calendar/storage.rs:355 | `let context = if let Some(keys) = za_keys {` in place of `DestroyArchive(` |
-| 7 | `crates/groupware/src/calendar/storage.rs:454` | `delete_with_events` | c | v1.0.1-src/crates/groupware/src/calendar/storage.rs:355 | `delete_with_events` returns the CANCEL messages it built |
+| 7 | `crates/groupware/src/calendar/storage.rs:454` | `delete_with_events` | c | v1.0.1-src/crates/groupware/src/calendar/storage.rs:355, inserted after :473 | `delete_with_events` returns the CANCEL messages it built |
 | 8 | `crates/groupware/src/calendar/storage.rs:479` | `delete` | b | v1.0.1-src/crates/groupware/src/calendar/storage.rs:479 | `batch.log_calendar_vanished(document_id, delete_path);` in place of `batch.log_vanished_item(VanishedCollection::Calendar, delete_path);` |
-| 9 | `crates/groupware/src/calendar/storage.rs:499` | `delete` | c | v1.0.1-src/crates/groupware/src/calendar/storage.rs:479 | `delete`. With `za_keys`, the CANCEL `delete_all_za` builds is returned instead of queued. |
-| 10 | `crates/groupware/src/calendar/storage.rs:584` | `delete` | c | v1.0.1-src/crates/groupware/src/calendar/storage.rs:479 | `za_message = self.delete_all_za_at(` in place of `self.delete_all(account_info, account_id, document_id, send_itip, batch)?;` |
-| 11 | `crates/groupware/src/calendar/storage.rs:615` | `delete_all` | c | v1.0.1-src/crates/groupware/src/calendar/storage.rs:685 | `delete_all`. With `za_keys` (a key account, invitations spec 5.5) the stored tree is unsealed before `itip_cancel`, and the CANCEL (or an attendee's declined REPLY) is ... |
+| 9 | `crates/groupware/src/calendar/storage.rs:499` | `delete` | c | v1.0.1-src/crates/groupware/src/calendar/storage.rs:479, inserted after :487 | `delete`. With `za_keys`, the CANCEL `delete_all_za` builds is returned instead of queued. |
+| 10 | `crates/groupware/src/calendar/storage.rs:584` | `delete` | c | v1.0.1-src/crates/groupware/src/calendar/storage.rs:479, inserted before :500 | `za_message = self.delete_all_za_at(` in place of `self.delete_all(account_info, account_id, document_id, send_itip, batch)?;` |
+| 11 | `crates/groupware/src/calendar/storage.rs:615` | `delete_all` | c | v1.0.1-src/crates/groupware/src/calendar/storage.rs:685, inserted after :694 | `delete_all`. With `za_keys` (a key account, invitations spec 5.5) the stored tree is unsealed before `itip_cancel`, and the CANCEL (or an attendee's declined REPLY) is ... |
 | 12 | `crates/groupware/src/calendar/storage.rs:679` | `delete_all` | c | v1.0.1-src/crates/groupware/src/calendar/storage.rs:685 | `let now = cutoff;` in place of `let now = now() as i64;` |
 | 13 | `crates/groupware/src/calendar/storage.rs:689` | `delete_all` | c | v1.0.1-src/crates/groupware/src/calendar/storage.rs:685 | `let pairs = match za_keys {` in place of `let event = event` |
 | 14 | `crates/groupware/src/calendar/storage.rs:736` | `delete_all` | b | v1.0.1-src/crates/groupware/src/calendar/storage.rs:685 | `Ok(za_message)` in place of `Ok(())` |
@@ -799,13 +814,13 @@ One row per hook, grouped by file:
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/groupware/src/scheduling/event_cancel.rs:26` | `itip_cancel` | b | v1.0.1-src/crates/groupware/src/scheduling/event_cancel.rs:30 | `itip_cancel_from_snapshot(ical, itip, is_deletion)` |
+| 2 | `crates/groupware/src/scheduling/event_cancel.rs:26` | `itip_cancel` | b | v1.0.1-src/crates/groupware/src/scheduling/event_cancel.rs:30, inserted after :37 | `itip_cancel_from_snapshot(ical, itip, is_deletion)` |
 
 #### `crates/http-proto/src/request.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/http-proto/src/request.rs:22` | `fetch_body` | c | v1.0.1-src/crates/http-proto/src/request.rs:26 | Like `fetch_body`, but never emits `HttpEvent::RequestBody`: for bodies that carry passwords, tokens or recovery keys. |
+| 1 | `crates/http-proto/src/request.rs:22` | `fetch_body` | c | v1.0.1-src/crates/http-proto/src/request.rs:26, inserted after :29 | Like `fetch_body`, but never emits `HttpEvent::RequestBody`: for bodies that carry passwords, tokens or recovery keys. |
 | 2 | `crates/http-proto/src/request.rs:68` | `fetch_body` | b | v1.0.1-src/crates/http-proto/src/request.rs:26 | `.map(\|(k, v)\| traced_header(k, v))` in place of `.map(\|(k, v)\| trc::Value::Array(vec![` |
 | 3 | `crates/http-proto/src/request.rs:82` | `fetch_body` | b | v1.0.1-src/crates/http-proto/src/request.rs:26 | `if !trace {` in place of `.map(\|(k, v)\| trc::Value::Array(vec![` |
 
@@ -813,51 +828,53 @@ One row per hook, grouped by file:
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/http/Cargo.toml:20` | top level | c | v1.0.1-src/crates/http/Cargo.toml:1 | `vault = { path = "../vault" }` |
-| 2 | `crates/http/Cargo.toml:34` | top level | c | v1.0.1-src/crates/http/Cargo.toml:1 | `subtle` for constant-time comparisons in the vault API |
+| 1 | `crates/http/Cargo.toml:20` | top level | c | v1.0.1-src/crates/http/Cargo.toml:1, inserted after :23 | `vault = { path = "../vault" }` |
+| 2 | `crates/http/Cargo.toml:34` | top level | c | v1.0.1-src/crates/http/Cargo.toml:1, inserted after :35 | `subtle` for constant-time comparisons in the vault API |
 
 #### `crates/http/src/api/mod.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
 | 1 | `crates/http/src/api/mod.rs:10` | `pub mod diagnose;` | c | v1.0.1-src/crates/http/src/api/mod.rs:13 | `vault::VaultApi,` in place of `api::diagnose::{DeliveryStage, spawn_delivery_diagnose},` |
-| 3 | `crates/http/src/api/mod.rs:67` | `handle_api_request` | b | v1.0.1-src/crates/http/src/api/mod.rs:45 | Zero-access and login request bodies carry passwords, tokens and recovery keys; no account is known before they are parsed. |
-| 4 | `crates/http/src/api/mod.rs:88` | `handle_api_request` | b | v1.0.1-src/crates/http/src/api/mod.rs:45 | `.map(HttpResponse::with_untraced_body)` |
-| 5 | `crates/http/src/api/mod.rs:279` | `handle_api_request` | b | v1.0.1-src/crates/http/src/api/mod.rs:45 | routes for `vault` (POST), `contacts` and `shares` |
+| 3 | `crates/http/src/api/mod.rs:67` | `handle_api_request` | b | v1.0.1-src/crates/http/src/api/mod.rs:60, inserted after :65 | Zero-access and login request bodies carry passwords, tokens and recovery keys; no account is known before they are parsed. |
+| 4 | `crates/http/src/api/mod.rs:88` | `handle_api_request` | b | v1.0.1-src/crates/http/src/api/mod.rs:60, inserted after :80 | `.map(HttpResponse::with_untraced_body)` |
+| 5 | `crates/http/src/api/mod.rs:279` | `handle_api_request` | b | v1.0.1-src/crates/http/src/api/mod.rs:60 | routes for `vault` (POST), `contacts` and `shares` |
 
 #### `crates/http/src/auth/authenticate.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/http/src/auth/authenticate.rs:28` | `authenticate_headers` | c | v1.0.1-src/crates/http/src/auth/authenticate.rs:27 | The cache key is a keyed fingerprint of the header value; the value itself is never stored (spec 5). |
-| 2 | `crates/http/src/auth/authenticate.rs:102` | `authenticate_headers` | b | v1.0.1-src/crates/http/src/auth/authenticate.rs:27 | Full verification of an Authorization header, caching the result under the header's own fingerprint, computed here so that no caller can cache under another key. The ... |
+| 1 | `crates/http/src/auth/authenticate.rs:28` | `authenticate_headers` | c | v1.0.1-src/crates/http/src/auth/authenticate.rs:35, inserted after :42 | The cache key is a keyed fingerprint of the header value; the value itself is never stored (spec 5). |
+| 2 | `crates/http/src/auth/authenticate.rs:102` | `authenticate_headers` | b | v1.0.1-src/crates/http/src/auth/authenticate.rs:35 | Full verification of an Authorization header, caching the result under the header's own fingerprint, computed here so that no caller can cache under another key. The ... |
+| 1a | `crates/http/src/auth/authenticate.rs:122` | `authenticate_headers` | c | v1.0.1-src/crates/http/src/auth/authenticate.rs:73-78 (`.id`) | Ruling 28 (C3): no raw Authorization value in the Basic decode error. 0.16.27 had `.id(token.to_string())` (base :60); the fork removed it; 1.0.1 has `.id(CompactString::from(token))` on its side of a conflict block, so taking that side brings the credential back into the error |
+| 1b | `crates/http/src/auth/authenticate.rs:143` | `authenticate_headers` | c | v1.0.1-src/crates/http/src/auth/authenticate.rs:94-98 (`.details`) | Ruling 28 (C3): no raw Authorization value in the unsupported-mechanism error. 0.16.27 had `.details(token.to_string())` (base :80); 1.0.1 has `.details(CompactString::from(token))`, also inside the conflict |
 
 #### `crates/http/src/auth/oauth/auth.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/http/src/auth/oauth/auth.rs:296` | `handle_login_request` | c | v1.0.1-src/crates/http/src/auth/oauth/auth.rs:91 | Mail ruling R36: no code for an impersonated login of a key account. |
-| 2 | `crates/http/src/auth/oauth/auth.rs:410` | `handle_login_request` | c | v1.0.1-src/crates/http/src/auth/oauth/auth.rs:91 | Mail ruling R36: no code for an impersonated login of a key account. |
+| 1 | `crates/http/src/auth/oauth/auth.rs:296` | `handle_login_request` | c | v1.0.1-src/crates/http/src/auth/oauth/auth.rs:600 (`authenticate_login`), reached from `authorize_code` (:757) and `approve_device` (:1002) | R36: no OAuth code for an impersonated login of a key account (`za_oauth_grant_refused`). 1.0.1 authenticates the login in the free function `authenticate_login`, the one site that sees the token before `LoginAccount` drops it, so one refusal there covers both callers (0.16.27's authorization-code login) |
+| 2 | `crates/http/src/auth/oauth/auth.rs:410` | `handle_login_request` | c | v1.0.1-src/crates/http/src/auth/oauth/auth.rs:600 (`authenticate_login`), reached from `authorize_code` (:757) and `approve_device` (:1002) | R36: no OAuth code for an impersonated login of a key account (`za_oauth_grant_refused`). 1.0.1 authenticates the login in the free function `authenticate_login`, the one site that sees the token before `LoginAccount` drops it, so one refusal there covers both callers (0.16.27's second login path) |
 
 #### `crates/http/src/request.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 4 | `crates/http/src/request.rs:130` | `parse_http_request` | b | v1.0.1-src/crates/http/src/request.rs:91 | Spec section 10, "Traces": the parser's details and reason can echo the body. |
-| 5 | `crates/http/src/request.rs:204` | `parse_http_request` | c | v1.0.1-src/crates/http/src/request.rs:91 | Ruling R30: the keyless refusal answers 403. |
-| 6 | `crates/http/src/request.rs:236` | `parse_http_request` | b | v1.0.1-src/crates/http/src/request.rs:91 | Mail spec 4, 5.7: an upload into a key account is sealed with its keys; a token without them is refused before the body is read. |
-| 7 | `crates/http/src/request.rs:310` | `parse_http_request` | c | v1.0.1-src/crates/http/src/request.rs:91 | A stream outlives the key residency bound (spec 5). |
-| 8 | `crates/http/src/request.rs:573` | `parse_http_request` | b | v1.0.1-src/crates/http/src/request.rs:91 | Zero-access account API: CORS for the account page only (spec 4.1). |
-| 9 | `crates/http/src/request.rs:936` | `handle_session` | b | v1.0.1-src/crates/http/src/request.rs:870 | Vault responses keep their own allowed origin (below). |
-| 10 | `crates/http/src/request.rs:965` | `handle_session` | c | v1.0.1-src/crates/http/src/request.rs:870 | `trc::Value::String("[redacted]".into())` in place of `Contents = match response.body() {` |
-| 11 | `crates/http/src/request.rs:993` | `handle_session` | b | v1.0.1-src/crates/http/src/request.rs:870 | The vault API sets its own CORS headers from the account-page origin and none when that is unset (spec 4.1); operator CORS headers never apply there. Every other ... |
+| 4 | `crates/http/src/request.rs:130` | `parse_http_request` | b | v1.0.1-src/crates/http/src/request.rs:99, inserted before :148 | Spec section 10, "Traces": the parser's details and reason can echo the body. |
+| 5 | `crates/http/src/request.rs:204` | `parse_http_request` | c | v1.0.1-src/crates/http/src/request.rs:99, inserted after :186 | Ruling R30: the keyless refusal answers 403. |
+| 6 | `crates/http/src/request.rs:236` | `parse_http_request` | b | v1.0.1-src/crates/http/src/request.rs:99, inserted after :221 | Mail spec 4, 5.7: an upload into a key account is sealed with its keys; a token without them is refused before the body is read. |
+| 7 | `crates/http/src/request.rs:310` | `parse_http_request` | c | v1.0.1-src/crates/http/src/request.rs:99, inserted before :275 | A stream outlives the key residency bound (spec 5). |
+| 8 | `crates/http/src/request.rs:573` | `parse_http_request` | b | v1.0.1-src/crates/http/src/request.rs:99, inserted before :579 | Zero-access account API: CORS for the account page only (spec 4.1). |
+| 9 | `crates/http/src/request.rs:936` | `handle_session` | b | v1.0.1-src/crates/http/src/request.rs:870, inserted before :960 | Vault responses keep their own allowed origin (below). |
+| 10 | `crates/http/src/request.rs:965` | `handle_session` | c | v1.0.1-src/crates/http/src/request.rs:870, inserted before :1015 | `trc::Value::String("[redacted]".into())` in place of `Contents = match response.body() {` |
+| 11 | `crates/http/src/request.rs:993` | `handle_session` | b | v1.0.1-src/crates/http/src/request.rs:870, inserted after :1026 | The vault API sets its own CORS headers from the account-page origin and none when that is unset (spec 4.1); operator CORS headers never apply there. Every other ... |
 | 12 | `crates/http/src/request.rs:1058` | `shutdown` | c | v1.0.1-src/crates/http/src/request.rs:1077 | Spec section 10, "Traces": a key account's JMAP request and response bodies are never traced, since a request can carry the account's password (`x:AccountPassword/set`). ... |
 
 #### `crates/imap/src/core/client.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/imap/src/core/client.rs:24` | `ingest` | b | v1.0.1-src/crates/imap/src/core/client.rs:22 | Mail spec 10: a key account's session is masked throughout. |
+| 1 | `crates/imap/src/core/client.rs:24` | `ingest` | b | v1.0.1-src/crates/imap/src/core/client.rs:22, inserted after :26 | Mail spec 10: a key account's session is masked throughout. |
 
 #### `crates/imap/src/core/mailbox.rs`
 
@@ -866,7 +883,7 @@ One row per hook, grouped by file:
 | 1 | `crates/imap/src/core/mailbox.rs:55` | `new` | c | v1.0.1-src/crates/imap/src/core/mailbox.rs:39 | Mail spec 6.3, ruling R34: not a key account's. |
 | 2 | `crates/imap/src/core/mailbox.rs:266` | `synchronize_mailboxes` | c | v1.0.1-src/crates/imap/src/core/mailbox.rs:129 | Mail spec 6.3, ruling R34: not a key account's. |
 | 3 | `crates/imap/src/core/mailbox.rs:294` | `synchronize_mailboxes` | b | v1.0.1-src/crates/imap/src/core/mailbox.rs:129 | Mail spec 6.3, ruling R34: whatever the token still grants. |
-| 4 | `crates/imap/src/core/mailbox.rs:426` | `check_mailbox_acl` | b | v1.0.1-src/crates/imap/src/core/mailbox.rs:584 | Mail spec 6.3, ruling R34: a key account's mailbox is used only by its own sessions. |
+| 4 | `crates/imap/src/core/mailbox.rs:426` | `check_mailbox_acl` | b | v1.0.1-src/crates/imap/src/core/mailbox.rs:584, inserted after :590 | Mail spec 6.3, ruling R34: a key account's mailbox is used only by its own sessions. |
 
 #### `crates/imap/src/core/message.rs`
 
@@ -878,38 +895,38 @@ One row per hook, grouped by file:
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/imap/src/core/mod.rs:30` | `pub mod session;` | c | v1.0.1-src/crates/imap/src/core/mod.rs:35 | fork module declaration `mod za` |
-| 2 | `crates/imap/src/core/mod.rs:193` | `try_replace_stream_tx` | b | v1.0.1-src/crates/imap/src/core/mod.rs:252 | Mail spec 3.3: whether this session is logged in with its account's keys. |
-| 3 | `crates/imap/src/core/mod.rs:213` | `refresh_access_token` | b | v1.0.1-src/crates/imap/src/core/mod.rs:278 | Mail spec 3.3: the renewed token carries the session's keys. |
+| 1 | `crates/imap/src/core/mod.rs:30` | `pub mod session;` | c | v1.0.1-src/crates/imap/src/core/mod.rs:35, inserted after :35 | fork module declaration `mod za` |
+| 2 | `crates/imap/src/core/mod.rs:193` | `try_replace_stream_tx` | b | v1.0.1-src/crates/imap/src/core/mod.rs:252, inserted before :277 | Mail spec 3.3: whether this session is logged in with its account's keys. |
+| 3 | `crates/imap/src/core/mod.rs:213` | `refresh_access_token` | b | v1.0.1-src/crates/imap/src/core/mod.rs:278, inserted after :282 | Mail spec 3.3: the renewed token carries the session's keys. |
 
 #### `crates/imap/src/core/session.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/imap/src/core/session.rs:266` | `write_error` | c | v1.0.1-src/crates/imap/src/core/session.rs:259 | `trc::error!(self.traced_error(err).span_id(self.session_id));` in place of `trc::error!(err.span_id(self.session_id));` |
+| 2 | `crates/imap/src/core/session.rs:266` | `write_error` | c | v1.0.1-src/crates/imap/src/core/session.rs:259, inserted before :265 | `trc::error!(self.traced_error(err).span_id(self.session_id));` in place of `trc::error!(err.span_id(self.session_id));` |
 | 3 | `crates/imap/src/core/session.rs:275` | `write_error` | b | v1.0.1-src/crates/imap/src/core/session.rs:259 | Issue #20: before authentication a syntax error can quote client input (a SASL response parsed as a tag), so its trace redacts it; mail spec 10: so does a key account's ... |
-| 4 | `crates/imap/src/core/session.rs:314` | `write_bytes` | b | v1.0.1-src/crates/imap/src/core/session.rs:237 | Mail spec 10: a key account's session is masked throughout. |
+| 4 | `crates/imap/src/core/session.rs:314` | `write_bytes` | b | v1.0.1-src/crates/imap/src/core/session.rs:237, inserted after :243 | Mail spec 10: a key account's session is masked throughout. |
 | 5 | `crates/imap/src/core/session.rs:337` | `write_error` | c | v1.0.1-src/crates/imap/src/core/session.rs:259 | Mail spec 10: in a key account's session a BAD error is traced redacted, as `Session::traced_error` traces one before authentication. |
 
 #### `crates/imap/src/op/acl.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/imap/src/op/acl.rs:343` | `handle_set_acl` | c | v1.0.1-src/crates/imap/src/op/acl.rs:177 | Mail spec 6.3, ruling I3: no grant is added to or widened on a key account's mailbox; a removal or a narrowing passes. |
-| 3 | `crates/imap/src/op/acl.rs:470` | `get_acl_mailbox` | b | v1.0.1-src/crates/imap/src/op/acl.rs:398 | Mail spec 6.3, ruling R34: GETACL, MYRIGHTS, SETACL and DELETEACL name a key account's mailbox only in its own sessions. |
+| 2 | `crates/imap/src/op/acl.rs:343` | `handle_set_acl` | c | v1.0.1-src/crates/imap/src/op/acl.rs:177, inserted before :294 | Mail spec 6.3, ruling I3: no grant is added to or widened on a key account's mailbox; a removal or a narrowing passes. |
+| 3 | `crates/imap/src/op/acl.rs:470` | `get_acl_mailbox` | b | v1.0.1-src/crates/imap/src/op/acl.rs:398, inserted after :407 | Mail spec 6.3, ruling R34: GETACL, MYRIGHTS, SETACL and DELETEACL name a key account's mailbox only in its own sessions. |
 
 #### `crates/imap/src/op/authenticate.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/imap/src/op/authenticate.rs:69` | `authenticate` | c | v1.0.1-src/crates/imap/src/op/authenticate.rs:132 | `let (access_token, session_keys) = self` in place of `let access_token = self` |
+| 2 | `crates/imap/src/op/authenticate.rs:69` | `authenticate` | c | v1.0.1-src/crates/imap/src/op/authenticate.rs:132, inserted after :138 | `let (access_token, session_keys) = self` in place of `let access_token = self` |
 | 3 | `crates/imap/src/op/authenticate.rs:94` | `authenticate` | c | v1.0.1-src/crates/imap/src/op/authenticate.rs:132 | Mail spec 4: a key account's session exists only with its keys. |
 
 #### `crates/imap/src/op/copy_move.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/imap/src/op/copy_move.rs:241` | `copy_move` | b | v1.0.1-src/crates/imap/src/op/copy_move.rs:126 | Mail spec 6.3: no copy or move into or out of a key account. |
+| 1 | `crates/imap/src/op/copy_move.rs:241` | `copy_move` | b | v1.0.1-src/crates/imap/src/op/copy_move.rs:126, inserted after :270 | Mail spec 6.3: no copy or move into or out of a key account. |
 | 2 | `crates/imap/src/op/copy_move.rs:604` | `copy_move` | c | v1.0.1-src/crates/imap/src/op/copy_move.rs:126 | Mail ruling R55: each chunk commits only while the source account holds no vault record. |
 
 #### `crates/imap/src/op/create.rs`
@@ -928,7 +945,7 @@ One row per hook, grouped by file:
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/imap/src/op/expunge.rs:139` | `expunge` | c | v1.0.1-src/crates/imap/src/op/expunge.rs:159 | Mail spec 6.3, ruling R34: nothing is expunged from a key account's mailbox through another account's session. EXPUNGE is refused before (`check_mailbox_acl`); CLOSE ... |
+| 1 | `crates/imap/src/op/expunge.rs:139` | `expunge` | c | v1.0.1-src/crates/imap/src/op/expunge.rs:159, inserted after :166 | Mail spec 6.3, ruling R34: nothing is expunged from a key account's mailbox through another account's session. EXPUNGE is refused before (`check_mailbox_acl`); CLOSE ... |
 
 #### `crates/imap/src/op/fetch.rs`
 
@@ -956,7 +973,7 @@ One row per hook, grouped by file:
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/imap/src/op/search.rs:266` | `query` | b | v1.0.1-src/crates/imap/src/op/search.rs:286 | Mail spec 6.3, ruling R34: SEARCH, SORT and THREAD read a key account's mailbox only in its own sessions. |
+| 2 | `crates/imap/src/op/search.rs:266` | `query` | b | v1.0.1-src/crates/imap/src/op/search.rs:286, inserted after :293 | Mail spec 6.3, ruling R34: SEARCH, SORT and THREAD read a key account's mailbox only in its own sessions. |
 | 3 | `crates/imap/src/op/search.rs:725` | `query` | c | v1.0.1-src/crates/imap/src/op/search.rs:286 | Mail spec 8: true when the filter key needs a message's sealed content (header values, body text, the sent date). The match has no wildcard, so a key added upstream ... |
 | 4 | `crates/imap/src/op/search.rs:878` | `unwrap` | b | v1.0.1-src/crates/imap/src/op/search.rs:844 | Every `Filter` variant with its verdict (mail spec 8). The table pins today's verdicts; the compile-time guard against a new variant is the exhaustive match in ... |
 
@@ -971,199 +988,199 @@ One row per hook, grouped by file:
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/imap/src/op/subscribe.rs:72` | `subscribe_folder` | b | v1.0.1-src/crates/imap/src/op/subscribe.rs:50 | Mail spec 6.3, rulings R34 and R35: before the write. |
+| 1 | `crates/imap/src/op/subscribe.rs:72` | `subscribe_folder` | b | v1.0.1-src/crates/imap/src/op/subscribe.rs:50, inserted after :72 | Mail spec 6.3, rulings R34 and R35: before the write. |
 
 #### `crates/jmap/Cargo.toml`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/jmap/Cargo.toml:19` | top level | c | v1.0.1-src/crates/jmap/Cargo.toml:1 | `vault = { path = "../vault" }` |
+| 1 | `crates/jmap/Cargo.toml:19` | top level | c | v1.0.1-src/crates/jmap/Cargo.toml:1, inserted after :21 | `vault = { path = "../vault" }` |
 
 #### `crates/jmap/src/api/request.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/jmap/src/api/request.rs:99` | `handle_jmap_request` | b | v1.0.1-src/crates/jmap/src/api/request.rs:66 | `let error = za_method_error_for_trace(self, access_token, error).await;` |
-| 3 | `crates/jmap/src/api/request.rs:206` | `handle_jmap_request` | b | v1.0.1-src/crates/jmap/src/api/request.rs:66 | `let error = za_method_error_for_trace(self, access_token, error).await;` |
-| 4 | `crates/jmap/src/api/request.rs:256` | `handle_method_call` | b | v1.0.1-src/crates/jmap/src/api/request.rs:75 | `za_assert_mail_keys(self, access_token, req.account_id).await?;` |
-| 5 | `crates/jmap/src/api/request.rs:285` | `handle_method_call` | b | v1.0.1-src/crates/jmap/src/api/request.rs:75 | `self.za_assert_mail_route(access_token, req.account_id.document_id())` |
-| 6 | `crates/jmap/src/api/request.rs:318` | `handle_method_call` | b | v1.0.1-src/crates/jmap/src/api/request.rs:75 | `za_assert_mail_keys(self, access_token, req.account_id).await?;` |
-| 7 | `crates/jmap/src/api/request.rs:347` | `handle_method_call` | c | v1.0.1-src/crates/jmap/src/api/request.rs:75 | `za_assert_calendar_allowed(self, req.account_id).await?;` |
-| 8 | `crates/jmap/src/api/request.rs:370` | `handle_method_call` | c | v1.0.1-src/crates/jmap/src/api/request.rs:75 | `za_assert_calendar_allowed(self, req.account_id).await?;` |
-| 9 | `crates/jmap/src/api/request.rs:397` | `handle_method_call` | b | v1.0.1-src/crates/jmap/src/api/request.rs:75 | `self.za_assert_mail_route(access_token, req.account_id.document_id())` |
-| 10 | `crates/jmap/src/api/request.rs:454` | `handle_method_call` | c | v1.0.1-src/crates/jmap/src/api/request.rs:75 | `za_assert_calendar_allowed(self, req.account_id).await?;` |
-| 11 | `crates/jmap/src/api/request.rs:497` | `handle_method_call` | b | v1.0.1-src/crates/jmap/src/api/request.rs:75 | `self.za_assert_mail_route(access_token, req.account_id.document_id())` |
-| 12 | `crates/jmap/src/api/request.rs:519` | `handle_method_call` | b | v1.0.1-src/crates/jmap/src/api/request.rs:75 | `za_assert_mail_keys(self, access_token, req.account_id).await?;` in place of `self.email_submission_set(*req, &session.instance, next_call)` |
-| 13 | `crates/jmap/src/api/request.rs:576` | `handle_method_call` | b | v1.0.1-src/crates/jmap/src/api/request.rs:75 | `za_assert_calendar_allowed(self, req.account_id).await?;` |
-| 14 | `crates/jmap/src/api/request.rs:592` | `handle_method_call` | c | v1.0.1-src/crates/jmap/src/api/request.rs:75 | `za_assert_calendar_allowed(self, req.account_id).await?;` |
-| 15 | `crates/jmap/src/api/request.rs:601` | `handle_method_call` | c | v1.0.1-src/crates/jmap/src/api/request.rs:75 | `za_assert_calendar_allowed(self, req.account_id).await?;` |
-| 16 | `crates/jmap/src/api/request.rs:634` | `handle_method_call` | c | v1.0.1-src/crates/jmap/src/api/request.rs:75 | `za_assert_mail_keys(self, access_token, req.account_id).await?;` |
-| 17 | `crates/jmap/src/api/request.rs:644` | `handle_method_call` | c | v1.0.1-src/crates/jmap/src/api/request.rs:75 | `za_assert_mail_keys(self, access_token, req.account_id).await?;` |
-| 18 | `crates/jmap/src/api/request.rs:667` | `handle_method_call` | c | v1.0.1-src/crates/jmap/src/api/request.rs:75 | `za_assert_calendar_allowed(self, req.account_id).await?;` |
-| 19 | `crates/jmap/src/api/request.rs:690` | `handle_method_call` | b | v1.0.1-src/crates/jmap/src/api/request.rs:75 | `za_assert_mail_keys(self, access_token, req.account_id).await?;` |
-| 20 | `crates/jmap/src/api/request.rs:698` | `handle_method_call` | b | v1.0.1-src/crates/jmap/src/api/request.rs:75 | `za_assert_mail_keys(self, access_token, req.account_id).await?;` |
-| 21 | `crates/jmap/src/api/request.rs:711` | `handle_method_call` | b | v1.0.1-src/crates/jmap/src/api/request.rs:75 | `za_assert_calendar_allowed(self, req.account_id).await?;` |
-| 22 | `crates/jmap/src/api/request.rs:720` | `handle_method_call` | b | v1.0.1-src/crates/jmap/src/api/request.rs:75 | `za_assert_mail_keys(self, access_token, req.account_id).await?;` |
-| 23 | `crates/jmap/src/api/request.rs:733` | `handle_method_call` | b | v1.0.1-src/crates/jmap/src/api/request.rs:75 | `self.za_assert_mail_route(access_token, req.account_id.document_id())` |
-| 24 | `crates/jmap/src/api/request.rs:761` | `handle_method_call` | c | v1.0.1-src/crates/jmap/src/api/request.rs:75 | Spec 9: JMAP calendar methods are not offered for key accounts in this release. An unknown account is not a key account: upstream's outcome stands. |
+| 2 | `crates/jmap/src/api/request.rs:99` | `handle_jmap_request` | b | v1.0.1-src/crates/jmap/src/api/request.rs:88, inserted before :108 | `let error = za_method_error_for_trace(self, access_token, error).await;` |
+| 3 | `crates/jmap/src/api/request.rs:206` | `handle_jmap_request` | b | v1.0.1-src/crates/jmap/src/api/request.rs:88, inserted before :234 | `let error = za_method_error_for_trace(self, access_token, error).await;` |
+| 4 | `crates/jmap/src/api/request.rs:256` | `handle_method_call` | b | v1.0.1-src/crates/jmap/src/api/request.rs:263, inserted before :299 | `za_assert_mail_keys(self, access_token, req.account_id).await?;` |
+| 5 | `crates/jmap/src/api/request.rs:285` | `handle_method_call` | b | v1.0.1-src/crates/jmap/src/api/request.rs:263, inserted before :311 | `self.za_assert_mail_route(access_token, req.account_id.document_id())` |
+| 6 | `crates/jmap/src/api/request.rs:318` | `handle_method_call` | b | v1.0.1-src/crates/jmap/src/api/request.rs:263, inserted before :344 | `za_assert_mail_keys(self, access_token, req.account_id).await?;` |
+| 7 | `crates/jmap/src/api/request.rs:347` | `handle_method_call` | c | v1.0.1-src/crates/jmap/src/api/request.rs:263, inserted before :393 | `za_assert_calendar_allowed(self, req.account_id).await?;` |
+| 8 | `crates/jmap/src/api/request.rs:370` | `handle_method_call` | c | v1.0.1-src/crates/jmap/src/api/request.rs:263 | `za_assert_calendar_allowed(self, req.account_id).await?;` |
+| 9 | `crates/jmap/src/api/request.rs:397` | `handle_method_call` | b | v1.0.1-src/crates/jmap/src/api/request.rs:263, inserted before :437 | `self.za_assert_mail_route(access_token, req.account_id.document_id())` |
+| 10 | `crates/jmap/src/api/request.rs:454` | `handle_method_call` | c | v1.0.1-src/crates/jmap/src/api/request.rs:263, inserted before :499 | `za_assert_calendar_allowed(self, req.account_id).await?;` |
+| 11 | `crates/jmap/src/api/request.rs:497` | `handle_method_call` | b | v1.0.1-src/crates/jmap/src/api/request.rs:263 | `self.za_assert_mail_route(access_token, req.account_id.document_id())` |
+| 12 | `crates/jmap/src/api/request.rs:519` | `handle_method_call` | b | v1.0.1-src/crates/jmap/src/api/request.rs:263 | `za_assert_mail_keys(self, access_token, req.account_id).await?;` in place of `self.email_submission_set(*req, &session.instance, next_call)` |
+| 13 | `crates/jmap/src/api/request.rs:576` | `handle_method_call` | b | v1.0.1-src/crates/jmap/src/api/request.rs:263 | `za_assert_calendar_allowed(self, req.account_id).await?;` |
+| 14 | `crates/jmap/src/api/request.rs:592` | `handle_method_call` | c | v1.0.1-src/crates/jmap/src/api/request.rs:263, inserted before :615 | `za_assert_calendar_allowed(self, req.account_id).await?;` |
+| 15 | `crates/jmap/src/api/request.rs:601` | `handle_method_call` | c | v1.0.1-src/crates/jmap/src/api/request.rs:263 | `za_assert_calendar_allowed(self, req.account_id).await?;` |
+| 16 | `crates/jmap/src/api/request.rs:634` | `handle_method_call` | c | v1.0.1-src/crates/jmap/src/api/request.rs:263 | `za_assert_mail_keys(self, access_token, req.account_id).await?;` |
+| 17 | `crates/jmap/src/api/request.rs:644` | `handle_method_call` | c | v1.0.1-src/crates/jmap/src/api/request.rs:263, inserted before :677 | `za_assert_mail_keys(self, access_token, req.account_id).await?;` |
+| 18 | `crates/jmap/src/api/request.rs:667` | `handle_method_call` | c | v1.0.1-src/crates/jmap/src/api/request.rs:263 | `za_assert_calendar_allowed(self, req.account_id).await?;` |
+| 19 | `crates/jmap/src/api/request.rs:690` | `handle_method_call` | b | v1.0.1-src/crates/jmap/src/api/request.rs:263 | `za_assert_mail_keys(self, access_token, req.account_id).await?;` |
+| 20 | `crates/jmap/src/api/request.rs:698` | `handle_method_call` | b | v1.0.1-src/crates/jmap/src/api/request.rs:263, inserted before :741 | `za_assert_mail_keys(self, access_token, req.account_id).await?;` |
+| 21 | `crates/jmap/src/api/request.rs:711` | `handle_method_call` | b | v1.0.1-src/crates/jmap/src/api/request.rs:263, inserted before :753 | `za_assert_calendar_allowed(self, req.account_id).await?;` |
+| 22 | `crates/jmap/src/api/request.rs:720` | `handle_method_call` | b | v1.0.1-src/crates/jmap/src/api/request.rs:263, inserted before :763 | `za_assert_mail_keys(self, access_token, req.account_id).await?;` |
+| 23 | `crates/jmap/src/api/request.rs:733` | `handle_method_call` | b | v1.0.1-src/crates/jmap/src/api/request.rs:263, inserted before :781 | `self.za_assert_mail_route(access_token, req.account_id.document_id())` |
+| 24 | `crates/jmap/src/api/request.rs:761` | `handle_method_call` | c | v1.0.1-src/crates/jmap/src/api/request.rs:263 | Spec 9: JMAP calendar methods are not offered for key accounts in this release. An unknown account is not a key account: upstream's outcome stands. |
 
 #### `crates/jmap/src/api/session.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/jmap/src/api/session.rs:39` | `handle_session_resource` | c | v1.0.1-src/crates/jmap/src/api/session.rs:22 | Spec 9: JMAP calendars are not offered for key accounts. |
-| 2 | `crates/jmap/src/api/session.rs:78` | `handle_session_resource` | c | v1.0.1-src/crates/jmap/src/api/session.rs:22 | `let is_key = account.is_key_account();` in place of `for capability in access_token.account_capabilities() {` |
+| 1 | `crates/jmap/src/api/session.rs:39` | `handle_session_resource` | c | v1.0.1-src/crates/jmap/src/api/session.rs:103, inserted after :124 | Spec 9: JMAP calendars are not offered for key accounts. |
+| 2 | `crates/jmap/src/api/session.rs:78` | `handle_session_resource` | c | v1.0.1-src/crates/jmap/src/api/session.rs:103 | `let is_key = account.is_key_account();` in place of `for capability in access_token.account_capabilities() {` |
 
 #### `crates/jmap/src/blob/copy.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/jmap/src/blob/copy.rs:45` | `blob_copy` | b | v1.0.1-src/crates/jmap/src/blob/copy.rs:24 | Mail spec 6.3, 9: no blob copy into or out of a key account. |
+| 2 | `crates/jmap/src/blob/copy.rs:45` | `blob_copy` | b | v1.0.1-src/crates/jmap/src/blob/copy.rs:32, inserted after :43 | Mail spec 6.3, 9: no blob copy into or out of a key account. |
 
 #### `crates/jmap/src/blob/download.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/jmap/src/blob/download.rs:47` | `blob_download` | c | v1.0.1-src/crates/jmap/src/blob/download.rs:101 | Mail spec 5.7, 7: a key account's message or upload, opened with the request's keys. |
-| 3 | `crates/jmap/src/blob/download.rs:136` | `has_access_blob` | c | v1.0.1-src/crates/jmap/src/blob/download.rs:119 | Spec 9: never for a key account's calendar data. |
-| 4 | `crates/jmap/src/blob/download.rs:179` | `has_access_blob` | c | v1.0.1-src/crates/jmap/src/blob/download.rs:119 | Mail spec 5.7, 7: a key account's message, or a section of it, read through the unsealed pair as upstream reads the stored one: a section id applies its offsets, which ... |
+| 2 | `crates/jmap/src/blob/download.rs:47` | `blob_download` | c | v1.0.1-src/crates/jmap/src/blob/download.rs:127 | Mail spec 5.7, 7: a key account's message or upload, opened with the request's keys. |
+| 3 | `crates/jmap/src/blob/download.rs:136` | `has_access_blob` | c | v1.0.1-src/crates/jmap/src/blob/download.rs:216, inserted before :261 | Spec 9: never for a key account's calendar data. |
+| 4 | `crates/jmap/src/blob/download.rs:179` | `has_access_blob` | c | v1.0.1-src/crates/jmap/src/blob/download.rs:216 | Mail spec 5.7, 7: a key account's message, or a section of it, read through the unsealed pair as upstream reads the stored one: a section id applies its offsets, which ... |
 
 #### `crates/jmap/src/blob/upload.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/jmap/src/blob/upload.rs:52` | `blob_upload_many` | b | v1.0.1-src/crates/jmap/src/blob/upload.rs:30 | Mail spec 4, 5.7: a key account's uploads are sealed with its keys; a token without them is refused before anything is read. |
-| 3 | `crates/jmap/src/blob/upload.rs:106` | `blob_upload_many` | c | v1.0.1-src/crates/jmap/src/blob/upload.rs:30 | Mail spec 5.7: never a sealed source's stored bytes, a reference to an upload of this call included. |
-| 4 | `crates/jmap/src/blob/upload.rs:209` | `blob_upload_many` | b | v1.0.1-src/crates/jmap/src/blob/upload.rs:30 | Mail spec 5.7: a key account's upload is sealed. |
-| 5 | `crates/jmap/src/blob/upload.rs:235` | `blob_upload` | c | v1.0.1-src/crates/jmap/src/blob/upload.rs:36 | Mail spec 4, 5.7: a key account's upload is sealed with its keys; a token without them is refused here too, whatever the caller checked (`/jmap/upload` answers 403 ... |
-| 6 | `crates/jmap/src/blob/upload.rs:275` | `blob_upload` | b | v1.0.1-src/crates/jmap/src/blob/upload.rs:36 | Mail spec 5.7: a key account's upload is sealed. |
+| 2 | `crates/jmap/src/blob/upload.rs:52` | `blob_upload_many` | b | v1.0.1-src/crates/jmap/src/blob/upload.rs:46, inserted after :56 | Mail spec 4, 5.7: a key account's uploads are sealed with its keys; a token without them is refused before anything is read. |
+| 3 | `crates/jmap/src/blob/upload.rs:106` | `blob_upload_many` | c | v1.0.1-src/crates/jmap/src/blob/upload.rs:46 | Mail spec 5.7: never a sealed source's stored bytes, a reference to an upload of this call included. |
+| 4 | `crates/jmap/src/blob/upload.rs:209` | `blob_upload_many` | b | v1.0.1-src/crates/jmap/src/blob/upload.rs:46, inserted after :209 | Mail spec 5.7: a key account's upload is sealed. |
+| 5 | `crates/jmap/src/blob/upload.rs:235` | `blob_upload` | c | v1.0.1-src/crates/jmap/src/blob/upload.rs:220 | Mail spec 4, 5.7: a key account's upload is sealed with its keys; a token without them is refused here too, whatever the caller checked (`/jmap/upload` answers 403 ... |
+| 6 | `crates/jmap/src/blob/upload.rs:275` | `blob_upload` | b | v1.0.1-src/crates/jmap/src/blob/upload.rs:220, inserted after :263 | Mail spec 5.7: a key account's upload is sealed. |
 
 #### `crates/jmap/src/calendar_event/set.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/jmap/src/calendar_event/set.rs:434` | `calendar_event_set` | c | v1.0.1-src/crates/jmap/src/calendar_event/set.rs:109 | The JMAP target is never a key account (za_assert_calendar_allowed): the owner is plain and upstream's Send applies, as on DAV (spec 5.1). |
-| 3 | `crates/jmap/src/calendar_event/set.rs:563` | `calendar_event_set` | b | v1.0.1-src/crates/jmap/src/calendar_event/set.rs:109 | `cache` in place of `cache.format_resource_path_by_parent(document_id, calendar_id)` |
-| 4 | `crates/jmap/src/calendar_event/set.rs:577` | `calendar_event_set` | b | v1.0.1-src/crates/jmap/src/calendar_event/set.rs:109 | `for (calendar_id, path) in vanished_paths {` in place of `for path in vanished_paths {` |
-| 5 | `crates/jmap/src/calendar_event/set.rs:648` | `calendar_event_set` | c | v1.0.1-src/crates/jmap/src/calendar_event/set.rs:109 | The JMAP target is never a key account (za_assert_calendar_allowed): the owner is plain and upstream's Send applies, as on DAV (spec 5.1). |
-| 6 | `crates/jmap/src/calendar_event/set.rs:671` | `calendar_event_set` | b | v1.0.1-src/crates/jmap/src/calendar_event/set.rs:109 | Retain each source link before consuming the archive. The path cannot be used to reconstruct identity when calendar names collide. |
-| 7 | `crates/jmap/src/calendar_event/set.rs:695` | `calendar_event_set` | b | v1.0.1-src/crates/jmap/src/calendar_event/set.rs:109 | `for (calendar_id, path) in vanished_paths {` in place of `for path in cache.format_resource_paths_by_id(document_id) {` |
-| 8 | `crates/jmap/src/calendar_event/set.rs:854` | `create_calendar_event` | c | v1.0.1-src/crates/jmap/src/calendar_event/set.rs:117 | The JMAP target is never a key account (za_assert_calendar_allowed): the owner is plain and upstream's Send applies, as on DAV (spec 5.1). |
+| 2 | `crates/jmap/src/calendar_event/set.rs:434` | `calendar_event_set` | c | v1.0.1-src/crates/jmap/src/calendar_event/set.rs:182 | The JMAP target is never a key account (za_assert_calendar_allowed): the owner is plain and upstream's Send applies, as on DAV (spec 5.1). |
+| 3 | `crates/jmap/src/calendar_event/set.rs:563` | `calendar_event_set` | b | v1.0.1-src/crates/jmap/src/calendar_event/set.rs:182, inserted after :1324 | `cache` in place of `cache.format_resource_path_by_parent(document_id, calendar_id)` |
+| 4 | `crates/jmap/src/calendar_event/set.rs:577` | `calendar_event_set` | b | v1.0.1-src/crates/jmap/src/calendar_event/set.rs:182 | `for (calendar_id, path) in vanished_paths {` in place of `for path in vanished_paths {` |
+| 5 | `crates/jmap/src/calendar_event/set.rs:648` | `calendar_event_set` | c | v1.0.1-src/crates/jmap/src/calendar_event/set.rs:182 | The JMAP target is never a key account (za_assert_calendar_allowed): the owner is plain and upstream's Send applies, as on DAV (spec 5.1). |
+| 6 | `crates/jmap/src/calendar_event/set.rs:671` | `calendar_event_set` | b | v1.0.1-src/crates/jmap/src/calendar_event/set.rs:182, inserted before :1540 | Retain each source link before consuming the archive. The path cannot be used to reconstruct identity when calendar names collide. |
+| 7 | `crates/jmap/src/calendar_event/set.rs:695` | `calendar_event_set` | b | v1.0.1-src/crates/jmap/src/calendar_event/set.rs:182, inserted before :1577 | `for (calendar_id, path) in vanished_paths {` in place of `for path in cache.format_resource_paths_by_id(document_id) {` |
+| 8 | `crates/jmap/src/calendar_event/set.rs:854` | `create_calendar_event` | c | v1.0.1-src/crates/jmap/src/calendar_event/set.rs:1609 | The JMAP target is never a key account (za_assert_calendar_allowed): the owner is plain and upstream's Send applies, as on DAV (spec 5.1). |
 
 #### `crates/jmap/src/changes/get.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/jmap/src/changes/get.rs:94` | `changes` | c | v1.0.1-src/crates/jmap/src/changes/get.rs:59 | `za_assert_calendar_allowed(self, request.account_id).await?;` |
-| 3 | `crates/jmap/src/changes/get.rs:119` | `changes` | c | v1.0.1-src/crates/jmap/src/changes/get.rs:59 | Mail spec 6.3, ruling R34: a key account's mail changes are read only by its own sessions (Email, Mailbox, Thread and EmailSubmission `/changes`, and the `/queryChanges` ... |
+| 2 | `crates/jmap/src/changes/get.rs:94` | `changes` | c | v1.0.1-src/crates/jmap/src/changes/get.rs:147, inserted after :196 | `za_assert_calendar_allowed(self, request.account_id).await?;` |
+| 3 | `crates/jmap/src/changes/get.rs:119` | `changes` | c | v1.0.1-src/crates/jmap/src/changes/get.rs:147 | Mail spec 6.3, ruling R34: a key account's mail changes are read only by its own sessions (Email, Mailbox, Thread and EmailSubmission `/changes`, and the `/queryChanges` ... |
 
 #### `crates/jmap/src/changes/query.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/jmap/src/changes/query.rs:57` | `query_changes` | b | v1.0.1-src/crates/jmap/src/changes/query.rs:33 | Mail spec 8: refused here as well, since an unchanged state returns below without running the query. |
+| 2 | `crates/jmap/src/changes/query.rs:57` | `query_changes` | b | v1.0.1-src/crates/jmap/src/changes/query.rs:42 | Mail spec 8: refused here as well, since an unchanged state returns below without running the query. |
 
 #### `crates/jmap/src/email/copy.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/jmap/src/email/copy.rs:67` | `email_copy` | c | v1.0.1-src/crates/jmap/src/email/copy.rs:56 | Mail spec 6.3: no copy into or out of a key account. |
-| 2 | `crates/jmap/src/email/copy.rs:248` | `email_copy` | c | v1.0.1-src/crates/jmap/src/email/copy.rs:56 | Mail ruling R55: each chunk commits only while the source account holds no vault record. |
+| 1 | `crates/jmap/src/email/copy.rs:67` | `email_copy` | c | v1.0.1-src/crates/jmap/src/email/copy.rs:67, inserted after :81 | Mail spec 6.3: no copy into or out of a key account. |
+| 2 | `crates/jmap/src/email/copy.rs:248` | `email_copy` | c | v1.0.1-src/crates/jmap/src/email/copy.rs:67 | Mail ruling R55: each chunk commits only while the source account holds no vault record. |
 
 #### `crates/jmap/src/email/get.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 3 | `crates/jmap/src/email/get.rs:150` | `email_get` | c | v1.0.1-src/crates/jmap/src/email/get.rs:53 | Mail spec 7: the account's keys, once for the request. Only these properties are served without the message's content (from the cache and the stored stub's visible ... |
-| 4 | `crates/jmap/src/email/get.rs:190` | `email_get` | c | v1.0.1-src/crates/jmap/src/email/get.rs:53 | Mail spec 7, 10: the unsealed view, when the properties read content; an unreadable message is not found. |
-| 5 | `crates/jmap/src/email/get.rs:228` | `email_get` | c | v1.0.1-src/crates/jmap/src/email/get.rs:53 | Mail spec 7, 10: the opened blob (a view opened a stub). |
+| 3 | `crates/jmap/src/email/get.rs:150` | `email_get` | c | v1.0.1-src/crates/jmap/src/email/get.rs:63 | Mail spec 7: the account's keys, once for the request. Only these properties are served without the message's content (from the cache and the stored stub's visible ... |
+| 4 | `crates/jmap/src/email/get.rs:190` | `email_get` | c | v1.0.1-src/crates/jmap/src/email/get.rs:63 | Mail spec 7, 10: the unsealed view, when the properties read content; an unreadable message is not found. |
+| 5 | `crates/jmap/src/email/get.rs:228` | `email_get` | c | v1.0.1-src/crates/jmap/src/email/get.rs:63 | Mail spec 7, 10: the opened blob (a view opened a stub). |
 
 #### `crates/jmap/src/email/import.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/jmap/src/email/import.rs:89` | `email_import` | c | v1.0.1-src/crates/jmap/src/email/import.rs:42 | Ruling R31 (mail spec 6.3): no sealed source of another account becomes this account's message; every id is checked before the first import. |
+| 2 | `crates/jmap/src/email/import.rs:89` | `email_import` | c | v1.0.1-src/crates/jmap/src/email/import.rs:52, inserted after :98 | Ruling R31 (mail spec 6.3): no sealed source of another account becomes this account's message; every id is checked before the first import. |
 
 #### `crates/jmap/src/email/mod.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/jmap/src/email/mod.rs:19` | `pub mod snippet;` | b | v1.0.1-src/crates/jmap/src/email/mod.rs:26 | fork module declaration `pub mod za` (search, sort and snippet refusals) |
+| 1 | `crates/jmap/src/email/mod.rs:19` | `pub mod snippet;` | b | v1.0.1-src/crates/jmap/src/email/mod.rs:26, inserted after :26 | fork module declaration `pub mod za` (search, sort and snippet refusals) |
 
 #### `crates/jmap/src/email/query.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/jmap/src/email/query.rs:44` | `email_query` | c | v1.0.1-src/crates/jmap/src/email/query.rs:57 | Mail spec 8: a key account's search index holds the arrival time and the size only; a filter or sort that needs content is refused before the query runs, rather than ... |
+| 2 | `crates/jmap/src/email/query.rs:44` | `email_query` | c | v1.0.1-src/crates/jmap/src/email/query.rs:104, inserted after :110 | Mail spec 8: a key account's search index holds the arrival time and the size only; a filter or sort that needs content is refused before the query runs, rather than ... |
 
 #### `crates/jmap/src/email/set.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 3 | `crates/jmap/src/email/set.rs:122` | `email_set` | b | v1.0.1-src/crates/jmap/src/email/set.rs:78 | Mail spec 4: a create needs the account's keys; updates and destroys do not. |
-| 4 | `crates/jmap/src/email/set.rs:587` | `email_set` | c | v1.0.1-src/crates/jmap/src/email/set.rs:78 | Ruling R31 (mail spec 6.3): no sealed source of another account in this account's message. |
+| 3 | `crates/jmap/src/email/set.rs:122` | `email_set` | b | v1.0.1-src/crates/jmap/src/email/set.rs:88, inserted after :153 | Mail spec 4: a create needs the account's keys; updates and destroys do not. |
+| 4 | `crates/jmap/src/email/set.rs:587` | `email_set` | c | v1.0.1-src/crates/jmap/src/email/set.rs:88, inserted after :688 | Ruling R31 (mail spec 6.3): no sealed source of another account in this account's message. |
 
 #### `crates/jmap/src/email/snippet.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 3 | `crates/jmap/src/email/snippet.rs:49` | `email_search_snippet` | b | v1.0.1-src/crates/jmap/src/email/snippet.rs:42 | Mail spec 8: snippets mark terms in sealed content, which a search cannot find; a key account's request carrying a text, subject or body property is refused before any ... |
-| 4 | `crates/jmap/src/email/snippet.rs:124` | `email_search_snippet` | c | v1.0.1-src/crates/jmap/src/email/snippet.rs:42 | Mail spec 7, 8: the account's keys, once for the request; without terms nothing is read. Defence in depth: a key account's request with terms is refused above, so this ... |
-| 5 | `crates/jmap/src/email/snippet.rs:171` | `email_search_snippet` | c | v1.0.1-src/crates/jmap/src/email/snippet.rs:42 | Mail spec 7, 10: the unsealed view; an unreadable message is not found. |
-| 6 | `crates/jmap/src/email/snippet.rs:202` | `email_search_snippet` | c | v1.0.1-src/crates/jmap/src/email/snippet.rs:42 | `let Some(raw_body) = za_readable(` |
+| 3 | `crates/jmap/src/email/snippet.rs:49` | `email_search_snippet` | b | v1.0.1-src/crates/jmap/src/email/snippet.rs:50, inserted after :54 | Mail spec 8: snippets mark terms in sealed content, which a search cannot find; a key account's request carrying a text, subject or body property is refused before any ... |
+| 4 | `crates/jmap/src/email/snippet.rs:124` | `email_search_snippet` | c | v1.0.1-src/crates/jmap/src/email/snippet.rs:50, inserted after :131 | Mail spec 7, 8: the account's keys, once for the request; without terms nothing is read. Defence in depth: a key account's request with terms is refused above, so this ... |
+| 5 | `crates/jmap/src/email/snippet.rs:171` | `email_search_snippet` | c | v1.0.1-src/crates/jmap/src/email/snippet.rs:50 | Mail spec 7, 10: the unsealed view; an unreadable message is not found. |
+| 6 | `crates/jmap/src/email/snippet.rs:202` | `email_search_snippet` | c | v1.0.1-src/crates/jmap/src/email/snippet.rs:50 | `let Some(raw_body) = za_readable(` |
 
 #### `crates/jmap/src/file/copy.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/jmap/src/file/copy.rs:176` | `file_node_copy` | c | v1.0.1-src/crates/jmap/src/file/copy.rs:40 | Mail spec 5.7: a sealed source is never a file's blob. |
+| 2 | `crates/jmap/src/file/copy.rs:176` | `file_node_copy` | c | v1.0.1-src/crates/jmap/src/file/copy.rs:51 | Mail spec 5.7: a sealed source is never a file's blob. |
 
 #### `crates/jmap/src/file/set.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/jmap/src/file/set.rs:96` | `file_node_set` | c | v1.0.1-src/crates/jmap/src/file/set.rs:56 | Mail spec 5.7: a sealed source is never a file's blob. |
-| 3 | `crates/jmap/src/file/set.rs:360` | `file_node_set` | c | v1.0.1-src/crates/jmap/src/file/set.rs:56 | Mail spec 5.7: a sealed source is never a file's blob. |
+| 2 | `crates/jmap/src/file/set.rs:96` | `file_node_set` | c | v1.0.1-src/crates/jmap/src/file/set.rs:159 | Mail spec 5.7: a sealed source is never a file's blob. |
+| 3 | `crates/jmap/src/file/set.rs:360` | `file_node_set` | c | v1.0.1-src/crates/jmap/src/file/set.rs:159 | Mail spec 5.7: a sealed source is never a file's blob. |
 
 #### `crates/jmap/src/mailbox/set.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/jmap/src/mailbox/set.rs:615` | `mailbox_set_item` | c | v1.0.1-src/crates/jmap/src/mailbox/set.rs:150 | Mail spec 6.3, ruling I3: no grant is added to or widened on a key account's mailbox; a removal or a narrowing passes. |
+| 2 | `crates/jmap/src/mailbox/set.rs:615` | `mailbox_set_item` | c | v1.0.1-src/crates/jmap/src/mailbox/set.rs:710 | Mail spec 6.3, ruling I3: no grant is added to or widened on a key account's mailbox; a removal or a narrowing passes. |
 
 #### `crates/jmap/src/principal/availability.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/jmap/src/principal/availability.rs:107` | `principal_get_availability` | b | v1.0.1-src/crates/jmap/src/principal/availability.rs:52 | Spec 9: a key account contributes no busy periods. |
+| 1 | `crates/jmap/src/principal/availability.rs:107` | `principal_get_availability` | b | v1.0.1-src/crates/jmap/src/principal/availability.rs:60, inserted after :164 | Spec 9: a key account contributes no busy periods. |
 
 #### `crates/jmap/src/principal/get.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/jmap/src/principal/get.rs:84` | `principal_get` | c | v1.0.1-src/crates/jmap/src/principal/get.rs:29 | `let is_key = principal.is_key_account();` |
-| 2 | `crates/jmap/src/principal/get.rs:155` | `principal_get` | c | v1.0.1-src/crates/jmap/src/principal/get.rs:29 | `.filter(\|(key, _)\| za_shown_capability(is_key, key)),` |
-| 3 | `crates/jmap/src/principal/get.rs:173` | `principal_get` | c | v1.0.1-src/crates/jmap/src/principal/get.rs:29 | `.filter(\|(key, _)\| za_shown_capability(is_key, key)),` |
-| 4 | `crates/jmap/src/principal/get.rs:187` | `principal_get` | b | v1.0.1-src/crates/jmap/src/principal/get.rs:29 | Spec 9: a key account's principal advertises no calendars capability. |
+| 1 | `crates/jmap/src/principal/get.rs:84` | `principal_get` | c | v1.0.1-src/crates/jmap/src/principal/get.rs:43, inserted before :110 | `let is_key = principal.is_key_account();` |
+| 2 | `crates/jmap/src/principal/get.rs:155` | `principal_get` | c | v1.0.1-src/crates/jmap/src/principal/get.rs:43, inserted before :139 | `.filter(\|(key, _)\| za_shown_capability(is_key, key)),` |
+| 3 | `crates/jmap/src/principal/get.rs:173` | `principal_get` | c | v1.0.1-src/crates/jmap/src/principal/get.rs:43, inserted after :150 | `.filter(\|(key, _)\| za_shown_capability(is_key, key)),` |
+| 4 | `crates/jmap/src/principal/get.rs:187` | `principal_get` | b | v1.0.1-src/crates/jmap/src/principal/get.rs:43, inserted after :197 | Spec 9: a key account's principal advertises no calendars capability. |
 
 #### `crates/jmap/src/registry/mapping/account.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
 | 1 | `crates/jmap/src/registry/mapping/account.rs:135` | `account_set` | b | v1.0.1-src/crates/jmap/src/registry/mapping/account.rs:59 | `if old_credential.secret == vault::ZA_MARKER {` |
-| 2 | `crates/jmap/src/registry/mapping/account.rs:355` | `account_set` | b | v1.0.1-src/crates/jmap/src/registry/mapping/account.rs:59 | `.is_some_and(\|c\| c.secret == vault::ZA_MARKER)` |
+| 2 | `crates/jmap/src/registry/mapping/account.rs:355` | `account_set` | b | v1.0.1-src/crates/jmap/src/registry/mapping/account.rs:59, inserted after :353 | `.is_some_and(\|c\| c.secret == vault::ZA_MARKER)` |
 
 #### `crates/jmap/src/registry/mapping/action.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/jmap/src/registry/mapping/action.rs:389` | `classify_spam` | b | v1.0.1-src/crates/jmap/src/registry/mapping/action.rs:279 | The administrator's test classification of a message it supplied. |
+| 1 | `crates/jmap/src/registry/mapping/action.rs:389` | `classify_spam` | b | v1.0.1-src/crates/jmap/src/registry/mapping/action.rs:279, inserted after :423 | The administrator's test classification of a message it supplied. |
 
 #### `crates/jmap/src/registry/mapping/principal.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/jmap/src/registry/mapping/principal.rs:76` | `validate_account` | b | v1.0.1-src/crates/jmap/src/registry/mapping/principal.rs:42 | Key accounts: every credential edit goes through the account API (spec 4.2). Compared before the masked-secret restore, so echoing the masked view back is refused too. |
+| 1 | `crates/jmap/src/registry/mapping/principal.rs:76` | `validate_account` | b | v1.0.1-src/crates/jmap/src/registry/mapping/principal.rs:42, inserted after :90 | Key accounts: every credential edit goes through the account API (spec 4.2). Compared before the masked-secret restore, so echoing the masked view back is refused too. |
 
 #### `crates/jmap/src/registry/mapping/spam_sample.rs`
 
@@ -1175,50 +1192,50 @@ One row per hook, grouped by file:
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/jmap/src/sieve/set.rs:518` | `sieve_set_item` | b | v1.0.1-src/crates/jmap/src/sieve/set.rs:88 | Mail spec 5.7, ruling R32 (amended): a key account's message or section never becomes a script; its upload is read through `blob_download`, opened with the request's ... |
+| 2 | `crates/jmap/src/sieve/set.rs:518` | `sieve_set_item` | b | v1.0.1-src/crates/jmap/src/sieve/set.rs:606, inserted after :710 | Mail spec 5.7, ruling R32 (amended): a key account's message or section never becomes a script; its upload is read through `blob_download`, opened with the request's ... |
 
 #### `crates/jmap/src/submission/set.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/jmap/src/submission/set.rs:52` | `email_submission_set` | b | v1.0.1-src/crates/jmap/src/submission/set.rs:57 | `access_token` threaded into `email_submission_set` so the submission can open the sealed message |
-| 4 | `crates/jmap/src/submission/set.rs:73` | `email_submission_set` | b | v1.0.1-src/crates/jmap/src/submission/set.rs:57 | same, at the call site |
-| 5 | `crates/jmap/src/submission/set.rs:87` | `email_submission_set` | b | v1.0.1-src/crates/jmap/src/submission/set.rs:57 | `.send_message(account_id, access_token, &response, instance, object)` in place of `.send_message(account_id, &response, instance, object)` |
-| 6 | `crates/jmap/src/submission/set.rs:367` | `send_message` | b | v1.0.1-src/crates/jmap/src/submission/set.rs:64 | `access_token` parameter on `send_message` |
-| 7 | `crates/jmap/src/submission/set.rs:572` | `send_message` | c | v1.0.1-src/crates/jmap/src/submission/set.rs:64 | Mail spec 6.5, 7, 10: the unsealed view and blob; an unreadable message fails its submission. |
-| 8 | `crates/jmap/src/submission/set.rs:673` | `send_message` | c | v1.0.1-src/crates/jmap/src/submission/set.rs:64 | `let Some(message) = za_readable(` |
-| 9 | `crates/jmap/src/submission/set.rs:707` | `send_message` | c | v1.0.1-src/crates/jmap/src/submission/set.rs:64 | `message = Zeroizing::new(new_message);` in place of `message = new_message;` |
-| 10 | `crates/jmap/src/submission/set.rs:750` | `send_message` | c | v1.0.1-src/crates/jmap/src/submission/set.rs:64 | The bytes leave for the queue (mail spec 6.5). |
+| 2 | `crates/jmap/src/submission/set.rs:52` | `email_submission_set` | b | v1.0.1-src/crates/jmap/src/submission/set.rs:76, inserted before :79 | `access_token` threaded into `email_submission_set` so the submission can open the sealed message |
+| 4 | `crates/jmap/src/submission/set.rs:73` | `email_submission_set` | b | v1.0.1-src/crates/jmap/src/submission/set.rs:76, inserted after :78 | same, at the call site |
+| 5 | `crates/jmap/src/submission/set.rs:87` | `email_submission_set` | b | v1.0.1-src/crates/jmap/src/submission/set.rs:76, inserted after :108 | `.send_message(account_id, access_token, &response, instance, object)` in place of `.send_message(account_id, &response, instance, object)` |
+| 6 | `crates/jmap/src/submission/set.rs:367` | `send_message` | b | v1.0.1-src/crates/jmap/src/submission/set.rs:414, inserted after :416 | `access_token` parameter on `send_message` |
+| 7 | `crates/jmap/src/submission/set.rs:572` | `send_message` | c | v1.0.1-src/crates/jmap/src/submission/set.rs:414, inserted after :617 | Mail spec 6.5, 7, 10: the unsealed view and blob; an unreadable message fails its submission. |
+| 8 | `crates/jmap/src/submission/set.rs:673` | `send_message` | c | v1.0.1-src/crates/jmap/src/submission/set.rs:414 | `let Some(message) = za_readable(` |
+| 9 | `crates/jmap/src/submission/set.rs:707` | `send_message` | c | v1.0.1-src/crates/jmap/src/submission/set.rs:414, inserted before :696 | `message = Zeroizing::new(new_message);` in place of `message = new_message;` |
+| 10 | `crates/jmap/src/submission/set.rs:750` | `send_message` | c | v1.0.1-src/crates/jmap/src/submission/set.rs:414, inserted after :736 | The bytes leave for the queue (mail spec 6.5). |
 
 #### `crates/jmap/src/vacation/set.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/jmap/src/vacation/set.rs:434` | `build_script` | b | v1.0.1-src/crates/jmap/src/vacation/set.rs:45 | Issue #21 (mail spec 10), for every account: the compile error names its position only, as the compiler's message can quote the script, which holds the response's text. |
+| 1 | `crates/jmap/src/vacation/set.rs:434` | `build_script` | b | v1.0.1-src/crates/jmap/src/vacation/set.rs:331 | Issue #21 (mail spec 10), for every account: the compile error names its position only, as the compiler's message can quote the script, which holds the response's text. |
 
 #### `crates/jmap/src/websocket/stream.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/jmap/src/websocket/stream.rs:120` | `handle_websocket_stream` | b | v1.0.1-src/crates/jmap/src/websocket/stream.rs:41 | Spec section 10, "Traces": the parser's error can echo the message, which a key account's must not. |
+| 2 | `crates/jmap/src/websocket/stream.rs:120` | `handle_websocket_stream` | b | v1.0.1-src/crates/jmap/src/websocket/stream.rs:51 | Spec section 10, "Traces": the parser's error can echo the message, which a key account's must not. |
 
 #### `crates/main/Cargo.toml`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/main/Cargo.toml:7` | top level | c | v1.0.1-src/crates/main/Cargo.toml:1 | `version = "0.1.1-beta.1"` in place of `version = "0.16.27"` |
+| 1 | `crates/main/Cargo.toml:7` | top level | c | v1.0.1-src/crates/main/Cargo.toml:1, inserted after :9 | `version = "0.1.1-beta.1"` in place of `version = "0.16.27"` |
 
 #### `crates/managesieve/src/op/authenticate.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/managesieve/src/op/authenticate.rs:27` | `handle_authenticate` | c | v1.0.1-src/crates/managesieve/src/op/authenticate.rs:26 | Issue #20: the token is not quoted, as it can be a credential. |
+| 1 | `crates/managesieve/src/op/authenticate.rs:27` | `handle_authenticate` | c | v1.0.1-src/crates/managesieve/src/op/authenticate.rs:26, inserted after :34 | Issue #20: the token is not quoted, as it can be a credential. |
 
 #### `crates/pop3/src/client.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/pop3/src/client.rs:21` | `ingest` | b | v1.0.1-src/crates/pop3/src/client.rs:16 | Mail spec 10: a key account's session is masked throughout. |
+| 1 | `crates/pop3/src/client.rs:21` | `ingest` | b | v1.0.1-src/crates/pop3/src/client.rs:16, inserted after :20 | Mail spec 10: a key account's session is masked throughout. |
 | 2 | `crates/pop3/src/client.rs:80` | `ingest` | b | v1.0.1-src/crates/pop3/src/client.rs:16 | Issue #20: a parse error can quote client input (an unsupported mechanism) and is written after the read's earlier requests ran, which may authenticate: one read before ... |
 
 #### `crates/pop3/src/op/authenticate.rs`
@@ -1233,26 +1250,26 @@ One row per hook, grouped by file:
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
 | 2 | `crates/pop3/src/op/fetch.rs:42` | `handle_fetch` | c | v1.0.1-src/crates/pop3/src/op/fetch.rs:23 | Mail spec 7, 10: the unsealed view and blob; an unreadable message answers -ERR. |
-| 3 | `crates/pop3/src/op/fetch.rs:71` | `handle_fetch` | b | v1.0.1-src/crates/pop3/src/op/fetch.rs:23 | `let Some(bytes) = za_readable(` |
+| 3 | `crates/pop3/src/op/fetch.rs:71` | `handle_fetch` | b | v1.0.1-src/crates/pop3/src/op/fetch.rs:23, inserted before :56 | `let Some(bytes) = za_readable(` |
 | 4 | `crates/pop3/src/op/fetch.rs:119` | `handle_fetch` | b | v1.0.1-src/crates/pop3/src/op/fetch.rs:23 | Mail spec 10: the answer for a message that does not open. |
 
 #### `crates/services/Cargo.toml`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/services/Cargo.toml:36` | top level | c | v1.0.1-src/crates/services/Cargo.toml:1 | `test_mode = ["common/test_mode"]` in place of `test_mode = []` |
+| 1 | `crates/services/Cargo.toml:36` | top level | c | v1.0.1-src/crates/services/Cargo.toml:1, inserted after :39 | `test_mode = ["common/test_mode"]` in place of `test_mode = []` |
 
 #### `crates/services/src/state_manager/email_push.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/services/src/state_manager/email_push.rs:64` | `build_email_push_object` | b | v1.0.1-src/crates/services/src/state_manager/email_push.rs:55 | Mail spec 7: no content leaves a key account in a push (the manager already sends its state changes only). |
+| 1 | `crates/services/src/state_manager/email_push.rs:64` | `build_email_push_object` | b | v1.0.1-src/crates/services/src/state_manager/email_push.rs:55, inserted after :61 | Mail spec 7: no content leaves a key account in a push (the manager already sends its state changes only). |
 
 #### `crates/services/src/state_manager/push.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/services/src/state_manager/push.rs:368` | `spawn_push_manager` | b | v1.0.1-src/crates/services/src/state_manager/push.rs:33 | Mail spec 7: a key account's push carries state changes only. |
+| 1 | `crates/services/src/state_manager/push.rs:368` | `spawn_push_manager` | b | v1.0.1-src/crates/services/src/state_manager/push.rs:33, inserted after :375 | Mail spec 7: a key account's push carries state changes only. |
 
 #### `crates/services/src/task_manager/alarm.rs`
 
@@ -1289,14 +1306,14 @@ One row per hook, grouped by file:
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 3 | `crates/services/src/task_manager/scheduler.rs:136` | `spawn_task_scheduler` | b | v1.0.1-src/crates/services/src/task_manager/scheduler.rs:71 | Zero-access key cache sweep (process-local, every node) |
-| 4 | `crates/services/src/task_manager/scheduler.rs:239` | `spawn_task_scheduler` | b | v1.0.1-src/crates/services/src/task_manager/scheduler.rs:71 | the `ZaKeySweep` event calls `za_sweep_keys` and reschedules (spec 5 residency bound) |
+| 3 | `crates/services/src/task_manager/scheduler.rs:136` | `spawn_task_scheduler` | b | v1.0.1-src/crates/services/src/task_manager/scheduler.rs:71, inserted after :133 | Zero-access key cache sweep (process-local, every node) |
+| 4 | `crates/services/src/task_manager/scheduler.rs:239` | `spawn_task_scheduler` | b | v1.0.1-src/crates/services/src/task_manager/scheduler.rs:71, inserted before :242 | the `ZaKeySweep` event calls `za_sweep_keys` and reschedules (spec 5 residency bound) |
 
 #### `crates/smtp/src/core/mod.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/smtp/src/core/mod.rs:92` | `pub struct SessionData` | b | v1.0.1-src/crates/smtp/src/core/mod.rs:73 | Issue #20: the session wrote a 334 and the client's answer, which can carry a SASL response, has not ended its line yet. |
+| 1 | `crates/smtp/src/core/mod.rs:92` | `pub struct SessionData` | b | v1.0.1-src/crates/smtp/src/core/mod.rs:73, inserted after :106 | Issue #20: the session wrote a 334 and the client's answer, which can carry a SASL response, has not ended its line yet. |
 | 2 | `crates/smtp/src/core/mod.rs:175` | `new` | b | v1.0.1-src/crates/smtp/src/core/mod.rs:38 | Mail spec 10: the session is authenticated as a key account (submission); its reads are redacted. |
 | 3 | `crates/smtp/src/core/mod.rs:308` | `local` | b | v1.0.1-src/crates/smtp/src/core/mod.rs:237 | `SessionData::local` initialises `za_answers_334` and `za_key_rcpt` |
 
@@ -1304,81 +1321,81 @@ One row per hook, grouped by file:
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/smtp/src/inbound/data.rs:549` | `queue_message` | b | v1.0.1-src/crates/smtp/src/inbound/data.rs:78 | Mail spec 6.1 step 4: no autolearn sample, which stores the subject and the message, for a key account's message. |
+| 1 | `crates/smtp/src/inbound/data.rs:549` | `queue_message` | b | v1.0.1-src/crates/smtp/src/inbound/data.rs:78, inserted after :586 | Mail spec 6.1 step 4: no autolearn sample, which stores the subject and the message, for a key account's message. |
 | 2 | `crates/smtp/src/inbound/data.rs:741` | `queue_message` | b | v1.0.1-src/crates/smtp/src/inbound/data.rs:78 | Mail spec 10 and 6.1 step 4: a recipient added after RCPT (a milter or MTA hook's `AddRcpt`, the script's `SetEnvelope`) is classified too. |
 
 #### `crates/smtp/src/inbound/milter/client.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/smtp/src/inbound/milter/client.rs:22` | `connect` | b | v1.0.1-src/crates/smtp/src/inbound/milter/client.rs:26 | `pub async fn connect(config: &Milter, session_id: u64, redact: bool) -> Result<Self> {` in place of `pub async fn connect(config: &Milter, session_id: u64) -> Result<Self> {` |
-| 2 | `crates/smtp/src/inbound/milter/client.rs:50` | `connect` | b | v1.0.1-src/crates/smtp/src/inbound/milter/client.rs:26 | `MilterClient` stores the redact flag |
-| 4 | `crates/smtp/src/inbound/milter/client.rs:316` | `write` | c | v1.0.1-src/crates/smtp/src/inbound/milter/client.rs:314 | `trc::Value::redacted()` in place of `Contents = action.to_string(),` |
+| 1 | `crates/smtp/src/inbound/milter/client.rs:22` | `connect` | b | v1.0.1-src/crates/smtp/src/inbound/milter/client.rs:26, inserted before :27 | `pub async fn connect(config: &Milter, session_id: u64, redact: bool) -> Result<Self> {` in place of `pub async fn connect(config: &Milter, session_id: u64) -> Result<Self> {` |
+| 2 | `crates/smtp/src/inbound/milter/client.rs:50` | `connect` | b | v1.0.1-src/crates/smtp/src/inbound/milter/client.rs:26, inserted after :54 | `MilterClient` stores the redact flag |
+| 4 | `crates/smtp/src/inbound/milter/client.rs:316` | `write` | c | v1.0.1-src/crates/smtp/src/inbound/milter/client.rs:314, inserted before :322 | `trc::Value::redacted()` in place of `Contents = action.to_string(),` |
 | 5 | `crates/smtp/src/inbound/milter/client.rs:340` | `read` | c | v1.0.1-src/crates/smtp/src/inbound/milter/client.rs:330 | `trc::Value::redacted()` in place of `Contents = response.to_string(),` |
 
 #### `crates/smtp/src/inbound/milter/message.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/smtp/src/inbound/milter/message.rs:39` | `run_milters` | b | v1.0.1-src/crates/smtp/src/inbound/milter/message.rs:33 | Mail spec 10: the milter is sent the plaintext (transit); its traces are redacted for a key account's transaction. |
-| 2 | `crates/smtp/src/inbound/milter/message.rs:55` | `run_milters` | b | v1.0.1-src/crates/smtp/src/inbound/milter/message.rs:33 | `match self.connect_and_run(milter, message, za_redact).await {` in place of `match self.connect_and_run(milter, message).await {` |
-| 3 | `crates/smtp/src/inbound/milter/message.rs:139` | `run_milters` | b | v1.0.1-src/crates/smtp/src/inbound/milter/message.rs:33 | Mail spec 10: an invalid frame or an unexpected response can carry a header the milter returned. |
+| 1 | `crates/smtp/src/inbound/milter/message.rs:39` | `run_milters` | b | v1.0.1-src/crates/smtp/src/inbound/milter/message.rs:33, inserted after :41 | Mail spec 10: the milter is sent the plaintext (transit); its traces are redacted for a key account's transaction. |
+| 2 | `crates/smtp/src/inbound/milter/message.rs:55` | `run_milters` | b | v1.0.1-src/crates/smtp/src/inbound/milter/message.rs:33, inserted after :57 | `match self.connect_and_run(milter, message, za_redact).await {` in place of `match self.connect_and_run(milter, message).await {` |
+| 3 | `crates/smtp/src/inbound/milter/message.rs:139` | `run_milters` | b | v1.0.1-src/crates/smtp/src/inbound/milter/message.rs:33, inserted after :141 | Mail spec 10: an invalid frame or an unexpected response can carry a header the milter returned. |
 
 #### `crates/smtp/src/inbound/rcpt.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/smtp/src/inbound/rcpt.rs:351` | `handle_rcpt_to` | b | v1.0.1-src/crates/smtp/src/inbound/rcpt.rs:27 | `let za_added = self.data.rcpt_to.len().saturating_sub(1);` |
+| 1 | `crates/smtp/src/inbound/rcpt.rs:351` | `handle_rcpt_to` | b | v1.0.1-src/crates/smtp/src/inbound/rcpt.rs:27, inserted after :348 | `let za_added = self.data.rcpt_to.len().saturating_sub(1);` |
 | 2 | `crates/smtp/src/inbound/rcpt.rs:406` | `handle_rcpt_to` | b | v1.0.1-src/crates/smtp/src/inbound/rcpt.rs:27 | Mail spec 10: a key account among this command's recipients (the address or the list's members) redacts the transaction's content from traces. RFC 3030 orders RCPT ... |
 
 #### `crates/smtp/src/inbound/session.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/smtp/src/inbound/session.rs:492` | `reset` | b | v1.0.1-src/crates/smtp/src/inbound/session.rs:579 | `self.data.za_key_rcpt = false;` |
-| 2 | `crates/smtp/src/inbound/session.rs:504` | `write` | b | v1.0.1-src/crates/smtp/src/inbound/session.rs:600 | Issue #20: the reply to a 334 can carry a SASL response, also when the session left the exchange (the MFA reply). |
-| 3 | `crates/smtp/src/inbound/session.rs:544` | `read` | c | v1.0.1-src/crates/smtp/src/inbound/session.rs:635 | Masked until the line answering a 334 ends. |
+| 1 | `crates/smtp/src/inbound/session.rs:492` | `reset` | b | v1.0.1-src/crates/smtp/src/inbound/session.rs:579, inserted after :589 | `self.data.za_key_rcpt = false;` |
+| 2 | `crates/smtp/src/inbound/session.rs:504` | `write` | b | v1.0.1-src/crates/smtp/src/inbound/session.rs:600, inserted after :600 | Issue #20: the reply to a 334 can carry a SASL response, also when the session left the exchange (the MFA reply). |
+| 3 | `crates/smtp/src/inbound/session.rs:544` | `read` | c | v1.0.1-src/crates/smtp/src/inbound/session.rs:635, inserted after :638 | Masked until the line answering a 334 ends. |
 | 4 | `crates/smtp/src/inbound/session.rs:657` | `resolve_global` | b | v1.0.1-src/crates/smtp/src/inbound/session.rs:635 (`read`; `resolve_global` removed) | `is_auth_input`, `is_data_input`, `has_data_command`; rely on `RequestReceiver::buf()` (now in-tree, v1.0.1-src/crates/smtp-proto/src/request/receiver.rs:161) |
 
 #### `crates/smtp/src/inbound/spam.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/smtp/src/inbound/spam.rs:92` | `build_spam_input` | b | v1.0.1-src/crates/smtp/src/inbound/spam.rs:51 | `za_redact: self.data.za_key_rcpt \|\| self.data.za_key_sender(),` |
+| 1 | `crates/smtp/src/inbound/spam.rs:92` | `build_spam_input` | b | v1.0.1-src/crates/smtp/src/inbound/spam.rs:51, inserted after :99 | `za_redact: self.data.za_key_rcpt \|\| self.data.za_key_sender(),` |
 
 #### `crates/smtp/src/scripts/event_loop.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/smtp/src/scripts/event_loop.rs:69` | `run_script` | c | v1.0.1-src/crates/smtp/src/scripts/event_loop.rs:35 | Mail rulings R57 and R59: a key account's transaction; every value the runtime evaluated (from the message, possibly) is redacted in these events and in the plugin ... |
-| 2 | `crates/smtp/src/scripts/event_loop.rs:92` | `run_script` | c | v1.0.1-src/crates/smtp/src/scripts/event_loop.rs:35 | `Details = if za_redact {` in place of `Details = name.as_str().to_string(),` |
-| 3 | `crates/smtp/src/scripts/event_loop.rs:127` | `run_script` | c | v1.0.1-src/crates/smtp/src/scripts/event_loop.rs:35 | `Details = if za_redact {` in place of `Details = list,` |
-| 4 | `crates/smtp/src/scripts/event_loop.rs:148` | `run_script` | c | v1.0.1-src/crates/smtp/src/scripts/event_loop.rs:35 | the redact flag passed to `PluginContext` (R59) |
-| 5 | `crates/smtp/src/scripts/event_loop.rs:192` | `run_script` | c | v1.0.1-src/crates/smtp/src/scripts/event_loop.rs:35 | `Details = if za_redact {` in place of `Details = list,` |
-| 6 | `crates/smtp/src/scripts/event_loop.rs:333` | `run_script` | c | v1.0.1-src/crates/smtp/src/scripts/event_loop.rs:35 | `To = if za_redact {` in place of `To = message` |
-| 7 | `crates/smtp/src/scripts/event_loop.rs:368` | `run_script` | c | v1.0.1-src/crates/smtp/src/scripts/event_loop.rs:35 | `Details = if za_redact {` in place of `Details = format!("{unsupported:?}"),` |
-| 8 | `crates/smtp/src/scripts/event_loop.rs:382` | `run_script` | c | v1.0.1-src/crates/smtp/src/scripts/event_loop.rs:35 | `Reason = if za_redact {` in place of `Reason = err.to_string(),` |
-| 9 | `crates/smtp/src/scripts/event_loop.rs:412` | `run_script` | b | v1.0.1-src/crates/smtp/src/scripts/event_loop.rs:35 | `Details = if za_redact {` in place of `Details = reject_reason.clone(),` |
+| 1 | `crates/smtp/src/scripts/event_loop.rs:69` | `run_script` | c | v1.0.1-src/crates/smtp/src/scripts/event_loop.rs:223, inserted after :231 | Mail rulings R57 and R59: a key account's transaction; every value the runtime evaluated (from the message, possibly) is redacted in these events and in the plugin ... |
+| 2 | `crates/smtp/src/scripts/event_loop.rs:92` | `run_script` | c | v1.0.1-src/crates/smtp/src/scripts/event_loop.rs:223 | `Details = if za_redact {` in place of `Details = name.as_str().to_string(),` |
+| 3 | `crates/smtp/src/scripts/event_loop.rs:127` | `run_script` | c | v1.0.1-src/crates/smtp/src/scripts/event_loop.rs:223 | `Details = if za_redact {` in place of `Details = list,` |
+| 4 | `crates/smtp/src/scripts/event_loop.rs:148` | `run_script` | c | v1.0.1-src/crates/smtp/src/scripts/event_loop.rs:223, inserted after :308 | the redact flag passed to `PluginContext` (R59) |
+| 5 | `crates/smtp/src/scripts/event_loop.rs:192` | `run_script` | c | v1.0.1-src/crates/smtp/src/scripts/event_loop.rs:223 | `Details = if za_redact {` in place of `Details = list,` |
+| 6 | `crates/smtp/src/scripts/event_loop.rs:333` | `run_script` | c | v1.0.1-src/crates/smtp/src/scripts/event_loop.rs:223 | `To = if za_redact {` in place of `To = message` |
+| 7 | `crates/smtp/src/scripts/event_loop.rs:368` | `run_script` | c | v1.0.1-src/crates/smtp/src/scripts/event_loop.rs:223 | `Details = if za_redact {` in place of `Details = format!("{unsupported:?}"),` |
+| 8 | `crates/smtp/src/scripts/event_loop.rs:382` | `run_script` | c | v1.0.1-src/crates/smtp/src/scripts/event_loop.rs:223 | `Reason = if za_redact {` in place of `Reason = err.to_string(),` |
+| 9 | `crates/smtp/src/scripts/event_loop.rs:412` | `run_script` | b | v1.0.1-src/crates/smtp/src/scripts/event_loop.rs:223 | `Details = if za_redact {` in place of `Details = reject_reason.clone(),` |
 
 #### `crates/smtp/src/scripts/exec.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/smtp/src/scripts/exec.rs:164` | `run_script` | b | v1.0.1-src/crates/smtp/src/scripts/exec.rs:153 | `.with_za_redact(self.data.za_key_rcpt \|\| self.data.za_key_sender())` |
+| 1 | `crates/smtp/src/scripts/exec.rs:164` | `run_script` | b | v1.0.1-src/crates/smtp/src/scripts/exec.rs:153, inserted after :164 | `.with_za_redact(self.data.za_key_rcpt \|\| self.data.za_key_sender())` |
 
 #### `crates/smtp/src/scripts/mod.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/smtp/src/scripts/mod.rs:43` | `pub struct ScriptParameters<'x>` | b | v1.0.1-src/crates/smtp/src/scripts/mod.rs:45 | Mail ruling R57: the transaction is a key account's (a recipient or the sender); the script's content-evaluated diagnostics are redacted. |
-| 2 | `crates/smtp/src/scripts/mod.rs:62` | `new` | b | v1.0.1-src/crates/smtp/src/scripts/mod.rs:61 | `ScriptParameters::new` defaults `za_redact` to false |
+| 1 | `crates/smtp/src/scripts/mod.rs:43` | `pub struct ScriptParameters<'x>` | b | v1.0.1-src/crates/smtp/src/scripts/mod.rs:45, inserted before :60 | Mail ruling R57: the transaction is a key account's (a recipient or the sender); the script's content-evaluated diagnostics are redacted. |
+| 2 | `crates/smtp/src/scripts/mod.rs:62` | `new` | b | v1.0.1-src/crates/smtp/src/scripts/mod.rs:61, inserted after :74 | `ScriptParameters::new` defaults `za_redact` to false |
 
 #### `crates/spam-filter/src/analysis/domain.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/spam-filter/src/analysis/domain.rs:219` | `spam_filter_analyze_domain` | b | v1.0.1-src/crates/spam-filter/src/analysis/domain.rs:27 | `\|\| is_trusted_domain(self, &email.element.email.domain_part.fqdn, &ctx.input)` in place of `\|\| is_trusted_domain(` |
-| 2 | `crates/spam-filter/src/analysis/domain.rs:237` | `spam_filter_analyze_domain` | b | v1.0.1-src/crates/spam-filter/src/analysis/domain.rs:27 | `if !is_trusted_domain(self, &domain.element, &ctx.input).await {` in place of `if !is_trusted_domain(self, &domain.element, ctx.input.span_id).await {` |
+| 1 | `crates/spam-filter/src/analysis/domain.rs:219` | `spam_filter_analyze_domain` | b | v1.0.1-src/crates/spam-filter/src/analysis/domain.rs:34, inserted after :41 | `\|\| is_trusted_domain(self, &email.element.email.domain_part.fqdn, &ctx.input)` in place of `\|\| is_trusted_domain(` |
+| 2 | `crates/spam-filter/src/analysis/domain.rs:237` | `spam_filter_analyze_domain` | b | v1.0.1-src/crates/spam-filter/src/analysis/domain.rs:34 | `if !is_trusted_domain(self, &domain.element, &ctx.input).await {` in place of `if !is_trusted_domain(self, &domain.element, ctx.input.span_id).await {` |
 
 #### `crates/spam-filter/src/analysis/llm.rs`
 
@@ -1390,47 +1407,47 @@ One row per hook, grouped by file:
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 2 | `crates/spam-filter/src/analysis/rules.rs:29` | `spam_filter_analyze_rules` | c | v1.0.1-src/crates/spam-filter/src/analysis/rules.rs:24 | `.spam_eval_if::<String, _>(` in place of `.eval_if::<String, _>(` |
-| 3 | `crates/spam-filter/src/analysis/rules.rs:48` | `spam_filter_analyze_rules` | c | v1.0.1-src/crates/spam-filter/src/analysis/rules.rs:24 | `.spam_eval_if::<String, _>(` in place of `.eval_if::<String, _>(` |
-| 4 | `crates/spam-filter/src/analysis/rules.rs:65` | `spam_filter_analyze_rules` | c | v1.0.1-src/crates/spam-filter/src/analysis/rules.rs:24 | `.spam_eval_if::<String, _>(` in place of `.eval_if::<String, _>(` |
-| 5 | `crates/spam-filter/src/analysis/rules.rs:85` | `spam_filter_analyze_rules` | c | v1.0.1-src/crates/spam-filter/src/analysis/rules.rs:24 | `.spam_eval_if::<String, _>(` in place of `.eval_if::<String, _>(` |
-| 6 | `crates/spam-filter/src/analysis/rules.rs:105` | `spam_filter_analyze_rules` | c | v1.0.1-src/crates/spam-filter/src/analysis/rules.rs:24 | `.spam_eval_if::<String, _>(` in place of `.eval_if::<String, _>(` |
-| 7 | `crates/spam-filter/src/analysis/rules.rs:134` | `spam_filter_analyze_rules` | c | v1.0.1-src/crates/spam-filter/src/analysis/rules.rs:24 | `.spam_eval_if::<String, _>(` in place of `.eval_if::<String, _>(` |
-| 8 | `crates/spam-filter/src/analysis/rules.rs:166` | `spam_filter_analyze_rules` | c | v1.0.1-src/crates/spam-filter/src/analysis/rules.rs:24 | `.spam_eval_if::<String, _>(` in place of `.eval_if::<String, _>(` |
-| 9 | `crates/spam-filter/src/analysis/rules.rs:183` | `spam_filter_analyze_rules` | c | v1.0.1-src/crates/spam-filter/src/analysis/rules.rs:24 | `.spam_eval_if::<String, _>(` in place of `.eval_if::<String, _>(` |
+| 2 | `crates/spam-filter/src/analysis/rules.rs:29` | `spam_filter_analyze_rules` | c | v1.0.1-src/crates/spam-filter/src/analysis/rules.rs:51 | `.spam_eval_if::<String, _>(` in place of `.eval_if::<String, _>(` |
+| 3 | `crates/spam-filter/src/analysis/rules.rs:48` | `spam_filter_analyze_rules` | c | v1.0.1-src/crates/spam-filter/src/analysis/rules.rs:51 | `.spam_eval_if::<String, _>(` in place of `.eval_if::<String, _>(` |
+| 4 | `crates/spam-filter/src/analysis/rules.rs:65` | `spam_filter_analyze_rules` | c | v1.0.1-src/crates/spam-filter/src/analysis/rules.rs:51 | `.spam_eval_if::<String, _>(` in place of `.eval_if::<String, _>(` |
+| 5 | `crates/spam-filter/src/analysis/rules.rs:85` | `spam_filter_analyze_rules` | c | v1.0.1-src/crates/spam-filter/src/analysis/rules.rs:51 | `.spam_eval_if::<String, _>(` in place of `.eval_if::<String, _>(` |
+| 6 | `crates/spam-filter/src/analysis/rules.rs:105` | `spam_filter_analyze_rules` | c | v1.0.1-src/crates/spam-filter/src/analysis/rules.rs:51 | `.spam_eval_if::<String, _>(` in place of `.eval_if::<String, _>(` |
+| 7 | `crates/spam-filter/src/analysis/rules.rs:134` | `spam_filter_analyze_rules` | c | v1.0.1-src/crates/spam-filter/src/analysis/rules.rs:51 | `.spam_eval_if::<String, _>(` in place of `.eval_if::<String, _>(` |
+| 8 | `crates/spam-filter/src/analysis/rules.rs:166` | `spam_filter_analyze_rules` | c | v1.0.1-src/crates/spam-filter/src/analysis/rules.rs:51 | `.spam_eval_if::<String, _>(` in place of `.eval_if::<String, _>(` |
+| 9 | `crates/spam-filter/src/analysis/rules.rs:183` | `spam_filter_analyze_rules` | c | v1.0.1-src/crates/spam-filter/src/analysis/rules.rs:51 | `.spam_eval_if::<String, _>(` in place of `.eval_if::<String, _>(` |
 
 #### `crates/spam-filter/src/analysis/url.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/spam-filter/src/analysis/url.rs:155` | `spam_filter_analyze_url` | b | v1.0.1-src/crates/spam-filter/src/analysis/url.rs:37 | `&& is_trusted_domain(self, host_sld, &ctx.input).await` in place of `&& is_trusted_domain(self, host_sld, ctx.input.span_id).await` |
-| 2 | `crates/spam-filter/src/analysis/url.rs:232` | `spam_filter_analyze_url` | c | v1.0.1-src/crates/spam-filter/src/analysis/url.rs:37 | `&ctx.input,` in place of `ctx.input.span_id,` |
-| 3 | `crates/spam-filter/src/analysis/url.rs:250` | `spam_filter_analyze_url` | c | v1.0.1-src/crates/spam-filter/src/analysis/url.rs:37 | Mail spec 10: the request's error names a URL of the message. |
+| 1 | `crates/spam-filter/src/analysis/url.rs:155` | `spam_filter_analyze_url` | b | v1.0.1-src/crates/spam-filter/src/analysis/url.rs:66, inserted after :83 | `&& is_trusted_domain(self, host_sld, &ctx.input).await` in place of `&& is_trusted_domain(self, host_sld, ctx.input.span_id).await` |
+| 2 | `crates/spam-filter/src/analysis/url.rs:232` | `spam_filter_analyze_url` | c | v1.0.1-src/crates/spam-filter/src/analysis/url.rs:66 | `&ctx.input,` in place of `ctx.input.span_id,` |
+| 3 | `crates/spam-filter/src/analysis/url.rs:250` | `spam_filter_analyze_url` | c | v1.0.1-src/crates/spam-filter/src/analysis/url.rs:66 | Mail spec 10: the request's error names a URL of the message. |
 
 #### `crates/spam-filter/src/lib.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/spam-filter/src/lib.rs:55` | `pub struct SpamFilterInput<'x>` | b | v1.0.1-src/crates/spam-filter/src/lib.rs:34 | Mail spec 10: the message is a key account's (a recipient or the sender); events that can echo its content are redacted. |
-| 2 | `crates/spam-filter/src/lib.rs:170` | `from_message` | b | v1.0.1-src/crates/spam-filter/src/lib.rs:186 | `SpamFilterInput::from_message` defaults `za_redact` to false |
+| 1 | `crates/spam-filter/src/lib.rs:55` | `pub struct SpamFilterInput<'x>` | b | v1.0.1-src/crates/spam-filter/src/lib.rs:34, inserted after :66 | Mail spec 10: the message is a key account's (a recipient or the sender); events that can echo its content are redacted. |
+| 2 | `crates/spam-filter/src/lib.rs:170` | `from_message` | b | v1.0.1-src/crates/spam-filter/src/lib.rs:186, inserted after :214 | `SpamFilterInput::from_message` defaults `za_redact` to false |
 
 #### `crates/spam-filter/src/modules/classifier.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/spam-filter/src/modules/classifier.rs:738` | `spam_build_tokens` | c | v1.0.1-src/crates/spam-filter/src/modules/classifier.rs:67 | `&ctx.input,` in place of `ctx.input.span_id,` |
-| 2 | `crates/spam-filter/src/modules/classifier.rs:749` | `spam_build_tokens` | c | v1.0.1-src/crates/spam-filter/src/modules/classifier.rs:67 | `&& !is_trusted_domain(self, url.host.sld_or_default(), &ctx.input).await` in place of `&& !is_trusted_domain(self, url.host.sld_or_default(), ctx.input.span_id).await` |
-| 3 | `crates/spam-filter/src/modules/classifier.rs:788` | `spam_build_tokens` | c | v1.0.1-src/crates/spam-filter/src/modules/classifier.rs:67 | `if !is_trusted_domain(self, host_sld, &ctx.input).await {` in place of `if !is_trusted_domain(self, host_sld, ctx.input.span_id).await {` |
+| 1 | `crates/spam-filter/src/modules/classifier.rs:738` | `spam_build_tokens` | c | v1.0.1-src/crates/spam-filter/src/modules/classifier.rs:764 | `&ctx.input,` in place of `ctx.input.span_id,` |
+| 2 | `crates/spam-filter/src/modules/classifier.rs:749` | `spam_build_tokens` | c | v1.0.1-src/crates/spam-filter/src/modules/classifier.rs:764 | `&& !is_trusted_domain(self, url.host.sld_or_default(), &ctx.input).await` in place of `&& !is_trusted_domain(self, url.host.sld_or_default(), ctx.input.span_id).await` |
+| 3 | `crates/spam-filter/src/modules/classifier.rs:788` | `spam_build_tokens` | c | v1.0.1-src/crates/spam-filter/src/modules/classifier.rs:764 | `if !is_trusted_domain(self, host_sld, &ctx.input).await {` in place of `if !is_trusted_domain(self, host_sld, ctx.input.span_id).await {` |
 
 #### `crates/spam-filter/src/modules/dnsbl.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
 | 2 | `crates/spam-filter/src/modules/dnsbl.rs:79` | `check_dnsbl` | c | v1.0.1-src/crates/spam-filter/src/modules/dnsbl.rs:52 | `.spam_eval_if::<String, _>(` in place of `.eval_if::<String, _>(` |
-| 3 | `crates/spam-filter/src/modules/dnsbl.rs:111` | `dnsbl_codes` | c | v1.0.1-src/crates/spam-filter/src/modules/dnsbl.rs:130 | Mail spec 10: the zone names the checked address, domain or URL. |
+| 3 | `crates/spam-filter/src/modules/dnsbl.rs:111` | `dnsbl_codes` | c | v1.0.1-src/crates/spam-filter/src/modules/dnsbl.rs:130, inserted after :141 | Mail spec 10: the zone names the checked address, domain or URL. |
 | 4 | `crates/spam-filter/src/modules/dnsbl.rs:142` | `dnsbl_codes` | c | v1.0.1-src/crates/spam-filter/src/modules/dnsbl.rs:130 | `Hostname = za_redacted(za_redact, zone.clone()),` in place of `Hostname = zone.clone(),` |
-| 5 | `crates/spam-filter/src/modules/dnsbl.rs:167` | `dnsbl_codes` | c | v1.0.1-src/crates/spam-filter/src/modules/dnsbl.rs:130 | `Hostname = za_redacted(za_redact, zone.clone()),` in place of `Hostname = zone.clone(),` |
-| 6 | `crates/spam-filter/src/modules/dnsbl.rs:186` | `dnsbl_codes` | b | v1.0.1-src/crates/spam-filter/src/modules/dnsbl.rs:130 | `Hostname = za_redacted(za_redact, zone),` in place of `Hostname = zone,` |
+| 5 | `crates/spam-filter/src/modules/dnsbl.rs:167` | `dnsbl_codes` | c | v1.0.1-src/crates/spam-filter/src/modules/dnsbl.rs:130, inserted before :205 | `Hostname = za_redacted(za_redact, zone.clone()),` in place of `Hostname = zone.clone(),` |
+| 6 | `crates/spam-filter/src/modules/dnsbl.rs:186` | `dnsbl_codes` | b | v1.0.1-src/crates/spam-filter/src/modules/dnsbl.rs:130, inserted after :216 | `Hostname = za_redacted(za_redact, zone),` in place of `Hostname = zone,` |
 | 7 | `crates/spam-filter/src/modules/dnsbl.rs:197` | `dnsbl_codes` | c | v1.0.1-src/crates/spam-filter/src/modules/dnsbl.rs:130 | Mail spec 10: `value`, or the redaction marker for a key account's message. |
 
 #### `crates/spam-filter/src/modules/expression.rs`
@@ -1449,15 +1466,15 @@ One row per hook, grouped by file:
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/store/src/lib.rs:13` | `pub mod write;` | b | v1.0.1-src/crates/store/src/lib.rs:15 | fork module declaration `za_test` under `test_mode` (`INDEX_CHUNK_PAUSE`, `INDEX_GUARD_FAIL_ONCE`) |
+| 1 | `crates/store/src/lib.rs:13` | `pub mod write;` | b | v1.0.1-src/crates/store/src/lib.rs:15, inserted after :15 | fork module declaration `za_test` under `test_mode` (`INDEX_CHUNK_PAUSE`, `INDEX_GUARD_FAIL_ONCE`) |
 | 2 | `crates/store/src/lib.rs:127` | `pub const SUBSPACE_SPAM_SAMPLES: u8 = b'` | d (target moved, conflict) | v1.0.1-src/crates/store/src/lib.rs (`Subspace` enum; no in-memory subspace) | `ZA_UID_LEASE_PREFIX`: subject gone with `ValueClass::InMemory`; keep only if the new lease home uses a prefix byte |
-| 3 | `crates/store/src/lib.rs:726` | `is_ephemeral` | b | v1.0.1-src/crates/store/src/lib.rs:984 | `Store::is_read_replica` for the move route's store refusal; its `SQLReadReplica` arm is an SEL-tagged `enterprise` snippet written by the fork |
+| 3 | `crates/store/src/lib.rs:726` | `is_ephemeral` | b | v1.0.1-src/crates/store/src/lib.rs:984, inserted after :985 | `Store::is_read_replica` for the move route's store refusal; its `SQLReadReplica` arm is an SEL-tagged `enterprise` snippet written by the fork |
 
 #### `crates/store/src/query/log.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/store/src/query/log.rs:139` | `vanished` | b | v1.0.1-src/crates/store/src/query/log.rs:186 | Preserve the physical log key for identity coverage. Equal paths from different commits and repeated paths within a commit are distinct entries. |
+| 1 | `crates/store/src/query/log.rs:139` | `vanished` | b | v1.0.1-src/crates/store/src/query/log.rs:186, inserted after :191 | Preserve the physical log key for identity coverage. Equal paths from different commits and repeated paths within a commit are distinct entries. |
 | 2 | `crates/store/src/query/log.rs:186` | `vanished` | c | v1.0.1-src/crates/store/src/query/log.rs:186 | `vanished.push((change_id, item));` in place of `vanished.push(item);` |
 
 #### `crates/store/src/search/index.rs`
@@ -1492,19 +1509,19 @@ One row per hook, grouped by file:
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/trc/src/event/mod.rs:89` | `ctx_unique` | b | v1.0.1-src/crates/trc/src/event/mod.rs:114 | Replaces the values of `keys` with the redaction marker, for a trace of an error that can echo client input before authentication (issue #20). The client's response is ... |
+| 1 | `crates/trc/src/event/mod.rs:89` | `ctx_unique` | b | v1.0.1-src/crates/trc/src/event/mod.rs:114, inserted before :121 | Replaces the values of `keys` with the redaction marker, for a trace of an error that can echo client input before authentication (issue #20). The client's response is ... |
 
 #### `crates/types/src/collection.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/types/src/collection.rs:64` | `pub enum VanishedCollection` | b | v1.0.1-src/crates/types/src/collection.rs:104 | Fork reservation: identity-bound Calendar paths; never renumber legacy logs. |
+| 1 | `crates/types/src/collection.rs:64` | `pub enum VanishedCollection` | b | v1.0.1-src/crates/types/src/collection.rs:104, inserted after :104 | Fork reservation: identity-bound Calendar paths; never renumber legacy logs. |
 
 #### `crates/types/src/field.rs`
 
 | # | Fork site (9a7574203) | Upstream item | Cat. | v1.0.1 site | What the port must preserve |
 |---|---|---|---|---|---|
-| 1 | `crates/types/src/field.rs:83` | `pub enum PrincipalField` | b | v1.0.1-src/crates/types/src/field.rs:81 | Zero-access vault record. 150 has never been assigned to any field: 46 was `EncryptionKeys` and then `IdentityAddresses` (0.16.18) before that moved to 110, so leftover ... |
+| 1 | `crates/types/src/field.rs:83` | `pub enum PrincipalField` | b | v1.0.1-src/crates/types/src/field.rs:81, inserted after :88 | Zero-access vault record. 150 has never been assigned to any field: 46 was `EncryptionKeys` and then `IdentityAddresses` (0.16.18) before that moved to 110, so leftover ... |
 
 #### `Cargo.toml` (root)
 
@@ -1581,6 +1598,208 @@ before a writer ports it.
     `common/src/auth/vault.rs` and `email/src/message/za/ingest.rs` match on
     `Task::IndexDocument`; `common/src/za/test_hooks.rs` references
     `task_manager::index`. These are not hooks, but their owners will meet them first.
+
+#### Upstream test hooks (for Task 2)
+
+At `v0.16.27`, 63 upstream files hold 144 `feature = "test_mode"` sites: attributes,
+`cfg_attr`s and `cfg!` expressions. `v1.0.1` has none. Each one went one of three ways:
+- it became `cfg(stalwart_tests)`, `cfg(not(stalwart_tests))`, `cfg(any(test,
+  stalwart_tests))` or a variant with `dev_mode`;
+- it moved into a private `test_support` slot;
+- it went away.
+
+No fork build sets `stalwart_tests`, so after the merge every one is dead: its test branch
+never compiles and its production branch always does. An `any(test, stalwart_tests)` site
+compiles only in its own crate's unit tests. It never compiles in the `tests` crate's build
+of that crate, which is where the integration suites run.
+
+Totals by proposed disposition:
+- restore under `test_mode`: 121;
+- not needed by the retained suite: 11;
+- subject deleted: 10;
+- in an SEL-only file: 2.
+
+How the consumers were found: a grep of the fork's `tests/src` for each hook's identifier or
+trigger string (`STS_TEST_POLICY`, `badtls`, `dmarc-`, `-debug`, `skip_checks`, `__sleep`,
+port `9925`, `shard_index`, `DNS_RECORDS` and so on). A hook with no identifier was matched
+by its subject, marked "(by subject)". Part A's baseline holds the per-test identifiers.
+
+The restore rule for Task 2:
+- Where the site survives, turn its `stalwart_tests` back into `feature = "test_mode"`
+  (keeping `dev_mode` and `test` where 1.0.1 has them). This is a one-line edit in an
+  upstream file, as at 0.16.27. Each such edit is a Task 2 hook of its own.
+- Where v1.0.1 moved the code into a private slot or removed it, write a fork-owned
+  replacement from the 0.16.27 behaviour.
+
+Flags:
+- **Silent changes** that a passing suite would not show:
+  - registry queries now default to descending id order (`jmap/src/registry/query.rs`);
+  - loopback push URLs are no longer exempt (`jmap/src/push/set.rs`);
+  - the DNS provider domain has no test override (`common/src/network/dns/records.rs`);
+  - ACME retries and backoff lost their test values (`tasks/acme.rs`).
+- **The test licence key** sits in an SEL-only file (`common/src/enterprise/config.rs`).
+  Restoring it edits SEL code, so it needs a decision: either the harness runs without a
+  licence, or the SEL disposition allows the cfg edit.
+- **`any(test, stalwart_tests)` in `smtp`** (`badtls`, the DNSSEC mock): these keep
+  `cfg(test)`, which hides the loss from `cargo test -p smtp`. The integration suites
+  (`smtp::outbound::tls`, `smtp::outbound::dane`) still lose them.
+
+| 0.16.27 site (under `crates/`) | 0.16.27 cfg | v1.0.1 site and cfg | What it switches | Retained tests that rely on it | Proposed Task 2 disposition |
+|---|---|---|---|---|---|
+| `common/src/auth/authentication.rs:49` | `cfg(not(feature = "test_mode"))` | `common/src/auth/authentication.rs:83` `cfg(not(stalwart_tests))` | no random delay after a failed login | every suite with failed logins (za::password, za::raw_input, imap and jmap auth cases); timing only | restore under `test_mode` (ruling 9) |
+| `common/src/config/mailstore/scripts.rs:217` | `cfg!(feature = "test_mode")` | `common/src/config/mailstore/scripts.rs:228` `cfg!(stalwart_tests)` | Sieve script HTTP client accepts invalid certificates | smtp::inbound::scripts and smtp::inbound::antispam (scripts that fetch from the test server) | restore under `test_mode` |
+| `common/src/config/network.rs:375` | `any(feature = "dev_mode", feature = "test_mode"),` | `common/src/config/network.rs:421` `cfg_attr(any(feature = "dev_mode", stalwart_tests), allow(unused_variables))` | HTTP server name forced to `127.0.0.1` (and its unused-variable allow) | every HTTP suite (URLs and discovery against the local test server) | restore under `test_mode` |
+| `common/src/config/network.rs:438` | `cfg(any(feature = "dev_mode", feature = "test_mode"))` | `common/src/config/network.rs:482` `cfg(any(feature = "dev_mode", stalwart_tests))` | (same) | (same) | (same) |
+| `common/src/config/smtp/mod.rs:36` | `//cfg_attr(feature = "test_mode", derive(PartialEq, Eq))` | `config/smtp/mod.rs:37` (still commented out) | commented-out `cfg_attr` (no effect) | none | not needed by the retained suite |
+| `common/src/config/smtp/resolver.rs:229` | `cfg(not(feature = "test_mode"))` | `common/src/config/smtp/resolver.rs:314` `cfg(not(stalwart_tests))` | DNSSEC treated as available, no probe | smtp::outbound::dane | restore under `test_mode` |
+| `common/src/config/smtp/resolver.rs:231` | `cfg(feature = "test_mode")` | `common/src/config/smtp/resolver.rs:316` `cfg(stalwart_tests)` | (same) | (same) | (same) |
+| `common/src/config/smtp/resolver.rs:239` | `cfg(not(feature = "test_mode"))` | `common/src/config/smtp/resolver.rs:326` `cfg(not(stalwart_tests))` | (same) | (same) | (same) |
+| `common/src/enterprise/config.rs:87` | `cfg(not(feature = "test_mode"))` | `common/src/enterprise/config.rs:94` `cfg(not(stalwart_tests))` | a test licence key, so enterprise features run in tests | SEL tests (system::tenant, system::archiving, scim) and any retained test that needs a licensed feature | SEL file; decide whether the harness needs a licence (Task 2) |
+| `common/src/enterprise/config.rs:90` | `cfg(feature = "test_mode")` | `common/src/enterprise/config.rs:97` `cfg(stalwart_tests)` | (same) | (same) | (same) |
+| `common/src/manager/defaults.rs:63` | `cfg(not(feature = "test_mode"))` | `common/src/manager/defaults.rs:57` `cfg(not(stalwart_tests))` | bootstrap skips default objects (application, system settings, ASN, tracing and metrics stores, default data) | every suite: the harness boots from its own registry objects | restore under `test_mode` |
+| `common/src/manager/defaults.rs:85` | `cfg(not(any(feature = "dev_mode", feature = "test_mode")))` | `common/src/manager/defaults.rs:79` `cfg(not(any(feature = "dev_mode", stalwart_tests)))` | (same) | (same) | (same) |
+| `common/src/manager/defaults.rs:497` | `cfg(not(any(feature = "dev_mode", feature = "test_mode")))` | `common/src/manager/defaults.rs:477` `cfg(not(any(feature = "dev_mode", stalwart_tests)))` | (same) | (same) | (same) |
+| `common/src/manager/defaults.rs:514` | `cfg(not(feature = "test_mode"))` | `common/src/manager/defaults.rs:498` `cfg(not(stalwart_tests))` | (same) | (same) | (same) |
+| `common/src/manager/defaults.rs:521` | `cfg(not(feature = "test_mode"))` | `common/src/manager/defaults.rs:506` `cfg(not(stalwart_tests))` | (same) | (same) | (same) |
+| `common/src/manager/defaults.rs:544` | `cfg(not(feature = "test_mode"))` | `common/src/manager/defaults.rs:530` `cfg(not(stalwart_tests))` | (same) | (same) | (same) |
+| `common/src/network/acme/http.rs:29` | `cfg(any(feature = "dev_mode", feature = "test_mode"))` | `common/src/network/acme/http.rs:28` `cfg(any(feature = "dev_mode", stalwart_tests))` | ACME client accepts invalid certificates on localhost | automation::acme (Docker; CI only) | restore under `test_mode` |
+| `common/src/network/dns/records.rs:420` | `cfg(feature = "test_mode")` | removed: `provider_domain` (`records.rs:453`) has no test branch | provider domain fixed to `pebble.letsencrypt.org` | automation::acme, automation::dns (Docker) | restore under `test_mode` (v1.0.1 removed the override) |
+| `common/src/network/dns/records.rs:425` | `cfg(not(feature = "test_mode"))` | removed (as above) | (same) | (same) | (same) |
+| `common/src/network/dns/update.rs:34` | `cfg(feature = "test_mode")` | `common/src/network/dns/update.rs:35` `cfg(stalwart_tests)` | in-memory DNS records and the `test@pebble.org` updater | automation::acme, automation::dkim, automation::dns | restore under `test_mode` |
+| `common/src/network/dns/update.rs:80` | `cfg(feature = "test_mode")` | `common/src/network/dns/update.rs:81` `cfg(stalwart_tests)` | (same) | (same) | (same) |
+| `common/src/network/dns/update.rs:96` | `cfg(not(feature = "test_mode"))` | `common/src/network/dns/update.rs:97` `cfg(not(stalwart_tests))` | (same) | (same) | (same) |
+| `common/src/network/dns/update.rs:1275` | `cfg(feature = "test_mode")` | `common/src/network/dns/update.rs:1279` `cfg(stalwart_tests)` | (same) | (same) | (same) |
+| `common/src/network/security.rs:151` | `cfg(not(feature = "test_mode"))` | `common/src/network/security.rs:157` `cfg(not(stalwart_tests))` | loopback not added to the allowed IPs, so fail2ban can ban 127.0.0.1 | system::security, za::mail::login (fail2ban cases) | restore under `test_mode` |
+| `common/src/scripts/plugins/dns.rs:72` | `cfg(feature = "test_mode")` | `common/src/scripts/plugins/dns.rs:72` `cfg(stalwart_tests)` | canned DNS answers for Sieve's DNS functions | smtp::inbound::scripts, smtp::inbound::antispam | restore under `test_mode` |
+| `common/src/scripts/plugins/dns.rs:114` | `cfg(feature = "test_mode")` | `common/src/scripts/plugins/dns.rs:114` `cfg(stalwart_tests)` | (same) | (same) | (same) |
+| `common/src/scripts/plugins/dns.rs:173` | `cfg(feature = "test_mode")` | `common/src/scripts/plugins/dns.rs:173` `cfg(stalwart_tests)` | (same) | (same) | (same) |
+| `common/src/scripts/plugins/http.rs:24` | `cfg(feature = "test_mode")` | `common/src/scripts/plugins/http.rs:24` `cfg(stalwart_tests)` | canned answer for `redirect.` URLs | smtp::inbound::antispam, smtp::inbound::scripts | restore under `test_mode` |
+| `common/src/scripts/plugins/llm_prompt.rs:26` | `cfg(feature = "test_mode")` | `common/src/scripts/plugins/llm_prompt.rs:40` `cfg(stalwart_tests)` | an `echo-test` model for Sieve's LLM prompt | none found in tests/src (no `echo-test` reference) | not needed by the retained suite |
+| `common/src/scripts/plugins/mod.rs:57` | `cfg(feature = "test_mode")` | `common/src/scripts/plugins/mod.rs:57` `cfg(stalwart_tests)` | the `print` test plugin for Sieve | smtp::inbound::scripts (Sieve `print`) | restore under `test_mode` |
+| `common/src/scripts/plugins/mod.rs:76` | `cfg(feature = "test_mode")` | `common/src/scripts/plugins/mod.rs:76` `cfg(stalwart_tests)` | (same) | (same) | (same) |
+| `common/src/scripts/plugins/mod.rs:109` | `cfg(feature = "test_mode")` | moved into the private `test_support` slot (`plugins/mod.rs:109-111`) | (same) | (same) | (same) |
+| `common/src/telemetry/metrics/mod.rs:17` | `cfg(any(feature = "dev_mode", feature = "test_mode"))` | `common/src/telemetry/metrics/mod.rs:20` `cfg(all(feature = "enterprise", any(feature = "dev_mode", stalwart_tests)))` | `test_data` module of metric fixtures | telemetry::metrics (v1.0.1 also gates it on `enterprise`) | restore under `test_mode` |
+| `common/src/telemetry/metrics/store.rs:89` | `cfg(not(any(feature = "dev_mode", feature = "test_mode")))` | `common/src/telemetry/metrics/store.rs:168` `cfg(not(any(feature = "dev_mode", stalwart_tests)))` | deterministic metric ids from the timestamp | telemetry::metrics | restore under `test_mode` |
+| `common/src/telemetry/metrics/store.rs:92` | `cfg(any(feature = "dev_mode", feature = "test_mode"))` | `common/src/telemetry/metrics/store.rs:171` `cfg(any(feature = "dev_mode", stalwart_tests))` | (same) | (same) | (same) |
+| `common/src/telemetry/metrics/store.rs:116` | `cfg(not(any(feature = "dev_mode", feature = "test_mode")))` | `common/src/telemetry/metrics/store.rs:195` `cfg(not(any(feature = "dev_mode", stalwart_tests)))` | (same) | (same) | (same) |
+| `common/src/telemetry/metrics/store.rs:119` | `cfg(any(feature = "dev_mode", feature = "test_mode"))` | `common/src/telemetry/metrics/store.rs:198` `cfg(any(feature = "dev_mode", stalwart_tests))` | (same) | (same) | (same) |
+| `common/src/telemetry/metrics/store.rs:160` | `cfg(not(any(feature = "dev_mode", feature = "test_mode")))` | `common/src/telemetry/metrics/store.rs:228` `cfg(not(any(feature = "dev_mode", stalwart_tests)))` | (same) | (same) | (same) |
+| `common/src/telemetry/metrics/store.rs:163` | `cfg(any(feature = "dev_mode", feature = "test_mode"))` | `common/src/telemetry/metrics/store.rs:231` `cfg(any(feature = "dev_mode", stalwart_tests))` | (same) | (same) | (same) |
+| `common/src/telemetry/mod.rs:73` | `cfg(feature = "test_mode")` | moved into the private `test_support` slot (`telemetry/mod.rs:101-103`) | `test_tracer` helper | none found in tests/src; v1.0.1 moved it into a private `test_support` slot | not needed by the retained suite |
+| `dav/src/calendar/copy_move.rs:74` | `cfg(not(any(feature = "dev_mode", feature = "test_mode")))` | `dav/src/calendar/copy_move.rs:94` `cfg(not(any(feature = "dev_mode", stalwart_tests)))` | allows moving the default calendar | webdav suites that move or rename the default calendar (webdav::cal_* and za::dav_seal) | restore under `test_mode` |
+| `dav/src/calendar/delete.rs:87` | `cfg(not(any(feature = "dev_mode", feature = "test_mode")))` | `dav/src/calendar/delete.rs:93` `cfg(not(any(feature = "dev_mode", stalwart_tests)))` | allows deleting the default calendar | webdav suites and za modules that delete calendars | restore under `test_mode` |
+| `directory/src/backend/oidc/lookup.rs:31` | `cfg(feature = "test_mode")` | `directory/src/backend/oidc/lookup.rs:64` `cfg(stalwart_tests)` | OIDC token prefix stripped | directory::oidc (SEL-only test file) | not needed by the retained suite (its test is SEL-only) |
+| `email/src/mailbox/destroy.rs:59` | `cfg(not(feature = "test_mode"))` | `email/src/mailbox/destroy.rs:63` `cfg(not(stalwart_tests))` | system mailboxes (Inbox, Trash, Junk) can be destroyed | suite cleanups that destroy every mailbox before `assert_is_empty` (by subject) | restore under `test_mode` |
+| `email/src/mailbox/manage.rs:31` | `cfg(feature = "test_mode")` | `email/src/mailbox/manage.rs:31` `cfg(stalwart_tests)` | account 0 (the admin) gets no system mailboxes | every suite that counts an account's mailboxes or scans the store after the admin acted (by subject) | restore under `test_mode` |
+| `email/src/message/index/search.rs:167` | `cfg(not(feature = "test_mode"))` | `email/src/message/index/search.rs:141` `cfg(not(stalwart_tests))` | headers always indexed; unknown language falls back to the default | store::query, jmap::mail::search_snippet, imap::search (plain mode) | restore under `test_mode` |
+| `email/src/message/index/search.rs:171` | `cfg(feature = "test_mode")` | `email/src/message/index/search.rs:149` `cfg(stalwart_tests)` | (same) | (same) | (same) |
+| `email/src/message/index/search.rs:328` | `cfg(not(feature = "test_mode"))` | `email/src/message/index/search.rs:202` `cfg(not(stalwart_tests))` | (same) | (same) | (same) |
+| `email/src/message/index/search.rs:335` | `cfg(feature = "test_mode")` | `email/src/message/index/search.rs:207` `cfg(stalwart_tests)` | (same) | (same) | (same) |
+| `email/src/sieve/ingest.rs:501` | `cfg(feature = "test_mode")` | `email/src/sieve/ingest.rs:758` `cfg(stalwart_tests)` | a Sieve script error message is reported | smtp::inbound::scripts, jmap::mail::sieve_script | restore under `test_mode` |
+| `jmap/src/api/event_source.rs:80` | `cfg(not(feature = "test_mode"))` | `jmap/src/api/event_source.rs:84` `cfg(not(stalwart_tests))` | EventSource ping interval not clamped to 30 s | jmap::core::event_source | restore under `test_mode` |
+| `jmap/src/api/event_source.rs:82` | `cfg(feature = "test_mode")` | `jmap/src/api/event_source.rs:86` `cfg(stalwart_tests)` | (same) | (same) | (same) |
+| `jmap/src/blob/upload.rs:21` | `cfg(feature = "test_mode")` | `jmap/src/blob/upload.rs:25` `cfg(stalwart_tests)` | `DISABLE_UPLOAD_QUOTA` switch for uploads | system::quota | restore under `test_mode` |
+| `jmap/src/blob/upload.rs:211` | `cfg(feature = "test_mode")` | `jmap/src/blob/upload.rs:232` `cfg(stalwart_tests)` | (same) | (same) | (same) |
+| `jmap/src/blob/upload.rs:232` | `cfg(feature = "test_mode")` | `jmap/src/blob/upload.rs:253` `cfg(stalwart_tests)` | (same) | (same) | (same) |
+| `jmap/src/blob/upload.rs:237` | `cfg(not(feature = "test_mode"))` | `jmap/src/blob/upload.rs:258` `cfg(not(stalwart_tests))` | (same) | (same) | (same) |
+| `jmap/src/email/import.rs:62` | `cfg(feature = "test_mode")` | `jmap/src/email/import.rs:74` `cfg(stalwart_tests)` | import for another account without building its token | jmap::mail::import and the za mail modules that import into a fixture account | restore under `test_mode` |
+| `jmap/src/email/import.rs:67` | `cfg(not(feature = "test_mode"))` | `jmap/src/email/import.rs:79` `cfg(not(stalwart_tests))` | (same) | (same) | (same) |
+| `jmap/src/email/set.rs:101` | `cfg(feature = "test_mode")` | `jmap/src/email/set.rs:134` `cfg(stalwart_tests)` | same for `Email/set`; headers sorted for deterministic output | jmap::mail::set, jmap::mail::thread_merge, za::mail::writes | restore under `test_mode` |
+| `jmap/src/email/set.rs:106` | `cfg(not(feature = "test_mode"))` | `jmap/src/email/set.rs:139` `cfg(not(stalwart_tests))` | (same) | (same) | (same) |
+| `jmap/src/email/set.rs:565` | `cfg(feature = "test_mode")` | `jmap/src/email/set.rs:677` `cfg(stalwart_tests)` | (same) | (same) | (same) |
+| `jmap/src/email/set.rs:756` | `cfg(feature = "test_mode")` | `jmap/src/email/set.rs:941` `cfg(stalwart_tests)` | (same) | (same) | (same) |
+| `jmap/src/mailbox/query.rs:63` | `cfg(any(feature = "dev_mode", feature = "test_mode"))` | `jmap/src/mailbox/query.rs:105` `cfg(any(feature = "dev_mode", stalwart_tests))` | a mailbox named `__sleep` sleeps 1 s (concurrent-request tests) | system::security | restore under `test_mode` |
+| `jmap/src/push/set.rs:445` | `cfg(feature = "test_mode")` | removed: `validate_push_url` (`push/set.rs:427`) has no loopback exemption | loopback push URLs allowed; a unit-test assertion | jmap::core::push_subscription (loopback receiver), za::mail::reads (state-only push); the `cfg!` sits in the 0.16.27 inline test module | restore under `test_mode` (v1.0.1 removed the loopback exemption); the unit assertion returns with its restored module |
+| `jmap/src/push/set.rs:586` | `cfg!(feature = "test_mode")` | with the inline test module, now the slot `push/set.rs:513` (`all(test, stalwart_tests)`) | (same) | (same) | (same) |
+| `jmap/src/registry/query.rs:400` | `cfg(feature = "test_mode")` | removed: `registry/query.rs:470` always sorts descending | registry queries default to ascending id order | suites that read `x:*/query` results in order (tests/src/utils/registry.rs callers) | restore under `test_mode` (v1.0.1 removed the test order; a silent change for ordered assertions) |
+| `jmap/src/registry/query.rs:408` | `cfg(not(feature = "test_mode"))` | kept ungated (`registry/query.rs:470`) | (same) | (same) | (same) |
+| `services/src/state_manager/http.rs:257` | `cfg!(feature = "test_mode")` | `services/src/state_manager/http.rs:261` `cfg!(stalwart_tests)` | push HTTP client accepts invalid certificates | jmap::core::push_subscription | restore under `test_mode` |
+| `services/src/state_manager/push.rs:247` | `cfg(feature = "test_mode")` | `services/src/state_manager/push.rs:257` `cfg(stalwart_tests)` | `skip_checks` push URLs bypass the verification | jmap::core::push_subscription, jmap key-mode push_subscription, za::mail::reads | restore under `test_mode` |
+| `services/src/task_manager/acme.rs:36` | `cfg(not(feature = "test_mode"))` | removed (`tasks/acme.rs` has no retry constant) | more ACME retries, 1 s backoff | automation::acme (Docker) | restore under `test_mode` (v1.0.1 removed both; `tasks/acme.rs` has no retry constant) |
+| `services/src/task_manager/acme.rs:39` | `cfg(feature = "test_mode")` | removed | (same) | (same) | (same) |
+| `services/src/task_manager/acme.rs:106` | `cfg(not(feature = "test_mode"))` | removed | (same) | (same) | (same) |
+| `services/src/task_manager/acme.rs:109` | `cfg(feature = "test_mode")` | removed | (same) | (same) | (same) |
+| `services/src/task_manager/dkim.rs:170` | `cfg(feature = "test_mode")` | `services/src/task_manager/tasks/dkim.rs:184` `cfg(stalwart_tests)` | fixed DKIM test keys instead of generated ones | automation::dkim, smtp::inbound::dkim2 | restore under `test_mode` (v1.0.1 moved the keys into a private `test_support` slot, `tasks/dkim.rs:711`) |
+| `services/src/task_manager/dkim.rs:186` | `cfg(not(feature = "test_mode"))` | `services/src/task_manager/tasks/dkim.rs:205` `cfg(not(stalwart_tests))` | (same) | (same) | (same) |
+| `services/src/task_manager/dkim.rs:713` | `cfg(feature = "test_mode")` | moved into the private `test_support` slot (`tasks/dkim.rs:711-713`) | (same) | (same) | (same) |
+| `services/src/task_manager/dkim.rs:743` | `cfg(feature = "test_mode")` | moved into the private `test_support` slot (`tasks/dkim.rs:711-713`) | (same) | (same) | (same) |
+| `services/src/task_manager/maintenance.rs:131` | `cfg(feature = "test_mode")` | `services/src/task_manager/tasks/maintenance.rs:145` `cfg(stalwart_tests)` | tasks scheduled at `now` without jitter; simulated outcomes keyed by `shard_index` | system::task, system::purge, system::antispam, smtp::reporting::analyze, za::sweep, za::mail::fence | restore under `test_mode` |
+| `services/src/task_manager/maintenance.rs:134` | `cfg(not(feature = "test_mode"))` | `services/src/task_manager/tasks/maintenance.rs:148` `cfg(not(stalwart_tests))` | (same) | (same) | (same) |
+| `services/src/task_manager/maintenance.rs:311` | `cfg(feature = "test_mode")` | `tasks/maintenance.rs:361` `cfg(stalwart_tests)` | (same) | (same) | (same) |
+| `services/src/task_manager/maintenance.rs:382` | `cfg(feature = "test_mode")` | `tasks/maintenance.rs:187` `cfg(stalwart_tests)` | (same) | (same) | (same) |
+| `services/src/task_manager/maintenance.rs:385` | `cfg(not(feature = "test_mode"))` | `tasks/maintenance.rs:190` `cfg(not(stalwart_tests))` | (same) | (same) | (same) |
+| `smtp/src/inbound/data.rs:745` | `cfg(feature = "test_mode")` | `smtp/src/inbound/data.rs:807` `cfg(stalwart_tests)` | `dmarc-` senders treated as DMARC pass | smtp::inbound::dmarc, system::delivery | restore under `test_mode` |
+| `smtp/src/inbound/data.rs:752` | `cfg(not(feature = "test_mode"))` | `smtp/src/inbound/data.rs:814` `cfg(not(stalwart_tests))` | (same) | (same) | (same) |
+| `smtp/src/inbound/milter/protocol.rs:184` | `cfg(feature = "test_mode")` | moved into the private `test_support` slot (`milter/protocol.rs:291-293`) | `Command::deserialize`, `Response::serialize` and `PacketReader` for the mock milter | smtp::inbound::milter and the mock in tests/src/utils/milter.rs (za::mail::traces uses it) | restore under `test_mode` (v1.0.1 moved them into a private `test_support` slot, :291; rewrite against 1.0's protocol types) |
+| `smtp/src/inbound/milter/protocol.rs:351` | `cfg(feature = "test_mode")` | moved into the private `test_support` slot | (same) | (same) | (same) |
+| `smtp/src/inbound/milter/protocol.rs:482` | `cfg(feature = "test_mode")` | moved into the private `test_support` slot | (same) | (same) | (same) |
+| `smtp/src/inbound/milter/protocol.rs:488` | `cfg(feature = "test_mode")` | moved into the private `test_support` slot | (same) | (same) | (same) |
+| `smtp/src/inbound/rcpt.rs:27` | `cfg(feature = "test_mode")` | `smtp/src/inbound/rcpt.rs:28` `cfg(stalwart_tests)` | `-debug` instances log recipients | smtp::management::queue, smtp::outbound::{lmtp,smtp}, smtp::queue::* | restore under `test_mode` |
+| `smtp/src/inbound/session.rs:175` | `cfg(any(test, feature = "test_mode"))` | `smtp/src/inbound/session.rs:191` `cfg(any(test, stalwart_tests))` | `badtls` HELO forces a TLS failure | smtp::outbound::tls | restore under `test_mode` (v1.0.1 keeps `any(test, stalwart_tests)`, which the tests crate's build of `smtp` never sets) |
+| `smtp/src/outbound/dane/dnssec.rs:81` | `cfg(any(test, feature = "test_mode"))` | `smtp/src/outbound/dane/dnssec.rs:79` `cfg(any(test, stalwart_tests))` | DNSSEC validation treated as passing | smtp::outbound::dane | restore under `test_mode` (same `any(test, stalwart_tests)` note) |
+| `smtp/src/outbound/dane/dnssec.rs:164` | `cfg(any(test, feature = "test_mode"))` | `smtp/src/outbound/dane/dnssec.rs:166` `cfg(any(test, stalwart_tests))` | (same) | (same) | (same) |
+| `smtp/src/outbound/dane/dnssec.rs:282` | `cfg(any(test, feature = "test_mode"))` | `smtp/src/outbound/dane/dnssec.rs:288` `cfg(any(test, stalwart_tests))` | (same) | (same) | (same) |
+| `smtp/src/outbound/dane/dnssec.rs:360` | `cfg(any(test, feature = "test_mode"))` | `smtp/src/outbound/dane/dnssec.rs:365` `cfg(any(test, stalwart_tests))` | (same) | (same) | (same) |
+| `smtp/src/outbound/mod.rs:300` | `cfg(feature = "test_mode")` | `smtp/src/outbound/mod.rs:323` `cfg(stalwart_tests)` | MX delivery to port 9925, with test TLS rules | every smtp outbound and queue test, smtp::inbound::dkim2, system::delivery | restore under `test_mode` |
+| `smtp/src/outbound/mod.rs:302` | `cfg(not(feature = "test_mode"))` | `smtp/src/outbound/mod.rs:325` `cfg(not(stalwart_tests))` | (same) | (same) | (same) |
+| `smtp/src/outbound/mod.rs:311` | `cfg!(feature = "test_mode")` | `smtp/src/outbound/mod.rs:334` `cfg!(stalwart_tests)` | (same) | (same) | (same) |
+| `smtp/src/outbound/mod.rs:326` | `cfg(feature = "test_mode")` | `smtp/src/outbound/mod.rs:349` `cfg(stalwart_tests)` | (same) | (same) | (same) |
+| `smtp/src/outbound/mod.rs:330` | `cfg(not(feature = "test_mode"))` | `smtp/src/outbound/mod.rs:353` `cfg(not(stalwart_tests))` | (same) | (same) | (same) |
+| `smtp/src/outbound/mta_sts/lookup.rs:9` | `cfg(feature = "test_mode")` | `smtp/src/outbound/mta_sts/lookup.rs:13` `cfg(stalwart_tests)` | MTA-STS policy from `STS_TEST_POLICY` | smtp::outbound::mta_sts | restore under `test_mode` |
+| `smtp/src/outbound/mta_sts/lookup.rs:17` | `cfg(not(feature = "test_mode"))` | `smtp/src/outbound/mta_sts/lookup.rs:30` `cfg(not(stalwart_tests))` (`:28` is a new site) | (same) | (same) | (same) |
+| `smtp/src/outbound/mta_sts/lookup.rs:20` | `cfg(not(feature = "test_mode"))` | `smtp/src/outbound/mta_sts/lookup.rs:37` `cfg(not(stalwart_tests))` | (same) | (same) | (same) |
+| `smtp/src/outbound/mta_sts/lookup.rs:69` | `cfg(not(feature = "test_mode"))` | `smtp/src/outbound/mta_sts/lookup.rs:123` `cfg(not(stalwart_tests))` | (same) | (same) | (same) |
+| `smtp/src/outbound/mta_sts/lookup.rs:81` | `cfg(feature = "test_mode")` | `smtp/src/outbound/mta_sts/lookup.rs:138` `cfg(stalwart_tests)` | (same) | (same) | (same) |
+| `smtp/src/reporting/send.rs:81` | `cfg(not(feature = "test_mode"))` | `smtp/src/reporting/send.rs:87` `cfg(not(stalwart_tests))` | report submission skipped (no external relay) | smtp::reporting::* | restore under `test_mode` |
+| `smtp/src/reporting/tls.rs:56` | `cfg(feature = "test_mode")` | `smtp/src/reporting/tls.rs:57` `cfg(stalwart_tests)` | TLS reports captured in `TLS_HTTP_REPORT` | smtp::reporting::tls | restore under `test_mode` |
+| `smtp/src/reporting/tls.rs:132` | `cfg(feature = "test_mode")` | `smtp/src/reporting/tls.rs:192` `cfg(stalwart_tests)` | (same) | (same) | (same) |
+| `spam-filter/src/analysis/url.rs:334` | `cfg(feature = "test_mode")` | `spam-filter/src/analysis/url.rs:440` `cfg(stalwart_tests)` | canned URL resolution | smtp::inbound::antispam | restore under `test_mode` |
+| `spam-filter/src/modules/dnsbl.rs:15` | `cfg(not(feature = "test_mode"))` | `spam-filter/src/modules/dnsbl.rs:16` `cfg(not(stalwart_tests))` | canned DNSBL answers | smtp::inbound::antispam, za::mail::traces | restore under `test_mode` (the test resolver moved into a private `test_support` slot, :309) |
+| `spam-filter/src/modules/dnsbl.rs:20` | `cfg(feature = "test_mode")` | `spam-filter/src/modules/dnsbl.rs:28` `cfg(stalwart_tests)` | (same) | (same) | (same) |
+| `spam-filter/src/modules/dnsbl.rs:117` | `cfg(feature = "test_mode")` | `spam-filter/src/modules/dnsbl.rs:158` `cfg(stalwart_tests)` | (same) | (same) | (same) |
+| `spam-filter/src/modules/dnsbl.rs:198` | `cfg(not(feature = "test_mode"))` | `dnsbl.rs:245` `cfg(not(stalwart_tests))` | (same) | (same) | (same) |
+| `spam-filter/src/modules/dnsbl.rs:232` | `cfg(feature = "test_mode")` | moved into the private `test_support` slot (`dnsbl.rs:309-311`) | (same) | (same) | (same) |
+| `spam-filter/src/modules/pyzor.rs:38` | `cfg(feature = "test_mode")` | `spam-filter/src/modules/pyzor.rs:120` `cfg(stalwart_tests)` | canned Pyzor answer | smtp::inbound::antispam | restore under `test_mode` |
+| `store/src/backend/elastic/main.rs:116` | `cfg(feature = "test_mode")` | moved into the private `test_support` slot (`elastic/main.rs:134-136`) | `drop_indexes` for cleanup | tests/src/utils/cleanup.rs with an ElasticSearch search store (not in CI) | not needed by the retained suite (only for an ElasticSearch store; moved to a private `test_support` slot) |
+| `store/src/backend/elastic/mod.rs:90` | `cfg(feature = "test_mode")` | `store/src/backend/elastic/mod.rs:79` `cfg(stalwart_tests)` | Cc and Bcc indexed | search_tests with ElasticSearch (not in CI) | not needed by the retained suite |
+| `store/src/backend/elastic/mod.rs:101` | `cfg(not(feature = "test_mode"))` | `store/src/backend/elastic/mod.rs:90` `cfg(not(stalwart_tests))` | (same) | (same) | (same) |
+| `store/src/backend/http/lookup.rs:41` | `cfg(feature = "test_mode")` | `store/src/backend/http/lookup.rs:41` `cfg(stalwart_tests)` | canned answers for the phishtank and openphish lists | smtp::inbound::antispam (the spam rules' phishing lists; by subject) | restore under `test_mode` |
+| `store/src/backend/meili/main.rs:134` | `cfg(feature = "test_mode")` | `store/src/backend/meili/main.rs:138` `cfg(stalwart_tests)` | Bcc filterable; `drop_indexes` | search_tests with MeiliSearch (not in CI) | not needed by the retained suite |
+| `store/src/backend/meili/main.rs:201` | `cfg(feature = "test_mode")` | moved into the private `test_support` slot (`meili/main.rs:314-316`) | (same) | (same) | (same) |
+| `store/src/backend/postgres/mod.rs:134` | `cfg(feature = "test_mode")` | ungated: `postgres/mod.rs:132-133` always map Cc and Bcc | Cc and Bcc as text and sort columns | search_tests with a PostgreSQL search store (not in CI) | subject deleted (v1.0.1 has the Cc and Bcc columns ungated, :132-133) |
+| `store/src/backend/postgres/mod.rs:145` | `cfg(feature = "test_mode")` | ungated (as above) | (same) | (same) | (same) |
+| `store/src/backend/postgres/mod.rs:147` | `cfg(feature = "test_mode")` | ungated (as above) | (same) | (same) | (same) |
+| `store/src/backend/sqlite/main.rs:41` | `cfg(feature = "test_mode")` | moved into the private `test_support` slot (`sqlite/main.rs:131-133`) | `SqliteStore::open_memory` | directory::sql, za::external_directory (SQLite directories) | restore under `test_mode` (moved to a private `test_support` slot, :131) |
+| `store/src/build/registry.rs:132` | `cfg(feature = "test_mode")` | moved into the private `test_support` slot (`build/registry.rs:138-140`) | `RegistryStore::{clone_with_public_url, new}` | tests/src/utils/server.rs (every suite) | restore under `test_mode` (Task 2's named helpers; moved to a private `test_support` slot, :138) |
+| `store/src/build/registry.rs:139` | `cfg(feature = "test_mode")` | moved into the private `test_support` slot (`build/registry.rs:138-140`) | (same) | (same) | (same) |
+| `store/src/registry/write.rs:186` | `cfg(not(feature = "test_mode"))` | `store/src/registry/write.rs:225` `cfg(not(stalwart_tests))` | registry index keys written in a stable (sorted) order | tests that compare registry writes or traces (by subject) | restore under `test_mode` |
+| `store/src/registry/write.rs:189` | `cfg(feature = "test_mode")` | `store/src/registry/write.rs:228` `cfg(stalwart_tests)` | (same) | (same) | (same) |
+| `store/src/search/fields.rs:36` | `cfg(not(feature = "test_mode"))` | removed: `search/fields.rs:31` `is_indexed` returns false | Cc and Bcc indexed for Email | store::query, search_tests | subject deleted (1.0's `is_indexed` returns false for every Email field) |
+| `store/src/search/fields.rs:50` | `cfg(feature = "test_mode")` | removed (as above) | (same) | (same) | (same) |
+| `store/src/write/mod.rs:105` | `cfg(not(feature = "test_mode"))` | `store/src/write/mod.rs:208` `cfg(not(stalwart_tests))` | commit retries 1000 and a one-hour commit time | store suites under contention, za::mail::fence (stress test) | restore under `test_mode` |
+| `store/src/write/mod.rs:107` | `cfg(not(feature = "test_mode"))` | `store/src/write/mod.rs:210` `cfg(not(stalwart_tests))` | (same) | (same) | (same) |
+| `store/src/write/mod.rs:110` | `cfg(feature = "test_mode")` | `store/src/write/mod.rs:213` `cfg(stalwart_tests)` | (same) | (same) | (same) |
+| `store/src/write/mod.rs:112` | `cfg(feature = "test_mode")` | `store/src/write/mod.rs:215` `cfg(stalwart_tests)` | (same) | (same) | (same) |
+| `trc/src/ipc/collector.rs:168` | `cfg(any(feature = "dev_mode", feature = "test_mode"))` | `trc/src/ipc/collector.rs:410` `cfg(any(feature = "dev_mode", stalwart_tests))` | prints "Unregistered span ID" to stderr (a diagnostic) | none: output only | not needed by the retained suite |
+| `trc/src/ipc/collector.rs:184` | `feature = "test_mode"` | `trc/src/ipc/collector.rs:416` `cfg(any(feature = "dev_mode", stalwart_tests))` | (same) | (same) | (same) |
+| `types/src/dead_property.rs:8` | `cfg_attr(feature = "test_mode", derive(serde::Serialize, serde::Deserialize))` | file deleted | serde derives for `DeadProperty` fixtures | webdav::prop, za::leak, za::sharing | subject deleted (`DeadProperty` is gone; 1.0's `types/src/metadata/` replaces it) |
+| `types/src/dead_property.rs:9` | `cfg_attr(feature = "test_mode", serde(tag = "type", content = "data"))` | file deleted | (same) | (same) | (same) |
+| `types/src/dead_property.rs:18` | `cfg_attr(feature = "test_mode", derive(serde::Serialize, serde::Deserialize))` | file deleted | (same) | (same) | (same) |
+| `types/src/dead_property.rs:26` | `cfg_attr(feature = "test_mode", derive(serde::Serialize, serde::Deserialize))` | file deleted | (same) | (same) | (same) |
+| `types/src/dead_property.rs:27` | `cfg_attr(feature = "test_mode", serde(transparent))` | file deleted | (same) | (same) | (same) |
+| `types/src/lib.rs:23` | `cfg_attr(feature = "test_mode", derive(serde::Serialize, serde::Deserialize))` | `types/src/lib.rs:26` `cfg_attr(stalwart_tests, derive(serde::Serialize, serde::Deserialize))` | serde derives for `TimeRange` | webdav::cal_query, za::drain | restore under `test_mode` |
+| `utils/src/lib.rs:94` | `cfg(feature = "test_mode")` | `utils/src/lib.rs:101` `cfg(stalwart_tests)` | `failed()` panics in test mode instead of logging | every suite (a hidden store error fails the test) | restore under `test_mode` |
+| `utils/src/lib.rs:97` | `cfg(not(feature = "test_mode"))` | `utils/src/lib.rs:104` `cfg(not(stalwart_tests))` | (same) | (same) | (same) |
+
+**Non-module `#[cfg(test)]` items that 1.0.1 regated to `cfg(all(test, stalwart_tests))`.**
+These go dead even in a crate's own unit tests, and the restored inline modules (see
+"Inline test modules the merge removes") depend on them.
+
+| 0.16.27 site (under `crates/`) | Item | v1.0.1 site and cfg | Relied on by | Proposed Task 2 disposition |
+|---|---|---|---|---|
+| `common/src/expr/parser.rs:258-259` | `panic!("Invalid jump position")` in `update_jmp_pos` | `common/src/expr/parser.rs:253-254` `cfg(all(test, stalwart_tests))` | `common`'s restored expression tests. Under `cfg(test)` a bad jump position fails the test; regated, it is ignored | **Flag: a silent change of test behaviour.** Restore `cfg(test)` |
+| `dav-proto/src/parser/mod.rs:146-147` | `impl PartialEq for Token` | `dav-proto/src/parser/mod.rs:159-160` `cfg(all(test, stalwart_tests))` | `dav-proto`'s restored tokenizer and request tests, which compare tokens | **Flag.** Restore `cfg(test)`; without it the restored modules do not compile |
+| `dav-proto/src/responses/propstat.rs:36-37` | `PropStat::new` | `dav-proto/src/responses/propstat.rs:36-37` `cfg(all(test, stalwart_tests))` | `dav-proto`'s restored response tests (0.16.27 `responses/mod.rs:262`, `:266`) | **Flag.** Restore `cfg(test)`; same reason |
 
 ### Moved hook targets: check against the known answer
 
@@ -1826,7 +2045,7 @@ baseline JSON records the restored-file name for each module.
 |---|---|---|---|---|
 | `common/src/auth/access_token.rs` | `sharing_access_tests` | 1 | present (fork side) | keep through the conflict resolution |
 | `common/src/cache/directory.rs` | `tests` | 1 | present (fork side) | keep through the conflict resolution |
-| `groupware/src/calendar/dates.rs` | `tests` | 1 | present (fork side) | v1.0.1 adds its own `mod tests` slot in this file (`unit/groupware/src/calendar/dates/tests.rs`), cfg `all(test, stalwart_tests)`, never compiled here; the two items share a name, so renaming the fork module is safer |
+| `groupware/src/calendar/dates.rs` | `tests` | 1 | present (fork side) | keep the name: its libtest identifiers are in the baseline. v1.0.1 adds its own `mod tests` slot in this file (`unit/groupware/src/calendar/dates/tests.rs`), cfg `all(test, stalwart_tests)`, which never compiles here, so there is no clash |
 | `http/src/auth/authenticate.rs` | `tests` | 2 | present (fork side) | keep through the conflict resolution |
 | `imap/src/op/search.rs` | `tests` | 2 | present (fork side) | keep through the conflict resolution |
 | `jmap/src/vacation/set.rs` | `tests` | 1 | present (fork side) | keep through the conflict resolution |
@@ -2819,7 +3038,7 @@ How to read it:
 
 The primary's decisions during Task 1, numbered as in the execution ledger. Each gives the
 decision, the reason and what it costs if it is wrong. Rulings 9–29 settle the interface
-sheet's proposals and the inventory's findings; Tasks 2–6 carry them in their briefs.
+sheet's proposals and the inventory's findings, and 30–33 come from the task review and its fix round; Tasks 2–6 carry them in their briefs.
 
 **Setup**
 
@@ -2859,27 +3078,62 @@ sheet's proposals and the inventory's findings; Tasks 2–6 carry them in their 
    (`common/src/auth/authentication.rs:83-89`) to also skip under `test_mode`, as at 0.16.
    The product never builds `test_mode`. Cost if wrong: the test timing of failed logins
    differs from production.
-10. **Impersonation marker** (sheet 2.1). On an HTTP cache hit, re-derive R35's marker from
-    the request: Basic, with a master-form username. `HttpAuthCache` is asserted at most
-    40 bytes and is already 40, so it gets no field. Cost if wrong: a new impersonation
-    route that isn't Basic is missed. Task 3's tests cover the routes that exist.
-11. **Key carry on token renewal** (sheet 2.2, not adopted). Carry the keys at the protocol
-    call sites that hold them for a connection, IMAP, and POP3 if it renews, not inside the
-    shared `renew_access_token` and `refresh_access_token`. Invariant 5 names exactly who
-    holds keys, and a call-site carry fails closed if upstream adds a renew caller. Cost if
-    wrong: one more insertion to maintain.
+10. **Impersonation marker** (sheet 2.1; revised after the review's M1). On an HTTP cache
+    hit, re-derive R35's marker from the cached token itself, whatever the mechanism:
+    `decode_plain_auth(token)` with `UsernameParts::new(..).is_master()`. `HttpAuthEntries`
+    keys on the token alone, so a Bearer header carrying a Basic login's token hits that
+    login's entry, and a rule that read the mechanism would derive no marker.
+    `HttpAuthCache` is asserted at most 40 bytes and is already 40, so it gets no field.
+    Cost if wrong: an impersonation route that doesn't use a master-form username is
+    missed; Task 3's tests cover the routes that exist.
+11. **Carry on token renewal** (sheet 2.2; revised after the review's I1). Two carries,
+    kept apart:
+    - **The marker.** R35's impersonation marker is carried inside `renew_access_token` and
+      `refresh_access_token` (`common/src/auth/oauth/grant.rs:195-230`), so every renewal
+      keeps it. At 1.0.1 the WebSocket loop renews its token on every request
+      (`jmap/src/websocket/stream.rs:97-108`). A renewed token that lost the marker would
+      serve an impersonated session the key account's keyless `Mailbox/get` and `Email/set`
+      (C4, C5). The marker only restricts, so carrying it in the shared functions fails
+      safe.
+    - **The keys.** They're carried only at the call site that holds them for a connection,
+      IMAP's renewal (`imap/src/core/mod.rs:280`); POP3 doesn't renew. Invariant 5 names
+      exactly who holds keys, and a call-site carry fails closed if upstream adds a renew
+      caller.
+    - Task 3 adds a za case: an impersonated WebSocket, a forced token refresh, then
+      `Mailbox/get` still refused.
+
+    Cost if wrong: a renewal path that bypasses both functions drops the marker. The new
+    case covers the WebSocket path.
 12. **The authentication generation** (sheet 3.1). Keep `za_generation` in the boxed
     `AccountStorage`, built through a fork helper, so the 0.16 hit and insert fences stay
     exact. `AccountCache` is asserted at most 112 bytes. `AccountStorage` is an in-memory
     type, and C9 covers stored types. Move `za_public_key` there too if it has a reader;
     drop it only if it has none. Cost if wrong: one upstream in-memory struct gains a
     field, a new merge hotspot.
-13. **Calendar notifications** (sheet 4.1; mismatch 7). No notification is stored under a
-    key account, and none carries a key account's event content. The producers
-    (`notify_direct_change`, `notify_calendar_removal` and the iTIP notification path) return
-    early through one fork call. At 1.0.1 these store full `ICalendar` snapshots, and DAV
-    serves them. This is 0.16 parity, since 0.16 had no notifications. Cost if wrong: key
-    accounts lack 1.0's notifications.
+13. **Calendar notifications** (sheet 4.1; revised after the review's I2). The first
+    version rested on a wrong premise, that 0.16 had no notifications. In fact
+    `CalendarEventNotification` is the 0.16 scheduling-inbox item, and release 2 stores
+    sealed ones under key accounts for the drain (`seal/item.rs`, `drain.rs`). So:
+    - **Direct-change notifications.** Upstream's (`notify_direct_change`, and through it
+      `notify_calendar_addition` and `notify_calendar_removal`) produce nothing for a
+      key-account owner: one fork call returns early. At 1.0.1 they store full `ICalendar`
+      snapshots, and DAV serves them.
+    - **Sealed inbox items.** The fork's items stay `CalendarEventNotification` records in
+      1.0.1's split notification record. The sealed message rides in
+      `CalendarEventNotificationContent::Itip`'s `message`, with `previous` and `current`
+      set to `None`. Task 4 defines the row's `calendar_ids`, `etag` and
+      `NotificationAudience` flags without reading plaintext, and records the mapping in
+      this note before it ports the drain.
+    - **The drain's mirror.** Its hand-mirror of `itip_ingest`'s import branch
+      (`itip.rs:339-352`) and of `commit_itip_merge` (`:956-970`) writes no plaintext
+      `Itip` snapshot.
+    - **Deletion.** Upstream's quota eviction (`NotificationQuota::reserve`,
+      `storage.rs:1086-1150`) and reaper (`reap_calendar_notifications`,
+      `notification.rs:370-425`) must not delete a pending sealed item before the drain sees
+      it, or Task 4 records why that deletion is safe.
+
+    Cost if wrong: key accounts lack 1.0's direct-change notifications, which 0.16 didn't
+    have either.
 14. **The create's id before the fan-out** (sheet 4.2; mismatch 8). `assign_document_ids` is
     gone. Task 4 establishes whether a reservation-only batch allocates an id that is never
     reused. If it does, Task 4 uses one. If not, it stops and brings key pinning 5.2's phase
@@ -2947,10 +3201,50 @@ sheet's proposals and the inventory's findings; Tasks 2–6 carry them in their 
     at `http/src/auth/authenticate.rs:73-78` (`.id`) and `:94-98` (`.details`). The fork
     removed both at 0.16. Task 3 carries the removal, and they join the hook inventory as
     C3 hooks.
-29. **Dead properties outside the event** (sheet concern 3). At 1.0.1 a container is not part
-    of the event's extras. So sharing's conversion, rollback and rotation handle each
-    container explicitly, and Task 4 records the conversion journal's identity rule for
-    containers.
+29. **Dead properties outside the event** (sheet concern 3; the review's M12). At 1.0.1 a
+    container is no longer part of the event's extras. So each of these handles every
+    container explicitly, resealing or rewrapping it:
+    - sharing's conversion, rollback and rotation;
+    - a MOVE or COPY between calendars or key domains.
+
+    Task 4 records the conversion journal's identity rule for containers.
+
+**After the task review**
+
+30. **The pending-item flag** (the review's I3). The fork's
+    `EVENT_NOTIFICATION_ZA_PENDING = 1 << 2` (`groupware/src/calendar/mod.rs:125`) is the
+    same bit as 1.0.1's `EVENT_NOTIFICATION_IS_DESTROY` (`v1.0.1 mod.rs:158`), and keeping
+    both constants compiles. Task 4 moves the fork flag to a bit that no 1.0.1 notification
+    flag uses (`NotificationAudience` holds bits 4 and 5). A compile-time check makes it
+    differ from every upstream flag, and the notification flags join C9's collision
+    checks. Fresh stores need no migration of the bit.
+31. **Gate granularity** (the review's I6, M2, M3 and M10). Each of these fails the gates,
+    where at 0.16.27 the thing it guards held:
+    - **A step.** The gates read per step, not per mode, so a loss under only
+      `BLOB_STORE=FileSystem` fails.
+    - **A helper.** Every `tests/src` function that ran in a step at 0.16.27 must run there
+      under the same three counts, so an unawaited helper future or a helper's early return
+      fails.
+    - **A loop.** Each of the 12 loop-tailed sub-test bodies needs a positive loop-body count
+      where it had one, so a lost fixture fails.
+    - **The cohort.** The coverage gate also reports a runtime-only cohort figure, without
+      the inline `#[cfg(test)]` modules and the fork's test-support files, and both figures
+      must hold their baseline fractions.
+
+    Task 7's diff step also flags a removed `.await`, an added `let _ = <call>` and an
+    added `drop(<call>)` of a future. Cost if wrong: a gate that fails on a legitimate
+    restructuring, which then gets an expectation-ledger entry.
+32. **The strict-rule tooling is committed** (the review's M15) under
+    `tests/qualification/tools/`. It has a self-check that reproduces every recorded
+    `last_statement` region on the `5b914ddb5` sources, so Task 7 builds on the method
+    rather than reimplementing it.
+33. **The test licence key is not restored** (inventory fix round 1). Its two `test_mode`
+    sites sit in the SEL-only `common/src/enterprise/config.rs` (`:87`, `:90` at 0.16.27),
+    and the fork doesn't edit SEL code. The tests that use it are SEL-only (`system::tenant`,
+    `system::archiving`, `scim`). Task 2 finds any retained test whose behaviour depended on
+    the licence: it is dispositioned, or adapted with an expectation-ledger entry. Running
+    the retained suite unlicensed is also closer to the OSS product. Cost if wrong: a
+    retained test changes behaviour without a licence, which Task 7's gates show.
 
 The inventory's findings 3–7 and 11–14 are directives to their owner tasks and need no
 choice. The baseline's observation that imap `uidbatches::test` reaches its final loop with
@@ -2972,9 +3266,13 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 Part B's answer to the brief's check, item by item:
 
 - **Every original runtime hook has an owner and a disposition.**
-  - Yes for all 483 hooks under `crates/` and the 3 in the root `Cargo.toml`. Each sits in
-    one file row with an owner, and each (b), (c) and (d) hook has its own row with a
-    v1.0.1 site. The 42 (a) hooks merge clean.
+  - Yes for all 485 hooks under `crates/` (483 diff hunks plus ruling 28's two C3 hooks
+    in `http/src/auth/authenticate.rs`, owned by Task 3) and the 3 in the root
+    `Cargo.toml`. Each sits in one file row with an owner, and each (b), (c) and (d) hook
+    has its own row with a v1.0.1 site. The 42 (a) hooks merge clean.
+  - The pending-item flag in `groupware/src/calendar/mod.rs` collides with 1.0.1's
+    destroy flag; ruling 30 moves it (Task 4).
+  - The auto-merged Docker tag change in `.github/workflows/ci.yml` goes to Task 9 (C11).
   - `Cargo.lock` is regenerated by Task 2.
   - The llm hook's disposition is "SEL-only, not ported".
   - The disposition is not final for the hooks named in "Findings for the primary": the
@@ -2987,15 +3285,19 @@ Part B's answer to the brief's check, item by item:
   - Test support: the 541 `tests/` files and `.github/workflows/test.yml` (restored), the
     114 dav-proto fixtures (Task 2 restores them with their tests), and the root
     workspace's `tests` member (Task 2 re-adds it).
-  - The design does not name the last two; both are new here.
+  - Test hooks: the 144 upstream `test_mode` sites and the 3 non-module `cfg(test)` items
+    that 1.0.1 regated each have a 1.0.1 counterpart and a proposed disposition in
+    "Upstream test hooks (for Task 2)".
+  - The design does not name the dav-proto fixtures or the workspace member; both are new
+    here.
 - **Every removed test is accounted for.**
   - The 541 `tests/` files are restored by the fork-side checkout.
   - All 132 upstream inline test modules are listed above with their 1.0 counterparts.
     That is 282 active tests outside the SEL crates, plus the SEL-only `scim` and
     `scim-proto` modules, whose 183 tests are dispositioned.
   - The fork's 7 unit modules in upstream files (10 tests) survive in the merge result.
-    They must be kept through the conflict resolution, and the one in `dates.rs` should be
-    renamed.
+    They must be kept through the conflict resolution, under their current names: their
+    libtest identifiers are in the baseline.
 - **No data migration task appears in the scope.** Correct.
   - The plan's Tasks 1 to 9 hold none, and Task 2 accepts the removal of
     `crates/migration` "without inventing a fork migration replacement".

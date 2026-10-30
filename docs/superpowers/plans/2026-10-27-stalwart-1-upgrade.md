@@ -119,7 +119,7 @@ Crate paths abbreviated as `common/...`, `email/...` and similar below are relat
 | Harness | `tests/src/utils/{server,storage,cleanup}.rs`, `tests/src/lib.rs`, restored upstream unit tests (`*restored_tests.rs`), `test_mode` support; the fork's hooks in `types` and `store` far enough to compile (reserved fields and collection, `ZA_UID_LEASE_PREFIX`, `za_test.rs`, `has_account_search_terms`, R58's carrier type) | Task 2 |
 | Accounts | `crates/vault/`, `common/src/{auth,cache/principals.rs,ipc.rs,za/}`, HTTP auth/vault/contacts, protocol login handlers | Task 3 |
 | Calendars | `groupware/src/calendar/{seal,sharing,drain,fanout,delegation,pinning,sequence}`, the new `privacy`, `hidden`, `participants`, `overlap` and `notification` modules, scheduling, DAV (including `dav/src/common/propfind/`, which replaced `propfind.rs`, and `dav/src/common/dead/`), HTTP shares | Task 4 |
-| Mail | `email/src/message/{za,metadata,ingest}`, mail readers/writers in IMAP/POP3/JMAP/SMTP and tracing; `imap/src/op/fetch/` (replaced `fetch.rs`) and `imap/src/core/view.rs` (replaced `core/message.rs`); `spam-filter/src/analysis/llm.rs`'s hook, now in the SEL-only `common/src/enterprise/ai/` (a disposition, not a port) | Task 5 |
+| Mail | `email/src/message/{za,metadata,ingest}`, mail readers/writers in IMAP/POP3/JMAP/SMTP and tracing; `imap/src/op/fetch/` (replaced `fetch.rs`) and `imap/src/core/view.rs` (replaced `core/message.rs`); `spam-filter/src/analysis/llm.rs`'s hook, now in the SEL-only `spam-filter/src/analysis/ai/`, which calls `common/src/enterprise/ai/` (a disposition, not a port) | Task 5 |
 | Background | `services/src/index_queue/`, `task_manager/tasks/{grantee_cleanup,rebuild_shares}`, `store/src/{search,write}`, `common/src/cache/{large,swap}`, `jmap/src/api/metadata/`, `imap/src/op/metadata/` | Task 6 |
 | Coverage | Existing za and protocol tests, `tests/qualification/`, inventory and coverage tooling, the expectation ledger | Task owners; Task 7 integrates |
 | Product/release | `tests/product/`, existing CalDAV harness, workflows, identity tooling/docs | Tasks 8–9 |
@@ -169,7 +169,7 @@ checkpoint.
   - every libtest identifier per binary and feature set, with its status: run, ignored (the
     six `#[ignore]`d tests) or not selected, and whether CI selects it after PR #66;
   - every suite sub-test call, with its mode and cfg guards, whether it is `async`, and
-    whether it executed in each mode under the strict rule. The rule needs three positive
+    whether it executed in each step under the strict rule. The rule needs three positive
     counts:
     - the body record: the async body's own record for an `async fn`, never the outer
       constructor record; the function's own record for a plain `fn`;
@@ -205,12 +205,13 @@ checkpoint.
   - `dav/src/common/propfind.rs` (15 call sites) became `propfind/`;
   - `imap/src/op/fetch.rs` (7) became `op/fetch/`;
   - `imap/src/core/message.rs` (1) became `core/view.rs`;
-  - `spam-filter/src/analysis/llm.rs` (1) moved into the SEL-only `common/src/enterprise/ai/`.
+  - `spam-filter/src/analysis/llm.rs` (1) moved into the SEL-only `spam-filter/src/analysis/ai/`,
+    which calls `common/src/enterprise/ai/`.
 - [ ] Freeze the shared adaptations: keyless `Authenticated`, request/connection key ownership,
   account epoch/classification, split calendar views, metadata/extras mapping, pending-ID
   fences and search/snapshot inputs. Use the upstream interfaces named in Tasks 3–6.
 - [ ] Count upstream's private-test slots (`#[path = "…/stalwart-tests/…"]`) in the target,
-  and record the count: 562 at v1.0.1 (534 test-only, 27 support). List the modules gaining
+  and record the count: 562 at v1.0.1 (535 test-only, 27 support). List the modules gaining
   slots relative to the previous release, for review in Tasks 3–6.
 - [ ] Primary reviews this inventory before assigning writers. Then start the normal merge:
   1. Run `git merge --no-commit`.
@@ -340,7 +341,8 @@ optional `Arc<SessionKeys>`. Retain `za_commit`/`za_vault_commit` as mutation bo
   - `expired_bearer_cache_entry_is_refused`: an expired cached bearer token is refused.
 
   Assert also that forbidden key-account bearer and impersonation authentication is still
-  refused. Use deterministic epoch pauses for late loaders.
+  refused, including an impersonated JMAP WebSocket after a forced token refresh, whose
+  `Mailbox/get` must still be refused (Task 1's ruling 11). Use deterministic epoch pauses for late loaders.
 - [ ] Port vault storage, checked decoding, pin records and crypto units to the 1.0 archive
   configuration without legacy readers. Assert setup/password/recovery/app-wrap/pin round
   trips and malformed-record refusal without secret-bearing Debug/errors.
@@ -521,7 +523,7 @@ recorded limits. `cargo check -p groupware -p dav` passes. Run the cases at Task
 - `imap/src/core/view.rs`, which replaced `core/message.rs`.
 
 `spam-filter/src/analysis/llm.rs`'s one hook moved into the SEL-only
-`common/src/enterprise/ai/` and is recorded as a disposition, not ported. SMTP delivery
+`spam-filter/src/analysis/ai/` (which calls `common/src/enterprise/ai/`) and is recorded as a disposition, not ported. SMTP delivery
 still calls the single-message `email_ingest`.
 Tests: existing `tests/src/za/mail/{delivery,writes,fence,reads,uploads,gates,traces}.rs`,
 plain/key IMAP and JMAP variants; related email units.
@@ -550,7 +552,7 @@ Option<PendingId>) -> trc::Result<PendingIngest>`,
 
 **Check:** Every delivery, import, append, copy, upload and read route has a named sealing,
 unsealing or refusal boundary. No single-message-only guard is left around a grouped bypass.
-`cargo check -p email -p imap -p jmap -p smtp -p pop3` passes.
+`cargo check -p email -p imap -p pop3 -p smtp -p spam-filter` passes (Task 1's ruling 21).
 
 ## Task 6: Port search, snapshots and new metadata surfaces
 
@@ -602,7 +604,9 @@ outside `za_tests`.
     (`store/src/search/index.rs`), the batch the worker commits. It does not go on the queue
     entry, which the producer writes. The worker (`index_queue/index.rs`) attaches it through
     the store-side carrier field (Task 2) on the documents it passes to
-    `index_account_documents`. The reason is that `store` cannot call into `common`.
+    `index_account_documents`; the carrier is attached at the builders' plain returns
+    (`index_queue/document.rs`, `build_email_document` and `build_calendar_document`), as at
+    0.16. The reason is that `store` cannot call into `common`.
     `account_batch` splits a pass into chunks (`store/src/search/term.rs:364-383`), so one
     fork call after `build_batch` places the assertion in every chunk of a pass that holds
     a fenced document (Task 1's ruling 18). Test it with the `FORCE_COMMIT_SPLIT` hook
@@ -683,7 +687,8 @@ outside `za_tests`.
 
 **Check:** No new background path obtains session keys, indexes decrypted content, or
 rewrites a key account's sealed calendar data. Every new persistent surface appears in the
-leak inventory or has a source-backed exclusion. `cargo check -p services -p store` passes.
+leak inventory or has a source-backed exclusion. `cargo check -p services -p store -p jmap -p http@1.0.1 -p managesieve` passes (Task 1's
+ruling 21).
 
 ## Task 7: Reach the integrated compile and coverage gate
 
@@ -699,7 +704,10 @@ and `scripts/tests/check_coverage.py`; the expectation ledger in the outcome not
   - a test that ran at 0.16.27 is now ignored;
   - a required exact selector selects nothing;
   - a status change has no disposition;
-  - a required sub-test call did not execute in a mode where it executed at 0.16.27.
+  - a required sub-test call did not execute in a step where it executed at 0.16.27;
+  - a `tests/src` function that ran in a step at 0.16.27 did not run there, under the same
+    three counts (Task 1's ruling 31), or a loop-tailed body's loop body ran no iteration
+    where it had.
 
   A test ignored at 0.16.27 that is still ignored, and still listed, passes.
   - Capture both `-- --list` and `-- --ignored --list` for each required package and
@@ -754,7 +762,8 @@ and `scripts/tests/check_coverage.py`; the expectation ledger in the outcome not
 
   Show the failure each time, then restore and rerun.
 - [ ] Diff every ported test file against `5b914ddb5` for added `return`, `cfg!`, `#[cfg]`
-  and `#[ignore]`. Each addition needs an expectation-ledger entry naming the 1.0 change
+  and `#[ignore]`, and for a removed `.await`, an added `let _ = <call>` and an added
+  `drop(<call>)` of a future. Each addition needs an expectation-ledger entry naming the 1.0 change
   behind it.
 - [ ] Rerun the baseline's 19-step coverage net on the candidate with the same commands
   (`cargo llvm-cov --no-report`, one step at a time, the profiles merged afterwards). Feed
@@ -933,7 +942,7 @@ the [Codex review](2026-10-27-stalwart-1-upgrade-codex-review-2026-10-30.md) (C)
 | F-M11: external suites unscoped | Adopted (Jay's decision: deferred to a follow-up plan). Design scope exclusions; Task 8. |
 | F-M12: restore cost and stop rule | Adopted (Jay's decision: verbatim where the subject exists; equivalents for public behaviour or hotspots; upstream coverage reported). Task 2. |
 | F-L1: `test.yml` modify/delete | Adopted: restored with `tests/` in Task 1. |
-| F-L2: slot classification | Adopted: 534 test-only, 27 support. |
+| F-L2: slot classification | Adopted: 534 test-only, 27 support (corrected to 535 by Task 1). |
 | F-L3: 520 of 598 at the wrong SHA | Adopted: 541 of 599 at `9a7574203`, 520 silent and 21 conflicts. |
 | F-L4: swap tier | Adopted (Jay's decision: started by default). Task 2 interfaces. |
 | F-L5: feature list re-derived late | Adopted: moved to Task 2. |
@@ -969,7 +978,7 @@ Findings of the [Fable re-review](../specs/2026-10-27-stalwart-1-upgrade-design-
 | F3-L7: `DefaultAlertsResolver` | Adopted: added to the viewer-side readers. Task 4. |
 | F3-L8: slot wording | Adopted. |
 | F-M8's stop clause | Removed: no DAV path writes event preferences at 1.0.1 (F3 verdict). |
-| R62 and R63 | Settled as "subject deleted": `account_batch` has no commit point (F3 verdict on F-M5). |
+| R62 and R63 | Settled as "subject deleted": `account_batch` has no commit point (F3 verdict on F-M5). Superseded: Task 1 found the split; see "Amended during execution" and ruling 19. |
 
 ## Review dispositions (revision 5)
 
@@ -1023,4 +1032,4 @@ Changes made from what Task 1 measured. The
 | 19 shared directories, not 20; five inline test modules aren't named `tests` | Counts corrected; a restored module keeps its own name. Design "Decisions"; Task 2. |
 | `account_batch` splits a pass into commit chunks, with the `Document` keys last | R58 is asserted in every chunk; R62's guard and R63 retire only once Task 6 confirms the per-partition ordering; R62's term scans stay. Design "Indexing"; Task 6. |
 | `jmap` depends on `services`; no task checked `http`, `managesieve` or `spam-filter` | The crate checks are reordered, and a failure goes back to the file's owner. "File ownership and dependencies". |
-| Further corrections to cited paths, lines and signatures, and decisions on the shared interfaces | The outcome note's interface sheet and Task 1's rulings 9–29 amend Tasks 2–6. Where they correct a cite in this plan or the design, they win, and each task's brief carries them. |
+| Further corrections to cited paths, lines and signatures, and decisions on the shared interfaces | The outcome note's interface sheet and Task 1's rulings 9–33 amend Tasks 2–7. Where they correct a cite in this plan or the design, they win, and each task's brief carries them. |
