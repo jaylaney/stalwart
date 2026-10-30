@@ -3271,13 +3271,22 @@ sheet's proposals and the inventory's findings, and 30–33 come from the task r
       stop those five from compiling, and with them the telemetry suite, `za::disabled`'s
       disabled-tenant case, `za::mail::delivery`'s restore-refusal case,
       `smtp::inbound::antispam` and `scim_tests`, which design Decision 1 keeps compiling.
+    - **What needs a licence.** Without one, `core.enterprise` is `None`, so licensed
+      features are off as well as the four objects: alerts and AI models among them. That
+      reaches `telemetry::alerts` (its alert email) and `smtp::inbound::antispam`'s LLM case
+      too (the third re-review's R3-1).
     - **The licensed parts take the SEL-only disposition,** in line with Jay's decision on
       SEL tests: they come back only if a licence is bought, and then only in a private
-      repository. Task 2 identifies each part of the five sub-tests that needs a licensed
-      object. It skips that part with an expectation-ledger entry giving this evidence, and
-      keeps the rest of each sub-test running. No part is adapted to expect the refusal.
-      If a part's subject also exists in the OSS product, Task 2 stops and brings it to the
-      primary.
+      repository.
+      - `telemetry::tracing` and `telemetry::metrics` take it as whole calls, since every
+        assertion in them is on `Trace` or `Metric` objects and a skipped body would pass
+        the gate empty (R3-2).
+      - Elsewhere, Task 2 identifies each part that needs a licence. It removes or
+        cfg-gates that part with an expectation-ledger entry giving this evidence, and
+        keeps the rest of the sub-test running.
+      - In-memory metrics are OSS, so a part that tests them stays.
+      - No part is adapted to expect the refusal. If a part's subject also exists in the
+        OSS product, Task 2 stops and brings it to the primary.
 
     Cost if wrong: lost coverage of enterprise objects the OSS product doesn't ship.
 
