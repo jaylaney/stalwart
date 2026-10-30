@@ -9,7 +9,7 @@ use super::*;
 fn jwt(payload: &str) -> String {
     format!(
         "eyJhbGciOiJSUzI1NiJ9.{}.c2lnbmF0dXJl",
-        general_purpose::URL_SAFE_NO_PAD.encode(payload)
+        URL_SAFE_NO_PAD.encode(payload)
     )
 }
 

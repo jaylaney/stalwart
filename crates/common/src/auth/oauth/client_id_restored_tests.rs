@@ -6,6 +6,13 @@
 
 use super::*;
 
+const SCOPE_OFFLINE_ACCESS: &str = "offline_access";
+const SCOPE_MAIL: &str = "urn:ietf:params:oauth:scope:mail";
+
+fn scopes_to_mask(scope: &str) -> OAuthScopes {
+    OAuthScopes::parse(scope)
+}
+
 const KEY: &[u8] = b"a-test-encryption-key-of-some-length";
 
 fn sample() -> ClientMeta {
@@ -14,7 +21,7 @@ fn sample() -> ClientMeta {
             "http://127.0.0.1/cb".to_string(),
             "com.example.app:/oauth".to_string(),
         ],
-        scope_mask: scopes_to_mask(&format!("{SCOPE_OFFLINE_ACCESS} {SCOPE_MAIL}")),
+        scopes: scopes_to_mask(&format!("{SCOPE_OFFLINE_ACCESS} {SCOPE_MAIL}")),
         client_name: Some("Example Client".to_string()),
     }
 }
@@ -25,7 +32,7 @@ fn round_trip_preserves_all_fields() {
         sample(),
         ClientMeta {
             redirect_uris: vec!["http://[::1]/".to_string()],
-            scope_mask: 0,
+            scopes: OAuthScopes::NONE,
             client_name: None,
         },
         ClientMeta::default(),
@@ -46,7 +53,7 @@ fn scope_mask_is_order_independent_and_drops_unknown() {
         scopes_to_mask(&format!("{SCOPE_MAIL} custom:unknown")),
         scopes_to_mask(SCOPE_MAIL)
     );
-    assert_eq!(scopes_to_mask("totally unknown"), 0);
+    assert_eq!(scopes_to_mask("totally unknown"), OAuthScopes::NONE);
 }
 
 #[test]
@@ -71,14 +78,11 @@ fn wrong_key_is_rejected() {
 fn tampering_is_rejected() {
     let client_id = encode_client_id(KEY, &sample()).unwrap();
     let (header, body_b64) = client_id.split_at(CLIENT_ID_HEADER.len());
-    let mut body = general_purpose::URL_SAFE_NO_PAD.decode(body_b64).unwrap();
+    let mut body = URL_SAFE_NO_PAD.decode(body_b64).unwrap();
     for idx in 0..body.len() {
         let mut tampered = body.clone();
         tampered[idx] ^= 0x01;
-        let forged = format!(
-            "{header}{}",
-            general_purpose::URL_SAFE_NO_PAD.encode(&tampered)
-        );
+        let forged = format!("{header}{}", URL_SAFE_NO_PAD.encode(&tampered));
         assert_eq!(decode_client_id(KEY, &forged), None, "byte {idx}");
     }
     body[0] ^= 0x00;

@@ -7,7 +7,7 @@
 use super::*;
 
 fn b64(bytes: &[u8]) -> String {
-    String::from_utf8(Base64Encoder::new().encode(bytes).unwrap()).unwrap()
+    STANDARD.encode(bytes)
 }
 
 #[test]

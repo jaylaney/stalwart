@@ -95,9 +95,15 @@ async fn fixture(name: &str, client_id: Option<&str>) -> WebApplications {
         Resource::new("text/javascript", dir.path.join("app.js")),
     );
 
+    // 1.0 renders each prefix's index page when the bundle is unpacked.
     let routes = Arc::new(AppRoutes {
         resources,
-        oauth_client_id_meta: client_id.map(oauth_client_id_meta),
+        index_pages: index_pages(
+            INDEX.as_bytes(),
+            &["admin".to_string(), "account".to_string()],
+            client_id,
+        ),
+        oauth_client: None,
         _bundle_dir: dir,
     });
 
@@ -115,7 +121,7 @@ async fn serve_html(apps: &WebApplications, prefix: &str, path: &str) -> String 
     let served = apps.serve(prefix, path).await.unwrap().unwrap();
     assert!(served.no_cache, "index responses must not be cached");
     assert_eq!(served.resource.content_type.as_ref(), "text/html");
-    String::from_utf8(served.resource.contents).unwrap()
+    String::from_utf8(served.resource.contents.to_vec()).unwrap()
 }
 
 #[tokio::test]
@@ -154,7 +160,7 @@ async fn assets_and_unknown_prefixes_are_untouched() {
     let apps = fixture("serve-assets", Some("pocket-id-client")).await;
 
     let served = apps.serve("admin", "app.js").await.unwrap().unwrap();
-    assert_eq!(served.resource.contents, b"export const x = 1;\n");
+    assert_eq!(served.resource.contents, &b"export const x = 1;\n"[..]);
     assert_eq!(served.resource.content_type.as_ref(), "text/javascript");
     assert!(!served.no_cache);
 
@@ -247,30 +253,26 @@ fn bundle(version: Option<&str>) -> zip::ZipArchive<Cursor<Vec<u8>>> {
     writer.start_file("index.html", options).unwrap();
     io::Write::write_all(&mut writer, INDEX.as_bytes()).unwrap();
     if let Some(version) = version {
-        writer.start_file("VERSION", options).unwrap();
-        io::Write::write_all(&mut writer, version.as_bytes()).unwrap();
+        writer.start_file(APP_MANIFEST, options).unwrap();
+        io::Write::write_all(
+            &mut writer,
+            format!("{{\"id\":\"webui\",\"version\":\"{version}\"}}").as_bytes(),
+        )
+        .unwrap();
     }
     zip::ZipArchive::new(writer.finish().unwrap()).unwrap()
 }
 
+// 1.0 replaced the VERSION file with the `stalwart-app.json` manifest and
+// requires the web UI's major version 2 (`verify_manifest`); a bundle
+// without a manifest is refused.
 #[test]
 fn bundles_newer_than_the_supported_major_version_are_rejected() {
-    // Bundles without VERSION or with a 1.x VERSION are accepted, anything else is rejected
-    assert_eq!(unsupported_bundle_version(&mut bundle(None)), None);
-    assert_eq!(
-        unsupported_bundle_version(&mut bundle(Some("1.0.12\n"))),
-        None
-    );
-    assert_eq!(
-        unsupported_bundle_version(&mut bundle(Some("2.0.0\n"))),
-        Some("2.0.0".to_string())
-    );
-    assert_eq!(
-        unsupported_bundle_version(&mut bundle(Some("10.1.0"))),
-        Some("10.1.0".to_string())
-    );
-    assert_eq!(
-        unsupported_bundle_version(&mut bundle(Some("garbage"))),
-        Some("garbage".to_string())
-    );
+    let url = "https://example.org/webui.zip";
+    assert!(verify_manifest(&mut bundle(None), url).is_err());
+    assert!(verify_manifest(&mut bundle(Some("2.0.12")), url).is_ok());
+    assert!(verify_manifest(&mut bundle(Some("1.0.12")), url).is_err());
+    assert!(verify_manifest(&mut bundle(Some("3.0.0")), url).is_err());
+    assert!(verify_manifest(&mut bundle(Some("10.1.0")), url).is_err());
+    assert!(verify_manifest(&mut bundle(Some("garbage")), url).is_err());
 }

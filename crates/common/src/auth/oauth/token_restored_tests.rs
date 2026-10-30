@@ -9,6 +9,22 @@ use super::*;
 const KEY: &[u8] = b"a-test-encryption-key-of-some-length";
 const NAME: &[u8] = b"user@example.org";
 
+// 1.0 seals with a `SymmetricEncrypt` and a caller-chosen nonce; these
+// wrappers keep 0.16's key-based calls, with a random nonce per token.
+fn seal_token(key: &[u8], raw: &RawToken, footer: &[u8]) -> Result<String, String> {
+    let nonce = store::rand::random::<[u8; SymmetricEncrypt::NONCE_LEN]>();
+    super::seal_token(
+        &SymmetricEncrypt::new(key, "restored-token-tests"),
+        raw,
+        footer,
+        &nonce,
+    )
+}
+
+fn open_token(key: &[u8], token: &str) -> Result<RawToken, ()> {
+    super::open_token(&SymmetricEncrypt::new(key, "restored-token-tests"), token)
+}
+
 fn sample(grant_type: GrantType, claims: Option<&str>, cv: u64) -> RawToken {
     RawToken {
         grant_type,
@@ -17,6 +33,7 @@ fn sample(grant_type: GrantType, claims: Option<&str>, cv: u64) -> RawToken {
         issued_at: 1_000,
         expiry: 2_000,
         credential_version: cv,
+        grant: None,
     }
 }
 
@@ -61,10 +78,7 @@ fn round_trip_preserves_all_fields() {
             assert!(!token[TOKEN_HEADER.len()..].contains('.'));
         } else {
             let segment = token.rsplit_once('.').unwrap().1;
-            assert_eq!(
-                general_purpose::URL_SAFE_NO_PAD.decode(segment).unwrap(),
-                footer
-            );
+            assert_eq!(URL_SAFE_NO_PAD.decode(segment).unwrap(), footer);
         }
     }
 }
@@ -78,7 +92,7 @@ fn account_name_is_readable_in_clear_text_footer() {
     )
     .unwrap();
     let footer = token.rsplit_once('.').unwrap().1;
-    let decoded = general_purpose::URL_SAFE_NO_PAD.decode(footer).unwrap();
+    let decoded = URL_SAFE_NO_PAD.decode(footer).unwrap();
     assert_eq!(decoded, b"route-me@example.org");
 }
 
@@ -97,13 +111,13 @@ fn tampering_with_ciphertext_is_rejected() {
         Some((b, f)) => (b.to_string(), Some(f.to_string())),
         None => (rest.to_string(), None),
     };
-    let mut body = general_purpose::URL_SAFE_NO_PAD.decode(&body_b64).unwrap();
+    let mut body = URL_SAFE_NO_PAD.decode(&body_b64).unwrap();
 
     for idx in 0..body.len() {
         let mut tampered = body.clone();
         tampered[idx] ^= 0x01;
         let mut rebuilt = String::from(header);
-        rebuilt.push_str(&general_purpose::URL_SAFE_NO_PAD.encode(&tampered));
+        rebuilt.push_str(&URL_SAFE_NO_PAD.encode(&tampered));
         if let Some(footer) = &footer {
             rebuilt.push('.');
             rebuilt.push_str(footer);
@@ -126,7 +140,7 @@ fn tampering_with_clear_text_footer_is_rejected() {
     let (body, _) = token.rsplit_once('.').unwrap();
 
     // An attacker rewrites the clear-text account name to impersonate another account
-    let forged_footer = general_purpose::URL_SAFE_NO_PAD.encode(b"attacker@example.org");
+    let forged_footer = URL_SAFE_NO_PAD.encode(b"attacker@example.org");
     let forged = format!("{body}.{forged_footer}");
     assert!(
         open_token(KEY, &forged).is_err(),
@@ -180,10 +194,10 @@ fn truncating_the_body_is_rejected() {
     let token = seal_token(KEY, &sample(GrantType::AccessToken, None, 0), NAME).unwrap();
     let (header, rest) = token.split_at(TOKEN_HEADER.len());
     let body_b64 = rest.split_once('.').map(|(b, _)| b).unwrap_or(rest);
-    let body = general_purpose::URL_SAFE_NO_PAD.decode(body_b64).unwrap();
+    let body = URL_SAFE_NO_PAD.decode(body_b64).unwrap();
     for len in 0..body.len() {
         let mut rebuilt = String::from(header);
-        rebuilt.push_str(&general_purpose::URL_SAFE_NO_PAD.encode(&body[..len]));
+        rebuilt.push_str(&URL_SAFE_NO_PAD.encode(&body[..len]));
         assert!(
             open_token(KEY, &rebuilt).is_err(),
             "truncation to {len} must be rejected"
