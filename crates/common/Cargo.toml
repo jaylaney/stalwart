@@ -98,7 +98,7 @@ sd-notify = "0.5"
 dns-update = { version = "0.6", features = ["test_provider"] }
 
 [features]
-test_mode = ["store/test_mode"]
+test_mode = ["store/test_mode", "dns-update/test_provider"]
 dev_mode = []
 enterprise = ["store/enterprise", "utils/enterprise", "trc/enterprise", "telemetry/enterprise", "directory/enterprise", "coordinator/enterprise", "registry/enterprise", "jmap_proto/enterprise"]
 foundation = []

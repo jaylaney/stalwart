@@ -3603,6 +3603,11 @@ written, right after upstream's private slot.
   does not pass an already-encoded segment through.
 - `groupware`'s restored modules (`cache/file`, `calendar/expand`, `scheduling/format`)
   compile first at Task 4's check.
+- The move route's payload bound has no store API until Task 6 re-derives it:
+  `BatchBuilder::accounted_input_bytes` and `Params::accounted_input_bytes` are gone, since
+  1.0's `MergeFnc` is a closure with no countable `Params` (ledger cells for
+  `store/src/write/batch.rs` and `write/mod.rs`). The route's call
+  (`dav/src/calendar/copy_move.rs`) waits for Task 6's API.
 
 **Task 5**
 - Declaration in `spam-filter/src/analysis/url.rs`: `#[cfg(test)] #[path =
@@ -3635,6 +3640,14 @@ written, right after upstream's private slot.
 - `services`', `jmap`'s and `http`'s restored modules compile first at Task 6's check.
 - If `automation::acme` needs fast retries now that ACME retries go through the task queue,
   that is a task-manager retry policy under `test_mode`.
+- Ruling 18's tests: `store::za_test::FORCE_COMMIT_SPLIT` splits an index pass after each
+  `Document` key, because it also splits batches with no current account, which
+  `AccountIndexer::build_batch` never sets (unit test
+  `za_test::tests::force_commit_split_splits_the_named_account_and_index_passes`). It does not
+  govern `build_batch`'s own `add_commit_point()` after every 1000 term merges
+  (`search/term.rs:364-368`); a fixture document with more than 1000 distinct terms crosses
+  that point without the hook. Re-export the setter through `common::za::test_hooks` with
+  the other store hooks.
 
 **Task 7**
 - The tests crate's first compile: the harness items above, and the `SUBSPACE_*` constants
@@ -3684,7 +3697,7 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 |---|---|---|---|
 | `Cargo.lock` | content | Task 2 (regenerated) | resolved (Task 2a): regenerated from v1.0.1's lockfile (`git show 23b69755c:Cargo.lock`) with `cargo metadata` once the manifests resolved. No v1.0.1 package changed version; `stalwart` is now `0.1.1-beta.1`; 72 packages were added: `vault`, `tests` and 70 crates that only `tests`' dev-dependencies pull (`jmap-client`, `testcontainers`, `rust-s3`, `ece`, `biscuit`, `serial_test`, `csv` and their dependencies). `cargo tree -d --workspace -e normal,build` lists the same 157 entries as v1.0.1's tree. With dev edges, the extra duplicates are internal to test-only clients: `quick-xml` 0.41, `reqwest` 0.12 and `hashbrown` 0.14 under `rust-s3`; `tungstenite` 0.29, `rand` 0.9 and `sha1` 0.10 under `jmap-client`; `darling` 0.24 under `testcontainers`. None sits at a server crate's API. |
 | `Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's file plus rows 1-3. `crates/vault` is in `members` and `default-members`; `tests` is back in `members` only (like `crates/s3`, it is built with `-p`); `crates/migration` stays removed. The dev profile keeps v1.0.1's argon2 and blake2 blocks with the fork's comment; `[profile.test.package.argon2]` stays. |
-| `crates/common/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies plus `vault` (row 1); `test_mode = ["store/test_mode"]` (row 3); the dev-dependency `totp-rs` (used by `auth/vault.rs`'s tests). Row 2 (the pinned opentelemetry git rev) has no subject: v1.0.1 dropped opentelemetry, prometheus and chrono from `common` (OTLP is in the new `telemetry` crate), so nothing is pinned. The `[target.'cfg(stalwart_tests)'.dependencies]` table (dns-update `test_provider`) is left as supplied and is dead in fork builds; the tests manifest enables `test_provider` itself. |
+| `crates/common/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies plus `vault` (row 1); `test_mode = ["store/test_mode", "dns-update/test_provider"]` (row 3; the provider since Task 2's fix round 1: the restored `test_mode` code in `network/dns/update.rs` calls `DnsUpdater::new_pebble`, `new_in_memory` and `NamedDnsRecord`, which dns-update gates on it, as upstream's `stalwart_tests` dependency table does); the dev-dependency `totp-rs` (used by `auth/vault.rs`'s tests). Row 2 (the pinned opentelemetry git rev) has no subject: v1.0.1 dropped opentelemetry, prometheus and chrono from `common` (OTLP is in the new `telemetry` crate), so nothing is pinned. The `[target.'cfg(stalwart_tests)'.dependencies]` table is left as supplied and is dead in fork builds; `test_mode` now does its job. |
 | `crates/common/src/auth/access_token.rs` | content | Task 3 | open |
 | `crates/common/src/auth/authentication.rs` | content | Task 3 | open |
 | `crates/common/src/auth/mod.rs` | content | Task 3 | open |
@@ -3748,7 +3761,7 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/imap/src/op/idle.rs` | content | Task 5 | open |
 | `crates/imap/src/op/search.rs` | content | Task 5 (search: Task 6) | open |
 | `crates/imap/src/op/store.rs` | content | Task 5 | open |
-| `crates/jmap/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies (local `calcard`, `smtp-proto`, `sieve-rs`, `jmap-tools`; mail-parser 1.0 without `rkyv`) plus `vault` (row 1); `test_mode = []`, the fork's 0.16.27 declaration. |
+| `crates/jmap/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies (local `calcard`, `smtp-proto`, `sieve-rs`, `jmap-tools`; mail-parser 1.0 without `rkyv`) plus `vault` (row 1). `test_mode = ["utils/test_mode"]`: part 2a declared `[]`, the fork's 0.16.27 value, and part 2b made it enable `utils/test_mode` ("Manifests" above). |
 | `crates/jmap/src/api/request.rs` | content | Task 5 (calendar refusal: Task 4) | open |
 | `crates/jmap/src/api/session.rs` | content | Task 6 | open |
 | `crates/jmap/src/blob/copy.rs` | content | Task 5 | open |

@@ -24,11 +24,23 @@
 //!   them until R62's per-chunk guard and R63's confirmation read are
 //!   placed again, if they are kept.
 //! - `FORCE_COMMIT_SPLIT`: while it names an account, every
-//!   `BatchBuilder::commit_point()` of a batch whose current account is
-//!   that account adds a commit point, as if the batch were large, once the
-//!   chunk holds an operation. Fixture-sized batches then reach their later
-//!   commit chunks, so rules that apply per chunk can be tested. It stays
-//!   set until cleared; batches of other accounts are not affected.
+//!   `BatchBuilder::commit_point()` adds a commit point, as if the batch were
+//!   large, once the chunk holds an operation, in two kinds of batch: one
+//!   whose current account is that account, and one with no current
+//!   account. The second kind covers a search-index pass:
+//!   `AccountIndexer::build_batch` never sets an account, and calls
+//!   `commit_point()` after each `Document` key, so under the hook a pass
+//!   with two documents commits in at least two chunks. Fixture-sized
+//!   batches then reach their later commit chunks, so rules that apply per
+//!   chunk can be tested. It stays set until cleared; batches whose current
+//!   account is another account are not affected.
+//!
+//!   It governs `commit_point()` only. It does not govern
+//!   `bulk_commit_point()`, nor the `add_commit_point()` that `build_batch`
+//!   calls after every 1000 term merges (`search/term.rs`, by its own
+//!   count): an index pass splits between its term merges only when it holds
+//!   more than 1000 of them, as a document with more than 1000 distinct terms
+//!   does.
 
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
@@ -98,24 +110,32 @@ pub fn take_index_guard_fail(account_id: u32) -> bool {
     }
 }
 
-/// The account whose batches add a commit point at every `commit_point()`.
+/// The account whose batches, and every batch with no current account, add
+/// a commit point at every `commit_point()`.
 pub static FORCE_COMMIT_SPLIT: Mutex<Option<u32>> = Mutex::new(None);
 
 pub fn set_force_commit_split(account_id: Option<u32>) {
     *FORCE_COMMIT_SPLIT.lock().unwrap_or_else(|e| e.into_inner()) = account_id;
 }
 
-/// Whether `FORCE_COMMIT_SPLIT` names `account_id`, the current account of
-/// the batch at its commit point.
+/// Whether `commit_point()` splits a batch whose current account is
+/// `account_id`: `FORCE_COMMIT_SPLIT` is set, and it names that account or
+/// the batch has none.
 pub fn force_commit_split(account_id: Option<u32>) -> bool {
-    account_id.is_some()
-        && *FORCE_COMMIT_SPLIT.lock().unwrap_or_else(|e| e.into_inner()) == account_id
+    match *FORCE_COMMIT_SPLIT.lock().unwrap_or_else(|e| e.into_inner()) {
+        Some(forced) => account_id.is_none_or(|account_id| account_id == forced),
+        None => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::write::{BatchBuilder, ValueClass};
+    use crate::{
+        search::{EmailSearchField, IndexDocument, index::account_batch},
+        write::{BatchBuilder, SearchIndex, ValueClass},
+    };
+    use nlp::language::Language;
     use types::collection::Collection;
 
     fn batch_of(account_id: u32) -> BatchBuilder {
@@ -134,21 +154,48 @@ mod tests {
         batch
     }
 
+    /// A search-index pass of two documents, built as the internal search
+    /// store builds one: `account_batch` returns `AccountIndexer::build_batch`'s
+    /// batch, which has no current account.
+    fn index_pass_of(account_id: u32) -> BatchBuilder {
+        let documents = [1u32, 2]
+            .into_iter()
+            .map(|document_id| {
+                let mut document = IndexDocument::new(SearchIndex::Email)
+                    .with_account_id(account_id)
+                    .with_document_id(document_id);
+                document.index_text(
+                    EmailSearchField::Subject,
+                    "quarterly planning notes",
+                    Language::English,
+                );
+                (document_id, document)
+            })
+            .collect();
+        account_batch(SearchIndex::Email, account_id, documents, &[], &[], false).unwrap()
+    }
+
+    // One test, as the hook is a process-wide setting.
     #[test]
-    fn force_commit_split_splits_only_the_named_account() {
+    fn force_commit_split_splits_the_named_account_and_index_passes() {
         // Account ids no other test of this crate uses.
         const SPLIT: u32 = 0x5a5a_0001;
         const OTHER: u32 = 0x5a5a_0002;
 
         assert_eq!(batch_of(SPLIT).commit_point_count(), 0);
+        assert_eq!(index_pass_of(SPLIT).commit_point_count(), 0);
 
         set_force_commit_split(Some(SPLIT));
         let split = batch_of(SPLIT).commit_point_count();
         let other = batch_of(OTHER).commit_point_count();
+        let index_pass = index_pass_of(SPLIT).commit_point_count();
         set_force_commit_split(None);
 
         assert_eq!(split, 3);
         assert_eq!(other, 0);
+        // One commit point after each document's `Document` key.
+        assert_eq!(index_pass, 2);
         assert_eq!(batch_of(SPLIT).commit_point_count(), 0);
+        assert_eq!(index_pass_of(SPLIT).commit_point_count(), 0);
     }
 }
