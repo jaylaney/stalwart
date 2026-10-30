@@ -4023,6 +4023,99 @@ Credential checks outside `authenticate`: `jmap/src/registry/mapping/account.rs:
 3b), the SQL and LDAP directories' own `verify_secret_hash` (behind the directory refusals)
 and `http/src/auth/oauth/registration.rs:313` (OAuth client secrets, not account logins).
 
+### Part 3b: HTTP, protocol logins and session ownership
+
+Part 3b resolved the fourteen remaining Task 3 conflicts (cells in the conflict ledger,
+including the files shared with Tasks 5 and 6 under ruling 41) and ported the non-conflicted
+Task 3 sites: `http/src/api/vault.rs` (and the authentication surface of `contacts.rs`), the
+JMAP registry refusals and the SMTP and ManageSieve logins. In outline:
+
+- **The HTTP hit rule** (interface sheet 2; 3a's concern 1). 1.0's `HttpAuthEntries`
+  hashes the raw token, so an entry cannot be dropped when its keys are evicted or swept.
+  `za_cache_hit` (`http/src/auth/authenticate.rs`) is therefore the only C2 check on a hit:
+  the account is read with `account()` (fail closed: both entries removed and the error
+  returned); an ordinary account takes upstream's path; a key account's entry is served only
+  with resident keys under the token's keyed fingerprint whose account is the entry's and
+  whose generation is non-zero and equal to `AccountCache::za_generation()`. Anything else
+  removes both entries and verifies in full. The miss path keeps upstream's revocation epoch
+  on every insert and the 0.16 generation fence; keyless key-account results (Bearer,
+  impersonation, a pre-setup hash) are never cached.
+- **Ruling 10.** On a hit the marker is re-derived from the token itself
+  (`za_is_impersonation`). Since a key account's entry without keys is never served and an
+  impersonation never yields keys, the marker matters on a hit only for ordinary accounts,
+  where it restricts nothing; it is kept as the ruling frames it.
+- **Ruling 28.** The Basic decode error and the unsupported-mechanism error carry no
+  Authorization value.
+- **Key ownership.** HTTP keys ride `HttpAuthenticated.access_token` for one request and are
+  dropped after the scope check on EventSource and WebSocket. IMAP and POP3 logins call
+  `authenticate_with_keys` after upstream's bearer, scope and permission checks and refuse a
+  keyless key-account session with `za_mail_login`; IMAP's renewal carries the keys at its
+  call site (ruling 11). SMTP, ManageSieve and the OAuth login stay keyless.
+- **Vault endpoints at 1.0.** `za_verify_primary` destructures `(Authenticated, keys)`;
+  registry objects are boxed (`ObjectInner::Account(Box<Account>)`);
+  `RegistryWriteResult::ForeignKeyOutOfScope` is named in the trace; `hash_secret` takes the
+  password verifier; base64 is `encodify`'s. The default-calendar check reads 1.0's layout:
+  a calendar's dead properties are no longer in its archive, so an untouched default
+  calendar is one whose shared metadata container (`Server::metadata_container`) is absent.
+  `setup-token`'s 0.16 tenant scoping is dropped: at 1.0 `AccessToken::tenant_id` and
+  `UserAccount::member_tenant_id` exist only inside SEL snippets, so the scoping has no
+  subject in the product build (see the report's concerns).
+- **Tests.** `za::caches` gains `scoped_cache_hit_preserves_scope`,
+  `revoked_grant_cannot_repopulate_cache` (the loader parked at `za_test::set`, the existing
+  pause between verification and the cache insert), `expired_bearer_cache_entry_is_refused`,
+  `keyless_key_account_logins_are_not_cached` and `impersonated_websocket_refresh`. OAuth
+  tokens are minted in-process (`utils::za::za_grant_token`), since 1.0 binds every access
+  token to a grant and resolves only registered, stateless or metadata-document clients.
+
+#### Authentication entrypoints at 1.0.1, completed
+
+Lines are the worktree's after part 3b.
+
+| Entrypoint | 1.0 site | Fork hook | Keys |
+|---|---|---|---|
+| `Server::authenticate` | `common/src/auth/authentication.rs:60` | wraps `authenticate_with_keys` (3a) | dropped |
+| `authenticate_with_keys` | `:73` | upstream's body, then the detach (3a) | returned beside the token |
+| `authenticate_basic` (recovery admin, app password, directory, internal password, master user) | `:169` | 3a's hooks (marker diversion, app-password wrap, directory refusals, R35 marker) | from the vault or the wrap |
+| `authenticate_bearer`, `authenticate_oauth_token` | `:451`, `:589` | `za_refuse_directory_account` in the directory arm (3a) | never |
+| `renew_access_token`, `refresh_access_token` | `common/src/auth/oauth/grant.rs:195`, `:212` | R35 marker carried (3a, ruling 11) | never |
+| HTTP `authenticate_headers` (every `/jmap`, `/dav`, `/api`, `/.well-known`, registration and SCIM arm) | `http/src/auth/authenticate.rs:38` | hit rule `za_cache_hit` (`:106`), ruling 10 (`:146`), miss path `authenticate_uncached` (`:156`) with ruling 28 and the generation fence | one request |
+| EventSource, WebSocket upgrade | `http/src/request.rs:342`, `:359` | `without_session_keys()` after the scope check | dropped |
+| WebSocket renewal | `jmap/src/websocket/stream.rs:103`, `:109` | through the shared renewals (marker carried) | never |
+| Vault and contacts endpoints | `http/src/api/vault.rs:606` (`za_verify_primary`); `setup-token` at `:301` | fresh `authenticate_with_keys`; master and app passwords refused first | one request |
+| OAuth login (`authorize_code`, `approve_device`) | `http/src/auth/oauth/auth.rs:600` (`authenticate_login`) | R36 refusal at `:625` | none |
+| IMAP AUTHENTICATE and LOGIN | `imap/src/op/authenticate.rs:141` (LOGIN reaches it from `op/login.rs:16`) | `authenticate_with_keys`, `za_mail_login` at `:192` | the connection |
+| IMAP renewal | `imap/src/core/mod.rs:290` | keys carried at the call site (ruling 11) | the connection |
+| POP3 AUTH, USER/PASS | `pop3/src/op/authenticate.rs:119` (USER/PASS from `client.rs:137`) | `authenticate_with_keys`, `za_mail_login` at `:163` | the connection |
+| SMTP AUTH | `smtp/src/inbound/auth.rs:226` | keyless `authenticate`, unchanged | none |
+| ManageSieve AUTHENTICATE | `managesieve/src/op/authenticate.rs:98` | keyless `authenticate`; the mechanism error does not quote the token | none |
+| Registry self-service password change | `jmap/src/registry/mapping/account.rs:250` (`verify_mfa_secret_hash`) | the marker refusal at `:144` runs first, so a marker never reaches the verifier | none |
+| Registry credential edits | `jmap/src/registry/mapping/principal.rs:96`; app passwords and API keys `account.rs:368` | marker refusals, merged clean (re-read) | none |
+
+#### Deferred, by owner (part 3b)
+
+**Task 4**
+- `http/src/api/contacts.rs` is Task 4's "contacts redelivery integration" beyond its
+  authentication surface (which needs no change: it reads `ZaVerified`). Its groupware
+  imports follow Task 4's port, including ruling 25's `sequence` → `sequence_floor`.
+- `vault.rs` dispatches the `shares` routes to `super::shares` (Task 4's `shares.rs`).
+
+**Task 5**
+- `http/src/request.rs` row 6 (the upload gate) is kept as merged; Task 5 re-reads it against
+  1.0's `blob_upload`.
+- `jmap/src/api/request.rs` must keep `za_jmap_untraced` (used by the WebSocket stream).
+- `imap/src/core/za.rs` is declared (`mod za`); its body is Task 5's.
+- The mail test modules `gates.rs`, `uploads.rs` and `reads.rs` call `utils::za::bearer_token`,
+  0.16's OAuth HTTP flow; they move to `za_bearer_token(&test.server, name)` (and revoke the
+  grant with `za_revoke_grant` where the account outlives the module).
+
+**Task 6**
+- `services/src/task_manager/tasks/maintenance.rs:145`, `:148` (Task 2's handoff) sit inside
+  an SEL snippet and keep `stalwart_tests`; whether that needs anything is a ruling.
+
+**Task 7**
+- The tests crate's first compile covers the part 3b test edits; they were checked by
+  source only.
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
@@ -4106,19 +4199,19 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/groupware/src/calendar/sequence.rs` | add/add | Task 4 (ruling 25: the fork's file becomes `sequence_floor.rs`; upstream's is taken as supplied) | open |
 | `crates/groupware/src/calendar/storage.rs` | content | Task 4 | open |
 | `crates/groupware/src/scheduling/event_cancel.rs` | content | Task 4 | open |
-| `crates/http-proto/src/request.rs` | content | Task 3 | open |
+| `crates/http-proto/src/request.rs` | content | Task 3 | resolved (Task 3b): rows 1-3 on 1.0's `fetch_body`: `fetch_body` and `fetch_body_untraced` share `fetch_body_inner`, which keeps 1.0's declared-size allocation; `traced_header` redacts the credential headers. `cargo check -p http_proto --tests` passes. |
 | `crates/http/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies plus `vault` (row 1) and `subtle` (row 2); `test_mode = []`, the fork's 0.16.27 declaration (the `za_test` hooks of `auth/authenticate.rs`). |
-| `crates/http/src/api/mod.rs` | content | Task 3 (shares route: Task 4) | open |
-| `crates/http/src/auth/authenticate.rs` | content | Task 3 | open |
-| `crates/http/src/auth/oauth/auth.rs` | content | Task 3 | open |
-| `crates/http/src/auth/oauth/mod.rs` | content | Task 3 | open |
-| `crates/http/src/request.rs` | content | Task 3 (upload gate: Task 5) | open |
+| `crates/http/src/api/mod.rs` | content | Task 3 (shares route: Task 4) | resolved (Task 3b): 1.0's imports plus `vault::VaultApi`; rows 1, 3 and 5 merged as written. Row 4 (`with_untraced_body`) had been placed by the merge on the `auth/client` arm; it is moved back to the login POST arm, whose response it covers, and the client-info arm is upstream's again. The shares routes live in `vault.rs`'s dispatcher (Task 4's `shares.rs`). |
+| `crates/http/src/auth/authenticate.rs` | content | Task 3 | resolved (Task 3b): v1.0.1's `HttpAuthenticated`, `HttpAuthEntries` and `GrantRevocations` as supplied. Hit: upstream's live and revision checks, then ruling 10's marker (`za_is_impersonation`: `decode_plain_auth(token)` and `UsernameParts::is_master`, whatever the mechanism), then the hit rule (`za_cache_hit`): `account()` fails closed (both entries removed, error returned); an ordinary account takes upstream's path; a key account is served only with `za_keys.get(fingerprint)` keys of the same account, generation non-zero and equal to `AccountCache::za_generation()`; otherwise both entries are removed and the request is verified in full. Miss (`authenticate_uncached`): ruling 28 (no `.id`/`.details` with the header value), `authenticate_with_keys`, the `za_test` pause, then upstream's `revocations.insert(.., epoch)` for an ordinary account (with the 0.16 double-check after publish) or for a key account whose keys pass the generation fence (plus `za_insert_keys`); keyless key-account results and foreign keys are never cached. `za_test` and its unit module kept. Type-checked in the part 3b harness (report). |
+| `crates/http/src/auth/oauth/auth.rs` | content | Task 3 | resolved (Task 3b): v1.0.1's `handle_login_request` (both blocks taken as supplied); rows 1-2 as one R36 refusal in `authenticate_login`, the one site `authorize_code` and `approve_device` share: an impersonated login of a key account answers `LoginResponse::Failure` through the callers' `Err(response)` path. |
+| `crates/http/src/auth/oauth/mod.rs` | content | Task 3 | resolved (Task 3b): 1.0's imports (`RequestOrigin`, `HttpSessionData`, `HOST`) with `fetch_body_untraced` in place of `fetch_body`; `FormData::from_request` stays untraced (issue #20). |
+| `crates/http/src/request.rs` | content | Task 3 (upload gate: Task 5) | resolved (Task 3b): rows 4-12 on 1.0. The JMAP POST arm reads the body untraced for a key account (`za_jmap_untraced`, fail closed) and keeps 1.0's `allowed_capabilities` and memory reservation, with one parse and one dispatch for both cases; the parser's `NotRequest` is reduced to a fixed reason only when untraced. R30's 403 wraps 1.0's `blob_contents`. Row 6 (upload gate, Task 5) merged clean and is kept unchanged; Task 5 re-reads it against 1.0's `blob_upload`. Row 7: `without_session_keys()` after the scope assertion on EventSource and WebSocket (1.0's `epoch` passed through). The response-body trace keeps the redaction and adds 1.0's `Prefixed` body. The 0.16 inline test module is dropped; Task 2's restored module is declared after the private slot (Task 2 handoff). |
 | `crates/imap/src/core/mailbox.rs` | content | Task 5 | open |
 | `crates/imap/src/core/message.rs` | modify/delete | Task 5 | open |
-| `crates/imap/src/core/mod.rs` | content | Task 3 (session keys) / Task 5 | open |
-| `crates/imap/src/core/session.rs` | content | Task 5 / Task 3 (issue #20 hunks) | open |
+| `crates/imap/src/core/mod.rs` | content | Task 3 (session keys) / Task 5 | resolved (Task 3b, ruling 41): `pub mod view` and its re-exports beside `mod za` (row 1, Task 5's module, declared); row 2 (`za_key_session`) merged; row 3: `refresh_access_token` carries the session's keys at the call site (ruling 11); its 0.16 R35 re-application is dropped, as `renew_access_token` carries the marker (3a). |
+| `crates/imap/src/core/session.rs` | content | Task 5 / Task 3 (issue #20 hunks) | resolved (Task 3b, ruling 41): both `write_error`s use 1.0's `error_response` for the bytes and trace `traced_error(err)`; rows 2-5 (pre-auth and key-session masking of writes and BAD errors) all ported; nothing deferred. |
 | `crates/imap/src/op/acl.rs` | content | Task 5 | open |
-| `crates/imap/src/op/authenticate.rs` | content | Task 3 | open |
+| `crates/imap/src/op/authenticate.rs` | content | Task 3 | resolved (Task 3b): 1.0's SASL and bearer-challenge code as supplied; `authenticate` calls `authenticate_with_keys` and keeps upstream's scope check, permission check and failure accounting, then `za_mail_login` refuses a keyless key-account session (`NO [NOPERM]`) before the session is built; the keys ride the session's token for the connection. |
 | `crates/imap/src/op/copy_move.rs` | content | Task 5 | open |
 | `crates/imap/src/op/expunge.rs` | content | Task 5 | open |
 | `crates/imap/src/op/fetch.rs` | modify/delete | Task 5 | open |
@@ -4145,17 +4238,17 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/jmap/src/principal/get.rs` | content | Task 6 | open |
 | `crates/jmap/src/registry/mapping/spam_sample.rs` | content | Task 5 | open |
 | `crates/jmap/src/submission/set.rs` | content | Task 5 | open |
-| `crates/jmap/src/websocket/stream.rs` | content | Task 3 | open |
+| `crates/jmap/src/websocket/stream.rs` | content | Task 3 | resolved (Task 3b): 1.0's imports plus `za_jmap_untraced` (defined in Task 5's `jmap/src/api/request.rs`, which must keep it); row 2 merged. The loop's renewals go through `renew_access_token`/`refresh_access_token`, which carry the marker and never keys (ruling 11). |
 | `crates/main/Cargo.toml` | content | Task 2 (identity: Task 9) | resolved (Task 2a): v1.0.1's file with the fork's `version = "0.1.1-beta.1"` (row 1); the rest of the identity is Task 9's. |
-| `crates/managesieve/src/op/authenticate.rs` | content | Task 3 | open |
-| `crates/pop3/src/op/authenticate.rs` | content | Task 3 | open |
+| `crates/managesieve/src/op/authenticate.rs` | content | Task 3 | resolved (Task 3b): row 1 (the mechanism error does not quote the token) with 1.0's `Vec<CompactString>` params; the login stays keyless `authenticate`. |
+| `crates/pop3/src/op/authenticate.rs` | content | Task 3 | resolved (Task 3b): rows 2-3 at 1.0's `authenticate` (`handle_auth` is gone): `authenticate_with_keys`, upstream's scope and permission checks, then `za_mail_login`; the keys live in `State::Authenticated.access_token` until the connection drops. |
 | `crates/pop3/src/op/fetch.rs` | content | Task 5 | open |
 | `crates/services/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's `enterprise` list plus `test_mode = ["common/test_mode"]` (row 1). |
 | `crates/services/src/task_manager/index.rs` | modify/delete | Task 6 | open |
 | `crates/services/src/task_manager/manager.rs` | content | Task 6 | open |
-| `crates/services/src/task_manager/tasks/maintenance.rs` | content | Task 6 (lease: Task 3/Task 4); renamed from `task_manager/maintenance.rs`, whose file group it is | open |
+| `crates/services/src/task_manager/tasks/maintenance.rs` | content | Task 6 (lease: Task 3/Task 4); renamed from `task_manager/maintenance.rs`, whose file group it is | resolved (Task 3b, ruling 41): `sweep_expired_uid_leases(server.store())` after `purge_store` in `PurgeData` (1.0 has no in-memory purge). Task 2's handoff: `:187`, `:190` and `:369` regated to `feature = "test_mode"`. Deferred to Task 6 (for a ruling): `:145` and `:148` sit inside an SEL snippet (the tenant maintenance block), so they keep `stalwart_tests`; in enterprise test builds tenant maintenance keeps its jitter. |
 | `crates/smtp/src/inbound/milter/client.rs` | content | Task 5 | open |
-| `crates/smtp/src/inbound/session.rs` | content | Task 3 (issue #20, R41) / Task 5 | open |
+| `crates/smtp/src/inbound/session.rs` | content | Task 3 (issue #20, R41) / Task 5 | resolved (Task 3b, ruling 41): rows 1-4 kept; the raw-input trace keeps the mask and builds 1.0's `CompactString` otherwise. 1.0's `State::Bdat { .. }` is a struct variant now, and the in-tree smtp-proto's `RequestReceiver::buf()` returns `&mut Vec<u8>` with 0.2.5's clearing rule (re-read). Task 2's handoff: the `badtls` HELO regated to `any(test, feature = "test_mode")`. The fork unit module is kept. Nothing deferred. |
 | `crates/smtp/src/scripts/event_loop.rs` | content | Task 5 | open |
 | `crates/spam-filter/src/analysis/llm.rs` | modify/delete | Task 5 (disposition, SEL-only) | open |
 | `crates/spam-filter/src/analysis/rules.rs` | content | Task 5 | open |
@@ -4215,6 +4308,9 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `auth::access_token::sharing_access_tests::shared_access_never_uses_membership_or_impersonate` (fork) | Builds `member_of` as a boxed slice and `AccessTo` with `is_writable: false`. Assertions unchanged. | `AccessTokenInner.member_of: Box<[u32]>`; `AccessTo.is_writable` (`auth/mod.rs:256-260`). |
 | `auth::vault::tests::unknown_layout_and_corruption_are_rejected_without_payload` (fork) | Serializes its archive with `Archiver::with_compression(.., Compression::None)`, as the vault now writes. Assertions unchanged. | 1.0's `Archiver::new` needs `ArchiveCompression`, which the vault crate does not implement (it does not depend on `store`). |
 | `backend::oidc::lookup::tests::extract_string_list_distinguishes_absent_from_empty` (directory, restored) | Ruling 44 (apparent upstream bug): the array, string, empty, `null` and number cases are unchanged (absent versus present still holds); the object case now asserts 1.0's result, `{"groups": []}` giving `Some(["groups"])`, where 0.16 asserted `None`. | `extract_string_list` (`directory/src/backend/oidc/lookup.rs:508-519`) maps a JSON object to its keys; 0.16 returned `None`. Its caller, `build_account` (`:362-380`), turns the claim into group memberships; the fork accepts the behaviour as inherited. |
+| `za::caches` (`live_caches`, fork) | After the idle sweep the HTTP entry is asserted present (0.16 asserted it gone with its keys), and the next request is asserted to re-verify; a full verification is detected by new resident keys (a new `Arc`), where 0.16 compared the entry's expiry `Instant`. The case "a stale generation in the authentication entry" becomes "keys evicted while the entry stays", "stale-generation keys" and "another account's keys", each re-verified. Entries are counted and inspected through `HttpAuthEntries::retain`. | `common/src/cache/http_auth.rs`: entries are keyed by a SipHash of the raw token (no removal by fingerprint, no iterator); `HttpAuthCache` has no generation (40-byte assertion, ruling 12), so the hit rule reads the account's; `TtlClock` expiry has one-second resolution (`utils/src/cache.rs:369-391`). |
+| `za::caches` (`assert_holds_no_credential`, fork) | No longer checks the HTTP cache's keys against the fingerprints of known tokens; it checks each entry's `Debug` and the key cache's fingerprints of the known tokens. | 1.0's HTTP cache keys are an internal keyed hash, not exposed and not caller-chosen (interface sheet 2: non-reversible, C3). |
+| `za::mail::login` (`keyless_mechanisms_are_refused`, `refusals_are_not_auth_failures`, fork) | The Bearer tokens are minted in-process (`utils::za::za_bearer_token`, `za_grant_token`), where 0.16 ran the `/api/auth` and `/auth/token` flow; the ordinary account's grant is revoked at the end. Assertions unchanged. | 1.0 binds every access token to a grant (`authenticate_oauth_token`, `common/src/auth/authentication.rs:603-607`) and resolves only registered, stateless or metadata-document clients (`common/src/auth/oauth/client.rs:80-130`); its login request takes an authorization `query` (`http/src/auth/oauth/auth.rs:126-159`). |
 
 ## Task 1 check
 
