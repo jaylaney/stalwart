@@ -84,7 +84,7 @@ impl MtaReportSend for Server {
 
         // Schedule delivery at a random time between now and the next 3 hours
         if !deliver_now {
-            #[cfg(not(stalwart_tests))]
+            #[cfg(not(feature = "test_mode"))]
             {
                 use common::config::smtp::queue::QueueExpiry;
                 use rand::RngExt;

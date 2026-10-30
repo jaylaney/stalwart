@@ -154,7 +154,7 @@ impl Security {
             );
         }
 
-        #[cfg(not(stalwart_tests))]
+        #[cfg(not(feature = "test_mode"))]
         {
             // Add loopback addresses
             allowed_ip_addresses.insert(IpWithTtl::new(

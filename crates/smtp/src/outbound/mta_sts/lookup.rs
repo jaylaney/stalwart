@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(stalwart_tests)]
+#[cfg(feature = "test_mode")]
 pub static STS_TEST_POLICY: parking_lot::Mutex<Vec<u8>> = parking_lot::Mutex::new(Vec::new());
 
 use common::{
@@ -25,16 +25,16 @@ use utils::outbound::OutboundError;
 
 use super::{Error, parse::ParsePolicy};
 
-#[cfg(not(stalwart_tests))]
+#[cfg(not(feature = "test_mode"))]
 use reqwest::Method;
-#[cfg(not(stalwart_tests))]
+#[cfg(not(feature = "test_mode"))]
 use utils::HttpLimitResponse;
 
 const FETCH_RETRY_INTERVAL: Duration = Duration::from_secs(300);
 const FETCH_IN_PROGRESS: &str = "Policy fetch in progress.";
 const MAX_REASON_LEN: usize = 256;
 
-#[cfg(not(stalwart_tests))]
+#[cfg(not(feature = "test_mode"))]
 const MAX_POLICY_SIZE: usize = 1024 * 1024;
 
 pub trait MtaStsLookup: Sync + Send {
@@ -120,7 +120,7 @@ impl MtaStsLookup for Server {
 
         // Fetch policy
         let result: Result<Policy, Error> = async {
-            #[cfg(not(stalwart_tests))]
+            #[cfg(not(feature = "test_mode"))]
             let bytes = self
                 .core
                 .smtp
@@ -135,7 +135,7 @@ impl MtaStsLookup for Server {
                 .bytes_with_limit(MAX_POLICY_SIZE)
                 .await?
                 .ok_or_else(|| Error::InvalidPolicy("Policy too large".to_string()))?;
-            #[cfg(stalwart_tests)]
+            #[cfg(feature = "test_mode")]
             let bytes = STS_TEST_POLICY.lock().clone();
 
             Ok(Policy::parse(

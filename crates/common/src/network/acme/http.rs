@@ -25,10 +25,10 @@ const MAX_REDIRECTS: usize = 10;
 
 #[cfg_attr(not(feature = "enterprise"), allow(unused_variables))]
 pub(crate) fn acme_client(provider: &AcmeProvider) -> OutboundClient {
-    #[cfg(any(feature = "dev_mode", stalwart_tests))]
+    #[cfg(any(feature = "dev_mode", feature = "test_mode"))]
     let allow_invalid_certs = provider.directory.starts_with("https://localhost")
         || provider.directory.starts_with("https://127.0.0.1");
-    #[cfg(not(any(feature = "dev_mode", stalwart_tests)))]
+    #[cfg(not(any(feature = "dev_mode", feature = "test_mode")))]
     let allow_invalid_certs = false;
 
     // SPDX-SnippetBegin
@@ -178,4 +178,8 @@ fn retry_after(value: &str, now: Timestamp) -> Option<Duration> {
 #[cfg(all(test, stalwart_tests))]
 #[rustfmt::skip]
 #[path = "../../../../../../stalwart-tests/unit/common/src/network/acme/http/tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "http_restored_tests.rs"]
 mod tests;

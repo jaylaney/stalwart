@@ -50,7 +50,7 @@ compact_str = "0.10.0"
 memchr = "2.8"
 
 [features]
-test_mode = []
+test_mode = ["utils/test_mode"]
 dev_mode = []
 enterprise = ["store/enterprise", "http_proto/enterprise", "jmap_proto/enterprise", "smtp/enterprise", "utils/enterprise", "common/enterprise", "services/enterprise", "directory/enterprise", "trc/enterprise", "spam-filter/enterprise", "email/enterprise", "groupware/enterprise", "registry/enterprise"]
 

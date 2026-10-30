@@ -181,7 +181,7 @@ async fn dkim_management(
     let mut temporary_errors = String::new();
 
     for algorithm in create_signatures {
-        #[cfg(stalwart_tests)]
+        #[cfg(feature = "test_mode")]
         let secret = {
             if dkim.selector_template.contains("dummy") {
                 match algorithm {
@@ -202,7 +202,7 @@ async fn dkim_management(
         };
 
         // Generate new key and selector
-        #[cfg(not(stalwart_tests))]
+        #[cfg(not(feature = "test_mode"))]
         let secret = match generate_dkim_private_key(algorithm).await? {
             Ok(secret) => secret,
             Err(err) => {
@@ -711,4 +711,8 @@ async fn update_signature(
 #[cfg(stalwart_tests)]
 #[rustfmt::skip]
 #[path = "../../../../../../stalwart-tests/unit/services/src/task_manager/tasks/dkim/test_support.rs"]
+mod test_support;
+
+#[cfg(feature = "test_mode")]
+#[path = "dkim_test_support.rs"]
 mod test_support;

@@ -292,3 +292,7 @@ fn read_u32(bytes: &mut std::slice::Iter<u8>) -> Option<u32> {
 #[rustfmt::skip]
 #[path = "../../../../../../stalwart-tests/unit/smtp/src/inbound/milter/protocol/test_support.rs"]
 mod test_support;
+
+#[cfg(feature = "test_mode")]
+#[path = "protocol_test_support.rs"]
+mod test_support;

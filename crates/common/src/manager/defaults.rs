@@ -54,7 +54,7 @@ async fn insert_safe_defaults(bp: &mut Bootstrap) -> trc::Result<()> {
     let is_recovery_mode = bp.registry.is_recovery_mode();
     let is_bootstrap_mode = bp.registry.is_bootstrap_mode();
 
-    #[cfg(not(stalwart_tests))]
+    #[cfg(not(feature = "test_mode"))]
     if bp.registry.count_object(ObjectType::Application).await? == 0 {
         bp.registry
             .write(RegistryWrite::insert(
@@ -76,7 +76,7 @@ async fn insert_safe_defaults(bp: &mut Bootstrap) -> trc::Result<()> {
     }
 
     if is_bootstrap_mode {
-        #[cfg(not(any(feature = "dev_mode", stalwart_tests)))]
+        #[cfg(not(any(feature = "dev_mode", feature = "test_mode")))]
         if bp.registry.count_object(ObjectType::SystemSettings).await? == 0 {
             bp.registry
                 .write(RegistryWrite::insert(
@@ -474,7 +474,7 @@ async fn insert_safe_defaults(bp: &mut Bootstrap) -> trc::Result<()> {
         }
     }
 
-    #[cfg(not(any(feature = "dev_mode", stalwart_tests)))]
+    #[cfg(not(any(feature = "dev_mode", feature = "test_mode")))]
     if bp.registry.count_object(ObjectType::Asn).await? == 0 {
         bp.registry
             .write(RegistryWrite::insert(
@@ -527,7 +527,7 @@ async fn insert_safe_defaults(bp: &mut Bootstrap) -> trc::Result<()> {
             .await?;
     }
 
-    #[cfg(not(stalwart_tests))]
+    #[cfg(not(feature = "test_mode"))]
     {
         use store::write::BatchBuilder;
         use types::id::Id;

@@ -243,7 +243,7 @@ impl Display for OutboundError {
 impl std::error::Error for OutboundError {}
 
 fn is_public_domain(domain: &str) -> bool {
-    #[cfg(all(stalwart_tests, not(test)))]
+    #[cfg(all(feature = "test_mode", not(test)))]
     if domain.eq_ignore_ascii_case("localhost") {
         return true;
     }
@@ -266,7 +266,7 @@ fn is_special_use_suffix(suffix: &[u8]) -> bool {
 }
 
 fn is_permitted_ip(ip: IpAddr) -> bool {
-    #[cfg(all(stalwart_tests, not(test)))]
+    #[cfg(all(feature = "test_mode", not(test)))]
     if ip.is_loopback() {
         return true;
     }
@@ -380,4 +380,8 @@ fn is_global_ipv6(ip: &Ipv6Addr) -> bool {
 #[cfg(all(test, stalwart_tests))]
 #[rustfmt::skip]
 #[path = "../../../../stalwart-tests/unit/utils/src/outbound/tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "outbound_restored_tests.rs"]
 mod tests;

@@ -117,7 +117,7 @@ impl SpamFilterInput<'_> {
             return Ok(None);
         };
 
-        #[cfg(stalwart_tests)]
+        #[cfg(feature = "test_mode")]
         {
             if request.contains("b5b476f0b5ba6e1c038361d3ded5818dd39c90a2") {
                 return Ok(PyzorResponse {
@@ -468,4 +468,8 @@ pub fn html_to_text(input: &str) -> String {
 #[cfg(all(test, stalwart_tests))]
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/spam-filter/src/modules/pyzor/test.rs"]
+mod test;
+
+#[cfg(test)]
+#[path = "pyzor_restored_tests.rs"]
 mod test;

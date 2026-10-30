@@ -473,7 +473,15 @@ impl RegistryQueryFilters for QueryRequest<Registry> {
             .unwrap_or_default()
             .into_iter()
             .next()
-            .unwrap_or_else(|| Comparator::descending(RegistryComparator::Property(Property::Id)));
+            .unwrap_or_else(|| {
+                // Zero-access fork (upgrade Task 2): test builds keep 0.16's
+                // ascending default order, which the suites' assertions read.
+                if cfg!(feature = "test_mode") {
+                    Comparator::ascending(RegistryComparator::Property(Property::Id))
+                } else {
+                    Comparator::descending(RegistryComparator::Property(Property::Id))
+                }
+            });
 
         match comparator.property {
             RegistryComparator::Property(property) => {

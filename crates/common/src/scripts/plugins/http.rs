@@ -21,7 +21,7 @@ pub async fn exec_header(ctx: PluginContext<'_>) -> trc::Result<Variable<'static
     let agent = ctx.arguments[2].to_string();
     let timeout = ctx.arguments[3].to_string().parse::<u64>().unwrap_or(5000);
 
-    #[cfg(stalwart_tests)]
+    #[cfg(feature = "test_mode")]
     if url.contains("redirect.") {
         return Ok(Variable::from(url.split_once("/?").unwrap().1.to_string()));
     }

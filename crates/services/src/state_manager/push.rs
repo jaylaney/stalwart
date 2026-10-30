@@ -254,7 +254,7 @@ pub fn spawn_push_manager(inner: Arc<Inner>) -> mpsc::Sender<Event> {
                         if let Some(subscription) = newest_unverified {
                             let current_time = Instant::now();
 
-                            #[cfg(stalwart_tests)]
+                            #[cfg(feature = "test_mode")]
                             if subscription.url.contains("skip_checks") {
                                 last_verify.remove(&account_id);
                             }

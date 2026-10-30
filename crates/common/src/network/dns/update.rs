@@ -32,7 +32,7 @@ pub struct DnsUpdater {
     core: Arc<Core>,
 }
 
-#[cfg(stalwart_tests)]
+#[cfg(feature = "test_mode")]
 pub static DNS_RECORDS: std::sync::LazyLock<
     Arc<std::sync::Mutex<Vec<dns_update::NamedDnsRecord>>>,
 > = std::sync::LazyLock::new(|| Arc::new(std::sync::Mutex::new(Vec::new())));
@@ -78,7 +78,7 @@ impl DnsUpdater {
             }),
             DnsServer::Cloudflare(server) => {
                 let updater = {
-                    #[cfg(stalwart_tests)]
+                    #[cfg(feature = "test_mode")]
                     match server.secret.secret().await.unwrap().as_ref() {
                         "test@pebble.org" => dns_update::DnsUpdater::new_pebble(
                             "http://localhost:8055",
@@ -94,7 +94,7 @@ impl DnsUpdater {
                         .map_err(|err| format!("Failed to build DNS updater: {}", err))?,
                     }
 
-                    #[cfg(not(stalwart_tests))]
+                    #[cfg(not(feature = "test_mode"))]
                     dns_update::DnsUpdater::new_cloudflare(
                         server.secret.secret().await?,
                         server.timeout.into_inner().into(),
@@ -1276,7 +1276,7 @@ impl DnsUpdater {
     }
 
     pub async fn check_txt_propagation(&self, name: &str, origin: &str, expected: &str) -> bool {
-        #[cfg(stalwart_tests)]
+        #[cfg(feature = "test_mode")]
         if matches!(
             self.updater,
             dns_update::DnsUpdater::Pebble(_) | dns_update::DnsUpdater::InMemory(_)
@@ -1328,7 +1328,7 @@ impl DnsUpdater {
     }
 
     pub async fn wait_for_txt_propagation(&self, name: &str, origin: &str, expected: &str) -> bool {
-        #[cfg(stalwart_tests)]
+        #[cfg(feature = "test_mode")]
         if matches!(
             self.updater,
             dns_update::DnsUpdater::Pebble(_) | dns_update::DnsUpdater::InMemory(_)

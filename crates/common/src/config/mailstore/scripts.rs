@@ -225,7 +225,7 @@ impl Scripting {
             trusted_compiler,
             untrusted_scripts,
             trusted_scripts,
-            http_client: utils::http::http_client_builder(cfg!(stalwart_tests))
+            http_client: utils::http::http_client_builder(cfg!(feature = "test_mode"))
                 .pool_max_idle_per_host(0)
                 .redirect(reqwest::redirect::Policy::none())
                 .build()

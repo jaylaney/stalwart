@@ -69,7 +69,7 @@ pub async fn exec(ctx: PluginContext<'_>) -> trc::Result<Variable<'static>> {
             Err(err) => err.short_error().into(),
         }
     } else if record_type.eq_ignore_ascii_case("txt") {
-        #[cfg(stalwart_tests)]
+        #[cfg(feature = "test_mode")]
         {
             if entry.contains("origin") {
                 return Ok(Variable::from("23028|US|arin|2002-01-04".to_string()));
@@ -111,7 +111,7 @@ pub async fn exec(ctx: PluginContext<'_>) -> trc::Result<Variable<'static>> {
             Variable::default()
         }
     } else if record_type.eq_ignore_ascii_case("ipv4") {
-        #[cfg(stalwart_tests)]
+        #[cfg(feature = "test_mode")]
         {
             if entry.contains(".168.192.") {
                 let parts = entry.split('.').collect::<Vec<_>>();
@@ -170,7 +170,7 @@ pub async fn exec_exists(ctx: PluginContext<'_>) -> trc::Result<Variable<'static
     } else if record_type.eq_ignore_ascii_case("ptr") {
         ctx.server.dns_exists_ptr(entry.as_ref()).await
     } else if record_type.eq_ignore_ascii_case("ipv4") {
-        #[cfg(stalwart_tests)]
+        #[cfg(feature = "test_mode")]
         {
             if entry.starts_with("2.0.168.192.") {
                 return Ok(1.into());

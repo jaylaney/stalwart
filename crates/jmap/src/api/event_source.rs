@@ -81,9 +81,9 @@ impl EventSourceHandler for Server {
         }
 
         let mut ping = if ping > 0 {
-            #[cfg(not(stalwart_tests))]
+            #[cfg(not(feature = "test_mode"))]
             let interval = std::cmp::max(ping, 30);
-            #[cfg(stalwart_tests)]
+            #[cfg(feature = "test_mode")]
             let interval = ping;
             let interval_duration = Duration::from_secs(interval as u64);
 

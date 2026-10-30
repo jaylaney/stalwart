@@ -76,7 +76,7 @@ impl TlsaLookup for Server {
             return Ok(value);
         }
 
-        #[cfg(any(test, stalwart_tests))]
+        #[cfg(any(test, feature = "test_mode"))]
         if true {
             return mail_auth::dns::mock_resolve(key.as_ref());
         }
@@ -163,7 +163,7 @@ impl TlsaLookup for Server {
             });
         }
 
-        #[cfg(any(test, stalwart_tests))]
+        #[cfg(any(test, feature = "test_mode"))]
         if true {
             if key.as_ref().contains("_dnssec_bogus.") {
                 return Ok(TlsaResult::Bogus);
@@ -285,7 +285,7 @@ impl TlsaLookup for Server {
             return Ok(value);
         }
 
-        #[cfg(any(test, stalwart_tests))]
+        #[cfg(any(test, feature = "test_mode"))]
         if true {
             return mail_auth::dns::mock_resolve(key.as_ref());
         }
@@ -362,7 +362,7 @@ impl TlsaLookup for Server {
             return Ok(value);
         }
 
-        #[cfg(any(test, stalwart_tests))]
+        #[cfg(any(test, feature = "test_mode"))]
         if true {
             return mail_auth::dns::mock_resolve(key.as_ref());
         }
@@ -538,4 +538,8 @@ pub(crate) fn least_secure(a: DnssecStatus, b: DnssecStatus) -> DnssecStatus {
 #[cfg(all(test, stalwart_tests))]
 #[rustfmt::skip]
 #[path = "../../../../../../stalwart-tests/unit/smtp/src/outbound/dane/dnssec/tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "dnssec_restored_tests.rs"]
 mod tests;

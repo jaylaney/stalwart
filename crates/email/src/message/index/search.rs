@@ -138,7 +138,7 @@ impl ArchivedMessageMetadata {
             }
         }
 
-        #[cfg(not(stalwart_tests))]
+        #[cfg(not(feature = "test_mode"))]
         builder.document.set_unknown_language(
             builder
                 .detector
@@ -146,7 +146,7 @@ impl ArchivedMessageMetadata {
                 .unwrap_or(default_language),
         );
 
-        #[cfg(stalwart_tests)]
+        #[cfg(feature = "test_mode")]
         builder.document.set_unknown_language(default_language);
         builder.document
     }
@@ -199,12 +199,12 @@ impl DocumentBuilder<'_> {
     }
 
     fn indexes_headers(&self) -> bool {
-        #[cfg(not(stalwart_tests))]
+        #[cfg(not(feature = "test_mode"))]
         let index_headers = self
             .index_fields
             .contains(&SearchField::Email(EmailSearchField::Headers));
 
-        #[cfg(stalwart_tests)]
+        #[cfg(feature = "test_mode")]
         let index_headers = true;
 
         index_headers

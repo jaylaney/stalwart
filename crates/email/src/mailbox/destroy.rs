@@ -60,7 +60,7 @@ impl MailboxDestroy for Server {
         containers: Option<&ContainerCleanup>,
     ) -> trc::Result<Result<Option<u64>, MailboxDestroyError>> {
         // Internal folders cannot be deleted
-        #[cfg(not(stalwart_tests))]
+        #[cfg(not(feature = "test_mode"))]
         if [INBOX_ID, TRASH_ID, JUNK_ID].contains(&document_id) {
             return Ok(Err(MailboxDestroyError::CannotDestroy));
         }

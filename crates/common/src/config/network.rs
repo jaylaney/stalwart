@@ -418,7 +418,7 @@ impl Network {
 }
 
 impl Http {
-    #[cfg_attr(any(feature = "dev_mode", stalwart_tests), allow(unused_variables))]
+    #[cfg_attr(any(feature = "dev_mode", feature = "test_mode"), allow(unused_variables))]
     pub async fn parse(bp: &mut Bootstrap, server_name: &str) -> Self {
         let http = bp.setting_infallible::<structs::Http>().await;
 
@@ -479,7 +479,7 @@ impl Http {
             ));
         }
 
-        #[cfg(any(feature = "dev_mode", stalwart_tests))]
+        #[cfg(any(feature = "dev_mode", feature = "test_mode"))]
         let server_name = "127.0.0.1";
 
         Http {

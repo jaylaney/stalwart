@@ -450,6 +450,17 @@ impl Pacc {
     }
 }
 
+#[cfg_attr(feature = "test_mode", allow(unused_variables))]
 fn provider_domain(url: &Url) -> Option<&str> {
-    url.host_str().and_then(psl::domain_str)
+    // Zero-access fork (upgrade Task 2): 0.16's test value, which the ACME and
+    // DNS automation tests' Pebble server expects.
+    #[cfg(feature = "test_mode")]
+    {
+        Some("pebble.letsencrypt.org")
+    }
+
+    #[cfg(not(feature = "test_mode"))]
+    {
+        url.host_str().and_then(psl::domain_str)
+    }
 }

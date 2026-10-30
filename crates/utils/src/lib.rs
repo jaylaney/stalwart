@@ -98,10 +98,10 @@ impl<T, E: std::fmt::Display> UnwrapFailure<T> for Result<T, E> {
                     Reason = err.to_compact_string()
                 );
 
-                #[cfg(stalwart_tests)]
+                #[cfg(feature = "test_mode")]
                 panic!("{message}: {err}");
 
-                #[cfg(not(stalwart_tests))]
+                #[cfg(not(feature = "test_mode"))]
                 {
                     eprintln!("{message}: {err}");
                     exit_failed();
@@ -460,4 +460,8 @@ pub fn is_valid_domain(domain: &str) -> bool {
 #[cfg(all(test, stalwart_tests))]
 #[rustfmt::skip]
 #[path = "../../../../stalwart-tests/unit/utils/src/tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "restored_tests.rs"]
 mod tests;

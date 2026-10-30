@@ -311,9 +311,9 @@ impl Resolvers {
         let negative_ttl = bp.setting_infallible::<Cache>().await.negative_ttl;
 
         Resolvers {
-            #[cfg(not(stalwart_tests))]
+            #[cfg(not(feature = "test_mode"))]
             dnssec_available: ensure_dnssec(&resolver_config, &dnssec.resolver).await,
-            #[cfg(stalwart_tests)]
+            #[cfg(feature = "test_mode")]
             dnssec_available: true,
             dns: MessageAuthenticator::new(resolver_config, opts)
                 .unwrap()
@@ -323,7 +323,7 @@ impl Resolvers {
     }
 }
 
-#[cfg(not(stalwart_tests))]
+#[cfg(not(feature = "test_mode"))]
 async fn ensure_dnssec(config: &ResolverConfig, resolver: &TokioResolver) -> bool {
     config.name_servers().iter().any(|name_server| {
         name_server

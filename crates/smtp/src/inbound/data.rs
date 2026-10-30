@@ -818,14 +818,14 @@ impl<T: SessionStream> Session<T> {
         let source = if !self.is_authenticated() {
             let dmarc_pass = dmarc_result.is_some_and(|result| result == DmarcResult::Pass);
 
-            #[cfg(stalwart_tests)]
+            #[cfg(feature = "test_mode")]
             {
                 MessageSource::Unauthenticated {
                     dmarc_pass: dmarc_pass || mail_from.address.starts_with("dmarc-"),
                 }
             }
 
-            #[cfg(not(stalwart_tests))]
+            #[cfg(not(feature = "test_mode"))]
             {
                 MessageSource::Unauthenticated { dmarc_pass }
             }

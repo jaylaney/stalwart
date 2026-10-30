@@ -25,7 +25,7 @@ use utils::DomainPart;
 
 impl<T: SessionStream> Session<T> {
     pub async fn handle_rcpt_to(&mut self, to: RcptTo<Cow<'_, str>>) -> Result<(), ()> {
-        #[cfg(stalwart_tests)]
+        #[cfg(feature = "test_mode")]
         if self.instance.id.ends_with("-debug") {
             if to.address.contains("fail@") {
                 return self.write(b"503 5.5.1 Invalid recipient.\r\n").await;

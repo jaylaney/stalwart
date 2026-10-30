@@ -258,7 +258,7 @@ async fn post_object(
 
 pub(crate) fn build_push_client() -> OutboundClient {
     OutboundClient::new(
-        utils::http::http_client_builder(cfg!(stalwart_tests)),
+        utils::http::http_client_builder(cfg!(feature = "test_mode")),
         OutboundPolicy::PublicOnly,
         Redirects::SameOrganization(MAX_REDIRECTS),
     )

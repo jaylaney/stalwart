@@ -320,9 +320,9 @@ impl NextHop<'_> {
     #[inline(always)]
     fn port(&self) -> u16 {
         match self {
-            #[cfg(stalwart_tests)]
+            #[cfg(feature = "test_mode")]
             NextHop::MX { .. } => 9925,
-            #[cfg(not(stalwart_tests))]
+            #[cfg(not(feature = "test_mode"))]
             NextHop::MX { .. } => 25,
             NextHop::Relay(host) => host.port,
         }
@@ -331,7 +331,7 @@ impl NextHop<'_> {
     #[inline(always)]
     fn allow_loopback(&self) -> bool {
         match self {
-            NextHop::MX { .. } => cfg!(stalwart_tests),
+            NextHop::MX { .. } => cfg!(feature = "test_mode"),
             NextHop::Relay(_) => true,
         }
     }
@@ -346,11 +346,11 @@ impl NextHop<'_> {
 
     #[inline(always)]
     fn allow_invalid_certs(&self) -> bool {
-        #[cfg(stalwart_tests)]
+        #[cfg(feature = "test_mode")]
         {
             true
         }
-        #[cfg(not(stalwart_tests))]
+        #[cfg(not(feature = "test_mode"))]
         match self {
             NextHop::MX { .. } => false,
             NextHop::Relay(host) => host.tls_allow_invalid_certs,

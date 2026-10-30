@@ -28,7 +28,7 @@ pub trait MailboxFnc: Sync + Send {
 
 impl MailboxFnc for Server {
     async fn create_system_folders(&self, account_id: u32) -> trc::Result<()> {
-        #[cfg(stalwart_tests)]
+        #[cfg(feature = "test_mode")]
         if account_id == 0 {
             return Ok(());
         }

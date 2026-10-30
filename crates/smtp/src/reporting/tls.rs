@@ -54,7 +54,7 @@ pub struct TlsRptOptions {
     pub interval: AggregateFrequency,
 }
 
-#[cfg(stalwart_tests)]
+#[cfg(feature = "test_mode")]
 pub static TLS_HTTP_REPORT: parking_lot::Mutex<Vec<u8>> = parking_lot::Mutex::new(Vec::new());
 
 pub trait TlsReporting: Sync + Send {
@@ -189,7 +189,7 @@ impl TlsPayload {
         // Try delivering report over HTTP
         for uri in report.http_rua.as_slice() {
             {
-                #[cfg(stalwart_tests)]
+                #[cfg(feature = "test_mode")]
                 if uri == "https://127.0.0.1/tls" {
                     TLS_HTTP_REPORT.lock().extend_from_slice(&compressed_json);
 
