@@ -6,16 +6,19 @@
 
 use common::{
     HttpAuthCache, Server,
-    auth::{AccessToken, AuthRequest, authentication::Authenticated},
+    auth::{
+        AccessToken, AuthRequest,
+        authentication::{Authenticated, UsernameParts},
+    },
     cache::http_auth::RevocationEpoch,
     network::limiter::InFlight,
 };
-use compact_str::CompactString;
 use directory::Credentials;
 use encodify::base64::LENIENT;
 use http_proto::{HttpRequest, HttpSessionData};
 use hyper::header;
 use std::future::Future;
+use std::time::Instant;
 
 pub struct HttpAuthenticated {
     pub in_flight: Option<InFlight>,
@@ -40,66 +43,26 @@ impl Authenticator for Server {
         let revocations = &self.inner.cache.grant_revocations;
         let epoch = revocations.epoch();
         if let Some((mechanism, token)) = req.authorization() {
-            // The cache key is a keyed fingerprint of the header value; the
-            // value itself is never stored (spec 5).
-            let fp = self.inner.cache.za_fingerprint(token);
-
             // Check if the credentials are cached
-            if let Some(http_cache) = self.inner.cache.http_auth.get(&fp) {
+            if let Some(http_cache) = self.inner.cache.http_auth.get(token) {
                 // Make sure the revision is still valid
-<<<<<<< HEAD
-                if http_cache.expires > Instant::now() {
-                    let mut access_token = AccessToken::renew(
-=======
                 if self.inner.cache.http_auth.is_live(&http_cache) {
-                    let access_token = AccessToken::renew(
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+                    let mut access_token = AccessToken::renew(
                         self.access_token(http_cache.account_id).await?,
                         http_cache.credential_id,
                         http_cache.token_scope,
                         session.remote_ip,
                     )?;
-                    // Mail ruling R35: an impersonation stays one.
-                    if http_cache.za_impersonated {
+
+                    // Ruling 10 (mail ruling R35): an impersonation stays one.
+                    if za_is_impersonation(token) {
                         access_token = access_token.with_za_impersonation();
                     }
 
-                    if access_token.revision() == http_cache.revision {
-<<<<<<< HEAD
-                        if http_cache.generation == 0 {
-                            // Non-key account: unchanged upstream path.
-                            // Enforce authenticated rate limit
-                            return self
-                                .is_http_authenticated_request_allowed(
-                                    &access_token,
-                                    session.remote_ip,
-                                )
-                                .await
-                                .map(|in_flight| (in_flight, access_token));
-                        }
-
-                        // Generation fence (spec 5): the entry must match the
-                        // account's current authentication generation, and the
-                        // resident keys must still be present and current.
-                        // Anything else forces a full verification.
-                        let account = self.account(http_cache.account_id).await?;
-                        if account.za_generation == http_cache.generation
-                            && let Some(keys) = self.inner.cache.za_keys.get(&fp, Instant::now())
-                            && keys.generation == http_cache.generation
-                            && keys.account_id == http_cache.account_id
-                        {
-                            let access_token = access_token.with_session_keys(keys);
-
-                            // Enforce authenticated rate limit
-                            return self
-                                .is_http_authenticated_request_allowed(
-                                    &access_token,
-                                    session.remote_ip,
-                                )
-                                .await
-                                .map(|in_flight| (in_flight, access_token));
-                        }
-=======
+                    if access_token.revision() == http_cache.revision
+                        && let Some(access_token) =
+                            za_cache_hit(self, token, http_cache.account_id, access_token).await?
+                    {
                         // Enforce authenticated rate limit
                         return self
                             .is_http_authenticated_request_allowed(&access_token, session.remote_ip)
@@ -109,86 +72,18 @@ impl Authenticator for Server {
                                 access_token,
                                 epoch,
                             });
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                     }
                 }
 
                 // If the entry is not valid, remove the cached credentials and keys
-                self.inner.cache.http_auth.remove(&fp);
-                self.inner.cache.za_keys.remove(&fp);
+                self.inner.cache.http_auth.remove(token);
+                self.inner
+                    .cache
+                    .za_keys
+                    .remove(&self.inner.cache.za_fingerprint(token));
             }
 
-<<<<<<< HEAD
-            authenticate_uncached(self, mechanism, token, session).await
-=======
-            let credentials = if mechanism.eq_ignore_ascii_case("basic") {
-                // Decode the base64 encoded credentials
-                decode_plain_auth(token).ok_or_else(|| {
-                    trc::AuthEvent::Error
-                        .into_err()
-                        .details("Failed to decode Basic auth request.")
-                        .id(CompactString::from(token))
-                        .caused_by(trc::location!())
-                })?
-            } else if mechanism.eq_ignore_ascii_case("bearer") {
-                // Enforce anonymous rate limit
-                self.is_http_anonymous_request_allowed(session.remote_ip)
-                    .await?;
-
-                Credentials::Bearer {
-                    username: None,
-                    token: token.to_string(),
-                }
-            } else {
-                // Enforce anonymous rate limit
-                self.is_http_anonymous_request_allowed(session.remote_ip)
-                    .await?;
-
-                return Err(trc::AuthEvent::Error
-                    .into_err()
-                    .reason("Unsupported authentication mechanism.")
-                    .details(CompactString::from(token))
-                    .caused_by(trc::location!()));
-            };
-
-            // Authenticate
-            let Authenticated {
-                access_token,
-                expires_in,
-            } = self
-                .authenticate(&AuthRequest::from_credentials(
-                    credentials,
-                    session.session_id,
-                    session.remote_ip,
-                ))
-                .await?;
-
-            // Cache credentials
-            let cache_ttl = expires_in.map_or(self.core.oauth.oauth_expiry_token, |expires_in| {
-                expires_in.min(self.core.oauth.oauth_expiry_token)
-            });
-            revocations.insert(
-                &self.inner.cache.http_auth,
-                token,
-                HttpAuthCache {
-                    account_id: access_token.account_id(),
-                    expires: self.inner.cache.http_auth.expires_in(cache_ttl),
-                    credential_id: access_token.credential_id(),
-                    revision: access_token.revision(),
-                    token_scope: access_token.token_scope(),
-                },
-                epoch,
-            );
-
-            // Enforce authenticated rate limit
-            self.is_http_authenticated_request_allowed(&access_token, session.remote_ip)
-                .await
-                .map(|in_flight| HttpAuthenticated {
-                    in_flight,
-                    access_token,
-                    epoch,
-                })
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+            authenticate_uncached(self, mechanism, token, session, epoch).await
         } else {
             // Enforce anonymous rate limit
             self.is_http_anonymous_request_allowed(session.remote_ip)
@@ -202,18 +97,70 @@ impl Authenticator for Server {
     }
 }
 
+/// The hit rule (interface sheet 2; C2). 1.0 keys `http_auth` on a hash of
+/// the raw token, so an entry cannot be dropped when its keys are evicted or
+/// swept: this rule alone keeps a key account's entry from being served
+/// without them. A key account's entry is served only with resident keys of
+/// the account's current authentication generation; `None` asks for a full
+/// verification. An ordinary account's entry takes upstream's path.
+async fn za_cache_hit(
+    server: &Server,
+    token: &str,
+    account_id: u32,
+    access_token: AccessToken,
+) -> trc::Result<Option<AccessToken>> {
+    let cache = &server.inner.cache;
+
+    // Fail closed: an account that cannot be read is not served from the cache.
+    let account = match server.account(account_id).await {
+        Ok(account) => account,
+        Err(err) => {
+            cache.http_auth.remove(token);
+            cache.za_keys.remove(&cache.za_fingerprint(token));
+            return Err(err);
+        }
+    };
+
+    if !account.is_key_account() {
+        // Non-key account: unchanged upstream path.
+        return Ok(Some(access_token));
+    }
+
+    // Generation fence (spec 5): the resident keys must still be present and
+    // belong to the account's current authentication generation.
+    let generation = account.za_generation();
+    Ok(cache
+        .za_keys
+        .get(&cache.za_fingerprint(token), Instant::now())
+        .filter(|keys| {
+            keys.account_id == account_id && keys.generation != 0 && keys.generation == generation
+        })
+        .map(|keys| access_token.with_session_keys(keys)))
+}
+
+/// Ruling 10: R35's impersonation marker, re-derived from the cached token
+/// itself whatever the mechanism. `HttpAuthEntries` keys on the token alone,
+/// so a Bearer header carrying a Basic login's token hits that login's
+/// entry. Every successful login whose username has the master form is an
+/// impersonation; the marker only restricts, so a false positive fails safe.
+fn za_is_impersonation(token: &str) -> bool {
+    matches!(
+        decode_plain_auth(token),
+        Some(Credentials::Basic { username, .. }) if UsernameParts::new(&username).is_master()
+    )
+}
+
 /// Full verification of an Authorization header, caching the result under
-/// the header's own fingerprint, computed here so that no caller can cache
-/// under another key. The only place session keys are attached (spec 5).
+/// the header's own token, given here so that no caller can cache under
+/// another key. The only place session keys are attached (spec 5).
 async fn authenticate_uncached(
     server: &Server,
     mechanism: &str,
     token: &str,
     session: &HttpSessionData,
-) -> trc::Result<(Option<InFlight>, AccessToken)> {
-    let fp = server.inner.cache.za_fingerprint(token);
-
-    // The raw header value never reaches an event (spec 5).
+    epoch: RevocationEpoch,
+) -> trc::Result<HttpAuthenticated> {
+    // Ruling 28 (C3): the raw header value never reaches an error or event.
     let credentials = if mechanism.eq_ignore_ascii_case("basic") {
         // Decode the base64 encoded credentials
         decode_plain_auth(token).ok_or_else(|| {
@@ -245,7 +192,13 @@ async fn authenticate_uncached(
     };
 
     // Authenticate
-    let (mut access_token, session_keys) = server
+    let (
+        Authenticated {
+            mut access_token,
+            expires_in,
+        },
+        session_keys,
+    ) = server
         .authenticate_with_keys(&AuthRequest::from_credentials(
             credentials,
             session.session_id,
@@ -256,27 +209,29 @@ async fn authenticate_uncached(
     #[cfg(feature = "test_mode")]
     za_test::pause_point(access_token.account_id()).await;
 
+    // Cache credentials
+    let cache = &server.inner.cache;
+    let revocations = &cache.grant_revocations;
     let account_id = access_token.account_id();
-    let expires = Instant::now() + Duration::from_secs(server.core.oauth.oauth_expiry_token);
+    let cache_ttl = expires_in.map_or(server.core.oauth.oauth_expiry_token, |expires_in| {
+        expires_in.min(server.core.oauth.oauth_expiry_token)
+    });
+    let entry = HttpAuthCache {
+        account_id,
+        expires: cache.http_auth.expires_in(cache_ttl),
+        credential_id: access_token.credential_id(),
+        revision: access_token.revision(),
+        token_scope: access_token.token_scope(),
+    };
     match session_keys {
         None => {
-            // A keyless result for a key account (Bearer/OAuth, or a
-            // password verified against the pre-setup hash while setup
-            // committed) must not survive in the cache: a generation-0
-            // entry is served on later hits without the fence. Only
-            // non-key accounts are cached here, as upstream does.
+            // A keyless result for a key account (Bearer/OAuth, an
+            // impersonation, or a password verified against the pre-setup
+            // hash while setup committed) is never cached: the hit rule would
+            // refuse it anyway. Only ordinary accounts are cached here, as
+            // upstream does, under upstream's revocation epoch.
             if !server.account(account_id).await?.is_key_account() {
-                server.inner.cache.http_auth.insert(
-                    fp,
-                    HttpAuthCache {
-                        account_id,
-                        revision: access_token.revision(),
-                        credential_id: access_token.credential_id(),
-                        expires,
-                        generation: 0,
-                        za_impersonated: access_token.za_is_impersonated(),
-                    },
-                );
+                revocations.insert(&cache.http_auth, token, entry, epoch);
 
                 // Double-check after publish: the check above may have read
                 // a stale non-key entry while setup's `Account` invalidation
@@ -286,7 +241,7 @@ async fn authenticate_uncached(
                 match server.account(account_id).await {
                     Ok(account) if !account.is_key_account() => {}
                     result => {
-                        server.inner.cache.http_auth.remove(&fp);
+                        cache.http_auth.remove(token);
                         result?;
                     }
                 }
@@ -311,26 +266,12 @@ async fn authenticate_uncached(
             // Caching now would resurrect the superseded verification, so
             // both inserts happen only if the verified generation still
             // equals the one rebuilt from the store; otherwise the request
-            // succeeds uncached. Generation 0 is never cached: such an
-            // entry would be served from the non-key hit branch, unfenced,
-            // with keys resident.
+            // succeeds uncached. Generation 0 is never cached. The entry
+            // also passes upstream's revocation epoch.
             let account = server.account(account_id).await?;
-            if keys.generation != 0 && keys.generation == account.za_generation {
-                server.inner.cache.http_auth.insert(
-                    fp,
-                    HttpAuthCache {
-                        account_id,
-                        revision: access_token.revision(),
-                        credential_id: access_token.credential_id(),
-                        expires,
-                        generation: keys.generation,
-                        za_impersonated: access_token.za_is_impersonated(),
-                    },
-                );
-                server
-                    .inner
-                    .cache
-                    .za_insert_keys(fp, keys.clone(), Instant::now());
+            if keys.generation != 0 && keys.generation == account.za_generation() {
+                revocations.insert(&cache.http_auth, token, entry, epoch);
+                cache.za_insert_keys(cache.za_fingerprint(token), keys.clone(), Instant::now());
             }
             access_token = access_token.with_session_keys(keys);
         }
@@ -340,7 +281,11 @@ async fn authenticate_uncached(
     server
         .is_http_authenticated_request_allowed(&access_token, session.remote_ip)
         .await
-        .map(|in_flight| (in_flight, access_token))
+        .map(|in_flight| HttpAuthenticated {
+            in_flight,
+            access_token,
+            epoch,
+        })
 }
 
 /// Test-only pause points, each keyed on an account id and one-shot: only

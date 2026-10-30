@@ -28,7 +28,6 @@ pub async fn fetch_body(
     max_size: usize,
     session_id: u64,
 ) -> Option<Vec<u8>> {
-<<<<<<< HEAD
     fetch_body_inner(req, max_size, session_id, true).await
 }
 
@@ -60,8 +59,6 @@ async fn fetch_body_inner(
     session_id: u64,
     trace: bool,
 ) -> Option<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(1024);
-=======
     let declared = req
         .body()
         .size_hint()
@@ -69,7 +66,6 @@ async fn fetch_body_inner(
         .and_then(|len| usize::try_from(len).ok())
         .filter(|&len| max_size == 0 || len <= max_size);
     let mut bytes = Vec::new();
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
     while let Some(Ok(frame)) = req.frame().await {
         if let Some(data) = frame.data_ref() {
             let len = bytes.len() + data.len();

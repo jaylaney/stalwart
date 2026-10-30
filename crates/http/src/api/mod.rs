@@ -16,14 +16,10 @@ pub mod shares;
 pub mod vault;
 
 use crate::{
-<<<<<<< HEAD
     api::{
-        diagnose::{DeliveryStage, spawn_delivery_diagnose},
+        diagnose::{DeliveryStage, DeliveryTarget, spawn_delivery_diagnose},
         vault::VaultApi,
     },
-=======
-    api::diagnose::{DeliveryStage, DeliveryTarget, spawn_delivery_diagnose},
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
     auth::{
         authenticate::{Authenticator, HttpAuthenticated},
         oauth::{auth::OAuthApiHandler, request_origin},
@@ -95,6 +91,7 @@ impl ManagementApi for Server {
                     body.ok_or_else(|| trc::LimitEvent::SizeRequest.into_err())?,
                 )
                 .await
+                .map(HttpResponse::with_untraced_body)
             }
             "auth" if path.get(1).copied() == Some("client") => {
                 self.is_http_anonymous_request_allowed(session.remote_ip)
@@ -105,7 +102,6 @@ impl ManagementApi for Server {
                     req.uri().query().unwrap_or_default(),
                 )
                 .await
-                .map(HttpResponse::with_untraced_body)
             }
             "calendar"
                 if is_post

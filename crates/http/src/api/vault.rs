@@ -8,7 +8,10 @@
 //! write of the vault record; the registry is written only for the marker and
 //! for app-password hashes.
 
-use crate::{api::contacts, auth::authenticate::Authenticator};
+use crate::{
+    api::contacts,
+    auth::authenticate::{Authenticator, HttpAuthenticated},
+};
 use ::vault::{
     ZA_MARKER,
     keys::{
@@ -20,11 +23,11 @@ use ::vault::{
     recovery::RecoveryKey,
     session::SessionKeys,
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use common::{
     Server,
     auth::{
         AccessToken, AuthRequest, BuildAccessToken,
+        authentication::Authenticated,
         credential::AppPassword,
         vault::{VaultRead, za_argon2_params, za_derive_root},
     },
@@ -36,6 +39,7 @@ use directory::{
     core::secret::{hash_secret, verify_totp_code},
 };
 use email::message::za::sharing::za_mailbox_grantees;
+use encodify::base64::URL_SAFE_NO_PAD;
 use groupware::calendar::{ArchivedTimezone, Calendar};
 use http_proto::{HttpRequest, HttpResponse, HttpSessionData};
 use hyper::{
@@ -58,7 +62,11 @@ use store::{
 };
 use subtle::ConstantTimeEq;
 use trc::AddContext;
-use types::{collection::Collection, field::EmailField, id::Id};
+use types::{
+    collection::Collection,
+    field::{EmailField, Field},
+    id::Id,
+};
 
 /// Lifetime of a setup token (spec 4.1).
 pub const SETUP_TOKEN_TTL_SECS: i64 = 7 * 86400;
@@ -289,9 +297,10 @@ impl VaultApi for Server {
         body: Vec<u8>,
     ) -> trc::Result<HttpResponse> {
         if endpoint == "setup-token" && sub.is_none() {
-            let (_in_flight, access_token) = self.authenticate_headers(req, session).await?;
+            let HttpAuthenticated { access_token, .. } =
+                self.authenticate_headers(req, session).await?;
             access_token.enforce_permission(Permission::SysAccountUpdate)?;
-            return za_setup_token(self, access_token.tenant_id(), parse(&body)?).await;
+            return za_setup_token(self, parse(&body)?).await;
         }
 
         // Credentials travel in the body; rate-limit like the other anonymous endpoints.
@@ -349,9 +358,10 @@ async fn za_registry_account(
     };
     let revision = object.revision;
     match object.inner {
-        ObjectInner::Account(Account::User(account)) => {
-            Ok(Some(RegistryAccount { account, revision }))
-        }
+        ObjectInner::Account(account) => match *account {
+            Account::User(account) => Ok(Some(RegistryAccount { account, revision })),
+            _ => Ok(None),
+        },
         _ => Ok(None),
     }
 }
@@ -366,6 +376,7 @@ fn registry_rejection(result: &RegistryWriteResult) -> &'static str {
         RegistryWriteResult::CannotDeleteSingleton => "cannot delete singleton",
         RegistryWriteResult::NotFound { .. } => "not found",
         RegistryWriteResult::InvalidForeignKey { .. } => "invalid foreign key",
+        RegistryWriteResult::ForeignKeyOutOfScope { .. } => "foreign key out of scope",
         RegistryWriteResult::PrimaryKeyConflict { .. } => "primary key conflict",
         RegistryWriteResult::ValidationError { .. } => "validation error",
         RegistryWriteResult::NotSupported => "not supported",
@@ -381,9 +392,9 @@ async fn za_registry_update(
     old: &RegistryAccount,
     new: UserAccount,
 ) -> trc::Result<bool> {
-    let object = Object::new(ObjectInner::Account(Account::User(new)));
+    let object = Object::new(ObjectInner::Account(Box::new(Account::User(new))));
     let old_object = Object::with_revision(
-        ObjectInner::Account(Account::User(old.account.clone())),
+        ObjectInner::Account(Box::new(Account::User(old.account.clone()))),
         old.revision,
     );
     match server
@@ -585,7 +596,13 @@ pub(super) async fn za_verify_primary(
             "App passwords are not accepted on this endpoint.",
         ));
     }
-    let (token, keys) = server
+    let (
+        Authenticated {
+            access_token: token,
+            ..
+        },
+        keys,
+    ) = server
         .authenticate_with_keys(&AuthRequest::from_credentials(
             Credentials::Basic {
                 username: username.to_string(),
@@ -664,27 +681,17 @@ fn za_set_recovery(record: &mut VaultRecord, account_id: u32, mk: &Secret) -> Re
     key
 }
 
-async fn za_setup_token(
-    server: &Server,
-    caller_tenant_id: Option<u32>,
-    request: SetupTokenRequest,
-) -> trc::Result<HttpResponse> {
+async fn za_setup_token(server: &Server, request: SetupTokenRequest) -> trc::Result<HttpResponse> {
     let Some(account_id) = server
         .account_id_from_email(&request.account, false)
         .await?
     else {
         return Err(trc::ResourceEvent::NotFound.into_err());
     };
+    // Tenants are enterprise-only at 1.0 (`AccessToken::tenant_id` and
+    // `UserAccount::member_tenant_id` sit in SEL snippets), so the 0.16
+    // tenant scoping of this endpoint has no subject in the product build.
     let reg = za_registry_account(server, account_id).await?;
-    // A tenant administrator only sees its own tenant's accounts, like the
-    // registry set path; a tenant-less caller sees all.
-    if let Some(tenant_id) = caller_tenant_id
-        && reg
-            .as_ref()
-            .is_none_or(|reg| reg.account.member_tenant_id != Some(Id::from(tenant_id)))
-    {
-        return Err(trc::ResourceEvent::NotFound.into_err());
-    }
     let Some(reg) = reg else {
         return Ok(conflict("not a user account"));
     };
@@ -981,32 +988,52 @@ async fn za_has_user_calendars(server: &Server, account_id: u32) -> trc::Result<
     );
     let mut count = 0u32;
     let mut user_data = false;
+    let mut default_id = None;
     server
-        .archives(account_id, Collection::Calendar, &(), |_, archive| {
-            count += 1;
-            let calendar = archive.unarchive::<Calendar>()?;
-            let untouched = calendar.name.as_str() == default_name
-                && calendar.acls.is_empty()
-                && calendar.dead_properties.0.is_empty()
-                && match calendar.preferences.as_slice() {
-                    [] => true,
-                    [prefs] => {
-                        prefs.name.as_str() == expected_display
-                            && prefs.description.is_none()
-                            && prefs.color.is_none()
-                            && prefs.default_alerts.is_empty()
-                            && matches!(prefs.time_zone, ArchivedTimezone::Default)
-                    }
-                    _ => false,
-                };
-            if !untouched {
-                user_data = true;
-            }
-            Ok(count < 2 && !user_data)
-        })
+        .archives(
+            account_id,
+            Collection::Calendar,
+            Field::ARCHIVE,
+            &(),
+            |document_id, archive| {
+                count += 1;
+                let calendar = archive.unarchive::<Calendar>()?;
+                let untouched = calendar.name.as_str() == default_name
+                    && calendar.acls.is_empty()
+                    && match calendar.preferences.as_slice() {
+                        [] => true,
+                        [prefs] => {
+                            prefs.name.as_str() == expected_display
+                                && prefs.description.is_none()
+                                && prefs.color.is_none()
+                                && prefs.default_alerts.is_empty()
+                                && matches!(prefs.time_zone, ArchivedTimezone::Default)
+                        }
+                        _ => false,
+                    };
+                if untouched {
+                    default_id = Some(document_id);
+                } else {
+                    user_data = true;
+                }
+                Ok(count < 2 && !user_data)
+            },
+        )
         .await
         .caused_by(trc::location!())?;
-    Ok(user_data || count > 1)
+    if user_data || count > 1 {
+        return Ok(true);
+    }
+    // 1.0 keeps a calendar's dead properties outside its archive, in its
+    // shared metadata container (`Collection::Metadata`): the untouched
+    // default calendar has none.
+    match default_id {
+        Some(document_id) => Ok(server
+            .metadata_container(account_id, Collection::Calendar, document_id)
+            .await?
+            .is_some()),
+        None => Ok(false),
+    }
 }
 
 async fn za_setup(
@@ -1276,6 +1303,7 @@ async fn za_app_password(
     let credential_id = reg.account.next_credential_id() as u32;
     let app_pass = AppPassword::new(credential_id);
     let secret_hash = hash_secret(
+        &server.inner.data.password_verifier,
         server.core.network.security.password_hash_algorithm,
         app_pass.secret.to_vec(),
     )

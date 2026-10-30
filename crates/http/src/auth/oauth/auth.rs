@@ -270,111 +270,6 @@ impl OAuthApiHandler for Server {
                         account_secret,
                         mfa_token,
                     },
-<<<<<<< HEAD
-                    None => {
-                        if stateless_client.is_some() {
-                            return Err(trc::AuthEvent::Error.into_err().details(
-                                "A PKCE code_challenge with the S256 method is required.",
-                            ));
-                        }
-                        PkceCodeChallenge::None
-                    }
-                };
-
-                // Authenticate
-                match self
-                    .authenticate(&AuthRequest {
-                        credentials: Credentials::Basic {
-                            username: account_name,
-                            secret: account_secret,
-                            mfa_token,
-                        },
-                        session_id: session.session_id,
-                        remote_ip: session.remote_ip,
-                    })
-                    .await
-                {
-                    Ok(access_token) => {
-                        // Mail ruling R36: no code for an impersonated login
-                        // of a key account.
-                        if self
-                            .za_oauth_grant_refused(&access_token, session.session_id)
-                            .await?
-                        {
-                            return Ok(JsonResponse::new(LoginResponse::Failure)
-                                .no_cache()
-                                .into_http_response());
-                        }
-                        // Registry-backed clients are validated once the account is known
-                        if stateless_client.is_none()
-                            && self
-                                .validate_client_registration(
-                                    &client_id,
-                                    Some(redirect_uri.as_str()),
-                                    access_token.account_id(),
-                                )
-                                .await?
-                                .is_some()
-                        {
-                            return Err(trc::AuthEvent::Error
-                                .into_err()
-                                .details("Invalid client registration."));
-                        }
-
-                        // Generate client code
-                        let client_code = rng()
-                            .sample_iter(Alphanumeric)
-                            .take(DEVICE_CODE_LEN)
-                            .map(char::from)
-                            .collect::<String>();
-
-                        // Serialize OAuth code
-                        let value = Archiver::new(OAuthCode {
-                            status: OAuthStatus::Authorized,
-                            account_id: access_token.account_id(),
-                            client_id,
-                            nonce,
-                            params: redirect_uri,
-                            code_challenge: pkce_challenge,
-                            scope: granted_scope,
-                            resources: resource,
-                        })
-                        .untrusted()
-                        .serialize()
-                        .caused_by(trc::location!())?;
-
-                        // Insert client code
-                        self.in_memory_store()
-                            .key_set(
-                                KeyValue::with_prefix(KV_OAUTH, client_code.as_bytes(), value)
-                                    .expires(self.core.oauth.oauth_expiry_auth_code),
-                            )
-                            .await?;
-
-                        LoginResponse::Authenticated {
-                            client_code,
-                            iss: self.core.network.http.url_https.clone(),
-                        }
-                    }
-                    Err(err) => match *err.as_ref() {
-                        trc::EventType::Auth(trc::AuthEvent::MfaRequired) => {
-                            trc::error!(err.span_id(session.session_id));
-                            LoginResponse::MfaRequired
-                        }
-                        trc::EventType::Auth(_) => {
-                            trc::error!(err.span_id(session.session_id));
-                            LoginResponse::Failure
-                        }
-                        trc::EventType::Security(_) => {
-                            trc::error!(err.span_id(session.session_id));
-                            LoginResponse::Failure
-                        }
-                        _ => {
-                            return Err(err);
-                        }
-                    },
-                }
-=======
                     &query,
                     consent,
                 )
@@ -387,7 +282,6 @@ impl OAuthApiHandler for Server {
             } => {
                 self.confirm_consent(session, origin, &token, &query, consent)
                     .await?
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
             }
             LoginRequest::AuthDevice {
                 account_name,
@@ -396,60 +290,6 @@ impl OAuthApiHandler for Server {
                 code,
                 consent,
             } => {
-<<<<<<< HEAD
-                // Obtain code
-                let mut result = LoginResponse::Failure;
-                if let Some(auth_code_) = self
-                    .in_memory_store()
-                    .key_get::<Archive<AlignedBytes>>(KeyValue::<()>::build_key(
-                        KV_OAUTH,
-                        code.as_bytes(),
-                    ))
-                    .await?
-                {
-                    let oauth = auth_code_
-                        .unarchive::<OAuthCode>()
-                        .caused_by(trc::location!())?;
-                    if oauth.status == OAuthStatus::Pending {
-                        // Authenticate
-                        match self
-                            .authenticate(&AuthRequest {
-                                credentials: Credentials::Basic {
-                                    username: account_name,
-                                    secret: account_secret,
-                                    mfa_token,
-                                },
-                                session_id: session.session_id,
-                                remote_ip: session.remote_ip,
-                            })
-                            .await
-                        {
-                            Ok(access_token) => {
-                                // Mail ruling R36: no code for an impersonated
-                                // login of a key account.
-                                if self
-                                    .za_oauth_grant_refused(&access_token, session.session_id)
-                                    .await?
-                                {
-                                    return Ok(JsonResponse::new(LoginResponse::Failure)
-                                        .no_cache()
-                                        .into_http_response());
-                                }
-                                let new_oauth_code = OAuthCode {
-                                    status: OAuthStatus::Authorized,
-                                    account_id: access_token.account_id(),
-                                    client_id: oauth.client_id.to_string(),
-                                    nonce: oauth.nonce.as_ref().map(|s| s.to_string()),
-                                    params: Default::default(),
-                                    code_challenge: PkceCodeChallenge::None,
-                                    scope: oauth.scope.as_ref().map(|s| s.to_string()),
-                                    resources: oauth
-                                        .resources
-                                        .iter()
-                                        .map(|s| s.to_string())
-                                        .collect(),
-                                };
-=======
                 approve_device(
                     self,
                     session,
@@ -462,7 +302,6 @@ impl OAuthApiHandler for Server {
                 .await?
             }
         };
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
         Ok(JsonResponse::new(response).no_cache().into_http_response())
     }
@@ -780,6 +619,14 @@ async fn authenticate_login(
     {
         Ok(authenticated) => {
             let access_token = authenticated.access_token;
+            // Mail ruling R36: no code for an impersonated login of a key
+            // account (the authorization-code and device logins both pass here).
+            if server
+                .za_oauth_grant_refused(&access_token, session.session_id)
+                .await?
+            {
+                return Ok(Err(LoginResponse::Failure));
+            }
             let account_id = access_token.account_id();
             if !client.is_first_party() && access_token.is_main_credential_expired() {
                 trc::event!(

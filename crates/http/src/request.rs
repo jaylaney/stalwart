@@ -31,11 +31,6 @@ use common::{
     auth::oauth::{client::RequestOrigin, scope::OAuthScopes},
     config::telemetry::PrometheusAuth,
     ipc::PushEvent,
-<<<<<<< HEAD
-    manager::application::Resource,
-    network::{SessionData, SessionManager, SessionStream},
-    za::{ZA_MAIL_KEYLESS, ZA_TRACE_MAIL_KEYLESS, mail::za_is_keyless_refusal},
-=======
     manager::{
         app_client::APP_CLIENT_DOCUMENT,
         application::{AppClientDocument, Resource},
@@ -43,7 +38,7 @@ use common::{
     network::{
         SessionData, SessionManager, SessionStream, forwarded::ClientIp, memory::MemoryClass,
     },
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+    za::{ZA_MAIL_KEYLESS, ZA_TRACE_MAIL_KEYLESS, mail::za_is_keyless_refusal},
 };
 use compact_str::{CompactString, ToCompactString};
 use dav::{DavMethod, request::DavRequestHandler};
@@ -158,69 +153,54 @@ impl ParseHttp for Server {
                             }
                         }
 
-                        if za_jmap_untraced(self, access_token.account_id()).await {
-                            let bytes = fetch_body_untraced(
-                                &mut req,
-                                if !access_token.has_permission(Permission::UnlimitedUploads) {
-                                    self.core.jmap.upload_max_size
-                                } else {
-                                    0
-                                },
-                            )
-                            .await
-                            .ok_or_else(|| trc::LimitEvent::SizeRequest.into_err())?;
-
-                            let request = match Request::parse(
-                                &bytes,
-                                self.core.jmap.request_max_calls,
-                                self.core.jmap.request_max_size,
-                            ) {
-                                Ok(request) => request,
-                                // Spec section 10, "Traces": the parser's
-                                // details and reason can echo the body.
-                                Err(err)
-                                    if err.matches(trc::EventType::Jmap(
-                                        trc::JmapEvent::NotRequest,
-                                    )) =>
-                                {
-                                    return Err(trc::JmapEvent::NotRequest
-                                        .into_err()
-                                        .reason("invalid JMAP request"));
-                                }
-                                Err(err) => return Err(err),
-                            };
-
-                            return Ok(self
-                                .handle_jmap_request(request, &access_token, &session)
-                                .await
-                                .into_http_response()
-                                .with_untraced_body());
+                        // Spec section 10, "Traces": a key account's request
+                        // and response bodies are never traced.
+                        let untraced = za_jmap_untraced(self, access_token.account_id()).await;
+                        let max_size = if !access_token.has_permission(Permission::UnlimitedUploads)
+                        {
+                            self.core.jmap.upload_max_size
+                        } else {
+                            0
+                        };
+                        let bytes = if untraced {
+                            fetch_body_untraced(&mut req, max_size).await
+                        } else {
+                            fetch_body(&mut req, max_size, session.session_id).await
                         }
-
-                        let bytes = fetch_body(
-                            &mut req,
-                            if !access_token.has_permission(Permission::UnlimitedUploads) {
-                                self.core.jmap.upload_max_size
-                            } else {
-                                0
-                            },
-                            session.session_id,
-                        )
-                        .await
                         .ok_or_else(|| trc::LimitEvent::SizeRequest.into_err())?;
 
-                        let mut request = Request::parse(
+                        let mut request = match Request::parse(
                             &bytes,
                             self.core.jmap.request_max_calls,
                             self.core.jmap.request_max_size,
-                        )?;
+                        ) {
+                            Ok(request) => request,
+                            // Spec section 10, "Traces": the parser's details
+                            // and reason can echo the body.
+                            Err(err)
+                                if untraced
+                                    && err.matches(trc::EventType::Jmap(
+                                        trc::JmapEvent::NotRequest,
+                                    )) =>
+                            {
+                                return Err(trc::JmapEvent::NotRequest
+                                    .into_err()
+                                    .reason("invalid JMAP request"));
+                            }
+                            Err(err) => return Err(err),
+                        };
                         request.using = allowed_capabilities(&access_token, request.using);
 
                         let mut reservation = self.memory_reservation(MemoryClass::Read);
-                        return Ok(self
+                        let response = self
                             .handle_jmap_request(request, &access_token, &session, &mut reservation)
                             .await
-                            .into_http_response());
+                            .into_http_response();
+                        return Ok(if untraced {
+                            response.with_untraced_body()
+                        } else {
+                            response
+                        });
                     }
                     ("download", &Method::GET) => {
                         // Authenticate request
@@ -237,29 +217,14 @@ impl ParseHttp for Server {
                             path.next().and_then(BlobId::from_base32),
                             path.next(),
                         ) {
-<<<<<<< HEAD
                             // Ruling R30: the keyless refusal answers 403.
-                            let blob = match self.blob_download(&blob_id, &access_token).await {
+                            let contents = match self.blob_contents(&blob_id, &access_token).await {
                                 Err(err) if za_is_keyless_refusal(&err) => {
                                     return Ok(za_keyless_response());
                                 }
-                                blob => blob?,
+                                contents => contents?,
                             };
-                            return match blob {
-                                Some(blob) => Ok(DownloadResponse {
-                                    filename: name.to_string(),
-                                    content_type: req
-                                        .uri()
-                                        .query()
-                                        .and_then(|q| {
-                                            form_urlencoded::parse(q.as_bytes())
-                                                .find(|(k, _)| k == "accept")
-                                                .map(|(_, v)| v.into_owned())
-                                        })
-                                        .unwrap_or("application/octet-stream".to_string()),
-                                    blob,
-=======
-                            return match self.blob_contents(&blob_id, &access_token).await? {
+                            return match contents {
                                 Some(contents) => {
                                     let (prefix, blob) = contents.into_http_parts()?;
                                     Ok(DownloadResponse {
@@ -277,7 +242,6 @@ impl ParseHttp for Server {
                                         blob,
                                     }
                                     .into_http_response())
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                                 }
                                 None => Err(trc::ResourceEvent::NotFound.into_err()),
                             };
@@ -390,15 +354,12 @@ impl ParseHttp for Server {
 
                         // A WebSocket outlives the key residency bound (spec 5).
                         return self
-<<<<<<< HEAD
                             .upgrade_websocket_connection(
                                 req,
                                 access_token.without_session_keys(),
+                                epoch,
                                 session,
                             )
-=======
-                            .upgrade_websocket_connection(req, access_token, epoch, session)
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                             .await;
                     }
                     ("session", &Method::GET) => {
@@ -1144,7 +1105,6 @@ async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionDat
                     trc::event!(
                         Http(trc::HttpEvent::ResponseBody),
                         SpanId = session.session_id,
-<<<<<<< HEAD
                         Contents = if response.is_untraced() {
                             trc::Value::String("[redacted]".into())
                         } else {
@@ -1152,7 +1112,7 @@ async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionDat
                                 HttpResponseBody::Text(value) => {
                                     trc::Value::String(value.as_str().into())
                                 }
-                                HttpResponseBody::Binary(_) => {
+                                HttpResponseBody::Binary(_) | HttpResponseBody::Prefixed(_) => {
                                     trc::Value::String("[binary data]".into())
                                 }
                                 HttpResponseBody::Stream(_) => {
@@ -1160,15 +1120,6 @@ async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionDat
                                 }
                                 _ => trc::Value::None,
                             }
-=======
-                        Contents = match response.body() {
-                            HttpResponseBody::Text(value) =>
-                                trc::Value::String(value.as_str().into()),
-                            HttpResponseBody::Binary(_) | HttpResponseBody::Prefixed(_) =>
-                                trc::Value::String("[binary data]".into()),
-                            HttpResponseBody::Stream(_) => trc::Value::String("[stream]".into()),
-                            _ => trc::Value::None,
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                         },
                         Code = response.status().as_u16(),
                         Size = response.size(),
@@ -1247,7 +1198,6 @@ impl SessionManager for HttpSessionManager {
     }
 }
 
-<<<<<<< HEAD
 /// Spec section 10, "Traces": a key account's JMAP request and response
 /// bodies are never traced, since a request can carry the account's password
 /// (`x:AccountPassword/set`). Fails closed: a failed lookup counts as a key
@@ -1267,13 +1217,7 @@ fn za_keyless_response() -> HttpResponse {
         .with_untraced_body()
 }
 
-#[cfg(test)]
-mod tests {
-    use flate2::read::GzDecoder;
-    use std::io::Read;
-=======
 const PACC_HOST_PREFIX: &str = "ua-auto-config.";
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
 fn pacc_domain(host: &str) -> &str {
     let host = host.rsplit_once(':').map_or(host, |(host, _)| host);
@@ -1286,4 +1230,8 @@ fn pacc_domain(host: &str) -> &str {
 #[cfg(all(test, stalwart_tests))]
 #[rustfmt::skip]
 #[path = "../../../../stalwart-tests/unit/http/src/request/tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "request_restored_tests.rs"]
 mod tests;

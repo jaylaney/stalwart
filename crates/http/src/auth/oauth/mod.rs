@@ -4,14 +4,9 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-<<<<<<< HEAD
-use http_proto::{HttpRequest, request::fetch_body_untraced};
-use hyper::header::CONTENT_TYPE;
-=======
 use common::auth::oauth::client::RequestOrigin;
-use http_proto::{HttpRequest, HttpSessionData, request::fetch_body};
+use http_proto::{HttpRequest, HttpSessionData, request::fetch_body_untraced};
 use hyper::header::{CONTENT_TYPE, HOST};
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 use serde::{Deserialize, Serialize};
 use utils::map::vec_map::VecMap;
 
