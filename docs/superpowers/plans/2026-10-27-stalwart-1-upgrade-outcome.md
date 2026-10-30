@@ -4116,6 +4116,36 @@ Lines are the worktree's after part 3b.
 - The tests crate's first compile covers the part 3b test edits; they were checked by
   source only.
 
+
+### Task 3 rulings
+
+41. **A conflicted file with several owners is resolved whole by its first owner** in task
+    order. That owner ports its own hooks, and ports or defers the others', recording each
+    deferral with its inventory row and owner, as under ruling 34. Cost if wrong: a later
+    owner re-ports a deferred hook from `9601038de`.
+42. **Task 3 ran as two dispatches.** 3a did `directory`, `common` and `vault`, which compile
+    now. 3b did the HTTP and protocol login sites, which compile at Tasks 5 and 6.
+43. **Task 3's review ran on Fable at xhigh.** The plan sends authority kernels to the
+    strongest permitted reviewer, and Jay gave standing permission for Fable reviews.
+44. **A restored test that fails on 1.0's behaviour is adapted by kind:**
+    - an intended change gets its assertion updated, with an expectation-ledger entry;
+    - a timing artefact waits for the outcome;
+    - an apparent upstream bug keeps its subject where it survives, and gets a case
+      documenting 1.0's behaviour.
+
+    No test is ignored silently. The two apparent upstream bugs found so far are recorded
+    privately.
+45. **The fork's tenant check on `setup-token` is dropped, with the SEL-only disposition.**
+    At 1.0 the tenant fields exist only inside SEL snippets. So the OSS product has no
+    tenants, and enterprise binaries are never deployed. Cost if wrong: an enterprise build
+    wouldn't scope a tenant admin's setup tokens, an unsupported configuration.
+46. **An HTTP cache hit reads the account cache for every account** (the Task 3 review's
+    F4). The hit rule classifies each cached entry through `account()`, which fails closed.
+    So an `account()` error on a hit refuses where upstream would serve, and a recovery
+    admin's hit does an uncached registry lookup. This is an accepted failure-mode deviation
+    under C4: the alternative would serve a key account's entry unclassified. Cost if wrong:
+    a registry outage refuses cached logins it could have served.
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
