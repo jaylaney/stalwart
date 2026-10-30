@@ -1,10 +1,18 @@
 # Stalwart 1.0 fresh store upgrade design
 
-Revision 4, 2026-10-30. It adopts both re-reviews of revision 3:
-[Fable's](2026-10-27-stalwart-1-upgrade-design-review-r3.md) and the "Revision 3 re-review"
-section of the [Codex review](../plans/2026-10-27-stalwart-1-upgrade-codex-review-2026-10-30.md).
-It also records Jay's answers to their four questions. The main correction is to the
-dead-property design, which now seals exactly the unit upstream stores.
+Revision 5, 2026-10-30. It adopts
+[Fable's check of revision 4](2026-10-27-stalwart-1-upgrade-design-review-r4.md) and records
+Jay's answers to its two questions; the "Revision 4 re-review" section of the
+[Codex review](../plans/2026-10-27-stalwart-1-upgrade-codex-review-2026-10-30.md) found no
+new finding. The main change is a visibility-policy decision: sharers can hide events by
+`CLASS`, so `CLASS` becomes visible under field-policy version 2 (calendar spec revision 8)
+and upstream's privacy filters work unchanged for key accounts. The dead-property wrapper,
+its seal sites and the COPY/MOVE re-key are now specified.
+
+Revision 4 (2026-10-30) adopted both re-reviews of revision 3
+([Fable's](2026-10-27-stalwart-1-upgrade-design-review-r3.md) and the Codex review's
+"Revision 3 re-review") and Jay's answers to their four questions. Its main correction was
+to the dead-property design, which now seals exactly the unit upstream stores.
 
 Revision 3 (2026-10-30) adopted the first reviews of both
 ([Fable](2026-10-27-stalwart-1-upgrade-design-review.md) and Codex), under one principle:
@@ -121,7 +129,7 @@ The contracts below are acceptance criteria, not an opportunity to redesign thos
 | C3 | No credential, reversible credential cache key, private key, decrypted protected content or content-bearing diagnostic is added to caches, traces, errors or persistent snapshots. Keep the approved field-specific trace exceptions. |
 | C4 | Ordinary accounts keep upstream 1.0 behaviour. Key accounts keep the existing refusals, including the unsupported credential, content-search, mail-sharing and JMAP-calendar operations, and the external-directory refusals and marker preservation (calendar spec 4.3). Keep upstream's OAuth expiry, grant-revocation and scope checks. |
 | C5 | Key-account mail is a stub plus a sealed blob, whatever wrote it. Every ordinary writer asserts the vault's absence in its effective commit. Every protected reader has the owner's keys or refuses; background work never acquires those keys. |
-| C6 | Calendar metadata and content are sealed or sanitized before serialization and derived indexing. No hidden property can reappear in metadata, alarms, notifications, dead properties or indexes, whether through a split or metadata-only write, through a background rewrite, or through a stored flag derived from it (for example `CLASS`). |
+| C6 | Calendar metadata and content are sealed or sanitized before serialization and derived indexing. No hidden property can reappear in metadata, alarms, notifications, dead properties or indexes, whether through a split or metadata-only write, through a background rewrite, or through a stored flag derived from it. Flags derived from visible properties are permitted: the alarm flags the calendar spec allows (sections 6 and 9) and, from field-policy version 2, `EVENT_PRIVATE` and `EVENT_SECRET`, derived from a visible `CLASS`. |
 | C7 | Sharing uses the current principal's keys, the current own-id permission and the authenticated ring identity. Keep the physical parent and link fences, conversion, future-write rotation, sync boundaries, pin-before-deliver, UID leases, SEQUENCE and delegated scheduling semantics. |
 | C8 | Search work for key mail keeps only the allowed arrival-time and size fields. Sealed calendar content and protected attachment text stay out of background indexes. Provisioning and deletion fences cover every new queue and commit segment. |
 | C9 | Keep upstream 1.0 stored types as supplied: add no fork fields to them, and hand-edit no generated registry schema or event enum. Keep the reserved Principal fields 150/151, the account flag `1 << 9` and the vanished collection 250, after checking each for collisions. |
@@ -170,25 +178,46 @@ event record. The store has this shape:
   CalendarEvent, AddressBook, ContactCard and FileNode.
 
 **Decision (parity by construction):** for a key account's calendars and events, seal
-exactly the unit upstream stores, in the store's common write and read path.
-- **Sealed unit:** the per-document container of a `Shared` or `Private{viewer}` entry,
-  names and values together, which matches 0.16, where the whole dead property was sealed.
-- **Key:** the calendar's collection key, for both classes. Every holder of the collection
-  key can read a grantee's `Private` entries. At 0.16 every dead property sat under that key
-  and `Private` did not exist, so this is no regression. Per-viewer secrecy among a
-  collection's members would need a new key purpose and its own review; it is out of scope.
-- **Marker:** a fork payload version byte marks a sealed container.
+exactly the unit upstream stores.
+- **Sealed unit:** the per-document container of a `Shared` entry, names and values
+  together, which matches 0.16, where the whole dead property was sealed. DAV writes only
+  `Shared` (`dead/patch.rs:190`; nothing under `crates/dav` calls `into_private_write`), and
+  the other writers of `Private` (IMAP METADATA, JMAP object metadata) are refused for key
+  accounts. So no `Private` container exists for a key account's calendar or event; a
+  change that lets one be written needs its own review.
+- **Key:** the calendar's collection key.
+- **Wrapper:** a sealed container is still a valid upstream container, because keyless
+  paths parse every container's header: `MetadataBuf::read` and `StoredMetadata::view`
+  (through `MetadataView::from_trusted`), `StoredContainer::new` (`view.kinds()`),
+  `containers_of`, `all_containers_of`, `container_kinds`, and the cleanup, purge and quota
+  paths. The header `[FORMAT_VERSION, kinds, count]` (`types/src/metadata/view.rs:62-69`)
+  must match the entries it holds, so the wrapper's header carries `MetadataKinds::DAV`
+  (the only kind DAV writes), and its one entry is a `Dav` entry under a fork-reserved
+  namespace and name. That entry's value holds the fork's payload version byte and then the
+  ciphertext of the original container, encoded so that both the trusted and the checked
+  parsers accept it. The presence derivation reads the same header and is unchanged.
+- **Seal and unseal sites:** DAV's consumers, which hold the request's keys. Seal `next` in
+  `dav/src/common/dead/patch.rs` before `into_write`. Unseal after `.view()` in
+  `dav/src/common/propfind/dead.rs` (`dead_properties`, `dead_property_names`) and in
+  `dav/src/common/dead/containers.rs` (`get`, `stored_entries`). Each is a one-line call
+  into a fork module. `common/src/storage/metadata/` and `store/src/write/metadata.rs`
+  stay upstream's and keyless.
+- **COPY and MOVE:** `DeadContainers::copy` rebuilds the destination's container from the
+  stored bytes (`dead/containers.rs:135-150`). The collection key differs between two
+  calendars, so the copy unseals under the source calendar's key and reseals under the
+  destination's, in `za_copy_move_event`'s path. Cross-account copies stay refused
+  (calendar spec section 8).
 - **Bookkeeping:** the `Viewer` and `Owner` records stay in upstream's format.
 - **Other object kinds:** a key account's address books, contacts and files keep their
   containers in the clear, as at 0.16 and upstream; those objects were never sealed for key
-  accounts. Mailboxes and Sieve scripts are reachable only through IMAP METADATA and JMAP
-  object metadata, which are refused.
-- **Leak rule:** every container of a key account's calendar or event document is sealed,
-  and the 12-byte bookkeeping records are permitted. It is not a name check: names are
-  never in keys.
+  accounts. Emails, mailboxes and Sieve scripts are reachable only through IMAP METADATA
+  and JMAP object metadata, which are refused.
+- **Leak rule:** a key account's calendar or event document has no `Private` container, and
+  each of its `Shared` containers is sealed; the 12-byte bookkeeping records are permitted.
+  It is not a name check: names are never in keys.
 
-DAV PROPPATCH and PROPFIND go through this path with the request's keys. Keep the extras
-codec only for the parts of the sealed content that still live in the content archive.
+Keep the extras codec only for the parts of the sealed content that still live in the
+content archive.
 
 IMAP METADATA and JMAP object metadata are refused for key accounts in this port.
 - **IMAP:** the refusal covers `GETMETADATA`, `SETMETADATA` and `LIST … RETURN (METADATA …)`
@@ -276,14 +305,42 @@ entries. Keep the rule and assert it.
 - `calendar/alerts.rs`'s `DefaultAlertsResolver`, which DAV GET and COPY run to add the
   calendar's default alerts to served events.
 
-They run on the unsealed view, with keys, and never in keyless code.
+They run on the unsealed view, with keys, and never in keyless code. The one exception is
+the privacy check, which reads the stored flags (below) wherever upstream reads them.
 
-**Privacy flags.** `EventPrivacy::from_flags` reads the metadata flags `EVENT_PRIVATE` and
-`EVENT_SECRET` (`calendar/mod.rs:149-150`), which encode `CLASS`, and the calendar spec
-seals `CLASS`. For a key account those flags are never persisted in the sanitized metadata
-row. They are derived on the keyed, unsealed view before upstream's filters run. Showing a
-classification in the clear would be a visibility-policy change, with its own version and
-acceptance criteria, not a porting detail.
+**Privacy flags.** 1.0.1 limits a non-owner's view of an event by its `CLASS`.
+`EventPrivacy` maps PUBLIC to public, CONFIDENTIAL to secret and any other value to private
+(`calendar/privacy.rs`). `refresh_from_content` stores the result as `EVENT_PRIVATE` or
+`EVENT_SECRET` in the metadata flags (`calendar/index.rs:247`), on every full write
+(`GroupwareWrite::full`). Fourteen DAV sites read those flags from the keyless resource
+cache (`dav/src/calendar/{copy_move,freebusy,get,mod,query}.rs`,
+`dav/src/common/{lock,propfind/dead,propfind/item,propfind/get}.rs`). Calendar spec
+revision 7 seals `CLASS`, so on a sealed tree the flags would stay clear, and the hiding
+would do nothing. 0.16.27 has no such hiding, for any account.
+
+**Decision (Jay, 2026-10-30):** sharers can hide events, and the operator may learn each
+event's classification. Calendar spec revision 8 adds field-policy version 2: `CLASS` is
+visible on event, task and journal components when its value is PUBLIC, PRIVATE or
+CONFIDENTIAL. Its parameters follow the level-3 rule, so an extension parameter on it is
+sealed. A `CLASS` with any other value stays sealed. Upstream's `refresh_from_content` then
+derives both flags from the stored, sealed tree on every write path, foreground or
+background, and upstream's filters read them unchanged. No fork code computes, overrides or
+re-derives the flags, so no write path can drift from the stored tree.
+- **Change:** one value-conditional entry in `groupware/src/calendar/seal/policy.rs` and
+  `POLICY_VERSION = 2`. Writers record 2. The unseal path accepts 1 and 2: a fresh 1.0 store
+  holds only version 2, but the version check stays.
+- **What the operator learns:** for each event component, whether it is public, private or
+  confidential, and when that changes.
+- **Limits:** a `CLASS` with an extension or other non-standard value stays sealed, so its
+  event is served to sharees as public, where upstream would treat it as private. Common
+  clients write only the three standard values. The hiding is enforced by the server, not by
+  the encryption: a grantee holds the collection key.
+- `EventPrivacy::may_be_set_by` and `set_privacy`, which stop a sharee from changing an
+  owner's classification, run on the unsealed view in the write path, before sealing.
+- **Acceptance:** the same sharee requests against a key account's shared calendar and an
+  ordinary account's give the same answers, for PUBLIC, PRIVATE, CONFIDENTIAL and a
+  non-standard value (the recorded limit aside). Every stored event's flags match its
+  `CLASS` after each kind of write.
 
 ### Mail writers and readers
 
@@ -338,9 +395,13 @@ pause hook. Then:
   `DmarcReportWindow` and `TlsReportWindow` are excluded.
 - **No terminal failure.** A failing partition retries with backoff capped at 30 minutes
   and never reaches a "failed" state (`index_queue/manager.rs:316-359`). So a queue entry
-  blocks provisioning until it drains. The operator's remedy for a stuck partition is the
-  `x:IndexQueueStatus` registry object (`jmap/src/registry/mapping/index_queue.rs`). It
-  replaces CLAUDE.md's failed-task remedy for index work.
+  blocks provisioning until it drains. `x:IndexQueueStatus/set`
+  (`jmap/src/registry/mapping/index_queue.rs:191-240`) resets a partition's retry state, so
+  it retries at once; it removes no entry. The operator's remedy is that reset for a
+  transient failure. For a permanent one (a document that fails to build every time), it
+  is deleting the document, whose entry then becomes an un-index, or deleting and
+  recreating the account, as for any account that setup refuses. This replaces CLAUDE.md's
+  failed-task remedy for index work.
 - **R58's vault-absence assertion** moves to the batch the worker commits, `account_batch`
   (`store/src/search/index.rs`), not to the queue entry, which the producer writes. The
   layering is the same as at 0.16. `store` cannot call into `common`, so the worker
@@ -356,10 +417,15 @@ population nor snapshot serialization and restoration may accept an unsealed res
 or `SessionKeys`. Test persistent file and blob snapshots and the shared codecs, including
 stale loaders racing provisioning and revocation.
 - The swap tier's registry default is `Disabled` (`CacheSwap::{Disabled, LocalFile, Redis,
-  BlobStore}`). The test server keeps that default, which matches upstream and the
-  baseline. The swap tests configure `LocalFile` under the server's temporary directory, and
-  `BlobStore` for the filesystem-blob run. They hand `Caches::parse`'s receiver to
-  `SwapTier::start`, as boot does.
+  BlobStore}`). The tier is built once, at boot (`Caches::parse` → `SwapTier::build`,
+  `common/src/config/inner.rs:125`), and `cache/reload.rs` does not rebuild it, so a running
+  server cannot change tiers. The za suite's server keeps the default, which matches
+  upstream and the baseline.
+- The swap tests are a suite function of their own (Jay's decision, 2026-10-30):
+  `za::cache_swap::cache_swap_tests` boots a server with `LocalFile` under its temporary
+  directory, then a second one with `BlobStore` on a filesystem blob store, each with
+  `cache.swap` set in its bootstrap. It hands `Caches::parse`'s receiver to
+  `SwapTier::start`, as boot does. CI runs it as its own step.
 - Redis and cluster operation remain unqualified. The central serialization and authority
   guards must not depend on which snapshot backend is selected.
 - Checksum framing named `seal` is not encryption and cannot satisfy this contract.
@@ -489,9 +555,11 @@ reduced form.
     outer function's record only constructs the future, and never counts. For a plain `fn`
     sub-test (for example `imap::body_structure::test`, `webdav::cal_itip::test`), the
     function's own record is the body.
-  - **The final region has a positive count.** This is the region that ends at the body's
-    closing brace. Since a failed assertion panics, reaching it means every assertion before
-    it passed.
+  - **The final region has a positive count.** This is the exit region at the body's
+    closing brace, whose start and end both lie on that brace. It is not the body's outer
+    region, which starts at the opening brace and counts entries, so it stays positive after
+    an early return. Since a failed assertion panics, reaching the exit region means every
+    assertion before it passed.
 
   Each call must execute in every mode where it did at 0.16.27, under the same rule. When
   Task 1 recomputes the baseline, it reports every sub-test that completed at 0.16.27 but

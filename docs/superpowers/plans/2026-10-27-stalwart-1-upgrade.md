@@ -19,9 +19,13 @@ configuration, the existing vault crypto, RocksDB, cargo-llvm-cov, the Python pr
 CalDAV harnesses, GitHub Actions.
 
 **Spec:** [Stalwart 1.0 fresh store upgrade design](../specs/2026-10-27-stalwart-1-upgrade-design.md),
-revision 4. Its C1–C11 contracts and the earlier approved feature designs remain binding.
+revision 5. Its C1–C11 contracts and the earlier approved feature designs remain binding,
+with the calendar spec at revision 8 (field-policy version 2).
 
-**Status:** Revision 4, proposed, 2026-10-30. It adopts both re-reviews of revision 3
+**Status:** Revision 5, proposed, 2026-10-30. It adopts
+[Fable's check of revision 4](../specs/2026-10-27-stalwart-1-upgrade-design-review-r4.md)
+and Jay's answers to its two questions; the Codex review's "Revision 4 re-review" found no
+new finding. Revision 4 adopted both re-reviews of revision 3
 ([Fable](../specs/2026-10-27-stalwart-1-upgrade-design-review-r3.md), and the "Revision 3
 re-review" section of the
 [Codex review](2026-10-27-stalwart-1-upgrade-codex-review-2026-10-30.md)) and Jay's answers
@@ -111,7 +115,7 @@ Crate paths abbreviated as `common/...`, `email/...` and similar below are relat
 | Integration | `Cargo.toml`, `Cargo.lock`, crate manifests, tag merge, conflict ledger | Primary coordinates; one assigned writer |
 | Harness | `tests/src/utils/{server,storage,cleanup}.rs`, `tests/src/lib.rs`, restored upstream unit tests (`*restored_tests.rs`), `test_mode` support; the fork's hooks in `types` and `store` far enough to compile (reserved fields and collection, `ZA_UID_LEASE_PREFIX`, `za_test.rs`, `has_account_search_terms`, R58's carrier type) | Task 2 |
 | Accounts | `crates/vault/`, `common/src/{auth,cache/principals.rs,ipc.rs,za/}`, HTTP auth/vault/contacts, protocol login handlers | Task 3 |
-| Calendars | `groupware/src/calendar/{seal,sharing,drain,fanout,delegation,pinning,sequence}`, the new `privacy`, `hidden`, `participants`, `overlap` and `notification` modules, scheduling, DAV (including `dav/src/common/propfind/`, which replaced `propfind.rs`, and `dav/src/common/dead/`), `common/src/storage/metadata/`, HTTP shares | Task 4 |
+| Calendars | `groupware/src/calendar/{seal,sharing,drain,fanout,delegation,pinning,sequence}`, the new `privacy`, `hidden`, `participants`, `overlap` and `notification` modules, scheduling, DAV (including `dav/src/common/propfind/`, which replaced `propfind.rs`, and `dav/src/common/dead/`), HTTP shares | Task 4 |
 | Mail | `email/src/message/{za,metadata,ingest}`, mail readers/writers in IMAP/POP3/JMAP/SMTP and tracing; `imap/src/op/fetch/` (replaced `fetch.rs`) and `imap/src/core/view.rs` (replaced `core/message.rs`); `spam-filter/src/analysis/llm.rs`'s hook, now in the SEL-only `common/src/enterprise/ai/` (a disposition, not a port) | Task 5 |
 | Background | `services/src/index_queue/`, `task_manager/tasks/{grantee_cleanup,rebuild_shares}`, `store/src/{search,write}`, `common/src/cache/{large,swap}`, `jmap/src/api/metadata/`, `imap/src/op/metadata/` | Task 6 |
 | Coverage | Existing za and protocol tests, `tests/qualification/`, inventory and coverage tooling, the expectation ledger | Task owners; Task 7 integrates |
@@ -162,7 +166,8 @@ checkpoint.
     counts:
     - the body record: the async body's own record for an `async fn`, never the outer
       constructor record; the function's own record for a plain `fn`;
-    - the body's final region, the region that ends at the body's closing brace.
+    - the body's final region: the exit region whose start and end both lie on the body's
+      closing brace, not the outer region that starts at the opening brace.
 
     Recompute this from the stored region-level exports in `coverage/steps/*.json`; the
     baseline's `subtests-ran.json` used a permissive rule. Report every sub-test that
@@ -228,8 +233,9 @@ cache sites (`tests/src/utils/server.rs:362` and `:592`) to 1.0.1's
 `let (cache, swap_rx) = Caches::parse(&mut bootstrap, &core.storage).await`, and hands the
 receiver to `SwapTier::start(&inner, swap_rx)` as boot does
 (`common/src/manager/boot.rs:158, 225`). The registry default for `cache.swap` is `Disabled`,
-and the test server keeps it. Task 6's swap tests configure `LocalFile` under the server's
-temporary directory, and `BlobStore` for the filesystem-blob run.
+and the test server keeps it. The tier is fixed at boot, so `TestServerBuilder` takes the
+swap setting as a bootstrap option for Task 6's own swap suite (`cache_swap_tests`), which
+boots one server per tier.
 
 - [ ] Keep `crates/vault` and `tests` as workspace members alongside new upstream crates;
   accept removal of `crates/migration` without inventing a fork migration replacement.
@@ -365,7 +371,6 @@ establish C1–C4.
 - scheduling;
 - the DAV handlers, including `dav/src/common/propfind/` (which replaced `propfind.rs` and
   its 15 fork call sites), `dav/src/common/dead/` and `dav/src/calendar/{view,filter}.rs`;
-- `common/src/storage/metadata/`;
 - `http/src/api/shares.rs`, the contacts redelivery integration, and the relevant common
   storage builders.
 
@@ -379,24 +384,51 @@ sharing_move_atomic,sharing_races,sharing_review,sharing_tombstones}.rs`, seal/s
 
 - [ ] Add `split_metadata_only_update_keeps_sealed_content`: update an allowed metadata
   property, read back as owner/grantee, and scan both rows/indexes for protected canaries.
-  Preserve the stored-version identity of read-only views.
+  Include a PROPPATCH whose dead-property write flips a presence bit, which
+  `rewrite_presence` applies to the event's metadata archive through a store-side merge
+  (`groupware/src/metadata/mod.rs:40-60`), and scan that row afterwards. Preserve the
+  stored-version identity of read-only views.
 - [ ] Port the sealed tree, extras and collection codecs. Seal and sanitize before the
   builders compute derived values, and never index an unsealed read view.
 - [ ] Seal key-account dead properties in upstream's metadata store (design: "Dead
-  properties and object metadata"). Do this in the common write and read path of
-  `common/src/storage/metadata/`, which `dav/src/common/dead/` uses. Do not add a fork path.
+  properties and object metadata").
   - **Sealed unit:** for a key account's calendars and events, the per-document container
-    of a `MetadataClass::Shared` or `Private{viewer}` entry, names and values together,
-    sealed under the calendar's collection key. A fork payload version byte marks it.
+    of a `MetadataClass::Shared` entry, names and values together, sealed under the
+    calendar's collection key. DAV writes only `Shared` (`dead/patch.rs:190`), and the other
+    writers of `Private` are refused for key accounts, so no `Private` container exists.
+  - **Wrapper:** the sealed container stays a valid upstream container, since keyless code
+    parses every container's header (`types/src/metadata/view.rs:62-69`, which also checks
+    that the header's kinds equal the entries'). Its header carries `MetadataKinds::DAV`,
+    and its one entry is a `Dav` entry (`EntryKind::Dav`, `view.rs:111-135`) under a
+    fork-reserved namespace and name. The entry's value holds the fork's payload version
+    byte, then the ciphertext of the original container, in an encoding that both
+    `MetadataView::from_trusted` and the checked validator accept. Fix the encoding in
+    this checkpoint's reviewed interface sheet.
+  - **Sites:** seal `next` in `dav/src/common/dead/patch.rs` (`prepare`) before
+    `change.into_write(…)`. Unseal after `.view()` in `dav/src/common/propfind/dead.rs`
+    (`dead_properties`, `dead_property_names`) and `dav/src/common/dead/containers.rs`
+    (`get`, `stored_entries`). Each site is a one-line call into a fork module.
+    `common/src/storage/metadata/` and `store/src/write/metadata.rs` stay upstream's and
+    keyless; they have no keys to seal with.
+  - **COPY and MOVE:** `DeadContainers::copy` builds the destination's container from the
+    source's stored bytes (`dead/containers.rs:135-150`). In `za_copy_move_event`'s path,
+    unseal under the source calendar's key and reseal under the destination's before the
+    copy is built.
   - **Not sealed:** the `Viewer{viewer}` and `Owner{owner}` records are upstream's 12-byte
     `ViewerState` counters and stay in upstream's format. A key account's address books,
     contacts and files keep their containers in the clear, as at 0.16.
   - **Keys** hold only ids (`store/src/write/key.rs:589-608`), so nothing about a property's
     name is exposed.
-  - **Tests:** add round trips for custom XML properties (including a sensitive namespace
-    and name), colour, order and a corrupted sealed container, as owner and as grantee.
-    Add a check that `Viewer` and `Owner` counters still decode and merge after sealed
-    writes. Fix the payload format in this checkpoint's reviewed interface sheet.
+  - **Tests:**
+    - keyed round trips, as owner and as grantee, for custom XML properties (including a
+      sensitive namespace and name), colour, order and a corrupted sealed container;
+    - a COPY and a MOVE of an event with dead properties between two calendars of the
+      account, then a PROPFIND at the destination;
+    - the `Viewer` and `Owner` counters still decode and merge after sealed writes;
+    - keyless paths over sealed containers: `MetadataBuf::read`, `container_kinds` and
+      `metadata_used_quota`; deleting an event and a calendar that hold sealed containers
+      (`container_cleanup_from`); destroying the account (`destroy_owner_metadata`,
+      `purge_private_metadata`). Each runs without keys and without error.
 - [ ] Per-user event data: keep the 0.16 rule (calendar spec, table near line 717). These
   preferences are JMAP-only, and JMAP calendars are refused for key accounts. Assert that a
   key account's `CalendarEventContent.preferences` stays empty through DAV PUT, COPY, MOVE,
@@ -411,14 +443,28 @@ sharing_move_atomic,sharing_races,sharing_review,sharing_tombstones}.rs`, seal/s
   - `alerts.rs`'s `DefaultAlertsResolver`, run by DAV GET and COPY (`dav/src/calendar/get.rs:180`,
     `copy_move.rs:682, 726, 987, 1032`).
 
-  Each runs on the unsealed view with keys and never in keyless code.
-- [ ] Keep `CLASS` sealed. For a key account, never persist `EVENT_PRIVATE` or
-  `EVENT_SECRET` (`calendar/mod.rs:149-150`) in the sanitized metadata row: they encode
-  `CLASS`. Derive `EventPrivacy` on the keyed, unsealed view before upstream's filters run.
-  Add two tests:
-  - a grantee-side test of `CLASS:PRIVATE` and `CLASS:CONFIDENTIAL` on a shared sealed
-    calendar;
-  - a store scan showing that neither flag is set on any stored row of the key account.
+  Each runs on the unsealed view with keys and never in keyless code, except the privacy
+  check: the DAV sites read `EVENT_PRIVATE`/`EVENT_SECRET` from the resource cache, as
+  upstream does (next item).
+- [ ] Field-policy version 2 (design: "Privacy flags"; calendar spec revision 8, Jay's
+  decision): make `CLASS` visible in `seal/policy.rs` on `VEVENT`, `VTODO` and `VJOURNAL`
+  when its value is `ICalendarClassification::{Public, Private, Confidential}`. Any other
+  value stays sealed, and its parameters follow the level-3 rule. Set `POLICY_VERSION = 2`;
+  the unseal path accepts 1 and 2. Upstream's `refresh_from_content`
+  (`calendar/index.rs:247`) then derives the two flags from the stored tree; add no fork
+  code that computes or overrides them. Update the allowlist units
+  (`event_allowlist_matches_spec_section_6` lists `Class` as sealed today) and the leak
+  scanner's allowlist. Add these tests:
+  - a differential sharee test: the same GET, PROPFIND, REPORT (calendar-query and
+    multiget), free-busy, COPY and LOCK requests by a sharee against a key account's shared
+    calendar and an ordinary account's, for events with `CLASS:PUBLIC`, `CLASS:PRIVATE` and
+    `CLASS:CONFIDENTIAL`, give the same status codes and the same served properties; the
+    owner sees all three in full;
+  - a store scan: each stored event's `EVENT_PRIVATE`/`EVENT_SECRET` bits match its `CLASS`
+    after a PUT, a PROPPATCH, a COPY, a MOVE, a drain import and merge, and a sharee's
+    write, and after a `CLASS` change from PRIVATE to PUBLIC;
+  - the recorded limit: an event with `CLASS:X-SOMETHING` stores the value sealed, keeps
+    both bits clear, and is served to the sharee in full.
 - [ ] Port all physical event/link assertions, assigned parent/document identity, conversion
   chunks, rollback/reconversion, ring cache identity and fresh own-id grant admission.
   Reuse the existing deterministic races instead of replacing assertions with cache hints.
@@ -499,7 +545,8 @@ unsealing or refusal boundary. No single-message-only guard is left around a gro
 - `imap/src/op/metadata/` and capabilities.
 
 Tests: `tests/src/za/{index_task,leak,gating,disabled}.rs`, `mail/{search,fence,traces}.rs`;
-proposed `tests/src/za/cache_swap.rs`.
+proposed `tests/src/za/cache_swap.rs`, a suite function of its own (`cache_swap_tests`),
+outside `za_tests`.
 
 **Interfaces:**
 - Retain C8 through the new `IndexDocument` builders, the queue and reindex, and
@@ -524,11 +571,14 @@ proposed `tests/src/za/cache_swap.rs`.
     Keep R54's position in the fence order.
   - **No terminal failure:** a failing partition retries with backoff capped at 30 minutes
     and never fails terminally (`index_queue/manager.rs:316-359`). So a queue entry blocks
-    provisioning until it drains. The operator's remedy for a stuck partition is
-    `x:IndexQueueStatus/set` (`jmap/src/registry/mapping/index_queue.rs`); Task 9 replaces
-    CLAUDE.md's failed-task remedy for index work with it. Add a test: a partition held in
-    retry blocks setup with the existing 409, and clearing it through
-    `x:IndexQueueStatus/set` lets setup proceed.
+    provisioning until it drains. `x:IndexQueueStatus/set`
+    (`jmap/src/registry/mapping/index_queue.rs:191-240`) resets the partition's retry state
+    so that it retries at once; it removes no entry. The remedy is that reset for a
+    transient failure, and deleting the offending document (or the account) for a permanent
+    one. Task 9 puts this in CLAUDE.md in place of the failed-task remedy for index work.
+    Add a test with a fault hook that fails a document's index build once: the partition in
+    retry blocks setup with the existing 409; after `x:IndexQueueStatus/set`, the retry
+    succeeds, the entry drains and setup proceeds.
   - **R58:** the vault-absence assertion goes on `account_batch`'s write
     (`store/src/search/index.rs`), the batch the worker commits. It does not go on the queue
     entry, which the producer writes. The worker (`index_queue/index.rs`) attaches it through
@@ -568,7 +618,12 @@ proposed `tests/src/za/cache_swap.rs`.
   - Integrate both tasks with the Task 4 resolver and ring authority, and make their
     completion observable to the Task 2 drain helper.
 - [ ] Add `swap_roundtrip_contains_no_protected_canary` and
-  `swap_restore_after_revoke_cannot_restore_access`. Exercise file and blob snapshots with
+  `swap_restore_after_revoke_cannot_restore_access` to `cache_swap_tests`, a suite function
+  of its own: the tier is built once in `Caches::parse` and `cache/reload.rs` does not
+  rebuild it, so the za suite's server cannot switch to it (Jay's decision, 2026-10-30). The
+  suite boots its own `TestServer` with `cache.swap` set to `LocalFile` under its temporary
+  directory, then another set to `BlobStore` with `BLOB_STORE=FileSystem`, and runs both
+  cases on each. Exercise file and blob snapshots with
   cache eviction, fresh loads, provisioning/revocation races and process-independent decode.
   Scan decoded frames/archives as well as raw files; compression is not a privacy control.
 - [ ] Trace all snapshot population, serialization, load and invalidation inputs. Prevent
@@ -590,9 +645,11 @@ proposed `tests/src/za/cache_swap.rs`.
   - `SearchDocument` (`m`): arrival time and size only;
   - `Immutable` (`c`), `IndexProperty` (`v`) and `System` (`u`): a rule for each from the
     source, before the scanner treats them as clean;
-  - `Collection::Metadata`: every container of a key account's calendar or event document
-    is sealed, and the 12-byte `Viewer`/`Owner` counters are permitted. This is not a name
-    check, because names are never in keys.
+  - `Collection::Metadata`: a key account's calendar or event document has no `Private`
+    container, each of its `Shared` containers is a sealed wrapper, and the 12-byte
+    `Viewer`/`Owner` counters are permitted. This is not a name check, because names are
+    never in keys;
+  - calendar trees: `CLASS` is permitted only with a standard value (field-policy version 2).
 
   Key the rules on the `Subspace` enum, not on bytes, since `m`, `y` and `u` changed
   meaning.
@@ -626,7 +683,9 @@ and `scripts/tests/check_coverage.py`; the expectation ledger in the outcome not
   - **"Executed"** means both of these have positive counts in that step's export:
     - the sub-test's body record: for an `async fn`, the async body's own record, whose
       first region starts after the signature; for a plain `fn`, the function's own record;
-    - that body's final region: the region that ends at the body's closing brace.
+    - that body's final region: the exit region whose start and end both lie on the
+      body's closing brace. The body's outer region also ends there but starts at the
+      opening brace and counts entries, so it does not qualify.
 
     The outer record of an `async fn` only constructs the future, and never counts; neither
     do declared modules. Compare against the baseline recomputed under the same rule
@@ -693,6 +752,7 @@ it explicitly for plain rows. Use separate processes sequentially.
 | Vault and groupware | `cargo test -p vault -p groupware --features vault/test_mode` |
 | ZA | `cargo test -p tests za::za_tests -- --exact --nocapture`, and the leak scanner's unit test `za::leak::tests::try_archive_short_values_are_not_archives -- --exact` |
 | ZA filesystem blobs | The same ZA command with `BLOB_STORE=FileSystem` |
+| ZA cache swap | `cargo test -p tests za::cache_swap::cache_swap_tests -- --exact --nocapture` (its own `LocalFile` and `BlobStore` servers) |
 | CalDAV plain/key | `cargo test -p tests webdav::webdav_tests -- --exact --nocapture`, twice; and `webdav::cal_query::` |
 | IMAP plain/key | `cargo test -p tests imap::imap_tests -- --exact --nocapture`, twice |
 | JMAP plain/key | `cargo test -p tests jmap::jmap_tests -- --exact --nocapture`, twice |
@@ -742,7 +802,8 @@ conversion mode and refuses a pre-existing data directory supplied as a fresh ta
   - `unit-tests` (with its feature list re-derived for 1.0's workspace);
   - `upstream-suites`;
   - `zero-access`, with its embedded and filesystem blob runs, the plain and key protocol
-    steps, the vault `test_mode` step and the leak-scanner step;
+    steps, the vault `test_mode` step and the leak-scanner step, plus a new step for
+    `cache_swap_tests`;
   - the independent CalDAV jobs.
 
   Then add two jobs: the inventory and coverage gates, and the fresh OSS restart. Upload
@@ -768,8 +829,13 @@ coverage.
 fork release contract. The preview is `0.2.0-beta.1` (Jay confirmed on 2026-10-30). After
 full integration, the upstream metadata becomes the pinned 1.0.1 tag and SHA. CLAUDE.md's
 package selectors become `-p http@1.0.1`. Its provisioning remedy for index work changes
-from destroying failed tasks to clearing a stuck partition with `x:IndexQueueStatus/set`;
-the failed-task remedy stays for the task types that still exist.
+from destroying failed tasks to resetting a partition's retry state with
+`x:IndexQueueStatus/set` for a transient failure, and deleting the offending document or
+the account for a permanent one; the failed-task remedy stays for the task types that still
+exist. CLAUDE.md's zero-access section also records field-policy version 2 (`CLASS`
+visible with a standard value) and the `cache_swap_tests` suite. The key-account web page's
+claims (`~/Development/circulo-account`, outside this repository) need the same `CLASS`
+change; note it for Jay rather than editing that repository.
 
 - [ ] Update base/version-specific developer commands, schema/fresh-store instructions and
   package disambiguation. Explain unsupported old stores and separate fork/upstream
@@ -875,3 +941,25 @@ Findings of the [Fable re-review](../specs/2026-10-27-stalwart-1-upgrade-design-
 | F3-L8: slot wording | Adopted. |
 | F-M8's stop clause | Removed: no DAV path writes event preferences at 1.0.1 (F3 verdict). |
 | R62 and R63 | Settled as "subject deleted": `account_batch` has no commit point (F3 verdict on F-M5). |
+
+## Review dispositions (revision 5)
+
+Findings of [Fable's check of revision 4](../specs/2026-10-27-stalwart-1-upgrade-design-review-r4.md)
+(R4). The Codex review's "Revision 4 re-review" confirmed no new finding; its note on
+`x:IndexQueueStatus/set` is R4-L1. Fable's three partly resolved revision 3 verdicts are
+closed by the rows named: R3-H1 by R4-M1 to M3, R3-M5 by R4-M4, C3-2 by R4-H1.
+
+| Finding | Disposition |
+|---|---|
+| R4-H1: the privacy flags are read from the keyless resource cache, not a keyed view | Adopted, as a visibility-policy change (Jay's answer to question 1: sharers can hide events; the operator may learn each event's classification). Calendar spec revision 8 adds field-policy version 2: `CLASS` is visible with a standard value, and upstream derives and reads the flags unchanged. Non-standard values stay sealed (recorded limit). C6 amended. Design "Privacy flags"; Task 4 (differential sharee test, flag scan); Task 6 (leak rule); Task 9 (CLAUDE.md, the account page's claims). |
+| R4-M1: the sealed container must parse as an upstream container | Adopted: a valid container with `MetadataKinds::DAV` in its header and one `Dav` entry under a fork-reserved name, the version byte and ciphertext in its value. Design "Dead properties"; Task 4. |
+| R4-M2: the seal sites are DAV's consumers | Adopted: seal in `dead/patch.rs` before `into_write`, unseal in `propfind/dead.rs` and `dead/containers.rs`; `common/src/storage/metadata/` stays upstream's and leaves Task 4's files. Design; Task 4. |
+| R4-M3: COPY/MOVE copies container bytes | Adopted: unseal under the source calendar's key and reseal under the destination's in `za_copy_move_event`'s path, with COPY and MOVE round trips. Design; Task 4. |
+| R4-M4: the swap tier is fixed at boot | Adopted (Jay's answer to question 2): `cache_swap_tests` is its own suite function, one server per tier, with its own CI step. Design "Cache snapshots"; Tasks 2, 6 and 8. |
+| R4-L1: `x:IndexQueueStatus/set` resets, it does not remove | Adopted: reset for a transient failure; delete the document or the account for a permanent one; the test uses a fail-once hook. Design; Tasks 6 and 9. |
+| R4-L2: C6 forbade the alarm-flag exception | Adopted: C6 permits flags derived from visible properties, the alarm flags and, from policy version 2, the classification flags. |
+| R4-L3: `Private` cannot exist for key accounts | Adopted: stated, the leak rule requires no `Private` container and every `Shared` one sealed, and Email joins the refused-only kinds. Design; Tasks 4 and 6. |
+| R4-L4: the presence rewrite | Adopted: `split_metadata_only_update_keeps_sealed_content` includes a PROPPATCH that flips a presence bit. Task 4. |
+| R4-L5: "region that ends at the closing brace" | Adopted: the exit region whose start and end lie on the brace, not the outer region. Design "Gates"; Tasks 1 and 7. |
+| R4-L6: keyless paths untested | Adopted: keyless reads, deletes, account destruction and quota over sealed containers. Task 4. |
+| Stopping rule | One high finding (R4-H1) was a policy choice, now made. By Jay's answer, one narrow check covers the lines revision 5 changes, then reviews stop. |

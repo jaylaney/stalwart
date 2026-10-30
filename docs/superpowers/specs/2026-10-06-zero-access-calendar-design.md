@@ -1,6 +1,7 @@
 # Zero-access calendar: design spec
 
-Date: 2026-10-06. Status: revision 7, approved. Scope: release 1 of the
+Date: 2026-10-06. Status: revision 8; revisions 1–7 approved, revision 8
+proposed with the Stalwart 1.0 upgrade design. Scope: release 1 of the
 zero-access fork of Stalwart (`jaylaney/stalwart`, upstream
 `stalwartlabs/stalwart`, base commit 3f657330, Stalwart 0.16.25).
 
@@ -27,7 +28,13 @@ authentication as the second invariant 9 exception (section 8.2), the
 Traces paragraph (section 10), the HTTP trace redactions as further
 invariant 9 exceptions (section 12), and in the section 9 table the
 `ParticipantIdentity/changes` answer, the mail index of key accounts and
-the contents of the generic alarm email.
+the contents of the generic alarm email. Revision 8 (2026-10-30) records
+Jay's decision for the Stalwart 1.0 port
+(`2026-10-27-stalwart-1-upgrade-design.md`, "Privacy flags"): sharers can
+hide events by CLASS, as upstream 1.0 lets them, and the operator may learn
+each event's classification. Field-policy version 2 makes CLASS visible
+when its value is PUBLIC, PRIVATE or CONFIDENTIAL (sections 2 and 6). It
+takes effect with the 1.0 port; until then the fork writes version 1.
 
 ## 1. Purpose
 
@@ -112,10 +119,13 @@ plaintext size of each event, the type name of every component including `X-`
 components, which components carry a sealed bundle and the size class of each
 bundle (a multiple of 256 bytes), free text that sits in visible slots (TZID
 values, `X-` values of STATUS and TRANSP, and `X-` parts of RRULE), ETags and
-sync history, and account metadata such as login times.
+sync history, and account metadata such as login times. From field-policy
+version 2: the classification of each event, task and journal component when
+it is PUBLIC, PRIVATE or CONFIDENTIAL, which upstream's privacy flags encode.
 
 **Sealed:** titles, descriptions, locations, geo, URLs, attendees,
-organizers, categories, comments, attachments, conference links, class,
+organizers, categories, comments, attachments, conference links, a class
+with any other value (and, under policy version 1, every class),
 priority, colours, calendar names and descriptions, every extension property,
 every extension parameter, and comments, names and extensions inside
 timezone definitions.
@@ -477,7 +487,9 @@ the request timeout. Tokens built for background tasks have none.
 
 ## 6. Field policy
 
-Policy version 1. Visibility is an **allowlist at three levels**:
+Policy version 1, and version 2 from the Stalwart 1.0 port (revision 8),
+which differs from version 1 only in CLASS (below). Visibility is an
+**allowlist at three levels**:
 components, properties, and parameters of visible properties. Anything not
 listed is sealed, including extension properties and extension parameters.
 The policy applies to every iCalendar tree the server stores: events, tasks,
@@ -489,6 +501,15 @@ TRANSP, DTSTAMP, CREATED, LAST-MODIFIED. UID is visible on every
 component, not only these: also on VALARM, VTIMEZONE, STANDARD, DAYLIGHT,
 VFREEBUSY and the VCALENDAR root, because events already expose their UIDs
 and components are indexed by UID.
+
+**CLASS (policy version 2):** visible in event, task and journal components
+when its value is PUBLIC, PRIVATE or CONFIDENTIAL; its parameters follow the
+rule for visible properties below. A CLASS with any other value is sealed.
+Upstream derives the flags its privacy filters read from the stored tree, so
+sharers see an event as its classification allows. A sealed non-standard
+CLASS leaves the event public to sharees, where upstream would treat it as
+private; this is a recorded limit. The hiding is enforced by the server: a
+grantee holds the collection key.
 
 **Visible properties in alarm components:** TRIGGER, ACTION, REPEAT,
 DURATION. The precomputed "is email alarm" flag is visible.
@@ -518,7 +539,8 @@ offsets and ACL list.
 
 **Sealed:** every other property of every component (SUMMARY, DESCRIPTION,
 LOCATION, GEO, URL, ATTENDEE, ORGANIZER, CATEGORIES, COMMENT, CONTACT,
-RESOURCES, ATTACH, RELATED-TO, CLASS, PRIORITY, COLOR, CONFERENCE, IMAGE,
+RESOURCES, ATTACH, RELATED-TO, CLASS (under policy version 2, only with a
+non-standard value), PRIORITY, COLOR, CONFERENCE, IMAGE,
 STRUCTURED-DATA, all `X-` properties except the two timezone names above,
 alarm SUMMARY, DESCRIPTION and ATTENDEE, timezone TZNAME and TZURL), every
 non-listed parameter, the event's WebDAV display name and dead properties,
