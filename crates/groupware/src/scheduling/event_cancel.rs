@@ -5,11 +5,7 @@
  */
 
 use crate::scheduling::{
-<<<<<<< HEAD
-    InstanceId, ItipError, ItipMessage, ItipSnapshots, ItipSummary,
-=======
-    Email, InstanceId, ItipError, ItipMessage, ItipSummary,
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+    Email, InstanceId, ItipError, ItipMessage, ItipSnapshots, ItipSummary,
     attendee::attendee_decline,
     itip::{itip_add_tz, itip_build_envelope},
     recipient::{RecipientPolicy, itip_messages_per_recipient},
@@ -39,9 +35,17 @@ pub fn itip_cancel(
 ) -> Result<Vec<ItipMessage<ICalendar>>, ItipError> {
     // Prepare iTIP message
     let itip = itip_snapshot(ical, account_emails, false)?;
-    itip_cancel_from_snapshot(ical, itip, is_deletion)
+    let message = itip_cancel_from_snapshot(ical, itip, is_deletion)?;
+    if message.from_organizer {
+        itip_messages_per_recipient(vec![message], policy)
+    } else {
+        Ok(vec![message])
+    }
 }
 
+/// `itip_cancel`'s message from a snapshot the caller built, before upstream's
+/// per-recipient split: the delegated scheduling path (sharing spec, SENT-BY)
+/// routes from its own snapshot and splits, or not, itself.
 pub(crate) fn itip_cancel_from_snapshot(
     ical: &ICalendar,
     itip: ItipSnapshots<'_>,
@@ -87,16 +91,13 @@ pub(crate) fn itip_cancel_from_snapshot(
             // Add timezones
             itip_add_tz(&mut message, ical);
 
-            itip_messages_per_recipient(
-                vec![ItipMessage {
-                    to: recipients.into_iter().map(str::to_string).collect(),
-                    summary: ItipSummary::Cancel(instance.build_summary(None, &[])),
-                    from: itip.organizer.email.email,
-                    from_organizer: true,
-                    message,
-                }],
-                policy,
-            )
+            Ok(ItipMessage {
+                to: recipients.into_iter().map(str::to_string).collect(),
+                summary: ItipSummary::Cancel(instance.build_summary(None, &[])),
+                from: itip.organizer.email.email,
+                from_organizer: true,
+                message,
+            })
         } else {
             Err(ItipError::NothingToSend)
         }
@@ -135,7 +136,7 @@ pub(crate) fn itip_cancel_from_snapshot(
 
             email_rcpt.insert(&itip.organizer.email.email);
 
-            Ok(vec![ItipMessage {
+            Ok(ItipMessage {
                 from: from.to_string(),
                 from_organizer: false,
                 to: email_rcpt.into_iter().map(|e| e.to_string()).collect(),
@@ -144,7 +145,7 @@ pub(crate) fn itip_cancel_from_snapshot(
                     current: itip.build_instances_summary(&declined_instances, None, &[]),
                 },
                 message,
-            }])
+            })
         } else {
             Err(ItipError::NothingToSend)
         }

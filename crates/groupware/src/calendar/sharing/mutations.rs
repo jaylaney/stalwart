@@ -108,8 +108,9 @@ pub struct ZaShareApplied {
 /// Fresh registry classification; a stale directory cache cannot keep a dead grant alive.
 pub async fn za_share_key_account(server: &Server, account_id: u32) -> trc::Result<bool> {
     Ok(server.registry().get(ObjectId::new(ObjectType::Account, Id::from(account_id))).await?
-        .is_some_and(|object| matches!(object.inner, ObjectInner::Account(Account::User(user))
-            if user.password_credential().is_some_and(|credential| credential.secret == vault::ZA_MARKER))))
+        .is_some_and(|object| matches!(object.inner, ObjectInner::Account(account)
+            if matches!(account.as_ref(), Account::User(user)
+                if user.password_credential().is_some_and(|credential| credential.secret == vault::ZA_MARKER)))))
 }
 
 pub async fn za_share_precheck(
@@ -425,10 +426,7 @@ pub async fn za_share_apply(
         .collect::<Result<Vec<_>, SealError>>()?;
     let entries = calendar.preferences.clone();
     za_replace_calendar_entries(&mut calendar, keys.account_id, calendar_id, entries, acls)?;
-    let changed_by = server
-        .account_info(keys.account_id)
-        .await?
-        .account_tenant_ids();
+    let changed_by = server.account_info(keys.account_id).await?.changed_by();
     let mut batch = BatchBuilder::new();
     context.assert_in(&mut batch);
     guards.assert_in(&mut batch);
@@ -445,7 +443,7 @@ pub async fn za_share_apply(
     server.notify_task_queue();
     if new_grant.is_some() {
         applied.boundary_commit = Some(ZaBoundaryCommit {
-            change_id: committed.last_change_id(keys.account_id)?,
+            change_id: committed.last_change_id(keys.account_id, SyncCollection::Calendar),
         });
     }
     applied.affected_grantees.sort_unstable();

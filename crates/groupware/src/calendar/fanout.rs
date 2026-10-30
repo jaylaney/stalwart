@@ -58,20 +58,21 @@
 //!
 //! Ahead of phase 1, unless the fan-out is a deletion, a clone of the
 //! sender's tree and the messages are reconciled (spec 5.1,
-//! `sequence::za_reconcile_sequences`); the phases build from that clone,
+//! `sequence_floor::za_reconcile_sequences`); the phases build from that clone,
 //! and the committed values return for `za_set_sequences`.
 
 use crate::{
+    SizeWriter,
     calendar::{
-        CalendarEventNotification, ChangedBy, EVENT_NOTIFICATION_ZA_PENDING,
+        ChangedBy,
         delegation::{ZaDelegationResolution, ZaResolvedAccount},
         drain::instance_key,
         pinning::{za_decline_all, za_full_request_for, za_participation_replies},
-        seal::{TOKEN_LEN, TokenPairs, seal_error, seal_pending_item},
-        sequence::{ZaSequence, za_reconcile_sequences},
+        seal::{TOKEN_LEN, TokenPairs, item::sealed_item_record, seal_error, seal_pending_item},
+        sequence_floor::{ZaSequence, za_reconcile_sequences},
     },
     scheduling::{
-        Email, ItipMessage, ical_size,
+        Email, ItipMessage,
         inbound::itip_method,
         itip::{
             ITIP_STATUS_DELIVERED, ITIP_STATUS_DELIVERY_FAILED, ITIP_STATUS_INVALID_USER,
@@ -138,10 +139,10 @@ pub struct ZaFanOutResult {
 /// DELETE built from the unsealed stored event (spec 5.5), with what the
 /// fan-out needs from that event.
 pub struct ZaDeleteMessage {
-    /// `itip_cancel`'s message; `None` when it builds nothing, since an
-    /// attendee's DELETE enters the fan-out even then (key pinning spec
-    /// 5.1 item 2).
-    pub message: Option<ItipMessage<ICalendar>>,
+    /// `itip_cancel`'s messages, after upstream's per-recipient split;
+    /// `None` when it builds nothing, since an attendee's DELETE enters the
+    /// fan-out even then (key pinning spec 5.1 item 2).
+    pub messages: Option<Vec<ItipMessage<ICalendar>>>,
     /// The stored event's token pairs.
     pub pairs: Option<TokenPairs>,
     /// The unsealed stored tree.
@@ -1357,7 +1358,7 @@ async fn write_item_inner(
     fence: Option<&ZaUidLease>,
 ) -> trc::Result<bool> {
     // Step 5: the two checks upstream's ingest makes.
-    let size = ical_size(message);
+    let size = SizeWriter::ical(message);
     if size >= server.core.groupware.itip_inbound_max_ical_size {
         return Ok(false);
     }
@@ -1372,10 +1373,7 @@ async fn write_item_inner(
         .await
     {
         Ok(_) => {}
-        Err(err)
-            if err.matches(trc::EventType::Limit(trc::LimitEvent::Quota))
-                || err.matches(trc::EventType::Limit(trc::LimitEvent::TenantQuota)) =>
-        {
+        Err(err) if err.matches(trc::EventType::Limit(trc::LimitEvent::Quota)) => {
             return Ok(false);
         }
         Err(err) => return Err(err.caused_by(trc::location!())),
@@ -1384,32 +1382,26 @@ async fn write_item_inner(
     let mut tree = message.clone();
     seal_pending_item(&mut tree, recipient_id, public_key, pair, reply_token)
         .map_err(|err| seal_error(err, recipient_id, u32::MAX))?;
-    // Step 4: the item, its own batch in the recipient's account.
-    let document_id = server
-        .store()
-        .assign_document_ids(recipient_id, Collection::CalendarEventNotification, 1)
-        .await
-        .caused_by(trc::location!())?;
+    // Step 4: the item, its own batch in the recipient's account. At 1.0 its
+    // record is built without plaintext (`sealed_item_record`, upgrade
+    // ruling 13) and its id is reserved in the batch itself.
     #[cfg(feature = "test_mode")]
     common::za::test_hooks::fan_out_pause_point(recipient_id).await;
+    let (item, content) = sealed_item_record(tree, ChangedBy::PrincipalId(sender_id), None, true);
     let mut batch = BatchBuilder::new();
     // Ahead of the insert: the assertion and the insert share the batch's
     // first commit point.
     if let Some(fence) = fence {
         fence.assert_in(&mut batch);
     }
-    CalendarEventNotification {
-        event: tree,
-        event_id: None,
-        changed_by: ChangedBy::PrincipalId(sender_id),
-        flags: EVENT_NOTIFICATION_ZA_PENDING,
-        size: size as u32,
-        ..Default::default()
-    }
-    .insert(
-        account.account_tenant_ids(),
+    let document_id =
+        batch.reserve_document_id(recipient_id, Collection::CalendarEventNotification);
+    item.insert(
+        content,
+        account.changed_by(),
         recipient_id,
         document_id,
+        None,
         &mut batch,
     )
     .caused_by(trc::location!())?;

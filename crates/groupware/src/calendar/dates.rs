@@ -14,14 +14,7 @@ use super::{
 use crate::calendar::ComponentTimeRange;
 use calcard::{
     common::timezone::Tz,
-<<<<<<< HEAD
-    icalendar::{
-        ICalendar, ICalendarComponentType,
-        dates::{CalendarErrorType, TimeOrDelta},
-    },
-=======
-    icalendar::{ICalendar, ICalendarComponentType},
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+    icalendar::{ICalendar, ICalendarComponentType, dates::CalendarErrorType},
 };
 use compact_str::ToCompactString;
 use indexmap::IndexMap;
@@ -46,17 +39,18 @@ impl CalendarEventData {
         max_expansions: usize,
         default_alerts: &DefaultAlerts,
     ) -> Self {
-        Self::new_for(ical, default_tz, max_expansions, next_email_alarm, false)
+        Self::new_for(ical, default_tz, max_expansions, default_alerts, false)
     }
 
-    /// `new`, except that for a key account the rule-expansion trace names
-    /// each error's kind instead of calcard's text, which quotes RRULE values
-    /// (spec 10, "Traces").
+    /// `new_with_default_alerts`, except that for a key account the
+    /// rule-expansion trace names each error's kind instead of calcard's
+    /// text, which quotes RRULE values, and carries no contents (calendar
+    /// spec 10, "Traces").
     pub fn new_for(
         ical: ICalendar,
         default_tz: Tz,
         max_expansions: usize,
-        next_email_alarm: &mut Option<CalendarAlarm>,
+        default_alerts: &DefaultAlerts,
         key_account: bool,
     ) -> Self {
         let mut ranges = TimeRanges::default();
@@ -169,12 +163,8 @@ impl CalendarEventData {
                         }
                     })
                     .collect::<Vec<_>>(),
-<<<<<<< HEAD
-                Details = ical.uids().next().unwrap_or_default().to_string(),
-=======
-                Contents = ical.to_compact_string(),
+                Contents = (!key_account).then(|| ical.to_compact_string()),
                 ResourceUid = ical.uids().next().map(|uid| uid.to_compact_string()),
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                 Limit = max_expansions,
             );
         }
@@ -314,6 +304,9 @@ fn za_expansion_reason(error: &CalendarErrorType) -> &'static str {
         CalendarErrorType::InvalidDtEnd => "Invalid DTEND property",
         CalendarErrorType::InvalidDuration => "Invalid DURATION property",
         CalendarErrorType::RRule(_) => "RRule error",
+        CalendarErrorType::ExpansionLimitReached => {
+            "Recurrence expansion gave up before the rule finished"
+        }
     }
 }
 
@@ -330,7 +323,11 @@ impl ArchivedTimezone {
     }
 }
 
-<<<<<<< HEAD
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/groupware/src/calendar/dates/tests.rs"]
+mod tests;
+
 #[cfg(test)]
 mod tests {
     use super::za_expansion_reason;
@@ -356,15 +353,17 @@ mod tests {
         );
         assert_eq!(
             za_expansion_reason(&CalendarErrorType::RRule(
-                calcard::datecalc::error::RRuleError::IterError("UNTIL=20200101T000000Z".into())
+                calcard::datecalc::error::ValidationError::InvalidFieldValue {
+                    field: "UNTIL".into(),
+                    value: "20200101T000000Z".into(),
+                }
+                .into()
             )),
             "RRule error"
         );
+        assert_eq!(
+            za_expansion_reason(&CalendarErrorType::ExpansionLimitReached),
+            "Recurrence expansion gave up before the rule finished"
+        );
     }
 }
-=======
-#[cfg(all(test, stalwart_tests))]
-#[rustfmt::skip]
-#[path = "../../../../../stalwart-tests/unit/groupware/src/calendar/dates/tests.rs"]
-mod tests;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184

@@ -11,27 +11,37 @@ use super::{
     resolve::{ZaCalendarContext, ZaCalendarError, za_owned_calendar_context},
 };
 use crate::calendar::{
-    Calendar, CalendarEvent, CalendarPreferences,
+    Calendar, CalendarEvent, CalendarEventContent, CalendarPreferences,
     seal::{
-        COLLECTION_MARKER, SealError, ZaEventStorageKind, ZaKeyDomain, calendar_view_in_domain,
-        classify_event_storage,
+        COLLECTION_MARKER, SealError, ZaContainerOf, ZaEvent, ZaEventStorageKind, ZaKeyDomain,
+        calendar_view_in_domain, classify_event_storage,
         collection::{seal_personal_entry, seal_shared_properties},
-        rewrap_event, seal_calendar, unseal_event_in_domain,
+        container_is_ck,
+        event::za_event_uid,
+        open_container, rewrap_container, rewrap_event, seal_calendar, unseal_event_in_domain,
     },
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use common::{Server, auth::AccountTenantIds};
+use common::{
+    Server,
+    auth::ChangedBy,
+    storage::metadata::{ContainerChange, MetadataLog},
+};
 use registry::{schema::prelude::ObjectType, types::EnumImpl};
 use std::collections::BTreeMap;
 use store::write::assert::AssertValue;
 use store::{
     ValueKey,
-    write::{AlignedBytes, Archive, ArchiveVersion, BatchBuilder, RegistryClass, ValueClass},
+    write::{
+        Archive, ArchiveBytes, ArchiveVersion, BatchBuilder, PendingId, RegistryClass, ValueClass,
+        metadata::MetadataBuf,
+    },
 };
 use types::{
     collection::Collection,
-    field::{Field, PrincipalField},
+    field::{CalendarEventField, Field, PrincipalField},
     id::Id,
+    metadata::{EncodedMetadata, MetadataEdit},
 };
 use vault::keys::Secret;
 use vault::session::SessionKeys;
@@ -163,10 +173,7 @@ pub async fn za_convert_calendar_tracked(
     if guards.owner_id != keys.account_id || guards.verified_generation != keys.generation {
         return Err(ZaShareError::Forbidden);
     }
-    let changed_by = server
-        .account_info(keys.account_id)
-        .await?
-        .account_tenant_ids();
+    let changed_by = server.account_info(keys.account_id).await?.changed_by();
     let mut counts = ZaConversionCounts::default();
     let mut linked = false;
     loop {
@@ -190,7 +197,11 @@ pub async fn za_convert_calendar_tracked(
                 }
                 #[cfg(feature = "test_mode")]
                 common::za::test_hooks::share_precheck_pause_point(keys.account_id).await;
-                let calendar = initialize(&context, keys)?;
+                let (calendar, domain) = initialize(&context, keys)?;
+                // Ruling 29: the calendar's dead-property container moves to
+                // the collection key in the ring's own commit.
+                let container =
+                    calendar_container(server, &context, &context.domain, &domain).await?;
                 write_calendar(
                     server,
                     keys,
@@ -198,6 +209,7 @@ pub async fn za_convert_calendar_tracked(
                     changed_by,
                     &context,
                     calendar,
+                    container,
                     WriteClass::Init,
                     counts,
                 )
@@ -235,6 +247,7 @@ pub async fn za_convert_calendar_tracked(
                         changed_by,
                         &context,
                         calendar,
+                        None,
                         WriteClass::Revert,
                         counts,
                     )
@@ -247,20 +260,49 @@ pub async fn za_convert_calendar_tracked(
                     if index > 0 {
                         conversion_cut(keys.account_id).await?;
                     }
-                    for (id, stored) in &chunk {
-                        let mut event = stored.deserialize::<CalendarEvent>()?;
-                        if !event.names.iter().any(|n| n.parent_id == calendar_id) {
+                    for stored in &chunk {
+                        let meta = stored.meta.deserialize::<CalendarEvent>()?;
+                        if !meta.names.iter().any(|n| n.parent_id == calendar_id) {
                             continue;
                         }
-                        if !matches!(event.names.as_slice(), [name] if name.parent_id == calendar_id)
+                        if !matches!(meta.names.as_slice(), [name] if name.parent_id == calendar_id)
                         {
                             // A legitimate new link is impossible after phase 1;
                             // still refuse rather than writing a linked CK row.
                             return Err(SealError::Structure("collection key event parent").into());
                         }
-                        let kind = classify_event_storage(&event)?;
-                        if is_ck(&event, kind)? {
+                        let content = stored.content.deserialize::<CalendarEventContent>()?;
+                        let kind = classify_event_storage(&content)?;
+                        let mut event = ZaEvent::new(meta, content);
+                        let uid = za_event_uid(&event.content);
+                        // Ruling 29: the event's container moves with it, in
+                        // the same commit chunk (identity rule: the
+                        // container is the event's, by account, collection
+                        // and document id).
+                        let container = rewrapped_container(
+                            stored.container.as_ref(),
+                            &context.domain,
+                            &context.domain,
+                            ZaContainerOf::Event(&uid),
+                            true,
+                        )?;
+                        if is_ck(&event.content, kind)? {
                             unseal_event_in_domain(&mut event, &context.domain)?;
+                            if let Some(container) = container {
+                                // A converted event whose container is not
+                                // under the collection key yet.
+                                write_container(
+                                    server,
+                                    guards,
+                                    &context,
+                                    stored.id,
+                                    container,
+                                    WriteClass::Rewrap,
+                                    counts,
+                                )
+                                .await?;
+                                *wrote = true;
+                            }
                             continue;
                         }
                         rewrap_event(&mut event, &context.domain, &context.domain)?;
@@ -269,9 +311,9 @@ pub async fn za_convert_calendar_tracked(
                             guards,
                             changed_by,
                             &context,
-                            *id,
-                            &stored,
+                            stored,
                             event,
+                            container,
                             WriteClass::Rewrap,
                             counts,
                         )
@@ -320,7 +362,10 @@ pub(super) fn owner_ring(
     )?))
 }
 
-fn initialize(context: &ZaCalendarContext, keys: &SessionKeys) -> Result<Calendar, ZaShareError> {
+fn initialize(
+    context: &ZaCalendarContext,
+    keys: &SessionKeys,
+) -> Result<(Calendar, ZaKeyDomain), ZaShareError> {
     let mut calendar = calendar_view_in_domain(&context.stored, &context.domain, keys.account_id)?
         .deserialize::<Calendar>()?;
     if calendar.preferences.is_empty() {
@@ -357,10 +402,9 @@ fn initialize(context: &ZaCalendarContext, keys: &SessionKeys) -> Result<Calenda
         BTreeMap::from([(1, ck)]),
         false,
     )?;
-    let (envelope, bundle) = seal_shared_properties(&calendar.dead_properties, &domain)?;
+    let (envelope, bundle) = seal_shared_properties(&domain)?;
     let mut owner = seal_personal_entry(&calendar.preferences[0], &domain, &encoded)?;
     owner.name.push_str(&format!("|{envelope}|{bundle}"));
-    calendar.dead_properties = Default::default();
     za_replace_calendar_entries(
         &mut calendar,
         keys.account_id,
@@ -368,7 +412,7 @@ fn initialize(context: &ZaCalendarContext, keys: &SessionKeys) -> Result<Calenda
         vec![owner],
         Vec::new(),
     )?;
-    Ok(calendar)
+    Ok((calendar, domain))
 }
 
 fn mark_reverting(
@@ -411,7 +455,7 @@ async fn rollback(
     server: &Server,
     keys: &SessionKeys,
     guards: &ZaShareGuards,
-    changed_by: AccountTenantIds,
+    changed_by: ChangedBy,
     context: &ZaCalendarContext,
     counts: &mut ZaConversionCounts,
     wrote: &mut bool,
@@ -423,28 +467,51 @@ async fn rollback(
         if index > 0 {
             conversion_cut(keys.account_id).await?;
         }
-        for (id, stored) in &chunk {
-            let mut event = stored.deserialize::<CalendarEvent>()?;
-            if !event
+        for stored in &chunk {
+            let meta = stored.meta.deserialize::<CalendarEvent>()?;
+            if !meta
                 .names
                 .iter()
                 .any(|n| n.parent_id == context.calendar_id)
             {
                 continue;
             }
-            let kind = classify_event_storage(&event)?;
-            if !is_ck(&event, kind)? {
+            let content = stored.content.deserialize::<CalendarEventContent>()?;
+            let kind = classify_event_storage(&content)?;
+            let uid = za_event_uid(&content);
+            let container = rewrapped_container(
+                stored.container.as_ref(),
+                &context.domain,
+                &owner,
+                ZaContainerOf::Event(&uid),
+                false,
+            )?;
+            if !is_ck(&content, kind)? {
+                if let Some(container) = container {
+                    write_container(
+                        server,
+                        guards,
+                        context,
+                        stored.id,
+                        container,
+                        WriteClass::Rollback,
+                        *counts,
+                    )
+                    .await?;
+                    *wrote = true;
+                }
                 continue;
             }
+            let mut event = ZaEvent::new(meta, content);
             rewrap_event(&mut event, &context.domain, &owner)?;
             write_event(
                 server,
                 guards,
                 changed_by,
                 context,
-                *id,
-                &stored,
+                stored,
                 event,
+                container,
                 WriteClass::Rollback,
                 *counts,
             )
@@ -470,6 +537,7 @@ async fn rollback(
         entries,
         Vec::new(),
     )?;
+    let container = calendar_container(server, &fresh, &fresh.domain, &owner).await?;
     write_calendar(
         server,
         keys,
@@ -477,6 +545,7 @@ async fn rollback(
         changed_by,
         &fresh,
         calendar,
+        container,
         WriteClass::Restore,
         *counts,
     )
@@ -494,10 +563,11 @@ pub(super) async fn event_ids(
     let mut ids = Vec::new();
     let mut linked = false;
     server
-        .all_archives(
+        .archives(
             owner,
             Collection::CalendarEvent,
-            Field::ARCHIVE.into(),
+            Field::ARCHIVE,
+            &(),
             |id, stored| {
                 let event = stored.unarchive::<CalendarEvent>()?;
                 if event
@@ -508,7 +578,7 @@ pub(super) async fn event_ids(
                     linked |= event.names.len() != 1;
                     ids.push(id);
                 }
-                Ok(())
+                Ok(true)
             },
         )
         .await?;
@@ -522,14 +592,80 @@ async fn read_chunk(
     server: &Server,
     owner: u32,
     ids: &[u32],
-) -> Result<Vec<(u32, Archive<AlignedBytes>)>, ZaShareError> {
+) -> Result<Vec<StoredEvent>, ZaShareError> {
     let mut chunk = Vec::with_capacity(ids.len());
     for &id in ids {
         if let Some(stored) = read_event(server, owner, id).await? {
-            chunk.push((id, stored));
+            chunk.push(stored);
         }
     }
     Ok(chunk)
+}
+
+/// A stored event at 1.0: its metadata row, its content and its
+/// dead-property container, read together.
+struct StoredEvent {
+    id: u32,
+    meta: Archive<ArchiveBytes>,
+    content: Archive<ArchiveBytes>,
+    container: Option<MetadataBuf>,
+}
+
+/// The rewrapped form of a stored container, or `None` when there is none
+/// or it is already in the target class (`to_ck`).
+fn rewrapped_container(
+    stored: Option<&MetadataBuf>,
+    from: &ZaKeyDomain,
+    to: &ZaKeyDomain,
+    of: ZaContainerOf<'_>,
+    to_ck: bool,
+) -> Result<Option<(MetadataBuf, EncodedMetadata)>, SealError> {
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    let bytes = stored.view().as_bytes();
+    if container_is_ck(bytes) == Some(to_ck) {
+        return Ok(None);
+    }
+    rewrap_container(bytes, from, to, of).map(|next| Some((stored.clone(), next)))
+}
+
+/// The calendar's own container, rewrapped from `from` to `to`.
+async fn calendar_container(
+    server: &Server,
+    context: &ZaCalendarContext,
+    from: &ZaKeyDomain,
+    to: &ZaKeyDomain,
+) -> Result<Option<(MetadataBuf, EncodedMetadata)>, ZaShareError> {
+    let stored = server
+        .metadata_container(context.owner_id, Collection::Calendar, context.calendar_id)
+        .await?;
+    Ok(rewrapped_container(
+        stored.as_ref(),
+        from,
+        to,
+        ZaContainerOf::Calendar(context.calendar_id),
+        to.calendar_id().is_some() && !to.is_reverting(),
+    )?)
+}
+
+/// Adds a container's conditional rewrite (upstream's own write: the
+/// stored container's hash is asserted) to `batch`.
+async fn add_container_write(
+    server: &Server,
+    owner_id: u32,
+    collection: Collection,
+    document_id: u32,
+    (previous, next): (MetadataBuf, EncodedMetadata),
+    batch: &mut BatchBuilder,
+) -> Result<(), ZaShareError> {
+    let owner = server.account(owner_id).await?;
+    if let Some(change) = ContainerChange::new(Some(&previous), Some(next), MetadataEdit::Write) {
+        change
+            .into_write(owner.as_ref(), collection, MetadataLog::None)
+            .build(PendingId::Assigned(document_id), batch)?;
+    }
+    Ok(())
 }
 
 /// Stream final validation, retaining only the current archive and any fixed
@@ -539,48 +675,61 @@ pub(super) async fn validate_scan(
     context: &ZaCalendarContext,
     forward: bool,
 ) -> Result<(), ZaShareError> {
+    let (ids, _) = event_ids(server, context.owner_id, context.calendar_id).await?;
     let mut failure = None;
-    server
-        .all_archives(
-            context.owner_id,
-            Collection::CalendarEvent,
-            Field::ARCHIVE.into(),
-            |_, stored| {
-                let event = stored.unarchive::<CalendarEvent>()?;
-                if failure.is_none()
-                    && event
-                        .names
-                        .iter()
-                        .any(|n| n.parent_id.to_native() == context.calendar_id)
-                {
-                    let checked = (|| -> Result<(), ZaShareError> {
-                        let mut event = stored.deserialize::<CalendarEvent>()?;
-                        let kind = classify_event_storage(&event)?;
-                        if forward {
-                            if !is_ck(&event, kind)? {
-                                return Err(SealError::NotSealed.into());
-                            }
-                            unseal_event_in_domain(&mut event, &context.domain)?;
-                        } else if is_ck(&event, kind)? {
-                            return Err(SealError::Structure("rollback incomplete").into());
-                        }
-                        Ok(())
-                    })();
-                    if let Err(error) = checked {
-                        failure = Some(error);
-                    }
+    for id in ids {
+        // Store read errors keep precedence over a failed check.
+        let Some(stored) = read_event(server, context.owner_id, id).await? else {
+            continue;
+        };
+        if failure.is_some() {
+            continue;
+        }
+        let checked = (|| -> Result<(), ZaShareError> {
+            let meta = stored.meta.deserialize::<CalendarEvent>()?;
+            if !meta
+                .names
+                .iter()
+                .any(|n| n.parent_id == context.calendar_id)
+            {
+                return Ok(());
+            }
+            let content = stored.content.deserialize::<CalendarEventContent>()?;
+            let kind = classify_event_storage(&content)?;
+            let container = stored
+                .container
+                .as_ref()
+                .map(|container| container_is_ck(container.view().as_bytes()));
+            if forward {
+                if !is_ck(&content, kind)? || container.is_some_and(|ck| ck != Some(true)) {
+                    return Err(SealError::NotSealed.into());
                 }
-                Ok(())
-            },
-        )
-        .await?;
+                let uid = za_event_uid(&content);
+                let mut event = ZaEvent::new(meta, content);
+                unseal_event_in_domain(&mut event, &context.domain)?;
+                if let Some(container) = &stored.container {
+                    open_container(
+                        container.view().as_bytes(),
+                        &context.domain,
+                        ZaContainerOf::Event(&uid),
+                    )?;
+                }
+            } else if is_ck(&content, kind)? || container == Some(Some(true)) {
+                return Err(SealError::Structure("rollback incomplete").into());
+            }
+            Ok(())
+        })();
+        if let Err(error) = checked {
+            failure = Some(error);
+        }
+    }
     failure.map_or(Ok(()), Err)
 }
-fn is_ck(event: &CalendarEvent, kind: ZaEventStorageKind) -> Result<bool, SealError> {
+fn is_ck(content: &CalendarEventContent, kind: ZaEventStorageKind) -> Result<bool, SealError> {
     if kind == ZaEventStorageKind::LegacyPlaintext {
         return Ok(false);
     }
-    let carrier = event.data.event.components[0]
+    let carrier = content.data.event.components[0]
         .entries
         .last()
         .ok_or(SealError::Format)?;
@@ -589,30 +738,67 @@ fn is_ck(event: &CalendarEvent, kind: ZaEventStorageKind) -> Result<bool, SealEr
     };
     Ok(STANDARD.decode(encoded).map_err(|_| SealError::Decode)?[1] == super::format::WRAP_CK)
 }
-async fn read_event(
+async fn read_event(server: &Server, owner: u32, id: u32) -> trc::Result<Option<StoredEvent>> {
+    let (meta, content) = server
+        .archive_and_field(
+            owner,
+            Collection::CalendarEvent,
+            id,
+            CalendarEventField::Content.field(),
+        )
+        .await?;
+    let (Some(meta), Some(content)) = (meta, content) else {
+        return Ok(None);
+    };
+    let container = server
+        .metadata_container(owner, Collection::CalendarEvent, id)
+        .await?;
+    Ok(Some(StoredEvent {
+        id,
+        meta,
+        content,
+        container,
+    }))
+}
+
+async fn read_event_version(
     server: &Server,
     owner: u32,
     id: u32,
-) -> trc::Result<Option<Archive<AlignedBytes>>> {
+) -> trc::Result<Option<ArchiveVersion>> {
     server
         .store()
-        .get_value(ValueKey::archive(owner, Collection::CalendarEvent, id))
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(owner, Collection::CalendarEvent, id))
         .await
+        .map(|archive| archive.map(|archive| archive.version))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn write_calendar(
     server: &Server,
     keys: &SessionKeys,
     guards: &ZaShareGuards,
-    changed_by: AccountTenantIds,
+    changed_by: ChangedBy,
     context: &ZaCalendarContext,
     calendar: Calendar,
+    container: Option<(MetadataBuf, EncodedMetadata)>,
     class: WriteClass,
     counts: ZaConversionCounts,
 ) -> Result<(), ZaShareError> {
     let mut batch = BatchBuilder::new();
     context.assert_in(&mut batch);
     guards.assert_in(&mut batch);
+    if let Some(container) = container {
+        add_container_write(
+            server,
+            context.owner_id,
+            Collection::Calendar,
+            context.calendar_id,
+            container,
+            &mut batch,
+        )
+        .await?;
+    }
     calendar.update(
         changed_by,
         context.stored.to_unarchived::<Calendar>()?,
@@ -622,26 +808,44 @@ async fn write_calendar(
     )?;
     commit(server, context, batch, class, &[], counts).await
 }
+#[allow(clippy::too_many_arguments)]
 async fn write_event(
     server: &Server,
     guards: &ZaShareGuards,
-    changed_by: AccountTenantIds,
+    changed_by: ChangedBy,
     context: &ZaCalendarContext,
-    id: u32,
-    stored: &Archive<AlignedBytes>,
-    event: CalendarEvent,
+    stored: &StoredEvent,
+    event: ZaEvent,
+    container: Option<(MetadataBuf, EncodedMetadata)>,
     class: WriteClass,
     counts: ZaConversionCounts,
 ) -> Result<(), ZaShareError> {
     let mut batch = BatchBuilder::new();
     context.assert_in(&mut batch);
     guards.assert_in(&mut batch);
-    let modified = event.modified;
-    event.update_at(
+    // The container's write precedes the event's, whose commit point closes
+    // the chunk: both land in one transaction.
+    if let Some(container) = container {
+        add_container_write(
+            server,
+            context.owner_id,
+            Collection::CalendarEvent,
+            stored.id,
+            container,
+            &mut batch,
+        )
+        .await?;
+    }
+    let (meta, content) = event.into_parts();
+    let modified = meta.modified;
+    meta.update_full_at(
+        content,
         changed_by,
-        stored.to_unarchived::<CalendarEvent>()?,
+        stored.meta.to_unarchived::<CalendarEvent>()?,
+        stored.content.unarchive::<CalendarEventContent>()?,
         context.owner_id,
-        id,
+        stored.id,
+        None,
         modified,
         &mut batch,
     )?;
@@ -650,10 +854,35 @@ async fn write_event(
         context,
         batch,
         class,
-        &[(id, Some(stored.version))],
+        &[(stored.id, Some(stored.meta.version))],
         counts,
     )
     .await
+}
+
+/// A container-only rewrap of a converted (or rolled back) event.
+async fn write_container(
+    server: &Server,
+    guards: &ZaShareGuards,
+    context: &ZaCalendarContext,
+    id: u32,
+    container: (MetadataBuf, EncodedMetadata),
+    class: WriteClass,
+    counts: ZaConversionCounts,
+) -> Result<(), ZaShareError> {
+    let mut batch = BatchBuilder::new();
+    context.assert_in(&mut batch);
+    guards.assert_in(&mut batch);
+    add_container_write(
+        server,
+        context.owner_id,
+        Collection::CalendarEvent,
+        id,
+        container,
+        &mut batch,
+    )
+    .await?;
+    commit(server, context, batch, class, &[], counts).await
 }
 async fn commit(
     server: &Server,
@@ -698,7 +927,7 @@ async fn commit(
             Ok(())
         }
         Err(error) if error.is_assertion_failure() => {
-            let after: Option<Archive<AlignedBytes>> = server
+            let after: Option<Archive<ArchiveBytes>> = server
                 .store()
                 .get_value(ValueKey::archive(
                     context.owner_id,
@@ -708,10 +937,8 @@ async fn commit(
                 .await?;
             let mut progress_changed = after.map(|a| a.version) != Some(context.stored.version);
             for (id, before) in affected {
-                progress_changed |= read_event(server, context.owner_id, *id)
-                    .await?
-                    .map(|a| a.version)
-                    != *before;
+                progress_changed |=
+                    read_event_version(server, context.owner_id, *id).await? != *before;
             }
             Err(ZaShareError::ConversionConflict {
                 committed: counts,

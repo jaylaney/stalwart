@@ -367,8 +367,19 @@ mod tests {
         event_cancel::{itip_cancel, itip_cancel_from_snapshot},
         event_create::itip_create,
         event_update::itip_update,
+        recipient::{AttendeeVisibility, RecipientPolicy},
         snapshot::itip_snapshot,
     };
+
+    /// Upstream's builders with every attendee visible and no limits: the
+    /// per-recipient split then keeps one message, as before 1.0.
+    fn policy() -> RecipientPolicy {
+        RecipientPolicy {
+            visibility: AttendeeVisibility::All,
+            max_recipients: usize::MAX,
+            max_instances: usize::MAX,
+        }
+    }
     use calcard::icalendar::{
         ICalendarParameterName, ICalendarParameterValue, ICalendarParticipationStatus,
         ICalendarProperty, ICalendarValue,
@@ -502,7 +513,7 @@ mod tests {
             .collect::<Vec<_>>()
         );
         let mut reference = tree.clone();
-        let expected = itip_create(&mut reference, &owner.addresses).unwrap();
+        let expected = itip_create(&mut reference, &owner.addresses, policy()).unwrap();
         assert_eq!(
             canonical_without_dtstamp(actual.messages()[0].message.clone()),
             canonical_without_dtstamp(expected[0].message.clone())
@@ -566,7 +577,8 @@ mod tests {
         assert!(matches!(
             itip_create(
                 &mut first_run,
-                &[WRITER.into(), SHARED.into(), GROUP.into(), OWNER.into()]
+                &[WRITER.into(), SHARED.into(), GROUP.into(), OWNER.into()],
+                policy()
             ),
             Err(ItipError::NothingToSend)
         ));
@@ -764,14 +776,20 @@ mod tests {
         assert!(!actual.increments().is_empty());
         assert!(actual.finalize());
         let mut owner_reference = new.clone();
-        let owner_messages = itip_update(&mut owner_reference, &old, &owner.addresses).unwrap();
+        let owner_messages =
+            itip_update(&mut owner_reference, &old, &owner.addresses, policy()).unwrap();
         assert_eq!(
             sequence(&actual.messages()[0].message),
             sequence(&owner_messages[0].message)
         );
         let mut first_run = new.clone();
         assert!(matches!(
-            itip_update(&mut first_run, &old, &[WRITER.into(), OWNER.into()]),
+            itip_update(
+                &mut first_run,
+                &old,
+                &[WRITER.into(), OWNER.into()],
+                policy()
+            ),
             Err(ItipError::NothingToSend)
         ));
         za_finalize(&mut first_run, actual.increments());
@@ -852,8 +870,13 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut owner_removal_tree = old.clone();
-        let owner_removal =
-            itip_update(&mut owner_removal_tree, &with_instance, &owner.addresses).unwrap();
+        let owner_removal = itip_update(
+            &mut owner_removal_tree,
+            &with_instance,
+            &owner.addresses,
+            policy(),
+        )
+        .unwrap();
         assert_eq!(removed.messages().len(), 1);
         assert_eq!(owner_removal.len(), 1);
         assert_eq!(removed.messages()[0].to, vec![WRITER.to_string()]);
@@ -890,7 +913,10 @@ mod tests {
         ];
         for (organizer, attendees, addresses, is_deletion) in cases {
             let tree = event(organizer, &attendees, "x", "20990301T100000Z", "");
-            let public = itip_cancel(&tree, &addresses, is_deletion);
+            let public = itip_cancel(&tree, &addresses, is_deletion, policy()).map(|mut all| {
+                assert_eq!(all.len(), 1, "one message with every attendee visible");
+                all.remove(0)
+            });
             let from_snapshot = itip_cancel_from_snapshot(
                 &tree,
                 itip_snapshot(&tree, &addresses, false).unwrap(),
@@ -919,7 +945,7 @@ mod tests {
             comp.entries.retain(|e| e.name != ICalendarProperty::Uid);
         }
         assert!(matches!(
-            itip_cancel(&invalid, &[OWNER.into()], true),
+            itip_cancel(&invalid, &[OWNER.into()], true, policy()),
             Err(ItipError::MissingUid)
         ));
     }

@@ -6,15 +6,18 @@
 
 //! Sealing of one calendar collection (spec 7.2).
 //!
-//! The collection's user-facing name, description, colour and dead
-//! properties go into one encrypted bundle carried in the owner's
+//! The collection's user-facing name, description and colour go into one
+//! encrypted bundle carried in the owner's
 //! `CalendarPreferences.name` as `"$za$" + base64(envelope) + "|" + sealed
 //! bundle`, where the envelope is `policy version || wrap type || wrapped
 //! DEK`. A custom timezone is sealed in place by `seal_tree` under scope
 //! `calendar-tz` with the same DEK. The associated data binds the account
 //! only, so copying or moving the collection needs no resealing. The record's
 //! own `name` (the URL slug), sort order, flags and default alerts stay
-//! visible.
+//! visible. At Stalwart 1.0 the collection's dead properties are a metadata
+//! container outside the record (`seal::container`), so the bundle no longer
+//! carries them; a shared collection keeps its shared bundle, now always
+//! empty, so the five-part ring format is unchanged.
 
 use super::domain::ZaKeyDomain;
 use super::tree::{
@@ -25,9 +28,8 @@ use crate::calendar::{Calendar, CalendarPreferences, Timezone};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use store::{
     Deserialize, Serialize,
-    write::{AlignedBytes, Archive, Archiver},
+    write::{Archive, ArchiveBytes, Archiver},
 };
-use types::dead_property::DeadProperty;
 use vault::{
     keys::{Secret, aad},
     session::SessionKeys,
@@ -43,7 +45,6 @@ struct Bundle {
     name: String,
     description: Option<String>,
     color: Option<String>,
-    dead_properties: DeadProperty,
 }
 
 /// The preferences entry `Calendar::preferences(account_id)` resolves to,
@@ -70,7 +71,7 @@ pub fn calendar_is_sealed(calendar: &Calendar, account_id: u32) -> bool {
         .is_some_and(|i| calendar.preferences[i].name.starts_with(COLLECTION_MARKER))
 }
 
-/// Seals name, description, colour, dead properties and a custom timezone
+/// Seals name, description, colour and a custom timezone
 /// into the owner's preferences entry, under a fresh DEK. The bundle is
 /// always written for a key account's collection, so the wrapped key is
 /// present whenever any ciphertext in the collection depends on it
@@ -104,13 +105,11 @@ fn seal_calendar_in_owner(calendar: &mut Calendar, domain: &ZaKeyDomain) -> Resu
         return Err(SealError::Structure("preferences other than the owner's"));
     }
     let dek = Secret::random();
-    let dead_properties = std::mem::take(&mut calendar.dead_properties);
     let pref = &mut calendar.preferences[0];
     let bundle = Bundle {
         name: std::mem::take(&mut pref.name),
         description: pref.description.take(),
         color: pref.color.take(),
-        dead_properties,
     };
     if let Timezone::Custom(tz) = &mut pref.time_zone {
         seal_tree(tz, &dek, account_id, TZ_SCOPE);
@@ -126,7 +125,7 @@ fn seal_calendar_in_owner(calendar: &mut Calendar, domain: &ZaKeyDomain) -> Resu
     Ok(())
 }
 
-/// Restores the owner's entry and the collection's dead properties in place.
+/// Restores the owner's entry in place.
 ///
 /// A collection without the marker (for example the default calendar the
 /// server created without a key) is plaintext and is left unchanged; the
@@ -166,7 +165,6 @@ fn unseal_calendar_with_key(
     pref.name = bundle.name;
     pref.description = bundle.description;
     pref.color = bundle.color;
-    calendar.dead_properties = bundle.dead_properties;
     Ok(())
 }
 
@@ -182,10 +180,10 @@ fn unseal_calendar_with_key(
 /// back, passed to `into_inner()` for a write, or used as an update's
 /// "current" value (`AssertValue`); writes start from the stored archive.
 pub fn unseal_calendar_archive(
-    stored: &Archive<AlignedBytes>,
+    stored: &Archive<ArchiveBytes>,
     keys: &SessionKeys,
     account_id: u32,
-) -> Result<Archive<AlignedBytes>, SealError> {
+) -> Result<Archive<ArchiveBytes>, SealError> {
     let mut calendar = stored
         .deserialize::<Calendar>()
         .map_err(|_| SealError::Format)?;
@@ -196,7 +194,7 @@ pub fn unseal_calendar_archive(
     let bytes = Archiver::new(calendar)
         .serialize()
         .map_err(|_| SealError::Format)?;
-    let mut view = <Archive<AlignedBytes> as Deserialize>::deserialize(&bytes)
+    let mut view = <Archive<ArchiveBytes> as Deserialize>::deserialize(&bytes)
         .map_err(|_| SealError::Format)?;
     view.version = stored.version;
     Ok(view)
@@ -215,7 +213,6 @@ pub(crate) fn seal_personal_entry(
         name: entry.name.clone(),
         description: entry.description.clone(),
         color: None,
-        dead_properties: DeadProperty::default(),
     };
     let plain = rkyv::to_bytes::<rkyv::rancor::Error>(&bundle).map_err(|_| SealError::Format)?;
     let envelope = domain.seal_ck(&dek, "ck-bundle", Some(&principal))?;
@@ -238,18 +235,16 @@ pub(crate) fn seal_personal_entry(
     Ok(changed)
 }
 
-/// Prepare the calendar-wide dead-property bundle for explicit assembly or
-/// a property write. A new bundle always has a fresh independently wrapped DEK.
-pub(crate) fn seal_shared_properties(
-    properties: &DeadProperty,
-    domain: &ZaKeyDomain,
-) -> Result<(String, String), SealError> {
+/// Prepare the calendar-wide shared bundle for explicit assembly. A new
+/// bundle always has a fresh independently wrapped DEK. At 1.0 it carries
+/// nothing: the collection's dead properties are a sealed metadata container
+/// (`seal::container`); the bundle keeps the five-part ring format.
+pub(crate) fn seal_shared_properties(domain: &ZaKeyDomain) -> Result<(String, String), SealError> {
     let dek = Secret::random();
     let bundle = Bundle {
         name: String::new(),
         description: None,
         color: None,
-        dead_properties: properties.clone(),
     };
     let plain = rkyv::to_bytes::<rkyv::rancor::Error>(&bundle).map_err(|_| SealError::Format)?;
     Ok((
@@ -320,7 +315,7 @@ fn open_personal(
         &domain.bundle_aad("ck-calendar-bundle", Some(entry.account_id))?,
         parts[2],
     )?;
-    if bundle.color.is_some() || !bundle.dead_properties.0.is_empty() {
+    if bundle.color.is_some() {
         return Err(SealError::Format);
     }
     if let Timezone::Custom(tree) = &mut entry.time_zone {
@@ -332,14 +327,14 @@ fn open_personal(
     Ok(())
 }
 
-fn open_shared(parts: &[&str], domain: &ZaKeyDomain) -> Result<DeadProperty, SealError> {
+fn open_shared(parts: &[&str], domain: &ZaKeyDomain) -> Result<(), SealError> {
     let envelope = STANDARD.decode(parts[3]).map_err(|_| SealError::Decode)?;
     let dek = domain.open_ck(&envelope, "ck-shared-dek", None)?;
     let bundle = open_archive::<Bundle>(&dek, &domain.aad("ck-shared-bundle")?, parts[4])?;
     if !bundle.name.is_empty() || bundle.description.is_some() || bundle.color.is_some() {
         return Err(SealError::Format);
     }
-    Ok(bundle.dead_properties)
+    Ok(())
 }
 
 fn calendar_in_domain(
@@ -369,7 +364,7 @@ fn calendar_in_domain(
         .iter()
         .position(|p| p.account_id == domain.owner_id())
         .unwrap();
-    view.dead_properties = open_shared(&parts[owner], domain)?;
+    open_shared(&parts[owner], domain)?;
     open_personal(&mut view, personal, &parts[personal], domain)?;
     Ok(view)
 }
@@ -377,10 +372,10 @@ fn calendar_in_domain(
 /// Opens only the requested principal's personal bundle and shared properties.
 /// This archive is a response view; never use it as an update's current value.
 pub fn calendar_view_in_domain(
-    stored: &Archive<AlignedBytes>,
+    stored: &Archive<ArchiveBytes>,
     domain: &ZaKeyDomain,
     personal_id: u32,
-) -> Result<Archive<AlignedBytes>, SealError> {
+) -> Result<Archive<ArchiveBytes>, SealError> {
     let calendar = stored
         .deserialize::<Calendar>()
         .map_err(|_| SealError::Format)?;
@@ -388,7 +383,7 @@ pub fn calendar_view_in_domain(
     let bytes = Archiver::new(calendar)
         .serialize()
         .map_err(|_| SealError::Format)?;
-    let mut view = <Archive<AlignedBytes> as Deserialize>::deserialize(&bytes)
+    let mut view = <Archive<ArchiveBytes> as Deserialize>::deserialize(&bytes)
         .map_err(|_| SealError::Format)?;
     view.version = stored.version;
     Ok(view)
@@ -479,18 +474,6 @@ pub fn seal_calendar_changes(
     if edited_personal.color.is_some() {
         return Err(SealError::Structure("personal color"));
     }
-    if edited.dead_properties != opened.dead_properties {
-        let (envelope, bundle) = seal_shared_properties(&edited.dead_properties, domain)?;
-        let own = &mut changed.preferences[owner];
-        let personal_parts = entry_parts(own)?;
-        own.name = format!(
-            "{}|{}|{}|{envelope}|{bundle}",
-            COLLECTION_MARKER.to_owned() + personal_parts[0],
-            personal_parts[1],
-            personal_parts[2]
-        );
-    }
-    changed.dead_properties = DeadProperty::default();
     // Validate exactly the same assembly contract as explicit share mutations.
     shared_parts(&changed, domain)?;
     Ok(changed)
@@ -502,7 +485,6 @@ mod tests {
     use crate::calendar::{Calendar, CalendarPreferences, Timezone};
     use calcard::{Entry, Parser};
     use store::{Serialize, write::Archiver};
-    use types::dead_property::{DeadElementTag, DeadPropertyTag};
     use vault::keys::{Secret, unwrap_key};
 
     const TZ: &str = "BEGIN:VCALENDAR\r\nPRODID:-//Example Corp.//CalDAV Client//EN\r\nVERSION:2.0\r\nBEGIN:VTIMEZONE\r\nTZID:US-Eastern\r\nLAST-MODIFIED:19870101T000000Z\r\nX-LIC-LOCATION:America/New_York\r\nBEGIN:STANDARD\r\nDTSTART:19671029T020000\r\nRRULE:FREQ=YEARLY;BYDAY=-1SU;BYMONTH=10\r\nTZOFFSETFROM:-0400\r\nTZOFFSETTO:-0500\r\nTZNAME:Eastern Standard canary\r\nCOMMENT:tz comment canary\r\nEND:STANDARD\r\nEND:VTIMEZONE\r\nEND:VCALENDAR\r\n";
@@ -527,11 +509,6 @@ mod tests {
                 time_zone: Timezone::Custom(tz()),
                 ..Default::default()
             }],
-            dead_properties: DeadProperty(vec![
-                DeadPropertyTag::ElementStart(DeadElementTag::new("A:calendar-color".into(), None)),
-                DeadPropertyTag::Text("#00ff00 canary".into()),
-                DeadPropertyTag::ElementEnd,
-            ]),
             ..Default::default()
         }
     }
@@ -540,9 +517,9 @@ mod tests {
         SessionKeys::new(4, 1, Secret::random())
     }
 
-    fn archive(calendar: &Calendar) -> Archive<AlignedBytes> {
+    fn archive(calendar: &Calendar) -> Archive<ArchiveBytes> {
         let bytes = Archiver::new(calendar.clone()).serialize().unwrap();
-        <Archive<AlignedBytes> as store::Deserialize>::deserialize(&bytes).unwrap()
+        <Archive<ArchiveBytes> as store::Deserialize>::deserialize(&bytes).unwrap()
     }
 
     fn custom_tz(calendar: &mut Calendar) -> &mut calcard::icalendar::ICalendar {
@@ -632,7 +609,7 @@ mod tests {
         .unwrap();
         let mut c = calendar();
         let mut own = seal_personal_entry(&c.preferences[0], &owner, &ring).unwrap();
-        let (envelope, bundle) = seal_shared_properties(&c.dead_properties, &owner).unwrap();
+        let (envelope, bundle) = seal_shared_properties(&owner).unwrap();
         own.name.push_str(&format!("|{envelope}|{bundle}"));
         let grant_header = GrantRingHeader {
             calendar_id: 42,
@@ -651,7 +628,6 @@ mod tests {
         personal.color = None;
         let personal = seal_personal_entry(&personal, &grantee, &grant).unwrap();
         c.preferences = vec![own, personal];
-        c.dead_properties = DeadProperty::default();
         c.acls = vec![types::acl::AclGrant {
             account_id: 8,
             grants: utils::map::bitmap::Bitmap::new()
@@ -671,11 +647,12 @@ mod tests {
         let dek=unwrap_key(&envelope[10..],&ck,b"za/v1|ck-bundle|\0\0\0\x04|\0\0\0\x2a|\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07|\0\0\0\x01|\0\0\0\x08").unwrap();
         let bundle=open_archive::<Bundle>(&dek,b"za/v1|ck-calendar-bundle|\0\0\0\x04|\0\0\0\x2a|\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07|\0\0\0\x08",personal[2]).unwrap();
         assert_eq!(bundle.name, "Grantee name");
-        assert!(bundle.dead_properties.0.is_empty());
         let envelope = STANDARD.decode(own[3]).unwrap();
         let dek=unwrap_key(&envelope[10..],&ck,b"za/v1|ck-shared-dek|\0\0\0\x04|\0\0\0\x2a|\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07|\0\0\0\x01").unwrap();
         let bundle=open_archive::<Bundle>(&dek,b"za/v1|ck-shared-bundle|\0\0\0\x04|\0\0\0\x2a|\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07\x07",own[4]).unwrap();
-        assert_eq!(bundle.dead_properties, calendar().dead_properties);
+        // At 1.0 the shared bundle carries nothing: dead properties are a
+        // sealed metadata container (`seal::container`).
+        assert!(bundle.name.is_empty() && bundle.description.is_none() && bundle.color.is_none());
         let view = calendar_view_in_domain(&archive(&c), &grantee, 8)
             .unwrap()
             .deserialize::<Calendar>()
@@ -708,7 +685,6 @@ mod tests {
         let opened = view.deserialize::<Calendar>().unwrap();
         assert_eq!(opened.preferences[0].name, "Work canary");
         assert!(opened.preferences[0].color.is_none());
-        assert_eq!(opened.dead_properties, calendar().dead_properties);
         assert_eq!(opened.preferences[1], c.preferences[1]);
         let opened = calendar_view_in_domain(&stored, &grantee, 8)
             .unwrap()
@@ -745,9 +721,10 @@ mod tests {
             .decode(super::super::tree::entry_text(carrier).unwrap())
             .unwrap();
         bytes[30] ^= 1;
-        carrier.values = vec![calcard::icalendar::ICalendarValue::Text(
+        carrier.values = [calcard::icalendar::ICalendarValue::Text(
             STANDARD.encode(bytes),
-        )];
+        )]
+        .into();
         let view = calendar_view_in_domain(&archive(&c), &grantee, 8)
             .unwrap()
             .deserialize::<Calendar>()
@@ -764,27 +741,16 @@ mod tests {
             .deserialize::<Calendar>()
             .unwrap();
         edited.preferences[1].name = "Changed".into();
-        edited.dead_properties = DeadProperty::default();
         let changed = seal_calendar_changes(&stored, &edited, &grantee, 8).unwrap();
         let before = stored.preferences[0].name.split('|').collect::<Vec<_>>();
         let after = changed.preferences[0].name.split('|').collect::<Vec<_>>();
-        assert_eq!(&before[..3], &after[..3]);
+        // At 1.0 the shared bundle carries no dead properties (they are a
+        // sealed metadata container), so a personal write leaves every part
+        // of the owner's entry, the shared bundle included, as stored.
+        assert_eq!(before, after);
         assert_eq!(
             stored.preferences[0].time_zone,
             changed.preferences[0].time_zone
-        );
-        assert_ne!(before[3], after[3]);
-        assert_ne!(before[4], after[4]);
-        let old_shared = grantee
-            .open_ck(&STANDARD.decode(before[3]).unwrap(), "ck-shared-dek", None)
-            .unwrap();
-        let new_shared = grantee
-            .open_ck(&STANDARD.decode(after[3]).unwrap(), "ck-shared-dek", None)
-            .unwrap();
-        assert_ne!(
-            old_shared.as_bytes(),
-            new_shared.as_bytes(),
-            "rewriting shared properties draws a fresh DEK"
         );
         let old_parts = entry_parts(&stored.preferences[1]).unwrap();
         let new_parts = entry_parts(&changed.preferences[1]).unwrap();
@@ -821,7 +787,6 @@ mod tests {
             .deserialize::<Calendar>()
             .unwrap();
         assert_eq!(opened.preferences[1].name, "Changed");
-        assert!(opened.dead_properties.0.is_empty());
         let mut injected = edited.clone();
         injected.preferences_mut(99);
         assert!(seal_calendar_changes(&stored, &injected, &grantee, 8).is_err());
@@ -858,7 +823,6 @@ mod tests {
         assert!(pref.color.is_none());
         assert_eq!(pref.sort_order, 3);
         assert_eq!(pref.flags, 1);
-        assert!(sealed.dead_properties.0.is_empty());
         let Timezone::Custom(tz) = &pref.time_zone else {
             panic!()
         };
@@ -920,7 +884,6 @@ mod tests {
         let mut c = calendar();
         c.preferences[0].description = None;
         c.preferences[0].color = None;
-        c.dead_properties = DeadProperty(Vec::new());
         let original = c.clone();
         seal_calendar(&mut c, &keys, 4).unwrap();
         assert!(c.preferences(4).name.starts_with(COLLECTION_MARKER));
@@ -1033,7 +996,11 @@ mod tests {
         let view = unseal_calendar_archive(&stored, &keys, 4).unwrap();
         assert_eq!(view.version, stored.version);
         assert_eq!(
-            view.unarchive::<Calendar>().unwrap().preferences(4).name,
+            view.unarchive::<Calendar>()
+                .unwrap()
+                .preferences(4)
+                .unwrap()
+                .name,
             "Work canary"
         );
         assert!(!String::from_utf8_lossy(stored.as_bytes()).contains("canary"));

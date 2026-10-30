@@ -13,29 +13,23 @@ pub mod dates;
 pub mod delegation;
 pub mod drain;
 pub mod expand;
-<<<<<<< HEAD
 pub mod fanout;
-=======
 pub mod hidden;
 pub mod identity;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 pub mod index;
 pub mod instance_filter;
 pub mod itip;
-<<<<<<< HEAD
-pub mod pinning;
-pub mod seal;
-pub mod sequence;
-pub mod sharing;
-=======
 pub mod notification;
 pub mod overlap;
 pub mod participants;
+pub mod pinning;
 pub mod privacy;
 pub mod rights;
 pub mod schedule;
+pub mod seal;
 pub mod sequence;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+pub mod sequence_floor;
+pub mod sharing;
 pub mod storage;
 pub mod user;
 
@@ -168,17 +162,25 @@ pub const EVENT_FLOATING_START: u16 = 1 << 11;
 
 pub const EVENT_NOTIFICATION_IS_DRAFT: u16 = 1;
 pub const EVENT_NOTIFICATION_IS_CHANGE: u16 = 1 << 1;
-<<<<<<< HEAD
-/// Invitations spec 9: an inbox item still sealed to the recipient's public
-/// key. Set by the fan-out (plan 9), cleared by the drain (plan 10); hidden
-/// from clients meanwhile (spec 6.6).
-pub const EVENT_NOTIFICATION_ZA_PENDING: u16 = 1 << 2;
-=======
 pub const EVENT_NOTIFICATION_IS_DESTROY: u16 = 1 << 2;
 pub const EVENT_NOTIFICATION_IS_DIRECT: u16 = 1 << 3;
 pub const EVENT_NOTIFICATION_PRIVATE: u16 = 1 << 4;
 pub const EVENT_NOTIFICATION_HIDE_ATTENDEES: u16 = 1 << 5;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+/// Invitations spec 9: an inbox item still sealed to the recipient's public
+/// key. Set by the fan-out (plan 9), cleared by the drain (plan 10); hidden
+/// from clients meanwhile (spec 6.6). Upgrade ruling 30: kept clear of every
+/// upstream notification flag, including `NotificationAudience`'s bits.
+pub const EVENT_NOTIFICATION_ZA_PENDING: u16 = 1 << 15;
+const _: () = assert!(
+    EVENT_NOTIFICATION_ZA_PENDING
+        & (EVENT_NOTIFICATION_IS_DRAFT
+            | EVENT_NOTIFICATION_IS_CHANGE
+            | EVENT_NOTIFICATION_IS_DESTROY
+            | EVENT_NOTIFICATION_IS_DIRECT
+            | EVENT_NOTIFICATION_PRIVATE
+            | EVENT_NOTIFICATION_HIDE_ATTENDEES)
+        == 0
+);
 
 pub const PREF_USE_DEFAULT_ALERTS: u16 = 1;
 pub const PREF_HAS_USE_DEFAULT_ALERTS: u16 = 1 << 1;

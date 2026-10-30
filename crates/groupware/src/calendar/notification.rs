@@ -93,7 +93,10 @@ impl NotificationViewer {
     }
 
     pub fn can_view(&self, notification: &NotificationRef<'_>) -> bool {
-        notification.changed_by != self.viewer_id
+        // Invitations spec 6.6: a sealed inbox item still pending for the
+        // drain is never shown (upgrade ruling 13).
+        notification.flags & super::EVENT_NOTIFICATION_ZA_PENDING == 0
+            && notification.changed_by != self.viewer_id
             && !notification.dismissed_by.contains(&self.viewer_id)
             && match NotificationAudience::from_flags(notification.flags) {
                 NotificationAudience::Readers => true,

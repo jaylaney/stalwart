@@ -33,7 +33,8 @@ use super::{
     },
 };
 use crate::calendar::{
-    ArchivedCalendarEventNotification, CalendarEventNotification, EVENT_NOTIFICATION_ZA_PENDING,
+    ArchivedCalendarEventNotification, CalendarEventNotification, CalendarEventNotificationContent,
+    ChangedBy, EVENT_NOTIFICATION_PRIVATE, EVENT_NOTIFICATION_ZA_PENDING,
 };
 use base64::{
     Engine,
@@ -42,9 +43,8 @@ use base64::{
 use calcard::icalendar::{ICalendar, ICalendarComponentType};
 use store::{
     Deserialize, Serialize,
-    write::{AlignedBytes, Archive, Archiver},
+    write::{Archive, ArchiveBytes, Archiver},
 };
-use types::dead_property::DeadProperty;
 use vault::{
     keys::{AAD_PK_DEK, PUBLIC_KEY_LEN, Secret, aad},
     session::SessionKeys,
@@ -120,6 +120,72 @@ pub fn archived_item_is_pending(item: &ArchivedCalendarEventNotification) -> boo
     item.flags.to_native() & EVENT_NOTIFICATION_ZA_PENDING != 0
 }
 
+/// The record of a sealed inbox item at Stalwart 1.0 (upgrade ruling 13),
+/// built without reading plaintext:
+/// - the row: `event_id` the linked event when the caller has one, else
+///   `None`; `changed_by` the sender; `calendar_ids` empty, so upstream's
+///   reaper (`reap_calendar_notifications`, which selects only rows whose
+///   non-empty `calendar_ids` all lie in the deleted calendars) never takes
+///   a sealed item; `flags` `EVENT_NOTIFICATION_PRIVATE`, upstream's
+///   `NotificationAudience::Members`, so only the owner's members see it
+///   (owner-only inbox access), plus `EVENT_NOTIFICATION_ZA_PENDING` while
+///   it waits for the drain. `size`, `created`, `modified` and `etag` are
+///   left to upstream's builder, which derives them from the sealed content
+///   archive (`refresh_from_content`, `GroupwareWrite::full`).
+/// - the content: `Itip { message: <the sealed tree>, previous: None,
+///   current: None }`; no plaintext snapshot is ever stored.
+pub fn sealed_item_record(
+    sealed: ICalendar,
+    changed_by: ChangedBy,
+    event_id: Option<u32>,
+    pending: bool,
+) -> (CalendarEventNotification, CalendarEventNotificationContent) {
+    (
+        CalendarEventNotification {
+            event_id,
+            changed_by,
+            calendar_ids: Vec::new(),
+            flags: EVENT_NOTIFICATION_PRIVATE
+                | if pending {
+                    EVENT_NOTIFICATION_ZA_PENDING
+                } else {
+                    0
+                },
+            ..Default::default()
+        },
+        CalendarEventNotificationContent::Itip {
+            message: sealed,
+            previous: None,
+            current: None,
+        },
+    )
+}
+
+/// The sealed tree of a stored item's content, if it is one the fork wrote
+/// (`Itip` with no snapshots); `None` for any other content.
+pub fn item_message(content: &CalendarEventNotificationContent) -> Option<&ICalendar> {
+    match content {
+        CalendarEventNotificationContent::Itip {
+            message,
+            previous: None,
+            current: None,
+        } => Some(message),
+        _ => None,
+    }
+}
+
+/// `item_message`, owned.
+pub fn into_item_message(content: CalendarEventNotificationContent) -> Option<ICalendar> {
+    match content {
+        CalendarEventNotificationContent::Itip {
+            message,
+            previous: None,
+            current: None,
+        } => Some(message),
+        _ => None,
+    }
+}
+
 /// Pops the root's key envelope and decodes it.
 fn pop_envelope(ical: &mut ICalendar) -> Result<Vec<u8>, SealError> {
     if !item_is_sealed(ical) {
@@ -157,15 +223,9 @@ pub fn seal_pending_item(
     let envelope = seal_pk_envelope(&dek, recipient_public, &pending_key_aad(recipient_id, &uid))?;
     seal_tree(ical, &dek, recipient_id, ITIP_SCOPE);
     let root = &mut ical.components[0].entries;
-    if let Some(text) = pair.and_then(|pair| {
-        seal_extra(
-            &dek,
-            &extra_aad(recipient_id, &uid),
-            None,
-            DeadProperty::default(),
-            Some(pair),
-        )
-    }) {
+    if let Some(text) =
+        pair.and_then(|pair| seal_extra(&dek, &extra_aad(recipient_id, &uid), None, Some(pair)))
+    {
         root.push(text_entry(EXTRA_PROP, text));
     }
     if let Some(token) = reply_token {
@@ -277,25 +337,32 @@ pub fn open_drained_item(
     unseal_tree(ical, &dek, owner_id, ITIP_SCOPE)
 }
 
-/// Spec 6.6: the read view of a stored item, with `unseal_event_archive`'s
+/// Spec 6.6: the read view of a stored item's content archive
+/// (`CalendarEventNotificationContent`), with `unseal_event_archive`'s
 /// contract: `version` copied from the stored archive, read-only, never
-/// written back. A plaintext item yields a copy of `stored`.
+/// written back. Content that is not a sealed fork item yields a copy of
+/// `stored`.
 pub fn unseal_item_archive(
-    stored: &Archive<AlignedBytes>,
+    stored: &Archive<ArchiveBytes>,
     keys: &SessionKeys,
     account_id: u32,
-) -> Result<Archive<AlignedBytes>, SealError> {
+) -> Result<Archive<ArchiveBytes>, SealError> {
     let mut item = stored
-        .deserialize::<CalendarEventNotification>()
+        .deserialize::<CalendarEventNotificationContent>()
         .map_err(|_| SealError::Format)?;
-    if !item_is_sealed(&item.event) {
-        return Ok(stored.clone());
-    }
-    open_drained_item(&mut item.event, keys, account_id)?;
+    let message = match &mut item {
+        CalendarEventNotificationContent::Itip {
+            message,
+            previous: None,
+            current: None,
+        } if item_is_sealed(message) => message,
+        _ => return Ok(stored.clone()),
+    };
+    open_drained_item(message, keys, account_id)?;
     let bytes = Archiver::new(item)
         .serialize()
         .map_err(|_| SealError::Format)?;
-    let mut view = <Archive<AlignedBytes> as Deserialize>::deserialize(&bytes)
+    let mut view = <Archive<ArchiveBytes> as Deserialize>::deserialize(&bytes)
         .map_err(|_| SealError::Format)?;
     view.version = stored.version;
     Ok(view)
@@ -305,9 +372,9 @@ pub fn unseal_item_archive(
 mod tests {
     use super::*;
     use crate::calendar::{
-        CalendarEvent, CalendarEventData,
+        CalendarEventContent, CalendarEventData,
         seal::{
-            event::{seal_event, unseal_event},
+            event::{ZaEvent, seal_event, unseal_event},
             tree::SEALED_PROP,
         },
     };
@@ -355,9 +422,88 @@ mod tests {
             .unwrap()
     }
 
-    fn archive_of(item: CalendarEventNotification) -> Archive<AlignedBytes> {
+    fn archive_of<T>(item: T) -> Archive<ArchiveBytes>
+    where
+        T: rkyv::Archive
+            + for<'a> rkyv::Serialize<
+                rkyv::api::high::HighSerializer<
+                    Vec<u8>,
+                    rkyv::ser::allocator::ArenaHandle<'a>,
+                    rkyv::rancor::Error,
+                >,
+            > + store::write::ArchiveCompression,
+    {
         let bytes = Archiver::new(item).serialize().unwrap();
-        <Archive<AlignedBytes> as Deserialize>::deserialize(&bytes).unwrap()
+        <Archive<ArchiveBytes> as Deserialize>::deserialize(&bytes).unwrap()
+    }
+
+    /// A stored item as the fan-out or the drain writes it: the row and the
+    /// content archives.
+    fn stored_item(
+        ical: ICalendar,
+        pending: bool,
+    ) -> (Archive<ArchiveBytes>, Archive<ArchiveBytes>) {
+        let (row, content) = sealed_item_record(ical, ChangedBy::PrincipalId(3), None, pending);
+        (archive_of(row), archive_of(content))
+    }
+
+    #[test]
+    fn sealed_item_record_reads_no_plaintext_and_is_owner_only() {
+        let (public, _) = generate_keypair();
+        let mut ical = tree();
+        seal_pending_item(&mut ical, 9, &public, None, None).unwrap();
+        let (row, content) =
+            sealed_item_record(ical.clone(), ChangedBy::PrincipalId(3), Some(5), true);
+        assert!(row.calendar_ids.is_empty(), "never reaped by upstream");
+        assert_eq!(
+            row.flags,
+            EVENT_NOTIFICATION_PRIVATE | EVENT_NOTIFICATION_ZA_PENDING
+        );
+        assert_eq!(
+            crate::calendar::notification::NotificationAudience::from_flags(row.flags),
+            crate::calendar::notification::NotificationAudience::Members
+        );
+        assert_eq!(row.event_id, Some(5));
+        assert_eq!(item_message(&content), Some(&ical));
+        assert!(matches!(
+            &content,
+            CalendarEventNotificationContent::Itip {
+                previous: None,
+                current: None,
+                ..
+            }
+        ));
+        let (drained, _) = sealed_item_record(ical, ChangedBy::PrincipalId(3), None, false);
+        assert_eq!(drained.flags, EVENT_NOTIFICATION_PRIVATE);
+        // Only the fork's shape is an item message.
+        assert!(
+            item_message(&CalendarEventNotificationContent::Itip {
+                message: tree(),
+                previous: None,
+                current: Some(tree()),
+            })
+            .is_none()
+        );
+        assert!(item_message(&CalendarEventNotificationContent::default()).is_none());
+    }
+
+    #[test]
+    fn pending_flag_is_clear_of_upstream_notification_flags() {
+        use crate::calendar::{
+            EVENT_NOTIFICATION_HIDE_ATTENDEES, EVENT_NOTIFICATION_IS_CHANGE,
+            EVENT_NOTIFICATION_IS_DESTROY, EVENT_NOTIFICATION_IS_DIRECT,
+            EVENT_NOTIFICATION_IS_DRAFT,
+        };
+        for flag in [
+            EVENT_NOTIFICATION_IS_DRAFT,
+            EVENT_NOTIFICATION_IS_CHANGE,
+            EVENT_NOTIFICATION_IS_DESTROY,
+            EVENT_NOTIFICATION_IS_DIRECT,
+            EVENT_NOTIFICATION_PRIVATE,
+            EVENT_NOTIFICATION_HIDE_ATTENDEES,
+        ] {
+            assert_eq!(flag & EVENT_NOTIFICATION_ZA_PENDING, 0);
+        }
     }
 
     #[test]
@@ -529,12 +675,11 @@ mod tests {
         let (public, private) = generate_keypair();
         let mut two = pair();
         two.insert("other@example.com", [8; TOKEN_LEN]);
-        let two_pairs = pending_with_extra(&public, |dek, aad| {
-            seal_extra(dek, aad, None, DeadProperty::default(), Some(&two))
-        });
+        let two_pairs =
+            pending_with_extra(&public, |dek, aad| seal_extra(dek, aad, None, Some(&two)));
         // A format 1 bundle (no pair list) under the item's purpose.
         let no_pairs = pending_with_extra(&public, |dek, aad| {
-            seal_extra(dek, aad, Some("name".into()), DeadProperty::default(), None)
+            seal_extra(dek, aad, Some("name".into()), None)
         });
         for (name, mut item) in [("two pairs", two_pairs), ("no pair list", no_pairs)] {
             assert_eq!(
@@ -606,7 +751,7 @@ mod tests {
             .iter_mut()
             .find(|e| e.name == ICalendarProperty::Uid)
             .expect("UID entry");
-        entry.values = vec![ICalendarValue::Text(uid.to_string())];
+        entry.values = [ICalendarValue::Text(uid.to_string())].into();
         moved
     }
 
@@ -652,19 +797,25 @@ mod tests {
         );
         // Envelopes: a sealed event is not a drained item, nor the reverse.
         let keys = keys();
-        let mut event = CalendarEvent {
-            data: CalendarEventData::new(tree(), Tz::Floating, 100, &mut None),
+        let mut event = ZaEvent {
+            content: CalendarEventContent {
+                data: CalendarEventData::new(tree(), Tz::Floating, 100),
+                ..Default::default()
+            },
             ..Default::default()
         };
         seal_event(&mut event, &keys, 9, None).unwrap();
         assert_eq!(
-            open_drained_item(&mut event.data.event.clone(), &keys, 9),
+            open_drained_item(&mut event.content.data.event.clone(), &keys, 9),
             Err(SealError::Aead)
         );
         let mut drained = tree();
         seal_drained_item(&mut drained, &keys, 9).unwrap();
-        let mut as_event = CalendarEvent {
-            data: CalendarEventData::new(drained, Tz::Floating, 100, &mut None),
+        let mut as_event = ZaEvent {
+            content: CalendarEventContent {
+                data: CalendarEventData::new(drained, Tz::Floating, 100),
+                ..Default::default()
+            },
             ..Default::default()
         };
         assert_eq!(unseal_event(&mut as_event, &keys, 9), Err(SealError::Aead));
@@ -677,25 +828,18 @@ mod tests {
         let (public, _) = generate_keypair();
         let mut ical = tree();
         seal_pending_item(&mut ical, 9, &public, None, None).unwrap();
-        let stored = archive_of(CalendarEventNotification {
-            event: ical,
-            flags: EVENT_NOTIFICATION_ZA_PENDING,
-            ..Default::default()
-        });
+        let (row, stored) = stored_item(ical, true);
         assert!(archived_item_is_pending(
-            stored.unarchive::<CalendarEventNotification>().unwrap()
+            row.unarchive::<CalendarEventNotification>().unwrap()
         ));
         assert_eq!(
             unseal_item_archive(&stored, &keys, 9).err(),
             Some(SealError::Structure("pending item"))
         );
         // Plaintext (Review Focus 4): passes through as stored.
-        let plain = archive_of(CalendarEventNotification {
-            event: tree(),
-            ..Default::default()
-        });
+        let (row, plain) = stored_item(tree(), false);
         assert!(!archived_item_is_pending(
-            plain.unarchive::<CalendarEventNotification>().unwrap()
+            row.unarchive::<CalendarEventNotification>().unwrap()
         ));
         let view = unseal_item_archive(&plain, &keys, 9).unwrap();
         assert_eq!(view.as_bytes(), plain.as_bytes());
@@ -703,18 +847,24 @@ mod tests {
         // Drained: a plaintext view that keeps the stored version.
         let mut ical = tree();
         seal_drained_item(&mut ical, &keys, 9).unwrap();
-        let stored = archive_of(CalendarEventNotification {
-            event: ical,
-            ..Default::default()
-        });
+        let (_, stored) = stored_item(ical, false);
         assert!(!String::from_utf8_lossy(stored.as_bytes()).contains("item-summary-canary"));
         let view = unseal_item_archive(&stored, &keys, 9).unwrap();
         assert_eq!(view.version, stored.version);
         assert_eq!(
-            view.deserialize::<CalendarEventNotification>()
-                .unwrap()
-                .event,
-            tree()
+            into_item_message(
+                view.deserialize::<CalendarEventNotificationContent>()
+                    .unwrap()
+            ),
+            Some(tree())
         );
+        // Upstream's own content (a snapshot) is not opened: as stored.
+        let snapshot = archive_of(CalendarEventNotificationContent::Itip {
+            message: tree(),
+            previous: None,
+            current: Some(tree()),
+        });
+        let view = unseal_item_archive(&snapshot, &keys, 9).unwrap();
+        assert_eq!(view.as_bytes(), snapshot.as_bytes());
     }
 }

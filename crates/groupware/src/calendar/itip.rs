@@ -361,6 +361,10 @@ impl ItipIngest for Server {
             batch.with_account_id(account_id);
             self.limit_disk_quota(&mut batch, &account);
             self.limit_object_quota(&mut batch, &account, StorageQuota::MaxCalendarEvents);
+            // Mail spec 6.1: iMIP is reached only for an account read as
+            // ordinary; its writes take the ingest's provisioning fence, in
+            // every commit chunk (each write below ends in a commit point).
+            self.za_provisioning_fence(&mut batch, account_id);
             let document_id = batch.reserve_document_id(account_id, Collection::CalendarEvent);
             event
                 .insert(
@@ -373,6 +377,7 @@ impl ItipIngest for Server {
                     &mut batch,
                 )
                 .caused_by(trc::location!())?;
+            self.za_provisioning_fence(&mut batch, account_id);
             if NotificationQuota::default()
                 .reserve(
                     self,
@@ -380,15 +385,10 @@ impl ItipIngest for Server {
                     notification_content.stored_size(),
                     &mut batch,
                 )
-<<<<<<< HEAD
-                .caused_by(trc::location!())?;
-            // Mail spec 6.1: iMIP is reached only for an account read as
-            // ordinary; its writes take the ingest's provisioning fence.
-            self.za_provisioning_fence(&mut batch, account_id);
-=======
                 .await
                 .caused_by(trc::location!())?
             {
+                self.za_provisioning_fence(&mut batch, account_id);
                 let itip_document_id =
                     batch.reserve_document_id(account_id, Collection::CalendarEventNotification);
                 notification
@@ -402,7 +402,7 @@ impl ItipIngest for Server {
                     )
                     .caused_by(trc::location!())?;
             }
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+            self.za_provisioning_fence(&mut batch, account_id);
             self.commit_batch(batch).await.caused_by(trc::location!())?;
 
             Ok(None)
@@ -1001,6 +1001,10 @@ async fn commit_itip_merge(
     let mut batch = BatchBuilder::new();
     batch.with_account_id(account_id);
     server.limit_disk_quota(&mut batch, &account);
+    // Mail spec 6.1: as the import's batch in `itip_ingest`, in every commit
+    // chunk; the RSVP handler, the other caller, refuses key accounts' links
+    // before this.
+    server.za_provisioning_fence(&mut batch, account_id);
     event
         .update_full(
             content,
@@ -1022,13 +1026,8 @@ async fn commit_itip_merge(
             &mut AlarmTasks::None,
             &mut batch,
         )
-<<<<<<< HEAD
-        .caused_by(trc::location!())?;
-    // Mail spec 6.1: as the import's batch in `itip_ingest`; the RSVP
-    // handler, the other caller, refuses key accounts' links before this.
-    server.za_provisioning_fence(&mut batch, account_id);
-=======
         .await?;
+    server.za_provisioning_fence(&mut batch, account_id);
     if NotificationQuota::default()
         .reserve(
             server,
@@ -1039,6 +1038,7 @@ async fn commit_itip_merge(
         .await
         .caused_by(trc::location!())?
     {
+        server.za_provisioning_fence(&mut batch, account_id);
         let itip_document_id =
             batch.reserve_document_id(account_id, Collection::CalendarEventNotification);
         notification
@@ -1052,7 +1052,7 @@ async fn commit_itip_merge(
             )
             .caused_by(trc::location!())?;
     }
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+    server.za_provisioning_fence(&mut batch, account_id);
     server
         .commit_batch(batch)
         .await

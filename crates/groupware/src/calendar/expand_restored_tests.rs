@@ -6,13 +6,16 @@
 
 use super::*;
 use calcard::{Entry, Parser};
-use chrono::NaiveDate;
-
+// Restored from 0.16.27. Ruling 44: chrono is no longer a dependency at
+// 1.0, so the naive timestamp is computed with jiff (same value), and
+// `CalendarEventData::new` lost its alarm out-parameter.
 fn naive(year: i32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> i64 {
-    NaiveDate::from_ymd_opt(year, month, day)
-        .and_then(|date| date.and_hms_opt(hour, minute, second))
-        .map(|date_time| date_time.and_utc().timestamp())
+    jiff::civil::date(year as i16, month as i8, day as i8)
+        .at(hour as i8, minute as i8, second as i8, 0)
+        .to_zoned(jiff::tz::TimeZone::UTC)
         .expect("valid date")
+        .timestamp()
+        .as_second()
 }
 
 fn key(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> RecurrenceKey {
@@ -25,7 +28,7 @@ fn event_data(ical: &str) -> CalendarEventData {
     let Entry::ICalendar(ical) = entry else {
         panic!("failed to parse iCalendar: {entry:?}");
     };
-    CalendarEventData::new(ical, Tz::UTC, 1000, &mut None)
+    CalendarEventData::new(ical, Tz::UTC, 1000)
 }
 
 fn expand_key(data: &CalendarEventData, key: RecurrenceKey) -> Vec<(u32, i64)> {
@@ -110,14 +113,18 @@ fn this_and_future_instances_get_distinct_keys() {
         expand_key(&data, key(2027, 3, 15, 9, 0)),
         [(2, naive(2027, 3, 15, 10, 0, 0))]
     );
+    // Ruling 44, an intended 1.0 change: an instance a RANGE=THISANDFUTURE
+    // override shifts keeps the series' recurrence id (RFC 5545: the
+    // original start, 09:00), not its shifted start; 0.16 keyed it at 10:00.
     assert_eq!(
-        expand_key(&data, key(2027, 3, 22, 10, 0)),
+        expand_key(&data, key(2027, 3, 22, 9, 0)),
         [(2, naive(2027, 3, 22, 10, 0, 0))]
     );
     assert_eq!(
-        expand_key(&data, key(2027, 3, 29, 10, 0)),
+        expand_key(&data, key(2027, 3, 29, 9, 0)),
         [(2, naive(2027, 3, 29, 10, 0, 0))]
     );
+    assert!(expand_key(&data, key(2027, 3, 22, 10, 0)).is_empty());
     assert_eq!(
         expand_key(&data, key(2027, 3, 1, 9, 0)),
         [(1, naive(2027, 3, 1, 9, 0, 0))]

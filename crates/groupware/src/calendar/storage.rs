@@ -12,26 +12,21 @@ use crate::{
     DavResourceName, DestroyArchive, RFC_3986, SizeWriter,
     cache::GroupwareCache,
     calendar::{
-<<<<<<< HEAD
-        ArchivedCalendarEventNotification, CalendarEventNotification,
-        alarm::CalendarAlarmType,
-        fanout::ZaDeleteMessage,
-        seal::{ZaKeyDomain, seal_error, unseal_event_in_domain},
-        sharing::resolve::za_owned_calendar_context,
-=======
         ArchivedCalendarEventContent, ArchivedCalendarEventNotification, CalendarEventContent,
         CalendarEventNotification, CalendarEventNotificationContent, ChangedBy as EventChangedBy,
         EVENT_DRAFT, EVENT_HAS_ALARMS, EVENT_NOTIFICATION_IS_CHANGE, EVENT_NOTIFICATION_IS_DESTROY,
         EVENT_NOTIFICATION_IS_DIRECT, EVENT_NOTIFICATION_IS_DRAFT,
         alarm::{AlarmTarget, CalendarAlarmType},
         alerts::DefaultAlertsResolver,
+        fanout::ZaDeleteMessage,
         notification::{
             AccountViewers, CalendarNotificationReap, CalendarNotificationViewers,
             NotificationAudience, has_viewers, may_have_viewers,
         },
         privacy::ICalendarPrivacy,
         schedule::{AlarmTasks, EventAlarmScheduler, EventAlarmUsers, EventAlarms},
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+        seal::{ZaEvent, ZaKeyDomain, seal_error, unseal_event_in_domain},
+        sharing::resolve::za_owned_calendar_context,
     },
     scheduling::{ItipMessages, event_cancel::itip_cancel, recipient::RecipientPolicy},
 };
@@ -61,16 +56,12 @@ use store::{
     },
 };
 use trc::AddContext;
-<<<<<<< HEAD
-use types::{collection::Collection, field::CalendarNotificationField, id::Id};
-use vault::session::SessionKeys;
-=======
 use types::{
-    collection::{Collection, VanishedCollection},
+    collection::Collection,
     field::{CalendarEventField, CalendarNotificationField, Field},
     id::Id,
 };
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+use vault::session::SessionKeys;
 
 pub trait ItipAutoExpunge: Sync + Send {
     fn itip_auto_expunge(
@@ -166,38 +157,39 @@ impl CalendarEvent {
         event_content: &ArchivedCalendarEventContent,
         account_id: u32,
         document_id: u32,
-<<<<<<< HEAD
-        batch: &'x mut BatchBuilder,
-    ) -> trc::Result<&'x mut BatchBuilder> {
-        self.update_at(
+        parent_id: Option<Slot>,
+        batch: &mut BatchBuilder,
+    ) -> trc::Result<String> {
+        self.update_full_at(
+            content,
             changed_by,
             event,
+            event_content,
             account_id,
             document_id,
+            parent_id,
             now() as i64,
             batch,
         )
     }
 
-    /// Rebuild a fenced event write without advancing its original timestamp.
-    pub fn update_at<'x>(
+    /// `update_full`, rebuilding a fenced event write without advancing its
+    /// original timestamp.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_full_at(
         self,
-        changed_by: AccountTenantIds,
+        content: CalendarEventContent,
+        changed_by: ChangedBy,
         event: Archive<&ArchivedCalendarEvent>,
+        event_content: &ArchivedCalendarEventContent,
         account_id: u32,
         document_id: u32,
-        modified: i64,
-        batch: &'x mut BatchBuilder,
-    ) -> trc::Result<&'x mut BatchBuilder> {
-        let mut new_event = self;
-        new_event.modified = modified;
-=======
         parent_id: Option<Slot>,
+        modified: i64,
         batch: &mut BatchBuilder,
     ) -> trc::Result<String> {
         let mut new_event = self;
-        new_event.modified = now() as i64;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+        new_event.modified = modified;
 
         let update = SplitUpdate::full(event, event_content, new_event, content, ())?;
         let etag = update.etag();
@@ -220,32 +212,33 @@ impl CalendarEvent {
         document_id: u32,
         parent_id: Option<Slot>,
         batch: &mut BatchBuilder,
-<<<<<<< HEAD
-    ) -> trc::Result<&mut BatchBuilder> {
-        self.insert_at(
+    ) -> trc::Result<String> {
+        self.update_meta_at(
             changed_by,
+            event,
             account_id,
             document_id,
-            next_alarm,
+            parent_id,
             now() as i64,
             batch,
         )
     }
 
-    /// Rebuild a fenced create using its initially assigned timestamps.
-    pub fn insert_at(
+    /// `update_meta`, rebuilding a fenced event write without advancing its
+    /// original timestamp.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_meta_at(
         self,
-        changed_by: AccountTenantIds,
+        changed_by: ChangedBy,
+        event: Archive<&ArchivedCalendarEvent>,
         account_id: u32,
         document_id: u32,
-        next_alarm: Option<CalendarAlarm>,
-        timestamp: i64,
+        parent_id: Option<Slot>,
+        modified: i64,
         batch: &mut BatchBuilder,
-    ) -> trc::Result<&mut BatchBuilder> {
-=======
     ) -> trc::Result<String> {
         let mut new_event = self;
-        new_event.modified = now() as i64;
+        new_event.modified = modified;
 
         let update = SplitUpdate::meta_only(event, new_event);
         let etag = update.etag();
@@ -271,7 +264,32 @@ impl CalendarEvent {
         next_alarms: EventAlarms,
         batch: &mut BatchBuilder,
     ) -> trc::Result<String> {
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+        self.insert_at(
+            content,
+            changed_by,
+            account_id,
+            document_id,
+            parent_id,
+            next_alarms,
+            now() as i64,
+            batch,
+        )
+    }
+
+    /// `insert`, rebuilding a fenced create with its initially assigned
+    /// timestamps.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_at(
+        self,
+        content: CalendarEventContent,
+        changed_by: ChangedBy,
+        account_id: u32,
+        document_id: impl Into<PendingId>,
+        parent_id: Option<Slot>,
+        next_alarms: EventAlarms,
+        timestamp: i64,
+        batch: &mut BatchBuilder,
+    ) -> trc::Result<String> {
         let mut event = self;
         event.modified = timestamp;
         event.created = timestamp;
@@ -422,7 +440,7 @@ impl DestroyArchive<Archive<&ArchivedCalendar>> {
         account_info: &AccountInfo,
         account_id: u32,
         document_id: u32,
-        mut children_ids: Vec<u32>,
+        children_ids: Vec<u32>,
         alarm_ids: &RoaringBitmap,
         cleanup: &ContainerCleanup,
         delete_path: Option<String>,
@@ -431,10 +449,13 @@ impl DestroyArchive<Archive<&ArchivedCalendar>> {
     ) -> trc::Result<()> {
         self.delete_with_events_za(
             server,
+            access_token,
             account_info,
             account_id,
             document_id,
             children_ids,
+            alarm_ids,
+            cleanup,
             delete_path,
             send_itip,
             None,
@@ -445,16 +466,20 @@ impl DestroyArchive<Archive<&ArchivedCalendar>> {
     }
 
     /// `delete_with_events`. With `za_keys` (a key account, invitations
-    /// spec 5.5) each event's CANCEL is built from its unsealed tree and
-    /// returned for the fan-out instead of queued.
+    /// spec 5.5) each event's write asserts the calendar's context, and its
+    /// CANCEL is built from its unsealed tree and returned for the fan-out
+    /// instead of queued.
     #[allow(clippy::too_many_arguments)]
     pub async fn delete_with_events_za(
         self,
         server: &Server,
+        access_token: &AccessToken,
         account_info: &AccountInfo,
         account_id: u32,
         document_id: u32,
-        children_ids: Vec<u32>,
+        mut children_ids: Vec<u32>,
+        alarm_ids: &RoaringBitmap,
+        cleanup: &ContainerCleanup,
         delete_path: Option<String>,
         send_itip: bool,
         za_keys: Option<&SessionKeys>,
@@ -462,38 +487,16 @@ impl DestroyArchive<Archive<&ArchivedCalendar>> {
     ) -> trc::Result<Vec<ZaDeleteMessage>> {
         // Process deletions
         let calendar_id = document_id;
-<<<<<<< HEAD
+        let context = match za_keys {
+            Some(keys) => Some(
+                za_owned_calendar_context(server, keys, calendar_id)
+                    .await
+                    .map_err(|error| error.into_store_error(account_id, calendar_id))?,
+            ),
+            None => None,
+        };
         let mut za_messages = Vec::new();
-        for document_id in children_ids {
-            if let Some(event_) = server
-                .store()
-                .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
-                    account_id,
-                    Collection::CalendarEvent,
-                    document_id,
-                ))
-                .await?
-            {
-                let context = if let Some(keys) = za_keys {
-                    Some(
-                        za_owned_calendar_context(server, keys, calendar_id)
-                            .await
-                            .map_err(|error| error.into_store_error(account_id, calendar_id))?,
-                    )
-                } else {
-                    None
-                };
-                if let Some(context) = &context {
-                    context.assert_in(batch);
-                }
-                za_messages.extend(
-                    DestroyArchive(
-                        event_
-                            .to_unarchived::<CalendarEvent>()
-                            .caused_by(trc::location!())?,
-                    )
-                    .delete_za(
-=======
+        let cutoff = now() as i64;
         let mut resolver = DefaultAlertsResolver::default();
         let mut quota = NotificationQuota::default();
         server
@@ -572,36 +575,37 @@ impl DestroyArchive<Archive<&ArchivedCalendar>> {
                         .await
                         .caused_by(trc::location!())?;
                 }
-                DestroyArchive(event)
-                    .delete_from_calendar(
-                        server,
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
-                        account_info,
-                        account_id,
-                        document_id,
-                        calendar_id,
-<<<<<<< HEAD
-                        None,
-                        send_itip,
-                        za_keys,
-                        context.as_ref().map(|context| &context.domain),
-                        batch,
-                    )?,
+                // Every commit chunk that holds an event's write asserts the
+                // calendar's context (each write below ends in a commit point).
+                if let Some(context) = &context {
+                    context.assert_in(batch);
+                }
+                za_messages.extend(
+                    DestroyArchive(event)
+                        .delete_from_calendar_za(
+                            server,
+                            account_info,
+                            account_id,
+                            document_id,
+                            calendar_id,
+                            content,
+                            &mut tasks,
+                            None,
+                            send_itip,
+                            &mut resolver,
+                            cleanup,
+                            context.as_ref().map(|context| &context.domain),
+                            cutoff,
+                            batch,
+                        )
+                        .await?,
                 );
-=======
-                        content,
-                        &mut tasks,
-                        None,
-                        send_itip,
-                        &mut resolver,
-                        cleanup,
-                        batch,
-                    )
-                    .await?;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
             }
         }
 
+        if let Some(context) = &context {
+            context.assert_in(batch);
+        }
         self.delete(
             server,
             account_info.changed_by(),
@@ -609,13 +613,9 @@ impl DestroyArchive<Archive<&ArchivedCalendar>> {
             document_id,
             delete_path,
             batch,
-<<<<<<< HEAD
-        )?;
-        Ok(za_messages)
-=======
         )
-        .await
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+        .await?;
+        Ok(za_messages)
     }
 
     pub async fn delete(
@@ -696,38 +696,57 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
         send_itip: bool,
         batch: &mut BatchBuilder,
     ) -> trc::Result<()> {
-<<<<<<< HEAD
-        self.delete_za(
-=======
-        self.delete_from_calendar(
+        self.delete_za_at(
             server,
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
             account_info,
             account_id,
             document_id,
             calendar_id,
-<<<<<<< HEAD
+            content,
             delete_path,
             send_itip,
             None,
-            None,
+            now() as i64,
             batch,
         )
+        .await
         .map(|_| ())
     }
 
-    /// `delete`. With `za_keys`, the CANCEL `delete_all_za` builds is
-    /// returned instead of queued.
+    /// `delete`. With `domain` (a key account's event, invitations spec
+    /// 5.5), the CANCEL is built from the unsealed tree and returned for the
+    /// fan-out instead of queued. `cutoff` is the initial DELETE's time, kept
+    /// when a fenced mutation is rebuilt. The caller asserts the event's
+    /// calendar context in the same commit chunk.
     #[allow(clippy::too_many_arguments)]
-    pub fn delete_za(
+    pub async fn delete_za_at(
         self,
-=======
+        server: &Server,
+        account_info: &AccountInfo,
+        account_id: u32,
+        document_id: u32,
+        calendar_id: u32,
+        content: Option<Archive<ArchiveBytes>>,
+        delete_path: Option<String>,
+        send_itip: bool,
+        domain: Option<&ZaKeyDomain>,
+        cutoff: i64,
+        batch: &mut BatchBuilder,
+    ) -> trc::Result<Option<ZaDeleteMessage>> {
+        self.delete_from_calendar_za(
+            server,
+            account_info,
+            account_id,
+            document_id,
+            calendar_id,
             content,
             &mut AlarmTasks::None,
             delete_path,
             send_itip,
             &mut DefaultAlertsResolver::default(),
             &ContainerCleanup::empty(Collection::CalendarEvent),
+            domain,
+            cutoff,
             batch,
         )
         .await
@@ -737,20 +756,10 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
     pub async fn delete_with_cleanup(
         self,
         server: &Server,
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
         account_info: &AccountInfo,
         account_id: u32,
         document_id: u32,
         calendar_id: u32,
-<<<<<<< HEAD
-        delete_path: Option<String>,
-        send_itip: bool,
-        za_keys: Option<&SessionKeys>,
-        domain: Option<&ZaKeyDomain>,
-        batch: &mut BatchBuilder,
-    ) -> trc::Result<Option<ZaDeleteMessage>> {
-        self.delete_za_at(
-=======
         content: Option<Archive<ArchiveBytes>>,
         tasks: &mut AlarmTasks,
         delete_path: Option<String>,
@@ -759,26 +768,10 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
     ) -> trc::Result<()> {
         self.delete_from_calendar(
             server,
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
             account_info,
             account_id,
             document_id,
             calendar_id,
-<<<<<<< HEAD
-            delete_path,
-            send_itip,
-            za_keys,
-            domain,
-            now() as i64,
-            batch,
-        )
-    }
-
-    /// Preserve the initial DELETE cutoff when rebuilding a fenced mutation.
-    #[allow(clippy::too_many_arguments)]
-    pub fn delete_za_at(
-        self,
-=======
             content,
             tasks,
             delete_path,
@@ -794,21 +787,10 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
     async fn delete_from_calendar(
         self,
         server: &Server,
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
         account_info: &AccountInfo,
         account_id: u32,
         document_id: u32,
         calendar_id: u32,
-<<<<<<< HEAD
-        delete_path: Option<String>,
-        send_itip: bool,
-        za_keys: Option<&SessionKeys>,
-        domain: Option<&ZaKeyDomain>,
-        cutoff: i64,
-        batch: &mut BatchBuilder,
-    ) -> trc::Result<Option<ZaDeleteMessage>> {
-        let mut za_message = None;
-=======
         content: Option<Archive<ArchiveBytes>>,
         tasks: &mut AlarmTasks,
         delete_path: Option<String>,
@@ -817,7 +799,45 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
         cleanup: &ContainerCleanup,
         batch: &mut BatchBuilder,
     ) -> trc::Result<()> {
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+        self.delete_from_calendar_za(
+            server,
+            account_info,
+            account_id,
+            document_id,
+            calendar_id,
+            content,
+            tasks,
+            delete_path,
+            send_itip,
+            resolver,
+            cleanup,
+            None,
+            now() as i64,
+            batch,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn delete_from_calendar_za(
+        self,
+        server: &Server,
+        account_info: &AccountInfo,
+        account_id: u32,
+        document_id: u32,
+        calendar_id: u32,
+        content: Option<Archive<ArchiveBytes>>,
+        tasks: &mut AlarmTasks,
+        delete_path: Option<String>,
+        send_itip: bool,
+        resolver: &mut DefaultAlertsResolver,
+        cleanup: &ContainerCleanup,
+        domain: Option<&ZaKeyDomain>,
+        cutoff: i64,
+        batch: &mut BatchBuilder,
+    ) -> trc::Result<Option<ZaDeleteMessage>> {
+        let mut za_message = None;
         if let Some(delete_idx) = self
             .0
             .inner
@@ -857,31 +877,21 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
                     .custom(update.into_builder(account_info.changed_by(), None))
                     .caused_by(trc::location!())?;
             } else {
-<<<<<<< HEAD
-                za_message = self.delete_all_za_at(
-                    account_info,
-                    account_id,
-                    document_id,
-                    send_itip,
-                    za_keys,
-                    domain,
-                    cutoff,
-                    batch,
-                )?;
-=======
-                self.remove_all(
-                    server,
-                    account_info,
-                    account_id,
-                    document_id,
-                    content,
-                    tasks,
-                    send_itip,
-                    cleanup,
-                    batch,
-                )
-                .await?;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+                za_message = self
+                    .remove_all_za_at(
+                        server,
+                        account_info,
+                        account_id,
+                        document_id,
+                        content,
+                        tasks,
+                        send_itip,
+                        cleanup,
+                        domain,
+                        cutoff,
+                        batch,
+                    )
+                    .await?;
             }
 
             if let Some(delete_path) = delete_path {
@@ -905,66 +915,6 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
         send_itip: bool,
         batch: &mut BatchBuilder,
     ) -> trc::Result<()> {
-<<<<<<< HEAD
-        self.delete_all_za(
-            account_info,
-            account_id,
-            document_id,
-            send_itip,
-            None,
-            None,
-            batch,
-        )
-        .map(|_| ())
-    }
-
-    /// `delete_all`. With `za_keys` (a key account, invitations spec 5.5)
-    /// the stored tree is unsealed before `itip_cancel`, and the CANCEL (or
-    /// an attendee's declined REPLY) is returned with the stored pairs for
-    /// the fan-out instead of queued; whenever the scheduling gate holds,
-    /// with no message when `itip_cancel` builds none (key pinning spec 5.1
-    /// item 2).
-    #[allow(clippy::too_many_arguments)]
-    pub fn delete_all_za(
-        self,
-        account_info: &AccountInfo,
-        account_id: u32,
-        document_id: u32,
-        send_itip: bool,
-        za_keys: Option<&SessionKeys>,
-        domain: Option<&ZaKeyDomain>,
-        batch: &mut BatchBuilder,
-    ) -> trc::Result<Option<ZaDeleteMessage>> {
-        self.delete_all_za_at(
-            account_info,
-            account_id,
-            document_id,
-            send_itip,
-            za_keys,
-            domain,
-            now() as i64,
-            batch,
-        )
-    }
-
-    /// Shared delete implementation; callers rebuilding reuse the initial
-    /// cutoff so the exact original Task/Due alarm cleanup is retained.
-    #[allow(clippy::too_many_arguments)]
-    pub fn delete_all_za_at(
-        self,
-        account_info: &AccountInfo,
-        account_id: u32,
-        document_id: u32,
-        send_itip: bool,
-        za_keys: Option<&SessionKeys>,
-        domain: Option<&ZaKeyDomain>,
-        cutoff: i64,
-        batch: &mut BatchBuilder,
-    ) -> trc::Result<Option<ZaDeleteMessage>> {
-        let event = self.0;
-        let mut za_message = None;
-        // Delete event
-=======
         self.remove_all(
             server,
             account_info,
@@ -992,8 +942,48 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
         cleanup: &ContainerCleanup,
         batch: &mut BatchBuilder,
     ) -> trc::Result<()> {
+        self.remove_all_za_at(
+            server,
+            account_info,
+            account_id,
+            document_id,
+            content,
+            tasks,
+            send_itip,
+            cleanup,
+            None,
+            now() as i64,
+            batch,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// `remove_all`. With `domain` (a key account, invitations spec 5.5) the
+    /// stored tree is unsealed before `itip_cancel`, and the CANCEL (or an
+    /// attendee's declined REPLY) is returned with the stored pairs for the
+    /// fan-out instead of queued; whenever the scheduling gate holds, with no
+    /// message when `itip_cancel` builds none (key pinning spec 5.1 item 2).
+    /// `cutoff` replaces upstream's `now` so a rebuilt mutation keeps the
+    /// initial gate.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn remove_all_za_at(
+        self,
+        server: &Server,
+        account_info: &AccountInfo,
+        account_id: u32,
+        document_id: u32,
+        content: Option<Archive<ArchiveBytes>>,
+        tasks: &mut AlarmTasks,
+        send_itip: bool,
+        cleanup: &ContainerCleanup,
+        domain: Option<&ZaKeyDomain>,
+        cutoff: i64,
+        batch: &mut BatchBuilder,
+    ) -> trc::Result<Option<ZaDeleteMessage>> {
         let event = self.0;
-        let now = now() as i64;
+        let now = cutoff;
+        let mut za_message = None;
 
         let has_alarms = event.inner.flags.to_native() & EVENT_HAS_ALARMS != 0;
         let send_itip =
@@ -1040,73 +1030,39 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
                 event.inner.metadata_kinds(),
             )
             .await?;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
         batch
             .with_account_id(account_id)
             .with_collection(Collection::CalendarEvent)
             .with_document(document_id);
 
-<<<<<<< HEAD
-        // Remove next alarm if it exists
-        let now = cutoff;
-        if let Some(next_alarm) = event.inner.data.next_alarm(now, Tz::Floating) {
-            next_alarm.delete_task(batch);
-        }
-
-        // Scheduling
-        if send_itip
-            && event.inner.schedule_tag.is_some()
-            && event.inner.data.event_range_end() > now
-        {
-            let mut event = event
-                .deserialize::<CalendarEvent>()
-=======
         if send_itip && let Some(content) = content {
             let content = content
                 .deserialize::<CalendarEventContent>()
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                 .caused_by(trc::location!())?;
-            let pairs = match za_keys {
-                Some(_) => unseal_event_in_domain(
-                    &mut event,
-                    domain.ok_or_else(|| {
-                        trc::StoreEvent::DataCorruption
-                            .into_err()
-                            .details("missing event key domain")
-                    })?,
-                )
-                .map_err(|err| seal_error(err, account_id, document_id))?,
-                None => None,
-            };
+            let policy =
+                RecipientPolicy::new(&server.core.groupware, event.inner.flags.to_native());
 
-<<<<<<< HEAD
-            let message = itip_cancel(&event.data.event, account_info.addresses(), true).ok();
-            if za_keys.is_some() {
-                let uid = event
-                    .data
-                    .event
-                    .uids()
-                    .next()
-                    .unwrap_or_default()
-                    .to_string();
+            if let Some(domain) = domain {
+                let meta = event
+                    .deserialize::<CalendarEvent>()
+                    .caused_by(trc::location!())?;
+                let mut opened = ZaEvent::new(meta, content);
+                let pairs = unseal_event_in_domain(&mut opened, domain)
+                    .map_err(|err| seal_error(err, account_id, document_id))?;
+                let tree = opened.content.data.event;
+                let messages = itip_cancel(&tree, account_info.addresses(), true, policy).ok();
+                let uid = tree.uids().next().unwrap_or_default().to_string();
                 za_message = Some(ZaDeleteMessage {
-                    message,
+                    messages,
                     pairs,
-                    event: event.data.event,
+                    event: tree,
                     document_id,
                     uid,
                 });
-            } else if let Some(messages) = message {
-                ItipMessages::new(vec![messages])
-=======
-            if let Ok(messages) = itip_cancel(
-                &content.data.event,
-                account_info.addresses(),
-                true,
-                RecipientPolicy::new(&server.core.groupware, event.inner.flags.to_native()),
-            ) {
+            } else if let Ok(messages) =
+                itip_cancel(&content.data.event, account_info.addresses(), true, policy)
+            {
                 ItipMessages::new(messages)
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                     .queue(batch)
                     .caused_by(trc::location!())?;
             }
@@ -1571,6 +1527,16 @@ impl DirectChangeNotification for Server {
         quota: &mut NotificationQuota,
         batch: &mut BatchBuilder,
     ) -> trc::Result<()> {
+        // Upgrade ruling 13: no direct-change snapshot of a key account's
+        // event is stored; its owner's notification collection holds only
+        // the fork's sealed inbox items.
+        if self
+            .za_is_key_account(account_id)
+            .await
+            .caused_by(trc::location!())?
+        {
+            return Ok(());
+        }
         let (notification, content, pending_event_id) =
             change.into_notification(access_token.account_id());
         if !self

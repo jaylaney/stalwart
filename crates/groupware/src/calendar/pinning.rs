@@ -117,6 +117,7 @@ pub fn za_participation_reply(
             &dt_stamp,
             instance.sequence.unwrap_or_default(),
             ItipExportAs::Attendee(attendee_entry_ids),
+            None,
         ));
     }
     let part_stat = part_stat?;
@@ -340,8 +341,20 @@ mod tests {
     use super::*;
     use crate::{
         calendar::drain::{InstanceKey, instance_key},
-        scheduling::{event_cancel::itip_cancel, snapshot::itip_snapshot},
+        scheduling::{
+            event_cancel::itip_cancel,
+            recipient::{AttendeeVisibility, RecipientPolicy},
+            snapshot::itip_snapshot,
+        },
     };
+
+    fn policy() -> RecipientPolicy {
+        RecipientPolicy {
+            visibility: AttendeeVisibility::All,
+            max_recipients: usize::MAX,
+            max_instances: usize::MAX,
+        }
+    }
     use calcard::{Entry, Parser, common::IanaString};
 
     const ALICE: &str = "key1@example.com";
@@ -613,7 +626,7 @@ mod tests {
         let rsvp_false = copy_with("PARTSTAT=DECLINED;RSVP=FALSE");
         let client_scheduled = parse(CLIENT_SCHEDULED);
         assert!(
-            itip_cancel(&declined, &bob(), true).is_err(),
+            itip_cancel(&declined, &bob(), true, policy()).is_err(),
             "upstream builds nothing"
         );
         let message = za_decline_all(&declined, &bob()).expect("the fork declines");
@@ -629,7 +642,7 @@ mod tests {
         // A deletion skips NEEDS-ACTION upstream (`skip_needs_action`); the
         // fork's gate has no PARTSTAT match at all.
         assert!(
-            itip_cancel(&needs_action, &bob(), true).is_err(),
+            itip_cancel(&needs_action, &bob(), true, policy()).is_err(),
             "upstream builds nothing at NEEDS-ACTION"
         );
         let message = za_decline_all(&needs_action, &bob()).expect("the fork declines");
