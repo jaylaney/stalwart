@@ -287,7 +287,9 @@ async fn antispam() {
         "classifier_features",
         "classifier",
         "pyzor",
-        "llm",
+        // Upgrade ruling 33: the "llm" case runs the LLM analysis, which
+        // needs a licence (AI models are off while `core.enterprise` is
+        // `None`). With no test licence it takes the SEL-only disposition.
     ] {
         if filter_test
             .as_ref()

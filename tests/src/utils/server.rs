@@ -17,8 +17,9 @@ use crate::{
 };
 use ahash::AHashMap;
 use common::{
-    BuildServer, Caches, Core, Data, DavResources, Inner, Server,
+    BuildServer, Caches, Core, Data, GroupwareResources, Inner, Server,
     auth::RECOVERY_ADMIN_ID,
+    cache::swap::SwapTier,
     config::{
         server::{Listeners, ServerProtocol},
         storage::Storage,
@@ -43,8 +44,8 @@ use registry::{
         enums::{EventPolicy, NetworkListenerProtocol, TracingLevel},
         prelude::{Object, ObjectType, SocketAddr},
         structs::{
-            Authentication, Certificate, Domain, NetworkListener, PublicText, SecretKeyFile,
-            SecretText, SystemSettings, Tracer, TracerStdout,
+            Authentication, Cache, CacheSwap, Certificate, Domain, NetworkListener, PublicText,
+            SecretKeyFile, SecretText, SystemSettings, Tracer, TracerStdout,
         },
     },
     types::{EnumImpl, datetime::UTCDateTime, map::Map},
@@ -207,7 +208,7 @@ impl TestServerBuilder {
             name: name.to_string(),
             protocol,
             use_tls: true,
-            tls_implicit,
+            implicit_tls: tls_implicit,
             ..Default::default()
         })
         .await;
@@ -217,6 +218,17 @@ impl TestServerBuilder {
     pub async fn with_object(self, object: impl Into<Object>) -> Self {
         self.insert_object(object).await;
         self
+    }
+
+    /// Sets the cache swap tier. 1.0 fixes the tier at boot, so a suite that
+    /// tests one tier boots its own server with it; every other suite keeps
+    /// the registry default, `CacheSwap::Disabled`, as boot does.
+    pub async fn with_cache_swap(self, swap: CacheSwap) -> Self {
+        self.with_object(Cache {
+            swap,
+            ..Default::default()
+        })
+        .await
     }
 
     pub fn with_logging(mut self) -> Self {
@@ -353,25 +365,33 @@ impl TestServerBuilder {
             search_store_destroy(&storage.search).await;
         }
 
+        // Build the IPC first: 1.0's telemetry takes the index queue's notifier
+        let (ipc, mut ipc_rxs) = build_ipc(!storage.coordinator.is_none());
+
         // Parse telemetry
-        let telemetry = Telemetry::parse(&mut self.bootstrap, &storage).await;
+        let telemetry =
+            Telemetry::parse(&mut self.bootstrap, &storage, ipc.index_queue_notify()).await;
 
         // Parse components
         let core = Box::pin(Core::parse(&mut self.bootstrap, storage)).await;
         let data = Data::parse(&mut self.bootstrap).await;
-        let cache = Caches::parse(&mut self.bootstrap).await;
+        let (cache, swap_rx) = Caches::parse(&mut self.bootstrap, &core.storage).await;
 
-        // Enable telemetry
-        telemetry.enable(true);
+        // Enable telemetry. As boot does: there is no test licence (upgrade
+        // ruling 33), so an enterprise build runs as an unlicensed one.
+        telemetry.enable(core.is_enterprise_edition());
 
         // Build inner
-        let (ipc, mut ipc_rxs) = build_ipc(!core.storage.coordinator.is_none());
         let inner = Arc::new(Inner {
             shared_core: core.into_shared(),
             data,
             ipc,
             cache,
         });
+
+        // Start the cache swap tier writer, as boot does (it runs only when
+        // the tier is enabled)
+        SwapTier::start(&inner, swap_rx);
 
         // Parse TCP acceptors
         servers
@@ -528,10 +548,14 @@ impl TestServer {
         (Session::test_with_shutdown(self.server.clone(), rx), tx)
     }
 
-    pub async fn resources(&self, name: &'static str, collection: Collection) -> Arc<DavResources> {
+    pub async fn resources(
+        &self,
+        name: &'static str,
+        collection: Collection,
+    ) -> Arc<GroupwareResources> {
         let account_id = self.account(name).id().document_id();
         self.server
-            .fetch_dav_resources(account_id, account_id, collection.into())
+            .fetch_groupware_resources(account_id, account_id, collection.into())
             .await
             .unwrap()
     }
@@ -589,7 +613,9 @@ impl TestServer {
                 shared_core: self.server.core.as_ref().clone().into_shared(),
                 data: Default::default(),
                 ipc,
-                cache: Caches::parse(&mut bp).await,
+                // The swap receiver is dropped: this inner never starts a
+                // swap writer
+                cache: Caches::parse(&mut bp, &self.server.core.storage).await.0,
             }
             .into(),
             ipc_rxs,

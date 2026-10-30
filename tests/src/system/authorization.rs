@@ -262,17 +262,10 @@ pub async fn test(test: &mut TestServer) {
             .object_id();
         ids.insert(ObjectType::PublicKey, pk_id);
 
-        let masked_id = account
-            .registry_create_many(
-                ObjectType::MaskedEmail,
-                [json!({
-                    Property::EmailDomain: "example.org",
-                })],
-            )
-            .await
-            .created(0)
-            .object_id();
-        ids.insert(ObjectType::MaskedEmail, masked_id);
+        // Upgrade ruling 33: 0.16 also created a masked email here and ran
+        // every check below on it. An unlicensed 1.0 server refuses
+        // `MaskedEmail` (`assert_enterprise_object`), so with no test licence
+        // that object takes the SEL-only disposition.
     }
 
     // John should not be able to see Jane's objects and vice versa
@@ -328,7 +321,7 @@ pub async fn test(test: &mut TestServer) {
     }
 
     // Admin should see all objects
-    for object_type in [ObjectType::PublicKey, ObjectType::MaskedEmail] {
+    for object_type in [ObjectType::PublicKey] {
         let objects = admin
             .registry_query(object_type, Vec::<(&str, &str)>::new(), Vec::<&str>::new())
             .await

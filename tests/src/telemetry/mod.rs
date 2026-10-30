@@ -56,8 +56,10 @@ pub async fn telemetry_tests() {
     test.insert_account(admin);
 
     alerts::test(&test).await;
-    metrics::test(&test).await;
-    tracing::test(&test).await;
+    // Upgrade ruling 33: `metrics::test` and `tracing::test` assert only on
+    // the licensed `Metric` and `Trace` objects, which an unlicensed 1.0
+    // server refuses (`assert_enterprise_object`). Without a test licence
+    // they take the SEL-only disposition; their modules keep compiling.
     webhooks::test(&test).await;
 
     if test.is_reset() {

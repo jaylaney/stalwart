@@ -277,35 +277,13 @@ pub async fn test(test: &TestServer) {
     let account_cache = test.server.account(account_id.document_id()).await.unwrap();
     assert!(account_cache.id_member_of.as_ref().is_empty());
 
-    // Create a masked email
-    let john = crate::utils::account::Account::new(
-        "johndoe@example.com",
-        "hello world",
-        &[],
-        "John",
-        account_id,
-    );
-    let response = john
-        .registry_create_many(
-            ObjectType::MaskedEmail,
-            [json!({
-                Property::EmailPrefix: "test",
-            })],
-        )
-        .await;
-    let masked = response.created(0);
-    let masked_id = masked.object_id();
-    let masked_email = masked.text_field("email").to_string();
+    // Upgrade ruling 33: 0.16 created a masked email here and resolved it
+    // (`account_id_from_email`, `rcpt_resolve`). An unlicensed 1.0 server
+    // refuses `MaskedEmail` (`assert_enterprise_object`), so with no test
+    // licence those parts take the SEL-only disposition.
     assert_eq!(
         test.server
             .account_id_from_email("johndoe@example.com", true)
-            .await
-            .unwrap(),
-        Some(account_id.document_id())
-    );
-    assert_eq!(
-        test.server
-            .account_id_from_email(&masked_email, true)
             .await
             .unwrap(),
         Some(account_id.document_id())
@@ -545,13 +523,6 @@ pub async fn test(test: &TestServer) {
             .unwrap(),
         RcptResolution::UnknownRecipient
     );
-    assert_eq!(
-        test.server
-            .rcpt_resolve(masked_email.as_str(), true, 0)
-            .await
-            .unwrap(),
-        RcptResolution::Rewrite("johndoe@example.com".into())
-    );
 
     // Catch-all addresses have to be resolved rather than accepted verbatim
     let domain_3_id = account
@@ -628,9 +599,6 @@ pub async fn test(test: &TestServer) {
     );
 
     // Delete everything
-    john.registry_destroy(ObjectType::MaskedEmail, [masked_id])
-        .await
-        .assert_destroyed(&[masked_id]);
     account
         .registry_destroy(ObjectType::MailingList, [list_id])
         .await

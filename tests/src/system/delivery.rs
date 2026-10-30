@@ -15,7 +15,6 @@ use email::{
 };
 use groupware::DavResourceName;
 use jmap::blob::download::BlobDownload;
-use jmap_proto::error::set::SetErrorType;
 use registry::{
     schema::{
         enums::StorageQuota,
@@ -25,14 +24,14 @@ use registry::{
             SpamTrainingSample,
         },
     },
-    types::{EnumImpl, datetime::UTCDateTime, float::Float, list::List, map::Map},
+    types::{EnumImpl, float::Float, list::List, map::Map},
 };
 use serde_json::json;
 use std::time::Duration;
 use store::{
     ValueKey,
     roaring::RoaringBitmap,
-    write::{AlignedBytes, Archive, now},
+    write::{AlignedBytes, Archive},
 };
 use types::{
     blob::{BlobClass, BlobId},
@@ -173,69 +172,16 @@ pub async fn test(test: &mut TestServer) {
             .is_none()
     );
 
-    // Masked email tests
-    john.registry_create_many(
-        ObjectType::MaskedEmail,
-        [json!({
-            Property::EmailDomain: "invalid.org"
-        })],
-    )
-    .await
-    .not_created(0)
-    .to_set_error()
-    .assert_type(SetErrorType::Forbidden)
-    .assert_description_contains("The specified domain is not valid for this account.");
-
-    let response = john
-        .registry_create_many(
-            ObjectType::MaskedEmail,
-            [json!({
-                Property::EmailDomain: "example.org",
-                Property::EmailPrefix: "secretive",
-                Property::ExpiresAt: UTCDateTime::from_timestamp((now() + 1) as i64)
-            })],
-        )
-        .await;
-    let masked = response.created(0);
-    let masked_prefix_id = masked.object_id();
-    let masked_prefix_email = masked.text_field("email").to_string();
-    assert!(
-        masked_prefix_email.starts_with("secretive")
-            && masked_prefix_email.ends_with("@example.org"),
-        "Unexpected masked email: {masked_prefix_email}"
-    );
-
-    let response = john
-        .registry_create_many(
-            ObjectType::MaskedEmail,
-            [json!({
-                Property::EmailDomain: "example.org",
-            })],
-        )
-        .await;
-    let masked = response.created(0);
-    let masked_random_id = masked.object_id();
-    let masked_random_email = masked.text_field("email").to_string();
-    assert!(
-        masked_random_email.contains(".") && masked_random_email.ends_with("@example.org"),
-        "Unexpected masked email: {masked_random_email}"
-    );
-
-    john.registry_create_many(
-        ObjectType::MaskedEmail,
-        [json!({
-            Property::EmailDomain: "example.org",
-        })],
-    )
-    .await
-    .not_created(0)
-    .to_set_error()
-    .assert_type(SetErrorType::OverQuota);
-
-    // Test spam filtering using masked email
+    // Upgrade ruling 33: 0.16 created two masked emails for john here (and
+    // checked the domain and quota refusals), delivered the two spam cases
+    // below to them, checked them with VRFY and destroyed them. An unlicensed
+    // 1.0 server refuses `MaskedEmail` (`assert_enterprise_object`), so with
+    // no test licence the masked-email parts take the SEL-only disposition.
+    // The spam cases are OSS and stay, delivered to john's alias instead.
+    // Test spam filtering
     lmtp.ingest(
         "bill@example.org",
-        &[masked_prefix_email.as_str()],
+        &["john.doe@example.org"],
         concat!(
             "From: bill@example.org\r\n",
             "To: john.doe@example.org\r\n",
@@ -272,7 +218,7 @@ pub async fn test(test: &mut TestServer) {
     .await;
     assert_eq!(john.spam_training_samples().await, vec![]);
 
-    // CardDAV spam override, using masked email
+    // CardDAV spam override
     let dav_client = john.webdav_client();
     dav_client
         .request(
@@ -293,7 +239,7 @@ END:VCARD
         .with_status(hyper::StatusCode::CREATED);
     lmtp.ingest(
         "dmarc-bill@example.org",
-        &[masked_random_email.as_str()],
+        &["john.doe@example.org"],
         concat!(
             "From: dmarc-bill@example.org\r\n",
             "To: john.doe@example.org\r\n",
@@ -418,8 +364,6 @@ END:VCARD
     lmtp.vrfy("jdoe@example.org", 2).await;
     lmtp.vrfy("members@example.org", 5).await;
     lmtp.vrfy("non_existant@example.org", 5).await;
-    lmtp.vrfy(masked_random_email.as_str(), 2).await;
-    lmtp.vrfy(masked_prefix_email.as_str(), 5).await; // Should have expired
 
     // Delivering to a mailing list
     lmtp.ingest(
@@ -722,12 +666,6 @@ END:VCARD
     );
 
     // Remove test data
-    john.registry_destroy(
-        ObjectType::MaskedEmail,
-        [masked_prefix_id, masked_random_id],
-    )
-    .await
-    .assert_destroyed(&[masked_prefix_id, masked_random_id]);
     for account in [&john, &jane, &bill] {
         test.destroy_all_mailboxes(account).await;
     }
