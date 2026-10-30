@@ -28,14 +28,10 @@ pub struct PluginContext<'x> {
     pub server: &'x Server,
     pub message: &'x Message<'x>,
     pub modifications: &'x mut Vec<ScriptModification>,
-<<<<<<< HEAD
-    pub arguments: Vec<Variable>,
+    pub arguments: Vec<Variable<'x>>,
     /// Mail ruling R59: a key account's message or transaction; the plugin
     /// traces carry no value the script evaluated.
     pub za_redact: bool,
-=======
-    pub arguments: Vec<Variable<'x>>,
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 }
 
 const PLUGINS_REGISTER: [RegisterPluginFnc; 13] = [
@@ -61,7 +57,7 @@ pub trait RegisterSievePlugins {
 
 impl RegisterSievePlugins for FunctionMap {
     fn register_plugins_trusted(mut self) -> Self {
-        #[cfg(stalwart_tests)]
+        #[cfg(feature = "test_mode")]
         {
             self.set_external_function("print", PLUGINS_REGISTER.len() as u32, 1)
         }
@@ -80,9 +76,9 @@ impl RegisterSievePlugins for FunctionMap {
 
 impl Core {
     pub async fn run_plugin(&self, id: u32, ctx: PluginContext<'_>) -> Input<'static> {
-        #[cfg(stalwart_tests)]
+        #[cfg(feature = "test_mode")]
         if id == PLUGINS_REGISTER.len() as u32 {
-            return test_support::test_print(ctx);
+            return test_print(ctx);
         }
 
         let session_id = ctx.session_id;
@@ -126,3 +122,11 @@ impl Core {
 #[rustfmt::skip]
 #[path = "../../../../../../stalwart-tests/unit/common/src/scripts/plugins/test_support.rs"]
 mod test_support;
+
+/// The `print` test plugin, written fork-owned from 0.16's (1.0 moved
+/// upstream's into a private slot).
+#[cfg(feature = "test_mode")]
+fn test_print(ctx: PluginContext<'_>) -> Input<'static> {
+    println!("{}", ctx.arguments[0].to_string());
+    Input::Bool(true)
+}

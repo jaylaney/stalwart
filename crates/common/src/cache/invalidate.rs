@@ -529,14 +529,10 @@ impl Server {
         self.inner.cache.accounts.clear();
         self.inner.cache.roles.clear();
         self.inner.cache.lists.clear();
-<<<<<<< HEAD
-        self.inner.cache.za_keys.clear();
-        // Cached authentication is trusted only up to a generation; a global
-        // invalidation must drop it together with the resident keys.
-        self.inner.cache.http_auth.clear();
-=======
         self.inner.cache.directory_recipients.clear();
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+        // Zero-access fork: resident keys go with the cached authentication
+        // that `grant_revocations.clear` dropped above.
+        self.inner.cache.za_keys.clear();
         self.inner.data.logos.lock().clear();
     }
 
@@ -581,12 +577,8 @@ impl Server {
                         .account_epoch
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     cache.access_tokens.remove(id);
-<<<<<<< HEAD
-                    cache.http_auth.inner().retain(|_, v| v.account_id != *id);
-                    cache.za_keys.remove_account(*id);
-=======
                     http_auth_accounts.insert(*id);
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+                    cache.za_keys.remove_account(*id);
                 }
                 CacheInvalidation::GroupwareResources(id) => {
                     cache.remove_resources(*id);
@@ -610,22 +602,11 @@ impl Server {
                         .account_epoch
                         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     cache.accounts.remove(id);
-<<<<<<< HEAD
-                    // Set order is arbitrary: drop HTTP auth here too, or an entry
+                    // Zero-access fork: drop HTTP auth here too, or an entry
                     // cached between the AccessToken and Account arms survives.
-                    cache.http_auth.inner().retain(|_, v| v.account_id != *id);
+                    http_auth_accounts.insert(*id);
                     cache.za_keys.remove_account(*id);
-                    cache.emails.inner().retain(|_, v| {
-                        !matches!(
-                            v,
-                            EmailCache::Account(account_id)
-                                | EmailCache::DisabledAccountAddress(account_id)
-                            if account_id == id
-                        )
-                    });
-=======
                     email_accounts.insert(*id);
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                 }
                 CacheInvalidation::DkimSignature(id) => {
                     cache.dkim_signers.remove(id);

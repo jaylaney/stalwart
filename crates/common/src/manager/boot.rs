@@ -171,46 +171,28 @@ impl BootManager {
                 if bootstrap.registry.is_bootstrap_mode() {
                     trc::event!(
                         Server(trc::ServerEvent::BootstrapMode),
-<<<<<<< HEAD
-                        Hostname = bootstrap.registry.local_hostname().to_string(),
-                        Details =
-                            "No configuration file was found. Port 8080 is open for initial setup.",
-                        Version = crate::version::BUILD_IDENTITY,
-=======
                         Hostname = CompactString::from(bootstrap.registry.local_hostname()),
                         Details = format!(
                             "No configuration file was found. Port {} is open for initial setup.",
                             recovery_mode_port()
                         ),
-                        Version = env!("CARGO_PKG_VERSION"),
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+                        Version = crate::version::BUILD_IDENTITY,
                     );
                 } else if bootstrap.registry.is_recovery_mode() {
                     trc::event!(
                         Server(trc::ServerEvent::RecoveryMode),
-<<<<<<< HEAD
-                        Details = "Port 8080 is open for troubleshooting and recovery.",
-                        Hostname = bootstrap.registry.local_hostname().to_string(),
-                        Version = crate::version::BUILD_IDENTITY,
-=======
                         Details = format!(
                             "Port {} is open for troubleshooting and recovery.",
                             recovery_mode_port()
                         ),
                         Hostname = CompactString::from(bootstrap.registry.local_hostname()),
-                        Version = env!("CARGO_PKG_VERSION"),
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+                        Version = crate::version::BUILD_IDENTITY,
                     );
                 } else {
                     trc::event!(
                         Server(trc::ServerEvent::Startup),
-<<<<<<< HEAD
-                        Hostname = bootstrap.registry.local_hostname().to_string(),
-                        Version = crate::version::BUILD_IDENTITY,
-=======
                         Hostname = CompactString::from(bootstrap.registry.local_hostname()),
-                        Version = env!("CARGO_PKG_VERSION"),
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+                        Version = crate::version::BUILD_IDENTITY,
                     );
                 }
 

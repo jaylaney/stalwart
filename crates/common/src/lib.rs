@@ -155,16 +155,6 @@ pub const KV_RATE_LIMIT_HTTP_AUTHENTICATED: u8 = 8;
 pub const KV_RATE_LIMIT_HTTP_ANONYMOUS: u8 = 9;
 pub const KV_RATE_LIMIT_IMAP: u8 = 10;
 pub const KV_QUOTA_BLOB: u8 = 11;
-<<<<<<< HEAD
-pub const KV_GREYLIST: u8 = 16;
-pub const KV_LOCK_QUEUE_MESSAGE: u8 = 21;
-pub const KV_LOCK_TASK: u8 = 23;
-pub const KV_LOCK_DAV: u8 = 25;
-pub const KV_SIEVE_ID: u8 = 26;
-/// Invitations spec 6.3: the per-(account, UID) creation lease
-/// (`za::lease`).
-pub const KV_LOCK_ZA_UID: u8 = store::ZA_UID_LEASE_PREFIX;
-=======
 pub const KV_RATE_LIMIT_AVAILABILITY: u8 = 12;
 pub const KV_GREYLIST: u8 = 13;
 pub const KV_LOCK_QUEUE_MESSAGE: u8 = 14;
@@ -173,7 +163,6 @@ pub const KV_LOCK_DAV: u8 = 16;
 pub const KV_LOCK_SEARCH_INDEX: u8 = 17;
 pub const KV_OAUTH_CIMD: u8 = 18;
 pub const KV_RATE_LIMIT_CIMD: u8 = 19;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
 #[derive(Clone)]
 pub struct Server {
@@ -228,9 +217,9 @@ pub struct LogoCache {
 }
 
 pub struct Caches {
-<<<<<<< HEAD
-    pub access_tokens: Cache<u32, Arc<AccessTokenInner>>,
-    pub http_auth: Cache<[u8; 32], HttpAuthCache>,
+    pub swap: crate::cache::swap::SwapTier,
+    pub revalidate: crate::cache::RevalidateInterval,
+
     /// Resident master keys for CalDAV sessions (spec 5).
     pub za_keys: vault::cache::KeyCache,
     /// Per-process secret for keyed fingerprints of Authorization headers.
@@ -241,10 +230,6 @@ pub struct Caches {
     /// Origin of the account page, allowed by CORS on `/api/vault/*` (spec 4.1).
     /// Set from the environment at startup; only test builds change it.
     za_account_page_origin: arc_swap::ArcSwapOption<hyper::header::HeaderValue>,
-=======
-    pub swap: crate::cache::swap::SwapTier,
-    pub revalidate: crate::cache::RevalidateInterval,
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
     pub access_tokens: SpillCache<u32, Arc<AccessTokenInner>>,
     pub http_auth: HttpAuthEntries,
@@ -424,14 +409,11 @@ pub struct HttpAuthCache {
     pub account_id: u32,
     pub expires: u32,
     pub credential_id: Option<u32>,
-<<<<<<< HEAD
-    pub expires: Instant,
-    /// Authentication generation at verification time; 0 for non-key accounts.
-    pub generation: u64,
-    /// Mail ruling R35: the credential is an impersonation's, whose token is
-    /// marked on every hit; an account's own credential never is.
-    pub za_impersonated: bool,
+    pub revision: u64,
+    pub token_scope: Option<TokenScope>,
 }
+
+const _: () = assert!(size_of::<HttpAuthCache>() <= 40);
 
 impl Caches {
     /// Keyed BLAKE3 of the Authorization header value; usable only by this process.
@@ -440,27 +422,24 @@ impl Caches {
     }
 
     /// Makes `keys` resident under `fp`. An entry evicted to stay within the
-    /// bound takes its cached authentication with it: a fingerprint lives no
-    /// longer than its keys (spec 5).
+    /// bound leaves its cached authentication behind, but a key account's
+    /// cached authentication is served only while its keys are resident
+    /// (the hit rule in `authenticate_headers`), so a fingerprint still
+    /// authenticates no longer than its keys (spec 5).
     pub fn za_insert_keys(
         &self,
         fp: [u8; 32],
         keys: Arc<vault::session::SessionKeys>,
-        now: Instant,
+        now: std::time::Instant,
     ) {
-        if let Some(evicted) = self.za_keys.insert(fp, keys, now) {
-            self.http_auth.remove(&evicted);
-        }
+        let _ = self.za_keys.insert(fp, keys, now);
     }
 
-    /// Sweep of expired resident keys, dropping the cached authentication
-    /// under each removed fingerprint. Returns the number of entries removed.
-    pub fn za_sweep_keys(&self, now: Instant) -> usize {
-        let removed = self.za_keys.sweep(now);
-        for fp in &removed {
-            self.http_auth.remove(fp);
-        }
-        removed.len()
+    /// Sweep of expired resident keys. A cached authentication whose keys
+    /// are swept is refused on its next hit (see `za_insert_keys`). Returns
+    /// the number of entries removed.
+    pub fn za_sweep_keys(&self, now: std::time::Instant) -> usize {
+        self.za_keys.sweep(now).len()
     }
 
     pub fn za_account_page_origin(&self) -> Option<Arc<hyper::header::HeaderValue>> {
@@ -472,13 +451,7 @@ impl Caches {
     pub fn set_za_account_page_origin(&self, origin: Option<hyper::header::HeaderValue>) {
         self.za_account_page_origin.store(origin.map(Arc::new));
     }
-=======
-    pub revision: u64,
-    pub token_scope: Option<TokenScope>,
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 }
-
-const _: () = assert!(size_of::<HttpAuthCache>() <= 40);
 
 pub struct Ipc {
     pub push_tx: mpsc::Sender<PushEvent>,

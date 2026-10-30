@@ -94,81 +94,15 @@ impl Server {
                     .member_group_ids
                     .iter()
                     .map(|m| m.id() as u32)
-<<<<<<< HEAD
-                    .collect::<TinyVec<[u32; 3]>>();
-                let mut access_to: Vec<AccessTo> = Vec::new();
-                for grant_account_id in [account_id].into_iter().chain(member_of.iter().copied()) {
-                    for acl_item in self
-                        .store()
-                        .acl_query(AclQuery::HasAccess { grant_account_id })
-                        .await
-                        .caused_by(trc::location!())?
-                    {
-                        if acl_item.to_account_id != account_id
-                            && !member_of.contains(&acl_item.to_account_id)
-                        {
-                            let acl = Bitmap::<Acl>::from(acl_item.permissions);
-                            let collection = acl_item.to_collection;
-                            if !collection.is_valid() {
-                                return Err(trc::StoreEvent::DataCorruption
-                                    .ctx(trc::Key::Reason, "Corrupted collection found in ACL key.")
-                                    .details(format!("{acl_item:?}"))
-                                    .account_id(grant_account_id)
-                                    .caused_by(trc::location!()));
-                            }
-
-                            let mut collections: Bitmap<Collection> = Bitmap::new();
-                            if acl.contains(Acl::Read) {
-                                collections.insert(collection);
-                            }
-                            if acl.contains(Acl::ReadItems)
-                                && let Some(child_col) = collection.child_collection()
-                            {
-                                collections.insert(child_col);
-                            }
-
-                            if !collections.is_empty() {
-                                if let Some(idx) = access_to
-                                    .iter()
-                                    .position(|a| a.account_id == acl_item.to_account_id)
-                                {
-                                    access_to[idx].collections.union(&collections);
-                                } else {
-                                    access_to.push(AccessTo {
-                                        account_id: acl_item.to_account_id,
-                                        collections,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-                // Mail spec 6.3: a key account's mailboxes are left out of
-                // another account's listing, a grant made before it was
-                // provisioned included. The rule of ruling R34 enforces this
-                // at use time, so a failed lookup is logged and lists the
-                // account (review M6).
-                for entry in access_to.iter_mut() {
-                    match self.za_is_key_account(entry.account_id).await {
-                        Ok(true) => {
-                            entry.collections.remove(Collection::Mailbox);
-                            entry.collections.remove(Collection::Email);
-                        }
-                        Ok(false) => {}
-                        Err(err) => {
-                            trc::error!(err.caused_by(trc::location!()));
-                        }
-                    }
-                }
-                access_to.retain(|a| !a.collections.is_empty());
-=======
                     .collect::<Box<[u32]>>();
                 let access_to = AccessTo::from_acl_items(
                     account_id,
                     &member_of,
                     self.acl_items_by_grantee(account_id, &member_of).await?,
                 )?;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+                // Mail spec 6.3: a key account's mailboxes are left out of
+                // another account's listing (ruling R34 enforces it at use time).
+                let access_to = self.za_filter_access_to(access_to).await;
 
                 let now = now();
                 let mut credential_version = 0;
@@ -429,7 +363,6 @@ impl Server {
                         .caused_by(trc::location!()));
                 };
 
-<<<<<<< HEAD
                 // As in `try_account`: an invalidation during the load cannot
                 // evict the placeholder, so a stale token is returned uncached.
                 let epoch_now = || self.inner.cache.account_epoch.load(Ordering::SeqCst);
@@ -439,9 +372,6 @@ impl Server {
                         self.inner.cache.access_tokens.remove(&account_id);
                     }
                 }
-=======
-                guard.insert(token.clone());
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                 Ok(token)
             }
         }
@@ -453,6 +383,11 @@ impl Server {
         account: Account,
     ) -> trc::Result<Arc<AccessTokenInner>> {
         let revision_account = hash_account(&account);
+        // Zero-access fork: the loader fence of `access_token`. The caller
+        // read `account`; the epoch covers the vault read in
+        // `build_access_token` (a key account's credential version).
+        let epoch = self.inner.cache.account_epoch.load(Ordering::SeqCst);
+        let epoch_now = || self.inner.cache.account_epoch.load(Ordering::SeqCst);
         match self
             .inner
             .cache
@@ -486,10 +421,15 @@ impl Server {
                         .build_access_token(account, account_id, revision, revision_account)
                         .await?
                         .into();
-                    self.inner
-                        .cache
-                        .access_tokens
-                        .update(account_id, token.clone());
+                    if epoch_now() == epoch {
+                        self.inner
+                            .cache
+                            .access_tokens
+                            .update(account_id, token.clone());
+                        if epoch_now() != epoch {
+                            self.inner.cache.access_tokens.remove(&account_id);
+                        }
+                    }
                     Ok(token)
                 }
             }
@@ -505,7 +445,12 @@ impl Server {
                     .build_access_token(account, account_id, revision, revision_account)
                     .await?
                     .into();
-                guard.insert(token.clone());
+                if epoch_now() == epoch {
+                    let _ = guard.insert(token.clone());
+                    if epoch_now() != epoch {
+                        self.inner.cache.access_tokens.remove(&account_id);
+                    }
+                }
                 Ok(token)
             }
         }
@@ -520,12 +465,9 @@ impl AccessToken {
         AccessToken {
             scope_idx,
             inner,
-<<<<<<< HEAD
+            token_scope: None,
             session_keys: None,
             za_impersonated: false,
-=======
-            token_scope: None,
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
         }
     }
 
@@ -534,15 +476,7 @@ impl AccessToken {
     }
 
     pub fn new_maybe_invalid(inner: Arc<AccessTokenInner>) -> Self {
-<<<<<<< HEAD
         AccessToken::from_parts(0, inner)
-=======
-        AccessToken {
-            scope_idx: 0,
-            inner,
-            token_scope: None,
-        }
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
     }
 
     pub fn new_scoped(
@@ -561,15 +495,7 @@ impl AccessToken {
                     .ctx(trc::Key::Id, credential_id)
                     .reason("Credential expired or removed.")
             })
-<<<<<<< HEAD
             .map(|scope_idx| AccessToken::from_parts(scope_idx, inner))
-=======
-            .map(|scope_idx| AccessToken {
-                scope_idx,
-                inner,
-                token_scope: None,
-            })
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
             .and_then(|token| token.assert_is_valid(remote_ip))
     }
 
@@ -582,8 +508,9 @@ impl AccessToken {
         if let Some(credential_id) = credential_id.filter(|id| *id != u32::MAX) {
             Self::new_scoped(inner, credential_id, remote_ip)
         } else {
-<<<<<<< HEAD
-            AccessToken::from_parts(0, inner).assert_is_valid(remote_ip)
+            AccessToken::from_parts(0, inner)
+                .with_token_scope(token_scope)
+                .assert_is_valid(remote_ip)
         }
     }
 
@@ -609,6 +536,15 @@ impl AccessToken {
         self.za_impersonated
     }
 
+    /// Ruling 11: a renewal of `from` keeps R35's impersonation marker. The
+    /// marker only restricts, so carrying it fails safe. Session keys are
+    /// never carried here; a protocol that holds them for a connection
+    /// carries them at its own renewal call site.
+    pub fn za_carry_impersonation(mut self, from: &AccessToken) -> Self {
+        self.za_impersonated |= from.za_impersonated;
+        self
+    }
+
     pub fn session_keys(&self) -> Option<&Arc<::vault::session::SessionKeys>> {
         self.session_keys.as_ref()
     }
@@ -620,14 +556,6 @@ impl AccessToken {
         self.session_keys
             .as_ref()
             .filter(|k| k.account_id == account_id)
-=======
-            AccessToken {
-                scope_idx: 0,
-                inner,
-                token_scope,
-            }
-            .assert_is_valid(remote_ip)
-        }
     }
 
     pub fn is_built_from(&self, inner: &Arc<AccessTokenInner>) -> bool {
@@ -683,7 +611,6 @@ impl AccessToken {
     #[inline(always)]
     pub fn is_main_credential_expired(&self) -> bool {
         self.inner.is_main_credential_expired()
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
     }
 
     pub fn state(&self) -> u32 {
@@ -879,12 +806,9 @@ impl AccessToken {
                 access_token = AccessToken {
                     scope_idx: access_token.scope_idx,
                     inner: Arc::new(inner),
-<<<<<<< HEAD
+                    token_scope: access_token.token_scope,
                     session_keys: access_token.session_keys.take(),
                     za_impersonated: access_token.za_impersonated,
-=======
-                    token_scope: access_token.token_scope,
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                 };
             }
 
@@ -1043,15 +967,7 @@ impl AccessToken {
     }
 
     pub fn new_admin() -> AccessToken {
-<<<<<<< HEAD
         AccessToken::from_parts(0, Arc::new(AccessTokenInner::new_admin()))
-=======
-        AccessToken {
-            scope_idx: 0,
-            inner: Arc::new(AccessTokenInner::new_admin()),
-            token_scope: None,
-        }
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
     }
 
     pub fn from_permissions(
@@ -1062,16 +978,9 @@ impl AccessToken {
         for permission in set_permissions {
             permissions.set(permission as usize);
         }
-<<<<<<< HEAD
         AccessToken::from_parts(
             0,
             Arc::new(AccessTokenInner {
-=======
-        AccessToken {
-            scope_idx: 0,
-            token_scope: None,
-            inner: Arc::new(AccessTokenInner {
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                 account_id,
                 // SPDX-SnippetBegin
                 // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
@@ -1379,7 +1288,11 @@ fn hash_credential_permissions(hasher: &mut AHasher, permissions: &structs::Cred
     }
 }
 
-<<<<<<< HEAD
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/common/src/auth/access_token/tests.rs"]
+mod tests;
+
 #[cfg(test)]
 mod sharing_access_tests {
     use super::*;
@@ -1390,12 +1303,13 @@ mod sharing_access_tests {
         assert!(admin.is_member(9201));
         assert!(!admin.has_shared_access(9201, Collection::Calendar));
         let mut inner = AccessTokenInner::from_id(9202);
-        inner.member_of.push(9201);
+        inner.member_of = vec![9201].into_boxed_slice();
         let token = AccessToken::new_maybe_invalid(Arc::new(inner.clone()));
         assert!(!token.has_shared_access(9201, Collection::Calendar));
         inner.access_to = vec![AccessTo {
             account_id: 9201,
             collections: Bitmap::new().with_item(Collection::Calendar),
+            is_writable: false,
         }]
         .into_boxed_slice();
         let token = AccessToken::new_maybe_invalid(Arc::new(inner));
@@ -1404,9 +1318,3 @@ mod sharing_access_tests {
         assert!(!token.has_shared_access(9202, Collection::Calendar));
     }
 }
-=======
-#[cfg(all(test, stalwart_tests))]
-#[rustfmt::skip]
-#[path = "../../../../../stalwart-tests/unit/common/src/auth/access_token/tests.rs"]
-mod tests;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184

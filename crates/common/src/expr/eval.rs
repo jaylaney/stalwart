@@ -28,44 +28,28 @@ impl Server {
         resolver: &'x V,
         arena: &'x mut Bump,
         session_id: u64,
-<<<<<<< HEAD
-    ) -> Option<R> {
-        self.eval_if_inner(if_block, resolver, session_id, false)
-            .await
-    }
-
-    /// Zero-access fan-out: `eval_if` without the trace that carries the
-    /// evaluation result (invitations spec 10).
-    pub async fn za_eval_if<'x, R: TryFrom<Variable<'x>>, V: ResolveVariable>(
-        &'x self,
-        if_block: &'x IfBlock,
-        resolver: &'x V,
-        session_id: u64,
-    ) -> Option<R> {
-        self.eval_if_inner(if_block, resolver, session_id, true)
-            .await
-    }
-
-    // Zero-access fork: `quiet` skips the events that carry evaluation
-    // content (the result, and an error that may echo a resolved value).
-    // In quiet mode an evaluation error is neither traced nor returned (the
-    // caller gets `None`, as upstream does); the same rule evaluated on the
-    // SMTP path still traces its failures.
-    async fn eval_if_inner<'x, R: TryFrom<Variable<'x>>, V: ResolveVariable>(
-        &'x self,
-        if_block: &'x IfBlock,
-        resolver: &'x V,
-        session_id: u64,
-        quiet: bool,
-    ) -> Option<R> {
-        if if_block.is_empty() {
-=======
     ) -> impl Future<Output = Option<R>> + Send + 'x
     where
         R: for<'b> TryFrom<Variable<'b>> + 'x,
         V: ResolveVariable,
     {
-        self.eval_program(if_block, resolver, arena, session_id, convert::<R>)
+        self.eval_program(if_block, resolver, arena, session_id, false, convert::<R>)
+    }
+
+    /// Zero-access fan-out: `eval_if` without the trace that carries the
+    /// evaluation result (invitations spec 10).
+    pub fn za_eval_if<'x, R, V>(
+        &'x self,
+        if_block: &'x IfBlock,
+        resolver: &'x V,
+        arena: &'x mut Bump,
+        session_id: u64,
+    ) -> impl Future<Output = Option<R>> + Send + 'x
+    where
+        R: for<'b> TryFrom<Variable<'b>> + 'x,
+        V: ResolveVariable,
+    {
+        self.eval_program(if_block, resolver, arena, session_id, true, convert::<R>)
     }
 
     pub fn eval_if_with<'x, T, V, F>(
@@ -81,18 +65,24 @@ impl Server {
         V: ResolveVariable,
         F: for<'v> FnOnce(Variable<'v>) -> T + Send + 'x,
     {
-        self.eval_program(if_block, resolver, arena, session_id, |value| {
+        self.eval_program(if_block, resolver, arena, session_id, false, |value| {
             Some(with(value))
         })
     }
 
-    #[allow(clippy::manual_async_fn)]
+    // Zero-access fork: `quiet` skips the events that carry evaluation
+    // content (the result, and an error that may echo a resolved value).
+    // In quiet mode an evaluation error is neither traced nor returned (the
+    // caller gets `None`, as upstream does); the same rule evaluated on the
+    // SMTP path still traces its failures.
+    #[allow(clippy::manual_async_fn, clippy::too_many_arguments)]
     fn eval_program<'x, T, V, F>(
         &'x self,
         if_block: &'x IfBlock,
         resolver: &'x V,
         arena: &'x mut Bump,
         session_id: u64,
+        quiet: bool,
         finish: F,
     ) -> impl Future<Output = Option<T>> + Send + 'x
     where
@@ -114,11 +104,11 @@ impl Server {
             }
             arena.reset();
             if let Some(value) = self.run_inline(program, resolver, &*arena) {
-                let result = if_block.finish_eval(value, session_id, finish);
+                let result = if_block.finish_eval(value, session_id, quiet, finish);
                 recycle_arena(arena);
                 return result;
             }
-            self.eval_suspending(if_block, resolver, arena, session_id, finish)
+            self.eval_suspending(if_block, resolver, arena, session_id, quiet, finish)
                 .await
         }
     }
@@ -129,6 +119,7 @@ impl Server {
         resolver: &V,
         arena: &mut Bump,
         session_id: u64,
+        quiet: bool,
         finish: F,
     ) -> Option<T>
     where
@@ -152,20 +143,24 @@ impl Server {
                     pc,
                 );
                 match step {
-                    Step::Done(value) => break if_block.finish_eval(value, session_id, finish),
+                    Step::Done(value) => {
+                        break if_block.finish_eval(value, session_id, quiet, finish);
+                    }
                     Step::Suspend { call, resume } => match self.eval_fnc(call, session_id).await {
                         Ok(output) => {
                             machine.push(output.into_variable(&*arena));
                             pc = resume;
                         }
                         Err(err) => {
-                            trc::event!(
-                                Eval(EvalEvent::Error),
-                                SpanId = session_id,
-                                Name = if_block.id.to_compact_string(),
-                                Property = if_block.property.as_str(),
-                                CausedBy = err,
-                            );
+                            if !quiet {
+                                trc::event!(
+                                    Eval(EvalEvent::Error),
+                                    SpanId = session_id,
+                                    Name = if_block.id.to_compact_string(),
+                                    Property = if_block.property.as_str(),
+                                    CausedBy = err,
+                                );
+                            }
                             break None;
                         }
                     },
@@ -198,20 +193,27 @@ impl Server {
 }
 
 impl IfBlock {
-    fn finish_eval<T, F>(&self, value: Variable<'_>, session_id: u64, finish: F) -> Option<T>
+    fn finish_eval<T, F>(
+        &self,
+        value: Variable<'_>,
+        session_id: u64,
+        quiet: bool,
+        finish: F,
+    ) -> Option<T>
     where
         F: for<'v> FnOnce(Variable<'v>) -> Option<T>,
     {
-        trc::event!(
-            Eval(EvalEvent::Result),
-            SpanId = session_id,
-            Name = self.id.to_compact_string(),
-            Property = self.property.as_str(),
-            Result = format_compact!("{value:?}"),
-        );
+        if !quiet {
+            trc::event!(
+                Eval(EvalEvent::Result),
+                SpanId = session_id,
+                Name = self.id.to_compact_string(),
+                Property = self.property.as_str(),
+                Result = format_compact!("{value:?}"),
+            );
+        }
         let result = finish(value);
         if result.is_none() {
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
             trc::event!(
                 Eval(EvalEvent::Result),
                 SpanId = session_id,
@@ -224,58 +226,17 @@ impl IfBlock {
     }
 }
 
-<<<<<<< HEAD
-        match (EvalContext {
-            resolver,
-            core: self,
-            expr: if_block,
-            captures: Vec::new(),
-            session_id,
-        })
-        .eval()
-        .await
-        {
-            Ok(result) => {
-                if !quiet {
-                    trc::event!(
-                        Eval(EvalEvent::Result),
-                        SpanId = session_id,
-                        Id = if_block.id.to_string(),
-                        Key = if_block.property.as_str(),
-                        Result = format!("{result:?}"),
-                    );
-                }
-=======
 fn recycle_arena(arena: &mut Bump) {
     arena.reset();
     if arena.allocated_bytes() > ARENA_RETAIN_CAP {
         *arena = Bump::new();
     }
 }
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
 fn convert<R: for<'b> TryFrom<Variable<'b>>>(value: Variable<'_>) -> Option<R> {
     R::try_from(value).ok()
 }
 
-<<<<<<< HEAD
-                        None
-                    }
-                }
-            }
-            Err(err) => {
-                if !quiet {
-                    trc::event!(
-                        Eval(EvalEvent::Error),
-                        SpanId = session_id,
-                        Id = if_block.id.to_string(),
-                        Key = if_block.property.as_str(),
-                        CausedBy = err,
-                    );
-                }
-
-                None
-=======
 fn stack<'b, 's: 'b, const N: usize>(
     depth: usize,
     inline: &'b mut [Variable<'s>; N],
@@ -329,7 +290,6 @@ impl<'s, V: ResolveVariable> Env<'s, V> {
             SystemVariable::NodeHostname => Variable::String(server.registry().local_hostname()),
             SystemVariable::NodeRole => {
                 Variable::String(server.registry().cluster_role().unwrap_or_default())
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
             }
             SystemVariable::Metric(metric) => Variable::Float(Collector::read_metric(metric)),
         }

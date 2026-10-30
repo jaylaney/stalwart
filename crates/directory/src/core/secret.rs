@@ -70,7 +70,6 @@ pub async fn verify_mfa_secret_hash(
     }
 }
 
-<<<<<<< HEAD
 /// Checks `code` against an `otpauth://` URL with the same semantics as
 /// `verify_mfa_secret_hash` (current window only). The URL holds the TOTP
 /// secret, so it is never attached to the error.
@@ -85,11 +84,6 @@ pub fn verify_totp_code(totp_uri: &str, code: &str) -> trc::Result<bool> {
         .is_some())
 }
 
-async fn verify_hash_prefix(hashed_secret: &str, secret: &[u8]) -> trc::Result<bool> {
-    let is_argon = hashed_secret.starts_with("$argon2");
-    let is_pbkdf2 = !is_argon && hashed_secret.starts_with("$pbkdf2");
-    let is_scrypt = !is_argon && !is_pbkdf2 && hashed_secret.starts_with("$scrypt");
-=======
 #[derive(Debug, Clone, Copy)]
 enum CryptScheme {
     Argon2,
@@ -103,7 +97,6 @@ enum CryptScheme {
     BsdiCrypt,
     UnixCrypt,
 }
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
 impl CryptScheme {
     fn from_prefix(hashed_secret: &str) -> Option<Self> {
@@ -486,4 +479,8 @@ fn b64_decoded_len_ge(body: &str, min: usize) -> bool {
 #[cfg(all(test, stalwart_tests))]
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/directory/src/core/secret/tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "secret_restored_tests.rs"]
 mod tests;

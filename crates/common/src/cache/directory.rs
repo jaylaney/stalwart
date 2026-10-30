@@ -26,16 +26,22 @@ use types::id::Id;
 /// classification derives from it, and the vault record holds the real
 /// verifier. Returns whether the account changed.
 fn merge_directory_secret(account: &mut UserAccount, secret: Option<String>) -> bool {
-    let current = account.password();
-    match secret {
-        Some(secret)
-            if current != Some(::vault::ZA_MARKER) && secret != current.unwrap_or_default() =>
-        {
+    match directory_secret(account, secret) {
+        Some(secret) => {
             account.set_password(secret);
             true
         }
-        _ => false,
+        None => false,
     }
+}
+
+/// The directory-supplied secret `merge_directory_secret` would apply to
+/// `current`: none for a key account's marker, nor for an unchanged secret.
+fn directory_secret(current: &UserAccount, secret: Option<String>) -> Option<String> {
+    let current = current.password();
+    secret.filter(|secret| {
+        current != Some(::vault::ZA_MARKER) && secret != current.unwrap_or_default()
+    })
 }
 
 pub struct AccountWithId {
@@ -114,23 +120,11 @@ impl Server {
                     }
                 };
 
-<<<<<<< HEAD
-                let mut has_changes = merge_directory_secret(&mut updated_account, account.secret);
-                if account.description.is_some()
-                    && account.description != updated_account.description
-                {
-                    updated_account.description = account.description;
-                    has_changes = true;
-                }
-=======
-                let secret = account
-                    .secret
-                    .filter(|secret| secret != current_user.password().unwrap_or_default());
+                let secret = directory_secret(current_user, account.secret);
                 let description = account
                     .description
                     .filter(|description| current_user.description.as_ref() != Some(description));
                 let mut new_aliases = Vec::new();
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                 for alias in account.email_aliases {
                     if let Some((local, alias_domain)) = self.validate_alias(&alias).await?
                         && alias_domain.is_same_tenant(&domain)
@@ -178,9 +172,7 @@ impl Server {
 
                 if has_changes {
                     let mut updated_account = current_user.clone();
-                    if let Some(secret) = secret {
-                        updated_account.set_password(secret);
-                    }
+                    merge_directory_secret(&mut updated_account, secret);
                     if description.is_some() {
                         updated_account.description = description;
                     }

@@ -10,19 +10,11 @@ use crate::{
         ACCOUNT_FLAG_ENCRYPT_ALGO_AES128, ACCOUNT_FLAG_ENCRYPT_ALGO_AES256,
         ACCOUNT_FLAG_ENCRYPT_ALGO_AES256_GCM, ACCOUNT_FLAG_ENCRYPT_ALGO_CHACHA20_POLY1305,
         ACCOUNT_FLAG_ENCRYPT_APPEND, ACCOUNT_FLAG_ENCRYPT_METHOD_PGP,
-<<<<<<< HEAD
         ACCOUNT_FLAG_ENCRYPT_METHOD_SMIME, ACCOUNT_FLAG_ENCRYPT_TRAIN_SPAM_FILTER,
-        ACCOUNT_IS_KEY_ACCOUNT, ACCOUNT_IS_USER, AccountCache, AccountInfo, AccountTenantIds,
-        DOMAIN_FLAG_RELAY, DOMAIN_FLAG_SUB_ADDRESSING, DomainCache, EmailAddress, EmailAddressRef,
-        EmailCache, MailingListCache, PermissionsGroup, RECOVERY_ADMIN_ID, RoleCache, TenantCache,
-        permissions::BuildPermissions, vault::is_vault_unusable,
-=======
-        ACCOUNT_FLAG_ENCRYPT_METHOD_SMIME, ACCOUNT_FLAG_ENCRYPT_TRAIN_SPAM_FILTER, ACCOUNT_IS_USER,
-        AccountCache, AccountInfo, AccountStorage, ChangedBy, DOMAIN_FLAG_RELAY,
-        DOMAIN_FLAG_SUB_ADDRESSING, DomainCache, EmailAddress, EmailAddressRef, EmailCache,
-        EncryptionKeys, MailingListCache, PermissionsGroup, RECOVERY_ADMIN_ID, RoleCache,
-        permissions::BuildPermissions,
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+        ACCOUNT_IS_KEY_ACCOUNT, ACCOUNT_IS_USER, AccountCache, AccountInfo, AccountStorage,
+        ChangedBy, DOMAIN_FLAG_RELAY, DOMAIN_FLAG_SUB_ADDRESSING, DomainCache, EmailAddress,
+        EmailAddressRef, EmailCache, EncryptionKeys, MailingListCache, PermissionsGroup,
+        RECOVERY_ADMIN_ID, RoleCache, permissions::BuildPermissions, vault::is_vault_unusable,
     },
     config::smtp::auth::DkimSigners,
     expr::{Bump, if_block::BootstrapExprExt},
@@ -95,21 +87,13 @@ impl Server {
         let domain_names = &self.inner.cache.domain_names;
 
         if let Some(domain_id) = domain_names.get(domain) {
-<<<<<<< HEAD
             if !quiet {
                 trc::event!(
-                    Store(StoreEvent::CacheHit),
-                    Key = domain.to_string(),
-                    Collection = "domainName",
+                    Cache(CacheEvent::Hit),
+                    Key = CompactString::from(domain),
+                    Name = "domainName",
                 );
             }
-=======
-            trc::event!(
-                Cache(CacheEvent::Hit),
-                Key = CompactString::from(domain),
-                Name = "domainName",
-            );
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
             let result = self.domain_by_id(domain_id).await?;
             if result.is_none() {
@@ -152,40 +136,24 @@ impl Server {
                         self.inner.cache.negative_cache_ttl,
                     );
 
-<<<<<<< HEAD
                     if !quiet {
                         trc::event!(
-                            Store(StoreEvent::CacheMiss),
-                            Key = domain.to_string(),
-                            Collection = "domainName",
+                            Cache(CacheEvent::Miss),
+                            Key = CompactString::from(domain),
+                            Name = "domainName",
                         );
                     }
-=======
-                    trc::event!(
-                        Cache(CacheEvent::Miss),
-                        Key = CompactString::from(domain),
-                        Name = "domainName",
-                    );
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
                     Ok(None)
                 }
             } else {
-<<<<<<< HEAD
                 if !quiet {
                     trc::event!(
-                        Store(StoreEvent::CacheHit),
-                        Key = domain.to_string(),
-                        Collection = "domainNameNegative",
+                        Cache(CacheEvent::Hit),
+                        Key = CompactString::from(domain),
+                        Name = "domainNameNegative",
                     );
                 }
-=======
-                trc::event!(
-                    Cache(CacheEvent::Hit),
-                    Key = CompactString::from(domain),
-                    Name = "domainNameNegative",
-                );
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
                 Ok(None)
             }
@@ -296,23 +264,14 @@ impl Server {
         let emails = &self.inner.cache.emails;
 
         if let Some(email) = emails.get(&EmailAddressRef::new(local_part, domain_id)) {
-<<<<<<< HEAD
             if !quiet {
                 trc::event!(
-                    Store(StoreEvent::CacheHit),
-                    Key = local_part.to_string(),
+                    Cache(CacheEvent::Hit),
+                    Key = CompactString::from(local_part),
                     Domain = domain_id,
-                    Collection = "email",
+                    Name = "email",
                 );
             }
-=======
-            trc::event!(
-                Cache(CacheEvent::Hit),
-                Key = CompactString::from(local_part),
-                Domain = domain_id,
-                Name = "email",
-            );
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
             Ok(Some(email))
         } else {
@@ -321,23 +280,14 @@ impl Server {
                 .get(&EmailAddressRef::new(local_part, domain_id))
                 .is_none()
             {
-<<<<<<< HEAD
                 if !quiet {
                     trc::event!(
-                        Store(StoreEvent::CacheMiss),
-                        Key = local_part.to_string(),
+                        Cache(CacheEvent::Miss),
+                        Key = CompactString::from(local_part),
                         Domain = domain_id,
-                        Collection = "email",
+                        Name = "email",
                     );
                 }
-=======
-                trc::event!(
-                    Cache(CacheEvent::Miss),
-                    Key = CompactString::from(local_part),
-                    Domain = domain_id,
-                    Name = "email",
-                );
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
                 if let Some(object) = self
                     .registry()
@@ -406,23 +356,14 @@ impl Server {
                     Ok(None)
                 }
             } else {
-<<<<<<< HEAD
                 if !quiet {
                     trc::event!(
-                        Store(StoreEvent::CacheHit),
-                        Key = local_part.to_string(),
+                        Cache(CacheEvent::Hit),
+                        Key = CompactString::from(local_part),
                         Domain = domain_id,
-                        Collection = "emailNegative",
+                        Name = "emailNegative",
                     );
                 }
-=======
-                trc::event!(
-                    Cache(CacheEvent::Hit),
-                    Key = CompactString::from(local_part),
-                    Domain = domain_id,
-                    Name = "emailNegative",
-                );
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                 Ok(None)
             }
         }
@@ -475,12 +416,7 @@ impl Server {
                 storage: Default::default(),
                 locale: Default::default(),
                 flags: Default::default(),
-<<<<<<< HEAD
-                za_generation: 0,
-                za_public_key: None,
-=======
                 active_script: Default::default(),
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
             }))
         } else {
             Err(trc::AuthEvent::Error
@@ -676,15 +612,15 @@ impl Server {
                                 .collect(),
                             quota_disk,
                             description: account.description.map(Into::into),
-                            storage: AccountStorage::boxed(quota_objects, encryption_key),
+                            storage: AccountStorage::za_boxed(
+                                quota_objects,
+                                encryption_key,
+                                za_generation,
+                                za_public_key,
+                            ),
                             locale: account.locale,
                             flags,
-<<<<<<< HEAD
-                            za_generation,
-                            za_public_key,
-=======
                             active_script: Default::default(),
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                         }
                     }
                     Account::Group(account) => {
@@ -748,12 +684,7 @@ impl Server {
                             storage: AccountStorage::boxed(quota_objects, None),
                             locale: account.locale,
                             flags: 0,
-<<<<<<< HEAD
-                            za_generation: 0,
-                            za_public_key: None,
-=======
                             active_script: Default::default(),
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                         }
                     }
                 });
@@ -852,29 +783,22 @@ impl Server {
                     if domain.flags & DOMAIN_FLAG_SUB_ADDRESSING != 0 {
                         if let Some(sub_addressing) = &domain.sub_addressing_custom {
                             // Custom sub-addressing resolution
-<<<<<<< HEAD
+                            let mut arena = Bump::new();
                             let resolver = AddressResolver(local_part.as_ref());
                             // Zero-access fork: the quiet path skips the result trace.
                             let result = if quiet {
-                                self.za_eval_if::<String, _>(sub_addressing, &resolver, 0)
-                                    .await
-                            } else {
-                                self.eval_if::<String, _>(sub_addressing, &resolver, 0)
-                                    .await
-                            };
-                            if let Some(result) = result {
-=======
-                            let mut arena = Bump::new();
-                            if let Some(result) = self
-                                .eval_if::<String, _>(
+                                self.za_eval_if::<String, _>(
                                     sub_addressing,
-                                    &AddressResolver(local_part.as_ref()),
+                                    &resolver,
                                     &mut arena,
                                     0,
                                 )
                                 .await
-                            {
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+                            } else {
+                                self.eval_if::<String, _>(sub_addressing, &resolver, &mut arena, 0)
+                                    .await
+                            };
+                            if let Some(result) = result {
                                 local_part = Cow::Owned(result);
                             }
                         } else if let Some((new_local_part, _)) = address.split_once('+') {

@@ -83,8 +83,9 @@
 //!   (mail spec 6.1).
 //! - `INDEX_WRITE_PAUSE`: in the index worker after its documents are built
 //!   and immediately before the search store's write, keyed by the account
-//!   of an `IndexDocument` task of the batch
-//!   (`services::task_manager::index`, mail ruling R54).
+//!   of a queued document (mail ruling R54). At 0.16 its call site was
+//!   `services::task_manager::index`, which 1.0 replaced with the index
+//!   queue (`services::index_queue`); Task 6 re-homes the call site.
 //! - `TRAIN_PAUSE`: in `add_account_spam_sample` after the message's
 //!   metadata read and before the sample is added to the batch, keyed by
 //!   the sample's account (`email::message::ingest`, mail ruling R55).
@@ -97,14 +98,46 @@
 //!   `AssertValueFailed`, as FoundationDB reports a read error at the
 //!   guard's assertion (`store::search::index`, mail ruling R63); defined in
 //!   `store::za_test` and re-exported here.
+//!
+//!   `INDEX_CHUNK_PAUSE` and `INDEX_GUARD_FAIL_ONCE` have no call site at
+//!   1.0 (0.16's `Store::index` is gone); Task 6 decides their fate with
+//!   R62 and R63.
+//! - `FORCE_COMMIT_SPLIT` (ruling 18): while it names an account, every
+//!   `BatchBuilder::commit_point()` of a batch whose current account is that
+//!   account, or of a batch with no current account, adds a commit point.
+//!   The second kind also covers batches that are not the test's: other
+//!   accounts' search-index passes, the index queue's bookkeeping batch and
+//!   registry-mapping batches split too while it is set. Defined in
+//!   `store::za_test`; set it through `ForceCommitSplit`, whose drop clears
+//!   it, so a test that panics while it is set does not leave every later
+//!   batch splitting.
 
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
 pub use store::za_test::{
-    INDEX_GUARD_FAIL_ONCE, Pause, set_index_chunk_pause, set_index_guard_fail_once,
+    FORCE_COMMIT_SPLIT, INDEX_GUARD_FAIL_ONCE, Pause, set_index_chunk_pause,
+    set_index_guard_fail_once,
 };
+
+/// Sets `FORCE_COMMIT_SPLIT` to `account_id` for the guard's lifetime; the
+/// drop clears it, also when the test panics.
+#[must_use = "dropping the guard clears FORCE_COMMIT_SPLIT"]
+pub struct ForceCommitSplit(());
+
+impl ForceCommitSplit {
+    pub fn new(account_id: u32) -> Self {
+        store::za_test::set_force_commit_split(Some(account_id));
+        ForceCommitSplit(())
+    }
+}
+
+impl Drop for ForceCommitSplit {
+    fn drop(&mut self) {
+        store::za_test::set_force_commit_split(None);
+    }
+}
 
 pub static FAN_OUT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 

@@ -206,6 +206,7 @@ impl Server {
             token_scope => token_scope,
         };
         AccessToken::renew(inner, access_token.credential_id(), token_scope, remote_ip)
+            .map(|renewed| renewed.za_carry_impersonation(access_token))
     }
 
     pub async fn refresh_access_token(
@@ -223,7 +224,7 @@ impl Server {
                 access_token.token_scope(),
                 remote_ip,
             )
-            .map(Some)
+            .map(|renewed| Some(renewed.za_carry_impersonation(access_token)))
         }
     }
 

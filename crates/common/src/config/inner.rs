@@ -12,11 +12,6 @@ use super::server::tls::build_self_signed_cert;
 use crate::auth::TenantCache;
 // SPDX-SnippetEnd
 use crate::{
-<<<<<<< HEAD
-    Caches, Data, DavResource, DavResources, HttpAuthCache, MailboxCache, MessageStoreCache,
-    MessageUidCache, TlsConnectors,
-    auth::{AccessTokenInner, AccountCache, DomainCache, MailingListCache, RoleCache, TenantCache},
-=======
     Caches, Data, GroupwareResource, GroupwareResources, MailboxCache, MessageStoreCache,
     MessageUid, TlsConnectors,
     auth::{AccessTokenInner, AccountCache, DomainCache, MailingListCache, RoleCache},
@@ -26,7 +21,6 @@ use crate::{
         large::{LargeMessageCaches, LargeResourceCaches},
         swap::SwapReceiver,
     },
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
     config::{
         mailstore::spamfilter::{SpamClassifier, SpamLookup},
         server::tls::parse_certificates,
@@ -48,12 +42,8 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     sync::Arc,
 };
-<<<<<<< HEAD
 use store::{LookupStores, rand, registry::bootstrap::Bootstrap};
-=======
-use store::{LookupStores, registry::bootstrap::Bootstrap};
 use types::collection::SyncCollection;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 use utils::{
     UnwrapFailure,
     cache::{Cache, CacheWithTtl, SpillCache},
@@ -139,26 +129,17 @@ impl Caches {
             access_tokens: SpillCache::new(
                 cache.access_tokens,
                 (std::mem::size_of::<AccessTokenInner>() + 255) as u64,
-<<<<<<< HEAD
-            ),
-            http_auth: Cache::new(
-                cache.http_auth,
-                (32 + std::mem::size_of::<HttpAuthCache>()) as u64,
-            ),
+            )
+            .with_name("accessTokens"),
+            http_auth: HttpAuthEntries::new(cache.http_auth),
+            grant_revocations: GrantRevocations::default(),
             za_keys: vault::cache::KeyCache::new(vault::cache::KeyCacheConfig::from_env()),
             za_fingerprint_key: vault::Zeroizing::new(rand::random::<[u8; 32]>()),
             account_epoch: std::sync::atomic::AtomicU64::new(0),
             za_account_page_origin: arc_swap::ArcSwapOption::from_pointee(
                 crate::auth::vault::za_account_page_origin_from_env(),
             ),
-            messages: Cache::new_single_shard(
-=======
-            )
-            .with_name("accessTokens"),
-            http_auth: HttpAuthEntries::new(cache.http_auth),
-            grant_revocations: GrantRevocations::default(),
             messages: Cache::new_single_shard_with(
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                 cache.messages,
                 (std::mem::size_of::<u32>()
                     + std::mem::size_of::<Arc<MessageStoreCache>>()

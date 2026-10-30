@@ -40,11 +40,8 @@ pub mod credential;
 pub mod oauth;
 pub mod permissions;
 pub mod rate_limit;
-<<<<<<< HEAD
-pub mod vault;
-=======
 pub mod sasl;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+pub mod vault;
 
 pub const RECOVERY_ADMIN_ID: u32 = u32::MAX;
 const PERMISSIONS_BITSET_SIZE: usize = Permission::COUNT.div_ceil(std::mem::size_of::<usize>() * 8);
@@ -113,12 +110,6 @@ pub struct AccountCache {
     pub storage: Option<Box<AccountStorage>>,
     pub locale: Locale,
     pub flags: u64,
-<<<<<<< HEAD
-    /// Authentication generation (vault record revision); 0 for non-key accounts.
-    pub za_generation: u64,
-    /// X25519 public key of a key account.
-    pub za_public_key: Option<[u8; 32]>,
-=======
     pub active_script: ActiveScriptSlot,
 }
 
@@ -126,6 +117,12 @@ pub struct AccountCache {
 pub struct AccountStorage {
     pub quota_objects: Option<ObjectQuota>,
     pub encryption_key: Option<EncryptionKeys>,
+    /// Zero-access fork (ruling 12): authentication generation (vault
+    /// record revision); 0 for non-key accounts. Kept here, boxed, so
+    /// `AccountCache` stays within its size assertion.
+    pub za_generation: u64,
+    /// Zero-access fork: X25519 public key of a key account.
+    pub za_public_key: Option<[u8; 32]>,
 }
 
 const _: () = assert!(size_of::<AccountCache>() <= 112);
@@ -139,10 +136,10 @@ impl AccountStorage {
             Box::new(AccountStorage {
                 quota_objects,
                 encryption_key,
+                ..Default::default()
             })
         })
     }
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 }
 
 pub type EncryptionKeys = Box<[Box<[u8]>]>;
@@ -195,7 +192,7 @@ pub struct PermissionsGroup {
 pub struct AccessToken {
     scope_idx: usize,
     inner: Arc<AccessTokenInner>,
-<<<<<<< HEAD
+    token_scope: Option<TokenScope>,
     /// Resident keys for this request or mail session only (spec 5,
     /// "in-flight copies"; mail spec 3.3).
     session_keys: Option<Arc<::vault::session::SessionKeys>>,
@@ -203,9 +200,6 @@ pub struct AccessToken {
     /// recovery admin's `%` form). Kept on this copy, as `session_keys` is,
     /// never in the shared inner: the account's own logins stay unmarked.
     za_impersonated: bool,
-=======
-    token_scope: Option<TokenScope>,
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -415,15 +409,7 @@ pub trait BuildAccessToken {
 
 impl BuildAccessToken for Arc<AccessTokenInner> {
     fn build(self) -> AccessToken {
-<<<<<<< HEAD
         AccessToken::from_parts(0, self)
-=======
-        AccessToken {
-            scope_idx: 0,
-            inner: self,
-            token_scope: None,
-        }
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
     }
 }
 
@@ -459,11 +445,6 @@ impl AccountCache {
         self.addresses.first().map(|address| address.domain_id)
     }
 
-<<<<<<< HEAD
-    #[inline(always)]
-    pub fn is_key_account(&self) -> bool {
-        self.flags & ACCOUNT_IS_KEY_ACCOUNT != 0
-=======
     // SPDX-SnippetBegin
     // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
     // SPDX-License-Identifier: LicenseRef-SEL
@@ -478,7 +459,6 @@ impl AccountCache {
     #[inline]
     pub fn is_same_tenant(&self, _access_token: &AccessToken) -> bool {
         true
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
     }
 }
 
@@ -511,4 +491,53 @@ impl DomainCache {
         (self.flags & DOMAIN_FLAG_SCIM_PROVISIONING) != 0
     }
     // SPDX-SnippetEnd
+}
+
+// Zero-access fork: key-account classification and the authentication
+// generation (interface sheet 3, ruling 12).
+impl AccountCache {
+    #[inline(always)]
+    pub fn is_key_account(&self) -> bool {
+        self.flags & ACCOUNT_IS_KEY_ACCOUNT != 0
+    }
+
+    /// Authentication generation (vault record revision) seen by the
+    /// loader; 0 for non-key accounts.
+    #[inline]
+    pub fn za_generation(&self) -> u64 {
+        self.storage
+            .as_ref()
+            .map_or(0, |storage| storage.za_generation)
+    }
+
+    /// X25519 public key of a key account, as the loader read it. Never a
+    /// substitute for the served key a write reads fresh.
+    #[inline]
+    pub fn za_public_key(&self) -> Option<&[u8; 32]> {
+        self.storage
+            .as_ref()
+            .and_then(|storage| storage.za_public_key.as_ref())
+    }
+}
+
+impl AccountStorage {
+    /// `AccountStorage::boxed` plus the authentication generation and the
+    /// public key: always boxed for a key account (`za_generation != 0`),
+    /// so the generation fence has a value to compare.
+    pub fn za_boxed(
+        quota_objects: Option<ObjectQuota>,
+        encryption_key: Option<EncryptionKeys>,
+        za_generation: u64,
+        za_public_key: Option<[u8; 32]>,
+    ) -> Option<Box<Self>> {
+        if za_generation == 0 && za_public_key.is_none() {
+            return AccountStorage::boxed(quota_objects, encryption_key);
+        }
+        Some(Box::new(AccountStorage {
+            quota_objects,
+            encryption_key,
+            za_generation,
+            za_public_key,
+        }))
+    }
 }

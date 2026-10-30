@@ -723,17 +723,7 @@ impl Tracers {
 impl Metrics {
     pub async fn parse(bp: &mut Bootstrap) -> Self {
         let metrics = bp.setting_infallible::<structs::Metrics>().await;
-<<<<<<< HEAD
-        let resource = Resource::builder()
-            .with_service_name("stalwart")
-            .with_attribute(KeyValue::new(SERVICE_VERSION, crate::version::FORK_VERSION))
-            .build();
-        let instrumentation = InstrumentationScope::builder("stalwart")
-            .with_version(crate::version::FORK_VERSION)
-            .build();
-=======
         let resource = OtlpResource::new(bp, &metrics).resource;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
         Metrics {
             prometheus: match metrics.prometheus {
