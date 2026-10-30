@@ -3511,12 +3511,20 @@ checked by `rustfmt` only.
 
 - Removed with their sub-test calls: `tests/src/directory/oidc.rs` (`oidc::test`),
   `tests/src/system/archiving.rs` and `tenant.rs` (`archiving::test`, `tenant::test`), and
-  the 8 SEL-only files of `tests/src/scim/`. The removed `scim/mod.rs` held `scim_tests`
-  itself, so `scim_tests` no longer exists, and `tests/src/lib.rs` no longer declares
-  `scim`. The three dual-licensed files there (`conformance.rs`, `oidc.rs`, `tenant.rs`)
-  import `ScimTest` from the removed `mod.rs`; they stay on disk, undeclared. Design
-  Decision 1 and ruling 33 say `scim_tests` keeps compiling: that no longer holds, a
-  decision for the primary.
+  the 8 SEL-only files of `tests/src/scim/`.
+- `scim_tests` takes the SEL-only disposition (ruling 38). Its entry function sat in the
+  SEL-only `tests/src/scim/mod.rs`, and its only subject is the SEL-only `scim` crate. So
+  the whole suite goes:
+  - the three dual-licensed files that only it declared (`conformance.rs`, `oidc.rs`,
+    `tenant.rs`, which import `ScimTest` from that `mod.rs`) are removed with it;
+  - `tests/src/lib.rs` no longer declares `scim`;
+  - the tests crate's `scim` dev-dependency is removed: nothing else in `tests` uses it
+    (checked with grep), and `http/enterprise` still enables `scim/enterprise`.
+
+  They stay in git history and come back only with a bought licence, in a private
+  repository. Left in place, now unused: the `scim-proto` dev-dependency, and the
+  SCIM-tester container helpers (`ensure_scim_tester`, `scim_tester_exec` in
+  `tests/src/utils/containers.rs`, with `tests/docker/scim/`).
 - `get_token_for_client`, which the dual-licensed `tests/src/directory/issuer.rs` imported
   from the SEL-only `oidc.rs`, is written in `issuer.rs` from RFC 6749: the resource owner
   password credentials grant (4.3) against the token endpoint of the issuer's discovery
@@ -3777,7 +3785,7 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `smtp::inbound::antispam::antispam` | The `llm` case is removed from its case list. | Ruling 33: the LLM analysis needs a licence (AI models are off while `core.enterprise` is `None`). |
 | `directory::directory_tests` | The `oidc::test` call is removed. | SEL-only file `tests/src/directory/oidc.rs` (design Decision 1). |
 | `system::system_tests` | The `tenant::test` and `archiving::test` calls are removed. | SEL-only files (design Decision 1). |
-| `scim::scim_tests` | Removed, with the SEL-only `tests/src/scim/mod.rs` that held it. | SEL-only files (design Decision 1); see "SEL-only removals and ruling 33". |
+| `scim::scim_tests` | Removed, with the SEL-only `tests/src/scim/mod.rs` that held it and the three dual-licensed files only it declared. | Ruling 38: SEL-only disposition (its entry and its only subject, the `scim` crate, are SEL-only); see "SEL-only removals and ruling 33". |
 | Every suite (harness) | Telemetry is enabled with `core.is_enterprise_edition()`, false without a licence, where 0.16 passed `true`. | Ruling 33: no test licence; boot does the same (`common/src/manager/boot.rs`). |
 | Every suite (harness) | The emptiness check no longer expires in-memory keys (`store_lookup_expire_all`). | 1.0 keeps no in-memory values in the data store (`InMemoryStore` has no data-store variant). |
 

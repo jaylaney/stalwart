@@ -8785,7 +8785,6 @@ dependencies = [
  "rust-s3",
  "rustls",
  "rustls-pki-types",
- "scim",
  "scim-proto",
  "serde",
  "serde_json",
