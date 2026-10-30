@@ -215,7 +215,16 @@ async fn dropping_the_routes_removes_the_bundle_directory() {
 
     apps.routes.store(Arc::new(AHashMap::new()));
 
-    assert!(tokio::fs::metadata(&path).await.is_err());
+    // Ruling 44: 1.0's `TempDir` drop removes the directory in
+    // `spawn_blocking` inside a runtime, so wait for it, bounded.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while tokio::fs::metadata(&path).await.is_ok() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the bundle directory was not removed after the routes were dropped"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 #[tokio::test]

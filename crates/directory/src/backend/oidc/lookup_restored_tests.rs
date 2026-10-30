@@ -20,7 +20,13 @@ fn extract_string_list_distinguishes_absent_from_empty() {
     assert_eq!(extract_string_list(&json!([])), Some(vec![]));
     assert_eq!(extract_string_list(&json!("")), Some(vec![]));
     assert_eq!(extract_string_list(&json!(null)), None);
-    assert_eq!(extract_string_list(&json!({"groups": []})), None);
+    // Ruling 44: 1.0 turns an object into its keys, where 0.16 treated it
+    // as absent. Documents the 1.0 behaviour, recorded as an apparent
+    // upstream bug.
+    assert_eq!(
+        extract_string_list(&json!({"groups": []})),
+        Some(vec!["groups".to_string()])
+    );
     assert_eq!(extract_string_list(&json!(42)), None);
 }
 
