@@ -3238,13 +3238,41 @@ sheet's proposals and the inventory's findings, and 30–33 come from the task r
     `tests/qualification/tools/`. It has a self-check that reproduces every recorded
     `last_statement` region on the `5b914ddb5` sources, so Task 7 builds on the method
     rather than reimplementing it.
-33. **The test licence key is not restored** (inventory fix round 1). Its two `test_mode`
-    sites sit in the SEL-only `common/src/enterprise/config.rs` (`:87`, `:90` at 0.16.27),
-    and the fork doesn't edit SEL code. The tests that use it are SEL-only (`system::tenant`,
-    `system::archiving`, `scim`). Task 2 finds any retained test whose behaviour depended on
-    the licence: it is dispositioned, or adapted with an expectation-ledger entry. Running
-    the retained suite unlicensed is also closer to the OSS product. Cost if wrong: a
-    retained test changes behaviour without a licence, which Task 7's gates show.
+33. **The test licence key is not restored** (inventory fix round 1; revised after the
+    re-review's N1). Its two `test_mode` sites sit in the SEL-only
+    `common/src/enterprise/config.rs` (`:87`, `:90` at 0.16.27). The fork doesn't edit SEL
+    code, and a licence minted by fork code would get around the licence check.
+    - **What breaks without one.** At 1.0.1 an enterprise-built server refuses `MaskedEmail`,
+      `ArchivedItem`, `Metric` and `Trace` without a licence (`assert_enterprise_object`,
+      `jmap/src/registry/mod.rs:18-42`), while the OSS build allows them. Five retained
+      non-SEL sub-tests use those objects: `system::delivery`, `system::authorization`,
+      `system::directory`, `telemetry::tracing` and `telemetry::metrics`.
+    - **What Task 2 does.** It establishes whether the retained suite builds and runs
+      without the `enterprise` feature. If it does, the harness drops the feature, which
+      matches the shipping product and also answers Review Focus 5. A retained test that
+      needs an enterprise feature gets a disposition with evidence. If the suite can't drop
+      the feature, Task 2 stops and brings the five sub-tests to the primary.
+    - No test is adapted to expect the refusal.
+    Recorded limits of the helper gate (the re-review's N3 and N6):
+    - **Locator refinements.** The locator refines the rule in four ways, none of which can
+      pass a body that skipped a last statement holding code:
+      - a statement with no region of its own passes to the one before it;
+      - `let`, `if let` and `while let` are anchored at the scrutinee;
+      - among regions with the same start, the highest count wins;
+      - ties go in symbol order.
+    - **Exemptions.** The gate never requires 81 `tests/src` functions, the baseline's
+      documented exemptions:
+      - 63 `#[tokio::test]` entry points, which the libtest status gate covers instead;
+      - 13 that complete only through `return`;
+      - 3 that the locator can't anchor;
+      - 2 that didn't complete at 0.16.27.
+    - **Future-building helpers.** The twelve helpers whose last statement is an async
+      block (six request builders that drive the race tests and six `SessionManager`
+      methods) are also required to run that block's own record (`tail_block`) where it
+      ran at 0.16.27, so a future that is built but never run fails.
+
+    Cost if wrong: if the feature can't go, the five sub-tests, or their licensed parts,
+    need a decision from Jay.
 
 The inventory's findings 3–7 and 11–14 are directives to their owner tasks and need no
 choice. The baseline's observation that imap `uidbatches::test` reaches its final loop with

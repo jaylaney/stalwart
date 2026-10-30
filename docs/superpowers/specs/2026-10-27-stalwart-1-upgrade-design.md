@@ -612,7 +612,9 @@ reduced form.
   fails the rule, for example one whose body ends in a diverging or branching tail. Such a
   sub-test gets an explicit completion marker; the rule is not loosened.
 - **Coverage.** Line coverage of the fork-owned cohort must not fall below the baseline's
-  exact fraction, 17,821 of 18,490 lines (96.38%; the table above rounds it to 96.4%). The
+  exact fraction, 17,821 of 18,490 lines (96.38%; the table above rounds it to 96.4%), and
+  its runtime-only figure, without inline `#[cfg(test)]` modules and the fork's test-support
+  files, must not fall below 10,646 of 11,246 lines (94.66%). The
   cohort is the baseline's 40 fork-owned files, mapped across moves, plus fork runtime code
   added during the port, listed as it is added.
   - Restored upstream tests (`*restored_tests.rs`) and the `tests` crate are reported as

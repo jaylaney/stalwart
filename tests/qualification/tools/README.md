@@ -26,9 +26,33 @@ positive counts:
 2. **The region that starts the body's last top-level statement.**
 3. **The closing-brace exit region.**
 
-The module docstring of `strict_rule.py` gives the details: how a statement's anchor is chosen,
-how the region is chosen, and what happens when a statement has no region. The baseline's
-`subtests.strict_rule.method` describes the same method, with worked examples.
+The module docstring of `strict_rule.py` gives the details:
+- how a statement's anchor is chosen and how its region is chosen;
+- what happens when a statement has no region;
+- how an empty body's exit is found.
+
+The baseline's `subtests.strict_rule.method` describes the same method, with worked examples.
+
+Some plain functions return an `async { }` or `async move { }` block as their last statement. For
+those, the tool also measures the block's own closure record under the same three counts: this
+is `tail` in the output, and `tail_block` in the baseline. A future that is built but never
+polled therefore shows there.
+
+## Identity
+
+A function is identified by `(file, in, name)`:
+- `in` is the enclosing inline `mod`, the `impl` or `trait` header in angle brackets, or the
+  enclosing `fn`, joined by `::`;
+- `in` is null for a function at file level.
+
+The line of the `fn` keyword is data, not identity. A function therefore keeps its identity when
+lines above it change. The identity is unique across all 2,267 functions at 0.16.27.
+- `functions` exits with an error when two functions with a body record share an identity.
+- `self-check` reports a mismatch when two baseline entries share one.
+
+A gate maps a candidate's functions onto the baseline by this identity. A function that is
+renamed, or moved to another file or another `impl`, needs a disposition that names both its old
+and its new `(file, in, name)`.
 
 ## Inputs
 
@@ -62,7 +86,8 @@ python3 -I tests/qualification/tools/strict_rule.py functions \
 For each function, the output gives:
 - its geometry: body braces, top-level statements, anchors, and the loop block's first statement;
 - per step, the reported record: symbol, `body`, `last`, `exit`, `loop`, the chosen regions, and
-  `executed`.
+  `executed`;
+- for a function with a tail block, the same for the block, under `tail_steps`.
 
 Compute the cohort's full and runtime-only coverage:
 
@@ -98,12 +123,24 @@ python3 -I tests/qualification/tools/strict_rule.py self-check \
 ```
 
 `self-check` recomputes every function and compares the results with the baseline:
-- every recorded `last_statement` region, for the sub-test calls and the helper functions;
-- every loop-body region;
-- every per-step count and executed flag;
-- that no function with a positive body count is missing from the baseline;
-- every cohort file's full and runtime-only figures and its test-module spans;
-- both gate fractions, `cohort.reference.threshold` and `threshold_runtime`.
+- **recorded values:**
+  - every `last_statement` region, for the sub-test calls, the helper functions and the tail
+    blocks;
+  - every loop-body region;
+  - every per-step count and executed flag.
+- **Both directions** for helpers and tail blocks: a positive body count the baseline does not
+  record is a mismatch.
+- **The derived fields the gates read:**
+  - each call's `executed`, per step;
+  - each call's `expected_steps`, derived from its mode, env, other conditions and cfg flag, and
+    from its suite's steps and their modes;
+  - each loop body's `positive_at_0_16_27` and `required_in`;
+  - each helper's line, span, `async` and symbol;
+  - the aggregate counts in `subtests.counts` and `helpers.counts`.
+- **Identity:** that every helper identity is unique.
+- **The cohort:**
+  - every file's full and runtime-only figures and its test-module spans;
+  - both gate fractions, `cohort.reference.threshold` and `threshold_runtime`.
 
 It prints each mismatch and exits 1 if there is one. On the 0.16.27 inputs it takes about 50
 seconds and prints:
@@ -111,10 +148,15 @@ seconds and prints:
 ```
 cohort threshold: 17821/18490
 cohort threshold_runtime: 10646/11246
-checked: {"call_counts": 332, "call_regions": 197, "cohort_files": 40, "cohort_fractions": 2, "helper_counts": 4199, "helper_regions": 2249, "helpers": 2249, "loop_counts": 19, "loop_regions": 12}
+checked: {"aggregates": 13, "call_counts": 332, "call_executed": 197, "call_expected_steps": 198, "call_regions": 197, "cohort_files": 40, "cohort_fractions": 2, "helper_counts": 4199, "helper_identity": 2249, "helper_regions": 2249, "helpers": 2249, "loop_counts": 19, "loop_derived": 12, "loop_regions": 12, "tail_blocks": 12, "tail_counts": 24}
 result: OK
 ```
 
 Task 7's gates run `functions` and `cohort` on the candidate's exports and sources, then compare
-the results with the baseline: step by step, never mode by mode, and against both cohort
-fractions. These tools do not implement that comparison.
+the results with the baseline:
+- step by step, never mode by mode;
+- functions by identity;
+- tail blocks wherever they executed;
+- against both cohort fractions.
+
+These tools do not implement that comparison.

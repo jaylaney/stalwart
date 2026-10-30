@@ -275,8 +275,8 @@ boots one server per tier.
   Notes on this rule:
   - A `#[path]` resolves relative to the directory of the declaring file, so a shared name
     would collide in the 19 directories with two or more such modules.
-  - The module keeps its own name (`tests` for all but five, recorded in the baseline's
-    mapping), so its libtest identifiers are unchanged and Task 7's
+  - The module keeps its own name (`tests` for all but six: five test modules named
+    otherwise and the test-support module `serde_impl`, recorded in the baseline's mapping), so its libtest identifiers are unchanged and Task 7's
     gate needs no rename table. As a child module it sees the parent's private items, as
     the inline module did.
   - Follow Task 1's mapping, and update it where a subject moved.
@@ -729,7 +729,9 @@ and `scripts/tests/check_coverage.py`; the expectation ledger in the outcome not
     region get an explicit completion marker, and the tool checks that marker instead.
 - **The coverage tool** compares the candidate's per-file export with the baseline. It fails
   if line coverage of the fork-owned cohort falls below the baseline's exact fraction,
-  17,821 of 18,490 lines (96.38%).
+  17,821 of 18,490 lines (96.38%), or if its runtime-only figure (the same files without
+  their inline `#[cfg(test)]` modules and the fork's test-support files) falls below
+  10,646 of 11,246 lines (94.66%) (Task 1's ruling 31).
   - The cohort is the baseline's 40 files, mapped across moves, plus fork runtime code added
     during the port, listed as it is added.
   - Restored upstream tests (`*restored_tests.rs`) and the `tests` crate are reported as
