@@ -1,13 +1,16 @@
 # Stalwart 1.0 fresh store upgrade design
 
-Revision 3, 2026-10-30. It adopts the findings of two independent reviews of revision 2:
-[Fable](2026-10-27-stalwart-1-upgrade-design-review.md) and
-[Codex](../plans/2026-10-27-stalwart-1-upgrade-codex-review-2026-10-30.md). It also records
-Jay's decisions on the questions they raised, under one principle: maintain upstream.
+Revision 4, 2026-10-30. It adopts both re-reviews of revision 3:
+[Fable's](2026-10-27-stalwart-1-upgrade-design-review-r3.md) and the "Revision 3 re-review"
+section of the [Codex review](../plans/2026-10-27-stalwart-1-upgrade-codex-review-2026-10-30.md).
+It also records Jay's answers to their four questions. The main correction is to the
+dead-property design, which now seals exactly the unit upstream stores.
 
-Revision 2 (2026-10-29) moved the base to 0.16.27 and the target to v1.0.1, and made the
-fork own the whole 0.16.27 suite. Revision 1 (2026-10-27) targeted v1.0.0 from the 0.16.26
-base.
+Revision 3 (2026-10-30) adopted the first reviews of both
+([Fable](2026-10-27-stalwart-1-upgrade-design-review.md) and Codex), under one principle:
+maintain upstream. Revision 2 (2026-10-29) moved the base to 0.16.27 and the target to
+v1.0.1, and made the fork own the whole 0.16.27 suite. Revision 1 (2026-10-27) targeted
+v1.0.0 from the 0.16.26 base.
 
 ## Purpose and scope
 
@@ -118,7 +121,7 @@ The contracts below are acceptance criteria, not an opportunity to redesign thos
 | C3 | No credential, reversible credential cache key, private key, decrypted protected content or content-bearing diagnostic is added to caches, traces, errors or persistent snapshots. Keep the approved field-specific trace exceptions. |
 | C4 | Ordinary accounts keep upstream 1.0 behaviour. Key accounts keep the existing refusals, including the unsupported credential, content-search, mail-sharing and JMAP-calendar operations, and the external-directory refusals and marker preservation (calendar spec 4.3). Keep upstream's OAuth expiry, grant-revocation and scope checks. |
 | C5 | Key-account mail is a stub plus a sealed blob, whatever wrote it. Every ordinary writer asserts the vault's absence in its effective commit. Every protected reader has the owner's keys or refuses; background work never acquires those keys. |
-| C6 | Calendar metadata and content are sealed or sanitized before serialization and derived indexing. No hidden property can reappear in metadata, alarms, notifications, dead properties or indexes through a split or metadata-only write, or through a background rewrite. |
+| C6 | Calendar metadata and content are sealed or sanitized before serialization and derived indexing. No hidden property can reappear in metadata, alarms, notifications, dead properties or indexes, whether through a split or metadata-only write, through a background rewrite, or through a stored flag derived from it (for example `CLASS`). |
 | C7 | Sharing uses the current principal's keys, the current own-id permission and the authenticated ring identity. Keep the physical parent and link fences, conversion, future-write rotation, sync boundaries, pin-before-deliver, UID leases, SEQUENCE and delegated scheduling semantics. |
 | C8 | Search work for key mail keeps only the allowed arrival-time and size fields. Sealed calendar content and protected attachment text stay out of background indexes. Provisioning and deletion fences cover every new queue and commit segment. |
 | C9 | Keep upstream 1.0 stored types as supplied: add no fork fields to them, and hand-edit no generated registry schema or event enum. Keep the reserved Principal fields 150/151, the account flag `1 << 9` and the vanished collection 250, after checking each for collisions. |
@@ -150,31 +153,52 @@ product gate runs the OSS binary.
 ### Dead properties and object metadata
 
 1.0.1 removed `types::DeadProperty` and the event record's `dead_properties` field. DAV
-dead properties, IMAP METADATA and JMAP object metadata now share one store. Each entry is
-a document of `Collection::Metadata` (14) with a per-viewer class:
-`MetadataClass::{Shared, Private{viewer}, Viewer{viewer}, Owner{owner}}`. They are written
-through `dav/src/common/dead/` and `common/src/storage/metadata/`. The fork's sealed extras
-therefore lose their home in the event record.
+dead properties, IMAP METADATA and JMAP object metadata now share one store,
+`Collection::Metadata` (14), written through `dav/src/common/dead/` and
+`common/src/storage/metadata/`. The fork's sealed extras therefore lose their home in the
+event record. The store has this shape:
+- **Keys** hold only ids: `account / Collection::Metadata / class / collection /
+  document_id`, with the viewer's id for `Private` (`store/src/write/key.rs:589-608`). No
+  property name appears in a key.
+- **Containers.** Only two classes carry one: `Shared` and `Private{viewer}`. The value is a
+  per-document container of `Entry { key, value }` pairs, so the names and values are
+  inside it (`types/src/metadata/entries.rs`).
+- **Bookkeeping.** `Viewer{viewer}` and `Owner{owner}` hold upstream's 12-byte
+  `ViewerState { change_id, containers }` counters, keyed without a document id. Keyless
+  enumeration decodes them directly (`common/src/storage/metadata/{mod,read,purge}.rs`).
+- **Scope.** The store serves eight object kinds: Email, Mailbox, SieveScript, Calendar,
+  CalendarEvent, AddressBook, ContactCard and FileNode.
 
-**Decision:** keep upstream's metadata store, and seal the values for key accounts in that
-store's common write and read path.
-- `Shared` and `Owner` entries are sealed under the calendar's collection key, so every
-  holder of the collection key reads them, as with the existing extras.
-- `Private` and `Viewer` entries are sealed under the viewer's own key.
-- A fork payload version byte marks a sealed value.
-- Property names sit in the keys and stay visible. The calendar spec's visibility allowlist
-  governs which names a key account may hold. The leak scanner covers `Collection::Metadata`.
+**Decision (parity by construction):** for a key account's calendars and events, seal
+exactly the unit upstream stores, in the store's common write and read path.
+- **Sealed unit:** the per-document container of a `Shared` or `Private{viewer}` entry,
+  names and values together, which matches 0.16, where the whole dead property was sealed.
+- **Key:** the calendar's collection key, for both classes. Every holder of the collection
+  key can read a grantee's `Private` entries. At 0.16 every dead property sat under that key
+  and `Private` did not exist, so this is no regression. Per-viewer secrecy among a
+  collection's members would need a new key purpose and its own review; it is out of scope.
+- **Marker:** a fork payload version byte marks a sealed container.
+- **Bookkeeping:** the `Viewer` and `Owner` records stay in upstream's format.
+- **Other object kinds:** a key account's address books, contacts and files keep their
+  containers in the clear, as at 0.16 and upstream; those objects were never sealed for key
+  accounts. Mailboxes and Sieve scripts are reachable only through IMAP METADATA and JMAP
+  object metadata, which are refused.
+- **Leak rule:** every container of a key account's calendar or event document is sealed,
+  and the 12-byte bookkeeping records are permitted. It is not a name check: names are
+  never in keys.
 
 DAV PROPPATCH and PROPFIND go through this path with the request's keys. Keep the extras
 codec only for the parts of the sealed content that still live in the content archive.
 
-IMAP METADATA (`GETMETADATA`, `SETMETADATA`) and JMAP object metadata are refused for key
-accounts in this port. JMAP object metadata is a property layer inside the existing
-`*/get`, `*/set`, `*/query` and `*/copy` methods, not a new method, so the dispatcher gate
-cannot catch it. The refusal sits in `jmap/src/api/metadata/` (`write`, `apply`, `get`,
-`preload`, `copy`). The IMAP refusal is per command. The presence flags that object writers
-record (`email/src/presence.rs`, `common/src/storage/index/presence.rs`) name metadata
-kinds, not values, and stay upstream's.
+IMAP METADATA and JMAP object metadata are refused for key accounts in this port.
+- **IMAP:** the refusal covers `GETMETADATA`, `SETMETADATA` and `LIST … RETURN (METADATA …)`
+  (`imap/src/op/list.rs:181-182`).
+- **JMAP:** object metadata is a property layer inside the existing `*/get`, `*/set`,
+  `*/query` and `*/copy` methods, not a new method, so the dispatcher gate cannot catch it.
+  The refusal sits in `jmap/src/api/metadata/` (`write`, `apply`, `get`, `preload`, `copy`).
+- **Presence flags:** object writers record which metadata kinds exist
+  (`email/src/presence.rs`, `common/src/storage/index/presence.rs`). They name kinds, not
+  values, and stay upstream's.
 
 ### Authentication and authority
 
@@ -189,8 +213,9 @@ adaptation keeps them.
 
 Keep the external-directory refusals and the marker check at their 1.0.1 sites:
 - `za_refuse_directory_login` goes in `authenticate_basic`'s directory branch;
-- `za_refuse_directory_account` goes after `assert_account_directory` and before
-  `build_directory_token`;
+- `za_refuse_directory_account` goes after `directory.authenticate` returns and before
+  `assert_account_directory`, which keeps 0.16's error order (a key account is refused
+  before a directory mismatch is reported);
 - `merge_directory_secret`'s marker check goes in `synchronize_account`.
 
 The `za::external_directory` module (PR #66) is their regression test. The Bearer arm needs
@@ -226,30 +251,39 @@ keyless background rewrite.
 
 **Decision:** for a key-account owner, `stage_event`, `stage_calendar` and
 `stage_notification` skip the account. The fork's own revoke runs with the owner's keys:
-it rotates the ring and removes the grantee's entries. The periodic `rebuild_shares` task
-(from `AccountMaintenance`) gets the same treatment where it would write a key account's
-calendar data.
+it rotates the ring and removes the grantee's entries. The grantee-side writes the task
+makes are metadata container counters, not content.
+
+The periodic `rebuild_shares` task (from `AccountMaintenance`) runs unchanged for key
+accounts. It writes only the `acl_grant` and `acl_revoke` index keys derived from object
+ACLs, never event or calendar records, and keeps the grantee index in line with the ACLs
+the fork's revoke maintains.
 
 **Per-user event data.** 1.0.1 reshapes `EventPreferences` into
 `{ account_id, updated, instances: Vec<EventUserData { recurrence_key, flags, color,
-keywords, alerts }> }`, stored in `CalendarEventContent.preferences`. At 0.16 the rule is:
-these preferences are JMAP-only, and JMAP calendars are refused for key accounts, so they
-never exist for a key account (calendar spec, table near line 717). Keep that rule and
-assert it.
+keywords, alerts }> }`, stored in `CalendarEventContent.preferences`. At 0.16 these
+preferences are JMAP-only, and JMAP calendars are refused for key accounts, so they never
+exist for a key account (calendar spec, table near line 717). The rule still holds at
+1.0.1: no DAV path writes event preferences. The only DAV `preferences_mut` is
+`mkcol.rs:114`, which is calendar-level, and `copy_move.rs` only retains the caller's own
+entries. Keep the rule and assert it.
 
-If 1.0.1 also writes per-user data through DAV (DAV copy and move retain preferences, and
-the alarm task reads them), a sealing rule is needed. Task 4 establishes this, and the
-question returns to Jay before any code relies on it.
-
-**New sharing filters.** 1.0.1 adds viewer-side filters:
-- `calendar/privacy.rs`: CLASS-based filtering for non-owners, with `EventPrivacy` derived
-  from the metadata flags;
+**New viewer-side readers.** 1.0.1 adds readers that filter or add to what a viewer sees:
+- `calendar/privacy.rs`: CLASS-based filtering for non-owners, through `EventPrivacy`;
 - `calendar/hidden.rs`, `participants.rs`, `overlap.rs` and `notification.rs`
   (`visible_notifications`);
-- `dav/calendar/{view,filter}.rs`.
+- `dav/calendar/{view,filter}.rs`;
+- `calendar/alerts.rs`'s `DefaultAlertsResolver`, which DAV GET and COPY run to add the
+  calendar's default alerts to served events.
 
-They run on the unsealed view, with keys, and never in keyless code. The fork's sanitized
-metadata must carry the flags `EventPrivacy` reads.
+They run on the unsealed view, with keys, and never in keyless code.
+
+**Privacy flags.** `EventPrivacy::from_flags` reads the metadata flags `EVENT_PRIVATE` and
+`EVENT_SECRET` (`calendar/mod.rs:149-150`), which encode `CLASS`, and the calendar spec
+seals `CLASS`. For a key account those flags are never persisted in the sanitized metadata
+row. They are derived on the keyed, unsealed view before upstream's filters run. Showing a
+classification in the clear would be a visibility-policy change, with its own version and
+acceptance criteria, not a porting detail.
 
 ### Mail writers and readers
 
@@ -289,28 +323,43 @@ and the document write, and the next pass of the same partition repairs it.
 **Decision:** adopt "ordered". Task 6 confirms it with the 0.16 interleaving reproduced by a
 pause hook. Then:
 - the in-flight index tests in `za::mail::fence` flip to expect no late write;
-- the key-mode JMAP ACL variant's wait comes out;
+- the key-mode JMAP ACL variant's PR #66 wait comes out. It is the one under the comment
+  "An unindex queued before the import's index write can orphan the document"; the
+  variant's other three waits stay, for the emptiness check;
 - no source-exists assertion is added.
 
 **The provisioning fence (R54 and R58).** These retarget to the new key space.
-- R54's scan `Server::za_has_tasks` covers the account's `SearchIndexClass::Queue` entries
-  for every `SearchIndex`, plus the partition's status key. It no longer matches the removed
-  task types.
-- The exhaustive match over `Task` classifies the three new types: `ShareRevokeCleanup`
-  counts for the owner and the grantees it stages; `DmarcReportWindow` and
-  `TlsReportWindow` are excluded.
-- R58's vault-absence assertion moves to the batch the worker commits: `account_batch`
-  (`store/src/search/index.rs`), not the queue entry, which the producer writes.
-- `Store::index`'s chunk loop is gone. If `account_batch` commits each document in one
-  write, R62 and R63 take the "subject deleted" disposition, with that evidence; Task 6
-  confirms which.
+- **R54's scan:** `Server::za_has_tasks` covers the account's `SearchIndexClass::Queue`
+  entries for every `SearchIndex`, plus the partition's status key. It no longer matches the
+  removed task types.
+- **The exhaustive match over `Task`** classifies the three new types.
+  `ShareRevokeCleanup` counts for its `account_id`, the owner: the task record holds only
+  the owner, and its grantee-side writes are container counters, not content.
+  `DmarcReportWindow` and `TlsReportWindow` are excluded.
+- **No terminal failure.** A failing partition retries with backoff capped at 30 minutes
+  and never reaches a "failed" state (`index_queue/manager.rs:316-359`). So a queue entry
+  blocks provisioning until it drains. The operator's remedy for a stuck partition is the
+  `x:IndexQueueStatus` registry object (`jmap/src/registry/mapping/index_queue.rs`). It
+  replaces CLAUDE.md's failed-task remedy for index work.
+- **R58's vault-absence assertion** moves to the batch the worker commits, `account_batch`
+  (`store/src/search/index.rs`), not to the queue entry, which the producer writes. The
+  layering is the same as at 0.16. `store` cannot call into `common`, so the worker
+  (`services/src/index_queue/index.rs`) attaches the assertion through a store-side field on
+  the documents it passes to `index_account_documents`, and `account_batch` places it in the
+  batch.
+- **R62 and R63 have no subject.** `Store::index`'s chunk loop is gone, and `account_batch`
+  commits each pass in one write with no commit point (`store/src/search/index.rs:299-341`),
+  so both take the "subject deleted" disposition with that evidence.
 
 **Cache snapshots.** Keep them working on stored, sanitized views only. Neither cache
 population nor snapshot serialization and restoration may accept an unsealed response view
 or `SessionKeys`. Test persistent file and blob snapshots and the shared codecs, including
 stale loaders racing provisioning and revocation.
-- The test server starts the swap tier (`Caches::parse` returns its receiver; boot calls
-  `SwapTier::start`) by default, as production does.
+- The swap tier's registry default is `Disabled` (`CacheSwap::{Disabled, LocalFile, Redis,
+  BlobStore}`). The test server keeps that default, which matches upstream and the
+  baseline. The swap tests configure `LocalFile` under the server's temporary directory, and
+  `BlobStore` for the filesystem-blob run. They hand `Caches::parse`'s receiver to
+  `SwapTier::start`, as boot does.
 - Redis and cluster operation remain unqualified. The central serialization and authority
   guards must not depend on which snapshot backend is selected.
 - Checksum framing named `seal` is not encryption and cannot satisfy this contract.
@@ -328,8 +377,8 @@ reduced form.
     `.github/workflows/test.yml`.
   - Upstream links its tests through 562 `#[path = "…/stalwart-tests/…"]` slots that point to
     a private sibling checkout (560 at 1.0.0).
-  - 534 of the slots compile only when that crate's own tests are built; 27 are support
-    modules that are always compiled once the flag is set.
+  - 534 of the slots compile only when that crate's own tests are built. 27 are support
+    modules compiled once the flag is set, two of them only with a store feature.
 - **What the fork has at 0.16.27:** 795 test functions.
   - 697 are unit tests in `crates/`: 466 from upstream, 183 of those in the SEL-only scim
     crates.
@@ -385,9 +434,16 @@ reduced form.
      in full from the fork side, before resolving anything else, and record the restored
      paths. Task 8 rewrites the workflow later.
    - Move each 0.16.27 inline test module of upstream's into a fork-owned file next to its
-     1.0 counterpart, attached as `#[cfg(test)] #[path = "restored_tests.rs"] mod tests;`.
-     The module keeps the name `tests`, so its libtest identifiers are unchanged, and as a
-     child module it sees the parent's private items as the inline module did.
+     1.0 counterpart, with a file name unique to its module:
+     - for a module file `<stem>.rs`: `#[cfg(test)] #[path = "<stem>_restored_tests.rs"] mod tests;`;
+     - for `mod.rs`, `lib.rs` or `main.rs`: `#[path = "restored_tests.rs"]`.
+
+     A `#[path]` resolves relative to the directory of the file that declares it, so one
+     shared file name would collide wherever sibling modules share a directory: 20
+     directories at 0.16.27, `common/src/auth/oauth/` among them. The module keeps the name
+     `tests`, so its libtest identifiers are unchanged. As a child module it sees the
+     parent's private items, as the inline module did. Task 1 records the mapping from each
+     source module to its restored file.
    - A module whose subject moved follows its subject.
    - Bring the fork's own unit tests along with their modules.
 3. **Restore only the test hooks the suite uses.** Restore the `test_mode` features only
@@ -406,11 +462,16 @@ reduced form.
 6. **Make the harness exhaustive.**
    - `wait_for_tasks` waits for the scheduled tasks and for the index queue's
      `SearchIndexClass::Queue` entries and status keys.
-   - Cleanup enumerates 1.0's closed `Subspace` enum with no catch-all arm, so a new
-     subspace stops the build. The 0.16 `SUBSPACE_*` constants are gone.
-   - The leak scanner covers `SearchQueue`, `SearchDocument`, `Presence`, `Value` and
-     `Collection::Metadata`. Each has a stated rule for what a key account may hold there
-     in the clear, and a planted-violation control.
+   - Cleanup enumerates 1.0's closed `Subspace` enum (26 variants) with no catch-all arm,
+     so a new subspace stops the build. The 0.16 `SUBSPACE_*` constants are gone.
+   - Against the fork's 0.16 constants, the new subspaces are `Immutable` (`c`),
+     `IndexProperty` (`v`), `SearchDocument` (`m`), `SearchQueue` (`y`) and `System` (`u`).
+     Three bytes changed meaning: `m` was `IN_MEMORY_VALUE`, `y` was `IN_MEMORY_COUNTER` and
+     `u` was `QUOTA`. The scanner therefore keys its rules on the enum, never on the byte.
+     `Value` and `Presence` are value shapes (`Shape`), not subspaces.
+   - The leak scanner covers each new subspace and `Collection::Metadata`, each with a stated
+     rule for what a key account may hold there in the clear, and a planted-violation
+     control.
 
 ### Gates (C10)
 
@@ -423,25 +484,35 @@ reduced form.
 - **Executed sub-tests.** Rerun the baseline's 19-step coverage net on the candidate. A
   sub-test call counts as executed in a mode only if two things hold in that step's export,
   by llvm-cov's region counts:
-  - its async body record has a positive count;
-  - the body's final region has a positive count.
+  - **The body record has a positive count.** For an `async fn` sub-test, the body record
+    is the async body's own record, whose first region starts after the signature. The
+    outer function's record only constructs the future, and never counts. For a plain `fn`
+    sub-test (for example `imap::body_structure::test`, `webdav::cal_itip::test`), the
+    function's own record is the body.
+  - **The final region has a positive count.** This is the region that ends at the body's
+    closing brace. Since a failed assertion panics, reaching it means every assertion before
+    it passed.
 
-  A record of the outer async function only constructs the future, and never counts. Since
-  a failed assertion panics, reaching the final region means every assertion before it
-  passed. Each call must execute in every mode where it did at 0.16.27, under the same
-  strict rule.
-- **Coverage.** Line coverage of fork-owned code must not fall below 96.4%. Fork-owned means
-  files added relative to v1.0.1, the `vault` crate and the `za*` paths. Upstream crates are
-  reported, and a drop is explained.
+  Each call must execute in every mode where it did at 0.16.27, under the same rule. When
+  Task 1 recomputes the baseline, it reports every sub-test that completed at 0.16.27 but
+  fails the rule, for example one whose body ends in a diverging or branching tail. Such a
+  sub-test gets an explicit completion marker; the rule is not loosened.
+- **Coverage.** Line coverage of the fork-owned cohort must not fall below 96.4%. The
+  cohort is the baseline's 40 fork-owned files, mapped across moves, plus fork runtime code
+  added during the port, listed as it is added.
+  - Restored upstream tests (`*restored_tests.rs`) and the `tests` crate are reported as
+    groups of their own. Neither counts toward the cohort or toward product code, so copied
+    test code cannot offset lost coverage of the zero-access implementation.
+  - Upstream crates are reported, and a drop is explained.
 - **Gate self-tests.** In disposable changes, show that each of these fails the gates:
-  - an omitted sub-test call;
+  - an omitted sub-test call, async and synchronous;
   - a constructed but unawaited sub-test future;
   - an early return before a sub-test's assertions;
   - a newly ignored required test;
   - a dropped restored module;
   - a coverage drop.
 
-  Also show that the unchanged baseline passes.
+  Also show that the unchanged baseline passes, including its synchronous sub-tests.
 - **Mutation sample.** Disable each re-ported protection hook in turn, and record that a
   named test fails. Tests adapted to new APIs can pass vacuously.
 - **Upstream's hidden tests.** Record the number of private-test slots in each upstream
@@ -460,7 +531,11 @@ The [implementation plan](../plans/2026-10-27-stalwart-1-upgrade.md) uses one in
 branch with bounded ownership. No permissive shim, skipped protection, ignored test or
 temporary production feature gate may manufacture a green build. Each component task ends
 with a crate-level `cargo check`, so that implementers can check their own work before the
-integrated gate. Upstream's crate dependencies allow this order:
+integrated gate. `common` depends on `store` and `types`, and every later crate depends on
+`common`, so the order is:
+- Task 2 closes with `types`, `store` and `vault`. The fork's hooks in those crates are
+  ported first, with R58's carrier type kept compiling. Those hooks are the reserved fields
+  and collection, `ZA_UID_LEASE_PREFIX`, `za_test.rs` and `has_account_search_terms`;
 - Task 3 closes with `common`;
 - Task 4 with `groupware` and `dav`;
 - Task 5 with `email`, `imap`, `jmap`, `smtp` and `pop3`;
