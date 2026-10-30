@@ -3669,10 +3669,13 @@ checked by `rustfmt` only.
   - `System`: the schema version and node-id claims kept, anything else a leftover;
   - `SearchTerm`, `SearchDocument`: leftovers, except on PostgreSQL and MySQL, which create
     no such table (`Subspace::is_internal_fts`);
-  - `Logs`: change-log entries are deleted after the check, as at 0.16. 1.0 also keeps
-    share notifications there, as log entries of `SyncCollection::ShareNotification` (key:
-    account id, `9`, notification id), and every grant removal writes one; a share
-    notification left behind is reported as a leftover (fix round 1).
+  - `Logs`: deleted after the check, as at 0.16. 1.0 also keeps share notifications there,
+    as log entries of `SyncCollection::ShareNotification` (key: account id, `9`,
+    notification id). Upstream writes one for the grantee on every grant, regrant, change
+    and revoke, and keeps them with the change log, so they are a live account's normal
+    state. They are deleted with the logs, and their accounts are returned with the vault
+    accounts (`AccountState`); `assert_is_empty` reports any whose account no longer exists,
+    since destroying an account clears its `Logs` prefix (fix round 2).
 - `store_lookup_expire_all` is gone: its subject, in-memory values in the data store, does
   not exist at 1.0. `store_destroy` and `search_store_destroy` cover 1.0's subspaces and
   search stores; resetting an ElasticSearch or MeiliSearch store panics, since 1.0 moved
@@ -3827,6 +3830,11 @@ written, right after upstream's private slot.
 - `services`', `jmap`'s and `http`'s restored modules compile first at Task 6's check.
 - If `automation::acme` needs fast retries now that ACME retries go through the task queue,
   that is a task-manager retry policy under `test_mode`.
+- When `common::za::test_hooks` re-exports the `FORCE_COMMIT_SPLIT` setter, give it a drop
+  guard (like `DrainOn`), so that a test that panics while the hook is set does not leave
+  every later batch splitting. While set, it also splits batches that carry no account (other
+  accounts' index passes, the index queue's bookkeeping batch, registry-mapping batches); say
+  so in the module doc.
 - Ruling 18's tests: `store::za_test::FORCE_COMMIT_SPLIT` splits an index pass after each
   `Document` key, because it also splits batches with no current account, which
   `AccountIndexer::build_batch` never sets (unit test
@@ -4021,7 +4029,7 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `smtp::inbound::antispam::antispam` | The `llm` case is removed from its case list. | Ruling 33: the LLM analysis needs a licence (AI models are off while `core.enterprise` is `None`). |
 | `directory::issuer::test` | `get_token_for_client` is a new fork helper in `issuer.rs` (RFC 6749 4.3 against the issuer's discovered token endpoint); it adds an assertion that the token request answers 200, where 0.16's helper sat in an SEL-only file. | The SEL-only `tests/src/directory/oidc.rs` is not carried (design Decision 1); the helper is written from RFC 6749, not from that file. |
 | Any suite with an ElasticSearch or MeiliSearch search store (harness) | `search_store_destroy` panics for these stores, where 0.16 dropped and recreated their indexes. No CI step uses them. | 1.0 moved their `drop_indexes` into upstream's private test support (`store/src/backend/elastic/main.rs:134`, `meili/main.rs:314`, test-hook table rows "not needed"). |
-| Every suite (harness) | The emptiness check reports a share notification left in `Logs`, where it deletes the rest of `Logs` as at 0.16. | 1.0 stores share notifications as `Logs` entries of `SyncCollection::ShareNotification` (`store/src/write/key.rs:519-525`, `:860`), and every grant removal writes one (`common/src/storage/index/build.rs`); 0.16 had none. |
+| Every suite (harness) | The emptiness check deletes share notifications with the change logs, as it deletes the logs at 0.16, and reports those whose account no longer exists (as for vault and pin records). | 1.0 stores share notifications as `Logs` entries of `SyncCollection::ShareNotification` (`store/src/write/key.rs:519-525`, `:860`), written for the grantee on every grant, regrant, change and revoke (`common/src/storage/index/build.rs:95`, `:110`, `:300`, `:332`, `:352`, `:379`) and kept with the change log (`common/src/storage/transaction.rs:162-179`); 0.16 had none. |
 | `directory::directory_tests` | The `oidc::test` call is removed. | SEL-only file `tests/src/directory/oidc.rs` (design Decision 1). |
 | `system::system_tests` | The `tenant::test` and `archiving::test` calls are removed. | SEL-only files (design Decision 1). |
 | `scim::scim_tests` | Removed, with the SEL-only `tests/src/scim/mod.rs` that held it and the three dual-licensed files only it declared. | Ruling 38: SEL-only disposition (its entry and its only subject, the `scim` crate, are SEL-only); see "SEL-only removals and ruling 33". |

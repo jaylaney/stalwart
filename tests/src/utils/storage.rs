@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::utils::cleanup::{search_store_destroy, store_assert_is_empty_except_vaults};
+use crate::utils::cleanup::{search_store_destroy, store_assert_is_empty_except_account_state};
 use crate::utils::registry::UnwrapRegistryId;
 use ahash::AHashSet;
 use common::{Server, storage::search::SearchIndexStatus};
@@ -346,22 +346,33 @@ pub async fn assert_is_empty(server: &Server, include_registry: bool) {
     wait_for_tasks(server, false, false).await;
 
     // Assert is empty
-    let vault_accounts = store_assert_is_empty_except_vaults(
+    let account_state = store_assert_is_empty_except_account_state(
         server.store(),
         server.core.storage.blob.clone(),
         include_registry,
     )
     .await;
-    for account_id in vault_accounts {
-        assert!(
-            server
-                .registry()
-                .object::<registry::schema::structs::Account>(account_id.into())
-                .await
-                .unwrap()
-                .is_some(),
-            "Found a zero-access vault or pin record of destroyed account {account_id}"
-        );
+    for (account_ids, what) in [
+        (
+            &account_state.vault_accounts,
+            "a zero-access vault or pin record",
+        ),
+        (
+            &account_state.share_notification_accounts,
+            "share notifications",
+        ),
+    ] {
+        for &account_id in account_ids {
+            assert!(
+                server
+                    .registry()
+                    .object::<registry::schema::structs::Account>(account_id.into())
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "Found {what} of destroyed account {account_id}"
+            );
+        }
     }
     search_store_destroy(server.search_store()).await;
 

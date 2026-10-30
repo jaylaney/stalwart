@@ -59,8 +59,10 @@ enum Rule {
     InternalSearch,
     /// The change logs, deleted after the check as at 0.16. 1.0 also keeps
     /// share notifications here, as log entries of
-    /// `SyncCollection::ShareNotification`; a share notification left behind is
-    /// a leftover.
+    /// `SyncCollection::ShareNotification`: an account's own state, written on
+    /// every grant, change and revoke, and deleted with the logs. Their
+    /// accounts are reported to the caller, which checks that each still
+    /// exists (destroying an account clears its `Logs` prefix).
     Logs,
 }
 
@@ -233,25 +235,41 @@ pub async fn store_blob_expire_all(store: &Store) {
 }
 
 pub async fn store_assert_is_empty(store: &Store, blob_store: BlobStore, include_registry: bool) {
-    let vault_accounts =
-        store_assert_is_empty_except_vaults(store, blob_store, include_registry).await;
+    let account_state =
+        store_assert_is_empty_except_account_state(store, blob_store, include_registry).await;
     assert!(
-        vault_accounts.is_empty(),
-        "Found zero-access vault records of accounts {vault_accounts:?}"
+        account_state.vault_accounts.is_empty(),
+        "Found zero-access vault records of accounts {:?}",
+        account_state.vault_accounts
+    );
+    assert!(
+        account_state.share_notification_accounts.is_empty(),
+        "Found share notifications of accounts {:?}",
+        account_state.share_notification_accounts
     );
 }
 
+/// The keys that live exactly as long as their account, which the emptiness
+/// check leaves to its caller: the caller checks that each account still
+/// exists.
+#[derive(Debug, Default)]
+pub struct AccountState {
+    /// Accounts holding a zero-access vault or pin record (kept).
+    pub vault_accounts: Vec<u32>,
+    /// Accounts that held share notifications (deleted with the logs).
+    pub share_notification_accounts: Vec<u32>,
+}
+
 /// Like `store_assert_is_empty`, but returns the accounts holding a
-/// zero-access vault record instead of reporting them. The caller must check
-/// that each account still exists: a vault record lives exactly as long as
-/// its account.
+/// zero-access vault record or a share notification instead of reporting
+/// them. The caller must check that each account still exists.
 #[allow(unused_variables)]
 #[must_use]
-pub async fn store_assert_is_empty_except_vaults(
+pub async fn store_assert_is_empty_except_account_state(
     store: &Store,
     blob_store: BlobStore,
     include_registry: bool,
-) -> Vec<u32> {
+) -> AccountState {
     // 0.16 also expired the in-memory keys kept in the data store here
     // (`store_lookup_expire_all`). 1.0 keeps no in-memory values in the data
     // store: `InMemoryStore` has no data-store variant, so that step has no
@@ -264,6 +282,7 @@ pub async fn store_assert_is_empty_except_vaults(
     let mut failed = false;
     let mut delete_batch = BatchBuilder::new();
     let mut vault_accounts = Vec::new();
+    let mut share_notification_accounts = Vec::new();
 
     for subspace in Subspace::ALL.iter().copied() {
         let rule = subspace_rule(subspace);
@@ -271,7 +290,7 @@ pub async fn store_assert_is_empty_except_vaults(
             Rule::InternalSearch if store.is_pg_or_mysql() => continue,
             Rule::Leftover { with_values } => with_values,
             Rule::RegistryIndex => false,
-            Rule::Logs => true,
+            Rule::Logs => false,
             Rule::Counters
             | Rule::RegistryItems
             | Rule::RegistryPrimaryKey
@@ -359,11 +378,16 @@ pub async fn store_assert_is_empty_except_vaults(
                                 object_id, key
                             );
                         }
-                        Rule::Logs
-                            if !(key.len() == U32_LEN + 1 + U64_LEN
-                                && key[U32_LEN] == u8::from(SyncCollection::ShareNotification)) =>
-                        {
-                            // A change-log entry, deleted below
+                        Rule::Logs => {
+                            // Change-log entries and share notifications, deleted below
+                            if key.len() == U32_LEN + 1 + U64_LEN
+                                && key[U32_LEN] == u8::from(SyncCollection::ShareNotification)
+                            {
+                                let account_id = key.deserialize_be_u32(0).unwrap();
+                                if !share_notification_accounts.contains(&account_id) {
+                                    share_notification_accounts.push(account_id);
+                                }
+                            }
                             return Ok(true);
                         }
                         Rule::Properties
@@ -404,8 +428,7 @@ pub async fn store_assert_is_empty_except_vaults(
                         Rule::Leftover { .. }
                         | Rule::Properties
                         | Rule::System
-                        | Rule::InternalSearch
-                        | Rule::Logs => {
+                        | Rule::InternalSearch => {
                             println!(
                                 "Found key in {:?}: {:?} ({:?}) = {:?} ({:?})",
                                 subspace.name(),
@@ -437,7 +460,10 @@ pub async fn store_assert_is_empty_except_vaults(
         panic!("Store is not empty.");
     }
 
-    vault_accounts
+    AccountState {
+        vault_accounts,
+        share_notification_accounts,
+    }
 }
 
 fn is_allowed_registry_type(object_type: ObjectType) -> bool {
