@@ -41,6 +41,7 @@ privdrop = "0.5.7"
 windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
 
 [features]
+test_mode = []
 enterprise = ["trc/enterprise"]
 
 [dev-dependencies]

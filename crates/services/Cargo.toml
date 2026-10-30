@@ -39,12 +39,8 @@ compact_str = "0.10.0"
 [dev-dependencies]
 
 [features]
-<<<<<<< HEAD
 test_mode = ["common/test_mode"]
-enterprise = []
-=======
 enterprise = ["store/enterprise", "common/enterprise", "coordinator/enterprise", "utils/enterprise", "trc/enterprise", "email/enterprise", "smtp/enterprise", "groupware/enterprise", "spam-filter/enterprise", "jmap_proto/enterprise", "registry/enterprise"]
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
 [lints]
 workspace = true

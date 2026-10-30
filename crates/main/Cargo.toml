@@ -7,11 +7,7 @@ homepage = "https://stalw.art"
 keywords = ["imap", "jmap", "smtp", "email", "mail", "webdav", "server"]
 categories = ["email"]
 license = "AGPL-3.0-only OR LicenseRef-SEL"
-<<<<<<< HEAD
 version = "0.1.1-beta.1"
-=======
-version = "1.0.1"
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 edition = "2024"
 
 [[bin]]

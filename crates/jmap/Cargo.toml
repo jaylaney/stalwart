@@ -19,16 +19,7 @@ spam-filter = { path = "../spam-filter" }
 email = { path = "../email" }
 groupware = { path = "../groupware" }
 registry = { path = "../registry" }
-<<<<<<< HEAD
 vault = { path = "../vault" }
-calcard = { version = "0.3" }
-smtp-proto = { version = "0.2" }
-mail-parser = { version = "0.11", features = ["full_encoding", "rkyv"] } 
-mail-builder = { version = "1.0" }
-mail-auth = { version = "0.13", features = ["generate", "arc"] }
-sieve-rs = { version = "0.7", features = ["rkyv"] } 
-jmap-tools = { version = "0.1", features = ["rkyv"] }
-=======
 calcard = { path = "../calcard" }
 smtp-proto = { path = "../smtp-proto" }
 mail-parser = { version = "1.0", features = ["full_encoding"] } 
@@ -36,7 +27,6 @@ mail-builder = { version = "2.0" }
 mail-auth = { version = "0.14", features = ["generate", "arc"] }
 sieve-rs = { path = "../sieve" }
 jmap-tools = { path = "../jmap-tools", features = ["rkyv"] }
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 serde = { version = "1.0", features = ["derive"]}
 serde_json = "1.0"
 hyper = { version = "1.12.0", features = ["server", "http1", "http2"] }
@@ -60,6 +50,7 @@ compact_str = "0.10.0"
 memchr = "2.8"
 
 [features]
+test_mode = []
 dev_mode = []
 enterprise = ["store/enterprise", "http_proto/enterprise", "jmap_proto/enterprise", "smtp/enterprise", "utils/enterprise", "common/enterprise", "services/enterprise", "directory/enterprise", "trc/enterprise", "spam-filter/enterprise", "email/enterprise", "groupware/enterprise", "registry/enterprise"]
 

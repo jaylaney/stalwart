@@ -15,16 +15,10 @@ registry = { path = "../registry" }
 http_proto = { path = "../http-proto" }
 types = { path = "../types" }
 trc = { path = "../trc" }
-<<<<<<< HEAD
 vault = { path = "../vault" }
-calcard = { version = "0.3", features = ["rkyv"] }
-hashify = { version = "0.2" }
-hyper = { version = "1.11.1", features = ["server", "http1", "http2"] }
-=======
 calcard = { path = "../calcard", features = ["rkyv"] }
 hashify = { version = "0.3" }
 hyper = { version = "1.12.0", features = ["server", "http1", "http2"] }
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 percent-encoding = "2.3.2"
 rkyv.workspace = true
 compact_str = "0.10.0"
@@ -33,10 +27,7 @@ tokio = { version = "1.54", features = ["time"] }
 [dev-dependencies]
 
 [features]
-<<<<<<< HEAD
 test_mode = ["common/test_mode"]
-=======
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 dev_mode = []
 enterprise = ["dav-proto/enterprise", "common/enterprise", "store/enterprise", "utils/enterprise", "groupware/enterprise", "directory/enterprise", "registry/enterprise", "http_proto/enterprise", "trc/enterprise"]
 

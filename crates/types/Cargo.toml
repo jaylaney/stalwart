@@ -18,6 +18,7 @@ unicode-normalization = "0.1.26"
 
 
 [features]
+test_mode = []
 
 
 [lints]

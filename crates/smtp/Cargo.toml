@@ -53,6 +53,7 @@ mail-auth = { version = "0.14", features = ["test"] }
 mail-auth = { version = "0.14", features = ["test"] }
 
 [features]
+test_mode = ["mail-auth/test"]
 enterprise = ["store/enterprise", "utils/enterprise", "directory/enterprise", "common/enterprise", "email/enterprise", "registry/enterprise", "spam-filter/enterprise", "trc/enterprise"]
 
 #[[bench]]

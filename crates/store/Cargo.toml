@@ -79,6 +79,7 @@ azure = ["azure_core", "azure_storage_blob", "azure_identity", "aws-lc-rs", "fut
 redis = ["dep:redis", "deadpool", "deadpool/rt_tokio_1", "futures"]
 
 enterprise = ["utils/enterprise", "trc/enterprise", "registry/enterprise"]
+test_mode = []
 
 [lints]
 workspace = true

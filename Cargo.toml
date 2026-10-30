@@ -37,6 +37,7 @@ members = [
     "crates/sieve",
     "crates/jmap-tools",
     "crates/s3",
+    "tests",
 ]
 default-members = [
     "crates/main",
@@ -61,6 +62,7 @@ default-members = [
     "crates/store",
     "crates/coordinator",
     "crates/directory",
+    "crates/vault",
     "crates/registry",
     "crates/services",
     "crates/utils",
@@ -95,20 +97,14 @@ debug-assertions = true
 overflow-checks = false
 rpath = false
 
-<<<<<<< HEAD
 # Argon2 at opt-level 0 takes ~0.5 s per password verification, which trips
 # the 500 ms client timeout in the DAV test helper on CI runners.
-[profile.dev.package.argon2]
-opt-level = 3
-
-=======
 [profile.dev.package.argon2]
 opt-level = 3
 
 [profile.dev.package.blake2]
 opt-level = 3
 
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 [profile.release]
 opt-level = 3
 debug = false

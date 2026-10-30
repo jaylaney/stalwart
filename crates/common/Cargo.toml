@@ -43,18 +43,8 @@ serde_json = { version = "1.0", features = ["raw_value"] }
 encodify = "1.0"
 x509-parser = "0.18"
 pem = "4.0"
-<<<<<<< HEAD
-chrono = { version = "0.4", features = ["serde"] }
-hyper = { version = "1.11.1", features = ["server", "http1", "http2"] }
-opentelemetry = { git = "https://github.com/open-telemetry/opentelemetry-rust", rev = "ae66e97b140f70e477ab710686aafce665cc2f8b" }
-opentelemetry_sdk = { git = "https://github.com/open-telemetry/opentelemetry-rust", rev = "ae66e97b140f70e477ab710686aafce665cc2f8b" }
-opentelemetry-otlp = { git = "https://github.com/open-telemetry/opentelemetry-rust", rev = "ae66e97b140f70e477ab710686aafce665cc2f8b", default-features = false, features = ["reqwest-client", "http-proto", "trace", "metrics", "logs", "internal-logs", "grpc-tonic", "tls-aws-lc", "tls-roots", "reqwest-rustls"] }
-opentelemetry-semantic-conventions = { git = "https://github.com/open-telemetry/opentelemetry-rust", rev = "ae66e97b140f70e477ab710686aafce665cc2f8b" }
-prometheus = { version = "0.14", default-features = false }
-=======
 jiff = "0.2.38"
 hyper = { version = "1.12.0", features = ["server", "http1", "http2"] }
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 imagesize = "0.15"
 sha1 = "0.11"
 sha2 = "0.11"
@@ -108,23 +98,16 @@ sd-notify = "0.5"
 dns-update = { version = "0.6", features = ["test_provider"] }
 
 [features]
-<<<<<<< HEAD
 test_mode = ["store/test_mode"]
-=======
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 dev_mode = []
 enterprise = ["store/enterprise", "utils/enterprise", "trc/enterprise", "telemetry/enterprise", "directory/enterprise", "coordinator/enterprise", "registry/enterprise", "jmap_proto/enterprise"]
 foundation = []
 redis = ["store/redis"]
 
 [dev-dependencies]
-<<<<<<< HEAD
-tokio = { version = "1.53", features = ["full"] }
-totp-rs = { version = "6.0.0", features = ["otpauth"] }
-=======
 tokio = { version = "1.54", features = ["full"] }
 regex = "1.13.1"
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+totp-rs = { version = "6.0.0", features = ["otpauth"] }
 
 [lints]
 workspace = true
