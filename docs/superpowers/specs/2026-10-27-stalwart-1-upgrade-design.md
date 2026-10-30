@@ -1,10 +1,13 @@
 # Stalwart 1.0 fresh store upgrade design
 
-Revision 2, 2026-10-29. Revision 1 (2026-10-27) targeted v1.0.0 from the 0.16.26 base. This
-revision moves the base to 0.16.27 and the target to v1.0.1. It also replaces the test
-strategy with one that owns the whole 0.16.27 suite, measured against a recorded baseline.
-The contracts C1–C11 and the integration architecture of revision 1 stand, with C10
-extended.
+Revision 3, 2026-10-30. It adopts the findings of two independent reviews of revision 2:
+[Fable](2026-10-27-stalwart-1-upgrade-design-review.md) and
+[Codex](../plans/2026-10-27-stalwart-1-upgrade-codex-review-2026-10-30.md). It also records
+Jay's decisions on the questions they raised, under one principle: maintain upstream.
+
+Revision 2 (2026-10-29) moved the base to 0.16.27 and the target to v1.0.1, and made the
+fork own the whole 0.16.27 suite. Revision 1 (2026-10-27) targeted v1.0.0 from the 0.16.26
+base.
 
 ## Purpose and scope
 
@@ -13,9 +16,9 @@ account, mail, calendar, invitation, pinning and sharing contracts, and as much 
 coverage as can be kept. Implementation has not started; this design and its execution plan
 are proposed for review.
 
-- **Starting fork:** `main` at `9a7574203e9821a8313239f51a080c0657672be9`, the merge of PR #66,
-  which makes CI enforce every test that passes at 0.16.27. The baseline below was measured
-  one commit earlier, at `5b914ddb5`.
+- **Starting fork:** `main` at `9a7574203e9821a8313239f51a080c0657672be9`, the merge of PR
+  #66, which makes CI enforce every test that passes at 0.16.27. The baseline below was
+  measured one commit earlier, at `5b914ddb5`.
 - **Upstream base:** `v0.16.27`, `aa47d8ef7bfba7200d3293198ac2592747b20e73`, merged by PR #62.
 - **Target:** the immutable `v1.0.1` release, `23b69755cb3cd8ecd952fe0443c5ac067a506184`.
   It is one commit on top of `v1.0.0` (`47df4c0baeb88d83424dfda6aa7cf6040706999e`), which
@@ -35,6 +38,15 @@ the existing Linux x86_64 GNU product artifact, with embedded and filesystem blo
 Existing backend refusals stay. SQL stores, other backends, clusters and new artifact
 platforms gain no qualification from this project.
 
+## Principle: maintain upstream
+
+Where a choice exists, prefer upstream's mechanism and code unchanged. Add fork code only
+where a contract (C1–C11) requires it, and then in fork-owned modules reached by one-line
+insertions. Upstream's own builders, stores and tasks are reused with different inputs, or
+skipped for key accounts, rather than re-derived by hand. This is the parity-by-construction
+rule the sharing design settled on. For tests, restore upstream's tests verbatim wherever
+their subject still exists.
+
 ## Approaches
 
 1. **Merge 1.0.1 directly into the fork and initialize fresh stores (selected).** This keeps
@@ -49,9 +61,15 @@ platforms gain no qualification from this project.
 
 Use a normal merge in an isolated implementation worktree, and never rebase the published
 branch. A dry merge of v1.0.1 into `5b914ddb5` reports 134 conflicts (106 content, 27
-modify/delete, 1 add/add). Resolving them is only part of the port. Upstream also replaces
-interfaces and introduces new writers, and Git cannot tell that those need a fork
-protection.
+modify/delete, 1 add/add). Resolving them is only part of the port: upstream also
+modified 849 files, added 670 and deleted 139 under `crates/`. It replaces interfaces and
+introduces new writers, and Git cannot tell that those need a fork protection.
+
+Fork hooks sit in four upstream files that 1.0.1 deleted or split:
+- `crates/dav/src/common/propfind.rs` (15 call sites) became `propfind/`;
+- `crates/imap/src/op/fetch.rs` (7) became `op/fetch/`;
+- `crates/imap/src/core/message.rs` (1) became `core/view.rs`;
+- `crates/spam-filter/src/analysis/llm.rs` (1) moved into the SEL-only `common/src/enterprise/ai/`.
 
 ## Scope exclusions
 
@@ -62,11 +80,14 @@ protection.
   conversion of an owner's calendar to shared, resumable conversion and refusal of unsealed
   rows. A test named `legacy` is not a reason to remove it.
 - No use of upstream's private tests. Do not enable `cfg(stalwart_tests)`, and do not
-  recreate the private support modules its 562 slots expect in a sibling `stalwart-tests`
-  checkout.
+  recreate the private support modules that its 562 slots expect in a sibling
+  `stalwart-tests` checkout.
 - No SEL-only test is ported. Enterprise features are excluded from the product. Under SELv2
   (sections 4.1, 4.4 and 2.3), even a subscription permits modified copies only for internal
   use, never in this public repository. The 0.16.27 originals stay recoverable from history.
+- No external protocol suite (Dovecot imaptest, Fastmail JMAP-TestSuite, Apple
+  CalDAVTester) in this project. They add coverage rather than preserve it, and they are
+  deferred to a follow-up plan. The python-caldav runner the fork already uses stays.
 - No deletion of existing `.run/` state or other worktrees. New tests and manual checks use a
   newly allocated state directory and disposable accounts.
 - No new signup, billing, provisioning service, webmail, AI feature or encryption redesign.
@@ -97,11 +118,11 @@ The contracts below are acceptance criteria, not an opportunity to redesign thos
 | C3 | No credential, reversible credential cache key, private key, decrypted protected content or content-bearing diagnostic is added to caches, traces, errors or persistent snapshots. Keep the approved field-specific trace exceptions. |
 | C4 | Ordinary accounts keep upstream 1.0 behaviour. Key accounts keep the existing refusals, including the unsupported credential, content-search, mail-sharing and JMAP-calendar operations, and the external-directory refusals and marker preservation (calendar spec 4.3). Keep upstream's OAuth expiry, grant-revocation and scope checks. |
 | C5 | Key-account mail is a stub plus a sealed blob, whatever wrote it. Every ordinary writer asserts the vault's absence in its effective commit. Every protected reader has the owner's keys or refuses; background work never acquires those keys. |
-| C6 | Calendar metadata and content are sealed or sanitized before serialization and derived indexing. No hidden property can reappear in metadata, alarms, notifications, dead properties or indexes through a split or metadata-only write. |
+| C6 | Calendar metadata and content are sealed or sanitized before serialization and derived indexing. No hidden property can reappear in metadata, alarms, notifications, dead properties or indexes through a split or metadata-only write, or through a background rewrite. |
 | C7 | Sharing uses the current principal's keys, the current own-id permission and the authenticated ring identity. Keep the physical parent and link fences, conversion, future-write rotation, sync boundaries, pin-before-deliver, UID leases, SEQUENCE and delegated scheduling semantics. |
 | C8 | Search work for key mail keeps only the allowed arrival-time and size fields. Sealed calendar content and protected attachment text stay out of background indexes. Provisioning and deletion fences cover every new queue and commit segment. |
 | C9 | Keep upstream 1.0 stored types as supplied: add no fork fields to them, and hand-edit no generated registry schema or event enum. Keep the reserved Principal fields 150/151, the account flag `1 << 9` and the vanished collection 250, after checking each for collisions. |
-| C10 | Own the retained test suite. The required set is the 0.16.27 baseline minus its recorded dispositions. A required test cannot disappear, become ignored, stop being selected, or stop reaching the code it reached, while a green aggregate hides the loss. Test-only hooks and the weakened Argon2 never enter shipping builds. |
+| C10 | Own the retained test suite. The required set is the 0.16.27 baseline minus its recorded dispositions. A required test cannot disappear, become ignored, stop being selected, or stop running to completion, while a green aggregate hides the loss. Test-only hooks and the weakened Argon2 never enter shipping builds. |
 | C11 | Qualify fresh creation and restart with the actual OSS product binary. Enterprise-enabled harness results are separate evidence, because 1.0 stamps each store with its edition. Keep the fork's independent version and provenance and its immutable release artifacts. |
 
 ## Integration architecture
@@ -126,12 +147,34 @@ without, and each refuses the other's store (`crates/common/src/manager/schema.r
 harness builds with `enterprise`, so its stores are enterprise-edition. That is why C11's
 product gate runs the OSS binary.
 
-Upstream removed `types::DeadProperty`. Adapt the sealed extras and collection bundles to the
-new metadata representation, and keep every protected value inside encrypted carriers. Use a
-fork-owned payload type only where the public metadata representation cannot carry the
-existing encrypted extras losslessly. Its fields and version dispatch must be reviewed with
-the calendar codec tests before any caller uses it. Do not restore the removed upstream
-storage type across the workspace.
+### Dead properties and object metadata
+
+1.0.1 removed `types::DeadProperty` and the event record's `dead_properties` field. DAV
+dead properties, IMAP METADATA and JMAP object metadata now share one store. Each entry is
+a document of `Collection::Metadata` (14) with a per-viewer class:
+`MetadataClass::{Shared, Private{viewer}, Viewer{viewer}, Owner{owner}}`. They are written
+through `dav/src/common/dead/` and `common/src/storage/metadata/`. The fork's sealed extras
+therefore lose their home in the event record.
+
+**Decision:** keep upstream's metadata store, and seal the values for key accounts in that
+store's common write and read path.
+- `Shared` and `Owner` entries are sealed under the calendar's collection key, so every
+  holder of the collection key reads them, as with the existing extras.
+- `Private` and `Viewer` entries are sealed under the viewer's own key.
+- A fork payload version byte marks a sealed value.
+- Property names sit in the keys and stay visible. The calendar spec's visibility allowlist
+  governs which names a key account may hold. The leak scanner covers `Collection::Metadata`.
+
+DAV PROPPATCH and PROPFIND go through this path with the request's keys. Keep the extras
+codec only for the parts of the sealed content that still live in the content archive.
+
+IMAP METADATA (`GETMETADATA`, `SETMETADATA`) and JMAP object metadata are refused for key
+accounts in this port. JMAP object metadata is a property layer inside the existing
+`*/get`, `*/set`, `*/query` and `*/copy` methods, not a new method, so the dispatcher gate
+cannot catch it. The refusal sits in `jmap/src/api/metadata/` (`write`, `apply`, `get`,
+`preload`, `copy`). The IMAP refusal is per command. The presence flags that object writers
+record (`email/src/presence.rs`, `common/src/storage/index/presence.rs`) name metadata
+kinds, not values, and stay upstream's.
 
 ### Authentication and authority
 
@@ -140,14 +183,20 @@ Target `Server::authenticate(&AuthRequest) -> trc::Result<Authenticated>` (uncha
 revocation handling. Attach session keys separately in the authorized protocol layers.
 Restore the marker diversion in the new basic-auth path, along with app-password publication,
 the vault generation fences and credential redaction. The common authentication result stays
-keyless.
+keyless. 1.0.1's `HttpAuthenticated { in_flight, access_token, epoch }` and
+`GrantRevocations` are the cache's new scope and revocation state, and the fork's cache
+adaptation keeps them.
 
-Keep the external-directory refusals (`za_refuse_directory_login`,
-`za_refuse_directory_account`) at their equivalent sites, and keep `merge_directory_secret`'s
-marker check. The `za::external_directory` module (PR #66) is their regression test. The
-Bearer arm needs an OIDC provider and is not covered locally. What a directory
-synchronisation may change on a key account besides its credential is an open product
-question (fork issue #67), outside this port.
+Keep the external-directory refusals and the marker check at their 1.0.1 sites:
+- `za_refuse_directory_login` goes in `authenticate_basic`'s directory branch;
+- `za_refuse_directory_account` goes after `assert_account_directory` and before
+  `build_directory_token`;
+- `merge_directory_secret`'s marker check goes in `synchronize_account`.
+
+The `za::external_directory` module (PR #66) is their regression test. The Bearer arm needs
+an OIDC provider and is not covered locally. What a directory synchronisation may change on
+a key account besides its credential is an open product question (fork issue #67), outside
+this port.
 
 Extend the new account-cache loader with the existing key-account classification and epoch
 rules. No cached hint replaces the vault and calendar reads a write needs. Keep the quiet
@@ -158,28 +207,65 @@ catch-all resolution and the exact ordering of account and vault failures.
 `CalendarEvent` is metadata, and `CalendarEventContent { data, preferences }` holds the
 tree. Port read and write views together. `CalendarEvent::{insert,update_full,update_meta}`
 use `GroupwareWrite`/`SplitUpdate`, which serialize the content and recompute the metadata
-from it. Sealing and metadata sanitization must therefore happen before those builders,
-including on metadata-only updates, conversion, drain commits and COPY/MOVE.
+from it (`SplitUpdate::full` calls `refresh_from_content`). Sealing and metadata
+sanitization must therefore happen before those builders, including on metadata-only
+updates, conversion, drain commits and COPY/MOVE.
 
 Port the owner/grantee resolver, the conversion journal, the event and link assertions, and
 the lease, pin and ring writes to `PendingId`, `AssignedIds` and the new store batch
-interface. Upstream's new grantee-cleanup and share-rebuild tasks must not recreate a grant,
-keep unauthorized content, or bypass ring rotation and boundary completion. Keep the
-accepted scheduling limits; an upstream behaviour change needs an explicit disposition, not
-a silent weakening of the lifecycle oracle.
+interface. Keep the accepted scheduling limits; an upstream behaviour change needs an
+explicit disposition, not a silent weakening of the lifecycle oracle. `itip_merge_changes`
+now returns `Result<(), ItipError>`. The drain's hand-mirrored `merge` and `import`
+propagate it, and are re-read against 1.0.1's `itip_ingest` and `commit_itip_merge`.
+
+**The share-revocation cleanup.** 1.0.1's `ShareRevokeCleanup` task is queued by the generic
+index builder whenever an ACL grant disappears. Its `stage_event` strips the lost grantee's
+preferences and calls `CalendarEvent::update_full`. That re-serializes the content,
+recomputes the metadata from it and changes the ETag. On a sealed event it would be a
+keyless background rewrite.
+
+**Decision:** for a key-account owner, `stage_event`, `stage_calendar` and
+`stage_notification` skip the account. The fork's own revoke runs with the owner's keys:
+it rotates the ring and removes the grantee's entries. The periodic `rebuild_shares` task
+(from `AccountMaintenance`) gets the same treatment where it would write a key account's
+calendar data.
+
+**Per-user event data.** 1.0.1 reshapes `EventPreferences` into
+`{ account_id, updated, instances: Vec<EventUserData { recurrence_key, flags, color,
+keywords, alerts }> }`, stored in `CalendarEventContent.preferences`. At 0.16 the rule is:
+these preferences are JMAP-only, and JMAP calendars are refused for key accounts, so they
+never exist for a key account (calendar spec, table near line 717). Keep that rule and
+assert it.
+
+If 1.0.1 also writes per-user data through DAV (DAV copy and move retain preferences, and
+the alarm task reads them), a sealing rule is needed. Task 4 establishes this, and the
+question returns to Jay before any code relies on it.
+
+**New sharing filters.** 1.0.1 adds viewer-side filters:
+- `calendar/privacy.rs`: CLASS-based filtering for non-owners, with `EventPrivacy` derived
+  from the metadata flags;
+- `calendar/hidden.rs`, `participants.rs`, `overlap.rs` and `notification.rs`
+  (`visible_notifications`);
+- `dav/calendar/{view,filter}.rs`.
+
+They run on the unsealed view, with keys, and never in keyless code. The fork's sanitized
+metadata must carry the flags `EventPrivacy` reads.
 
 ### Mail writers and readers
 
 Adapt stub construction and the unsealing readers to mail-parser 1.0 and
 `email::message::metadata::{build,row,source,view}`. Integrate at `email_ingest_into`, at
-grouped batch construction and flush, and at `email_ingest_finish`, not only in the old
-single-message wrapper. Classification assertions must survive pending-ID allocation,
-commit points, retries, mixed-account work and post-commit notification.
+grouped batch construction and flush (`IngestGroup`, used by IMAP APPEND and JMAP), and at
+`email_ingest_finish`, not only in the single-message `email_ingest` that SMTP delivery
+still calls. Classification assertions must survive pending-ID allocation, commit points,
+retries, mixed-account work and post-commit notification.
 
 Keep nested MIME and attachment offsets, section reads, encrypted uploads and every refusal
 of a raw-blob consumer. Background delivery still seals to the served public key and never
 borrows a user's session keys. Submission, spam training, threading and push keep their
-existing content restrictions.
+existing content restrictions. The un-index path's `delete_email_metadata` reads the stored
+row's `raw_headers` to resolve the thread subject. It must recognize a stub by its format
+byte, as the index side does.
 
 ### Indexing, metadata and cache snapshots
 
@@ -187,36 +273,47 @@ Replace the protection that lived in `services::task_manager::index` at every ne
 point of `services::index_queue::{document,index,reindex,file}` and at the storage commit
 boundaries they use. Index rebuild and attachment extraction fall under the same rule.
 
-**The index/un-index race.** At 0.16, `IndexDocument` and `UnindexDocument` run in separate
-workers with nothing ordering them per document. An un-index that overtakes a queued index
-write leaves an orphaned search document for a destroyed message. The race is upstream's. In
-the fork, `za::mail::fence`'s in-flight index tests pin it, and since PR #66 the key-mode
-JMAP ACL variant waits for tasks before its destroy.
+**The index queue.** 1.0.1 removes the `IndexDocument` and `UnindexDocument` tasks. The
+queue is its own key space:
+- `SearchIndexClass::Queue { index, id_prefix: account_id, id_suffix, created_at }`, with
+  value 1 for index and 0 for un-index;
+- a `QueueIndex { index, partition }` marker, plus control and status keys;
+- all in subspace `SearchQueue` (`y`).
 
-1.0.1 replaces the two workers with a partitioned queue (`services::index_queue::manager`):
-entries are grouped by index and partition id, and one holder works a partition at a time
-under a lock. The port must establish whether a document's index and un-index entries share
-a partition and apply in order.
+`services::index_queue::manager` works one `(index, account)` partition at a time under a
+lock, in `created_at` order. The worker reads the metadata row first, and skips an index
+entry whose row is gone. So the 0.16 race (an un-index overtaking a queued index write and
+orphaning the document) is gone by construction. One window remains, between the row read
+and the document write, and the next pass of the same partition repairs it.
 
-- **If they do,** the race is gone. The fence tests' expected outcome changes (the late
-  write no longer lands), and the ACL wait can go.
-- **If they don't,** chunk 0 of the index write asserts that the document's source still
-  exists (the Email metadata property, or the event or card archive). The failed assertion
-  is confirmed by a read outside the transaction, the fork's R58/R62/R63 pattern.
+**Decision:** adopt "ordered". Task 6 confirms it with the 0.16 interleaving reproduced by a
+pause hook. Then:
+- the in-flight index tests in `za::mail::fence` flip to expect no late write;
+- the key-mode JMAP ACL variant's wait comes out;
+- no source-exists assertion is added.
 
-Keep cache snapshots working on stored, sanitized views only. Neither cache population nor
-snapshot serialization and restoration may accept an unsealed response view or
-`SessionKeys`. Test persistent file and blob snapshots and the shared codecs, including stale
-loaders racing provisioning and revocation. Redis and cluster operation remain unqualified,
-and the central serialization and authority guards must not depend on which snapshot backend
-is selected. Checksum framing named `seal` is not encryption and cannot satisfy this
-contract.
+**The provisioning fence (R54 and R58).** These retarget to the new key space.
+- R54's scan `Server::za_has_tasks` covers the account's `SearchIndexClass::Queue` entries
+  for every `SearchIndex`, plus the partition's status key. It no longer matches the removed
+  task types.
+- The exhaustive match over `Task` classifies the three new types: `ShareRevokeCleanup`
+  counts for the owner and the grantees it stages; `DmarcReportWindow` and
+  `TlsReportWindow` are excluded.
+- R58's vault-absence assertion moves to the batch the worker commits: `account_batch`
+  (`store/src/search/index.rs`), not the queue entry, which the producer writes.
+- `Store::index`'s chunk loop is gone. If `account_batch` commits each document in one
+  write, R62 and R63 take the "subject deleted" disposition, with that evidence; Task 6
+  confirms which.
 
-The new IMAP METADATA and JMAP object-metadata operations initially refuse key-account
-access wherever they add storage outside the existing encrypted carriers. Reuse the
-protocols' error conventions, and make capability and refusal behaviour explicit. Existing
-DAV property operations continue through their ported encrypted mapping. Ordinary-account
-metadata behaviour stays upstream's, and no generated permission or schema change is needed.
+**Cache snapshots.** Keep them working on stored, sanitized views only. Neither cache
+population nor snapshot serialization and restoration may accept an unsealed response view
+or `SessionKeys`. Test persistent file and blob snapshots and the shared codecs, including
+stale loaders racing provisioning and revocation.
+- The test server starts the swap tier (`Caches::parse` returns its receiver; boot calls
+  `SwapTier::start`) by default, as production does.
+- Redis and cluster operation remain unqualified. The central serialization and authority
+  guards must not depend on which snapshot backend is selected.
+- Checksum framing named `seal` is not encryption and cannot satisfy this contract.
 
 ## Test suite ownership
 
@@ -227,19 +324,23 @@ exports are in the git-ignored `.superpowers/sdd/baseline-01627/`; the plan comm
 reduced form.
 
 - **What 1.0.1 ships:** no public test.
-  - The tree has no `#[test]`, no `tests/` crate and no `test_mode` feature.
+  - The tree has no `#[test]`, no `tests/` crate, no `test_mode` feature and no
+    `.github/workflows/test.yml`.
   - Upstream links its tests through 562 `#[path = "…/stalwart-tests/…"]` slots that point to
     a private sibling checkout (560 at 1.0.0).
-  - 530 of the slots compile only when that crate's own tests are built; about 27 are
-    support modules that are always compiled once the flag is set.
+  - 534 of the slots compile only when that crate's own tests are built; 27 are support
+    modules that are always compiled once the flag is set.
 - **What the fork has at 0.16.27:** 795 test functions.
   - 697 are unit tests in `crates/`: 466 from upstream, 183 of those in the SEL-only scim
     crates.
   - 98 are in the `tests` crate. Its suites make 197 sub-test calls.
+  - Six tests were already `#[ignore]`d: `nlp`'s `text_classifier`, `spam-filter`'s pyzor
+    `send_message`, the SMTP `asn`, `milter_client_test` and `dane_live_smtp_hosts`, and
+    `webdav::cal_query::ical_roundtrip_expansion`.
   - After PR #66, CI selects 609 of the 795. The other 186 are the SEL-only scim tests and
     the `cluster_tests`, `stress_tests` and `scim_tests` suites.
 - **What passes:** every test in the local net except `automation_tests`, which needs
-  Docker, as does `directory_tests`. Both run in CI.
+  Docker, as does `directory_tests`. Both pass in CI.
 - **Coverage of that net,** measured with llvm-cov over 19 steps:
 
   | Code | Lines | Functions |
@@ -250,67 +351,105 @@ reduced form.
   | Upstream files the fork edited | 75.4% | 75.7% |
   | Upstream files the fork never touched | 57.1% | 57.8% |
 
-  173 of the 197 sub-test calls ran. The rest need Docker, are SEL-only, or are gated by a
-  feature or an environment variable.
-- **What a plain merge does:** merging v1.0.1 deletes 520 of the 598 files under `tests/`,
-  and every upstream unit test in `crates/`, without a single conflict.
+  173 of the 197 sub-test calls ran, by the baseline's first, permissive rule: a positive
+  count on either the async function or its body. The rest need Docker, are SEL-only, or
+  are gated by a feature or an environment variable. Task 1 recomputes "ran" with the strict
+  rule below from the stored region-level exports.
+- **What a plain merge does:** merging v1.0.1 deletes 541 of the 599 files under `tests/` at
+  `9a7574203`. 520 of those go without a conflict, and 21 as modify/delete conflicts. It
+  also deletes every upstream unit test in `crates/` and `.github/workflows/test.yml`.
 
 ### Decisions
 
-1. **Keep the whole 0.16.27 suite and port it.** A test leaves the required set only with a
-   recorded disposition, of one of four kinds:
-   - **SEL-only:** the `scim` and `scim-proto` crates; `tests/src/directory/oidc.rs`,
-     `tests/src/scim/*` (the SEL-only files), `tests/src/system/archiving.rs` and
-     `tests/src/system/tenant.rs`; and the sub-test calls to them.
-   - **Subject deleted upstream:** the test's subject no longer exists in 1.0.
-   - **Internals replaced in 1.0:** the test is replaced by a behaviour-equivalent test of
-     the new code, not deleted.
+1. **Keep the 0.16.27 suite and port it, restoring upstream's tests verbatim wherever
+   possible.** A test leaves the required set only with a recorded disposition.
+   - **Subject unchanged or renamed:** restore the test verbatim, adapting only names and
+     call shapes. This is the default.
+   - **Internals replaced in 1.0:** write an equivalent test of the new code when the test
+     exercised public behaviour (a parser, a protocol exchange, a stored format) or sits in
+     a fork hotspot module. Otherwise record "internals replaced, no equivalent", with the
+     1.0 diff hunk. Upstream-crate coverage is reported against the baseline, so what this
+     costs is visible.
+   - **Subject deleted upstream:** recorded with the 1.0 diff that removed it.
+   - **SEL-only:**
+     - the `scim` and `scim-proto` crates;
+     - `tests/src/directory/oidc.rs`, the SEL-only `tests/src/scim/*` files,
+       `tests/src/system/archiving.rs` and `tests/src/system/tenant.rs`;
+     - the sub-test calls to them, including `system::tenant::test` and
+       `system::archiving::test`.
    - **Ungated as today:** `cluster_tests`, `stress_tests` and `scim_tests` keep compiling
-     but stay out of the required set, as now.
+     but stay out of the required set.
+   - **Ignored as today:** the six `#[ignore]`d tests stay ignored and keep compiling.
 2. **Restore everything at merge time.**
-   - Right after `git merge --no-commit`, restore `tests/` in full from the fork side,
-     before resolving anything else, and record the restored paths.
-   - Move each 0.16.27 inline test module of upstream's into a fork-owned
-     `restored_tests.rs` next to its 1.0 counterpart, attached by a single
-     `#[cfg(test)] mod restored_tests;` line. A module whose subject moved follows its
-     subject. A module whose subject is gone takes the "subject deleted" disposition.
+   - Right after `git merge --no-commit`, restore `tests/` and `.github/workflows/test.yml`
+     in full from the fork side, before resolving anything else, and record the restored
+     paths. Task 8 rewrites the workflow later.
+   - Move each 0.16.27 inline test module of upstream's into a fork-owned file next to its
+     1.0 counterpart, attached as `#[cfg(test)] #[path = "restored_tests.rs"] mod tests;`.
+     The module keeps the name `tests`, so its libtest identifiers are unchanged, and as a
+     child module it sees the parent's private items as the inline module did.
+   - A module whose subject moved follows its subject.
    - Bring the fork's own unit tests along with their modules.
 3. **Restore only the test hooks the suite uses.** Restore the `test_mode` features only
    where the retained suite needs them. Write each hook as a one-line call into a fork-owned
-   module, as `common::za::test_hooks` already does.
+   module, as `common::za::test_hooks` already does. Re-derive the unit-test step's feature
+   list for 1.0's workspace at the same time.
 4. **Replace the one SEL-only helper an AGPL test needs.** The dual-licensed
    `tests/src/directory/issuer.rs` imports `get_token_for_client` from the SEL-only
    `oidc.rs`. Write a replacement from the OAuth 2.0 token-endpoint specification (RFC 6749),
    not from the SEL file.
 5. **Keep an expectation ledger.** Every changed assertion in a ported test names the 1.0
-   change behind it (a diff hunk or release note) in the outcome note. Reviewers check those
+   change behind it (a diff hunk or release note) in the outcome note. So does every early
+   return, `cfg` skip or new `#[ignore]` added to a ported test. Reviewers check those
    entries against source. Without upstream's own tests, this is what stops a port from
    quietly accepting a regression.
-6. **Make the harness exhaustive.** `wait_for_tasks` covers 1.0's index queue (partitions
-   and retries) as well as scheduled tasks. Cleanup enumerates 1.0's closed `Subspace` enum
-   with no catch-all arm, so a new subspace stops the build.
+6. **Make the harness exhaustive.**
+   - `wait_for_tasks` waits for the scheduled tasks and for the index queue's
+     `SearchIndexClass::Queue` entries and status keys.
+   - Cleanup enumerates 1.0's closed `Subspace` enum with no catch-all arm, so a new
+     subspace stops the build. The 0.16 `SUBSPACE_*` constants are gone.
+   - The leak scanner covers `SearchQueue`, `SearchDocument`, `Presence`, `Value` and
+     `Collection::Metadata`. Each has a stated rule for what a key account may hold there
+     in the clear, and a planted-violation control.
 
 ### Gates (C10)
 
 - **Test list.** The candidate's libtest listings, per binary and feature set, are compared
-  with the baseline minus its dispositions. So are the sub-test calls the suites execute.
-  The gate fails on any required test that is missing, ignored or unselected.
-- **Executed sub-tests.** Rerun the baseline's 19-step coverage net on the candidate. Each
-  sub-test call must execute in every mode where it did at 0.16.27 (llvm-cov's function
-  counts). This needs no instrumentation of the suites.
-- **Coverage.** Line coverage of fork-owned code must not fall below 96.4%. Upstream crates
-  are reported, and a drop is explained.
+  with the baseline, which carries each test's status there: run, ignored or not selected.
+  - The gate fails on a required test that is missing or unselected.
+  - It fails on a test that ran at 0.16.27 and is now ignored.
+  - It fails on any status change that lacks a disposition.
+  - A test ignored at 0.16.27 that is still ignored passes.
+- **Executed sub-tests.** Rerun the baseline's 19-step coverage net on the candidate. A
+  sub-test call counts as executed in a mode only if two things hold in that step's export,
+  by llvm-cov's region counts:
+  - its async body record has a positive count;
+  - the body's final region has a positive count.
+
+  A record of the outer async function only constructs the future, and never counts. Since
+  a failed assertion panics, reaching the final region means every assertion before it
+  passed. Each call must execute in every mode where it did at 0.16.27, under the same
+  strict rule.
+- **Coverage.** Line coverage of fork-owned code must not fall below 96.4%. Fork-owned means
+  files added relative to v1.0.1, the `vault` crate and the `za*` paths. Upstream crates are
+  reported, and a drop is explained.
+- **Gate self-tests.** In disposable changes, show that each of these fails the gates:
+  - an omitted sub-test call;
+  - a constructed but unawaited sub-test future;
+  - an early return before a sub-test's assertions;
+  - a newly ignored required test;
+  - a dropped restored module;
+  - a coverage drop.
+
+  Also show that the unchanged baseline passes.
 - **Mutation sample.** Disable each re-ported protection hook in turn, and record that a
   named test fails. Tests adapted to new APIs can pass vacuously.
 - **Upstream's hidden tests.** Record the number of private-test slots in each upstream
   release. A new slot marks a module where upstream added a test we cannot see; review that
   module for fork-relevant behaviour.
-- **CI.**
-  - Port every job PR #66 added (`unit-tests`, `upstream-suites` and the `zero-access`
-    additions) to the 1.0 commands.
-  - Add Dovecot's imaptest (with the 112 scripts in `tests/resources`), python
-    caldav-server-tester and Fastmail's JMAP-TestSuite against the OSS product binary.
-  - Run these against the 0.16.27 binary in the same job, and diff the two sets of results.
+- **CI.** Port every job PR #66 added (`unit-tests`, `upstream-suites` and the
+  `zero-access` additions) to the 1.0 commands. Keep the python-caldav runner. The external
+  protocol suites are deferred (see the scope exclusions).
 - **Product.** The OSS create-and-restart gate creates fresh accounts and data, stops the
   process, restarts on the same store, and checks mail, calendars, pins and sharing after a
   fresh authentication. This is a persistence test on one version, not a migration test.
@@ -318,38 +457,47 @@ reduced form.
 ## Execution and release gates
 
 The [implementation plan](../plans/2026-10-27-stalwart-1-upgrade.md) uses one integration
-branch with bounded ownership. Early source checkpoints are not independently deployable,
-and not necessarily buildable: common types affect most crates. No permissive shim, skipped
-protection, ignored test or temporary production feature gate may manufacture a green build.
+branch with bounded ownership. No permissive shim, skipped protection, ignored test or
+temporary production feature gate may manufacture a green build. Each component task ends
+with a crate-level `cargo check`, so that implementers can check their own work before the
+integrated gate. Upstream's crate dependencies allow this order:
+- Task 3 closes with `common`;
+- Task 4 with `groupware` and `dav`;
+- Task 5 with `email`, `imap`, `jmap`, `smtp` and `pop3`;
+- Task 6 with `services` and `store`.
 
 1. Approve this design and the plan.
-2. Merge the pinned release in an isolated worktree, restore the tests, inventory the fork's
-   hooks, and settle the shared interface changes.
-3. Complete the coupled core port, and reach a product and test compilation gate free of
-   conflicts, with every contract mapped to code.
+2. Merge the pinned release in an isolated worktree, restore the tests and the test
+   workflow, inventory the fork's hooks, and settle the shared interface changes.
+3. Complete the coupled core port through its crate-level checkpoints, and reach a product
+   and test compilation gate free of conflicts, with every contract mapped to code.
 4. Pass the C10 gates, the units, the za and leak suites, the plain and key protocol suites,
-   the retained ordinary-account CI, the independent CalDAV suites and the fresh OSS
+   the retained ordinary-account CI, the python-caldav suites and the fresh OSS
    create-and-restart gate.
 5. Complete a fresh, clean-context review of the whole branch. Close its findings, and rerun
    the affected complete gates after the fixes.
-6. Record the exact candidate SHA, commands, results, skips, retries, expectation-ledger
-   entries and artifact provenance. Native client checks remain a separate gate under the
-   existing manual checklist.
+6. Record the exact candidate SHA, commands, results, skips, retries, dispositions,
+   expectation-ledger entries and artifact provenance. Native client checks remain a
+   separate gate under the existing manual checklist.
 
-Propose `0.2.0-beta.1` for the next fork preview, because storage compatibility changes. This
-does not rename the fork to upstream 1.0. Finalize the version under the release policy at
-implementation and release review. Publish only with separate authorization, and keep any
-release with pending native gates explicitly limited and marked as a prerelease.
+The next fork preview is `0.2.0-beta.1`, because storage compatibility changes (Jay
+confirmed on 2026-10-30). This does not rename the fork to upstream 1.0. Publish only with
+separate authorization, and keep any release with pending native gates explicitly limited
+and marked as a prerelease.
 
 ## Source references
 
 - [Pinned upstream release](https://github.com/stalwartlabs/stalwart/releases/tag/v1.0.1)
   and its parent [v1.0.0](https://github.com/stalwartlabs/stalwart/releases/tag/v1.0.0): the
   new database layout, metadata, cache and index changes, and the move to private tests.
-- In the target: `crates/common/src/auth/authentication.rs`, `cache/swap/` and
-  `storage/index/split.rs`; `crates/common/src/manager/schema.rs`;
-  `crates/groupware/src/calendar/{mod,storage}.rs`; `crates/email/src/message/{ingest,metadata}`;
-  `crates/services/src/index_queue/`.
+- In the target:
+  - `crates/common/src/auth/authentication.rs`, `cache/swap/`, `storage/index/split.rs` and
+    `storage/metadata/`; `crates/common/src/manager/schema.rs`;
+  - `crates/groupware/src/calendar/{mod,storage,privacy,hidden}.rs`; `crates/dav/src/common/dead/`;
+  - `crates/email/src/message/{ingest,metadata}`; `crates/jmap/src/api/metadata/`;
+    `crates/imap/src/op/metadata/`;
+  - `crates/services/src/index_queue/` and `task_manager/tasks/{grantee_cleanup,rebuild_shares}`;
+  - `crates/store/src/search/index.rs` and `write/{batch,key,metadata}.rs`.
 - The baseline in `.superpowers/sdd/baseline-01627/`; PRs #62 and #66; fork issue #67.
 - The fork's `CLAUDE.md`, existing tests and the linked approved designs take precedence for
   the preserved contracts. Upstream's performance claims are not qualification of this fork.
