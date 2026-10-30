@@ -4,21 +4,31 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use common::auth::AccessToken;
-use common::{HttpAuthCache, Server, auth::AuthRequest, network::limiter::InFlight};
+use common::{
+    HttpAuthCache, Server,
+    auth::{AccessToken, AuthRequest, authentication::Authenticated},
+    cache::http_auth::RevocationEpoch,
+    network::limiter::InFlight,
+};
+use compact_str::CompactString;
 use directory::Credentials;
+use encodify::base64::LENIENT;
 use http_proto::{HttpRequest, HttpSessionData};
 use hyper::header;
-use mail_parser::decoders::base64::base64_decode;
 use std::future::Future;
-use std::time::{Duration, Instant};
+
+pub struct HttpAuthenticated {
+    pub in_flight: Option<InFlight>,
+    pub access_token: AccessToken,
+    pub epoch: RevocationEpoch,
+}
 
 pub trait Authenticator: Sync + Send {
     fn authenticate_headers(
         &self,
         req: &HttpRequest,
         session: &HttpSessionData,
-    ) -> impl Future<Output = trc::Result<(Option<InFlight>, AccessToken)>> + Send;
+    ) -> impl Future<Output = trc::Result<HttpAuthenticated>> + Send;
 }
 
 impl Authenticator for Server {
@@ -26,7 +36,9 @@ impl Authenticator for Server {
         &self,
         req: &HttpRequest,
         session: &HttpSessionData,
-    ) -> trc::Result<(Option<InFlight>, AccessToken)> {
+    ) -> trc::Result<HttpAuthenticated> {
+        let revocations = &self.inner.cache.grant_revocations;
+        let epoch = revocations.epoch();
         if let Some((mechanism, token)) = req.authorization() {
             // The cache key is a keyed fingerprint of the header value; the
             // value itself is never stored (spec 5).
@@ -35,10 +47,16 @@ impl Authenticator for Server {
             // Check if the credentials are cached
             if let Some(http_cache) = self.inner.cache.http_auth.get(&fp) {
                 // Make sure the revision is still valid
+<<<<<<< HEAD
                 if http_cache.expires > Instant::now() {
                     let mut access_token = AccessToken::renew(
+=======
+                if self.inner.cache.http_auth.is_live(&http_cache) {
+                    let access_token = AccessToken::renew(
+>>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                         self.access_token(http_cache.account_id).await?,
                         http_cache.credential_id,
+                        http_cache.token_scope,
                         session.remote_ip,
                     )?;
                     // Mail ruling R35: an impersonation stays one.
@@ -47,6 +65,7 @@ impl Authenticator for Server {
                     }
 
                     if access_token.revision() == http_cache.revision {
+<<<<<<< HEAD
                         if http_cache.generation == 0 {
                             // Non-key account: unchanged upstream path.
                             // Enforce authenticated rate limit
@@ -80,6 +99,17 @@ impl Authenticator for Server {
                                 .await
                                 .map(|in_flight| (in_flight, access_token));
                         }
+=======
+                        // Enforce authenticated rate limit
+                        return self
+                            .is_http_authenticated_request_allowed(&access_token, session.remote_ip)
+                            .await
+                            .map(|in_flight| HttpAuthenticated {
+                                in_flight,
+                                access_token,
+                                epoch,
+                            });
+>>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                     }
                 }
 
@@ -88,7 +118,77 @@ impl Authenticator for Server {
                 self.inner.cache.za_keys.remove(&fp);
             }
 
+<<<<<<< HEAD
             authenticate_uncached(self, mechanism, token, session).await
+=======
+            let credentials = if mechanism.eq_ignore_ascii_case("basic") {
+                // Decode the base64 encoded credentials
+                decode_plain_auth(token).ok_or_else(|| {
+                    trc::AuthEvent::Error
+                        .into_err()
+                        .details("Failed to decode Basic auth request.")
+                        .id(CompactString::from(token))
+                        .caused_by(trc::location!())
+                })?
+            } else if mechanism.eq_ignore_ascii_case("bearer") {
+                // Enforce anonymous rate limit
+                self.is_http_anonymous_request_allowed(session.remote_ip)
+                    .await?;
+
+                Credentials::Bearer {
+                    username: None,
+                    token: token.to_string(),
+                }
+            } else {
+                // Enforce anonymous rate limit
+                self.is_http_anonymous_request_allowed(session.remote_ip)
+                    .await?;
+
+                return Err(trc::AuthEvent::Error
+                    .into_err()
+                    .reason("Unsupported authentication mechanism.")
+                    .details(CompactString::from(token))
+                    .caused_by(trc::location!()));
+            };
+
+            // Authenticate
+            let Authenticated {
+                access_token,
+                expires_in,
+            } = self
+                .authenticate(&AuthRequest::from_credentials(
+                    credentials,
+                    session.session_id,
+                    session.remote_ip,
+                ))
+                .await?;
+
+            // Cache credentials
+            let cache_ttl = expires_in.map_or(self.core.oauth.oauth_expiry_token, |expires_in| {
+                expires_in.min(self.core.oauth.oauth_expiry_token)
+            });
+            revocations.insert(
+                &self.inner.cache.http_auth,
+                token,
+                HttpAuthCache {
+                    account_id: access_token.account_id(),
+                    expires: self.inner.cache.http_auth.expires_in(cache_ttl),
+                    credential_id: access_token.credential_id(),
+                    revision: access_token.revision(),
+                    token_scope: access_token.token_scope(),
+                },
+                epoch,
+            );
+
+            // Enforce authenticated rate limit
+            self.is_http_authenticated_request_allowed(&access_token, session.remote_ip)
+                .await
+                .map(|in_flight| HttpAuthenticated {
+                    in_flight,
+                    access_token,
+                    epoch,
+                })
+>>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
         } else {
             // Enforce anonymous rate limit
             self.is_http_anonymous_request_allowed(session.remote_ip)
@@ -401,15 +501,13 @@ impl HttpHeaders for HttpRequest {
 }
 
 fn decode_plain_auth(token: &str) -> Option<Credentials> {
-    base64_decode(token.as_bytes())
-        .and_then(|token| String::from_utf8(token).ok())
-        .and_then(|token| {
-            token
-                .split_once(':')
-                .map(|(login, secret)| Credentials::Basic {
-                    username: login.trim().to_lowercase(),
-                    secret: secret.to_string(),
-                    mfa_token: None,
-                })
-        })
+    LENIENT.decode_to_string(token).ok().and_then(|token| {
+        token
+            .split_once(':')
+            .map(|(login, secret)| Credentials::Basic {
+                username: login.trim().to_lowercase(),
+                secret: secret.to_string(),
+                mfa_token: None,
+            })
+    })
 }

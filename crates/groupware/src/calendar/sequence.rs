@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+<<<<<<< HEAD
 //! Key pinning spec 5.1: the SEQUENCE floor and the fan-out's
 //! reconciliation, key organizers only (invariant 9); upstream's builders
 //! run unchanged (invariant 15).
@@ -208,10 +209,132 @@ pub fn za_set_sequences(ical: &mut ICalendar, sequences: &[ZaSequence]) {
     for (comp_id, instance) in za_instance_keys(ical) {
         if let Some(sequence) = sequences.iter().find(|s| s.instance == instance) {
             raise_sequence(&mut ical.components[comp_id as usize], sequence.sequence);
+=======
+use super::{
+    EVENT_HIDE_ATTENDEES, EVENT_INVITE_OTHERS, EVENT_INVITE_SELF, compare::ComparisonScope,
+    expand::ComponentRecurrenceId,
+};
+use calcard::{
+    common::timezone::Tz,
+    icalendar::{
+        ICalendar, ICalendarComponent, ICalendarComponentType, ICalendarProperty, ICalendarValue,
+    },
+};
+
+pub const SCHEDULING_EVENT_FLAGS: u16 =
+    EVENT_INVITE_SELF | EVENT_INVITE_OTHERS | EVENT_HIDE_ATTENDEES;
+
+pub trait ICalendarSequence {
+    fn has_scheduling_changes(&self, previous: &ICalendar) -> bool;
+
+    fn increment_sequence(&mut self, previous: &ICalendar);
+}
+
+impl ICalendarSequence for ICalendar {
+    fn has_scheduling_changes(&self, previous: &ICalendar) -> bool {
+        !ComparisonScope::SchedulingData.component_eq(self, 0, previous, 0)
+            || PreviousSequences::new(previous).are_lowered_by(self)
+    }
+
+    fn increment_sequence(&mut self, previous: &ICalendar) {
+        let previous = PreviousSequences::new(previous);
+        for component in self
+            .components
+            .iter_mut()
+            .filter(|component| component.component_type.is_scheduling_object())
+        {
+            let previous_sequence = previous.of(component);
+            if component.sequence().unwrap_or_default() <= previous_sequence {
+                component.set_sequence(previous_sequence + 1);
+            }
         }
     }
 }
 
+struct PreviousSequences<'x> {
+    series: Option<i64>,
+    components: Vec<(&'x ICalendarComponentType, Option<i64>, Option<i64>)>,
+}
+
+impl<'x> PreviousSequences<'x> {
+    fn new(ical: &'x ICalendar) -> Self {
+        let components = ical
+            .components
+            .iter()
+            .filter(|component| component.component_type.is_scheduling_object())
+            .map(|component| {
+                (
+                    &component.component_type,
+                    component.recurrence_instant(),
+                    component.sequence(),
+                )
+            })
+            .collect::<Vec<_>>();
+        PreviousSequences {
+            series: ical
+                .components
+                .iter()
+                .find(|component| {
+                    component.component_type.is_scheduling_object()
+                        && !component.is_recurrence_override()
+                })
+                .and_then(ComponentSequence::sequence),
+            components,
+        }
+    }
+
+    fn are_lowered_by(&self, ical: &ICalendar) -> bool {
+        ical.components
+            .iter()
+            .filter(|component| component.component_type.is_scheduling_object())
+            .any(|component| component.sequence().unwrap_or_default() < self.of(component))
+    }
+
+    fn of(&self, component: &ICalendarComponent) -> i64 {
+        let recurrence_instant = component.recurrence_instant();
+        self.components
+            .iter()
+            .find(|(component_type, instant, _)| {
+                **component_type == component.component_type && *instant == recurrence_instant
+            })
+            .map_or(self.series, |(_, _, sequence)| *sequence)
+            .unwrap_or_default()
+    }
+}
+
+trait ComponentSequence {
+    fn sequence(&self) -> Option<i64>;
+
+    fn set_sequence(&mut self, sequence: i64);
+
+    fn recurrence_instant(&self) -> Option<i64>;
+}
+
+impl ComponentSequence for ICalendarComponent {
+    fn sequence(&self) -> Option<i64> {
+        self.property(&ICalendarProperty::Sequence)
+            .and_then(|entry| entry.values.first())
+            .and_then(ICalendarValue::as_integer)
+    }
+
+    fn recurrence_instant(&self) -> Option<i64> {
+        self.recurrence_id(Tz::Floating).map(|id| id.utc)
+    }
+
+    fn set_sequence(&mut self, sequence: i64) {
+        match self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == ICalendarProperty::Sequence)
+        {
+            Some(entry) => entry.values = [ICalendarValue::Integer(sequence)].into(),
+            None => self.add_sequence(sequence),
+>>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+        }
+    }
+}
+
+<<<<<<< HEAD
 /// The component's SEQUENCE as `itip_snapshot` reads it (the last integer
 /// value); `None` when absent.
 fn sequence_of(comp: &ICalendarComponent) -> Option<i64> {
@@ -553,3 +676,9 @@ mod tests {
         assert_eq!(new, untouched);
     }
 }
+=======
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/groupware/src/calendar/sequence/tests.rs"]
+mod tests;
+>>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184

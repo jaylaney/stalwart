@@ -4,23 +4,10 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::{LONG_1Y_SLUMBER, config::telemetry::OtelTracer};
-use ahash::{AHashMap, AHashSet};
-use mail_parser::DateTime;
-use opentelemetry::{
-    InstrumentationScope, Key, KeyValue, Value,
-    logs::{AnyValue, Severity},
-    trace::{SpanContext, SpanKind, Status, TraceFlags, TraceState},
-};
-use opentelemetry_sdk::{
-    Resource,
-    logs::{LogBatch, LogExporter, SdkLogRecord},
-    trace::{SpanData, SpanEvents, SpanExporter, SpanLinks},
-};
-use opentelemetry_semantic_conventions::resource::SERVICE_VERSION;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use trc::{Event, EventDetails, Level, TelemetryEvent, ipc::subscriber::SubscriberBuilder};
+use crate::config::telemetry::OtelTracer;
+use trc::{TelemetryEvent, ipc::subscriber::SubscriberBuilder};
 
+<<<<<<< HEAD
 const MAX_EVENTS: usize = 2048;
 
 pub(crate) fn spawn_otel_tracer(builder: SubscriberBuilder, mut otel: OtelTracer) {
@@ -284,5 +271,14 @@ fn build_any_value(value: &trc::Value) -> AnyValue {
             AnyValue::ListAny(Box::new(v.iter().map(build_any_value).collect()))
         }
         trc::Value::None => AnyValue::Boolean(false),
+=======
+pub(crate) fn spawn_otel_tracer(builder: SubscriberBuilder, tracer: OtelTracer) {
+    if let Err(err) = tracer.spawn(builder) {
+        trc::event!(
+            Telemetry(TelemetryEvent::OtelExporterError),
+            Details = "Failed to start the OpenTelemetry exporter",
+            Reason = err.to_string(),
+        );
+>>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
     }
 }

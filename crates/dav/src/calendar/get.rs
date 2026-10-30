@@ -6,8 +6,8 @@
 
 use crate::{
     DavError, DavMethod,
+    calendar::CalendarEventView,
     common::{
-        ETag,
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
         za::{ZaReadMemo, za_read_event_view},
@@ -15,17 +15,25 @@ use crate::{
 };
 use common::{Server, auth::AccessToken};
 use dav_proto::{RequestHeaders, schema::property::Rfc1123DateTime};
-use groupware::{cache::GroupwareCache, calendar::CalendarEvent};
+use groupware::{
+    SizeWriter,
+    cache::GroupwareCache,
+    calendar::{
+        CalendarEvent, CalendarEventContent, EVENT_HAS_ALARMS, alerts::DefaultAlertsResolver,
+        privacy::EventPrivacy,
+    },
+};
 use http_proto::HttpResponse;
 use hyper::StatusCode;
 use store::{
     ValueKey,
-    write::{AlignedBytes, Archive},
+    write::{Archive, ArchiveBytes},
 };
 use trc::AddContext;
 use types::{
     acl::Acl,
     collection::{Collection, SyncCollection},
+    field::CalendarEventField,
 };
 
 pub(crate) trait CalendarGetRequestHandler: Sync + Send {
@@ -51,7 +59,7 @@ impl CalendarGetRequestHandler for Server {
             .into_owned_uri()?;
         let account_id = resource_.account_id;
         let resources = self
-            .fetch_dav_resources(
+            .fetch_groupware_resources(
                 access_token.account_id(),
                 account_id,
                 SyncCollection::Calendar,
@@ -70,10 +78,19 @@ impl CalendarGetRequestHandler for Server {
         }
 
         // Validate ACL
-        if !access_token.is_member(account_id)
+        let is_owner = access_token.is_member(account_id);
+        if !is_owner
+            && EventPrivacy::from_flags(resource.resource.event_flags().unwrap_or_default())
+                == EventPrivacy::Secret
+        {
+            return Err(DavError::Code(StatusCode::NOT_FOUND));
+        }
+        if !is_owner
             && !resources.has_access_to_container(
                 access_token,
-                resource.parent_id().unwrap(),
+                resource
+                    .parent_id()
+                    .ok_or(DavError::Code(StatusCode::NOT_FOUND))?,
                 Acl::ReadItems,
             )
         {
@@ -81,15 +98,28 @@ impl CalendarGetRequestHandler for Server {
         }
 
         // Fetch event
-        let event_ = self
-            .store()
-            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+        let (event_, prefetched) = if is_head || !headers.if_.is_empty() {
+            (
+                self.store()
+                    .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
+                        account_id,
+                        Collection::CalendarEvent,
+                        resource.document_id(),
+                    ))
+                    .await
+                    .caused_by(trc::location!())?,
+                None,
+            )
+        } else {
+            self.archive_and_field(
                 account_id,
                 Collection::CalendarEvent,
                 resource.document_id(),
-            ))
+                CalendarEventField::Content.field(),
+            )
             .await
             .caused_by(trc::location!())?
+<<<<<<< HEAD
             .ok_or(DavError::Code(StatusCode::NOT_FOUND))?;
         let etag = event_.etag();
         let view_ = za_read_event_view(
@@ -103,10 +133,19 @@ impl CalendarGetRequestHandler for Server {
         )
         .await??;
         let event = view_
+=======
+        };
+        let event_ = event_.ok_or(DavError::Code(StatusCode::NOT_FOUND))?;
+        let event = event_
+>>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
             .unarchive::<CalendarEvent>()
             .caused_by(trc::location!())?;
 
         // Validate headers
+<<<<<<< HEAD
+=======
+        let etag = format!("\"{}\"", event.etag.to_native());
+>>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
         let schedule_tag = event.schedule_tag.as_ref().map(|tag| tag.to_native());
         self.validate_headers(
             access_token,
@@ -130,12 +169,50 @@ impl CalendarGetRequestHandler for Server {
             .with_schedule_tag_opt(schedule_tag)
             .with_last_modified(Rfc1123DateTime::new(i64::from(event.modified)).to_string());
 
-        let ical = event.data.event.to_string();
-
-        if !is_head {
-            Ok(response.with_binary_body(ical))
-        } else {
-            Ok(response.with_content_length(ical.len()))
+        let has_alarms = event.flags.to_native() & EVENT_HAS_ALARMS != 0;
+        if is_head && is_owner && !has_alarms {
+            return Ok(response.with_content_length(event.size.to_native() as usize));
         }
+
+        let content_ = match prefetched {
+            Some(content) => content,
+            None => self
+                .store()
+                .get_value::<Archive<ArchiveBytes>>(ValueKey::property(
+                    account_id,
+                    Collection::CalendarEvent,
+                    resource.document_id(),
+                    CalendarEventField::Content,
+                ))
+                .await
+                .caused_by(trc::location!())?
+                .ok_or(DavError::Code(StatusCode::NOT_FOUND))?,
+        };
+        let content = content_
+            .to_unarchived::<CalendarEventContent>()
+            .caused_by(trc::location!())?;
+        let view = self
+            .calendar_event_view(
+                access_token,
+                account_id,
+                event,
+                content.inner,
+                &mut DefaultAlertsResolver::default(),
+            )
+            .await?;
+
+        if is_head {
+            return Ok(match view {
+                Some((view, _)) => response.with_content_length(SizeWriter::ical(&view.data.event)),
+                None => response.with_content_length(event.size.to_native() as usize),
+            });
+        }
+
+        let mut body = String::with_capacity(event.size.to_native() as usize);
+        let _ = match view {
+            Some((view, _)) => view.data.event.write_to(&mut body),
+            None => content.inner.data.event.write_to(&mut body),
+        };
+        Ok(response.with_binary_body(body))
     }
 }

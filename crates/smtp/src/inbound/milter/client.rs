@@ -5,6 +5,7 @@
  */
 
 use common::config::smtp::session::Milter;
+use compact_str::ToCompactString;
 use rustls_pki_types::ServerName;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -28,6 +29,7 @@ impl MilterClient<TcpStream> {
             for addr in &config.addrs {
                 match TcpStream::connect(addr).await {
                     Ok(stream) => {
+                        let _ = stream.set_nodelay(true);
                         return Ok(MilterClient {
                             stream,
                             timeout_cmd: config.timeout_command,
@@ -315,12 +317,17 @@ impl<T: AsyncRead + AsyncWrite + Unpin> MilterClient<T> {
         trc::event!(
             Milter(MilterEvent::Write),
             SpanId = self.session_id,
+<<<<<<< HEAD
             Id = self.id.to_string(),
             Contents = if self.redact {
                 trc::Value::redacted()
             } else {
                 action.to_string().into()
             },
+=======
+            Name = self.id.to_compact_string(),
+            Contents = action.to_compact_string(),
+>>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
         );
 
         tokio::time::timeout(self.timeout_cmd, async {
@@ -339,12 +346,17 @@ impl<T: AsyncRead + AsyncWrite + Unpin> MilterClient<T> {
                         trc::event!(
                             Milter(MilterEvent::Read),
                             SpanId = self.session_id,
+<<<<<<< HEAD
                             Id = self.id.to_string(),
                             Contents = if self.redact {
                                 trc::Value::redacted()
                             } else {
                                 response.to_string().into()
                             },
+=======
+                            Name = self.id.to_compact_string(),
+                            Contents = response.to_compact_string(),
+>>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                         );
 
                         return Ok(response);

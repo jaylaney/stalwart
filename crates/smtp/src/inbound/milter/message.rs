@@ -13,8 +13,10 @@ use crate::{
 use common::{
     DAEMON_NAME,
     config::smtp::session::{Milter, Stage},
+    expr::Bump,
     network::SessionStream,
 };
+use compact_str::ToCompactString;
 use mail_auth::AuthenticatedMessage;
 use smtp_proto::{IntoString, request::parser::Rfc5321Parser};
 use std::{borrow::Cow, time::Instant};
@@ -43,11 +45,12 @@ impl<T: SessionStream> Session<T> {
         // are redacted for a key account's transaction.
         let za_redact = self.data.za_key_rcpt || self.data.za_key_sender();
         let mut modifications = Vec::new();
+        let mut arena = Bump::new();
         for milter in milters {
             if !milter.run_on_stage.contains(&stage)
                 || !self
                     .server
-                    .eval_if(&milter.enable, self, self.data.session_id)
+                    .eval_if(&milter.enable, self, &mut arena, self.data.session_id)
                     .await
                     .unwrap_or(false)
             {
@@ -60,7 +63,7 @@ impl<T: SessionStream> Session<T> {
                     trc::event!(
                         Milter(MilterEvent::ActionAccept),
                         SpanId = self.data.session_id,
-                        Id = milter.id.to_string(),
+                        Name = milter.id.to_compact_string(),
                         Elapsed = time.elapsed(),
                     );
 
@@ -94,7 +97,7 @@ impl<T: SessionStream> Session<T> {
                         }),
                         SpanId = self.data.session_id,
                         QueueId = queue_id,
-                        Id = milter.id.to_string(),
+                        Name = milter.id.to_compact_string(),
                         Elapsed = time.elapsed(),
                     );
 
@@ -122,9 +125,10 @@ impl<T: SessionStream> Session<T> {
                 }
                 Err(Rejection::Error(err)) => {
                     let (code, details) = match err {
-                        Error::Io(details) => {
-                            (MilterEvent::IoError, trc::Value::from(details.to_string()))
-                        }
+                        Error::Io(details) => (
+                            MilterEvent::IoError,
+                            trc::Value::from(details.to_compact_string()),
+                        ),
                         Error::FrameTooLarge(size) => {
                             (MilterEvent::FrameTooLarge, trc::Value::from(size))
                         }
@@ -133,7 +137,7 @@ impl<T: SessionStream> Session<T> {
                         }
                         Error::Unexpected(response) => (
                             MilterEvent::UnexpectedResponse,
-                            trc::Value::from(response.to_string()),
+                            trc::Value::from(response.to_compact_string()),
                         ),
                         Error::Timeout => (MilterEvent::Timeout, trc::Value::None),
                         Error::TLSInvalidName => (MilterEvent::TlsInvalidName, trc::Value::None),
@@ -154,7 +158,7 @@ impl<T: SessionStream> Session<T> {
                     trc::event!(
                         Milter(code),
                         SpanId = self.data.session_id,
-                        Id = milter.id.to_string(),
+                        Name = milter.id.to_compact_string(),
                         Details = details,
                         Elapsed = time.elapsed(),
                     );
@@ -229,16 +233,18 @@ impl<T: SessionStream> Session<T> {
             .assert_continue()?;
 
         // EHLO/HELO
-        let (tls_version, tls_cipher) = self.stream.tls_version_and_cipher();
-        client
-            .helo(
-                &self.data.helo_domain,
-                Macros::new()
-                    .with_cipher(tls_cipher.as_ref())
-                    .with_tls_version(tls_version.as_ref()),
-            )
-            .await?
-            .assert_continue()?;
+        if !self.data.helo_domain.is_empty() {
+            let (tls_version, tls_cipher) = self.stream.tls_version_and_cipher();
+            client
+                .helo(
+                    &self.data.helo_domain,
+                    Macros::new()
+                        .with_cipher(tls_cipher.as_ref())
+                        .with_tls_version(tls_version.as_ref()),
+                )
+                .await?
+                .assert_continue()?;
+        }
 
         // Mail from
         if let Some(mail_from) = &self.data.mail_from {
@@ -277,7 +283,7 @@ impl<T: SessionStream> Session<T> {
 
             // Headers
             client
-                .headers(message.raw_parsed_headers().iter().map(|(k, v)| {
+                .headers(message.headers().iter().map(|(k, v)| {
                     (
                         std::str::from_utf8(k).unwrap_or_default(),
                         std::str::from_utf8(v).unwrap_or_default(),
@@ -341,7 +347,7 @@ impl SessionData {
                                     Milter(MilterEvent::ParseError),
                                     SpanId = self.session_id,
                                     Details = "Failed to parse milter mailFrom parameters",
-                                    Reason = err.to_string(),
+                                    Reason = err.to_compact_string(),
                                 );
                             }
                         }
@@ -377,7 +383,7 @@ impl SessionData {
                                         Milter(MilterEvent::ParseError),
                                         SpanId = self.session_id,
                                         Details = "Failed to parse milter rcptTo parameters",
-                                        Reason = err.to_string(),
+                                        Reason = err.to_compact_string(),
                                     );
                                 }
                             }
@@ -393,7 +399,11 @@ impl SessionData {
                     self.rcpt_to.retain(|r| r.address_lcase != recipient);
                 }
                 Modification::ReplaceBody { value } => {
-                    body.extend(value);
+                    if body.is_empty() {
+                        body = value;
+                    } else {
+                        body.extend(value);
+                    }
                 }
                 Modification::AddHeader { name, value } => {
                     header_changes.push((0, name, value, false));
@@ -405,7 +415,7 @@ impl SessionData {
                 Modification::ChangeHeader { index, name, value } => {
                     if value.is_empty()
                         || message
-                            .raw_parsed_headers()
+                            .headers()
                             .iter()
                             .any(|(n, _)| n.eq_ignore_ascii_case(name.as_bytes()))
                     {
@@ -441,7 +451,7 @@ impl SessionData {
 
         if needs_rewrite {
             let mut headers = message
-                .raw_parsed_headers()
+                .headers()
                 .iter()
                 .map(|(h, v)| (Cow::from(*h), Cow::from(*v)))
                 .collect::<Vec<_>>();

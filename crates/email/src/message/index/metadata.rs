@@ -5,98 +5,60 @@
  */
 
 use crate::message::{
-    index::{IndexMessage, MAX_MESSAGE_PARTS, PREVIEW_LENGTH},
-    metadata::{
-        ArchivedMessageMetadata, ArchivedMessageMetadataPart, ArchivedMetadataHeaderName,
-        MESSAGE_HAS_ATTACHMENT, MESSAGE_RECEIVED_MASK, MessageData, MessageMetadata,
-        MessageMetadataPart, build_metadata_contents,
-    },
+    index::{IndexMessage, PendingMessageData},
+    metadata::{ArchivedMessageMetadata, ExtraHeaders, MessageMetadata},
+    sortkeys::MessageSortKeys,
 };
 use common::storage::index::ObjectIndexBuilder;
-use mail_parser::{
-    PartType,
-    decoders::html::html_to_text,
-    parsers::{fields::thread::thread_name, preview::preview_text},
-};
 use store::{
-    Serialize,
-    write::{Archiver, BatchBuilder, BlobLink, BlobOp, IndexPropertyClass, ValueClass},
+    write::{BatchBuilder, BlobLink, BlobOp, IndexPropertyClass, ValueClass, blob::BlobLinkValue},
+    xxhash_rust::xxh3::xxh3_128,
 };
 use trc::AddContext;
-use types::{blob_hash::BlobHash, field::EmailField};
-use utils::cheeky_hash::CheekyHash;
-
-impl MessageMetadata {
-    #[inline(always)]
-    pub fn root_part(&self) -> &MessageMetadataPart {
-        &self.contents[0].parts[0]
-    }
-
-    pub fn index(self, batch: &mut BatchBuilder, set: bool) -> trc::Result<()> {
-        if set {
-            batch
-                .set(
-                    BlobOp::Link {
-                        hash: self.blob_hash.clone(),
-                        to: BlobLink::Document,
-                    },
-                    Vec::new(),
-                )
-                .set(EmailField::Metadata, Archiver::new(self).serialize()?);
-        } else {
-            batch
-                .clear(BlobOp::Link {
-                    hash: self.blob_hash.clone(),
-                    to: BlobLink::Document,
-                })
-                .clear(EmailField::Metadata);
-        }
-
-        Ok(())
-    }
-}
+use types::{
+    blob_hash::BlobHash,
+    field::EmailField,
+    keyword::{HASATTACHMENT, HASNOATTACHMENT},
+};
+use utils::hash128::Hash128;
 
 impl ArchivedMessageMetadata {
-    #[inline(always)]
-    pub fn root_part(&self) -> &ArchivedMessageMetadataPart {
-        &self.contents[0].parts[0]
+    pub fn index_verbatim(&self, batch: &mut BatchBuilder, metadata: Vec<u8>, sort_keys: Vec<u8>) {
+        batch
+            .set(
+                BlobOp::Link {
+                    hash: self.blob_hash(),
+                    to: BlobLink::Document,
+                },
+                BlobLinkValue::new(self.blob_size()),
+            )
+            .set(EmailField::SortKeys, sort_keys)
+            .set(EmailField::Metadata, metadata);
     }
 
-    pub fn unindex(&self, batch: &mut BatchBuilder) {
-        // Delete metadata
-        let thread_name = self
-            .contents
-            .first()
-            .and_then(|c| c.parts.first())
-            .and_then(|p| {
-                p.headers.iter().rev().find_map(|h| {
-                    if let ArchivedMetadataHeaderName::Subject = &h.name {
-                        h.value.as_text()
-                    } else {
-                        None
-                    }
-                })
-            })
-            .map(thread_name)
-            .unwrap_or_default();
-
+    pub fn unindex(&self, batch: &mut BatchBuilder, thread_name: &str) {
         batch
             .clear(EmailField::Metadata)
+            .clear(EmailField::SortKeys)
             .clear(ValueClass::IndexProperty(IndexPropertyClass::Hash {
                 property: EmailField::Threading.into(),
-                hash: CheekyHash::new(if !thread_name.is_empty() {
-                    thread_name
-                } else {
-                    "!"
-                }),
+                hash: Hash128::from(xxh3_128(
+                    if !thread_name.is_empty() {
+                        thread_name
+                    } else {
+                        "!"
+                    }
+                    .as_bytes(),
+                )),
             }))
             .clear(BlobOp::Link {
-                hash: BlobHash::from(&self.blob_hash),
+                hash: self.blob_hash(),
                 to: BlobLink::Document,
             });
     }
 }
 
+<<<<<<< HEAD
 impl MessageMetadata {
     /// The metadata archive upstream stores for `message`: every part, the
     /// parsed headers with `extra_headers` prepended to the root part, the
@@ -256,24 +218,51 @@ impl IndexMessage for BatchBuilder {
         metadata: MessageMetadata,
         data: MessageData,
     ) -> trc::Result<&mut Self> {
+=======
+impl IndexMessage for BatchBuilder {
+    fn index_message(
+        &mut self,
+        // SPDX-SnippetBegin
+        // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+        // SPDX-License-Identifier: LicenseRef-SEL
+        #[cfg(feature = "enterprise")] tenant_id: Option<u32>,
+        // SPDX-SnippetEnd
+        message: &mail_parser::Message<'_>,
+        extra_headers: &ExtraHeaders,
+        blob_hash: BlobHash,
+        mut data: PendingMessageData,
+    ) -> trc::Result<&mut Self> {
+        let built = MessageMetadata::build(message, extra_headers, blob_hash.clone());
+        if built.has_attachments {
+            data.data.keywords |= 1 << HASATTACHMENT;
+        } else {
+            data.data.keywords |= 1 << HASNOATTACHMENT;
+        }
+
+        let index_builder = ObjectIndexBuilder::<(), _>::new();
+        // SPDX-SnippetBegin
+        // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+        // SPDX-License-Identifier: LicenseRef-SEL
+        #[cfg(feature = "enterprise")]
+        let index_builder = index_builder.with_tenant_id(tenant_id);
+        // SPDX-SnippetEnd
+>>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
         self.set(
             BlobOp::Link {
-                hash: metadata.blob_hash.clone(),
+                hash: blob_hash,
                 to: BlobLink::Document,
             },
-            Vec::new(),
+            BlobLinkValue::new(message.raw().len()),
         )
-        .custom(
-            ObjectIndexBuilder::<(), _>::new()
-                .with_tenant_id(tenant_id)
-                .with_changes(data),
-        )
+        .custom(index_builder.with_changes(data))
         .caused_by(trc::location!())?
         .set(
+            EmailField::SortKeys,
+            MessageSortKeys::from_message(message).serialize(),
+        )
+        .set(
             EmailField::Metadata,
-            Archiver::new(metadata)
-                .serialize()
-                .caused_by(trc::location!())?,
+            built.encode().caused_by(trc::location!())?,
         );
 
         Ok(self)

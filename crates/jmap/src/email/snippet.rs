@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+<<<<<<< HEAD
 use crate::email::za::za_refuse_snippet_terms;
 use common::{Server, auth::AccessToken};
 use email::{
@@ -13,6 +14,22 @@ use email::{
             ArchivedMetadataPartType, DecodedPartContent, MessageMetadata, MetadataHeaderName,
         },
         za::view::{ZaMailView, za_readable},
+=======
+use common::{
+    Server,
+    auth::AccessToken,
+    storage::batch::{DocumentBatch, Lookup, MAX_BATCH_BYTES, MAX_BATCH_DOCUMENTS},
+};
+use email::{
+    cache::{
+        MessageCacheFetch,
+        email::{MessageAccess, MessageCacheAccess},
+        mailbox::MailboxCacheAccess,
+    },
+    message::{
+        messagedata::{EmailMessageData, MetadataForm},
+        metadata::{PartKind, PartSource},
+>>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
     },
 };
 use jmap_proto::{
@@ -23,17 +40,15 @@ use jmap_proto::{
     object::email::EmailFilter,
     request::MaybeInvalid,
 };
-use mail_parser::decoders::html::html_to_text;
 use nlp::language::{Language, search_snippet::generate_snippet, stemmer::Stemmer};
 use std::{borrow::Cow, future::Future};
 use store::{
-    ValueKey,
     backend::MAX_TOKEN_LENGTH,
-    write::{AlignedBytes, Archive},
+    search::{MAX_PLANNED_TOKENS, MAX_QUERY_LEAVES, MAX_QUERY_PLANNED_TOKENS},
 };
 use trc::AddContext;
-use types::{acl::Acl, collection::Collection, field::EmailField};
-use utils::chained_bytes::ChainedBytes;
+use types::{acl::Acl, collection::Collection};
+use utils::cheeky_hash::{CheekyHash, CheekyHashSet};
 
 pub trait EmailSearchSnippet: Sync + Send {
     fn email_search_snippet(
@@ -57,6 +72,9 @@ impl EmailSearchSnippet for Server {
         let mut filter_stack = vec![];
         let mut include_term = true;
         let mut terms = vec![];
+        let mut seen = CheekyHashSet::default();
+        let mut planned = 0usize;
+        let mut conditions = 0usize;
         let mut is_exact = false;
         let mut language = self.core.email.default_language;
 
@@ -68,23 +86,46 @@ impl EmailSearchSnippet for Server {
                     | EmailFilter::Body(text) = cond
                         && include_term
                     {
+                        conditions += 1;
+                        if conditions > MAX_QUERY_LEAVES {
+                            return Err(too_many_terms());
+                        }
                         let (text, language_) =
                             Language::detect(text, self.core.email.default_language);
                         language = language_;
                         if (text.starts_with('"') && text.ends_with('"'))
                             || (text.starts_with('\'') && text.ends_with('\''))
                         {
-                            for token in language.tokenize_text(&text, MAX_TOKEN_LENGTH) {
-                                terms.push(token.word.into_owned());
-                            }
+                            let before = terms.len();
+                            terms.extend(
+                                language
+                                    .tokenize_text(&text, MAX_TOKEN_LENGTH)
+                                    .take(MAX_PLANNED_TOKENS)
+                                    .map(|token| token.word.into_owned()),
+                            );
+                            planned += terms.len() - before;
                             is_exact = true;
                         } else {
+                            let mut condition_words = 0;
                             for token in Stemmer::new(&text, language, MAX_TOKEN_LENGTH) {
+                                if !seen.insert(CheekyHash::new(token.word.as_bytes())) {
+                                    continue;
+                                }
                                 terms.push(token.word.into_owned());
-                                if let Some(stemmed_word) = token.stemmed_word {
+                                if let Some(stemmed_word) = token.stemmed_word
+                                    && seen.insert(CheekyHash::new(stemmed_word.as_bytes()))
+                                {
                                     terms.push(stemmed_word.into_owned());
                                 }
+                                condition_words += 1;
+                                if condition_words == MAX_PLANNED_TOKENS {
+                                    break;
+                                }
                             }
+                            planned += condition_words;
+                        }
+                        if planned > MAX_QUERY_PLANNED_TOKENS {
+                            return Err(too_many_terms());
                         }
                     }
                 }
@@ -102,25 +143,31 @@ impl EmailSearchSnippet for Server {
                 }
             }
         }
+        let email_ids = request.email_ids.unwrap();
+        if email_ids.len() > self.core.jmap.snippet_max_results {
+            return Err(trc::JmapEvent::RequestTooLarge.into_err());
+        }
+
         let account_id = request.account_id.document_id();
         let cached_messages = self
             .get_cached_messages(account_id)
             .await
             .caused_by(trc::location!())?;
-        let document_ids = if access_token.is_member(account_id) {
-            cached_messages.email_document_ids()
+        let access = if access_token.is_member(account_id) {
+            MessageAccess::All
         } else {
-            cached_messages.shared_messages(access_token, Acl::ReadItems)
+            MessageAccess::Mailboxes(cached_messages.shared_mailboxes(access_token, Acl::ReadItems))
         };
 
-        let email_ids = request.email_ids.unwrap();
         let mut response = GetSearchSnippetResponse {
             account_id: request.account_id,
             list: Vec::with_capacity(email_ids.len()),
             not_found: None,
         };
         let mut not_found = Vec::new();
+        let mut batch = DocumentBatch::new(MAX_BATCH_BYTES);
 
+<<<<<<< HEAD
         if email_ids.len() > self.core.jmap.snippet_max_results {
             return Err(trc::JmapEvent::RequestTooLarge.into_err());
         }
@@ -227,73 +274,137 @@ impl EmailSearchSnippet for Server {
                     Details = "Blob not found.",
                     CausedBy = trc::location!(),
                 );
-
-                not_found.push(MaybeInvalid::Value(email_id));
-                continue;
-            };
-            let raw_message = ChainedBytes::new(metadata.raw_headers.as_ref()).with_last(
-                raw_body
-                    .get(metadata.blob_body_offset.to_native() as usize..)
-                    .unwrap_or_default(),
-            );
-
-            // Find a matching part
-            'outer: for part in contents.parts.iter() {
-                match &part.body {
-                    ArchivedMetadataPartType::Text => {
-                        let text = match part.decode_contents(&raw_message) {
-                            DecodedPartContent::Text(text) => text,
-                            _ => unreachable!(),
-                        };
-
-                        if let Some(body) = generate_snippet(&text, &terms, language, is_exact) {
-                            snippet.preview = body.into();
-                            break;
-                        }
+=======
+        for chunk in email_ids.chunks(MAX_BATCH_DOCUMENTS) {
+            batch.reset();
+            if !terms.is_empty() {
+                for email_id in chunk {
+                    if let MaybeInvalid::Value(email_id) = email_id
+                        && cached_messages
+                            .email_by_id(&email_id.document_id())
+                            .is_some_and(|message| access.allows(message))
+                    {
+                        batch.request(email_id.document_id());
                     }
-                    ArchivedMetadataPartType::Html => {
-                        let text = match part.decode_contents(&raw_message) {
-                            DecodedPartContent::Text(html) => html_to_text(&html),
-                            _ => unreachable!(),
-                        };
-
-                        if let Some(body) = generate_snippet(&text, &terms, language, is_exact) {
-                            snippet.preview = body.into();
-                            break;
-                        }
-                    }
-                    ArchivedMetadataPartType::Message(message) => {
-                        for part in metadata.contents[u16::from(message) as usize].parts.iter() {
-                            if let ArchivedMetadataPartType::Text | ArchivedMetadataPartType::Html =
-                                part.body
-                            {
-                                let text = match (part.decode_contents(&raw_message), &part.body) {
-                                    (
-                                        DecodedPartContent::Text(text),
-                                        ArchivedMetadataPartType::Text,
-                                    ) => text,
-                                    (
-                                        DecodedPartContent::Text(html),
-                                        ArchivedMetadataPartType::Html,
-                                    ) => html_to_text(&html).into(),
-                                    _ => unreachable!(),
-                                };
-
-                                if let Some(body) =
-                                    generate_snippet(&text, &terms, language, is_exact)
-                                {
-                                    snippet.preview = body.into();
-                                    break 'outer;
-                                }
-                            }
-                        }
-                    }
-                    _ => (),
                 }
             }
-            //}
 
-            response.list.push(snippet);
+            loop {
+                self.read_metadata_batch(account_id, MetadataForm::Structure, &mut batch)
+                    .await
+                    .caused_by(trc::location!())?;
+>>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+
+                for email_id in chunk {
+                    let email_id = match email_id {
+                        MaybeInvalid::Value(email_id) => *email_id,
+                        invalid => {
+                            if batch.is_first_round() {
+                                not_found.push(invalid.clone());
+                            }
+                            continue;
+                        }
+                    };
+                    let document_id = email_id.document_id();
+                    let mut snippet = SearchSnippet {
+                        email_id,
+                        subject: None,
+                        preview: None,
+                    };
+                    if !cached_messages
+                        .email_by_id(&document_id)
+                        .is_some_and(|message| access.allows(message))
+                    {
+                        if batch.is_first_round() {
+                            not_found.push(MaybeInvalid::Value(email_id));
+                        }
+                        continue;
+                    } else if terms.is_empty() {
+                        response.list.push(snippet);
+                        continue;
+                    }
+                    let structure = match batch.lookup(document_id) {
+                        Lookup::Found(structure) => structure,
+                        Lookup::Missing => {
+                            not_found.push(MaybeInvalid::Value(email_id));
+                            continue;
+                        }
+                        Lookup::Skip => continue,
+                    };
+                    let metadata = structure.unarchive().caused_by(trc::location!())?;
+                    let root = metadata.root();
+
+                    // Add subject snippet
+                    if let Some(subject) = root
+                        .envelope()
+                        .subject()
+                        .and_then(|subject| generate_snippet(subject, &terms, language, is_exact))
+                    {
+                        snippet.subject = subject.into();
+                    }
+
+                    // Download message
+                    let blob_hash = metadata.blob_hash();
+                    let Some(raw_body) = self
+                        .fetch_blob(&blob_hash, 0..usize::MAX, Some(metadata.size() as u64))
+                        .await?
+                    else {
+                        trc::event!(
+                            Store(trc::StoreEvent::NotFound),
+                            AccountId = account_id,
+                            DocumentId = email_id.document_id(),
+                            Collection = Collection::Email,
+                            BlobId = blob_hash.as_slice(),
+                            Details = "Blob not found.",
+                            CausedBy = trc::location!(),
+                        );
+
+                        not_found.push(MaybeInvalid::Value(email_id));
+                        continue;
+                    };
+                    let raw = metadata.raw_message(None, &raw_body);
+                    let source = PartSource::Raw(raw);
+
+                    // Find a matching part
+                    'outer: for part in root.parts() {
+                        match part.kind() {
+                            PartKind::Text | PartKind::Html => {
+                                if let Some(body) = part.plain_text(&source).and_then(|text| {
+                                    generate_snippet(&text, &terms, language, is_exact)
+                                }) {
+                                    snippet.preview = body.into();
+                                    break;
+                                }
+                            }
+                            PartKind::Message => {
+                                let Some(nested) = part.nested() else {
+                                    continue;
+                                };
+                                let Some(nested_source) = metadata.source(nested, raw) else {
+                                    continue;
+                                };
+                                for part in nested.parts().filter(|part| part.is_text()) {
+                                    if let Some(body) =
+                                        part.plain_text(&nested_source).and_then(|text| {
+                                            generate_snippet(&text, &terms, language, is_exact)
+                                        })
+                                    {
+                                        snippet.preview = body.into();
+                                        break 'outer;
+                                    }
+                                }
+                            }
+                            _ => (),
+                        }
+                    }
+
+                    response.list.push(snippet);
+                }
+
+                if !batch.next_round() {
+                    break;
+                }
+            }
         }
 
         if !not_found.is_empty() {
@@ -302,4 +413,11 @@ impl EmailSearchSnippet for Server {
 
         Ok(response)
     }
+}
+
+#[cold]
+fn too_many_terms() -> trc::Error {
+    trc::LimitEvent::SizeRequest
+        .into_err()
+        .details("Too many search terms in one query")
 }

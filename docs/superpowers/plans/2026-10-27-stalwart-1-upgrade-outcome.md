@@ -3297,8 +3297,152 @@ Task 7.
 
 ## Conflict ledger
 
-Filled at the real merge: each conflicted path, how it was resolved, and the hooks of this
-note it resolves.
+**The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
+`git merge --no-commit --no-ff 23b69755c` (v1.0.1) reported 134 conflicted paths, as
+predicted.
+
+**Restored.** Right after it, `git checkout HEAD -- tests/ .github/workflows/test.yml`
+restored 542 paths from the fork side, and `git diff HEAD -- tests/ .github/workflows/test.yml`
+is empty afterwards. The 542 are:
+- 520 files the merge deleted under `tests/` without a conflict;
+- the 21 modify/delete conflicts under `tests/`;
+- `.github/workflows/test.yml`, which Task 8 rewrites.
+
+`tests/` now holds 604 files: the 599 at `9a7574203`, plus `tests/qualification/`'s five.
+
+**Prediction check.** Outside `tests/`, the workflow and `docs/`, the working tree matches
+the dry merge's tree `df7eab1ff` except for conflict-marker labels
+(`git diff df7eab1ff -I '<marker lines>'` is empty). So the inventory's deleted-path list
+and its inline-test-module list stand as written.
+
+**Workspace members.** The merge also removes `tests` from the root workspace's `members`
+(see "Merge prediction"). Task 2 adds it back.
+
+**Unresolved.** 112 conflicts remain: 1 add/add, 106 content, 5 modify/delete. Each is listed below with its owner from the hook
+inventory's file groups. Resolving each is the owning task's port work, recorded here as it
+happens.
+
+**Committed as the raw merge** (Jay, 2026-10-30: "Commit now and after every task"; this
+replaces ruling 4's uncommitted state). The merge commit holds every content and add/add
+conflict with its markers in place. The five modify/delete paths outside `tests/` are kept
+as the fork's file, because each holds hooks its owner ports to the replacement; the owner
+deletes the file once they're ported. So the branch doesn't compile until the owners
+resolve their files (Task 7's gate). Every later task ends with a commit.
+
+| Path | Conflict | Owner | Resolution |
+|---|---|---|---|
+| `Cargo.lock` | content | Task 2 (regenerated) | open |
+| `Cargo.toml` | content | Task 2 | open |
+| `crates/common/Cargo.toml` | content | Task 2 | open |
+| `crates/common/src/auth/access_token.rs` | content | Task 3 | open |
+| `crates/common/src/auth/authentication.rs` | content | Task 3 | open |
+| `crates/common/src/auth/mod.rs` | content | Task 3 | open |
+| `crates/common/src/cache/directory.rs` | content | Task 3 | open |
+| `crates/common/src/cache/invalidate.rs` | content | Task 3 | open |
+| `crates/common/src/cache/principals.rs` | content | Task 3 | open |
+| `crates/common/src/config/inner.rs` | content | Task 3 | open |
+| `crates/common/src/config/telemetry.rs` | content | Task 9 (compiles in Task 3) | open |
+| `crates/common/src/expr/eval.rs` | content | Task 3 | open |
+| `crates/common/src/lib.rs` | content | Task 3 | open |
+| `crates/common/src/manager/boot.rs` | content | Task 3 | open |
+| `crates/common/src/scripts/plugins/mod.rs` | content | Task 5 | open |
+| `crates/common/src/storage/transaction.rs` | content | Task 4 | open |
+| `crates/common/src/telemetry/tracers/otel.rs` | content | Task 9 (compiles in Task 3) | open |
+| `crates/dav/Cargo.toml` | content | Task 2 | open |
+| `crates/dav/src/calendar/copy_move.rs` | content | Task 4 | open |
+| `crates/dav/src/calendar/delete.rs` | content | Task 4 | open |
+| `crates/dav/src/calendar/freebusy.rs` | content | Task 4 | open |
+| `crates/dav/src/calendar/get.rs` | content | Task 4 | open |
+| `crates/dav/src/calendar/mkcol.rs` | content | Task 4 | open |
+| `crates/dav/src/calendar/mod.rs` | content | Task 4 | open |
+| `crates/dav/src/calendar/proppatch.rs` | content | Task 4 | open |
+| `crates/dav/src/calendar/query.rs` | content | Task 4 | open |
+| `crates/dav/src/calendar/scheduling.rs` | content | Task 4 | open |
+| `crates/dav/src/calendar/update.rs` | content | Task 4 | open |
+| `crates/dav/src/common/acl.rs` | content | Task 4 | open |
+| `crates/dav/src/common/propfind.rs` | modify/delete | Task 4 | open |
+| `crates/dav/src/common/uri.rs` | content | Task 4 | open |
+| `crates/dav/src/request.rs` | content | Task 4 | open |
+| `crates/directory/src/core/secret.rs` | content | Task 3 | open |
+| `crates/email/Cargo.toml` | content | Task 2 | open |
+| `crates/email/src/message/copy.rs` | content | Task 5 | open |
+| `crates/email/src/message/index/metadata.rs` | content | Task 5 | open |
+| `crates/email/src/message/index/mod.rs` | content | Task 5 | open |
+| `crates/email/src/message/ingest.rs` | content | Task 5 | open |
+| `crates/email/src/message/mod.rs` | content | Task 5 | open |
+| `crates/email/src/sieve/ingest.rs` | content | Task 5 | open |
+| `crates/groupware/Cargo.toml` | content | Task 2 | open |
+| `crates/groupware/src/calendar/dates.rs` | content | Task 4 | open |
+| `crates/groupware/src/calendar/itip.rs` | content | Task 4 | open |
+| `crates/groupware/src/calendar/mod.rs` | content | Task 4 | open |
+| `crates/groupware/src/calendar/sequence.rs` | add/add | Task 4 (ruling 25: the fork's file becomes `sequence_floor.rs`; upstream's is taken as supplied) | open |
+| `crates/groupware/src/calendar/storage.rs` | content | Task 4 | open |
+| `crates/groupware/src/scheduling/event_cancel.rs` | content | Task 4 | open |
+| `crates/http-proto/src/request.rs` | content | Task 3 | open |
+| `crates/http/Cargo.toml` | content | Task 2 | open |
+| `crates/http/src/api/mod.rs` | content | Task 3 (shares route: Task 4) | open |
+| `crates/http/src/auth/authenticate.rs` | content | Task 3 | open |
+| `crates/http/src/auth/oauth/auth.rs` | content | Task 3 | open |
+| `crates/http/src/auth/oauth/mod.rs` | content | Task 3 | open |
+| `crates/http/src/request.rs` | content | Task 3 (upload gate: Task 5) | open |
+| `crates/imap/src/core/mailbox.rs` | content | Task 5 | open |
+| `crates/imap/src/core/message.rs` | modify/delete | Task 5 | open |
+| `crates/imap/src/core/mod.rs` | content | Task 3 (session keys) / Task 5 | open |
+| `crates/imap/src/core/session.rs` | content | Task 5 / Task 3 (issue #20 hunks) | open |
+| `crates/imap/src/op/acl.rs` | content | Task 5 | open |
+| `crates/imap/src/op/authenticate.rs` | content | Task 3 | open |
+| `crates/imap/src/op/copy_move.rs` | content | Task 5 | open |
+| `crates/imap/src/op/expunge.rs` | content | Task 5 | open |
+| `crates/imap/src/op/fetch.rs` | modify/delete | Task 5 | open |
+| `crates/imap/src/op/idle.rs` | content | Task 5 | open |
+| `crates/imap/src/op/search.rs` | content | Task 5 (search: Task 6) | open |
+| `crates/imap/src/op/store.rs` | content | Task 5 | open |
+| `crates/jmap/Cargo.toml` | content | Task 2 | open |
+| `crates/jmap/src/api/request.rs` | content | Task 5 (calendar refusal: Task 4) | open |
+| `crates/jmap/src/api/session.rs` | content | Task 6 | open |
+| `crates/jmap/src/blob/copy.rs` | content | Task 5 | open |
+| `crates/jmap/src/blob/download.rs` | content | Task 5 | open |
+| `crates/jmap/src/blob/upload.rs` | content | Task 5 | open |
+| `crates/jmap/src/calendar_event/set.rs` | content | Task 4 | open |
+| `crates/jmap/src/changes/get.rs` | content | Task 5 | open |
+| `crates/jmap/src/email/copy.rs` | content | Task 5 | open |
+| `crates/jmap/src/email/get.rs` | content | Task 5 | open |
+| `crates/jmap/src/email/import.rs` | content | Task 5 | open |
+| `crates/jmap/src/email/query.rs` | content | Task 5 (search: Task 6) | open |
+| `crates/jmap/src/email/set.rs` | content | Task 5 | open |
+| `crates/jmap/src/email/snippet.rs` | content | Task 5 | open |
+| `crates/jmap/src/file/copy.rs` | content | Task 5 | open |
+| `crates/jmap/src/file/set.rs` | content | Task 5 | open |
+| `crates/jmap/src/mailbox/set.rs` | content | Task 5 | open |
+| `crates/jmap/src/principal/get.rs` | content | Task 6 | open |
+| `crates/jmap/src/registry/mapping/spam_sample.rs` | content | Task 5 | open |
+| `crates/jmap/src/submission/set.rs` | content | Task 5 | open |
+| `crates/jmap/src/websocket/stream.rs` | content | Task 3 | open |
+| `crates/main/Cargo.toml` | content | Task 2 (identity: Task 9) | open |
+| `crates/managesieve/src/op/authenticate.rs` | content | Task 3 | open |
+| `crates/pop3/src/op/authenticate.rs` | content | Task 3 | open |
+| `crates/pop3/src/op/fetch.rs` | content | Task 5 | open |
+| `crates/services/Cargo.toml` | content | Task 2 | open |
+| `crates/services/src/task_manager/index.rs` | modify/delete | Task 6 | open |
+| `crates/services/src/task_manager/manager.rs` | content | Task 6 | open |
+| `crates/services/src/task_manager/tasks/maintenance.rs` | content | Task 6 (lease: Task 3/Task 4); renamed from `task_manager/maintenance.rs`, whose file group it is | open |
+| `crates/smtp/src/inbound/milter/client.rs` | content | Task 5 | open |
+| `crates/smtp/src/inbound/session.rs` | content | Task 3 (issue #20, R41) / Task 5 | open |
+| `crates/smtp/src/scripts/event_loop.rs` | content | Task 5 | open |
+| `crates/spam-filter/src/analysis/llm.rs` | modify/delete | Task 5 (disposition, SEL-only) | open |
+| `crates/spam-filter/src/analysis/rules.rs` | content | Task 5 | open |
+| `crates/spam-filter/src/analysis/url.rs` | content | Task 5 | open |
+| `crates/spam-filter/src/modules/classifier.rs` | content | Task 5 | open |
+| `crates/spam-filter/src/modules/dnsbl.rs` | content | Task 5 | open |
+| `crates/spam-filter/src/modules/expression.rs` | content | Task 5 | open |
+| `crates/store/src/dispatch/lookup.rs` | content | Task 2 (lease home: Task 3/Task 4) | open |
+| `crates/store/src/lib.rs` | content | Task 2 (is_read_replica consumer: Task 4) | open |
+| `crates/store/src/query/log.rs` | content | Task 4 | open |
+| `crates/store/src/search/index.rs` | content | Task 6 (`has_account_search_terms`: Task 2) | open |
+| `crates/store/src/write/batch.rs` | content | Task 6 (consumer: Task 4) | open |
+| `crates/store/src/write/mod.rs` | content | Task 6 (consumer: Task 4) | open |
+| `README.md` | content | primary (keep the fork's text) | open |
+| `SECURITY.md` | content | primary (keep the fork's text) | open |
 
 ## Expectation ledger
 

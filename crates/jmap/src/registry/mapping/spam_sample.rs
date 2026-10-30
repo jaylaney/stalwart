@@ -9,13 +9,17 @@ use crate::{
     blob::download::BlobDownload,
     registry::{
         mapping::{RegistryGetResponse, RegistryQueryResponse, RegistrySetResponse},
-        query::RegistryQueryFilters,
+        query::{RegistryQueryFilters, with_page_position},
     },
 };
+<<<<<<< HEAD
 use email::message::za::view::ZaMailView;
+=======
+use compact_str::format_compact;
+>>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 use jmap_proto::{error::set::SetError, types::state::State};
 use jmap_tools::JsonPointer;
-use mail_parser::{MessageParser, parsers::fields::thread::thread_name};
+use mail_parser::{MessageParser, thread_name};
 use registry::{
     jmap::{IntoValue, JsonPointerPatch, RegistryJsonPatch},
     schema::{
@@ -29,7 +33,7 @@ use std::str::FromStr;
 use store::{
     SerializeInfallible, ValueKey,
     registry::RegistryQuery,
-    write::{BatchBuilder, BlobLink, BlobOp, RegistryClass, ValueClass, now},
+    write::{BatchBuilder, BlobLink, BlobOp, RegistryClass, ValueClass, blob::BlobLinkValue, now},
 };
 use trc::AddContext;
 use types::{blob::BlobClass, id::Id};
@@ -82,11 +86,27 @@ pub(crate) async fn spam_sample_set(
             continue;
         }
 
+<<<<<<< HEAD
         // Mail spec 5.7, ruling R32: a sealed source never becomes a sample.
         set.server.za_refuse_raw_source(&sample.blob_id).await?;
         let Some(bytes) = set
+=======
+        if sample.blob_id.section.is_some()
+            || matches!(sample.blob_id.class, BlobClass::Embedded { .. })
+        {
+            set.response.not_created.append(
+                id,
+                SetError::invalid_properties()
+                    .with_property(Property::BlobId)
+                    .with_description("blobId must refer to a stored email message"),
+            );
+            continue;
+        }
+
+        let Some(blob) = set
+>>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
             .server
-            .blob_download(&sample.blob_id, set.access_token)
+            .blob_download_with_extra(&sample.blob_id, set.access_token)
             .await?
         else {
             set.response.not_created.append(
@@ -98,7 +118,7 @@ pub(crate) async fn spam_sample_set(
             continue;
         };
 
-        if bytes.len() > set.server.core.email.mail_max_size {
+        if blob.bytes.len() > set.server.core.email.mail_max_size {
             set.response.not_created.append(
                 id,
                 SetError::invalid_properties()
@@ -111,7 +131,7 @@ pub(crate) async fn spam_sample_set(
             continue;
         }
 
-        let Some(message) = MessageParser::new().parse(&bytes) else {
+        let Some(message) = MessageParser::new().parse(&blob.bytes) else {
             set.response.not_created.append(
                 id,
                 SetError::invalid_properties()
@@ -145,24 +165,29 @@ pub(crate) async fn spam_sample_set(
 
         // Write sample to store
         let item_id = set.server.registry().assign_id();
+        let account_id = sample
+            .account_id
+            .map(|id| id.document_id())
+            .unwrap_or(u32::MAX);
+        batch.with_account_id(account_id);
+        let blob_size = blob.bytes.len().saturating_sub(blob.extra_headers_len);
         batch
             .set(
                 BlobOp::Link {
                     hash: sample.blob_id.hash.clone(),
                     to: BlobLink::Temporary { until: expires_at },
                 },
-                ObjectId::new(ObjectType::SpamTrainingSample, item_id.into()).serialize(),
+                BlobLinkValue::new(blob_size).with_object_id(ObjectId::new(
+                    ObjectType::SpamTrainingSample,
+                    item_id.into(),
+                )),
             )
             .set(
                 ValueClass::Registry(RegistryClass::Index {
                     index_id: Property::AccountId.to_id(),
                     object_id,
                     item_id,
-                    key: sample
-                        .account_id
-                        .map(|id| id.id())
-                        .unwrap_or(u32::MAX as u64)
-                        .serialize(),
+                    key: (account_id as u64).serialize(),
                 }),
                 vec![],
             )
@@ -228,8 +253,7 @@ pub(crate) async fn spam_sample_set(
 
     if !batch.is_empty() {
         set.server
-            .store()
-            .write(batch.build_all())
+            .commit_batch(batch)
             .await
             .caused_by(trc::location!())?;
     }
@@ -308,7 +332,7 @@ pub(crate) async fn spam_sample_query(
             _ => false,
         })?;
 
-    let mut query = if let Some(account_id) = account_id {
+    let query = if let Some(account_id) = account_id {
         RegistryQuery::new(req.object_type).with_account(account_id.document_id())
     } else if !can_impersonate {
         RegistryQuery::new(req.object_type).with_account(req.request.account_id.document_id())
@@ -320,37 +344,39 @@ pub(crate) async fn spam_sample_query(
         .request
         .extract_parameters(req.server.core.jmap.query_max_results, Some(Property::Id))?;
 
-    if let Some(limit) = params.limit {
-        query = query.with_limit(limit);
-        if let Some(anchor) = params.anchor {
-            query = query.with_anchor(anchor);
-        } else if let Some(position) = params.position {
-            query = query.with_index_start(position);
-        }
-    }
-
-    let mut results = req.server.registry().query::<Vec<Id>>(query).await?;
+    let page = req
+        .server
+        .registry()
+        .query_page::<Vec<Id>>(params.paged(query))
+        .await?;
+    let position = params.page_position(page.position)?;
+    let mut results = page.ids;
 
     match params.sort_by {
         Property::Id => {
-            if !params.sort_ascending {
+            if params.needs_reversal() {
                 results.sort_unstable_by(|a, b| b.cmp(a));
             }
         }
         property => {
-            return Err(trc::JmapEvent::UnsupportedSort.into_err().details(format!(
-                "Property {} is not supported for sorting",
-                property
-            )));
+            return Err(trc::JmapEvent::UnsupportedSort
+                .into_err()
+                .details(format_compact!(
+                    "Property {} is not supported for sorting",
+                    property
+                )));
         }
     }
 
     // Build response
-    let mut response = QueryResponseBuilder::new(
-        results.len(),
-        req.server.core.jmap.query_max_results,
-        State::Initial,
-        &req.request,
+    let mut response = with_page_position(
+        QueryResponseBuilder::new(
+            results.len(),
+            req.server.core.jmap.query_max_results,
+            State::Initial,
+            &req.request,
+        ),
+        position,
     );
 
     for id in results {
