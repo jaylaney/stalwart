@@ -219,8 +219,7 @@ pub async fn test(test: &mut TestServer) {
     // cached, and the password alone no longer logs in afterwards.
     caldav(STRONG, StatusCode::MULTI_STATUS).await;
     test.server
-        .invalidate_local_caches(&[CacheInvalidation::AccessToken(id)])
-        .await;
+        .invalidate_local_caches(&[CacheInvalidation::AccessToken(id)]);
     let (registry_totp, registry_revision) = registry_state(test).await;
     assert_eq!(registry_totp, None);
     let before = test.server.za_vault_record(id).await.unwrap().unwrap();

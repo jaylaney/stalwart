@@ -139,10 +139,11 @@ pub async fn test(test: &mut TestServer) {
     let account = test.server.account(key1_id).await.unwrap();
     assert!(account.is_key_account());
     assert_eq!(
-        account.za_generation, 3,
+        account.za_generation(),
+        3,
         "pending record was revision 1, the reissue made it 2, setup made it 3"
     );
-    assert!(account.za_public_key.is_some());
+    assert!(account.za_public_key().is_some());
     // Registry: marker only, no TOTP.
     let password = registry_password(test, key1.id()).await;
     assert_eq!(password.secret, "$za$");
@@ -162,8 +163,7 @@ pub async fn test(test: &mut TestServer) {
     assert_eq!(test.server.inner.cache.za_keys.len(), 1);
     // Invalidation drops the resident keys.
     test.server
-        .invalidate_local_caches(&[CacheInvalidation::AccessToken(key1_id)])
-        .await;
+        .invalidate_local_caches(&[CacheInvalidation::AccessToken(key1_id)]);
     assert_eq!(test.server.inner.cache.za_keys.len(), 0);
     // Wrong password, and the literal marker as a password, are refused.
     for bad in ["wrong password here", "$za$"] {
@@ -182,12 +182,10 @@ pub async fn test(test: &mut TestServer) {
         .with_document(0)
         .clear(types::field::PrincipalField::ZeroAccessVault);
     test.server.store().write(batch.build_all()).await.unwrap();
-    test.server
-        .invalidate_local_caches(&[
-            CacheInvalidation::AccessToken(key1_id),
-            CacheInvalidation::Account(key1_id),
-        ])
-        .await;
+    test.server.invalidate_local_caches(&[
+        CacheInvalidation::AccessToken(key1_id),
+        CacheInvalidation::Account(key1_id),
+    ]);
     assert!(test.server.account(key1_id).await.unwrap().is_key_account());
     client
         .request("PROPFIND", "/dav/cal/key1@example.com/", "")
@@ -204,12 +202,10 @@ pub async fn test(test: &mut TestServer) {
         .za_vault_write(key1_id, &saved.record, None)
         .await
         .unwrap();
-    test.server
-        .invalidate_local_caches(&[
-            CacheInvalidation::AccessToken(key1_id),
-            CacheInvalidation::Account(key1_id),
-        ])
-        .await;
+    test.server.invalidate_local_caches(&[
+        CacheInvalidation::AccessToken(key1_id),
+        CacheInvalidation::Account(key1_id),
+    ]);
     client
         .request("PROPFIND", "/dav/cal/key1@example.com/", "")
         .await

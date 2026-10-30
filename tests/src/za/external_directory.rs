@@ -35,7 +35,11 @@
 
 use super::{STRONG, user_permissions};
 use crate::utils::{account::Account, server::TestServer};
-use common::{BuildServer, Server, auth::AuthRequest, network::RcptResolution};
+use common::{
+    BuildServer, Server,
+    auth::{AuthRequest, authentication::Authenticated},
+    network::RcptResolution,
+};
 use registry::schema::{
     prelude::{ObjectType, Property},
     structs::{self, Authentication, SqlAuthStore, SqlDirectory},
@@ -181,7 +185,8 @@ async fn positive_control(server: &Server, sql: &Store) -> Id {
     let token = server
         .authenticate(&request(PLAIN, PLAIN_DIRECTORY_SECRET))
         .await
-        .unwrap_or_else(|err| panic!("the directory's account did not log in: {err:?}"));
+        .unwrap_or_else(|err| panic!("the directory's account did not log in: {err:?}"))
+        .access_token;
     assert_eq!(
         lookups(sql).await,
         [("login", PLAIN)],
@@ -276,7 +281,8 @@ async fn sync_paths(
             recovery.secret(),
         ))
         .await
-        .unwrap_or_else(|err| panic!("the impersonation failed: {err:?}"));
+        .unwrap_or_else(|err| panic!("the impersonation failed: {err:?}"))
+        .access_token;
     assert_eq!(Id::from(token.account_id()), key_id);
     assert!(token.za_is_impersonated());
     assert!(token.session_keys().is_none());
@@ -307,7 +313,13 @@ async fn marker_survives(server: &Server, sql: &Store, key_id: Id) {
         user.password_credential().map(|c| c.secret.as_str()),
         Some(ZA_MARKER)
     );
-    let (token, keys) = server
+    let (
+        Authenticated {
+            access_token: token,
+            ..
+        },
+        keys,
+    ) = server
         .authenticate_with_keys(&request(KEY, STRONG))
         .await
         .unwrap_or_else(|err| panic!("the vault password did not log in: {err:?}"));
@@ -331,9 +343,9 @@ async fn marker_survives(server: &Server, sql: &Store, key_id: Id) {
 
 async fn assert_refused(server: &Server, name: &str, secret: &str) {
     match server.authenticate(&request(name, secret)).await {
-        Ok(token) => panic!(
+        Ok(authenticated) => panic!(
             "{name} authenticated through the directory as account {}",
-            token.account_id()
+            authenticated.access_token.account_id()
         ),
         Err(err) => {
             assert!(

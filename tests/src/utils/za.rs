@@ -305,15 +305,16 @@ pub async fn caldav_from(fail_ip: &str, name: &str, secret: &str, status: Status
 }
 
 pub fn assert_nothing_cached(test: &TestServer, account_id: u32) {
+    // 1.0's `HttpAuthEntries` has no iterator; `retain` visits every entry.
+    let cached = std::sync::atomic::AtomicBool::new(false);
+    test.server.inner.cache.http_auth.retain(|entry| {
+        if entry.account_id == account_id {
+            cached.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        true
+    });
     assert!(
-        !test
-            .server
-            .inner
-            .cache
-            .http_auth
-            .inner()
-            .iter()
-            .any(|(_, v)| v.account_id == account_id),
+        !cached.into_inner(),
         "no cached authentication for the account"
     );
     assert!(
@@ -1099,9 +1100,82 @@ pub async fn za_app_password(name: &str, password: &str, description: &str) -> S
     .str(200, "app_password")
 }
 
+/// An OAuth grant of `name` restricted to `scopes`, for a third-party
+/// (`Registered`) client, and an access token bound to it, minted
+/// in-process with the server's own helpers. 1.0 binds every access token
+/// to a grant and resolves only registered, stateless or metadata-document
+/// clients, so the 0.16 HTTP flow of `bearer_token` no longer applies; the
+/// caller revokes the grant (`GrantDeletion`) when it is done. Returns the
+/// grant id and the token.
+pub async fn za_grant_token(
+    server: &common::Server,
+    name: &str,
+    scopes: common::auth::oauth::scope::OAuthScopes,
+) -> (u64, String) {
+    let account_id = server
+        .account_id_from_email(name, false)
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("no account {name}"));
+    let grant_id = server
+        .create_oauth_grant(common::auth::oauth::grant::NewOAuthGrant {
+            account_id,
+            client_id: "za-test-client",
+            client_name: None,
+            client_kind: registry::schema::enums::OAuthClientKind::Registered,
+            scopes,
+            remote_ip: std::net::IpAddr::from([127, 0, 0, 1]),
+        })
+        .await
+        .unwrap();
+    let credential_version = server
+        .access_token(account_id)
+        .await
+        .unwrap()
+        .credential_version();
+    let token = server
+        .encode_grant_access_token(account_id, name, grant_id, credential_version)
+        .unwrap();
+    (grant_id, token)
+}
+
+/// Deletes the grant `za_grant_token` created and applies its invalidation
+/// (1.0's `GrantRevocations::evict`).
+pub async fn za_revoke_grant(server: &common::Server, grant_id: u64) {
+    let stored = server
+        .oauth_grant(grant_id)
+        .await
+        .unwrap()
+        .expect("the grant exists");
+    let mut invalidator = common::cache::invalidate::CacheInvalidationBuilder::default();
+    assert!(
+        server
+            .delete_oauth_grant(
+                stored,
+                common::auth::oauth::grant::GrantDeletion::Unconditional,
+                &mut invalidator,
+            )
+            .await
+            .unwrap()
+    );
+    server.invalidate_caches(invalidator).await.unwrap();
+}
+
+/// An OAuth access token of `name` with every scope (`za_grant_token`). The
+/// token holds no keys.
+pub async fn za_bearer_token(server: &common::Server, name: &str) -> String {
+    za_grant_token(server, name, common::auth::oauth::scope::OAuthScopes::ALL)
+        .await
+        .1
+}
+
 /// An OAuth access token of `name`, through the server's own flow: an
 /// authorization code from `/api/auth`, exchanged at `/auth/token` (the
 /// suite requires no client registration). The token holds no keys.
+///
+/// This is 0.16's login request; 1.0's takes an authorization `query` and a
+/// resolvable client. Its callers move to `za_bearer_token` (Task 3b moved
+/// `mail::login`; the mail modules' calls are Task 5's).
 pub async fn bearer_token(name: &str, password: &str) -> String {
     const CLIENT_ID: &str = "za-bearer-test";
     const REDIRECT_URI: &str = "https://client.example.com/callback";

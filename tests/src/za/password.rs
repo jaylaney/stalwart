@@ -194,8 +194,7 @@ pub async fn test(test: &mut TestServer) {
     // Paused verification across a password change: the login verified the
     // old password before the change and succeeds, but nothing is cached.
     test.server
-        .invalidate_local_caches(&[CacheInvalidation::AccessToken(id)])
-        .await;
+        .invalidate_local_caches(&[CacheInvalidation::AccessToken(id)]);
     let parked = park_login(id, name, STRONG2).await;
     za_post(
         "password",
@@ -320,8 +319,7 @@ pub async fn test(test: &mut TestServer) {
     // Paused verification across a recovery: the login verified the old
     // password before the recovery and succeeds, but nothing is cached.
     test.server
-        .invalidate_local_caches(&[CacheInvalidation::AccessToken(id)])
-        .await;
+        .invalidate_local_caches(&[CacheInvalidation::AccessToken(id)]);
     let parked = park_login(id, name, STRONG2).await;
     recovery = za_post(
         "recover",
