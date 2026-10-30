@@ -124,3 +124,7 @@ impl Optimizer for Sgd {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/nlp/src/classifier/sgd/tests.rs"]
 pub mod tests;
+
+#[cfg(test)]
+#[path = "sgd_restored_tests.rs"]
+pub mod tests;

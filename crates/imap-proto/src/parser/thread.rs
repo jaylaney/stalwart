@@ -70,3 +70,7 @@ impl Algorithm {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/imap-proto/src/parser/thread/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "thread_restored_tests.rs"]
+mod tests;

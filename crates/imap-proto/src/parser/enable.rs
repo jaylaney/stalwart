@@ -51,3 +51,7 @@ impl Capability {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/imap-proto/src/parser/enable/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "enable_restored_tests.rs"]
+mod tests;

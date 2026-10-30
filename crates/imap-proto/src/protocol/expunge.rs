@@ -127,3 +127,7 @@ impl VanishedFilter {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/imap-proto/src/protocol/expunge/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "expunge_restored_tests.rs"]
+mod tests;

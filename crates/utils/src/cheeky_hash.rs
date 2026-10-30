@@ -125,3 +125,7 @@ impl Debug for CheekyHash {
 #[rustfmt::skip]
 #[path = "../../../../stalwart-tests/unit/utils/src/cheeky_hash/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "cheeky_hash_restored_tests.rs"]
+mod tests;

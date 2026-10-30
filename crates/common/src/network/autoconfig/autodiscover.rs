@@ -302,3 +302,7 @@ fn parse_autodiscover_request(bytes: &[u8]) -> Result<AutodiscoverRequest, Strin
 #[rustfmt::skip]
 #[path = "../../../../../../stalwart-tests/unit/common/src/network/autoconfig/autodiscover/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "autodiscover_restored_tests.rs"]
+mod tests;

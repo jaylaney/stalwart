@@ -104,3 +104,7 @@ fn take_string(bytes: &mut &[u8]) -> Option<String> {
 #[rustfmt::skip]
 #[path = "../../../../../../stalwart-tests/unit/common/src/auth/oauth/client_id/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "client_id_restored_tests.rs"]
+mod tests;

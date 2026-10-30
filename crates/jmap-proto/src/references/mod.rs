@@ -95,3 +95,7 @@ fn topological_sort<T>(
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/jmap-proto/src/references/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "restored_tests.rs"]
+mod tests;

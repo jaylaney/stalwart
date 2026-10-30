@@ -15,3 +15,7 @@ static SERVER_GREETING: &str = "Stalwart ManageSieve at your service.";
 #[rustfmt::skip]
 #[path = "../../../../stalwart-tests/unit/managesieve/src/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "restored_tests.rs"]
+mod tests;

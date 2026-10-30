@@ -342,3 +342,7 @@ impl BitPacker for BitBlockPacker {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/store/src/write/bitpack/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "bitpack_restored_tests.rs"]
+mod tests;

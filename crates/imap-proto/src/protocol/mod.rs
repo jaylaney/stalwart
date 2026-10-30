@@ -1045,3 +1045,7 @@ impl Display for Command {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/imap-proto/src/protocol/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "restored_tests.rs"]
+mod tests;

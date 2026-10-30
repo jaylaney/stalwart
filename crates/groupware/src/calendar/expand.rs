@@ -793,3 +793,7 @@ pub fn resolve_local_zoned(tz: Tz, naive_secs: i64) -> Option<ZonedDateTime> {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/groupware/src/calendar/expand/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "expand_restored_tests.rs"]
+mod tests;

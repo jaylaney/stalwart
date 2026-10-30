@@ -131,3 +131,7 @@ pub static STEMMER_MAP: &[Option<Algorithm>] = &[
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/nlp/src/language/stemmer/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "stemmer_restored_tests.rs"]
+mod tests;

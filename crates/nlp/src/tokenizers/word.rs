@@ -189,3 +189,7 @@ impl<'x> Iterator for WordTokenizer<'x> {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/nlp/src/tokenizers/word/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "word_restored_tests.rs"]
+mod tests;

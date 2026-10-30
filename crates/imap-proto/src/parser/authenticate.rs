@@ -59,3 +59,7 @@ impl Mechanism {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/imap-proto/src/parser/authenticate/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "authenticate_restored_tests.rs"]
+mod tests;

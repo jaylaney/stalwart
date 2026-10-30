@@ -514,3 +514,7 @@ fn email_push_error(description: &'static str) -> SetError<PushSubscriptionPrope
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/jmap/src/push/set/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "set_restored_tests.rs"]
+mod tests;

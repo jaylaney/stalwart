@@ -563,3 +563,7 @@ fn challenge_zone<'x>(zone: &'x str, domain: &'x str) -> &'x str {
 #[rustfmt::skip]
 #[path = "../../../../../../stalwart-tests/unit/common/src/network/acme/order/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "order_restored_tests.rs"]
+mod tests;

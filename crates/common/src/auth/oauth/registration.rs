@@ -562,3 +562,7 @@ pub fn validate_grant_metadata(
 #[rustfmt::skip]
 #[path = "../../../../../../stalwart-tests/unit/common/src/auth/oauth/registration/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "registration_restored_tests.rs"]
+mod tests;

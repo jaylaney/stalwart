@@ -330,3 +330,7 @@ fn seconds_since_oauth_epoch() -> u64 {
 #[rustfmt::skip]
 #[path = "../../../../../../stalwart-tests/unit/common/src/auth/oauth/token/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "token_restored_tests.rs"]
+mod tests;

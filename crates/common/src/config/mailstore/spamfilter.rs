@@ -851,3 +851,7 @@ impl<T> SpamFilterAction<T> {
 #[rustfmt::skip]
 #[path = "../../../../../../stalwart-tests/unit/common/src/config/mailstore/spamfilter/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "spamfilter_restored_tests.rs"]
+mod tests;

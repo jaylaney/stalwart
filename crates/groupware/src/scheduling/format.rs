@@ -432,3 +432,7 @@ pub fn hyperlink(value: &str) -> Option<&str> {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/groupware/src/scheduling/format/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "format_restored_tests.rs"]
+mod tests;

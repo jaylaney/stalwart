@@ -505,3 +505,7 @@ fn sanitize_or_lower(rcpt: &str) -> String {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/smtp/src/inbound/dkim/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "dkim_restored_tests.rs"]
+mod tests;

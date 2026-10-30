@@ -20,10 +20,7 @@ pub struct MultiStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct Response {
     pub href: Href,
     pub typ: ResponseType,
@@ -33,10 +30,7 @@ pub struct Response {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub enum ResponseType {
     PropStat(List<PropStat>),
     Status { href: List<Href>, status: Status },
@@ -47,18 +41,12 @@ pub enum ResponseType {
 pub struct Status(pub StatusCode);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 #[repr(transparent)]
 pub struct Location(pub Href);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 #[repr(transparent)]
 pub struct ResponseDescription(pub String);
 
@@ -66,18 +54,12 @@ pub struct ResponseDescription(pub String);
 pub struct SyncToken(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 #[repr(transparent)]
 pub struct Href(pub String);
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 #[repr(transparent)]
 pub struct List<T: Display>(pub Vec<T>);
 
@@ -88,10 +70,7 @@ pub struct MkColResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct PropStat {
     pub prop: Prop,
     pub status: Status,
@@ -100,10 +79,7 @@ pub struct PropStat {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 #[repr(transparent)]
 pub struct Prop(pub List<DavPropertyValue>);
 
@@ -125,10 +101,7 @@ pub struct ScheduleResponseItem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct SupportedPrivilege {
     pub privilege: Privilege,
     pub abstract_: bool,
@@ -137,10 +110,7 @@ pub struct SupportedPrivilege {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct Ace {
     pub principal: Principal,
     pub invert: bool,
@@ -150,20 +120,14 @@ pub struct Ace {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub enum GrantDeny {
     Grant(List<Privilege>),
     Deny(List<Privilege>),
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub enum Principal {
     Href(Href),
     Response(Response),
@@ -176,10 +140,7 @@ pub enum Principal {
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct AclRestrictions {
     pub grant_only: bool,
     pub no_invert: bool,
@@ -188,10 +149,7 @@ pub struct AclRestrictions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub enum RequiredPrincipal {
     All,
     Authenticated,
@@ -202,20 +160,14 @@ pub enum RequiredPrincipal {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct PrincipalSearchPropertySet {
     pub namespaces: Namespaces,
     pub properties: List<PrincipalSearchProperty>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct PrincipalSearchProperty {
     pub name: DavProperty,
     pub description: String,
@@ -227,10 +179,7 @@ pub struct ErrorResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub enum Condition {
     Base(BaseCondition),
     Cal(CalCondition),
@@ -238,10 +187,7 @@ pub enum Condition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub enum BaseCondition {
     NoConflictingLock(List<Href>),
     LockTokenSubmitted(List<Href>),
@@ -271,20 +217,14 @@ pub enum BaseCondition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct Resource {
     pub href: Href,
     pub privilege: Privilege,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub enum CalCondition {
     CalendarCollectionLocationOk,
     ValidCalendarData,
@@ -313,10 +253,7 @@ pub enum CalCondition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub enum CardCondition {
     SupportedAddressData,
     SupportedAddressDataConversion,
@@ -455,4 +392,8 @@ impl Condition {
 #[cfg(all(test, stalwart_tests))]
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/dav-proto/src/schema/response/serde_impl.rs"]
+mod serde_impl;
+
+#[cfg(test)]
+#[path = "response_restored_tests.rs"]
 mod serde_impl;

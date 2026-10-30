@@ -560,3 +560,7 @@ impl<'de> Deserialize<'de> for Call<RequestMethod<'de>> {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/jmap-proto/src/request/parser/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "parser_restored_tests.rs"]
+mod tests;

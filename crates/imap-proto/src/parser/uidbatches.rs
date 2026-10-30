@@ -68,3 +68,7 @@ impl Request<Command> {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/imap-proto/src/parser/uidbatches/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "uidbatches_restored_tests.rs"]
+mod tests;

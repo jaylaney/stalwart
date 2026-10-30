@@ -325,3 +325,7 @@ impl Mechanism {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/pop3/src/protocol/request/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "request_restored_tests.rs"]
+mod tests;

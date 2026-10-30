@@ -197,3 +197,7 @@ fn secret_key_from_explicit_params(pem: &str) -> Option<SecretKey> {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/common/src/network/webpush/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "webpush_restored_tests.rs"]
+mod tests;

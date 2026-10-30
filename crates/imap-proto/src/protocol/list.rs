@@ -364,3 +364,7 @@ impl ImapResponse for Response {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/imap-proto/src/protocol/list/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "list_restored_tests.rs"]
+mod tests;

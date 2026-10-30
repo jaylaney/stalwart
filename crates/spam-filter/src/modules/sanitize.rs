@@ -110,3 +110,7 @@ impl Email {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/spam-filter/src/modules/sanitize/test.rs"]
 mod test;
+
+#[cfg(test)]
+#[path = "sanitize_restored_tests.rs"]
+mod test;

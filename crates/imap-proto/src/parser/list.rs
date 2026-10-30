@@ -226,3 +226,7 @@ impl ReturnOption {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/imap-proto/src/parser/list/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "list_restored_tests.rs"]
+mod tests;

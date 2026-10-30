@@ -668,3 +668,7 @@ impl<T: PartialEq> PushUnique<T> for Vec<T> {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/imap-proto/src/parser/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "restored_tests.rs"]
+mod tests;

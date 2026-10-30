@@ -97,3 +97,7 @@ where
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/nlp/src/tokenizers/chinese/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "chinese_restored_tests.rs"]
+mod tests;

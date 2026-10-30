@@ -526,3 +526,7 @@ fn is_claim_missing(claims: &Value, claim: Option<&str>) -> bool {
 #[rustfmt::skip]
 #[path = "../../../../../../stalwart-tests/unit/directory/src/backend/oidc/lookup/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "lookup_restored_tests.rs"]
+mod tests;

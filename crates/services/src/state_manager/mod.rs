@@ -102,3 +102,7 @@ fn merge_state(states: &mut VecMap<DataType, State>, data_type: DataType, change
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/services/src/state_manager/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "restored_tests.rs"]
+mod tests;

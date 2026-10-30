@@ -426,3 +426,7 @@ fn try_unwrap_coded_url(url: &str) -> &str {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/dav-proto/src/parser/header/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "header_restored_tests.rs"]
+mod tests;

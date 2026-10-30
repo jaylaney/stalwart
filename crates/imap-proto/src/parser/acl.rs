@@ -122,3 +122,7 @@ impl ModRights {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/imap-proto/src/parser/acl/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "acl_restored_tests.rs"]
+mod tests;

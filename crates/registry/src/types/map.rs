@@ -422,3 +422,7 @@ impl<T: MapItem> IntoIterator for Map<T> {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/registry/src/types/map/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "map_restored_tests.rs"]
+mod tests;

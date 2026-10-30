@@ -42,3 +42,7 @@ impl Request<Command> {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/imap-proto/src/parser/lsub/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "lsub_restored_tests.rs"]
+mod tests;

@@ -9,10 +9,7 @@ use std::{borrow::Cow, convert::identity};
 use types::collation::unicode_casemap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub enum Collation {
     AsciiCasemap,
     Octet,
@@ -20,10 +17,7 @@ pub enum Collation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub enum MatchType {
     Equals,
     Contains,

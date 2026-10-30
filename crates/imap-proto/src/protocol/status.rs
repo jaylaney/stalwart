@@ -87,3 +87,7 @@ impl StatusItem {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/imap-proto/src/protocol/status/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "status_restored_tests.rs"]
+mod tests;

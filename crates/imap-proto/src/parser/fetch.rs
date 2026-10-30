@@ -538,3 +538,7 @@ impl Section {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/imap-proto/src/parser/fetch/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "fetch_restored_tests.rs"]
+mod tests;

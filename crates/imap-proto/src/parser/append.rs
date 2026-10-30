@@ -144,3 +144,7 @@ impl Request<Command> {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/imap-proto/src/parser/append/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "append_restored_tests.rs"]
+mod tests;

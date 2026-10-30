@@ -154,3 +154,7 @@ pub struct Help {
 #[rustfmt::skip]
 #[path = "../../../../../../stalwart-tests/unit/common/src/network/autoconfig/pacc/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "pacc_restored_tests.rs"]
+mod tests;

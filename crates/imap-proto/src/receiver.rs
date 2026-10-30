@@ -945,3 +945,7 @@ DQUOTE         =  %x22 ; " (Double Quote)
 #[rustfmt::skip]
 #[path = "../../../../stalwart-tests/unit/imap-proto/src/receiver/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "receiver_restored_tests.rs"]
+mod tests;

@@ -33,3 +33,7 @@ impl Request<Command> {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/imap-proto/src/parser/delete/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "delete_restored_tests.rs"]
+mod tests;

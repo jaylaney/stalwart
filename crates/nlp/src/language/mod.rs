@@ -258,3 +258,7 @@ impl Language {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/nlp/src/language/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "restored_tests.rs"]
+mod tests;

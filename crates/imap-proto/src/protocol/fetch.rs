@@ -490,3 +490,7 @@ impl FetchItem<'_> {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/imap-proto/src/protocol/fetch/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "fetch_restored_tests.rs"]
+mod tests;

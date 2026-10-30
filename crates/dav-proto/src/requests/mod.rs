@@ -16,3 +16,7 @@ pub mod report;
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/dav-proto/src/requests/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "restored_tests.rs"]
+mod tests;

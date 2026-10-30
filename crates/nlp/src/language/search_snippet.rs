@@ -249,3 +249,7 @@ impl SnippetWriter<'_> {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/nlp/src/language/search_snippet/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "search_snippet_restored_tests.rs"]
+mod tests;

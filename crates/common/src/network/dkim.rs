@@ -232,3 +232,7 @@ fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/common/src/network/dkim/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "dkim_restored_tests.rs"]
+mod tests;

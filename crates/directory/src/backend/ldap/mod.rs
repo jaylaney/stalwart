@@ -142,3 +142,7 @@ impl Bind {
 #[rustfmt::skip]
 #[path = "../../../../../../stalwart-tests/unit/directory/src/backend/ldap/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "restored_tests.rs"]
+mod tests;

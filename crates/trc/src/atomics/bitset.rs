@@ -78,3 +78,7 @@ impl<const N: usize> AtomicBitset<N> {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/trc/src/atomics/bitset/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "bitset_restored_tests.rs"]
+mod tests;

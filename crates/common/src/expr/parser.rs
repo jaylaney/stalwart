@@ -250,7 +250,7 @@ impl ExpressionParser {
             if let ExpressionItem::JmpIf { pos, .. } = &mut self.output[jmp_pos] {
                 *pos = (cur_pos - jmp_pos) as u32;
             } else {
-                #[cfg(all(test, stalwart_tests))]
+                #[cfg(test)]
                 panic!("Invalid jump position");
             }
         }

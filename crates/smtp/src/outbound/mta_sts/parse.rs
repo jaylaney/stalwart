@@ -87,3 +87,7 @@ impl ParsePolicy for Policy {
 #[rustfmt::skip]
 #[path = "../../../../../../stalwart-tests/unit/smtp/src/outbound/mta_sts/parse/test.rs"]
 mod test;
+
+#[cfg(test)]
+#[path = "parse_restored_tests.rs"]
+mod test;

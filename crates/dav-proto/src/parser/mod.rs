@@ -156,7 +156,7 @@ impl<'x> RawElement<'x> {
     }
 }
 
-#[cfg(all(test, stalwart_tests))]
+#[cfg(test)]
 impl PartialEq for Token<'_> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {

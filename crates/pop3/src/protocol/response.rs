@@ -292,3 +292,7 @@ fn serialize_err(code: &[u8], message: &str) -> Vec<u8> {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/pop3/src/protocol/response/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "response_restored_tests.rs"]
+mod tests;

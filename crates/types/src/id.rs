@@ -185,3 +185,7 @@ impl<'x, P: Property, E: Element + From<Id>> From<Id> for Value<'x, P, E> {
 #[rustfmt::skip]
 #[path = "../../../../stalwart-tests/unit/types/src/id/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "id_restored_tests.rs"]
+mod tests;

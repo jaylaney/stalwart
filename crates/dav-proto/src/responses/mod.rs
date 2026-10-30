@@ -171,3 +171,7 @@ impl Display for SupportedCollation {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/dav-proto/src/responses/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "restored_tests.rs"]
+mod tests;

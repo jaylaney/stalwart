@@ -190,3 +190,7 @@ impl From<Lang> for Language {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/nlp/src/language/detect/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "detect_restored_tests.rs"]
+mod tests;

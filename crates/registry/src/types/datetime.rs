@@ -293,3 +293,7 @@ impl IntoValue for UTCDateTime {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/registry/src/types/datetime/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "datetime_restored_tests.rs"]
+mod tests;

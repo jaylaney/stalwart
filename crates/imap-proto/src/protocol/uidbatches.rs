@@ -40,3 +40,7 @@ impl Response {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/imap-proto/src/protocol/uidbatches/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "uidbatches_restored_tests.rs"]
+mod tests;

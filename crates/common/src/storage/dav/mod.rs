@@ -285,3 +285,7 @@ fn is_pchar(byte: u8) -> bool {
 #[rustfmt::skip]
 #[path = "../../../../../../stalwart-tests/unit/common/src/storage/dav/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "restored_tests.rs"]
+mod tests;

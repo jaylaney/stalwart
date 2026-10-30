@@ -213,3 +213,7 @@ impl Exists {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/imap-proto/src/protocol/select/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "select_restored_tests.rs"]
+mod tests;

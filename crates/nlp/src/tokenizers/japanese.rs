@@ -321,3 +321,7 @@ static UW6: LazyLock<AHashMap<char, i32>> = LazyLock::new(|| {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/nlp/src/tokenizers/japanese/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "japanese_restored_tests.rs"]
+mod tests;

@@ -14,6 +14,12 @@ pub mod parser;
 pub mod protocol;
 pub mod receiver;
 
+// Zero-access fork (upgrade Task 2): 0.16's `utf7` codec moved to the external
+// `encodify` crate. Its tests keep their 0.16 module path.
+#[cfg(test)]
+#[path = "utf7_restored_tests.rs"]
+mod utf7;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Command {
     // Client Commands - Any State

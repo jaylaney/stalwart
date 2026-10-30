@@ -242,3 +242,7 @@ impl<T: Eq + Hash, V: AsRef<str>> Default for Variables<T, V> {
 #[rustfmt::skip]
 #[path = "../../../../stalwart-tests/unit/utils/src/template/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "template_restored_tests.rs"]
+mod tests;

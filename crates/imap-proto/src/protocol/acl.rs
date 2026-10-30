@@ -199,3 +199,7 @@ impl Display for Rights {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/imap-proto/src/protocol/acl/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "acl_restored_tests.rs"]
+mod tests;

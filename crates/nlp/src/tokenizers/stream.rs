@@ -77,3 +77,7 @@ impl WordStemTokenizer {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/nlp/src/tokenizers/stream/tests.rs"]
 pub mod tests;
+
+#[cfg(test)]
+#[path = "stream_restored_tests.rs"]
+pub mod tests;

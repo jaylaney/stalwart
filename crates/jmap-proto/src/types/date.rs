@@ -311,3 +311,7 @@ impl From<u64> for UTCDate {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/jmap-proto/src/types/date/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "date_restored_tests.rs"]
+mod tests;

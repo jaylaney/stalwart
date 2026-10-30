@@ -360,3 +360,7 @@ fn archived_condition_to_value(
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/jmap/src/push/get/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "get_restored_tests.rs"]
+mod tests;

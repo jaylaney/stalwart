@@ -956,3 +956,7 @@ pub(crate) fn is_invisible(ch: char) -> bool {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/spam-filter/src/modules/html/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "html_restored_tests.rs"]
+mod tests;

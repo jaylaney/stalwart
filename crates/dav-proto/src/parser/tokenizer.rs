@@ -357,3 +357,7 @@ impl From<AttrError> for Error {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/dav-proto/src/parser/tokenizer/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tokenizer_restored_tests.rs"]
+mod tests;

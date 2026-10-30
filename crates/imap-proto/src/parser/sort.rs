@@ -113,3 +113,7 @@ impl Sort {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/imap-proto/src/parser/sort/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "sort_restored_tests.rs"]
+mod tests;

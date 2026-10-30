@@ -766,6 +766,10 @@ impl<K: Eq + Hash + CacheItemWeight, V: Clone + CacheItemWeight> ResolverCache<K
 #[path = "../../../../stalwart-tests/unit/utils/src/cache/tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "cache_restored_tests.rs"]
+mod tests;
+
 #[cfg(stalwart_tests)]
 #[rustfmt::skip]
 #[path = "../../../../stalwart-tests/unit/utils/src/cache/test_support.rs"]

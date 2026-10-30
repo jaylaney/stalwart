@@ -273,3 +273,7 @@ impl EcKeyCurve {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/common/src/config/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "restored_tests.rs"]
+mod tests;

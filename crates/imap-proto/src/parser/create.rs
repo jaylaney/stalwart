@@ -94,3 +94,7 @@ impl Attribute {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/imap-proto/src/parser/create/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "create_restored_tests.rs"]
+mod tests;

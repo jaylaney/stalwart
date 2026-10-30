@@ -142,3 +142,7 @@ pub(crate) fn split_filters(filters_in: Vec<SearchFilter>) -> Option<Vec<SplitFi
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/store/src/search/split/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "split_restored_tests.rs"]
+mod tests;

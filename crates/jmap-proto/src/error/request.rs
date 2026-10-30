@@ -380,3 +380,7 @@ impl Display for RequestError<'_> {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/jmap-proto/src/error/request/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "request_restored_tests.rs"]
+mod tests;

@@ -810,3 +810,7 @@ fn oauth_client_id_meta(client_id: &str) -> String {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/common/src/manager/application/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "application_restored_tests.rs"]
+mod tests;

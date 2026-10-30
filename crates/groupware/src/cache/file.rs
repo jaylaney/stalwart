@@ -199,3 +199,7 @@ pub fn push_file(builder: &mut ResourceChunkBuilder, node: &ArchivedFileNode, do
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/groupware/src/cache/file/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "file_restored_tests.rs"]
+mod tests;

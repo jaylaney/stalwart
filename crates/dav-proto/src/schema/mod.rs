@@ -14,20 +14,14 @@ pub mod response;
 pub use collation::{Collation, MatchType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct NamedElement {
     pub ns: Namespace,
     pub element: Element,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 #[repr(u8)]
 pub enum Namespace {
     Dav,
@@ -37,10 +31,7 @@ pub enum Namespace {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct Namespaces {
     pub(crate) cal: bool,
     pub(crate) card: bool,
@@ -99,10 +90,7 @@ impl AsRef<str> for Namespace {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub enum Element {
     Abstract,
     Ace,

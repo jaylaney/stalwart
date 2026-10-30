@@ -177,3 +177,7 @@ impl fmt::Display for State {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/jmap-proto/src/types/state/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "state_restored_tests.rs"]
+mod tests;

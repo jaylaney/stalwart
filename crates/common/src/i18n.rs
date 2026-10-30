@@ -33,3 +33,7 @@ pub fn locale_or_default(name: &str) -> &'static Locale {
 #[rustfmt::skip]
 #[path = "../../../../stalwart-tests/unit/common/src/i18n/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "i18n_restored_tests.rs"]
+mod tests;

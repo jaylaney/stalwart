@@ -290,3 +290,7 @@ impl IntoValue for IpAddrOrMask {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/registry/src/types/ipmask/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ipmask_restored_tests.rs"]
+mod tests;

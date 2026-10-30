@@ -560,3 +560,7 @@ impl ResultOption {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/imap-proto/src/parser/search/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "search_restored_tests.rs"]
+mod tests;

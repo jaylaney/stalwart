@@ -35,14 +35,14 @@ const XMLNS_PREFIX: &str = "xmlns";
 const GENERATED_PREFIX: &str = "a";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-#[cfg_attr(stalwart_tests, derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "test_mode", derive(serde::Serialize, serde::Deserialize))]
 pub struct XmlName<'x> {
     pub namespace: Option<Cow<'x, str>>,
     pub name: Cow<'x, str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-#[cfg_attr(stalwart_tests, derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "test_mode", derive(serde::Serialize, serde::Deserialize))]
 pub struct XmlValue<'x> {
     pub lang: Option<Cow<'x, str>>,
     pub attributes: Vec<XmlAttribute<'x>>,
@@ -50,7 +50,7 @@ pub struct XmlValue<'x> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(stalwart_tests, derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "test_mode", derive(serde::Serialize, serde::Deserialize))]
 pub struct XmlElement<'x> {
     pub name: XmlName<'x>,
     pub prefix: Option<Cow<'x, str>>,
@@ -59,14 +59,14 @@ pub struct XmlElement<'x> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(stalwart_tests, derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "test_mode", derive(serde::Serialize, serde::Deserialize))]
 pub struct XmlAttribute<'x> {
     pub name: XmlName<'x>,
     pub value: Cow<'x, str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(stalwart_tests, derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "test_mode", derive(serde::Serialize, serde::Deserialize))]
 pub enum XmlNode<'x> {
     Text(Cow<'x, str>),
     Element(XmlElement<'x>),

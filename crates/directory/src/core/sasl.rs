@@ -113,3 +113,7 @@ fn extract_email_from_jwt(token: &str) -> Option<String> {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/directory/src/core/sasl/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "sasl_restored_tests.rs"]
+mod tests;

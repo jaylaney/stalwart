@@ -302,3 +302,7 @@ fn lookup_key(key: &str) -> Cow<'_, str> {
 #[rustfmt::skip]
 #[path = "../../../../../../stalwart-tests/unit/store/src/backend/http/lookup/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "lookup_restored_tests.rs"]
+mod tests;

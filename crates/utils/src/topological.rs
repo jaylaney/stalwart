@@ -85,3 +85,7 @@ impl<T: Copy + Eq + Hash> TopologicalSortIterator<T> {
 #[rustfmt::skip]
 #[path = "../../../../stalwart-tests/unit/utils/src/topological/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "topological_restored_tests.rs"]
+mod tests;

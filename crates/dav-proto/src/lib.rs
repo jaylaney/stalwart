@@ -88,11 +88,8 @@ pub enum Condition<'x> {
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
-#[cfg_attr(all(test, stalwart_tests), serde(tag = "type", content = "data"))]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(test, serde(tag = "type", content = "data"))]
 pub enum Timeout {
     Infinite,
     Second(u64),
@@ -101,10 +98,7 @@ pub enum Timeout {
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub enum Depth {
     Zero,
     One,

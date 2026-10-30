@@ -1009,3 +1009,7 @@ impl<T, E, U, I> TokenType<T, E, U, I> {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/nlp/src/tokenizers/types/test.rs"]
 mod test;
+
+#[cfg(test)]
+#[path = "types_restored_tests.rs"]
+mod test;

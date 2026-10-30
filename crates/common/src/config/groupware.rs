@@ -223,3 +223,7 @@ impl FromStr for CalendarTemplateVariable {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/common/src/config/groupware/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "groupware_restored_tests.rs"]
+mod tests;

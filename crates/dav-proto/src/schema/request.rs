@@ -17,11 +17,8 @@ use calcard::{
 use types::{TimeRange, metadata::XmlValue};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
-#[cfg_attr(all(test, stalwart_tests), serde(tag = "type", content = "data"))]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(test, serde(tag = "type", content = "data"))]
 pub enum PropFind {
     #[default]
     PropName,
@@ -30,49 +27,34 @@ pub enum PropFind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct PropertyUpdate {
     pub ops: Vec<PropertyUpdateOp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub enum PropertyUpdateOp {
     Set(DavPropertyValue),
     Remove(DavProperty),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct DavPropertyValue {
     pub property: DavProperty,
     pub value: DavValue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct MkCol {
     pub is_mkcalendar: bool,
     pub props: Vec<DavPropertyValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct LockInfo {
     pub lock_scope: LockScope,
     pub lock_type: LockType,
@@ -80,11 +62,8 @@ pub struct LockInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
-#[cfg_attr(all(test, stalwart_tests), serde(tag = "type"))]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(test, serde(tag = "type"))]
 pub enum Report {
     AddressbookQuery(AddressbookQuery),
     AddressbookMultiGet(MultiGet),
@@ -100,29 +79,20 @@ pub enum Report {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct ExpandProperty {
     pub properties: Vec<ExpandPropertyItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct ExpandPropertyItem {
     pub property: DavProperty,
     pub depth: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct AddressbookQuery {
     pub properties: PropFind,
     pub filter: CardFilter,
@@ -130,20 +100,14 @@ pub struct AddressbookQuery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct VCardPropertyWithGroup {
     pub name: VCardProperty,
     pub group: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct CalendarQuery {
     pub properties: PropFind,
     pub filter: Option<CompFilter>,
@@ -151,11 +115,8 @@ pub struct CalendarQuery {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
-#[cfg_attr(all(test, stalwart_tests), serde(tag = "type", content = "data"))]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(test, serde(tag = "type", content = "data"))]
 pub enum Timezone {
     Name(String),
     Id(String),
@@ -163,29 +124,20 @@ pub enum Timezone {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct FreeBusyQuery {
     pub range: Option<TimeRange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct MultiGet {
     pub properties: PropFind,
     pub hrefs: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct SyncCollection {
     pub sync_token: Option<String>,
     pub properties: PropFind,
@@ -194,10 +146,7 @@ pub struct SyncCollection {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub enum FilterTest {
     #[default]
     AnyOf,
@@ -205,31 +154,22 @@ pub enum FilterTest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
-#[cfg_attr(all(test, stalwart_tests), serde(tag = "type", content = "data"))]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(test, serde(tag = "type", content = "data"))]
 pub enum Presence<T> {
     IsNotDefined,
     IsDefined(T),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct CompFilter {
     pub name: ICalendarComponentType,
     pub test: Presence<CompFilterMatch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct CompFilterMatch {
     pub time_range: Option<TimeRange>,
     pub prop_filters: Vec<CalendarPropFilter>,
@@ -237,71 +177,50 @@ pub struct CompFilterMatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct CalendarPropFilter {
     pub name: ICalendarProperty,
     pub test: Presence<CalendarPropMatch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct CalendarPropMatch {
     pub value: Option<PropValueMatch>,
     pub param_filters: Vec<ParamFilter<ICalendarParameterName>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
-#[cfg_attr(all(test, stalwart_tests), serde(tag = "type", content = "data"))]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(test, serde(tag = "type", content = "data"))]
 pub enum PropValueMatch {
     TimeRange(TimeRange),
     Text(TextMatch),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct ParamFilter<P> {
     pub name: P,
     pub test: Presence<Option<TextMatch>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct CardFilter {
     pub test: FilterTest,
     pub prop_filters: Vec<CardPropFilter>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct CardPropFilter {
     pub name: VCardPropertyWithGroup,
     pub test: Presence<CardPropMatch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct CardPropMatch {
     pub test: FilterTest,
     pub text_matches: Vec<TextMatch>,
@@ -309,62 +228,44 @@ pub struct CardPropMatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct TextMatch {
     pub match_type: MatchType,
     pub value: String,
     pub collation: Collation,
     pub negate: bool,
-    #[cfg_attr(all(test, stalwart_tests), serde(skip))]
+    #[cfg_attr(test, serde(skip))]
     pub(crate) needle: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct Acl {
     pub aces: Vec<Ace>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct AclPrincipalPropSet {
     pub properties: Vec<DavProperty>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct PrincipalMatch {
     pub principal_properties: PrincipalMatchProperties,
     pub properties: Vec<DavProperty>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub enum PrincipalMatchProperties {
     Properties(Vec<DavProperty>),
     Self_,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct PrincipalPropertySearch {
     pub property_search: Vec<PropertySearch>,
     pub properties: Vec<DavProperty>,
@@ -373,10 +274,7 @@ pub struct PrincipalPropertySearch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    all(test, stalwart_tests),
-    derive(serde::Serialize, serde::Deserialize)
-)]
+#[cfg_attr(test, derive(serde::Serialize, serde::Deserialize))]
 pub struct PropertySearch {
     pub properties: Vec<DavProperty>,
     pub match_: String,

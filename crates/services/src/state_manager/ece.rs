@@ -214,3 +214,7 @@ pub fn generate_iv(nonce: &[u8], counter: usize) -> [u8; ECE_NONCE_LENGTH] {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/services/src/state_manager/ece/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ece_restored_tests.rs"]
+mod tests;
