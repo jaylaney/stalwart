@@ -3295,6 +3295,313 @@ choice. The baseline's observation that imap `uidbatches::test` reaches its fina
 zero iterations in both modes, so its contiguity assertion never ran at 0.16.27, goes to
 Task 7.
 
+## Task 2
+
+Part 2a (workspace, manifests, `types`, `store`, `vault`) is recorded in the conflict ledger
+cells it resolved. Part 2b restored the test infrastructure: the inline unit test modules,
+the upstream test hooks, the harness, the SEL-only removals and ruling 33's licensed parts.
+Paths are under `crates/` unless they start with `tests/`.
+
+### Restored unit test modules
+
+Every one of the 132 upstream modules on Task 1's list has a disposition. The 22 SEL-only
+`scim` and `scim-proto` modules are dispositioned, not restored. The 7 fork modules in
+upstream files stay inline in their files, under their own names; all but
+`jmap/src/vacation/set.rs`'s sit in conflicted files, which their owners keep through the
+resolution.
+
+The 110 others, each in a fork-owned file named as the baseline's `restored_tests` mapping
+says, with SPDX headers copied from fork-owned neighbours:
+
+| Disposition | Modules | Where |
+|---|---:|---|
+| Restored and declared; the crate compiles and its tests pass | 68 | `types` 1, `store` 3, `utils` 5, `trc` 1, `registry` 3, `nlp` 10, `jmap-proto` 5, `imap-proto` 35, `dav-proto` 5 (`serde_impl` included) |
+| Restored and declared; the crate compiles only at its owner's check (ruling 37) | 33 | `common` 14, `directory` 3, `groupware` 3, `jmap` 2, `managesieve` 1, `pop3` 2, `services` 2, `smtp` 3, `spam-filter` 3 |
+| Restored; the counterpart is conflicted, so the declaration is handed off (ruling 35) | 4 | `common/src/auth/authentication.rs`, `directory/src/core/secret.rs`, `http/src/request.rs`, `spam-filter/src/analysis/url.rs` |
+| Moved with its subject | 5 | see below |
+
+Declarations follow the brief's rule, placed right after upstream's private slot:
+`#[cfg(test)] #[path = "<stem>_restored_tests.rs"] mod <name>;` (`restored_tests.rs` for
+`mod.rs` and `lib.rs`). Two `nlp` modules were `pub mod tests` at 0.16 and stay `pub`.
+
+Moved modules (the baseline mapping is updated for the three whose file moved):
+
+| 0.16 module | 1.0 subject | Restored as | libtest identifier |
+|---|---|---|---|
+| `common::network::tests` | `is_global_ip`, now `utils/src/outbound.rs:294` | `utils/src/outbound_restored_tests.rs`, module `tests` (merged) | `utils::outbound::tests::global_ip_classification` |
+| `services::state_manager::http::tests` | `is_same_organization`, now `utils/src/outbound.rs:277` | the same file and module | `utils::outbound::tests::same_organization_redirects` |
+| `groupware::tests` | `encode_path_segment`, replaced by `common::storage::dav::{canonical_path_segment, canonical_uri_path}` (`common/src/storage/dav/mod.rs:143-149`) | `common/src/storage/dav/restored_tests.rs`, an equivalent test of the new pair (internals replaced; DAV paths are public behaviour) | `common::storage::dav::tests::*`, same three names |
+| `imap_proto::utf7::tests` | the external `encodify::utf7::IMAP` | `imap-proto/src/utf7_restored_tests.rs`, declared from `lib.rs` as `mod utf7` with an inline `tests` | unchanged, `imap_proto::utf7::tests::*` |
+| `utils::codec::base32_custom::tests` | the external `encodify::base32::STALWART` | `utils/src/codec/base32_custom_restored_tests.rs`, declared from `codec/mod.rs` as `mod base32_custom` with an inline `tests` | unchanged |
+
+The `common::storage::dav` equivalent was run against a copy of 1.0's functions in a scratch
+crate (3 passed), since `common` does not compile yet.
+
+Internals replaced, with an equivalent test (both public behaviour): `utils::cheeky_hash`
+(a stored key format; 1.0 moved the length byte to the end and stores up to 16 bytes
+directly) and the DAV path pair above. No module is "subject deleted" or "internals replaced,
+no equivalent".
+
+Adaptations of names and call shapes only (no ledger entry): `store` http lookup
+(`refresh_interval`, `custom_user_agent`), `store` split (`SearchFilter::{Integer, Text}`
+replace `Operator`), `jmap-proto` references (`AHashMap`), `imap-proto` receiver
+(`Token::Argument` takes `ArgumentBytes`), `imap-proto` list and select (`ListItem`'s
+`objectid` and `metadata`, `permanent_flags`), `imap-proto` fetch's `serialize_fetch`
+(`FetchItem::serialize`, `ChainedBytes`), `dav-proto` tokenizer (`Namespace` import) and
+responses (lock owners built as `XmlValue`, 1.0's replacement of `DeadProperty`).
+
+The `dav-proto` request and response tests read 114 fixtures under `dav-proto/resources/`,
+which the merge deleted; they are restored from the fork side. Upstream's `parse_requests`
+rewrites the JSON fixtures instead of comparing them (its comparison is commented out at
+0.16 too): under 1.0 it rewrites 26 of them. The committed fixtures are 0.16's; do not commit
+a run's rewrite.
+
+Three non-module `cfg(test)` items that 1.0 regated (`common/src/expr/parser.rs`'s panic,
+`dav-proto`'s `PartialEq for Token` and `PropStat::new`) are back under `cfg(test)`, as at
+0.16. Task 1's table missed `dav-proto`'s 99 `cfg_attr(test, …)` serde attributes in
+`lib.rs` and `schema/{collation,mod,property,request,response}.rs`, which 1.0 regated to
+`all(test, stalwart_tests)` and which the restored request and response tests need; they are
+back under `cfg_attr(test, …)`.
+
+### Upstream test hooks
+
+Of the table's 121 "restore" rows:
+- **Restored, 79.** 68 here and 11 in part 2a (`store` 10, `types` 1). Each turns
+  `stalwart_tests` back into `feature = "test_mode"`, or writes a fork-owned replacement where
+  1.0 moved or removed the code:
+  - `common`: `config/mailstore/scripts.rs`, `config/network.rs`, `config/smtp/resolver.rs`,
+    `manager/defaults.rs` (4 of 6), `network/acme/http.rs`, `network/dns/update.rs` (with
+    1.0's second propagation skip, `:1331`, part of the same in-memory DNS hook),
+    `network/security.rs`, `scripts/plugins/{dns,http}.rs`;
+  - `network/dns/records.rs`: 0.16's test provider domain, `pebble.letsencrypt.org`,
+    restored in `provider_domain` (1.0 removed the branch);
+  - `email`: `mailbox/{destroy,manage}.rs`, `message/index/search.rs`;
+  - `jmap`: `api/event_source.rs`, `mailbox/query.rs`; `registry/query.rs`: 0.16's ascending
+    default order restored under `test_mode` (1.0 removed it);
+  - the push loopback exemption (`jmap/src/push/set.rs:445` at 0.16): Task 1's table says
+    1.0 removed it, but it moved. 1.0's `validate_push_url` goes through `OutboundPolicy`,
+    whose `is_public_domain` and `is_permitted_ip` (`utils/src/outbound.rs:246`, `:269`)
+    allow `localhost` and loopback under `all(stalwart_tests, not(test))`. Both are regated
+    to `all(feature = "test_mode", not(test))`, and `jmap`'s `test_mode` now enables
+    `utils/test_mode`, so `jmap`'s restored push test sees the exemption as at 0.16. The
+    exemption now covers every outbound policy check in a test build, as upstream's test
+    configuration does;
+  - `services`: `state_manager/{http,push}.rs`, `task_manager/tasks/dkim.rs` (its two sites,
+    and 0.16's fixed test keys in a fork-owned `tasks/dkim_test_support.rs`, declared as
+    `test_support` under `test_mode` beside upstream's private slot);
+  - `smtp`: `inbound/{data,rcpt}.rs`, `outbound/dane/dnssec.rs` (`any(test, …)`),
+    `outbound/mod.rs`, `outbound/mta_sts/lookup.rs` (with 1.0's `:28` import gate),
+    `reporting/{send,tls}.rs`; the mock milter's codec (`Command::deserialize`,
+    `Response::serialize`, `PacketReader`) in a fork-owned `inbound/milter/protocol_test_support.rs`,
+    0.16's code (1.0 left the protocol types unchanged);
+  - `spam-filter`: `modules/pyzor.rs`; `utils`: `lib.rs` (`failed()` panics).
+- **Handed to the owners of conflicted files, 29.** Listed under "Handoffs from Task 2".
+- **Not restored, 13:**
+  - ACME retries (`services/src/task_manager/acme.rs`, 4 rows): subject deleted. 1.0's
+    `tasks/acme.rs` has no retry loop; a failed renewal returns `Outcome::transient` and the
+    task queue retries it.
+  - Metrics test data and deterministic metric ids (`common/src/telemetry/metrics/mod.rs:20`
+    and 6 sites in `store.rs`, 7 rows): `store.rs` and `test_data.rs` are SEL-only files, and
+    their only consumer, `telemetry::metrics`, takes the SEL-only disposition (ruling 33).
+  - `common/src/manager/defaults.rs:498`, `:506` (2 rows): inside an SEL snippet, so not
+    edited. In the enterprise-built test server, bootstrap therefore inserts the default
+    `TracingStore` and `MetricsStore` (both singletons, which the emptiness check keeps).
+
+Corrections to the table's other rows: the 5 `types/src/dead_property.rs` rows ("subject
+deleted") moved to `types/src/metadata/xml/mod.rs`, where 1.0 gates the same serde derives
+on `stalwart_tests`; they are restored under `feature = "test_mode"`, which `dav-proto`'s
+restored tests need. The rest of the "not needed" (11), "subject deleted" (5) and "SEL file"
+(2, the licence) rows stand.
+
+Manifests: `jmap`'s `test_mode = ["utils/test_mode"]`. No other crate needed a `test_mode`
+feature added, and none of the eight that part 2a dropped from the tests manifest gained a
+`test_mode` site.
+
+### `UNIT_TEST_FEATURES` for 1.0 (Tasks 7 and 8)
+
+Re-derived from `tests/Cargo.toml`'s dev-dependencies (their `test_mode` and `enterprise`
+features), its default `rocks` and `sqlite`, and `dns-update/test_provider`:
+
+```
+common/test_mode common/enterprise
+coordinator/enterprise
+dav/test_mode
+directory/enterprise directory/sqlite
+dns-update/test_provider
+email/test_mode email/enterprise
+groupware/test_mode
+jmap/test_mode jmap/enterprise
+managesieve/enterprise
+services/test_mode services/enterprise
+smtp/test_mode smtp/enterprise
+spam-filter/test_mode spam-filter/enterprise
+store/test_mode store/enterprise store/rocks store/sqlite
+trc/enterprise
+utils/test_mode
+vault/test_mode
+```
+
+- Dropped from 0.16's list: `coordinator/test_mode`, `dav-proto/test_mode`,
+  `directory/test_mode`, `http_proto/test_mode`, `imap/test_mode`, `managesieve/test_mode`
+  and `pop3/test_mode`. No 1.0 crate of the fork has those features.
+- **`http/test_mode` and `http/enterprise` cannot be listed.** 1.0's `telemetry` crate
+  depends on the crates.io `http` crate, and `--features http/<feature>` also asks that
+  dependency for the feature, so resolution fails ("package `telemetry` depends on `http`
+  with feature `test_mode` but `http` does not have that feature"); `http@1.0.1/test_mode`
+  is not accepted either. `http/enterprise` is on anyway, through `stalwart`'s default
+  features. `http`'s unit tests need `test_mode` for the fork's `za_test` module, so Task 8
+  runs them in a step of their own:
+  `cargo test -p http@1.0.1 --lib --bins --features test_mode,enterprise`.
+- `cargo tree --workspace --exclude tests --exclude scim --exclude scim-proto -e features`
+  with this list resolves; it enables `types/test_mode` (through `dav-proto`'s
+  dev-dependency) and `mail-auth/test` (through `smtp/test_mode`).
+
+### Harness
+
+`tests/src/utils/{server,storage,cleanup}.rs` follow the interface sheet's section 8. The
+tests crate cannot compile before Task 7, so they were written from the 1.0.1 source and
+checked by `rustfmt` only.
+
+- `TestServerBuilder` keeps its 0.16 API. `build_with_opts` builds the IPC before
+  `Telemetry::parse(&mut bootstrap, &storage, ipc.index_queue_notify())`, binds
+  `(cache, swap_rx)` from `Caches::parse(&mut bootstrap, &core.storage)`, and calls
+  `SwapTier::start(&inner, swap_rx)` right after building `Inner`, as boot does.
+  `inner_with_rxs` passes `&self.server.core.storage` and drops the receiver.
+- `with_cache_swap(CacheSwap)` inserts a `Cache` singleton with that tier (ruling 20's
+  suite). No suite calls it, so every server keeps the registry default, `Disabled`.
+- Telemetry is enabled with `core.is_enterprise_edition()`, as boot does, instead of 0.16's
+  `true`: with no test licence (ruling 33) the enterprise build runs unlicensed.
+- Renames: `NetworkListener::implicit_tls`; `fetch_groupware_resources` returning
+  `GroupwareResources`; the S3 store's `access_key_id` and custom region `{url, region}`.
+- `RegistryStore::{new, clone_with_public_url}` are part 2a's (`process_nonce:
+  rand::random()`); `RegistryEnvStores` stays fork-owned in `storage.rs`.
+- `wait_for_tasks` keeps its signature. It waits for the scheduled tasks
+  (`TaskQueueClass::Task`, now keyed by `TaskId`) and for the search index queue: every key
+  of subspace `SearchQueue` (`y`), that is, the entries (`SearchIndexClass::Queue`, grouped
+  by partition through `SearchIndexClass::queue_partition`), the claim markers
+  (`QueueIndex`) and the failure statuses (`QueueStatus`, a `SearchIndexStatus`). With
+  `skip_not_due`, a partition whose retry is due later is skipped, entries included. The
+  index queue has no permanent failure, so `skip_permanent_failures` applies to tasks only.
+- `cleanup.rs` matches 1.0's `Subspace` enum exhaustively in `subspace_rule`, with no
+  catch-all arm, and iterates `Subspace::ALL`. Rules are keyed on the enum, never on the
+  byte:
+  - leftovers (reported): `Acl`, `Immutable`, `QueueMessage`, `TaskQueue`, `ReportOut`,
+    `ReportIn`, `Indexes`, `DeletedItems`, `BlobLink`, `TelemetrySpan`, `TelemetryMetric`,
+    `QueueEvent`, `Blobs`, `IndexProperty`, `SearchQueue`;
+  - registry items, indexes and primary keys: kept for singletons and the fixture types, as
+    at 0.16. A reference now starts with `RegistryClass::REFERENCE_MARKER`; its target's type
+    decides, as at 0.16;
+  - `Counter`: document-id and change-id counters deleted and registry id counters kept, as
+    at 0.16 (by `CounterKind` byte); any other counter the store purge left is a leftover;
+  - `Property`: the vault and pin exemption, unchanged (account, `Collection::Principal`,
+    field 150 or 151);
+  - `System`: the schema version and node-id claims kept, anything else a leftover;
+  - `SearchTerm`, `SearchDocument`: leftovers, except on PostgreSQL and MySQL, which create
+    no such table (`Subspace::is_internal_fts`);
+  - `Logs`: deleted after the check, as at 0.16 (share notifications live there now too).
+- `store_lookup_expire_all` is gone: its subject, in-memory values in the data store, does
+  not exist at 1.0. `store_destroy` and `search_store_destroy` cover 1.0's subspaces and
+  search stores; resetting an ElasticSearch or MeiliSearch store panics, since 1.0 moved
+  `drop_indexes` into upstream's private test support (no CI step uses them).
+- Not settled (left as at 0.16, for their owners): `TestServer::all_queued_messages` uses
+  0.16's `QueuedMessages` and `SmtpSpool::next_event(&mut Queue)`, which 1.0's SMTP queue
+  replaced (`next_event(Option<QueueName>) -> Option<u64>`).
+
+### SEL-only removals and ruling 33
+
+- Removed with their sub-test calls: `tests/src/directory/oidc.rs` (`oidc::test`),
+  `tests/src/system/archiving.rs` and `tenant.rs` (`archiving::test`, `tenant::test`), and
+  the 8 SEL-only files of `tests/src/scim/`. The removed `scim/mod.rs` held `scim_tests`
+  itself, so `scim_tests` no longer exists, and `tests/src/lib.rs` no longer declares
+  `scim`. The three dual-licensed files there (`conformance.rs`, `oidc.rs`, `tenant.rs`)
+  import `ScimTest` from the removed `mod.rs`; they stay on disk, undeclared. Design
+  Decision 1 and ruling 33 say `scim_tests` keeps compiling: that no longer holds, a
+  decision for the primary.
+- `get_token_for_client`, which the dual-licensed `tests/src/directory/issuer.rs` imported
+  from the SEL-only `oidc.rs`, is written in `issuer.rs` from RFC 6749: the resource owner
+  password credentials grant (4.3) against the token endpoint of the issuer's discovery
+  document, with HTTP Basic client authentication over form-urlencoded credentials (2.3.1).
+- Ruling 33's licensed parts are listed in the expectation ledger.
+
+### Handoffs from Task 2
+
+Grouped by owner. Each restored file already exists; the owner adds the declaration as
+written, right after upstream's private slot.
+
+**Task 3**
+- Declaration in `common/src/auth/authentication.rs`: `#[cfg(test)] #[path =
+  "authentication_restored_tests.rs"] mod tests;` (slot at v1.0.1 `:945`).
+- Declaration in `directory/src/core/secret.rs`: `#[cfg(test)] #[path =
+  "secret_restored_tests.rs"] mod tests;` (slot at `:467`).
+- Declaration in `http/src/request.rs`: `#[cfg(test)] #[path = "request_restored_tests.rs"]
+  mod tests;` (slot at `:1096`). The 0.16 inline module still sits inside this file's
+  conflict; the resolution drops it, since the restored file replaces it.
+- Hook, ruling 9: `common/src/auth/authentication.rs:83-89`, the failed-login delay, also
+  skipped under `test_mode` (`cfg(not(any(stalwart_tests, feature = "test_mode")))` or
+  equivalent).
+- Hook: `smtp/src/inbound/session.rs:191`, the `badtls` HELO, `any(test, stalwart_tests)` to
+  `any(test, feature = "test_mode")` (Task 3 edits the file first; Task 5 otherwise).
+- The cleanup's vault and pin exemption assumes 0.16's key (account id, `Collection::Principal`,
+  field 150 or 151, document id) in subspace `Property`. If the vault record's 1.0 home
+  differs, `tests/src/utils/cleanup.rs` needs the matching rule (through the primary; Task 2
+  owns the file).
+- The UID lease (ruling 24): the emptiness check reports any lease key left in its subspace.
+  At 0.16 the test cleanup silently deleted expiring in-memory keys, leases included
+  (`store_lookup_expire_all`). If a suite ends with a live lease, the cleanup needs a rule
+  for the chosen subspace and `ZA_UID_LEASE_PREFIX`.
+
+**Task 4**
+- Hooks: `dav/src/calendar/copy_move.rs:94` and `delete.rs:93`,
+  `cfg(not(any(feature = "dev_mode", stalwart_tests)))` to `feature = "test_mode"`.
+- `groupware::encode_path_segment` is gone. The fork still calls it at
+  `http/src/api/shares.rs:567` and `dav/src/common/propfind.rs:1521`. 1.0's
+  `common::storage::dav::canonical_path_segment` always percent-encodes a stored name; it
+  does not pass an already-encoded segment through.
+- `groupware`'s restored modules (`cache/file`, `calendar/expand`, `scheduling/format`)
+  compile first at Task 4's check.
+
+**Task 5**
+- Declaration in `spam-filter/src/analysis/url.rs`: `#[cfg(test)] #[path =
+  "url_restored_tests.rs"] mod tests;` (slot at `:660`).
+- Hooks:
+  - `common/src/scripts/plugins/mod.rs:57`, `:76`, and the `print` test plugin that 1.0 moved
+    into a private slot (`:109`), written fork-owned from 0.16;
+  - `email/src/sieve/ingest.rs:758`;
+  - `jmap/src/blob/upload.rs:25`, `:232`, `:253`, `:258`;
+  - `jmap/src/email/import.rs:74`, `:79`; `jmap/src/email/set.rs:134`, `:139`, `:677`, `:941`;
+  - `spam-filter/src/analysis/url.rs:440`;
+  - `spam-filter/src/modules/dnsbl.rs:16`, `:28`, `:158`, `:245`, and the test resolver that
+    1.0 moved into a private slot (`:309`), written fork-owned from 0.16.
+- The imap-proto fetch test's six ENVELOPE, BODY and BODYSTRUCTURE cases need an equivalent
+  test in the imap crate: 1.0 writes those items from the message metadata
+  (`imap/src/op/fetch/structure.rs`, `write_envelope`, `write_structure`). The 0.16 cases
+  and their expected strings are in `9601038de:crates/imap-proto/src/protocol/fetch.rs`'s
+  test module.
+- `spam-filter`'s restored pyzor test: 1.0 removed the `PyzorDigest` trait; the message
+  digest and `pyzor_create_message` are methods of `SpamFilterInput`
+  (`spam-filter/src/modules/pyzor.rs:158`, `:185`). Its message-level cases need that call
+  shape.
+- The restored modules of `email`'s neighbours (`smtp`, `spam-filter`, `pop3`,
+  `managesieve`) compile first at Task 5's check.
+- `TestServer::all_queued_messages` (see "Harness").
+
+**Task 6**
+- Hooks: `services/src/task_manager/tasks/maintenance.rs:145`, `:148`, `:187`, `:190`,
+  `:361`.
+- `services`', `jmap`'s and `http`'s restored modules compile first at Task 6's check.
+- If `automation::acme` needs fast retries now that ACME retries go through the task queue,
+  that is a task-manager retry policy under `test_mode`.
+
+**Task 7**
+- The tests crate's first compile: the harness items above, and the `SUBSPACE_*` constants
+  that `tests/src/za/{leak,sharing_tombstones}.rs`, `tests/src/za/mail/{fence,uploads,search}.rs`
+  and `tests/src/store/{import_export,ops,sql_timeout}.rs` still use (1.0's `Subspace` enum
+  replaces them; the cleanup's rules show the mapping).
+- The libtest identifiers of the three moved modules change (table above).
+
+**Task 8**
+- The workflow's `UNIT_TEST_FEATURES` and the separate `http` step (see above).
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
@@ -3448,6 +3755,31 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 
 Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or new
 `#[ignore]` in a ported test, with the 1.0 change behind it.
+
+| Test | Change | 1.0 change behind it |
+|---|---|---|
+| `utils::cheeky_hash::tests::test_cheeky_hash_all` | Its first six checks are rewritten for 1.0's layout: length, key bytes and boundary through `len`, `as_key` and `key_len`, and a `from_key_bytes` round trip in place of the `AsRef` check. The other seven are unchanged. | `utils/src/cheeky_hash.rs`: `CheekyHash([u8; HASH_SIZE + 1])` keeps the length byte last and stores up to 16 bytes directly; `as_bytes`, `payload`, `deserialize` and `AsRef<[u8]>` are gone. |
+| `types::id::tests::parse_jmap_id` | `Id::from_str("p333333333333p333333333333")` is asserted to fail, where 0.16 asserted it parses. | `types/src/id.rs`: `from_str` is `STALWART.decode_u64`, which refuses a numeral longer than 13 symbols (`Error::Overflow`); 0.16 shifted the excess bits out. |
+| `imap_proto::protocol::fetch::tests::serialize_fetch_data_item` | Its six ENVELOPE, BODY and BODYSTRUCTURE cases are removed; the BINARY, BODY[section], FLAGS and INTERNALDATE cases stay. Their equivalent goes to the imap crate (Task 5 handoff). | `imap-proto/src/protocol/fetch.rs`: `DataItem::{Envelope, Body, BodyStructure}`, `Envelope` and `BodyPart` are gone; `imap/src/op/fetch/structure.rs` writes those items from the message metadata. |
+| `imap_proto::protocol::list::tests::serialize_list_item` | The rev2 expectations of the two non-ASCII names lose their `OLDNAME` tag. | `imap-proto/src/protocol/list.rs:263-266`: a rev2 or UTF8=ACCEPT client gets the name as stored; OLDNAME is kept for RENAME (RFC 9051 5.1, 6.3.9.7). |
+| `imap_proto::protocol::select::tests::serialize_select` | The rev2 LIST line of the second case loses its `OLDNAME` tag. | The same change. |
+| `imap_proto::parser::select::tests::parse_select_objectid` | The object id `abc` becomes `bcd` in the inputs and expectations of three cases. | `imap-proto/src/protocol/mod.rs:80-85`: `ObjectId::decode_id` refuses an id that starts with the zero symbol `a` followed by more symbols (a non-canonical encoding); the parser then drops the MAILBOXID. |
+| `imap_proto::parser::fetch::tests::parse_fetch` | `BODY[MIME]` becomes `BODY[1.MIME]`, with `Section::Part { num: 1 }` before `Section::Mime`. | `imap-proto/src/parser/fetch.rs:374-377`: MIME needs a part number before it, as RFC 3501's section-spec says. |
+| `imap_proto::parser::search::tests::parse_search` | Two expectations with `NOT (…)` gain an `And` after `Not` and an `End` closing it. | `imap-proto/src/parser/search.rs` (`parse_filters`): a parenthesised group merges into its parent only when the parent is AND, so NOT applies to the whole conjunction. |
+| `imap_proto::utf7::tests::utf7_decode` | Decodes with `IMAP.lenient()`. With the strict decoder, five of the eleven cases fail. | 0.16's in-tree codec moved to `encodify::utf7::IMAP`, whose default decoder refuses non-canonical input; 1.0 decodes mailbox names with `IMAP.lenient()` (`imap-proto/src/receiver.rs:752-763`), as 0.16's codec did. |
+| `dav_proto::parser::tokenizer::tests::test_tokenizer` | A `Token::Content` arm panics. | `dav-proto/src/parser/mod.rs`: the new `Token::Content`, returned only in raw-content mode, which the test never turns on. |
+| `common::storage::dav::tests::*` (0.16's `groupware::tests`) | Written against `canonical_uri_path` and `canonical_path_segment`. The `is_uri_segment` assertions are gone, the stable case checks `dav_file_name` too, and `a/b.txt` is asserted to have no URI path (`InvalidCharacter`). | `common/src/storage/dav/mod.rs:143-149`, `:234-245`: 1.0 always encodes a stored name and canonicalises a request path by decoding it; a segment that decodes to `/` is refused (`decode_segment`). |
+| `telemetry::telemetry_tests` | The `metrics::test` and `tracing::test` calls are removed; both modules keep compiling. | Ruling 33: without a licence 1.0 refuses `Metric` and `Trace` (`assert_enterprise_object`, `jmap/src/registry/mod.rs:18-42`), the only objects those two assert on; no test licence (`core.enterprise` is `None`). |
+| `telemetry::alerts::test` | Processing the alerts, with its email and event assertions, is removed. Creating the alerts, the in-memory metric checks (OSS) and the cleanup stay. | Ruling 33: `process_alerts` (`common/src/enterprise/alerts.rs:33-34`) returns nothing while `core.enterprise` is `None`. |
+| `system::authorization::test` | The masked email is no longer created, so the visibility, update, destroy and admin-query checks run on `PublicKey` only. | Ruling 33: `MaskedEmail` is refused without a licence (`assert_enterprise_object`). |
+| `system::directory::test` | The masked email's creation, its `account_id_from_email` and `rcpt_resolve` checks and its destroy are removed. | The same. |
+| `system::delivery::test` | The masked emails' creation, their domain and quota refusals, their two VRFY checks and their destroy are removed. The two spam cases that were delivered to them (GTUBE to Junk, the CardDAV `card-exists` override) are delivered to john's alias `john.doe@example.org` instead. | The same. The spam filtering is OSS, so those cases stay. |
+| `smtp::inbound::antispam::antispam` | The `llm` case is removed from its case list. | Ruling 33: the LLM analysis needs a licence (AI models are off while `core.enterprise` is `None`). |
+| `directory::directory_tests` | The `oidc::test` call is removed. | SEL-only file `tests/src/directory/oidc.rs` (design Decision 1). |
+| `system::system_tests` | The `tenant::test` and `archiving::test` calls are removed. | SEL-only files (design Decision 1). |
+| `scim::scim_tests` | Removed, with the SEL-only `tests/src/scim/mod.rs` that held it. | SEL-only files (design Decision 1); see "SEL-only removals and ruling 33". |
+| Every suite (harness) | Telemetry is enabled with `core.is_enterprise_edition()`, false without a licence, where 0.16 passed `true`. | Ruling 33: no test licence; boot does the same (`common/src/manager/boot.rs`). |
+| Every suite (harness) | The emptiness check no longer expires in-memory keys (`store_lookup_expire_all`). | 1.0 keeps no in-memory values in the data store (`InMemoryStore` has no data-store variant). |
 
 ## Task 1 check
 
