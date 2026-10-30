@@ -1940,6 +1940,9 @@ pub async fn acl(test: &TestServer) {
         )
         .await
         .unwrap();
+    // An unindex queued before the import's index write can orphan the document (an
+    // upstream task-worker race, which `za::mail::fence`'s in-flight index tests pin).
+    test.wait_for_tasks().await;
     john_client
         .set_default_account_id(admin.id_string())
         .email_destroy(&email_id)
