@@ -430,11 +430,19 @@ pause hook. Then:
   (`store/src/search/index.rs`), not to the queue entry, which the producer writes. The
   layering is the same as at 0.16. `store` cannot call into `common`, so the worker
   (`services/src/index_queue/index.rs`) attaches the assertion through a store-side field on
-  the documents it passes to `index_account_documents`, and `account_batch` places it in the
-  batch.
-- **R62 and R63 have no subject.** `Store::index`'s chunk loop is gone, and `account_batch`
-  commits each pass in one write with no commit point (`store/src/search/index.rs:299-341`),
-  so both take the "subject deleted" disposition with that evidence.
+  the documents it passes to `index_account_documents`, and `account_batch` places it in
+  every commit chunk of the batch. Task 1 found that `account_batch` does split a pass:
+  `AccountIndexer::build_batch` (`store/src/search/term.rs:276-388`) adds a commit point
+  every 1000 term merges and after each `Document` key, which comes last, and
+  `write_batch` commits each chunk as its own transaction. `add_commit_point` re-emits only
+  the account and collection, so one assertion would cover only the first chunk. One fork
+  call after `build_batch` adds the assertion to each chunk.
+- **R62's guard and R63 retire, on corrected evidence.** At 1.0.1 the `Document` keys are
+  written last, not in chunk 0. One partition worker runs an account's index and un-index
+  entries in order, so an un-index between two chunks needs a lost cluster lease, and R58
+  in every chunk then stops a superseded tail after setup. Task 6 confirms the ordering
+  from source before retiring them; if it doesn't hold, a guard on the last chunk's
+  `Document` key replaces R62's. R62's term scans stay.
 
 **Cache snapshots.** Keep them working on stored, sanitized views only. Neither cache
 population nor snapshot serialization and restoration may accept an unsealed response view
@@ -529,9 +537,10 @@ reduced form.
      - for `mod.rs`, `lib.rs` or `main.rs`: `#[path = "restored_tests.rs"]`.
 
      A `#[path]` resolves relative to the directory of the file that declares it, so one
-     shared file name would collide wherever sibling modules share a directory: 20
-     directories at 0.16.27, `common/src/auth/oauth/` among them. The module keeps the name
-     `tests`, so its libtest identifiers are unchanged. As a child module it sees the
+     shared file name would collide wherever sibling modules share a directory: 19
+     directories at 0.16.27, `common/src/auth/oauth/` among them. The module keeps its own
+     name, so its libtest identifiers are unchanged. That name is `tests`, except for five
+     modules: four named `test`, and the fork's `sharing_access_tests`. As a child module it sees the
      parent's private items, as the inline module did. Task 1 records the mapping from each
      source module to its restored file.
    - A module whose subject moved follows its subject.
@@ -572,24 +581,30 @@ reduced form.
   - It fails on any status change that lacks a disposition.
   - A test ignored at 0.16.27 that is still ignored passes.
 - **Executed sub-tests.** Rerun the baseline's 19-step coverage net on the candidate. A
-  sub-test call counts as executed in a mode only if two things hold in that step's export,
-  by llvm-cov's region counts:
+  sub-test call counts as executed in a mode only if three things hold in that step's
+  export, by llvm-cov's region counts:
   - **The body record has a positive count.** For an `async fn` sub-test, the body record
     is the async body's own record, whose first region starts after the signature. The
     outer function's record only constructs the future, and never counts. For a plain `fn`
     sub-test (for example `imap::body_structure::test`, `webdav::cal_itip::test`), the
     function's own record is the body.
+  - **The last statement's region has a positive count.** This is the region that starts at
+    the body's last top-level statement, located from the source. It stays at zero when an
+    early return before that statement is taken.
   - **The final region has a positive count.** This is the exit region at the body's
     closing brace, whose start and end both lie on that brace. It is not the body's outer
-    region, which starts at the opening brace and counts entries, so it stays positive after
-    an early return. Since a failed assertion panics, reaching the exit region means every
-    assertion before it passed.
+    region, which starts at the opening brace and counts entries. rustc routes every
+    `return` through the block at the closing brace, so this region also counts early
+    returns; the last statement's region is what tells them apart (Task 1's ruling 7).
+    Since a failed assertion panics, reaching the last statement and the exit region
+    means every assertion before them passed.
 
   Each call must execute in every mode where it did at 0.16.27, under the same rule. When
   Task 1 recomputes the baseline, it reports every sub-test that completed at 0.16.27 but
   fails the rule, for example one whose body ends in a diverging or branching tail. Such a
   sub-test gets an explicit completion marker; the rule is not loosened.
-- **Coverage.** Line coverage of the fork-owned cohort must not fall below 96.4%. The
+- **Coverage.** Line coverage of the fork-owned cohort must not fall below the baseline's
+  exact fraction, 17,821 of 18,490 lines (96.38%; the table above rounds it to 96.4%). The
   cohort is the baseline's 40 fork-owned files, mapped across moves, plus fork runtime code
   added during the port, listed as it is added.
   - Restored upstream tests (`*restored_tests.rs`) and the `tests` crate are reported as

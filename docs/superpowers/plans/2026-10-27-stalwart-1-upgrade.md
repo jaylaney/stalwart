@@ -136,8 +136,12 @@ permissive shim. `common` depends on `store` and `types`, and every later crate 
 - Task 2: `-p types -p store -p vault`;
 - Task 3: `-p common`;
 - Task 4: `-p groupware -p dav`;
-- Task 5: `-p email -p imap -p jmap -p smtp -p pop3`;
-- Task 6: `-p services -p store`.
+- Task 5: `-p email -p imap -p pop3 -p smtp -p spam-filter`;
+- Task 6: `-p services -p store -p jmap -p http@1.0.1 -p managesieve`.
+
+`jmap` depends on `services`, and `http` on `jmap`, `dav` and `services`, so they're checked
+at Task 6 (Task 1's ruling 21). A file that first fails to compile at a later task's check
+goes back to the task that owns it; the later task reports the failure and doesn't patch it.
 
 Task 2 must already have made the workspace resolve. The integrated compile gate of the
 product and the harness is Task 7. A command that is still blocked is recorded as blocked,
@@ -165,10 +169,11 @@ checkpoint.
   - every libtest identifier per binary and feature set, with its status: run, ignored (the
     six `#[ignore]`d tests) or not selected, and whether CI selects it after PR #66;
   - every suite sub-test call, with its mode and cfg guards, whether it is `async`, and
-    whether it executed in each mode under the strict rule. The rule needs two positive
+    whether it executed in each mode under the strict rule. The rule needs three positive
     counts:
     - the body record: the async body's own record for an `async fn`, never the outer
       constructor record; the function's own record for a plain `fn`;
+    - the region that starts the body's last top-level statement, located from the source;
     - the body's final region: the exit region whose start and end both lie on the body's
       closing brace, not the outer region that starts at the opening brace.
 
@@ -268,8 +273,9 @@ boots one server per tier.
 
   Notes on this rule:
   - A `#[path]` resolves relative to the directory of the declaring file, so a shared name
-    would collide in the 20 directories with two or more such modules.
-  - The module keeps the name `tests`, so its libtest identifiers are unchanged and Task 7's
+    would collide in the 19 directories with two or more such modules.
+  - The module keeps its own name (`tests` for all but five, recorded in the baseline's
+    mapping), so its libtest identifiers are unchanged and Task 7's
     gate needs no rename table. As a child module it sees the parent's private items, as
     the inline module did.
   - Follow Task 1's mapping, and update it where a subject moved.
@@ -596,11 +602,16 @@ outside `za_tests`.
     (`store/src/search/index.rs`), the batch the worker commits. It does not go on the queue
     entry, which the producer writes. The worker (`index_queue/index.rs`) attaches it through
     the store-side carrier field (Task 2) on the documents it passes to
-    `index_account_documents`, and `account_batch` places it in the batch, as at 0.16. The
-    reason is that `store` cannot call into `common`.
-  - **R62 and R63:** `account_batch` commits each pass in one write with no commit point
-    (`store/src/search/index.rs:299-341`). Both take the "subject deleted" disposition with
-    that evidence. Retire their tests, or flip them where the scenario still applies.
+    `index_account_documents`. The reason is that `store` cannot call into `common`.
+    `account_batch` splits a pass into chunks (`store/src/search/term.rs:364-383`), so one
+    fork call after `build_batch` places the assertion in every chunk of a pass that holds
+    a fenced document (Task 1's ruling 18). Test it with the `FORCE_COMMIT_SPLIT` hook
+    (ruling 17), since fixture-sized data never reaches a second chunk.
+  - **R62 and R63:** confirm from source (`services/src/index_queue/index.rs:56-104`) that
+    one partition worker runs an account's index and un-index entries in order. If it does,
+    retire R62's per-chunk guard and R63's confirmation read on that evidence, and retire
+    or flip their tests. If it doesn't, rebuild the guard on the last chunk's `Document`
+    key. Keep R62's term scans (`has_account_search_terms`) either way (ruling 19).
   - Assert, with pauses, that provisioning or deleting the account mid-pass leaves no orphan
     plaintext or index and no endless retry.
 - [ ] Confirm the index queue is ordered, and adopt it. Upstream's source shows that a
@@ -693,9 +704,13 @@ and `scripts/tests/check_coverage.py`; the expectation ledger in the outcome not
   A test ignored at 0.16.27 that is still ignored, and still listed, passes.
   - Capture both `-- --list` and `-- --ignored --list` for each required package and
     feature combination; the ordinary listing alone does not establish that a test will run.
-  - **"Executed"** means both of these have positive counts in that step's export:
+  - **"Executed"** means all three of these have positive counts in that step's export:
     - the sub-test's body record: for an `async fn`, the async body's own record, whose
       first region starts after the signature; for a plain `fn`, the function's own record;
+    - the region that starts the body's last top-level statement, located from the source
+      by the method recorded in the baseline's `strict_rule.method`. rustc routes every
+      `return` through the closing-brace block, so without this count an early return
+      passes the gate;
     - that body's final region: the exit region whose start and end both lie on the
       body's closing brace. The body's outer region also ends there but starts at the
       opening brace and counts entries, so it does not qualify.
@@ -705,7 +720,8 @@ and `scripts/tests/check_coverage.py`; the expectation ledger in the outcome not
     (Task 1). Sub-tests that Task 1 reported as completing without reaching their final
     region get an explicit completion marker, and the tool checks that marker instead.
 - **The coverage tool** compares the candidate's per-file export with the baseline. It fails
-  if line coverage of the fork-owned cohort falls below 96.4%.
+  if line coverage of the fork-owned cohort falls below the baseline's exact fraction,
+  17,821 of 18,490 lines (96.38%).
   - The cohort is the baseline's 40 files, mapped across moves, plus fork runtime code added
     during the port, listed as it is added.
   - Restored upstream tests (`*restored_tests.rs`) and the `tests` crate are reported as
@@ -994,3 +1010,17 @@ review. Its one partly resolved verdict, R4-M2, is closed by R5-M4.
 | R5-L: per-document flags versus per-component `CLASS` | Adopted: the design says the flags hold the maximum over components, as upstream computes. |
 | R5-L: where the classification lands | Adopted: the tree, the row's flags, the resource cache and its swap snapshots. |
 | R5-L: the drain's mirror of `set_privacy` | Adopted: the drain's merge carries `itip_ingest`'s preservation, and the store scan includes an inbound update whose `CLASS` differs. Task 4. |
+
+### Amended during execution
+
+Changes made from what Task 1 measured. The
+[outcome note](2026-10-27-stalwart-1-upgrade-outcome.md) records each one with its ruling.
+
+| Finding | Change |
+|---|---|
+| The closing-brace exit region also counts early returns: rustc routes every `return` through it (shown on the 0.16.27 exports) | The executed rule needs a third count: the region that starts the body's last top-level statement. Design "Gates"; Tasks 1 and 7. |
+| The cohort is 96.38% (17,821 of 18,490 lines), so a literal 96.4% check fails the unchanged baseline | The coverage gate uses the exact fraction. Design "Gates"; Task 7. |
+| 19 shared directories, not 20; five inline test modules aren't named `tests` | Counts corrected; a restored module keeps its own name. Design "Decisions"; Task 2. |
+| `account_batch` splits a pass into commit chunks, with the `Document` keys last | R58 is asserted in every chunk; R62's guard and R63 retire only once Task 6 confirms the per-partition ordering; R62's term scans stay. Design "Indexing"; Task 6. |
+| `jmap` depends on `services`; no task checked `http`, `managesieve` or `spam-filter` | The crate checks are reordered, and a failure goes back to the file's owner. "File ownership and dependencies". |
+| Further corrections to cited paths, lines and signatures, and decisions on the shared interfaces | The outcome note's interface sheet and Task 1's rulings 9–29 amend Tasks 2–6. Where they correct a cite in this plan or the design, they win, and each task's brief carries them. |
