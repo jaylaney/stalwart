@@ -3741,6 +3741,16 @@ The primary's decisions during Task 2, numbered on from Task 1's.
     fork doesn't edit it, and adds no cleanup exemption. Task 7 shows whether they write
     anything without a licence. If they do, the harness removes them after bootstrap
     through the registry API. Cost if wrong: one harness step at Task 7.
+40. **`system::delivery`'s spam cases keep their subject** (the Task 2 review's M7). Part 2b
+    moved the GTUBE-to-Junk and `card-exists` cases from masked addresses to
+    `john.doe@example.org`, john's alias from creation, and flagged it after the fact,
+    where ruling 33 said to stop first. The ruling ratifies the move:
+    - the spam score and the `card-exists` override depend on the recipient account and
+      the sender, not on the envelope address;
+    - the assertions are unchanged;
+    - delivery to a masked address is enterprise-only and takes the SEL disposition.
+
+    Cost if wrong: none for the OSS product.
 
 ### Handoffs from Task 2
 
