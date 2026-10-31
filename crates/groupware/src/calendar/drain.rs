@@ -1244,34 +1244,19 @@ async fn merge(
         Step::Nothing => return ctx.rewrite_only(tree, Some(event_id), 0).await,
         Step::Merge(changes) => changes,
     };
-    // 1.0.1's `commit_itip_merge`: the stored classification (from the
-    // row's flags, which upstream derives from the stored tree's visible
-    // CLASS under field policy 2) is kept when the merge would change it.
-    let privacy = EventPrivacy::from_flags(event_.inner.flags.to_native());
+    // 1.0.1's `commit_itip_merge`: the stored classification is kept when
+    // the merge would change it. Upstream reads it from the row's flags,
+    // which it derives from the stored tree (`refresh_from_content`); here
+    // it is read from the unsealed stored tree itself, because a sealed
+    // non-standard CLASS leaves the sealed row's flags clear (field policy
+    // 2's recorded limit) while the tree an ordinary account stores would
+    // have set them. So the kept classification, and the tree, are an
+    // ordinary account's for every value.
+    let privacy = stored_classification(&event.content.data.event);
     if let Err(err) = itip_merge_changes(&mut event.content.data.event, &tree, changes) {
         return ctx.reject(tree, Some(event_id), &err).await;
     }
-    if event
-        .content
-        .data
-        .event
-        .components
-        .iter()
-        .filter(|component| component.component_type.is_scheduling_object())
-        .any(|component| {
-            component
-                .entries
-                .iter()
-                .filter(|entry| entry.name == ICalendarProperty::Class)
-                .filter_map(|entry| entry.values.first())
-                .map(EventPrivacy::from_value)
-                .max()
-                .unwrap_or_default()
-                != privacy
-        })
-    {
-        event.content.data.event.set_privacy(privacy);
-    }
+    keep_classification(&mut event.content.data.event, privacy);
     // The plaintext size, as upstream's merge measures it; the stored size
     // is the sealed tree's (`refresh_from_content`).
     let new_size = SizeWriter::ical(&event.content.data.event) as u32;
@@ -1547,6 +1532,36 @@ async fn merge(
     .caused_by(trc::location!())?;
     ctx.commit_or_reject_quota(batch, reply_lease, tree, Some(event_id))
         .await
+}
+
+/// The classification upstream's merge preserves, read from the unsealed
+/// stored tree: what `refresh_from_content` derives for an ordinary
+/// account's stored tree, so `EventPrivacy::from_flags` of its row.
+fn stored_classification(stored: &ICalendar) -> EventPrivacy {
+    stored.privacy()
+}
+
+/// `commit_itip_merge`'s preservation, verbatim: a scheduling component
+/// whose merged CLASS reads differently from `stored` gets `stored` back.
+fn keep_classification(merged: &mut ICalendar, stored: EventPrivacy) {
+    if merged
+        .components
+        .iter()
+        .filter(|component| component.component_type.is_scheduling_object())
+        .any(|component| {
+            component
+                .entries
+                .iter()
+                .filter(|entry| entry.name == ICalendarProperty::Class)
+                .filter_map(|entry| entry.values.first())
+                .map(EventPrivacy::from_value)
+                .max()
+                .unwrap_or_default()
+                != stored
+        })
+    {
+        merged.set_privacy(stored);
+    }
 }
 
 /// The event an item's rewrite records: assigned, or reserved in the same
@@ -1958,6 +1973,123 @@ mod tests {
         let recomputed =
             CalendarEventData::new(sealed.content.data.event.clone(), Tz::Floating, 100);
         assert_eq!(recomputed.time_ranges, plain.content.data.time_ranges);
+    }
+
+    /// Review M1: the drain's merge keeps the stored classification as an
+    /// ordinary account's `commit_itip_merge` does, for every stored value,
+    /// a sealed non-standard one included.
+    #[test]
+    fn the_merge_keeps_the_classification_an_ordinary_account_keeps() {
+        use crate::calendar::seal::{ZaKeyDomain, seal_event};
+        use common::storage::index::SplitObject;
+        use vault::{keys::Secret, session::SessionKeys};
+        let stored_tree = |class: &str| {
+            parse(&format!(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\nUID:class-2\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990105T090000Z\r\nDTEND:20990105T100000Z\r\nSEQUENCE:0\r\nCLASS:{class}\r\nORGANIZER:mailto:org@example.com\r\nATTENDEE;PARTSTAT=ACCEPTED:mailto:att@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+            ))
+        };
+        let incoming = |class: Option<&str>| {
+            let class = class.map_or(String::new(), |class| format!("CLASS:{class}\r\n"));
+            parse(&format!(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:class-2\r\nDTSTAMP:20240102T000000Z\r\nDTSTART:20990105T100000Z\r\nDTEND:20990105T110000Z\r\nSEQUENCE:1\r\n{class}ORGANIZER:mailto:org@example.com\r\nATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:att@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+            ))
+        };
+        let attendee = vec!["att@example.com".to_string()];
+        let policy = || RecipientPolicy {
+            visibility: crate::scheduling::recipient::AttendeeVisibility::All,
+            max_recipients: usize::MAX,
+            max_instances: usize::MAX,
+        };
+        let merge = |stored: &ICalendar, itip: &ICalendar| {
+            let mut merged = stored.clone();
+            let MergeResult::Actions(changes) = itip_process_message(
+                stored,
+                itip_snapshot(stored, &attendee, false).unwrap(),
+                itip,
+                itip_snapshot(itip, &attendee, false).unwrap(),
+                "org@example.com".into(),
+                policy(),
+            )
+            .unwrap() else {
+                panic!("no merge");
+            };
+            itip_merge_changes(&mut merged, itip, changes).unwrap();
+            merged
+        };
+        let row_flags = |tree: &ICalendar| {
+            let content = CalendarEventContent {
+                data: CalendarEventData::new(tree.clone(), Tz::Floating, 100),
+                ..Default::default()
+            };
+            let mut meta = CalendarEvent::default();
+            meta.refresh_from_content(&content, ());
+            meta.flags
+        };
+        let keys = SessionKeys::new(9, 1, Secret::random());
+        let domain = ZaKeyDomain::owner(&keys);
+        for class in ["PUBLIC", "PRIVATE", "CONFIDENTIAL", "X-SOMETHING"] {
+            for update in [None, Some("PUBLIC"), Some("PRIVATE"), Some("X-OTHER")] {
+                let stored = stored_tree(class);
+                let itip = incoming(update);
+                // An ordinary account: upstream's merge, the classification
+                // read from the row's flags over the plaintext tree.
+                let mut ordinary = merge(&stored, &itip);
+                keep_classification(&mut ordinary, EventPrivacy::from_flags(row_flags(&stored)));
+                // A key account: the drain, on the unsealed stored tree.
+                let mut sealed = ZaEvent::new(
+                    CalendarEvent {
+                        names: vec![DavName {
+                            name: "e.ics".into(),
+                            parent_id: 1,
+                        }],
+                        ..Default::default()
+                    },
+                    CalendarEventContent {
+                        data: CalendarEventData::new(stored.clone(), Tz::Floating, 100),
+                        ..Default::default()
+                    },
+                );
+                seal_event(&mut sealed, &keys, 9, None).unwrap();
+                let mut sealed_row = CalendarEvent::default();
+                sealed_row.refresh_from_content(&sealed.content, ());
+                unseal_event_in_domain(&mut sealed, &domain).unwrap();
+                let privacy = stored_classification(&sealed.content.data.event);
+                assert_eq!(privacy, EventPrivacy::from_flags(row_flags(&stored)));
+                if class == "X-SOMETHING" {
+                    // The sealed row reads public: the flags are not the
+                    // stored classification's source (review M1).
+                    assert!(EventPrivacy::from_flags(sealed_row.flags).is_public());
+                    assert!(!privacy.is_public());
+                }
+                let mut drained = merge(&sealed.content.data.event, &itip);
+                keep_classification(&mut drained, privacy);
+                assert_eq!(drained, ordinary, "{class} <- {update:?}");
+                // The flags upstream derives from what each stores agree,
+                // except for the recorded limit: a non-standard value stays
+                // sealed, so the sealed row's flags are clear.
+                let mut stored_sealed = ZaEvent::new(sealed.meta.clone(), {
+                    let mut content = sealed.content.clone();
+                    content.data.event = drained.clone();
+                    content
+                });
+                seal_event(&mut stored_sealed, &keys, 9, None).unwrap();
+                let mut meta = CalendarEvent::default();
+                meta.refresh_from_content(&stored_sealed.content, ());
+                let expected = if drained.privacy() != EventPrivacy::Public
+                    && drained.to_string().contains("CLASS:X-")
+                {
+                    0
+                } else {
+                    row_flags(&ordinary)
+                        & (crate::calendar::EVENT_PRIVATE | crate::calendar::EVENT_SECRET)
+                };
+                assert_eq!(
+                    meta.flags & (crate::calendar::EVENT_PRIVATE | crate::calendar::EVENT_SECRET),
+                    expected,
+                    "{class} <- {update:?}"
+                );
+            }
+        }
     }
 
     #[test]
