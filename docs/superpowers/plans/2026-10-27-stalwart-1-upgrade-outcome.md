@@ -4023,6 +4023,59 @@ Credential checks outside `authenticate`: `jmap/src/registry/mapping/account.rs:
 3b), the SQL and LDAP directories' own `verify_secret_hash` (behind the directory refusals)
 and `http/src/auth/oauth/registration.rs:313` (OAuth client secrets, not account logins).
 
+#### Follow-up: R46's class (found by part 5d)
+
+`Server::za_has_property` scanned `ValueKey::property`, the property class, but at 1.0
+`EmailField::Metadata` (field 71) is stored in the immutable class, so R46's refusal in
+`za_assert_no_data` never saw a destroyed message's metadata row. Evidence, in
+`v1.0.1-src/crates/`:
+- `store/src/write/mod.rs:1741-1747`: `From<EmailField> for ValueClass` maps `Metadata` and
+  `SortKeys` to `ValueClass::Immutable` and every other field to `ValueClass::Property`.
+  `email/src/message/index/metadata.rs:36` (`set`) and `:41` (`clear`) write and remove the
+  row through that conversion.
+- `store/src/write/key.rs:799`: `ValueClass::Immutable` is `Subspace::Immutable`.
+  `:785-797` asserts, in debug builds, that Email field 71 is never written as
+  `ValueClass::Property`. So 0.16's scan would trip that assertion in a debug build, and in a
+  release build it reads an empty range.
+- Upstream reads the row the same way: `email/src/message/messagedata.rs:171` and
+  `services/src/task_manager/tasks/destroy_account.rs:290`.
+- R46's subject still exists at 1.0. A deleted message's row is cleared only when the index
+  queue's worker processes its unindex entry: `services/src/index_queue/index.rs:856`
+  calls `metadata.unindex(batch, ..)`, which clears field 71.
+
+The fix: `za_has_property` now takes `field: impl Into<ValueClass>` and scans the class that
+conversion yields, through the store-level `has_field_store`. The caller
+(`http/src/api/vault.rs:914`) and the two Task 6 assertions in `tests/src/za/mail/fence.rs`
+pass `EmailField::Metadata` unchanged, and now read the immutable class.
+`za_has_documents(.., Field::ARCHIVE)` still scans the property class, where 1.0 keeps
+archives (`From<Field> for ValueClass`, `store/src/write/mod.rs:1776-1780`;
+`ValueKey::archive`, `store/src/write/key.rs:203`).
+
+The unit test `auth::vault::tests::the_metadata_scan_reads_the_class_1_0_stores_it_in` writes
+field 71 as upstream does, then asserts:
+- that the conversion yields the immutable class;
+- that the scan finds the row;
+- that another account sees nothing;
+- that the archive class sees nothing.
+
+The other scans of `za_assert_no_data` and the provisioning fence were checked against 1.0's
+classes, and none has the same problem:
+- **The archive checks** (Email, CalendarEvent, CalendarEventNotification, Calendar):
+  `Field::ARCHIVE` in the property class, as above.
+- **R52**: `RegistryClass::Index { AccountId, SpamTrainingSample, .. }` is still where 1.0
+  keeps the account index of a sample. `spam-filter/src/modules/classifier.rs:1005-1050`
+  clears that index. It lives in `Subspace::RegistryIndex` (`store/src/write/key.rs:826`),
+  serialized as object, index, key, then item (`:431-440`), so the scan covers one account.
+- **R54**: written for 1.0 in part 3a (the index queue's `SearchIndexClass::Queue` and the
+  task queue).
+- **R51 and R60**: `SearchIndexClass::Document { index, account_id, document_id }` is the key
+  1.0's index writer sets per document (`store/src/search/term.rs:375-383`).
+- **R62**: Task 2's `has_account_search_terms` reads `Subspace::SearchTerm`, which
+  `unindex_account` clears.
+- **The provisioning and index fences**: `PrincipalField::ZeroAccessVault` maps to
+  `ValueClass::Property` (`store/src/write/mod.rs:1759-1763`), where the vault record is
+  written.
+
 ### Part 3b: HTTP, protocol logins and session ownership
 
 Part 3b resolved the fourteen remaining Task 3 conflicts (cells in the conflict ledger,
@@ -5222,7 +5275,8 @@ as APPEND).
 (`http/src/api/vault.rs:914`) never finds a destroyed message's row. `fence.rs`'s R46 case
 would fail on it (it expects the 409), and two Task 6 assertions in `fence.rs`
 (`za_has_property(.., EmailField::Metadata)`) read the same wrong class. Owners: Task 3's
-helper, Task 6's tests.
+helper, Task 6's tests. Resolved after part 5d: the helper reads the class 1.0 stores a field in, so these
+call sites need no change (see Task 3's "Follow-up: R46's class").
 
 #### Assumptions Task 7 must confirm at runtime
 

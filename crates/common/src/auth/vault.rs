@@ -414,6 +414,36 @@ pub(crate) async fn served_public_key_store(
     }
 }
 
+/// One `only_first`, `no_values` scan of `class` over every document of
+/// `collection` in the account.
+pub(crate) async fn has_field_store(
+    store: &Store,
+    account_id: u32,
+    collection: Collection,
+    class: ValueClass,
+) -> trc::Result<bool> {
+    let key = |document_id| ValueKey {
+        account_id,
+        collection: collection.into(),
+        document_id,
+        class: class.clone(),
+    };
+    let mut found = false;
+    store
+        .iterate(
+            IterateParams::new(key(0), key(u32::MAX))
+                .no_values()
+                .only_first(),
+            |_, _| {
+                found = true;
+                Ok(false)
+            },
+        )
+        .await
+        .caused_by(trc::location!())?;
+    Ok(found)
+}
+
 impl Server {
     /// Spec 3: whether `account_id` is a key account. An unknown account id
     /// is not a key account, so upstream's outcome stands for it (plan 3
@@ -698,33 +728,19 @@ impl Server {
     }
 
     /// True when any document of `collection` in the account holds the
-    /// property `field`. Mail ruling R46: a destroyed message's metadata
-    /// archive (`EmailField::Metadata`) outlives its archive until the
-    /// scheduled unindex task runs.
+    /// field `field`. Mail ruling R46: a destroyed message's metadata
+    /// archive (`EmailField::Metadata`) outlives its archive until the index
+    /// queue's unindex runs. The field is scanned in the class 1.0 stores it
+    /// in, which its `Into<ValueClass>` picks: `EmailField::Metadata` and
+    /// `SortKeys` are `ValueClass::Immutable` (`Subspace::Immutable`), the
+    /// archive and other fields `ValueClass::Property`.
     pub async fn za_has_property(
         &self,
         account_id: u32,
         collection: Collection,
-        field: impl Into<u8>,
+        field: impl Into<ValueClass>,
     ) -> trc::Result<bool> {
-        let field = field.into();
-        let mut found = false;
-        self.store()
-            .iterate(
-                IterateParams::new(
-                    ValueKey::property(account_id, collection, 0, field),
-                    ValueKey::property(account_id, collection, u32::MAX, field),
-                )
-                .no_values()
-                .only_first(),
-                |_, _| {
-                    found = true;
-                    Ok(false)
-                },
-            )
-            .await
-            .caused_by(trc::location!())?;
-        Ok(found)
+        has_field_store(self.store(), account_id, collection, field.into()).await
     }
 
     /// Mail ruling R52: true when any spam training sample is indexed under
@@ -1407,6 +1423,49 @@ mod tests {
         assert_eq!(read2.record.revision, 2);
         assert_ne!(read2.cas, read.cas);
         assert!(vault_read_store(&store, 6).await.unwrap().is_none());
+    }
+
+    /// Mail ruling R46 at 1.0: a destroyed message's metadata archive
+    /// (field 71) is written as upstream writes it (`batch.set` with
+    /// `EmailField::Metadata`, which 1.0 stores as `ValueClass::Immutable`)
+    /// and found by `za_has_property`'s scan of the same field. 0.16's scan
+    /// of the property class cannot even be built here: 1.0's key
+    /// serializer asserts in debug builds that Email field 71 is never a
+    /// `ValueClass::Property` (`store/src/write/key.rs:785-797`), and in
+    /// release builds that range is empty.
+    #[tokio::test]
+    async fn the_metadata_scan_reads_the_class_1_0_stores_it_in() {
+        use types::field::EmailField;
+
+        let store = EphemeralStore::open();
+        let mut batch = BatchBuilder::new();
+        batch
+            .with_account_id(12)
+            .with_collection(Collection::Email)
+            .with_document(3)
+            .set(EmailField::Metadata, vec![1, 2, 3]);
+        store.write_batch(&mut batch).await.unwrap();
+
+        assert!(matches!(
+            ValueClass::from(EmailField::Metadata),
+            ValueClass::Immutable(_)
+        ));
+        assert!(
+            has_field_store(&store, 12, Collection::Email, EmailField::Metadata.into())
+                .await
+                .unwrap()
+        );
+        // Another account, and the archive class, see nothing.
+        assert!(
+            !has_field_store(&store, 13, Collection::Email, EmailField::Metadata.into())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !has_field_store(&store, 12, Collection::Email, Field::ARCHIVE.into())
+                .await
+                .unwrap()
+        );
     }
 
     async fn write_raw(store: &Store, account_id: u32, value: Vec<u8>) {
