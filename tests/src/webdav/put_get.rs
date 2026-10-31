@@ -197,25 +197,30 @@ pub async fn test(test: &TestServer) {
             .with_status(StatusCode::CONFLICT);
     }
 
-    // PUT under resources should fail
-    for (path, contents) in [
+    // PUT under resources should fail. 1.0 answers 409 under a file node
+    // (its parent is not a folder, RFC 4918 9.7.1), where 0.16 answered 405;
+    // address books and calendars still answer 405.
+    for (path, contents, expected) in [
         (
             "/dav/file/john%40example.com/file1.txt/other-file.txt",
             TEST_FILE_1,
+            StatusCode::CONFLICT,
         ),
         (
             "/dav/card/john%40example.com/default/card1.vcf/other-file.vcf",
             TEST_VCARD_1,
+            StatusCode::METHOD_NOT_ALLOWED,
         ),
         (
             "/dav/cal/john%40example.com/default/event1.ics/other-file.ical",
             TEST_ICAL_1,
+            StatusCode::METHOD_NOT_ALLOWED,
         ),
     ] {
         client
             .request("PUT", path, contents)
             .await
-            .with_status(StatusCode::METHOD_NOT_ALLOWED);
+            .with_status(expected);
     }
 
     // PUT a non-vCard/iCalendar file should fail
@@ -308,8 +313,10 @@ pub async fn test(test: &TestServer) {
                 num_success += 1;
                 response.with_status(StatusCode::CREATED);
             } else {
+                // 1.0 answers an exceeded quota 507 (0.16: 412), with the
+                // same condition.
                 response
-                    .with_status(StatusCode::PRECONDITION_FAILED)
+                    .with_status(StatusCode::INSUFFICIENT_STORAGE)
                     .with_failed_precondition("D:quota-not-exceeded", "");
                 did_fail = true;
                 break;
@@ -472,7 +479,8 @@ pub async fn test(test: &TestServer) {
                 content,
             )
             .await
-            .with_status(StatusCode::PRECONDITION_FAILED)
+            // A UID conflict is 403 at 1.0 (0.16: 412), as ruling 50 records.
+            .with_status(StatusCode::FORBIDDEN)
             .with_failed_precondition(precond_key, precond_value);
     }
 

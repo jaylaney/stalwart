@@ -604,7 +604,9 @@ pub async fn test(test: &TestServer, assisted_discovery: bool) {
                         "",
                     )
                     .await
-                    .with_status(StatusCode::PRECONDITION_FAILED)
+                    // A UID conflict is 403 at 1.0 (0.16: 412), as ruling 50
+                    // records.
+                    .with_status(StatusCode::FORBIDDEN)
                     .with_failed_precondition(
                         if resource_type == DavResourceName::Cal {
                             "A:no-uid-conflict.D:href"
