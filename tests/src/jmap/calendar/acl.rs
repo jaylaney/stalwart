@@ -323,17 +323,21 @@ pub async fn test(test: &TestServer) {
         .description(),
         "You are not allowed to delete this calendar."
     );
-    assert!(
+    // 1.0 checks an event update by what it changes (`groupware/src/calendar/
+    // rights.rs`), so the read-only sharee's refusal is tested with a change;
+    // 0.16 refused the empty patch with "You are not allowed to modify
+    // calendar ...".
+    assert_eq!(
         jane.jmap_update_account(
             john,
             MethodObject::CalendarEvent,
-            [(&john_event_id, json!({}))],
+            [(&john_event_id, json!({"title": "Changed by Jane"}))],
             Vec::<(&str, &str)>::new(),
         )
         .await
         .not_updated(&john_event_id)
-        .description()
-        .contains("You are not allowed to modify calendar"),
+        .description(),
+        "You are not allowed to modify this event."
     );
     assert!(
         jane.jmap_destroy_account(
