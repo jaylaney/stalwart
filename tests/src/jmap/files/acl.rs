@@ -25,6 +25,7 @@ pub async fn test(test: &TestServer) {
         .jmap_create(
             MethodObject::FileNode,
             [json!({
+                "@type": "Directory",
                 "name": "Test #1",
             })],
             Vec::<(&str, &str)>::new(),
@@ -352,6 +353,7 @@ pub async fn test(test: &TestServer) {
             john,
             MethodObject::FileNode,
             [json!({
+                "@type": "Directory",
                 "name": "A new shared folder",
             })],
             Vec::<(&str, &str)>::new()
@@ -511,7 +513,7 @@ pub async fn test(test: &TestServer) {
     let jane_folder_id = jane
         .jmap_create(
             MethodObject::FileNode,
-            [json!({"name": "jane-src"})],
+            [json!({"@type": "Directory", "name": "jane-src"})],
             Vec::<(&str, &str)>::new(),
         )
         .await

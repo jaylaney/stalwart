@@ -3114,9 +3114,9 @@ pub async fn file_node(test: &TestServer) {
         .jmap_create(
             MethodObject::FileNode,
             [
-                json!({ "name": "Root Folder", "parentId": null }),
-                json!({ "name": "Sub Folder", "parentId": "#i0" }),
-                json!({ "name": "Sub-sub Folder", "parentId": "#i1" }),
+                json!({"@type": "Directory",  "name": "Root Folder", "parentId": null }),
+                json!({"@type": "Directory",  "name": "Sub Folder", "parentId": "#i0" }),
+                json!({"@type": "Directory",  "name": "Sub-sub Folder", "parentId": "#i1" }),
             ],
             Vec::<(&str, &str)>::new(),
         )
@@ -3156,10 +3156,11 @@ pub async fn file_node(test: &TestServer) {
             "accountId": account.id_string(),
             "create": {
               "i0": {
+                "@type": "File",
                 "name": "hello.txt",
                 "parentId": &root_folder_id,
                 "blobId": "#hello",
-                "type": "text/plain",
+                "mediaType": "text/plain",
               }
             }
           },
@@ -3206,7 +3207,7 @@ pub async fn file_node(test: &TestServer) {
                 FileNodeProperty::BlobId,
                 FileNodeProperty::Name,
                 FileNodeProperty::ParentId,
-                FileNodeProperty::Type,
+                FileNodeProperty::MediaType,
                 FileNodeProperty::Size,
             ],
             [&file_id],
@@ -3217,7 +3218,7 @@ pub async fn file_node(test: &TestServer) {
         "id": &file_id,
         "name": "hello.txt",
         "parentId": &root_folder_id,
-        "type": "text/plain",
+        "mediaType": "text/plain",
         "size": 11,
         "blobId": &blob_id,
     }));
@@ -3235,11 +3236,11 @@ pub async fn file_node(test: &TestServer) {
         .jmap_create(
             MethodObject::FileNode,
             [
-                json!({ "name": "Sub Folder", "parentId": &root_folder_id }),
-                json!({ "name": "Folder under file", "parentId": &file_id }),
-                json!({ "name": "My/Sub/Folder" }),
-                json!({ "name": "." }),
-                json!({ "name": ".." }),
+                json!({"@type": "Directory",  "name": "Sub Folder", "parentId": &root_folder_id }),
+                json!({"@type": "Directory",  "name": "Folder under file", "parentId": &file_id }),
+                json!({"@type": "Directory",  "name": "My/Sub/Folder" }),
+                json!({"@type": "Directory",  "name": "." }),
+                json!({"@type": "Directory",  "name": ".." }),
             ],
             Vec::<(&str, &str)>::new(),
         )

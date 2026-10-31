@@ -39,14 +39,17 @@ pub async fn test(test: &TestServer) {
             MethodObject::FileNode,
             [
                 json!({
+                    "@type": "Directory",
                     "name": "Root Folder",
                     "parentId": null,
                 }),
                 json!({
+                    "@type": "Directory",
                     "name": "Sub Folder",
                     "parentId": "#i0",
                 }),
                 json!({
+                    "@type": "Directory",
                     "name": "Sub-sub Folder",
                     "parentId": "#i1",
                 }),
@@ -129,10 +132,11 @@ pub async fn test(test: &TestServer) {
             "accountId": account.id_string(),
             "create": {
               "i0": {
+                "@type": "File",
                 "name": "hello.txt",
                 "parentId": &root_folder_id,
                 "blobId": "#hello",
-                "type": "text/plain",
+                "mediaType": "text/plain",
               }
             }
           },
@@ -155,7 +159,7 @@ pub async fn test(test: &TestServer) {
                 FileNodeProperty::BlobId,
                 FileNodeProperty::Name,
                 FileNodeProperty::ParentId,
-                FileNodeProperty::Type,
+                FileNodeProperty::MediaType,
                 FileNodeProperty::Size,
             ],
             [&file_id],
@@ -166,7 +170,7 @@ pub async fn test(test: &TestServer) {
         "id": &file_id,
         "name": "hello.txt",
         "parentId": &root_folder_id,
-        "type": "text/plain",
+        "mediaType": "text/plain",
         "size": 11,
         "blobId": &blob_id,
     }));
@@ -185,20 +189,25 @@ pub async fn test(test: &TestServer) {
             MethodObject::FileNode,
             [
                 json!({
+                    "@type": "Directory",
                     "name": "Sub Folder",
                     "parentId": &root_folder_id,
                 }),
                 json!({
+                    "@type": "Directory",
                     "name": "Folder under file",
                     "parentId": &file_id,
                 }),
                 json!({
+                    "@type": "Directory",
                     "name": "My/Sub/Folder",
                 }),
                 json!({
+                    "@type": "Directory",
                     "name": ".",
                 }),
                 json!({
+                    "@type": "Directory",
                     "name": "..",
                 }),
             ],
@@ -351,9 +360,9 @@ pub async fn test_options(test: &TestServer) {
         .jmap_create(
             MethodObject::FileNode,
             [
-                json!({"name": "fp-root"}),
-                json!({"name": "fp-sub", "parentId": "#i0"}),
-                json!({"name": "fp-leaf", "parentId": "#i1"}),
+                json!({"@type": "Directory", "name": "fp-root"}),
+                json!({"@type": "Directory", "name": "fp-sub", "parentId": "#i0"}),
+                json!({"@type": "Directory", "name": "fp-leaf", "parentId": "#i1"}),
             ],
             Vec::<(&str, &str)>::new(),
         )
@@ -403,7 +412,7 @@ pub async fn test_options(test: &TestServer) {
     let response = account
         .jmap_create(
             MethodObject::FileNode,
-            [json!({"name": "dupe.txt", "parentId": null, "blobId": null})],
+            [json!({"@type": "Directory", "name": "dupe.txt", "parentId": null, "blobId": null})],
             Vec::<(&str, &str)>::new(),
         )
         .await;
@@ -411,7 +420,7 @@ pub async fn test_options(test: &TestServer) {
     let response = account
         .jmap_create(
             MethodObject::FileNode,
-            [json!({"name": "dupe.txt"})],
+            [json!({"@type": "Directory", "name": "dupe.txt"})],
             [("onExists", "rename")],
         )
         .await;
@@ -423,7 +432,7 @@ pub async fn test_options(test: &TestServer) {
     let response = account
         .jmap_create(
             MethodObject::FileNode,
-            [json!({"name": "dupe.txt"})],
+            [json!({"@type": "Directory", "name": "dupe.txt"})],
             Vec::<(&str, &str)>::new(),
         )
         .await;
@@ -435,7 +444,7 @@ pub async fn test_options(test: &TestServer) {
     let response = account
         .jmap_create(
             MethodObject::FileNode,
-            [json!({"name": "dupe.txt"})],
+            [json!({"@type": "Directory", "name": "dupe.txt"})],
             [("onExists", "replace")],
         )
         .await;
@@ -459,7 +468,7 @@ pub async fn test_options(test: &TestServer) {
     let response = account
         .jmap_create(
             MethodObject::FileNode,
-            [json!({"name": "CASE"})],
+            [json!({"@type": "Directory", "name": "CASE"})],
             Vec::<(&str, &str)>::new(),
         )
         .await;
@@ -467,7 +476,7 @@ pub async fn test_options(test: &TestServer) {
     let response = account
         .jmap_create(
             MethodObject::FileNode,
-            [json!({"name": "case"})],
+            [json!({"@type": "Directory", "name": "case"})],
             [("compareCaseInsensitively", true)],
         )
         .await;
@@ -489,8 +498,8 @@ pub async fn test_options(test: &TestServer) {
         .jmap_create(
             MethodObject::FileNode,
             [
-                json!({"name": "twin-reject"}),
-                json!({"name": "twin-reject"}),
+                json!({"@type": "Directory", "name": "twin-reject"}),
+                json!({"@type": "Directory", "name": "twin-reject"}),
             ],
             Vec::<(&str, &str)>::new(),
         )
@@ -517,8 +526,8 @@ pub async fn test_options(test: &TestServer) {
         .jmap_create(
             MethodObject::FileNode,
             [
-                json!({"name": "twin-rename"}),
-                json!({"name": "twin-rename"}),
+                json!({"@type": "Directory", "name": "twin-rename"}),
+                json!({"@type": "Directory", "name": "twin-rename"}),
             ],
             [("onExists", "rename")],
         )
@@ -542,8 +551,8 @@ pub async fn test_options(test: &TestServer) {
         .jmap_create(
             MethodObject::FileNode,
             [
-                json!({"name": "twin-replace"}),
-                json!({"name": "twin-replace"}),
+                json!({"@type": "Directory", "name": "twin-replace"}),
+                json!({"@type": "Directory", "name": "twin-replace"}),
             ],
             [("onExists", "replace")],
         )
@@ -570,8 +579,8 @@ pub async fn test_options(test: &TestServer) {
         .jmap_create(
             MethodObject::FileNode,
             [
-                json!({"name": "twin-newest", "modified": "2020-01-01T00:00:00Z"}),
-                json!({"name": "twin-newest", "modified": "2040-01-01T00:00:00Z"}),
+                json!({"@type": "Directory", "name": "twin-newest", "modified": "2020-01-01T00:00:00Z"}),
+                json!({"@type": "Directory", "name": "twin-newest", "modified": "2040-01-01T00:00:00Z"}),
             ],
             [("onExists", "newest")],
         )
@@ -593,7 +602,7 @@ pub async fn test_options(test: &TestServer) {
     let setup = account
         .jmap_create(
             MethodObject::FileNode,
-            [json!({"name": "lhs"})],
+            [json!({"@type": "Directory", "name": "lhs"})],
             Vec::<(&str, &str)>::new(),
         )
         .await;
@@ -635,7 +644,10 @@ pub async fn test_options(test: &TestServer) {
     let response = account
         .jmap_create(
             MethodObject::FileNode,
-            [json!({"name": "FOO"}), json!({"name": "foo"})],
+            [
+                json!({"@type": "Directory", "name": "FOO"}),
+                json!({"@type": "Directory", "name": "foo"}),
+            ],
             [("compareCaseInsensitively", true)],
         )
         .await;
@@ -655,7 +667,7 @@ pub async fn test_options(test: &TestServer) {
     let response = account
         .jmap_create(
             MethodObject::FileNode,
-            [json!({"name": "stamped", "modified": "2030-01-01T00:00:00Z"})],
+            [json!({"@type": "Directory", "name": "stamped", "modified": "2030-01-01T00:00:00Z"})],
             Vec::<(&str, &str)>::new(),
         )
         .await;
@@ -663,7 +675,7 @@ pub async fn test_options(test: &TestServer) {
     let older_attempt = account
         .jmap_create(
             MethodObject::FileNode,
-            [json!({"name": "stamped", "modified": "2020-01-01T00:00:00Z"})],
+            [json!({"@type": "Directory", "name": "stamped", "modified": "2020-01-01T00:00:00Z"})],
             [("onExists", "newest")],
         )
         .await;
@@ -673,7 +685,7 @@ pub async fn test_options(test: &TestServer) {
     let newer_attempt = account
         .jmap_create(
             MethodObject::FileNode,
-            [json!({"name": "stamped", "modified": "2040-01-01T00:00:00Z"})],
+            [json!({"@type": "Directory", "name": "stamped", "modified": "2040-01-01T00:00:00Z"})],
             [("onExists", "newest")],
         )
         .await;
@@ -700,8 +712,8 @@ pub async fn test_options(test: &TestServer) {
         .jmap_create(
             MethodObject::FileNode,
             [
-                json!({"name": "Ünterlagen 2026", "parentId": null}),
-                json!({"name": "Q1 & Q2 (final)", "parentId": "#i0"}),
+                json!({"@type": "Directory", "name": "Ünterlagen 2026", "parentId": null}),
+                json!({"@type": "Directory", "name": "Q1 & Q2 (final)", "parentId": "#i0"}),
             ],
             Vec::<(&str, &str)>::new(),
         )
