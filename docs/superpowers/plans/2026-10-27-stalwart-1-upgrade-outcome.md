@@ -6372,6 +6372,176 @@ Runtime facts this part relies on and did not run:
   `*.imap_failed` and is a 1.0 output change for the expectation ledger.
 - `webdav::{prop,lock}`: the large-property cases now probe `metadata.max_entry_size`.
 
+### Part 7b: the two gates and the dispositions
+
+Part 7b wrote the C10 gates and the dispositions file. It ran no cargo and changed no Rust
+file. The self-tests that need disposable changes and the candidate's real exports belong to
+part 7d.
+
+#### The tools
+
+All four are in `scripts/tests/`, and `README.md` there gives their inputs and the commands
+that produce them. They build on `tests/qualification/tools/` and reimplement neither the
+strict rule nor the cohort figures.
+
+- **`check_test_inventory.py`.** It takes exactly the brief's arguments: `--baseline`,
+  `--dispositions`, `--listing`, `--ignored-listing` and `--executed`.
+  - **Listings.** Each listing is a capture of `cargo test ... -- --list` output, one file per
+    configuration, named as in the baseline's `libtest.configurations`.
+  - **Executed.** `--executed` is the output of `strict_rule.py functions`, run on the
+    candidate's step exports and sources. So "executed" is the strict rule, recomputed.
+  - **Failure classes.** It exits 1 on each brief condition, under its own name:
+    - `missing`, `unselected` and `newly_ignored`;
+    - `empty_selector` and `capture_missing`;
+    - `status_change` and `missing_from`;
+    - `call_not_executed` and `loop_not_executed`;
+    - `helper_not_executed` and `tail_not_executed`.
+
+    Each failure names the test, the step and the count.
+  - **Granularity.** It reads step by step, so a loss in one step fails.
+  - **Required configurations.** A capture is required for every CI step and every ignored-only
+    configuration of the baseline. A selection move's target is required where a moved test is
+    no longer in its old step.
+- **`check_coverage.py`.** Its arguments are `--baseline`, `--dispositions`, `--merged`,
+  `--sources` and an optional `--out`.
+  - **The cohort.** It maps the 40 files across the moves, adds the file's additions and computes
+    both figures with `cohort.py`.
+  - **Failures.** It fails when either figure falls below 17,821/18,490 or 10,646/11,246, as
+    exact integer comparisons, or when a cohort file is missing.
+  - **Reported only.** These groups never count: `restored_tests`, the port's fork test files,
+    the `tests` crate, and the upstream product, with per-crate deltas against the baseline's
+    `per_crate`.
+- **`gate_common.py`.** It loads and validates the dispositions file, merges in the baseline's
+  own 34 dispositions, and parses the captures.
+- **`test_gates.py`.** The self-tests, run with `python3 -I`.
+
+**Unconfirmed entries.** An entry marked `"unconfirmed": true` does not excuse anything. A
+requirement that only such an entry would satisfy fails as `unconfirmed`,
+`rename_unconfirmed` or `move_unconfirmed`, and the failure names the entry. The primary
+confirms an entry by setting the flag to `false`.
+
+**Renames.** The gates match renames only through exact `{from, to}` pairs. They accept the old
+identifier while the candidate still has it, so the unchanged baseline passes with the
+committed file too.
+
+#### The dispositions file
+
+`tests/qualification/dispositions.json` holds entries from four places: the tasks' sections,
+the expectation ledger, the rulings and the source. Entries by kind:
+
+| Kind | Entries | Subjects |
+|---|---:|---|
+| `internals_replaced_equivalent` | 11 | 8 `tests/src` functions, each with its 1.0 replacement as the equivalent, and 0.16's three `groupware::tests` path tests, with `common::storage::dav::tests::*` as theirs |
+| `subject_deleted` | 3 | 5 functions: `system::task`'s two retry helpers (ruling 73), `store_lookup_expire_all` (Task 2's harness), and the two retired R63 cases in `fence.rs` (part 6d, rulings 19 and 63) |
+| `sel_only` | 1 | the `telemetry_tests` calls `metrics::test` and `tracing::test` (ruling 33) |
+
+The other sections:
+- **Renames.** Eight libtest pairs:
+  - `calendar::sequence::tests::*` to `calendar::sequence_floor::tests::*`, five tests
+    (ruling 25);
+  - the two tests Task 2 moved to `utils::outbound::tests`;
+  - `seal::tests::a_plaintext_archive_is_not_a_stub` to `a_plaintext_row_is_not_a_stub`.
+
+  Four function pairs: `store_assert_is_empty_except_vaults` to
+  `store_assert_is_empty_except_account_state` (commit `cee76c781`), and `fence.rs`'s
+  `search_keys`, `SearchKeys::holds_term` and `SearchKeys::is_empty`, which moved to
+  `utils/za.rs` (part 6d).
+- **Selection moves.** Two:
+  - ruling 53's seven DKIM tests, to a step built without `smtp/enterprise`;
+  - `http`'s two `za_test` tests, to a step of their own with `test_mode`. `http/test_mode`
+    can't be listed in the workspace step ("`UNIT_TEST_FEATURES` for 1.0").
+- **Cohort moves.** One: `sequence.rs` to `sequence_floor.rs` (ruling 25).
+- **Cohort additions.** Eight fork runtime files the port added:
+  - `common/src/za/metadata.rs`;
+  - `dav/src/common/propfind/za.rs`;
+  - `groupware/src/calendar/seal/container.rs`;
+  - `imap/src/op/{fetch,metadata}/za.rs`;
+  - `jmap/src/api/metadata/za.rs`;
+  - `services/src/index_queue/za.rs`;
+  - `services/src/task_manager/tasks/grantee_cleanup/za.rs`.
+- **Excluded additions.** Four files, reported as their own group:
+  - the fork test modules `email/src/message/ingest/group/za_tests.rs` and
+    `store/src/search/index_za_tests.rs`;
+  - Task 2's restored upstream test support, `services/.../dkim_test_support.rs` and
+    `smtp/.../protocol_test_support.rs`.
+
+**The source census.** 20 baseline `tests/src` functions that executed at 0.16.27 have no
+identity in the current tree.
+- 16 are covered by the entries above.
+- The other 4 are covered by the baseline's own SEL-only file dispositions: `system/archiving.rs`
+  and `system/tenant.rs`.
+
+The only baseline libtest identifiers absent from the tree are the renamed ones and the moved
+or replaced modules above. The removed sub-test calls are the SEL-only and ruling-33 ones.
+
+**Unconfirmed, 8 entries.** Each one waits for the primary:
+- **Replacements inferred from the source.** The note names no replacement for these five:
+  - `leak.rs`'s `check_email_search` to `check_search`;
+  - `leak.rs`'s `metadata_key` to `metadata_row_key`;
+  - `leak.rs`'s `write_metadata` to `write_metadata_row`;
+  - `fence.rs`'s `delete_event` to `utils::za::delete_event_records`;
+  - `fence.rs`'s `wait_for_the_unindex` to `utils::za::wait_for_index_queue`.
+- **One rename.** The `seal` test's rename is inferred from the diff.
+- **Two selection moves.** Task 8 hasn't named either step. The configuration names
+  `test.yml__unit-tests__smtp-unit-tests-without-enterprise` and
+  `test.yml__unit-tests__http-unit-tests` are proposals, and each move's `to_command` is the
+  command that produces its capture.
+
+#### Self-tests
+
+`python3 -I scripts/tests/test_gates.py`: 28 offline tests pass in about 4 seconds.
+
+- **The strict rule.** Synthetic exports of a synthetic `tests/src` file go through
+  `strict_rule.py functions`. Each of these fails with its step and count:
+  - a body that ran but skipped its last statement;
+  - a future built but never awaited;
+  - an omitted synchronous call;
+  - a loop with no iteration;
+  - a helper's early return;
+  - a tail block that was never polled;
+  - a loss in one step only.
+
+  The unchanged case passes. Renames and dispositions excuse a failure only when they are
+  confirmed and their equivalents hold.
+- **The listings.** A candidate built from the committed baseline's own records passes, with an
+  empty dispositions file and with the committed one. It covers 795 tests, 27 configurations,
+  272 call-steps, 3,833 helper-steps, 24 tail-steps and 14 loop-steps. Each of these fails:
+  - a missing test;
+  - a test dropped from one CI step;
+  - a newly ignored test;
+  - an empty selector;
+  - a missing capture;
+  - a dropped restored module (`common::auth::oauth::token::tests`, all 10 tests);
+  - an ignored test that now runs;
+  - `za::setup::test` lost in `za-tests-fs-blob` only;
+  - an unrun `imap::body_structure::test` or `webdav::cal_itip::test`;
+  - an unconfirmed or uncaptured selection move.
+
+  The `sequence_floor` renames pass only with the dispositions file.
+- **The coverage gate.** The baseline's exact fractions pass. One line below the full
+  threshold fails, and so does one line below the runtime-only threshold, each while a
+  restored test file adds 50,000 covered lines. A missing cohort file and an uncovered
+  addition also fail, and excluded files don't count.
+
+With `--real DIR`, two more tests feed both gates the 0.16.27 raw inputs as the candidate:
+- the 105 captures;
+- `strict_rule.py functions` over the 19 step exports;
+- `merged.json` and the 5b914ddb5 tree.
+
+Both pass. The coverage gate prints 17821/18490 and 10646/11246, with every per-crate delta
+at zero.
+
+#### For part 7d
+
+- **Capture the listings.** Capture every CI step and every ignored-only configuration under
+  its baseline name. Use the 1.0 commands, plus the two move targets' `to_command`.
+  Then run `strict_rule.py functions` on the 19 step exports and feed both gates.
+- **Confirm or correct the 8 unconfirmed entries.** Until then, the gate fails on them by
+  design.
+- **Expect more dispositions.** The candidate's real exports may show helpers that no longer
+  run because a ported test lost its caller, such as `system::task`'s remaining helpers or
+  `telemetry` helpers. The gate names each one, and it then needs an entry.
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,

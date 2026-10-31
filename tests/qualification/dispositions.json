@@ -1,0 +1,585 @@
+{
+ "schema": {
+  "purpose": "Task 7's dispositions for the C10 gates (scripts/tests/check_test_inventory.py and check_coverage.py): every 0.16.27 test, sub-test call, tests/src function or cohort file whose 1.0 counterpart differs, with its kind and evidence. The baseline's own 34 dispositions (baseline-0.16.27.json `dispositions`) apply as well and are not repeated here.",
+  "dispositions": "id, kind (see `kinds`), scope (libtest {package, name} | crate {crate} | file {file} | sub_test_call {suite, call} | function {file, in, name} | configuration {configuration}), subjects, equivalents (internals_replaced_equivalent only: libtest ids for a libtest subject, function ids otherwise; the gate requires every equivalent where the subject was required), evidence (the 1.0 change, ruling or ledger row), unconfirmed (true: the gate does not apply it until the primary confirms it).",
+  "renames": "libtest and functions: exact {from, to} pairs; the gate accepts the old identifier if the candidate still has it, else the new one; never fuzzy. steps and configurations: {from, to} names of coverage steps and listing configurations.",
+  "selection_moves": "tests whose CI step changed: the gate requires them in to_configuration where from_configuration selected them at 0.16.27, exempts them from the feature-set captures in absent_from, and requires a capture of to_configuration (to_command produces it).",
+  "cohort": "moves {from, to}, additions {file, runtime_excluded, evidence}: fork runtime files the port added; excluded_additions {file, reason}: fork test and test-support files the port added, reported as their own group, never counted in the cohort."
+ },
+ "kinds": {
+  "sel_only": "SEL-only subject (design Decision 1, ruling 33): not ported",
+  "subject_deleted": "1.0 removed the subject",
+  "internals_replaced_equivalent": "1.0 replaced the internals; `equivalents` covers the same behaviour",
+  "internals_replaced_no_equivalent": "1.0 replaced the internals; no equivalent",
+  "ungated_as_today": "outside the required set at 0.16.27 and still",
+  "ignored_as_today": "#[ignore] at 0.16.27 and still",
+  "needs_docker_ci_only": "runs in CI only (Docker); no local execution record"
+ },
+ "dispositions": [
+  {
+   "id": "telemetry-metrics-call",
+   "kind": "sel_only",
+   "scope": "sub_test_call",
+   "subjects": [
+    {
+     "suite": "telemetry::telemetry_tests",
+     "call": "metrics::test"
+    },
+    {
+     "suite": "telemetry::telemetry_tests",
+     "call": "tracing::test"
+    }
+   ],
+   "evidence": "Ruling 33: without a licence 1.0 refuses `Metric` and `Trace` (`assert_enterprise_object`, `jmap/src/registry/mod.rs:18-42`), the only objects the two sub-tests assert on; both calls are removed and the modules keep compiling. Expectation ledger: `telemetry::telemetry_tests`; part 7a's sweep."
+  },
+  {
+   "id": "system-task-retry",
+   "kind": "subject_deleted",
+   "scope": "function",
+   "subjects": [
+    {
+     "file": "tests/src/system/task.rs",
+     "in": null,
+     "name": "retry_time_boundaries"
+    },
+    {
+     "file": "tests/src/system/task.rs",
+     "in": "<impl Account>",
+     "name": "assert_has_retried_task"
+    }
+   ],
+   "evidence": "Ruling 73 (part 7a): v1.0.1 `TaskManager` has only `strategy` and `alert_after`; `manager::next_retry_time` is gone and a transient failure retries without limit (`services/src/task_manager/outcome.rs`, `NextAttempt::plan`). `retry_time_boundaries` and the attempt-limit case's helper are removed. Expectation ledger: `system::task::test`."
+  },
+  {
+   "id": "cleanup-expire-all",
+   "kind": "subject_deleted",
+   "scope": "function",
+   "subjects": [
+    {
+     "file": "tests/src/utils/cleanup.rs",
+     "in": null,
+     "name": "store_lookup_expire_all"
+    }
+   ],
+   "evidence": "Task 2, Harness: `store_lookup_expire_all` is gone; its subject, in-memory values in the data store, does not exist at 1.0 (`InMemoryStore` has no data-store variant). Expectation ledger: 'Every suite (harness): the emptiness check no longer expires in-memory keys'."
+  },
+  {
+   "id": "fence-r63-retired",
+   "kind": "subject_deleted",
+   "scope": "function",
+   "subjects": [
+    {
+     "file": "tests/src/za/mail/fence.rs",
+     "in": null,
+     "name": "failed_guard_with_its_document_stored_defers_the_task"
+    },
+    {
+     "file": "tests/src/za/mail/fence.rs",
+     "in": null,
+     "name": "stopped_document_leaves_its_batch_written"
+    }
+   ],
+   "evidence": "Part 6d, 'The cases and where they live': R63's two other cases are retired with the guard (rulings 19 and 63: R62's per-chunk guard and R63's confirmation read retire because one partition worker runs an account's index and unindex entries in order). Expectation ledger: `za::mail::fence` index cases ('Two R63 cases are retired')."
+  },
+  {
+   "id": "za-bearer-token",
+   "kind": "internals_replaced_equivalent",
+   "scope": "function",
+   "subjects": [
+    {
+     "file": "tests/src/utils/za.rs",
+     "in": null,
+     "name": "bearer_token"
+    }
+   ],
+   "equivalents": [
+    {
+     "file": "tests/src/utils/za.rs",
+     "in": null,
+     "name": "za_bearer_token"
+    }
+   ],
+   "evidence": "Part 5d ('za_bearer_token': reads, uploads and gates moved from 0.16's `bearer_token`, which had no caller left and is removed); part 3b's deferral. 1.0 binds every access token to a grant (`authenticate_oauth_token`, `common/src/auth/authentication.rs:603-607`). Expectation ledger: `za::mail::login`."
+  },
+  {
+   "id": "index-task-calendar-entries",
+   "kind": "internals_replaced_equivalent",
+   "scope": "function",
+   "subjects": [
+    {
+     "file": "tests/src/za/index_task.rs",
+     "in": null,
+     "name": "calendar_entries_of"
+    }
+   ],
+   "equivalents": [
+    {
+     "file": "tests/src/utils/za.rs",
+     "in": null,
+     "name": "search_keys"
+    }
+   ],
+   "evidence": "Part 6d; expectation ledger `za::index_task::{test, test_sealed_archive}`: 'The checks read `search_keys` instead of the scanner's violation text' (1.0's index queue, split event records)."
+  },
+  {
+   "id": "search-records",
+   "kind": "internals_replaced_equivalent",
+   "scope": "function",
+   "subjects": [
+    {
+     "file": "tests/src/za/mail/search.rs",
+     "in": null,
+     "name": "search_records"
+    }
+   ],
+   "equivalents": [
+    {
+     "file": "tests/src/utils/za.rs",
+     "in": null,
+     "name": "search_keys"
+    }
+   ],
+   "evidence": "Part 6d ported `mail/search.rs`'s search-store scan to 1.0's subspaces; `visible_field_document` reads `utils::za::search_keys` (`tests/src/za/mail/search.rs:1026-1042`). Expectation ledger `za::mail::search::visible_field_document` (ruling 64). 0.16's `search_records` iterated `SUBSPACE_SEARCH_INDEX`, which 1.0 does not have."
+  },
+  {
+   "id": "leak-email-search",
+   "kind": "internals_replaced_equivalent",
+   "scope": "function",
+   "unconfirmed": true,
+   "subjects": [
+    {
+     "file": "tests/src/za/leak.rs",
+     "in": null,
+     "name": "check_email_search"
+    }
+   ],
+   "equivalents": [
+    {
+     "file": "tests/src/za/leak.rs",
+     "in": null,
+     "name": "check_search"
+    }
+   ],
+   "evidence": "Expectation ledger `za::leak::scan` (part 6d): the walk covers `Subspace::ALL`, and Email search documents must be ids only (ruling 64). The note does not name the function that replaced `check_email_search`; `check_search` is inferred from the source."
+  },
+  {
+   "id": "leak-metadata-key",
+   "kind": "internals_replaced_equivalent",
+   "scope": "function",
+   "unconfirmed": true,
+   "subjects": [
+    {
+     "file": "tests/src/za/leak.rs",
+     "in": null,
+     "name": "metadata_key"
+    }
+   ],
+   "equivalents": [
+    {
+     "file": "tests/src/za/leak.rs",
+     "in": null,
+     "name": "metadata_row_key"
+    }
+   ],
+   "evidence": "Expectation ledger `za::leak::{test, test_mail, ...}` (part 6d): a message's row is checked in `Immutable` as a `MetadataRow` stub, and `test_mail`'s rewritten stub is re-encoded as a row (1.0's `EmailField::Metadata` is `ValueClass::Immutable`, `store/src/write/mod.rs:1741`). The note does not name the replacement; `metadata_row_key` is inferred from the source."
+  },
+  {
+   "id": "leak-write-metadata",
+   "kind": "internals_replaced_equivalent",
+   "scope": "function",
+   "unconfirmed": true,
+   "subjects": [
+    {
+     "file": "tests/src/za/leak.rs",
+     "in": null,
+     "name": "write_metadata"
+    }
+   ],
+   "equivalents": [
+    {
+     "file": "tests/src/za/leak.rs",
+     "in": null,
+     "name": "write_metadata_row"
+    }
+   ],
+   "evidence": "Expectation ledger `za::leak::{test, test_mail, ...}` (part 6d): a message's row is checked in `Immutable` as a `MetadataRow` stub, and `test_mail`'s rewritten stub is re-encoded as a row (1.0's `EmailField::Metadata` is `ValueClass::Immutable`, `store/src/write/mod.rs:1741`). The note does not name the replacement; `write_metadata_row` is inferred from the source."
+  },
+  {
+   "id": "fence-delete-event",
+   "kind": "internals_replaced_equivalent",
+   "scope": "function",
+   "unconfirmed": true,
+   "subjects": [
+    {
+     "file": "tests/src/za/mail/fence.rs",
+     "in": null,
+     "name": "delete_event"
+    }
+   ],
+   "equivalents": [
+    {
+     "file": "tests/src/utils/za.rs",
+     "in": null,
+     "name": "delete_event_records"
+    }
+   ],
+   "evidence": "Part 6d, 'Holding a partition': `delete_event_records` joins `utils::za`'s helpers for the ported index cases (split event records, 1.0's index queue). The note does not say it replaces `fence.rs`'s `delete_event`; inferred from the source."
+  },
+  {
+   "id": "fence-wait-for-unindex",
+   "kind": "internals_replaced_equivalent",
+   "scope": "function",
+   "unconfirmed": true,
+   "subjects": [
+    {
+     "file": "tests/src/za/mail/fence.rs",
+     "in": null,
+     "name": "wait_for_the_unindex"
+    }
+   ],
+   "equivalents": [
+    {
+     "file": "tests/src/utils/za.rs",
+     "in": null,
+     "name": "wait_for_index_queue"
+    }
+   ],
+   "evidence": "Part 6d: 0.16's helper waited for `Task::IndexDocument` records, which 1.0's index queue replaced; `wait_for_index_queue` (bounded) is the new wait. Expectation ledger `za::mail::fence` index cases. The note does not name the replacement; inferred from the source."
+  },
+  {
+   "id": "dav-path-segments-1",
+   "kind": "internals_replaced_equivalent",
+   "scope": "libtest",
+   "subjects": [
+    {
+     "package": "groupware",
+     "name": "tests::path_segments_from_uris_are_preserved"
+    }
+   ],
+   "equivalents": [
+    {
+     "package": "common",
+     "name": "storage::dav::tests::path_segments_from_uris_are_preserved"
+    }
+   ],
+   "evidence": "Task 2, 'Restored unit test modules' (moved modules): 0.16's `groupware::tests` subject `encode_path_segment` became `common::storage::dav::{canonical_path_segment, canonical_uri_path}` (`common/src/storage/dav/mod.rs:143-149`); restored as `common/src/storage/dav/restored_tests.rs`, an equivalent test of the new pair, same three names. Expectation ledger `common::storage::dav::tests::*`."
+  },
+  {
+   "id": "dav-path-segments-2",
+   "kind": "internals_replaced_equivalent",
+   "scope": "libtest",
+   "subjects": [
+    {
+     "package": "groupware",
+     "name": "tests::path_segments_from_names_are_encoded"
+    }
+   ],
+   "equivalents": [
+    {
+     "package": "common",
+     "name": "storage::dav::tests::path_segments_from_names_are_encoded"
+    }
+   ],
+   "evidence": "Task 2, 'Restored unit test modules' (moved modules): 0.16's `groupware::tests` subject `encode_path_segment` became `common::storage::dav::{canonical_path_segment, canonical_uri_path}` (`common/src/storage/dav/mod.rs:143-149`); restored as `common/src/storage/dav/restored_tests.rs`, an equivalent test of the new pair, same three names. Expectation ledger `common::storage::dav::tests::*`."
+  },
+  {
+   "id": "dav-path-segments-3",
+   "kind": "internals_replaced_equivalent",
+   "scope": "libtest",
+   "subjects": [
+    {
+     "package": "groupware",
+     "name": "tests::encoded_path_segments_are_stable"
+    }
+   ],
+   "equivalents": [
+    {
+     "package": "common",
+     "name": "storage::dav::tests::encoded_path_segments_are_stable"
+    }
+   ],
+   "evidence": "Task 2, 'Restored unit test modules' (moved modules): 0.16's `groupware::tests` subject `encode_path_segment` became `common::storage::dav::{canonical_path_segment, canonical_uri_path}` (`common/src/storage/dav/mod.rs:143-149`); restored as `common/src/storage/dav/restored_tests.rs`, an equivalent test of the new pair, same three names. Expectation ledger `common::storage::dav::tests::*`."
+  }
+ ],
+ "renames": {
+  "libtest": [
+   {
+    "from": {
+     "package": "groupware",
+     "name": "calendar::sequence::tests::the_reconciliation_takes_each_instances_maximum_with_the_committed_component"
+    },
+    "to": {
+     "package": "groupware",
+     "name": "calendar::sequence_floor::tests::the_reconciliation_takes_each_instances_maximum_with_the_committed_component"
+    },
+    "evidence": "Ruling 25: the fork's module is renamed `groupware/src/calendar/sequence_floor.rs` (upstream's `sequence.rs` takes the name). Expectation ledger `calendar::sequence::tests::*`: renamed, bodies unchanged."
+   },
+   {
+    "from": {
+     "package": "groupware",
+     "name": "calendar::sequence::tests::applying_the_sequences_never_lowers_one"
+    },
+    "to": {
+     "package": "groupware",
+     "name": "calendar::sequence_floor::tests::applying_the_sequences_never_lowers_one"
+    },
+    "evidence": "Ruling 25: the fork's module is renamed `groupware/src/calendar/sequence_floor.rs` (upstream's `sequence.rs` takes the name). Expectation ledger `calendar::sequence::tests::*`: renamed, bodies unchanged."
+   },
+   {
+    "from": {
+     "package": "groupware",
+     "name": "calendar::sequence::tests::instance_keys_agree_with_itip_snapshot"
+    },
+    "to": {
+     "package": "groupware",
+     "name": "calendar::sequence_floor::tests::instance_keys_agree_with_itip_snapshot"
+    },
+    "evidence": "Ruling 25: the fork's module is renamed `groupware/src/calendar/sequence_floor.rs` (upstream's `sequence.rs` takes the name). Expectation ledger `calendar::sequence::tests::*`: renamed, bodies unchanged."
+   },
+   {
+    "from": {
+     "package": "groupware",
+     "name": "calendar::sequence::tests::the_floor_raises_lower_values_and_keeps_higher_ones"
+    },
+    "to": {
+     "package": "groupware",
+     "name": "calendar::sequence_floor::tests::the_floor_raises_lower_values_and_keeps_higher_ones"
+    },
+    "evidence": "Ruling 25: the fork's module is renamed `groupware/src/calendar/sequence_floor.rs` (upstream's `sequence.rs` takes the name). Expectation ledger `calendar::sequence::tests::*`: renamed, bodies unchanged."
+   },
+   {
+    "from": {
+     "package": "groupware",
+     "name": "calendar::sequence::tests::the_floor_applies_only_to_a_local_organizer"
+    },
+    "to": {
+     "package": "groupware",
+     "name": "calendar::sequence_floor::tests::the_floor_applies_only_to_a_local_organizer"
+    },
+    "evidence": "Ruling 25: the fork's module is renamed `groupware/src/calendar/sequence_floor.rs` (upstream's `sequence.rs` takes the name). Expectation ledger `calendar::sequence::tests::*`: renamed, bodies unchanged."
+   },
+   {
+    "from": {
+     "package": "common",
+     "name": "network::tests::global_ip_classification"
+    },
+    "to": {
+     "package": "utils",
+     "name": "outbound::tests::global_ip_classification"
+    },
+    "evidence": "Task 2, 'Restored unit test modules' (moved modules): `is_global_ip` moved to `utils/src/outbound.rs:294`; restored in `utils/src/outbound_restored_tests.rs`, module `tests`."
+   },
+   {
+    "from": {
+     "package": "services",
+     "name": "state_manager::http::tests::same_organization_redirects"
+    },
+    "to": {
+     "package": "utils",
+     "name": "outbound::tests::same_organization_redirects"
+    },
+    "evidence": "Task 2, 'Restored unit test modules' (moved modules): `is_same_organization` moved to `utils/src/outbound.rs:277`; restored in the same file and module."
+   },
+   {
+    "from": {
+     "package": "email",
+     "name": "message::za::seal::tests::a_plaintext_archive_is_not_a_stub"
+    },
+    "to": {
+     "package": "email",
+     "name": "message::za::seal::tests::a_plaintext_row_is_not_a_stub"
+    },
+    "unconfirmed": true,
+    "evidence": "Expectation ledger `email::message::za::seal::tests::*`: rewritten for 1.0's metadata row (`email/src/message/metadata/{mod,row}.rs`). The rename itself is not recorded in the note; the pair is inferred from `git diff 9601038de -- crates/email/src/message/za/seal.rs`."
+   }
+  ],
+  "functions": [
+   {
+    "from": {
+     "file": "tests/src/utils/cleanup.rs",
+     "in": null,
+     "name": "store_assert_is_empty_except_vaults"
+    },
+    "to": {
+     "file": "tests/src/utils/cleanup.rs",
+     "in": null,
+     "name": "store_assert_is_empty_except_account_state"
+    },
+    "evidence": "Task 2, Harness (fix round 2, commit cee76c781): share notifications' accounts are returned with the vault accounts (`AccountState`), so the vault-exempting check is renamed. Expectation ledger: 'Every suite (harness): the emptiness check deletes share notifications with the change logs'."
+   },
+   {
+    "from": {
+     "file": "tests/src/za/mail/fence.rs",
+     "in": null,
+     "name": "search_keys"
+    },
+    "to": {
+     "file": "tests/src/utils/za.rs",
+     "in": null,
+     "name": "search_keys"
+    },
+    "evidence": "Part 6d, 'Holding a partition': `search_keys` (a document's id and value, and the term keys with their verbatim bytes) is one of `utils::za`'s helpers, shared by `fence.rs`, `index_task.rs` and `search.rs`."
+   },
+   {
+    "from": {
+     "file": "tests/src/za/mail/fence.rs",
+     "in": "<impl SearchKeys>",
+     "name": "holds_term"
+    },
+    "to": {
+     "file": "tests/src/utils/za.rs",
+     "in": "<impl SearchKeys>",
+     "name": "holds_term"
+    },
+    "evidence": "Part 6d, 'Holding a partition': `search_keys` (a document's id and value, and the term keys with their verbatim bytes) is one of `utils::za`'s helpers, shared by `fence.rs`, `index_task.rs` and `search.rs`."
+   },
+   {
+    "from": {
+     "file": "tests/src/za/mail/fence.rs",
+     "in": "<impl SearchKeys>",
+     "name": "is_empty"
+    },
+    "to": {
+     "file": "tests/src/utils/za.rs",
+     "in": "<impl SearchKeys>",
+     "name": "is_empty"
+    },
+    "evidence": "Part 6d, 'Holding a partition': `search_keys` (a document's id and value, and the term keys with their verbatim bytes) is one of `utils::za`'s helpers, shared by `fence.rs`, `index_task.rs` and `search.rs`."
+   }
+  ],
+  "steps": [],
+  "configurations": []
+ },
+ "selection_moves": [
+  {
+   "tests": [
+    {
+     "package": "smtp",
+     "name": "inbound::dkim::tests::all_recipients_disclosed"
+    },
+    {
+     "package": "smtp",
+     "name": "inbound::dkim::tests::display_names_and_brackets_are_ignored"
+    },
+    {
+     "package": "smtp",
+     "name": "inbound::dkim::tests::group_addresses_are_disclosed"
+    },
+    {
+     "package": "smtp",
+     "name": "inbound::dkim::tests::header_address_casing_is_ignored"
+    },
+    {
+     "package": "smtp",
+     "name": "inbound::dkim::tests::mixed_disclosed_and_undisclosed"
+    },
+    {
+     "package": "smtp",
+     "name": "inbound::dkim::tests::no_to_or_cc_header_all_undisclosed"
+    },
+    {
+     "package": "smtp",
+     "name": "inbound::dkim::tests::single_recipient_is_always_disclosed"
+    }
+   ],
+   "from_configuration": "test.yml__unit-tests__workspace-unit-tests",
+   "to_configuration": "test.yml__unit-tests__smtp-unit-tests-without-enterprise",
+   "to_command": "cargo test -p smtp --lib --bins --features test_mode -- --list",
+   "absent_from": [
+    "exists__WORKSPACE__all-members",
+    "exists__smtp__test_mode+enterprise"
+   ],
+   "unconfirmed": true,
+   "evidence": "Ruling 53: `smtp/src/inbound/dkim_restored_tests.rs` is compiled only without `enterprise` (`queue::Message`'s SEL-gated `tenant_ids`), so the seven tests run only in a build without `smtp/enterprise`, and Task 8 adds a CI step for them. Expectation ledger `smtp::inbound::dkim::tests::*`. Unconfirmed: Task 8 has not named the step; the configuration name and command here are proposals."
+  },
+  {
+   "tests": [
+    {
+     "package": "http",
+     "name": "auth::authenticate::za_test::tests::endpoint_slot_is_independent"
+    },
+    {
+     "package": "http",
+     "name": "auth::authenticate::za_test::tests::pause_fires_once_for_its_account_only"
+    }
+   ],
+   "from_configuration": "test.yml__unit-tests__workspace-unit-tests",
+   "to_configuration": "test.yml__unit-tests__http-unit-tests",
+   "to_command": "cargo test -p http@1.0.1 --lib --bins --features test_mode,enterprise -- --list",
+   "absent_from": [
+    "exists__WORKSPACE__all-members"
+   ],
+   "unconfirmed": true,
+   "evidence": "Task 2, '`UNIT_TEST_FEATURES` for 1.0': `http/test_mode` cannot be listed in the workspace step (1.0's `telemetry` crate depends on the crates.io `http` crate), and `http`'s unit tests need `test_mode` for the fork's `za_test` module, so Task 8 runs them in a step of their own with this command. Unconfirmed: Task 8 has not named the step. The other four `http` tests need no `test_mode` and stay required in the workspace step."
+  }
+ ],
+ "cohort": {
+  "moves": [
+   {
+    "from": "crates/groupware/src/calendar/sequence.rs",
+    "to": "crates/groupware/src/calendar/sequence_floor.rs",
+    "evidence": "Ruling 25 (baseline `cohort.moves`): at v1.0.1 `sequence.rs` is upstream's file (`ICalendarSequence`); the fork's floor is measured at `sequence_floor.rs`."
+   }
+  ],
+  "additions": [
+   {
+    "file": "crates/common/src/za/metadata.rs",
+    "runtime_excluded": false,
+    "evidence": "Ruling 66 (Task 6 fix round, commit 9a4046919): the object-metadata refusals at provisioning. A fork runtime file added during the port (`git diff --diff-filter=A 23b69755c HEAD -- crates`)."
+   },
+   {
+    "file": "crates/dav/src/common/propfind/za.rs",
+    "runtime_excluded": false,
+    "evidence": "Part 4b (commit 4beb2ae0f): the sealed calendar PROPFIND paths; 0.16's `dav/src/common/propfind.rs` became upstream's `propfind/` directory (Task 1, 'Deleted paths and their disposition'). A fork runtime file added during the port (`git diff --diff-filter=A 23b69755c HEAD -- crates`)."
+   },
+   {
+    "file": "crates/groupware/src/calendar/seal/container.rs",
+    "runtime_excluded": false,
+    "evidence": "Rulings 16, 23 and 29 (part 4a, commit a92064a43): the sealed dead-property container. A fork runtime file added during the port (`git diff --diff-filter=A 23b69755c HEAD -- crates`)."
+   },
+   {
+    "file": "crates/imap/src/op/fetch/za.rs",
+    "runtime_excluded": false,
+    "evidence": "Part 5b (commit 42b6943c0): the sealed-mail FETCH reader; 0.16's `imap/src/op/fetch.rs` became upstream's `fetch/` directory. A fork runtime file added during the port (`git diff --diff-filter=A 23b69755c HEAD -- crates`)."
+   },
+   {
+    "file": "crates/imap/src/op/metadata/za.rs",
+    "runtime_excluded": false,
+    "evidence": "Ruling 66 (part 6b, commit bb02e57ba): IMAP METADATA refusals for key accounts. A fork runtime file added during the port (`git diff --diff-filter=A 23b69755c HEAD -- crates`)."
+   },
+   {
+    "file": "crates/jmap/src/api/metadata/za.rs",
+    "runtime_excluded": false,
+    "evidence": "Ruling 66 (part 6b, commit bb02e57ba): JMAP object-metadata refusals for key accounts. A fork runtime file added during the port (`git diff --diff-filter=A 23b69755c HEAD -- crates`)."
+   },
+   {
+    "file": "crates/services/src/index_queue/za.rs",
+    "runtime_excluded": false,
+    "evidence": "Part 6a (commit c8e4d78de): the index queue's key-account gates (rulings 18, 19 and 22; R58). Its test_mode hooks count as runtime, as in-file hooks did at 0.16.27. A fork runtime file added during the port (`git diff --diff-filter=A 23b69755c HEAD -- crates`)."
+   },
+   {
+    "file": "crates/services/src/task_manager/tasks/grantee_cleanup/za.rs",
+    "runtime_excluded": false,
+    "evidence": "Part 6a (commit 6766311ec): the share-revocation cleanup skips key-account owners. A fork runtime file added during the port (`git diff --diff-filter=A 23b69755c HEAD -- crates`)."
+   }
+  ],
+  "excluded_additions": [
+   {
+    "file": "crates/email/src/message/ingest/group/za_tests.rs",
+    "reason": "fork unit tests (ruling 59; Task 5 fix round, commit 3c88a4ffb), a test module in its own file: not runtime code"
+   },
+   {
+    "file": "crates/store/src/search/index_za_tests.rs",
+    "reason": "fork unit tests (ruling 18; part 6a, commit f943452c7), a test module in its own file: not runtime code"
+   },
+   {
+    "file": "crates/services/src/task_manager/tasks/dkim_test_support.rs",
+    "reason": "0.16's upstream DKIM test keys, restored under test_mode by Task 2 (commit 3376e84b0): test support, not fork runtime code"
+   },
+   {
+    "file": "crates/smtp/src/inbound/milter/protocol_test_support.rs",
+    "reason": "0.16's upstream test-only milter codec, restored under test_mode by Task 2 (commit 3376e84b0): test support, not fork runtime code"
+   }
+  ]
+ }
+}

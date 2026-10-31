@@ -175,4 +175,6 @@ the results with the baseline:
 - tail blocks wherever they executed;
 - against both cohort fractions.
 
-These tools do not implement that comparison.
+These tools do not implement that comparison. The two gates do: `scripts/tests/check_test_inventory.py`
+and `scripts/tests/check_coverage.py`, with the dispositions in `../dispositions.json`. See
+`scripts/tests/README.md` for their inputs and the commands that produce them.
