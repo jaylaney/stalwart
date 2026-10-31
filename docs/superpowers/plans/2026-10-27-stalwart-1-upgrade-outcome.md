@@ -4804,13 +4804,10 @@ fence lives in the message's own chunk, which `write_batch` commits as one trans
   but recognizing the stub keeps it from reading the bundle as headers.
 
 **Task 2 or the primary**
-- `smtp/src/inbound/dkim_restored_tests.rs` builds a `queue::Message` literal, which does
-  not compile with `smtp/enterprise` (1.0's `Message` has the SEL-gated `tenant_ids`), so
-  CI's unit job (`smtp/enterprise` in `UNIT_TEST_FEATURES`) fails to build smtp's tests.
-  Fork code cannot name the field (ruling 26's rule), and `Message` has no `Default` or
-  server-free constructor. It compiles and passes without `enterprise`. Options: gate the
-  module on `not(feature = "enterprise")` with an expectation row and a separate CI step,
-  or a ruling.
+- Settled by ruling 53: `smtp/src/inbound/dkim_restored_tests.rs` builds a `queue::Message`
+  literal, which cannot name 1.0's SEL-gated `tenant_ids`; `Message` has no `Default` or
+  server-free constructor, so the module is gated off `enterprise` (expectation row). A CI
+  step without `smtp/enterprise` would be needed to run it there (Task 8).
 - `TestServer::all_queued_messages` (tests crate, Task 2's harness) is not part 5a's: it
   needs 1.0's queue API, at Task 7's first compile.
 
@@ -4996,6 +4993,7 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `smtp::inbound::antispam::antispam` | The `llm` case is removed from its case list. | Ruling 33: the LLM analysis needs a licence (AI models are off while `core.enterprise` is `None`). |
 | `email::message::za::seal::tests::*` | Rewritten for 1.0's metadata row: the stub is a `MetadataRow` whose structure holds one binary root part at offsets (0, bundle, bundle + sealed) instead of 0.16's empty part at zero offsets; there is no `rcvd_attach`, so the arrival-time and attachment-bit checks are gone; the moved, tampered, bad-policy and unknown-wrap cases re-encode the bundle under a new row instead of editing `raw_headers`; round trips compare the opened row's structure and header section with the full row. A new case, `a_forged_bundle_does_not_open_as_a_row`, covers the checked decode. | `email/src/message/metadata/{mod,row}.rs`: `MessageMetadata` is a flat structure with no `raw_headers`, `rcvd_attach` or `contents`; the header block lives in the row's header section; the arrival time and the attachment keywords live in `MessageData`. |
 | `email::message::za::view::tests::the_view_keeps_upstreams_offsets` | Compares the opened row with the full row (structure and header section), reconstructs the message through `raw_message`, and reads every text part, nested and transfer-encoded messages included, through upstream's `source` and `PartView::text` against the parser's text. 0.16 compared archive bytes and used `decode_contents` and `text_part`. A base64 `message/rfc822` case joins the corpus. | The same, and `email/src/message/metadata/source.rs`: parts are read through `RawMessage` and `PartSource`. |
+| `smtp::inbound::dkim::tests::*` (restored module `dkim_restored_tests.rs`) | The module is compiled only without `enterprise` (`cfg(all(test, not(feature = "enterprise")))`, ruling 53), so it runs in `cargo test -p smtp --lib` and not in a build with `smtp/enterprise` (CI's unit job lists it). Its seven assertions are unchanged. | `smtp/src/queue/mod.rs:79-101`: 1.0's `queue::Message` has `tenant_ids` under `cfg(feature = "enterprise")` inside an SEL snippet, which fork code cannot name, and `Message` implements no `Default` and has no constructor that works without a `Server` (`new_message` is a `SmtpSpool` method). |
 | `directory::issuer::test` | `get_token_for_client` is a new fork helper in `issuer.rs` (RFC 6749 4.3 against the issuer's discovered token endpoint); it adds an assertion that the token request answers 200, where 0.16's helper sat in an SEL-only file. | The SEL-only `tests/src/directory/oidc.rs` is not carried (design Decision 1); the helper is written from RFC 6749, not from that file. |
 | Any suite with an ElasticSearch or MeiliSearch search store (harness) | `search_store_destroy` panics for these stores, where 0.16 dropped and recreated their indexes. No CI step uses them. | 1.0 moved their `drop_indexes` into upstream's private test support (`store/src/backend/elastic/main.rs:134`, `meili/main.rs:314`, test-hook table rows "not needed"). |
 | Every suite (harness) | The emptiness check deletes share notifications with the change logs, as it deletes the logs at 0.16, and reports those whose account no longer exists (as for vault and pin records). | 1.0 stores share notifications as `Logs` entries of `SyncCollection::ShareNotification` (`store/src/write/key.rs:519-525`, `:860`), written for the grantee on every grant, regrant, change and revoke (`common/src/storage/index/build.rs:95`, `:110`, `:300`, `:332`, `:352`, `:379`) and kept with the change log (`common/src/storage/transaction.rs:162-179`); 0.16 had none. |

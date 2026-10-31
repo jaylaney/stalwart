@@ -506,6 +506,9 @@ fn sanitize_or_lower(rcpt: &str) -> String {
 #[path = "../../../../../stalwart-tests/unit/smtp/src/inbound/dkim/tests.rs"]
 mod tests;
 
-#[cfg(test)]
+// Ruling 53: the module builds a `queue::Message` literal, which cannot name the
+// SEL-gated `tenant_ids` field that `enterprise` adds; `Message` has no `Default`
+// and no server-free constructor.
+#[cfg(all(test, not(feature = "enterprise")))]
 #[path = "dkim_restored_tests.rs"]
 mod tests;
