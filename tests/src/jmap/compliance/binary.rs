@@ -250,9 +250,11 @@ async fn blob_copy_not_found(ctx: &CompCtx<'_>) -> TestOutcome {
     check(!r["notCopied"].is_null(), "notCopied must be present")?;
     let nc = &r["notCopied"]["nonexistent-blob-xyz"];
     check(!nc.is_null(), "Invalid blob should be in notCopied")?;
+    // RFC 8620 6.3 names this error notFound, which 1.0 answers; 0.16 answered
+    // blobNotFound, which the suite expected.
     check_eq(
         nc["type"].as_str().unwrap_or(""),
-        "blobNotFound",
+        "notFound",
         "notCopied type",
     )
 }
