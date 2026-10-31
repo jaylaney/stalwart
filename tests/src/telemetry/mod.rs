@@ -24,8 +24,8 @@ pub async fn telemetry_tests() {
         .with_object(TracingStore::Default)
         .await
         .with_object(Jmap {
-            get_max_results: 100_000,
-            query_max_results: 100_000,
+            max_get_results: 100_000,
+            max_query_results: 100_000,
             ..Default::default()
         })
         .await

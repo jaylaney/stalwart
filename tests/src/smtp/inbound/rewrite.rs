@@ -103,7 +103,6 @@ pub async fn address_rewrite() {
                 ..Default::default()
             },
             message_id_hostname: Some("'mx.foobar.org'".into()),
-            duplicate_expiry: (86_400u64 * 100 * 7).into(),
             max_cpu_cycles: 10000,
             max_nested_includes: 5,
             max_out_messages: 5,

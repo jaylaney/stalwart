@@ -11,10 +11,7 @@ use crate::{
     },
     utils::{account::Account, dns::DnsCache, server::TestServerBuilder},
 };
-use mail_auth::{
-    common::{parse::TxtRecordParser, verify::DomainKey},
-    spf::Spf,
-};
+use mail_auth::{dkim::DomainKey, dns::TxtRecordParser, spf::SpfRecord};
 use registry::schema::{
     enums::{DkimCanonicalization, DkimRotationStage},
     structs::{
@@ -73,16 +70,25 @@ async fn sign_and_seal() {
                 else_: "strict".into(),
                 ..Default::default()
             },
-            dkim_sign_domain: Expression {
-                else_: "'example.com'".into(),
-                ..Default::default()
-            },
             dkim_verify: Expression {
                 else_: "relaxed".into(),
                 ..Default::default()
             },
             dkim_strict: false,
         })
+        .await;
+    // 1.0 moved the DKIM signing domain from SenderAuth to MtaStageData.
+    admin
+        .registry_update_setting(
+            registry::schema::structs::MtaStageData {
+                dkim_sign_domain: Expression {
+                    else_: "'example.com'".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            &[registry::schema::prelude::Property::DkimSignDomain],
+        )
         .await;
     admin.reload_settings().await;
     test.reload_core();
@@ -91,12 +97,12 @@ async fn sign_and_seal() {
     // Add SPF, DKIM and DMARC records
     test.server.txt_add(
         "mx.example.com",
-        Spf::parse(b"v=spf1 ip4:10.0.0.1 ip4:10.0.0.2 -all").unwrap(),
+        SpfRecord::parse(b"v=spf1 ip4:10.0.0.1 ip4:10.0.0.2 -all").unwrap(),
         Instant::now() + Duration::from_secs(5),
     );
     test.server.txt_add(
         "example.com",
-        Spf::parse(b"v=spf1 ip4:10.0.0.1 -all").unwrap(),
+        SpfRecord::parse(b"v=spf1 ip4:10.0.0.1 -all").unwrap(),
         Instant::now() + Duration::from_secs(5),
     );
     test.server.txt_add(

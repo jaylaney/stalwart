@@ -36,7 +36,7 @@ pub async fn test(test: &TestServer) {
     let mut batch = BatchBuilder::new();
     batch.set(
         ValueClass::Any(AnyClass {
-            subspace: SUBSPACE_PROPERTY,
+            subspace: Subspace::Property,
             key: vec![0u8],
         }),
         DATABASE_SCHEMA_VERSION.serialize(),
@@ -53,7 +53,7 @@ pub async fn test(test: &TestServer) {
             .unwrap();
         batch.set(ValueClass::Blob(BlobOp::Commit { hash }), vec![]);
     }
-    db.write(batch.build_all()).await.unwrap();
+    db.write_batch(&mut batch).await.unwrap();
 
     // Create account data
     println!("Creating account data...");
@@ -120,7 +120,7 @@ pub async fn test(test: &TestServer) {
             }
         }
 
-        db.write(batch.build_all()).await.unwrap();
+        db.write_batch(&mut batch).await.unwrap();
     }
 
     // Create queue, config and lookup data
@@ -165,7 +165,7 @@ pub async fn test(test: &TestServer) {
             );
         }
     }
-    db.write(batch.build_all()).await.unwrap();
+    db.write_batch(&mut batch).await.unwrap();
 
     // Create directory data
     println!("Creating directory data...");
@@ -179,7 +179,7 @@ pub async fn test(test: &TestServer) {
             .with_document(account_id)
             .add(ValueClass::Quota, account_id as i64 * 1000);
     }
-    db.write(batch.build_all()).await.unwrap();
+    db.write_batch(&mut batch).await.unwrap();
 
     // Obtain store hash
     println!("Calculating store hash...");
@@ -209,11 +209,11 @@ pub async fn test(test: &TestServer) {
             .write("localhost")
             .finalize(),
     );
-    db.write(batch.build_all()).await.unwrap();
+    db.write_batch(&mut batch).await.unwrap();
     test.server.core.restore(temp_dir.path.clone()).await;
     let mut batch = BatchBuilder::new();
     batch.clear(ValueClass::NodeId(0));
-    db.write(batch.build_all()).await.unwrap();
+    db.write_batch(&mut batch).await.unwrap();
 
     // Verify hash
     print!("Verifying store hash...");
@@ -233,7 +233,7 @@ struct Snapshot {
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct KeyValue {
-    subspace: u8,
+    subspace: Subspace,
     key: Vec<u8>,
     value: Vec<u8>,
 }
@@ -245,26 +245,26 @@ impl Snapshot {
         let mut keys = AHashSet::new();
 
         for (subspace, with_values) in [
-            (SUBSPACE_ACL, true),
-            (SUBSPACE_TASK_QUEUE, true),
-            (SUBSPACE_INDEXES, false),
-            (SUBSPACE_DELETED_ITEMS, true),
-            (SUBSPACE_SPAM_SAMPLES, true),
-            (SUBSPACE_BLOB_LINK, true),
-            (SUBSPACE_BLOBS, true),
-            (SUBSPACE_LOGS, true),
-            (SUBSPACE_COUNTER, !is_sql),
-            (SUBSPACE_IN_MEMORY_COUNTER, !is_sql),
-            (SUBSPACE_IN_MEMORY_VALUE, true),
-            (SUBSPACE_PROPERTY, true),
-            (SUBSPACE_REGISTRY, true),
-            (SUBSPACE_REGISTRY_IDX, !is_sql),
-            (SUBSPACE_REGISTRY_PK, true),
-            (SUBSPACE_QUEUE_MESSAGE, true),
-            (SUBSPACE_QUEUE_EVENT, true),
-            (SUBSPACE_QUOTA, !is_sql),
-            (SUBSPACE_REPORT_OUT, true),
-            (SUBSPACE_REPORT_IN, true),
+            (Subspace::Acl, true),
+            (Subspace::TaskQueue, true),
+            (Subspace::Indexes, false),
+            (Subspace::DeletedItems, true),
+            (Subspace::SpamSamples, true),
+            (Subspace::BlobLink, true),
+            (Subspace::Blobs, true),
+            (Subspace::Logs, true),
+            (Subspace::Counter, !is_sql),
+            (Subspace::Property, true),
+            (Subspace::Immutable, true),
+            (Subspace::IndexProperty, true),
+            (Subspace::Registry, true),
+            (Subspace::RegistryIndex, !is_sql),
+            (Subspace::RegistryPrimaryKey, true),
+            (Subspace::Directory, true),
+            (Subspace::QueueMessage, true),
+            (Subspace::QueueEvent, true),
+            (Subspace::ReportOut, true),
+            (Subspace::ReportIn, true),
         ] {
             let from_key = AnyKey {
                 subspace,
@@ -300,7 +300,7 @@ impl Snapshot {
             if !other.keys.contains(key) {
                 println!(
                     "Subspace {}, Key {:?} not found in restored snapshot",
-                    char::from(key.subspace),
+                    char::from(key.subspace as u8),
                     key.key,
                 );
                 is_err = true;
@@ -310,7 +310,7 @@ impl Snapshot {
             if !self.keys.contains(key) {
                 println!(
                     "Subspace {}, Key {:?} not found in original snapshot",
-                    char::from(key.subspace),
+                    char::from(key.subspace as u8),
                     key.key,
                 );
                 is_err = true;

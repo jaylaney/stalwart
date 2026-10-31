@@ -37,7 +37,7 @@ use tokio_rustls::{
     rustls::{self, pki_types::ServerName},
 };
 use trc::{
-    AuthEvent, CalendarEvent, Collector, EvalEvent, EventType, HttpEvent, JmapEvent, StoreEvent,
+    AuthEvent, CacheEvent, CalendarEvent, Collector, EvalEvent, EventType, HttpEvent, JmapEvent,
     ipc::subscriber::{Interests, SubscriberBuilder},
 };
 
@@ -506,7 +506,7 @@ pub async fn test(test: &mut TestServer) {
         .registry_create_object(Domain {
             name: SUBADDR_DOMAIN.to_string(),
             aliases: Map::new(vec![SUBADDR_DOMAIN_ALIAS.to_string()]),
-            is_enabled: true,
+            enable: true,
             certificate_management: CertificateManagement::Manual,
             dns_management: DnsManagement::Manual,
             dkim_management: DkimManagement::Manual,
@@ -538,8 +538,8 @@ pub async fn test(test: &mut TestServer) {
         EventType::Jmap(JmapEvent::InvalidResultReference),
         EventType::Auth(AuthEvent::Failed),
         EventType::Calendar(CalendarEvent::ItipMessageError),
-        EventType::Store(StoreEvent::CacheHit),
-        EventType::Store(StoreEvent::CacheMiss),
+        EventType::Cache(CacheEvent::Hit),
+        EventType::Cache(CacheEvent::Miss),
         EventType::Eval(EvalEvent::Result),
         EventType::Eval(EvalEvent::Error),
     ];
@@ -547,7 +547,7 @@ pub async fn test(test: &mut TestServer) {
     for event_type in traced {
         interests.set(event_type);
     }
-    let (_tx, mut rx) = SubscriberBuilder::new(SUBSCRIBER_ID.into())
+    let (_tx, mut rx, _) = SubscriberBuilder::new(SUBSCRIBER_ID.into())
         .set_interests(traced)
         .with_lossy(false)
         .register();
@@ -861,8 +861,8 @@ pub async fn test(test: &mut TestServer) {
     // Recipient lookups: the subscriber sees upstream's cache events with
     // the looked-up local part, and none carries a key account's attendee.
     let lookups = [
-        traced_as(EventType::Store(StoreEvent::CacheHit)),
-        traced_as(EventType::Store(StoreEvent::CacheMiss)),
+        traced_as(EventType::Cache(CacheEvent::Hit)),
+        traced_as(EventType::Cache(CacheEvent::Miss)),
     ]
     .join("\n");
     assert!(

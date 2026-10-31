@@ -2553,7 +2553,7 @@ pub async fn test_errors(test: &mut TestServer) {
     rewrite_inbox_item(test, key2.id, corrupt, |item| {
         // The root's last entry is `X-ZA-KEY`; its text becomes garbage.
         let envelope = item.event.components[0].entries.last_mut().unwrap();
-        envelope.values = vec![ICalendarValue::Text("AAAA".to_string())];
+        envelope.values = vec![ICalendarValue::Text("AAAA".to_string())].into();
     })
     .await;
     assert_eq!(pending_ids(test, key2.id).await.len(), 2);

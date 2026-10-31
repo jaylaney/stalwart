@@ -38,7 +38,10 @@ use common::{
 };
 use email::{
     mailbox::{DRAFTS_ID, SENT_ID},
-    message::{ingest::group::IngestGroup, za::open_stub},
+    message::{
+        ingest::group::IngestGroup,
+        za::{open_stub, view::ZaMailView},
+    },
     push::{EmailPush, Urgency},
 };
 use groupware::calendar::seal::{WRAP_MK, WRAP_PK};
@@ -822,7 +825,11 @@ async fn content_free_reads_open_nothing(test: &TestServer, key: &Account) {
     // private key yet.
     let fresh_keys = || {
         test.server.inner.cache.za_keys.remove_account(key_id);
-        test.server.inner.cache.http_auth.clear();
+        test.server
+            .inner
+            .cache
+            .grant_revocations
+            .clear(&test.server.inner.cache.http_auth);
     };
 
     let mut imap = imap_session(key, b"_f ").await;
@@ -905,7 +912,7 @@ async fn corrupted_stub_and_blob(test: &TestServer, key: &Account) {
     for event_type in traced {
         interests.set(event_type);
     }
-    let (_tx, mut rx) = SubscriberBuilder::new(SUBSCRIBER_ID.into())
+    let (_tx, mut rx, _) = SubscriberBuilder::new(SUBSCRIBER_ID.into())
         .set_interests(traced)
         .with_lossy(false)
         .register();

@@ -657,7 +657,7 @@ async fn plain_update_trace(test: &TestServer, failures: &mut Vec<String>) {
     let event_type = EventType::Store(StoreEvent::AssertValueFailed);
     let mut interests = Interests::default();
     interests.set(event_type);
-    let (_tx, mut rx) = SubscriberBuilder::new("sharing-review-trace".into())
+    let (_tx, mut rx, _) = SubscriberBuilder::new("sharing-review-trace".into())
         .set_interests([event_type])
         .with_lossy(false)
         .register();

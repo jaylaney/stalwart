@@ -7,7 +7,6 @@
 use crate::utils::server::TestServerBuilder;
 pub use crate::utils::za::key_accounts_mode;
 use ahash::AHashMap;
-use common::{DavResource, DavResources};
 use groupware::DavResourceName;
 use hyper::StatusCode;
 use registry::{
@@ -258,16 +257,6 @@ pub async fn webdav_tests() {
     // Remove test data
     if test.is_reset() {
         test.temp_dir.delete();
-    }
-}
-
-pub trait DavResourcesTest {
-    fn items(&self) -> Vec<DavResource>;
-}
-
-impl DavResourcesTest for DavResources {
-    fn items(&self) -> Vec<DavResource> {
-        self.resources.clone()
     }
 }
 

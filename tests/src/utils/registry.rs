@@ -262,7 +262,8 @@ impl Account {
     }
 
     pub async fn reload_settings(&self) {
-        self.registry_create_object(Action::ReloadSettings).await;
+        self.registry_create_object(Action::ReloadSettings(Default::default()))
+            .await;
     }
 
     pub async fn reload_lookup_stores(&self) {

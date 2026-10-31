@@ -8793,6 +8793,7 @@ dependencies = [
  "sieve-rs",
  "smtp",
  "smtp-proto",
+ "smtp-report",
  "spam-filter",
  "store",
  "testcontainers",

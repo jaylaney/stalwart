@@ -5,8 +5,8 @@
  */
 
 use crate::utils::{dns::DnsCache, server::TestServerBuilder};
-use common::expr::{tokenizer::TokenMap, *};
-use mail_auth::{DnssecStatus, MX};
+use common::expr::{if_block::IfBlock, tokenizer::TokenMap, *};
+use mail_auth::{DnssecStatus, Mx};
 use registry::schema::{
     enums::ExpressionVariable,
     prelude::{ObjectType, Property},
@@ -69,7 +69,7 @@ async fn expressions() {
             namespace: "sql".into(),
             store: LookupStore::Sqlite(SqliteStore {
                 path: format!("{}/smtp_sql.db", test.tmp_dir()),
-                pool_max_connections: 10,
+                pool_max_connections: Some(10),
                 pool_workers: None,
             }),
         })
@@ -79,7 +79,7 @@ async fn expressions() {
 
     test.server.mx_add(
         "test.org",
-        vec![MX {
+        vec![Mx {
             exchanges: vec!["mx.foobar.org".into()].into_boxed_slice(),
             preference: 10,
         }],
@@ -119,16 +119,17 @@ async fn expressions() {
         ExpressionVariable::Priority,
     ]);
     for (expr, expected) in TESTS {
-        let e = Expression::parse(&token_map, expr);
+        // 1.0 removed `Server::eval_expr`: an expression is evaluated as an
+        // `IfBlock` with no conditions.
+        let e = IfBlock::new(
+            ObjectType::Account.singleton(),
+            Property::AccountName,
+            Box::default(),
+            Expression::parse(&token_map, expr).unwrap(),
+        );
         assert_eq!(
             test.server
-                .eval_expr::<String, _>(
-                    &e,
-                    &RecipientDomain::new("test.org"),
-                    ObjectType::Account.singleton(),
-                    Property::AccountName,
-                    0
-                )
+                .eval_if::<String, _>(&e, &RecipientDomain::new("test.org"), &mut Bump::new(), 0)
                 .await
                 .unwrap(),
             *expected,

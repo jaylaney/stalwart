@@ -12,7 +12,7 @@ use dav_proto::schema::property::{
 };
 use groupware::DavResourceName;
 use hyper::StatusCode;
-use types::dead_property::DeadElementTag;
+use types::metadata::XmlName;
 
 pub async fn test(test: &TestServer, assisted_discovery: bool) {
     let client = test.account("jane@example.com").webdav_client();
@@ -572,9 +572,9 @@ pub async fn test(test: &TestServer, assisted_discovery: bool) {
                             "2000-01-01T00:00:00Z",
                         ),
                         (
-                            DavProperty::DeadProperty(DeadElementTag::new(
+                            DavProperty::Dead(XmlName::owned(
+                                Some("http://example.com/ns/".to_string()),
                                 "my-dead-element".to_string(),
-                                Some("xmlns=\"http://example.com/ns/\" prop=\"abc\"".to_string()),
                             )),
                             "this is a dead but exciting element",
                         ),
@@ -585,9 +585,9 @@ pub async fn test(test: &TestServer, assisted_discovery: bool) {
                 .patch_and_check(
                     path,
                     [(
-                        DavProperty::DeadProperty(DeadElementTag::new(
+                        DavProperty::Dead(XmlName::owned(
+                            Some("http://example.com/ns/".to_string()),
                             "my-dead-element".to_string(),
-                            Some("xmlns=\"http://example.com/ns/\" prop=\"xyz\"".to_string()),
                         )),
                         "this is a modified dead but exciting element",
                     )],
@@ -597,9 +597,9 @@ pub async fn test(test: &TestServer, assisted_discovery: bool) {
             // Test 13: PROPPATCH remove on DAV properties
             let mut props = vec![
                 (
-                    DavProperty::DeadProperty(DeadElementTag::new(
+                    DavProperty::Dead(XmlName::owned(
+                        Some("http://example.com/ns/".to_string()),
                         "my-dead-element".to_string(),
-                        Some("xmlns=\"http://example.com/ns/\"".to_string()),
                     )),
                     "",
                 ),
@@ -687,9 +687,9 @@ pub async fn test(test: &TestServer, assisted_discovery: bool) {
             // Test 17: PROPPATCH should fail on large properties
             let mut chunky_props = vec![
                 DavProperty::WebDav(WebDavProperty::DisplayName),
-                DavProperty::DeadProperty(DeadElementTag::new(
+                DavProperty::Dead(XmlName::owned(
+                    Some("http://example.com/ns/".to_string()),
                     "my-chunky-dead-element".to_string(),
-                    Some("xmlns=\"http://example.com/ns/\"".to_string()),
                 )),
             ];
             if !is_file {
@@ -704,17 +704,16 @@ pub async fn test(test: &TestServer, assisted_discovery: bool) {
             let chunky_live_contents = (0..=(test.server.core.groupware.live_property_size + 1))
                 .map(|_| "a")
                 .collect::<String>();
-            let chunky_dead_contents =
-                (0..=(test.server.core.groupware.dead_property_size.unwrap() + 1))
-                    .map(|_| "a")
-                    .collect::<String>();
+            let chunky_dead_contents = (0..=(test.server.core.metadata.max_entry_size + 1))
+                .map(|_| "a")
+                .collect::<String>();
             let response = client
                 .proppatch(
                     path,
                     chunky_props.iter().map(|prop| {
                         (
                             prop.clone(),
-                            if matches!(prop, DavProperty::DeadProperty(_)) {
+                            if matches!(prop, DavProperty::Dead(_)) {
                                 &chunky_dead_contents
                             } else {
                                 &chunky_live_contents

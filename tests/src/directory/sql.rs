@@ -4,7 +4,10 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use directory::{Account, Credentials, Group, Recipient, backend::sql::SqlDirectory};
+use directory::{
+    Account, Credentials, Group, Recipient, backend::sql::SqlDirectory,
+    core::verifier::PasswordVerifier,
+};
 use registry::schema::structs::{self, SqlAuthStore};
 use store::{Store, backend::sqlite::SqliteStore};
 
@@ -98,11 +101,14 @@ pub async fn test() {
     // Test authentication
     let sql = SqlDirectory::open(config, &sql_store).await.unwrap();
     assert_eq!(
-        sql.authenticate(&Credentials::Basic {
-            username: "john@example.org".to_string(),
-            secret: "john secret".to_string(),
-            mfa_token: None,
-        })
+        sql.authenticate(
+            &Credentials::Basic {
+                username: "john@example.org".to_string(),
+                secret: "john secret".to_string(),
+                mfa_token: None,
+            },
+            &PasswordVerifier::default(),
+        )
         .await
         .unwrap(),
         Account {
@@ -114,22 +120,28 @@ pub async fn test() {
         }
     );
     assert!(
-        sql.authenticate(&Credentials::Basic {
-            username: "john@example.org".to_string(),
-            secret: "wrong secret".to_string(),
-            mfa_token: None,
-        })
+        sql.authenticate(
+            &Credentials::Basic {
+                username: "john@example.org".to_string(),
+                secret: "wrong secret".to_string(),
+                mfa_token: None,
+            },
+            &PasswordVerifier::default(),
+        )
         .await
         .is_err()
     );
 
     // Empty columns are treated as missing values
     assert_eq!(
-        sql.authenticate(&Credentials::Basic {
-            username: "bob@example.org".to_string(),
-            secret: "bob secret".to_string(),
-            mfa_token: None,
-        })
+        sql.authenticate(
+            &Credentials::Basic {
+                username: "bob@example.org".to_string(),
+                secret: "bob secret".to_string(),
+                mfa_token: None,
+            },
+            &PasswordVerifier::default(),
+        )
         .await
         .unwrap(),
         Account {
@@ -141,11 +153,14 @@ pub async fn test() {
         }
     );
     assert!(
-        sql.authenticate(&Credentials::Basic {
-            username: "nobody@example.org".to_string(),
-            secret: "".to_string(),
-            mfa_token: None,
-        })
+        sql.authenticate(
+            &Credentials::Basic {
+                username: "nobody@example.org".to_string(),
+                secret: "".to_string(),
+                mfa_token: None,
+            },
+            &PasswordVerifier::default(),
+        )
         .await
         .is_err()
     );

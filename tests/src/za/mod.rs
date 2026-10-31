@@ -6,7 +6,7 @@
 
 use crate::utils::server::{TestServer, TestServerBuilder};
 use ::registry::schema::{
-    enums::{NetworkListenerProtocol, Permission},
+    enums::{ClientIpSource, NetworkListenerProtocol, Permission},
     prelude::Property,
     structs::{Expression, Http, Imap, MtaStageAuth, Rate},
 };
@@ -89,14 +89,14 @@ pub async fn za_tests() {
     admin
         .registry_update_setting(
             Http {
-                use_x_forwarded: true,
+                client_ip_source: ClientIpSource::XForwardedFor,
                 rate_limit_anonymous: Some(Rate {
                     count: 10000,
                     period: Duration::from_millis(60000),
                 }),
                 ..Default::default()
             },
-            &[Property::UseXForwarded, Property::RateLimitAnonymous],
+            &[Property::ClientIpSource, Property::RateLimitAnonymous],
         )
         .await;
     // The cache module logs a key account in over plain-text IMAP.

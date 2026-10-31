@@ -21,7 +21,7 @@ use jmap_client::{
 };
 use registry::{
     schema::{
-        enums::BlockReason,
+        enums::{BlockReason, ClientIpSource},
         prelude::{ObjectType, Property},
         structs::{Action, BlockedIp, Http, Jmap},
     },
@@ -45,10 +45,10 @@ pub async fn test(test: &mut TestServer) {
     admin
         .registry_update_setting(
             Http {
-                use_x_forwarded: true,
+                client_ip_source: ClientIpSource::XForwardedFor,
                 ..Default::default()
             },
-            &[Property::UseXForwarded],
+            &[Property::ClientIpSource],
         )
         .await;
     admin
@@ -454,10 +454,10 @@ pub async fn test(test: &mut TestServer) {
     admin
         .registry_update_setting(
             Http {
-                use_x_forwarded: false,
+                client_ip_source: ClientIpSource::Peer,
                 ..Default::default()
             },
-            &[Property::UseXForwarded],
+            &[Property::ClientIpSource],
         )
         .await;
     admin.reload_settings().await;

@@ -441,7 +441,7 @@ async fn calendar_retry_keeps_event_and_uid_assertions(
     .await;
     let stored = event_archive(test, owner, id).await;
     let mut concurrent = stored.za_event();
-    concurrent.flags ^= 1;
+    concurrent.meta.flags ^= 1;
     save_event(test, owner, id, &stored, concurrent.clone()).await;
     stage(test, owner, calendar, 2).await;
     assert_eq!(
@@ -450,8 +450,8 @@ async fn calendar_retry_keeps_event_and_uid_assertions(
         "calendar retry overwrote a concurrent event"
     );
     assert_eq!(
-        event_archive(test, owner, id).await.za_event().flags,
-        concurrent.flags
+        event_archive(test, owner, id).await.za_event().meta.flags,
+        concurrent.meta.flags
     );
 
     test_hooks::set_lease_secs_override(Some(1));
@@ -539,7 +539,7 @@ async fn non_put_writers_use_current_domain(
         .await
         .unwrap();
     rewrap_event(&mut linked, &context.domain, &other_context.domain).unwrap();
-    linked.names.push(common::DavName {
+    linked.meta.names.push(common::DavName {
         name: "linked.ics".into(),
         parent_id: other_id,
     });
@@ -876,7 +876,7 @@ async fn grantee_commit_seams(test: &mut TestServer, owner: u32, calendar: u32, 
         .unwrap();
     let private_parent = resources.by_path("default").unwrap().document_id();
     let mut linked = committed.clone();
-    linked.names.push(common::DavName {
+    linked.meta.names.push(common::DavName {
         name: "race-grantee-linked.ics".into(),
         parent_id: private_parent,
     });
@@ -884,7 +884,7 @@ async fn grantee_commit_seams(test: &mut TestServer, owner: u32, calendar: u32, 
         &test.server,
         &token,
         owner,
-        &linked,
+        &linked.meta,
         calendar,
         utils::map::bitmap::Bitmap::new().with_item(Acl::ModifyItems),
     )
@@ -961,7 +961,7 @@ async fn grantee_commit_seams(test: &mut TestServer, owner: u32, calendar: u32, 
                     &test.server,
                     &token,
                     owner,
-                    &linked,
+                    &linked.meta,
                     calendar,
                     required
                 )
@@ -1199,7 +1199,7 @@ async fn drain_and_contacts_use_current_domain(
         .document_id();
     let stored = event_archive(test, owner, source_id).await;
     let mut linked = stored.za_event();
-    linked.names.push(common::DavName {
+    linked.meta.names.push(common::DavName {
         name: "linked.ics".into(),
         parent_id: other_id,
     });
@@ -1271,7 +1271,9 @@ async fn delete_retry_keeps_due_alarm(test: &TestServer, owner: u32, calendar: u
     let task_id = types::id::Id::from_parts(owner, event_id).id();
     let due_key = || {
         ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Due {
-            id: task_id,
+            id: store::write::TaskId::Assigned(task_id),
+            // The fixture's alarm is ACTION:EMAIL.
+            typ: registry::schema::enums::TaskType::CalendarAlarmEmail,
             due: due as u64,
         }))
     };
@@ -1384,8 +1386,7 @@ async fn task5_boundary_and_copy_races(test: &mut TestServer) {
             .commit_batch(batch)
             .await
             .unwrap()
-            .last_change_id(keys.account_id)
-            .unwrap()
+            .last_change_id(keys.account_id, SyncCollection::Calendar)
     }
     // An interrupted second write stays pending until an explicit owner read adapter repairs it.
     let committed = pending(test, &keys, shared).await;
@@ -1916,8 +1917,8 @@ async fn overwrite_other_parent_fences(test: &TestServer, owner: u32, client: &D
     );
     assert_eq!(moved, StatusCode::NO_CONTENT);
     let survivor = event_archive(test, owner, ow_target).await.za_event();
-    assert_eq!(survivor.names.len(), 1);
-    assert_eq!(survivor.names[0].parent_id, ow_other);
+    assert_eq!(survivor.meta.names.len(), 1);
+    assert_eq!(survivor.meta.names[0].parent_id, ow_other);
     // Collection overwrite has no replay of creation; its pre-creation unlink
     // chunk must lose the other parent's assertion before changing any name.
     let copying = async move {
@@ -2632,7 +2633,7 @@ async fn sharing_http_races(test: &mut TestServer) {
                 .unwrap();
             let stored = event_archive(test, owner, event).await;
             let mut linked = stored.za_event();
-            linked.names.push(common::DavName {
+            linked.meta.names.push(common::DavName {
                 name: format!("{class}-copy.ics"),
                 parent_id: other,
             });
@@ -3684,7 +3685,7 @@ async fn sharing_event_terminal_contract(
     .await;
     let stored = event_archive(test, owner, last).await;
     let mut changed = stored.za_event();
-    changed.modified += 1;
+    changed.meta.modified += 1;
     save_event(test, owner, last, &stored, changed).await;
     let old = test.server.za_vault_record(owner).await.unwrap().unwrap();
     let mut revised = old.record.clone();

@@ -5,13 +5,13 @@
  */
 
 use crate::utils::{
-    account::Account, imap::AssertResult, jmap::JmapUtils, server::TestServer, smtp::SmtpConnection,
+    account::Account, imap::AssertResult, server::TestServer, smtp::SmtpConnection,
 };
 use common::{Server, auth::BuildAccessToken};
 use email::{
     cache::{MessageCacheFetch, email::MessageCacheAccess},
     mailbox::{INBOX_ID, JUNK_ID, SENT_ID},
-    message::metadata::MessageMetadata,
+    message::metadata::MetadataRow,
 };
 use groupware::DavResourceName;
 use jmap::blob::download::BlobDownload;
@@ -28,11 +28,7 @@ use registry::{
 };
 use serde_json::json;
 use std::time::Duration;
-use store::{
-    ValueKey,
-    roaring::RoaringBitmap,
-    write::{AlignedBytes, Archive},
-};
+use store::{Deserialize, ValueKey, roaring::RoaringBitmap, write::serialize::RawValue};
 use types::{
     blob::{BlobClass, BlobId},
     collection::Collection,
@@ -121,7 +117,7 @@ pub async fn test(test: &mut TestServer) {
             aliases: List::from_iter([EmailAlias {
                 name: "corporate".to_string(),
                 domain_id,
-                enabled: true,
+                enable: true,
                 ..Default::default()
             }]),
             domain_id,
@@ -151,7 +147,7 @@ pub async fn test(test: &mut TestServer) {
         .await
         .unwrap();
 
-    assert_eq!(john_cache.emails.items.len(), 1);
+    assert_eq!(john_cache.emails.len(), 1);
     assert_eq!(john_cache.in_mailbox(INBOX_ID).count(), 1);
     assert_eq!(john_cache.in_mailbox(JUNK_ID).count(), 0);
 
@@ -200,13 +196,13 @@ pub async fn test(test: &mut TestServer) {
         .unwrap();
     let inbox_ids = john_cache
         .in_mailbox(INBOX_ID)
-        .map(|e| e.document_id)
+        .map(|e| e.document_id())
         .collect::<RoaringBitmap>();
     let junk_ids = john_cache
         .in_mailbox(JUNK_ID)
-        .map(|e| e.document_id)
+        .map(|e| e.document_id())
         .collect::<RoaringBitmap>();
-    assert_eq!(john_cache.emails.items.len(), 2);
+    assert_eq!(john_cache.emails.len(), 2);
     assert_eq!(inbox_ids.len(), 1);
     assert_eq!(junk_ids.len(), 1);
     assert_message_headers_contains(
@@ -258,13 +254,13 @@ END:VCARD
         .unwrap();
     let inbox_ids = john_cache
         .in_mailbox(INBOX_ID)
-        .map(|e| e.document_id)
+        .map(|e| e.document_id())
         .collect::<RoaringBitmap>();
     let junk_ids = john_cache
         .in_mailbox(JUNK_ID)
-        .map(|e| e.document_id)
+        .map(|e| e.document_id())
         .collect::<RoaringBitmap>();
-    assert_eq!(john_cache.emails.items.len(), 3);
+    assert_eq!(john_cache.emails.len(), 3);
     assert_eq!(inbox_ids.len(), 2);
     assert_eq!(junk_ids.len(), 1);
     dav_client.delete_default_containers().await;
@@ -306,7 +302,6 @@ END:VCARD
             .await
             .unwrap()
             .emails
-            .items
             .len(),
         4
     );
@@ -333,13 +328,13 @@ END:VCARD
         .unwrap();
     let inbox_ids = john_cache
         .in_mailbox(INBOX_ID)
-        .map(|e| e.document_id)
+        .map(|e| e.document_id())
         .collect::<RoaringBitmap>();
     let junk_ids = john_cache
         .in_mailbox(JUNK_ID)
-        .map(|e| e.document_id)
+        .map(|e| e.document_id())
         .collect::<RoaringBitmap>();
-    assert_eq!(john_cache.emails.items.len(), 5);
+    assert_eq!(john_cache.emails.len(), 5);
     assert_eq!(inbox_ids.len(), 3);
     assert_eq!(junk_ids.len(), 1);
     assert_message_headers_contains(
@@ -389,7 +384,6 @@ END:VCARD
                 .await
                 .unwrap()
                 .emails
-                .items
                 .len(),
             num_messages,
             "for {}",
@@ -429,7 +423,6 @@ END:VCARD
                 .await
                 .unwrap()
                 .emails
-                .items
                 .len(),
             num_messages,
             "for {}",
@@ -465,32 +458,35 @@ END:VCARD
         let account_id = account.id().document_id();
         let cache = test.server.get_cached_messages(account_id).await.unwrap();
         assert_eq!(
-            cache.emails.items.len(),
+            cache.emails.len(),
             num_messages,
             "for {}",
             account.id_string()
         );
         let access_token = test.server.access_token(account_id).await.unwrap().build();
 
-        for document_id in cache.in_mailbox(INBOX_ID).map(|e| e.document_id) {
-            let metadata = message_metadata(&test.server, account_id, document_id).await;
+        for document_id in cache.in_mailbox(INBOX_ID).map(|e| e.document_id()) {
+            // 1.0's row keeps the raw headers beside the archived metadata.
+            let row = message_metadata(&test.server, account_id, document_id).await;
+            let metadata = row.unarchive().unwrap();
+            let raw_headers = row.raw_headers().unwrap();
+            let blob_hash = metadata.blob_hash();
             let partial_message = test
                 .server
                 .blob_store()
-                .get_blob(metadata.blob_hash.0.as_ref(), 0..usize::MAX)
+                .get_blob(blob_hash.as_slice(), 0..usize::MAX)
                 .await
                 .unwrap()
                 .unwrap();
 
-            assert_ne!(metadata.blob_body_offset, 0);
+            assert_ne!(metadata.blob_body_offset(), 0);
             let expected_full_message = String::from_utf8(
-                ChainedBytes::new(metadata.raw_headers.as_ref())
-                    .with_last(
-                        partial_message
-                            .get(metadata.blob_body_offset as usize..)
-                            .unwrap_or_default(),
-                    )
-                    .to_bytes(),
+                ChainedBytes::from_blob(
+                    raw_headers.as_ref(),
+                    &partial_message,
+                    metadata.blob_body_offset(),
+                )
+                .to_vec(),
             )
             .unwrap();
             assert!(
@@ -502,7 +498,7 @@ END:VCARD
                 test.server
                     .blob_download(
                         &BlobId {
-                            hash: metadata.blob_hash,
+                            hash: blob_hash,
                             class: BlobClass::Linked {
                                 account_id,
                                 collection: Collection::Email.into(),
@@ -514,7 +510,8 @@ END:VCARD
                     )
                     .await
                     .unwrap()
-                    .unwrap(),
+                    .unwrap()
+                    .into_bytes(),
             )
             .unwrap();
             assert_eq!(full_message, expected_full_message, "for {account_id}");
@@ -717,27 +714,31 @@ async fn message_headers(server: &Server, account_id: u32, document_id: u32) -> 
     std::str::from_utf8(
         message_metadata(server, account_id, document_id)
             .await
-            .raw_headers
+            .raw_headers()
+            .unwrap()
             .as_ref(),
     )
     .unwrap()
     .to_string()
 }
 
-async fn message_metadata(server: &Server, account_id: u32, document_id: u32) -> MessageMetadata {
-    server
-        .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::property(
-            account_id,
-            Collection::Email,
-            document_id,
-            EmailField::Metadata,
-        ))
-        .await
-        .unwrap()
-        .unwrap()
-        .deserialize::<MessageMetadata>()
-        .unwrap()
+/// The message's metadata row: field 71 in the immutable class at 1.0.
+async fn message_metadata(server: &Server, account_id: u32, document_id: u32) -> MetadataRow {
+    MetadataRow::deserialize(
+        &server
+            .store()
+            .get_value::<RawValue>(ValueKey::immutable(
+                account_id,
+                Collection::Email,
+                document_id,
+                EmailField::Metadata,
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .0,
+    )
+    .unwrap()
 }
 
 async fn inbox_count(server: &Server, account: &Account) -> usize {
@@ -746,6 +747,5 @@ async fn inbox_count(server: &Server, account: &Account) -> usize {
         .await
         .unwrap()
         .emails
-        .items
         .len()
 }

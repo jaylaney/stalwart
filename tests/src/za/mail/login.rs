@@ -88,7 +88,7 @@ pub async fn test(test: &mut TestServer) {
 fn baseline(test: &TestServer, id: u32) -> usize {
     let caches = &test.server.inner.cache;
     caches.za_keys.remove_account(id);
-    caches.http_auth.clear();
+    caches.grant_revocations.clear(&caches.http_auth);
     live_keys(id)
 }
 

@@ -162,7 +162,10 @@ async fn bump_registry_revision(test: &TestServer) {
         .unwrap();
     let old_object = Object::with_revision(object.inner.clone(), object.revision);
     let mut inner = object.inner;
-    let ObjectInner::Account(structs::Account::User(user)) = &mut inner else {
+    let ObjectInner::Account(account) = &mut inner else {
+        panic!("not an account");
+    };
+    let structs::Account::User(user) = account.as_mut() else {
         panic!("not a user account");
     };
     user.description = Some(format!("Key Seven, revision {}", object.revision));

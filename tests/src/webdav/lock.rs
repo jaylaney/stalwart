@@ -162,7 +162,7 @@ pub async fn test(test: &TestServer) {
         client
             .lock_create(
                 &path,
-                (0..=test.server.core.groupware.dead_property_size.unwrap() + 1)
+                (0..=test.server.core.metadata.max_entry_size + 1)
                     .map(|_| "a")
                     .collect::<String>()
                     .as_str(),

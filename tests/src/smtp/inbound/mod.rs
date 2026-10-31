@@ -14,7 +14,7 @@ use smtp::queue::{Message, MessageWrapper, QueueId, QueuedMessage};
 use std::time::Duration;
 use store::{
     Deserialize, IterateParams, U64_LEN, ValueKey,
-    write::{AlignedBytes, Archive, QueueClass, ValueClass, key::DeserializeBigEndian},
+    write::{Archive, ArchiveBytes, QueueClass, ValueClass, key::DeserializeBigEndian},
 };
 use tokio::sync::mpsc::error::TryRecvError;
 use types::id::Id;
@@ -225,7 +225,7 @@ impl TestServer {
                         queue_name: Default::default(),
                         is_multi_queue: false,
                         span_id: 0,
-                        message: <Archive<AlignedBytes> as Deserialize>::deserialize(value)?
+                        message: <Archive<ArchiveBytes> as Deserialize>::deserialize(value)?
                             .deserialize::<Message>()?,
                     });
                     Ok(true)
@@ -315,7 +315,7 @@ impl TestQueueEvent for QueueEvent {
     fn is_refresh(&self) -> bool {
         matches!(
             self,
-            QueueEvent::Refresh
+            QueueEvent::Refresh(_)
                 | QueueEvent::WorkerDone {
                     status: QueueEventStatus::Deferred,
                     ..
@@ -325,7 +325,7 @@ impl TestQueueEvent for QueueEvent {
 
     fn assert_refresh(self) {
         match self {
-            QueueEvent::Refresh
+            QueueEvent::Refresh(_)
             | QueueEvent::WorkerDone {
                 status: QueueEventStatus::Deferred,
                 ..

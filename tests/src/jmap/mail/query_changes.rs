@@ -8,7 +8,7 @@ use crate::{
     jmap::mail::changes::{LogAction, ParseState},
     utils::server::TestServer,
 };
-use ::email::message::metadata::MessageData;
+use ::email::message::messagedata::{MessageData, PendingMessageData};
 use common::storage::index::ObjectIndexBuilder;
 use jmap_client::{
     core::query::{Comparator, Filter},
@@ -20,7 +20,7 @@ use std::str::FromStr;
 use store::{
     ValueKey,
     ahash::{AHashMap, AHashSet},
-    write::{AlignedBytes, Archive, BatchBuilder},
+    write::BatchBuilder,
 };
 use types::{
     collection::{Collection, SyncCollection},
@@ -124,8 +124,8 @@ pub async fn test(test: &TestServer) {
                 let mut batch = BatchBuilder::new();
                 batch
                     .with_document(id.document_id())
-                    .log_item_update(SyncCollection::Email, id.prefix_id().into());
-                server.store().write(batch.build_all()).await.unwrap();
+                    .log_item_update(SyncCollection::Email, Some(id.prefix_id().into()));
+                server.store().write_batch(&mut batch).await.unwrap();
                 updated_ids.insert(id);
             }
             LogAction::Delete(id) => {
@@ -139,9 +139,11 @@ pub async fn test(test: &TestServer) {
 
                 //let new_thread_id = store::rand::random::<u32>();
 
-                let old_message_ = server
+                // 1.0 stores a message's data in its own encoding, not as
+                // an archive.
+                let old_message = server
                     .store()
-                    .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                    .get_value::<MessageData>(ValueKey::archive(
                         account.id().document_id(),
                         Collection::Email,
                         id.document_id(),
@@ -149,15 +151,14 @@ pub async fn test(test: &TestServer) {
                     .await
                     .unwrap()
                     .unwrap();
-                let old_message = old_message_.to_unarchived::<MessageData>().unwrap();
-                let mut new_message = old_message.deserialize::<MessageData>().unwrap();
+                let mut new_message = old_message.clone();
                 new_message.thread_id = thread_id;
 
                 server
                     .core
                     .storage
                     .data
-                    .write(
+                    .write_batch(
                         BatchBuilder::new()
                             .with_account_id(account.id().document_id())
                             .with_collection(Collection::Email)
@@ -165,10 +166,14 @@ pub async fn test(test: &TestServer) {
                             .custom(
                                 ObjectIndexBuilder::new()
                                     .with_current(old_message)
-                                    .with_changes(new_message),
+                                    .with_changes(PendingMessageData {
+                                        data: new_message,
+                                        uid_slots: Default::default(),
+                                        thread_slot: None,
+                                        change_id: None,
+                                    }),
                             )
-                            .unwrap()
-                            .build_all(),
+                            .unwrap(),
                     )
                     .await
                     .unwrap();

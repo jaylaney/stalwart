@@ -328,23 +328,24 @@ pub async fn alarm(test: &TestServer) {
         .get_cached_messages(client.account_id)
         .await
         .unwrap();
-    assert_eq!(messages.emails.items.len(), 2);
+    assert_eq!(messages.emails.len(), 2);
     // Spec 11: the generic email still carries the event's start time.
     let start = TextFormatter::new("en").unwrap().field_to_string(
         &ItipValue::Time(ItipTime {
             start,
             tz_id: Tz::UTC.as_id(),
+            kind: Default::default(),
         }),
         DateStyle::Short,
     );
-    for message in messages.emails.items.iter() {
+    for message in messages.emails.iter() {
         // Mail spec 5.1: a key account's message is stored sealed, so it is
         // read opened with the account's keys.
         let (_, contents) = open_message(
             test,
             client.account_id,
             account.secret(),
-            message.document_id,
+            message.document_id(),
         )
         .await;
         let message = MessageParser::new().parse(&contents).unwrap();
@@ -361,14 +362,8 @@ pub async fn alarm(test: &TestServer) {
             "recipient is the account address, not the alarm attendee"
         );
         let html =
-            String::from_utf8(message.html_bodies().next().unwrap().contents().to_vec()).unwrap();
-        let text = message
-            .html_bodies()
-            .next()
-            .unwrap()
-            .text_contents()
-            .unwrap()
-            .to_string();
+            String::from_utf8(message.html_bodies().next().unwrap().as_bytes().to_vec()).unwrap();
+        let text = message.html_bodies().next().unwrap().to_string();
         assert!(
             html.contains(
                 "/dav/cal/john%40example.com/default/its-alarming-how-charming-i-feel.ics"
@@ -726,7 +721,7 @@ pub async fn alarm_override(test: &TestServer) {
     wait_for_delivery(test).await;
     let messages = test.server.get_cached_messages(id).await.unwrap();
     assert_eq!(
-        messages.emails.items.len(),
+        messages.emails.len(),
         1,
         "exactly one email reached the account"
     );
@@ -735,7 +730,7 @@ pub async fn alarm_override(test: &TestServer) {
         test,
         id,
         account.secret(),
-        messages.emails.items[0].document_id,
+        messages.emails.at(0).unwrap().document_id(),
     )
     .await;
     let message = MessageParser::new().parse(&contents).unwrap();
@@ -753,7 +748,10 @@ pub async fn alarm_override(test: &TestServer) {
         String::from_utf8_lossy(&contents)
     );
     assert_eq!(
-        message.header_raw("Auto-Submitted").map(str::trim),
+        message
+            .headers()
+            .get("Auto-Submitted")
+            .map(|header| std::str::from_utf8(header.raw_value()).unwrap().trim()),
         Some("auto-generated"),
         "the alarm email is auto-generated"
     );

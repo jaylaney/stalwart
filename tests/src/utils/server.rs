@@ -22,6 +22,7 @@ use common::{
     cache::swap::SwapTier,
     config::{
         server::{Listeners, ServerProtocol},
+        smtp::queue::QueueName,
         storage::Storage,
         telemetry::Telemetry,
     },
@@ -32,7 +33,7 @@ use common::{
     },
     psl,
 };
-use email::message::metadata::MessageMetadata;
+use email::message::metadata::MetadataRow;
 use groupware::cache::GroupwareCache;
 use http::HttpSessionManager;
 use imap::core::ImapSessionManager;
@@ -54,17 +55,14 @@ use services::{SpawnServices, broadcast::subscriber::spawn_broadcast_subscriber}
 use smtp::{
     SpawnQueueManager,
     core::{Session, SmtpSessionManager},
-    queue::{
-        manager::{Queue, SpawnQueue},
-        spool::{QueuedMessages, SmtpSpool},
-    },
+    queue::{QueuedMessage, manager::SpawnQueue, spool::QUEUE_REFRESH},
     reporting::scheduler::SpawnReport,
 };
 use std::{collections::VecDeque, path::PathBuf, str::FromStr, sync::Arc};
 use store::{
-    RegistryStore, Store, ValueKey,
+    Deserialize, IterateParams, RegistryStore, Store, ValueKey,
     registry::{RegistryQuery, bootstrap::Bootstrap, write::RegistryWrite},
-    write::{AlignedBytes, Archive, now},
+    write::{QueueClass, ValueClass, now, serialize::RawValue},
 };
 use tokio::sync::{mpsc, watch};
 use trc::EventType;
@@ -79,6 +77,12 @@ pub struct TestServer {
     pub report_rx: mpsc::Receiver<ReportingEvent>,
     shutdown_tx: watch::Sender<bool>,
     reset: bool,
+}
+
+/// The due queue events `all_queued_messages` returns.
+pub struct QueuedMessages {
+    pub messages: Vec<QueuedMessage>,
+    pub next_refresh: u64,
 }
 
 pub struct TestServerBuilder {
@@ -561,10 +565,11 @@ impl TestServer {
     }
 
     pub async fn fetch_email(&self, account_id: u32, document_id: u32) -> Vec<u8> {
-        let metadata_ = self
+        // 1.0 keeps a message's metadata row in the immutable class.
+        let row = self
             .server
             .store()
-            .get_value::<Archive<AlignedBytes>>(ValueKey::property(
+            .get_value::<RawValue>(ValueKey::immutable(
                 account_id,
                 Collection::Email,
                 document_id,
@@ -573,29 +578,65 @@ impl TestServer {
             .await
             .unwrap()
             .unwrap();
+        let blob_hash = MetadataRow::deserialize(&row.0)
+            .unwrap()
+            .unarchive()
+            .unwrap()
+            .blob_hash();
         self.server
             .blob_store()
-            .get_blob(
-                metadata_
-                    .unarchive::<MessageMetadata>()
-                    .unwrap()
-                    .blob_hash
-                    .0
-                    .as_slice(),
-                0..usize::MAX,
-            )
+            .get_blob(blob_hash.as_slice(), 0..usize::MAX)
             .await
             .unwrap()
             .unwrap()
     }
 
+    /// Every queue event that is due now, across all queues, and the time
+    /// of the next one (0.16's `SmtpSpool::next_event` over a fresh queue;
+    /// 1.0's queue manager scans one queue at a time, so the harness reads
+    /// the event keys itself).
     pub async fn all_queued_messages(&self) -> QueuedMessages {
+        let now = now();
+        let mut events = QueuedMessages {
+            messages: Vec::new(),
+            next_refresh: now + QUEUE_REFRESH,
+        };
+        let from_key = ValueKey::from(ValueClass::Queue(QueueClass::MessageEvent(
+            store::write::QueueEvent {
+                due: 0,
+                queue_id: 0,
+                queue_name: [0; 8],
+            },
+        )));
+        let to_key = ValueKey::from(ValueClass::Queue(QueueClass::MessageEvent(
+            store::write::QueueEvent {
+                due: u64::MAX,
+                queue_id: u64::MAX,
+                queue_name: store::write::QueueEvent::LAST_QUEUE,
+            },
+        )));
         self.server
-            .next_event(&mut Queue::new(
-                self.server.inner.clone(),
-                mpsc::channel(100).1,
-            ))
+            .store()
+            .iterate(
+                IterateParams::new(from_key, to_key).ascending().no_values(),
+                |key, _| {
+                    let event = store::write::QueueEvent::deserialize(key)?;
+                    if event.due > now {
+                        events.next_refresh = events.next_refresh.min(event.due);
+                    } else if let Some(queue_name) = QueueName::from_bytes(&event.queue_name) {
+                        events.messages.push(QueuedMessage {
+                            due: event.due,
+                            queue_id: event.queue_id,
+                            queue_name,
+                        });
+                    }
+                    Ok(true)
+                },
+            )
             .await
+            .unwrap();
+        events.messages.sort_by_key(|event| event.due);
+        events
     }
 
     pub async fn destroy_all_mailboxes(&self, account: &Account) {

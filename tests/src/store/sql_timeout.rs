@@ -9,8 +9,7 @@ use futures::FutureExt;
 use registry::schema::structs::DataStore;
 use std::{panic::AssertUnwindSafe, time::Duration};
 use store::{
-    IterateParams, Key, Rows, SUBSPACE_COUNTER, SUBSPACE_PROPERTY, Store, U32_LEN, Value, ValueKey,
-    write::ValueClass,
+    IterateParams, Key, Rows, Store, Subspace, U32_LEN, Value, ValueKey, write::ValueClass,
 };
 use types::collection::Collection;
 
@@ -284,7 +283,7 @@ impl Backend {
     }
 
     fn populate_query(&self) -> String {
-        let table = char::from(SUBSPACE_PROPERTY);
+        let table = char::from(Subspace::Property as u8);
         let prefix = key_prefix();
         let padding = VALUE_SIZE - U32_LEN;
         let last = NUM_KEYS - 1;
@@ -308,7 +307,7 @@ impl Backend {
     }
 
     fn populate_counters_query(&self) -> String {
-        let table = char::from(SUBSPACE_COUNTER);
+        let table = char::from(Subspace::Counter as u8);
         let prefix = key_prefix();
         let last = NUM_KEYS - 1;
 
@@ -328,11 +327,14 @@ impl Backend {
     }
 
     fn purge_query(&self) -> String {
-        format!("DELETE FROM {} WHERE v = 0", char::from(SUBSPACE_COUNTER))
+        format!(
+            "DELETE FROM {} WHERE v = 0",
+            char::from(Subspace::Counter as u8)
+        )
     }
 
     fn count_counters_query(&self) -> String {
-        let table = char::from(SUBSPACE_COUNTER);
+        let table = char::from(Subspace::Counter as u8);
         match self {
             #[cfg(feature = "postgres")]
             Backend::Postgres => format!("SELECT COUNT(*) FROM {table} WHERE k >= $1 AND k <= $2"),
@@ -342,7 +344,7 @@ impl Backend {
     }
 
     fn scan_query(&self) -> String {
-        let table = char::from(SUBSPACE_PROPERTY);
+        let table = char::from(Subspace::Property as u8);
         match self {
             #[cfg(feature = "postgres")]
             Backend::Postgres => {
@@ -356,7 +358,7 @@ impl Backend {
     }
 
     fn delete_query(&self) -> String {
-        let table = char::from(SUBSPACE_PROPERTY);
+        let table = char::from(Subspace::Property as u8);
         match self {
             #[cfg(feature = "postgres")]
             Backend::Postgres => format!("DELETE FROM {table} WHERE k >= $1 AND k <= $2"),

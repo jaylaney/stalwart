@@ -40,8 +40,7 @@ pub async fn test() {
             claim_username: "email".to_string(),
             claim_name: Some("name".to_string()),
             claim_groups: Some("groups".to_string()),
-            require_audience: Some("stalwart".to_string()),
-            require_scopes: Map::new(vec!["openid".to_string()]),
+            accepted_audiences: Map::new(vec!["stalwart".to_string()]),
             ..Default::default()
         }))
         .await;

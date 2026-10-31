@@ -37,20 +37,15 @@ pub async fn test(test: &TestServer) {
         .get_cached_messages(client.account_id)
         .await
         .unwrap();
-    assert_eq!(messages.emails.items.len(), 2);
+    assert_eq!(messages.emails.len(), 2);
 
-    for (idx, message) in messages.emails.items.iter().enumerate() {
+    for (idx, message) in messages.emails.iter().enumerate() {
         let contents = test
-            .fetch_email(client.account_id, message.document_id)
+            .fetch_email(client.account_id, message.document_id())
             .await;
 
         let message = MessageParser::new().parse(&contents).unwrap();
-        let contents = message
-            .html_bodies()
-            .next()
-            .unwrap()
-            .text_contents()
-            .unwrap();
+        let contents = message.html_bodies().next().unwrap();
 
         if idx == 0 {
             // First alarm does not have a summary or description
@@ -81,7 +76,7 @@ pub async fn test(test: &TestServer) {
         );
 
         // The logo is an inline part, so the template must reference it by cid: URI
-        let html = message.html_bodies().next().unwrap().contents().to_vec();
+        let html = message.html_bodies().next().unwrap().as_bytes().to_vec();
         let html = String::from_utf8(html).unwrap();
         assert!(
             html.contains("src=\"cid:logo."),

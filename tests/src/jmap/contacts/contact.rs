@@ -478,7 +478,7 @@ END:VCARD"#
     let dav_client = account.webdav_client();
     let resources = test
         .server
-        .fetch_dav_resources(account_id, account_id, SyncCollection::AddressBook)
+        .fetch_groupware_resources(account_id, account_id, SyncCollection::AddressBook)
         .await
         .unwrap();
     let path = format!(
@@ -487,9 +487,9 @@ END:VCARD"#
         resources
             .paths
             .iter()
-            .find(|v| v.parent_id.is_some())
+            .find(|(_, v)| v.parent_id != common::NO_ID)
+            .map(|(chunk, v)| chunk.path_str(v))
             .unwrap()
-            .path
     );
     let vcard = dav_client
         .request("GET", &path, "")

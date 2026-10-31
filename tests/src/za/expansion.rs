@@ -9,18 +9,14 @@
 
 use super::STRONG;
 use crate::utils::{server::TestServer, webdav::DummyWebDavClient};
-use groupware::{cache::GroupwareCache, calendar::CalendarEvent};
+use groupware::cache::GroupwareCache;
 use hyper::StatusCode;
 use std::time::Duration;
-use store::{
-    ValueKey,
-    write::{AlignedBytes, Archive, BatchBuilder},
-};
 use trc::{
     CalendarEvent as TraceCalendarEvent, Collector, EventType, Key,
     ipc::subscriber::{Interests, SubscriberBuilder},
 };
-use types::collection::{Collection, SyncCollection};
+use types::collection::SyncCollection;
 
 const SUBSCRIBER_ID: &str = "za-expansion-test";
 const CONTENT_TYPE: (&str, &str) = ("content-type", "text/calendar; charset=utf-8");
@@ -55,35 +51,14 @@ fn strings(value: &trc::Value, out: &mut Vec<String>) {
 /// Empties the first stored time range's instances, keeping everything else
 /// (including the seal): `expand` then returns `None` at query time.
 async fn break_time_ranges(test: &TestServer, account_id: u32, document_id: u32) {
-    let stored = test
-        .server
-        .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
-            account_id,
-            Collection::CalendarEvent,
-            document_id,
-        ))
-        .await
-        .unwrap()
-        .unwrap();
-    let mut event = stored.deserialize::<CalendarEvent>().unwrap();
-    let mut ranges = event.data.time_ranges.into_vec();
+    // 1.0 splits the event: the time ranges live in the content record.
+    let stored = crate::utils::za::stored_event(test, account_id, document_id).await;
+    let mut event = stored.za_event();
+    let mut ranges = std::mem::take(&mut event.content.data.time_ranges).into_vec();
     assert!(!ranges.is_empty());
     ranges[0].instances = Box::default();
-    event.data.time_ranges = ranges.into_boxed_slice();
-    let account_info = test.server.account_info(account_id).await.unwrap();
-    let mut batch = BatchBuilder::new();
-    event
-        .update(
-            account_info.account_tenant_ids(),
-            stored.to_unarchived::<CalendarEvent>().unwrap(),
-            account_id,
-            document_id,
-            &mut batch,
-        )
-        .unwrap();
-    test.server.commit_batch(batch).await.unwrap();
-    test.server.notify_task_queue();
+    event.content.data.time_ranges = ranges.into_boxed_slice();
+    crate::utils::za::write_stored_event(test, account_id, document_id, &stored, event).await;
 }
 
 pub async fn test(test: &mut TestServer) {
@@ -108,7 +83,7 @@ pub async fn test(test: &mut TestServer) {
     let event_type = EventType::Calendar(TraceCalendarEvent::RuleExpansionError);
     let mut interests = Interests::default();
     interests.set(event_type);
-    let (_tx, mut rx) = SubscriberBuilder::new(SUBSCRIBER_ID.into())
+    let (_tx, mut rx, _) = SubscriberBuilder::new(SUBSCRIBER_ID.into())
         .set_interests([event_type])
         .with_lossy(false)
         .register();
@@ -145,7 +120,7 @@ pub async fn test(test: &mut TestServer) {
         test.wait_for_tasks().await;
         let document_id = test
             .server
-            .fetch_dav_resources(*id, *id, SyncCollection::Calendar)
+            .fetch_groupware_resources(*id, *id, SyncCollection::Calendar)
             .await
             .unwrap()
             .by_path(&format!("{name}/broken-{who}.ics"))

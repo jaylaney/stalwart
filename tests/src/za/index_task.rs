@@ -54,7 +54,7 @@ use registry::schema::{
 use serde_json::json;
 use std::time::Duration;
 use store::{
-    ValueKey,
+    Serialize as _, ValueKey,
     write::{
         Archiver, BatchBuilder, SearchIndex, SearchIndexClass, ValueClass, serialize::RawValue,
     },

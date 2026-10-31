@@ -49,13 +49,13 @@ pub async fn test(test: &TestServer) {
             EmailAlias {
                 description: "Test Alias 1".to_string().into(),
                 domain_id: 1000u64.into(),
-                enabled: true,
+                enable: true,
                 name: "alias1".into(),
             },
             EmailAlias {
                 description: "Test Alias 2".to_string().into(),
                 domain_id: 1001u64.into(),
-                enabled: true,
+                enable: true,
                 name: "alias2".into(),
             },
         ]),
@@ -65,7 +65,7 @@ pub async fn test(test: &TestServer) {
                 allowed_ips: Map::new(vec![IpAddrOrMask::from_str("192.168.1.1").unwrap()]),
                 credential_id: 3u64.into(),
                 expires_at: None,
-                otp_auth: "otpauth://totp/test?secret=SECRET".to_string().into(),
+                otp_url: "otpauth://totp/test?secret=SECRET".to_string().into(),
                 secret: "secret".into(),
             }),
             Credential::AppPassword(SecondaryCredential {
@@ -140,7 +140,7 @@ pub async fn test(test: &TestServer) {
                 certificate_management: CertificateManagement::Manual,
                 dns_management: DnsManagement::Manual,
                 dkim_management: DkimManagement::Manual,
-                is_enabled: true,
+                enable: true,
                 ..Default::default()
             }
             .into(),
@@ -155,7 +155,7 @@ pub async fn test(test: &TestServer) {
                 certificate_management: CertificateManagement::Manual,
                 dns_management: DnsManagement::Manual,
                 dkim_management: DkimManagement::Manual,
-                is_enabled: true,
+                enable: true,
                 ..Default::default()
             }
             .into(),
@@ -271,7 +271,7 @@ pub async fn test(test: &TestServer) {
     test.assert_registry_insert_error(
         Domain {
             name: "test.org".into(),
-            is_enabled: true,
+            enable: true,
             certificate_management: CertificateManagement::Manual,
             dns_management: DnsManagement::Manual,
             dkim_management: DkimManagement::Manual,
@@ -318,7 +318,7 @@ pub async fn test(test: &TestServer) {
             aliases: List::from_iter([EmailAlias {
                 description: "Test Alias 1".to_string().into(),
                 domain_id,
-                enabled: true,
+                enable: true,
                 name: "alias1".into(),
             }]),
             recipients: Map::new(vec!["rcpt@domain.org".into()]),
@@ -553,14 +553,14 @@ fn test_patch_regressions() {
                     ]),
                     credential_id: 3u64.into(),
                     expires_at: None,
-                    otp_auth: None,
+                    otp_url: None,
                     secret: "secret".into(),
                 }),
                 Credential::Password(PasswordCredential {
                     allowed_ips: Map::new(vec![IpAddrOrMask::from_str("10.0.0.1").unwrap()]),
                     credential_id: 4u64.into(),
                     expires_at: None,
-                    otp_auth: None,
+                    otp_url: None,
                     secret: "another".into(),
                 }),
             ]),

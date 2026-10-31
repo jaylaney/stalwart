@@ -98,6 +98,7 @@ use email::message::{
     sortkeys::MessageSortKeys,
     za::{MAIL_FORMAT_V1, is_stub, stub_structure},
 };
+use groupware::cache::GroupwareCache;
 use groupware::calendar::{
     Calendar, CalendarEvent, CalendarEventContent, CalendarEventNotification,
     CalendarEventNotificationContent, EVENT_NOTIFICATION_ZA_PENDING, Timezone,
@@ -120,7 +121,8 @@ use registry::{
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use store::{
-    Deserialize as _, IterateParams, Subspace, U32_LEN, U64_LEN, ValueKey, ZA_UID_LEASE_PREFIX,
+    Deserialize as _, IterateParams, Serialize as _, Subspace, U32_LEN, U64_LEN, ValueKey,
+    ZA_UID_LEASE_PREFIX,
     write::{
         AnyKey, Archive, ArchiveBytes, Archiver, BatchBuilder, IndexPropertyClass, QueueDocumentId,
         SearchIndex, SearchIndexClass, ValueClass,
@@ -1489,8 +1491,8 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
             "subject",
             &mut scan,
         );
-        for part in parsed.parts.iter() {
-            find_canaries(part.contents(), &what, "decoded part", &mut scan);
+        for part in parsed.parts() {
+            find_canaries(&part.decoded(), &what, "decoded part", &mut scan);
         }
     }
 
@@ -3110,7 +3112,7 @@ async fn test_shared_structure(test: &mut TestServer) {
     }
     let resources = test
         .server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap();
     let calendar = resources.by_path("shared").unwrap().document_id();
@@ -3147,7 +3149,10 @@ async fn test_shared_structure(test: &mut TestServer) {
         Collection::Calendar,
         calendar,
         archive_field,
-        Archiver::new(1u8).untrusted().serialize().unwrap(),
+        Archiver::with_compression(1u8, store::write::Compression::None)
+            .untrusted()
+            .serialize()
+            .unwrap(),
         "malformed calendar archive",
         "calendar archive does not decode",
     )
@@ -3162,7 +3167,7 @@ async fn test_shared_structure(test: &mut TestServer) {
         .with_status(StatusCode::CREATED);
     let unshared = test
         .server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap()
         .by_path("unshared")
@@ -3346,7 +3351,7 @@ async fn test_shared_structure(test: &mut TestServer) {
             .entries
             .last_mut()
             .unwrap()
-            .values = vec![ICalendarValue::Text(STANDARD.encode(envelope))];
+            .values = vec![ICalendarValue::Text(STANDARD.encode(envelope))].into();
         contents.push((label, e, expected));
     }
     for (label, bad, expected) in events {

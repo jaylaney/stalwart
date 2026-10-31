@@ -40,7 +40,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use calcard::common::timezone::Tz;
 use common::{
     Server,
-    auth::{AccessToken, ChangedBy},
+    auth::AccessToken,
     za::{ZA_MAIL_KEYLESS, test_hooks},
 };
 use email::{
@@ -390,7 +390,10 @@ async fn registry_user(server: &Server, id: Id) -> (Object, structs::UserAccount
         .await
         .unwrap()
         .unwrap();
-    let ObjectInner::Account(structs::Account::User(user)) = &object.inner else {
+    let ObjectInner::Account(account) = &object.inner else {
+        panic!("not an account");
+    };
+    let structs::Account::User(user) = account.as_ref() else {
         panic!("not a user account");
     };
     let user = user.clone();
@@ -417,7 +420,7 @@ pub(super) async fn set_marker(server: &Server, id: Id, marker: bool) {
     let result = server
         .registry()
         .write(RegistryWrite::Update {
-            object: &Object::new(ObjectInner::Account(structs::Account::User(user))),
+            object: &Object::new(ObjectInner::Account(Box::new(structs::Account::User(user)))),
             id,
             old_object: &old_object,
         })
@@ -1601,10 +1604,16 @@ async fn stress_the_fence(test: &TestServer, admin: &Account) -> Account {
             .unwrap();
         if !stored.is_empty() {
             let mut batch = BatchBuilder::new();
+            let changed_by = test
+                .server
+                .account_info(account_id)
+                .await
+                .unwrap()
+                .changed_by();
             test.server
                 .emails_delete(
                     account_id,
-                    ChangedBy::PrincipalId(account_id),
+                    changed_by,
                     &mut batch,
                     RoaringBitmap::from_iter(stored),
                 )
@@ -2970,7 +2979,7 @@ async fn setup_refuses_object_metadata(test: &TestServer, admin: &Account) -> (A
 /// private server annotation all fail and store nothing. With the record
 /// removed, the same writes commit (the controls).
 async fn metadata_writes_lose_to_provisioning(test: &TestServer) -> Account {
-    use crate::utils::{imap::Type, jmap::JmapUtils};
+    use crate::utils::imap::Type;
     use imap_proto::ResponseType;
     println!("metadata_writes_lose_to_provisioning");
     const USING: &[&str] = &[
@@ -3044,7 +3053,7 @@ async fn metadata_writes_lose_to_provisioning(test: &TestServer) -> Account {
         .with_collection(Collection::Principal)
         .with_document(0)
         .clear(types::field::PrincipalField::ZeroAccessVault);
-    test.server.store().write(batch.build_all()).await.unwrap();
+    test.server.store().write_batch(&mut batch).await.unwrap();
     let reply = jmap_write(note()).await;
     assert!(
         reply.method_response()["updated"]

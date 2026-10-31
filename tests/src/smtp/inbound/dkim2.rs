@@ -10,9 +10,11 @@ use crate::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use mail_auth::{
-    DnssecStatus, MX,
-    common::{crypto::Ed25519Key, parse::TxtRecordParser, verify::DomainKey},
+    DnssecStatus, Mx,
+    crypto::Ed25519Key,
+    dkim::DomainKey,
     dkim2::{Dkim2Signer, Hop},
+    dns::TxtRecordParser,
 };
 use registry::schema::{
     enums::{DkimCanonicalization, DkimRotationStage},
@@ -397,10 +399,18 @@ impl Account {
             spf_ehlo_verify: expr("relaxed"),
             spf_from_verify: expr("relaxed"),
             arc_verify: expr("relaxed"),
-            dkim_sign_domain: expr(dkim_sign_domain),
             dkim_verify: expr("relaxed"),
             dkim_strict: false,
         })
+        .await;
+        // 1.0 moved the DKIM signing domain from SenderAuth to MtaStageData.
+        self.registry_update_setting(
+            registry::schema::structs::MtaStageData {
+                dkim_sign_domain: expr(dkim_sign_domain),
+                ..Default::default()
+            },
+            &[registry::schema::prelude::Property::DkimSignDomain],
+        )
         .await;
     }
 }
@@ -467,7 +477,7 @@ async fn build_signer_and_verifier(
     // Route foobar.org deliveries back to the local (in-process) receiver
     local.server.mx_add(
         "foobar.org",
-        vec![MX {
+        vec![Mx {
             exchanges: vec!["mx.foobar.org".into()].into_boxed_slice(),
             preference: 10,
         }],
@@ -541,7 +551,7 @@ fn dkim2_sign(
     let signed = Dkim2Signer::from_key(ed25519_key())
         .domain(domain)
         .selector(selector)
-        .sign(message, Hop::real(mail_from, rcpt_to))
+        .sign(message, Hop::real(mail_from, rcpt_to), None)
         .expect("dkim2 sign");
     let mut out = signed.to_header().into_bytes();
     out.extend_from_slice(message);

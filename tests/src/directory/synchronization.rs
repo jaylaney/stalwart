@@ -88,7 +88,7 @@ pub async fn test() {
         &EmailAlias {
             description: None,
             domain_id,
-            enabled: true,
+            enable: true,
             name: "john.doe".to_string(),
         }
     );
@@ -97,7 +97,7 @@ pub async fn test() {
         &EmailAlias {
             description: None,
             domain_id,
-            enabled: true,
+            enable: true,
             name: "j.doe".to_string(),
         }
     );
@@ -200,7 +200,7 @@ pub async fn test() {
         &EmailAlias {
             description: None,
             domain_id,
-            enabled: true,
+            enable: true,
             name: "johnny".to_string(),
         }
     );
@@ -290,7 +290,7 @@ pub async fn test() {
         &EmailAlias {
             description: None,
             domain_id,
-            enabled: true,
+            enable: true,
             name: "everyone".to_string(),
         }
     );

@@ -259,11 +259,10 @@ async fn fast_retry_tests(test: &TestServer) {
     account
         .registry_update_setting(
             TaskManager {
-                max_attempts: 100,
                 strategy: TaskRetryStrategy::FixedDelay(TaskRetryStrategyFixed {
                     delay: 1_000u64.into(),
                 }),
-                total_deadline: 86_400_000u64.into(),
+                ..Default::default()
             },
             &[],
         )
@@ -856,7 +855,9 @@ impl Account {
             match signature {
                 DkimSignature::Dkim1RsaSha256(sig) => v1_rsa.push(sig),
                 DkimSignature::Dkim1Ed25519Sha256(sig) => v1_ed25519.push(sig),
-                DkimSignature::Dkim2Ed25519Sha256(_) | DkimSignature::Dkim2RsaSha256(_) => todo!(),
+                DkimSignature::Dkim2Ed25519Sha256(_)
+                | DkimSignature::Dkim2RsaSha256(_)
+                | DkimSignature::Dkim2MlDsa44Ed25519Sha512(_) => todo!(),
             }
         }
 
@@ -969,8 +970,8 @@ impl TestServer {
                 .dkim1
                 .iter()
                 .map(|s| match s {
-                    Dkim1Signer::RsaSha256(s) => s.template.s.as_str(),
-                    Dkim1Signer::Ed25519Sha256(s) => s.template.s.as_str(),
+                    Dkim1Signer::RsaSha256(s) => s.template().s.as_str(),
+                    Dkim1Signer::Ed25519Sha256(s) => s.template().s.as_str(),
                 })
                 .collect::<AHashSet<_>>(),
             selectors.iter().copied().collect::<AHashSet<_>>()

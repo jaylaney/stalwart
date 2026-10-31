@@ -16,6 +16,7 @@ use groupware::scheduling::{
     event_update::itip_update,
     inbound::{MergeResult, itip_import_message, itip_merge_changes, itip_process_message},
     itip::itip_set_unreachable_status,
+    recipient::{AttendeeVisibility, RecipientPolicy},
     snapshot::itip_snapshot,
 };
 use std::{collections::hash_map::Entry, path::PathBuf};
@@ -144,12 +145,17 @@ pub fn test() {
                                 &mut ical,
                                 entry.get_mut(),
                                 std::slice::from_ref(account),
+                                policy(),
                             ));
                             itip_set_unreachable_status(&mut ical, std::slice::from_ref(account));
                             entry.insert(ical);
                         }
                         Entry::Vacant(entry) => {
-                            last_itip = Some(itip_create(&mut ical, std::slice::from_ref(account)));
+                            last_itip = Some(itip_create(
+                                &mut ical,
+                                std::slice::from_ref(account),
+                                policy(),
+                            ));
                             itip_set_unreachable_status(&mut ical, std::slice::from_ref(account));
                             entry.insert(ical);
                         }
@@ -203,10 +209,12 @@ pub fn test() {
                     let store = store.get_mut(account).expect("Account not found in store");
 
                     if let Some(ical) = store.remove(name) {
-                        last_itip = Some(
-                            itip_cancel(&ical, &[account.to_string()], force_send)
-                                .map(|message| vec![message]),
-                        );
+                        last_itip = Some(itip_cancel(
+                            &ical,
+                            &[account.to_string()],
+                            force_send,
+                            policy(),
+                        ));
                     } else {
                         panic!(
                             "ICalendar not found for account: {}, name: {}",
@@ -274,15 +282,17 @@ pub fn test() {
                                                         &message.message,
                                                         itip_snapshots,
                                                         message.from.clone(),
+                                                        policy(),
                                                     ) {
                                                         Ok(result) => match result {
                                                             MergeResult::Actions(changes) => {
+                                                                // 1.0's merge reports its errors.
                                                                 itip_merge_changes(
                                                                     ical,
                                                                     &message.message,
                                                                     changes,
-                                                                );
-                                                                Ok(None)
+                                                                )
+                                                                .map(|()| None)
                                                             }
                                                             MergeResult::Message(message) => {
                                                                 Ok(Some(message))
@@ -441,15 +451,26 @@ fn normalize_ical(mut ical: ICalendar, map: &mut AHashMap<PartialDateTime, usize
                 (&entry.name, entry.values.first())
             {
                 if let Some(index) = map.get(dt) {
-                    entry.values = vec![ICalendarValue::Integer(*index as i64)];
+                    entry.values = vec![ICalendarValue::Integer(*index as i64)].into();
                 } else {
                     let index = map.len();
-                    map.insert(dt.as_ref().clone(), index);
-                    entry.values = vec![ICalendarValue::Integer(index as i64)];
+                    map.insert((*dt).clone(), index);
+                    entry.values = vec![ICalendarValue::Integer(index as i64)].into();
                 }
             }
         }
         comp.entries.sort_unstable();
     }
     ical.to_string().replace("\r\n", "\n")
+}
+
+/// Upstream's builders with every attendee visible and no limits: 1.0's
+/// per-recipient split then keeps one message per recipient group, as 0.16
+/// built them (the delegation unit tests use the same policy).
+fn policy() -> RecipientPolicy {
+    RecipientPolicy {
+        visibility: AttendeeVisibility::All,
+        max_recipients: usize::MAX,
+        max_instances: usize::MAX,
+    }
 }

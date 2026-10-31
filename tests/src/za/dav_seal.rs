@@ -425,7 +425,7 @@ pub async fn test_reports(test: &mut TestServer) {
     let mut broken = records.za_event();
     let root = &mut broken.content.data.event.components[0];
     let last = root.entries.last_mut().unwrap();
-    last.values = vec![calcard::icalendar::ICalendarValue::Text("AQI=".into())];
+    last.values = vec![calcard::icalendar::ICalendarValue::Text("AQI=".into())].into();
     crate::utils::za::write_stored_event(test, id, document_id, &records, broken).await;
     client
         .request("GET", path, "")

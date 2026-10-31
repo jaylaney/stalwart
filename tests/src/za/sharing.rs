@@ -12,6 +12,7 @@ use crate::utils::{
     za::{StoredEvent, plant_event, stored_event, write_stored_event, za_unlock},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
+use groupware::scheduling::recipient::RecipientPolicy;
 use groupware::{
     cache::GroupwareCache,
     calendar::{
@@ -3078,7 +3079,7 @@ async fn sharing_rotation_contracts(test: &mut TestServer, owner: u32, reader: u
     let aliases = List::from_iter([EmailAlias {
         name: "sharing-alias".into(),
         domain_id: domain,
-        enabled: true,
+        enable: true,
         description: None,
     }]);
     test.account("admin@example.com")
@@ -3175,7 +3176,7 @@ async fn sharing_rotation_contracts(test: &mut TestServer, owner: u32, reader: u
     let aliases = List::from_iter([EmailAlias {
         name: "sharing-alias".into(),
         domain_id: domain,
-        enabled: true,
+        enable: true,
         description: None,
     }]);
     test.account("admin@example.com")
@@ -3229,7 +3230,7 @@ async fn sharing_rotation_contracts(test: &mut TestServer, owner: u32, reader: u
     let aliases = List::from_iter([EmailAlias {
         name: "sharing-alias".into(),
         domain_id: domain,
-        enabled: true,
+        enable: true,
         description: None,
     }]);
     test.account("admin@example.com")
@@ -3271,7 +3272,7 @@ async fn sharing_rotation_contracts(test: &mut TestServer, owner: u32, reader: u
     let aliases = List::from_iter([EmailAlias {
         name: "sharing-alias".into(),
         domain_id: domain,
-        enabled: true,
+        enable: true,
         description: None,
     }]);
     test.account("admin@example.com")
@@ -4587,9 +4588,7 @@ async fn delegated_run(
             event_update::itip_update,
         },
     };
-    let sender = test
-        .server
-        .scheduling_account_info(writer.account_id, owner.account_id)
+    let sender = scheduling_account_info(&test.server, writer.account_id, owner.account_id)
         .await
         .unwrap();
     let operation = match kind {
@@ -4636,9 +4635,23 @@ async fn delegated_run(
         za_finalize(&mut cloned_finalized_tree, second.increments());
     }
     let first = match kind {
-        0 => itip_create(&mut new, sender.addresses()),
-        1 => itip_update(&mut new, old.unwrap(), sender.addresses()),
-        _ => itip_cancel(old.unwrap(), sender.addresses(), true).map(|message| vec![message]),
+        0 => itip_create(
+            &mut new,
+            sender.addresses(),
+            RecipientPolicy::new(&test.server.core.groupware, 0),
+        ),
+        1 => itip_update(
+            &mut new,
+            old.unwrap(),
+            sender.addresses(),
+            RecipientPolicy::new(&test.server.core.groupware, 0),
+        ),
+        _ => itip_cancel(
+            old.unwrap(),
+            sender.addresses(),
+            true,
+            RecipientPolicy::new(&test.server.core.groupware, 0),
+        ),
     };
     let first = match first {
         Ok(messages) => messages,
@@ -4684,7 +4697,7 @@ async fn delegated_run(
         .await
         .unwrap();
     za_set_schedule_status(&mut new, &result.statuses);
-    groupware::calendar::sequence::za_set_sequences(&mut new, &result.sequences);
+    groupware::calendar::sequence_floor::za_set_sequences(&mut new, &result.sequences);
     (new, result, self_counts)
 }
 
@@ -4740,9 +4753,7 @@ async fn delegated_scheduling_tests(test: &mut TestServer) {
         .await
         .unwrap();
     let writer_info = test.server.account_info(writer.id).await.unwrap();
-    let sender = test
-        .server
-        .scheduling_account_info(writer.id, owner.account_id)
+    let sender = scheduling_account_info(&test.server, writer.id, owner.account_id)
         .await
         .unwrap();
     let keys = za_unlock(test, writer.id, STRONG).await;
@@ -4764,7 +4775,12 @@ async fn delegated_scheduling_tests(test: &mut TestServer) {
     // Public upstream provenance never acquires self-inbox authority merely
     // because a valid request-local resolution is supplied beside it.
     let mut reference = initial.clone();
-    let ordinary = itip_create(&mut reference, owner.addresses()).unwrap();
+    let ordinary = itip_create(
+        &mut reference,
+        owner.addresses(),
+        RecipientPolicy::new(&test.server.core.groupware, 0),
+    )
+    .unwrap();
     let refused = test
         .server
         .za_fan_out(
@@ -4814,7 +4830,8 @@ async fn delegated_scheduling_tests(test: &mut TestServer) {
                         "20990302T100000Z"
                     };
                     if step == "summary" {
-                        entry.values = vec![calcard::icalendar::ICalendarValue::Text(text.into())];
+                        entry.values =
+                            vec![calcard::icalendar::ICalendarValue::Text(text.into())].into();
                     } else {
                         *entry = delegated_tree("x", &[]).components[1]
                             .entries
@@ -5029,9 +5046,7 @@ async fn delegated_identity_and_groups(test: &mut TestServer, owner_id: u32, wri
     let admin = test.account("admin@example.com").clone();
     let owner = test.server.account_info(owner_id).await.unwrap();
     let writer = test.server.account_info(writer_id).await.unwrap();
-    let sender = test
-        .server
-        .scheduling_account_info(writer_id, owner_id)
+    let sender = scheduling_account_info(&test.server, writer_id, owner_id)
         .await
         .unwrap();
     let keys = za_unlock(test, writer_id, STRONG).await;
@@ -5211,9 +5226,7 @@ async fn delegated_identity_and_groups(test: &mut TestServer, owner_id: u32, wri
         .await;
     let owner = test.server.account_info(owner_id).await.unwrap();
     let writer = test.server.account_info(writer_id).await.unwrap();
-    let sender = test
-        .server
-        .scheduling_account_info(writer_id, owner_id)
+    let sender = scheduling_account_info(&test.server, writer_id, owner_id)
         .await
         .unwrap();
     let tree = delegated_tree("task9-shared-attendee", &[ATT_GROUP]);
@@ -5331,7 +5344,11 @@ async fn delegated_identity_and_groups(test: &mut TestServer, owner_id: u32, wri
         writer_id,
         DELEGATE_ALIAS
     ));
-    let messages = itip_create(&mut tree, sender.addresses());
+    let messages = itip_create(
+        &mut tree,
+        sender.addresses(),
+        RecipientPolicy::new(&test.server.core.groupware, 0),
+    );
     assert!(matches!(
         messages,
         Err(groupware::scheduling::ItipError::NothingToSend)
@@ -5393,9 +5410,7 @@ async fn catch_all_resolution_is_quiet(test: &TestServer, owner_id: u32, writer_
         .await;
     let owner = test.server.account_info(owner_id).await.unwrap();
     let writer = test.server.account_info(writer_id).await.unwrap();
-    let sender = test
-        .server
-        .scheduling_account_info(writer_id, owner_id)
+    let sender = scheduling_account_info(&test.server, writer_id, owner_id)
         .await
         .unwrap();
     let party = Party::new(test, DELEGATE_WRITER);
@@ -5723,7 +5738,10 @@ async fn delegated_receiver_rejections_and_reply(test: &TestServer) {
     // A delegated REPLY must merge the named owner's attendee line and match
     // that line's token, while SENT-BY authenticates the writer separately.
     test.server
-        .get_or_create_default_calendar(recipient.id, recipient.id)
+        .get_or_create_default_calendar(
+            &*test.server.account(recipient.id).await.unwrap(),
+            &*test.server.account(recipient.id).await.unwrap(),
+        )
         .await
         .unwrap();
     let uid = "task9-owner-named-reply";
@@ -5880,7 +5898,10 @@ async fn delegated_collection_lifecycle(test: &TestServer, owner_id: u32, writer
     // An own-name organizer's reply has no source in the writer account and
     // remains EventNotFound history, the accepted inherited limitation.
     test.server
-        .get_or_create_default_calendar(writer_id, writer_id)
+        .get_or_create_default_calendar(
+            &*test.server.account(writer_id).await.unwrap(),
+            &*test.server.account(writer_id).await.unwrap(),
+        )
         .await
         .unwrap();
     let own = delegated_tree("task9-own-name-reply", &["key3@example.com"])
@@ -6049,9 +6070,7 @@ async fn delegated_attendee_and_alias_edges(test: &TestServer, owner_id: u32, wr
     };
     let owner = test.server.account_info(owner_id).await.unwrap();
     let writer = test.server.account_info(writer_id).await.unwrap();
-    let sender = test
-        .server
-        .scheduling_account_info(writer_id, owner_id)
+    let sender = scheduling_account_info(&test.server, writer_id, owner_id)
         .await
         .unwrap();
     let keys = za_unlock(test, writer_id, STRONG).await;
@@ -6276,7 +6295,8 @@ async fn delegated_attendee_and_alias_edges(test: &TestServer, owner_id: u32, wr
         if entry.name == ICalendarProperty::Summary {
             entry.values = vec![calcard::icalendar::ICalendarValue::Text(
                 "task9 mixed changed".into(),
-            )];
+            )]
+            .into();
         }
     }
     let recipient_before = inbox_ids(test, recipient.id).await;
@@ -6312,7 +6332,10 @@ async fn delegated_attendee_and_alias_edges(test: &TestServer, owner_id: u32, wr
     // The attendee side has no second run. It sends the owner's named REPLY
     // with the writer marked separately, and merges against the owner's pair.
     test.server
-        .get_or_create_default_calendar(recipient.id, recipient.id)
+        .get_or_create_default_calendar(
+            &*test.server.account(recipient.id).await.unwrap(),
+            &*test.server.account(recipient.id).await.unwrap(),
+        )
         .await
         .unwrap();
     let uid = "task9-attendee-delegation";
@@ -6342,7 +6365,13 @@ async fn delegated_attendee_and_alias_edges(test: &TestServer, owner_id: u32, wr
         .unwrap()
         .is_none()
     );
-    let messages = itip_update(&mut new, &old, sender.addresses()).unwrap();
+    let messages = itip_update(
+        &mut new,
+        &old,
+        sender.addresses(),
+        RecipientPolicy::new(&test.server.core.groupware, 0),
+    )
+    .unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].from, DELEGATE_OWNER);
     let mut pairs = TokenPairs::new();
@@ -6448,7 +6477,13 @@ async fn delegated_attendee_and_alias_edges(test: &TestServer, owner_id: u32, wr
         .unwrap()
         .is_none()
     );
-    let messages = itip_update(&mut new, &old, sender.addresses()).unwrap();
+    let messages = itip_update(
+        &mut new,
+        &old,
+        sender.addresses(),
+        RecipientPolicy::new(&test.server.core.groupware, 0),
+    )
+    .unwrap();
     let owner_before = inbox_ids(test, owner_id).await;
     let result = test
         .server
@@ -6479,7 +6514,13 @@ async fn delegated_attendee_and_alias_edges(test: &TestServer, owner_id: u32, wr
         1
     );
     let mut control = new.clone();
-    let messages = itip_update(&mut control, &old, owner.addresses()).unwrap();
+    let messages = itip_update(
+        &mut control,
+        &old,
+        owner.addresses(),
+        RecipientPolicy::new(&test.server.core.groupware, 0),
+    )
+    .unwrap();
     let owner_keys = za_unlock(test, owner_id, STRONG).await;
     let result = test
         .server
@@ -6523,9 +6564,7 @@ async fn delegated_owner_exclusion_precedes_eligibility(
         scheduling::event_create::itip_create,
     };
     const ADDRESS: &str = "task9-alice+store-canary@example.com";
-    let sender = test
-        .server
-        .scheduling_account_info(writer.account_id, owner.account_id)
+    let sender = scheduling_account_info(&test.server, writer.account_id, owner.account_id)
         .await
         .unwrap();
     let input = delegated_tree("task9-owner-store-failure", &[ADDRESS]);
@@ -6552,7 +6591,12 @@ async fn delegated_owner_exclusion_precedes_eligibility(
     std::sync::Arc::make_mut(&mut broken.core).storage.data = store::Store::None;
     let second = za_self_create(&input, writer, owner, &resolution).unwrap();
     let mut tree = input.clone();
-    let first = itip_create(&mut tree, sender.addresses()).unwrap();
+    let first = itip_create(
+        &mut tree,
+        sender.addresses(),
+        RecipientPolicy::new(&test.server.core.groupware, 0),
+    )
+    .unwrap();
     let result = broken
         .za_fan_out(
             &sender,
@@ -6596,7 +6640,12 @@ async fn delegated_owner_exclusion_precedes_eligibility(
     .unwrap();
     let second = za_self_create(&input, writer, owner, &resolution).unwrap();
     let mut tree = input.clone();
-    let first = itip_create(&mut tree, sender.addresses()).unwrap();
+    let first = itip_create(
+        &mut tree,
+        sender.addresses(),
+        RecipientPolicy::new(&test.server.core.groupware, 0),
+    )
+    .unwrap();
     let result = broken
         .za_fan_out(
             &sender,
@@ -9686,7 +9735,6 @@ const CLASS_KEY_ORGANIZER: &str = "sharing-class-organizer@example.com";
 const CLASS_KEY_ATTENDEE: &str = "sharing-class-attendee@example.com";
 const CLASS_PLAIN_ORGANIZER: &str = "sharing-class-plain-organizer@example.com";
 const CLASS_PLAIN_ATTENDEE: &str = "sharing-class-plain-attendee@example.com";
-const CLASSES: [&str; 3] = ["PUBLIC", "PRIVATE", "CONFIDENTIAL"];
 
 /// An event with `CLASS:<class>` and content canaries.
 fn class_event(uid: &str, class: &str, summary: &str) -> String {
@@ -10995,4 +11043,23 @@ pub async fn revoke_cleanup_does_not_rewrite_sealed_event(test: &mut TestServer)
         .await
         .with_status(StatusCode::NO_CONTENT);
     test.wait_for_tasks().await;
+}
+
+/// 0.16's `Server::scheduling_account_info`, which 1.0 removed: the
+/// writer's account info with the owner's addresses added, as the DAV
+/// handlers' `za_roles` builds the sender.
+async fn scheduling_account_info(
+    server: &common::Server,
+    writer_id: u32,
+    owner_id: u32,
+) -> trc::Result<common::auth::AccountInfo> {
+    let mut sender = server.account_info(writer_id).await?;
+    if owner_id != writer_id {
+        for address in server.account_info(owner_id).await?.addresses {
+            if !sender.addresses.contains(&address) {
+                sender.addresses.push(address);
+            }
+        }
+    }
+    Ok(sender)
 }

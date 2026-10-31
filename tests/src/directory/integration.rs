@@ -154,7 +154,6 @@ pub async fn test() {
                 .await
                 .unwrap()
                 .emails
-                .index
                 .len(),
             1
         );
@@ -185,7 +184,6 @@ pub async fn test() {
                 .await
                 .unwrap()
                 .emails
-                .index
                 .len(),
             1
         );
@@ -209,7 +207,8 @@ pub async fn test() {
             IpAddr::from([127, 0, 0, 1]),
         ))
         .await
-        .unwrap_or_else(|err| panic!("Failed to impersonate multi.mail@example.org: {err:?}"));
+        .unwrap_or_else(|err| panic!("Failed to impersonate multi.mail@example.org: {err:?}"))
+        .access_token;
     assert_ne!(access_token.account_id(), RECOVERY_ADMIN_ID);
     assert_eq!(
         test.server

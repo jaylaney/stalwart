@@ -4,21 +4,14 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use crate::smtp::reporting::DmarcRecordBuilder;
 use crate::utils::server::TestServerBuilder;
 use ahash::AHashMap;
 use common::{
     config::smtp::report::AggregateFrequency,
     ipc::{DmarcEvent, PolicyType, TlsEvent},
 };
-use mail_auth::{
-    common::parse::TxtRecordParser,
-    dmarc::Dmarc,
-    mta_sts::TlsRpt,
-    report::{
-        ActionDisposition, DmarcResult, Record,
-        tlsrpt::{FailureDetails, ResultType},
-    },
-};
+use mail_auth::{dmarc::DmarcRecord, dns::TxtRecordParser, mta_sts::TlsRptRecord};
 use registry::schema::{
     prelude::{ObjectType, Property},
     structs::{
@@ -26,6 +19,10 @@ use registry::schema::{
     },
 };
 use smtp::reporting::send::MtaReportSend;
+use smtp_report::{
+    dmarc::{Disposition, DmarcStatus, Record},
+    tlsrpt::{FailureDetails, FailureType},
+};
 use std::sync::Arc;
 
 #[tokio::test]
@@ -52,7 +49,7 @@ async fn manage_reports() {
         .await;
     admin
         .registry_create_object(DmarcReportSettings {
-            aggregate_max_report_size: Expression {
+            max_aggregate_report_size: Expression {
                 else_: "1024".into(),
                 ..Default::default()
             },
@@ -71,16 +68,16 @@ async fn manage_reports() {
     test.server
         .schedule_report(DmarcEvent {
             domain: "foobar.org".to_string(),
-            report_record: Record::new()
+            report_record: Record::default()
                 .with_source_ip("192.168.1.2".parse().unwrap())
-                .with_action_disposition(ActionDisposition::Pass)
-                .with_dmarc_dkim_result(DmarcResult::Pass)
-                .with_dmarc_spf_result(DmarcResult::Fail)
+                .with_action_disposition(Disposition::Pass)
+                .with_dmarc_dkim_result(DmarcStatus::Pass)
+                .with_dmarc_spf_result(DmarcStatus::Fail)
                 .with_envelope_from("hello@example.org")
                 .with_envelope_to("other@example.org")
                 .with_header_from("bye@example.org"),
             dmarc_record: Arc::new(
-                Dmarc::parse(b"v=DMARC1; p=reject; rua=mailto:reports@foobar.org").unwrap(),
+                DmarcRecord::parse(b"v=DMARC1; p=reject; rua=mailto:reports@foobar.org").unwrap(),
             ),
             interval: AggregateFrequency::Daily,
             span_id: 0,
@@ -89,13 +86,13 @@ async fn manage_reports() {
     test.server
         .schedule_report(DmarcEvent {
             domain: "foobar.net".to_string(),
-            report_record: Record::new()
+            report_record: Record::default()
                 .with_source_ip("a:b:c::e:f".parse().unwrap())
-                .with_action_disposition(ActionDisposition::Reject)
-                .with_dmarc_dkim_result(DmarcResult::Fail)
-                .with_dmarc_spf_result(DmarcResult::Pass),
+                .with_action_disposition(Disposition::Reject)
+                .with_dmarc_dkim_result(DmarcStatus::Fail)
+                .with_dmarc_spf_result(DmarcStatus::Pass),
             dmarc_record: Arc::new(
-                Dmarc::parse(
+                DmarcRecord::parse(
                     concat!(
                         "v=DMARC1; p=quarantine; rua=mailto:reports",
                         "@foobar.net,mailto:reports@example.net"
@@ -114,7 +111,7 @@ async fn manage_reports() {
             policy: PolicyType::None,
             failure: None,
             tls_record: Arc::new(
-                TlsRpt::parse(b"v=TLSRPTv1;rua=mailto:reports@foobar.org").unwrap(),
+                TlsRptRecord::parse(b"v=TLSRPTv1;rua=mailto:reports@foobar.org").unwrap(),
             ),
             interval: AggregateFrequency::Daily,
             span_id: 0,
@@ -124,9 +121,9 @@ async fn manage_reports() {
         .schedule_report(TlsEvent {
             domain: "foobar.net".to_string(),
             policy: PolicyType::Sts(None),
-            failure: FailureDetails::new(ResultType::StsPolicyInvalid).into(),
+            failure: FailureDetails::new(FailureType::StsPolicyInvalid).into(),
             tls_record: Arc::new(
-                TlsRpt::parse(b"v=TLSRPTv1;rua=mailto:reports@foobar.net").unwrap(),
+                TlsRptRecord::parse(b"v=TLSRPTv1;rua=mailto:reports@foobar.net").unwrap(),
             ),
             interval: AggregateFrequency::Weekly,
             span_id: 0,
@@ -138,7 +135,7 @@ async fn manage_reports() {
     let mut dmarc_id_to_name = AHashMap::new();
     for (id, report) in admin.registry_get_all::<DmarcInternalReport>().await {
         let diff =
-            report.report.date_range_end.timestamp() - report.report.date_range_begin.timestamp();
+            report.report.date_range_end.timestamp() - report.report.date_range_start.timestamp();
         if report.domain == "foobar.org" {
             assert_eq!(diff, 86400);
         } else {

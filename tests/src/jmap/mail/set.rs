@@ -8,7 +8,7 @@ use crate::{
     jmap::{find_values, replace_blob_ids, replace_boundaries, replace_values},
     utils::server::TestServer,
 };
-use ::email::{mailbox::INBOX_ID, message::metadata::MessageData};
+use ::email::{mailbox::INBOX_ID, message::messagedata::MessageData};
 use ahash::AHashSet;
 use jmap_client::{
     Error, Set,
@@ -19,10 +19,7 @@ use jmap_client::{
 };
 use registry::schema::prelude::ObjectType;
 use std::{fs, path::PathBuf, str::FromStr};
-use store::{
-    ValueKey,
-    write::{AlignedBytes, Archive},
-};
+use store::ValueKey;
 use types::{collection::Collection, id::Id};
 
 pub async fn test(test: &TestServer) {
@@ -376,15 +373,13 @@ async fn message_uids(
 ) -> std::collections::BTreeMap<u32, u32> {
     test.server
         .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+        .get_value::<MessageData>(ValueKey::archive(
             account_id,
             Collection::Email,
             document_id,
         ))
         .await
         .unwrap()
-        .unwrap()
-        .deserialize::<MessageData>()
         .unwrap()
         .mailboxes
         .iter()

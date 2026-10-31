@@ -11,7 +11,10 @@ use crate::{
 use ::email::{
     cache::MessageCacheFetch,
     mailbox::INBOX_ID,
-    message::ingest::{EmailIngest, IngestEmail, IngestSource},
+    message::{
+        delivery::SenderAuthentication,
+        ingest::{EmailIngest, IngestEmail, IngestSource},
+    },
 };
 use common::auth::AccessToken;
 use jmap_client::{email, mailbox::Role};
@@ -230,11 +233,15 @@ async fn test_multi_thread(test: &TestServer) {
                         mailbox_ids: vec![mailbox_id],
                         keywords: vec![],
                         received_at: None,
+                        // 1.0 names the sender and its authentication
+                        // (`is_sender_authenticated: true` at 0.16).
                         source: IngestSource::Smtp {
                             deliver_to: "test@domain.org",
-                            is_sender_authenticated: true,
+                            envelope_from: "sender@domain.org",
+                            sender_authentication: SenderAuthentication::DmarcPass,
                             is_spam: false,
                         },
+                        metadata: None,
                         session_id: 0,
                     })
                     .await
@@ -267,7 +274,6 @@ async fn test_multi_thread(test: &TestServer) {
             .await
             .unwrap()
             .emails
-            .items
             .len(),
     );
     println!("Deleting all messages...");

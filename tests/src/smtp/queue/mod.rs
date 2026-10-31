@@ -43,6 +43,7 @@ pub fn new_message(queue_id: u64) -> MessageWrapper {
             env_id: None,
             priority: 0,
             metadata: Default::default(),
+            tenant_ids: Default::default(),
             blob_hash: Default::default(),
             received_from_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             received_via_port: 0,

@@ -9,7 +9,7 @@ use common::auth::credential::{ApiKey, AppPassword};
 use jmap_proto::error::set::SetErrorType;
 use registry::{
     schema::{
-        enums::StorageQuota,
+        enums::{ClientIpSource, StorageQuota},
         prelude::{ObjectType, Property},
         structs::{
             self, Account, Credential, Http, PasswordCredential, SecondaryCredential, UserAccount,
@@ -32,10 +32,10 @@ pub async fn test(test: &TestServer) {
     admin
         .registry_update_setting(
             Http {
-                use_x_forwarded: true,
+                client_ip_source: ClientIpSource::XForwardedFor,
                 ..Default::default()
             },
-            &[Property::UseXForwarded],
+            &[Property::ClientIpSource],
         )
         .await;
     admin.reload_settings().await;
@@ -354,10 +354,10 @@ pub async fn test(test: &TestServer) {
     admin
         .registry_update_setting(
             Http {
-                use_x_forwarded: false,
+                client_ip_source: ClientIpSource::Peer,
                 ..Default::default()
             },
-            &[Property::UseXForwarded],
+            &[Property::ClientIpSource],
         )
         .await;
     admin.reload_settings().await;

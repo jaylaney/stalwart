@@ -53,8 +53,8 @@ use registry::{
 use serde_json::json;
 use std::time::Duration;
 use trc::{
-    EvalEvent, EventType, HttpEvent, ImapEvent, Key, MessageIngestEvent, MilterEvent, Pop3Event,
-    SieveEvent, SmtpEvent, SpamEvent, StoreEvent,
+    CacheEvent, EvalEvent, EventType, HttpEvent, ImapEvent, Key, MessageIngestEvent, MilterEvent,
+    Pop3Event, SieveEvent, SmtpEvent, SpamEvent, StoreEvent,
 };
 use types::id::Id;
 
@@ -158,7 +158,7 @@ async fn configure(admin: &Account) -> Settings {
                 else_: "true".into(),
                 ..Default::default()
             },
-            hostname: "127.0.0.1".into(),
+            host: "127.0.0.1".into(),
             port: 9332,
             use_tls: false,
             stages: Map::new(vec![MtaStage::Data]),
@@ -452,13 +452,13 @@ async fn delivery_leaves_no_content_in_events(test: &TestServer) {
             // the body names, and the ordinary lookup traces them (the URL's
             // registrable domain may already be in the negative cache).
             assert_any_contains(
-                &values(&events, EventType::Store(StoreEvent::CacheMiss), Key::Key),
+                &values(&events, EventType::Cache(CacheEvent::Miss), Key::Key),
                 "domain-canary",
                 "control: the domain lookup of the body's address",
             );
-            let lookups = [StoreEvent::CacheMiss, StoreEvent::CacheHit]
+            let lookups = [CacheEvent::Miss, CacheEvent::Hit]
                 .into_iter()
-                .flat_map(|event| values(&events, EventType::Store(event), Key::Key))
+                .flat_map(|event| values(&events, EventType::Cache(event), Key::Key))
                 .collect::<Vec<_>>();
             assert_any_contains(
                 &lookups,

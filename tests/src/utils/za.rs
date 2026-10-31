@@ -60,7 +60,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::{future::Future, sync::Arc, time::Duration};
 use store::{
-    Deserialize, IterateParams, Serialize as _, Subspace, U32_LEN, ValueKey,
+    Deserialize, IterateParams, Subspace, U32_LEN, ValueKey,
     write::{
         AnyKey, Archive, ArchiveBytes, ArchiveVersion, BatchBuilder, BlobLink, BlobOp,
         IndexPropertyClass, QueueDocumentId, SearchIndex, SearchIndexClass, TaskId, TaskQueueClass,
@@ -1998,7 +1998,7 @@ pub fn normalize_sharing_copy(mut ical: ICalendar, uid: &str) -> ICalendar {
         });
         for entry in &mut component.entries {
             if entry.name == ICalendarProperty::Uid {
-                entry.values = vec![ICalendarValue::Text(uid.into())];
+                entry.values = vec![ICalendarValue::Text(uid.into())].into();
             } else if entry.name == ICalendarProperty::Organizer {
                 entry
                     .params

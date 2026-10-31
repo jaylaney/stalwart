@@ -25,7 +25,7 @@ use store::{
     ahash::AHashMap,
     write::{BatchBuilder, now},
 };
-use types::{collection::Collection, id::Id, special_use::SpecialUse};
+use types::{collection::Collection, id::Id};
 
 const MAX_THREADS: usize = 100;
 const MAX_MESSAGES: usize = 1000;
@@ -51,12 +51,13 @@ pub async fn test(test: &TestServer) {
                 .with_document(mailbox_id)
                 .custom(ObjectIndexBuilder::<(), _>::new().with_changes(Mailbox {
                     name: format!("Mailbox {mailbox_id}"),
-                    role: SpecialUse::None,
                     parent_id: 0,
                     sort_order: None,
                     uid_validity: 0,
                     subscribers: vec![],
                     acls: vec![],
+                    // 1.0 keeps the role in the flags; 0 is no role.
+                    flags: 0,
                 }))
                 .unwrap();
         }
@@ -64,7 +65,7 @@ pub async fn test(test: &TestServer) {
             .core
             .storage
             .data
-            .write(batch.build_all())
+            .write_batch(&mut batch)
             .await
             .unwrap();
 
@@ -78,9 +79,8 @@ pub async fn test(test: &TestServer) {
                 .await
                 .unwrap()
                 .emails
-                .items
                 .iter()
-                .map(|m| m.thread_id)
+                .map(|m| m.thread_id())
                 .collect::<AHashSet<_>>()
                 .len(),
             MAX_THREADS

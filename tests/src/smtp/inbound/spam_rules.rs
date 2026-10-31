@@ -215,7 +215,7 @@ async fn update_rules(test: &TestServer, rules: &Value) {
     test.wait_for_tasks().await;
 }
 
-async fn stored<T: ObjectImpl + From<Object>>(
+async fn stored<T: ObjectImpl + registry::pickle::Pickle + From<Object>>(
     test: &TestServer,
     property: &str,
     value: &str,

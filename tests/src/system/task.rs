@@ -137,7 +137,7 @@ pub async fn test(test: &mut TestServer) {
             }),
         }),
     );
-    test.server.store().write(batch.build_all()).await.unwrap();
+    test.server.store().write_batch(&mut batch).await.unwrap();
     test.server.notify_task_queue();
 
     // The worker must execute the temporary failure and refuse another retry.

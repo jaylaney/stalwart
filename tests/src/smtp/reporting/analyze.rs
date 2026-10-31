@@ -77,7 +77,7 @@ async fn report_analyze() {
                 "feedback@foobar.org".to_string(),
             ]),
             inbound_report_forwarding: false,
-            inbound_report_max_size: MAX_REPORT_SIZE,
+            max_inbound_report_size: MAX_REPORT_SIZE as u64,
             ..Default::default()
         })
         .await;

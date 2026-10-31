@@ -147,7 +147,7 @@ pub async fn test(test: &mut TestServer) {
     // Registry: marker only, no TOTP.
     let password = registry_password(test, key1.id()).await;
     assert_eq!(password.secret, "$za$");
-    assert!(password.otp_auth.is_none());
+    assert!(password.otp_url.is_none());
 
     // CalDAV login with the new password; second request is a cache hit that carries keys.
     let client = DummyWebDavClient::new(key1_id, "key1@example.com", STRONG, "key1@example.com");
@@ -181,7 +181,7 @@ pub async fn test(test: &mut TestServer) {
         .with_collection(types::collection::Collection::Principal)
         .with_document(0)
         .clear(types::field::PrincipalField::ZeroAccessVault);
-    test.server.store().write(batch.build_all()).await.unwrap();
+    test.server.store().write_batch(&mut batch).await.unwrap();
     test.server.invalidate_local_caches(&[
         CacheInvalidation::AccessToken(key1_id),
         CacheInvalidation::Account(key1_id),
@@ -297,7 +297,7 @@ pub async fn test(test: &mut TestServer) {
             }],
             ..Default::default()
         }
-        .insert(account_info.account_tenant_ids(), key4_id, 0, &mut batch)
+        .insert(account_info.changed_by(), key4_id, 0, &mut batch)
         .unwrap();
         test.server.commit_batch(batch).await.unwrap();
     }
@@ -408,12 +408,7 @@ pub async fn test_data_check(test: &mut TestServer) {
             }],
             ..Default::default()
         }
-        .insert(
-            account_info.account_tenant_ids(),
-            key6_id,
-            calendar_id,
-            &mut batch,
-        )
+        .insert(account_info.changed_by(), key6_id, calendar_id, &mut batch)
         .unwrap();
         test.server.commit_batch(batch).await.unwrap();
     }
@@ -426,14 +421,14 @@ pub async fn test_data_check(test: &mut TestServer) {
         use groupware::{DestroyArchive, calendar::Calendar};
         use store::{
             ValueKey,
-            write::{AlignedBytes, Archive},
+            write::{Archive, ArchiveBytes},
         };
         use types::collection::Collection;
         let account_info = test.server.account_info(key6_id).await.unwrap();
         let archive = test
             .server
             .store()
-            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
                 key6_id,
                 Collection::Calendar,
                 calendar_id,
@@ -444,12 +439,14 @@ pub async fn test_data_check(test: &mut TestServer) {
         let mut batch = store::write::BatchBuilder::new();
         DestroyArchive(archive.to_unarchived::<Calendar>().unwrap())
             .delete(
-                account_info.account_tenant_ids(),
+                &test.server,
+                account_info.changed_by(),
                 key6_id,
                 calendar_id,
                 None,
                 &mut batch,
             )
+            .await
             .unwrap();
         test.server.commit_batch(batch).await.unwrap();
     }
@@ -520,22 +517,27 @@ pub async fn test_data_check(test: &mut TestServer) {
     .await;
     let event_id = 0u32;
     {
-        use groupware::calendar::{CalendarEvent, CalendarEventData};
+        use groupware::calendar::{CalendarEvent, CalendarEventContent, CalendarEventData};
         let account_info = test.server.account_info(key6_id).await.unwrap();
         let mut batch = store::write::BatchBuilder::new();
+        // 1.0 splits an event into its row and its content record.
         CalendarEvent {
             names: vec![common::DavName {
                 name: "stray.ics".into(),
                 parent_id: 2,
             }],
-            data: CalendarEventData::default(),
             ..Default::default()
         }
         .insert(
-            account_info.account_tenant_ids(),
+            CalendarEventContent {
+                data: CalendarEventData::default(),
+                ..Default::default()
+            },
+            account_info.changed_by(),
             key6_id,
             event_id,
             None,
+            Default::default(),
             &mut batch,
         )
         .unwrap();
@@ -553,14 +555,14 @@ pub async fn test_data_check(test: &mut TestServer) {
         use groupware::{DestroyArchive, calendar::CalendarEvent};
         use store::{
             ValueKey,
-            write::{AlignedBytes, Archive},
+            write::{Archive, ArchiveBytes},
         };
         use types::collection::Collection;
         let account_info = test.server.account_info(key6_id).await.unwrap();
         let archive = test
             .server
             .store()
-            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
                 key6_id,
                 Collection::CalendarEvent,
                 event_id,
@@ -570,7 +572,16 @@ pub async fn test_data_check(test: &mut TestServer) {
             .expect("event archive");
         let mut batch = store::write::BatchBuilder::new();
         DestroyArchive(archive.to_unarchived::<CalendarEvent>().unwrap())
-            .delete_all(&account_info, key6_id, event_id, false, &mut batch)
+            .delete_all(
+                &test.server,
+                &account_info,
+                key6_id,
+                event_id,
+                None,
+                false,
+                &mut batch,
+            )
+            .await
             .unwrap();
         test.server.commit_batch(batch).await.unwrap();
     }
@@ -611,7 +622,7 @@ async fn insert_default_calendar(
         ..Default::default()
     }
     .insert(
-        account_info.account_tenant_ids(),
+        account_info.changed_by(),
         account_id,
         document_id,
         &mut batch,
@@ -624,14 +635,14 @@ async fn remove_calendar(test: &TestServer, account_id: u32, document_id: u32) {
     use groupware::{DestroyArchive, calendar::Calendar};
     use store::{
         ValueKey,
-        write::{AlignedBytes, Archive},
+        write::{Archive, ArchiveBytes},
     };
     use types::collection::Collection;
     let account_info = test.server.account_info(account_id).await.unwrap();
     let archive = test
         .server
         .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
             account_id,
             Collection::Calendar,
             document_id,
@@ -642,12 +653,14 @@ async fn remove_calendar(test: &TestServer, account_id: u32, document_id: u32) {
     let mut batch = store::write::BatchBuilder::new();
     DestroyArchive(archive.to_unarchived::<Calendar>().unwrap())
         .delete(
-            account_info.account_tenant_ids(),
+            &test.server,
+            account_info.changed_by(),
             account_id,
             document_id,
             None,
             &mut batch,
         )
+        .await
         .unwrap();
     test.server.commit_batch(batch).await.unwrap();
 }

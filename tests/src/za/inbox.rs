@@ -24,7 +24,7 @@ use groupware::calendar::{EVENT_NOTIFICATION_ZA_PENDING, seal::seal_drained_item
 use hyper::StatusCode;
 use store::{
     ValueKey,
-    write::{AlignedBytes, Archive, now},
+    write::{Archive, ArchiveBytes, now},
 };
 use types::collection::Collection;
 
@@ -66,10 +66,10 @@ pub async fn stored_item(
     test: &TestServer,
     account_id: u32,
     document_id: u32,
-) -> Option<Archive<AlignedBytes>> {
+) -> Option<Archive<ArchiveBytes>> {
     test.server
         .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
             account_id,
             Collection::CalendarEventNotification,
             document_id,

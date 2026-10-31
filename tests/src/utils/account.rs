@@ -224,7 +224,7 @@ impl Account {
             EmailAlias {
                 name,
                 domain_id,
-                enabled: true,
+                enable: true,
                 ..Default::default()
             }
         });
@@ -274,7 +274,7 @@ impl Account {
             EmailAlias {
                 name,
                 domain_id,
-                enabled: true,
+                enable: true,
                 ..Default::default()
             }
         });
@@ -294,7 +294,7 @@ impl Account {
 
     pub async fn create_domain(&self, name: &'static str) -> Id {
         self.registry_create_object(Domain {
-            is_enabled: true,
+            enable: true,
             name: name.to_string(),
             certificate_management: CertificateManagement::Manual,
             dns_management: DnsManagement::Manual,

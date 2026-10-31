@@ -19,7 +19,7 @@ use ::registry::{
     types::duration::Duration as RegistryDuration,
 };
 use common::{
-    Caches, HttpAuthCache,
+    BuildServer, Caches, HttpAuthCache,
     auth::{AuthRequest, TokenScope, oauth::scope::OAuthScopes},
     ipc::CacheInvalidation,
 };

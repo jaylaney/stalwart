@@ -4,7 +4,10 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use directory::{Account, Credentials, Group, Recipient, backend::ldap::LdapDirectory};
+use directory::{
+    Account, Credentials, Group, Recipient, backend::ldap::LdapDirectory,
+    core::verifier::PasswordVerifier,
+};
 use registry::{
     schema::structs::{self, SecretKeyOptional, SecretKeyValue},
     types::map::Map,
@@ -18,11 +21,14 @@ pub async fn test() {
     // Test bind authentication
     let ldap = LdapDirectory::open(config.clone()).await.unwrap();
     assert_eq!(
-        ldap.authenticate(&Credentials::Basic {
-            username: "john.doe@example.org".into(),
-            secret: "this is John's LDAP password".into(),
-            mfa_token: None,
-        })
+        ldap.authenticate(
+            &Credentials::Basic {
+                username: "john.doe@example.org".into(),
+                secret: "this is John's LDAP password".into(),
+                mfa_token: None,
+            },
+            &PasswordVerifier::default(),
+        )
         .await
         .unwrap(),
         Account {
@@ -34,11 +40,14 @@ pub async fn test() {
         }
     );
     assert_eq!(
-        ldap.authenticate(&Credentials::Basic {
-            username: "jane.smith@example.org".into(),
-            secret: "this is Jane's LDAP password".into(),
-            mfa_token: None,
-        })
+        ldap.authenticate(
+            &Credentials::Basic {
+                username: "jane.smith@example.org".into(),
+                secret: "this is Jane's LDAP password".into(),
+                mfa_token: None,
+            },
+            &PasswordVerifier::default(),
+        )
         .await
         .unwrap(),
         Account {
@@ -53,20 +62,26 @@ pub async fn test() {
         }
     );
     assert!(
-        ldap.authenticate(&Credentials::Basic {
-            username: "jane.smith@example.org".into(),
-            secret: "this is a wrong LDAP password".into(),
-            mfa_token: None,
-        })
+        ldap.authenticate(
+            &Credentials::Basic {
+                username: "jane.smith@example.org".into(),
+                secret: "this is a wrong LDAP password".into(),
+                mfa_token: None,
+            },
+            &PasswordVerifier::default(),
+        )
         .await
         .is_err()
     );
     assert!(
-        ldap.authenticate(&Credentials::Basic {
-            username: "jane.smith@example.org".into(),
-            secret: "".into(),
-            mfa_token: None,
-        })
+        ldap.authenticate(
+            &Credentials::Basic {
+                username: "jane.smith@example.org".into(),
+                secret: "".into(),
+                mfa_token: None,
+            },
+            &PasswordVerifier::default(),
+        )
         .await
         .is_err(),
         "Empty password accepted during bind authentication"
@@ -78,11 +93,14 @@ pub async fn test() {
     config.bind_authentication = false;
     let ldap = LdapDirectory::open(config.clone()).await.unwrap();
     assert_eq!(
-        ldap.authenticate(&Credentials::Basic {
-            username: "john.doe@example.org".into(),
-            secret: "this is John's LDAP password".into(),
-            mfa_token: None,
-        })
+        ldap.authenticate(
+            &Credentials::Basic {
+                username: "john.doe@example.org".into(),
+                secret: "this is John's LDAP password".into(),
+                mfa_token: None,
+            },
+            &PasswordVerifier::default(),
+        )
         .await
         .unwrap(),
         Account {
@@ -94,20 +112,26 @@ pub async fn test() {
         }
     );
     assert!(
-        ldap.authenticate(&Credentials::Basic {
-            username: "john.doe@example.org".into(),
-            secret: "this is a wrong LDAP password".into(),
-            mfa_token: None,
-        })
+        ldap.authenticate(
+            &Credentials::Basic {
+                username: "john.doe@example.org".into(),
+                secret: "this is a wrong LDAP password".into(),
+                mfa_token: None,
+            },
+            &PasswordVerifier::default(),
+        )
         .await
         .is_err()
     );
     assert!(
-        ldap.authenticate(&Credentials::Basic {
-            username: "john.doe@example.org".into(),
-            secret: "".into(),
-            mfa_token: None,
-        })
+        ldap.authenticate(
+            &Credentials::Basic {
+                username: "john.doe@example.org".into(),
+                secret: "".into(),
+                mfa_token: None,
+            },
+            &PasswordVerifier::default(),
+        )
         .await
         .is_err(),
         "Empty password accepted during direct authentication"
@@ -195,11 +219,14 @@ pub async fn test() {
     }
 
     let account = ldap_overloaded_attr
-        .authenticate(&Credentials::Basic {
-            username: "mm@example.org".into(),
-            secret: "this is Multi's LDAP password".into(),
-            mfa_token: None,
-        })
+        .authenticate(
+            &Credentials::Basic {
+                username: "mm@example.org".into(),
+                secret: "this is Multi's LDAP password".into(),
+                mfa_token: None,
+            },
+            &PasswordVerifier::default(),
+        )
         .await
         .unwrap();
     assert_eq!(sorted_addresses(&account), MULTI_MAIL);
@@ -230,7 +257,7 @@ pub fn ldap_test_directory() -> structs::LdapDirectory {
         }),
         filter_member_of: "(&(objectClass=groupOfNames)(member=?))".to_string().into(),
         filter_login: "(&(objectClass=inetOrgPerson)(mail=?))".into(),
-        filter_mailbox: concat!(
+        filter_recipient: concat!(
             "(|(&(objectClass=inetOrgPerson)(|(mail=?)(mailAlias=?)))",
             "(&(objectClass=groupOfNames)(|(mail=?)(mailAlias=?))))"
         )

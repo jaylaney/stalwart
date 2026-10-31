@@ -496,7 +496,7 @@ impl Traced {
             "za-mail-traced-{}",
             TRACED_SUBSCRIBERS.fetch_add(1, Ordering::Relaxed)
         );
-        let (_tx, rx) = SubscriberBuilder::new(id.clone())
+        let (_tx, rx, _) = SubscriberBuilder::new(id.clone())
             .set_interests(types.iter().copied())
             .with_lossy(false)
             .register();

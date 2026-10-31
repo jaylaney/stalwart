@@ -76,11 +76,14 @@ async fn registry_state(test: &TestServer) -> (Option<String>, u64) {
         .await
         .unwrap()
         .unwrap();
-    let ObjectInner::Account(structs::Account::User(account)) = object.inner else {
+    let ObjectInner::Account(account) = object.inner else {
+        panic!("not an account");
+    };
+    let structs::Account::User(account) = *account else {
         panic!("not a user account");
     };
     (
-        account.password_credential().unwrap().otp_auth.clone(),
+        account.password_credential().unwrap().otp_url.clone(),
         object.revision,
     )
 }

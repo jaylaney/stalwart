@@ -17,6 +17,7 @@ use crate::utils::{
 };
 use common::auth::oauth::GrantType;
 use dav_proto::schema::property::{DavProperty, PrincipalProperty};
+use groupware::cache::GroupwareCache;
 use groupware::calendar::{
     CalendarEvent, CalendarEventContent,
     itip::{ItipIngest, RsvpError, RsvpRequest, RsvpResponse},
@@ -513,7 +514,7 @@ pub async fn test_scheduling(test: &mut TestServer) {
     // link, before the event is read.
     let document_id = test
         .server
-        .fetch_dav_resources(key1_id, key1_id, SyncCollection::Calendar)
+        .fetch_groupware_resources(key1_id, key1_id, SyncCollection::Calendar)
         .await
         .unwrap()
         .by_path("default/invite.ics")
@@ -646,7 +647,7 @@ pub async fn test_scheduling(test: &mut TestServer) {
         .to_string();
     let document_id = test
         .server
-        .fetch_dav_resources(plain_id, plain_id, SyncCollection::Calendar)
+        .fetch_groupware_resources(plain_id, plain_id, SyncCollection::Calendar)
         .await
         .unwrap()
         .by_path("scheduling/invite.ics")

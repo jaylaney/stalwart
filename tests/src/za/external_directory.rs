@@ -97,7 +97,7 @@ pub async fn test(test: &mut TestServer) {
     let sql = SqliteStore::open(structs::SqliteStore {
         path: path.clone(),
         pool_workers: None,
-        pool_max_connections: 1,
+        pool_max_connections: Some(1),
     })
     .unwrap();
     populate(&sql).await;
