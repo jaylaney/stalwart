@@ -742,7 +742,15 @@ END:VCALENDAR
       "CONFERENCE": true
     },
     "organizerCalendarAddress": "mailto:jsmith@example.com",
-    "duration": "P2DT7H30M"
+    "duration": "P2DT7H30M",
+    // 1.0's parse also lists the server-set properties, null for a parsed
+    // event, and the JSCalendar version.
+    "id": null,
+    "baseEventId": null,
+    "calendarIds": null,
+    "isDraft": null,
+    "isOrigin": null,
+    "version": "2.0"
   }
 ]));
 
