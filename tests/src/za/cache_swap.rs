@@ -356,7 +356,7 @@ async fn swap_roundtrip_contains_no_protected_canary(test: &mut TestServer, suit
         needles.extend(key_needles(&format!("account {id}"), test, id).await);
     }
     let accounts = [key_id, pending_id, plain_id];
-    assert_snapshots_clean(test, suite, &accounts, &needles).await;
+    assert_snapshots_clean(test, suite, &accounts, &needles, true).await;
     for id in accounts {
         assert_visible_snapshot(test, id).await;
     }
@@ -446,7 +446,7 @@ async fn swap_roundtrip_contains_no_protected_canary(test: &mut TestServer, suit
         assert_eq!(messages.emails.len(), 2, "account {id}: the fresh load");
     }
     flush(test).await;
-    assert_snapshots_clean(test, suite, &accounts, &needles).await;
+    assert_snapshots_clean(test, suite, &accounts, &needles, true).await;
 }
 
 /// Revocation race: a snapshot of the owner's calendar taken while the
@@ -622,7 +622,14 @@ async fn swap_restore_after_revoke_cannot_restore_access(test: &mut TestServer, 
     // The owner's ring and the calendar's display name live in its
     // preferences, which no cache entry holds.
     needles.push(Needle::text("ring marker", vault::ZA_MARKER));
-    assert_snapshots_clean(test, suite, &[owner_id, reader_id, never_id], &needles).await;
+    assert_snapshots_clean(
+        test,
+        suite,
+        &[owner_id, reader_id, never_id],
+        &needles,
+        false,
+    )
+    .await;
 }
 
 /// GET as `client`: the status, and whether the body holds the summary.
@@ -840,11 +847,15 @@ fn decoded(bytes: &[u8]) -> Option<(SwapPart, Vec<u8>)> {
 
 /// No needle in any stored snapshot, raw or decoded; and both kinds of
 /// snapshot were found and decoded.
+/// `with_mail`: whether the accounts hold mail, so a message frame must
+/// decode (the revocation case delivers none; on the file tier the scan
+/// also reads the other cases' files, on the blob tier only its accounts').
 async fn assert_snapshots_clean(
     test: &TestServer,
     suite: &Suite,
     accounts: &[u32],
     needles: &[Needle],
+    with_mail: bool,
 ) {
     let artifacts = raw_artifacts(test, suite, accounts).await;
     let mut violations = Vec::new();
@@ -873,7 +884,7 @@ async fn assert_snapshots_clean(
         suite.tier
     );
     assert!(
-        messages > 0 && resources > 0,
+        (messages > 0 || !with_mail) && resources > 0,
         "{:?}: {} stored snapshots, {messages} message and {resources} resource frames decoded",
         suite.tier,
         artifacts.len()
