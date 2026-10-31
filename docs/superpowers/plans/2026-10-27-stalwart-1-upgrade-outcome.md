@@ -4426,6 +4426,131 @@ key) is its state, as an event's envelope is.
 - `clippy` reports five warnings in fork code that predate the port (`fanout.rs:790`,
   `seal/domain.rs:297`, `sequence_floor.rs:218`, `sharing/resolve.rs:141` and `:1006`).
 
+### Part 4b: DAV, JMAP refusals and the HTTP endpoints
+
+Part 4b resolved every conflict in `dav`, ported the 0.16 `propfind.rs` hooks into
+`common/propfind/` (the file is deleted), resolved `jmap/src/api/request.rs` whole (ruling 41)
+and `jmap/src/calendar_event/set.rs`, and ported `http/src/api/{shares,contacts}.rs` beyond the
+login code (commits `4beb2ae0f`, `79695301b`, `ae37bdd7d`). `cargo check -p dav --tests` and
+`cargo check -p groupware -p dav --tests --features test_mode` are warning-free;
+`cargo test -p dav --lib` passes 2 tests (one new: `tombstones_need_identity_coverage`). `jmap`
+and `http` compile at Task 6: their four files are rustfmt-clean and were checked against
+v1.0.1's signatures by reading. One `groupware` line changed: `ZaKeyDomain::owner` is public, for
+MKCOL's container (below).
+
+#### The dead-property wrapper at the DAV sites (rulings 16, 23 and 29)
+
+The wrapper is 4a's (`seal/container.rs`, layout in part 4a): header `[FORMAT_VERSION, DAV, 1]`,
+one DAV entry `{urn:x-zero-access:sealed}container` whose text-only value is base64 of
+`1 || bound || envelope || seal_padded(DEK, za/v1|dead-container|<owner>|<scope>, container)`.
+The DAV sites choose the scope and domain as follows:
+
+| Site | Domain | Scope sealed | Scope opened |
+|---|---|---|---|
+| MKCOL (`calendar/mkcol.rs`) | the owner's (`ZaKeyDomain::owner`) | `Calendar(None)`, bound 0: the id is a pending slot (ruling 16's recorded limit) | none (no stored container) |
+| Calendar PROPPATCH | the calendar's fresh mutation context | `Calendar(Some(id))`, bound 1 | `Calendar(id)` (either bound) |
+| Event PROPPATCH | the event's write context (its calendar's) | `Event(uid)` | `Event(uid)` |
+| PROPFIND, REPORT, `propname` | the item's read context (memoized per request) | none | as PROPPATCH |
+| Event MOVE across key domains | source context to target context | `Event(uid)`, resealed under a fresh data key (`reseal_container`) in the event's own commit | `Event(uid)` |
+| Calendar COPY or MOVE (`za_copy_container`, `za_move_overwrite_container`) | source context to the owner's | `Calendar(Some(target))`, the target id from a reservation-only batch (ruling 14) or the overwritten id | `Calendar(source)` |
+
+- **PROPPATCH** (`dead/patch.rs`): `DeadPatch::apply_za(.., Some(&ZaDeadSeal))` opens the stored
+  container into the builder's view, measures `previous_len` and the entry bound on the
+  plaintext, compares plaintext (an unchanged container writes nothing), and seals `next` before
+  `ContainerChange::new`, whose previous value is the stored sealed container, so the hash CAS is
+  upstream's. The `check_edit` limit runs on the plaintext `next`; the quota check runs on the
+  sealed change, which is what is stored. `apply` is `apply_za(.., None, ..)`.
+- **PROPFIND**: the container is opened at the callers of `dead_properties` and
+  `dead_property_names` (`propfind/mod.rs`, both the `propname` branch and the main loop, before
+  `add_propfind_item` and `into_property_names`) into an owned `MetadataBuf` that keeps the
+  stored size and hash. A container that does not open fails that item (500).
+- **COPY within an account** adds a link to the same document, so the event's container is
+  unchanged; a COPY into or out of a shared calendar is refused (`shared_copy_refusal`), so a
+  COPY never changes key domain.
+- Keyless paths (`stored_entries`, `MetadataBuf::read`, quota, cleanup, purge) are upstream's, on
+  the sealed bytes.
+
+#### Site map, 0.16 to 1.0
+
+| 0.16 site | 1.0 site |
+|---|---|
+| `propfind.rs` `PropFindData.calendar_memo`, `new` | `propfind/data.rs` (field and constructor) |
+| `propfind.rs:278` root discovery (`foreign_home_visible`) | `propfind/mod.rs` `handle_propfind_request`, before `prepare_principal_propfind_response` |
+| `propfind.rs:322` `za_home_listing` | `propfind/mod.rs` `handle_dav_query` |
+| `propfind.rs:405`, `:475` `propname` context, pending items, 404 rule | `propfind/mod.rs` `propname` branch through `za::za_propname_item` and `dav_query_response` |
+| `propfind.rs:508`, `:525` stored/view split, `za_archive_view` | `propfind/mod.rs` main loop through `za::za_propfind_item` and `ZaViews::apply`, after the batch load or the resource-cache answer and before `calendar_event_view` (inventory finding 4) |
+| `propfind.rs:599`, `:1118` trace ids | `CalendarQueryHandler::for_content(.., account_id, document_id)` in `propfind/{mod,item}.rs` |
+| `propfind.rs:1255` tail | `dav_query_response` |
+| `propfind.rs:1288` helpers | `propfind/za.rs` (`dav_query_response`, `foreign_calendar_contexts`, `invalid_calendar_sync_token`, `tombstone_prefixes`, `authorize_calendar_tombstones`) |
+| `propfind.rs:1417` foreign sync | `propfind/get.rs` `get`: both tombstone streams read with `vanished_with_change_id` over `Query::Range(from, snapshot)` of a `State` or `ChangesPage` token (inventory finding 3); boundary refusal compares the token's `from` |
+| `propfind.rs:1565` subtree restriction | `propfind/get.rs`, after `display_children` |
+| `propfind.rs:1597` truncated-change refusal | no code: 1.0's `needs_full_rebuild` refuses a truncated change set for every account, and `ChangesPage` pages the rest |
+| `propfind.rs:1668` authorized tombstones | `propfind/get.rs` vanished list |
+| `propfind.rs:1818`, `:1856` assisted discovery | `propfind/get.rs` shared-account loop |
+| `propfind.rs:1918` multiget collection | `propfind/get.rs` `multiget` |
+| `encode_path_segment` (prefixes, shares href) | `common::storage::dav::canonical_path_segment` and `DavResourceName::account_base_path` (inventory finding 6) |
+| `copy_move.rs` `assert_value(.., AlignedBytes)`, `ValueClass::ChangeId` | `ArchiveBytes`; `ValueClass::ChangeId(Calendar group)`, `last_change_id(owner, Calendar)` |
+| `update.rs` `assign_document_ids` | reservation-only batch, then `PendingId::Assigned` (ruling 14) |
+| `update.rs`, `delete.rs` `scheduling_account_info` | `calendar::za_roles` (sender = writer plus owner's addresses; 1.0's handlers pass the owner's) |
+| `CalendarEvent::update_at` / `insert_at` | `update_full_at`, `update_meta_at`, `insert_at` over the stored row and content |
+| `sequence::{za_sequence_floor, za_set_sequences}` | `sequence_floor::..` (ruling 25) |
+
+#### Decisions recorded for the primary
+
+- **1.0's whole-request conflict retry** (`request.rs`, `MAX_CONFLICT_RETRIES`) is skipped when
+  the token holds session keys. The fork's handlers run their own bounded retry, and a replay
+  would run a fan-out again after its items committed (invitations spec 5.4). Plain sessions
+  keep upstream's retry.
+- **Per-user data on a key account's write.** A sharee's PUT is not split into per-user
+  preferences (`is_user_data_only` is false and `extract_user_data` is skipped): the whole tree is
+  shared data, as at 0.16, and `seal_event_in_domain` would refuse non-empty preferences.
+- **`za_assert_is_unique_uid`** follows 1.0's `assert_is_unique_uid`: 403 `NoUidConflict` (0.16
+  answered 412), and a sharee whose only conflict is a secret event gets a plain 403.
+- **Own-items rights.** 1.0's own-item paths (`EventAcl::may_manage_own_items`) read ownership
+  from the stored tree, which is sealed for a key account, so they refuse (403); a key
+  account's writes still need the fork's operation bits through the fresh context. Fail-closed,
+  recorded.
+- **Sizes.** A key account's stored `size` is the sealed tree's. PROPFIND's metadata view, GET's
+  and the inbox's HEAD measure the plaintext view instead.
+
+#### The viewer-side readers at the DAV sites
+
+- `dav/calendar/view.rs`, `filter.rs` and `CalendarQueryHandler` run on the unsealed content:
+  PROPFIND and REPORT replace the stored content before `calendar_event_view` and the filters;
+  GET and PUT pass the view; free-busy unseals before the scan.
+- `DefaultAlertsResolver` runs on the view in GET, PUT and PROPFIND. The key path of COPY never
+  serves content, and upstream's COPY paths that run it are unreachable for key accounts
+  (cross-account copies are refused).
+- The privacy flags are read from the resource cache, as upstream does
+  (`assert_event_privacy_access`, `EventPrivacy::from_flags`); no fork code reads or overrides
+  them.
+- The inbox (ruling 13): PROPFIND and `propname` leave out pending items; GET answers 404 for
+  one and unseals a drained one's content.
+
+#### Deferred, by owner
+
+**Part 4c**
+- Every test in Task 4's brief, including the dead-property round trips, COPY and MOVE with
+  dead properties, the keyless container paths and the differential sharee test.
+- `record_calendar_move_plan` now records 0 bytes: 1.0 has no input-byte measure (see Task 6).
+
+**Task 5**
+- `jmap/src/api/request.rs`: the mail gates are ported on their 0.16 arms; 1.0's new mail arms
+  need classification.
+
+**Task 6**
+- The move route's input-byte bound: `za_move_overwrite_container` refuses (409) a batch with a
+  commit point, more than 1000 operations or over `is_large_batch`; 1.0's `batch_size` counts
+  set values with their size hints, which Task 6 confirms or replaces with an exact measure.
+- `jmap`: 1.0's new arms `PrincipalAvailability` (free-busy) and `ShareNotification` need a
+  key-account disposition (spec 9); `http` and `jmap` compile first at Task 6's check.
+- `reschedule_calendar_alarms` (calendar PROPPATCH) and the alarm task read sealed trees; they
+  find nothing to schedule, which is safe (as part 4a's alarm task note).
+
+**Recorded, no owner**
+- `za_eval_if`'s arena argument: no DAV call site; the fan-out's recipient evaluation goes
+  through `common/src/cache/principals.rs` (Task 3a).
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
@@ -4480,20 +4605,20 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/common/src/storage/transaction.rs` | content | Task 4 | resolved (Task 3a, ruling 41): v1.0.1's `delete_changes`, whose `truncate_change_log` already writes the truncation entry before any delete for every collection (0.16's Calendar-only early publication is now upstream's behaviour, so rows 2-3's ordering needs no fork code); a Calendar truncation also clears `VanishedCollection::CalendarIdentity` (250) over the same range, then calls `calendar_history_purge_pause_point` under `test_mode`. Nothing deferred to Task 4. Task 4a re-read: confirmed, and `CalendarIdentity`'s change group is Calendar's (see Task 4, "`delete_changes` and `CalendarIdentity`"). |
 | `crates/common/src/telemetry/tracers/otel.rs` | content | Task 9 (compiles in Task 3) | resolved (Task 3a, ruling 41): v1.0.1's file as supplied (the exporter moved to the `telemetry` crate). Deferred to Task 9: row 1, at `crates/telemetry/src/otlp/resource.rs` (see `config/telemetry.rs`). |
 | `crates/dav/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies (local `calcard`, hashify 0.3, hyper 1.12) plus `vault` (row 1); `test_mode = ["common/test_mode"]` (row 2). |
-| `crates/dav/src/calendar/copy_move.rs` | content | Task 4 | open |
-| `crates/dav/src/calendar/delete.rs` | content | Task 4 | open |
-| `crates/dav/src/calendar/freebusy.rs` | content | Task 4 | open |
-| `crates/dav/src/calendar/get.rs` | content | Task 4 | open |
-| `crates/dav/src/calendar/mkcol.rs` | content | Task 4 | open |
-| `crates/dav/src/calendar/mod.rs` | content | Task 4 | open |
-| `crates/dav/src/calendar/proppatch.rs` | content | Task 4 | open |
-| `crates/dav/src/calendar/query.rs` | content | Task 4 | open |
-| `crates/dav/src/calendar/scheduling.rs` | content | Task 4 | open |
-| `crates/dav/src/calendar/update.rs` | content | Task 4 | open |
-| `crates/dav/src/common/acl.rs` | content | Task 4 | open |
-| `crates/dav/src/common/propfind.rs` | modify/delete | Task 4 | open |
-| `crates/dav/src/common/uri.rs` | content | Task 4 | open |
-| `crates/dav/src/request.rs` | content | Task 4 | open |
+| `crates/dav/src/calendar/copy_move.rs` | content | Task 4 | resolved (Task 4b): v1.0.1's file with row 3 (cross-account refusal, beside 1.0's privacy check), rows 4-11 (`from_calendar_id`, the key path's early returns; `log_calendar_vanished`) and the fork tail ported to split events: `za_copy_move_stored_event` writes `update_meta_at`, or `update_full_at` with the event and its container rewrapped/resealed when a MOVE changes key domain (ruling 29); `za_copy_container` seals the calendar's container for the destination id from a reservation-only batch (rulings 14, 16); `za_move_overwrite_container` keeps the one-transaction bound with 1.0's `commit_point_count`/`is_large_batch` (the input-byte measure is Task 6's). Rows 12-15 (`rename_container`) as merged; `last_change_id` takes the Calendar change group. The default-calendar gate is `feature = "test_mode"`. |
+| `crates/dav/src/calendar/delete.rs` | content | Task 4 | resolved (Task 4b): v1.0.1's file with rows 3-7: key paths use `za_roles`'s sender/writer/owner, `delete_with_events_za` and `delete_za_at` (upstream's calls kept for plain accounts), the fan-out of `ZaDeleteMessage.messages`, the bounded retry and the grantees' invalidation; the default-calendar gate is `feature = "test_mode"`. |
+| `crates/dav/src/calendar/freebusy.rs` | content | Task 4 | resolved (Task 4b): v1.0.1's file; ruling R6 through `za_freebusy_views` (the selected events unsealed before upstream's synchronous scan; withheld leaves no ids); the URI gate after `parse_uri`; expansion-trace ids. |
+| `crates/dav/src/calendar/get.rs` | content | Task 4 | resolved (Task 4b): v1.0.1's file; the read context before header evaluation, the content unsealed before `calendar_event_view`; HEAD measures a key account's view. |
+| `crates/dav/src/calendar/mkcol.rs` | content | Task 4 | resolved (Task 4b): v1.0.1's imports plus the seal; the calendar is sealed after `sync_owner_preferences`; dead properties sealed with `ZaDeadSeal::calendar(owner, None)` (ruling 16's MKCOL limit). |
+| `crates/dav/src/calendar/mod.rs` | content | Task 4 | resolved (Task 4b): v1.0.1's file plus the fork helpers on 1.0 types (`GroupwareResources`, `ArchiveBytes`); `za_assert_is_unique_uid` follows 1.0's 403 `NoUidConflict` and secret-conflict rule; new `za_roles` (0.16's `scheduling_account_info`, which 1.0 removed); `za_refresh_event` rewraps a `ZaEvent`. |
+| `crates/dav/src/calendar/proppatch.rs` | content | Task 4 | resolved (Task 4b): v1.0.1's handler with rows 3-9: calendar context and sealed calendar edits; dead properties through `DeadPatch::apply_za`; a key event's displayname becomes a sealed `update_full` (ruling 15); contexts asserted in every write; one bounded retry rewrapping the event and its container (`za_proppatch_retry`). |
+| `crates/dav/src/calendar/query.rs` | content | Task 4 | resolved (Task 4b): 1.0's trace without `Contents` (the tree is a key account's plaintext view), with account and document ids and `ResourceUid`; `for_content` takes the ids too (rows 1-2). |
+| `crates/dav/src/calendar/scheduling.rs` | content | Task 4 | resolved (Task 4b): row 2 on 1.0's split item (pending check on the row, unseal on the content archive, HEAD length from the view); row 3 inside 1.0's tenant-checked account resolution. |
+| `crates/dav/src/calendar/update.rs` | content | Task 4 | resolved (Task 4b): v1.0.1's handler with rows 4-17: the view/stored split (spec 8.1), no per-user split for key accounts, the SEQUENCE floor, `SendSealed` through `za_schedule`, the fan-out, `seal_event_in_domain` and a bounded `update_full_at` retry; the create in `za_create_event` (ruling 14's reservation-only batch before the fan-out, the lease fence, `insert_at`). |
+| `crates/dav/src/common/acl.rs` | content | Task 4 | resolved (Task 4b): v1.0.1's actor check plus row 1 (spec 9). |
+| `crates/dav/src/common/propfind.rs` | modify/delete | Task 4 | resolved (Task 4b): deleted; its hooks are in `common/propfind/{mod,get,data,item}.rs` and the new fork module `common/propfind/za.rs` (see Task 4, part 4b, site map). |
+| `crates/dav/src/common/uri.rs` | content | Task 4 | resolved (Task 4b): v1.0.1's split of `parse_uri` and `validate_uri_with_status`; row 2 is `za_uri_gate` after the access check (and after `parse_uri` in the free-busy handler). |
+| `crates/dav/src/request.rs` | content | Task 4 | resolved (Task 4b): 1.0's imports plus `za_calendar_report_uri`; rows 3-9 as merged; 1.0's whole-request conflict retry is skipped for keyed sessions (part 4b). |
 | `crates/directory/src/core/secret.rs` | content | Task 3 | resolved (Task 3a): v1.0.1's `CryptScheme` plus row 1, `verify_totp_code`; the restored module is declared after the private slot (Task 2 handoff), its base64 helper moved to `encodify`. |
 | `crates/email/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies (mail-parser 1.0, mail-builder 2.0, local `sieve-rs` and `text-extract`, workspace rkyv) plus `vault` (row 1) and `zeroize` (row 2); `test_mode = []`, the fork's 0.16.27 declaration, for the tests manifest. |
 | `crates/email/src/message/copy.rs` | content | Task 5 | open |
@@ -4529,12 +4654,12 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/imap/src/op/search.rs` | content | Task 5 (search: Task 6) | open |
 | `crates/imap/src/op/store.rs` | content | Task 5 | open |
 | `crates/jmap/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies (local `calcard`, `smtp-proto`, `sieve-rs`, `jmap-tools`; mail-parser 1.0 without `rkyv`) plus `vault` (row 1). `test_mode = ["utils/test_mode"]`: part 2a declared `[]`, the fork's 0.16.27 value, and part 2b made it enable `utils/test_mode` ("Manifests" above). |
-| `crates/jmap/src/api/request.rs` | content | Task 5 (calendar refusal: Task 4) | open |
+| `crates/jmap/src/api/request.rs` | content | Task 5 (calendar refusal: Task 4) | resolved (Task 4b, ruling 41, whole): rows 2-24 on their arms beside 1.0's `assert_has_source_access` and from-account checks; `za_jmap_untraced` and `za_method_error_for_trace` kept. 1.0's new arms (`PrincipalAvailability`, `ShareNotification`, `FileNode`/`ContactCard` copy) are Task 5's and Task 6's to classify. |
 | `crates/jmap/src/api/session.rs` | content | Task 6 | open |
 | `crates/jmap/src/blob/copy.rs` | content | Task 5 | open |
 | `crates/jmap/src/blob/download.rs` | content | Task 5 | open |
 | `crates/jmap/src/blob/upload.rs` | content | Task 5 | open |
-| `crates/jmap/src/calendar_event/set.rs` | content | Task 4 | open |
+| `crates/jmap/src/calendar_event/set.rs` | content | Task 4 | resolved (Task 4b): rows 2-8; `ItipSendStatus::resolve(.., false)` at the three sites; identity tombstones. |
 | `crates/jmap/src/changes/get.rs` | content | Task 5 | open |
 | `crates/jmap/src/email/copy.rs` | content | Task 5 | open |
 | `crates/jmap/src/email/get.rs` | content | Task 5 | open |
