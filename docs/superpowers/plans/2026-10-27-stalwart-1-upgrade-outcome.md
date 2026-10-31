@@ -6694,6 +6694,115 @@ path); the unit run rewrites `crates/dav-proto/resources/requests/*.json` (an up
 its output; reverted); the IMAP and JMAP runs leave untracked `*.imap_failed` and `*.failed`
 fixtures for comparison.
 
+#### Part 7c2: rulings 79-88, 95, 96 and the remaining rows
+
+Part 7c2 applied rulings 79-88 (and 95 and 96, issued during the part), drove each red row from
+its first failure, and reran the ZA rows at the end. Logs: `task-7c/logs/<row>-<attempt>.log`
+(runner `task-7c/matrix2.sh`), results `task-7c/results.md`. The held edits are down to N3
+(`za::pinning::case_11_mixed`) and N7 (the `za::sharing` lifecycle differential): `holds.py`
+holds only those two, as ruling 89 and the later rulings left them.
+
+Commits: `0c3a4fb10` (SMTP, store, system and telemetry tests, the emptiness check's blob
+expiry), `2b74f9e7b` (CalDAV, IMAP and JMAP tests and fixtures), `96dbbda01` (the ZA rulings
+and two dispositions), `f83f313ea` (the gates' copy-refusal traces), and this note.
+
+##### Rulings applied
+
+- **79 (N1).** The tenant-disable case of `za::disabled` is removed; disposition
+  `za-disabled-tenant` (SEL-only).
+- **80 (N2).** `za::drain::test_lease` A names the late item by role. The drain's enumeration
+  does not depend on ids arriving in order: each pass reads every pending item, in document id
+  order, and its cursor is the inbox's change id, not a document id (`enumerate`). Items of
+  one UID are taken in document id order, which at 1.0 is commit order.
+- **81 (N4).** The MOVE byte-oversize case is retired; disposition `sharing-move-bytes-oversize`.
+- **82 (N5).** The between-reads race is staged with a token one change behind and is reached.
+  1.0 answers it 207 without the concurrent change, which the next sync reports: both tombstone
+  reads are bounded by the snapshot read before them. The step asserts that (see Needs a ruling).
+- **83 (N8).** The class differential's sharee COPY goes into the sharee's own second calendar
+  (key 403, ordinary 201); the ordinary same-calendar COPY is asserted 403 `no-uid-conflict`.
+- **84 (N10, N11).** 1.0's own refusals (`accountNotFound`, `fromAccountNotFound`,
+  `accountNotSupportedByMethod`, the FileNode kind check) are accepted as refusals, each
+  asserted to carry no content; a File-node copy reaches the fork's raw-source refusal in
+  `uploads`. No session reaches the fork's refusal of a `Blob/copy` out of a key account
+  (see Needs a ruling).
+- **85 (N12).** `test_mid_pass_deletion` accepts no orphan or the resumed pass's document only.
+- **86 (N13).** No fork code adds bytes for an ordinary account (`groupware/src/file/index.rs`,
+  `dav/src/file/update.rs`, `common/src/storage/quota.rs` equal v1.0.1). 1.0 checks the
+  quota at commit against the object's charge; a file charges its name, content and
+  `size_of::<FileNode>()`. A key account's event charges its content plus 485 bytes and its
+  sealed collection 491 bytes more than an ordinary one (measured); key mode's extra quota is
+  set from those numbers.
+- **87.** `smtp::lookup::expressions` runs the key and counter functions on the default
+  in-memory store (`'*'`) and `counter_*` as `key_incr`; the SQL query case stays. Passes.
+- **88.** Ledger row added.
+- **95 (N6).** `plain_update_trace` expects 1.0's replay: 204 and both changes kept.
+- **96 (N9).** The grantee's race uses its display name; a new case documents the dead-property
+  behaviour on both account kinds.
+
+##### CalDAV `put_get`'s blob leftover
+
+Cause in 1.0, not fork code: `Server::hold_blob` writes the blob before its batch and the commit
+entry only when the batch commits, so a PUT refused for quota leaves the blob reachable only
+through its temporary link. The test harness's `store_blob_expire_all` deleted temporary links,
+which left the blob unreachable to the purge; it now expires them in place, as the purge finds
+them once the hold runs out.
+
+##### Fixes by kind
+
+Ledger rows below. The protocol suites' tails held one 1.0 difference after another (reply
+codes, keyword case and server-set keywords, fixture writers, OAuth rules, dav-proto statuses);
+each was adapted under ruling 44 where 1.0's behaviour is intended, and the rows still red are
+listed in the results with their next failure.
+
+##### Results
+
+Rows run at `96dbbda01`/`f83f313ea` with the N3 and N7 holds applied. Workspace units and vault
+and groupware were not rerun (part 7c2 changed only the `tests` crate and fixtures).
+
+| Row | Result (passed / failed / ignored) | Status |
+|---|---|---|
+| Formatting | rc 0 | green |
+| ZA | 1 / 0 / 0 (`za-85`) | green with the N3 and N7 holds |
+| ZA leak unit | 1 / 0 / 0 | green |
+| ZA filesystem blobs | 1 / 0 / 0 (`zafs-3`) | green with the N3 and N7 holds |
+| ZA cache swap | 1 / 0 / 0 | green |
+| `webdav::cal_query::` | 2 / 0 / 1 | green |
+| CalDAV plain and key | 0 / 1 each | red: `webdav::prop` (/dav/cal) answers a PROPPATCH over quota 424 where 507 is expected; not yet classified |
+| IMAP plain | 0 / 1 | red: `imap::fetch`'s pipelined failing command is accepted (`* 1 FETCH (UID 1)`, OK) where `_p BAD` is expected; not yet classified |
+| IMAP key | 0 / 1 | red: `imap::condstore` gets `* VANISHED (EARLIER) 1:2` where none is expected; not yet classified |
+| JMAP plain | 0 / 1 | red: `jmap::mail::query` returns four more ids than 0.16 for `after(1875) and before(1878)` sorted by `someInThreadHaveKeyword`; undiagnosed |
+| JMAP key | 0 / 1 | red: `jmap::mail::changes` answers no changes from state 2 (key mode only so far) |
+| `store_tests`, `blob_tests`, `lookup_tests`, `search_tests`, `telemetry_tests` | 1 / 0 each | green |
+| `system_tests` | 0 / 1 | red: `system::oidc`'s SMTP OAUTHBEARER step answers `503 5.5.1 AUTH not allowed.`; not yet classified |
+| SMTP | 75 / 1 / 3 | red: `dkim2_dsn_is_signed` (the DSN carries no DKIM2 signature; fails alone too, so not its known timing flake) |
+
+
+##### Needs a ruling (part 7c2)
+
+- **N14, ruling 82's race:** reached, it answers 207 without the change written between the two
+  tombstone reads, and the next sync reports it, because both reads are bounded by the snapshot
+  read before them. The step asserts that, where the ruling expected a refusal. Confirm.
+- **N15, ruling 84's coverage:** no session in the suite reaches the fork's refusal of a
+  `Blob/copy` out of a key account any more (1.0 answers `fromAccountNotFound` for a session
+  without access and `accountNotSupportedByMethod` for one whose access is a mailbox or folder
+  share). The refusal stays in code, unexercised.
+- **N16, `webdav::prop`:** a file node's display-name PROPPATCH leaves its ETag unchanged at 1.0
+  (the name is stored beside the node), the same class as ruling 96's dead properties; the test
+  now asserts the unchanged ETag for files. Confirm, or treat it as ruling 96's regression.
+- **N17, `jmap::mail::set` `nested_body`:** the created message's `$hasattachment` keyword was
+  present in one plain run and absent in the next (with `hasAttachment: true` both times), an
+  apparent upstream nondeterminism; the comparison now leaves server-set keywords out.
+- **N18, key-mode quota (ruling 86's other side):** a key account's sealed event charges 485 bytes
+  more than its content and its sealed calendar 491 bytes more than an ordinary one, which 1.0's
+  commit-time check now enforces (0.16 checked only the content's length); key mode's extra quota
+  is set from those measurements. Confirm the overhead is acceptable.
+- **N19, case-level dispositions:** the gates have no case scope, so the two new entries
+  (`za-disabled-tenant`, `sharing-move-bytes-oversize`) name the containing function and are
+  marked unconfirmed, which keeps the gates from applying them.
+- **N20, `jmap::mail::changes` in key mode:** `Email/changes` from an intermediate state answers
+  nothing for a key account; plain mode has not reached the sub-test, so a fork path (the key
+  account's changes handling) is not excluded.
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
@@ -6969,6 +7078,47 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `za::mail::traces::delivery_leaves_no_content_in_events` (fork, part 7c) | The list name is read from `Name` (0.16 `Details`), the plugin error's store name from `Name` (0.16 `Id`). | 1.0's `SieveEvent::ListNotFound` and `scripts/plugins/lookup.rs` keys. |
 | `za::cache_swap` (fork, part 7c) | A decoded message frame is required only by the canary round trip (`with_mail`). | The revocation case delivers no mail; on the blob tier its scan reads only its accounts' snapshots (6c test bug). |
 | `webdav::put_get`, `webdav::copy_move` (upstream, part 7c) | A PUT under a file node is asserted 409 (address book and calendar items stay 405); an exceeded quota 507 with `quota-not-exceeded`; a UID conflict 403. | `dav/src/request.rs` and the 1.0 handlers: 409 for a non-folder parent, 507 for `LimitEvent::Quota`, 403 for `NoUidConflict` (0.16: 405, 412, 412). |
+| `za::disabled::test` (fork, part 7c2, ruling 79) | SEL-only: the tenant-disable case (`recover` for a member of a disabled tenant answers 403) is removed; the account-disable cases stay. Disposition `za-disabled-tenant` (unconfirmed: the gates have no case scope). | 1.0 applies a tenant's permissions only in the licensed snippet of `effective_permissions`; the product build has no `enterprise` feature, so without a licence a disabled tenant's member logs in (ruling 33). |
+| `za::drain::test_lease` A (fork, part 7c2, ruling 80) | The late item is the held PUT's, whatever its id (at 1.0 the higher one); the "lower id arrives late" premise is retired. The drain's enumeration does not depend on ids arriving in order: every pass reads every pending item (`enumerate`, a full scan in document id order), and its cursor is the inbox's change id, not a document id. Items of one UID are taken in document id order, which at 1.0 is commit order. | `store` `BatchBuilder::reserve_document_id`: 1.0 assigns an item's id in its batch at commit, after the fan-out pause (0.16 assigned it before). |
+| `za::sharing_move_atomic` (fork, part 7c2, ruling 81) | The byte-oversize case (30 events of 230 KB) is retired as unreachable; the operations and split cases stay and the byte budget stays in the code. Disposition `sharing-move-bytes-oversize` (unconfirmed: case scope). | `dav/src/calendar/copy_move.rs`: a collection MOVE at 1.0 rewrites rows only (120 operations, 12,516 bytes planned for those events), so event content never reaches the 5 MB budget. |
+| `za::sharing_tombstones::scan_races` (fork, part 7c2, ruling 82) | The between-reads race starts from a token one change behind (a seeded container change), so the sync reads both tombstone streams and parks between them. The race is now reached, and 1.0 answers it 207 without the change written between the reads, whose sync token then reports it: both reads are bounded by the snapshot taken before them (`Query::Range(id, snapshot)`), so neither sees the later change. The step asserts that, where 0.16 asserted a refusal (403 `valid-sync-token`). | `dav/src/common/propfind/get.rs`: 1.0 reads no log for a current token (`token_range` is `(id, id)`). |
+| `za::sharing::sharing_class_differential` COPY (fork, part 7c2, ruling 83) | The sharee's COPY goes into its own second calendar, `class-sharee/`, where the UID does not conflict: refused on the key account (403), copied on the ordinary account (201). The ordinary sharee's same-calendar COPY is asserted 403 `no-uid-conflict`. | 1.0 refuses a copy that repeats a UID within one calendar (`no-uid-conflict`), on both account kinds. |
+| `za::mail::uploads::raw_consumers_are_refused` (fork, part 7c2, ruling 84) | The key account's `FileNode/copy` of its own folder is accepted as refused by 1.0's kind check (nothing created); a `FileNode/copy` of the shared plain File node into the key account's folder, with each sealed source as its blob, is added and meets the raw-source refusal. A plain session's `Blob/copy` out of the key account answers `fromAccountNotFound`, the key session's copy into the plain account that shares only a file folder with it `accountNotSupportedByMethod`, and its copy from an account it cannot reach `fromAccountNotFound`; each is asserted to be an error carrying no content, and the module now expects no trace of the fork's copy refusal (0.16: one per source plus one). | 1.0 checks a FileNode's kind (`blobId is only defined for File nodes.`), requires `accountId` and `fromAccountId` to differ, and checks the session's access to both accounts for the method before the fork's refusals. |
+| `za::mail::gates` (fork, part 7c2, ruling 84) | `Email/copy` into the key account by the plain session answers `accountNotFound`, its `Blob/copy` out of it `fromAccountNotFound`, and the key session's `Blob/copy` out of its account into the plain account that shares a mailbox with it `accountNotSupportedByMethod`; the key session's `Blob/copy` into its account still meets the fork's refusal. The copy-refusal traces expect the plain account once (0.16: twice). The stale grantee's WebSocket calls and its `Mailbox/get` and `Email/get` of the provisioned account answer `accountNotFound`. Each such answer is asserted to be an error carrying no content. | 1.0 checks the session's access to `accountId` and `fromAccountId`, and the account's support for the method, first, and rechecks access on every call: the provisioned account left the grantee's token (`build_access_token`'s filter). |
+| `za::index_task::test_mid_pass_deletion` (fork, part 7c2, ruling 85) | Either outcome is accepted: no orphan, or only the resumed pass's document under the destroyed id. The inertness checks and the cleanup are unchanged. | Ruling 69's residual depends on whether the resumed chunk commits after the account's unindex (timing). |
+| `za::expansion::test` (fork, ruling 88) | Accepted: the no-iCalendar-text scan covers only the key account's traces (the row above). | 1.0 adds `Contents` to the ordinary account's PUT-time expansion event, an upstream path (invariant 4). |
+| `za::sharing_review::plain_update_trace` (fork, part 7c2, ruling 95) | The parked plain PUT that loses its assertion to a concurrent row-only change is asserted 204, and the event then holds both the PUT's SUMMARY and the concurrent flag; the check that the lost assertion is traced at the DAV update call site is dropped. A key account's PUT is not replayed and keeps its 503. | `dav/src/request.rs` (`handle_dav_request`): 1.0 replays a keyless write after an assertion failure, silently, up to `MAX_CONFLICT_RETRIES`; a key account's request is not replayed (invitations spec 5.4). |
+| `za::sharing_races::calendar_conditional_proppatch_races` (fork, part 7c2, ruling 96) | The grantee's stale-If-Match race uses its per-principal display name (412, competing value kept) instead of `calendar-color`; a new case, `calendar_dead_property_last_writer_wins`, documents a dead property on a key account's calendar and an ordinary account's alike: a dead-only PROPPATCH leaves the ETag unchanged, so a stale If-Match matches, 207, and the last writer wins. | 1.0 regression, inherited by both account kinds (ruling 96). |
+| `webdav::put_get` quota (upstream, part 7c2, ruling 86) | A file's predicted charge is its content plus its name plus `size_of::<FileNode>()`, and a PUT is expected to fit while the available quota is at least the charge; a key account's event charges its sealed size, measured from the previous PUT. No fork code adds bytes for an ordinary account (`groupware/src/file/index.rs`, `dav/src/file/update.rs` and `common/src/storage/quota.rs` equal v1.0.1). | `common/src/storage/quota.rs` `limit_disk_quota`: 1.0 checks the quota when the batch commits, against the object's charge (`FileNode::size`); 0.16 checked the content's length before writing. |
+| `webdav::copy_move` rename (upstream, part 7c2) | The changes after renaming a file container hold the old root (404) and the whole renamed subtree (`hierarchy.len() + 1` hrefs; calendars and address books keep two). | `dav/src/file/copy_move.rs`: 1.0 logs every descendant of a moved file container (`log_descendant_updates`). |
+| Every suite (harness, `utils::cleanup::store_blob_expire_all`, part 7c2) | Temporary blob links are expired in place (`until` 1) instead of deleted, so the purge deletes the blobs they hold. | `common/src/storage/blob.rs` `hold_blob`: 1.0 writes a held blob before its batch and its commit entry only when the batch commits; a refused batch (a DAV PUT over quota) leaves the blob reachable only through its temporary link. |
+| `imap::body_structure` fixtures 000-015 (upstream, part 7c2) | Regenerated from 1.0's output. | 1.0's writer: a body's MD5 is the `Content-MD5` header (0.16 computed one), a missing transfer encoding is `"7bit"`, `message/rfc822` and audio and image parts keep their types and line counts, header names keep their case, and a MIME section ends with the message's own line ending. No fork path shapes plain output (`imap/src/op/fetch/structure.rs` and `email/src/message/metadata` equal v1.0.1). |
+| `imap::mailbox::test` (upstream, part 7c2) | `LIST (SUBSCRIBED RECURSIVEMATCH) "" "*"` lists only the subscribed mailboxes; a `"%"` case is added where the top-level parent keeps `CHILDINFO`. | `imap/src/op/list.rs`: 1.0 suppresses a parent's CHILDINFO when its matching descendant is listed (RFC 5258 3.5). |
+| `jmap::mail::{get, set, parse}` fixtures (upstream, part 7c2) | Regenerated from 1.0's output. | 1.0: `$hasattachment`/`$hasnoattachment` keywords set at ingest, `receivedAt` stored in 32 bits (clamped to 2106-02-07T06:28:15Z), part sizes are decoded sizes and multiparts carry one, header names keep their case, no default charset on non-text parts, inline media of a mixed part in `textBody`/`htmlBody` and not `attachments` (RFC 8621 4.1.4). |
+| `store::import_export::test` (upstream, part 7c2) | The schema version is written to the system subspace; the mailbox UID counter as `ValueClass::MailboxUid`; an email's fields 1 and 2 as `ValueClass::Immutable`. | `store/src/write/key.rs`: 1.0 moved these keys out of the property subspace and asserts it in debug builds. |
+| `store::query::test_global` (upstream, part 7c2, ruling 76) | On the internal store the `QueueId` range is asserted refused and replaced by the equality that selects the same documents; other stores keep the range. | `store/src/search/query.rs`: 1.0's internal global query supports equality only on integer fields (`Integer range filters are not supported`). |
+| `system::authentication`, `system::security` (upstream, part 7c2) | A loopback client address sends no `X-Forwarded-For` (the peer is loopback). | `common/src/network/forwarded.rs`: 1.0 answers 400 to a forwarded loopback address (`is_loopback_claim`). |
+| `system::oidc::test` lifetimes (upstream, part 7c2) | The 1-second access-token and authorization-code lifetimes and the 10-second refresh lifetime are set on the running core after the settings load. | `registry` `OidcProvider`: 1.0 refuses `accessTokenExpiry` and `authCodeExpiry` under 600000 ms and `refreshTokenExpiry` under 86400000 ms. |
+| `telemetry::webhooks::test` (upstream, part 7c2) | The webhook is created with `level: Debug`. | `registry` `WebHook.level` (new, default Info); `smtp.connection-start` and `delivery.dsn-success` are Debug events. |
+| `smtp::inbound::{rcpt, vrfy}`, `jmap::mail::submission` (upstream, part 7c2) | A refused relay is 550 5.7.1, an unknown mailbox, address or list 550 5.1.1 (0.16: 5.1.2). | `smtp/src/inbound/{rcpt,vrfy}.rs`. |
+| `smtp::inbound::antispam` pyzor (upstream, part 7c2) | The test enables `SpamPyzor`. | `registry` `SpamPyzor.enable` defaults to false at 1.0 (0.16: true). |
+| `smtp::inbound::dmarc::dmarc` (upstream, part 7c2) | The failure reports' `To:` is expected with angle brackets. | 1.0's report builder writes `To: <address>`. |
+| `smtp::outbound::mta_sts::mta_sts_verify` (upstream, part 7c2) | The unauthorized-MX policy is published under a new record id (`policy_not_authorized`). | `smtp/src/outbound/mta_sts/lookup.rs`: 1.0 caches a failed fetch for its record id and backs off. |
+| `smtp::reporting::{dmarc, tls, scheduler}`, `smtp::management::report` (upstream, part 7c2) | The tests close every report window (`create_window_reports`) before reading the reports; a report's delivery is expected 300 s to 900 s after its window. | `smtp/src/reporting/aggregate`: 1.0 keeps a report's rows in their window and writes the report when the window's task closes it; `deliver_at` is the window's end plus `SEND_DELAY` and a jitter under `SEND_JITTER`. |
+| `smtp::inbound` harness (`read_queued_events`, part 7c2) | Queue events are read with `QueueEvent::deserialize` and bounded by `LAST_QUEUE`. | `store/src/write/key.rs`: 1.0 keys a queue event by queue name, due time, then id. |
+| `smtp::lookup::expressions` (upstream, part 7c2, ruling 87) | The key and counter cases run on the default in-memory store (`'*'`); `counter_get`/`counter_incr` are `key_incr` (by zero to read). The `sql_query` case stays on the SQL store. | 1.0's `InMemoryStore::Sql` refuses key and counter operations; `counter_*` functions removed. |
+| `webdav::copy_move` quota (upstream, part 7c2) | A COPY over quota is expected 507 (0.16: 412). | `dav/src/request.rs`: 507 for `LimitEvent::Quota`, as for PUT (part 7c). |
+| `webdav::prop` (upstream, part 7c2) | After a conditional display-name PROPPATCH a file node's ETag is expected unchanged (calendars and address books still change it); a removed property's propstat is expected 200 OK (0.16: 204); `supported-collation-set` includes `i;octet`; the harness reads an unprefixed element's empty namespace declaration (`xmlns=""`) as the element itself. | 1.0's `FileNode` keeps an `etag` field and no display name (stored as a property beside the node); `dav-proto` answers removals 200 (RFC 4918 9.2.1), advertises `i;octet`, and declares the empty default namespace on an element without one. |
+| `webdav` key-mode quota (fork, part 7c2) | Key mode's extra quota is 491 + 2 x 485 bytes (0.16: 640). | Measured at 1.0: a sealed collection charges 491 bytes more than an ordinary one and a sealed event 485 bytes more than its content; 1.0 checks the whole charge at commit. |
+| `imap::search::test` (upstream, part 7c2) | `NOT (FROM nathaniel ANSWERED)` matches every message; a `NOT (FROM nathaniel)` case keeps 0.16's set; the `(DATE SUBJECT)` sort places message 9 after 10. | `imap-proto` `parse_filters`: NOT applies to the whole parenthesised conjunction (unit ledger row `parse_search`); 1.0's date sort order (the alternative upstream's own comment recorded). |
+| `imap::fetch::test` and its key variant (upstream and fork, part 7c2) | FLAGS are expected in lower case with the server-set `$hasattachment` (plain mode); the BODYSTRUCTURE expectation follows 1.0's writer (as the fixtures); `BODY[MIME]` becomes `BODY[1.MIME]`, checked by its prefix. | `types/src/keyword.rs` `Keyword::other` lowercases; 1.0 sets the attachment keyword at ingest (a key account's message stores none); `imap-proto` refuses MIME without a part number. |
+| `imap::antispam` (upstream, part 7c2) | The `$Junk` checks look for the flag anywhere in the FETCH line. | The server-set attachment keyword precedes it in FLAGS. |
+| `jmap::mail::{set, copy, sieve_script}` keywords (upstream, part 7c2) | Keyword comparisons leave out `$hasattachment` and `$hasnoattachment`; `email_set` fixtures are compared without a multipart's `size` and without those keywords. | 1.0 keeps the server-set keyword through a keyword update; a multipart's size counts its generated boundaries (variable length); `nested_body`'s keyword was present in one run and absent in the next (reported for the primary). |
+| `jmap::mail::get` key mode (fork, part 7c2) | In key mode the fixture is compared without the server-set attachment keywords. | Plan 13 ruling 55: a key account's message stores neither keyword. |
+| `jmap::mail::query` (upstream, part 7c2) | The keyword "attributed to" is stored as "attributed_to"; the key variant's corpus matches keywords case-insensitively. | 1.0 refuses a keyword with a space and stores keywords in lower case. |
+| `system::oidc::test` (upstream, part 7c2) | Pathless loopback redirect URIs are expected refused; authorization requests carry `state`; a code presented by another client or redirect URI answers `invalid_grant`; the scope includes `openid`; introspection names the client. | 1.0's `loopback_redirect_parts` (a path is required), required `state`, RFC 6749 5.2 errors, ID tokens only for `openid`, and `client_id` in introspection (RFC 7662). |
+| `telemetry::webhooks::test` (upstream, part 7c2) | The check waits, bounded at 10 s, for the expected events; the trace purge accepts an unconfigured tracing store. | 1.0 retries a rejected payload and sends the pending ones a throttle period apart (timing); no tracing store without a licence (ruling 39). |
+| `smtp::management::report::manage_reports` (upstream, part 7c2) | The windows are closed until both report kinds are listed (bounded); the listings are compared as sets. | 1.0's report scheduler writes rows asynchronously; a report's id comes from its window and a hash of its slot. |
 
 ## Task 1 check
 
