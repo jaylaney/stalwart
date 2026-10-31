@@ -17,12 +17,9 @@ use crate::utils::{
 };
 use common::auth::oauth::GrantType;
 use dav_proto::schema::property::{DavProperty, PrincipalProperty};
-use groupware::{
-    cache::GroupwareCache,
-    calendar::{
-        CalendarEvent, CalendarEventContent,
-        itip::{ItipIngest, RsvpError, RsvpRequest, RsvpResponse},
-    },
+use groupware::calendar::{
+    CalendarEvent, CalendarEventContent,
+    itip::{ItipIngest, RsvpError, RsvpRequest, RsvpResponse},
 };
 use hyper::StatusCode;
 use serde_json::{Value, json};
@@ -745,4 +742,266 @@ pub async fn test_scheduling(test: &mut TestServer) {
     // Counting `plain`'s mail created its default mailboxes; `plain` outlives
     // the suite, so remove them for the final emptiness check.
     test.destroy_all_mailboxes(&plain).await;
+}
+
+/// `test_metadata`'s accounts.
+const METADATA_KEY: &str = "keymail33@example.com";
+const METADATA_PLAIN: &str = "plainmail33@example.com";
+
+/// The capabilities `test_metadata`'s JMAP requests use: object metadata is
+/// a property layer of the mail methods, active only when the request uses
+/// its capability.
+const METADATA_USING: &[&str] = &[
+    "urn:ietf:params:jmap:core",
+    "urn:ietf:params:jmap:mail",
+    "urn:ietf:params:jmap:metadata",
+];
+
+/// A shared metadata value under a vendor namespace (the only kind 1.0
+/// registers no namespace for: `REGISTERED_NAMESPACES` is empty, and
+/// `vendorNamespaces` is on by default).
+fn metadata_value() -> Value {
+    json!({ "example.com": { "note": "metadata-canary" } })
+}
+
+/// The upgrade design's object-metadata refusals (Task 6, ruling 66): a key
+/// account gets no JMAP object metadata and no IMAP METADATA, and an
+/// ordinary account keeps upstream's (the controls).
+///
+/// - `Mailbox/set` with metadata on a key account is refused per object
+///   (`forbidden`, `ZA_METADATA_REFUSED`), and the same call without it
+///   succeeds; an update naming metadata is refused too.
+/// - `Mailbox/get` naming the metadata property answers objects without it,
+///   and `Mailbox/query` with a metadata filter answers `unsupportedFilter`.
+/// - The session advertises no metadata capability for the key account.
+/// - IMAP `GETMETADATA`, `SETMETADATA` and `LIST … RETURN (METADATA …)`
+///   answer `NO [NOPERM]` in the key account's session, and its `CAPABILITY`
+///   lists neither `METADATA` nor `LIST-METADATA`.
+///
+/// The ordinary account's identical requests succeed, so each refusal is
+/// the fork's and not an unsupported feature.
+pub async fn test_metadata(test: &mut TestServer) {
+    use crate::utils::imap::{ImapConnection, Type};
+    use imap_proto::ResponseType;
+    use jmap::api::metadata::ZA_METADATA_REFUSED;
+
+    println!("Running zero-access object metadata refusal tests...");
+    let admin = test.account("admin@example.com").clone();
+    let key = admin
+        .create_key_user_account(
+            METADATA_KEY,
+            STRONG,
+            "Metadata",
+            &[],
+            super::user_permissions(),
+        )
+        .await;
+    let plain = admin
+        .create_user_account(
+            METADATA_PLAIN,
+            STRONG,
+            "Metadata",
+            &[],
+            super::user_permissions(),
+        )
+        .await;
+
+    // JMAP: Mailbox/set create, with and without metadata.
+    for account in [&key, &plain] {
+        let is_key = account.name() == METADATA_KEY;
+        let with = account
+            .jmap_request(
+                METADATA_USING,
+                json!([["Mailbox/set", {
+                    "accountId": account.id_string(),
+                    "create": { "m": { "name": "with-metadata", "metadata": metadata_value() } }
+                }, "0"]]),
+            )
+            .await;
+        let response = with.method_response();
+        if is_key {
+            assert_eq!(
+                response["notCreated"]["m"]["type"], "forbidden",
+                "a key account's Mailbox/set with metadata: {:?}",
+                with.0
+            );
+            assert_eq!(
+                response["notCreated"]["m"]["description"], ZA_METADATA_REFUSED,
+                "{:?}",
+                with.0
+            );
+        } else {
+            assert!(
+                response["created"]["m"]["id"].is_string(),
+                "the control's Mailbox/set with metadata: {:?}",
+                with.0
+            );
+        }
+        let without = account
+            .jmap_request(
+                METADATA_USING,
+                json!([["Mailbox/set", {
+                    "accountId": account.id_string(),
+                    "create": { "m": { "name": "without-metadata" } }
+                }, "0"]]),
+            )
+            .await;
+        let id = without.method_response()["created"]["m"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("Mailbox/set without metadata: {:?}", without.0))
+            .to_string();
+
+        // An update naming metadata.
+        let update = account
+            .jmap_request(
+                METADATA_USING,
+                json!([["Mailbox/set", {
+                    "accountId": account.id_string(),
+                    "update": { (id.as_str()): { "metadata": metadata_value() } }
+                }, "0"]]),
+            )
+            .await;
+        let response = update.method_response();
+        if is_key {
+            assert_eq!(
+                response["notUpdated"][id.as_str()]["type"],
+                "forbidden",
+                "a key account's Mailbox/set update with metadata: {:?}",
+                update.0
+            );
+        } else {
+            assert!(
+                response["updated"].get(id.as_str()).is_some(),
+                "the control's Mailbox/set update with metadata: {:?}",
+                update.0
+            );
+        }
+
+        // A get naming the metadata property, and a metadata filter.
+        let get = account
+            .jmap_request(
+                METADATA_USING,
+                json!([["Mailbox/get", {
+                    "accountId": account.id_string(),
+                    "ids": [&id],
+                    "properties": ["id", "name", "metadata"]
+                }, "0"]]),
+            )
+            .await;
+        let object = &get.method_response()["list"][0];
+        assert_eq!(object["id"], id.as_str(), "Mailbox/get: {:?}", get.0);
+        if is_key {
+            assert!(
+                object.get("metadata").is_none(),
+                "a key account's Mailbox/get carries metadata: {:?}",
+                get.0
+            );
+        } else {
+            assert_eq!(
+                object["metadata"],
+                metadata_value(),
+                "the control's Mailbox/get: {:?}",
+                get.0
+            );
+        }
+        let query = account
+            .jmap_request(
+                METADATA_USING,
+                json!([["Mailbox/query", {
+                    "accountId": account.id_string(),
+                    "filter": { "metadataExists": "example.com/note" }
+                }, "0"]]),
+            )
+            .await;
+        if is_key {
+            assert_eq!(
+                method_error(&query),
+                Some("unsupportedFilter"),
+                "a key account's metadata filter: {:?}",
+                query.0
+            );
+        } else {
+            assert_eq!(
+                method_error(&query),
+                None,
+                "the control's metadata filter: {:?}",
+                query.0
+            );
+        }
+
+        // The session's capabilities.
+        let session = account.jmap_session_object().await;
+        let advertised = session.0["capabilities"]
+            .get("urn:ietf:params:jmap:metadata")
+            .is_some();
+        assert_eq!(
+            advertised,
+            !is_key,
+            "the session's metadata capability for {}: {:?}",
+            account.name(),
+            session.0["capabilities"]
+        );
+    }
+
+    // IMAP METADATA.
+    for account in [&key, &plain] {
+        let is_key = account.name() == METADATA_KEY;
+        let mut imap = ImapConnection::connect(b"_m ").await;
+        imap.authenticate(account.name(), account.secret()).await;
+        imap.send("CAPABILITY").await;
+        let capability = imap
+            .assert_read(Type::Tagged, ResponseType::Ok)
+            .await
+            .join("\n");
+        let tokens = capability.split_whitespace().collect::<Vec<_>>();
+        for name in ["METADATA", "LIST-METADATA"] {
+            assert_eq!(
+                tokens.contains(&name),
+                !is_key,
+                "{name} in the CAPABILITY of {}: {capability}",
+                account.name()
+            );
+        }
+        for command in [
+            "SETMETADATA INBOX (/shared/comment \"metadata-canary\")",
+            "GETMETADATA INBOX /shared/comment",
+            "LIST \"\" \"*\" RETURN (METADATA (/shared/comment))",
+        ] {
+            imap.send(command).await;
+            if is_key {
+                let refused = imap
+                    .assert_read(Type::Tagged, ResponseType::No)
+                    .await
+                    .join("\n");
+                assert!(
+                    refused.contains("NOPERM"),
+                    "{command} in a key account's session: {refused}"
+                );
+            } else {
+                imap.assert_read(Type::Tagged, ResponseType::Ok).await;
+            }
+        }
+        if !is_key {
+            imap.send_ok("SETMETADATA INBOX (/shared/comment NIL)")
+                .await;
+        }
+        imap.send_ok("LOGOUT").await;
+    }
+
+    // Nothing of the key account's metadata was stored: the leak scanner's
+    // object-metadata rule flags any mailbox container or private container
+    // of a key account. The control's containers go with its mailboxes.
+    let found = super::leak::scan(test, key.id().document_id()).await;
+    assert!(
+        found.violations.is_empty(),
+        "the key account's records:\n{}",
+        found.violations.join("\n")
+    );
+    for account in [&key, &plain] {
+        test.destroy_all_mailboxes(account).await;
+    }
+    test.wait_for_tasks().await;
+    admin.destroy_account(key).await;
+    admin.destroy_account(plain).await;
+    test.wait_for_tasks().await;
 }
