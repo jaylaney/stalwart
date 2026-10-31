@@ -69,8 +69,7 @@ fn authorization_signs_a_verifiable_es256_token() {
     assert_eq!(parts.len(), 3);
 
     let verifying_key =
-        VerifyingKey::from_sec1_bytes(&URL_SAFE_NO_PAD.decode(key.public_key()).unwrap())
-            .unwrap();
+        VerifyingKey::from_sec1_bytes(&URL_SAFE_NO_PAD.decode(key.public_key()).unwrap()).unwrap();
     let signature = Signature::from_slice(&URL_SAFE_NO_PAD.decode(parts[2]).unwrap()).unwrap();
     verifying_key
         .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &signature)

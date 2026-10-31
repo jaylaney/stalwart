@@ -55,8 +55,7 @@ const EXAMPLE_JSON: &str = r#"{
 
 #[test]
 fn deserialize_full_example() {
-    let config: Configuration =
-        serde_json::from_str(EXAMPLE_JSON).expect("failed to deserialize");
+    let config: Configuration = serde_json::from_str(EXAMPLE_JSON).expect("failed to deserialize");
 
     // Protocols
     assert_eq!(
@@ -116,8 +115,7 @@ fn deserialize_full_example() {
 
 #[test]
 fn roundtrip() {
-    let config: Configuration =
-        serde_json::from_str(EXAMPLE_JSON).expect("failed to deserialize");
+    let config: Configuration = serde_json::from_str(EXAMPLE_JSON).expect("failed to deserialize");
     let serialized = serde_json::to_string_pretty(&config).expect("failed to serialize");
     let roundtripped: Configuration =
         serde_json::from_str(&serialized).expect("failed to re-deserialize");

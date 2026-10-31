@@ -147,11 +147,8 @@ fn autodiscover_encryption() {
             )
         })
         .collect();
-        let response = super::build_autodiscover_response(
-            "user@example.com",
-            "mail.example.com",
-            &services,
-        );
+        let response =
+            super::build_autodiscover_response("user@example.com", "mail.example.com", &services);
 
         assert_eq!(
             response

@@ -8,8 +8,7 @@ use super::alternate_links;
 
 #[test]
 fn parses_single_alternate_link() {
-    let links =
-        alternate_links([r#"<https://acme.example/cert/1/1>;rel="alternate""#].into_iter());
+    let links = alternate_links([r#"<https://acme.example/cert/1/1>;rel="alternate""#].into_iter());
     assert_eq!(links, vec!["https://acme.example/cert/1/1".to_string()]);
 }
 

@@ -34,15 +34,13 @@ rzycz9sDxxSzzXmq90vomJqtfTnNHPFHuR2SAiwuzUf26rcPwa7DCWk=
 
 #[test]
 fn ecdsa_pem_accepts_sec1_and_pkcs8() {
-    let sec1 =
-        build_ecdsa_pem(EcKeyCurve::P256, P256_SEC1).expect("P-256 SEC1 key should parse");
+    let sec1 = build_ecdsa_pem(EcKeyCurve::P256, P256_SEC1).expect("P-256 SEC1 key should parse");
     let pkcs8 =
         build_ecdsa_pem(EcKeyCurve::P256, P256_PKCS8).expect("P-256 PKCS8 key should parse");
     assert_eq!((&sec1.x, &sec1.y), (&pkcs8.x, &pkcs8.y));
     assert_eq!(sec1.x.len(), 32);
 
-    let sec1 =
-        build_ecdsa_pem(EcKeyCurve::P384, P384_SEC1).expect("P-384 SEC1 key should parse");
+    let sec1 = build_ecdsa_pem(EcKeyCurve::P384, P384_SEC1).expect("P-384 SEC1 key should parse");
     let pkcs8 =
         build_ecdsa_pem(EcKeyCurve::P384, P384_PKCS8).expect("P-384 PKCS8 key should parse");
     assert_eq!((&sec1.x, &sec1.y), (&pkcs8.x, &pkcs8.y));
