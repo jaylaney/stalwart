@@ -6542,6 +6542,158 @@ at zero.
   run because a ported test lost its caller, such as `system::task`'s remaining helpers or
   `telemetry` helpers. The gate names each one, and it then needs an entry.
 
+### Part 7c: the sequential matrix, first run
+
+Part 7c ran the matrix for the first time, one suite at a time, with the PATH prefix and
+`STORE=RocksDb RUST_MIN_STACK=16777216` on integration rows (`ZA_KEY_ACCOUNTS=1` on key rows
+only). Logs, the per-row table and working notes are in the plan workspace under `task-7c/`
+(`results.md`, `logs/<row>-<attempt>.log`, each log headed by its SHA, environment and
+command). Commits: `a5cddf448` (DAV port defects), `5b98949d6` (the ZA suite's tests),
+`d6c5bd2e3` (the swap suite), `c55d3edab` (webdav statuses). Behaviour that a fix would change,
+or a test that a fix would weaken, was held under "Needs a ruling" (ruling 72): the held edits
+(marked `7C-HOLD`) stay uncommitted in the worktree, so the committed tests keep their original
+assertions and fail on those cases until the rulings land.
+
+#### Results
+
+| Row | Result (passed / failed / ignored) | Status |
+|---|---|---|
+| Formatting | rc 0 | green |
+| Workspace units (Task 2's `UNIT_TEST_FEATURES`) | 551 / 0 / 2 | green; the two ignored are `classifier::sgd::tests::text_classifier` and `modules::pyzor::test::send_message` (the 6 ignored of the brief count the whole listing, Task 7b's) |
+| Vault and groupware | 209 / 0 / 0 | green |
+| ZA | 1 / 0 / 0 at attempt 79 | green with the held edits; 78 failing attempts fixed in place or held |
+| ZA leak unit | 1 / 0 / 0 | green |
+| ZA filesystem blobs | 1 / 0 / 0 | green with the held edits, first attempt |
+| ZA cache swap | 1 / 0 / 0 at attempt 2 | green (a 6c test bug fixed) |
+| CalDAV plain | 0 / 1 at attempt 6 | red: `put_get` leaves a blob at its emptiness check (undiagnosed) after three status fixes and one hold |
+| CalDAV key | 0 / 1 at attempt 1 | red on the same `put_get` status since fixed; not rerun |
+| `webdav::cal_query::` | 2 / 0 / 1 | green (the 0.16 ignored test) |
+| IMAP plain and key | 0 / 1 each | red: `body_structure` fixture 003 differs from 1.0's writer (the 7a-predicted case; `tests/resources/imap/003.imap_failed`) |
+| JMAP plain and key | 0 / 1 each | red: `mail::get` fixture `multipart_mixed` differs (`.failed` file) |
+| `store_tests` | 0 / 1 | red: `store/src/write/key.rs:786`, "the mailbox UID counter must be written as ValueClass::MailboxUid" (a 7a-ported `store::ops` write) |
+| `blob_tests`, `lookup_tests` | 1 / 0 each | green |
+| `search_tests` | 0 / 1 | red: "Integer range filters are not supported" (ruling 76's `QueueId` range on the Tracing index) |
+| `telemetry_tests` | 0 / 1 | red: `webhooks`, no `smtp.connection-start` delivered |
+| `system_tests` | 0 / 1 | red: `authentication.rs:396`, a password check answers 400 |
+| SMTP | 46 / 30 / 3 | red: 22 tests on "No event found in queue for message" (the harness's queue read, 7a's `all_queued_messages`), `rcpt`/`vrfy` relay codes, `antispam` PYZOR tag, four reporting tests, and the expected `smtp::lookup::expressions` |
+
+The rows after ZA ran once each, except CalDAV plain; their first failures are listed, not
+fixed. No documented flake was hit, so no flake rerun was made.
+
+#### Fixes by file
+
+Crate code (`a5cddf448`), each a port defect that restores the 0.16 behaviour:
+- `dav/src/calendar/query.rs`, `dav/src/common/search.rs`: a key account's calendar-query text
+  filters skip 1.0's Calendar index candidates (`TextIndex::za_unindexed`) and match in memory;
+  the index never holds a key account's events, so every SUMMARY text match answered nothing.
+- `dav/src/common/propfind/za.rs` (`tombstone_prefixes`), `http/src/api/shares.rs` (the listing's
+  href): `canonical_calcard_segment`, the calendar cache's encoding, in place of the file
+  cache's `canonical_path_segment`; a calendar named with a percent-encoded byte lost its
+  foreign tombstones.
+- `dav/src/common/propfind/mod.rs`: a multiget answers a hidden (pending) inbox item 404, as it
+  answers a missing href. 1.0 routes a scheduling multiget to the inbox's items, where the item
+  was omitted, so its existence was observable.
+- `dav/src/calendar/update.rs`: `update_commit_pause_point` on the plain update path too.
+
+Tests (`5b98949d6`, `d6c5bd2e3`, `c55d3edab`): harness and fixture fixes for 1.0's APIs
+(`utils/registry.rs` strips `ReloadSettings`' server-set `warnings`; `utils/za.rs`'s
+`plant_container` logs its change; grant-backed Bearer tokens, revoked after use; `otpUrl`;
+FileNode `@type` and `mayModifyContent`; `/copy` source ids; a registered OAuth client and 1.0's
+login request; `Sharing.allowDirectoryQueries`; trace key renames; temporary blob links expired in
+place before the purge), the expectations in the expectation ledger, and ruling 70's new case.
+
+#### Deferred runtime checks
+
+- **Ruling 63.** The reproduction leaves no late document: `za::mail::fence::
+  setup_refuses_an_in_flight_index_write` and its calendar twin pass (no document, no term, setup
+  without cleanup). The fence cases already expected no late write (part 6d). The PR #66
+  `wait_for_tasks` in `jmap::za_variants` is removed (`5b98949d6`); the key JMAP row has not yet
+  reached that sub-test.
+- **Ruling 69.** `index_task::test_mid_pass_deletion` is timing-dependent: one run left no
+  orphan (0 documents, 0 terms), the next six each left the later document (`[2]`) under the
+  destroyed id. Its orphan assertion is held (Needs a ruling, N12).
+- **Ruling 70.** New case `za::mail::fence::dead_property_writes_lose_to_provisioning`
+  (`plainmail37`): with a vault record planted behind the cached ordinary classification, a
+  calendar and an event PROPPATCH answer 503 and store no container; with the record cleared the
+  same writes answer 207 and store them. Passes.
+- **Ruling 39.** The default `TracingStore` and `MetricsStore` write nothing without a licence:
+  the store tracer spawns only when `is_enterprise` (`common/src/telemetry/mod.rs`), metrics are
+  scheduled only with `core.enterprise`, and the ZA suite's final emptiness check, which flags any
+  `TelemetrySpan` or `TelemetryMetric` key, passes. No harness change.
+- **`smtp::lookup::expressions`** fails as expected (`expressions.rs:134`); it needs its ruling.
+
+#### Runtime assumptions
+
+- **Part 4c.** 1-6, 9-11 confirmed. 7 partly refuted: 1.0 serves a sharee a PRIVATE event, and the
+  ordinary account's derived-private `X-SOMETHING` event, with 200 and the time and CLASS only, on
+  both sides (0.16: 403); the rest of the differential holds. 8 refuted: an ordinary sharee's COPY
+  within the shared calendar answers 403 `no-uid-conflict` (N8). Known failures: the MOVE
+  byte-oversize case still fails (N4); `revoke_cleanup_does_not_rewrite_sealed_event` passes.
+- **Part 5d.** 1-5, 7-11, 13, 14 confirmed. 6 refuted: the ordinary account's `metadataExists`
+  needs `urn:ietf:params:jmap:metadata` in `using`. 12 confirmed for the layout, but deleting the
+  temporary links (0.16's helper) leaves a never-committed staged blob unreachable at 1.0; the
+  fence's purge helper now expires them in place.
+- **Part 6c.** All confirmed; one test bug (the revocation case's message-frame requirement).
+- **Part 6d.** All confirmed (indexing, two-document passes, partition status, the index-queue
+  status API, stub byte equality, no other writers, metadata permissions and defaults, `using`,
+  attachment extraction, destruction while a pass is parked).
+- **Part 7a.** `CacheEvent::{Hit, Miss}` carry `Key` (confirmed); `store::lookup`'s `key_incr` by
+  zero (confirmed); `imap::body_structure` (refuted: fixture 003 differs); `store::query`
+  (refuted: the Tracing index refuses integer ranges); `smtp::lookup::expressions` (fails, as
+  expected); the queue-read assumption behind `all_queued_messages` (refuted: 22 SMTP tests find
+  no queue event); `webdav::cal_itip`, `webdav::{prop,lock}`, `system::oidc`, `store::ops` and the
+  DKIM stage-data assumption not yet reached.
+
+#### Needs a ruling
+
+The held edits (`7C-HOLD`) let the suite run past each one; none is committed.
+
+- **N1, `za::disabled`:** without a licence 1.0 applies no tenant permissions
+  (`effective_permissions`, SEL snippet), so `recover` for a disabled tenant's member answers 200,
+  and so does the member's CalDAV login. Options: SEL-only disposition for the tenant case, or
+  keep it under a licence.
+- **N2, `za::drain::test_lease` A:** 1.0 reserves the inbox item's id at commit, after the fan-out
+  pause, so the held PUT's item takes the higher id and "the lower id arrives late" cannot be
+  staged; the rest of the scenario passes with the late item's id. Options: re-express by id
+  role, or retire the late-lower-id premise.
+- **N3, `za::pinning::case_11_mixed`:** bob receives a master-carrying full REQUEST, a Z-only
+  REQUEST and the X CANCEL, where the case allows one full state. The fan-out kernel's
+  `carries_master`/`full_state` skip did not suppress the Z-only state (the silent dependency on
+  `organizer_handle_update`'s partial-drop block). Needs a kernel review.
+- **N4, `za::sharing_move_atomic` bytes oversize:** a collection MOVE at 1.0 rewrites rows only
+  (120 operations, 12,516 bytes for 30 events of 230 KB), so the 5 MB admission cannot be crossed
+  with event content. Options: drop the bytes case or find another oversize input.
+- **N5, `za::sharing_tombstones::scan_races`:** the between-reads race is unreachable: a sync with
+  a current token reads no log (`token_range` is `(id, id)`), so the pause is never reached.
+- **N6, `za::sharing_review::plain_update_trace`:** a parked plain PUT commits (204) over a
+  concurrent row-only change of the same event, although `SplitUpdate` asserts the row. A lost
+  update on the upstream path, or a test premise to correct; needs investigation.
+- **N7, `za::sharing` lifecycle differential:** the owner and delegated runs' inbox
+  messages and copies differ for `eleven` (steps 5, 8), `listed-alias` (0-2) and `subaddress`
+  (0-2); one message carries an empty VCALENDAR child and lacks an override. Possibly 1.0's
+  per-group `RecipientPolicy` split; scheduling kernel.
+- **N8, `za::sharing::sharing_class_differential` COPY:** the ordinary sharee's same-calendar COPY
+  now answers 403 `no-uid-conflict`, so the recorded limit's other side cannot be shown this way.
+- **N9, `za::sharing_races::calendar_conditional_proppatch_races`:** a grantee's
+  `calendar-color` (a dead property at 1.0) PROPPATCH with a stale If-Match answers 207 and
+  overwrites the competing value; the owner's displayname case still answers 412.
+- **N10, `za::mail::uploads`:** the key account's `FileNode/copy` of its own folder is refused by
+  1.0's kind check before the raw-source refusal; `Blob/copy` between accounts the session cannot
+  reach answers `fromAccountNotFound` first, so no refusal is traced.
+- **N11, `za::mail::gates`:** `Email/copy` and `Blob/copy` into or out of the key account by a
+  session without access answer `accountNotFound`/`fromAccountNotFound` first; the stale grantee's
+  WebSocket and session reads answer `accountNotFound` (1.0 rechecks access) instead of the keyless
+  refusal; one copy refusal trace fewer.
+- **N12, ruling 69:** see above.
+- **N13, `webdav::put_get` quota:** 1.0 refuses a PUT with 507 while the reported available quota
+  (132 bytes) exceeds the content (111 bytes); the test's prediction no longer holds.
+
+Also for the primary: the expansion test now scans only the key account's traces for iCalendar
+text, because 1.0 adds `Contents` to the ordinary account's PUT-time expansion event (upstream
+path); the unit run rewrites `crates/dav-proto/resources/requests/*.json` (an upstream test writes
+its output; reverted); the IMAP and JMAP runs leave untracked `*.imap_failed` and `*.failed`
+fixtures for comparison.
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
@@ -6796,6 +6948,27 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `store::lookup::lookup_tests` (Task 7a, ruling 75) | Subject deleted: the four `store_assert_is_empty` checks and the initial `store_destroy` under `if let InMemoryStore::Store`, and the `purge_in_memory_store` calls. `counter_get` reads are increments by zero. | v1.0.1 `store/src/lib.rs` `InMemoryStore` (no `Store` variant; `Sql` refuses every operation in `dispatch/lookup.rs`), no `purge_in_memory_store` or `counter_get`; the local store's `key_incr` returns the value. |
 | `store::query::test` (Task 7a, ruling 76) | Internals replaced, with an equivalent: integer and text-range predicates are `DocumentSet` filters computed from the dataset; sorts are `SortedSet` comparators; the PostgreSQL tie order is dropped; integer filters run on the Tracing index (three cases added); trace deletion on the internal store is by id bucket, with the ids spread over three buckets, so two documents remain where three did. Expected account results are 0.16's. | v1.0.1 `store/src/search/mod.rs` (`EmailSearchField` without `ReceivedAt`, `Size`, `SentAt`; `SearchComparator` only `DocumentSet` and `SortedSet`; no `SearchOperator`), `local.rs` `into_sorted`, `dispatch/search.rs` (`index`/`unindex` unreachable on the internal store), `search/index.rs` `unindex_traces`. |
 | `smtp::inbound::antispam::antispam` DKIM and ARC fixtures (Task 7a, ruling 77) | The 24 `dkim.result` and `arc.result` lines build their outputs through `From<DkimResult>`; results and expected tags unchanged. | mail-auth 0.14.1 `dkim/output.rs` (`pass`, `fail`, … crate-private; `impl From<DkimResult> for DkimOutput`), `arc/output.rs` (`with_result` crate-private; `impl From<ArcResult> for ArcOutput`). |
+| `za::caches` (`expired_bearer_cache_entry_is_refused`, fork, part 7c) | The 5-second token is minted through a `Server` view whose cloned `Core` carries the short lifetime; the server's own setting is never changed. Assertions unchanged. | `registry` `OidcProvider.accessTokenExpiry`: 1.0 refuses a value under 600000 ms (`validationFailed`, `MinValue`). |
+| `za::dav_gate`, `za::sharing` (keyless Bearer, fork, part 7c) | The Bearer tokens come from `za_bearer_token` (a grant-backed token) instead of `encode_access_token` with no grant. Assertions unchanged. | `common/src/auth/oauth/token.rs`: 1.0 refuses an access token without a grant (401). |
+| `za::registry::test` (fork, part 7c) | The TOTP refusal patches `credentials/0/otpUrl`. Assertion unchanged. | `registry` `PasswordCredential.otp_auth` became `otp_url` (`otpUrl`). |
+| `za::dav_seal::test_dead_properties` (fork, part 7c) | The seal marker `X-ZA-KEY:` is looked for in the stored tree's text, not in the archive bytes. | 1.0's archived tree holds the property as an entry; the 4c check could never match. |
+| `za::fanout::test_plain_owner` (fork, part 7c) | The event key1 writes into plain's calendar names plain as its ORGANIZER. The task, inbox, lease and mail assertions are unchanged. | `dav/src/calendar/update.rs`: 1.0 schedules from the calendar owner's addresses (`account_info(account_id)`); 0.16's `scheduling_account_info` used the writer's. |
+| `za::{sharing_move_atomic, sharing_review, sharing, sharing_races}` race outcomes (fork, part 7c) | A write that loses its commit assertion is asserted to answer 503 where 0.16 asserted 409 (eight sites). The archive, quota and state checks after each are unchanged. | `dav/src/request.rs`: 1.0 maps `StoreEvent::AssertValueFailed` to 503 with `Retry-After` (0.16: 409). |
+| `za::sharing_tombstones` (fork, part 7c) | The raw Calendar name-log bytes are expected in 1.0's encoding (LEB128 length, then the bytes; a repeated name as its shared-prefix length and a zero-length rest). | `store/src/write/log.rs` `VanishedItems::serialize`: 0.16 ended each name with a NUL. |
+| `za::sharing::sharing_class_differential` (fork, part 7c) | A sharee's GET of a PRIVATE event, and of the ordinary account's derived-private `X-SOMETHING` event, answers 200 with the time and CLASS only (no summary), on both sides; the owner's COPY goes into a third calendar, `class-copy/`. | 1.0 serves a private event to a sharee redacted (0.16: 403); 1.0 refuses a COPY that repeats a UID within one calendar (`no-uid-conflict`, ruling 50). |
+| `za::tracing::put_and_report` (fork, part 7c) | The REPORT is retried, bounded at 10 s, until it returns the canary. | `dav/src/calendar/query.rs`: 1.0 selects an ordinary account's text-match candidates from the Calendar search index, which the index queue writes after the PUT. |
+| `za::expansion::test` (fork, part 7c) | The bad rule is `RSCALE=HEBREW` (plain reason names the scale; the key reason stays `RRule error`); the UID is read from `ResourceUid`; the query-time reason is 1.0's `Failed to expand stored time ranges`; the no-iCalendar-text scan covers the key account's events. | calcard 1.0 expands an UNTIL before DTSTART to no instance without an error; 1.0's traces name the UID in `ResourceUid` and add `Contents` to the ordinary account's PUT-time event (upstream path, invariant 4). |
+| `za::gating::test` (fork, part 7c) | Principal/get runs with `Sharing.allowDirectoryQueries` on (restored after); the key account's own account object is read by the key account; capabilities under `accountCapabilities`; the busy period carries `accountId: null`; `ContactCard/copy` entries carry their source `id`. | 1.0 hides other principals unless directory queries are allowed, fills `accounts` only for an accessible principal, nests account capabilities, adds `accountId` to a busy period, and reads a `/copy` source from each entry's `id` (RFC 8620 5.4). |
+| `za::inbox::test` (fork, part 7c) | A propname multiget on the inbox answers the drained item 200 and not the pending one; a multiget naming the pending item answers exactly as one naming a missing href (both 404). | 1.0 routes a scheduling multiget to the inbox's items (0.16 bound it to the calendar collection, so every inbox href was 404). |
+| `za::mail::reads::assigned_ids_preserve_sealed_read_offsets` (fork, part 7c) | The corrupted-blob read requests `bodyValues`, as `corrupted_stub_and_blob` does. | At 1.0 `subject` comes from the opened stub; only body values read the blob. |
+| `za::mail::uploads` (fork, part 7c) | File nodes are created with `@type`; the shared folder's grants add `mayModifyContent`; `FileNode/copy` entries carry their source `id`. | 1.0's FileNode requires `@type` on creation, splits a content change into `mayModifyContent`, and reads a `/copy` source from `id`. |
+| `za::mail::fence::stress_the_fence` (fork, part 7c) | The temporary links are expired in place (`until` 1) before the purge, where 0.16's helper deleted them. | `common/src/storage/blob.rs`: 1.0 writes a blob's commit entry only when its batch commits, so a lost run's staged blob is reachable to the purge only through its expired temporary link. |
+| `za::mail::gates::oauth_grant_refused_for_impersonation` (fork, part 7c) | The login is 1.0's (`query` with S256 and `state`, `consent: true`; success is `authenticated` with a code); the test registers its OAuth client with the authorization-code and device grants. | 1.0's login API and its registered-client requirement. |
+| `jmap::za_variants` (fork, ruling 63) | The `wait_for_tasks` PR #66 added before the cross-account destroy is removed. | Ruling 63: the reproduction (`za::mail::fence::setup_refuses_an_in_flight_index_write` and its calendar twin) leaves no late document. |
+| `za::mail::search::jmap_refused_filters_and_sorts` (fork, part 7c) | The filter queries name `urn:ietf:params:jmap:metadata` in `using`; the `cc` sort is dropped from the refused sorts. | 1.0 reads object-metadata conditions only for a request that names the capability, and sorts by no `cc` for any account (`EmailComparator::Cc` answers `unsupportedSort`). |
+| `za::mail::traces::delivery_leaves_no_content_in_events` (fork, part 7c) | The list name is read from `Name` (0.16 `Details`), the plugin error's store name from `Name` (0.16 `Id`). | 1.0's `SieveEvent::ListNotFound` and `scripts/plugins/lookup.rs` keys. |
+| `za::cache_swap` (fork, part 7c) | A decoded message frame is required only by the canary round trip (`with_mail`). | The revocation case delivers no mail; on the blob tier its scan reads only its accounts' snapshots (6c test bug). |
+| `webdav::put_get`, `webdav::copy_move` (upstream, part 7c) | A PUT under a file node is asserted 409 (address book and calendar items stay 405); an exceeded quota 507 with `quota-not-exceeded`; a UID conflict 403. | `dav/src/request.rs` and the 1.0 handlers: 409 for a non-folder parent, 507 for `LimitEvent::Quota`, 403 for `NoUidConflict` (0.16: 405, 412, 412). |
 
 ## Task 1 check
 
