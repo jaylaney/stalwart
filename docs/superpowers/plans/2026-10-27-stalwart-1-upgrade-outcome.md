@@ -4695,6 +4695,132 @@ Recorded limit (ruling 16, the review's M5): a calendar container sealed at MKCO
 calendar's id only from its next changing PROPPATCH. An unchanged PROPPATCH doesn't rebind
 it, and a sharing rollback restores the unbound form. This affects integrity only.
 
+## Task 5
+
+### Part 5a: `email`, `spam-filter` and `smtp`
+
+Part 5a resolved the fourteen conflicts of `email`, `spam-filter` and `smtp` (cells in the
+conflict ledger), ported the fork's sealed-mail module onto 1.0's metadata rows, and
+re-read the hooks that merged clean (`smtp/src/core/mod.rs`, `inbound/{data,rcpt,spam,
+session}.rs`, `inbound/milter/{message,mod}.rs`, `scripts/{exec,mod}.rs`,
+`spam-filter/src/{lib,analysis/mod,analysis/domain}.rs`). `cargo check -p email
+-p spam-filter -p smtp` passes with and without `test_mode`, with test targets, and with
+`enterprise` except one restored smtp test module (below).
+
+#### The stub at 1.0
+
+1.0 stores a message's metadata as a `MetadataRow` (`email/src/message/metadata/row.rs`):
+an rkyv structure, a header section and a trailer. 0.16's stub put its bundle in
+`raw_headers`; 1.0's row has no such field, so the stub is now a row of its own:
+
+- **Header section:** `0x01 || envelope || seal_padded(DEK, aad_meta, full row)`, where the
+  full row is upstream's `NewMetadata::encode()` output for the message (structure and
+  header section, as an ordinary message's row). The format byte at its head is the one
+  discriminator (`is_stub_headers`, `is_stub(&MetadataRow)`), as at 0.16. The associated
+  data is unchanged: `za/v1|mail-meta|<account>|<sealed blob hash>`.
+- **Structure (`stub_structure`):** the sealed blob's hash and one binary root part at
+  offsets `0`, `bundle length`, `bundle length + sealed length`; nothing else. So
+  upstream's size readers see stored sizes (`blob_size()` is the sealed blob's, the size
+  `index_verbatim` gives the blob link), and upstream's row invariant (the root
+  body starts where the header section ends) holds. A stub's structure has no header, so
+  `thread_subject()` resolves to the empty name without reading the header section.
+- **Opening (`open_stub`, `za_open_stub_row`):** the bundle is decrypted, the full row's
+  structure is decoded with rkyv's checked access before a `MetadataRow` is built (a `pk`
+  envelope can be sealed by anyone holding the public key, and a row is otherwise read
+  unchecked), its header section must decode, and its blob hash must equal the stub's.
+  Errors are `SealError`s mapped to the fixed unreadable error, so no decrypted byte
+  reaches an error (upstream's archive errors quote the bytes).
+- **`MessageData`:** a key account's message keeps upstream's visible fields (mailboxes,
+  keywords, size, arrival time, thread), but its `sent_at` offset is 0 (the Date header
+  stays sealed) and neither attachment keyword is set (spec 5.2 kept the attachment bit
+  sealed). Its sort keys are `MessageSortKeys::default()`.
+- **The view API for readers** (`za/view.rs`): `za_metadata_view(stored: MetadataRow, keys,
+  account_id, document_id) -> ZaMetadataRow { row, opened }` replaces 0.16's `Cow` view;
+  `opened` is what `za_open_message_blob` takes. `za_open_stub_row` replaces
+  `za_open_stub_archive`. A key account's reader must read the row, not
+  `MetadataStructure`: a stub's structure names only the sealed blob. `za_is_sealed_source`
+  also counts 1.0's `BlobClass::Embedded` of `Collection::Email`.
+
+#### Route map (`email` and `smtp`)
+
+| Route | Entry | Sealing or refusal boundary |
+|---|---|---|
+| SMTP local delivery | `email/src/message/delivery.rs:203` (`email_ingest`, `IngestSource::Smtp`) | `email_ingest_into`: `za_ingest_wrap` with the keyless delivery token wraps to the served public key (`za_served_public_key`, read fresh); without one, `StoreEvent::UnexpectedError`, which `delivery.rs` maps to a temporary failure; `za_stage_sealed` holds the sealed blob, never the queue's; `za_index_stub` writes the stub. An ordinary account asserts vault absence after `with_account_id`. |
+| Sieve delivery | `delivery.rs:223` → `sieve/ingest.rs` (`sieve_script_ingest`), each filed message through `email_ingest` (`:831`, `Smtp`) | As delivery. The user script's plugins get `za_redact`; a key account's runtime-error reason is redacted; its ingest events carry `MessageId = [redacted]`. |
+| Sieve-generated messages (vacation, redirect, notify) | `sieve/ingest.rs` `send_message`; trusted scripts `smtp/src/scripts/event_loop.rs` `queue_sieve_message` | The SMTP queue (plaintext in transit, allowed); delivery to a local key account seals as above. The trusted script's events and plugin context are redacted for a key account's transaction (R57, R59). |
+| SMTP DATA (any recipient) | `smtp/src/inbound/data.rs` `queue_message` | No autolearn sample for a key recipient or sender; recipients added after RCPT are classified at the end of DATA; the spam-filter input, milter client and scripts carry the redaction flag; raw reads are masked by `session.rs` (issue #20, R41). The queue holds plaintext (allowed). |
+| IMAP APPEND | `imap/src/op/append.rs:224` → `IngestGroup::ingest` → `email_ingest_into` (`Imap`); `IngestGroup::flush` → `email_ingest_finish` | The wrap is the session's keys (`mk`), or the keyless refusal (`za_keyless_refusal`) before any batch operation, so a group keeps its batch as it was. No group thread, threading key, recheck or training for a key account. Each message's operations sit in one commit chunk with its own fence. `email_ingest_finish` reads nothing (content-free `PendingEmail`). |
+| JMAP Email/import | `jmap/src/email/grouped.rs:40` → `IngestGroup` (`Jmap`) | As APPEND. |
+| JMAP Email/set create | `jmap/src/email/set.rs:1062` → `email_ingest` (`Jmap`) | As APPEND; a key account's message with object metadata is refused before the batch (`za_metadata_refusal`, a 550 rejection). |
+| Restore | `services/src/task_manager/tasks/restore_item.rs:57` → `email_ingest` (`Restore`) | Refused for a key account before the batch (550, spec 6.7); an ordinary account is fenced. |
+| Cross-account copy | `email/src/message/copy.rs` `copy_message`, from IMAP COPY/MOVE (`imap/src/op/copy_move.rs:540`) and JMAP Email/copy (`jmap/src/email/copy.rs:343`) | Refused at use time when the source row's account (`CopySource::account_id`) or the target is a key account (`ZA_TRACE_MAIL_COPY`, the keyless refusal), before the row is read; the ordinary target asserts vault absence in the copy's one chunk. |
+| Training samples | `email/src/message/ingest.rs` `add_account_spam_samples` (IMAP STORE, COPY and MOVE, Email/set, Email/copy) and `add_spam_sample` inside `email_ingest_into` | A key account is skipped (fresh `za_is_key_account`); `email_ingest_into` sets no sample for one. An ordinary account's samples assert vault absence in every commit chunk (R55: the fence after `with_account_id` and again after every `commit_point` that splits). |
+
+No single-message guard remains around the grouped path: every guard sits in
+`email_ingest_into`, which both `email_ingest` and `IngestGroup::ingest` call, and the
+fence lives in the message's own chunk, which `write_batch` commits as one transaction.
+
+#### Rulings applied
+
+- **Ruling 27:** `llm.rs` deleted; its C3 limit is in the ledger cell.
+- **Ruling 26 and 45's disposition for tenants:** `za_index_stub` writes the stub without
+  `ObjectIndexBuilder::with_tenant_id`, which is enterprise-only code inside an SEL snippet.
+  An `enterprise` build therefore accounts a key account's message to no tenant; the
+  product has no tenants. The SEL snippet calling `index_message` is untouched: the stub
+  branch returns before it.
+- **Interface sheet 6:** refusals before the batch, the fence after `with_account_id`, the
+  content-free `PendingEmail`, the R55 fence before every commit chunk.
+- **R58** stays Task 6's: nothing in `email` places it; `common`'s `za_index_fence` is
+  unchanged.
+
+#### Deferred, by owner
+
+**Part 5b (`imap`, `pop3`)**
+- The readers move to the row view (`za_metadata_view` over a `MetadataRow`,
+  `ZaMetadataRow::opened`, `za_open_stub_row`, `is_stub(&MetadataRow) -> trc::Result<bool>`).
+  0.16's `Cow<Archive>` view and `za_open_stub_archive` are gone.
+- A key account's message has no attachment keyword and a zero `sent_at` offset: FETCH of
+  `$HasAttachment`-style flags, BODYSTRUCTURE and dates come from the opened row.
+- Task 2's handoff: the imap equivalent of imap-proto's six ENVELOPE, BODY and
+  BODYSTRUCTURE cases.
+
+**Part 5c (JMAP mail files and the tests)**
+- The same reader API; JMAP `hasAttachment` and `sentAt` for a key account come from the
+  opened row.
+- The new cases of Task 5's brief: `grouped_ingest_provisioning_wins_before_flush`,
+  `grouped_ingest_mixed_key_and_plain`, `grouped_rejection_discards_uncommitted_plain_metadata`
+  and `assigned_ids_preserve_sealed_read_offsets`. Hooks for them: `INGEST_PAUSE` parks
+  `email_ingest_into` after the account read and before the classification is used;
+  `COPY_PAUSE` parks `copy_message` after its refusal; `TRAIN_PAUSE` parks
+  `add_account_spam_samples` after its check.
+- Task 4's handoff `utils/za.rs` `plant_plain_message`, and the za mail tests that call
+  0.16's seal API (`delivery`, `fence`, `reads`, `writes`, `mail/mod.rs`).
+- Task 2's handoffs in `jmap` (`blob/upload.rs`, `email/import.rs`, `email/set.rs`).
+
+**Task 6**
+- `services`' index worker and un-index path read stubs through `is_stub(&MetadataRow)`
+  (0.16's `services/src/task_manager/index.rs` caller takes an archived structure). The
+  un-index path's thread subject needs no stub check (a stub's structure has no header),
+  but recognizing the stub keeps it from reading the bundle as headers.
+
+**Task 2 or the primary**
+- `smtp/src/inbound/dkim_restored_tests.rs` builds a `queue::Message` literal, which does
+  not compile with `smtp/enterprise` (1.0's `Message` has the SEL-gated `tenant_ids`), so
+  CI's unit job (`smtp/enterprise` in `UNIT_TEST_FEATURES`) fails to build smtp's tests.
+  Fork code cannot name the field (ruling 26's rule), and `Message` has no `Default` or
+  server-free constructor. It compiles and passes without `enterprise`. Options: gate the
+  module on `not(feature = "enterprise")` with an expectation row and a separate CI step,
+  or a ruling.
+- `TestServer::all_queued_messages` (tests crate, Task 2's harness) is not part 5a's: it
+  needs 1.0's queue API, at Task 7's first compile.
+
+**Recorded, no owner action**
+- An `IngestGroup` records a key account's message under its content-derived `ThreadKey`
+  in memory; the key-account branch ignores group threads, and every caller builds a group
+  for one account, so no message joins a thread across accounts.
+- `spam-filter/src/modules/classifier.rs` keeps upstream's `stalwart_tests` seeding of its
+  sampling RNG; 0.16 had no hook there.
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
@@ -4765,12 +4891,12 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/dav/src/request.rs` | content | Task 4 | resolved (Task 4b): 1.0's imports plus `za_calendar_report_uri`; rows 3-9 as merged; 1.0's whole-request conflict retry is skipped for keyed sessions (part 4b). |
 | `crates/directory/src/core/secret.rs` | content | Task 3 | resolved (Task 3a): v1.0.1's `CryptScheme` plus row 1, `verify_totp_code`; the restored module is declared after the private slot (Task 2 handoff), its base64 helper moved to `encodify`. |
 | `crates/email/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies (mail-parser 1.0, mail-builder 2.0, local `sieve-rs` and `text-extract`, workspace rkyv) plus `vault` (row 1) and `zeroize` (row 2); `test_mode = []`, the fork's 0.16.27 declaration, for the tests manifest. |
-| `crates/email/src/message/copy.rs` | content | Task 5 | open |
-| `crates/email/src/message/index/metadata.rs` | content | Task 5 | open |
-| `crates/email/src/message/index/mod.rs` | content | Task 5 | open |
-| `crates/email/src/message/ingest.rs` | content | Task 5 | open |
-| `crates/email/src/message/mod.rs` | content | Task 5 | open |
-| `crates/email/src/sieve/ingest.rs` | content | Task 5 | open |
+| `crates/email/src/message/copy.rs` | content | Task 5 | resolved (Task 5a): v1.0.1's `copy_message` (`CopySource`, `AccountCache`); row 2 at use time over the source row's account (`CopySource::account_id`, a fork field set by `CopySources::read`) and the target; row 3 (`COPY_PAUSE`) after the refusal; row 4 right after `with_account_id`, the batch's one commit chunk. |
+| `crates/email/src/message/index/metadata.rs` | content | Task 5 | resolved (Task 5a): v1.0.1 as supplied. 1.0 splits `MessageMetadata::build` out of `index_message` itself (rows 1-3's purpose); the stub is written by `za::ingest::za_index_stub`, so no fork line is needed here. |
+| `crates/email/src/message/index/mod.rs` | content | Task 5 | resolved (Task 5a): v1.0.1 as supplied; row 2's `index_metadata` is replaced by `za_index_stub` in the fork module (it cannot name `index_message`'s enterprise-only tenant argument). |
+| `crates/email/src/message/ingest.rs` | content | Task 5 | resolved (Task 5a): v1.0.1's `email_ingest_into`/`email_ingest_finish`; rows 2-9 in `email_ingest_into` (classification, wrap and the metadata refusal before any batch operation; no thread lookup or group thread, `sent_at` dropped, no iTIP, no training, no encryption, sealed staging; the fence after `with_account_id`; the stub branch returns a content-free `PendingEmail` before the SEL `index_message` snippet), rows 10-11 in `add_account_spam_samples` (key accounts skipped, `TRAIN_PAUSE`, R55's fence in every chunk). Upstream's ingest-event match moved into `ingest_event`, shared by both branches. |
+| `crates/email/src/message/mod.rs` | content | Task 5 | resolved (Task 5a): v1.0.1 plus `pub mod za` (row 1). |
+| `crates/email/src/sieve/ingest.rs` | content | Task 5 | resolved (Task 5a): v1.0.1; row 1 (`za_redact` on the `PluginContext`), row 2 (a key account's runtime-error reason redacted); Task 2's handoff `:758` regated to `feature = "test_mode"`. |
 | `crates/groupware/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies and `enterprise` list plus `vault`, `base64`, `subtle` and `zeroize` (row 1); `test_mode = ["common/test_mode"]` (row 2). |
 | `crates/groupware/src/calendar/dates.rs` | content | Task 4 | resolved (Task 4a): v1.0.1's file plus `new_for(…, &DefaultAlerts, key_account)`, which traces each expansion error's kind and no `Contents` for a key account (rows 2, 3, 5); the fork unit module keeps its name `tests` and covers 1.0.1's new `ExpansionLimitReached`. |
 | `crates/groupware/src/calendar/itip.rs` | content | Task 4 | resolved (Task 4a): v1.0.1's file plus `SendSealed`, `resolve(…, owner_is_key)`, the RSVP refusals (rows 3, 4) and the provisioning fence in every commit chunk of the iMIP import and merge (rows 2, 5): before the event write, before the notification quota's eviction, before the notification insert and at the end. |
@@ -4826,15 +4952,15 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/services/src/task_manager/index.rs` | modify/delete | Task 6 | open |
 | `crates/services/src/task_manager/manager.rs` | content | Task 6 | open |
 | `crates/services/src/task_manager/tasks/maintenance.rs` | content | Task 6 (lease: Task 3/Task 4); renamed from `task_manager/maintenance.rs`, whose file group it is | resolved (Task 3b, ruling 41): `sweep_expired_uid_leases(server.store())` after `purge_store` in `PurgeData` (1.0 has no in-memory purge). Task 2's handoff: `:187`, `:190` and `:369` regated to `feature = "test_mode"`. Deferred to Task 6 (for a ruling): `:145` and `:148` sit inside an SEL snippet (the tenant maintenance block), so they keep `stalwart_tests`; in enterprise test builds tenant maintenance keeps its jitter. |
-| `crates/smtp/src/inbound/milter/client.rs` | content | Task 5 | open |
+| `crates/smtp/src/inbound/milter/client.rs` | content | Task 5 | resolved (Task 5a): v1.0.1's `Name`/`CompactString` events with rows 4-5's redacted contents; rows 1-2 merged clean. |
 | `crates/smtp/src/inbound/session.rs` | content | Task 3 (issue #20, R41) / Task 5 | resolved (Task 3b, ruling 41): rows 1-4 kept; the raw-input trace keeps the mask and builds 1.0's `CompactString` otherwise. 1.0's `State::Bdat { .. }` is a struct variant now, and the in-tree smtp-proto's `RequestReceiver::buf()` returns `&mut Vec<u8>` with 0.2.5's clearing rule (re-read). Task 2's handoff: the `badtls` HELO regated to `any(test, feature = "test_mode")`. The fork unit module is kept. Nothing deferred. |
-| `crates/smtp/src/scripts/event_loop.rs` | content | Task 5 | open |
-| `crates/spam-filter/src/analysis/llm.rs` | modify/delete | Task 5 (disposition, SEL-only) | open |
-| `crates/spam-filter/src/analysis/rules.rs` | content | Task 5 | open |
-| `crates/spam-filter/src/analysis/url.rs` | content | Task 5 | open |
-| `crates/spam-filter/src/modules/classifier.rs` | content | Task 5 | open |
-| `crates/spam-filter/src/modules/dnsbl.rs` | content | Task 5 | open |
-| `crates/spam-filter/src/modules/expression.rs` | content | Task 5 | open |
+| `crates/smtp/src/scripts/event_loop.rs` | content | Task 5 | resolved (Task 5a): v1.0.1's `SmtpHandler`, which gains `za_redact` (rows 1-9): the include, list, send-to-list, unsupported-action, runtime-error and reject events redact their value, and the plugin context carries the flag (R59). 1.0's quota event names no recipient, so row 6 has no site. |
+| `crates/spam-filter/src/analysis/llm.rs` | modify/delete | Task 5 (disposition, SEL-only) | resolved (Task 5a, ruling 27): deleted. Its hook's site is the SEL-only `analysis/ai/` (and `common/src/enterprise/ai/`), not ported. Recorded C3 limit: an `enterprise` build's LLM analysis traces the model's answer (`AiEvent::LlmResponse`) and its gate evaluates rules with the tracing evaluator for a key account's message too; no za test configures an LLM, and the product build has no AI analysis. |
+| `crates/spam-filter/src/analysis/rules.rs` | content | Task 5 | resolved (Task 5a): v1.0.1's `RulePass`; rows 2-9 collapse into its one `eval_if`, now `spam_eval_if` (quiet for `za_redact`). |
+| `crates/spam-filter/src/analysis/url.rs` | content | Task 5 | resolved (Task 5a): v1.0.1; rows 1-2 (`is_trusted_domain` takes the input, R56); row 3 moved with 1.0's redirect error into `resolve_redirect`, which gains a `za_redact` argument; Task 2's `:440` regated to `test_mode` and the restored test module declared. |
+| `crates/spam-filter/src/modules/classifier.rs` | content | Task 5 | resolved (Task 5a): v1.0.1; rows 1-3 collapse into 1.0's one `is_trusted_domain` call in `spam_build_tokens` (R56). |
+| `crates/spam-filter/src/modules/dnsbl.rs` | content | Task 5 | resolved (Task 5a): v1.0.1; the zone and tag evaluations use `spam_eval_string_with` (1.0 uses `eval_if_with`, which has no quiet form; a string-only result type keeps upstream's semantics), the three events' `Hostname` and the error's `CausedBy` are redacted (rows 2-7). Task 2's `:16`, `:28`, `:158`, `:245` regated to `test_mode`; the test resolver in 1.0's private slot is replaced by a fork-owned `resolve_zone` written from 0.16's (mail-auth's test resolver; seeded zones are read from `spam_lookup` first). |
+| `crates/spam-filter/src/modules/expression.rs` | content | Task 5 | resolved (Task 5a): v1.0.1 plus row 2 as two free functions, `spam_eval_if` and `spam_eval_string_with`, beside the resolver. |
 | `crates/store/src/dispatch/lookup.rs` | content | Task 2 (lease home: Task 3/Task 4) | resolved (Task 2a): v1.0.1's file as supplied (both blocks). Row 2's purge skip is moot, not deferred. Evidence (paths in `v1.0.1-src/crates/`): v1.0.1 has no `purge_in_memory_store`, and `InMemoryStore` (`store/src/lib.rs:426-439`) has no data-store variant: it is `Sql`, `Local`, `Redis`, `Http`, `Static` and the SEL `Sharded`, and `Sql` answers `NotSupported` to key writes (`store/src/dispatch/lookup.rs:61` and the arms after it). So nothing sweeps expired keys out of the data store. Its other bulk deletions of data-store keys are: `Store::purge_store`, which only clears zero counters in `Shape::Counter` subspaces (`store/src/backend/{rocksdb,sqlite,foundationdb}/write.rs`); `danger_destroy_account` (`store/src/dispatch/store.rs:415-476`: the account's `Counter` kinds, its `Logs`, `Indexes`, `Property`, `Immutable` and `IndexProperty` prefixes, and its ACLs); the change-log truncation (`delete_changes` and `truncate_change_log`, `common/src/storage/transaction.rs:116-235`, `Logs`); the private-metadata cleanup (`common/src/storage/metadata/cleanup.rs:228-265`, an owner's private metadata and private logs); the telemetry purges (`TelemetrySpan`, `TelemetryMetric`); the reindex and search-queue clears (search subspaces); and the console's operator-driven range delete. Ruling 24's guarantee (only the asserting sweep clears a lease) therefore rests on Task 3's choice of a `Shape::Value` subspace and key range for `ValueClass::Any` that none of these reaches. `ZA_UID_LEASE_PREFIX` stays in `store/src/lib.rs` as the first byte of the lease key in it. |
 | `crates/store/src/lib.rs` | content | Task 2 (is_read_replica consumer: Task 4) | resolved (Task 2a): v1.0.1's `Subspace` block as supplied, without the 0.16 `LEGACY_SUBSPACE_BITMAP_*` constants (no user). Row 1: `za_test` declared under `test_mode`. Row 2: `ZA_UID_LEASE_PREFIX = 27` kept (ruling 24), its comment rewritten for a `ValueClass::Any` key. Row 3 (ruling 26): the only caller of `Store::is_read_replica` is the fork's move route (`dav/src/calendar/copy_move.rs:2324`), and v1.0.1 still has the SEL `SQLReadReplica` variant, so the function stays, rewritten without the SEL arm: an SQL store (`is_sql`) that is neither SQLite nor `is_pg_or_mysql`, which at v1.0.1 is exactly the replica, and fails closed for any SQL variant upstream adds. |
 | `crates/store/src/query/log.rs` | content | Task 4 | resolved to compile (Task 2a, ruling 34): rows 1 and 2 ported. `vanished` wraps `vanished_with_change_id` as at 0.16, and each record is decoded with v1.0.1's `deserialize_vanished(bytes, &mut items)` into a per-record buffer, then tagged with that record's change id (the `String` decoder's prefix sharing is per record). Nothing deferred; finding 3 (paged sync tokens at the consumer) stays Task 4's. Task 4a re-read: nothing in `groupware` consumes it; the paged consumer is part 4b's. |
@@ -4868,6 +4994,8 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `system::directory::test` | The masked email's creation, its `account_id_from_email` and `rcpt_resolve` checks and its destroy are removed. | The same. |
 | `system::delivery::test` | The masked emails' creation, their domain and quota refusals, their two VRFY checks and their destroy are removed. The two spam cases that were delivered to them (GTUBE to Junk, the CardDAV `card-exists` override) are delivered to john's alias `john.doe@example.org` instead. | The same. The spam filtering is OSS, so those cases stay. |
 | `smtp::inbound::antispam::antispam` | The `llm` case is removed from its case list. | Ruling 33: the LLM analysis needs a licence (AI models are off while `core.enterprise` is `None`). |
+| `email::message::za::seal::tests::*` | Rewritten for 1.0's metadata row: the stub is a `MetadataRow` whose structure holds one binary root part at offsets (0, bundle, bundle + sealed) instead of 0.16's empty part at zero offsets; there is no `rcvd_attach`, so the arrival-time and attachment-bit checks are gone; the moved, tampered, bad-policy and unknown-wrap cases re-encode the bundle under a new row instead of editing `raw_headers`; round trips compare the opened row's structure and header section with the full row. A new case, `a_forged_bundle_does_not_open_as_a_row`, covers the checked decode. | `email/src/message/metadata/{mod,row}.rs`: `MessageMetadata` is a flat structure with no `raw_headers`, `rcvd_attach` or `contents`; the header block lives in the row's header section; the arrival time and the attachment keywords live in `MessageData`. |
+| `email::message::za::view::tests::the_view_keeps_upstreams_offsets` | Compares the opened row with the full row (structure and header section), reconstructs the message through `raw_message`, and reads every text part, nested and transfer-encoded messages included, through upstream's `source` and `PartView::text` against the parser's text. 0.16 compared archive bytes and used `decode_contents` and `text_part`. A base64 `message/rfc822` case joins the corpus. | The same, and `email/src/message/metadata/source.rs`: parts are read through `RawMessage` and `PartSource`. |
 | `directory::issuer::test` | `get_token_for_client` is a new fork helper in `issuer.rs` (RFC 6749 4.3 against the issuer's discovered token endpoint); it adds an assertion that the token request answers 200, where 0.16's helper sat in an SEL-only file. | The SEL-only `tests/src/directory/oidc.rs` is not carried (design Decision 1); the helper is written from RFC 6749, not from that file. |
 | Any suite with an ElasticSearch or MeiliSearch search store (harness) | `search_store_destroy` panics for these stores, where 0.16 dropped and recreated their indexes. No CI step uses them. | 1.0 moved their `drop_indexes` into upstream's private test support (`store/src/backend/elastic/main.rs:134`, `meili/main.rs:314`, test-hook table rows "not needed"). |
 | Every suite (harness) | The emptiness check deletes share notifications with the change logs, as it deletes the logs at 0.16, and reports those whose account no longer exists (as for vault and pin records). | 1.0 stores share notifications as `Logs` entries of `SyncCollection::ShareNotification` (`store/src/write/key.rs:519-525`, `:860`), written for the grantee on every grant, regrant, change and revoke (`common/src/storage/index/build.rs:95`, `:110`, `:300`, `:332`, `:352`, `:379`) and kept with the change log (`common/src/storage/transaction.rs:162-179`); 0.16 had none. |
