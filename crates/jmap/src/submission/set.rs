@@ -10,27 +10,19 @@ use common::{
     config::smtp::queue::QueueName,
     network::{ServerInstance, stream::NullIo},
     storage::index::ObjectIndexBuilder,
-<<<<<<< HEAD
+    storage::quota::ObjectQuotaUsage,
     za::ZA_MAIL_UNREADABLE,
 };
 use email::{
     identity::Identity,
     message::{
-        metadata::{ArchivedMetadataHeaderName, ArchivedMetadataHeaderValue, MessageMetadata},
-        za::view::{ZaMailView, Zeroizing, za_readable},
+        metadata::{HeaderId, MetadataRow},
+        za::view::{ZaMailView, ZaMetadataRow, za_readable},
     },
-    submission::{Address, Delivered, DeliveryStatus, EmailSubmission, UndoStatus},
-=======
-    storage::quota::ObjectQuotaUsage,
-};
-use email::{
-    identity::Identity,
-    message::metadata::{HeaderId, MetadataRow},
     submission::{
         Address, Delivered, DeliveryResults, DeliveryStatus, EmailSubmission, QUEUED_REPLY,
         UndoStatus,
     },
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 };
 use jmap_proto::{
     error::set::{SetError, SetErrorType},
@@ -633,23 +625,17 @@ impl EmailSubmissionSet for Server {
                 .with_property(EmailSubmissionProperty::EmailId)
                 .with_description("Email not found.")));
         };
-<<<<<<< HEAD
         // Mail spec 6.5, 7, 10: the unsealed view and blob; an unreadable
         // message fails its submission.
         let keys = self.za_mail_keys(access_token, account_id).await?;
-        let Some(view) = za_readable(
-            self.za_metadata_view(&metadata_, keys.as_deref(), account_id, submission.email_id)
+        let Some(ZaMetadataRow { row, opened }) = za_readable(
+            self.za_metadata_view(row, keys.as_deref(), account_id, submission.email_id)
                 .await,
         )?
         else {
             return Ok(Err(za_unreadable_email()));
         };
-        let metadata = view
-            .unarchive::<MessageMetadata>()
-            .caused_by(trc::location!())?;
-=======
         let metadata = row.unarchive().caused_by(trc::location!())?;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
         // Add recipients to envelope if missing
         if rcpt_to.is_empty() {
@@ -705,64 +691,40 @@ impl EmailSubmissionSet for Server {
                 Some(metadata.size() as u64),
             )
             .await?
-<<<<<<< HEAD
-        {
-            let Some(message) = za_readable(
-                self.za_open_message_blob(
-                    matches!(view, Cow::Owned(_)),
-                    keys.as_deref(),
-                    account_id,
-                    submission.email_id,
-                    message,
-                )
-                .await,
-            )?
-            else {
-                return Ok(Err(za_unreadable_email()));
-            };
-            if message.len() > self.core.email.mail_max_size {
-                return Ok(Err(SetError::new(SetErrorType::InvalidEmail)
-                    .with_description(format!(
-                        "Message exceeds maximum size of {} bytes.",
-                        self.core.email.mail_max_size
-                    ))));
-            }
-
-            message
-        } else {
-=======
         else {
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
             return Ok(Err(SetError::invalid_properties()
                 .with_property(EmailSubmissionProperty::EmailId)
                 .with_description("Blob for email not found.")));
         };
-<<<<<<< HEAD
-
-        // Remove BCC header if present
-        if let Some(bcc_header) = bcc_header {
-            let mut new_message = Vec::with_capacity(message.len());
-            let range = bcc_header.name_value_range();
-            new_message.extend_from_slice(&message[..range.start]);
-            new_message.extend_from_slice(&message[range.end..]);
-            message = Zeroizing::new(new_message);
-=======
-        if blob.len() > self.core.email.mail_max_size {
+        let (raw_message, message_memory) = blob.into_parts();
+        let Some(mut raw_message) = za_readable(
+            self.za_open_message_blob(
+                opened,
+                keys.as_deref(),
+                account_id,
+                submission.email_id,
+                raw_message,
+            )
+            .await,
+        )?
+        else {
+            return Ok(Err(za_unreadable_email()));
+        };
+        if raw_message.len() > self.core.email.mail_max_size {
             return Ok(Err(SetError::new(SetErrorType::InvalidEmail)
                 .with_description(format!(
                     "Message exceeds maximum size of {} bytes.",
                     self.core.email.mail_max_size
                 ))));
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
         }
 
         // Remove BCC header if present
-        let stripped = match metadata.strip_root_fields(&blob, HeaderId::BCC) {
+        let stripped = match metadata.strip_root_fields(&raw_message, HeaderId::BCC) {
             Cow::Owned(stripped) => Some(stripped),
             Cow::Borrowed(_) => None,
         };
-        let (raw_message, message_memory) = blob.into_parts();
-        let message = stripped.unwrap_or(raw_message);
+        // The bytes leave for the queue (mail spec 6.5).
+        let message = stripped.unwrap_or_else(|| std::mem::take(&mut *raw_message));
 
         // Begin local SMTP session
         let origin = MessageOrigin::Submission { account_id };
@@ -805,15 +767,9 @@ impl EmailSubmissionSet for Server {
 
             // DATA
             if has_success {
-<<<<<<< HEAD
-                // The bytes leave for the queue (mail spec 6.5).
-                session.data.message = std::mem::take(&mut *message);
-                let response = session.queue_message().await;
-=======
                 session.data.message = message;
                 session.data.message_memory = Some(message_memory);
                 let response = session.queue_message(origin).await;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                 if let smtp::core::State::Accepted(queue_id) = session.state {
                     Ok((responses, Some(queue_id)))
                 } else {

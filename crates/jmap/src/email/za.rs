@@ -15,7 +15,7 @@
 use common::{Server, za::ZA_MAIL_SEARCH_REFUSED};
 use jmap_proto::{
     method::query::{Comparator, Filter},
-    object::email::{EmailComparator, EmailFilter},
+    object::email::{EmailComparator, EmailFilter, EmailQueryFilter},
 };
 
 /// True when answering the filter needs a message's sealed content (header
@@ -52,6 +52,21 @@ pub fn filter_needs_content(filter: &EmailFilter) -> bool {
     }
 }
 
+/// True when answering an `Email/query` condition needs what a key
+/// account's message does not hold in the clear: an `EmailFilter` that
+/// needs content (`filter_needs_content`), or, new at 1.0, any condition on
+/// the message's object metadata (`metadataExists`, `metadataTextContains`,
+/// `metadataTextEquals` and their private forms). A key account's message
+/// is ingested without object metadata (`za_metadata_refusal`), so such a
+/// filter would answer only silently; it is refused as the attachment
+/// keywords are (ruling 55).
+pub fn query_filter_needs_content(filter: &EmailQueryFilter) -> bool {
+    match filter {
+        EmailQueryFilter::Email(filter) => filter_needs_content(filter),
+        EmailQueryFilter::Metadata(_) => true,
+    }
+}
+
 /// True when ordering by the property needs a message's sealed content.
 pub fn sort_needs_content(comparator: &EmailComparator) -> bool {
     match comparator {
@@ -73,9 +88,9 @@ pub fn sort_needs_content(comparator: &EmailComparator) -> bool {
 /// The first filter condition of the request that needs content. Operators
 /// (`AND`, `OR`, `NOT`, the closing mark) are not conditions; a refused
 /// condition anywhere in the tree refuses the whole request.
-pub fn first_refused_filter(filters: &[Filter<EmailFilter>]) -> Option<&EmailFilter> {
+pub fn first_refused_filter(filters: &[Filter<EmailQueryFilter>]) -> Option<&EmailQueryFilter> {
     filters.iter().find_map(|filter| match filter {
-        Filter::Property(condition) if filter_needs_content(condition) => Some(condition),
+        Filter::Property(condition) if query_filter_needs_content(condition) => Some(condition),
         _ => None,
     })
 }
@@ -107,7 +122,7 @@ pub fn first_snippet_term(filters: &[Filter<EmailFilter>]) -> Option<&EmailFilte
 pub async fn za_refuse_content_query(
     server: &Server,
     account_id: u32,
-    filters: &[Filter<EmailFilter>],
+    filters: &[Filter<EmailQueryFilter>],
     sorts: &[Comparator<EmailComparator>],
 ) -> trc::Result<()> {
     let filter = first_refused_filter(filters);
@@ -149,7 +164,10 @@ pub async fn za_refuse_snippet_terms(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jmap_proto::types::date::UTCDate;
+    use jmap_proto::{
+        object::metadata::{MetadataFilter, MetadataRoot},
+        types::date::UTCDate,
+    };
     use types::{id::Id, keyword::Keyword};
 
     fn keyword() -> Keyword {
@@ -229,26 +247,50 @@ mod tests {
     }
 
     #[test]
+    fn query_filter_table() {
+        for (filter, needs_content) in filters() {
+            assert_eq!(
+                query_filter_needs_content(&EmailQueryFilter::Email(filter.clone())),
+                needs_content,
+                "{filter}"
+            );
+        }
+        // Every object-metadata condition is refused for a key account.
+        let metadata = MetadataFilter::Invalid {
+            root: MetadataRoot::Shared,
+            name: "metadataExists",
+            reason: "test",
+        };
+        assert!(query_filter_needs_content(&EmailQueryFilter::Metadata(
+            metadata
+        )));
+    }
+
+    fn email(filter: EmailFilter) -> Filter<EmailQueryFilter> {
+        Filter::Property(EmailQueryFilter::Email(filter))
+    }
+
+    #[test]
     fn first_refused_walks_the_filter_tree() {
         let tree = vec![
             Filter::And,
-            Filter::Property(EmailFilter::InMailbox(Id::default())),
+            email(EmailFilter::InMailbox(Id::default())),
             Filter::Not,
-            Filter::Property(EmailFilter::Subject("x".into())),
+            email(EmailFilter::Subject("x".into())),
             Filter::Close,
-            Filter::Property(EmailFilter::From("y".into())),
+            email(EmailFilter::From("y".into())),
             Filter::Close,
         ];
         assert_eq!(
             first_refused_filter(&tree),
-            Some(&EmailFilter::Subject("x".into()))
+            Some(&EmailQueryFilter::Email(EmailFilter::Subject("x".into())))
         );
         assert_eq!(first_refused_filter(&[]), None);
         assert_eq!(
             first_refused_filter(&[
                 Filter::Or,
-                Filter::Property(EmailFilter::MinSize(1)),
-                Filter::Property(EmailFilter::HasKeyword(keyword())),
+                email(EmailFilter::MinSize(1)),
+                email(EmailFilter::HasKeyword(keyword())),
                 Filter::Close,
             ]),
             None

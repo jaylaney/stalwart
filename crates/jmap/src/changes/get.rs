@@ -5,15 +5,10 @@
  */
 
 use crate::{
-<<<<<<< HEAD
-    api::{auth::JmapAuthorization, request::za_assert_calendar_allowed},
-    changes::state::JmapCacheState,
-};
-use common::{Server, auth::AccessToken};
-=======
     api::{
         auth::JmapAuthorization,
         metadata::{MetadataType, ObjectMetadata},
+        request::za_assert_calendar_allowed,
     },
     changes::{
         page::{
@@ -29,7 +24,6 @@ use common::{
     GroupwareResources, MessageStoreCache, Server, auth::AccessToken,
     storage::metadata::MetadataViewer,
 };
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 use email::cache::{MessageCacheFetch, email::MessageCacheAccess, mailbox::MailboxCacheAccess};
 use groupware::{
     cache::GroupwareCache,
@@ -212,12 +206,8 @@ impl ChangesLookup for Server {
                 (SyncCollection::Calendar, false)
             }
             MethodObject::CalendarEventNotification => {
-<<<<<<< HEAD
-                access_token.assert_is_member(request.account_id)?;
-                za_assert_calendar_allowed(self, request.account_id).await?;
-=======
                 access_token.assert_has_access(request.account_id, Collection::CalendarEvent)?;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+                za_assert_calendar_allowed(self, request.account_id).await?;
 
                 (SyncCollection::CalendarEventNotification, false)
             }
@@ -228,6 +218,9 @@ impl ChangesLookup for Server {
             }
             MethodObject::ParticipantIdentity => {
                 access_token.assert_has_access(request.account_id, Collection::CalendarEvent)?;
+                // Spec 9: new at 1.0, a JMAP calendars method, refused for a
+                // key account as ParticipantIdentity/get and /set are.
+                za_assert_calendar_allowed(self, request.account_id).await?;
 
                 return self
                     .participant_identity_changes(request, access_token)
@@ -242,7 +235,6 @@ impl ChangesLookup for Server {
                 return Err(trc::JmapEvent::CannotCalculateChanges.into_err());
             }
         };
-<<<<<<< HEAD
         // Mail spec 6.3, ruling R34: a key account's mail changes are read only
         // by its own sessions (Email, Mailbox, Thread and EmailSubmission
         // `/changes`, and the `/queryChanges` built on them).
@@ -256,14 +248,6 @@ impl ChangesLookup for Server {
             self.za_assert_mail_route(access_token, request.account_id.document_id())
                 .await?;
         }
-        let max_changes = std::cmp::min(
-            request
-                .max_changes
-                .filter(|n| *n != 0)
-                .unwrap_or(usize::MAX),
-            self.core.jmap.changes_max_results,
-        );
-=======
         let max_changes = match request.max_changes {
             Some(0) => {
                 return Err(trc::JmapEvent::InvalidArguments
@@ -273,7 +257,6 @@ impl ChangesLookup for Server {
             Some(max_changes) => max_changes.min(self.core.jmap.changes_max_results),
             None => self.core.jmap.changes_max_results,
         };
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
         let mut response: ChangesResponse<NullObject> = ChangesResponse {
             account_id: request.account_id,
             old_state: request.since_state.clone(),

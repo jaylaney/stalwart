@@ -4,19 +4,14 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-<<<<<<< HEAD
-use super::download::BlobDownload;
+use super::download::{BlobAccess, BlobDownload};
+use super::embedded::EmbeddedBlobs;
 use common::{
     Server,
     auth::AccessToken,
     za::{ZA_TRACE_MAIL_COPY, mail::za_keyless_refusal},
 };
 use email::message::za::view::ZaMailView;
-=======
-use super::download::{BlobAccess, BlobDownload};
-use super::embedded::EmbeddedBlobs;
-use common::{Server, auth::AccessToken};
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 use jmap_proto::{
     error::set::SetError,
     method::copy::{CopyBlobRequest, CopyBlobResponse},

@@ -26,6 +26,7 @@ use common::{
     },
     storage::dav::{FILE_KIND_SYMLINK, MAX_FILE_NODE_DEPTH},
 };
+use email::message::za::view::ZaMailView;
 use groupware::{DestroyArchive, file::FileNode};
 use jmap_proto::{
     error::set::SetError,
@@ -698,6 +699,9 @@ impl<'x> FileNodeWriter<'x> {
         &mut self,
         blob_id: &BlobId,
     ) -> trc::Result<Result<ResolvedBlob, SetError<FileNodeProperty>>> {
+        // Mail spec 5.7: a sealed source is never a file's blob, whether a
+        // create, an update or a copy names it.
+        self.server.za_refuse_raw_source(blob_id).await?;
         let BlobAccess::Allowed { size: known_size } = self
             .server
             .has_access_blob(blob_id, self.access_token)

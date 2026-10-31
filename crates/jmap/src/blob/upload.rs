@@ -23,7 +23,7 @@ use std::future::Future;
 use trc::AddContext;
 use types::{blob::BlobClass, id::Id};
 
-#[cfg(stalwart_tests)]
+#[cfg(feature = "test_mode")]
 pub static DISABLE_UPLOAD_QUOTA: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
@@ -111,16 +111,12 @@ impl BlobUpload for Server {
                             }
                         };
 
-<<<<<<< HEAD
                         // Mail spec 5.7: never a sealed source's stored bytes,
                         // a reference to an upload of this call included.
                         self.za_refuse_raw_source(&id).await?;
-                        if !self.has_access_blob(&id, access_token).await? {
-=======
                         let BlobAccess::Allowed { size } =
                             self.has_access_blob(&id, access_token).await?
                         else {
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                             response.not_created.append(
                                 create_id,
                                 SetError::forbidden().with_description(format!(
@@ -260,7 +256,6 @@ impl BlobUpload for Server {
             .is_upload_allowed(access_token)
             .caused_by(trc::location!())?;
 
-<<<<<<< HEAD
         // Mail spec 4, 5.7: a key account's upload is sealed with its keys;
         // a token without them is refused here too, whatever the caller
         // checked (`/jmap/upload` answers 403 before this call).
@@ -269,9 +264,6 @@ impl BlobUpload for Server {
             .await?;
 
         #[cfg(feature = "test_mode")]
-=======
-        #[cfg(stalwart_tests)]
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
         {
             // Used for concurrent upload tests
             if data == b"sleep" {
@@ -292,12 +284,12 @@ impl BlobUpload for Server {
                     .ctx(trc::Key::Total, self.core.jmap.upload_tmp_quota_amount)
                     .ctx(trc::Key::Expires, status.expires_in));
 
-                #[cfg(stalwart_tests)]
+                #[cfg(feature = "test_mode")]
                 if !DISABLE_UPLOAD_QUOTA.load(std::sync::atomic::Ordering::Relaxed) {
                     return err;
                 }
 
-                #[cfg(not(stalwart_tests))]
+                #[cfg(not(feature = "test_mode"))]
                 return err;
             }
         }

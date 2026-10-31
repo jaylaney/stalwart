@@ -9,16 +9,11 @@ use super::{
     set::create_node,
     writer::{FileNodeWriter, WriteOptions, fetch_archive},
 };
-<<<<<<< HEAD
-use common::{Server, auth::AccessToken, sharing::EffectiveAcl};
-use email::message::za::view::ZaMailView;
-=======
 use crate::{
     api::metadata::{MetadataPreload, MetadataType, ObjectMetadata},
     changes::state::JmapCacheState,
 };
 use common::{Server, auth::AccessToken};
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 use groupware::{cache::GroupwareCache, file::FileNode};
 use http_proto::HttpSessionData;
 use jmap_proto::{
@@ -184,65 +179,6 @@ impl FileNodeCopy for Server {
             node.unsubscribed.clear();
             node.parent_id = 0;
 
-<<<<<<< HEAD
-            let has_acl_changes =
-                match update_file_node(None, create, &mut file_node, true, &NoResolver) {
-                    Ok(result) => {
-                        if let Some(blob_id) = result.blob_id {
-                            // Mail spec 5.7: a sealed source is never a file's blob.
-                            self.za_refuse_raw_source(&blob_id).await?;
-                            let file_details = file_node.file.get_or_insert_default();
-                            if !self.has_access_blob(&blob_id, access_token).await? {
-                                response.not_created.append(
-                                    id,
-                                    SetError::forbidden().with_description(format!(
-                                        "You do not have access to blobId {blob_id}."
-                                    )),
-                                );
-                                continue 'create;
-                            } else if let Some(blob_contents) = self
-                                .blob_store()
-                                .get_blob(blob_id.hash.as_slice(), 0..usize::MAX)
-                                .await?
-                            {
-                                file_details.size = blob_contents.len() as u32;
-                            } else {
-                                response.not_created.append(
-                                    id,
-                                    SetError::invalid_properties()
-                                        .with_property(FileNodeProperty::BlobId)
-                                        .with_description("Blob could not be found."),
-                                );
-                                continue 'create;
-                            }
-                            file_details.blob_hash = blob_id.hash;
-                        }
-
-                        if file_node
-                            .file
-                            .as_ref()
-                            .is_some_and(|f| f.blob_hash.is_empty())
-                        {
-                            response.not_created.append(
-                                id,
-                                SetError::invalid_properties()
-                                    .with_property(FileNodeProperty::BlobId)
-                                    .with_description("Missing blob id."),
-                            );
-                            continue 'create;
-                        }
-
-                        result.has_acl_changes
-                    }
-                    Err(err) => {
-                        response.not_created.append(id, err);
-                        continue 'create;
-                    }
-                };
-
-            if let Err(err) =
-                validate_file_node_hierarchy(None, &file_node, is_shared, &cache, &created_folders)
-=======
             match create_node(
                 &mut writer,
                 String::new(),
@@ -252,7 +188,6 @@ impl FileNodeCopy for Server {
                 Some(from_document_id),
             )
             .await?
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
             {
                 Ok(node) => {
                     created.push((create_id, node));

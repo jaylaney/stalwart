@@ -13,23 +13,17 @@ use crate::{
         ingested_into_object, invalid_keywords,
     },
 };
-<<<<<<< HEAD
-use common::{Server, auth::AccessToken, ipc::PushNotification, za::mail::za_keyless_refusal};
+use common::storage::blob::FetchedBlob;
+use common::{
+    MAX_RECEIVED_AT, Server, auth::AccessToken, ipc::PushNotification, za::mail::za_keyless_refusal,
+};
 use email::{
     cache::{MessageCacheFetch, mailbox::MailboxCacheAccess},
     mailbox::JUNK_ID,
     message::{
-        ingest::{EmailIngest, IngestEmail, IngestSource},
+        ingest::{group::ThreadKey, recheck::ThreadRecheck},
         za::view::ZaMailView,
     },
-=======
-use common::storage::blob::FetchedBlob;
-use common::{MAX_RECEIVED_AT, Server, auth::AccessToken, ipc::PushNotification};
-use email::{
-    cache::{MessageCacheFetch, mailbox::MailboxCacheAccess},
-    mailbox::JUNK_ID,
-    message::ingest::{group::ThreadKey, recheck::ThreadRecheck},
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 };
 use http_proto::HttpSessionData;
 use jmap_proto::{
@@ -82,12 +76,12 @@ impl EmailImport for Server {
 
         // Obtain import access token
         let import_access_token = if account_id != access_token.account_id() {
-            #[cfg(stalwart_tests)]
+            #[cfg(feature = "test_mode")]
             {
                 AccessToken::from_id_maybe_invalid(account_id).into()
             }
 
-            #[cfg(not(stalwart_tests))]
+            #[cfg(not(feature = "test_mode"))]
             {
                 use common::auth::BuildAccessToken;
                 use trc::AddContext;
@@ -109,7 +103,6 @@ impl EmailImport for Server {
             not_created: VecMap::new(),
         };
 
-<<<<<<< HEAD
         // Ruling R31 (mail spec 6.3): no sealed source of another account
         // becomes this account's message; every id is checked before the
         // first import.
@@ -121,12 +114,10 @@ impl EmailImport for Server {
             }
         }
 
-=======
         let mut grouped = GroupedIngest::new(
             import_access_token.as_ref().unwrap_or(access_token),
             session.session_id,
         );
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
         let mut last_change_id = None;
         let mut recheck = ThreadRecheck::default();
         let grouping = request.emails.len() > 1;

@@ -29,11 +29,8 @@ use email::{
             BodyValueOptions, EmailNeeds, EmailRender,
             estimate::{EmailCost, EmailEstimate},
         },
-<<<<<<< HEAD
-        za::view::{ZaMailView, za_readable},
-=======
-        messagedata::{EmailMessageData, MetadataForm},
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+        messagedata::{EmailMessageData, MetadataForm, MetadataValue},
+        za::view::{ZaMailView, Zeroizing, za_has_attachment, za_readable},
     },
 };
 use jmap_proto::{
@@ -42,18 +39,8 @@ use jmap_proto::{
     request::{IntoValid, capability::CapabilityIds},
     types::date::UTCDate,
 };
-<<<<<<< HEAD
-use jmap_tools::{Key, Map, Value};
-use mail_parser::HeaderValue;
-use std::{borrow::Cow, future::Future};
-use store::{
-    ValueKey,
-    write::{AlignedBytes, Archive},
-};
-=======
 use jmap_tools::{Map, Value};
 use std::future::Future;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 use trc::{AddContext, StoreEvent};
 use types::{
     acl::Acl,
@@ -213,147 +200,31 @@ impl EmailGet for Server {
             list: Vec::with_capacity(ids.len()),
             not_found: not_found_ids,
         };
-<<<<<<< HEAD
 
-        // Check if we need to fetch the raw headers or body
-        let mut needs_body = false;
-        for property in &properties {
-            if matches!(
-                property,
-                EmailProperty::BodyValues
-                    | EmailProperty::TextBody
-                    | EmailProperty::HtmlBody
-                    | EmailProperty::Attachments
-                    | EmailProperty::BodyStructure
-            ) {
-                needs_body = true;
-                break;
-            }
-        }
         // Mail spec 7: the account's keys, once for the request. Only these
         // properties are served without the message's content (from the
         // cache and the stored stub's visible fields, whose blob hash is the
-        // view's); any other opens the stub.
+        // opened row's); any other opens the stub. A key account's
+        // `hasAttachment` is read from the opened row (ruling 55): its
+        // message stores no attachment keyword.
         let keys = self.za_mail_keys(access_token, account_id).await?;
-        let needs_content = !properties.iter().all(|property| {
-            matches!(
-                property,
-                EmailProperty::Id
-                    | EmailProperty::ThreadId
-                    | EmailProperty::BlobId
-                    | EmailProperty::MailboxIds
-                    | EmailProperty::Keywords
-                    | EmailProperty::Size
-                    | EmailProperty::ReceivedAt
-            )
-        });
+        let needs_content = keys.is_some()
+            && !properties.iter().all(|property| {
+                matches!(
+                    property,
+                    EmailProperty::Id
+                        | EmailProperty::ThreadId
+                        | EmailProperty::BlobId
+                        | EmailProperty::MailboxIds
+                        | EmailProperty::Keywords
+                        | EmailProperty::Size
+                        | EmailProperty::ReceivedAt
+                )
+            });
+        let za_reads_attachment =
+            keys.is_some() && properties.contains(&EmailProperty::HasAttachment);
+        let needs_metadata = needs_metadata || za_reads_attachment;
 
-        for id in ids {
-            // Obtain the email object
-            if !message_ids.contains(id.document_id()) {
-                response.push_not_found(id);
-                continue;
-            }
-            let metadata_ = match self
-                .store()
-                .get_value::<Archive<AlignedBytes>>(ValueKey::property(
-                    account_id,
-                    Collection::Email,
-                    id.document_id(),
-                    EmailField::Metadata,
-                ))
-                .await?
-            {
-                Some(metadata) => metadata,
-                None => {
-                    response.push_not_found(id);
-                    continue;
-                }
-            };
-            // Mail spec 7, 10: the unsealed view, when the properties read
-            // content; an unreadable message is not found.
-            let view = if needs_content {
-                let Some(view) = za_readable(
-                    self.za_metadata_view(
-                        &metadata_,
-                        keys.as_deref(),
-                        account_id,
-                        id.document_id(),
-                    )
-                    .await,
-                )?
-                else {
-                    response.push_not_found(id);
-                    continue;
-                };
-                view
-            } else {
-                Cow::Borrowed(&metadata_)
-            };
-            let metadata = view
-                .unarchive::<MessageMetadata>()
-                .caused_by(trc::location!())?;
-
-            // Obtain message data
-            let data = match cache.email_by_id(&id.document_id()) {
-                Some(data) => data,
-                None => {
-                    response.push_not_found(id);
-                    continue;
-                }
-            };
-
-            // Retrieve raw message if needed
-            let blob_hash = BlobHash::from(&metadata.blob_hash);
-            let raw_body;
-            let mut raw_message = ChainedBytes::new(metadata.raw_headers.as_ref());
-            if needs_body {
-                raw_body = match self
-                    .blob_store()
-                    .get_blob(blob_hash.as_slice(), 0..usize::MAX)
-                    .await?
-                {
-                    // Mail spec 7, 10: the opened blob (a view opened a stub).
-                    Some(bytes) => {
-                        let Some(bytes) = za_readable(
-                            self.za_open_message_blob(
-                                matches!(view, Cow::Owned(_)),
-                                keys.as_deref(),
-                                account_id,
-                                id.document_id(),
-                                bytes,
-                            )
-                            .await,
-                        )?
-                        else {
-                            response.push_not_found(id);
-                            continue;
-                        };
-                        Some(bytes)
-                    }
-                    None => None,
-                };
-
-                if let Some(raw_body) = &raw_body {
-                    raw_message.append(
-                        raw_body
-                            .get(metadata.blob_body_offset.to_native() as usize..)
-                            .unwrap_or_default(),
-                    );
-                } else {
-                    trc::event!(
-                        Store(StoreEvent::NotFound),
-                        AccountId = account_id,
-                        DocumentId = id.document_id(),
-                        Collection = Collection::Email,
-                        BlobId = blob_hash.to_hex(),
-                        Details = "Blob not found.",
-                        CausedBy = trc::location!(),
-                    );
-
-                    response.push_not_found(id);
-                    continue;
-=======
         let mut metadata_values = match &metadata {
             Some(metadata) => {
                 let mut documents = MetadataDocuments::default();
@@ -374,7 +245,9 @@ impl EmailGet for Server {
             None => None,
         };
 
-        let form = if needs.headers {
+        // A key account's stub is read as a row: its structure alone names
+        // only the sealed blob.
+        let form = if needs.headers || needs_content {
             MetadataForm::Row
         } else {
             MetadataForm::Structure
@@ -390,7 +263,6 @@ impl EmailGet for Server {
                     {
                         batch.request(id.document_id());
                     }
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                 }
             }
 
@@ -424,12 +296,43 @@ impl EmailGet for Server {
                         continue;
                     };
 
+                    // Mail spec 7, 10: a key account's stub opened into the
+                    // message's full row when the properties read content; an
+                    // unreadable message is not found.
+                    let opened = match (keys.as_deref(), metadata) {
+                        (Some(keys), Some(MetadataValue::Row(row))) if needs_content => {
+                            match za_readable(
+                                self.za_open_metadata_row(
+                                    row,
+                                    Some(keys),
+                                    account_id,
+                                    id.document_id(),
+                                )
+                                .await,
+                            )? {
+                                Some(opened) => opened.map(MetadataValue::Row),
+                                None => {
+                                    response.push_not_found(id);
+                                    continue;
+                                }
+                            }
+                        }
+                        _ => None,
+                    };
+                    let is_sealed = opened.is_some();
+                    let metadata = opened.as_ref().or(metadata);
+
                     let raw_headers;
                     let mut blob = None;
+                    let mut za_blob: Option<(Zeroizing<Vec<u8>>, MemoryReservation)> = None;
+                    let mut za_has_attachments = None;
                     let mut cost = EmailCost::default();
                     let render = if let Some(metadata) = metadata {
                         raw_headers = metadata.raw_headers().caused_by(trc::location!())?;
                         let metadata = metadata.unarchive().caused_by(trc::location!())?;
+                        if za_reads_attachment {
+                            za_has_attachments = Some(za_has_attachment(metadata));
+                        }
                         cost = estimate.cost(metadata);
                         budget.add(cost.bytes)?;
                         budget.add_light(cost.light)?;
@@ -452,7 +355,30 @@ impl EmailGet for Server {
                                 response.push_not_found(id);
                                 continue;
                             };
-                            blob = Some(value);
+                            if is_sealed {
+                                // Mail spec 7, 10: the opened blob, held in a
+                                // `Zeroizing` buffer under the stored bytes'
+                                // reservation; one that does not open is not
+                                // found.
+                                let (bytes, memory) = value.into_parts();
+                                let Some(bytes) = za_readable(
+                                    self.za_open_message_blob(
+                                        true,
+                                        keys.as_deref(),
+                                        account_id,
+                                        id.document_id(),
+                                        bytes,
+                                    )
+                                    .await,
+                                )?
+                                else {
+                                    response.push_not_found(id);
+                                    continue;
+                                };
+                                za_blob = Some((bytes, memory));
+                            } else {
+                                blob = Some(value);
+                            }
                         }
                         Some((
                             metadata,
@@ -474,7 +400,10 @@ impl EmailGet for Server {
                         EmailRender::new(
                             metadata,
                             *headers,
-                            blob.as_deref(),
+                            za_blob
+                                .as_ref()
+                                .map(|(bytes, _)| bytes.as_slice())
+                                .or(blob.as_deref()),
                             blob_id,
                             &body_properties,
                             &options,
@@ -532,7 +461,8 @@ impl EmailGet for Server {
                             EmailProperty::HasAttachment => {
                                 email.insert_unchecked(
                                     EmailProperty::HasAttachment,
-                                    (data.keywords() & 1 << HASATTACHMENT) != 0,
+                                    za_has_attachments
+                                        .unwrap_or((data.keywords() & 1 << HASATTACHMENT) != 0),
                                 );
                             }
                             _ => {

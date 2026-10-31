@@ -6,27 +6,20 @@
 
 use super::embedded::EmbeddedBlobs;
 use common::{
-    GroupwareResourceRef, GroupwareResources, Server, auth::AccessToken, sharing::EffectiveAcl,
-    storage::blob::FetchedBlob,
+    GroupwareResourceRef, GroupwareResources, Server,
+    auth::AccessToken,
+    sharing::EffectiveAcl,
+    storage::blob::{FetchedBlob, SectionDecode},
 };
 use email::cache::MessageCacheFetch;
 use email::cache::email::MessageCacheAccess;
-<<<<<<< HEAD
-use email::message::metadata::MessageMetadata;
-use email::message::za::view::{ZaMailView, Zeroizing, za_readable};
-use groupware::cache::GroupwareCache;
-use mail_parser::{
-    Encoding,
-    decoders::{base64::base64_decode, quoted_printable::quoted_printable_decode},
-};
-=======
 use email::cache::mailbox::MailboxCacheAccess;
 use email::message::metadata::MetadataRow;
+use email::message::za::view::{ZaMailView, za_readable};
 use groupware::cache::GroupwareCache;
 use hyper::body::Bytes;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 use registry::schema::enums::Permission;
-use std::{borrow::Cow, future::Future};
+use std::future::Future;
 use store::ValueKey;
 use trc::AddContext;
 use types::acl::Acl;
@@ -138,78 +131,6 @@ impl BlobDownload for Server {
         &self,
         blob_id: &BlobId,
         access_token: &AccessToken,
-<<<<<<< HEAD
-    ) -> trc::Result<Option<Vec<u8>>> {
-        if self.has_access_blob(blob_id, access_token).await? {
-            // Mail spec 5.7, 7: a key account's message or upload, opened
-            // with the request's keys.
-            if self.za_is_sealed_source(blob_id).await? {
-                return match blob_id.class {
-                    BlobClass::Linked {
-                        account_id,
-                        document_id,
-                        ..
-                    } => {
-                        za_download_message(self, blob_id, access_token, account_id, document_id)
-                            .await
-                    }
-                    BlobClass::Reserved { account_id, .. } => {
-                        za_download_upload(self, blob_id, access_token, account_id).await
-                    }
-                };
-            }
-            if let Some(section) = &blob_id.section {
-                self.get_blob_section(&blob_id.hash, section)
-                    .await
-                    .caused_by(trc::location!())
-            } else {
-                let blob = self
-                    .blob_store()
-                    .get_blob(blob_id.hash.as_slice(), 0..usize::MAX)
-                    .await
-                    .caused_by(trc::location!());
-                match (&blob_id.class, blob) {
-                    (
-                        BlobClass::Linked {
-                            account_id,
-                            collection,
-                            document_id,
-                        },
-                        Ok(Some(data)),
-                    ) if *collection == Collection::Email as u8 => {
-                        let Some(archive) = self
-                            .store()
-                            .get_value::<Archive<AlignedBytes>>(ValueKey::property(
-                                *account_id,
-                                Collection::Email,
-                                *document_id,
-                                EmailField::Metadata,
-                            ))
-                            .await
-                            .caused_by(trc::location!())?
-                        else {
-                            return Ok(Some(data));
-                        };
-                        let metadata = archive
-                            .to_unarchived::<MessageMetadata>()
-                            .caused_by(trc::location!())?;
-                        let body_offset = metadata.inner.blob_body_offset.to_native();
-                        if metadata.inner.root_part().offset_body.to_native() != body_offset {
-                            let raw_message = ChainedBytes::new(
-                                metadata.inner.raw_headers.as_ref(),
-                            )
-                            .with_last(data.get(body_offset as usize..).unwrap_or_default());
-                            Ok(Some(raw_message.to_bytes()))
-                        } else {
-                            Ok(Some(data))
-                        }
-                    }
-                    (_, blob) => blob,
-                }
-            }
-        } else {
-            Ok(None)
-=======
     ) -> trc::Result<Option<FetchedBlob>> {
         self.blob_download_with_extra(blob_id, access_token)
             .await
@@ -248,13 +169,32 @@ impl BlobDownload for Server {
                     .map(|blob| Some(BlobContents::Plain(blob))),
                 None => Ok(None),
             };
-        } else if let Some(section) = &blob_id.section {
+        }
+        // Mail spec 5.7, 7: a key account's message or upload, opened with
+        // the request's keys, before any read of the stored bytes.
+        if self.za_is_sealed_source(blob_id).await? {
+            return match blob_id.class {
+                BlobClass::Linked {
+                    account_id,
+                    document_id,
+                    ..
+                } => {
+                    za_download_message(self, blob_id, access_token, account_id, document_id, size)
+                        .await
+                }
+                BlobClass::Reserved { account_id, .. } => {
+                    za_download_upload(self, blob_id, access_token, account_id, size).await
+                }
+                // Answered above: no embedded blob of a message exists.
+                BlobClass::Embedded { .. } => Ok(None),
+            };
+        }
+        if let Some(section) = &blob_id.section {
             return self
                 .fetch_blob_section(&blob_id.hash, section, size)
                 .await
                 .caused_by(trc::location!())
                 .map(|blob| blob.map(BlobContents::Plain));
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
         }
 
         let Some(blob) = self
@@ -300,57 +240,6 @@ impl BlobDownload for Server {
         &self,
         blob_id: &BlobId,
         access_token: &AccessToken,
-<<<<<<< HEAD
-    ) -> trc::Result<bool> {
-        Ok(
-            (blob_id.class.is_superuser() && access_token.has_permission(Permission::FetchAnyBlob))
-                || (self
-                    .store()
-                    .blob_has_access(&blob_id.hash, &blob_id.class)
-                    .await
-                    .caused_by(trc::location!())?
-                    && match &blob_id.class {
-                        BlobClass::Linked {
-                            account_id,
-                            collection,
-                            document_id,
-                        } => {
-                            if matches!(
-                                Collection::from(*collection),
-                                Collection::Calendar | Collection::CalendarEvent
-                            ) && self
-                                .za_is_key_account(*account_id)
-                                .await
-                                .caused_by(trc::location!())?
-                            {
-                                // Spec 9: never for a key account's calendar data.
-                                false
-                            } else if access_token.is_member(*account_id) {
-                                true
-                            } else {
-                                match Collection::from(*collection) {
-                                    Collection::Email => self
-                                        .get_cached_messages(*account_id)
-                                        .await
-                                        .caused_by(trc::location!())?
-                                        .shared_messages(access_token, Acl::ReadItems)
-                                        .contains(*document_id),
-                                    collection @ (Collection::FileNode
-                                    | Collection::ContactCard
-                                    | Collection::CalendarEvent) => self
-                                        .fetch_dav_resources(
-                                            access_token.account_id(),
-                                            *account_id,
-                                            SyncCollection::from(collection),
-                                        )
-                                        .await
-                                        .caused_by(trc::location!())?
-                                        .shared_items(access_token, [Acl::ReadItems], true)
-                                        .contains(*document_id),
-                                    _ => false,
-                                }
-                            }
-=======
     ) -> trc::Result<BlobAccess> {
         if let BlobClass::Embedded {
             account_id,
@@ -358,6 +247,10 @@ impl BlobDownload for Server {
             document_id,
         } = &blob_id.class
         {
+            // Spec 9: never for a key account's calendar data.
+            if za_calendar_data(self, *collection, *account_id).await? {
+                return Ok(BlobAccess::Denied);
+            }
             return self
                 .has_access_embedded_blob(access_token, *account_id, *collection, *document_id)
                 .await
@@ -389,7 +282,10 @@ impl BlobDownload for Server {
                 collection,
                 document_id,
             } => {
-                if access_token.is_member(*account_id) {
+                if za_calendar_data(self, *collection, *account_id).await? {
+                    // Spec 9: never for a key account's calendar data.
+                    false
+                } else if access_token.is_member(*account_id) {
                     true
                 } else {
                     match Collection::from(*collection) {
@@ -411,7 +307,6 @@ impl BlobDownload for Server {
                                     )
                                 })
                             })
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                         }
                         Collection::FileNode => self
                             .fetch_groupware_resources(
@@ -454,24 +349,41 @@ impl BlobDownload for Server {
     }
 }
 
-<<<<<<< HEAD
+/// Spec 9: whether a blob of `collection` in `account_id` is a key account's
+/// calendar data, which no blob route serves.
+async fn za_calendar_data(server: &Server, collection: u8, account_id: u32) -> trc::Result<bool> {
+    if matches!(
+        Collection::from(collection),
+        Collection::Calendar | Collection::CalendarEvent
+    ) {
+        server
+            .za_is_key_account(account_id)
+            .await
+            .caused_by(trc::location!())
+    } else {
+        Ok(false)
+    }
+}
+
 /// Mail spec 5.7, 7: a key account's message, or a section of it, read
 /// through the unsealed pair as upstream reads the stored one: a section id
-/// applies its offsets, which Email/get translated to stored-blob
-/// coordinates, to the opened blob and transfer-decodes the section; a
-/// whole-message id reconstructs `raw_headers || opened[blob_body_offset..]`.
-/// An unreadable message is not found (spec 10).
+/// applies its offsets, which Email/get took from the opened row (the
+/// plaintext blob's coordinates), to the opened blob and transfer-decodes
+/// the section; a whole-message id pairs the opened row's header section
+/// with `opened[blob_body_offset..]` when they differ, as upstream's
+/// `BlobContents::Message`. An unreadable message is not found (spec 10).
 async fn za_download_message(
     server: &Server,
     blob_id: &BlobId,
     access_token: &AccessToken,
     account_id: u32,
     document_id: u32,
-) -> trc::Result<Option<Vec<u8>>> {
+    size: Option<u64>,
+) -> trc::Result<Option<BlobContents>> {
     let keys = server.za_mail_keys(access_token, account_id).await?;
     let Some(stored) = server
         .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::property(
+        .get_value::<MetadataRow>(ValueKey::immutable(
             account_id,
             Collection::Email,
             document_id,
@@ -484,15 +396,14 @@ async fn za_download_message(
     };
     let Some(view) = za_readable(
         server
-            .za_metadata_view(&stored, keys.as_deref(), account_id, document_id)
+            .za_metadata_view(stored, keys.as_deref(), account_id, document_id)
             .await,
     )?
     else {
         return Ok(None);
     };
     let Some(blob) = server
-        .blob_store()
-        .get_blob(blob_id.hash.as_slice(), 0..usize::MAX)
+        .fetch_blob(&blob_id.hash, 0..usize::MAX, size)
         .await
         .caused_by(trc::location!())?
     else {
@@ -501,11 +412,11 @@ async fn za_download_message(
     let Some(mut opened) = za_readable(
         server
             .za_open_message_blob(
-                matches!(view, Cow::Owned(_)),
+                view.opened,
                 keys.as_deref(),
                 account_id,
                 document_id,
-                blob,
+                blob.into_bytes(),
             )
             .await,
     )?
@@ -513,22 +424,32 @@ async fn za_download_message(
         return Ok(None);
     };
     if let Some(section) = &blob_id.section {
-        return Ok(decode_section(&opened, section));
+        return decode_section(&opened, section)
+            .map(|bytes| server.account_blob(bytes).map(BlobContents::Plain))
+            .transpose();
     }
-    let metadata = view
-        .unarchive::<MessageMetadata>()
-        .caused_by(trc::location!())?;
-    let body_offset = metadata.blob_body_offset.to_native();
-    if metadata.root_part().offset_body.to_native() != body_offset {
-        Ok(Some(
-            ChainedBytes::new(metadata.raw_headers.as_ref())
-                .with_last(opened.get(body_offset as usize..).unwrap_or_default())
-                .to_bytes(),
-        ))
+    let metadata = view.row.unarchive().caused_by(trc::location!())?;
+    let body_offset = metadata.blob_body_offset();
+    let headers = if metadata.headers_len() != body_offset {
+        Some(
+            view.row
+                .raw_headers()
+                .caused_by(trc::location!())?
+                .into_owned(),
+        )
     } else {
-        // The bytes leave in the HTTP body.
-        Ok(Some(std::mem::take(&mut *opened)))
-    }
+        None
+    };
+    // The bytes leave in the HTTP body.
+    let blob = server.account_blob(std::mem::take(&mut *opened))?;
+    Ok(Some(match headers {
+        Some(headers) => BlobContents::Message {
+            headers,
+            body_offset,
+            blob,
+        },
+        None => BlobContents::Plain(blob),
+    }))
 }
 
 /// Mail spec 5.7, 7: a key account's upload, opened whole with the
@@ -540,11 +461,11 @@ async fn za_download_upload(
     blob_id: &BlobId,
     access_token: &AccessToken,
     account_id: u32,
-) -> trc::Result<Option<Vec<u8>>> {
+    size: Option<u64>,
+) -> trc::Result<Option<BlobContents>> {
     let keys = server.za_mail_keys(access_token, account_id).await?;
     let Some(blob) = server
-        .blob_store()
-        .get_blob(blob_id.hash.as_slice(), 0..usize::MAX)
+        .fetch_blob(&blob_id.hash, 0..usize::MAX, size)
         .await
         .caused_by(trc::location!())?
     else {
@@ -552,8 +473,11 @@ async fn za_download_upload(
     };
     let mut opened = match keys {
         Some(keys) => {
-            let Some(opened) =
-                za_readable(server.za_open_upload_blob(&keys, account_id, blob).await)?
+            let Some(opened) = za_readable(
+                server
+                    .za_open_upload_blob(&keys, account_id, blob.into_bytes())
+                    .await,
+            )?
             else {
                 return Ok(None);
             };
@@ -561,31 +485,36 @@ async fn za_download_upload(
         }
         // `za_mail_keys` answers `None` only for an account that is not a
         // key account (any longer): the bytes as stored.
-        None => Zeroizing::new(blob),
+        None => return Ok(Some(BlobContents::Plain(blob))),
     };
-    Ok(match &blob_id.section {
-        Some(section) => decode_section(&opened, section),
+    let bytes = match &blob_id.section {
+        Some(section) => match decode_section(&opened, section) {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        },
         // The bytes leave in the HTTP body.
-        None => Some(std::mem::take(&mut *opened)),
-    })
+        None => std::mem::take(&mut *opened),
+    };
+    server
+        .account_blob(bytes)
+        .map(|blob| Some(BlobContents::Plain(blob)))
 }
 
-/// `get_blob_section` on bytes in memory: the blob store's range read (from
-/// offset 0 a range is cut at the end of the blob, any other range out of
-/// it reads empty), then the section's transfer decoding.
+/// `fetch_blob_section` on bytes in memory: the blob store's range read of
+/// the section's outermost range (from offset 0 a range is cut at the end of
+/// the blob, any other range out of it reads empty, as `BlobStore::get_blob`),
+/// then upstream's decoding of the section's containers and part
+/// (`SectionDecode::decode_fetched`).
 fn decode_section(bytes: &[u8], section: &BlobSection) -> Option<Vec<u8>> {
-    let end = section.offset_start.saturating_add(section.size);
-    let bytes = if section.offset_start == 0 {
-        &bytes[..end.min(bytes.len())]
+    let range = section.fetch_range();
+    let fetched = if range.start == 0 {
+        &bytes[..range.end.min(bytes.len())]
     } else {
-        bytes.get(section.offset_start..end).unwrap_or_default()
+        bytes.get(range).unwrap_or_default()
     };
-    match Encoding::from(section.encoding) {
-        Encoding::None => Some(bytes.to_vec()),
-        Encoding::Base64 => base64_decode(bytes),
-        Encoding::QuotedPrintable => quoted_printable_decode(bytes),
-    }
-=======
+    section.decode_fetched(fetched.to_vec())
+}
+
 pub(crate) fn is_shared_item_readable(
     resources: &GroupwareResources,
     item: GroupwareResourceRef<'_>,
@@ -594,5 +523,4 @@ pub(crate) fn is_shared_item_readable(
     item.child_names()
         .iter()
         .any(|name| resources.has_access_to_container(access_token, name.parent_id, Acl::ReadItems))
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 }

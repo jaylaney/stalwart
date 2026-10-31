@@ -12,11 +12,8 @@ use crate::{
         query::{RegistryQueryFilters, with_page_position},
     },
 };
-<<<<<<< HEAD
-use email::message::za::view::ZaMailView;
-=======
 use compact_str::format_compact;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+use email::message::za::view::ZaMailView;
 use jmap_proto::{error::set::SetError, types::state::State};
 use jmap_tools::JsonPointer;
 use mail_parser::{MessageParser, thread_name};
@@ -86,11 +83,8 @@ pub(crate) async fn spam_sample_set(
             continue;
         }
 
-<<<<<<< HEAD
         // Mail spec 5.7, ruling R32: a sealed source never becomes a sample.
         set.server.za_refuse_raw_source(&sample.blob_id).await?;
-        let Some(bytes) = set
-=======
         if sample.blob_id.section.is_some()
             || matches!(sample.blob_id.class, BlobClass::Embedded { .. })
         {
@@ -104,7 +98,6 @@ pub(crate) async fn spam_sample_set(
         }
 
         let Some(blob) = set
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
             .server
             .blob_download_with_extra(&sample.blob_id, set.access_token)
             .await?

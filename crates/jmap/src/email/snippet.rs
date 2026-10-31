@@ -4,17 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-<<<<<<< HEAD
 use crate::email::za::za_refuse_snippet_terms;
-use common::{Server, auth::AccessToken};
-use email::{
-    cache::{MessageCacheFetch, email::MessageCacheAccess},
-    message::{
-        metadata::{
-            ArchivedMetadataPartType, DecodedPartContent, MessageMetadata, MetadataHeaderName,
-        },
-        za::view::{ZaMailView, za_readable},
-=======
 use common::{
     Server,
     auth::AccessToken,
@@ -27,9 +17,9 @@ use email::{
         mailbox::MailboxCacheAccess,
     },
     message::{
-        messagedata::{EmailMessageData, MetadataForm},
+        messagedata::{EmailMessageData, MetadataForm, MetadataValue},
         metadata::{PartKind, PartSource},
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+        za::view::{ZaMailView, za_readable},
     },
 };
 use jmap_proto::{
@@ -41,7 +31,7 @@ use jmap_proto::{
     request::MaybeInvalid,
 };
 use nlp::language::{Language, search_snippet::generate_snippet, stemmer::Stemmer};
-use std::{borrow::Cow, future::Future};
+use std::future::Future;
 use store::{
     backend::MAX_TOKEN_LENGTH,
     search::{MAX_PLANNED_TOKENS, MAX_QUERY_LEAVES, MAX_QUERY_PLANNED_TOKENS},
@@ -167,10 +157,6 @@ impl EmailSearchSnippet for Server {
         let mut not_found = Vec::new();
         let mut batch = DocumentBatch::new(MAX_BATCH_BYTES);
 
-<<<<<<< HEAD
-        if email_ids.len() > self.core.jmap.snippet_max_results {
-            return Err(trc::JmapEvent::RequestTooLarge.into_err());
-        }
         // Mail spec 7, 8: the account's keys, once for the request; without
         // terms nothing is read. Defence in depth: a key account's request
         // with terms is refused above, so this branch and the sealed reads
@@ -180,101 +166,14 @@ impl EmailSearchSnippet for Server {
         } else {
             self.za_mail_keys(access_token, account_id).await?
         };
+        // A key account's stub is read as a row: its structure alone names
+        // only the sealed blob.
+        let form = if keys.is_some() {
+            MetadataForm::Row
+        } else {
+            MetadataForm::Structure
+        };
 
-        for email_id in email_ids {
-            let email_id = match email_id {
-                MaybeInvalid::Value(email_id) => email_id,
-                invalid => {
-                    not_found.push(invalid);
-                    continue;
-                }
-            };
-            let document_id = email_id.document_id();
-            let mut snippet = SearchSnippet {
-                email_id,
-                subject: None,
-                preview: None,
-            };
-            if !document_ids.contains(document_id) {
-                not_found.push(MaybeInvalid::Value(email_id));
-                continue;
-            } else if terms.is_empty() {
-                response.list.push(snippet);
-                continue;
-            }
-            let metadata_ = match self
-                .store()
-                .get_value::<Archive<AlignedBytes>>(ValueKey::property(
-                    account_id,
-                    Collection::Email,
-                    document_id,
-                    EmailField::Metadata,
-                ))
-                .await?
-            {
-                Some(metadata) => metadata,
-                None => {
-                    not_found.push(MaybeInvalid::Value(email_id));
-                    continue;
-                }
-            };
-            // Mail spec 7, 10: the unsealed view; an unreadable message is
-            // not found.
-            let Some(view) = za_readable(
-                self.za_metadata_view(&metadata_, keys.as_deref(), account_id, document_id)
-                    .await,
-            )?
-            else {
-                not_found.push(MaybeInvalid::Value(email_id));
-                continue;
-            };
-            let metadata = view
-                .unarchive::<MessageMetadata>()
-                .caused_by(trc::location!())?;
-
-            // Add subject snippet
-            let contents = &metadata.contents[0];
-            if let Some(subject) = contents
-                .root_part()
-                .header_value(&MetadataHeaderName::Subject)
-                .and_then(|v| v.as_text())
-                .and_then(|v| generate_snippet(v, &terms, language, is_exact))
-            {
-                snippet.subject = subject.into();
-            }
-
-            // Download message
-            let raw_body = if let Some(raw_body) = self
-                .blob_store()
-                .get_blob(metadata.blob_hash.0.as_slice(), 0..usize::MAX)
-                .await?
-            {
-                let Some(raw_body) = za_readable(
-                    self.za_open_message_blob(
-                        matches!(view, Cow::Owned(_)),
-                        keys.as_deref(),
-                        account_id,
-                        document_id,
-                        raw_body,
-                    )
-                    .await,
-                )?
-                else {
-                    not_found.push(MaybeInvalid::Value(email_id));
-                    continue;
-                };
-                raw_body
-            } else {
-                trc::event!(
-                    Store(trc::StoreEvent::NotFound),
-                    AccountId = account_id,
-                    DocumentId = email_id.document_id(),
-                    Collection = Collection::Email,
-                    BlobId = metadata.blob_hash.0.as_slice(),
-                    Details = "Blob not found.",
-                    CausedBy = trc::location!(),
-                );
-=======
         for chunk in email_ids.chunks(MAX_BATCH_DOCUMENTS) {
             batch.reset();
             if !terms.is_empty() {
@@ -290,10 +189,9 @@ impl EmailSearchSnippet for Server {
             }
 
             loop {
-                self.read_metadata_batch(account_id, MetadataForm::Structure, &mut batch)
+                self.read_metadata_batch(account_id, form, &mut batch)
                     .await
                     .caused_by(trc::location!())?;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
                 for email_id in chunk {
                     let email_id = match email_id {
@@ -331,6 +229,23 @@ impl EmailSearchSnippet for Server {
                         }
                         Lookup::Skip => continue,
                     };
+                    // Mail spec 7, 10: the unsealed view; an unreadable
+                    // message is not found.
+                    let opened = match (keys.as_deref(), structure) {
+                        (Some(keys), MetadataValue::Row(row)) => match za_readable(
+                            self.za_open_metadata_row(row, Some(keys), account_id, document_id)
+                                .await,
+                        )? {
+                            Some(opened) => opened.map(MetadataValue::Row),
+                            None => {
+                                not_found.push(MaybeInvalid::Value(email_id));
+                                continue;
+                            }
+                        },
+                        _ => None,
+                    };
+                    let is_sealed = opened.is_some();
+                    let structure = opened.as_ref().unwrap_or(structure);
                     let metadata = structure.unarchive().caused_by(trc::location!())?;
                     let root = metadata.root();
 
@@ -362,7 +277,33 @@ impl EmailSearchSnippet for Server {
                         not_found.push(MaybeInvalid::Value(email_id));
                         continue;
                     };
-                    let raw = metadata.raw_message(None, &raw_body);
+                    // Mail spec 7, 10: the opened blob (the view opened a
+                    // stub), under the stored bytes' reservation.
+                    let raw_body = if is_sealed {
+                        let (bytes, memory) = raw_body.into_parts();
+                        let Some(bytes) = za_readable(
+                            self.za_open_message_blob(
+                                true,
+                                keys.as_deref(),
+                                account_id,
+                                document_id,
+                                bytes,
+                            )
+                            .await,
+                        )?
+                        else {
+                            not_found.push(MaybeInvalid::Value(email_id));
+                            continue;
+                        };
+                        Ok((bytes, memory))
+                    } else {
+                        Err(raw_body)
+                    };
+                    let raw_body: &[u8] = match &raw_body {
+                        Ok((bytes, _)) => bytes,
+                        Err(blob) => blob,
+                    };
+                    let raw = metadata.raw_message(None, raw_body);
                     let source = PartSource::Raw(raw);
 
                     // Find a matching part

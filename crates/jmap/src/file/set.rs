@@ -19,18 +19,12 @@ use crate::{
     },
     changes::state::JmapCacheState,
 };
-<<<<<<< HEAD
-use common::{DavResourceMetadata, DavResources, Server, auth::AccessToken, sharing::EffectiveAcl};
-use email::message::za::view::ZaMailView;
-use groupware::{DestroyArchive, cache::GroupwareCache, file::FileNode};
-=======
 use common::{
     Server,
     auth::AccessToken,
     storage::dav::{FILE_KIND_DIRECTORY, FilePresence},
 };
 use groupware::{cache::GroupwareCache, file::FileNode};
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 use http_proto::HttpSessionData;
 use jmap_proto::{
     error::set::SetError,
@@ -207,54 +201,6 @@ impl FileNodeSet for Server {
             writer = writer.with_quota().await?;
         }
 
-<<<<<<< HEAD
-        // Process creates
-        let mut batch = BatchBuilder::new();
-        let mut created_folders = AHashMap::new();
-        'create: for (id, object) in request.unwrap_create() {
-            let mut file_node = FileNode::default();
-
-            // Process changes
-            let has_acl_changes =
-                match update_file_node(None, object, &mut file_node, true, &response) {
-                    Ok(result) => {
-                        if let Some(blob_id) = result.blob_id {
-                            // Mail spec 5.7: a sealed source is never a file's blob.
-                            self.za_refuse_raw_source(&blob_id).await?;
-                            let file_details = file_node.file.get_or_insert_default();
-                            if !self.has_access_blob(&blob_id, access_token).await? {
-                                response.not_created.append(
-                                    id,
-                                    SetError::forbidden().with_description(format!(
-                                        "You do not have access to blobId {blob_id}."
-                                    )),
-                                );
-                                continue;
-                            } else if let Some(blob_contents) = self
-                                .blob_store()
-                                .get_blob(blob_id.hash.as_slice(), 0..usize::MAX)
-                                .await?
-                            {
-                                file_details.size = blob_contents.len() as u32;
-                            } else {
-                                response.not_created.append(
-                                    id,
-                                    SetError::invalid_properties()
-                                        .with_property(FileNodeProperty::BlobId)
-                                        .with_description("Blob could not be found."),
-                                );
-                                continue 'create;
-                            }
-
-                            file_details.blob_hash = blob_id.hash;
-                        }
-
-                        // Validate blob hash
-                        if file_node
-                            .file
-                            .as_ref()
-                            .is_some_and(|f| f.blob_hash.is_empty())
-=======
         let moving = request
             .update
             .as_ref()
@@ -266,7 +212,6 @@ impl FileNodeSet for Server {
                             if object.as_object().is_some_and(|object| {
                                 object.contains_key(&Key::Property(FileNodeProperty::ParentId))
                             }) =>
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                         {
                             Some(id.document_id())
                         }
@@ -323,140 +268,10 @@ impl FileNodeSet for Server {
                 .metadata
                 .extract(MetadataPatches::for_update(), &mut object)
             {
-<<<<<<< HEAD
-                file_node_
-            } else {
-                response.not_updated.append(id, SetError::not_found());
-                continue 'update;
-            };
-            let file_node = file_node_
-                .to_unarchived::<FileNode>()
-                .caused_by(trc::location!())?;
-            let mut new_file_node = file_node
-                .deserialize::<FileNode>()
-                .caused_by(trc::location!())?;
-
-            // Apply changes
-            let (has_acl_changes, modified_set) =
-                match update_file_node(Some(id), object, &mut new_file_node, false, &response) {
-                    Ok(result) => {
-                        let modified_set = result.modified_set;
-                        if let Some(blob_id) = result.blob_id {
-                            // Mail spec 5.7: a sealed source is never a file's blob.
-                            self.za_refuse_raw_source(&blob_id).await?;
-                            let file_details = new_file_node.file.get_or_insert_default();
-                            if !self.has_access_blob(&blob_id, access_token).await? {
-                                response.not_updated.append(
-                                    id,
-                                    SetError::forbidden().with_description(format!(
-                                        "You do not have access to blobId {blob_id}."
-                                    )),
-                                );
-                                continue;
-                            } else if let Some(blob_contents) = self
-                                .blob_store()
-                                .get_blob(blob_id.hash.as_slice(), 0..usize::MAX)
-                                .await?
-                            {
-                                file_details.size = blob_contents.len() as u32;
-                            } else {
-                                response.not_updated.append(
-                                    id,
-                                    SetError::invalid_properties()
-                                        .with_property(FileNodeProperty::BlobId)
-                                        .with_description("Blob could not be found."),
-                                );
-                                continue 'update;
-                            }
-
-                            file_details.blob_hash = blob_id.hash;
-                        }
-
-                        (result.has_acl_changes, modified_set)
-                    }
-                    Err(err) => {
-                        response.not_updated.append(id, err);
-                        continue 'update;
-                    }
-                };
-
-            // Validate hierarchy
-            if let Err(err) = validate_file_node_hierarchy(
-                Some(document_id),
-                &new_file_node,
-                is_shared,
-                &cache,
-                &created_folders,
-            ) {
-                response.not_updated.append(id, err);
-                continue 'update;
-            }
-
-            let renamed = match find_sibling_collision(
-                Some(document_id),
-                &new_file_node,
-                &cache,
-                &pending_names,
-                case_insensitive,
-            ) {
-                Collision::None => false,
-                Collision::Existing(existing) => {
-                    let effective = match on_exists {
-                        OnExists::Newest => {
-                            let existing_modified =
-                                fetch_existing_modified(self.store(), account_id, existing).await?;
-                            if new_file_node.modified > existing_modified {
-                                OnExists::Replace
-                            } else {
-                                response.not_updated.append(
-                                    id,
-                                    SetError::already_exists().with_existing_id(Id::from(existing)),
-                                );
-                                continue 'update;
-                            }
-                        }
-                        other => other,
-                    };
-                    match effective {
-                        OnExists::Reject => {
-                            response.not_updated.append(
-                                id,
-                                SetError::already_exists().with_existing_id(Id::from(existing)),
-                            );
-                            continue 'update;
-                        }
-                        OnExists::Rename => {
-                            new_file_node.name = pick_unique_rename(
-                                &new_file_node.name,
-                                Some(document_id),
-                                new_file_node.parent_id,
-                                &cache,
-                                &pending_names,
-                                case_insensitive,
-                            );
-                            true
-                        }
-                        OnExists::Replace => {
-                            if let Some(target) = cache.any_resource_path_by_id(existing) {
-                                let subtree_len = cache.subtree(target.path()).count();
-                                if subtree_len > 1 && !on_destroy_remove_children {
-                                    response
-                                        .not_updated
-                                        .append(id, SetError::node_has_children());
-                                    continue 'update;
-                                }
-                            }
-                            implicit_destroys.insert(existing);
-                            false
-                        }
-                        OnExists::Newest => unreachable!(),
-                    }
-=======
                 Ok(patches) => patches,
                 Err(err) => {
                     response.not_updated.append(id, err);
                     continue;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                 }
             };
             let resolver = CreateResolver::new(&pending_creates);

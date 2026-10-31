@@ -4,14 +4,6 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-<<<<<<< HEAD
-use crate::{
-    api::query::QueryResponseBuilder, changes::state::JmapCacheState,
-    email::za::za_refuse_content_query,
-};
-use common::{MessageStoreCache, Server, auth::AccessToken};
-use email::cache::{MessageCacheFetch, email::MessageCacheAccess};
-=======
 mod filter;
 mod text;
 mod window;
@@ -27,6 +19,7 @@ use crate::{
         query::QueryResponseBuilder,
     },
     changes::state::JmapCacheState,
+    email::za::za_refuse_content_query,
 };
 use common::{
     MessageStoreCache, MessagesCache, Server, auth::AccessToken, cache::email::MessageRef,
@@ -43,7 +36,6 @@ use email::{
     },
 };
 use filter::{QueryFilter, RowFilter};
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 use jmap_proto::{
     method::query::{Comparator, Filter, QueryRequest, QueryResponse},
     object::email::{Email, EmailComparator, EmailQueryFilter},
@@ -117,7 +109,6 @@ impl EmailQuery for Server {
         using: CapabilityIds,
     ) -> trc::Result<QueryResponse> {
         let account_id = request.account_id.document_id();
-<<<<<<< HEAD
 
         // Mail spec 8: a key account's search index holds the arrival time
         // and the size only; a filter or sort that needs content is refused
@@ -132,13 +123,9 @@ impl EmailQuery for Server {
         )
         .await?;
 
-        let mut filters = Vec::with_capacity(request.filter.len());
-        let cached_messages = self
-=======
         let object_metadata = ObjectMetadata::new(self, access_token, using, MetadataType::Email);
         let sampled = object_metadata.viewer_change_id(self, account_id).await?;
         let cache = self
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
             .get_cached_messages(account_id)
             .await
             .caused_by(trc::location!())?;

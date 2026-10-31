@@ -5,16 +5,14 @@
  */
 
 use crate::{
-<<<<<<< HEAD
-    api::request::za_assert_mail_keys,
-    blob::download::BlobDownload,
-=======
-    api::metadata::{
-        MetadataAccess, MetadataPatches, MetadataTarget, MetadataType, MetadataWriter, NewMetadata,
-        ObjectMetadata,
+    api::{
+        metadata::{
+            MetadataAccess, MetadataPatches, MetadataTarget, MetadataType, MetadataWriter,
+            NewMetadata, ObjectMetadata,
+        },
+        request::za_assert_mail_keys,
     },
     blob::download::{BlobAccess, BlobDownload},
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
     changes::state::JmapCacheState,
     email::{
         PatchResult,
@@ -23,13 +21,8 @@ use crate::{
     },
 };
 use common::{
-<<<<<<< HEAD
-    Server, auth::AccessToken, ipc::PushNotification, storage::index::ObjectIndexBuilder,
-    za::ZA_MAIL_KEYLESS,
-=======
     MAX_RECEIVED_AT, MessageUid, Server, auth::AccessToken, ipc::PushNotification,
-    network::memory::MemoryReservation, storage::index::ObjectIndexBuilder,
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+    network::memory::MemoryReservation, storage::index::ObjectIndexBuilder, za::ZA_MAIL_KEYLESS,
 };
 use email::message::headers::{BuildHeader, ValueToHeader};
 use email::{
@@ -41,17 +34,12 @@ use email::{
     mailbox::{JUNK_ID, TRASH_ID},
     message::{
         delete::EmailDeletion,
-<<<<<<< HEAD
-        ingest::{EmailIngest, IngestEmail, IngestSource},
-        metadata::MessageData,
-        za::view::ZaMailView,
-=======
         ingest::{
             EmailIngest, IngestEmail, IngestSource, SpamSamples, group::ThreadKey,
             recheck::ThreadRecheck,
         },
         messagedata::{KeywordDiff, PendingMessageData, merge_keywords},
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+        za::view::ZaMailView,
     },
     presence::update_email_presence,
 };
@@ -147,12 +135,12 @@ impl EmailSet for Server {
 
         // Obtain import access token
         let import_access_token = if account_id != access_token.account_id() {
-            #[cfg(stalwart_tests)]
+            #[cfg(feature = "test_mode")]
             {
                 AccessToken::from_id_maybe_invalid(account_id).into()
             }
 
-            #[cfg(not(stalwart_tests))]
+            #[cfg(not(feature = "test_mode"))]
             {
                 use common::auth::BuildAccessToken;
                 self.access_token(account_id)
@@ -700,7 +688,7 @@ impl EmailSet for Server {
                                 headers.push(("Content-Type".into(), content_type.into()));
 
                                 // In test, sort headers to avoid randomness
-                                #[cfg(stalwart_tests)]
+                                #[cfg(feature = "test_mode")]
                                 {
                                     headers.sort_unstable_by(|a, b| match a.0.cmp(&b.0) {
                                         std::cmp::Ordering::Equal => a.1.cmp(&b.1),
@@ -712,20 +700,20 @@ impl EmailSet for Server {
                                     headers,
                                     contents: if !is_multipart {
                                         if let Some(blob_id) = blob_id {
-<<<<<<< HEAD
                                             // Ruling R31 (mail spec 6.3): no sealed source of
                                             // another account in this account's message.
-                                            if self.za_foreign_sealed_source(&blob_id, account_id).await? {
+                                            if let MaybeInvalid::Value(blob_id) = &blob_id
+                                                && self
+                                                    .za_foreign_sealed_source(blob_id, account_id)
+                                                    .await?
+                                            {
                                                 response.not_created.append(
                                                     id,
-                                                    SetError::forbidden().with_description(ZA_MAIL_KEYLESS),
+                                                    SetError::forbidden()
+                                                        .with_description(ZA_MAIL_KEYLESS),
                                                 );
                                                 continue 'create;
                                             }
-                                            match self.blob_download(&blob_id, access_token).await? {
-                                                Some(contents) => {
-                                                    BodyPart::Binary(contents.into())
-=======
                                             match blob_id {
                                                 MaybeInvalid::Value(blob_id)
                                                     if missing_blobs.is_empty() =>
@@ -746,7 +734,6 @@ impl EmailSet for Server {
                                                             BodyPart::Binary(Cow::Borrowed(&[]))
                                                         }
                                                     }
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                                                 }
                                                 MaybeInvalid::Value(blob_id) => {
                                                     if !matches!(
@@ -979,7 +966,7 @@ impl EmailSet for Server {
             }
 
             // In test, sort headers to avoid randomness
-            #[cfg(stalwart_tests)]
+            #[cfg(feature = "test_mode")]
             {
                 builder
                     .headers

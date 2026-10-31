@@ -19,12 +19,8 @@ use common::{
     Server,
     auth::AccessToken,
     sharing::EffectiveAcl,
-<<<<<<< HEAD
-    storage::index::ObjectIndexBuilder,
-    za::{ZA_MAIL_KEYLESS, mail::za_acl_widens},
-=======
     storage::index::{ObjectIndexBuilder, PresenceFlags, RewritePresence},
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+    za::{ZA_MAIL_KEYLESS, mail::za_acl_widens},
 };
 use email::{
     cache::{
@@ -1018,32 +1014,20 @@ impl MailboxSet for Server {
 
         // Validate ACLs
         let current = update.map(|(_, current)| current);
-<<<<<<< HEAD
-        if has_acl_changes {
-            // Mail spec 6.3, ruling I3: no grant is added to or widened on a
-            // key account's mailbox; a removal or a narrowing passes.
-            if za_acl_widens(
+        // Mail spec 6.3, ruling I3: no grant is added to or widened on a key
+        // account's mailbox; a removal or a narrowing passes. Checked before
+        // upstream's validation, which counts the shares.
+        if has_acl_changes
+            && za_acl_widens(
                 &changes.acls,
                 current
                     .as_ref()
                     .map_or(&[][..], |m| m.inner.acls.as_slice()),
-            ) && self.za_mail_sharing_refused(ctx.account_id).await?
-            {
-                return Ok(Err(SetError::forbidden().with_description(ZA_MAIL_KEYLESS)));
-            }
-            if !changes.acls.is_empty()
-                && let Err(err) = self.acl_validate(&changes.acls).await
-            {
-                return Ok(Err(err.into()));
-            }
-
-            self.refresh_acls(
-                &changes.acls,
-                current.as_ref().map(|m| m.inner.acls.as_slice()),
             )
-            .await
-            .caused_by(trc::location!())?;
-=======
+            && self.za_mail_sharing_refused(ctx.account_id).await?
+        {
+            return Ok(Err(SetError::forbidden().with_description(ZA_MAIL_KEYLESS)));
+        }
         if has_acl_changes
             && !changes.acls.is_empty()
             && let Err(err) = self
@@ -1058,7 +1042,6 @@ impl MailboxSet for Server {
                 .await
         {
             return Ok(Err(err.into()));
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
         }
 
         // Validate
