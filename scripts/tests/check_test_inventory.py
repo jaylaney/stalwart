@@ -44,7 +44,9 @@ positive counts in that step's export. Steps are compared step by step, never mo
 Identifiers are matched exactly. A renamed or moved test or function is matched only through the
 dispositions file's rename tables; a test whose CI step changed, only through its selection moves.
 A test ignored at 0.16.27 that is still ignored and still listed passes. The baseline's own
-dispositions apply as well as the file's. Exit status: 0 pass, 1 gate failure, 2 bad input.
+dispositions apply as well as the file's. A disposition with a `steps` list applies only to
+failures in those (baseline) steps; one of scope `case` documents a case retired inside a function
+that still runs and is never applied (ruling 103). Exit status: 0 pass, 1 gate failure, 2 bad input.
 """
 import argparse
 import collections
@@ -54,7 +56,7 @@ import sys
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from gate_common import (  # noqa: E402
-    EXCUSING, InputError, call_label, fn_identity, load_captures, load_dispositions, load_json,
+    DOCUMENTATION_SCOPES, EXCUSING, InputError, call_label, fn_identity, load_captures, load_dispositions, load_json,
     norm_package, strip_ignored, test_key,
 )
 
@@ -142,6 +144,8 @@ class Gate:
         if ident is not None:
             files.add(ident.split(" | ", 1)[0])
         for d in self.disp["dispositions"]:
+            if d["scope"] in DOCUMENTATION_SCOPES:
+                continue  # ruling 103: a retired case inside a running function; never applied
             for s in d["subjects"]:
                 sc = d["scope"]
                 hit = False
@@ -172,6 +176,8 @@ class Gate:
         for d in covers:
             if d["kind"] not in EXCUSING or check == "newly_ignored":
                 continue
+            if d.get("steps") is not None and step not in d["steps"]:
+                continue  # a disposition limited to named steps applies only to failures in them
             (unconfirmed if d.get("unconfirmed") else confirmed).append(d)
         for d in confirmed:
             if d["kind"] == "internals_replaced_equivalent" and equivalent_check is not None:

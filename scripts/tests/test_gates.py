@@ -326,6 +326,31 @@ class StrictRuleTests(unittest.TestCase):
             counts[s]["helper_two"]["last"] = 0
         self.assertFails(self.case.gate(counts, root, dispositions=equiv), "equivalent tests/src/suite.rs | - | helper_two")
 
+    def test_a_disposition_limited_to_steps_excuses_only_there(self):
+        root, counts = self.renamed_tree()
+        limited = {"dispositions": [{"id": "s1", "kind": "subject_deleted", "scope": "function", "evidence": "test",
+                                     "steps": [STEPS[0]], "subjects": [{"file": FILE, "name": "helper"}]}]}
+        code, out = self.case.gate(counts, root, dispositions=limited)
+        self.assertEqual(code, 1, out)
+        self.assertIn(f"[helper_not_executed] function tests/src/suite.rs | - | helper [step {STEPS[1]}]", out)
+        self.assertNotIn(f"helper [step {STEPS[0]}]", out)
+        limited["dispositions"][0]["steps"] = list(STEPS)
+        code, out = self.case.gate(counts, root, dispositions=limited)
+        self.assertEqual(code, 0, out)
+        limited["dispositions"][0]["steps"] = []
+        code, out = self.case.gate(counts, root, dispositions=limited)
+        self.assertEqual(code, 2, out)
+
+    def test_a_case_entry_excuses_nothing(self):
+        # Ruling 103: scope `case` documents a case retired inside a function that still runs.
+        root, counts = self.renamed_tree()
+        case = {"dispositions": [{"id": "c1", "kind": "subject_deleted", "scope": "case", "evidence": "test",
+                                  "subjects": [{"file": FILE, "name": "helper", "case": "a retired case"}]}]}
+        self.assertFails(self.case.gate(counts, root, dispositions=case),
+                         "[helper_not_executed] function tests/src/suite.rs | - | helper")
+        code, out = self.case.gate(dispositions=case)
+        self.assertEqual(code, 0, out)
+
     def test_a_bad_dispositions_file_is_an_input_error(self):
         code, out = self.case.gate(dispositions={"dispositions": [{"id": "x", "kind": "obsolete", "scope": "function",
                                                                    "evidence": "e", "subjects": []}]})

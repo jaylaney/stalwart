@@ -24,8 +24,13 @@ Exit status, for both gates: 0 pass, 1 gate failure, 2 bad input.
   - `kind`: `sel_only`, `subject_deleted`, `internals_replaced_equivalent`,
     `internals_replaced_no_equivalent`, `ungated_as_today`, `ignored_as_today` or
     `needs_docker_ci_only`.
-  - `scope`: `libtest`, `crate`, `file`, `sub_test_call`, `function` or `configuration`.
+  - `scope`: `libtest`, `crate`, `file`, `sub_test_call`, `function`, `configuration` or
+    `case`. A `case` entry (ruling 103) records a case retired inside a function that still
+    runs. It is documentation only: the gates never apply it.
   - `subjects`: what the decision covers.
+  - `steps` (optional): the baseline step names the entry is limited to. Without it, the entry
+    applies in every step. Use it when a function stopped running in one step only (its caller
+    there was removed) and stays required in the others.
   - `evidence`: the 1.0 change, ruling or expectation-ledger row.
   - `equivalents`: for `internals_replaced_equivalent` only. The gate checks the
     equivalents in the subject's place, where the subject was required.

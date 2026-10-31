@@ -31,7 +31,10 @@ KINDS = {
 }
 # Kinds that let a required subject be absent, unselected or unexecuted.
 EXCUSING = {"sel_only", "subject_deleted", "internals_replaced_equivalent", "internals_replaced_no_equivalent"}
-SCOPES = {"libtest", "crate", "file", "sub_test_call", "function", "configuration"}
+SCOPES = {"libtest", "crate", "file", "sub_test_call", "function", "configuration", "case"}
+# Ruling 103: a `case` entry records a case retired inside a function that still runs. It is
+# documentation only: the gates never apply it, so it excuses nothing.
+DOCUMENTATION_SCOPES = {"case"}
 
 
 class InputError(Exception):
@@ -93,7 +96,7 @@ def baseline_dispositions(base):
 def _check_subject(scope, s, where):
     need = {"libtest": ("package", "name"), "crate": ("crate",), "file": ("file",),
             "sub_test_call": ("suite", "call"), "function": ("file", "name"),
-            "configuration": ("configuration",)}[scope]
+            "configuration": ("configuration",), "case": ("file", "name", "case")}[scope]
     for k in need:
         if not isinstance(s.get(k), str) or not s[k]:
             raise InputError(f"{where}: subject {s} lacks {k!r}")
@@ -123,6 +126,9 @@ def load_dispositions(path, base):
             raise InputError(f"{where}: no subjects")
         for s in e["subjects"]:
             _check_subject(e["scope"], s, where)
+        if "steps" in e and (not isinstance(e["steps"], list) or not e["steps"]
+                             or not all(isinstance(x, str) and x for x in e["steps"])):
+            raise InputError(f"{where}: `steps` must be a non-empty list of step names")
         if e["kind"] == "internals_replaced_equivalent":
             if not e.get("equivalents"):
                 raise InputError(f"{where}: internals_replaced_equivalent needs `equivalents`")
