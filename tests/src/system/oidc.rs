@@ -69,7 +69,6 @@ const PKCE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 const PKCE_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
 const PROFILE_SCOPE: &str = "urn:ietf:params:oauth:scope:mail offline_access";
 const REFRESH_TOKEN_LIFETIME: u64 = 10;
-const REFRESH_TOKEN_RENEWAL: u64 = 4;
 
 #[derive(Debug, serde::Deserialize)]
 pub struct OpenIdMetadata {
@@ -96,20 +95,18 @@ pub async fn test(test: &mut TestServer) {
 
     let admin = test.account("admin@example.org");
 
-    // Set test parameters
+    // Set test parameters. Upgrade ruling 74: 1.0 removed
+    // `auth_code_max_attempts`, `refresh_token_renewal`,
+    // `anonymous_client_registration` and `require_client_registration`
+    // (subject deleted); the assertions that depended on them are marked
+    // where they stood.
     let settings = OidcProvider {
         access_token_expiry: registry::schema::prelude::Duration::from_millis(1000),
         auth_code_expiry: registry::schema::prelude::Duration::from_millis(1000),
-        auth_code_max_attempts: 1,
         user_code_expiry: registry::schema::prelude::Duration::from_millis(1000),
         refresh_token_expiry: registry::schema::prelude::Duration::from_millis(
             REFRESH_TOKEN_LIFETIME * 1000,
         ),
-        refresh_token_renewal: registry::schema::prelude::Duration::from_millis(
-            REFRESH_TOKEN_RENEWAL * 1000,
-        ),
-        anonymous_client_registration: true,
-        require_client_registration: true,
         signature_algorithm: JwtSignatureAlgorithm::Rs256,
         signature_key: SecretText::Text(SecretTextValue {
             secret: OIDC_SIGNATURE_KEY_RS256.to_string(),
@@ -122,12 +119,8 @@ pub async fn test(test: &mut TestServer) {
             &[
                 Property::AccessTokenExpiry,
                 Property::AuthCodeExpiry,
-                Property::AuthCodeMaxAttempts,
                 Property::UserCodeExpiry,
                 Property::RefreshTokenExpiry,
-                Property::RefreshTokenRenewal,
-                Property::AnonymousClientRegistration,
-                Property::RequireClientRegistration,
                 Property::SignatureAlgorithm,
                 Property::SignatureKey,
             ],
@@ -316,72 +309,59 @@ pub async fn test(test: &mut TestServer) {
 
     // A redirect URI that does not match the client registration must be rejected
     // and the authorization server must not issue a code (OAuth Public Clients §3.4)
-    let (status, _) = post_login_raw(&LoginRequest::AuthCode {
-        account_name: "user@example.org".to_string(),
-        account_secret: "this is a very strong password".to_string(),
-        mfa_token: None,
-        client_id: client_id.to_string(),
-        redirect_uri: "com.example.app:/evil".to_string().into(),
-        nonce: None,
-        scope: Some(PROFILE_SCOPE.to_string()),
-        code_challenge: Some(PKCE_CHALLENGE.to_string()),
-        code_challenge_method: Some("S256".to_string()),
-        state: None,
-        resource: vec![],
-    })
+    let (status, body) = post_login_raw(&auth_code_request(AuthCodeQuery {
+        client_id: &client_id,
+        redirect_uri: "com.example.app:/evil",
+        scope: Some(PROFILE_SCOPE),
+        code_challenge: Some(PKCE_CHALLENGE),
+        ..Default::default()
+    }))
     .await;
-    assert_ne!(
-        status, 200,
-        "mismatched redirect URI must not be authorized"
+    assert!(
+        !is_authorized(status, &body),
+        "mismatched redirect URI must not be authorized: {status} {body}"
     );
 
     // An unknown resource indicator must be rejected (RFC 8707)
-    let (status, _) = post_login_raw(&LoginRequest::AuthCode {
-        account_name: "user@example.org".to_string(),
-        account_secret: "this is a very strong password".to_string(),
-        mfa_token: None,
-        client_id: client_id.to_string(),
-        redirect_uri: "com.example.app:/cb".to_string().into(),
-        nonce: None,
-        scope: Some(PROFILE_SCOPE.to_string()),
-        code_challenge: Some(PKCE_CHALLENGE.to_string()),
-        code_challenge_method: Some("S256".to_string()),
-        state: None,
-        resource: vec!["https://evil.example.com/jmap".to_string()],
-    })
+    let (status, body) = post_login_raw(&auth_code_request(AuthCodeQuery {
+        client_id: &client_id,
+        redirect_uri: "com.example.app:/cb",
+        scope: Some(PROFILE_SCOPE),
+        code_challenge: Some(PKCE_CHALLENGE),
+        resources: &["https://evil.example.com/jmap"],
+        ..Default::default()
+    }))
     .await;
-    assert_ne!(
-        status, 200,
-        "unknown resource indicator must not be authorized"
+    assert!(
+        !is_authorized(status, &body),
+        "unknown resource indicator must not be authorized: {status} {body}"
     );
 
     // Authenticate with the correct password, PKCE (S256), scope and a valid resource indicator
     let response = http
         .post::<LoginResponse>(
             "/api/auth",
-            &LoginRequest::AuthCode {
-                account_name: "user@example.org".to_string(),
-                account_secret: "this is a very strong password".to_string(),
-                mfa_token: None,
-                client_id: client_id.to_string(),
-                redirect_uri: "com.example.app:/cb".to_string().into(),
-                nonce: "abc1234".to_string().into(),
-                scope: Some(PROFILE_SCOPE.to_string()),
-                code_challenge: Some(PKCE_CHALLENGE.to_string()),
-                code_challenge_method: Some("S256".to_string()),
-                state: None,
-                resource: vec!["https://mail.example.org/jmap/session".to_string()],
-            },
+            &auth_code_request(AuthCodeQuery {
+                client_id: &client_id,
+                redirect_uri: "com.example.app:/cb",
+                nonce: Some("abc1234"),
+                scope: Some(PROFILE_SCOPE),
+                code_challenge: Some(PKCE_CHALLENGE),
+                resources: &["https://mail.example.org/jmap/session"],
+                ..Default::default()
+            }),
         )
         .await
         .unwrap();
 
     // The issuer returned in the authorization response must match the metadata issuer (RFC 9207)
-    if let LoginResponse::Authenticated { iss, .. } = &response {
-        assert_eq!(iss, &metadata.issuer);
-    } else {
-        panic!("Expected an authenticated response, got {response:?}");
-    }
+    // 1.0 answers with the redirect location, which carries the code and
+    // `iss` (RFC 9207 2).
+    assert_eq!(
+        response.location_param("iss").as_deref(),
+        Some(metadata.issuer.as_str()),
+        "{response:?}"
+    );
 
     // Both client_id and redirect_uri have to match
     let mut token_params = AHashMap::from_iter([
@@ -432,7 +412,7 @@ pub async fn test(test: &mut TestServer) {
     token_params.insert("code_verifier".to_string(), PKCE_VERIFIER.to_string());
     let granted = post::<TokenResponse>(&metadata.token_endpoint, &token_params).await;
     if let TokenResponse::Granted(response) = &granted {
-        assert_eq!(response.scope.as_deref(), Some(PROFILE_SCOPE));
+        assert_eq!(response.scope, PROFILE_SCOPE);
     }
     let (token, refresh_token, id_token) = unwrap_oidc_token_response(granted);
 
@@ -742,6 +722,7 @@ pub async fn test(test: &mut TestServer) {
                 account_secret: "this is a very strong password".to_string(),
                 mfa_token: None,
                 code: device_response.user_code.clone(),
+                consent: Some(true),
             },
         )
         .await
@@ -770,6 +751,7 @@ pub async fn test(test: &mut TestServer) {
                 account_secret: "this is a very strong password".to_string(),
                 mfa_token: None,
                 code: device_response.user_code.clone(),
+                consent: Some(true),
             },
         )
         .await
@@ -778,7 +760,6 @@ pub async fn test(test: &mut TestServer) {
     );
 
     // Obtain token
-    let time_first_token = Instant::now();
     let (token, refresh_token, _) =
         unwrap_token_response(post(&metadata.token_endpoint, &token_params).await);
     let refresh_token = refresh_token.unwrap();
@@ -800,8 +781,10 @@ pub async fn test(test: &mut TestServer) {
         Some(REFRESH_TOKEN_LIFETIME),
         "issued_at={refresh_issued_at} expiry={refresh_expiry}"
     );
+    // Upgrade ruling 74: 0.16 also required more than the removed
+    // `refresh_token_renewal` window to remain (subject deleted).
     assert!(
-        refresh_expires_in > REFRESH_TOKEN_RENEWAL && refresh_expires_in <= REFRESH_TOKEN_LIFETIME,
+        refresh_expires_in <= REFRESH_TOKEN_LIFETIME,
         "issued_at={refresh_issued_at} expiry={refresh_expiry} expires_in={refresh_expires_in}"
     );
 
@@ -850,42 +833,22 @@ pub async fn test(test: &mut TestServer) {
         }
     );
 
-    // Refreshing the access token before expiration should not include a new refresh token
+    // Refresh the access token. Upgrade ruling 74: 0.16's renewal-window
+    // checks (no new refresh token while more than `refresh_token_renewal`
+    // remained, a new one inside the window) depended on the removed
+    // setting (subject deleted); 1.0 rotates the refresh token on every
+    // refresh.
     let refresh_params = AHashMap::from_iter([
         ("client_id".to_string(), client_id.to_string()),
         ("grant_type".to_string(), "refresh_token".to_string()),
         ("refresh_token".to_string(), refresh_token),
     ]);
-    let early_now = store::write::now();
-    let early_remaining = refresh_expiry.saturating_sub(early_now);
-    assert!(
-        early_remaining > REFRESH_TOKEN_RENEWAL,
-        "now={early_now} expiry={refresh_expiry} remaining={early_remaining} elapsed_ms={}",
-        time_first_token.elapsed().as_millis()
-    );
-    let (token, new_refresh_token, _) =
+    let (token, _, _) =
         unwrap_token_response(post(&metadata.token_endpoint, &refresh_params).await);
-    assert!(
-        new_refresh_token.is_none(),
-        "Early refresh renewed: now={early_now} expiry={refresh_expiry} remaining={early_remaining} elapsed_ms={}",
-        time_first_token.elapsed().as_millis()
-    );
 
-    // The access token still has a one-second lifetime, independent of refresh renewal.
+    // The access token still has a one-second lifetime.
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_unauthorized("https://127.0.0.1:8899", &token).await;
-
-    // Enter the renewal window with three seconds left on the original refresh token.
-    let late_now = wait_until_epoch(refresh_expiry - 3).await;
-    let late_remaining = refresh_expiry.saturating_sub(late_now);
-    assert!(
-        late_remaining > 0 && late_remaining <= REFRESH_TOKEN_RENEWAL,
-        "now={late_now} expiry={refresh_expiry} remaining={late_remaining} renewal={REFRESH_TOKEN_RENEWAL} elapsed_ms={}",
-        time_first_token.elapsed().as_millis()
-    );
-    let (_, new_refresh_token, _) =
-        unwrap_token_response(post(&metadata.token_endpoint, &refresh_params).await);
-    assert!(new_refresh_token.is_some());
 
     // Reject the original refresh token at its recorded absolute expiry.
     wait_until_epoch(refresh_expiry).await;
@@ -1022,19 +985,12 @@ async fn post_form_basic<T: DeserializeOwned>(
 async fn obtain_auth_code(http: &HttpRequest, client_id: &str, redirect_uri: &str) -> String {
     http.post::<LoginResponse>(
         "/api/auth",
-        &LoginRequest::AuthCode {
-            account_name: "user@example.org".to_string(),
-            account_secret: "this is a very strong password".to_string(),
-            mfa_token: None,
-            client_id: client_id.to_string(),
-            redirect_uri: redirect_uri.to_string().into(),
-            nonce: None,
-            scope: Some(PROFILE_SCOPE.to_string()),
-            code_challenge: None,
-            code_challenge_method: None,
-            state: None,
-            resource: vec![],
-        },
+        &auth_code_request(AuthCodeQuery {
+            client_id,
+            redirect_uri,
+            scope: Some(PROFILE_SCOPE),
+            ..Default::default()
+        }),
     )
     .await
     .unwrap()
@@ -1138,15 +1094,82 @@ fn unwrap_oidc_token_response(response: TokenResponse) -> (String, Option<String
     }
 }
 
+/// The parameters of an authorization request (RFC 6749 4.1.1, RFC 7636
+/// 4.3, RFC 8707 2). 1.0's login API takes them as the authorization
+/// endpoint's query string, where 0.16 took them as fields.
+#[derive(Default)]
+struct AuthCodeQuery<'x> {
+    client_id: &'x str,
+    redirect_uri: &'x str,
+    nonce: Option<&'x str>,
+    scope: Option<&'x str>,
+    /// An S256 challenge.
+    code_challenge: Option<&'x str>,
+    state: Option<&'x str>,
+    resources: &'x [&'x str],
+}
+
+/// The account's login for `query`, with consent given in the same request
+/// (`consent: true`, as the login page submits it).
+fn auth_code_request(query: AuthCodeQuery<'_>) -> LoginRequest {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    serializer
+        .append_pair("response_type", "code")
+        .append_pair("client_id", query.client_id)
+        .append_pair("redirect_uri", query.redirect_uri);
+    if let Some(nonce) = query.nonce {
+        serializer.append_pair("nonce", nonce);
+    }
+    if let Some(scope) = query.scope {
+        serializer.append_pair("scope", scope);
+    }
+    if let Some(code_challenge) = query.code_challenge {
+        serializer
+            .append_pair("code_challenge", code_challenge)
+            .append_pair("code_challenge_method", "S256");
+    }
+    if let Some(state) = query.state {
+        serializer.append_pair("state", state);
+    }
+    for resource in query.resources {
+        serializer.append_pair("resource", resource);
+    }
+    LoginRequest::AuthCode {
+        account_name: "user@example.org".to_string(),
+        account_secret: "this is a very strong password".to_string(),
+        mfa_token: None,
+        query: serializer.finish(),
+        consent: Some(true),
+    }
+}
+
+/// Whether a raw login response issued an authorization code: 1.0 answers
+/// every login with 200 and a typed body, so a refusal is any other answer.
+fn is_authorized(status: u16, body: &serde_json::Value) -> bool {
+    status == 200 && body["type"] == "authenticated"
+}
+
 pub trait LoginResponseTest {
     fn unwrap_code(self) -> String;
+    fn location_param(&self, name: &str) -> Option<String>;
 }
 
 impl LoginResponseTest for LoginResponse {
     fn unwrap_code(self) -> String {
+        self.location_param("code")
+            .unwrap_or_else(|| panic!("Expected auth code response, got {:?}", self))
+    }
+
+    /// A query parameter of an authenticated response's redirect location.
+    fn location_param(&self, name: &str) -> Option<String> {
         match self {
-            LoginResponse::Authenticated { client_code, .. } => client_code,
-            _ => panic!("Expected auth code response, got {:?}", self),
+            LoginResponse::Authenticated { location } => {
+                let (_, query) = location.split_once('?')?;
+                form_urlencoded::parse(query.as_bytes())
+                    .find(|(key, _)| key == name)
+                    .map(|(_, value)| value.into_owned())
+            }
+            _ => None,
         }
     }
 }

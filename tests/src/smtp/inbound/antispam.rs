@@ -337,20 +337,17 @@ async fn antispam() {
                                 .result = IprevResult::from_str(value);
                         }
                         "dkim.result" => {
+                            // mail-auth 0.14 builds an output from a bare result
+                            // through its public `From`; 0.16's per-result
+                            // constructors are crate-private.
                             dkim_result = match DkimResult::from_str(value) {
-                                DkimResult::Pass => DkimOutput::pass(),
-                                DkimResult::Neutral(error) => DkimOutput::neutral(error),
-                                DkimResult::Fail(error) => DkimOutput::fail(error),
-                                DkimResult::PermError(error) => DkimOutput::perm_err(error),
-                                DkimResult::TempError(error) => DkimOutput::temp_err(error),
                                 DkimResult::None => unreachable!(),
+                                result => DkimOutput::from(result),
                             }
                             .into();
                         }
                         "arc.result" => {
-                            arc_result = ArcOutput::default()
-                                .with_result(DkimResult::from_str(value))
-                                .into();
+                            arc_result = ArcOutput::from(DkimResult::from_str(value)).into();
                         }
                         "dkim.domains" => {
                             dkim_signatures = value
