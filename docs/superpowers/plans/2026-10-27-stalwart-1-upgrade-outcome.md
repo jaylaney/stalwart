@@ -7051,6 +7051,272 @@ name in `smtp-flake-3` and in `smtp-9` (N27).
   failed once in `smtp-8` (the HTTP reload request closed during TLS) and passed alone
   (`smtp-flake-3`); not seen in later runs.
 
+### Part 7d1: the coverage net, the two gates and their self-tests
+
+Part 7d1 measured the candidate with the baseline's 19-step llvm-cov net, fed both C10 gates,
+confirmed the pending dispositions, proved the gates through disposable changes and diffed the
+ported test files against `5b914ddb5`. Scratch work, profiles, exports, logs and the drivers are
+in the plan workspace under `task-7d/` (`steps.tsv` in the baseline's format, `coverage/`,
+`list/`, `ign/`, `gates/`, `selftest-*`, `tools/`).
+
+Commits: `577540104` (the gates' `case` scope and step-limited dispositions, with two offline
+self-tests), `b405e5490` (dispositions), and this note with its ledger rows.
+
+#### The net
+
+- **SHA.** Measured at `6ca04a058` (HEAD at the start), whose `tests` and `crates` equal
+  `3de0dfff2`'s (`git diff --quiet 3de0dfff2 6ca04a058 -- tests crates`; it adds only this note's
+  part 7c4). The gates' sources are `git archive 6ca04a058 tests crates`.
+- **Tools.** The baseline's driver, adapted (`task-7d/tools/cov_driver.py`): one step at a time
+  with `cargo llvm-cov --no-report test`, each step's profiles merged into its own `.profdata`
+  and exported alone (`cargo llvm-cov report --json`, the baseline's filename filter), then every
+  step's profile merged and exported (`tools/merge.py`). cargo-llvm-cov 0.9.1, rustc 1.99.0.
+  Environment `STORE=RocksDb RUST_MIN_STACK=16777216`, plus each step's own variable; the plain
+  steps unset `ZA_KEY_ACCOUNTS`.
+- **Commands.** The baseline's 19 step names and commands, unchanged: no command changed at 1.0
+  (the unit step's `--skip` list is the 98 tests-crate tests of the 1.0 listing, as the
+  baseline's skipped its 98), so `renames.steps` stays empty.
+
+| Step | Attempt | Command (`cargo llvm-cov --no-report test` ...) | Extra env | Exit | Passed / failed / ignored | Wall |
+|---|---|---|---|---|---|---|
+| `build-A` | build | `--workspace --exclude-from-test scim --exclude-from-test scim-proto --lib --bins --tests --no-fail-fast -- zz_no_such_test_zz` | - | 0 | 0 / 0 / 0 | 5:22 |
+| `build-B` | build | `-p tests zz_no_such_test_zz_2 -- --nocapture` | - | 0 | 0 / 0 / 0 | 2:42 |
+| `leak-unit-test` | 1 | `-p tests za::leak::tests::try_archive_short_values_are_not_archives -- --exact --nocapture` | - | 0 | 1 / 0 / 0 | 0:01 |
+| `unit-tests` | 1 | `--workspace --exclude-from-test scim --exclude-from-test scim-proto --lib --bins --tests --no-fail-fast -- --exact --skip <the 98 tests-crate tests>` | - | 0 | 557 / 0 / 2 | 0:59 |
+| `za-tests` | 1 | `-p tests za::za_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 6:36 |
+| `za-tests-fs-blob` | 1 | `-p tests za::za_tests -- --nocapture` | BLOB_STORE=FileSystem | 0 | 1 / 0 / 0 | 6:12 |
+| `webdav-plain` | 1 | `-p tests webdav::webdav_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 0:21 |
+| `webdav-key` | 1 | `-p tests webdav::webdav_tests -- --nocapture` | ZA_KEY_ACCOUNTS=1 | 0 | 1 / 0 / 0 | 0:25 |
+| `imap-plain` | 1 | `-p tests imap::imap_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 0:11 |
+| `imap-key` | 1 | `-p tests imap::imap_tests -- --nocapture` | ZA_KEY_ACCOUNTS=1 | 0 | 1 / 0 / 0 | 0:12 |
+| `jmap-plain` | 1 | `-p tests jmap::jmap_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 2:14 |
+| `jmap-key` | 1 | `-p tests jmap::jmap_tests -- --nocapture` | ZA_KEY_ACCOUNTS=1 | 0 | 1 / 0 / 0 | 1:34 |
+| `smtp` | 1 | `-p tests smtp -- --nocapture` | `SPAM_RULES_URL` (v3.0.3) | 101 | 74 / 2 / 3 (smtp::inbound::dkim2::dkim2_dsn_is_signed smtp::queue::retry::queue_retry) | 0:52 |
+| `smtp` | 2 | `-p tests -- --exact --nocapture smtp::inbound::dkim2::dkim2_dsn_is_signed smtp::queue::retry::queue_retry` | `SPAM_RULES_URL` (v3.0.3) | 0 | 2 / 0 / 0 | 0:08 |
+| `system-tests` | 1 | `-p tests system::system_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 1:01 |
+| `store-tests` | 1 | `-p tests store::store_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 0:08 |
+| `blob-tests` | 1 | `-p tests store::blob::blob_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 0:05 |
+| `lookup-tests` | 1 | `-p tests store::lookup::lookup_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 0:12 |
+| `search-tests` | 1 | `-p tests store::search_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 11:32 |
+| `telemetry-tests` | 1 | `-p tests telemetry::telemetry_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 0:38 |
+| `cal-query-tests` | 1 | `-p tests webdav::cal_query:: -- --nocapture` | - | 0 | 2 / 0 / 1 | 0:01 |
+| `automation-tests` | 1 | `-p tests automation::automation_tests -- --nocapture` | - | 101 | 0 / 1 / 0 (automation::automation_tests) | 0:00 |
+| `automation-tests` | 2 | `-p tests automation::automation_tests -- --nocapture` | - | 101 | 0 / 1 / 0 (automation::automation_tests) | 0:00 |
+| `za-cache-swap` | 1 | `-p tests za::cache_swap::cache_swap_tests -- --exact --nocapture` | - | 0 | 1 / 0 / 0 | 0:18 |
+
+- **Reruns.** `smtp` failed `dkim2_dsn_is_signed` and `queue_retry`, two of CLAUDE.md's
+  documented SMTP timing flakes, and both passed when rerun by name, as at the baseline.
+  `automation-tests` needs Docker: both attempts panic in `ensure_acme()` (no
+  `/var/run/docker.sock`), as at the baseline (disposition `needs_docker_ci_only`).
+- **The swap step.** `za::cache_swap::cache_swap_tests` is new since 0.16.27 and runs as the extra
+  step `za-cache-swap`, outside the baseline's 19. The gates' merged export holds the 19 steps;
+  `merged-plus-swap.json` adds it and changes no cohort figure.
+- **Listings.** `-- --list` and `-- --ignored --list` of every CI step under its baseline name, the
+  three ignored-only feature sets (`nlp`, `spam-filter`, `tests`) and both selection moves'
+  `to_command` (`task-7d/list/`, `ign/`; 28 each). The workspace unit step lists 557 tests, the
+  vault and groupware step 213, the DKIM move target 16 (its seven moved tests among them), the
+  `http` move target 6. The ignored listings hold exactly the six tests ignored at 0.16.27.
+
+#### The inventory gate
+
+```
+python3 -I scripts/tests/check_test_inventory.py --baseline tests/qualification/baseline-0.16.27.json \
+  --dispositions tests/qualification/dispositions.json --listing task-7d/list \
+  --ignored-listing task-7d/ign --executed task-7d/gates/candidate/functions.json
+```
+
+`functions.json` is `strict_rule.py functions` over the 19 step exports and the `6ca04a058`
+sources (2,324 functions). It checks 795 tests, 29 configurations, 272 call-steps, 3,833
+helper-steps, 24 tail-steps and 14 loop-steps.
+
+- **With the dispositions as of `6ca04a058`: 44 failures.**
+  - 20 waited on entries marked unconfirmed: the five helpers in both ZA steps (10
+    `unconfirmed`), the seal rename (1 `rename_unconfirmed`) and the two Task 8 moves' 9 tests
+    (`move_unconfirmed`);
+  - 3 `missing`: 0.16's `groupware::tests` path tests, whose equivalents in `common` are not
+    selected by the vault and groupware step;
+  - 21 `helper_not_executed` (19) or `tail_not_executed` (2), each a `tests/src` helper that
+    stopped running in one step because its caller there was removed or rewritten (below).
+  - No sub-test call failed: every za call, `imap::body_structure::test` and
+    `webdav::cal_itip::test` executed under the three counts in every step where they did at
+    0.16.27 (`body_structure` 1/1/1 in both IMAP steps, `cal_itip` 1/1/1 in both CalDAV steps).
+- **With `b405e5490`'s dispositions: 9 failures, every one `move_unconfirmed`:** the seven DKIM
+  tests and the two `http` `za_test` tests, selected by their move targets' captures through the
+  two selection moves that wait for Task 8's step names. Excused: 22
+  `internals_replaced_equivalent`, 202 `sel_only`, 22 `subject_deleted` checks.
+
+#### The coverage gate
+
+```
+python3 -I scripts/tests/check_coverage.py --baseline tests/qualification/baseline-0.16.27.json \
+  --dispositions tests/qualification/dispositions.json --merged task-7d/coverage/merged.json \
+  --sources task-7d/src-cand
+```
+
+**It fails, on a real drop, and the drop is held.** The cohort is the baseline's 40 files (with
+`sequence.rs` at `sequence_floor.rs`) plus the 8 runtime additions; a census of the files at
+`6ca04a058` that are in neither v1.0.1 nor `5b914ddb5` finds no other fork runtime file, so the
+cohort is complete.
+
+| Figure | Candidate | Baseline threshold | Short by |
+|---|---|---|---|
+| Full | 20,542 / 21,382 (96.07%) | 17,821 / 18,490 (96.38%) | 67 lines (20,609 needed) |
+| Runtime-only | 12,082 / 12,848 (94.04%) | 10,646 / 11,246 (94.66%) | 81 lines (12,163 needed) |
+
+The candidate leaves 840 cohort lines uncovered against the baseline's 669 (full), 766 against
+600 (runtime-only). Where the 171 more uncovered lines are (full figure, baseline to candidate):
+
+| File | Uncovered lines | What is not run |
+|---|---|---|
+| `groupware/src/calendar/sharing/convert.rs` | 42 to 98 | `write_container` (24 lines: the container-only rewrap of a converted or rolled-back event, called at `:294` and `:491`), `rollback`'s branches at `:488-501`, `ZaShareError`'s `Debug` and `From` impls |
+| `dav/src/common/propfind/za.rs` (added) | 44 | `za_propname_item` `:400-422`, `za_propfind_item` refusals, `refusal`, `za_open_dead_container`'s error arms |
+| `groupware/src/calendar/drain.rs` | 95 to 106 | 11 more error and edge arms |
+| `groupware/src/calendar/seal/container.rs` (added) | 11 | `parse`'s malformed-input arms, error returns |
+| `services/src/index_queue/za.rs` (added) | 11 | `for_row` `:114-126`, the two test-hook setters |
+| `common/src/za/metadata.rs` (added) | 9 | `za_has_object_metadata`'s arms `:165-201` |
+| `email/src/message/za/ingest.rs` | 4 to 11 | `za_metadata_refusal` (`:133-141`) |
+| `groupware/src/calendar/fanout.rs` | 52 to 59 | 7 more |
+| `imap/src/core/za.rs` | 2 to 8 | `za_unlist_key_accounts` `:50-58` |
+| `common/src/auth/vault.rs`, `email/src/message/za/view.rs`, `pinning.rs`, `delegation.rs`, `seal/item.rs`, `sharing/resolve.rs` | +4, +4, +2, +1, +1, +1 | |
+
+Every other cohort file is at or above its baseline count. The per-function list is
+`task-7d/uncovered-all.txt` (`tools/uncovered.py`, cohort.py's line rule).
+
+Reported beside the cohort and never counted: `restored_tests` 11,612 / 12,017 (96.63%), the
+port's fork test files 383 / 428, the `tests` crate 100,045 / 107,665 (92.92%), the upstream
+product 198,063 / 369,061 (53.67%); per-crate deltas are in `gates/candidate/coverage.out`.
+
+#### Dispositions confirmed or added (`b405e5490`)
+
+- **Confirmed (7b):** the five helper replacements (`leak.rs`'s `check_email_search`,
+  `metadata_key`, `write_metadata`; `fence.rs`'s `delete_event`, `wait_for_the_unindex`), each read
+  against its 0.16.27 function, with the equivalent executed in both ZA steps; the seal test's
+  rename (the same checks on 1.0's metadata row).
+- **Settled (7c2, ruling 103):** `za-disabled-tenant` and `sharing-move-bytes-oversize` now have
+  scope `case`, which the gates never apply. `za::disabled::test` and
+  `sharing_move_atomic::controls` executed 1/1/1 in both ZA steps, and neither gate fails on the
+  retired cases: the byte budget sits in `dav/src/calendar/copy_move.rs:2737`, an upstream file
+  outside the cohort, on a line the operations case also runs, and the tenant check is SEL-only
+  code. No helper needs naming.
+- **Still unconfirmed:** the two selection moves' step names, for Task 8. Their `to_command`
+  captures list every moved test.
+- **Added:**
+  - `leak-fetch-email` (equivalent `za::leak::scan`, which reads the metadata row and blob itself)
+    and `webdav-key-raw-event` (equivalent `raw_event_records`, part 4c);
+  - step-limited entries, each for helpers whose only caller in that step was removed:
+    `lookup-unreachable-empty-checks` (`lookup-tests`, ruling 75),
+    `system-archiving-imap-helpers` (`system-tests`, the SEL-only `archiving.rs`),
+    `system-task-retry-helpers` (`system-tests`, ruling 73), `antispam-llm-mock-server` (`smtp`,
+    ruling 33's LLM case), `telemetry-uncalled-helpers` (`telemetry-tests`, ruling 33's uncalled
+    `metrics` and `tracing` tests);
+  - a selection move of the three `groupware::tests` path tests from the vault and groupware
+    step to the workspace unit step, where their `common` equivalents run.
+- **Gate changes (`577540104`).** The `case` scope (ruling 103) and an optional `steps` list on a
+  disposition, which limits it to failures in those steps. Without `steps`, a function-scope
+  entry for, say, `store_assert_is_empty` would excuse it in every step. Both narrow what the
+  gates excuse; neither loosens a rule, a threshold or the cohort. Offline self-tests: 32 (two
+  new), and with `--real` the baseline still passes both gates.
+
+#### Self-tests through disposable changes
+
+Ruling 120's combining applies: two disposable change sets, each shown failing, then restored
+with `git checkout -- <files>` and rerun. Nothing was committed; `selftest-L.diff` and
+`selftest-I.diff` hold the changes.
+
+**The unchanged candidate.** The inventory gate's only failures are the 9 Task 8 moves; with a
+scratch copy of the dispositions in which those two moves are confirmed (never committed), it
+exits 0 (`gates/candidate/inventory-task8-moves-confirmed.out`). Both synchronous sub-tests
+pass: `imap::body_structure::test` and `webdav::cal_itip::test` execute 1/1/1 in both of their
+steps. The coverage gate cannot pass on the unchanged candidate (N28).
+
+**Set L: the listings** (relisted with `tools/capture.py`: the workspace unit step, the vault and
+groupware step, the leak step and `exists__tests__default`; the other captures unchanged).
+
+| Mutation | Change | Gate failure |
+|---|---|---|
+| L1 a missing test | `#[test]` removed from `vault::record::tests::record_round_trips_through_rkyv` | `[missing] test vault::record::tests::record_round_trips_through_rkyv: not listed by any --listing capture` |
+| L2 a newly ignored test that ran at 0.16.27 | `#[ignore]` on `debug_prints_no_secret_material` | `[newly_ignored] test vault::record::tests::debug_prints_no_secret_material: ran at 0.16.27 and is now ignored` |
+| L3 an empty selection | the leak unit test renamed | `[empty_selector] configuration test.yml__zero-access__zero-access-leak-scanner-unit-test: selects nothing (selected 1 at 0.16.27)`, plus `unselected` and `missing_from` for the test |
+| L4 a dropped restored unit test module | `imap-proto`'s `#[path = "utf7_restored_tests.rs"] mod utf7;` removed | `[missing]` for `imap_proto::utf7::tests::utf7_decode` and `utf7_encode` |
+
+Result: 16 failures (these 7 and the 9 Task 8 moves). Restored and relisted: the four captures'
+entries equal the candidate's, and the gate is back to the 9 moves.
+
+**Set I: one instrumented run** (`build-A`, `build-B`, then `unit-tests`, `za-tests` and
+`webdav-plain` rerun; the other 16 steps keep the candidate's profiles and exports, which the
+mutations do not touch; every mutated line keeps its line number). The ZA suite ran to its end
+(`test result: ok`, through `index_task::test_mid_pass_deletion` and the final emptiness check),
+as ruling 120 requires.
+
+| Mutation | Change | Gate failure |
+|---|---|---|
+| I1 an omitted za sub-test call | `cors::test(&mut test).await;` commented out | `[call_not_executed] call za::za_tests -> cors::test [step za-tests]: body count 0` (body 0, last 0, exit 0) |
+| I2 a za future built, never awaited | `let _ = mail::search::test(&mut test);` | `[call_not_executed] call za::za_tests -> mail::search::test [step za-tests]: body count 0` |
+| I3 a sub-test that returns before its assertions | `if std::hint::black_box(true) { return; }` at the head of `mail::traces::test` | `[call_not_executed] call za::za_tests -> mail::traces::test [step za-tests]: last-statement count 0: the body returned before its last statement (body 1, last 0, exit 1)` |
+| I4 an omitted synchronous sub-test call | `cal_itip::test();` commented out in `webdav_tests` | `[call_not_executed] call webdav::webdav_tests -> cal_itip::test [step webdav-plain]: body count 0`, and `[loop_not_executed]` (loop-body count 0; 9 at 0.16.27) |
+| I5 a cohort drop that restored tests would offset | a never-called 63-line function in `http/src/api/vault.rs` (cohort), and a 124-line covered test in `http/src/request_restored_tests.rs` | cohort full 20,542 / 21,445 (95.79%), runtime 12,082 / 12,911 (93.58%): both fail, 63 lines lower than the candidate's 21,382 and 12,848; `restored_tests` rises to 11,736 / 12,141 and is reported outside the cohort only |
+
+Each mutation failed under its own name and step; the 60 other failures are the helpers of the
+omitted or unrun modules (`cors.rs`, `mail/search.rs`, `mail/traces.rs`, `cal_itip.rs`), each in
+`za-tests` or `webdav-plain` only, and the 9 Task 8 moves (74 in all). The unchanged steps
+(`za-tests-fs-blob`, `webdav-key`) still pass the same calls, so the failures are per step.
+I5 shows the exclusion on a real export: the restored group gained more covered lines (124) than
+the cohort lost (63), and the cohort figure still fell by exactly the 63. It cannot show a pass
+turning into a fail (N31); 7b's offline self-test does that, one line below each threshold with
+50,000 covered restored lines, and still passes.
+
+Restored, the same three steps and both builds were rerun (`selftest-I-restored/`): the ZA suite,
+`unit-tests` (557 passed) and `webdav-plain` pass; the inventory gate is back to the 9 moves; the
+coverage figures equal the candidate's (20,542 / 21,382 and 12,082 / 12,848; `restored_tests`
+11,612 / 12,017), so the three reruns reproduce the net's cohort numbers exactly.
+
+#### The ported-file diff
+
+`task-7d/tools/diffcheck.py` pairs every ported test unit with its `5b914ddb5` counterpart: the
+modified and renamed `tests/` files (`git diff -M`), each restored test module with its 0.16
+inline module (the baseline's `restored_tests.modules`), and each fork file's inline test module.
+318 units. Functions are matched by container and name, patterns are counted on source with
+comments and literals blanked.
+
+- **`#[ignore]`:** none added. **`let _ = <call>`:** none added. **`drop(<call>)`:** none; the five
+  added `drop(..)` calls drop guards held in variables (`split`, `held`, `attempts`), not calls.
+- **`#[cfg]` and `cfg!`:** two units.
+  - `za/mod.rs`'s `#[cfg(feature = "sqlite")]` on `external_directory` came in with PR #66
+    (`9a7574203`), before the port; it is absent from a diff against `9a7574203`.
+  - `utils/cleanup.rs`'s PostgreSQL and MySQL search-store arms: new ledger row.
+- **`return`:** one changed function (`leak.rs`'s `check_item`) and eleven new helpers in ported
+  files. All are control flow inside helpers (a no-op write, a match fallthrough, a wait loop's
+  exit, a scanner skipping another account's record). None returns from a sub-test before its
+  assertions.
+- **Removed `.await`:** 42 functions. Each one lost an awaited call that was removed with its
+  subject (rulings 33, 73, 75, 79, the SEL-only files, ledger rows already present), moved into an
+  awaited helper, or became synchronous at 1.0 (`invalidate_local_caches`). The tests crate
+  builds with no warning but the linker's, so no future is built and left unused.
+- **Ledger rows added: nine** (part 7d1 diff check), each citing a reason the note already
+  recorded: `invalidate_local_caches` made synchronous; the event helpers; ids assigned at commit;
+  `ContainerChange::new`'s no-op; the index queue's wait loops; the leak scanner's per-space
+  rules; the emptiness check's three new exemptions; the search stores' feature-gated arms;
+  `without_attachment_flag`. No addition is held.
+
+#### Needs a ruling (part 7d1)
+
+- **N28, the coverage gate fails.** The cohort is 67 lines short of the full threshold and 81 of
+  the runtime-only one (table above). Most of the drop is fork code with no test at 1.0:
+  `sharing/convert.rs`'s container-only rewrap and rollback branches (+56), and four of the port's
+  runtime additions (76 uncovered in `propfind/za.rs`, `seal/container.rs`,
+  `index_queue/za.rs`, `za/metadata.rs`). Options: tests for those paths (the conversion of an
+  event that holds a dead-property container is the largest), or a ruling on the additions'
+  share of the cohort. Not changed here.
+- **N29, step-limited dispositions.** `577540104` adds the `steps` field to the gate (narrowing
+  only) so that five removed callers need not excuse their helpers in every step. Confirm the
+  gate change.
+- **N30, the inventory gate's last 9 failures** are the two Task 8 selection moves; they pass
+  once Task 8 names the steps and the moves are confirmed.
+- **N31, the coverage self-test cannot show the unchanged candidate passing**, since the
+  candidate fails (N28). Set I's coverage mutation shows the cohort figure falling by exactly
+  the uncovered lines while the restored group rises, and 7b's offline self-test shows a pass
+  turning into a fail. A pass-to-fail demonstration on the candidate needs N28 settled first.
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
@@ -7438,6 +7704,15 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `jmap::principal::get` (upstream, part 7c4) | The session object takes 1.0's account capabilities (as in the key variant above, plus `maxCalendarsPerEvent` 10 and the `metadata` capability with its eight data types, its session and primary-account entries); the principals list only John's own account (the session's Account object) and `accounts: null` for the others, carry the calendars capability on the principal (`accountId` null where the session reaches no account; `mayShareWith` false for John himself) and name `timeZone`. | 1.0's session builder; RFC 9670 Principal/get (`accounts`, `timeZone`). A key account's session leaves out the metadata capability (the fork's `za_metadata_refused`). |
 | `jmap::principal::availability` (upstream, part 7c4) | Each busy period expects `accountId` (null where no event is shown); the third event's period expects `tentative` (0.16 `confirmed`), in both checks that list it. | 1.0's BusyPeriod names its account and takes the busy status from a tentative event's status (JMAP Calendars Principal/getAvailability). |
 | `jmap::compliance::binary` `blob-copy-not-found` (upstream port of jmap-test-suite, part 7c4) | An unknown blob in Blob/copy expects `notFound` (0.16 `blobNotFound`). | RFC 8620 6.3 names the error `notFound`, which 1.0 answers. |
+| `za::{setup, password, app_password, totp}::test`, `za::sharing::{conversion_link, delegated_identity_and_groups, catch_all_resolution_is_quiet, sharing_lifecycle_negative_and_exception}`, `utils::za::{insert_event, plant_inbox_item, rewrite_inbox_item}` (fork, part 7d1 diff check) | Their `invalidate_local_caches` calls lose `.await`. Assertions unchanged. | `common/src/cache/invalidate.rs:557`: `invalidate_local_caches` is synchronous at 1.0 (interface sheet, "3. Account epoch and classification"). |
+| `za::dav_seal::{raw_event, test_reports}`, `za::expansion::break_time_ranges`, `za::mail::fence::update_event`, `za::pinning::keep_only_pair`, `za::sharing::update_event`, `za::sharing_races::save_event`, `za::leak::test` (fork, part 7d1 diff check) | The event reads and writes they did inline (`account_info`, `get_value`, `fetch_dav_resources`, `commit_batch`, `invalidate_local_caches`) are done by the awaited helpers `stored_event`, `write_stored_event`, `raw_event_records` and `utils::za::insert_event`, so the callers hold fewer `.await`s. Every helper call is awaited. Assertions unchanged. | 1.0 stores an event as a row and a content record; part 4c, "How the existing modules were adapted": `StoredEvent` with `stored_event` and `write_stored_event` (upstream's `update_full`) replace 0.16's one archive and `CalendarEvent::update`, and `raw_event_records` returns both records. |
+| `utils::za::{insert_event, plant_plain_message}` (fork, part 7d1 diff check) | No `assign_document_ids` or `assign_email_ids` call: the id is read from the committed batch (`commit_batch(..).slot(..)`). Assertions unchanged. | 1.0 assigns a document id at commit (ruling 80; part 4c: `insert_event` writes the pair with a reserved id). |
+| `utils::za::plant_container`, `za::mail::fence::write_object_metadata` (fork, part 7d1 diff check) | Return without writing when `ContainerChange::new` is `None`. | `ContainerChange::new` returns `None` when the previous and next bytes are equal (interface sheet, "5. Metadata and extras mapping"; `common/src/storage/metadata/change.rs:23-37`), so there is nothing to write. |
+| `utils::za::wait_for_index_queue`, `za::index_task::two_messages_held` (fork, part 7d1 diff check) | Their wait loops end with `return` once the account's index queue is empty, or once both messages are committed with their entries queued; otherwise they assert the deadline. | 1.0's index queue replaces the index tasks (part 6d; ledger row `za::index_task::{test, test_sealed_archive}`). |
+| `za::leak::{check_search, check_search_queue, check_metadata, check_item, subspace_records}` (fork, part 7d1 diff check) | Early `return`s pass over records outside the scanned account or index, after recording any violation; `check_item` returns `false` after recording an item with plaintext. | Part 6d's per-space leak rules ("The leak rules per space"; ledger row `za::leak::scan` and `token_hits`). |
+| `utils::cleanup::store_assert_is_empty_except_account_state` (harness, part 7d1 diff check) | Three more exemptions than 0.16's `store_assert_is_empty_except_vaults`, each a `return Ok(true)`: registry id counters are kept, share notifications are collected for the caller, and the schema version and node-id claims are kept. | The "Harness" notes (Task 2): `Counter` (document-id and change-id counters deleted, registry id counters kept) and `System` (the schema version and node-id claims kept); share notifications as in the ledger row "the emptiness check deletes share notifications". |
+| `utils::cleanup::{search_store_destroy, store_destroy_sql_indexes}` (harness, part 7d1 diff check) | `#[cfg(feature = "postgres")]` and `#[cfg(feature = "mysql")]` arms for 1.0's PostgreSQL and MySQL search stores. | `store/src/lib.rs:421-427`: 1.0's `SearchStore` has `PostgreSQL` and `MySQL` variants, compiled only with those features; the "Harness" notes (Task 2: "`search_store_destroy` cover[s] 1.0's subspaces and search stores"). |
+| `za::mail::reads::without_attachment_flag` (fork, part 7d1 diff check) | Returns the answer unchanged when it holds no FLAGS item. | Ruling 114: `$hasattachment` is set at ingest for an ordinary account and never for a key account (plan 13 ruling 55), so the plain answer is compared without it. |
 
 ## Task 1 check
 
