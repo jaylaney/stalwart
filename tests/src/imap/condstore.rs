@@ -140,10 +140,13 @@ pub async fn test(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
         modseqs[0]
     ))
     .await;
+    // 1.0 lists every UID expunged from the mailbox since the modseq, including
+    // UIDs created and expunged after it (0.16 netted them out of its change log).
     imap.assert_read(Type::Tagged, ResponseType::Ok)
         .await
         .assert_count("FETCH (", 3)
-        .assert_count("VANISHED", 0);
+        .assert_count("VANISHED", 1)
+        .assert_contains("VANISHED (EARLIER) 1:2");
 
     // Fetch changes since SEQ 1, UID MOVE should count as a deletion
     imap.send(&format!(

@@ -306,10 +306,12 @@ pub async fn query(client: &Client, can_stem: bool) {
                 email::query::Comparator::from(),
                 email::query::Comparator::sent_at(),
             ],
+            // 1.0's `after` is inclusive (RFC 8621 4.4.1), so the four messages
+            // received at 1875 (N01558, N01952, N02120, T10251) match.
             vec![
-                "N01559", "N02123", "N01940", "N03594", "N01494", "N04271", "N04326", "N01610",
-                "N02920", "N01587", "T00167", "T00168", "N01554", "N01535", "N01536", "N01622",
-                "N01754", "N01594",
+                "N01559", "N02123", "N01558", "N01952", "N02120", "N01940", "N03594", "N01494",
+                "T10251", "N04271", "N04326", "N01610", "N02920", "N01587", "T00167", "T00168",
+                "N01554", "N01535", "N01536", "N01622", "N01754", "N01594",
             ],
         ),
         (
@@ -322,10 +324,11 @@ pub async fn query(client: &Client, can_stem: bool) {
                 email::query::Comparator::from(),
                 email::query::Comparator::sent_at(),
             ],
+            // The 1875 messages, as above (`after` is inclusive at 1.0).
             vec![
                 "N04326", "N01610", "N02920", "N01587", "T00167", "T00168", "N01554", "N01535",
-                "N01536", "N01622", "N01754", "N01594", "N01559", "N02123", "N01940", "N03594",
-                "N01494", "N04271",
+                "N01536", "N01622", "N01754", "N01594", "N01559", "N02123", "N01558", "N01952",
+                "N02120", "N01940", "N03594", "N01494", "T10251", "N04271",
             ],
         ),
         (

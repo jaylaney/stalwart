@@ -235,6 +235,9 @@ async fn dkim2_dsn_is_signed() {
     admin
         .registry_create_object(DsnReportSettings {
             dkim_sign_domain: expr("'example.com'"),
+            // mail-auth 0.14 (1.0) starts a DKIM2 chain only when the From
+            // domain matches d=, so the DSN's From moves to the signing domain.
+            from_address: expr("'MAILER-DAEMON@example.com'"),
             ..Default::default()
         })
         .await;

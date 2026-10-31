@@ -4,13 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::utils::{
-    http::HttpRequest,
-    imap::{ImapConnection, Type},
-    pop3::Pop3Connection,
-    server::TestServer,
-    smtp::SmtpConnection,
-};
+use crate::utils::{http::HttpRequest, pop3::Pop3Connection, server::TestServer, za::Conn};
 use base64::{Engine, engine::general_purpose};
 use biscuit::{JWT, SingleOrMultiple, jwk::JWKSet};
 use bytes::Bytes;
@@ -27,7 +21,6 @@ use http::auth::oauth::{
     DeviceAuthResponse, ErrorType, TokenResponse,
     auth::{LoginRequest, LoginResponse},
 };
-use imap_proto::ResponseType;
 use jmap_client::{
     client::{Client, Credentials},
     mailbox::query::Filter,
@@ -527,20 +520,25 @@ pub async fn test(test: &mut TestServer) {
         "n,a={},\u{1}auth=Bearer {}\u{1}\u{1}",
         "user@domain", token
     ));
-    let mut smtp = SmtpConnection::connect().await;
-    smtp.send(&format!("AUTH OAUTHBEARER {oauth_bearer_invalid_sasl}",))
+    // 1.0 offers the bearer mechanisms only over TLS, on SMTP and IMAP alike.
+    let mut smtp = Conn::open_smtp(super::SUBMISSION_PORT).await;
+    smtp.send("EHLO localhost\r\n").await;
+    smtp.until(&["250 "]).await;
+    smtp.send(&format!("AUTH OAUTHBEARER {oauth_bearer_invalid_sasl}\r\n"))
         .await;
-    smtp.read(1, 4).await;
-    smtp.send(&format!("AUTH OAUTHBEARER {oauth_bearer_sasl}",))
+    let line = smtp.until(&["2", "3", "4", "5"]).await;
+    assert!(line.starts_with('4'), "invalid bearer answered {line:?}");
+    smtp.exchange(&format!("AUTH OAUTHBEARER {oauth_bearer_sasl}\r\n"), "235")
         .await;
-    smtp.read(1, 2).await;
 
     // Try IMAP OAUTHBEARER auth
-    let mut imap = ImapConnection::connect(b"_x ").await;
-    imap.assert_read(Type::Untagged, ResponseType::Ok).await;
-    imap.send(&format!("AUTHENTICATE OAUTHBEARER {oauth_bearer_sasl}"))
-        .await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok).await;
+    let mut imap = Conn::open(9992).await;
+    imap.until(&["* OK"]).await;
+    imap.exchange(
+        &format!("a1 AUTHENTICATE OAUTHBEARER {oauth_bearer_sasl}\r\n"),
+        "a1 OK",
+    )
+    .await;
 
     // Try POP3 OAUTHBEARER auth
     let mut pop3 = Pop3Connection::connect().await;

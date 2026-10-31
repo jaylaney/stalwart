@@ -936,6 +936,12 @@ pub async fn query_changes(test: &TestServer) {
                     .with_document(id.document_id())
                     .log_item_update(SyncCollection::Email, Some(id.prefix_id().into()));
                 server.store().write_batch(&mut batch).await.unwrap();
+                // A raw write skips `commit_batch`'s cache invalidation, and 1.0
+                // serves a message-cache snapshot for up to 5 s without
+                // revalidating it.
+                server
+                    .inner
+                    .mark_cache_stale(account.id().document_id(), SyncCollection::Email);
                 updated_ids.insert(id);
             }
             LogAction::Delete(id) => {
@@ -980,6 +986,9 @@ pub async fn query_changes(test: &TestServer) {
                     .write_batch(&mut batch)
                     .await
                     .unwrap();
+                server
+                    .inner
+                    .mark_cache_stale(account.id().document_id(), SyncCollection::Email);
 
                 id_map.insert(*to, new_id);
                 if type1_ids.contains(&id) {

@@ -736,9 +736,42 @@ pub async fn test(test: &TestServer, assisted_discovery: bool) {
                 .await
                 .into_propfind_response(None);
             let props = response.properties(path);
-            for prop in chunky_props {
-                props
-                    .get(prop)
+            for prop in &chunky_props {
+                // 1.0's PROPPATCH is atomic (RFC 4918 9.2): on a collection, the
+                // dead properties are applied after the live ones and are not
+                // attempted once a live one fails, so they answer 424. A file's
+                // display name is itself a dead property, so every property of a
+                // file is checked and answers 507.
+                if !is_file && matches!(prop, DavProperty::Dead(_)) {
+                    let result = props.get(prop.clone());
+                    result.with_status(StatusCode::FAILED_DEPENDENCY);
+                    assert_eq!(result.prop.description, None);
+                } else {
+                    props
+                        .get(prop.clone())
+                        .with_status(StatusCode::INSUFFICIENT_STORAGE)
+                        .with_description("Property value is too long");
+                }
+            }
+            if !is_file {
+                // The dead property's own size check, alone in its PROPPATCH.
+                let dead_prop = chunky_props
+                    .iter()
+                    .find(|prop| matches!(prop, DavProperty::Dead(_)))
+                    .unwrap()
+                    .clone();
+                let response = client
+                    .proppatch(
+                        path,
+                        [(dead_prop.clone(), chunky_dead_contents.as_str())],
+                        [],
+                        [],
+                    )
+                    .await
+                    .into_propfind_response(None);
+                response
+                    .properties(path)
+                    .get(dead_prop)
                     .with_status(StatusCode::INSUFFICIENT_STORAGE)
                     .with_description("Property value is too long");
             }

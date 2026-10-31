@@ -17,13 +17,27 @@ pub mod security;
 pub mod task;
 
 use crate::utils::server::TestServerBuilder;
-use registry::schema::structs::{Expression, Imap, MtaStageAuth};
+use registry::schema::{
+    enums::NetworkListenerProtocol,
+    structs::{Expression, Imap, MtaStageAuth},
+};
+
+/// Submission over implicit TLS: 1.0 offers the bearer SASL mechanisms
+/// only over TLS, so `oidc::test` authenticates with OAUTHBEARER here.
+pub const SUBMISSION_PORT: u16 = 4467;
 
 #[tokio::test(flavor = "multi_thread")]
 pub async fn system_tests() {
     let mut test = TestServerBuilder::new("system_tests")
         .await
         .with_default_listeners()
+        .await
+        .with_listener(
+            NetworkListenerProtocol::Smtp,
+            "submissions",
+            SUBMISSION_PORT,
+            true,
+        )
         .await
         .with_object(Imap {
             allow_plain_text_auth: true,
