@@ -589,6 +589,8 @@ pub async fn test(test: &TestServer) {
         )
         .await
         .list_array()
+        // 1.0: a non-recurring event's instance has no base event
+        // (`baseEventId` null); 0.16 named the event itself.
         .assert_is_equal(json!([
           {
             "duration": "PT1H",
@@ -596,7 +598,7 @@ pub async fn test(test: &TestServer) {
             "start": "2006-01-02T10:00:00",
             "timeZone": "US/Eastern",
             "id": &ids[0],
-            "baseEventId": &event_1_id
+            "baseEventId": null
           },
           {
             "recurrenceId": "2006-01-02T12:00:00",
@@ -622,7 +624,7 @@ pub async fn test(test: &TestServer) {
             "duration": "PT2H",
             "title": "Event three",
             "id": &ids[3],
-            "baseEventId": &event_3_id
+            "baseEventId": null
           },
           {
             "recurrenceId": "2006-01-04T12:00:00",
