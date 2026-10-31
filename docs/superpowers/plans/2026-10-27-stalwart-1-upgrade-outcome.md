@@ -6113,6 +6113,48 @@ metadata", after R54's), the metadata fences (JMAP, IMAP, ingest and copy; DAV's
 containers by ruling 70) beside the mail writers' ordinary-writer assertion, and the next free
 names.
 
+
+### Task 6 rulings
+
+61. **Task 6 ran as four parts:** 6a (the `services` index queue and fences), 6b (the first
+    `jmap`, `http` and `managesieve` compile, and the object-metadata refusals), 6c (cache
+    snapshots and the swap suite) and 6d (the remaining tests and the leak rules). Its
+    review ran on Opus at xhigh.
+62. **Mechanical fixes during the first compile were made in place,** and listed. Behaviour
+    changes would have gone back to their owners. In the event there was one mechanical fix
+    (`http/src/api/shares.rs`'s base64 import).
+63. **The index queue's ordering reproduction runs at Task 7,** since it needs the `tests`
+    crate. R62's guard and R63's read are retired on source evidence, provisionally until
+    then.
+64. **A key account's Email search document holds ids only.** 1.0's Email index has no
+    arrival-time or size field, so this is more private than 0.16. The `SearchDocument` leak
+    rule is "ids only".
+65. **A key account's File and Contacts indexes keep upstream's builders,** because contacts,
+    address books and files aren't sealed for key accounts, as at 0.16.
+66. **Object-metadata refusals apply when the account or the caller is a key account.**
+    - Gets omit metadata rather than fail.
+    - `/changes` reports no metadata changes.
+    - IMAP answers `NO [NOPERM]`, and CAPABILITY drops `METADATA` and `LIST-METADATA`.
+    - A copy out of a key account carries no metadata, and a copy into one, its own copies
+      included, is refused when the source carries any.
+    - Setup refuses an account that holds object metadata (409 "account already holds
+      object metadata", placed after R54's term).
+    - The metadata writers assert that no vault record exists in every commit chunk.
+67. **The rest of Task 6 was split** into 6c and 6d for size.
+68. **The swap suite's `BlobStore` tier runs on the default blob store.** 1.0.1 refuses a
+    filesystem blob store for that tier.
+69. **The destroy window is accepted.** `destroy_account` runs `unindex_account` outside the
+    partition lock, so an index pass in flight can leave terms under the destroyed id. 1.0
+    never reuses account ids (`OBJ_SEQ_ID`, a counter that only grows), so they are inert for
+    access. Cost if wrong: a destroyed ordinary account's terms linger in the index.
+70. **Calendar dead-property writes are fenced.** A write to a calendar or calendar-event
+    dead-property container, by a writer that classified the account as ordinary, carries
+    the vault-absence assertion in every commit chunk (`za_dead_fence`). Address-book,
+    contact and file containers are excluded.
+
+Open for Task 9: the new 409 reason goes into CLAUDE.md and into the Circulo contract
+(`docs/api.md` in `circulo-account`).
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
