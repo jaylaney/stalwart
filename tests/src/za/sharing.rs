@@ -4610,9 +4610,28 @@ async fn delegated_run(
     .unwrap()
     .expect("owner-organized delegated gate");
     let second = match kind {
-        0 => za_self_create(&new, writer, owner, &resolution),
-        1 => za_self_update(old.unwrap(), &new, writer, owner, &resolution),
-        _ => za_self_cancel(old.unwrap(), writer, owner, &resolution),
+        0 => za_self_create(
+            &new,
+            writer,
+            owner,
+            &resolution,
+            RecipientPolicy::new(&test.server.core.groupware, 0),
+        ),
+        1 => za_self_update(
+            old.unwrap(),
+            &new,
+            writer,
+            owner,
+            &resolution,
+            RecipientPolicy::new(&test.server.core.groupware, 0),
+        ),
+        _ => za_self_cancel(
+            old.unwrap(),
+            writer,
+            owner,
+            &resolution,
+            RecipientPolicy::new(&test.server.core.groupware, 0),
+        ),
     };
     let second = match second {
         Ok(second) => second,
@@ -4692,6 +4711,7 @@ async fn delegated_run(
             } else {
                 ZaFanOutKind::Change
             },
+            RecipientPolicy::new(&test.server.core.groupware, 0),
             None,
             Some(&resolution),
         )
@@ -4800,6 +4820,7 @@ async fn delegated_scheduling_tests(test: &mut TestServer) {
                 uid: "task9-source",
             },
             ZaFanOutKind::Change,
+            RecipientPolicy::new(&test.server.core.groupware, 0),
             None,
             Some(&resolution),
         )
@@ -5244,7 +5265,13 @@ async fn delegated_identity_and_groups(test: &mut TestServer, owner_id: u32, wri
     .unwrap()
     .unwrap();
     assert!(matches!(
-        za_self_create(&tree, &writer, &owner, &resolution),
+        za_self_create(
+            &tree,
+            &writer,
+            &owner,
+            &resolution,
+            RecipientPolicy::new(&test.server.core.groupware, 0)
+        ),
         Err(groupware::scheduling::ItipError::NothingToSend)
     ));
     let (_, result, counts) =
@@ -5451,7 +5478,13 @@ async fn catch_all_resolution_is_quiet(test: &TestServer, owner_id: u32, writer_
         .unwrap()
         .unwrap();
         assert!(matches!(
-            za_self_create(&tree, &writer, &owner, &resolution),
+            za_self_create(
+                &tree,
+                &writer,
+                &owner,
+                &resolution,
+                RecipientPolicy::new(&test.server.core.groupware, 0)
+            ),
             Err(groupware::scheduling::ItipError::NothingToSend)
         ));
         assert!(
@@ -6162,7 +6195,14 @@ async fn delegated_attendee_and_alias_edges(test: &TestServer, owner_id: u32, wr
     .unwrap()
     .unwrap();
     assert!(matches!(
-        za_self_update(&old, &old, &writer, &owner, &resolution),
+        za_self_update(
+            &old,
+            &old,
+            &writer,
+            &owner,
+            &resolution,
+            RecipientPolicy::new(&test.server.core.groupware, 0)
+        ),
         Err(ItipError::NothingToSend)
     ));
     let (_, result, counts) = delegated_run(
@@ -6270,6 +6310,7 @@ async fn delegated_attendee_and_alias_edges(test: &TestServer, owner_id: u32, wr
                 uid: "task9-fallback",
             },
             ZaFanOutKind::Deletion,
+            RecipientPolicy::new(&test.server.core.groupware, 0),
             None,
             None,
         )
@@ -6406,6 +6447,7 @@ async fn delegated_attendee_and_alias_edges(test: &TestServer, owner_id: u32, wr
                 uid,
             },
             ZaFanOutKind::Change,
+            RecipientPolicy::new(&test.server.core.groupware, 0),
             None,
             None,
         )
@@ -6504,6 +6546,7 @@ async fn delegated_attendee_and_alias_edges(test: &TestServer, owner_id: u32, wr
                 uid: "task9-subaddress",
             },
             ZaFanOutKind::Change,
+            RecipientPolicy::new(&test.server.core.groupware, 0),
             None,
             None,
         )
@@ -6541,6 +6584,7 @@ async fn delegated_attendee_and_alias_edges(test: &TestServer, owner_id: u32, wr
                 uid: "task9-subaddress",
             },
             ZaFanOutKind::Change,
+            RecipientPolicy::new(&test.server.core.groupware, 0),
             None,
             None,
         )
@@ -6590,7 +6634,14 @@ async fn delegated_owner_exclusion_precedes_eligibility(
         .build();
     let mut broken = test.server.clone();
     std::sync::Arc::make_mut(&mut broken.core).storage.data = store::Store::None;
-    let second = za_self_create(&input, writer, owner, &resolution).unwrap();
+    let second = za_self_create(
+        &input,
+        writer,
+        owner,
+        &resolution,
+        RecipientPolicy::new(&test.server.core.groupware, 0),
+    )
+    .unwrap();
     let mut tree = input.clone();
     let first = itip_create(
         &mut tree,
@@ -6612,6 +6663,7 @@ async fn delegated_owner_exclusion_precedes_eligibility(
                 uid: "task9-owner-store-failure",
             },
             ZaFanOutKind::Change,
+            RecipientPolicy::new(&test.server.core.groupware, 0),
             None,
             Some(&resolution),
         )
@@ -6639,7 +6691,14 @@ async fn delegated_owner_exclusion_precedes_eligibility(
     .await
     .unwrap()
     .unwrap();
-    let second = za_self_create(&input, writer, owner, &resolution).unwrap();
+    let second = za_self_create(
+        &input,
+        writer,
+        owner,
+        &resolution,
+        RecipientPolicy::new(&test.server.core.groupware, 0),
+    )
+    .unwrap();
     let mut tree = input.clone();
     let first = itip_create(
         &mut tree,
@@ -6661,6 +6720,7 @@ async fn delegated_owner_exclusion_precedes_eligibility(
                 uid: "task9-owner-store-failure",
             },
             ZaFanOutKind::Change,
+            RecipientPolicy::new(&test.server.core.groupware, 0),
             None,
             Some(&resolution),
         )
@@ -6685,6 +6745,7 @@ async fn delegated_owner_exclusion_precedes_eligibility(
                     uid: "task9-owner-store-failure"
                 },
                 ZaFanOutKind::Change,
+                RecipientPolicy::new(&test.server.core.groupware, 0),
                 None,
                 Some(&resolution)
             )

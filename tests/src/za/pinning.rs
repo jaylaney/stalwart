@@ -845,15 +845,19 @@ async fn case_10_replay(test: &TestServer) {
 /// Spec 9 case 11 (spec 5.1, the two-item rule): ordinary delivery to an
 /// address with a withheld entry writes the full current state, then
 /// upstream's messages for it, and retires the entry after both; the full
-/// state is skipped when upstream's messages carry the master (a REQUEST or
-/// a CANCEL), when the relationship ended, or when it yields nothing. Each
-/// sub-case that counts items starts from a fresh refusal.
+/// state is skipped when upstream's messages cover the address (at 1.0, an
+/// organizer REQUEST carrying every instance it attends, its slice of the
+/// full update; upgrade ruling 91) or cancel the master, when the
+/// relationship ended, or when it yields nothing. Each sub-case that
+/// counts items starts from a fresh refusal.
 async fn case_11_ordinary_delivery(test: &TestServer) {
     case_11_reply(test).await;
     case_11_organizer(test).await;
     case_11_removal(test).await;
     case_11_failed_full_state(test).await;
     case_11_mixed(test).await;
+    case_11_still_fires(test).await;
+    case_11_exclusion_only(test).await;
     case_11_master_removal(test).await;
     case_11_delete(test).await;
     case_11_withheld_then_declined(test).await;
@@ -1196,9 +1200,12 @@ async fn case_11_failed_full_state(test: &TestServer) {
 /// Case 11, Mixed (`pin-11m`): bob on overrides X and Z but not the master,
 /// carol on the master and X, bob holding an entry; one PUT adds dave to
 /// the master and removes bob from X, the client bumping X. bob gets the
-/// full REQUEST (he is on Z), then his CANCEL for X, and no extra full
-/// state; the CANCEL, built from the old tree one below, carries the full
-/// REQUEST's SEQUENCE for X.
+/// full update (he is on Z), then his CANCEL for X, and no extra full
+/// state. At 1.0 the full update reaches him as his slice, Z alone (upgrade
+/// ruling 91): it covers him, so the fan-out adds no full state. The
+/// CANCEL carries alice's committed SEQUENCE for X. bob's first copy, the
+/// import of the create's X and Z slice, is its own reparse (upgrade
+/// ruling 94: no split placeholder persists).
 async fn case_11_mixed(test: &TestServer) {
     const Z: &str = "20990304T100000Z";
     const DAVE: &str = "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:dave@external.test\r\n";
@@ -1226,6 +1233,7 @@ async fn case_11_mixed(test: &TestServer) {
         .with_status(StatusCode::CREATED);
     assert_eq!(trigger_drain(BOB, STRONG).await, 207);
     assert_eq!(trigger_drain(CAROL, STRONG).await, 207);
+    assert_copy_reparses(test, bob.id, "pin-11m").await;
     // bob's entry: a refused change to Z.
     let original = substitute_public_key(test, bob.id, &writer_key(), true).await;
     assert_eq!(
@@ -1270,13 +1278,20 @@ async fn case_11_mixed(test: &TestServer) {
         "no extra full state"
     );
     assert!(
-        sequence_of(&items[0], X).is_some(),
-        "the full REQUEST holds X"
+        instance_of(&items[0], Some(Z)).is_some(),
+        "the full update's slice holds Z"
     );
+    assert!(
+        instance_of(&items[0], None).is_none() && instance_of(&items[0], Some(X)).is_none(),
+        "the slice holds neither the master nor X: {}",
+        items[0]
+    );
+    let committed = parse(&body(&alice.client, &path).await);
+    assert!(sequence_of(&committed, X).is_some());
     assert_eq!(
         sequence_of(&items[1], X),
-        sequence_of(&items[0], X),
-        "the CANCEL raised to the full REQUEST's value"
+        sequence_of(&committed, X),
+        "the CANCEL carries alice's committed SEQUENCE for X"
     );
     assert!(withheld(test, alice.id, BOB).await.is_empty());
 
@@ -1284,6 +1299,205 @@ async fn case_11_mixed(test: &TestServer) {
     delete_event(&alice, &path).await;
     clear_recipient(test, &bob, &bob_start, "pin-11m").await;
     clear_recipient(test, &carol, &carol_start, "pin-11m").await;
+}
+
+/// Case 11, Still fires (`pin-11s`, upgrade ruling 91): bob on overrides X
+/// and Z but not the master, holding an entry; alice changes only Z. bob's
+/// own message, Z's partial REQUEST, does not carry X, so the full state
+/// still goes first: his slice, X and Z without the master. Then the Z
+/// partial.
+async fn case_11_still_fires(test: &TestServer) {
+    const Z: &str = "20990304T100000Z";
+    let (alice, bob, carol) = parties(test);
+    let (bob_start, carol_start) = (
+        inbox_ids(test, bob.id).await,
+        inbox_ids(test, carol.id).await,
+    );
+    let path = event_path(&alice, "pin-11s");
+    alice
+        .client
+        .request_with_headers(
+            "PUT",
+            &path,
+            [CONTENT_TYPE],
+            with_override(
+                &recurring_invite("pin-11s", &[CAROL], &[BOB, CAROL]),
+                "pin-11s",
+                Z,
+                "",
+                &[BOB],
+            ),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+    assert_eq!(trigger_drain(CAROL, STRONG).await, 207);
+    let z_title = |from: &'static str, to: &'static str| {
+        move |body: String| edit_override(&body, Z, |line| Some(line.replace(from, to)))
+    };
+    // bob's entry: a refused change to Z.
+    let original = substitute_public_key(test, bob.id, &writer_key(), true).await;
+    assert_eq!(
+        rewrite(
+            &alice.client,
+            &path,
+            z_title("SUMMARY:fo-title pin-11s", "SUMMARY:fo-title pin-11s Z v2")
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(withheld(test, alice.id, BOB).await.len(), 1);
+    substitute_public_key(test, bob.id, &original, true).await;
+    let before = inbox_ids(test, bob.id).await;
+    assert_eq!(
+        rewrite(
+            &alice.client,
+            &path,
+            z_title(
+                "SUMMARY:fo-title pin-11s Z v2",
+                "SUMMARY:fo-title pin-11s Z v3"
+            )
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let items = opened(test, bob.id, &before).await;
+    assert_eq!(
+        methods(&items),
+        [
+            Some(ICalendarMethod::Request),
+            Some(ICalendarMethod::Request)
+        ],
+        "the full state, then the Z partial"
+    );
+    assert!(
+        instance_of(&items[0], Some(X)).is_some()
+            && instance_of(&items[0], Some(Z)).is_some()
+            && instance_of(&items[0], None).is_none(),
+        "the full state is bob's slice, X and Z: {}",
+        items[0]
+    );
+    assert!(
+        instance_of(&items[1], Some(Z)).is_some()
+            && instance_of(&items[1], Some(X)).is_none()
+            && instance_of(&items[1], None).is_none(),
+        "the Z partial: {}",
+        items[1]
+    );
+    assert!(withheld(test, alice.id, BOB).await.is_empty());
+    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+    let copy = body(&bob.client, &copy_href(test, bob.id, "pin-11s").await).await;
+    assert!(copy.contains("pin-11s Z v3"), "{copy}");
+
+    // Cleanup.
+    delete_event(&alice, &path).await;
+    clear_recipient(test, &bob, &bob_start, "pin-11s").await;
+    clear_recipient(test, &carol, &carol_start, "pin-11s").await;
+}
+
+/// Case 11, Exclusion only (`pin-11e`, upgrade ruling 91, A2): bob on the
+/// master and on X, holding an entry; alice adds an EXDATE to the master
+/// and changes nothing else. At 1.0 upstream sends that as a CANCEL with
+/// RECURRENCE-IDs, not as the full update, so no own REQUEST covers bob:
+/// the full state (which already carries the EXDATE) goes first, then the
+/// CANCEL, which merges without effect on any instance (it adds a cancelled
+/// override for the excluded date). Accepted: one more item than 0.16.
+async fn case_11_exclusion_only(test: &TestServer) {
+    const EXCLUDED: &str = "20990303T100000Z";
+    let (alice, bob, _) = parties(test);
+    let bob_start = inbox_ids(test, bob.id).await;
+    let path = event_path(&alice, "pin-11e");
+    alice
+        .client
+        .request_with_headers(
+            "PUT",
+            &path,
+            [CONTENT_TYPE],
+            recurring_invite("pin-11e", &[BOB], &[BOB]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+    let original = substitute_public_key(test, bob.id, &writer_key(), true).await;
+    assert_eq!(
+        rewrite(&alice.client, &path, |body| body.replacen(
+            "SUMMARY:fo-title pin-11e\r\n",
+            "SUMMARY:fo-title pin-11e v2\r\n",
+            1
+        ))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(withheld(test, alice.id, BOB).await.len(), 1);
+    substitute_public_key(test, bob.id, &original, true).await;
+    let before = inbox_ids(test, bob.id).await;
+    assert_eq!(
+        rewrite(&alice.client, &path, |body| body.replacen(
+            "RRULE:FREQ=DAILY;COUNT=5\r\n",
+            &format!("RRULE:FREQ=DAILY;COUNT=5\r\nEXDATE:{EXCLUDED}\r\n"),
+            1
+        ))
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let items = opened(test, bob.id, &before).await;
+    assert_eq!(
+        methods(&items),
+        [
+            Some(ICalendarMethod::Request),
+            Some(ICalendarMethod::Cancel)
+        ],
+        "the full state, then the exclusion's CANCEL"
+    );
+    assert!(
+        items[0].to_string().contains(&format!("EXDATE:{EXCLUDED}")),
+        "the full state carries the EXDATE: {}",
+        items[0]
+    );
+    assert!(
+        instance_of(&items[1], Some(EXCLUDED)).is_some() && instance_of(&items[1], None).is_none(),
+        "a CANCEL with RECURRENCE-IDs: {}",
+        items[1]
+    );
+    assert!(withheld(test, alice.id, BOB).await.is_empty());
+    assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+    let copy = copy_href(test, bob.id, "pin-11e").await;
+    let copy_body = body(&bob.client, &copy).await;
+    assert!(
+        copy_body.contains("pin-11e v2") && copy_body.contains(&format!("EXDATE:{EXCLUDED}")),
+        "bob keeps the update and the exclusion: {copy_body}"
+    );
+    // The CANCEL's merge adds a cancelled override for the date the
+    // EXDATE already excludes: no instance changes.
+    assert_eq!(
+        status_in(&bob.client, &copy, Some(EXCLUDED)).await,
+        Some(ICalendarStatus::Cancelled),
+        "the CANCEL merged without effect: {copy_body}"
+    );
+
+    // Cleanup.
+    delete_event(&alice, &path).await;
+    clear_recipient(test, &bob, &bob_start, "pin-11e").await;
+}
+
+/// Upgrade ruling 94: the stored tree of the account's copy of `uid`,
+/// unsealed, equals its own reparse: no component the root does not
+/// reference (a split placeholder) persisted from the item it was imported
+/// from.
+async fn assert_copy_reparses(test: &TestServer, account_id: u32, uid: &str) {
+    use crate::utils::za::stored_event;
+    use groupware::calendar::seal::unseal_event_pairs;
+    let keys = crate::utils::za::za_unlock(test, account_id, STRONG).await;
+    let href = copy_href(test, account_id, uid).await;
+    let document_id = document_id_of(test, account_id, &href).await;
+    let mut event = stored_event(test, account_id, document_id).await.za_event();
+    unseal_event_pairs(&mut event, &keys, account_id).unwrap();
+    let tree = event.content.data.event;
+    assert_eq!(
+        ICalendar::parse(tree.to_string()).unwrap(),
+        tree,
+        "{uid}: the copy's tree is its own reparse"
+    );
 }
 
 /// Case 11, Master removal (`pin-11y`): bob the master's only attendee and
