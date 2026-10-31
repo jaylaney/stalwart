@@ -363,10 +363,24 @@ pub async fn test(test: &TestServer) {
             .request("DELETE", &sharee_created_file, "")
             .await
             .with_status(StatusCode::NO_CONTENT);
-        sharee_client
-            .request("DELETE", &owner_folder, "")
-            .await
-            .with_status(StatusCode::NO_CONTENT);
+        if is_file {
+            sharee_client
+                .request("DELETE", &owner_folder, "")
+                .await
+                .with_status(StatusCode::NO_CONTENT);
+        } else {
+            // 1.0's write privilege no longer carries the right to delete a
+            // shared calendar or address book itself (`Acl::Delete`, which
+            // 0.16's write granted), so the owner deletes it.
+            sharee_client
+                .request("DELETE", &owner_folder, "")
+                .await
+                .with_status(StatusCode::FORBIDDEN);
+            owner_client
+                .request("DELETE", &owner_folder, "")
+                .await
+                .with_status(StatusCode::NO_CONTENT);
+        }
 
         // Test 12: Share and unshare a resource
         owner_client

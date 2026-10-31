@@ -756,8 +756,12 @@ pub async fn test(test: &mut TestServer) {
         .await;
 
     // Request a device code
-    let device_code_params =
-        AHashMap::from_iter([("client_id".to_string(), device_client_id.to_string())]);
+    // 1.0 scopes the token to what the request asks for: without the mail
+    // scope its session lists no account. 0.16 issued an unscoped token.
+    let device_code_params = AHashMap::from_iter([
+        ("client_id".to_string(), device_client_id.to_string()),
+        ("scope".to_string(), PROFILE_SCOPE.to_string()),
+    ]);
     let device_response: DeviceAuthResponse =
         post(&metadata.device_authorization_endpoint, &device_code_params).await;
     //println!("Device response: {:#?}", device_response);

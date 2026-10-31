@@ -28,6 +28,9 @@ pub async fn test(test: &TestServer) {
             .with_status(hyper::StatusCode::CREATED);
         hrefs.push(href);
     }
+    // 1.0 answers addressbook-query from the Contacts search index, which an
+    // index task fills after each PUT; 0.16 matched the cards directly.
+    test.wait_for_tasks().await;
     let uri_sarah = hrefs[0].as_str();
     let uri_carlos = hrefs[1].as_str();
     let uri_acme = hrefs[2].as_str();
