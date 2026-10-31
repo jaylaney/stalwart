@@ -796,7 +796,7 @@ END:VCALENDAR
         .with_status(StatusCode::OK)
         .expect_body()
         .lines()
-        .filter(|line| !line.starts_with("DTSTAMP"))
+        .filter(|line| !line.starts_with("DTSTAMP") && !line.starts_with("CREATED"))
         .map(String::from)
         .collect::<AHashSet<_>>();
     let expected_ical = TEST_ICAL_1
@@ -1247,15 +1247,59 @@ pub fn test_jscalendar_4() -> Value {
     })
 }
 
+// 1.0's CalDAV view of the JMAP event: its PRODID, the referenced time zone,
+// the description, SEQUENCE and the alert (with its JSCalendar id) the event
+// holds by then, and a server CREATED (left out of the comparison).
 const TEST_ICAL_1: &str = r#"BEGIN:VCALENDAR
 VERSION:2.0
+PRODID:-//Stalwart Labs LLC//Stalwart Server//EN
 BEGIN:VEVENT
 DTSTART;TZID=US/Eastern:20060102T100000
 UID:74855313FA803DA593CD579A@example.com
 DURATION:PT1H
 SUMMARY:Event one
+DESCRIPTION:Event one
 DTSTAMP:20060206T001102Z
 CATEGORIES:work
+SEQUENCE:1
+BEGIN:VALARM
+ACTION:DISPLAY
+TRIGGER:PT15M
+JSID:abc
+END:VALARM
 END:VEVENT
+BEGIN:VTIMEZONE
+TZID:US/Eastern
+BEGIN:STANDARD
+DTSTART:20051230T190000
+TZNAME:EST
+TZOFFSETFROM:-0500
+TZOFFSETTO:-0500
+END:STANDARD
+BEGIN:DAYLIGHT
+DTSTART:20060402T020000
+TZNAME:EDT
+TZOFFSETFROM:-0500
+TZOFFSETTO:-0400
+END:DAYLIGHT
+BEGIN:STANDARD
+DTSTART:20061029T020000
+TZNAME:EST
+TZOFFSETFROM:-0400
+TZOFFSETTO:-0500
+END:STANDARD
+BEGIN:DAYLIGHT
+DTSTART:20070311T020000
+TZNAME:EDT
+TZOFFSETFROM:-0500
+TZOFFSETTO:-0400
+END:DAYLIGHT
+BEGIN:STANDARD
+DTSTART:20071104T020000
+TZNAME:EST
+TZOFFSETFROM:-0400
+TZOFFSETTO:-0500
+END:STANDARD
+END:VTIMEZONE
 END:VCALENDAR
 "#;
