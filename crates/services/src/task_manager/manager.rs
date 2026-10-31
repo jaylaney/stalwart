@@ -95,24 +95,19 @@ pub fn spawn_task_manager(inner: Arc<Inner>) {
             revision: 0,
         };
         loop {
-<<<<<<< HEAD
-            // Zero-access test hook (invitations spec 11): while it is held,
-            // the consumer takes no task, so a test can read the queue.
-            #[cfg(feature = "test_mode")]
-            common::za::test_hooks::task_consumer_pause_point().await;
-
-            // Index any queued tasks
-            let mut sleep_for = inner.build_server().process_tasks(&mut ipc).await;
-=======
             // Release the locks held by tasks that have completed, unless the event
             // was already dispatched again
             while let Ok(done) = done_rx.try_recv() {
                 ipc.task_done(done);
             }
 
+            // Zero-access test hook (invitations spec 11): while it is held,
+            // the consumer takes no task, so a test can read the queue.
+            #[cfg(feature = "test_mode")]
+            common::za::test_hooks::task_consumer_pause_point().await;
+
             let flagged = inner.ipc.task_tx.take();
             let mut sleep_for = inner.build_server().process_tasks(&mut ipc, flagged).await;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
             if is_clustered && sleep_for > REFRESH_INTERVAL {
                 sleep_for = REFRESH_INTERVAL;
             }

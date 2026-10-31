@@ -7,8 +7,8 @@
 use super::*;
 
 fn encrypt_len(plaintext_len: usize) -> usize {
-    let secret = EphemeralSecret::random(&mut OsRng);
-    let p256dh = secret.public_key().to_encoded_point(false);
+    let secret = EphemeralSecret::try_generate().expect("key generation failed");
+    let p256dh = secret.public_key().to_sec1_point(false);
 
     ece_encrypt(p256dh.as_bytes(), &[0u8; 16], &vec![b'a'; plaintext_len])
         .expect("encryption failed")
