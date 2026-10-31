@@ -6155,6 +6155,212 @@ names.
 Open for Task 9: the new 409 reason goes into CLAUDE.md and into the Circulo contract
 (`docs/api.md` in `circulo-account`).
 
+## Task 7
+
+### Part 7a: the integrated compile and the sweep
+
+Part 7a brought the `tests` crate to 1.0.1's APIs, ran the four compile checks and the
+integration sweep, and ran no integration suite (that is part 7c). Commits: `c41374600`
+(the mechanical port), `31d192cad` (ruling 33's LLM and metrics setup). The crate code
+outside `tests/` is unchanged.
+
+#### Compile results
+
+At `31d192cad`, with the PATH prefix:
+
+| Check | Result |
+|---|---|
+| `cargo check -p stalwart --no-default-features --features rocks` | passes, no warning |
+| `cargo fmt --all --check` | passes |
+| `cargo test --workspace --exclude tests --exclude scim --exclude scim-proto --lib --bins --no-run --features "$UNIT_TEST_FEATURES"` (Task 2's list) | passes, no warning |
+| `cargo check -p tests --tests` | fails: 215 errors, all in the five files under "Needs a ruling" (`system/task.rs` 10, `system/oidc.rs` 45, `store/lookup.rs` 26, `store/query.rs` 128, `smtp/inbound/antispam.rs` 6) |
+| `cargo test -p tests --no-run`, `cargo check --workspace --tests` | fail on the same 215 errors |
+
+With a disposable change that sets those five spots aside (`store::query` cut to its
+`FIELDS` constant, `system::oidc` declared under `cfg(any())`, the antispam DKIM and ARC
+arms replaced by `todo!()`, and the two proposals below applied), every check passes:
+`cargo test -p tests --no-run` links the test binary, `cargo check --workspace --tests`
+finishes, and the only warnings are the disposable change's own. That change was reverted
+and is not committed; it is kept with the proposals in the plan workspace
+(`task-7a/disposable-verification.patch`, `task-7a/proposal-task-lookup.patch`). So once
+the five spots are ruled, the crate needs no further compile work outside them.
+
+#### Sweep
+
+Over tracked files at `31d192cad`. "Added" means more occurrences in a file than in both
+`9601038de` and `23b69755c`.
+
+- **Conflict markers** (`^<<<<<<< `, `^>>>>>>> `, `^=======$`): none.
+- **`todo!()` and `unimplemented!()`:** none added. `automation/dkim.rs`'s `todo!()` arm is
+  0.16's; part 7a only added 1.0's new `Dkim2MlDsa44Ed25519Sha512` variant to it.
+- **Placeholder returns:** none. The early returns added in fork code are its logic, read
+  at each site: `za_has_search_documents`/`za_has_search_terms` without an internal search
+  store (the recorded limit), `za_assert_absent_in_every_chunk` with no keys, the metadata
+  probes' found exits, the index-queue builder's header check, the sharing converter's
+  already-linked exit and `is_ck`'s legacy exit. Words such as TODO and placeholder match
+  only VTODO, test names and test data.
+- **Disabled tests:** no new `#[ignore]`. The six ignored tests are 0.16's six (two of them
+  moved into restored test files). No `cfg(any())`, `cfg(not(test))` or commented-out call.
+  Sub-test calls missing from the suites, against `9601038de`: `directory::oidc`,
+  `system::archiving`, `system::tenant` (SEL-only, Task 2) and `telemetry::{metrics,
+  tracing}` (ruling 33); every other 0.16 call is present, and the za suite gained Tasks 4
+  and 6's.
+- **Private test dependencies:** none restored. The 562 `stalwart-tests/` `#[path]`s equal
+  v1.0.1's and all sit under `cfg(all(test, stalwart_tests, …))`; the two
+  `[target.'cfg(stalwart_tests)'.dependencies]` blocks equal v1.0.1's; no file has more
+  `stalwart_tests` references than v1.0.1 (993 against 1195: Task 2 regated some to
+  `test_mode`); the `tests` crate gained only `smtp-report`, a workspace crate.
+- **Test hooks named in CLAUDE.md:** all present, each with as many production call sites
+  as at 0.16 (the `common::za::test_hooks` pause and fault points, the drain skip and the
+  lease, retry and redelivery overrides, `store::za_test`'s `INDEX_CHUNK_PAUSE` and
+  `FORCE_COMMIT_SPLIT`, `http`'s four `za_test` pause points), except
+  `INDEX_GUARD_FAIL_ONCE`, which Task 6a retired with R62's guard (ruling 63, provisional
+  until 7c). CLAUDE.md still lists it (Task 9).
+
+#### Fixes by file
+
+All under `tests/` (`tests/Cargo.toml` gains the workspace's `smtp-report`).
+
+- **Harness.** `utils/dns.rs`: 1.0's cache values (`TxtRecord`; `Ok(RecordSet { records, .. })`
+  for MX, IP and PTR; `Some(..)` for TLSA; DNSBL entries in `spam_lookup` as
+  `SpamLookup::Dnsbl`). `utils/server.rs`: `all_queued_messages` reads the queue-event keys
+  itself (0.16's `SmtpSpool::next_event` and `QueuedMessages` are gone; 1.0's manager scans
+  one queue at a time), returning the due events of every queue and the next due time;
+  `fetch_email` reads the metadata row from the immutable class. `utils/webdav.rs`:
+  quick-xml 0.42's `str`-based names and text. `utils/registry.rs`: `Action::ReloadSettings`
+  takes its result struct.
+- **Renames and moves.** mail-auth 0.14 (`Mx`, `SpfRecord`, `DmarcRecord`, `TlsRptRecord`,
+  `MtaStsRecord`, `DkimReportRecord`, `dns::TxtRecordParser`, `crypto`, `dkim::DomainKey`);
+  `AlignedBytes` to `ArchiveBytes`; `write(batch.build_all())` to `write_batch`;
+  `fetch_dav_resources` to `fetch_groupware_resources` (with `GroupwareCache` imported);
+  `MessagesCache::{items, index}` to its methods; `MessageRef` accessors; boxed
+  `ObjectInner` and SMTP error details; `QueueEvent::Refresh(QueueRefresh::All)`;
+  `SubscriberBuilder::register`'s third value; `StoreEvent::{CacheHit, CacheMiss}` to
+  `CacheEvent::{Hit, Miss}` (`za/tracing.rs`, `za/mail/traces.rs`: same keys);
+  `HttpAuthEntries` cleared through `grant_revocations`; `ZaMailView` imported; ZaEvent's
+  row fields through `.meta`; `Subspace` for the `SUBSPACE_*` constants; mail-parser 1.0's
+  bodies, parts, headers and offsets; `base64` for `base64_decode`; `PasswordVerifier` for
+  the directory backends' `authenticate`; `Authenticated.access_token`.
+- **Registry field renames** (1.0's schema): `EmailAlias.enable`, `Domain.enable`,
+  `Http.client_ip_source` (`XForwardedFor` for `use_x_forwarded: true`),
+  `NetworkListener.implicit_tls`, `Jmap.max_*`, `MtaRouteRelay.host`, `MtaMilter.host`,
+  `MtaInboundSession.idle_timeout`, `DmarcReportSettings.max_aggregate_report_size`,
+  `ReportSettings.max_inbound_report_size`, `DmarcReport.date_range_start`,
+  `AsnResource.refresh_interval`, `NatsCoordinator.hosts`, `DnsServerTsig.poll_interval`,
+  `MtaConnectionStrategy.local_ips`/`local_ip`, `LdapDirectory.filter_recipient`,
+  `PasswordCredential.otp_url`, `TaskManager` without its removed fields
+  (`automation::dkim`'s fast-retry setting), the SQLite stores' `Option` pool sizes.
+- **Settings 1.0 moved or removed.** `SenderAuth.dkim_sign_domain` is set on `MtaStageData`
+  instead (`smtp/inbound/{dkim2,dmarc,sign}.rs`, written after `mta_add_all_headers`);
+  `SieveSystemInterpreter.duplicate_expiry` is dropped (no trusted script uses
+  `duplicate`); `OidcDirectory.require_audience` becomes `accepted_audiences` and
+  `require_scopes` is dropped (`directory/{issuer,discovery,unavailable}.rs`).
+- **Reports.** `smtp/{reporting,management}/*`, `smtp/inbound/dmarc.rs`,
+  `smtp/outbound/{dane,mta_sts}.rs`: smtp-report's `AggregateReport`, `Record`,
+  `Disposition`, `DmarcStatus`, `FailureType`, `TlsReport` and `Summary` fields; a test-side
+  `DmarcRecordBuilder` (`smtp/reporting/mod.rs`) gives 1.0's builder-less `Record` 0.16's
+  `with_*` calls.
+- **Groupware and calendar.** `za/setup.rs`, `za/expansion.rs`, `webdav/cal_scheduling.rs`:
+  1.0's split-record storage calls (`insert` with content, `update_meta`, the async
+  `delete`/`delete_all`, `changed_by`); `za/sharing.rs`: a local `scheduling_account_info`
+  (0.16's removed helper, as the DAV handlers' `za_roles` builds the sender),
+  `sequence_floor::za_set_sequences`, `RecipientPolicy::new(&config, 0)` for upstream's
+  builders, `get_or_create_default_calendar` on `AccountCache`s; `webdav/cal_itip.rs`: an
+  all-visible, unlimited `RecipientPolicy` (as the delegation unit tests), and
+  `itip_merge_changes`'s result propagated; `webdav/cal_query.rs`: 1.0's expansion API;
+  `ItipTime.kind`; `SmallVec` values; `webdav/{prop,lock}.rs`: `DavProperty::Dead(XmlName)`
+  and the metadata entry-size limit.
+- **Mail.** `imap/body_structure.rs` (the synchronous sub-test): built from
+  `MessageMetadata::build` and written with `ImapMetadata`'s `write_structure`,
+  `body_section`, `binary` and `binary_size`, compared with the same fixtures;
+  `system/delivery.rs`: the metadata row and `FetchedBlob`; `jmap/mail/*`: `MessageData`
+  read in its own encoding, the thread move through `PendingMessageData`, `Mailbox.flags`,
+  `IngestSource::Smtp`'s sender fields (as `jmap::za_variants`), `PendingId` arguments.
+- **Store.** `store/blob.rs`: a test-side `blob_has_access` (0.16's removed function over
+  1.0's link keys) and the metadata row in the immutable class, where account destruction
+  reads it; `store/ops.rs`: `merge_fnc` without `Params`, the change id written by a
+  `ChangeIdBe` patch where 0.16 used `set_fnc`, `ValueClass::ChangeId(group)`;
+  `store/import_export.rs`: `Subspace` (below).
+- **SMTP.** `MessageTexts` for `build_spam_input` and `from_message`; `CompactString` tags;
+  `build_message(&SessionAddress)`; `run_script(&Sieve)`; `eval_if`'s arena;
+  `Server::eval_expr` (removed) as `eval_if` over a condition-free `IfBlock`; DKIM2
+  `sign(.., None)`; `tenant_ids` on queued-message fixtures; the milter client test's raw
+  headers.
+- **Warnings.** `za/sharing.rs`'s `CLASSES` constant, which part 4c defined and never used,
+  is removed; unused imports are dropped.
+
+#### Needs a ruling
+
+Each spot is left as merged; the crate does not compile until all five are ruled.
+
+1. **`system::task` (`tests/src/system/task.rs`).** 1.0 removed `TaskManager.max_attempts`,
+   `total_deadline` and `manager::next_retry_time`: a transient failure retries until it
+   succeeds, and `alert_after` marks it `Stalled` (`services/src/task_manager/outcome.rs`,
+   `NextAttempt::plan`). Errors: the removed fields (lines 77, 81, 110, 114, 163, 167, 193,
+   194) and the unresolved `next_retry_time` (line 20, called at 170-203). Options:
+   (a) drop `retry_time_boundaries`, the attempt-limit case and the terminal-deadline case
+   as "subject deleted" (proposal in `task-7a/proposal-task-lookup.patch`; compiles; ledger
+   rows needed); (b) re-express the attempt-limit case for 1.0 (`alert_after: 3`, expect a
+   `Stalled` task at attempt 3) and drop the other two; (c) keep them for a fork retry
+   limit, which would be new product code.
+2. **`system::oidc` (`tests/src/system/oidc.rs`, 45 errors).** 1.0 redesigned the OAuth login
+   API (`LoginRequest::AuthCode { account_name, account_secret, mfa_token, query, consent }`;
+   `LoginResponse::Authenticated { location }`) and removed `OidcProvider`'s
+   `auth_code_max_attempts`, `refresh_token_renewal`, `anonymous_client_registration` and
+   `require_client_registration`. The request port is mechanical (the authorization
+   parameters as a query string, the code and `iss` read from `location`); the removed
+   settings are not: the test sets them and checks behaviours that depend on them
+   (`REFRESH_TOKEN_RENEWAL` at line 804, anonymous confidential registration at 567-579).
+   Options: (a) port the flows and give the removed-setting cases a "subject deleted"
+   disposition with ledger rows; (b) disposition the module until a rewrite; (c) port the
+   flows and re-derive the refresh-renewal and registration checks from 1.0's fixed
+   behaviour.
+3. **`store::lookup` (`tests/src/store/lookup.rs`, 26 errors).** 1.0 has no in-memory store
+   kept in the data store (`InMemoryStore::Store` is gone; `InMemoryStore::Sql` refuses
+   every operation), no `purge_in_memory_store` (a local store expires entries when read),
+   no `counter_get`, and `counter_incr`/`is_rate_allowed` changed shape. The four
+   `store_assert_is_empty` checks and the initial `store_destroy` sit under
+   `if let InMemoryStore::Store`, which cannot occur at 1.0. Proposal (compiles): drop those
+   branches and the purges, `counter_incr` to `key_incr`, `counter_get` as
+   `key_incr(KeyValue::new(key, 0))` (1.0's local store returns the current value), ledger
+   rows. Note for 7c: `smtp::lookup::expressions` also uses an `sql` lookup store for
+   `key_*`/`counter_*`, which 1.0 refuses.
+4. **`store::query` (`tests/src/store/query.rs`, 128 errors).** 1.0 replaced the search
+   filter API (`SearchOperator` and `SearchFilter::cond` give way to `TextMatch`,
+   `Ordering` and `KeyValueMatch` variants) and the Email index has no `ReceivedAt`, `Size`
+   or `SentAt` fields (ruling 64), which the test's integer filters and sorts use. The text
+   filters port mechanically; the integer ones do not. Options: (a) move the dataset's
+   integer columns to an index that keeps integer fields; (b) keep the text part and give
+   the integer filters and sorts a "subject deleted" disposition; (c) rewrite against 1.0's
+   query engine. `jmap::mail::query` imports its `FIELDS` constant, which needs no change.
+5. **`smtp::inbound::antispam` DKIM and ARC fixtures (`tests/src/smtp/inbound/antispam.rs`,
+   lines 341-353).** mail-auth 0.14 keeps `DkimOutput::{pass, neutral, fail, perm_err,
+   temp_err}` and `ArcOutput::with_result` crate-private, with no test constructor, so the
+   fixtures' `dkim.result` (18 lines) and `arc.result` (6 lines) cannot be turned into
+   outputs. Options: (a) drop the two parameters and the tags they produce, with ledger
+   rows; (b) produce real outputs by verifying signed fixtures against cached DNS records
+   (a rewrite of those fixtures); (c) pin a mail-auth build that exposes constructors,
+   which is not an upstream release.
+
+#### Expectations for part 7c
+
+Runtime facts this part relies on and did not run:
+
+- `all_queued_messages` returns every due event of every queue, sorted by due time, where
+  0.16's spool listed them through a fresh `Queue`; the SMTP queue tests that loop on it
+  (`lmtp`, `smtp`, `retry`, `manager`) assume the same set.
+- `CacheEvent::{Hit, Miss}` carry the looked-up key in `Key`, as 0.16's store events did,
+  so `za::tracing`'s and `za::mail::traces`' controls and canaries keep their meaning.
+- `smtp/inbound/{dkim2,dmarc,sign}.rs`: updating only `MtaStageData.dkim_sign_domain` after
+  `mta_add_all_headers` keeps the headers it set.
+- `store::ops`: the batch assigns the change id the `ChangeIdBe` patch writes when the set
+  precedes `log_container_insert`.
+- `webdav::cal_itip` and `za::sharing`: the recipient policies reproduce 0.16's messages
+  (one per recipient group with every attendee visible).
+- `imap::body_structure`: the fixtures still match 1.0's writer; a mismatch writes
+  `*.imap_failed` and is a 1.0 output change for the expectation ledger.
+- `webdav::{prop,lock}`: the large-property cases now probe `metadata.max_entry_size`.
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
@@ -6395,6 +6601,15 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `za::index_task::test_mid_pass_deletion` (fork, Task 6 fix round, ruling 69) | Asserts the orphan that the resumed chunk leaves under the destroyed id, and its inertness: no account holds the id, the partition holds no entry, and a later account gets a greater id. Part 6d asserted that no orphan is left. The case then removes the orphan for the suite's emptiness check. | Ruling 69: `destroy_account` runs outside the partition lock; 1.0 never reuses an account id (`OBJ_SEQ_ID`, `RegistryClass::IdCounter`). |
 | `za::leak::{scan, test_index_control}` (fork, Task 6 fix round, F2 and F8) | Every `Shared` container except a calendar's, an event's, an address book's, a card's or a file's is flagged (`Collection::Principal` included). Counters are decoded, and one that counts containers is flagged. Other owners' `Private` records whose viewer is the account are flagged. Five new plants. | Stronger. Ruling 66's caller rule. |
 | `za::index_task::test_reindex` (fork, Task 6 fix round, F7) | The two messages differ in size and arrival time. Both sorts are checked against `Email/get`'s values, and the two orders must differ. Part 6d checked only the count. | Stronger. |
+| `store::import_export::test` (Task 7a) | The snapshot's subspace list is 1.0's `Subspace` enum. 0.16's in-memory counter, in-memory value and quota subspaces are gone; `Immutable`, `IndexProperty` and `Directory` are added, so the restore is still compared wherever account and directory data live. | `store/src/lib.rs`: 1.0 has no in-memory or quota subspaces, keeps message rows in `Immutable` and per-object properties in `IndexProperty`, and backs up `Directory` with the registry (`common/src/manager/backup.rs`). |
+| `directory::{issuer, discovery, unavailable}` (Task 7a) | `require_audience` becomes `accepted_audiences` with the same audience; `require_scopes` is dropped from the fixtures. No assertion changes. | `registry` `OidcDirectory`: 1.0 removed the required-scopes setting and takes a list of accepted audiences. |
+| `smtp::inbound::antispam::antispam` (Task 7a, ruling 33) | The LLM case's setup goes with the case: the AI model, the `SpamLlm` settings, the mock chat-completion server and the `"llm"` match arm. | 1.0's OSS build has no `SpamLlm`, `common::enterprise::llm` or `spam_filter::analysis::llm`, and `AiModel` is an enum. |
+| `telemetry::metrics::test` (Task 7a, ruling 33) | The uncalled sub-test no longer inserts test metrics. | `insert_test_metrics` is in the SEL-only `common/src/telemetry/metrics/test_data.rs`, which Task 2 did not restore. |
+| `webdav::cal_query` expansion comparison (Task 7a) | The expected instances fill 1.0's added `CalendarEventExpansion` fields with defaults, and the comparison clears `series_recurrence_id`, `end_naive`, `start_tz`, `end_tz` and `flags` on both sides, as it cleared `own_recurrence_id` and `start_naive` at 0.16. It still compares the component and the instants. `expand` takes `OverlapRule::CalDav`. | `groupware/src/calendar/expand.rs`: 1.0's expansion carries series recurrence ids, naive ends, zones and range flags, and expansion takes an overlap rule. |
+| `webdav::{prop, lock}` large-property cases (Task 7a) | The oversized dead property and lock owner are sized from `core.metadata.max_entry_size`. | `dav/src/common/{lock,dead/patch}.rs`: 1.0 stores dead properties as metadata entries and limits them, and lock owners, by the metadata entry size; `GroupwareConfig.dead_property_size` is gone. |
+| `store::blob::blob_tests` (Task 7a) | Link checks go through a test-side `blob_has_access`, 0.16's removed function over 1.0's link keys; the linked document's metadata fixture is a metadata row in the immutable class. | `store/src/write/blob.rs`: 1.0 removed `Store::blob_has_access`; `services` `destroy_account_blobs` reads the blob hash from the immutable metadata row. |
+| `imap::body_structure::test` (Task 7a) | The metadata is built by ingest's `MessageMetadata::build` and written with `ImapMetadata` (`write_structure`, `body_section`, `binary`, `binary_size`); `HEADER.FIELDS` sections are read through `body_section` with a `HeaderMatcher`. The fixtures and the comparison are unchanged. | `imap/src/op/fetch/structure.rs`: 1.0 writes BODY, BODYSTRUCTURE and sections from the stored metadata row; 0.16's `AsImapDataItem` and `build_metadata_contents` are gone. |
+| `webdav::cal_itip::test` (Task 7a) | The iTIP builders and `itip_process_message` take an all-visible, unlimited `RecipientPolicy`. | `groupware/src/scheduling/recipient.rs`: 1.0's builders split messages per recipient by policy; with every attendee visible and no limit they build 0.16's messages (the fork's delegation unit tests use the same policy). |
 
 ## Task 1 check
 
