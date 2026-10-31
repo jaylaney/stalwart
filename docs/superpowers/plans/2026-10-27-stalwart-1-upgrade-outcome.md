@@ -5913,6 +5913,172 @@ The scans assert that at least one frame of each kind decoded. The needles are:
   - the `SearchDocument` leak rule;
   - the object-metadata and IMAP METADATA tests.
 
+### Part 6d: the remaining Task 6 tests and the leak scanner at 1.0
+
+Part 6d wrote the Task 6 tests that parts 6a to 6c left open, ported the
+za tests that still used 0.16's index tasks and storage (`leak.rs`,
+`index_task.rs`, `mail/fence.rs`'s index cases, `mail/search.rs`'s scan),
+and extended the leak scanner to 1.0's spaces. It changes no crate code and
+adds no hook: ruling 63's reproduction uses the existing
+`INDEX_WRITE_PAUSE`, and a partition is held through its status key (below).
+Commits: `34f704f37` (the scanner and the helpers), `e40fa2c10` (the
+metadata refusals), `3ca6e4941` (the index cases).
+
+**Checks.** `cargo check -p tests --tests` reaches type checking: the
+crate's other files still fail (152 errors, Task 7's), and none is in a file
+this part touched, which also carry no warning. Borrow checking of these
+files is not confirmed, because the crate does not finish compiling.
+rustfmt is clean on every touched file.
+
+#### Holding a partition
+
+0.16's tests held the task consumer, which does not hold 1.0's index queue.
+`utils::za::hold_index_partition` writes the partition's status key as a
+failed pass writes it, with its retry an hour away, so the manager skips
+the partition (`scan_index_queue`) while its entries stay queued.
+`release_index_partition` clears the key and wakes the manager, as
+`x:IndexQueueStatus/set` with a `Running` status does. A partition must be
+idle when it is held, and `wait_for_tasks` waits for a held partition.
+Beside them: `queue_entries`, `partition_status`, `wait_for_index_queue`
+(bounded, it does not wait out a retry delay), `search_keys` (a document's
+id and value, and the term keys with their verbatim bytes),
+`index_search_documents`, `unindex_search_documents`,
+`unindex_search_account` and `delete_event_records`. 1.0's
+`SearchStore::index` and `unindex` are unreachable on the internal store, so
+the tests go through `index_account_documents` and `unindex_account`.
+
+#### The cases and where they live
+
+| Case | Module | What fails it |
+|---|---|---|
+| `reindex_key_account_stays_visible_fields_only` | `index_task::test_reindex` | A key account's rebuilt Email document that holds a term or more than its ids, or a threading key, non-empty sort keys or a leak-scan violation; the ordinary control must hold the subject, body and attachment tokens. The records are first removed with the account-wide range delete, so the reindex task must rebuild them. |
+| `attachment_indexer_never_reads_sealed_blob` | `index_task::test_attachment_indexer` | The key account's sealed blob is deleted and its entry queued again: a blob read fails the pass ("Blob not found"), so the partition must drain within 10 s. The control proves the deletion is detected: the ordinary account's same pass enters its retry state, and its unindex then clears it. |
+| The index-queue fault test | `index_task::test_index_retry` | `INDEX_BUILD_FAIL_ONCE` fails a calendar build. The partition keeps its entry, and `x:IndexQueueStatus/get` reports it failed. The reset (`x:IndexQueueStatus/set`) makes the retry run within 10 s, well inside the 30 s delay, and it indexes the event. A second failure with the events deleted refuses setup with R54's "account has unfinished tasks". After the reset, the queue drains and setup proceeds. |
+| Provisioning mid-pass | `index_task::test_mid_pass_provisioning`; `fence::superseded_index_write_loses_to_provisioning` and `superseded_index_tail_loses_to_provisioning` | `index_task` uses `FORCE_COMMIT_SPLIT` and a two-message pass: chunk 0 holds every term merge and the first `Document` key, and chunk 1 the second. On one node, R46 refuses setup while the pass is parked. A superseding node B is simulated (`emulate_superseding_node`), and its deletions leave the second message's postings, which R62's term scan refuses. After the account-wide unindex, setup completes. The resumed chunk 1 must fail its assertion: nothing lands, the partition enters its retry state, and one reset drains it. Fencing chunk 0 only fails it. `fence`'s two cases do the same with a whole small pass and with a large body's natural split. |
+| Deletion mid-pass | `index_task::test_mid_pass_deletion`, run last in the suite | The account is destroyed while its pass is parked between chunks, and no orphan may be left under its id. Part 6a expects this to fail: destruction runs outside the partition lock. |
+| The ordering reproduction (ruling 63) | `fence::setup_refuses_an_in_flight_index_write` and its calendar twin | The import's index write is parked at `INDEX_WRITE_PAUSE`, and the message's unindex is queued before it runs. After the release there must be no document or term, and setup must pass with no cleanup. If the late write orphans the document, this case fails. |
+| The destroyed-stub unindex | `index_task::test_destroyed_stub` | A key account's destroyed stub must leave no row, sort keys, blob link or search document, and its queue must drain without a failure. The format-byte arm itself is unit-tested by 6a (`services::index_queue::za::tests`), because a stub's thread subject resolves without reading its header section. |
+| Metadata refusals | `gating::test_metadata` | Covered on the key account: `Mailbox/set` create and update with metadata (`forbidden`, `ZA_METADATA_REFUSED`), the same create without metadata (it succeeds), `Mailbox/get` (metadata omitted), `Mailbox/query` with `metadataExists` (`unsupportedFilter`) and the session capability. Over IMAP: `GETMETADATA`, `SETMETADATA` and `LIST … RETURN (METADATA …)` answer `NO [NOPERM]`, and `CAPABILITY` lists neither `METADATA` nor `LIST-METADATA`. An ordinary account's identical requests succeed. |
+| The leak enumeration | `leak::{scan, test_index_control, test_mail, test_shared_structure}` | Below. |
+
+The `fence.rs` index cases at 1.0:
+- **R46** holds the Email partition.
+- **R51** plants its document through `index_account_documents`. 1.0 has no `ReceivedAt` field.
+- **R54's `account_tasks`** reads only the `MergeThreads`, `CalendarItipMessage` and `ShareRevokeCleanup` task records. Index work is read as queue entries.
+- **R62's term scans** are kept. 0.16's "`Index` key alone" case is dropped, because every 1.0 field is a term.
+- **R62's two between-chunks cases and R63's merge case are flipped.** The unindex waits behind the parked pass on the same partition: setup is refused meanwhile, and nothing is left afterwards.
+- **R63's two other cases are retired** with the guard: `failed_guard_with_its_document_stored_defers_the_task` and `stopped_document_leaves_its_batch_written`.
+- **`multi_chunk_calendar_merge_is_written_whole`** is ported unchanged.
+- **The jmap variant's `wait_for_tasks`** (PR #66, "An unindex queued before the import's index write can orphan the document") stays until Task 7 runs the reproduction.
+
+#### The leak rules per space
+
+`scan` walks `Subspace::ALL` and keys every rule on the `Subspace` enum,
+never on bytes. `SearchTerm` and `SearchDocument` are read from the
+internal search store, and every other subspace from the data store. Each
+record is also searched for the canaries, both raw and decoded.
+
+| Space | A key account may hold in the clear | Source and reason | Planted violation, and the permitted record beside it |
+|---|---|---|---|
+| `Property` (`p`), `Collection::Metadata` | No `Private` container. A calendar's or event's `Shared` container is a sealed wrapper (`is_sealed_container`). A mailbox's, message's or Sieve script's `Shared` container is flagged. An address book's, card's or file's container is permitted: DAV keeps their dead properties in the clear. `Viewer` and `Owner` counters are 12 bytes. | Ruling 66. Rulings 16, 23 and 29. The design's "Other object kinds". `ViewerState`. | A `Private` container and a 5-byte `Owner` counter, beside a 12-byte `Viewer` counter (`test_index_control`). An unsealed container on a shared calendar and on its event, written by upstream's keyless writer (`test_shared_structure`). |
+| `Property` (`p`), records | Events are checked as row and content pairs (`ZaEvent`): no display name, no per-account preference, a sealed tree, and the envelope matches the domain. Inbox items are checked as row and content pairs: `Itip` with no snapshot, and a sealed message. A record without its pair is flagged. | Task 4 (part 4c), ruling 13. | The existing controls: a planted plaintext event, now planted with `plant_event`; a plaintext item; the shared-calendar header and envelope mutations, now split between the row and the content. |
+| `Immutable` (`c`) | A message row that is a stub byte-equal to `seal_stub`'s (`stub_structure` over its bundle and blob), and empty sort keys (`MessageSortKeys::default`). Nothing else of the account. | Mail spec 5.2; `za_ingest`. | Content-bearing sort keys over empty ones, and a stub rewritten with plaintext headers (`test_mail`). |
+| `IndexProperty` (`v`) | No threading hash. A mailbox name index is permitted (visible by structure; mail spec 5.6). So are Sieve seen-id hashes and a submission's integer indexes. Anything else is unclassified and flagged. | Mail spec 5.4. By source, the only writers are `email` and `merge_threads`. | A threading hash, beside a mailbox-name hash. |
+| `SearchTerm` (`z`) | No Email or Calendar term of the account. Contacts and File terms are permitted. | Calendar spec 9; mail spec 5.5; ruling 65. | Calendar and Email terms, beside a Contacts term. |
+| `SearchDocument` (`m`) | No Calendar document. Every Email document holds its ids only (`IDS_ONLY_DOCUMENT`, `[0, 0, 0]`). | Ruling 64. | A Calendar document and an Email document that lists a term, beside an ids-only Email document and another account's Calendar document. |
+| `SearchQueue` (`y`) | Entries keyed by index, account, document and creation id, whose value is one action byte. An empty queued-work marker. A status key that decodes as a `SearchIndexStatus`; its reason is searched for canaries. | `queue_document_index` and `queue_document_unindex`; `update_partition_status`. | An entry whose value carries more than its action, beside a valid entry and the hold's status key. |
+| `System` (`u`) | The schema version (`0x00`), the node-id leases (`0x01`) and the UID leases (`ZA_UID_LEASE_PREFIX`, 37 bytes). Anything else is flagged. | `SystemKind`; ruling 24. | An unknown kind. |
+| `BlobLink`, `Blobs`, `SpamSamples` | As at 0.16. | | The existing controls. |
+
+**Ordinary-account positive control** (`test_mail`). A message delivered to
+`plainmail26` must trip every mail rule against 1.0's real writes:
+- "plaintext metadata row";
+- "sort keys with content";
+- "threading key of the account";
+- "search term of the account";
+- "search document with terms";
+- "plaintext message blob".
+
+The existing scanner controls and corruption controls are kept. 0.16's
+plaintext-dead-property control becomes the container control. The token
+search returns `Subspace`, and the visible reply token is now in the item's
+content record (`CalendarNotificationField::Content`).
+
+#### Fixture names
+
+| Name | Used by |
+|---|---|
+| `plainmail26` | `leak::test_mail`'s ordinary control |
+| `keymail30`, `plainmail27` | `test_reindex` |
+| `keymail31`, `plainmail28` | `test_attachment_indexer` |
+| `keymail32` | `test_destroyed_stub` |
+| `plainmail29` | `test_index_retry` |
+| `plainmail30`, `plainmail31` | `test_mid_pass_provisioning` and its control |
+| `plainmail32` | `test_mid_pass_deletion` |
+| `keymail33`, `plainmail33` | `gating::test_metadata` |
+
+`plainmail19`, `21` and `22` (the retired R63 cases) are unallocated. The
+next free names are `keymail34` and `plainmail34`.
+
+The suite's order (`za/mod.rs`):
+- `gating::test_metadata` runs after `gating::test_scheduling`.
+- After `index_task::test_sealed_archive`, five cases run in turn: `test_destroyed_stub`, `test_reindex`, `test_attachment_indexer`, `test_index_retry` and `test_mid_pass_provisioning`.
+- `index_task::test_mid_pass_deletion` runs after `mail::traces`, before the key accounts are destroyed.
+
+#### Runtime assumptions (Task 7)
+
+- **Indexing.** The za server indexes Email and Calendar, as 0.16's fence
+  cases required. `build_calendar_document` returns before the fault hook
+  when Calendar is not indexed.
+- **Index passes.** A pass reads both of two queued messages
+  (`index_batch_size` ≥ 2). Under `FORCE_COMMIT_SPLIT`, the two-document pass
+  commits as described (6a's store unit test asserts 2 commit points).
+- **Partition status.** A status key whose retry is in the future makes the
+  manager skip the partition. A failed R58 assertion fails the pass, and the
+  partition then enters its retry state.
+- **`x:IndexQueueStatus/set`** accepts `{"status": {"@type": "Running"}}`.
+  `x:IndexQueueStatus/get` serializes a failed status with
+  `"@type": "Failed"`.
+- **Stub byte equality.** `MetadataRow::encode(stub_structure(..), bundle)`
+  is deterministic, and the stored stub equals it byte for byte. Otherwise
+  every scan of a key account reports "stub whose structure is not the
+  sealed stub's".
+- **No other writers.** No upstream path writes another `IndexProperty`,
+  `Immutable` or `System` record for a key account. Otherwise the scanner's
+  "unclassified" rules flag it, and the rule needs a ruling.
+- **Default permissions.** The default user role carries
+  `JmapMetadataGet`/`Set` and `ImapMetadataGet`/`Set`.
+- **Metadata defaults.** Vendor namespaces are on (the default).
+- **`using`.** A key account's request may name
+  `urn:ietf:params:jmap:metadata` in `using`, although its session does not
+  advertise it.
+- **Attachment extraction.** The text attachment is indexed in the
+  `Attachment` field. The RTF part makes the row's attachment extractable.
+- **Destruction.** A destroyed account's DestroyAccount task completes while
+  another account's pass is parked.
+
+#### Deferred, by owner
+
+**Task 7**
+- The tests' first compile, borrow checking included, and their first run.
+- `index_task::test_mid_pass_deletion` is expected to fail on part 6a's
+  destroy-window residual. A ruling is needed: either fix it (destruction
+  takes the partition's lock, or sweeps again after the pass) or accept the
+  residual and flip the case.
+- If the in-flight reproduction leaves nothing, remove the
+  `jmap::za_variants` wait (PR #66) and record the evidence.
+- `TestServer::fetch_email` (`utils/server.rs`) still reads 0.16's metadata
+  archive. The scanner no longer uses it.
+
+**Task 9**
+- Update CLAUDE.md:
+  - the za suite's order and modules;
+  - the next free names (`keymail34`, `plainmail34`);
+  - the retired `INDEX_GUARD_FAIL_ONCE` in the hook list;
+  - "only `ReceivedAt` and `Size` in search documents", which becomes "ids
+    only";
+  - the index-retry remedy (`x:IndexQueueStatus/set`).
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
@@ -6145,6 +6311,11 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `za::mail::reads::offsets_round_trip` (fork) | `sentAt` joins the compared `Email/get` properties (stronger). | Part 5a stores no `sent_at` offset for a key account; 5c serves `sentAt` from the opened envelope. |
 | `za::mail::search::jmap_refused_filters_and_sorts` (fork, fix round 1) | The five keyword filters on `$hasattachment` or `$hasnoattachment` (mixed case) and the `hasKeyword`, `allInThreadHaveKeyword` and `someInThreadHaveKeyword` sorts on them join the key account's refused filters and sorts; the ordinary account answers them (stronger). The sort list carries each sort's JSON. | Ruling 55's JMAP side (review F2): 1.0 sets both keywords at ingest; a key account's message carries neither. |
 | `za::mail::reads::assigned_ids_preserve_sealed_read_offsets` (fork, ruling 60) | Another account's download of the key account's sections is asserted 404, where the test asserted only that it was not 200. A grantee from before provisioning now gets 404 too (0.16.27: 403); no test pinned that answer. | Ruling 60 (re-review N1, N2): `has_access_blob` answers not found for any token but the key account owner's, before the ACL walk; v1.0.1 and 0.16.27 answer 404 without a grant. |
+| `za::leak::scan` and `token_hits` (fork, part 6d) | The walk covers `Subspace::ALL`, with its rules keyed on the enum (part 6d's table). A message's row is checked in `Immutable` as a `MetadataRow` stub, byte-equal to `seal_stub`'s, and its violation reads "plaintext metadata row" where 0.16's read "archive". Email search documents must be ids only, where 0.16 required the arrival time and the size. Events and inbox items are checked as row and content pairs. Dead-property checks become the container rule. `token_hits` returns `Subspace`. The new spaces' rules are stronger. | 1.0's split records, the immutable class, the new `m`, `y`, `z` and `u` layouts, and ruling 64 (no `ReceivedAt` or `Size` field). |
+| `za::leak::{test, test_mail, test_index_control, test_shared_structure}` (fork, part 6d) | `test`: the visible reply token is asserted in the item's content record, and the unsealed-event control is planted with `plant_event`. `test_mail`: the rewritten stub is re-encoded around a plaintext header section, and an ordinary-account positive control is added. `test_index_control`: one planted violation and one permitted record per space, where 0.16 planted calendar entries only. `test_shared_structure`: the `dead_properties` control becomes an unsealed-container control, and the event controls are split between the row and the content. | Ruling 13 (the item's content). Dead properties now live in `MetadataClass::Shared` (rulings 16 and 29). 1.0's spaces. |
+| `za::index_task::{test, test_sealed_archive}` (fork, part 6d) | Queue entries replace `TaskIndexDocument` tasks. The sealed content record is planted alone, because the builder reads `CalendarEventField::Content`. The checks read `search_keys` instead of the scanner's violation text. Assertions unchanged. | 1.0's index queue; split event records. |
+| `za::mail::search::visible_field_document` (fork, part 6d) | Asserts 0 terms and ids-only documents, where 0.16 asserted 8 field entries (the arrival time and the size). | Ruling 64. |
+| `za::mail::fence` index cases (fork, part 6d) | R46 holds the partition through its status key, and R51 plants through `index_account_documents`. R54's `account_tasks` reads no index task. The in-flight cases now expect R46's "account already holds mail" for mail while parked, and no late document after the release, with no manual cleanup. The R58 and R62 superseded cases simulate B over the queue and expect the partition's retry state. The R62 tail case first expects R62's refusal, then the remedy. R62's "Index key alone" case is removed. The between-chunks and merge cases are flipped. Two R63 cases are retired. | Task 1's rulings 18 and 19 (part 6a), ruling 63, 1.0's index queue. |
 
 ## Task 1 check
 
