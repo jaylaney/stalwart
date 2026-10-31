@@ -13,14 +13,14 @@
 
 use super::{
     Traced, assert_sealed, assert_sealed_upload, deliver, key_mail_account, message_ids,
-    message_with, new_message, open_message, stored_metadata,
+    message_with, new_message, open_message, stored_hash,
 };
 use crate::{
     utils::{
         account::Account,
         jmap::JmapResponse,
         server::TestServer,
-        za::{bearer_token, wait_for_delivery},
+        za::{wait_for_delivery, za_bearer_token},
     },
     za::{
         STRONG,
@@ -30,18 +30,14 @@ use crate::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use common::za::ZA_MAIL_KEYLESS;
-use email::{mailbox::INBOX_ID, message::metadata::MessageMetadata};
+use email::mailbox::INBOX_ID;
 use groupware::calendar::seal::{WRAP_MK, WRAP_PK};
 use registry::schema::{enums::Permission, prelude::ObjectType};
 use serde_json::{Value, json};
 use std::{str::FromStr, time::Duration};
-use store::{IterateParams, SUBSPACE_BLOB_LINK, U32_LEN, U64_LEN, write::AnyKey};
+use store::{IterateParams, Subspace, U32_LEN, U64_LEN, write::AnyKey};
 use trc::{EventType, SecurityEvent};
-use types::{
-    blob::BlobId,
-    blob_hash::{BLOB_HASH_LEN, BlobHash},
-    id::Id,
-};
+use types::{blob::BlobId, blob_hash::BLOB_HASH_LEN, id::Id};
 
 const KEY: &str = "keymail6@example.com";
 const OTHER_KEY: &str = "keymail7@example.com";
@@ -286,11 +282,11 @@ async fn temporary_links(test: &TestServer, account_id: u32) -> usize {
         .iterate(
             IterateParams::new(
                 AnyKey {
-                    subspace: SUBSPACE_BLOB_LINK,
+                    subspace: Subspace::BlobLink,
                     key: vec![0u8],
                 },
                 AnyKey {
-                    subspace: SUBSPACE_BLOB_LINK,
+                    subspace: Subspace::BlobLink,
                     key: vec![u8::MAX; 64],
                 },
             )
@@ -385,7 +381,7 @@ async fn upload_without_keys_is_refused(
     let links = temporary_links(test, id).await;
     let other_links = temporary_links(test, other_id).await;
 
-    let token = bearer_token(KEY, STRONG).await;
+    let token = za_bearer_token(&test.server, KEY).await;
     let traced = Traced::start(&[EventType::Security(SecurityEvent::Unauthorized)]);
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -507,13 +503,7 @@ async fn sealed_upload_imported_and_attached(test: &TestServer, key: &Account, s
     let document_id = new_message(test, id, &before).await;
     assert_eq!(Id::from_str(&email_id).unwrap().document_id(), document_id);
     assert_sealed(test, id, document_id, WRAP_MK).await;
-    let stored_hash = BlobHash::from(
-        &stored_metadata(test, id, document_id)
-            .await
-            .unarchive::<MessageMetadata>()
-            .unwrap()
-            .blob_hash,
-    );
+    let stored_hash = stored_hash(test, id, document_id).await;
     assert_ne!(
         stored_hash,
         BlobId::from_base32(&blob_id).unwrap().hash,

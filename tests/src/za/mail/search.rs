@@ -378,6 +378,10 @@ fn refused_commands() -> Vec<(String, &'static str)> {
         "TEXT x",
         "TO x",
         "OR FROM x SEEN",
+        // Ruling 55: 1.0 sets the attachment keywords from the parsed
+        // message, which a key account's message never carries.
+        "KEYWORD $HasAttachment",
+        "UNKEYWORD $HasNoAttachment",
     ] {
         commands.push((format!("SEARCH {key}"), "* SEARCH"));
     }
@@ -753,6 +757,12 @@ async fn jmap_refused_filters_and_sorts(key: &Fixture, plain: &Fixture) {
             json!({ "sentBefore": "2030-01-01T00:00:00Z" }),
         ),
         ("sentAfter", json!({ "sentAfter": "2020-01-01T00:00:00Z" })),
+        // Ruling 57: 1.0's object-metadata conditions; a key account's
+        // message holds no object metadata.
+        (
+            "metadataExists",
+            json!({ "metadataExists": "za-search/key" }),
+        ),
     ];
     let sorts = ["from", "to", "cc", "subject", "sentAt"];
 

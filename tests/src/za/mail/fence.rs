@@ -13,9 +13,10 @@
 //! is refused on PostgreSQL and MySQL, where the assertion is no fence.
 
 use super::{
-    Traced, assert_no_plaintext, assert_sealed, deliver,
+    Traced, append_params, assert_no_plaintext, assert_sealed, deliver,
     delivery::{configure, temporarily_failed, unconfigure},
-    message_ids, message_with, stored_blob, stored_metadata,
+    group_ingest, keyed_token, keyless_token, message_ids, message_with, metadata_key,
+    metadata_rows, open_message, reply_to, row_is_stub, stored_blob, stored_hash, stored_metadata,
 };
 use crate::{
     utils::{
@@ -34,23 +35,29 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use calcard::common::timezone::Tz;
 use common::{
     Server,
-    auth::AccessToken,
+    auth::{AccessToken, ChangedBy},
     za::{ZA_MAIL_KEYLESS, test_hooks},
 };
 use email::{
     cache::MessageCacheFetch,
     mailbox::{INBOX_ID, JUNK_ID},
     message::{
+        copy::CopySources,
         copy::EmailCopy,
         delete::EmailDeletion,
-        ingest::{EmailIngest, IngestEmail, IngestSource},
-        metadata::MessageMetadata,
-        za::is_stub,
+        delivery::SenderAuthentication,
+        ingest::{
+            EmailIngest, IngestEmail, IngestSource,
+            group::{IngestGroup, ThreadKey},
+        },
     },
 };
 use groupware::{
     DestroyArchive,
-    calendar::{CalendarEvent, CalendarEventData, seal::WRAP_PK},
+    calendar::{
+        CalendarEvent, CalendarEventData,
+        seal::{WRAP_MK, WRAP_PK},
+    },
 };
 use mail_parser::MessageParser;
 use nlp::language::Language;
@@ -78,7 +85,7 @@ use store::{
     write::{
         AlignedBytes, AnyKey, Archive, BatchBuilder, BlobLink, BlobOp, SearchIndex,
         SearchIndexClass, SearchIndexId, SearchIndexType, TaskQueueClass, ValueClass,
-        key::DeserializeBigEndian, now,
+        key::DeserializeBigEndian, now, serialize::RawValue,
     },
 };
 use trc::{EventType, Key, SecurityEvent, StoreEvent};
@@ -175,6 +182,16 @@ const MERGE_CANARY: &str = "zzmergecanary";
 /// `Term` key (`CheekyHash`), and longer than the body's five-byte tokens,
 /// so written in a later commit chunk than the first.
 const TAIL_CANARY: &str = "zztailcanary";
+/// `grouped_ingest_provisioning_wins_before_flush`'s account (Task 5 of the
+/// 1.0 upgrade).
+const GROUPED: &str = "keymail27@example.com";
+/// Its ordinary control, whose group flushes in the clear.
+const GROUPED_CONTROL: &str = "plainmail24@example.com";
+/// `grouped_rejection_discards_uncommitted_plain_metadata`'s account, refused
+/// in mid-group once provisioned.
+const REJECTED: &str = "keymail29@example.com";
+/// Its ordinary account, whose group keeps its batch after a rejection.
+const REJECTED_CONTROL: &str = "plainmail25@example.com";
 /// `train_batch_loses_to_provisioning`'s source account (ruling R55).
 const TRAINED: &str = "keymail19@example.com";
 /// `train_batch_loses_to_provisioning`'s destination, an ordinary account.
@@ -213,6 +230,10 @@ pub async fn test(test: &mut TestServer) {
     let fence3 = reverse_race_setup_token_aborts(test, &admin).await;
     let fence4 = reverse_race_reissue_keeps_the_marker(test, &admin).await;
     let fence11 = reissue_repairs_an_aborted_issuance(test, &admin).await;
+    let (grouped, grouped_control) =
+        grouped_ingest_provisioning_wins_before_flush(test, &admin).await;
+    let (rejected, rejected_control) =
+        grouped_rejection_discards_uncommitted_plain_metadata(test, &admin).await;
     let (fence5, fence6) = copy_message_race(test, &admin).await;
     copy_message_refuses_key_accounts(test, &fence1, &fence5, &fence6).await;
     let (trained, train_destination) = train_batch_loses_to_provisioning(test, &admin).await;
@@ -242,7 +263,19 @@ pub async fn test(test: &mut TestServer) {
     // pending or credentialless, and the account's destruction removes
     // what they hold.
     for account in [
-        &fence1, &fence2, &plain, &fence10, &organizer, &fence3, &fence4, &fence11, &fence5,
+        &fence1,
+        &fence2,
+        &plain,
+        &fence10,
+        &organizer,
+        &fence3,
+        &fence4,
+        &fence11,
+        &grouped,
+        &grouped_control,
+        &rejected,
+        &rejected_control,
+        &fence5,
         &fence6,
     ] {
         test.destroy_all_mailboxes(account).await;
@@ -257,6 +290,10 @@ pub async fn test(test: &mut TestServer) {
         fence3,
         fence4,
         fence11,
+        grouped,
+        grouped_control,
+        rejected,
+        rejected_control,
         fence5,
         fence6,
         trained,
@@ -285,6 +322,11 @@ pub async fn test(test: &mut TestServer) {
     ] {
         admin.destroy_account(account).await;
     }
+    // The grouped ingests train as IMAP APPEND does: the ordinary
+    // controls' samples.
+    admin
+        .registry_destroy_all(ObjectType::SpamTrainingSample)
+        .await;
     test.wait_for_tasks().await;
     unconfigure(&admin, schedule_id).await;
     wait_for_delivery(test).await;
@@ -477,13 +519,7 @@ async fn expire_and_purge_blobs(test: &TestServer, admin: &Account) {
 
 /// The blob hash of the account's message `document_id`.
 async fn message_hash(test: &TestServer, account_id: u32, document_id: u32) -> BlobHash {
-    BlobHash::from(
-        &stored_metadata(test, account_id, document_id)
-            .await
-            .unarchive::<MessageMetadata>()
-            .unwrap()
-            .blob_hash,
-    )
+    stored_hash(test, account_id, document_id).await
 }
 
 /// Review F1: a delivery that classified the account as ordinary before
@@ -590,9 +626,10 @@ async fn forward_race_with_a_staged_blob(test: &TestServer, admin: &Account) -> 
         assert!(
             test.server
                 .store()
-                .blob_has_access(&staged, &plain_link)
+                .blob_link_size(&staged, &plain_link)
                 .await
-                .unwrap(),
+                .unwrap()
+                .is_some(),
             "the plain account no longer links the staged hash"
         );
         assert_eq!(
@@ -829,12 +866,7 @@ async fn reissue_repairs_an_aborted_issuance(test: &TestServer, admin: &Account)
     deliver(test, SENDER, FENCE11, &message_with("after", "after-body")).await;
     let after = super::new_message(test, id, &before).await;
     assert!(
-        !is_stub(
-            stored_metadata(test, id, after)
-                .await
-                .unarchive::<MessageMetadata>()
-                .unwrap()
-        ),
+        !row_is_stub(&stored_metadata(test, id, after).await),
         "the ordinary account's delivery is plaintext"
     );
 
@@ -962,6 +994,268 @@ async fn reverse_race_reissue_keeps_the_marker(test: &TestServer, admin: &Accoun
     account
 }
 
+/// Task 5 of the 1.0 upgrade: a grouped ingest (`IngestGroup`, IMAP
+/// APPEND's and JMAP's) classifies each message when it is ingested into
+/// the group and writes nothing until the flush. An account provisioned in
+/// between (its `setup-token` and setup complete: the group's messages are
+/// in memory only, so the emptiness check and the recheck see nothing)
+/// wins: every message the group classified as ordinary carries the
+/// provisioning fence in its own commit chunk, so the flush fails its
+/// assertion and commits nothing, no message, metadata row, threading key
+/// or sample. The plaintext the group staged is left to its temporary
+/// links (spec 6.1's allowed residue), which the purge removes. The client's
+/// retry, now with the account's keys, stores the same messages sealed.
+/// The control, an ordinary account's identical group, flushes in the
+/// clear, threaded.
+async fn grouped_ingest_provisioning_wins_before_flush(
+    test: &TestServer,
+    admin: &Account,
+) -> (Account, Account) {
+    println!("grouped_ingest_provisioning_wins_before_flush");
+    let account = passwordless(admin, GROUPED).await;
+    let id = account.id().document_id();
+    let control = admin
+        .create_user_account(GROUPED_CONTROL, STRONG, "Fence", &[], user_permissions())
+        .await;
+    let control_id = control.id().document_id();
+    // The system folders, so INBOX exists for both.
+    message_ids(test, id).await;
+    message_ids(test, control_id).await;
+    let first = message_with("grouped fence", "grouped-first-canary");
+    let reply = reply_to(&first, "grouped fence", "grouped-reply-canary");
+    let messages = [&first, &reply];
+
+    // The control: the same group for an ordinary account commits both,
+    // in the clear, the reply in its parent's pending thread.
+    let mut group = IngestGroup::default();
+    for raw in messages {
+        group_ingest(&test.server, &mut group, &keyless_token(control_id), raw)
+            .await
+            .unwrap();
+    }
+    let controls = group.flush(&test.server).await.unwrap();
+    assert_eq!(controls.len(), 2, "control: the ordinary group's flush");
+    for email in &controls {
+        assert!(
+            !row_is_stub(&stored_metadata(test, control_id, email.document_id).await),
+            "control: the ordinary group stored a stub"
+        );
+        assert_eq!(
+            super::threading_keys(test, control_id, email.document_id).await,
+            1,
+            "control: the ordinary group's message is threaded"
+        );
+    }
+    assert_eq!(controls[1].thread_id, controls[0].thread_id);
+
+    // The race: classified as ordinary, then provisioned before the flush.
+    let stale = keyless_token(id);
+    let mut group = IngestGroup::default();
+    for raw in messages {
+        group_ingest(&test.server, &mut group, &stale, raw)
+            .await
+            .unwrap();
+    }
+    let token = za_setup_token(admin, GROUPED).await;
+    za_setup(GROUPED, &token, STRONG).await;
+    let err = match group.flush(&test.server).await {
+        Err(err) => err,
+        Ok(ingested) => panic!(
+            "the stale group committed {} messages after provisioning",
+            ingested.len()
+        ),
+    };
+    assert!(err.is_assertion_failure(), "the flush's failure: {err:?}");
+    assert!(
+        message_ids(test, id).await.is_empty(),
+        "the stale group stored a message"
+    );
+    assert!(
+        metadata_rows(test, id).await.is_empty(),
+        "the stale group left a metadata row"
+    );
+    assert!(
+        !test.server.za_has_spam_samples(id).await.unwrap(),
+        "the stale group stored a sample"
+    );
+    assert!(
+        group.flush(&test.server).await.unwrap().is_empty(),
+        "the failed flush kept its batch"
+    );
+    let staged = temporary_links(test, id).await;
+    for raw in messages {
+        assert!(
+            staged.contains(&BlobHash::generate(raw.as_bytes())),
+            "the stale group did not stage its plaintext"
+        );
+    }
+
+    // The retry, with the session's keys: sealed under them.
+    let keyed = keyed_token(test, id, STRONG).await;
+    let mut group = IngestGroup::default();
+    for raw in messages {
+        group_ingest(&test.server, &mut group, &keyed, raw)
+            .await
+            .unwrap();
+    }
+    let ingested = group.flush(&test.server).await.unwrap();
+    assert_eq!(ingested.len(), 2, "the keyed retry's flush");
+    let mut documents = Vec::new();
+    for (email, raw) in ingested.iter().zip(messages) {
+        assert_sealed(test, id, email.document_id, WRAP_MK).await;
+        assert_eq!(email.thread_id, email.document_id, "a thread of its own");
+        let (_, opened) = open_message(test, id, STRONG, email.document_id).await;
+        assert_eq!(opened, raw.as_bytes(), "the retried message");
+        documents.push(email.document_id);
+    }
+    documents.sort_unstable();
+    assert_eq!(message_ids(test, id).await, documents);
+    assert_eq!(
+        metadata_rows(test, id).await.len(),
+        2,
+        "a metadata row without its message"
+    );
+    assert_no_plaintext(test, id).await;
+
+    expire_and_purge_blobs(test, admin).await;
+    let staged = temporary_links(test, id).await;
+    for raw in messages {
+        assert!(
+            !staged.contains(&BlobHash::generate(raw.as_bytes())),
+            "the stale group's staged plaintext survived the purge"
+        );
+    }
+    (account, control)
+}
+
+/// Task 5 of the 1.0 upgrade: a group discards its batch after an error
+/// that is not a rejection (`IngestGroup::ingest`), so a message refused in
+/// mid-group leaves none of the plaintext metadata the group already held
+/// for an earlier one. The account is classified as ordinary for the first
+/// message, then provisioned; the second, ingested with the same keyless
+/// token, is now a key account's and is refused (`za_keyless_refusal`,
+/// before any operation of the batch). The flush then commits nothing, and
+/// the client's retry with the account's keys stores both sealed, with no
+/// metadata row left over. The control, an ordinary account: a message that
+/// does not parse is a rejection, after which a group keeps its batch, and
+/// the rejected message adds nothing to it; its retry, parsed, adds one
+/// message and one row.
+async fn grouped_rejection_discards_uncommitted_plain_metadata(
+    test: &TestServer,
+    admin: &Account,
+) -> (Account, Account) {
+    println!("grouped_rejection_discards_uncommitted_plain_metadata");
+    let account = passwordless(admin, REJECTED).await;
+    let id = account.id().document_id();
+    let control = admin
+        .create_user_account(REJECTED_CONTROL, STRONG, "Fence", &[], user_permissions())
+        .await;
+    let control_id = control.id().document_id();
+    message_ids(test, id).await;
+    message_ids(test, control_id).await;
+    let first = message_with("grouped refusal", "refusal-first-canary");
+    let second = message_with("grouped refusal second", "refusal-second-canary");
+
+    let stale = keyless_token(id);
+    let mut group = IngestGroup::default();
+    group_ingest(&test.server, &mut group, &stale, &first)
+        .await
+        .unwrap();
+    let token = za_setup_token(admin, REJECTED).await;
+    za_setup(REJECTED, &token, STRONG).await;
+    let err = group_ingest(&test.server, &mut group, &stale, &second)
+        .await
+        .expect_err("a keyless ingest into a key account");
+    assert!(
+        err.matches(EventType::Jmap(trc::JmapEvent::Forbidden))
+            && err.value_as_str(Key::Details) == Some(ZA_MAIL_KEYLESS),
+        "the refusal: {err:?}"
+    );
+    assert!(
+        group.flush(&test.server).await.unwrap().is_empty(),
+        "the refusal left the first message in the group's batch"
+    );
+    assert!(
+        message_ids(test, id).await.is_empty() && metadata_rows(test, id).await.is_empty(),
+        "the discarded group stored a message or a metadata row"
+    );
+
+    let keyed = keyed_token(test, id, STRONG).await;
+    let mut group = IngestGroup::default();
+    for raw in [&first, &second] {
+        group_ingest(&test.server, &mut group, &keyed, raw)
+            .await
+            .unwrap();
+    }
+    let ingested = group.flush(&test.server).await.unwrap();
+    assert_eq!(ingested.len(), 2, "the keyed retry's flush");
+    for (email, raw) in ingested.iter().zip([&first, &second]) {
+        assert_sealed(test, id, email.document_id, WRAP_MK).await;
+        let (_, opened) = open_message(test, id, STRONG, email.document_id).await;
+        assert_eq!(opened, raw.as_bytes(), "the retried message");
+    }
+    let rows = metadata_rows(test, id).await;
+    let mut documents = ingested.iter().map(|e| e.document_id).collect::<Vec<_>>();
+    documents.sort_unstable();
+    assert_eq!(
+        rows.iter()
+            .map(|(document_id, _)| *document_id)
+            .collect::<Vec<_>>(),
+        documents,
+        "the account's metadata rows are the retry's messages"
+    );
+    assert_eq!(message_ids(test, id).await, documents);
+    assert_no_plaintext(test, id).await;
+
+    // The control: a rejection keeps the batch, and adds nothing to it.
+    let ordinary = keyless_token(control_id);
+    let mut group = IngestGroup::default();
+    group_ingest(&test.server, &mut group, &ordinary, &first)
+        .await
+        .unwrap();
+    let err = group
+        .ingest(
+            &test.server,
+            append_params(&second, None, &ordinary),
+            ThreadKey::default(),
+        )
+        .await
+        .expect_err("an unparsed message is rejected");
+    assert!(
+        err.matches(EventType::MessageIngest(trc::MessageIngestEvent::Error)),
+        "the rejection: {err:?}"
+    );
+    let kept = group.flush(&test.server).await.unwrap();
+    assert_eq!(kept.len(), 1, "control: the rejection discarded the batch");
+    let rows = metadata_rows(test, control_id).await;
+    assert_eq!(
+        rows.iter()
+            .map(|(document_id, _)| *document_id)
+            .collect::<Vec<_>>(),
+        [kept[0].document_id],
+        "the rejected message left a metadata row"
+    );
+    assert!(!row_is_stub(&rows[0].1), "control: an ordinary message");
+    let mut group = IngestGroup::default();
+    group_ingest(&test.server, &mut group, &ordinary, &second)
+        .await
+        .unwrap();
+    let retried = group.flush(&test.server).await.unwrap();
+    assert_eq!(retried.len(), 1, "the control's retry");
+    let mut documents = vec![kept[0].document_id, retried[0].document_id];
+    documents.sort_unstable();
+    assert_eq!(
+        metadata_rows(test, control_id)
+            .await
+            .iter()
+            .map(|(document_id, _)| *document_id)
+            .collect::<Vec<_>>(),
+        documents
+    );
+    assert_eq!(message_ids(test, control_id).await, documents);
+    (account, control)
+}
+
 /// Mail spec 6.3 and ruling R3 of plan 13: a cross-account copy that read
 /// its destination as ordinary before the destination was provisioned loses
 /// its assertion at commit, which surfaces as a method-level server error,
@@ -979,8 +1273,8 @@ async fn copy_message_race(test: &TestServer, admin: &Account) -> (Account, Acco
     message_ids(test, to_id).await;
     let email_id = {
         let cache = test.server.get_cached_messages(from_id).await.unwrap();
-        let item = &cache.emails.items[0];
-        Id::from_parts(item.thread_id, item.document_id).to_string()
+        let item = cache.emails.iter().next().unwrap();
+        Id::from_parts(item.thread_id(), item.document_id()).to_string()
     };
 
     let copy = json!({
@@ -1064,9 +1358,32 @@ async fn copy_message_refuses_key_accounts(
         (plain_id, plain_before[0], empty_id, "into a key account"),
         (key_id, key_doc, plain_id, "out of a key account"),
     ] {
+        // 1.0's `copy_message` takes the source row its caller read
+        // (`CopySources`, as `Email/copy` and IMAP COPY read it) and the
+        // destination's account; the refusal reads the row's account
+        // (`CopySource::account_id`) and the destination, not the row.
+        let source = CopySources::new(from, vec![document_id])
+            .take(&test.server, document_id)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("no source row for {from}/{document_id}"));
+        let to_account = test.server.account(to).await.unwrap();
         let err = match test
             .server
-            .copy_message(from, document_id, to, vec![INBOX_ID], vec![], None, 0)
+            .copy_message(
+                source,
+                &to_account,
+                // The tenant budget: the parameter exists in an `enterprise`
+                // build of `email`, which the tests crate always enables
+                // (`tests/Cargo.toml`); the budget is upstream's AGPL type,
+                // unlimited as for an account without a tenant.
+                &mut common::storage::quota::DiskQuotaBudget::unlimited(),
+                vec![INBOX_ID],
+                vec![],
+                now(),
+                None,
+                0,
+            )
             .await
         {
             Err(err) => err,
@@ -1132,10 +1449,10 @@ async fn train_batch_loses_to_provisioning(
     message_ids(test, to_id).await;
     let (email_id, document_id) = {
         let cache = test.server.get_cached_messages(from_id).await.unwrap();
-        let item = &cache.emails.items[0];
+        let item = cache.emails.iter().next().unwrap();
         (
-            Id::from_parts(item.thread_id, item.document_id).to_string(),
-            item.document_id,
+            Id::from_parts(item.thread_id(), item.document_id()).to_string(),
+            item.document_id(),
         )
     };
     let hash = message_hash(test, from_id, document_id).await;
@@ -1222,9 +1539,11 @@ async fn stress_the_fence(test: &TestServer, admin: &Account) -> Account {
                     received_at: None,
                     source: IngestSource::Smtp {
                         deliver_to: FENCE7,
-                        is_sender_authenticated: true,
+                        envelope_from: SENDER,
+                        sender_authentication: SenderAuthentication::DmarcPass,
                         is_spam: false,
                     },
+                    metadata: None,
                     session_id: 0,
                 })
                 .await
@@ -1257,9 +1576,8 @@ async fn stress_the_fence(test: &TestServer, admin: &Account) -> Account {
                     "run {run}: the message committed after the vault record"
                 );
                 assert_eq!(stored.len(), 1, "run {run}");
-                let archive = stored_metadata(test, account_id, stored[0]).await;
                 assert!(
-                    !is_stub(archive.unarchive::<MessageMetadata>().unwrap()),
+                    !row_is_stub(&stored_metadata(test, account_id, stored[0]).await),
                     "run {run}: an ordinary ingest stored a stub"
                 );
                 outcomes[0] += 1;
@@ -1288,7 +1606,7 @@ async fn stress_the_fence(test: &TestServer, admin: &Account) -> Account {
             test.server
                 .emails_delete(
                     account_id,
-                    None,
+                    ChangedBy::PrincipalId(account_id),
                     &mut batch,
                     RoaringBitmap::from_iter(stored),
                 )
@@ -1375,22 +1693,15 @@ async fn setup_refuses_existing_mail(test: &TestServer, admin: &Account) -> Acco
     account
 }
 
-/// The metadata archive (field 71) of message `document_id`, if stored.
-async fn metadata_archive(
-    test: &TestServer,
-    account_id: u32,
-    document_id: u32,
-) -> Option<Archive<AlignedBytes>> {
+/// The metadata row (field 71, immutable at 1.0) of message
+/// `document_id`, if stored.
+async fn metadata_archive(test: &TestServer, account_id: u32, document_id: u32) -> Option<Vec<u8>> {
     test.server
         .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::property(
-            account_id,
-            Collection::Email,
-            document_id,
-            EmailField::Metadata,
-        ))
+        .get_value::<RawValue>(metadata_key(account_id, document_id))
         .await
         .unwrap()
+        .map(|value| value.0)
 }
 
 /// Ruling R46 of plan 13 (review F1): destroying a message removes its

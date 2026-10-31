@@ -12,8 +12,10 @@
 //! into a key account is refused (6.7).
 
 use super::{
-    assert_sealed, deliver, key_mail_account, message_ids, message_with, new_message, open_message,
-    spam_samples, stored_blob, stored_metadata, threading_keys,
+    assert_no_plaintext, assert_sealed, deliver, group_ingest, has_metadata, key_mail_account,
+    keyed_token, keyless_token, message_ids, message_with, metadata_rows, new_message,
+    open_message, reply_to, row_is_stub, spam_samples, stored_blob, stored_hash, stored_metadata,
+    stored_metadata_bytes, threading_keys,
 };
 use crate::{
     utils::{
@@ -28,9 +30,9 @@ use crate::{
 use email::{
     cache::MessageCacheFetch,
     mailbox::{INBOX_ID, JUNK_ID},
-    message::{metadata::MessageMetadata, za::is_stub},
+    message::ingest::group::IngestGroup,
 };
-use groupware::calendar::seal::WRAP_PK;
+use groupware::calendar::seal::{WRAP_MK, WRAP_PK};
 use imap_proto::ResponseType;
 use registry::{
     schema::{
@@ -48,21 +50,20 @@ use registry::{
 use serde_json::json;
 use smtp::queue::Status;
 use std::time::{Duration, Instant};
-use store::{
-    ValueKey,
-    write::{AlignedBytes, Archive, BatchBuilder, now},
-};
+use store::write::{BatchBuilder, now};
 use types::{
     blob::{BlobClass, BlobId},
-    blob_hash::BlobHash,
     collection::Collection,
-    field::EmailField,
     id::Id,
 };
 
 const KEY: &str = "keymail2@example.com";
 const PENDING: &str = "keymail3@example.com";
 const PLAIN: &str = "plainmail1@example.com";
+/// `grouped_ingest_mixed_key_and_plain`'s key account.
+const MIXED_KEY: &str = "keymail28@example.com";
+/// Its ordinary account, whose messages share the group's batch.
+const MIXED_PLAIN: &str = "plainmail23@example.com";
 const SENDER: &str = "sender@example.com";
 /// The module's local delivery schedule: retries one second apart, so a
 /// temporary failure is retried while the test waits.
@@ -94,8 +95,13 @@ pub async fn test(test: &mut TestServer) {
     sieve_fileinto_vacation_redirect(test, &key, key_id, plain_id).await;
     imap_and_jmap_flags_and_moves_touch_no_content(test, &key, key_id, plain_id, plain_doc).await;
     restore_is_refused(test, key_id).await;
+    let mixed_key = key_mail_account(test, MIXED_KEY, STRONG).await;
+    let mixed_plain = admin
+        .create_user_account(MIXED_PLAIN, STRONG, "Plain mail", &[], user_permissions())
+        .await;
+    grouped_ingest_mixed_key_and_plain(test, &mixed_key, &mixed_plain).await;
 
-    for account in [&key, &plain, &pending] {
+    for account in [&key, &plain, &pending, &mixed_key, &mixed_plain] {
         test.destroy_all_mailboxes(account).await;
     }
     admin
@@ -317,10 +323,10 @@ async fn delivery_is_sealed_under_pk(test: &TestServer, id: u32) {
     deliver(test, SENDER, KEY, &message).await;
     let document_id = new_message(test, id, &before).await;
     assert_sealed(test, id, document_id, WRAP_PK).await;
-    let stub = stored_metadata(test, id, document_id).await;
-    let blob_hash = BlobHash::from(&stub.unarchive::<MessageMetadata>().unwrap().blob_hash);
+    let stub = stored_metadata_bytes(test, id, document_id).await;
+    let blob_hash = stored_hash(test, id, document_id).await;
     for canary in ["subject-canary", "body-canary"] {
-        assert!(!contains(stub.as_bytes(), canary), "{canary} in the stub");
+        assert!(!contains(&stub, canary), "{canary} in the stub");
         assert!(
             !contains(&stored_blob(test, &blob_hash).await, canary),
             "{canary} in the blob"
@@ -331,27 +337,26 @@ async fn delivery_is_sealed_under_pk(test: &TestServer, id: u32) {
     // The blob is the message as received: the queue's copy, whose head the
     // receiving session extended with its trace headers.
     assert_received_as(&raw, &message);
+    let raw_headers = meta.raw_headers().unwrap();
+    let meta = meta.unarchive().unwrap();
     assert!(
-        meta.raw_headers
-            .starts_with(format!("Delivered-To: {KEY}\r\n").as_bytes()),
+        raw_headers.starts_with(format!("Delivered-To: {KEY}\r\n").as_bytes()),
         "{}",
-        String::from_utf8_lossy(&meta.raw_headers)
+        String::from_utf8_lossy(&raw_headers)
     );
-    assert!(meta.preview.contains("body-canary"), "{}", meta.preview);
-    assert_eq!(meta.blob_hash, blob_hash);
+    assert!(meta.preview().contains("body-canary"), "{}", meta.preview());
+    assert_eq!(meta.blob_hash(), blob_hash);
     let cache = test.server.get_cached_messages(id).await.unwrap();
     let item = cache
         .emails
-        .items
-        .iter()
-        .find(|m| m.document_id == document_id)
-        .unwrap();
+        .by_id(document_id)
+        .expect("the message is cached");
     assert_eq!(
-        item.size as usize,
-        meta.raw_headers.len() + raw.len() - meta.blob_body_offset as usize,
+        item.size() as usize,
+        raw_headers.len() + raw.len() - meta.blob_body_offset(),
         "MessageData.size is the plaintext size"
     );
-    assert_eq!(item.thread_id, document_id, "a thread of its own");
+    assert_eq!(item.thread_id(), document_id, "a thread of its own");
 }
 
 /// Mail spec 5.1: a message delivered to two key accounts or to a key and a
@@ -376,13 +381,10 @@ async fn same_message_to_a_key_and_a_plain_account(
     let key_doc = new_message(test, key_id, &key_before).await;
     let plain_doc = new_message(test, plain_id, &plain_before).await;
     assert_sealed(test, key_id, key_doc, WRAP_PK).await;
-    let key_archive = stored_metadata(test, key_id, key_doc).await;
-    let plain_archive = stored_metadata(test, plain_id, plain_doc).await;
-    let key_meta = key_archive.unarchive::<MessageMetadata>().unwrap();
-    let plain_meta = plain_archive.unarchive::<MessageMetadata>().unwrap();
-    assert!(!is_stub(plain_meta), "the plain copy is not sealed");
-    let plain_hash = BlobHash::from(&plain_meta.blob_hash);
-    assert_ne!(BlobHash::from(&key_meta.blob_hash), plain_hash);
+    let plain_row = stored_metadata(test, plain_id, plain_doc).await;
+    assert!(!row_is_stub(&plain_row), "the plain copy is not sealed");
+    let plain_hash = plain_row.unarchive().unwrap().blob_hash();
+    assert_ne!(stored_hash(test, key_id, key_doc).await, plain_hash);
     assert!(
         stored_blob(test, &plain_hash)
             .await
@@ -432,24 +434,23 @@ async fn sieve_fileinto_vacation_redirect(
         .mailboxes
         .items
         .iter()
-        .find(|m| m.name == "Archive")
+        .find(|m| &*m.name == "Archive")
         .expect("fileinto :create made the Archive mailbox")
         .document_id;
     let mut filed = Vec::new();
     for item in cache
         .emails
-        .items
         .iter()
-        .filter(|m| !key_before.contains(&m.document_id))
+        .filter(|m| !key_before.contains(&m.document_id()))
     {
-        assert_sealed(test, key_id, item.document_id, WRAP_PK).await;
-        let (_, raw) = open_message(test, key_id, STRONG, item.document_id).await;
+        assert_sealed(test, key_id, item.document_id(), WRAP_PK).await;
+        let (_, raw) = open_message(test, key_id, STRONG, item.document_id()).await;
         let subject = ["file-me sieve", "redirect-me sieve", "kept sieve"]
             .into_iter()
             .find(|s| contains(&raw, &format!("Subject: {s}")))
             .expect("one of the delivered messages");
         let mailboxes = item
-            .mailboxes
+            .mailboxes()
             .iter()
             .map(|m| m.mailbox_id)
             .collect::<Vec<_>>();
@@ -472,10 +473,9 @@ async fn sieve_fileinto_vacation_redirect(
         .into_iter()
         .filter(|id| !plain_before.contains(id))
     {
-        let archive = stored_metadata(test, plain_id, document_id).await;
-        let meta = archive.unarchive::<MessageMetadata>().unwrap();
-        assert!(!is_stub(meta), "the plain account's copy is not sealed");
-        let blob = stored_blob(test, &BlobHash::from(&meta.blob_hash)).await;
+        let row = stored_metadata(test, plain_id, document_id).await;
+        assert!(!row_is_stub(&row), "the plain account's copy is not sealed");
+        let blob = stored_blob(test, &row.unarchive().unwrap().blob_hash()).await;
         received.push(if contains(&blob, "redirect-me sieve body") {
             "redirect"
         } else if contains(&blob, "away text") {
@@ -498,18 +498,15 @@ async fn uid_in(test: &TestServer, account_id: u32, document_id: u32, mailbox_id
         .await
         .unwrap()
         .emails
-        .items
-        .iter()
-        .find(|m| m.document_id == document_id)
-        .and_then(|m| m.mailboxes.iter().find(|m| m.mailbox_id == mailbox_id))
+        .by_id(document_id)
+        .and_then(|m| m.uid_in(mailbox_id))
         .unwrap_or_else(|| panic!("message {document_id} is not in mailbox {mailbox_id}"))
-        .uid
 }
 
 /// The stored stub is byte-identical to `archive`.
 async fn assert_unchanged(test: &TestServer, id: u32, doc: u32, archive: &[u8], after: &str) {
     assert_eq!(
-        stored_metadata(test, id, doc).await.as_bytes(),
+        stored_metadata_bytes(test, id, doc).await,
         archive,
         "the stub changed after {after}"
     );
@@ -544,14 +541,8 @@ async fn imap_and_jmap_flags_and_moves_touch_no_content(
     let before = message_ids(test, key_id).await;
     deliver(test, SENDER, KEY, &message_with("flags", "flags-canary")).await;
     let doc = new_message(test, key_id, &before).await;
-    let archive = stored_metadata(test, key_id, doc).await.as_bytes().to_vec();
-    let hash = BlobHash::from(
-        &stored_metadata(test, key_id, doc)
-            .await
-            .unarchive::<MessageMetadata>()
-            .unwrap()
-            .blob_hash,
-    );
+    let archive = stored_metadata_bytes(test, key_id, doc).await;
+    let hash = stored_hash(test, key_id, doc).await;
 
     let mut imap = ImapConnection::connect(b"_k ").await;
     imap.authenticate(KEY, STRONG).await;
@@ -600,25 +591,11 @@ async fn imap_and_jmap_flags_and_moves_touch_no_content(
         [email_id.as_str()]
     );
     test.wait_for_tasks().await;
+    assert!(!has_metadata(test, key_id, doc).await, "the stub is gone");
     assert!(
         test.server
             .store()
-            .get_value::<Archive<AlignedBytes>>(ValueKey::property(
-                key_id,
-                Collection::Email,
-                doc,
-                EmailField::Metadata,
-            ))
-            .await
-            .unwrap()
-            .is_none(),
-        "the stub is gone"
-    );
-    assert!(
-        !test
-            .server
-            .store()
-            .blob_has_access(
+            .blob_link_size(
                 &hash,
                 BlobClass::Linked {
                     account_id: key_id,
@@ -627,7 +604,8 @@ async fn imap_and_jmap_flags_and_moves_touch_no_content(
                 },
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .is_none(),
         "the blob link is gone"
     );
 }
@@ -652,7 +630,7 @@ async fn restore_is_refused(test: &TestServer, key_id: u32) {
         account_id: Id::from(key_id),
         status: TaskStatus::now(),
     }));
-    test.server.store().write(batch.build_all()).await.unwrap();
+    test.server.store().write_batch(&mut batch).await.unwrap();
     test.server.notify_task_queue();
     test.wait_for_tasks_skip_failures().await;
     assert_eq!(message_ids(test, key_id).await, before, "nothing restored");
@@ -678,4 +656,142 @@ async fn restore_is_refused(test: &TestServer, key_id: u32) {
         .registry_destroy(ObjectType::Task, [failed[0].0])
         .await
         .assert_destroyed(&[failed[0].0]);
+}
+
+/// Task 5 of the 1.0 upgrade: one `IngestGroup` batch (IMAP APPEND's and
+/// JMAP's) holding a key account's and an ordinary account's messages,
+/// interleaved, flushed once. The classification, the wrap and the fence
+/// are each message's own (`email_ingest_into`): the key account's messages
+/// are sealed under its session's key (`WRAP_MK`), with no threading key and
+/// a thread of their own, although the plain message before them recorded
+/// the same thread key in the group (a group thread a key message must
+/// ignore); the ordinary account's messages are upstream's, plaintext and
+/// threaded, its reply joining its parent's pending thread (the control
+/// that the group threads at all). The same bytes go to both accounts, so
+/// the key account's opened row is compared with the ordinary account's
+/// stored row. Each result names its own account (`email_ingest_finish`).
+async fn grouped_ingest_mixed_key_and_plain(test: &TestServer, key: &Account, plain: &Account) {
+    println!("grouped_ingest_mixed_key_and_plain");
+    let key_id = key.id().document_id();
+    let plain_id = plain.id().document_id();
+    // The system folders, so INBOX exists for both.
+    message_ids(test, key_id).await;
+    message_ids(test, plain_id).await;
+    let key_token = keyed_token(test, key_id, STRONG).await;
+    let plain_token = keyless_token(plain_id);
+
+    let first = message_with("grouped mixed", "mixed-first-canary");
+    let reply = reply_to(&first, "grouped mixed", "mixed-reply-canary");
+    // (account, token, message), in the group's order: the plain message
+    // records the thread key first, the key account's copy of it follows.
+    let order = [
+        (plain_id, &plain_token, &first),
+        (key_id, &key_token, &first),
+        (plain_id, &plain_token, &reply),
+        (key_id, &key_token, &reply),
+    ];
+    let mut group = IngestGroup::default();
+    for (account_id, token, raw) in order {
+        group_ingest(&test.server, &mut group, token, raw)
+            .await
+            .unwrap_or_else(|err| panic!("{account_id}: the grouped ingest failed: {err:?}"));
+    }
+    assert!(
+        message_ids(test, key_id).await.is_empty() && message_ids(test, plain_id).await.is_empty(),
+        "the group wrote before its flush"
+    );
+    let ingested = group.flush(&test.server).await.unwrap();
+    assert_eq!(ingested.len(), order.len(), "one result per message");
+
+    for ((account_id, _, raw), email) in order.iter().zip(&ingested) {
+        assert_eq!(
+            email.blob_id.class,
+            BlobClass::Linked {
+                account_id: *account_id,
+                collection: Collection::Email.into(),
+                document_id: email.document_id,
+            },
+            "the result names its own account and document"
+        );
+        assert_eq!(email.size, raw.len(), "{account_id}: the ingested size");
+        assert_eq!(email.imap_uids.len(), 1, "one UID, in INBOX");
+    }
+    let (plain_first, key_first, plain_reply, key_reply) =
+        (&ingested[0], &ingested[1], &ingested[2], &ingested[3]);
+    let mut key_docs = vec![key_first.document_id, key_reply.document_id];
+    key_docs.sort_unstable();
+    assert_eq!(message_ids(test, key_id).await, key_docs);
+    let mut plain_docs = vec![plain_first.document_id, plain_reply.document_id];
+    plain_docs.sort_unstable();
+    assert_eq!(message_ids(test, plain_id).await, plain_docs);
+
+    // The key account's messages: sealed, unthreaded, each its own thread.
+    for (email, raw) in [(key_first, &first), (key_reply, &reply)] {
+        assert_sealed(test, key_id, email.document_id, WRAP_MK).await;
+        assert_eq!(
+            email.thread_id, email.document_id,
+            "a key account's grouped message joined a thread"
+        );
+        let (_, opened) = open_message(test, key_id, STRONG, email.document_id).await;
+        assert_eq!(opened, raw.as_bytes(), "the opened blob is the message");
+    }
+    assert_no_plaintext(test, key_id).await;
+    assert_eq!(
+        metadata_rows(test, key_id).await.len(),
+        2,
+        "a metadata row without its message"
+    );
+
+    // The ordinary account's messages: upstream's, plaintext and threaded.
+    for (email, raw) in [(plain_first, &first), (plain_reply, &reply)] {
+        let row = stored_metadata(test, plain_id, email.document_id).await;
+        assert!(
+            !row_is_stub(&row),
+            "the ordinary account's message is sealed"
+        );
+        assert_eq!(
+            stored_blob(test, &row.unarchive().unwrap().blob_hash()).await,
+            raw.as_bytes(),
+            "the ordinary account's blob is the message"
+        );
+        assert_eq!(
+            threading_keys(test, plain_id, email.document_id).await,
+            1,
+            "control: the ordinary account's message is threaded"
+        );
+    }
+    assert_eq!(
+        plain_reply.thread_id, plain_first.thread_id,
+        "control: the ordinary reply joined its parent's pending thread"
+    );
+
+    // The key account's opened row is the row the ordinary path stores for
+    // the same bytes, but for the blob it names (the sealed blob's hash).
+    let (opened, _) = open_message(test, key_id, STRONG, key_first.document_id).await;
+    let stored = stored_metadata(test, plain_id, plain_first.document_id).await;
+    assert_eq!(
+        opened.raw_headers().unwrap(),
+        stored.raw_headers().unwrap(),
+        "the opened header section"
+    );
+    let (opened, stored) = (opened.unarchive().unwrap(), stored.unarchive().unwrap());
+    assert_eq!(opened.blob_body_offset(), stored.blob_body_offset());
+    assert_eq!(opened.size(), stored.size());
+    assert_eq!(opened.preview(), stored.preview());
+    assert_eq!(opened.parts().len(), stored.parts().len());
+    assert_eq!(
+        opened.root().envelope().subject(),
+        stored.root().envelope().subject(),
+        "the opened envelope"
+    );
+    assert_eq!(
+        opened.blob_hash(),
+        stored_hash(test, key_id, key_first.document_id).await,
+        "the opened row names the sealed blob"
+    );
+
+    assert!(
+        !test.server.za_has_spam_samples(key_id).await.unwrap(),
+        "the group trained a sample of the key account"
+    );
 }

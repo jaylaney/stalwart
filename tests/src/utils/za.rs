@@ -24,10 +24,13 @@ use common::{
 };
 use email::{
     cache::MessageCacheFetch,
-    mailbox::{INBOX_ID, UidMailbox},
+    mailbox::INBOX_ID,
     message::{
-        ingest::EmailIngest,
-        metadata::{MessageData, MessageMetadata},
+        ingest::{ThreadInfo, thread_hash},
+        messagedata::{MessageData, PendingMessageData},
+        metadata::{ExtraHeaders, MessageMetadata},
+        sortkeys::MessageSortKeys,
+        thread::ThreadFields,
     },
 };
 use groupware::{
@@ -49,18 +52,15 @@ use groupware::{
 use http::auth::authenticate::za_test::{self, Pause};
 use hyper::{Method, StatusCode};
 use mail_parser::MessageParser;
-use registry::schema::{
-    enums::IndexDocumentType,
-    structs::{Task, TaskIndexDocument, TaskStatus},
-};
+use registry::schema::structs::Task;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{future::Future, sync::Arc, time::Duration};
 use store::{
     Deserialize, IterateParams, Serialize as _, ValueKey,
     write::{
-        Archive, ArchiveBytes, ArchiveVersion, Archiver, BatchBuilder, BlobLink, BlobOp, TaskId,
-        TaskQueueClass, ValueClass, now,
+        Archive, ArchiveBytes, ArchiveVersion, BatchBuilder, BlobLink, BlobOp, IndexPropertyClass,
+        QueueDocumentId, SearchIndex, TaskId, TaskQueueClass, ValueClass, blob::BlobLinkValue, now,
     },
 };
 use tokio::{
@@ -864,65 +864,97 @@ pub async fn assert_no_event_preferences(test: &TestServer, account_id: u32, doc
 /// Mail spec 6.6: a plaintext message in INBOX, as an account that held
 /// mail before it became a key account would hold one. `email_ingest`
 /// seals every message of a key account, so the message is written here as
-/// its ordinary path writes one (`index_message`: the blob linked,
-/// `MessageData`, the metadata archive) with its thread container and index
-/// task, as `plant_event` writes an unsealed event. Returns the document id.
+/// 1.0's ordinary path writes one (`email_ingest_into` and `index_message`,
+/// `email/src/message/{ingest,index/metadata}.rs`): the blob held and
+/// linked at its length, a thread of its own, `MessageData` with the
+/// attachment keyword upstream sets, the sort keys, the plaintext metadata
+/// row, the threading key and the message's index-queue entry. Nothing here
+/// asserts vault absence: it plants into key accounts too, as `plant_event`
+/// writes an unsealed event. Returns the document id.
 pub async fn plant_plain_message(test: &TestServer, account_id: u32, raw: &str) -> u32 {
     let server = &test.server;
+    let message = MessageParser::new()
+        .parse(raw.as_bytes())
+        .expect("a planted message parses");
     let (blob_hash, blob_hold) = server
-        .put_temporary_blob(account_id, raw.as_bytes(), 60)
+        .hold_blob(
+            account_id,
+            types::blob_hash::BlobHash::generate(raw.as_bytes()),
+            raw.as_bytes(),
+            60,
+        )
         .await
         .unwrap();
-    let mut ids = server
-        .assign_email_ids(account_id, [INBOX_ID], true)
-        .await
-        .unwrap();
-    let document_id = ids.next().unwrap();
-    let uid = ids.next().unwrap();
-    let metadata = MessageMetadata::build(
-        MessageParser::new().parse(raw.as_bytes()).unwrap(),
-        Vec::new(),
-        Vec::new(),
-        blob_hash.clone(),
-        now(),
-    );
-    let data = MessageData {
-        mailboxes: vec![UidMailbox::new(INBOX_ID, uid)].into_boxed_slice(),
-        keywords: Box::default(),
-        thread_id: document_id,
-        size: raw.len() as u32,
-    };
+    let built = MessageMetadata::build(&message, &ExtraHeaders::default(), blob_hash.clone());
+    let fields = ThreadFields::scan(&message);
+    let received_at = now();
+    let keywords = 1u32
+        << if built.has_attachments {
+            types::keyword::HASATTACHMENT
+        } else {
+            types::keyword::HASNOATTACHMENT
+        };
+
     let mut batch = BatchBuilder::new();
+    batch.with_account_id(account_id);
+    let document_slot = batch.reserve_document_id(account_id, Collection::Email);
+    let uid_slots = batch.reserve_uids(account_id, [INBOX_ID]);
     batch
-        .with_account_id(account_id)
         .with_collection(Collection::Thread)
-        .with_document(document_id)
-        .log_container_insert(SyncCollection::Thread)
+        .create_document(document_slot)
+        .log_container_insert(SyncCollection::Thread);
+    let data = PendingMessageData {
+        data: MessageData {
+            mailboxes: [common::MessageUid::new_unassigned(INBOX_ID)]
+                .into_iter()
+                .collect(),
+            keywords,
+            keywords_extra: Vec::new(),
+            thread_id: 0,
+            size: raw.len() as u32,
+            received_at,
+            sent_at: MessageData::sent_at_offset(fields.sent_at, received_at),
+            change_id: 0,
+        },
+        uid_slots,
+        thread_slot: Some(document_slot),
+        change_id: None,
+    };
+    let thread_id = data.thread_id();
+    batch
         .with_collection(Collection::Email)
-        .with_document(document_id)
+        .create_document(document_slot)
         .set(
             BlobOp::Link {
                 hash: blob_hash,
                 to: BlobLink::Document,
             },
-            Vec::new(),
+            BlobLinkValue::new(message.raw().len()),
         )
         .custom(ObjectIndexBuilder::<(), _>::new().with_changes(data))
         .unwrap()
         .set(
-            EmailField::Metadata,
-            Archiver::new(metadata).serialize().unwrap(),
+            EmailField::SortKeys,
+            MessageSortKeys::from_message(&message).serialize(),
         )
-        .schedule_task(Task::IndexDocument(TaskIndexDocument {
-            account_id: account_id.into(),
-            document_id: document_id.into(),
-            document_type: IndexDocumentType::Email,
-            status: TaskStatus::now(),
-        }))
-        .clear(blob_hold);
-    server.commit_batch(batch).await.unwrap();
-    server.notify_task_queue();
-    document_id
+        .set(EmailField::Metadata, built.encode().unwrap())
+        .set(
+            ValueClass::IndexProperty(IndexPropertyClass::Hash {
+                property: EmailField::Threading.into(),
+                hash: thread_hash(fields.subject),
+            }),
+            ThreadInfo {
+                thread_id,
+                ref_ids: &fields.message_ids,
+            },
+        )
+        .queue_document_index(SearchIndex::Email, account_id, QueueDocumentId::Current);
+    blob_hold.release(&mut batch);
+    server
+        .commit_batch(batch)
+        .await
+        .unwrap()
+        .slot(document_slot)
 }
 
 /// Emails in the account's mailboxes.
@@ -932,7 +964,6 @@ pub async fn mail_count(test: &TestServer, account_id: u32) -> usize {
         .await
         .unwrap()
         .emails
-        .items
         .len()
 }
 
@@ -1555,7 +1586,7 @@ pub async fn za_app_password(name: &str, password: &str, description: &str) -> S
 /// (`Registered`) client, and an access token bound to it, minted
 /// in-process with the server's own helpers. 1.0 binds every access token
 /// to a grant and resolves only registered, stateless or metadata-document
-/// clients, so the 0.16 HTTP flow of `bearer_token` no longer applies; the
+/// clients, so 0.16's `/api/auth` and `/auth/token` flow no longer applies; the
 /// caller revokes the grant (`GrantDeletion`) when it is done. Returns the
 /// grant id and the token.
 pub async fn za_grant_token(
@@ -1618,59 +1649,6 @@ pub async fn za_bearer_token(server: &common::Server, name: &str) -> String {
     za_grant_token(server, name, common::auth::oauth::scope::OAuthScopes::ALL)
         .await
         .1
-}
-
-/// An OAuth access token of `name`, through the server's own flow: an
-/// authorization code from `/api/auth`, exchanged at `/auth/token` (the
-/// suite requires no client registration). The token holds no keys.
-///
-/// This is 0.16's login request; 1.0's takes an authorization `query` and a
-/// resolvable client. Its callers move to `za_bearer_token` (Task 3b moved
-/// `mail::login`; the mail modules' calls are Task 5's).
-pub async fn bearer_token(name: &str, password: &str) -> String {
-    const CLIENT_ID: &str = "za-bearer-test";
-    const REDIRECT_URI: &str = "https://client.example.com/callback";
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap();
-    let reply: Value = client
-        .post(format!("{SERVER_URL}/api/auth"))
-        .json(&json!({
-            "type": "authCode",
-            "accountName": name,
-            "accountSecret": password,
-            "clientId": CLIENT_ID,
-            "redirectUri": REDIRECT_URI,
-        }))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let code = reply["client_code"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no authorization code: {reply}"));
-    let reply: Value = client
-        .post(format!("{SERVER_URL}/auth/token"))
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("client_id", CLIENT_ID),
-            ("redirect_uri", REDIRECT_URI),
-        ])
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    reply["access_token"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no access token: {reply}"))
-        .to_string()
 }
 
 /// A fresh TOTP enrolment URL (a random 20-byte secret).

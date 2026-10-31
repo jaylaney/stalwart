@@ -37,8 +37,9 @@ use ::email::{
     cache::MessageCacheFetch,
     mailbox::{INBOX_ID, Mailbox, TRASH_ID},
     message::{
+        delivery::SenderAuthentication,
         ingest::{EmailIngest, IngestEmail, IngestSource},
-        metadata::MessageData,
+        messagedata::MessageData,
     },
     push::{EmailPush, Urgency},
 };
@@ -81,14 +82,13 @@ use std::{
 use store::{
     ValueKey,
     rand::{self, RngExt},
-    write::{AlignedBytes, Archive, BatchBuilder},
+    write::BatchBuilder,
 };
 use tokio::sync::mpsc;
 use types::{
     collection::{Collection, SyncCollection},
     id::Id,
     keyword::Keyword,
-    special_use::SpecialUse,
 };
 
 /// Mail spec 8: method response `n` is the error `kind` (`unsupportedFilter`
@@ -259,14 +259,10 @@ pub async fn query(test: &TestServer) {
         for mailbox_id in 1545..3010 {
             batch
                 .with_document(mailbox_id)
+                // 1.0's `Mailbox` keeps its role in `flags` (0: none).
                 .custom(ObjectIndexBuilder::<(), _>::new().with_changes(Mailbox {
-                    name: format!("Mailbox {mailbox_id}"),
-                    role: SpecialUse::None,
-                    parent_id: 0,
-                    sort_order: None,
                     uid_validity: 0,
-                    subscribers: vec![],
-                    acls: vec![],
+                    ..Mailbox::new(format!("Mailbox {mailbox_id}"))
                 }))
                 .unwrap();
         }
@@ -274,7 +270,7 @@ pub async fn query(test: &TestServer) {
             .core
             .storage
             .data
-            .write(batch.build_all())
+            .write_batch(&mut batch)
             .await
             .unwrap();
 
@@ -286,12 +282,11 @@ pub async fn query(test: &TestServer) {
         assert_eq!(
             cached
                 .emails
-                .items
                 .iter()
-                .map(|m| m.thread_id)
+                .map(|m| m.thread_id())
                 .collect::<AHashSet<_>>()
                 .len(),
-            cached.emails.items.len()
+            cached.emails.len()
         );
         test.wait_for_tasks().await;
     }
@@ -924,11 +919,15 @@ pub async fn query_changes(test: &TestServer) {
             }
             LogAction::Update(id) => {
                 let id = *id_map.get(id).unwrap();
+                // 1.0's `log_item_update` logs only under a current
+                // account, so the batch names it.
                 let mut batch = BatchBuilder::new();
                 batch
+                    .with_account_id(account.id().document_id())
+                    .with_collection(Collection::Email)
                     .with_document(id.document_id())
-                    .log_item_update(SyncCollection::Email, id.prefix_id().into());
-                server.store().write(batch.build_all()).await.unwrap();
+                    .log_item_update(SyncCollection::Email, Some(id.prefix_id().into()));
+                server.store().write_batch(&mut batch).await.unwrap();
                 updated_ids.insert(id);
             }
             LogAction::Delete(id) => {
@@ -940,9 +939,11 @@ pub async fn query_changes(test: &TestServer) {
                 let id = *id_map.get(from).unwrap();
                 let new_id = Id::from_parts(thread_id, id.document_id());
 
-                let old_message_ = server
+                // 1.0 stores `MessageData` in its own encoding, not as an
+                // rkyv archive.
+                let old_message = server
                     .store()
-                    .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                    .get_value::<MessageData>(ValueKey::archive(
                         account.id().document_id(),
                         Collection::Email,
                         id.document_id(),
@@ -950,27 +951,25 @@ pub async fn query_changes(test: &TestServer) {
                     .await
                     .unwrap()
                     .unwrap();
-                let old_message = old_message_.to_unarchived::<MessageData>().unwrap();
-                let mut new_message = old_message.deserialize::<MessageData>().unwrap();
+                let mut new_message = old_message.clone();
                 new_message.thread_id = thread_id;
 
+                let mut batch = BatchBuilder::new();
+                batch
+                    .with_account_id(account.id().document_id())
+                    .with_collection(Collection::Email)
+                    .with_document(id.document_id())
+                    .custom(
+                        ObjectIndexBuilder::new()
+                            .with_current(old_message)
+                            .with_changes(new_message),
+                    )
+                    .unwrap();
                 server
                     .core
                     .storage
                     .data
-                    .write(
-                        BatchBuilder::new()
-                            .with_account_id(account.id().document_id())
-                            .with_collection(Collection::Email)
-                            .with_document(id.document_id())
-                            .custom(
-                                ObjectIndexBuilder::new()
-                                    .with_current(old_message)
-                                    .with_changes(new_message),
-                            )
-                            .unwrap()
-                            .build_all(),
-                    )
+                    .write_batch(&mut batch)
                     .await
                     .unwrap();
 
@@ -1260,7 +1259,6 @@ pub async fn copy(test: &TestServer) {
             .await
             .unwrap()
             .emails
-            .items
             .len(),
         0
     );
@@ -1497,9 +1495,11 @@ pub async fn thread_merge(test: &TestServer) {
                         received_at: None,
                         source: IngestSource::Smtp {
                             deliver_to: "test@domain.org",
-                            is_sender_authenticated: true,
+                            envelope_from: "sender@domain.org",
+                            sender_authentication: SenderAuthentication::DmarcPass,
                             is_spam: false,
                         },
+                        metadata: None,
                         session_id: 0,
                     })
                     .await
@@ -1525,13 +1525,12 @@ pub async fn thread_merge(test: &TestServer) {
     }
     test.wait_for_tasks().await;
     let cached = test.server.get_cached_messages(account_id).await.unwrap();
-    assert_eq!(messages, cached.emails.items.len());
+    assert_eq!(messages, cached.emails.len());
     assert!(
         cached
             .emails
-            .items
             .iter()
-            .all(|m| m.thread_id == m.document_id),
+            .all(|m| m.thread_id() == m.document_id()),
         "a sealed message is its own thread"
     );
     println!("Deleting all messages...");
@@ -3369,6 +3368,12 @@ pub async fn calendars(test: &TestServer) {
         (
             "ParticipantIdentity/get",
             json!({ "accountId": id, "ids": null }),
+        ),
+        // New at 1.0 (0.16 answered `cannotCalculateChanges`): refused as
+        // `/get` and `/set` are, naming the request's account.
+        (
+            "ParticipantIdentity/changes",
+            json!({ "accountId": id, "sinceState": "n" }),
         ),
     ] {
         let reply = account.jmap_method_call(method, args).await;

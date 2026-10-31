@@ -21,7 +21,7 @@ use crate::{
         imap::{AssertResult, ImapConnection, Type},
         jmap::JmapResponse,
         server::TestServer,
-        za::{bearer_token, wait_for_delivery, za_setup, za_setup_token},
+        za::{wait_for_delivery, za_bearer_token, za_setup, za_setup_token},
     },
     za::{
         STRONG,
@@ -425,7 +425,7 @@ async fn keyless_tokens_hit_the_dispatcher_gate(test: &TestServer, key: &Account
     ];
 
     let channels = [
-        Keyless::Bearer(bearer_token(KEY, STRONG).await),
+        Keyless::Bearer(za_bearer_token(&test.server, KEY).await),
         Keyless::WebSocket(ws_connect(KEY, STRONG).await),
     ];
     let traced = Traced::start(&[EventType::Security(SecurityEvent::Unauthorized)]);
@@ -1618,7 +1618,7 @@ async fn impersonated_session_is_foreign(test: &mut TestServer, admin: &Account)
 }
 
 /// The OAuth client of `oauth_grant_refused_for_impersonation` (the suite
-/// requires no client registration, as `bearer_token`).
+/// requires no client registration at 0.16; see `za_grant_token` for 1.0).
 const OAUTH_CLIENT: &str = "za-gates-test";
 const OAUTH_REDIRECT: &str = "https://client.example.com/callback";
 
