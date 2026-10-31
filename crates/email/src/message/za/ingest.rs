@@ -25,7 +25,7 @@ use common::{
     za::{ZA_TRACE_MAIL_KEYLESS, mail::za_keyless_refusal},
 };
 use std::sync::Arc;
-use store::write::{BatchBuilder, BlobLink, BlobOp, blob::BlobLinkValue};
+use store::write::{BatchBuilder, BlobLink, BlobOp, PendingId, blob::BlobLinkValue};
 use trc::AddContext;
 use types::{blob_hash::BlobHash, field::EmailField};
 use vault::{
@@ -114,6 +114,16 @@ pub async fn za_ingest_wrap(
         );
         Err(za_keyless_refusal().account_id(account_id))
     }
+}
+
+/// Mail spec 5.4, ruling 59: the thread an `IngestGroup` records a queued
+/// message under, for the group's later messages to join, if any. A key
+/// account has no threading, so its message is recorded under no thread
+/// key, neither its own thread nor a shared one, and takes no part in the
+/// group's pending threads: a plain reply in the same group would otherwise
+/// find two threads under its key and join neither.
+pub fn za_group_thread(za_key: bool, thread_id: PendingId) -> Option<PendingId> {
+    (!za_key).then_some(thread_id)
 }
 
 /// Object metadata (an IMAP METADATA or JMAP metadata container) is not

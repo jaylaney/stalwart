@@ -537,12 +537,18 @@ impl Server {
         Ok(())
     }
 
-    /// Mail spec 6.1, the provisioning fence: appended as the last ops of a
-    /// batch that stores into `account_id` read as an ordinary account, it
-    /// commits the batch only while the account holds no vault record. Last,
-    /// because the context it selects is not restored for later ops. Nothing
-    /// on PostgreSQL or MySQL: key accounts cannot exist there (`setup-token`
-    /// refuses) and the assertion would be no fence.
+    /// Mail spec 6.1, the provisioning fence: added to a batch that stores
+    /// into `account_id` read as an ordinary account, in each commit chunk
+    /// that holds its writes, it commits the chunk only while the account
+    /// holds no vault record. The mail callers add it first, right after
+    /// `with_account_id` (`email_ingest_into`, `copy_message`), the training
+    /// path before its samples and again after each commit point, and the
+    /// iTIP writes before each commit point. It selects the `Principal`
+    /// collection and document 0 and does not restore the caller's
+    /// selection, so the caller re-selects its collection and document after
+    /// it (every later op of those callers names its keys or selects them
+    /// again). Nothing on PostgreSQL or MySQL: key accounts cannot exist
+    /// there (`setup-token` refuses) and the assertion would be no fence.
     pub fn za_provisioning_fence(&self, batch: &mut BatchBuilder, account_id: u32) {
         if !self.store().is_pg_or_mysql() {
             batch
@@ -783,8 +789,9 @@ impl Server {
     ///   worker's batch clears it, so a write still in flight is seen here
     ///   before it lands, and a failed partition keeps its entries;
     /// - the task queue, for the account's `MergeThreads` and
-    ///   `CalendarItipMessage` tasks. A retained merge task holds a subject
-    ///   of up to 15 bytes verbatim. The task queue has no per-account range:
+    ///   `CalendarItipMessage` tasks. A retained merge task holds the
+    ///   thread's subject hash (`TaskMergeThreads.thread_name`, the hash's
+    ///   string form), not the subject. The task queue has no per-account range:
     ///   one pass over every task record, stopping at the first hit.
     ///
     /// The match over `Task` is exhaustive on purpose: a task type upstream

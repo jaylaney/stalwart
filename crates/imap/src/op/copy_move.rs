@@ -207,6 +207,14 @@ impl<T: SessionStream> SessionData<T> {
                 .id(arguments.tag));
         }
 
+        // Mail spec 6.3, ruling R34: the destination, a key account's
+        // mailbox, is used only by its own sessions, checked before its
+        // message cache is read (`check_mailbox_acl` checks it again).
+        self.server
+            .za_assert_mail_route(&self.access_token, dest_mailbox.account_id)
+            .await
+            .imap_ctx(&arguments.tag, trc::location!())?;
+
         // Verify that the user can append messages to the destination mailbox.
         let dest_mailbox_id = dest_mailbox.mailbox_id;
         let dest_cache = if src_mailbox.id.account_id != dest_mailbox.account_id {

@@ -7,7 +7,7 @@
 use super::{
     EmailIngest, IngestEmail, IngestedEmail, PendingIngest, sorted_intersect, thread_hash,
 };
-use crate::message::thread::ThreadFields;
+use crate::message::{thread::ThreadFields, za::ingest::za_group_thread};
 use common::Server;
 use mail_parser::Message;
 use store::write::{BatchBuilder, PendingId};
@@ -97,11 +97,7 @@ impl IngestGroup {
             .await
         {
             Ok(pending) => {
-                if let PendingIngest::Queued(email) = &pending
-                    && !key.message_ids.is_empty()
-                {
-                    self.threads.push((key, email.thread_id));
-                }
+                self.record_thread(&pending, key);
                 self.pending.push(pending);
                 self.size = self.size.saturating_add(size);
                 Ok(())
@@ -112,6 +108,15 @@ impl IngestGroup {
                 }
                 Err(err)
             }
+        }
+    }
+
+    fn record_thread(&mut self, pending: &PendingIngest, key: ThreadKey) {
+        if let PendingIngest::Queued(email) = pending
+            && !key.message_ids.is_empty()
+            && let Some(thread_id) = za_group_thread(email.za_key, email.thread_id)
+        {
+            self.threads.push((key, thread_id));
         }
     }
 
@@ -167,3 +172,6 @@ fn is_rejection(err: &trc::Error) -> bool {
         _ => false,
     }
 }
+
+#[cfg(test)]
+mod za_tests;

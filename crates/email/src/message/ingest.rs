@@ -92,6 +92,9 @@ pub struct PendingEmail {
     message_id: Option<String>,
     session_id: u64,
     start_time: Instant,
+    /// Mail spec 5.4, ruling 59: a key account's message, which an
+    /// `IngestGroup` records under no thread (`za_group_thread`).
+    za_key: bool,
 }
 
 pub struct IngestEmail<'x> {
@@ -842,6 +845,7 @@ impl EmailIngest for Server {
                 message_id: Some("[redacted]".into()),
                 session_id: params.session_id,
                 start_time,
+                za_key: true,
             }));
         }
         // SPDX-SnippetBegin
@@ -933,6 +937,7 @@ impl EmailIngest for Server {
             message_id,
             session_id: params.session_id,
             start_time,
+            za_key: false,
         }))
     }
 
@@ -955,6 +960,7 @@ impl EmailIngest for Server {
             message_id,
             session_id,
             start_time,
+            za_key: _,
         } = pending;
         self.private_metadata_committed(private_commit, assigned_ids)
             .await;

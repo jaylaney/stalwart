@@ -763,8 +763,59 @@ async fn jmap_refused_filters_and_sorts(key: &Fixture, plain: &Fixture) {
             "metadataExists",
             json!({ "metadataExists": "za-search/key" }),
         ),
+        // Ruling 55: the attachment keywords the server sets at ingest, in
+        // any case, which a key account's message never carries.
+        ("hasKeyword", json!({ "hasKeyword": "$hasattachment" })),
+        ("notKeyword", json!({ "notKeyword": "$HasNoAttachment" })),
+        (
+            "allInThreadHaveKeyword",
+            json!({ "allInThreadHaveKeyword": "$HASATTACHMENT" }),
+        ),
+        (
+            "someInThreadHaveKeyword",
+            json!({ "someInThreadHaveKeyword": "$hasnoattachment" }),
+        ),
+        (
+            "noneInThreadHaveKeyword",
+            json!({ "noneInThreadHaveKeyword": "$HasAttachment" }),
+        ),
     ];
-    let sorts = ["from", "to", "cc", "subject", "sentAt"];
+    let sorts = ["from", "to", "cc", "subject", "sentAt"]
+        .map(|property| {
+            (
+                property,
+                json!({ "property": property, "isAscending": true }),
+            )
+        })
+        .into_iter()
+        .chain([
+            // Ruling 55, as for the keyword filters.
+            (
+                "hasKeyword",
+                json!({
+                    "property": "hasKeyword",
+                    "keyword": "$HasAttachment",
+                    "isAscending": true,
+                }),
+            ),
+            (
+                "allInThreadHaveKeyword",
+                json!({
+                    "property": "allInThreadHaveKeyword",
+                    "keyword": "$hasnoattachment",
+                    "isAscending": true,
+                }),
+            ),
+            (
+                "someInThreadHaveKeyword",
+                json!({
+                    "property": "someInThreadHaveKeyword",
+                    "keyword": "$hasattachment",
+                    "isAscending": true,
+                }),
+            ),
+        ])
+        .collect::<Vec<_>>();
 
     for fixture in [key, plain] {
         let is_key = std::ptr::eq(fixture, key);
@@ -825,17 +876,12 @@ async fn jmap_refused_filters_and_sorts(key: &Fixture, plain: &Fixture) {
         } else {
             assert_eq!(reply.name_at(0), "Email/query", "{context}: {:?}", reply.0);
         }
-        for property in sorts {
+        for (property, sort) in &sorts {
             let reply = fixture
                 .account
                 .jmap_method_call(
                     "Email/query",
-                    query_args(
-                        &fixture.account,
-                        None,
-                        Some(json!([{ "property": property, "isAscending": true }])),
-                        false,
-                    ),
+                    query_args(&fixture.account, None, Some(json!([sort])), false),
                 )
                 .await;
             if is_key {

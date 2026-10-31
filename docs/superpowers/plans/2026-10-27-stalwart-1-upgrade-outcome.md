@@ -4806,7 +4806,7 @@ an rkyv structure, a header section and a trailer. 0.16's stub put its bundle in
 | JMAP Email/import | `jmap/src/email/grouped.rs:40` → `IngestGroup` (`Jmap`) | As APPEND. |
 | JMAP Email/set create | `jmap/src/email/set.rs:1062` → `email_ingest` (`Jmap`) | As APPEND; a key account's message with object metadata is refused before the batch (`za_metadata_refusal`, a 550 rejection). |
 | Restore | `services/src/task_manager/tasks/restore_item.rs:57` → `email_ingest` (`Restore`) | Refused for a key account before the batch (550, spec 6.7); an ordinary account is fenced. |
-| Cross-account copy | `email/src/message/copy.rs` `copy_message`, from IMAP COPY/MOVE (`imap/src/op/copy_move.rs:540`) and JMAP Email/copy (`jmap/src/email/copy.rs:343`) | Refused at use time when the source row's account (`CopySource::account_id`) or the target is a key account (`ZA_TRACE_MAIL_COPY`, the keyless refusal), before the row is read; the ordinary target asserts vault absence in the copy's one chunk. |
+| Cross-account copy | `email/src/message/copy.rs` `copy_message`, from IMAP COPY/MOVE (`imap/src/op/copy_move.rs:540`) and JMAP Email/copy (`jmap/src/email/copy.rs:343`) | Refused at use time when the source row's account (`CopySource::account_id`) or the target is a key account (`ZA_TRACE_MAIL_COPY`, the keyless refusal), before the row is decoded (`CopySources::take` has read its stored bytes, the sealed stub for a key account); the ordinary target asserts vault absence in the copy's one chunk. |
 | Training samples | `email/src/message/ingest.rs` `add_account_spam_samples` (IMAP STORE, COPY and MOVE, Email/set, Email/copy) and `add_spam_sample` inside `email_ingest_into` | A key account is skipped (fresh `za_is_key_account`); `email_ingest_into` sets no sample for one. An ordinary account's samples assert vault absence in every commit chunk (R55: the fence after `with_account_id` and again after every `commit_point` that splits). |
 
 No single-message guard remains around the grouped path: every guard sits in
@@ -4865,9 +4865,10 @@ fence lives in the message's own chunk, which `write_batch` commits as one trans
   needs 1.0's queue API, at Task 7's first compile.
 
 **Recorded, no owner action**
-- An `IngestGroup` records a key account's message under its content-derived `ThreadKey`
-  in memory; the key-account branch ignores group threads, and every caller builds a group
-  for one account, so no message joins a thread across accounts.
+- Superseded by ruling 59 (fix round 1, F1): an `IngestGroup` no longer records a key
+  account's message under any thread key (`za_group_thread`), so its content-derived
+  `ThreadKey` is dropped at the ingest and a plain reply in the same group is not stopped
+  by it. Every caller still builds a group for one account.
 - `spam-filter/src/modules/classifier.rs` keeps upstream's `stalwart_tests` seeding of its
   sampling RNG; 0.16 had no hook there.
 
@@ -4925,7 +4926,7 @@ provisioning (R33, R48).
 | IMAP SEARCH, ESEARCH, SORT | `op/search.rs` `search` → `query` | R34 before the cache read; then a filter or sort key that needs content (`za_filter_needs_content`, `za_sort_needs_content`) is refused for a key account as a whole, `NO [CANNOT]` `ZA_MAIL_SEARCH_REFUSED`, before any filter is built. The other keys read the cache (flags, sizes, arrival dates, modseq, ids). |
 | IMAP THREAD | `op/thread.rs` | R34 before the cache read; the filter refusal in `query`; threads come from the cache's thread ids (a key account's messages each have their own thread). |
 | IMAP COPY, MOVE (same account) | `op/copy_move.rs` | R34 before the source cache read; the copy changes mailbox memberships only (no content read); training through `add_account_spam_samples`, which skips a key account. |
-| IMAP COPY, MOVE (across accounts) | `op/copy_move.rs` → `email::copy_message` | R34 on the source and, through `check_mailbox_acl_as`, on the destination; `za_assert_mail_copy` refuses before the copy loop when either account is a key account (`NO [NOPERM]`); `copy_message` refuses again at use time (5a). An ordinary pair's training samples carry R55's fence in every chunk (`add_account_spam_samples`). |
+| IMAP COPY, MOVE (across accounts) | `op/copy_move.rs` → `email::copy_message` | R34 on the source and on the destination, each before that account's cache read (the destination's since fix round 1, F3; `check_mailbox_acl_as` checks it again); `za_assert_mail_copy` refuses before the copy loop when either account is a key account (`NO [NOPERM]`); `copy_message` refuses again at use time (5a). An ordinary pair's training samples carry R55's fence in every chunk (`add_account_spam_samples`). |
 | IMAP APPEND | `op/append.rs` → `IngestGroup` (5a) | R34 through `check_mailbox_acl` → `check_mailbox_acl_as`; sealing as in part 5a's map. |
 | IMAP STORE | `op/store.rs` | R34 before the cache read; keywords only; training skips a key account; the `ImapEvent::Store` details are `[redacted]` in a key session. |
 | IMAP IDLE, NOOP, CHECK | `op/idle.rs` `write_changes` | A foreign key account's selected mailbox gets no update and its cache is not read. Otherwise the update is a FETCH of FLAGS and UID only: no keys, no content pushed. |
@@ -5077,7 +5078,7 @@ email/test_mode` passes 8 tests (one new: `the_opened_row_answers_has_attachment
 | `Blob/upload` | `blob/upload.rs:61` | Keys once (refused without them); every literal source that is a sealed source refuses the call before the first write (`:77`), and each source is checked again at its turn (`:116`, including a reference to this call's upload). A key account's upload is sealed (`za_put_sealed_upload`, `:235`). |
 | `Blob/copy` | `blob/copy.rs:51` | Refused when either account is a key account, and for any sealed-source id, before the first link. |
 | `Blob/lookup` | dispatcher | `za_assert_mail_route`; reads references, no content. |
-| `/jmap/download` | `http/src/request.rs:221` → `blob_contents` (`blob/download.rs:175`) | A sealed source (`za_is_sealed_source`: a key account's `Reserved` upload, or `Linked`/`Embedded` Email blob) is answered only by `za_download_message` or `za_download_upload`, with `za_mail_keys` (keyless: R30's 403). Calendar data of a key account is denied in `has_access_blob` for `Linked` and, new at 1.0, `Embedded` blobs (`za_calendar_data`). |
+| `/jmap/download` | `http/src/request.rs:221` → `blob_contents` (`blob/download.rs:175`) | A non-member's `Linked` Email blob of a key account is refused by R34's route check in `has_access_blob`, before that account's message cache is read (fix round 1, F9). A sealed source (`za_is_sealed_source`: a key account's `Reserved` upload, or `Linked`/`Embedded` Email blob) is answered only by `za_download_message` or `za_download_upload`, with `za_mail_keys` (keyless: R30's 403). Calendar data of a key account is denied in `has_access_blob` for `Linked` and, new at 1.0, `Embedded` blobs (`za_calendar_data`). |
 | `/jmap/upload` | `http/src/request.rs:264` → `blob_upload` (`blob/upload.rs:262`) | The gate refuses a key account without its keys before the body is read (403); `blob_upload` asserts the keys again and seals. The body is read untraced for a key account's token. Re-read against 1.0's `blob_upload`: unchanged. |
 | `EmailSubmission/set` | `submission/set.rs:630` | Dispatcher keys; `za_metadata_view`, then `za_open_message_blob` (`:701`); an unreadable message fails its create (`ZA_MAIL_UNREADABLE`). The recipients come from the opened row, the BCC strip runs on the opened bytes, and the plaintext goes only to the SMTP queue. |
 | `Mailbox/get`, `/query`, `/changes`, `/queryChanges` | dispatcher, `changes/get.rs:248` | `za_assert_mail_route`. Object metadata: Task 6. |
@@ -5152,9 +5153,11 @@ it is Task 6's. For key accounts:
 `filter_needs_content` and `sort_needs_content` keep their verdicts and stay exhaustive:
 - content: the filters `text`, `from`, `to`, `cc`, `bcc`, `subject`, `body`, `header`,
   `hasAttachment`, `sentBefore` and `sentAfter`, and the sorts `from`, `to`, `cc`,
-  `subject` and `sentAt`;
+  `subject` and `sentAt`; since fix round 1 (F2, ruling 55), also every keyword filter
+  (`hasKeyword`, `notKeyword` and the three thread forms) and keyword sort (`hasKeyword`
+  and the two thread forms) naming `$hasattachment` or `$hasnoattachment` in any case;
 - visible: everything else, including `before` and `after` (the arrival time), the sizes,
-  keywords, mailboxes, threads and ids.
+  the other keywords, mailboxes, threads and ids.
 
 New at 1.0, `Email/query`'s filter type is `EmailQueryFilter { Email(EmailFilter),
 Metadata(MetadataFilter) }`. The new exhaustive match is
@@ -5312,6 +5315,24 @@ call sites need no change (see Task 3's "Follow-up: R46's class").
 `tests/src/utils/za.rs`, `tests/src/jmap/za_variants.rs`. `tests/src/za/mail/{login,traces}.rs`
 and `tests/src/imap/za_variants.rs` needed no change for 1.0's mail APIs (their uses are
 protocol-level or the harness's).
+
+### Fix round 1: the Task 5 review's findings
+
+The review (`task-5-review.md` in the plan workspace) raised F1-F9. This round fixes F1, F2,
+F3, F6, F8 and F9; F4 and F7 are Task 6's and F5 is Task 8's.
+
+| Finding | Change | Behaviour |
+|---|---|---|
+| F1, ruling 59 | `PendingEmail` carries `za_key` (process memory only, never stored); the key branch of `email_ingest_into` sets it. `IngestGroup::ingest` records a queued message's thread through `IngestGroup::record_thread`, whose one fork line is `za_group_thread(email.za_key, email.thread_id)` (`email/src/message/za/ingest.rs`): `None` for a key account's message. | A key account's message never takes part in a group's pending threads, under its own thread or a shared one. A plain reply after a plain message and the key account's copy of it now finds one pending thread and joins it, which `grouped_ingest_mixed_key_and_plain` asserts as written (its order unchanged). Unit tests `message::ingest::group::za_tests::{a_key_message_is_recorded_under_no_thread, a_plain_reply_joins_its_parent_past_a_key_copy, control_two_plain_threads_under_one_key_join_neither}` (crate `email`, `ingest/group/za_tests.rs`) reach `pending_thread`. |
+| F2, ruling 55 | `filter_needs_content` and `sort_needs_content` (`jmap/src/email/za.rs`) classify `hasKeyword`, `notKeyword`, `allInThreadHaveKeyword`, `someInThreadHaveKeyword`, `noneInThreadHaveKeyword` and the `hasKeyword`, `allInThreadHaveKeyword` and `someInThreadHaveKeyword` comparators as content when the keyword is `$hasattachment` or `$hasnoattachment` (`is_attachment_keyword`: the two variants, or an `Other` equal to either name ignoring ASCII case; the parser already maps either name to its variant in any case). The matches stay exhaustive. | A key account's `Email/query` or `Email/queryChanges` naming either keyword answers `unsupportedFilter` or `unsupportedSort` with `ZA_MAIL_SEARCH_REFUSED`, as `hasAttachment` and IMAP's `KEYWORD`/`UNKEYWORD` do. The two thread-keyword comparators go beyond the review's fix line (it named the `hasKeyword` comparator); they answer from the same client-stored flags, so they are refused alike. Other keywords are served as before. |
+| F3 | IMAP COPY and MOVE call `za_assert_mail_route` on the destination account before its `MessageStoreCache` is fetched (`imap/src/op/copy_move.rs`), as for the source. | Refused as before (`NO [NOPERM]`, keyless refusal); the destination's cache is no longer read first. |
+| F9 | `has_access_blob`'s non-member arm for a `Linked` Email blob calls `za_assert_mail_route` before `get_cached_messages` (`jmap/src/blob/download.rs`). | A non-member's download of a key account's message or section is refused with the keyless refusal before the cache read, whether or not a grant made before provisioning exists; without such a grant it answered not found before. It is still not 200. The other `has_access_blob` callers (`Blob/copy`, `Blob/upload`, `FileNode`, `Email/set` attachments) refuse a sealed source before they reach it. |
+| F6 | `za_provisioning_fence`'s docstring (`common/src/auth/vault.rs`) says where the callers put it (first, after `with_account_id`, in ingest and copy; per chunk in training and iTIP) and that the caller re-selects its collection and document after it. Part 5a's route map says `copy_message` refuses before the row is decoded. | None. |
+| F8 | R54's scan comment says a retained merge task holds the subject's hash (`TaskMergeThreads.thread_name`), not the subject. | None. |
+
+`jmap` compiles at Task 6, so F2's and F9's edits were checked by reading and rustfmt; the
+F2 unit rows (`email::za::tests::{filter_table, sort_table, query_filter_table,
+attachment_keywords_parse_to_their_variants}`) run then.
 
 ## Conflict ledger
 
@@ -5543,6 +5564,7 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `jmap::za_variants::query_changes` (fork, ruling R44) | The `LogAction::Update` batch names its account and collection before `log_item_update`; the `LogAction::Move` rewrite reads `MessageData` in its own encoding. Assertions unchanged. | `store/src/write/batch.rs:395-410`: `log_item_update` logs only under a current account (0.16's call had none and would log nothing at 1.0); `MessageData` is no rkyv archive at 1.0. |
 | `za::mail::search::{imap_refused_keys, jmap_refused_filters_and_sorts}` (fork) | `KEYWORD $HasAttachment` and `UNKEYWORD $HasNoAttachment` join the refused IMAP keys, and `metadataExists` the refused JMAP filters (stronger). | Rulings 55 and 57. |
 | `za::mail::reads::offsets_round_trip` (fork) | `sentAt` joins the compared `Email/get` properties (stronger). | Part 5a stores no `sent_at` offset for a key account; 5c serves `sentAt` from the opened envelope. |
+| `za::mail::search::jmap_refused_filters_and_sorts` (fork, fix round 1) | The five keyword filters on `$hasattachment` or `$hasnoattachment` (mixed case) and the `hasKeyword`, `allInThreadHaveKeyword` and `someInThreadHaveKeyword` sorts on them join the key account's refused filters and sorts; the ordinary account answers them (stronger). The sort list carries each sort's JSON. | Ruling 55's JMAP side (review F2): 1.0 sets both keywords at ingest; a key account's message carries neither. |
 
 ## Task 1 check
 

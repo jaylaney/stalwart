@@ -290,6 +290,10 @@ impl BlobDownload for Server {
                 } else {
                     match Collection::from(*collection) {
                         Collection::Email => {
+                            // Mail spec 6.3, ruling R34: a key account's
+                            // message is reached only by its own sessions,
+                            // refused before its message cache is read.
+                            self.za_assert_mail_route(access_token, *account_id).await?;
                             let cache = self
                                 .get_cached_messages(*account_id)
                                 .await

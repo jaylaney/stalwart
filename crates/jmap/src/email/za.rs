@@ -17,9 +17,11 @@ use jmap_proto::{
     method::query::{Comparator, Filter},
     object::email::{EmailComparator, EmailFilter, EmailQueryFilter},
 };
+use types::keyword::Keyword;
 
 /// True when answering the filter needs a message's sealed content (header
-/// values, body text, attachment presence, the sent date). An unknown
+/// values, body text, attachment presence, the attachment keywords, the sent
+/// date). An unknown
 /// property is left to upstream, which names it in its own
 /// `unsupportedFilter`.
 pub fn filter_needs_content(filter: &EmailFilter) -> bool {
@@ -35,17 +37,22 @@ pub fn filter_needs_content(filter: &EmailFilter) -> bool {
         | EmailFilter::HasAttachment(_)
         | EmailFilter::SentBefore(_)
         | EmailFilter::SentAfter(_) => true,
+        // Ruling 55: 1.0 sets `$hasattachment` and `$hasnoattachment` from
+        // the parsed message; a key account's message carries neither, only
+        // what its client stored, so a condition on them would answer only
+        // the client's flags. Refused as `hasAttachment` and IMAP's
+        // `KEYWORD`/`UNKEYWORD` on the same flags are.
+        EmailFilter::AllInThreadHaveKeyword(keyword)
+        | EmailFilter::SomeInThreadHaveKeyword(keyword)
+        | EmailFilter::NoneInThreadHaveKeyword(keyword)
+        | EmailFilter::HasKeyword(keyword)
+        | EmailFilter::NotKeyword(keyword) => is_attachment_keyword(keyword),
         EmailFilter::InMailbox(_)
         | EmailFilter::InMailboxOtherThan(_)
         | EmailFilter::Before(_)
         | EmailFilter::After(_)
         | EmailFilter::MinSize(_)
         | EmailFilter::MaxSize(_)
-        | EmailFilter::AllInThreadHaveKeyword(_)
-        | EmailFilter::SomeInThreadHaveKeyword(_)
-        | EmailFilter::NoneInThreadHaveKeyword(_)
-        | EmailFilter::HasKeyword(_)
-        | EmailFilter::NotKeyword(_)
         | EmailFilter::InThread(_)
         | EmailFilter::Id(_)
         | EmailFilter::_T(_) => false,
@@ -67,7 +74,8 @@ pub fn query_filter_needs_content(filter: &EmailQueryFilter) -> bool {
     }
 }
 
-/// True when ordering by the property needs a message's sealed content.
+/// True when ordering by the property needs a message's sealed content (the
+/// sender, recipients, subject and sent date, and the attachment keywords).
 pub fn sort_needs_content(comparator: &EmailComparator) -> bool {
     match comparator {
         EmailComparator::From
@@ -75,13 +83,32 @@ pub fn sort_needs_content(comparator: &EmailComparator) -> bool {
         | EmailComparator::Cc
         | EmailComparator::Subject
         | EmailComparator::SentAt => true,
+        // Ruling 55, as for the keyword filters above.
+        EmailComparator::HasKeyword(keyword)
+        | EmailComparator::AllInThreadHaveKeyword(keyword)
+        | EmailComparator::SomeInThreadHaveKeyword(keyword) => is_attachment_keyword(keyword),
         EmailComparator::ReceivedAt
         | EmailComparator::Size
-        | EmailComparator::HasKeyword(_)
-        | EmailComparator::AllInThreadHaveKeyword(_)
-        | EmailComparator::SomeInThreadHaveKeyword(_)
         | EmailComparator::ThreadId
         | EmailComparator::_T(_) => false,
+    }
+}
+
+/// Ruling 55: whether `keyword` is one of the attachment keywords the server
+/// sets at ingest (`$hasattachment`, `$hasnoattachment`), in any case. The
+/// parser maps either name to its variant whatever its case, and keeps any
+/// other keyword lowercase; an `Other` holding one of the names (built
+/// without the parser) is matched the same way.
+fn is_attachment_keyword(keyword: &Keyword) -> bool {
+    match keyword {
+        Keyword::HasAttachment | Keyword::HasNoAttachment => true,
+        Keyword::Other(name) => [
+            Keyword::HasAttachment.as_str(),
+            Keyword::HasNoAttachment.as_str(),
+        ]
+        .iter()
+        .any(|attachment| name.eq_ignore_ascii_case(attachment)),
+        _ => false,
     }
 }
 
@@ -213,6 +240,31 @@ mod tests {
             (EmailFilter::Id(vec![Id::default()]), false),
             (EmailFilter::_T("x-unknown".into()), false),
         ]
+        .into_iter()
+        .chain(attachment_keywords().into_iter().flat_map(|keyword| {
+            [
+                EmailFilter::HasKeyword(keyword.clone()),
+                EmailFilter::NotKeyword(keyword.clone()),
+                EmailFilter::AllInThreadHaveKeyword(keyword.clone()),
+                EmailFilter::SomeInThreadHaveKeyword(keyword.clone()),
+                EmailFilter::NoneInThreadHaveKeyword(keyword),
+            ]
+            .map(|filter| (filter, true))
+        }))
+        .collect()
+    }
+
+    /// Ruling 55: the attachment keywords in the forms a request can carry
+    /// (parsed in any case, and an `Other` holding a name in mixed case).
+    fn attachment_keywords() -> Vec<Keyword> {
+        vec![
+            Keyword::HasAttachment,
+            Keyword::HasNoAttachment,
+            Keyword::parse("$HasAttachment"),
+            Keyword::parse("$HASNOATTACHMENT"),
+            Keyword::Other("$HasAttachment".into()),
+            Keyword::Other("$hasnoattachment".into()),
+        ]
     }
 
     fn sorts() -> Vec<(EmailComparator, bool)> {
@@ -230,6 +282,32 @@ mod tests {
             (EmailComparator::SomeInThreadHaveKeyword(keyword()), false),
             (EmailComparator::_T("x-unknown".into()), false),
         ]
+        .into_iter()
+        .chain(attachment_keywords().into_iter().flat_map(|keyword| {
+            [
+                EmailComparator::HasKeyword(keyword.clone()),
+                EmailComparator::AllInThreadHaveKeyword(keyword.clone()),
+                EmailComparator::SomeInThreadHaveKeyword(keyword),
+            ]
+            .map(|property| (property, true))
+        }))
+        .collect()
+    }
+
+    #[test]
+    fn attachment_keywords_parse_to_their_variants() {
+        // The parser ignores case for both names, so a request's
+        // `$HasAttachment` reaches the classification as the variant.
+        assert_eq!(Keyword::parse("$HasAttachment"), Keyword::HasAttachment);
+        assert_eq!(Keyword::parse("$HASNOATTACHMENT"), Keyword::HasNoAttachment);
+        // Neighbouring keywords stay ordinary.
+        for other in [
+            Keyword::Other("$hasattachments".into()),
+            Keyword::HasMemo,
+            Keyword::parse("$attachment"),
+        ] {
+            assert!(!is_attachment_keyword(&other), "{other:?}");
+        }
     }
 
     #[test]
