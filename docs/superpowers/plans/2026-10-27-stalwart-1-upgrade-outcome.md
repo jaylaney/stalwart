@@ -6803,6 +6803,119 @@ and groupware were not rerun (part 7c2 changed only the `tests` crate and fixtur
   nothing for a key account; plain mode has not reached the sub-test, so a fork path (the key
   account's changes handling) is not excluded.
 
+#### Part 7c3: rulings 91-94, the fan-out, delegation and item-sealing fixes
+
+Part 7c3 fixed the two fork defects the matrix found, N3 and N7, and the side findings A1-A4
+of the investigation (`task-7c-investigate-report.md`). Each was the same port gap: 1.0.1
+splits every outgoing organizer message per recipient (`itip_messages_per_recipient`,
+`RecipientSplit` in `groupware/src/scheduling/recipient/split.rs`), and the fork's own
+builders skipped that split. Upstream's split and builders are unchanged; the fork calls
+them. The `7C-HOLD` edits for N3 and N7 are gone from the worktree, and `holds.py` holds no
+pairs.
+
+##### Rulings applied
+
+- **91 (N3, A1, A2): the fan-out's full state.**
+  - `za_full_request_for` (`groupware/src/calendar/pinning.rs`) now takes the event's
+    `RecipientPolicy` and passes its message through `itip_messages_per_recipient`, so the
+    full state is the recipient's 1.0 slice: the instances it attends, the series' EXDATEs
+    for overrides it does not attend when it attends the master, no master when it does
+    not, and no attendee list the policy hides (A1). It returns the slices (one per address
+    that normalizes to the recipient, usually one).
+  - The policy reaches both callers. `za_fan_out` takes it as a new argument after `kind`:
+    the PUT update and create pass `RecipientPolicy::new(groupware, flags)` of the event,
+    the drain's delegating merge the stored event's flags, the DELETE the policy
+    `delete_za_at` already built (a new `ZaDeleteMessage::policy` field). The
+    `contacts/pin` redelivery (`http/src/api/contacts.rs`) builds it from the event's flags.
+  - `full_state`'s REQUEST skip is now coverage (`requests_cover`, `fanout.rs`): skip when,
+    for every address of an ATTENDEE of the committed tree that normalizes to the entry's
+    address (parsed with `Email::new`, as the split parses it), one organizer REQUEST to that
+    address carries every scheduling instance whose ATTENDEEs name it, compared by
+    `InstanceKey` (`za_instance_keys`). For an attendee of the master this is 0.16's
+    `carries_master` rule. The master-CANCEL skip is unchanged (`cancels_master`).
+  - Key-pinning spec 5.1 item (1) is amended to match (the split full state, the coverage
+    skip, and A2's exclusion-only edit).
+  - Case 11's Removal and Organizer sub-cases were re-read for the EXDATE ripple: Removal's
+    full state is now bob's master slice with an EXDATE for X (he is no longer on X), and the
+    drain still ends with X cancelled in his copy, so both sub-cases' expectations hold
+    unchanged at 1.0 (no ledger row). Mixed's restored assertion and the two new sub-cases
+    have ledger rows.
+- **92 (A3): `sequence_floor.rs` re-read against 1.0.1.** It holds, with no code change.
+  - The floor never double-counts. It raises a stale client SEQUENCE to the stored value,
+    and 1.0's `SequenceIncrement` then adds one (it keeps only a value above the stored
+    one). A client-raised value is kept by both.
+  - The floor is still needed. Without it, `SequenceIncrement` adds one to the stale value,
+    which leaves it below the stored one (a stale master at 1 under a stored 3 becomes 2).
+  - The reconciliation cannot double-count: it takes each instance's maximum and only
+    raises. On upstream's own messages at 1.0 it changes nothing, because the partial
+    branch now records its increments (so `itip_finalize` raises the committed tree to the
+    messages' values) and a CANCEL's SEQUENCE is computed per instance from the same
+    increment. It stays as a guard: a fan-out can carry messages from two builder runs (the
+    delegated second run beside the owner run), and a CANCEL's `old + 1` exceeds the
+    committed value when a client lowers an instance below the stored one, which only the
+    floor otherwise prevents.
+  - Guarded by the new unit test
+    `at_1_0_the_floor_never_double_counts_and_the_reconciliation_is_a_no_op`
+    (`sequence_floor.rs`): stale, client-raised and partial-CANCEL updates through
+    `itip_update`, asserting single increments, the unfloored lowering, and an unchanged
+    tree and messages after the reconciliation.
+- **93 (N7): the delegated second run.** `za_self_create`, `za_self_update` (both arms) and
+  `za_self_cancel` (`groupware/src/calendar/delegation.rs`) take the policy and pass their
+  messages through `itip_messages_per_recipient` after `retain_writer_messages` keeps the
+  writer's addresses, so the split's recipient limit counts only those. `za_schedule` passes
+  the policy it holds; the DELETE passes `ZaDeleteMessage::policy`. The comment on
+  `itip_cancel_from_snapshot` (`scheduling/event_cancel.rs`) now says the delegated path
+  splits. The `za::sharing` lifecycle differential's equality assertions are restored. The
+  new unit test `second_run_splits_as_the_owner_run` compares the second run's message for a
+  writer who attends the master but not override X with `itip_create`'s and
+  `itip_update`'s slice for that address.
+- **94 (A4): sealed items.** The fan-out's `write_item_inner` normalises each message with
+  `za_item_shape` (`groupware/src/calendar/seal/item.rs`) before sealing it, as upstream's
+  text round-trip does (`ICalendar::parse(message.to_string())`). No placeholder component
+  of a builder or of the split persists in a pending item, in its drained record or in a
+  drain copy imported from it. Serialization walks from the root, so the served iCalendar is
+  unchanged, and sealing still never adds, removes or reorders a component of it. A message
+  that does not reparse is a delivery failure (`5.1`). Tests: the unit test
+  `an_item_takes_upstreams_queued_shape` (a split slice with a placeholder, its shape, its
+  served text, and the item's tree after the pending and drained seals) and, in
+  `case_11_mixed`, bob's first copy, imported from the create's X-and-Z slice, equals its own
+  reparse.
+
+Each new unit test was checked against its fix: with the split removed from
+`retain_writer_messages`, with `requests_cover` forced false, and with `za_item_shape`
+returning its input, the matching test fails.
+
+##### Results
+
+Commits: `eb6340746` (ruling 92's test), `07b93d05f` (the kernel fixes of rulings 91, 93 and
+94, with their unit tests), `3e0ce7252` (the restored assertions and the new case 11
+sub-cases), and this note with the spec amendment. Logs `task-7c/logs/<row>-<attempt>.log`.
+
+| Row | Result (passed / failed / ignored) | Status |
+|---|---|---|
+| Formatting (`cargo fmt --all --check`) | rc 0 | green |
+| `cargo test -p groupware` | 167 / 0 / 0 | green (four new unit tests) |
+| `cargo test -p http@1.0.1 --features test_mode` | 6 / 0 / 0 | green |
+| ZA | 1 / 0 / 0 (`za-87`) | green, no holds. `za-86` stopped on the exclusion-only sub-case's first expectation (a no-op merge); 1.0's CANCEL merge adds a cancelled override for the excluded date, now asserted |
+| ZA filesystem blobs | 1 / 0 / 0 (`zafs-4`) | green, no holds |
+| CalDAV key | 0 / 1 (`caldav-key-10`) | red, unchanged from `caldav-key-9`: `webdav::prop` (/dav/cal) answers a PROPPATCH over quota 424 where 507 is expected, before the scheduling sub-tests run |
+
+##### Needs a ruling (part 7c3)
+
+- **Exclusion-only CANCEL (A2):** ruling 91 expected the CANCEL to merge as a no-op. At 1.0
+  the attendee's merge adds a `STATUS:CANCELLED` override for the date the full state's
+  EXDATE already excludes. No instance changes; the sub-case asserts the override.
+- **The CANCEL copies the organizer's SCHEDULE-STATUS.** In that sub-case the exclusion
+  CANCEL (`CancelScope::build_component` over the organizer's master) carries the
+  organizer's `SCHEDULE-STATUS=3.8` for bob, from the earlier key refusal, into bob's copy.
+  Upstream's builder, so ordinary accounts carry the organizer's status values the same way.
+- **The coverage rule with subaddresses:** coverage is checked per address of the tree that
+  normalizes to the entry's address, each needing its own covering REQUEST, which is how the
+  split addresses them; a bare reading of ruling 91 ("one REQUEST") gives the same result
+  for a single address.
+- **Ruling 92:** the reconciliation is a no-op on one upstream run at 1.0 and is kept as a
+  guard (see above); removing it would be a kernel change outside these rulings.
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
@@ -7119,6 +7232,11 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `system::oidc::test` (upstream, part 7c2) | Pathless loopback redirect URIs are expected refused; authorization requests carry `state`; a code presented by another client or redirect URI answers `invalid_grant`; the scope includes `openid`; introspection names the client. | 1.0's `loopback_redirect_parts` (a path is required), required `state`, RFC 6749 5.2 errors, ID tokens only for `openid`, and `client_id` in introspection (RFC 7662). |
 | `telemetry::webhooks::test` (upstream, part 7c2) | The check waits, bounded at 10 s, for the expected events; the trace purge accepts an unconfigured tracing store. | 1.0 retries a rejected payload and sends the pending ones a throttle period apart (timing); no tracing store without a licence (ruling 39). |
 | `smtp::management::report::manage_reports` (upstream, part 7c2) | The windows are closed until both report kinds are listed (bounded); the listings are compared as sets. | 1.0's report scheduler writes rows asynchronously; a report's id comes from its window and a hash of its slot. |
+| `za::pinning::case_11_mixed` (fork, part 7c3, ruling 91) | `items[0]` is asserted to hold Z and neither the master nor X; the CANCEL's X SEQUENCE is compared with alice's committed X (0.16: with `items[0]`'s X). bob's first copy is asserted equal to its own reparse (ruling 94). | 1.0 splits the full update per recipient: bob, on Z only, gets the Z slice, which no longer holds X. |
+| `za::pinning::case_11_still_fires` (fork, part 7c3, ruling 91, new) | bob on X and Z, not the master, with an entry; a Z-only change gives the full state (X and Z, no master), then the Z partial. | The coverage skip (`requests_cover`) and the split full state. |
+| `za::pinning::case_11_exclusion_only` (fork, part 7c3, ruling 91, A2, new) | An exclusion-only master edit gives the full state (with the EXDATE), then a CANCEL with RECURRENCE-IDs; bob's copy keeps the update and the EXDATE, and the CANCEL adds a cancelled override for the excluded date. | 1.0's `organizer_handle_update` sends an exclusion-only edit as a CANCEL, not as the full update. |
+| `za::sharing` lifecycle differential (fork, part 7c3, ruling 93) | The equality assertions on inbox payloads, owner-stored pairs and statuses, recipient copies and token sets are restored (part 7c had held them). | The delegated second run now splits as the owner run does. |
+| `za::sharing` direct delegated-scheduling fixtures (fork, part 7c3) | `za_self_*` and `za_fan_out` calls pass `RecipientPolicy::new(groupware, 0)`. | The new policy arguments of rulings 91 and 93. |
 
 ## Task 1 check
 

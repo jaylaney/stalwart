@@ -484,7 +484,13 @@ upstream's messages for it:
    after a whole-event CANCEL or a removal); for an attendee, the event still
    exists (not after a DELETE). For an organizer it is
    `organizer_request_full(committed_tree, fresh_snapshot, None, false)` for
-   that attendee, without a second `itip_finalize` (no second SEQUENCE bump);
+   that attendee, without a second `itip_finalize` (no second SEQUENCE bump),
+   split per recipient under the event's `RecipientPolicy` as upstream 1.0
+   splits its own messages (`itip_messages_per_recipient`): at 1.0 an
+   attendee's copy of the full update is that attendee's slice, the
+   instances it attends, with the series' EXDATEs for overrides it does not
+   attend when it attends the master, and without the master when it does
+   not;
    for an attendee, the refused instances' current participation (section 6.4's
    helper), one REPLY per local address they are attended as that holds a token
    in the copy's pairs, each routed with its own address's token as any REPLY,
@@ -493,12 +499,20 @@ upstream's messages for it:
    The entry is retired only when every one of them and upstream's messages
    were written. Both are built from the state being committed, reconciled
    (below), never from a superseded tree: the deletion flag marks a
-   pre-deletion one. Item (1) is skipped when any message of item (2) is a
-   METHOD:REQUEST containing the master scheduling component (no
-   RECURRENCE-ID): upstream routes every master change to the full update,
-   partial REQUESTs hold only overrides, and `ItipSummary` cannot tell them
-   apart (when the master has no attendees the full REQUEST lacks it, the skip
-   does not fire, and the full state is a harmless duplicate). It is also
+   pre-deletion one. Item (1) is skipped when the organizer's own
+   METHOD:REQUESTs of item (2) already carry the address's full view: for
+   each address of an ATTENDEE of the committed tree that normalizes to the
+   entry's address (parsed as upstream's split parses it), one REQUEST to
+   that address carries every scheduling instance whose ATTENDEEs name it,
+   instances compared by `InstanceKey`. At 1.0 upstream routes every master
+   change to the full update and delivers it to each attendee as its slice,
+   so this skip fires for every attendee of a master change, master
+   attendee or not; for an attendee of the master it reduces to 0.16's rule
+   (a REQUEST holding the master). A partial REQUEST that misses an
+   instance the address attends does not skip it. An exclusion-only master
+   edit (only EXDATEs added) is sent by 1.0 as a CANCEL with RECURRENCE-IDs,
+   not as the full update, so an entry holder then gets the full state and
+   that CANCEL, which merges as a no-op (accepted). It is also
    skipped when one is a METHOD:CANCEL with the master component (the address
    removed from the master while an override still names it; the CANCEL then
    cancels every instance of the copy, upstream's `cancel_all_instances`,
