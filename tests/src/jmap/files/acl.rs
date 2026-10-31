@@ -59,7 +59,8 @@ pub async fn test(test: &TestServer) {
           "mayShare": true,
           "maySetMetadata": true
         },
-        "shareWith": {}
+        // 1.0 answers null for a node with no shares (`file/get.rs`).
+        "shareWith": null
         }));
 
     // Obtain share notifications
@@ -424,7 +425,8 @@ pub async fn test(test: &TestServer) {
         "id": john_folder_id,
         "@type": "Directory",
         "name": "Jane's updated name",
-        "shareWith": {}
+        // 1.0 answers null for a node with no shares (`file/get.rs`).
+        "shareWith": null
         }));
 
     // Verify Jane can no longer access the folder or its contacts
