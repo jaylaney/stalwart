@@ -147,6 +147,8 @@ pub async fn za_tests() {
     dav_seal::test_collections(&mut test).await;
     dav_seal::test_conditional(&mut test).await;
     dav_seal::test_legacy(&mut test).await;
+    dav_seal::test_dead_properties(&mut test).await;
+    dav_seal::split_metadata_only_update_keeps_sealed_content(&mut test).await;
     fanout::test_task_queue(&mut test).await;
     fanout::test(&mut test).await;
     fanout::test_failures(&mut test).await;
@@ -159,12 +161,17 @@ pub async fn za_tests() {
     drain::test_lease(&mut test).await;
     drain::test_cursor(&mut test).await;
     drain::test_errors(&mut test).await;
+    drain::incoming_timezone_update_survives_seal(&mut test).await;
     drain_limits::test(&mut test).await;
     pinning::test(&mut test).await;
     sharing_move_atomic::test(&mut test).await;
     sharing_tombstones::test(&mut test).await;
     sharing_review::test(&mut test).await;
     sharing::test(&mut test).await;
+    sharing::sharing_class_differential(&mut test).await;
+    sharing::sharing_class_inbound(&mut test).await;
+    sharing::cleanup_cannot_restore_revoked_ring(&mut test).await;
+    sharing::revoke_cleanup_does_not_rewrite_sealed_event(&mut test).await;
     sharing_races::test(&mut test).await;
     sweep::test(&mut test).await;
     tracing::test(&mut test).await;

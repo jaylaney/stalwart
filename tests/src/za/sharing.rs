@@ -9,14 +9,14 @@ use super::{STRONG, user_permissions};
 use crate::utils::{
     server::TestServer,
     webdav::DummyWebDavClient,
-    za::{plant_event, za_unlock},
+    za::{StoredEvent, plant_event, stored_event, write_stored_event, za_unlock},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use groupware::{
     cache::GroupwareCache,
     calendar::{
-        Calendar, CalendarEvent,
-        seal::{rewrap_event, unseal_calendar},
+        Calendar, CalendarEvent, CalendarEventContent,
+        seal::{ZaEvent, rewrap_event, unseal_calendar},
         sharing::{
             format::{OwnerRingHeader, ZaOwnerRing, seal_owner_ring},
             resolve::za_owned_calendar_context,
@@ -28,7 +28,7 @@ use hyper::StatusCode;
 use std::collections::BTreeMap;
 use store::{
     ValueKey,
-    write::{AlignedBytes, Archive, BatchBuilder},
+    write::{Archive, ArchiveBytes, BatchBuilder},
 };
 use types::collection::{Collection, SyncCollection};
 
@@ -40,12 +40,19 @@ const EVENT: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//share-tests//EN
 // The calendar and generation a stored event's root `X-ZA-KEY` names when
 // it is a CK envelope (spec 3.4: policy version, `0x03`, calendar (4),
 // generation (4), wrapped DEK (72)); `None` for any other wrap or shape.
-fn ck_envelope(event: &CalendarEvent) -> Option<(u32, u32)> {
+fn ck_envelope(event: &ZaEvent) -> Option<(u32, u32)> {
     use groupware::calendar::{
         seal::tree::{KEY_PROP, entry_text, is_carrier},
         sharing::format::WRAP_CK,
     };
-    let entry = event.data.event.components.first()?.entries.last()?;
+    let entry = event
+        .content
+        .data
+        .event
+        .components
+        .first()?
+        .entries
+        .last()?;
     if !is_carrier(entry, KEY_PROP) {
         return None;
     }
@@ -58,53 +65,35 @@ fn ck_envelope(event: &CalendarEvent) -> Option<(u32, u32)> {
     })
 }
 
-async fn event_archive(test: &TestServer, owner_id: u32, event_id: u32) -> Archive<AlignedBytes> {
-    test.server
-        .store()
-        .get_value(ValueKey::archive(
-            owner_id,
-            Collection::CalendarEvent,
-            event_id,
-        ))
-        .await
-        .unwrap()
-        .unwrap()
+/// The event's row and content (1.0's split records).
+async fn event_archive(test: &TestServer, owner_id: u32, event_id: u32) -> StoredEvent {
+    stored_event(test, owner_id, event_id).await
 }
 
+/// 0.16's `CalendarEvent::update` over the stored records: upstream's full
+/// split update, conditional on the stored row.
 async fn update_event(
     test: &TestServer,
     owner_id: u32,
     event_id: u32,
-    stored: &Archive<AlignedBytes>,
-    event: CalendarEvent,
+    stored: &StoredEvent,
+    event: ZaEvent,
 ) {
-    let account = test.server.account_info(owner_id).await.unwrap();
-    let mut batch = BatchBuilder::new();
-    event
-        .update(
-            account.account_tenant_ids(),
-            stored.to_unarchived::<CalendarEvent>().unwrap(),
-            owner_id,
-            event_id,
-            &mut batch,
-        )
-        .unwrap();
-    test.server.commit_batch(batch).await.unwrap();
-    test.server.notify_task_queue();
+    write_stored_event(test, owner_id, event_id, stored, event).await;
 }
 
 async fn update_calendar(
     test: &TestServer,
     owner_id: u32,
     calendar_id: u32,
-    stored: &Archive<AlignedBytes>,
+    stored: &Archive<ArchiveBytes>,
     calendar: Calendar,
 ) {
     let account = test.server.account_info(owner_id).await.unwrap();
     let mut batch = BatchBuilder::new();
     calendar
         .update(
-            account.account_tenant_ids(),
+            account.changed_by(),
             stored.to_unarchived::<Calendar>().unwrap(),
             owner_id,
             calendar_id,
@@ -136,7 +125,7 @@ pub async fn test(test: &mut TestServer) {
     let keys = za_unlock(test, owner_id, STRONG).await;
     let resources = test
         .server
-        .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner_id, owner_id, SyncCollection::Calendar)
         .await
         .unwrap();
     let calendar_id = resources.by_path("share-read").unwrap().document_id();
@@ -160,7 +149,7 @@ pub async fn test(test: &mut TestServer) {
             .with_status(StatusCode::CREATED);
         let resources = test
             .server
-            .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+            .fetch_groupware_resources(owner_id, owner_id, SyncCollection::Calendar)
             .await
             .unwrap();
         event_ids.push(
@@ -203,7 +192,7 @@ pub async fn test(test: &mut TestServer) {
         .await
         .unwrap();
     let stored = event_archive(test, owner_id, event_ids[1]).await;
-    let mut event = stored.deserialize::<CalendarEvent>().unwrap();
+    let mut event = stored.za_event();
     rewrap_event(&mut event, &old_context.domain, &context.domain).unwrap();
     update_event(test, owner_id, event_ids[1], &stored, event).await;
 
@@ -305,8 +294,8 @@ pub async fn test(test: &mut TestServer) {
 
     // Content corruption is one multistatus item; direct GET still fails 500.
     let healthy = event_archive(test, owner_id, event_ids[1]).await;
-    let mut corrupt = healthy.deserialize::<CalendarEvent>().unwrap();
-    let key = corrupt.data.event.components[0]
+    let mut corrupt = healthy.za_event();
+    let key = corrupt.content.data.event.components[0]
         .entries
         .iter_mut()
         .find(|entry| groupware::calendar::seal::tree::is_carrier(entry, "X-ZA-KEY"))
@@ -335,14 +324,7 @@ pub async fn test(test: &mut TestServer) {
         "{listing}"
     );
     let corrupt = event_archive(test, owner_id, event_ids[1]).await;
-    update_event(
-        test,
-        owner_id,
-        event_ids[1],
-        &corrupt,
-        healthy.deserialize::<CalendarEvent>().unwrap(),
-    )
-    .await;
+    update_event(test, owner_id, event_ids[1], &corrupt, healthy.za_event()).await;
 
     // The same envelopes remain readable while rollback changes the fresh owner journal.
     let mut reverting = context.stored.deserialize::<Calendar>().unwrap();
@@ -373,7 +355,7 @@ pub async fn test(test: &mut TestServer) {
 
     // Restore the fixture before upstream deletion: later tasks wire CK writers.
     let stored = event_archive(test, owner_id, event_ids[1]).await;
-    let mut event = stored.deserialize::<CalendarEvent>().unwrap();
+    let mut event = stored.za_event();
     rewrap_event(&mut event, &context.domain, &old_context.domain).unwrap();
     update_event(test, owner_id, event_ids[1], &stored, event).await;
     update_calendar(
@@ -511,17 +493,23 @@ async fn stage_calendar(
 
 async fn resource_id(test: &TestServer, owner: u32, path: &str) -> u32 {
     test.server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap()
         .by_path(path)
         .unwrap()
         .document_id()
 }
-fn payload(mut event: CalendarEvent) -> CalendarEvent {
-    event.names.clear();
-    event.modified = 0;
-    for component in &mut event.data.event.components {
+/// What a MOVE must keep of a sealed event: everything but its names, its
+/// modification time and its key envelope. At 1.0 the row's `size` and
+/// `etag` are derived from the stored content (the sealed tree, envelope
+/// included), so they follow the envelope and are left out too.
+fn payload(mut event: ZaEvent) -> ZaEvent {
+    event.meta.names.clear();
+    event.meta.modified = 0;
+    event.meta.size = 0;
+    event.meta.etag = 0;
+    for component in &mut event.content.data.event.components {
         component
             .entries
             .retain(|entry| !groupware::calendar::seal::tree::is_carrier(entry, "X-ZA-KEY"));
@@ -591,10 +579,7 @@ async fn copy_move_test(test: &mut TestServer) {
     };
     put(format!("{HOME}a/sealed.ics"), put_body("move-sealed")).await;
     let event_id = resource_id(test, owner_id, "a/sealed.ics").await;
-    let original = event_archive(test, owner_id, event_id)
-        .await
-        .deserialize::<CalendarEvent>()
-        .unwrap();
+    let original = event_archive(test, owner_id, event_id).await.za_event();
     client
         .request_with_headers(
             "COPY",
@@ -613,12 +598,9 @@ async fn copy_move_test(test: &mut TestServer) {
         )
         .await
         .with_status(StatusCode::CREATED);
-    let moved = event_archive(test, owner_id, event_id)
-        .await
-        .deserialize::<CalendarEvent>()
-        .unwrap();
-    assert_eq!(moved.names.len(), 1);
-    assert_eq!(moved.names[0].parent_id, ids[2]);
+    let moved = event_archive(test, owner_id, event_id).await.za_event();
+    assert_eq!(moved.meta.names.len(), 1);
+    assert_eq!(moved.meta.names[0].parent_id, ids[2]);
     assert_eq!(payload(moved.clone()), payload(original));
     assert!(
         client
@@ -655,12 +637,7 @@ async fn copy_move_test(test: &mut TestServer) {
         .await
         .with_status(StatusCode::CREATED);
     assert_eq!(
-        payload(
-            event_archive(test, owner_id, event_id)
-                .await
-                .deserialize::<CalendarEvent>()
-                .unwrap()
-        ),
+        payload(event_archive(test, owner_id, event_id).await.za_event()),
         payload(moved)
     );
     // CK-to-CK and CK-to-EWK preserve ciphertext and the original DEK.
@@ -668,10 +645,7 @@ async fn copy_move_test(test: &mut TestServer) {
         ("c/renamed.ics", "d/sealed.ics"),
         ("d/sealed.ics", "b/sealed.ics"),
     ] {
-        let before = event_archive(test, owner_id, event_id)
-            .await
-            .deserialize::<CalendarEvent>()
-            .unwrap();
+        let before = event_archive(test, owner_id, event_id).await.za_event();
         client
             .request_with_headers(
                 "MOVE",
@@ -682,12 +656,7 @@ async fn copy_move_test(test: &mut TestServer) {
             .await
             .with_status(StatusCode::CREATED);
         assert_eq!(
-            payload(
-                event_archive(test, owner_id, event_id)
-                    .await
-                    .deserialize::<CalendarEvent>()
-                    .unwrap()
-            ),
+            payload(event_archive(test, owner_id, event_id).await.za_event()),
             payload(before)
         );
     }
@@ -716,10 +685,10 @@ async fn copy_move_test(test: &mut TestServer) {
         .await
         .with_status(StatusCode::CREATED);
     let stored = event_archive(test, owner_id, legacy).await;
-    let event = stored.deserialize::<CalendarEvent>().unwrap();
-    assert_eq!(event.names.len(), 1);
-    assert_eq!(event.names[0].parent_id, ids[2]);
-    let text = event.data.event.to_string().replace("\r\n ", "");
+    let event = stored.za_event();
+    assert_eq!(event.meta.names.len(), 1);
+    assert_eq!(event.meta.names[0].parent_id, ids[2]);
+    let text = event.content.data.event.to_string().replace("\r\n ", "");
     assert!(!text.contains("share-read-private-summary"));
     let envelope = STANDARD
         .decode(
@@ -792,8 +761,8 @@ async fn copy_move_test(test: &mut TestServer) {
     assert_eq!(
         event_archive(test, owner_id, bad)
             .await
-            .deserialize::<CalendarEvent>()
-            .unwrap()
+            .za_event()
+            .meta
             .names[0]
             .parent_id,
         ids[0]
@@ -942,11 +911,8 @@ async fn copy_move_test(test: &mut TestServer) {
         )
         .await
         .with_status(StatusCode::CREATED);
-    let inbound = event_archive(test, owner_id, event_id)
-        .await
-        .deserialize::<CalendarEvent>()
-        .unwrap();
-    let text = inbound.data.event.to_string().replace("\r\n ", "");
+    let inbound = event_archive(test, owner_id, event_id).await.za_event();
+    let text = inbound.content.data.event.to_string().replace("\r\n ", "");
     assert_eq!(
         STANDARD
             .decode(
@@ -1111,7 +1077,7 @@ async fn conversion_test(test: &mut TestServer) {
     use crate::utils::za::plant_sealed_event;
     use groupware::calendar::seal::TokenPairs;
     use groupware::calendar::{
-        seal::{event_pairs_in_domain, unseal_event_in_domain},
+        seal::unseal_event_in_domain,
         sharing::convert::{ZaShareGuards, za_convert_calendar},
     };
     println!("Running direct first-grant conversion tests...");
@@ -1130,7 +1096,7 @@ async fn conversion_test(test: &mut TestServer) {
         .with_status(StatusCode::CREATED);
     let calendar_id = test
         .server
-        .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner_id, owner_id, SyncCollection::Calendar)
         .await
         .unwrap()
         .by_path("converter")
@@ -1157,10 +1123,7 @@ async fn conversion_test(test: &mut TestServer) {
         None,
     )
     .await;
-    let before = event_archive(test, owner_id, sealed_id)
-        .await
-        .deserialize::<CalendarEvent>()
-        .unwrap();
+    let before = event_archive(test, owner_id, sealed_id).await.za_event();
     let keys = za_unlock(test, owner_id, STRONG).await;
     let guards = ZaShareGuards {
         owner_id,
@@ -1185,30 +1148,23 @@ async fn conversion_test(test: &mut TestServer) {
     assert!(context.domain.domain_id().is_some());
     let calendar = context.stored.deserialize::<Calendar>().unwrap();
     assert!(calendar.acls.is_empty());
-    let mut after = event_archive(test, owner_id, sealed_id)
-        .await
-        .deserialize::<CalendarEvent>()
-        .unwrap();
+    let mut after = event_archive(test, owner_id, sealed_id).await.za_event();
     assert_eq!(payload(after.clone()), payload(before.clone()));
-    assert_eq!(after.created, before.created);
-    assert_eq!(after.modified, before.modified);
+    assert_eq!(after.meta.created, before.meta.created);
+    assert_eq!(after.meta.modified, before.meta.modified);
     assert!(
-        event_pairs_in_domain(
-            &event_archive(test, owner_id, sealed_id).await,
-            &context.domain
-        )
-        .unwrap()
-        .unwrap()
-        .matches("attendee@example.org", &[0x51; 16])
+        (event_archive(test, owner_id, sealed_id).await)
+            .pairs_in(&context.domain)
+            .unwrap()
+            .unwrap()
+            .matches("attendee@example.org", &[0x51; 16])
     );
     for id in [sealed_id, plain_id] {
-        after = event_archive(test, owner_id, id)
-            .await
-            .deserialize::<CalendarEvent>()
-            .unwrap();
+        after = event_archive(test, owner_id, id).await.za_event();
         unseal_event_in_domain(&mut after, &context.domain).unwrap();
         assert!(
             after
+                .content
                 .data
                 .event
                 .to_string()
@@ -1333,19 +1289,21 @@ fn conversion_conflict(
 }
 async fn conversion_link(test: &TestServer, owner: u32, event: u32, other_parent: u32, add: bool) {
     let stored = event_archive(test, owner, event).await;
-    let mut value = stored.deserialize::<CalendarEvent>().unwrap();
+    let mut value = stored.za_event();
     if add {
-        value.names.push(common::DavName {
+        value.meta.names.push(common::DavName {
             name: format!("linked-{event}.ics"),
             parent_id: other_parent,
         });
     } else {
-        value.names.retain(|name| name.parent_id != other_parent);
+        value
+            .meta
+            .names
+            .retain(|name| name.parent_id != other_parent);
     }
     update_event(test, owner, event, &stored, value).await;
     test.server
-        .invalidate_local_caches(&[common::ipc::CacheInvalidation::DavResources(owner)])
-        .await;
+        .invalidate_local_caches(&[common::ipc::CacheInvalidation::GroupwareResources(owner)]);
 }
 async fn conversion_wait(pause: &common::za::test_hooks::Pause) {
     tokio::time::timeout(std::time::Duration::from_secs(10), pause.arrived.notified())
@@ -1360,10 +1318,7 @@ async fn conversion_contract_tests(test: &mut TestServer) {
     use common::za::test_hooks::*;
     use groupware::calendar::{
         CalendarPreferences,
-        seal::{
-            TokenPairs, calendar_view_in_domain, event_pairs_in_domain, seal_calendar,
-            unseal_event_in_domain,
-        },
+        seal::{TokenPairs, calendar_view_in_domain, seal_calendar, unseal_event_in_domain},
         sharing::convert::{ZaConversionCounts, ZaShareError, za_convert_calendar},
     };
     use std::sync::Arc;
@@ -1399,7 +1354,7 @@ async fn conversion_contract_tests(test: &mut TestServer) {
             .await
             .with_status(StatusCode::CREATED);
         test.server
-            .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+            .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
             .await
             .unwrap()
             .by_path(slug)
@@ -1460,8 +1415,12 @@ async fn conversion_contract_tests(test: &mut TestServer) {
             after.version, before.version,
             "mutation34: earlier unlinked EWK candidate changed before failed revert"
         );
-        let raw = after.deserialize::<CalendarEvent>().unwrap();
-        let key = raw.data.event.components[0].entries.last().unwrap().values[0]
+        let raw = after.za_event();
+        let key = raw.content.data.event.components[0]
+            .entries
+            .last()
+            .unwrap()
+            .values[0]
             .as_text()
             .unwrap();
         let envelope = STANDARD.decode(key).unwrap();
@@ -1505,24 +1464,35 @@ async fn conversion_contract_tests(test: &mut TestServer) {
                 .unwrap()
                 .deserialize::<Calendar>()
                 .unwrap();
-        use types::dead_property::{DeadElementTag, DeadProperty, DeadPropertyTag as Tag};
-        original_plain.dead_properties = DeadProperty(vec![
-            Tag::ElementStart(DeadElementTag {
-                name: "http://apple.com/ns/ical/ calendar-color".into(),
-                attrs: None,
-            }),
-            Tag::Text("#ABCDEF77".into()),
-            Tag::ElementEnd,
-            Tag::ElementStart(DeadElementTag {
-                name: "http://apple.com/ns/ical/ calendar-order".into(),
-                attrs: None,
-            }),
-            Tag::Text("71".into()),
-            Tag::ElementEnd,
-        ]);
-        let original_properties = original_plain.dead_properties.clone();
         seal_calendar(&mut original_plain, &keys, owner_id).unwrap();
         update_calendar(test, owner_id, id, &current.stored, original_plain).await;
+        // At 1.0 the calendar's dead properties are its shared metadata
+        // container (ruling 29: conversion and rollback rewrap it with the
+        // ring), written here by the owner's PROPPATCH, sealed.
+        client
+            .request(
+                "PROPPATCH",
+                &format!("{home}{slug}/"),
+                concat!(
+                    "<D:propertyupdate xmlns:D=\"DAV:\" xmlns:I=\"http://apple.com/ns/ical/\">",
+                    "<D:set><D:prop><I:calendar-color>#ABCDEF77</I:calendar-color>",
+                    "<I:calendar-order>71</I:calendar-order></D:prop></D:set></D:propertyupdate>"
+                ),
+            )
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+        let current = za_owned_calendar_context(&test.server, &keys, id)
+            .await
+            .unwrap();
+        let original_properties = groupware::calendar::seal::open_container(
+            &crate::utils::za::shared_container(test, owner_id, Collection::Calendar, id)
+                .await
+                .expect("the calendar's container"),
+            &current.domain,
+            groupware::calendar::seal::ZaContainerOf::Calendar(id),
+        )
+        .unwrap()
+        .to_vec();
         let before_event = event_archive(test, owner_id, event_id).await;
         let before_calendar = za_owned_calendar_context(&test.server, &keys, id)
             .await
@@ -1579,13 +1549,11 @@ async fn conversion_contract_tests(test: &mut TestServer) {
                 .await
                 .unwrap();
             assert!(
-                event_pairs_in_domain(
-                    &event_archive(test, owner_id, event_id).await,
-                    &domain.domain
-                )
-                .unwrap()
-                .unwrap()
-                .matches("token@example.org", &[0x62; 16])
+                (event_archive(test, owner_id, event_id).await)
+                    .pairs_in(&domain.domain)
+                    .unwrap()
+                    .unwrap()
+                    .matches("token@example.org", &[0x62; 16])
             );
             continue;
         }
@@ -1627,7 +1595,7 @@ async fn conversion_contract_tests(test: &mut TestServer) {
             .with_status(StatusCode::CREATED);
         let ck_id = test
             .server
-            .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+            .fetch_groupware_resources(owner_id, owner_id, SyncCollection::Calendar)
             .await
             .unwrap()
             .by_path(&format!("{slug}/ck.ics"))
@@ -1661,12 +1629,9 @@ async fn conversion_contract_tests(test: &mut TestServer) {
                 "injected rollback attempt wrote nothing"
             );
         } else {
-            let mut event = ck_after.deserialize::<CalendarEvent>().unwrap();
+            let mut event = ck_after.za_event();
             groupware::calendar::seal::unseal_event(&mut event, &keys, owner_id).unwrap();
-            assert_eq!(
-                payload(ck_after.deserialize::<CalendarEvent>().unwrap()),
-                payload(ck_before.deserialize::<CalendarEvent>().unwrap())
-            );
+            assert_eq!(payload(ck_after.za_event()), payload(ck_before.za_event()));
         }
         if class == "revert" {
             let guards = conversion_guards(test, &keys).await;
@@ -1678,12 +1643,24 @@ async fn conversion_contract_tests(test: &mut TestServer) {
             let restored = za_owned_calendar_context(&test.server, &keys, id)
                 .await
                 .unwrap();
+            // The container is back under the owner's key and opens to the
+            // same plaintext.
+            let container =
+                crate::utils::za::shared_container(test, owner_id, Collection::Calendar, id)
+                    .await
+                    .expect("the calendar's container");
             assert_eq!(
-                calendar_view_in_domain(&restored.stored, &restored.domain, owner_id)
-                    .unwrap()
-                    .deserialize::<Calendar>()
-                    .unwrap()
-                    .dead_properties,
+                groupware::calendar::seal::container_is_ck(&container),
+                Some(false)
+            );
+            assert_eq!(
+                groupware::calendar::seal::open_container(
+                    &container,
+                    &restored.domain,
+                    groupware::calendar::seal::ZaContainerOf::Calendar(id),
+                )
+                .unwrap()
+                .to_vec(),
                 original_properties
             );
             // Link-preserving writes are ordinary EWK writes again after restore.
@@ -1727,59 +1704,57 @@ async fn conversion_contract_tests(test: &mut TestServer) {
         let calcard::Entry::ICalendar(tree) = calcard::Parser::new(&text).entry() else {
             panic!()
         };
-        let mut next_alarm = None;
-        let mut event = CalendarEvent {
-            names: vec![common::DavName {
-                name: "resident.ics".into(),
-                parent_id: id,
-            }],
-            data: groupware::calendar::CalendarEventData::new(
-                tree,
-                calcard::common::timezone::Tz::Floating,
-                100,
-                &mut next_alarm,
-            ),
-            size: text.len() as u32,
-            ..Default::default()
-        };
+        let mut event = ZaEvent::new(
+            CalendarEvent {
+                names: vec![common::DavName {
+                    name: "resident.ics".into(),
+                    parent_id: id,
+                }],
+                ..Default::default()
+            },
+            CalendarEventContent {
+                data: groupware::calendar::CalendarEventData::new(
+                    tree,
+                    calcard::common::timezone::Tz::Floating,
+                    100,
+                ),
+                ..Default::default()
+            },
+        );
         groupware::calendar::seal::seal_event_in_domain(&mut event, &new.domain, None).unwrap();
-        let resident_id = test
-            .server
-            .store()
-            .assign_document_ids(owner_id, Collection::CalendarEvent, 1)
-            .await
-            .unwrap();
         let mut batch = BatchBuilder::new();
+        let slot = batch.reserve_document_id(owner_id, Collection::CalendarEvent);
         new.assert_in(&mut batch);
-        event
-            .insert(
-                test.server
-                    .account_info(owner_id)
-                    .await
-                    .unwrap()
-                    .account_tenant_ids(),
-                owner_id,
-                resident_id,
-                next_alarm,
-                &mut batch,
-            )
-            .unwrap();
-        test.server.commit_batch(batch).await.unwrap();
+        let (meta, content) = event.into_parts();
+        meta.insert(
+            content,
+            test.server
+                .account_info(owner_id)
+                .await
+                .unwrap()
+                .changed_by(),
+            owner_id,
+            slot,
+            None,
+            Default::default(),
+            &mut batch,
+        )
+        .unwrap();
+        let resident_id = test.server.commit_batch(batch).await.unwrap().slot(slot);
         test.server.notify_task_queue();
         test.server
-            .invalidate_local_caches(&[common::ipc::CacheInvalidation::DavResources(owner_id)])
-            .await;
+            .invalidate_local_caches(&[common::ipc::CacheInvalidation::GroupwareResources(
+                owner_id,
+            )]);
         let fresh_keys = za_unlock(test, owner_id, STRONG).await;
         let fresh = za_owned_calendar_context(&test.server, &fresh_keys, id)
             .await
             .unwrap();
-        let mut event = event_archive(test, owner_id, resident_id)
-            .await
-            .deserialize::<CalendarEvent>()
-            .unwrap();
+        let mut event = event_archive(test, owner_id, resident_id).await.za_event();
         unseal_event_in_domain(&mut event, &fresh.domain).unwrap();
         assert!(
             event
+                .content
                 .data
                 .event
                 .to_string()
@@ -1874,23 +1849,22 @@ async fn conversion_contract_tests(test: &mut TestServer) {
                 ..Default::default()
             }]
         };
-        use types::dead_property::{DeadElementTag, DeadProperty, DeadPropertyTag as Tag};
-        plain.dead_properties = DeadProperty(vec![
-            Tag::ElementStart(DeadElementTag {
-                name: "http://apple.com/ns/ical/ calendar-color".into(),
-                attrs: None,
-            }),
-            Tag::Text("#123456FF".into()),
-            Tag::ElementEnd,
-            Tag::ElementStart(DeadElementTag {
-                name: "http://apple.com/ns/ical/ calendar-order".into(),
-                attrs: None,
-            }),
-            Tag::Text("23".into()),
-            Tag::ElementEnd,
-        ]);
-        let expected = plain.dead_properties.clone();
         update_calendar(test, owner_id, id, &context.stored, plain).await;
+        // A legacy plaintext calendar's dead properties: an unsealed
+        // container, which conversion seals in full under the collection key
+        // (`rewrap_container`).
+        let expected = crate::utils::za::plain_dav_container(&[
+            ("http://apple.com/ns/ical/", "calendar-color", "#123456FF"),
+            ("http://apple.com/ns/ical/", "calendar-order", "23"),
+        ]);
+        crate::utils::za::plant_container(
+            test,
+            owner_id,
+            Collection::Calendar,
+            id,
+            Some(expected.clone()),
+        )
+        .await;
         let guards = conversion_guards(test, &keys).await;
         assert_eq!(
             za_convert_calendar(&test.server, &keys, id, &guards)
@@ -1905,7 +1879,25 @@ async fn conversion_contract_tests(test: &mut TestServer) {
             .unwrap()
             .deserialize::<Calendar>()
             .unwrap();
-        assert_eq!(view.dead_properties, expected);
+        let container =
+            crate::utils::za::shared_container(test, owner_id, Collection::Calendar, id)
+                .await
+                .expect("the calendar's container");
+        assert_eq!(
+            groupware::calendar::seal::container_is_ck(&container),
+            Some(true),
+            "conversion sealed the legacy container under the collection key"
+        );
+        assert_eq!(
+            groupware::calendar::seal::open_container(
+                &container,
+                &converted.domain,
+                groupware::calendar::seal::ZaContainerOf::Calendar(id),
+            )
+            .unwrap()
+            .to_vec(),
+            expected.as_bytes()
+        );
         assert_eq!(
             view.preferences[0].name,
             if empty { "default" } else { "Plain owner name" }
@@ -1948,10 +1940,7 @@ async fn conversion_contract_tests(test: &mut TestServer) {
     let context = za_owned_calendar_context(&test.server, &keys, id)
         .await
         .unwrap();
-    let mut event = event_archive(test, owner_id, event_id)
-        .await
-        .deserialize::<CalendarEvent>()
-        .unwrap();
+    let mut event = event_archive(test, owner_id, event_id).await.za_event();
     unseal_event_in_domain(&mut event, &context.domain).unwrap();
     assert_eq!(
         za_convert_calendar(&test.server, &keys, id, &guards)
@@ -2108,10 +2097,8 @@ async fn conversion_contract_tests(test: &mut TestServer) {
         let mut ck_count = 0;
         for event in &ids {
             let stored = event_archive(test, owner_id, *event).await;
-            if groupware::calendar::seal::classify_event_storage(
-                &stored.deserialize::<CalendarEvent>().unwrap(),
-            )
-            .unwrap()
+            if groupware::calendar::seal::classify_event_storage(&stored.za_event().content)
+                .unwrap()
                 == groupware::calendar::seal::ZaEventStorageKind::Sealed
             {
                 ck_count += 1;
@@ -2130,7 +2117,7 @@ async fn conversion_contract_tests(test: &mut TestServer) {
         } else {
             // A concurrent writer seals the last row under the current CK.
             let stored = event_archive(test, owner_id, last).await;
-            let mut event = stored.deserialize::<CalendarEvent>().unwrap();
+            let mut event = stored.za_event();
             groupware::calendar::seal::seal_event_in_domain(&mut event, &context.domain, None)
                 .unwrap();
             update_event(test, owner_id, last, &stored, event).await;
@@ -2160,7 +2147,7 @@ async fn conversion_contract_tests(test: &mut TestServer) {
         if let Some((class, bytes)) = account_restore {
             let mut batch = BatchBuilder::new();
             batch.set(class, bytes);
-            test.server.store().write(batch.build_all()).await.unwrap();
+            test.server.store().write_batch(&mut batch).await.unwrap();
         }
         keys = za_unlock(test, owner_id, STRONG).await;
         let guards = conversion_guards(test, &keys).await;
@@ -2208,7 +2195,7 @@ async fn conversion_contract_tests(test: &mut TestServer) {
         if let Some((class, bytes)) = account_restore {
             let mut batch = BatchBuilder::new();
             batch.set(class, bytes);
-            test.server.store().write(batch.build_all()).await.unwrap();
+            test.server.store().write_batch(&mut batch).await.unwrap();
         }
         assert!(conversion_ring(test, &keys, id).await.is_none());
         keys = za_unlock(test, owner_id, STRONG).await;
@@ -2243,18 +2230,13 @@ async fn conversion_contract_tests(test: &mut TestServer) {
         let before = if updating {
             let event = test
                 .server
-                .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+                .fetch_groupware_resources(owner_id, owner_id, SyncCollection::Calendar)
                 .await
                 .unwrap()
                 .by_path(&format!("{slug}/held.ics"))
                 .unwrap()
                 .document_id();
-            Some(
-                event_archive(test, owner_id, event)
-                    .await
-                    .deserialize::<CalendarEvent>()
-                    .unwrap(),
-            )
+            Some(event_archive(test, owner_id, event).await.za_event())
         } else {
             None
         };
@@ -2290,7 +2272,7 @@ async fn conversion_contract_tests(test: &mut TestServer) {
         assert_eq!(held.finish().await.status, if updating { 409 } else { 201 });
         let event = test
             .server
-            .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+            .fetch_groupware_resources(owner_id, owner_id, SyncCollection::Calendar)
             .await
             .unwrap()
             .by_path(&format!("{slug}/held.ics"))
@@ -2299,14 +2281,11 @@ async fn conversion_contract_tests(test: &mut TestServer) {
         let context = za_owned_calendar_context(&test.server, &keys, id)
             .await
             .unwrap();
-        let mut event = event_archive(test, owner_id, event)
-            .await
-            .deserialize::<CalendarEvent>()
-            .unwrap();
+        let mut event = event_archive(test, owner_id, event).await.za_event();
         if let Some(before) = before {
             assert_eq!(payload(event.clone()), payload(before.clone()));
-            assert_eq!(event.created, before.created);
-            assert_eq!(event.modified, before.modified);
+            assert_eq!(event.meta.created, before.meta.created);
+            assert_eq!(event.meta.modified, before.meta.modified);
         }
         // Spec 11.2 case 21: every event ends 0x03. The unseal below also
         // opens an EWK (0x01) row through the owner's legacy read path, so it
@@ -2319,7 +2298,7 @@ async fn conversion_contract_tests(test: &mut TestServer) {
             .0
             .generations;
         assert_eq!(
-            crate::utils::za::envelope_wrap(&event.data.event),
+            crate::utils::za::envelope_wrap(&event.content.data.event),
             Some(groupware::calendar::sharing::format::WRAP_CK),
             "{slug}: case 21 requires the held write's event to end under a 0x03 envelope"
         );
@@ -2337,13 +2316,14 @@ async fn conversion_contract_tests(test: &mut TestServer) {
         if updating {
             assert!(
                 !event
+                    .content
                     .data
                     .event
                     .to_string()
                     .contains("held conversion write")
             );
         }
-        assert!(event.data.event.to_string().contains(if updating {
+        assert!(event.content.data.event.to_string().contains(if updating {
             "share-read-private-summary"
         } else {
             "held conversion write"
@@ -2398,13 +2378,11 @@ async fn conversion_contract_tests(test: &mut TestServer) {
     let context = za_owned_calendar_context(&test.server, &keys, id)
         .await
         .unwrap();
-    let mut event = event_archive(test, owner_id, event_id)
-        .await
-        .deserialize::<CalendarEvent>()
-        .unwrap();
+    let mut event = event_archive(test, owner_id, event_id).await.za_event();
     unseal_event_in_domain(&mut event, &context.domain).unwrap();
     assert!(
         event
+            .content
             .data
             .event
             .to_string()
@@ -2429,7 +2407,7 @@ async fn conversion_contract_tests(test: &mut TestServer) {
     assert!(
         test.server
             .store()
-            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
                 owner_id,
                 Collection::Calendar,
                 id
@@ -2550,8 +2528,9 @@ async fn conversion_contract_tests(test: &mut TestServer) {
         1
     );
     let stored = event_archive(test, owner_id, event_id).await;
-    let mut corrupted = stored.deserialize::<CalendarEvent>().unwrap();
+    let mut corrupted = stored.za_event();
     let carrier = corrupted
+        .content
         .data
         .event
         .components
@@ -2643,7 +2622,7 @@ pub(super) async fn conversion_remove_account(
         .0;
     let mut batch = BatchBuilder::new();
     batch.clear(class.clone());
-    test.server.store().write(batch.build_all()).await.unwrap();
+    test.server.store().write_batch(&mut batch).await.unwrap();
     (class, bytes)
 }
 
@@ -2688,7 +2667,7 @@ async fn conversion_guarded_class_loss(
     let result = za_convert_calendar(&test.server, keys, id, &guards).await;
     let mut batch = BatchBuilder::new();
     batch.set(account_class, account_bytes);
-    test.server.store().write(batch.build_all()).await.unwrap();
+    test.server.store().write_batch(&mut batch).await.unwrap();
     conversion_conflict(result, 0, 0, false);
     let fresh = za_unlock(test, owner, STRONG).await;
     assert_eq!(
@@ -3448,12 +3427,7 @@ async fn sharing_rotation_contracts(test: &mut TestServer, owner: u32, reader: u
         .with_status(StatusCode::CREATED);
     let post_revoke_id = resource_id(test, owner, "http-sharing/post-revoke.ics").await;
     assert_eq!(
-        ck_envelope(
-            &event_archive(test, owner, post_revoke_id)
-                .await
-                .deserialize::<CalendarEvent>()
-                .unwrap()
-        ),
+        ck_envelope(&event_archive(test, owner, post_revoke_id).await.za_event()),
         Some((id, newest)),
         "case 6: the owner event written after the revoke must carry the new generation"
     );
@@ -4369,11 +4343,12 @@ async fn sharing_scan_transition_contracts(test: &TestServer, owner: u32, reader
         .await
         .unwrap();
     let original = event_archive(test, owner, event).await;
-    let mut valid = original.deserialize::<CalendarEvent>().unwrap();
+    let mut valid = original.za_event();
     rewrap_event(&mut valid, &context.domain, &context.domain).unwrap();
     update_event(test, owner, event, &original, valid.clone()).await;
-    let damage = |event: &mut CalendarEvent| {
+    let damage = |event: &mut ZaEvent| {
         let carrier = event
+            .content
             .data
             .event
             .components
@@ -5079,10 +5054,9 @@ async fn delegated_identity_and_groups(test: &mut TestServer, owner_id: u32, wri
         .0;
     let mut batch = BatchBuilder::new();
     batch.set(class.clone(), vec![0xffu8]);
-    test.server.store().write(batch.build_all()).await.unwrap();
+    test.server.store().write_batch(&mut batch).await.unwrap();
     test.server
-        .invalidate_local_caches(&[common::ipc::CacheInvalidation::Domain(domain.document_id())])
-        .await;
+        .invalidate_local_caches(&[common::ipc::CacheInvalidation::Domain(domain.document_id())]);
     let tree = delegated_tree("task9-identity-error", &[DELEGATE_ALIAS]);
     let result = za_resolve_delegation(
         &test.server,
@@ -5096,10 +5070,9 @@ async fn delegated_identity_and_groups(test: &mut TestServer, owner_id: u32, wri
     .await;
     let mut batch = BatchBuilder::new();
     batch.set(class, bytes);
-    test.server.store().write(batch.build_all()).await.unwrap();
+    test.server.store().write_batch(&mut batch).await.unwrap();
     test.server
-        .invalidate_local_caches(&[common::ipc::CacheInvalidation::Domain(domain.document_id())])
-        .await;
+        .invalidate_local_caches(&[common::ipc::CacheInvalidation::Domain(domain.document_id())]);
     assert!(
         result.is_err(),
         "identity preparation errors are outer errors, not Failed recipient outcomes"
@@ -5428,13 +5401,11 @@ async fn catch_all_resolution_is_quiet(test: &TestServer, owner_id: u32, writer_
     let party = Party::new(test, DELEGATE_WRITER);
     let before = inbox_ids(test, writer_id).await;
     let cold = async || {
-        test.server
-            .invalidate_local_caches(&[
-                CacheInvalidation::Domain(source.document_id()),
-                CacheInvalidation::Domain(target.document_id()),
-                CacheInvalidation::Account(writer_id),
-            ])
-            .await;
+        test.server.invalidate_local_caches(&[
+            CacheInvalidation::Domain(source.document_id()),
+            CacheInvalidation::Domain(target.document_id()),
+            CacheInvalidation::Account(writer_id),
+        ]);
         test.server.invalidate_all_local_negative_caches();
     };
     let text = delegated_tree("task9-quiet-classification", &[SOURCE])
@@ -7614,19 +7585,14 @@ async fn sharing_compare_lifecycle(
                     ),
                 )
                 .await;
-                let raw = event_archive(test, alice.id, id)
-                    .await
-                    .deserialize::<CalendarEvent>()
-                    .unwrap();
+                let raw = event_archive(test, alice.id, id).await.za_event();
                 let owner_keys = za_unlock(test, alice.id, STRONG).await;
                 let calendar_id = resource_id(test, alice.id, "lifecycle").await;
                 let context = za_owned_calendar_context(&test.server, &owner_keys, calendar_id)
                     .await
                     .unwrap();
                 let stored = event_archive(test, alice.id, id).await;
-                let pairs =
-                    groupware::calendar::seal::event_pairs_in_domain(&stored, &context.domain)
-                        .unwrap();
+                let pairs = stored.pairs_in(&context.domain).unwrap();
                 let present = pairs.as_ref().map(|pairs| {
                     let addresses = addresses
                         .iter()
@@ -7678,7 +7644,7 @@ async fn sharing_compare_lifecycle(
                 }
                 if label.contains("force") || label.contains("sole-group") {
                     assert!(
-                        raw.schedule_tag.is_some(),
+                        raw.meta.schedule_tag.is_some(),
                         "self-only scheduling must finalize and set a tag"
                     );
                     let Entry::ICalendar(parsed) = Parser::new(&source).entry() else {
@@ -7730,7 +7696,14 @@ async fn sharing_compare_lifecycle(
                     .find(|(item_id, _)| *item_id == id)
                     .unwrap()
                     .1;
-                assert_eq!(item.flags, 0, "{label}: rejected item is drained history");
+                // Ruling 13: a fork item's row always carries
+                // `EVENT_NOTIFICATION_PRIVATE` (upstream's Members audience);
+                // a drained one carries nothing else.
+                assert_eq!(
+                    item.flags,
+                    groupware::calendar::EVENT_NOTIFICATION_PRIVATE,
+                    "{label}: rejected item is drained history"
+                );
                 assert_eq!(item.event_id, None, "{label}: rejected item has no copy");
                 assert_eq!(
                     events
@@ -8311,12 +8284,10 @@ async fn sharing_lifecycle_negative_and_exception(test: &mut TestServer) {
             admin
                 .registry_update_object(ObjectType::Domain, domain, settings)
                 .await;
-            test.server
-                .invalidate_local_caches(&[
-                    CacheInvalidation::Domain(domain.document_id()),
-                    CacheInvalidation::Account(writer.document_id()),
-                ])
-                .await;
+            test.server.invalidate_local_caches(&[
+                CacheInvalidation::Domain(domain.document_id()),
+                CacheInvalidation::Account(writer.document_id()),
+            ]);
             test.server.invalidate_all_local_negative_caches();
             assert_eq!(
                 test.server
@@ -8335,12 +8306,10 @@ async fn sharing_lifecycle_negative_and_exception(test: &mut TestServer) {
             )
             .await;
             admin.registry_update_object(ObjectType::Domain, domain, json!({"catchAllAddress":saved.catch_all_address,"subAddressing":saved.sub_addressing})).await;
-            test.server
-                .invalidate_local_caches(&[
-                    CacheInvalidation::Domain(domain.document_id()),
-                    CacheInvalidation::Account(writer.document_id()),
-                ])
-                .await;
+            test.server.invalidate_local_caches(&[
+                CacheInvalidation::Domain(domain.document_id()),
+                CacheInvalidation::Account(writer.document_id()),
+            ]);
             test.server.invalidate_all_local_negative_caches();
         }
     }
@@ -8687,9 +8656,12 @@ async fn grantee_gate_controls(
     // Eligible corrupt events stay visible as500 items, rather than disappearing.
     let event_id = resource_id(test, alice.account_id, "shared/event.ics").await;
     let stored = event_archive(test, alice.account_id, event_id).await;
-    let valid = stored.deserialize::<CalendarEvent>().unwrap();
+    let valid = stored.za_event();
     let mut corrupt = valid.clone();
-    let carrier = corrupt.data.event.components[0].entries.last_mut().unwrap();
+    let carrier = corrupt.content.data.event.components[0]
+        .entries
+        .last_mut()
+        .unwrap();
     let calcard::icalendar::ICalendarValue::Text(encoded) = &mut carrier.values[0] else {
         panic!("envelope")
     };
@@ -8719,7 +8691,7 @@ async fn grantee_gate_controls(
     let current = test
         .server
         .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
             alice.account_id,
             Collection::Calendar,
             private_id,
@@ -8916,7 +8888,7 @@ async fn grantee_unrelated_corruption(
     let current = test
         .server
         .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
             alice.account_id,
             Collection::Calendar,
             id,
@@ -9405,7 +9377,8 @@ async fn sharing_http_schedule_contracts(test: &mut TestServer) {
     )
     .await;
     assert!(
-        groupware::calendar::seal::event_pairs_in_domain(&archive, &context.domain)
+        archive
+            .pairs_in(&context.domain)
             .unwrap()
             .unwrap()
             .get(LIFE_BOB)
@@ -9694,4 +9667,1299 @@ async fn sharing_http_schedule_contracts(test: &mut TestServer) {
     println!(
         "Cases9/10 actual HTTP delegated requests, component markers, cross-origin cancellations, replies, alias retokens, no-message writes and queued revoke passed"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Upgrade part 4c: field policy 2 (design "Privacy flags"; calendar spec
+// revision 8). A standard CLASS is visible on VEVENT, VTODO and VJOURNAL, so
+// upstream's builder derives `EVENT_PRIVATE` and `EVENT_SECRET` from the
+// stored tree and its privacy filters treat a key account's sharee exactly
+// as an ordinary account's.
+// ---------------------------------------------------------------------------
+
+const CLASS_KEY_OWNER: &str = "sharing-class-owner@example.com";
+const CLASS_KEY_READER: &str = "sharing-class-reader@example.com";
+const CLASS_PLAIN_OWNER: &str = "sharing-class-plain-owner@example.com";
+const CLASS_PLAIN_READER: &str = "sharing-class-plain-reader@example.com";
+const CLASS_KEY_ORGANIZER: &str = "sharing-class-organizer@example.com";
+const CLASS_KEY_ATTENDEE: &str = "sharing-class-attendee@example.com";
+const CLASS_PLAIN_ORGANIZER: &str = "sharing-class-plain-organizer@example.com";
+const CLASS_PLAIN_ATTENDEE: &str = "sharing-class-plain-attendee@example.com";
+const CLASSES: [&str; 3] = ["PUBLIC", "PRIVATE", "CONFIDENTIAL"];
+
+/// An event with `CLASS:<class>` and content canaries.
+fn class_event(uid: &str, class: &str, summary: &str) -> String {
+    format!(
+        concat!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//class//EN\r\nBEGIN:VEVENT\r\n",
+            "UID:{uid}\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990102T090000Z\r\n",
+            "DTEND:20990102T100000Z\r\nCLASS:{class}\r\nSUMMARY:{summary}\r\n",
+            "DESCRIPTION:class-description-canary\r\nLOCATION:class-location-canary\r\n",
+            "END:VEVENT\r\nEND:VCALENDAR\r\n"
+        ),
+        uid = uid,
+        class = class,
+        summary = summary
+    )
+}
+
+/// The two privacy bits upstream's builder stored on the event's row.
+async fn class_flags(test: &TestServer, account_id: u32, document_id: u32) -> (bool, bool) {
+    let flags = stored_event(test, account_id, document_id)
+        .await
+        .meta
+        .unarchive::<CalendarEvent>()
+        .unwrap()
+        .flags
+        .to_native();
+    (
+        flags & groupware::calendar::EVENT_PRIVATE != 0,
+        flags & groupware::calendar::EVENT_SECRET != 0,
+    )
+}
+
+/// The bits a CLASS value must derive (`EventPrivacy::from_value`); a
+/// sealed non-standard value derives none (the recorded limit).
+fn class_bits(class: &str) -> (bool, bool) {
+    match class {
+        "PRIVATE" => (true, false),
+        "CONFIDENTIAL" => (false, true),
+        _ => (false, false),
+    }
+}
+
+/// Removes the text of every `<prefix:tag>` element (its value differs
+/// between two accounts for reasons that are not the CLASS policy: ETags,
+/// timestamps, tokens).
+fn strip_element(body: &str, tag: &str) -> String {
+    let needle = format!(":{tag}>");
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(at) = rest.find(&needle) {
+        let end = at + needle.len();
+        let opening = rest[..at]
+            .rfind('<')
+            .is_some_and(|lt| !rest[lt + 1..].starts_with('/'));
+        out.push_str(&rest[..end]);
+        rest = &rest[end..];
+        if opening && let Some(close) = rest.find("</") {
+            rest = &rest[close..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A response body with what legitimately differs between the two owners
+/// removed: the owner's name in hrefs, ETags, timestamps, sync and lock
+/// tokens, and the free-busy object's DTSTAMP.
+fn class_normalize(body: &str, owner: &str) -> String {
+    let mut text = body
+        .replace(&owner.replace('@', "%40"), "OWNER")
+        .replace(owner, "OWNER");
+    for tag in [
+        "getetag",
+        "getlastmodified",
+        "creationdate",
+        "sync-token",
+        "locktoken",
+        "getctag",
+    ] {
+        text = strip_element(&text, tag);
+    }
+    text.split("\r\n")
+        .filter(|line| !line.starts_with("DTSTAMP:"))
+        .collect::<Vec<_>>()
+        .join("\r\n")
+}
+
+/// One side of the differential: an owner, its sharee and the shared
+/// calendar `class/`.
+struct ClassSide {
+    key: bool,
+    /// The ordinary side's accounts, destroyed at the end (the suite only
+    /// destroys key accounts).
+    plain_accounts: Vec<crate::utils::account::Account>,
+    owner_name: &'static str,
+    owner_id: u32,
+    owner: DummyWebDavClient,
+    reader: DummyWebDavClient,
+    cal: String,
+}
+
+impl ClassSide {
+    fn path(&self, name: &str) -> String {
+        format!("{}{name}", self.cal)
+    }
+
+    /// Runs `method` on `path` as the sharee and returns the status and
+    /// the normalized body.
+    async fn sharee(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&'static str, &str)],
+        body: &str,
+    ) -> (StatusCode, String) {
+        let response = self
+            .reader
+            .request_with_headers(method, path, headers.iter().copied(), body)
+            .await;
+        (
+            response.status,
+            class_normalize(&response.body.unwrap_or_default(), self.owner_name),
+        )
+    }
+}
+
+async fn class_side(test: &mut TestServer, key: bool) -> ClassSide {
+    let (owner_name, reader_name) = if key {
+        (CLASS_KEY_OWNER, CLASS_KEY_READER)
+    } else {
+        (CLASS_PLAIN_OWNER, CLASS_PLAIN_READER)
+    };
+    let admin = test.account("admin@example.com").clone();
+    let mut ids = Vec::new();
+    let mut plain_accounts = Vec::new();
+    for name in [owner_name, reader_name] {
+        if key {
+            let account = admin
+                .create_key_user_account(name, STRONG, name, &[], user_permissions())
+                .await;
+            ids.push(account.id().document_id());
+            test.insert_account(account);
+        } else {
+            let account = admin
+                .create_user_account(name, STRONG, name, &[], user_permissions())
+                .await;
+            ids.push(account.id().document_id());
+            plain_accounts.push(account);
+        }
+    }
+    let side = ClassSide {
+        key,
+        plain_accounts,
+        owner_name,
+        owner_id: ids[0],
+        owner: DummyWebDavClient::new(ids[0], owner_name, STRONG, owner_name),
+        reader: DummyWebDavClient::new(ids[1], reader_name, STRONG, reader_name),
+        cal: format!("/dav/cal/{}/class/", owner_name.replace('@', "%40")),
+    };
+    for slug in ["class/", "class-own/"] {
+        side.owner
+            .request(
+                "MKCALENDAR",
+                &format!("/dav/cal/{}/{slug}", owner_name.replace('@', "%40")),
+                MKCAL,
+            )
+            .await
+            .with_status(StatusCode::CREATED);
+    }
+    for (name, class) in [
+        ("public.ics", "PUBLIC"),
+        ("private.ics", "PRIVATE"),
+        ("confidential.ics", "CONFIDENTIAL"),
+        ("delete.ics", "PUBLIC"),
+    ] {
+        side.owner
+            .request_with_headers(
+                "PUT",
+                &side.path(name),
+                [("content-type", "text/calendar")],
+                &class_event(
+                    &format!("class-{name}"),
+                    class,
+                    &format!("class-summary-{class}"),
+                ),
+            )
+            .await
+            .with_status(StatusCode::CREATED);
+    }
+    if key {
+        let key = test
+            .server
+            .za_served_public_key(ids[1])
+            .await
+            .unwrap()
+            .unwrap();
+        super::pinning::pin(
+            owner_name,
+            reader_name,
+            &vault::keys::display_fingerprint(&key),
+        )
+        .await
+        .expect(200);
+        crate::utils::za::za_post(
+            "shares/grant",
+            &serde_json::json!({"username": owner_name, "password": STRONG,
+                "calendar": "class", "address": reader_name, "level": "edit"}),
+        )
+        .await
+        .expect(200);
+    } else {
+        side.owner
+            .acl(
+                &side.cal,
+                &format!("/dav/pal/{}/", reader_name.replace('@', "%40")),
+                ["read", "write"],
+            )
+            .await
+            .with_status(StatusCode::OK);
+    }
+    side
+}
+
+/// The stored privacy bits of every event of `side` match its CLASS.
+async fn assert_class_bits(
+    test: &TestServer,
+    side: &ClassSide,
+    events: &[(&str, &str)],
+    step: &str,
+) {
+    for (name, class) in events {
+        let id = resource_id(test, side.owner_id, &format!("class/{name}")).await;
+        assert_eq!(
+            class_flags(test, side.owner_id, id).await,
+            class_bits(class),
+            "{step}: key={} {name} ({class})",
+            side.key
+        );
+    }
+}
+
+/// Field policy 2's differential: the same requests by a sharee against a
+/// key account's shared calendar and an ordinary account's give the same
+/// statuses and the same served properties, except the recorded limits; the
+/// owner sees every event in full; the stored privacy bits follow CLASS
+/// through every write; and `CLASS:X-SOMETHING` is the recorded limit.
+pub async fn sharing_class_differential(test: &mut TestServer) {
+    println!("Running field policy 2 sharee differential...");
+    let key = class_side(test, true).await;
+    let plain = class_side(test, false).await;
+    let sides = [&key, &plain];
+    let all = [
+        ("public.ics", "PUBLIC"),
+        ("private.ics", "PRIVATE"),
+        ("confidential.ics", "CONFIDENTIAL"),
+    ];
+
+    // The stored form: a key account's CLASS stays visible in the sealed
+    // tree and derives the same bits as the ordinary account's.
+    for side in sides {
+        assert_class_bits(test, side, &all, "PUT").await;
+    }
+    for (name, class) in all {
+        let id = resource_id(test, key.owner_id, &format!("class/{name}")).await;
+        let stored = stored_event(test, key.owner_id, id).await;
+        let tree = stored.tree().to_string();
+        assert!(tree.contains(&format!("CLASS:{class}")), "{tree}");
+        assert!(!stored.bytes().contains("class-summary-"), "{name} leaked");
+    }
+
+    // The owner reads every event in full, on both sides.
+    for side in sides {
+        for (name, class) in all {
+            let body = side
+                .owner
+                .request("GET", &side.path(name), "")
+                .await
+                .with_status(StatusCode::OK)
+                .body
+                .unwrap();
+            assert!(body.contains(&format!("class-summary-{class}")), "{body}");
+            assert!(!body.contains("X-ZA-"), "{body}");
+        }
+    }
+
+    // The sharee's reads.
+    let propfind = "<D:propfind xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:prop><D:getetag/><D:getcontentlength/><D:getcontenttype/><D:displayname/><C:calendar-data/></D:prop></D:propfind>";
+    let query = "<C:calendar-query xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:prop><D:getetag/><C:calendar-data/></D:prop><C:filter><C:comp-filter name=\"VCALENDAR\"><C:comp-filter name=\"VEVENT\"><C:time-range start=\"20990101T000000Z\" end=\"20990201T000000Z\"/></C:comp-filter></C:comp-filter></C:filter></C:calendar-query>";
+    let free_busy = "<C:free-busy-query xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><C:time-range start=\"20990101T000000Z\" end=\"20990201T000000Z\"/></C:free-busy-query>";
+    let mut outcomes: Vec<Vec<(String, StatusCode, String)>> = Vec::new();
+    for side in sides {
+        let mut results = Vec::new();
+        for (name, _) in all {
+            for method in ["GET", "HEAD"] {
+                let (status, body) = side.sharee(method, &side.path(name), &[], "").await;
+                results.push((format!("{method} {name}"), status, body));
+            }
+            let (status, body) = side
+                .sharee("PROPFIND", &side.path(name), &[("depth", "0")], propfind)
+                .await;
+            results.push((format!("PROPFIND {name}"), status, body));
+        }
+        let (status, body) = side
+            .sharee("PROPFIND", &side.cal, &[("depth", "1")], propfind)
+            .await;
+        results.push(("PROPFIND depth 1".into(), status, body));
+        let (status, body) = side
+            .sharee("REPORT", &side.cal, &[("depth", "1")], query)
+            .await;
+        results.push(("REPORT calendar-query".into(), status, body));
+        let hrefs = all
+            .iter()
+            .map(|(name, _)| format!("<D:href>{}</D:href>", side.path(name)))
+            .collect::<String>();
+        let multiget = format!(
+            "<C:calendar-multiget xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:prop><D:getetag/><C:calendar-data/></D:prop>{hrefs}</C:calendar-multiget>"
+        );
+        let (status, body) = side.sharee("REPORT", &side.cal, &[], &multiget).await;
+        results.push(("REPORT multiget".into(), status, body));
+        let (status, body) = side.sharee("REPORT", &side.cal, &[], free_busy).await;
+        results.push(("REPORT free-busy".into(), status, body));
+        outcomes.push(results);
+    }
+    for (key_result, plain_result) in outcomes[0].iter().zip(&outcomes[1]) {
+        assert_eq!(key_result.0, plain_result.0);
+        assert_eq!(
+            (key_result.1, &key_result.2),
+            (plain_result.1, &plain_result.2),
+            "{}: the key account's sharee is served differently",
+            key_result.0
+        );
+    }
+    // The upstream privacy rule itself, on both sides: a sharee reads a
+    // public event, is refused a private one and does not see a
+    // confidential one.
+    for side in sides {
+        let (status, body) = side.sharee("GET", &side.path("public.ics"), &[], "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("class-summary-PUBLIC"), "{body}");
+        for (name, expected) in [
+            ("private.ics", StatusCode::FORBIDDEN),
+            ("confidential.ics", StatusCode::NOT_FOUND),
+        ] {
+            assert_eq!(
+                side.sharee("GET", &side.path(name), &[], "").await.0,
+                expected
+            );
+        }
+    }
+
+    // The sharee's writes, compared the same way, with the store's bits
+    // checked after each.
+    let changed = class_event("class-public.ics", "PUBLIC", "class-summary-PUBLIC-shared");
+    let displayname = "<D:propertyupdate xmlns:D=\"DAV:\"><D:set><D:prop><D:displayname>class-name</D:displayname></D:prop></D:set></D:propertyupdate>";
+    let lock = "<D:lockinfo xmlns:D=\"DAV:\"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype><D:owner>class</D:owner></D:lockinfo>";
+    let mut writes: Vec<Vec<(String, StatusCode, String)>> = Vec::new();
+    for side in sides {
+        let mut results = Vec::new();
+        let (status, body) = side
+            .sharee(
+                "PUT",
+                &side.path("public.ics"),
+                &[("content-type", "text/calendar")],
+                &changed,
+            )
+            .await;
+        results.push(("PUT public".to_string(), status, body));
+        let (status, body) = side
+            .sharee(
+                "PUT",
+                &side.path("private.ics"),
+                &[("content-type", "text/calendar")],
+                &class_event("class-private.ics", "PRIVATE", "class-sharee-private"),
+            )
+            .await;
+        results.push(("PUT private".to_string(), status, body));
+        let (status, body) = side
+            .sharee("PROPPATCH", &side.path("public.ics"), &[], displayname)
+            .await;
+        results.push(("PROPPATCH public".to_string(), status, body));
+        let response = side
+            .reader
+            .request_with_headers(
+                "LOCK",
+                &side.path("public.ics"),
+                [("timeout", "Second-60")],
+                lock,
+            )
+            .await;
+        results.push(("LOCK public".to_string(), response.status, String::new()));
+        if let Some(token) = response.headers.get("lock-token").cloned() {
+            let (status, _) = side
+                .sharee(
+                    "UNLOCK",
+                    &side.path("public.ics"),
+                    &[("lock-token", token.as_str())],
+                    "",
+                )
+                .await;
+            results.push(("UNLOCK public".to_string(), status, String::new()));
+        }
+        let (status, body) = side
+            .sharee(
+                "MOVE",
+                &side.path("public.ics"),
+                &[("destination", side.path("public-moved.ics").as_str())],
+                "",
+            )
+            .await;
+        results.push(("MOVE public".to_string(), status, body));
+        let (status, body) = side
+            .sharee(
+                "MOVE",
+                &side.path("public-moved.ics"),
+                &[("destination", side.path("public.ics").as_str())],
+                "",
+            )
+            .await;
+        results.push(("MOVE back".to_string(), status, body));
+        let (status, body) = side
+            .sharee("DELETE", &side.path("delete.ics"), &[], "")
+            .await;
+        results.push(("DELETE".to_string(), status, body));
+        let (status, body) = side.sharee("GET", &side.path("public.ics"), &[], "").await;
+        results.push(("GET after writes".to_string(), status, body));
+        writes.push(results);
+        assert_class_bits(test, side, &all, "sharee writes").await;
+    }
+    for (key_result, plain_result) in writes[0].iter().zip(&writes[1]) {
+        assert_eq!(key_result.0, plain_result.0);
+        assert_eq!(
+            (key_result.1, &key_result.2),
+            (plain_result.1, &plain_result.2),
+            "{}: the key account's sharee write differs",
+            key_result.0
+        );
+    }
+    assert_eq!(writes[0].len(), writes[1].len());
+    // Ruling 49: a sharee's PUT on a key account is not split into per-user
+    // preferences, so the event's preferences stay empty.
+    let public_id = resource_id(test, key.owner_id, "class/public.ics").await;
+    crate::utils::za::assert_no_event_preferences(test, key.owner_id, public_id).await;
+
+    // The recorded limit of COPY (the fork's `shared_copy_refusal`): a COPY
+    // into or out of a shared calendar is refused on a key account, where
+    // the ordinary account's sharee copies.
+    for (side, expected) in [(&key, StatusCode::FORBIDDEN), (&plain, StatusCode::CREATED)] {
+        let (status, _) = side
+            .sharee(
+                "COPY",
+                &side.path("public.ics"),
+                &[("destination", side.path("public-copy.ics").as_str())],
+                "",
+            )
+            .await;
+        assert_eq!(status, expected, "COPY key={}", side.key);
+    }
+
+    // The recorded limit of field policy 2: a non-standard CLASS is sealed,
+    // derives neither bit, and is served to the key account's sharee in
+    // full; the ordinary account's builder reads it as private
+    // (`EventPrivacy::from_value`), so its sharee is refused.
+    // Written now, so the listings compared above hold only the standard
+    // classes.
+    for side in sides {
+        side.owner
+            .request_with_headers(
+                "PUT",
+                &side.path("other.ics"),
+                [("content-type", "text/calendar")],
+                &class_event(
+                    "class-other.ics",
+                    "X-SOMETHING",
+                    "class-summary-X-SOMETHING",
+                ),
+            )
+            .await
+            .with_status(StatusCode::CREATED);
+    }
+    let other = resource_id(test, key.owner_id, "class/other.ics").await;
+    let stored = stored_event(test, key.owner_id, other).await;
+    assert!(!stored.tree().to_string().contains("X-SOMETHING"));
+    assert!(!stored.bytes().contains("X-SOMETHING"));
+    assert_eq!(class_flags(test, key.owner_id, other).await, (false, false));
+    let (status, body) = key.sharee("GET", &key.path("other.ics"), &[], "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("CLASS:X-SOMETHING") && body.contains("class-summary-X-SOMETHING"),
+        "{body}"
+    );
+    let plain_other = resource_id(test, plain.owner_id, "class/other.ics").await;
+    assert_eq!(
+        class_flags(test, plain.owner_id, plain_other).await,
+        (true, false)
+    );
+    assert_eq!(
+        plain
+            .sharee("GET", &plain.path("other.ics"), &[], "")
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+
+    // The owner's writes: PROPPATCH, COPY and MOVE into the owner's other
+    // calendar, and a CLASS change from PRIVATE to PUBLIC; the bits follow
+    // on both sides.
+    for side in sides {
+        side.owner
+            .request("PROPPATCH", &side.path("private.ics"), displayname)
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+        assert_class_bits(test, side, &all, "PROPPATCH").await;
+        let own = side.cal.replace("/class/", "/class-own/");
+        side.owner
+            .request_with_headers(
+                "MOVE",
+                &side.path("confidential.ics"),
+                [("destination", format!("{own}confidential.ics").as_str())],
+                "",
+            )
+            .await
+            .with_status(StatusCode::CREATED);
+        side.owner
+            .request_with_headers(
+                "MOVE",
+                &format!("{own}confidential.ics"),
+                [("destination", side.path("confidential.ics").as_str())],
+                "",
+            )
+            .await
+            .with_status(StatusCode::CREATED);
+        assert_class_bits(test, side, &all, "MOVE").await;
+        side.owner
+            .request_with_headers(
+                "PUT",
+                &format!("{own}copy-source.ics"),
+                [("content-type", "text/calendar")],
+                &class_event("class-copy", "CONFIDENTIAL", "class-summary-copy"),
+            )
+            .await
+            .with_status(StatusCode::CREATED);
+        side.owner
+            .request_with_headers(
+                "COPY",
+                &format!("{own}copy-source.ics"),
+                [("destination", format!("{own}copied.ics").as_str())],
+                "",
+            )
+            .await
+            .with_status(StatusCode::CREATED);
+        for name in ["copy-source.ics", "copied.ics"] {
+            let id = test
+                .server
+                .fetch_groupware_resources(side.owner_id, side.owner_id, SyncCollection::Calendar)
+                .await
+                .unwrap()
+                .by_path(&format!("class-own/{name}"))
+                .unwrap()
+                .document_id();
+            assert_eq!(
+                class_flags(test, side.owner_id, id).await,
+                (false, true),
+                "COPY key={} {name}",
+                side.key
+            );
+        }
+        side.owner
+            .request_with_headers(
+                "PUT",
+                &side.path("private.ics"),
+                [("content-type", "text/calendar")],
+                &class_event("class-private.ics", "PUBLIC", "class-summary-PRIVATE"),
+            )
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+        assert_class_bits(
+            test,
+            side,
+            &[
+                ("public.ics", "PUBLIC"),
+                ("private.ics", "PUBLIC"),
+                ("confidential.ics", "CONFIDENTIAL"),
+            ],
+            "PRIVATE to PUBLIC",
+        )
+        .await;
+        // The sharee now reads the formerly private event, on both sides.
+        assert_eq!(
+            side.sharee("GET", &side.path("private.ics"), &[], "")
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+
+    test.wait_for_tasks().await;
+    for side in sides {
+        for slug in ["class/", "class-own/"] {
+            side.owner
+                .request(
+                    "DELETE",
+                    &format!("/dav/cal/{}/{slug}", side.owner_name.replace('@', "%40")),
+                    "",
+                )
+                .await
+                .with_status(StatusCode::NO_CONTENT);
+        }
+    }
+    test.wait_for_tasks().await;
+    let admin = test.account("admin@example.com").clone();
+    for account in plain.plain_accounts.clone() {
+        admin.destroy_account(account).await;
+    }
+    test.wait_for_tasks().await;
+}
+
+/// An invitation from `organizer` to `attendee` with `CLASS:<class>` at
+/// `sequence`.
+fn class_invite(uid: &str, organizer: &str, attendee: &str, class: &str, sequence: u32) -> String {
+    format!(
+        concat!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//class//EN\r\nBEGIN:VEVENT\r\n",
+            "UID:{uid}\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990105T090000Z\r\n",
+            "DURATION:PT1H\r\nSEQUENCE:{sequence}\r\nCLASS:{class}\r\n",
+            "SUMMARY:class-inbound-summary\r\nORGANIZER:mailto:{organizer}\r\n",
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{attendee}\r\n",
+            "END:VEVENT\r\nEND:VCALENDAR\r\n"
+        ),
+        uid = uid,
+        organizer = organizer,
+        attendee = attendee,
+        class = class,
+        sequence = sequence
+    )
+}
+
+/// The CLASS lines of a GET body, in order.
+fn class_lines(body: &str) -> Vec<String> {
+    body.split("\r\n")
+        .filter(|line| line.starts_with("CLASS:"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// One inbound party pair: organizer, its id, attendee, its id, key account.
+type ClassParty = (&'static str, u32, &'static str, u32, bool);
+
+/// Delivers what the organizers sent: the ordinary attendee's iTIP task
+/// runs `itip_ingest`, the key attendee's DAV request drains.
+async fn class_deliver(test: &TestServer) {
+    crate::utils::za::wait_for_delivery(test).await;
+    test.wait_for_tasks_skip_not_due().await;
+    assert_eq!(
+        crate::utils::za::trigger_drain(CLASS_KEY_ATTENDEE, STRONG).await,
+        207
+    );
+}
+
+/// Each attendee's copy as its client reads it (the CLASS lines) and as
+/// stored (the privacy bits); both must agree across the two paths.
+async fn class_observe(
+    test: &TestServer,
+    parties: &[ClassParty],
+    hrefs: &[String],
+    label: &str,
+) -> (Vec<String>, (bool, bool)) {
+    let mut seen = Vec::new();
+    for ((_, _, attendee, attendee_id, key), href) in parties.iter().zip(hrefs) {
+        let body = DummyWebDavClient::new(*attendee_id, attendee, STRONG, attendee)
+            .request("GET", href, "")
+            .await
+            .with_status(StatusCode::OK)
+            .body
+            .unwrap();
+        let id = test
+            .server
+            .fetch_groupware_resources(*attendee_id, *attendee_id, SyncCollection::Calendar)
+            .await
+            .unwrap()
+            .by_path(&format!("default/{}", href.rsplit('/').next().unwrap()))
+            .unwrap()
+            .document_id();
+        if *key {
+            // The drain's copy stores CLASS visible in a sealed tree.
+            let stored = stored_event(test, *attendee_id, id).await;
+            assert!(!stored.bytes().contains("class-inbound-summary"));
+            crate::utils::za::assert_no_event_preferences(test, *attendee_id, id).await;
+        }
+        seen.push((
+            class_lines(&body),
+            class_flags(test, *attendee_id, id).await,
+        ));
+    }
+    assert_eq!(
+        seen[0], seen[1],
+        "{label}: the drain kept a different classification than itip_ingest"
+    );
+    assert!(!seen[0].0.is_empty(), "{label}: no CLASS on the copy");
+    seen.swap_remove(0)
+}
+
+/// Field policy 2's inbound case: an update whose CLASS differs from the
+/// stored copy's, through upstream's `itip_ingest` (two ordinary accounts)
+/// and through the drain's hand-mirrored merge (two key accounts). The
+/// classification each attendee's copy keeps and its stored bits are the
+/// same, after the import and after the merge.
+pub async fn sharing_class_inbound(test: &mut TestServer) {
+    use super::drain::DrainOn;
+    use crate::utils::za::{copy_href, inbox_ids};
+    println!("Running field policy 2 inbound classification tests...");
+    let _drain = DrainOn::new();
+    let admin = test.account("admin@example.com").clone();
+    let mut key_ids = Vec::new();
+    for name in [CLASS_KEY_ORGANIZER, CLASS_KEY_ATTENDEE] {
+        let account = admin
+            .create_key_user_account(name, STRONG, name, &[], user_permissions())
+            .await;
+        key_ids.push(account.id().document_id());
+        test.insert_account(account);
+    }
+    let mut plain_ids = Vec::new();
+    let mut plain_accounts = Vec::new();
+    for name in [CLASS_PLAIN_ORGANIZER, CLASS_PLAIN_ATTENDEE] {
+        let account = admin
+            .create_user_account(name, STRONG, name, &[], user_permissions())
+            .await;
+        plain_ids.push(account.id().document_id());
+        plain_accounts.push(account);
+    }
+    let parties: [ClassParty; 2] = [
+        (
+            CLASS_KEY_ORGANIZER,
+            key_ids[0],
+            CLASS_KEY_ATTENDEE,
+            key_ids[1],
+            true,
+        ),
+        (
+            CLASS_PLAIN_ORGANIZER,
+            plain_ids[0],
+            CLASS_PLAIN_ATTENDEE,
+            plain_ids[1],
+            false,
+        ),
+    ];
+    let uid = "sharing-class-inbound";
+    let mut hrefs = Vec::new();
+    let mut attendee_starts = Vec::new();
+    for (organizer, organizer_id, attendee, attendee_id, _) in parties {
+        attendee_starts.push(inbox_ids(test, attendee_id).await);
+        for name in [organizer, attendee] {
+            let id = if name == organizer {
+                organizer_id
+            } else {
+                attendee_id
+            };
+            // Both parties need a default calendar to hold their copy.
+            DummyWebDavClient::new(id, name, STRONG, name)
+                .request(
+                    "MKCALENDAR",
+                    &format!("/dav/cal/{}/default/", name.replace('@', "%40")),
+                    MKCAL,
+                )
+                .await;
+        }
+        let organizer_client = DummyWebDavClient::new(organizer_id, organizer, STRONG, organizer);
+        organizer_client
+            .request_with_headers(
+                "PUT",
+                &format!(
+                    "/dav/cal/{}/default/inbound.ics",
+                    organizer.replace('@', "%40")
+                ),
+                [("content-type", "text/calendar")],
+                class_invite(uid, organizer, attendee, "PRIVATE", 0),
+            )
+            .await
+            .with_status(StatusCode::CREATED);
+    }
+    class_deliver(test).await;
+    for (_, _, _, attendee_id, _) in parties {
+        hrefs.push(copy_href(test, attendee_id, uid).await);
+    }
+    let imported = class_observe(test, &parties, &hrefs, "import").await;
+    assert_eq!(imported, (vec!["CLASS:PRIVATE".to_string()], (true, false)));
+
+    // The update changes CLASS: each attendee's copy keeps what upstream's
+    // merge keeps, the same on both paths.
+    for (organizer, organizer_id, attendee, _, _) in parties {
+        DummyWebDavClient::new(organizer_id, organizer, STRONG, organizer)
+            .request_with_headers(
+                "PUT",
+                &format!(
+                    "/dav/cal/{}/default/inbound.ics",
+                    organizer.replace('@', "%40")
+                ),
+                [("content-type", "text/calendar")],
+                class_invite(uid, organizer, attendee, "PUBLIC", 1),
+            )
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    class_deliver(test).await;
+    let merged = class_observe(test, &parties, &hrefs, "merge").await;
+    println!("inbound CLASS change: import={imported:?} merge={merged:?}");
+    let (class, bits) = &merged;
+    assert_eq!(
+        *bits,
+        class_bits(class[0].trim_start_matches("CLASS:")),
+        "the merged copy's bits do not follow its CLASS"
+    );
+
+    // Cleanup: copies and organizers' events without scheduling messages,
+    // the key attendee's items, then the ordinary accounts.
+    for ((organizer, organizer_id, attendee, attendee_id, _), href) in parties.iter().zip(&hrefs) {
+        DummyWebDavClient::new(*attendee_id, attendee, STRONG, attendee)
+            .request_with_headers("DELETE", href, [("schedule-reply", "F")], "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+        DummyWebDavClient::new(*organizer_id, organizer, STRONG, organizer)
+            .request_with_headers(
+                "DELETE",
+                &format!(
+                    "/dav/cal/{}/default/inbound.ics",
+                    organizer.replace('@', "%40")
+                ),
+                [("schedule-reply", "F")],
+                "",
+            )
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    super::fanout::Party::new(test, CLASS_KEY_ATTENDEE)
+        .delete_items_since(test, &attendee_starts[0])
+        .await;
+    test.wait_for_tasks_skip_not_due().await;
+    for account in plain_accounts {
+        admin.destroy_account(account).await;
+    }
+    test.wait_for_tasks().await;
+}
+
+// ---------------------------------------------------------------------------
+// Upgrade part 4c: the lifecycle cases of 1.0's grantee-cleanup and
+// share-rebuild tasks (Task 6 owns the workers' final integration).
+// ---------------------------------------------------------------------------
+
+const REVOKE_OWNER: &str = "sharing-revoke-owner@example.com";
+const REVOKE_READER: &str = "sharing-revoke-reader@example.com";
+const REVOKE_LATER: &str = "sharing-revoke-later@example.com";
+const REVOKE_CAL: &str = "/dav/cal/sharing-revoke-owner%40example.com/revoke/";
+
+/// `ShareRevokeCleanup` tasks of `owner_id` in the task queue.
+async fn revoke_cleanup_tasks(test: &TestServer, owner_id: u32) -> usize {
+    use store::write::{TaskId, TaskQueueClass, ValueClass};
+    let task = |id| {
+        ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task {
+            id: TaskId::Assigned(id),
+        }))
+    };
+    let mut count = 0;
+    test.server
+        .store()
+        .iterate(
+            store::IterateParams::new(task(0), task(u64::MAX)).ascending(),
+            |_, value| {
+                if let registry::schema::structs::Task::ShareRevokeCleanup(task) =
+                    <registry::schema::structs::Task as store::Deserialize>::deserialize(value)?
+                    && task.account_id.document_id() == owner_id
+                {
+                    count += 1;
+                }
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+    count
+}
+
+/// The owner's grants of `revoke` as the account API lists them.
+async fn revoke_grants(owner: &str) -> Vec<String> {
+    let listing = crate::utils::za::za_post(
+        "shares",
+        &serde_json::json!({"username": owner, "password": STRONG}),
+    )
+    .await
+    .expect(200);
+    listing["calendars"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|calendar| calendar["calendar"] == "revoke")
+        .flat_map(|calendar| calendar["grants"].as_array().cloned().unwrap_or_default())
+        .map(|grant| grant["address"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The status a client with no grant gets for `path`, and whether the
+/// body names the event's private summary.
+async fn revoke_probe(client: &DummyWebDavClient, path: &str) -> (StatusCode, bool) {
+    let response = client.request("GET", path, "").await;
+    let leaked = response
+        .body
+        .as_ref()
+        .is_ok_and(|body| body.contains("share-read-private-summary"));
+    (response.status, leaked)
+}
+
+/// Shares `revoke` with `reader` at `level` (pin first).
+async fn revoke_grant(test: &TestServer, reader: &str, reader_id: u32) {
+    let key = test
+        .server
+        .za_served_public_key(reader_id)
+        .await
+        .unwrap()
+        .unwrap();
+    super::pinning::pin(
+        REVOKE_OWNER,
+        reader,
+        &vault::keys::display_fingerprint(&key),
+    )
+    .await
+    .expect(200);
+    crate::utils::za::za_post(
+        "shares/grant",
+        &serde_json::json!({"username": REVOKE_OWNER, "password": STRONG,
+            "calendar": "revoke", "address": reader, "level": "edit"}),
+    )
+    .await
+    .expect(200);
+}
+
+/// Every cache a revoked grantee's access could be served from, dropped.
+fn revoke_refresh(test: &TestServer, ids: &[u32]) {
+    let mut changes = Vec::new();
+    for id in ids {
+        changes.push(common::ipc::CacheInvalidation::GroupwareResources(*id));
+        changes.push(common::ipc::CacheInvalidation::AccessToken(*id));
+    }
+    test.server.invalidate_local_caches(&changes);
+}
+
+/// A revoked grantee's ring stays revoked: after the revoke, the background
+/// work it queues (`ShareRevokeCleanup`), a refresh of every cache, and a
+/// later grant to someone else, the revoked account gets exactly what an
+/// account that was never granted gets, and the owner's listing never
+/// shows it again.
+pub async fn cleanup_cannot_restore_revoked_ring(test: &mut TestServer) {
+    use crate::utils::za::{hold_task_consumer, za_post};
+    println!("Running revoked-ring lifecycle tests...");
+    let admin = test.account("admin@example.com").clone();
+    let mut ids = Vec::new();
+    for name in [REVOKE_OWNER, REVOKE_READER, REVOKE_LATER] {
+        let account = admin
+            .create_key_user_account(name, STRONG, name, &[], user_permissions())
+            .await;
+        ids.push(account.id().document_id());
+        test.insert_account(account);
+    }
+    let (owner_id, reader_id, later_id) = (ids[0], ids[1], ids[2]);
+    let owner = DummyWebDavClient::new(owner_id, REVOKE_OWNER, STRONG, REVOKE_OWNER);
+    let reader = DummyWebDavClient::new(reader_id, REVOKE_READER, STRONG, REVOKE_READER);
+    let later = DummyWebDavClient::new(later_id, REVOKE_LATER, STRONG, REVOKE_LATER);
+    owner
+        .request("MKCALENDAR", REVOKE_CAL, MKCAL)
+        .await
+        .with_status(StatusCode::CREATED);
+    let path = format!("{REVOKE_CAL}event.ics");
+    owner
+        .request_with_headers(
+            "PUT",
+            &path,
+            [("content-type", "text/calendar")],
+            EVENT.replace("share-read-UID", "sharing-revoke-ring"),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    // The oracle: what an account never granted gets, for a read and for a
+    // write.
+    let never = revoke_probe(&later, &path).await;
+    assert!(!never.1, "an ungranted account read the event");
+    assert_ne!(never.0, StatusCode::OK);
+    let rewrite = EVENT
+        .replace("share-read-UID", "sharing-revoke-ring")
+        .replace("share-read-private-summary", "sharing-revoke-overwrite");
+    let never_write = later
+        .request_with_headers(
+            "PUT",
+            &path,
+            [("content-type", "text/calendar")],
+            rewrite.clone(),
+        )
+        .await
+        .status;
+    assert!(!never_write.is_success());
+
+    revoke_grant(test, REVOKE_READER, reader_id).await;
+    assert_eq!(revoke_probe(&reader, &path).await, (StatusCode::OK, true));
+    assert_eq!(
+        revoke_grants(REVOKE_OWNER).await,
+        vec![REVOKE_READER.to_string()]
+    );
+
+    // The revoke, with the consumer held so the queued cleanup is seen.
+    let held = hold_task_consumer(test).await;
+    assert_eq!(
+        za_post(
+            "shares/revoke",
+            &serde_json::json!({"username": REVOKE_OWNER, "password": STRONG,
+                "calendar": "revoke", "grant": reader_id}),
+        )
+        .await
+        .expect(200)["changed"],
+        true
+    );
+    let queued = revoke_cleanup_tasks(test, owner_id).await;
+    println!("revoke queued {queued} ShareRevokeCleanup task(s)");
+    assert_eq!(revoke_probe(&reader, &path).await, never);
+    drop(held);
+    test.wait_for_tasks().await;
+    assert_eq!(revoke_cleanup_tasks(test, owner_id).await, 0);
+
+    // After the background work and a refresh of every cache.
+    revoke_refresh(test, &[owner_id, reader_id]);
+    assert_eq!(revoke_probe(&reader, &path).await, never);
+    assert!(revoke_grants(REVOKE_OWNER).await.is_empty());
+
+    // A later grant to another account rebuilds the ring without the
+    // revoked one.
+    revoke_grant(test, REVOKE_LATER, later_id).await;
+    assert_eq!(revoke_probe(&later, &path).await, (StatusCode::OK, true));
+    test.wait_for_tasks().await;
+    revoke_refresh(test, &[owner_id, reader_id, later_id]);
+    assert_eq!(revoke_probe(&reader, &path).await, never);
+    assert_eq!(
+        revoke_grants(REVOKE_OWNER).await,
+        vec![REVOKE_LATER.to_string()]
+    );
+    assert_eq!(
+        za_post(
+            "shares",
+            &serde_json::json!({"username": REVOKE_READER, "password": STRONG}),
+        )
+        .await
+        .expect(200)["shared_with_me"],
+        serde_json::json!([])
+    );
+    // A write by the revoked account is refused as for the never-granted,
+    // and changes nothing.
+    assert_eq!(
+        reader
+            .request_with_headers("PUT", &path, [("content-type", "text/calendar")], rewrite,)
+            .await
+            .status,
+        never_write
+    );
+    assert!(
+        owner
+            .request("GET", &path, "")
+            .await
+            .with_status(StatusCode::OK)
+            .body
+            .unwrap()
+            .contains("share-read-private-summary")
+    );
+
+    test.wait_for_tasks().await;
+    owner
+        .request("DELETE", REVOKE_CAL, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    test.wait_for_tasks().await;
+}
+
+const REVOKE_SEALED_CAL: &str = "/dav/cal/sharing-revoke-owner%40example.com/revoke-sealed/";
+
+/// The stored bytes and ETags of `ids`, row and content.
+async fn revoke_snapshot(test: &TestServer, owner_id: u32, ids: &[u32]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for id in ids {
+        let stored = stored_event(test, owner_id, *id).await;
+        out.push((stored.bytes(), stored.etag()));
+    }
+    out
+}
+
+/// After a grantee loses access, the grantee cleanup must not rewrite a key
+/// account owner's sealed events (`ShareRevokeCleanup` skips key-account
+/// owners, Task 6): every event keeps its row and content bytes and its
+/// ETag, and no record holds plaintext. Runs after
+/// `cleanup_cannot_restore_revoked_ring`, whose accounts it uses; the
+/// grantee wrote to the events before the revoke.
+pub async fn revoke_cleanup_does_not_rewrite_sealed_event(test: &mut TestServer) {
+    use crate::utils::za::{hold_task_consumer, plant_event, za_post};
+    println!("Running revoke cleanup sealed-event tests...");
+    let owner_id = test.account(REVOKE_OWNER).id().document_id();
+    let reader_id = test.account(REVOKE_READER).id().document_id();
+    let owner = DummyWebDavClient::new(owner_id, REVOKE_OWNER, STRONG, REVOKE_OWNER);
+    let reader = DummyWebDavClient::new(reader_id, REVOKE_READER, STRONG, REVOKE_READER);
+    owner
+        .request("MKCALENDAR", REVOKE_SEALED_CAL, MKCAL)
+        .await
+        .with_status(StatusCode::CREATED);
+    let mut ids = Vec::new();
+    for (name, uid) in [
+        ("one.ics", "revoke-sealed-1"),
+        ("two.ics", "revoke-sealed-2"),
+    ] {
+        owner
+            .request_with_headers(
+                "PUT",
+                &format!("{REVOKE_SEALED_CAL}{name}"),
+                [("content-type", "text/calendar")],
+                EVENT.replace("share-read-UID", uid),
+            )
+            .await
+            .with_status(StatusCode::CREATED);
+        ids.push(resource_id(test, owner_id, &format!("revoke-sealed/{name}")).await);
+    }
+    let key = test
+        .server
+        .za_served_public_key(reader_id)
+        .await
+        .unwrap()
+        .unwrap();
+    super::pinning::pin(
+        REVOKE_OWNER,
+        REVOKE_READER,
+        &vault::keys::display_fingerprint(&key),
+    )
+    .await
+    .expect(200);
+    za_post(
+        "shares/grant",
+        &serde_json::json!({"username": REVOKE_OWNER, "password": STRONG,
+            "calendar": "revoke-sealed", "address": REVOKE_READER, "level": "edit"}),
+    )
+    .await
+    .expect(200);
+    // The grantee writes: a sharee's PUT, and a dead property, the per-user
+    // and private data a cleanup would look for.
+    reader
+        .request_with_headers(
+            "PUT",
+            &format!("{REVOKE_SEALED_CAL}two.ics"),
+            [("content-type", "text/calendar")],
+            EVENT.replace("share-read-UID", "revoke-sealed-2").replace(
+                "share-read-private-summary",
+                "revoke-sealed-grantee-summary",
+            ),
+        )
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    reader
+        .request(
+            "PROPPATCH",
+            &format!("{REVOKE_SEALED_CAL}one.ics"),
+            "<D:propertyupdate xmlns:D=\"DAV:\" xmlns:X=\"urn:x-revoke\"><D:set><D:prop><X:note>revoke-sealed-note</X:note></D:prop></D:set></D:propertyupdate>",
+        )
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    test.wait_for_tasks().await;
+    let before = revoke_snapshot(test, owner_id, &ids).await;
+    let etags = [
+        owner
+            .request("GET", &format!("{REVOKE_SEALED_CAL}one.ics"), "")
+            .await
+            .etag()
+            .to_string(),
+        owner
+            .request("GET", &format!("{REVOKE_SEALED_CAL}two.ics"), "")
+            .await
+            .etag()
+            .to_string(),
+    ];
+    assert_eq!(etags[0], before[0].1);
+    assert_eq!(etags[1], before[1].1);
+
+    let held = hold_task_consumer(test).await;
+    za_post(
+        "shares/revoke",
+        &serde_json::json!({"username": REVOKE_OWNER, "password": STRONG,
+            "calendar": "revoke-sealed", "grant": reader_id}),
+    )
+    .await
+    .expect(200);
+    // The state the revoke's own commit left (a revoke may rewrap; the
+    // cleanup must not write at all), taken while the queued cleanup waits.
+    let revoked_state = revoke_snapshot(test, owner_id, &ids).await;
+    println!(
+        "revoke-sealed: the revoke queued {} cleanup task(s); its own commit {} the events",
+        revoke_cleanup_tasks(test, owner_id).await,
+        if revoked_state == before {
+            "kept"
+        } else {
+            "rewrote"
+        }
+    );
+    // Whatever upstream queued, one cleanup of this calendar is queued here
+    // too, due now, so the worker certainly runs over the key owner's
+    // events.
+    let calendar_id = resource_id(test, owner_id, "revoke-sealed").await;
+    let mut batch = store::write::BatchBuilder::new();
+    batch.schedule_task(registry::schema::structs::Task::ShareRevokeCleanup(
+        registry::schema::structs::TaskShareRevokeCleanup {
+            account_id: owner_id.into(),
+            document_id: calendar_id.into(),
+            object_type: registry::schema::enums::SharedObjectType::Calendar,
+            status: registry::schema::structs::TaskStatus::now(),
+        },
+    ));
+    test.server.store().write_batch(&mut batch).await.unwrap();
+    assert!(revoke_cleanup_tasks(test, owner_id).await >= 1);
+    drop(held);
+    test.server.notify_task_queue();
+    test.wait_for_tasks().await;
+    assert_eq!(
+        revoke_cleanup_tasks(test, owner_id).await,
+        0,
+        "the cleanup did not run"
+    );
+    revoke_refresh(test, &[owner_id, reader_id]);
+    assert_eq!(
+        revoke_snapshot(test, owner_id, &ids).await,
+        revoked_state,
+        "the grantee cleanup rewrote a key account's sealed event"
+    );
+    for (index, name) in ["one.ics", "two.ics"].into_iter().enumerate() {
+        let got = owner
+            .request("GET", &format!("{REVOKE_SEALED_CAL}{name}"), "")
+            .await
+            .with_status(StatusCode::OK);
+        assert_eq!(got.etag(), revoked_state[index].1);
+    }
+    // No record holds plaintext.
+    for (bytes, _) in &revoked_state {
+        for canary in [
+            "share-read-private-summary",
+            "revoke-sealed-grantee-summary",
+            "revoke-sealed-note",
+        ] {
+            assert!(!bytes.contains(canary), "{canary} in a stored record");
+        }
+    }
+    for id in &ids {
+        if let Some(container) =
+            crate::utils::za::shared_container(test, owner_id, Collection::CalendarEvent, *id).await
+        {
+            assert!(groupware::calendar::seal::is_sealed_container(&container));
+            assert!(!String::from_utf8_lossy(&container).contains("revoke-sealed-note"));
+        }
+    }
+    // Negative control: the same scan catches a planted plaintext event.
+    let planted = plant_event(
+        test,
+        owner_id,
+        "revoke-sealed",
+        "planted.ics",
+        &EVENT.replace("share-read-UID", "revoke-sealed-planted"),
+        None,
+    )
+    .await;
+    assert!(
+        revoke_snapshot(test, owner_id, &[planted]).await[0]
+            .0
+            .contains("share-read-private-summary"),
+        "the scan misses a plaintext event"
+    );
+
+    test.wait_for_tasks().await;
+    owner
+        .request("DELETE", REVOKE_SEALED_CAL, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    test.wait_for_tasks().await;
 }

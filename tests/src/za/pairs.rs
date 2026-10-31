@@ -15,7 +15,7 @@ use crate::utils::{
     za::{plant_event, plant_sealed_event, za_unlock},
 };
 use groupware::calendar::{
-    CalendarEvent,
+    CalendarEventContent,
     seal::{TOKEN_LEN, TokenPairs, archived_event_is_sealed, event_token_pairs},
 };
 use hyper::StatusCode;
@@ -189,7 +189,7 @@ pub async fn test(test: &mut TestServer) {
         .with_status(StatusCode::NO_CONTENT);
     let (archive, _) = raw_event(test, id, "default/pairs-legacy.ics").await;
     assert!(archived_event_is_sealed(
-        archive.unarchive::<CalendarEvent>().unwrap()
+        archive.unarchive::<CalendarEventContent>().unwrap()
     ));
     assert!(event_token_pairs(&archive, &keys, id).unwrap().is_none());
 

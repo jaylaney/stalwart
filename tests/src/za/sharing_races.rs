@@ -9,16 +9,17 @@ use super::{STRONG, uid_lease::put, user_permissions};
 use crate::utils::{
     server::TestServer,
     webdav::DummyWebDavClient,
-    za::{HookParked, za_unlock},
+    za::{HookParked, StoredEvent, stored_event, write_stored_event, za_unlock},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use common::za::test_hooks;
 use groupware::{
     cache::GroupwareCache,
     calendar::{
-        Calendar, CalendarEvent,
+        Calendar, CalendarEvent, CalendarEventContent,
         seal::{
-            calendar_view_in_domain, rewrap_event, seal_event_in_domain, unseal_event_in_domain,
+            ZaEvent, calendar_view_in_domain, rewrap_event, seal_event_in_domain,
+            unseal_event_in_domain,
         },
         sharing::{
             format::{
@@ -36,7 +37,7 @@ use hyper::StatusCode;
 use std::collections::BTreeMap;
 use store::{
     ValueKey,
-    write::{AlignedBytes, Archive, BatchBuilder},
+    write::{Archive, ArchiveBytes, BatchBuilder},
 };
 use types::collection::{Collection, SyncCollection};
 
@@ -45,13 +46,9 @@ const CAL: &str = "/dav/cal/race-owner%40example.com/race/";
 const MKCAL: &str = "<C:mkcalendar xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:set><D:prop><D:displayname>Race</D:displayname></D:prop></D:set></C:mkcalendar>";
 const EVENT: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//race//EN\r\nBEGIN:VEVENT\r\nUID:race-create\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990102T090000Z\r\nDTEND:20990102T100000Z\r\nSUMMARY:race-private\r\nBEGIN:VALARM\r\nACTION:EMAIL\r\nTRIGGER:-PT10M\r\nATTENDEE:mailto:race-owner@example.com\r\nSUMMARY:race-alarm\r\nDESCRIPTION:race-alarm-private\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 
-async fn event_archive(test: &TestServer, owner: u32, id: u32) -> Archive<AlignedBytes> {
-    test.server
-        .store()
-        .get_value(ValueKey::archive(owner, Collection::CalendarEvent, id))
-        .await
-        .unwrap()
-        .unwrap()
+/// The event's row and content (1.0's split records).
+async fn event_archive(test: &TestServer, owner: u32, id: u32) -> StoredEvent {
+    stored_event(test, owner, id).await
 }
 
 async fn stage(test: &TestServer, owner: u32, calendar_id: u32, generation: u32) {
@@ -145,11 +142,7 @@ async fn stage_grant(
     let mut batch = BatchBuilder::new();
     calendar
         .update(
-            test.server
-                .account_info(owner)
-                .await
-                .unwrap()
-                .account_tenant_ids(),
+            test.server.account_info(owner).await.unwrap().changed_by(),
             old.stored.to_unarchived::<Calendar>().unwrap(),
             owner,
             calendar_id,
@@ -159,28 +152,36 @@ async fn stage_grant(
     test.server.commit_batch(batch).await.unwrap();
 }
 
-async fn save_event(
+/// 0.16's `CalendarEvent::update_at` into `batch`: upstream's full split
+/// update over the stored records at `timestamp`, uncommitted.
+async fn update_at(
     test: &TestServer,
     owner: u32,
     id: u32,
-    stored: &Archive<AlignedBytes>,
-    event: CalendarEvent,
+    stored: &StoredEvent,
+    event: ZaEvent,
+    timestamp: i64,
+    batch: &mut BatchBuilder,
 ) {
-    let mut batch = BatchBuilder::new();
-    event
-        .update(
-            test.server
-                .account_info(owner)
-                .await
-                .unwrap()
-                .account_tenant_ids(),
-            stored.to_unarchived::<CalendarEvent>().unwrap(),
-            owner,
-            id,
-            &mut batch,
-        )
-        .unwrap();
-    test.server.commit_batch(batch).await.unwrap();
+    let (meta, content) = event.into_parts();
+    meta.update_full_at(
+        content,
+        test.server.account_info(owner).await.unwrap().changed_by(),
+        stored.meta.to_unarchived::<CalendarEvent>().unwrap(),
+        stored.content.unarchive::<CalendarEventContent>().unwrap(),
+        owner,
+        id,
+        None,
+        timestamp,
+        batch,
+    )
+    .unwrap();
+}
+
+/// 0.16's `CalendarEvent::update` over the stored records: upstream's full
+/// split update, conditional on the stored row.
+async fn save_event(test: &TestServer, owner: u32, id: u32, stored: &StoredEvent, event: ZaEvent) {
+    write_stored_event(test, owner, id, stored, event).await;
 }
 
 fn put_response(
@@ -220,15 +221,15 @@ async fn alarm_task(
         .store()
         .get_value(ValueKey::from(store::write::ValueClass::TaskQueue(
             store::write::TaskQueueClass::Task {
-                id: types::id::Id::from_parts(owner, id).id(),
+                id: store::write::TaskId::Assigned(types::id::Id::from_parts(owner, id).id()),
             },
         )))
         .await
         .unwrap()
 }
 
-fn generation(event: &CalendarEvent) -> u32 {
-    let text = event.data.event.to_string().replace("\r\n ", "");
+fn generation(event: &ZaEvent) -> u32 {
+    let text = event.content.data.event.to_string().replace("\r\n ", "");
     let encoded = text
         .lines()
         .find_map(|line| line.strip_prefix("X-ZA-KEY:"))
@@ -260,7 +261,7 @@ pub async fn test(test: &mut TestServer) {
         .with_status(StatusCode::CREATED);
     let resources = test
         .server
-        .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner_id, owner_id, SyncCollection::Calendar)
         .await
         .unwrap();
     let calendar_id = resources.by_path("race").unwrap().document_id();
@@ -277,7 +278,7 @@ pub async fn test(test: &mut TestServer) {
     assert_eq!(response.status.as_u16(), 201);
     let resources = test
         .server
-        .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner_id, owner_id, SyncCollection::Calendar)
         .await
         .unwrap();
     let id = resources
@@ -285,41 +286,33 @@ pub async fn test(test: &mut TestServer) {
         .unwrap()
         .document_id();
     let committed = event_archive(test, owner_id, id).await;
-    let metadata = committed.deserialize::<CalendarEvent>().unwrap();
+    let metadata = committed.za_event().meta;
     assert!(
         metadata.created <= held_at && metadata.modified <= held_at,
         "retry advanced the original creation/modified timestamp"
     );
     assert_eq!(metadata.created, metadata.modified);
-    let alarm = committed
-        .unarchive::<CalendarEvent>()
-        .unwrap()
-        .data
-        .next_alarm(
-            store::write::now() as i64,
-            calcard::common::timezone::Tz::Floating,
-        )
-        .unwrap();
+    let alarm_time = committed
+        .next_alarm_time(test, owner_id, calendar_id)
+        .await
+        .expect("the event's next email alarm");
     match alarm_task(test, owner_id, id).await.unwrap() {
         registry::schema::structs::Task::CalendarAlarmEmail(task) => {
             assert_eq!(task.account_id.document_id(), owner_id);
             assert_eq!(task.document_id.document_id(), id);
             match task.status {
                 registry::schema::structs::TaskStatus::Pending(status) => {
-                    assert_eq!(status.due.timestamp(), alarm.alarm_time)
+                    assert_eq!(status.due.timestamp(), alarm_time)
                 }
                 _ => panic!("future alarm task lost its pending state"),
             }
         }
         _ => panic!("retry did not retain its email alarm task"),
     }
-    assert_eq!(
-        generation(&committed.deserialize::<CalendarEvent>().unwrap()),
-        1
-    );
+    assert_eq!(generation(&committed.za_event()), 1);
     assert_eq!(
         response.header("etag"),
-        Some(format!("\"{}\"", committed.version.hash().unwrap()).as_str()),
+        Some(committed.etag().as_str()),
         "create returned the discarded first-attempt ETag"
     );
     // Case 21's update variant: an already opened EWK event crosses conversion.
@@ -336,7 +329,7 @@ pub async fn test(test: &mut TestServer) {
     );
     let resources = test
         .server
-        .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner_id, owner_id, SyncCollection::Calendar)
         .await
         .unwrap();
     let update_calendar = resources.by_path("race-update").unwrap().document_id();
@@ -358,12 +351,7 @@ pub async fn test(test: &mut TestServer) {
     stage(test, owner_id, update_calendar, 1).await;
     assert_eq!(parked.finish().await, 204);
     assert_eq!(
-        generation(
-            &event_archive(test, owner_id, update_id)
-                .await
-                .deserialize::<CalendarEvent>()
-                .unwrap()
-        ),
+        generation(&event_archive(test, owner_id, update_id).await.za_event()),
         1
     );
 
@@ -382,12 +370,7 @@ pub async fn test(test: &mut TestServer) {
     stage(test, owner_id, update_calendar, 2).await;
     assert_eq!(parked.finish().await, 204);
     assert_eq!(
-        generation(
-            &event_archive(test, owner_id, update_id)
-                .await
-                .deserialize::<CalendarEvent>()
-                .unwrap()
-        ),
+        generation(&event_archive(test, owner_id, update_id).await.za_event()),
         2
     );
 
@@ -457,7 +440,7 @@ async fn calendar_retry_keeps_event_and_uid_assertions(
     )
     .await;
     let stored = event_archive(test, owner, id).await;
-    let mut concurrent = stored.deserialize::<CalendarEvent>().unwrap();
+    let mut concurrent = stored.za_event();
     concurrent.flags ^= 1;
     save_event(test, owner, id, &stored, concurrent.clone()).await;
     stage(test, owner, calendar, 2).await;
@@ -467,11 +450,7 @@ async fn calendar_retry_keeps_event_and_uid_assertions(
         "calendar retry overwrote a concurrent event"
     );
     assert_eq!(
-        event_archive(test, owner, id)
-            .await
-            .deserialize::<CalendarEvent>()
-            .unwrap()
-            .flags,
+        event_archive(test, owner, id).await.za_event().flags,
         concurrent.flags
     );
 
@@ -517,14 +496,30 @@ async fn non_put_writers_use_current_domain(
         .await
         .with_status(StatusCode::MULTI_STATUS);
     let stored = event_archive(test, owner, id).await;
-    let mut event = stored.deserialize::<CalendarEvent>().unwrap();
+    let mut event = stored.za_event();
     assert_eq!(generation(&event), 2);
     let keys = za_unlock(test, owner, STRONG).await;
     let context = za_owned_calendar_context(&test.server, &keys, calendar)
         .await
         .unwrap();
     unseal_event_in_domain(&mut event, &context.domain).unwrap();
-    assert!(!event.dead_properties.0.is_empty());
+    // At 1.0 the event's dead properties are its shared metadata container,
+    // sealed under the calendar's current collection key.
+    let container = crate::utils::za::shared_container(test, owner, Collection::CalendarEvent, id)
+        .await
+        .expect("the event's dead-property container");
+    assert_eq!(
+        groupware::calendar::seal::container_is_ck(&container),
+        Some(true)
+    );
+    let uid = event.meta.uid.clone();
+    let opened = groupware::calendar::seal::open_container(
+        &container,
+        &context.domain,
+        groupware::calendar::seal::ZaContainerOf::Event(&uid),
+    )
+    .unwrap();
+    assert!(String::from_utf8_lossy(&opened).contains("race-property"));
 
     // Linked-write refusal holds through both paths, while unlink-only recovery
     // remains possible without opening or resealing the source.
@@ -535,11 +530,11 @@ async fn non_put_writers_use_current_domain(
         .with_status(StatusCode::CREATED);
     let resources = test
         .server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap();
     let other_id = resources.by_path("race-other").unwrap().document_id();
-    let mut linked = stored.deserialize::<CalendarEvent>().unwrap();
+    let mut linked = stored.za_event();
     let other_context = za_owned_calendar_context(&test.server, &keys, other_id)
         .await
         .unwrap();
@@ -576,8 +571,8 @@ async fn non_put_writers_use_current_domain(
     assert!(
         event_archive(test, owner, id)
             .await
-            .deserialize::<CalendarEvent>()
-            .unwrap()
+            .za_event()
+            .meta
             .names
             .len()
             == 1
@@ -602,7 +597,7 @@ async fn non_put_writers_use_current_domain(
     assert!(
         test.server
             .store()
-            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
                 owner,
                 Collection::CalendarEvent,
                 id
@@ -726,7 +721,7 @@ async fn second_create_loss(test: &TestServer, owner: u32, calendar: u32) {
             replacement.assert_in(&mut fenced);
             test.server
                 .store()
-                .write(fenced.build_all())
+                .write_batch(&mut fenced)
                 .await
                 .expect("opaque cleanup removed or changed its successor fence");
             assert!(
@@ -777,7 +772,7 @@ async fn grantee_commit_seams(test: &mut TestServer, owner: u32, calendar: u32, 
         .unwrap()
         .unwrap();
     let stored = event_archive(test, owner, id).await;
-    let mut event = stored.deserialize::<CalendarEvent>().unwrap();
+    let mut event = stored.za_event();
     let mut pairs = unseal_event_in_domain(&mut event, &before.domain)
         .unwrap()
         .unwrap_or_default();
@@ -788,21 +783,16 @@ async fn grantee_commit_seams(test: &mut TestServer, owner: u32, calendar: u32, 
     let timestamp = 123456789;
     let mut batch = BatchBuilder::new();
     before.assert_in(&mut batch);
-    event
-        .clone()
-        .update_at(
-            test.server
-                .account_info(owner)
-                .await
-                .unwrap()
-                .account_tenant_ids(),
-            stored.to_unarchived::<CalendarEvent>().unwrap(),
-            owner,
-            id,
-            timestamp,
-            &mut batch,
-        )
-        .unwrap();
+    update_at(
+        test,
+        owner,
+        id,
+        &stored,
+        event.clone(),
+        timestamp,
+        &mut batch,
+    )
+    .await;
     stage_grant(test, owner, calendar, 6, Some(reader_id)).await;
     assert!(
         test.server
@@ -823,47 +813,44 @@ async fn grantee_commit_seams(test: &mut TestServer, owner: u32, calendar: u32, 
     assert_eq!(generation(&event), 6);
     let mut payload_before = sealed_before.clone();
     let mut payload_after = event.clone();
-    payload_before.data.event.components[0].entries.pop();
-    payload_after.data.event.components[0].entries.pop();
+    payload_before.content.data.event.components[0]
+        .entries
+        .pop();
+    payload_after.content.data.event.components[0].entries.pop();
     assert_eq!(
         payload_after, payload_before,
         "retry changed sealed payload, pairs, metadata or alarms"
     );
     let mut batch = BatchBuilder::new();
     after.assert_in(&mut batch);
-    event
-        .clone()
-        .update_at(
-            test.server
-                .account_info(owner)
-                .await
-                .unwrap()
-                .account_tenant_ids(),
-            stored.to_unarchived::<CalendarEvent>().unwrap(),
-            owner,
-            id,
-            timestamp,
-            &mut batch,
-        )
-        .unwrap();
+    update_at(
+        test,
+        owner,
+        id,
+        &stored,
+        event.clone(),
+        timestamp,
+        &mut batch,
+    )
+    .await;
     test.server.commit_batch(batch).await.unwrap();
-    let committed = event_archive(test, owner, id)
-        .await
-        .deserialize::<CalendarEvent>()
-        .unwrap();
-    assert_eq!(committed.modified, timestamp);
+    let committed = event_archive(test, owner, id).await.za_event();
+    assert_eq!(committed.meta.modified, timestamp);
     assert_eq!(
         alarm_task(test, owner, id).await,
         Some(alarm_before),
         "retry changed alarm queue values"
     );
-    assert_eq!(committed.created, event.created);
-    assert_eq!(committed.data, event.data);
+    assert_eq!(committed.meta.created, event.meta.created);
+    assert_eq!(committed.content.data, event.content.data);
     assert!(
-        !committed.data.alarms.is_empty(),
+        !committed.content.data.alarms.is_empty(),
         "the preservation fixture needs an alarm"
     );
-    assert_eq!(committed.data.alarms, sealed_before.data.alarms);
+    assert_eq!(
+        committed.content.data.alarms,
+        sealed_before.content.data.alarms
+    );
     let mut opened = committed.clone();
     let restored = unseal_event_in_domain(&mut opened, &after.domain)
         .unwrap()
@@ -884,7 +871,7 @@ async fn grantee_commit_seams(test: &mut TestServer, owner: u32, calendar: u32, 
     // C1: requested shared path is authorized; the other parent is private.
     let resources = test
         .server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap();
     let private_parent = resources.by_path("default").unwrap().document_id();
@@ -926,36 +913,35 @@ async fn grantee_commit_seams(test: &mut TestServer, owner: u32, calendar: u32, 
         let mut batch = BatchBuilder::new();
         context.assert_in(&mut batch);
         if remove {
-            groupware::DestroyArchive(stored.to_unarchived::<CalendarEvent>().unwrap())
-                .delete_za(
+            // 1.0's `delete_za_at` reads the content it is given (the
+            // stored archive) and takes the domain alone.
+            groupware::DestroyArchive(stored.meta.to_unarchived::<CalendarEvent>().unwrap())
+                .delete_za_at(
+                    &test.server,
                     &test.server.account_info(owner).await.unwrap(),
                     owner,
                     id,
                     calendar,
+                    Some(stored.content.clone()),
                     None,
                     false,
-                    token.session_keys().map(|keys| keys.as_ref()),
                     Some(&context.domain),
+                    store::write::now() as i64,
                     &mut batch,
                 )
+                .await
                 .unwrap();
         } else {
-            stored
-                .deserialize::<CalendarEvent>()
-                .unwrap()
-                .update_at(
-                    test.server
-                        .account_info(owner)
-                        .await
-                        .unwrap()
-                        .account_tenant_ids(),
-                    stored.to_unarchived::<CalendarEvent>().unwrap(),
-                    owner,
-                    id,
-                    timestamp,
-                    &mut batch,
-                )
-                .unwrap();
+            update_at(
+                test,
+                owner,
+                id,
+                &stored,
+                stored.za_event(),
+                timestamp,
+                &mut batch,
+            )
+            .await;
         }
         stage(test, owner, calendar, 7).await;
         assert!(
@@ -1052,7 +1038,7 @@ async fn drain_and_contacts_use_current_domain(
     let recipient = DummyWebDavClient::new(receiver, RECEIVER, STRONG, RECEIVER);
     let resources = test
         .server
-        .fetch_dav_resources(receiver, receiver, SyncCollection::Calendar)
+        .fetch_groupware_resources(receiver, receiver, SyncCollection::Calendar)
         .await
         .unwrap();
     let target = resources.by_path("default").unwrap().document_id();
@@ -1103,12 +1089,7 @@ async fn drain_and_contacts_use_current_domain(
         .unwrap();
     let event_id = hits.iter().next().unwrap();
     assert_eq!(
-        generation(
-            &event_archive(test, receiver, event_id)
-                .await
-                .deserialize::<CalendarEvent>()
-                .unwrap()
-        ),
+        generation(&event_archive(test, receiver, event_id).await.za_event()),
         2,
         "drain import used the account EWK"
     );
@@ -1125,19 +1106,14 @@ async fn drain_and_contacts_use_current_domain(
     );
     assert_eq!(trigger_drain(RECEIVER, STRONG).await, 207);
     assert_eq!(
-        generation(
-            &event_archive(test, receiver, event_id)
-                .await
-                .deserialize::<CalendarEvent>()
-                .unwrap()
-        ),
+        generation(&event_archive(test, receiver, event_id).await.za_event()),
         3,
         "drain merge used an old key domain"
     );
 
     let source_resources = test
         .server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap();
     let source_id = source_resources
@@ -1157,12 +1133,7 @@ async fn drain_and_contacts_use_current_domain(
     assert_eq!(reply["delivered"], 1);
     assert_eq!(reply["failed"], 0);
     assert_eq!(
-        generation(
-            &event_archive(test, owner, source_id)
-                .await
-                .deserialize::<CalendarEvent>()
-                .unwrap()
-        ),
+        generation(&event_archive(test, owner, source_id).await.za_event()),
         8
     );
 
@@ -1198,12 +1169,7 @@ async fn drain_and_contacts_use_current_domain(
     assert_eq!(reply["failed"], 0);
     assert_eq!(reply["remaining"], 1);
     assert_eq!(
-        generation(
-            &event_archive(test, owner, source_id)
-                .await
-                .deserialize::<CalendarEvent>()
-                .unwrap()
-        ),
+        generation(&event_archive(test, owner, source_id).await.za_event()),
         8
     );
     assert!(
@@ -1224,7 +1190,7 @@ async fn drain_and_contacts_use_current_domain(
         .with_status(StatusCode::CREATED);
     let resources = test
         .server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap();
     let other_id = resources
@@ -1232,7 +1198,7 @@ async fn drain_and_contacts_use_current_domain(
         .unwrap()
         .document_id();
     let stored = event_archive(test, owner, source_id).await;
-    let mut linked = stored.deserialize::<CalendarEvent>().unwrap();
+    let mut linked = stored.za_event();
     linked.names.push(common::DavName {
         name: "linked.ics".into(),
         parent_id: other_id,
@@ -1295,7 +1261,7 @@ async fn delete_retry_keeps_due_alarm(test: &TestServer, owner: u32, calendar: u
     assert_eq!(put(OWNER, STRONG, path.clone(), body).await, 201);
     let resources = test
         .server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap();
     let event_id = resources
@@ -1340,7 +1306,7 @@ async fn delete_retry_keeps_due_alarm(test: &TestServer, owner: u32, calendar: u
     assert!(
         test.server
             .store()
-            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
                 owner,
                 Collection::CalendarEvent,
                 event_id
@@ -1387,7 +1353,7 @@ async fn task5_boundary_and_copy_races(test: &mut TestServer) {
     }
     let resources = test
         .server
-        .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner_id, owner_id, SyncCollection::Calendar)
         .await
         .unwrap();
     let a = resources.by_path("a").unwrap().document_id();
@@ -1407,7 +1373,7 @@ async fn task5_boundary_and_copy_races(test: &mut TestServer) {
                     .account_info(keys.account_id)
                     .await
                     .unwrap()
-                    .account_tenant_ids(),
+                    .changed_by(),
                 context.stored.to_unarchived::<Calendar>().unwrap(),
                 keys.account_id,
                 id,
@@ -1638,7 +1604,7 @@ async fn task5_boundary_and_copy_races(test: &mut TestServer) {
         .with_status(StatusCode::CREATED);
     let event_id = test
         .server
-        .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner_id, owner_id, SyncCollection::Calendar)
         .await
         .unwrap()
         .by_path("a/race.ics")
@@ -1661,16 +1627,16 @@ async fn task5_boundary_and_copy_races(test: &mut TestServer) {
     assert_eq!(
         event_archive(test, owner_id, event_id)
             .await
-            .deserialize::<CalendarEvent>()
-            .unwrap()
+            .za_event()
+            .meta
             .names
             .len(),
         1
     );
     // Another stored parent is shared: COPY through the unshared path and collection COPY both refuse.
     let stored = event_archive(test, owner_id, event_id).await;
-    let mut event = stored.deserialize::<CalendarEvent>().unwrap();
-    event.names.push(common::DavName {
+    let mut event = stored.za_event();
+    event.meta.names.push(common::DavName {
         name: "linked.ics".into(),
         parent_id: b,
     });
@@ -1706,7 +1672,7 @@ async fn task5_boundary_and_copy_races(test: &mut TestServer) {
     }
     let source_resources = test
         .server
-        .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner_id, owner_id, SyncCollection::Calendar)
         .await
         .unwrap();
     let mut original_children = Vec::new();
@@ -1718,7 +1684,7 @@ async fn task5_boundary_and_copy_races(test: &mut TestServer) {
         original_children.push((
             resource.document_id(),
             stored.version,
-            stored.deserialize::<CalendarEvent>().unwrap().names,
+            stored.za_event().meta.names,
         ));
     }
     let copying = async move {
@@ -1735,7 +1701,7 @@ async fn task5_boundary_and_copy_races(test: &mut TestServer) {
     let parked = HookParked::start(owner_id, test_hooks::set_copy_pause, copying).await;
     let resources = test
         .server
-        .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner_id, owner_id, SyncCollection::Calendar)
         .await
         .unwrap();
     let target = resources.by_path("split-target").unwrap().document_id();
@@ -1753,14 +1719,14 @@ async fn task5_boundary_and_copy_races(test: &mut TestServer) {
             "COPY committed a child despite destination conversion"
         );
         assert_eq!(
-            stored.deserialize::<CalendarEvent>().unwrap().names,
+            stored.za_event().meta.names,
             names,
             "COPY left a forbidden destination link"
         );
     }
     let resources = test
         .server
-        .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner_id, owner_id, SyncCollection::Calendar)
         .await
         .unwrap();
     assert_eq!(
@@ -1819,7 +1785,7 @@ async fn task5_boundary_and_copy_races(test: &mut TestServer) {
         .with_status(StatusCode::OK);
     let resources = test
         .server
-        .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner_id, owner_id, SyncCollection::Calendar)
         .await
         .unwrap();
     assert!(resources.by_path("collection-source").is_none());
@@ -1899,7 +1865,7 @@ async fn overwrite_other_parent_fences(test: &TestServer, owner: u32, client: &D
     }
     let resources = test
         .server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap();
     let ow_other = resources.by_path("ow-other").unwrap().document_id();
@@ -1949,10 +1915,7 @@ async fn overwrite_other_parent_fences(test: &TestServer, owner: u32, client: &D
         Some(false)
     );
     assert_eq!(moved, StatusCode::NO_CONTENT);
-    let survivor = event_archive(test, owner, ow_target)
-        .await
-        .deserialize::<CalendarEvent>()
-        .unwrap();
+    let survivor = event_archive(test, owner, ow_target).await.za_event();
     assert_eq!(survivor.names.len(), 1);
     assert_eq!(survivor.names[0].parent_id, ow_other);
     // Collection overwrite has no replay of creation; its pre-creation unlink
@@ -2035,7 +1998,7 @@ async fn collection_move_conversion_policy(
         }
         let resources = test
             .server
-            .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+            .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
             .await
             .unwrap();
         let source_id = resources.by_path(&source_slug).unwrap().document_id();
@@ -2046,7 +2009,7 @@ async fn collection_move_conversion_policy(
             originals.push((
                 event.document_id(),
                 stored.version,
-                stored.deserialize::<CalendarEvent>().unwrap().names,
+                stored.za_event().meta.names,
             ));
         }
         let from = format!("{HOME}{source_slug}/");
@@ -2067,12 +2030,11 @@ async fn collection_move_conversion_policy(
         let mut unchanged = true;
         for (id, version, names) in originals {
             let stored = event_archive(test, owner, id).await;
-            unchanged &= stored.version == version
-                && stored.deserialize::<CalendarEvent>().unwrap().names == names;
+            unchanged &= stored.version == version && stored.za_event().meta.names == names;
         }
         let resources = test
             .server
-            .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+            .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
             .await
             .unwrap();
         let source_retained = resources
@@ -2168,7 +2130,7 @@ async fn overwrite_grantee_unlink_authority(
             .with_status(StatusCode::CREATED);
         let resources = test
             .server
-            .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+            .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
             .await
             .unwrap();
         let a = resources.by_path(&slugs[0]).unwrap().document_id();
@@ -2219,7 +2181,7 @@ async fn overwrite_grantee_unlink_authority(
         }
 
         let source_stored = event_archive(test, owner, source).await;
-        let mut source_event = source_stored.deserialize::<CalendarEvent>().unwrap();
+        let mut source_event = source_stored.za_event();
         rewrap_event(&mut source_event, &old_a.domain, &new_a.domain).unwrap();
         save_event(test, owner, source, &source_stored, source_event).await;
         assert!(
@@ -2238,7 +2200,7 @@ async fn overwrite_grantee_unlink_authority(
         );
         let original_source = event_archive(test, owner, source).await;
         let original_target = event_archive(test, owner, target).await;
-        let old_target = original_target.deserialize::<CalendarEvent>().unwrap();
+        let old_target = original_target.za_event();
         let moving_slugs = slugs.clone();
         let moving = async move {
             let response = crate::utils::za::sharing_dav_request(
@@ -2260,7 +2222,7 @@ async fn overwrite_grantee_unlink_authority(
         };
         let response = if retry {
             let parked = HookParked::start(owner, test_hooks::set_copy_pause, moving).await;
-            let private: Archive<AlignedBytes> = test
+            let private: Archive<ArchiveBytes> = test
                 .server
                 .store()
                 .get_value(ValueKey::archive(owner, Collection::Calendar, c))
@@ -2274,11 +2236,7 @@ async fn overwrite_grantee_unlink_authority(
             let mut batch = BatchBuilder::new();
             changed
                 .update(
-                    test.server
-                        .account_info(owner)
-                        .await
-                        .unwrap()
-                        .account_tenant_ids(),
+                    test.server.account_info(owner).await.unwrap().changed_by(),
                     private.to_unarchived::<Calendar>().unwrap(),
                     owner,
                     c,
@@ -2286,7 +2244,7 @@ async fn overwrite_grantee_unlink_authority(
                 )
                 .unwrap();
             test.server.commit_batch(batch).await.unwrap();
-            let fresh_private: Archive<AlignedBytes> = test
+            let fresh_private: Archive<ArchiveBytes> = test
                 .server
                 .store()
                 .get_value(ValueKey::archive(owner, Collection::Calendar, c))
@@ -2326,31 +2284,19 @@ async fn overwrite_grantee_unlink_authority(
             Some(false),
             "Bob HTTP overwrite must preserve the outer no-CANCEL Option"
         );
-        let surviving = event_archive(test, owner, target)
-            .await
-            .deserialize::<CalendarEvent>()
-            .unwrap();
-        assert_eq!(surviving.names.len(), 1);
-        assert_eq!(surviving.names[0].parent_id, c);
+        let surviving = event_archive(test, owner, target).await.za_event();
+        assert_eq!(surviving.meta.names.len(), 1);
+        assert_eq!(surviving.meta.names[0].parent_id, c);
         assert_eq!(
-            surviving.data.event.to_string(),
-            old_target.data.event.to_string()
+            surviving.content.data.event.to_string(),
+            old_target.content.data.event.to_string()
         );
-        assert_eq!(surviving.created, old_target.created);
-        assert_eq!(surviving.modified, old_target.modified);
-        let moved = event_archive(test, owner, source)
-            .await
-            .deserialize::<CalendarEvent>()
-            .unwrap();
-        assert_eq!(moved.names.len(), 1);
-        assert_eq!(moved.names[0].parent_id, b);
-        assert_eq!(
-            moved.created,
-            original_source
-                .deserialize::<CalendarEvent>()
-                .unwrap()
-                .created
-        );
+        assert_eq!(surviving.meta.created, old_target.meta.created);
+        assert_eq!(surviving.meta.modified, old_target.meta.modified);
+        let moved = event_archive(test, owner, source).await.za_event();
+        assert_eq!(moved.meta.names.len(), 1);
+        assert_eq!(moved.meta.names[0].parent_id, b);
+        assert_eq!(moved.meta.created, original_source.za_event().meta.created);
         println!(
             "Task5 grantee overwrite private parent: retry={retry}, status204, private access denied, payload preserved"
         );
@@ -2449,7 +2395,7 @@ async fn sharing_http_races(test: &mut TestServer) {
         let slug = slug.to_owned();
         async move {
             server
-                .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+                .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
                 .await
                 .unwrap()
                 .by_path(&slug)
@@ -2685,7 +2631,7 @@ async fn sharing_http_races(test: &mut TestServer) {
                 .await
                 .unwrap();
             let stored = event_archive(test, owner, event).await;
-            let mut linked = stored.deserialize::<CalendarEvent>().unwrap();
+            let mut linked = stored.za_event();
             linked.names.push(common::DavName {
                 name: format!("{class}-copy.ics"),
                 parent_id: other,
@@ -2917,7 +2863,7 @@ async fn sharing_terminal_contracts(test: &TestServer, owner: u32, client: &Dumm
             .with_status(StatusCode::CREATED);
         let id = test
             .server
-            .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+            .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
             .await
             .unwrap()
             .by_path(&slug)
@@ -2975,7 +2921,7 @@ async fn sharing_terminal_contracts(test: &TestServer, owner: u32, client: &Dumm
         if let Some((class, bytes)) = account {
             let mut batch = BatchBuilder::new();
             batch.set(class, bytes);
-            test.server.store().write(batch.build_all()).await.unwrap();
+            test.server.store().write_batch(&mut batch).await.unwrap();
         }
         set_share_init_assert_fail(None);
         za_post("shares/grant", &request(&slug)).await.expect(200);
@@ -2993,7 +2939,7 @@ async fn sharing_terminal_contracts(test: &TestServer, owner: u32, client: &Dumm
         .with_status(StatusCode::CREATED);
     let id = test
         .server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap()
         .by_path(slug)
@@ -3026,11 +2972,7 @@ async fn sharing_terminal_contracts(test: &TestServer, owner: u32, client: &Dumm
     let mut batch = BatchBuilder::new();
     calendar
         .update(
-            test.server
-                .account_info(owner)
-                .await
-                .unwrap()
-                .account_tenant_ids(),
+            test.server.account_info(owner).await.unwrap().changed_by(),
             context.stored.to_unarchived::<Calendar>().unwrap(),
             owner,
             id,
@@ -3160,7 +3102,7 @@ async fn sharing_destruction_contracts(test: &mut TestServer) {
     }
     let id = test
         .server
-        .fetch_dav_resources(owner_id, owner_id, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner_id, owner_id, SyncCollection::Calendar)
         .await
         .unwrap()
         .by_path("destroy")
@@ -3495,7 +3437,7 @@ async fn sharing_boundary_error_contract(
         .with_status(StatusCode::CREATED);
     let id = test
         .server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap()
         .by_path("boundary-error")
@@ -3538,11 +3480,7 @@ async fn sharing_boundary_error_contract(
     let mut batch = BatchBuilder::new();
     corrupted
         .update(
-            test.server
-                .account_info(owner)
-                .await
-                .unwrap()
-                .account_tenant_ids(),
+            test.server.account_info(owner).await.unwrap().changed_by(),
             context.stored.to_unarchived::<Calendar>().unwrap(),
             owner,
             id,
@@ -3558,18 +3496,14 @@ async fn sharing_boundary_error_contract(
     let current = test
         .server
         .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(owner, Collection::Calendar, id))
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(owner, Collection::Calendar, id))
         .await
         .unwrap()
         .unwrap();
     let mut batch = BatchBuilder::new();
     original
         .update(
-            test.server
-                .account_info(owner)
-                .await
-                .unwrap()
-                .account_tenant_ids(),
+            test.server.account_info(owner).await.unwrap().changed_by(),
             current.to_unarchived::<Calendar>().unwrap(),
             owner,
             id,
@@ -3598,7 +3532,7 @@ async fn sharing_count_delta_contract(test: &TestServer, owner: u32, client: &Du
         .with_status(StatusCode::CREATED);
     let id = test
         .server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap()
         .by_path("count-deltas")
@@ -3626,7 +3560,7 @@ async fn sharing_count_delta_contract(test: &TestServer, owner: u32, client: &Du
         .unwrap();
     for event in &events {
         let stored = event_archive(test, owner, *event).await;
-        let mut converted = stored.deserialize::<CalendarEvent>().unwrap();
+        let mut converted = stored.za_event();
         rewrap_event(&mut converted, &context.domain, &context.domain).unwrap();
         save_event(test, owner, *event, &stored, converted).await;
     }
@@ -3660,11 +3594,7 @@ async fn sharing_count_delta_contract(test: &TestServer, owner: u32, client: &Du
     let mut batch = BatchBuilder::new();
     calendar
         .update(
-            test.server
-                .account_info(owner)
-                .await
-                .unwrap()
-                .account_tenant_ids(),
+            test.server.account_info(owner).await.unwrap().changed_by(),
             context.stored.to_unarchived::<Calendar>().unwrap(),
             owner,
             id,
@@ -3693,13 +3623,11 @@ async fn sharing_count_delta_contract(test: &TestServer, owner: u32, client: &Du
             .request("GET", &format!("{path}{index}.ics"), "")
             .await
             .with_status(StatusCode::OK);
-        let mut stored = event_archive(test, owner, *event)
-            .await
-            .deserialize::<CalendarEvent>()
-            .unwrap();
+        let mut stored = event_archive(test, owner, *event).await.za_event();
         unseal_event_in_domain(&mut stored, &fresh.domain).unwrap();
         assert!(
             stored
+                .content
                 .data
                 .event
                 .to_string()
@@ -3728,7 +3656,7 @@ async fn sharing_event_terminal_contract(
         .with_status(StatusCode::CREATED);
     let id = test
         .server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap()
         .by_path("terminal-event")
@@ -3755,7 +3683,7 @@ async fn sharing_event_terminal_contract(
     )
     .await;
     let stored = event_archive(test, owner, last).await;
-    let mut changed = stored.deserialize::<CalendarEvent>().unwrap();
+    let mut changed = stored.za_event();
     changed.modified += 1;
     save_event(test, owner, last, &stored, changed).await;
     let old = test.server.za_vault_record(owner).await.unwrap().unwrap();
@@ -3772,7 +3700,7 @@ async fn sharing_event_terminal_contract(
     );
     let mut batch = BatchBuilder::new();
     batch.set(class, bytes);
-    test.server.store().write(batch.build_all()).await.unwrap();
+    test.server.store().write_batch(&mut batch).await.unwrap();
     assert_eq!(
         za_post("shares/grant", &request).await.expect(200)["sealed"],
         1
@@ -3804,7 +3732,7 @@ async fn sharing_changed_attribution_contract(
             .with_status(StatusCode::CREATED);
         let id = test
             .server
-            .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+            .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
             .await
             .unwrap()
             .by_path(slug)
@@ -3881,7 +3809,7 @@ async fn sharing_dav_copy_after_precheck_contract(
     .await;
     let resources = test
         .server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap();
     let source = resources
@@ -3920,7 +3848,7 @@ async fn sharing_dav_copy_after_precheck_contract(
         .with_status(StatusCode::OK);
     let committed = test
         .server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap();
     assert_eq!(
@@ -3932,7 +3860,7 @@ async fn sharing_dav_copy_after_precheck_contract(
     );
     let linked = event_archive(test, owner, event).await;
     assert_ne!(linked.version, original.version);
-    let names = linked.deserialize::<CalendarEvent>().unwrap().names;
+    let names = linked.za_event().meta.names;
     assert_eq!(names.len(), 2);
     assert!(names.iter().any(|n| n.parent_id == source));
     assert!(names.iter().any(|n| n.parent_id == destination));
@@ -4066,7 +3994,7 @@ async fn grantee_http_write_races(test: &mut TestServer) {
     let keys = za_unlock(test, owner, STRONG).await;
     let calendar = test
         .server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap()
         .by_path("shared")
@@ -4102,7 +4030,7 @@ async fn grantee_http_write_races(test: &mut TestServer) {
             let event_id = if operation != "CREATE" {
                 Some(
                     test.server
-                        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+                        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
                         .await
                         .unwrap()
                         .by_path(&format!("shared/{name}"))
@@ -4182,7 +4110,7 @@ async fn grantee_http_write_races(test: &mut TestServer) {
                 if operation != "DELETE" {
                     let resources = test
                         .server
-                        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+                        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
                         .await
                         .unwrap();
                     let id = resources
@@ -4190,7 +4118,7 @@ async fn grantee_http_write_races(test: &mut TestServer) {
                         .unwrap()
                         .document_id();
                     let stored = event_archive(test, owner, id).await;
-                    let mut opened = stored.deserialize::<CalendarEvent>().unwrap();
+                    let mut opened = stored.za_event();
                     assert_eq!(generation(&opened), current_ring_generation(&after));
                     unseal_event_in_domain(&mut opened, &after.domain).unwrap();
                     DummyWebDavClient::new(bob, BOB, STRONG, BOB)

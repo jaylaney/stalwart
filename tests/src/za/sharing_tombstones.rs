@@ -17,9 +17,9 @@ use groupware::{cache::GroupwareCache, calendar::Calendar};
 use hyper::StatusCode;
 use serde_json::json;
 use store::{
-    IterateParams, Key, LogKey, SUBSPACE_LOGS, ValueKey,
+    IterateParams, Key, LogKey, Subspace, ValueKey,
     query::log::Query,
-    write::{AlignedBytes, AnyClass, Archive, BatchBuilder, ValueClass},
+    write::{AnyClass, Archive, ArchiveBytes, BatchBuilder, ValueClass},
 };
 use types::collection::{Collection, SyncCollection, VanishedCollection};
 
@@ -80,7 +80,7 @@ async fn grant(slug: &str) {
 }
 async fn id(test: &TestServer, owner: u32, slug: &str) -> u32 {
     test.server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap()
         .by_path(slug)
@@ -88,7 +88,7 @@ async fn id(test: &TestServer, owner: u32, slug: &str) -> u32 {
         .document_id()
 }
 async fn rename_fixture(test: &TestServer, owner: u32, calendar_id: u32, name: &str) {
-    let stored: Archive<AlignedBytes> = test
+    let stored: Archive<ArchiveBytes> = test
         .server
         .store()
         .get_value(ValueKey::archive(owner, Collection::Calendar, calendar_id))
@@ -100,11 +100,7 @@ async fn rename_fixture(test: &TestServer, owner: u32, calendar_id: u32, name: &
     let mut batch = BatchBuilder::new();
     calendar
         .update(
-            test.server
-                .account_info(owner)
-                .await
-                .unwrap()
-                .account_tenant_ids(),
+            test.server.account_info(owner).await.unwrap().changed_by(),
             stored.to_unarchived::<Calendar>().unwrap(),
             owner,
             calendar_id,
@@ -151,8 +147,7 @@ async fn seed(
         .commit_batch(batch)
         .await
         .unwrap()
-        .last_change_id(owner)
-        .unwrap()
+        .last_change_id(owner, SyncCollection::Calendar)
 }
 fn identity(id: u32, path: &str) -> String {
     format!("{id:08x}:{path}")
@@ -691,7 +686,7 @@ async fn retention(test: &TestServer) {
                 };
                 batch.set(
                     ValueClass::Any(AnyClass {
-                        subspace: SUBSPACE_LOGS,
+                        subspace: Subspace::Logs,
                         key: LogKey {
                             account_id: owner,
                             collection,
@@ -704,7 +699,7 @@ async fn retention(test: &TestServer) {
             }
         }
     }
-    test.server.store().write(batch.build_all()).await.unwrap();
+    test.server.store().write_batch(&mut batch).await.unwrap();
     test.server
         .delete_changes(account, Some(1), None)
         .await
@@ -804,7 +799,7 @@ async fn ordinary_owner(test: &TestServer) {
     assert!(response.expect_body().contains("404 Not Found"));
     let calendar = test
         .server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap()
         .by_path("ordinary")

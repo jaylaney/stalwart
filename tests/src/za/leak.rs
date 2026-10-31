@@ -53,7 +53,7 @@ use groupware::{
             collection::COLLECTION_MARKER,
             event_token_pairs,
             item::RSVP_TOKEN_PROP,
-            policy::{is_visible_parameter, is_visible_property},
+            policy::{is_visible_entry, is_visible_parameter},
             tree::{EXTRA_PROP, KEY_PROP, SEALED_PROP},
         },
     },
@@ -454,10 +454,36 @@ fn check_tree(tree: &ICalendar, what: &str, is_event: bool, violations: &mut Vec
                     "{what}: component {index} has misplaced carrier {kind} at entry {position}"
                 )),
                 None => {
-                    if !is_visible_property(&component.component_type, &entry.name) {
+                    // Field policy 2 (upgrade design, "Privacy flags"): the
+                    // predicate takes the entry, since CLASS is visible only
+                    // with a standard value on VEVENT, VTODO and VJOURNAL.
+                    if !is_visible_entry(&component.component_type, entry) {
                         violations.push(format!(
                             "{what}: component {index} ({:?}) has sealed-class property {:?}",
                             component.component_type, entry.name
+                        ));
+                    }
+                    // The scanner's own CLASS rule, independent of the
+                    // product's predicate: a visible CLASS holds exactly one
+                    // standard classification, on an event, task or journal.
+                    if entry.name == calcard::icalendar::ICalendarProperty::Class
+                        && !(matches!(
+                            component.component_type,
+                            calcard::icalendar::ICalendarComponentType::VEvent
+                                | calcard::icalendar::ICalendarComponentType::VTodo
+                                | calcard::icalendar::ICalendarComponentType::VJournal
+                        ) && matches!(
+                            entry.values.as_slice(),
+                            [calcard::icalendar::ICalendarValue::Classification(
+                                calcard::icalendar::ICalendarClassification::Public
+                                    | calcard::icalendar::ICalendarClassification::Private
+                                    | calcard::icalendar::ICalendarClassification::Confidential
+                            )]
+                        ))
+                    {
+                        violations.push(format!(
+                            "{what}: component {index} has a visible non-standard CLASS {:?}",
+                            entry.values
                         ));
                     }
                     for param in entry.params.iter() {

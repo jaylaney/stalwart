@@ -5,18 +5,23 @@
  */
 
 use super::STRONG;
-use crate::utils::{server::TestServer, webdav::DummyWebDavClient, za::plant_event};
+use crate::utils::{
+    server::TestServer,
+    webdav::DummyWebDavClient,
+    za::{StoredEvent, plant_event, shared_container, stored_event},
+};
 use calcard::{Entry, Parser};
 use dav_proto::Depth;
 use dav_proto::schema::property::{DavProperty, WebDavProperty};
 use groupware::{
+    SizeWriter,
     cache::GroupwareCache,
-    calendar::{Calendar, CalendarEvent},
+    calendar::{Calendar, CalendarEvent, CalendarEventContent, seal::is_sealed_container},
 };
 use hyper::StatusCode;
 use store::{
     ValueKey,
-    write::{AlignedBytes, Archive},
+    write::{Archive, ArchiveBytes},
 };
 use types::collection::{Collection, SyncCollection};
 
@@ -36,53 +41,68 @@ pub const CANARIES: &[&str] = &[
 
 const CONTENT_TYPE: (&str, &str) = ("content-type", "text/calendar; charset=utf-8");
 
+/// The document id of the account's resource at `path` (`<calendar>/<name>`).
+pub async fn resource_id(test: &TestServer, account_id: u32, path: &str) -> u32 {
+    test.server
+        .fetch_groupware_resources(account_id, account_id, SyncCollection::Calendar)
+        .await
+        .unwrap()
+        .by_path(path)
+        .unwrap_or_else(|| panic!("{path} not found"))
+        .document_id()
+}
+
+/// The event at `path`: its content archive (the stored tree, which 0.16
+/// read from the one event archive) and its document id. At 1.0 the row is
+/// a separate record (`raw_event_records`).
 pub async fn raw_event(
     test: &TestServer,
     account_id: u32,
     path: &str,
-) -> (Archive<AlignedBytes>, u32) {
-    let resources = test
-        .server
-        .fetch_dav_resources(account_id, account_id, SyncCollection::Calendar)
-        .await
-        .unwrap();
-    let resource = resources
-        .by_path(path)
-        .unwrap_or_else(|| panic!("{path} not found"));
-    let document_id = resource.document_id();
-    let archive = test
-        .server
+) -> (Archive<ArchiveBytes>, u32) {
+    let (records, document_id) = raw_event_records(test, account_id, path).await;
+    (records.content, document_id)
+}
+
+/// Both stored records of the event at `path`, and its document id.
+pub async fn raw_event_records(
+    test: &TestServer,
+    account_id: u32,
+    path: &str,
+) -> (StoredEvent, u32) {
+    let document_id = resource_id(test, account_id, path).await;
+    (
+        stored_event(test, account_id, document_id).await,
+        document_id,
+    )
+}
+
+pub async fn raw_calendar(test: &TestServer, account_id: u32, path: &str) -> Archive<ArchiveBytes> {
+    let document_id = resource_id(test, account_id, path).await;
+    test.server
         .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
             account_id,
-            Collection::CalendarEvent,
+            Collection::Calendar,
             document_id,
         ))
         .await
         .unwrap()
-        .expect("event archive");
-    (archive, document_id)
+        .expect("calendar archive")
 }
 
-pub async fn raw_calendar(test: &TestServer, account_id: u32, path: &str) -> Archive<AlignedBytes> {
-    let resources = test
-        .server
-        .fetch_dav_resources(account_id, account_id, SyncCollection::Calendar)
-        .await
-        .unwrap();
-    let resource = resources
-        .by_path(path)
-        .unwrap_or_else(|| panic!("{path} not found"));
-    test.server
-        .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
-            account_id,
-            Collection::Calendar,
-            resource.document_id(),
-        ))
-        .await
-        .unwrap()
-        .expect("calendar archive")
+/// The stored size of a key account's event at 1.0: upstream's builder
+/// derives the row's `size` from the content it stores
+/// (`refresh_from_content`), the sealed tree (expectation ledger, part
+/// 4c). Readers still serve the plaintext's length (HEAD, PROPFIND).
+fn sealed_size(content: &Archive<ArchiveBytes>) -> usize {
+    SizeWriter::ical(
+        &content
+            .deserialize::<CalendarEventContent>()
+            .unwrap()
+            .data
+            .event,
+    )
 }
 
 /// The VCALENDAR root's `X-ZA-KEY` value (the DEK wrapped for this write),
@@ -130,17 +150,28 @@ pub async fn test(test: &mut TestServer) {
         .with_status(StatusCode::CREATED);
     let etag1 = created.etag().to_string();
 
-    // Stored record: no canary, carriers present, size is the body length.
-    let (archive, _) = raw_event(test, id, "default/sealed-1.ics").await;
-    let raw = String::from_utf8_lossy(archive.as_bytes()).to_string();
+    // Stored records: no canary in the row or the content, carriers
+    // present. At 1.0 the row's size is upstream's measure of the stored
+    // (sealed) tree; HEAD below still serves the body length.
+    let (records, sealed_id) = raw_event_records(test, id, "default/sealed-1.ics").await;
+    let archive = records.content.clone();
+    // Per-user event data (calendar spec, near line 717): a key account's
+    // PUT stores no preferences.
+    crate::utils::za::assert_no_event_preferences(test, id, sealed_id).await;
+    let raw = records.bytes();
     for canary in CANARIES {
         assert!(
             !raw.contains(canary),
             "{canary} leaked into the stored event"
         );
     }
-    let stored = archive.unarchive::<CalendarEvent>().unwrap();
-    assert_eq!(stored.size.to_native() as usize, EVENT.len());
+    let row = records.meta.unarchive::<CalendarEvent>().unwrap();
+    assert_eq!(row.size.to_native() as usize, sealed_size(&archive));
+    assert!(
+        row.display_name.is_none(),
+        "ruling 15: the row holds no name"
+    );
+    let stored = archive.unarchive::<CalendarEventContent>().unwrap();
     let stored_text = stored.data.event.to_string();
     assert!(
         stored_text.contains("X-ZA-KEY:") && stored_text.contains("X-ZA-SEALED:"),
@@ -214,7 +245,7 @@ pub async fn test(test: &mut TestServer) {
     let (after, _) = raw_event(test, id, "default/sealed-1.ics").await;
     assert_ne!(after.version, archive.version);
     let after_text = after
-        .unarchive::<CalendarEvent>()
+        .unarchive::<CalendarEventContent>()
         .unwrap()
         .data
         .event
@@ -390,23 +421,12 @@ pub async fn test_reports(test: &mut TestServer) {
     );
 
     // A corrupted stored record fails that one item with 500 and leaves the rest readable.
-    let (archive, document_id) = raw_event(test, id, "default/report-1.ics").await;
-    let mut broken = archive.deserialize::<CalendarEvent>().unwrap();
-    let root = &mut broken.data.event.components[0];
+    let (records, document_id) = raw_event_records(test, id, "default/report-1.ics").await;
+    let mut broken = records.za_event();
+    let root = &mut broken.content.data.event.components[0];
     let last = root.entries.last_mut().unwrap();
     last.values = vec![calcard::icalendar::ICalendarValue::Text("AQI=".into())];
-    let account_info = test.server.account_info(id).await.unwrap();
-    let mut batch = store::write::BatchBuilder::new();
-    broken
-        .update(
-            account_info.account_tenant_ids(),
-            archive.to_unarchived::<CalendarEvent>().unwrap(),
-            id,
-            document_id,
-            &mut batch,
-        )
-        .unwrap();
-    test.server.commit_batch(batch).await.unwrap();
+    crate::utils::za::write_stored_event(test, id, document_id, &records, broken).await;
     client
         .request("GET", path, "")
         .await
@@ -414,7 +434,7 @@ pub async fn test_reports(test: &mut TestServer) {
     // HEAD shares GET's handler, and a PUT over an existing event unseals it
     // to compare: both fail the same way, before any conditional header is
     // looked at, and the failed PUT leaves the record as it was.
-    let (tampered, _) = raw_event(test, id, "default/report-1.ics").await;
+    let (tampered, _) = raw_event_records(test, id, "default/report-1.ics").await;
     client
         .request("HEAD", path, "")
         .await
@@ -428,8 +448,8 @@ pub async fn test_reports(test: &mut TestServer) {
         )
         .await
         .with_status(StatusCode::INTERNAL_SERVER_ERROR);
-    let (after, _) = raw_event(test, id, "default/report-1.ics").await;
-    assert_eq!(after.as_bytes(), tampered.as_bytes(), "a failed PUT wrote");
+    let (after, _) = raw_event_records(test, id, "default/report-1.ics").await;
+    assert_eq!(after.bytes(), tampered.bytes(), "a failed PUT wrote");
     let body = client
         .multiget_calendar("/dav/cal/key1@example.com/default/", &[path, other])
         .await
@@ -542,10 +562,23 @@ pub async fn test_collections(test: &mut TestServer) {
     }
     let stored = archive.unarchive::<Calendar>().unwrap();
     assert_eq!(stored.name, "work", "slug visible");
-    let pref = stored.preferences(id);
+    let pref = stored.preferences(id).unwrap();
     assert!(pref.name.starts_with("$za$"));
     assert!(pref.description.is_none());
-    assert!(stored.dead_properties.0.is_empty());
+    // At 1.0 `calendar-color` is a dead property in the calendar's shared
+    // metadata container, which MKCALENDAR sealed (ruling 16).
+    let work_id = resource_id(test, id, "work").await;
+    let container = shared_container(test, id, Collection::Calendar, work_id)
+        .await
+        .expect("the calendar's dead-property container");
+    assert!(is_sealed_container(&container), "an unsealed container");
+    let container_text = String::from_utf8_lossy(&container).to_string();
+    for canary in collection_canaries.iter().chain(&["calendar-color"]) {
+        assert!(
+            !container_text.contains(canary),
+            "{canary} in the stored container"
+        );
+    }
     let props = client
         .propfind(
             cal,
@@ -597,7 +630,7 @@ pub async fn test_collections(test: &mut TestServer) {
     }
     let stored = archive.unarchive::<Calendar>().unwrap();
     let groupware::calendar::ArchivedTimezone::Custom(stored_tz) =
-        &stored.preferences(id).time_zone
+        &stored.preferences(id).unwrap().time_zone
     else {
         panic!("custom timezone expected")
     };
@@ -671,7 +704,7 @@ pub async fn test_collections(test: &mut TestServer) {
         assert!(!raw.contains(canary), "{canary} in the stored collection");
     }
     let stored = archive.unarchive::<Calendar>().unwrap();
-    assert!(stored.preferences(id).name.starts_with("$za$"));
+    assert!(stored.preferences(id).unwrap().name.starts_with("$za$"));
     assert_eq!(stored.created.to_native(), 946684800);
     client
         .propfind(cal, ["D:displayname"])
@@ -763,6 +796,7 @@ pub async fn test_collections(test: &mut TestServer) {
             .unarchive::<Calendar>()
             .unwrap()
             .preferences(id)
+            .unwrap()
             .name
             .starts_with("$za$"),
         "the default calendar starts in plaintext"
@@ -782,6 +816,7 @@ pub async fn test_collections(test: &mut TestServer) {
             .unarchive::<Calendar>()
             .unwrap()
             .preferences(id)
+            .unwrap()
             .name
             .starts_with("$za$")
     );
@@ -793,7 +828,9 @@ pub async fn test_collections(test: &mut TestServer) {
         .get("D:displayname")
         .with_values(["Default displayname-canary"]);
 
-    // Event PROPPATCH: display name and dead properties go into X-ZA-EXTRA.
+    // Event PROPPATCH: the display name goes into X-ZA-EXTRA (ruling 15);
+    // at 1.0 the dead property goes into the event's shared metadata
+    // container, sealed whole (ruling 16).
     let path = "/dav/cal/key1%40example.com/work/evt.ics";
     client
         .request_with_headers("PUT", path, [CONTENT_TYPE], EVENT)
@@ -811,22 +848,23 @@ pub async fn test_collections(test: &mut TestServer) {
         )
         .await
         .with_status(StatusCode::MULTI_STATUS);
-    let (archive, _) = raw_event(test, id, "work/evt.ics").await;
-    let raw = String::from_utf8_lossy(archive.as_bytes()).to_string();
+    let (records, evt_id) = raw_event_records(test, id, "work/evt.ics").await;
+    let raw = records.bytes();
     for canary in CANARIES.iter().chain(&["evtname-canary", "dead-canary"]) {
         assert!(
             !raw.contains(canary),
             "{canary} leaked into the stored event"
         );
     }
-    let stored = archive.unarchive::<CalendarEvent>().unwrap();
+    assert_dead_container_sealed(test, id, evt_id, &["dead-canary", "za-dead"]).await;
+    let row = records.meta.unarchive::<CalendarEvent>().unwrap();
     assert_eq!(
-        stored.size.to_native() as usize,
-        EVENT.len(),
-        "PROPPATCH keeps the stored size"
+        row.size.to_native() as usize,
+        sealed_size(&records.content),
+        "the row measures the stored tree"
     );
-    assert!(stored.display_name.is_none() && stored.dead_properties.0.is_empty());
-    assert!(stored.data.event.to_string().contains("X-ZA-EXTRA:"));
+    assert!(row.display_name.is_none());
+    assert!(records.tree().to_string().contains("X-ZA-EXTRA:"));
     let props = client.propfind(path, ["D:displayname", "C:za-dead"]).await;
     props
         .properties(path)
@@ -853,20 +891,23 @@ pub async fn test_collections(test: &mut TestServer) {
         .proppatch(path, [("D:creationdate", "2000-01-01T00:00:00Z")], [], [])
         .await
         .with_status(StatusCode::MULTI_STATUS);
-    let (archive, _) = raw_event(test, id, "work/evt.ics").await;
-    let raw = String::from_utf8_lossy(archive.as_bytes()).to_string();
+    let (records, _) = raw_event_records(test, id, "work/evt.ics").await;
+    let raw = records.bytes();
     for canary in CANARIES.iter().chain(&["evtname-canary", "dead-canary"]) {
         assert!(
             !raw.contains(canary),
             "{canary} leaked into the stored event"
         );
     }
-    let stored = archive.unarchive::<CalendarEvent>().unwrap();
-    assert!(groupware::calendar::seal::archived_event_is_sealed(stored));
-    assert_eq!(stored.created.to_native(), 946684800);
-    assert_eq!(stored.size.to_native() as usize, EVENT.len());
-    assert!(stored.display_name.is_none() && stored.dead_properties.0.is_empty());
-    assert!(stored.data.event.to_string().contains("X-ZA-EXTRA:"));
+    assert_dead_container_sealed(test, id, evt_id, &["dead-canary", "za-dead"]).await;
+    assert!(groupware::calendar::seal::archived_event_is_sealed(
+        records.content.unarchive::<CalendarEventContent>().unwrap()
+    ));
+    let row = records.meta.unarchive::<CalendarEvent>().unwrap();
+    assert_eq!(row.created.to_native(), 946684800);
+    assert_eq!(row.size.to_native() as usize, sealed_size(&records.content));
+    assert!(row.display_name.is_none());
+    assert!(records.tree().to_string().contains("X-ZA-EXTRA:"));
     let props = client.propfind(path, ["D:displayname", "C:za-dead"]).await;
     props
         .properties(path)
@@ -1030,8 +1071,8 @@ async fn conditional_statuses(
         out.push((case, status));
     }
     // A UID of its own: a second event with `EVENT`'s UID in the same
-    // calendar is refused (412 no-uid-conflict) before the condition is
-    // looked at.
+    // calendar is refused (no-uid-conflict: 403 at 1.0, ruling 50) before
+    // the condition is looked at.
     let status = client
         .request_with_headers(
             "PUT",
@@ -1120,9 +1161,10 @@ pub async fn test_conditional(test: &mut TestServer) {
         "stored archive unchanged by the accepted If-Match PUT"
     );
     assert!(groupware::calendar::seal::archived_event_is_sealed(
-        archive.unarchive::<CalendarEvent>().unwrap()
+        archive.unarchive::<CalendarEventContent>().unwrap()
     ));
-    assert!(!String::from_utf8_lossy(archive.as_bytes()).contains("conditional-canary"));
+    let (records, _) = raw_event_records(test, id, "default/cond.ics").await;
+    assert!(!records.bytes().contains("conditional-canary"));
 
     test.wait_for_tasks().await;
     for (client, base) in [
@@ -1153,9 +1195,9 @@ pub async fn test_legacy(test: &mut TestServer) {
     let path = "/dav/cal/key1@example.com/default/legacy.ics";
     let legacy = EVENT.replace("za-event-1", "za-legacy-1");
     plant_event(test, id, "default", "legacy.ics", &legacy, None).await;
-    let is_sealed = |archive: &Archive<AlignedBytes>| {
+    let is_sealed = |archive: &Archive<ArchiveBytes>| {
         groupware::calendar::seal::archived_event_is_sealed(
-            archive.unarchive::<CalendarEvent>().unwrap(),
+            archive.unarchive::<CalendarEventContent>().unwrap(),
         )
     };
     let (archive, _) = raw_event(test, id, "default/legacy.ics").await;
@@ -1184,9 +1226,9 @@ pub async fn test_legacy(test: &mut TestServer) {
         .request_with_headers("PUT", path, [CONTENT_TYPE], changed)
         .await
         .with_status(StatusCode::NO_CONTENT);
-    let (archive, _) = raw_event(test, id, "default/legacy.ics").await;
-    assert!(is_sealed(&archive));
-    let raw = String::from_utf8_lossy(archive.as_bytes()).to_string();
+    let (records, _) = raw_event_records(test, id, "default/legacy.ics").await;
+    assert!(is_sealed(&records.content));
+    let raw = records.bytes();
     for canary in CANARIES.iter().chain(&["legacy-rewritten-canary"]) {
         assert!(!raw.contains(canary), "{canary} left in the clear");
     }
@@ -1203,4 +1245,825 @@ pub async fn test_legacy(test: &mut TestServer) {
         .request("DELETE", path, "")
         .await
         .with_status(StatusCode::NO_CONTENT);
+}
+
+// ---------------------------------------------------------------------------
+// Upgrade part 4c: dead properties, split metadata-only updates and the
+// per-user preference rule on 1.0's split records.
+// ---------------------------------------------------------------------------
+
+/// Canaries of the dead-property cases: a sensitive namespace and name, its
+/// value, and the Apple colour and order properties' namespace and name.
+const DEAD_CANARIES: &[&str] = &[
+    "deadprop-name-canary",
+    "x-deadprop-ns-canary",
+    "deadprop-value-canary",
+    "apple.com/ns/ical",
+    "calendar-order",
+];
+
+/// A PROPPATCH setting the sensitive custom property to `value`, with the
+/// Apple colour and order.
+fn dead_proppatch(value: &str) -> String {
+    format!(
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>",
+            "<D:propertyupdate xmlns:D=\"DAV:\" xmlns:X=\"urn:x-deadprop-ns-canary\" ",
+            "xmlns:I=\"http://apple.com/ns/ical/\"><D:set><D:prop>",
+            "<X:deadprop-name-canary>{value}</X:deadprop-name-canary>",
+            "<I:calendar-color>#C0FFEEFF</I:calendar-color>",
+            "<I:calendar-order>3</I:calendar-order>",
+            "</D:prop></D:set></D:propertyupdate>"
+        ),
+        value = value
+    )
+}
+
+/// A PROPFIND of the three dead properties.
+const DEAD_PROPFIND: &str = concat!(
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?>",
+    "<D:propfind xmlns:D=\"DAV:\" xmlns:X=\"urn:x-deadprop-ns-canary\" ",
+    "xmlns:I=\"http://apple.com/ns/ical/\"><D:prop><X:deadprop-name-canary/>",
+    "<I:calendar-color/><I:calendar-order/></D:prop></D:propfind>"
+);
+
+/// The dead properties of `path` as `client` reads them: the response
+/// body, which must hold every value.
+async fn assert_dead_round_trip(client: &DummyWebDavClient, path: &str, value: &str) {
+    let body = client
+        .request_with_headers("PROPFIND", path, [("depth", "0")], DEAD_PROPFIND)
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .body
+        .unwrap();
+    assert!(
+        body.contains(value)
+            && body.contains("deadprop-name-canary")
+            && body.contains("urn:x-deadprop-ns-canary")
+            && body.contains("#C0FFEEFF")
+            && body.contains("calendar-order")
+            && !body.contains(groupware::calendar::seal::container::CONTAINER_NAMESPACE),
+        "{path}: {body}"
+    );
+}
+
+/// The canaries found in the raw stored container of a document: its keys
+/// hold only ids (`store/src/write/key.rs`), so the value is all a reader
+/// of the store sees of it.
+fn container_leaks(container: &[u8], canaries: &[&str]) -> Vec<String> {
+    let text = String::from_utf8_lossy(container);
+    canaries
+        .iter()
+        .filter(|canary| text.contains(**canary))
+        .map(|canary| canary.to_string())
+        .collect()
+}
+
+/// Ruling 16 at the store: a key account's document holds a sealed
+/// container whose stored bytes carry none of `canaries`.
+pub(super) async fn assert_dead_container_sealed(
+    test: &TestServer,
+    account_id: u32,
+    document_id: u32,
+    canaries: &[&str],
+) {
+    let container = shared_container(test, account_id, Collection::CalendarEvent, document_id)
+        .await
+        .unwrap_or_else(|| panic!("event {document_id} has no dead-property container"));
+    assert!(
+        is_sealed_container(&container),
+        "event {document_id}: an unsealed container"
+    );
+    assert_eq!(
+        container_leaks(&container, canaries),
+        Vec::<String>::new(),
+        "event {document_id}: the container leaks"
+    );
+}
+
+/// The raw stored value of a document's shared container (compressed and
+/// trailed as upstream stores it), for the keyless readers.
+async fn raw_container(
+    test: &TestServer,
+    account_id: u32,
+    collection: Collection,
+    document_id: u32,
+) -> Option<Vec<u8>> {
+    test.server
+        .store()
+        .get_value::<common::auth::vault::RawValue>(ValueKey {
+            account_id,
+            collection: collection.into(),
+            document_id,
+            class: store::write::ValueClass::Metadata(
+                store::write::metadata::MetadataClass::Shared,
+            ),
+        })
+        .await
+        .unwrap()
+        .map(|raw| raw.0)
+}
+
+/// Every canary of `canaries` found in an event's stored row and content
+/// and in its stored container: the scan of the split metadata case.
+async fn event_leaks(
+    test: &TestServer,
+    account_id: u32,
+    document_id: u32,
+    canaries: &[&str],
+) -> Vec<String> {
+    let records = stored_event(test, account_id, document_id).await;
+    let mut text = records.bytes();
+    if let Some(container) =
+        shared_container(test, account_id, Collection::CalendarEvent, document_id).await
+    {
+        text.push_str(&String::from_utf8_lossy(&container));
+    }
+    canaries
+        .iter()
+        .filter(|canary| text.contains(**canary))
+        .map(|canary| canary.to_string())
+        .collect()
+}
+
+/// Shares the owner's calendar `slug` with `reader` at `level` through the
+/// account API (pin first, as every grant requires).
+pub(super) async fn share_calendar(
+    test: &TestServer,
+    owner: &str,
+    reader: &str,
+    reader_id: u32,
+    slug: &str,
+    level: &str,
+) {
+    let key = test
+        .server
+        .za_served_public_key(reader_id)
+        .await
+        .unwrap()
+        .unwrap();
+    super::pinning::pin(owner, reader, &vault::keys::display_fingerprint(&key))
+        .await
+        .expect(200);
+    crate::utils::za::za_post(
+        "shares/grant",
+        &serde_json::json!({
+            "username": owner,
+            "password": STRONG,
+            "calendar": slug,
+            "address": reader,
+            "level": level,
+        }),
+    )
+    .await
+    .expect(200);
+}
+
+/// The suite's key account pair for a module, created and registered.
+async fn key_pair(test: &mut TestServer, owner: &'static str, reader: &'static str) -> (u32, u32) {
+    let mut ids = Vec::new();
+    for name in [owner, reader] {
+        let account = test
+            .account("admin@example.com")
+            .create_key_user_account(name, STRONG, name, &[], super::user_permissions())
+            .await;
+        ids.push(account.id().document_id());
+        test.insert_account(account);
+    }
+    (ids[0], ids[1])
+}
+
+const DEAD_OWNER: &str = "deadprop-owner@example.com";
+const DEAD_READER: &str = "deadprop-reader@example.com";
+const DEAD_HOME: &str = "/dav/cal/deadprop-owner%40example.com/";
+
+/// Design "Dead properties and object metadata" (rulings 16, 23 and 29): a
+/// key account's dead properties round-trip sealed for the owner and a
+/// grantee, survive COPY and MOVE, leave upstream's viewer counters alone,
+/// and every keyless reader of a sealed container runs without keys.
+pub async fn test_dead_properties(test: &mut TestServer) {
+    println!("Running zero-access dead-property tests...");
+    let (owner_id, reader_id) = key_pair(test, DEAD_OWNER, DEAD_READER).await;
+    let owner = DummyWebDavClient::new(owner_id, DEAD_OWNER, STRONG, DEAD_OWNER);
+    let reader = DummyWebDavClient::new(reader_id, DEAD_READER, STRONG, DEAD_READER);
+    for slug in ["dead-a", "dead-b", "dead-c"] {
+        owner
+            .request(
+                "MKCALENDAR",
+                &format!("{DEAD_HOME}{slug}/"),
+                mkcalendar_body(&[]),
+            )
+            .await
+            .with_status(StatusCode::CREATED);
+    }
+    for (path, uid) in [
+        ("dead-a/evt.ics", "deadprop-evt"),
+        ("dead-a/control.ics", "deadprop-control"),
+        ("dead-b/copy-src.ics", "deadprop-copy"),
+        ("dead-b/move-src.ics", "deadprop-move"),
+        ("dead-b/shared-in.ics", "deadprop-shared-in"),
+    ] {
+        owner
+            .request_with_headers(
+                "PUT",
+                &format!("{DEAD_HOME}{path}"),
+                [CONTENT_TYPE],
+                EVENT.replace("za-event-1", uid),
+            )
+            .await
+            .with_status(StatusCode::CREATED);
+    }
+
+    // 1. Owner round trips: an event's and a calendar's custom (sensitive
+    // namespace and name), colour and order properties.
+    let evt = format!("{DEAD_HOME}dead-a/evt.ics");
+    let cal_a = format!("{DEAD_HOME}dead-a/");
+    for (path, value) in [
+        (&evt, "deadprop-value-canary"),
+        (&cal_a, "deadprop-value-canary-cal"),
+    ] {
+        owner
+            .request("PROPPATCH", path, dead_proppatch(value))
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+        assert_dead_round_trip(&owner, path, value).await;
+    }
+    let evt_id = resource_id(test, owner_id, "dead-a/evt.ics").await;
+    let cal_a_id = resource_id(test, owner_id, "dead-a").await;
+    assert_dead_container_sealed(test, owner_id, evt_id, DEAD_CANARIES).await;
+    let cal_container = shared_container(test, owner_id, Collection::Calendar, cal_a_id)
+        .await
+        .expect("the calendar's container");
+    assert!(is_sealed_container(&cal_container));
+    assert!(container_leaks(&cal_container, DEAD_CANARIES).is_empty());
+    // The row's presence bit says a DAV container exists (rewrite_presence).
+    let row = stored_event(test, owner_id, evt_id).await;
+    assert_eq!(
+        row.meta
+            .unarchive::<CalendarEvent>()
+            .unwrap()
+            .metadata_kinds(),
+        types::metadata::MetadataKinds::DAV
+    );
+    assert!(row.bytes().contains("X-ZA-KEY:"));
+    assert!(container_leaks(row.bytes().as_bytes(), DEAD_CANARIES).is_empty());
+
+    // Negative control: a planted plaintext container on another event is
+    // what the scan above must catch.
+    let control_id = resource_id(test, owner_id, "dead-a/control.ics").await;
+    crate::utils::za::plant_container(
+        test,
+        owner_id,
+        Collection::CalendarEvent,
+        control_id,
+        Some(crate::utils::za::plain_dav_container(&[(
+            "urn:x-deadprop-ns-canary",
+            "deadprop-name-canary",
+            "deadprop-value-canary",
+        )])),
+    )
+    .await;
+    let planted = shared_container(test, owner_id, Collection::CalendarEvent, control_id)
+        .await
+        .unwrap();
+    assert!(!is_sealed_container(&planted), "the control is plaintext");
+    assert!(
+        !container_leaks(&planted, DEAD_CANARIES).is_empty(),
+        "the scan misses a plaintext container"
+    );
+    crate::utils::za::plant_container(test, owner_id, Collection::CalendarEvent, control_id, None)
+        .await;
+
+    // A corrupted sealed container fails its item (500) and nothing else:
+    // GET reads the content record, which is intact.
+    let original = shared_container(test, owner_id, Collection::CalendarEvent, evt_id)
+        .await
+        .unwrap();
+    let view = types::metadata::MetadataView::new(&original).unwrap();
+    let (_, value) = view.dav().next().unwrap();
+    let text = value.text().unwrap();
+    let mut payload =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, text.as_bytes())
+            .unwrap();
+    *payload.last_mut().unwrap() ^= 1;
+    let corrupt = crate::utils::za::plain_dav_container(&[(
+        groupware::calendar::seal::container::CONTAINER_NAMESPACE,
+        groupware::calendar::seal::container::CONTAINER_NAME,
+        &base64::Engine::encode(&base64::engine::general_purpose::STANDARD, payload),
+    )]);
+    crate::utils::za::plant_container(
+        test,
+        owner_id,
+        Collection::CalendarEvent,
+        evt_id,
+        Some(corrupt),
+    )
+    .await;
+    let body = owner
+        .request_with_headers("PROPFIND", &evt, [("depth", "0")], DEAD_PROPFIND)
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .body
+        .unwrap();
+    assert!(
+        body.contains("500") && !body.contains("deadprop-value-canary"),
+        "{body}"
+    );
+    owner
+        .request("GET", &evt, "")
+        .await
+        .with_status(StatusCode::OK);
+    crate::utils::za::plant_container(
+        test,
+        owner_id,
+        Collection::CalendarEvent,
+        evt_id,
+        types::metadata::EncodedMetadata::from_view(&view),
+    )
+    .await;
+    assert_dead_round_trip(&owner, &evt, "deadprop-value-canary").await;
+
+    // 2. Viewer and Owner counters (upstream's 12-byte `ViewerState`, never
+    // sealed): planted for the pair, merged once, then left as they were by
+    // every sealed write below.
+    use store::{
+        SerializeInfallible,
+        write::metadata::{MetadataClass, ViewerState},
+    };
+    let planted_state = ViewerState {
+        change_id: 1,
+        containers: 0,
+    };
+    let mut batch = store::write::BatchBuilder::new();
+    batch
+        .with_account_id(owner_id)
+        .with_collection(Collection::CalendarEvent)
+        .set(
+            MetadataClass::Viewer { viewer: reader_id },
+            planted_state.serialize(),
+        )
+        .with_account_id(reader_id)
+        .with_collection(Collection::CalendarEvent)
+        .set(
+            MetadataClass::Owner { owner: owner_id },
+            planted_state.serialize(),
+        );
+    test.server.store().write_batch(&mut batch).await.unwrap();
+    let mut batch = store::write::BatchBuilder::new();
+    batch
+        .with_account_id(owner_id)
+        .with_collection(Collection::CalendarEvent)
+        .merge_fnc(MetadataClass::Viewer { viewer: reader_id }, |_, current| {
+            let mut state = current
+                .map(<ViewerState as store::Deserialize>::deserialize)
+                .transpose()?
+                .unwrap_or_default();
+            state.change_id = state.change_id.max(5);
+            Ok(store::write::MergeResult::Update(state.serialize()))
+        });
+    test.server.store().write_batch(&mut batch).await.unwrap();
+    let merged = ViewerState {
+        change_id: 5,
+        containers: 0,
+    };
+
+    // 3. A grantee's round trip: the shared calendar's containers move to
+    // the collection key with the ring (ruling 29) and the grantee reads
+    // and writes them.
+    share_calendar(test, DEAD_OWNER, DEAD_READER, reader_id, "dead-a", "edit").await;
+    assert_dead_round_trip(&reader, &evt, "deadprop-value-canary").await;
+    assert_dead_round_trip(&reader, &cal_a, "deadprop-value-canary-cal").await;
+    reader
+        .request(
+            "PROPPATCH",
+            &evt,
+            dead_proppatch("deadprop-value-canary-reader"),
+        )
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    assert_dead_round_trip(&owner, &evt, "deadprop-value-canary-reader").await;
+    assert_dead_round_trip(&reader, &evt, "deadprop-value-canary-reader").await;
+    let container = shared_container(test, owner_id, Collection::CalendarEvent, evt_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        groupware::calendar::seal::container_is_ck(&container),
+        Some(true),
+        "a shared calendar's event container is under its collection key"
+    );
+    assert!(container_leaks(&container, DEAD_CANARIES).is_empty());
+
+    // 4. COPY and MOVE between two of the account's calendars, then a
+    // PROPFIND at the destination; and a MOVE into the shared calendar,
+    // which reseals the container under its collection key.
+    for name in ["copy-src.ics", "move-src.ics", "shared-in.ics"] {
+        owner
+            .request(
+                "PROPPATCH",
+                &format!("{DEAD_HOME}dead-b/{name}"),
+                dead_proppatch("deadprop-value-canary"),
+            )
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+    }
+    owner
+        .request_with_headers(
+            "COPY",
+            &format!("{DEAD_HOME}dead-b/copy-src.ics"),
+            [(
+                "destination",
+                format!("{DEAD_HOME}dead-c/copied.ics").as_str(),
+            )],
+            "",
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    owner
+        .request_with_headers(
+            "MOVE",
+            &format!("{DEAD_HOME}dead-b/move-src.ics"),
+            [(
+                "destination",
+                format!("{DEAD_HOME}dead-c/moved.ics").as_str(),
+            )],
+            "",
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    owner
+        .request_with_headers(
+            "MOVE",
+            &format!("{DEAD_HOME}dead-b/shared-in.ics"),
+            [(
+                "destination",
+                format!("{DEAD_HOME}dead-a/shared-in.ics").as_str(),
+            )],
+            "",
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    for path in [
+        "dead-c/copied.ics",
+        "dead-b/copy-src.ics",
+        "dead-c/moved.ics",
+        "dead-a/shared-in.ics",
+    ] {
+        assert_dead_round_trip(
+            &owner,
+            &format!("{DEAD_HOME}{path}"),
+            "deadprop-value-canary",
+        )
+        .await;
+        let id = resource_id(test, owner_id, path).await;
+        assert_dead_container_sealed(test, owner_id, id, DEAD_CANARIES).await;
+        // Per-user event data: no COPY or MOVE writes preferences.
+        crate::utils::za::assert_no_event_preferences(test, owner_id, id).await;
+    }
+    let shared_in = resource_id(test, owner_id, "dead-a/shared-in.ics").await;
+    assert_eq!(
+        groupware::calendar::seal::container_is_ck(
+            &shared_container(test, owner_id, Collection::CalendarEvent, shared_in)
+                .await
+                .unwrap()
+        ),
+        Some(true),
+        "the MOVE into the shared calendar resealed the container"
+    );
+    assert_dead_round_trip(
+        &reader,
+        &format!("{DEAD_HOME}dead-a/shared-in.ics"),
+        "deadprop-value-canary",
+    )
+    .await;
+
+    // The counters decode and kept the merged value through every sealed
+    // write above.
+    let viewers = test.server.all_metadata_viewers(owner_id).await.unwrap();
+    assert_eq!(viewers.len(), 1, "{viewers:?}");
+    assert_eq!(viewers[0].viewer_id, reader_id);
+    assert_eq!(viewers[0].collection, Collection::CalendarEvent);
+    assert_eq!(viewers[0].state, merged);
+    assert_eq!(
+        test.server.metadata_owners(reader_id).await.unwrap(),
+        vec![(owner_id, Collection::CalendarEvent)]
+    );
+
+    // 5. Keyless readers over the sealed containers, with no session keys:
+    // `MetadataBuf::read` and its kinds (DAV's `container_kinds`), the
+    // used-quota scan, then the cleanup of a deleted event and calendar and
+    // the account-destruction paths.
+    for (collection, id) in [
+        (Collection::CalendarEvent, evt_id),
+        (Collection::Calendar, cal_a_id),
+    ] {
+        let raw = raw_container(test, owner_id, collection, id).await.unwrap();
+        let read = store::write::metadata::MetadataBuf::read(&raw).unwrap();
+        assert_eq!(read.kinds(), types::metadata::MetadataKinds::DAV);
+        assert_eq!(read.view().len(), 1, "one sealed wrapper entry");
+        assert_eq!(read.stored_len() as usize, raw.len());
+    }
+    let mut stored = 0i64;
+    for collection in [Collection::Calendar, Collection::CalendarEvent] {
+        test.server
+            .all_metadata_containers(owner_id, collection, |_, _, container| {
+                stored += container.size as i64;
+                Ok(true)
+            })
+            .await
+            .unwrap();
+    }
+    assert!(stored > 0);
+    assert_eq!(
+        test.server.metadata_used_quota(owner_id).await.unwrap(),
+        stored,
+        "the keyless quota scan counts every sealed container"
+    );
+    owner
+        .request("DELETE", &evt, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    assert!(
+        raw_container(test, owner_id, Collection::CalendarEvent, evt_id)
+            .await
+            .is_none()
+    );
+    test.wait_for_tasks().await;
+    owner
+        .request("DELETE", &cal_a, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    test.wait_for_tasks().await;
+    assert!(
+        raw_container(test, owner_id, Collection::Calendar, cal_a_id)
+            .await
+            .is_none()
+    );
+    assert!(
+        raw_container(test, owner_id, Collection::CalendarEvent, shared_in)
+            .await
+            .is_none()
+    );
+    test.server
+        .purge_private_metadata(owner_id, Some(1))
+        .await
+        .unwrap();
+    test.server.destroy_owner_metadata(owner_id).await.unwrap();
+    assert!(
+        test.server
+            .all_metadata_viewers(owner_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        test.server
+            .metadata_owners(reader_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    test.wait_for_tasks().await;
+    for slug in ["dead-b", "dead-c"] {
+        owner
+            .request("DELETE", &format!("{DEAD_HOME}{slug}/"), "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    test.wait_for_tasks().await;
+}
+
+const SPLIT_OWNER: &str = "split-meta-owner@example.com";
+const SPLIT_READER: &str = "split-meta-reader@example.com";
+const SPLIT_CAL: &str = "/dav/cal/split-meta-owner%40example.com/split/";
+
+/// What the owner and the grantee read of the event at `path`: each GET's
+/// ETag is the stored row's (the view keeps the stored version's identity)
+/// and its body the plaintext; a GET conditional on that ETag answers 304.
+async fn split_reads(
+    test: &TestServer,
+    owner_id: u32,
+    document_id: u32,
+    clients: [&DummyWebDavClient; 2],
+    path: &str,
+) {
+    let etag = stored_event(test, owner_id, document_id).await.etag();
+    for client in clients {
+        let got = client
+            .request("GET", path, "")
+            .await
+            .with_status(StatusCode::OK);
+        assert_eq!(got.etag(), etag, "{path}: the view's ETag is the row's");
+        let body = got.body.unwrap();
+        assert!(!body.contains("X-ZA-"), "{body}");
+        for canary in CANARIES {
+            assert!(body.contains(canary), "{canary} missing from {path}");
+        }
+        client
+            .request_with_headers("GET", path, [("if-none-match", etag.as_str())], "")
+            .await
+            .with_status(StatusCode::NOT_MODIFIED);
+    }
+}
+
+/// Upgrade part 4c: a metadata-only write on 1.0's split records (a
+/// rename, and a dead-property PROPPATCH whose presence bit
+/// `rewrite_presence` writes to the row through a store-side merge) leaves
+/// the sealed content record byte for byte, and neither row nor content nor
+/// container holds a protected value afterwards; owner and grantee read the
+/// event as before.
+pub async fn split_metadata_only_update_keeps_sealed_content(test: &mut TestServer) {
+    println!("Running zero-access split metadata-only update tests...");
+    let (owner_id, reader_id) = key_pair(test, SPLIT_OWNER, SPLIT_READER).await;
+    let owner = DummyWebDavClient::new(owner_id, SPLIT_OWNER, STRONG, SPLIT_OWNER);
+    let reader = DummyWebDavClient::new(reader_id, SPLIT_READER, STRONG, SPLIT_READER);
+    owner
+        .request("MKCALENDAR", SPLIT_CAL, mkcalendar_body(&[]))
+        .await
+        .with_status(StatusCode::CREATED);
+    let path = format!("{SPLIT_CAL}evt.ics");
+    owner
+        .request_with_headers(
+            "PUT",
+            &path,
+            [CONTENT_TYPE],
+            EVENT.replace("za-event-1", "split-meta-1"),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    share_calendar(test, SPLIT_OWNER, SPLIT_READER, reader_id, "split", "edit").await;
+    let id = resource_id(test, owner_id, "split/evt.ics").await;
+    let canaries: Vec<&str> = CANARIES
+        .iter()
+        .copied()
+        .chain(["split-dead-canary", "split-name-canary", "x-split-ns"])
+        .collect();
+    let base = stored_event(test, owner_id, id).await;
+    assert_eq!(
+        event_leaks(test, owner_id, id, &canaries).await,
+        Vec::<String>::new()
+    );
+    split_reads(test, owner_id, id, [&owner, &reader], &path).await;
+
+    // 1. A dead-property PROPPATCH: the container is written sealed and the
+    // presence bit is set on the row alone.
+    let proppatch = concat!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>",
+        "<D:propertyupdate xmlns:D=\"DAV:\" xmlns:X=\"urn:x-split-ns\"><D:set><D:prop>",
+        "<X:split-dead>split-dead-canary</X:split-dead>",
+        "</D:prop></D:set></D:propertyupdate>"
+    );
+    owner
+        .request("PROPPATCH", &path, proppatch)
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    let flipped = stored_event(test, owner_id, id).await;
+    assert_eq!(
+        flipped.content.as_bytes(),
+        base.content.as_bytes(),
+        "a presence-bit write rewrote the sealed content"
+    );
+    assert_eq!(flipped.content.version, base.content.version);
+    assert_ne!(
+        flipped.meta.version, base.meta.version,
+        "the row was not rewritten"
+    );
+    let row = flipped.meta.unarchive::<CalendarEvent>().unwrap();
+    assert_eq!(row.metadata_kinds(), types::metadata::MetadataKinds::DAV);
+    assert_ne!(
+        row.flags.to_native() & groupware::calendar::EVENT_META_DAV,
+        0
+    );
+    assert!(row.display_name.is_none());
+    assert_eq!(
+        event_leaks(test, owner_id, id, &canaries).await,
+        Vec::<String>::new()
+    );
+    assert!(is_sealed_container(
+        &shared_container(test, owner_id, Collection::CalendarEvent, id)
+            .await
+            .unwrap()
+    ));
+    split_reads(test, owner_id, id, [&owner, &reader], &path).await;
+
+    // 2. A rename: MOVE within the calendar is upstream's `update_meta`
+    // (the row's names only).
+    let renamed = format!("{SPLIT_CAL}evt-renamed.ics");
+    test.wait_for_tasks().await;
+    owner
+        .request_with_headers("MOVE", &path, [("destination", renamed.as_str())], "")
+        .await
+        .with_status(StatusCode::CREATED);
+    let moved = stored_event(test, owner_id, id).await;
+    assert_eq!(moved.content.as_bytes(), base.content.as_bytes());
+    assert_eq!(moved.content.version, base.content.version);
+    assert_eq!(
+        moved.meta.unarchive::<CalendarEvent>().unwrap().names[0]
+            .name
+            .as_str(),
+        "evt-renamed.ics"
+    );
+    assert_eq!(
+        event_leaks(test, owner_id, id, &canaries).await,
+        Vec::<String>::new()
+    );
+    split_reads(test, owner_id, id, [&owner, &reader], &renamed).await;
+    // Per-user event data: neither metadata write added preferences.
+    crate::utils::za::assert_no_event_preferences(test, owner_id, id).await;
+
+    // Negative control (a flipped field): a row-only writer that put a
+    // protected value in the row is what the scan must catch. Written with
+    // upstream's `update_meta` and restored the same way.
+    let mut leaky = moved.meta.deserialize::<CalendarEvent>().unwrap();
+    leaky.display_name = Some("split-name-canary".into());
+    let changed_by = test
+        .server
+        .account_info(owner_id)
+        .await
+        .unwrap()
+        .changed_by();
+    let mut batch = store::write::BatchBuilder::new();
+    leaky
+        .update_meta(
+            changed_by,
+            moved.meta.to_unarchived::<CalendarEvent>().unwrap(),
+            owner_id,
+            id,
+            None,
+            &mut batch,
+        )
+        .unwrap();
+    test.server.commit_batch(batch).await.unwrap();
+    assert_eq!(
+        event_leaks(test, owner_id, id, &canaries).await,
+        vec!["split-name-canary".to_string()],
+        "the scan misses a protected value in the row"
+    );
+    let planted = stored_event(test, owner_id, id).await;
+    let mut restored = planted.meta.deserialize::<CalendarEvent>().unwrap();
+    restored.display_name = None;
+    let mut batch = store::write::BatchBuilder::new();
+    restored
+        .update_meta(
+            changed_by,
+            planted.meta.to_unarchived::<CalendarEvent>().unwrap(),
+            owner_id,
+            id,
+            None,
+            &mut batch,
+        )
+        .unwrap();
+    test.server.commit_batch(batch).await.unwrap();
+    test.server
+        .invalidate_local_caches(&[common::ipc::CacheInvalidation::GroupwareResources(owner_id)]);
+    assert_eq!(
+        event_leaks(test, owner_id, id, &canaries).await,
+        Vec::<String>::new()
+    );
+
+    // 3. Removing the dead property clears the container and the presence
+    // bit, again on the row alone.
+    owner
+        .request(
+            "PROPPATCH",
+            &renamed,
+            concat!(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>",
+                "<D:propertyupdate xmlns:D=\"DAV:\" xmlns:X=\"urn:x-split-ns\"><D:remove>",
+                "<D:prop><X:split-dead/></D:prop></D:remove></D:propertyupdate>"
+            ),
+        )
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    let cleared = stored_event(test, owner_id, id).await;
+    assert_eq!(cleared.content.as_bytes(), base.content.as_bytes());
+    assert_eq!(
+        cleared
+            .meta
+            .unarchive::<CalendarEvent>()
+            .unwrap()
+            .metadata_kinds(),
+        types::metadata::MetadataKinds::NONE
+    );
+    assert!(
+        shared_container(test, owner_id, Collection::CalendarEvent, id)
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        event_leaks(test, owner_id, id, &canaries).await,
+        Vec::<String>::new()
+    );
+    split_reads(test, owner_id, id, [&owner, &reader], &renamed).await;
+
+    test.wait_for_tasks().await;
+    owner
+        .request("DELETE", &renamed, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    owner
+        .request("DELETE", SPLIT_CAL, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    test.wait_for_tasks().await;
 }

@@ -209,6 +209,11 @@ pub async fn test(test: &mut TestServer) {
         0,
         "plain's inbox received an item"
     );
+    // Per-user event data (calendar spec, near line 717): the scheduling
+    // write of the organizer's copy stores no preferences.
+    let (_, mixed_id) =
+        super::dav_seal::raw_event_records(test, key1.id, "default/fo-mixed.ics").await;
+    crate::utils::za::assert_no_event_preferences(test, key1.id, mixed_id).await;
     let items = new_inbox_items(test, key2.id, &start2).await;
     assert_eq!(items.len(), 1, "key2's inbox holds exactly one new item");
     let (item_id, item) = &items[0];
@@ -693,10 +698,10 @@ pub async fn test_failures(test: &mut TestServer) {
     admin
         .registry_update_setting(
             CalendarScheduling {
-                itip_max_size: 100,
+                max_itip_size: 100,
                 ..Default::default()
             },
-            &[Property::ItipMaxSize],
+            &[Property::MaxItipSize],
         )
         .await;
     admin.reload_settings().await;
@@ -720,7 +725,7 @@ pub async fn test_failures(test: &mut TestServer) {
         ["5.1"]
     );
     admin
-        .registry_update_setting(CalendarScheduling::default(), &[Property::ItipMaxSize])
+        .registry_update_setting(CalendarScheduling::default(), &[Property::MaxItipSize])
         .await;
     admin.reload_settings().await;
 

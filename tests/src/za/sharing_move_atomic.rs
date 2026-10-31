@@ -12,9 +12,12 @@ use groupware::{cache::GroupwareCache, calendar::CalendarEvent};
 use hyper::StatusCode;
 use store::{
     ValueKey,
-    write::{AlignedBytes, Archive, ArchiveVersion},
+    write::{Archive, ArchiveBytes, ArchiveVersion},
 };
-use types::collection::{Collection, SyncCollection};
+use types::{
+    collection::{Collection, SyncCollection},
+    field::{CalendarEventField, Field},
+};
 
 const USER: &str = "sharing-move-atomic@example.com";
 const HOME: &str = "/dav/cal/sharing-move-atomic%40example.com/";
@@ -54,7 +57,7 @@ async fn archive(
     owner: u32,
     collection: Collection,
     id: u32,
-) -> Option<Archive<AlignedBytes>> {
+) -> Option<Archive<ArchiveBytes>> {
     test.server
         .store()
         .get_value(ValueKey::archive(owner, collection, id))
@@ -63,20 +66,31 @@ async fn archive(
 }
 async fn id(test: &TestServer, owner: u32, path: &str) -> u32 {
     test.server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap()
         .by_path(path)
         .unwrap()
         .document_id()
 }
-async fn snapshot(test: &TestServer, owner: u32) -> Vec<(u8, u32, ArchiveVersion, Vec<u8>)> {
+/// Every calendar row, event row and event content record of `owner`: at
+/// 1.0 an event's tree is in its own content record, which a MOVE must
+/// leave as it does the row.
+async fn snapshot(test: &TestServer, owner: u32) -> Vec<(u8, u8, u32, ArchiveVersion, Vec<u8>)> {
     let mut result = Vec::new();
-    for collection in [Collection::Calendar, Collection::CalendarEvent] {
+    for (collection, field) in [
+        (Collection::Calendar, Field::ARCHIVE),
+        (Collection::CalendarEvent, Field::ARCHIVE),
+        (
+            Collection::CalendarEvent,
+            CalendarEventField::Content.field(),
+        ),
+    ] {
         test.server
-            .archives(owner, collection, &(), |id, stored| {
+            .archives(owner, collection, field, &(), |id, stored| {
                 result.push((
                     collection.into(),
+                    field.inner(),
                     id,
                     stored.version,
                     stored.as_bytes().to_vec(),
@@ -261,7 +275,7 @@ pub async fn test(test: &mut TestServer) {
     controls(test, owner, &client).await;
     let resources = test
         .server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap();
     let paths = resources
@@ -643,22 +657,28 @@ async fn controls(test: &TestServer, owner: u32, client: &DummyWebDavClient) {
     // Every stored event name still has a live parent after all race/control cases.
     let mut calendars = std::collections::BTreeSet::new();
     test.server
-        .archives(owner, Collection::Calendar, &(), |id, _| {
+        .archives(owner, Collection::Calendar, Field::ARCHIVE, &(), |id, _| {
             calendars.insert(id);
             Ok(true)
         })
         .await
         .unwrap();
     test.server
-        .archives(owner, Collection::CalendarEvent, &(), |_, stored| {
-            for name in stored.unarchive::<CalendarEvent>()?.names.iter() {
-                assert!(
-                    calendars.contains(&name.parent_id.to_native()),
-                    "event name has a deleted parent"
-                );
-            }
-            Ok(true)
-        })
+        .archives(
+            owner,
+            Collection::CalendarEvent,
+            Field::ARCHIVE,
+            &(),
+            |_, stored| {
+                for name in stored.unarchive::<CalendarEvent>()?.names.iter() {
+                    assert!(
+                        calendars.contains(&name.parent_id.to_native()),
+                        "event name has a deleted parent"
+                    );
+                }
+                Ok(true)
+            },
+        )
         .await
         .unwrap();
 }
@@ -674,5 +694,5 @@ async fn set_default(test: &TestServer, owner: u32, id: u32) {
             types::field::PrincipalField::DefaultCalendarId,
             id.serialize(),
         );
-    test.server.store().write(batch.build_all()).await.unwrap();
+    test.server.store().write_batch(&mut batch).await.unwrap();
 }

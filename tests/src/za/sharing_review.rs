@@ -20,7 +20,7 @@ use hyper::StatusCode;
 use serde_json::json;
 use store::{
     ValueKey,
-    write::{AlignedBytes, Archive, BatchBuilder},
+    write::{Archive, ArchiveBytes, BatchBuilder},
 };
 use types::collection::{Collection, SyncCollection};
 
@@ -33,14 +33,14 @@ const PATCH: &str = "<D:propertyupdate xmlns:D=\"DAV:\"><D:set><D:prop><D:displa
 
 async fn id(test: &TestServer, owner: u32, path: &str) -> u32 {
     test.server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap()
         .by_path(path)
         .unwrap()
         .document_id()
 }
-async fn archive(test: &TestServer, owner: u32, calendar: u32) -> Archive<AlignedBytes> {
+async fn archive(test: &TestServer, owner: u32, calendar: u32) -> Archive<ArchiveBytes> {
     test.server
         .store()
         .get_value(ValueKey::archive(owner, Collection::Calendar, calendar))
@@ -364,7 +364,7 @@ pub async fn test(test: &mut TestServer) {
         }
         let resources = test
             .server
-            .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+            .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
             .await
             .unwrap();
         let retained_source = if rename { "renamed-during-move" } else { &slug };
@@ -466,7 +466,7 @@ pub async fn test(test: &mut TestServer) {
     );
     let resources = test
         .server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap();
     assert!(resources.by_path("move-late-source").is_some());
@@ -527,11 +527,7 @@ pub async fn test(test: &mut TestServer) {
                 let mut batch = BatchBuilder::new();
                 broken
                     .update(
-                        test.server
-                            .account_info(owner)
-                            .await
-                            .unwrap()
-                            .account_tenant_ids(),
+                        test.server.account_info(owner).await.unwrap().changed_by(),
                         stored.to_unarchived::<Calendar>().unwrap(),
                         owner,
                         calendar,
@@ -558,11 +554,7 @@ pub async fn test(test: &mut TestServer) {
                 original
                     .unwrap()
                     .update(
-                        test.server
-                            .account_info(owner)
-                            .await
-                            .unwrap()
-                            .account_tenant_ids(),
+                        test.server.account_info(owner).await.unwrap().changed_by(),
                         broken.to_unarchived::<Calendar>().unwrap(),
                         owner,
                         calendar,
@@ -603,7 +595,7 @@ pub async fn test(test: &mut TestServer) {
     // Cleanup goes through DAV, including any committed-prefix source still present on RED.
     let resources = test
         .server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap();
     let paths = resources
@@ -688,7 +680,7 @@ async fn plain_update_trace(test: &TestServer, failures: &mut Vec<String>) {
     let stored = test
         .server
         .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
             owner,
             Collection::CalendarEvent,
             event_id,
@@ -699,16 +691,14 @@ async fn plain_update_trace(test: &TestServer, failures: &mut Vec<String>) {
     let mut concurrent = stored.deserialize::<CalendarEvent>().unwrap();
     concurrent.flags ^= 1;
     let mut batch = BatchBuilder::new();
+    // A row-only change: the parked PUT asserts the row it read.
     concurrent
-        .update(
-            test.server
-                .account_info(owner)
-                .await
-                .unwrap()
-                .account_tenant_ids(),
+        .update_meta(
+            test.server.account_info(owner).await.unwrap().changed_by(),
             stored.to_unarchived::<CalendarEvent>().unwrap(),
             owner,
             event_id,
+            None,
             &mut batch,
         )
         .unwrap();

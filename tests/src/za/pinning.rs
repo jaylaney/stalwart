@@ -1158,10 +1158,10 @@ async fn case_11_failed_full_state(test: &TestServer) {
     admin
         .registry_update_setting(
             CalendarScheduling {
-                itip_max_size: 1500,
+                max_itip_size: 1500,
                 ..Default::default()
             },
-            &[Property::ItipMaxSize],
+            &[Property::MaxItipSize],
         )
         .await;
     admin.reload_settings().await;
@@ -1170,7 +1170,7 @@ async fn case_11_failed_full_state(test: &TestServer) {
     })
     .await;
     admin
-        .registry_update_setting(CalendarScheduling::default(), &[Property::ItipMaxSize])
+        .registry_update_setting(CalendarScheduling::default(), &[Property::MaxItipSize])
         .await;
     admin.reload_settings().await;
     assert_eq!(status, StatusCode::NO_CONTENT);
@@ -3399,49 +3399,21 @@ async fn pr_6_untokened_address(test: &TestServer) {
 /// token pair of `address` from its bundle, written straight to the store
 /// under the archive it was read from, as `contacts/pin`'s step 4 reseals.
 async fn keep_only_pair(test: &TestServer, account_id: u32, href: &str, address: &str) {
-    use groupware::calendar::{
-        CalendarEvent,
-        seal::{seal_event, unseal_event_pairs},
-    };
-    use store::{
-        ValueKey,
-        write::{AlignedBytes, Archive, BatchBuilder},
-    };
+    use crate::utils::za::{stored_event, write_stored_event};
+    use groupware::calendar::seal::{seal_event, unseal_event_pairs};
     let keys = crate::utils::za::za_unlock(test, account_id, STRONG).await;
     let document_id = document_id_of(test, account_id, href).await;
-    let archive = test
-        .server
-        .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
-            account_id,
-            types::collection::Collection::CalendarEvent,
-            document_id,
-        ))
-        .await
-        .unwrap()
-        .expect("the event's archive");
-    let mut event = archive.deserialize::<CalendarEvent>().unwrap();
+    let stored = stored_event(test, account_id, document_id).await;
+    let mut event = stored.za_event();
     let pairs = unseal_event_pairs(&mut event, &keys, account_id)
         .unwrap()
         .expect("a pair bundle");
     let kept = pairs.only(address).expect("a pair for the address");
     assert!(pairs.len() > kept.len(), "the copy holds another pair");
     seal_event(&mut event, &keys, account_id, Some(&kept)).unwrap();
-    let account_info = test.server.account_info(account_id).await.unwrap();
-    let mut batch = BatchBuilder::new();
-    event
-        .update(
-            account_info.account_tenant_ids(),
-            archive.to_unarchived::<CalendarEvent>().unwrap(),
-            account_id,
-            document_id,
-            &mut batch,
-        )
-        .unwrap();
-    test.server.commit_batch(batch).await.unwrap();
-    test.server
-        .invalidate_local_caches(&[common::ipc::CacheInvalidation::DavResources(account_id)])
-        .await;
+    // Upstream's full split update over the stored row and content, which
+    // also refreshes the account's resource cache.
+    write_stored_event(test, account_id, document_id, &stored, event).await;
 }
 
 /// Gives bob the second address `BOB_ALIAS` (on its own `.test` domain), or
@@ -3453,7 +3425,7 @@ async fn bob_alias(test: &TestServer, on: bool) {
         List::from_iter([EmailAlias {
             name: "key2".to_string(),
             domain_id,
-            enabled: true,
+            enable: true,
             description: None,
         }])
     } else {
@@ -3802,7 +3774,7 @@ fn documents(entries: Vec<ZaWithheld>) -> Vec<u32> {
     entries.iter().map(|entry| entry.document_id).collect()
 }
 
-/// Sets the inbound iTIP size limit (`CalendarScheduling::itip_max_size`)
+/// Sets the inbound iTIP size limit (`CalendarScheduling::max_itip_size`)
 /// to `size`, or restores the default for `None`, and reloads.
 async fn itip_max_size(test: &TestServer, size: Option<u64>) {
     let admin = test.account("admin@example.com");
@@ -3810,12 +3782,12 @@ async fn itip_max_size(test: &TestServer, size: Option<u64>) {
         .registry_update_setting(
             match size {
                 Some(itip_max_size) => CalendarScheduling {
-                    itip_max_size,
+                    max_itip_size: itip_max_size,
                     ..Default::default()
                 },
                 None => CalendarScheduling::default(),
             },
-            &[Property::ItipMaxSize],
+            &[Property::MaxItipSize],
         )
         .await;
     admin.reload_settings().await;
@@ -3925,7 +3897,7 @@ pub fn put_raw(
 pub async fn document_id_of(test: &TestServer, account_id: u32, href: &str) -> u32 {
     let resources = test
         .server
-        .fetch_dav_resources(account_id, account_id, SyncCollection::Calendar)
+        .fetch_groupware_resources(account_id, account_id, SyncCollection::Calendar)
         .await
         .unwrap();
     // A container's href ends with '/', an event's never, so a calendar
@@ -3933,7 +3905,7 @@ pub async fn document_id_of(test: &TestServer, account_id: u32, href: &str) -> u
     resources
         .resources
         .iter()
-        .map(|resource| resource.document_id)
+        .map(|resource| resource.document_id())
         .find(|id| {
             resources
                 .format_resource_paths_by_id(*id)
