@@ -2724,16 +2724,17 @@ async fn za_move_overwrite_container(
             .assert_value(PrincipalField::DefaultCalendarId, source)
             .clear(PrincipalField::DefaultCalendarId);
     }
-    // One physical transaction (upgrade: 1.0's batch accounts every set
-    // value, including the archive builders' size hints, in its own commit
-    // split; Task 6 re-derives the exact input bound 0.16 counted with
-    // `accounted_input_bytes`): no commit point may have been taken, and the
-    // open chunk is within upstream's commit limits.
+    // One physical transaction: no commit point may have been taken, the
+    // open chunk is within upstream's commit limits, and its input bytes
+    // (`accounted_input_bytes`, which first materializes the change logs and
+    // counters; its merges are the metadata viewer states and
+    // `clear_if_equals`, within its per-operation allowance) are within 5 MB.
+    let bytes = batch.accounted_input_bytes();
     let slices = batch.commit_point_count() + 1;
     let operations = batch.ops().len();
     #[cfg(feature = "test_mode")]
-    common::za::test_hooks::record_calendar_move_plan(owner, operations, 0, slices);
-    if slices != 1 || operations > 1000 || batch.is_large_batch() {
+    common::za::test_hooks::record_calendar_move_plan(owner, operations, bytes, slices);
+    if slices != 1 || operations > 1000 || bytes > 5_000_000 || batch.is_large_batch() {
         return Err(DavError::Code(StatusCode::CONFLICT));
     }
     #[cfg(feature = "test_mode")]

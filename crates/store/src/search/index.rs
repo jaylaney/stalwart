@@ -14,6 +14,7 @@ use crate::{
 };
 use ahash::AHashSet;
 use trc::AddContext;
+use types::collection::Collection;
 
 const STORED_DOCUMENT_BATCH: usize = 1024;
 
@@ -48,6 +49,13 @@ impl Store {
             &stored,
             diffs,
         )?;
+        // Zero-access fork: under `test_mode`, `INDEX_CHUNK_PAUSE` can park
+        // the pass between its first and second commit chunk.
+        #[cfg(feature = "test_mode")]
+        crate::za_test::write_index_pass(self, &mut batch, account_id)
+            .await
+            .caused_by(trc::location!())?;
+        #[cfg(not(feature = "test_mode"))]
         self.write_batch(&mut batch)
             .await
             .caused_by(trc::location!())?;
@@ -330,6 +338,9 @@ pub(crate) fn account_batch(
     stored: &[(u32, Vec<u8>)],
     diffs: bool,
 ) -> trc::Result<BatchBuilder> {
+    // Zero-access fork (mail ruling R58): the absent keys of the pass's
+    // fenced documents, asserted in each of its commit chunks below.
+    let za_fences = za_index_fences(&documents);
     let mut account_indexer = AccountIndexer::default();
     for document_id in unindex_document_ids {
         if let Some(document) = stored_document(stored, *document_id) {
@@ -361,7 +372,31 @@ pub(crate) fn account_batch(
         }
     }
 
-    account_indexer.build_batch(index, account_id)
+    let mut batch = account_indexer.build_batch(index, account_id)?;
+    batch.za_assert_absent_in_every_chunk(&za_fences)?;
+    Ok(batch)
+}
+
+/// Zero-access fork (mail ruling R58, Task 1's ruling 18): the distinct
+/// absent keys the pass's documents carry (`IndexDocument::assert_absent`,
+/// set by the index worker's builders for an account read as ordinary).
+/// `account_batch` asserts them in every commit chunk of the pass: a pass
+/// splits (`build_batch` adds a commit point every 1000 term merges, and
+/// one after each `Document` key once the batch is large), and
+/// `write_batch` commits each chunk as its own transaction, so a pass that
+/// holds a fenced document writes no chunk once the account holds a vault
+/// record.
+fn za_index_fences(documents: &[(u32, IndexDocument)]) -> Vec<(u32, Collection, u32, ValueClass)> {
+    let mut fences: Vec<(u32, Collection, u32, ValueClass)> = Vec::new();
+    for fence in documents
+        .iter()
+        .filter_map(|(_, document)| document.assert_absent.as_ref())
+    {
+        if !fences.contains(fence) {
+            fences.push(fence.clone());
+        }
+    }
+    fences
 }
 
 pub(crate) fn stored_document(stored: &[(u32, Vec<u8>)], document_id: u32) -> Option<&[u8]> {
@@ -376,3 +411,7 @@ pub(crate) fn stored_document(stored: &[(u32, Vec<u8>)], document_id: u32) -> Op
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/store/src/search/index/test_support.rs"]
 mod test_support;
+
+#[cfg(test)]
+#[path = "index_za_tests.rs"]
+mod za_tests;

@@ -7,7 +7,7 @@
 use super::{
     AccountCounter, Batch, BatchBuilder, ChangedCollection, CommitPriority, IntoOperations,
     Operation, QueueCounter, QueueNotify, ValueClass, ValueOp,
-    assert::ToAssertValue,
+    assert::{AssertValue, ToAssertValue},
     counter::CounterKey,
     log::{CalendarTombstone, VanishedItem},
 };
@@ -1089,6 +1089,137 @@ impl CommitPointIterator {
                 self.offset_start = end;
                 point
             })
+    }
+}
+
+/// Zero-access fork: the fixed allowance `accounted_input_bytes` reserves for
+/// each operation's key, tag and scalars.
+const ZA_OPERATION_OVERHEAD: usize = 64;
+
+impl BatchBuilder {
+    /// Zero-access fork (mail ruling R58, Task 1's ruling 18): opens every
+    /// commit chunk that holds an operation with one assertion per key that
+    /// each `(account_id, collection, document_id, class)` key is absent, so
+    /// each chunk commits only while every key is absent. `write_batch`
+    /// commits each chunk as its own transaction, and `add_commit_point`
+    /// re-emits only the account and the collection, so an assertion placed
+    /// once would cover only the first chunk.
+    ///
+    /// For a built search-index pass only (`AccountIndexer::build_batch`),
+    /// whose operations all name their own keys (`ValueClass::SearchIndex`
+    /// values), so the selection the assertions leave behind does not
+    /// matter to them. Any other operation is refused with an error and the
+    /// batch is left as it was.
+    pub fn za_assert_absent_in_every_chunk(
+        &mut self,
+        keys: &[(u32, Collection, u32, ValueClass)],
+    ) -> trc::Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let self_keyed = self.changes.is_empty()
+            && self.counters.is_empty()
+            && self.ops.iter().all(|op| {
+                matches!(
+                    op,
+                    Operation::Value {
+                        class: ValueClass::SearchIndex(_),
+                        ..
+                    }
+                )
+            });
+        if !self_keyed {
+            return Err(trc::StoreEvent::UnexpectedError
+                .caused_by(trc::location!())
+                .ctx(
+                    trc::Key::Reason,
+                    "Chunk assertions are placed on search-index passes only.",
+                ));
+        }
+
+        let ends = self
+            .commit_points
+            .iter()
+            .map(|point| point.ops)
+            .chain([self.ops.len()])
+            .collect::<Vec<_>>();
+        let mut ops = Vec::with_capacity(self.ops.len() + ends.len() * keys.len() * 4);
+        let mut old_ops = std::mem::take(&mut self.ops).into_iter();
+        let mut start = 0;
+        for (chunk, end) in ends.into_iter().enumerate() {
+            let len = end.saturating_sub(start);
+            if len > 0 {
+                for (account_id, collection, document_id, class) in keys {
+                    ops.push(Operation::AccountId {
+                        account_id: *account_id,
+                    });
+                    ops.push(Operation::Collection {
+                        collection: *collection,
+                    });
+                    ops.push(Operation::DocumentId {
+                        document_id: PendingId::Assigned(*document_id),
+                    });
+                    ops.push(Operation::AssertValue {
+                        class: class.clone(),
+                        assert_value: AssertValue::None,
+                    });
+                }
+            }
+            ops.extend(old_ops.by_ref().take(len));
+            if let Some(point) = self.commit_points.get_mut(chunk) {
+                point.ops = ops.len();
+            }
+            start = end;
+        }
+        self.ops = ops;
+        Ok(())
+    }
+
+    /// Zero-access fork: the input bytes of the batch's operations, for a
+    /// caller that bounds one transaction's payload (the calendar move
+    /// route, `dav::calendar::copy_move`). It first materializes the pending
+    /// change logs and counters, as `commit_points()` does, so it takes
+    /// `&mut self`; a later `commit_points()` finds nothing left to add.
+    ///
+    /// Each operation counts `ZA_OPERATION_OVERHEAD` plus its key hint, and:
+    /// a fixed or patched value its length (a patch overwrites in place); a
+    /// serializable value its size hint (only `PendingMessageData` and
+    /// `PendingTask` serialize this way, an estimate); a counter 16; an
+    /// index key, a cleared range's bounds and a serialized log their
+    /// lengths; a log with pending ids `Changes::za_serialized_size_bound`.
+    /// A merge counts no input: 1.0's `MergeFnc` is a closure with no
+    /// countable inputs, and its output is not bounded by anything the batch
+    /// holds. So this is a bound only for batches whose merges are known to
+    /// emit at most `ZA_OPERATION_OVERHEAD` bytes; the move route's are the
+    /// metadata viewer states (12 bytes, `merge_viewer_state`) and
+    /// `clear_if_equals` (none).
+    pub fn accounted_input_bytes(&mut self) -> usize {
+        self.serialize_changes();
+        self.flush_counters();
+        self.ops.iter().fold(0usize, |total, operation| {
+            let bytes = match operation {
+                Operation::Value { class, op } => class.key_len_hint().saturating_add(match op {
+                    ValueOp::Set(SetValue::Fixed(bytes))
+                    | ValueOp::Set(SetValue::Patched(bytes, _)) => bytes.len(),
+                    ValueOp::Set(SetValue::Serializable(value)) => value.0.size_hint(),
+                    ValueOp::MergeFnc(_) | ValueOp::Clear => 0,
+                    ValueOp::AtomicAdd(_) | ValueOp::AddAndGet(_) => 16,
+                }),
+                Operation::AssertValue { class, .. } => class.key_len_hint(),
+                Operation::Index { key, .. } => key.len(),
+                Operation::Log { set, .. } => match set {
+                    LogSet::Bytes(bytes) => bytes.len(),
+                    LogSet::Pending(changes) => changes.za_serialized_size_bound(),
+                },
+                Operation::ClearRange { from, to, .. } => from.len().saturating_add(to.len()),
+                Operation::AccountId { .. }
+                | Operation::Collection { .. }
+                | Operation::DocumentId { .. } => 0,
+            };
+            total
+                .saturating_add(ZA_OPERATION_OVERHEAD)
+                .saturating_add(bytes)
+        })
     }
 }
 

@@ -529,6 +529,29 @@ impl Changes {
 }
 
 impl Changes {
+    /// Zero-access fork (`BatchBuilder::accounted_input_bytes`): an upper
+    /// bound on `serialize_into`'s output whatever ids it resolves: the
+    /// presence and extended bytes, one LEB128 count per list (at most 10
+    /// bytes each), and at most 10 bytes per id (`write_ids` writes one
+    /// LEB128 `u64` delta; `write_prefixed_ids` a `u32` delta and a
+    /// zigzagged `u32` delta, at most 5 bytes each).
+    pub(crate) fn za_serialized_size_bound(&self) -> usize {
+        const LEB128_MAX: usize = 10;
+        let ids = self.container_inserts.len()
+            + self.container_updates.len()
+            + self.container_property_changes.len()
+            + self.container_deletes.len()
+            + self.item_inserts.len()
+            + self.item_updates.len()
+            + self.item_deletes.len()
+            + self.metadata.as_ref().map_or(0, |metadata| {
+                metadata.containers.len() + metadata.items.len()
+            });
+        2usize
+            .saturating_add(CHANGE_LISTS.saturating_mul(LEB128_MAX))
+            .saturating_add(ids.saturating_mul(LEB128_MAX))
+    }
+
     pub fn serialize(&self, is_prefixed: bool, scratch: &mut Vec<u64>) -> Option<Vec<u8>> {
         if self.has_pending() {
             return None;

@@ -11,18 +11,17 @@
 //! account reaching the point takes it; requests for other accounts pass
 //! and leave it set.
 //!
-//! - `INDEX_CHUNK_PAUSE`: after a multi-chunk search document's first
-//!   commit chunk and before its second, keyed by the document's account
-//!   (mail ruling R62).
-//! - `INDEX_GUARD_FAIL_ONCE`: the account's next later commit chunk (the
-//!   second or after) of a guarded search document is not written and
-//!   fails with `AssertValueFailed`, as FoundationDB reports a read error
-//!   at the guard's assertion (mail ruling R63).
+//! - `INDEX_CHUNK_PAUSE`: in `Store::index_account_documents`, after an
+//!   index pass's first commit chunk is written and before its second,
+//!   keyed by the pass's account (`write_index_pass`). A pass reaches a
+//!   second chunk when it is large or under `FORCE_COMMIT_SPLIT`. Used to
+//!   provision or delete the account mid-pass (Task 6, ruling 18's
+//!   per-chunk vault-absence assertion).
 //!
-//!   These two had their call sites in 0.16's `Store::index`, which 1.0.1
-//!   replaced with `Store::index_account_documents`; no call site reaches
-//!   them until R62's per-chunk guard and R63's confirmation read are
-//!   placed again, if they are kept.
+//!   0.16's `INDEX_GUARD_FAIL_ONCE` is retired with R62's per-chunk guard
+//!   and R63's confirmation read (Task 6, ruling 19): 1.0's index queue runs
+//!   an account's index and unindex entries in order on one partition
+//!   worker, so the guard has no subject.
 //! - `FORCE_COMMIT_SPLIT`: while it names an account, every
 //!   `BatchBuilder::commit_point()` adds a commit point, as if the batch were
 //!   large, once the chunk holds an operation, in two kinds of batch: one
@@ -88,26 +87,25 @@ pub async fn index_chunk_pause_point(account_id: u32) {
     wait(take_for(&INDEX_CHUNK_PAUSE, account_id)).await;
 }
 
-/// The account whose next guarded later chunk fails its guard unwritten.
-pub static INDEX_GUARD_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
-
-pub fn set_index_guard_fail_once(account_id: Option<u32>) {
-    *INDEX_GUARD_FAIL_ONCE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = account_id;
-}
-
-/// Whether `INDEX_GUARD_FAIL_ONCE` names `account_id`; clears it if so.
-pub fn take_index_guard_fail(account_id: u32) -> bool {
-    let mut slot = INDEX_GUARD_FAIL_ONCE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if *slot == Some(account_id) {
-        *slot = None;
-        true
-    } else {
-        false
+/// `Store::write_batch` for an index pass, with `INDEX_CHUNK_PAUSE` between
+/// its first and second commit chunk: the same chunks, each written as its
+/// own transaction, in the same order.
+pub(crate) async fn write_index_pass(
+    store: &crate::Store,
+    batch: &mut crate::write::BatchBuilder,
+    account_id: u32,
+) -> trc::Result<()> {
+    let mut assigned_ids = crate::write::AssignedIds::default();
+    let mut commit_points = batch.commit_points();
+    for (chunk, commit_point) in commit_points.iter().enumerate() {
+        if chunk == 1 {
+            index_chunk_pause_point(account_id).await;
+        }
+        store
+            .write(batch.build_one(commit_point), &mut assigned_ids)
+            .await?;
     }
+    Ok(())
 }
 
 /// The account whose batches, and every batch with no current account, add
@@ -197,5 +195,75 @@ mod tests {
         assert_eq!(index_pass, 2);
         assert_eq!(batch_of(SPLIT).commit_point_count(), 0);
         assert_eq!(index_pass_of(SPLIT).commit_point_count(), 0);
+    }
+
+    /// Ruling 18 at runtime: a vault record written between a fenced pass's
+    /// first and second commit chunk stops every later chunk. The pass's
+    /// `Document` keys come last (`build_batch`), so none is written.
+    #[tokio::test]
+    async fn a_vault_written_mid_pass_stops_the_later_chunks() {
+        use crate::{Store, backend::ephemeral::EphemeralStore};
+        use types::field::PrincipalField;
+
+        // An account id no other test of this crate uses.
+        const MID_PASS: u32 = 0x5a5a_0201;
+        let vault: ValueClass = PrincipalField::ZeroAccessVault.into();
+        let text = (0..2500)
+            .map(|n| format!("term{n:05}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut document = IndexDocument::new(SearchIndex::Email)
+            .with_account_id(MID_PASS)
+            .with_document_id(1);
+        document.index_text(EmailSearchField::Body, &text, Language::English);
+        let document =
+            document.with_assert_absent(MID_PASS, Collection::Principal, 0, vault.clone());
+
+        let store: Store = EphemeralStore::open();
+        let pause = Arc::new(Pause::new(MID_PASS));
+        set_index_chunk_pause(Some(pause.clone()));
+        let arrived = pause.arrived.notified();
+        let writer = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .index_account_documents(MID_PASS, SearchIndex::Email, vec![document], vec![])
+                    .await
+            })
+        };
+        arrived.await;
+
+        // Chunk 0 is written: some terms, no `Document` key.
+        assert!(
+            store
+                .has_account_search_terms(SearchIndex::Email, MID_PASS)
+                .await
+                .unwrap()
+        );
+        let mut batch = BatchBuilder::new();
+        batch
+            .with_account_id(MID_PASS)
+            .with_collection(Collection::Principal)
+            .with_document(0)
+            .set(vault, vec![1u8]);
+        store.write_batch(&mut batch).await.unwrap();
+        pause.release.notify_one();
+
+        let err = writer.await.unwrap().unwrap_err();
+        assert!(err.is_assertion_failure());
+        let document = crate::ValueKey::from(ValueClass::SearchIndex(
+            crate::write::SearchIndexClass::Document {
+                index: SearchIndex::Email,
+                account_id: MID_PASS,
+                document_id: 1,
+            },
+        ));
+        assert!(
+            store
+                .get_value::<crate::write::serialize::RawValue>(document)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

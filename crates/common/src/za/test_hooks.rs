@@ -81,27 +81,20 @@
 //!   account (`http::api::vault`, mail spec 6.1's recheck).
 //! - `FORCE_SQL_STORE`: `setup-token` answers as on PostgreSQL or MySQL
 //!   (mail spec 6.1).
-//! - `INDEX_WRITE_PAUSE`: in the index worker after its documents are built
-//!   and immediately before the search store's write, keyed by the account
-//!   of a queued document (mail ruling R54). At 0.16 its call site was
-//!   `services::task_manager::index`, which 1.0 replaced with the index
-//!   queue (`services::index_queue`); Task 6 re-homes the call site.
+//! - `INDEX_WRITE_PAUSE`: in the index worker after a pass's documents are
+//!   built and immediately before the search store's write, keyed by the
+//!   partition's account, for a pass that holds a document to write (mail
+//!   ruling R54). At 0.16 its call site was `services::task_manager::index`;
+//!   at 1.0 it is `services::index_queue::index::process_items`, before
+//!   `Sink::flush`. The pass's queue entries stay stored while it is held.
 //! - `TRAIN_PAUSE`: in `add_account_spam_sample` after the message's
 //!   metadata read and before the sample is added to the batch, keyed by
 //!   the sample's account (`email::message::ingest`, mail ruling R55).
-//! - `INDEX_CHUNK_PAUSE`: in `Store::index` after a multi-chunk document's
-//!   first commit chunk and before its second, keyed by the document's
-//!   account (`store::search::index`, mail ruling R62); defined in
-//!   `store::za_test` and re-exported here.
-//! - `INDEX_GUARD_FAIL_ONCE`: the account's next later commit chunk of a
-//!   guarded search document is not written and fails with
-//!   `AssertValueFailed`, as FoundationDB reports a read error at the
-//!   guard's assertion (`store::search::index`, mail ruling R63); defined in
-//!   `store::za_test` and re-exported here.
-//!
-//!   `INDEX_CHUNK_PAUSE` and `INDEX_GUARD_FAIL_ONCE` have no call site at
-//!   1.0 (0.16's `Store::index` is gone); Task 6 decides their fate with
-//!   R62 and R63.
+//! - `INDEX_CHUNK_PAUSE`: in `Store::index_account_documents` after an
+//!   index pass's first commit chunk and before its second, keyed by the
+//!   pass's account (`store::search::index`); defined in `store::za_test`
+//!   and re-exported here. 0.16's `INDEX_GUARD_FAIL_ONCE` is retired with
+//!   R62's per-chunk guard and R63's confirmation read (Task 6, ruling 19).
 //! - `FORCE_COMMIT_SPLIT` (ruling 18): while it names an account, every
 //!   `BatchBuilder::commit_point()` of a batch whose current account is that
 //!   account, or of a batch with no current account, adds a commit point.
@@ -116,10 +109,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
-pub use store::za_test::{
-    FORCE_COMMIT_SPLIT, INDEX_GUARD_FAIL_ONCE, Pause, set_index_chunk_pause,
-    set_index_guard_fail_once,
-};
+pub use store::za_test::{FORCE_COMMIT_SPLIT, Pause, set_index_chunk_pause};
 
 /// Sets `FORCE_COMMIT_SPLIT` to `account_id` for the guard's lifetime; the
 /// drop clears it, also when the test panics.
