@@ -283,9 +283,17 @@ impl Account {
                 "fromAccountId": from_account.id_string(),
                 "accountId": to_account.id_string(),
                 "onSuccessDestroyOriginal": on_success_destroy,
+                // 1.0 reads the source record's id from each create object's
+                // "id" (RFC 8620 5.4); 0.16 read the creation key. The key
+                // stays the source id, so responses are keyed as before.
                 "create": items
                         .into_iter()
-                        .map(|(i, item)| (i.to_string(), item)).collect::<serde_json::Map<_, _>>()
+                        .map(|(i, mut item)| {
+                            if let Value::Object(map) = &mut item {
+                                map.entry("id").or_insert_with(|| Value::String(i.to_string()));
+                            }
+                            (i.to_string(), item)
+                        }).collect::<serde_json::Map<_, _>>()
             },
             "0"
         ]]))
