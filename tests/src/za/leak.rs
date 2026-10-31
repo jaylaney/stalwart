@@ -6,12 +6,62 @@
 
 //! Spec 11: decodes every stored record and asserts the sealing boundary.
 //! A regression test, not a proof.
+//!
+//! At 1.0 the walk is keyed on the `Subspace` enum (`Subspace::ALL`), never
+//! on subspace bytes: `m`, `y` and `u` changed meaning between 0.16 and 1.0
+//! (Task 6). Each subspace that can hold a key account's data has a stated
+//! rule for what the account may hold there in the clear; every record of
+//! every subspace is also searched for the canaries, raw and decoded:
+//!
+//! - `Property` (`p`): the calendar, event and inbox-item records (the
+//!   structural checks below), and the object-metadata containers
+//!   (`Collection::Metadata`): no `Private` container (ruling 66); a
+//!   calendar's or event's `Shared` container is a sealed wrapper
+//!   (`is_sealed_container`; rulings 16, 23 and 29); a mailbox's, message's
+//!   or Sieve script's `Shared` container is object metadata, refused for a
+//!   key account (ruling 66); an address book's, card's or file's `Shared`
+//!   container holds DAV dead properties, which DAV keeps in the clear for
+//!   contacts and files (design, "Other object kinds"); the `Viewer` and
+//!   `Owner` counters are 12 bytes (a change id and a container count,
+//!   `merge_viewer_state`). Names are never in metadata keys, so the rule
+//!   reads the class byte, not a name.
+//! - `Immutable` (`c`): a message's metadata row is a stub (mail spec 5.2),
+//!   exactly the row `seal_stub` writes for its bundle and blob; its sort
+//!   keys are the empty ones `za_ingest` writes (`MessageSortKeys::default`);
+//!   nothing else of the account is stored there (`ValueClass::Immutable`
+//!   holds only `EmailField::Metadata` and `SortKeys`).
+//! - `IndexProperty` (`v`): no threading hash (mail spec 5.4); a mailbox's
+//!   name index (its parent and lower-cased name: visible by structure, mail
+//!   spec 5.6, reported in `Scan::found`), a Sieve script's seen-id hashes
+//!   (keyed hashes of an id, `SeenIdHash`) and a submission's integer
+//!   indexes (send time, queue id; values hold ids and the undo status, and
+//!   the delivery results' recipients and replies) are permitted; any other
+//!   index property of the account is unclassified and flagged (the
+//!   writers are `email` and `merge_threads` only, by source).
+//! - `SearchTerm` (`z`) and `SearchDocument` (`m`), in the internal search
+//!   store: no Calendar entry of the account (calendar spec 9); no Email
+//!   term, and every Email document holds its ids only (ruling 64:
+//!   `IDS_ONLY_DOCUMENT`; 1.0's Email index has no arrival-time or size
+//!   field); Contacts and File entries are permitted (ruling 65: their
+//!   builders index plaintext for every account, as at 0.16).
+//! - `SearchQueue` (`y`, in the data store): the account's queue entries
+//!   carry ids only (the key: index, account, document, creation id; the
+//!   value: one action byte, 0 or 1); a partition's queued-work marker is
+//!   empty and its status key decodes as a `SearchIndexStatus` (a retry
+//!   time, an attempt count and an error reason, searched for canaries).
+//! - `System` (`u`): the schema version (`0x00`), the node-id leases
+//!   (`0x01 || node id`) and the UID leases (`ZA_UID_LEASE_PREFIX ||
+//!   account || SHA-256 of the UID`, ruling 24) only; any other record is
+//!   unclassified and flagged. None names content.
+//! - `BlobLink`, `Blobs`, `SpamSamples`: as at 0.16 (no temporary link held
+//!   once delivery completes, every blob searched decoded, no spam sample
+//!   of the account).
 
 use super::{
     STRONG,
     dav_seal::{CANARIES, EVENT, mkcalendar_body, raw_event, raw_event_records},
     fanout::{NO_REPLY, uid_copies},
-    mail::{Traced, key_mail_account, message_ids, stored_metadata},
+    mail::{Traced, key_mail_account, message_ids, stored_metadata_bytes},
     pinning::{ALICE, drop_entries, forget, parties, refuse_once_at},
     raw_input::{SUBMISSION_PORT, strings},
 };
@@ -23,10 +73,12 @@ use crate::{
         smtp::SmtpConnection,
         webdav::DummyWebDavClient,
         za::{
-            Conn, PlantedItem, copy_href, hold_task_consumer, inbox_ids, itip_tasks_for,
-            new_inbox_items, pending_ids, pin_record, plant_inbox_item, plant_plain_message,
-            plant_sealed_event, queued_recipients, substitute_public_key, trigger_drain,
-            wait_for_delivery, za_unlock,
+            Conn, IDS_ONLY_DOCUMENT, PlantedItem, copy_href, hold_index_partition,
+            hold_task_consumer, inbox_ids, internal_search, itip_tasks_for, new_inbox_items,
+            pending_ids, pin_record, plain_dav_container, plant_container, plant_event,
+            plant_inbox_item, plant_plain_message, plant_sealed_event, queued_recipients,
+            release_index_partition, substitute_public_key, trigger_drain, wait_for_delivery,
+            za_unlock,
         },
     },
     za::drain::{DrainOn, body, set_partstat},
@@ -36,26 +88,22 @@ use base64::{
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD},
 };
 use calcard::icalendar::{ICalendar, ICalendarEntry, ICalendarProperty};
-use email::{
-    cache::MessageCacheFetch,
-    message::{
-        metadata::{MESSAGE_HAS_ATTACHMENT, MessageMetadata, MetadataPartType},
-        za::MAIL_FORMAT_V1,
-    },
+use common::storage::search::SearchIndexStatus;
+use email::message::{
+    metadata::MetadataRow,
+    sortkeys::MessageSortKeys,
+    za::{MAIL_FORMAT_V1, is_stub, stub_structure},
 };
-use groupware::{
-    cache::GroupwareCache,
-    calendar::{
-        Calendar, CalendarEvent, CalendarEventData, CalendarEventNotification,
-        EVENT_NOTIFICATION_ZA_PENDING, Timezone,
-        seal::{
-            TokenPairs,
-            collection::COLLECTION_MARKER,
-            event_token_pairs,
-            item::RSVP_TOKEN_PROP,
-            policy::{is_visible_entry, is_visible_parameter},
-            tree::{EXTRA_PROP, KEY_PROP, SEALED_PROP},
-        },
+use groupware::calendar::{
+    Calendar, CalendarEvent, CalendarEventContent, CalendarEventNotification,
+    CalendarEventNotificationContent, EVENT_NOTIFICATION_ZA_PENDING, Timezone,
+    seal::{
+        TokenPairs, ZaEvent,
+        collection::COLLECTION_MARKER,
+        event_token_pairs, is_sealed_container,
+        item::{RSVP_TOKEN_PROP, item_message},
+        policy::{is_visible_entry, is_visible_parameter},
+        tree::{EXTRA_PROP, KEY_PROP, SEALED_PROP},
     },
 };
 use hyper::StatusCode;
@@ -66,24 +114,25 @@ use registry::{
     schema::structs::SpamTrainingSample,
 };
 use serde_json::json;
+use std::collections::{BTreeMap, BTreeSet};
 use store::{
-    IterateParams, SUBSPACE_ACL, SUBSPACE_BLOB_LINK, SUBSPACE_BLOBS, SUBSPACE_COUNTER,
-    SUBSPACE_DELETED_ITEMS, SUBSPACE_DIRECTORY, SUBSPACE_IN_MEMORY_COUNTER,
-    SUBSPACE_IN_MEMORY_VALUE, SUBSPACE_INDEXES, SUBSPACE_LOGS, SUBSPACE_PROPERTY,
-    SUBSPACE_QUEUE_EVENT, SUBSPACE_QUEUE_MESSAGE, SUBSPACE_QUOTA, SUBSPACE_REGISTRY,
-    SUBSPACE_REGISTRY_IDX, SUBSPACE_REGISTRY_PK, SUBSPACE_REPORT_IN, SUBSPACE_REPORT_OUT,
-    SUBSPACE_SEARCH_INDEX, SUBSPACE_SPAM_SAMPLES, SUBSPACE_TASK_QUEUE, SUBSPACE_TELEMETRY_METRIC,
-    SUBSPACE_TELEMETRY_SPAN, Serialize as _, U32_LEN, U64_LEN,
-    write::{AlignedBytes, AnyKey, Archive, Archiver, BatchBuilder, SearchIndex},
+    Deserialize as _, IterateParams, Subspace, U32_LEN, U64_LEN, ValueKey, ZA_UID_LEASE_PREFIX,
+    write::{
+        AnyKey, Archive, ArchiveBytes, Archiver, BatchBuilder, IndexPropertyClass, QueueDocumentId,
+        SearchIndex, SearchIndexClass, ValueClass, metadata::MetadataClass, serialize::RawValue,
+    },
 };
 use trc::EventType;
 use types::{
     blob_hash::BLOB_HASH_LEN,
     collection::{Collection, SyncCollection},
-    field::{EmailField, Field},
+    field::{
+        CalendarEventField, CalendarNotificationField, EmailField, EmailSubmissionField, Field,
+        MailboxField, SieveField,
+    },
     id::Id,
 };
-use utils::cheeky_hash::CheekyHash;
+use utils::{cheeky_hash::CheekyHash, hash128::Hash128};
 
 const CONTENT_TYPE: (&str, &str) = ("content-type", "text/calendar; charset=utf-8");
 const EVENT_PATH: &str = "/dav/cal/key2%40example.com/leak/e.ics";
@@ -147,33 +196,6 @@ const EXTRA_CANARIES: &[&str] = &[
 /// structure. The scan reports them in `Scan::found`, not as violations: the
 /// positive controls of `test_mail`.
 const VISIBLE_CANARIES: &[&str] = &["mailkw-canary", "mailbox-canary"];
-
-/// The search fields a key account's message documents hold (mail spec 5.5):
-/// `EmailSearchField::ReceivedAt` and `Size`, as `SearchField::u8_id`
-/// (`store/src/search/term.rs`, crate-private) numbers them.
-const SEARCH_FIELD_RECEIVED_AT: u8 = 10;
-const SEARCH_FIELD_SIZE: u8 = 12;
-
-/// The layout of the store's search document (`TermIndex`,
-/// `store/src/search/term.rs`, crate-private), mirrored to decode the value
-/// of a `Document`-layout search entry.
-#[derive(rkyv::Archive, rkyv::Deserialize, rkyv::Serialize)]
-struct ScannedDocument {
-    terms: Vec<ScannedTerm>,
-    fields: Vec<ScannedField>,
-}
-
-#[derive(rkyv::Archive, rkyv::Deserialize, rkyv::Serialize)]
-struct ScannedTerm {
-    hash: CheekyHash,
-    fields: u32,
-}
-
-#[derive(rkyv::Archive, rkyv::Deserialize, rkyv::Serialize)]
-struct ScannedField {
-    field_id: u8,
-    data: Vec<u8>,
-}
 
 /// Plan 10: key1's invitation to key2 with every canary the drain handles,
 /// plus an external attendee whose address is a canary.
@@ -241,39 +263,27 @@ const TOKEN_EVENT_B: [u8; 16] = *b"za-tok-event-b04";
 /// Archive marker bits (`store/src/write/serialize.rs`, private there).
 const ARCHIVE_MAGIC_MARKER: u8 = 1 << 7;
 const ARCHIVE_LZ4_COMPRESSED: u8 = 1 << 4;
-const ARCHIVE_VERSIONED: u8 = 1 << 6;
-const ARCHIVE_HASHED: u8 = 1 << 5;
 /// Largest decompressed size the scanner accepts for a value that merely
 /// looks like an LZ4 archive, so arbitrary bytes cannot ask for gigabytes.
 const MAX_DECODED_LEN: usize = 64 * 1024 * 1024;
 
-/// Every subspace `assert_is_empty` knows about, plus the change log.
-const SUBSPACES: &[u8] = &[
-    SUBSPACE_ACL,
-    SUBSPACE_TASK_QUEUE,
-    SUBSPACE_IN_MEMORY_VALUE,
-    SUBSPACE_IN_MEMORY_COUNTER,
-    SUBSPACE_PROPERTY,
-    SUBSPACE_QUEUE_MESSAGE,
-    SUBSPACE_QUEUE_EVENT,
-    SUBSPACE_REPORT_OUT,
-    SUBSPACE_REPORT_IN,
-    SUBSPACE_DELETED_ITEMS,
-    SUBSPACE_SPAM_SAMPLES,
-    SUBSPACE_BLOB_LINK,
-    SUBSPACE_BLOBS,
-    SUBSPACE_COUNTER,
-    SUBSPACE_QUOTA,
-    SUBSPACE_INDEXES,
-    SUBSPACE_TELEMETRY_SPAN,
-    SUBSPACE_TELEMETRY_METRIC,
-    SUBSPACE_SEARCH_INDEX,
-    SUBSPACE_REGISTRY,
-    SUBSPACE_REGISTRY_IDX,
-    SUBSPACE_REGISTRY_PK,
-    SUBSPACE_DIRECTORY,
-    SUBSPACE_LOGS,
-];
+/// `MetadataClass::Shared` and `Private`'s key bytes (`store/src/write/
+/// metadata.rs`, crate-private there); `VIEWER` and `OWNER` are public.
+const METADATA_SHARED: u8 = 0;
+const METADATA_PRIVATE: u8 = 1;
+/// The length of a `Viewer` or `Owner` counter (`ViewerState`: a change id
+/// and a container count).
+const METADATA_COUNTER_LEN: usize = U64_LEN + U32_LEN;
+
+/// The `System` subspace's kinds (`SystemKind`, `store/src/write/key.rs`).
+const SYSTEM_SCHEMA_VERSION: u8 = 0x00;
+const SYSTEM_NODE_ID: u8 = 0x01;
+/// A UID lease's key length (`common::za::lease::LEASE_KEY_LEN`).
+const LEASE_KEY_LEN: usize = 1 + U32_LEN + 32;
+
+/// A search-queue entry's key length: the index byte, the partition and the
+/// document id (u32 BE) and the creation id (u64 BE).
+const QUEUE_ENTRY_LEN: usize = 1 + U32_LEN * 2 + U64_LEN;
 
 /// What one scan saw. The counters let the caller prove the scanner was
 /// not blind: a wrong key layout would decode nothing and find nothing.
@@ -283,15 +293,24 @@ pub struct Scan {
     pub records: usize,
     pub archives: usize,
     pub blobs: usize,
+    /// Records of the internal search store's `SearchTerm` and
+    /// `SearchDocument` subspaces, and those of the account.
     pub search_records: usize,
     pub search_account_records: usize,
+    /// The account's search-queue entries, markers and status keys.
+    pub queue_records: usize,
+    /// The account's object-metadata records (containers and counters).
+    pub metadata_records: usize,
+    /// The account's `IndexProperty` and `Immutable` records.
+    pub index_properties: usize,
+    pub immutables: usize,
     pub events: usize,
     pub calendars: usize,
     pub items: usize,
     pub item_keys: usize,
     pub item_extras: usize,
     pub emails: usize,
-    /// Message metadata archives of the account that are stubs.
+    /// Message metadata rows of the account that are stubs.
     pub stubs: usize,
     /// Hits of `VISIBLE_CANARIES`, which are not violations.
     pub found: Vec<String>,
@@ -326,90 +345,304 @@ fn find_canaries(bytes: &[u8], what: &str, how: &str, scan: &mut Scan) {
     }
 }
 
-/// Mail spec 5.2 and 6.1: the metadata archive (`EmailField::Metadata`) of a
-/// key account's message is a stub: `raw_headers` opens with the format
-/// byte, and the visible fields are the arrival time, the blob hash and one
-/// empty root part. Counts the stubs.
-fn check_email(
-    archive: &Archive<AlignedBytes>,
-    what: &str,
-    violations: &mut Vec<String>,
-    stubs: &mut usize,
-) {
-    let metadata = match archive.deserialize::<MessageMetadata>() {
-        Ok(metadata) => metadata,
+/// A subspace's character in a violation's text (`'p'`, `'c'`, ...).
+fn subspace_char(subspace: Subspace) -> char {
+    char::from(subspace.byte())
+}
+
+/// The key of a per-document value of the account (`Property`,
+/// `Immutable`): account id (u32 BE) | collection | field | document id
+/// (u32 BE).
+pub fn document_key(
+    account_id: u32,
+    collection: Collection,
+    field: u8,
+    document_id: u32,
+) -> Vec<u8> {
+    let mut key = account_id.to_be_bytes().to_vec();
+    key.push(collection as u8);
+    key.push(field);
+    key.extend_from_slice(&document_id.to_be_bytes());
+    key
+}
+
+/// The `Property` key of an archive (`Field::ARCHIVE`).
+fn archive_key(account_id: u32, collection: Collection, document_id: u32) -> Vec<u8> {
+    document_key(
+        account_id,
+        collection,
+        u8::from(Field::ARCHIVE),
+        document_id,
+    )
+}
+
+/// The `Immutable` key of a message's metadata row (`EmailField::Metadata`).
+fn metadata_row_key(account_id: u32, document_id: u32) -> Vec<u8> {
+    document_key(
+        account_id,
+        Collection::Email,
+        u8::from(EmailField::Metadata),
+        document_id,
+    )
+}
+
+/// Mail spec 5.2 and 6.1: the metadata row (`EmailField::Metadata`, in the
+/// immutable class at 1.0) of a key account's message is a stub: its header
+/// section is the sealed bundle (the format byte first) and its structure is
+/// exactly `stub_structure` for that bundle and the sealed blob, the row
+/// `seal_stub` writes: one binary root part, no preview, no attachment, no
+/// header entry. Counts the stubs.
+fn check_email(value: &[u8], what: &str, violations: &mut Vec<String>, stubs: &mut usize) {
+    let row = match MetadataRow::deserialize(value) {
+        Ok(row) => row,
         Err(err) => {
-            violations.push(format!("{what}: metadata archive does not decode: {err:?}"));
+            violations.push(format!("{what}: metadata row does not decode: {err:?}"));
             return;
         }
     };
-    if metadata.raw_headers.first() != Some(&MAIL_FORMAT_V1) {
-        violations.push(format!("{what}: plaintext metadata archive"));
+    if !is_stub(&row).unwrap_or(false) {
+        violations.push(format!("{what}: plaintext metadata row"));
         return;
     }
     *stubs += 1;
-    if !metadata.preview.is_empty() {
-        violations.push(format!("{what}: stub with a preview"));
-    }
-    if metadata.blob_body_offset != 0 || metadata.rcvd_attach & MESSAGE_HAS_ATTACHMENT != 0 {
-        violations.push(format!("{what}: stub with a body offset or attachment bit"));
-    }
-    let empty_root = matches!(metadata.contents.as_ref(), [contents]
-        if contents.html_body.is_empty()
-            && contents.text_body.is_empty()
-            && contents.attachments.is_empty()
-            && matches!(contents.parts.as_ref(), [part]
-                if part.headers.is_empty()
-                    && matches!(part.body, MetadataPartType::Binary)
-                    && part.flags == 0
-                    && part.offset_header == 0
-                    && part.offset_body == 0
-                    && part.offset_end == 0));
-    if !empty_root {
-        violations.push(format!("{what}: stub with content parts"));
+    let rebuilt =
+        row.raw_headers()
+            .ok()
+            .zip(row.unarchive().ok())
+            .and_then(|(bundle, metadata)| {
+                MetadataRow::encode(
+                    stub_structure(metadata.blob_hash(), bundle.len(), metadata.blob_size()),
+                    &bundle,
+                )
+                .ok()
+            });
+    if rebuilt.as_deref() != Some(value) {
+        violations.push(format!(
+            "{what}: stub whose structure is not the sealed stub's"
+        ));
     }
 }
 
-/// Mail spec 5.5: a key account's Email search entries are one document per
-/// message holding the arrival time and the size, and those two fields'
-/// entries; no term. The class byte is the index, plus 0 for a term, 1 << 6
-/// for a field, 2 << 6 for a document (`store/src/write/key.rs`); a field
-/// key continues with the account id and the field id.
-fn check_email_search(key: &[u8], value: &[u8], what: &str, violations: &mut Vec<String>) {
-    let is_visible = |field: u8| matches!(field, SEARCH_FIELD_RECEIVED_AT | SEARCH_FIELD_SIZE);
-    match key[0] >> 6 {
-        0 => violations.push(format!("{what}: search term of the account")),
-        1 => {
-            if !key.get(1 + U32_LEN).is_some_and(|field| is_visible(*field)) {
-                violations.push(format!("{what}: search field of the account"));
+/// Mail spec 5.4 and the `IndexProperty` rule (module documentation): the
+/// account's index properties, keyed account id | collection | property |
+/// kind | ... (`store/src/write/key.rs`).
+fn check_index_property(key: &[u8], what: &str, violations: &mut Vec<String>) {
+    let collection = key.get(U32_LEN).copied().map(Collection::from);
+    let property = key.get(U32_LEN + 1).copied();
+    let kind = key.get(U32_LEN + 2).copied();
+    let hash = Some(IndexPropertyClass::KIND_HASH);
+    let integer = Some(IndexPropertyClass::KIND_INTEGER);
+    match (collection, property, kind) {
+        (Some(Collection::Email), Some(p), k)
+            if p == u8::from(EmailField::Threading) && k == hash =>
+        {
+            violations.push(format!("{what}: threading key of the account"))
+        }
+        (Some(Collection::Mailbox), Some(p), k)
+            if p == u8::from(MailboxField::Name) && k == hash => {}
+        (Some(Collection::SieveScript), Some(p), k)
+            if p == u8::from(SieveField::SeenId) && k == hash => {}
+        (Some(Collection::EmailSubmission), Some(p), k)
+            if (p == u8::from(EmailSubmissionField::Metadata)
+                || p == u8::from(EmailSubmissionField::DeliveryResult))
+                && k == integer => {}
+        _ => violations.push(format!(
+            "{what}: unclassified index property of the account"
+        )),
+    }
+}
+
+/// The `Immutable` rule: the account's message rows are stubs and its sort
+/// keys empty; nothing else of the account is immutable.
+fn check_immutable(key: &[u8], value: &[u8], what: &str, scan: &mut Scan) {
+    let is_email = key.get(U32_LEN) == Some(&(Collection::Email as u8));
+    let field = key.get(U32_LEN + 1).copied();
+    if is_email && field == Some(u8::from(EmailField::Metadata)) {
+        check_email(value, what, &mut scan.violations, &mut scan.stubs);
+    } else if is_email && field == Some(u8::from(EmailField::SortKeys)) {
+        if value != MessageSortKeys::default().serialize().as_slice() {
+            scan.violations
+                .push(format!("{what}: sort keys with content"));
+        }
+    } else {
+        scan.violations.push(format!(
+            "{what}: unclassified immutable record of the account"
+        ));
+    }
+}
+
+/// The search store's rules (module documentation). A key of an
+/// account-partitioned index starts with the index byte and the account id
+/// (u32 BE); a `Document` key then holds the document id, a `Term` key the
+/// term group, the term, its length, the field and the block id. Tracing
+/// keys are global and carry no account.
+fn check_search(
+    subspace: Subspace,
+    key: &[u8],
+    value: &[u8],
+    account_id: u32,
+    what: &str,
+    scan: &mut Scan,
+) {
+    scan.search_records += 1;
+    let Some(index) = key.first().copied().and_then(SearchIndex::try_from_u8) else {
+        scan.violations
+            .push(format!("{what}: search record of an unknown index"));
+        return;
+    };
+    if index == SearchIndex::Tracing
+        || key.get(1..1 + U32_LEN) != Some(account_id.to_be_bytes().as_slice())
+    {
+        return;
+    }
+    scan.search_account_records += 1;
+    match (index, subspace) {
+        (SearchIndex::Calendar, _) => scan.violations.push(format!(
+            "{what}: calendar search index entry of the account"
+        )),
+        (SearchIndex::Email, Subspace::SearchTerm) => scan
+            .violations
+            .push(format!("{what}: search term of the account")),
+        (SearchIndex::Email, _) => {
+            if key.len() != 1 + U32_LEN * 2 {
+                scan.violations
+                    .push(format!("{what}: search document key shape"));
+            } else if value != IDS_ONLY_DOCUMENT {
+                scan.violations
+                    .push(format!("{what}: search document with terms"));
             }
         }
-        _ => {
-            // A value that is not an archive holds no document (the index
-            // control plants empty ones).
-            let Some(archive) = try_archive(value) else {
-                return;
-            };
-            match archive.unarchive_untrusted::<ScannedDocument>() {
-                Ok(document) => {
-                    if !document.terms.is_empty() {
-                        violations.push(format!("{what}: search document with terms"));
-                    }
-                    if document
-                        .fields
-                        .iter()
-                        .any(|field| !is_visible(field.field_id))
+        // Ruling 65: the Contacts and File builders index plaintext for
+        // every account, as at 0.16.
+        _ => {}
+    }
+}
+
+/// The `SearchQueue` rule (module documentation): an entry's key is the
+/// index byte, the partition, the document id and the creation id, and its
+/// value the action; a control key is `QUEUE_CONTROL`, the index byte, the
+/// partition and the kind.
+fn check_search_queue(key: &[u8], value: &[u8], account_id: u32, what: &str, scan: &mut Scan) {
+    let account = account_id.to_be_bytes();
+    if key.first() == Some(&SearchIndexClass::QUEUE_CONTROL) {
+        let index = key.get(1).copied().and_then(SearchIndex::try_from_u8);
+        if index.is_none_or(|index| index == SearchIndex::Tracing)
+            || key.get(2..2 + U32_LEN) != Some(account.as_slice())
+        {
+            return;
+        }
+        scan.queue_records += 1;
+        match key.get(2 + U32_LEN).copied() {
+            Some(SearchIndexClass::CONTROL_INDEX) if key.len() == U32_LEN + 3 => {
+                if !value.is_empty() {
+                    scan.violations
+                        .push(format!("{what}: queue marker with a value"));
+                }
+            }
+            Some(SearchIndexClass::CONTROL_STATUS) if key.len() == U32_LEN + 3 => {
+                if SearchIndexStatus::deserialize(value).is_err() {
+                    scan.violations
+                        .push(format!("{what}: queue status does not decode"));
+                }
+            }
+            _ => scan
+                .violations
+                .push(format!("{what}: unclassified queue control key")),
+        }
+        return;
+    }
+    let index = key.first().copied().and_then(SearchIndex::try_from_u8);
+    if index.is_none_or(|index| index == SearchIndex::Tracing)
+        || key.get(1..1 + U32_LEN) != Some(account.as_slice())
+    {
+        return;
+    }
+    scan.queue_records += 1;
+    if key.len() != QUEUE_ENTRY_LEN {
+        scan.violations
+            .push(format!("{what}: queue entry key shape"));
+    }
+    if !matches!(value, [0] | [1]) {
+        scan.violations
+            .push(format!("{what}: queue entry carries more than its action"));
+    }
+}
+
+/// The `System` rule (module documentation).
+fn check_system(key: &[u8], what: &str, violations: &mut Vec<String>) {
+    match key.first().copied() {
+        Some(SYSTEM_SCHEMA_VERSION) | Some(SYSTEM_NODE_ID) => {}
+        Some(ZA_UID_LEASE_PREFIX) if key.len() == LEASE_KEY_LEN => {}
+        _ => violations.push(format!("{what}: unclassified system record")),
+    }
+}
+
+/// An object-metadata record of the account (`Collection::Metadata` in the
+/// `Property` subspace): account id | `Collection::Metadata` | class byte,
+/// then for `Shared` the collection and the document id, for `Private` the
+/// viewer, the collection and the document id, for `Viewer` the collection
+/// and the viewer, for `Owner` the owner and the collection.
+struct MetadataRecord {
+    what: String,
+    key: Vec<u8>,
+    value_len: usize,
+}
+
+/// The object-metadata rule (module documentation). A `Shared` container is
+/// read through the server's container reader, which decompresses it.
+async fn check_metadata(
+    test: &TestServer,
+    account_id: u32,
+    record: &MetadataRecord,
+    scan: &mut Scan,
+) {
+    let what = record.what.as_str();
+    let key = record.key.as_slice();
+    scan.metadata_records += 1;
+    match key.get(U32_LEN + 1).copied() {
+        Some(METADATA_SHARED) if key.len() == U32_LEN + 3 + U32_LEN => {
+            let collection = Collection::from(key[U32_LEN + 2]);
+            let document_id = u32::from_be_bytes(key[U32_LEN + 3..].try_into().unwrap());
+            match collection {
+                Collection::Calendar | Collection::CalendarEvent => {
+                    match test
+                        .server
+                        .metadata_container(account_id, collection, document_id)
+                        .await
                     {
-                        violations.push(format!(
-                            "{what}: search document with fields other than the arrival time and the size"
-                        ));
+                        Ok(Some(container)) => {
+                            let bytes = container.view().as_bytes().to_vec();
+                            find_canaries(&bytes, what, "decoded container", scan);
+                            if !is_sealed_container(&bytes) {
+                                scan.violations
+                                    .push(format!("{what}: unsealed shared container"));
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(err) => scan
+                            .violations
+                            .push(format!("{what}: shared container does not decode: {err:?}")),
                     }
                 }
-                Err(err) => {
-                    violations.push(format!("{what}: search document does not decode: {err:?}"))
-                }
+                Collection::Mailbox | Collection::Email | Collection::SieveScript => scan
+                    .violations
+                    .push(format!("{what}: object metadata of a key account")),
+                // DAV dead properties of contacts and files, in the clear.
+                _ => {}
             }
         }
+        Some(METADATA_PRIVATE) => scan.violations.push(format!(
+            "{what}: private metadata container of a key account"
+        )),
+        Some(MetadataClass::VIEWER) | Some(MetadataClass::OWNER) => {
+            if record.value_len != METADATA_COUNTER_LEN {
+                scan.violations
+                    .push(format!("{what}: metadata counter shape"));
+            }
+        }
+        _ => scan
+            .violations
+            .push(format!("{what}: unclassified metadata record")),
     }
 }
 
@@ -509,18 +742,19 @@ fn check_tree(tree: &ICalendar, what: &str, is_event: bool, violations: &mut Vec
     }
 }
 
-fn check_event(event: &CalendarEvent, what: &str, violations: &mut Vec<String>) {
-    if event.display_name.is_some() {
+/// An event of a key account at 1.0 (Task 6: the 1.0 event pair,
+/// `ZaEvent`): the row holds no display name (it rides in the sealed
+/// bundle), the content no per-account preference (decision 7, part 4c),
+/// and the content's tree is sealed. Dead properties left the records at
+/// 1.0; the object-metadata rule checks their containers.
+fn check_event(event: &ZaEvent, what: &str, violations: &mut Vec<String>) {
+    if event.meta.display_name.is_some() {
         violations.push(format!("{what}: display_name not empty"));
     }
-    if !event.dead_properties.0.is_empty() {
-        violations.push(format!("{what}: dead_properties not empty"));
-    }
-    // Per-account properties and alerts are not sealed (decision 7).
-    if !event.preferences.is_empty() {
+    if !event.content.preferences.is_empty() {
         violations.push(format!("{what}: event preferences not empty"));
     }
-    check_tree(&event.data.event, what, true, violations);
+    check_tree(&event.content.data.event, what, true, violations);
 }
 
 /// Whether the root's last two entries are `X-ZA-EXTRA` then `X-ZA-KEY`.
@@ -534,13 +768,26 @@ fn ends_extra_then_key(tree: &ICalendar) -> bool {
     })
 }
 
-/// An inbox item (invitations spec 9): the root ends with `X-ZA-KEY` and,
-/// before it, at most one of `X-ZA-RSVP-TOKEN` (visible, a pending reply)
-/// or `X-ZA-EXTRA`, and neither once drained (pending bit clear); the rest
-/// as `check_tree` checks any component. Returns whether the item carries
-/// its key envelope.
-fn check_item(item: &CalendarEventNotification, what: &str, violations: &mut Vec<String>) -> bool {
-    let mut tree = item.event.clone();
+/// An inbox item (invitations spec 9) at 1.0: a row and a content record
+/// (ruling 13). The content is `Itip` with no plaintext snapshot
+/// (`item_message`), and its message tree ends with `X-ZA-KEY` and, before
+/// it, at most one of `X-ZA-RSVP-TOKEN` (visible, a pending reply) or
+/// `X-ZA-EXTRA`, and neither once drained (pending bit clear); the rest as
+/// `check_tree` checks any component. Returns whether the item carries its
+/// key envelope.
+fn check_item(
+    item: &CalendarEventNotification,
+    content: &CalendarEventNotificationContent,
+    what: &str,
+    violations: &mut Vec<String>,
+) -> bool {
+    let Some(message) = item_message(content) else {
+        violations.push(format!(
+            "{what}: inbox item with a plaintext snapshot or upstream content"
+        ));
+        return false;
+    };
+    let mut tree = message.clone();
     let has_key = tree
         .components
         .first()
@@ -551,7 +798,7 @@ fn check_item(item: &CalendarEventNotification, what: &str, violations: &mut Vec
     } else {
         let pending = item.flags & EVENT_NOTIFICATION_ZA_PENDING != 0;
         let expected = if pending { (2, 106) } else { (1, 74) };
-        if !key_envelope(&item.event)
+        if !key_envelope(message)
             .is_some_and(|b| b.len() == expected.1 && b[..2] == [1, expected.0])
         {
             violations.push(format!("{what}: inbox envelope state mismatch"));
@@ -569,7 +816,7 @@ fn check_item(item: &CalendarEventNotification, what: &str, violations: &mut Vec
             }
         });
         if let Some(carrier) = carrier {
-            if item.flags & EVENT_NOTIFICATION_ZA_PENDING == 0 {
+            if !pending {
                 violations.push(format!("{what}: drained item carries {carrier}"));
             }
             root.pop();
@@ -581,8 +828,7 @@ fn check_item(item: &CalendarEventNotification, what: &str, violations: &mut Vec
 
 /// Keyless correspondence only: this does not authenticate encrypted ring payloads,
 /// the owner ledger, keys, or associated data.
-type CalendarHeaders =
-    std::collections::BTreeMap<u32, Option<groupware::calendar::sharing::format::OwnerRingHeader>>;
+type CalendarHeaders = BTreeMap<u32, Option<groupware::calendar::sharing::format::OwnerRingHeader>>;
 
 fn key_envelope(tree: &ICalendar) -> Option<Vec<u8>> {
     let entry = tree.components.first()?.entries.last()?;
@@ -593,22 +839,23 @@ fn key_envelope(tree: &ICalendar) -> Option<Vec<u8>> {
 }
 
 fn check_event_domain(
-    event: &CalendarEvent,
+    event: &ZaEvent,
     calendars: &CalendarHeaders,
     what: &str,
     violations: &mut Vec<String>,
 ) {
-    let envelope = key_envelope(&event.data.event);
-    if event.names.is_empty() {
+    let envelope = key_envelope(&event.content.data.event);
+    let names = &event.meta.names;
+    if names.is_empty() {
         violations.push(format!("{what}: event parent calendar missing"));
     }
-    for name in &event.names {
+    for name in names {
         let Some(header) = calendars.get(&name.parent_id) else {
             violations.push(format!("{what}: event parent calendar missing"));
             continue;
         };
         if let Some(header) = header {
-            if event.names.len() != 1 {
+            if names.len() != 1 {
                 violations.push(format!("{what}: shared event must have one parent"));
             }
             match envelope.as_deref() {
@@ -664,8 +911,7 @@ fn check_calendar(
             p.description.is_some()
                 || p.color.is_some()
                 || matches!(p.time_zone, Timezone::Custom(_))
-        }) || !calendar.dead_properties.0.is_empty()
-            || calendar.preferences.len() != 1
+        }) || calendar.preferences.len() != 1
             || !calendar.acls.is_empty()
         {
             violations.push(format!("{what}: unsealed collection with user data"));
@@ -676,7 +922,6 @@ fn check_calendar(
         .preferences
         .iter()
         .any(|p| p.description.is_some() || p.color.is_some())
-        || !calendar.dead_properties.0.is_empty()
     {
         violations.push(format!("{what}: sealed collection with plaintext fields"));
     }
@@ -788,22 +1033,12 @@ fn check_calendar(
 
 /// Decodes a value as a stored archive if it carries the archive marker.
 /// An LZ4 archive starts with its decompressed size (little endian u32);
-/// values that only look like one and claim a huge size are skipped, as are
-/// values too short for the trailer their marker implies (the store's
-/// deserializer would underflow on them).
-fn try_archive(value: &[u8]) -> Option<Archive<AlignedBytes>> {
+/// values that only look like one and claim a huge size are skipped. At 1.0
+/// the store's decoder checks every trailer length itself
+/// (`validate_marker_and_contents`), so a short value is not an archive.
+fn try_archive(value: &[u8]) -> Option<Archive<ArchiveBytes>> {
     let marker = *value.last()?;
     if marker & ARCHIVE_MAGIC_MARKER == 0 {
-        return None;
-    }
-    let min_len = 1 + if marker & ARCHIVE_VERSIONED != 0 {
-        U64_LEN + U32_LEN
-    } else if marker & ARCHIVE_HASHED != 0 {
-        U32_LEN
-    } else {
-        0
-    };
-    if value.len() < min_len {
         return None;
     }
     if marker & ARCHIVE_LZ4_COMPRESSED != 0 {
@@ -812,7 +1047,51 @@ fn try_archive(value: &[u8]) -> Option<Archive<AlignedBytes>> {
             return None;
         }
     }
-    <Archive<AlignedBytes> as store::Deserialize>::deserialize(value).ok()
+    <Archive<ArchiveBytes> as store::Deserialize>::deserialize(value).ok()
+}
+
+/// Every record of `subspace`, from the store that holds it: the internal
+/// search store for `SearchTerm` and `SearchDocument` (none without one),
+/// the data store for every other subspace.
+async fn subspace_records(test: &TestServer, subspace: Subspace) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let store = match subspace {
+        Subspace::SearchTerm | Subspace::SearchDocument => {
+            match test.server.search_store().internal_fts() {
+                Some(store) => store.clone(),
+                None => return Vec::new(),
+            }
+        }
+        _ => test.server.store().clone(),
+    };
+    let mut records: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    store
+        .iterate(
+            IterateParams::new(
+                AnyKey {
+                    subspace,
+                    key: vec![0u8],
+                },
+                AnyKey {
+                    subspace,
+                    key: vec![u8::MAX; 64],
+                },
+            ),
+            |key, value| {
+                records.push((key.to_vec(), value.to_vec()));
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+    records
+}
+
+/// The two records of a split document (1.0: an event or an inbox item is
+/// a row, `Field::ARCHIVE`, and a content archive), as the walk finds them.
+#[derive(Default)]
+struct SplitRecords {
+    row: Option<(String, Archive<ArchiveBytes>)>,
+    content: Option<(String, Archive<ArchiveBytes>)>,
 }
 
 /// Walks every subspace and the account's mail. Returns what it saw and the
@@ -820,6 +1099,8 @@ fn try_archive(value: &[u8]) -> Option<Archive<AlignedBytes>> {
 pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
     let store = test.server.store().clone();
     let archive_field = u8::from(Field::ARCHIVE);
+    let event_content_field = u8::from(CalendarEventField::Content);
+    let item_content_field = u8::from(CalendarNotificationField::Content);
     let mut scan = Scan::default();
     let mut blob_hashes: Vec<Vec<u8>> = Vec::new();
     // Build the complete owner/calendar/header map before validating any event.
@@ -828,11 +1109,11 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
         .iterate(
             IterateParams::new(
                 AnyKey {
-                    subspace: SUBSPACE_PROPERTY,
+                    subspace: Subspace::Property,
                     key: archive_key(account_id, Collection::Calendar, 0),
                 },
                 AnyKey {
-                    subspace: SUBSPACE_PROPERTY,
+                    subspace: Subspace::Property,
                     key: archive_key(account_id, Collection::Calendar, u32::MAX),
                 },
             ),
@@ -858,7 +1139,7 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
             ));
         }
     }
-    let mut key_accounts = std::collections::BTreeSet::new();
+    let mut key_accounts = BTreeSet::new();
     for (_, calendar) in &stored_calendars {
         for acl in &calendar.acls {
             if groupware::calendar::sharing::mutations::za_share_key_account(
@@ -888,101 +1169,79 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
         );
     }
 
-    for &subspace in SUBSPACES {
-        if subspace == SUBSPACE_SEARCH_INDEX && store.is_pg_or_mysql() {
-            continue;
-        }
-        let from = AnyKey {
-            subspace,
-            key: vec![0u8],
-        };
-        let to = AnyKey {
-            subspace,
-            key: vec![u8::MAX; 64],
-        };
-        let mut records: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        store
-            .iterate(IterateParams::new(from, to), |key, value| {
-                records.push((key.to_vec(), value.to_vec()));
-                Ok(true)
-            })
-            .await
-            .unwrap();
-        for (key, value) in records {
+    let mut events: BTreeMap<u32, SplitRecords> = BTreeMap::new();
+    let mut items: BTreeMap<u32, SplitRecords> = BTreeMap::new();
+    let mut metadata = Vec::new();
+    for &subspace in Subspace::ALL {
+        for (key, value) in subspace_records(test, subspace).await {
             scan.records += 1;
-            let what = format!("subspace {:?} key {:?}", char::from(subspace), key);
+            let what = format!("subspace {:?} key {:?}", subspace_char(subspace), key);
             find_canaries(&key, &what, "key", &mut scan);
             find_canaries(&value, &what, "raw value", &mut scan);
             let of_account = key.get(..U32_LEN) == Some(account_id.to_be_bytes().as_slice());
 
-            // Blob contents are decoded after the walk, through the server's
-            // configured blob store: the data store's own blob subspace, or a
-            // filesystem or S3 store whose blobs only the link records name
-            // (a link key starts with the blob hash).
-            if subspace == SUBSPACE_BLOBS {
-                blob_hashes.push(key.clone());
-            } else if subspace == SUBSPACE_BLOB_LINK && key.len() >= BLOB_HASH_LEN {
-                blob_hashes.push(key[..BLOB_HASH_LEN].to_vec());
-                // Mail spec 11: once delivery completes the account holds no
-                // temporary link (hash | account id | until): no staged blob
-                // and no training sample's hold.
-                if key.len() == BLOB_HASH_LEN + U32_LEN + U64_LEN
-                    && key[BLOB_HASH_LEN..BLOB_HASH_LEN + U32_LEN] == account_id.to_be_bytes()
-                {
-                    scan.undelivered
-                        .push(format!("{what}: temporary blob link held by the account"));
-                }
-            }
-
-            // Mail spec 5.4: no threading key of the account (account id |
-            // collection | `EmailField::Threading` | hash | document id).
-            if (subspace == SUBSPACE_PROPERTY || subspace == SUBSPACE_INDEXES)
-                && of_account
-                && key.get(U32_LEN) == Some(&(Collection::Email as u8))
-                && key.get(U32_LEN + 1) == Some(&u8::from(EmailField::Threading))
-            {
-                scan.violations
-                    .push(format!("{what}: threading key of the account"));
-            }
-
-            // Mail spec 9: no spam training sample of the account.
-            if subspace == SUBSPACE_SPAM_SAMPLES {
-                match PickledStream::new(&value)
-                    .and_then(|mut stream| SpamTrainingSample::unpickle(&mut stream))
-                {
-                    Some(sample) if sample.account_id == Some(Id::from(account_id)) => scan
-                        .violations
-                        .push(format!("{what}: spam training sample of the account")),
-                    Some(_) => {}
-                    None => scan
-                        .violations
-                        .push(format!("{what}: spam training sample does not decode")),
-                }
-            }
-
-            // Term keys are hashes of tokens, so a canary never appears in
-            // them whole: assert structurally that no calendar data of the
-            // account was indexed (spec 9) and that the account's mail is
-            // indexed by its visible fields only (mail spec 5.5). Key: class
-            // (index | type << 6), then the account id (u32 BE) for every
-            // index but tracing, which is global (`store/src/write/key.rs`).
-            // The account's Email entries prove the key layout is read
-            // correctly.
-            if subspace == SUBSPACE_SEARCH_INDEX {
-                scan.search_records += 1;
-                if let Some(index) = key.first().and_then(|c| SearchIndex::try_from_u8(c & 0x3f))
-                    && index != SearchIndex::Tracing
-                    && key.get(1..1 + U32_LEN) == Some(account_id.to_be_bytes().as_slice())
-                {
-                    scan.search_account_records += 1;
-                    if index == SearchIndex::Calendar {
-                        scan.violations.push(format!(
-                            "{what}: calendar search index entry of the account"
-                        ));
-                    } else if index == SearchIndex::Email {
-                        check_email_search(&key, &value, &what, &mut scan.violations);
+            match subspace {
+                // Blob contents are decoded after the walk, through the
+                // server's configured blob store: the data store's own blob
+                // subspace, or a filesystem or S3 store whose blobs only the
+                // link records name (a link key starts with the blob hash).
+                Subspace::Blobs => blob_hashes.push(key.clone()),
+                Subspace::BlobLink if key.len() >= BLOB_HASH_LEN => {
+                    blob_hashes.push(key[..BLOB_HASH_LEN].to_vec());
+                    // Mail spec 11: once delivery completes the account
+                    // holds no temporary link (hash | account id | until):
+                    // no staged blob and no training sample's hold.
+                    if key.len() == BLOB_HASH_LEN + U32_LEN + U64_LEN
+                        && key[BLOB_HASH_LEN..BLOB_HASH_LEN + U32_LEN] == account_id.to_be_bytes()
+                    {
+                        scan.undelivered
+                            .push(format!("{what}: temporary blob link held by the account"));
                     }
                 }
+                Subspace::IndexProperty if of_account => {
+                    scan.index_properties += 1;
+                    check_index_property(&key, &what, &mut scan.violations);
+                }
+                Subspace::Immutable if of_account => {
+                    scan.immutables += 1;
+                    check_immutable(&key, &value, &what, &mut scan);
+                }
+                // Mail spec 9: no spam training sample of the account.
+                Subspace::SpamSamples => {
+                    match PickledStream::new(&value)
+                        .and_then(|mut stream| SpamTrainingSample::unpickle(&mut stream))
+                    {
+                        Some(sample) if sample.account_id == Some(Id::from(account_id)) => scan
+                            .violations
+                            .push(format!("{what}: spam training sample of the account")),
+                        Some(_) => {}
+                        None => scan
+                            .violations
+                            .push(format!("{what}: spam training sample does not decode")),
+                    }
+                }
+                // Term keys hold a token's `CheekyHash`, the token itself
+                // for one of up to 16 bytes, so a long canary never appears
+                // in them whole: the rules are structural (calendar spec 9,
+                // mail spec 5.5, rulings 64 and 65). The account's Email
+                // documents prove the key layout is read correctly.
+                Subspace::SearchTerm | Subspace::SearchDocument => {
+                    check_search(subspace, &key, &value, account_id, &what, &mut scan);
+                }
+                Subspace::SearchQueue => {
+                    check_search_queue(&key, &value, account_id, &what, &mut scan);
+                }
+                Subspace::System => check_system(&key, &what, &mut scan.violations),
+                Subspace::Property
+                    if of_account && key.get(U32_LEN) == Some(&(Collection::Metadata as u8)) =>
+                {
+                    metadata.push(MetadataRecord {
+                        what: what.clone(),
+                        key: key.clone(),
+                        value_len: value.len(),
+                    });
+                }
+                _ => {}
             }
 
             let Some(archive) = try_archive(&value) else {
@@ -991,56 +1250,96 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
             scan.archives += 1;
             find_canaries(archive.as_bytes(), &what, "decoded archive", &mut scan);
 
-            // Property key: account_id (u32 BE) | collection | property | document_id (u32 BE).
-            if subspace != SUBSPACE_PROPERTY || key.len() != U32_LEN + 2 + U32_LEN || !of_account {
+            // Property key: account_id (u32 BE) | collection | field | document_id (u32 BE).
+            if subspace != Subspace::Property || key.len() != U32_LEN + 2 + U32_LEN || !of_account {
                 continue;
             }
-            if key[U32_LEN] == Collection::Email as u8
-                && key[U32_LEN + 1] == u8::from(EmailField::Metadata)
-            {
-                check_email(&archive, &what, &mut scan.violations, &mut scan.stubs);
-                continue;
+            let collection = Collection::from(key[U32_LEN]);
+            let field = key[U32_LEN + 1];
+            let document_id = u32::from_be_bytes(key[U32_LEN + 2..].try_into().unwrap());
+            match collection {
+                Collection::CalendarEvent if field == archive_field => {
+                    events.entry(document_id).or_default().row = Some((what, archive));
+                }
+                Collection::CalendarEvent if field == event_content_field => {
+                    events.entry(document_id).or_default().content = Some((what, archive));
+                }
+                Collection::CalendarEventNotification if field == archive_field => {
+                    items.entry(document_id).or_default().row = Some((what, archive));
+                }
+                Collection::CalendarEventNotification if field == item_content_field => {
+                    items.entry(document_id).or_default().content = Some((what, archive));
+                }
+                Collection::Calendar if field == archive_field => {
+                    scan.calendars += 1;
+                    if let Err(err) = archive.deserialize_untrusted::<Calendar>() {
+                        scan.violations
+                            .push(format!("{what}: calendar archive does not decode: {err:?}"));
+                    }
+                }
+                _ => {}
             }
-            if key[U32_LEN + 1] != archive_field {
-                continue;
-            }
-            let collection = key[U32_LEN];
-            if collection == Collection::CalendarEvent as u8 {
-                scan.events += 1;
-                match archive.deserialize::<CalendarEvent>() {
-                    Ok(event) => {
+        }
+    }
+
+    // Events: the row and the content, checked as one `ZaEvent`.
+    for (document_id, records) in events {
+        scan.events += 1;
+        match (records.row, records.content) {
+            (Some((what, row)), Some((_, content))) => {
+                match (
+                    row.deserialize::<CalendarEvent>(),
+                    content.deserialize::<CalendarEventContent>(),
+                ) {
+                    (Ok(meta), Ok(content)) => {
+                        let event = ZaEvent::new(meta, content);
                         check_event(&event, &what, &mut scan.violations);
                         check_event_domain(&event, &calendar_headers, &what, &mut scan.violations);
                     }
-                    Err(err) => scan
+                    (Err(err), _) | (_, Err(err)) => scan
                         .violations
-                        .push(format!("{what}: event archive does not decode: {err:?}")),
+                        .push(format!("{what}: event records do not decode: {err:?}")),
                 }
-            } else if collection == Collection::Calendar as u8 {
-                scan.calendars += 1;
-                match archive.deserialize_untrusted::<Calendar>() {
-                    Ok(_) => {}
-                    Err(err) => scan
-                        .violations
-                        .push(format!("{what}: calendar archive does not decode: {err:?}")),
-                }
-            } else if collection == Collection::CalendarEventNotification as u8 {
-                scan.items += 1;
-                match archive.deserialize::<CalendarEventNotification>() {
-                    Ok(item) => {
-                        if check_item(&item, &what, &mut scan.violations) {
+            }
+            (Some((what, _)), None) | (None, Some((what, _))) => scan.violations.push(format!(
+                "{what}: event {account_id}/{document_id} has one of its two records"
+            )),
+            (None, None) => {}
+        }
+    }
+
+    // Inbox items: the row and the content, as one item.
+    for (document_id, records) in items {
+        scan.items += 1;
+        match (records.row, records.content) {
+            (Some((what, row)), Some((_, content))) => {
+                match (
+                    row.deserialize::<CalendarEventNotification>(),
+                    content.deserialize::<CalendarEventNotificationContent>(),
+                ) {
+                    (Ok(item), Ok(content)) => {
+                        if check_item(&item, &content, &what, &mut scan.violations) {
                             scan.item_keys += 1;
                         }
-                        if ends_extra_then_key(&item.event) {
+                        if item_message(&content).is_some_and(ends_extra_then_key) {
                             scan.item_extras += 1;
                         }
                     }
-                    Err(err) => scan.violations.push(format!(
-                        "{what}: inbox item archive does not decode: {err:?}"
-                    )),
+                    (Err(err), _) | (_, Err(err)) => scan
+                        .violations
+                        .push(format!("{what}: inbox item records do not decode: {err:?}")),
                 }
             }
+            (Some((what, _)), None) | (None, Some((what, _))) => scan.violations.push(format!(
+                "{what}: inbox item {account_id}/{document_id} has one of its two records"
+            )),
+            (None, None) => {}
         }
+    }
+
+    // Object metadata of the account.
+    for record in &metadata {
+        check_metadata(test, account_id, record, &mut scan).await;
     }
 
     // Blobs are stored compressed; decode them the way readers do.
@@ -1068,33 +1367,65 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
         }
     }
 
-    // The account's messages as stored. A sealed blob (mail spec 5.1) is
-    // searched as the ciphertext it is; a plaintext one is decoded too, as
-    // transfer encodings would hide a canary from the raw search.
-    if let Ok(messages) = test.server.get_cached_messages(account_id).await {
-        for message in messages.emails.items.iter() {
-            scan.emails += 1;
-            let what = format!("email {}", message.document_id);
-            let contents = test.fetch_email(account_id, message.document_id).await;
-            find_canaries(&contents, &what, "raw message", &mut scan);
-            if contents.first() == Some(&MAIL_FORMAT_V1) {
+    // The account's messages as stored: each one's blob, named by its
+    // metadata row. A sealed blob (mail spec 5.1) is searched as the
+    // ciphertext it is; a plaintext one is decoded too, as transfer
+    // encodings would hide a canary from the raw search.
+    for document_id in cached_message_ids(test, account_id).await {
+        scan.emails += 1;
+        let what = format!("email {document_id}");
+        let Some(row) = test
+            .server
+            .store()
+            .get_value::<RawValue>(ValueKey::immutable(
+                account_id,
+                Collection::Email,
+                document_id,
+                EmailField::Metadata,
+            ))
+            .await
+            .unwrap()
+            .and_then(|value| MetadataRow::deserialize(&value.0).ok())
+        else {
+            scan.violations
+                .push(format!("{what}: message without a metadata row"));
+            continue;
+        };
+        let Ok(metadata) = row.unarchive() else {
+            continue;
+        };
+        let contents = match test
+            .server
+            .blob_store()
+            .get_blob(metadata.blob_hash().as_slice(), 0..usize::MAX)
+            .await
+        {
+            Ok(Some(contents)) => contents,
+            Ok(None) => continue,
+            Err(err) => {
+                scan.violations
+                    .push(format!("{what}: message blob does not decode: {err:?}"));
                 continue;
             }
-            // Mail spec 5.1, 11: every message blob opens only with the keys.
-            scan.violations
-                .push(format!("{what}: plaintext message blob"));
-            let parsed = MessageParser::new()
-                .parse(&contents)
-                .unwrap_or_else(|| panic!("{what} does not parse"));
-            find_canaries(
-                parsed.subject().unwrap_or_default().as_bytes(),
-                &what,
-                "subject",
-                &mut scan,
-            );
-            for part in parsed.parts.iter() {
-                find_canaries(part.contents(), &what, "decoded part", &mut scan);
-            }
+        };
+        find_canaries(&contents, &what, "raw message", &mut scan);
+        if contents.first() == Some(&MAIL_FORMAT_V1) {
+            continue;
+        }
+        // Mail spec 5.1, 11: every message blob opens only with the keys.
+        scan.violations
+            .push(format!("{what}: plaintext message blob"));
+        let parsed = MessageParser::new()
+            .parse(&contents)
+            .unwrap_or_else(|| panic!("{what} does not parse"));
+        find_canaries(
+            parsed.subject().unwrap_or_default().as_bytes(),
+            &what,
+            "subject",
+            &mut scan,
+        );
+        for part in parsed.parts.iter() {
+            find_canaries(part.contents(), &what, "decoded part", &mut scan);
         }
     }
 
@@ -1124,23 +1455,27 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
     scan
 }
 
-/// The property-subspace key of an archive: account id (u32 BE) |
-/// collection | `Field::ARCHIVE` | document id (u32 BE).
-fn archive_key(account_id: u32, collection: Collection, document_id: u32) -> Vec<u8> {
-    let mut key = account_id.to_be_bytes().to_vec();
-    key.push(collection as u8);
-    key.push(u8::from(Field::ARCHIVE));
-    key.extend_from_slice(&document_id.to_be_bytes());
-    key
+/// The account's message document ids from the message cache, empty for an
+/// account without one (a destroyed account).
+async fn cached_message_ids(test: &TestServer, account_id: u32) -> Vec<u32> {
+    use email::cache::MessageCacheFetch;
+    match test.server.get_cached_messages(account_id).await {
+        Ok(messages) => {
+            let mut ids = messages.emails.document_ids().collect::<Vec<_>>();
+            ids.sort_unstable();
+            ids
+        }
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Where any of `tokens` appears in the clear (invitations spec 11): as raw
 /// bytes, base64url without padding (the `X-ZA-RSVP-TOKEN` form), standard
 /// base64 or standard base64 without padding, in a raw key, a raw value, a
 /// decoded archive or a decoded blob. Returns (subspace, key, token index)
-/// per hit; a blob hit carries `SUBSPACE_BLOBS` and the blob hash. A blob
+/// per hit; a blob hit carries `Subspace::Blobs` and the blob hash. A blob
 /// that fails to read panics: it must not go unsearched unnoticed.
-pub async fn token_hits(test: &TestServer, tokens: &[[u8; 16]]) -> Vec<(u8, Vec<u8>, usize)> {
+pub async fn token_hits(test: &TestServer, tokens: &[[u8; 16]]) -> Vec<(Subspace, Vec<u8>, usize)> {
     let forms: Vec<(usize, Vec<u8>)> = tokens
         .iter()
         .enumerate()
@@ -1160,42 +1495,18 @@ pub async fn token_hits(test: &TestServer, tokens: &[[u8; 16]]) -> Vec<(u8, Vec<
             .map(|(i, _)| *i)
             .collect()
     };
-    let store = test.server.store().clone();
     let mut hits = Vec::new();
     let mut blob_hashes: Vec<Vec<u8>> = Vec::new();
-    for &subspace in SUBSPACES {
-        if subspace == SUBSPACE_SEARCH_INDEX && store.is_pg_or_mysql() {
-            continue;
-        }
-        let mut records: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        store
-            .iterate(
-                IterateParams::new(
-                    AnyKey {
-                        subspace,
-                        key: vec![0u8],
-                    },
-                    AnyKey {
-                        subspace,
-                        key: vec![u8::MAX; 64],
-                    },
-                ),
-                |key, value| {
-                    records.push((key.to_vec(), value.to_vec()));
-                    Ok(true)
-                },
-            )
-            .await
-            .unwrap();
-        for (key, value) in records {
+    for &subspace in Subspace::ALL {
+        for (key, value) in subspace_records(test, subspace).await {
             let mut found = find(&key);
             found.extend(find(&value));
             if let Some(archive) = try_archive(&value) {
                 found.extend(find(archive.as_bytes()));
             }
-            if subspace == SUBSPACE_BLOBS {
+            if subspace == Subspace::Blobs {
                 blob_hashes.push(key.clone());
-            } else if subspace == SUBSPACE_BLOB_LINK && key.len() >= BLOB_HASH_LEN {
+            } else if subspace == Subspace::BlobLink && key.len() >= BLOB_HASH_LEN {
                 blob_hashes.push(key[..BLOB_HASH_LEN].to_vec());
             }
             found.sort_unstable();
@@ -1216,7 +1527,7 @@ pub async fn token_hits(test: &TestServer, tokens: &[[u8; 16]]) -> Vec<(u8, Vec<
             Ok(Some(blob)) => hits.extend(
                 find(&blob)
                     .into_iter()
-                    .map(|i| (SUBSPACE_BLOBS, hash.clone(), i)),
+                    .map(|i| (Subspace::Blobs, hash.clone(), i)),
             ),
             Ok(None) => {}
             Err(err) => panic!("blob {hash:?} does not decode: {err:?}"),
@@ -1468,33 +1779,19 @@ async fn purge_blobs(test: &TestServer) {
         .unwrap();
 }
 
-/// The property-subspace key of a message's metadata archive.
-fn metadata_key(account_id: u32, document_id: u32) -> Vec<u8> {
-    let mut key = account_id.to_be_bytes().to_vec();
-    key.push(Collection::Email as u8);
-    key.push(u8::from(EmailField::Metadata));
-    key.extend_from_slice(&document_id.to_be_bytes());
-    key
-}
-
-/// Writes `metadata` as the message's metadata archive (field 71).
-async fn write_metadata(
-    test: &TestServer,
-    account_id: u32,
-    document_id: u32,
-    metadata: MessageMetadata,
-) {
+/// Writes `row` as the message's metadata row (field 71, immutable at 1.0).
+async fn write_metadata_row(test: &TestServer, account_id: u32, document_id: u32, row: Vec<u8>) {
     let mut batch = BatchBuilder::new();
     batch
         .with_account_id(account_id)
         .with_collection(Collection::Email)
         .with_document(document_id)
-        .set(
-            EmailField::Metadata,
-            Archiver::new(metadata).serialize().unwrap(),
-        );
-    test.server.store().write(batch.build_all()).await.unwrap();
+        .set(EmailField::Metadata, row);
+    test.server.store().write_batch(&mut batch).await.unwrap();
 }
+
+/// `test_mail`'s ordinary account, the rules' positive control.
+const MAIL_PLAIN: &str = "plainmail26@example.com";
 
 /// Every string a captured event carries, lower-cased.
 fn event_text(keys: &[(trc::Key, trc::Value)]) -> String {
@@ -1509,13 +1806,14 @@ fn event_text(keys: &[(trc::Key, trc::Value)]) -> String {
 /// message carrying every mail canary over LMTP and appends a second one
 /// over IMAP, and a session of the account FETCHes, RETRs and submits it.
 /// Then the account's records hold two stubs and no plaintext metadata
-/// archive, its blobs and every other record no canary, its search
-/// documents the arrival time and the size only, and nothing of it is
+/// row, its blobs and every other record no canary, its search documents
+/// their ids only (ruling 64), its sort keys none, and nothing of it is
 /// threaded, queued, held or sampled; no IMAP, POP3 or SMTP event of the
 /// session carries a canary. Positive controls: the keyword and the mailbox
-/// name the account set are found, visible by structure. Negative controls:
-/// a planted plaintext message, and a stub rewritten with plaintext headers
-/// alone, are flagged.
+/// name the account set are found, visible by structure; an ordinary
+/// account that receives a message is flagged by every mail rule, so the
+/// rules read 1.0's real records. Negative controls: a planted plaintext
+/// message, and a stub rewritten with plaintext headers alone, are flagged.
 pub async fn test_mail(test: &mut TestServer) {
     println!("Running zero-access leak test of mail...");
     let key = key_mail_account(test, MAIL_KEY, STRONG).await;
@@ -1698,14 +1996,14 @@ pub async fn test_mail(test: &mut TestServer) {
     .await;
     test.wait_for_tasks().await;
     let found = scan(test, id).await;
-    let planted_key = format!("{:?}", metadata_key(id, planted));
+    let planted_key = format!("{:?}", metadata_row_key(id, planted));
     let report = found.violations.join("\n");
     assert!(
         found
             .violations
             .iter()
-            .any(|v| v.contains(&planted_key) && v.ends_with("plaintext metadata archive")),
-        "the scanner must flag the planted metadata archive:\n{report}"
+            .any(|v| v.contains(&planted_key) && v.ends_with("plaintext metadata row")),
+        "the scanner must flag the planted metadata row:\n{report}"
     );
     assert!(
         found
@@ -1737,38 +2035,88 @@ pub async fn test_mail(test: &mut TestServer) {
 
     // Negative control: a stub rewritten with a plaintext header block alone
     // (its blob still sealed) is flagged by structure.
+    // At 1.0 the row is re-encoded around a plaintext header section with
+    // the stub's own structure, so only the header section changes.
     let document = documents[0];
-    let original = stored_metadata(test, id, document)
-        .await
-        .deserialize::<MessageMetadata>()
-        .unwrap();
-    let mut rewritten = stored_metadata(test, id, document)
-        .await
-        .deserialize::<MessageMetadata>()
-        .unwrap();
-    rewritten.raw_headers = b"Subject: rewritten\r\n\r\n".to_vec().into_boxed_slice();
-    write_metadata(test, id, document, rewritten).await;
+    let original = stored_metadata_bytes(test, id, document).await;
+    let headers = b"Subject: rewritten\r\n\r\n";
+    let rewritten = {
+        let row = MetadataRow::deserialize(&original).unwrap();
+        let metadata = row.unarchive().unwrap();
+        MetadataRow::encode(
+            stub_structure(metadata.blob_hash(), headers.len(), metadata.blob_size()),
+            headers,
+        )
+        .unwrap()
+    };
+    write_metadata_row(test, id, document, rewritten).await;
     let found = scan(test, id).await;
-    let rewritten_key = format!("{:?}", metadata_key(id, document));
+    let rewritten_key = format!("{:?}", metadata_row_key(id, document));
     assert_eq!(
         found.violations,
         vec![format!(
-            "subspace {:?} key {rewritten_key}: plaintext metadata archive",
-            char::from(SUBSPACE_PROPERTY)
+            "subspace {:?} key {rewritten_key}: plaintext metadata row",
+            subspace_char(Subspace::Immutable)
         )],
         "the scanner must flag the rewritten stub, and only it"
     );
     assert_eq!(found.stubs, 1);
-    write_metadata(test, id, document, original).await;
+    write_metadata_row(test, id, document, original).await;
     let restored = scan(test, id).await;
     assert!(restored.violations.is_empty(), "{:?}", restored.violations);
     assert_eq!(restored.stubs, 2);
 
+    // Positive control: an ordinary account's message, delivered and
+    // indexed by 1.0's ordinary paths, is flagged by every mail rule.
+    let plain = test
+        .account("admin@example.com")
+        .create_user_account(
+            MAIL_PLAIN,
+            STRONG,
+            "Plain mail",
+            &[],
+            super::user_permissions(),
+        )
+        .await;
+    let plain_id = plain.id().document_id();
+    SmtpConnection::connect()
+        .await
+        .ingest(
+            "sender@example.org",
+            &[MAIL_PLAIN],
+            "From: Ordinary <ordinary@example.org>\r\nSubject: ordinary control\r\n\r\nordinary body text\r\n",
+        )
+        .await;
+    wait_for_delivery(test).await;
+    let ordinary = scan(test, plain_id).await;
+    let report = ordinary.violations.join("\n");
+    for rule in [
+        "plaintext metadata row",
+        "sort keys with content",
+        "threading key of the account",
+        "search term of the account",
+        "search document with terms",
+        "plaintext message blob",
+    ] {
+        assert!(
+            ordinary.violations.iter().any(|v| v.ends_with(rule)),
+            "the ordinary account's records do not trip the rule {rule:?}:\n{report}"
+        );
+    }
+    assert!(
+        ordinary.search_account_records > 0 && ordinary.immutables > 0,
+        "{ordinary:?}"
+    );
+
     // Cleanup: the messages and the mailbox, and their blobs.
-    for account in [&key, &recipient] {
+    for account in [&key, &recipient, &plain] {
         test.destroy_all_mailboxes(account).await;
     }
     wait_for_delivery(test).await;
+    test.account("admin@example.com")
+        .destroy_account(plain)
+        .await;
+    test.wait_for_tasks().await;
     purge_blobs(test).await;
 }
 
@@ -1960,14 +2308,14 @@ pub async fn test(test: &mut TestServer) {
         organizer_violations.join("\n")
     );
     assert!(
-        ends_extra_then_key(&organizer.data.event),
+        ends_extra_then_key(&organizer.content.data.event),
         "the organizer's root does not end {EXTRA_PROP} then {KEY_PROP}"
     );
     // The fan-out's token for key2 is in the clear nowhere, the held task
     // queue included: its item carries it in the sealed bundle, and no
     // reply item exists here.
     let keys1 = za_unlock(test, key1_id, STRONG).await;
-    let fan_out_token = *event_token_pairs(&organizer_event, &keys1, key1_id)
+    let fan_out_token = *event_token_pairs(&organizer_event.content, &keys1, key1_id)
         .unwrap()
         .expect("key1's bundle holds pairs")
         .get("key2@example.com")
@@ -2152,9 +2500,16 @@ pub async fn test(test: &mut TestServer) {
         &[TOKEN_REQUEST, TOKEN_REPLY, TOKEN_EVENT_A, TOKEN_EVENT_B],
     )
     .await;
-    let reply_key = archive_key(id, Collection::CalendarEventNotification, reply_id);
-    let on_reply = |subspace: u8, key: &[u8], token: usize| {
-        subspace == SUBSPACE_PROPERTY && key == reply_key.as_slice() && token == 1
+    // At 1.0 the reply's message tree, and so its visible token, is in the
+    // item's content record (ruling 13).
+    let reply_key = document_key(
+        id,
+        Collection::CalendarEventNotification,
+        u8::from(CalendarNotificationField::Content),
+        reply_id,
+    );
+    let on_reply = |subspace: Subspace, key: &[u8], token: usize| {
+        subspace == Subspace::Property && key == reply_key.as_slice() && token == 1
     };
     assert!(
         hits.iter().any(|(s, k, t)| on_reply(*s, k, *t)),
@@ -2172,54 +2527,15 @@ pub async fn test(test: &mut TestServer) {
     // Negative control: an unsealed event planted directly must be caught,
     // both by the canary search and by the structural check.
     {
-        let resources = test
-            .server
-            .fetch_dav_resources(id, id, SyncCollection::Calendar)
-            .await
-            .unwrap();
-        let calendar_id = resources.by_path("leak").unwrap().document_id();
-        let ical = match calcard::Parser::new(&EVENT.replace("summary-canary", "negative-canary"))
-            .entry()
-        {
-            calcard::Entry::ICalendar(ical) => ical,
-            other => panic!("{other:?}"),
-        };
-        let mut next = None;
-        let event = CalendarEvent {
-            names: vec![common::DavName {
-                name: "planted.ics".into(),
-                parent_id: calendar_id,
-            }],
-            data: CalendarEventData::new(
-                ical,
-                calcard::common::timezone::Tz::Floating,
-                100,
-                &mut next,
-            ),
-            size: 1,
-            ..Default::default()
-        };
-        let account_info = test.server.account_info(id).await.unwrap();
-        let document_id = test
-            .server
-            .store()
-            .assign_document_ids(id, Collection::CalendarEvent, 1)
-            .await
-            .unwrap();
-        let mut batch = store::write::BatchBuilder::new();
-        event
-            .insert(
-                account_info.account_tenant_ids(),
-                id,
-                document_id,
-                None,
-                &mut batch,
-            )
-            .unwrap();
-        test.server.commit_batch(batch).await.unwrap();
-        // A direct store write does not wake the task manager the way the
-        // DAV handlers do; without this the index task waits for its poll.
-        test.server.notify_task_queue();
+        plant_event(
+            test,
+            id,
+            "leak",
+            "planted.ics",
+            &EVENT.replace("summary-canary", "negative-canary"),
+            None,
+        )
+        .await;
         test.wait_for_tasks().await;
         let planted = scan(test, id).await;
         let report = planted.violations.join("\n");
@@ -2248,9 +2564,6 @@ pub async fn test(test: &mut TestServer) {
             "Negative control caught {} violations:\n{report}",
             planted.violations.len()
         );
-        test.server
-            .invalidate_local_caches(&[common::ipc::CacheInvalidation::DavResources(id)])
-            .await;
         client
             .request("DELETE", "/dav/cal/key2%40example.com/leak/planted.ics", "")
             .await
@@ -2329,74 +2642,250 @@ pub async fn test(test: &mut TestServer) {
     test.destroy_all_mailboxes(test.account(name)).await;
 }
 
-/// Positive control for the scanner's calendar search-index check: entries
-/// planted with the store's own key serializer are flagged exactly when they
-/// are Calendar entries of the scanned account.
+/// Positive and planted-violation controls for the scanner's rules over
+/// 1.0's spaces, with records planted through the store's own key
+/// serializer: each new space has a record that its rule flags and one it
+/// permits, and every record is the scanned account's except where the
+/// control is another account's. The Email partition of the account is held
+/// while the queue entries are planted, so the index worker never reads
+/// them.
 pub async fn test_index_control(test: &mut TestServer) {
-    use store::write::{
-        BatchBuilder, SearchIndexClass, SearchIndexId, SearchIndexType, ValueClass,
-    };
     println!("Running zero-access leak scanner index control...");
     // `leak::test` ends by deleting key2's calendars and mailboxes without
-    // waiting: their unindex tasks may still be running. Drain them so the
-    // baseline below is stable.
+    // waiting: their index-queue entries may still be pending. Drain them so
+    // the baseline below is stable.
     test.wait_for_tasks().await;
     let id = test.account("key2@example.com").id().document_id();
     let plain_id = test.account("plain@example.com").id().document_id();
-    let entry = |index, account_id, typ| {
-        ValueClass::SearchIndex(SearchIndexClass {
+    let document_id = u32::MAX - 1;
+    let term = |index, account_id| {
+        ValueClass::SearchIndex(SearchIndexClass::Term {
             index,
-            id: SearchIndexId::Account {
-                account_id,
-                document_id: u32::MAX - 1,
-            },
-            typ,
+            account_id,
+            field: 0,
+            term: CheekyHash::new(b"za-control"),
+            block_id: 0,
         })
     };
-    let term = || SearchIndexType::Term {
-        field: 0,
-        hash: utils::cheeky_hash::CheekyHash::new(b"za-control"),
+    let document = |index, account_id, document_id| {
+        ValueClass::SearchIndex(SearchIndexClass::Document {
+            index,
+            account_id,
+            document_id,
+        })
     };
-    let planted = [
-        // Flagged: Calendar entries of the scanned account (document and term layouts).
-        entry(SearchIndex::Calendar, id, SearchIndexType::Document),
-        entry(SearchIndex::Calendar, id, term()),
-        // Not flagged: an Email entry of the account, a Calendar entry of another.
-        entry(SearchIndex::Email, id, SearchIndexType::Document),
-        entry(SearchIndex::Calendar, plain_id, SearchIndexType::Document),
+    // (class, value, the violation it trips, or `None`), in the internal
+    // search store.
+    let search_plants = [
+        (
+            document(SearchIndex::Calendar, id, document_id),
+            IDS_ONLY_DOCUMENT.to_vec(),
+            Some("calendar search index entry of the account"),
+        ),
+        (
+            term(SearchIndex::Calendar, id),
+            vec![],
+            Some("calendar search index entry of the account"),
+        ),
+        (
+            term(SearchIndex::Email, id),
+            vec![],
+            Some("search term of the account"),
+        ),
+        // One term listed: not ids only.
+        (
+            document(SearchIndex::Email, id, document_id),
+            vec![1, 0, 0],
+            Some("search document with terms"),
+        ),
+        // Permitted: an ids-only Email document of the account (ruling 64),
+        // a Contacts term of the account (ruling 65), another account's
+        // Calendar document.
+        (
+            document(SearchIndex::Email, id, document_id - 1),
+            IDS_ONLY_DOCUMENT.to_vec(),
+            None,
+        ),
+        (term(SearchIndex::Contacts, id), vec![], None),
+        (
+            document(SearchIndex::Calendar, plain_id, document_id),
+            IDS_ONLY_DOCUMENT.to_vec(),
+            None,
+        ),
     ];
+    let queue_entry = |created_at| {
+        ValueClass::SearchIndex(SearchIndexClass::Queue {
+            index: SearchIndex::Email,
+            id_prefix: id,
+            id_suffix: QueueDocumentId::Assigned(document_id),
+            created_at,
+        })
+    };
+    let index_property = |property: u8| {
+        ValueClass::IndexProperty(IndexPropertyClass::Hash {
+            property,
+            hash: Hash128::from(0x5a5a_u128),
+        })
+    };
+    let sort_keys = MessageSortKeys {
+        subject: "control".into(),
+        ..Default::default()
+    }
+    .serialize();
+    // (collection, class, value, the violation it trips, or `None`), in
+    // the data store, keyed on the account and `document_id`.
+    let data_plants = [
+        (
+            Collection::Email,
+            queue_entry(1),
+            vec![1, 0xAA],
+            Some("queue entry carries more than its action"),
+        ),
+        (Collection::Email, queue_entry(2), vec![0], None),
+        (
+            Collection::Email,
+            index_property(u8::from(EmailField::Threading)),
+            vec![],
+            Some("threading key of the account"),
+        ),
+        (
+            Collection::Mailbox,
+            index_property(u8::from(MailboxField::Name)),
+            vec![],
+            None,
+        ),
+        (
+            Collection::Email,
+            ValueClass::Immutable(u8::from(EmailField::SortKeys)),
+            sort_keys,
+            Some("sort keys with content"),
+        ),
+        (
+            Collection::Email,
+            ValueClass::Immutable(u8::from(EmailField::SortKeys)),
+            MessageSortKeys::default().serialize(),
+            None,
+        ),
+        (
+            Collection::Calendar,
+            ValueClass::Metadata(MetadataClass::Private { viewer: plain_id }),
+            vec![1, 2, 3],
+            Some("private metadata container of a key account"),
+        ),
+        (
+            Collection::Calendar,
+            ValueClass::Metadata(MetadataClass::Viewer { viewer: plain_id }),
+            vec![0; METADATA_COUNTER_LEN],
+            None,
+        ),
+        (
+            Collection::Calendar,
+            ValueClass::Metadata(MetadataClass::Owner { owner: plain_id }),
+            vec![0; 5],
+            Some("metadata counter shape"),
+        ),
+        (
+            Collection::None,
+            ValueClass::Any(store::write::AnyClass {
+                subspace: Subspace::System,
+                key: vec![0x7F, 0x5A],
+            }),
+            vec![],
+            Some("unclassified system record"),
+        ),
+    ];
+    let expected = search_plants
+        .iter()
+        .filter_map(|(_, _, rule)| *rule)
+        .chain(data_plants.iter().filter_map(|(_, _, _, rule)| *rule))
+        .collect::<Vec<_>>();
+
     let before = scan(test, id).await;
     assert!(before.violations.is_empty(), "{:?}", before.violations);
+    hold_index_partition(test, SearchIndex::Email, id).await;
+    // The two sort-key plants share one key: the flagged one is written in
+    // a second batch, after the permitted one is scanned with the rest.
+    let write = async |plants: &[(Collection, ValueClass, Vec<u8>, Option<&str>)], set: bool| {
+        let mut batch = BatchBuilder::new();
+        for (collection, class, value, _) in plants {
+            batch
+                .with_account_id(id)
+                .with_collection(*collection)
+                .with_document(document_id);
+            if set {
+                batch.set(class.clone(), value.clone());
+            } else {
+                batch.clear(class.clone());
+            }
+        }
+        test.server.store().write_batch(&mut batch).await.unwrap();
+    };
+    let search = internal_search(test);
     let mut batch = BatchBuilder::new();
-    for class in &planted {
-        batch.set(class.clone(), Vec::<u8>::new());
+    for (class, value, _) in &search_plants {
+        batch.set(class.clone(), value.clone());
     }
-    test.server.store().write(batch.build_all()).await.unwrap();
+    search.write_batch(&mut batch).await.unwrap();
+    let (flagged_sort_keys, rest): (Vec<_>, Vec<_>) =
+        data_plants
+            .iter()
+            .cloned()
+            .partition(|(_, class, _, rule)| {
+                matches!(class, ValueClass::Immutable(_)) && rule.is_some()
+            });
+    write(&rest, true).await;
 
+    // The permitted sort keys: every rule but that one's trips.
     let result = scan(test, id).await;
-    let flagged = result
-        .violations
-        .iter()
-        .filter(|v| v.ends_with("calendar search index entry of the account"))
-        .count();
-    assert_eq!(flagged, 2, "{:?}", result.violations);
+    let mut tripped = expected.clone();
+    tripped.retain(|rule| *rule != "sort keys with content");
+    for rule in &tripped {
+        assert!(
+            result.violations.iter().any(|v| v.ends_with(rule)),
+            "the planted violation {rule:?} was not flagged: {:?}",
+            result.violations
+        );
+    }
     assert_eq!(
         result.violations.len(),
-        2,
-        "unexpected violations: {:?}",
+        tripped.len(),
+        "unexpected violations (a permitted plant was flagged): {:?}",
         result.violations
     );
     assert_eq!(
         result.search_account_records,
-        before.search_account_records + 3,
-        "the three entries of the account were not all counted"
+        before.search_account_records + 6,
+        "the six search entries of the account were not all counted"
+    );
+    // The two entries and the hold's status key.
+    assert_eq!(result.queue_records, before.queue_records + 3, "{result:?}");
+
+    // The flagged sort keys over the permitted ones.
+    write(&flagged_sort_keys, true).await;
+    let result = scan(test, id).await;
+    assert!(
+        result
+            .violations
+            .iter()
+            .any(|v| v.ends_with("sort keys with content")),
+        "the planted sort keys were not flagged: {:?}",
+        result.violations
+    );
+    assert_eq!(
+        result.violations.len(),
+        expected.len(),
+        "{:?}",
+        result.violations
     );
 
     let mut batch = BatchBuilder::new();
-    for class in planted {
+    for (class, _, _) in search_plants {
         batch.clear(class);
     }
-    test.server.store().write(batch.build_all()).await.unwrap();
+    search.write_batch(&mut batch).await.unwrap();
+    write(&rest, false).await;
+    release_index_partition(&test.server, SearchIndex::Email, id).await;
+    test.wait_for_tasks().await;
     let after = scan(test, id).await;
     assert!(after.violations.is_empty(), "{:?}", after.violations);
 }
@@ -2428,11 +2917,7 @@ mod tests {
 async fn test_shared_structure(test: &mut TestServer) {
     use crate::utils::za::za_post;
     use calcard::icalendar::ICalendarValue;
-    use store::ValueKey;
-    use types::{
-        acl::AclGrant,
-        dead_property::{DeadProperty, DeadPropertyTag},
-    };
+    use types::acl::AclGrant;
     const OWNER: &str = "leak-shared-owner@example.com";
     const BOB: &str = "leak-shared-bob@example.com";
     const CAROL: &str = "leak-shared-carol@example.com";
@@ -2514,7 +2999,7 @@ async fn test_shared_structure(test: &mut TestServer) {
     let original: Calendar = test
         .server
         .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
             owner,
             Collection::Calendar,
             calendar,
@@ -2524,25 +3009,25 @@ async fn test_shared_structure(test: &mut TestServer) {
         .unwrap()
         .deserialize()
         .unwrap();
-    let original_event: CalendarEvent = test
-        .server
-        .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
-            owner,
-            Collection::CalendarEvent,
-            event_id,
-        ))
-        .await
-        .unwrap()
-        .unwrap()
-        .deserialize()
+    // At 1.0 an event is a row (its names) and a content record (its tree).
+    let (original_records, _) = raw_event_records(test, owner, "shared/g1.ics").await;
+    let original_event = original_records
+        .meta
+        .deserialize::<CalendarEvent>()
         .unwrap();
+    let original_content = original_records
+        .content
+        .deserialize::<CalendarEventContent>()
+        .unwrap();
+    let archive_field = u8::from(Field::ARCHIVE);
+    let content_field = u8::from(CalendarEventField::Content);
     // A malformed archive must return diagnostics and permit exact restoration.
     shared_control(
         test,
         owner,
         Collection::Calendar,
         calendar,
+        archive_field,
         Archiver::new(1u8).untrusted().serialize().unwrap(),
         "malformed calendar archive",
         "calendar archive does not decode",
@@ -2663,12 +3148,11 @@ async fn test_shared_structure(test: &mut TestServer) {
         c,
         "ACL principal is not a current key account",
     ));
-    for field in ["description", "color", "dead_properties"] {
+    for field in ["description", "color"] {
         let mut c = original.clone();
         match field {
             "description" => c.preferences[bob_index].description = Some("plain".into()),
-            "color" => c.preferences[bob_index].color = Some("plain".into()),
-            _ => c.dead_properties = DeadProperty(vec![DeadPropertyTag::Text("plain".into())]),
+            _ => c.preferences[bob_index].color = Some("plain".into()),
         }
         controls.push((field, c, "sealed collection with plaintext fields"));
     }
@@ -2678,13 +3162,24 @@ async fn test_shared_structure(test: &mut TestServer) {
             owner,
             Collection::Calendar,
             calendar,
+            archive_field,
             Archiver::new(bad).serialize().unwrap(),
             label,
             expected,
         )
         .await;
     }
+    // 0.16's plaintext dead-property control: at 1.0 dead properties live in
+    // the calendar's shared metadata container (rulings 16 and 29), so the
+    // control is an unsealed container written by upstream's keyless writer.
+    for (collection, document) in [
+        (Collection::Calendar, calendar),
+        (Collection::CalendarEvent, event_id),
+    ] {
+        shared_container_control(test, owner, collection, document).await;
+    }
     let mut events = Vec::new();
+    let mut contents = Vec::new();
     let mut e = original_event.clone();
     let mut second = e.names[0].clone();
     second.parent_id = unshared;
@@ -2727,13 +3222,13 @@ async fn test_shared_structure(test: &mut TestServer) {
             "shared event requires CK envelope",
         ),
     ] {
-        let mut e = original_event.clone();
+        let mut e = original_content.clone();
         e.data.event.components[0]
             .entries
             .last_mut()
             .unwrap()
             .values = vec![ICalendarValue::Text(STANDARD.encode(envelope))];
-        events.push((label, e, expected));
+        contents.push((label, e, expected));
     }
     for (label, bad, expected) in events {
         shared_control(
@@ -2741,6 +3236,20 @@ async fn test_shared_structure(test: &mut TestServer) {
             owner,
             Collection::CalendarEvent,
             event_id,
+            archive_field,
+            Archiver::new(bad).serialize().unwrap(),
+            label,
+            expected,
+        )
+        .await;
+    }
+    for (label, bad, expected) in contents {
+        shared_control(
+            test,
+            owner,
+            Collection::CalendarEvent,
+            event_id,
+            content_field,
             Archiver::new(bad).serialize().unwrap(),
             label,
             expected,
@@ -2796,11 +3305,32 @@ async fn test_shared_structure(test: &mut TestServer) {
     );
 }
 
+/// The `Property` value `field` of the document (a row, `Field::ARCHIVE`,
+/// or an event's content record).
+fn property_value_key(
+    owner: u32,
+    collection: Collection,
+    document: u32,
+    field: u8,
+) -> ValueKey<ValueClass> {
+    ValueKey {
+        account_id: owner,
+        collection: collection.into(),
+        document_id: document,
+        class: ValueClass::Property(field),
+    }
+}
+
+/// Writes `bad` as the document's record `field`, scans, restores the exact
+/// original bytes and checks that the bad scan named `expected` and the
+/// restored fixture scans clean.
+#[allow(clippy::too_many_arguments)]
 async fn shared_control(
     test: &TestServer,
     owner: u32,
     collection: Collection,
     document: u32,
+    field: u8,
     bad: Vec<u8>,
     label: &str,
     expected: &str,
@@ -2808,9 +3338,7 @@ async fn shared_control(
     let original = test
         .server
         .store()
-        .get_value::<common::auth::vault::RawValue>(store::ValueKey::archive(
-            owner, collection, document,
-        ))
+        .get_value::<RawValue>(property_value_key(owner, collection, document, field))
         .await
         .unwrap()
         .unwrap()
@@ -2820,6 +3348,7 @@ async fn shared_control(
         owner: u32,
         collection: Collection,
         document: u32,
+        field: u8,
         bytes: Vec<u8>,
     ) {
         let mut batch = BatchBuilder::new();
@@ -2827,21 +3356,19 @@ async fn shared_control(
             .with_account_id(owner)
             .with_collection(collection)
             .with_document(document)
-            .set(Field::ARCHIVE, bytes);
-        test.server.store().write(batch.build_all()).await.unwrap();
+            .set(ValueClass::Property(field), bytes);
+        test.server.store().write_batch(&mut batch).await.unwrap();
     }
-    write(test, owner, collection, document, bad).await;
+    write(test, owner, collection, document, field, bad).await;
     use futures::FutureExt;
     let bad_scan = std::panic::AssertUnwindSafe(scan(test, owner))
         .catch_unwind()
         .await;
-    write(test, owner, collection, document, original.clone()).await;
+    write(test, owner, collection, document, field, original.clone()).await;
     let restored_bytes = test
         .server
         .store()
-        .get_value::<common::auth::vault::RawValue>(store::ValueKey::archive(
-            owner, collection, document,
-        ))
+        .get_value::<RawValue>(property_value_key(owner, collection, document, field))
         .await
         .unwrap()
         .unwrap()
@@ -2864,4 +3391,87 @@ async fn shared_control(
         restored.violations
     );
     println!("Task11 corruption control {label}: {expected}; exact raw restoration and clean scan");
+}
+
+/// The object-metadata rule's control on a key account's calendar or event:
+/// a plaintext shared container (a DAV dead property, as a legacy writer or
+/// an ordinary account stores one) written by upstream's keyless writer is
+/// flagged; the exact stored container and row bytes are then restored and
+/// the fixture scans clean.
+async fn shared_container_control(
+    test: &TestServer,
+    owner: u32,
+    collection: Collection,
+    document: u32,
+) {
+    let container_key = ValueKey {
+        account_id: owner,
+        collection: collection.into(),
+        document_id: document,
+        class: ValueClass::Metadata(MetadataClass::Shared),
+    };
+    let row_key = property_value_key(owner, collection, document, u8::from(Field::ARCHIVE));
+    let raw = async |key: &ValueKey<ValueClass>| {
+        test.server
+            .store()
+            .get_value::<RawValue>(key.clone())
+            .await
+            .unwrap()
+            .map(|value| value.0)
+    };
+    let container = raw(&container_key).await;
+    let row = raw(&row_key).await.expect("the container's document");
+    plant_container(
+        test,
+        owner,
+        collection,
+        document,
+        Some(plain_dav_container(&[(
+            "http://apple.com/ns/ical/",
+            "calendar-color",
+            "plain-container-colour",
+        )])),
+    )
+    .await;
+    let bad = scan(test, owner).await;
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(owner)
+        .with_collection(collection)
+        .with_document(document)
+        .set(ValueClass::Property(u8::from(Field::ARCHIVE)), row.clone());
+    match &container {
+        Some(container) => batch.set(
+            ValueClass::Metadata(MetadataClass::Shared),
+            container.clone(),
+        ),
+        None => batch.clear(ValueClass::Metadata(MetadataClass::Shared)),
+    };
+    test.server.store().write_batch(&mut batch).await.unwrap();
+    test.server
+        .invalidate_local_caches(&[common::ipc::CacheInvalidation::GroupwareResources(owner)]);
+    assert_eq!(
+        raw(&container_key).await,
+        container,
+        "{collection:?}: container restoration"
+    );
+    assert_eq!(
+        raw(&row_key).await,
+        Some(row),
+        "{collection:?}: row restoration"
+    );
+    assert!(
+        bad.violations
+            .iter()
+            .any(|v| v.ends_with("unsealed shared container")),
+        "{collection:?}: the plaintext container was not flagged: {:?}",
+        bad.violations
+    );
+    let restored = scan(test, owner).await;
+    assert!(
+        restored.violations.is_empty(),
+        "{collection:?}: restored fixture: {:?}",
+        restored.violations
+    );
+    println!("Task 6 container control on {collection:?}: flagged, restored, clean scan");
 }

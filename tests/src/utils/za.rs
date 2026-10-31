@@ -16,7 +16,10 @@ use calcard::{
 use common::{
     auth::vault::{RawValue, VaultRead, ZaMark, ZaVerification},
     ipc::CacheInvalidation,
-    storage::index::{GroupwareWrite, ObjectIndexBuilder},
+    storage::{
+        index::{GroupwareWrite, ObjectIndexBuilder},
+        search::SearchIndexStatus,
+    },
     za::{
         lease::lease_key_range,
         test_hooks::{self, Pause as HookPause},
@@ -57,10 +60,11 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::{future::Future, sync::Arc, time::Duration};
 use store::{
-    Deserialize, IterateParams, Serialize as _, ValueKey,
+    Deserialize, IterateParams, Serialize as _, Subspace, U32_LEN, ValueKey,
     write::{
-        Archive, ArchiveBytes, ArchiveVersion, BatchBuilder, BlobLink, BlobOp, IndexPropertyClass,
-        QueueDocumentId, SearchIndex, TaskId, TaskQueueClass, ValueClass, blob::BlobLinkValue, now,
+        AnyKey, Archive, ArchiveBytes, ArchiveVersion, BatchBuilder, BlobLink, BlobOp,
+        IndexPropertyClass, QueueDocumentId, SearchIndex, SearchIndexClass, TaskId, TaskQueueClass,
+        ValueClass, blob::BlobLinkValue, key::DeserializeBigEndian, now,
     },
 };
 use tokio::{
@@ -2058,4 +2062,340 @@ pub async fn sharing_dav_request(
         headers,
         body,
     }
+}
+
+/// The account-partitioned indexes of 1.0's index queue (Task 1's ruling
+/// 22): their partition is the account, so their entries and status key
+/// are the account's.
+pub const ACCOUNT_INDEXES: [SearchIndex; 4] = [
+    SearchIndex::Email,
+    SearchIndex::Calendar,
+    SearchIndex::Contacts,
+    SearchIndex::File,
+];
+
+/// One entry of 1.0's search index queue (`SearchIndexClass::Queue`, in the
+/// data store): the index, the document and whether it indexes (`true`,
+/// value `1`) or unindexes (value `0`), as `read_queue` reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueEntry {
+    pub index: SearchIndex,
+    pub document_id: u32,
+    pub insert: bool,
+}
+
+/// The account's index-queue entries in every account-partitioned index,
+/// in queue order (index, document, creation). A key is the index byte, the
+/// partition (the account, u32 BE), the document id (u32 BE) and the
+/// creation id (u64 BE).
+pub async fn queue_entries(test: &TestServer, account_id: u32) -> Vec<QueueEntry> {
+    let mut entries = Vec::new();
+    for index in ACCOUNT_INDEXES {
+        let (from, to) = SearchIndexClass::queue_range(index, account_id);
+        test.server
+            .store()
+            .iterate(
+                IterateParams::new(
+                    ValueKey::from(ValueClass::SearchIndex(from)),
+                    ValueKey::from(ValueClass::SearchIndex(to)),
+                )
+                .ascending(),
+                |key, value| {
+                    entries.push(QueueEntry {
+                        index,
+                        document_id: key.deserialize_be_u32(1 + U32_LEN)?,
+                        insert: value.first().is_some_and(|action| *action != 0),
+                    });
+                    Ok(true)
+                },
+            )
+            .await
+            .unwrap();
+    }
+    entries
+}
+
+/// The status key of the account's partition in `index`
+/// (`SearchIndexClass::QueueStatus`): set by a failed pass, by
+/// `x:IndexQueueStatus/set` and by `hold_index_partition`, cleared by the
+/// next pass that completes.
+pub async fn partition_status(
+    test: &TestServer,
+    index: SearchIndex,
+    account_id: u32,
+) -> Option<SearchIndexStatus> {
+    test.server
+        .search_index_status(index, account_id)
+        .await
+        .unwrap()
+}
+
+/// The reason `hold_index_partition` writes into the status key.
+pub const HELD_REASON: &str = "held by the za suite";
+
+/// Holds the account's partition of `index` in the index queue: its status
+/// key is written as a failed pass writes it (and as `x:IndexQueueStatus/set`
+/// with a `Failed` status does), with its retry an hour away, so the
+/// manager's scan skips the partition (`scan_index_queue` skips a status
+/// whose retry is in the future) while its entries stay stored. 1.0's
+/// stand-in for 0.16's held task consumer, which does not hold the index
+/// queue. Call it only while the partition is idle (no pass in flight);
+/// `TestServer::wait_for_tasks` waits for a held partition, so release it
+/// first.
+pub async fn hold_index_partition(test: &TestServer, index: SearchIndex, account_id: u32) {
+    let mut batch = BatchBuilder::new();
+    batch.set(
+        ValueClass::SearchIndex(SearchIndexClass::QueueStatus {
+            index,
+            partition: account_id,
+        }),
+        SearchIndexStatus {
+            next_retry: now() + 3600,
+            attempts: 0,
+            reason: HELD_REASON.to_string(),
+        }
+        .serialize(),
+    );
+    test.server.store().write_batch(&mut batch).await.unwrap();
+}
+
+/// Releases `hold_index_partition`'s hold (or a failed pass's retry state,
+/// as `x:IndexQueueStatus/set` with a `Running` status does): the status key
+/// is cleared and the manager is woken, so the partition runs at once.
+/// Takes a `Server` so a parked request's future can call it.
+pub async fn release_index_partition(server: &common::Server, index: SearchIndex, account_id: u32) {
+    let mut batch = BatchBuilder::new();
+    batch.clear(ValueClass::SearchIndex(SearchIndexClass::QueueStatus {
+        index,
+        partition: account_id,
+    }));
+    server.store().write_batch(&mut batch).await.unwrap();
+    server.notify_index_queue();
+}
+
+/// Waits (at most `limit`) until the account has no index-queue entry and no
+/// partition status in any account-partitioned index; panics naming what is
+/// left. Unlike `TestServer::wait_for_tasks`, it does not wait out a
+/// partition's retry delay: it fails if the queue is not drained in time.
+pub async fn wait_for_index_queue(test: &TestServer, account_id: u32, limit: Duration) {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        let entries = queue_entries(test, account_id).await;
+        let mut statuses = Vec::new();
+        for index in ACCOUNT_INDEXES {
+            if let Some(status) = partition_status(test, index, account_id).await {
+                statuses.push((index, status));
+            }
+        }
+        if entries.is_empty() && statuses.is_empty() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the index queue of account {account_id} did not drain in {limit:?}: \
+             entries {entries:?}, statuses {statuses:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The internal search store (the suites run on it).
+pub fn internal_search(test: &TestServer) -> store::Store {
+    test.server
+        .search_store()
+        .internal_fts()
+        .expect("the suite runs on the internal search store")
+        .clone()
+}
+
+/// Writes `documents` into the account's `index` straight through the
+/// internal search store, as the index worker's flush writes them (one
+/// `index_account_documents` pass). 1.0's `SearchStore::index` is not
+/// available on the internal store.
+pub async fn index_search_documents(
+    test: &TestServer,
+    index: SearchIndex,
+    account_id: u32,
+    documents: Vec<store::search::IndexDocument>,
+) {
+    internal_search(test)
+        .index_account_documents(account_id, index, documents, vec![])
+        .await
+        .unwrap();
+}
+
+/// Unindexes `document_ids` of the account's `index` as the index worker's
+/// deletions do: each stored `Document` key and every term it lists.
+pub async fn unindex_search_documents(
+    test: &TestServer,
+    index: SearchIndex,
+    account_id: u32,
+    document_ids: Vec<u32>,
+) {
+    internal_search(test)
+        .index_account_documents(account_id, index, vec![], document_ids)
+        .await
+        .unwrap();
+}
+
+/// Removes every key of the account in `index` (`Store::unindex_account`,
+/// the range delete account destruction runs): R62's remedy for orphaned
+/// terms.
+pub async fn unindex_search_account(test: &TestServer, index: SearchIndex, account_id: u32) {
+    internal_search(test)
+        .unindex_account(index, account_id)
+        .await
+        .unwrap();
+}
+
+/// The stored value of a search document that holds no term and no field
+/// position (`Document::encode` then `Writer::into_document`,
+/// `store/src/search/{term,codec}.rs`, crate-private): the term count 0,
+/// the field count 0 (LEB128) and the plain marker 0. A key account's
+/// Email document holds its ids only (ruling 64), so its stored value is
+/// exactly this.
+pub const IDS_ONLY_DOCUMENT: [u8; 3] = [0, 0, 0];
+
+/// The account's keys in one index of the internal search store: its
+/// `Document` keys (`Subspace::SearchDocument`: the index byte, the account
+/// id and the document id) with their values, and its `Term` keys
+/// (`Subspace::SearchTerm`: the index byte, the account id, the term group,
+/// the term's `CheekyHash` key bytes, their length, the field and the block
+/// id, u16 BE), with each term's key bytes, which are the token itself for
+/// one of up to 16 bytes. 1.0 has no separate `Index` keys: integer and
+/// keyword fields are terms too.
+#[derive(Default)]
+pub struct SearchKeys {
+    pub documents: Vec<(u32, Vec<u8>)>,
+    pub terms: usize,
+    pub term_payloads: Vec<Vec<u8>>,
+}
+
+impl SearchKeys {
+    pub fn is_empty(&self) -> bool {
+        self.documents.is_empty() && self.terms == 0
+    }
+
+    pub fn document_ids(&self) -> Vec<u32> {
+        self.documents.iter().map(|(id, _)| *id).collect()
+    }
+
+    pub fn holds_term(&self, token: &str) -> bool {
+        self.term_payloads
+            .iter()
+            .any(|payload| payload == token.as_bytes())
+    }
+
+    /// Whether every stored document holds its ids only (`IDS_ONLY_DOCUMENT`).
+    pub fn documents_are_ids_only(&self) -> bool {
+        self.documents
+            .iter()
+            .all(|(_, value)| value.as_slice() == IDS_ONLY_DOCUMENT)
+    }
+}
+
+/// Counts only: the payloads of a large document would flood a failure.
+impl std::fmt::Debug for SearchKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "documents {:?} ({} ids only), {} term keys",
+            self.document_ids(),
+            self.documents
+                .iter()
+                .filter(|(_, value)| value.as_slice() == IDS_ONLY_DOCUMENT)
+                .count(),
+            self.terms
+        )
+    }
+}
+
+/// `SearchKeys` of `account_id` in `index`, read raw from the internal
+/// search store.
+pub async fn search_keys(test: &TestServer, account_id: u32, index: SearchIndex) -> SearchKeys {
+    const TERM_BASE: usize = 1 + U32_LEN + 1;
+    let store = internal_search(test);
+    let mut prefix = vec![index.to_u8()];
+    prefix.extend_from_slice(&account_id.to_be_bytes());
+    let mut end = prefix.clone();
+    end.extend_from_slice(&[u8::MAX; 64]);
+    let mut keys = SearchKeys::default();
+    store
+        .iterate(
+            IterateParams::new(
+                AnyKey {
+                    subspace: Subspace::SearchDocument,
+                    key: prefix.clone(),
+                },
+                AnyKey {
+                    subspace: Subspace::SearchDocument,
+                    key: end.clone(),
+                },
+            ),
+            |key, value| {
+                if key.len() == 1 + U32_LEN * 2 {
+                    keys.documents
+                        .push((key.deserialize_be_u32(1 + U32_LEN)?, value.to_vec()));
+                }
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .iterate(
+            IterateParams::new(
+                AnyKey {
+                    subspace: Subspace::SearchTerm,
+                    key: prefix,
+                },
+                AnyKey {
+                    subspace: Subspace::SearchTerm,
+                    key: end,
+                },
+            )
+            .no_values(),
+            |key, _| {
+                keys.terms += 1;
+                // The term's key bytes: after the base, before its length,
+                // field and block id.
+                if let Some(payload) = key
+                    .len()
+                    .checked_sub(4)
+                    .and_then(|end| key.get(TERM_BASE..end))
+                {
+                    keys.term_payloads.push(payload.to_vec());
+                }
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+    keys
+}
+
+/// Deletes the account's event `document_id` straight from the store, as a
+/// DELETE does without its scheduling (`DestroyArchive::delete_all`: the
+/// row, the content record, the alarms and the index-queue unindex entry),
+/// and wakes the index queue.
+pub async fn delete_event_records(test: &TestServer, account_id: u32, document_id: u32) {
+    let (meta, content) = event_records(test, account_id, document_id).await;
+    let account_info = test.server.account_info(account_id).await.unwrap();
+    let mut batch = BatchBuilder::new();
+    groupware::DestroyArchive(meta.to_unarchived::<CalendarEvent>().unwrap())
+        .delete_all(
+            &test.server,
+            &account_info,
+            account_id,
+            document_id,
+            Some(content),
+            false,
+            &mut batch,
+        )
+        .await
+        .unwrap();
+    test.server.commit_batch(batch).await.unwrap();
+    test.server.notify_index_queue();
+    test.server
+        .invalidate_local_caches(&[CacheInvalidation::GroupwareResources(account_id)]);
 }
