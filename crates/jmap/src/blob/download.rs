@@ -287,13 +287,19 @@ impl BlobDownload for Server {
                     false
                 } else if access_token.is_member(*account_id) {
                     true
+                } else if matches!(Collection::from(*collection), Collection::Email)
+                    && self
+                        .za_foreign_key_account(access_token, *account_id)
+                        .await?
+                {
+                    // Mail spec 6.3 and 10, rulings R34 and 60: a key account's
+                    // message is reached only by its own sessions. Another
+                    // token's request is not found, as without a grant, and
+                    // the account's message cache is not read.
+                    false
                 } else {
                     match Collection::from(*collection) {
                         Collection::Email => {
-                            // Mail spec 6.3, ruling R34: a key account's
-                            // message is reached only by its own sessions,
-                            // refused before its message cache is read.
-                            self.za_assert_mail_route(access_token, *account_id).await?;
                             let cache = self
                                 .get_cached_messages(*account_id)
                                 .await

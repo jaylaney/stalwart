@@ -1863,12 +1863,13 @@ async fn assigned_ids_preserve_sealed_read_offsets(
         assert_eq!(key_email_json["hasAttachment"], true, "{key_email_json}");
 
         // Owner binding: the ordinary account cannot read the key account's
-        // sections, and a token without the key account's keys is refused.
+        // sections (not found, as without a grant: ruling 60), and a token
+        // without the key account's keys is refused.
         for blob_id in [key_nested, key_inner] {
             let (status, bytes) = download(plain, blob_id).await;
-            assert_ne!(
-                status, 200,
-                "fixture {n}: another account read a sealed section"
+            assert_eq!(
+                status, 404,
+                "fixture {n}: another account's download of a sealed section"
             );
             assert!(
                 !String::from_utf8_lossy(&bytes).contains("canary")
