@@ -322,6 +322,9 @@ impl PropFindRequestHandler for Server {
         // An otherwise valid home listing omits individual refused calendars.
         // Directly addressed resources and reports retain request-level refusals.
         let za_home_listing = matches!(&query.resource, DavQueryResource::Uri(resource) if resource.resource.is_none());
+        // A multiget answers a hidden (pending) inbox item as it answers an
+        // href that names no item: 404, where a listing omits it.
+        let za_multiget = matches!(&query.resource, DavQueryResource::Multiget { .. });
         let mut paths = match std::mem::take(&mut query.resource) {
             DavQueryResource::Uri(resource) => {
                 collection_container = resource.collection;
@@ -437,6 +440,12 @@ impl PropFindRequestHandler for Server {
                             )
                             .await?
                             else {
+                                if za_multiget {
+                                    response.add_response(Response::new_status(
+                                        [item.name],
+                                        StatusCode::NOT_FOUND,
+                                    ));
+                                }
                                 continue;
                             };
                             let container =
@@ -599,7 +608,15 @@ impl PropFindRequestHandler for Server {
                 .await?
                 {
                     ZaItem::Plain => za_views = None,
-                    ZaItem::Skip => continue,
+                    ZaItem::Skip => {
+                        if za_multiget {
+                            state.response.add_response(Response::new_status(
+                                [item.name],
+                                StatusCode::NOT_FOUND,
+                            ));
+                        }
+                        continue;
+                    }
                     ZaItem::Status(status) => {
                         state
                             .response

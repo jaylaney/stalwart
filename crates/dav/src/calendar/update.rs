@@ -831,6 +831,8 @@ impl CalendarUpdateRequestHandler for Server {
                     .queue(&mut batch)
                     .caused_by(trc::location!())?;
             }
+            #[cfg(feature = "test_mode")]
+            common::za::test_hooks::update_commit_pause_point(account_id).await;
             self.commit_batch(batch).await.caused_by(trc::location!())?;
 
             Ok(HttpResponse::new(StatusCode::NO_CONTENT)

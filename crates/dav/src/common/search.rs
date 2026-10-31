@@ -70,6 +70,14 @@ impl<'x> TextIndex<'x> {
         }
     }
 
+    /// Zero-access: an index that holds none of the fields, so every text
+    /// filter selects every candidate and is matched in memory only. A key
+    /// account's calendar is never indexed (its events are sealed).
+    pub fn za_unindexed(mut self) -> Self {
+        self.fields = None;
+        self
+    }
+
     pub fn candidates(
         &self,
         field: SearchField,

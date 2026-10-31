@@ -134,8 +134,15 @@ impl CalendarQueryRequestHandler for Server {
             .unwrap_or_default();
         let items = match &request.filter {
             Some(filter) if collection == Collection::Calendar && !scope.is_empty() => {
-                let candidates =
-                    filter.candidates(&scope, TextIndex::new(self, SearchIndex::Calendar));
+                let mut index = TextIndex::new(self, SearchIndex::Calendar);
+                if self
+                    .za_is_key_account(account_id)
+                    .await
+                    .caused_by(trc::location!())?
+                {
+                    index = index.za_unindexed();
+                }
+                let candidates = filter.candidates(&scope, index);
                 scope
                     .resolve(
                         self,

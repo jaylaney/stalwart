@@ -23,7 +23,9 @@ use crate::{
         },
     },
 };
-use common::{GroupwareResources, Server, auth::AccessToken, storage::dav::canonical_path_segment};
+use common::{
+    GroupwareResources, Server, auth::AccessToken, storage::dav::canonical_calcard_segment,
+};
 use dav_proto::schema::response::{BaseCondition, MultiStatus};
 use groupware::calendar::{
     ArchivedCalendarEvent, ArchivedCalendarEventContent, ArchivedCalendarEventNotificationContent,
@@ -491,8 +493,9 @@ pub(super) fn invalid_calendar_sync_token() -> DavError {
 }
 
 /// The href prefix of each eligible calendar the response may disclose
-/// tombstones under (inventory finding 6: 1.0 names a stored calendar's path
-/// segment with `canonical_path_segment`).
+/// tombstones under: 1.0's calendar resource cache names a stored calendar's
+/// path segment with `canonical_calcard_segment` (`build_calcard_paths`), so
+/// the prefix does too (`canonical_path_segment` is the file cache's).
 pub(super) fn tombstone_prefixes(
     eligible: &BTreeMap<u32, Arc<ZaCalendarContext>>,
     resources: &GroupwareResources,
@@ -510,7 +513,7 @@ pub(super) fn tombstone_prefixes(
                 format!(
                     "{}{}/",
                     resources.base_path,
-                    canonical_path_segment(&calendar.name)
+                    canonical_calcard_segment(&calendar.name)
                 ),
             ));
         }

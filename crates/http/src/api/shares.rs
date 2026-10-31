@@ -17,7 +17,7 @@ use common::{
     auth::vault::{ZaMark, za_normalize_address},
     cache::invalidate::CacheInvalidationBuilder,
     ipc::CacheInvalidation,
-    storage::dav::canonical_path_segment,
+    storage::dav::canonical_calcard_segment,
 };
 use encodify::base64::STANDARD;
 use groupware::{
@@ -564,11 +564,11 @@ pub(super) async fn za_shares(
                 Err(error) => return Err(error.into_store_error(owner, id)),
             };
             // The calendar's DAV href as 1.0's resource cache formats it
-            // (inventory finding 6: `canonical_path_segment`).
+            // (`canonical_calcard_segment`, as `build_calcard_paths`).
             let href = format!(
                 "{}{}/",
                 DavResourceName::Cal.account_base_path(&owner_name),
-                canonical_path_segment(&slug)
+                canonical_calcard_segment(&slug)
             );
             shared.push(object!({"owner":owner_name,"calendar":slug,"href":href,"name":name,"level":level.as_str()}));
         }
