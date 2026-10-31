@@ -86,6 +86,11 @@ impl GranteeCleanup<'_> {
         document_id: u32,
         batch: &mut BatchBuilder,
     ) -> trc::Result<bool> {
+        // Zero-access fork: a key account's calendar data is the keyed
+        // revoke's to clean up.
+        if self.za_skips_owner().await? {
+            return Ok(false);
+        }
         let Some(archive) = self.archive(Collection::Calendar, document_id).await? else {
             return Ok(false);
         };
@@ -122,6 +127,11 @@ impl GranteeCleanup<'_> {
     }
 
     async fn stage_event(&self, document_id: u32, batch: &mut BatchBuilder) -> trc::Result<bool> {
+        // Zero-access fork: a key account's calendar data is the keyed
+        // revoke's to clean up.
+        if self.za_skips_owner().await? {
+            return Ok(false);
+        }
         let Some(content) = self
             .server
             .store()
@@ -209,6 +219,11 @@ impl GranteeCleanup<'_> {
         document_id: u32,
         batch: &mut BatchBuilder,
     ) -> trc::Result<bool> {
+        // Zero-access fork: a key account's calendar data is the keyed
+        // revoke's to clean up.
+        if self.za_skips_owner().await? {
+            return Ok(false);
+        }
         let Some(archive) = self
             .archive(Collection::CalendarEventNotification, document_id)
             .await?
