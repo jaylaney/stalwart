@@ -797,9 +797,10 @@ impl<T: SessionStream> SessionData<T> {
 fn za_filter_needs_content(filter: &Filter) -> bool {
     match filter {
         // 1.0 sets `$HasAttachment` and `$HasNoAttachment` from the parsed
-        // message, and a client cannot store them (`store.rs`); a key
-        // account's message carries neither (spec 5.2), so a search on them
-        // would match nothing, or everything, instead of being refused.
+        // message (`index/metadata.rs`); a key account's message carries
+        // neither (spec 5.2), only what its client stored, so a search on
+        // them would answer only the client's flags instead of being
+        // refused, as JMAP's `hasAttachment` filter is.
         Filter::Keyword(flag) | Filter::Unkeyword(flag) => {
             matches!(flag, Flag::HasAttachment | Flag::HasNoAttachment)
         }

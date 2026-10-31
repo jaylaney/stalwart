@@ -4818,6 +4818,148 @@ fence lives in the message's own chunk, which `write_batch` commits as one trans
 - `spam-filter/src/modules/classifier.rs` keeps upstream's `stalwart_tests` seeding of its
   sampling RNG; 0.16 had no hook there.
 
+### Part 5b: `imap` and `pop3`
+
+Part 5b resolved the ten conflicts of `imap` and `pop3` (cells in the conflict ledger),
+deleted the two modify/delete files (`imap/src/core/message.rs`, `imap/src/op/fetch.rs`)
+with their hooks ported, wrote the body of `imap/src/core/za.rs` that part 3b declared, and
+re-read the hooks that merged clean (`imap/src/core/{client,mod,session}.rs`,
+`imap/src/op/{authenticate,create,delete,rename,subscribe}.rs`,
+`pop3/src/{client,lib,session}.rs`, `pop3/src/op/authenticate.rs`). `cargo check -p imap
+-p pop3 -p managesieve` passes with no warnings; with `--tests` (none of the three has
+`test_mode`), `imap` and `pop3` pass and `managesieve` fails only in Task 2's restored
+module (below). `cargo test -p imap -p pop3 --lib`: 8 and 2 passed.
+
+#### R34 at 1.0 (finding 5)
+
+0.16 ran R34's route check (`za_assert_mail_route`) inside `synchronize_messages`, before
+anything was read. 1.0's `sync_view` takes a `MessageStoreCache` its callers have already
+read, and several commands read a mailbox's cache without calling `check_mailbox_acl`. So
+the check now sits before the cache read at every site that reads a selected or named
+mailbox's message cache:
+
+- `fetch` (`op/fetch/mod.rs`, also when IDLE passes its cache in), `store`, `search`,
+  `thread`, UIDBATCHES, `handle_expunge`, `copy_move` (the source), SELECT (`select.rs`,
+  which 1.0 no longer routes through `check_mailbox_acl`), STATUS (`status.rs`), LIST's
+  RETURN (STATUS) (`list.rs`, which skips the item) and `selected_access`;
+- `check_mailbox_acl_as`, which `check_mailbox_acl`, STATUS and `selected_access` call:
+  the check moved there from `check_mailbox_acl`, which APPEND, CREATE's parent check,
+  EXPUNGE, CLOSE and COPY/MOVE call;
+- `sync_view` itself, as the net for a caller that does not check first.
+
+Three paths skip instead of refusing, as 0.16 did (`write_changes`' "the calling command
+completes"):
+- `write_changes` (`idle.rs`; IDLE, NOOP, CHECK and every command's trailing update)
+  treats a foreign key account's selected mailbox as unselected, so its cache is neither
+  read nor synced, and the mailbox-list update still runs;
+- the pre-command access check (`client.rs`, `assert_selected_readable`) returns before
+  `selected_access` for a foreign key account, so NOOP, CHECK and IDLE complete and every
+  other command refuses at its own check;
+- CLOSE deselects without expunging and without reading the cache.
+
+The listing paths keep 0.16's rule: `SessionData::new` and `synchronize_mailboxes_as` skip
+a foreign key account before `account_view` reads its cache, and `za_unlist_key_accounts`
+drops one the token still grants. The session's own account is listed and read; a keyless
+key-account session does not exist (`za_mail_login`), except one opened before
+provisioning (R33, R48).
+
+#### Route map (`imap` and `pop3`)
+
+| Route | Entry | Unsealing or refusal boundary |
+|---|---|---|
+| IMAP FETCH (FLAGS, UID, INTERNALDATE, RFC822.SIZE, MODSEQ, EMAILID/THREADID) | `op/fetch/mod.rs` `fetch` | R34 before the cache read. `FetchNeeds.structure` is false: no keys taken, nothing opened; the values come from the cache (`INTERNALDATE` is the arrival time, `RFC822.SIZE` the stored size). A key account's FLAGS carry no `$HasAttachment` or `$HasNoAttachment` (spec 5.2; see below). |
+| IMAP FETCH ENVELOPE, BODY, BODYSTRUCTURE, PREVIEW, BINARY.SIZE | same | `za_mail_keys` once per command (a keyless read of a key account: `NO [NOPERM]`, `ZA_MAIL_KEYLESS`); a key account's metadata read as `MetadataForm::Row`, opened by `za_open_metadata_row` (a stub's structure alone names only the sealed blob). The envelope's Date and every part come from the opened row. An unreadable stub skips the message, and the command ends `NO [SERVERBUG]` `ZA_MAIL_UNREADABLE` after the served ones. |
+| IMAP FETCH RFC822, RFC822.HEADER, RFC822.TEXT, BODY[...] (header, header fields, MIME, text, part, nested part), BINARY[...] | same, then `section.rs`, `source.rs`, `structure.rs` | As above, and `fetch_blob` then `za_open_message_blob` opens the sealed blob whole into a `Zeroizing` buffer (`ZaFetchedBlob`, held with the fetched bytes' memory reservation). Every section, header, part and decoded-source reader reads the opened row and bytes; no reader reads the blob store directly. An unreadable blob skips the message as above. A non-peek BODY sets `\Seen` as for any account. |
+| IMAP SEARCH, ESEARCH, SORT | `op/search.rs` `search` → `query` | R34 before the cache read; then a filter or sort key that needs content (`za_filter_needs_content`, `za_sort_needs_content`) is refused for a key account as a whole, `NO [CANNOT]` `ZA_MAIL_SEARCH_REFUSED`, before any filter is built. The other keys read the cache (flags, sizes, arrival dates, modseq, ids). |
+| IMAP THREAD | `op/thread.rs` | R34 before the cache read; the filter refusal in `query`; threads come from the cache's thread ids (a key account's messages each have their own thread). |
+| IMAP COPY, MOVE (same account) | `op/copy_move.rs` | R34 before the source cache read; the copy changes mailbox memberships only (no content read); training through `add_account_spam_samples`, which skips a key account. |
+| IMAP COPY, MOVE (across accounts) | `op/copy_move.rs` → `email::copy_message` | R34 on the source and, through `check_mailbox_acl_as`, on the destination; `za_assert_mail_copy` refuses before the copy loop when either account is a key account (`NO [NOPERM]`); `copy_message` refuses again at use time (5a). An ordinary pair's training samples carry R55's fence in every chunk (`add_account_spam_samples`). |
+| IMAP APPEND | `op/append.rs` → `IngestGroup` (5a) | R34 through `check_mailbox_acl` → `check_mailbox_acl_as`; sealing as in part 5a's map. |
+| IMAP STORE | `op/store.rs` | R34 before the cache read; keywords only; training skips a key account; the `ImapEvent::Store` details are `[redacted]` in a key session. |
+| IMAP IDLE, NOOP, CHECK | `op/idle.rs` `write_changes` | A foreign key account's selected mailbox gets no update and its cache is not read. Otherwise the update is a FETCH of FLAGS and UID only: no keys, no content pushed. |
+| IMAP EXPUNGE, UID EXPUNGE, CLOSE | `op/expunge.rs`, `op/close.rs` | R34 before the cache read (EXPUNGE refused; CLOSE deselects without expunging); `expunge` keeps 0.16's no-op for a foreign key account. |
+| IMAP SELECT, EXAMINE, STATUS, LIST RETURN (STATUS), UIDBATCHES | `op/select.rs`, `op/status.rs`, `op/list.rs`, `op/uidbatches.rs` | R34 before the cache read (LIST skips the item); counts and UIDs only. |
+| IMAP GETACL, MYRIGHTS, SETACL, DELETEACL | `op/acl.rs` | R34 in `get_acl_mailbox`; SETACL refuses an added or widened grant on a key account's mailbox (ruling I3). |
+| IMAP traces | `core/{client,session}.rs`, `op/fetch/mod.rs`, `op/store.rs` | Raw input and output `[redacted]` before authentication and in a key session; BAD errors redacted in both; `ImapEvent::Fetch` and `Store` details `[redacted]` in a key session (issue #21). |
+| POP3 RETR, TOP | `pop3/src/op/fetch.rs` | `za_mail_keys`, then `za_metadata_view` over the stored `MetadataRow` (a stub opened into the full row: headers, header length and body offset come from it); an opened stub's blob opened whole by `za_open_message_blob` under the fetched bytes' reservation. A keyless read is refused; an unreadable stub or blob answers `-ERR` `ZA_MAIL_UNREADABLE`. |
+| POP3 LIST, UIDL, STAT, DELE | `pop3/src/op/{list,delete}.rs` | Sizes and ids from the cache; no content read. |
+| POP3 traces | `pop3/src/{client,session}.rs` | Raw input and output `[redacted]` before authentication and in a key session; parse errors marked BAD there and redacted. |
+
+#### Filter and sort classification
+
+1.0's `imap_proto::protocol::search::Filter` and `Sort` have the same variants as 0.16's
+(`EmailId` and `ThreadId` now hold a `CompactString`). Both matches stay exhaustive, with no
+wildcard.
+
+- **Content (refused for a key account):** `BCC`, `BODY`, `CC`, `FROM`, `HEADER`,
+  `SENTBEFORE`, `SENTON`, `SENTSINCE`, `SUBJECT`, `TEXT`, `TO`, as at 0.16; and, new at 1.0,
+  `KEYWORD` and `UNKEYWORD` of `$HasAttachment` or `$HasNoAttachment`. 1.0 sets those two
+  keywords from the parsed message (`email/src/message/index/metadata.rs:76`); a key
+  account's message carries neither (spec 5.2, part 5a), only what its client stored with
+  STORE, so a search on them would silently answer only the client's flags. JMAP's
+  `hasAttachment` filter is refused for key accounts likewise (`tests/src/za/mail/search.rs`).
+  At 0.16 the server set neither keyword for any account, and `KEYWORD $HasAttachment`
+  matched client flags for both; this verdict is a one-line revert if the primary prefers
+  0.16's behaviour.
+- **Visible (served from the cache):** every other key, including `KEYWORD` and
+  `UNKEYWORD` of any other flag, `BEFORE`, `ON`, `SINCE`, `OLDER` and `YOUNGER` (arrival
+  time), `LARGER` and `SMALLER` (stored size), `MODSEQ`, `EMAILID`, `THREADID`, the
+  sequence and UID keys and the operators.
+- **Sort:** `ARRIVAL` and `SIZE` are visible; `CC`, `DATE` (the sent date, which 1.0 reads
+  from `MessageData.sent_at`, 0 for a key account), `FROM`, `DISPLAYFROM`, `SUBJECT`, `TO`
+  and `DISPLAYTO` need content.
+
+The unit tables `op::search::tests::{filter_table, sort_table}` pin these verdicts.
+
+#### Decisions recorded for the primary
+
+- **The attachment keywords in FLAGS.** Part 5a stores no attachment keyword for a key
+  account. 5b does not derive them from the opened row in FETCH FLAGS: FLAGS is served
+  from the cache without keys (R33), and deriving them would make every FLAGS fetch open
+  every stub, and would answer differently with and without a content attribute in the same
+  FETCH. A key account's FLAGS therefore never show `$HasAttachment` or
+  `$HasNoAttachment`, as at 0.16, where no account's did; SEARCH on them is refused (above).
+  BODYSTRUCTURE and every attachment-derived structure answer come from the opened row.
+  Consequence for Task 7: a non-peek FETCH adds FLAGS to its answer, so
+  `za::mail::reads`' key-versus-plain comparison of `FETCH 1 (BODY[])` will see the plain
+  account's server-set `$hasattachment` and not the key account's. Either the comparison
+  drops that flag (an expectation-ledger row) or FETCH derives it from the opened row when
+  it opens one, at the cost of FLAGS answers that differ with and without a content
+  attribute. Part 5b did neither; this needs a ruling.
+- **A borrowed view for batch readers.** 1.0's FETCH holds each row by reference inside a
+  `DocumentBatch`, and `MetadataRow` is neither `Clone` nor rebuildable from its parts. Part
+  5b added `ZaMailView::za_open_metadata_row(&MetadataRow, ..) -> Option<MetadataRow>` to
+  `email/src/message/za/view.rs` (Task 5's file) and made `za_metadata_view` call it, so both
+  share one implementation: the same stub check, private-key unwrap and checked decode.
+- **R55 in the copy loop.** 0.16's fence sat before each `commit_point()` of IMAP's
+  cross-account training loop. 1.0's loop collects `SpamSamples` and commits them through
+  `add_account_spam_samples`, where part 5a fences every chunk, so the CLAUDE.md silent
+  dependency now points at `email/src/message/ingest.rs` for IMAP; JMAP's site is 5c's.
+- **New 1.0 commands without a route check of their own:** METADATA (RFC 5464) and
+  UIDBATCHES' ranges read only listed mailboxes after a sync, which unlists a foreign key
+  account first; UIDBATCHES checks before its cache read anyway. METADATA reads mailbox
+  annotations, not message content.
+
+#### Deferred, by owner
+
+**Task 2 or the primary**
+- `managesieve/src/restored_tests.rs` (Task 2's restored module) does not compile:
+  1.0's `Token::Argument` holds a `SmallVec<[u8; 22]>`, and the module passes
+  `b"...".to_vec()` (13 sites). Neither 5b's nor 3b's code; listed, not fixed, as the brief
+  says. The fix is `.into()` (or `SmallVec::from_slice`) at each site, with no assertion
+  change. `cargo check -p managesieve` (no `--tests`) passes.
+
+**Task 6**
+- Nothing from `imap/src/op/search.rs`: the refusals need no index, the visible keys read
+  the cache, and `query_emails` receives only set filters and cache comparators for a key
+  account. What the search index holds for a key account's message (arrival time and size,
+  part 5a's stub) is the index worker's, as part 5a's deferral says.
+
+**Part 5c**
+- The za IMAP and POP3 integration tests (`tests/src/za/mail/{login,reads,gates,search,
+  traces}.rs`, `tests/src/imap/za_variants.rs`) are not compiled until Task 7; they need no
+  API from 5b beyond 0.16's protocol behaviour, which 5b keeps.
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
@@ -4908,18 +5050,18 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/http/src/auth/oauth/auth.rs` | content | Task 3 | resolved (Task 3b): v1.0.1's `handle_login_request` (both blocks taken as supplied); rows 1-2 as one R36 refusal in `authenticate_login`, the one site `authorize_code` and `approve_device` share: an impersonated login of a key account answers `LoginResponse::Failure` through the callers' `Err(response)` path. |
 | `crates/http/src/auth/oauth/mod.rs` | content | Task 3 | resolved (Task 3b): 1.0's imports (`RequestOrigin`, `HttpSessionData`, `HOST`) with `fetch_body_untraced` in place of `fetch_body`; `FormData::from_request` stays untraced (issue #20). |
 | `crates/http/src/request.rs` | content | Task 3 (upload gate: Task 5) | resolved (Task 3b): rows 4-12 on 1.0. The JMAP POST arm reads the body untraced for a key account (`za_jmap_untraced`, fail closed) and keeps 1.0's `allowed_capabilities` and memory reservation, with one parse and one dispatch for both cases; the parser's `NotRequest` is reduced to a fixed reason only when untraced. R30's 403 wraps 1.0's `blob_contents`. Row 6 (upload gate, Task 5) merged clean and is kept unchanged; Task 5 re-reads it against 1.0's `blob_upload`. Row 7: `without_session_keys()` after the scope assertion on EventSource and WebSocket (1.0's `epoch` passed through). The response-body trace keeps the redaction and adds 1.0's `Prefixed` body. The 0.16 inline test module is dropped; Task 2's restored module is declared after the private slot (Task 2 handoff). |
-| `crates/imap/src/core/mailbox.rs` | content | Task 5 | open |
-| `crates/imap/src/core/message.rs` | modify/delete | Task 5 | open |
+| `crates/imap/src/core/mailbox.rs` | content | Task 5 | resolved (Task 5b): v1.0.1's `SessionData::new` and `synchronize_mailboxes_as` with rows 1-2 (a foreign key account is skipped before `shared_prefix` and `account_view`) and row 3 (`za_unlist_key_accounts`, ported to 1.0's `AccountView.names` and `MailboxChange`); row 4 moved from `check_mailbox_acl` into `check_mailbox_acl_as`, which STATUS and the selected-mailbox check call directly; `selected_access` checks the route before its cache read. |
+| `crates/imap/src/core/message.rs` | modify/delete | Task 5 | resolved (Task 5b): deleted. Row 1 (R34 in `synchronize_messages`) is at the head of `sync_view` (`core/view.rs`) as the net, and before the cache read of every `sync_view` caller (finding 5; see Task 5, part 5b). |
 | `crates/imap/src/core/mod.rs` | content | Task 3 (session keys) / Task 5 | resolved (Task 3b, ruling 41): `pub mod view` and its re-exports beside `mod za` (row 1, Task 5's module, declared); row 2 (`za_key_session`) merged; row 3: `refresh_access_token` carries the session's keys at the call site (ruling 11); its 0.16 R35 re-application is dropped, as `renew_access_token` carries the marker (3a). |
 | `crates/imap/src/core/session.rs` | content | Task 5 / Task 3 (issue #20 hunks) | resolved (Task 3b, ruling 41): both `write_error`s use 1.0's `error_response` for the bytes and trace `traced_error(err)`; rows 2-5 (pre-auth and key-session masking of writes and BAD errors) all ported; nothing deferred. |
-| `crates/imap/src/op/acl.rs` | content | Task 5 | open |
+| `crates/imap/src/op/acl.rs` | content | Task 5 | resolved (Task 5b): v1.0.1's imports (no `CacheInvalidation`) and flattened `handle_set_acl`; row 2 (ruling I3's widening refusal) before the share-count limit; row 3 merged in `get_acl_mailbox`. |
 | `crates/imap/src/op/authenticate.rs` | content | Task 3 | resolved (Task 3b): 1.0's SASL and bearer-challenge code as supplied; `authenticate` calls `authenticate_with_keys` and keeps upstream's scope check, permission check and failure accounting, then `za_mail_login` refuses a keyless key-account session (`NO [NOPERM]`) before the session is built; the keys ride the session's token for the connection. |
-| `crates/imap/src/op/copy_move.rs` | content | Task 5 | open |
-| `crates/imap/src/op/expunge.rs` | content | Task 5 | open |
-| `crates/imap/src/op/fetch.rs` | modify/delete | Task 5 | open |
-| `crates/imap/src/op/idle.rs` | content | Task 5 | open |
-| `crates/imap/src/op/search.rs` | content | Task 5 (search: Task 6) | open |
-| `crates/imap/src/op/store.rs` | content | Task 5 | open |
+| `crates/imap/src/op/copy_move.rs` | content | Task 5 | resolved (Task 5b): v1.0.1's cross-account loop, which collects `SpamSamples` and commits them through `add_account_spam_samples`, where 5a placed R55's fence in every chunk (row 2 has no site of its own here); row 1 merged; R34 before the source cache read. |
+| `crates/imap/src/op/expunge.rs` | content | Task 5 | resolved (Task 5b): v1.0.1's `expunge(.., cache, ..)` with row 1 at its head; `handle_expunge` checks the route before its cache read, and CLOSE (`close.rs`) skips the expunge, and its cache read, for a foreign key account. |
+| `crates/imap/src/op/fetch.rs` | modify/delete | Task 5 | resolved (Task 5b): deleted. Rows 2-6 in `op/fetch/mod.rs` and the new fork module `op/fetch/za.rs`: keys once per command when `FetchNeeds.structure`; a key account's metadata read as `MetadataForm::Row` and opened with `za_open_metadata_row`; the sealed blob opened whole (`za_open_message_blob`, `ZaFetchedBlob`); the `ImapEvent::Fetch` details redacted in a key session; NO `ZA_MAIL_UNREADABLE` after the served messages. R34 before the cache read. |
+| `crates/imap/src/op/idle.rs` | content | Task 5 | resolved (Task 5b): v1.0.1's `write_changes`; row 1 moved to its head: a foreign key account's selected mailbox is treated as unselected, so its cache is neither read nor synced and the mailbox-list update still runs. |
+| `crates/imap/src/op/search.rs` | content | Task 5 (search: Task 6) | resolved (Task 5b, ruling 41, whole): v1.0.1's file plus rows 2-4; row 2 moved from `query` to `search` (and `thread.rs`), before the cache read; row 3 kept exhaustive over 1.0's `Filter` and `Sort` (unchanged variants), with `KEYWORD` and `UNKEYWORD` of `$HasAttachment` and `$HasNoAttachment` now classified as content; row 4's tables updated. Nothing deferred to Task 6 from this file (see part 5b). |
+| `crates/imap/src/op/store.rs` | content | Task 5 | resolved (Task 5b): rows 1-2 on 1.0's `format_compact!` traces; R34 before the cache read. |
 | `crates/jmap/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies (local `calcard`, `smtp-proto`, `sieve-rs`, `jmap-tools`; mail-parser 1.0 without `rkyv`) plus `vault` (row 1). `test_mode = ["utils/test_mode"]`: part 2a declared `[]`, the fork's 0.16.27 value, and part 2b made it enable `utils/test_mode` ("Manifests" above). |
 | `crates/jmap/src/api/request.rs` | content | Task 5 (calendar refusal: Task 4) | resolved (Task 4b, ruling 41, whole): rows 2-24 on their arms beside 1.0's `assert_has_source_access` and from-account checks; `za_jmap_untraced` and `za_method_error_for_trace` kept. 1.0's new arms (`PrincipalAvailability`, `ShareNotification`, `FileNode`/`ContactCard` copy) are Task 5's and Task 6's to classify. |
 | `crates/jmap/src/api/session.rs` | content | Task 6 | open |
@@ -4944,7 +5086,7 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/main/Cargo.toml` | content | Task 2 (identity: Task 9) | resolved (Task 2a): v1.0.1's file with the fork's `version = "0.1.1-beta.1"` (row 1); the rest of the identity is Task 9's. |
 | `crates/managesieve/src/op/authenticate.rs` | content | Task 3 | resolved (Task 3b): row 1 (the mechanism error does not quote the token) with 1.0's `Vec<CompactString>` params; the login stays keyless `authenticate`. |
 | `crates/pop3/src/op/authenticate.rs` | content | Task 3 | resolved (Task 3b): rows 2-3 at 1.0's `authenticate` (`handle_auth` is gone): `authenticate_with_keys`, upstream's scope and permission checks, then `za_mail_login`; the keys live in `State::Authenticated.access_token` until the connection drops. |
-| `crates/pop3/src/op/fetch.rs` | content | Task 5 | open |
+| `crates/pop3/src/op/fetch.rs` | content | Task 5 | resolved (Task 5b): rows 2-4 on 1.0's `MetadataRow` read: `za_metadata_view` gives the row and `opened`; an opened stub's sealed blob is opened whole under the fetched bytes' reservation; an unreadable message answers `-ERR`. |
 | `crates/services/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's `enterprise` list plus `test_mode = ["common/test_mode"]` (row 1). |
 | `crates/services/src/task_manager/index.rs` | modify/delete | Task 6 | open |
 | `crates/services/src/task_manager/manager.rs` | content | Task 6 | open |
@@ -5036,6 +5178,8 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `za::dav_seal::test_conditional` (fork) | Comment only: a UID conflict is 403 at 1.0. | Ruling 50. |
 | `za::uid_lease::test` (fork) | A key account's UID conflict after a stale snapshot, an expired holder, a lost commit fence and a second creator is asserted to answer 403, where 0.16 asserted 412. The 503 (busy or no copy) and 201 (another calendar) cases are unchanged. | Ruling 50: `za_assert_is_unique_uid` answers 403 `NoUidConflict`, as 1.0's `assert_is_unique_uid` does (`dav/src/calendar/mod.rs`). |
 | `za::sharing::sharing_class_differential` (fork, new) | The sharee's `REPORT free-busy-query` is not in the equality block: the ordinary grantee is asserted to get the public event's busy period and the key account's grantee none (`Withheld`), a recorded divergence (ruling 51). | 1.0.1 selects a grantee's free-busy events with `is_shared_item(.., [ReadItems, SchedulingReadFreeBusy], match_any = true)` (`dav/src/calendar/freebusy.rs:199-204`), so `ReadItems` alone suffices; 0.16.27 required both bits. A key account's grantee holds no keys for the owner's account (`za_freebusy_access`). |
+| `imap::op::fetch::structure::restored_tests::*` (new, Task 2's handoff) | 0.16's six hand-built `DataItem` cases become six parsed messages written through `write_envelope` and `write_structure`. Sizes and line counts are the messages' own (computed in the test), not 0.16's literals. Media types, subtypes and parameter names are lower case, a multipart's extension data lists its `boundary`, and a text part without parameters gets `("charset" "us-ascii")` where 0.16 wrote `NIL`. | `imap/src/op/fetch/structure.rs`: 1.0 writes these items from the metadata, with the parser's normalized (lower-case) tokens and parameters, and `DEFAULT_TEXT_PARAMS` (RFC 3501's default) for a text part without any; 0.16's `DataItem::{Envelope, Body, BodyStructure}` are gone. |
+| `pop3::protocol::response::tests::serialize_response` (restored) | Its seven message cases are built with `Response::message(ChainedBytes, header length, lines)`; the header length is given (the blank line's end, or the whole message). The expected strings are unchanged. | `pop3/src/protocol/response.rs`: `Response::Message` holds a `ChainedBytes` and a `MessageEnd`, built by `Response::message` from the metadata's header length; 0.16's `SliceRange` and `lines` field are gone. |
 
 ## Task 1 check
 
