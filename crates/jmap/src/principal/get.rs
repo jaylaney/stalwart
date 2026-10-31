@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::api::session::JmapAccount;
+use crate::api::session::{JmapAccount, za_hidden_capability};
 use common::{
     Server,
     auth::{AccessToken, AccountCache},
@@ -106,14 +106,7 @@ impl PrincipalGet for Server {
                 response.push_not_found(id);
                 continue;
             };
-<<<<<<< HEAD
-            let principal = self
-                .account(document_id)
-                .await
-                .caused_by(trc::location!())?;
             let is_key = principal.is_key_account();
-=======
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
             let mut result = Map::with_capacity(properties.len());
             for property in &properties {
@@ -132,77 +125,24 @@ impl PrincipalGet for Server {
                         .map(|v| Value::Str(v.to_string().into()))
                         .unwrap_or(Value::Null),
                     PrincipalProperty::Email => Value::Str(principal.name().to_string().into()),
-<<<<<<< HEAD
-                    PrincipalProperty::Accounts => Value::Object(Map::from(vec![(
-                        Key::Property(PrincipalProperty::IdValue(id)),
-                        Value::Object(Map::from_iter(
-                            [
-                                Capability::Mail,
-                                Capability::Contacts,
-                                Capability::Calendars,
-                                Capability::FileNode,
-                                Capability::Principals,
-                            ]
-                            .iter()
-                            .map(|cap| {
-                                (
-                                    Key::Property(PrincipalProperty::Capability(*cap)),
-                                    Value::Object(Map::new()),
-                                )
-                            })
-                            .chain([
-                                (
-                                    Key::Property(PrincipalProperty::Capability(
-                                        Capability::PrincipalsOwner,
-                                    )),
-                                    Value::Object(Map::from(vec![
-                                        (
-                                            Key::Borrowed("accountIdForPrincipal"),
-                                            Value::Element(PrincipalValue::Id(id)),
-                                        ),
-                                        (
-                                            Key::Borrowed("principalId"),
-                                            Value::Element(PrincipalValue::Id(id)),
-                                        ),
-                                    ])),
-                                ),
-                                (
-                                    Key::Property(PrincipalProperty::Capability(
-                                        Capability::Calendars,
-                                    )),
-                                    Value::Object(Map::from(vec![
-                                        (
-                                            Key::Borrowed("accountId"),
-                                            Value::Element(PrincipalValue::Id(id)),
-                                        ),
-                                        (Key::Borrowed("mayGetAvailability"), Value::Bool(true)),
-                                        (Key::Borrowed("mayShareWith"), Value::Bool(true)),
-                                        (
-                                            Key::Borrowed("calendarAddress"),
-                                            Value::Str(
-                                                format!("mailto:{}", principal.name()).into(),
-                                            ),
-                                        ),
-                                    ])),
-                                ),
-                            ])
-                            .filter(|(key, _)| za_shown_capability(is_key, key)),
-                        )),
-                    )])),
-=======
                     PrincipalProperty::Accounts => {
                         if access_token.is_member(document_id)
                             || access_token.is_shared(document_id)
                         {
                             Value::Object(Map::from(vec![(
                                 Key::Property(PrincipalProperty::IdValue(id)),
-                                accounts.account(self, access_token, id, principal.name())?,
+                                accounts.account(
+                                    self,
+                                    access_token,
+                                    id,
+                                    principal.name(),
+                                    is_key,
+                                )?,
                             )]))
                         } else {
                             Value::Null
                         }
                     }
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                     PrincipalProperty::Capabilities => Value::Object(Map::from_iter(
                         [
                             Capability::Mail,
@@ -217,9 +157,6 @@ impl PrincipalGet for Server {
                                 Value::Object(Map::new()),
                             )
                         })
-<<<<<<< HEAD
-                        .filter(|(key, _)| za_shown_capability(is_key, key)),
-=======
                         .chain([(
                             Key::Property(PrincipalProperty::Capability(Capability::Calendars)),
                             Value::Object(Map::from(vec![
@@ -254,8 +191,8 @@ impl PrincipalGet for Server {
                                     },
                                 ),
                             ])),
-                        )]),
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+                        )])
+                        .filter(|(key, _)| za_shown_capability(is_key, key)),
                     )),
                     _ => Value::Null,
                 };
@@ -310,6 +247,7 @@ impl AccountObjects {
         access_token: &AccessToken,
         id: Id,
         name: &str,
+        is_key: bool,
     ) -> trc::Result<PrincipalObject> {
         let account_id = id.document_id();
         let template = if access_token.is_member(account_id) {
@@ -325,6 +263,7 @@ impl AccountObjects {
         capabilities.extend(
             template
                 .iter()
+                .filter(|(key, _)| za_shown_capability(is_key, key))
                 .map(|(key, value)| (key.clone(), value.clone())),
         );
         capabilities.insert_unchecked(
@@ -419,11 +358,12 @@ impl IntoPrincipalValue for serde_json::Value {
     }
 }
 
-/// Spec 9: a key account's principal advertises no calendars capability.
+/// Spec 9: a key account's principal advertises no calendars capability, in
+/// its `capabilities` and in its account object (`za_hidden_capability`).
 fn za_shown_capability(is_key: bool, key: &Key<'_, PrincipalProperty>) -> bool {
-    !(is_key
-        && matches!(
-            key,
-            Key::Property(PrincipalProperty::Capability(Capability::Calendars))
-        ))
+    !matches!(
+        key,
+        Key::Property(PrincipalProperty::Capability(capability))
+            if za_hidden_capability(is_key, *capability)
+    )
 }

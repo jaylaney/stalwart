@@ -122,33 +122,18 @@ impl SessionHandler for Server {
             .caused_by(trc::location!())?;
         session.username = account.name().to_string();
         let account_id = Id::from(access_token.account_id());
-<<<<<<< HEAD
         // Spec 9: JMAP calendars are not offered for key accounts.
         let primary_is_key = account.is_key_account();
-        let mut account = Account {
-            name: account.name().to_string(),
-            is_personal: true,
-            is_read_only: false,
-            account_capabilities: VecMap::with_capacity(account_capabilities.len()),
-        };
-        for capability in access_token.account_capabilities().filter(|c| {
-            !(primary_is_key && matches!(c, Capability::Calendars | Capability::CalendarsParse))
-        }) {
-            session.primary_accounts.append(capability, account_id);
-            account.account_capabilities.append(
-                capability,
-                account_capabilities
-                    .get(&capability)
-                    .map(|v| v.to_account_capabilities(account_id.into(), true))
-                    .unwrap_or_else(|| Capabilities::Empty(EmptyCapabilities::default())),
-            );
-=======
-        let primary_account = self.jmap_account(
+        let mut primary_account = self.jmap_account(
             access_token,
             access_token.account_id(),
             account.name().to_string(),
         );
-        for capability in access_token.account_capabilities(&self.core.jmap.capabilities) {
+        za_trim_account(&mut primary_account, primary_is_key);
+        for capability in access_token
+            .account_capabilities(&self.core.jmap.capabilities)
+            .filter(|capability| !za_hidden_capability(primary_is_key, *capability))
+        {
             if capability != Capability::Metadata
                 || primary_account
                     .account_capabilities
@@ -156,7 +141,6 @@ impl SessionHandler for Server {
             {
                 session.primary_accounts.append(capability, account_id);
             }
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
         }
         session.accounts.append(account_id, primary_account);
 
@@ -174,41 +158,18 @@ impl SessionHandler for Server {
                 );
                 continue;
             };
-            session.accounts.append(
-                Id::from(account_id),
-                self.jmap_account(access_token, account_id, account.name().to_string()),
-            );
+            let mut secondary =
+                self.jmap_account(access_token, account_id, account.name().to_string());
+            za_trim_account(&mut secondary, account.is_key_account());
+            session.accounts.append(Id::from(account_id), secondary);
         }
 
-<<<<<<< HEAD
-            let account_id = Id::from(account_id);
-            let is_key = account.is_key_account();
-            let mut account = Account {
-                name: account.name().to_string(),
-                is_personal: false,
-                is_read_only: false,
-                account_capabilities: VecMap::with_capacity(account_capabilities.len()),
-            };
-            for capability in access_token.account_capabilities().filter(|c| {
-                !(is_key && matches!(c, Capability::Calendars | Capability::CalendarsParse))
-            }) {
-                account.account_capabilities.append(
-                    capability,
-                    account_capabilities
-                        .get(&capability)
-                        .map(|v| v.to_account_capabilities(account_id.into(), is_owner))
-                        .unwrap_or_else(|| Capabilities::Empty(EmptyCapabilities::default())),
-                );
-            }
-            session.accounts.append(account_id, account);
-=======
         if !session.accounts.values().any(|account| {
             account
                 .account_capabilities
                 .contains_key(&Capability::Metadata)
         }) {
             session.capabilities.remove(&Capability::Metadata);
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
         }
 
         Ok(session)
@@ -306,4 +267,25 @@ pub fn allowed_capabilities(access_token: &AccessToken, using: CapabilityIds) ->
                 && access_token.allows_oauth_scopes(capability_scopes(*capability))
         })
         .collect()
+}
+
+/// Spec 9: whether an account's capabilities leave `capability` out, the
+/// account being a key account (`is_key`): JMAP calendars are not offered
+/// for key accounts.
+pub(crate) fn za_hidden_capability(is_key: bool, capability: Capability) -> bool {
+    is_key
+        && matches!(
+            capability,
+            Capability::Calendars | Capability::CalendarsParse
+        )
+}
+
+/// Spec 9: removes the capabilities `za_hidden_capability` leaves out from a
+/// session's account object.
+fn za_trim_account(account: &mut Account, is_key: bool) {
+    for capability in Capability::all_capabilities() {
+        if za_hidden_capability(is_key, *capability) {
+            account.account_capabilities.remove(capability);
+        }
+    }
 }
