@@ -5,7 +5,9 @@
  */
 
 use crate::{DavError, DavResourceName};
-use common::{Server, auth::AccessToken, storage::metadata::ContainerChange};
+use common::{
+    Server, auth::AccessToken, storage::metadata::ContainerChange, za::metadata::ZaMetadataFence,
+};
 use groupware::calendar::{
     ArchivedCalendarEvent, CalendarEvent, CalendarEventNotification,
     seal::{
@@ -514,6 +516,47 @@ pub(crate) async fn is_key_account(server: &Server, account_id: u32) -> crate::R
         .caused_by(trc::location!())?)
 }
 
+/// Ruling 70: the collections whose DAV dead-property containers carry the
+/// ordinary-writer assertion. A key account's calendar and event containers
+/// are sealed (rulings 16 and 23), so a plaintext one is an ordinary
+/// writer's; address books, cards and files keep their dead properties in
+/// the clear for every account, a key account's included, and are excluded.
+pub(crate) fn za_dead_fenced(collection: Collection) -> bool {
+    matches!(collection, Collection::Calendar | Collection::CalendarEvent)
+}
+
+/// Ruling 70 (with ruling 66 and the Task 6 review's F1): the fence of a DAV
+/// dead-property container write on `account_id`'s `collection` object.
+/// `sealed` is the writer's classification: `Some(true)` for a write sealed
+/// for a key account, `Some(false)` for upstream's plaintext path, `None` to
+/// read it (`account()`, which fails closed). A plaintext calendar or event
+/// container write commits only while the account holds no vault record
+/// (`ZaMetadataFence`, applied before the write in the same commit chunk),
+/// as mail's ordinary writers do; every other write gets no fence.
+pub(crate) async fn za_dead_fence(
+    server: &Server,
+    account_id: u32,
+    collection: Collection,
+    sealed: Option<bool>,
+) -> trc::Result<Option<ZaMetadataFence>> {
+    if !za_dead_fenced(collection) {
+        return Ok(None);
+    }
+    let sealed = match sealed {
+        Some(sealed) => sealed,
+        None => server
+            .account(account_id)
+            .await
+            .caused_by(trc::location!())?
+            .is_key_account(),
+    };
+    Ok(if sealed {
+        None
+    } else {
+        server.za_metadata_fence(account_id, None)
+    })
+}
+
 /// The scope of a key account's dead-property container (upgrade rulings 16
 /// and 23): which document it belongs to and the key domain it is sealed in.
 pub(crate) struct ZaDeadSeal<'x> {
@@ -636,6 +679,29 @@ pub(crate) fn za_reseal_container(
 fn za_container_buf(container: EncodedMetadata) -> trc::Result<MetadataBuf> {
     let stored = StoredMetadata::new(container).caused_by(trc::location!())?;
     MetadataBuf::read(stored.as_bytes()).caused_by(trc::location!())
+}
+
+#[cfg(test)]
+mod dead_fence_tests {
+    use super::za_dead_fenced;
+    use types::collection::Collection;
+
+    /// Ruling 70: only calendar and event containers are fenced.
+    #[test]
+    fn only_calendar_containers_are_fenced() {
+        assert!(za_dead_fenced(Collection::Calendar));
+        assert!(za_dead_fenced(Collection::CalendarEvent));
+        for collection in [
+            Collection::AddressBook,
+            Collection::ContactCard,
+            Collection::FileNode,
+            Collection::CalendarEventNotification,
+            Collection::Mailbox,
+            Collection::Email,
+        ] {
+            assert!(!za_dead_fenced(collection), "{collection:?}");
+        }
+    }
 }
 
 #[cfg(test)]

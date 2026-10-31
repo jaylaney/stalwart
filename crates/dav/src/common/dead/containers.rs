@@ -220,6 +220,13 @@ impl ContainerWrites {
         #[cfg(feature = "enterprise")]
         let tenant_id = self.owner(server).await?.id_tenant;
         // SPDX-SnippetEnd
+        // Ruling 70: a plaintext calendar or event container copied by a
+        // writer that read the account as ordinary.
+        if let Some(fence) =
+            crate::common::za::za_dead_fence(server, self.account_id, self.collection, None).await?
+        {
+            fence.apply(batch);
+        }
         MetadataWrite {
             account_id: self.account_id,
             // SPDX-SnippetBegin
