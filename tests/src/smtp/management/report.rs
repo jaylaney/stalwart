@@ -130,7 +130,19 @@ async fn manage_reports() {
         })
         .await;
 
-    // List DMARC reports
+    // List DMARC reports once their windows are closed (see
+    // `close_report_windows`). The report scheduler writes the events'
+    // rows asynchronously, so the windows are closed until both kinds are
+    // listed.
+    for _ in 0..50 {
+        test.close_report_windows().await;
+        if admin.registry_get_all::<DmarcInternalReport>().await.len() == 2
+            && admin.registry_get_all::<TlsInternalReport>().await.len() == 2
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
     let mut dmarc_name_to_id = AHashMap::new();
     let mut dmarc_id_to_name = AHashMap::new();
     for (id, report) in admin.registry_get_all::<DmarcInternalReport>().await {
@@ -198,11 +210,16 @@ async fn manage_reports() {
             vec![tls_name_to_id["foobar.net"]],
         ),
     ] {
+        // 1.0 derives a report's id from its window and a hash of its slot,
+        // so the listing's order is not the order of scheduling.
+        let mut ids = admin
+            .registry_query_ids(object, query.clone(), Vec::<&str>::new())
+            .await;
+        let mut expected_ids = expected_ids;
+        ids.sort_unstable();
+        expected_ids.sort_unstable();
         assert_eq!(
-            admin
-                .registry_query_ids(object, query.clone(), Vec::<&str>::new())
-                .await,
-            expected_ids,
+            ids, expected_ids,
             "failed for {object:?} with query {query:?}"
         );
     }

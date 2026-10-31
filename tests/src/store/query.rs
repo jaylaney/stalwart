@@ -866,14 +866,39 @@ async fn test_global(store: SearchStore) {
         .await,
         AHashSet::from_iter([ids[0], ids[2], ids[4]])
     );
-    assert_eq!(
-        query_global(vec![
-            SearchFilter::integer_gt(TracingSearchField::QueueId, 1000u64),
-            SearchFilter::integer_lt(TracingSearchField::QueueId, 1002u64),
-        ])
-        .await,
-        AHashSet::from_iter([ids[2], ids[3]])
-    );
+    // 1.0's internal store answers only equality on an indexed integer
+    // field (`SearchFilter::Integer` in its global query), so the range of
+    // queue ids is asked as the one id it holds there; other stores keep
+    // the range.
+    if store.internal_fts().is_some() {
+        assert!(
+            store
+                .query_global(SearchQuery::new(SearchIndex::Tracing).with_filters(vec![
+                    SearchFilter::integer_gt(TracingSearchField::QueueId, 1000u64),
+                    SearchFilter::integer_lt(TracingSearchField::QueueId, 1002u64),
+                ]))
+                .await
+                .is_err(),
+            "the internal store refuses an integer range"
+        );
+        assert_eq!(
+            query_global(vec![SearchFilter::integer_eq(
+                TracingSearchField::QueueId,
+                1001u64
+            )])
+            .await,
+            AHashSet::from_iter([ids[2], ids[3]])
+        );
+    } else {
+        assert_eq!(
+            query_global(vec![
+                SearchFilter::integer_gt(TracingSearchField::QueueId, 1000u64),
+                SearchFilter::integer_lt(TracingSearchField::QueueId, 1002u64),
+            ])
+            .await,
+            AHashSet::from_iter([ids[2], ids[3]])
+        );
+    }
     assert_eq!(
         query_global(vec![
             SearchFilter::Or,

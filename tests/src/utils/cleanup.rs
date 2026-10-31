@@ -180,7 +180,13 @@ async fn store_destroy_sql_indexes(store: &Store) {
 }
 
 pub async fn store_blob_expire_all(store: &Store) {
-    // Delete all temporary hashes
+    // Expire every temporary link in place, as the purge would find it once
+    // its hold ran out. 0.16's helper deleted the links. At 1.0 a blob held
+    // for a batch that never committed (`Server::hold_blob`, for example a
+    // DAV PUT refused for quota) has no commit entry, only its temporary
+    // link, and the purge reads that link to delete the blob: a deleted link
+    // leaves the blob in the blob store, unreachable.
+    const EXPIRED: u64 = 1;
     let from_key = ValueKey {
         account_id: 0,
         collection: 0,
@@ -203,7 +209,7 @@ pub async fn store_blob_expire_all(store: &Store) {
     store
         .iterate(
             IterateParams::new(from_key, to_key).ascending(),
-            |key, _| {
+            |key, value| {
                 if key.len() == BLOB_HASH_LEN + U32_LEN + U64_LEN {
                     let account_id = key
                         .deserialize_be_u32(BLOB_HASH_LEN)
@@ -218,10 +224,20 @@ pub async fn store_blob_expire_all(store: &Store) {
                         .deserialize_be_u64(BLOB_HASH_LEN + U32_LEN)
                         .caused_by(trc::location!())?;
 
-                    batch.clear(ValueClass::Blob(BlobOp::Link {
-                        hash,
-                        to: BlobLink::Temporary { until },
-                    }));
+                    if until > EXPIRED {
+                        batch
+                            .clear(ValueClass::Blob(BlobOp::Link {
+                                hash: hash.clone(),
+                                to: BlobLink::Temporary { until },
+                            }))
+                            .set(
+                                ValueClass::Blob(BlobOp::Link {
+                                    hash,
+                                    to: BlobLink::Temporary { until: EXPIRED },
+                                }),
+                                value.to_vec(),
+                            );
+                    }
                 }
 
                 Ok(true)

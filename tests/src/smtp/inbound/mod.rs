@@ -13,7 +13,7 @@ use registry::{schema::prelude::ObjectType, types::ObjectImpl};
 use smtp::queue::{Message, MessageWrapper, QueueId, QueuedMessage};
 use std::time::Duration;
 use store::{
-    Deserialize, IterateParams, U64_LEN, ValueKey,
+    Deserialize, IterateParams, ValueKey,
     write::{Archive, ArchiveBytes, QueueClass, ValueClass, key::DeserializeBigEndian},
 };
 use tokio::sync::mpsc::error::TryRecvError;
@@ -185,7 +185,10 @@ impl TestServer {
             store::write::QueueEvent {
                 due: u64::MAX,
                 queue_id: u64::MAX,
-                queue_name: [u8::MAX; 8],
+                // 1.0 keys an event by its queue name first, then its due
+                // time and its message (`QueueEvent::deserialize`); the
+                // last queue name is below the tenant index's.
+                queue_name: store::write::QueueEvent::LAST_QUEUE,
             },
         )));
 
@@ -194,13 +197,7 @@ impl TestServer {
             .iterate(
                 IterateParams::new(from_key, to_key).ascending().no_values(),
                 |key, _| {
-                    events.push(store::write::QueueEvent {
-                        due: key.deserialize_be_u64(0)?,
-                        queue_id: key.deserialize_be_u64(U64_LEN)?,
-                        queue_name: key[U64_LEN + 1..U64_LEN + 9]
-                            .try_into()
-                            .expect("Queue name must be 8 bytes"),
-                    });
+                    events.push(store::write::QueueEvent::deserialize(key)?);
                     Ok(true)
                 },
             )
@@ -237,7 +234,28 @@ impl TestServer {
         messages
     }
 
+    /// 1.0 keeps an aggregate report's rows in their window until the
+    /// window's task closes it (`create_window_reports`) and writes the
+    /// report the registry lists; 0.16 wrote the report as the first event
+    /// arrived. The tests close every window first, as that task does at the
+    /// window's end.
+    pub async fn close_report_windows(&self) {
+        for object in [
+            ObjectType::DmarcInternalReport,
+            ObjectType::TlsInternalReport,
+        ] {
+            smtp::reporting::aggregate::window::create_window_reports(
+                &self.server,
+                object,
+                u64::MAX - 1,
+            )
+            .await
+            .unwrap();
+        }
+    }
+
     pub async fn read_report_events<T: ObjectImpl>(&self) -> Vec<(Id, T)> {
+        self.close_report_windows().await;
         self.account("admin").registry_get_all().await
     }
 

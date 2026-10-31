@@ -67,7 +67,9 @@ pub struct ProtectedResourceMetadata {
 
 const PKCE_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 const PKCE_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
-const PROFILE_SCOPE: &str = "urn:ietf:params:oauth:scope:mail offline_access";
+// 1.0 issues an ID token only for the `openid` scope (OpenID Connect Core
+// 3.1.2.1); 0.16 issued one for any authorization code.
+const PROFILE_SCOPE: &str = "openid urn:ietf:params:oauth:scope:mail offline_access";
 const REFRESH_TOKEN_LIFETIME: u64 = 10;
 
 #[derive(Debug, serde::Deserialize)]
@@ -100,13 +102,12 @@ pub async fn test(test: &mut TestServer) {
     // `anonymous_client_registration` and `require_client_registration`
     // (subject deleted); the assertions that depended on them are marked
     // where they stood.
+    // 1.0 refuses an `authCodeExpiry` or `accessTokenExpiry` under ten
+    // minutes and a `refreshTokenExpiry` under a day, so the short lifetimes
+    // this test waits out are set on the running core after the settings
+    // load, as 0.16 set them through the registry.
     let settings = OidcProvider {
-        access_token_expiry: registry::schema::prelude::Duration::from_millis(1000),
-        auth_code_expiry: registry::schema::prelude::Duration::from_millis(1000),
         user_code_expiry: registry::schema::prelude::Duration::from_millis(1000),
-        refresh_token_expiry: registry::schema::prelude::Duration::from_millis(
-            REFRESH_TOKEN_LIFETIME * 1000,
-        ),
         signature_algorithm: JwtSignatureAlgorithm::Rs256,
         signature_key: SecretText::Text(SecretTextValue {
             secret: OIDC_SIGNATURE_KEY_RS256.to_string(),
@@ -117,16 +118,21 @@ pub async fn test(test: &mut TestServer) {
         .registry_update_setting(
             settings,
             &[
-                Property::AccessTokenExpiry,
-                Property::AuthCodeExpiry,
                 Property::UserCodeExpiry,
-                Property::RefreshTokenExpiry,
                 Property::SignatureAlgorithm,
                 Property::SignatureKey,
             ],
         )
         .await;
     admin.reload_settings().await;
+    let mut core = (*test.server.inner.shared_core.load_full()).clone();
+    core.oauth.oauth_expiry_token = 1;
+    core.oauth.oauth_expiry_auth_code = 1;
+    core.oauth.oauth_expiry_refresh_token = REFRESH_TOKEN_LIFETIME;
+    test.server
+        .inner
+        .shared_core
+        .store(std::sync::Arc::new(core));
 
     // Create test account
     let user = test
@@ -247,9 +253,9 @@ pub async fn test(test: &mut TestServer) {
         "http://127.0.0.1/cb",
         "http://127.0.0.1:54321/cb",
         "http://[::1]:8080/cb",
-        "http://127.0.0.1",
-        "http://127.0.0.1:54321",
-        "http://[::1]:8080",
+        "http://127.0.0.1/",
+        "http://127.0.0.1:54321/",
+        "http://[::1]:8080/",
     ] {
         let (status, body) = post_json_raw(
             &metadata.registration_endpoint,
@@ -264,6 +270,25 @@ pub async fn test(test: &mut TestServer) {
             status, 201,
             "registration should return 201 for {good_uri}: {body}"
         );
+    }
+    // 1.0 requires a loopback redirect URI to carry a path, at least "/"
+    // (`loopback_redirect_parts`); 0.16 accepted these without one.
+    for pathless_uri in [
+        "http://127.0.0.1",
+        "http://127.0.0.1:54321",
+        "http://[::1]:8080",
+    ] {
+        let (status, body) = post_json_raw(
+            &metadata.registration_endpoint,
+            &ClientRegistrationRequest {
+                redirect_uris: vec![pathless_uri.to_string()],
+                scope: Some(PROFILE_SCOPE.to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(status, 400, "expected rejection for {pathless_uri}: {body}");
+        assert_eq!(body["error"], "invalid_redirect_uri", "for {pathless_uri}");
     }
 
     // Register the client used for the flow with a private-use scheme redirect URI
@@ -374,10 +399,13 @@ pub async fn test(test: &mut TestServer) {
         ("code".to_string(), response.unwrap_code()),
         ("code_verifier".to_string(), PKCE_VERIFIER.to_string()),
     ]);
+    // 1.0 answers a code presented by another client, or with another
+    // redirect URI, `invalid_grant` (RFC 6749 5.2); 0.16 answered
+    // `invalid_client`.
     assert_eq!(
         post::<TokenResponse>(&metadata.token_endpoint, &token_params).await,
         TokenResponse::Error {
-            error: ErrorType::InvalidClient
+            error: ErrorType::InvalidGrant
         }
     );
     token_params.insert("client_id".to_string(), client_id.to_string());
@@ -388,7 +416,7 @@ pub async fn test(test: &mut TestServer) {
     assert_eq!(
         post::<TokenResponse>(&metadata.token_endpoint, &token_params).await,
         TokenResponse::Error {
-            error: ErrorType::InvalidClient
+            error: ErrorType::InvalidGrant
         }
     );
 
@@ -466,7 +494,12 @@ pub async fn test(test: &mut TestServer) {
     .await;
     assert_eq!(access_introspect.username.unwrap(), "user@example.org");
     assert_eq!(access_introspect.token_type.unwrap(), "bearer");
-    assert!(access_introspect.client_id.is_none());
+    // 1.0 names the token's client in the introspection (RFC 7662 2.2);
+    // 0.16 left `client_id` out.
+    assert_eq!(
+        access_introspect.client_id.as_deref(),
+        Some(client_id.as_str())
+    );
     assert!(access_introspect.active);
     let refresh_introspect = post_with_auth::<OAuthIntrospect>(
         &metadata.introspection_endpoint,
@@ -475,7 +508,10 @@ pub async fn test(test: &mut TestServer) {
     )
     .await;
     assert_eq!(refresh_introspect.username.unwrap(), "user@example.org");
-    assert!(refresh_introspect.client_id.is_none());
+    assert_eq!(
+        refresh_introspect.client_id.as_deref(),
+        Some(client_id.as_str())
+    );
     assert!(refresh_introspect.active);
     assert_eq!(
         refresh_introspect.iat.unwrap(),
@@ -1128,9 +1164,10 @@ fn auth_code_request(query: AuthCodeQuery<'_>) -> LoginRequest {
             .append_pair("code_challenge", code_challenge)
             .append_pair("code_challenge_method", "S256");
     }
-    if let Some(state) = query.state {
-        serializer.append_pair("state", state);
-    }
+    // 1.0 refuses an authorization request without `state`
+    // (`invalid_request`, "The state parameter is missing."); a request that
+    // names none sends a fixed one.
+    serializer.append_pair("state", query.state.unwrap_or("oidc-test-state"));
     for resource in query.resources {
         serializer.append_pair("resource", resource);
     }

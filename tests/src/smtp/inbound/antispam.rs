@@ -82,6 +82,14 @@ async fn antispam() {
             ..Default::default()
         })
         .await;
+    // 1.0 ships Pyzor disabled (`SpamPyzor::enable` defaults to false; 0.16:
+    // true); the pyzor cases need it.
+    admin
+        .registry_create_object(structs::SpamPyzor {
+            enable: true,
+            ..Default::default()
+        })
+        .await;
     admin
         .registry_create_object(MemoryLookupKey {
             is_glob_pattern: true,

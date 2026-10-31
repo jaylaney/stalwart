@@ -169,18 +169,20 @@ async fn report_scheduler() {
     let mut total_dmarc_policies = 0;
     for (_, report) in test.read_report_events::<DmarcInternalReport>().await {
         total_dmarc_policies += 1;
-        assert_eq!(
-            report.deliver_at.timestamp() - report.created_at.timestamp(),
-            7 * 86400
-        );
+        // 1.0: the report covers its window (`created_at` is its start)
+        // and is delivered `SEND_DELAY` (300 s) plus a jitter under 600 s
+        // after the window ends; 0.16 delivered it at the window's end.
+        let delay = report.deliver_at.timestamp() - report.created_at.timestamp() - 7 * 86400;
+        assert!((300..900).contains(&delay), "delivery delay {delay}");
     }
     for (_, report) in test.read_report_events::<TlsInternalReport>().await {
         total_tls += 1;
         total_tls_policies += report.report.policies.len();
-        assert_eq!(
-            report.deliver_at.timestamp() - report.created_at.timestamp(),
-            86400
-        );
+        // 1.0: the report covers its window (`created_at` is its start)
+        // and is delivered `SEND_DELAY` (300 s) plus a jitter under 600 s
+        // after the window ends; 0.16 delivered it at the window's end.
+        let delay = report.deliver_at.timestamp() - report.created_at.timestamp() - 86400;
+        assert!((300..900).contains(&delay), "delivery delay {delay}");
     }
     assert_eq!(total_tls, 1);
     assert_eq!(total_tls_policies, 3);

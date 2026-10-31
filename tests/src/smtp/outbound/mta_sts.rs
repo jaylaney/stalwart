@@ -184,7 +184,15 @@ async fn mta_sts_verify() {
         FailureType::StsPolicyInvalid
     );
 
-    // MTA-STS policy does not authorize mx.foobar.org
+    // MTA-STS policy does not authorize mx.foobar.org. 1.0 caches a failed
+    // fetch for its record id and backs off (`MtaStsEntry::Failed`), so the
+    // policy is published under a new id, as a domain publishing a fixed
+    // policy would; 0.16 refetched the same id.
+    local.server.txt_add(
+        "_mta-sts.foobar.org",
+        MtaStsRecord::parse(b"v=STSv1; id=policy_not_authorized;").unwrap(),
+        Instant::now() + Duration::from_secs(10),
+    );
     let policy = concat!(
         "version: STSv1\n",
         "mode: enforce\n",
@@ -213,7 +221,7 @@ async fn mta_sts_verify() {
     assert_eq!(
         report.policy,
         PolicyType::Sts(
-            Arc::new(Policy::parse(policy, "policy_will_fail".to_string()).unwrap()).into()
+            Arc::new(Policy::parse(policy, "policy_not_authorized".to_string()).unwrap()).into()
         )
     );
     assert_eq!(

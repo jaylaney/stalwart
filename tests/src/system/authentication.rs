@@ -375,16 +375,22 @@ pub async fn validate_password_with_ip(
     remote_ip: &str,
     is_valid: bool,
 ) {
-    let response = reqwest::Client::builder()
+    let mut request = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .build()
         .unwrap()
         .get("https://127.0.0.1:8899/.well-known/jmap")
-        .basic_auth(username, Some(password))
-        .header("X-Forwarded-For", remote_ip)
-        .send()
-        .await
-        .unwrap();
+        .basic_auth(username, Some(password));
+    // 1.0 answers 400 to a forwarded loopback address (`is_loopback_claim`,
+    // `ClientIp::Invalid`), and takes the peer's address when the header is
+    // missing on a loopback connection: a loopback client sends none.
+    if !remote_ip
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+    {
+        request = request.header("X-Forwarded-For", remote_ip);
+    }
+    let response = request.send().await.unwrap();
 
     let status = response.status();
     if status.is_success() != is_valid {

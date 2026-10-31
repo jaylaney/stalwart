@@ -243,7 +243,7 @@ async fn dmarc() {
         .read_lines(&test)
         .await
         .assert_contains("DKIM-Signature: v=1; a=rsa-sha256; s=rsa; d=localdomain.org;")
-        .assert_contains("To: spf-failures@example.com")
+        .assert_contains("To: <spf-failures@example.com>")
         .assert_contains("Feedback-Type: auth-failure")
         .assert_contains("Auth-Failure: spf");
 
@@ -274,7 +274,7 @@ async fn dmarc() {
         .read_lines(&test)
         .await
         .assert_contains("DKIM-Signature: v=1; a=rsa-sha256; s=rsa; d=localdomain.org;")
-        .assert_contains("To: dkim-failures@example.com")
+        .assert_contains("To: <dkim-failures@example.com>")
         .assert_contains("Feedback-Type: auth-failure")
         .assert_contains("Auth-Failure: bodyhash");
 
@@ -325,7 +325,7 @@ async fn dmarc() {
         .read_lines(&test)
         .await
         .assert_contains("DKIM-Signature: v=1; a=rsa-sha256; s=rsa; d=localdomain.org;")
-        .assert_contains("To: dmarc-failures@example.com")
+        .assert_contains("To: <dmarc-failures@example.com>")
         .assert_contains("Feedback-Type: auth-failure")
         .assert_contains("Auth-Failure: dmarc")
         .assert_contains("dmarc=3Dfail");

@@ -17,12 +17,18 @@ use std::time::{Duration, Instant};
 
 const TESTS: &[(&str, &str)] = &[
     ("dns_query(rcpt_domain, 'mx')[0]", "mx.foobar.org"),
+    // Ruling 87: 1.0's SQL lookup store answers queries only
+    // (`InMemoryStore::Sql` refuses key and counter operations), so the key
+    // and counter functions run against the default in-memory store
+    // (`'*'`), 1.0's OSS key-value lookup; 0.16 ran them on the SQL store.
+    // 1.0 replaced `counter_get` and `counter_incr` with `key_incr` (an
+    // increment of zero reads the counter).
     (
-        "key_get('sql', 'hello') + '-' + key_exists('sql', 'hello') + '-' + key_set('sql', 'hello', 'world') + '-' + key_get('sql', 'hello') + '-' + key_exists('sql', 'hello')",
+        "key_get('*', 'hello') + '-' + key_exists('*', 'hello') + '-' + key_set('*', 'hello', 'world') + '-' + key_get('*', 'hello') + '-' + key_exists('*', 'hello')",
         "-0-1-world-1",
     ),
     (
-        "counter_get('sql', 'county') + '-' + counter_incr('sql', 'county', 1) + '-' + counter_incr('sql', 'county', 1) + '-' + counter_get('sql', 'county')",
+        "key_incr('*', 'county', 0) + '-' + key_incr('*', 'county', 1) + '-' + key_incr('*', 'county', 1) + '-' + key_incr('*', 'county', 0)",
         "0-1-2-2",
     ),
     (
@@ -131,7 +137,7 @@ async fn expressions() {
             test.server
                 .eval_if::<String, _>(&e, &RecipientDomain::new("test.org"), &mut Bump::new(), 0)
                 .await
-                .unwrap(),
+                .unwrap_or_else(|| panic!("no value for '{expr}'")),
             *expected,
             "failed for '{}'",
             expr

@@ -23,7 +23,7 @@ use store::{
 use types::{
     blob_hash::BlobHash,
     collection::{Collection, SyncCollection},
-    field::{Field, MailboxField},
+    field::{EmailField, Field, MailboxField},
 };
 
 pub async fn test(test: &TestServer) {
@@ -34,10 +34,12 @@ pub async fn test(test: &TestServer) {
     // Create blobs
     println!("Creating blobs...");
     let mut batch = BatchBuilder::new();
+    // 1.0 keeps the schema version in the system subspace (0.16: the
+    // property subspace, key 0).
     batch.set(
         ValueClass::Any(AnyClass {
-            subspace: Subspace::Property,
-            key: vec![0u8],
+            subspace: Subspace::System,
+            key: vec![store::write::key::SystemKind::SchemaVersion as u8],
         }),
         DATABASE_SCHEMA_VERSION.serialize(),
     );
@@ -79,14 +81,23 @@ pub async fn test(test: &TestServer) {
                             ValueClass::Property(Field::ARCHIVE.into()),
                             random_bytes(10),
                         )
-                        .add(
-                            ValueClass::Property(MailboxField::UidCounter.into()),
-                            rand::random(),
-                        );
+                        // 1.0 keeps the mailbox UID counter in the counter
+                        // subspace (`ValueClass::MailboxUid`).
+                        .add(ValueClass::from(MailboxField::UidCounter), rand::random());
                 }
 
                 for (idx, value_size) in [16, 128, 1024, 2056, 102400].into_iter().enumerate() {
-                    batch.set(ValueClass::Property(idx as u8), random_bytes(value_size));
+                    // 1.0 keeps an email's metadata and sort keys (fields 1
+                    // and 2) in the immutable subspace.
+                    let class = if collection == Collection::Email
+                        && (idx as u8 == u8::from(EmailField::Metadata)
+                            || idx as u8 == u8::from(EmailField::SortKeys))
+                    {
+                        ValueClass::Immutable(idx as u8)
+                    } else {
+                        ValueClass::Property(idx as u8)
+                    };
+                    batch.set(class, random_bytes(value_size));
                 }
 
                 for grant_account_id in 0u32..10u32 {
