@@ -11,6 +11,8 @@ use jmap_proto::{
 };
 use serde_json::json;
 
+// 1.0 lists `maySetMetadata` among the rights (`Acl::ModifyMetadata`): an
+// owner holds it, and no grant below gives it.
 pub async fn test(test: &TestServer) {
     println!("Running File Storage ACL tests...");
     let john = test.account("jdoe@example.com");
@@ -52,7 +54,8 @@ pub async fn test(test: &TestServer) {
           "mayRename": true,
           "mayDelete": true,
           "mayModifyContent": true,
-          "mayShare": true
+          "mayShare": true,
+          "maySetMetadata": true
         },
         "shareWith": {}
         }));
@@ -120,7 +123,8 @@ pub async fn test(test: &TestServer) {
                 "mayRename": false,
                 "mayDelete": false,
                 "mayModifyContent": false,
-                "mayShare": false
+                "mayShare": false,
+                "maySetMetadata": false
             }
         }
         }));
@@ -147,7 +151,8 @@ pub async fn test(test: &TestServer) {
             "mayRename": false,
             "mayDelete": false,
             "mayModifyContent": false,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
         }
         }));
 
@@ -191,7 +196,8 @@ pub async fn test(test: &TestServer) {
             "mayRename": false,
             "mayDelete": false,
             "mayModifyContent": false,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
           },
           "newRights": {
             "mayRead": true,
@@ -199,7 +205,8 @@ pub async fn test(test: &TestServer) {
             "mayRename": false,
             "mayDelete": false,
             "mayModifyContent": false,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
           },
           "name": null
         }));
@@ -267,7 +274,8 @@ pub async fn test(test: &TestServer) {
             "mayRename": true,
             "mayDelete": true,
             "mayModifyContent": true,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
         }
         }));
 
@@ -311,7 +319,8 @@ pub async fn test(test: &TestServer) {
             "mayRename": false,
             "mayDelete": false,
             "mayModifyContent": false,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
           },
           "newRights": {
             "mayRead": true,
@@ -319,7 +328,8 @@ pub async fn test(test: &TestServer) {
             "mayRename": true,
             "mayDelete": true,
             "mayModifyContent": true,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
           },
           "name": null
         }));
@@ -450,7 +460,8 @@ pub async fn test(test: &TestServer) {
             "mayRename": true,
             "mayDelete": true,
             "mayModifyContent": true,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
           },
           "newRights": {
             "mayRead": false,
@@ -458,7 +469,8 @@ pub async fn test(test: &TestServer) {
             "mayRename": false,
             "mayDelete": false,
             "mayModifyContent": false,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
           },
           "name": null
         }));

@@ -13,6 +13,8 @@ use jmap_proto::{
 use serde_json::json;
 use types::id::Id;
 
+// 1.0 lists `maySetMetadata` among the rights (`Acl::ModifyMetadata`): an
+// owner holds it, and no grant below gives it.
 pub async fn test(test: &TestServer) {
     println!("Running Calendar ACL tests...");
     let john = test.account("jdoe@example.com");
@@ -107,7 +109,8 @@ pub async fn test(test: &TestServer) {
             "mayWriteOwn": true,
             "mayReadFreeBusy": true,
             "mayUpdatePrivate": true,
-            "mayRSVP": true
+            "mayRSVP": true,
+            "maySetMetadata": true
         },
         "shareWith": {}
         }));
@@ -177,7 +180,8 @@ pub async fn test(test: &TestServer) {
                 "mayWriteOwn": false,
                 "mayReadFreeBusy": false,
                 "mayUpdatePrivate": false,
-                "mayRSVP": false
+                "mayRSVP": false,
+                "maySetMetadata": false
             }
         }
         }));
@@ -206,7 +210,8 @@ pub async fn test(test: &TestServer) {
             "mayWriteOwn": false,
             "mayReadFreeBusy": false,
             "mayUpdatePrivate": false,
-            "mayRSVP": false
+            "mayRSVP": false,
+            "maySetMetadata": false
         }
         }));
     jane.jmap_get_account(
@@ -264,7 +269,8 @@ pub async fn test(test: &TestServer) {
             "mayWriteOwn": false,
             "mayReadFreeBusy": false,
             "mayUpdatePrivate": false,
-            "mayRSVP": false
+            "mayRSVP": false,
+            "maySetMetadata": false
           },
           "newRights": {
             "mayReadItems": true,
@@ -274,7 +280,8 @@ pub async fn test(test: &TestServer) {
             "mayWriteOwn": false,
             "mayReadFreeBusy": false,
             "mayUpdatePrivate": false,
-            "mayRSVP": false
+            "mayRSVP": false,
+            "maySetMetadata": false
           },
           "name": null
         }));
@@ -366,7 +373,8 @@ pub async fn test(test: &TestServer) {
             "mayWriteOwn": false,
             "mayReadFreeBusy": false,
             "mayUpdatePrivate": false,
-            "mayRSVP": false
+            "mayRSVP": false,
+            "maySetMetadata": false
         }
         }));
 
@@ -412,7 +420,8 @@ pub async fn test(test: &TestServer) {
             "mayWriteOwn": false,
             "mayReadFreeBusy": false,
             "mayUpdatePrivate": false,
-            "mayRSVP": false
+            "mayRSVP": false,
+            "maySetMetadata": false
           },
           "newRights": {
             "mayReadItems": true,
@@ -422,7 +431,8 @@ pub async fn test(test: &TestServer) {
             "mayWriteOwn": false,
             "mayReadFreeBusy": false,
             "mayUpdatePrivate": false,
-            "mayRSVP": false
+            "mayRSVP": false,
+            "maySetMetadata": false
           },
           "name": null
         }));
@@ -660,7 +670,8 @@ pub async fn test(test: &TestServer) {
             "mayWriteOwn": false,
             "mayReadFreeBusy": false,
             "mayUpdatePrivate": false,
-            "mayRSVP": false
+            "mayRSVP": false,
+            "maySetMetadata": false
           },
           "newRights": {
             "mayReadItems": false,
@@ -670,7 +681,8 @@ pub async fn test(test: &TestServer) {
             "mayWriteOwn": false,
             "mayReadFreeBusy": false,
             "mayUpdatePrivate": false,
-            "mayRSVP": false
+            "mayRSVP": false,
+            "maySetMetadata": false
           },
           "name": null
         }));

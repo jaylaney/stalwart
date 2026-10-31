@@ -13,6 +13,8 @@ use jmap_proto::{
 use serde_json::json;
 use types::id::Id;
 
+// 1.0 lists `maySetMetadata` among the rights (`Acl::ModifyMetadata`): an
+// owner holds it, and no grant below gives it.
 pub async fn test(test: &TestServer) {
     println!("Running Contacts ACL tests...");
     let john = test.account("jdoe@example.com");
@@ -98,7 +100,8 @@ pub async fn test(test: &TestServer) {
           "mayRead": true,
           "mayWrite": true,
           "mayDelete": true,
-          "mayShare": true
+          "mayShare": true,
+          "maySetMetadata": true
         },
         "shareWith": {}
         }));
@@ -164,7 +167,8 @@ pub async fn test(test: &TestServer) {
                 "mayRead": true,
                 "mayWrite": false,
                 "mayDelete": false,
-                "mayShare": false
+                "mayShare": false,
+                "maySetMetadata": false
             }
         }
         }));
@@ -189,7 +193,8 @@ pub async fn test(test: &TestServer) {
             "mayRead": true,
             "mayWrite": false,
             "mayDelete": false,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
         }
         }));
     jane.jmap_get_account(
@@ -245,13 +250,15 @@ pub async fn test(test: &TestServer) {
             "mayRead": false,
             "mayWrite": false,
             "mayDelete": false,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
           },
           "newRights": {
             "mayRead": true,
             "mayWrite": false,
             "mayDelete": false,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
           },
           "name": null
         }));
@@ -339,7 +346,8 @@ pub async fn test(test: &TestServer) {
             "mayRead": true,
             "mayWrite": true,
             "mayDelete": true,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
         }
         }));
 
@@ -381,13 +389,15 @@ pub async fn test(test: &TestServer) {
             "mayRead": true,
             "mayWrite": false,
             "mayDelete": false,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
           },
           "newRights": {
             "mayRead": true,
             "mayWrite": true,
             "mayDelete": true,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
           },
           "name": null
         }));
@@ -627,13 +637,15 @@ pub async fn test(test: &TestServer) {
             "mayRead": true,
             "mayWrite": true,
             "mayDelete": true,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
           },
           "newRights": {
             "mayRead": false,
             "mayWrite": false,
             "mayDelete": false,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
           },
           "name": null
         }));
