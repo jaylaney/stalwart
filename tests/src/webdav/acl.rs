@@ -319,16 +319,23 @@ pub async fn test(test: &TestServer) {
             .request("PUT", &owner_file, &owner_file_content)
             .await
             .with_status(StatusCode::NO_CONTENT);
+        // 1.0 maps write-content to modifying existing items only (RFC 3744
+        // 3.10); creating one needs bind, which 0.16's write-content also
+        // granted. The sharee creates the file once Test 11 grants write.
         sharee_client
             .request("PUT", &sharee_created_file, resource_type.generate())
             .await
-            .with_status(StatusCode::CREATED);
+            .with_status(StatusCode::FORBIDDEN);
 
         // Test 11: Grant delete access to the sharee and verify
         owner_client
             .acl(&owner_folder, sharee_principal.as_str(), ["read", "write"])
             .await
             .with_status(StatusCode::OK);
+        sharee_client
+            .request("PUT", &sharee_created_file, resource_type.generate())
+            .await
+            .with_status(StatusCode::CREATED);
         if is_file {
             owner_client
                 .acl(&owner_file, sharee_principal.as_str(), ["read", "write"])

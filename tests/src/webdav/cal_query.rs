@@ -10,7 +10,7 @@ use ahash::AHashSet;
 use calcard::{common::timezone::Tz, icalendar::ICalendar};
 use groupware::{
     DavResourceName,
-    calendar::{CalendarEventData, alarm::ExpandAlarm, expand::CalendarEventExpansion},
+    calendar::{CalendarEventData, expand::CalendarEventExpansion},
 };
 use hyper::StatusCode;
 use std::str::FromStr;
@@ -254,23 +254,11 @@ fn roundtrip_expansion(ics: &str, ignore_errors: bool) {
         .into_iter()
         .map(|e| {
             let (start, end) = e.timestamps();
-            let mut min = std::cmp::min(start, end);
-            let mut max = std::cmp::max(start, end);
-
-            for alarm in ical.alarms_for_id(e.comp_id) {
-                if let Some(alarm_time) = alarm
-                    .expand_alarm(0, 0)
-                    .and_then(|alarm| alarm.delta.to_timestamp(&e.start, &e.end, Tz::UTC))
-                {
-                    if alarm_time < min {
-                        min = alarm_time;
-                    }
-
-                    if alarm_time > max {
-                        max = alarm_time;
-                    }
-                }
-            }
+            // 1.0's stored range spans the instances only; its alarms are
+            // kept apart (`CalendarEventData::alarms`). 0.16 widened the
+            // range to every alarm's time, which this check mirrored.
+            let min = std::cmp::min(start, end);
+            let max = std::cmp::max(start, end);
 
             if min < min_utc {
                 min_utc = min;

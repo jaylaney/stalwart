@@ -1077,30 +1077,30 @@ pub async fn antispam(test: &TestServer) {
     // The checks read headers: 1.0's RFC822.TEXT is the body only (RFC 3501
     // 6.4.5, as BODY[TEXT]), where 0.16 returned the whole message.
     imap_admin.send("FETCH 11 (FLAGS RFC822)").await;
-    imap_admin
+    let lines = imap_admin
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_not_contains("FLAGS ($Junk")
         .assert_contains("Subject: can someone explain")
         .assert_contains("X-Spam-Status: No")
         .assert_contains("PROB_HAM_HIGH");
+    assert!(!has_junk_flag(&lines), "{lines:?}");
     imap_admin.send("FETCH 12 (FLAGS RFC822)").await;
-    imap_admin
+    let lines = imap_admin
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_not_contains("FLAGS ($Junk")
         .assert_contains("Subject: classifier test")
         .assert_contains("X-Spam-Status: No")
         .assert_contains_any(&["PROB_SPAM_UNCERTAIN", "PROB_HAM_LOW"]);
+    assert!(!has_junk_flag(&lines), "{lines:?}");
     imap_admin.send_ok("SELECT \"Junk Mail\"").await;
     imap_admin.send("FETCH 10 (FLAGS RFC822)").await;
-    imap_admin
+    let lines = imap_admin
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_contains("FLAGS ($Junk")
         .assert_contains("Subject: save up to")
         .assert_contains("X-Spam-Status: Yes")
         .assert_contains("PROB_SPAM_HIGH");
+    assert!(has_junk_flag(&lines), "{lines:?}");
     imap_admin.send_ok("MOVE 10 INBOX").await;
     let samples = admin.spam_training_samples().await;
     assert_eq!(samples.iter().filter(|x| !x.1.is_spam).count(), 11);
@@ -1217,4 +1217,15 @@ pub async fn antispam(test: &TestServer) {
     assert_eq!(samples_for(support_id, false).await, 1);
     assert_eq!(samples_for(jane_id, false).await, 0);
     assert_eq!(samples_for(jane_id, true).await, 0);
+}
+
+/// Whether the FETCH response's FLAGS list holds `$Junk`. 1.0 lists the
+/// server-set `$hasattachment` or `$hasnoattachment` keyword of an ordinary
+/// account's message first, so `$Junk` is not the list's first flag.
+fn has_junk_flag(lines: &[String]) -> bool {
+    lines
+        .iter()
+        .find_map(|line| line.split_once("FETCH (FLAGS ("))
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .is_some_and(|(flags, _)| flags.split(' ').any(|flag| flag == "$Junk"))
 }

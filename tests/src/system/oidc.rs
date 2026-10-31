@@ -26,7 +26,7 @@ use jmap_client::{
     mailbox::query::Filter,
 };
 use registry::schema::{
-    enums::{JwtSignatureAlgorithm, OAuthScope},
+    enums::{JwtSignatureAlgorithm, OAuthGrantType, OAuthScope},
     prelude::{ObjectType, Property},
     structs::{OAuthClient, OidcProvider, SecretText, SecretTextValue},
 };
@@ -742,16 +742,29 @@ pub async fn test(test: &mut TestServer) {
     // Device code flow
     // ------------------------
 
+    // 1.0 grants the device flow only to a registry client that lists it
+    // (`ResolvedClient::allows_grant`); a self-describing public client, as
+    // registered above, never gets it. 0.16 allowed the registered client.
+    let device_client_id = "device-flow-client";
+    admin
+        .registry_create_object(OAuthClient {
+            client_id: device_client_id.to_string(),
+            scopes: vec![OAuthScope::Mail].into(),
+            grant_types: vec![OAuthGrantType::DeviceCode, OAuthGrantType::RefreshToken].into(),
+            ..Default::default()
+        })
+        .await;
+
     // Request a device code
     let device_code_params =
-        AHashMap::from_iter([("client_id".to_string(), client_id.to_string())]);
+        AHashMap::from_iter([("client_id".to_string(), device_client_id.to_string())]);
     let device_response: DeviceAuthResponse =
         post(&metadata.device_authorization_endpoint, &device_code_params).await;
     //println!("Device response: {:#?}", device_response);
 
     // Status should be pending
     let mut token_params = AHashMap::from_iter([
-        ("client_id".to_string(), client_id.to_string()),
+        ("client_id".to_string(), device_client_id.to_string()),
         (
             "grant_type".to_string(),
             "urn:ietf:params:oauth:grant-type:device_code".to_string(),
@@ -878,7 +891,7 @@ pub async fn test(test: &mut TestServer) {
         post::<TokenResponse>(
             &metadata.token_endpoint,
             &AHashMap::from_iter([
-                ("client_id".to_string(), client_id.to_string()),
+                ("client_id".to_string(), device_client_id.to_string()),
                 ("grant_type".to_string(), "refresh_token".to_string()),
                 ("refresh_token".to_string(), token),
             ]),
@@ -895,7 +908,7 @@ pub async fn test(test: &mut TestServer) {
     // setting (subject deleted); 1.0 rotates the refresh token on every
     // refresh.
     let refresh_params = AHashMap::from_iter([
-        ("client_id".to_string(), client_id.to_string()),
+        ("client_id".to_string(), device_client_id.to_string()),
         ("grant_type".to_string(), "refresh_token".to_string()),
         ("refresh_token".to_string(), refresh_token),
     ]);
