@@ -135,7 +135,10 @@ pub async fn test(test: &TestServer) {
         .collect::<AHashSet<_>>(),
     );
 
-    // Verify event contents
+    // Verify event contents. A full get at 1.0 also returns the JMAP for
+    // Calendars properties (asserted on their own below) and JSCalendar's
+    // `version`, and a server-set `created` that `assert_eq_ignoring_updated`
+    // leaves out like `updated`.
     let response = account
         .jmap_get(
             MethodObject::CalendarEvent,
@@ -148,6 +151,11 @@ pub async fn test(test: &TestServer) {
         &response.list()[0],
         event_1
             .with_property(JSCalendarProperty::<Id>::Id, event_1_id.as_str())
+            .with_property(JSCalendarProperty::<Id>::MayInviteSelf, true)
+            .with_property(JSCalendarProperty::<Id>::MayInviteOthers, true)
+            .with_property(JSCalendarProperty::<Id>::HideAttendees, true)
+            .with_property(JSCalendarProperty::<Id>::UseDefaultAlerts, false)
+            .with_property("version", "2.0")
             .with_property(JSCalendarProperty::<Id>::IsDraft, true)
             .with_property(JSCalendarProperty::<Id>::IsOrigin, true),
     );
@@ -155,6 +163,11 @@ pub async fn test(test: &TestServer) {
         &response.list()[1],
         event_2
             .with_property(JSCalendarProperty::<Id>::Id, event_2_id.as_str())
+            .with_property(JSCalendarProperty::<Id>::MayInviteSelf, false)
+            .with_property(JSCalendarProperty::<Id>::MayInviteOthers, false)
+            .with_property(JSCalendarProperty::<Id>::HideAttendees, false)
+            .with_property(JSCalendarProperty::<Id>::UseDefaultAlerts, true)
+            .with_property("version", "2.0")
             .with_property(JSCalendarProperty::<Id>::IsDraft, false)
             .with_property(JSCalendarProperty::<Id>::IsOrigin, true)
             .with_property(
@@ -175,6 +188,11 @@ pub async fn test(test: &TestServer) {
         &response.list()[2],
         event_3
             .with_property(JSCalendarProperty::<Id>::Id, event_3_id.as_str())
+            .with_property(JSCalendarProperty::<Id>::MayInviteSelf, false)
+            .with_property(JSCalendarProperty::<Id>::MayInviteOthers, false)
+            .with_property(JSCalendarProperty::<Id>::HideAttendees, false)
+            .with_property(JSCalendarProperty::<Id>::UseDefaultAlerts, false)
+            .with_property("version", "2.0")
             .with_property(JSCalendarProperty::<Id>::IsDraft, false)
             .with_property(JSCalendarProperty::<Id>::IsOrigin, false),
     );
@@ -1072,7 +1090,27 @@ fn test_jscalendar_participants(uid: &str, organizer: Option<&str>) -> Value {
 }
 
 pub fn assert_eq_ignoring_updated(got: &Value, expected: Value) {
-    strip_updated(got.clone()).assert_is_equal(strip_updated(expected));
+    let mut got = got.clone();
+    strip_unexpected_created(&mut got, &expected);
+    strip_updated(got).assert_is_equal(strip_updated(expected));
+}
+
+/// 1.0 sets a server `created` timestamp on an event the fixture created
+/// without one; it is left out where the expectation names none.
+fn strip_unexpected_created(got: &mut Value, expected: &Value) {
+    match (got, expected) {
+        (Value::Object(got), Value::Object(expected)) => {
+            if !expected.contains_key("created") {
+                got.remove("created");
+            }
+        }
+        (Value::Array(got), Value::Array(expected)) => {
+            for (got, expected) in got.iter_mut().zip(expected) {
+                strip_unexpected_created(got, expected);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn strip_updated(mut value: Value) -> Value {
