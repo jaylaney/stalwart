@@ -170,16 +170,33 @@ pub async fn test(test: &TestServer) {
             .with_property("version", "2.0")
             .with_property(JSCalendarProperty::<Id>::IsDraft, false)
             .with_property(JSCalendarProperty::<Id>::IsOrigin, true)
+            // 1.0 keeps the calendar's default alert id ("abc"; 0.16 numbered
+            // it k1) and leaves out an override's unchanged duration.
             .with_property(
                 JSCalendarProperty::<Id>::Alerts,
                 json!({
-                  "k1": {
+                  "abc": {
                     "action": "display",
                     "trigger": {
                       "@type": "OffsetTrigger",
                       "offset": "PT15M"
                     },
                     "@type": "Alert"
+                  }
+                }),
+            )
+            .with_property(
+                JSCalendarProperty::<Id>::RecurrenceOverrides,
+                json!({
+                  "2006-01-04T12:00:00": {
+                    "title": "Event #2 bis",
+                    "start": "2006-01-04T14:00:00",
+                    "updated": "2006-02-06T00:11:21Z"
+                  },
+                  "2006-01-06T12:00:00": {
+                    "title": "Event #2 bis bis",
+                    "start": "2006-01-06T14:00:00",
+                    "updated": "2006-02-06T00:11:21Z"
                   }
                 }),
             ),
@@ -269,8 +286,7 @@ pub async fn test(test: &TestServer) {
               "2006-01-06T12:00:00": {
                 "updated": "2006-02-06T00:11:21Z",
                 "start": "2006-01-06T14:00:00",
-                "title": "Event #2 bis bis",
-                "duration": "PT1H"
+                "title": "Event #2 bis bis"
               }
             },
             "id": "c"
@@ -466,13 +482,11 @@ pub async fn test(test: &TestServer) {
                 "2006-01-04T12:00:00": {
                     "title": "Event two overridden",
                     "start": "2006-01-04T14:00:00",
-                    "duration": "PT1H",
                     "updated": "2006-02-06T00:11:21Z"
                 },
                 "2006-01-06T12:00:00": {
                     "title": "Event two overridden twice",
                     "start": "2006-01-06T14:00:00",
-                    "duration": "PT1H",
                     "updated": "2006-02-06T00:11:21Z"
                 }
             },

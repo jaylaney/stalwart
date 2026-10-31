@@ -3454,6 +3454,7 @@ pub async fn principal_get(test: &TestServer) {
     // Validate session object capabilities: upstream's object, minus the
     // account's calendar capabilities (release 1 spec 9).
     let response = john.jmap_session_object().await.into_inner();
+    let john_account = response["accounts"][john_id.to_string().as_str()].clone();
     let application_server_key =
         response["capabilities"]["urn:ietf:params:jmap:webpush-vapid"]["applicationServerKey"]
             .clone();
@@ -3760,36 +3761,35 @@ pub async fn principal_get(test: &TestServer) {
         .await;
     let list = response.list();
     assert_eq!(list.len(), 4);
+    // 1.0 lists a principal's accounts only where the session can reach them
+    // (RFC 9670 `accounts`), as the session's Account objects: John's own
+    // account is the one the session object above describes, and the other
+    // principals list none. The time zone is `timeZone`. 0.16 listed every
+    // principal's account capabilities and named the field `timezone`.
     for (item, (id, email, description)) in list.iter().zip([
         (john_id, "jdoe@example.com", "John Doe"),
         (jane_id, "jane.smith@example.com", "Jane Smith"),
         (bill_id, "bill@example.com", "Bill Foobar"),
     ]) {
+        let accounts = if id == john_id {
+            json!({ id: john_account.clone() })
+        } else {
+            Value::Null
+        };
         item.assert_is_equal(json!({
           "id": id,
           "type": "individual",
           "email": email,
           "description": description,
           "name": email,
-          "timezone": null,
+          "timeZone": null,
           "capabilities": {
             "urn:ietf:params:jmap:mail": {},
             "urn:ietf:params:jmap:contacts": {},
             "urn:ietf:params:jmap:filenode": {},
             "urn:ietf:params:jmap:principals": {}
           },
-          "accounts": {
-            id: {
-              "urn:ietf:params:jmap:mail": {},
-              "urn:ietf:params:jmap:contacts": {},
-              "urn:ietf:params:jmap:filenode": {},
-              "urn:ietf:params:jmap:principals": {},
-              "urn:ietf:params:jmap:principals:owner": {
-                "accountIdForPrincipal": id,
-                "principalId": id
-              }
-            }
-          }
+          "accounts": accounts
         }));
     }
     list[3].assert_is_equal(json!({
@@ -3798,31 +3798,19 @@ pub async fn principal_get(test: &TestServer) {
       "email": "sales@example.com",
       "description": "Sales Group",
       "name": "sales@example.com",
-      "timezone": null,
+      "timeZone": null,
       "capabilities": {
         "urn:ietf:params:jmap:mail": {},
         "urn:ietf:params:jmap:contacts": {},
-        "urn:ietf:params:jmap:calendars": {},
+        "urn:ietf:params:jmap:calendars": {
+          "accountId": null,
+          "mayGetAvailability": true,
+          "mayShareWith": true,
+          "calendarAddress": "mailto:sales@example.com"
+        },
         "urn:ietf:params:jmap:filenode": {},
         "urn:ietf:params:jmap:principals": {}
       },
-      "accounts": {
-        sales_id: {
-          "urn:ietf:params:jmap:mail": {},
-          "urn:ietf:params:jmap:contacts": {},
-          "urn:ietf:params:jmap:calendars": {
-            "accountId": sales_id,
-            "mayGetAvailability": true,
-            "mayShareWith": true,
-            "calendarAddress": "mailto:sales@example.com"
-          },
-          "urn:ietf:params:jmap:filenode": {},
-          "urn:ietf:params:jmap:principals": {},
-          "urn:ietf:params:jmap:principals:owner": {
-            "accountIdForPrincipal": sales_id,
-            "principalId": sales_id
-          }
-        }
-      }
+      "accounts": null
     }));
 }
