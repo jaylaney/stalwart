@@ -7697,8 +7697,9 @@ async fn sharing_compare_lifecycle(
                     .unwrap()
                     .1;
                 // Ruling 13: a fork item's row always carries
-                // `EVENT_NOTIFICATION_PRIVATE` (upstream's Members audience);
-                // a drained one carries nothing else.
+                // `EVENT_NOTIFICATION_PRIVATE` (upstream's Members audience).
+                // A merged item adds `EVENT_NOTIFICATION_IS_CHANGE`; a
+                // rejected one, kept as history (`reject`), adds nothing.
                 assert_eq!(
                     item.flags,
                     groupware::calendar::EVENT_NOTIFICATION_PRIVATE,
@@ -10005,8 +10006,6 @@ pub async fn sharing_class_differential(test: &mut TestServer) {
         );
         let (status, body) = side.sharee("REPORT", &side.cal, &[], &multiget).await;
         results.push(("REPORT multiget".into(), status, body));
-        let (status, body) = side.sharee("REPORT", &side.cal, &[], free_busy).await;
-        results.push(("REPORT free-busy".into(), status, body));
         outcomes.push(results);
     }
     for (key_result, plain_result) in outcomes[0].iter().zip(&outcomes[1]) {
@@ -10018,6 +10017,40 @@ pub async fn sharing_class_differential(test: &mut TestServer) {
             key_result.0
         );
     }
+    // Ruling 51, a recorded divergence: 1.0.1 selects a grantee's free-busy
+    // events with `match_any = true` (`dav/src/calendar/freebusy.rs`), so
+    // the ordinary grantee, who holds `ReadItems`, gets the public event's
+    // busy period; a key account's grantee has no keys for the owner's
+    // account, so its free-busy is `Withheld` and carries no period.
+    let mut free_busy_bodies = Vec::new();
+    for side in sides {
+        let (status, body) = side.sharee("REPORT", &side.cal, &[], free_busy).await;
+        assert_eq!(status, StatusCode::OK, "free-busy key={}", side.key);
+        assert!(body.contains("BEGIN:VFREEBUSY"), "{body}");
+        free_busy_bodies.push(body);
+    }
+    let periods = |body: &str| {
+        body.replace("\r\n ", "")
+            .split("\r\n")
+            .filter(|line| line.starts_with("FREEBUSY"))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        periods(&free_busy_bodies[0]),
+        Vec::<String>::new(),
+        "a key account's grantee was served busy periods: {}",
+        free_busy_bodies[0]
+    );
+    let ordinary = periods(&free_busy_bodies[1]);
+    assert!(
+        ordinary
+            .iter()
+            .any(|line| line.contains("20990102T090000Z/20990102T100000Z")),
+        "the ordinary grantee got no busy period: {}",
+        free_busy_bodies[1]
+    );
+
     // The upstream privacy rule itself, on both sides: a sharee reads a
     // public event, is refused a private one and does not see a
     // confidential one.

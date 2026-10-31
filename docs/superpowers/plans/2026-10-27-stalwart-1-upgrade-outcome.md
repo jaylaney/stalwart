@@ -4565,7 +4565,7 @@ No test hook was added; `common` is unchanged.
 | Dead properties: owner and grantee round trips (a sensitive namespace and name, Apple colour and order), a planted plaintext container as the scan's negative control, a corrupted sealed container (500 for its item, GET intact), COPY and MOVE between two calendars then PROPFIND, a MOVE into the shared calendar (resealed under its collection key), the `Viewer`/`Owner` counters planted, merged and left alone by sealed writes, and the keyless readers (`MetadataBuf::read` and its kinds, `metadata_used_quota`, the cleanup of a deleted event and calendar, `purge_private_metadata`, `destroy_owner_metadata`) | `dav_seal::test_dead_properties` | `dav_seal::test_legacy` |
 | `split_metadata_only_update_keeps_sealed_content`: a dead-property PROPPATCH (container sealed; the presence bit set on the row by `rewrite_presence`), a rename MOVE (`update_meta`) and the property's removal, each leaving the content record byte for byte; owner and grantee reads keep the row's ETag (304 on it); the scan of row, content and container; negative control: a row-only write of a protected display name, which the scan must catch | `dav_seal` | `dav_seal::test_dead_properties` |
 | Per-user event data: `assert_no_event_preferences` (`utils/za.rs`) after a PUT (`dav_seal::test`), COPY and MOVE (`test_dead_properties`), a metadata-only write (`split_…`), the organizer's scheduling write (`fanout::test`), the drain's import and merge (`drain::test`), a sharee's PUT (ruling 49, the differential) and the inbound case | several | — |
-| Field policy 2, the differential: a key and an ordinary owner each share `class/` with a sharee (account API "edit"; DAV ACL read and write); GET, HEAD and PROPFIND per event, PROPFIND depth 1, calendar-query, multiget and free-busy, then PUT, PROPPATCH, LOCK/UNLOCK, MOVE, MOVE back, DELETE and GET give equal statuses and equal normalized bodies; the privacy rule on both sides (PUBLIC 200, PRIVATE 403, CONFIDENTIAL 404); the stored bits after PUT, the sharee's writes, PROPPATCH, MOVE, COPY and a CLASS change from PRIVATE to PUBLIC; the recorded limits: a sharee's COPY (403 on the key side, `shared_copy_refusal`; 201 on the ordinary side) and `CLASS:X-SOMETHING` (sealed, both bits clear, served in full to the key account's sharee; the ordinary account derives Private and refuses its sharee) | `sharing::sharing_class_differential` | `sharing::test` |
+| Field policy 2, the differential: a key and an ordinary owner each share `class/` with a sharee (account API "edit"; DAV ACL read and write); GET, HEAD and PROPFIND per event, PROPFIND depth 1, calendar-query and multiget, then PUT, PROPPATCH, LOCK/UNLOCK, MOVE, MOVE back, DELETE and GET give equal statuses and equal normalized bodies; the privacy rule on both sides (PUBLIC 200, PRIVATE 403, CONFIDENTIAL 404); the stored bits after PUT, the sharee's writes, PROPPATCH, MOVE, COPY and a CLASS change from PRIVATE to PUBLIC; the recorded limits: free-busy (ruling 51: the ordinary grantee gets the public event's busy period, the key account's grantee none, `Withheld`), a sharee's COPY (403 on the key side, `shared_copy_refusal`; 201 on the ordinary side) and `CLASS:X-SOMETHING` (sealed, both bits clear, served in full to the key account's sharee; the ordinary account derives Private and refuses its sharee) | `sharing::sharing_class_differential` | `sharing::test` |
 | Field policy 2, inbound: a CLASS change from PRIVATE to PUBLIC through `itip_ingest` (two ordinary accounts) and through the drain's merge (two key accounts); the copy's CLASS lines and stored bits are equal on the two paths after the import and after the merge, and the bits follow the kept CLASS | `sharing::sharing_class_inbound` | `sharing_class_differential` |
 | `cleanup_cannot_restore_revoked_ring`: after the revoke, its queued `ShareRevokeCleanup`, a refresh of every cache and a later grant to a third account, the revoked account gets exactly what a never-granted account gets (read and write) and is never listed again | `sharing` | `sharing_class_inbound` |
 | `revoke_cleanup_does_not_rewrite_sealed_event`: the grantee writes (a PUT and a dead property), the revoke commits, then a `ShareRevokeCleanup` of the calendar is queued explicitly (so the worker certainly runs) and must leave every event's row and content bytes and ETag as the revoke left them; no record holds plaintext; negative control: a planted plaintext event the same scan catches | `sharing` | `cleanup_cannot_restore_revoked_ring` |
@@ -4632,9 +4632,11 @@ labels before.
 6. The grant converts the calendar's and its events' containers to the collection key
    (ruling 29), and a MOVE from an unshared calendar into a shared one is admitted and
    reseals the container.
-7. The differential's normalization (owner name, ETag, timestamps, tokens and the free-busy
-   DTSTAMP removed) leaves nothing else that differs between a key and an ordinary account;
-   HEAD bodies are empty on both. "edit" and DAV `read`+`write` give a sharee the same rights.
+7. The differential's normalization (owner name, ETag, timestamps, tokens and DTSTAMP lines
+   removed) leaves nothing else that differs between a key and an ordinary account; HEAD
+   bodies are empty on both. "edit" and DAV `read`+`write` give a sharee the same rights.
+   Free-busy is outside the equality block (ruling 51): both answer 200 with a VFREEBUSY, the
+   ordinary grantee's holding the public event's period and the key account grantee's none.
 8. An ordinary sharee's COPY within the shared calendar answers 201 (the recorded limit's
    other side), and the ordinary account's `X-SOMETHING` event derives Private and refuses its
    sharee with 403.
@@ -4644,8 +4646,10 @@ labels before.
 10. The revoke through the account API leaves the events readable by the owner, and a
     `ShareRevokeCleanup` of a key owner's calendar runs to completion without writing (this
     holds only once Task 6 makes the worker skip key-account owners).
-11. The fork's flags on inbox items: a drained item's row holds exactly
-    `EVENT_NOTIFICATION_PRIVATE` (ruling 13's mapping).
+11. The fork's flags on inbox items, as ruling 13's mapping records them (Part 4a): a drained
+    item's row holds `EVENT_NOTIFICATION_PRIVATE`, plus `EVENT_NOTIFICATION_IS_CHANGE` after a
+    merge. An item the drain rejects and keeps as history holds `EVENT_NOTIFICATION_PRIVATE`
+    alone, which is what the lifecycle test asserts.
 
 #### Known failures until another task lands
 
@@ -4905,6 +4909,7 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `za::sharing_review` (fork) | The concurrent writer changes the row with `update_meta`; assertion unchanged. | `CalendarEvent::update` is gone; a row-only change is `update_meta`. |
 | `za::dav_seal::test_conditional` (fork) | Comment only: a UID conflict is 403 at 1.0. | Ruling 50. |
 | `za::uid_lease::test` (fork) | A key account's UID conflict after a stale snapshot, an expired holder, a lost commit fence and a second creator is asserted to answer 403, where 0.16 asserted 412. The 503 (busy or no copy) and 201 (another calendar) cases are unchanged. | Ruling 50: `za_assert_is_unique_uid` answers 403 `NoUidConflict`, as 1.0's `assert_is_unique_uid` does (`dav/src/calendar/mod.rs`). |
+| `za::sharing::sharing_class_differential` (fork, new) | The sharee's `REPORT free-busy-query` is not in the equality block: the ordinary grantee is asserted to get the public event's busy period and the key account's grantee none (`Withheld`), a recorded divergence (ruling 51). | 1.0.1 selects a grantee's free-busy events with `is_shared_item(.., [ReadItems, SchedulingReadFreeBusy], match_any = true)` (`dav/src/calendar/freebusy.rs:199-204`), so `ReadItems` alone suffices; 0.16.27 required both bits. A key account's grantee holds no keys for the owner's account (`za_freebusy_access`). |
 
 ## Task 1 check
 
