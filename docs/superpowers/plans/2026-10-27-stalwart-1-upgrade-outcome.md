@@ -4660,6 +4660,37 @@ labels before.
   scanner's new-subspace rules.
 - **Task 5:** `utils/za.rs`'s mail helper `plant_plain_message`.
 
+
+### Task 4 rulings
+
+47. **Task 4 ran as three parts:** 4a (`groupware`), 4b (DAV, dead properties, shares and
+    the JMAP calendar refusals) and 4c (tests). Its review ran on Fable at xhigh.
+48. **No whole-request conflict retry for a session that holds keys.** A replay would run the
+    fan-out again after its items committed. This also covers a key-account session writing
+    to an ordinary owner's shared calendar (the review's M2, a C4 residue: that write's
+    conflict goes back to the client). The fork's own retry covers calendar changes only,
+    not event-level conflicts, as at 0.16 (M3). Cost if wrong: a write conflict reaches the
+    client, which retries.
+49. **A sharee's PUT on a key account isn't split into per-user preferences.** That is the
+    0.16 rule: a key account's preferences stay empty (JMAP-only). Visible effects, from the
+    review's M4: the owner sees a sharee's alarms, and the ETag and Schedule-Tag move on a
+    sharee's alarm-only change. Cost if wrong: alarm sharing differs from an ordinary
+    account's.
+50. **A key-account UID conflict answers 1.0's 403** (own-items rights), not 0.16's 412.
+    That fails closed. Tests that asserted 412 have ledger rows.
+51. **Free-busy for key-account grantees stays withheld.** At 1.0.1 upstream selects a
+    grantee's free-busy calendars with `match_any = true` (`dav/src/calendar/freebusy.rs:199-204`),
+    so an ordinary grantee with `ReadItems` now gets busy periods, while a key-account grantee
+    still gets `Withheld` (the review's I1). This is a recorded divergence: the sharing spec's
+    free-busy section says so, and the differential test asserts it instead of equality.
+    Serving busy periods from the unsealed view during the grantee's own keyed session would
+    restore parity, but needs a sharing-spec revision, so it's left for Jay. Cost if wrong:
+    key-account sharees see no busy periods where ordinary sharees do.
+
+Recorded limit (ruling 16, the review's M5): a calendar container sealed at MKCOL binds the
+calendar's id only from its next changing PROPPATCH. An unchanged PROPPATCH doesn't rebind
+it, and a sharing rollback restores the unbound form. This affects integrity only.
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,

@@ -1529,6 +1529,14 @@ The outbox POST (3.7 for a key target, `crates/dav/src/calendar/
 scheduling.rs`) and JMAP `Principal/getAvailability` (which skips key
 accounts) are unchanged.
 
+At 1.0.1 upstream selects a grantee's free-busy calendars with
+`match_any = true` (`crates/dav/src/calendar/freebusy.rs:199-204`), so an
+ordinary grantee holding `ReadItems` now gets busy periods. A key-account
+grantee still gets `ZaFreeBusy::Withheld`. This is a recorded divergence
+(Stalwart 1.0.1 upgrade, ruling 51). Serving busy periods computed from the
+unsealed view during the grantee's own keyed session would restore parity,
+and needs a revision of this section.
+
 ### 5.4 Discovery
 
 `calendar-home-set` (`build_home_set` in
