@@ -2115,7 +2115,7 @@ pub async fn acl(test: &TestServer) {
             .mailbox_update_acl(&inbox_id, bill.id_string(), [ACL::ReadItems])
             .await,
     );
-    assert_forbidden(
+    assert_account_not_found(
         bill_client
             .set_default_account_id(admin.id_string())
             .email_query(None::<email::query::Filter>, None::<Vec<_>>)

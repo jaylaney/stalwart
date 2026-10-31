@@ -429,7 +429,12 @@ pub async fn test(test: &mut TestServer) {
         }
     );
 
-    // Obtain token and verify the granted scope is echoed back
+    // Obtain token and verify the granted scope is echoed back. The token
+    // lives a minute: the SASL steps below outlast the one-second lifetime
+    // since 1.0 delays the answer to the invalid bearer (`auth_errors_wait`)
+    // before the valid one is tried; the one-second lifetime is restored
+    // after them.
+    set_access_token_expiry(test, 60);
     token_params.insert("code_verifier".to_string(), PKCE_VERIFIER.to_string());
     let granted = post::<TokenResponse>(&metadata.token_endpoint, &token_params).await;
     if let TokenResponse::Granted(response) = &granted {
@@ -558,6 +563,7 @@ pub async fn test(test: &mut TestServer) {
     pop3.send(&format!("AUTH OAUTHBEARER {oauth_bearer_sasl}"))
         .await;
     pop3.assert_read(crate::utils::pop3::ResponseType::Ok).await;
+    set_access_token_expiry(test, 1);
 
     // ------------------------
     // Confidential client with client_secret
@@ -910,6 +916,15 @@ pub async fn test(test: &mut TestServer) {
     admin.registry_destroy_all(ObjectType::OAuthClient).await;
     admin.destroy_account(user).await;
     test.cleanup().await;
+}
+
+fn set_access_token_expiry(test: &TestServer, secs: u64) {
+    let mut core = (*test.server.inner.shared_core.load_full()).clone();
+    core.oauth.oauth_expiry_token = secs;
+    test.server
+        .inner
+        .shared_core
+        .store(std::sync::Arc::new(core));
 }
 
 async fn wait_until_epoch(target: u64) -> u64 {

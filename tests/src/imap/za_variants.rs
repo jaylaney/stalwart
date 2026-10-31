@@ -830,10 +830,12 @@ pub async fn acl(imap_john: &mut ImapConnection, test: &TestServer) {
 
     // Grant access to Bill and check ACLs
     imap_admin.send("GETACL INBOX").await;
+    // 1.0 lists rights in RFC 4314 order (l r s w i p k x t e n a); 0.16
+    // listed them in its own order (`rl`, `tewsrxl`).
     imap_admin
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_contains("\"jdoe@example.com\" rl");
+        .assert_contains("\"jdoe@example.com\" lr");
     imap_admin
         .send("SETACL INBOX foobar@example.com lrxtws")
         .await;
@@ -842,8 +844,8 @@ pub async fn acl(imap_john: &mut ImapConnection, test: &TestServer) {
     imap_admin
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_contains("\"jdoe@example.com\" rl")
-        .assert_contains("\"foobar@example.com\" tewsrxl");
+        .assert_contains("\"jdoe@example.com\" lr")
+        .assert_contains("\"foobar@example.com\" lrswxte");
     imap_bill.send("LIST \"\" \"*\"").await;
     imap_bill
         .assert_read(Type::Tagged, ResponseType::Ok)
@@ -862,7 +864,7 @@ pub async fn acl(imap_john: &mut ImapConnection, test: &TestServer) {
     imap_john
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_equals(&format!("* MYRIGHTS \"{shared}\" rl"));
+        .assert_equals(&format!("* MYRIGHTS \"{shared}\" lr"));
 
     // John should not be able to append messages
     assert_append_message(
@@ -881,7 +883,7 @@ pub async fn acl(imap_john: &mut ImapConnection, test: &TestServer) {
     imap_john
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_equals(&format!("* MYRIGHTS \"{shared}\" rli"));
+        .assert_equals(&format!("* MYRIGHTS \"{shared}\" lri"));
     let uid = assert_append_message(
         imap_john,
         &shared,
@@ -943,7 +945,7 @@ pub async fn acl(imap_john: &mut ImapConnection, test: &TestServer) {
     imap_admin
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_contains("\"jdoe@example.com\" rl")
+        .assert_contains("\"jdoe@example.com\" lr")
         .assert_count("foobar@example.com", 0);
 
     // Bill should not have access to the admin's Inbox anymore

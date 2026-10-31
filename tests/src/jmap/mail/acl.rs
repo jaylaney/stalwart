@@ -226,11 +226,21 @@ pub async fn test(test: &TestServer) {
         .unwrap()
         .unwrap()
         .take_blob_id();
-    assert_forbidden(
-        john_client
-            .set_default_account_id(john.id_string())
-            .blob_copy(jane.id_string(), &blob_id)
-            .await,
+    // 1.0 answers a blob the session cannot read `notFound` (RFC 8620 6.3);
+    // 0.16 answered `blobNotFound`.
+    let result = john_client
+        .set_default_account_id(john.id_string())
+        .blob_copy(jane.id_string(), &blob_id)
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(jmap_client::Error::Set(SetError {
+                type_: SetErrorType::NotFound,
+                ..
+            }))
+        ),
+        "Expected notFound, got {result:?}"
     );
 
     // John only has ReadItems access to Inbox
@@ -515,7 +525,7 @@ pub async fn test(test: &TestServer) {
             .mailbox_update_acl(&inbox_id, bill.id_string(), [ACL::ReadItems])
             .await,
     );
-    assert_forbidden(
+    assert_account_not_found(
         bill_client
             .set_default_account_id(jane.id_string())
             .email_query(None::<Filter>, None::<Vec<_>>)
