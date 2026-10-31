@@ -108,7 +108,10 @@ pub async fn test(test: &TestServer) {
     .await
     .updated(&calendar1_id);
 
-    // Jane should see John's availability now
+    // Jane should see John's availability now. 1.0 names each period's
+    // account (null without an event) and reports the third event, whose
+    // status is tentative, as tentative; 0.16 left accountId out and reported
+    // it confirmed.
     let response = jane
         .jmap_method_calls(json!([[
             "Principal/getAvailability",
@@ -126,43 +129,50 @@ pub async fn test(test: &TestServer) {
         "utcStart": "2006-01-02T15:00:00Z",
         "utcEnd": "2006-01-02T16:00:00Z",
         "busyStatus": "confirmed",
-        "event": null
+        "event": null,
+        "accountId": null
       },
       {
         "utcStart": "2006-01-02T17:00:00Z",
         "utcEnd": "2006-01-02T18:00:00Z",
         "busyStatus": "confirmed",
-        "event": null
+        "event": null,
+        "accountId": null
       },
       {
         "utcStart": "2006-01-03T17:00:00Z",
         "utcEnd": "2006-01-03T18:00:00Z",
         "busyStatus": "confirmed",
-        "event": null
+        "event": null,
+        "accountId": null
       },
       {
         "utcStart": "2006-01-04T15:00:00Z",
         "utcEnd": "2006-01-04T16:00:00Z",
-        "busyStatus": "confirmed",
-        "event": null
+        "busyStatus": "tentative",
+        "event": null,
+        "accountId": null
       },
       {
         "utcStart": "2006-01-04T19:00:00Z",
         "utcEnd": "2006-01-04T20:00:00Z",
         "busyStatus": "confirmed",
-        "event": null
+        "event": null,
+        "accountId": null
       },
       {
         "utcStart": "2006-01-05T17:00:00Z",
         "utcEnd": "2006-01-05T18:00:00Z",
         "busyStatus": "confirmed",
-        "event": null
+        "event": null,
+        "accountId": null
       },
       {
         "utcStart": "2006-01-06T19:00:00Z",
         "utcEnd": "2006-01-06T20:00:00Z",
         "busyStatus": "confirmed",
-        "event": null
+        "event": null,
+        "accountId": null
       }
     ]));
 
@@ -226,8 +236,9 @@ pub async fn test(test: &TestServer) {
       {
         "utcStart": "2006-01-04T15:00:00Z",
         "utcEnd": "2006-01-04T16:00:00Z",
-        "busyStatus": "confirmed",
-        "event": null
+        "busyStatus": "tentative",
+        "event": null,
+        "accountId": null
       }
     ]));
 
