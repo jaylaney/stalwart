@@ -9857,6 +9857,17 @@ impl ClassSide {
     }
 }
 
+/// The sharee's own calendar `class-sharee/`, the COPY destination of
+/// ruling 83.
+fn class_sharee_calendar(side: &ClassSide) -> String {
+    let reader = if side.key {
+        CLASS_KEY_READER
+    } else {
+        CLASS_PLAIN_READER
+    };
+    format!("/dav/cal/{}/class-sharee/", reader.replace('@', "%40"))
+}
+
 async fn class_side(test: &mut TestServer, key: bool) -> ClassSide {
     let (owner_name, reader_name) = if key {
         (CLASS_KEY_OWNER, CLASS_KEY_READER)
@@ -10219,17 +10230,39 @@ pub async fn sharing_class_differential(test: &mut TestServer) {
 
     // The recorded limit of COPY (the fork's `shared_copy_refusal`): a COPY
     // into or out of a shared calendar is refused on a key account, where
-    // the ordinary account's sharee copies.
+    // the ordinary account's sharee copies. Ruling 83: the copy goes into a
+    // second calendar, the sharee's own, where its UID does not conflict;
+    // 1.0 refuses a copy that repeats a UID within one calendar
+    // (`no-uid-conflict`, ruling 50), which the ordinary side shows.
+    let (status, copy_body) = plain
+        .sharee(
+            "COPY",
+            &plain.path("public.ics"),
+            &[("destination", plain.path("public-copy.ics").as_str())],
+            "",
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "same-calendar COPY");
+    assert!(copy_body.contains("no-uid-conflict"), "{copy_body}");
     for (side, expected) in [(&key, StatusCode::FORBIDDEN), (&plain, StatusCode::CREATED)] {
+        let own = class_sharee_calendar(side);
+        side.reader
+            .request("MKCALENDAR", &own, MKCAL)
+            .await
+            .with_status(StatusCode::CREATED);
         let (status, _) = side
             .sharee(
                 "COPY",
                 &side.path("public.ics"),
-                &[("destination", side.path("public-copy.ics").as_str())],
+                &[("destination", format!("{own}public-copy.ics").as_str())],
                 "",
             )
             .await;
         assert_eq!(status, expected, "COPY key={}", side.key);
+        side.reader
+            .request("DELETE", &own, "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
     }
 
     // The recorded limit of field policy 2: a non-standard CLASS is sealed,

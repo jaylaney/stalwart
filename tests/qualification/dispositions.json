@@ -299,6 +299,34 @@
     }
    ],
    "evidence": "Task 2, 'Restored unit test modules' (moved modules): 0.16's `groupware::tests` subject `encode_path_segment` became `common::storage::dav::{canonical_path_segment, canonical_uri_path}` (`common/src/storage/dav/mod.rs:143-149`); restored as `common/src/storage/dav/restored_tests.rs`, an equivalent test of the new pair, same three names. Expectation ledger `common::storage::dav::tests::*`."
+  },
+  {
+   "id": "za-disabled-tenant",
+   "kind": "sel_only",
+   "scope": "function",
+   "unconfirmed": true,
+   "subjects": [
+    {
+     "file": "tests/src/za/disabled.rs",
+     "in": null,
+     "name": "test"
+    }
+   ],
+   "evidence": "Ruling 79 (N1), ruling 33: the tenant-disable case inside `za::disabled::test` (recover for a disabled tenant's member answers 403) is removed; the account-disable cases stay. 1.0 applies tenant permissions only in the licensed snippet of `effective_permissions`. Case-level: the gates have no case scope, so this names the containing function and stays unconfirmed (the function itself remains required). Expectation ledger: `za::disabled::test` (part 7c2)."
+  },
+  {
+   "id": "sharing-move-bytes-oversize",
+   "kind": "subject_deleted",
+   "scope": "function",
+   "unconfirmed": true,
+   "subjects": [
+    {
+     "file": "tests/src/za/sharing_move_atomic.rs",
+     "in": null,
+     "name": "controls"
+    }
+   ],
+   "evidence": "Ruling 81 (N4): the byte-oversize case inside `controls` is retired as unreachable at 1.0 (a collection MOVE rewrites rows only: 120 operations, 12,516 bytes for 30 events of 230 KB); the operations and split cases stay and the byte budget stays in the code. Case-level: the gates have no case scope, so this names the containing function and stays unconfirmed. Expectation ledger: `za::sharing_move_atomic` (part 7c2)."
   }
  ],
  "renames": {

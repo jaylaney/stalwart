@@ -627,13 +627,14 @@ pub async fn test(test: &mut TestServer) {
     );
 }
 
-/// A real plain-account event CAS failure must retain the DAV update call site.
+/// A plain-account event PUT that loses its commit assertion to a
+/// concurrent row-only change. Ruling 95: 1.0's DAV dispatcher replays a
+/// keyless write after an assertion failure (`handle_dav_request`), so the
+/// parked PUT answers 204 with both its change and the concurrent one kept;
+/// 0.16 answered 409 and traced the lost assertion at the DAV update call
+/// site, which the silent replay no longer reaches. A key account's PUT is
+/// not replayed (invitations spec 5.4) and still answers 503.
 async fn plain_update_trace(test: &TestServer, failures: &mut Vec<String>) {
-    use std::time::Duration;
-    use trc::{
-        Collector, EventType, StoreEvent,
-        ipc::subscriber::{Interests, SubscriberBuilder},
-    };
     let account = test.account("plain@example.com");
     let owner = account.id().document_id();
     let name = account.name();
@@ -655,15 +656,6 @@ async fn plain_update_trace(test: &TestServer, failures: &mut Vec<String>) {
         .request_with_headers("PUT", &path, [("content-type", "text/calendar")], &body)
         .await
         .with_status(StatusCode::NO_CONTENT);
-    let event_type = EventType::Store(StoreEvent::AssertValueFailed);
-    let mut interests = Interests::default();
-    interests.set(event_type);
-    let (_tx, mut rx, _) = SubscriberBuilder::new("sharing-review-trace".into())
-        .set_interests([event_type])
-        .with_lossy(false)
-        .register();
-    Collector::union_interests(interests);
-    Collector::reload();
     let request_path = path.clone();
     let parked = HookParked::start(owner, test_hooks::set_update_commit_pause, async move {
         DummyWebDavClient::new(owner, name, secret, name)
@@ -678,19 +670,22 @@ async fn plain_update_trace(test: &TestServer, failures: &mut Vec<String>) {
     })
     .await;
     let event_id = id(test, owner, "sharing-review-trace/one.ics").await;
-    let stored = test
-        .server
-        .store()
-        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
-            owner,
-            Collection::CalendarEvent,
-            event_id,
-        ))
-        .await
-        .unwrap()
-        .unwrap();
+    let read_row = || async {
+        test.server
+            .store()
+            .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
+                owner,
+                Collection::CalendarEvent,
+                event_id,
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    let stored = read_row().await;
     let mut concurrent = stored.deserialize::<CalendarEvent>().unwrap();
     concurrent.flags ^= 1;
+    let flipped = concurrent.flags & 1;
     let mut batch = BatchBuilder::new();
     // A row-only change: the parked PUT asserts the row it read.
     concurrent
@@ -704,32 +699,23 @@ async fn plain_update_trace(test: &TestServer, failures: &mut Vec<String>) {
         )
         .unwrap();
     test.server.commit_batch(batch).await.unwrap();
-    // A lost commit assertion: 503 at 1.0 (409 at 0.16, `dav/src/request.rs`).
-    assert_eq!(parked.finish().await, StatusCode::SERVICE_UNAVAILABLE);
-    let captured = tokio::time::timeout(Duration::from_secs(5), async {
-        while let Some(batch) = rx.recv().await {
-            for event in batch {
-                let this_request = event.keys.iter().any(|(key, value)| {
-                    *key == trc::Key::Url
-                        && matches!(value, trc::Value::String(url) if url.as_str() == path)
-                });
-                if this_request {
-                    return event;
-                }
-            }
-        }
-        panic!("trace subscriber closed before plain CAS failure");
-    })
-    .await
-    .unwrap();
-    Collector::remove_subscriber("sharing-review-trace".into());
-    Collector::reload();
-    assert_eq!(captured.inner.typ, event_type, "trace positive control");
-    let located = captured.keys.iter().any(|(key, value)| *key == trc::Key::CausedBy && matches!(value, trc::Value::String(location) if location.contains("crates/dav/src/calendar/update.rs:")));
-    if !located {
+    let status = parked.finish().await;
+    if status != StatusCode::NO_CONTENT {
         failures.push(format!(
-            "plain update CAS trace lost DAV location: {:?}",
-            captured.keys
+            "plain update after a lost assertion: {status}, expected 204 (replayed)"
+        ));
+    }
+    // Both changes are kept: the PUT's SUMMARY and the concurrent row's flag.
+    let served = client.request("GET", &path, "").await;
+    let served = served.body.unwrap_or_default();
+    if !served.contains("SUMMARY:parked ") {
+        failures.push(format!("the replayed PUT's change is missing: {served}"));
+    }
+    let after = read_row().await.deserialize::<CalendarEvent>().unwrap();
+    if after.flags & 1 != flipped {
+        failures.push(format!(
+            "the concurrent row-only change was lost: flags {:#x}",
+            after.flags
         ));
     }
     client

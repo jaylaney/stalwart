@@ -590,11 +590,11 @@ async fn controls(test: &TestServer, owner: u32, client: &DummyWebDavClient) {
     }
 
     // Cross each cap independently; a small source control still commits one slice.
-    for (label, count, padding) in [
-        ("operations", 360, 0),
-        ("bytes", 30, 230_000),
-        ("split", 999, 0),
-    ] {
+    // Ruling 81: 0.16's third case, a byte oversize (30 events of 230 KB),
+    // is retired as unreachable at 1.0: a collection MOVE rewrites rows
+    // only (it planned 120 operations and 12,516 bytes), so no event content
+    // reaches the 5 MB byte budget, which stays in the code.
+    for (label, count) in [("operations", 360), ("split", 999)] {
         let source = format!("budget-{label}-source");
         let target = format!("budget-{label}-target");
         for slug in [&source, &target] {
@@ -602,13 +602,7 @@ async fn controls(test: &TestServer, owner: u32, client: &DummyWebDavClient) {
         }
         put(client, &target, "old.ics", &format!("budget-{label}-old")).await;
         for n in 0..count {
-            let mut event = super::sharing::sharing_event(&format!("budget-{label}-{n}"));
-            if padding > 0 {
-                event = event.replace(
-                    "END:VEVENT",
-                    &format!("DESCRIPTION:{}\r\nEND:VEVENT", "p".repeat(padding)),
-                );
-            }
+            let event = super::sharing::sharing_event(&format!("budget-{label}-{n}"));
             client
                 .request_with_headers(
                     "PUT",
@@ -644,10 +638,8 @@ async fn controls(test: &TestServer, owner: u32, client: &DummyWebDavClient) {
         );
         if label == "operations" {
             assert!(operations > 1000 && bytes < 5_000_000);
-        } else if label == "split" {
-            assert!(operations > 1000 && bytes < 5_000_000 && slices > 1);
         } else {
-            assert!(operations <= 1000 && bytes > 5_000_000 && slices == 1);
+            assert!(operations > 1000 && bytes < 5_000_000 && slices > 1);
         }
     }
     test_hooks::take_calendar_move_plans(owner);

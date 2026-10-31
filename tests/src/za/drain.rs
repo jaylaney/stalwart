@@ -1743,16 +1743,17 @@ pub async fn test_lease(test: &mut TestServer) {
     test_hooks::set_drain_retry_override(Some(0));
 
     // A. Drain versus drain (spec 6.3, 11). Two fan-outs for one UID
-    // publish the lower document id late. The late one is key1's PUT, held
-    // at the fan-out pause after its item's id was assigned; key1 holds
+    // publish one item late. The late one is key1's PUT, held at the
+    // fan-out pause (at 1.0 its item's id is assigned at commit, after the
+    // pause, so the late item has the higher id; ruling 80); key1 holds
     // its own creation lease for the UID while held, so the second
     // fan-out comes from another organizer, key3, whose PUT of the same
-    // UID contends on nothing and delivers the higher id. Session 1 drains
-    // the higher id and is held, holding key2's creation lease, right
-    // before its commit; the first PUT then commits the lower id. Session
+    // UID contends on nothing and delivers its item first. Session 1
+    // drains key3's item and is held, holding key2's creation lease, right
+    // before its commit; the first PUT then commits the late item. Session
     // 2 drains: both items find no event, the lease is busy, both stay
     // pending. Session 1 commits one copy (key3's invitation); its next
-    // request finds the lower id, whose ORGANIZER differs, and keeps it as
+    // request finds the late item, whose ORGANIZER differs, and keeps it as
     // history. Exactly one copy, both items drained.
     let uid = "za-drain-l1";
     let parked_put = HookParked::start(
@@ -1790,10 +1791,15 @@ pub async fn test_lease(test: &mut TestServer) {
     assert_eq!(parked_put.finish().await, 201, "the held PUT");
     let both = pending_ids(test, key2.id).await;
     assert_eq!(both.len(), 2);
+    // Ruling 80: the late item is the held PUT's, whatever its id. 1.0
+    // reserves an item's id in its batch at commit, after the fan-out
+    // pause, so it takes the higher id (0.16 assigned it before the pause:
+    // the lower one).
     assert!(
-        both[0] < both[1] && both[1] == high[0],
-        "the lower id arrived late: {both:?}"
+        both.contains(&high[0]),
+        "key3's item stays pending: {both:?}"
     );
+    let late_id = *both.iter().find(|id| **id != high[0]).unwrap();
     let waited = std::time::Instant::now();
     assert_eq!(
         trigger_drain(key2.name, &app).await,
@@ -1819,7 +1825,7 @@ pub async fn test_lease(test: &mut TestServer) {
     );
     assert_eq!(
         pending_ids(test, key2.id).await,
-        [both[0]],
+        [late_id],
         "the late item waits for a pass"
     );
     assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
@@ -1846,7 +1852,7 @@ pub async fn test_lease(test: &mut TestServer) {
             .get("key2@example.com"),
         Some(&key3_token)
     );
-    let late = stored_item(test, key2.id, both[0]).await;
+    let late = stored_item(test, key2.id, late_id).await;
     assert_eq!(late.flags & EVENT_NOTIFICATION_IS_CHANGE, 0);
     assert!(late.event_id.is_some());
     let copy_body = body(&key2.client, &copy).await;

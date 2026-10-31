@@ -1006,7 +1006,8 @@ pub async fn test_mid_pass_provisioning(test: &mut TestServer) {
 
 /// The plan's mid-pass deletion case, flipped by ruling 69: an ordinary
 /// account destroyed while its index pass is parked between two commit
-/// chunks leaves an orphan under its id, and the orphan is inert.
+/// chunks may leave an orphan under its id (ruling 85: it depends on
+/// timing, so the case accepts none), and the orphan is inert.
 ///
 /// Account destruction runs `unindex_account` and
 /// `clear_search_index_queue` outside the partition lock
@@ -1018,8 +1019,9 @@ pub async fn test_mid_pass_provisioning(test: &mut TestServer) {
 /// reuses an account id (`Account` is `OBJ_SEQ_ID`, its ids come from
 /// `RegistryClass::IdCounter` through `add_and_get` and only grow), so no
 /// later account reads the orphan, and its partition does not retry. The
-/// case asserts the orphan, its inertness (no account holds the id, and an
-/// account created afterwards gets another one), and then removes the
+/// case asserts that any orphan is the resumed pass's document, the
+/// inertness (no account holds the id, no queue entry is left, and an
+/// account created afterwards gets another one), and then removes any
 /// orphan so the suite's final emptiness check holds; in production it
 /// stays until the index is rebuilt.
 pub async fn test_mid_pass_deletion(test: &mut TestServer) {
@@ -1046,15 +1048,15 @@ pub async fn test_mid_pass_deletion(test: &mut TestServer) {
     drop(split);
     wait_for_index_queue(test, id, Duration::from_secs(10)).await;
 
-    // The residual: the resumed chunk 1 landed under the destroyed id.
+    // The residual, timing-dependent (ruling 85): either no orphan, or the
+    // resumed chunk's document under the destroyed id and nothing else.
     let keys = search_keys(test, id, SearchIndex::Email).await;
     let orphans = keys.document_ids();
     assert!(
-        !orphans.is_empty()
-            && orphans
-                .iter()
-                .all(|document_id| messages.contains(document_id)),
-        "ruling 69 expects the resumed pass's later document as an orphan under the \
+        orphans
+            .iter()
+            .all(|document_id| messages.contains(document_id)),
+        "ruling 85 allows only the resumed pass's document as an orphan under the \
          destroyed id: {keys:?}"
     );
     // Inert: no account holds the id, the partition is not retrying, and

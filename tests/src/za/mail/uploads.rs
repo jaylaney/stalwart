@@ -264,6 +264,21 @@ fn assert_refused(reply: &JmapResponse, what: &str) {
     );
 }
 
+/// Ruling 84: 1.0's own check refused the method call first, with `error`
+/// (`accountNotFound`, `fromAccountNotFound`): nothing is read or written.
+fn assert_account_refused(reply: &JmapResponse, error: &str, what: &str) {
+    assert_eq!(
+        reply.0["methodResponses"][0][0], "error",
+        "{what}: {:?}",
+        reply.0
+    );
+    assert_eq!(
+        reply.0["methodResponses"][0][1]["type"], error,
+        "{what}: {:?}",
+        reply.0
+    );
+}
+
 /// `pointer` of the first method response, which must exist (an update's
 /// entry may be `null`).
 fn accepted<'x>(reply: &'x JmapResponse, pointer: &str, what: &str) -> &'x Value {
@@ -844,6 +859,23 @@ async fn raw_consumers_are_refused(
                         .unwrap()
                         .to_string(),
                 );
+            } else if what == "FileNode/copy" {
+                // Ruling 84: the key account's own node is a folder (none of
+                // its uploads can become a file's blob), whose copy 1.0's
+                // kind check refuses before the raw-source refusal; nothing
+                // is created. The copy of a File node below reaches it.
+                let text = format!("{:?}", reply.0);
+                assert!(
+                    text.contains("blobId is only defined for File nodes."),
+                    "{what} of {source} by the key account: {text}"
+                );
+                assert!(
+                    reply
+                        .pointer("/methodResponses/0/1/created")
+                        .is_none_or(|created| created.is_null()
+                            || created.as_object().is_some_and(|c| c.is_empty())),
+                    "{what} of {source} by the key account created a node: {text}"
+                );
             } else {
                 assert_refused(&reply, &format!("{what} of {source} by the key account"));
                 raw_refusals += 1;
@@ -872,22 +904,61 @@ async fn raw_consumers_are_refused(
                 raw_refusals += 1;
             }
         }
+        // Ruling 84: the key account's copy of a File node, the shared
+        // plain file, into its own folder with the sealed source as its
+        // blob reaches the raw-source refusal (1.0 requires `accountId`
+        // and `fromAccountId` to differ).
+        let reply = key
+            .jmap_method_call(
+                "FileNode/copy",
+                json!({
+                    "fromAccountId": other_plain.id_string(),
+                    "accountId": key.id_string(),
+                    "create": { &shared_file: {
+                        "id": &shared_file,
+                        "parentId": &key_folder,
+                        "name": "za-raw-copy.bin",
+                        "blobId": source
+                    } }
+                }),
+            )
+            .await;
+        assert_refused(
+            &reply,
+            &format!("FileNode/copy of a File node with {source} by the key account"),
+        );
+        raw_refusals += 1;
         // A plain `fromAccountId` does not hide the blob's owner.
         assert_refused(
             &blob_copy(plain, other_plain, plain, &[source]).await,
             &format!("Blob/copy of {source} from a plain account"),
         );
         raw_refusals += 1;
-        // Spec 9: no blob copy out of a key account.
-        assert_refused(
+        // Spec 9: no blob copy out of a key account. Ruling 84: the plain
+        // session cannot reach the key account, so 1.0 refuses its
+        // `fromAccountId` first, and the key session's copy into the plain
+        // account that shares only a file folder with it is refused as
+        // `accountNotSupportedByMethod`. The fork's refusal of a blob copy
+        // out of and into a key account is exercised by `gates`, whose
+        // sessions reach both accounts through a mail share.
+        assert_account_refused(
             &blob_copy(plain, key, plain, &[source]).await,
+            "fromAccountNotFound",
+            &format!("Blob/copy of {source} out of the key account by a plain account"),
+        );
+        assert_account_refused(
+            &blob_copy(key, key, other_plain, &[source]).await,
+            "accountNotSupportedByMethod",
             &format!("Blob/copy of {source} out of the key account"),
         );
     }
-    // Spec 9: no blob copy into a key account, even of a plain blob.
-    assert_refused(
+    // Spec 9: no blob copy into a key account, even of a plain blob. Ruling
+    // 84: the key session cannot reach `plain`, so 1.0 refuses that
+    // `fromAccountId` first.
+    assert_account_refused(
         &blob_copy(key, plain, key, &[&plain_upload]).await,
-        "Blob/copy into the key account",
+        "fromAccountNotFound",
+        "Blob/copy into the key account from an account it cannot reach",
     );
 
     // A sealed source anywhere in the call refuses it before its first
@@ -1062,11 +1133,9 @@ async fn raw_consumers_are_refused(
         vec![Some(u64::from(key_id)); raw_refusals],
         "one trace per refused raw read, naming the blob's owner"
     );
-    assert_eq!(
-        refused(COPY_REFUSED),
-        vec![Some(u64::from(key_id)); sources.len() + 1],
-        "one trace per refused blob copy"
-    );
+    // Ruling 84: every blob copy above is refused by 1.0's own checks
+    // first, so none traces the fork's copy refusal.
+    assert_eq!(refused(COPY_REFUSED), Vec::<Option<u64>>::new());
 
     // The key account's copy of the shared plain blob is its own upload,
     // sealed; its script holds the upload's plaintext.

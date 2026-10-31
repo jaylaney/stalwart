@@ -4161,6 +4161,7 @@ async fn grantee_http_write_races(test: &mut TestServer) {
         .unwrap();
     assert!(!body.contains("must-conflict"));
     calendar_conditional_proppatch_races(owner, bob, USER, BOB, PATH).await;
+    calendar_dead_property_last_writer_wins(test, owner, USER, PATH).await;
     client
         .request("DELETE", PATH, "")
         .await
@@ -4227,15 +4228,19 @@ async fn calendar_conditional_proppatch_races(
             "Current personal name",
             "Unconditional personal name",
         ),
+        // Ruling 96: the grantee's race uses its per-principal display
+        // name, a live property; a dead property such as `calendar-color`
+        // leaves the collection's ETag unchanged at 1.0, so a stale If-Match
+        // still matches it (`calendar_dead_property_last_writer_wins`).
         (
             grantee_name,
             grantee,
-            "A:calendar-color",
-            "#111111FF",
-            "#222222FF",
-            "#333333FF",
-            "#444444FF",
-            "#555555FF",
+            "D:displayname",
+            "Initial grantee name",
+            "Competing grantee name",
+            "Stale grantee name",
+            "Current grantee name",
+            "Unconditional grantee name",
         ),
     ] {
         let client = DummyWebDavClient::new(id, principal, STRONG, principal);
@@ -4349,4 +4354,90 @@ async fn calendar_conditional_proppatch_races(
         );
     }
     assert!(failures.is_empty(), "{}", failures.join("; "));
+}
+
+/// Ruling 96: 1.0 keeps a calendar's dead properties (`calendar-color`) in
+/// a container of their own, outside the archive whose hash is the
+/// collection's ETag, so a dead-only PROPPATCH leaves the ETag unchanged and
+/// a PROPPATCH whose If-Match was read before a competing one still
+/// matches: 207, and the last writer wins. A 1.0 regression, inherited by
+/// a key account's calendar and an ordinary account's alike.
+async fn calendar_dead_property_last_writer_wins(
+    test: &TestServer,
+    owner: u32,
+    owner_name: &'static str,
+    path: &'static str,
+) {
+    const PLAIN: &str = "race-dead-property-plain@example.com";
+    let admin = test.account("admin@example.com");
+    let plain = admin
+        .create_user_account(PLAIN, STRONG, "Dead property", &[], user_permissions())
+        .await;
+    let plain_id = plain.id().document_id();
+    let plain_path = format!("/dav/cal/{}/dead-color/", PLAIN.replace('@', "%40"));
+    let plain_client = DummyWebDavClient::new(plain_id, PLAIN, STRONG, PLAIN);
+    plain_client
+        .request("MKCALENDAR", &plain_path, MKCAL)
+        .await
+        .with_status(StatusCode::CREATED);
+    let key_client = DummyWebDavClient::new(owner, owner_name, STRONG, owner_name);
+    let patch = |value: &str| {
+        format!(
+            "<D:propertyupdate xmlns:D=\"DAV:\" xmlns:A=\"http://apple.com/ns/ical/\"><D:set><D:prop><A:calendar-color>{value}</A:calendar-color></D:prop></D:set></D:propertyupdate>"
+        )
+    };
+    let properties = "<D:propfind xmlns:D=\"DAV:\" xmlns:A=\"http://apple.com/ns/ical/\"><D:prop><A:calendar-color/><D:getetag/></D:prop></D:propfind>";
+    for (client, path, kind) in [
+        (&key_client, path.to_string(), "key"),
+        (&plain_client, plain_path.clone(), "ordinary"),
+    ] {
+        let view = |path: String| async move {
+            let response = client
+                .request_with_headers("PROPFIND", &path, [("depth", "0")], properties)
+                .await
+                .with_status(StatusCode::MULTI_STATUS);
+            let value = |suffix: &str| {
+                response
+                    .xml
+                    .iter()
+                    .find(|(name, _)| name.ends_with(suffix) && !name.contains('['))
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_default()
+            };
+            // 1.0 may write the property with an inline namespace
+            // (`<calendar-color xmlns=...>`), so the names match by suffix.
+            (value("calendar-color"), value(":getetag"))
+        };
+        client
+            .request("PROPPATCH", &path, patch("#111111FF"))
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+        let (_, old_etag) = view(path.clone()).await;
+        client
+            .request("PROPPATCH", &path, patch("#222222FF"))
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+        let (color, etag) = view(path.clone()).await;
+        assert_eq!(color, "#222222FF", "{kind}: the competing color");
+        assert_eq!(
+            etag, old_etag,
+            "{kind}: a dead-only PROPPATCH changed the ETag"
+        );
+        client
+            .request_with_headers(
+                "PROPPATCH",
+                &path,
+                [("if-match", old_etag.as_str())],
+                patch("#333333FF"),
+            )
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+        let (color, _) = view(path.clone()).await;
+        assert_eq!(color, "#333333FF", "{kind}: the last writer wins");
+    }
+    plain_client
+        .request("DELETE", &plain_path, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    admin.destroy_account(plain).await;
 }

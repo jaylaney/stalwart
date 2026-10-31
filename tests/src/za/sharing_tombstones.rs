@@ -635,7 +635,11 @@ async fn purge_publication_gap(
 async fn scan_races(test: &TestServer, owner: u32, reader: u32, granted: u32) {
     let client = move || DummyWebDavClient::new(reader, READER, STRONG, READER);
     let scope = format!("{HOME}granted/");
+    // Ruling 82: at 1.0 a sync whose token is current reads no log
+    // (`token_range` is `(id, id)`), so the token is one change behind: the
+    // sync reads both streams and parks between them.
     let token = initial(&client()).await;
+    seed(test, owner, granted, &[], &[]).await;
     let request_scope = scope.clone();
     let parked = HookParked::start(owner, test_hooks::set_calendar_sync_log_pause, async move {
         sync(
@@ -655,7 +659,20 @@ async fn scan_races(test: &TestServer, owner: u32, reader: u32, granted: u32) {
         &[identity(granted, &path)],
     )
     .await;
-    refused(parked.finish().await);
+    // Both reads are bounded by the snapshot taken before them, so the
+    // change written between them is in neither: the sync answers without
+    // it, consistently, and the next sync reports it. (0.16's unbounded
+    // reads saw it in one stream only and refused the token.)
+    let answer = parked.finish().await;
+    assert_eq!(answer.status, StatusCode::MULTI_STATUS, "{:?}", answer.body);
+    assert!(!answer.expect_body().contains("between-reads.ics"));
+    let next = sync(&client(), &scope, answer.sync_token())
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    assert!(
+        next.hrefs().contains(&path.as_str()),
+        "the next sync reports the change written between the reads"
+    );
     let token = initial(&client()).await;
     let path = format!("{scope}purged.ics");
     seed(

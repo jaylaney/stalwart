@@ -200,6 +200,15 @@ fn assert_forbidden(response: &Value, what: &str) {
     assert!(!response.to_string().contains(CANARY), "{what}: {response}");
 }
 
+/// Ruling 84: 1.0's own check refused the method call first, with `error`
+/// (`accountNotFound`, `fromAccountNotFound`), before the fork's refusal:
+/// nothing is read or written, and no content is answered.
+fn assert_account_refused(response: &Value, error: &str, what: &str) {
+    assert_eq!(response[0], "error", "{what}: {response}");
+    assert_eq!(response[1]["type"], error, "{what}: {response}");
+    assert!(!response.to_string().contains(CANARY), "{what}: {response}");
+}
+
 /// The account's messages: id, blob id, thread id and attachments, read
 /// with the account's own credential (its keys).
 async fn emails(account: &Account) -> Vec<Value> {
@@ -690,12 +699,16 @@ async fn cross_account_copies_are_refused(
         ),
         "Email/copy into the key account by its own client",
     );
-    assert_forbidden(
+    // Ruling 84: the plain session cannot reach the key account, so 1.0
+    // refuses its `accountId` first; the key account's own client above
+    // meets the fork's refusal.
+    assert_account_refused(
         first(
             &plain
                 .jmap_method_call("Email/copy", copy(plain, key, &plain_email))
                 .await,
         ),
+        "accountNotFound",
         "Email/copy into the key account",
     );
     let blob_copy = |from: &Account, to: &Account, id: &str| {
@@ -712,12 +725,27 @@ async fn cross_account_copies_are_refused(
         ),
         "Blob/copy into the key account",
     );
-    assert_forbidden(
+    // Ruling 84: the plain session cannot reach the key account, so 1.0
+    // refuses its `fromAccountId` first; the key account's own session,
+    // whose access to the plain account is a mailbox share, is refused a
+    // blob copy into it as `accountNotSupportedByMethod`. No session reaches
+    // the fork's refusal of a blob copy out of a key account; its refusal of
+    // one into a key account is the copy above.
+    assert_account_refused(
         first(
             &plain
                 .jmap_method_call("Blob/copy", blob_copy(key, plain, &key_blob))
                 .await,
         ),
+        "fromAccountNotFound",
+        "Blob/copy out of the key account by the plain account",
+    );
+    assert_account_refused(
+        first(
+            &key.jmap_method_call("Blob/copy", blob_copy(key, plain, &key_blob))
+                .await,
+        ),
+        "accountNotSupportedByMethod",
         "Blob/copy out of the key account",
     );
 
@@ -784,10 +812,11 @@ async fn cross_account_copies_are_refused(
     copies.sort_unstable();
     // IMAP COPY and MOVE and JMAP Email/copy name the source account,
     // Blob/copy the key account, the R31 refusals the source's owner: the
-    // key account seven times, the plain account for the two copies into
-    // the key account.
+    // key account seven times, the plain account for the copy into the key
+    // account by its own client. Ruling 84: the plain session's copy into
+    // the key account is refused by 1.0 first and traces nothing.
     let mut expected = vec![Some(u64::from(key_id)); 7];
-    expected.extend([Some(u64::from(plain_id)); 2]);
+    expected.extend([Some(u64::from(plain_id)); 1]);
     expected.sort_unstable();
     assert_eq!(copies, expected, "the copy refusals' traces: {events:?}");
     for event in &events {
@@ -1081,8 +1110,12 @@ async fn rf_2_stale_grant(
             json!({ "accountId": stale.id_string(), "filter": { "inMailbox": inbox() } }),
         ),
     ] {
-        assert_refused(
+        // Ruling 84: 1.0 rechecks the account's access on each call, and
+        // the provisioned account left the grantee's token (the filter in
+        // `build_access_token`), so the WebSocket's call no longer finds it.
+        assert_account_refused(
             &socket.call(plain, method, args).await,
+            "accountNotFound",
             &format!("{method} over the grantee's WebSocket"),
         );
     }
@@ -1164,8 +1197,10 @@ async fn rf_2_stale_grant(
     imap.assert_read(Type::Tagged, ResponseType::No).await;
     imap.send_ok("LOGOUT").await;
 
-    assert_forbidden(
+    // Ruling 84: as over the WebSocket, the account is not found.
+    assert_account_refused(
         first(&plain.jmap_method_call("Mailbox/get", mailbox_get).await),
+        "accountNotFound",
         "Mailbox/get of the provisioned account",
     );
     assert!(
@@ -1174,7 +1209,7 @@ async fn rf_2_stale_grant(
             .is_none(),
         "the session object lists the provisioned account"
     );
-    assert_forbidden(
+    assert_account_refused(
         first(
             &plain
                 .jmap_method_call(
@@ -1186,6 +1221,7 @@ async fn rf_2_stale_grant(
                 )
                 .await,
         ),
+        "accountNotFound",
         "Email/get of the provisioned account's message",
     );
     assert_eq!(
