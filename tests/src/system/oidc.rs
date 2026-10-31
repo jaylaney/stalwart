@@ -526,8 +526,19 @@ pub async fn test(test: &mut TestServer) {
     smtp.until(&["250 "]).await;
     smtp.send(&format!("AUTH OAUTHBEARER {oauth_bearer_invalid_sasl}\r\n"))
         .await;
+    // 1.0 answers an invalid bearer token with RFC 7628's 334 error challenge
+    // (0.16 answered 4xx); the client's dummy response then gets 535.
     let line = smtp.until(&["2", "3", "4", "5"]).await;
-    assert!(line.starts_with('4'), "invalid bearer answered {line:?}");
+    let challenge = line
+        .strip_prefix("334 ")
+        .and_then(|challenge| general_purpose::STANDARD.decode(challenge.trim_end()).ok())
+        .map(|challenge| String::from_utf8(challenge).unwrap())
+        .unwrap_or_else(|| panic!("invalid bearer answered {line:?}"));
+    assert!(
+        challenge.contains("\"status\":\"invalid_token\""),
+        "invalid bearer challenge {challenge:?}"
+    );
+    smtp.exchange("AQ==\r\n", "535").await;
     smtp.exchange(&format!("AUTH OAUTHBEARER {oauth_bearer_sasl}\r\n"), "235")
         .await;
 
