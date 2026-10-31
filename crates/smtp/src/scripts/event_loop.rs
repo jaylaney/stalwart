@@ -44,6 +44,10 @@ struct SmtpHandler<'x> {
     server: &'x Server,
     script_id: &'x str,
     session_id: u64,
+    /// Mail rulings R57 and R59: a key account's transaction; every value the
+    /// runtime evaluated (from the message, possibly) is redacted in these
+    /// events and in the plugin traces they reach.
+    za_redact: bool,
     modifications: Vec<ScriptModification>,
     messages: Vec<Vec<u8>>,
     reject_reason: Option<String>,
@@ -95,7 +99,7 @@ impl<'x> Handler<'x> for SmtpHandler<'x> {
                         Sieve(SieveEvent::ScriptNotFound),
                         Script = CompactString::from(self.script_id),
                         SpanId = self.session_id,
-                        Details = CompactString::from(name.name()),
+                        Details = za_redacted(self.za_redact, CompactString::from(name.name())),
                     );
                 }
 
@@ -179,7 +183,7 @@ impl<'x> Handler<'x> for SmtpHandler<'x> {
                             Sieve(SieveEvent::NotSupported),
                             Script = CompactString::from(self.script_id),
                             SpanId = self.session_id,
-                            Name = CompactString::from(list),
+                            Name = za_redacted(self.za_redact, CompactString::from(list)),
                             Reason = "Sending to lists is not supported.",
                         );
 
@@ -209,7 +213,7 @@ impl<'x> Handler<'x> for SmtpHandler<'x> {
                     Script = CompactString::from(self.script_id),
                     SpanId = self.session_id,
                     Reason = "Unsupported action",
-                    Details = format_compact!("{action:?}"),
+                    Details = za_redacted(self.za_redact, format_compact!("{action:?}")),
                 );
                 return Reply::Error(RuntimeError::CapabilityNotSupported(capability.into()));
             }
@@ -250,21 +254,12 @@ impl RunScript for Server {
         if let Some(spam_status) = params.spam_status {
             ctx.set_spam_status(spam_status);
         }
-<<<<<<< HEAD
-        let mut input = Input::script("__script", script);
-        let mut messages: Vec<Vec<u8>> = Vec::new();
-        let session_id = params.session_id;
-        // Mail rulings R57 and R59: a key account's transaction; every value
-        // the runtime evaluated (from the message, possibly) is redacted in
-        // these events and in the plugin traces they reach.
-        let za_redact = params.za_redact;
-=======
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
         let mut handler = SmtpHandler {
             server: self,
             script_id: script_id.as_str(),
             session_id,
+            za_redact: params.za_redact,
             modifications: Vec::new(),
             messages: Vec::new(),
             reject_reason: None,
@@ -273,38 +268,6 @@ impl RunScript for Server {
         };
 
         // Start event loop
-<<<<<<< HEAD
-        while let Some(result) = instance.run(input) {
-            match result {
-                Ok(event) => match event {
-                    Event::IncludeScript { name, optional } => {
-                        if let Some(script) = self.core.sieve.trusted_script(name.as_str()) {
-                            input = Input::script(name, script.clone());
-                        } else if optional {
-                            input = false.into();
-                        } else {
-                            trc::event!(
-                                Sieve(SieveEvent::ScriptNotFound),
-                                Id = script_id.clone(),
-                                SpanId = session_id,
-                                Details = if za_redact {
-                                    trc::Value::redacted()
-                                } else {
-                                    name.as_str().to_string().into()
-                                },
-                            );
-                            break;
-                        }
-                    }
-                    Event::ListContains {
-                        lists,
-                        values,
-                        match_as,
-                    } => {
-                        input = false.into();
-                        'outer: for list in lists {
-                            if let Some(store) = self.get_lookup_store(&list) {
-=======
         let mut first_redirect = None;
         let mut more_redirects = Vec::new();
         let mut redirect_copies = 0;
@@ -322,104 +285,22 @@ impl RunScript for Server {
                                         Sieve(SieveEvent::ListNotFound),
                                         Script = script_id.clone(),
                                         SpanId = session_id,
-                                        Name = list,
+                                        Name = za_redacted(handler.za_redact, list),
                                     );
 
                                     continue;
                                 };
 
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                                 for value in &values {
                                     if let Ok(true) = store.key_exists(value.as_str()).await {
                                         contains = true;
                                         break 'outer;
                                     }
                                 }
-<<<<<<< HEAD
-                            } else {
-                                trc::event!(
-                                    Sieve(SieveEvent::ListNotFound),
-                                    Id = script_id.clone(),
-                                    SpanId = session_id,
-                                    Details = if za_redact {
-                                        trc::Value::redacted()
-                                    } else {
-                                        list.into()
-                                    },
-                                );
-=======
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                             }
 
                             Input::Bool(contains)
                         }
-<<<<<<< HEAD
-                    }
-                    Event::Function { id, arguments } => {
-                        input = self
-                            .core
-                            .run_plugin(
-                                id,
-                                PluginContext {
-                                    session_id,
-                                    server: self,
-                                    message: instance.message(),
-                                    modifications: &mut modifications,
-                                    access_token: params.access_token,
-                                    arguments,
-                                    za_redact,
-                                },
-                            )
-                            .await;
-                    }
-                    Event::Keep { message_id, .. } => {
-                        keep_id = message_id;
-                        input = true.into();
-                    }
-                    Event::Discard => {
-                        keep_id = usize::MAX - 1;
-                        input = true.into();
-                    }
-                    Event::Reject { reason, .. } => {
-                        reject_reason = reason.into();
-                        input = true.into();
-                    }
-                    Event::SendMessage {
-                        recipient,
-                        notify,
-                        return_of_content,
-                        by_time,
-                        message_id,
-                    } => {
-                        // Build message
-                        let mut message = self.new_message(
-                            params.return_path.as_str(),
-                            MessageSource::Autogenerated,
-                            session_id,
-                        );
-                        match recipient {
-                            Recipient::Address(rcpt) => {
-                                message.expand_and_add_recipient(rcpt, self).await;
-                            }
-                            Recipient::Group(rcpt_list) => {
-                                for rcpt in rcpt_list {
-                                    message.expand_and_add_recipient(rcpt, self).await;
-                                }
-                            }
-                            Recipient::List(list) => {
-                                trc::event!(
-                                    Sieve(SieveEvent::NotSupported),
-                                    Id = script_id.clone(),
-                                    SpanId = session_id,
-                                    Details = if za_redact {
-                                        trc::Value::redacted()
-                                    } else {
-                                        list.into()
-                                    },
-                                    Reason = "Sending to lists is not supported.",
-                                );
-                            }
-=======
                         Some(PendingWork::Function { id, arguments }) => {
                             self.core
                                 .run_plugin(
@@ -431,6 +312,7 @@ impl RunScript for Server {
                                         modifications: &mut handler.modifications,
                                         access_token: params.access_token,
                                         arguments,
+                                        za_redact: handler.za_redact,
                                     },
                                 )
                                 .await
@@ -459,205 +341,18 @@ impl RunScript for Server {
                             .await;
 
                             Input::Continue
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                         }
                         None => Input::Continue,
                     };
 
-<<<<<<< HEAD
-                        // Set notify flags
-                        let mut flags = 0;
-                        match notify {
-                            Notify::Never => {
-                                flags = RCPT_NOTIFY_NEVER;
-                            }
-                            Notify::Items(items) => {
-                                for item in items {
-                                    flags |= match item {
-                                        NotifyItem::Success => RCPT_NOTIFY_SUCCESS,
-                                        NotifyItem::Failure => RCPT_NOTIFY_FAILURE,
-                                        NotifyItem::Delay => RCPT_NOTIFY_DELAY,
-                                    };
-                                }
-                            }
-                            Notify::Default => (),
-                        }
-                        if flags > 0 {
-                            for rcpt in &mut message.message.recipients {
-                                rcpt.flags |= flags;
-                            }
-                        }
-
-                        // Set ByTime flags
-                        match by_time {
-                            ByTime::Relative {
-                                rlimit,
-                                mode,
-                                trace,
-                            } => {
-                                if trace {
-                                    message.message.flags |= MAIL_BY_TRACE;
-                                }
-                                match mode {
-                                    ByMode::Notify => {
-                                        for domain in &mut message.message.recipients {
-                                            domain.notify.due += rlimit;
-                                        }
-                                    }
-                                    ByMode::Return => {
-                                        for domain in &mut message.message.recipients {
-                                            domain.notify.due += rlimit;
-                                        }
-                                    }
-                                    ByMode::Default => (),
-                                }
-                            }
-                            ByTime::Absolute {
-                                alimit,
-                                mode,
-                                trace,
-                            } => {
-                                if trace {
-                                    message.message.flags |= MAIL_BY_TRACE;
-                                }
-                                match mode {
-                                    ByMode::Notify => {
-                                        for domain in &mut message.message.recipients {
-                                            domain.notify.due = alimit as u64;
-                                        }
-                                    }
-                                    ByMode::Return => {
-                                        let expires =
-                                            (alimit as u64).saturating_sub(message.message.created);
-                                        if expires > 0 {
-                                            for domain in &mut message.message.recipients {
-                                                domain.expires = QueueExpiry::Ttl(expires);
-                                            }
-                                        }
-                                    }
-                                    ByMode::Default => (),
-                                }
-                            }
-                            ByTime::None => (),
-                        };
-
-                        // Set ret
-                        match return_of_content {
-                            Ret::Full => {
-                                message.message.flags |= MAIL_RET_FULL;
-                            }
-                            Ret::Hdrs => {
-                                message.message.flags |= MAIL_RET_HDRS;
-                            }
-                            Ret::Default => (),
-                        }
-
-                        // Queue message
-                        let is_forward = message_id == 0;
-                        let raw_message = if !is_forward {
-                            messages.get(message_id - 1).map(|m| m.as_slice())
-                        } else {
-                            instance.message().raw_message().into()
-                        };
-                        if let Some(raw_message) = raw_message.filter(|m| !m.is_empty()) {
-                            if let Some(metadata) = self.has_quota(&mut message).await {
-                                let dkim_signers = if let Some(sign_domain) = &params.sign_domain {
-                                    match self.dkim_signers(sign_domain).await {
-                                        Ok(signers) => signers,
-                                        Err(err) => {
-                                            trc::error!(
-                                                err.details("Failed to obtain DKIM signers")
-                                                    .caused_by(trc::location!())
-                                            );
-
-                                            None
-                                        }
-                                    }
-                                } else {
-                                    None
-                                };
-
-                                let _ = message
-                                    .queue(
-                                        QueueParams::new(raw_message, session_id, self)
-                                            .with_dkim_signers(dkim_signers)
-                                            .with_raw_headers_opt(
-                                                params.headers.filter(|_| is_forward),
-                                            )
-                                            .with_original_raw_message(
-                                                instance.message().raw_message(),
-                                            )
-                                            .with_metadata(metadata),
-                                    )
-                                    .await;
-                            } else {
-                                trc::event!(
-                                    Sieve(SieveEvent::QuotaExceeded),
-                                    SpanId = session_id,
-                                    Id = script_id.clone(),
-                                    From = message.message.return_path,
-                                    To = if za_redact {
-                                        trc::Value::redacted()
-                                    } else {
-                                        trc::Value::from(
-                                            message
-                                                .message
-                                                .recipients
-                                                .into_iter()
-                                                .map(|r| trc::Value::from(r.address().to_string()))
-                                                .collect::<Vec<_>>(),
-                                        )
-                                    },
-                                );
-                            }
-                        }
-
-                        input = true.into();
-                    }
-                    Event::CreatedMessage { message, .. } => {
-                        messages.push(message);
-                        input = true.into();
-                    }
-                    Event::SetEnvelope { envelope, value } => {
-                        modifications.push(ScriptModification::SetEnvelope {
-                            name: envelope,
-                            value,
-                        });
-                        input = true.into();
-                    }
-                    unsupported => {
-                        trc::event!(
-                            Sieve(SieveEvent::NotSupported),
-                            Id = script_id.clone(),
-                            SpanId = session_id,
-                            Reason = "Unsupported event",
-                            Details = if za_redact {
-                                trc::Value::redacted()
-                            } else {
-                                format!("{unsupported:?}").into()
-                            },
-                        );
-                        break;
-                    }
-                },
-=======
                     ctx.resume(input);
                 }
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                 Err(err) => {
                     trc::event!(
                         Sieve(SieveEvent::RuntimeError),
                         Script = script_id.clone(),
                         SpanId = session_id,
-<<<<<<< HEAD
-                        Reason = if za_redact {
-                            trc::Value::redacted()
-                        } else {
-                            err.to_string().into()
-                        },
-=======
-                        Reason = err.to_compact_string(),
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+                        Reason = za_redacted(handler.za_redact, err.to_compact_string()),
                     );
 
                     break;
@@ -713,11 +408,7 @@ impl RunScript for Server {
                 Sieve(SieveEvent::ActionReject),
                 Script = script_id,
                 SpanId = session_id,
-                Details = if za_redact {
-                    trc::Value::redacted()
-                } else {
-                    reject_reason.clone().into()
-                },
+                Details = za_redacted(params.za_redact, reject_reason.clone()),
                 Elapsed = time.elapsed(),
             );
 
@@ -771,6 +462,16 @@ impl RunScript for Server {
 
             ScriptResult::Discard
         }
+    }
+}
+
+/// Mail rulings R57 and R59: `value`, or the redaction marker for a key
+/// account's transaction.
+fn za_redacted(redact: bool, value: impl Into<trc::Value>) -> trc::Value {
+    if redact {
+        trc::Value::redacted()
+    } else {
+        value.into()
     }
 }
 
