@@ -352,7 +352,8 @@ pub async fn test(test: &TestServer) {
         .contains("You are not allowed to remove events from calendar"),
     );
 
-    // Grant Jane write access
+    // Grant Jane write access (1.0 derives mayWriteOwn, mayUpdatePrivate and
+    // mayRSVP from mayWriteAll in every rights object; 0.16 listed them false)
     john.jmap_update(
         MethodObject::Calendar,
         [(
@@ -386,10 +387,10 @@ pub async fn test(test: &TestServer) {
             "mayWriteAll": true,
             "mayDelete": true,
             "mayShare": false,
-            "mayWriteOwn": false,
+            "mayWriteOwn": true,
             "mayReadFreeBusy": false,
-            "mayUpdatePrivate": false,
-            "mayRSVP": false,
+            "mayUpdatePrivate": true,
+            "mayRSVP": true,
             "maySetMetadata": false
         }
         }));
@@ -444,10 +445,10 @@ pub async fn test(test: &TestServer) {
             "mayWriteAll": true,
             "mayDelete": true,
             "mayShare": false,
-            "mayWriteOwn": false,
+            "mayWriteOwn": true,
             "mayReadFreeBusy": false,
-            "mayUpdatePrivate": false,
-            "mayRSVP": false,
+            "mayUpdatePrivate": true,
+            "mayRSVP": true,
             "maySetMetadata": false
           },
           "name": null
@@ -685,10 +686,10 @@ pub async fn test(test: &TestServer) {
             "mayWriteAll": true,
             "mayDelete": true,
             "mayShare": false,
-            "mayWriteOwn": false,
+            "mayWriteOwn": true,
             "mayReadFreeBusy": false,
-            "mayUpdatePrivate": false,
-            "mayRSVP": false,
+            "mayUpdatePrivate": true,
+            "mayRSVP": true,
             "maySetMetadata": false
           },
           "newRights": {
