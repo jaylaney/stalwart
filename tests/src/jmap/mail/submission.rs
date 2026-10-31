@@ -341,7 +341,7 @@ pub async fn test(test: &TestServer) {
             (
                 "nonexistant@example.com".to_string(),
                 DeliveryStatus::new(
-                    "550 5.1.2 Mailbox does not exist.",
+                    "550 5.1.1 Mailbox does not exist.",
                     Delivered::No,
                     Displayed::Unknown
                 )
@@ -393,7 +393,7 @@ pub async fn test(test: &TestServer) {
             (
                 "nonexistant@example.com".to_string(),
                 DeliveryStatus::new(
-                    "550 5.1.2 Mailbox does not exist.",
+                    "550 5.1.1 Mailbox does not exist.",
                     Delivered::No,
                     Displayed::Unknown
                 )

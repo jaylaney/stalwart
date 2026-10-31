@@ -19,33 +19,6 @@
   "subject": "RFC 8621 Section 4.1.4 test",
   "sentAt": "2018-07-10T01:03:11Z",
   "bodyStructure": {
-    "headers": [
-      {
-        "name": "Date",
-        "value": " Tue, 10 Jul 2018 01:03:11 +0000"
-      },
-      {
-        "name": "From",
-        "value": " \"Joe Bloggs\" <joe@example.com>"
-      },
-      {
-        "name": "Message-ID",
-        "value": " <my-message-id>"
-      },
-      {
-        "name": "Subject",
-        "value": " RFC 8621 Section 4.1.4 test"
-      },
-      {
-        "name": "MIME-Version",
-        "value": " 1.0"
-      },
-      {
-        "name": "Content-Type",
-        "value": " multipart/mixed;\r\n boundary=\"boundary_0\""
-      }
-    ],
-    "type": "multipart/mixed",
     "subParts": [
       {
         "partId": "1",
@@ -70,31 +43,10 @@
         "disposition": "inline"
       },
       {
-        "headers": [
-          {
-            "name": "Content-Type",
-            "value": " multipart/mixed;\r\n boundary=\"boundary_1\""
-          }
-        ],
-        "type": "multipart/mixed",
         "subParts": [
           {
-            "headers": [
-              {
-                "name": "Content-Type",
-                "value": " multipart/alternative;\r\n boundary=\"boundary_2\""
-              }
-            ],
-            "type": "multipart/alternative",
             "subParts": [
               {
-                "headers": [
-                  {
-                    "name": "Content-Type",
-                    "value": " multipart/mixed;\r\n boundary=\"boundary_3\""
-                  }
-                ],
-                "type": "multipart/mixed",
                 "subParts": [
                   {
                     "partId": "5",
@@ -161,16 +113,16 @@
                     "charset": "us-ascii",
                     "disposition": "inline"
                   }
-                ]
-              },
-              {
+                ],
                 "headers": [
                   {
                     "name": "Content-Type",
-                    "value": " multipart/related;\r\n boundary=\"boundary_4\""
+                    "value": " multipart/mixed;\r\n boundary=\"boundary_0\""
                   }
                 ],
-                "type": "multipart/related",
+                "type": "multipart/mixed"
+              },
+              {
                 "subParts": [
                   {
                     "partId": "9",
@@ -205,9 +157,23 @@
                     ],
                     "type": "image/jpeg"
                   }
-                ]
+                ],
+                "headers": [
+                  {
+                    "name": "Content-Type",
+                    "value": " multipart/related;\r\n boundary=\"boundary_1\""
+                  }
+                ],
+                "type": "multipart/related"
               }
-            ]
+            ],
+            "headers": [
+              {
+                "name": "Content-Type",
+                "value": " multipart/alternative;\r\n boundary=\"boundary_2\""
+              }
+            ],
+            "type": "multipart/alternative"
           },
           {
             "partId": "11",
@@ -262,7 +228,14 @@
             ],
             "type": "x-message/rfc822"
           }
-        ]
+        ],
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": " multipart/mixed;\r\n boundary=\"boundary_3\""
+          }
+        ],
+        "type": "multipart/mixed"
       },
       {
         "partId": "14",
@@ -286,7 +259,34 @@
         "charset": "us-ascii",
         "disposition": "inline"
       }
-    ]
+    ],
+    "headers": [
+      {
+        "name": "Date",
+        "value": " Tue, 10 Jul 2018 01:03:11 +0000"
+      },
+      {
+        "name": "From",
+        "value": " \"Joe Bloggs\" <joe@example.com>"
+      },
+      {
+        "name": "Message-ID",
+        "value": " <my-message-id>"
+      },
+      {
+        "name": "Subject",
+        "value": " RFC 8621 Section 4.1.4 test"
+      },
+      {
+        "name": "MIME-Version",
+        "value": " 1.0"
+      },
+      {
+        "name": "Content-Type",
+        "value": " multipart/mixed;\r\n boundary=\"boundary_4\""
+      }
+    ],
+    "type": "multipart/mixed"
   },
   "bodyValues": {
     "1": {

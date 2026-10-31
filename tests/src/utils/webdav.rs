@@ -403,10 +403,10 @@ impl DummyWebDavClient {
         for (key, _) in &expect_set {
             patch_prop.get(key.as_ref()).with_status(StatusCode::OK);
         }
+        // 1.0 answers a removed property 200 OK in its propstat (RFC 4918
+        // 9.2.1); 0.16 answered 204.
         for key in &expect_remove {
-            patch_prop
-                .get(key.as_ref())
-                .with_status(StatusCode::NO_CONTENT);
+            patch_prop.get(key.as_ref()).with_status(StatusCode::OK);
         }
 
         let response = self
@@ -825,6 +825,7 @@ impl DavResponse {
         let mut href_status = StatusCode::OK;
         let mut props = Vec::new();
         let mut prop = DavItem::default();
+        let mut empty_namespace: Option<String> = None;
 
         for (key, value) in &result.response.xml {
             match key.as_str() {
@@ -871,6 +872,20 @@ impl DavResponse {
                             props.push(std::mem::take(&mut prop));
                         }
 
+                        // 1.0 declares the empty default namespace on an
+                        // unprefixed element (`xmlns=""`): the attribute
+                        // stands for the element, as an empty value, which
+                        // the element's text replaces when it has one.
+                        if let Some(element) = prop_name.strip_suffix(".[xmlns]")
+                            && value.is_empty()
+                        {
+                            prop.values
+                                .entry(element.to_string())
+                                .or_default()
+                                .push(String::new());
+                            empty_namespace = Some(element.to_string());
+                            continue;
+                        }
                         let (prop_name, prop_value) =
                             if let Some((prop_name, prop_sub_name)) = prop_name.split_once('.') {
                                 if value.is_empty() {
@@ -881,10 +896,15 @@ impl DavResponse {
                             } else {
                                 (prop_name, value.to_string())
                             };
-                        prop.values
-                            .entry(prop_name.to_string())
-                            .or_default()
-                            .push(prop_value);
+                        let values = prop.values.entry(prop_name.to_string()).or_default();
+                        if empty_namespace
+                            .take()
+                            .is_some_and(|element| element == prop_name)
+                            && values.last().is_some_and(|value| value.is_empty())
+                        {
+                            values.pop();
+                        }
+                        values.push(prop_value);
                     }
                 }
             }

@@ -159,7 +159,25 @@ pub async fn test(test: &TestServer) {
 
         file_name.set_extension("json");
 
-        if fs::read(&file_name).unwrap() != result.as_bytes() {
+        let expected = fs::read(&file_name).unwrap();
+        // A key account's message stores no `$hasattachment` or
+        // `$hasnoattachment` keyword (plan 13 ruling 55; 1.0 sets one at
+        // ordinary ingest), so in key mode the fixture is compared without
+        // them.
+        let matches = if crate::utils::za::key_accounts_mode() {
+            let mut expected: serde_json::Value = serde_json::from_slice(&expected).unwrap();
+            if let Some(keywords) = expected
+                .get_mut("keywords")
+                .and_then(|keywords| keywords.as_object_mut())
+            {
+                keywords.remove("$hasattachment");
+                keywords.remove("$hasnoattachment");
+            }
+            expected == serde_json::from_str::<serde_json::Value>(&result).unwrap()
+        } else {
+            expected == result.as_bytes()
+        };
+        if !matches {
             file_name.set_extension("failed");
             fs::write(&file_name, result.as_bytes()).unwrap();
             panic!("Test failed, output saved to {}", file_name.display());

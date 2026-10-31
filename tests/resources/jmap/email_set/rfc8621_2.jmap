@@ -25,37 +25,6 @@
   "subject": "World domination",
   "sentAt": "2018-07-10T01:05:08Z",
   "bodyStructure": {
-    "headers": [
-      {
-        "name": "Date",
-        "value": " Tue, 10 Jul 2018 01:05:08 +0000"
-      },
-      {
-        "name": "From",
-        "value": " \"Joe Bloggs\" <joe@example.com>"
-      },
-      {
-        "name": "Message-ID",
-        "value": " <my-message-id>"
-      },
-      {
-        "name": "Subject",
-        "value": " World domination"
-      },
-      {
-        "name": "To",
-        "value": " \"John\" <john@example.com>"
-      },
-      {
-        "name": "MIME-Version",
-        "value": " 1.0"
-      },
-      {
-        "name": "Content-Type",
-        "value": " multipart/alternative;\r\n boundary=\"boundary_0\""
-      }
-    ],
-    "type": "multipart/alternative",
     "subParts": [
       {
         "partId": "1",
@@ -105,7 +74,38 @@
           "en"
         ]
       }
-    ]
+    ],
+    "headers": [
+      {
+        "name": "Date",
+        "value": " Tue, 10 Jul 2018 01:05:08 +0000"
+      },
+      {
+        "name": "From",
+        "value": " \"Joe Bloggs\" <joe@example.com>"
+      },
+      {
+        "name": "Message-ID",
+        "value": " <my-message-id>"
+      },
+      {
+        "name": "Subject",
+        "value": " World domination"
+      },
+      {
+        "name": "To",
+        "value": " \"John\" <john@example.com>"
+      },
+      {
+        "name": "MIME-Version",
+        "value": " 1.0"
+      },
+      {
+        "name": "Content-Type",
+        "value": " multipart/alternative;\r\n boundary=\"boundary_0\""
+      }
+    ],
+    "type": "multipart/alternative"
   },
   "bodyValues": {
     "1": {

@@ -17,6 +17,9 @@ pub async fn test(
     imap_check: &mut ImapConnection,
     is_cluster_test: bool,
 ) {
+    // 1.0 sets `$hasattachment` or `$hasnoattachment` at ordinary ingest; a
+    // key account's message stores neither (plan 13 ruling 55).
+    let key_mode = crate::utils::za::key_accounts_mode();
     println!("Running IDLE tests...");
 
     // Switch connection to IDLE mode
@@ -124,7 +127,11 @@ pub async fn test(
     imap_check
         .assert_read(Type::Status, ResponseType::Ok)
         .await
-        .assert_contains("* 1 FETCH (FLAGS () UID 1)");
+        .assert_contains(if key_mode {
+            "* 1 FETCH (FLAGS () UID 1)"
+        } else {
+            "* 1 FETCH (FLAGS ($hasnoattachment) UID 1)"
+        });
 
     // Delete message and expect an update
     imap.send("SELECT Parmeggiano").await;
@@ -135,10 +142,15 @@ pub async fn test(
     if is_cluster_test {
         tokio::time::sleep(SLEEP).await;
     }
-    imap_check
-        .assert_read(Type::Status, ResponseType::Ok)
-        .await
-        .assert_contains("* 1 FETCH (FLAGS (\\Deleted) UID 1)");
+    let lines = imap_check.assert_read(Type::Status, ResponseType::Ok).await;
+    if key_mode {
+        lines.assert_contains("* 1 FETCH (FLAGS (\\Deleted) UID 1)");
+    } else {
+        lines
+            .assert_contains("* 1 FETCH (FLAGS (")
+            .assert_contains("\\Deleted")
+            .assert_contains("$hasnoattachment");
+    }
 
     imap.send("UID EXPUNGE").await;
     imap.assert_read(Type::Tagged, ResponseType::Ok)

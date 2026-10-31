@@ -82,7 +82,15 @@ pub async fn test(test: &TestServer) {
     );
     assert_eq!(email.subject().unwrap(), "TPS Report");
     assert_eq!(email.mailbox_ids(), &[&ac2_mailbox_id]);
-    assert_eq!(email.keywords(), &["$draft"]);
+    // 1.0 adds the server-set `$hasnoattachment` keyword at ingest.
+    assert_eq!(
+        email
+            .keywords()
+            .into_iter()
+            .filter(|keyword| !matches!(*keyword, "$hasattachment" | "$hasnoattachment"))
+            .collect::<Vec<_>>(),
+        &["$draft"]
+    );
     assert_eq!(email.received_at().unwrap(), 311923920);
 
     // Check that the email was deleted

@@ -335,7 +335,7 @@ pub async fn query(client: &Client, can_stem: bool) {
                 (email::query::Filter::has_keyword("T")),
             ]),
             vec![
-                email::query::Comparator::has_keyword("attributed to"),
+                email::query::Comparator::has_keyword("attributed_to"),
                 email::query::Comparator::from(),
                 email::query::Comparator::sent_at(),
             ],
@@ -355,7 +355,7 @@ pub async fn query(client: &Client, can_stem: bool) {
                 (email::query::Filter::has_keyword("T")),
             ]),
             vec![
-                email::query::Comparator::has_keyword("attributed to").descending(),
+                email::query::Comparator::has_keyword("attributed_to").descending(),
                 email::query::Comparator::from(),
                 email::query::Comparator::sent_at(),
             ],
@@ -813,7 +813,10 @@ pub async fn create(test: &TestServer, account: &Account) {
                 || keyword == "artist"
                 || keyword == "Bronze"
             {
-                keywords.push(keyword);
+                // 1.0 refuses a keyword holding a space ("Invalid keyword.",
+                // RFC 8621's IMAP atom), so "attributed to" is stored as
+                // "attributed_to".
+                keywords.push(keyword.replace(' ', "_"));
             }
         }
 

@@ -34,46 +34,8 @@
   "subject": "Why not both importing AND exporting? ☺",
   "sentAt": "2021-11-20T22:22:01Z",
   "bodyStructure": {
-    "headers": [
-      {
-        "name": "Date",
-        "value": " Sat, 20 Nov 2021 22:22:01 +0000"
-      },
-      {
-        "name": "From",
-        "value": " \"Art Vandelay (Vandelay Industries)\" <art@vandelay.com>"
-      },
-      {
-        "name": "Message-ID",
-        "value": " <my-message-id>"
-      },
-      {
-        "name": "Subject",
-        "value": " =?utf-8?Q?Why_not_both_importing_AND_exporting=3F_=E2=98=BA?="
-      },
-      {
-        "name": "To",
-        "value": " \"Colleagues\": \"James Smythe\" <james@vandelay.com>;, \"Friends\":\r\n <jane@example.com>, =?utf-8?Q?John_Sm=C3=AEth?= <john@example.com>;"
-      },
-      {
-        "name": "MIME-Version",
-        "value": " 1.0"
-      },
-      {
-        "name": "Content-Type",
-        "value": " multipart/mixed;\r\n boundary=\"boundary_0\""
-      }
-    ],
-    "type": "multipart/mixed",
     "subParts": [
       {
-        "headers": [
-          {
-            "name": "Content-Type",
-            "value": " multipart/alternative;\r\n boundary=\"boundary_1\""
-          }
-        ],
-        "type": "multipart/alternative",
         "subParts": [
           {
             "partId": "2",
@@ -123,7 +85,14 @@
               "en_US"
             ]
           }
-        ]
+        ],
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": " multipart/alternative;\r\n boundary=\"boundary_0\""
+          }
+        ],
+        "type": "multipart/alternative"
       },
       {
         "partId": "4",
@@ -168,7 +137,38 @@
         "type": "x-document/pdf",
         "disposition": "attachment"
       }
-    ]
+    ],
+    "headers": [
+      {
+        "name": "Date",
+        "value": " Sat, 20 Nov 2021 22:22:01 +0000"
+      },
+      {
+        "name": "From",
+        "value": " \"Art Vandelay (Vandelay Industries)\" <art@vandelay.com>"
+      },
+      {
+        "name": "Message-ID",
+        "value": " <my-message-id>"
+      },
+      {
+        "name": "Subject",
+        "value": " =?utf-8?Q?Why_not_both_importing_AND_exporting=3F_=E2=98=BA?="
+      },
+      {
+        "name": "To",
+        "value": " \"Colleagues\": \"James Smythe\" <james@vandelay.com>;, \"Friends\":\r\n <jane@example.com>, =?utf-8?Q?John_Sm=C3=AEth?= <john@example.com>;"
+      },
+      {
+        "name": "MIME-Version",
+        "value": " 1.0"
+      },
+      {
+        "name": "Content-Type",
+        "value": " multipart/mixed;\r\n boundary=\"boundary_1\""
+      }
+    ],
+    "type": "multipart/mixed"
   },
   "bodyValues": {
     "2": {
@@ -277,27 +277,6 @@
     }
   ],
   "attachments": [
-    {
-      "partId": "4",
-      "blobId": "blob_2",
-      "size": 37,
-      "headers": [
-        {
-          "name": "Content-ID",
-          "value": " <cid:1234-5678-9012-3456>"
-        },
-        {
-          "name": "Content-Type",
-          "value": " image/png"
-        },
-        {
-          "name": "Content-Transfer-Encoding",
-          "value": " base64"
-        }
-      ],
-      "type": "image/png",
-      "cid": "cid:1234-5678-9012-3456"
-    },
     {
       "partId": "5",
       "blobId": "blob_3",

@@ -72,9 +72,17 @@ pub async fn test(imap: &mut ImapConnection, imap_check: &mut ImapConnection, te
         .await
         .assert_equals("* SEARCH 10");
 
+    // 1.0 applies NOT to the whole parenthesised conjunction (RFC 3501's
+    // search-key list), and no message is answered, so every message
+    // matches; 0.16 matched only the ones not from nathaniel.
     imap_check
         .send("UID SEARCH NOT (FROM nathaniel ANSWERED)")
         .await;
+    imap_check
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_equals("* SEARCH 1 2 3 4 5 6 7 8 9 10");
+    imap_check.send("UID SEARCH NOT (FROM nathaniel)").await;
     imap_check
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
@@ -190,9 +198,11 @@ pub async fn test(imap: &mut ImapConnection, imap_check: &mut ImapConnection, te
         .await;
     imap.assert_read(Type::Tagged, ResponseType::Ok)
         .await
+        // 1.0 sorts message 9 between 10 and 3 (the order upstream's
+        // comment recorded); 0.16 sorted it last.
         .assert_contains(if !test.server.search_store().is_mysql() {
-            "COUNT 10 ALL 6,4:5,1,10,3,7:8,2,9"
+            "COUNT 10 ALL 6,4:5,1,10,9,3,7:8,2"
         } else {
             "COUNT 10 ALL 9,3,7:8,2,6,4:5,1,10"
-        }); //6,4:5,1,10,9,3,7:8,2");
+        });
 }

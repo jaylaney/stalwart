@@ -301,17 +301,43 @@ pub async fn test(test: &TestServer) {
             .with_status(StatusCode::CREATED);
         let mut num_success = 0;
         let mut did_fail = false;
+        // A key account's event is charged its sealed size, which the test
+        // cannot compute: it is measured from the previous PUT.
+        let mut last_available: Option<u64> = None;
+        let mut sealed_charge: Option<u64> = None;
 
         for i in 0..100 {
             let content = resource_type.generate();
             let available = mike_noquota.available_quota(&path).await;
+            if let Some(last) = last_available.take() {
+                sealed_charge = Some(last - available);
+            }
 
+            let name = format!("file{i}");
             let response = mike_noquota
-                .request_with_headers("PUT", &format!("{path}file{i}"), [], &content)
+                .request_with_headers("PUT", &format!("{path}{name}"), [], &content)
                 .await;
-            if available > content.len() as u64 {
+            // 1.0 checks the quota when the batch commits, against what the
+            // object charges (`limit_disk_quota`, at most the quota): a file
+            // node charges its name, its content and the node's own size
+            // (`FileNode::size`), a card or an event its content. 0.16
+            // checked the content's length before writing.
+            // A key account's event charges its sealed size (fork code; for
+            // an ordinary account no fork code adds bytes, ruling 86).
+            let charged = match resource_type {
+                DavResourceName::File => {
+                    (content.len() + name.len() + std::mem::size_of::<groupware::file::FileNode>())
+                        as u64
+                }
+                DavResourceName::Cal if crate::utils::za::key_accounts_mode() => {
+                    sealed_charge.unwrap_or(content.len() as u64)
+                }
+                _ => content.len() as u64,
+            };
+            if available >= charged {
                 num_success += 1;
                 response.with_status(StatusCode::CREATED);
+                last_available = Some(available);
             } else {
                 // 1.0 answers an exceeded quota 507 (0.16: 412), with the
                 // same condition.

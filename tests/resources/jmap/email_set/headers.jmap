@@ -69,6 +69,63 @@
   "subject": "Headers test",
   "sentAt": "2018-07-10T01:03:11Z",
   "bodyStructure": {
+    "subParts": [
+      {
+        "partId": "1",
+        "blobId": "blob_0",
+        "size": 81,
+        "headers": [
+          {
+            "name": "Content-Language",
+            "value": " en"
+          },
+          {
+            "name": "Content-Type",
+            "value": " text/plain; charset=\"us-ascii\""
+          },
+          {
+            "name": "X-Header",
+            "value": " just a value"
+          },
+          {
+            "name": "X-Text",
+            "value": " more text"
+          },
+          {
+            "name": "Content-Transfer-Encoding",
+            "value": " quoted-printable"
+          }
+        ],
+        "type": "text/plain",
+        "charset": "us-ascii",
+        "language": [
+          "en"
+        ]
+      },
+      {
+        "partId": "2",
+        "blobId": "blob_1",
+        "size": 218,
+        "headers": [
+          {
+            "name": "Content-Location",
+            "value": " https://example.com/html-body.html"
+          },
+          {
+            "name": "Content-Type",
+            "value": " text/html; charset=\"utf-8\"; name=\"html-body.html\""
+          },
+          {
+            "name": "Content-Transfer-Encoding",
+            "value": " quoted-printable"
+          }
+        ],
+        "name": "html-body.html",
+        "type": "text/html",
+        "charset": "utf-8",
+        "location": "https://example.com/html-body.html"
+      }
+    ],
     "headers": [
       {
         "name": "Bcc",
@@ -171,64 +228,7 @@
         "value": " multipart/alternative;\r\n boundary=\"boundary_0\""
       }
     ],
-    "type": "multipart/alternative",
-    "subParts": [
-      {
-        "partId": "1",
-        "blobId": "blob_0",
-        "size": 81,
-        "headers": [
-          {
-            "name": "Content-Language",
-            "value": " en"
-          },
-          {
-            "name": "Content-Type",
-            "value": " text/plain; charset=\"us-ascii\""
-          },
-          {
-            "name": "X-Header",
-            "value": " just a value"
-          },
-          {
-            "name": "X-Text",
-            "value": " more text"
-          },
-          {
-            "name": "Content-Transfer-Encoding",
-            "value": " quoted-printable"
-          }
-        ],
-        "type": "text/plain",
-        "charset": "us-ascii",
-        "language": [
-          "en"
-        ]
-      },
-      {
-        "partId": "2",
-        "blobId": "blob_1",
-        "size": 218,
-        "headers": [
-          {
-            "name": "Content-Location",
-            "value": " https://example.com/html-body.html"
-          },
-          {
-            "name": "Content-Type",
-            "value": " text/html; charset=\"utf-8\"; name=\"html-body.html\""
-          },
-          {
-            "name": "Content-Transfer-Encoding",
-            "value": " quoted-printable"
-          }
-        ],
-        "name": "html-body.html",
-        "type": "text/html",
-        "charset": "utf-8",
-        "location": "https://example.com/html-body.html"
-      }
-    ]
+    "type": "multipart/alternative"
   },
   "bodyValues": {
     "1": {
@@ -278,6 +278,40 @@
   ],
   "htmlBody": [
     {
+      "partId": "1",
+      "blobId": "blob_0",
+      "size": 81,
+      "headers": [
+        {
+          "name": "Content-Language",
+          "value": " en"
+        },
+        {
+          "name": "Content-Type",
+          "value": " text/plain; charset=\"us-ascii\""
+        },
+        {
+          "name": "X-Header",
+          "value": " just a value"
+        },
+        {
+          "name": "X-Text",
+          "value": " more text"
+        },
+        {
+          "name": "Content-Transfer-Encoding",
+          "value": " quoted-printable"
+        }
+      ],
+      "type": "text/plain",
+      "charset": "us-ascii",
+      "language": [
+        "en"
+      ]
+    }
+  ],
+  "attachments": [
+    {
       "partId": "2",
       "blobId": "blob_1",
       "size": 218,
@@ -301,7 +335,6 @@
       "location": "https://example.com/html-body.html"
     }
   ],
-  "attachments": [],
-  "hasAttachment": false,
+  "hasAttachment": true,
   "preview": "I have the most brilliant plan.  Let me tell you all about it.  What we do is, we"
 }

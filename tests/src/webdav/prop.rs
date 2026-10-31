@@ -424,7 +424,9 @@ pub async fn test(test: &TestServer, assisted_discovery: bool) {
                         ]);
                     properties
                         .get(DavProperty::CalDav(CalDavProperty::SupportedCollationSet))
+                        // 1.0 also advertises i;octet.
                         .with_values([
+                            "A:supported-collation:i;octet",
                             "A:supported-collation:i;unicode-casemap",
                             "A:supported-collation:i;ascii-casemap",
                         ]);
@@ -550,13 +552,20 @@ pub async fn test(test: &TestServer, assisted_discovery: bool) {
                 )
                 .await
                 .with_status(StatusCode::MULTI_STATUS);
-            client
+            let response = client
                 .propfind(path, [DavProperty::WebDav(WebDavProperty::GetETag)])
-                .await
-                .properties(path)
-                .get(DavProperty::WebDav(WebDavProperty::GetETag))
-                .with_status(StatusCode::OK)
-                .without_values([etag.as_str()]);
+                .await;
+            let properties = response.properties(path);
+            let etag_after = properties.get(DavProperty::WebDav(WebDavProperty::GetETag));
+            etag_after.with_status(StatusCode::OK);
+            if resource_type == DavResourceName::File {
+                // 1.0 keeps a file node's display name as a property beside
+                // the node, outside its ETag (`FileNode.etag`), so the ETag
+                // is unchanged; 0.16 stored it in the node.
+                etag_after.with_values([etag.as_str()]);
+            } else {
+                etag_after.without_values([etag.as_str()]);
+            }
 
             // Test 12: PROPPATCH set on DAV properties
             client

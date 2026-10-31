@@ -293,7 +293,7 @@ pub async fn fetch(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
     .await;
     imap.assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_contains("FLAGS (Flag_009)")
+        .assert_contains("FLAGS (flag_009)")
         .assert_contains("RFC822.SIZE 1457")
         .assert_contains("UID 10")
         .assert_contains("INTERNALDATE")
@@ -314,21 +314,24 @@ pub async fn fetch(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
             "(\"John Smîth\" NIL \"john\" \"example.com\")",
             "(NIL NIL NIL NIL)) NIL NIL NIL NIL)"
         ))
+        // 1.0's writer: a body's MD5 is its Content-MD5 header (none here),
+        // a missing transfer encoding is "7bit", and a message/rfc822
+        // part counts its lines (0.16: computed MD5s, NIL, 0).
         .assert_contains(concat!(
             "BODYSTRUCTURE ((\"text\" \"html\" (\"charset\" \"us-ascii\") NIL NIL ",
-            "\"base64\" 239 3 \"07aab44e51c5f1833a5d19f2e1804c4b\" NIL NIL NIL)",
-            "(\"message\" \"rfc822\" NIL NIL NIL NIL 723 ",
+            "\"base64\" 239 3 NIL NIL NIL NIL)",
+            "(\"message\" \"rfc822\" NIL NIL NIL \"7bit\" 723 ",
             "(NIL \"Exporting my book about coffee tables\" ",
             "((\"Cosmo Kramer\" NIL \"kramer\" \"kramerica.com\")) ",
             "((\"Cosmo Kramer\" NIL \"kramer\" \"kramerica.com\")) ",
             "((\"Cosmo Kramer\" NIL \"kramer\" \"kramerica.com\")) ",
             "NIL NIL NIL NIL NIL) ",
             "((\"text\" \"plain\" (\"charset\" \"utf-16\") NIL NIL ",
-            "\"quoted-printable\" 228 3 \"3a942a99cdd8a099ae107d3867ec20fb\" NIL NIL NIL)",
+            "\"quoted-printable\" 228 3 NIL NIL NIL NIL)",
             "(\"image\" \"gif\" (\"name\" \"Book about ☕ tables.gif\") ",
-            "NIL NIL \"Base64\" 56 \"d40fa7f401e9dc2df56cbb740d65ff52\" ",
+            "NIL NIL \"Base64\" 56 NIL ",
             "(\"attachment\" NIL) NIL NIL) \"mixed\" (\"boundary\" \"giddyup\") NIL NIL NIL)",
-            " 0 \"cdb0382a03a15601fb1b3c7422521620\" NIL NIL NIL) ",
+            " 19 NIL NIL NIL NIL) ",
             "\"mixed\" (\"boundary\" \"festivus\") NIL NIL NIL)"
         ));
 
@@ -347,7 +350,7 @@ pub async fn fetch(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
     // Fetch bodyparts
     imap.send(concat!(
         "UID FETCH 10 (BINARY[1] BINARY.SIZE[1] BODY[1.TEXT] BODY[2.1.HEADER] ",
-        "BINARY[2.1] BODY[MIME] BODY[HEADER.FIELDS (From)]<10.8>)"
+        "BINARY[2.1] BODY[1.MIME] BODY[HEADER.FIELDS (From)]<10.8>)"
     ))
     .await;
     imap.assert_read(Type::Tagged, ResponseType::Ok)
@@ -357,7 +360,10 @@ pub async fn fetch(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
         .assert_contains("BODY[1.TEXT] {239}")
         .assert_contains("BODY[2.1.HEADER] {88}")
         .assert_contains("BINARY[2.1] ~{108}")
-        .assert_contains("BODY[MIME] {54}")
+        // 1.0 refuses MIME without a part number (RFC 3501's section-spec,
+        // "Expected a part number before 'MIME'"); 0.16 answered the
+        // message's header for BODY[MIME].
+        .assert_contains("BODY[1.MIME] {")
         .assert_contains("BODY[HEADER.FIELDS (FROM)]<10> {8}")
         .assert_contains("&ldquo;exporting&rdquo;")
         .assert_contains("PGh0bWw+PHA+")
@@ -373,7 +379,7 @@ pub async fn fetch(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
     imap.send("UID FETCH 10 (FLAGS)").await;
     imap.assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_contains("FLAGS (Flag_009)");
+        .assert_contains("FLAGS (flag_009)");
 
     // Switch to SELECT mode
     imap.send("SELECT INBOX").await;
@@ -392,7 +398,7 @@ pub async fn fetch(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
     imap.send("UID FETCH 10 (FLAGS)").await;
     imap.assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_contains("FLAGS (Flag_009)");
+        .assert_contains("FLAGS (flag_009)");
 
     // Fetching a body section should set the \Seen flag
     imap.send("UID FETCH 10 (BODY[1.TEXT])").await;

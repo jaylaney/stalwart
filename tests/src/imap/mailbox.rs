@@ -249,7 +249,9 @@ pub async fn test(
             true,
         );
 
-    // Recursive match including children
+    // Recursive match including children. 1.0 suppresses a parent's
+    // CHILDINFO when a subscribed descendant is itself listed (RFC 5258
+    // 3.5), as it is with "*", so the unsubscribed parents are not listed.
     imap.send("LIST (SUBSCRIBED RECURSIVEMATCH) \"\" \"*\" RETURN (CHILDREN)")
         .await;
     imap.assert_read(Type::Tagged, ResponseType::Ok)
@@ -261,14 +263,18 @@ pub async fn test(
                     "Vehicles/Electric/4 doors/Red",
                     ["Subscribed", "HasNoChildren"],
                 ),
-                (
-                    "Vehicles/Electric/4 doors",
-                    ["\"CHILDINFO\" (\"SUBSCRIBED\")", "HasChildren"],
-                ),
-                (
-                    "Vehicles/Electric",
-                    ["\"CHILDINFO\" (\"SUBSCRIBED\")", "HasChildren"],
-                ),
+            ],
+            true,
+        );
+    // With "%" the subscribed descendant is not listed, so its top-level
+    // parent keeps CHILDINFO.
+    imap.send("LIST (SUBSCRIBED RECURSIVEMATCH) \"\" \"%\" RETURN (CHILDREN)")
+        .await;
+    imap.assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_folders(
+            [
+                ("INBOX", ["Subscribed", "HasNoChildren"]),
                 (
                     "Vehicles",
                     ["\"CHILDINFO\" (\"SUBSCRIBED\")", "HasChildren"],

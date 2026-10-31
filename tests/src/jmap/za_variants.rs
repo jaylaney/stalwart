@@ -163,6 +163,14 @@ struct CorpusMessage {
     thread_id: String,
 }
 
+impl CorpusMessage {
+    /// 1.0 stores a keyword in lower case (`Keyword::other`), so the corpus
+    /// is matched case-insensitively.
+    fn has_keyword(&self, keyword: &str) -> bool {
+        self.keywords.contains(&keyword.to_ascii_lowercase())
+    }
+}
+
 /// Every message of the account, by JMAP id.
 async fn load_corpus(account: &Account) -> AHashMap<String, CorpusMessage> {
     let ids = account
@@ -439,7 +447,7 @@ async fn query_refusals(account: &Account) {
 async fn query_served(account: &Account, corpus: &AHashMap<String, CorpusMessage>) {
     type Matcher = Box<dyn Fn(&CorpusMessage) -> bool>;
     let and = |conditions: Vec<Value>| json!({ "operator": "AND", "conditions": conditions });
-    let has = |keyword: &'static str| move |m: &CorpusMessage| m.keywords.contains(keyword);
+    let has = |keyword: &'static str| move |m: &CorpusMessage| m.has_keyword(keyword);
     let mailbox_1768 = Id::new(1768u64).to_string();
     let others = [1991u64, 1870, 2011, 1951, 1902, 1808, 1963]
         .into_iter()
@@ -477,19 +485,19 @@ async fn query_served(account: &Account, corpus: &AHashMap<String, CorpusMessage
         (
             "notKeyword",
             json!({ "notKeyword": "artist" }),
-            Box::new(|m| !m.keywords.contains("artist")),
+            Box::new(|m| !m.has_keyword("artist")),
         ),
         (
             "NOT hasKeyword",
             json!({ "operator": "NOT", "conditions": [{ "hasKeyword": "N0" }] }),
-            Box::new(|m| !m.keywords.contains("N0")),
+            Box::new(|m| !m.has_keyword("N0")),
         ),
         (
             "OR hasKeyword",
             json!({ "operator": "OR", "conditions": [
                 { "hasKeyword": "Bronze" }, { "hasKeyword": "artist" }
             ] }),
-            Box::new(|m| m.keywords.contains("Bronze") || m.keywords.contains("artist")),
+            Box::new(|m| m.has_keyword("Bronze") || m.has_keyword("artist")),
         ),
         (
             "inMailbox",
@@ -513,7 +521,7 @@ async fn query_served(account: &Account, corpus: &AHashMap<String, CorpusMessage
                 json!({ "allInThreadHaveKeyword": "N" }),
                 json!({ "before": date(1800) }),
             ]),
-            Box::new(|m| m.keywords.contains("N") && m.received_at < 1800),
+            Box::new(|m| m.has_keyword("N") && m.received_at < 1800),
         ),
         (
             "noneInThreadHaveKeyword",
@@ -521,7 +529,7 @@ async fn query_served(account: &Account, corpus: &AHashMap<String, CorpusMessage
                 json!({ "noneInThreadHaveKeyword": "N" }),
                 json!({ "after": date(1995) }),
             ]),
-            Box::new(|m| !m.keywords.contains("N") && m.received_at >= 1995),
+            Box::new(|m| !m.has_keyword("N") && m.received_at >= 1995),
         ),
         (
             "someInThreadHaveKeyword",
@@ -529,7 +537,7 @@ async fn query_served(account: &Account, corpus: &AHashMap<String, CorpusMessage
                 json!({ "someInThreadHaveKeyword": "Bronze" }),
                 json!({ "before": date(1878) }),
             ]),
-            Box::new(|m| m.keywords.contains("Bronze") && m.received_at < 1878),
+            Box::new(|m| m.has_keyword("Bronze") && m.received_at < 1878),
         ),
         (
             "hasKeyword in a range",
@@ -538,7 +546,7 @@ async fn query_served(account: &Account, corpus: &AHashMap<String, CorpusMessage
                 json!({ "before": date(1840) }),
                 json!({ "hasKeyword": "T" }),
             ]),
-            Box::new(|m| m.keywords.contains("T") && (1786..1840).contains(&m.received_at)),
+            Box::new(|m| m.has_keyword("T") && (1786..1840).contains(&m.received_at)),
         ),
         (
             "minSize",

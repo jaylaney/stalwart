@@ -196,8 +196,14 @@ pub async fn test(test: &TestServer) {
         .await
         .unwrap()
         .unwrap();
+    // 1.0 adds a server-set `$hasattachment` or `$hasnoattachment` keyword
+    // at ingest, which the count leaves out.
     assert_eq!(
-        email.keywords().len(),
+        email
+            .keywords()
+            .iter()
+            .filter(|keyword| !matches!(**keyword, "$hasattachment" | "$hasnoattachment"))
+            .count(),
         2,
         "Expected 2 keywords, found {:?}.",
         email.keywords()
