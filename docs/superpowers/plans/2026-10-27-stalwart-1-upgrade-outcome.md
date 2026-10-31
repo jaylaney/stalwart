@@ -5373,6 +5373,241 @@ Limits recorded in Task 5:
   attachment lies beyond 16,384 parts.
 - In enterprise builds, a key account's message counts toward no tenant's quota.
 
+## Task 6
+
+### Part 6a: the index fences and the background gates
+
+Part 6a ported the fork's index fences onto v1.0.1's index queue (`services/src/index_queue/`)
+and the store's index pass, and gated the background tasks that would touch a key account's
+data. It resolved the two `services` conflicts (`task_manager/index.rs`, deleted as v1.0.1
+did; `task_manager/manager.rs`) and filled the ledger cells of `store/src/search/index.rs`,
+`store/src/write/batch.rs` and `store/src/write/mod.rs`. Lines are the worktree's after this
+part. No background path obtains session keys, indexes decrypted content, or rewrites a key
+account's sealed calendar data: the builders never read a key account's blob or event
+content, and the share-revocation cleanup stages nothing of a key-account owner.
+
+#### The index queue's ordering (ruling 19), from source
+
+One worker runs a partition, and it runs that partition's entries in order:
+- **One worker per partition on a node.** The manager dispatches a partition only if
+  `state.claimed.insert(partition)` succeeds (`index_queue/manager.rs:245`), and removes it
+  from `claimed` only when the worker's result arrives (`:66`).
+- **Across nodes,** a worker holds the partition's lock (`try_lock_search_index`,
+  `index_queue/index.rs:67`, `LOCK_EXPIRY` 10 minutes). It renews the lock only at the top of
+  each batch, once less than `LOCK_MARGIN` (60 s) is left (`drain_partition`, `:107-131`).
+- **In order within a worker.** `read_queue` (`:687`) iterates the partition's
+  `SearchIndexClass::Queue` keys in ascending order: account, document, `created_at`.
+  `pending_items` (`:801`) collapses one document's entries, and any unindex among them makes
+  the document a deletion. `process_items` (`:191`) then:
+  - builds the documents;
+  - writes them, with the deletions, in one `Sink::flush` (`:283`), which for the internal
+    store is one `index_account_documents` call, one `account_batch` and its chunks in
+    sequence;
+  - only then clears the exact queue keys it read (`:296`).
+
+  An unindex queued after the read keeps its own key, so the next batch of the same loop
+  runs it.
+
+So on one node, an unindex of a document cannot run between two chunks of that document's
+index write. The window the design names remains: a worker reads a row, the message is
+deleted, and the worker writes a stale document. The next batch's unindex then removes it,
+since `stored_documents` reads the stored document first. R54's scan sees the queue entries
+throughout, because they are cleared only after the flush.
+
+**Decision:** R62's per-chunk guard and R63's confirmation read (with `take_clears`) are
+retired. This is provisional until Task 7's runtime reproduction (ruling 63). R62's term
+scans (`has_account_search_terms`, `za_has_{email,calendar}_search_terms`) are kept.
+`INDEX_GUARD_FAIL_ONCE` is retired with them: removed from `store::za_test`, and its
+re-export dropped from `common::za::test_hooks`.
+
+Two residuals, neither reproduced (both Task 7's):
+- **A lost cluster lease.** One batch, its build and flush, can outlast the lease's
+  remainder, and then another node runs the partition. R58 in every chunk stops a superseded
+  tail once the account is provisioned.
+- **Account destruction runs outside the partition lock.** `destroy_account` calls
+  `unindex_account` and `clear_search_index_queue` directly
+  (`task_manager/tasks/destroy_account.rs:235`, `:245`). So a pass in flight for the destroyed
+  account can commit chunks after the range delete, and orphan terms under the destroyed id.
+  They matter only to an account that reuses the id, and R62's kept term scans refuse its
+  setup with the existing 409. The remedy is the usual one: recreate the account.
+
+#### R54: the queue scan, the status key and `ShareRevokeCleanup`
+
+Part 3a had already ported ruling 22's queue scan: any `SearchIndexClass::Queue` entry of the
+account in the Email, Calendar, Contacts or File index (`common/src/auth/vault.rs:800`).
+Part 6a adds the rest:
+- **The partition's status key.** For each of the four indexes, the scan also reads
+  `SearchIndexClass::QueueStatus { index, partition: account_id }` (`:827-846`). A failed pass
+  sets it, and the next completed pass clears it (`update_partition_status`,
+  `manager.rs:322-386`). A status key left with no entries is stale, and the partition's
+  next pass clears it, so it blocks setup only until then.
+- **`ShareRevokeCleanup` counts** for its `account_id`, the owner (`:877`), as the design
+  says. This replaces part 3a's "no" in its R54 table. The record holds only the owner, and
+  the task's grantee-side writes are container counters. The task stays exhaustive over
+  `Task`, and no other variant is open.
+- **The fence order is unchanged.** `za_has_tasks` stays where part 3b put it in
+  `za_assert_no_data`, before R51's scan.
+
+**No terminal failure.** A failing partition retries after `retry_delay(attempts)`:
+30 s × 2^min(attempts, 8), capped at 30 minutes (`manager.rs:316-320`, `mod.rs:38-39`). It never
+reaches a failed state, so its entries block provisioning until they drain. Part 6a adds the
+fault hook for the brief's test: `services::index_queue::za::test_hooks::INDEX_BUILD_FAIL_ONCE`,
+which fails the named account's next Email or Calendar build once. The test itself is 6c's.
+
+#### R58 in every chunk (ruling 18)
+
+Three pieces carry the fence:
+- **The carrier is attached at the builders' plain returns.** `build_email_document` wraps
+  both returns, the inline one and the `spawn_blocking` one, and `build_calendar_document`
+  wraps its one return, all in `za_index_fence` (`index_queue/document.rs`).
+- **`account_batch` places it** (`store/src/search/index.rs`). `za_index_fences` collects the
+  pass's distinct absent keys before the documents are consumed. After `build_batch`, one call
+  to `BatchBuilder::za_assert_absent_in_every_chunk` opens every non-empty commit chunk with
+  `AccountId`, `Collection::Principal`, `DocumentId(0)` and `AssertValue(None)` on field 150,
+  and shifts the chunk offsets to match.
+- **The method refuses any other kind of batch.** It errors, and leaves the batch unchanged,
+  when the batch holds pending changes or counters, or any operation other than a
+  `ValueClass::SearchIndex` value. Those operations name their own keys, so the selection the
+  assertion leaves behind does not matter to them.
+
+The cost is ruling 18's: one key read per chunk on an ordinary account's pass. A pass holds
+one partition, which is one account, so all of its fenced documents share one key.
+
+Tests: the store unit tests run without a hook, since a document of 2,500 distinct terms
+splits its pass by itself. `search::index::za_tests` covers:
+- every chunk is fenced;
+- an unfenced pass carries no assertion;
+- the method refuses a batch that is not a search pass;
+- on an ephemeral store, a fenced pass for a provisioned account writes nothing, while
+  ordinary and unfenced controls are written.
+
+`za_test::tests::a_vault_written_mid_pass_stops_the_later_chunks` (`test_mode`) parks the pass
+after chunk 0 with `INDEX_CHUNK_PAUSE` and writes the vault record. The pass then fails, and
+no `Document` key lands.
+
+Mutation: fencing chunk 0 only fails two of these tests, the structural test and the
+mid-pass test.
+
+#### The F4 builders
+
+- **Email** (`index_queue/za.rs`, `za_email_document`, called first in
+  `build_email_document`). For a key account, or for a stub (format byte) whose account no
+  longer exists, the builder returns a document without reading the blob. A stub therefore
+  never reaches `index_document`, its attachment extraction or `spawn_blocking`. An existing
+  ordinary account keeps upstream's document (R47).
+  - **Premise mismatch:** the brief and the design say this document holds `ReceivedAt` and
+    `Size`, but 1.0's Email index has no field for either. `EmailSearchField` holds text
+    fields only, and arrival time and size are served from the message cache. So the
+    document holds only the account and document ids, and no term derives from the message.
+    6c's leak rule for `SearchDocument` should read "ids only, no term" for key accounts.
+- **Calendar.** A key account gets no document (`za_skips_calendar`), and neither does a
+  sealed archive (`za_is_sealed_event`, over 1.0's `CalendarEventField::Content`). Every other
+  event is fenced.
+- **Reindex.** `reindex_account` only queues entries (`index_queue/reindex.rs:102-178`), so
+  rebuilt documents go through the same builders. No reindex path builds a document itself.
+- **The un-index path.** In `delete_email_metadata`, the arm that reads `raw_headers` now
+  calls `za_thread_subject_in`, which answers an empty subject for a header section that
+  starts with the stub's format byte.
+  - A stub's structure has no header entry, so `thread_subject()` already resolves it to `""`
+    without reading the section. Unit tests `index_queue::za::tests` show both.
+  - The SEL `ArchivedItem` snippet after it reads the envelope, which is empty for a stub. It
+    is untouched.
+  - The destroyed-stub un-index integration test is 6c's.
+- **File and Contacts** keep upstream's builders, and are not fenced (see the questions).
+
+#### The share-revocation cleanup
+
+`stage_calendar`, `stage_event` and `stage_notification` (`task_manager/tasks/grantee_cleanup/stage.rs`)
+return `Ok(false)` first when `za_skips_owner` holds. That check is a fork method in
+`grantee_cleanup/za.rs` over `za_is_key_account(owner_id)`: an unknown owner is not a key
+account, and a lookup error is returned so the task retries. Staging would deserialize a key
+account's event content and rewrite it with `update_full`, without keys. The fork's keyed
+revoke handles the grantee's entries. `rebuild_shares` runs unchanged: it writes only the
+`acl_grant` and `acl_revoke` index keys derived from object ACLs.
+
+#### The move route's input bytes
+
+`BatchBuilder::accounted_input_bytes(&mut self)` (`store/src/write/batch.rs`) re-derives 0.16's
+count over 1.0's `Operation`:
+- **First,** it materializes the pending change logs and counters, as `commit_points()` does.
+- **Per operation,** it counts 64 bytes plus the key hint, then by kind:
+  - fixed and patched values count their length (a patch overwrites in place);
+  - serializable values count their size hint (only `PendingMessageData` and `PendingTask`
+    use them);
+  - counters count 16;
+  - index keys, cleared ranges and serialized logs count their lengths;
+  - a log with pending ids counts `Changes::za_serialized_size_bound` (`write/log.rs`): two
+    bytes, plus at most 10 per list count and 10 per id.
+- **A merge counts no input.** 1.0's `MergeFnc` is a boxed closure, which has no countable
+  inputs. So the count is a bound only for batches whose merges emit at most the 64-byte
+  allowance. The move route's merges are the metadata viewer states (12 bytes,
+  `merge_viewer_state`) and `clear_if_equals` (none).
+
+The route (`dav/src/calendar/copy_move.rs`) now computes the bytes before the slice and
+operation counts. Its plan hook (`record_calendar_move_plan`) records the real bytes, where
+it recorded 0. The route again refuses above 5 MB, beside upstream's `is_large_batch`. This
+restores what `za::sharing_move_atomic`'s oversize case asserts (`bytes > 5_000_000`); no
+expectation changes. Unit test: `search::index::za_tests::accounted_input_bytes_counts_values_logs_and_merges`.
+
+#### Hooks
+
+- **`INDEX_WRITE_PAUSE`** is re-homed in `process_items`, before `Sink::flush`. It is keyed
+  by the partition's account, and taken only by a pass that has documents to write. While it
+  is held, the pass's queue entries stay stored.
+- **`INDEX_CHUNK_PAUSE`** is re-homed in `index_account_documents`. Under `test_mode` the
+  write goes through `za_test::write_index_pass`: the same chunks, in the same order, with the
+  pause between chunk 0 and chunk 1. It serves provisioning or deleting the account mid-pass.
+- **`INDEX_GUARD_FAIL_ONCE`** is retired (above).
+- **`INDEX_BUILD_FAIL_ONCE`** is new. It lives in `services`, because the call sites are
+  there.
+- **`TASK_CONSUMER_PAUSE`** sits in 1.0's task-manager loop, after the completed-task drain.
+- **The lease sweep** is called in `PurgeData` (`task_manager/tasks/maintenance.rs:281`).
+- **`maintenance.rs:145` and `:148`** sit inside an SEL snippet and keep `stalwart_tests`.
+  Recommended ruling: no change, since SEL code is not edited and only the enterprise test
+  build keeps tenant maintenance's jitter.
+
+Restored test: `services`' `state_manager/ece_restored_tests.rs` compiles for the first time
+here. It is adapted to p256 0.14's call shape (`EphemeralSecret::try_generate()`,
+`to_sec1_point`), with its assertions unchanged.
+
+#### Deferred, by owner
+
+**Part 6b**
+- None from this part. `common::za::test_hooks` no longer exports
+  `INDEX_GUARD_FAIL_ONCE`; no non-test crate used it.
+
+**Part 6c**
+- `tests/src/za/mail/fence.rs:3100-3150` uses `INDEX_GUARD_FAIL_ONCE`. Retire R63's cases,
+  and flip the R62 between-chunks cases to `INDEX_CHUNK_PAUSE` at its new site.
+- Tests to add:
+  - the partition-retry test, with `INDEX_BUILD_FAIL_ONCE` and `x:IndexQueueStatus/set`;
+  - R58's per-chunk test, through HTTP, with `FORCE_COMMIT_SPLIT` and `INDEX_CHUNK_PAUSE`;
+  - the destroyed-stub un-index test in `index_task.rs`;
+  - the reindex test and the attachment-indexer test;
+  - provisioning or deleting the account mid-pass.
+- The `SearchDocument` leak rule: ids only, per the F4 premise mismatch.
+
+**Task 7**
+- The runtime reproduction of the 0.16 interleaving (ruling 63), using `INDEX_WRITE_PAUSE`.
+- The destroy-account window above.
+
+**Task 9**
+- CLAUDE.md's remedy for index work: an `x:IndexQueueStatus/set` reset for a transient
+  failure, and deleting the document or the account for a permanent one.
+
+**Questions for the primary**
+- **The File and Contacts indexes for key accounts.** Upstream's builders index a key
+  account's files and contacts from plaintext.
+  - 0.16 indexed contacts the same way and had no File index. A key account's file blob is
+    never a sealed source (the JMAP writer refuses one), so no sealed blob reaches the file
+    indexer.
+  - Neither index is fenced, and neither is scanned by R51 or R62.
+  - Should files and contacts be gated or fenced like mail?
+- **A destroyed grantee on a key-account owner's calendar.** `Purge::Grantee` reaches the same
+  staging functions, so the gate also skips removing a destroyed grantee's grant from a key
+  account's calendars and events. Is the fork's account-destruction path the only remover of
+  those grants (`share-destroy-grantee`)?
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
@@ -5427,7 +5662,7 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/common/src/storage/transaction.rs` | content | Task 4 | resolved (Task 3a, ruling 41): v1.0.1's `delete_changes`, whose `truncate_change_log` already writes the truncation entry before any delete for every collection (0.16's Calendar-only early publication is now upstream's behaviour, so rows 2-3's ordering needs no fork code); a Calendar truncation also clears `VanishedCollection::CalendarIdentity` (250) over the same range, then calls `calendar_history_purge_pause_point` under `test_mode`. Nothing deferred to Task 4. Task 4a re-read: confirmed, and `CalendarIdentity`'s change group is Calendar's (see Task 4, "`delete_changes` and `CalendarIdentity`"). |
 | `crates/common/src/telemetry/tracers/otel.rs` | content | Task 9 (compiles in Task 3) | resolved (Task 3a, ruling 41): v1.0.1's file as supplied (the exporter moved to the `telemetry` crate). Deferred to Task 9: row 1, at `crates/telemetry/src/otlp/resource.rs` (see `config/telemetry.rs`). |
 | `crates/dav/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies (local `calcard`, hashify 0.3, hyper 1.12) plus `vault` (row 1); `test_mode = ["common/test_mode"]` (row 2). |
-| `crates/dav/src/calendar/copy_move.rs` | content | Task 4 | resolved (Task 4b): v1.0.1's file with row 3 (cross-account refusal, beside 1.0's privacy check), rows 4-11 (`from_calendar_id`, the key path's early returns; `log_calendar_vanished`) and the fork tail ported to split events: `za_copy_move_stored_event` writes `update_meta_at`, or `update_full_at` with the event and its container rewrapped/resealed when a MOVE changes key domain (ruling 29); `za_copy_container` seals the calendar's container for the destination id from a reservation-only batch (rulings 14, 16); `za_move_overwrite_container` keeps the one-transaction bound with 1.0's `commit_point_count`/`is_large_batch` (the input-byte measure is Task 6's). Rows 12-15 (`rename_container`) as merged; `last_change_id` takes the Calendar change group. The default-calendar gate is `feature = "test_mode"`. |
+| `crates/dav/src/calendar/copy_move.rs` | content | Task 4 | resolved (Task 4b): v1.0.1's file with row 3 (cross-account refusal, beside 1.0's privacy check), rows 4-11 (`from_calendar_id`, the key path's early returns; `log_calendar_vanished`) and the fork tail ported to split events: `za_copy_move_stored_event` writes `update_meta_at`, or `update_full_at` with the event and its container rewrapped/resealed when a MOVE changes key domain (ruling 29); `za_copy_container` seals the calendar's container for the destination id from a reservation-only batch (rulings 14, 16); `za_move_overwrite_container` keeps the one-transaction bound with 1.0's `commit_point_count`/`is_large_batch` (the input-byte measure is Task 6's). Task 6a: the route counts `accounted_input_bytes` again (records them in its plan hook, refuses above 5 MB). Rows 12-15 (`rename_container`) as merged; `last_change_id` takes the Calendar change group. The default-calendar gate is `feature = "test_mode"`. |
 | `crates/dav/src/calendar/delete.rs` | content | Task 4 | resolved (Task 4b): v1.0.1's file with rows 3-7: key paths use `za_roles`'s sender/writer/owner, `delete_with_events_za` and `delete_za_at` (upstream's calls kept for plain accounts), the fan-out of `ZaDeleteMessage.messages`, the bounded retry and the grantees' invalidation; the default-calendar gate is `feature = "test_mode"`. |
 | `crates/dav/src/calendar/freebusy.rs` | content | Task 4 | resolved (Task 4b): v1.0.1's file; ruling R6 through `za_freebusy_views` (the selected events unsealed before upstream's synchronous scan; withheld leaves no ids); the URI gate after `parse_uri`; expansion-trace ids. |
 | `crates/dav/src/calendar/get.rs` | content | Task 4 | resolved (Task 4b): v1.0.1's file; the read context before header evaluation, the content unsealed before `calendar_event_view`; HEAD measures a key account's view. |
@@ -5501,8 +5736,8 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/pop3/src/op/authenticate.rs` | content | Task 3 | resolved (Task 3b): rows 2-3 at 1.0's `authenticate` (`handle_auth` is gone): `authenticate_with_keys`, upstream's scope and permission checks, then `za_mail_login`; the keys live in `State::Authenticated.access_token` until the connection drops. |
 | `crates/pop3/src/op/fetch.rs` | content | Task 5 | resolved (Task 5b): rows 2-4 on 1.0's `MetadataRow` read: `za_metadata_view` gives the row and `opened`; an opened stub's sealed blob is opened whole under the fetched bytes' reservation; an unreadable message answers `-ERR`. |
 | `crates/services/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's `enterprise` list plus `test_mode = ["common/test_mode"]` (row 1). |
-| `crates/services/src/task_manager/index.rs` | modify/delete | Task 6 | open |
-| `crates/services/src/task_manager/manager.rs` | content | Task 6 | open |
+| `crates/services/src/task_manager/index.rs` | modify/delete | Task 6 | resolved (Task 6a): deleted, as v1.0.1 did. Its hooks moved into `services/src/index_queue/`: rows 4 and 6 (the key-account gates) and row 7's sealed-archive check through the fork module `index_queue/za.rs`, called from `build_email_document` and `build_calendar_document`; rows 5 and 7's R58 fence at the builders' plain returns (`za_index_fence`), placed in every commit chunk by `account_batch`; row 3's pause point (`INDEX_WRITE_PAUSE`) in `process_items` before `Sink::flush`. See "Task 6", part 6a. |
+| `crates/services/src/task_manager/manager.rs` | content | Task 6 | resolved (Task 6a): v1.0.1's loop (the completed-task drain, the flagged dispatch) with row 1's `TASK_CONSUMER_PAUSE` point after the drain and before `process_tasks`, so the consumer dispatches no task while it is held. |
 | `crates/services/src/task_manager/tasks/maintenance.rs` | content | Task 6 (lease: Task 3/Task 4); renamed from `task_manager/maintenance.rs`, whose file group it is | resolved (Task 3b, ruling 41): `sweep_expired_uid_leases(server.store())` after `purge_store` in `PurgeData` (1.0 has no in-memory purge). Task 2's handoff: `:187`, `:190` and `:369` regated to `feature = "test_mode"`. Deferred to Task 6 (for a ruling): `:145` and `:148` sit inside an SEL snippet (the tenant maintenance block), so they keep `stalwart_tests`; in enterprise test builds tenant maintenance keeps its jitter. |
 | `crates/smtp/src/inbound/milter/client.rs` | content | Task 5 | resolved (Task 5a): v1.0.1's `Name`/`CompactString` events with rows 4-5's redacted contents; rows 1-2 merged clean. |
 | `crates/smtp/src/inbound/session.rs` | content | Task 3 (issue #20, R41) / Task 5 | resolved (Task 3b, ruling 41): rows 1-4 kept; the raw-input trace keeps the mask and builds 1.0's `CompactString` otherwise. 1.0's `State::Bdat { .. }` is a struct variant now, and the in-tree smtp-proto's `RequestReceiver::buf()` returns `&mut Vec<u8>` with 0.2.5's clearing rule (re-read). Task 2's handoff: the `badtls` HELO regated to `any(test, feature = "test_mode")`. The fork unit module is kept. Nothing deferred. |
@@ -5516,9 +5751,9 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/store/src/dispatch/lookup.rs` | content | Task 2 (lease home: Task 3/Task 4) | resolved (Task 2a): v1.0.1's file as supplied (both blocks). Row 2's purge skip is moot, not deferred. Evidence (paths in `v1.0.1-src/crates/`): v1.0.1 has no `purge_in_memory_store`, and `InMemoryStore` (`store/src/lib.rs:426-439`) has no data-store variant: it is `Sql`, `Local`, `Redis`, `Http`, `Static` and the SEL `Sharded`, and `Sql` answers `NotSupported` to key writes (`store/src/dispatch/lookup.rs:61` and the arms after it). So nothing sweeps expired keys out of the data store. Its other bulk deletions of data-store keys are: `Store::purge_store`, which only clears zero counters in `Shape::Counter` subspaces (`store/src/backend/{rocksdb,sqlite,foundationdb}/write.rs`); `danger_destroy_account` (`store/src/dispatch/store.rs:415-476`: the account's `Counter` kinds, its `Logs`, `Indexes`, `Property`, `Immutable` and `IndexProperty` prefixes, and its ACLs); the change-log truncation (`delete_changes` and `truncate_change_log`, `common/src/storage/transaction.rs:116-235`, `Logs`); the private-metadata cleanup (`common/src/storage/metadata/cleanup.rs:228-265`, an owner's private metadata and private logs); the telemetry purges (`TelemetrySpan`, `TelemetryMetric`); the reindex and search-queue clears (search subspaces); and the console's operator-driven range delete. Ruling 24's guarantee (only the asserting sweep clears a lease) therefore rests on Task 3's choice of a `Shape::Value` subspace and key range for `ValueClass::Any` that none of these reaches. `ZA_UID_LEASE_PREFIX` stays in `store/src/lib.rs` as the first byte of the lease key in it. |
 | `crates/store/src/lib.rs` | content | Task 2 (is_read_replica consumer: Task 4) | resolved (Task 2a): v1.0.1's `Subspace` block as supplied, without the 0.16 `LEGACY_SUBSPACE_BITMAP_*` constants (no user). Row 1: `za_test` declared under `test_mode`. Row 2: `ZA_UID_LEASE_PREFIX = 27` kept (ruling 24), its comment rewritten for a `ValueClass::Any` key. Row 3 (ruling 26): the only caller of `Store::is_read_replica` is the fork's move route (`dav/src/calendar/copy_move.rs:2324`), and v1.0.1 still has the SEL `SQLReadReplica` variant, so the function stays, rewritten without the SEL arm: an SQL store (`is_sql`) that is neither SQLite nor `is_pg_or_mysql`, which at v1.0.1 is exactly the replica, and fails closed for any SQL variant upstream adds. |
 | `crates/store/src/query/log.rs` | content | Task 4 | resolved to compile (Task 2a, ruling 34): rows 1 and 2 ported. `vanished` wraps `vanished_with_change_id` as at 0.16, and each record is decoded with v1.0.1's `deserialize_vanished(bytes, &mut items)` into a per-record buffer, then tagged with that record's change id (the `String` decoder's prefix sharing is per record). Nothing deferred; finding 3 (paged sync tokens at the consumer) stays Task 4's. Task 4a re-read: nothing in `groupware` consumes it; the paged consumer is part 4b's. |
-| `crates/store/src/search/index.rs` | content | Task 6 (`has_account_search_terms`: Task 2) | resolved to compile (Task 2a, ruling 34): v1.0.1's imports and `index_account_documents` as supplied; 0.16's `Store::index` is gone. Deferred to Task 6: R58 placement, row 2 (the carrier `IndexDocument::assert_absent` and `with_assert_absent` in `search/{mod,document}.rs` compile unchanged and nothing reads them yet); R62's per-chunk guard, row 3; R63's confirmation read and its `take_clears` helper, row 4 (both removed from the file; the 0.16 code is at `9601038de`). Row 5 kept (ruling 19): `has_account_search_terms` is re-derived over v1.0.1's layout as one `only_first` scan of the account's term range in `Subspace::SearchTerm`, the range `unindex_account` deletes (`codec::account_region_range`); v1.0.1 has no separate `Index` keys. `za_test`'s `INDEX_CHUNK_PAUSE` and `INDEX_GUARD_FAIL_ONCE` stay, with no call site until rows 3 and 4 are decided. |
-| `crates/store/src/write/batch.rs` | content | Task 6 (consumer: Task 4) | resolved to compile (Task 2a, ruling 34): v1.0.1's imports plus `CalendarTombstone`. Row 2 (`log_calendar_vanished`) kept; `types` gives `VanishedCollection::CalendarIdentity` Calendar's change group, so both records of one deletion share a change id. Deferred to Task 6: `accounted_input_bytes`, row 3 (removed: v1.0.1's `SetValue` and boxed `MergeFnc` closures have no countable `Params`). Ruling 17's `FORCE_COMMIT_SPLIT` call is in `commit_point()`. |
-| `crates/store/src/write/mod.rs` | content | Task 6 (consumer: Task 4) | resolved to compile (Task 2a, ruling 34): v1.0.1's code as supplied. Deferred to Task 6: `Params::accounted_input_bytes`, row 1 (`Params` is gone; `MergeFnc` is a closure, so the move route's payload bound must be re-derived). The commit-retry constants are back under `test_mode` (test-hook table rows `store/src/write/mod.rs:105-112`), with `PRODUCTION_MAX_COMMIT_ATTEMPTS` gated to non-test builds, where it is used. |
+| `crates/store/src/search/index.rs` | content | Task 6 (`has_account_search_terms`: Task 2) | resolved to compile (Task 2a, ruling 34): v1.0.1's imports and `index_account_documents` as supplied; 0.16's `Store::index` is gone. Deferred to Task 6: R58 placement, row 2 (the carrier `IndexDocument::assert_absent` and `with_assert_absent` in `search/{mod,document}.rs` compile unchanged and nothing reads them yet); R62's per-chunk guard, row 3; R63's confirmation read and its `take_clears` helper, row 4 (both removed from the file; the 0.16 code is at `9601038de`). Row 5 kept (ruling 19): `has_account_search_terms` is re-derived over v1.0.1's layout as one `only_first` scan of the account's term range in `Subspace::SearchTerm`, the range `unindex_account` deletes (`codec::account_region_range`); v1.0.1 has no separate `Index` keys. `za_test`'s `INDEX_CHUNK_PAUSE` and `INDEX_GUARD_FAIL_ONCE` stay, with no call site until rows 3 and 4 are decided. | Task 6a: row 2 placed (ruling 18): `account_batch` collects the pass's distinct absent keys (`za_index_fences`) and, after `build_batch`, calls `BatchBuilder::za_assert_absent_in_every_chunk`, so every commit chunk of a pass that holds a fenced document opens with the vault-absence assertion. Rows 3 and 4 retired (ruling 19, provisional until Task 7's reproduction under ruling 63): one partition worker runs an account's index and unindex entries in order (part 6a's evidence). `INDEX_CHUNK_PAUSE` re-homed to `index_account_documents` (between a pass's first and second chunk, `za_test::write_index_pass`, under `test_mode` only); `INDEX_GUARD_FAIL_ONCE` retired. Row 5 kept. |
+| `crates/store/src/write/batch.rs` | content | Task 6 (consumer: Task 4) | resolved to compile (Task 2a, ruling 34): v1.0.1's imports plus `CalendarTombstone`. Row 2 (`log_calendar_vanished`) kept; `types` gives `VanishedCollection::CalendarIdentity` Calendar's change group, so both records of one deletion share a change id. Deferred to Task 6: `accounted_input_bytes`, row 3 (removed: v1.0.1's `SetValue` and boxed `MergeFnc` closures have no countable `Params`). Ruling 17's `FORCE_COMMIT_SPLIT` call is in `commit_point()`. | Task 6a: row 3 re-derived as `BatchBuilder::accounted_input_bytes(&mut self)` over 1.0's `Operation`s (part 6a), with `Changes::za_serialized_size_bound` in `write/log.rs` for logs with pending ids; the move route (`dav/src/calendar/copy_move.rs`) records the real bytes in its plan hook and refuses above 5 MB again. Also `za_assert_absent_in_every_chunk` (ruling 18). |
+| `crates/store/src/write/mod.rs` | content | Task 6 (consumer: Task 4) | resolved to compile (Task 2a, ruling 34): v1.0.1's code as supplied. Deferred to Task 6: `Params::accounted_input_bytes`, row 1 (`Params` is gone; `MergeFnc` is a closure, so the move route's payload bound must be re-derived). The commit-retry constants are back under `test_mode` (test-hook table rows `store/src/write/mod.rs:105-112`), with `PRODUCTION_MAX_COMMIT_ATTEMPTS` gated to non-test builds, where it is used. | Task 6a: nothing added here; the bound lives in `write/batch.rs` (row 3 of that file), and merges count no input (part 6a). |
 | `README.md` | content | primary (keep the fork's text) | resolved: the fork's text ("Keep the fork's README and SECURITY") |
 | `SECURITY.md` | content | primary (keep the fork's text) | resolved: the fork's text ("Keep the fork's README and SECURITY") |
 
