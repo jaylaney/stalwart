@@ -197,21 +197,15 @@ pub async fn test(test: &TestServer) {
                 }
             },
             "recurrenceOverrides": {
+                // 1.0 stores an override as a patch of what differs from the
+                // master (RFC 8984 4.3.5); 0.16 stored the instance whole.
                 "2007-03-06T12:00:00": {
                     "title": "Standup with guests",
-                    "start": "2007-03-06T12:00:00",
-                    "duration": "PT1H",
-                    "locations": {
-                        "loc1": {
-                            "@type": "Location",
-                            "name": "Room B"
-                        }
-                    }
+                    "locations/loc1/name": "Room B"
                 },
                 "2007-03-07T12:00:00": {
                     "title": "Moved standup, renamed",
-                    "start": "2007-03-07T15:00:00",
-                    "duration": "PT1H"
+                    "start": "2007-03-07T15:00:00"
                 }
             }
         }),
