@@ -5151,6 +5151,114 @@ first_refused_walks_the_filter_tree, ...}`. They run at Task 6's first compile.
 - `ParticipantIdentity/changes` names the request's account in its refusal, as `/get` and
   `/set` do; upstream reads the token's own identities whatever account the request names.
 
+### Part 5d: the mail integration tests
+
+Part 5d added Task 5's four new cases and the `plant_plain_message` helper, and adapted the
+za mail modules and the key-mode IMAP and JMAP variants to 1.0's APIs and part 5a's reader
+API. The `tests` crate compiles first at Task 7: every changed file is rustfmt-clean
+(`rustfmt --edition 2024`) and was checked against the 1.0 signatures by reading; none of
+it has run. No test hook was added.
+
+#### The new cases
+
+| Case | Module (`tests/src/za/mail/`) | Registered after | Negative control |
+|---|---|---|---|
+| `grouped_ingest_provisioning_wins_before_flush`: an `IngestGroup` of two threaded messages classified as ordinary (keyless token); `setup-token` and setup complete before the flush, which fails its assertion (`is_assertion_failure`) and commits no message, metadata row (`metadata_rows`, the immutable class scanned directly) or sample; the group's staged plaintext stays under temporary links until the purge removes them; the keyed retry stores both sealed (`WRAP_MK`, own threads, the opened bytes equal) and no other row | `fence` | `reissue_repairs_an_aborted_issuance` | the same group for `plainmail24` flushes in the clear, each message threaded, the reply in its parent's pending thread |
+| `grouped_rejection_discards_uncommitted_plain_metadata`: a group holds an ordinary-classified message; the account is provisioned; the next ingest with the same keyless token is refused (`JmapEvent::Forbidden`, `ZA_MAIL_KEYLESS`, not a rejection) and the group discards its batch, so the flush commits nothing; the keyed retry stores both messages sealed, and the account's metadata rows are exactly the retry's | `fence` | the case above | `plainmail25`: an unparsed message is a rejection; the group keeps its batch, the rejected message adds no row; its parsed retry adds one message and one row |
+| `grouped_ingest_mixed_key_and_plain`: one group interleaving `plainmail23`'s and `keymail28`'s copies of a message and its reply (the plain message records the thread key first); one flush; each result names its own account and document; the key messages are sealed under `mk`, unthreaded, each its own thread, opened bytes equal; their opened row equals the plain account's stored row for the same bytes (header section, body offset, size, preview, parts, subject) but for the blob hash; no sample for the key account | `delivery` | `restore_is_refused` | the plain messages are plaintext, threaded, the reply joined to its parent's pending thread |
+| `assigned_ids_preserve_sealed_read_offsets`: three extended fixtures (a base64 `message/rfc822` holding its own base64 attachment, and an outer binary attachment) and a message without an attachment, grouped into the key account (keyed) and the plain account; by the flush's assigned ids and UIDs: owner binding (`BlobClass::Linked` of the account, the stub refuses another account's associated data, `blobId` is the sealed hash); twelve `UID FETCH` attributes (nested sections included) equal the plain account's; `Email/get` (with `sentAt`, `hasAttachment`, `bodyStructure`) equal; the outer attachment, the nested message and, through `Email/parse` of the nested section, its own attachment downloaded byte for byte; another account's download and a keyless Bearer download of the key account's sections refused; `hasAttachment` false and `sentAt` equal for the attachment-less message; a corrupted stub and a corrupted blob fail their own `UID FETCH` (`NO [SERVERBUG]`) and `Email/get` (not found) while the middle message reads | `reads` | `rf_5_large_header_block` | the plain account's answers are the comparison |
+
+Beside them, from part 5c's deferrals: `ParticipantIdentity/changes` joins the key-mode
+calendar refusals (`jmap::za_variants::calendars`); `KEYWORD $HasAttachment`, `UNKEYWORD
+$HasNoAttachment` (ruling 55) and `metadataExists` (ruling 57) join `search.rs`'s refused
+keys and filters; `sentAt` joins `offsets_round_trip`'s compared properties. A nested
+section download, `hasAttachment` true and false and the BCC strip are covered above or
+already were (`submission_strips_bcc`); a `blobId`-only `Email/get` is
+`content_free_reads_open_nothing`'s; FileNode create, update and copy of a sealed source are
+`uploads::raw_consumers`'. Not added: a key account's embedded calendar blob (no mail
+module writes one; Task 6's or Task 7's).
+
+#### Fixture names allocated
+
+All at example.com: `keymail27` and `plainmail24` (fence, the provisioning race),
+`keymail28` and `plainmail23` (delivery, the mixed group), `keymail29` and `plainmail25`
+(fence, the refusal). The next free names are `keymail30` and `plainmail26`. The ordinary
+accounts are destroyed by `fence::test` or emptied by `delivery::test`, as their
+neighbours are; `fence::test` and `reads::test` now also destroy the spam training samples
+the grouped ingests' ordinary accounts train (`IngestSource::Imap { train_classifier: true }`,
+as APPEND).
+
+#### How the existing modules were adapted
+
+- **Helpers** (`mail/mod.rs`): the row helpers above (expectation ledger), plus
+  `stored_metadata_bytes`, `stored_hash`, `has_metadata`, `metadata_key`, `metadata_rows`,
+  `row_is_stub`; the grouped-ingest helpers `append_params`, `group_ingest`,
+  `keyless_token`, `keyed_token` and `reply_to`; `message_ids` reads 1.0's columnar cache
+  (`MessagesCache::document_ids`).
+- **`plant_plain_message`** (`utils/za.rs`) writes 1.0's ordinary path by hand, as
+  `email_ingest_into` and `index_message` write it: the held and linked blob, a thread of its
+  own, `MessageData` with the attachment keyword upstream sets, the sort keys, the
+  plaintext row (`MessageMetadata::build(..).encode()`), the threading key and the
+  index-queue entry, without the fence (it plants into key accounts too).
+- **`za_bearer_token`**: `reads`, `uploads` and `gates` moved from 0.16's `bearer_token`,
+  which had no caller left and is removed.
+- **1.0 call shapes**: `IngestEmail.metadata`; `IngestSource::Smtp { envelope_from,
+  sender_authentication }` (`SenderAuthentication::DmarcPass` for 0.16's
+  `is_sender_authenticated: true`); `emails_delete(.., ChangedBy::PrincipalId(..), ..)`;
+  `write_batch(&mut batch)` for `write(batch.build_all())`; `Subspace::BlobLink`;
+  `MessagesCache::{iter, by_id, len}` and `MessageRef` accessors for 0.16's `items`;
+  `MailboxCache.name` is an `Arc<str>`; 1.0's `Mailbox` (role in `flags`).
+- **Left to Task 6** (`fence.rs` from `setup_refuses_a_pending_unindex` on, and `search.rs`'s
+  search-store scan): the index-task cases of rulings R46 and R51-R63 still use 0.16's
+  `Task::IndexDocument`, `TaskQueueClass`, `IndexDocument`, `SUBSPACE_SEARCH_INDEX` and the
+  calendar archive; Task 6 retargets them to the search queue (design, "Indexing, metadata
+  and cache snapshots"). Their mail calls (`metadata_archive`) read the 1.0 row already.
+
+#### Finding for the primary
+
+`Server::za_has_property` (`common/src/auth/vault.rs:704`) iterates the property class
+(`ValueKey::property`). At 1.0 `EmailField::Metadata` lives in the immutable class
+(`store/src/write/mod.rs:1741`), so ruling R46's refusal in `za_assert_no_data`
+(`http/src/api/vault.rs:914`) never finds a destroyed message's row. `fence.rs`'s R46 case
+would fail on it (it expects the 409), and two Task 6 assertions in `fence.rs`
+(`za_has_property(.., EmailField::Metadata)`) read the same wrong class. Owners: Task 3's
+helper, Task 6's tests.
+
+#### Assumptions Task 7 must confirm at runtime
+
+1. A fixture-sized `IngestGroup` batch commits as one transaction: ingest adds no commit
+   point, so `FORCE_COMMIT_SPLIT` cannot split it, and a failed assertion commits nothing.
+2. `setup-token`'s emptiness check and recheck pass while a group holds the account's
+   messages in memory and its staged blobs under temporary links.
+3. Setup invalidates the account cache, so the next `email_ingest_into` reads a key
+   account; the keyless refusal there is `JmapEvent::Forbidden` with `ZA_MAIL_KEYLESS`.
+4. `AccessToken::from_id_maybe_invalid(..).with_session_keys(..)` ingests as a keyed
+   session (only `za_keys_for` is read).
+5. An unparsed message is rejected before any batch operation (`MessageIngest(Error)`).
+6. The JMAP metadata refusal reads `metadataExists: <ZA_MAIL_SEARCH_REFUSED>`, and the
+   ordinary account answers `Email/query` for `{"metadataExists": "za-search/key"}`.
+7. Each refused IMAP `KEYWORD $HasAttachment` search is one `ImapEvent::Error`.
+8. `ParticipantIdentity/changes` on a key account answers `accountNotSupportedByMethod`.
+9. A key account's `Email/parse` of a nested section blob answers its attachments with
+   section blob ids that download the decoded bytes; another account's download of them
+   is not 200, and a keyless Bearer download is 403 with `ZA_MAIL_KEYLESS` (R30).
+10. `UID FETCH` of a key account's nested sections answers what the ordinary account
+    answers for the same bytes, the UID and sequence number aside.
+11. `copy_message`'s refusal is still `JmapEvent::Forbidden` that `should_write_err`, with
+    the unlimited tenant budget the test passes.
+12. The temporary-link key layout (`hash || account || until`) is unchanged, so `fence`'s
+    and `uploads`' link scans keep finding the staged blobs.
+13. The `sentAt` of the attachment-less message renders a 2026-10-20 date for both accounts.
+14. Harness items from Tasks 2 and 7 the modules use unchanged: `read_queued_messages`,
+    `ImapConnection`, `Account` helpers, `HttpAuthCache::clear`, `create_passwordless_user_account`.
+
+#### Uncompiled files
+
+`tests/src/za/mail/{mod,delivery,fence,reads,writes,uploads,gates,search}.rs`,
+`tests/src/utils/za.rs`, `tests/src/jmap/za_variants.rs`. `tests/src/za/mail/{login,traces}.rs`
+and `tests/src/imap/za_variants.rs` needed no change for 1.0's mail APIs (their uses are
+protocol-level or the harness's).
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
@@ -5372,6 +5480,15 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `imap::op::fetch::structure::restored_tests::*` (new, Task 2's handoff) | 0.16's six hand-built `DataItem` cases become six parsed messages written through `write_envelope` and `write_structure`. Sizes and line counts are the messages' own (computed in the test), not 0.16's literals. Media types, subtypes and parameter names are lower case, a multipart's extension data lists its `boundary`, and a text part without parameters gets `("charset" "us-ascii")` where 0.16 wrote `NIL`. | `imap/src/op/fetch/structure.rs`: 1.0 writes these items from the metadata, with the parser's normalized (lower-case) tokens and parameters, and `DEFAULT_TEXT_PARAMS` (RFC 3501's default) for a text part without any; 0.16's `DataItem::{Envelope, Body, BodyStructure}` are gone. |
 | `pop3::protocol::response::tests::serialize_response` (restored) | Its seven message cases are built with `Response::message(ChainedBytes, header length, lines)`; the header length is given (the blank line's end, or the whole message). The expected strings are unchanged. | `pop3/src/protocol/response.rs`: `Response::Message` holds a `ChainedBytes` and a `MessageEnd`, built by `Response::message` from the metadata's header length; 0.16's `SliceRange` and `lines` field are gone. |
 | `za::mail::reads::offsets_round_trip` (fork) | The key-versus-plain FETCH comparison takes `$hasattachment` out of the ordinary account's FLAGS item (the one a non-peek FETCH adds) and asserts it was there exactly where a FLAGS item is, and absent from every key-account answer; the answers are otherwise equal. | Ruling 55: 1.0 sets `$HasAttachment` and `$HasNoAttachment` from the parsed message (`email/src/message/index/metadata.rs:76`); a key account's message carries neither (mail spec 5.2), and 0.16 set neither for any account. |
+| `za::mail` helpers (`mod.rs`: `stored_metadata`, `assert_sealed`, `assert_no_plaintext`, `open_message`, `corrupt_stub`, `threading_keys`) (fork) | The metadata is read as a `MetadataRow` from the immutable class (`ValueKey::immutable`, field 71); a stub is recognized by `is_stub(&MetadataRow)` and its wrap byte read from `raw_headers()`; `open_message` returns the opened row. `threading_keys` matches the inverted document id that ends a hash index key. `assert_no_plaintext` now scans every metadata row of the account (`metadata_rows`), not only the cached messages' (stronger). `corrupt_stub` flips the bundle's last byte and re-encodes the row with `stub_structure`, so the row still reads. Assertions unchanged. | `email/src/message/metadata/row.rs` (the row, its header section), `store/src/write/mod.rs:1741` (`EmailField::Metadata` is `ValueClass::Immutable`), `store/src/write/key.rs:386-392` (`IndexPropertyClass::Hash` keys end with `!document_id`); part 5a's stub. |
+| `za::mail::reads::keyless_reads_are_refused` (fork) | The keyless view check asserts `opened == false` and the same header section, and that the batch opener `za_open_metadata_row` answers `None`, where 0.16 asserted the view borrowed the stored archive (`Cow::Borrowed`, pointer equality). | `za_metadata_view` takes the stored `MetadataRow` by value and returns `ZaMetadataRow { row, opened }` (part 5a, 5b). |
+| `za::mail::reads::legacy_plaintext_is_served_as_plaintext` (fork) | The planted row is asserted to hold message and part entries, and the stub's structure exactly one part, where 0.16 asserted both had a non-empty `contents[0].parts`. | 1.0's `MessageMetadata` has `messages` and `parts` instead of `contents`; a stub's structure is `stub_structure`'s one binary root part and no message entry. |
+| `za::mail::reads::rf_5_large_header_block` (fork) | The opened row's header section is asserted compressed (`headers_compressed()`), where 0.16 asserted the view's archive serialized smaller than the header block and the bundle longer than 8192 bytes. | `MetadataRow::encode` compresses the header section past the email dictionary's watermark; 0.16 compressed the whole archive past 8192 bytes. |
+| `za::mail::fence::copy_message_refuses_key_accounts` (fork) | `copy_message` is given the source row read through `CopySources` and the destination's `AccountCache`, and an unlimited `DiskQuotaBudget` (the tests crate always enables `email/enterprise`). Assertions unchanged. | `email/src/message/copy.rs:64-78`: 1.0's signature; the refusal reads `CopySource::account_id` (part 5a). |
+| `za::mail::delivery`, `za::mail::fence` (`blob_has_access`) (fork) | The blob-link checks use `Store::blob_link_size(..).is_some()`. Assertions unchanged. | `store/src/write/blob.rs:106`: `blob_has_access` is gone. |
+| `jmap::za_variants::query_changes` (fork, ruling R44) | The `LogAction::Update` batch names its account and collection before `log_item_update`; the `LogAction::Move` rewrite reads `MessageData` in its own encoding. Assertions unchanged. | `store/src/write/batch.rs:395-410`: `log_item_update` logs only under a current account (0.16's call had none and would log nothing at 1.0); `MessageData` is no rkyv archive at 1.0. |
+| `za::mail::search::{imap_refused_keys, jmap_refused_filters_and_sorts}` (fork) | `KEYWORD $HasAttachment` and `UNKEYWORD $HasNoAttachment` join the refused IMAP keys, and `metadataExists` the refused JMAP filters (stronger). | Rulings 55 and 57. |
+| `za::mail::reads::offsets_round_trip` (fork) | `sentAt` joins the compared `Email/get` properties (stronger). | Part 5a stores no `sent_at` offset for a key account; 5c serves `sentAt` from the opened envelope. |
 
 ## Task 1 check
 
