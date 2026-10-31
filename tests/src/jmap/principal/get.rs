@@ -21,6 +21,11 @@ pub async fn test(test: &TestServer) {
     let bill_id = bill.id_string();
     let sales_id = sales.id_string();
 
+    // 1.0's session object sets the per-account limits (mailboxes per email,
+    // address books per card, file node depth), lists more file-node sort
+    // options and the node types, CalendarEvent and ContactCard blobs and the
+    // principals:owner capability, and drops imapsieve from the Sieve
+    // extensions.
     // Validate session object capabilities
     let response = john.jmap_session_object().await.into_inner();
     let application_server_key =
@@ -73,7 +78,7 @@ pub async fn test(test: &TestServer) {
           "isReadOnly": false,
           "accountCapabilities": {
             "urn:ietf:params:jmap:mail": {
-              "maxMailboxesPerEmail": null,
+              "maxMailboxesPerEmail": 100,
               "maxMailboxDepth": 10,
               "maxSizeMailboxName": 255,
               "maxSizeAttachmentsPerEmail": 50000000,
@@ -105,7 +110,7 @@ pub async fn test(test: &TestServer) {
             },
             "urn:ietf:params:jmap:vacationresponse": {},
             "urn:ietf:params:jmap:contacts": {
-              "maxAddressBooksPerCard": null,
+              "maxAddressBooksPerCard": 10,
               "mayCreateAddressBook": true
             },
             "urn:ietf:params:jmap:contacts:parse": {},
@@ -151,7 +156,6 @@ pub async fn test(test: &TestServer) {
                 "foreverypart",
                 "ihave",
                 "imap4flags",
-                "imapsieve",
                 "include",
                 "index",
                 "mailbox",
@@ -185,7 +189,9 @@ pub async fn test(test: &TestServer) {
               "supportedTypeNames": [
                 "Email",
                 "Thread",
-                "SieveScript"
+                "SieveScript",
+                "CalendarEvent",
+                "ContactCard"
               ],
               "supportedDigestAlgorithms": [
                 "sha",
@@ -201,7 +207,7 @@ pub async fn test(test: &TestServer) {
               "maxAvailabilityDuration": "P52W1D",
             },
             "urn:ietf:params:jmap:filenode": {
-              "maxFileNodeDepth": null,
+              "maxFileNodeDepth": 64,
               "maxSizeFileNodeName": 255,
               "forbiddenNameChars": "/<>:\"\\|?*",
               "forbiddenNodeNames": [
@@ -235,7 +241,16 @@ pub async fn test(test: &TestServer) {
               "fileNodeQuerySortOptions": [
                 "name",
                 "size",
-                "nodeType"
+                "created",
+                "modified",
+                "mediaType",
+                "nodeType",
+                "tree"
+              ],
+              "supportedNodeTypes": [
+                "Directory",
+                "File",
+                "SymLink"
               ],
               "mayCreateTopLevelFileNode": true,
               "caseInsensitiveNames": false,
@@ -244,6 +259,10 @@ pub async fn test(test: &TestServer) {
               "webWriteUrlTemplate": null
             },
             "urn:ietf:params:jmap:mail:share": {},
+            "urn:ietf:params:jmap:principals:owner": {
+              "accountIdForPrincipal": john_id,
+              "principalId": john_id
+            },
             "urn:stalwart:jmap": {}
           }
         }
