@@ -91,7 +91,7 @@ pub async fn test(test: &TestServer) {
             .unwrap(),
         "Owned by john in inbox"
     );
-    assert_forbidden(
+    assert_account_not_found(
         john_client
             .set_default_account_id(jane.id_string())
             .email_get(
@@ -100,13 +100,13 @@ pub async fn test(test: &TestServer) {
             )
             .await,
     );
-    assert_forbidden(
+    assert_account_not_found(
         john_client
             .set_default_account_id(jane.id_string())
             .mailbox_get(&inbox_id, None::<Vec<_>>)
             .await,
     );
-    assert_forbidden(
+    assert_account_not_found(
         john_client
             .set_default_account_id(sales.id_string())
             .email_get(
@@ -115,13 +115,13 @@ pub async fn test(test: &TestServer) {
             )
             .await,
     );
-    assert_forbidden(
+    assert_account_not_found(
         john_client
             .set_default_account_id(sales.id_string())
             .mailbox_get(&inbox_id, None::<Vec<_>>)
             .await,
     );
-    assert_forbidden(
+    assert_account_not_found(
         john_client
             .set_default_account_id(jane.id_string())
             .email_query(None::<Filter>, None::<Vec<_>>)
@@ -583,7 +583,7 @@ pub async fn test(test: &TestServer) {
         .mailbox_update_acl(&inbox_id, john.id_string(), [])
         .await
         .unwrap();
-    assert_forbidden(
+    assert_account_not_found(
         john_client
             .set_default_account_id(jane.id_string())
             .email_get(
@@ -706,7 +706,7 @@ pub async fn test(test: &TestServer) {
             .unwrap(),
         "Created by john in sales"
     );
-    assert_forbidden(
+    assert_account_not_found(
         bill_client
             .set_default_account_id(sales.id_string())
             .email_get(&email_id, [Property::Subject].into())
@@ -724,7 +724,7 @@ pub async fn test(test: &TestServer) {
         )
         .await;
 
-    assert_forbidden(
+    assert_account_not_found(
         john_client
             .set_default_account_id(sales.id_string())
             .email_get(&email_id, [Property::Subject].into())
@@ -738,6 +738,32 @@ pub async fn test(test: &TestServer) {
             .await;
     }
     test.assert_is_empty().await;
+}
+
+/// 1.0 answers a method on an account the session has no access to with
+/// `accountNotFound` (RFC 8620 3.6.2, which does not reveal the account), and
+/// keeps `forbidden` for an account it can reach; 0.16 answered `forbidden`.
+pub fn assert_account_not_found<T: Debug>(result: Result<T, jmap_client::Error>) {
+    if !matches!(
+        result,
+        Err(jmap_client::Error::Method(MethodError {
+            p_type: MethodErrorType::AccountNotFound
+        }))
+    ) {
+        panic!("Expected accountNotFound, got {:?}", result);
+    }
+}
+
+/// As `assert_account_not_found`, for the source account of a copy.
+pub fn assert_from_account_not_found<T: Debug>(result: Result<T, jmap_client::Error>) {
+    if !matches!(
+        result,
+        Err(jmap_client::Error::Method(MethodError {
+            p_type: MethodErrorType::FromAccountNotFound
+        }))
+    ) {
+        panic!("Expected fromAccountNotFound, got {:?}", result);
+    }
 }
 
 pub fn assert_forbidden<T: Debug>(result: Result<T, jmap_client::Error>) {

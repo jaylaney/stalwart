@@ -539,8 +539,10 @@ pub async fn test(test: &mut TestServer) {
         "invalid bearer challenge {challenge:?}"
     );
     smtp.exchange("AQ==\r\n", "535").await;
-    smtp.exchange(&format!("AUTH OAUTHBEARER {oauth_bearer_sasl}\r\n"), "235")
+    smtp.send(&format!("AUTH OAUTHBEARER {oauth_bearer_sasl}\r\n"))
         .await;
+    let line = smtp.until(&["2", "3", "4", "5"]).await;
+    assert!(line.starts_with("235"), "valid bearer answered {line:?}");
 
     // Try IMAP OAUTHBEARER auth
     let mut imap = Conn::open(9992).await;

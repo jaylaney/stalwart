@@ -83,7 +83,8 @@ pub async fn test(
     imap_jane
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_equals("* LISTRIGHTS \"INBOX\" \"jdoe@example.com\" r l ws i et k x p a");
+        // 1.0 lists the METADATA annotation right `n` (RFC 5464 6).
+        .assert_equals("* LISTRIGHTS \"INBOX\" \"jdoe@example.com\" r l ws i et k x p n a");
 
     // Jane shares her Inbox to John, expect a Shared Folders item in John's list
     imap_jane.send("SETACL INBOX jdoe@example.com lr").await;

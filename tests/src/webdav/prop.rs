@@ -466,7 +466,9 @@ pub async fn test(test: &TestServer, assisted_discovery: bool) {
                             ]);
                         properties
                             .get(DavProperty::CardDav(CardDavProperty::SupportedCollationSet))
+                            // 1.0 also advertises i;octet.
                             .with_values([
+                                "B:supported-collation:i;octet",
                                 "B:supported-collation:i;unicode-casemap",
                                 "B:supported-collation:i;ascii-casemap",
                             ]);

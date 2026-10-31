@@ -18,7 +18,7 @@ use crate::{
     jmap::{
         files,
         mail::{
-            acl::assert_forbidden,
+            acl::{assert_account_not_found, assert_forbidden, assert_from_account_not_found},
             changes::{LogAction, ParseState},
             query::create as create_query_corpus,
             query_changes::QueryChanges,
@@ -1644,13 +1644,13 @@ pub async fn acl(test: &TestServer) {
         "Owned by john in inbox"
     );
     for (account, email) in [(jane, first("jane")), (sales, first("sales"))] {
-        assert_forbidden(
+        assert_account_not_found(
             john_client
                 .set_default_account_id(account.id_string())
                 .email_get(&email, [Property::Subject].into())
                 .await,
         );
-        assert_forbidden(
+        assert_account_not_found(
             john_client
                 .set_default_account_id(account.id_string())
                 .mailbox_get(&inbox_id, None::<Vec<_>>)
@@ -1672,13 +1672,13 @@ pub async fn acl(test: &TestServer) {
             "Jane's grant on her INBOX",
         );
     }
-    assert_forbidden(
+    assert_account_not_found(
         john_client
             .set_default_account_id(jane.id_string())
             .email_get(&first("jane"), [Property::Subject].into())
             .await,
     );
-    assert_forbidden(
+    assert_account_not_found(
         john_client
             .set_default_account_id(jane.id_string())
             .email_changes("n", None)
@@ -1695,7 +1695,7 @@ pub async fn acl(test: &TestServer) {
         .unwrap()
         .unwrap()
         .take_blob_id();
-    assert_forbidden(
+    assert_from_account_not_found(
         john_client
             .set_default_account_id(john.id_string())
             .blob_copy(jane.id_string(), &blob_id)
@@ -1728,12 +1728,14 @@ pub async fn acl(test: &TestServer) {
             }),
         )
         .await;
+    // John has no access to Jane's account: 1.0 answers accountNotFound
+    // before the fork's refusal is reached.
     assert_eq!(reply.0["methodResponses"][0][0], "error", "{reply:?}");
     assert_eq!(
-        reply.0["methodResponses"][0][1]["type"], "forbidden",
+        reply.0["methodResponses"][0][1]["type"], "accountNotFound",
         "{reply:?}"
     );
-    assert_forbidden(
+    assert_account_not_found(
         john_client
             .set_default_account_id(jane.id_string())
             .email_copy(
@@ -2180,7 +2182,7 @@ pub async fn acl(test: &TestServer) {
         .mailbox_update_acl(&inbox_id, john.id_string(), [])
         .await
         .unwrap();
-    assert_forbidden(
+    assert_account_not_found(
         john_client
             .set_default_account_id(admin.id_string())
             .email_get(&first("admin"), [Property::Subject].into())
@@ -2289,7 +2291,7 @@ pub async fn acl(test: &TestServer) {
             "Created by john in sales"
         );
     }
-    assert_forbidden(
+    assert_account_not_found(
         bill_client
             .set_default_account_id(sales.id_string())
             .email_get(&email_id, [Property::Subject].into())
@@ -2306,7 +2308,7 @@ pub async fn acl(test: &TestServer) {
             }),
         )
         .await;
-    assert_forbidden(
+    assert_account_not_found(
         john_client
             .set_default_account_id(sales.id_string())
             .email_get(&email_id, [Property::Subject].into())

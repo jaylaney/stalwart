@@ -713,7 +713,8 @@ pub async fn acl(imap_john: &mut ImapConnection, test: &TestServer) {
     imap_jane
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_equals("* LISTRIGHTS \"INBOX\" \"jdoe@example.com\" r l ws i et k x p a");
+        // 1.0 lists the METADATA annotation right `n` (RFC 5464 6).
+        .assert_equals("* LISTRIGHTS \"INBOX\" \"jdoe@example.com\" r l ws i et k x p n a");
 
     // Jane's grants on her own INBOX are refused, so nothing is shared
     assert_noperm(&mut imap_jane, "SETACL INBOX jdoe@example.com lr").await;
