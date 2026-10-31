@@ -650,8 +650,9 @@ outside `za_tests`.
   of its own: the tier is built once in `Caches::parse` and `cache/reload.rs` does not
   rebuild it, so the za suite's server cannot switch to it (Jay's decision, 2026-10-30). The
   suite boots its own `TestServer` with `cache.swap` set to `LocalFile` under its temporary
-  directory, then another set to `BlobStore` with `BLOB_STORE=FileSystem`, and runs both
-  cases on each. Exercise file and blob snapshots with
+  directory, then another set to `BlobStore` on the default blob store (1.0.1 refuses a
+  filesystem blob store for that tier, so `BLOB_STORE=FileSystem` would stop the server at
+  boot: Task 6's ruling 68), and runs both cases on each. Exercise file and blob snapshots with
   cache eviction, fresh loads, provisioning/revocation races and process-independent decode.
   Scan decoded frames/archives as well as raw files; compression is not a privacy control.
 - [ ] Trace all snapshot population, serialization, load and invalidation inputs. Prevent
@@ -1035,4 +1036,5 @@ Changes made from what Task 1 measured. The
 | `account_batch` splits a pass into commit chunks, with the `Document` keys last | R58 is asserted in every chunk; R62's guard and R63 retire only once Task 6 confirms the per-partition ordering; R62's term scans stay. Design "Indexing"; Task 6. |
 | `jmap` depends on `services`; no task checked `http`, `managesieve` or `spam-filter` | The crate checks are reordered, and a failure goes back to the file's owner. "File ownership and dependencies". |
 | `scim_tests`'s entry function is in the SEL-only `tests/src/scim/mod.rs`, so it can't keep compiling | It takes the SEL-only disposition with its three dual-licensed siblings (Task 2's ruling 38). Design Decision 1. |
+| 1.0.1 refuses a filesystem blob store for the swap tier's `BlobStore` setting | `cache_swap_tests` runs that tier on the default blob store (Task 6's ruling 68). Design "Cache snapshots"; Tasks 6 and 8. |
 | Further corrections to cited paths, lines and signatures, and decisions on the shared interfaces | The outcome note's interface sheet and Task 1's rulings 9–33 amend Tasks 2–7. Where they correct a cite in this plan or the design, they win, and each task's brief carries them. |

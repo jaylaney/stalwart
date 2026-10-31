@@ -458,7 +458,7 @@ stale loaders racing provisioning and revocation.
   upstream and the baseline.
 - The swap tests are a suite function of their own (Jay's decision, 2026-10-30):
   `za::cache_swap::cache_swap_tests` boots a server with `LocalFile` under its temporary
-  directory, then a second one with `BlobStore` on a filesystem blob store, each with
+  directory, then a second one with `BlobStore` on the default blob store (1.0.1 refuses a filesystem blob store for that tier; Task 6's ruling 68), each with
   `cache.swap` set in its bootstrap. It hands `Caches::parse`'s receiver to
   `SwapTier::start`, as boot does. CI runs it as its own step.
 - Redis and cluster operation remain unqualified. The central serialization and authority
