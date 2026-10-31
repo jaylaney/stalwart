@@ -18,9 +18,10 @@ use common::{
     auth::vault::{ZaMark, za_normalize_address},
     cache::invalidate::CacheInvalidationBuilder,
     ipc::CacheInvalidation,
+    storage::dav::canonical_path_segment,
 };
 use groupware::{
-    DavResourceName, RFC_3986,
+    DavResourceName,
     calendar::{
         Calendar, SCHEDULE_INBOX_ID, SCHEDULE_OUTBOX_ID,
         seal::{COLLECTION_MARKER, SealError, calendar_view_in_domain, seal_error},
@@ -37,7 +38,6 @@ use groupware::{
             resolve::{ZaCalendarError, za_calendar_context, za_owned_calendar_context},
         },
     },
-    encode_path_segment,
 };
 use http_proto::{HttpResponse, HttpSessionData};
 use registry::{
@@ -183,10 +183,11 @@ async fn grant_pin_inner(
 async fn calendar_id(server: &Server, owner: u32, slug: &str) -> trc::Result<Option<u32>> {
     let mut found = None;
     server
-        .all_archives(
+        .archives(
             owner,
             Collection::Calendar,
-            Field::ARCHIVE.into(),
+            Field::ARCHIVE,
+            &(),
             |id, stored| {
                 if id != SCHEDULE_INBOX_ID
                     && id != SCHEDULE_OUTBOX_ID
@@ -194,7 +195,7 @@ async fn calendar_id(server: &Server, owner: u32, slug: &str) -> trc::Result<Opt
                 {
                     found = Some(id);
                 }
-                Ok(())
+                Ok(true)
             },
         )
         .await?;
@@ -415,15 +416,16 @@ pub(super) async fn za_shares(
     let pins = server.za_pin_read(&verified.keys).await?;
     let mut ids = Vec::new();
     server
-        .all_archives(
+        .archives(
             verified.account_id,
             Collection::Calendar,
-            Field::ARCHIVE.into(),
+            Field::ARCHIVE,
+            &(),
             |id, _| {
                 if id != SCHEDULE_INBOX_ID && id != SCHEDULE_OUTBOX_ID {
                     ids.push(id);
                 }
-                Ok(())
+                Ok(true)
             },
         )
         .await?;
@@ -508,10 +510,11 @@ pub(super) async fn za_shares(
         let owner_name = server.account(owner).await?.name().to_string();
         let mut candidates = Vec::new();
         server
-            .all_archives(
+            .archives(
                 owner,
                 Collection::Calendar,
-                Field::ARCHIVE.into(),
+                Field::ARCHIVE,
+                &(),
                 |id, stored| {
                     let cal = stored.deserialize::<Calendar>()?;
                     if let Some(level) = cal
@@ -522,7 +525,7 @@ pub(super) async fn za_shares(
                     {
                         candidates.push((id, cal.name, level));
                     }
-                    Ok(())
+                    Ok(true)
                 },
             )
             .await?;
@@ -560,11 +563,12 @@ pub(super) async fn za_shares(
                 Err(ZaCalendarError::Forbidden) | Ok(None) => continue,
                 Err(error) => return Err(error.into_store_error(owner, id)),
             };
+            // The calendar's DAV href as 1.0's resource cache formats it
+            // (inventory finding 6: `canonical_path_segment`).
             let href = format!(
-                "{}/{}/{}/",
-                DavResourceName::Cal.base_path(),
-                percent_encoding::utf8_percent_encode(&owner_name, RFC_3986),
-                encode_path_segment(&slug)
+                "{}{}/",
+                DavResourceName::Cal.account_base_path(&owner_name),
+                canonical_path_segment(&slug)
             );
             shared.push(object!({"owner":owner_name,"calendar":slug,"href":href,"name":name,"level":level.as_str()}));
         }
