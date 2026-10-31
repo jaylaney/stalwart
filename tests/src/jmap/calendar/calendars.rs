@@ -58,7 +58,10 @@ pub async fn test(test: &TestServer) {
     );
     let change_id = response.state();
 
-    // Create Calendar
+    // Create Calendar. 1.0 requires default alert ids to be unique across all
+    // of an account's alert sets ("Default alert ids must be unique across all
+    // calendars in the account."), so the timeless alerts use ids 2 and 3
+    // where 0.16's fixture reused 0 and 1.
     let calendar_id = account
         .jmap_create(
             MethodObject::Calendar,
@@ -88,14 +91,14 @@ pub async fn test(test: &TestServer) {
                     }
                 },
                 "defaultAlertsWithoutTime": {
-                    "0": {
+                    "2": {
                         "action": "display",
                         "trigger": {
                             "relativeTo": "start",
                             "offset": "P1D"
                         }
                     },
-                    "1": {
+                    "3": {
                         "action": "email",
                         "trigger": {
                             "relativeTo": "end",
@@ -174,7 +177,7 @@ pub async fn test(test: &TestServer) {
             }
         },
         "defaultAlertsWithoutTime": {
-            "0": {
+            "2": {
                 "@type": "Alert",
                 "action": "display",
                 "trigger": {
@@ -183,7 +186,7 @@ pub async fn test(test: &TestServer) {
                     "offset": "P1D"
                 }
             },
-            "1": {
+            "3": {
                 "@type": "Alert",
                 "action": "email",
                 "trigger": {
@@ -220,15 +223,15 @@ pub async fn test(test: &TestServer) {
                             }
                         }
                     },
-                    "defaultAlertsWithoutTime/0": {
+                    "defaultAlertsWithoutTime/2": {
                         "action": "email",
                         "trigger": {
                             "relativeTo": "start",
                             "offset": "P3D"
                         }
                     },
-                    "defaultAlertsWithoutTime/1": null,
-                    "defaultAlertsWithoutTime/2": {
+                    "defaultAlertsWithoutTime/3": null,
+                    "defaultAlertsWithoutTime/4": {
                         "action": "display",
                         "trigger": {
                             "relativeTo": "end",
@@ -286,7 +289,7 @@ pub async fn test(test: &TestServer) {
             }
         },
         "defaultAlertsWithoutTime": {
-            "0": {
+            "2": {
                 "@type": "Alert",
                 "action": "email",
                 "trigger": {
@@ -295,7 +298,7 @@ pub async fn test(test: &TestServer) {
                     "offset": "P3D"
                 }
             },
-            "2": {
+            "4": {
                 "@type": "Alert",
                 "action": "display",
                 "trigger": {
