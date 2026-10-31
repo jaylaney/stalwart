@@ -25,11 +25,16 @@ use crate::{
         server::TestServer,
         smtp::SmtpConnection,
         za::{
-            Conn, HookParked, hold_task_consumer, plant_event, wait_for_delivery, za_post_as,
-            za_setup, za_setup_token,
+            Conn, HookParked, delete_event_records, hold_index_partition, index_search_documents,
+            internal_search, partition_status, plant_event, queue_entries, release_index_partition,
+            search_keys, stored_event, unindex_search_account, unindex_search_documents,
+            wait_for_delivery, wait_for_index_queue, write_stored_event, za_post_as, za_setup,
+            za_setup_token,
         },
     },
-    za::{STRONG, raw_input::SUBMISSION_PORT, user_permissions},
+    za::{
+        STRONG, index_task::emulate_superseding_node, raw_input::SUBMISSION_PORT, user_permissions,
+    },
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use calcard::common::timezone::Tz;
@@ -52,12 +57,9 @@ use email::{
         },
     },
 };
-use groupware::{
-    DestroyArchive,
-    calendar::{
-        CalendarEvent, CalendarEventData,
-        seal::{WRAP_MK, WRAP_PK},
-    },
+use groupware::calendar::{
+    CalendarEventData,
+    seal::{WRAP_MK, WRAP_PK},
 };
 use mail_parser::MessageParser;
 use nlp::language::Language;
@@ -75,17 +77,13 @@ use registry::{
 use serde_json::json;
 use std::time::{Duration, Instant};
 use store::{
-    Deserialize, IterateParams, SUBSPACE_SEARCH_INDEX, U32_LEN, U64_LEN, ValueKey,
+    Deserialize, IterateParams, U32_LEN, U64_LEN, ValueKey,
     registry::write::{RegistryWrite, RegistryWriteResult},
     roaring::RoaringBitmap,
-    search::{
-        CalendarSearchField, EmailSearchField, IndexDocument, SearchField, SearchFilter,
-        SearchQuery,
-    },
+    search::{CalendarSearchField, EmailSearchField, IndexDocument},
     write::{
-        AlignedBytes, AnyKey, Archive, BatchBuilder, BlobLink, BlobOp, SearchIndex,
-        SearchIndexClass, SearchIndexId, SearchIndexType, TaskQueueClass, ValueClass,
-        key::DeserializeBigEndian, now, serialize::RawValue,
+        BatchBuilder, BlobLink, BlobOp, SearchIndex, SearchIndexClass, TaskId, TaskQueueClass,
+        ValueClass, key::DeserializeBigEndian, now, serialize::RawValue,
     },
 };
 use trc::{EventType, Key, SecurityEvent, StoreEvent};
@@ -153,34 +151,23 @@ const CHUNKED: &str = "keymail23@example.com";
 const CHUNKED_EVENT: &str = "keymail24@example.com";
 /// `superseded_index_tail_loses_to_provisioning`'s account (ruling R62).
 const SUPERSEDED_TAIL: &str = "keymail25@example.com";
-/// Its ordinary control, whose multi-chunk index write passes the guard.
+/// Its ordinary control, whose multi-chunk index write passes the fence.
 const SUPERSEDED_TAIL_CONTROL: &str = "plainmail18@example.com";
-/// `failed_guard_with_its_document_stored_defers_the_task`'s account, an
-/// ordinary one (ruling R63).
-const GUARD_FAILED: &str = "plainmail19@example.com";
+/// `plainmail19`, `plainmail21` and `plainmail22` belonged to the R63 cases
+/// retired at 1.0 (part 6d); they stay unallocated.
 /// `unindex_between_calendar_merge_chunks_leaves_no_terms`'s account
 /// (ruling R63).
 const MERGE_UNINDEXED: &str = "keymail26@example.com";
 /// `multi_chunk_calendar_merge_is_written_whole`'s account, an ordinary one
 /// (ruling R63).
 const MERGE_CONTROL: &str = "plainmail20@example.com";
-/// `stopped_document_leaves_its_batch_written`'s account whose document
-/// stops (ruling R63).
-const BATCH_STOPPED: &str = "plainmail21@example.com";
-/// The account of that batch's other document, which the pause does not
-/// park.
-const BATCH_OTHER: &str = "plainmail22@example.com";
-/// Under the smallest deferral of an index task's failed first attempt:
-/// the default retry strategy (exponential backoff from a 60 s initial
-/// delay, a jitter factor from 0.5 to 1.5) defers it by at least 30 s from
-/// the whole second of the failure, so by more than 29 s.
-const UNDER_THE_DEFERRAL: Duration = Duration::from_secs(15);
 /// The token the merge tests' updated DESCRIPTION ends with: 13 bytes, so
 /// stored verbatim, and new to the event.
 const MERGE_CANARY: &str = "zzmergecanary";
 /// The token `large_body` ends with: 12 bytes, so stored verbatim in its
-/// `Term` key (`CheekyHash`), and longer than the body's five-byte tokens,
-/// so written in a later commit chunk than the first.
+/// `Term` key (`CheekyHash`), and written after the body's `c`-tokens, in
+/// the pass's last commit chunk: 1.0 writes an account's term merges in key
+/// order (`account_term_key_order`).
 const TAIL_CANARY: &str = "zztailcanary";
 /// `grouped_ingest_provisioning_wins_before_flush`'s account (Task 5 of the
 /// 1.0 upgrade).
@@ -253,11 +240,11 @@ pub async fn test(test: &mut TestServer) {
     let chunked_event = unindex_between_calendar_index_chunks_leaves_no_terms(test, &admin).await;
     let (superseded_tail, superseded_tail_control) =
         superseded_index_tail_loses_to_provisioning(test, &admin).await;
-    let guard_failed = failed_guard_with_its_document_stored_defers_the_task(test, &admin).await;
+    // Retired at 1.0 with R62's guard and R63's confirmation read (Task 1's
+    // ruling 19, part 6a): `failed_guard_with_its_document_stored_defers_the_task`
+    // and `stopped_document_leaves_its_batch_written`.
     let merge_unindexed = unindex_between_calendar_merge_chunks_leaves_no_terms(test, &admin).await;
     let merge_control = multi_chunk_calendar_merge_is_written_whole(test, &admin).await;
-    let (batch_stopped, batch_other) =
-        stopped_document_leaves_its_batch_written(test, &admin).await;
 
     // The accounts that log in empty their own mailboxes; the others are
     // pending or credentialless, and the account's destruction removes
@@ -314,11 +301,8 @@ pub async fn test(test: &mut TestServer) {
         chunked_event,
         superseded_tail,
         superseded_tail_control,
-        guard_failed,
         merge_unindexed,
         merge_control,
-        batch_stopped,
-        batch_other,
     ] {
         admin.destroy_account(account).await;
     }
@@ -1705,11 +1689,13 @@ async fn metadata_archive(test: &TestServer, account_id: u32, document_id: u32) 
 }
 
 /// Ruling R46 of plan 13 (review F1): destroying a message removes its
-/// `MessageData` (field 50) at once and leaves its plaintext metadata
-/// archive (field 71), blob link and search document to the scheduled
-/// unindex task. While that task has not run, issuance answers the same 409
-/// as for mail present (spec 6.6's "empty the mailbox, then provision"); it
-/// succeeds once the task has run.
+/// `MessageData` (field 50) at once and leaves its plaintext metadata row
+/// (field 71), blob link and search document to its unindex, which 1.0's
+/// index queue runs (`delete_email_metadata`). While that has not run,
+/// issuance answers the same 409 as for mail present (spec 6.6's "empty the
+/// mailbox, then provision"); it succeeds once it has run. The account's
+/// Email partition is held (`hold_index_partition`: 0.16 held the task
+/// consumer, which does not hold 1.0's index queue).
 async fn setup_refuses_a_pending_unindex(test: &TestServer, admin: &Account) -> Account {
     println!("setup_refuses_a_pending_unindex");
     let account = passwordless(admin, PENDING_UNINDEX).await;
@@ -1724,10 +1710,10 @@ async fn setup_refuses_a_pending_unindex(test: &TestServer, admin: &Account) -> 
     let ids = message_ids(test, id).await;
     assert_eq!(ids.len(), 1, "{ids:?}");
 
-    let held = hold_task_consumer(test).await;
+    hold_index_partition(test, SearchIndex::Email, id).await;
     admin.destroy_all_mailboxes_for_account(id).await;
-    // The window: the message's `MessageData` is gone, its metadata archive
-    // is not.
+    // The window: the message's `MessageData` is gone, its metadata row is
+    // not, and its unindex entry is queued.
     assert!(
         !test
             .server
@@ -1738,16 +1724,19 @@ async fn setup_refuses_a_pending_unindex(test: &TestServer, admin: &Account) -> 
     );
     assert!(
         metadata_archive(test, id, ids[0]).await.is_some(),
-        "the metadata archive was removed before the unindex task ran"
+        "the metadata row was removed before the unindex ran"
+    );
+    assert!(
+        queue_entries(test, id)
+            .await
+            .iter()
+            .any(|entry| entry.document_id == ids[0] && !entry.insert),
+        "the destroy queued no unindex"
     );
     // Ruling R51 would refuse on the message's search document too: it is
-    // removed here, ahead of the held unindex task, so field 71 alone
-    // carries the refusal (R46's pin on the internal search store).
-    let mut query = SearchQuery::new(SearchIndex::Email);
-    query
-        .add_filter(SearchFilter::eq(SearchField::AccountId, id))
-        .add_filter(SearchFilter::eq(SearchField::DocumentId, ids[0]));
-    test.server.search_store().unindex(query).await.unwrap();
+    // removed here, ahead of the held unindex, so field 71 alone carries the
+    // refusal (R46's pin on the internal search store).
+    unindex_search_documents(test, SearchIndex::Email, id, vec![ids[0]]).await;
     assert!(
         !test.server.za_has_email_search_documents(id).await.unwrap(),
         "the message's search document is still stored"
@@ -1756,18 +1745,18 @@ async fn setup_refuses_a_pending_unindex(test: &TestServer, admin: &Account) -> 
     assert_eq!(
         reply.expect(409)["error"],
         "account already holds mail",
-        "issuance while the destroyed message's metadata archive is stored"
+        "issuance while the destroyed message's metadata row is stored"
     );
     assert!(
         test.server.za_vault_record(id).await.unwrap().is_none(),
         "the refused issuance wrote a record"
     );
 
-    drop(held);
+    release_index_partition(&test.server, SearchIndex::Email, id).await;
     test.wait_for_tasks().await;
     assert!(
         metadata_archive(test, id, ids[0]).await.is_none(),
-        "the unindex task left the metadata archive"
+        "the unindex left the metadata row"
     );
     za_setup_token(admin, PENDING_UNINDEX).await;
     account
@@ -1806,7 +1795,7 @@ async fn setup_refuses_spam_samples(test: &TestServer, admin: &Account) -> Accou
 
     admin.destroy_all_mailboxes_for_account(id).await;
     test.wait_for_tasks().await;
-    // Only the sample is left: no message, no metadata archive.
+    // Only the sample is left: no message, no metadata row.
     assert!(
         !test
             .server
@@ -1841,22 +1830,16 @@ async fn setup_refuses_spam_samples(test: &TestServer, admin: &Account) -> Accou
     account
 }
 
-/// Ruling R51 of plan 13 (re-review N1): the unindex task deletes a
-/// message's search document in a write after the one that clears its
-/// metadata archive, and that write can fail or be skipped, leaving an
-/// Email search document that outlived its message. Issuance is refused
-/// while the internal search store holds one for the account (planted here
-/// through the search store, with no Email archive and no metadata archive)
-/// and succeeds once it is removed.
+/// Ruling R51 of plan 13 (re-review N1): an Email search document can
+/// outlive its message (a deletion that failed or was skipped after the
+/// metadata row was cleared). Issuance is refused while the internal search
+/// store holds one for the account (planted here through the store's index
+/// pass, with no Email archive and no metadata row) and succeeds once it is
+/// removed.
 async fn setup_refuses_an_orphaned_search_document(test: &TestServer, admin: &Account) -> Account {
     println!("setup_refuses_an_orphaned_search_document");
     let account = passwordless(admin, ORPHANED).await;
     let id = account.id().document_id();
-    let search = test.server.search_store();
-    assert!(
-        search.internal_fts().is_some(),
-        "the suite runs on the internal search store"
-    );
     let mut document = IndexDocument::new(SearchIndex::Email)
         .with_account_id(id)
         .with_document_id(0);
@@ -1865,8 +1848,7 @@ async fn setup_refuses_an_orphaned_search_document(test: &TestServer, admin: &Ac
         "orphaned search document",
         Language::English,
     );
-    document.index_unsigned(EmailSearchField::ReceivedAt, now());
-    search.index(vec![document]).await.unwrap();
+    index_search_documents(test, SearchIndex::Email, id, vec![document]).await;
     assert!(
         !test
             .server
@@ -1892,19 +1874,21 @@ async fn setup_refuses_an_orphaned_search_document(test: &TestServer, admin: &Ac
         "the refused issuance wrote a record"
     );
 
-    let mut query = SearchQuery::new(SearchIndex::Email);
-    query
-        .add_filter(SearchFilter::eq(SearchField::AccountId, id))
-        .add_filter(SearchFilter::eq(SearchField::DocumentId, 0u32));
-    search.unindex(query).await.unwrap();
+    unindex_search_documents(test, SearchIndex::Email, id, vec![0]).await;
     za_setup_token(admin, ORPHANED).await;
     account
 }
 
-/// The task records of `account_id` that ruling R54 counts (index, unindex,
-/// thread merge, iTIP), in queue order.
+/// The task records of `account_id` that ruling R54 counts in the task
+/// queue at 1.0 (thread merge, iTIP, share-revocation cleanup), in queue
+/// order. Index work is no longer a task: its queue entries are read by
+/// `queue_entries`.
 async fn account_tasks(test: &TestServer, account_id: u32) -> Vec<Task> {
-    let key = |id| ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task { id }));
+    let key = |id| {
+        ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task {
+            id: TaskId::Assigned(id),
+        }))
+    };
     let mut tasks = Vec::new();
     test.server
         .store()
@@ -1913,11 +1897,9 @@ async fn account_tasks(test: &TestServer, account_id: u32) -> Vec<Task> {
             |_, value| {
                 let task = Task::deserialize(value)?;
                 let owner = match &task {
-                    Task::IndexDocument(task) | Task::UnindexDocument(task) => {
-                        Some(task.account_id)
-                    }
                     Task::MergeThreads(task) => Some(task.account_id),
                     Task::CalendarItipMessage(task) => Some(task.account_id),
+                    Task::ShareRevokeCleanup(task) => Some(task.account_id),
                     _ => None,
                 };
                 if owner.is_some_and(|owner| owner.document_id() == account_id) {
@@ -1931,20 +1913,26 @@ async fn account_tasks(test: &TestServer, account_id: u32) -> Vec<Task> {
     tasks
 }
 
-/// Ruling R54 of plan 13 (PR #51 review 1, P2-1): the index worker builds an
-/// ordinary message's full document, then writes it; the message's unindex
-/// task runs in a worker of its own and can finish in between, so neither
-/// the metadata archive (R46) nor the search document (R51) is there when
-/// issuance checks, and the document lands afterwards. Issuance is refused
-/// while the index task's record is in the queue; once the document is
-/// written, R51's scan refuses on it; after it is removed, issuance succeeds.
+/// Ruling R54 of plan 13 at 1.0, and the index queue's ordering (Task 6,
+/// ruling 63): the 0.16 interleaving reproduced. At 0.16 the index worker
+/// built an ordinary message's full document and the message's unindex
+/// task, in a worker of its own, finished before the build was written, so
+/// the document landed afterwards with nothing to remove it. At 1.0 the
+/// build is parked (`INDEX_WRITE_PAUSE`, after the pass's documents are
+/// built and before the search store's write) and the message destroyed:
+/// its unindex entry is queued before the parked write runs, in the same
+/// partition, which one worker runs in order. While parked, issuance is
+/// refused (the message's row is stored until the unindex runs: R46). Once
+/// released, the stale document lands and the partition's next batch
+/// removes it: no late document survives, and issuance succeeds without any
+/// cleanup. If the reproduction orphaned the document, this case fails.
 async fn setup_refuses_an_in_flight_index_write(test: &TestServer, admin: &Account) -> Account {
     println!("setup_refuses_an_in_flight_index_write");
     test.wait_for_tasks().await;
     let account = passwordless(admin, IN_FLIGHT).await;
     let id = account.id().document_id();
     let message = message_with("in flight", "in-flight-body");
-    // The delivery commits; its index task builds the document and parks.
+    // The delivery commits; its index pass builds the document and parks.
     let parked = HookParked::start(id, test_hooks::set_index_write_pause, async move {
         SmtpConnection::connect()
             .await
@@ -1956,35 +1944,21 @@ async fn setup_refuses_an_in_flight_index_write(test: &TestServer, admin: &Accou
     assert_eq!(ids.len(), 1, "{ids:?}");
 
     admin.destroy_all_mailboxes_for_account(id).await;
-    // The unindex task runs and clears its record while the index task
-    // stays parked: only the index task's record is left.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let tasks = account_tasks(test, id).await;
-        if metadata_archive(test, id, ids[0]).await.is_none()
-            && matches!(tasks.as_slice(), [Task::IndexDocument(_)])
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the unindex task did not finish: {tasks:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
     assert!(
-        !test
-            .server
-            .za_has_documents(id, Collection::Email)
+        queue_entries(test, id)
             .await
-            .unwrap()
-            && !test.server.za_has_email_search_documents(id).await.unwrap(),
-        "the account still holds the message or its search document"
+            .iter()
+            .any(|entry| entry.document_id == ids[0] && !entry.insert),
+        "the unindex was not queued before the parked write"
+    );
+    assert!(
+        !test.server.za_has_email_search_documents(id).await.unwrap(),
+        "the parked write landed early"
     );
     let reply = za_post_as(admin, "setup-token", &json!({ "account": IN_FLIGHT })).await;
     assert_eq!(
         reply.expect(409)["error"],
-        "account has unfinished tasks",
+        "account already holds mail",
         "issuance while an index write of the account is in flight"
     );
     assert!(
@@ -1993,34 +1967,27 @@ async fn setup_refuses_an_in_flight_index_write(test: &TestServer, admin: &Accou
     );
 
     parked.finish().await;
-    test.wait_for_tasks().await;
+    wait_for_index_queue(test, id, Duration::from_secs(10)).await;
+    let keys = search_keys(test, id, SearchIndex::Email).await;
     assert!(
-        test.server.za_has_email_search_documents(id).await.unwrap(),
-        "the released index task wrote no document"
+        keys.is_empty(),
+        "the late index write outlived the message's unindex (the 0.16 interleaving orphaned it): {keys:?}"
     );
-    let reply = za_post_as(admin, "setup-token", &json!({ "account": IN_FLIGHT })).await;
-    assert_eq!(
-        reply.expect(409)["error"],
-        "account already holds mail",
-        "issuance while the late document is stored"
+    assert!(
+        metadata_archive(test, id, ids[0]).await.is_none(),
+        "the unindex left the metadata row"
     );
-    let mut query = SearchQuery::new(SearchIndex::Email);
-    query
-        .add_filter(SearchFilter::eq(SearchField::AccountId, id))
-        .add_filter(SearchFilter::eq(SearchField::DocumentId, ids[0]));
-    test.server.search_store().unindex(query).await.unwrap();
     za_setup_token(admin, IN_FLIGHT).await;
     account
 }
 
-/// Ruling R60 of plan 13 (PR #51 review 2, the adjacent gap): the calendar
-/// twin of `setup_refuses_an_in_flight_index_write`. An ordinary event's
-/// index task builds its full document (summary, description, location,
-/// participants) and parks; the event is deleted and its unindex task, in a
-/// worker of its own, finds nothing to delete. Issuance is refused while the
-/// index task's record is in the queue (R54); once the document is written
-/// and the task cleared, R51's scan, which covers calendar documents too,
-/// refuses on it; after it is removed, issuance succeeds.
+/// Ruling R60 of plan 13, at 1.0: the calendar twin of
+/// `setup_refuses_an_in_flight_index_write`. An ordinary event's index pass
+/// builds its full document (summary, description, location, participants)
+/// and parks; the event is deleted, which queues its unindex entry behind
+/// the parked pass. Issuance is refused while the entries are queued
+/// (R54's queue scan); once released, the late document lands and the
+/// partition's next batch removes it, and issuance succeeds.
 async fn setup_refuses_an_in_flight_calendar_index_write(
     test: &TestServer,
     admin: &Account,
@@ -2029,48 +1996,17 @@ async fn setup_refuses_an_in_flight_calendar_index_write(
     test.wait_for_tasks().await;
     let account = passwordless(admin, IN_FLIGHT_EVENT).await;
     let id = account.id().document_id();
-    // The event is planted while the consumer is held; released with the
-    // pause set, the consumer dispatches its index task, which builds the
-    // document and parks.
-    let held = hold_task_consumer(test).await;
+    // The event is planted while its partition is held; released with the
+    // pause set, the partition's pass builds the document and parks.
+    hold_index_partition(test, SearchIndex::Calendar, id).await;
     let event_id = plant_event(test, id, "default", "in-flight.ics", IN_FLIGHT_ICAL, None).await;
+    let server = test.server.clone();
     let parked = HookParked::start(id, test_hooks::set_index_write_pause, async move {
-        drop(held);
+        release_index_partition(&server, SearchIndex::Calendar, id).await;
     })
     .await;
 
-    // The event is deleted: an unindex task, which runs and clears its
-    // record while the index task stays parked.
-    let account_info = test.server.account_info(id).await.unwrap();
-    let archive = test
-        .server
-        .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
-            id,
-            Collection::CalendarEvent,
-            event_id,
-        ))
-        .await
-        .unwrap()
-        .expect("the event's archive");
-    let mut batch = BatchBuilder::new();
-    DestroyArchive(archive.to_unarchived::<CalendarEvent>().unwrap())
-        .delete_all(&account_info, id, event_id, false, &mut batch)
-        .unwrap();
-    test.server.commit_batch(batch).await.unwrap();
-    test.server.notify_task_queue();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let tasks = account_tasks(test, id).await;
-        if matches!(tasks.as_slice(), [Task::IndexDocument(_)]) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the unindex task did not finish: {tasks:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    delete_event_records(test, id, event_id).await;
     assert!(
         !test
             .server
@@ -2096,41 +2032,24 @@ async fn setup_refuses_an_in_flight_calendar_index_write(
     );
 
     parked.finish().await;
-    test.wait_for_tasks().await;
+    wait_for_index_queue(test, id, Duration::from_secs(10)).await;
+    let keys = search_keys(test, id, SearchIndex::Calendar).await;
     assert!(
-        test.server
-            .za_has_calendar_search_documents(id)
-            .await
-            .unwrap(),
-        "the released index task wrote no document"
+        keys.is_empty(),
+        "the late calendar index write outlived the event's unindex: {keys:?}"
     );
-    let reply = za_post_as(admin, "setup-token", &json!({ "account": IN_FLIGHT_EVENT })).await;
-    assert_eq!(
-        reply.expect(409)["error"],
-        "account already holds calendar data",
-        "issuance while the late calendar document is stored"
-    );
-    assert!(
-        test.server.za_vault_record(id).await.unwrap().is_none(),
-        "the refused issuance wrote a record"
-    );
-    let mut query = SearchQuery::new(SearchIndex::Calendar);
-    query
-        .add_filter(SearchFilter::eq(SearchField::AccountId, id))
-        .add_filter(SearchFilter::eq(SearchField::DocumentId, event_id));
-    test.server.search_store().unindex(query).await.unwrap();
     za_setup_token(admin, IN_FLIGHT_EVENT).await;
     account
 }
 
 /// Ruling R54 of plan 13 (PR #51 review 1, P2-3): an ordinary APPEND or JMAP
 /// create schedules a thread-merge task whose `thread_name` and
-/// `message_ids` are `CheekyHash` strings, which hold an input of up to 15
+/// `message_ids` are `CheekyHash` strings, which hold an input of up to 16
 /// bytes verbatim; a task that exhausted its retries is kept as failed and
 /// never runs again, and destroying the message leaves it. Issuance is
 /// refused while one of the account's is in the queue (planted here as
-/// failed, so the consumer never takes it) and succeeds once the operator
-/// destroys it through `x:Task/set`.
+/// failed, so the task manager never takes it) and succeeds once the
+/// operator destroys it through `x:Task/set`.
 async fn setup_refuses_a_failed_merge_task(test: &TestServer, admin: &Account) -> Account {
     println!("setup_refuses_a_failed_merge_task");
     let account = passwordless(admin, FAILED_MERGE).await;
@@ -2155,7 +2074,7 @@ async fn setup_refuses_a_failed_merge_task(test: &TestServer, admin: &Account) -
             }),
         }),
     );
-    test.server.store().write(batch.build_all()).await.unwrap();
+    test.server.store().write_batch(&mut batch).await.unwrap();
     assert_eq!(account_tasks(test, id).await.len(), 1, "the planted task");
 
     let reply = za_post_as(admin, "setup-token", &json!({ "account": FAILED_MERGE })).await;
@@ -2184,19 +2103,30 @@ async fn setup_refuses_a_failed_merge_task(test: &TestServer, admin: &Account) -
     account
 }
 
-/// Ruling R58 of plan 13 (PR #51 review 2, P2-6): an index worker (A) that
-/// built an ordinary message's full document and stalled past its task
-/// lease is superseded on a cluster by another node's execution (B), which
-/// finds the message gone and clears the task's record; R54 and R51 then
-/// pass, and the account is provisioned. When A resumes, the internal search
-/// store's write of its document asserts in its first commit chunk that the
-/// account holds no vault record, so nothing of it lands; A's update is
-/// dropped (its task record is gone) and nothing is rescheduled. B is
-/// simulated by clearing the task's `Due` and `Task` records, what its
-/// `Ignored` update clears; the harness has one task manager. An ordinary
-/// account's document passes the same fence (the control), and its task
-/// clearing shows that A's batch ended: the index worker runs one batch at a
-/// time.
+/// Waits (at most 10 s) until the account's partition in `index` is in
+/// retry (its status key set by a failed pass).
+async fn wait_for_retry_state(test: &TestServer, index: SearchIndex, account_id: u32) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while partition_status(test, index, account_id).await.is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the partition of account {account_id} did not enter its retry state"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Ruling R58 of plan 13 (PR #51 review 2, P2-6) at 1.0: an index pass (A)
+/// that built an ordinary message's full document and stalled past its
+/// partition lock is superseded on a cluster by another node's execution
+/// (B), which runs the message's unindex and clears the partition's entries;
+/// R46, R54 and R51 then pass and the account is provisioned. When A
+/// resumes, the vault-absence assertion its document carries, in every
+/// commit chunk of its pass (ruling 18), fails: nothing of it lands, and the
+/// partition enters its retry state, which one reset drains. B is simulated
+/// (`index_task::emulate_superseding_node`); the harness has one index
+/// manager. An ordinary account's document passes the same fence (the
+/// control).
 async fn superseded_index_write_loses_to_provisioning(
     test: &TestServer,
     admin: &Account,
@@ -2208,7 +2138,7 @@ async fn superseded_index_write_loses_to_provisioning(
     let control = passwordless(admin, SUPERSEDED_CONTROL).await;
     let control_id = control.id().document_id();
     let message = message_with("superseded", "superseded-body");
-    // A: the delivery commits; its index task classifies the account as
+    // A: the delivery commits; its index pass classifies the account as
     // ordinary, builds the full document and parks before the write.
     let parked = HookParked::start(id, test_hooks::set_index_write_pause, async move {
         SmtpConnection::connect()
@@ -2221,63 +2151,16 @@ async fn superseded_index_write_loses_to_provisioning(
     assert_eq!(ids.len(), 1, "{ids:?}");
 
     admin.destroy_all_mailboxes_for_account(id).await;
-    // The unindex task runs and clears its record while A stays parked.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let tasks = account_tasks(test, id).await;
-        if metadata_archive(test, id, ids[0]).await.is_none()
-            && matches!(tasks.as_slice(), [Task::IndexDocument(_)])
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the unindex task did not finish: {tasks:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    // B, after A's lease expired: its retries find no message, and its
-    // `Ignored` update clears the task's `Due` and `Task` records.
-    let mut records = Vec::new();
-    test.server
-        .store()
-        .iterate(
-            IterateParams::new(
-                ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task { id: 0 })),
-                ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task { id: u64::MAX })),
-            )
-            .ascending(),
-            |key, value| {
-                if let Task::IndexDocument(task) = Task::deserialize(value)?
-                    && task.account_id.document_id() == id
-                {
-                    let due = Task::IndexDocument(task).due_timestamp();
-                    records.push((key.deserialize_be_u64(U64_LEN)?, due));
-                }
-                Ok(true)
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(records.len(), 1, "A's task record: {records:?}");
-    let mut batch = BatchBuilder::new();
-    for (task_id, due) in records {
-        batch
-            .clear(ValueClass::TaskQueue(TaskQueueClass::Due {
-                id: task_id,
-                due,
-            }))
-            .clear(ValueClass::TaskQueue(TaskQueueClass::Task { id: task_id }));
-    }
-    test.server.store().write(batch.build_all()).await.unwrap();
+    // B, after A's lease expired.
+    emulate_superseding_node(test, id, &ids).await;
     assert!(
-        account_tasks(test, id).await.is_empty(),
-        "B's update left the task record"
+        queue_entries(test, id).await.is_empty()
+            && metadata_archive(test, id, ids[0]).await.is_none(),
+        "B's execution left an entry or the row"
     );
 
-    // Every term passes: no message, no metadata archive, no task, no
-    // sample, no search document.
+    // Every term passes: no message, no metadata row, no entry, no sample,
+    // no search key.
     let token = za_setup_token(admin, SUPERSEDED).await;
     za_setup(SUPERSEDED, &token, STRONG).await;
     assert_eq!(
@@ -2292,9 +2175,21 @@ async fn superseded_index_write_loses_to_provisioning(
         "setup did not complete"
     );
 
-    // A resumes and attempts its write; the control's index task runs after
-    // A's batch and its update.
+    // A resumes and attempts its write.
     parked.finish().await;
+    wait_for_retry_state(test, SearchIndex::Email, id).await;
+    assert!(
+        search_keys(test, id, SearchIndex::Email).await.is_empty(),
+        "the superseded write landed in the key account's index"
+    );
+    release_index_partition(&test.server, SearchIndex::Email, id).await;
+    wait_for_index_queue(test, id, Duration::from_secs(10)).await;
+    assert!(
+        search_keys(test, id, SearchIndex::Email).await.is_empty(),
+        "the reset's retry wrote into the key account's index"
+    );
+
+    // The control's document passes the fence.
     deliver(
         test,
         SENDER,
@@ -2302,7 +2197,6 @@ async fn superseded_index_write_loses_to_provisioning(
         &message_with("superseded control", "superseded-control-body"),
     )
     .await;
-    test.wait_for_tasks().await;
     assert!(
         test.server
             .za_has_email_search_documents(control_id)
@@ -2310,127 +2204,16 @@ async fn superseded_index_write_loses_to_provisioning(
             .unwrap(),
         "the control's document was not written"
     );
-    assert!(
-        !test.server.za_has_email_search_documents(id).await.unwrap(),
-        "the superseded write landed in the key account's index"
-    );
-    assert!(
-        account_tasks(test, id).await.is_empty(),
-        "the superseded execution was rescheduled"
-    );
 
     admin.destroy_all_mailboxes_for_account(control_id).await;
     (account, control)
 }
 
-/// The account's raw keys in one search index of the internal search store
-/// (`store/src/write/key.rs`): its `Document` keys, its `Term` keys and its
-/// `Index` keys, and each `Term` key's `CheekyHash` payload, which is the
-/// token itself for one of up to 15 bytes.
-#[derive(Default)]
-struct SearchKeys {
-    documents: usize,
-    terms: usize,
-    fields: usize,
-    term_payloads: Vec<Vec<u8>>,
-}
-
-impl SearchKeys {
-    fn is_empty(&self) -> bool {
-        self.documents == 0 && self.terms == 0 && self.fields == 0
-    }
-
-    fn holds_term(&self, token: &str) -> bool {
-        self.term_payloads
-            .iter()
-            .any(|payload| payload == token.as_bytes())
-    }
-}
-
-/// Counts only: the payloads of a large document would flood a failure.
-impl std::fmt::Debug for SearchKeys {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} document, {} term ({} canary) and {} field keys",
-            self.documents,
-            self.terms,
-            if self.holds_term(TAIL_CANARY) {
-                "with the"
-            } else {
-                "no"
-            },
-            self.fields
-        )
-    }
-}
-
-/// The keys of `account_id` in `index`, read raw from the search index
-/// subspace. Key layout: the class (the index code, Email 0 and Calendar 1,
-/// with the type in its top bits: `Term` 0, `Index` 0x40, `Document` 0x80),
-/// the account id (u32 BE), then for a `Term` key the payload, its length
-/// byte, the field and the document id (u32 BE).
-async fn search_keys(test: &TestServer, account_id: u32, index: SearchIndex) -> SearchKeys {
-    let store = test
-        .server
-        .search_store()
-        .internal_fts()
-        .expect("the suite runs on the internal search store");
-    let code = match index {
-        SearchIndex::Email => 0u8,
-        SearchIndex::Calendar => 1u8,
-        _ => panic!("no account keys are read for this index"),
-    };
-    let mut keys = SearchKeys::default();
-    for class in [code, code | 0x40, code | 0x80] {
-        let mut from = vec![class];
-        from.extend_from_slice(&account_id.to_be_bytes());
-        let mut to = from.clone();
-        to.extend_from_slice(&[u8::MAX; 64]);
-        let mut found: Vec<Vec<u8>> = Vec::new();
-        store
-            .iterate(
-                IterateParams::new(
-                    AnyKey {
-                        subspace: SUBSPACE_SEARCH_INDEX,
-                        key: from,
-                    },
-                    AnyKey {
-                        subspace: SUBSPACE_SEARCH_INDEX,
-                        key: to,
-                    },
-                )
-                .no_values(),
-                |key, _| {
-                    found.push(key.to_vec());
-                    Ok(true)
-                },
-            )
-            .await
-            .unwrap();
-        match class & 0xC0 {
-            0x00 => {
-                keys.terms += found.len();
-                keys.term_payloads
-                    .extend(found.into_iter().filter_map(|key| {
-                        key.get(1 + U32_LEN..key.len().checked_sub(2 + U32_LEN)?)
-                            .map(<[u8]>::to_vec)
-                    }));
-            }
-            0x40 => keys.fields += found.len(),
-            _ => keys.documents += found.len(),
-        }
-    }
-    keys
-}
-
 /// 2,400 distinct five-byte tokens (`c0000` to `c2399`, 16 to a line) and
-/// then `canary`: with the headers indexed in test mode, about 2,500 index
-/// operations, so three commit chunks (`BatchBuilder::commit_point` splits
-/// above 1,000). `write_index` writes the terms in `CheekyHash` order, by
-/// length first, so a canary longer than five bytes lands in a later chunk
-/// than the first, and the `Index` keys (the subject and the addresses) in
-/// the last.
+/// then `canary`: about 2,400 term merges, so the pass splits after every
+/// 1,000 (`build_batch`'s `add_commit_point`) into three commit chunks, its
+/// `Document` key in the last. Terms are written in key order, so a canary
+/// that starts with `zz` lands in the last chunk.
 fn large_body(canary: &str) -> String {
     let mut body = String::new();
     for line in 0..150 {
@@ -2445,9 +2228,8 @@ fn large_body(canary: &str) -> String {
 }
 
 /// `unindex_between_calendar_index_chunks_leaves_no_terms`'s event: no
-/// alarm, no organizer (so its only tasks are its index and unindex
-/// tasks), and a DESCRIPTION of `large_body`'s tokens and the canary,
-/// folded at 70 octets.
+/// alarm, no organizer (so its only work is its index and unindex), and a
+/// DESCRIPTION of `large_body`'s tokens and the canary, folded at 70 octets.
 fn chunked_ical() -> String {
     event_ical(
         "chunked-event@example.com",
@@ -2456,7 +2238,7 @@ fn chunked_ical() -> String {
 }
 
 /// An event with `uid` and `description`, folded at 70 octets: no alarm,
-/// no organizer, so its only tasks are its index and unindex tasks.
+/// no organizer, so its only work is its index and unindex.
 fn event_ical(uid: &str, description: &str) -> String {
     let description = format!("DESCRIPTION:{description}");
     let folded = description
@@ -2481,58 +2263,25 @@ fn event_ical(uid: &str, description: &str) -> String {
     )
 }
 
-/// Waits (at most 10 s) until the account's unindex task has run and
-/// cleared its record while its index task stays parked: the message's
-/// metadata archive is gone, when `message_id` names one, and only the
-/// index task's record is left.
-async fn wait_for_the_unindex(test: &TestServer, account_id: u32, message_id: Option<u32>) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let tasks = account_tasks(test, account_id).await;
-        let unindexed = match message_id {
-            Some(message_id) => metadata_archive(test, account_id, message_id)
-                .await
-                .is_none(),
-            None => true,
-        };
-        if unindexed && matches!(tasks.as_slice(), [Task::IndexDocument(_)]) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the unindex task did not finish: {tasks:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-/// Indexes `document` for the account straight into the search store, then
-/// clears its `Document` key, leaving the `Term` and `Index` keys it wrote
-/// unlisted: the shape of an orphaned tail, of a calendar merge that lost
-/// its clears and of an Email re-index whose terms changed.
+/// Indexes `document` for the account straight into the internal search
+/// store, then clears its `Document` key, leaving the terms it wrote
+/// unlisted: the shape of a tail written after its document's unindex, of a
+/// calendar merge that lost its clears, and of the lost-lease residual
+/// (part 6a).
 async fn plant_orphaned_keys(
     test: &TestServer,
     account_id: u32,
     index: SearchIndex,
     document: IndexDocument,
 ) {
-    let search = test.server.search_store();
-    search.index(vec![document]).await.unwrap();
+    index_search_documents(test, index, account_id, vec![document]).await;
     let mut batch = BatchBuilder::new();
-    batch.clear(ValueClass::SearchIndex(SearchIndexClass {
+    batch.clear(ValueClass::SearchIndex(SearchIndexClass::Document {
         index,
-        id: SearchIndexId::Account {
-            account_id,
-            document_id: 0,
-        },
-        typ: SearchIndexType::Document,
+        account_id,
+        document_id: 0,
     }));
-    search
-        .internal_fts()
-        .expect("the suite runs on the internal search store")
-        .write(batch.build_all())
-        .await
-        .unwrap();
+    internal_search(test).write_batch(&mut batch).await.unwrap();
 }
 
 /// `setup-token` for the account `name` (id `id`) answers 409 with
@@ -2552,27 +2301,22 @@ async fn assert_refused(
     );
 }
 
-/// Ruling R62 of plan 13 (PR #51 review 3, P2-8): a search document's
-/// `Term` and `Index` keys can outlive its `Document` key (a later chunk
-/// written before R62's guard, a calendar merge that lost its clears, an
-/// Email re-index whose terms changed), and R51's and R60's scans read the
-/// `Document` keys only. Issuance is refused while the internal search
-/// store holds any `Term` or `Index` key of the account in the Email index
-/// (as for mail) or the Calendar index (as for calendar data); each case is
-/// planted alone, and issuance succeeds once the account-wide unindex has
-/// removed the keys. Neither scan reads the other index's keys or another
-/// account's (ruling R63).
+/// Ruling R62 of plan 13 (PR #51 review 3, P2-8), kept at 1.0 (Task 1's
+/// ruling 19): a search document's terms can outlive its `Document` key
+/// (the lost-lease residual, a calendar merge that lost its clears), and
+/// R51's and R60's scans read the `Document` keys only. Issuance is refused
+/// while the internal search store holds any term of the account in the
+/// Email index (as for mail) or the Calendar index (as for calendar data);
+/// each case is planted alone, and issuance succeeds once the account-wide
+/// unindex has removed the keys. Neither scan reads the other index's keys
+/// or another account's. 1.0 has no separate `Index` keys (0.16's
+/// "ReceivedAt alone" case): every field is a term.
 async fn setup_refuses_orphaned_search_terms(test: &TestServer, admin: &Account) -> Account {
     println!("setup_refuses_orphaned_search_terms");
     let account = passwordless(admin, ORPHANED_TERMS).await;
     let id = account.id().document_id();
-    let search = test.server.search_store();
-    assert!(
-        search.internal_fts().is_some(),
-        "the suite runs on the internal search store"
-    );
 
-    // Email `Term` keys only: Body is a text field, not an indexed one.
+    // Email terms only.
     let mut document = IndexDocument::new(SearchIndex::Email)
         .with_account_id(id)
         .with_document_id(0);
@@ -2580,7 +2324,7 @@ async fn setup_refuses_orphaned_search_terms(test: &TestServer, admin: &Account)
     plant_orphaned_keys(test, id, SearchIndex::Email, document).await;
     let keys = search_keys(test, id, SearchIndex::Email).await;
     assert!(
-        keys.documents == 0 && keys.terms > 0 && keys.fields == 0,
+        keys.documents.is_empty() && keys.terms > 0,
         "Email terms alone were not planted: {keys:?}"
     );
     assert!(
@@ -2597,49 +2341,13 @@ async fn setup_refuses_orphaned_search_terms(test: &TestServer, admin: &Account)
         "an orphaned Email term of the account is stored",
     )
     .await;
-    search
-        .unindex(SearchQuery::new(SearchIndex::Email).with_account_id(id))
-        .await
-        .unwrap();
+    unindex_search_account(test, SearchIndex::Email, id).await;
     assert!(
         !test.server.za_has_email_search_terms(id).await.unwrap(),
         "the account-wide unindex left Email terms"
     );
 
-    // An Email `Index` key only: ReceivedAt is indexed and not text.
-    let mut document = IndexDocument::new(SearchIndex::Email)
-        .with_account_id(id)
-        .with_document_id(0);
-    document.index_unsigned(EmailSearchField::ReceivedAt, now());
-    plant_orphaned_keys(test, id, SearchIndex::Email, document).await;
-    let keys = search_keys(test, id, SearchIndex::Email).await;
-    assert!(
-        keys.documents == 0 && keys.terms == 0 && keys.fields == 1,
-        "an Email field alone was not planted: {keys:?}"
-    );
-    assert!(
-        test.server.za_has_email_search_terms(id).await.unwrap()
-            && !test.server.za_has_calendar_search_terms(id).await.unwrap(),
-        "the scans do not see the orphaned Email field alone"
-    );
-    assert_refused(
-        test,
-        admin,
-        (ORPHANED_TERMS, id),
-        "account already holds mail",
-        "an orphaned Email field of the account is stored",
-    )
-    .await;
-    search
-        .unindex(SearchQuery::new(SearchIndex::Email).with_account_id(id))
-        .await
-        .unwrap();
-    assert!(
-        !test.server.za_has_email_search_terms(id).await.unwrap(),
-        "the account-wide unindex left an Email field"
-    );
-
-    // Calendar `Term` keys only: Title is a text field, not an indexed one.
+    // Calendar terms only.
     let mut document = IndexDocument::new(SearchIndex::Calendar)
         .with_account_id(id)
         .with_document_id(0);
@@ -2651,7 +2359,7 @@ async fn setup_refuses_orphaned_search_terms(test: &TestServer, admin: &Account)
     plant_orphaned_keys(test, id, SearchIndex::Calendar, document).await;
     let keys = search_keys(test, id, SearchIndex::Calendar).await;
     assert!(
-        keys.documents == 0 && keys.terms > 0 && keys.fields == 0,
+        keys.documents.is_empty() && keys.terms > 0,
         "Calendar terms alone were not planted: {keys:?}"
     );
     assert!(
@@ -2672,24 +2380,20 @@ async fn setup_refuses_orphaned_search_terms(test: &TestServer, admin: &Account)
         "an orphaned Calendar term of the account is stored",
     )
     .await;
-    search
-        .unindex(SearchQuery::new(SearchIndex::Calendar).with_account_id(id))
-        .await
-        .unwrap();
+    unindex_search_account(test, SearchIndex::Calendar, id).await;
     assert!(
         !test.server.za_has_calendar_search_terms(id).await.unwrap(),
         "the account-wide unindex left Calendar terms"
     );
 
-    // Ruling R63: orphans of another account, at the adjacent id above
-    // (account ids are assigned in order, so none holds it yet), are not
-    // the account's: its scans stay false.
+    // Orphans of another account, at the adjacent id above (account ids
+    // are assigned in order, so none holds it yet), are not the account's:
+    // its scans stay false.
     let neighbour = id + 1;
     let mut document = IndexDocument::new(SearchIndex::Email)
         .with_account_id(neighbour)
         .with_document_id(0);
     document.index_text(EmailSearchField::Body, "orphanterm", Language::English);
-    document.index_unsigned(EmailSearchField::ReceivedAt, now());
     plant_orphaned_keys(test, neighbour, SearchIndex::Email, document).await;
     let mut document = IndexDocument::new(SearchIndex::Calendar)
         .with_account_id(neighbour)
@@ -2718,10 +2422,7 @@ async fn setup_refuses_orphaned_search_terms(test: &TestServer, admin: &Account)
         "the account's scans see the adjacent account's orphans"
     );
     for index in [SearchIndex::Email, SearchIndex::Calendar] {
-        search
-            .unindex(SearchQuery::new(index).with_account_id(neighbour))
-            .await
-            .unwrap();
+        unindex_search_account(test, index, neighbour).await;
     }
     assert!(
         !test
@@ -2741,17 +2442,17 @@ async fn setup_refuses_orphaned_search_terms(test: &TestServer, admin: &Account)
     account
 }
 
-/// Ruling R62 of plan 13 (PR #51 review 3, P2-8): `Store::index` writes a
-/// large document in several commit chunks, its `Document` key in the
-/// first, and the message's unindex task, in a worker of its own, can run
-/// between two of them: it deletes the `Document` key and every key that
-/// key lists. Before R62 the later chunks then wrote `Term` and `Index`
-/// keys that nothing lists (short tokens, the subject and the addresses
-/// verbatim), the task cleared, and issuance passed R51's document scan.
-/// With R62's guard every later chunk of a fenced document asserts that its
-/// `Document` key is stored, so the rest of the document is not written,
-/// the task ends without a retry (ruling R63: within `UNDER_THE_DEFERRAL`
-/// of the release), and the account provisions cleanly.
+/// Ruling R62 of plan 13 (PR #51 review 3, P2-8), flipped at 1.0 (Task 1's
+/// ruling 19, part 6a): at 0.16 the message's unindex task ran in a worker
+/// of its own between two commit chunks of the message's index write, so
+/// the later chunks wrote terms nothing listed, and R62's per-chunk guard
+/// stopped them. At 1.0 the unindex is an entry of the same partition,
+/// which one worker runs in order: with the pass parked after chunk 0
+/// (`INDEX_CHUNK_PAUSE`) and the message destroyed, the unindex waits;
+/// issuance is refused meanwhile (the row is stored: R46). Released, the
+/// pass writes its later chunks whole and the next batch's unindex removes
+/// the document and every term: nothing is left, and the account
+/// provisions. The guard is retired.
 async fn unindex_between_index_chunks_leaves_no_terms(
     test: &TestServer,
     admin: &Account,
@@ -2761,8 +2462,7 @@ async fn unindex_between_index_chunks_leaves_no_terms(
     let account = passwordless(admin, CHUNKED).await;
     let id = account.id().document_id();
     let message = message_with("chunked subject", &large_body(TAIL_CANARY));
-    // The delivery commits; its index task writes the document's first
-    // chunk and parks before the second.
+    // The delivery commits; its index pass writes chunk 0 and parks.
     let parked = HookParked::start(id, test_hooks::set_index_chunk_pause, async move {
         SmtpConnection::connect()
             .await
@@ -2772,20 +2472,24 @@ async fn unindex_between_index_chunks_leaves_no_terms(
     .await;
     let keys = search_keys(test, id, SearchIndex::Email).await;
     assert!(
-        keys.documents == 1 && keys.terms > 0 && !keys.holds_term(TAIL_CANARY),
+        keys.documents.is_empty() && keys.terms > 0 && !keys.holds_term(TAIL_CANARY),
         "chunk 0 alone was not written: {keys:?}"
     );
     let ids = message_ids(test, id).await;
     assert_eq!(ids.len(), 1, "{ids:?}");
 
     admin.destroy_all_mailboxes_for_account(id).await;
-    wait_for_the_unindex(test, id, Some(ids[0])).await;
-    let keys = search_keys(test, id, SearchIndex::Email).await;
-    assert!(keys.is_empty(), "the unindex left chunk 0's keys: {keys:?}");
+    assert!(
+        queue_entries(test, id)
+            .await
+            .iter()
+            .any(|entry| entry.document_id == ids[0] && !entry.insert),
+        "the destroy queued no unindex"
+    );
     let reply = za_post_as(admin, "setup-token", &json!({ "account": CHUNKED })).await;
     assert_eq!(
         reply.expect(409)["error"],
-        "account has unfinished tasks",
+        "account already holds mail",
         "issuance while the index write of the account is between chunks"
     );
     assert!(
@@ -2793,35 +2497,23 @@ async fn unindex_between_index_chunks_leaves_no_terms(
         "the refused issuance wrote a record"
     );
 
-    let released = Instant::now();
     parked.finish().await;
-    test.wait_for_tasks().await;
-    let elapsed = released.elapsed();
-    assert!(
-        elapsed < UNDER_THE_DEFERRAL,
-        "the index task ended {elapsed:?} after the release: deferred, not ended without an error"
-    );
+    wait_for_index_queue(test, id, Duration::from_secs(10)).await;
     let keys = search_keys(test, id, SearchIndex::Email).await;
     assert!(
         keys.is_empty(),
         "the later chunks outlived the unindex: {keys:?}"
     );
-    assert!(
-        account_tasks(test, id).await.is_empty(),
-        "the index task is still queued"
-    );
     za_setup_token(admin, CHUNKED).await;
     account
 }
 
-/// Ruling R62 of plan 13: the calendar twin of
-/// `unindex_between_index_chunks_leaves_no_terms`, built like
-/// `setup_refuses_an_in_flight_calendar_index_write`. An ordinary event
-/// whose description fills three commit chunks is indexed; its first chunk
-/// is written, and the event is deleted before the second, so its unindex
-/// task removes the `Document` key and what it lists. The later chunks
-/// (the description's other tokens, the canary, the `Uid` verbatim in an
-/// `Index` key) are not written.
+/// Ruling R62 of plan 13, flipped at 1.0: the calendar twin of
+/// `unindex_between_index_chunks_leaves_no_terms`. An ordinary event whose
+/// description fills three commit chunks is indexed; its pass parks after
+/// chunk 0 and the event is deleted, which queues its unindex behind the
+/// pass; issuance is refused meanwhile (R54's queue scan). Released, the
+/// pass completes and the unindex removes everything.
 async fn unindex_between_calendar_index_chunks_leaves_no_terms(
     test: &TestServer,
     admin: &Account,
@@ -2830,82 +2522,52 @@ async fn unindex_between_calendar_index_chunks_leaves_no_terms(
     test.wait_for_tasks().await;
     let account = passwordless(admin, CHUNKED_EVENT).await;
     let id = account.id().document_id();
-    // The event is planted while the consumer is held; released with the
-    // pause set, the consumer dispatches its index task, which writes the
-    // document's first chunk and parks before the second.
-    let held = hold_task_consumer(test).await;
+    hold_index_partition(test, SearchIndex::Calendar, id).await;
     let event_id = plant_event(test, id, "default", "chunked.ics", &chunked_ical(), None).await;
+    let server = test.server.clone();
     let parked = HookParked::start(id, test_hooks::set_index_chunk_pause, async move {
-        drop(held);
+        release_index_partition(&server, SearchIndex::Calendar, id).await;
     })
     .await;
     let keys = search_keys(test, id, SearchIndex::Calendar).await;
     assert!(
-        keys.documents == 1 && keys.terms > 0 && !keys.holds_term(TAIL_CANARY),
+        keys.documents.is_empty() && keys.terms > 0 && !keys.holds_term(TAIL_CANARY),
         "chunk 0 alone was not written: {keys:?}"
     );
 
-    // The event is deleted: an unindex task, which runs and clears its
-    // record while the index task stays parked.
-    let account_info = test.server.account_info(id).await.unwrap();
-    let archive = test
-        .server
-        .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
-            id,
-            Collection::CalendarEvent,
-            event_id,
-        ))
-        .await
-        .unwrap()
-        .expect("the event's archive");
-    let mut batch = BatchBuilder::new();
-    DestroyArchive(archive.to_unarchived::<CalendarEvent>().unwrap())
-        .delete_all(&account_info, id, event_id, false, &mut batch)
-        .unwrap();
-    test.server.commit_batch(batch).await.unwrap();
-    test.server.notify_task_queue();
-    wait_for_the_unindex(test, id, None).await;
-    let keys = search_keys(test, id, SearchIndex::Calendar).await;
-    assert!(keys.is_empty(), "the unindex left chunk 0's keys: {keys:?}");
-    let reply = za_post_as(admin, "setup-token", &json!({ "account": CHUNKED_EVENT })).await;
-    assert_eq!(
-        reply.expect(409)["error"],
+    delete_event_records(test, id, event_id).await;
+    assert_refused(
+        test,
+        admin,
+        (CHUNKED_EVENT, id),
         "account has unfinished tasks",
-        "issuance while the calendar index write of the account is between chunks"
-    );
-    assert!(
-        test.server.za_vault_record(id).await.unwrap().is_none(),
-        "the refused issuance wrote a record"
-    );
+        "the calendar index write of the account is between chunks",
+    )
+    .await;
 
     parked.finish().await;
-    test.wait_for_tasks().await;
+    wait_for_index_queue(test, id, Duration::from_secs(10)).await;
     let keys = search_keys(test, id, SearchIndex::Calendar).await;
     assert!(
         keys.is_empty(),
         "the later calendar chunks outlived the unindex: {keys:?}"
     );
-    assert!(
-        account_tasks(test, id).await.is_empty(),
-        "the index task is still queued"
-    );
     za_setup_token(admin, CHUNKED_EVENT).await;
     account
 }
 
-/// Ruling R62 of plan 13 (P2-8's second route): on a cluster, an index
-/// worker (A) that wrote a large document's first chunk and stalled past
-/// its task lease before the second is superseded by another node's
-/// execution (B), which finds the message gone and clears the task's
-/// record; the message's unindex has removed the `Document` key and what it
-/// lists, so every term passes and the account is provisioned. R58's
-/// assertion is in the first chunk only; when A resumes, its later chunks
-/// assert that the `Document` key is stored (R62), so nothing of them lands
-/// in the key account's index. B is simulated as in
-/// `superseded_index_write_loses_to_provisioning`. An ordinary account's
-/// multi-chunk document passes the guard (the control), and its task
-/// clearing shows that A's batch ended.
+/// Ruling R62's cluster route (P2-8's second route), at 1.0 under ruling
+/// 18: an index pass (A) that wrote a large message's chunk 0 and stalled
+/// past its partition lock is superseded by another node's execution (B,
+/// simulated), which runs the message's unindex: the `Document` key is not
+/// written yet (it is in the last chunk), so B's deletion finds no stored
+/// document and chunk 0's terms are left, listed by nothing (part 6a's
+/// lost-lease residual). R62's kept term scan refuses issuance on them;
+/// after the account-wide unindex (the remedy) the account is provisioned.
+/// When A resumes, its later chunks fail the vault-absence assertion each
+/// carries: nothing of them lands, the partition enters its retry state,
+/// and one reset drains it. An ordinary account's multi-chunk document is
+/// written whole (the control).
 async fn superseded_index_tail_loses_to_provisioning(
     test: &TestServer,
     admin: &Account,
@@ -2917,8 +2579,7 @@ async fn superseded_index_tail_loses_to_provisioning(
     let control = passwordless(admin, SUPERSEDED_TAIL_CONTROL).await;
     let control_id = control.id().document_id();
     let message = message_with("superseded tail", &large_body(TAIL_CANARY));
-    // A: the delivery commits; its index task writes the document's first
-    // chunk and parks before the second.
+    // A: the delivery commits; its index pass writes chunk 0 and parks.
     let parked = HookParked::start(id, test_hooks::set_index_chunk_pause, async move {
         SmtpConnection::connect()
             .await
@@ -2930,51 +2591,23 @@ async fn superseded_index_tail_loses_to_provisioning(
     assert_eq!(ids.len(), 1, "{ids:?}");
 
     admin.destroy_all_mailboxes_for_account(id).await;
-    wait_for_the_unindex(test, id, Some(ids[0])).await;
+    // B, after A's lease expired.
+    emulate_superseding_node(test, id, &ids).await;
     let keys = search_keys(test, id, SearchIndex::Email).await;
-    assert!(keys.is_empty(), "the unindex left chunk 0's keys: {keys:?}");
-
-    // B, after A's lease expired: its retries find no message, and its
-    // `Ignored` update clears the task's `Due` and `Task` records.
-    let mut records = Vec::new();
-    test.server
-        .store()
-        .iterate(
-            IterateParams::new(
-                ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task { id: 0 })),
-                ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task { id: u64::MAX })),
-            )
-            .ascending(),
-            |key, value| {
-                if let Task::IndexDocument(task) = Task::deserialize(value)?
-                    && task.account_id.document_id() == id
-                {
-                    let due = Task::IndexDocument(task).due_timestamp();
-                    records.push((key.deserialize_be_u64(U64_LEN)?, due));
-                }
-                Ok(true)
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(records.len(), 1, "A's task record: {records:?}");
-    let mut batch = BatchBuilder::new();
-    for (task_id, due) in records {
-        batch
-            .clear(ValueClass::TaskQueue(TaskQueueClass::Due {
-                id: task_id,
-                due,
-            }))
-            .clear(ValueClass::TaskQueue(TaskQueueClass::Task { id: task_id }));
-    }
-    test.server.store().write(batch.build_all()).await.unwrap();
     assert!(
-        account_tasks(test, id).await.is_empty(),
-        "B's update left the task record"
+        keys.documents.is_empty() && keys.terms > 0,
+        "B's deletion did not leave chunk 0's terms: {keys:?}"
     );
+    assert_refused(
+        test,
+        admin,
+        (SUPERSEDED_TAIL, id),
+        "account already holds mail",
+        "chunk 0's terms outlived the superseding unindex",
+    )
+    .await;
+    unindex_search_account(test, SearchIndex::Email, id).await;
 
-    // Every term passes: no message, no metadata archive, no task, no
-    // sample, no search key.
     let token = za_setup_token(admin, SUPERSEDED_TAIL).await;
     za_setup(SUPERSEDED_TAIL, &token, STRONG).await;
     assert_eq!(
@@ -2989,9 +2622,18 @@ async fn superseded_index_tail_loses_to_provisioning(
         "setup did not complete"
     );
 
-    // A resumes and attempts its later chunks; the control's index task
-    // runs after A's batch and its update.
+    // A resumes: chunk 1 fails its assertion.
     parked.finish().await;
+    wait_for_retry_state(test, SearchIndex::Email, id).await;
+    let keys = search_keys(test, id, SearchIndex::Email).await;
+    assert!(
+        keys.is_empty(),
+        "the superseded tail landed in the key account's index: {keys:?}"
+    );
+    release_index_partition(&test.server, SearchIndex::Email, id).await;
+    wait_for_index_queue(test, id, Duration::from_secs(10)).await;
+
+    // The control's multi-chunk document, written whole.
     deliver(
         test,
         SENDER,
@@ -2999,88 +2641,31 @@ async fn superseded_index_tail_loses_to_provisioning(
         &message_with("superseded tail control", &large_body(TAIL_CANARY)),
     )
     .await;
-    test.wait_for_tasks().await;
     let control_keys = search_keys(test, control_id, SearchIndex::Email).await;
     assert!(
-        control_keys.documents == 1
+        control_keys.documents.len() == 1
             && control_keys.terms > 2000
-            && control_keys.holds_term(TAIL_CANARY)
-            && control_keys.fields > 0,
+            && control_keys.holds_term(TAIL_CANARY),
         "the control's multi-chunk document was not written whole: {control_keys:?}"
-    );
-    let keys = search_keys(test, id, SearchIndex::Email).await;
-    assert!(
-        keys.is_empty(),
-        "the superseded tail landed in the key account's index: {keys:?}"
-    );
-    assert!(
-        account_tasks(test, id).await.is_empty(),
-        "the superseded execution was rescheduled"
     );
 
     admin.destroy_all_mailboxes_for_account(control_id).await;
     (account, control)
 }
 
-/// Replaces the stored event's iCalendar data as a PUT does
-/// (`CalendarEvent::update`), which schedules its index task: a merge with
-/// the event's stored `Document` key.
+/// Replaces the stored event's iCalendar data as a PUT does (upstream's
+/// full split update over the row and the content), which queues its index
+/// entry: a merge with the event's stored `Document` key.
 async fn update_event(test: &TestServer, account_id: u32, event_id: u32, ical: &str) {
-    let archive = test
-        .server
-        .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
-            account_id,
-            Collection::CalendarEvent,
-            event_id,
-        ))
-        .await
-        .unwrap()
-        .expect("the event's archive");
-    let current = archive.to_unarchived::<CalendarEvent>().unwrap();
-    let mut event = current.deserialize::<CalendarEvent>().unwrap();
+    let stored = stored_event(test, account_id, event_id).await;
+    let mut event = stored.za_event();
     let parsed = match calcard::Parser::new(ical).entry() {
         calcard::Entry::ICalendar(ical) => ical,
         other => panic!("{other:?}"),
     };
-    let mut next_alarm = None;
-    event.size = ical.len() as u32;
-    event.data = CalendarEventData::new(parsed, Tz::Floating, 100, &mut next_alarm);
-    let account_info = test.server.account_info(account_id).await.unwrap();
-    let mut batch = BatchBuilder::new();
-    event
-        .update(
-            account_info.account_tenant_ids(),
-            current,
-            account_id,
-            event_id,
-            &mut batch,
-        )
-        .unwrap();
-    test.server.commit_batch(batch).await.unwrap();
-    test.server.notify_task_queue();
-}
-
-/// Deletes the stored event, which schedules its unindex task.
-async fn delete_event(test: &TestServer, account_id: u32, event_id: u32) {
-    let account_info = test.server.account_info(account_id).await.unwrap();
-    let archive = test
-        .server
-        .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
-            account_id,
-            Collection::CalendarEvent,
-            event_id,
-        ))
-        .await
-        .unwrap()
-        .expect("the event's archive");
-    let mut batch = BatchBuilder::new();
-    DestroyArchive(archive.to_unarchived::<CalendarEvent>().unwrap())
-        .delete_all(&account_info, account_id, event_id, false, &mut batch)
-        .unwrap();
-    test.server.commit_batch(batch).await.unwrap();
-    test.server.notify_task_queue();
+    event.content.data = CalendarEventData::new(parsed, Tz::Floating, 100);
+    write_stored_event(test, account_id, event_id, &stored, event).await;
+    test.server.notify_index_queue();
 }
 
 /// The merge tests' updated DESCRIPTION: a few tokens, none of the large
@@ -3089,100 +2674,14 @@ fn short_description() -> String {
     format!("short merged text {MERGE_CANARY}")
 }
 
-/// Ruling R63 of plan 13 (round 5's re-reviews, opus F1 and fable F1):
-/// FoundationDB evaluates an assertion's read error as a mismatch
-/// (`AssertValueFailed`), so a transient read error at a later chunk's
-/// guard stopped an ordinary document as R62 stops one whose `Document`
-/// key an unindex deleted: its later chunks were never written and its
-/// task cleared. `Store::index` now re-reads the `Document` key after a
-/// later chunk's failed guard and returns the error while the key is
-/// stored, so the worker defers the batch and the retry writes the
-/// document whole. The read error is simulated by `INDEX_GUARD_FAIL_ONCE`
-/// (the suites run no FoundationDB): an ordinary account's multi-chunk
-/// message whose second chunk is not written and fails its guard. The
-/// retry waits out the default deferral (at least 30 s).
-async fn failed_guard_with_its_document_stored_defers_the_task(
-    test: &TestServer,
-    admin: &Account,
-) -> Account {
-    println!("failed_guard_with_its_document_stored_defers_the_task");
-    test.wait_for_tasks().await;
-    let account = passwordless(admin, GUARD_FAILED).await;
-    let id = account.id().document_id();
-    test_hooks::set_index_guard_fail_once(Some(id));
-    SmtpConnection::connect()
-        .await
-        .ingest(
-            SENDER,
-            &[GUARD_FAILED],
-            &message_with("guard failed", &large_body(TAIL_CANARY)),
-        )
-        .await;
-
-    // The message and its index task commit together; the task writes chunk
-    // 0, fails chunk 1's guard and ends deferred, or cleared if the
-    // failure stopped the document.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let deferred = loop {
-        let index_tasks = account_tasks(test, id)
-            .await
-            .into_iter()
-            .filter(|task| matches!(task, Task::IndexDocument(_)))
-            .collect::<Vec<_>>();
-        match index_tasks.as_slice() {
-            [task] if matches!(task.status(), TaskStatus::Retry(_)) => break true,
-            [] if !message_ids(test, id).await.is_empty() => break false,
-            _ => {}
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the index task did not end: {index_tasks:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
-    assert!(
-        deferred,
-        "the failed guard stopped the document and its task was cleared"
-    );
-    assert!(
-        test_hooks::INDEX_GUARD_FAIL_ONCE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_none(),
-        "the guard failure was not taken"
-    );
-    let keys = search_keys(test, id, SearchIndex::Email).await;
-    assert!(
-        keys.documents == 1 && keys.terms > 0 && !keys.holds_term(TAIL_CANARY),
-        "chunk 0 alone was not written: {keys:?}"
-    );
-
-    // The retry, once due, writes the document whole.
-    test.wait_for_tasks().await;
-    let keys = search_keys(test, id, SearchIndex::Email).await;
-    assert!(
-        keys.documents == 1 && keys.terms > 2000 && keys.holds_term(TAIL_CANARY) && keys.fields > 0,
-        "the retry did not write the document whole: {keys:?}"
-    );
-    assert!(
-        account_tasks(test, id).await.is_empty(),
-        "the index task is still queued"
-    );
-
-    admin.destroy_all_mailboxes_for_account(id).await;
-    account
-}
-
-/// Ruling R63 of plan 13 (opus F4, fable F3): a calendar update's index
-/// write merges with the stored document: chunk 0 sets the new `Document`
-/// key and the new-only keys, then come the clears of the old-only keys,
-/// in later chunks when there are many. An unindex between two of those
-/// chunks deletes the new `Document` key and what it lists; R62's guard
-/// then stopped the rest, clears included, so the old version's keys that
-/// the later chunks clear stayed, listed by nothing, and issuance answered
-/// 409 for good. `Store::index` now writes a stopped document's remaining
-/// clears without the guard and drops its sets, so nothing of the account
-/// is left in the Calendar index and the account provisions.
+/// Ruling R63 of plan 13 (opus F4, fable F3), flipped at 1.0: a calendar
+/// update's index pass merges with the stored document, its clears of the
+/// old-only terms spread over several commit chunks. At 0.16 an unindex
+/// between two of them stopped the rest and left old-only keys. At 1.0 the
+/// event's deletion queues its unindex behind the parked merge (the same
+/// partition, in order); issuance is refused meanwhile; released, the merge
+/// completes and the unindex removes the document and every term, so the
+/// account provisions.
 async fn unindex_between_calendar_merge_chunks_leaves_no_terms(
     test: &TestServer,
     admin: &Account,
@@ -3204,45 +2703,36 @@ async fn unindex_between_calendar_merge_chunks_leaves_no_terms(
     test.wait_for_tasks().await;
     let keys = search_keys(test, id, SearchIndex::Calendar).await;
     assert!(
-        keys.documents == 1 && keys.terms > 2000 && keys.holds_term(TAIL_CANARY),
+        keys.documents.len() == 1 && keys.terms > 2000 && keys.holds_term(TAIL_CANARY),
         "the event was not indexed whole: {keys:?}"
     );
 
-    // The update is committed while the consumer is held; released with the
-    // pause set, its merge writes chunk 0 (the new `Document` key, the
-    // new-only keys, the first clears) and parks before the second.
-    let held = hold_task_consumer(test).await;
+    // The update is committed while the partition is held; released with
+    // the pause set, its merge writes chunk 0 and parks before the second.
+    hold_index_partition(test, SearchIndex::Calendar, id).await;
     update_event(test, id, event_id, &event_ical(uid, &short_description())).await;
+    let server = test.server.clone();
     let parked = HookParked::start(id, test_hooks::set_index_chunk_pause, async move {
-        drop(held);
+        release_index_partition(&server, SearchIndex::Calendar, id).await;
     })
     .await;
-    let keys = search_keys(test, id, SearchIndex::Calendar).await;
-    assert!(
-        keys.documents == 1 && keys.holds_term(MERGE_CANARY) && keys.terms > 1000,
-        "chunk 0 of a merge whose clears span later chunks was not written alone: {keys:?}"
-    );
 
-    // The event is deleted: its unindex removes the new `Document` key and
-    // what it lists, and leaves the old-only keys not yet cleared.
-    delete_event(test, id, event_id).await;
-    wait_for_the_unindex(test, id, None).await;
-    let keys = search_keys(test, id, SearchIndex::Calendar).await;
-    assert!(
-        keys.documents == 0 && !keys.holds_term(MERGE_CANARY) && keys.terms > 0,
-        "the unindex left no old-only key for the later chunks to clear: {keys:?}"
-    );
+    delete_event_records(test, id, event_id).await;
+    assert_refused(
+        test,
+        admin,
+        (MERGE_UNINDEXED, id),
+        "account has unfinished tasks",
+        "the calendar merge of the account is between chunks",
+    )
+    .await;
 
     parked.finish().await;
-    test.wait_for_tasks().await;
+    wait_for_index_queue(test, id, Duration::from_secs(10)).await;
     let keys = search_keys(test, id, SearchIndex::Calendar).await;
     assert!(
         keys.is_empty(),
-        "the stopped merge's old-only keys outlived the unindex: {keys:?}"
-    );
-    assert!(
-        account_tasks(test, id).await.is_empty(),
-        "the index task is still queued"
+        "the merge's keys outlived the unindex: {keys:?}"
     );
     za_setup_token(admin, MERGE_UNINDEXED).await;
     account
@@ -3250,10 +2740,8 @@ async fn unindex_between_calendar_merge_chunks_leaves_no_terms(
 
 /// Ruling R63 of plan 13 (fable F5): the merge path's positive control. An
 /// ordinary event whose description fills three commit chunks is indexed,
-/// then updated to a short description; its merge (the new `Document` key
-/// and the new-only keys in chunk 0, the old-only keys' clears in later
-/// chunks, each later chunk past the guard) leaves one `Document` key, the
-/// new tokens, and none of the old-only ones.
+/// then updated to a short description; its merge leaves one `Document`
+/// key, the new tokens, and none of the old-only ones.
 async fn multi_chunk_calendar_merge_is_written_whole(
     test: &TestServer,
     admin: &Account,
@@ -3275,7 +2763,7 @@ async fn multi_chunk_calendar_merge_is_written_whole(
     test.wait_for_tasks().await;
     let keys = search_keys(test, id, SearchIndex::Calendar).await;
     assert!(
-        keys.documents == 1 && keys.terms > 2000 && keys.holds_term(TAIL_CANARY),
+        keys.documents.len() == 1 && keys.terms > 2000 && keys.holds_term(TAIL_CANARY),
         "the event was not indexed whole: {keys:?}"
     );
 
@@ -3283,99 +2771,14 @@ async fn multi_chunk_calendar_merge_is_written_whole(
     test.wait_for_tasks().await;
     let keys = search_keys(test, id, SearchIndex::Calendar).await;
     assert!(
-        keys.documents == 1
+        keys.documents.len() == 1
             && keys.holds_term(MERGE_CANARY)
             && !keys.holds_term(TAIL_CANARY)
             && (0..2400).all(|token| !keys.holds_term(&format!("c{token:04}"))),
         "the multi-chunk merge was not written whole: {keys:?}"
     );
 
-    delete_event(test, id, event_id).await;
+    delete_event_records(test, id, event_id).await;
     test.wait_for_tasks().await;
     account
-}
-
-/// Ruling R63 of plan 13 (opus F2): a document that stops at a later
-/// chunk's failed guard ends without an error, and the batch's other
-/// documents are still written. One `Store::index` call holds two fenced
-/// multi-chunk Email documents of two ordinary accounts, fenced as the
-/// index worker fences them (`za_index_fence`); the worker's own batches
-/// cannot be made to hold both deterministically, since its dispatcher
-/// locks each task between two sends. The first document parks after its
-/// chunk 0 and is unindexed before it resumes: the call returns `Ok`, the
-/// first document leaves nothing, and the second, of an account the pause
-/// does not park, is written whole.
-async fn stopped_document_leaves_its_batch_written(
-    test: &TestServer,
-    admin: &Account,
-) -> (Account, Account) {
-    println!("stopped_document_leaves_its_batch_written");
-    test.wait_for_tasks().await;
-    let stopped = passwordless(admin, BATCH_STOPPED).await;
-    let stopped_id = stopped.id().document_id();
-    let other = passwordless(admin, BATCH_OTHER).await;
-    let other_id = other.id().document_id();
-    let document = |account_id: u32| {
-        let mut document = IndexDocument::new(SearchIndex::Email)
-            .with_account_id(account_id)
-            .with_document_id(0);
-        document.index_text(
-            EmailSearchField::Body,
-            &large_body(TAIL_CANARY),
-            Language::English,
-        );
-        document.index_unsigned(EmailSearchField::ReceivedAt, now());
-        test.server.za_index_fence(document, account_id)
-    };
-    let documents = vec![document(stopped_id), document(other_id)];
-    let search = test.server.search_store().clone();
-    let parked = HookParked::start(stopped_id, test_hooks::set_index_chunk_pause, async move {
-        search.index(documents).await
-    })
-    .await;
-    let keys = search_keys(test, stopped_id, SearchIndex::Email).await;
-    assert!(
-        keys.documents == 1 && keys.terms > 0 && !keys.holds_term(TAIL_CANARY),
-        "chunk 0 alone was not written: {keys:?}"
-    );
-    let keys = search_keys(test, other_id, SearchIndex::Email).await;
-    assert!(
-        keys.is_empty(),
-        "the batch's other document was written first: {keys:?}"
-    );
-
-    // The first document's unindex, as its task runs it.
-    let mut query = SearchQuery::new(SearchIndex::Email);
-    query
-        .add_filter(SearchFilter::eq(SearchField::AccountId, stopped_id))
-        .add_filter(SearchFilter::eq(SearchField::DocumentId, 0u32));
-    test.server.search_store().unindex(query).await.unwrap();
-    let keys = search_keys(test, stopped_id, SearchIndex::Email).await;
-    assert!(keys.is_empty(), "the unindex left chunk 0's keys: {keys:?}");
-
-    let result = parked.finish().await;
-    assert!(
-        result.is_ok(),
-        "the stopped document ended its batch with an error: {result:?}"
-    );
-    let keys = search_keys(test, stopped_id, SearchIndex::Email).await;
-    assert!(
-        keys.is_empty(),
-        "the stopped document's later chunks were written: {keys:?}"
-    );
-    let keys = search_keys(test, other_id, SearchIndex::Email).await;
-    assert!(
-        keys.documents == 1
-            && keys.terms > 2000
-            && keys.holds_term(TAIL_CANARY)
-            && keys.fields == 1,
-        "the batch's other document was not written whole: {keys:?}"
-    );
-
-    test.server
-        .search_store()
-        .unindex(SearchQuery::new(SearchIndex::Email).with_account_id(other_id))
-        .await
-        .unwrap();
-    (stopped, other)
 }
