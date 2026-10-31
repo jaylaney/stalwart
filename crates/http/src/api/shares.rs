@@ -12,7 +12,6 @@ use super::{
         za_reread_verified, za_verify_primary,
     },
 };
-use base64::{Engine, engine::general_purpose::STANDARD};
 use common::{
     Server,
     auth::vault::{ZaMark, za_normalize_address},
@@ -20,6 +19,7 @@ use common::{
     ipc::CacheInvalidation,
     storage::dav::canonical_path_segment,
 };
+use encodify::base64::STANDARD;
 use groupware::{
     DavResourceName,
     calendar::{
