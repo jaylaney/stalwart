@@ -6161,29 +6161,24 @@ Open for Task 9: the new 409 reason goes into CLAUDE.md and into the Circulo con
 
 Part 7a brought the `tests` crate to 1.0.1's APIs, ran the four compile checks and the
 integration sweep, and ran no integration suite (that is part 7c). Commits: `c41374600`
-(the mechanical port), `31d192cad` (ruling 33's LLM and metrics setup). The crate code
-outside `tests/` is unchanged.
+(the mechanical port), `31d192cad` (ruling 33's LLM and metrics setup), `ce4ee7c9a`
+(rulings 73-77 applied to the five held files). The crate code outside `tests/` is
+unchanged.
 
 #### Compile results
 
-At `31d192cad`, with the PATH prefix:
+At `ce4ee7c9a`, with the PATH prefix:
 
 | Check | Result |
 |---|---|
 | `cargo check -p stalwart --no-default-features --features rocks` | passes, no warning |
 | `cargo fmt --all --check` | passes |
-| `cargo test --workspace --exclude tests --exclude scim --exclude scim-proto --lib --bins --no-run --features "$UNIT_TEST_FEATURES"` (Task 2's list) | passes, no warning |
-| `cargo check -p tests --tests` | fails: 215 errors, all in the five files under "Needs a ruling" (`system/task.rs` 10, `system/oidc.rs` 45, `store/lookup.rs` 26, `store/query.rs` 128, `smtp/inbound/antispam.rs` 6) |
-| `cargo test -p tests --no-run`, `cargo check --workspace --tests` | fail on the same 215 errors |
+| `cargo check --workspace --tests` | passes, no warning |
+| `cargo test -p tests --no-run` | passes; links the test binary. Its one warning is the macOS linker's (`__eh_frame section too large … compact unwind table`), about the binary's size, not the code |
+| `cargo test --workspace --exclude tests --exclude scim --exclude scim-proto --lib --bins --no-run --features "$UNIT_TEST_FEATURES"` (Task 2's list) | passes, no warning (run at `31d192cad`; no crate code changed since) |
 
-With a disposable change that sets those five spots aside (`store::query` cut to its
-`FIELDS` constant, `system::oidc` declared under `cfg(any())`, the antispam DKIM and ARC
-arms replaced by `todo!()`, and the two proposals below applied), every check passes:
-`cargo test -p tests --no-run` links the test binary, `cargo check --workspace --tests`
-finishes, and the only warnings are the disposable change's own. That change was reverted
-and is not committed; it is kept with the proposals in the plan workspace
-(`task-7a/disposable-verification.patch`, `task-7a/proposal-task-lookup.patch`). So once
-the five spots are ruled, the crate needs no further compile work outside them.
+At `31d192cad` the `tests` crate stopped on 215 errors in the five files that needed a
+ruling; rulings 73-77 resolved them.
 
 #### Sweep
 
@@ -6289,62 +6284,78 @@ All under `tests/` (`tests/Cargo.toml` gains the workspace's `smtp-report`).
 - **Warnings.** `za/sharing.rs`'s `CLASSES` constant, which part 4c defined and never used,
   is removed; unused imports are dropped.
 
-#### Needs a ruling
+#### The five held spots and their rulings
 
-Each spot is left as merged; the crate does not compile until all five are ruled.
+Part 7a held five files for the primary under ruling 72. The rulings (Decision 1's
+dispositions) and what `ce4ee7c9a` does:
 
-1. **`system::task` (`tests/src/system/task.rs`).** 1.0 removed `TaskManager.max_attempts`,
-   `total_deadline` and `manager::next_retry_time`: a transient failure retries until it
-   succeeds, and `alert_after` marks it `Stalled` (`services/src/task_manager/outcome.rs`,
-   `NextAttempt::plan`). Errors: the removed fields (lines 77, 81, 110, 114, 163, 167, 193,
-   194) and the unresolved `next_retry_time` (line 20, called at 170-203). Options:
-   (a) drop `retry_time_boundaries`, the attempt-limit case and the terminal-deadline case
-   as "subject deleted" (proposal in `task-7a/proposal-task-lookup.patch`; compiles; ledger
-   rows needed); (b) re-express the attempt-limit case for 1.0 (`alert_after: 3`, expect a
-   `Stalled` task at attempt 3) and drop the other two; (c) keep them for a fork retry
-   limit, which would be new product code.
-2. **`system::oidc` (`tests/src/system/oidc.rs`, 45 errors).** 1.0 redesigned the OAuth login
-   API (`LoginRequest::AuthCode { account_name, account_secret, mfa_token, query, consent }`;
-   `LoginResponse::Authenticated { location }`) and removed `OidcProvider`'s
-   `auth_code_max_attempts`, `refresh_token_renewal`, `anonymous_client_registration` and
-   `require_client_registration`. The request port is mechanical (the authorization
-   parameters as a query string, the code and `iss` read from `location`); the removed
-   settings are not: the test sets them and checks behaviours that depend on them
-   (`REFRESH_TOKEN_RENEWAL` at line 804, anonymous confidential registration at 567-579).
-   Options: (a) port the flows and give the removed-setting cases a "subject deleted"
-   disposition with ledger rows; (b) disposition the module until a rewrite; (c) port the
-   flows and re-derive the refresh-renewal and registration checks from 1.0's fixed
-   behaviour.
-3. **`store::lookup` (`tests/src/store/lookup.rs`, 26 errors).** 1.0 has no in-memory store
-   kept in the data store (`InMemoryStore::Store` is gone; `InMemoryStore::Sql` refuses
-   every operation), no `purge_in_memory_store` (a local store expires entries when read),
-   no `counter_get`, and `counter_incr`/`is_rate_allowed` changed shape. The four
-   `store_assert_is_empty` checks and the initial `store_destroy` sit under
-   `if let InMemoryStore::Store`, which cannot occur at 1.0. Proposal (compiles): drop those
-   branches and the purges, `counter_incr` to `key_incr`, `counter_get` as
-   `key_incr(KeyValue::new(key, 0))` (1.0's local store returns the current value), ledger
-   rows. Note for 7c: `smtp::lookup::expressions` also uses an `sql` lookup store for
-   `key_*`/`counter_*`, which 1.0 refuses.
-4. **`store::query` (`tests/src/store/query.rs`, 128 errors).** 1.0 replaced the search
-   filter API (`SearchOperator` and `SearchFilter::cond` give way to `TextMatch`,
-   `Ordering` and `KeyValueMatch` variants) and the Email index has no `ReceivedAt`, `Size`
-   or `SentAt` fields (ruling 64), which the test's integer filters and sorts use. The text
-   filters port mechanically; the integer ones do not. Options: (a) move the dataset's
-   integer columns to an index that keeps integer fields; (b) keep the text part and give
-   the integer filters and sorts a "subject deleted" disposition; (c) rewrite against 1.0's
-   query engine. `jmap::mail::query` imports its `FIELDS` constant, which needs no change.
-5. **`smtp::inbound::antispam` DKIM and ARC fixtures (`tests/src/smtp/inbound/antispam.rs`,
-   lines 341-353).** mail-auth 0.14 keeps `DkimOutput::{pass, neutral, fail, perm_err,
-   temp_err}` and `ArcOutput::with_result` crate-private, with no test constructor, so the
-   fixtures' `dkim.result` (18 lines) and `arc.result` (6 lines) cannot be turned into
-   outputs. Options: (a) drop the two parameters and the tags they produce, with ledger
-   rows; (b) produce real outputs by verifying signed fixtures against cached DNS records
-   (a rewrite of those fixtures); (c) pin a mail-auth build that exposes constructors,
-   which is not an upstream release.
+73. **`system::task`: subject deleted.** 1.0 removed `TaskManager.max_attempts`,
+    `total_deadline` and `manager::next_retry_time` (a transient failure retries until it
+    succeeds; `alert_after` marks it `Stalled`, with different semantics, so the cases are
+    not re-expressed through it). `retry_time_boundaries`, the attempt-limit case and the
+    terminal-deadline case are removed, with the helper and constant only they used; the
+    rest of the module stays.
+74. **`system::oidc`: ported as an equivalent test of the same flows;** the assertions on
+    the four removed `OidcProvider` settings (`auth_code_max_attempts`,
+    `refresh_token_renewal`, `anonymous_client_registration`,
+    `require_client_registration`) are subject deleted. Written from 1.0's public API and
+    RFC 6749, 7636, 8707 and 9207, not from SEL-only code (this is the dual-licensed
+    `tests/src/system/oidc.rs`). The authorization request is built as the authorization
+    endpoint's query string (`response_type=code` and the 0.16 test's parameters, S256),
+    sent as `LoginRequest::AuthCode { query, consent: Some(true) }`; the code and `iss` are
+    read from `LoginResponse::Authenticated { location }`. A refused authorization is "not
+    an `authenticated` answer", since 1.0 answers every login with 200 and a typed body.
+    `OAuthResponse.scope` is a `String`. Removed: the settings from the fixture, the
+    `> REFRESH_TOKEN_RENEWAL` lower bound on the refresh token's `expires_in`, and the
+    renewal-window checks (no new refresh token early, a new one inside the window); 1.0
+    rotates the refresh token on every refresh. Kept: the refresh itself, the access
+    token's one-second lifetime, the original refresh token's rejection at its expiry,
+    single-use codes, and the anonymous confidential-registration refusal, which 1.0 still
+    enforces (`registration.rs` authenticates every non-public registration).
+75. **`store::lookup`: subject deleted** for the branches 1.0 cannot reach: the four
+    `store_assert_is_empty` checks and the initial `store_destroy` under
+    `if let InMemoryStore::Store` (1.0 has no in-memory store in the data store), and the
+    `purge_in_memory_store` calls (a local store expires entries when read). `counter_incr`
+    becomes `key_incr`; `counter_get`, which 1.0 removed, is read as an increment by zero,
+    which 1.0 returns; `is_rate_allowed` loses its fourth argument. Everything else stays.
+76. **`store::query`: internals replaced, with an equivalent test** (the search store is a
+    fork hotspot, R58 and R62). Over 1.0's filter API (`Text`, `Integer`, `KeyValue`,
+    `DocumentSet`): the text, keyword, phrase, key-value and boolean-group cases are
+    unchanged; the dataset's integer columns (year, width, height) and the text range
+    filters on the acquisition year, which 1.0's Email index cannot hold (ruling 64), become
+    `DocumentSet` filters computed from the dataset, as 1.0's callers pass cache-side
+    predicates; every sort is a `SortedSet` comparator ranked from the same columns (1.0's
+    search stores sort only through set comparators); 0.16's PostgreSQL-only tie order
+    goes, since 1.0 sorts locally for every store. Integer filtering moves to the Tracing
+    index, the one index with integer fields: `EventType` equality, a `QueueId` range and an
+    OR group are added. The internal store is written and unindexed through the index
+    worker's `index_account_documents` and `index_trace` (`SearchStore::index` and
+    `unindex` serve external stores only), and its trace deletion is `unindex_traces`, by
+    id bucket: the six trace ids sit in three buckets of 2^48 ids, and the deletion removes
+    the first two, where 0.16 deleted ids below 3 of 0..=5. The expected results are
+    0.16's.
+77. **`smtp::inbound::antispam`: expressed through a public path.** mail-auth 0.14 keeps
+    `DkimOutput`'s per-result constructors and `ArcOutput::with_result` crate-private but
+    exposes `From<DkimResult> for DkimOutput` and `From<ArcResult> for ArcOutput`
+    (`ArcResult` is `DkimResult`), so the 24 `dkim.result` and `arc.result` fixture lines
+    are built through them, with the same results. No expected tag changes.
 
 #### Expectations for part 7c
 
 Runtime facts this part relies on and did not run:
+
+- `smtp::lookup::expressions` evaluates `key_*` and `counter_*` against an `sql` lookup
+  store, which 1.0's `InMemoryStore::Sql` refuses (`NotSupported`); expect it to fail and
+  need a ruling.
+- `system::oidc`: the dynamically registered public client's login succeeds with
+  `consent: Some(true)` in the same request, and a refused login answers 200 with a
+  non-`authenticated` type.
+- `store::query`: 0.16's indexed-text sort order for To, From and Cc equals the
+  lexicographic order of the lowercased values, and its text "greater than" on the
+  acquisition year equals string comparison; `KeyValueMatch::Contains` matches as 0.16's
+  key-value `Contains` did.
+- `store::lookup`: a local store's `key_incr` by zero returns the counter's value, and 0
+  after it expired.
 
 - `all_queued_messages` returns every due event of every queue, sorted by due time, where
   0.16's spool listed them through a fresh `Queue`; the SMTP queue tests that loop on it
@@ -6610,6 +6621,11 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `store::blob::blob_tests` (Task 7a) | Link checks go through a test-side `blob_has_access`, 0.16's removed function over 1.0's link keys; the linked document's metadata fixture is a metadata row in the immutable class. | `store/src/write/blob.rs`: 1.0 removed `Store::blob_has_access`; `services` `destroy_account_blobs` reads the blob hash from the immutable metadata row. |
 | `imap::body_structure::test` (Task 7a) | The metadata is built by ingest's `MessageMetadata::build` and written with `ImapMetadata` (`write_structure`, `body_section`, `binary`, `binary_size`); `HEADER.FIELDS` sections are read through `body_section` with a `HeaderMatcher`. The fixtures and the comparison are unchanged. | `imap/src/op/fetch/structure.rs`: 1.0 writes BODY, BODYSTRUCTURE and sections from the stored metadata row; 0.16's `AsImapDataItem` and `build_metadata_contents` are gone. |
 | `webdav::cal_itip::test` (Task 7a) | The iTIP builders and `itip_process_message` take an all-visible, unlimited `RecipientPolicy`. | `groupware/src/scheduling/recipient.rs`: 1.0's builders split messages per recipient by policy; with every attendee visible and no limit they build 0.16's messages (the fork's delegation unit tests use the same policy). |
+| `system::task::test` (Task 7a, ruling 73) | Subject deleted: `retry_time_boundaries`, the attempt-limit case (three attempts, then `Failed`) and the terminal-deadline case are removed; the success, permanent-failure, reschedule and pagination cases stay. | v1.0.1 `registry` `TaskManager` has only `strategy` and `alert_after`; `services/src/task_manager/outcome.rs` `NextAttempt::plan` retries a transient failure without limit and marks it `Stalled` at `alert_after`; `manager::next_retry_time` is gone. |
+| `system::oidc::test` (Task 7a, ruling 74) | Internals replaced, with an equivalent: the authorization-code requests are the authorization endpoint's query string with `consent: Some(true)`; the code and `iss` come from the redirect location; a refusal is any answer that is not `authenticated` (0.16: a non-200 status). Subject deleted: the four removed provider settings in the fixture, the `> REFRESH_TOKEN_RENEWAL` bound on the refresh token's `expires_in`, and the renewal-window checks. | v1.0.1 `http/src/auth/oauth/auth.rs` (`LoginRequest::AuthCode { query, consent }`, `LoginResponse::Authenticated { location }`, every login answered 200), `authorize.rs` (`code_location`: `code`, `state`, `iss`), `token.rs` (`rotate_oauth_grant` issues a new refresh token on every refresh); `OidcProvider` without `auth_code_max_attempts`, `refresh_token_renewal`, `anonymous_client_registration`, `require_client_registration`. |
+| `store::lookup::lookup_tests` (Task 7a, ruling 75) | Subject deleted: the four `store_assert_is_empty` checks and the initial `store_destroy` under `if let InMemoryStore::Store`, and the `purge_in_memory_store` calls. `counter_get` reads are increments by zero. | v1.0.1 `store/src/lib.rs` `InMemoryStore` (no `Store` variant; `Sql` refuses every operation in `dispatch/lookup.rs`), no `purge_in_memory_store` or `counter_get`; the local store's `key_incr` returns the value. |
+| `store::query::test` (Task 7a, ruling 76) | Internals replaced, with an equivalent: integer and text-range predicates are `DocumentSet` filters computed from the dataset; sorts are `SortedSet` comparators; the PostgreSQL tie order is dropped; integer filters run on the Tracing index (three cases added); trace deletion on the internal store is by id bucket, with the ids spread over three buckets, so two documents remain where three did. Expected account results are 0.16's. | v1.0.1 `store/src/search/mod.rs` (`EmailSearchField` without `ReceivedAt`, `Size`, `SentAt`; `SearchComparator` only `DocumentSet` and `SortedSet`; no `SearchOperator`), `local.rs` `into_sorted`, `dispatch/search.rs` (`index`/`unindex` unreachable on the internal store), `search/index.rs` `unindex_traces`. |
+| `smtp::inbound::antispam::antispam` DKIM and ARC fixtures (Task 7a, ruling 77) | The 24 `dkim.result` and `arc.result` lines build their outputs through `From<DkimResult>`; results and expected tags unchanged. | mail-auth 0.14.1 `dkim/output.rs` (`pass`, `fail`, … crate-private; `impl From<DkimResult> for DkimOutput`), `arc/output.rs` (`with_result` crate-private; `impl From<ArcResult> for ArcOutput`). |
 
 ## Task 1 check
 
