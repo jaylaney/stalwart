@@ -552,4 +552,135 @@ mod tests {
         ));
         assert_eq!(new, untouched);
     }
+
+    /// Upgrade ruling 92: at 1.0 `SequenceIncrement` keeps a SEQUENCE the
+    /// client already raised, the partial branch records its increments, and
+    /// a CANCEL's SEQUENCE is computed per instance. The floor then never
+    /// double-counts: a stale client value is raised to the stored one and
+    /// upstream adds one; a client-raised value is kept. The floor is still
+    /// needed: without it upstream adds one to the stale value, below the
+    /// stored one. On upstream's own messages the reconciliation then
+    /// changes nothing: every carrier of an instance already holds the
+    /// committed value after `itip_finalize`.
+    #[test]
+    fn at_1_0_the_floor_never_double_counts_and_the_reconciliation_is_a_no_op() {
+        use crate::scheduling::{
+            event_update::itip_update,
+            recipient::{AttendeeVisibility, RecipientPolicy},
+        };
+        const CAROL: &str = "ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:key3@example.com\r\n";
+        let policy = RecipientPolicy {
+            visibility: AttendeeVisibility::All,
+            max_recipients: usize::MAX,
+            max_instances: usize::MAX,
+        };
+        let with_carol = |part: String| part.replace("END:VEVENT", &format!("{CAROL}END:VEVENT"));
+        let moved = |part: String| part.replace("DTSTAMP", "LOCATION:moved\r\nDTSTAMP");
+        let without_bob = |part: String| {
+            part.replace(
+                &format!("ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:{BOB}\r\n"),
+                "",
+            )
+        };
+        // stored: the master at 3, X at 4, bob and carol on both.
+        let stored = calendar(
+            None,
+            &[
+                with_carol(by_alice(None, Some(3))),
+                with_carol(by_alice(Some(":20990303T100000Z"), Some(4))),
+            ],
+        );
+        // Upstream's builders on `new`, the floor first when `floor`; then
+        // the reconciliation, which must leave messages and tree unchanged.
+        let run = |new: ICalendar, floor: bool| {
+            let mut new = new;
+            if floor {
+                za_sequence_floor(&mut new, &stored, &alice());
+            }
+            let mut messages = itip_update(&mut new, &stored, &alice(), policy).unwrap();
+            let committed = new.clone();
+            let texts: Vec<String> = messages.iter().map(|m| m.message.to_string()).collect();
+            let set = za_reconcile_sequences(&mut new, &mut messages, &alice());
+            assert_eq!(
+                new, committed,
+                "the reconciliation changes no committed value"
+            );
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|m| m.message.to_string())
+                    .collect::<Vec<_>>(),
+                texts,
+                "nor any message"
+            );
+            assert!(
+                set.iter()
+                    .all(|s| seq(&committed, s.instance) == s.sequence)
+            );
+            (committed, messages)
+        };
+        let carried = |messages: &[ItipMessage<ICalendar>], key: InstanceKey| {
+            let mut values: Vec<i64> = messages
+                .iter()
+                .filter_map(|m| component(&m.message, key).map(|c| sequence_of(c).unwrap()))
+                .collect();
+            values.dedup();
+            values
+        };
+
+        // A stale client (1 and 1) moves the master: one increment over the
+        // stored values, in the full update and in the committed tree.
+        let stale = || {
+            calendar(
+                None,
+                &[
+                    moved(with_carol(by_alice(None, Some(1)))),
+                    with_carol(by_alice(Some(":20990303T100000Z"), Some(1))),
+                ],
+            )
+        };
+        let (committed, messages) = run(stale(), true);
+        assert_eq!((seq(&committed, MASTER), seq(&committed, X)), (4, 5));
+        assert_eq!(
+            (carried(&messages, MASTER), carried(&messages, X)),
+            (vec![4], vec![5])
+        );
+        let (unfloored, _) = run(stale(), false);
+        assert!(
+            seq(&unfloored, MASTER) < 3,
+            "without the floor upstream lowers the master below the stored 3"
+        );
+
+        // The client raised the master to 4 itself: kept, not raised again.
+        let (committed, messages) = run(
+            calendar(
+                None,
+                &[
+                    moved(with_carol(by_alice(None, Some(4)))),
+                    with_carol(by_alice(Some(":20990303T100000Z"), Some(4))),
+                ],
+            ),
+            true,
+        );
+        assert_eq!((seq(&committed, MASTER), seq(&committed, X)), (4, 5));
+        assert_eq!(carried(&messages, MASTER), vec![4]);
+
+        // bob removed from X, the client raising X to 5 or not: the partial
+        // REQUEST (carol) and the CANCEL (bob) carry X's committed value.
+        for (x, expected) in [(4, 5), (5, 5)] {
+            let (committed, messages) = run(
+                calendar(
+                    None,
+                    &[
+                        with_carol(by_alice(None, Some(3))),
+                        without_bob(with_carol(by_alice(Some(":20990303T100000Z"), Some(x)))),
+                    ],
+                ),
+                true,
+            );
+            assert_eq!(seq(&committed, X), expected, "X from {x}");
+            assert_eq!(carried(&messages, X), vec![expected], "X from {x}");
+            assert!(messages.len() >= 2, "a REQUEST and a CANCEL");
+        }
+    }
 }
