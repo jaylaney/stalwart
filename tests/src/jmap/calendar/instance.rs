@@ -647,10 +647,15 @@ pub async fn test(test: &TestServer) {
         instance(&instances, "2007-03-07T14:00:00").text_field("recurrenceId"),
         "2007-03-07T12:00:00"
     );
-    for start in ["2007-03-08T14:00:00", "2007-03-09T14:00:00"] {
+    // 1.0 gives an occurrence that the this-and-future change shifted its
+    // original time as recurrenceId (12:00); 0.16 gave its shifted start.
+    for (start, recurrence_id) in [
+        ("2007-03-08T14:00:00", "2007-03-08T12:00:00"),
+        ("2007-03-09T14:00:00", "2007-03-09T12:00:00"),
+    ] {
         assert_eq!(
             instance(&instances, start).text_field("recurrenceId"),
-            start
+            recurrence_id
         );
         let id = instance_id(&instances, start);
         let response = account
