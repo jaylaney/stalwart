@@ -735,8 +735,11 @@ pub async fn test(test: &TestServer) {
         [john_calendar_id.as_str()]
     );
 
-    // Destroy all mailboxes
+    // Destroy all mailboxes. 1.0 also notifies John of the changes Jane made to
+    // his shared calendar (CalendarEventNotification), which 0.16 did not.
     john.destroy_all_calendars().await;
     jane.destroy_all_calendars().await;
+    john.destroy_all_event_notifications().await;
+    jane.destroy_all_event_notifications().await;
     test.assert_is_empty().await;
 }
