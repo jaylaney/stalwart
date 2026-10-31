@@ -42,6 +42,9 @@ pub async fn test(test: &TestServer) {
             .await
             .with_status(StatusCode::CREATED);
     }
+    // 1.0 answers filters on event text and parameters (Test 7) from the
+    // Calendar search index, which an index task fills after each PUT.
+    test.wait_for_tasks().await;
 
     // Test 1: Partial Retrieval of Events by Time Range
     let response = client

@@ -102,6 +102,7 @@ pub async fn test(test: &TestServer) {
         .take_id();
 
     assert_state(&mut event_rx, account.id(), &[DataType::Mailbox]).await;
+    drain_state_changes(&mut event_rx, account.id(), &[DataType::Mailbox]).await;
 
     // Receive states just for the requested types
     client
@@ -112,7 +113,9 @@ pub async fn test(test: &TestServer) {
         .mailbox_update_sort_order(&mailbox_id, 123)
         .await
         .unwrap();
-    expect_nothing(&mut event_rx).await;
+    // Long enough for a throttled push's retry, so a change sent despite the
+    // type filter is seen here.
+    expect_nothing_within(&mut event_rx, PUSH_SETTLE).await;
 
     // Destroy subscription
     client.push_subscription_destroy(&push_id).await.unwrap();
@@ -554,6 +557,36 @@ async fn expect_push_within(event_rx: &mut mpsc::Receiver<Value>, wait: Duration
         result => {
             panic!("Timeout waiting for push: {:?}", result);
         }
+    }
+}
+
+/// 1.0 throttles pushes (`push_throttle`) and sends what a throttled batch
+/// holds at the next retry (`push_retry_wait`, 1 s by default), so a change
+/// can reach the push server up to this long after the one before it.
+const PUSH_SETTLE: Duration = Duration::from_millis(2500);
+
+/// Receives the state changes that arrive within `PUSH_SETTLE` of each other,
+/// each for `state` only. A mailbox creation's second Mailbox change (1.0)
+/// reaches the push server at the throttled batch's retry, after the first
+/// was asserted; the test drains it before changing the subscription.
+async fn drain_state_changes(event_rx: &mut mpsc::Receiver<Value>, id: Id, state: &[DataType]) {
+    while let Ok(Some(push)) = tokio::time::timeout(PUSH_SETTLE, event_rx.recv()).await {
+        let push: PushMessage = serde_json::from_str(&push.to_string()).unwrap();
+        assert_eq!(
+            push.unwrap_state_change()
+                .get(&id)
+                .unwrap()
+                .iter()
+                .map(|x| x.0)
+                .collect::<AHashSet<&DataType>>(),
+            state.iter().collect::<AHashSet<&DataType>>()
+        );
+    }
+}
+
+async fn expect_nothing_within(event_rx: &mut mpsc::Receiver<Value>, wait: Duration) {
+    if let Ok(message) = tokio::time::timeout(wait, event_rx.recv()).await {
+        panic!("Received a message when expecting nothing: {:?}", message);
     }
 }
 

@@ -2337,6 +2337,10 @@ async fn next_push(rx: &mut mpsc::Receiver<Value>, wait: Duration) -> Value {
     }
 }
 
+/// See `core::push_subscription`: a throttled push is sent at the next retry
+/// (`push_retry_wait`, 1 s by default).
+const PUSH_SETTLE: Duration = Duration::from_millis(2500);
+
 async fn no_push(rx: &mut mpsc::Receiver<Value>) {
     if let Ok(message) = tokio::time::timeout(Duration::from_millis(1000), rx.recv()).await {
         panic!("Received a message when expecting nothing: {message:?}");
@@ -2408,6 +2412,11 @@ pub async fn push_subscription(test: &TestServer) {
         state_change(&next_push(&mut event_rx, wait).await, account),
         names(&["Mailbox"])
     );
+    // As upstream's test: a creation's later Mailbox change arrives at the
+    // throttled batch's retry (1.0), and is drained before the type change.
+    while let Ok(Some(push)) = tokio::time::timeout(PUSH_SETTLE, event_rx.recv()).await {
+        assert_eq!(state_change(&push, account), names(&["Mailbox"]));
+    }
 
     // Receive states just for the requested types
     client
@@ -2418,7 +2427,9 @@ pub async fn push_subscription(test: &TestServer) {
         .mailbox_update_sort_order(&mailbox_id, 123)
         .await
         .unwrap();
-    no_push(&mut event_rx).await;
+    if let Ok(message) = tokio::time::timeout(PUSH_SETTLE, event_rx.recv()).await {
+        panic!("Received a message when expecting nothing: {message:?}");
+    }
     client.push_subscription_destroy(&push_id).await.unwrap();
 
     // Only one verification per minute is allowed

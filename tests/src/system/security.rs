@@ -14,6 +14,7 @@ use crate::{
     },
 };
 use common::ipc::RegistryChange;
+use common::{KV_RATE_LIMIT_AUTH, network::ip_to_bytes};
 use imap_proto::ResponseType;
 use jmap_client::{
     client::{Client, Credentials},
@@ -79,6 +80,28 @@ pub async fn test(test: &mut TestServer) {
         )
         .await;
     let user_id = user.id();
+
+    // The failed logins below are counted from zero. Earlier sub-tests leave
+    // failures from 127.0.0.1 in the counter's window, and 1.0 counts more of
+    // them than 0.16 did (the OIDC test's refused bearer token and client
+    // secrets), which banned the address before this test's hundredth.
+    let rate = test
+        .server
+        .core
+        .network
+        .security
+        .auth_fail_rate
+        .clone()
+        .expect("authentication ban rate");
+    test.server
+        .in_memory_store()
+        .rate_reset(
+            KV_RATE_LIMIT_AUTH,
+            &ip_to_bytes(&Ipv4Addr::LOCALHOST.into()),
+            &rate,
+        )
+        .await
+        .unwrap();
 
     // Incorrect passwords should be rejected with a 401 error
     assert!(matches!(

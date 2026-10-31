@@ -142,7 +142,7 @@ from: a@example.com
 to: d@example.com
 summary: invite
 summary.attendee: Participants([ItipParticipant { email: "a@example.com", name: None, is_organizer: true }, ItipParticipant { email: "b@example.com", name: Some("B"), is_organizer: false }, ItipParticipant { email: "d@example.com", name: Some("B"), is_organizer: false }])
-summary.dtstart: Time(ItipTime { start: 867787200, tz_id: 32768 })
+summary.dtstart: Time(ItipTime { start: 867787200, tz_id: 32768, kind: DateTime })
 summary.summary: Text("Conference")
 BEGIN:VCALENDAR
 METHOD:REQUEST
@@ -398,7 +398,7 @@ from: a@example.com
 to: john.doe@example.net
 summary: invite
 summary.attendee: Participants([ItipParticipant { email: "a@example.com", name: None, is_organizer: true }, ItipParticipant { email: "john.doe@example.net", name: Some("John Doe"), is_organizer: false }])
-summary.dtstart: Time(ItipTime { start: 867787200, tz_id: 32768 })
+summary.dtstart: Time(ItipTime { start: 867787200, tz_id: 32768, kind: DateTime })
 summary.summary: Text("Conference")
 BEGIN:VCALENDAR
 METHOD:REQUEST
@@ -446,7 +446,7 @@ from: a@example.com
 to: jane.doe@example.net
 summary: invite
 summary.attendee: Participants([ItipParticipant { email: "a@example.com", name: None, is_organizer: true }, ItipParticipant { email: "jane.doe@example.net", name: Some("Jane Doe"), is_organizer: false }])
-summary.dtstart: Time(ItipTime { start: 867787200, tz_id: 32768 })
+summary.dtstart: Time(ItipTime { start: 867787200, tz_id: 32768, kind: DateTime })
 summary.summary: Text("Conference")
 BEGIN:VCALENDAR
 METHOD:REQUEST
