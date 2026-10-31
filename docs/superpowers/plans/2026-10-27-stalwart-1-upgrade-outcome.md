@@ -5608,6 +5608,118 @@ here. It is adapted to p256 0.14's call shape (`EphemeralSecret::try_generate()`
   account's calendars and events. Is the fork's account-destruction path the only remover of
   those grants (`share-destroy-grantee`)?
 
+### Part 6b: the first compile of `jmap`, `http` and `managesieve`, and object metadata
+
+Part 6b resolved the last two conflicts in `crates/` (cells in the conflict ledger), compiled
+`jmap`, `http` and `managesieve` for the first time, and refused IMAP METADATA and JMAP object
+metadata for key accounts. Commits: `e4a1b2942` (the conflicts), `e89fe90c4` (the one
+mechanical fix), `bb02e57ba` (the refusals).
+
+**Checks.**
+- `cargo check -p services -p store -p jmap -p http@1.0.1 -p managesieve` (with `-p imap`, whose
+  files changed), plain, with `--tests`, and with `--tests --features
+  jmap/test_mode,http/test_mode,services/test_mode,store/test_mode`: clean, no warnings.
+- `cargo test -p jmap -p http@1.0.1 --lib --features http/test_mode`: 13 and 6 passed. 5c's
+  unit rows ran here for the first time and pass: `email::za::tests::{filter_table,
+  sort_table, query_filter_table, first_refused_walks_the_filter_tree,
+  first_refused_sort_names_the_first_content_sort,
+  first_snippet_term_finds_the_marked_properties_anywhere,
+  attachment_keywords_parse_to_their_variants}`. Two are new:
+  `api::metadata::za::tests::{named_patches_are_the_clients,
+  key_accounts_are_offered_no_metadata}`. `cargo test -p imap --lib`: 8 passed.
+  `jmap_refused_filters_and_sorts` is an integration test (`za::mail::search`), Task 7's.
+- rustfmt is clean for `jmap`, `imap` and `http`; clippy reports nothing in the touched files.
+- `git grep -l '^<<<<<<< ' -- crates` finds nothing.
+
+#### Mechanical fixes (ruling 62)
+
+Tasks 3, 4 and 5's `jmap`, `http` and `managesieve` code needed one fix:
+- `http/src/api/shares.rs:15` (now `:22`): `use base64::{Engine,
+  engine::general_purpose::STANDARD}` became `use encodify::base64::STANDARD`. v1.0.1 removed
+  the `base64` crate from `http`'s dependencies, and `vault.rs` already uses encodify. The one
+  call (`STANDARD.decode`, `:463`) is unchanged. Both engines use the padded standard
+  alphabet and decode strictly (canonical padding, zero trailing bits), which is how groupware
+  encodes the owner's ring.
+
+Nothing was sent back to an owner.
+
+#### The conflicts
+
+- **`jmap/src/api/session.rs`.** v1.0.1's `jmap_account` builds each account object. The fork
+  trims it afterwards (`za_trim_account`) and filters `primaryAccounts` with the same rule
+  (`za_hidden_capability`). The key-account status comes from the account already read.
+- **`jmap/src/principal/get.rs`.** v1.0.1's `Accounts` property comes from cached capability
+  templates (`AccountObjects`), shared between principals. The fork filters each principal's
+  copy of the template. Its `Capabilities` property keeps v1.0.1's calendar object, filtered
+  for a key principal. The key-account status comes from `visible_principal`'s account, so the
+  fork's second `account()` read is gone.
+- Both now hide `calendars:parse` too: v1.0.1's account objects carry it, and 0.16's
+  principal list didn't.
+
+#### Object metadata
+
+The rule: object metadata is refused when the request's account **or** its caller is a key
+account (`za_metadata_refused`, `jmap/src/api/metadata/za.rs`; both accounts are read with
+`account()`, which fails closed). A key account's own objects never hold it. A key account's
+private metadata on an ordinary account's object would be its own data in the clear.
+Requests between ordinary accounts take upstream's paths, and the presence flags stay
+upstream's.
+
+| Surface | Site | Answer |
+|---|---|---|
+| Patches a client names (`*/set` create and update, `Email/import`, a copy's patches) | `MetadataWriter::prepare_for`, `prepare_new`, `prepare_ingest` (`writer.rs`) | `forbidden` per object, before validation, so a no-op patch is refused too |
+| Every non-empty update, including a copy's source containers | `MetadataUpdate::prepare`, `prepare_ingest` (`write.rs`), the only paths to a batch or to `IngestMetadata` | `forbidden` per object |
+| Preloads for a set or a copy | `ObjectMetadata::preload` (`object.rs`); `MetadataPreload` itself is pure | no container is read |
+| Reads (`*/get`) | `ObjectMetadata::load` (`object.rs`), the only caller of `MetadataGet::load` | no container is read; the objects carry no metadata property, which is upstream's answer where metadata is unsupported |
+| Filters (`*/query`) | `ObjectMetadata::evaluate` (`object.rs`), the only caller of `MetadataQuery::evaluate` | `unsupportedFilter` with `ZA_METADATA_REFUSED`; `Email/query`'s ruling 57 refusal still runs first for a key account |
+| `*/changes` | `changes/get.rs` | `MetadataChanges::Unsupported`: no private change log is read, and no metadata-only change is reported |
+| Session | `api/session.rs` | no `metadata` capability on a key account's object, nor on any account in a key account's session; upstream's rule then drops the session-level capability when no account offers it |
+| `Principal/get` | `principal/get.rs` | the same rule on each account object |
+| IMAP `GETMETADATA`, `SETMETADATA`, `LIST … RETURN (METADATA …)` | `imap/src/op/metadata/{get,set}.rs`, `op/list.rs`, through `za_assert_metadata_allowed` (`op/metadata/za.rs`) | `NO [NOPERM]` in a key account's session, before any read; also for a key account's mailbox named by another session (`metadata_mailbox`), which ruling R34 already keeps out of that session's list |
+| IMAP `CAPABILITY` | `imap/src/op/capability.rs` | no `METADATA` or `LIST-METADATA` in a key account's session (`za_key_session`) |
+
+`apply.rs`, `copy.rs` and `filter.rs` are pure: they hold no store access, and their output
+reaches the store only through the sites above.
+
+#### Decisions recorded for the primary
+
+- **The rule covers the caller too.** A key account reading or writing an ordinary account's
+  objects gets no object metadata, shared or private. The alternative would refuse only
+  private metadata for a key caller.
+- **Reads answer as unsupported, not with an error.** A metadata-aware client's default
+  `Mailbox/get` selects every metadata property, so a method error would break a key
+  account's ordinary gets. The answer is what an account without `JmapMetadataGet` sees, and
+  the session no longer advertises the capability.
+- **Copies.** A copy out of a key account carries none of its source's containers, since the
+  preload reads none. A copy into a key account whose source has containers is refused per
+  object, even when the client named no metadata. This covers `ContactCard/copy` and
+  `FileNode/copy` into a key account's shared address book or file tree, and the DAV dead
+  properties those sources may hold. DAV keeps a key account's contact and file dead
+  properties in the clear (design, "Other object kinds"), so the primary may relax this to
+  carry DAV-only containers.
+- **IMAP's advertisement uses the session's keys.** `CAPABILITY` is synchronous, so it checks
+  `za_key_session()`. A session that logged in before its account was provisioned holds no
+  keys and still advertises `METADATA`, but its commands are refused (the refusal reads the
+  account).
+
+#### Deferred, by owner
+
+**Part 6c (tests)**
+- `Mailbox/set` with metadata properties on a key account answers `forbidden`, and the same
+  call without them succeeds; `Email/set` update and `Email/import` likewise.
+- `Mailbox/get` and `Email/get` with metadata properties answer objects without them;
+  `Mailbox/query` with a metadata filter answers `unsupportedFilter`.
+- A key account's session object and `Principal/get` carry no `urn:ietf:params:jmap:metadata`;
+  an ordinary account's do (the control).
+- IMAP: `GETMETADATA`, `SETMETADATA` and `LIST "" "*" RETURN (METADATA (/shared/comment))`
+  answer `NO [NOPERM]` for a key account; `CAPABILITY` lacks `METADATA` and `LIST-METADATA`;
+  an ordinary session answers all of them (the control).
+
+**Task 7**
+- The key-mode `principal_get` variant (`tests/src/jmap/za_variants.rs:3407`) pins 0.16's
+  session object. At 1.0 it gains v1.0.1's new capabilities, minus `metadata` at both levels
+  for a key account.
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
@@ -5712,7 +5824,7 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/imap/src/op/store.rs` | content | Task 5 | resolved (Task 5b): rows 1-2 on 1.0's `format_compact!` traces; R34 before the cache read. |
 | `crates/jmap/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies (local `calcard`, `smtp-proto`, `sieve-rs`, `jmap-tools`; mail-parser 1.0 without `rkyv`) plus `vault` (row 1). `test_mode = ["utils/test_mode"]`: part 2a declared `[]`, the fork's 0.16.27 value, and part 2b made it enable `utils/test_mode` ("Manifests" above). |
 | `crates/jmap/src/api/request.rs` | content | Task 5 (calendar refusal: Task 4) | resolved (Task 4b, ruling 41, whole): rows 2-24 on their arms beside 1.0's `assert_has_source_access` and from-account checks; `za_jmap_untraced` and `za_method_error_for_trace` kept. 1.0's new arms (`PrincipalAvailability`, `ShareNotification`, `FileNode`/`ContactCard` copy) are Task 5's and Task 6's to classify. Task 5c: every method classified (part 5c's dispatcher table); the enums are 0.16's, so no arm changed; `ParticipantIdentity/changes` is gated in `changes/get.rs`. |
-| `crates/jmap/src/api/session.rs` | content | Task 6 | open |
+| `crates/jmap/src/api/session.rs` | content | Task 6 | resolved (Task 6b): v1.0.1's `jmap_account` and `primaryAccounts` loop, with rows 1-2 as `za_trim_account` on each account object and `za_hidden_capability` on `primaryAccounts` (calendars and `calendars:parse` for a key account). Part 6b also hides `metadata` for a key account or caller. |
 | `crates/jmap/src/blob/copy.rs` | content | Task 5 | resolved (Task 5c): 1.0's `BlobAccess` and embedded-blob copy kept; row 2 (no copy into or out of a key account) and the sealed-source refusal for every id before the first link. |
 | `crates/jmap/src/blob/download.rs` | content | Task 5 | resolved (Task 5c): 1.0's `blob_contents`/`BlobAccess`/`FetchedBlob` kept. Row 2: a sealed source is answered by `za_download_message` (row view, opened blob, upstream's `BlobContents::Message` shape) or `za_download_upload`, after 1.0's embedded branch and before any stored read. Rows 3 and 4: key-account calendar data denied for `Linked` and, new at 1.0, `Embedded` blobs. `decode_section` now mirrors `fetch_blob_section` (outermost range, then `SectionDecode::decode_fetched` for nested sections). Part 5c. |
 | `crates/jmap/src/blob/upload.rs` | content | Task 5 | resolved (Task 5c): rows 2-6 on 1.0's `BlobAccess`, section and embedded sources; the four Task 2 test hooks regated to `feature = "test_mode"`. |
@@ -5727,7 +5839,7 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/jmap/src/file/copy.rs` | content | Task 5 | resolved (Task 5c): upstream's side; row 2 moved with 1.0's blob read into `file/writer.rs` `resolve_blob`. |
 | `crates/jmap/src/file/set.rs` | content | Task 5 | resolved (Task 5c): upstream's side; rows 2 and 3 moved with 1.0's blob read into `file/writer.rs` `resolve_blob` (one `za_refuse_raw_source` for create, update and copy). |
 | `crates/jmap/src/mailbox/set.rs` | content | Task 5 | resolved (Task 5c): row 2 (ruling I3) before 1.0's `acl_validate`; 1.0 dropped `refresh_acls`. |
-| `crates/jmap/src/principal/get.rs` | content | Task 6 | open |
+| `crates/jmap/src/principal/get.rs` | content | Task 6 | resolved (Task 6b): v1.0.1's `AccountObjects` templates and calendar object; row 1 reads `visible_principal`'s account (the second read is gone), rows 2-4 filter the `capabilities` property and each account object's copy of the template (`za_shown_capability`). Part 6b also hides `metadata` for a key account or caller. |
 | `crates/jmap/src/registry/mapping/spam_sample.rs` | content | Task 5 | resolved (Task 5c): row 2 (R32) before 1.0's section and embedded checks. |
 | `crates/jmap/src/submission/set.rs` | content | Task 5 | resolved (Task 5c): rows 2-10 on 1.0's `MetadataRow` and `FetchedBlob`: `za_metadata_view`, the opened blob, BCC stripped from the opened bytes, plaintext only to the queue (its memory reservation kept). |
 | `crates/jmap/src/websocket/stream.rs` | content | Task 3 | resolved (Task 3b): 1.0's imports plus `za_jmap_untraced` (defined in Task 5's `jmap/src/api/request.rs`, which must keep it); row 2 merged. The loop's renewals go through `renew_access_token`/`refresh_access_token`, which carry the marker and never keys (ruling 11). |
