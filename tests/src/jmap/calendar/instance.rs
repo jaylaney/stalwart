@@ -485,10 +485,11 @@ pub async fn test(test: &TestServer) {
     );
     test.wait_for_tasks().await;
 
-    // A synthetic id of a non-recurring event refers to the event itself
+    // A non-recurring event expands to itself: 1.0 returns its own id (and no
+    // base event), where 0.16 returned a synthetic instance id for it
     let instances = expand_instances(account, &calendar_id).await;
     let id = instance_id(&instances, "2007-03-12T09:00:00");
-    assert_ne!(id, single_id);
+    assert_eq!(id, single_id);
     account
         .jmap_update(
             MethodObject::CalendarEvent,
