@@ -4551,6 +4551,113 @@ The DAV sites choose the scope and domain as follows:
 - `za_eval_if`'s arena argument: no DAV call site; the fan-out's recipient evaluation goes
   through `common/src/cache/principals.rs` (Task 3a).
 
+### Part 4c: the za integration tests
+
+Part 4c adapted the calendar za test modules to 1.0's split records and added the cases
+Task 4's brief names. The `tests` crate compiles first at Task 7: every changed file is
+rustfmt-clean and was checked against 1.0's signatures by reading, and none of it has run.
+No test hook was added; `common` is unchanged.
+
+#### The new cases and where they live
+
+| Case | Module (`tests/src/za/`) | Registered after |
+|---|---|---|
+| Dead properties: owner and grantee round trips (a sensitive namespace and name, Apple colour and order), a planted plaintext container as the scan's negative control, a corrupted sealed container (500 for its item, GET intact), COPY and MOVE between two calendars then PROPFIND, a MOVE into the shared calendar (resealed under its collection key), the `Viewer`/`Owner` counters planted, merged and left alone by sealed writes, and the keyless readers (`MetadataBuf::read` and its kinds, `metadata_used_quota`, the cleanup of a deleted event and calendar, `purge_private_metadata`, `destroy_owner_metadata`) | `dav_seal::test_dead_properties` | `dav_seal::test_legacy` |
+| `split_metadata_only_update_keeps_sealed_content`: a dead-property PROPPATCH (container sealed; the presence bit set on the row by `rewrite_presence`), a rename MOVE (`update_meta`) and the property's removal, each leaving the content record byte for byte; owner and grantee reads keep the row's ETag (304 on it); the scan of row, content and container; negative control: a row-only write of a protected display name, which the scan must catch | `dav_seal` | `dav_seal::test_dead_properties` |
+| Per-user event data: `assert_no_event_preferences` (`utils/za.rs`) after a PUT (`dav_seal::test`), COPY and MOVE (`test_dead_properties`), a metadata-only write (`split_…`), the organizer's scheduling write (`fanout::test`), the drain's import and merge (`drain::test`), a sharee's PUT (ruling 49, the differential) and the inbound case | several | — |
+| Field policy 2, the differential: a key and an ordinary owner each share `class/` with a sharee (account API "edit"; DAV ACL read and write); GET, HEAD and PROPFIND per event, PROPFIND depth 1, calendar-query, multiget and free-busy, then PUT, PROPPATCH, LOCK/UNLOCK, MOVE, MOVE back, DELETE and GET give equal statuses and equal normalized bodies; the privacy rule on both sides (PUBLIC 200, PRIVATE 403, CONFIDENTIAL 404); the stored bits after PUT, the sharee's writes, PROPPATCH, MOVE, COPY and a CLASS change from PRIVATE to PUBLIC; the recorded limits: a sharee's COPY (403 on the key side, `shared_copy_refusal`; 201 on the ordinary side) and `CLASS:X-SOMETHING` (sealed, both bits clear, served in full to the key account's sharee; the ordinary account derives Private and refuses its sharee) | `sharing::sharing_class_differential` | `sharing::test` |
+| Field policy 2, inbound: a CLASS change from PRIVATE to PUBLIC through `itip_ingest` (two ordinary accounts) and through the drain's merge (two key accounts); the copy's CLASS lines and stored bits are equal on the two paths after the import and after the merge, and the bits follow the kept CLASS | `sharing::sharing_class_inbound` | `sharing_class_differential` |
+| `cleanup_cannot_restore_revoked_ring`: after the revoke, its queued `ShareRevokeCleanup`, a refresh of every cache and a later grant to a third account, the revoked account gets exactly what a never-granted account gets (read and write) and is never listed again | `sharing` | `sharing_class_inbound` |
+| `revoke_cleanup_does_not_rewrite_sealed_event`: the grantee writes (a PUT and a dead property), the revoke commits, then a `ShareRevokeCleanup` of the calendar is queued explicitly (so the worker certainly runs) and must leave every event's row and content bytes and ETag as the revoke left them; no record holds plaintext; negative control: a planted plaintext event the same scan catches | `sharing` | `cleanup_cannot_restore_revoked_ring` |
+| `incoming_timezone_update_survives_seal`, end to end (4a's unit has the same name): a moved occurrence with a new VTIMEZONE through the fan-out and the drain's merge; the copy keeps the zone and the override's TZID, stores the zone's name sealed, and a time-range REPORT finds the occurrence at 14:00Z and not at its old slot | `drain` | `drain::test_errors` |
+
+The leak scanner (`leak.rs`) uses `is_visible_entry` and adds its own CLASS rule, independent
+of the product's predicate: a visible CLASS holds exactly one standard classification on a
+VEVENT, VTODO or VJOURNAL. The rest of `leak.rs` (its event checks on the 1.0 records and the
+new subspaces) is Task 6's.
+
+#### Fixture names allocated
+
+All at example.com: `deadprop-owner`, `deadprop-reader` (dav_seal); `split-meta-owner`,
+`split-meta-reader` (dav_seal); `sharing-class-owner`, `sharing-class-reader`,
+`sharing-class-plain-owner`, `sharing-class-plain-reader`, `sharing-class-organizer`,
+`sharing-class-attendee`, `sharing-class-plain-organizer`, `sharing-class-plain-attendee`;
+`sharing-revoke-owner`, `sharing-revoke-reader`, `sharing-revoke-later`. The ordinary accounts
+are destroyed by their tests (the suite destroys only key accounts) and are not inserted in
+the suite's account map. Neither sharing file used the `sharing-class-` or `sharing-revoke-`
+labels before.
+
+#### How the existing modules were adapted
+
+- **Helpers** (`utils/za.rs`): `insert_event` writes the pair with `CalendarEvent::insert` and
+  a reserved id; `StoredEvent` (row and content, `za_event`, `tree`, `bytes`, `as_bytes`,
+  `etag`, `pairs_in`, `next_alarm_time`, and a `version` pair of both records' versions) with
+  `stored_event` and `write_stored_event` (upstream's `update_full`) replace 0.16's one archive
+  and `CalendarEvent::update`; `InboxItem` (the row's fields, and the iTIP message as `event`)
+  replaces `CalendarEventNotification` in the inbox helpers, which read 1.0's split item and
+  write `sealed_item_record`'s shape; `inbox_ids` reads the items' `Created` index (0.16's
+  `itip_ids` is gone); `plain_dav_container` and `plant_container` write an unsealed container
+  through upstream's keyless writer; `shared_container` reads one.
+- **`dav_seal::raw_event`** returns the content record (the stored tree); `raw_event_records`
+  returns both. Its callers outside part 4c's files still unarchive `CalendarEvent` and need
+  the change listed under "Handoffs" below.
+- **Sharing files**: event reads go through `StoredEvent`; `ZaEvent` field paths
+  (`meta.names`, `content.data.event`); calendar dead properties are containers; 0.16's
+  `delete_za` is 1.0's `delete_za_at`; `Store::write(batch.build_all())` is `write_batch`; the
+  log subspace is `Subspace::Logs`; `last_change_id` takes the change group.
+- **Registry renames**: `CalendarScheduling.itip_max_size` is `max_itip_size`
+  (`Property::MaxItipSize`); `EmailAlias.enabled` is `enable`.
+
+#### Assumptions Task 7 must confirm at runtime
+
+1. A dead-property-only PROPPATCH on a key account's event writes the row through
+   `rewrite_presence` only, so the content record keeps its bytes and version; so does a rename
+   MOVE within a shared calendar (`update_meta`).
+2. GET and PROPFIND serve a key account's event with the row's `etag` as the ETag (the view
+   keeps the stored version's identity), and a conditional GET on it answers 304.
+3. A corrupted sealed container fails its PROPFIND item with 500 and leaves GET at 200.
+4. Apple's `calendar-color` and `calendar-order` are dead properties at 1.0 (dav-proto has no
+   live property for them).
+5. `destroy_owner_metadata` clears both the owner's `Viewer` counter and the viewer's `Owner`
+   record, so the planted counters leave nothing for `assert_is_empty`.
+6. The grant converts the calendar's and its events' containers to the collection key
+   (ruling 29), and a MOVE from an unshared calendar into a shared one is admitted and
+   reseals the container.
+7. The differential's normalization (owner name, ETag, timestamps, tokens and the free-busy
+   DTSTAMP removed) leaves nothing else that differs between a key and an ordinary account;
+   HEAD bodies are empty on both. "edit" and DAV `read`+`write` give a sharee the same rights.
+8. An ordinary sharee's COPY within the shared calendar answers 201 (the recorded limit's
+   other side), and the ordinary account's `X-SOMETHING` event derives Private and refuses its
+   sharee with 403.
+9. The inbound case's ordinary organizer schedules through upstream's local delivery, and the
+   attendee's `itip_ingest` adds the copy to the default calendar it created; the drain's
+   merge keeps the same CLASS as `commit_itip_merge`.
+10. The revoke through the account API leaves the events readable by the owner, and a
+    `ShareRevokeCleanup` of a key owner's calendar runs to completion without writing (this
+    holds only once Task 6 makes the worker skip key-account owners).
+11. The fork's flags on inbox items: a drained item's row holds exactly
+    `EVENT_NOTIFICATION_PRIVATE` (ruling 13's mapping).
+
+#### Known failures until another task lands
+
+- `sharing_move_atomic`'s byte-oversize admission case expects `bytes > 5_000_000` from
+  `take_calendar_move_plans`; part 4b records 0 bytes until Task 6 supplies a byte measure.
+- `revoke_cleanup_does_not_rewrite_sealed_event` fails until Task 6's `ShareRevokeCleanup`
+  skips key-account owners, if 1.0's worker rewrites their events.
+
+#### Handoffs
+
+- **Task 7 (or the owner of each file):**
+  - `za/gating.rs:561`, `webdav/za_variants.rs:550`: `schedule_tag` is on the row; read it
+    with `raw_event_records(..).0.meta.unarchive::<CalendarEvent>()`.
+  - `za/gating.rs:700`: unarchive `CalendarEventContent`.
+  - `webdav/za_variants.rs:524`, `:609`: scan both records (`raw_event_records(..).0.bytes()`).
+  - `za/leak.rs` (`check_event`, the drain and fan-out leak tests at `:1255`, `:1951`,
+    `:2135`): the 1.0 records (Task 6's scanner rules).
+  - `za/uid_lease.rs` (`:83`, `:131`, `:220`, `:281`): ruling 50 makes a key account's UID
+    conflict 403, where these assert 412; outside part 4c's files.
+  - `utils/za.rs`'s mail helper `plant_plain_message` is Task 5's.
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
@@ -4756,6 +4863,14 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `calendar::seal::item::tests::item_views_pending_drained_and_plaintext` (fork) | Items are stored as a row and an `Itip` content archive (`sealed_item_record`); the view is of the content, and upstream's own content with a snapshot passes through as stored. | 1.0.1's split `CalendarEventNotification` / `CalendarEventNotificationContent` (ruling 13). |
 | `calendar::delegation::tests::*`, `calendar::pinning::tests::the_fork_decline_ignores_partstat` (fork) | Upstream's builders are called with a `RecipientPolicy` that shows every attendee; `cancel_split_preserves_public_behavior` asserts that `itip_cancel` then returns one message and compares it with `itip_cancel_from_snapshot`'s. | 1.0.1's `itip_create`, `itip_update` and `itip_cancel` take a `RecipientPolicy` and return per-recipient messages (`scheduling/recipient.rs`). |
 | `calendar::sequence::tests::*` (fork) | Renamed `calendar::sequence_floor::tests::*`; bodies unchanged. | Ruling 25: upstream's `calendar/sequence.rs` takes the module's name. |
+| `za::dav_seal::test`, `test_collections` (fork) | The stored row's `size` is asserted to equal upstream's measure of the stored (sealed) tree (`SizeWriter::ical`), where 0.16 asserted the body length; HEAD still serves the body length. Canary scans cover the row and the content record. | `CalendarEvent::refresh_from_content` (`groupware/src/calendar/index.rs`) derives `size` from the content it stores, and the event is two records (`CalendarEvent`, `CalendarEventContent`). |
+| `za::dav_seal::test_collections` (fork) | The event's dead property is asserted sealed in its metadata container (no canary, `is_sealed_container`), where 0.16 asserted an empty `dead_properties` and the property inside `X-ZA-EXTRA`; the calendar's `calendar-color` likewise. | Dead properties left the records at 1.0 (`types::DeadProperty` is gone); they are `MetadataClass::Shared` containers (rulings 16 and 29). |
+| `za::sharing::*` conversion contracts (fork) | Calendar dead properties are written by PROPPATCH or planted as an unsealed container, and compared as the container's plaintext after rollback (owner key) or conversion (collection key), where 0.16 compared the calendar's `dead_properties`. `payload()` also leaves out the row's `size` and `etag`. | The same; and the row's `size` and `etag` derive from the stored content, envelope included. |
+| `za::sharing` lifecycle (`delegated` drain history) (fork) | A rejected item's flags are asserted to equal `EVENT_NOTIFICATION_PRIVATE`, where 0.16 asserted 0. | Ruling 13: a fork item's row always carries upstream's Members audience bit (`sealed_item_record`). |
+| `za::sharing_races` (fork) | The event's dead property is asserted in its container under the collection key; the retried create's ETag is the row's `etag`, where 0.16 used the archive hash; the expected alarm time comes from upstream's `next_event_alarms`. | Dead properties as above; at 1.0 an event's ETag is `content hash ^ row hash`; `CalendarEventData::next_alarm` is gone. |
+| `za::sharing_move_atomic::snapshot` (fork) | Also covers every event's content record. | The split records: a MOVE must leave both. |
+| `za::sharing_review` (fork) | The concurrent writer changes the row with `update_meta`; assertion unchanged. | `CalendarEvent::update` is gone; a row-only change is `update_meta`. |
+| `za::dav_seal::test_conditional` (fork) | Comment only: a UID conflict is 403 at 1.0. | Ruling 50. |
 
 ## Task 1 check
 
