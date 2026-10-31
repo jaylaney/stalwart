@@ -19,7 +19,7 @@ use super::{
     MailWrap, blob_needs_private_key, is_stub, new_dek, open_mail_blob, open_stub, seal_mail_blob,
     seal_mail_envelope, stub_needs_private_key,
 };
-use crate::message::metadata::MetadataRow;
+use crate::message::metadata::{ArchivedMessageMetadata, MetadataRow};
 use common::{
     Server,
     auth::AccessToken,
@@ -389,6 +389,32 @@ pub fn za_readable<T>(result: trc::Result<T>) -> trc::Result<Option<T>> {
     }
 }
 
+/// Mail spec 5.2, ruling 55: whether a key account's message has an
+/// attachment, read from its opened row's structure. Upstream sets the
+/// attachment keywords at ingest from the parsed message
+/// (`MessageMetadata::build`'s `has_attachments`); a key account's message
+/// stores neither keyword, so JMAP `hasAttachment` reads this instead. The
+/// rule is upstream's on the stored view: an attachment of the root message
+/// that is not inline, or that is a message (`message/rfc822`,
+/// `message/global` included). Recorded limit: a part beyond the row's
+/// `MAX_PART_ENTRIES` is not stored, so a message whose only attachment lies
+/// there reads `false` where upstream's keyword would say `true`.
+pub fn za_has_attachment(metadata: &ArchivedMessageMetadata) -> bool {
+    metadata.root().attachments().any(|part| {
+        !part
+            .content_disposition()
+            .is_some_and(|disposition| disposition.is_inline())
+            || part.is_message()
+            || part.content_type().is_some_and(|content_type| {
+                content_type.ctype().eq_ignore_ascii_case("message")
+                    && content_type.subtype().is_some_and(|subtype| {
+                        subtype.eq_ignore_ascii_case("rfc822")
+                            || subtype.eq_ignore_ascii_case("global")
+                    })
+            })
+    })
+}
+
 /// The account's private key for a `pk` envelope; a key that does not open
 /// (a `DataCorruption`) makes the message (`document_id`) or the upload
 /// (`None`) unreadable.
@@ -488,6 +514,33 @@ mod tests {
         }
         texts.sort();
         texts
+    }
+
+    /// Ruling 55: the attachment bit read from the opened row matches the
+    /// one upstream derives from the parsed message, for every corpus shape
+    /// and for an inline part and a nested message.
+    #[test]
+    fn the_opened_row_answers_has_attachment_as_upstream() {
+        const EXTRA: &[&str] = &[
+            // An inline image only: no attachment.
+            "From: alice@example.com\r\nSubject: inline\r\nMIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"rel\"\r\n\r\n--rel\r\nContent-Type: text/html\r\n\r\n<img src=\"cid:i\">\r\n--rel\r\nContent-Type: image/png\r\nContent-Disposition: inline\r\nContent-ID: <i>\r\nContent-Transfer-Encoding: base64\r\n\r\naW1hZ2U=\r\n--rel--\r\n",
+            // An inline message/global part: an attachment for upstream.
+            "From: alice@example.com\r\nSubject: global\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"g\"\r\n\r\n--g\r\nContent-Type: text/plain\r\n\r\nBody.\r\n--g\r\nContent-Type: message/global\r\nContent-Disposition: inline\r\n\r\nSubject: inner\r\n\r\nInner.\r\n--g--\r\n",
+        ];
+        let mut seen = [false, false];
+        for text in CORPUS.iter().chain(EXTRA) {
+            let raw = text.as_bytes();
+            let built = full_metadata(raw, BlobHash::generate(b"blob"));
+            let expected = built.has_attachments;
+            seen[usize::from(expected)] = true;
+            let row = MetadataRow::deserialize(&built.encode().unwrap()).unwrap();
+            assert_eq!(
+                za_has_attachment(row.unarchive().unwrap()),
+                expected,
+                "{text}"
+            );
+        }
+        assert_eq!(seen, [true, true], "both answers are exercised");
     }
 
     #[test]
