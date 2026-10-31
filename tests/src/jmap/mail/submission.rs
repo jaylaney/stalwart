@@ -277,29 +277,40 @@ pub async fn test(test: &TestServer) {
         );
     }
 
-    // Confirm that the email submission status was updated
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let email_submission = client
-        .email_submission_get(&email_submission_id, None)
-        .await
-        .unwrap()
-        .unwrap();
+    // Confirm that the email submission status was updated. 1.0 records each
+    // recipient's delivery result in the submission once the queue delivers
+    // it (RFC 8621 7: `delivered` yes with the remote reply); 0.16 kept the
+    // queueing answer. The test waits for the three results.
+    let delivered = DeliveryStatus::new(
+        "Code: 250, Enhanced code: 0.0.0, Message: OK",
+        Delivered::Yes,
+        Displayed::Unknown,
+    );
+    let mut email_submission = None;
+    for _ in 0..50 {
+        let submission = client
+            .email_submission_get(&email_submission_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        if submission.delivery_status().is_some_and(|status| {
+            status
+                .values()
+                .all(|status| status.delivered() == &Delivered::Yes)
+        }) {
+            email_submission = Some(submission);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let email_submission = email_submission.expect("the deliveries were not recorded");
     assert_eq!(email_submission.undo_status().unwrap(), &UndoStatus::Final);
     assert_eq!(
         email_submission.delivery_status().unwrap(),
         &AHashMap::from_iter([
-            (
-                "tim@foobar.com".to_string(),
-                DeliveryStatus::new("250 2.1.5 Queued", Delivered::Unknown, Displayed::Unknown)
-            ),
-            (
-                "secret_rcpt@test.com".to_string(),
-                DeliveryStatus::new("250 2.1.5 Queued", Delivered::Unknown, Displayed::Unknown)
-            ),
-            (
-                "james@other_domain.com".to_string(),
-                DeliveryStatus::new("250 2.1.5 Queued", Delivered::Unknown, Displayed::Unknown)
-            ),
+            ("tim@foobar.com".to_string(), delivered.clone()),
+            ("secret_rcpt@test.com".to_string(), delivered.clone()),
+            ("james@other_domain.com".to_string(), delivered),
         ])
     );
 

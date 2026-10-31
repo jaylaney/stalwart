@@ -320,29 +320,31 @@ pub async fn test(test: &mut TestServer) {
         }
     }
 
-    // Admin should see all objects
+    // Admin should see all objects. 1.0 scopes a query without an accountId
+    // filter to the requesting account (`jmap/src/registry/query.rs`), so the
+    // admin, who holds none, sees none there; filtered by each account it
+    // sees that account's object. 0.16 listed every account's objects.
     for object_type in [ObjectType::PublicKey] {
         let objects = admin
             .registry_query(object_type, Vec::<(&str, &str)>::new(), Vec::<&str>::new())
             .await
             .object_ids()
             .collect::<Vec<_>>();
-        assert_eq!(objects.len(), 2);
-        assert!(
-            objects.contains(&john_ids[&object_type]) && objects.contains(&jane_ids[&object_type]),
-        );
+        assert_eq!(objects, Vec::<Id>::new());
 
         // Filter by account id should work
-        let objects = admin
-            .registry_query(
-                object_type,
-                [(Property::AccountId, john.id().to_string())],
-                Vec::<&str>::new(),
-            )
-            .await
-            .object_ids()
-            .collect::<Vec<_>>();
-        assert_eq!(objects, vec![john_ids[&object_type]]);
+        for (account, ids) in [(&john, &john_ids), (&jane, &jane_ids)] {
+            let objects = admin
+                .registry_query(
+                    object_type,
+                    [(Property::AccountId, account.id().to_string())],
+                    Vec::<&str>::new(),
+                )
+                .await
+                .object_ids()
+                .collect::<Vec<_>>();
+            assert_eq!(objects, vec![ids[&object_type]]);
+        }
     }
 
     // Destroy test data

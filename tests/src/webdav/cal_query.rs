@@ -697,6 +697,8 @@ const REPORT_3: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
    </C:calendar-query>
 "#;
 
+// 1.0 keeps an expanded override's RECURRENCE-ID at the instance it replaces
+// (RFC 4791 7.8.3's example: 17:00 here); 0.16 gave its moved start.
 const REPORT_3_EXPECTED_ABCD2: &str = r#"BEGIN:VCALENDAR
 VERSION:2.0
 PRODID:-//Example Corp.//CalDAV Client//EN
@@ -710,7 +712,7 @@ UID:00959BC664CA650E933C892C@example.com
 END:VEVENT
 BEGIN:VEVENT
 DTSTART:20060104T190000Z
-RECURRENCE-ID:20060104T190000Z
+RECURRENCE-ID:20060104T170000Z
 DTSTAMP:20060206T001121Z
 DURATION:PT1H
 SUMMARY:Event #2 bis
