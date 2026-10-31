@@ -17,6 +17,7 @@ pub mod file;
 pub mod index;
 pub mod manager;
 pub mod reindex;
+pub mod za;
 
 const LOCK_EXPIRY: u64 = 10 * 60;
 const LOCK_MARGIN: Duration = Duration::from_secs(60);

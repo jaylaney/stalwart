@@ -787,9 +787,10 @@ impl Server {
     ///   An entry stays from the batch that queues it (an index or unindex,
     ///   `queue_document_index` or `queue_document_unindex`) until the index
     ///   worker's batch clears it, so a write still in flight is seen here
-    ///   before it lands, and a failed partition keeps its entries;
-    /// - the task queue, for the account's `MergeThreads` and
-    ///   `CalendarItipMessage` tasks. A retained merge task holds the
+    ///   before it lands, and a failed partition keeps its entries; the
+    ///   partition's status key (its retry state) counts too;
+    /// - the task queue, for the account's `MergeThreads`,
+    ///   `CalendarItipMessage` and `ShareRevokeCleanup` tasks. A retained merge task holds the
     ///   thread's subject hash (`TaskMergeThreads.thread_name`, the hash's
     ///   string form), not the subject. The task queue has no per-account range:
     ///   one pass over every task record, stopping at the first hit.
@@ -823,6 +824,26 @@ impl Server {
             if found {
                 return Ok(true);
             }
+            // The partition's status key (`SearchIndexClass::QueueStatus`):
+            // set when a pass fails and cleared by the next pass that
+            // completes. A failing partition retries with backoff and never
+            // fails terminally, so its entries above are still stored; a
+            // status left without entries is cleared by the partition's
+            // next pass, so it blocks only until then.
+            if self
+                .store()
+                .get_value::<RawValue>(ValueKey::from(ValueClass::SearchIndex(
+                    SearchIndexClass::QueueStatus {
+                        index,
+                        partition: account_id,
+                    },
+                )))
+                .await
+                .caused_by(trc::location!())?
+                .is_some()
+            {
+                return Ok(true);
+            }
         }
 
         let task = |id| {
@@ -847,9 +868,13 @@ impl Server {
                         // Not a provisioning state.
                         Task::DestroyAccount(_) => None,
                         // Purges grantee references after a revoked share
-                        // of the owner's object; writes no message, event
-                        // or index document of its own.
-                        Task::ShareRevokeCleanup(_) => None,
+                        // of the owner's object. The record holds only the
+                        // owner, and counts for it (design, "Indexing,
+                        // metadata and cache snapshots"); its grantee-side
+                        // writes are container counters, not content, and
+                        // its staging skips key-account owners
+                        // (`services::task_manager::tasks::grantee_cleanup`).
+                        Task::ShareRevokeCleanup(task) => Some(task.account_id),
                         // No account.
                         Task::DmarcReport(_)
                         | Task::TlsReport(_)

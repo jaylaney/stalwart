@@ -9,6 +9,7 @@ use crate::index_queue::document::{
     build_tracing_span_document, is_email_indexed,
 };
 use crate::index_queue::file::build_file_document;
+use crate::index_queue::za;
 use crate::index_queue::{
     BULK_LINGER, BulkRequest, Deletion, ITEM_OVERSCAN, LOCK_EXPIRY, LOCK_MARGIN,
     MAX_DELETE_CLAUSES, MAX_FLUSH_TEXT_BYTES, Partition, PartitionFailure, PartitionOutcome,
@@ -269,6 +270,13 @@ async fn process_items(
     };
     let consumed = consumed.items(items);
     let (processed, remaining) = items.split_at_checked(consumed).unwrap_or((items, &[]));
+
+    // Mail ruling R54's test: the pass's documents are built, not yet
+    // written, and its queue entries are still stored.
+    #[cfg(feature = "test_mode")]
+    if !documents.is_empty() && !matches!(partition.index, SearchIndex::Tracing) {
+        common::za::test_hooks::index_write_pause_point(partition.partition).await;
+    }
 
     // Update the search index
     let total = documents.len();
@@ -850,7 +858,8 @@ fn delete_email_metadata(
                 ThreadSubject::Resolved(name) => Cow::Borrowed(name),
                 ThreadSubject::InHeaders => {
                     headers = row.raw_headers().caused_by(trc::location!())?;
-                    metadata.thread_subject_in(&headers)
+                    // Mail spec 5.2: a stub's bundle is never read as headers.
+                    za::za_thread_subject_in(metadata, &headers)
                 }
             };
             metadata.unindex(batch, &thread_subject);

@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use crate::index_queue::za;
 use common::{Core, Server};
 use email::message::metadata::MetadataRow;
 use groupware::{calendar::CalendarEventContent, contact::ContactCardContent};
@@ -32,6 +33,13 @@ pub(crate) async fn build_email_document(
     document_id: u32,
     row: MetadataRow,
 ) -> trc::Result<IndexDocument> {
+    #[cfg(feature = "test_mode")]
+    za::test_hooks::index_build_fault(account_id)?;
+    // Mail spec 5.5: a key account's message is indexed from its stub, with
+    // no blob read.
+    if let Some(document) = za::za_email_document(server, account_id, document_id, &row).await? {
+        return Ok(document);
+    }
     let metadata = row.unarchive().caused_by(trc::location!())?;
     let raw_message = server
         .blob_store()
@@ -44,8 +52,10 @@ pub(crate) async fn build_email_document(
                 .details("Blob not found")
         })?;
 
+    // Mail ruling R58: the plain returns carry the vault-absence assertion.
     if !metadata.has_extractable_attachments() {
-        return email_document(&server.core, &row, account_id, document_id, &raw_message);
+        return email_document(&server.core, &row, account_id, document_id, &raw_message)
+            .map(|document| server.za_index_fence(document, account_id));
     }
 
     let core = server.core.clone();
@@ -59,6 +69,7 @@ pub(crate) async fn build_email_document(
             .details("Email indexing task failed")
             .caused_by(trc::location!())
     })?
+    .map(|document| server.za_index_fence(document, account_id))
 }
 
 fn email_document(
@@ -93,6 +104,12 @@ pub(crate) async fn build_calendar_document(
     let Some(index_fields) = server.core.email.index_fields.get(&SearchIndex::Calendar) else {
         return Ok(None);
     };
+    #[cfg(feature = "test_mode")]
+    za::test_hooks::index_build_fault(account_id)?;
+    // Calendar spec 9: nothing readable to index for a key account.
+    if za::za_skips_calendar(server, account_id).await? {
+        return Ok(None);
+    }
 
     match server
         .store()
@@ -104,17 +121,25 @@ pub(crate) async fn build_calendar_document(
         ))
         .await?
     {
-        Some(metadata_) => Ok(Some(
-            metadata_
+        Some(metadata_) => {
+            let content = metadata_
                 .unarchive::<CalendarEventContent>()
-                .caused_by(trc::location!())?
-                .index_document(
+                .caused_by(trc::location!())?;
+            if za::za_is_sealed_event(content) {
+                return Ok(None);
+            }
+            // Mail ruling R58: the plain return carries the vault-absence
+            // assertion.
+            Ok(Some(server.za_index_fence(
+                content.index_document(
                     account_id,
                     document_id,
                     index_fields,
                     server.core.email.default_language,
                 ),
-        )),
+                account_id,
+            )))
+        }
         None => Ok(None),
     }
 }
