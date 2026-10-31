@@ -18,6 +18,7 @@ mod validate;
 mod violation;
 mod write;
 mod writer;
+mod za;
 
 #[cfg(all(test, stalwart_tests))]
 #[rustfmt::skip]
@@ -36,6 +37,7 @@ pub use reject::reject_uncommitted;
 pub use validate::{MetadataAccess, ValidatedPatches};
 pub use write::MetadataUpdate;
 pub use writer::{MetadataTarget, MetadataWriter, NewMetadata};
+pub use za::{ZA_METADATA_REFUSED, za_metadata_refused};
 
 use common::{
     auth::AccessToken, config::metadata::MetadataConfig, storage::metadata::MetadataViewer,

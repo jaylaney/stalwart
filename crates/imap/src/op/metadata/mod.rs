@@ -9,6 +9,7 @@ mod get;
 mod list;
 mod select;
 mod set;
+mod za;
 
 pub(crate) use list::ListMetadataTarget;
 
@@ -103,6 +104,8 @@ impl<T: SessionStream> SessionData<T> {
         let mailbox = self
             .get_mailbox_by_name(mailbox_name)
             .ok_or_else(|| mailbox_not_found(tag))?;
+        self.za_assert_metadata_allowed(tag, Some(mailbox.account_id))
+            .await?;
         let cache = caches
             .fetch(&self.server, mailbox.account_id)
             .await

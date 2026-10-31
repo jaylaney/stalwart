@@ -204,6 +204,7 @@ impl<T: SessionStream> SessionData<T> {
         let metadata_access = match include_metadata {
             Some(entries) => {
                 self.assert_metadata_request(&tag, entries.len())?;
+                self.za_assert_metadata_allowed(&tag, None).await?;
                 access_token
                     .enforce_permission(Permission::ImapMetadataGet)
                     .map_err(|err| err.id(tag.clone()))?;

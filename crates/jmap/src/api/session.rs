@@ -122,17 +122,18 @@ impl SessionHandler for Server {
             .caused_by(trc::location!())?;
         session.username = account.name().to_string();
         let account_id = Id::from(access_token.account_id());
-        // Spec 9: JMAP calendars are not offered for key accounts.
+        // Spec 9 and Task 6: no calendars or object metadata for key
+        // accounts (`za_hidden_capability`).
         let primary_is_key = account.is_key_account();
         let mut primary_account = self.jmap_account(
             access_token,
             access_token.account_id(),
             account.name().to_string(),
         );
-        za_trim_account(&mut primary_account, primary_is_key);
+        za_trim_account(&mut primary_account, primary_is_key, primary_is_key);
         for capability in access_token
             .account_capabilities(&self.core.jmap.capabilities)
-            .filter(|capability| !za_hidden_capability(primary_is_key, *capability))
+            .filter(|capability| !za_hidden_capability(primary_is_key, primary_is_key, *capability))
         {
             if capability != Capability::Metadata
                 || primary_account
@@ -160,7 +161,7 @@ impl SessionHandler for Server {
             };
             let mut secondary =
                 self.jmap_account(access_token, account_id, account.name().to_string());
-            za_trim_account(&mut secondary, account.is_key_account());
+            za_trim_account(&mut secondary, account.is_key_account(), primary_is_key);
             session.accounts.append(Id::from(account_id), secondary);
         }
 
@@ -269,22 +270,31 @@ pub fn allowed_capabilities(access_token: &AccessToken, using: CapabilityIds) ->
         .collect()
 }
 
-/// Spec 9: whether an account's capabilities leave `capability` out, the
-/// account being a key account (`is_key`): JMAP calendars are not offered
-/// for key accounts.
-pub(crate) fn za_hidden_capability(is_key: bool, capability: Capability) -> bool {
-    is_key
-        && matches!(
-            capability,
-            Capability::Calendars | Capability::CalendarsParse
-        )
+/// Whether an account object leaves `capability` out, the account being a
+/// key account (`account_is_key`) or the session's or principal's caller
+/// being one (`caller_is_key`):
+/// - spec 9: JMAP calendars are not offered for key accounts;
+/// - Task 6: object metadata is refused for key accounts, as owner or as
+///   caller (`api::metadata::za_metadata_refused`), so it is not offered
+///   either; when no account offers it, upstream's rule drops the session's
+///   own metadata capability.
+pub(crate) fn za_hidden_capability(
+    account_is_key: bool,
+    caller_is_key: bool,
+    capability: Capability,
+) -> bool {
+    match capability {
+        Capability::Calendars | Capability::CalendarsParse => account_is_key,
+        Capability::Metadata => account_is_key || caller_is_key,
+        _ => false,
+    }
 }
 
-/// Spec 9: removes the capabilities `za_hidden_capability` leaves out from a
+/// Removes the capabilities `za_hidden_capability` leaves out from a
 /// session's account object.
-fn za_trim_account(account: &mut Account, is_key: bool) {
+fn za_trim_account(account: &mut Account, account_is_key: bool, caller_is_key: bool) {
     for capability in Capability::all_capabilities() {
-        if za_hidden_capability(is_key, *capability) {
+        if za_hidden_capability(account_is_key, caller_is_key, *capability) {
             account.account_capabilities.remove(capability);
         }
     }

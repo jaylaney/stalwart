@@ -61,6 +61,7 @@ impl<T: SessionStream> SessionData<T> {
             mailbox_name,
             entries,
         } = arguments;
+        self.za_assert_metadata_allowed(&tag, None).await?;
         let access_token = self
             .refresh_access_token()
             .await

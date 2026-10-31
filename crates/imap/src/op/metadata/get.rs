@@ -31,6 +31,7 @@ impl<T: SessionStream> SessionData<T> {
     ) -> trc::Result<()> {
         let tag = arguments.tag.as_str();
         self.assert_metadata_request(tag, arguments.entries.len())?;
+        self.za_assert_metadata_allowed(tag, None).await?;
 
         let access_token = self
             .refresh_access_token()

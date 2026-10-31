@@ -8,6 +8,7 @@ use super::{
     MetadataContainers, MetadataDocuments, MetadataGet, MetadataPatches, MetadataPreload,
     MetadataQuery, MetadataSupport, MetadataType, MetadataValues, PreloadedContainers,
     PrivateCandidates, uses_metadata,
+    za::{za_metadata_filter_error, za_metadata_refused},
 };
 use crate::changes::state::{MetadataStateManager, ViewerChangeId};
 use common::{
@@ -175,6 +176,10 @@ impl ObjectMetadata {
         account_id: u32,
         preload: MetadataPreload,
     ) -> trc::Result<PreloadedContainers> {
+        // Task 6: no key account's container is read for a set or a copy.
+        if !preload.is_empty() && za_metadata_refused(server, self.caller_id, account_id).await? {
+            return Ok(PreloadedContainers::default());
+        }
         let collection = self.collection();
         let shared = server
             .load_metadata_containers(account_id, collection, &preload.shared)
@@ -217,6 +222,12 @@ impl ObjectMetadata {
         P: MetadataProperty + Send + Sync,
         E: Element<Property = P> + Send + Sync,
     {
+        // Task 6: no key account's container is read, and the objects carry
+        // no metadata property, upstream's answer where metadata is not
+        // supported.
+        if za_metadata_refused(server, self.caller_id, account_id).await? {
+            return Ok(MetadataValues::new(None, None, Vec::new()));
+        }
         let private_viewer = if get.wants_private() && !documents.requested().is_empty() {
             match self.client {
                 MetadataClient::Aware {
@@ -250,6 +261,11 @@ impl ObjectMetadata {
     ) -> trc::Result<Vec<RoaringBitmap>> {
         if query.is_empty() {
             return Ok(Vec::new());
+        }
+        // Task 6: a metadata filter on a key account's objects, or by a key
+        // account, is refused.
+        if za_metadata_refused(server, self.caller_id, account_id).await? {
+            return Err(za_metadata_filter_error());
         }
         let shared = query.has_shared().then(shared);
         let private = if query.has_private() {

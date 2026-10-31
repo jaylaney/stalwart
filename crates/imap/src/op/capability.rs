@@ -57,6 +57,9 @@ impl<T: SessionStream> Session<T> {
             && data
                 .access_token
                 .has_permission(Permission::ImapMetadataGet)
+            // Task 6: a key account's session refuses METADATA
+            // (`op::metadata::za`), so it does not advertise it.
+            && !data.za_key_session()
         {
             capabilities.extend([Capability::Metadata, Capability::ListMetadata]);
         }

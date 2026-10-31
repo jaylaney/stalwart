@@ -6,7 +6,9 @@
 
 use super::{
     MetadataAccess, MetadataPatches, MetadataPreload, MetadataUpdate, ObjectMetadata,
-    PreloadedContainers, PreparedMetadata, write::ContainerTarget,
+    PreloadedContainers, PreparedMetadata,
+    write::ContainerTarget,
+    za::{za_metadata_refused, za_metadata_set_error, za_names_patches},
 };
 use common::{
     Server,
@@ -122,6 +124,9 @@ impl MetadataWriter {
         let Some(support) = self.metadata.support() else {
             return Ok(Ok(PreparedMetadata::default()));
         };
+        if self.za_refused(server).await? {
+            return Ok(Err(za_metadata_set_error()));
+        }
         let validated = match patches.validate(support, access) {
             Ok(validated) => validated,
             Err(err) => return Ok(Err(err)),
@@ -157,6 +162,9 @@ impl MetadataWriter {
         metadata: NewMetadata,
         access: MetadataAccess,
     ) -> trc::Result<Result<Option<Box<IngestMetadata>>, SetError<P>>> {
+        if za_names_patches(&metadata) && self.za_refused(server).await? {
+            return Ok(Err(za_metadata_set_error()));
+        }
         let update = match self.new_update(metadata, access) {
             Ok(update) if update.is_empty() => return Ok(Ok(None)),
             Ok(update) => update,
@@ -175,6 +183,9 @@ impl MetadataWriter {
         let Some(metadata) = metadata else {
             return Ok(Ok(None));
         };
+        if za_names_patches(&metadata) && self.za_refused(server).await? {
+            return Ok(Err(za_metadata_set_error()));
+        }
         match self.new_update(metadata, access) {
             Ok(update) => Ok(self
                 .finish_prepare(server, update, MetadataLog::None)
@@ -227,6 +238,13 @@ impl MetadataWriter {
         }
         let target = self.target(server, log).await?;
         update.prepare(server, target).await
+    }
+
+    /// Task 6: the patches a client names on a key account's object, or as
+    /// a key account, are refused before they are validated, so a no-op
+    /// patch is refused too (`za_metadata_refused`).
+    async fn za_refused(&self, server: &Server) -> trc::Result<bool> {
+        za_metadata_refused(server, self.metadata.caller_id(), self.account_id).await
     }
 
     async fn target(

@@ -4,7 +4,10 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::prepared::PreparedMetadata;
+use super::{
+    prepared::PreparedMetadata,
+    za::{za_metadata_refused, za_metadata_set_error},
+};
 use common::{
     Server,
     auth::AccountCache,
@@ -51,6 +54,9 @@ impl MetadataUpdate {
         server: &Server,
         target: ContainerTarget<'_>,
     ) -> trc::Result<Result<PreparedMetadata, SetError<P>>> {
+        if target.za_refused(server, &self).await? {
+            return Ok(Err(za_metadata_set_error()));
+        }
         let shared = match self.shared {
             Some(change) => {
                 if !server.has_metadata_quota(target.owner, &change).await? {
@@ -75,6 +81,9 @@ impl MetadataUpdate {
         server: &Server,
         target: ContainerTarget<'_>,
     ) -> trc::Result<Result<Option<Box<IngestMetadata>>, SetError<P>>> {
+        if target.za_refused(server, &self).await? {
+            return Ok(Err(za_metadata_set_error()));
+        }
         let private = match self.private {
             Some(change) => match target.private_write(server, change).await? {
                 Ok(write) => Some(write),
@@ -90,6 +99,16 @@ impl MetadataUpdate {
 }
 
 impl ContainerTarget<'_> {
+    /// Task 6: no container, shared or private, is written for a key
+    /// account's object or by a key account (`za_metadata_refused`), a
+    /// copy's included.
+    async fn za_refused(&self, server: &Server, update: &MetadataUpdate) -> trc::Result<bool> {
+        Ok(
+            !update.is_empty()
+                && za_metadata_refused(server, self.viewer_id, self.owner.id).await?,
+        )
+    }
+
     async fn private_write<P: MetadataProperty>(
         self,
         server: &Server,

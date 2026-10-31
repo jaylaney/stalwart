@@ -7,7 +7,7 @@
 use crate::{
     api::{
         auth::JmapAuthorization,
-        metadata::{MetadataType, ObjectMetadata},
+        metadata::{MetadataType, ObjectMetadata, za_metadata_refused},
         request::za_assert_calendar_allowed,
     },
     changes::{
@@ -280,6 +280,15 @@ impl ChangesLookup for Server {
                 }
             }
             _ => MetadataChanges::Unsupported,
+        };
+        // Task 6: object metadata is refused for key accounts, so their
+        // changes report none (`za_metadata_refused`).
+        let metadata = if metadata != MetadataChanges::Unsupported
+            && za_metadata_refused(self, access_token.account_id(), account_id).await?
+        {
+            MetadataChanges::Unsupported
+        } else {
+            metadata
         };
         let viewer = object_metadata.as_ref().and_then(ObjectMetadata::viewer);
         let state_viewer = object_metadata

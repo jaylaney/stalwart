@@ -88,6 +88,13 @@ impl PrincipalGet for Server {
         let has_availability_permission =
             access_token.has_permission(Permission::JmapPrincipalGetAvailability);
         let mut accounts = AccountObjects::default();
+        // Task 6: no object metadata on any account object a key account
+        // reads (`za_hidden_capability`).
+        let za_caller_is_key = self
+            .account(access_token.account_id())
+            .await
+            .caused_by(trc::location!())?
+            .is_key_account();
         let mut response = GetResponse {
             account_id: request.account_id.into(),
             state: State::Initial.into(),
@@ -137,6 +144,7 @@ impl PrincipalGet for Server {
                                     id,
                                     principal.name(),
                                     is_key,
+                                    za_caller_is_key,
                                 )?,
                             )]))
                         } else {
@@ -192,7 +200,7 @@ impl PrincipalGet for Server {
                                 ),
                             ])),
                         )])
-                        .filter(|(key, _)| za_shown_capability(is_key, key)),
+                        .filter(|(key, _)| za_shown_capability(is_key, false, key)),
                     )),
                     _ => Value::Null,
                 };
@@ -248,6 +256,7 @@ impl AccountObjects {
         id: Id,
         name: &str,
         is_key: bool,
+        caller_is_key: bool,
     ) -> trc::Result<PrincipalObject> {
         let account_id = id.document_id();
         let template = if access_token.is_member(account_id) {
@@ -263,7 +272,7 @@ impl AccountObjects {
         capabilities.extend(
             template
                 .iter()
-                .filter(|(key, _)| za_shown_capability(is_key, key))
+                .filter(|(key, _)| za_shown_capability(is_key, caller_is_key, key))
                 .map(|(key, value)| (key.clone(), value.clone())),
         );
         capabilities.insert_unchecked(
@@ -359,11 +368,17 @@ impl IntoPrincipalValue for serde_json::Value {
 }
 
 /// Spec 9: a key account's principal advertises no calendars capability, in
-/// its `capabilities` and in its account object (`za_hidden_capability`).
-fn za_shown_capability(is_key: bool, key: &Key<'_, PrincipalProperty>) -> bool {
+/// its `capabilities` and in its account object; Task 6: an account object
+/// advertises no object metadata to or for a key account
+/// (`za_hidden_capability`).
+fn za_shown_capability(
+    is_key: bool,
+    caller_is_key: bool,
+    key: &Key<'_, PrincipalProperty>,
+) -> bool {
     !matches!(
         key,
         Key::Property(PrincipalProperty::Capability(capability))
-            if za_hidden_capability(is_key, *capability)
+            if za_hidden_capability(is_key, caller_is_key, *capability)
     )
 }
