@@ -1505,7 +1505,9 @@ pub async fn test_dead_properties(test: &mut TestServer) {
             .metadata_kinds(),
         types::metadata::MetadataKinds::DAV
     );
-    assert!(row.bytes().contains("X-ZA-KEY:"));
+    // The seal's marker is a property of the stored tree, which the archive
+    // holds as an entry, not as iCalendar text.
+    assert!(row.tree().to_string().contains("X-ZA-KEY:"));
     assert!(container_leaks(row.bytes().as_bytes(), DEAD_CANARIES).is_empty());
 
     // Negative control: a planted plaintext container on another event is

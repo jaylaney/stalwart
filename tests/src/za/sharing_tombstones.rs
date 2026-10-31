@@ -149,6 +149,14 @@ async fn seed(
         .unwrap()
         .last_change_id(owner, SyncCollection::Calendar)
 }
+/// A LEB128 length, as 1.0's vanished-name log writes it.
+fn leb128(buf: &mut Vec<u8>, mut value: usize) {
+    while value >= 0x80 {
+        buf.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    buf.push(value as u8);
+}
 fn identity(id: u32, path: &str) -> String {
     format!("{id:08x}:{path}")
 }
@@ -333,7 +341,9 @@ async fn controls(
     assert!(
         response
             .hrefs()
-            .contains(&format!("{HOME}Family%20Trips/escaped.ics").as_str())
+            .contains(&format!("{HOME}Family%20Trips/escaped.ics").as_str()),
+        "{:?}",
+        response.hrefs()
     );
     let token = initial(bob).await;
     for name in ["page-one.ics", "page-two.ics"] {
@@ -404,10 +414,14 @@ async fn controls(
         1
     );
     // Legacy raw records keep exact bytes, and self-key sync keeps ordinary output.
-    let mut expected = path.as_bytes().to_vec();
-    expected.push(0);
+    // 1.0's name log (`VanishedItems::serialize`): each name as a LEB128 length
+    // and its bytes, a later one as the shared-prefix length, then the rest's
+    // length and bytes (0.16 wrote each name followed by a NUL).
+    let mut expected = Vec::new();
+    leb128(&mut expected, path.len());
     expected.extend_from_slice(path.as_bytes());
-    expected.push(0);
+    leb128(&mut expected, path.len());
+    leb128(&mut expected, 0);
     assert_eq!(bytes(test, owner, 252, commit).await, Some(expected));
     let own = sync(alice, &format!("{HOME}granted/"), &token)
         .await
@@ -780,8 +794,11 @@ async fn ordinary_owner(test: &TestServer) {
         .await
         .unwrap()
         .unwrap();
-    let mut expected = path.as_bytes().to_vec();
-    expected.push(0);
+    // 1.0's name log: the LEB128 length, then the bytes (0.16 ended the name
+    // with a NUL).
+    let mut expected = Vec::new();
+    leb128(&mut expected, path.len());
+    expected.extend_from_slice(path.as_bytes());
     assert_eq!(
         bytes(test, owner, 252, deleted).await,
         Some(expected),

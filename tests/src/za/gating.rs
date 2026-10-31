@@ -263,7 +263,22 @@ pub async fn test(test: &mut TestServer) {
     );
 
     // Principal/get: a key account's principal advertises no calendars
-    // capability; a non-key account's does.
+    // capability; a non-key account's does. 1.0 hides other principals
+    // unless directory queries are allowed (`Sharing.allowDirectoryQueries`,
+    // off by default; 0.16 listed them), so the query runs with them on.
+    let set_directory_queries = async |allow: bool| {
+        admin
+            .registry_update_setting(
+                registry::schema::structs::Sharing {
+                    allow_directory_queries: allow,
+                    ..Default::default()
+                },
+                &[registry::schema::prelude::Property::AllowDirectoryQueries],
+            )
+            .await;
+        admin.reload_settings().await;
+    };
+    set_directory_queries(true).await;
     let response = plain
         .jmap_method_call(
             "Principal/get",
@@ -288,14 +303,38 @@ pub async fn test(test: &mut TestServer) {
         key_principal["capabilities"].get(calendars).is_none(),
         "{key_principal}"
     );
+    // 1.0 fills `accounts` only for a principal the caller can access, so
+    // the key account's own objects are read by the key account itself; an
+    // account object lists its capabilities under `accountCapabilities`.
+    assert!(key_principal["accounts"].is_null(), "{key_principal}");
+    let own = key1
+        .jmap_method_call(
+            "Principal/get",
+            json!({
+                "accountId": key1.id_string(),
+                "ids": [key1.id_string()],
+                "properties": ["id", "accounts", "capabilities"],
+            }),
+        )
+        .await;
+    let key_principal = own
+        .list()
+        .iter()
+        .find(|principal| principal["id"] == key1.id_string())
+        .unwrap_or_else(|| panic!("own principal: {:?}", own.0))
+        .clone();
     assert!(
-        key_principal["accounts"][key1.id_string()]
+        key_principal["capabilities"].get(calendars).is_none(),
+        "{key_principal}"
+    );
+    assert!(
+        key_principal["accounts"][key1.id_string()]["accountCapabilities"]
             .get(calendars)
             .is_none(),
         "{key_principal}"
     );
     assert!(
-        key_principal["accounts"][key1.id_string()]
+        key_principal["accounts"][key1.id_string()]["accountCapabilities"]
             .get("urn:ietf:params:jmap:contacts")
             .is_some(),
         "{key_principal}"
@@ -306,11 +345,12 @@ pub async fn test(test: &mut TestServer) {
         "{plain_principal}"
     );
     assert!(
-        plain_principal["accounts"][plain.id_string()]
+        plain_principal["accounts"][plain.id_string()]["accountCapabilities"]
             .get(calendars)
             .is_some(),
         "{plain_principal}"
     );
+    set_directory_queries(false).await;
 
     // JMAP calendar methods on the key account are refused.
     let key1_account = key1.id_string();
@@ -413,7 +453,9 @@ pub async fn test(test: &mut TestServer) {
             "utcStart": "2024-03-01T10:00:00Z",
             "utcEnd": "2024-03-01T11:00:00Z",
             "busyStatus": "confirmed",
-            "event": null
+            "event": null,
+            // 1.0's busy period carries the account it came from.
+            "accountId": null
         }]));
     admin
         .jmap_method_call("Principal/getAvailability", availability(key1_account))
@@ -1366,11 +1408,14 @@ async fn metadata_beyond_mailboxes(
             json!([["ContactCard/copy", {
                 "fromAccountId": plain.id_string(),
                 "accountId": key.id_string(),
+                // 1.0 reads the source from each entry's `id` (RFC 8620 5.4).
                 "create": {
                     (with_metadata.as_str()): {
+                        "id": with_metadata,
                         "addressBookIds": { (destination_book.as_str()): true }
                     },
                     (without_metadata.as_str()): {
+                        "id": without_metadata,
                         "addressBookIds": { (destination_book.as_str()): true }
                     }
                 }

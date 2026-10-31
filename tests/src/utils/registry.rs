@@ -462,6 +462,8 @@ fn remove_server_set_props(typ: ObjectType, value: &mut serde_json::Value) {
             ]
             .contains(&k.as_str())
                 || (is_app_pass && k == "secret")
+                // 1.0's `Action::ReloadSettings` carries its server-set result.
+                || (typ == ObjectType::Action && k == "warnings")
                 || (k == "memberTenantId" && v.is_null()))
         });
         for v in obj.values_mut() {

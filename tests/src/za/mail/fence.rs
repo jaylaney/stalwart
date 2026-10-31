@@ -191,6 +191,9 @@ const OBJECT_METADATA_OWNER: &str = "plainmail34@example.com";
 /// `metadata_writes_lose_to_provisioning`'s account, an ordinary one that
 /// logs in.
 const METADATA_WRITER: &str = "plainmail35@example.com";
+/// `dead_property_writes_lose_to_provisioning`'s account (ruling 70), an
+/// ordinary one that writes calendar dead properties over DAV.
+const DEAD_WRITER: &str = "plainmail37@example.com";
 const PLAIN: &str = "plainmail3@example.com";
 /// The organizer of `forward_race_imip_side_write`'s invitation, which it
 /// sends through authenticated submission.
@@ -256,6 +259,7 @@ pub async fn test(test: &mut TestServer) {
     let (object_metadata, object_metadata_owner) =
         setup_refuses_object_metadata(test, &admin).await;
     let metadata_writer = metadata_writes_lose_to_provisioning(test).await;
+    let dead_writer = dead_property_writes_lose_to_provisioning(test).await;
 
     // The accounts that log in empty their own mailboxes; the others are
     // pending or credentialless, and the account's destruction removes
@@ -317,6 +321,7 @@ pub async fn test(test: &mut TestServer) {
         object_metadata,
         object_metadata_owner,
         metadata_writer,
+        dead_writer,
     ] {
         admin.destroy_account(account).await;
     }
@@ -507,7 +512,65 @@ async fn queued_blob(test: &TestServer, address: &str) -> Vec<u8> {
 
 /// The purge as the scheduler runs it, once every temporary link expired.
 async fn expire_and_purge_blobs(test: &TestServer, admin: &Account) {
-    test.blob_expire_all().await;
+    // At 1.0 a staged blob whose batch never committed has no commit entry,
+    // only its temporary link, which the purge reads to delete the blob: the
+    // links are expired in place (0.16's helper deleted them, which leaves
+    // such a blob unreachable at 1.0).
+    let from_key = ValueKey {
+        account_id: 0,
+        collection: 0,
+        document_id: 0,
+        class: ValueClass::Blob(BlobOp::Commit {
+            hash: BlobHash::default(),
+        }),
+    };
+    let to_key = ValueKey {
+        account_id: u32::MAX,
+        collection: u8::MAX,
+        document_id: u32::MAX,
+        class: ValueClass::Blob(BlobOp::Link {
+            hash: BlobHash::new_max(),
+            to: BlobLink::Document,
+        }),
+    };
+    let mut links = Vec::new();
+    test.server
+        .store()
+        .iterate(
+            IterateParams::new(from_key, to_key).ascending(),
+            |key, value| {
+                if key.len() == BLOB_HASH_LEN + U32_LEN + U64_LEN {
+                    links.push((
+                        BlobHash::try_from_hash_slice(&key[..BLOB_HASH_LEN]).unwrap(),
+                        key.deserialize_be_u32(BLOB_HASH_LEN)?,
+                        key.deserialize_be_u64(BLOB_HASH_LEN + U32_LEN)?,
+                        value.to_vec(),
+                    ));
+                }
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+    let mut batch = BatchBuilder::new();
+    for (hash, account_id, until, value) in links {
+        batch
+            .with_account_id(account_id)
+            .clear(ValueClass::Blob(BlobOp::Link {
+                hash: hash.clone(),
+                to: BlobLink::Temporary { until },
+            }))
+            .set(
+                ValueClass::Blob(BlobOp::Link {
+                    hash,
+                    to: BlobLink::Temporary { until: 1 },
+                }),
+                value,
+            );
+    }
+    if !batch.is_empty() {
+        test.server.store().write_batch(&mut batch).await.unwrap();
+    }
     admin
         .registry_create_object(Task::StoreMaintenance(TaskStoreMaintenance {
             maintenance_type: TaskStoreMaintenanceType::PurgeBlob,
@@ -1646,10 +1709,44 @@ async fn stress_the_fence(test: &TestServer, admin: &Account) -> Account {
     }
     expire_and_purge_blobs(test, admin).await;
     for hash in &staged_only {
-        assert!(
-            !readable(hash).await,
-            "a lost run's staged blob survived the purge"
-        );
+        if readable(hash).await {
+            // The links that still hold it.
+            let mut links = Vec::new();
+            test.server
+                .store()
+                .iterate(
+                    IterateParams::new(
+                        ValueKey {
+                            account_id: 0,
+                            collection: 0,
+                            document_id: 0,
+                            class: ValueClass::Blob(BlobOp::Commit { hash: hash.clone() }),
+                        },
+                        ValueKey {
+                            account_id: u32::MAX,
+                            collection: u8::MAX,
+                            document_id: u32::MAX,
+                            class: ValueClass::Blob(BlobOp::Link {
+                                hash: BlobHash::new_max(),
+                                to: BlobLink::Document,
+                            }),
+                        },
+                    )
+                    .ascending()
+                    .no_values(),
+                    |key, _| {
+                        if key.starts_with(hash.as_slice()) {
+                            links.push(key[BLOB_HASH_LEN..].to_vec());
+                            Ok(true)
+                        } else {
+                            Ok(false)
+                        }
+                    },
+                )
+                .await
+                .unwrap();
+            panic!("a lost run's staged blob survived the purge, held by {links:?}");
+        }
     }
     account
 }
@@ -3075,5 +3172,83 @@ async fn metadata_writes_lose_to_provisioning(test: &TestServer) -> Account {
     imap.send_ok("SETMETADATA \"\" (/private/comment NIL)")
         .await;
     imap.send_ok("LOGOUT").await;
+    account
+}
+
+/// Ruling 70 (the Task 6 re-review's N1): a calendar or event dead-property
+/// PROPPATCH by a writer that classified the account as ordinary carries the
+/// vault-absence assertion. A vault record is planted behind the cached
+/// classification, as a `setup-token` that commits after the writer read the
+/// account; the calendar's and the event's plaintext container writes then
+/// fail their assertion (503, nothing stored). With the record cleared, the
+/// same writes commit (the control).
+async fn dead_property_writes_lose_to_provisioning(test: &TestServer) -> Account {
+    use hyper::StatusCode;
+    println!("dead_property_writes_lose_to_provisioning");
+    const CALENDAR: &str = "/dav/cal/plainmail37@example.com/default/";
+    const EVENT: &str = "/dav/cal/plainmail37@example.com/default/dead-fence.ics";
+    const ICAL: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//fence//EN\r\n\
+BEGIN:VEVENT\r\nUID:dead-fence-1\r\nDTSTAMP:20261020T090000Z\r\n\
+DTSTART:20261021T090000Z\r\nDTEND:20261021T100000Z\r\nSUMMARY:dead fence\r\n\
+END:VEVENT\r\nEND:VCALENDAR\r\n";
+    let proppatch = |value: &str| {
+        format!(
+            concat!(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>",
+                "<D:propertyupdate xmlns:D=\"DAV:\" xmlns:X=\"urn:x-dead-fence\">",
+                "<D:set><D:prop><X:dead-fence>{}</X:dead-fence></D:prop></D:set>",
+                "</D:propertyupdate>"
+            ),
+            value
+        )
+    };
+    let admin = test.account("admin@example.com").clone();
+    let account = admin
+        .create_user_account(DEAD_WRITER, STRONG, "Fence", &[], user_permissions())
+        .await;
+    let id = account.id().document_id();
+    let dav = crate::utils::webdav::DummyWebDavClient::new(id, DEAD_WRITER, STRONG, DEAD_WRITER);
+    dav.request("PUT", EVENT, ICAL)
+        .await
+        .with_status(StatusCode::CREATED);
+    assert!(
+        !test.server.za_has_object_metadata(id).await.unwrap(),
+        "the account holds a container before the fenced writes"
+    );
+
+    let record = VaultRecord::pending(vec![0x5b; 32], i64::MAX);
+    test.server.za_vault_write(id, &record, None).await.unwrap();
+    assert!(
+        !test.server.account(id).await.unwrap().is_key_account(),
+        "the planted record changed the cached classification"
+    );
+    for path in [CALENDAR, EVENT] {
+        dav.request("PROPPATCH", path, proppatch("dead-fence-canary"))
+            .await
+            .with_status(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    assert!(
+        !test.server.za_has_object_metadata(id).await.unwrap(),
+        "a calendar container write committed while the account holds a vault record"
+    );
+
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(id)
+        .with_collection(Collection::Principal)
+        .with_document(0)
+        .clear(types::field::PrincipalField::ZeroAccessVault);
+    test.server.store().write_batch(&mut batch).await.unwrap();
+    for path in [CALENDAR, EVENT] {
+        dav.request("PROPPATCH", path, proppatch("dead-fence-control"))
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+    }
+    assert!(
+        test.server.za_has_object_metadata(id).await.unwrap(),
+        "the controls stored no container"
+    );
+    // The account's destruction removes the calendar, its event and their
+    // containers.
     account
 }

@@ -2270,7 +2270,8 @@ async fn conversion_contract_tests(test: &mut TestServer) {
                 .rewrapped,
             usize::from(updating)
         );
-        assert_eq!(held.finish().await.status, if updating { 409 } else { 201 });
+        // A lost commit assertion: 503 at 1.0 (409 at 0.16).
+        assert_eq!(held.finish().await.status, if updating { 503 } else { 201 });
         let event = test
             .server
             .fetch_groupware_resources(owner_id, owner_id, SyncCollection::Calendar)
@@ -8373,7 +8374,6 @@ async fn grantee_gate_controls(
     shared: &str,
 ) {
     use crate::utils::za::za_post;
-    use common::auth::oauth::GrantType;
     use registry::schema::{
         enums::Permission,
         prelude::{ObjectType, Property},
@@ -8401,18 +8401,13 @@ async fn grantee_gate_controls(
         .request("GET", &format!("{shared}event.ics"), "")
         .await
         .with_status(StatusCode::FORBIDDEN);
-    let bearer = test
-        .server
-        .encode_access_token(
-            GrantType::AccessToken,
-            bob.account_id,
-            bob.name,
-            3600,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+    // 1.0 accepts only grant-backed access tokens.
+    let (bearer_grant, bearer) = crate::utils::za::za_grant_token(
+        &test.server,
+        bob.name,
+        common::auth::oauth::scope::OAuthScopes::ALL,
+    )
+    .await;
     let mut keyless = DummyWebDavClient::new(bob.account_id, bob.name, STRONG, bob.name);
     keyless.credentials = format!("Bearer {bearer}");
     keyless
@@ -8524,6 +8519,7 @@ async fn grantee_gate_controls(
             "{label}: URI gate refusal must precede collection resolution"
         );
     }
+    crate::utils::za::za_revoke_grant(&test.server, bearer_grant).await;
 
     for (method, target, body) in [
         ("GET", format!("{shared}event.ics"), ""),
@@ -9894,7 +9890,9 @@ async fn class_side(test: &mut TestServer, key: bool) -> ClassSide {
         reader: DummyWebDavClient::new(ids[1], reader_name, STRONG, reader_name),
         cal: format!("/dav/cal/{}/class/", owner_name.replace('@', "%40")),
     };
-    for slug in ["class/", "class-own/"] {
+    // `class-copy/` is the owner's COPY destination: 1.0 refuses a copy
+    // that repeats a UID within one calendar (no-uid-conflict, ruling 50).
+    for slug in ["class/", "class-own/", "class-copy/"] {
         side.owner
             .request(
                 "MKCALENDAR",
@@ -10106,14 +10104,23 @@ pub async fn sharing_class_differential(test: &mut TestServer) {
         let (status, body) = side.sharee("GET", &side.path("public.ics"), &[], "").await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("class-summary-PUBLIC"), "{body}");
-        for (name, expected) in [
-            ("private.ics", StatusCode::FORBIDDEN),
-            ("confidential.ics", StatusCode::NOT_FOUND),
-        ] {
-            assert_eq!(
-                side.sharee("GET", &side.path(name), &[], "").await.0,
-                expected
-            );
+        // 1.0 serves a private event to a sharee with its time and CLASS
+        // only (0.16 refused it with 403), on both sides.
+        let (status, body) = side.sharee("GET", &side.path("private.ics"), &[], "").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "private.ics key={}: {body}",
+            side.key
+        );
+        assert!(
+            body.contains("CLASS:PRIVATE") && !body.contains("class-summary-"),
+            "private.ics key={}: {body}",
+            side.key
+        );
+        for (name, expected) in [("confidential.ics", StatusCode::NOT_FOUND)] {
+            let (status, body) = side.sharee("GET", &side.path(name), &[], "").await;
+            assert_eq!(status, expected, "{name} key={}: {body}", side.key);
         }
     }
 
@@ -10262,13 +10269,11 @@ pub async fn sharing_class_differential(test: &mut TestServer) {
         class_flags(test, plain.owner_id, plain_other).await,
         (true, false)
     );
-    assert_eq!(
-        plain
-            .sharee("GET", &plain.path("other.ics"), &[], "")
-            .await
-            .0,
-        StatusCode::FORBIDDEN
-    );
+    // Derived private: at 1.0 its sharee gets the time and CLASS only (0.16
+    // refused it with 403).
+    let (status, body) = plain.sharee("GET", &plain.path("other.ics"), &[], "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.contains("class-summary-"), "{body}");
 
     // The owner's writes: PROPPATCH, COPY and MOVE into the owner's other
     // calendar, and a CLASS change from PRIVATE to PUBLIC; the bits follow
@@ -10312,18 +10317,21 @@ pub async fn sharing_class_differential(test: &mut TestServer) {
             .request_with_headers(
                 "COPY",
                 &format!("{own}copy-source.ics"),
-                [("destination", format!("{own}copied.ics").as_str())],
+                [(
+                    "destination",
+                    format!("{}copied.ics", side.cal.replace("/class/", "/class-copy/")).as_str(),
+                )],
                 "",
             )
             .await
             .with_status(StatusCode::CREATED);
-        for name in ["copy-source.ics", "copied.ics"] {
+        for name in ["class-own/copy-source.ics", "class-copy/copied.ics"] {
             let id = test
                 .server
                 .fetch_groupware_resources(side.owner_id, side.owner_id, SyncCollection::Calendar)
                 .await
                 .unwrap()
-                .by_path(&format!("class-own/{name}"))
+                .by_path(name)
                 .unwrap()
                 .document_id();
             assert_eq!(
@@ -10364,7 +10372,7 @@ pub async fn sharing_class_differential(test: &mut TestServer) {
 
     test.wait_for_tasks().await;
     for side in sides {
-        for slug in ["class/", "class-own/"] {
+        for slug in ["class/", "class-own/", "class-copy/"] {
             side.owner
                 .request(
                     "DELETE",

@@ -191,9 +191,10 @@ pub async fn test(test: &mut TestServer) {
         .map(str::to_string)
         .collect();
     assert!(hrefs.contains(&drained_href), "{hrefs:?}");
-    // RFC 4791 7.9: a calendar-multiget may ask for `propname`, but the
-    // release 1 guard binds it to the calendar collection, so it never reaches
-    // the inbox (every inbox href is 404) and the propname fix need not cover it.
+    // RFC 4791 7.9: a calendar-multiget may ask for `propname`. 0.16 bound
+    // every multiget to the calendar collection, so each inbox href was 404;
+    // 1.0 routes a scheduling multiget to the inbox's items, so the visible
+    // item answers with its names and the pending one is still not served.
     let body = client
         .request(
             "REPORT",
@@ -212,22 +213,30 @@ pub async fn test(test: &mut TestServer) {
             .unwrap_or_default()
     };
     assert!(
-        entry(&pending_href).contains("HTTP/1.1 404")
-            && entry(&drained_href).contains("HTTP/1.1 404"),
+        !entry(&pending_href).contains("200 OK") && entry(&drained_href).contains("200 OK"),
         "{body}"
     );
-    // Review Focus 1: a multiget naming it answers 404 for that href.
+    // Review Focus 1: a multiget naming it answers exactly as for an href
+    // that names no item (0.16 answered 404 for both; 1.0's inbox multiget
+    // omits both).
     let body = client
         .multiget_calendar(KEY_INBOX, &[pending_href.as_str()])
         .await
         .response
         .body
         .unwrap();
-    assert!(
-        body.contains(&pending_href)
-            && body.contains("HTTP/1.1 404")
-            && !body.contains("inbox-pending-canary"),
-        "{body}"
+    let missing_href = format!("{KEY_INBOX}4294967.ics");
+    let missing = client
+        .multiget_calendar(KEY_INBOX, &[missing_href.as_str()])
+        .await
+        .response
+        .body
+        .unwrap();
+    assert!(!body.contains("inbox-pending-canary"), "{body}");
+    assert_eq!(
+        body.replace(&pending_href, "HREF"),
+        missing.replace(&missing_href, "HREF"),
+        "a pending item is answered unlike a missing one"
     );
     // An initial sync-collection does not report it either.
     let body = client

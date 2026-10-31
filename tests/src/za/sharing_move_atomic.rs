@@ -158,7 +158,9 @@ pub async fn test(test: &mut TestServer) {
         .with_status(StatusCode::MULTI_STATUS);
     let quota = test.server.get_used_quota_account(owner).await.unwrap();
     let status = parked.finish().await;
-    if status != StatusCode::CONFLICT {
+    // A lost commit assertion: 1.0 answers 503 with Retry-After where 0.16
+    // answered 409 (`dav/src/request.rs`).
+    if status != StatusCode::SERVICE_UNAVAILABLE {
         failures.push(format!("metadata race returned {status}"));
     }
     if !readable(
@@ -247,7 +249,8 @@ pub async fn test(test: &mut TestServer) {
     let after_create = snapshot(test, owner).await;
     let quota = test.server.get_used_quota_account(owner).await.unwrap();
     let status = parked.finish().await;
-    if status != StatusCode::CONFLICT
+    // A lost commit assertion: 503 at 1.0, as above.
+    if status != StatusCode::SERVICE_UNAVAILABLE
         || archive(test, owner, Collection::Calendar, source_id)
             .await
             .is_none()
@@ -374,7 +377,12 @@ async fn controls(test: &TestServer, owner: u32, client: &DummyWebDavClient) {
         }
         let after_competing = snapshot(test, owner).await;
         let quota = test.server.get_used_quota_account(owner).await.unwrap();
-        assert_eq!(parked.finish().await, StatusCode::CONFLICT, "{kind}");
+        // A lost commit assertion: 503 at 1.0 (409 at 0.16).
+        assert_eq!(
+            parked.finish().await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{kind}"
+        );
         assert_eq!(
             snapshot(test, owner).await,
             after_competing,
@@ -552,7 +560,8 @@ async fn controls(test: &TestServer, owner: u32, client: &DummyWebDavClient) {
         assert_eq!(
             parked.finish().await,
             if concurrent {
-                StatusCode::CONFLICT
+                // A lost commit assertion: 503 at 1.0 (409 at 0.16).
+                StatusCode::SERVICE_UNAVAILABLE
             } else {
                 StatusCode::NO_CONTENT
             }

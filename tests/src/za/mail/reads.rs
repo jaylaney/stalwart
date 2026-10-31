@@ -1985,7 +1985,14 @@ async fn assigned_ids_preserve_sealed_read_offsets(
         .iter()
         .map(|email| key_email_id(email.document_id))
         .collect::<Vec<_>>();
-    let (list, mut not_found) = email_get(key, Some(ids[..3].to_vec()), &["id", "subject"]).await;
+    // `bodyValues` reads the blob (a subject comes from the opened stub), as
+    // `corrupted_stub_and_blob` reads it.
+    let (list, mut not_found) = email_get(
+        key,
+        Some(ids[..3].to_vec()),
+        &["id", "subject", "bodyValues"],
+    )
+    .await;
     not_found.sort();
     let mut unreadable = vec![ids[0].clone(), ids[2].clone()];
     unreadable.sort();

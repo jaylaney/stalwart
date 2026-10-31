@@ -1083,12 +1083,18 @@ pub async fn test_plain_owner(test: &mut TestServer) {
         0,
         "a plain task was already queued"
     );
+    // 1.0's handlers schedule from the calendar owner's addresses (0.16's
+    // `scheduling_account_info` used the writer's), so the event key1
+    // writes into plain's calendar names plain as its organizer.
     key1.client
         .request_with_headers(
             "PUT",
             SHARED_PLAIN,
             [CONTENT_TYPE],
-            invite("za-fo-shared", START_A, &["key2@example.com"]),
+            invite("za-fo-shared", START_A, &["key2@example.com"]).replace(
+                "ORGANIZER:mailto:key1@example.com",
+                "ORGANIZER:mailto:plain@example.com",
+            ),
         )
         .await
         .with_status(StatusCode::CREATED);

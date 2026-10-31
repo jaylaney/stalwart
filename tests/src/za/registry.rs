@@ -37,7 +37,7 @@ pub async fn test(test: &mut TestServer) {
         .registry_update_object_expect_err(
             ObjectType::Account,
             key.id(),
-            json!({ "credentials/0/otpAuth": "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP" }),
+            json!({ "credentials/0/otpUrl": "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP" }),
         )
         .await
         .assert_type(SetErrorType::Forbidden)

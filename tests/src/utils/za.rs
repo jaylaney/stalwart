@@ -816,8 +816,14 @@ pub async fn plant_container(
         .unwrap()
         .expect("the container's document");
     let mut batch = BatchBuilder::new();
+    // Logged as the DAV writer logs it (`DeadTarget`): the presence rewrite
+    // patches the row's change id, which the logged change assigns.
+    let log = match collection {
+        Collection::Calendar => MetadataLog::Container,
+        _ => MetadataLog::Item { prefix: None },
+    };
     let presence = change
-        .into_write(&owner, collection, MetadataLog::None)
+        .into_write(&owner, collection, log)
         .build(store::write::PendingId::Assigned(document_id), &mut batch)
         .unwrap();
     match collection {

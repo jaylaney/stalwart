@@ -403,7 +403,8 @@ async fn delivery_leaves_no_content_in_events(test: &TestServer) {
         let list_names = values(
             &events,
             EventType::Sieve(SieveEvent::ListNotFound),
-            Key::Details,
+            // 1.0 names the list in `Name` (0.16: `Details`).
+            Key::Name,
         );
         assert_eq!(message_ids.len(), 1, "{to}: one ingest event");
         assert_any_contains(&reads, "RCPT TO", to);
@@ -443,7 +444,8 @@ async fn delivery_leaves_no_content_in_events(test: &TestServer) {
             assert_any_contains(
                 &plugin_errors
                     .iter()
-                    .map(|event| value(event, Key::Id).unwrap_or_default())
+                    // 1.0 names the store in `Name` (0.16: `Id`).
+                    .map(|event| value(event, Key::Name).unwrap_or_default())
                     .collect::<Vec<_>>(),
                 "subject-canary",
                 "control: the plugin error's store name",

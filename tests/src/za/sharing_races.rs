@@ -446,7 +446,8 @@ async fn calendar_retry_keeps_event_and_uid_assertions(
     stage(test, owner, calendar, 2).await;
     assert_eq!(
         parked.finish().await,
-        409,
+        // A lost commit assertion: 503 at 1.0 (409 at 0.16).
+        503,
         "calendar retry overwrote a concurrent event"
     );
     assert_eq!(
@@ -635,7 +636,8 @@ async fn second_calendar_loss(test: &TestServer, owner: u32, calendar: u32, id: 
     second.release.notify_one();
     assert_eq!(
         request.await.unwrap(),
-        409,
+        // A lost commit assertion: 503 at 1.0 (409 at 0.16).
+        503,
         "second calendar assertion loss must terminate"
     );
     assert_eq!(
@@ -1939,8 +1941,9 @@ async fn overwrite_other_parent_fences(test: &TestServer, owner: u32, client: &D
     println!(
         "Task5 overwrite other-parent fences: event_retried={retried}, collection_status={copied}, original_unchanged={unchanged}"
     );
+    // The lost assertion: 503 at 1.0 (409 at 0.16).
     assert!(
-        retried && copied == StatusCode::CONFLICT && unchanged,
+        retried && copied == StatusCode::SERVICE_UNAVAILABLE && unchanged,
         "overwrite escaped other-parent calendar fence"
     );
     for slug in [
@@ -4133,7 +4136,8 @@ async fn grantee_http_write_races(test: &mut TestServer) {
             }
         }
     }
-    // Calendar PROPPATCH keeps an immediate409 instead of the event one-retry path.
+    // Calendar PROPPATCH keeps an immediate refusal instead of the event
+    // one-retry path: a lost commit assertion, 503 at 1.0 (409 at 0.16).
     za_post("shares/grant", &grant(BOB)).await.expect(200);
     za_post("shares/grant", &grant(CAROL)).await.expect(200);
     let parked=HookParked::start(owner,test_hooks::set_update_commit_pause,async {
@@ -4145,7 +4149,10 @@ async fn grantee_http_write_races(test: &mut TestServer) {
     )
     .await
     .expect(200);
-    assert_eq!(parked.finish().await.status, StatusCode::CONFLICT);
+    assert_eq!(
+        parked.finish().await.status,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
     let body = DummyWebDavClient::new(bob, BOB, STRONG, BOB)
         .request("PROPFIND", PATH, "")
         .await

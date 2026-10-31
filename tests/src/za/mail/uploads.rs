@@ -603,7 +603,11 @@ async fn raw_consumers(
                     "FileNode/set",
                     json!({
                         "accountId": own,
-                        "create": { "f": { "name": "za-raw.bin", "blobId": blob_id } }
+                        "create": { "f": {
+                            "@type": "File",
+                            "name": "za-raw.bin",
+                            "blobId": blob_id
+                        } }
                     }),
                 )
                 .await,
@@ -628,7 +632,9 @@ async fn raw_consumers(
                     json!({
                         "fromAccountId": own,
                         "accountId": shared.0,
+                        // 1.0 reads the source from the entry's `id`.
                         "create": { copy_from: {
+                            "id": copy_from,
                             "parentId": shared.1,
                             "name": "za-raw-copy.bin",
                             "blobId": blob_id
@@ -683,8 +689,18 @@ async fn blob_copy(
         .await
 }
 
-/// A `FileNode/set` create of one node in `account`; its id.
-async fn file_node(session: &Account, account: &Account, node: Value) -> String {
+/// A `FileNode/set` create of one node in `account`; its id. 1.0 requires
+/// the node's `@type` on creation: a `File` with a blob, else a `Directory`.
+async fn file_node(session: &Account, account: &Account, mut node: Value) -> String {
+    let kind = if node.get("blobId").is_some() {
+        "File"
+    } else {
+        "Directory"
+    };
+    node.as_object_mut()
+        .unwrap()
+        .entry("@type")
+        .or_insert_with(|| kind.into());
     let reply = session
         .jmap_method_call(
             "FileNode/set",
@@ -747,9 +763,18 @@ async fn raw_consumers_are_refused(
             "FileNode/set",
             json!({
                 "accountId": other_plain.id_string(),
+                // 1.0 splits a content change into `mayModifyContent`.
                 "update": { &shared_folder: { "shareWith": {
-                    key.id_string(): { "mayRead": true, "mayAddChildren": true },
-                    plain.id_string(): { "mayRead": true, "mayAddChildren": true }
+                    key.id_string(): {
+                        "mayRead": true,
+                        "mayAddChildren": true,
+                        "mayModifyContent": true
+                    },
+                    plain.id_string(): {
+                        "mayRead": true,
+                        "mayAddChildren": true,
+                        "mayModifyContent": true
+                    }
                 } } }
             }),
         )
@@ -933,6 +958,7 @@ async fn raw_consumers_are_refused(
             json!({
                 "accountId": other_plain.id_string(),
                 "create": { "n": {
+                    "@type": "File",
                     "name": "from-key.bin",
                     "parentId": &shared_folder,
                     "blobId": &shared_blob
@@ -966,6 +992,7 @@ async fn raw_consumers_are_refused(
                 "fromAccountId": plain.id_string(),
                 "accountId": other_plain.id_string(),
                 "create": { &plain_file: {
+                    "id": &plain_file,
                     "parentId": &shared_folder,
                     "name": "copied.bin",
                     "blobId": &plain_upload

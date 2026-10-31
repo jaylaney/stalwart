@@ -14,10 +14,6 @@ use crate::utils::{
     webdav::DummyWebDavClient,
     za::{Parked, SERVER_URL, assert_nothing_cached, za_grant_token, za_revoke_grant},
 };
-use ::registry::{
-    schema::{prelude::Property, structs::OidcProvider},
-    types::duration::Duration as RegistryDuration,
-};
 use common::{
     BuildServer, Caches, HttpAuthCache,
     auth::{AuthRequest, TokenScope, oauth::scope::OAuthScopes},
@@ -538,15 +534,17 @@ async fn revoked_grant_cannot_repopulate_cache(test: &TestServer) {
     assert!(caches.http_auth.get(&token).is_none());
 }
 
-/// C4: an expired cached Bearer token is refused. The token is minted while
-/// the access-token lifetime is `TOKEN_SECS`, then the lifetime is restored,
-/// so the cache's own bound (`oauth_expiry_token`) is far longer than the
-/// token's: the entry must expire with the token (`expires_in`), and the
-/// request after it is verified afresh and refused.
+/// C4: an expired cached Bearer token is refused. The token is minted with an
+/// access-token lifetime of `TOKEN_SECS`, while the server's own lifetime
+/// stays as configured, so the cache's own bound (`oauth_expiry_token`) is
+/// far longer than the token's: the entry must expire with the token
+/// (`expires_in`), and the request after it is verified afresh and refused.
+/// 1.0 refuses an `accessTokenExpiry` under ten minutes, so the token is
+/// minted through a view of the server whose core carries the short
+/// lifetime, where 0.16 set and restored the setting.
 async fn expired_bearer_cache_entry_is_refused(test: &TestServer) {
     const TOKEN_SECS: u64 = 5;
     println!("expired_bearer_cache_entry_is_refused");
-    let admin = test.account(ADMIN);
     let plain = test.account(PLAIN);
     let lifetime = test
         .server
@@ -557,11 +555,14 @@ async fn expired_bearer_cache_entry_is_refused(test: &TestServer) {
         .oauth_expiry_token;
     assert!(lifetime > 60, "the suite's access tokens outlive this test");
 
-    set_access_token_expiry(admin, TOKEN_SECS).await;
     let server = test.server.inner.build_server();
-    assert_eq!(server.core.oauth.oauth_expiry_token, TOKEN_SECS);
-    let (grant_id, token) = za_grant_token(&server, plain.name(), OAuthScopes::ALL).await;
-    set_access_token_expiry(admin, lifetime).await;
+    let mut core = (*server.core).clone();
+    core.oauth.oauth_expiry_token = TOKEN_SECS;
+    let minting = common::Server {
+        inner: server.inner.clone(),
+        core: std::sync::Arc::new(core),
+    };
+    let (grant_id, token) = za_grant_token(&minting, plain.name(), OAuthScopes::ALL).await;
     assert_eq!(
         test.server
             .inner
@@ -594,19 +595,6 @@ async fn expired_bearer_cache_entry_is_refused(test: &TestServer) {
     assert!(caches.http_auth.get(&token).is_none());
 
     za_revoke_grant(&test.server, grant_id).await;
-}
-
-async fn set_access_token_expiry(admin: &crate::utils::account::Account, secs: u64) {
-    admin
-        .registry_update_setting(
-            OidcProvider {
-                access_token_expiry: RegistryDuration::from_millis(secs * 1000),
-                ..Default::default()
-            },
-            &[Property::AccessTokenExpiry],
-        )
-        .await;
-    admin.reload_settings().await;
 }
 
 /// C2, C4: a key account's keyless logins over HTTP, its own OAuth Bearer

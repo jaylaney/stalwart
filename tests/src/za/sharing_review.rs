@@ -357,9 +357,10 @@ pub async fn test(test: &mut TestServer) {
         }
         assert_ne!(archive(test, owner, source_id).await.version, before);
         let result = parked.finish().await;
-        if result != StatusCode::CONFLICT {
+        // A lost commit assertion: 503 at 1.0 (409 at 0.16).
+        if result != StatusCode::SERVICE_UNAVAILABLE {
             failures.push(format!(
-                "collection MOVE {scenario}: expected 409, got {result}"
+                "collection MOVE {scenario}: expected 503, got {result}"
             ));
         }
         let resources = test
@@ -461,7 +462,7 @@ pub async fn test(test: &mut TestServer) {
     assert_ne!(archive(test, owner, source_id).await.version, before);
     assert_eq!(
         parked.finish().await,
-        StatusCode::CONFLICT,
+        StatusCode::SERVICE_UNAVAILABLE,
         "late source write lost its CAS fence"
     );
     let resources = test
@@ -703,7 +704,8 @@ async fn plain_update_trace(test: &TestServer, failures: &mut Vec<String>) {
         )
         .unwrap();
     test.server.commit_batch(batch).await.unwrap();
-    assert_eq!(parked.finish().await, StatusCode::CONFLICT);
+    // A lost commit assertion: 503 at 1.0 (409 at 0.16, `dav/src/request.rs`).
+    assert_eq!(parked.finish().await, StatusCode::SERVICE_UNAVAILABLE);
     let captured = tokio::time::timeout(Duration::from_secs(5), async {
         while let Some(batch) = rx.recv().await {
             for event in batch {

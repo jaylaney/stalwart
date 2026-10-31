@@ -778,7 +778,9 @@ async fn jmap_refused_filters_and_sorts(key: &Fixture, plain: &Fixture) {
             json!({ "noneInThreadHaveKeyword": "$HasAttachment" }),
         ),
     ];
-    let sorts = ["from", "to", "cc", "subject", "sentAt"]
+    // 1.0 sorts by no `cc` for any account (`EmailComparator::Cc` answers
+    // `unsupportedSort` upstream), so it is not a refusal of this rule.
+    let sorts = ["from", "to", "subject", "sentAt"]
         .map(|property| {
             (
                 property,
@@ -819,11 +821,21 @@ async fn jmap_refused_filters_and_sorts(key: &Fixture, plain: &Fixture) {
         let is_key = std::ptr::eq(fixture, key);
         let context = fixture.account.name();
         for (property, filter) in &filters {
+            // 1.0 reads object-metadata conditions only for a request that
+            // names the metadata capability.
             let reply = fixture
                 .account
-                .jmap_method_call(
-                    "Email/query",
-                    query_args(&fixture.account, Some(filter.clone()), None, false),
+                .jmap_request(
+                    &[
+                        "urn:ietf:params:jmap:core",
+                        "urn:ietf:params:jmap:mail",
+                        "urn:ietf:params:jmap:metadata",
+                    ],
+                    json!([[
+                        "Email/query",
+                        query_args(&fixture.account, Some(filter.clone()), None, false),
+                        "0"
+                    ]]),
                 )
                 .await;
             if is_key {

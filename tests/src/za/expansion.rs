@@ -23,10 +23,12 @@ const CONTENT_TYPE: (&str, &str) = ("content-type", "text/calendar; charset=utf-
 const SUMMARY_CANARY: &str = "expansion-canary-summary-5b1e";
 const DESCRIPTION_CANARY: &str = "expansion-canary-description-8c3f";
 
-/// An RRULE that ends before it starts: calcard reports an expansion error.
+/// A rule in an unsupported RSCALE: calcard reports an RRULE error whose
+/// text names the scale. (1.0's calcard expands an UNTIL before DTSTART,
+/// 0.16's fixture, to no instance without an error.)
 fn bad_rrule(uid: &str) -> String {
     format!(
-        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\nBEGIN:VEVENT\r\nUID:{uid}\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20240102T090000Z\r\nRRULE:FREQ=DAILY;UNTIL=20200101T000000Z\r\nSUMMARY:{SUMMARY_CANARY}\r\nDESCRIPTION:{DESCRIPTION_CANARY}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\nBEGIN:VEVENT\r\nUID:{uid}\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20240102T090000Z\r\nRRULE:RSCALE=HEBREW;FREQ=YEARLY;COUNT=2\r\nSUMMARY:{SUMMARY_CANARY}\r\nDESCRIPTION:{DESCRIPTION_CANARY}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
     )
 }
 
@@ -147,7 +149,9 @@ pub async fn test(test: &mut TestServer) {
             for (key, value) in event.keys.iter() {
                 strings(value, &mut all);
                 match key {
-                    Key::Details => {
+                    // 1.0 names the event's UID in `ResourceUid` (0.16 in
+                    // `Details`).
+                    Key::Details | Key::ResourceUid => {
                         let mut d = Vec::new();
                         strings(value, &mut d);
                         details = d.join("");
@@ -187,7 +191,9 @@ pub async fn test(test: &mut TestServer) {
     for (details, reason, _, account_id, document_id) in &captured {
         if details.starts_with("za-chrono-") {
             assert!(
-                reason.iter().any(|s| s == "chrono error"),
+                reason
+                    .iter()
+                    .any(|s| s == "Failed to expand stored time ranges"),
                 "unexpected chrono reason: {dump}"
             );
             let (_, expected_account, expected_document) = broken
@@ -208,12 +214,17 @@ pub async fn test(test: &mut TestServer) {
             assert_eq!(reason, &["RRule error".to_string()], "key reason: {dump}");
         } else if details == "za-rrule-plain" {
             assert!(
-                reason.iter().any(|s| s.contains("Until date")),
+                reason.iter().any(|s| s.contains("HEBREW")),
                 "plain reason must stay upstream's text: {dump}"
             );
         }
     }
-    for (_, _, all, ..) in &captured {
+    // The key account's events. An ordinary account's PUT-time event carries
+    // 1.0 upstream's `Contents` (non-key accounts take upstream's path).
+    for (_, _, all, ..) in captured
+        .iter()
+        .filter(|(details, ..)| details.ends_with("-key"))
+    {
         for forbidden in [
             SUMMARY_CANARY,
             DESCRIPTION_CANARY,

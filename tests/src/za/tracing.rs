@@ -162,13 +162,23 @@ async fn put_and_report(client: &DummyWebDavClient, collection: &str, uid: &str,
         )
         .await
         .with_status(StatusCode::CREATED);
-    let body = client
-        .request_with_headers("REPORT", collection, [("depth", "1")], query(canary))
-        .await
-        .with_status(StatusCode::MULTI_STATUS)
-        .body
-        .unwrap();
-    assert!(body.contains(canary), "{body}");
+    // An ordinary account's text match reads 1.0's Calendar search index,
+    // which the index queue writes after the PUT: retried until it is
+    // written (bounded). A key account's is matched in memory.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let body = client
+            .request_with_headers("REPORT", collection, [("depth", "1")], query(canary))
+            .await
+            .with_status(StatusCode::MULTI_STATUS)
+            .body
+            .unwrap();
+        if body.contains(canary) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{body}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 /// POST a `Core/echo` call carrying `canary` to `/jmap`; the echoed
