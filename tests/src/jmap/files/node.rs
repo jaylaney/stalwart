@@ -720,8 +720,10 @@ pub async fn test_options(test: &TestServer) {
     let dav_parent_id = response.created(0).id().to_string();
     response.created(1);
     let dav_parent_path = "/dav/file/jdoe%40example.com/%C3%9Cnterlagen%202026";
+    // 1.0 leaves RFC 3986 sub-delimiters (`&`, `(`, `)`) unescaped in a
+    // path segment; 0.16 percent-encoded them.
     let dav_child_path =
-        "/dav/file/jdoe%40example.com/%C3%9Cnterlagen%202026/Q1%20%26%20Q2%20%28final%29";
+        "/dav/file/jdoe%40example.com/%C3%9Cnterlagen%202026/Q1%20&%20Q2%20(final)";
     dav_client
         .propfind(dav_parent_path, ["D:getetag"])
         .await
