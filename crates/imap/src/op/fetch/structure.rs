@@ -739,3 +739,7 @@ impl MediaToken for str {
 #[rustfmt::skip]
 #[path = "../../../../../../stalwart-tests/unit/imap/src/op/fetch/structure/tests.rs"]
 pub(super) mod tests;
+
+#[cfg(test)]
+#[path = "structure_restored_tests.rs"]
+mod restored_tests;
