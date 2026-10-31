@@ -85,6 +85,19 @@ pub trait ZaMailView: Sync + Send {
         document_id: u32,
     ) -> impl Future<Output = trc::Result<ZaMetadataRow>> + Send;
 
+    /// `za_metadata_view` for a reader that holds the stored row by
+    /// reference (a batch read): the stub's full row opened, or `None` when
+    /// the reader uses `stored` as it is (an ordinary account, or a key
+    /// account's row that is not a stub). The same checks and errors as the
+    /// view, which calls it.
+    fn za_open_metadata_row(
+        &self,
+        stored: &MetadataRow,
+        keys: Option<&SessionKeys>,
+        account_id: u32,
+        document_id: u32,
+    ) -> impl Future<Output = trc::Result<Option<MetadataRow>>> + Send;
+
     /// Mail spec 7: the message blob a reader uses in place of `bytes`, the
     /// blob read for a message whose stored row is a stub
     /// (`stored_is_stub`, the view's `opened`), opened with `keys`
@@ -184,27 +197,41 @@ impl ZaMailView for Server {
         account_id: u32,
         document_id: u32,
     ) -> trc::Result<ZaMetadataRow> {
+        Ok(
+            match self
+                .za_open_metadata_row(&stored, keys, account_id, document_id)
+                .await?
+            {
+                Some(row) => ZaMetadataRow { row, opened: true },
+                None => ZaMetadataRow {
+                    row: stored,
+                    opened: false,
+                },
+            },
+        )
+    }
+
+    async fn za_open_metadata_row(
+        &self,
+        stored: &MetadataRow,
+        keys: Option<&SessionKeys>,
+        account_id: u32,
+        document_id: u32,
+    ) -> trc::Result<Option<MetadataRow>> {
         let Some(keys) = keys else {
-            return Ok(ZaMetadataRow {
-                row: stored,
-                opened: false,
-            });
+            return Ok(None);
         };
-        if !is_stub(&stored).caused_by(trc::location!())? {
-            return Ok(ZaMetadataRow {
-                row: stored,
-                opened: false,
-            });
+        if !is_stub(stored).caused_by(trc::location!())? {
+            return Ok(None);
         }
-        let private_key = if stub_needs_private_key(&stored)
+        let private_key = if stub_needs_private_key(stored)
             .map_err(|err| za_unreadable(err, account_id, document_id))?
         {
             Some(za_private_key(self, keys, Some(document_id)).await?)
         } else {
             None
         };
-        za_open_stub_row(&stored, keys, private_key, account_id, document_id)
-            .map(|row| ZaMetadataRow { row, opened: true })
+        za_open_stub_row(stored, keys, private_key, account_id, document_id).map(Some)
     }
 
     async fn za_open_message_blob(

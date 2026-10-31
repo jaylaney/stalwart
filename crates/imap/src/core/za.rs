@@ -9,13 +9,15 @@
 //! one routed through a group's grant, still names the account among its
 //! shared accounts; the session's list leaves it out at every sync.
 
-use super::{MailboxSync, SessionData};
+use super::{MailboxChange, MailboxSync, SessionData};
 use common::{auth::AccessToken, network::SessionStream};
+use imap_proto::protocol::MailboxObjectId;
 use trc::AddContext;
 
 impl<T: SessionStream> SessionData<T> {
     /// Drops every foreign key account (`za_foreign_key_account`) from the
-    /// session's list, its mailboxes reported as deleted in `changes`. The
+    /// session's list, its mailboxes reported as deleted in `changes` (as
+    /// upstream reports an account whose grant is gone). The
     /// session's own account stays listed (the list's first entry), an
     /// impersonated key account included: every use of its mailboxes is
     /// refused (ruling R35).
@@ -45,7 +47,13 @@ impl<T: SessionStream> SessionData<T> {
                 {
                     let account = mailboxes.remove(pos);
                     if let Some(changes) = changes {
-                        changes.deleted.extend(account.mailbox_names.into_keys());
+                        changes
+                            .deleted
+                            .extend(account.names.into_iter().map(|entry| MailboxChange {
+                                account_id,
+                                name: entry.name,
+                                objectid: MailboxObjectId::Empty,
+                            }));
                     }
                 }
             }

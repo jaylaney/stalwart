@@ -182,6 +182,10 @@ impl<T: SessionStream> SessionData<T> {
             };
         };
 
+        // Mail spec 6.3, ruling R34: before the message cache is read.
+        self.server
+            .za_assert_mail_route(&self.access_token, mailbox.account_id)
+            .await?;
         let cache = caches.fetch(&self.server, mailbox.account_id).await?;
 
         self.status_in(&cache, access_token, mailbox, mailbox_name, items)

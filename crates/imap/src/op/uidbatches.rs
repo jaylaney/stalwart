@@ -60,6 +60,11 @@ impl<T: SessionStream> Session<T> {
         }
 
         // Resynchronize so that batches reflect the current mailbox contents
+        // Mail spec 6.3, ruling R34: before the message cache is read.
+        data.server
+            .za_assert_mail_route(&data.access_token, mailbox.id.account_id)
+            .await
+            .imap_ctx(&arguments.tag, trc::location!())?;
         let cache = data
             .server
             .get_cached_messages(mailbox.id.account_id)

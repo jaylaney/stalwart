@@ -50,6 +50,11 @@ impl<T: SessionStream> Session<T> {
 
         let op_start = Instant::now();
         let (data, mailbox) = self.state.select_data();
+        // Mail spec 6.3, ruling R34: before the message cache is read.
+        data.server
+            .za_assert_mail_route(&data.access_token, mailbox.id.account_id)
+            .await
+            .imap_ctx(&request.tag, trc::location!())?;
         let cache = data
             .server
             .get_cached_messages(mailbox.id.account_id)
@@ -164,10 +169,9 @@ impl<T: SessionStream> SessionData<T> {
         message_limit: u32,
         op_start: Instant,
     ) -> trc::Result<Option<u32>> {
-<<<<<<< HEAD
         // Mail spec 6.3, ruling R34: nothing is expunged from a key account's
         // mailbox through another account's session. EXPUNGE is refused
-        // before (`check_mailbox_acl`); CLOSE deselects without expunging.
+        // before its cache is read; CLOSE deselects without expunging.
         if self
             .server
             .za_foreign_key_account(&self.access_token, mailbox.id.account_id)
@@ -177,9 +181,6 @@ impl<T: SessionStream> SessionData<T> {
             return Ok(None);
         }
 
-        // Obtain message ids
-=======
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
         let account_id = mailbox.id.account_id;
         let sequence = sequence.map(|sequence| {
             RoaringBitmap::from_iter(sequence.into_iter().map(|resolved| resolved.id))

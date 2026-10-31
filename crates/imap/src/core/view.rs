@@ -796,6 +796,15 @@ impl<T: SessionStream> SessionData<T> {
         cache: &MessageStoreCache,
         changed: Option<&mut Vec<u32>>,
     ) -> trc::Result<u64> {
+        // Mail spec 6.3, ruling R34: a key account's selected mailbox is read
+        // only by its own sessions (FETCH, STORE, SEARCH, SORT, THREAD,
+        // UIDBATCHES, EXPUNGE, the source of COPY and MOVE). Every caller
+        // reads `cache` first, so each checks the route before its read
+        // (`za_assert_mail_route`); this check, 0.16's in
+        // `synchronize_messages`, is the net for a caller that does not.
+        self.server
+            .za_assert_mail_route(&self.access_token, mailbox.id.account_id)
+            .await?;
         let since = mailbox.change_id();
         if cache.emails.change_id <= since {
             return Ok(since);

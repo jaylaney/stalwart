@@ -65,6 +65,15 @@ impl<T: SessionStream> SessionData<T> {
                 .caused_by(trc::location!())?,
         );
         for account_id in shared {
+            // Mail spec 6.3, ruling R34: not a key account's.
+            if data
+                .server
+                .za_foreign_key_account(&data.access_token, account_id)
+                .await
+                .caused_by(trc::location!())?
+            {
+                continue;
+            }
             let prefix = data.shared_prefix(account_id).await?;
             accounts.push(
                 data.account_view(account_id, Some(prefix), &data.access_token)
@@ -85,47 +94,8 @@ impl<T: SessionStream> SessionData<T> {
                 .account(account_id)
                 .await
                 .caused_by(trc::location!())?
-<<<<<<< HEAD
-                .unwrap(),
-        ];
-
-        // Fetch shared mailboxes
-        for &account_id in session.access_token.shared_accounts(Collection::Mailbox) {
-            // Mail spec 6.3, ruling R34: not a key account's.
-            if session
-                .server
-                .za_foreign_key_account(&session.access_token, account_id)
-                .await
-                .caused_by(trc::location!())?
-            {
-                continue;
-            }
-            let prefix: String = format!(
-                "{}/{}",
-                session.server.core.email.shared_folder,
-                session
-                    .server
-                    .account(account_id)
-                    .await
-                    .caused_by(trc::location!())?
-                    .name()
-            );
-            mailboxes.push(
-                session
-                    .fetch_account_mailboxes(account_id, prefix.into(), &session.access_token, None)
-                    .await
-                    .caused_by(trc::location!())?
-                    .unwrap(),
-            );
-        }
-
-        session.mailboxes = Mutex::new(mailboxes);
-
-        Ok(session)
-=======
                 .name()
         ))
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
     }
 
     async fn account_view(
@@ -231,7 +201,6 @@ impl<T: SessionStream> SessionData<T> {
             };
 
             for account_id in added_account_ids {
-<<<<<<< HEAD
                 // Mail spec 6.3, ruling R34: not a key account's.
                 if self
                     .server
@@ -241,21 +210,6 @@ impl<T: SessionStream> SessionData<T> {
                 {
                     continue;
                 }
-                let prefix: String = format!(
-                    "{}/{}",
-                    self.server.core.email.shared_folder,
-                    self.server
-                        .account(account_id)
-                        .await
-                        .caused_by(trc::location!())?
-                        .name()
-                );
-                added_accounts.push(
-                    self.fetch_account_mailboxes(account_id, prefix.into(), &access_token, None)
-                        .await?
-                        .unwrap(),
-                );
-=======
                 let prefix = self.shared_prefix(account_id).await?;
                 let account = self
                     .account_view(account_id, Some(prefix), &access_token)
@@ -269,7 +223,6 @@ impl<T: SessionStream> SessionData<T> {
                     );
                 }
                 self.mailboxes.lock().push(account);
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
             }
 
             self.state.store(state, Ordering::Relaxed);
@@ -656,11 +609,6 @@ impl<T: SessionStream> SessionData<T> {
         mailbox_id: u32,
         item: Acl,
     ) -> trc::Result<bool> {
-        // Mail spec 6.3, ruling R34: a key account's mailbox is used only by
-        // its own sessions.
-        self.server
-            .za_assert_mail_route(&self.access_token, account_id)
-            .await?;
         let access_token = self.refresh_access_token().await?;
         self.check_mailbox_acl_as(&access_token, cache, account_id, mailbox_id, item)
             .await
@@ -674,6 +622,12 @@ impl<T: SessionStream> SessionData<T> {
         mailbox_id: u32,
         item: Acl,
     ) -> trc::Result<bool> {
+        // Mail spec 6.3, ruling R34: a key account's mailbox is used only by
+        // its own sessions. Here, not in `check_mailbox_acl`, since STATUS
+        // and the selected mailbox's access check call this one directly.
+        self.server
+            .za_assert_mail_route(&self.access_token, account_id)
+            .await?;
         if access_token.is_member(account_id) {
             return Ok(true);
         }
@@ -716,6 +670,10 @@ impl<T: SessionStream> SessionData<T> {
     }
 
     pub async fn selected_access(&self, mailbox: &MailboxId) -> trc::Result<SelectedAccess> {
+        // Mail spec 6.3, ruling R34: before the message cache is read.
+        self.server
+            .za_assert_mail_route(&self.access_token, mailbox.account_id)
+            .await?;
         let cache = self
             .server
             .get_cached_messages(mailbox.account_id)

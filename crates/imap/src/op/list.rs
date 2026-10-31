@@ -412,6 +412,17 @@ impl<T: SessionStream> SessionData<T> {
                 let Some(mailbox) = self.get_mailbox_by_name(&list_item.mailbox_name) else {
                     continue;
                 };
+                // Mail spec 6.3, ruling R34: no status of a key account's
+                // mailbox in another account's session, and its message
+                // cache is not read.
+                if let Err(err) = self
+                    .server
+                    .za_assert_mail_route(&self.access_token, mailbox.account_id)
+                    .await
+                {
+                    trc::error!(err.span_id(self.session_id));
+                    continue;
+                }
                 let cache = caches
                     .fetch(&self.server, mailbox.account_id)
                     .await

@@ -339,6 +339,22 @@ impl<T: SessionStream> SessionData<T> {
         is_utf8: bool,
         is_objectid: bool,
     ) -> trc::Result<()> {
+        // Mail spec 6.3, ruling R34: another account's session gets no
+        // update of a key account's mailbox it still has selected, and its
+        // message cache is not read; the calling command completes.
+        let mailbox = match mailbox {
+            Some(selected)
+                if self
+                    .server
+                    .za_foreign_key_account(&self.access_token, selected.id.account_id)
+                    .await
+                    .caused_by(trc::location!())? =>
+            {
+                None
+            }
+            mailbox => mailbox,
+        };
+
         // Synchronize the selected mailbox first so the account counters are current
         let mut changed_uids = Vec::new();
         let mut access_token = None;
@@ -444,36 +460,10 @@ impl<T: SessionStream> SessionData<T> {
         }
 
         // Fetch selected mailbox changes
-<<<<<<< HEAD
-        if check_emails {
-            // Synchronize emails
-            if let Some(mailbox) = mailbox {
-                // Mail spec 6.3, ruling R34: another account's session gets no
-                // update of a key account's mailbox it still has selected; the
-                // calling command completes.
-                if self
-                    .server
-                    .za_foreign_key_account(&self.access_token, mailbox.id.account_id)
-                    .await
-                    .caused_by(trc::location!())?
-                {
-                    return Ok(());
-                }
-                // Obtain changes since last sync
-                let modseq = mailbox.state.lock().modseq;
-                let new_state = self
-                    .write_mailbox_changes(mailbox, use_vanished)
-                    .await
-                    .caused_by(trc::location!())?;
-                if new_state == modseq {
-                    return Ok(());
-                }
-=======
         if let (Some(mailbox), Some(cache)) = (mailbox, cache) {
             self.flush_view(mailbox, use_vanished)
                 .await
                 .caused_by(trc::location!())?;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
             if !changed_uids.is_empty() {
                 changed_uids.sort_unstable();

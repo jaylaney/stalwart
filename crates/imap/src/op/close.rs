@@ -24,7 +24,17 @@ impl<T: SessionStream> Session<T> {
         let (data, mailbox) = self.state.select_data();
 
         let mut skipped_expunge = None;
-        if mailbox.is_select && data.access_token.has_permission(Permission::ImapExpunge) {
+        // Mail spec 6.3, ruling R34: CLOSE of a key account's mailbox in
+        // another account's session deselects without expunging, and its
+        // message cache is not read.
+        if mailbox.is_select
+            && data.access_token.has_permission(Permission::ImapExpunge)
+            && !data
+                .server
+                .za_foreign_key_account(&data.access_token, mailbox.id.account_id)
+                .await
+                .imap_ctx(&request.tag, trc::location!())?
+        {
             let cache = data
                 .server
                 .get_cached_messages(mailbox.id.account_id)

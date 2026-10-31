@@ -8,11 +8,7 @@ use crate::{
     core::{Resolved, Row, SavedSearch, SelectedMailbox, Session, SessionData},
     spawn_op,
 };
-<<<<<<< HEAD
-use common::{network::SessionStream, za::ZA_MAIL_SEARCH_REFUSED};
-use email::cache::{MessageCacheFetch, email::MessageCacheAccess};
-=======
-use common::{MessageStoreCache, network::SessionStream};
+use common::{MessageStoreCache, network::SessionStream, za::ZA_MAIL_SEARCH_REFUSED};
 use email::{
     cache::{
         MessageCacheFetch,
@@ -23,11 +19,10 @@ use email::{
         sortkeys::{EmailSortKeys, MessageCacheField, MessageComparator, MessageSortField},
     },
 };
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 use imap_proto::{
     Command, ResponseCode, ResponseType, StatusResponse,
     protocol::{
-        ObjectId, Sequence,
+        Flag, ObjectId, Sequence,
         search::{self, Arguments, Comparator, Filter, Response, ResultOption},
     },
     receiver::Request,
@@ -152,6 +147,12 @@ impl<T: SessionStream> SessionData<T> {
         message_limit: u32,
         op_start: Instant,
     ) -> trc::Result<(search::Response, Option<u32>)> {
+        // Mail spec 6.3, ruling R34: SEARCH and SORT read a key account's
+        // mailbox only in its own sessions, checked before its message cache
+        // is read (THREAD checks in `thread`).
+        self.server
+            .za_assert_mail_route(&self.access_token, mailbox.id.account_id)
+            .await?;
         let cache = self
             .server
             .get_cached_messages(mailbox.id.account_id)
@@ -296,11 +297,8 @@ impl<T: SessionStream> SessionData<T> {
         cache: &MessageStoreCache,
         prev_saved_search: &Option<Option<Arc<Vec<Row>>>>,
     ) -> trc::Result<(Vec<u32>, bool)> {
-        // Mail spec 6.3, ruling R34: SEARCH, SORT and THREAD read a key
-        // account's mailbox only in its own sessions.
-        self.server
-            .za_assert_mail_route(&self.access_token, mailbox.id.account_id)
-            .await?;
+        // Mail spec 6.3, ruling R34: the callers (`search`, `thread`) check
+        // the route before they read `cache`.
 
         // Mail spec 8: a key account's search index holds the arrival time
         // and the size only, so a filter or sort that needs a message's
@@ -792,12 +790,19 @@ impl<T: SessionStream> SessionData<T> {
     }
 }
 
-<<<<<<< HEAD
 /// Mail spec 8: true when the filter key needs a message's sealed content
-/// (header values, body text, the sent date). The match has no wildcard, so
-/// a key added upstream fails to compile here until it is classified.
+/// (header values, body text, the sent date, and at 1.0 the server-set
+/// attachment keywords). The match has no wildcard, so a key added upstream
+/// fails to compile here until it is classified.
 fn za_filter_needs_content(filter: &Filter) -> bool {
     match filter {
+        // 1.0 sets `$HasAttachment` and `$HasNoAttachment` from the parsed
+        // message, and a client cannot store them (`store.rs`); a key
+        // account's message carries neither (spec 5.2), so a search on them
+        // would match nothing, or everything, instead of being refused.
+        Filter::Keyword(flag) | Filter::Unkeyword(flag) => {
+            matches!(flag, Flag::HasAttachment | Flag::HasNoAttachment)
+        }
         Filter::Bcc(_)
         | Filter::Body(_)
         | Filter::Cc(_)
@@ -816,7 +821,6 @@ fn za_filter_needs_content(filter: &Filter) -> bool {
         | Filter::Deleted
         | Filter::Draft
         | Filter::Flagged
-        | Filter::Keyword(_)
         | Filter::Larger(_)
         | Filter::On(_)
         | Filter::Seen
@@ -826,7 +830,6 @@ fn za_filter_needs_content(filter: &Filter) -> bool {
         | Filter::Undeleted
         | Filter::Undraft
         | Filter::Unflagged
-        | Filter::Unkeyword(_)
         | Filter::Unseen
         | Filter::And
         | Filter::Or
@@ -856,7 +859,9 @@ fn za_sort_needs_content(sort: &search::Sort) -> bool {
         | search::Sort::To
         | search::Sort::DisplayTo => true,
         search::Sort::Arrival | search::Sort::Size => false,
-=======
+    }
+}
+
 struct SearchResults<'x> {
     is_uid: bool,
     find_min: bool,
@@ -915,7 +920,6 @@ impl SearchResults<'_> {
                 self.highest_modseq = Some(modseq);
             }
         }
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
     }
 }
 
@@ -954,7 +958,7 @@ impl SavedSearch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use imap_proto::protocol::{Flag, search::ModSeqEntry};
+    use imap_proto::protocol::search::ModSeqEntry;
 
     /// Every `Filter` variant with its verdict (mail spec 8). The table pins
     /// today's verdicts; the compile-time guard against a new variant is the
@@ -975,6 +979,9 @@ mod tests {
             (Filter::From(text()), true),
             (Filter::Header(text(), text()), true),
             (Filter::Keyword(Flag::Seen), false),
+            (Filter::Keyword(Flag::Keyword("$label1".into())), false),
+            (Filter::Keyword(Flag::HasAttachment), true),
+            (Filter::Keyword(Flag::HasNoAttachment), true),
             (Filter::Larger(1), false),
             (Filter::On(0), false),
             (Filter::Seen, false),
@@ -991,6 +998,8 @@ mod tests {
             (Filter::Undraft, false),
             (Filter::Unflagged, false),
             (Filter::Unkeyword(Flag::Seen), false),
+            (Filter::Unkeyword(Flag::HasAttachment), true),
+            (Filter::Unkeyword(Flag::HasNoAttachment), true),
             (Filter::Unseen, false),
             (Filter::And, false),
             (Filter::Or, false),
@@ -1002,8 +1011,8 @@ mod tests {
             (Filter::Older(1), false),
             (Filter::Younger(1), false),
             (Filter::ModSeq((1, ModSeqEntry::None)), false),
-            (Filter::EmailId(text()), false),
-            (Filter::ThreadId(text()), false),
+            (Filter::EmailId("x".into()), false),
+            (Filter::ThreadId("x".into()), false),
             (Filter::UidAfter(1), false),
             (Filter::UidBefore(1), false),
         ]

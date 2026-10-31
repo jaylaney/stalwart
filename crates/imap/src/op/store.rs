@@ -269,6 +269,11 @@ impl<T: SessionStream> SessionData<T> {
     ) -> trc::Result<Vec<u8>> {
         // Resync messages if needed
         let account_id = mailbox.id.account_id;
+        // Mail spec 6.3, ruling R34: before the message cache is read.
+        self.server
+            .za_assert_mail_route(&self.access_token, account_id)
+            .await
+            .imap_ctx(&arguments.tag, trc::location!())?;
         let cache = self
             .server
             .get_cached_messages(account_id)
@@ -358,8 +363,7 @@ impl<T: SessionStream> SessionData<T> {
                 SpanId = self.session_id,
                 AccountId = mailbox.id.account_id,
                 MailboxId = mailbox.id.mailbox_id,
-<<<<<<< HEAD
-                Type = format!("{:?}", arguments.operation),
+                Type = format_compact!("{:?}", arguments.operation),
                 // Mail spec 10: a key account's keywords are its client's.
                 Details = if self.za_key_session() {
                     trc::Value::redacted()
@@ -367,18 +371,10 @@ impl<T: SessionStream> SessionData<T> {
                     arguments
                         .keywords
                         .iter()
-                        .map(|c| trc::Value::from(format!("{c:?}")))
+                        .map(|c| trc::Value::from(format_compact!("{c:?}")))
                         .collect::<Vec<_>>()
                         .into()
                 },
-=======
-                Type = format_compact!("{:?}", arguments.operation),
-                Details = arguments
-                    .keywords
-                    .iter()
-                    .map(|c| trc::Value::from(format_compact!("{c:?}")))
-                    .collect::<Vec<_>>(),
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                 Elapsed = op_start.elapsed()
             );
 
@@ -607,8 +603,7 @@ impl<T: SessionStream> SessionData<T> {
                 .iter()
                 .map(|resolved| trc::Value::from(resolved.id))
                 .collect::<Vec<_>>(),
-<<<<<<< HEAD
-            Type = format!("{:?}", arguments.operation),
+            Type = format_compact!("{:?}", arguments.operation),
             // Mail spec 10: a key account's keywords are its client's.
             Details = if self.za_key_session() {
                 trc::Value::redacted()
@@ -616,18 +611,10 @@ impl<T: SessionStream> SessionData<T> {
                 arguments
                     .keywords
                     .iter()
-                    .map(|c| trc::Value::from(format!("{c:?}")))
+                    .map(|c| trc::Value::from(format_compact!("{c:?}")))
                     .collect::<Vec<_>>()
                     .into()
             },
-=======
-            Type = format_compact!("{:?}", arguments.operation),
-            Details = arguments
-                .keywords
-                .iter()
-                .map(|c| trc::Value::from(format_compact!("{c:?}")))
-                .collect::<Vec<_>>(),
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
             Elapsed = op_start.elapsed()
         );
 

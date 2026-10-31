@@ -7,6 +7,7 @@
 pub mod section;
 pub mod source;
 pub mod structure;
+mod za;
 
 use super::{FromModSeq, ImapContext};
 use crate::{
@@ -20,6 +21,7 @@ use common::{
     MessageStoreCache,
     network::SessionStream,
     storage::batch::{DocumentBatch, Lookup, MAX_BATCH_BYTES, MAX_BATCH_DOCUMENTS},
+    za::ZA_MAIL_UNREADABLE,
 };
 use compact_str::{CompactString, format_compact};
 use email::{
@@ -27,6 +29,7 @@ use email::{
     message::{
         messagedata::{EmailMessageData, KeywordDiff, MetadataForm, MetadataValue, merge_keywords},
         metadata::HeaderMatcher,
+        za::view::{ZaMailView, za_readable},
     },
 };
 use imap_proto::{
@@ -49,6 +52,7 @@ use types::{
     id::Id,
     keyword::Keyword,
 };
+use za::ZaFetchedBlob;
 
 impl<T: SessionStream> Session<T> {
     pub async fn handle_fetch(&mut self, requests: Vec<Request<Command>>) -> trc::Result<()> {
@@ -176,6 +180,13 @@ impl<T: SessionStream> SessionData<T> {
 
         // Resync messages if needed
         let account_id = mailbox.id.account_id;
+        // Mail spec 6.3, ruling R34: a key account's selected mailbox is read
+        // only by its own sessions, checked before its message cache is read
+        // (0.16 checked it in `synchronize_messages`).
+        self.server
+            .za_assert_mail_route(&self.access_token, account_id)
+            .await
+            .imap_ctx(&arguments.tag, trc::location!())?;
         let cache = match cache {
             Some(cache) => cache,
             None => self
@@ -324,7 +335,23 @@ impl<T: SessionStream> SessionData<T> {
             None
         };
 
-        let form = if needs.headers {
+        // Mail spec 7, ruling R33: the account's keys, once for the command,
+        // only when an attribute reads content (`needs.structure`); a FETCH
+        // of flags, sizes, dates and ids reads the cache alone, so the owner's
+        // session opened before its account was provisioned, which holds
+        // none, still reads them. A keyless read of a key account is refused.
+        let keys = if needs.structure {
+            self.server
+                .za_mail_keys(&self.access_token, account_id)
+                .await
+                .map_err(|err| err.id(arguments.tag.clone()))?
+        } else {
+            None
+        };
+        let mut unreadable = false;
+        // A key account's stub is read as a row: its structure alone names
+        // only the sealed blob.
+        let form = if needs.headers || keys.is_some() {
             MetadataForm::Row
         } else {
             MetadataForm::Structure
@@ -385,6 +412,27 @@ impl<T: SessionStream> SessionData<T> {
                     } else {
                         continue;
                     };
+                    // Mail spec 7, 10: a key account's stub opened into the
+                    // message's full row; an unreadable message is skipped,
+                    // and the command ends NO after the messages it served.
+                    let opened = match (keys.as_deref(), stored) {
+                        (Some(keys), Some(MetadataValue::Row(row))) => match za_readable(
+                            self.server
+                                .za_open_metadata_row(row, Some(keys), account_id, id)
+                                .await,
+                        )
+                        .imap_ctx(&arguments.tag, trc::location!())?
+                        {
+                            Some(opened) => opened.map(MetadataValue::Row),
+                            None => {
+                                unreadable = true;
+                                continue;
+                            }
+                        },
+                        _ => None,
+                    };
+                    let is_sealed = opened.is_some();
+                    let stored = opened.as_ref().or(stored);
                     let set_seen_flag = !cache.has_keyword(data, &Keyword::Seen)
                         && seen_rights.as_mut().is_some_and(|rights| {
                             rights
@@ -447,7 +495,35 @@ impl<T: SessionStream> SessionData<T> {
                                 );
                                 continue;
                             }
-                            blob
+                            match blob {
+                                // Mail spec 7, 10: the sealed blob opened
+                                // whole; one that does not open is skipped.
+                                Some(blob) if is_sealed => {
+                                    let (bytes, reservation) = blob.into_parts();
+                                    match za_readable(
+                                        self.server
+                                            .za_open_message_blob(
+                                                true,
+                                                keys.as_deref(),
+                                                account_id,
+                                                id,
+                                                bytes,
+                                            )
+                                            .await,
+                                    )
+                                    .imap_ctx(&arguments.tag, trc::location!())?
+                                    {
+                                        Some(bytes) => {
+                                            Some(ZaFetchedBlob::opened(bytes, reservation))
+                                        }
+                                        None => {
+                                            unreadable = true;
+                                            continue;
+                                        }
+                                    }
+                                }
+                                blob => blob.map(ZaFetchedBlob::Stored),
+                            }
                         }
                         None => None,
                     };
@@ -732,11 +808,18 @@ impl<T: SessionStream> SessionData<T> {
                 .iter()
                 .map(|resolved| trc::Value::from(resolved.id))
                 .collect::<Vec<_>>(),
-            Details = arguments
-                .attributes
-                .iter()
-                .map(|c| trc::Value::from(format_compact!("{c:?}")))
-                .collect::<Vec<_>>(),
+            // Mail spec 10: the attributes name the headers a key account
+            // requested.
+            Details = if self.za_key_session() {
+                trc::Value::redacted()
+            } else {
+                arguments
+                    .attributes
+                    .iter()
+                    .map(|c| trc::Value::from(format_compact!("{c:?}")))
+                    .collect::<Vec<_>>()
+                    .into()
+            },
             Elapsed = op_start.elapsed()
         );
 
@@ -748,6 +831,13 @@ impl<T: SessionStream> SessionData<T> {
                     .into_bytes(),
             )
             .await?;
+        }
+
+        // Mail spec 10: the command ends NO after the messages it served.
+        if unreadable {
+            return Ok(StatusResponse::no(ZA_MAIL_UNREADABLE)
+                .with_code(ResponseCode::ServerBug)
+                .with_tag(arguments.tag));
         }
 
         let response = StatusResponse::completed(Command::Fetch(is_uid)).with_tag(arguments.tag);

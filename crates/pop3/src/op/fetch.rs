@@ -4,30 +4,18 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-<<<<<<< HEAD
-use crate::{Session, protocol::response::Response};
-use common::{network::SessionStream, za::ZA_MAIL_UNREADABLE};
-use email::message::{
-    metadata::MessageMetadata,
-    za::view::{ZaMailView, za_readable},
-};
-use registry::schema::enums::Permission;
-use std::{borrow::Cow, time::Instant};
-use store::{
-    ValueKey,
-    write::{AlignedBytes, Archive},
-};
-=======
 use crate::{
     Session,
     protocol::response::{MessageWriter, Response},
 };
-use common::network::SessionStream;
-use email::message::metadata::MetadataRow;
+use common::{network::SessionStream, za::ZA_MAIL_UNREADABLE};
+use email::message::{
+    metadata::MetadataRow,
+    za::view::{ZaMailView, ZaMetadataRow, za_readable},
+};
 use registry::schema::enums::Permission;
 use std::time::Instant;
 use store::ValueKey;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 use trc::AddContext;
 use types::{collection::Collection, field::EmailField};
 use utils::chained_bytes::ChainedBytes;
@@ -56,33 +44,22 @@ impl<T: SessionStream> Session<T> {
                 .await
                 .caused_by(trc::location!())?
             {
-<<<<<<< HEAD
-                // Mail spec 7, 10: the unsealed view and blob; an unreadable
+                // Mail spec 7, 10: the unsealed row and blob; an unreadable
                 // message answers -ERR.
                 let keys = self
                     .server
                     .za_mail_keys(self.state.access_token(), mailbox.account_id)
                     .await?;
-                let Some(view) = za_readable(
+                let Some(ZaMetadataRow { row, opened }) = za_readable(
                     self.server
-                        .za_metadata_view(
-                            &metadata_,
-                            keys.as_deref(),
-                            mailbox.account_id,
-                            message.id,
-                        )
+                        .za_metadata_view(row, keys.as_deref(), mailbox.account_id, message.id)
                         .await,
                 )?
                 else {
                     return Err(unreadable());
                 };
-                let metadata = view
-                    .unarchive::<MessageMetadata>()
-                    .caused_by(trc::location!())?;
-=======
                 let metadata = row.unarchive().caused_by(trc::location!())?;
                 let headers = row.raw_headers().caused_by(trc::location!())?;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                 if let Some(bytes) = self
                     .server
                     .fetch_blob(
@@ -93,19 +70,32 @@ impl<T: SessionStream> Session<T> {
                     .await
                     .caused_by(trc::location!())?
                 {
-                    let Some(bytes) = za_readable(
-                        self.server
-                            .za_open_message_blob(
-                                matches!(view, Cow::Owned(_)),
-                                keys.as_deref(),
-                                mailbox.account_id,
-                                message.id,
-                                bytes,
-                            )
-                            .await,
-                    )?
-                    else {
-                        return Err(unreadable());
+                    // Mail spec 7, 10: a stub's sealed blob opened whole and
+                    // held for the response under the stored bytes'
+                    // reservation.
+                    let opened_blob;
+                    let _reservation;
+                    let bytes: &[u8] = if opened {
+                        let (sealed, reservation) = bytes.into_parts();
+                        _reservation = reservation;
+                        let Some(plain) = za_readable(
+                            self.server
+                                .za_open_message_blob(
+                                    true,
+                                    keys.as_deref(),
+                                    mailbox.account_id,
+                                    message.id,
+                                    sealed,
+                                )
+                                .await,
+                        )?
+                        else {
+                            return Err(unreadable());
+                        };
+                        opened_blob = plain;
+                        &opened_blob
+                    } else {
+                        &bytes
                     };
                     trc::event!(
                         Pop3(trc::Pop3Event::Fetch),
@@ -115,7 +105,7 @@ impl<T: SessionStream> Session<T> {
                     );
 
                     match Response::<u32>::message(
-                        ChainedBytes::from_blob(&headers, &bytes, metadata.blob_body_offset()),
+                        ChainedBytes::from_blob(&headers, bytes, metadata.blob_body_offset()),
                         metadata.headers_len(),
                         lines,
                     ) {

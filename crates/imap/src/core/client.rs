@@ -533,6 +533,18 @@ impl<T: SessionStream> Session<T> {
         if !touches_selected || !data.is_acl_shared(mailbox.id.account_id) {
             return Ok(());
         }
+        // Mail spec 6.3, ruling R34: a foreign key account's selected mailbox
+        // is not checked here, which would read its message cache. Each
+        // command refuses it before any read; NOOP, CHECK and IDLE complete
+        // without its changes (`write_changes`).
+        if data
+            .server
+            .za_foreign_key_account(&data.access_token, mailbox.id.account_id)
+            .await
+            .imap_ctx(&request.tag, trc::location!())?
+        {
+            return Ok(());
+        }
         match data
             .selected_access(&mailbox.id)
             .await

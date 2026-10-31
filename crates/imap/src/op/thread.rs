@@ -62,6 +62,11 @@ impl<T: SessionStream> SessionData<T> {
         is_uid: bool,
         op_start: Instant,
     ) -> trc::Result<Response> {
+        // Mail spec 6.3, ruling R34: THREAD reads a key account's mailbox
+        // only in its own sessions, checked before its message cache is read.
+        self.server
+            .za_assert_mail_route(&self.access_token, mailbox.id.account_id)
+            .await?;
         let cache = self
             .server
             .get_cached_messages(mailbox.id.account_id)

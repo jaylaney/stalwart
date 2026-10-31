@@ -84,6 +84,14 @@ impl<T: SessionStream> Session<T> {
             });
 
         if let Some((mailbox, mailbox_name)) = mailbox {
+            // Mail spec 6.3, ruling R34: a key account's mailbox is selected
+            // only in its own sessions, checked before its message cache is
+            // read (0.16 checked it in `check_mailbox_acl`, which 1.0's SELECT
+            // no longer calls).
+            data.server
+                .za_assert_mail_route(&data.access_token, mailbox.account_id)
+                .await
+                .imap_ctx(&arguments.tag, trc::location!())?;
             let cache = caches
                 .fetch(&data.server, mailbox.account_id)
                 .await

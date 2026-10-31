@@ -135,6 +135,13 @@ impl<T: SessionStream> SessionData<T> {
         message_limit: u32,
         op_start: Instant,
     ) -> trc::Result<()> {
+        // Mail spec 6.3, ruling R34: the source, a key account's selected
+        // mailbox, is read only by its own sessions, checked before its
+        // message cache is read.
+        self.server
+            .za_assert_mail_route(&self.access_token, src_mailbox.id.account_id)
+            .await
+            .imap_ctx(&arguments.tag, trc::location!())?;
         let mut cache = caches
             .fetch(&self.server, src_mailbox.id.account_id)
             .await
@@ -676,28 +683,8 @@ impl<T: SessionStream> SessionData<T> {
                     }
                 };
 
-<<<<<<< HEAD
-                if let Some(is_spam) = train_spam {
-                    self.server
-                        .add_account_spam_sample(
-                            &mut train_batch,
-                            src_account_id,
-                            id,
-                            is_spam,
-                            self.session_id,
-                        )
-                        .await
-                        .imap_ctx(&arguments.tag, trc::location!())?;
-                    // Mail ruling R55: each chunk commits only while the
-                    // source account holds no vault record.
-                    self.server
-                        .za_provisioning_fence(&mut train_batch, src_account_id);
-                    train_batch.commit_point();
-                    did_train = true;
-=======
                 if let Some(sample) = sample {
                     spam_samples.add_sample(sample);
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                 }
 
                 if is_move {

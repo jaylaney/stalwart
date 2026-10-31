@@ -10,14 +10,9 @@ use crate::{
     spawn_op,
 };
 use common::{
-<<<<<<< HEAD
     auth::AccessToken,
-    ipc::CacheInvalidation,
     network::SessionStream,
     sharing::EffectiveAcl,
-=======
-    auth::AccessToken, network::SessionStream, sharing::EffectiveAcl,
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
     storage::index::ObjectIndexBuilder,
     za::mail::{za_acl_widens, za_keyless_refusal},
 };
@@ -299,33 +294,24 @@ impl<T: SessionStream> Session<T> {
             });
         }
 
-<<<<<<< HEAD
-            // Mail spec 6.3, ruling I3: no grant is added to or widened on a key
-            // account's mailbox; a removal or a narrowing passes.
-            if za_acl_widens(&mailbox.acls, &current_mailbox.inner.acls)
-                && data
-                    .server
-                    .za_mail_sharing_refused(mailbox_id.account_id)
-                    .await
-                    .imap_ctx(&arguments.tag, trc::location!())?
-            {
-                return Err(za_keyless_refusal().id(arguments.tag));
-            }
+        // Mail spec 6.3, ruling I3: no grant is added to or widened on a key
+        // account's mailbox; a removal or a narrowing passes.
+        if za_acl_widens(&mailbox.acls, &current_mailbox.inner.acls)
+            && data
+                .server
+                .za_mail_sharing_refused(mailbox_id.account_id)
+                .await
+                .imap_ctx(&arguments.tag, trc::location!())?
+        {
+            return Err(za_keyless_refusal().id(arguments.tag));
+        }
 
-            if mailbox.acls.len() > data.server.core.groupware.max_shares_per_item {
-                return Err(trc::ImapEvent::Error
-                    .into_err()
-                    .details("Maximum shares per item exceeded")
-                    .caused_by(trc::location!()));
-            }
-=======
         if mailbox.acls.len() > data.server.core.groupware.max_shares_per_item {
             return Err(trc::ImapEvent::Error
                 .into_err()
                 .details("Maximum shares per item exceeded")
                 .caused_by(trc::location!()));
         }
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
         let grants = mailbox
             .acls
