@@ -4956,6 +4956,201 @@ The unit tables `op::search::tests::{filter_table, sort_table}` pin these verdic
   traces}.rs`, `tests/src/imap/za_variants.rs`) are not compiled until Task 7; they need no
   API from 5b beyond 0.16's protocol behaviour, which 5b keeps.
 
+### Part 5c: JMAP and the HTTP upload gate
+
+Part 5c resolved the fifteen Task 5 conflicts in `jmap` (cells in the conflict ledger),
+ported their hooks onto 1.0's readers, classified every JMAP method for key accounts, and
+re-read the hooks that merged clean (`jmap/src/api/request.rs`, `changes/query.rs`,
+`sieve/set.rs`, `vacation/set.rs`, `registry/mapping/action.rs`, `email/za.rs`,
+`http/src/request.rs`). Two files outside the conflict list changed:
+- `jmap/src/file/writer.rs`: 1.0 moved every FileNode blob read (create, update and copy)
+  into `FileNodeWriter::resolve_blob`, so the three `za_refuse_raw_source` hooks of 0.16's
+  `file/{copy,set}.rs` (inventory `file/copy.rs` row 2, `file/set.rs` rows 2 and 3) are one
+  call there;
+- `email/src/message/za/view.rs` (Task 5's): `za_has_attachment`, below.
+
+`jmap` and `http` compile at Task 6 (ruling 21). The changed jmap files are rustfmt-clean
+and were checked against v1.0.1's signatures by reading. `cargo check -p email --tests
+--features test_mode` passes with no warnings, and `cargo test -p email --lib --features
+email/test_mode` passes 8 tests (one new: `the_opened_row_answers_has_attachment_as_upstream`).
+
+#### The readers at 1.0
+
+- **Batch readers** (`Email/get`, `SearchSnippet/get`). 1.0 reads metadata through
+  `read_metadata_batch` into a `DocumentBatch<MetadataValue>`. A key account's stub is read
+  as `MetadataForm::Row` (its structure alone names only the sealed blob) and opened by
+  reference with `za_open_metadata_row`. The opened row replaces the stored value for every
+  reader below it: render, cost estimate, `raw_message`. The sealed blob is opened whole
+  with `za_open_message_blob` into a `Zeroizing` buffer, held with the stored bytes' memory
+  reservation. An unreadable stub or blob is not found (`za_readable`). An ordinary
+  account's path is upstream's: its form, its blob and no extra read.
+- **`Email/get`** takes the keys once (`za_mail_keys`). Only `id`, `threadId`, `blobId`,
+  `mailboxIds`, `keywords`, `size` and `receivedAt` are served without opening the stub;
+  `blobId` comes from the stub's structure, whose hash is the sealed blob's and equals the
+  opened row's (5a binds them). 1.0 serves `hasAttachment` from the cache's keyword bit,
+  which a key account's message never has (ruling 55). For a key account it reads the
+  opened row instead: `za_has_attachment` applies upstream's ingest rule
+  (`MessageMetadata::build`'s `has_attachments`) to the stored view, so the property forces
+  the metadata read. `sentAt` and every header property come from the opened row's
+  envelope, so 5a's zero `sent_at` offset is never read here.
+- **Single readers** (`/jmap/download` and every `blob_download` caller, EmailSubmission).
+  These go through `za_metadata_view` over the stored `MetadataRow` (`ZaMetadataRow
+  { row, opened }`), then `za_open_message_blob(opened, ..)`.
+- **`decode_section`** now mirrors `fetch_blob_section`: the blob store's range read of the
+  section's outermost range (`SectionDecode::fetch_range`, cut at the end from offset 0,
+  empty out of range otherwise), then upstream's own `SectionDecode::decode_fetched`. That
+  decodes 1.0's nested sections (containers, then the part) exactly as a stored read does.
+  Section offsets are the ones `Email/get` rendered from the opened row, in the plaintext
+  blob's coordinates, which is what the opened blob holds.
+- **A whole message** of a key account answers as upstream's `BlobContents::Message`:
+  the opened row's header section, then `opened[blob_body_offset..]`, when the two differ;
+  otherwise the opened bytes. Both are wrapped in an account `FetchedBlob` because they
+  leave in the HTTP body.
+
+#### Route map (`jmap` and `http`)
+
+| Route | Entry | Sealing, unsealing or refusal boundary |
+|---|---|---|
+| `Email/get` (visible properties) | `jmap/src/email/get.rs` `email_get` | Dispatcher `za_assert_mail_keys`. `needs_content` false: the stored structure or the cache, nothing opened. |
+| `Email/get` (headers, body, `hasAttachment`, `sentAt`, `preview`, parts, `bodyValues`) | same | Keys once (`:210`). Row form, `za_open_metadata_row` (`:305`), `za_open_message_blob` (`:365`) when the body is read. `hasAttachment` from `za_has_attachment` (`:334`). An unreadable message is `notFound`. |
+| `Email/query`, `Email/queryChanges` | `email/query.rs:118`, `changes/query.rs:71` | Dispatcher (or `changes`) `za_assert_mail_route`, then `za_refuse_content_query`: a filter or sort needing content is refused before the cache, the object-metadata evaluation or the search store are read (classification below). |
+| `SearchSnippet/get` | `email/snippet.rs:61` | Dispatcher keys; `za_refuse_snippet_terms` refuses any `text`, `subject` or `body` condition. Defence in depth: with terms, keys once (`:167`), row form, stub and blob opened (`:236`, `:285`); unreachable for a key account. |
+| `Email/set` create | `email/set.rs:166` → `GroupedIngest` → `email_ingest_into` | Keys asserted at the create (`za_assert_mail_keys`); sealing in `email_ingest_into` (5a). An attachment `blobId` that is another account's sealed source is refused per create (`:707`, R31, `forbidden` `ZA_MAIL_KEYLESS`); its own sealed upload is read through `blob_download`, opened with the keys. |
+| `Email/set` update, destroy | `email/set.rs` | Dispatcher route only; keywords and mailboxes. Training goes through `add_account_spam_samples` (5a: a key account is skipped, every chunk fenced). Object-metadata patches: Task 6. |
+| `Email/import` | `email/import.rs:111` → `GroupedIngest` | Dispatcher keys; every `blobId` that is another account's sealed source refuses the call before the first import (R31). The blob is read by `blob_download_with_extra` (opened for the account's own sealed upload or message). The key branch of `email_ingest_into` ignores the reused `blob_hash` and seals a new blob (5a). No thread recheck for a key account (5a: `thread_recheck: None`). |
+| `Email/copy` | `email/copy.rs:84` → `email::copy_message` | Dispatcher keys on both accounts; `za_assert_mail_copy` refuses when either is a key account, before any read; `copy_message` refuses again at use time (5a). R55: 1.0's loop collects `SpamSamples` and commits them through `add_account_spam_samples`, which fences every chunk (5a), so JMAP, like IMAP, has no fence of its own before a `commit_point()`. |
+| `Email/parse` | `email/parse.rs` | Dispatcher keys; `blob_download_with_extra` opens a sealed source with the request's keys. |
+| `Blob/get` | `blob/get.rs` → `blob_download` | Dispatcher keys; opened bytes for a sealed source. |
+| `Blob/upload` | `blob/upload.rs:61` | Keys once (refused without them); every literal source that is a sealed source refuses the call before the first write (`:77`), and each source is checked again at its turn (`:116`, including a reference to this call's upload). A key account's upload is sealed (`za_put_sealed_upload`, `:235`). |
+| `Blob/copy` | `blob/copy.rs:51` | Refused when either account is a key account, and for any sealed-source id, before the first link. |
+| `Blob/lookup` | dispatcher | `za_assert_mail_route`; reads references, no content. |
+| `/jmap/download` | `http/src/request.rs:221` → `blob_contents` (`blob/download.rs:175`) | A sealed source (`za_is_sealed_source`: a key account's `Reserved` upload, or `Linked`/`Embedded` Email blob) is answered only by `za_download_message` or `za_download_upload`, with `za_mail_keys` (keyless: R30's 403). Calendar data of a key account is denied in `has_access_blob` for `Linked` and, new at 1.0, `Embedded` blobs (`za_calendar_data`). |
+| `/jmap/upload` | `http/src/request.rs:264` → `blob_upload` (`blob/upload.rs:262`) | The gate refuses a key account without its keys before the body is read (403); `blob_upload` asserts the keys again and seals. The body is read untraced for a key account's token. Re-read against 1.0's `blob_upload`: unchanged. |
+| `EmailSubmission/set` | `submission/set.rs:630` | Dispatcher keys; `za_metadata_view`, then `za_open_message_blob` (`:701`); an unreadable message fails its create (`ZA_MAIL_UNREADABLE`). The recipients come from the opened row, the BCC strip runs on the opened bytes, and the plaintext goes only to the SMTP queue. |
+| `Mailbox/get`, `/query`, `/changes`, `/queryChanges` | dispatcher, `changes/get.rs:248` | `za_assert_mail_route`. Object metadata: Task 6. |
+| `Mailbox/set` | `mailbox/set.rs:1021` | Route; a grant added to or widened on a key account's mailbox is refused before upstream's `acl_validate` (ruling I3). |
+| `Thread/get`, `Email/changes`, `Thread/changes`, `EmailSubmission/get`, `/query`, `/changes`, `/queryChanges` | dispatcher, `changes/get.rs:248` | `za_assert_mail_route`; cache and logs only. |
+| `FileNode/set` create, update; `FileNode/copy` | `file/writer.rs:704` (`resolve_blob`) | `za_refuse_raw_source` before `has_access_blob` and any read of the blob. |
+| `SieveScript/set` | `sieve/set.rs:720` | A key account's message or section never becomes a script (R32); an upload is read through `blob_download`, opened with the keys. |
+| `SieveScript/validate`, `ContactCard/parse` | `blob_download` | A sealed upload is opened with the token's keys or refused. |
+| `x:SpamTrainingSample/set` | `registry/mapping/spam_sample.rs:87` | `za_refuse_raw_source` before the download (R32). |
+| `VacationResponse/set` | `vacation/set.rs` | The compile error names its position only (every account). |
+| Push (EventSource, WebSocket, PushSubscription) | `services` | State changes only (`StateChange` with data types); no content. The services side is Task 6's. |
+
+#### Dispatcher gate (`jmap/src/api/request.rs`)
+
+`RequestMethod` and its six sub-enums, `MethodObject`, have the same variants at 1.0.1 as
+at 0.16.27, and part 4b ported every 0.16 gate onto its arm. So no new arm was added. Two
+functions newly answer at 1.0 inside existing arms: `ParticipantIdentity/changes` and
+`Quota/changes` (0.16 answered `cannotCalculateChanges`). Several arms also changed
+behaviour. Classes:
+- **keys:** `za_assert_mail_keys`, the token must hold the target account's keys;
+- **route:** `za_assert_mail_route`, a key account's mail is reached only by its own
+  sessions;
+- **refused:** `za_assert_calendar_allowed`, `accountNotSupportedByMethod` for a key
+  account;
+- **ordinary:** upstream's checks only.
+
+| Method | Class | Note |
+|---|---|---|
+| `Email/get` | keys | |
+| `Email/query`, `Email/queryChanges` | route | plus `za_refuse_content_query` |
+| `Email/set` | route | keys at the create's site |
+| `Email/copy` | keys (both accounts) | plus `za_assert_mail_copy` |
+| `Email/import`, `Email/parse` | keys | |
+| `Email/changes` | route | in `changes` |
+| `Mailbox/get`, `/query`, `/set`, `/changes`, `/queryChanges` | route | I3 in `/set` |
+| `Thread/get`, `Thread/changes` | route | |
+| `EmailSubmission/get`, `/query`, `/changes`, `/queryChanges` | route | |
+| `EmailSubmission/set` | keys | |
+| `SearchSnippet/get` | keys | plus term refusal |
+| `Blob/get`, `Blob/upload` | keys | |
+| `Blob/copy` | keys (target) | `blob_copy` refuses either key account |
+| `Blob/lookup` | route | |
+| `Identity/get`, `/set`, `/changes` | ordinary | no content |
+| `PushSubscription/get`, `/set` | ordinary | the token's own; payloads are state only |
+| `SieveScript/get`, `/query`, `/set`, `/validate` | ordinary | R32 in `/set`; uploads opened through `blob_download` |
+| `VacationResponse/get`, `/set` | ordinary | compile reason redacted |
+| `Principal/get`, `/query`, `/queryChanges` | ordinary | capability filtering is Task 6's (`principal/get.rs`) |
+| `Principal/getAvailability` | ordinary | 4b's handoff. At 1.0 the arm resolves `accountId`; the rule is per principal in `principal/availability.rs` (Task 6's file, inventory row 1): a key account contributes no busy periods, and a key account's own request answers an empty list (the existing `za_variants::calendars` and `za::gating` expectations) rather than a refusal. Ruling 51 covers grantees. |
+| `Quota/get`, `/query`, `/queryChanges` | ordinary | |
+| `Quota/changes` | ordinary | new at 1.0: member check, then `cannotCalculateChanges` |
+| `AddressBook/*`, `ContactCard/*` (get, query, set, changes, queryChanges, copy, parse) | ordinary | `ContactCard/parse` opens a sealed upload or refuses |
+| `FileNode/*` (get, query, set, changes, queryChanges, copy) | ordinary | raw-source refusal in `resolve_blob` |
+| `Calendar/*`, `CalendarEvent/*` (including copy, parse, queryChanges), `CalendarEventNotification/*` | refused | 1.0 widened the notification arms to `assert_has_access(CalendarEvent)`; the refusal still names the target account |
+| `ParticipantIdentity/get`, `/set` | refused | |
+| `ParticipantIdentity/changes` | refused | new at 1.0; added in `changes/get.rs:223`. As for `/get` and `/set`, it names the request's account, while upstream reads the token's own identities. |
+| `ShareNotification/get`, `/query`, `/set`, `/changes`, `/queryChanges` | ordinary | 4b's handoff. The recipient's own records (`assert_is_member`): object ids, rights and the actor. The writer leaves `name` empty (`common/src/storage/index/build.rs`), so no content. A key account's mailbox gains no grant (I3), so it emits no grant notification. |
+| `x:*` registry methods | ordinary | registry refusals (Task 3) |
+| `Core/echo` | ordinary | |
+
+**Object metadata, for Task 6.** The object-metadata surface (`jmap/src/api/metadata/`) is
+not a method of its own. It is properties, patches and filters inside existing methods, and
+it is Task 6's. For key accounts:
+- 5a refuses metadata at ingest (`za_metadata_refusal`);
+- 5c refuses `Email/query`'s metadata filters (below);
+- these stay unported: `MetadataGet` in `Email/get` and `Mailbox/get`, `MetadataWriter`
+  patches in `Email/set` update, `Email/copy` and `Mailbox/set`, `MetadataPreload`, and
+  metadata `/changes` (`MetadataChanges` in `changes/get.rs`).
+
+#### Filter and sort classification
+
+1.0's `EmailFilter` and `EmailComparator` have the same variants as 0.16's, so
+`filter_needs_content` and `sort_needs_content` keep their verdicts and stay exhaustive:
+- content: the filters `text`, `from`, `to`, `cc`, `bcc`, `subject`, `body`, `header`,
+  `hasAttachment`, `sentBefore` and `sentAfter`, and the sorts `from`, `to`, `cc`,
+  `subject` and `sentAt`;
+- visible: everything else, including `before` and `after` (the arrival time), the sizes,
+  keywords, mailboxes, threads and ids.
+
+New at 1.0, `Email/query`'s filter type is `EmailQueryFilter { Email(EmailFilter),
+Metadata(MetadataFilter) }`. The new exhaustive match is
+`query_filter_needs_content(&EmailQueryFilter)` (`jmap/src/email/za.rs`). It refuses every
+`Metadata` condition (`metadataExists`, `metadataTextContains`, `metadataTextEquals` and
+their private forms) for a key account. Its message holds no object metadata (5a refuses
+it at ingest), so the filter could only answer silently, as the attachment keywords would
+(ruling 55). The refusal's detail names the filter only (`MetadataFilter::as_str`), never
+its path or value. `SearchSnippet/get`'s filter is still `Filter<EmailFilter>`.
+
+Unit tests: `email::za::tests::{filter_table, sort_table, query_filter_table,
+first_refused_walks_the_filter_tree, ...}`. They run at Task 6's first compile.
+
+#### Deferred, by owner
+
+**Part 5d (tests)**
+- The new cases of Task 5's brief (part 5a's list) and Task 3b's handoff (`gates`,
+  `uploads`, `reads` move to `za_bearer_token`).
+- Cases for 5c's own changes:
+  - a key account's `hasAttachment` from the opened row (true and false);
+  - the metadata-filter refusal;
+  - `ParticipantIdentity/changes` refused for a key account;
+  - a nested section (a part inside a base64 `message/rfc822`) downloaded from a key
+    account's message;
+  - a key account's embedded calendar blob denied;
+  - a sealed source named by a FileNode create, update and copy;
+  - `Email/get` of `blobId` alone not opening the stub (the stub's hash);
+  - EmailSubmission of a key account's message with a BCC header stripped.
+
+**Task 6**
+- The first compile of `jmap` and `http`, with the assumptions in the 5c report.
+- Object metadata for key accounts (above).
+- Search-index work behind `email/query.rs`. For a key account, 1.0's `QueryFilter`,
+  windowed walk and residual search filters receive only visible conditions, because the
+  refusal runs first. What the index holds for a key account's stub is the index worker's
+  (part 5a).
+- `principal/availability.rs`, `principal/get.rs` and `api/session.rs` (Task 6's conflicts).
+- CLAUDE.md's silent dependency on R55 "before each `commit_point()` of the cross-account
+  copy loops" now points at `add_account_spam_samples` for JMAP as well as IMAP (part 5b).
+
+**Recorded, no owner action**
+- `za_has_attachment` reads the stored view. A part beyond `MAX_PART_ENTRIES` is not stored,
+  so a message whose only attachment lies there reads `false` where upstream's keyword says
+  `true`.
+- `x:SpamTrainingSample/set` with a key account's `accountId` and an ordinary blob still
+  creates a sample under that account, as at 0.16. R52's provisioning refusal sees it.
+- `ParticipantIdentity/changes` names the request's account in its refusal, as `/get` and
+  `/set` do; upstream reads the token's own identities whatever account the request names.
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
@@ -5045,7 +5240,7 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/http/src/auth/authenticate.rs` | content | Task 3 | resolved (Task 3b): v1.0.1's `HttpAuthenticated`, `HttpAuthEntries` and `GrantRevocations` as supplied. Hit: upstream's live and revision checks, then ruling 10's marker (`za_is_impersonation`: `decode_plain_auth(token)` and `UsernameParts::is_master`, whatever the mechanism), then the hit rule (`za_cache_hit`): `account()` fails closed (both entries removed, error returned); an ordinary account takes upstream's path; a key account is served only with `za_keys.get(fingerprint)` keys of the same account, generation non-zero and equal to `AccountCache::za_generation()`; otherwise both entries are removed and the request is verified in full. Miss (`authenticate_uncached`): ruling 28 (no `.id`/`.details` with the header value), `authenticate_with_keys`, the `za_test` pause, then upstream's `revocations.insert(.., epoch)` for an ordinary account (with the 0.16 double-check after publish) or for a key account whose keys pass the generation fence (plus `za_insert_keys`); keyless key-account results and foreign keys are never cached. `za_test` and its unit module kept. Type-checked in the part 3b harness (report). |
 | `crates/http/src/auth/oauth/auth.rs` | content | Task 3 | resolved (Task 3b): v1.0.1's `handle_login_request` (both blocks taken as supplied); rows 1-2 as one R36 refusal in `authenticate_login`, the one site `authorize_code` and `approve_device` share: an impersonated login of a key account answers `LoginResponse::Failure` through the callers' `Err(response)` path. |
 | `crates/http/src/auth/oauth/mod.rs` | content | Task 3 | resolved (Task 3b): 1.0's imports (`RequestOrigin`, `HttpSessionData`, `HOST`) with `fetch_body_untraced` in place of `fetch_body`; `FormData::from_request` stays untraced (issue #20). |
-| `crates/http/src/request.rs` | content | Task 3 (upload gate: Task 5) | resolved (Task 3b): rows 4-12 on 1.0. The JMAP POST arm reads the body untraced for a key account (`za_jmap_untraced`, fail closed) and keeps 1.0's `allowed_capabilities` and memory reservation, with one parse and one dispatch for both cases; the parser's `NotRequest` is reduced to a fixed reason only when untraced. R30's 403 wraps 1.0's `blob_contents`. Row 6 (upload gate, Task 5) merged clean and is kept unchanged; Task 5 re-reads it against 1.0's `blob_upload`. Row 7: `without_session_keys()` after the scope assertion on EventSource and WebSocket (1.0's `epoch` passed through). The response-body trace keeps the redaction and adds 1.0's `Prefixed` body. The 0.16 inline test module is dropped; Task 2's restored module is declared after the private slot (Task 2 handoff). |
+| `crates/http/src/request.rs` | content | Task 3 (upload gate: Task 5) | resolved (Task 3b): rows 4-12 on 1.0. The JMAP POST arm reads the body untraced for a key account (`za_jmap_untraced`, fail closed) and keeps 1.0's `allowed_capabilities` and memory reservation, with one parse and one dispatch for both cases; the parser's `NotRequest` is reduced to a fixed reason only when untraced. R30's 403 wraps 1.0's `blob_contents`. Row 6 (upload gate, Task 5) merged clean and is kept unchanged; Task 5 re-reads it against 1.0's `blob_upload`. Row 7: `without_session_keys()` after the scope assertion on EventSource and WebSocket (1.0's `epoch` passed through). The response-body trace keeps the redaction and adds 1.0's `Prefixed` body. The 0.16 inline test module is dropped; Task 2's restored module is declared after the private slot (Task 2 handoff). Task 5c: row 6 re-read against 1.0's `blob_upload`, unchanged. |
 | `crates/imap/src/core/mailbox.rs` | content | Task 5 | resolved (Task 5b): v1.0.1's `SessionData::new` and `synchronize_mailboxes_as` with rows 1-2 (a foreign key account is skipped before `shared_prefix` and `account_view`) and row 3 (`za_unlist_key_accounts`, ported to 1.0's `AccountView.names` and `MailboxChange`); row 4 moved from `check_mailbox_acl` into `check_mailbox_acl_as`, which STATUS and the selected-mailbox check call directly; `selected_access` checks the route before its cache read. |
 | `crates/imap/src/core/message.rs` | modify/delete | Task 5 | resolved (Task 5b): deleted. Row 1 (R34 in `synchronize_messages`) is at the head of `sync_view` (`core/view.rs`) as the net, and before the cache read of every `sync_view` caller (finding 5; see Task 5, part 5b). |
 | `crates/imap/src/core/mod.rs` | content | Task 3 (session keys) / Task 5 | resolved (Task 3b, ruling 41): `pub mod view` and its re-exports beside `mod za` (row 1, Task 5's module, declared); row 2 (`za_key_session`) merged; row 3: `refresh_access_token` carries the session's keys at the call site (ruling 11); its 0.16 R35 re-application is dropped, as `renew_access_token` carries the marker (3a). |
@@ -5059,25 +5254,25 @@ resolve their files (Task 7's gate). Every later task ends with a commit.
 | `crates/imap/src/op/search.rs` | content | Task 5 (search: Task 6) | resolved (Task 5b, ruling 41, whole): v1.0.1's file plus rows 2-4; row 2 moved from `query` to `search` (and `thread.rs`), before the cache read; row 3 kept exhaustive over 1.0's `Filter` and `Sort` (unchanged variants), with `KEYWORD` and `UNKEYWORD` of `$HasAttachment` and `$HasNoAttachment` now classified as content; row 4's tables updated. Nothing deferred to Task 6 from this file (see part 5b). |
 | `crates/imap/src/op/store.rs` | content | Task 5 | resolved (Task 5b): rows 1-2 on 1.0's `format_compact!` traces; R34 before the cache read. |
 | `crates/jmap/Cargo.toml` | content | Task 2 | resolved (Task 2a): v1.0.1's dependencies (local `calcard`, `smtp-proto`, `sieve-rs`, `jmap-tools`; mail-parser 1.0 without `rkyv`) plus `vault` (row 1). `test_mode = ["utils/test_mode"]`: part 2a declared `[]`, the fork's 0.16.27 value, and part 2b made it enable `utils/test_mode` ("Manifests" above). |
-| `crates/jmap/src/api/request.rs` | content | Task 5 (calendar refusal: Task 4) | resolved (Task 4b, ruling 41, whole): rows 2-24 on their arms beside 1.0's `assert_has_source_access` and from-account checks; `za_jmap_untraced` and `za_method_error_for_trace` kept. 1.0's new arms (`PrincipalAvailability`, `ShareNotification`, `FileNode`/`ContactCard` copy) are Task 5's and Task 6's to classify. |
+| `crates/jmap/src/api/request.rs` | content | Task 5 (calendar refusal: Task 4) | resolved (Task 4b, ruling 41, whole): rows 2-24 on their arms beside 1.0's `assert_has_source_access` and from-account checks; `za_jmap_untraced` and `za_method_error_for_trace` kept. 1.0's new arms (`PrincipalAvailability`, `ShareNotification`, `FileNode`/`ContactCard` copy) are Task 5's and Task 6's to classify. Task 5c: every method classified (part 5c's dispatcher table); the enums are 0.16's, so no arm changed; `ParticipantIdentity/changes` is gated in `changes/get.rs`. |
 | `crates/jmap/src/api/session.rs` | content | Task 6 | open |
-| `crates/jmap/src/blob/copy.rs` | content | Task 5 | open |
-| `crates/jmap/src/blob/download.rs` | content | Task 5 | open |
-| `crates/jmap/src/blob/upload.rs` | content | Task 5 | open |
+| `crates/jmap/src/blob/copy.rs` | content | Task 5 | resolved (Task 5c): 1.0's `BlobAccess` and embedded-blob copy kept; row 2 (no copy into or out of a key account) and the sealed-source refusal for every id before the first link. |
+| `crates/jmap/src/blob/download.rs` | content | Task 5 | resolved (Task 5c): 1.0's `blob_contents`/`BlobAccess`/`FetchedBlob` kept. Row 2: a sealed source is answered by `za_download_message` (row view, opened blob, upstream's `BlobContents::Message` shape) or `za_download_upload`, after 1.0's embedded branch and before any stored read. Rows 3 and 4: key-account calendar data denied for `Linked` and, new at 1.0, `Embedded` blobs. `decode_section` now mirrors `fetch_blob_section` (outermost range, then `SectionDecode::decode_fetched` for nested sections). Part 5c. |
+| `crates/jmap/src/blob/upload.rs` | content | Task 5 | resolved (Task 5c): rows 2-6 on 1.0's `BlobAccess`, section and embedded sources; the four Task 2 test hooks regated to `feature = "test_mode"`. |
 | `crates/jmap/src/calendar_event/set.rs` | content | Task 4 | resolved (Task 4b): rows 2-8; `ItipSendStatus::resolve(.., false)` at the three sites; identity tombstones. |
-| `crates/jmap/src/changes/get.rs` | content | Task 5 | open |
-| `crates/jmap/src/email/copy.rs` | content | Task 5 | open |
-| `crates/jmap/src/email/get.rs` | content | Task 5 | open |
-| `crates/jmap/src/email/import.rs` | content | Task 5 | open |
-| `crates/jmap/src/email/query.rs` | content | Task 5 (search: Task 6) | open |
-| `crates/jmap/src/email/set.rs` | content | Task 5 | open |
-| `crates/jmap/src/email/snippet.rs` | content | Task 5 | open |
-| `crates/jmap/src/file/copy.rs` | content | Task 5 | open |
-| `crates/jmap/src/file/set.rs` | content | Task 5 | open |
-| `crates/jmap/src/mailbox/set.rs` | content | Task 5 | open |
+| `crates/jmap/src/changes/get.rs` | content | Task 5 | resolved (Task 5c): 1.0's paging and object-metadata changes kept; rows 2 and 3 (calendar refusals, R34 route for Email, Mailbox, Thread and EmailSubmission); new at 1.0, `ParticipantIdentity/changes` takes the calendar refusal. Metadata changes: Task 6. |
+| `crates/jmap/src/email/copy.rs` | content | Task 5 | resolved (Task 5c): row 1 (`za_assert_mail_copy` before any read); row 2 (R55) is 5a's fence in `add_account_spam_samples`, which 1.0's loop calls once with its `SpamSamples`. |
+| `crates/jmap/src/email/get.rs` | content | Task 5 | resolved (Task 5c): rows 3-5 on 1.0's `DocumentBatch` reader: keys once, row form and `za_open_metadata_row` when content is read, the opened blob in a `Zeroizing` buffer; a key account's `hasAttachment` from `za_has_attachment` (ruling 55). Object-metadata values: Task 6. |
+| `crates/jmap/src/email/import.rs` | content | Task 5 | resolved (Task 5c): row 2 (R31) before 1.0's `GroupedIngest`; Task 2's two test hooks regated. |
+| `crates/jmap/src/email/query.rs` | content | Task 5 (search: Task 6) | resolved (Task 5c, ruling 41, whole): row 2 before 1.0's object-metadata evaluation, `QueryFilter` and windowed walk; `za_refuse_content_query` now takes `Filter<EmailQueryFilter>` and refuses metadata filters for key accounts. Search-index work deferred to Task 6 (part 5c). |
+| `crates/jmap/src/email/set.rs` | content | Task 5 | resolved (Task 5c): rows 3 and 4 (keys for a create; R31 per attachment `MaybeInvalid` blob id before 1.0's download or access check); Task 2's four test hooks regated. Metadata patches: Task 6. |
+| `crates/jmap/src/email/snippet.rs` | content | Task 5 | resolved (Task 5c): rows 3-6 on 1.0's batch reader: term refusal first; with terms, keys once, row form, stub and blob opened (defence in depth). |
+| `crates/jmap/src/file/copy.rs` | content | Task 5 | resolved (Task 5c): upstream's side; row 2 moved with 1.0's blob read into `file/writer.rs` `resolve_blob`. |
+| `crates/jmap/src/file/set.rs` | content | Task 5 | resolved (Task 5c): upstream's side; rows 2 and 3 moved with 1.0's blob read into `file/writer.rs` `resolve_blob` (one `za_refuse_raw_source` for create, update and copy). |
+| `crates/jmap/src/mailbox/set.rs` | content | Task 5 | resolved (Task 5c): row 2 (ruling I3) before 1.0's `acl_validate`; 1.0 dropped `refresh_acls`. |
 | `crates/jmap/src/principal/get.rs` | content | Task 6 | open |
-| `crates/jmap/src/registry/mapping/spam_sample.rs` | content | Task 5 | open |
-| `crates/jmap/src/submission/set.rs` | content | Task 5 | open |
+| `crates/jmap/src/registry/mapping/spam_sample.rs` | content | Task 5 | resolved (Task 5c): row 2 (R32) before 1.0's section and embedded checks. |
+| `crates/jmap/src/submission/set.rs` | content | Task 5 | resolved (Task 5c): rows 2-10 on 1.0's `MetadataRow` and `FetchedBlob`: `za_metadata_view`, the opened blob, BCC stripped from the opened bytes, plaintext only to the queue (its memory reservation kept). |
 | `crates/jmap/src/websocket/stream.rs` | content | Task 3 | resolved (Task 3b): 1.0's imports plus `za_jmap_untraced` (defined in Task 5's `jmap/src/api/request.rs`, which must keep it); row 2 merged. The loop's renewals go through `renew_access_token`/`refresh_access_token`, which carry the marker and never keys (ruling 11). |
 | `crates/main/Cargo.toml` | content | Task 2 (identity: Task 9) | resolved (Task 2a): v1.0.1's file with the fork's `version = "0.1.1-beta.1"` (row 1); the rest of the identity is Task 9's. |
 | `crates/managesieve/src/op/authenticate.rs` | content | Task 3 | resolved (Task 3b): row 1 (the mechanism error does not quote the token) with 1.0's `Vec<CompactString>` params; the login stays keyless `authenticate`. |
