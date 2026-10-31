@@ -213,18 +213,28 @@ pub async fn test(test: &TestServer) {
           "name": null
         }));
 
-    // Updating and deleting should fail
+    // Updating and deleting should fail.
+    // 1.0 checks a sharee's update property by property: an empty patch changes
+    // nothing and is accepted; a rename needs `Modify`.
+    jane.jmap_update_account(
+        john,
+        MethodObject::FileNode,
+        [(&john_folder_id, json!({}))],
+        Vec::<(&str, &str)>::new(),
+    )
+    .await
+    .updated(&john_folder_id);
     assert_eq!(
         jane.jmap_update_account(
             john,
             MethodObject::FileNode,
-            [(&john_folder_id, json!({}))],
+            [(&john_folder_id, json!({"name": "Renamed by Jane"}))],
             Vec::<(&str, &str)>::new(),
         )
         .await
         .not_updated(&john_folder_id)
         .description(),
-        "You are not allowed to modify this file node."
+        "You are not allowed to rename or move this file node."
     );
     assert_eq!(
         jane.jmap_destroy_account(

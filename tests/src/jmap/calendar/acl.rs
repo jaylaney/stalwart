@@ -288,12 +288,22 @@ pub async fn test(test: &TestServer) {
           "name": null
         }));
 
-    // Updating and deleting should fail
+    // Updating and deleting should fail.
+    // 1.0 checks a sharee's update by what it changes: an empty patch changes
+    // nothing and is accepted; a sharing change needs `Share`.
+    jane.jmap_update_account(
+        john,
+        MethodObject::Calendar,
+        [(&john_calendar_id, json!({}))],
+        Vec::<(&str, &str)>::new(),
+    )
+    .await
+    .updated(&john_calendar_id);
     assert_eq!(
         jane.jmap_update_account(
             john,
             MethodObject::Calendar,
-            [(&john_calendar_id, json!({}))],
+            [(&john_calendar_id, json!({"shareWith": {}}))],
             Vec::<(&str, &str)>::new(),
         )
         .await

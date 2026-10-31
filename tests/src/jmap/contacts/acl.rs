@@ -265,18 +265,29 @@ pub async fn test(test: &TestServer) {
           "name": null
         }));
 
-    // Updating and deleting should fail
+    // Updating and deleting should fail.
+    // 1.0 checks a sharee's update property by property: an empty patch changes
+    // nothing and is accepted, and an address book's name and description are
+    // the sharee's own preferences; only a sharing change needs `Share`.
+    jane.jmap_update_account(
+        john,
+        MethodObject::AddressBook,
+        [(&john_book_id, json!({}))],
+        Vec::<(&str, &str)>::new(),
+    )
+    .await
+    .updated(&john_book_id);
     assert_eq!(
         jane.jmap_update_account(
             john,
             MethodObject::AddressBook,
-            [(&john_book_id, json!({}))],
+            [(&john_book_id, json!({"shareWith": {}}))],
             Vec::<(&str, &str)>::new(),
         )
         .await
         .not_updated(&john_book_id)
         .description(),
-        "You are not allowed to modify this address book."
+        "You are not allowed to share this address book."
     );
     assert_eq!(
         jane.jmap_destroy_account(
