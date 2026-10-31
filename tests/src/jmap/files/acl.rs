@@ -251,7 +251,8 @@ pub async fn test(test: &TestServer) {
         .await
         .not_destroyed(&john_folder_id)
         .description(),
-        "You are not allowed to delete this file node."
+        // 1.0's refusal of a destroy without the right (`not_permitted`).
+        "You do not have permission to perform this operation."
     );
 
     // Grant Jane write access
