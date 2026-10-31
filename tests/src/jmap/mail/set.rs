@@ -157,15 +157,33 @@ async fn create(client: &Client, mailbox_id: &str) {
         // Compare response
         file_name.set_extension("jmap");
         // 1.0 sizes a multipart from its raw bytes, generated boundaries
-        // included (their length varies), and the server-set attachment
-        // keyword is not stable across runs of `nested_body`: both are left
-        // out of the comparison.
+        // included (their length varies), so a multipart's size is left out
+        // of the comparison. 1.0 sets the `$hasattachment` or
+        // `$hasnoattachment` keyword when an ordinary account's message is
+        // ingested (`index_message`), and the fixtures include it.
         let mut email = serde_json::to_value(&email).unwrap();
         normalize_created(&mut email);
         let result = replace_blob_ids(replace_boundaries(
             serde_json::to_string_pretty(&email).unwrap(),
         ));
-        if fs::read(&file_name).unwrap() != result.as_bytes() {
+        let expected = fs::read(&file_name).unwrap();
+        // A key account's message stores neither keyword (plan 13 ruling
+        // 55), so in key mode the fixture is compared without them, as in
+        // `get::test`.
+        let matches = if crate::utils::za::key_accounts_mode() {
+            let mut expected: serde_json::Value = serde_json::from_slice(&expected).unwrap();
+            if let Some(keywords) = expected
+                .get_mut("keywords")
+                .and_then(|keywords| keywords.as_object_mut())
+            {
+                keywords.remove("$hasattachment");
+                keywords.remove("$hasnoattachment");
+            }
+            expected == serde_json::from_str::<serde_json::Value>(&result).unwrap()
+        } else {
+            expected == result.as_bytes()
+        };
+        if !matches {
             file_name.set_extension("jmap_failed");
             fs::write(&file_name, result.as_bytes()).unwrap();
             panic!("Test failed, output saved to {}", file_name.display());
@@ -431,8 +449,7 @@ pub async fn assert_email_properties(
     );
 }
 
-/// See `create`: drops a multipart's `size` and the server-set attachment
-/// keywords, and sorts the keywords.
+/// See `create`: drops a multipart's `size` and sorts the keywords.
 fn normalize_created(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
@@ -444,8 +461,6 @@ fn normalize_created(value: &mut serde_json::Value) {
                 map.remove("size");
             }
             if let Some(serde_json::Value::Object(keywords)) = map.get_mut("keywords") {
-                keywords.remove("$hasattachment");
-                keywords.remove("$hasnoattachment");
                 // 1.0 lists keywords in no fixed order.
                 keywords.sort_keys();
             }
