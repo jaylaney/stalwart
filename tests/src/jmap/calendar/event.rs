@@ -293,13 +293,18 @@ pub async fn test(test: &TestServer) {
           },
           {
             "title": "Event #3",
+            // 1.0's reduceParticipants keeps the participants it returns
+            // whole (their status and roles); 0.16 kept the address and the
+            // owner role only.
             "participants": {
               "3f5bc8c0-c722-5345-b7d9-5a899db08a30": {
                 "calendarAddress": "mailto:cyrus@example.com",
                 "@type": "Participant",
                 "roles": {
-                  "owner": true
-                }
+                  "owner": true,
+                  "chair": true
+                },
+                "participationStatus": "accepted"
               }
             },
             "id": "d"
