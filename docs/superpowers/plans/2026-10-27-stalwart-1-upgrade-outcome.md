@@ -6916,6 +6916,141 @@ sub-cases), and this note with the spec amendment. Logs `task-7c/logs/<row>-<att
 - **Ruling 92:** the reconciliation is a no-op on one upstream run at 1.0 and is kept as a
   guard (see above); removing it would be a kernel change outside these rulings.
 
+#### Part 7c4: ruling 105's batch, ruling 101 and the remaining red rows
+
+Part 7c4 applied investigator 2's seven classifications (ruling 105) and ruling 101's N17
+change, then drove the five red rows (CalDAV, IMAP, JMAP, each in both modes, `system_tests`
+and SMTP) by ruling 107: before each rerun the next failure was classified from the log and
+the code at `HEAD` and `v1.0.1-src/`, and the sub-modules after it were read for more. No
+product code changed. Every changed assertion is an expectation-ledger row ("part 7c4").
+
+##### Ruling 105's batch
+
+The seven test changes landed as the investigation gave them, with two corrections the runs
+showed:
+
+- **PROPPATCH (`webdav::prop`).** The 424 for dead properties applies to calendars and address
+  books, collections and items alike, not to "collections": a file node's display name is a
+  dead property, so every property under `/dav/file` stays 507. The dead-only PROPPATCH answers
+  507 "Property value is too long", as predicted.
+- **OIDC (`system::oidc`).** On the TLS listener an invalid bearer token gets RFC 7628's `334`
+  error challenge (`"status":"invalid_token"`), the case the investigation left open; the test
+  sends the dummy response and expects 535. 1.0 delays that 535 by `auth_errors_wait`, which
+  outlasted the test's one-second access token, so the token the SASL steps use is issued with
+  a one-minute lifetime and the one-second lifetime is restored after them.
+
+The JMAP stale-marks, the plain Update batch's account and collection, condstore's
+`VANISHED (EARLIER) 1:2`, the four 1875 ids, `_x UID FETCH` and the DSN's `from_address`
+needed no correction.
+
+##### Ruling 101 (N17)
+
+The premise did not hold: 1.0 sets `$hasattachment` or `$hasnoattachment` synchronously, when
+an ordinary account's message is ingested (`index_message`, `email/src/message/index/metadata.rs`),
+not in the index task, so there is nothing to wait for. A key account's message stores
+neither keyword (plan 13 ruling 55). 7c2's "present in one run, absent in the next" matches
+the fixture being regenerated in alternating plain and key runs. 7c2's exclusion is reverted:
+the `email_set` fixtures carry the keyword and are compared with it in plain mode, and key mode
+compares them without it, as `get::test` already did. Both modes passed. No wait was added.
+
+##### The rest of the rows
+
+Every further failure was an intended 1.0 change or a timing artefact (ruling 44); the
+expectation ledger gives each with its 1.0 cause. In outline:
+
+- **Protocol conformance at 1.0:** `maxChanges` 0 refused (RFC 8620 5.2); `accountNotFound` for
+  an unreachable account and `fromAccountNotFound` for an unreachable copy source (RFC 8620
+  3.6.2), `notFound` for an unreadable blob (6.3), a /copy's source `id` in its create object
+  (5.4); RFC 7162's inclusive MODSEQ search; RFC 3501's body-only RFC822.TEXT; RFC 4314's rights
+  order and RFC 5464's `n` right; RFC 3744's write-content without bind; RFC 4791's override
+  RECURRENCE-ID; RFC 6868's caret escapes; RFC 3986's sub-delimiters in hrefs; RFC 3834's null
+  return path for vacation replies; RFC 9670's principal accounts and `timeZone`; RFC 8984's
+  patch-style overrides.
+- **API changes:** the FileNode `@type` (required) and `mediaType`, returned with every get,
+  null `shareWith`, pending-create `existingId` and 1.0's refusal texts; `maySetMetadata` among
+  the sharing rights; account-unique default alert ids; full CalendarEvent gets and parses;
+  registry clients' scopes and grants (the device flow needs a registry client that lists it);
+  registry queries scoped to the requesting account; per-property sharee update checks;
+  delivery results recorded in a submission; identities in address order; free-busy only
+  through a shared calendar; seen ids of Sieve in the account's store.
+- **Timing artefacts, now waited for:** the Contacts and Calendar search indexes behind
+  addressbook-query and calendar-query, the alarm messages, a mailbox creation's trailing push
+  (1.0 sends a throttled batch at the next `push_retry_wait`), the authentication-failure
+  counter carried over from earlier `system_tests` sub-tests.
+- **iTIP fixtures (`webdav::cal_itip`).** Four of the nine iTIP fixtures were regenerated from
+  1.0's library output (the harness calls `itip_create`, `itip_update`, `itip_cancel` and the
+  inbound merge directly; the fork's split of `itip_cancel` is behaviour-neutral) with a
+  temporary, uncommitted regeneration mode, then reviewed: per-recipient messages, per-instance
+  summaries, materialised overrides, the organizer's SEQUENCE in an attendee's REPLY, no
+  `STATUS:CANCELLED` when uninviting. All nine also name `ItipTime`'s new `kind`.
+
+##### Results
+
+Commits: `bb0318d69` (ruling 105's batch), `33365c049` (ruling 101), then 38 focused test
+commits through `3de0dfff2`, and this note. No product code changed. Logs
+`task-7c/logs/<row>-<attempt>.log`, numbered on from 7c3's; every final row ran at
+`3de0dfff2`, the code of this note's commit (`zaleak-3`, `units-2` and `vaultgw-2` ran
+with this note's ledger rows not yet committed, and `vaultgw-2` also with the dav-proto request
+fixtures the unit run rewrites, since reverted).
+
+| Row | Final log | Passed / failed / ignored | Attempts in 7c4 | Status |
+|---|---|---|---|---|
+| Formatting (`cargo fmt --all --check`) | — | rc 0 | — | green |
+| CalDAV plain | `caldav-plain-27` | 1 / 0 / 0 | 13 (15-27) | green |
+| CalDAV key | `caldav-key-22` | 1 / 0 / 0 | 12 (11-22) | green |
+| IMAP plain | `imap-plain-15` | 1 / 0 / 0 | 6 (10-15) | green |
+| IMAP key | `imap-key-13` | 1 / 0 / 0 | 7 (7-13) | green |
+| JMAP plain | `jmap-plain-49` | 1 / 0 / 0 | 40 (10-49) | green |
+| JMAP key | `jmap-key-30` | 1 / 0 / 0 | 24 (7-30) | green |
+| `system_tests` | `up-system-system_tests-19` | 1 / 0 / 0 | 10 (10-19) | green |
+| SMTP (`cargo test -p tests smtp`, CI's `SPAM_RULES_URL`) | `smtp-9` | 76 / 0 / 3 | 2 (8-9), and `smtp-flake-3` | green |
+| ZA | `za-88` | 1 / 0 / 0 | 1 | green |
+| ZA filesystem blobs | `zafs-5` | 1 / 0 / 0 | 1 | green |
+| ZA leak unit | `zaleak-3` | 1 / 0 / 0 | 1 | green |
+| Workspace units (Task 2's `UNIT_TEST_FEATURES`) | `units-2` | 555 / 0 / 2 | 1 | green (the dav-proto request fixtures it rewrites were reverted) |
+| Vault and groupware | `vaultgw-2` | 213 / 0 / 0 | 1 | green |
+
+Documented flakes: none needed a rerun. `webdav::cal_itip` failed in four attempts, each on a
+deterministic fixture difference (1.0's `ItipTime` kind, an attendee REPLY's SEQUENCE, the
+RFC fixtures), not its DTSTAMP-index flake; plain `jmap::calendar::notification` passed in
+every attempt that reached it; the four SMTP tests passed in `smtp-9`. `smtp-8`'s one failure,
+`smtp::inbound::antispam::antispam` (its HTTP reload request closed during TLS), passed by
+name in `smtp-flake-3` and in `smtp-9` (N27).
+
+##### Needs a ruling (part 7c4)
+
+- **N21, ruling 101's premise.** `$hasattachment` is set at ingest, not by the index task, so
+  there was nothing to wait for; the fixture variation 7c2 saw is explained by fixture
+  regeneration in alternating plain and key runs. The comparison now includes the keyword in
+  plain mode and leaves it out in key mode (ruling 55). Confirm.
+- **N22, a CANCEL's summary after a replacement (`rfc5546_todo.txt`, "Recurring to-do
+  request").** The CANCEL to the uninvited attendee carries the old to-do in its body but a
+  summary (title, start, attendees, rule) of the organizer's new to-do, so the attendee's
+  notice names an event they were never invited to. 1.0's library output, both account kinds;
+  the regenerated fixture records it. An apparent upstream quirk under ruling 44, reported to
+  the primary.
+- **N23, per-occurrence inherited properties (`jmap::calendar::instance`).** 0.16 ignored a
+  differing `uid`, `recurrenceRule`, `privacy` or participant address on an occurrence; 1.0
+  rejects them and ignores only the base event's own values. The test now asserts the
+  rejection and sends the base's values in its "ignored" case. Confirm the stricter subject.
+- **N24, the push settle (`jmap::core::push_subscription` and its key mirror).** A Mailbox
+  state change arrives after the creation's first one, at the throttled batch's retry; the
+  tests drain Mailbox state changes for 2.5 s before changing the subscription's types, and
+  wait 2.5 s (0.16: 1 s) for the push the type filter must suppress. The trailing change's
+  source was inferred from `services/src/state_manager/push.rs`, not traced. Confirm the wait.
+- **N25, test isolation in `system_tests`.** The security test resets 127.0.0.1's
+  authentication-failure counter before counting to the ban (earlier sub-tests' failures
+  stayed in the day-long window), and the OIDC test's SASL token is issued with a one-minute
+  lifetime (1.0's delayed 535 outlasted the one-second one). Neither changes a threshold or a
+  refusal. Confirm.
+- **N26, key accounts' session.** A key account's session advertises CalendarEvent (and
+  ContactCard) blob types and the new file-node sort options although JMAP calendars answer
+  `accountNotSupportedByMethod` for it: the class of plan 13's open question about advertised
+  sort options. The key variant asserts 1.0's object as served.
+- **N27, a parallel SMTP failure outside the four.** `smtp::inbound::antispam::antispam`
+  failed once in `smtp-8` (the HTTP reload request closed during TLS) and passed alone
+  (`smtp-flake-3`); not seen in later runs.
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
@@ -7237,6 +7372,72 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `za::pinning::case_11_exclusion_only` (fork, part 7c3, ruling 91, A2, new) | An exclusion-only master edit gives the full state (with the EXDATE), then a CANCEL with RECURRENCE-IDs; bob's copy keeps the update and the EXDATE, and the CANCEL adds a cancelled override for the excluded date. | 1.0's `organizer_handle_update` sends an exclusion-only edit as a CANCEL, not as the full update. |
 | `za::sharing` lifecycle differential (fork, part 7c3, ruling 93) | The equality assertions on inbox payloads, owner-stored pairs and statuses, recipient copies and token sets are restored (part 7c had held them). | The delegated second run now splits as the owner run does. |
 | `za::sharing` direct delegated-scheduling fixtures (fork, part 7c3) | `za_self_*` and `za_fan_out` calls pass `RecipientPolicy::new(groupware, 0)`. | The new policy arguments of rulings 91 and 93. |
+| `jmap::mail::changes` (upstream, part 7c4) | After each raw change-log write the test marks the account's message cache stale (`Inner::mark_cache_stale`). | 1.0 serves a message-cache snapshot for up to 5 s without revalidating it (`email/src/cache/mod.rs`, `RevalidateInterval::DEFAULT`), and only `commit_batch` invalidates it; 0.16 read the change log on every call. Ruling 105 (N20, timing artefact). |
+| `jmap::mail::query_changes`, `jmap::za_variants::query_changes` (upstream and its key mirror, part 7c4) | The plain Update batch names its account and collection; both tests mark the message cache stale after the Update and Move raw writes. | 1.0's `log_item_update` logs nothing without a current account (`store/src/write/batch.rs`); the cache snapshot as above. Ruling 105 (S1, S2). |
+| `jmap::mail::query` (upstream, part 7c4) | The two `after(1875) and before(1878)` cases expect four more ids, N01558, N01952, N02120 and T10251, in the non-Bronze group. | 1.0's `after` is inclusive (`receivedAt >= after`, RFC 8621 4.4.1; `jmap/src/email/query/filter.rs`); 0.16 used `>`. The four messages are received at 1875. Ruling 105. |
+| `jmap::mail::set` (upstream, part 7c4) | The `email_set` fixtures include the `$hasattachment` or `$hasnoattachment` keyword and are compared with it in plain mode; key mode compares them without it, as `get::test` does. Reverts part 7c2's exclusion (the `email_set` part of its keywords row); the keyword-update filter of `assert_email_properties` stays. | 1.0 sets the keyword when an ordinary account's message is ingested (`index_message`, `email/src/message/index/metadata.rs`); a key account's message stores neither (plan 13 ruling 55). Ruling 101 (N17). |
+| `jmap::mail::mailbox` (upstream, part 7c4) | `Mailbox/changes` is called with `maxChanges` 1000 where 0.16 sent 0. | 1.0 refuses `maxChanges: 0` with `invalidArguments` (`jmap/src/changes/get.rs`, RFC 8620 5.2 requires a positive value); 0.16 read it as no limit. |
+| `jmap::mail::acl`, `jmap::za_variants::acl` (upstream and its key mirror, part 7c4) | A method on an account the session cannot reach (before a share, after a revocation or group removal, and Bill on accounts never shared with him) expects `accountNotFound`, a Blob/copy whose source is unreachable `fromAccountNotFound`, the key variant's raw Email/import `accountNotFound`; a Blob/copy of an unreadable blob in a reachable account expects `notFound`. New helpers `assert_account_not_found` and `assert_from_account_not_found`; `assert_forbidden` is unchanged. | 1.0's `account_error` (`jmap/src/api/auth.rs`) answers `accountNotFound` without access (RFC 8620 3.6.2) and `forbidden` only within a reachable account; Blob/copy answers `notFound` (RFC 8620 6.3; 0.16 `blobNotFound`). In the key variant these account checks precede the fork's refusals, which stay in place (ruling 99's class). |
+| `imap::condstore` (upstream, part 7c4) | `UID FETCH ... (CHANGEDSINCE <SEQ 0> VANISHED)` expects `* VANISHED (EARLIER) 1:2`; `SEARCH MODSEQ <SEQ 4>` expects `SEARCH 1 2 3`. | 1.0 lists every UID expunged from the mailbox since the modseq (`imap/src/op/fetch/mod.rs`, `Store::vanished_uids`), where 0.16 netted out UIDs created after it; 1.0's MODSEQ criterion is inclusive (`change_id + 1 >= modseq`, RFC 7162 3.1.5), so UID 3, last changed at that modseq, matches. Ruling 105 and part 7c4. |
+| `imap::fetch`, `imap::za_variants::fetch` (upstream and its key mirror, part 7c4) | The pipelined pair's second command is `_x UID FETCH 1 (UID)` (0.16: `_x FETCH 1 (UID)`). | `FETCH` and `UID FETCH` are different commands, which 1.0 runs as two concurrently spawned tasks (`imap/src/core/client.rs` `group_requests`), so their order was not fixed; the same command keeps them in one ordered batch. Ruling 105 (timing artefact, S3). |
+| `imap::acl`, `imap::za_variants::acl` (upstream and its key mirror, part 7c4) | LISTRIGHTS expects `r l ws i et k x p n a`; GETACL and MYRIGHTS expect `lr`, `lri` and `lrswxte` (0.16 `rl`, `rli`, `tewsrxl`). | 1.0 adds the METADATA annotation right `n` (RFC 5464 6) and lists rights in RFC 4314 order (`imap-proto/src/protocol/acl.rs` `ACL_RIGHTS`). |
+| `webdav::prop` (upstream, part 7c4) | Test 17: for calendars and address books (collections and items) the oversized live properties expect 507 and the dead property 424 Failed Dependency with no description, and a second PROPPATCH with only the dead property expects 507 "Property value is too long"; files keep 507 for every property. Address books' `supported-collation-set` lists `i;octet` too. | 1.0's PROPPATCH is atomic (RFC 4918 9.2): `DeadPatch::apply` answers 424 to every dead operation once a live one failed (`dav/src/common/dead/patch.rs`); a file node's display name is a dead property (`DisplayName::Stored`). Address books advertise `i;octet` (`dav/src/common/propfind/item.rs`), as calendars do (part 7c2). Ruling 105. |
+| `webdav::lock` (upstream, part 7c4) | The lock owner is read at `owner.D:href` (0.16 `owner.href`). | 1.0 echoes the owner element's `href` in the DAV namespace the request gave it. |
+| `system::oidc` (upstream, part 7c4) | `system_tests` adds an implicit-TLS submission listener (port 4467); the SMTP OAUTHBEARER steps run there and IMAP's on 9992 (TLS). The invalid token expects RFC 7628's `334` error challenge with `"status":"invalid_token"`, then 535 after the client's dummy response (0.16: a 4xx). The token used by the SASL steps is issued with a one-minute lifetime, and the one-second lifetime is restored after them. | 1.0 offers bearer mechanisms only over TLS (`common/src/auth/sasl.rs` `accepts_bearer_tokens`; the generated default `saslMechanisms`); `smtp/src/inbound/auth.rs` answers a refused bearer with the challenge and delays a failed attempt's 535 by `auth_errors_wait`, which outlasts the test's one-second token (0.16 answered 454 at once). Ruling 105 and part 7c4. |
+| `smtp::inbound::dkim2::dkim2_dsn_is_signed` (upstream, part 7c4) | The DSN's `from_address` is `MAILER-DAEMON@example.com`, the signing domain. | mail-auth 0.14.1 (1.0.1's) refuses to start a DKIM2 chain unless the From domain matches `d=` (`Dkim2Error::FromNotAuthentic`); the default DSN From is the report domain, `example.org`. Ruling 105. |
+| `imap::antispam`, `imap::za_variants::antispam` (upstream and its key mirror, part 7c4) | The three classification checks fetch `RFC822` (0.16 `RFC822.TEXT`); the key variant reads `$Junk` from the FETCH response's FLAGS list (`has_junk_flag`) where it matched the text `FLAGS ($Junk`. | 1.0's RFC822.TEXT is the body only (RFC 3501 6.4.5, as BODY[TEXT]; `imap/src/op/fetch/mod.rs`), where 0.16 returned the whole message (`get_full_range`), so the header checks need the whole message; 1.0 lists an ordinary message's server-set `$hasnoattachment` keyword before `$Junk`. |
+| `jmap::mail::sieve_script`, `jmap::mail::vacation_response` (upstream, part 7c4) | Before the emptiness check each test asserts that the account holds Sieve seen ids and clears them (`clear_sieve_seen_ids`). | 1.0 keeps Sieve's vacation and duplicate ids in the account's store until they expire (`SeenIdHash`, `email/src/sieve/mod.rs`; the account purge removes expired ones), where 0.16 kept them in the in-memory lookup store. |
+| `jmap::mail::vacation_response` (upstream, part 7c4) | The three vacation replies expect the null return path `<>` (0.16 `<jdoe@example.com>`). | 1.0 sends an auto-reply with the null return path (`AutogeneratedReturnPath::Null`, `email/src/sieve/ingest.rs`; RFC 3834 3.3, RFC 5230 5.1). |
+| `webdav::acl` (upstream, part 7c4) | An ACL on a file node expects 403 (three requests); with only write-content on the folder, creating a new item expects 403, and the sharee creates it after Test 11 grants write. | 1.0 sets ACLs on containers only, a file node taking its folder's (`dav/src/common/acl.rs`); write-content maps to `ModifyItems` alone (RFC 3744 3.10), where 0.16 also granted `AddItems`. |
+| `webdav::card_query` (upstream, part 7c4) | The returned vCard's quoted `LABEL` parameter carries `^n` where the fixture gave `\n`. | 1.0 writes a newline inside a parameter value with RFC 6868's caret encoding. |
+| `webdav::cal_query` `roundtrip_expansion` (upstream, part 7c4) | The expected range spans the instances only; the alarm widening is removed. | 1.0's `CalendarEventData` keeps alarms apart (`groupware/src/calendar/dates.rs`) and no longer widens the stored range to their times. |
+| `system::oidc` (upstream, part 7c4, continued) | The management-API client lists the `Mail` scope; the device flow runs with a new registry client, `device-flow-client`, that lists the device-code and refresh grants (0.16 used the dynamically registered public client). | 1.0 limits a registry client to the scopes it lists beyond `openid` and `offline_access` (`ResolvedClient::allowed_scopes`), and grants the device flow only to a registry client that lists it (`ResolvedClient::allows_grant`: a self-describing client never gets it). |
+| `system::oidc` (upstream, part 7c4, device scope) | The device-authorization request asks for the profile scope (openid, mail, offline_access). | 1.0 scopes a token to what was requested; an unscoped token's session lists no account. 0.16 issued unscoped tokens. |
+| `jmap::mail::submission` (upstream, part 7c4) | The automatic identities are expected as id 1 for `jdoe@example.com` and id 2 for `john.doe@example.com` (0.16: the reverse). | 1.0's `identity_get_or_create` (`jmap/src/identity/get.rs`) creates them in sorted address order. |
+| `webdav::card_query` (upstream, part 7c4, index wait) | The test waits for the server's tasks after its three PUTs. | 1.0 answers addressbook-query from the Contacts search index (`dav/src/card/query.rs`), filled by an index task after each write; the query raced it (it passed in `caldav-key-15` and failed in `caldav-key-16`). Timing artefact (ruling 44). |
+| `webdav::acl` (upstream, part 7c4, collection delete) | For calendars and address books, the sharee's DELETE of the shared collection under read and write expects 403 and the owner deletes it; file folders keep 204. | 1.0's write privilege maps to `Modify`, `AddItems`, `ModifyItems` and `RemoveItems` only; 0.16's also granted `Delete`, which deleting the collection itself needs. |
+| `system::authorization` (upstream, part 7c4) | The admin's unfiltered PublicKey query expects no ids; filtered by each account, it expects that account's key (0.16: the unfiltered query listed both). | 1.0 scopes a registry query without an `accountId` filter to the requesting account (`jmap/src/registry/query.rs`, `with_account`). |
+| `jmap::mail::submission` (upstream, part 7c4, delivery status) | After the three deliveries the test polls the submission until every recipient is delivered, then expects `delivered: yes` with the remote reply for each (0.16: `250 2.1.5 Queued`, unknown, read after 100 ms). | 1.0 records each recipient's delivery result in the submission once the queue delivers it (RFC 8621 7). Intended change, waited for (ruling 44). |
+| `webdav::cal_query` (upstream, part 7c4, expansion) | `REPORT_3_EXPECTED_ABCD2`'s moved override carries `RECURRENCE-ID:20060104T170000Z`, the instance it replaces (0.16: its moved start, 19:00). | 1.0 keeps an expanded override's RECURRENCE-ID at the original instance, as RFC 4791 7.8.3's example does. |
+| `system::security` (upstream, part 7c4) | Before its failed-login loop the test resets 127.0.0.1's authentication-failure counter (`rate_reset` on `KV_RATE_LIMIT_AUTH`). | The counter's window is a day and earlier sub-tests leave failures from the address in it; 1.0 counts more of them than 0.16 (the OIDC test's refused bearer and client secrets), which banned the address before the test's hundredth failure. The threshold the test checks (100) is unchanged. |
+| `jmap::core::push_subscription`, `jmap::za_variants::push_subscription` (upstream and its key mirror, part 7c4) | After the mailbox creation's state change the test drains further Mailbox state changes that arrive within 2.5 s, and the type-filter check waits 2.5 s (0.16: 1 s) for a push that must not come. | 1.0 throttles pushes and sends what a throttled batch held at the next retry (`push_retry_wait`, 1 s; `services/src/state_manager/push.rs`), so a trailing Mailbox change from the creation arrived after the 1 s window, at the next verification. Timing artefact (ruling 44); the wider window keeps the filter check able to see a late push. |
+| `webdav::cal_itip` fixtures (upstream, part 7c4) | Every `summary.dtstart` line names `kind: DateTime` (46 lines in 9 files; no fixture has an all-day start). | 1.0's `ItipTime` carries `kind: ItipTimeKind` (`groupware/src/scheduling/mod.rs`), which its Debug output prints. |
+| `webdav::cal_query` (upstream, part 7c4, index wait) | The test waits for the server's tasks after its eight PUTs. | 1.0 answers calendar-query's text and parameter filters from the Calendar search index, filled by an index task (Test 7 found nothing in `caldav-plain-22`; key mode passed by timing). Timing artefact (ruling 44). |
+| `jmap::contacts::contact` (upstream, part 7c4) | The CardDAV view of the test contact (`TEST_VCARD_1`) carries `^n` in its quoted `LABEL` parameters and a quoted `JSPTR` value. | 1.0's vCard writer uses RFC 6868's caret encoding for a parameter newline and quotes the JSPTR parameter value. |
+| `webdav::cal_itip` fixture `vtimezone.txt` (fork fixture, part 7c4) | The REPLY of "The REPLY sent by an attendee carries a definition of its own" expects `SEQUENCE:0`, the organizer's, where the attendee's PUT gave 1. | 1.0 restores the organizer's SEQUENCE over an attendee's edit (`OrganizerSequences`, `groupware/src/scheduling/attendee.rs`); an attendee does not version the event. |
+| `jmap::contacts::acl`, `jmap::files::acl`, `jmap::calendar::acl` (upstream, part 7c4) | Every rights object (`myRights`, `shareWith` entries, share notifications' `oldRights` and `newRights`; 30 objects) lists `maySetMetadata`: true for the owner's own rights, false for every grant the tests make. | 1.0 adds `MaySetMetadata` (`Acl::ModifyMetadata`) to the address-book, file-node and calendar rights (`jmap-proto/src/object/*`, `all_rights`); no grant in these tests includes it. |
+| `webdav::cal_alarm` (upstream, part 7c4) | After its 6 s wait the test polls up to 10 s more for the two alarm messages. | Timing artefact (ruling 44): one of the two had not landed after 6 s in `caldav-plain-24` (it had in `caldav-plain-23`); the alarm task and the delivery run on their own. |
+| `webdav::cal_itip` fixtures `rfc5546_event_single.txt`, `rfc5546_event_recurring.txt`, `rfc5546_todo.txt`, `rfc6638_recurring.txt` (upstream, part 7c4) | The expected messages and stored copies are 1.0's library output (`itip_create`, `itip_update`, `itip_cancel` and the inbound merge, which the harness calls directly, with the fork's refactor of `itip_cancel` behaviour-neutral): (1) an attendee's REPLY carries the organizer's SEQUENCE, and the organizer's later SEQUENCEs follow (one lower than 0.16's); (2) an organizer's message is split per recipient, each listing its own attendees and instances, with the instance's DTSTART and duration in the slice; (3) a message's summary describes the instance it carries (its start, description, location), an RRULE only for the master; (4) a CANCEL that uninvites specific attendees carries no `STATUS:CANCELLED`; (5) the organizer's copy materialises an instance a REPLY declines as a full override (summary, times, both attendees, SCHEDULE-STATUS). | (1) `OrganizerSequences` and `SequenceIncrement` (`groupware/src/scheduling/attendee.rs`); (2) `RecipientSplit`, `itip_messages_per_recipient`; (3) the instance summaries of 1.0's builders; (4) RFC 5546 3.2.5 ("MUST NOT be included" when uninviting); (5) 1.0's inbound merge. One point is reported to the primary: the CANCEL to an uninvited attendee summarises the organizer's new state (its summary, start and attendees), not the instance it cancels. |
+| `webdav::cal_scheduling` (upstream, part 7c4) | The schedule-outbox free-busy request expects `3.8;No authority` for Jane and Bill, who share no calendar with John (0.16: `2.0;Success`). | 1.0 answers another account's free-busy only through a calendar it shares with read or free-busy rights (`AvailabilityCalendars::owner`, `groupware/src/calendar/availability.rs`; `dav/src/calendar/scheduling.rs`). |
+| `jmap::contacts::acl`, `jmap::files::acl`, `jmap::calendar::acl` (upstream, part 7c4, no access) | The six no-access checks (before the share, after its revocation) expect `accountNotFound` (0.16 `forbidden`). | As for `jmap::mail::acl`: 1.0's `account_error` answers `accountNotFound` for an account the session cannot reach. |
+| `jmap::contacts::acl`, `jmap::calendar::acl`, `jmap::files::acl` (upstream, part 7c4, sharee update) | A read-only sharee's empty patch of the shared address book, calendar or folder is expected to succeed; the refusal is asserted with a change that needs a right the sharee lacks: a sharing change for the address book ("You are not allowed to share this address book.") and the calendar ("You are not allowed to modify this calendar."), a rename for the folder ("You are not allowed to rename or move this file node."). 0.16 refused the empty patch. | 1.0 checks a sharee's update by what it changes (`jmap/src/addressbook/set.rs`, `calendar/set.rs`, `file/writer.rs`); an address book's name and description are each sharee's own preferences. |
+| `utils::jmap::Account::jmap_copy` (test helper used by `jmap::{contacts,calendar,files}::acl`, part 7c4) | Each create object carries the source record's `id`, equal to its creation key (0.16 sent only the key). | 1.0 reads a /copy's source id from the create object's `id` property (RFC 8620 5.4) and answers `invalidProperties` ("Missing or invalid \"id\" property.") without it. |
+| `jmap::files::node`, `jmap::files::acl`, `jmap::za_variants::file_node` (upstream and its key mirror, part 7c4) | Every FileNode create names its `@type` (`Directory`, or `File` for one with a blob); a file's media type is `mediaType` in creates and expectations, and the get properties ask for `FileNodeProperty::MediaType` where they asked for `Type`. | 1.0's FileNode follows the JMAP file-storage draft: `@type` (`FileNodeProperty::Type`, File/Directory/SymLink) is required on creation ("@type is required on creation.", `jmap/src/file/set.rs`) and the media type is `mediaType`; 0.16's `type` was the media type. |
+| `jmap::files::node`, `jmap::files::acl`, `jmap::za_variants::file_node` (part 7c4, get results) | Every FileNode get expectation includes the node's `@type` (17 objects). | 1.0 returns `@type` with every FileNode, requested or not. |
+| `jmap::files::node` `test_options` (upstream, part 7c4) | A collision with a create of the same batch (reject, replace, and an update colliding with a create) expects `existingId` naming that create (0.16: no `existingId`); the raw Create+Update case's create names its `@type`; the raw FileNode/copy in `files::acl` names its source `id`. | 1.0 attaches the pending create's id to the error once the batch commits (`awaiting_existing`, `jmap/src/file/set.rs`); `@type` and the copy's `id` as above. |
+| `jmap::files::node` `test_options` (upstream, part 7c4, hrefs) | The child folder's WebDAV href is `.../Q1%20&%20Q2%20(final)/` (0.16 `.../Q1%20%26%20Q2%20%28final%29/`). | 1.0 percent-encodes a path segment's characters outside RFC 3986's unreserved and sub-delimiter sets only. |
+| `jmap::files::acl` (upstream, part 7c4, shareWith) | An unshared folder's `shareWith` is expected `null` (0.16 `{}`), twice. | 1.0's FileNode get answers null when a node has no shares or the reader lacks `Share` (`jmap/src/file/get.rs` `share_with`). |
+| `jmap::files::acl` (upstream, part 7c4, destroy) | A read-only sharee's destroy of the shared folder expects "You do not have permission to perform this operation." (0.16 "You are not allowed to delete this file node."). | 1.0's FileNode writer answers a destroy without the right with `not_permitted` (`jmap/src/file/writer.rs`). |
+| `jmap::calendar::calendars` (upstream, part 7c4) | The test calendar's timeless default alerts use ids 2 and 3 (0.16: 0 and 1, reusing the timed alerts' ids); the patch and expectations follow (the replaced alert 2, the removed 3, the added 4). | 1.0 requires default alert ids to be unique across an account's alert sets ("Default alert ids must be unique across all calendars in the account."). |
+| `jmap::principal::get`, `jmap::za_variants::principal_get` (upstream and its key mirror, part 7c4) | The session object expects 1.0's account capabilities: `maxMailboxesPerEmail` 100, `maxAddressBooksPerCard` 10, `maxFileNodeDepth` 64, the file-node sort options `created`, `modified`, `mediaType` and `tree` and `supportedNodeTypes`, the blob types `CalendarEvent` and `ContactCard`, the `principals:owner` capability, and no `imapsieve` Sieve extension. | 1.0's session builder. In key mode the account advertises CalendarEvent blobs although JMAP calendars answer `accountNotSupportedByMethod` for it, the class of the recorded open question about advertised sort options. |
+| `jmap::calendar::event` (upstream, part 7c4) | The three full-get expectations include `mayInviteSelf`, `mayInviteOthers`, `hideAttendees`, `useDefaultAlerts` (the values the test asserts on their own below) and `version` "2.0"; `assert_eq_ignoring_updated` also leaves out a server-set `created` where the expectation names none. | 1.0's CalendarEvent/get without `properties` returns the JMAP for Calendars properties and the JSCalendar `version` (`jmap/src/calendar_event/get.rs`), and sets `created` on creation. |
+| `jmap::za_variants::principal_get` (key mirror of `jmap::principal::get`, part 7c4) | John's principal lists his own account as the session object's Account (asserted above in full); Jane, Bill and Sales list `accounts: null`; Sales' calendars capability has `accountId: null`; `timezone` is `timeZone`. | 1.0's Principal/get follows RFC 9670: `accounts` holds the session's Account objects for accounts the session can reach, and the field is `timeZone`. |
+| `jmap::calendar::event` (upstream, part 7c4, overrides) | Event 2 keeps its calendar's default alert id `abc` (0.16 `k1`); its overrides in three checks leave out `duration`, equal to the master's. | 1.0 keeps a default alert's id and writes an override as a sparse patch of what differs from the master. |
+| `jmap::calendar::event` (upstream, part 7c4, reduceParticipants) | The organizer kept by `reduceParticipants` is expected whole: its `chair` role and `participationStatus` too. | 1.0 filters which participants it returns and leaves each one whole; 0.16 also cut the kept participant down. |
+| `jmap::calendar::event` (upstream, part 7c4, expansion) | The expanded instances of the two non-recurring events expect `baseEventId: null` (0.16: the event's own id). | 1.0 gives an instance a base event only when it is expanded from a recurring one. |
+| `jmap::calendar::event` (upstream, part 7c4, parse) | The parsed event also expects `id`, `baseEventId`, `calendarIds`, `isDraft` and `isOrigin` as null and `version` "2.0". | 1.0's CalendarEvent/parse lists the server-set properties, null for a parsed event, and the JSCalendar version. |
+| `jmap::calendar::event` (upstream, part 7c4, CalDAV view) | `TEST_ICAL_1` takes 1.0's iCalendar for the JMAP event: PRODID, the generated US/Eastern VTIMEZONE, DESCRIPTION, SEQUENCE 1 and the VALARM with its `JSID`; the comparison also leaves out the server `CREATED` line, as it leaves out DTSTAMP. | 1.0's JSCalendar-to-iCalendar conversion writes the referenced time zones, the alert ids and the server timestamps. |
+| `jmap::calendar::instance` (upstream, part 7c4) | The base event's overrides are expected as patches: the edited instance as its title and `locations/loc1/name`, the moved one as its title and start (0.16: each instance whole, with start, duration and locations). | 1.0 stores an override as a patch of what differs from the master (RFC 8984 4.3.5). |
+| `jmap::calendar::instance` (upstream, part 7c4, per-occurrence properties) | The refused per-occurrence properties use values that differ from the base event's (`calendarIds: {}`), and the four inherited properties 0.16 ignored whatever their values (`uid`, `recurrenceRule`, `privacy`, a participant's address) join them with the values 0.16's test sent; the "ignored" patch now carries the base's own values (its uid, null rule and privacy, its calendarIds) and is accepted. | 1.0 ignores a metadata or series property on an occurrence only when it equals the base event's value and rejects any other value ("This property cannot be modified on a single occurrence.", `jmap/src/calendar_event/validate.rs` `is_override_key`). |
+| `jmap::calendar::instance` (upstream, part 7c4, non-recurring) | The expansion of a non-recurring event is expected to carry the event's own id (`assert_eq!(id, single_id)`; 0.16 `assert_ne!`). | 1.0 expands a non-recurring event to itself, with no base event (see the `baseEventId` row above). |
+| `jmap::calendar::instance` (upstream, part 7c4, this-and-future) | The two occurrences a THISANDFUTURE change shifted expect their original times (12:00) as `recurrenceId` (0.16: their shifted starts, 14:00). | 1.0 names an occurrence by the time it replaces (RFC 5545 RECURRENCE-ID), as for overrides (`webdav::cal_query` row). |
+| `jmap::calendar::notification` (upstream, part 7c4) | `changedBy` includes the changer's `calendarAddress`; the requested `comment` and `eventPatch` are expected as null; the notified event includes its server `created` and `version` "2.0". | 1.0's CalendarEventNotification/get returns every requested property, names the changer by calendar address too, and carries the JSCalendar event as 1.0 serialises it. |
+| `jmap::calendar::acl` (upstream, part 7c4, event update) | A read-only sharee's event update is tested with a title change, refused "You are not allowed to modify this event." (0.16: an empty patch, refused "You are not allowed to modify calendar ..."). | 1.0 checks an event update by what it changes (`groupware/src/calendar/rights.rs`, `EventRightsError::ModifyEvent`). |
+| `jmap::calendar::acl` (upstream, part 7c4, implied rights) | The three rights objects that grant `mayWriteAll` expect `mayWriteOwn`, `mayUpdatePrivate` and `mayRSVP` true (0.16: false). | 1.0's `mayWriteAll` carries the ACLs of the narrower write rights, so they read true wherever it is granted. |
+| `jmap::calendar::acl` (upstream, part 7c4, cleanup) | Before the emptiness check the test destroys John's and Jane's event notifications. | 1.0 notifies an owner of the changes a sharee makes to the shared calendar's events (CalendarEventNotification); 0.16 created none in this test. |
+| `jmap::principal::get` (upstream, part 7c4) | The session object takes 1.0's account capabilities (as in the key variant above, plus `maxCalendarsPerEvent` 10 and the `metadata` capability with its eight data types, its session and primary-account entries); the principals list only John's own account (the session's Account object) and `accounts: null` for the others, carry the calendars capability on the principal (`accountId` null where the session reaches no account; `mayShareWith` false for John himself) and name `timeZone`. | 1.0's session builder; RFC 9670 Principal/get (`accounts`, `timeZone`). A key account's session leaves out the metadata capability (the fork's `za_metadata_refused`). |
+| `jmap::principal::availability` (upstream, part 7c4) | Each busy period expects `accountId` (null where no event is shown); the third event's period expects `tentative` (0.16 `confirmed`), in both checks that list it. | 1.0's BusyPeriod names its account and takes the busy status from a tentative event's status (JMAP Calendars Principal/getAvailability). |
+| `jmap::compliance::binary` `blob-copy-not-found` (upstream port of jmap-test-suite, part 7c4) | An unknown blob in Blob/copy expects `notFound` (0.16 `blobNotFound`). | RFC 8620 6.3 names the error `notFound`, which 1.0 answers. |
 
 ## Task 1 check
 
