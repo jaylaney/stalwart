@@ -48,6 +48,7 @@ pub async fn test(test: &TestServer) {
     .list()[0]
         .assert_is_equal(json!({
         "id": john_folder_id,
+        "@type": "Directory",
         "name": "Test #1",
         "myRights": {
           "mayRead": true,
@@ -118,6 +119,7 @@ pub async fn test(test: &TestServer) {
     .list()[0]
         .assert_is_equal(json!({
         "id": john_folder_id,
+        "@type": "Directory",
         "name": "Test #1",
         "shareWith": {
             &jane_id : {
@@ -147,6 +149,7 @@ pub async fn test(test: &TestServer) {
     .list()[0]
         .assert_is_equal(json!({
         "id": john_folder_id,
+        "@type": "Directory",
         "name": "Test #1",
         "myRights": {
             "mayRead": true,
@@ -280,6 +283,7 @@ pub async fn test(test: &TestServer) {
     .list()[0]
         .assert_is_equal(json!({
         "id": john_folder_id,
+        "@type": "Directory",
         "name": "Test #1",
         "myRights": {
             "mayRead": true,
@@ -388,6 +392,7 @@ pub async fn test(test: &TestServer) {
     .list()[0]
         .assert_is_equal(json!({
         "id": john_folder_id,
+        "@type": "Directory",
         "name": "Jane's updated name",
         }));
 
@@ -417,6 +422,7 @@ pub async fn test(test: &TestServer) {
     .list()[0]
         .assert_is_equal(json!({
         "id": john_folder_id,
+        "@type": "Directory",
         "name": "Jane's updated name",
         "shareWith": {}
         }));
@@ -548,6 +554,7 @@ pub async fn test(test: &TestServer) {
     .list()[0]
         .assert_is_equal(json!({
             "id": &copied_id,
+            "@type": "Directory",
             "name": "copied-here",
             "parentId": &john_folder_id,
         }));
@@ -559,7 +566,7 @@ pub async fn test(test: &TestServer) {
     )
     .await
     .list()[0]
-        .assert_is_equal(json!({ "id": &jane_folder_id }));
+        .assert_is_equal(json!({ "id": &jane_folder_id, "@type": "Directory" }));
 
     // onExists=rename on copy: colliding into John's folder again must echo the new name
     let renamed_copy = jane

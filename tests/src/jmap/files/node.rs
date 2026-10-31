@@ -77,7 +77,7 @@ pub async fn test(test: &TestServer) {
         .collect::<AHashSet<_>>()
     );
 
-    // Verify folder structure
+    // Verify folder structure (1.0 returns a node's @type with every get)
     let response = account
         .jmap_get(
             MethodObject::FileNode,
@@ -93,16 +93,19 @@ pub async fn test(test: &TestServer) {
     assert_eq!(list.len(), 3);
     list[0].assert_is_equal(json!({
         "id": &root_folder_id,
+        "@type": "Directory",
         "name": "Root Folder",
         "parentId": null,
     }));
     list[1].assert_is_equal(json!({
         "id": &sub_folder_id,
+        "@type": "Directory",
         "name": "Sub Folder",
         "parentId": &root_folder_id,
     }));
     list[2].assert_is_equal(json!({
         "id": &sub_sub_folder_id,
+        "@type": "Directory",
         "name": "Sub-sub Folder",
         "parentId": &sub_folder_id,
     }));
@@ -168,6 +171,7 @@ pub async fn test(test: &TestServer) {
     let blob_id = response.list()[0].blob_id().to_string();
     response.list()[0].assert_is_equal(json!({
         "id": &file_id,
+        "@type": "File",
         "name": "hello.txt",
         "parentId": &root_folder_id,
         "mediaType": "text/plain",
@@ -292,11 +296,13 @@ pub async fn test(test: &TestServer) {
     assert_eq!(list.len(), 2);
     list[0].assert_is_equal(json!({
         "id": &sub_folder_id,
+        "@type": "Directory",
         "name": "Renamed Sub Folder",
         "parentId": &root_folder_id,
     }));
     list[1].assert_is_equal(json!({
         "id": &file_id,
+        "@type": "File",
         "name": "renamed-hello.txt",
         "parentId": &root_folder_id,
     }));

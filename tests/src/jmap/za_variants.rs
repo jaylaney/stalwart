@@ -3216,6 +3216,7 @@ pub async fn file_node(test: &TestServer) {
     let blob_id = response.list()[0].blob_id().to_string();
     response.list()[0].assert_is_equal(json!({
         "id": &file_id,
+        "@type": "File",
         "name": "hello.txt",
         "parentId": &root_folder_id,
         "mediaType": "text/plain",
@@ -3304,11 +3305,13 @@ pub async fn file_node(test: &TestServer) {
     assert_eq!(list.len(), 2);
     list[0].assert_is_equal(json!({
         "id": &sub_folder_id,
+        "@type": "Directory",
         "name": "Renamed Sub Folder",
         "parentId": &root_folder_id,
     }));
     list[1].assert_is_equal(json!({
         "id": &file_id,
+        "@type": "File",
         "name": "renamed-hello.txt",
         "parentId": &root_folder_id,
     }));
