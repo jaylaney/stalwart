@@ -811,12 +811,11 @@ async fn cross_account_copies_are_refused(
         .collect::<Vec<_>>();
     copies.sort_unstable();
     // IMAP COPY and MOVE and JMAP Email/copy name the source account,
-    // Blob/copy the key account, the R31 refusals the source's owner: the
-    // key account seven times, the plain account for the copy into the key
-    // account by its own client. Ruling 84: the plain session's copy into
-    // the key account is refused by 1.0 first and traces nothing.
-    let mut expected = vec![Some(u64::from(key_id)); 7];
-    expected.extend([Some(u64::from(plain_id)); 1]);
+    // Blob/copy the key account, the R31 refusals the source's owner.
+    // Ruling 84: the copies 1.0 refuses first trace nothing, which leaves
+    // the key account six times (0.16: seven) and the plain account twice.
+    let mut expected = vec![Some(u64::from(key_id)); 6];
+    expected.extend([Some(u64::from(plain_id)); 2]);
     expected.sort_unstable();
     assert_eq!(copies, expected, "the copy refusals' traces: {events:?}");
     for event in &events {
