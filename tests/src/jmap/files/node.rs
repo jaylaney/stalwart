@@ -513,10 +513,9 @@ pub async fn test_options(test: &TestServer) {
     let twin_first = response.created(0).id().to_string();
     let err = response.not_created(1);
     assert_eq!(err.typ(), "alreadyExists");
-    assert!(
-        err.pointer("/existingId").is_none(),
-        "Pending Create collision has no committed existingId, got {err:?}"
-    );
+    // 1.0 names the pending create in `existingId` once the batch commits
+    // (`awaiting_existing`, `jmap/src/file/set.rs`); 0.16 left it out.
+    assert_eq!(err.text_field("existingId"), twin_first.as_str());
     account
         .jmap_destroy(
             MethodObject::FileNode,
@@ -566,10 +565,7 @@ pub async fn test_options(test: &TestServer) {
     let twin_survivor = response.created(0).id().to_string();
     let err = response.not_created(1);
     assert_eq!(err.typ(), "alreadyExists");
-    assert!(
-        err.pointer("/existingId").is_none(),
-        "Pending Create + Replace returns alreadyExists with no existingId, got {err:?}"
-    );
+    assert_eq!(err.text_field("existingId"), twin_survivor.as_str());
     account
         .jmap_destroy(
             MethodObject::FileNode,
@@ -619,7 +615,7 @@ pub async fn test_options(test: &TestServer) {
             {
                 "accountId": account.id_string(),
                 "update": { &lhs_id: { "name": "merged" } },
-                "create": { "new1": { "name": "merged" } }
+                "create": { "new1": { "@type": "Directory", "name": "merged" } }
             },
             "0"
         ]]))
@@ -632,10 +628,7 @@ pub async fn test_options(test: &TestServer) {
         .pointer(&format!("/methodResponses/0/1/notUpdated/{lhs_id}"))
         .expect("update should fail");
     assert_eq!(upd_err.typ(), "alreadyExists");
-    assert!(
-        upd_err.pointer("/existingId").is_none(),
-        "Pending-from-Create collision has no existingId, got {upd_err:?}"
-    );
+    assert_eq!(upd_err.text_field("existingId"), new1_id.as_str());
     account
         .jmap_destroy(
             MethodObject::FileNode,

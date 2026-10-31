@@ -577,7 +577,12 @@ pub async fn test(test: &TestServer) {
                 "accountId": john.id_string(),
                 "onExists": "rename",
                 "create": {
-                    &jane_folder_id: { "parentId": &john_folder_id, "name": "copied-here" }
+                    // 1.0 reads the source id from "id" (RFC 8620 5.4).
+                    &jane_folder_id: {
+                        "id": &jane_folder_id,
+                        "parentId": &john_folder_id,
+                        "name": "copied-here"
+                    }
                 }
             },
             "0"
