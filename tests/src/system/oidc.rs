@@ -26,7 +26,7 @@ use jmap_client::{
     mailbox::query::Filter,
 };
 use registry::schema::{
-    enums::JwtSignatureAlgorithm,
+    enums::{JwtSignatureAlgorithm, OAuthScope},
     prelude::{ObjectType, Property},
     structs::{OAuthClient, OidcProvider, SecretText, SecretTextValue},
 };
@@ -698,6 +698,9 @@ pub async fn test(test: &mut TestServer) {
             client_id: managed_id.to_string(),
             redirect_uris: vec![confidential_redirect.to_string()].into(),
             secret: Some(managed_secret.to_string()),
+            // 1.0 limits a registry client to the scopes it lists (beyond
+            // `openid` and `offline_access`); 0.16 allowed any.
+            scopes: vec![OAuthScope::Mail].into(),
             ..Default::default()
         })
         .await;

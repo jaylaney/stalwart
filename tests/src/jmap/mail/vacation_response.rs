@@ -198,6 +198,7 @@ pub async fn test(test: &TestServer) {
     for id in request.send_query_sieve_script().await.unwrap().take_ids() {
         client.sieve_script_destroy(&id).await.unwrap();
     }
+    crate::jmap::mail::sieve_script::clear_sieve_seen_ids(test, account.id().document_id()).await;
     test.destroy_all_mailboxes(account).await;
     test.assert_is_empty().await;
 }

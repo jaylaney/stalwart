@@ -86,10 +86,13 @@ pub async fn test(test: &TestServer) {
             .await
             .with_status(StatusCode::OK);
         if is_file {
+            // 1.0 sets ACLs on containers only: a file node takes its
+            // folder's (`dav/src/common/acl.rs`), and an ACL on the file
+            // itself is refused. 0.16 accepted one per file.
             owner_client
                 .acl(&owner_file, sharee_principal.as_str(), ["read"])
                 .await
-                .with_status(StatusCode::OK);
+                .with_status(StatusCode::FORBIDDEN);
         }
         sharee_client
             .propfind_with_headers(
@@ -259,7 +262,7 @@ pub async fn test(test: &TestServer) {
                     ["read", "write-content", "write-properties"],
                 )
                 .await
-                .with_status(StatusCode::OK);
+                .with_status(StatusCode::FORBIDDEN);
         }
         let response = owner_client
             .propfind(&owner_folder, [DavProperty::WebDav(WebDavProperty::Acl)])
@@ -330,7 +333,7 @@ pub async fn test(test: &TestServer) {
             owner_client
                 .acl(&owner_file, sharee_principal.as_str(), ["read", "write"])
                 .await
-                .with_status(StatusCode::OK);
+                .with_status(StatusCode::FORBIDDEN);
             owner_client
                 .acl(
                     &sharee_created_file,
@@ -338,7 +341,7 @@ pub async fn test(test: &TestServer) {
                     ["read", "write"],
                 )
                 .await
-                .with_status(StatusCode::OK);
+                .with_status(StatusCode::FORBIDDEN);
         }
         sharee_client
             .request_with_headers(

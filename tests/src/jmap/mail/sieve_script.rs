@@ -8,6 +8,7 @@ use crate::{
     jmap::mail::submission::{MockMessage, assert_message_delivery, spawn_mock_smtp_server},
     utils::{dns::DnsCache, server::TestServer, smtp::SmtpConnection},
 };
+use ::email::sieve::SeenIdHash;
 use jmap_client::{
     Error,
     core::set::{SetError, SetErrorType},
@@ -20,6 +21,7 @@ use std::{
     path::PathBuf,
     time::{Duration, Instant},
 };
+use store::IterateParams;
 
 pub async fn test(test: &TestServer) {
     println!("Running Sieve tests...");
@@ -570,11 +572,34 @@ pub async fn test(test: &TestServer) {
     for id in request.send_query_sieve_script().await.unwrap().take_ids() {
         client.sieve_script_destroy(&id).await.unwrap();
     }
+    clear_sieve_seen_ids(test, account.id().document_id()).await;
     test.destroy_all_mailboxes(account).await;
     admin
         .registry_destroy_all(ObjectType::SieveUserScript)
         .await;
     test.assert_is_empty().await;
+}
+
+/// 1.0 keeps Sieve's vacation and duplicate ids in the account's store until
+/// they expire (`SeenIdHash`; the account purge removes expired ones), where
+/// 0.16 kept them in the in-memory lookup store. A test that ran a script
+/// which records them finds and clears them before its emptiness check.
+pub async fn clear_sieve_seen_ids(test: &TestServer, account_id: u32) {
+    let (from, to) = SeenIdHash::account_range(account_id);
+    let mut seen_ids = 0;
+    test.server
+        .store()
+        .iterate(
+            IterateParams::new(from.clone(), to.clone()).set_values(false),
+            |_, _| {
+                seen_ids += 1;
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+    assert!(seen_ids > 0, "no Sieve seen ids were stored");
+    test.server.store().delete_range(from, to).await.unwrap();
 }
 
 fn get_script(name: &str) -> Vec<u8> {

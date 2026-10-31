@@ -1074,7 +1074,9 @@ pub async fn antispam(test: &TestServer) {
     }
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     imap_admin.send_ok("SELECT INBOX").await;
-    imap_admin.send("FETCH 11 (FLAGS RFC822.TEXT)").await;
+    // The checks read headers: 1.0's RFC822.TEXT is the body only (RFC 3501
+    // 6.4.5, as BODY[TEXT]), where 0.16 returned the whole message.
+    imap_admin.send("FETCH 11 (FLAGS RFC822)").await;
     imap_admin
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
@@ -1082,7 +1084,7 @@ pub async fn antispam(test: &TestServer) {
         .assert_contains("Subject: can someone explain")
         .assert_contains("X-Spam-Status: No")
         .assert_contains("PROB_HAM_HIGH");
-    imap_admin.send("FETCH 12 (FLAGS RFC822.TEXT)").await;
+    imap_admin.send("FETCH 12 (FLAGS RFC822)").await;
     imap_admin
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
@@ -1091,7 +1093,7 @@ pub async fn antispam(test: &TestServer) {
         .assert_contains("X-Spam-Status: No")
         .assert_contains_any(&["PROB_SPAM_UNCERTAIN", "PROB_HAM_LOW"]);
     imap_admin.send_ok("SELECT \"Junk Mail\"").await;
-    imap_admin.send("FETCH 10 (FLAGS RFC822.TEXT)").await;
+    imap_admin.send("FETCH 10 (FLAGS RFC822)").await;
     imap_admin
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await

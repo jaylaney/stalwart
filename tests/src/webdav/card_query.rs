@@ -120,7 +120,9 @@ END:VCARD
             properties: Default::default(),
             version: None,
         }))
-        .with_values([VCARD3.replace('\n', "\r\n").as_str()]);
+        // 1.0 writes a newline inside a parameter value as RFC 6868's `^n`; the
+        // fixture spells it `\n`, which 0.16 wrote back as given.
+        .with_values([VCARD3.replace("\\n", "^n").replace('\n', "\r\n").as_str()]);
 
     // Test 4: Search using limit
     client
