@@ -802,13 +802,19 @@ pub async fn test(test: &TestServer) {
                 account = value.strip_prefix("mailto:").unwrap();
             }
             "A:schedule-response.A:response.A:request-status" => {
-                if account == "unknown@example.com" {
-                    assert_eq!(
+                // 1.0 answers another account's free-busy only through a
+                // calendar it shares with read or free-busy rights
+                // (`AvailabilityCalendars::owner`); Jane and Bill share none.
+                // 0.16 answered any account of the tenant.
+                match account {
+                    "unknown@example.com" => assert_eq!(
                         value,
                         "3.7;Invalid calendar user or insufficient permissions"
-                    );
-                } else {
-                    assert_eq!(value, "2.0;Success");
+                    ),
+                    "jane.smith@example.com" | "bill@example.com" => {
+                        assert_eq!(value, "3.8;No authority")
+                    }
+                    _ => assert_eq!(value, "2.0;Success"),
                 }
             }
             "A:schedule-response.A:response.A:calendar-data" => {

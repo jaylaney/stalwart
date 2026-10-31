@@ -128,7 +128,9 @@ pub async fn test(test: &TestServer) {
         .await
         .method_response()
         .typ(),
-        "forbidden"
+        // 1.0: an account the session cannot reach is not found (RFC 8620
+        // 3.6.2); 0.16 answered forbidden.
+        "accountNotFound"
     );
 
     // Share address book with Jane
@@ -597,7 +599,9 @@ pub async fn test(test: &TestServer) {
         .await
         .method_response()
         .typ(),
-        "forbidden"
+        // 1.0: an account the session cannot reach is not found (RFC 8620
+        // 3.6.2); 0.16 answered forbidden.
+        "accountNotFound"
     );
 
     // Verify Jane received a share notification with the updated rights
