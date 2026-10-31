@@ -4826,9 +4826,8 @@ with their hooks ported, wrote the body of `imap/src/core/za.rs` that part 3b de
 re-read the hooks that merged clean (`imap/src/core/{client,mod,session}.rs`,
 `imap/src/op/{authenticate,create,delete,rename,subscribe}.rs`,
 `pop3/src/{client,lib,session}.rs`, `pop3/src/op/authenticate.rs`). `cargo check -p imap
--p pop3 -p managesieve` passes with no warnings; with `--tests` (none of the three has
-`test_mode`), `imap` and `pop3` pass and `managesieve` fails only in Task 2's restored
-module (below). `cargo test -p imap -p pop3 --lib`: 8 and 2 passed.
+-p pop3 -p managesieve` passes with no warnings, also with `--tests` (none of the three has
+`test_mode`; `managesieve`'s restored module after ruling 54, below). `cargo test -p imap -p pop3 --lib`: 8 and 2 passed.
 
 #### R34 at 1.0 (finding 5)
 
@@ -4899,8 +4898,7 @@ wildcard.
   STORE, so a search on them would silently answer only the client's flags. JMAP's
   `hasAttachment` filter is refused for key accounts likewise (`tests/src/za/mail/search.rs`).
   At 0.16 the server set neither keyword for any account, and `KEYWORD $HasAttachment`
-  matched client flags for both; this verdict is a one-line revert if the primary prefers
-  0.16's behaviour.
+  matched client flags for both. Ruling 55 keeps the refusal.
 - **Visible (served from the cache):** every other key, including `KEYWORD` and
   `UNKEYWORD` of any other flag, `BEFORE`, `ON`, `SINCE`, `OLDER` and `YOUNGER` (arrival
   time), `LARGER` and `SMALLER` (stored size), `MODSEQ`, `EMAILID`, `THREADID`, the
@@ -4920,12 +4918,10 @@ The unit tables `op::search::tests::{filter_table, sort_table}` pin these verdic
   FETCH. A key account's FLAGS therefore never show `$HasAttachment` or
   `$HasNoAttachment`, as at 0.16, where no account's did; SEARCH on them is refused (above).
   BODYSTRUCTURE and every attachment-derived structure answer come from the opened row.
-  Consequence for Task 7: a non-peek FETCH adds FLAGS to its answer, so
-  `za::mail::reads`' key-versus-plain comparison of `FETCH 1 (BODY[])` will see the plain
-  account's server-set `$hasattachment` and not the key account's. Either the comparison
-  drops that flag (an expectation-ledger row) or FETCH derives it from the opened row when
-  it opens one, at the cost of FLAGS answers that differ with and without a content
-  attribute. Part 5b did neither; this needs a ruling.
+  Ruling 55 confirms both this and the SEARCH refusal: the two keywords are new in 1.0 and
+  derived from content, 0.16 set neither, and the refusal matches JMAP's `hasAttachment`
+  refusal (mail spec 5.2). `za::mail::reads`' key-versus-plain FETCH comparison expects
+  exactly that difference (expectation ledger).
 - **A borrowed view for batch readers.** 1.0's FETCH holds each row by reference inside a
   `DocumentBatch`, and `MetadataRow` is neither `Clone` nor rebuildable from its parts. Part
   5b added `ZaMailView::za_open_metadata_row(&MetadataRow, ..) -> Option<MetadataRow>` to
@@ -4942,12 +4938,12 @@ The unit tables `op::search::tests::{filter_table, sort_table}` pin these verdic
 
 #### Deferred, by owner
 
-**Task 2 or the primary**
-- `managesieve/src/restored_tests.rs` (Task 2's restored module) does not compile:
-  1.0's `Token::Argument` holds a `SmallVec<[u8; 22]>`, and the module passes
-  `b"...".to_vec()` (13 sites). Neither 5b's nor 3b's code; listed, not fixed, as the brief
-  says. The fix is `.into()` (or `SmallVec::from_slice`) at each site, with no assertion
-  change. `cargo check -p managesieve` (no `--tests`) passes.
+**Done after ruling 54**
+- `managesieve/src/restored_tests.rs` (Task 2's restored module): 1.0's `Token::Argument`
+  holds a `SmallVec<[u8; 22]>`, so its 13 `b"...".to_vec()` arguments are now
+  `b"...".as_slice().into()`, a call-shape change with no assertion change.
+  `cargo check -p managesieve --tests` passes and `cargo test -p managesieve --lib` passes
+  (1 test).
 
 **Task 6**
 - Nothing from `imap/src/op/search.rs`: the refusals need no index, the visible keys read
@@ -5180,6 +5176,7 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `za::sharing::sharing_class_differential` (fork, new) | The sharee's `REPORT free-busy-query` is not in the equality block: the ordinary grantee is asserted to get the public event's busy period and the key account's grantee none (`Withheld`), a recorded divergence (ruling 51). | 1.0.1 selects a grantee's free-busy events with `is_shared_item(.., [ReadItems, SchedulingReadFreeBusy], match_any = true)` (`dav/src/calendar/freebusy.rs:199-204`), so `ReadItems` alone suffices; 0.16.27 required both bits. A key account's grantee holds no keys for the owner's account (`za_freebusy_access`). |
 | `imap::op::fetch::structure::restored_tests::*` (new, Task 2's handoff) | 0.16's six hand-built `DataItem` cases become six parsed messages written through `write_envelope` and `write_structure`. Sizes and line counts are the messages' own (computed in the test), not 0.16's literals. Media types, subtypes and parameter names are lower case, a multipart's extension data lists its `boundary`, and a text part without parameters gets `("charset" "us-ascii")` where 0.16 wrote `NIL`. | `imap/src/op/fetch/structure.rs`: 1.0 writes these items from the metadata, with the parser's normalized (lower-case) tokens and parameters, and `DEFAULT_TEXT_PARAMS` (RFC 3501's default) for a text part without any; 0.16's `DataItem::{Envelope, Body, BodyStructure}` are gone. |
 | `pop3::protocol::response::tests::serialize_response` (restored) | Its seven message cases are built with `Response::message(ChainedBytes, header length, lines)`; the header length is given (the blank line's end, or the whole message). The expected strings are unchanged. | `pop3/src/protocol/response.rs`: `Response::Message` holds a `ChainedBytes` and a `MessageEnd`, built by `Response::message` from the metadata's header length; 0.16's `SliceRange` and `lines` field are gone. |
+| `za::mail::reads::offsets_round_trip` (fork) | The key-versus-plain FETCH comparison takes `$hasattachment` out of the ordinary account's FLAGS item (the one a non-peek FETCH adds) and asserts it was there exactly where a FLAGS item is, and absent from every key-account answer; the answers are otherwise equal. | Ruling 55: 1.0 sets `$HasAttachment` and `$HasNoAttachment` from the parsed message (`email/src/message/index/metadata.rs:76`); a key account's message carries neither (mail spec 5.2), and 0.16 set neither for any account. |
 
 ## Task 1 check
 

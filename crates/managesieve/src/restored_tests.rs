@@ -18,7 +18,7 @@ fn receiver_parse_managesieve() {
             vec![Request {
                 tag: "".into(),
                 command: Command::Authenticate,
-                tokens: vec![Token::Argument(b"DIGEST-MD5".to_vec())],
+                tokens: vec![Token::Argument(b"DIGEST-MD5".as_slice().into())],
             }],
         ),
         (
@@ -30,9 +30,11 @@ fn receiver_parse_managesieve() {
                 tag: "".into(),
                 command: Command::Authenticate,
                 tokens: vec![
-                    Token::Argument(b"GSSAPI".to_vec()),
+                    Token::Argument(b"GSSAPI".as_slice().into()),
                     Token::Argument(
-                        b"cnNwYXV0aD1lYTQwZjYwMzM1YzQyN2I1NTI3Yjg0ZGJhYmNkZmZmZA==".to_vec(),
+                        b"cnNwYXV0aD1lYTQwZjYwMzM1YzQyN2I1NTI3Yjg0ZGJhYmNkZmZmZA=="
+                            .as_slice()
+                            .into(),
                     ),
                 ],
             }],
@@ -43,8 +45,8 @@ fn receiver_parse_managesieve() {
                 tag: "".into(),
                 command: Command::Authenticate,
                 tokens: vec![
-                    Token::Argument(b"PLAIN".to_vec()),
-                    Token::Argument(b"QJIrweAPyo6Q1T9xu".to_vec()),
+                    Token::Argument(b"PLAIN".as_slice().into()),
+                    Token::Argument(b"QJIrweAPyo6Q1T9xu".as_slice().into()),
                 ],
             }],
         ),
@@ -62,8 +64,8 @@ fn receiver_parse_managesieve() {
                 tag: "".into(),
                 command: Command::HaveSpace,
                 tokens: vec![
-                    Token::Argument(b"myscript".to_vec()),
-                    Token::Argument(b"999999".to_vec()),
+                    Token::Argument(b"myscript".as_slice().into()),
+                    Token::Argument(b"999999".as_slice().into()),
                 ],
             }],
         ),
@@ -77,8 +79,8 @@ fn receiver_parse_managesieve() {
                 tag: "".into(),
                 command: Command::PutScript,
                 tokens: vec![
-                    Token::Argument(b"foo".to_vec()),
-                    Token::Argument(b"#comment\r\nInvalidSieveCommand\r\n".to_vec()),
+                    Token::Argument(b"foo".as_slice().into()),
+                    Token::Argument(b"#comment\r\nInvalidSieveCommand\r\n".as_slice().into()),
                 ],
             }],
         ),
@@ -95,7 +97,7 @@ fn receiver_parse_managesieve() {
             vec![Request {
                 tag: "".into(),
                 command: Command::SetActive,
-                tokens: vec![Token::Argument(b"baz".to_vec())],
+                tokens: vec![Token::Argument(b"baz".as_slice().into())],
             }],
         ),
         (
@@ -104,8 +106,8 @@ fn receiver_parse_managesieve() {
                 tag: "".into(),
                 command: Command::RenameScript,
                 tokens: vec![
-                    Token::Argument(b"foo".to_vec()),
-                    Token::Argument(b"bar".to_vec()),
+                    Token::Argument(b"foo".as_slice().into()),
+                    Token::Argument(b"bar".as_slice().into()),
                 ],
             }],
         ),
@@ -114,7 +116,7 @@ fn receiver_parse_managesieve() {
             vec![Request {
                 tag: "".into(),
                 command: Command::Noop,
-                tokens: vec![Token::Argument(b"STARTTLS-SYNC-42".to_vec())],
+                tokens: vec![Token::Argument(b"STARTTLS-SYNC-42".as_slice().into())],
             }],
         ),
     ] {

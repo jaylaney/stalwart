@@ -224,6 +224,37 @@ fn normalize(answer: &str, address: &str) -> String {
 /// A JMAP object with its `id` and `blobId` values removed at every level,
 /// the account's own address replaced by `RCPT` and the top-level `size`
 /// counted for the replaced text.
+/// The keyword 1.0 sets on an ordinary account's message with an
+/// attachment (ruling 55).
+const ATTACHMENT_FLAG: &str = "$hasattachment";
+
+/// `answer` with `ATTACHMENT_FLAG` taken out of its last FLAGS item, and
+/// whether it was there.
+fn without_attachment_flag(answer: &str) -> (String, bool) {
+    let Some(open) = answer.rfind("FLAGS (") else {
+        return (answer.to_string(), false);
+    };
+    let start = open + "FLAGS (".len();
+    let Some(len) = answer[start..].find(')') else {
+        return (answer.to_string(), false);
+    };
+    let flags = answer[start..start + len].split(' ').collect::<Vec<_>>();
+    let kept = flags
+        .iter()
+        .filter(|flag| **flag != ATTACHMENT_FLAG)
+        .copied()
+        .collect::<Vec<_>>();
+    (
+        format!(
+            "{}{}{}",
+            &answer[..start],
+            kept.join(" "),
+            &answer[start + len..]
+        ),
+        kept.len() + 1 == flags.len(),
+    )
+}
+
 fn normalize_json(mut value: Value, address: &str) -> Value {
     fn strip(value: &mut Value) {
         match value {
@@ -501,11 +532,24 @@ async fn offsets_round_trip(key: &Account, plain: &Account) {
     let (plain_fetched, plain_email, plain_whole, plain_parsed) = &answers[1];
     assert_eq!(key_parsed, plain_parsed, "Email/parse");
     assert_eq!(key_parsed["subject"], "reads corpus", "{key_parsed}");
+    // Ruling 55: at 1.0 the server sets `$hasattachment` on an ordinary
+    // account's message and none on a key account's (spec 5.2), so the one
+    // difference is that flag in the FLAGS item a non-peek FETCH adds.
     for (attribute, (key, plain)) in FETCH_ATTRIBUTES
         .iter()
         .zip(key_fetched.iter().zip(plain_fetched))
     {
-        assert_eq!(key, plain, "FETCH {attribute}");
+        assert!(
+            !key.contains(ATTACHMENT_FLAG),
+            "FETCH {attribute}: a key account's FLAGS carry {ATTACHMENT_FLAG}: {key}"
+        );
+        let has_flags = key.contains("FLAGS (");
+        let (plain, removed) = without_attachment_flag(plain);
+        assert_eq!(
+            removed, has_flags,
+            "FETCH {attribute}: the ordinary account's FLAGS and {ATTACHMENT_FLAG}: {plain}"
+        );
+        assert_eq!(key, &plain, "FETCH {attribute}");
     }
     let body = &key_fetched[0];
     for expected in [
