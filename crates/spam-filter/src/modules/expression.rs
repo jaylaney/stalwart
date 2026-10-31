@@ -4,22 +4,17 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-<<<<<<< HEAD
-use common::{
-    Server,
-    config::mailstore::spamfilter::*,
-    expr::{StringCow, Variable, functions::ResolveVariable, if_block::IfBlock},
-=======
 use crate::{
     ContextToken, Recipient, SpamFilterInput, SpamFilterOutput, TextPart, analysis::url::UrlParts,
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 };
 use common::{
+    Server,
     config::mailstore::spamfilter::Location,
     expr::{
         Bump, Variable,
         bumpalo::collections::String as BumpString,
         functions::ResolveVariable,
+        if_block::IfBlock,
         kernels::{to_lowercase, utf8_lossy},
     },
 };
@@ -27,12 +22,8 @@ use compact_str::CompactString;
 use mail_parser::{DateTime, Header, HeaderValue};
 use nlp::tokenizers::types::TokenType;
 use registry::schema::enums::ExpressionVariable;
-<<<<<<< HEAD
-use std::future::Future;
-=======
 use std::fmt::Write;
 use store::ahash::AHashSet;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
 pub(crate) const HEADER_NAME_INLINE: usize = 64;
 
@@ -90,6 +81,75 @@ enum RecipientPart {
     Name,
     Local,
     Domain,
+}
+
+/// Mail spec 10: `eval_if` of a rule on a message, without the trace of its
+/// result (which can echo a header, the body or an address) for a key
+/// account's message (`SpamFilterInput::za_redact`).
+pub(crate) async fn spam_eval_if<R, T>(
+    server: &Server,
+    if_block: &IfBlock,
+    resolver: &SpamFilterResolver<'_, T>,
+    arena: &mut Bump,
+) -> Option<R>
+where
+    R: for<'b> TryFrom<Variable<'b>> + 'static,
+    T: ResolveVariable,
+{
+    let span_id = resolver.input.span_id;
+    if resolver.input.za_redact {
+        server.za_eval_if(if_block, resolver, arena, span_id).await
+    } else {
+        server.eval_if(if_block, resolver, arena, span_id).await
+    }
+}
+
+/// Mail spec 10: `eval_if_with` for a rule whose result is used only when it
+/// is a string, quiet for a key account's message as `spam_eval_if` is. The
+/// quiet evaluator has no `_with` form, so its result is converted to an owned
+/// string first; `with` sees the same text either way, and a result that is
+/// not a string gives `None` on both paths, as upstream's closures do.
+pub(crate) async fn spam_eval_string_with<O, T>(
+    server: &Server,
+    if_block: &IfBlock,
+    resolver: &SpamFilterResolver<'_, T>,
+    arena: &mut Bump,
+    with: impl FnOnce(&str) -> Option<O> + Send,
+) -> Option<O>
+where
+    O: Send,
+    T: ResolveVariable,
+{
+    let span_id = resolver.input.span_id;
+    if resolver.input.za_redact {
+        server
+            .za_eval_if::<ZaStringResult, _>(if_block, resolver, arena, span_id)
+            .await
+            .and_then(|value| with(value.0.as_str()))
+    } else {
+        server
+            .eval_if_with(if_block, resolver, arena, span_id, |value| match value {
+                Variable::String(value) => with(value),
+                _ => None,
+            })
+            .await
+            .flatten()
+    }
+}
+
+/// A rule result that is a string, and nothing else (see
+/// `spam_eval_string_with`).
+struct ZaStringResult(CompactString);
+
+impl<'x> TryFrom<Variable<'x>> for ZaStringResult {
+    type Error = ();
+
+    fn try_from(value: Variable<'x>) -> Result<Self, Self::Error> {
+        match value {
+            Variable::String(value) => Ok(ZaStringResult(CompactString::from(value))),
+            _ => Err(()),
+        }
+    }
 }
 
 impl<'x, T: ResolveVariable> SpamFilterResolver<'x, T> {
@@ -173,33 +233,6 @@ impl<'x, T: ResolveVariable> SpamFilterResolver<'x, T> {
                 })
                 .unwrap_or_default(),
             _ => &[],
-        }
-    }
-}
-
-/// Mail spec 10: `eval_if` of a rule on a message, without the trace of its
-/// result (which can echo a header, the body or an address) for a key
-/// account's message (`SpamFilterInput::za_redact`).
-pub(crate) trait SpamFilterEval: Sync + Send {
-    fn spam_eval_if<'x, R: TryFrom<Variable<'x>>, T: ResolveVariable>(
-        &'x self,
-        if_block: &'x IfBlock,
-        resolver: &'x SpamFilterResolver<'_, T>,
-        session_id: u64,
-    ) -> impl Future<Output = Option<R>> + Send;
-}
-
-impl SpamFilterEval for Server {
-    async fn spam_eval_if<'x, R: TryFrom<Variable<'x>>, T: ResolveVariable>(
-        &'x self,
-        if_block: &'x IfBlock,
-        resolver: &'x SpamFilterResolver<'_, T>,
-        session_id: u64,
-    ) -> Option<R> {
-        if resolver.ctx.input.za_redact {
-            self.za_eval_if(if_block, resolver, session_id).await
-        } else {
-            self.eval_if(if_block, resolver, session_id).await
         }
     }
 }

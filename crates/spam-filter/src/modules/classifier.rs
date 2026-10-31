@@ -766,7 +766,7 @@ impl SpamClassifier for Server {
         let mut checked = AHashSet::new();
         let mut trusted: AHashSet<String> = AHashSet::new();
         for domain in builder.trust_domains() {
-            if checked.insert(domain) && is_trusted_domain(self, domain, ctx.input.span_id).await {
+            if checked.insert(domain) && is_trusted_domain(self, domain, &ctx.input).await {
                 trusted.insert(domain.to_string());
             }
         }
@@ -776,25 +776,6 @@ impl SpamClassifier for Server {
     }
 }
 
-<<<<<<< HEAD
-            if is_sender
-                || !is_trusted_domain(
-                    self,
-                    email.element.email.domain_part.sld_or_default(),
-                    &ctx.input,
-                )
-                .await
-            {
-                tokens.insert_email(&email.element.email, is_sender);
-            }
-        }
-
-        // Add URLs
-        for url in &ctx.output.urls {
-            if let Some(url) = &url.element.url_parsed
-                && !is_trusted_domain(self, url.host.sld_or_default(), &ctx.input).await
-            {
-=======
 pub struct TokenBuilder<'x> {
     tokens: Tokens<'x>,
     alt_tokens: Tokens<'x>,
@@ -829,7 +810,6 @@ impl<'x> TokenBuilder<'x> {
 
         for url in urls {
             if !is_trusted(url.host.sld_or_default()) {
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                 if let Some(host) = &url.host.sld {
                     tokens.insert(Token::Url { value: host.into() });
                     if host != &url.host.fqdn {
@@ -857,26 +837,8 @@ impl<'x> TokenBuilder<'x> {
             }
         }
 
-<<<<<<< HEAD
-        // Add hostnames
-        for domain in &ctx.output.domains {
-            if matches!(
-                domain.location,
-                Location::HeaderReceived | Location::HeaderMid | Location::Ehlo | Location::Tcp
-            ) {
-                let host = Hostname::new(&domain.element);
-                let host_sld = host.sld_or_default();
-
-                if !is_trusted_domain(self, host_sld, &ctx.input).await {
-                    if !host_sld.is_empty() && host_sld != host.fqdn {
-                        tokens.insert(Token::Hostname {
-                            value: host_sld.to_string().into(),
-                        });
-                    }
-=======
         for host in hosts {
             let host_sld = host.sld_or_default();
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
             if !is_trusted(host_sld) {
                 if !host_sld.is_empty() && host_sld != host.fqdn {

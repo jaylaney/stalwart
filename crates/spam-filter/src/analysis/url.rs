@@ -44,6 +44,7 @@ pub trait SpamFilterAnalyzeUrl: Sync + Send {
         url: &str,
         fetches: &mut usize,
         span_id: u64,
+        za_redact: bool,
     ) -> impl Future<Output = Option<Arc<str>>> + Send;
 }
 
@@ -176,6 +177,7 @@ impl SpamFilterAnalyzeUrl for Server {
                                     url_redirect.as_ref(),
                                     &mut redirect_fetches,
                                     ctx.input.span_id,
+                                    ctx.input.za_redact,
                                 )
                                 .await
                             {
@@ -197,37 +199,13 @@ impl SpamFilterAnalyzeUrl for Server {
                                         if is_trusted_domain(
                                             self,
                                             location_parsed.host.sld_or_default(),
-                                            ctx.input.span_id,
+                                            &ctx.input,
                                         )
                                         .await
                                         {
-<<<<<<< HEAD
-                                            url_redirect =
-                                                Cow::Owned(location.request_url().into_owned());
-                                            redirect_count += 1;
-                                            continue;
-                                        } else {
-                                            if is_trusted_domain(
-                                                self,
-                                                location_parsed.host.sld_or_default(),
-                                                &ctx.input,
-                                            )
-                                            .await
-                                            {
-                                                trusted_domains.insert(
-                                                    location_parsed.host.sld_or_default().into(),
-                                                );
-                                            }
-
-                                            redirected_urls.insert(ElementLocation::new(
-                                                location,
-                                                url.location,
-                                            ));
-=======
                                             trusted_domains.insert(
                                                 location_parsed.host.sld_or_default().into(),
                                             );
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                                         }
 
                                         final_host =
@@ -236,20 +214,6 @@ impl SpamFilterAnalyzeUrl for Server {
                                             .insert(ElementLocation::new(location, url.location));
                                     }
                                 }
-<<<<<<< HEAD
-                                Ok(None) => {}
-                                Err(err) => {
-                                    // Mail spec 10: the request's error names
-                                    // a URL of the message.
-                                    let err = if ctx.input.za_redact {
-                                        err.redact(&[trc::Key::Reason])
-                                    } else {
-                                        err
-                                    };
-                                    trc::error!(err.span_id(ctx.input.span_id));
-                                }
-=======
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                             }
                             break;
                         }
@@ -327,6 +291,7 @@ impl SpamFilterAnalyzeUrl for Server {
         url: &str,
         fetches: &mut usize,
         span_id: u64,
+        za_redact: bool,
     ) -> Option<Arc<str>> {
         let cache = &self.inner.cache.spam_lookup;
         let guard = match cache.get(url) {
@@ -348,6 +313,13 @@ impl SpamFilterAnalyzeUrl for Server {
             ),
             Ok(None) => (SpamLookup::None, self.core.spam.url_redirect.cache_ttl),
             Err(err) => {
+                // Mail spec 10: the request's error names a URL of the
+                // message.
+                let err = if za_redact {
+                    err.redact(&[trc::Key::Reason])
+                } else {
+                    err
+                };
                 trc::error!(err.span_id(span_id));
                 (SpamLookup::None, self.inner.cache.negative_cache_ttl)
             }
@@ -475,7 +447,7 @@ async fn http_get_header(
     url: &str,
     header: hyper::header::HeaderName,
 ) -> trc::Result<Option<String>> {
-    #[cfg(stalwart_tests)]
+    #[cfg(feature = "test_mode")]
     {
         return if url.contains("redirect.") {
             Ok(url.split_once("/?").unwrap().1.to_string().into())
@@ -696,4 +668,8 @@ impl<'x> UrlParts<'x> {
 #[cfg(all(test, stalwart_tests))]
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/spam-filter/src/analysis/url/tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "url_restored_tests.rs"]
 mod tests;

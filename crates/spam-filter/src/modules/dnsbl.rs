@@ -4,16 +4,16 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::expression::{SpamFilterEval, SpamFilterResolver};
+use super::expression::{SpamFilterResolver, spam_eval_string_with};
 use crate::SpamFilterContext;
 use common::{
     Server,
     config::mailstore::spamfilter::{DnsBlServer, Element, IpResolver, Location, SpamLookup},
-    expr::{Bump, Variable, functions::ResolveVariable},
+    expr::{Bump, functions::ResolveVariable},
 };
 use compact_str::{CompactString, ToCompactString};
 use mail_auth::dns::ToFqdn;
-#[cfg(not(stalwart_tests))]
+#[cfg(not(feature = "test_mode"))]
 use mail_auth::hickory_resolver::{
     net::{DnsError, NetError},
     proto::rr::{Name, RData},
@@ -25,8 +25,8 @@ use std::{
 use store::xxhash_rust::xxh3::xxh3_64;
 use trc::SpamEvent;
 
-#[cfg(stalwart_tests)]
-use test_support::resolve_zone;
+#[cfg(feature = "test_mode")]
+use mail_auth::{DnsError, Error};
 
 const MAX_NEGATIVE_TTL: u32 = 3600;
 const EXPIRY_SPREAD_STEPS: u32 = 1024;
@@ -97,17 +97,6 @@ pub(crate) async fn check_dnsbl(
             .await
         {
             for code in codes.iter() {
-<<<<<<< HEAD
-                let tag = server
-                    .spam_eval_if::<String, _>(
-                        &dnsbl.tags,
-                        &SpamFilterResolver::new(ctx, code, location),
-                        ctx.input.span_id,
-                    )
-                    .await;
-
-                if let Some(tag) = tag {
-=======
                 if let Some(tag) = dnsbl_tag(
                     server,
                     dnsbl,
@@ -122,7 +111,6 @@ pub(crate) async fn check_dnsbl(
                 )
                 .await
                 {
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                     ctx.result.add_tag(tag);
                 }
             }
@@ -148,25 +136,16 @@ async fn dnsbl_codes(
     arena: &mut Bump,
 ) -> Option<Arc<[IpResolver]>> {
     let time = Instant::now();
-    let span_id = resolver.input.span_id;
     let spam_lookup = &server.inner.cache.spam_lookup;
-    let zone = server
-<<<<<<< HEAD
-        .spam_eval_if::<String, _>(&config.zone, &resolver, resolver.ctx.input.span_id)
-        .await?;
-    // Mail spec 10: the zone names the checked address, domain or URL.
-    let za_redact = resolver.ctx.input.za_redact;
-=======
-        .eval_if_with(&config.zone, &resolver, arena, span_id, |zone| match zone {
-            Variable::String(zone) => Some(match spam_lookup.get(zone) {
-                Some(entry) => Zone::Cached(entry),
-                None => Zone::Lookup(zone.into()),
-            }),
-            _ => None,
+    let zone = spam_eval_string_with(server, &config.zone, &resolver, arena, |zone| {
+        Some(match spam_lookup.get(zone) {
+            Some(entry) => Zone::Cached(entry),
+            None => Zone::Lookup(zone.into()),
         })
-        .await
-        .flatten()?;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+    })
+    .await?;
+    // Mail spec 10: the zone names the checked address, domain or URL.
+    let za_redact = resolver.input.za_redact;
 
     let zone = match zone {
         Zone::Cached(SpamLookup::Dnsbl(codes)) => return Some(codes),
@@ -174,7 +153,7 @@ async fn dnsbl_codes(
         Zone::Lookup(zone) => zone,
     };
 
-    #[cfg(stalwart_tests)]
+    #[cfg(feature = "test_mode")]
     {
         if zone.contains(".11.20.") {
             let parts = zone.split('.').collect::<Vec<_>>();
@@ -203,13 +182,8 @@ async fn dnsbl_codes(
             let expires = cache_expiry(&zone, time, expires, Instant::now());
             trc::event!(
                 Spam(SpamEvent::Dnsbl),
-<<<<<<< HEAD
-                Hostname = za_redacted(za_redact, zone.clone()),
-                Result = ips
-=======
-                Hostname = zone,
+                Hostname = za_redacted(za_redact, zone),
                 Result = codes
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                     .iter()
                     .map(|code| trc::Value::from(CompactString::from(code.text())))
                     .collect::<Vec<_>>(),
@@ -225,11 +199,7 @@ async fn dnsbl_codes(
             let expires = cache_expiry(&zone, time, expires, Instant::now());
             trc::event!(
                 Spam(SpamEvent::Dnsbl),
-<<<<<<< HEAD
-                Hostname = za_redacted(za_redact, zone.clone()),
-=======
-                Hostname = zone,
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+                Hostname = za_redacted(za_redact, zone),
                 Result = trc::Value::None,
                 Details = element.as_str(),
                 Elapsed = time.elapsed()
@@ -255,7 +225,6 @@ async fn dnsbl_codes(
     }
 }
 
-<<<<<<< HEAD
 /// Mail spec 10: `value`, or the redaction marker for a key account's message.
 fn za_redacted(redact: bool, value: impl Into<trc::Value>) -> trc::Value {
     if redact {
@@ -265,14 +234,9 @@ fn za_redacted(redact: bool, value: impl Into<trc::Value>) -> trc::Value {
     }
 }
 
-#[cfg(not(feature = "test_mode"))]
-async fn resolve_zone(server: &Server, zone: &str) -> Result<DnsblAnswer, String> {
-    let name = Name::from_str_relaxed(zone).map_err(|err| err.to_string())?;
-=======
 fn cache_expiry(zone: &str, start: Instant, expires: Instant, now: Instant) -> Instant {
     spread_expiry(zone, start, expires).max(now + MIN_CACHE_LIFETIME)
 }
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
 fn negative_expiry(ttl: Option<u32>) -> Instant {
     Instant::now() + Duration::from_secs(ttl.unwrap_or_default().min(MAX_NEGATIVE_TTL).into())
@@ -285,7 +249,7 @@ fn spread_expiry(zone: &str, start: Instant, expires: Instant) -> Instant {
             / EXPIRY_SPREAD_STEPS
 }
 
-#[cfg(not(stalwart_tests))]
+#[cfg(not(feature = "test_mode"))]
 async fn resolve_zone(server: &Server, zone: &str) -> Result<DnsblAnswer, CompactString> {
     let name = Name::from_str_relaxed(zone).map_err(|err| err.to_compact_string())?;
 
@@ -322,6 +286,27 @@ async fn resolve_zone(server: &Server, zone: &str) -> Result<DnsblAnswer, Compac
     }
 }
 
+/// Test builds resolve a zone through the mail-auth resolver, whose test
+/// build answers every uncached name as not found (fork-owned, written from
+/// 0.16's test resolver; upstream's moved into a private slot).
+#[cfg(feature = "test_mode")]
+async fn resolve_zone(server: &Server, zone: &str) -> Result<DnsblAnswer, CompactString> {
+    match server.core.smtp.resolvers.dns.ipv4_lookup_raw(zone).await {
+        Ok(result) => Ok(DnsblAnswer::Listed {
+            codes: result
+                .entry
+                .iter()
+                .map(|ip| IpResolver::new((*ip).into()))
+                .collect(),
+            expires: result.expires,
+        }),
+        Err(Error::Dns(DnsError::RecordNotFound(_))) => Ok(DnsblAnswer::NotListed {
+            expires: negative_expiry(Some(MAX_NEGATIVE_TTL)),
+        }),
+        Err(err) => Err(err.to_compact_string()),
+    }
+}
+
 async fn dnsbl_tag(
     server: &Server,
     config: &DnsBlServer,
@@ -329,19 +314,10 @@ async fn dnsbl_tag(
     arena: &mut Bump,
 ) -> Option<CompactString> {
     let tags = resolver.tags;
-    server
-        .eval_if_with(
-            &config.tags,
-            resolver,
-            arena,
-            resolver.input.span_id,
-            |tag| match tag {
-                Variable::String(tag) if !tags.contains(tag) => Some(CompactString::from(tag)),
-                _ => None,
-            },
-        )
-        .await
-        .flatten()
+    spam_eval_string_with(server, &config.tags, resolver, arena, |tag| {
+        (!tags.contains(tag)).then(|| CompactString::from(tag))
+    })
+    .await
 }
 
 #[cfg(all(test, stalwart_tests))]
