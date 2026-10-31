@@ -5334,6 +5334,45 @@ F3, F6, F8 and F9; F4 and F7 are Task 6's and F5 is Task 8's.
 F2 unit rows (`email::za::tests::{filter_table, sort_table, query_filter_table,
 attachment_keywords_parse_to_their_variants}`) run then.
 
+
+### Task 5 rulings
+
+52. **Task 5 ran in dependency order,** as 5a (`email`, `spam-filter`, `smtp`), 5b (`imap`,
+    `pop3`, `managesieve`), then 5c (the JMAP mail files, the dispatcher gate and the HTTP
+    upload gate) and 5d (tests), the last two split by ruling 56. Its review ran on Fable at
+    xhigh. Jay later asked for no further Fable reviews until the PR stage. From Task 6 on,
+    task reviews run on Opus.
+53. **The restored DKIM tests are gated off `enterprise`.** `queue::Message` gained the
+    SEL-gated field `tenant_ids` and has no `Default` or constructor, and fork code never
+    names SEL fields. So the seven tests run only in a build without `smtp/enterprise`, and
+    Task 8 adds a CI step for them.
+54. **`managesieve`'s restored tests are adapted** (13 call shapes, `.as_slice().into()`), as
+    Task 2's restore rule allows.
+55. **Key accounts get no `$HasAttachment` or `$HasNoAttachment` keyword,** and searching,
+    filtering or sorting on either is refused in IMAP and JMAP, in any letter case. The
+    refusal also covers the two thread-keyword sorts, since a key account's message is its
+    own thread. Both keywords are new in 1.0 and derived from content. 0.16 set neither, and
+    the refusal matches JMAP's `hasAttachment` refusal (mail spec 5.2). BODYSTRUCTURE still
+    shows attachments. Cost if wrong: IMAP clients show no attachment marker from flags for
+    key accounts.
+56. **5c and 5d were split** for context size.
+57. **`Email/query`'s object-metadata filters are refused for key accounts.** They could only
+    answer silently wrong, and sealed values have no index.
+58. **A mail test passes `DiskQuotaBudget::unlimited()`** for the enterprise-only tenant-budget
+    argument. The tests crate always enables `email/enterprise`, and the type is AGPL.
+59. **`IngestGroup` never records a key account's message under a thread key** (one fork
+    call, `za_group_thread`). Key accounts have no threading, and a key message in a group
+    would otherwise split an ordinary reply from its thread.
+60. **A key account's message blob answers not-found to every token but the owner's,** with
+    no cache read (`has_access_blob`). That is v1.0.1's and 0.16.27's answer without a
+    grant, and gives no existence oracle. One answer changes: a pre-provisioning grantee's
+    403 becomes 404, which has a ledger row.
+
+Limits recorded in Task 5:
+- `hasAttachment` is read from the stored view, so it can say `false` when a message's only
+  attachment lies beyond 16,384 parts.
+- In enterprise builds, a key account's message counts toward no tenant's quota.
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
