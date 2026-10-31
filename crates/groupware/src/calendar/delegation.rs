@@ -9,6 +9,7 @@ use crate::scheduling::{
     Email, ItipError, ItipMessage, ItipSnapshots,
     event_cancel::itip_cancel_from_snapshot,
     organizer::{organizer_handle_update, organizer_request_full},
+    recipient::{RecipientPolicy, itip_messages_per_recipient},
     snapshot::itip_snapshot,
 };
 use ahash::{AHashMap, AHashSet};
@@ -253,12 +254,18 @@ fn owner_snapshot<'a>(
     Ok(snapshot)
 }
 
+/// The second run's messages restricted to the writer's addresses, then
+/// split per recipient under `policy` as upstream's first run is
+/// (`itip_messages_per_recipient`, upgrade ruling 93): each writer address
+/// gets the slice the owner run would give it. Filtering first keeps the
+/// split's recipient limit to the writer's addresses.
 fn retain_writer_messages(
     messages: Vec<ItipMessage<ICalendar>>,
     increments: Vec<u16>,
     finalize: bool,
     resolution: &ZaDelegationResolution,
-) -> ZaSelfMessages {
+    policy: RecipientPolicy,
+) -> Result<ZaSelfMessages, ItipError> {
     let messages = messages
         .into_iter()
         .filter_map(|mut message| {
@@ -269,11 +276,11 @@ fn retain_writer_messages(
             (!message.to.is_empty()).then_some(message)
         })
         .collect();
-    ZaSelfMessages {
-        messages,
+    Ok(ZaSelfMessages {
+        messages: itip_messages_per_recipient(messages, policy)?,
         increments,
         finalize,
-    }
+    })
 }
 
 pub fn za_self_create(
@@ -281,6 +288,7 @@ pub fn za_self_create(
     writer: &AccountInfo,
     owner: &AccountInfo,
     resolution: &ZaDelegationResolution,
+    policy: RecipientPolicy,
 ) -> Result<Option<ZaSelfMessages>, ItipError> {
     if !delegated_organizer(new, writer, owner, resolution) {
         return Ok(None);
@@ -291,8 +299,9 @@ pub fn za_self_create(
     } else if !snapshot.organizer.email.is_local {
         Err(ItipError::NotOrganizer)
     } else {
-        organizer_request_full(new, &snapshot, None, true)
-            .map(|messages| Some(retain_writer_messages(messages, vec![], true, resolution)))
+        organizer_request_full(new, &snapshot, None, true).and_then(|messages| {
+            retain_writer_messages(messages, vec![], true, resolution, policy).map(Some)
+        })
     }
 }
 
@@ -302,6 +311,7 @@ pub fn za_self_update(
     writer: &AccountInfo,
     owner: &AccountInfo,
     resolution: &ZaDelegationResolution,
+    policy: RecipientPolicy,
 ) -> Result<Option<ZaSelfMessages>, ItipError> {
     if !delegated_organizer(old, writer, owner, resolution) {
         return Ok(None);
@@ -313,11 +323,9 @@ pub fn za_self_update(
                 return Err(ItipError::OrganizerMismatch);
             }
             let mut increments = Vec::new();
-            organizer_handle_update(old, new, old_snapshot, new_snapshot, &mut increments).map(
+            organizer_handle_update(old, new, old_snapshot, new_snapshot, &mut increments).and_then(
                 |messages| {
-                    Some(retain_writer_messages(
-                        messages, increments, true, resolution,
-                    ))
+                    retain_writer_messages(messages, increments, true, resolution, policy).map(Some)
                 },
             )
         }
@@ -326,13 +334,9 @@ pub fn za_self_update(
             | ItipError::NotOrganizer
             | ItipError::NotOrganizerNorAttendee
             | ItipError::OtherSchedulingAgent => {
-                itip_cancel_from_snapshot(old, old_snapshot, false).map(|message| {
-                    Some(retain_writer_messages(
-                        vec![message],
-                        vec![],
-                        false,
-                        resolution,
-                    ))
+                itip_cancel_from_snapshot(old, old_snapshot, false).and_then(|message| {
+                    retain_writer_messages(vec![message], vec![], false, resolution, policy)
+                        .map(Some)
                 })
             }
             _ => Err(err),
@@ -345,18 +349,14 @@ pub fn za_self_cancel(
     writer: &AccountInfo,
     owner: &AccountInfo,
     resolution: &ZaDelegationResolution,
+    policy: RecipientPolicy,
 ) -> Result<Option<ZaSelfMessages>, ItipError> {
     if !delegated_organizer(old, writer, owner, resolution) {
         return Ok(None);
     }
     let snapshot = owner_snapshot(old, owner, resolution)?;
-    itip_cancel_from_snapshot(old, snapshot, true).map(|message| {
-        Some(retain_writer_messages(
-            vec![message],
-            vec![],
-            false,
-            resolution,
-        ))
+    itip_cancel_from_snapshot(old, snapshot, true).and_then(|message| {
+        retain_writer_messages(vec![message], vec![], false, resolution, policy).map(Some)
     })
 }
 
@@ -491,7 +491,7 @@ mod tests {
             ],
             &[WRITER],
         );
-        let actual = za_self_create(&tree, &writer, &owner, &res)
+        let actual = za_self_create(&tree, &writer, &owner, &res, policy())
             .unwrap()
             .unwrap();
         assert!(actual.finalize());
@@ -525,17 +525,17 @@ mod tests {
         for organizer in [WRITER, EXTERNAL] {
             let other = event(organizer, &[(WRITER, "")], "x", "20990301T100000Z", "");
             assert!(
-                za_self_create(&other, &writer, &owner, &res)
+                za_self_create(&other, &writer, &owner, &res, policy())
                     .unwrap()
                     .is_none()
             );
             assert!(
-                za_self_update(&other, &other, &writer, &owner, &res)
+                za_self_update(&other, &other, &writer, &owner, &res, policy())
                     .unwrap()
                     .is_none()
             );
             assert!(
-                za_self_cancel(&other, &writer, &owner, &res)
+                za_self_cancel(&other, &writer, &owner, &res, policy())
                     .unwrap()
                     .is_none()
             );
@@ -548,23 +548,30 @@ mod tests {
             "",
         );
         assert!(
-            za_self_update(&attendee_side, &attendee_side, &writer, &owner, &res)
-                .unwrap()
-                .is_none()
+            za_self_update(
+                &attendee_side,
+                &attendee_side,
+                &writer,
+                &owner,
+                &res,
+                policy()
+            )
+            .unwrap()
+            .is_none()
         );
         let shared = event(SHARED, &[(WRITER, "")], "x", "20990301T100000Z", "");
         assert!(
-            za_self_create(&shared, &writer, &owner, &res)
+            za_self_create(&shared, &writer, &owner, &res, policy())
                 .unwrap()
                 .is_some()
         );
         let shared_only = event(SHARED, &[(SHARED, "")], "x", "20990301T100000Z", "");
         assert!(matches!(
-            za_self_create(&shared_only, &writer, &owner, &res),
+            za_self_create(&shared_only, &writer, &owner, &res, policy()),
             Err(ItipError::NothingToSend)
         ));
         assert!(
-            za_self_create(&tree, &owner, &owner, &res)
+            za_self_create(&tree, &owner, &owner, &res, policy())
                 .unwrap()
                 .is_none()
         );
@@ -582,7 +589,7 @@ mod tests {
             ),
             Err(ItipError::NothingToSend)
         ));
-        let group_second = za_self_create(&group_only, &writer, &owner, &group_res)
+        let group_second = za_self_create(&group_only, &writer, &owner, &group_res, policy())
             .unwrap()
             .unwrap();
         assert_eq!(group_second.messages()[0].to, vec![GROUP.to_string()]);
@@ -591,7 +598,7 @@ mod tests {
         // An upstream builder's Ok is still built when R filtering is empty.
         let external_only = event(OWNER, &[(EXTERNAL, "")], "x", "20990301T100000Z", "");
         let empty_res = resolution(&writer, &owner, &[], &[], &[]);
-        let built = za_self_create(&external_only, &writer, &owner, &empty_res)
+        let built = za_self_create(&external_only, &writer, &owner, &empty_res, policy())
             .unwrap()
             .unwrap();
         assert!(built.messages().is_empty());
@@ -625,7 +632,7 @@ mod tests {
         );
         res.accounts
             .insert(WRITER_ALIAS.into(), ZaResolvedAccount::Failed);
-        let actual = za_self_create(&tree, &writer, &owner, &res)
+        let actual = za_self_create(&tree, &writer, &owner, &res, policy())
             .unwrap()
             .unwrap();
         assert_eq!(actual.messages().len(), 1);
@@ -705,7 +712,7 @@ mod tests {
             "",
         );
         assert!(matches!(
-            za_self_create(&client, &writer, &owner, &res),
+            za_self_create(&client, &writer, &owner, &res, policy()),
             Err(ItipError::NothingToSend)
         ));
         let none = event(
@@ -716,7 +723,7 @@ mod tests {
             "",
         );
         assert!(matches!(
-            za_self_create(&none, &writer, &owner, &res),
+            za_self_create(&none, &writer, &owner, &res, policy()),
             Err(ItipError::NothingToSend)
         ));
 
@@ -727,7 +734,7 @@ mod tests {
             "20990301T100000Z",
             "",
         );
-        let accepted_result = za_self_create(&accepted, &writer, &owner, &res)
+        let accepted_result = za_self_create(&accepted, &writer, &owner, &res, policy())
             .unwrap()
             .unwrap();
         assert_eq!(accepted_result.messages()[0].to, vec![WRITER.to_string()]);
@@ -743,7 +750,7 @@ mod tests {
         let instance_id = added.components.len() as u32;
         added.components.push(occurrence.components[1].clone());
         added.components[0].component_ids.push(instance_id);
-        let added_result = za_self_update(&tree, &added, &writer, &owner, &res)
+        let added_result = za_self_update(&tree, &added, &writer, &owner, &res, policy())
             .unwrap()
             .unwrap();
         assert!(
@@ -768,7 +775,7 @@ mod tests {
             "",
         );
         let unchanged = new.clone();
-        let actual = za_self_update(&old, &new, &writer, &owner, &res)
+        let actual = za_self_update(&old, &new, &writer, &owner, &res, policy())
             .unwrap()
             .unwrap();
         assert_eq!(new, unchanged);
@@ -804,12 +811,12 @@ mod tests {
                     .iter()
                     .all(|p| format!("{:?}", p.name) != "ScheduleForceSend"))
         );
-        let create_branch = za_self_create(&new, &writer, &owner, &res)
+        let create_branch = za_self_create(&new, &writer, &owner, &res, policy())
             .unwrap()
             .unwrap();
         assert!(create_branch.finalize());
         assert!(create_branch.increments().is_empty());
-        let deleted = za_self_cancel(&old, &writer, &owner, &res)
+        let deleted = za_self_cancel(&old, &writer, &owner, &res, policy())
             .unwrap()
             .unwrap();
         assert!(!deleted.finalize());
@@ -823,7 +830,7 @@ mod tests {
             "20990301T100000Z",
             "",
         );
-        let summary_result = za_self_update(&old, &summary_only, &writer, &owner, &res)
+        let summary_result = za_self_update(&old, &summary_only, &writer, &owner, &res, policy())
             .unwrap()
             .unwrap();
         assert!(summary_result.increments().is_empty());
@@ -832,10 +839,10 @@ mod tests {
         // An existing-event PUT without a schedule tag explicitly dispatches
         // to create. The old tree remains available at the caller.
         assert!(matches!(
-            za_self_update(&old, &old, &writer, &owner, &res),
+            za_self_update(&old, &old, &writer, &owner, &res, policy()),
             Err(ItipError::NothingToSend)
         ));
-        let no_tag = za_self_create(&old, &writer, &owner, &res)
+        let no_tag = za_self_create(&old, &writer, &owner, &res, policy())
             .unwrap()
             .unwrap();
         assert_eq!(no_tag.messages()[0].to, vec![WRITER.to_string()]);
@@ -846,7 +853,7 @@ mod tests {
                 .entries
                 .retain(|e| e.name != ICalendarProperty::Organizer);
         }
-        let fallback = za_self_update(&old, &no_organizer, &writer, &owner, &res)
+        let fallback = za_self_update(&old, &no_organizer, &writer, &owner, &res, policy())
             .unwrap()
             .unwrap();
         assert!(!fallback.finalize());
@@ -866,7 +873,7 @@ mod tests {
             .components
             .push(recurrence.components[1].clone());
         with_instance.components[0].component_ids.push(instance_id);
-        let removed = za_self_update(&with_instance, &old, &writer, &owner, &res)
+        let removed = za_self_update(&with_instance, &old, &writer, &owner, &res, policy())
             .unwrap()
             .unwrap();
         let mut owner_removal_tree = old.clone();
@@ -948,5 +955,82 @@ mod tests {
             itip_cancel(&invalid, &[OWNER.into()], true, policy()),
             Err(ItipError::MissingUid)
         ));
+    }
+
+    /// Upgrade ruling 93: the second run splits per recipient as the owner
+    /// run does. The writer attends the master but not override X, so
+    /// upstream's split gives it the master with X excluded; the second
+    /// run's message for the writer is that slice, on a create and on an
+    /// update.
+    #[test]
+    fn second_run_splits_as_the_owner_run() {
+        let owner = account(1, &[OWNER]);
+        let writer = account(2, &[WRITER]);
+        let res = resolution(&writer, &owner, &[WRITER], &[WRITER], &[]);
+        let tree = |summary: &str| {
+            let text = format!(
+                concat!(
+                    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\n",
+                    "BEGIN:VEVENT\r\nUID:delegation-split\r\nDTSTAMP:20240101T000000Z\r\n",
+                    "DTSTART:20990301T100000Z\r\nDURATION:PT1H\r\nRRULE:FREQ=DAILY;COUNT=5\r\n",
+                    "SEQUENCE:2\r\nSUMMARY:{summary}\r\nORGANIZER:mailto:{owner}\r\n",
+                    "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{writer}\r\n",
+                    "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{external}\r\n",
+                    "END:VEVENT\r\n",
+                    "BEGIN:VEVENT\r\nUID:delegation-split\r\nDTSTAMP:20240101T000000Z\r\n",
+                    "RECURRENCE-ID:20990302T100000Z\r\nDTSTART:20990302T120000Z\r\n",
+                    "DURATION:PT1H\r\nSEQUENCE:2\r\nSUMMARY:{summary} X\r\n",
+                    "ORGANIZER:mailto:{owner}\r\n",
+                    "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{external}\r\n",
+                    "END:VEVENT\r\nEND:VCALENDAR\r\n"
+                ),
+                summary = summary,
+                owner = OWNER,
+                writer = WRITER,
+                external = EXTERNAL,
+            );
+            match Parser::new(&text).entry() {
+                Entry::ICalendar(ical) => ical,
+                other => panic!("{other:?}"),
+            }
+        };
+        let writer_slice = |messages: &[ItipMessage<ICalendar>]| {
+            let slices: Vec<_> = messages
+                .iter()
+                .filter(|message| message.to.contains(&WRITER.to_string()))
+                .collect();
+            assert_eq!(slices.len(), 1);
+            assert_eq!(slices[0].to, vec![WRITER.to_string()]);
+            canonical_without_dtstamp(slices[0].message.clone())
+        };
+        let has_override = |message: &ICalendar| {
+            message.components.iter().any(|component| {
+                component.component_type.is_scheduling_object()
+                    && component.is_recurrence_override()
+            })
+        };
+
+        // Create.
+        let new = tree("split");
+        let second = za_self_create(&new, &writer, &owner, &res, policy())
+            .unwrap()
+            .unwrap();
+        let mut reference = new.clone();
+        let owner_run = itip_create(&mut reference, &owner.addresses, policy()).unwrap();
+        let expected = writer_slice(&owner_run);
+        assert!(!has_override(&expected), "the writer's slice drops X");
+        assert_eq!(writer_slice(second.messages()), expected);
+
+        // Update: a master change, the full update.
+        let old = tree("split");
+        let new = tree("split v2");
+        let second = za_self_update(&old, &new, &writer, &owner, &res, policy())
+            .unwrap()
+            .unwrap();
+        let mut reference = new.clone();
+        let owner_run = itip_update(&mut reference, &old, &owner.addresses, policy()).unwrap();
+        let expected = writer_slice(&owner_run);
+        assert!(!has_override(&expected), "the writer's slice drops X");
+        assert_eq!(writer_slice(second.messages()), expected);
     }
 }

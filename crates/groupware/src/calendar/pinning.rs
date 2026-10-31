@@ -18,6 +18,7 @@ use crate::{
         Email, InstanceId, ItipMessage, ItipSnapshot, ItipSnapshots, ItipSummary,
         itip::{ItipExportAs, itip_add_tz, itip_build_envelope, itip_export_component},
         organizer::organizer_request_full,
+        recipient::{RecipientPolicy, itip_messages_per_recipient},
         snapshot::itip_snapshot,
     },
 };
@@ -36,30 +37,45 @@ use vault::pins::ZaInstances;
 /// the drain's delegating merge uses for a new delegate):
 /// `organizer_request_full` over the stored tree with no SEQUENCE bump
 /// (no `itip_finalize`), its recipients restricted to `recipient`, compared
-/// normalized (spec 4.3). `None` when the builder errs, the tree is not
-/// organized by one of `addresses`, or the REQUEST does not reach the
-/// recipient (DECLINED without SCHEDULE-FORCE-SEND, RSVP=FALSE,
-/// SCHEDULE-AGENT=CLIENT or NONE: upstream's `send_update_messages`).
+/// normalized (spec 4.3), then split per recipient under `policy` as 1.0's
+/// `itip_update` splits upstream's full update (`itip_messages_per_recipient`,
+/// upgrade ruling 91): each address gets its own slice, the instances it
+/// attends, and no attendee list `policy` hides. One message per address
+/// the recipient normalizes from, usually one. Empty when the builder or
+/// the split errs, the tree is not organized by one of `addresses`, or the
+/// REQUEST does not reach the recipient (DECLINED without
+/// SCHEDULE-FORCE-SEND, RSVP=FALSE, SCHEDULE-AGENT=CLIENT or NONE:
+/// upstream's `send_update_messages`).
 pub fn za_full_request_for(
     tree: &ICalendar,
     addresses: &[String],
     recipient: &str,
-) -> Option<ItipMessage<ICalendar>> {
-    let recipient = za_normalize_address(recipient)?;
-    let snapshots = itip_snapshot(tree, addresses, false).ok()?;
+    policy: RecipientPolicy,
+) -> Vec<ItipMessage<ICalendar>> {
+    let Some(recipient) = za_normalize_address(recipient) else {
+        return Vec::new();
+    };
+    let Ok(snapshots) = itip_snapshot(tree, addresses, false) else {
+        return Vec::new();
+    };
     // Only the organizer's own copy builds a REQUEST.
     if !snapshots.organizer.email.is_local {
-        return None;
+        return Vec::new();
     }
-    organizer_request_full(tree, &snapshots, None, false)
-        .ok()?
-        .into_iter()
-        .find_map(|mut message| {
-            message
-                .to
-                .retain(|to| za_normalize_address(to).as_deref() == Some(recipient.as_str()));
-            (!message.to.is_empty()).then_some(message)
+    let Some(message) = organizer_request_full(tree, &snapshots, None, false)
+        .ok()
+        .and_then(|messages| {
+            messages.into_iter().find_map(|mut message| {
+                message
+                    .to
+                    .retain(|to| za_normalize_address(to).as_deref() == Some(recipient.as_str()));
+                (!message.to.is_empty()).then_some(message)
+            })
         })
+    else {
+        return Vec::new();
+    };
+    itip_messages_per_recipient(vec![message], policy).unwrap_or_default()
 }
 
 /// The refused instances' current participation (spec 6.4 step 2): a REPLY
@@ -661,14 +677,16 @@ mod tests {
     #[test]
     fn the_full_request_names_only_its_recipient() {
         let organized = parse(ORGANIZED);
-        let message = za_full_request_for(&organized, &alice(), BOB).unwrap();
+        let messages = za_full_request_for(&organized, &alice(), BOB, policy());
+        assert_eq!(messages.len(), 1);
+        let message = &messages[0];
         assert_eq!(
             (message.to.clone(), message.from_organizer),
             (vec![BOB.to_string()], true)
         );
         for silent in ["declined@example.com", "rsvp-false@example.com"] {
             assert!(
-                za_full_request_for(&organized, &alice(), silent).is_none(),
+                za_full_request_for(&organized, &alice(), silent, policy()).is_empty(),
                 "{silent}"
             );
         }

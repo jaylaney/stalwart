@@ -56,6 +56,7 @@ use groupware::{
     },
     scheduling::{
         itip::{ITIP_STATUS_DELIVERED, ITIP_STATUS_NOT_ATTEMPTED},
+        recipient::RecipientPolicy,
         snapshot::itip_snapshot,
     },
 };
@@ -689,13 +690,16 @@ async fn za_redeliver_entry(
         return Ok(Outcome::Dropped);
     }
 
-    // Step 2: the full current state for this one recipient.
+    // Step 2: the full current state for this one recipient, split as
+    // upstream splits its messages (upgrade ruling 91).
     let tree = &event.content.data.event;
+    let policy = RecipientPolicy::new(&server.core.groupware, event.meta.flags);
     let (messages, lease) = match side {
         Side::Organizer => {
-            let Some(message) = za_full_request_for(tree, addresses, &entry.address) else {
+            let messages = za_full_request_for(tree, addresses, &entry.address, policy);
+            if messages.is_empty() {
                 return Ok(Outcome::Dropped);
-            };
+            }
             // The organizer's UID lease, as the delegating merge holds it.
             let Some(lease) = ZaUidLease::acquire(server.store(), account_id, &entry.uid)
                 .await
@@ -704,7 +708,7 @@ async fn za_redeliver_entry(
                 return Ok(Outcome::Failed);
             };
             (
-                vec![message],
+                messages,
                 Some(ZaUidLeaseGuard::new(server.store().clone(), lease)),
             )
         }
@@ -742,6 +746,7 @@ async fn za_redeliver_entry(
                 uid: &entry.uid,
             },
             ZaFanOutKind::Redelivery,
+            policy,
             lease.as_ref().map(|lease| lease.lease()),
             None,
         )

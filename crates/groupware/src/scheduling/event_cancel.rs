@@ -45,7 +45,9 @@ pub fn itip_cancel(
 
 /// `itip_cancel`'s message from a snapshot the caller built, before upstream's
 /// per-recipient split: the delegated scheduling path (sharing spec, SENT-BY)
-/// routes from its own snapshot and splits, or not, itself.
+/// routes from its own snapshot, then splits the messages it keeps for the
+/// writer's addresses under the same `RecipientPolicy`
+/// (`calendar::delegation`'s `retain_writer_messages`, upgrade ruling 93).
 pub(crate) fn itip_cancel_from_snapshot(
     ical: &ICalendar,
     itip: ItipSnapshots<'_>,

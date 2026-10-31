@@ -453,10 +453,15 @@ impl CalendarDeleteRequestHandler for Server {
                 .caused_by(trc::location!())?;
                 let first = message.messages.unwrap_or_default();
                 let messages = if let Some(resolution) = &resolution {
-                    let second =
-                        za_self_cancel(&message.event, &roles.writer, &roles.owner, resolution)
-                            .ok()
-                            .flatten();
+                    let second = za_self_cancel(
+                        &message.event,
+                        &roles.writer,
+                        &roles.owner,
+                        resolution,
+                        message.policy,
+                    )
+                    .ok()
+                    .flatten();
                     za_combine_delegated(first, second, resolution)
                 } else {
                     first.into_iter().map(ZaFanOutMessage::upstream).collect()
@@ -474,6 +479,7 @@ impl CalendarDeleteRequestHandler for Server {
                         uid: &message.uid,
                     },
                     ZaFanOutKind::Deletion,
+                    message.policy,
                     None,
                     resolution.as_ref(),
                 )

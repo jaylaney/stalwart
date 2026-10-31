@@ -1058,6 +1058,7 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
                     event: tree,
                     document_id,
                     uid,
+                    policy,
                 });
             } else if let Ok(messages) =
                 itip_cancel(&content.data.event, account_info.addresses(), true, policy)

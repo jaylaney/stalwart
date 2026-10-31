@@ -725,6 +725,7 @@ impl CalendarUpdateRequestHandler for Server {
                                 uid: event.inner.uid.as_str(),
                             },
                             ZaFanOutKind::Change,
+                            RecipientPolicy::new(&self.core.groupware, new_event.flags),
                             None,
                             za_resolution.as_ref(),
                         )
@@ -1221,8 +1222,8 @@ fn za_schedule(
     // The second run sees the pre-finalize trees.
     let second = resolution.and_then(|resolution| {
         match old {
-            Some(old) => za_self_update(old, ical, &roles.writer, &roles.owner, resolution),
-            None => za_self_create(ical, &roles.writer, &roles.owner, resolution),
+            Some(old) => za_self_update(old, ical, &roles.writer, &roles.owner, resolution, policy),
+            None => za_self_create(ical, &roles.writer, &roles.owner, resolution, policy),
         }
         .ok()
         .flatten()
@@ -1387,6 +1388,7 @@ async fn za_create_event(
                     uid: &uid,
                 },
                 ZaFanOutKind::Change,
+                RecipientPolicy::new(&server.core.groupware, event.flags),
                 lease.as_ref().map(|(lease, _)| lease.lease()),
                 resolution.as_ref(),
             )

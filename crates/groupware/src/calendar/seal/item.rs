@@ -161,6 +161,22 @@ pub fn sealed_item_record(
     )
 }
 
+/// An iTIP message in the shape upstream queues it (upgrade ruling 94):
+/// upstream stores a message as its text (`ItipMessage<String>`) and its
+/// ingest reparses it, so the components a builder or the per-recipient
+/// split leaves unreferenced by the root (`ICalendarComponent::default()`
+/// placeholders) never persist. The fork seals the tree itself, so it takes
+/// the same text round-trip before sealing an item. The serialization walks
+/// from the root, so the iCalendar an item serves is unchanged: the
+/// placeholders were never part of it, and sealing still never adds,
+/// removes or reorders a component of the served tree. `None` when the text
+/// does not reparse as a VCALENDAR with a component.
+pub fn za_item_shape(message: &ICalendar) -> Option<ICalendar> {
+    ICalendar::parse(message.to_string())
+        .ok()
+        .filter(|ical| ical.components.len() > 1 && check_root(ical).is_ok())
+}
+
 /// The sealed tree of a stored item's content, if it is one the fork wrote
 /// (`Itip` with no snapshots); `None` for any other content.
 pub fn item_message(content: &CalendarEventNotificationContent) -> Option<&ICalendar> {
@@ -866,5 +882,71 @@ mod tests {
         });
         let view = unseal_item_archive(&snapshot, &keys, 9).unwrap();
         assert_eq!(view.as_bytes(), snapshot.as_bytes());
+    }
+
+    /// Upgrade ruling 94: the per-recipient split leaves placeholder
+    /// components the root does not reference; `za_item_shape` drops them
+    /// as upstream's text round-trip does, serves the same iCalendar, and
+    /// the item it seals (pending, then drained) opens to its own reparse.
+    #[test]
+    fn an_item_takes_upstreams_queued_shape() {
+        use crate::scheduling::{
+            event_create::itip_create,
+            recipient::{AttendeeVisibility, RecipientPolicy},
+        };
+        let text = concat!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\n",
+            "BEGIN:VEVENT\r\nUID:item-shape\r\nDTSTAMP:20240101T000000Z\r\n",
+            "DTSTART:20990301T100000Z\r\nDURATION:PT1H\r\nRRULE:FREQ=DAILY;COUNT=5\r\n",
+            "SEQUENCE:0\r\nSUMMARY:master\r\nORGANIZER:mailto:org@example.com\r\n",
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:carol@example.com\r\n",
+            "END:VEVENT\r\n",
+            "BEGIN:VEVENT\r\nUID:item-shape\r\nDTSTAMP:20240101T000000Z\r\n",
+            "RECURRENCE-ID:20990302T100000Z\r\nDTSTART:20990302T100000Z\r\n",
+            "DURATION:PT1H\r\nSEQUENCE:0\r\nSUMMARY:x\r\nORGANIZER:mailto:org@example.com\r\n",
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:att@example.com\r\n",
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:carol@example.com\r\n",
+            "END:VEVENT\r\nEND:VCALENDAR\r\n"
+        );
+        let mut event = ICalendar::parse(text).unwrap();
+        let policy = RecipientPolicy {
+            visibility: AttendeeVisibility::All,
+            max_recipients: usize::MAX,
+            max_instances: usize::MAX,
+        };
+        let messages = itip_create(&mut event, &["org@example.com".into()], policy).unwrap();
+        let slice = messages
+            .into_iter()
+            .find(|message| message.to == ["att@example.com".to_string()])
+            .expect("att's slice: X alone")
+            .message;
+        let referenced = |ical: &ICalendar| {
+            let mut seen = vec![false; ical.components.len()];
+            let mut stack = vec![0u32];
+            while let Some(id) = stack.pop() {
+                if !std::mem::replace(&mut seen[id as usize], true) {
+                    stack.extend(&ical.components[id as usize].component_ids);
+                }
+            }
+            seen.into_iter().all(|seen| seen)
+        };
+        assert!(!referenced(&slice), "the split leaves a placeholder");
+
+        let shaped = za_item_shape(&slice).unwrap();
+        assert!(referenced(&shaped), "no placeholder");
+        assert_eq!(shaped.to_string(), slice.to_string(), "the served text");
+        assert_eq!(ICalendar::parse(shaped.to_string()).unwrap(), shaped);
+
+        // Sealed pending, opened, resealed drained, opened: the tree the
+        // drain imports and keeps is still its own reparse.
+        let (public, private) = generate_keypair();
+        let keys = keys();
+        let mut item = shaped.clone();
+        seal_pending_item(&mut item, 9, &public, Some(&pair()), None).unwrap();
+        open_pending_item(&mut item, 9, &private).unwrap();
+        assert_eq!(item, shaped);
+        seal_drained_item(&mut item, &keys, 9).unwrap();
+        open_drained_item(&mut item, &keys, 9).unwrap();
+        assert_eq!(ICalendar::parse(item.to_string()).unwrap(), item);
     }
 }

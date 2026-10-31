@@ -1387,6 +1387,7 @@ async fn merge(
                                 uid: &event_uid,
                             },
                             ZaFanOutKind::Change,
+                            RecipientPolicy::new(&server.core.groupware, event.meta.flags),
                             reply_lease.as_ref().map(|lease| lease.lease()),
                             None,
                         )
