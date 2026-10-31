@@ -4,54 +4,43 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::utils::{
-    dns::DnsCache,
-    http_server::{HttpMessage, spawn_mock_http_server},
-    server::TestServerBuilder,
-};
+use crate::utils::{dns::DnsCache, server::TestServerBuilder};
 use ahash::AHashSet;
 use common::{
     Server,
     auth::{AccountCache, AccountInfo},
     config::mailstore::spamfilter::SpamFilterAction,
-    enterprise::llm::{
-        ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse, Message,
-    },
 };
-use http_proto::{JsonResponse, ToHttpResponse};
-use hyper::Method;
 use mail_auth::{
-    ArcOutput, DkimOutput, DkimResult, DmarcResult, DnssecStatus, IprevOutput, IprevResult, MX,
+    ArcOutput, DkimOutput, DkimResult, DmarcResult, DnssecStatus, IprevOutput, IprevResult, Mx,
     SpfOutput, SpfResult, dkim::Signature, dmarc::Policy,
 };
 use mail_parser::MessageParser;
 use registry::{
     schema::{
-        enums::{AiModelType, TaskSpamFilterMaintenanceType},
+        enums::TaskSpamFilterMaintenanceType,
         prelude::{ObjectType, Property},
         structs::{
-            self, AiModel, MemoryLookupKey, SpamLlm, SpamLlmProperties, SpamSettings, Task,
-            TaskSpamFilterMaintenance, TaskStatus,
+            self, MemoryLookupKey, SpamSettings, Task, TaskSpamFilterMaintenance, TaskStatus,
         },
     },
-    types::{float::Float, map::Map},
+    types::float::Float,
 };
 use serde_json::json;
 use smtp::core::SessionAddress;
 use smtp_proto::{MAIL_BODY_8BITMIME, MAIL_SMTPUTF8};
 use spam_filter::{
-    SpamFilterInput,
+    MessageTexts, SpamFilterInput,
     analysis::{
         classifier::SpamFilterAnalyzeClassify, date::SpamFilterAnalyzeDate,
         dmarc::SpamFilterAnalyzeDmarc, domain::SpamFilterAnalyzeDomain,
         ehlo::SpamFilterAnalyzeEhlo, from::SpamFilterAnalyzeFrom,
         headers::SpamFilterAnalyzeHeaders, html::SpamFilterAnalyzeHtml, init::SpamFilterInit,
-        ip::SpamFilterAnalyzeIp, llm::SpamFilterAnalyzeLlm, messageid::SpamFilterAnalyzeMid,
-        mime::SpamFilterAnalyzeMime, pyzor::SpamFilterAnalyzePyzor,
-        received::SpamFilterAnalyzeReceived, recipient::SpamFilterAnalyzeRecipient,
-        replyto::SpamFilterAnalyzeReplyTo, rules::SpamFilterAnalyzeRules,
-        score::SpamFilterAnalyzeScore, subject::SpamFilterAnalyzeSubject,
-        url::SpamFilterAnalyzeUrl,
+        ip::SpamFilterAnalyzeIp, messageid::SpamFilterAnalyzeMid, mime::SpamFilterAnalyzeMime,
+        pyzor::SpamFilterAnalyzePyzor, received::SpamFilterAnalyzeReceived,
+        recipient::SpamFilterAnalyzeRecipient, replyto::SpamFilterAnalyzeReplyTo,
+        rules::SpamFilterAnalyzeRules, score::SpamFilterAnalyzeScore,
+        subject::SpamFilterAnalyzeSubject, url::SpamFilterAnalyzeUrl,
     },
     modules::{
         classifier::{SpamClassifier, Token},
@@ -92,39 +81,6 @@ async fn antispam() {
             min_spam_samples: 10,
             ..Default::default()
         })
-        .await;
-    let model_id = admin
-        .registry_create_object(AiModel {
-            model_type: AiModelType::Chat,
-            allow_invalid_certs: true,
-            model: "gpt-dummy".to_string(),
-            name: "dummy".to_string(),
-            url: "https://127.0.0.1:9090/v1/chat/completions".to_string(),
-            ..Default::default()
-        })
-        .await;
-    admin
-        .registry_create_object(SpamLlm::Enable(SpamLlmProperties {
-            categories: Map::new(vec![
-                "Unsolicited".to_string(),
-                "Commercial".to_string(),
-                "Harmful".to_string(),
-                "Legitimate".to_string(),
-            ]),
-            confidence: Map::new(vec![
-                "High".to_string(),
-                "Medium".to_string(),
-                "Low".to_string(),
-            ]),
-            model_id,
-            prompt: "You are an AI assistant specialized in analyzing email content to detect spam"
-                .to_string(),
-            response_pos_category: 0,
-            response_pos_confidence: 1.into(),
-            response_pos_explanation: 2.into(),
-            separator: ",".to_string(),
-            ..Default::default()
-        }))
         .await;
     admin
         .registry_create_object(MemoryLookupKey {
@@ -216,7 +172,7 @@ async fn antispam() {
     ] {
         test.server.mx_add(
             mx,
-            vec![MX {
+            vec![Mx {
                 exchanges: vec!["127.0.0.1".into()].into_boxed_slice(),
                 preference: 10,
             }],
@@ -224,38 +180,6 @@ async fn antispam() {
             Instant::now() + Duration::from_secs(100),
         );
     }
-
-    // Spawn mock OpenAI server
-    let _tx = spawn_mock_http_server(
-        &test,
-        Arc::new(|req: HttpMessage| {
-            assert_eq!(req.uri.path(), "/v1/chat/completions");
-            assert_eq!(req.method, Method::POST);
-            let req = serde_json::from_slice::<ChatCompletionRequest>(req.body.as_ref().unwrap())
-                .unwrap();
-            assert_eq!(req.model, "gpt-dummy");
-            let message = &req.messages[0].content;
-            assert!(message.contains("You are an AI assistant specialized in analyzing email"));
-
-            JsonResponse::new(&ChatCompletionResponse {
-                created: 0,
-                object: String::new(),
-                id: String::new(),
-                model: req.model,
-                choices: vec![ChatCompletionChoice {
-                    index: 0,
-                    finish_reason: "stop".to_string(),
-                    message: Message {
-                        role: "assistant".to_string(),
-                        content: message.split_once("Subject: ").unwrap().1.to_string(),
-                    },
-                }],
-            })
-            .into_http_response()
-        }),
-        9090,
-    )
-    .await;
 
     // Run tests
     let base_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -289,7 +213,10 @@ async fn antispam() {
         "pyzor",
         // Upgrade ruling 33: the "llm" case runs the LLM analysis, which
         // needs a licence (AI models are off while `core.enterprise` is
-        // `None`). With no test licence it takes the SEL-only disposition.
+        // `None`). With no test licence it takes the SEL-only disposition;
+        // its setup (the AI model, the `SpamLlm` settings and the mock
+        // chat-completion server) went with it, since 1.0 removed those
+        // types from the OSS build.
     ] {
         if filter_test
             .as_ref()
@@ -555,8 +482,10 @@ async fn antispam() {
             }
 
             // Initialize filter
+            let texts = MessageTexts::new(&parsed_message, test.server.core.spam.text_limits);
             let mut spam_input = session.build_spam_input(
                 &parsed_message,
+                &texts,
                 &dkim_domains,
                 None,
                 arc_result.as_ref(),
@@ -657,7 +586,7 @@ async fn antispam() {
                             r.headers
                                 .split_ascii_whitespace()
                                 .filter(|t| t.starts_with("PROB_"))
-                                .map(|t| t.to_string()),
+                                .map(Into::into),
                         ),
                         _ => unreachable!(),
                     }
@@ -665,22 +594,25 @@ async fn antispam() {
                 "pyzor" => {
                     server.spam_filter_analyze_pyzor(&mut spam_ctx).await;
                 }
-                "llm" => {
-                    server.spam_filter_analyze_llm(&mut spam_ctx).await;
-                }
                 _ => panic!("Invalid test {test_name:?}"),
             }
 
-            // Compare tags
-            if spam_ctx.result.tags != expected_tags {
-                for tag in &spam_ctx.result.tags {
+            // Compare tags (1.0 keeps them as `CompactString`s)
+            let tags = spam_ctx
+                .result
+                .tags
+                .iter()
+                .map(|tag| tag.to_string())
+                .collect::<AHashSet<String>>();
+            if tags != expected_tags {
+                for tag in &tags {
                     if !expected_tags.contains(tag) {
                         println!("Unexpected tag: {tag:?}");
                     }
                 }
 
                 for tag in &expected_tags {
-                    if !spam_ctx.result.tags.contains(tag) {
+                    if !tags.contains(tag) {
                         println!("Missing tag: {tag:?}");
                     }
                 }
@@ -708,8 +640,9 @@ async fn classifier_features(server: &Server, contents: String) {
 
         // Build features
         let message = MessageParser::new().parse(input).unwrap_or_default();
-        let mut ctx =
-            server.spam_filter_init(SpamFilterInput::from_message(&message, 0).train_mode());
+        let texts = MessageTexts::new(&message, server.core.spam.text_limits);
+        let mut ctx = server
+            .spam_filter_init(SpamFilterInput::from_message(&message, &texts, 0).train_mode());
         server.spam_filter_analyze_domain(&mut ctx).await;
         server.spam_filter_analyze_url(&mut ctx).await;
         let mut tokens = server
