@@ -551,29 +551,28 @@ impl Server {
     /// there (`setup-token` refuses) and the assertion would be no fence.
     pub fn za_provisioning_fence(&self, batch: &mut BatchBuilder, account_id: u32) {
         if !self.store().is_pg_or_mysql() {
-            batch
-                .with_account_id(account_id)
-                .with_collection(Collection::Principal)
-                .with_document(0)
-                .assert_value(PrincipalField::ZeroAccessVault, AssertValue::None);
+            crate::za::metadata::za_assert_no_vault(batch, account_id);
         }
     }
 
     /// Mail ruling R58, spec 12's rule 32 for the index worker: a search
     /// document built from `account_id` read as an ordinary account is
     /// written by the internal search store only while the account holds no
-    /// vault record, asserted in the document's first commit chunk (the one
-    /// with its `Document` key). A superseded execution (a worker that
-    /// outlived its task lease) therefore cannot write after provisioning,
-    /// and a first chunk that commits first is seen by the recheck's
-    /// document scan (R51). Ruling R62 conditions every later chunk on that
-    /// `Document` key (`Store::index`), so a chunk that commits after the
-    /// document's unindex writes nothing. Nothing on PostgreSQL or MySQL,
-    /// as `za_provisioning_fence`, or without an internal search store. On
-    /// a search store other than the data store (a separate FoundationDB
+    /// vault record. At 1.0 the document carries the assertion's key, and
+    /// `account_batch` (`store/src/search/index.rs`) places the assertion
+    /// at the head of every commit chunk of the account's index pass
+    /// (`BatchBuilder::za_assert_absent_in_every_chunk`; Task 1's ruling
+    /// 18), whose `Document` keys come after its term merges. So no chunk
+    /// of a superseded pass (a worker that lost its partition lock while
+    /// another node ran the partition) commits after provisioning, and a
+    /// chunk that commits before it is seen by the recheck's scans (R51 and
+    /// R62's term scans). R62's per-chunk `Document`-key guard and R63's
+    /// confirmation read are retired at 1.0: one worker runs a partition's
+    /// entries in order (part 6a). Nothing on PostgreSQL or MySQL, as
+    /// `za_provisioning_fence`, or without an internal search store. On a
+    /// search store other than the data store (a separate FoundationDB
     /// store among them) the assertion reads the search store's key space
-    /// and passes vacuously: R51's recorded limit. R62's guard holds there,
-    /// since the `Document` key lives in the search store.
+    /// and passes vacuously: R51's recorded limit.
     pub fn za_index_fence(&self, document: IndexDocument, account_id: u32) -> IndexDocument {
         if self.store().is_pg_or_mysql() || self.search_store().internal_fts().is_none() {
             document

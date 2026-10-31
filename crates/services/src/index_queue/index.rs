@@ -326,6 +326,7 @@ async fn process_email_items(
     let is_indexed = is_email_indexed(server);
     let pending = pending_items(items).collect::<Vec<_>>();
     let mut remaining = pending.as_slice();
+    let mut za_account = za::ZaUnindexAccount::default();
 
     while !remaining.is_empty() {
         let (rows, settled) = read_email_metadata(server, account_id, remaining, is_indexed)
@@ -377,8 +378,19 @@ async fn process_email_items(
                     }
                 }
             } else {
-                if let Err(err) =
-                    delete_email_metadata(server, batch, account_id, item.id_suffix, row.as_ref())
+                if let Err(err) = za_account
+                    .for_row(server, account_id, row.as_ref())
+                    .await
+                    .and_then(|za_key| {
+                        delete_email_metadata(
+                            server,
+                            batch,
+                            account_id,
+                            item.id_suffix,
+                            row.as_ref(),
+                            za_key,
+                        )
+                    })
                 {
                     let reason = err.to_string();
                     trc::error!(
@@ -845,6 +857,7 @@ fn delete_email_metadata(
     account_id: u32,
     document_id: u32,
     row: Option<&MetadataRow>,
+    za_key: bool,
 ) -> trc::Result<()> {
     match row {
         Some(row) => {
@@ -858,8 +871,9 @@ fn delete_email_metadata(
                 ThreadSubject::Resolved(name) => Cow::Borrowed(name),
                 ThreadSubject::InHeaders => {
                     headers = row.raw_headers().caused_by(trc::location!())?;
-                    // Mail spec 5.2: a stub's bundle is never read as headers.
-                    za::za_thread_subject_in(metadata, &headers)
+                    // Mail spec 5.2: a key account's stub's bundle is never
+                    // read as headers.
+                    za::za_thread_subject_in(za_key, metadata, &headers)
                 }
             };
             metadata.unindex(batch, &thread_subject);

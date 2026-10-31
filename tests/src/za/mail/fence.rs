@@ -183,6 +183,14 @@ const REJECTED_CONTROL: &str = "plainmail25@example.com";
 const TRAINED: &str = "keymail19@example.com";
 /// `train_batch_loses_to_provisioning`'s destination, an ordinary account.
 const TRAIN_DESTINATION: &str = "plainmail16@example.com";
+/// `setup_refuses_object_metadata`'s account (ruling 66, the Task 6
+/// review's F1).
+const OBJECT_METADATA: &str = "keymail34@example.com";
+/// The ordinary owner of the mailbox it holds a private container on.
+const OBJECT_METADATA_OWNER: &str = "plainmail34@example.com";
+/// `metadata_writes_lose_to_provisioning`'s account, an ordinary one that
+/// logs in.
+const METADATA_WRITER: &str = "plainmail35@example.com";
 const PLAIN: &str = "plainmail3@example.com";
 /// The organizer of `forward_race_imip_side_write`'s invitation, which it
 /// sends through authenticated submission.
@@ -245,6 +253,9 @@ pub async fn test(test: &mut TestServer) {
     // and `stopped_document_leaves_its_batch_written`.
     let merge_unindexed = unindex_between_calendar_merge_chunks_leaves_no_terms(test, &admin).await;
     let merge_control = multi_chunk_calendar_merge_is_written_whole(test, &admin).await;
+    let (object_metadata, object_metadata_owner) =
+        setup_refuses_object_metadata(test, &admin).await;
+    let metadata_writer = metadata_writes_lose_to_provisioning(test).await;
 
     // The accounts that log in empty their own mailboxes; the others are
     // pending or credentialless, and the account's destruction removes
@@ -303,6 +314,9 @@ pub async fn test(test: &mut TestServer) {
         superseded_tail_control,
         merge_unindexed,
         merge_control,
+        object_metadata,
+        object_metadata_owner,
+        metadata_writer,
     ] {
         admin.destroy_account(account).await;
     }
@@ -2780,5 +2794,277 @@ async fn multi_chunk_calendar_merge_is_written_whole(
 
     delete_event_records(test, id, event_id).await;
     test.wait_for_tasks().await;
+    account
+}
+
+/// Writes `container` (or removes the stored one with `None`) as the
+/// object-metadata container of `owner_id`'s document, through upstream's
+/// writers (`ContainerChange`, then `MetadataWrite` or, with a viewer,
+/// `PrivateMetadataWrite` and its counters), without the presence bits:
+/// what an ordinary writer leaves before provisioning, including on a
+/// document that no longer exists.
+async fn write_object_metadata(
+    test: &TestServer,
+    owner_id: u32,
+    viewer_id: Option<u32>,
+    collection: Collection,
+    document_id: u32,
+    container: Option<types::metadata::EncodedMetadata>,
+) {
+    use common::storage::metadata::{ContainerChange, MetadataLog, PrivateMetadataCommit};
+    use types::metadata::MetadataEdit;
+    let previous = match viewer_id {
+        Some(viewer_id) => test
+            .server
+            .private_metadata_container(owner_id, viewer_id, collection, document_id)
+            .await
+            .unwrap(),
+        None => test
+            .server
+            .metadata_container(owner_id, collection, document_id)
+            .await
+            .unwrap(),
+    };
+    let Some(change) = ContainerChange::new(previous.as_ref(), container, MetadataEdit::Write)
+    else {
+        return;
+    };
+    let mut batch = BatchBuilder::new();
+    let mut commit = PrivateMetadataCommit::default();
+    let document = store::write::PendingId::Assigned(document_id);
+    match viewer_id {
+        Some(viewer_id) => {
+            let viewer = test.server.account(viewer_id).await.unwrap();
+            change
+                .into_private_write(owner_id, &viewer, collection, MetadataLog::None)
+                .build(document, &mut batch, &mut commit)
+                .unwrap();
+        }
+        None => {
+            let owner = test.server.account(owner_id).await.unwrap();
+            change
+                .into_write(&owner, collection, MetadataLog::None)
+                .build(document, &mut batch)
+                .unwrap();
+        }
+    }
+    test.server
+        .commit_metadata_batch(batch, commit)
+        .await
+        .unwrap();
+}
+
+/// Ruling 66 (the Task 6 review's F1): issuance is refused while the account
+/// holds object metadata in the clear, and proceeds once it is removed. Each
+/// container is written through upstream's writers as an ordinary writer
+/// leaves it before provisioning (an impersonating operator or a grantee with
+/// `ModifyMetadata`): a mailbox's shared container, a server-level IMAP
+/// annotation, another account's private container on a destroyed message of
+/// the account (Email destruction releases only the shared container), and
+/// the account's own private container on another account's mailbox (its
+/// `Owner` counter; once removed, the counter stays and counts none). An
+/// address book's container, DAV dead properties kept in the clear for every
+/// account, is permitted.
+async fn setup_refuses_object_metadata(test: &TestServer, admin: &Account) -> (Account, Account) {
+    use crate::utils::za::plain_dav_container;
+    println!("setup_refuses_object_metadata");
+    let account = passwordless(admin, OBJECT_METADATA).await;
+    let id = account.id().document_id();
+    let owner = admin
+        .create_user_account(
+            OBJECT_METADATA_OWNER,
+            STRONG,
+            "Fence",
+            &[],
+            user_permissions(),
+        )
+        .await;
+    let owner_id = owner.id().document_id();
+    let container = || plain_dav_container(&[("urn:za:fence", "note", "object metadata canary")]);
+    // (what, the object's owner, the viewer of a private container, the
+    // collection, the document).
+    let cases = [
+        (
+            "a mailbox's shared container",
+            id,
+            None,
+            Collection::Mailbox,
+            INBOX_ID,
+        ),
+        (
+            "a server-level annotation",
+            id,
+            None,
+            Collection::Principal,
+            0,
+        ),
+        (
+            "another account's private container on a destroyed message",
+            id,
+            Some(owner_id),
+            Collection::Email,
+            u32::MAX - 7,
+        ),
+        (
+            "its private container on another account's mailbox",
+            owner_id,
+            Some(id),
+            Collection::Mailbox,
+            INBOX_ID,
+        ),
+    ];
+    assert!(!test.server.za_has_object_metadata(id).await.unwrap());
+    for (what, owner_id, viewer_id, collection, document_id) in cases {
+        write_object_metadata(
+            test,
+            owner_id,
+            viewer_id,
+            collection,
+            document_id,
+            Some(container()),
+        )
+        .await;
+        let reply = za_post_as(admin, "setup-token", &json!({ "account": OBJECT_METADATA })).await;
+        assert_eq!(
+            reply.expect(409)["error"],
+            "account already holds object metadata",
+            "issuance while the account holds {what}"
+        );
+        assert!(
+            test.server.za_vault_record(id).await.unwrap().is_none(),
+            "the refused issuance wrote a record ({what})"
+        );
+        write_object_metadata(test, owner_id, viewer_id, collection, document_id, None).await;
+        assert!(
+            !test.server.za_has_object_metadata(id).await.unwrap(),
+            "{what} was not removed"
+        );
+    }
+    // Permitted: an address book's dead properties.
+    write_object_metadata(
+        test,
+        id,
+        None,
+        Collection::AddressBook,
+        0,
+        Some(container()),
+    )
+    .await;
+    assert!(
+        !test.server.za_has_object_metadata(id).await.unwrap(),
+        "an address book's container refuses issuance"
+    );
+    write_object_metadata(test, id, None, Collection::AddressBook, 0, None).await;
+
+    za_setup_token(admin, OBJECT_METADATA).await;
+    (account, owner)
+}
+
+/// Ruling 66 (the Task 6 review's F1), the writers' fence: a container
+/// write whose accounts were read as ordinary commits only while the
+/// account holds no vault record, as mail's ordinary writers do (mail spec
+/// 6.1). A pending record is written straight to the store, as
+/// `setup-token` writes it but without the invalidation, so the account
+/// stays classified as ordinary in the caches the writers read: JMAP's
+/// `Mailbox/set` with metadata, IMAP `SETMETADATA` on a mailbox and a
+/// private server annotation all fail and store nothing. With the record
+/// removed, the same writes commit (the controls).
+async fn metadata_writes_lose_to_provisioning(test: &TestServer) -> Account {
+    use crate::utils::{imap::Type, jmap::JmapUtils};
+    use imap_proto::ResponseType;
+    println!("metadata_writes_lose_to_provisioning");
+    const USING: &[&str] = &[
+        "urn:ietf:params:jmap:core",
+        "urn:ietf:params:jmap:mail",
+        "urn:ietf:params:jmap:metadata",
+    ];
+    let admin = test.account("admin@example.com").clone();
+    let account = admin
+        .create_user_account(METADATA_WRITER, STRONG, "Fence", &[], user_permissions())
+        .await;
+    let id = account.id().document_id();
+    let reply = account
+        .jmap_request(
+            USING,
+            json!([["Mailbox/set", {
+                "accountId": account.id_string(),
+                "create": { "m": { "name": "fence-metadata" } }
+            }, "0"]]),
+        )
+        .await;
+    let mailbox = reply.method_response()["created"]["m"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("Mailbox/set: {:?}", reply.0))
+        .to_string();
+    let mut imap = ImapConnection::connect(b"_f ").await;
+    imap.authenticate(METADATA_WRITER, STRONG).await;
+    let jmap_write = async |value: serde_json::Value| {
+        account
+            .jmap_request(
+                USING,
+                json!([["Mailbox/set", {
+                    "accountId": account.id_string(),
+                    "update": { (mailbox.as_str()): { "metadata": value } }
+                }, "0"]]),
+            )
+            .await
+    };
+    let note = || json!({ "example.com": { "note": "fence-canary" } });
+    const IMAP_WRITES: [&str; 2] = [
+        "SETMETADATA INBOX (/shared/comment \"fence-canary\")",
+        "SETMETADATA \"\" (/private/comment \"fence-canary\")",
+    ];
+
+    let record = VaultRecord::pending(vec![0x5a; 32], i64::MAX);
+    test.server.za_vault_write(id, &record, None).await.unwrap();
+    assert!(
+        !test.server.account(id).await.unwrap().is_key_account(),
+        "the planted record changed the cached classification"
+    );
+    let reply = jmap_write(note()).await;
+    assert!(
+        reply.method_response()["updated"]
+            .get(mailbox.as_str())
+            .is_none(),
+        "Mailbox/set with metadata committed while the account holds a vault record: {:?}",
+        reply.0
+    );
+    for command in IMAP_WRITES {
+        imap.send(command).await;
+        imap.assert_read(Type::Tagged, ResponseType::No).await;
+    }
+    assert!(
+        !test.server.za_has_object_metadata(id).await.unwrap(),
+        "a container write committed while the account holds a vault record"
+    );
+
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(id)
+        .with_collection(Collection::Principal)
+        .with_document(0)
+        .clear(types::field::PrincipalField::ZeroAccessVault);
+    test.server.store().write(batch.build_all()).await.unwrap();
+    let reply = jmap_write(note()).await;
+    assert!(
+        reply.method_response()["updated"]
+            .get(mailbox.as_str())
+            .is_some(),
+        "the control's Mailbox/set with metadata: {:?}",
+        reply.0
+    );
+    for command in IMAP_WRITES {
+        imap.send_ok(command).await;
+    }
+    assert!(
+        test.server.za_has_object_metadata(id).await.unwrap(),
+        "the controls stored no container"
+    );
+    // The account's destruction removes the mailbox's container.
+    imap.send_ok("SETMETADATA INBOX (/shared/comment NIL)")
+        .await;
+    imap.send_ok("SETMETADATA \"\" (/private/comment NIL)")
+        .await;
+    imap.send_ok("LOGOUT").await;
     account
 }

@@ -15,16 +15,20 @@
 //!
 //! - `Property` (`p`): the calendar, event and inbox-item records (the
 //!   structural checks below), and the object-metadata containers
-//!   (`Collection::Metadata`): no `Private` container (ruling 66); a
+//!   (`Collection::Metadata`): no `Private` container (ruling 66), on the
+//!   account's objects or of the account on another owner's (the walk reads
+//!   every owner's `Private` records whose viewer is the account); a
 //!   calendar's or event's `Shared` container is a sealed wrapper
-//!   (`is_sealed_container`; rulings 16, 23 and 29); a mailbox's, message's
-//!   or Sieve script's `Shared` container is object metadata, refused for a
-//!   key account (ruling 66); an address book's, card's or file's `Shared`
-//!   container holds DAV dead properties, which DAV keeps in the clear for
-//!   contacts and files (design, "Other object kinds"); the `Viewer` and
-//!   `Owner` counters are 12 bytes (a change id and a container count,
-//!   `merge_viewer_state`). Names are never in metadata keys, so the rule
-//!   reads the class byte, not a name.
+//!   (`is_sealed_container`; rulings 16, 23 and 29); an address book's,
+//!   card's or file's `Shared` container holds DAV dead properties, which
+//!   DAV keeps in the clear for contacts and files (design, "Other object
+//!   kinds"); any other `Shared` container (a mailbox's, message's or Sieve
+//!   script's, a server-level IMAP annotation) is object metadata, refused
+//!   for a key account (ruling 66); the `Viewer` and `Owner` counters are
+//!   well formed (an 11-byte key naming a collection, a 12-byte value that
+//!   decodes as a `ViewerState`: a change id and a container count,
+//!   `merge_viewer_state`) and count no container. Names are never in
+//!   metadata keys, so the rule reads the class byte, not a name.
 //! - `Immutable` (`c`): a message's metadata row is a stub (mail spec 5.2),
 //!   exactly the row `seal_stub` writes for its bundle and blob; its sort
 //!   keys are the empty ones `za_ingest` writes (`MessageSortKeys::default`);
@@ -119,7 +123,9 @@ use store::{
     Deserialize as _, IterateParams, Subspace, U32_LEN, U64_LEN, ValueKey, ZA_UID_LEASE_PREFIX,
     write::{
         AnyKey, Archive, ArchiveBytes, Archiver, BatchBuilder, IndexPropertyClass, QueueDocumentId,
-        SearchIndex, SearchIndexClass, ValueClass, metadata::MetadataClass, serialize::RawValue,
+        SearchIndex, SearchIndexClass, ValueClass,
+        metadata::{MetadataClass, ViewerState},
+        serialize::RawValue,
     },
 };
 use trc::EventType;
@@ -585,7 +591,26 @@ fn check_system(key: &[u8], what: &str, violations: &mut Vec<String>) {
 struct MetadataRecord {
     what: String,
     key: Vec<u8>,
-    value_len: usize,
+    value: Vec<u8>,
+    /// A `Private` record of another owner whose viewer is the account.
+    foreign: bool,
+}
+
+/// A metadata key's length for `Shared`, `Viewer` and `Owner` records
+/// (account | `Collection::Metadata` | class | collection and document,
+/// collection and viewer, or owner and collection).
+const METADATA_KEY_LEN: usize = U32_LEN + 3 + U32_LEN;
+/// A `Private` record's key length (owner | `Collection::Metadata` | class
+/// | viewer | collection | document).
+const METADATA_PRIVATE_KEY_LEN: usize = U32_LEN * 3 + 3;
+
+/// Whether `key` (a `Property` record) is another owner's `Private`
+/// container whose viewer is `account_id`.
+fn is_foreign_private(key: &[u8], account_id: u32) -> bool {
+    key.len() == METADATA_PRIVATE_KEY_LEN
+        && key.get(U32_LEN) == Some(&(Collection::Metadata as u8))
+        && key.get(U32_LEN + 1) == Some(&METADATA_PRIVATE)
+        && key.get(U32_LEN + 2..U32_LEN * 2 + 2) == Some(account_id.to_be_bytes().as_slice())
 }
 
 /// The object-metadata rule (module documentation). A `Shared` container is
@@ -599,6 +624,12 @@ async fn check_metadata(
     let what = record.what.as_str();
     let key = record.key.as_slice();
     scan.metadata_records += 1;
+    if record.foreign {
+        scan.violations.push(format!(
+            "{what}: private metadata container of a key account on another account's object"
+        ));
+        return;
+    }
     match key.get(U32_LEN + 1).copied() {
         Some(METADATA_SHARED) if key.len() == U32_LEN + 3 + U32_LEN => {
             let collection = Collection::from(key[U32_LEN + 2]);
@@ -624,20 +655,43 @@ async fn check_metadata(
                             .push(format!("{what}: shared container does not decode: {err:?}")),
                     }
                 }
-                Collection::Mailbox | Collection::Email | Collection::SieveScript => scan
+                // DAV dead properties of contacts and files, in the clear.
+                Collection::AddressBook | Collection::ContactCard | Collection::FileNode => {}
+                // A mailbox's, message's or Sieve script's container, a
+                // server-level IMAP annotation (`Collection::Principal`) or
+                // any other: object metadata, refused for a key account.
+                _ => scan
                     .violations
                     .push(format!("{what}: object metadata of a key account")),
-                // DAV dead properties of contacts and files, in the clear.
-                _ => {}
             }
         }
         Some(METADATA_PRIVATE) => scan.violations.push(format!(
             "{what}: private metadata container of a key account"
         )),
-        Some(MetadataClass::VIEWER) | Some(MetadataClass::OWNER) => {
-            if record.value_len != METADATA_COUNTER_LEN {
-                scan.violations
-                    .push(format!("{what}: metadata counter shape"));
+        Some(class @ (MetadataClass::VIEWER | MetadataClass::OWNER)) => {
+            // `Viewer`: collection | viewer; `Owner`: owner | collection.
+            let collection = match class {
+                MetadataClass::VIEWER => key.get(U32_LEN + 2),
+                _ => key.get(U32_LEN * 2 + 2),
+            }
+            .map(|collection| Collection::from(*collection));
+            let state = (record.value.len() == METADATA_COUNTER_LEN)
+                .then(|| ViewerState::deserialize(&record.value).ok())
+                .flatten();
+            match (key.len(), collection, state) {
+                (METADATA_KEY_LEN, Some(collection), Some(state))
+                    if !matches!(collection, Collection::None | Collection::Metadata) =>
+                {
+                    if state.containers > 0 {
+                        scan.violations.push(format!(
+                            "{what}: metadata counter of private containers ({} counted)",
+                            state.containers
+                        ));
+                    }
+                }
+                _ => scan
+                    .violations
+                    .push(format!("{what}: metadata counter shape")),
             }
         }
         _ => scan
@@ -1238,7 +1292,18 @@ pub async fn scan(test: &TestServer, account_id: u32) -> Scan {
                     metadata.push(MetadataRecord {
                         what: what.clone(),
                         key: key.clone(),
-                        value_len: value.len(),
+                        value: value.clone(),
+                        foreign: false,
+                    });
+                }
+                // The account's private containers on another owner's
+                // objects (ruling 66's caller rule).
+                Subspace::Property if !of_account && is_foreign_private(&key, account_id) => {
+                    metadata.push(MetadataRecord {
+                        what: what.clone(),
+                        key: key.clone(),
+                        value: value.clone(),
+                        foreign: true,
                     });
                 }
                 _ => {}
@@ -2732,6 +2797,10 @@ pub async fn test_index_control(test: &mut TestServer) {
         ..Default::default()
     }
     .serialize();
+    // A `ViewerState` (change id, then container count, big-endian) that
+    // counts one container.
+    let mut counting_counter = vec![0u8; U64_LEN];
+    counting_counter.extend_from_slice(&1u32.to_be_bytes());
     // (collection, class, value, the violation it trips, or `None`), in
     // the data store, keyed on the account and `document_id`.
     let data_plants = [
@@ -2784,6 +2853,35 @@ pub async fn test_index_control(test: &mut TestServer) {
             vec![0; 5],
             Some("metadata counter shape"),
         ),
+        // A well-formed counter that counts one private container of the
+        // account on `plain`'s mailboxes (the Task 6 review's F2).
+        (
+            Collection::Mailbox,
+            ValueClass::Metadata(MetadataClass::Owner { owner: plain_id }),
+            counting_counter.clone(),
+            Some("metadata counter of private containers (1 counted)"),
+        ),
+        // Shared containers (the review's F8): a mailbox's and a
+        // server-level annotation's are flagged by their collection, an
+        // address book's (DAV dead properties) is permitted.
+        (
+            Collection::Mailbox,
+            ValueClass::Metadata(MetadataClass::Shared),
+            vec![1, 2, 3],
+            Some("object metadata of a key account"),
+        ),
+        (
+            Collection::Principal,
+            ValueClass::Metadata(MetadataClass::Shared),
+            vec![1, 2, 3],
+            Some("object metadata of a key account"),
+        ),
+        (
+            Collection::AddressBook,
+            ValueClass::Metadata(MetadataClass::Shared),
+            vec![1, 2, 3],
+            None,
+        ),
         (
             Collection::None,
             ValueClass::Any(store::write::AnyClass {
@@ -2794,10 +2892,29 @@ pub async fn test_index_control(test: &mut TestServer) {
             Some("unclassified system record"),
         ),
     ];
+    // The account's private container on `plain`'s mailbox, stored under
+    // `plain` (the review's F2: the walk reads other owners' records).
+    const FOREIGN_RULE: &str =
+        "private metadata container of a key account on another account's object";
+    let write_foreign = async |set: bool| {
+        let mut batch = BatchBuilder::new();
+        batch
+            .with_account_id(plain_id)
+            .with_collection(Collection::Mailbox)
+            .with_document(document_id);
+        let class = ValueClass::Metadata(MetadataClass::Private { viewer: id });
+        if set {
+            batch.set(class, vec![1, 2, 3]);
+        } else {
+            batch.clear(class);
+        }
+        test.server.store().write_batch(&mut batch).await.unwrap();
+    };
     let expected = search_plants
         .iter()
         .filter_map(|(_, _, rule)| *rule)
         .chain(data_plants.iter().filter_map(|(_, _, _, rule)| *rule))
+        .chain([FOREIGN_RULE])
         .collect::<Vec<_>>();
 
     let before = scan(test, id).await;
@@ -2834,6 +2951,7 @@ pub async fn test_index_control(test: &mut TestServer) {
                 matches!(class, ValueClass::Immutable(_)) && rule.is_some()
             });
     write(&rest, true).await;
+    write_foreign(true).await;
 
     // The permitted sort keys: every rule but that one's trips.
     let result = scan(test, id).await;
@@ -2884,6 +3002,7 @@ pub async fn test_index_control(test: &mut TestServer) {
     }
     search.write_batch(&mut batch).await.unwrap();
     write(&rest, false).await;
+    write_foreign(false).await;
     release_index_partition(&test.server, SearchIndex::Email, id).await;
     test.wait_for_tasks().await;
     let after = scan(test, id).await;

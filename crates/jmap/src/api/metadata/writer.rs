@@ -22,7 +22,10 @@ use email::message::ingest_metadata::IngestMetadata;
 use jmap_proto::{error::set::SetError, object::metadata::MetadataProperty, request::MaybeInvalid};
 use jmap_tools::{Element, Value};
 use std::{mem, sync::Arc};
-use store::write::{Archive, AssignedIds, BatchBuilder, PendingId};
+use store::{
+    roaring::RoaringBitmap,
+    write::{Archive, AssignedIds, BatchBuilder, PendingId},
+};
 use trc::AddContext;
 use types::{id::Id, metadata::MetadataKinds};
 use utils::map::vec_map::VecMap;
@@ -34,6 +37,10 @@ pub struct MetadataWriter {
     viewer: Option<Arc<AccountCache>>,
     containers: PreloadedContainers,
     commit: PrivateMetadataCommit,
+    /// Ruling 66 (the Task 6 review's F3): the copy sources whose shared
+    /// containers the preload did not read because the caller or the source
+    /// account is a key account.
+    za_unread_sources: RoaringBitmap,
 }
 
 #[derive(Debug)]
@@ -61,6 +68,7 @@ impl MetadataWriter {
             viewer: None,
             containers: PreloadedContainers::default(),
             commit: PrivateMetadataCommit::default(),
+            za_unread_sources: RoaringBitmap::new(),
         }
     }
 
@@ -92,6 +100,9 @@ impl MetadataWriter {
         preload: MetadataPreload,
     ) -> trc::Result<()> {
         if !preload.is_empty() {
+            if za_metadata_refused(server, self.metadata.caller_id(), account_id).await? {
+                self.za_unread_sources = preload.shared.clone();
+            }
             self.containers = self.metadata.preload(server, account_id, preload).await?;
         }
         Ok(())
@@ -162,7 +173,9 @@ impl MetadataWriter {
         metadata: NewMetadata,
         access: MetadataAccess,
     ) -> trc::Result<Result<Option<Box<IngestMetadata>>, SetError<P>>> {
-        if za_names_patches(&metadata) && self.za_refused(server).await? {
+        if (za_names_patches(&metadata) || self.za_drops_containers(&metadata))
+            && self.za_refused(server).await?
+        {
             return Ok(Err(za_metadata_set_error()));
         }
         let update = match self.new_update(metadata, access) {
@@ -183,7 +196,9 @@ impl MetadataWriter {
         let Some(metadata) = metadata else {
             return Ok(Ok(None));
         };
-        if za_names_patches(&metadata) && self.za_refused(server).await? {
+        if (za_names_patches(&metadata) || self.za_drops_containers(&metadata))
+            && self.za_refused(server).await?
+        {
             return Ok(Err(za_metadata_set_error()));
         }
         match self.new_update(metadata, access) {
@@ -245,6 +260,16 @@ impl MetadataWriter {
     /// patch is refused too (`za_metadata_refused`).
     async fn za_refused(&self, server: &Server) -> trc::Result<bool> {
         za_metadata_refused(server, self.metadata.caller_id(), self.account_id).await
+    }
+
+    /// Ruling 66 (the Task 6 review's F3): a copy whose source holds shared
+    /// containers the preload did not read. With a key account as the
+    /// destination or the caller (`za_refused`), the copy is refused rather
+    /// than created without them; a copy out of a key account by an
+    /// ordinary caller into an ordinary account carries none (6b's decision).
+    fn za_drops_containers(&self, metadata: &NewMetadata) -> bool {
+        matches!(metadata, NewMetadata::Copy { source_id, .. }
+            if self.za_unread_sources.contains(*source_id))
     }
 
     async fn target(

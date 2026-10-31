@@ -12,6 +12,7 @@
 
 pub mod lease;
 pub mod mail;
+pub mod metadata;
 
 #[cfg(feature = "test_mode")]
 pub mod test_hooks;

@@ -779,7 +779,9 @@ fn metadata_value() -> Value {
 ///   lists neither `METADATA` nor `LIST-METADATA`.
 ///
 /// The ordinary account's identical requests succeed, so each refusal is
-/// the fork's and not an unsupported feature.
+/// the fork's and not an unsupported feature. `metadata_beyond_mailboxes`
+/// adds the review's cases (Task 6 fix round, F6): Email, `Principal/get`,
+/// `*/changes`, the caller rule and `ContactCard/copy`.
 pub async fn test_metadata(test: &mut TestServer) {
     use crate::utils::imap::{ImapConnection, Type};
     use imap_proto::ResponseType;
@@ -988,9 +990,12 @@ pub async fn test_metadata(test: &mut TestServer) {
         imap.send_ok("LOGOUT").await;
     }
 
+    metadata_beyond_mailboxes(&key, &plain).await;
+
     // Nothing of the key account's metadata was stored: the leak scanner's
     // object-metadata rule flags any mailbox container or private container
-    // of a key account. The control's containers go with its mailboxes.
+    // of a key account, its private containers on the control's objects
+    // included. The control's containers go with its mailboxes.
     let found = super::leak::scan(test, key.id().document_id()).await;
     assert!(
         found.violations.is_empty(),
@@ -1004,4 +1009,385 @@ pub async fn test_metadata(test: &mut TestServer) {
     admin.destroy_account(key).await;
     admin.destroy_account(plain).await;
     test.wait_for_tasks().await;
+}
+
+/// The Task 6 review's F6 cases of ruling 66, with `plain` as the control
+/// and as the owner of the objects shared with `key`:
+///
+/// - `Email/set` create and update naming metadata on the key account are
+///   refused per object, and the control's succeed. (At 1.0 `Email/import`
+///   takes no metadata: its request has no metadata property.)
+/// - `Principal/get`'s account objects offer no metadata capability to the
+///   key account, for its own principal and for the control's, while the
+///   control's own principal offers it.
+/// - The caller rule: the key account's private and shared metadata on the
+///   control's shared mailbox are refused, though its grant allows them.
+/// - `*/changes`: a metadata-only change of the shared mailbox is reported
+///   to its owner and not to the key account (`MetadataChanges::Unsupported`),
+///   which still sees the mailbox's other changes.
+/// - Ruling 66's copies (F3): `ContactCard/copy` of the control's card that
+///   carries metadata into the key account is refused per object, rather
+///   than created without the card's container; a card without metadata is
+///   copied.
+async fn metadata_beyond_mailboxes(
+    key: &crate::utils::account::Account,
+    plain: &crate::utils::account::Account,
+) {
+    use crate::utils::account::Account;
+    use email::mailbox::INBOX_ID;
+    use jmap::api::metadata::ZA_METADATA_REFUSED;
+    use types::id::Id;
+
+    println!("metadata_beyond_mailboxes");
+    let inbox = Id::from(INBOX_ID).to_string();
+    let email = |subject: &str| {
+        json!({
+            "mailboxIds": { (inbox.as_str()): true },
+            "from": [{ "email": "sender@example.com" }],
+            "subject": subject,
+            "textBody": [{ "partId": "t", "type": "text/plain" }],
+            "bodyValues": { "t": { "value": "metadata body" } }
+        })
+    };
+
+    // Email/set create and update.
+    for account in [key, plain] {
+        let is_key = account.name() == METADATA_KEY;
+        let mut with = email("with metadata");
+        with["metadata"] = metadata_value();
+        let reply = account
+            .jmap_request(
+                METADATA_USING,
+                json!([["Email/set", {
+                    "accountId": account.id_string(),
+                    "create": { "e": with, "f": email("without metadata") }
+                }, "0"]]),
+            )
+            .await;
+        let response = reply.method_response();
+        if is_key {
+            assert_eq!(
+                response["notCreated"]["e"]["type"], "forbidden",
+                "a key account's Email/set create with metadata: {:?}",
+                reply.0
+            );
+            assert_eq!(
+                response["notCreated"]["e"]["description"], ZA_METADATA_REFUSED,
+                "{:?}",
+                reply.0
+            );
+        } else {
+            assert!(
+                response["created"]["e"]["id"].is_string(),
+                "the control's Email/set create with metadata: {:?}",
+                reply.0
+            );
+        }
+        let id = response["created"]["f"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("Email/set create without metadata: {:?}", reply.0))
+            .to_string();
+        let reply = account
+            .jmap_request(
+                METADATA_USING,
+                json!([["Email/set", {
+                    "accountId": account.id_string(),
+                    "update": { (id.as_str()): { "metadata": metadata_value() } }
+                }, "0"]]),
+            )
+            .await;
+        let response = reply.method_response();
+        if is_key {
+            assert_eq!(
+                response["notUpdated"][id.as_str()]["type"],
+                "forbidden",
+                "a key account's Email/set update with metadata: {:?}",
+                reply.0
+            );
+            assert_eq!(
+                response["notUpdated"][id.as_str()]["description"],
+                ZA_METADATA_REFUSED,
+                "{:?}",
+                reply.0
+            );
+        } else {
+            assert!(
+                response["updated"].get(id.as_str()).is_some(),
+                "the control's Email/set update with metadata: {:?}",
+                reply.0
+            );
+        }
+    }
+
+    // The control shares a mailbox with the key account, with the right to
+    // set metadata.
+    let reply = plain
+        .jmap_request(
+            METADATA_USING,
+            json!([["Mailbox/set", {
+                "accountId": plain.id_string(),
+                "create": { "s": {
+                    "name": "shared-with-key",
+                    "shareWith": { (key.id_string()): {
+                        "mayReadItems": true,
+                        "maySetMetadata": true
+                    } }
+                } }
+            }, "0"]]),
+        )
+        .await;
+    let shared = reply.method_response()["created"]["s"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the shared mailbox: {:?}", reply.0))
+        .to_string();
+
+    // Principal/get: the key account's own principal and the control's, as
+    // the key account reads them, and the control's own (offered).
+    const PRINCIPAL_USING: &[&str] = &[
+        "urn:ietf:params:jmap:core",
+        "urn:ietf:params:jmap:principals",
+        "urn:ietf:params:jmap:metadata",
+    ];
+    for (caller, ids, offered) in [
+        (key, vec![key.id_string(), plain.id_string()], false),
+        (plain, vec![plain.id_string()], true),
+    ] {
+        let reply = caller
+            .jmap_request(
+                PRINCIPAL_USING,
+                json!([["Principal/get", {
+                    "accountId": caller.id_string(),
+                    "ids": &ids,
+                    "properties": ["id", "accounts"]
+                }, "0"]]),
+            )
+            .await;
+        let list = reply.method_response()["list"]
+            .as_array()
+            .unwrap_or_else(|| panic!("Principal/get: {:?}", reply.0));
+        assert_eq!(list.len(), ids.len(), "Principal/get: {:?}", reply.0);
+        let own = list
+            .iter()
+            .find(|principal| principal["id"] == caller.id_string())
+            .unwrap_or_else(|| panic!("the caller's own principal: {:?}", reply.0));
+        assert!(
+            own["accounts"].is_object(),
+            "the caller's own principal lists no accounts: {:?}",
+            reply.0
+        );
+        for principal in list {
+            assert_eq!(
+                principal["accounts"]
+                    .to_string()
+                    .contains("urn:ietf:params:jmap:metadata"),
+                offered && principal["id"] == caller.id_string(),
+                "the metadata capability in {}'s Principal/get of {}: {:?}",
+                caller.name(),
+                principal["id"],
+                reply.0
+            );
+        }
+    }
+
+    // The caller rule: the grant allows both, ruling 66 refuses both.
+    for property in ["privateMetadata", "metadata"] {
+        let reply = key
+            .jmap_request(
+                METADATA_USING,
+                json!([["Mailbox/set", {
+                    "accountId": plain.id_string(),
+                    "update": { (shared.as_str()): { (property): metadata_value() } }
+                }, "0"]]),
+            )
+            .await;
+        let response = reply.method_response();
+        assert_eq!(
+            response["notUpdated"][shared.as_str()]["description"],
+            ZA_METADATA_REFUSED,
+            "the key account's {property} on the control's shared mailbox: {:?}",
+            reply.0
+        );
+    }
+    // The control's own private metadata on the same mailbox is stored:
+    // the key account's refusal is the fork's, not the grant's.
+    let reply = plain
+        .jmap_request(
+            METADATA_USING,
+            json!([["Mailbox/set", {
+                "accountId": plain.id_string(),
+                "update": { (shared.as_str()): { "privateMetadata": metadata_value() } }
+            }, "0"]]),
+        )
+        .await;
+    assert!(
+        reply.method_response()["updated"]
+            .get(shared.as_str())
+            .is_some(),
+        "the control's private metadata: {:?}",
+        reply.0
+    );
+
+    // `*/changes`: a metadata-only change of the shared mailbox.
+    let state = async |caller: &Account| {
+        let reply = caller
+            .jmap_request(
+                METADATA_USING,
+                json!([["Mailbox/get", {
+                    "accountId": plain.id_string(),
+                    "ids": [&shared]
+                }, "0"]]),
+            )
+            .await;
+        reply.method_response()["state"]
+            .as_str()
+            .unwrap_or_else(|| panic!("Mailbox/get: {:?}", reply.0))
+            .to_string()
+    };
+    let changes = async |caller: &Account, since: &str| {
+        let reply = caller
+            .jmap_request(
+                METADATA_USING,
+                json!([["Mailbox/changes", {
+                    "accountId": plain.id_string(),
+                    "sinceState": since
+                }, "0"]]),
+            )
+            .await;
+        reply.method_response()["updated"]
+            .as_array()
+            .unwrap_or_else(|| panic!("Mailbox/changes: {:?}", reply.0))
+            .clone()
+    };
+    let key_since = state(key).await;
+    let plain_since = state(plain).await;
+    let reply = plain
+        .jmap_request(
+            METADATA_USING,
+            json!([["Mailbox/set", {
+                "accountId": plain.id_string(),
+                "update": { (shared.as_str()): { "metadata": metadata_value() } }
+            }, "0"]]),
+        )
+        .await;
+    assert!(
+        reply.method_response()["updated"]
+            .get(shared.as_str())
+            .is_some(),
+        "the control's metadata-only change: {:?}",
+        reply.0
+    );
+    assert!(
+        changes(plain, &plain_since).await.contains(&json!(shared)),
+        "the owner's Mailbox/changes omits its metadata-only change"
+    );
+    assert!(
+        !changes(key, &key_since).await.contains(&json!(shared)),
+        "the key account's Mailbox/changes reports a metadata-only change"
+    );
+    let reply = plain
+        .jmap_request(
+            METADATA_USING,
+            json!([["Mailbox/set", {
+                "accountId": plain.id_string(),
+                "update": { (shared.as_str()): { "name": "shared-with-key-renamed" } }
+            }, "0"]]),
+        )
+        .await;
+    assert!(
+        reply.method_response()["updated"]
+            .get(shared.as_str())
+            .is_some(),
+        "the rename: {:?}",
+        reply.0
+    );
+    assert!(
+        changes(key, &key_since).await.contains(&json!(shared)),
+        "the key account does not see the shared mailbox's changes, so the \
+         metadata-only case above proves nothing"
+    );
+
+    // ContactCard/copy into the key account (ruling 66, F3).
+    const CONTACTS_USING: &[&str] = &[
+        "urn:ietf:params:jmap:core",
+        "urn:ietf:params:jmap:contacts",
+        "urn:ietf:params:jmap:metadata",
+    ];
+    let book = |account: &Account, name: &str, share: Option<&Account>| {
+        let mut object = json!({ "name": name });
+        if let Some(grantee) = share {
+            object["shareWith"] = json!({ (grantee.id_string()): { "mayRead": true } });
+        }
+        json!([["AddressBook/set", {
+            "accountId": account.id_string(),
+            "create": { "b": object }
+        }, "0"]])
+    };
+    let created = |reply: &JmapResponse, id: &str| {
+        reply.method_response()["created"][id]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{id}: {:?}", reply.0))
+            .to_string()
+    };
+    let reply = plain
+        .jmap_request(CONTACTS_USING, book(plain, "copy-source", Some(key)))
+        .await;
+    let source_book = created(&reply, "b");
+    let reply = key
+        .jmap_request(CONTACTS_USING, book(key, "copy-destination", None))
+        .await;
+    let destination_book = created(&reply, "b");
+    let reply = plain
+        .jmap_request(
+            CONTACTS_USING,
+            json!([["ContactCard/set", {
+                "accountId": plain.id_string(),
+                "create": {
+                    "m": {
+                        "uid": "za-metadata-copy-m",
+                        "name": { "full": "Card with metadata" },
+                        "addressBookIds": { (source_book.as_str()): true },
+                        "metadata": metadata_value()
+                    },
+                    "n": {
+                        "uid": "za-metadata-copy-n",
+                        "name": { "full": "Card without metadata" },
+                        "addressBookIds": { (source_book.as_str()): true }
+                    }
+                }
+            }, "0"]]),
+        )
+        .await;
+    let with_metadata = created(&reply, "m");
+    let without_metadata = created(&reply, "n");
+    let reply = key
+        .jmap_request(
+            CONTACTS_USING,
+            json!([["ContactCard/copy", {
+                "fromAccountId": plain.id_string(),
+                "accountId": key.id_string(),
+                "create": {
+                    (with_metadata.as_str()): {
+                        "addressBookIds": { (destination_book.as_str()): true }
+                    },
+                    (without_metadata.as_str()): {
+                        "addressBookIds": { (destination_book.as_str()): true }
+                    }
+                }
+            }, "0"]]),
+        )
+        .await;
+    let response = reply.method_response();
+    assert_eq!(
+        response["notCreated"][with_metadata.as_str()]["description"],
+        ZA_METADATA_REFUSED,
+        "ContactCard/copy of a card with metadata into a key account: {:?}",
+        reply.0
+    );
+    assert!(
+        response["created"][without_metadata.as_str()]["id"].is_string(),
+        "ContactCard/copy of a card without metadata into a key account: {:?}",
+        reply.0
+    );
+    // The account destruction at the end of `test_metadata` removes the
+    // address books and cards.
 }

@@ -884,7 +884,7 @@ async fn za_assert_enabled(server: &Server, account_id: u32) -> trc::Result<()> 
 }
 
 /// Refuses an account that already holds calendar data, mail, unfinished
-/// tasks or spam training samples: setup would otherwise convert plaintext
+/// tasks, object metadata or spam training samples: setup would otherwise convert plaintext
 /// into a key account (mail spec 6.6). A sole
 /// default calendar created by the server (`create_default_calendar`) with
 /// untouched preferences is not user data and is ignored; it is sealed by
@@ -925,6 +925,20 @@ async fn za_assert_no_data(server: &Server, account_id: u32) -> trc::Result<Opti
     // a task; the operator waits for pending ones and destroys failed ones.
     if server.za_has_tasks(account_id).await? {
         return Ok(Some(conflict("account has unfinished tasks")));
+    }
+    // Ruling 66 (the Task 6 review's F1): 1.0's object-metadata containers
+    // (`Collection::Metadata`) of the account, in the clear: a mailbox's,
+    // message's, Sieve script's or calendar's container, a server-level IMAP
+    // annotation, any private container on its objects, one orphaned on a
+    // destroyed document, and its own private containers on other accounts'
+    // objects (address books, cards and files keep DAV's plaintext dead
+    // properties). After R54's term, like the data scans below: a task that
+    // wrote a container and cleared its queue entry between the two scans
+    // would otherwise pass both. The request writers carry the
+    // vault-absence assertion (`za_metadata_fence`), so none commits after
+    // the pending record this check guards.
+    if server.za_has_object_metadata(account_id).await? {
+        return Ok(Some(conflict("account already holds object metadata")));
     }
     // Mail ruling R52: a sample written while the account was plain keeps
     // the message's blob linked and its sender and subject in the registry

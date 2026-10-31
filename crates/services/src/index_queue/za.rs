@@ -15,6 +15,7 @@
 use common::Server;
 use email::message::{
     metadata::{ArchivedMessageMetadata, MetadataRow},
+    thread::ThreadSubject,
     za::{is_stub, is_stub_headers},
 };
 use groupware::calendar::{ArchivedCalendarEventContent, seal::archived_event_is_sealed};
@@ -66,20 +67,65 @@ pub(crate) fn za_is_sealed_event(content: &ArchivedCalendarEventContent) -> bool
     archived_event_is_sealed(content)
 }
 
-/// The un-index path's thread subject (mail spec 5.2): a stub's header
-/// section is its sealed bundle, which names no `Subject`. A stub's
-/// structure has no header entry, so `thread_subject()` resolves it without
-/// reading the header section; this keeps a header section that starts
-/// with the stub's format byte from being read as headers if one reaches
-/// here anyway.
+/// The un-index path's thread subject (mail spec 5.2, rulings R29 and R47):
+/// a key account's stub is recognized by the account's classification and
+/// the stub's format byte together, never by a leading header byte alone,
+/// so every other row takes upstream's `thread_subject_in`, an ordinary row
+/// whose header section starts with that byte included. A stub's header
+/// section is its sealed bundle, which names no `Subject`; its structure
+/// has no header entry, so `thread_subject()` already resolves it without
+/// reading the section, and this answers the same if one reaches here.
 pub(crate) fn za_thread_subject_in<'m>(
+    za_key: bool,
     metadata: &'m ArchivedMessageMetadata,
     headers: &[u8],
 ) -> Cow<'m, str> {
-    if is_stub_headers(headers) {
+    if za_key && is_stub_headers(headers) {
         Cow::Borrowed("")
     } else {
         metadata.thread_subject_in(headers)
+    }
+}
+
+/// The partition's classification for `za_thread_subject_in`, read at most
+/// once per pass. A destroyed
+/// account is not a key account (`za_is_key_account`), so its rows take
+/// upstream's path; a stub of one resolves without its header section.
+#[derive(Default)]
+pub(crate) struct ZaUnindexAccount(Option<bool>);
+
+impl ZaUnindexAccount {
+    /// The classification `za_thread_subject_in` needs for `row`'s
+    /// un-index: read only for a row whose thread subject is in its header
+    /// section, so no other un-index reads the account.
+    pub(crate) async fn for_row(
+        &mut self,
+        server: &Server,
+        account_id: u32,
+        row: Option<&MetadataRow>,
+    ) -> trc::Result<bool> {
+        let in_headers = match row {
+            Some(row) => matches!(
+                row.unarchive()
+                    .caused_by(trc::location!())?
+                    .thread_subject(),
+                ThreadSubject::InHeaders
+            ),
+            None => false,
+        };
+        if !in_headers {
+            return Ok(false);
+        }
+        match self.0 {
+            Some(za_key) => Ok(za_key),
+            None => {
+                let za_key = server
+                    .za_is_key_account(account_id)
+                    .await
+                    .caused_by(trc::location!())?;
+                Ok(*self.0.insert(za_key))
+            }
+        }
     }
 }
 
@@ -154,6 +200,36 @@ mod tests {
             email::message::thread::ThreadSubject::Resolved("")
         );
         let headers = row.raw_headers().unwrap();
-        assert_eq!(za_thread_subject_in(metadata, &headers), "");
+        assert_eq!(za_thread_subject_in(true, metadata, &headers), "");
+    }
+
+    /// Rulings R29 and R47 (the Task 6 review's F4): an ordinary row whose
+    /// header section starts with the stub's format byte keeps upstream's
+    /// thread subject, so its un-index clears the threading key its ingest
+    /// wrote.
+    #[test]
+    fn an_ordinary_row_starting_with_the_format_byte_keeps_its_subject() {
+        let raw = b"\x01X: y\r\nSubject: Real\r\nSubject:\r\n\r\nbody";
+        assert_eq!(raw[0], MAIL_FORMAT_V1);
+        let message = mail_parser::MessageParser::default().parse(raw).unwrap();
+        let bytes = email::message::metadata::MessageMetadata::build(
+            &message,
+            &email::message::metadata::ExtraHeaders::default(),
+            BlobHash::generate(raw),
+        )
+        .encode()
+        .unwrap();
+        let row = MetadataRow::deserialize(&bytes).unwrap();
+        let metadata = row.unarchive().unwrap();
+        assert_eq!(
+            metadata.thread_subject(),
+            email::message::thread::ThreadSubject::InHeaders,
+            "the fixture must reach the header-section arm"
+        );
+        let headers = row.raw_headers().unwrap();
+        assert!(is_stub_headers(&headers));
+        let upstream = metadata.thread_subject_in(&headers).into_owned();
+        assert!(upstream.eq_ignore_ascii_case("real"), "{upstream:?}");
+        assert_eq!(za_thread_subject_in(false, metadata, &headers), upstream);
     }
 }

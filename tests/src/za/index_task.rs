@@ -86,6 +86,9 @@ const MID_PASS: &str = "plainmail30@example.com";
 const MID_PASS_CONTROL: &str = "plainmail31@example.com";
 /// `test_mid_pass_deletion`'s account.
 const MID_PASS_DELETED: &str = "plainmail32@example.com";
+/// `test_mid_pass_deletion`'s probe, created after the destruction: its id
+/// is never the destroyed one (ruling 69).
+const MID_PASS_PROBE: &str = "plainmail36@example.com";
 
 /// Tokens of up to 16 bytes, which a term key holds verbatim
 /// (`CheekyHash`), so their absence from a key account's index and their
@@ -100,6 +103,13 @@ const ATTACH_TOKEN: &str = "zzattachcanary";
 /// an extractable attachment (`has_extractable_attachments`) and the builder
 /// takes its blocking extraction path.
 fn attachment_message(n: u32) -> String {
+    padded_attachment_message(n, 0)
+}
+
+/// `attachment_message` with `padding` lines of `X-Za-Padding` (80 bytes
+/// each, well under SMTP's line limit), so messages differ in size.
+fn padded_attachment_message(n: u32, padding: usize) -> String {
+    let padding = format!("X-Za-Padding: {}\r\n", "p".repeat(64)).repeat(padding);
     format!(
         "From: Sender <sender@example.org>\r\n\
          To: <recipient@example.com>\r\n\
@@ -107,6 +117,7 @@ fn attachment_message(n: u32) -> String {
          Message-ID: <za-index-{n}.{:016x}@example.org>\r\n\
          Date: Tue, 20 Oct 2026 10:00:00 +0000\r\n\
          X-Za-Note: {HEADER_TOKEN}\r\n\
+         {padding}\
          MIME-Version: 1.0\r\n\
          Content-Type: multipart/mixed; boundary=\"za-index\"\r\n\
          \r\n\
@@ -385,7 +396,21 @@ pub async fn test_reindex(test: &mut TestServer) {
         .create_user_account(REINDEX_PLAIN, STRONG, "Reindex", &[], user_permissions())
         .await;
     let (key_id, plain_id) = (key.id().document_id(), plain.id().document_id());
-    deliver_attachment_messages(test, &[REINDEX_KEY, REINDEX_PLAIN], 2).await;
+    // The review's F7: the first message is the larger and arrives a second
+    // before the second, so the two sorts below answer opposite orders, and
+    // neither is the order of the ids.
+    for (n, padding) in [(0, 64), (1, 0)] {
+        SmtpConnection::connect()
+            .await
+            .ingest(
+                "sender@example.org",
+                &[REINDEX_KEY, REINDEX_PLAIN],
+                &padded_attachment_message(n, padding),
+            )
+            .await;
+        wait_for_delivery(test).await;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+    }
     assert_visible_fields_only(test, key_id, "delivered").await;
     assert_indexes_tokens(test, plain_id, "delivered").await;
 
@@ -410,7 +435,9 @@ pub async fn test_reindex(test: &mut TestServer) {
     assert_indexes_tokens(test, plain_id, "reindexed").await;
 
     // The visible fields still answer: the arrival time and the size sort
-    // the key account's messages.
+    // the key account's messages, from the message cache. Each order is
+    // checked against the values `Email/get` reports, and the two differ.
+    let mut orders = Vec::new();
     for sort in ["receivedAt", "size"] {
         let reply = key
             .jmap_method_call(
@@ -421,13 +448,51 @@ pub async fn test_reindex(test: &mut TestServer) {
                 }),
             )
             .await;
+        let ids = reply.ids().map(str::to_string).collect::<Vec<_>>();
         assert_eq!(
-            reply.ids().count(),
+            ids.len(),
             2,
             "sorting by {sort} after the reindex: {:?}",
             reply.0
         );
+        let reply = key
+            .jmap_method_call(
+                "Email/get",
+                json!({
+                    "accountId": key.id_string(),
+                    "ids": &ids,
+                    "properties": ["id", sort]
+                }),
+            )
+            .await;
+        let list = reply
+            .pointer("/methodResponses/0/1/list")
+            .and_then(|list| list.as_array())
+            .unwrap_or_else(|| panic!("Email/get: {:?}", reply.0))
+            .clone();
+        let values = ids
+            .iter()
+            .map(|id| {
+                list.iter()
+                    .find(|email| email["id"] == id.as_str())
+                    .map(|email| email[sort].clone())
+                    .unwrap_or_else(|| panic!("{id} in Email/get: {:?}", reply.0))
+            })
+            .collect::<Vec<_>>();
+        let ascending = match sort {
+            "size" => values[0].as_u64() < values[1].as_u64(),
+            _ => values[0].as_str() < values[1].as_str(),
+        };
+        assert!(
+            ascending,
+            "sorting by {sort} after the reindex is not ascending: {values:?}"
+        );
+        orders.push(ids);
     }
+    assert_ne!(
+        orders[0], orders[1],
+        "the arrival-time and size orders must differ for these messages"
+    );
 
     for account in [&key, &plain] {
         test.destroy_all_mailboxes(account).await;
@@ -939,25 +1004,31 @@ pub async fn test_mid_pass_provisioning(test: &mut TestServer) {
     test.wait_for_tasks().await;
 }
 
-/// The plan's mid-pass deletion assertion: an ordinary account destroyed
-/// while its index pass is parked between two commit chunks leaves no
-/// orphan index under its id, and its partition does not retry forever.
+/// The plan's mid-pass deletion case, flipped by ruling 69: an ordinary
+/// account destroyed while its index pass is parked between two commit
+/// chunks leaves an orphan under its id, and the orphan is inert.
 ///
-/// Part 6a recorded this as a residual it expects to reproduce: account
-/// destruction runs `unindex_account` and `clear_search_index_queue`
-/// outside the partition lock (`destroy_account.rs`), so the parked pass's
-/// chunk 1 (its second `Document` key) commits after the range delete, and
-/// the destroyed account holds no vault record, so the assertion passes. If
-/// that holds at runtime this case fails, as the plan requires ("must fail,
-/// not be skipped"); it runs last in the za suite so its failure loses no
-/// other module. Task 7 then rules on the fix or the residual.
+/// Account destruction runs `unindex_account` and
+/// `clear_search_index_queue` outside the partition lock
+/// (`destroy_account.rs`), so the parked pass's chunk 1 (its second
+/// `Document` key, whose value lists the document's terms; a term of up to
+/// 16 bytes is stored verbatim) commits after the range delete: the
+/// destroyed account holds no vault record, so R58's assertion passes.
+/// Ruling 69 accepts this residual as retention, not access: 1.0 never
+/// reuses an account id (`Account` is `OBJ_SEQ_ID`, its ids come from
+/// `RegistryClass::IdCounter` through `add_and_get` and only grow), so no
+/// later account reads the orphan, and its partition does not retry. The
+/// case asserts the orphan, its inertness (no account holds the id, and an
+/// account created afterwards gets another one), and then removes the
+/// orphan so the suite's final emptiness check holds; in production it
+/// stays until the index is rebuilt.
 pub async fn test_mid_pass_deletion(test: &mut TestServer) {
     println!("Running zero-access mid-pass deletion test...");
     test.wait_for_tasks().await;
     let admin = test.account("admin@example.com").clone();
     let account = passwordless(&admin, MID_PASS_DELETED).await;
     let id = account.id().document_id();
-    two_messages_held(test, MID_PASS_DELETED, id).await;
+    let messages = two_messages_held(test, MID_PASS_DELETED, id).await;
     let split = ForceCommitSplit::new(id);
     let parked = park_between_chunks(test, id).await;
     admin.destroy_account(account).await;
@@ -974,15 +1045,38 @@ pub async fn test_mid_pass_deletion(test: &mut TestServer) {
     parked.finish().await;
     drop(split);
     wait_for_index_queue(test, id, Duration::from_secs(10)).await;
+
+    // The residual: the resumed chunk 1 landed under the destroyed id.
     let keys = search_keys(test, id, SearchIndex::Email).await;
+    let orphans = keys.document_ids();
     assert!(
-        keys.is_empty(),
-        "the destroyed account's resumed pass left an orphan index: {keys:?}"
+        !orphans.is_empty()
+            && orphans
+                .iter()
+                .all(|document_id| messages.contains(document_id)),
+        "ruling 69 expects the resumed pass's later document as an orphan under the \
+         destroyed id: {keys:?}"
     );
+    // Inert: no account holds the id, the partition is not retrying, and
+    // an account created afterwards is given a new id.
+    assert!(test.server.try_account(id).await.unwrap().is_none());
     assert!(
-        !internal_terms(test, id).await,
-        "the destroyed account's resumed pass left orphan terms"
+        queue_entries(test, id).await.is_empty(),
+        "the destroyed account's partition still holds entries"
     );
+    let probe = passwordless(&admin, MID_PASS_PROBE).await;
+    assert!(
+        probe.id().document_id() > id,
+        "account id {id} was handed out again ({})",
+        probe.id().document_id()
+    );
+    admin.destroy_account(probe).await;
+
+    // The fixture's cleanup: the orphan would fail the suite's final
+    // emptiness check.
+    unindex_search_account(test, SearchIndex::Email, id).await;
+    assert!(search_keys(test, id, SearchIndex::Email).await.is_empty());
+    assert!(!internal_terms(test, id).await);
     test.wait_for_tasks().await;
 }
 

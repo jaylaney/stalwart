@@ -66,6 +66,8 @@ impl MetadataUpdate {
             }
             None => None,
         };
+        let viewer_id = target.viewer_id;
+        let owner_id = target.owner.id;
         let private = match self.private {
             Some(change) => match target.private_write(server, change).await? {
                 Ok(write) => Some(write),
@@ -73,7 +75,13 @@ impl MetadataUpdate {
             },
             None => None,
         };
-        Ok(Ok(PreparedMetadata { shared, private }))
+        // Ruling 66: both accounts were read as ordinary above.
+        let za_fence = server.za_metadata_fence(owner_id, private.is_some().then_some(viewer_id));
+        Ok(Ok(PreparedMetadata {
+            shared,
+            private,
+            za_fence,
+        }))
     }
 
     pub(super) async fn prepare_ingest<P: MetadataProperty>(

@@ -267,6 +267,13 @@ async fn destroy_account(server: &Server, task: &TaskDestroyAccount) -> trc::Res
         )
         .await?;
     server.inner.cache.swap.forget(account_id);
+    // Zero-access fork (the Task 6 review's F10): the writer handles
+    // `Forget` in turn, after a write already encoding, and `forget` drops
+    // the signal when the channel is full. The flush is queued behind it and
+    // writes whatever is still pending, so after its acknowledgement no write
+    // of this account is in flight on this node and the removal below is
+    // the last word.
+    server.inner.cache.swap.flush().await;
 
     // Remove persisted cache snapshots
     server.inner.cache.swap.remove_account(account_id).await;

@@ -997,6 +997,10 @@ async fn rf_2_stale_grant(
         .await
         .assert_contains(&shared_name);
     imap.send_ok(&format!("SELECT \"{shared_name}\"")).await;
+    // Control for the metadata case below: the share's annotations, read
+    // while the account is plain.
+    imap.send_ok(&format!("GETMETADATA \"{shared_name}\" /shared/comment"))
+        .await;
     let mailbox_get = json!({ "accountId": stale.id_string(), "ids": null });
     assert_eq!(
         first(
@@ -1054,6 +1058,22 @@ async fn rf_2_stale_grant(
     ] {
         assert_imap_refused(&mut imap, command).await;
     }
+    // Ruling 66 (the Task 6 review's F6): the ordinary session's metadata
+    // commands on the key account's mailbox are refused, by
+    // `metadata_mailbox`'s check or, once the session's mailboxes are
+    // resynchronized without the share, as a mailbox not found; nothing is
+    // stored either way.
+    for command in [
+        format!("GETMETADATA \"{shared_name}\" /shared/comment"),
+        format!("SETMETADATA \"{shared_name}\" (/shared/comment \"stale-canary\")"),
+    ] {
+        imap.send(&command).await;
+        imap.assert_read(Type::Tagged, ResponseType::No).await;
+    }
+    assert!(
+        !test.server.za_has_object_metadata(stale_id).await.unwrap(),
+        "the stale grantee stored object metadata on the key account's mailbox"
+    );
     for (method, args) in [
         ("Mailbox/get", mailbox_get.clone()),
         (

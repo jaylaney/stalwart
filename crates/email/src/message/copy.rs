@@ -287,6 +287,14 @@ impl EmailCopy for Server {
 
         let mut private_commit = PrivateMetadataCommit::default();
         if let Some(containers) = containers {
+            // Ruling 66: a private container's viewer was read as ordinary
+            // too; the destination's assertion is the fence above.
+            if let Some(fence) = self.za_metadata_fence(
+                to_account_id,
+                containers.private.as_ref().map(|write| write.viewer_id),
+            ) {
+                fence.apply(&mut batch);
+            }
             containers
                 .build(
                     &mut batch,

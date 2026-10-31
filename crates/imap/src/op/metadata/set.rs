@@ -158,6 +158,10 @@ impl<T: SessionStream> SessionData<T> {
         }
 
         let mut batch = BatchBuilder::new();
+        // Ruling 66: the account was read as ordinary (`za_assert_metadata_allowed`).
+        if let Some(fence) = self.server.za_metadata_fence(account_id, None) {
+            fence.apply(&mut batch);
+        }
         change
             .into_write(&account, Collection::Principal, MetadataLog::None)
             .build(SERVER_DOCUMENT_ID.into(), &mut batch)
@@ -273,6 +277,10 @@ impl<T: SessionStream> SessionData<T> {
             {
                 return Err(over_quota(tag));
             }
+            // Ruling 66: the owner was read as ordinary (`metadata_mailbox`).
+            if let Some(fence) = self.server.za_metadata_fence(mailbox.account_id, None) {
+                fence.apply(&mut batch);
+            }
             presence = Some(
                 change
                     .into_write(&owner, Collection::Mailbox, MetadataLog::Container)
@@ -293,6 +301,13 @@ impl<T: SessionStream> SessionData<T> {
                 .imap_ctx(tag, trc::location!())?
             {
                 return Err(over_quota(tag));
+            }
+            // Ruling 66: the owner and the viewer were read as ordinary.
+            if let Some(fence) = self
+                .server
+                .za_metadata_fence(mailbox.account_id, Some(viewer.account_id()))
+            {
+                fence.apply(&mut batch);
             }
             change
                 .into_private_write(
