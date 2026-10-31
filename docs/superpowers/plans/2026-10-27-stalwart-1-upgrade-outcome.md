@@ -5720,6 +5720,199 @@ reaches the store only through the sites above.
   session object. At 1.0 it gains v1.0.1's new capabilities, minus `metadata` at both levels
   for a key account.
 
+### Part 6c: cache snapshots
+
+Part 6c traced every input of 1.0.1's cache swap tier and wrote `cache_swap_tests`
+(`tests/src/za/cache_swap.rs`). It adds **no production code**: upstream builds every
+snapshot from stored rows only, and every restore is revalidated before it is served. This
+confirms the interface sheet's frozen point 7 ("Snapshots need no fork code"). No test hook
+was added. Lines are the worktree's.
+
+#### What the tier can persist
+
+The tier persists exactly two kinds of entry. `Snapshot` has two variants,
+`Messages(Arc<MessageStoreCache>)` and `Resources(Arc<GroupwareResources>)`
+(`common/src/cache/swap/writer.rs:92`), and `SwapCached` is implemented for those two types
+only (`swap/evict.rs:20`, `:26`). The only caller of `SwapTier::store` in production code is
+the writer's `write` (`writer.rs:471`), which stores `Snapshot::encode` (`:119`). Only the
+five caches built with `swap.eviction(..)` (`config/inner.rs:148-180`) and the two large tiers
+(`cache/large.rs`) feed it. Every other cache uses `DefaultLifecycle` and stays in memory.
+
+| Cache | Swappable | Fed by | What an entry holds | A key account's entry | Fence on restore |
+|---|---|---|---|---|---|
+| `messages`, `messages_large` | yes, `MessagesCache` only (`swap/messages.rs:64`) | `email/src/cache/mod.rs`: `full_cache_build`, `revalidate_messages`, `apply_keyword_writes`; all through `publish_messages` or `publish_loaded_messages` | per message: document id, change id, arrival time, sent time, size, keyword bits, thread id, mailbox UIDs; custom keyword names | read from the stored `MessageData` (`message_datas`). A key account's `sent_at` is never stored (`email/src/message/ingest.rs:377`), and a copy into or out of a key account is refused (`copy.rs:103`). `apply_keyword_writes` patches only the keyword bits just committed. Nothing comes from a stub's sealed blob. | Restored with `verification: Default` (`email/src/cache/mod.rs:616`), which is never fresh (`cache/mod.rs:94`). So `revalidate_messages` (`:203`) applies the change log from the snapshot's change id, or rebuilds if the log was truncated. Mailboxes are rebuilt from the store on every restore (`:599`). |
+| `events`, `contacts`, `files`, `scheduling`, `resources_large` | yes, `GroupwareResources` (`swap/resources.rs:441`) | `groupware/src/cache/mod.rs`: `build_full_cache`, `process_changes`, `fetch_container`; every record comes from a stored archive (`push_from_archive`) | calendar: slug, ACLs, `(account, time zone, flags)` per preference, metadata kinds, ETag. Event: DAV names, UID, start, duration, created and modified times, flags, ETag. Inbox item: names, event id, `changed_by`, principals, flags. Contact card: names, UID, times. File: name, size, parent, ACLs, flags. Plus the base path and the path index. | the stored metadata row, which upstream derives from the sealed tree (`refresh_from_content`, sheet item 4). The display name, the calendar's preference names (where the owner's ring lives) and any content are never cached. Contacts and files are cached as their store holds them: plaintext for every account (part 6a's open question). | Restored with `verification: Default` (`swap/resources.rs:778`), and a stale base path is discarded (`groupware/src/cache/mod.rs:844`). `fetch_groupware_resources_at` (`:158`) then applies the change log before it returns: `is_fresh` fails (`:177`). ACL changes are logged: `ObjectIndexBuilder::build` logs a container update for every archive update (`common/src/storage/index/mod.rs:191`), and the fork's grant mutations write the calendar through `Calendar::update` (`sharing/mutations.rs:433`). |
+| `access_tokens` (`SpillCache`) | no | `Server::access_token` | `AccessTokenInner` | in memory only | `account_epoch` |
+| `http_auth` | no | `http/src/auth/authenticate.rs` | token hash, then account, token, expiry | in memory only. Served only with resident keys of the current generation (part 3b). | revocation epoch, generation fence |
+| `za_keys` (`vault::cache::KeyCache`) | no | logins | `Arc<SessionKeys>` | in memory only | `remove_account` on Account and AccessToken invalidation |
+| `accounts` | no | `Server::account` | `AccountCache` with `za_generation` in `AccountStorage` | in memory only | `account_epoch` |
+| refresh slots (`RefreshSlots`) | handoff only | `notify_refresh_*`, `SwapEviction` | an `Arc` to one of the two swappable entries until it is written | as the entries above | not read back |
+| `metadata_viewers`, `grant_revocations`, address, domain, role, list, DKIM, DNS and spam caches | no | various | no key-account content | in memory only | n/a |
+
+`SessionKeys` cannot reach a snapshot. Neither swappable type has a field that holds an
+`AccessToken`, a `SessionKeys` value or a `Secret`, and the writer reads only those two caches
+(`writer.rs`, `peek` and `take_snapshot`). The caches that do hold keys or authority (the
+access-token, HTTP and key caches and the account cache) are never swapped. So
+`account_epoch` and `za_generation` have nothing to fence on load: a snapshot carries no
+authority. Access comes from the token's ACL list and the cache's ACLs. The token is
+rebuilt in memory; the ACLs are revalidated against the change log before any request sees
+them.
+
+#### Invalidation and removal
+
+- `CacheInvalidation::GroupwareResources` drops the resident entries and deletes the
+  account's four resource snapshots (`invalidate.rs:583-590`).
+- `CacheInvalidation::MessageCache` drops the resident entry and the writer's pending state
+  (`forget`), but it leaves the persisted message snapshot in place (`:591-594`). The next
+  restore revalidates it.
+- Account destruction forgets the account and removes all five snapshots
+  (`services/src/task_manager/tasks/destroy_account.rs:261-272`).
+- A grant or revoke invalidates the grantees' access tokens only. The owner's resource
+  snapshot is corrected by revalidation on the next load.
+
+#### Guards
+
+None. Every entry that can be swapped is a projection of stored rows. So a key account's
+snapshot holds only what its stored rows hold in the clear, and the leak scanner already
+rules on those rows. The serialization and restore paths are backend-independent:
+`Snapshot::encode` and `from_snapshot` sit above `SwapBackend`, so the proof covers Redis too.
+Redis itself is not run.
+
+#### Premise corrections
+
+- **The blob-store tier cannot use the filesystem blob store.** `BlobStore::build_cache_swap`
+  refuses `BlobSwapStore::FileSystem`. It also refuses `BlobSwapStore::Default` when the
+  configured blob store is the filesystem one (`store/src/build/swap.rs:10`, `:25`, `:52`):
+  that store skips writes whose length has not changed. With `BLOB_STORE=FileSystem` the
+  boot records a build error, and the harness's `assert_no_errors` panics. So the suite's
+  `BlobStore` server uses the default blob store, which is the data store when `BLOB_STORE`
+  is unset. The suite refuses `BLOB_STORE=FileSystem` with a message. The brief and the design
+  ("`BlobStore` on a filesystem blob store") need this correction. The CI step must not set
+  the variable.
+- **Framing is not a privacy control.** The frame's xxh3 checksum
+  (`swap/frame.rs`) is framing only. Snapshots are stored uncompressed: the file tier writes
+  the frame as is, and the blob tier stores it with `CompressionAlgo::None`. The suite scans
+  both the stored bytes and the decoded frames.
+
+#### Observations (no fork action)
+
+- **The writer does not rewrite a snapshot it believes current.** `write_if_changed` skips a
+  target whose `persisted_change_id` equals the cache's change id (`writer.rs`). So a file
+  replaced behind the writer stays until the account's next change. That is harmless,
+  because every restore revalidates. The suite's late-writer rounds depend on that
+  revalidation, not on the rewrite.
+- **Ordinary-era metadata can outlive its messages.** An ordinary account's message
+  snapshot can still hold the ids, times, sizes, keyword bits and custom keyword names of
+  messages that were deleted before the account was provisioned, until its next write. It
+  holds no content, and provisioning still requires the account to hold no mail.
+
+#### The suite
+
+`za::cache_swap::cache_swap_tests` is its own `#[tokio::test(flavor = "multi_thread")]`
+function, outside `za_tests`. For each tier it boots one `TestServer` through Task 2's
+`with_cache_swap`. The tiers are `LocalFile` under `<temp>/cache_swap_file/swap`, then
+`BlobStore { store: Default }`. Each server uses ruling 20's settings: `min_account_size: 0`,
+`flush_changes: 1` and `flush_interval: 0`. The suite asserts that the tier is enabled and
+uses that cadence. Every flush goes through `SwapTier::flush()`, and the first case asserts
+that `snapshots_written()` grew. Each tier then runs both cases. After that, the suite stops
+the writer, shuts the server down and waits until the listener ports refuse connections.
+
+Each restore is checked by the `CacheEvent::SwapHit` event for that account and collection
+(`za::mail::Traced`), so no case passes on a rebuild from the store. Every scan reads:
+
+- the stored bytes without the server: every file under the tier's directory, or each part's
+  pointer and both slots in the blob store;
+- the frames decoded from those bytes by the shared codecs alone
+  (`MessagesCache::from_snapshot`, `GroupwareResources::from_snapshot`): their `Debug` form,
+  plus the string arenas of the resource chunks and the path index.
+
+The scans assert that at least one frame of each kind decoded. The needles are:
+
+- ten protected text canaries: `X-WR-CALNAME`, `SUMMARY`, `DESCRIPTION`, `LOCATION`,
+  `COMMENT`, an `X-` property, the calendar display name, and the mail subject, sender name
+  and body;
+- each account's password and its Basic credential;
+- each key account's `mk`, `ewk` and `mwk`, unlocked as a login does (`za_unlock`), each raw
+  and in standard base64 (padded and unpadded), URL-safe base64 and hex;
+- the vault marker `$za$`, which the owner's ring name carries.
+
+**`swap_roundtrip_contains_no_protected_canary`** (accounts `swap-key`, `swap-plain` and
+`swap-pending`):
+
+- *Provisioning race.* `swap-pending` is created with no password. Its calendar cache is
+  built while the account is ordinary (the default calendar), and the snapshot is flushed and
+  kept. `setup-token` is parked at `SETUP_TOKEN_PAUSE`, after its first emptiness check.
+  Meanwhile the account's calendar is evicted and restored from that snapshot (`SwapHit`).
+  Then the token and setup complete.
+- *Round trip.* Each account receives a PUT of `swap-visible-res.ics` with every event
+  canary, and LMTP delivers one message with the mail canaries. Each account's caches are
+  then built and flushed. The scan finds no needle in any stored or decoded snapshot. The
+  positive control: each account's calendar snapshot holds the resource name, both raw and
+  decoded, and resolves `default/swap-visible-res.ics`; each message snapshot decodes to one
+  message. The ordinary account is the differential: upstream's caches carry no content for
+  any account.
+- *Eviction and fresh load.* After `remove_resources` and `remove_messages`, the key
+  account's GET restores the calendar (`SwapHit`) and serves the sealed event's summary with
+  the owner's keys. The message cache restores with one message.
+- *Stale snapshots.* For `swap-key`, the snapshot taken before a later event and message is
+  stored again after them. For `swap-pending`, the ordinary-era calendar snapshot is stored
+  again. In both cases a late writer is modelled. The fresh load restores it and serves both
+  events and both messages. A final scan finds no needle.
+
+**`swap_restore_after_revoke_cannot_restore_access`** (`swap-owner`, `swap-reader` and
+`swap-never`, all key accounts):
+
+- *Setup.* The owner makes calendar `swapshare` (its display name is a canary) and PUTs an
+  event. `swap-never`'s GET is the oracle for refusal. The owner pins the reader and grants
+  `view`, and the reader reads the event. The owner's snapshot is flushed and kept, and it
+  is asserted to hold the reader's grant.
+- *Restore racing the revoke.* `shares/revoke` is parked at `SHARE_COMMIT_PAUSE`. Meanwhile
+  the owner's calendars are evicted and restored (`SwapHit`). The restored cache holds the
+  grant, and the reader still reads the event. Then the revoke commits, and the reader gets
+  the oracle's answer. The snapshot written after a revalidation holds no grant.
+- *Late writer, two rounds.* In each round the pre-revoke snapshot is stored again, the
+  owner's and the reader's resource caches are evicted, and the owner's calendars are
+  restored (`SwapHit`). The restored cache holds no grant, and the reader gets the oracle's
+  answer. The stale snapshot is stored again, the owner's cache evicted, and the reader's
+  request is refused again. The owner still reads the event. A final scan finds no needle.
+
+**Runtime assumptions:**
+
+- The suite runs alone: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests
+  cache_swap_tests -- --nocapture`. Its two servers bind the default listener ports one after
+  the other, and those ports are `SO_REUSEPORT`.
+- `BLOB_STORE` is unset, or names a store other than the filesystem one.
+- The default calendar created by the ordinary account's first cache build does not count as
+  calendar data for `setup-token`. It has no shared metadata container (part 3b's check).
+- A grantee's GET while the revoke is parked is not blocked by the parked mutation. The
+  harness's DAV client times out after 500 ms.
+- `HookParked`, `za_post`, `za_post_as`, `za_setup`, `za_unlock`, `pinning::pin`,
+  `mail::{Traced, deliver}` and `TestServerBuilder::with_cache_swap` behave as their 1.0
+  ports in Tasks 2 to 5 describe. The suite was checked against them by reading only, and
+  formatted with rustfmt. It compiles first at Task 7.
+- The suite calls neither `assert_is_empty` nor any cleanup. Each tier's store is discarded
+  with the suite's temporary directory. The blob tier leaves temporary `BlobLink` keys,
+  which expire after the retention period.
+
+#### Deferred, by owner
+
+**Task 7**
+- The suite's first compile and run, on both tiers.
+
+**Task 8**
+- A CI step for `cache_swap_tests`, without `BLOB_STORE=FileSystem`.
+
+**Not part 6c's dispatch**
+- The other tests parts 6a and 6b assigned to "6c" are still open:
+  - the partition-retry test;
+  - R58 per chunk through HTTP;
+  - the destroyed-stub un-index test;
+  - the reindex and attachment-indexer tests;
+  - the mid-pass provisioning and deletion tests;
+  - the `fence.rs` `INDEX_GUARD_FAIL_ONCE` cases;
+  - the `SearchDocument` leak rule;
+  - the object-metadata and IMAP METADATA tests.
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
