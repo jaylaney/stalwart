@@ -99,12 +99,8 @@ use trc::AddContext;
 use types::{
     acl::Acl,
     blob::BlobId,
-<<<<<<< HEAD
     collection::{Collection, SyncCollection},
-=======
-    collection::{Collection, SyncCollection, VanishedCollection},
     field::CalendarEventField,
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
     id::Id,
     metadata::MetadataKinds,
 };
@@ -1058,14 +1054,10 @@ impl CalendarEventSet for Server {
                     self,
                     access_token,
                     &account_info,
-<<<<<<< HEAD
-                    new_calendar_event.data.event_range_end(),
+                    new_content.data.event_range_end(),
                     // The JMAP target is never a key account (za_assert_calendar_allowed): the
                     // owner is plain and upstream's Send applies, as on DAV (spec 5.1).
                     false,
-=======
-                    new_content.data.event_range_end(),
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                 )
             } else {
                 ItipSendStatus::NotRequested
@@ -1529,14 +1521,10 @@ impl CalendarEventSet for Server {
                     self,
                     access_token,
                     &account_info,
-<<<<<<< HEAD
-                    calendar_event.inner.data.event_range_end(),
+                    calendar_event.inner.event_range_end(),
                     // The JMAP target is never a key account (za_assert_calendar_allowed): the
                     // owner is plain and upstream's Send applies, as on DAV (spec 5.1).
                     false,
-=======
-                    calendar_event.inner.event_range_end(),
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                 )
             } else {
                 ItipSendStatus::NotRequested
@@ -1892,14 +1880,10 @@ impl CalendarEventSet for Server {
                 self,
                 access_token,
                 account_info,
-<<<<<<< HEAD
-                event.data.event_range_end(),
+                content.data.event_range_end(),
                 // The JMAP target is never a key account (za_assert_calendar_allowed): the
                 // owner is plain and upstream's Send applies, as on DAV (spec 5.1).
                 false,
-=======
-                content.data.event_range_end(),
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
             )
         } else {
             ItipSendStatus::NotRequested

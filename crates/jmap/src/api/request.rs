@@ -45,13 +45,9 @@ use crate::{
     thread::get::ThreadGet,
     vacation::{get::VacationResponseGet, set::VacationResponseSet},
 };
-<<<<<<< HEAD
-use common::{Server, auth::AccessToken};
-use email::message::za::view::ZaMailView;
-=======
 use common::{Server, auth::AccessToken, network::memory::MemoryReservation};
 use compact_str::format_compact;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+use email::message::za::view::ZaMailView;
 use http_proto::HttpSessionData;
 use jmap_proto::{
     request::{
@@ -405,12 +401,8 @@ impl RequestHandler for Server {
                 }
                 GetRequestMethod::CalendarEventNotification(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
-<<<<<<< HEAD
-                    access_token.assert_is_member(req.account_id)?;
-                    za_assert_calendar_allowed(self, req.account_id).await?;
-=======
                     access_token.assert_has_access(req.account_id, Collection::CalendarEvent)?;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+                    za_assert_calendar_allowed(self, req.account_id).await?;
 
                     self.calendar_event_notification_get(*req, access_token)
                         .await?
@@ -418,12 +410,8 @@ impl RequestHandler for Server {
                 }
                 GetRequestMethod::ParticipantIdentity(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
-<<<<<<< HEAD
-                    access_token.assert_is_member(req.account_id)?;
-                    za_assert_calendar_allowed(self, req.account_id).await?;
-=======
                     access_token.assert_has_access(req.account_id, Collection::CalendarEvent)?;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+                    za_assert_calendar_allowed(self, req.account_id).await?;
 
                     self.participant_identity_get(*req, access_token)
                         .await?
@@ -529,12 +517,8 @@ impl RequestHandler for Server {
                 }
                 QueryRequestMethod::CalendarEventNotification(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
-<<<<<<< HEAD
-                    access_token.assert_is_member(req.account_id)?;
-                    za_assert_calendar_allowed(self, req.account_id).await?;
-=======
                     access_token.assert_has_access(req.account_id, Collection::CalendarEvent)?;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+                    za_assert_calendar_allowed(self, req.account_id).await?;
 
                     self.calendar_event_notification_query(*req, access_token)
                         .await?
@@ -657,12 +641,8 @@ impl RequestHandler for Server {
                 }
                 SetRequestMethod::CalendarEventNotification(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
-<<<<<<< HEAD
-                    access_token.assert_is_member(req.account_id)?;
-                    za_assert_calendar_allowed(self, req.account_id).await?;
-=======
                     access_token.assert_has_access(req.account_id, Collection::CalendarEvent)?;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+                    za_assert_calendar_allowed(self, req.account_id).await?;
 
                     self.calendar_event_notification_set(*req, access_token, session)
                         .await?
@@ -670,12 +650,8 @@ impl RequestHandler for Server {
                 }
                 SetRequestMethod::ParticipantIdentity(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
-<<<<<<< HEAD
-                    access_token.assert_is_member(req.account_id)?;
-                    za_assert_calendar_allowed(self, req.account_id).await?;
-=======
                     access_token.assert_has_access(req.account_id, Collection::CalendarEvent)?;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+                    za_assert_calendar_allowed(self, req.account_id).await?;
 
                     self.participant_identity_set(*req, access_token)
                         .await?
@@ -713,13 +689,9 @@ impl RequestHandler for Server {
 
                     access_token
                         .assert_has_access(req.account_id, Collection::Email)?
-<<<<<<< HEAD
-                        .assert_has_access(req.from_account_id, Collection::Email)?;
+                        .assert_has_source_access(req.from_account_id, Collection::Email)?;
                     za_assert_mail_keys(self, access_token, req.account_id).await?;
                     za_assert_mail_keys(self, access_token, req.from_account_id).await?;
-=======
-                        .assert_has_source_access(req.from_account_id, Collection::Email)?;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
                     self.email_copy(*req, access_token, next_call, session, using)
                         .await?
@@ -733,13 +705,10 @@ impl RequestHandler for Server {
                         access_token,
                     )?;
                     access_token.assert_is_member(req.account_id)?;
-<<<<<<< HEAD
-                    za_assert_mail_keys(self, access_token, req.account_id).await?;
-=======
                     if !access_token.has_account_access(req.from_account_id.document_id()) {
                         return Err(trc::JmapEvent::FromAccountNotFound.into_err());
                     }
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+                    za_assert_mail_keys(self, access_token, req.account_id).await?;
 
                     self.blob_copy(*req, access_token).await?.into()
                 }
@@ -769,13 +738,9 @@ impl RequestHandler for Server {
 
                     access_token
                         .assert_has_access(req.account_id, Collection::CalendarEvent)?
-<<<<<<< HEAD
-                        .assert_has_access(req.from_account_id, Collection::CalendarEvent)?;
+                        .assert_has_source_access(req.from_account_id, Collection::CalendarEvent)?;
                     za_assert_calendar_allowed(self, req.account_id).await?;
                     za_assert_calendar_allowed(self, req.from_account_id).await?;
-=======
-                        .assert_has_source_access(req.from_account_id, Collection::CalendarEvent)?;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
                     self.calendar_event_copy(*req, access_token, next_call, session, using)
                         .await?
@@ -876,7 +841,6 @@ impl RequestHandler for Server {
     }
 }
 
-<<<<<<< HEAD
 /// Spec 9: JMAP calendar methods are not offered for key accounts in this
 /// release. An unknown account is not a key account: upstream's outcome stands.
 pub(crate) async fn za_assert_calendar_allowed(server: &Server, account_id: Id) -> trc::Result<()> {
@@ -944,7 +908,8 @@ async fn za_method_error_for_trace(
     } else {
         error
     }
-=======
+}
+
 pub(crate) fn resolve_from_account_id(
     account_id: &mut Id,
     obj: MethodObject,
@@ -957,7 +922,6 @@ pub(crate) fn resolve_from_account_id(
             err
         }
     })
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 }
 
 pub(crate) fn resolve_account_id(
