@@ -9,7 +9,7 @@
 
 use super::{
     STRONG,
-    dav_seal::{CANARIES, EVENT, mkcalendar_body, raw_event},
+    dav_seal::{CANARIES, EVENT, mkcalendar_body, raw_event, raw_event_records},
     fanout::{NO_REPLY, uid_copies},
     mail::{Traced, key_mail_account, message_ids, stored_metadata},
     pinning::{ALICE, drop_entries, forget, parties, refuse_once_at},
@@ -1948,9 +1948,11 @@ pub async fn test(test: &mut TestServer) {
     // The organizer's stored event passes the structural check (`scan`
     // checks only key2's records) and ends with its pair bundle, then its
     // key envelope.
-    let (organizer_event, _) = raw_event(test, key1_id, "default/fo-leak.ics").await;
+    // Both of 1.0's records, as one `ZaEvent` (row and content); the
+    // scanner's `check_event` takes the pair at 1.0 (Task 6).
+    let (organizer_event, _) = raw_event_records(test, key1_id, "default/fo-leak.ics").await;
     let mut organizer_violations = Vec::new();
-    let organizer = organizer_event.deserialize::<CalendarEvent>().unwrap();
+    let organizer = organizer_event.za_event();
     check_event(&organizer, "key1 fo-leak.ics", &mut organizer_violations);
     assert!(
         organizer_violations.is_empty(),
@@ -2132,8 +2134,11 @@ pub async fn test(test: &mut TestServer) {
     assert!(result.item_extras >= 2, "{result:?}");
     // The paired event's stored root ends with its pair bundle, then its key
     // envelope: the scan above checked an event that carries pairs.
+    // `raw_event` returns the content record, which holds the tree at 1.0.
     let (paired, _) = raw_event(test, id, "leak/pairs.ics").await;
-    let paired = paired.deserialize::<CalendarEvent>().unwrap();
+    let paired = paired
+        .deserialize::<groupware::calendar::CalendarEventContent>()
+        .unwrap();
     assert!(
         ends_extra_then_key(&paired.data.event),
         "the paired event's root does not end {EXTRA_PROP} then {KEY_PROP}"

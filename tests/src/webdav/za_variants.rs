@@ -521,13 +521,14 @@ pub async fn scheduling(test: &TestServer) {
             && !copy_body.contains("METHOD:"),
         "{copy_body}"
     );
-    let (copy_archive, _) = crate::za::dav_seal::raw_event(
+    // At 1.0 the copy is a row and a content record; the scan covers both.
+    let (copy_records, _) = crate::za::dav_seal::raw_event_records(
         test,
         jane.account_id,
         &format!("default/{}", copy.rsplit('/').next().unwrap()),
     )
     .await;
-    assert!(!String::from_utf8_lossy(copy_archive.as_bytes()).contains("sched-canary"));
+    assert!(!copy_records.bytes().contains("sched-canary"));
     // The event is readable by its owner with attendees intact, and jane's
     // ATTENDEE says delivered.
     let body = john
@@ -547,9 +548,12 @@ pub async fn scheduling(test: &TestServer) {
         schedule_statuses(&body, ICalendarProperty::Attendee, "jane@example.com"),
         ["1.2"]
     );
-    let (archive, _) = crate::za::dav_seal::raw_event(test, john.account_id, "default/s.ics").await;
+    // The schedule tag is on the row.
+    let (records, _) =
+        crate::za::dav_seal::raw_event_records(test, john.account_id, "default/s.ics").await;
     assert!(
-        archive
+        records
+            .meta
             .unarchive::<CalendarEvent>()
             .unwrap()
             .schedule_tag
@@ -606,14 +610,14 @@ pub async fn scheduling(test: &TestServer) {
     assert_eq!(stored_sequence(&jane, &copy).await, 1);
     assert!(pending_ids(test, jane.account_id).await.is_empty());
     assert_eq!(uid_copies(test, jane.account_id, "za-sched-1").await, 1);
-    let (copy_archive, _) = crate::za::dav_seal::raw_event(
+    let (copy_records, _) = crate::za::dav_seal::raw_event_records(
         test,
         jane.account_id,
         &format!("default/{}", copy.rsplit('/').next().unwrap()),
     )
     .await;
     assert!(
-        !String::from_utf8_lossy(copy_archive.as_bytes()).contains("sched-canary-moved"),
+        !copy_records.bytes().contains("sched-canary-moved"),
         "the drained update left the moved title in the clear"
     );
     assert_eq!(copy_href(test, jane.account_id, "za-sched-1").await, copy);

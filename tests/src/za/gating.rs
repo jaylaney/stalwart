@@ -4,7 +4,11 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::{STRONG, dav_seal::raw_event, fanout::NO_REPLY};
+use super::{
+    STRONG,
+    dav_seal::{raw_event, raw_event_records},
+    fanout::NO_REPLY,
+};
 use crate::utils::{
     jmap::{JmapResponse, JmapUtils},
     server::TestServer,
@@ -16,7 +20,7 @@ use dav_proto::schema::property::{DavProperty, PrincipalProperty};
 use groupware::{
     cache::GroupwareCache,
     calendar::{
-        CalendarEvent,
+        CalendarEvent, CalendarEventContent,
         itip::{ItipIngest, RsvpError, RsvpRequest, RsvpResponse},
     },
 };
@@ -558,9 +562,11 @@ pub async fn test_scheduling(test: &mut TestServer) {
 
     // The stored event carries the schedule tag a CANCEL on DELETE needs
     // (`delete_all` in groupware's calendar storage).
-    let (archive, _) = raw_event(test, key1_id, "default/invite.ics").await;
+    // At 1.0 the schedule tag is on the row (`raw_event_records`).
+    let (records, _) = raw_event_records(test, key1_id, "default/invite.ics").await;
     assert!(
-        archive
+        records
+            .meta
             .unarchive::<CalendarEvent>()
             .unwrap()
             .schedule_tag
@@ -699,7 +705,7 @@ pub async fn test_scheduling(test: &mut TestServer) {
     );
     let (archive, _) = raw_event(test, key1_id, "default/copy.ics").await;
     let stored = archive
-        .unarchive::<CalendarEvent>()
+        .unarchive::<CalendarEventContent>()
         .unwrap()
         .data
         .event

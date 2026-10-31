@@ -4599,8 +4599,17 @@ labels before.
   `itip_ids` is gone); `plain_dav_container` and `plant_container` write an unsealed container
   through upstream's keyless writer; `shared_container` reads one.
 - **`dav_seal::raw_event`** returns the content record (the stored tree); `raw_event_records`
-  returns both. Its callers outside part 4c's files still unarchive `CalendarEvent` and need
-  the change listed under "Handoffs" below.
+  returns both. Its callers in other modules are ported too:
+  - `za/gating.rs`: the schedule tag is read from the row (`raw_event_records`), the tree from
+    the content (`CalendarEventContent`);
+  - `webdav/za_variants.rs`: the schedule tag from the row, and both canary scans over row and
+    content (`StoredEvent::bytes`);
+  - `za/leak.rs`: the three `raw_event` calls only. The fan-out leak test reads both records
+    as one `ZaEvent` for `check_event`, whose port to the pair (with the scanner's
+    new-subspace rules) stays Task 6's; the pairs test reads the content record.
+- **Ruling 50** (`za/uid_lease.rs`): the four UID-conflict outcomes (a stale snapshot, an
+  expired holder, a lost commit fence, a second creator) assert 403 where 0.16 asserted 412;
+  the 503 and 201 cases are unchanged.
 - **Sharing files**: event reads go through `StoredEvent`; `ZaEvent` field paths
   (`meta.names`, `content.data.event`); calendar dead properties are containers; 0.16's
   `delete_za` is 1.0's `delete_za_at`; `Store::write(batch.build_all())` is `write_batch`; the
@@ -4647,16 +4656,9 @@ labels before.
 
 #### Handoffs
 
-- **Task 7 (or the owner of each file):**
-  - `za/gating.rs:561`, `webdav/za_variants.rs:550`: `schedule_tag` is on the row; read it
-    with `raw_event_records(..).0.meta.unarchive::<CalendarEvent>()`.
-  - `za/gating.rs:700`: unarchive `CalendarEventContent`.
-  - `webdav/za_variants.rs:524`, `:609`: scan both records (`raw_event_records(..).0.bytes()`).
-  - `za/leak.rs` (`check_event`, the drain and fan-out leak tests at `:1255`, `:1951`,
-    `:2135`): the 1.0 records (Task 6's scanner rules).
-  - `za/uid_lease.rs` (`:83`, `:131`, `:220`, `:281`): ruling 50 makes a key account's UID
-    conflict 403, where these assert 412; outside part 4c's files.
-  - `utils/za.rs`'s mail helper `plant_plain_message` is Task 5's.
+- **Task 6:** `za/leak.rs`'s `check_event` takes the 1.0 pair (`ZaEvent`), with the
+  scanner's new-subspace rules.
+- **Task 5:** `utils/za.rs`'s mail helper `plant_plain_message`.
 
 ## Conflict ledger
 
@@ -4871,6 +4873,7 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `za::sharing_move_atomic::snapshot` (fork) | Also covers every event's content record. | The split records: a MOVE must leave both. |
 | `za::sharing_review` (fork) | The concurrent writer changes the row with `update_meta`; assertion unchanged. | `CalendarEvent::update` is gone; a row-only change is `update_meta`. |
 | `za::dav_seal::test_conditional` (fork) | Comment only: a UID conflict is 403 at 1.0. | Ruling 50. |
+| `za::uid_lease::test` (fork) | A key account's UID conflict after a stale snapshot, an expired holder, a lost commit fence and a second creator is asserted to answer 403, where 0.16 asserted 412. The 503 (busy or no copy) and 201 (another calendar) cases are unchanged. | Ruling 50: `za_assert_is_unique_uid` answers 403 `NoUidConflict`, as 1.0's `assert_is_unique_uid` does (`dav/src/calendar/mod.rs`). |
 
 ## Task 1 check
 

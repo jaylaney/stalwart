@@ -80,7 +80,7 @@ pub async fn test(test: &mut TestServer) {
     .await;
     assert_eq!(
         parked.finish().await,
-        412,
+        403,
         "the stale snapshot let a second copy in"
     );
     assert_eq!(uid_copies(test, key1.id, uid).await, 1);
@@ -94,7 +94,7 @@ pub async fn test(test: &mut TestServer) {
     // 5.4). Parked inside its fan-out to key2 past the 1-second lease, the
     // PUT finds its lease taken over: the item's batch loses the fence, so
     // key2 receives nothing from it, and the retake finds the planted copy
-    // (412).
+    // (403 no-uid-conflict at 1.0, ruling 50).
     let uid = "za-lease-expiry";
     test_hooks::set_lease_secs_override(Some(1));
     let parked = HookParked::start(
@@ -128,7 +128,7 @@ pub async fn test(test: &mut TestServer) {
         "the test's lease releases"
     );
     test_hooks::set_lease_secs_override(None);
-    assert_eq!(parked.finish().await, 412, "an expired holder committed");
+    assert_eq!(parked.finish().await, 403, "an expired holder committed");
     assert_eq!(uid_copies(test, key1.id, uid).await, 1);
     assert_eq!(
         new_inbox_items(test, key2.id, &start2).await.len(),
@@ -181,7 +181,7 @@ pub async fn test(test: &mut TestServer) {
     // attendees runs no fan-out, so only the commit's fence can find the
     // takeover. Parked immediately before its commit past the 1-second
     // lease, the PUT loses its fenced commit; the retake finds the planted
-    // copy (412).
+    // copy (403 no-uid-conflict at 1.0, ruling 50).
     let uid = "za-lease-commit";
     test_hooks::set_lease_secs_override(Some(1));
     let parked = HookParked::start(
@@ -217,11 +217,11 @@ pub async fn test(test: &mut TestServer) {
     test_hooks::set_lease_secs_override(None);
     assert_eq!(
         parked.finish().await,
-        412,
-        "the lost commit fence did not answer 412"
+        403,
+        "the lost commit fence did not answer the UID conflict (403)"
     );
     assert_eq!(uid_copies(test, key1.id, uid).await, 1);
-    assert_eq!(za_uid_leases(test).await, 0, "the 412 left a lease behind");
+    assert_eq!(za_uid_leases(test).await, 0, "the 403 left a lease behind");
 
     // The same with no planted copy: the retake finds nothing (503).
     let uid = "za-lease-commit-none";
@@ -278,7 +278,7 @@ pub async fn test(test: &mut TestServer) {
     assert_eq!(parked.finish().await, 201);
     assert_eq!(
         second.await.unwrap(),
-        412,
+        403,
         "two creators of one UID both created"
     );
     assert_eq!(uid_copies(test, key1.id, uid).await, 1);
@@ -352,7 +352,7 @@ pub async fn test(test: &mut TestServer) {
     // (default calendar) into a second calendar of key1 creates its copy, as
     // upstream allows. Unlike the cases above this expects a 201: it pins the
     // per-calendar filter in `za_assert_is_unique_uid`, since dropping that
-    // filter would turn this 201 into a 412.
+    // filter would turn this 201 into a 403 (412 before 1.0, ruling 50).
     let second_cal = "/dav/cal/key1%40example.com/fo-lease-second/";
     key1.client
         .request("MKCALENDAR", second_cal, MKCALENDAR)
