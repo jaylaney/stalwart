@@ -131,8 +131,9 @@ impl DavAclHandler for Server {
             .caused_by(trc::location!())?;
 
         // Validate ACL
-<<<<<<< HEAD
-        let acls = container.acls().unwrap();
+        let acls = container
+            .acls()
+            .ok_or(DavError::Code(StatusCode::FORBIDDEN))?;
 
         // Spec 9: sharing is refused on calendars owned by key accounts.
         if collection == Collection::Calendar
@@ -140,13 +141,6 @@ impl DavAclHandler for Server {
         {
             return Err(DavError::Code(StatusCode::FORBIDDEN));
         }
-        if !access_token.is_member(account_id)
-            && !acls.effective_acl(access_token).contains(Acl::Share)
-        {
-=======
-        let acls = container
-            .acls()
-            .ok_or(DavError::Code(StatusCode::FORBIDDEN))?;
         let actor = (!access_token.is_member(account_id)).then(|| {
             if collection == Collection::FileNode {
                 resources.file_acl(access_token, resource.document_id())
@@ -155,7 +149,6 @@ impl DavAclHandler for Server {
             }
         });
         if actor.is_some_and(|actor| !actor.contains(Acl::Share)) {
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
             return Err(DavError::Code(StatusCode::FORBIDDEN));
         }
 

@@ -9,6 +9,7 @@ use crate::{
     common::{
         lock::{LockData, build_lock_key},
         uri::{SyncToken, Urn},
+        za::ZaReadMemo,
     },
     principal::propfind::PrincipalPropFind,
 };
@@ -38,6 +39,8 @@ use types::collection::{Collection, SyncCollection};
 pub(crate) struct PropFindData {
     pub accounts: AHashMap<u32, PropFindAccountData>,
     pub principals: ExpandedPrincipals,
+    /// Zero-access: this request's read contexts (never consumed by writers).
+    pub calendar_memo: ZaReadMemo,
 }
 
 #[derive(Default)]
@@ -64,6 +67,7 @@ impl PropFindData {
         Self {
             accounts: AHashMap::with_capacity(2),
             principals: ExpandedPrincipals::default(),
+            calendar_memo: ZaReadMemo::new(),
         }
     }
 

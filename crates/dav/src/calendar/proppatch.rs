@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::{za_refresh_event, za_write_contexts};
+use super::{za_calendar_error, za_write_contexts};
 use crate::{
     DavError, DavMethod, PropStatBuilder,
     calendar::assert_event_privacy_access,
@@ -13,9 +13,11 @@ use crate::{
         dead::{DeadPatch, DeadTarget, DisplayName},
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
+        za::{ZaDeadSeal, za_mutation_context},
     },
 };
 use calcard::common::timezone::Tz;
+use common::storage::metadata::MetadataWrite;
 use common::{
     Server,
     auth::AccessToken,
@@ -33,16 +35,15 @@ use dav_proto::{
 use groupware::{
     cache::GroupwareCache,
     calendar::{
-        Calendar, CalendarEvent, SupportedComponent, Timezone,
-<<<<<<< HEAD
-        seal::{
-            calendar_view_in_domain, event_pairs_in_domain, seal_calendar_changes, seal_error,
-            seal_event_in_domain, unseal_event_in_domain,
-        },
-=======
+        Calendar, CalendarEvent, CalendarEventContent, SupportedComponent, Timezone,
         alerts::{CalendarAlarmsReschedule, CalendarSettings},
         privacy::EventViewer,
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+        seal::{
+            ZaContainerOf, ZaEvent, calendar_view_in_domain, event_pairs_in_domain,
+            rewrap_container, rewrap_event, seal_calendar_changes, seal_error,
+            seal_event_in_domain, unseal_event_in_domain,
+        },
+        sharing::resolve::{ZaCalendarContext, calendars_changed},
     },
 };
 use http_proto::HttpResponse;
@@ -57,6 +58,8 @@ use trc::AddContext;
 use types::{
     acl::Acl,
     collection::{Collection, SyncCollection},
+    field::CalendarEventField,
+    metadata::MetadataKinds,
 };
 use utils::map::bitmap::Bitmap;
 
@@ -99,7 +102,7 @@ impl CalendarPropPatchRequestHandler for Server {
             .into_owned_uri()?;
         let uri = headers.uri;
         let account_id = resource_.account_id;
-        super::za_writer_keys(self, access_token, account_id).await?;
+        let za_keys = super::za_writer_keys(self, access_token, account_id).await?;
         let resources = self
             .fetch_groupware_resources(
                 access_token.account_id(),
@@ -157,6 +160,53 @@ impl CalendarPropPatchRequestHandler for Server {
             .await
             .caused_by(trc::location!())?
             .ok_or(DavError::Code(StatusCode::NOT_FOUND))?;
+
+        #[cfg(feature = "test_mode")]
+        if resource.is_container() {
+            common::za::test_hooks::calendar_proppatch_read_pause_point(account_id).await;
+        }
+
+        // Calendar properties write only this principal's personal bundle and
+        // shared dead properties. The codec retains every unopened personal
+        // bundle and ring verbatim.
+        let calendar_context = if resource.is_container() && za_keys.is_some() {
+            za_mutation_context(
+                self,
+                access_token,
+                account_id,
+                document_id,
+                Bitmap::new().with_item(Acl::Modify),
+            )
+            .await
+            .map_err(|error| za_calendar_error(error, account_id, document_id))?
+        } else {
+            None
+        };
+        // Spec 8.1: an event is edited as plaintext; the stored archives stay
+        // the update's current values.
+        let event_contexts = if !resource.is_container() && za_keys.is_some() {
+            za_write_contexts(
+                self,
+                access_token,
+                account_id,
+                &archive
+                    .deserialize::<CalendarEvent>()
+                    .caused_by(trc::location!())?,
+                resource
+                    .parent_id()
+                    .ok_or(DavError::Code(StatusCode::NOT_FOUND))?,
+                Acl::ModifyItems,
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
+        // The conditional headers are evaluated against the archive the final
+        // write asserts.
+        let archive = calendar_context
+            .as_ref()
+            .map(|context| &context.stored)
+            .unwrap_or(&archive);
         let etag = if resource.is_container() {
             archive.etag()
         } else {
@@ -169,32 +219,6 @@ impl CalendarPropPatchRequestHandler for Server {
                     .to_native()
             )
         };
-
-        #[cfg(feature = "test_mode")]
-        if resource.is_container() {
-            common::za::test_hooks::calendar_proppatch_read_pause_point(account_id).await;
-        }
-
-        // Calendar properties write only this principal's personal bundle and shared dead
-        // properties. The codec retains every unopened personal bundle and ring verbatim.
-        let calendar_context = if resource.is_container() {
-            crate::common::za::za_mutation_context(
-                self,
-                access_token,
-                account_id,
-                document_id,
-                Bitmap::new().with_item(Acl::Modify),
-            )
-            .await
-            .map_err(|error| super::za_calendar_error(error, account_id, document_id))?
-        } else {
-            None
-        };
-        // The conditional headers are evaluated against the archive the final write asserts.
-        let archive = calendar_context
-            .as_ref()
-            .map(|context| &context.stored)
-            .unwrap_or(&archive);
 
         // Validate headers
         self.validate_headers(
@@ -217,45 +241,34 @@ impl CalendarPropPatchRequestHandler for Server {
         let has_live_changes = !request.ops.is_empty();
         let mut batch = BatchBuilder::new();
         let mut items = PropStatBuilder::default();
-
-<<<<<<< HEAD
         let mut retry_event = None;
-        let mut etag = if resource.is_container() {
-=======
+
         let (is_success, etag) = if resource.is_container() {
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
             // Deserialize
             let calendar = archive
                 .to_unarchived::<Calendar>()
                 .caused_by(trc::location!())?;
-<<<<<<< HEAD
-            let stored_calendar = archive
-                .deserialize::<Calendar>()
-                .caused_by(trc::location!())?;
-            let (mut new_calendar, personal_id) = if let Some(context) = &calendar_context {
-                (
-                    calendar_view_in_domain(&context.stored, &context.domain, context.personal_id)
-                        .map_err(|err| seal_error(err, account_id, document_id))?
-                        .deserialize::<Calendar>()
-                        .caused_by(trc::location!())?,
-                    context.personal_id,
-                )
-            } else {
-                (
-                    stored_calendar.clone(),
-                    access_token.personal_id(account_id, Collection::Calendar),
-                )
-            };
-=======
-            let personal_id = access_token.personal_id(account_id, Collection::Calendar);
+            let personal_id = calendar_context
+                .as_ref()
+                .map(|context| context.personal_id)
+                .unwrap_or_else(|| access_token.personal_id(account_id, Collection::Calendar));
             let is_member = access_token.is_member(account_id);
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
             // Apply live properties
             let new_calendar = if has_live_changes {
-                let mut new_calendar = archive
+                let mut new_calendar = match &calendar_context {
+                    Some(context) => calendar_view_in_domain(
+                        &context.stored,
+                        &context.domain,
+                        context.personal_id,
+                    )
+                    .map_err(|err| seal_error(err, account_id, document_id))?
                     .deserialize::<Calendar>()
-                    .caused_by(trc::location!())?;
+                    .caused_by(trc::location!())?,
+                    None => archive
+                        .deserialize::<Calendar>()
+                        .caused_by(trc::location!())?,
+                };
                 if is_member {
                     new_calendar.inherit_owner_preferences(account_id, personal_id);
                 }
@@ -282,8 +295,11 @@ impl CalendarPropPatchRequestHandler for Server {
             };
 
             // Apply dead properties
+            let za_seal = calendar_context.as_ref().map(|context| {
+                ZaDeadSeal::calendar(&context.domain, account_id, Some(document_id))
+            });
             let mut dead_write = dead
-                .apply(
+                .apply_za(
                     self,
                     DeadTarget::container(
                         account_id,
@@ -291,52 +307,32 @@ impl CalendarPropPatchRequestHandler for Server {
                         document_id,
                         calendar.inner.metadata_kinds(),
                     ),
+                    za_seal.as_ref(),
                     &mut items,
                 )
                 .await
                 .caused_by(trc::location!())?;
 
-<<<<<<< HEAD
-            // Set properties
-            is_success = self.apply_calendar_properties(
-                personal_id,
-                &mut new_calendar,
-                true,
-                request.set,
-                &mut items,
-            );
-
-            // Remove properties
-            if is_success && !request.remove.is_empty() {
-                remove_calendar_properties(
-                    personal_id,
-                    &mut new_calendar,
-                    request.remove,
-                    &mut items,
-                );
-            }
-
-            if is_success {
-                if let Some(context) = &calendar_context {
-                    new_calendar = seal_calendar_changes(
-                        &stored_calendar,
-                        &new_calendar,
-                        &context.domain,
-                        personal_id,
-                    )
-                    .map_err(|err| seal_error(err, account_id, document_id))?;
-                }
-                new_calendar
-                    .update(
-                        access_token.account_tenant_ids(),
-                        calendar,
-=======
             if items.has_errors() {
                 (false, etag)
             } else {
+                if let Some(context) = &calendar_context {
+                    context.assert_in(&mut batch);
+                }
                 if let Some(mut new_calendar) = new_calendar {
                     if is_member {
                         new_calendar.sync_owner_preferences(account_id, personal_id);
+                    }
+                    if let Some(context) = &calendar_context {
+                        new_calendar = seal_calendar_changes(
+                            &archive
+                                .deserialize::<Calendar>()
+                                .caused_by(trc::location!())?,
+                            &new_calendar,
+                            &context.domain,
+                            personal_id,
+                        )
+                        .map_err(|err| seal_error(err, account_id, document_id))?;
                     }
                     if let Some(dead_write) = &dead_write {
                         new_calendar.set_metadata_kinds(dead_write.kinds);
@@ -374,7 +370,6 @@ impl CalendarPropPatchRequestHandler for Server {
                     Calendar::rewrite_presence(
                         &calendar,
                         dead_write.kinds,
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                         account_id,
                         document_id,
                         &mut batch,
@@ -389,11 +384,45 @@ impl CalendarPropPatchRequestHandler for Server {
                 .to_unarchived::<CalendarEvent>()
                 .caused_by(trc::location!())?;
 
+            // Ruling 15: a key account's display name lives in the sealed
+            // content, so a live change is a sealed full write over the
+            // stored content archive.
+            let za_content = if has_live_changes && !event_contexts.is_empty() {
+                Some(
+                    self.store()
+                        .get_value::<Archive<ArchiveBytes>>(ValueKey::property(
+                            account_id,
+                            Collection::CalendarEvent,
+                            document_id,
+                            CalendarEventField::Content,
+                        ))
+                        .await
+                        .caused_by(trc::location!())?
+                        .ok_or(DavError::Code(StatusCode::NOT_FOUND))?,
+                )
+            } else {
+                None
+            };
+
             // Apply live properties
             let new_event = if has_live_changes {
                 let mut new_event = archive
                     .deserialize::<CalendarEvent>()
                     .caused_by(trc::location!())?;
+                let mut za_event = None;
+                if let (Some(context), Some(content)) = (event_contexts.first(), &za_content) {
+                    let mut stored = ZaEvent::new(
+                        new_event.clone(),
+                        content
+                            .deserialize::<CalendarEventContent>()
+                            .caused_by(trc::location!())?,
+                    );
+                    // The plaintext pair, edited below and sealed again.
+                    unseal_event_in_domain(&mut stored, &context.domain)
+                        .map_err(|err| seal_error(err, account_id, document_id))?;
+                    new_event = stored.meta.clone();
+                    za_event = Some(stored);
+                }
                 for op in request.ops {
                     match op {
                         PropertyUpdateOp::Set(value) => {
@@ -404,14 +433,18 @@ impl CalendarPropPatchRequestHandler for Server {
                         }
                     }
                 }
-                Some(new_event)
+                Some((new_event, za_event))
             } else {
                 None
             };
 
             // Apply dead properties
+            let za_uid = event.inner.uid.to_string();
+            let za_seal = event_contexts.first().map(|context| {
+                ZaDeadSeal::event(&context.domain, account_id, document_id, &za_uid)
+            });
             let mut dead_write = dead
-                .apply(
+                .apply_za(
                     self,
                     DeadTarget::item(
                         account_id,
@@ -419,96 +452,83 @@ impl CalendarPropPatchRequestHandler for Server {
                         document_id,
                         event.inner.metadata_kinds(),
                     ),
+                    za_seal.as_ref(),
                     &mut items,
                 )
                 .await
                 .caused_by(trc::location!())?;
-            // Spec 8.1: edit the plaintext; `event` (stored) stays current.
-            let contexts = za_write_contexts(
-                self,
-                access_token,
-                account_id,
-                &new_event,
-                resource.parent_id().unwrap(),
-                Acl::ModifyItems,
-            )
-            .await?;
-            if let Some(context) = contexts.first() {
-                unseal_event_in_domain(&mut new_event, &context.domain)
-                    .map_err(|err| seal_error(err, account_id, document_id))?;
-            }
 
-<<<<<<< HEAD
-            // Remove properties
-            if !request.set_first && !request.remove.is_empty() {
-                remove_event_properties(
-                    &mut new_event,
-                    std::mem::take(&mut request.remove),
-                    &mut items,
-                );
-            }
-
-            // Set properties
-            is_success = self.apply_event_properties(&mut new_event, true, request.set, &mut items);
-
-            // Remove properties
-            if is_success && !request.remove.is_empty() {
-                remove_event_properties(&mut new_event, request.remove, &mut items);
-            }
-
-            if is_success {
-                if let Some(context) = contexts.first() {
-                    // Every rewrite carries the stored pairs.
-                    let pairs = event_pairs_in_domain(&archive, &context.domain)
-                        .map_err(|err| seal_error(err, account_id, document_id))?;
-                    seal_event_in_domain(&mut new_event, &context.domain, pairs.as_ref())
-                        .map_err(|err| seal_error(err, account_id, document_id))?;
-                }
-                let timestamp = store::write::now() as i64;
-                for context in &contexts {
-                    context.assert_in(&mut batch);
-                }
-                retry_event = Some((new_event.clone(), contexts, timestamp));
-                new_event
-                    .update_at(
-                        access_token.account_tenant_ids(),
-                        event,
-=======
             if items.has_errors() {
                 (false, etag)
             } else {
                 let mut new_etag = None;
+                for context in &event_contexts {
+                    context.assert_in(&mut batch);
+                }
                 if let Some(write) = dead_write
                     .as_mut()
                     .and_then(|dead_write| dead_write.write.take())
                 {
+                    if !event_contexts.is_empty() {
+                        retry_event = Some((None, Some(write.clone())));
+                    }
                     write
                         .build(document_id.into(), &mut batch)
                         .caused_by(trc::location!())?;
                 }
-                if let Some(mut new_event) = new_event {
+                if let Some((mut new_event, za_event)) = new_event {
                     if let Some(dead_write) = &dead_write {
                         new_event.set_metadata_kinds(dead_write.kinds);
                     }
-                    new_etag = new_event
-                        .update_meta(
-                            access_token.changed_by(),
-                            event,
-                            account_id,
-                            document_id,
-                            None,
-                            &mut batch,
-                        )
-                        .caused_by(trc::location!())?
-                        .into();
+                    match (za_event, event_contexts.first(), &za_content) {
+                        (Some(mut za_event), Some(context), Some(content)) => {
+                            let pairs =
+                                event_pairs_in_domain(&za_event.meta, content, &context.domain)
+                                    .map_err(|err| seal_error(err, account_id, document_id))?;
+                            za_event.meta = new_event;
+                            seal_event_in_domain(&mut za_event, &context.domain, pairs.as_ref())
+                                .map_err(|err| seal_error(err, account_id, document_id))?;
+                            retry_event = Some((
+                                Some(za_event.clone()),
+                                retry_event.and_then(|(_, write)| write),
+                            ));
+                            let (meta, content_) = za_event.into_parts();
+                            new_etag = meta
+                                .update_full(
+                                    content_,
+                                    access_token.changed_by(),
+                                    event,
+                                    content
+                                        .unarchive::<CalendarEventContent>()
+                                        .caused_by(trc::location!())?,
+                                    account_id,
+                                    document_id,
+                                    None,
+                                    &mut batch,
+                                )
+                                .caused_by(trc::location!())?
+                                .into();
+                        }
+                        _ => {
+                            new_etag = new_event
+                                .update_meta(
+                                    access_token.changed_by(),
+                                    event,
+                                    account_id,
+                                    document_id,
+                                    None,
+                                    &mut batch,
+                                )
+                                .caused_by(trc::location!())?
+                                .into();
+                        }
+                    }
                 } else if let Some(dead_write) = &dead_write {
                     CalendarEvent::rewrite_presence(
                         &event,
                         dead_write.kinds,
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                         account_id,
                         document_id,
-                        timestamp,
                         &mut batch,
                     )
                     .caused_by(trc::location!())?;
@@ -516,53 +536,39 @@ impl CalendarPropPatchRequestHandler for Server {
                 (true, new_etag.unwrap_or(etag))
             }
         };
+        let mut etag = etag;
 
         if is_success {
-<<<<<<< HEAD
-            #[cfg(feature = "test_mode")]
-            common::za::test_hooks::update_commit_pause_point(account_id).await;
-            match self.commit_batch(batch).await {
-                Ok(_) => {}
-                Err(error) if error.is_assertion_failure() && retry_event.is_some() => {
-                    let (mut sealed, contexts, timestamp) = retry_event.take().unwrap();
-                    let Some(fresh) = za_refresh_event(
-                        self,
-                        access_token,
-                        account_id,
-                        resource.parent_id().unwrap(),
-                        Acl::ModifyItems,
-                        &contexts,
-                        &mut sealed,
-                    )
-                    .await?
-                    else {
-                        return Err(error.into());
-                    };
-                    let mut batch = BatchBuilder::new();
-                    for context in &fresh {
-                        context.assert_in(&mut batch);
-                    }
-                    etag = sealed
-                        .update_at(
-                            access_token.account_tenant_ids(),
-                            archive.to_unarchived::<CalendarEvent>()?,
+            if !batch.is_empty() {
+                #[cfg(feature = "test_mode")]
+                common::za::test_hooks::update_commit_pause_point(account_id).await;
+                match self.commit_batch(batch).await {
+                    Ok(_) => {}
+                    Err(error) if error.is_assertion_failure() && retry_event.is_some() => {
+                        // Ruling 29: one bounded retry after a calendar
+                        // change, with the event's and the container's
+                        // envelopes rewrapped into the fresh domain.
+                        etag = za_proppatch_retry(
+                            self,
+                            access_token,
                             account_id,
                             document_id,
-                            timestamp,
-                            &mut batch,
-                        )?
-                        .etag();
-                    self.commit_batch(batch).await?;
+                            resource
+                                .parent_id()
+                                .ok_or(DavError::Code(StatusCode::NOT_FOUND))?,
+                            &event_contexts,
+                            archive,
+                            retry_event.take().unwrap(),
+                        )
+                        .await?
+                        .ok_or_else(|| DavError::from(error))?
+                        .unwrap_or(etag);
+                    }
+                    Err(error) => return Err(error.caused_by(trc::location!()).into()),
                 }
-                Err(error) => return Err(error.into()),
-            }
-=======
-            if !batch.is_empty() {
-                self.commit_batch(batch).await.caused_by(trc::location!())?;
             }
         } else {
             items.fail_dependencies();
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
         }
 
         if headers.ret != Return::Minimal || !is_success {
@@ -805,4 +811,118 @@ fn remove_calendar_properties(
             }
         }
     }
+}
+
+/// Ruling 29's bounded retry of a key account's event PROPPATCH after its
+/// assertion lost to a calendar change (a grant, a rotation or a
+/// conversion): the same edit, its event and container envelopes rewrapped
+/// into the fresh domain. `None` when the calendar did not change, so the
+/// caller returns the original error; `Some(etag)` after the commit.
+#[allow(clippy::too_many_arguments)]
+async fn za_proppatch_retry(
+    server: &Server,
+    access_token: &AccessToken,
+    account_id: u32,
+    document_id: u32,
+    calendar_id: u32,
+    before: &[ZaCalendarContext],
+    archive: &Archive<ArchiveBytes>,
+    (za_event, dead_write): (Option<ZaEvent>, Option<MetadataWrite>),
+) -> crate::Result<Option<Option<String>>> {
+    let Some(before_domain) = before.first().map(|context| &context.domain) else {
+        return Ok(None);
+    };
+    let event = archive
+        .to_unarchived::<CalendarEvent>()
+        .caused_by(trc::location!())?;
+    let after = za_write_contexts(
+        server,
+        access_token,
+        account_id,
+        &archive
+            .deserialize::<CalendarEvent>()
+            .caused_by(trc::location!())?,
+        calendar_id,
+        Acl::ModifyItems,
+    )
+    .await?;
+    if !calendars_changed(before, &after) {
+        return Ok(None);
+    }
+    let Some(after_domain) = after.first().map(|context| &context.domain) else {
+        return Ok(None);
+    };
+    let mut batch = BatchBuilder::new();
+    for context in &after {
+        context.assert_in(&mut batch);
+    }
+    let uid = event.inner.uid.to_string();
+    let mut kinds = None;
+    if let Some(mut write) = dead_write {
+        if let Some(next) = &write.next {
+            write.next = Some(
+                rewrap_container(
+                    next.as_bytes(),
+                    before_domain,
+                    after_domain,
+                    ZaContainerOf::Event(&uid),
+                )
+                .map_err(|err| seal_error(err, account_id, document_id))?,
+            );
+        }
+        kinds = Some(
+            write
+                .next
+                .as_ref()
+                .map_or(MetadataKinds::NONE, |next| next.kinds()),
+        );
+        write
+            .build(document_id.into(), &mut batch)
+            .caused_by(trc::location!())?;
+    }
+    let etag = match za_event {
+        Some(mut za_event) => {
+            rewrap_event(&mut za_event, before_domain, after_domain)
+                .map_err(|err| seal_error(err, account_id, document_id))?;
+            let content = server
+                .store()
+                .get_value::<Archive<ArchiveBytes>>(ValueKey::property(
+                    account_id,
+                    Collection::CalendarEvent,
+                    document_id,
+                    CalendarEventField::Content,
+                ))
+                .await
+                .caused_by(trc::location!())?
+                .ok_or(DavError::Code(StatusCode::NOT_FOUND))?;
+            let (meta, content_) = za_event.into_parts();
+            Some(
+                meta.update_full(
+                    content_,
+                    access_token.changed_by(),
+                    event,
+                    content
+                        .unarchive::<CalendarEventContent>()
+                        .caused_by(trc::location!())?,
+                    account_id,
+                    document_id,
+                    None,
+                    &mut batch,
+                )
+                .caused_by(trc::location!())?,
+            )
+        }
+        None => {
+            if let Some(kinds) = kinds {
+                CalendarEvent::rewrite_presence(&event, kinds, account_id, document_id, &mut batch)
+                    .caused_by(trc::location!())?;
+            }
+            None
+        }
+    };
+    server
+        .commit_batch(batch)
+        .await
+        .caused_by(trc::location!())?;
+    Ok(Some(etag))
 }

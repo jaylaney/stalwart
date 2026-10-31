@@ -12,7 +12,7 @@ use crate::{
         dead::{DeadPatch, DeadTarget, DisplayName},
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
-        za::ZeroAccessGate,
+        za::{ZaDeadSeal, ZeroAccessGate},
     },
 };
 use common::{Server, auth::AccessToken, storage::index::PresenceFlags};
@@ -22,14 +22,10 @@ use dav_proto::{
 };
 use groupware::{
     cache::GroupwareCache,
-<<<<<<< HEAD
     calendar::{
-        Calendar, CalendarPreferences,
-        seal::{seal_calendar, seal_error},
+        CALENDAR_SUBSCRIBED, Calendar, CalendarPreferences,
+        seal::{ZaKeyDomain, seal_calendar, seal_error},
     },
-=======
-    calendar::{CALENDAR_SUBSCRIBED, Calendar, CalendarPreferences},
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 };
 use http_proto::HttpResponse;
 use hyper::StatusCode;
@@ -137,8 +133,14 @@ impl CalendarMkColRequestHandler for Server {
                 mkcol.props,
                 &mut prop_stat,
             );
+            // Ruling 16: a key account's container is sealed in the owner's
+            // domain, unbound from the pending id until its next write.
+            let za_domain = za_keys.as_deref().map(ZaKeyDomain::owner);
+            let za_seal = za_domain
+                .as_ref()
+                .map(|domain| ZaDeadSeal::calendar(domain, account_id, None));
             dead_write = dead
-                .apply(
+                .apply_za(
                     self,
                     DeadTarget::container(
                         account_id,
@@ -146,6 +148,7 @@ impl CalendarMkColRequestHandler for Server {
                         document_id,
                         MetadataKinds::NONE,
                     ),
+                    za_seal.as_ref(),
                     &mut prop_stat,
                 )
                 .await
@@ -164,13 +167,12 @@ impl CalendarMkColRequestHandler for Server {
             }
         }
 
+        // Prepare write batch
+        calendar.sync_owner_preferences(account_id, personal_id);
         if let Some(keys) = &za_keys {
             seal_calendar(&mut calendar, keys, account_id)
                 .map_err(|err| seal_error(err, account_id, u32::MAX))?;
         }
-
-        // Prepare write batch
-        calendar.sync_owner_preferences(account_id, personal_id);
         if let Some(dead_write) = &dead_write {
             calendar.set_metadata_kinds(dead_write.kinds);
         }

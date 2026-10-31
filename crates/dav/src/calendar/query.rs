@@ -272,26 +272,17 @@ impl CalendarQueryHandler {
                         .unwrap_or_else(|| {
                             trc::event!(
                                 Calendar(trc::CalendarEvent::RuleExpansionError),
-<<<<<<< HEAD
-                                Reason = "chrono error",
+                                Reason = "Failed to expand stored time ranges",
+                                // Zero-access: never the tree, which is
+                                // plaintext for a key account's view.
                                 AccountId = account_id,
                                 DocumentId = document_id,
-                                Details = event
-=======
-                                Reason = "Failed to expand stored time ranges",
-                                Contents = event.data.event.to_compact_string(),
                                 ResourceUid = event
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                                     .data
                                     .event
                                     .uids()
                                     .next()
-<<<<<<< HEAD
-                                    .unwrap_or_default()
-                                    .to_string(),
-=======
                                     .map(|uid| uid.to_compact_string()),
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                             );
                             vec![]
                         })
@@ -334,13 +325,15 @@ impl CalendarQueryHandler {
         content: &EventContent<'_>,
         expansion: FilterTimeRanges,
         default_tz: Tz,
+        account_id: u32,
+        document_id: u32,
     ) -> Self {
         let stored = content.stored();
         let expansion_range = match content.view() {
             Some(view) => expansion.expansion_range(view),
             None => expansion.expansion_range(stored),
         };
-        let mut handler = Self::new(stored, expansion_range, default_tz);
+        let mut handler = Self::new(stored, expansion_range, default_tz, account_id, document_id);
         if event.flags.to_native() & EVENT_HAS_UNBOUNDED_TODO != 0 {
             handler.undated_todos.extend(stored.data.undated_todos());
         }

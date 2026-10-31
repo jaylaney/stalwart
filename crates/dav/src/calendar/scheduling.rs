@@ -139,13 +139,7 @@ impl CalendarEventNotificationHandler for Server {
             return Err(DavError::Code(StatusCode::NOT_FOUND));
         }
         let za_keys = self.za_session_keys(access_token, account_id).await?;
-        let view_ = za_item_view(
-            &event_,
-            za_keys.as_ref(),
-            account_id,
-            resource.document_id(),
-        )?;
-        let event = view_
+        let event = event_
             .unarchive::<CalendarEventNotification>()
             .caused_by(trc::location!())?;
 
@@ -172,7 +166,8 @@ impl CalendarEventNotificationHandler for Server {
             .with_etag(etag)
             .with_last_modified(Rfc1123DateTime::new(i64::from(event.modified)).to_string());
 
-        if is_head {
+        // A key account's stored size is the sealed message's: measure the view.
+        if is_head && za_keys.is_none() {
             return Ok(response.with_content_length(event.size.to_native() as usize));
         }
 
@@ -187,13 +182,22 @@ impl CalendarEventNotificationHandler for Server {
             .await
             .caused_by(trc::location!())?
             .ok_or(DavError::Code(StatusCode::NOT_FOUND))?;
-        let content = content_
+        let view_ = za_item_view(
+            &content_,
+            za_keys.as_ref(),
+            account_id,
+            resource.document_id(),
+        )?;
+        let content = view_
             .unarchive::<CalendarEventNotificationContent>()
             .caused_by(trc::location!())?;
 
         let mut body = String::with_capacity(event.size.to_native() as usize);
         if let Some(ical) = content.calendar_data() {
             let _ = ical.write_to(&mut body);
+        }
+        if is_head {
+            return Ok(response.with_content_length(body.len()));
         }
         Ok(response.with_binary_body(body))
     }
@@ -420,19 +424,6 @@ impl CalendarEventNotificationHandler for Server {
                 .await
                 .caused_by(trc::location!())?
             {
-<<<<<<< HEAD
-                // Spec 9: a key account's free-busy is not offered; answer
-                // as for an unknown or unpermitted calendar user.
-                if crate::common::za::is_key_account(self, account_id).await? {
-                    response.items.0.push(ScheduleResponseItem {
-                        recipient: Href(format!("mailto:{email}")),
-                        request_status: "3.7;Invalid calendar user or insufficient permissions"
-                            .into(),
-                        calendar_data: None,
-                    });
-                    continue;
-                }
-=======
                 Some(account_id)
                     if access_token.is_member(account_id)
                         || access_token.has_permission(Permission::SysAccountQuery) =>
@@ -448,7 +439,17 @@ impl CalendarEventNotificationHandler for Server {
                 None => None,
             };
             if let Some(account_id) = account_id {
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+                // Spec 9: a key account's free-busy is not offered; answer
+                // as for an unknown or unpermitted calendar user.
+                if crate::common::za::is_key_account(self, account_id).await? {
+                    response.items.0.push(ScheduleResponseItem {
+                        recipient: Href(format!("mailto:{email}")),
+                        request_status: "3.7;Invalid calendar user or insufficient permissions"
+                            .into(),
+                        calendar_data: None,
+                    });
+                    continue;
+                }
                 let resources = self
                     .fetch_groupware_resources(
                         access_token.account_id(),

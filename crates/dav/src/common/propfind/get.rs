@@ -4,7 +4,14 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::{PropFindItem, data::PropFindData};
+use super::{
+    PropFindItem,
+    data::PropFindData,
+    za::{
+        authorize_calendar_tombstones, foreign_calendar_contexts, invalid_calendar_sync_token,
+        tombstone_prefixes,
+    },
+};
 use crate::{
     DavError, DavErrorCondition,
     common::{
@@ -27,7 +34,7 @@ use store::{
 use trc::AddContext;
 use types::{
     acl::Acl,
-    collection::{Collection, SyncCollection},
+    collection::{Collection, SyncCollection, VanishedCollection},
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -67,10 +74,113 @@ pub(super) async fn get(
         .await
         .caused_by(trc::location!())?;
 
+    // Zero-access (sharing): a foreign key account's calendars are listed
+    // and synced only through fresh own-id contexts. Both tombstone streams
+    // are read over the token's change range before fresh authorization.
+    // Independent store scans do not form a snapshot: a relevant mismatch
+    // conservatively requires a resync (inventory finding 3: 1.0 pages
+    // changes over `Query::Range(from, snapshot)`; upstream's
+    // `needs_full_rebuild` already refuses a truncated change set).
+    let foreign_key_calendars = collection_container == Collection::Calendar
+        && account_id != access_token.account_id()
+        && server
+            .za_is_key_account(account_id)
+            .await
+            .caused_by(trc::location!())?;
+    let token_range = match query.sync_type {
+        SyncType::Token(SyncToken::State(id)) => Some((id, resources.highest_change_id.max(id))),
+        SyncType::Token(SyncToken::ChangesPage { from, snapshot, .. }) => Some((from, snapshot)),
+        _ => None,
+    };
+    let foreign_history = match token_range {
+        Some((id, snapshot)) if foreign_key_calendars && id < snapshot => {
+            let raw = server
+                .store()
+                .vanished_with_change_id::<String>(
+                    account_id,
+                    VanishedCollection::Calendar.into(),
+                    Query::Range(id, snapshot),
+                )
+                .await
+                .caused_by(trc::location!())?;
+            #[cfg(feature = "test_mode")]
+            common::za::test_hooks::calendar_sync_log_pause_point(account_id).await;
+            let identities = server
+                .store()
+                .vanished_with_change_id::<String>(
+                    account_id,
+                    VanishedCollection::CalendarIdentity.into(),
+                    Query::Range(id, snapshot),
+                )
+                .await
+                .caused_by(trc::location!())?;
+            Some((raw, identities))
+        }
+        _ => None,
+    };
+    let mut foreign_vanished: Option<Vec<String>> = None;
+    let requested_calendar = resource
+        .resource
+        .and_then(|path| resources.by_path(path))
+        .and_then(|item| {
+            if item.is_container() {
+                Some(item.document_id())
+            } else {
+                item.parent_id()
+            }
+        });
+    let eligible = if foreign_key_calendars {
+        if resource.resource.is_some() && requested_calendar.is_none() {
+            return Err(DavError::Code(StatusCode::NOT_FOUND));
+        }
+        Some(
+            foreign_calendar_contexts(
+                server,
+                access_token,
+                account_id,
+                &resources,
+                requested_calendar,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    if let Some(eligible) = &eligible {
+        if resource.resource.is_some()
+            && requested_calendar.is_some_and(|id| !eligible.contains_key(&id))
+        {
+            return Err(DavError::Code(StatusCode::FORBIDDEN));
+        }
+        // A token older than a grant or rename boundary needs a resync.
+        if let Some((id, _)) = token_range {
+            for (&calendar_id, context) in eligible {
+                if requested_calendar.is_none_or(|id| id == calendar_id)
+                    && context.boundary.is_some_and(|boundary| {
+                        boundary.pending
+                            || id <= boundary.grant_change_id.max(boundary.rename_change_id)
+                    })
+                {
+                    return Err(invalid_calendar_sync_token());
+                }
+            }
+        }
+        let prefixes = tombstone_prefixes(eligible, &resources, requested_calendar)?;
+        if let Some((raw, identities)) = foreign_history {
+            foreign_vanished = Some(authorize_calendar_tombstones(raw, identities, &prefixes)?);
+        }
+        // Reuse precisely these freshly read archives for the rest of this response.
+        for (&id, context) in eligible {
+            data.calendar_memo.insert((account_id, id), context.clone());
+        }
+    }
+
     // Obtain document ids
     let is_file = sync_collection == SyncCollection::FileNode;
     let mut file_readable = None;
-    let mut display_containers = if is_file && !access_token.is_member(account_id) {
+    let mut display_containers = if let Some(eligible) = &eligible {
+        Some(RoaringBitmap::from_iter(eligible.keys().copied()))
+    } else if is_file && !access_token.is_member(account_id) {
         let access = resources.file_access(access_token);
         file_readable = Some(access.readable.clone());
         let discoverable = access.discoverable.clone();
@@ -113,6 +223,31 @@ pub(super) async fn get(
                 .map(|child| child.document_id())
                 .collect::<RoaringBitmap>()
         });
+    // Restrict a foreign key account's containers and children to the
+    // requested subtree.
+    if eligible.is_some()
+        && let Some(path) = resource.resource
+    {
+        let subtree = resources
+            .subtree_with_depth(path, query.depth)
+            .collect::<Vec<_>>();
+        if let Some(containers) = &mut display_containers {
+            *containers &= RoaringBitmap::from_iter(
+                subtree
+                    .iter()
+                    .filter(|item| item.is_container())
+                    .map(|item| item.document_id()),
+            );
+        }
+        if let Some(children) = &mut display_children {
+            *children &= RoaringBitmap::from_iter(
+                subtree
+                    .iter()
+                    .filter(|item| !item.is_container())
+                    .map(|item| item.document_id()),
+            );
+        }
+    }
 
     // Filter by changelog
     let incremental = match query.sync_type {
@@ -191,7 +326,9 @@ pub(super) async fn get(
                 }
             }
 
+            // Authorized tombstones replace upstream's vanished list.
             let vanished: Vec<String> = match sync_collection.vanished_collection() {
+                _ if foreign_vanished.is_some() => foreign_vanished.take().unwrap_or_default(),
                 Some(vanished_collection) if maybe_has_vanished => server
                     .store()
                     .vanished(
@@ -427,7 +564,35 @@ pub(super) async fn get(
                         .resources(server, access_token, shared_account_id, sync_collection, 0)
                         .await
                         .caused_by(trc::location!())?;
-                    let shared_containers =
+                    // A foreign key account's calendars come from fresh contexts.
+                    let foreign_eligible = if sync_collection == SyncCollection::Calendar
+                        && server
+                            .za_is_key_account(shared_account_id)
+                            .await
+                            .caused_by(trc::location!())?
+                    {
+                        Some(
+                            foreign_calendar_contexts(
+                                server,
+                                access_token,
+                                shared_account_id,
+                                &shared_resources,
+                                None,
+                            )
+                            .await?,
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(eligible) = &foreign_eligible {
+                        for (&id, context) in eligible {
+                            data.calendar_memo
+                                .insert((shared_account_id, id), context.clone());
+                        }
+                    }
+                    let shared_containers = if let Some(eligible) = &foreign_eligible {
+                        Some(RoaringBitmap::from_iter(eligible.keys().copied()))
+                    } else {
                         (!access_token.is_member(shared_account_id)).then(|| {
                             shared_resources.shared_containers(
                                 access_token,
@@ -438,7 +603,8 @@ pub(super) async fn get(
                                 }],
                                 true,
                             )
-                        });
+                        })
+                    };
                     if shared_containers
                         .as_ref()
                         .is_none_or(|containers| !containers.is_empty())
@@ -571,6 +737,11 @@ pub(super) async fn multiget(
                 return Err(err);
             }
         };
+        // Zero-access: an href is read only from this REPORT's collection.
+        if resource.collection != collection_container {
+            response.add_response(Response::new_status([item], StatusCode::NOT_FOUND));
+            continue;
+        }
 
         let account_id = resource.account_id;
         let resources = data

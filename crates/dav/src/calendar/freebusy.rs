@@ -5,18 +5,14 @@
  */
 
 use super::query::CalendarQueryHandler;
-<<<<<<< HEAD
 use crate::{
     DavError,
-    calendar::query::is_resource_in_time_range,
+    calendar::query::EventTimeRange,
     common::{
         uri::DavUriResource,
-        za::{ZaFreeBusy, ZaReadMemo, ZeroAccessGate, za_read_event_view},
+        za::{ZaFreeBusy, ZeroAccessGate, za_freebusy_views},
     },
 };
-=======
-use crate::{DavError, calendar::query::EventTimeRange, common::uri::DavUriResource};
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 use calcard::{
     common::{PartialDateTime, timezone::Tz},
     icalendar::{
@@ -99,6 +95,9 @@ impl CalendarFreebusyRequestHandler for Server {
             .await?
             .into_owned_uri()?;
         let account_id = resource_.account_id;
+        // The calendar URI gate `validate_uri` runs, kept here as at 0.16.
+        self.za_uri_gate(access_token, account_id, resource_.collection)
+            .await?;
         let has_account_access = access_token.has_access(account_id, resource_.collection);
         let access_error = if has_account_access {
             StatusCode::NOT_FOUND
@@ -271,7 +270,7 @@ impl CalendarFreebusyRequestHandler for Server {
                 match self.za_freebusy_access(access_token, account_id).await? {
                     ZaFreeBusy::Plain => (None, document_ids),
                     ZaFreeBusy::Unsealed(keys) => (Some(keys), document_ids),
-                    ZaFreeBusy::Withheld => (None, Vec::new()),
+                    ZaFreeBusy::Withheld => (None, RoaringBitmap::new()),
                 };
 
             let mut fb_entries: AHashMap<ICalendarFreeBusyType, Vec<(i64, i64)>> =
@@ -279,93 +278,13 @@ impl CalendarFreebusyRequestHandler for Server {
             let max_instances = self.core.groupware.max_ical_instances;
             let mut total_instances: usize = 0;
 
-<<<<<<< HEAD
-            let mut za_memo = ZaReadMemo::new();
-            for document_id in document_ids {
-                let Some(archive) = self
-                    .store()
-                    .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
-                        account_id,
-                        Collection::CalendarEvent,
-                        document_id,
-                    ))
-                    .await
-                    .caused_by(trc::location!())?
-                else {
-                    continue;
-                };
-                let view_ = if za_keys.is_some() {
-                    za_read_event_view(
-                        self,
-                        access_token,
-                        account_id,
-                        document_id,
-                        resource.document_id(),
-                        &archive,
-                        &mut za_memo,
-                    )
-                    .await??
-                } else {
-                    std::borrow::Cow::Borrowed(&archive)
-                };
-                let event = view_
-                    .unarchive::<CalendarEvent>()
-                    .caused_by(trc::location!())?;
-
-                /*
-                   Only VEVENT components without a TRANSP property or with the TRANSP
-                   property set to OPAQUE, and VFREEBUSY components SHOULD be considered
-                   in generating the free busy time information.
-                */
-                let mut components = event
-                    .data
-                    .event
-                    .components
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, comp)| {
-                        (matches!(comp.component_type, ArchivedICalendarComponentType::VEvent)
-                            && comp
-                                .transparency()
-                                .is_none_or(|t| t == &ICalendarTransparency::Opaque))
-                            || matches!(
-                                comp.component_type,
-                                ArchivedICalendarComponentType::VFreebusy
-                            )
-                    })
-                    .peekable();
-
-                if components.peek().is_none() {
-                    continue;
+            // Ruling R6: the views are unsealed before the synchronous scan.
+            let za_views = match &za_keys {
+                Some(_) => {
+                    Some(za_freebusy_views(self, access_token, account_id, &document_ids).await?)
                 }
-
-                let events = CalendarQueryHandler::new(
-                    event,
-                    Some(range),
-                    default_tz,
-                    account_id,
-                    document_id,
-                )
-                .into_expanded_times();
-
-                if events.is_empty() {
-                    continue;
-                }
-
-                total_instances = total_instances.saturating_add(events.len());
-                if total_instances > max_instances {
-                    return Err(DavError::Code(StatusCode::PAYLOAD_TOO_LARGE));
-                }
-
-                for (component_id, component) in components {
-                    let component_id = component_id as u32;
-                    match component.component_type {
-                        ArchivedICalendarComponentType::VEvent => {
-                            let fbtype = match component.status() {
-                                Some(ArchivedICalendarStatus::Cancelled) => continue,
-                                Some(ArchivedICalendarStatus::Tentative) => {
-                                    ICalendarFreeBusyType::BusyTentative
-=======
+                None => None,
+            };
             if !document_ids.is_empty() {
                 self.archives(
                     account_id,
@@ -380,6 +299,13 @@ impl CalendarFreebusyRequestHandler for Server {
                         }) = selected.get(&document_id)
                         else {
                             return Ok(true);
+                        };
+                        let archive = match &za_views {
+                            Some(views) => match views.get(&document_id) {
+                                Some(view) => view,
+                                None => return Ok(true),
+                            },
+                            None => &archive,
                         };
                         let event = archive
                             .unarchive::<CalendarEventContent>()
@@ -405,7 +331,6 @@ impl CalendarFreebusyRequestHandler for Server {
                                                 ComponentBusy::parse(comp, identities, role)
                                                     .is_some_and(|busy| busy.is_attending())
                                             }))
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                                 }
                                 ArchivedICalendarComponentType::VFreebusy => !attending_only,
                                 _ => false,
@@ -416,7 +341,13 @@ impl CalendarFreebusyRequestHandler for Server {
                             return Ok(true);
                         }
 
-                        let events = CalendarQueryHandler::new(event, Some(range), default_tz);
+                        let events = CalendarQueryHandler::new(
+                            event,
+                            Some(range),
+                            default_tz,
+                            account_id,
+                            document_id,
+                        );
 
                         if events.expanded_times.is_empty() {
                             return Ok(true);

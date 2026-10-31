@@ -4,17 +4,12 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-<<<<<<< HEAD
 use crate::{DavError, DavResourceName, common::za::ZeroAccessGate};
-use common::{Server, auth::AccessToken};
-=======
-use crate::{DavError, DavResourceName};
 use common::{
     DavResourcePath, Server,
     auth::AccessToken,
     storage::dav::{DavFileNameError, canonical_calcard_uri, canonical_dav_resource_uri},
 };
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 use groupware::cache::GroupwareCache;
 use http_proto::request::decode_path_element;
 use hyper::StatusCode;
@@ -132,6 +127,10 @@ impl DavUriResource for Server {
         {
             return Err(DavError::Code(StatusCode::FORBIDDEN));
         }
+        if let Some(account_id) = resource.account_id {
+            self.za_uri_gate(access_token, account_id, resource.collection)
+                .await?;
+        }
         Ok(resource)
     }
 
@@ -171,24 +170,6 @@ impl DavUriResource for Server {
                     .ok_or(DavError::Code(error_status))?
             };
 
-<<<<<<< HEAD
-            // Validate access
-            if resource.collection != Collection::Principal
-                && !access_token.has_access(account_id, resource.collection)
-            {
-                return Err(DavError::Code(StatusCode::FORBIDDEN));
-            }
-
-            // Calendar sharing admits only an authenticated grantee's own session.
-            // Scheduling remains confined to the account whose keys are held.
-            if resource.collection == Collection::Calendar {
-                self.za_calendar_gate(access_token, account_id).await?;
-            } else if resource.collection == Collection::CalendarEventNotification {
-                self.za_session_keys(access_token, account_id).await?;
-            }
-
-=======
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
             // Obtain remaining path
             resource.account_id = Some(account_id);
             resource.resource = uri_parts.next();

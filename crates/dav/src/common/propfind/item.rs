@@ -671,6 +671,8 @@ impl PropFindItemBuilder for Server {
                                     has_alarms: false,
                                 },
                                 default_tz,
+                                account_id,
+                                item.document_id,
                             ));
                         }
                         if let Some(handler) = &calendar_filter {

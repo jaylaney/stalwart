@@ -24,12 +24,8 @@ use crate::{
         acl::DavAclHandler,
         lock::{LockRequest, LockRequestHandler},
         propfind::PropFindRequestHandler,
-<<<<<<< HEAD
-        uri::DavUriResource,
-        za::za_calendar_report_uri,
-=======
         uri::{DavUriResource, UriResource, canonical_dav_uri},
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+        za::za_calendar_report_uri,
     },
     file::{
         copy_move::FileCopyMoveRequestHandler, delete::FileDeleteRequestHandler,
@@ -682,10 +678,14 @@ impl DavRequestHandler for Server {
                 .dispatch_dav_request(&headers, access_token.clone(), resource, method, &body)
                 .await
             {
+                // Zero-access: a key account's handlers run their own bounded
+                // retry, and a whole-request replay would repeat a fan-out
+                // whose items already committed (invitations spec 5.4).
                 Err(DavError::Internal(err))
                     if err.is_assertion_failure()
                         && method.is_write()
-                        && retries < MAX_CONFLICT_RETRIES =>
+                        && retries < MAX_CONFLICT_RETRIES
+                        && access_token.session_keys().is_none() =>
                 {
                     retries += 1;
                     let collection = SyncCollection::from(Collection::from(resource));

@@ -9,6 +9,7 @@ mod dead;
 mod get;
 mod item;
 mod load;
+mod za;
 
 pub(crate) use data::{ExpandedPrincipals, PropFindAccountQuota, PropFindData, SyncTokenUrn};
 pub(crate) use get::requested_href;
@@ -28,7 +29,7 @@ use crate::{
     file::{FILE_CONTAINER_PROPS, FILE_ITEM_PROPS},
     principal::{
         CurrentUserPrincipal,
-        propfind::{PrincipalPropFind, build_home_set},
+        propfind::{PrincipalPropFind, build_home_set, foreign_home_visible},
     },
 };
 use calcard::common::timezone::Tz;
@@ -59,6 +60,7 @@ use std::borrow::Cow;
 use store::{registry::RegistryQuery, roaring::RoaringBitmap, write::metadata::MetadataBuf};
 use trc::AddContext;
 use types::collection::{Collection, SyncCollection};
+use za::{ZaItem, dav_query_response, za_open_dead_container, za_propfind_item, za_propname_item};
 
 pub(crate) trait PropFindRequestHandler: Sync + Send {
     fn handle_propfind_request(
@@ -273,10 +275,21 @@ impl PropFindRequestHandler for Server {
                     RoaringBitmap::from_iter(access_token.all_ids())
                 };
 
+                // A root discovery omits foreign key-account homes without an
+                // eligible own-id calendar. An explicitly addressed home still
+                // returns its root and 207 even when every calendar is omitted.
+                let mut visible_ids = Vec::new();
+                for account_id in ids {
+                    if resource.collection != Collection::Calendar
+                        || foreign_home_visible(self, access_token, account_id).await?
+                    {
+                        visible_ids.push(account_id);
+                    }
+                }
                 self.prepare_principal_propfind_response(
                     access_token,
                     resource.collection,
-                    ids.into_iter(),
+                    visible_ids.into_iter(),
                     &request,
                     &mut response,
                 )
@@ -306,6 +319,9 @@ impl PropFindRequestHandler for Server {
         let mut is_sync_limited = false;
         let mut is_propfind = false;
 
+        // An otherwise valid home listing omits individual refused calendars.
+        // Directly addressed resources and reports retain request-level refusals.
+        let za_home_listing = matches!(&query.resource, DavQueryResource::Uri(resource) if resource.resource.is_none());
         let mut paths = match std::mem::take(&mut query.resource) {
             DavQueryResource::Uri(resource) => {
                 collection_container = resource.collection;
@@ -408,8 +424,38 @@ impl PropFindRequestHandler for Server {
                         for item in paths.by_ref().take(len) {
                             let collection =
                                 collection_of(&item, collection_container, collection_children);
+                            // Zero-access: a fresh own-id read context per key-account
+                            // item; pending inbox items are not listed.
+                            let Some(za_views) = za_propname_item(
+                                self,
+                                access_token,
+                                &item,
+                                collection_container,
+                                collection,
+                                za_home_listing,
+                                &mut data.calendar_memo,
+                            )
+                            .await?
+                            else {
+                                continue;
+                            };
                             let container =
                                 containers.get(item.account_id, collection, item.document_id);
+                            let za_container = match (za_views.context(), container) {
+                                (Some(_), Some(container)) => Some(
+                                    za_open_dead_container(
+                                        self, &za_views, &item, collection, container,
+                                    )
+                                    .await
+                                    .caused_by(trc::location!())?,
+                                ),
+                                _ => None,
+                            };
+                            let container = if za_views.context().is_some() {
+                                za_container.as_ref()
+                            } else {
+                                container
+                            };
                             response.add_response(item.into_property_names(
                                 container_props,
                                 children_props,
@@ -419,8 +465,9 @@ impl PropFindRequestHandler for Server {
                         }
                     }
 
-                    return Ok(HttpResponse::new(StatusCode::MULTI_STATUS)
-                        .with_xml_body(response.to_string()));
+                    // A PROPFIND always lists its target: 404 only when every
+                    // item was hidden.
+                    return Ok(dav_query_response(is_propfind, &response, &query.sync_type));
                 }
 
                 (Vec::new(), Some((container_props, children_props)))
@@ -508,6 +555,7 @@ impl PropFindRequestHandler for Server {
                 let collection = loader.collection_of(&item);
 
                 // Unarchive resource
+                let za_views;
                 let cached_resources;
                 let archive = if ctx.is_scheduling && item.is_container {
                     Some(ArchivedResource::CalendarEventNotificationCollection(
@@ -534,6 +582,37 @@ impl PropFindRequestHandler for Server {
                         .add_response(Response::new_status([item.name], StatusCode::NOT_FOUND));
                     continue;
                 };
+                // Spec 8.2, invitations spec 6.6: a key account's calendar item
+                // is read through its fresh read context and unsealed before any
+                // use (and before `calendar_event_view`), whether it was loaded
+                // in the batch or answered from the resource cache; a pending
+                // inbox item is not listed.
+                match za_propfind_item(
+                    self,
+                    access_token,
+                    &item,
+                    collection,
+                    &archive,
+                    za_home_listing,
+                    &mut state.data.calendar_memo,
+                )
+                .await?
+                {
+                    ZaItem::Plain => za_views = None,
+                    ZaItem::Skip => continue,
+                    ZaItem::Status(status) => {
+                        state
+                            .response
+                            .add_response(Response::new_status([item.name], status));
+                        continue;
+                    }
+                    ZaItem::View(views) => {
+                        za_views = Some(views);
+                        if let Some(views) = &za_views {
+                            views.apply(&mut archive).caused_by(trc::location!())?;
+                        }
+                    }
+                }
                 if needs_event_view
                     && let ArchivedResource::CalendarEvent(event, Some(content)) = &mut archive
                     && let Some((view, merged_overrides)) = self
@@ -581,6 +660,8 @@ impl PropFindRequestHandler for Server {
                                 content,
                                 filter.expansion,
                                 default_tz,
+                                account_id,
+                                item.document_id,
                             );
                             if filter.filter.as_ref().is_some_and(|filter| {
                                 !query_handler.matches_content(content, filter)
@@ -617,6 +698,34 @@ impl PropFindRequestHandler for Server {
                 let container = containers
                     .get(account_id, collection, item.document_id)
                     .filter(|_| !item.dead.is_hidden_from(access_token, account_id));
+                // Rulings 16 and 23: a key account's dead properties are
+                // opened before their names or values are served.
+                let za_container = match (&za_views, container) {
+                    (Some(views), Some(container)) if views.context().is_some() => {
+                        match za_open_dead_container(self, views, &item, collection, container)
+                            .await
+                        {
+                            Ok(opened) => Some(opened),
+                            Err(error) => {
+                                trc::error!(error);
+                                state.response.add_response(Response::new_status(
+                                    [item.name],
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                ));
+                                continue;
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                let container = if za_views
+                    .as_ref()
+                    .is_some_and(|views| views.context().is_some())
+                {
+                    za_container.as_ref()
+                } else {
+                    container
+                };
                 if let Some((container_props, children_props)) = property_names {
                     state.response.add_response(item.into_property_names(
                         container_props,
@@ -650,11 +759,7 @@ impl PropFindRequestHandler for Server {
             );
         }
 
-        if !is_propfind || !response.response.0.is_empty() || !query.sync_type.is_none() {
-            Ok(HttpResponse::new(StatusCode::MULTI_STATUS).with_xml_body(response.to_string()))
-        } else {
-            Ok(HttpResponse::new(StatusCode::NOT_FOUND))
-        }
+        Ok(dav_query_response(is_propfind, &response, &query.sync_type))
     }
 
     async fn dav_quota(&self, account_id: u32) -> trc::Result<PropFindAccountQuota> {

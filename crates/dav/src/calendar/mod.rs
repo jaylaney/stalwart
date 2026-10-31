@@ -16,13 +16,6 @@ pub mod scheduling;
 pub mod update;
 pub mod view;
 
-<<<<<<< HEAD
-use crate::{DavError, DavErrorCondition};
-use common::{
-    DavResources, Server,
-    za::lease::{ZaUidLease, ZaUidLeaseGuard},
-};
-=======
 use crate::{
     DavError, DavErrorCondition,
     common::{ContainerOperation, MergedOverrides},
@@ -31,24 +24,19 @@ use calcard::icalendar::{
     ArchivedICalendar, ArchivedICalendarComponentType, ICalendar, ICalendarComponent,
     ICalendarComponentType,
 };
-use common::{ArchivedDavName, GroupwareResources, Server, auth::AccessToken};
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+use common::{
+    ArchivedDavName, GroupwareResources, Server,
+    auth::{AccessToken, AccountInfo},
+    za::lease::{ZaUidLease, ZaUidLeaseGuard},
+};
 use dav_proto::schema::{
     property::{CalDavProperty, CalendarData, DavProperty, WebDavProperty},
     response::CalCondition,
 };
-<<<<<<< HEAD
-use groupware::{calendar::CalendarEvent, scheduling::ItipError};
-use http_proto::HttpResponse;
-use hyper::StatusCode;
-use store::{
-    ValueKey,
-    write::{AlignedBytes, Archive, BatchBuilder},
-=======
 use groupware::{
     calendar::{
-        Alarm, ArchivedCalendarEvent, ArchivedCalendarEventContent, Calendar, CalendarEventContent,
-        EVENT_HAS_ALARMS, SupportedComponent,
+        Alarm, ArchivedCalendarEvent, ArchivedCalendarEventContent, Calendar, CalendarEvent,
+        CalendarEventContent, EVENT_HAS_ALARMS, SupportedComponent,
         alarm::ExpandAlarm,
         alerts::{DefaultAlertsResolver, DefaultAlertsView, ICalendarDefaultAlerts},
         compare::{ComparisonScope, RecurrenceComponents},
@@ -57,11 +45,11 @@ use groupware::{
     },
     scheduling::ItipError,
 };
+use http_proto::HttpResponse;
 use hyper::StatusCode;
 use store::{
     ValueKey,
-    write::{Archive, ArchiveBytes, serialize::rkyv_deserialize},
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+    write::{Archive, ArchiveBytes, BatchBuilder, serialize::rkyv_deserialize},
 };
 use trc::AddContext;
 use types::{collection::Collection, field::CalendarEventField};
@@ -500,7 +488,8 @@ pub(crate) fn user_data_error(err: UserDataError) -> DavError {
 /// lease is released.
 pub(crate) async fn za_take_uid_lease(
     server: &Server,
-    resources: &DavResources,
+    resources: &GroupwareResources,
+    access_token: &AccessToken,
     account_id: u32,
     calendar_id: u32,
     uid: &str,
@@ -517,7 +506,15 @@ pub(crate) async fn za_take_uid_lease(
         return Err(DavError::Code(StatusCode::SERVICE_UNAVAILABLE));
     };
     let lease = ZaUidLeaseGuard::new(server.store().clone(), lease);
-    if let Err(err) = za_assert_is_unique_uid(server, resources, account_id, calendar_id, uid).await
+    if let Err(err) = za_assert_is_unique_uid(
+        server,
+        resources,
+        access_token,
+        account_id,
+        calendar_id,
+        uid,
+    )
+    .await
     {
         lease.release().await;
         return Err(err);
@@ -534,7 +531,8 @@ pub(crate) async fn za_take_uid_lease(
 /// snapshot only formats the href.
 pub(crate) async fn za_assert_is_unique_uid(
     server: &Server,
-    resources: &DavResources,
+    resources: &GroupwareResources,
+    access_token: &AccessToken,
     account_id: u32,
     calendar_id: u32,
     uid: &str,
@@ -548,10 +546,15 @@ pub(crate) async fn za_assert_is_unique_uid(
         )
         .await
         .caused_by(trc::location!())?;
+    // Upstream's rule at 1.0 (`assert_is_unique_uid`): a conflict answers
+    // 403 `NoUidConflict`, and a sharee whose only conflict is a secret
+    // event gets a plain 403, without its href.
+    let is_owner = access_token.is_member(account_id);
+    let mut has_hidden_conflict = false;
     for document_id in hits {
         let Some(stored) = server
             .store()
-            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
                 account_id,
                 Collection::CalendarEvent,
                 document_id,
@@ -569,6 +572,12 @@ pub(crate) async fn za_assert_is_unique_uid(
             .iter()
             .find(|name| name.parent_id.to_native() == calendar_id)
         {
+            if !is_owner
+                && EventPrivacy::from_flags(event.flags.to_native()) == EventPrivacy::Secret
+            {
+                has_hidden_conflict = true;
+                continue;
+            }
             let href = resources
                 .container_resource_path_by_id(calendar_id)
                 .map(|calendar| {
@@ -576,12 +585,16 @@ pub(crate) async fn za_assert_is_unique_uid(
                 })
                 .unwrap_or_default();
             return Err(DavError::Condition(DavErrorCondition::new(
-                StatusCode::PRECONDITION_FAILED,
+                StatusCode::FORBIDDEN,
                 CalCondition::NoUidConflict(href.into()),
             )));
         }
     }
-    Ok(())
+    if has_hidden_conflict {
+        Err(DavError::Code(StatusCode::FORBIDDEN))
+    } else {
+        Ok(())
+    }
 }
 
 /// Invitations spec 5.4 and 6.3 step 3: what a key account's create does
@@ -593,7 +606,8 @@ pub(crate) async fn za_assert_is_unique_uid(
 /// and released; otherwise 503, so the client resends. Never `Ok`.
 pub(crate) async fn za_lost_create_fence(
     server: &Server,
-    resources: &DavResources,
+    resources: &GroupwareResources,
+    access_token: &AccessToken,
     lease: ZaUidLeaseGuard,
     account_id: u32,
     calendar_id: u32,
@@ -602,6 +616,7 @@ pub(crate) async fn za_lost_create_fence(
     za_finish_create_loss(
         server,
         resources,
+        access_token,
         lease,
         account_id,
         calendar_id,
@@ -616,9 +631,11 @@ enum CreateLoss {
     OpaqueSecondCommit,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn za_finish_create_loss(
     server: &Server,
-    resources: &DavResources,
+    resources: &GroupwareResources,
+    access_token: &AccessToken,
     lease: ZaUidLeaseGuard,
     account_id: u32,
     calendar_id: u32,
@@ -642,7 +659,15 @@ async fn za_finish_create_loss(
             let _ = lease.release().await;
         }
     }
-    let retry = za_take_uid_lease(server, resources, account_id, calendar_id, uid).await?;
+    let retry = za_take_uid_lease(
+        server,
+        resources,
+        access_token,
+        account_id,
+        calendar_id,
+        uid,
+    )
+    .await?;
     retry.release().await;
     // The retake found no copy in this calendar. Keep the existing resend
     // answer for either a confirmed lease loss or an opaque second loss.
@@ -652,9 +677,11 @@ async fn za_finish_create_loss(
 /// The bounded second create commit. Its assertion loss is opaque: release
 /// our fenced lease before the existing UID retake/outcome, without another
 /// calendar read, archive retry or fan-out.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn za_commit_create(
     server: &Server,
-    resources: &DavResources,
+    resources: &GroupwareResources,
+    access_token: &AccessToken,
     batch: BatchBuilder,
     lease: ZaUidLeaseGuard,
     account_id: u32,
@@ -680,6 +707,7 @@ pub(crate) async fn za_commit_create(
         Err(err) if err.is_assertion_failure() => za_finish_create_loss(
             server,
             resources,
+            access_token,
             lease,
             account_id,
             calendar_id,
@@ -779,12 +807,13 @@ pub(crate) async fn za_refresh_event(
     calendar_id: u32,
     required: types::acl::Acl,
     before: &[groupware::calendar::sharing::resolve::ZaCalendarContext],
-    sealed: &mut CalendarEvent,
+    sealed: &mut groupware::calendar::seal::ZaEvent,
 ) -> crate::Result<Option<Vec<groupware::calendar::sharing::resolve::ZaCalendarContext>>> {
     if before.is_empty() {
         return Ok(None);
     }
-    let after = za_write_contexts(server, token, owner_id, sealed, calendar_id, required).await?;
+    let after =
+        za_write_contexts(server, token, owner_id, &sealed.meta, calendar_id, required).await?;
     if !groupware::calendar::sharing::resolve::calendars_changed(before, &after) {
         return Ok(None);
     }
@@ -809,6 +838,48 @@ pub(crate) async fn za_writer_keys(
         .cloned()
         .map(Some)
         .ok_or(DavError::Code(StatusCode::FORBIDDEN))
+}
+
+/// The scheduling roles of a key account's write (release 4 delegated
+/// scheduling): the sender is the writer's account info with the owner's
+/// addresses added (0.16's `scheduling_account_info`, which 1.0 removed; its
+/// handlers now pass the owner's), the writer's and the owner's own infos.
+pub(crate) struct ZaRoles {
+    pub sender: AccountInfo,
+    pub writer: AccountInfo,
+    pub owner: AccountInfo,
+}
+
+pub(crate) async fn za_roles(
+    server: &Server,
+    token: &AccessToken,
+    owner_id: u32,
+) -> crate::Result<ZaRoles> {
+    let writer = server
+        .account_info(token.account_id())
+        .await
+        .caused_by(trc::location!())?;
+    let owner = if owner_id == token.account_id() {
+        writer.clone()
+    } else {
+        server
+            .account_info(owner_id)
+            .await
+            .caused_by(trc::location!())?
+    };
+    let mut sender = writer.clone();
+    if owner_id != token.account_id() {
+        for address in &owner.addresses {
+            if !sender.addresses.contains(address) {
+                sender.addresses.push(address.clone());
+            }
+        }
+    }
+    Ok(ZaRoles {
+        sender,
+        writer,
+        owner,
+    })
 }
 
 /// Exercise the actual private event MOVE helper before foreign DAV URI admission

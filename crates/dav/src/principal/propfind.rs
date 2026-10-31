@@ -33,7 +33,7 @@ use registry::schema::enums::Permission;
 use std::borrow::Cow;
 use store::{
     ValueKey,
-    write::{AlignedBytes, Archive},
+    write::{Archive, ArchiveBytes},
 };
 use trc::AddContext;
 use types::collection::{Collection, SyncCollection};
@@ -429,12 +429,12 @@ pub(crate) async fn foreign_home_visible(
         return Ok(true);
     }
     let resources = server
-        .fetch_dav_resources(token.account_id(), owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(token.account_id(), owner, SyncCollection::Calendar)
         .await?;
     for id in resources.document_ids(true) {
         if let Some(stored) = server
             .store()
-            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(owner, Collection::Calendar, id))
+            .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(owner, Collection::Calendar, id))
             .await?
         {
             let calendar = stored.deserialize::<Calendar>()?;

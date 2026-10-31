@@ -10,7 +10,7 @@ use crate::{
     common::{
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
-        za::{ZaReadMemo, za_read_event_view},
+        za::{ZaReadMemo, za_event_view_in, za_read_event_context},
     },
 };
 use common::{Server, auth::AccessToken};
@@ -119,33 +119,28 @@ impl CalendarGetRequestHandler for Server {
             )
             .await
             .caused_by(trc::location!())?
-<<<<<<< HEAD
-            .ok_or(DavError::Code(StatusCode::NOT_FOUND))?;
-        let etag = event_.etag();
-        let view_ = za_read_event_view(
-            self,
-            access_token,
-            account_id,
-            resource.document_id(),
-            resource.parent_id().unwrap(),
-            &event_,
-            &mut ZaReadMemo::new(),
-        )
-        .await??;
-        let event = view_
-=======
         };
         let event_ = event_.ok_or(DavError::Code(StatusCode::NOT_FOUND))?;
         let event = event_
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
             .unarchive::<CalendarEvent>()
             .caused_by(trc::location!())?;
 
         // Validate headers
-<<<<<<< HEAD
-=======
         let etag = format!("\"{}\"", event.etag.to_native());
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+        // Spec 7.3: a key account's event is read through its calendar's
+        // fresh read context (refused before any header is evaluated); the
+        // content is unsealed below, the identity stays the stored row's.
+        let za_context = za_read_event_context(
+            self,
+            access_token,
+            account_id,
+            resource.document_id(),
+            resource
+                .parent_id()
+                .ok_or(DavError::Code(StatusCode::NOT_FOUND))?,
+            &mut ZaReadMemo::new(),
+        )
+        .await??;
         let schedule_tag = event.schedule_tag.as_ref().map(|tag| tag.to_native());
         self.validate_headers(
             access_token,
@@ -170,7 +165,8 @@ impl CalendarGetRequestHandler for Server {
             .with_last_modified(Rfc1123DateTime::new(i64::from(event.modified)).to_string());
 
         let has_alarms = event.flags.to_native() & EVENT_HAS_ALARMS != 0;
-        if is_head && is_owner && !has_alarms {
+        // A key account's stored size is the sealed tree's: measure the view.
+        if is_head && is_owner && !has_alarms && za_context.is_none() {
             return Ok(response.with_content_length(event.size.to_native() as usize));
         }
 
@@ -188,6 +184,19 @@ impl CalendarGetRequestHandler for Server {
                 .caused_by(trc::location!())?
                 .ok_or(DavError::Code(StatusCode::NOT_FOUND))?,
         };
+        let content_ = match &za_context {
+            Some(context) => {
+                za_event_view_in(
+                    context,
+                    event,
+                    &content_,
+                    account_id,
+                    resource.document_id(),
+                )?
+                .content
+            }
+            None => content_,
+        };
         let content = content_
             .to_unarchived::<CalendarEventContent>()
             .caused_by(trc::location!())?;
@@ -204,6 +213,9 @@ impl CalendarGetRequestHandler for Server {
         if is_head {
             return Ok(match view {
                 Some((view, _)) => response.with_content_length(SizeWriter::ical(&view.data.event)),
+                None if za_context.is_some() => {
+                    response.with_content_length(content.inner.data.event.to_string().len())
+                }
                 None => response.with_content_length(event.size.to_native() as usize),
             });
         }

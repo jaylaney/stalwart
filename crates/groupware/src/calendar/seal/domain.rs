@@ -33,7 +33,10 @@ struct SharedDomain {
 }
 
 impl ZaKeyDomain {
-    pub(crate) fn owner(keys: &SessionKeys) -> Self {
+    /// The owner's own domain (its event wrapping key). Public for DAV's
+    /// MKCOL, which seals a new calendar's dead properties before the
+    /// calendar has a context (upgrade ruling 16).
+    pub fn owner(keys: &SessionKeys) -> Self {
         Self {
             owner_id: keys.account_id,
             principal_id: keys.account_id,

@@ -5,7 +5,7 @@
  */
 
 use super::DeadTarget;
-use crate::PropStatBuilder;
+use crate::{PropStatBuilder, common::za::ZaDeadSeal};
 use common::{
     Server,
     storage::{
@@ -109,13 +109,25 @@ impl DeadPatch {
         target: DeadTarget,
         items: &mut PropStatBuilder,
     ) -> trc::Result<Option<DeadWrite>> {
+        self.apply_za(server, target, None, items).await
+    }
+
+    /// `apply`, with a key account's container sealed in `za` (upgrade
+    /// rulings 16 and 23); `None` is upstream's path.
+    pub async fn apply_za(
+        self,
+        server: &Server,
+        target: DeadTarget,
+        za: Option<&ZaDeadSeal<'_>>,
+        items: &mut PropStatBuilder,
+    ) -> trc::Result<Option<DeadWrite>> {
         if self.is_empty() {
             Ok(None)
         } else if items.has_errors() {
             self.fail(items);
             Ok(None)
         } else {
-            self.prepare(server, target, items).await
+            self.prepare(server, target, za, items).await
         }
     }
 
@@ -123,6 +135,7 @@ impl DeadPatch {
         self,
         server: &Server,
         target: DeadTarget,
+        za: Option<&ZaDeadSeal<'_>>,
         items: &mut PropStatBuilder,
     ) -> trc::Result<Option<DeadWrite>> {
         let owner = server.account(target.account_id).await?;
@@ -134,7 +147,15 @@ impl DeadPatch {
             }
             _ => None,
         };
-        let current_view = current.as_ref().map(|current| current.view());
+        // Ruling 23: a key account's edit is built on the opened container.
+        let opened = za
+            .map(|za| za.open(current.as_ref()))
+            .transpose()?
+            .flatten();
+        let current_view = opened
+            .as_ref()
+            .or(current.as_ref())
+            .map(|current| current.view());
         let mut builder = current_view
             .as_ref()
             .map_or_else(MetadataBuilder::new, MetadataBuilder::from_view);
@@ -181,11 +202,25 @@ impl DeadPatch {
         }
 
         let mut change = None;
+        let mut plain_next = None;
         if outcomes.iter().all(|outcome| outcome.is_success()) {
-            change = ContainerChange::new(current.as_ref(), builder.encode(), builder.edit());
+            change = match za {
+                // Ruling 23: compared and limit-checked as plaintext, sealed
+                // before the change is built.
+                Some(za) => {
+                    plain_next = builder.encode();
+                    za.change(
+                        current.as_ref(),
+                        opened.as_ref(),
+                        plain_next.as_ref(),
+                        builder.edit(),
+                    )?
+                }
+                None => ContainerChange::new(current.as_ref(), builder.encode(), builder.edit()),
+            };
             let failure = match &change {
                 Some(change)
-                    if change.next().is_some_and(|next| {
+                    if plain_next.as_ref().or(change.next()).is_some_and(|next| {
                         limits
                             .check_edit(MetadataScope::Shared, previous_len, previous_entries, next)
                             .is_err()
