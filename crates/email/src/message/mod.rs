@@ -16,9 +16,6 @@ pub mod ingest_metadata;
 pub mod jmap;
 pub mod messagedata;
 pub mod metadata;
-<<<<<<< HEAD
-pub mod za;
-=======
 pub mod sortkeys;
 pub mod thread;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
+pub mod za;

@@ -693,6 +693,7 @@ impl SieveScriptIngest for Server {
                                         modifications: &mut Vec::new(),
                                         access_token: access_token.into(),
                                         arguments,
+                                        za_redact: account_info.is_key_account(),
                                     },
                                 )
                                 .await
@@ -710,42 +711,6 @@ impl SieveScriptIngest for Server {
 
                             Input::Bool(exists)
                         }
-<<<<<<< HEAD
-                    }
-                    Event::ListContains { .. }
-                    | Event::Notify { .. }
-                    | Event::SetEnvelope { .. } => {
-                        // Not allowed
-                        input = false.into();
-                    }
-                    Event::Function { id, arguments } => {
-                        input = self
-                            .core
-                            .run_plugin(
-                                id,
-                                PluginContext {
-                                    session_id,
-                                    server: self,
-                                    message: instance.message(),
-                                    modifications: &mut Vec::new(),
-                                    access_token: access_token.into(),
-                                    arguments,
-                                    za_redact: account_info.is_key_account(),
-                                },
-                            )
-                            .await;
-                    }
-                    Event::CreatedMessage { message, .. } => {
-                        messages.push(SieveMessage {
-                            raw_message: message.into(),
-                            file_into: Vec::new(),
-                            flags: Vec::new(),
-                            did_file_into: false,
-                        });
-                        input = true.into();
-                    }
-                },
-=======
                         Some(PendingWork::FileInto(request)) => {
                             let target = loop {
                                 match handler.file_into_target(&request) {
@@ -782,7 +747,6 @@ impl SieveScriptIngest for Server {
                                 (FileIntoTarget::Create, _) => INBOX_ID,
                             };
                             handler.file_into(target_id, request.flags, request.message_id, true);
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 
                             Input::Continue
                         }
@@ -792,7 +756,7 @@ impl SieveScriptIngest for Server {
                     ctx.resume(input);
                 }
 
-                #[cfg(stalwart_tests)]
+                #[cfg(feature = "test_mode")]
                 Err(sieve::runtime::RuntimeError::ScriptErrorMessage(err)) => {
                     panic!("Sieve test failed: {}", err);
                 }
@@ -800,17 +764,13 @@ impl SieveScriptIngest for Server {
                 Err(err) => {
                     trc::event!(
                         Sieve(SieveEvent::RuntimeError),
-<<<<<<< HEAD
                         // Mail spec 10: a key account's script can quote its
                         // message (`error "${header.subject}"`).
                         Reason = if account_info.is_key_account() {
                             trc::Value::redacted()
                         } else {
-                            err.to_string().into()
+                            err.to_compact_string().into()
                         },
-=======
-                        Reason = err.to_compact_string(),
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
                         SpanId = session_id
                     );
                 }

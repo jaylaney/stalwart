@@ -17,15 +17,8 @@ use common::{
     MessageUid, Server,
     auth::AccountCache,
     storage::{index::ObjectIndexBuilder, metadata::PrivateMetadataCommit},
-};
-<<<<<<< HEAD
-use common::{
-    Server,
-    storage::index::ObjectIndexBuilder,
     za::{ZA_TRACE_MAIL_COPY, mail::za_keyless_refusal},
 };
-use mail_parser::parsers::fields::thread::thread_name;
-=======
 // SPDX-SnippetBegin
 // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
 // SPDX-License-Identifier: LicenseRef-SEL
@@ -33,7 +26,6 @@ use mail_parser::parsers::fields::thread::thread_name;
 use common::storage::quota::DiskQuotaBudget;
 // SPDX-SnippetEnd
 use mail_parser::HeaderForm;
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 use registry::{
     schema::{
         enums::StorageQuota,
@@ -103,11 +95,11 @@ impl EmailCopy for Server {
         mut containers: Option<Box<IngestMetadata>>,
         session_id: u64,
     ) -> trc::Result<Result<IngestedEmail, CopyMessageError>> {
-<<<<<<< HEAD
+        let to_account_id = to_account.id;
         // Mail spec 6.3: no copy into or out of a key account. The callers
         // answer their client first; this refuses a classification that
-        // changed since, before any read.
-        for account_id in [from_account_id, to_account_id] {
+        // changed since, before the source row is read.
+        for account_id in [source.account_id(), to_account_id] {
             if self.za_is_key_account(account_id).await? {
                 trc::event!(
                     Security(trc::SecurityEvent::Unauthorized),
@@ -118,44 +110,8 @@ impl EmailCopy for Server {
                 return Err(za_keyless_refusal().account_id(account_id));
             }
         }
-
-        // Obtain metadata
-        let mut metadata = if let Some(metadata) = self
-            .store()
-            .get_value::<Archive<AlignedBytes>>(ValueKey::property(
-                from_account_id,
-                Collection::Email,
-                from_message_id,
-                EmailField::Metadata,
-            ))
-            .await?
-        {
-            metadata
-                .deserialize::<MessageMetadata>()
-                .caused_by(trc::location!())?
-        } else {
-            return Ok(Err(CopyMessageError::NotFound));
-        };
-
-        // Check quota
-        let size = metadata.root_part().offset_end;
-        let to_account = self.account(to_account_id).await?;
         #[cfg(feature = "test_mode")]
         common::za::copy_pause_point(to_account_id).await;
-        match self.has_available_quota(&to_account, size as u64).await {
-            Ok(_) => (),
-            Err(err) => {
-                if err.matches(trc::EventType::Limit(trc::LimitEvent::Quota))
-                    || err.matches(trc::EventType::Limit(trc::LimitEvent::TenantQuota))
-                {
-                    trc::error!(err.account_id(to_account_id).span_id(session_id));
-                    return Ok(Err(CopyMessageError::OverQuota));
-                } else {
-                    return Err(err);
-                }
-            }
-=======
-        let to_account_id = to_account.id;
         let (metadata_bytes, sort_keys_bytes) = source.into_parts();
         let row = MetadataRow::deserialize(&metadata_bytes).caused_by(trc::location!())?;
         let metadata = row.unarchive().caused_by(trc::location!())?;
@@ -164,7 +120,6 @@ impl EmailCopy for Server {
                 .shared
                 .take()
                 .filter(|container| container.kinds().intersects(MessageData::TRACKED_METADATA));
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
         }
 
         let size = u32::try_from(metadata.size()).unwrap_or(u32::MAX);
@@ -251,6 +206,9 @@ impl EmailCopy for Server {
         // Prepare batch
         let mut batch = BatchBuilder::new();
         batch.with_account_id(to_account_id);
+        // Mail spec 6.1, the provisioning fence, as in `email_ingest_into`:
+        // the batch adds no commit point.
+        self.za_provisioning_fence(&mut batch, to_account_id);
         self.limit_disk_quota(&mut batch, to_account);
         self.limit_object_quota(&mut batch, to_account, StorageQuota::MaxEmails);
 
@@ -361,9 +319,6 @@ impl EmailCopy for Server {
         };
 
         metadata.index_verbatim(&mut batch, metadata_bytes, sort_keys);
-
-        // Mail spec 6.1, the provisioning fence, as in `email_ingest`.
-        self.za_provisioning_fence(&mut batch, to_account_id);
 
         // Insert and obtain ids
         let queues = batch.queue_notify();

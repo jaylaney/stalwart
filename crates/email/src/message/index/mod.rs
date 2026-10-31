@@ -6,9 +6,6 @@
 
 use crate::{
     mailbox::{JUNK_ID, TRASH_ID},
-<<<<<<< HEAD
-    message::metadata::{ArchivedMessageData, MessageData, MessageMetadata},
-=======
     message::{
         messagedata::{MessageData, PendingMessageData},
         metadata::ExtraHeaders,
@@ -30,7 +27,6 @@ use types::{
     collection::SyncCollection,
     field::{EmailField, Field},
     metadata::MetadataKinds,
->>>>>>> 23b69755cb3cd8ecd952fe0443c5ac067a506184
 };
 
 pub mod attachment;
@@ -175,15 +171,6 @@ pub(super) trait IndexMessage {
         extra_headers: &ExtraHeaders,
         blob_hash: BlobHash,
         data: PendingMessageData,
-    ) -> trc::Result<&mut Self>;
-
-    /// The blob link, `MessageData` and the metadata archive of
-    /// `index_message`, for a metadata archive built by the caller.
-    fn index_metadata(
-        &mut self,
-        tenant_id: Option<u32>,
-        metadata: MessageMetadata,
-        data: MessageData,
     ) -> trc::Result<&mut Self>;
 }
 

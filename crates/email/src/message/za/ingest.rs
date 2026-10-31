@@ -4,33 +4,30 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-//! The key-account branch of `email_ingest` (mail spec 5, 6.1, 6.2, 6.7):
-//! what a message's DEK is wrapped to, chosen once, before any write; the
-//! sealed blob staged in place of the queue's or the upload's; the stub
-//! written in place of the metadata archive.
+//! The key-account branch of `email_ingest_into` (mail spec 5, 6.1, 6.2,
+//! 6.7): what a message's DEK is wrapped to, chosen once, before any write;
+//! the sealed blob staged in place of the queue's or the upload's; the stub
+//! written in place of the metadata row.
 
 use super::{
     MailWrap, new_dek, seal_mail_blob, seal_mail_envelope, seal_stub, view::za_sealing_error,
 };
 use crate::message::{
-    index::IndexMessage,
     ingest::IngestSource,
-    metadata::{MessageData, MessageMetadata},
+    messagedata::PendingMessageData,
+    metadata::{ExtraHeaders, MessageMetadata},
+    sortkeys::MessageSortKeys,
 };
 use common::{
     Server,
     auth::AccessToken,
+    storage::{blob::BlobHold, index::ObjectIndexBuilder},
     za::{ZA_TRACE_MAIL_KEYLESS, mail::za_keyless_refusal},
 };
-use groupware::calendar::seal::seal_error;
-use registry::schema::{
-    enums::IndexDocumentType,
-    structs::{Task, TaskIndexDocument, TaskStatus},
-};
 use std::sync::Arc;
-use store::write::{BatchBuilder, BlobOp};
+use store::write::{BatchBuilder, BlobLink, BlobOp, blob::BlobLinkValue};
 use trc::AddContext;
-use types::{blob_hash::BlobHash, collection::Collection};
+use types::{blob_hash::BlobHash, field::EmailField};
 use vault::{
     keys::{PUBLIC_KEY_LEN, Secret},
     session::SessionKeys,
@@ -64,6 +61,11 @@ impl IngestWrap {
 /// error every caller writes: IMAP answers `NO [NOPERM]` and JMAP
 /// `forbidden`, with `ZA_MAIL_KEYLESS` (`SecurityEvent` errors are never
 /// written, which would leave an IMAP client waiting).
+///
+/// `email_ingest_into` calls it before any operation of its batch, so a
+/// refusal leaves a group's batch as it was (the restore refusal is a
+/// rejection, which a group keeps its batch after; the other two are not,
+/// and a group discards its batch after them).
 pub async fn za_ingest_wrap(
     server: &Server,
     access_token: &AccessToken,
@@ -114,6 +116,20 @@ pub async fn za_ingest_wrap(
     }
 }
 
+/// Object metadata (an IMAP METADATA or JMAP metadata container) is not
+/// supported on a key account's message (its containers are refused there,
+/// and a container would hold its value in the clear): a rejection, raised
+/// before the batch's first operation.
+pub fn za_metadata_refusal(account_id: u32) -> trc::Error {
+    trc::EventType::MessageIngest(trc::MessageIngestEvent::Error)
+        .ctx(trc::Key::Code, 550)
+        .ctx(
+            trc::Key::Reason,
+            "zero-access: object metadata not supported for key accounts",
+        )
+        .account_id(account_id)
+}
+
 /// The key material of a message sealed for a key account, kept from the
 /// staging of its blob to the writing of its stub.
 pub struct ZaSealed {
@@ -121,25 +137,26 @@ pub struct ZaSealed {
     envelope: Vec<u8>,
     account_id: u32,
     blob_hash: BlobHash,
+    sealed_len: usize,
 }
 
 /// Mail spec 5.1, 6.1 step 3: a fresh DEK wrapped as `wrap` and the raw
-/// message sealed into a new blob, staged as upstream stages a blob (a
+/// message sealed into a new blob, held as upstream holds a blob (a
 /// 60-second temporary link); never the queue's or the upload's blob.
-/// Returns the staged hash and hold as the ordinary staging does.
+/// Returns the held hash and hold as the ordinary staging does.
 pub async fn za_stage_sealed(
     server: &Server,
     wrap: &IngestWrap,
     account_id: u32,
     raw_message: &[u8],
-) -> trc::Result<(ZaSealed, (BlobHash, Option<BlobOp>))> {
+) -> trc::Result<(ZaSealed, (BlobHash, Option<BlobHold>))> {
     let dek = new_dek();
     // The message has no document id yet.
     let envelope = seal_mail_envelope(&dek, wrap.mail_wrap(), account_id)
         .map_err(|err| za_sealing_error(err, account_id))?;
     let sealed = seal_mail_blob(&dek, &envelope, account_id, raw_message);
     let (blob_hash, hold) = server
-        .put_temporary_blob(account_id, &sealed, 60)
+        .hold_blob(account_id, BlobHash::generate(&sealed), &sealed, 60)
         .await
         .caused_by(trc::location!())?;
     Ok((
@@ -148,56 +165,57 @@ pub async fn za_stage_sealed(
             envelope,
             account_id,
             blob_hash: blob_hash.clone(),
+            sealed_len: sealed.len(),
         },
         (blob_hash, Some(hold)),
     ))
 }
 
-/// Mail spec 5.2, 5.4: the message's full metadata, whose `blob_hash` is the
-/// sealed blob's, sealed into the stub and written with `data` as
-/// `index_message` writes the metadata archive, without a threading key;
-/// the message's index task is scheduled as for any message.
-#[allow(clippy::too_many_arguments)]
-pub fn za_index_stub<'x>(
+/// Mail spec 5.2, 5.4: the message's full metadata row, whose blob hash is
+/// the sealed blob's, sealed into the stub and written with `data` as
+/// upstream's `index_message` writes the row: the blob link (to the sealed
+/// blob, at its length), `data` and the stub row, with sort keys that hold
+/// nothing and without the attachment keywords. The caller has created the
+/// document, as for `index_message`, and queues its index entry as for any
+/// message; it writes no threading key.
+///
+/// Recorded limit: an `enterprise` build accounts a key account's message to
+/// no tenant (the tenant setter is enterprise-only code the fork does not
+/// name), the SEL disposition of rulings 26 and 45; the product has no
+/// tenants.
+pub fn za_index_stub(
     batch: &mut BatchBuilder,
     sealed: ZaSealed,
-    tenant_id: Option<u32>,
-    document_id: u32,
-    message: mail_parser::Message<'x>,
-    extra_headers: Vec<u8>,
-    extra_headers_parsed: Vec<mail_parser::Header<'x>>,
-    data: MessageData,
-    received_at: u64,
+    message: &mail_parser::Message<'_>,
+    extra_headers: &ExtraHeaders,
+    data: PendingMessageData,
 ) -> trc::Result<()> {
     let ZaSealed {
         dek,
         envelope,
         account_id,
         blob_hash,
+        sealed_len,
     } = sealed;
     let stub = seal_stub(
-        MessageMetadata::build(
-            message,
-            extra_headers,
-            extra_headers_parsed,
-            blob_hash,
-            received_at,
-        ),
+        MessageMetadata::build(message, extra_headers, blob_hash.clone()),
         &dek,
         &envelope,
         account_id,
+        sealed_len,
     )
-    .map_err(|err| seal_error(err, account_id, document_id))?;
+    .map_err(|err| za_sealing_error(err, account_id))?;
     batch
-        .with_collection(Collection::Email)
-        .with_document(document_id)
-        .index_metadata(tenant_id, stub, data)
+        .set(
+            BlobOp::Link {
+                hash: blob_hash,
+                to: BlobLink::Document,
+            },
+            BlobLinkValue::new(sealed_len),
+        )
+        .custom(ObjectIndexBuilder::<(), _>::new().with_changes(data))
         .caused_by(trc::location!())?
-        .schedule_task(Task::IndexDocument(TaskIndexDocument {
-            account_id: account_id.into(),
-            document_id: document_id.into(),
-            document_type: IndexDocumentType::Email,
-            status: TaskStatus::now(),
-        }));
+        .set(EmailField::SortKeys, MessageSortKeys::default().serialize())
+        .set(EmailField::Metadata, stub);
     Ok(())
 }

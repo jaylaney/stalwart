@@ -19,6 +19,9 @@ const CHUNK_BYTES: usize = 4 * 1024 * 1024;
 pub struct CopySource {
     metadata: Vec<u8>,
     sort_keys: Option<Vec<u8>>,
+    /// Mail spec 6.3: the account the row was read from, which
+    /// `copy_message` classifies at use time.
+    za_account_id: u32,
 }
 
 pub struct CopySources {
@@ -37,6 +40,11 @@ enum ReadInto {
 impl CopySource {
     pub fn metadata(&self) -> &[u8] {
         &self.metadata
+    }
+
+    /// The account the source row was read from.
+    pub fn account_id(&self) -> u32 {
+        self.za_account_id
     }
 
     pub(super) fn into_parts(self) -> (Vec<u8>, Option<Vec<u8>>) {
@@ -173,6 +181,7 @@ impl CopySources {
                             Some(CopySource {
                                 metadata: value.to_vec(),
                                 sort_keys: None,
+                                za_account_id: account_id,
                             }),
                         ));
                     } else {
