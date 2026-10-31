@@ -14,6 +14,7 @@ use ::registry::types::duration::Duration;
 use common::za::test_hooks;
 
 pub mod app_password;
+pub mod cache_swap;
 pub mod caches;
 pub mod cors;
 pub mod dav_gate;
