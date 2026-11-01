@@ -11165,3 +11165,335 @@ async fn scheduling_account_info(
     }
     Ok(sender)
 }
+
+const CONTAINER_OWNER: &str = "sharing-container-owner@example.com";
+const CONTAINER_READER: &str = "sharing-container-reader@example.com";
+const CONTAINER_HOME: &str = "/dav/cal/sharing-container-owner%40example.com/";
+const CONTAINER_NAMES: &str = "<D:propfind xmlns:D=\"DAV:\"><D:propname/></D:propfind>";
+const CONTAINER_FIND: &str = "<D:propfind xmlns:D=\"DAV:\" xmlns:X=\"urn:x-container\"><D:prop><X:note/></D:prop></D:propfind>";
+
+fn container_patch(note: &str) -> String {
+    format!(
+        "<D:propertyupdate xmlns:D=\"DAV:\" xmlns:X=\"urn:x-container\"><D:set><D:prop><X:note>{note}</X:note></D:prop></D:set></D:propertyupdate>"
+    )
+}
+
+/// The key class of a stored dead-property container: `Some(true)` under
+/// the calendar's collection key, `Some(false)` under the owner's event
+/// wrapping key.
+async fn container_class(
+    test: &TestServer,
+    owner_id: u32,
+    collection: Collection,
+    id: u32,
+) -> Option<bool> {
+    let stored = crate::utils::za::shared_container(test, owner_id, collection, id)
+        .await
+        .expect("a stored container");
+    assert!(
+        !String::from_utf8_lossy(&stored).contains("container-note"),
+        "a dead property stored in the clear"
+    );
+    groupware::calendar::seal::container_is_ck(&stored)
+}
+
+/// The dead property `X:note` as `client` reads it through PROPFIND.
+async fn container_note(client: &DummyWebDavClient, path: &str) -> String {
+    client
+        .request_with_headers("PROPFIND", path, [("depth", "0")], CONTAINER_FIND)
+        .await
+        .with_status(StatusCode::MULTI_STATUS)
+        .expect_body()
+        .to_string()
+}
+
+/// Ruling 29 at 1.0 (part 7d1b, ruling 122): the conversion moves each
+/// event's dead-property container with it, and a resumed conversion or a
+/// rollback repairs an event whose row and container are in different key
+/// classes (`write_container`): a converted row whose container a writer left
+/// under the owner's key, and a rolled-back row whose container is still
+/// under the collection key. The owner and, once granted, the grantee read
+/// the dead properties of the calendar and its event afterwards.
+pub async fn conversion_carries_dead_property_containers(test: &mut TestServer) {
+    use crate::utils::za::{plant_container, za_post};
+    use common::za::test_hooks::set_share_rewrap_fail_once;
+    use groupware::calendar::{
+        seal::{ZaContainerOf, ZaKeyDomain, rewrap_container},
+        sharing::convert::{ZaShareError, za_convert_calendar},
+    };
+    println!("Running conversion dead-property container tests...");
+    let admin = test.account("admin@example.com").clone();
+    let mut ids = Vec::new();
+    for name in [CONTAINER_OWNER, CONTAINER_READER] {
+        let account = admin
+            .create_key_user_account(name, STRONG, name, &[], user_permissions())
+            .await;
+        ids.push(account.id().document_id());
+        test.insert_account(account);
+    }
+    let (owner_id, reader_id) = (ids[0], ids[1]);
+    let owner = DummyWebDavClient::new(owner_id, CONTAINER_OWNER, STRONG, CONTAINER_OWNER);
+    let reader = DummyWebDavClient::new(reader_id, CONTAINER_READER, STRONG, CONTAINER_READER);
+    let keys = za_unlock(test, owner_id, STRONG).await;
+    let owner_domain = ZaKeyDomain::owner(&keys);
+    let key = test
+        .server
+        .za_served_public_key(reader_id)
+        .await
+        .unwrap()
+        .unwrap();
+    super::pinning::pin(
+        CONTAINER_OWNER,
+        CONTAINER_READER,
+        &vault::keys::display_fingerprint(&key),
+    )
+    .await
+    .expect(200);
+
+    // Two calendars, each with a dead property on the calendar and on its
+    // one event, and a third calendar for a link.
+    let mut fixture = Vec::new();
+    for slug in ["container-rewrap", "container-rollback", "container-other"] {
+        owner
+            .request("MKCALENDAR", &format!("{CONTAINER_HOME}{slug}/"), MKCAL)
+            .await
+            .with_status(StatusCode::CREATED);
+        if slug == "container-other" {
+            continue;
+        }
+        let calendar_path = format!("{CONTAINER_HOME}{slug}/");
+        let event_path = format!("{calendar_path}event.ics");
+        owner
+            .request_with_headers(
+                "PUT",
+                &event_path,
+                [("content-type", "text/calendar")],
+                EVENT.replace("share-read-UID", &format!("{slug}-uid")),
+            )
+            .await
+            .with_status(StatusCode::CREATED);
+        for (path, note) in [
+            (&calendar_path, format!("{slug}-calendar-container-note")),
+            (&event_path, format!("{slug}-event-container-note")),
+        ] {
+            owner
+                .request("PROPPATCH", path, container_patch(&note))
+                .await
+                .with_status(StatusCode::MULTI_STATUS);
+            assert!(container_note(&owner, path).await.contains(&note));
+        }
+        let calendar_id = resource_id(test, owner_id, slug).await;
+        let event_id = resource_id(test, owner_id, &format!("{slug}/event.ics")).await;
+        assert_eq!(
+            container_class(test, owner_id, Collection::Calendar, calendar_id).await,
+            Some(false)
+        );
+        assert_eq!(
+            container_class(test, owner_id, Collection::CalendarEvent, event_id).await,
+            Some(false)
+        );
+        fixture.push((slug, calendar_path, event_path, calendar_id, event_id));
+    }
+    let other_id = resource_id(test, owner_id, "container-other").await;
+    let reads = |slug: &str| {
+        [
+            format!("{slug}-calendar-container-note"),
+            format!("{slug}-event-container-note"),
+        ]
+    };
+
+    // 1. A resumed conversion repairs a converted row whose container was
+    //    left under the owner's key.
+    let (slug, calendar_path, event_path, calendar_id, event_id) = fixture[0].clone();
+    set_share_rewrap_fail_once(Some(owner_id));
+    let guards = conversion_guards(test, &keys).await;
+    assert!(matches!(
+        za_convert_calendar(&test.server, &keys, calendar_id, &guards).await,
+        Err(ZaShareError::Store(_))
+    ));
+    assert!(conversion_ring(test, &keys, calendar_id).await.is_some());
+    assert_eq!(
+        container_class(test, owner_id, Collection::Calendar, calendar_id).await,
+        Some(true),
+        "phase 1 moves the calendar's container to the collection key"
+    );
+    // A writer seals the event's row under the collection key, as a PUT
+    // into the converting calendar does, and keeps its container as stored.
+    let context = za_owned_calendar_context(&test.server, &keys, calendar_id)
+        .await
+        .unwrap();
+    let stored = event_archive(test, owner_id, event_id).await;
+    let mut event = stored.za_event();
+    rewrap_event(&mut event, &owner_domain, &context.domain).unwrap();
+    update_event(test, owner_id, event_id, &stored, event).await;
+    test.server
+        .invalidate_local_caches(&[common::ipc::CacheInvalidation::GroupwareResources(owner_id)]);
+    assert_eq!(
+        container_class(test, owner_id, Collection::CalendarEvent, event_id).await,
+        Some(false)
+    );
+    let guards = conversion_guards(test, &keys).await;
+    let counts = za_convert_calendar(&test.server, &keys, calendar_id, &guards)
+        .await
+        .unwrap();
+    assert_eq!(
+        (counts.rewrapped, counts.sealed),
+        (0, 0),
+        "the row was already converted; only its container moves"
+    );
+    assert_eq!(
+        container_class(test, owner_id, Collection::CalendarEvent, event_id).await,
+        Some(true),
+        "the resumed conversion moves the left-behind container"
+    );
+    // Before the grant, no PROPFIND of the reader's reveals the calendar:
+    // neither its dead-property names nor their values, and the owner's
+    // home lists none of its calendars to it.
+    for path in [&calendar_path, &event_path] {
+        for body in [CONTAINER_NAMES, CONTAINER_FIND] {
+            let response = reader
+                .request_with_headers("PROPFIND", path, [("depth", "0")], body)
+                .await;
+            let text = response.body.as_deref().unwrap_or_default();
+            assert!(
+                !text.contains("container-note") && !text.contains("urn:x-container"),
+                "{path}: {} {text}",
+                response.status
+            );
+        }
+    }
+    for body in [CONTAINER_NAMES, CONTAINER_FIND] {
+        let response = reader
+            .request_with_headers("PROPFIND", CONTAINER_HOME, [("depth", "1")], body)
+            .await;
+        let text = response.body.as_deref().unwrap_or_default();
+        assert!(
+            !text.contains("container-rewrap")
+                && !text.contains("container-note")
+                && !text.contains("urn:x-container"),
+            "{text}"
+        );
+    }
+    za_post(
+        "shares/grant",
+        &serde_json::json!({"username": CONTAINER_OWNER, "password": STRONG,
+            "calendar": slug, "address": CONTAINER_READER, "level": "view"}),
+    )
+    .await
+    .expect(200);
+    for client in [&owner, &reader] {
+        let [calendar_note, event_note] = reads(slug);
+        assert!(
+            container_note(client, &calendar_path)
+                .await
+                .contains(&calendar_note)
+        );
+        assert!(
+            container_note(client, &event_path)
+                .await
+                .contains(&event_note)
+        );
+    }
+
+    // 2. A rollback repairs a rolled-back row whose container is still
+    //    under the collection key.
+    let (slug, calendar_path, event_path, calendar_id, event_id) = fixture[1].clone();
+    set_share_rewrap_fail_once(Some(owner_id));
+    let guards = conversion_guards(test, &keys).await;
+    assert!(matches!(
+        za_convert_calendar(&test.server, &keys, calendar_id, &guards).await,
+        Err(ZaShareError::Store(_))
+    ));
+    assert!(conversion_ring(test, &keys, calendar_id).await.is_some());
+    let context = za_owned_calendar_context(&test.server, &keys, calendar_id)
+        .await
+        .unwrap();
+    // A writer seals the event's container under the collection key and
+    // keeps its row under the owner's key.
+    let stored =
+        crate::utils::za::shared_container(test, owner_id, Collection::CalendarEvent, event_id)
+            .await
+            .unwrap();
+    let uid = format!("{slug}-uid");
+    let next = rewrap_container(
+        &stored,
+        &owner_domain,
+        &context.domain,
+        ZaContainerOf::Event(&uid),
+    )
+    .unwrap();
+    plant_container(
+        test,
+        owner_id,
+        Collection::CalendarEvent,
+        event_id,
+        Some(next),
+    )
+    .await;
+    assert_eq!(
+        container_class(test, owner_id, Collection::CalendarEvent, event_id).await,
+        Some(true)
+    );
+    // A link into another calendar makes the resume roll back.
+    conversion_link(test, owner_id, event_id, other_id, true).await;
+    let guards = conversion_guards(test, &keys).await;
+    assert!(matches!(
+        za_convert_calendar(&test.server, &keys, calendar_id, &guards).await,
+        Err(ZaShareError::LinkedEvents)
+    ));
+    assert_eq!(
+        container_class(test, owner_id, Collection::CalendarEvent, event_id).await,
+        Some(false),
+        "the rollback moves the event's container back to the owner's key"
+    );
+    assert_eq!(
+        container_class(test, owner_id, Collection::Calendar, calendar_id).await,
+        Some(false),
+        "the rollback moves the calendar's container back to the owner's key"
+    );
+    let [calendar_note, event_note] = reads(slug);
+    assert!(
+        container_note(&owner, &calendar_path)
+            .await
+            .contains(&calendar_note)
+    );
+    assert!(
+        container_note(&owner, &event_path)
+            .await
+            .contains(&event_note)
+    );
+    // Unlinked, the calendar converts and is granted; both read it.
+    conversion_link(test, owner_id, event_id, other_id, false).await;
+    za_post(
+        "shares/grant",
+        &serde_json::json!({"username": CONTAINER_OWNER, "password": STRONG,
+            "calendar": slug, "address": CONTAINER_READER, "level": "view"}),
+    )
+    .await
+    .expect(200);
+    assert_eq!(
+        container_class(test, owner_id, Collection::CalendarEvent, event_id).await,
+        Some(true)
+    );
+    for client in [&owner, &reader] {
+        assert!(
+            container_note(client, &calendar_path)
+                .await
+                .contains(&calendar_note)
+        );
+        assert!(
+            container_note(client, &event_path)
+                .await
+                .contains(&event_note)
+        );
+    }
+
+    test.wait_for_tasks().await;
+    for slug in ["container-rewrap", "container-rollback", "container-other"] {
+        owner
+            .request("DELETE", &format!("{CONTAINER_HOME}{slug}/"), "")
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+    test.wait_for_tasks().await;
+}

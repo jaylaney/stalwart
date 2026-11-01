@@ -173,6 +173,7 @@ pub async fn za_tests() {
     sharing::sharing_class_inbound(&mut test).await;
     sharing::cleanup_cannot_restore_revoked_ring(&mut test).await;
     sharing::revoke_cleanup_does_not_rewrite_sealed_event(&mut test).await;
+    sharing::conversion_carries_dead_property_containers(&mut test).await;
     sharing_races::test(&mut test).await;
     sweep::test(&mut test).await;
     tracing::test(&mut test).await;
