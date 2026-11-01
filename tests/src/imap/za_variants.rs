@@ -1222,7 +1222,7 @@ pub async fn antispam(test: &TestServer) {
 /// Whether the FETCH response's FLAGS list holds `$Junk`. 1.0 lists the
 /// server-set `$hasattachment` or `$hasnoattachment` keyword of an ordinary
 /// account's message first, so `$Junk` is not the list's first flag.
-fn has_junk_flag(lines: &[String]) -> bool {
+pub(crate) fn has_junk_flag(lines: &[String]) -> bool {
     lines
         .iter()
         .find_map(|line| line.split_once("FETCH (FLAGS ("))

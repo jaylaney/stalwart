@@ -322,12 +322,21 @@ pub async fn alarm(test: &TestServer) {
         )
         .await
         .with_status(StatusCode::CREATED);
-    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
-    let messages = test
-        .server
-        .get_cached_messages(client.account_id)
-        .await
-        .unwrap();
+    // Ruling 129: both alarms fall due about 5 s from now; their delivery is
+    // awaited for a bounded time, as `cal_alarm` waits (a fixed 6 s wait
+    // failed once while the alarm task and the delivery ran on their own).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let messages = loop {
+        let messages = test
+            .server
+            .get_cached_messages(client.account_id)
+            .await
+            .unwrap();
+        if messages.emails.len() >= 2 || std::time::Instant::now() >= deadline {
+            break messages;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    };
     assert_eq!(messages.emails.len(), 2);
     // Spec 11: the generic email still carries the event's start time.
     let start = TextFormatter::new("en").unwrap().field_to_string(

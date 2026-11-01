@@ -52,6 +52,73 @@ pub async fn test(test: &mut TestServer) {
     expired_bearer_cache_entry_is_refused(test).await;
     keyless_key_account_logins_are_not_cached(test).await;
     impersonated_websocket_refresh(test).await;
+    account_invalidation_drops_http_auth(test).await;
+    fingerprint_key_is_drawn(test);
+}
+
+/// Whether the HTTP authentication cache holds an entry of the account.
+fn http_auth_holds(caches: &Caches, account_id: u32) -> bool {
+    // 1.0's `HttpAuthEntries` has no iterator; `retain` visits every entry.
+    let cached = std::sync::atomic::AtomicBool::new(false);
+    caches.http_auth.retain(|entry| {
+        if entry.account_id == account_id {
+            cached.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        true
+    });
+    cached.into_inner()
+}
+
+/// Ruling 135 (mutation a013): an `Account` invalidation alone drops the
+/// account's cached HTTP authentications, as the `AccessToken` arm does, so
+/// an entry cached between the two arms of a password change cannot
+/// survive it: the next request verifies afresh and is cached again.
+async fn account_invalidation_drops_http_auth(test: &TestServer) {
+    println!("account_invalidation_drops_http_auth");
+    let plain = test.account(PLAIN);
+    let id = plain.id().document_id();
+    let caches = &test.server.inner.cache;
+    let authorization = basic(PLAIN, plain.secret());
+    let call = || {
+        jmap_call(
+            &authorization,
+            "Mailbox/get",
+            json!({ "accountId": plain.id_string(), "ids": [] }),
+        )
+    };
+    assert_eq!(call().await.0, 200);
+    assert!(http_auth_holds(caches, id), "control: the login is cached");
+    test.server
+        .invalidate_local_caches(&[CacheInvalidation::Account(id)]);
+    assert!(
+        !http_auth_holds(caches, id),
+        "an Account-only invalidation kept the cached authentication"
+    );
+    assert_eq!(call().await.0, 200);
+    assert!(
+        http_auth_holds(caches, id),
+        "the next request is cached again"
+    );
+}
+
+/// Ruling 135 (mutation a018): the HTTP layer's fingerprint key is drawn at
+/// random, so no fingerprint the key cache uses can be computed without the
+/// process. The key is not the zero key, and the fingerprints it yields are
+/// not the zero key's. (A second `Inner` cannot be built inside the suite,
+/// so the draw's difference between processes is not checked.)
+fn fingerprint_key_is_drawn(test: &TestServer) {
+    println!("fingerprint_key_is_drawn");
+    let caches = &test.server.inner.cache;
+    assert_ne!(
+        *caches.za_fingerprint_key, [0u8; 32],
+        "the fingerprint key is the zero key"
+    );
+    let token = basic(NAME, STRONG);
+    assert_ne!(
+        caches.za_fingerprint(&token),
+        vault::keys::fingerprint(&[0u8; 32], token.as_bytes()),
+        "a fingerprint computable without the process's key"
+    );
 }
 
 /// Spec 2 and 5, amended by mail spec 3.3: the key cache serves the HTTP
@@ -391,7 +458,7 @@ fn http_client() -> reqwest::Client {
 }
 
 /// `GET /jmap/session` with a Bearer token; the status.
-async fn session_status(token: &str) -> u16 {
+pub(super) async fn session_status(token: &str) -> u16 {
     http_client()
         .get(format!("{SERVER_URL}/jmap/session"))
         .bearer_auth(token)

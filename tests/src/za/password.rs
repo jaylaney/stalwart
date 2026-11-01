@@ -4,15 +4,18 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::{STRONG, user_permissions};
+use super::{STRONG, caches::session_status, user_permissions};
 use crate::utils::{
     server::TestServer,
     za::{
-        VaultReply, assert_nothing_cached, caldav_from, park_endpoint, park_login, za_post,
-        za_post_concurrent, za_post_from, za_setup_token,
+        VaultReply, assert_nothing_cached, caldav_from, park_endpoint, park_login, za_grant_token,
+        za_post, za_post_concurrent, za_post_from, za_revoke_grant, za_setup_token,
     },
 };
-use common::{auth::credential::AppPassword, ipc::CacheInvalidation};
+use common::{
+    auth::{credential::AppPassword, oauth::scope::OAuthScopes},
+    ipc::CacheInvalidation,
+};
 use hyper::StatusCode;
 use serde_json::{Value, json};
 use vault::recovery::RecoveryKey;
@@ -152,6 +155,15 @@ pub async fn test(test: &mut TestServer) {
     // Change then read: cached authentication for the old password is gone.
     caldav(name, STRONG, StatusCode::MULTI_STATUS).await;
     assert!(test.server.inner.cache.za_keys.contains_account(id));
+    // Ruling 135 (M14, mutation a001): a key account's OAuth access token is
+    // bound to the vault record's revision (its registry secret is the
+    // constant marker), so a password change revokes it.
+    let (grant_id, bearer) = za_grant_token(&test.server, name, OAuthScopes::ALL).await;
+    assert_eq!(
+        session_status(&bearer).await,
+        200,
+        "control: the token before the change"
+    );
     let before = test.server.za_vault_record(id).await.unwrap().unwrap();
     za_post(
         "password",
@@ -159,6 +171,17 @@ pub async fn test(test: &mut TestServer) {
     )
     .await
     .expect(200);
+    assert_eq!(
+        session_status(&bearer).await,
+        401,
+        "an access token minted before the password change still works"
+    );
+    // The grant itself outlives the change; the token's version does not.
+    assert!(
+        test.server.oauth_grant(grant_id).await.unwrap().is_some(),
+        "the change deleted the grant, so the version check is not what refused"
+    );
+    za_revoke_grant(&test.server, grant_id).await;
     let after = test.server.za_vault_record(id).await.unwrap().unwrap();
     assert_eq!(after.record.revision, before.record.revision + 1);
     assert_ne!(after.record.salt, before.record.salt);

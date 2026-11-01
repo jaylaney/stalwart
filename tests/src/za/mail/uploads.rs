@@ -938,9 +938,10 @@ async fn raw_consumers_are_refused(
         // session cannot reach the key account, so 1.0 refuses its
         // `fromAccountId` first, and the key session's copy into the plain
         // account that shares only a file folder with it is refused as
-        // `accountNotSupportedByMethod`. The fork's refusal of a blob copy
-        // out of and into a key account is exercised by `gates`, whose
-        // sessions reach both accounts through a mail share.
+        // `accountNotSupportedByMethod`. `gates` reaches the fork's refusal
+        // of a blob copy into a key account through a mail share; no session
+        // reaches its refusal of one out of a key account (ruling 99, 1.0
+        // refuses first).
         assert_account_refused(
             &blob_copy(plain, key, plain, &[source]).await,
             "fromAccountNotFound",

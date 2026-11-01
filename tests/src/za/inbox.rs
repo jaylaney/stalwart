@@ -217,8 +217,8 @@ pub async fn test(test: &mut TestServer) {
         "{body}"
     );
     // Review Focus 1: a multiget naming it answers exactly as for an href
-    // that names no item (0.16 answered 404 for both; 1.0's inbox multiget
-    // omits both).
+    // that names no item: 404 for both, at 0.16 and at 1.0 (the pending
+    // item's 404 since `a5cddf448`, ruling 136).
     let body = client
         .multiget_calendar(KEY_INBOX, &[pending_href.as_str()])
         .await

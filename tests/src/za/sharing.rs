@@ -11257,6 +11257,14 @@ async fn container_note(client: &DummyWebDavClient, path: &str) -> String {
         .to_string()
 }
 
+/// The `response` element of a multistatus `body` whose `href` is `path`,
+/// or an empty string.
+fn response_of<'x>(body: &'x str, path: &str) -> &'x str {
+    body.split(":response>")
+        .find(|response| response.contains(&format!(">{path}<")))
+        .unwrap_or_default()
+}
+
 /// Ruling 29 at 1.0 (part 7d1b, ruling 122): the conversion moves each
 /// event's dead-property container with it, and a resumed conversion or a
 /// rollback repairs an event whose row and container are in different key
@@ -11442,6 +11450,56 @@ pub async fn conversion_carries_dead_property_containers(test: &mut TestServer) 
             container_note(client, &event_path)
                 .await
                 .contains(&event_note)
+        );
+    }
+    // Ruling 134 (`za_propname_item`): a depth-1 `propname` lists the
+    // calendar's event with its dead property's name, opened in the
+    // calendar's key domain under the event's own read context, for the
+    // owner and the grantee; and the grantee's depth-1 `propname` of the
+    // owner's home lists the granted calendar with its name, and no other.
+    for client in [&owner, &reader] {
+        let listed = client
+            .request_with_headers(
+                "PROPFIND",
+                &calendar_path,
+                [("depth", "1")],
+                CONTAINER_NAMES,
+            )
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+        for path in [&calendar_path, &event_path] {
+            let names = response_of(listed.expect_body(), path);
+            assert!(
+                names.contains("note") && listed.expect_body().contains("urn:x-container"),
+                "{}: {path}'s dead-property name is not listed: {}",
+                client.name,
+                listed.expect_body()
+            );
+        }
+        assert!(
+            !listed.expect_body().contains("container-note"),
+            "propname served a value"
+        );
+    }
+    let home = reader
+        .request_with_headers(
+            "PROPFIND",
+            CONTAINER_HOME,
+            [("depth", "1")],
+            CONTAINER_NAMES,
+        )
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    assert!(
+        response_of(home.expect_body(), &calendar_path).contains("note"),
+        "the granted calendar's name in the home listing: {}",
+        home.expect_body()
+    );
+    for other in ["container-rollback", "container-other"] {
+        assert!(
+            !home.expect_body().contains(other),
+            "the home listing names an ungranted calendar: {}",
+            home.expect_body()
         );
     }
 

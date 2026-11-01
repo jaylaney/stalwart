@@ -83,7 +83,11 @@ use store::{
     search::{CalendarSearchField, EmailSearchField, IndexDocument},
     write::{
         BatchBuilder, BlobLink, BlobOp, SearchIndex, SearchIndexClass, TaskId, TaskQueueClass,
-        ValueClass, key::DeserializeBigEndian, now, serialize::RawValue,
+        ValueClass,
+        key::DeserializeBigEndian,
+        metadata::{MetadataClass, ViewerState},
+        now,
+        serialize::RawValue,
     },
 };
 use trc::{EventType, Key, SecurityEvent, StoreEvent};
@@ -3046,6 +3050,55 @@ async fn setup_refuses_object_metadata(test: &TestServer, admin: &Account) -> (A
             "{what} was not removed"
         );
     }
+    // Ruling 134 (`za_has_object_metadata`'s second pass): the last case
+    // left the account's `Owner` counter on `owner`'s mailboxes counting no
+    // container. A private container of the account stored under `owner`
+    // that the counter does not count (written straight to the store) is
+    // still found through it, and refuses issuance.
+    let counter = test
+        .server
+        .store()
+        .get_value::<RawValue>(ValueKey {
+            account_id: id,
+            collection: Collection::Mailbox.into(),
+            document_id: 0,
+            class: ValueClass::Metadata(MetadataClass::Owner { owner: owner_id }),
+        })
+        .await
+        .unwrap();
+    let counter = counter.map(|counter| ViewerState::deserialize(&counter.0).unwrap());
+    assert!(
+        counter.is_some_and(|counter| counter.containers == 0),
+        "the fixture needs a counter that counts none: {counter:?}"
+    );
+    let write_uncounted = async |set: bool| {
+        let mut batch = BatchBuilder::new();
+        batch
+            .with_account_id(owner_id)
+            .with_collection(Collection::Mailbox)
+            .with_document(INBOX_ID);
+        let class = ValueClass::Metadata(MetadataClass::Private { viewer: id });
+        if set {
+            batch.set(class, vec![1, 2, 3]);
+        } else {
+            batch.clear(class);
+        }
+        test.server.store().write_batch(&mut batch).await.unwrap();
+    };
+    write_uncounted(true).await;
+    assert!(
+        test.server.za_has_object_metadata(id).await.unwrap(),
+        "an uncounted private container on another account's object"
+    );
+    let reply = za_post_as(admin, "setup-token", &json!({ "account": OBJECT_METADATA })).await;
+    assert_eq!(
+        reply.expect(409)["error"],
+        "account already holds object metadata",
+        "issuance while the account holds an uncounted private container"
+    );
+    assert!(test.server.za_vault_record(id).await.unwrap().is_none());
+    write_uncounted(false).await;
+    assert!(!test.server.za_has_object_metadata(id).await.unwrap());
     // Permitted: an address book's dead properties.
     write_object_metadata(
         test,

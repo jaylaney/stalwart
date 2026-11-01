@@ -1377,6 +1377,14 @@ async fn group_member_stale_token(
         .await
         .assert_contains(&shared_name);
     imap.send_ok(&format!("SELECT \"{shared_name}\"")).await;
+    // A second session of the member, which lists the share and selects
+    // nothing: its IDLE reports the share's removal (ruling 134).
+    let mut idle = ImapConnection::connect(b"_l ").await;
+    idle.authenticate(MEMBER, STRONG).await;
+    idle.send(r#"LIST "" "*""#).await;
+    idle.assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_contains(&shared_name);
     let mailbox_get = json!({ "accountId": shared.id_string(), "ids": null });
     assert_eq!(
         first(
@@ -1397,6 +1405,42 @@ async fn group_member_stale_token(
     )
     .await;
     let shared_doc = message_ids(test, shared_id).await[0];
+
+    // Ruling 134 (`za_unlist_key_accounts`, ruling R34): the member's token
+    // still names the provisioned account, so the IDLE's mailbox sync, woken
+    // by a delivery to the member, drops the share and reports it deleted
+    // (`\NonExistent`, as upstream reports a revoked share) before any
+    // status of the member's own mailboxes.
+    idle.send("IDLE").await;
+    idle.assert_read(Type::Continuation, ResponseType::Ok).await;
+    deliver(
+        test,
+        SENDER,
+        MEMBER,
+        &message_with("gates group idle wake", "gates group idle body"),
+    )
+    .await;
+    let update = idle.assert_read(Type::Status, ResponseType::Ok).await;
+    assert!(
+        update
+            .iter()
+            .any(|line| line.starts_with("* LIST (\\NonExistent)") && line.contains(&shared_name)),
+        "the IDLE did not report the share's removal first: {update:?}"
+    );
+    idle.send_untagged("DONE").await;
+    let lines = idle.assert_read(Type::Tagged, ResponseType::Ok).await;
+    assert!(
+        !lines
+            .iter()
+            .chain(update.iter())
+            .any(|line| line.contains("canary")),
+        "content in the IDLE's updates: {lines:?}"
+    );
+    idle.send(r#"LIST "" "*""#).await;
+    idle.assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_not_contains(GROUP_OWNER);
+    idle.send_ok("LOGOUT").await;
 
     let traced = Traced::start(&[EventType::Security(SecurityEvent::Unauthorized)]);
     for (method, args) in [

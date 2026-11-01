@@ -209,6 +209,104 @@ fn http_client() -> reqwest::Client {
         .unwrap()
 }
 
+/// Ruling 135 (M14, mutations a070 and a072): no credential-bearing input
+/// of a request that fails before or during authentication reaches any
+/// event, for every account (the account is unknown there). Ruling 28's
+/// Basic decode and unsupported-mechanism errors carry no part of the
+/// Authorization value, a malformed one or one of an unknown mechanism; and
+/// an OAuth token request's form (`/auth/token`), with a code, a client
+/// secret or a device code, is read untraced (issue #20). Each request comes
+/// from its own forwarded address, so its failure is charged to no other
+/// client. The Basic decode's error event is the control: the subscriber
+/// sees the refusals.
+async fn credential_inputs_are_not_traced() {
+    println!("credential_inputs_are_not_traced");
+    const BASIC_CANARY: &str = "trace-canary-basic-4f7a";
+    const NO_COLON_CANARY: &str = "trace-canary-nocolon-8b21";
+    const MECHANISM_CANARY: &str = "trace-canary-mechanism-3c5e";
+    const CODE_CANARY: &str = "trace-canary-code-6a0d";
+    const SECRET_CANARY: &str = "trace-canary-secret-1f9b";
+    const DEVICE_CANARY: &str = "trace-canary-device-7e42";
+    let traced = super::mail::Traced::start(EventType::variants());
+    let mut answers = Vec::new();
+    for (n, authorization) in [
+        format!("Basic !{BASIC_CANARY}!"),
+        format!("Basic {}", STANDARD.encode(NO_COLON_CANARY)),
+        format!("Negotiate {MECHANISM_CANARY}"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = http_client()
+            .get(format!("{SERVER_URL}/jmap/session"))
+            .header("authorization", authorization)
+            .header("x-forwarded-for", format!("10.77.1.{}", n + 1))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        assert!(status.is_client_error(), "a malformed credential: {status}");
+        answers.push(response.text().await.unwrap());
+    }
+    for (n, form) in [
+        format!(
+            "grant_type=authorization_code&code={CODE_CANARY}&client_id=za-trace-client\
+             &client_secret={SECRET_CANARY}&redirect_uri=https%3A%2F%2Fclient.example.com%2Fcb"
+        ),
+        format!(
+            "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code\
+             &device_code={DEVICE_CANARY}&client_id=za-trace-client"
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = http_client()
+            .post(format!("{SERVER_URL}/auth/token"))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("x-forwarded-for", format!("10.77.2.{}", n + 1))
+            .body(form)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        assert!(
+            status.is_client_error(),
+            "a refused token request: {status}"
+        );
+        answers.push(response.text().await.unwrap());
+    }
+    let events = traced.finish().await;
+    assert!(
+        events
+            .iter()
+            .any(|event| event.typ == EventType::Auth(AuthEvent::Error)
+                && event.details == "Failed to decode Basic auth request."),
+        "control: the Basic decode's refusal was not traced"
+    );
+    for canary in [
+        BASIC_CANARY,
+        NO_COLON_CANARY,
+        MECHANISM_CANARY,
+        CODE_CANARY,
+        SECRET_CANARY,
+        DEVICE_CANARY,
+    ] {
+        for event in &events {
+            assert!(
+                !event.text.contains(canary),
+                "{:?} carries {canary}: {}",
+                event.typ,
+                event.text
+            );
+        }
+        assert!(
+            !answers.iter().any(|answer| answer.contains(canary)),
+            "an answer quotes {canary}: {answers:?}"
+        );
+    }
+}
+
 /// DAV OPTIONS with a wrong Basic credential, from its own forwarded address
 /// (the suite enables `use_x_forwarded`) so the failed attempt is not charged
 /// to the suite's other clients.
@@ -485,6 +583,7 @@ async fn ws_bad_arguments(user: &str, secret: &str, canary: &str) {
 
 pub async fn test(test: &mut TestServer) {
     println!("Running zero-access HTTP trace tests...");
+    credential_inputs_are_not_traced().await;
     let key1 = test.account("key1@example.com").clone();
     let key_client = DummyWebDavClient::new(
         key1.id().document_id(),

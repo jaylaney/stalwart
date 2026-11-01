@@ -102,6 +102,7 @@ pub async fn test(test: &mut TestServer) {
         .expect(200);
     let mut failures = Vec::new();
     plain_update_trace(test, &mut failures).await;
+    plain_update_trace_exhausted(test, &mut failures).await;
 
     // Incorrect URI encoding used to silently drop these granted 404 tombstones.
     for slug in [
@@ -625,6 +626,145 @@ pub async fn test(test: &mut TestServer) {
         "PR58 regressions:\n{}",
         failures.join("\n")
     );
+}
+
+/// Ruling 135 (M9, the Task 7c investigation's N6 option (b)): the lost
+/// assertion's trace still names the DAV update call site once the replay
+/// is exhausted. The plain PUT is parked at its commit on every attempt
+/// (the first and the dispatcher's three replays), and each time a
+/// row-only change commits first; the pause is re-armed before the parked
+/// attempt is released, so each replay parks in turn. The fourth failure
+/// answers 503 with `Retry-After`, and its `AssertValueFailed` trace, for
+/// this request's URL, has a `CausedBy` in `crates/dav/src/calendar/
+/// update.rs`.
+async fn plain_update_trace_exhausted(test: &TestServer, failures: &mut Vec<String>) {
+    use common::za::test_hooks::Pause as HookPause;
+    use std::{sync::Arc, time::Duration};
+    use trc::{EventType, Key, StoreEvent};
+    const ATTEMPTS: usize = 4;
+    let account = test.account("plain@example.com");
+    let owner = account.id().document_id();
+    let name = account.name();
+    let secret = account.secret();
+    let client = DummyWebDavClient::new(owner, name, secret, name);
+    let home = format!(
+        "/dav/cal/{}/sharing-review-exhausted/",
+        name.replace('@', "%40")
+    );
+    let path = format!("{home}one.ics");
+    client
+        .request("MKCALENDAR", &home, MKCAL)
+        .await
+        .with_status(StatusCode::CREATED);
+    put(&client, &path, "review-plain-exhausted").await;
+    let event_id = id(test, owner, "sharing-review-exhausted/one.ics").await;
+    let flip_row = || async {
+        let stored = test
+            .server
+            .store()
+            .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
+                owner,
+                Collection::CalendarEvent,
+                event_id,
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut concurrent = stored.deserialize::<CalendarEvent>().unwrap();
+        concurrent.flags ^= 1;
+        let mut batch = BatchBuilder::new();
+        concurrent
+            .update_meta(
+                test.server.account_info(owner).await.unwrap().changed_by(),
+                stored.to_unarchived::<CalendarEvent>().unwrap(),
+                owner,
+                event_id,
+                None,
+                &mut batch,
+            )
+            .unwrap();
+        test.server.commit_batch(batch).await.unwrap();
+    };
+    let arrive = |pause: Arc<HookPause>| async move {
+        tokio::time::timeout(Duration::from_secs(10), pause.arrived.notified())
+            .await
+            .expect("the attempt did not reach the commit pause");
+    };
+
+    let traced = super::mail::Traced::start(&[EventType::Store(StoreEvent::AssertValueFailed)]);
+    let mut pause = Arc::new(HookPause::new(owner));
+    test_hooks::set_update_commit_pause(Some(pause.clone()));
+    let body = super::sharing::sharing_event("review-plain-exhausted")
+        .replace("SUMMARY:", "SUMMARY:exhausted ");
+    let request_path = path.clone();
+    let request = tokio::spawn(async move {
+        DummyWebDavClient::new(owner, name, secret, name)
+            .request_with_headers(
+                "PUT",
+                &request_path,
+                [("content-type", "text/calendar")],
+                body,
+            )
+            .await
+    });
+    arrive(pause.clone()).await;
+    for attempt in 0..ATTEMPTS {
+        flip_row().await;
+        let next = (attempt + 1 < ATTEMPTS).then(|| {
+            let next = Arc::new(HookPause::new(owner));
+            test_hooks::set_update_commit_pause(Some(next.clone()));
+            next
+        });
+        pause.release.notify_one();
+        if let Some(next) = next {
+            arrive(next.clone()).await;
+            pause = next;
+        }
+    }
+    let response = request.await.unwrap();
+    test_hooks::set_update_commit_pause(None);
+    let events = traced.finish().await;
+    if response.status != StatusCode::SERVICE_UNAVAILABLE
+        || response.headers.get("retry-after").is_none()
+    {
+        failures.push(format!(
+            "plain update after {ATTEMPTS} lost assertions: {} {:?}, expected 503 with Retry-After",
+            response.status, response.headers
+        ));
+    }
+    let located = events.iter().any(|event| {
+        let this_request = event.keys.iter().any(|(key, value)| {
+            *key == Key::Url && matches!(value, trc::Value::String(url) if url.as_str() == path)
+        });
+        this_request
+            && event.keys.iter().any(|(key, value)| {
+                *key == Key::CausedBy
+                    && trc_strings(value)
+                        .iter()
+                        .any(|location| location.contains("crates/dav/src/calendar/update.rs:"))
+            })
+    });
+    if !located {
+        failures.push(format!(
+            "the exhausted plain update's AssertValueFailed trace lost its DAV location: {:?}",
+            events.iter().map(|event| &event.keys).collect::<Vec<_>>()
+        ));
+    }
+    client
+        .request("DELETE", &path, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    client
+        .request("DELETE", &home, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+}
+
+/// Every string a trace value holds (a `CausedBy` is a string or a list).
+fn trc_strings(value: &trc::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    super::raw_input::strings(value, &mut out);
+    out
 }
 
 /// A plain-account event PUT that loses its commit assertion to a

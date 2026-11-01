@@ -37,9 +37,9 @@ use crate::utils::{
     webdav::DummyWebDavClient,
     za::{
         HookParked, delete_event_records, hold_index_partition, partition_status, plant_event,
-        queue_entries, release_index_partition, search_keys, unindex_search_account,
-        unindex_search_documents, wait_for_delivery, wait_for_index_queue, za_post_as, za_setup,
-        za_setup_token,
+        plant_plain_message, queue_entries, release_index_partition, search_keys,
+        unindex_search_account, unindex_search_documents, wait_for_delivery, wait_for_index_queue,
+        za_post_as, za_setup, za_setup_token,
     },
 };
 use common::za::test_hooks::{self, ForceCommitSplit};
@@ -56,7 +56,8 @@ use std::time::Duration;
 use store::{
     Serialize as _, ValueKey,
     write::{
-        Archiver, BatchBuilder, SearchIndex, SearchIndexClass, ValueClass, serialize::RawValue,
+        Archiver, BatchBuilder, IndexPropertyClass, SearchIndex, SearchIndexClass, ValueClass,
+        serialize::RawValue,
     },
 };
 use types::{
@@ -78,6 +79,13 @@ const ATTACH_KEY: &str = "keymail31@example.com";
 const ATTACH_PLAIN: &str = "plainmail28@example.com";
 /// `test_destroyed_stub`'s account.
 const STUB_KEY: &str = "keymail32@example.com";
+/// `test_destroyed_stub`'s ordinary control (ruling 134).
+const STUB_PLAIN: &str = "plainmail38@example.com";
+/// A message whose header section starts with the stub's format byte and
+/// whose thread subject is in its headers: two `Subject` headers, the last
+/// one empty (`ArchivedMessageMetadata::thread_subject`).
+const IN_HEADERS_MESSAGE: &str =
+    "\u{1}X-Za-Stub: like\r\nSubject: zz in headers\r\nSubject:\r\n\r\nin headers body\r\n";
 /// `test_index_retry`'s account (ordinary, then provisioned).
 const RETRY: &str = "plainmail29@example.com";
 /// `test_mid_pass_provisioning`'s account (provisioned mid-pass) and its
@@ -165,6 +173,33 @@ pub async fn test(test: &mut TestServer) {
         .with_status(StatusCode::CREATED);
     test.wait_for_tasks().await;
     let (_, document_id) = raw_event_records(test, id, "default/r8.ics").await;
+
+    // Ruling 135 (M8, mutation b009; calendar spec 9): a key account's
+    // event that is not sealed (a legacy event, planted as a 0.16-era
+    // writer left it) is not indexed either. Its entry drains at once
+    // without a document; a build of it would carry R58's vault-absence
+    // fence, fail against the account's vault record and retry, so the
+    // bounded wait names that cause.
+    let legacy = plant_event(
+        test,
+        id,
+        "default",
+        "legacy.ics",
+        &EVENT
+            .replace("UID:r8-event", "UID:r8-legacy")
+            .replace("r8-canary", "r8-legacy-canary"),
+        None,
+    )
+    .await;
+    wait_for_index_queue(test, id, Duration::from_secs(30)).await;
+    assert!(
+        search_keys(test, id, SearchIndex::Calendar)
+            .await
+            .is_empty(),
+        "a key account's unsealed event was indexed"
+    );
+    delete_event_records(test, id, legacy).await;
+    test.wait_for_tasks().await;
 
     // The registry entry, the data, the search index and the index queue of
     // the account go.
@@ -601,7 +636,16 @@ pub async fn test_destroyed_stub(test: &mut TestServer) {
             &message_with("stub subject", "stub body"),
         )
         .await;
-    wait_for_delivery(test).await;
+    // Ruling 135 (M8, mutation b008): a key account's message is indexed
+    // from its stub, so its partition drains at once. Bounded, so that a
+    // build that reads the sealed blob (which fails and retries forever)
+    // fails here by name instead of hanging the suite's later waits.
+    tokio::time::timeout(Duration::from_secs(60), wait_for_delivery(test))
+        .await
+        .expect(
+            "the key account's index partition did not drain: its message was not \
+             indexed from its stub (mail spec 5.5)",
+        );
     let ids = message_ids(test, id).await;
     assert_eq!(ids.len(), 1, "{ids:?}");
     let document_id = ids[0];
@@ -618,8 +662,72 @@ pub async fn test_destroyed_stub(test: &mut TestServer) {
     let keys = search_keys(test, id, SearchIndex::Email).await;
     assert_eq!(keys.document_ids(), vec![document_id], "{keys:?}");
 
+    // Ruling 134 (`ZaUnindexAccount::for_row`, mail rulings R29 and R47): a
+    // row whose header section starts with the stub's format byte and whose
+    // thread subject is in its headers (two `Subject` headers, the last one
+    // empty), planted in the key account and in an ordinary control. Its
+    // un-index reads the account's classification: the key account's takes
+    // the stub's empty subject and leaves the threading key of the header
+    // section's subject alone; the control takes upstream's subject and
+    // clears it.
+    let control = admin
+        .create_user_account(STUB_PLAIN, STRONG, "Stub control", &[], user_permissions())
+        .await;
+    let control_id = control.id().document_id();
+    let mut crafted = Vec::new();
+    for account_id in [id, control_id] {
+        let document_id = plant_plain_message(test, account_id, IN_HEADERS_MESSAGE).await;
+        wait_for_index_queue(test, account_id, Duration::from_secs(10)).await;
+        let row = stored_metadata(test, account_id, document_id).await;
+        assert!(
+            super::mail::row_is_stub(&row),
+            "the row starts with the format byte"
+        );
+        assert_eq!(
+            row.unarchive().unwrap().thread_subject(),
+            ThreadSubject::InHeaders,
+            "the fixture must reach the header-section arm"
+        );
+        assert_eq!(threading_keys(test, account_id, document_id).await, 1);
+        crafted.push((account_id, document_id));
+    }
+
     test.destroy_all_mailboxes(&key).await;
+    test.destroy_all_mailboxes(&control).await;
+    wait_for_index_queue(test, control_id, Duration::from_secs(10)).await;
     wait_for_index_queue(test, id, Duration::from_secs(10)).await;
+    let (_, key_doc) = crafted[0];
+    let (_, control_doc) = crafted[1];
+    assert!(metadata_rows(test, control_id).await.is_empty());
+    assert_eq!(
+        threading_keys(test, control_id, control_doc).await,
+        0,
+        "control: the un-index of an ordinary account's row clears its threading key"
+    );
+    assert_eq!(
+        threading_keys(test, id, key_doc).await,
+        1,
+        "the key account's un-index read the row's header section as headers"
+    );
+    // The fixture's leftover: the key the header section's subject names.
+    let message = mail_parser::MessageParser::new()
+        .parse(IN_HEADERS_MESSAGE.as_bytes())
+        .unwrap();
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(id)
+        .with_collection(Collection::Email)
+        .with_document(key_doc)
+        .clear(ValueClass::IndexProperty(IndexPropertyClass::Hash {
+            property: EmailField::Threading.into(),
+            hash: email::message::ingest::thread_hash(
+                email::message::thread::ThreadFields::scan(&message).subject,
+            ),
+        }));
+    test.server.store().write_batch(&mut batch).await.unwrap();
+    assert_eq!(threading_keys(test, id, key_doc).await, 0);
+    admin.destroy_account(control).await;
+
     assert!(
         metadata_rows(test, id).await.is_empty(),
         "the unindex left the stub's row"
