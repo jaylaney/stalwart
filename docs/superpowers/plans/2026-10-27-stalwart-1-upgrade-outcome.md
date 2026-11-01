@@ -7548,6 +7548,193 @@ Restored with `git checkout -- <files>`, the same two builds and `unit-tests` we
   - Either CLAUDE.md's flaky list gains it (with CI's rerun), or the test's code lifetime is
     raised for that one exchange, as ruling 117 did for its SASL token.
 
+### Task 7 results
+
+Consolidated from parts 7a to 7d. The authoritative run of each row is the last one listed
+here; the part sections above hold every attempt. Every Cargo command starts with
+`export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$PATH"`; integration rows also set
+`STORE=RocksDb RUST_MIN_STACK=16777216`, `ZA_KEY_ACCOUNTS=1` on key rows only (unset on plain
+rows). Logs: `task-7c/logs/` (matrix), `task-7d/` (net and gates), `task-7d2/` (this part).
+
+#### Compile checks (part 7a, at `ce4ee7c9a`)
+
+| Check | Result |
+|---|---|
+| `cargo check -p stalwart --no-default-features --features rocks` | pass, no warning |
+| `cargo fmt --all --check` | pass |
+| `cargo check --workspace --tests` | pass, no warning |
+| `cargo test -p tests --no-run` | pass (the macOS linker's unwind-table size warning only) |
+| `cargo test --workspace --exclude tests --exclude scim --exclude scim-proto --lib --bins --no-run --features "$UNIT_TEST_FEATURES"` | pass, no warning (at `31d192cad`) |
+
+#### The matrix
+
+Two final runs cover the matrix: the uninstrumented one at `3de0dfff2` (part 7c4), and the
+19-step llvm-cov net at `b39124246` (part 7d1b), whose `tests` and `crates` differ from
+`3de0dfff2` only by part 7d1b's five unit tests and one ZA case. Counts are passed / failed /
+ignored. "Attempts" counts every run of the row in parts 7c to 7c4 (`task-7c/logs/`).
+
+| Row | Command | `3de0dfff2` (7c4) | `b39124246` (7d1b net) | Attempts, failures and retries |
+|---|---|---|---|---|
+| Formatting | `cargo fmt --all --check` | rc 0 | rc 0 at `c46b7293d` and at this part's commits | none |
+| Workspace units | `cargo test --workspace --exclude tests --exclude scim --exclude scim-proto --lib --bins --features "$UNIT_TEST_FEATURES"` (net: `--exclude-from-test scim --exclude-from-test scim-proto --lib --bins --tests --no-fail-fast -- --exact --skip <98 tests-crate tests>`) | 555 / 0 / 2 (`units-2`) | 562 / 0 / 2 | 2 runs; the two ignored are 0.16's `classifier::sgd::tests::text_classifier` and `modules::pyzor::test::send_message` |
+| Vault and groupware | `cargo test -p vault -p groupware --features vault/test_mode` | 213 / 0 / 0 (`vaultgw-2`) | in the unit step (217 listed) | 2 runs |
+| ZA | `cargo test -p tests za::za_tests -- --exact --nocapture` | 1 / 0 / 0 (`za-88`) | 1 / 0 / 0 (6:11) | 88 runs: 78 failures in 7c fixed in place or held for rulings 79-96, then 7c2-7c4's kernel fixes (rulings 91-94) |
+| ZA leak unit | `cargo test -p tests za::leak::tests::try_archive_short_values_are_not_archives -- --exact` | 1 / 0 / 0 (`zaleak-3`) | 1 / 0 / 0 | 3 runs |
+| ZA filesystem blobs | the ZA command with `BLOB_STORE=FileSystem` | 1 / 0 / 0 (`zafs-5`) | 1 / 0 / 0 (6:11) | 5 runs, each green once the held edits were in |
+| ZA cache swap | `cargo test -p tests za::cache_swap::cache_swap_tests -- --exact --nocapture` | 1 / 0 / 0 | 1 / 0 / 0 (extra step) | 3 runs: a part 6c test bug fixed |
+| CalDAV plain | `cargo test -p tests webdav::webdav_tests -- --exact --nocapture` | 1 / 0 / 0 (`caldav-plain-27`) | 1 / 0 / 0 | 27 runs: port defects (`a5cddf448`), status changes, the `put_get` blob leftover, 1.0 fixtures; no `cal_itip` DTSTAMP flake |
+| CalDAV key | the same with `ZA_KEY_ACCOUNTS=1` | 1 / 0 / 0 (`caldav-key-22`) | 1 / 0 / 0 | 22 runs |
+| `webdav::cal_query::` | `cargo test -p tests webdav::cal_query::` | 2 / 0 / 1 | 2 / 0 / 1 | 2 runs; the ignored test is 0.16's |
+| IMAP plain | `cargo test -p tests imap::imap_tests -- --exact --nocapture` | 1 / 0 / 0 (`imap-plain-15`) | 1 / 0 / 0 | 15 runs: 1.0 fixtures (`body_structure`, `fetch`, `acl`) |
+| IMAP key | the same with `ZA_KEY_ACCOUNTS=1` | 1 / 0 / 0 (`imap-key-13`) | 1 / 0 / 0 | 13 runs |
+| JMAP plain | `cargo test -p tests jmap::jmap_tests -- --exact --nocapture` | 1 / 0 / 0 (`jmap-plain-49`) | 1 / 0 / 0 | 49 runs, driven by ruling 107; `calendar::notification` passed in every run that reached it |
+| JMAP key | the same with `ZA_KEY_ACCOUNTS=1` | 1 / 0 / 0 (`jmap-key-30`) | 1 / 0 / 0 | 30 runs |
+| `store::store_tests` | `cargo test -p tests store::store_tests -- --nocapture` | 1 / 0 / 0 | 1 / 0 / 0 | 4 runs: a 7a-ported `MailboxUid` write fixed |
+| `store::blob::blob_tests` | by its exact name | 1 / 0 / 0 | 1 / 0 / 0 | 2 runs |
+| `store::lookup::lookup_tests` | by its exact name | 1 / 0 / 0 | 1 / 0 / 0 | 2 runs |
+| `store::search_tests` | by its exact name | 1 / 0 / 0 | 1 / 0 / 0 (9:52) | 3 runs: ruling 76's `QueueId` range |
+| `telemetry::telemetry_tests` | by its exact name (ruling 33's removals) | 1 / 0 / 0 | 1 / 0 / 0 | 6 runs: the webhook delivery |
+| `system::system_tests` | `cargo test -p tests system::system_tests -- --nocapture` (SEL sub-tests removed) | 1 / 0 / 0 (`up-system-system_tests-19`) | 1 / 0 / 0 at attempt 2; and 1 / 0 / 0 (67 s) at `6d662128f` | 19 runs in 7c-7c4; in the net, attempt 1 failed `system::oidc`'s `client_secret_basic` exchange (N32, the one-second code lifetime under instrumentation), fixed by ruling 125 in this part |
+| SMTP | `cargo test -p tests smtp` with CI's `SPAM_RULES_URL` | 76 / 0 / 3 (`smtp-9`) | 76 / 0 / 3 | 9 runs plus 3 named reruns: `antispam` once (N27, its HTTP reload closed during TLS) passed alone; at `6ca04a058` the documented flakes `dkim2_dsn_is_signed` and `queue_retry` passed when rerun by name |
+| CI only (Docker): `directory`, `automation::automation_tests` | Task 8's CI jobs | not run | `automation-tests` fails both attempts: no Docker socket here (disposition `needs_docker_ci_only`) | settles at Task 8 |
+
+New-case completion: every new case of parts 4c, 5d, 6d and 7d1b is a sub-call of the ZA suite
+or a unit test. The inventory gate counted every ZA call executed in both ZA steps of the net,
+and the unit listing holds the five new unit tests (562 tests).
+
+#### The gates (part 7d1b, at `b39124246`)
+
+| Gate | Command | Result |
+|---|---|---|
+| Inventory | `python3 -I scripts/tests/check_test_inventory.py --baseline tests/qualification/baseline-0.16.27.json --dispositions tests/qualification/dispositions.json --listing task-7d/capture-b/list --ignored-listing task-7d/capture-b/ign --executed task-7d/gates/final/functions.json` | 9 failures, all `move_unconfirmed` (the seven DKIM tests and the two `http` `za_test` tests); they settle at Task 8 (ruling 124). Exit 0 with the two moves confirmed in a scratch copy. Excused: 22 `internals_replaced_equivalent`, 202 `sel_only`, 22 `subject_deleted` |
+| Coverage | `python3 -I scripts/tests/check_coverage.py --baseline tests/qualification/baseline-0.16.27.json --dispositions tests/qualification/dispositions.json --merged task-7d/coverage-b/merged.json --sources task-7d/src-final` | pass: full 20,821 / 21,549 (96.62%, 51 lines of margin), runtime-only 12,195 / 12,848 (94.92%, 32 lines) |
+| Gate self-tests | `python3 -I scripts/tests/test_gates.py` and the disposable changes I, L and N31 | 28 offline tests pass (7b); each disposable change turns its gate from pass to fail and passes again once restored (7d1, 7d1b) |
+| Ported-file diff | every ported test file against `5b914ddb5`: added `return`, `cfg!`, `#[cfg]`, `#[ignore]`, removed `.await`, added `let _ =` or `drop(` | every addition has an expectation-ledger row (7d1) |
+#### The hook-disable mutation sample (part 7d2)
+
+Ruling 126 sets the sample. The full table, one row per mutation with its command, outcome
+and failing assertion, is `task-7d2/mutations.tsv` in the plan workspace; the definitions
+are `task-7d2/muts/m_*.py`, applied by `muts/apply.py` and run by `muts/run.py`.
+
+**Method.**
+- Each mutation disables the protection itself: a refusal passes, a fence or assertion is
+  dropped, a redaction emits the raw value, a seal stores the plain value, a gate takes the
+  ordinary path. Every mutation compiles.
+- **One build for the whole sample.** Instead of rebuilding per mutation, each disposable
+  change is guarded by a run-time switch: the mutated branch runs only when the environment
+  variable `ZA_MUT` names the mutation (`std::env::var("ZA_MUT").is_ok_and(..)`), and the
+  original code runs otherwise. All 204 mutations were applied together, the `tests` crate and
+  the workspace unit tests were built once, and each run set `ZA_MUT` to one id. Where two
+  mutations share a site, the switch names both ids. Every mutation is still disabled
+  alone in its run. The switches stayed uncommitted and were removed with
+  `git checkout -- .`; the tree was then clean.
+- **Controls.** With `ZA_MUT` unset, the switched build passed the whole ZA suite (351 s), every
+  module set the sample used, the three key-mode suites (CalDAV 26 s, IMAP 14 s, JMAP 94 s) and
+  the unit sets. So the switches change nothing until a mutation is named.
+- **Speed tools (uncommitted).**
+  - In `tests/src/za/mod.rs`, `ZA_ONLY` names the modules to run after `setup::test`. A
+    selected run then destroys the plain account before the usual end of the suite
+    (`destroy_key_accounts`, `assert_is_empty`), because in the full suite later modules clear
+    that account's default containers.
+  - In `tests/src/jmap/mod.rs`, `ZA_JMAP_ONLY` names the key-mode variants to run.
+  - Three module sets cannot run alone: `fanout::test_task_queue`, `fanout::test_plain_owner`
+    without `dav_gate`, and `sharing_races` without `sharing::test`. Their sets carry the
+    module they depend on.
+- **Narrow first, then wide.** Each mutation ran first against the module or unit test that
+  the inventory names, one module per run. A mutation those runs did not catch then ran
+  against the key-mode CalDAV, IMAP and JMAP suites and the whole ZA suite, in that order,
+  stopping at the first failure. "Not caught" means it passed all of them.
+- A run that hung on an index-queue wait was stopped after 60 consecutive waits (about
+  2.7 minutes). It is recorded as caught by a hang, with the module it hung in.
+
+**Size and result.** 204 mutations; every mutation compiles. Counts per ruling 126's classes:
+
+| Class | What | Mutations | Caught | Not caught |
+|---|---|---|---|---|
+| (a) | one per pair of (hooked file of Tasks 3-6, contract C1-C8) | 155, covering 166 of the 184 pairs (one mutation covers two pairs where one hook serves both contracts); the other 18 pairs have no runtime hook to disable at 1.0 (`task-7d/mutations.tsv` names each and why) | 134 (145 of the 166 pairs) | 21 |
+| (b) | each hook whose guarding test the expectation ledger changed, alone | 37 | 33 | 4 |
+| (c) | Task 4's two lifecycle cases | 3 (one for `revoke_cleanup_does_not_rewrite_sealed_event`, two for `cleanup_cannot_restore_revoked_ring`) | 3 | 0 |
+| (d) | each port defect Task 7 fixed, reverted alone | 8 (`a5cddf448`'s four, ruling 91's split and coverage skip, ruling 93, ruling 94) | 8 | 0 |
+| (e) | ruling 99's `Blob/copy`-out refusal | 1 | 0 | 1, as expected |
+
+Each contract C1-C8 has at least one caught mutation.
+
+443 runs in all: 62 unmutated controls, 229 narrow runs, 150 wide runs, and 2 extra runs (a063's
+unit test and c001's rerun). Before the restore, the switched build passed the whole ZA suite
+again (370 s).
+
+**Not caught.** These are findings for the Task 7 review. No test was added in this part.
+
+| Id | File (1.0) | Contract | Disabled | Why no test fails |
+|---|---|---|---|---|
+| a001 | `common/src/auth/access_token.rs` | C1 | a key account's credential version taken from the vault revision; the access-token loader's epoch fences | No test revokes an OAuth grant through a vault password change. No test races the token loader against an invalidation. |
+| a011 | `common/src/cache/invalidate.rs` | C1 | the account-epoch bumps | A defence against races only; no test interleaves a loader with an invalidation. |
+| a013 | `common/src/cache/invalidate.rs` | C3 | the `Account` arm's drop of HTTP auth entries | No test sends an `Account`-only invalidation while an entry is cached; the `AccessToken` arm drops it as well. |
+| a014 | `common/src/cache/principals.rs` | C1 | the account loader's epoch fence | A defence against races only; untested. |
+| a018 | `common/src/config/inner.rs` | C3 | the random fingerprint key (all zeros instead) | Not observable: the tests check that a fingerprint is not the credential, not that its key is secret. |
+| a022 | `common/src/manager/boot.rs` | C2 | the startup line with the key-cache bounds | Not reachable: the harness never runs `BootManager::init`. The line is a diagnostic. |
+| a057 | `email/src/sieve/ingest.rs` | C3 | the redact flag of a key account's delivery Sieve run, and its runtime-error reason | The trace canaries reach plugins through the SMTP DATA-stage script (a024 catches that path). No delivery-time Sieve script fails with a canary. |
+| a062 | `groupware/src/calendar/storage.rs` | C7 | the calendar fences of `delete_with_events` | No test races a calendar delete against a concurrent change to one of its events. |
+| a063 | `groupware/src/scheduling/event_cancel.rs` | C7 | `itip_cancel`'s split of an organizer CANCEL per recipient | The unit `cancel_split_preserves_public_behavior` uses a policy that shows every attendee and one recipient, so the split changes nothing. No fixture has a CANCEL whose split differs. |
+| a070 | `http/src/auth/authenticate.rs` | C3 | ruling 28's two hooks (the raw Authorization value back in the Basic-decode and unsupported-mechanism errors) | No test sends a malformed Basic header or an unknown mechanism and scans the traces. |
+| a072 | `http/src/auth/oauth/mod.rs` | C3 | the untraced OAuth form read | `raw_input` covers IMAP, POP3, ManageSieve and SMTP; no test scans traces for an OAuth form body. |
+| a082, a083, a087, a092, a094 | `imap/src/core/{mailbox,view}.rs`, `imap/src/op/{acl,rename,expunge}.rs` | C5 | ruling R34's route checks (and EXPUNGE/CLOSE's foreign-account checks) | Defence in depth: a foreign key account's mailboxes are left out of the session's listing (a004 and a081 are caught), so no command can name one, and the route is never reached with one. |
+| a106 | `jmap/src/blob/download.rs` | C6 | the refusal of a key account's calendar blobs | No test downloads a Calendar or CalendarEvent blob of a key account. |
+| a108 | `jmap/src/calendar_event/set.rs` | C7 | the calendar identity tombstone on JMAP event moves and destroys | JMAP calendars refuse key accounts, and `sharing_tombstones` writes through DAV. No test reads `CalendarIdentity` tombstones after a JMAP write. |
+| a142 | `services/src/task_manager/scheduler.rs` | C2 | the scheduled 30 s key sweep | The cache tests call `za_sweep_keys` directly; nothing waits for the scheduler. |
+| a158 | `spam-filter/src/modules/classifier.rs` | C3 | R56's quiet trusted-domain lookup in token building | The trace test's message does not reach the classifier's token building. |
+| a159 | `spam-filter/src/modules/dnsbl.rs` | C3 | the DNSBL zone and error redaction | No DNSBL is configured in the ZA suite. |
+| b007 | `jmap/src/blob/download.rs` | C5 | the foreign-key-account branch of `has_access_blob` (ledger row `assigned_ids_preserve_sealed_read_offsets`) | Another token's download already answers 404 before this branch, so it is defence in depth. a105, which also bypasses the unsealing reader, is caught. |
+| b014 | `services/src/index_queue/index.rs` | C8 | the key-account flag on a deleted message's thread subject (ledger row `test_mid_pass_deletion`) | The stub's headers hold no subject, so the outcome is the same. |
+| b034 | `dav/src/calendar/proppatch.rs` | C7 | PROPPATCH's calendar fences alone (ledger row `calendar_conditional_proppatch_races`) | No race reaches a PROPPATCH commit. a048, which also drops ruling 70's dead-property fence, is caught only through that fence (`mail::fence`). |
+| b039 | `imap/src/op/fetch/mod.rs` | C5 | FETCH's route check (ledger row imap `fetch` key variant) | As a082: defence in depth. |
+| e001 | `jmap/src/blob/copy.rs` | C5 | ruling 99's `Blob/copy`-out refusal | Expected: 1.0's own checks refuse first. |
+
+**Caught, with a note.**
+- **c001** disables `ShareRevokeCleanup`'s skip of key-account owners. The case written for it,
+  `revoke_cleanup_does_not_rewrite_sealed_event`, passed in its narrow run, which also runs its
+  predecessor `cleanup_cannot_restore_revoked_ring`. The
+  mutation was caught later in the full ZA suite, in `sharing_races`: "direct full-ledger apply
+  expected TooManyShares, got Seal(..)" at `sharing_races.rs:3253`. This reproduced on a rerun.
+- **c002 and c003** (the keyed revoke's ring removal; the grantees' token invalidation) were
+  caught by `cleanup_cannot_restore_revoked_ring` (`sharing.rs:10878`) and by `sharing::test`
+  (`sharing.rs:3517`).
+- **Hangs.** In b008 the index partition never drains in `index_task::test_destroyed_stub`; in
+  b009 it never drains in CalDAV key mode. A hang is a failure, but no assertion names the
+  protection: `index_task::test` and `test_reindex` passed under b008.
+- **Panics in a helper, not at an assertion.** a096 and a135 serve sealed bytes raw; the test
+  panics while slicing them.
+- **Caught by a fence behind the one disabled.** b003 (MKCALENDAR's dead properties unsealed) is
+  refused by ruling 70's vault-absence fence (503). b005 (`copy_message`'s refusal) is refused by
+  the provisioning fence.
+- **Two failures not caused by the mutation, then caught.** a030's first CalDAV key run failed in
+  the key-mode alarm variant (`webdav/za_variants.rs:331`: one of the two alarm emails had not
+  arrived after its fixed 6 s wait). a037's first run failed in `webdav::cal_itip`'s
+  library-level fixtures. Both passed on rerun. The ZA suite then caught both mutations:
+  a030 in `sharing::sharing_class_differential`, a037 in `gating::test`.
+
+#### Needs a ruling (part 7d2)
+
+- **N33, the method.** The brief asks for a restore after each mutation. This part instead
+  applied all 204 mutations behind run-time switches and built once. Each run still disabled
+  exactly one mutation. Unmutated controls show the switched build behaves as the committed
+  tree. The tree was restored with `git checkout -- .` and is clean. Confirm that this
+  satisfies the sample.
+- **N34, the 21 uncaught class (a) and (b) mutations** (the table above). Each needs a
+  disposition from the Task 7 review: a test, or an accepted residual. They group as:
+  - race-only defences: a001, a011, a014, a062, b034;
+  - defence in depth behind an earlier refusal: the IMAP route checks a082, a083, a087, a092,
+    a094 and b039, and b007;
+  - a path no test drives: a013, a057, a063, a070, a072, a106, a108, a142, a158, a159;
+  - not observable or not reachable from the harness: a018, a022, b014.
+- **N35, c001.** `revoke_cleanup_does_not_rewrite_sealed_event` does not fail when the skip it
+  was written for is disabled. Should the case reach a state that upstream's cleanup would
+  rewrite?
+- **N36, two timing failures seen in key-mode CalDAV during the sample.** These are
+  `webdav/za_variants.rs:331`, the key-mode alarm variant's fixed 6 s wait (upstream's
+  `cal_alarm` now polls, by part 7c4's ledger row), and one `webdav::cal_itip` mismatch. Both
+  passed on rerun. Should the alarm variant poll as upstream's test does?
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
