@@ -502,25 +502,41 @@ upstream's messages for it:
    organizer's full state, after the address's slice, sends one CANCEL
    from the organizer to the address forms the slice reached, with a
    component for each recorded instance the committed tree no longer has
-   the address attend: built by upstream's cancel builder
-   (`CancelScope::Instance` over those addresses, so it lists none of the
-   instance's current attendees), plus a bare ATTENDEE line for each of
-   those addresses (upstream's own CANCEL copies the removed attendee's line
-   from the superseded tree, which the full state no longer has, and a
-   CANCEL naming none of the recipient's addresses fails its snapshot), at
-   the instance's committed SEQUENCE, or,
-   for an instance the tree has no component for, from the master with
-   the recorded instant as RECURRENCE-ID and DTSTART at the master's
-   SEQUENCE (skipped when the address attends the master), then split per
+   the address attend. When the slice is empty because the address
+   DECLINED every instance it attends without SCHEDULE-FORCE-SEND, or has
+   RSVP=FALSE there (upgrade ruling 153), the CANCEL still goes, to the
+   address forms the tree names for it on an ATTENDEE the server
+   schedules: the replay does not depend on a REQUEST going out, and the
+   entry retires only once the replay is delivered, from the fan-out and
+   from `contacts/pin` alike. Each component is built by upstream's cancel
+   builder (`CancelScope::Instance` over those addresses, so it lists none
+   of the instance's current attendees) at the instance's committed
+   SEQUENCE, or, for an instance the tree has no component for, from the
+   master at the master's SEQUENCE with the recorded instant as
+   RECURRENCE-ID (skipped when the address attends the master). It then
+   keeps only what a CANCEL needs (upgrade ruling 152): UID, ORGANIZER,
+   RECURRENCE-ID, SEQUENCE, DTSTAMP and STATUS:CANCELLED, plus DTSTART at
+   the RECURRENCE-ID's value (upstream's CANCEL merge stores a component the
+   copy lacks as its cancelled override, and a stored VEVENT needs a
+   DTSTART) and a bare ATTENDEE line for each of those addresses (upstream's
+   own CANCEL copies the removed attendee's line from the superseded tree,
+   which the full state no longer has, and a CANCEL naming none of the
+   recipient's addresses fails its snapshot). No SUMMARY, DESCRIPTION,
+   LOCATION, CREATED, LAST-MODIFIED, DTEND, DURATION or DUE of the instance
+   or of the master is carried, and the message's iTIP summary holds only
+   the instances' RECURRENCE-ID times. The CANCEL is then split per
    recipient as above. An instance the address attends again gets none;
-   the recipient learns only RECURRENCE-IDs of instances it was on. The
+   the recipient learns only the RECURRENCE-IDs of instances it was on. The
    coverage skip below does not apply while the entry records instance
    keys, and the instances retire with the entry. An entry whose instances
    overflowed (`all`) keeps the behaviour without the record, a recorded
    limit, as does a master CANCEL (never recorded: it cancels every
    instance of the copy); so does an override CANCEL whose instance the
    copy holds at a higher SEQUENCE than the master's when the tree has no
-   component for it (the drain answers `OutOfSequence`). A split error of
+   component for it (the drain answers `OutOfSequence`); and so does an
+   address the tree marks SCHEDULE-AGENT=CLIENT or NONE wherever it names
+   it: the server does not schedule for it (RFC 6638), so no replay is
+   built and the entry is dropped, which is correct. A split error of
    the full state is a failure (`5.1`, the entry kept), not "nothing to
    send" (upgrade ruling 135);
    for an attendee, the refused instances' current participation (section 6.4's
