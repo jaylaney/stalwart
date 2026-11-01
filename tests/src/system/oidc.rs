@@ -790,7 +790,8 @@ pub async fn test(test: &mut TestServer) {
         }
     );
 
-    // Let the code expire and make sure it's invalidated
+    // Let the code expire and make sure it's invalidated. This code has the
+    // one-second `user_code_expiry` set above.
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(
         http.post::<LoginResponse>(
@@ -814,7 +815,11 @@ pub async fn test(test: &mut TestServer) {
         }
     );
 
-    // Authenticate account using a valid code
+    // Authenticate account using a valid code. Upgrade ruling 159: the
+    // expiry case above has its own one-second user code; this one lives a
+    // minute, so the login cannot race the code's expiry (the class of
+    // ruling 125, seen once in an uninstrumented run).
+    set_user_code_expiry(test, 60);
     let device_response: DeviceAuthResponse =
         post(&metadata.device_authorization_endpoint, &device_code_params).await;
     token_params.insert(
@@ -941,6 +946,15 @@ pub async fn test(test: &mut TestServer) {
     admin.registry_destroy_all(ObjectType::OAuthClient).await;
     admin.destroy_account(user).await;
     test.cleanup().await;
+}
+
+fn set_user_code_expiry(test: &TestServer, secs: u64) {
+    let mut core = (*test.server.inner.shared_core.load_full()).clone();
+    core.oauth.oauth_expiry_user_code = secs;
+    test.server
+        .inner
+        .shared_core
+        .store(std::sync::Arc::new(core));
 }
 
 fn set_access_token_expiry(test: &TestServer, secs: u64) {
