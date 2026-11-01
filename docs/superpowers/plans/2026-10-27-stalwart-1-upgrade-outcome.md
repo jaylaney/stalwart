@@ -8855,6 +8855,192 @@ gate are green. Nothing in the product was changed.
   not pass through a symbolic link (the runner's `log_directory` refuses one, so a macOS
   `/var/...` path must be given as `/private/var/...`).
 
+### Part 8c: CI at 1.0, the last runner rulings, the push and the runs
+
+Run on 2026-11-01 from `bc31a715b`. Jay authorized two GitHub actions for this part: pushing
+the branch (`git push -u origin stalwart-1-upgrade`) and dispatching `test.yml` on it. The
+coordinator later authorized cancelling runs 1 and 2 (below). Nothing else was written to
+GitHub: no pull request, tag, push to `main`, or other workflow.
+
+#### Runner and test fixes
+
+- **Ruling 166** (`cf52ced9d`). In plain mode `flows/test_delegation_and_organizer_mediated_status`
+  is a strict xfail with the reason "1.0 refuses a delegator-forwarded REQUEST (sender must be
+  the organizer)". Key mode has no record, so it stays a required pass. The policy used to
+  refuse any record for a strict flow; it now accepts a strict xfail only (never a skip or a
+  non-strict xfail). The flow fails through `pytest.fail` inside `poll_event`, so the
+  fingerprint gained three things:
+  - pytest's hidden frames are left out before the deepest frame is read, as pytest's report
+    does;
+  - `Failed` (pytest's failure exception) is an accepted exception type;
+  - an optional `via`, the failing frame's caller. The record names `test_flows.py:67` (the
+    poll's failure) via `:164` (Carol's poll), so no other poll of the flow can match.
+- **Ruling 167** (`cf52ced9d`). The per-test retry was built first, in `policy_plugin.py`: up to
+  2 more attempts, 3 s apart, for `calendar/testSearchEvent` in plain mode only, each retry
+  written to the run's output. Against the 8a binary it failed all three attempts (at
+  `test_caldav.py:2793`, then `:2804` twice). The test recreates its calendar in every
+  attempt (`_fixCalendar` tears the test calendar down and makes it again), PUTs its three
+  events and searches their summaries at once, so each attempt races the index again. A retry
+  cannot be made to work cleanly, so by the ruling's fallback the test is a non-strict xfail in
+  plain mode, with the reason "1.0 indexes calendar text asynchronously; a search right after a
+  PUT can miss". The retry code was removed. A non-strict record (`"strict": false`) may pass;
+  a failure counts as expected only at one of its `lines`: the four summary-search assertions
+  `2793`, `2804`, `2810` and `2815`. Key mode stays a required pass.
+- The harness unit suite has 34 tests (was 30), all passing: a strict flow record (accepted
+  as xfailed, refused as a skip), the caller match (the right caller, another caller, an
+  unexpected pass), the non-strict record (a pass, a failure at either listed line, a failure
+  at an unlisted line, key mode with no record), and the new validation (`via`, `lines`,
+  `strict`).
+- Three local runs of the runner against the 8a binary after the change, both modes each:
+  plain 68 passed, 1 skipped, 3 xfailed of 72 (`testSearchEvent` passed), then 67 passed,
+  1 skipped, 4 xfailed (it failed at a listed line); key 74 passed, 1 skipped, 2 xfailed of 77
+  both times. Both modes passed.
+- **Ruling 168** (`832e7598b`). `docs/zero-access/client-caldav.md`: the three former strict
+  xfails pass at 1.0; the If-Match race uses live properties (owner `displayname`, grantee
+  `calendar-description`), with the dead-property case beside it; the two plain-mode records;
+  the fingerprint rules. No tracker is named.
+- **Ruling 159** (`cdc1d8cfd`). In `system::oidc` the expiry case keeps its own one-second user
+  code (the registry's `user_code_expiry`); the successful device login sets a 60 s lifetime on
+  the running core before it asks for its code. `system::system_tests`: 1 passed (62 s).
+
+#### `test.yml` at 1.0 (`c1d4c412a`)
+
+The header says what public CI can claim: the tests this repository holds, on the fork at
+1.0.1. Upstream's private suites do not run here, and neither do the deferred external
+protocol suites (Dovecot imaptest, Fastmail's JMAP test suite, Apple's CalDAVTester).
+`UNIT_TEST_FEATURES` moved to the workflow's `env`, re-derived for 1.0 (this note's
+"`UNIT_TEST_FEATURES` for 1.0"), so the unit step and the gates' listing capture share one list.
+
+| Job | Purpose | Commands (all with `STORE=RocksDb RUST_MIN_STACK=16777216`) | Triggers, timeout |
+|---|---|---|---|
+| `style` | formatting | `cargo fmt --all --check` | every trigger |
+| `test` | upstream's suites on the paths shared with ordinary accounts | `cargo test -p tests directory` (no oidc sub-test at 1.0; Docker: OpenLDAP, Keycloak); `smtp` with `SPAM_RULES_URL` and the rerun of failed tests by name; `imap`; `jmap` with one rerun | not on push; 60 min |
+| `unit-tests` | every unit test of `crates/*` but scim | the workspace step with `$UNIT_TEST_FEATURES`; **SMTP Unit Tests (without enterprise)**: `cargo test -p smtp --lib --bins --features test_mode` (ruling 53's seven DKIM tests); **HTTP Unit Tests**: `cargo test -p http@1.0.1 --lib --bins --features test_mode,enterprise` (the two `za_test` tests) | every trigger; 75 min (was 45: two more feature sets) |
+| `upstream-suites` | the other upstream suites | `webdav::cal_query::`, `store::store_tests`, `store::blob::blob_tests`, `store::lookup::lookup_tests`, `store::search_tests`, `telemetry::telemetry_tests`, `system::system_tests`, `automation::automation_tests` (Docker) | not on push; 60 min |
+| `zero-access` | the fork's suites | vault and groupware units (`--features vault/test_mode`); the leak-scanner unit test; `za::za_tests`, then with `BLOB_STORE=FileSystem`; **new**: `za::cache_swap::cache_swap_tests -- --exact`, without `BLOB_STORE`; CalDAV plain and key (one rerun each); IMAP and JMAP plain (push only) and key | every trigger; 120 min (was 90) |
+| `caldav-client` | the independent python-caldav runner | `cargo build --release --locked -p stalwart --no-default-features --features rocks`; python-caldav at `111ae14b875f40d100d5259820f10210f00e20f9`; the harness unit suite; `runner.py` in both modes; four sanitized logs on failure | after `zero-access`; 60 min |
+| `fresh-store` (**new**) | the OSS create-and-restart gate | its failure tests (`python -B -m unittest discover -s tests/product -p test_fresh_store.py -v`), then the product build in this job's own Cargo process (the command above), then `python -B tests/product/fresh_store.py --binary target/release/stalwart --log-dir "$RUNNER_TEMP/fresh-store-logs"`; its two sanitized logs on failure | every trigger; 90 min |
+| `gates` (**new**) | the C10 gates | `scripts/tests/coverage_net.py` (the 19-step `cargo llvm-cov --no-report` net: `build-A`, `build-B`, then the baseline's steps and commands, a failed step rerun once, `smtp` by name; per-step and merged exports), `scripts/tests/capture_listings.py` (every CI step's listing), `strict_rule.py functions`, `check_test_inventory.py`, `check_coverage.py`; sanitized gate reports on failure | weekly and dispatch only; 330 min |
+
+- **Sanitized receipts.** `caldav-client` and `fresh-store` keep only the logs their harnesses
+  write through exact redaction of every generated credential. `gates` keeps only the gate
+  reports, the strict-rule log, the net's step table and the listings' exit lines (no test logs
+  or profiles), and redacts Basic and Bearer values and password, secret and token assignments
+  all the same.
+- **Not covered.** The optional Keycloak case for the Bearer arm of the external-directory
+  refusal is deferred (a comment at the directory step says so).
+- **The gates' scripts** (`045b9a9f8`) are part 7d1's driver and capture tool made portable
+  (repository-relative paths, the target directory from `cargo metadata`). Checked locally: the
+  capture reproduced part 7d1's listings of the two move targets and the ZA step exactly (the
+  same tests and commands); the net ran `build-B` and `leak-unit-test` and exported it, and its
+  tests-crate skip list holds 98 names, as the baseline's did.
+- **Validation before the push.** The workflow parses as YAML (PyYAML); `shellcheck -S
+  warning` passes on all 42 `run` blocks; `actionlint` is not installed.
+
+#### The handoffs
+
+- **Ruling 53**: the unit-tests job's "SMTP Unit Tests (without enterprise)" runs the seven DKIM
+  tests.
+- **The `http` `test_mode` step**: "HTTP Unit Tests".
+- **Ruling 124** (`55634f2b8`): both selection moves are confirmed (`unconfirmed: false`). The
+  steps' configuration names (`test.yml__unit-tests__smtp-unit-tests-without-enterprise`,
+  `test.yml__unit-tests__http-unit-tests`) and commands equal the moves', so part 7d1's captures
+  stand and nothing was recaptured. The gate self-test that showed an unconfirmed move failing
+  now marks its own copy unconfirmed (32 self-tests, 2 skipped, pass). The inventory gate on the
+  `6fd9a131f` set (`task-7d/capture-7f4/list`, `ign`, `task-7d/gates/7f4/functions.json`)
+  **exits 0**: 795 tests, 29 configurations, 272 call-steps, 3,833 helper-steps, 24 tail-steps,
+  14 loop-steps; excused 20 `internals_replaced_equivalent`, 2 `internals_replaced_no_equivalent`,
+  202 `sel_only`, 22 `subject_deleted`.
+- **Ruling 137**: both Docker-backed suites run in CI (`directory` in `test`, `automation` in
+  `upstream-suites`).
+  - `automation`: the gates job's net runs its baseline step (`automation-tests`) on a runner
+    with Docker, so its export reaches the executed rule (run 3: exported and merged, though
+    the step fails on held finding 2).
+  - `directory`: recorded as a **C10 limit**. The baseline net has no directory step (it
+    needed Docker at 0.16.27 too; disposition `needs_docker_ci_only`), so the executed rule
+    holds no requirement its export could meet, and an instrumented 20th step would only add
+    time to a job that already takes hours. It runs uninstrumented in `test`.
+- **`ci.yml`'s semver tags** (`ci.yml:274-275`): no change. They cannot publish an image from
+  this fork: the metadata step is in the `linux` job, which is `if: ${{ false }}` (disabled
+  because its builds enable `enterprise`); `multiarch`, the only job that pushes images, needs
+  `linux`, so it is skipped too, as are `release` and `publish`. The fork's tags `fork-v*` do
+  not match `ci.yml`'s `v*.*.*` trigger; fork releases go through `product-build.yml`.
+
+#### The runs
+
+The branch was pushed to `origin` (`jaylaney/stalwart`); a branch push triggers no workflow.
+Each run was a manual dispatch of `test.yml` on `stalwart-1-upgrade`. Runs 1 and 2 were
+cancelled once every other job had finished: both gates jobs had sat in "Capture CI step
+listings" for over two hours, which the coordinator authorized cancelling (finding below).
+
+| Job | Run 1, [41329853936](https://github.com/jaylaney/stalwart/actions/runs/41329853936) at `c1d4c412a` | Run 2, [41333532545](https://github.com/jaylaney/stalwart/actions/runs/41333532545) at `a57c0fb35` | Run 3, [41353338209](https://github.com/jaylaney/stalwart/actions/runs/41353338209) at `24d179471` |
+|---|---|---|---|
+| Check Style | success | success | success |
+| Unit Tests | success: workspace 568 passed, 2 ignored; SMTP without enterprise 16 (the seven DKIM tests); HTTP 6 (the two `za_test` tests) | success | success (590) |
+| Test | failure: Directory (held 1); the later steps did not run | failure: Directory only (held 1). SMTP: `antispam` and `queue_retry` failed in the full filter and passed rerun by name; IMAP and JMAP passed | failure: Directory (held 1) and IMAP (held 3); SMTP passed with no rerun, JMAP passed |
+| Upstream Suites | failure: Automation only (held 2); cal_query, store, blob, lookup, search, telemetry and system (with ruling 159's fix) passed | failure: Automation only (held 2) | failure: Automation only (held 2) |
+| Zero-access Test | failure: the first `za_tests` step, a request past the DAV helper's 500 ms client timeout during "drain timezone merge regression"; the later steps did not run | success, every step on its first attempt: vault and groupware units, leak unit, ZA (430 s), ZA filesystem blobs (436 s), cache swap, CalDAV plain and key, IMAP and JMAP key | success, every step on its first attempt |
+| Independent CalDAV Client | skipped (needs `zero-access`) | success: harness 34 tests; plain 67 passed, 1 skipped, 4 xfailed of 72 (`testSearchEvent` failed at a listed line: its non-strict xfail); key 74 passed, 1 skipped, 2 xfailed of 77 | success: harness 34; plain 67 passed, 1 skipped, 4 xfailed; key 74 passed, 1 skipped, 2 xfailed |
+| Fresh OSS Store Restart | success: failure tests 9 (Python 3.12), the product build, then 9 readback checks after the restart | success | success |
+| C10 Gates | cancelled in the capture. The net ran every step: `imap-plain` failed both attempts (instrumented), `automation-tests` both (held 2), `smtp` passed `antispam` by name | cancelled in the capture. The net: only `automation-tests` failed both attempts (held 2); `smtp` passed `dkim2_dsn_is_signed` and `queue_retry` by name | failure, on the net alone: every step passed on its first attempt but `automation-tests`, which failed both (held 2). Then, in CI, the capture (28 listings, 28 ignored-only), the executed functions (2,345) and **both gates pass**: inventory `result: OK` (795 tests, 29 configurations, 272 call-steps, 3,833 helper-steps, 24 tail-steps, 14 loop-steps; the same excused counts as locally); coverage full 21,512 / 22,244 (96.71%), runtime-only 12,450 / 13,106 (94.99%), the figures of the local `6fd9a131f` net. The sanitized receipt was uploaded (gate reports, step table, listing exit lines; checked: no credential) |
+
+Workflow fixes between the runs, each a CI fault:
+- `a57c0fb35` (after run 1). Every suite step of `test`, `upstream-suites` and `zero-access`
+  runs unless the run is cancelled: run 1's directory and ZA failures had left every later step
+  of their jobs unrun (the job still fails). Both `za_tests` steps rerun once with a warning, as
+  the CalDAV steps do, for a hosted runner's request outlasting upstream's 500 ms DAV client
+  timeout (`tests/src/utils/webdav.rs:100`). Runs 2 and 3 did not need the rerun.
+- `24d179471` (after runs 1 and 2). **Every cargo command recompiled `common` and everything
+  above it** (about 2 minutes each; in run 2's Test job each `cargo test -p tests` step
+  compiled `common` again). `common`'s build script (`crates/common/build_support/release.rs`)
+  watches `.git/HEAD`, `index`, `packed-refs` and `refs` for the build identity;
+  `actions/checkout` (`git init` and a fetch) leaves no `packed-refs`, and cargo reruns a build
+  script whose watched path is missing. The capture's roughly 110 cargo commands therefore took
+  about 5 minutes per configuration and ran past two hours. Each job that builds now runs
+  `git pack-refs --all` after checkout; the source state stays `clean`. In run 3 the IMAP and
+  JMAP steps start in under a second. `capture_listings.py` also runs each command with stdin
+  from `/dev/null`, in its own process group, under a 45-minute timeout, with a timestamped line
+  before and after; `coverage_net.py`'s steps read stdin from `/dev/null`. No product code
+  changed (the build script is left as it is).
+- Docker: the directory and automation suites ran their containers on the hosted runner
+  (OpenLDAP, Keycloak, Pebble, challtestsrv, PowerDNS); both fail on test assertions (held 1
+  and 2), not on the environment, so no Docker change was needed.
+
+#### Held
+
+Each fails only in CI, in a test, and is not changed here (no product code was touched).
+
+1. **`directory::directory_tests`, `issuer::test`** (`tests/src/directory/issuer.rs:80`), every
+   run: "A bearer token without a username claim did not reach the domain's OIDC directory",
+   401 for 200. The suite needs Docker, so it never ran locally at 1.0. Likely cause, not
+   confirmed: 1.0's OIDC directory defaults `unscopedTokens` to `Reject`
+   (`registry/src/schema/structs_impl.rs:51293`), and the test's Keycloak token asks only for
+   `openid`, so `token_access` refuses it (`directory/src/backend/oidc/lookup.rs:315-318`); the
+   port carried `accepted_audiences` (part 7a) but not this setting. Log: run 41353338209, job
+   Test.
+2. **`automation::automation_tests`, ACME** (`tests/src/automation/acme.rs:167`), every run:
+   creating an `AcmeProvider` from `Default` without a contact email expects `invalidProperties`
+   ("At least one contact email is required"), and 1.0 answers `invalidPatch` "Cannot modify
+   server set property" (`accountHashPrefix`) first. Docker-only, never run at 1.0 before. Log:
+   run 41353338209, job Upstream Suites. The gates' net fails its `automation-tests` step for the
+   same reason, so the net cannot exit 0 until this is settled.
+3. **`imap::imap_tests`, SEARCH** (`tests/src/imap/search.rs:197-204`, plain mode):
+   `UID SORT RETURN (COUNT ALL) (DATE SUBJECT)` answered `COUNT 10 ALL 6,4:5,1,10,3,2,9,7:8`,
+   where part 7c2's 1.0 expectation is `6,4:5,1,10,9,3,7:8,2`. It failed in run 3's Test job
+   and in both of run 1's instrumented `imap-plain` attempts, and passed in runs 1 and 2's Test
+   jobs, run 2's net and every local run. So the order is not stable on the hosted runner (ties
+   on DATE, or messages not yet indexed when the SORT runs). Log: run 41353338209, job Test.
+
+Not held: run 1's `za_tests` request timeout (above). The documented flakes reran by name and
+passed: `antispam`, `queue_retry`, `dkim2_dsn_is_signed`.
+
+#### Timing (run 3)
+
+The gates job took about 1 h 45 min: the instrumented builds and the 19 steps about 65 min
+(the two ZA steps 10 min each, `search-tests` 6 min), the capture about 35 min, the gates a few
+minutes. Its 330-minute timeout stays, for a cold cache and runner variance. The other jobs
+took 20 to 45 minutes each; the CalDAV client starts after `zero-access`.
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
