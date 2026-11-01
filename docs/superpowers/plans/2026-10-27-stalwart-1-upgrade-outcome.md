@@ -8180,8 +8180,8 @@ owner's home at depth 1, a home listing; the calendar at depth 1), the case:
 - parks the same request at the hook, makes the change, and releases it;
 - sends the request again after the change.
 
-**What the case found, held for a ruling.** The refusal arms are not reached from this race,
-and the in-flight answer to a revocation serves the calendar in full.
+**What the case found.** The refusal arms are not reached from this race, and the in-flight
+answer to a revocation serves the calendar in full (accepted by ruling 148, below).
 - `get` puts every admitted context in the request's memo (`data.calendar_memo`), and
   `za_read_context` answers a memo hit with `check_access` against the memoized calendar
   archive. A grant revoked after admission is therefore invisible to the rest of the request:
@@ -8198,15 +8198,36 @@ and the in-flight answer to a revocation serves the calendar in full.
   calendar deleted, between that admission and the item's read" is wrong for PROPFIND: the memo
   covers every foreign item the listing admits.
 
-**What the committed case asserts.** For a deletion: 207, no name, content, dead-property value
-or (in propname) dead-property name of the calendar or its event, and, for allprop and prop, no
-`200 OK` in the calendar's or the event's response. For both changes: the request sent after
-the change answers 403 and names no such calendar (the reader holds no other grant on the owner,
-so the URI gate refuses it). The revocation's in-flight answer is printed, not asserted. The
-ruling-strength version, which asserts the refusal arms' answers (home listing: the calendar
-left out; the calendar: 403 revoked, 404 deleted) and that nothing of the calendar is served,
-is kept uncommitted as `task-7f3/case-ruling-strength.diff`; it fails on 12 of its 12 parked
-requests (run `task-7f3/logs/dev-1.log`).
+**Rulings 148-150.**
+- **Ruling 148: the in-flight window is accepted.** Sharing spec 4.4 lets a read-only operation
+  memoize the resolved calendar context for one request "within 4.6's accepted in-flight read
+  window", and spec 4.6 says "a revoked grantee's request already in flight finishes on its own
+  copy of the keys". Ruling 142's premise (that the arms run when a grant is revoked or a
+  calendar deleted mid-request) was wrong.
+- **Ruling 149: the refusal arms stay as defence in depth.** `refusal` and
+  `za_propname_item`'s Forbidden-in-a-home-listing and `Err` arms are unreachable by
+  construction under the read memo: every foreign item a listing admits sits under a memoized
+  calendar. p001-p003 below are uncaught by construction. The hook stays.
+- **Ruling 150: propname after a deletion is accepted** in its current shape: each admitted
+  href with 200 and the static property names, with no data and no dead-property name.
+
+**What the case asserts** (a follow-up commit; the case's comment cites spec 4.4 and 4.6):
+- **Revocation:** each of the six in-flight answers equals the unparked control's, status and
+  body (every served property).
+- **Deletion:** 207, and no name, content, dead-property value or (in propname)
+  dead-property name of the calendar or its event. Allprop and prop: no `200 OK` in the
+  calendar's or the event's response. Propname: each admitted href (the calendar; on the
+  calendar target, the event too) is answered 200 with the static names (`getetag` among them).
+- **Both changes:** the request sent after the change answers 403 and names no such calendar
+  (the reader holds no other grant on the owner, so the URI gate refuses it).
+
+Runs of the updated case, with an uninstrumented build from scratch: `ZA_ONLY=sharing,sharing_races`
+(part 7d2's uncommitted selector, unmutated) 1 passed (84 s, `task-7f3/logs/r148-sel.log`, all
+12 parked requests checked); `za-95` (`task-7c/logs/`), the full `za::za_tests`, 1 passed (342 s).
+
+The first version of the case printed the revocation's answer without asserting it, and an
+uncommitted ruling-strength version, which failed on all 12 parked requests
+(`task-7f3/logs/dev-1.log`), was discarded after ruling 148.
 
 ##### Mutation rows (appended to `task-7d/mutations.tsv`)
 
@@ -8222,7 +8243,8 @@ use). The control with `ZA_MUT` unset passed (84 s).
 | p002 | `za_propname_item` lists a calendar refused in a home listing | not caught | the same |
 | p003 | `za_propname_item`'s `Err` arm lists the item | not caught | the same |
 
-None can be caught by this race, for the reason above: the arms are not reached.
+None can be caught by this race: the arms are unreachable by construction under the read memo
+(ruling 149), and they stay as defence in depth.
 
 ##### Runs (logs in `task-7c/logs/`)
 
@@ -8334,22 +8356,13 @@ The superseded exports are kept: disk is not short (about 80 GB free after the n
 step rewrote `crates/dav-proto/resources/requests/*.json` again (the upstream test that writes
 its output, as in part 7c); the files were reverted before this note's commit.
 
-##### Needs a ruling (part 7f3)
+##### Rulings on part 7f3
 
-- **The in-flight revocation (ruling 142's case).** A grantee's PROPFIND admitted before a
-  revocation is answered from the request's admission memo, after the revocation commits: the
-  calendar's name, its dead property and the event's content in the clear. Either this is
-  accepted (the read is linearized at its admission, as the memo's comment intends; then the
-  ruling-strength assertion becomes "the in-flight answer equals the control's"), or the item
-  reads must re-check the grant (for example a fresh `za_calendar_context`, or a grant-ring
-  generation check, per item or once after the listing), which is a product change in
-  `propfind/za.rs` or `dav/src/common/za.rs` and puts kernel lines in the cohort.
-- **The refusal arms stay unreached.** `refusal` and `za_propname_item`'s two arms cannot run
-  from this race, and no other grantee path reaches them (every foreign item is under a
-  memoized calendar). Record them as unreachable-by-construction, or keep them for the fix
-  above, which would make them reachable.
-- **Propname after a deletion** lists the admitted hrefs of the deleted calendar and event with
-  200 and the static property names (no data). Accept, or answer them 404 as allprop does.
+Answered by rulings 148 (the in-flight revocation: accepted under sharing spec 4.4 and 4.6),
+149 (the refusal arms: kept as defence in depth, unreachable by construction), 150 (propname
+after a deletion: accepted) and 151 (`dkim2_all_disclosed` joins CLAUDE.md's list of
+timing-flaky SMTP tests at Task 9). The net at `52ee3ad8c` stands: the follow-up commit
+changes only the case's assertions.
 
 ## Conflict ledger
 
