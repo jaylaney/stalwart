@@ -8,10 +8,11 @@
 
 # Run against the recovery-mode server (start-recovery.sh, plain HTTP on 127.0.0.1:8080).
 # Creates, in this order, through the registry JMAP API as the fallback admin: three listeners
-# (http 8080 and imap 1143, both plain; https 8443 with TLS), the domain example.com, the
-# certificate from $ZA_RUN_DIR/tls (made by tls-cert.sh), one update of the settings singleton
-# (default certificate, default domain example.com, default hostname), and a user
-# alice@example.com with NO password credential (eligible for the zero-access setup flow).
+# (http 8080, plain; imap 1143, plain with STARTTLS; https 8443 with TLS), the domain
+# example.com, the certificate from $ZA_RUN_DIR/tls (made by tls-cert.sh), one update of the
+# settings singleton (default certificate, default domain example.com, default hostname), and
+# a user alice@example.com with NO password credential (eligible for the zero-access setup
+# flow).
 # If PLAIN_PASS is set it also creates the ordinary account plain@example.com with that
 # password (the control account of the gating checks).
 # ZA_HOSTNAME is the default hostname (default mail.example.com); the server requires a
@@ -46,7 +47,9 @@ created_id() { python3 -I -c 'import json,sys; r=json.load(sys.stdin)["methodRes
 updated_ok() { python3 -I -c 'import json,sys; r=json.load(sys.stdin)["methodResponses"][0][1]; print("ok" if "singleton" in (r.get("updated") or {}) else "ERROR: "+json.dumps(r.get("notUpdated")))'; }
 
 echo "listener http 8080: $(jmap_create NetworkListener '{"name":"http","bind":{"[::]:8080":true},"protocol":"http","useTls":false,"implicitTls":false}' | created_id)"
-echo "listener imap 1143: $(jmap_create NetworkListener '{"name":"imap","bind":{"[::]:1143":true},"protocol":"imap","useTls":false,"implicitTls":false}' | created_id)"
+# IMAP refuses a login on a connection without TLS (LOGINDISABLED; the Imap settings'
+# allowPlainTextAuth stays off), so the IMAP listener offers STARTTLS.
+echo "listener imap 1143 (STARTTLS): $(jmap_create NetworkListener '{"name":"imap","bind":{"[::]:1143":true},"protocol":"imap","useTls":true,"implicitTls":false}' | created_id)"
 echo "listener https 8443: $(jmap_create NetworkListener '{"name":"https","bind":{"[::]:8443":true},"protocol":"http","useTls":true,"implicitTls":true}' | created_id)"
 
 DOMAIN_ID=$(jmap_create Domain '{"name":"example.com","enable":true,"description":"Zero-access test domain"}' | created_id)
