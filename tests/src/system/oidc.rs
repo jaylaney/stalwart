@@ -120,7 +120,12 @@ pub async fn test(test: &mut TestServer) {
     admin.reload_settings().await;
     let mut core = (*test.server.inner.shared_core.load_full()).clone();
     core.oauth.oauth_expiry_token = 1;
-    core.oauth.oauth_expiry_auth_code = 1;
+    // Upgrade ruling 125: no assertion waits out an authorization code (the
+    // expiry case below is the device's user code, `user_code_expiry`; reuse
+    // is refused because a code is deleted or marked issued on exchange), so
+    // the code lives a minute. 0.16 set one second, which raced the
+    // instrumented build between issue and exchange.
+    core.oauth.oauth_expiry_auth_code = 60;
     core.oauth.oauth_expiry_refresh_token = REFRESH_TOKEN_LIFETIME;
     test.server
         .inner
