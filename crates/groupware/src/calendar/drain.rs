@@ -2370,4 +2370,70 @@ mod tests {
                 .any(|candidate| candidate.sent_by.as_deref() == Some("writer1@example.com"))
         );
     }
+
+    /// Spec 10: the drain traces a fixed name per `ItipError`, never the
+    /// error's payload; `SenderIsNotParticipant` and `UnknownParticipant`
+    /// carry an address, which upstream's `to_string()` would trace. Every
+    /// variant has its own name.
+    #[test]
+    fn itip_reasons_are_fixed_names_without_payload() {
+        let canary = "drain-reason-canary@example.com";
+        let errors = [
+            ItipError::NoSchedulingInfo,
+            ItipError::OtherSchedulingAgent,
+            ItipError::NotOrganizer,
+            ItipError::NotOrganizerNorAttendee,
+            ItipError::NothingToSend,
+            ItipError::MissingUid,
+            ItipError::MultipleUid,
+            ItipError::MultipleOrganizer,
+            ItipError::MultipleObjectTypes,
+            ItipError::MultipleObjectInstances,
+            ItipError::CannotModifyProperty(ICalendarProperty::Summary),
+            ItipError::CannotModifyInstance,
+            ItipError::CannotModifyAddress,
+            ItipError::OrganizerMismatch,
+            ItipError::MissingMethod,
+            ItipError::InvalidComponentType,
+            ItipError::OutOfSequence,
+            ItipError::OrganizerIsLocalAddress,
+            ItipError::SenderIsNotOrganizerNorAttendee,
+            ItipError::SenderIsNotOrganizer,
+            ItipError::SenderIsNotParticipant(canary.to_string()),
+            ItipError::UnknownParticipant(canary.to_string()),
+            ItipError::UnsupportedMethod(ICalendarMethod::Publish),
+            ItipError::ICalendarParseError,
+            ItipError::EventNotFound,
+            ItipError::EventTooLarge,
+            ItipError::QuotaExceeded,
+            ItipError::NoDefaultCalendar,
+            ItipError::AutoAddDisabled,
+            ItipError::TooManyRecipients,
+        ];
+        let mut names = AHashSet::new();
+        for err in &errors {
+            let name = itip_reason(err);
+            assert!(
+                !name.is_empty() && name.chars().all(|c| c.is_ascii_alphabetic()),
+                "{name:?} is not a bare variant name"
+            );
+            assert!(!name.contains("canary") && !name.contains('@'));
+            assert!(names.insert(name), "{name} names two variants");
+        }
+        assert_eq!(names.len(), errors.len());
+        assert_eq!(
+            itip_reason(&ItipError::SenderIsNotParticipant(canary.to_string())),
+            "SenderIsNotParticipant"
+        );
+        assert_eq!(
+            itip_reason(&ItipError::UnknownParticipant(canary.to_string())),
+            "UnknownParticipant"
+        );
+        assert!(
+            ItipError::UnknownParticipant(canary.to_string())
+                .to_string()
+                .contains(canary),
+            "the control: upstream's text carries the address"
+        );
+    }
 }

@@ -229,3 +229,26 @@ pub fn za_index_stub(
         .set(EmailField::Metadata, stub);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mail spec 6.1: object metadata offered with a key account's message
+    /// is refused as a permanent ingest error (550), whose fixed reason and
+    /// account id are all it carries.
+    #[test]
+    fn object_metadata_is_refused_for_a_key_account() {
+        let error = za_metadata_refusal(77);
+        assert!(error.matches(trc::EventType::MessageIngest(
+            trc::MessageIngestEvent::Error
+        )));
+        assert_eq!(error.value_as_uint(trc::Key::Code), Some(550));
+        assert_eq!(
+            error.value_as_str(trc::Key::Reason),
+            Some("zero-access: object metadata not supported for key accounts")
+        );
+        assert_eq!(error.value_as_uint(trc::Key::AccountId), Some(77));
+        assert_eq!(error.keys().len(), 3, "{:?}", error.keys());
+    }
+}

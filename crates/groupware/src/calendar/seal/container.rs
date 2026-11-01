@@ -572,4 +572,108 @@ mod tests {
         let envelope = owner.seal_event_key(&dek, "ev-1").unwrap();
         assert!(owner.open_container_key(&envelope, b"ev-1").is_err());
     }
+
+    /// A wrapper whose payload is `payload`, with `lang` set when asked: the
+    /// shapes a forged or damaged container takes.
+    fn wrapper(payload: &[u8], lang: bool) -> EncodedMetadata {
+        let mut builder = MetadataBuilder::new();
+        builder
+            .set_dav(
+                XmlName::borrowed(Some(CONTAINER_NAMESPACE), CONTAINER_NAME),
+                &XmlValue {
+                    lang: lang.then(|| Cow::Borrowed("en")),
+                    attributes: Vec::new(),
+                    children: vec![XmlNode::Text(Cow::Owned(STANDARD.encode(payload)))],
+                },
+            )
+            .unwrap();
+        builder.encode().unwrap()
+    }
+
+    /// Damaged, forged and misdirected containers are refused, and none
+    /// classifies as sealed: a payload too short for its header, an unknown
+    /// version or bound byte, an unknown envelope type, an envelope with no
+    /// ciphertext after it, a wrapper with a language tag, a calendar
+    /// container opened as an event's, plaintext offered to a grantee, and a
+    /// rewrap or reseal into another account.
+    #[test]
+    fn damaged_and_misdirected_containers_are_refused() {
+        let keys = keys();
+        let owner = ZaKeyDomain::owner(&keys);
+        let plain = plain();
+        for payload in [
+            &[CONTAINER_PAYLOAD_V1][..],
+            &[CONTAINER_PAYLOAD_V1 + 1, 0, 1, WRAP_MK, 0],
+            &[CONTAINER_PAYLOAD_V1, 2, 1, WRAP_MK, 0],
+            &[CONTAINER_PAYLOAD_V1, 0, 1, 0xee, 0, 0],
+            &[CONTAINER_PAYLOAD_V1, 0, 1, WRAP_MK],
+        ] {
+            let forged = wrapper(payload, false);
+            assert!(!is_sealed_container(forged.as_bytes()), "{payload:?}");
+            assert_eq!(container_is_ck(forged.as_bytes()), None, "{payload:?}");
+            assert!(
+                matches!(
+                    open_container(forged.as_bytes(), &owner, ZaContainerOf::Event("ev-1")),
+                    Err(SealError::Format)
+                ),
+                "{payload:?}"
+            );
+        }
+        // A real payload under a language tag is not a wrapper, so it is
+        // read as the plaintext container it then is.
+        let sealed =
+            seal_container(plain.as_bytes(), &owner, ZaContainerScope::Event("ev-1")).unwrap();
+        let payload = wrapper_payload(sealed.as_bytes()).unwrap();
+        let tagged = wrapper(&payload, true);
+        assert!(wrapper_payload(tagged.as_bytes()).is_none());
+        assert!(!is_sealed_container(tagged.as_bytes()));
+        // A calendar's bound container does not open as an event's.
+        let calendar = seal_container(
+            plain.as_bytes(),
+            &owner,
+            ZaContainerScope::Calendar(Some(42)),
+        )
+        .unwrap();
+        assert!(matches!(
+            open_container(calendar.as_bytes(), &owner, ZaContainerOf::Event("ev-1")),
+            Err(SealError::Format)
+        ));
+        // Not a container at all.
+        assert!(matches!(
+            seal_container(b"not a container", &owner, ZaContainerScope::Event("ev-1")),
+            Err(SealError::Structure("container"))
+        ));
+        // A plaintext container opens for the owner only.
+        let grantee = ck(&keys, false);
+        assert!(open_container(plain.as_bytes(), &owner, ZaContainerOf::Event("ev-1")).is_ok());
+        assert!(matches!(
+            open_container(plain.as_bytes(), &grantee, ZaContainerOf::Event("ev-1")),
+            Err(SealError::NotSealed)
+        ));
+        assert!(matches!(
+            open_container(b"not a container", &owner, ZaContainerOf::Event("ev-1")),
+            Err(SealError::NotSealed)
+        ));
+        // Never across accounts.
+        let other = ZaKeyDomain::owner(&SessionKeys::new(10, 1, Secret::random()));
+        assert!(matches!(
+            rewrap_container(
+                sealed.as_bytes(),
+                &owner,
+                &other,
+                ZaContainerOf::Event("ev-1")
+            ),
+            Err(SealError::Structure("cross-account container rewrap"))
+        ));
+        assert!(matches!(
+            reseal_container(
+                sealed.as_bytes(),
+                &owner,
+                ZaContainerOf::Event("ev-1"),
+                &other,
+                ZaContainerScope::Event("ev-1"),
+            ),
+            Err(SealError::Structure("cross-account container reseal"))
+        ));
+    }
 }

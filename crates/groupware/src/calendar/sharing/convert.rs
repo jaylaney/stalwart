@@ -963,3 +963,73 @@ async fn conversion_cut(owner: u32) -> Result<(), ZaShareError> {
     let _ = owner;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A share error's `Debug` form (what reaches a trace through `{:?}`)
+    /// names its variant only: a seal or store error's detail is never
+    /// printed, and a conversion conflict prints only its counts.
+    #[test]
+    fn share_errors_debug_print_no_detail() {
+        let canary = "convert-debug-canary";
+        for (error, expected) in [
+            (ZaShareError::LinkedEvents, "LinkedEvents"),
+            (ZaShareError::Forbidden, "Forbidden"),
+            (ZaShareError::TooManyShares, "TooManyShares"),
+            (ZaShareError::AmbiguousAddress, "AmbiguousAddress"),
+            (ZaShareError::NotReady, "NotReady"),
+            (
+                ZaShareError::Seal(SealError::Structure("convert-debug-canary")),
+                "Seal(..)",
+            ),
+            (
+                ZaShareError::Store(trc::StoreEvent::UnexpectedError.into_err().details(canary)),
+                "Store(..)",
+            ),
+        ] {
+            let printed = format!("{error:?}");
+            assert_eq!(printed, expected);
+            assert!(!printed.contains(canary));
+        }
+        assert_eq!(
+            format!(
+                "{:?}",
+                ZaShareError::ConversionConflict {
+                    committed: ZaConversionCounts {
+                        rewrapped: 2,
+                        sealed: 1,
+                    },
+                    progress_changed: true,
+                }
+            ),
+            "ConversionConflict { committed: ZaConversionCounts { rewrapped: 2, sealed: 1 }, \
+             progress_changed: true }"
+        );
+    }
+
+    /// A calendar resolution error becomes the share error of the same
+    /// meaning (the HTTP layer answers each kind by its share error).
+    #[test]
+    fn calendar_errors_map_to_share_errors() {
+        assert!(matches!(
+            ZaShareError::from(ZaCalendarError::Forbidden),
+            ZaShareError::Forbidden
+        ));
+        assert!(matches!(
+            ZaShareError::from(ZaCalendarError::LinkedEvent),
+            ZaShareError::LinkedEvents
+        ));
+        assert!(matches!(
+            ZaShareError::from(ZaCalendarError::Seal(SealError::Aead)),
+            ZaShareError::Seal(SealError::Aead)
+        ));
+        assert!(matches!(
+            ZaShareError::from(ZaCalendarError::Store(
+                trc::StoreEvent::UnexpectedError.into_err()
+            )),
+            ZaShareError::Store(error) if error.matches(trc::EventType::Store(trc::StoreEvent::UnexpectedError))
+        ));
+    }
+}
