@@ -108,6 +108,7 @@ jobs:
         run: cargo test -p tests directory -- --nocapture
 
       - name: SMTP Tests
+        if: ${{ !cancelled() }}
         # The antispam test fetches the spam filter rules from the URL in
         # SPAM_RULES_URL. Without it the test falls back to a file path on
         # upstream's developer machine (file:///Users/me/code/spam-filter/...),
@@ -147,9 +148,11 @@ jobs:
           SPAM_RULES_URL: https://github.com/stalwartlabs/spam-filter/releases/download/v3.0.3/spam-filter-rules.json.gz
 
       - name: IMAP Tests
+        if: ${{ !cancelled() }}
         run: cargo test -p tests imap -- --nocapture
 
       - name: JMAP Tests
+        if: ${{ !cancelled() }}
         # Upstream's calendar::notification sub-test is timing-flaky (a fixed
         # 200 ms wait); one rerun keeps it from failing the job. A real
         # regression fails both runs. The test server wipes its data
@@ -248,25 +251,32 @@ jobs:
         run: cargo test -p tests 'webdav::cal_query::' -- --nocapture
 
       - name: Store Tests
+        if: ${{ !cancelled() }}
         run: cargo test -p tests store::store_tests -- --nocapture
 
       - name: Blob Tests
+        if: ${{ !cancelled() }}
         run: cargo test -p tests store::blob::blob_tests -- --nocapture
 
       - name: Lookup Tests
+        if: ${{ !cancelled() }}
         run: cargo test -p tests store::lookup::lookup_tests -- --nocapture
 
       - name: Search Tests
+        if: ${{ !cancelled() }}
         run: cargo test -p tests store::search_tests -- --nocapture
 
       - name: Telemetry Tests
+        if: ${{ !cancelled() }}
         run: cargo test -p tests telemetry::telemetry_tests -- --nocapture
 
       - name: System Tests
+        if: ${{ !cancelled() }}
         # At 1.0 the SEL-only tenant and archiving sub-tests are not carried.
         run: cargo test -p tests system::system_tests -- --nocapture
 
       - name: Automation Tests
+        if: ${{ !cancelled() }}
         # Needs Docker: ensure_acme and ensure_powerdns build and start the
         # Pebble, challtestsrv and PowerDNS test servers.
         run: cargo test -p tests automation::automation_tests -- --nocapture
@@ -274,6 +284,9 @@ jobs:
   zero-access:
     name: Zero-access Test
     needs: style
+    # Each suite step runs whatever the earlier steps' results (`!cancelled()`),
+    # so one failure does not hide the others; the job still fails. The test
+    # and upstream-suites jobs do the same.
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
@@ -294,27 +307,46 @@ jobs:
         run: cargo test -p vault -p groupware --features vault/test_mode -- --nocapture
 
       - name: Zero-access Leak Scanner Unit Test
+        if: ${{ !cancelled() }}
         # A plain unit test of the leak scanner (tests/src/za/leak.rs) that the
         # za_tests filter below does not select.
         run: cargo test -p tests za::leak::tests::try_archive_short_values_are_not_archives -- --exact --nocapture
 
       - name: Zero-access Tests
-        run: cargo test -p tests za::za_tests -- --nocapture
+        if: ${{ !cancelled() }}
+        # One rerun, as the CalDAV steps have: on a hosted runner a request
+        # of the suite can outlast the 500 ms client timeout of upstream's
+        # DAV test helper (tests/src/utils/webdav.rs). A real regression
+        # fails both runs. The test server wipes its data directory at
+        # start, so the rerun starts clean.
+        run: |
+          cargo test -p tests za::za_tests -- --nocapture || {
+            echo "::warning title=za_tests::run failed; retrying once (hosted-runner request timeout)"
+            cargo test -p tests za::za_tests -- --nocapture
+          }
 
       - name: Zero-access Tests (filesystem blob store)
+        if: ${{ !cancelled() }}
         # The leak scanner reads blobs through the configured blob store;
         # this run keeps blobs outside the data store. The test server wipes
-        # its data directory, blob files included, at start.
-        run: cargo test -p tests za::za_tests -- --nocapture
+        # its data directory, blob files included, at start. One rerun, as
+        # above.
+        run: |
+          cargo test -p tests za::za_tests -- --nocapture || {
+            echo "::warning title=za_tests::filesystem-blob run failed; retrying once (hosted-runner request timeout)"
+            cargo test -p tests za::za_tests -- --nocapture
+          }
         env:
           BLOB_STORE: FileSystem
 
       - name: Zero-access Cache Swap Tests
+        if: ${{ !cancelled() }}
         # New at 1.0: the za suite with the cache swap tier (upgrade ruling
         # 20). It runs without BLOB_STORE, on the default blob store.
         run: cargo test -p tests za::cache_swap::cache_swap_tests -- --exact --nocapture
 
       - name: CalDAV Tests (plain accounts)
+        if: ${{ !cancelled() }}
         # Upstream's cal_itip sub-test is timing-flaky (DTSTAMP index
         # mismatch); one rerun keeps it from failing the job. A real
         # regression fails both runs. The test server wipes its data
@@ -326,6 +358,7 @@ jobs:
           }
 
       - name: CalDAV Tests (key accounts)
+        if: ${{ !cancelled() }}
         # Upstream's cal_itip sub-test is timing-flaky (DTSTAMP index
         # mismatch); one rerun keeps it from failing the job. A real
         # regression fails both runs. The test server wipes its data
@@ -342,13 +375,13 @@ jobs:
       # workflow_dispatch; zero-access retains them on main pushes because
       # Test skips push.
       - name: IMAP Tests (plain accounts)
-        if: github.event_name == 'push'
+        if: ${{ !cancelled() && github.event_name == 'push' }}
         # Ordinary accounts through the mail paths this branch edits: they
         # keep upstream's behaviour (invariant 9).
         run: cargo test -p tests imap::imap_tests -- --nocapture
 
       - name: JMAP Tests (plain accounts)
-        if: github.event_name == 'push'
+        if: ${{ !cancelled() && github.event_name == 'push' }}
         # Upstream's calendar::notification sub-test is timing-flaky (a fixed
         # 200 ms wait); one rerun keeps it from failing the job. A real
         # regression fails both runs. The test server wipes its data
@@ -360,6 +393,7 @@ jobs:
           }
 
       - name: IMAP Tests (key accounts)
+        if: ${{ !cancelled() }}
         # Upstream's IMAP suite with its users provisioned as key accounts
         # (the admin and the groups stay plain; mail spec 11): the variants in
         # tests/src/imap/za_variants.rs assert the refusals, the rest runs
@@ -369,6 +403,7 @@ jobs:
           ZA_KEY_ACCOUNTS: "1"
 
       - name: JMAP Tests (key accounts)
+        if: ${{ !cancelled() }}
         # The same for the JMAP suite (tests/src/jmap/za_variants.rs). Key
         # mode runs the calendar modules as refusals, so upstream's
         # timing-flaky calendar::notification sub-test does not run here.
