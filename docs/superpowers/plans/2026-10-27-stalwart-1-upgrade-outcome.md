@@ -7569,18 +7569,20 @@ rows). Logs: `task-7c/logs/` (matrix), `task-7d/` (net and gates), `task-7d2/` (
 #### The matrix
 
 Two final runs cover the matrix: the uninstrumented one at `3de0dfff2` (part 7c4), and the
-19-step llvm-cov net at `b39124246` (part 7d1b), whose `tests` and `crates` differ from
-`3de0dfff2` only by part 7d1b's five unit tests and one ZA case. Counts are passed / failed /
-ignored. "Attempts" counts every run of the row in parts 7c to 7c4 (`task-7c/logs/`).
+19-step llvm-cov net at the final SHA `52ee3ad8c` (part 7f3, ruling 141; 7d1b's net at
+`b39124246` is in its section above). Since `3de0dfff2`, `tests` and `crates` gained part
+7d1b's five unit tests and one ZA case, fix round 1's kernel fixes and tests (parts 7f1, 7f2)
+and part 7f3's test hook and case. Counts are passed / failed / ignored. "Attempts" counts
+every run of the row in parts 7c to 7c4 (`task-7c/logs/`).
 
-| Row | Command | `3de0dfff2` (7c4) | `b39124246` (7d1b net) | Attempts, failures and retries |
+| Row | Command | `3de0dfff2` (7c4) | `52ee3ad8c` (7f3 net) | Attempts, failures and retries |
 |---|---|---|---|---|
 | Formatting | `cargo fmt --all --check` | rc 0 | rc 0 at `c46b7293d` and at this part's commits | none |
-| Workspace units | `cargo test --workspace --exclude tests --exclude scim --exclude scim-proto --lib --bins --features "$UNIT_TEST_FEATURES"` (net: `--exclude-from-test scim --exclude-from-test scim-proto --lib --bins --tests --no-fail-fast -- --exact --skip <98 tests-crate tests>`) | 555 / 0 / 2 (`units-2`) | 562 / 0 / 2 | 2 runs; the two ignored are 0.16's `classifier::sgd::tests::text_classifier` and `modules::pyzor::test::send_message` |
-| Vault and groupware | `cargo test -p vault -p groupware --features vault/test_mode` | 213 / 0 / 0 (`vaultgw-2`) | in the unit step (217 listed) | 2 runs |
-| ZA | `cargo test -p tests za::za_tests -- --exact --nocapture` | 1 / 0 / 0 (`za-88`) | 1 / 0 / 0 (6:11) | 88 runs: 78 failures in 7c fixed in place or held for rulings 79-96, then 7c2-7c4's kernel fixes (rulings 91-94) |
+| Workspace units | `cargo test --workspace --exclude tests --exclude scim --exclude scim-proto --lib --bins --features "$UNIT_TEST_FEATURES"` (net: `--exclude-from-test scim --exclude-from-test scim-proto --lib --bins --tests --no-fail-fast -- --exact --skip <98 tests-crate tests>`) | 555 / 0 / 2 (`units-2`) | 568 / 0 / 2 | 2 runs; the two ignored are 0.16's `classifier::sgd::tests::text_classifier` and `modules::pyzor::test::send_message` |
+| Vault and groupware | `cargo test -p vault -p groupware --features vault/test_mode` | 213 / 0 / 0 (`vaultgw-2`) | in the unit step (223 listed) | 2 runs |
+| ZA | `cargo test -p tests za::za_tests -- --exact --nocapture` | 1 / 0 / 0 (`za-88`) | 1 / 0 / 0 (6:17) | 88 runs: 78 failures in 7c fixed in place or held for rulings 79-96, then 7c2-7c4's kernel fixes (rulings 91-94) |
 | ZA leak unit | `cargo test -p tests za::leak::tests::try_archive_short_values_are_not_archives -- --exact` | 1 / 0 / 0 (`zaleak-3`) | 1 / 0 / 0 | 3 runs |
-| ZA filesystem blobs | the ZA command with `BLOB_STORE=FileSystem` | 1 / 0 / 0 (`zafs-5`) | 1 / 0 / 0 (6:11) | 5 runs, each green once the held edits were in |
+| ZA filesystem blobs | the ZA command with `BLOB_STORE=FileSystem` | 1 / 0 / 0 (`zafs-5`) | 1 / 0 / 0 (6:10) | 5 runs, each green once the held edits were in |
 | ZA cache swap | `cargo test -p tests za::cache_swap::cache_swap_tests -- --exact --nocapture` | 1 / 0 / 0 | 1 / 0 / 0 (extra step) | 3 runs: a part 6c test bug fixed |
 | CalDAV plain | `cargo test -p tests webdav::webdav_tests -- --exact --nocapture` | 1 / 0 / 0 (`caldav-plain-27`) | 1 / 0 / 0 | 27 runs: port defects (`a5cddf448`), status changes, the `put_get` blob leftover, 1.0 fixtures; no `cal_itip` DTSTAMP flake |
 | CalDAV key | the same with `ZA_KEY_ACCOUNTS=1` | 1 / 0 / 0 (`caldav-key-22`) | 1 / 0 / 0 | 22 runs |
@@ -7592,22 +7594,22 @@ ignored. "Attempts" counts every run of the row in parts 7c to 7c4 (`task-7c/log
 | `store::store_tests` | `cargo test -p tests store::store_tests -- --nocapture` | 1 / 0 / 0 | 1 / 0 / 0 | 4 runs: a 7a-ported `MailboxUid` write fixed |
 | `store::blob::blob_tests` | by its exact name | 1 / 0 / 0 | 1 / 0 / 0 | 2 runs |
 | `store::lookup::lookup_tests` | by its exact name | 1 / 0 / 0 | 1 / 0 / 0 | 2 runs |
-| `store::search_tests` | by its exact name | 1 / 0 / 0 | 1 / 0 / 0 (9:52) | 3 runs: ruling 76's `QueueId` range |
+| `store::search_tests` | by its exact name | 1 / 0 / 0 | 1 / 0 / 0 (8:44) | 3 runs: ruling 76's `QueueId` range |
 | `telemetry::telemetry_tests` | by its exact name (ruling 33's removals) | 1 / 0 / 0 | 1 / 0 / 0 | 6 runs: the webhook delivery |
-| `system::system_tests` | `cargo test -p tests system::system_tests -- --nocapture` (SEL sub-tests removed) | 1 / 0 / 0 (`up-system-system_tests-19`) | 1 / 0 / 0 at attempt 2; and 1 / 0 / 0 (67 s) at `6d662128f` | 19 runs in 7c-7c4; in the net, attempt 1 failed `system::oidc`'s `client_secret_basic` exchange (N32, the one-second code lifetime under instrumentation), fixed by ruling 125 in this part |
-| SMTP | `cargo test -p tests smtp` with CI's `SPAM_RULES_URL` | 76 / 0 / 3 (`smtp-9`) | 76 / 0 / 3 | 9 runs plus 3 named reruns: `antispam` once (N27, its HTTP reload closed during TLS) passed alone; at `6ca04a058` the documented flakes `dkim2_dsn_is_signed` and `queue_retry` passed when rerun by name |
+| `system::system_tests` | `cargo test -p tests system::system_tests -- --nocapture` (SEL sub-tests removed) | 1 / 0 / 0 (`up-system-system_tests-19`) | 1 / 0 / 0 at attempt 1 (1:01) | 19 runs in 7c-7c4; in 7d1b's net, attempt 1 failed `system::oidc`'s `client_secret_basic` exchange (N32, the one-second code lifetime under instrumentation), fixed by ruling 125 in this part |
+| SMTP | `cargo test -p tests smtp` with CI's `SPAM_RULES_URL` | 76 / 0 / 3 (`smtp-9`) | 74 / 2 / 3, then 2 / 0 / 0 rerun by name | 9 runs plus 3 named reruns: `antispam` once (N27, its HTTP reload closed during TLS) passed alone; at `6ca04a058` the documented flakes `dkim2_dsn_is_signed` and `queue_retry` passed when rerun by name; at `52ee3ad8c` `dkim2_dsn_is_signed` and `dkim2_all_disclosed` (not on CLAUDE.md's list, 7f2's open item) passed when rerun by name |
 | CI only (Docker): `directory`, `automation::automation_tests` | Task 8's CI jobs | not run | `automation-tests` fails both attempts: no Docker socket here (disposition `needs_docker_ci_only`) | settles at Task 8 |
 
-New-case completion: every new case of parts 4c, 5d, 6d and 7d1b is a sub-call of the ZA suite
-or a unit test. The inventory gate counted every ZA call executed in both ZA steps of the net,
-and the unit listing holds the five new unit tests (562 tests).
+New-case completion: every new case of parts 4c, 5d, 6d, 7d1b, 7f1, 7f2 and 7f3 is a sub-call
+of the ZA suite or a unit test. The inventory gate counted every ZA call executed in both ZA
+steps of the final net, and the unit listing holds the new unit tests (568 tests).
 
-#### The gates (part 7d1b, at `b39124246`)
+#### The gates (part 7f3, at the final SHA `52ee3ad8c`)
 
 | Gate | Command | Result |
 |---|---|---|
-| Inventory | `python3 -I scripts/tests/check_test_inventory.py --baseline tests/qualification/baseline-0.16.27.json --dispositions tests/qualification/dispositions.json --listing task-7d/capture-b/list --ignored-listing task-7d/capture-b/ign --executed task-7d/gates/final/functions.json` | 9 failures, all `move_unconfirmed` (the seven DKIM tests and the two `http` `za_test` tests); they settle at Task 8 (ruling 124). Exit 0 with the two moves confirmed in a scratch copy. Excused: 22 `internals_replaced_equivalent`, 202 `sel_only`, 22 `subject_deleted` |
-| Coverage | `python3 -I scripts/tests/check_coverage.py --baseline tests/qualification/baseline-0.16.27.json --dispositions tests/qualification/dispositions.json --merged task-7d/coverage-b/merged.json --sources task-7d/src-final` | pass: full 20,821 / 21,549 (96.62%, 51 lines of margin), runtime-only 12,195 / 12,848 (94.92%, 32 lines) |
+| Inventory | `python3 -I scripts/tests/check_test_inventory.py --baseline tests/qualification/baseline-0.16.27.json --dispositions tests/qualification/dispositions.json --listing task-7d/capture-final/list --ignored-listing task-7d/capture-final/ign --executed task-7d/gates/7f3/functions.json` | 9 failures, all `move_unconfirmed` (the seven DKIM tests and the two `http` `za_test` tests); they settle at Task 8 (ruling 124). Exit 0 with the two moves confirmed in a scratch copy. Excused: 20 `internals_replaced_equivalent`, 2 `internals_replaced_no_equivalent`, 202 `sel_only`, 22 `subject_deleted` (7d1b at `b39124246`: the same 9) |
+| Coverage | `python3 -I scripts/tests/check_coverage.py --baseline tests/qualification/baseline-0.16.27.json --dispositions tests/qualification/dispositions.json --merged task-7d/coverage-final/merged.json --sources task-7d/src-7f3` | pass: full 21,300 / 22,030 (96.69%, 67 lines of margin), runtime-only 12,383 / 13,037 (94.98%, 41 lines) (7d1b at `b39124246`: 51 and 32 lines) |
 | Gate self-tests | `python3 -I scripts/tests/test_gates.py` and the disposable changes I, L and N31 | 28 offline tests pass (7b); each disposable change turns its gate from pass to fail and passes again once restored (7d1, 7d1b) |
 | Ported-file diff | every ported test file against `5b914ddb5`: added `return`, `cfg!`, `#[cfg]`, `#[ignore]`, removed `.await`, added `let _ =` or `drop(` | every addition has an expectation-ledger row (7d1) |
 #### The hook-disable mutation sample (part 7d2)
@@ -8142,6 +8144,212 @@ Development runs on the uncommitted tests: `za-92` (347 s), `imap-plain-16` and 
 all passed. Mutation logs: `task-7f2/logs/` (`p0-*`, `p2-*`) and
 `task-7c/logs/mut7f2-units-*`. The coverage gate was not rerun: an instrumented build needs
 about 24 GB and 12 GB was free.
+
+#### Fix round 1, part 7f3
+
+Part 7f3 adds ruling 142's PROPFIND race hook and its case, then reruns ruling 141's coverage
+net and both gates at the final SHA. Scratch work, drivers and logs are in the plan workspace
+under `task-7f3/`; the net's records are under `task-7d/coverage-final/`,
+`task-7d/capture-final/`, `task-7d/gates/7f3/` and `task-7d/steps-final.tsv`.
+
+Commits:
+- `d087e3e12`: the hook;
+- `52ee3ad8c`: the case;
+- this note.
+
+##### The hook (ruling 142)
+
+`PROPFIND_ADMITTED_PAUSE` (`common::za::test_hooks`, `set_propfind_admitted_pause`,
+`propfind_admitted_pause_point`). It follows the other pause hooks: a one-shot `Pause` slot,
+compiled only with `test_mode`. The call site is one line under `#[cfg(feature = "test_mode")]`
+at the end of `foreign_calendar_contexts` (`dav/src/common/propfind/za.rs`), after every
+calendar is admitted and before `get` memoizes the contexts and the items are read. It is keyed
+by the requesting principal (the grantee), as `SHARE_LIST_FOREIGN_PAUSE` is, so the owner's own
+requests pass. `cargo check -p stalwart --no-default-features --features rocks` builds with no
+warning; the shipping build does not contain the hook.
+
+##### The case: `za::sharing_races`, `propfind_admission_races`
+
+Accounts `race-propfind-owner` and `race-propfind-reader` (unique across the sharing files).
+For each change (revoke the grant; delete the calendar), each form (allprop; a named prop of
+`displayname`, `getetag`, `calendar-data` and a dead property; propname) and each target (the
+owner's home at depth 1, a home listing; the calendar at depth 1), the case:
+- makes a fresh calendar with an event and a dead property on both, and grants it (view);
+- runs the request once unparked (the control: the calendar, its event and the dead
+  property's name are served);
+- parks the same request at the hook, makes the change, and releases it;
+- sends the request again after the change.
+
+**What the case found, held for a ruling.** The refusal arms are not reached from this race,
+and the in-flight answer to a revocation serves the calendar in full.
+- `get` puts every admitted context in the request's memo (`data.calendar_memo`), and
+  `za_read_context` answers a memo hit with `check_access` against the memoized calendar
+  archive. A grant revoked after admission is therefore invisible to the rest of the request:
+  `refusal` and `za_propname_item`'s arms never run.
+- After a revocation, all six in-flight requests answered 207 and served what the control
+  served: the calendar's display name, the dead property's value (allprop and prop) or name
+  (propname), and, for the named prop on the calendar, the event's `calendar-data` in the clear.
+  The event content is read from the store after the revocation committed, and opened in the
+  memoized key domain.
+- After a deletion, allprop and prop answer each admitted href (the calendar and its event)
+  404 inside a 207, and serve no property. Propname lists the admitted hrefs with 200 and the
+  static property names, with no dead-property name: no store read decides that listing.
+- 7f2's record (and ruling 142's premise) that these arms run "when a grant is revoked, or a
+  calendar deleted, between that admission and the item's read" is wrong for PROPFIND: the memo
+  covers every foreign item the listing admits.
+
+**What the committed case asserts.** For a deletion: 207, no name, content, dead-property value
+or (in propname) dead-property name of the calendar or its event, and, for allprop and prop, no
+`200 OK` in the calendar's or the event's response. For both changes: the request sent after
+the change answers 403 and names no such calendar (the reader holds no other grant on the owner,
+so the URI gate refuses it). The revocation's in-flight answer is printed, not asserted. The
+ruling-strength version, which asserts the refusal arms' answers (home listing: the calendar
+left out; the calendar: 403 revoked, 404 deleted) and that nothing of the calendar is served,
+is kept uncommitted as `task-7f3/case-ruling-strength.diff`; it fails on 12 of its 12 parked
+requests (run `task-7f3/logs/dev-1.log`).
+
+##### Mutation rows (appended to `task-7d/mutations.tsv`)
+
+Method as part 7d2's: each mutation behind the `ZA_MUT` switch (`task-7f3/muts.py`), all
+applied together and built once with part 7d2's uncommitted `ZA_ONLY` selector, the binary
+copied out (`task-7f3/bin/tests-mut`), and the tree restored with `git checkout`. Selection
+`ZA_ONLY=sharing,sharing_races` (`sharing::test` creates accounts later `sharing_races` modules
+use). The control with `ZA_MUT` unset passed (84 s).
+
+| Id | Mutation | Outcome | Failing assertion |
+|---|---|---|---|
+| p001 | `refusal` answers every refusal as the plain path (the stored archive) | not caught | none: the case's 18 printed observations equal the control's |
+| p002 | `za_propname_item` lists a calendar refused in a home listing | not caught | the same |
+| p003 | `za_propname_item`'s `Err` arm lists the item | not caught | the same |
+
+None can be caught by this race, for the reason above: the arms are not reached.
+
+##### Runs (logs in `task-7c/logs/`)
+
+At `52ee3ad8c`, a clean tree, before `target/debug` was deleted:
+- `za-94`: `cargo test -p tests za::za_tests -- --exact --nocapture`, 1 passed (351 s).
+- `caldav-key-26`: `ZA_KEY_ACCOUNTS=1`, `webdav::webdav_tests`, 1 passed (28 s).
+- `cargo check -p stalwart --no-default-features --features rocks`: no warning;
+  `cargo fmt --all --check`: rc 0.
+
+Development runs (`task-7f3/logs/dev-*.log`, `ZA_ONLY=sharing_races`): `dev-1`, the
+ruling-strength case, failed as above; `dev-2` failed on the follow-up request's first
+expectation (207 for the home, 404 for a deleted calendar; the answer is 403 throughout, since
+the reader keeps no grant on the owner); `dev-3` passed the case and stopped in
+`sharing_http_races`, whose accounts `sharing::test` creates outside that selection.
+
+##### The net at the final SHA (ruling 141)
+
+- **SHA.** `52ee3ad8c`, HEAD after the two commits, with a clean tree
+  (`coverage-final/sha.txt`). This note's commit changes only docs. The sources are
+  `git archive 52ee3ad8c tests crates` (`task-7d/src-7f3`).
+- **Disk.** The worktree's `target/debug` was deleted after the listings were captured, so the
+  instrumented build started from an empty `target/llvm-cov-target`.
+- **Tools.** Part 7d1's driver, with one change in a copy (`task-7f3/tools/cov_driver.py`):
+  `COV_SKIP_LIST` names the listing that the unit step's `--skip` list is read from (the tests
+  binary's 98 names, from `capture-final/`). The same 19 step names and commands as the
+  baseline and 7d1b, each step exported from its own profile, then the 19 merged
+  (`coverage-final/merged.json`; `merged-plus-swap.json` adds `za-cache-swap`). The record
+  is `task-7d/steps-final.tsv`, in the baseline's format.
+- **Listings.** The 28 listings and 28 ignored listings were recaptured at `52ee3ad8c`
+  (`capture-final/`), with the uninstrumented build, before `target/debug` was deleted. Against
+  7d1b's, only the workspace unit step and the vault and groupware step changed: each lists
+  the six groupware unit tests of parts 7f1 and 7f2 (568 in the workspace unit step). The
+  ignored listings are unchanged: the six tests ignored at 0.16.27.
+
+| Step | Attempt | Command (`cargo llvm-cov --no-report test` ...) | Extra env | Exit | Passed / failed / ignored | Wall |
+|---|---|---|---|---|---|---|
+| `build-A` | build | `--workspace --exclude-from-test scim --exclude-from-test scim-proto --lib --bins --tests --no-fail-fast -- zz_no_such_test_zz` | - | 0 | 0 / 0 / 0 | 5:15 |
+| `build-B` | build | `-p tests zz_no_such_test_zz_2 -- --nocapture` | - | 0 | 0 / 0 / 0 | 2:38 |
+| `leak-unit-test` | 1 | `-p tests za::leak::tests::try_archive_short_values_are_not_archives -- --exact --nocapture` | - | 0 | 1 / 0 / 0 | 0:01 |
+| `unit-tests` | 1 | `--workspace --exclude-from-test scim --exclude-from-test scim-proto --lib --bins --tests --no-fail-fast -- --exact --skip <the 98 tests-crate tests>` | - | 0 | 568 / 0 / 2 | 0:13 |
+| `za-tests` | 1 | `-p tests za::za_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 6:17 |
+| `za-tests-fs-blob` | 1 | `-p tests za::za_tests -- --nocapture` | BLOB_STORE=FileSystem | 0 | 1 / 0 / 0 | 6:10 |
+| `webdav-plain` | 1 | `-p tests webdav::webdav_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 0:20 |
+| `webdav-key` | 1 | `-p tests webdav::webdav_tests -- --nocapture` | ZA_KEY_ACCOUNTS=1 | 0 | 1 / 0 / 0 | 0:22 |
+| `imap-plain` | 1 | `-p tests imap::imap_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 0:11 |
+| `imap-key` | 1 | `-p tests imap::imap_tests -- --nocapture` | ZA_KEY_ACCOUNTS=1 | 0 | 1 / 0 / 0 | 0:11 |
+| `jmap-plain` | 1 | `-p tests jmap::jmap_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 2:13 |
+| `jmap-key` | 1 | `-p tests jmap::jmap_tests -- --nocapture` | ZA_KEY_ACCOUNTS=1 | 0 | 1 / 0 / 0 | 1:34 |
+| `smtp` | 1 | `-p tests smtp -- --nocapture` | `SPAM_RULES_URL` (v3.0.3) | 101 | 74 / 2 / 3 (`dkim2_all_disclosed`, `dkim2_dsn_is_signed`) | 0:51 |
+| `smtp` | 2 | `-p tests -- --exact --nocapture smtp::inbound::dkim2::dkim2_all_disclosed smtp::inbound::dkim2::dkim2_dsn_is_signed` | `SPAM_RULES_URL` (v3.0.3) | 0 | 2 / 0 / 0 | 0:02 |
+| `system-tests` | 1 | `-p tests system::system_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 1:01 |
+| `store-tests` | 1 | `-p tests store::store_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 0:06 |
+| `blob-tests` | 1 | `-p tests store::blob::blob_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 0:04 |
+| `lookup-tests` | 1 | `-p tests store::lookup::lookup_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 0:11 |
+| `search-tests` | 1 | `-p tests store::search_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 8:44 |
+| `telemetry-tests` | 1 | `-p tests telemetry::telemetry_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 0:03 |
+| `cal-query-tests` | 1 | `-p tests webdav::cal_query:: -- --nocapture` | - | 0 | 2 / 0 / 1 | 0:00 |
+| `automation-tests` | 1 | `-p tests automation::automation_tests -- --nocapture` | - | 101 | 0 / 1 / 0 (automation::automation_tests) | 0:00 |
+| `automation-tests` | 2 | `-p tests automation::automation_tests -- --nocapture` | - | 101 | 0 / 1 / 0 (automation::automation_tests) | 0:00 |
+| `za-cache-swap` | 1 | `-p tests za::cache_swap::cache_swap_tests -- --exact --nocapture` | - | 0 | 1 / 0 / 0 | 0:17 |
+
+- **Reruns.**
+  - `smtp`: `dkim2_dsn_is_signed` (one of CLAUDE.md's documented SMTP flakes) and
+    `dkim2_all_disclosed` (7f2's open item: not on the list) failed in the parallel run, and both
+    passed when rerun by name, as CI reruns them.
+  - `automation-tests` failed both attempts in `ensure_acme()` (`tests/src/utils/containers.rs:316`):
+    there is no Docker on this machine (disposition `needs_docker_ci_only`), as before.
+  - Every other step passed at its first attempt; `system::oidc` did not repeat N32 (ruling 125).
+
+##### Both gates at that SHA
+
+Inputs, all from `52ee3ad8c`: `capture-final/list` and `capture-final/ign`;
+`strict_rule.py functions` over the 19 exports in `coverage-final/steps/` (`steps19-final/`)
+and the `52ee3ad8c` sources (2,338 functions); `coverage-final/merged.json`. Outputs:
+`task-7d/gates/7f3/`.
+
+**Inventory gate: FAIL, with 9 failures, all `move_unconfirmed`,** the same 9 as 7d1b: the seven
+DKIM tests and the two `http` `za_test` tests, which wait for Task 8's step names (ruling 124).
+It checks 795 tests, 29 configurations, 272 call-steps, 3,833 helper-steps, 24 tail-steps and
+14 loop-steps. Excused: 20 `internals_replaced_equivalent`, 2 `internals_replaced_no_equivalent`
+(7f2's M4 and M5), 202 `sel_only`, 22 `subject_deleted`. With a scratch copy of the committed
+dispositions in which the two Task 8 moves are confirmed (`task-7f3/`, never committed), it
+exits 0.
+
+**Coverage gate: OK.**
+
+| Figure | `52ee3ad8c` | Threshold | Margin |
+|---|---|---|---|
+| Full | 21,300 / 22,030 (96.69%) | 17,821 / 18,490 (96.38%) | 67 lines over the 21,233 needed |
+| Runtime-only | 12,383 / 13,037 (94.98%) | 10,646 / 11,246 (94.66%) | 41 lines over the 12,342 needed |
+
+Cross-multiplied: full `21300 * 18490 = 393837000 >= 17821 * 22030 = 392596630`; runtime-only
+`12383 * 11246 = 139259218 >= 10646 * 13037 = 138791902`. Against 7d1b's `b39124246`, the
+runtime cohort grew by 189 lines (7f1's kernel lines among them) and 188 of them are covered,
+so the runtime margin rose from 32 to 41 lines (full: 51 to 67).
+
+- `propfind/za.rs` is 373 / 415. `refusal` (6 of 6 lines), `za_propname_item`'s refusal arms
+  (`:416-422`) and `za_propfind_item`'s refusal calls (`:143-144`, `:163-164`) are still not
+  run, which agrees with the case's finding.
+- Files below their baseline fraction (the gate checks only the totals): `common/src/auth/
+  vault.rs`, `email/src/message/za/view.rs`, `fanout.rs`, `seal/collection.rs`,
+  `sharing/resolve.rs`, `sharing/test.rs` and `http/src/api/shares.rs`, each in functions new
+  at the port or with the same uncovered count over a smaller file, as 7d1b recorded;
+  `pinning.rs` is no longer among them.
+- Beside the cohort: `restored_tests` 11,612 / 12,017, the port's fork test files 383 / 428,
+  the `tests` crate 101,221 / 108,871 (92.97%), the upstream product 198,192 / 369,061.
+
+The superseded exports are kept: disk is not short (about 80 GB free after the net). The unit
+step rewrote `crates/dav-proto/resources/requests/*.json` again (the upstream test that writes
+its output, as in part 7c); the files were reverted before this note's commit.
+
+##### Needs a ruling (part 7f3)
+
+- **The in-flight revocation (ruling 142's case).** A grantee's PROPFIND admitted before a
+  revocation is answered from the request's admission memo, after the revocation commits: the
+  calendar's name, its dead property and the event's content in the clear. Either this is
+  accepted (the read is linearized at its admission, as the memo's comment intends; then the
+  ruling-strength assertion becomes "the in-flight answer equals the control's"), or the item
+  reads must re-check the grant (for example a fresh `za_calendar_context`, or a grant-ring
+  generation check, per item or once after the listing), which is a product change in
+  `propfind/za.rs` or `dav/src/common/za.rs` and puts kernel lines in the cohort.
+- **The refusal arms stay unreached.** `refusal` and `za_propname_item`'s two arms cannot run
+  from this race, and no other grantee path reaches them (every foreign item is under a
+  memoized calendar). Record them as unreachable-by-construction, or keep them for the fix
+  above, which would make them reachable.
+- **Propname after a deletion** lists the admitted hrefs of the deleted calendar and event with
+  200 and the static property names (no data). Accept, or answer them 404 as allprop does.
 
 ## Conflict ledger
 
