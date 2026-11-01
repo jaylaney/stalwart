@@ -949,4 +949,22 @@ mod tests {
         open_drained_item(&mut item, &keys, 9).unwrap();
         assert_eq!(ICalendar::parse(item.to_string()).unwrap(), item);
     }
+    /// Upgrade ruling 94's failure arm (ruling 134, `fanout.rs`'s
+    /// `write_item_inner`): a message whose text does not reparse as a
+    /// VCALENDAR holding a component has no shape, so the fan-out writes no
+    /// item and records the recipient's failure. Upstream's builders never
+    /// emit one; these are the two shapes the check refuses.
+    #[test]
+    fn a_message_without_a_component_has_no_shape() {
+        let root_only = ICalendar::parse(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nEND:VCALENDAR\r\n",
+        )
+        .unwrap();
+        assert_eq!(root_only.components.len(), 1);
+        assert!(za_item_shape(&root_only).is_none(), "a root alone");
+        assert!(
+            za_item_shape(&ICalendar::default()).is_none(),
+            "a tree with no root"
+        );
+    }
 }

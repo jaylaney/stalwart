@@ -367,7 +367,7 @@ mod tests {
         event_cancel::{itip_cancel, itip_cancel_from_snapshot},
         event_create::itip_create,
         event_update::itip_update,
-        recipient::{AttendeeVisibility, RecipientPolicy},
+        recipient::{AttendeeVisibility, RecipientPolicy, itip_messages_per_recipient},
         snapshot::itip_snapshot,
     };
 
@@ -955,6 +955,96 @@ mod tests {
             itip_cancel(&invalid, &[OWNER.into()], true, policy()),
             Err(ItipError::MissingUid)
         ));
+    }
+
+    /// Upgrade ruling 133 (the Task 7 review's I3): `itip_cancel` splits an
+    /// organizer's CANCEL per recipient, as upstream's did before the fork
+    /// split it from `itip_cancel_from_snapshot`. The writer attends the
+    /// master and override X, the external attendee only X, so the unsplit
+    /// CANCEL (the master, with the writer's attendee line) names both.
+    /// With every attendee visible the split keeps it whole; under
+    /// `RecipientOnly` each recipient gets its own CANCEL of the series (the
+    /// master alone), which names no other attendee (the external
+    /// attendee's names none, as it is not on the master), exactly as
+    /// `itip_messages_per_recipient` builds them from the unsplit message.
+    #[test]
+    fn cancel_splits_a_recurring_event_per_recipient() {
+        let text = format!(
+            concat!(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\n",
+                "BEGIN:VEVENT\r\nUID:cancel-split\r\nDTSTAMP:20240101T000000Z\r\n",
+                "DTSTART:20990301T100000Z\r\nDURATION:PT1H\r\nRRULE:FREQ=DAILY;COUNT=3\r\n",
+                "SEQUENCE:2\r\nSUMMARY:series\r\nORGANIZER:mailto:{owner}\r\n",
+                "ATTENDEE:mailto:{writer}\r\nEND:VEVENT\r\n",
+                "BEGIN:VEVENT\r\nUID:cancel-split\r\nDTSTAMP:20240101T000000Z\r\n",
+                "RECURRENCE-ID:20990302T100000Z\r\nDTSTART:20990302T120000Z\r\n",
+                "DURATION:PT1H\r\nSEQUENCE:2\r\nSUMMARY:override\r\n",
+                "ORGANIZER:mailto:{owner}\r\nATTENDEE:mailto:{writer}\r\n",
+                "ATTENDEE:mailto:{external}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+            ),
+            owner = OWNER,
+            writer = WRITER,
+            external = EXTERNAL,
+        );
+        let tree = match Parser::new(&text).entry() {
+            Entry::ICalendar(ical) => ical,
+            other => panic!("{other:?}"),
+        };
+        let by_recipients = |messages: Vec<ItipMessage<ICalendar>>| {
+            let mut messages = messages
+                .into_iter()
+                .map(|mut message| {
+                    message.to.sort_unstable();
+                    (message.to, canonical_without_dtstamp(message.message))
+                })
+                .collect::<Vec<_>>();
+            messages.sort_by(|a, b| a.0.cmp(&b.0));
+            messages
+        };
+        let hidden = RecipientPolicy {
+            visibility: AttendeeVisibility::RecipientOnly,
+            ..policy()
+        };
+        for policy in [policy(), hidden] {
+            let public = by_recipients(itip_cancel(&tree, &[OWNER.into()], true, policy).unwrap());
+            let unsplit = itip_cancel_from_snapshot(
+                &tree,
+                itip_snapshot(&tree, &[OWNER.into()], false).unwrap(),
+                true,
+            )
+            .unwrap();
+            let mut named = unsplit.to.clone();
+            named.sort_unstable();
+            assert_eq!(
+                named,
+                vec![EXTERNAL, WRITER],
+                "the unsplit CANCEL names both"
+            );
+            let expected =
+                by_recipients(itip_messages_per_recipient(vec![unsplit], policy).unwrap());
+            assert_eq!(public, expected, "{policy:?}");
+            if policy.visibility == AttendeeVisibility::All {
+                assert_eq!(public.len(), 1, "kept whole: {public:?}");
+                continue;
+            }
+            let recipients = public
+                .iter()
+                .map(|(to, _)| to.join(","))
+                .collect::<Vec<_>>();
+            assert_eq!(recipients, vec![EXTERNAL, WRITER], "one CANCEL each");
+            for (to, message) in &public {
+                let other = if to[0] == EXTERNAL { WRITER } else { EXTERNAL };
+                let text = message.to_string();
+                assert!(text.contains("METHOD:CANCEL"), "{text}");
+                // The deletion cancels the series: one component, the master.
+                assert_eq!(text.matches("BEGIN:VEVENT").count(), 1, "{text}");
+                assert!(!text.contains("RECURRENCE-ID"), "{text}");
+                assert!(
+                    !text.contains(&format!("mailto:{other}")),
+                    "{to:?}'s CANCEL names {other}: {text}"
+                );
+            }
+        }
     }
 
     /// Upgrade ruling 93: the second run splits per recipient as the owner
