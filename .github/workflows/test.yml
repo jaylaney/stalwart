@@ -9,12 +9,53 @@ on:
   schedule:
     - cron: "0 7 * * 1"
 
+# What this workflow can claim. It runs the tests this public repository holds,
+# against the fork on upstream 1.0.1. Upstream's private test suites are not
+# public, so no job here runs them and no result here says they passed. The
+# external protocol suites (Dovecot imaptest, Fastmail's JMAP test suite,
+# Apple's CalDAVTester) are deferred to a follow-up plan by the 1.0 upgrade
+# design's scope exclusions; no job runs them either.
+
 # A newer push to a pull request cancels that pull request's run in progress.
 # Every other trigger (push to main, schedule, manual dispatch) gets a group of
 # its own, keyed on the run id, so those runs never cancel or hold each other.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # The workspace unit step's features (unit-tests job), which the gates job's
+  # listing capture (scripts/tests/capture_listings.py) reads too. The tests
+  # crate stays out of that build, so cargo does not unify its dev-dependency
+  # features across the workspace; this list enables them by hand: the
+  # test_mode and enterprise features of tests/Cargo.toml's dev-dependencies,
+  # its rocks and sqlite stores, and dns-update's test_provider (common's test
+  # build needs it); smtp/test_mode also turns on mail-auth's test feature.
+  # Re-derived for 1.0 (the upgrade outcome note, "UNIT_TEST_FEATURES for
+  # 1.0"): no 1.0 crate has coordinator, dav-proto, directory, http_proto,
+  # imap, managesieve or pop3 test_mode. http's features cannot be listed
+  # here (1.0's telemetry crate depends on the crates.io http crate, which
+  # has no such features), so http's unit tests run in their own step. After
+  # a change to tests/Cargo.toml, compare the step's `-- --list` with
+  # `cargo test --workspace --lib --bins -- --list` (less the tests, scim and
+  # scim-proto binaries) and update the list.
+  UNIT_TEST_FEATURES: >-
+    common/test_mode common/enterprise
+    coordinator/enterprise
+    dav/test_mode
+    directory/enterprise directory/sqlite
+    dns-update/test_provider
+    email/test_mode email/enterprise
+    groupware/test_mode
+    jmap/test_mode jmap/enterprise
+    managesieve/enterprise
+    services/test_mode services/enterprise
+    smtp/test_mode smtp/enterprise
+    spam-filter/test_mode spam-filter/enterprise
+    store/test_mode store/enterprise store/rocks store/sqlite
+    trc/enterprise
+    utils/test_mode
+    vault/test_mode
 
 jobs:
   style:
@@ -59,6 +100,11 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Directory Tests
+        # Needs Docker: OpenLDAP and Keycloak run as testcontainers. At 1.0
+        # the suite has no oidc sub-test (its file is SEL-only and was not
+        # carried). The Bearer arm of the zero-access external-directory
+        # refusal would need a key-account case against Keycloak here; that
+        # optional case is deferred, so no step covers the Bearer arm.
         run: cargo test -p tests directory -- --nocapture
 
       - name: SMTP Tests
@@ -68,9 +114,10 @@ jobs:
         # the UpdateRules task fails three times and stays in the queue as
         # Failed, and the test waits for it forever. The URL pins a rules
         # release (v3.0.3, the latest when this was written); raise it
-        # deliberately. Four SMTP tests are timing-flaky when the whole filter
+        # deliberately. Six SMTP tests are timing-flaky when the whole filter
         # runs in parallel (dkim2_dsn_is_signed, lmtp_delivery, queue_retry,
-        # manage_reports) and pass when rerun by name. The step reruns the
+        # manage_reports, and at 1.0 antispam and dkim2_all_disclosed) and
+        # pass when rerun by name. The step reruns the
         # failed ones once, taking their names from libtest's final failures
         # list (with --nocapture the per-test FAILED lines can interleave with
         # test output). A real regression fails both runs. The explicit bash
@@ -117,15 +164,19 @@ jobs:
     name: Unit Tests
     needs: style
     # Every unit test of crates/* except the Enterprise-licensed scim and
-    # scim-proto crates (514 at the 0.16.27 base, two of them #[ignore]d). It
-    # runs on every trigger, a push to main included: it holds the fork's own
-    # unit tests in common, email, http and the other crates, which no other
-    # job runs, and the protocol and store unit tests that the Test job used
-    # to run on pull requests only. The one doctest in the workspace (store,
-    # with its sqlite feature) imports r2d2_sqlite, which is not a dependency,
-    # so it does not compile at the base and has no step.
+    # scim-proto crates (570 in the workspace step at 1.0, two of them
+    # #[ignore]d, and 16 in the smtp step), in three steps:
+    # the workspace step, then smtp without enterprise and http with its
+    # test_mode, which the workspace step's features cannot select. It runs
+    # on every trigger, a push to main included: it holds the fork's own unit
+    # tests in common, email, http and the other crates, which no other job
+    # runs, and the protocol and store unit tests. The one doctest in the
+    # workspace (store, with its sqlite feature) imports r2d2_sqlite, which
+    # is not a dependency, so it does not compile and has no step. The two
+    # extra steps build their crates with other features, hence the longer
+    # timeout.
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 75
 
     env:
       STORE: RocksDb
@@ -139,42 +190,30 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Workspace Unit Tests
-        # The tests crate stays out of the build, so cargo does not unify its
-        # dev-dependency features across the workspace; the list below enables
-        # them by hand: the test_mode and enterprise features of
-        # tests/Cargo.toml's dev-dependencies and its sqlite store, plus
-        # dns-update's test_provider (common's test build needs it) and the
-        # test_mode of smtp (its test build needs mail-auth's test feature).
-        # stalwart's default features (rocks, enterprise) apply as they do in
-        # a plain `cargo test --workspace`. The list selects the same unit
-        # tests as `cargo test --workspace --lib --bins` does with the tests
-        # crate in the build, less the tests crate's own functions, scim and
-        # scim-proto: after a change to tests/Cargo.toml, compare the two
-        # `-- --list` outputs and update the list.
+        # UNIT_TEST_FEATURES is set at the top of this file. stalwart's
+        # default features (rocks, enterprise) apply as they do in a plain
+        # `cargo test --workspace`.
         run: |
           cargo test --workspace --exclude tests --exclude scim --exclude scim-proto \
             --lib --bins --features "$UNIT_TEST_FEATURES"
-        env:
-          UNIT_TEST_FEATURES: >-
-            common/test_mode common/enterprise
-            coordinator/test_mode coordinator/enterprise
-            dav/test_mode dav-proto/test_mode
-            directory/test_mode directory/enterprise directory/sqlite
-            dns-update/test_provider
-            email/test_mode email/enterprise
-            groupware/test_mode
-            http/test_mode http/enterprise http_proto/test_mode
-            imap/test_mode
-            jmap/test_mode jmap/enterprise
-            managesieve/test_mode managesieve/enterprise
-            pop3/test_mode
-            services/test_mode services/enterprise
-            smtp/test_mode smtp/enterprise
-            spam-filter/test_mode spam-filter/enterprise
-            store/test_mode store/enterprise store/rocks store/sqlite
-            trc/enterprise
-            utils/test_mode
-            vault/test_mode
+
+      - name: SMTP Unit Tests (without enterprise)
+        # Upgrade ruling 53: smtp's restored DKIM tests (seven,
+        # inbound::dkim::tests) build only without enterprise, since their
+        # queue::Message literal cannot name the SEL-gated tenant_ids, so the
+        # workspace step (smtp/enterprise) leaves them out. This build runs
+        # them with the rest of smtp's unit tests. The gates' configuration
+        # test.yml__unit-tests__smtp-unit-tests-without-enterprise is this
+        # step; its name and command are the selection move's.
+        run: cargo test -p smtp --lib --bins --features test_mode
+
+      - name: HTTP Unit Tests
+        # http's unit tests with its test_mode, which the fork's za_test
+        # module needs (two tests); the workspace step cannot enable it (see
+        # UNIT_TEST_FEATURES). `-p http` is ambiguous in this workspace. The
+        # gates' configuration test.yml__unit-tests__http-unit-tests is this
+        # step; its name and command are the selection move's.
+        run: cargo test -p http@1.0.1 --lib --bins --features test_mode,enterprise
 
   upstream-suites:
     name: Upstream Suites
@@ -224,7 +263,7 @@ jobs:
         run: cargo test -p tests telemetry::telemetry_tests -- --nocapture
 
       - name: System Tests
-        # Includes the SEL-only tenant and archiving sub-tests, which run because the build enables enterprise.
+        # At 1.0 the SEL-only tenant and archiving sub-tests are not carried.
         run: cargo test -p tests system::system_tests -- --nocapture
 
       - name: Automation Tests
@@ -236,7 +275,7 @@ jobs:
     name: Zero-access Test
     needs: style
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     env:
       STORE: RocksDb
@@ -269,6 +308,11 @@ jobs:
         run: cargo test -p tests za::za_tests -- --nocapture
         env:
           BLOB_STORE: FileSystem
+
+      - name: Zero-access Cache Swap Tests
+        # New at 1.0: the za suite with the cache swap tier (upgrade ruling
+        # 20). It runs without BLOB_STORE, on the default blob store.
+        run: cargo test -p tests za::cache_swap::cache_swap_tests -- --exact --nocapture
 
       - name: CalDAV Tests (plain accounts)
         # Upstream's cal_itip sub-test is timing-flaky (DTSTAMP index
@@ -351,7 +395,7 @@ jobs:
           python-version: "3.12"
 
       - name: Build product (RocksDB, no enterprise or test mode)
-        run: cargo build --release -p stalwart --no-default-features --features rocks
+        run: cargo build --release --locked -p stalwart --no-default-features --features rocks
 
       - name: Fetch pinned independent client suite
         run: |
@@ -383,3 +427,163 @@ jobs:
             ${{ runner.temp }}/caldav-client-logs/plain-pytest.log
             ${{ runner.temp }}/caldav-client-logs/key-server.log
             ${{ runner.temp }}/caldav-client-logs/key-pytest.log
+
+  fresh-store:
+    name: Fresh OSS Store Restart
+    needs: style
+    # The shipping product (RocksDB, no enterprise or test mode), built in
+    # this job's own Cargo process, apart from the enterprise-enabled test
+    # builds. The gate creates a fresh store, an ordinary account and two key
+    # accounts, seeds mail, calendars, pins and sharing through public
+    # interfaces, stops the server, restarts the same binary on the same
+    # store and reads everything back on new connections
+    # (tests/product/fresh_store.py). Its failure tests run first; they use
+    # stand-in binaries and need no build.
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Check gate failure boundaries
+        run: python -B -m unittest discover -s tests/product -p test_fresh_store.py -v
+
+      - name: Build product (RocksDB, no enterprise or test mode)
+        run: cargo build --release --locked -p stalwart --no-default-features --features rocks
+
+      - name: Fresh store create, restart and readback
+        run: |
+          python -B tests/product/fresh_store.py \
+            --binary target/release/stalwart \
+            --log-dir "$RUNNER_TEMP/fresh-store-logs"
+
+      - name: Retain sanitized fresh-store failure diagnostics
+        # The harness writes only these two logs, each through its exact
+        # redaction of every generated credential, token and recovery key.
+        if: failure()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: fresh-store-logs
+          retention-days: 3
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/fresh-store-logs/server.log
+            ${{ runner.temp }}/fresh-store-logs/fresh-store.log
+
+  gates:
+    name: C10 Gates
+    needs: style
+    # The inventory and coverage gates of the 1.0 upgrade (scripts/tests,
+    # tests/qualification): the baseline's 19-step `cargo llvm-cov
+    # --no-report` net, every CI step's libtest listing, then both gates. An
+    # instrumented build of the workspace and the whole net take hours, so
+    # it runs weekly and on manual dispatch, not on pull requests or pushes.
+    # The Docker-backed automation step runs in the net here (it could not
+    # on a developer machine without Docker).
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    env:
+      STORE: RocksDb
+      RUST_MIN_STACK: "16777216"
+      # The runner's root disk cannot hold the instrumented and plain builds;
+      # /mnt can.
+      CARGO_TARGET_DIR: /mnt/target
+      GATES: /mnt/gates
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Make room on /mnt
+        run: |
+          sudo mkdir -p /mnt/target /mnt/gates
+          sudo chown "$(id -u):$(id -g)" /mnt/target /mnt/gates
+          df -h / /mnt
+
+      - name: Install cargo-llvm-cov
+        run: |
+          rustup component add llvm-tools-preview
+          cargo install cargo-llvm-cov --version 0.9.1 --locked
+
+      - name: Coverage net (19 steps)
+        id: net
+        # The driver runs each step under its own environment (the SMTP
+        # step's SPAM_RULES_URL, the key and filesystem-blob variables), runs
+        # a failed step once more (smtp: its failed tests by name) and exits
+        # nonzero if a step failed twice; the steps after it still run.
+        run: python3 -I scripts/tests/coverage_net.py --out "$GATES/net"
+
+      - name: Capture CI step listings
+        id: listings
+        if: ${{ !cancelled() }}
+        run: python3 -I scripts/tests/capture_listings.py --out "$GATES/listings"
+
+      - name: Executed functions
+        id: functions
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          mkdir -p "$GATES/src"
+          git archive HEAD tests crates | tar -x -C "$GATES/src"
+          python3 -I tests/qualification/tools/strict_rule.py functions \
+            --exports "$GATES/net/steps" --sources "$GATES/src" \
+            --out "$GATES/functions.json" 2>&1 | tee "$GATES/functions.log"
+
+      - name: Inventory gate
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          python3 -I scripts/tests/check_test_inventory.py \
+            --baseline tests/qualification/baseline-0.16.27.json \
+            --dispositions tests/qualification/dispositions.json \
+            --listing "$GATES/listings/list" --ignored-listing "$GATES/listings/ign" \
+            --executed "$GATES/functions.json" 2>&1 | tee "$GATES/inventory.out"
+
+      - name: Coverage gate
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          python3 -I scripts/tests/check_coverage.py \
+            --baseline tests/qualification/baseline-0.16.27.json \
+            --dispositions tests/qualification/dispositions.json \
+            --merged "$GATES/net/merged.json" --sources "$GATES/src" \
+            --out "$GATES/coverage.json" 2>&1 | tee "$GATES/coverage.out"
+
+      - name: Sanitize gate output
+        # Only the gates' reports and the net's step table are kept: test
+        # names, step names, counts and source locations. Test logs and
+        # profiles are not uploaded. Any Basic or Bearer credential, and any
+        # password, secret or token assignment, is redacted all the same.
+        if: failure()
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/gates-receipt"
+          for file in "$GATES/inventory.out" "$GATES/coverage.out" "$GATES/functions.log" \
+                      "$GATES/net/steps.tsv"; do
+            [ -f "$file" ] || continue
+            sed -E \
+              -e 's/(Basic|Bearer) [A-Za-z0-9._~+\/=-]+/\1 [REDACTED]/g' \
+              -e 's/((password|secret|token)[A-Za-z_]*["]?[=:] *["]?)[^" ,}]+/\1[REDACTED]/Ig' \
+              "$file" > "$RUNNER_TEMP/gates-receipt/$(basename "$file")"
+          done
+          grep -h "^## exit\|^# config" "$GATES"/listings/list/*.txt "$GATES"/listings/ign/*.txt \
+            > "$RUNNER_TEMP/gates-receipt/listing-exits.txt" 2>/dev/null || true
+
+      - name: Retain sanitized gate output
+        if: failure()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: gates-receipt
+          retention-days: 7
+          if-no-files-found: ignore
+          path: ${{ runner.temp }}/gates-receipt/
