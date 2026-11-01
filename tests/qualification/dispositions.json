@@ -686,8 +686,8 @@
     "exists__WORKSPACE__all-members",
     "exists__smtp__test_mode+enterprise"
    ],
-   "unconfirmed": true,
-   "evidence": "Ruling 53: `smtp/src/inbound/dkim_restored_tests.rs` is compiled only without `enterprise` (`queue::Message`'s SEL-gated `tenant_ids`), so the seven tests run only in a build without `smtp/enterprise`, and Task 8 adds a CI step for them. Expectation ledger `smtp::inbound::dkim::tests::*`. Unconfirmed: Task 8 has not named the step; the configuration name and command here are proposals. Part 7d1 captured `to_command`: it lists every moved test, so the move is unconfirmed only for the step name Task 8 gives it."
+   "unconfirmed": false,
+   "evidence": "Ruling 53: `smtp/src/inbound/dkim_restored_tests.rs` is compiled only without `enterprise` (`queue::Message`'s SEL-gated `tenant_ids`), so the seven tests run only in a build without `smtp/enterprise`, and Task 8 adds a CI step for them. Expectation ledger `smtp::inbound::dkim::tests::*`. Confirmed at Task 8 (part 8c, ruling 124): test.yml's unit-tests job has the step \"SMTP Unit Tests (without enterprise)\", which runs `cargo test -p smtp --lib --bins --features test_mode`; part 7d1 captured `to_command`, which lists every moved test."
   },
   {
    "tests": [
@@ -706,8 +706,8 @@
    "absent_from": [
     "exists__WORKSPACE__all-members"
    ],
-   "unconfirmed": true,
-   "evidence": "Task 2, '`UNIT_TEST_FEATURES` for 1.0': `http/test_mode` cannot be listed in the workspace step (1.0's `telemetry` crate depends on the crates.io `http` crate), and `http`'s unit tests need `test_mode` for the fork's `za_test` module, so Task 8 runs them in a step of their own with this command. Unconfirmed: Task 8 has not named the step. The other four `http` tests need no `test_mode` and stay required in the workspace step. Part 7d1 captured `to_command`: it lists every moved test, so the move is unconfirmed only for the step name Task 8 gives it."
+   "unconfirmed": false,
+   "evidence": "Task 2, '`UNIT_TEST_FEATURES` for 1.0': `http/test_mode` cannot be listed in the workspace step (1.0's `telemetry` crate depends on the crates.io `http` crate), and `http`'s unit tests need `test_mode` for the fork's `za_test` module, so Task 8 runs them in a step of their own with this command. The other four `http` tests need no `test_mode` and stay required in the workspace step. Confirmed at Task 8 (part 8c, ruling 124): test.yml's unit-tests job has the step \"HTTP Unit Tests\", which runs `cargo test -p http@1.0.1 --lib --bins --features test_mode,enterprise`; part 7d1 captured `to_command`, which lists every moved test."
   },
   {
    "tests": [

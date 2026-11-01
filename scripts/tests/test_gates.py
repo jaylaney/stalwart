@@ -555,12 +555,17 @@ class ListingTests(unittest.TestCase):
         listing[unit] = (listing[unit][0] - dkim, listing[unit][1] - dkim)
         self.assertFails(self.gate(listing, dispositions=DISPOSITIONS), "[capture_missing]", target)
         listing[target] = (dkim, dkim)
-        self.assertFails(self.gate(listing, dispositions=DISPOSITIONS), "[move_unconfirmed]", target)
+        # Task 8 confirmed the committed moves (ruling 124); an unconfirmed copy still fails.
         with open(DISPOSITIONS, encoding="utf-8") as f:
             disp = json.load(f)
         for m in disp["selection_moves"]:
+            m["unconfirmed"] = m["to_configuration"] == target
+        self.assertFails(self.gate(listing, dispositions=disp), "[move_unconfirmed]", target)
+        for m in disp["selection_moves"]:
             m["unconfirmed"] = False
         code, out = self.gate(listing, dispositions=disp)
+        self.assertEqual(code, 0, out[-3000:])
+        code, out = self.gate(listing, dispositions=DISPOSITIONS)
         self.assertEqual(code, 0, out[-3000:])
 
 
