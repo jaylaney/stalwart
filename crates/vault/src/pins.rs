@@ -69,12 +69,16 @@ pub struct ZaWithheld {
     /// Regenerated on every refusal of the entry, so a delivery retires
     /// exactly the refusal it consumed (spec 5.2).
     pub refusal_id: u64,
-    /// Attendee-side entries only; organizer-side entries leave it empty.
+    /// Attendee-side entries: the instances of the refused REPLYs.
+    /// Organizer-side entries (upgrade ruling 132): the instances of the
+    /// refused per-instance CANCELs, the master never set; the full state
+    /// replays a CANCEL for each one the address no longer attends.
     pub instances: ZaInstances,
 }
 
-/// The instance keys of refused REPLYs: the drain's `InstanceKey` (a UTC
-/// instant and the THISANDFUTURE flag), the master apart.
+/// The instance keys of refused REPLYs (organizer-side: of refused
+/// per-instance CANCELs): the drain's `InstanceKey` (a UTC instant and the
+/// THISANDFUTURE flag), the master apart.
 #[derive(
     rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Debug, Default, Clone, PartialEq, Eq,
 )]

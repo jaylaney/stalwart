@@ -43,13 +43,13 @@ use common::{
 use groupware::{
     calendar::{
         CalendarEvent, CalendarEventContent,
-        drain::{ZaDrain, ZaHeldBack},
+        drain::{ZaDrain, ZaHeldBack, itip_reason},
         fanout::{
             ITIP_STATUS_KEY_REFUSED, ZaFanOut, ZaFanOutKind, ZaFanOutMessage, ZaScheduleStatus,
             ZaSource, za_set_schedule_status,
         },
         itip::ItipSendStatus,
-        pinning::{za_full_request_for, za_participation_replies},
+        pinning::{za_full_state_for, za_participation_replies},
         seal::{TokenPairs, ZaEvent, seal_error, seal_event_in_domain, unseal_event_in_domain},
         sequence_floor::{ZaSequence, za_set_sequences},
         sharing::resolve::za_owned_event_contexts,
@@ -696,7 +696,28 @@ async fn za_redeliver_entry(
     let policy = RecipientPolicy::new(&server.core.groupware, event.meta.flags);
     let (messages, lease) = match side {
         Side::Organizer => {
-            let messages = za_full_request_for(tree, addresses, &entry.address, policy);
+            // The slice, then the CANCELs of the recorded removals (upgrade
+            // ruling 132). A split error is a failure, so the entry stays
+            // (upgrade ruling 135, M10).
+            let messages = match za_full_state_for(
+                tree,
+                addresses,
+                &entry.address,
+                &entry.instances,
+                policy,
+            ) {
+                Ok(messages) => messages,
+                Err(err) => {
+                    trc::event!(
+                        Calendar(trc::CalendarEvent::ItipMessageError),
+                        AccountId = account_id,
+                        DocumentId = document_id,
+                        Reason = itip_reason(&err),
+                        Details = "zero-access: full state not built",
+                    );
+                    return Ok(Outcome::Failed);
+                }
+            };
             if messages.is_empty() {
                 return Ok(Outcome::Dropped);
             }

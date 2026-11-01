@@ -87,7 +87,7 @@ use crate::{
             itip_process_message,
         },
         organizer::organizer_request_full,
-        recipient::RecipientPolicy,
+        recipient::{RecipientPolicy, itip_messages_per_recipient},
         snapshot::itip_snapshot,
     },
 };
@@ -1321,20 +1321,31 @@ async fn merge(
                     if new_attendees.is_empty() {
                         Ok(None)
                     } else {
+                        // Restricted to the new attendees, then split per
+                        // recipient under the event's policy as 1.0 splits
+                        // upstream's own organizer messages (upgrade ruling
+                        // 131): each delegate gets its slice. A split error
+                        // is the builders' error.
                         organizer_request_full(&event.content.data.event, &after, None, false)
-                            .map(|messages| Some((new_attendees, messages)))
+                            .and_then(|mut messages| {
+                                for message in &mut messages {
+                                    message.to.retain(|to| {
+                                        new_attendees.contains(&to.to_ascii_lowercase())
+                                    });
+                                }
+                                messages.retain(|message| !message.to.is_empty());
+                                itip_messages_per_recipient(
+                                    messages,
+                                    RecipientPolicy::new(&server.core.groupware, event.meta.flags),
+                                )
+                            })
+                            .map(Some)
                     }
                 }
                 Err(err) => Err(err),
             };
             match new_attendees {
-                Ok(Some((new_attendees, mut messages))) => {
-                    for message in &mut messages {
-                        message
-                            .to
-                            .retain(|to| new_attendees.contains(&to.to_ascii_lowercase()));
-                    }
-                    messages.retain(|message| !message.to.is_empty());
+                Ok(Some(messages)) => {
                     if !messages.is_empty() {
                         // Two sessions of the organizer (two drain locks)
                         // can both pass the re-read of this REPLY, and the
@@ -1808,7 +1819,7 @@ fn seal_reason(err: &SealError) -> &'static str {
 /// A fixed name per `ItipError` variant: upstream traces `to_string()`,
 /// whose `SenderIsNotParticipant` and `UnknownParticipant` texts carry an
 /// address (spec 10).
-fn itip_reason(err: &ItipError) -> &'static str {
+pub fn itip_reason(err: &ItipError) -> &'static str {
     match err {
         ItipError::NoSchedulingInfo => "NoSchedulingInfo",
         ItipError::OtherSchedulingAgent => "OtherSchedulingAgent",
