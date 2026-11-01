@@ -7300,6 +7300,8 @@ comments and literals blanked.
 
 #### Needs a ruling (part 7d1)
 
+Answered by rulings 122 (N28), 123 (N29) and 124 (N30); N31 is shown in "#### Part 7d1b".
+
 - **N28, the coverage gate fails.** The cohort is 67 lines short of the full threshold and 81 of
   the runtime-only one (table above). Most of the drop is fork code with no test at 1.0:
   `sharing/convert.rs`'s container-only rewrap and rollback branches (+56), and four of the port's
@@ -7316,6 +7318,235 @@ comments and literals blanked.
   candidate fails (N28). Set I's coverage mutation shows the cohort figure falling by exactly
   the uncovered lines while the restored group rises, and 7b's offline self-test shows a pass
   turning into a fail. A pass-to-fail demonstration on the candidate needs N28 settled first.
+
+#### Part 7d1b: ruling 122's tests, and the net at one SHA
+
+Rulings 122 to 124 answered N28 to N31. Ruling 122 kept the threshold and the cohort, and asked
+for tests that reach the uncovered fork paths, then for the whole net rerun at one SHA. Ruling
+123 accepts `577540104`'s `steps` field provisionally, for the Task 7 review. Ruling 124 records
+the nine `move_unconfirmed` failures as settling at Task 8.
+
+Commits:
+- `c48b60a01`: unit tests;
+- `b39124246`: the ZA case;
+- this note.
+
+No runtime code changed: the crate changes are `#[cfg(test)]` modules only. Scratch work is
+under `task-7d/`: `coverage-b/`, `capture-b/`, `steps19-b/`, `gates/final/` and `selftest-N31*/`;
+`steps.tsv` is now the final net's (the first net's is `steps-6ca04a058.tsv`).
+
+##### The tests
+
+- **`groupware::calendar::drain::tests::itip_reasons_are_fixed_names_without_payload`.**
+  - Every `ItipError` traces as its own fixed variant name.
+  - The address that `SenderIsNotParticipant` and `UnknownParticipant` carry never appears.
+  - Control: upstream's `to_string()` does carry the address.
+- **`groupware::calendar::sharing::convert::tests::share_errors_debug_print_no_detail`**, and
+  **`calendar_errors_map_to_share_errors`**.
+  - A share error's `Debug` form names only its variant: no seal or store detail.
+  - A conversion conflict prints only its counts.
+  - Each calendar error maps to the share error of the same meaning.
+- **`groupware::calendar::seal::container::tests::damaged_and_misdirected_containers_are_refused`.**
+  These are refused, and none reads as sealed:
+  - five forged payloads: too short, a wrong version, a wrong bound byte, an unknown envelope
+    type, and an envelope with no ciphertext;
+  - a wrapper with a language tag;
+  - a calendar's bound container opened as an event's;
+  - a value that is not a container;
+  - plaintext offered to a grantee;
+  - a rewrap or reseal into another account.
+- **`email::message::za::ingest::tests::object_metadata_is_refused_for_a_key_account`.** The
+  refusal is a 550 `MessageIngest` error carrying only its fixed reason and the account id.
+- **`za::sharing::conversion_carries_dead_property_containers`** (ZA suite, after
+  `revoke_cleanup_does_not_rewrite_sealed_event`; accounts `sharing-container-owner` and
+  `sharing-container-reader`).
+  - **Setup.** Two calendars, each with a dead property on the calendar and on its event,
+    written by PROPPATCH under the owner's key. The conversion is interrupted after phase 1
+    (`set_share_rewrap_fail_once`).
+  - **Case 1 (resume).** A writer seals the event's row under the collection key and leaves its
+    container under the owner's key.
+    - The resumed conversion moves only the container (`write_container`): 0 rewrapped, 0
+      sealed, and the container is now under the collection key.
+    - Before the grant, the reader's PROPFIND reveals neither the property names nor their
+      values, and the owner's home lists none of the calendars. That holds for both forms
+      (`propname` and a named property), at depth 0 and on the home.
+    - After a view grant, the owner and the grantee both read both dead properties.
+  - **Case 2 (rollback).** A writer seals the event's container under the collection key and
+    leaves its row under the owner's key. A link into a third calendar makes the resume roll
+    back.
+    - The rollback moves the event's container, and the calendar's, back to the owner's key.
+    - The owner reads both properties.
+    - Unlinked, the calendar converts and is granted, and the owner and the grantee read them.
+  - **Cleanup.** The calendars are deleted at the end, and the suite's emptiness check passes.
+
+##### Where the lost lines were (ruling 122, item 2)
+
+No lost line was code that 0.16.27 covered and an adapted test no longer reaches. Each one was new
+code the port added without a test, or code 0.16.27 left uncovered too. File by file:
+- **`sharing/convert.rs`:** new at 1.0.
+  - `write_container`, and the container branches of the resume and of `rollback`, came with
+    ruling 29's containers.
+  - `ZaShareError`'s `Debug` and `From` impls were uncovered at 0.16.27 too (24 lines).
+- **`drain.rs`:** `itip_reason` was uncovered at 0.16.27 too (23 lines); it now has two more
+  variants. `keep_classification` is new.
+- **`email/src/message/za/ingest.rs`:** `za_metadata_refusal` is new. 1.0's object metadata is
+  new.
+- **`fanout.rs`:** the item-shape failure of ruling 94 (`:1452-1457`) is new; see "Not
+  reachable".
+- **`imap/src/core/za.rs`:** `za_unlist_key_accounts`'s removal block was already uncovered at
+  0.16.27 (`:48`, `:50`). 1.0 adds a closure there.
+- **The four additions:** `propfind/za.rs`, `seal/container.rs`, `index_queue/za.rs` and
+  `za/metadata.rs` are new code.
+- **The smaller drops** (`common/src/auth/vault.rs`, `view.rs`, `pinning.rs`, `delegation.rs`,
+  `item.rs`, `resolve.rs`): each newly uncovered function is new at the port. For example
+  `za_filter_access_to`, `za_has_tasks`' 1.0 arms, `za_has_attachment`, `za_is_sealed_source` and
+  `into_item_message`.
+
+##### Not reachable, kept (ruling 122, item 3)
+
+- **`dav/src/common/propfind/za.rs:334-338` and `:373-375`.** `za_open_dead_container`'s "no
+  read context" and "another collection" errors. Both callers (`propfind/mod.rs:453`, `:720`)
+  call it only with a read context, which exists only for calendar collections.
+- **`groupware/src/calendar/fanout.rs:1452-1457`.** `write_item_inner`'s failure when an iTIP
+  message does not reparse (ruling 94). Upstream's builders emit text its own parser accepts, so
+  no input reaches it without a fault.
+
+Still uncovered, and not reached by this part's tests:
+- `index_queue/za.rs` `for_row` `:114-126`: an un-index of a row whose thread subject is in its
+  header section;
+- `za/metadata.rs` `:165-201`: an owner counter with no containers whose owner still holds
+  private containers of the account;
+- `imap/src/core/za.rs` `:50-58`: a shared account that becomes a foreign key account during a
+  session.
+
+##### The net at one SHA
+
+- **SHA.** Measured at `b39124246`, HEAD after the two test commits (`coverage-b/sha.txt`). The
+  sources are `git archive b39124246 tests crates`; this note's commit changes only docs. The
+  same driver, step names and commands as above, so every figure below comes from that one SHA.
+  The listings were recaptured at it too (`capture-b/`), and so were the gates' inputs.
+
+| Step | Attempt | Command (`cargo llvm-cov --no-report test` ...) | Extra env | Exit | Passed / failed / ignored | Wall |
+|---|---|---|---|---|---|---|
+| `build-A` | build | `--workspace --exclude-from-test scim --exclude-from-test scim-proto --lib --bins --tests --no-fail-fast -- zz_no_such_test_zz` | - | 0 | 0 / 0 / 0 | 1:22 |
+| `build-B` | build | `-p tests zz_no_such_test_zz_2 -- --nocapture` | - | 0 | 0 / 0 / 0 | 0:52 |
+| `leak-unit-test` | 1 | `-p tests za::leak::tests::try_archive_short_values_are_not_archives -- --exact --nocapture` | - | 0 | 1 / 0 / 0 | 0:01 |
+| `unit-tests` | 1 | `--workspace --exclude-from-test scim --exclude-from-test scim-proto --lib --bins --tests --no-fail-fast -- --exact --skip <the 98 tests-crate tests>` | - | 0 | 562 / 0 / 2 | 0:13 |
+| `za-tests` | 1 | `-p tests za::za_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 6:11 |
+| `za-tests-fs-blob` | 1 | `-p tests za::za_tests -- --nocapture` | BLOB_STORE=FileSystem | 0 | 1 / 0 / 0 | 6:11 |
+| `webdav-plain` | 1 | `-p tests webdav::webdav_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 0:21 |
+| `webdav-key` | 1 | `-p tests webdav::webdav_tests -- --nocapture` | ZA_KEY_ACCOUNTS=1 | 0 | 1 / 0 / 0 | 0:26 |
+| `imap-plain` | 1 | `-p tests imap::imap_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 0:11 |
+| `imap-key` | 1 | `-p tests imap::imap_tests -- --nocapture` | ZA_KEY_ACCOUNTS=1 | 0 | 1 / 0 / 0 | 0:13 |
+| `jmap-plain` | 1 | `-p tests jmap::jmap_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 2:13 |
+| `jmap-key` | 1 | `-p tests jmap::jmap_tests -- --nocapture` | ZA_KEY_ACCOUNTS=1 | 0 | 1 / 0 / 0 | 1:35 |
+| `smtp` | 1 | `-p tests smtp -- --nocapture` | `SPAM_RULES_URL` (v3.0.3) | 0 | 76 / 0 / 3 | 0:47 |
+| `system-tests` | 1 | `-p tests system::system_tests -- --nocapture` | - | 101 | 0 / 1 / 0 (system::system_tests) | 0:11 |
+| `system-tests` | 2 | `-p tests system::system_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 1:02 |
+| `store-tests` | 1 | `-p tests store::store_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 0:08 |
+| `blob-tests` | 1 | `-p tests store::blob::blob_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 0:05 |
+| `lookup-tests` | 1 | `-p tests store::lookup::lookup_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 0:12 |
+| `search-tests` | 1 | `-p tests store::search_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 9:52 |
+| `telemetry-tests` | 1 | `-p tests telemetry::telemetry_tests -- --nocapture` | - | 0 | 1 / 0 / 0 | 0:03 |
+| `cal-query-tests` | 1 | `-p tests webdav::cal_query:: -- --nocapture` | - | 0 | 2 / 0 / 1 | 0:01 |
+| `automation-tests` | 1 | `-p tests automation::automation_tests -- --nocapture` | - | 101 | 0 / 1 / 0 (automation::automation_tests) | 0:00 |
+| `automation-tests` | 2 | `-p tests automation::automation_tests -- --nocapture` | - | 101 | 0 / 1 / 0 (automation::automation_tests) | 0:00 |
+| `za-cache-swap` | 1 | `-p tests za::cache_swap::cache_swap_tests -- --exact --nocapture` | - | 0 | 1 / 0 / 0 | 0:18 |
+
+- **Reruns.**
+  - `smtp` passed at the first attempt: 76 passed, 0 failed, 3 ignored.
+  - `system-tests` failed once in `system::oidc`: the `client_secret_basic` exchange answered
+    `InvalidGrant`. The rerun passed.
+    - The test sets the authorization code's lifetime to one second
+      (`oauth_expiry_auth_code = 1`), and its 0.16.27 version did too.
+    - Under instrumentation the exchange can outlast that second. This is not one of the
+      documented flakes (N32).
+  - `automation-tests` failed both attempts, as before: there is no Docker on this machine.
+- **The swap step.** `za-cache-swap` passes. It is outside the 19, and the merged export
+  leaves it out.
+- **Tests run.** The unit step runs 562 tests: 557 plus the five new ones.
+
+##### Both gates at that SHA
+
+Inputs, all from `b39124246`:
+- the 28 listings and 28 ignored listings in `capture-b/`;
+- `strict_rule.py functions` over the 19 exports in `coverage-b/steps/` and the `b39124246`
+  sources (2,328 functions);
+- `coverage-b/merged.json`.
+
+Outputs are in `gates/final/`.
+
+**Inventory gate: FAIL, with 9 failures, all `move_unconfirmed`.**
+- They are the seven DKIM tests and the two `http` `za_test` tests. They settle at Task 8
+  (ruling 124).
+- Excused checks: 22 `internals_replaced_equivalent`, 202 `sel_only`, 22 `subject_deleted`.
+- With the scratch dispositions copy in which the two moves are confirmed, the gate exits 0.
+- The listings hold the five new unit tests (562 in the workspace unit step, 217 in the vault
+  and groupware step) and the same six ignored tests as 0.16.27.
+
+**Coverage gate: OK.**
+
+| Figure | `b39124246` | Threshold | Margin |
+|---|---|---|---|
+| Full | 20,821 / 21,549 (96.62%) | 17,821 / 18,490 (96.38%) | 51 lines over the 20,770 needed |
+| Runtime-only | 12,195 / 12,848 (94.92%) | 10,646 / 11,246 (94.66%) | 32 lines over the 12,163 needed |
+
+The new tests cover 113 more runtime lines than at `6ca04a058`:
+- `convert.rs`: 669 to 740 of 767 (+71). `write_container` and both container branches now run.
+- `drain.rs`: +27.
+- `seal/container.rs`: +8.
+- `email/src/message/za/ingest.rs`: +7.
+
+The full figure also counts the new test modules' own lines.
+
+`propfind/za.rs` is unchanged at 370 / 414. The ZA case's pre-grant PROPFINDs are refused
+before `za_propname_item`'s and `refusal`'s arms run, so those lines stay uncovered.
+
+Some files are still below their baseline fraction. The gate checks only the cohort totals.
+- **More uncovered lines, all in functions new at the port:** `common/src/auth/vault.rs` +4,
+  `view.rs` +4, `fanout.rs` +7, `pinning.rs` +2, `sharing/resolve.rs` +1.
+- **The same uncovered count over a smaller file:** `seal/collection.rs` (20), `http/src/api/
+  shares.rs` (19) and `sharing/test.rs` (1).
+- **`imap/src/core/za.rs`:** see "Where the lost lines were".
+
+Beside the cohort, `restored_tests` is 11,612 / 12,017.
+
+##### N31: the coverage gate turns from pass to fail
+
+This is the coverage self-test, run on the passing candidate. The disposable change is Set I's I5
+(`selftest-N31.diff`, never committed):
+- a 63-line function, never called, in the cohort file `http/src/api/vault.rs`;
+- a covered 124-line test in `http/src/request_restored_tests.rs`.
+
+Both builds and `unit-tests` were rerun. The other 18 steps kept their `b39124246` profiles,
+which the change does not touch.
+
+| | Full | Runtime-only | `restored_tests` |
+|---|---|---|---|
+| Unchanged (`b39124246`) | 20,821 / 21,549: pass | 12,195 / 12,848: pass | 11,612 / 12,017 |
+| Mutated | 20,821 / 21,612 (96.34%): **FAIL** | 12,195 / 12,911 (94.45%): **FAIL** | 11,736 / 12,141 |
+| Mutated, if restored tests counted | 32,557 / 33,753 (96.46%): would pass | 23,931 / 25,052 (95.53%): would pass | |
+
+The gate fails both fractions:
+- full: `20821 * 18490 = 384980290 < 17821 * 21612 = 385147452`;
+- runtime-only: `12195 * 11246 = 137144970 < 10646 * 12911 = 137450506`.
+
+The restored tests' 124 new covered lines would have offset the drop. The gate reports them only
+in their own group.
+
+Restored with `git checkout -- <files>`, the same two builds and `unit-tests` were rerun
+(`selftest-N31-restored/`). The figures are back to 20,821 / 21,549 and 12,195 / 12,848, and
+`restored_tests` to 11,612 / 12,017; the gate passes.
+
+##### Needs a ruling (part 7d1b)
+
+- **N32, `system::oidc` flake candidate.** In the final net's `system-tests` step, the
+  `client_secret_basic` code exchange answered `InvalidGrant` once, and the rerun passed.
+  - The test gives the authorization code a one-second lifetime (`oauth_expiry_auth_code = 1`),
+    and so did 0.16.27's version.
+  - Under instrumentation the exchange can take longer than that second.
+  - Either CLAUDE.md's flaky list gains it (with CI's rerun), or the test's code lifetime is
+    raised for that one exchange, as ruling 117 did for its SASL token.
 
 ## Conflict ledger
 
