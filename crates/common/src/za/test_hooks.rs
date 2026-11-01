@@ -104,6 +104,10 @@
 //!   `store::za_test`; set it through `ForceCommitSplit`, whose drop clears
 //!   it, so a test that panics while it is set does not leave every later
 //!   batch splitting.
+//! - `PROPFIND_ADMITTED_PAUSE` (upgrade ruling 142): in a foreign key
+//!   account's calendar PROPFIND, after `foreign_calendar_contexts` admitted
+//!   the calendars and before any item is read, keyed by the requesting
+//!   principal (`dav::common::propfind::za`).
 
 use std::sync::{
     Arc, Mutex,
@@ -754,4 +758,15 @@ pub fn set_calendar_history_purge_pause(pause: Option<Arc<Pause>>) {
 }
 pub async fn calendar_history_purge_pause_point(owner: u32) {
     wait(take_for(&CALENDAR_HISTORY_PURGE_PAUSE, owner)).await;
+}
+
+/// Foreign calendar PROPFIND after `foreign_calendar_contexts`' fresh own-id
+/// admission and before any item is read (upgrade ruling 142), keyed by the
+/// requesting principal (the grantee), so the owner's own requests pass.
+pub static PROPFIND_ADMITTED_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub fn set_propfind_admitted_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&PROPFIND_ADMITTED_PAUSE, pause);
+}
+pub async fn propfind_admitted_pause_point(reader: u32) {
+    wait(take_for(&PROPFIND_ADMITTED_PAUSE, reader)).await;
 }

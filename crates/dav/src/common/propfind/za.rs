@@ -485,6 +485,8 @@ pub(super) async fn foreign_calendar_contexts(
             Err(error) => return Err(crate::calendar::za_calendar_error(error, owner_id, id)),
         }
     }
+    #[cfg(feature = "test_mode")]
+    common::za::test_hooks::propfind_admitted_pause_point(token.account_id()).await;
     Ok(eligible)
 }
 
