@@ -12,7 +12,7 @@
 #   --force overwrites existing files; without it the script refuses to.
 # Environment (read from the environment only: this script runs before env.sh and local.env
 # are usable, so it does not source them):
-#   ZA_RUN_DIR         state directory (default: .run/ in the repository)
+#   ZA_RUN_DIR         state directory (default: .run-1.0/ in the repository)
 #   ZA_TLS_EXTRA_SAN   comma-separated extra DNS names or IP addresses for the certificate,
 #                      on top of localhost, 127.0.0.1 and ::1 (e.g. "mybox.local,192.168.1.20")
 # The certificate has serverAuth extended key usage and a validity below 825 days, which
@@ -20,7 +20,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ZA_RUN_DIR="${ZA_RUN_DIR:-$REPO_ROOT/.run}"
+ZA_RUN_DIR="${ZA_RUN_DIR:-$REPO_ROOT/.run-1.0}"
 DAYS=800
 
 force=0

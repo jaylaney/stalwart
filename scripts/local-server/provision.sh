@@ -45,11 +45,11 @@ jmap_create() { # $1 object type, $2 JSON object
 created_id() { python3 -I -c 'import json,sys; r=json.load(sys.stdin)["methodResponses"][0][1]; c=r.get("created",{}).get("i0"); print(c["id"] if c else "ERROR: "+json.dumps(r.get("notCreated")))'; }
 updated_ok() { python3 -I -c 'import json,sys; r=json.load(sys.stdin)["methodResponses"][0][1]; print("ok" if "singleton" in (r.get("updated") or {}) else "ERROR: "+json.dumps(r.get("notUpdated")))'; }
 
-echo "listener http 8080: $(jmap_create NetworkListener '{"name":"http","bind":{"[::]:8080":true},"protocol":"http","useTls":false,"tlsImplicit":false}' | created_id)"
-echo "listener imap 1143: $(jmap_create NetworkListener '{"name":"imap","bind":{"[::]:1143":true},"protocol":"imap","useTls":false,"tlsImplicit":false}' | created_id)"
-echo "listener https 8443: $(jmap_create NetworkListener '{"name":"https","bind":{"[::]:8443":true},"protocol":"http","useTls":true,"tlsImplicit":true}' | created_id)"
+echo "listener http 8080: $(jmap_create NetworkListener '{"name":"http","bind":{"[::]:8080":true},"protocol":"http","useTls":false,"implicitTls":false}' | created_id)"
+echo "listener imap 1143: $(jmap_create NetworkListener '{"name":"imap","bind":{"[::]:1143":true},"protocol":"imap","useTls":false,"implicitTls":false}' | created_id)"
+echo "listener https 8443: $(jmap_create NetworkListener '{"name":"https","bind":{"[::]:8443":true},"protocol":"http","useTls":true,"implicitTls":true}' | created_id)"
 
-DOMAIN_ID=$(jmap_create Domain '{"name":"example.com","isEnabled":true,"description":"Zero-access test domain"}' | created_id)
+DOMAIN_ID=$(jmap_create Domain '{"name":"example.com","enable":true,"description":"Zero-access test domain"}' | created_id)
 echo "domain example.com: $DOMAIN_ID"
 
 # issuer and subjectAlternativeNames are server-set and refused on create.
