@@ -68,7 +68,10 @@ use crate::{
         CalendarEvent, CalendarEventContent, CalendarEventData, CalendarEventNotification,
         CalendarEventNotificationContent, ChangedBy, EVENT_NOTIFICATION_IS_CHANGE,
         alerts::{DefaultAlerts, DefaultAlertsResolver},
-        fanout::{ZaFanOut, ZaFanOutKind, ZaFanOutMessage, ZaSource, za_set_schedule_status},
+        fanout::{
+            ZaFanOut, ZaFanOutKind, ZaFanOutMessage, ZaScheduleStatus, ZaSource,
+            za_set_schedule_status,
+        },
         privacy::{EventPrivacy, ICalendarPrivacy},
         schedule::{AlarmTasks, EventAlarmScheduler, EventAlarmUsers},
         seal::{
@@ -86,6 +89,7 @@ use crate::{
             MergeAction, MergeResult, itip_import_message, itip_merge_changes, itip_method,
             itip_process_message,
         },
+        itip::ITIP_STATUS_DELIVERY_FAILED,
         organizer::organizer_request_full,
         recipient::{RecipientPolicy, itip_messages_per_recipient},
         snapshot::itip_snapshot,
@@ -1303,6 +1307,9 @@ async fn merge(
         // upstream's organizer request builder on the merged tree,
         // restricted to the new attendees (spec 6.4, "Delegates").
         Incoming::Reply(_) => {
+            // Upgrade ruling 154: the new delegates whose invitation's split
+            // failed, for their `5.1`.
+            let mut split_failed: Vec<String> = Vec::new();
             let new_attendees = match itip_snapshot(&event.content.data.event, addresses, false) {
                 Ok(after) => {
                     // Compared per instance, so a delegate who already
@@ -1325,7 +1332,8 @@ async fn merge(
                         // recipient under the event's policy as 1.0 splits
                         // upstream's own organizer messages (upgrade ruling
                         // 131): each delegate gets its slice. A split error
-                        // is the builders' error.
+                        // is the builders' error, and the delegates it
+                        // leaves uninvited get `5.1` (upgrade ruling 154).
                         organizer_request_full(&event.content.data.event, &after, None, false)
                             .and_then(|mut messages| {
                                 for message in &mut messages {
@@ -1334,10 +1342,15 @@ async fn merge(
                                     });
                                 }
                                 messages.retain(|message| !message.to.is_empty());
+                                let delegates: Vec<String> = messages
+                                    .iter()
+                                    .flat_map(|message| message.to.iter().cloned())
+                                    .collect();
                                 itip_messages_per_recipient(
                                     messages,
                                     RecipientPolicy::new(&server.core.groupware, event.meta.flags),
                                 )
+                                .inspect_err(|_| split_failed = delegates)
                             })
                             .map(Some)
                     }
@@ -1425,7 +1438,10 @@ async fn merge(
                 }
                 Ok(None) => {}
                 // The reply still applies; the delegate's invitation is
-                // not built. Traced as upstream traces a builder error.
+                // not built. Traced as upstream traces a builder error. A
+                // split error (upgrade ruling 154) is each uninvited new
+                // delegate's `5.1` on its ATTENDEE lines, so the organizer
+                // sees the failure, as a failed delivery shows it.
                 Err(err) => {
                     trc::event!(
                         Calendar(trc::CalendarEvent::ItipMessageError),
@@ -1434,6 +1450,15 @@ async fn merge(
                         Reason = itip_reason(&err),
                         Details = "zero-access: delegate invitation not built",
                     );
+                    let statuses: Vec<ZaScheduleStatus> = split_failed
+                        .into_iter()
+                        .map(|address| ZaScheduleStatus {
+                            address,
+                            on_organizer: false,
+                            status: ITIP_STATUS_DELIVERY_FAILED,
+                        })
+                        .collect();
+                    za_set_schedule_status(&mut event.content.data.event, &statuses);
                 }
             }
         }

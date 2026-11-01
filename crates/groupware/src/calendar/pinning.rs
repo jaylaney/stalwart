@@ -15,10 +15,12 @@
 use crate::{
     calendar::{drain::instance_key, seal::TokenPairs},
     scheduling::{
-        Email, InstanceId, ItipError, ItipMessage, ItipSnapshot, ItipSnapshots, ItipSummary,
-        RecurrenceId,
+        Email, InstanceId, ItipError, ItipField, ItipMessage, ItipSnapshot, ItipSnapshots,
+        ItipSummary, ItipValue, RecurrenceId,
         event_cancel::CancelScope,
-        itip::{ItipExportAs, itip_add_tz, itip_build_envelope, itip_export_component},
+        itip::{
+            ItipExportAs, itip_add_tz, itip_build_envelope, itip_date_entry, itip_export_component,
+        },
         organizer::organizer_request_full,
         recipient::{RecipientPolicy, itip_messages_per_recipient},
         snapshot::itip_snapshot,
@@ -82,10 +84,16 @@ pub fn za_full_request_for(
 }
 
 /// An organizer-side entry's full state (spec 5.1 item 1, 6.4 step 2):
-/// `za_full_request_for`, then, when it sends anything, the per-instance
-/// CANCELs of the entry's recorded instances (`za_withheld_cancels`, upgrade
-/// ruling 132) to the address forms the full REQUEST reached. A split error
-/// of either is returned.
+/// `za_full_request_for`, then the per-instance CANCELs of the entry's
+/// recorded instances (`za_withheld_cancels`, upgrade ruling 132) to the
+/// address forms the full REQUEST reached. When the slice is empty (the
+/// address DECLINED every instance it attends without SCHEDULE-FORCE-SEND,
+/// or has RSVP=FALSE there), the CANCELs still go, to the address forms the
+/// tree names for the recipient on an ATTENDEE the server schedules
+/// (`za_scheduled_forms`, upgrade ruling 153): the replay does not depend on
+/// a REQUEST going out. A form the tree marks SCHEDULE-AGENT=CLIENT or NONE
+/// gets nothing (RFC 6638: the server does not schedule for it). A split
+/// error of either is returned.
 pub fn za_full_state_for(
     tree: &ICalendar,
     addresses: &[String],
@@ -94,18 +102,70 @@ pub fn za_full_state_for(
     policy: RecipientPolicy,
 ) -> Result<Vec<ItipMessage<ICalendar>>, ItipError> {
     let mut messages = za_full_request_for(tree, addresses, recipient, policy)?;
-    if !messages.is_empty() {
-        let mut to: Vec<String> = Vec::new();
-        for address in messages.iter().flat_map(|message| message.to.iter()) {
-            if !to.contains(address) {
-                to.push(address.clone());
-            }
+    let mut to: Vec<String> = Vec::new();
+    for address in messages.iter().flat_map(|message| message.to.iter()) {
+        if !to.contains(address) {
+            to.push(address.clone());
         }
-        messages.extend(za_withheld_cancels(
-            tree, addresses, recipient, &to, instances, policy,
-        )?);
     }
+    if to.is_empty() {
+        to = za_scheduled_forms(tree, addresses, recipient);
+    }
+    messages.extend(za_withheld_cancels(
+        tree, addresses, recipient, &to, instances, policy,
+    )?);
     Ok(messages)
+}
+
+/// Upgrade ruling 153: the address forms of every ATTENDEE of the organized
+/// `tree` that normalizes to `recipient` and that the server schedules (no
+/// SCHEDULE-AGENT=CLIENT or NONE), each once, sorted. Empty when the tree is
+/// not organized by one of `addresses`, or names no such ATTENDEE.
+fn za_scheduled_forms(tree: &ICalendar, addresses: &[String], recipient: &str) -> Vec<String> {
+    let Some(recipient) = za_normalize_address(recipient) else {
+        return Vec::new();
+    };
+    let Ok(snapshots) = itip_snapshot(tree, addresses, false) else {
+        return Vec::new();
+    };
+    if !snapshots.organizer.email.is_local {
+        return Vec::new();
+    }
+    let mut forms: Vec<String> = Vec::new();
+    for attendee in snapshots
+        .components
+        .values()
+        .flat_map(|instance| instance.attendees.iter())
+    {
+        if attendee.is_server_scheduling
+            && za_normalize_address(&attendee.email.email).as_deref() == Some(recipient.as_str())
+            && !forms.contains(&attendee.email.email)
+        {
+            forms.push(attendee.email.email.clone());
+        }
+    }
+    forms.sort_unstable();
+    forms
+}
+
+/// Upgrade ruling 152: the properties a replayed CANCEL component keeps
+/// (UID, ORGANIZER, RECURRENCE-ID, SEQUENCE, DTSTAMP and STATUS); every
+/// content property upstream's cancel builder copies (SUMMARY, DESCRIPTION,
+/// LOCATION, CREATED, LAST-MODIFIED, DTSTART, DTEND, DURATION, DUE) and any
+/// copied ATTENDEE line go. The caller then adds DTSTART at the
+/// RECURRENCE-ID's value and the recipient's own ATTENDEE lines.
+fn za_cancel_only(component: &mut ICalendarComponent) {
+    component.entries.retain(|entry| {
+        matches!(
+            entry.name,
+            ICalendarProperty::Uid
+                | ICalendarProperty::Organizer
+                | ICalendarProperty::RecurrenceId
+                | ICalendarProperty::Sequence
+                | ICalendarProperty::Dtstamp
+                | ICalendarProperty::Status
+        )
+    });
 }
 
 /// Upgrade ruling 132 (spec 5.1 item 1): the removals a full state cannot
@@ -119,17 +179,29 @@ pub fn za_full_state_for(
 /// (`CancelScope::Instance` over the address forms of `to`, so the
 /// component lists none of the instance's current attendees) at the
 /// instance's committed SEQUENCE, then split per recipient under `policy`.
+/// Upgrade ruling 152: the component carries no content. Only UID,
+/// ORGANIZER, RECURRENCE-ID, SEQUENCE, DTSTAMP and STATUS:CANCELLED are
+/// kept from the builder's (`za_cancel_only`), so neither the instance's
+/// current content (edits made after the address left it) nor the
+/// master's reaches the recipient, and DTSTART is the RECURRENCE-ID's
+/// value. Neither merge fails without it (an override present in the copy
+/// keeps its own DTSTART, and calcard's expansion falls back to the
+/// RECURRENCE-ID), but upstream's CANCEL merge stores a component the copy
+/// lacks as the copy's cancelled override, and a stored VEVENT needs a
+/// DTSTART (RFC 5545 3.6.1), as upstream's own exclusion CANCEL carries. The
+/// iTIP summary lists the cancelled instances' RECURRENCE-ID times alone.
 /// Each component names the recipient with a bare ATTENDEE line per
 /// address of `to`: the tree no longer holds its line, which upstream's
 /// own CANCEL copies from the superseded tree, and the recipient's
 /// snapshot of a message that names none of its addresses fails
 /// (`NotOrganizerNorAttendee`), so its drain would not merge it.
 /// A recorded instance the tree has no component for is built from the
-/// master, its RECURRENCE-ID and DTSTART the recorded UTC instant (with
-/// RANGE=THISANDFUTURE when recorded so), at the master's SEQUENCE, as
-/// upstream builds an exclusion's CANCEL; it is skipped when the address
-/// attends the master (a master instance it attends, or an EXDATE the slice
-/// carries). An instance the address attends again gets no component.
+/// master's UID and ORGANIZER, its RECURRENCE-ID and DTSTART the recorded
+/// UTC instant (with RANGE=THISANDFUTURE when recorded so), at the master's
+/// SEQUENCE, as upstream builds an exclusion's CANCEL; it is skipped when
+/// the address attends the master (a master instance it attends, or an
+/// EXDATE the slice carries). An instance the address attends again gets no
+/// component.
 /// Empty when the entry recorded no instance key, overflowed (`all`: today's
 /// behaviour, a recorded limit), `to` is empty, the tree is not organized
 /// by one of `addresses`, or no recorded instance qualifies. Only the
@@ -180,11 +252,19 @@ pub fn za_withheld_cancels(
             Some((_, snapshot)) if attends(snapshot) => continue,
             Some((id, snapshot)) => {
                 cancelled.push(id.clone());
-                CancelScope::Instance(&scope).build_component(
+                let mut component = CancelScope::Instance(&scope).build_component(
                     snapshot.comp,
                     snapshot.sequence.unwrap_or_default(),
                     dt_stamp.clone(),
-                )
+                );
+                za_cancel_only(&mut component);
+                let dt_start = component
+                    .entries
+                    .iter()
+                    .find(|entry| entry.name == ICalendarProperty::RecurrenceId)
+                    .map(|entry| itip_date_entry(ICalendarProperty::Dtstart, entry));
+                component.entries.extend(dt_start);
+                component
             }
             None => {
                 let Some(main) = main.filter(|main| !attends(main)) else {
@@ -200,15 +280,7 @@ pub fn za_withheld_cancels(
                     main.sequence.unwrap_or_default(),
                     dt_stamp.clone(),
                 );
-                component.entries.retain(|entry| {
-                    !matches!(
-                        entry.name,
-                        ICalendarProperty::Dtstart
-                            | ICalendarProperty::Dtend
-                            | ICalendarProperty::Duration
-                            | ICalendarProperty::Due
-                    )
-                });
+                za_cancel_only(&mut component);
                 let value =
                     ICalendarValue::PartialDateTime(PartialDateTime::from_utc_timestamp(date));
                 component.entries.push(ICalendarEntry {
@@ -247,11 +319,38 @@ pub fn za_withheld_cancels(
             from: snapshots.organizer.email.email.clone(),
             from_organizer: true,
             to: to.to_vec(),
-            summary: ItipSummary::Cancel(snapshots.build_instances_summary(&cancelled, None, &[])),
+            summary: ItipSummary::Cancel(recurrence_times(&snapshots, &cancelled)),
             message,
         }],
         policy,
     )
+}
+
+/// Upgrade ruling 152: a replayed CANCEL's iTIP summary, one DTSTART field
+/// per cancelled instance at its RECURRENCE-ID's time, and no SUMMARY,
+/// DESCRIPTION, LOCATION, CONFERENCE or guest list. An instance in the tree
+/// takes its RECURRENCE-ID's own time (`recurrence_time`), not its DTSTART;
+/// one generated from the master takes the recorded instant in the master's
+/// time zone (`instance_time` of an absent instance).
+fn recurrence_times(snapshots: &ItipSnapshots<'_>, cancelled: &[InstanceId]) -> Vec<ItipField> {
+    let mut fields: Vec<ItipField> = Vec::with_capacity(cancelled.len());
+    for id in cancelled {
+        let time = match snapshots.components.get(id) {
+            Some(instance) => instance.recurrence_time,
+            None => snapshots.instance_time(id),
+        };
+        let Some(time) = time else {
+            continue;
+        };
+        let field = ItipField {
+            name: ICalendarProperty::Dtstart,
+            value: ItipValue::Time(time),
+        };
+        if !fields.contains(&field) {
+            fields.push(field);
+        }
+    }
+    fields
 }
 
 /// The refused instances' current participation (spec 6.4 step 2): a REPLY
@@ -986,6 +1085,201 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// Upgrade ruling 152: canary content on the master and on X, written
+    /// after bob left X (a new title, description, location, creation and
+    /// modification time, and a moved time), reaches neither component of the
+    /// replayed CANCEL: X (the present-component arm) nor the master-generated
+    /// day 5 (the master arm). Each keeps UID, ORGANIZER, RECURRENCE-ID,
+    /// SEQUENCE, DTSTAMP, STATUS:CANCELLED, bob's own ATTENDEE line and a
+    /// DTSTART at the RECURRENCE-ID's value; the iTIP summary holds the two
+    /// RECURRENCE-ID times alone.
+    #[test]
+    fn withheld_cancels_carry_no_content() {
+        let canaries = [
+            "canary-master-summary",
+            "canary-master-description",
+            "canary-master-location",
+            "canary-x-summary",
+            "canary-x-description",
+            "canary-x-location",
+            "20990302T150000Z",
+            "20990302T170000Z",
+            "PT1H",
+            "20240202T000000Z",
+            "20240303T000000Z",
+        ];
+        let text = removal_event(&["key3@example.com"], &["key3@example.com"])
+            .to_string()
+            .replace(
+                "SUMMARY:master\r\n",
+                concat!(
+                    "SUMMARY:canary-master-summary\r\n",
+                    "DESCRIPTION:canary-master-description\r\n",
+                    "LOCATION:canary-master-location\r\n",
+                    "CREATED:20240202T000000Z\r\nLAST-MODIFIED:20240303T000000Z\r\n",
+                ),
+            )
+            .replace(
+                "DTSTART:20990302T100000Z\r\nDURATION:PT1H\r\n",
+                "DTSTART:20990302T150000Z\r\nDTEND:20990302T170000Z\r\n",
+            )
+            .replace(
+                "SUMMARY:x\r\n",
+                concat!(
+                    "SUMMARY:canary-x-summary\r\n",
+                    "DESCRIPTION:canary-x-description\r\n",
+                    "LOCATION:canary-x-location\r\n",
+                    "CREATED:20240202T000000Z\r\nLAST-MODIFIED:20240303T000000Z\r\n",
+                ),
+            );
+        for canary in &canaries[..7] {
+            assert!(text.contains(canary), "the fixture plants {canary}: {text}");
+        }
+        let tree = parse(&text);
+        let to = vec![BOB.to_string()];
+        let cancels =
+            za_withheld_cancels(&tree, &alice(), BOB, &to, &recorded(&[D, C, A]), policy())
+                .expect("no split error");
+        assert_eq!(cancels.len(), 1);
+        let cancel = &cancels[0];
+        assert_eq!(components_of(cancel), [(Some(A), 3), (Some(D), 1)]);
+        let text = cancel.message.to_string();
+        for canary in canaries {
+            assert!(
+                !text.contains(canary),
+                "{canary} reached the CANCEL: {text}"
+            );
+        }
+        let summary = serde_json::to_string(&cancel.summary).unwrap();
+        for canary in canaries {
+            assert!(
+                !summary.contains(canary),
+                "{canary} reached the summary: {summary}"
+            );
+        }
+        let scheduling: Vec<&ICalendarComponent> = cancel
+            .message
+            .components
+            .iter()
+            .filter(|comp| comp.component_type.is_scheduling_object())
+            .collect();
+        assert_eq!(scheduling.len(), 2);
+        for (comp, (rid, date)) in scheduling
+            .into_iter()
+            .zip([("20990302T100000Z", A.0), ("20990305T100000Z", D.0)])
+        {
+            let mut names: Vec<&str> = comp
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                [
+                    "ATTENDEE",
+                    "DTSTAMP",
+                    "DTSTART",
+                    "ORGANIZER",
+                    "RECURRENCE-ID",
+                    "SEQUENCE",
+                    "STATUS",
+                    "UID"
+                ],
+                "{text}"
+            );
+            assert_eq!(comp.status(), Some(&ICalendarStatus::Cancelled), "{text}");
+            let value_of = |name: ICalendarProperty| {
+                let entry = comp.property(&name).expect("the property");
+                let mut value = String::new();
+                entry
+                    .values
+                    .first()
+                    .and_then(|value| value.as_partial_date_time())
+                    .unwrap()
+                    .format_as_ical(
+                        &mut value,
+                        &calcard::icalendar::ICalendarValueType::DateTime,
+                    )
+                    .unwrap();
+                value
+            };
+            assert_eq!(value_of(ICalendarProperty::RecurrenceId), rid, "{text}");
+            assert_eq!(value_of(ICalendarProperty::Dtstart), rid, "{text}");
+            assert_eq!(
+                comp.property(&ICalendarProperty::Attendee)
+                    .and_then(|entry| entry.values.first())
+                    .and_then(|value| value.as_text()),
+                Some(format!("mailto:{BOB}").as_str()),
+                "{text}"
+            );
+            assert!(
+                matches!(&cancel.summary, ItipSummary::Cancel(fields)
+                    if fields.iter().any(|field| matches!(&field.value,
+                        ItipValue::Time(time) if time.start == date))),
+                "{summary}"
+            );
+        }
+        assert!(
+            matches!(&cancel.summary, ItipSummary::Cancel(fields)
+                if fields.len() == 2
+                    && fields.iter().all(|field| field.name == ICalendarProperty::Dtstart)),
+            "{summary}"
+        );
+    }
+
+    /// Upgrade ruling 153: bob's slice is empty (he DECLINED Z, his only
+    /// instance, without SCHEDULE-FORCE-SEND, or has RSVP=FALSE there), yet
+    /// the recorded removals are replayed to him, a CANCEL alone; where the
+    /// tree marks him SCHEDULE-AGENT=CLIENT or NONE nothing is sent.
+    #[test]
+    fn a_recorded_removal_is_replayed_without_a_slice() {
+        const ON_Z: &str = "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:key2@example.com";
+        let base = removal_event(&["key3@example.com"], &["key3@example.com"]).to_string();
+        assert_eq!(base.matches(ON_Z).count(), 1, "{base}");
+        let recorded_xw = recorded(&[D, A]);
+        for line in [
+            "ATTENDEE;PARTSTAT=DECLINED:mailto:key2@example.com",
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=FALSE:mailto:key2@example.com",
+        ] {
+            let tree = parse(&base.replace(ON_Z, line));
+            assert!(
+                za_full_request_for(&tree, &alice(), BOB, policy())
+                    .unwrap()
+                    .is_empty(),
+                "{line}: the slice is empty"
+            );
+            let messages = za_full_state_for(&tree, &alice(), BOB, &recorded_xw, policy())
+                .expect("no split error");
+            assert_eq!(messages.len(), 1, "{line}");
+            assert_eq!(
+                (
+                    itip_method(&messages[0].message).ok(),
+                    messages[0].to.clone()
+                ),
+                (Some(&ICalendarMethod::Cancel), vec![BOB.to_string()]),
+                "{line}"
+            );
+            assert_eq!(
+                components_of(&messages[0]),
+                [(Some(A), 3), (Some(D), 1)],
+                "{line}"
+            );
+        }
+        for agent in ["CLIENT", "NONE"] {
+            let line = format!(
+                "ATTENDEE;SCHEDULE-AGENT={agent};PARTSTAT=DECLINED:mailto:key2@example.com"
+            );
+            let tree = parse(&base.replace(ON_Z, &line));
+            assert!(
+                za_full_state_for(&tree, &alice(), BOB, &recorded_xw, policy())
+                    .unwrap()
+                    .is_empty(),
+                "{agent}: the server does not schedule for him"
+            );
+        }
     }
 
     /// Upgrade ruling 135 (M10): the split's error is returned, not read as
