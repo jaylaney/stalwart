@@ -11056,9 +11056,50 @@ pub async fn revoke_cleanup_does_not_rewrite_sealed_event(test: &mut TestServer)
     )
     .await
     .expect(200);
+    // Upgrade ruling 128: give the cleanup something to rewrite at the
+    // point the key-owner skip protects. `one.ics` gets a per-user
+    // preference of the grantee, who has lost access, in its content
+    // archive: upstream's cleanup stages exactly such an event and rewrites
+    // its content without the preference. With the skip disabled the
+    // assertions below fail on the bytes, the ETag and the change log.
+    let planted = {
+        use crate::utils::za::{stored_event, write_stored_event};
+        let stored = stored_event(test, owner_id, ids[0]).await;
+        let mut event = stored.za_event();
+        event
+            .content
+            .preferences
+            .push(groupware::calendar::EventPreferences {
+                account_id: reader_id,
+                updated: store::write::now() as i64,
+                instances: vec![],
+            });
+        write_stored_event(test, owner_id, ids[0], &stored, event).await;
+        ids[0]
+    };
+    let grantee_preference = |stored: &crate::utils::za::StoredEvent| {
+        stored
+            .content
+            .unarchive::<groupware::calendar::CalendarEventContent>()
+            .unwrap()
+            .preferences
+            .iter()
+            .any(|pref| pref.account_id.to_native() == reader_id)
+    };
+    assert!(grantee_preference(
+        &crate::utils::za::stored_event(test, owner_id, planted).await
+    ));
+    let change_id = || async {
+        test.server
+            .store()
+            .get_last_change_id(owner_id, SyncCollection::Calendar.into())
+            .await
+            .unwrap()
+    };
     // The state the revoke's own commit left (a revoke may rewrap; the
     // cleanup must not write at all), taken while the queued cleanup waits.
     let revoked_state = revoke_snapshot(test, owner_id, &ids).await;
+    let revoked_change = change_id().await;
     println!(
         "revoke-sealed: the revoke queued {} cleanup task(s); its own commit {} the events",
         revoke_cleanup_tasks(test, owner_id).await,
@@ -11096,6 +11137,15 @@ pub async fn revoke_cleanup_does_not_rewrite_sealed_event(test: &mut TestServer)
         revoke_snapshot(test, owner_id, &ids).await,
         revoked_state,
         "the grantee cleanup rewrote a key account's sealed event"
+    );
+    assert_eq!(
+        change_id().await,
+        revoked_change,
+        "the grantee cleanup logged a change to a key account's calendar"
+    );
+    assert!(
+        grantee_preference(&crate::utils::za::stored_event(test, owner_id, planted).await),
+        "the grantee cleanup removed the planted preference"
     );
     for (index, name) in ["one.ics", "two.ics"].into_iter().enumerate() {
         let got = owner

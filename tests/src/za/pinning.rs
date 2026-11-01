@@ -861,6 +861,7 @@ async fn case_11_ordinary_delivery(test: &TestServer) {
     case_11_master_removal(test).await;
     case_11_delete(test).await;
     case_11_withheld_then_declined(test).await;
+    case_11_withheld_override_removal(test).await;
 }
 
 /// Case 11, Reply (`pin-11r`): bob's DECLINED refused; his ACCEPTED then
@@ -1686,6 +1687,229 @@ async fn case_11_withheld_then_declined(test: &TestServer) {
     delete_event(&alice, &path).await;
     alice.delete_items_since(test, &alice_start).await;
     clear_recipient(test, &bob, &bob_start, "pin-11w").await;
+}
+
+/// Case 11, Withheld override removal (`pin-11o`, `pin-11o2`, upgrade
+/// ruling 132): bob on overrides X and Z but not the master, carol on the
+/// master and X, both holding a copy. bob's key changes, so alice's change
+/// removing bob and carol from X withholds bob's CANCEL of X (his entry
+/// records X), while carol, an ordinary attendee, gets hers directly. bob's
+/// full state cannot carry the removal (his slice is Z alone, without the
+/// master), so it is followed by a CANCEL of X: (`pin-11o`) after a
+/// `contacts/pin` redelivery; (`pin-11o2`) instead, ahead of alice's later
+/// change to Z, whose partial would otherwise cover bob. In both, bob's
+/// copy ends with X cancelled or absent and no longer listing him, as
+/// carol's ends with X cancelled.
+async fn case_11_withheld_override_removal(test: &TestServer) {
+    const Z: &str = "20990304T100000Z";
+    const X_KEY: (i64, bool) = (4_076_128_800, false);
+    let lists = |ical: &ICalendar, recurrence_id: Option<&str>, address: &str| {
+        instance_of(ical, recurrence_id).is_some_and(|component| {
+            component.entries.iter().any(|entry| {
+                entry.name == ICalendarProperty::Attendee
+                    && entry
+                        .values
+                        .first()
+                        .and_then(|value| value.as_text())
+                        .is_some_and(|value| {
+                            value
+                                .trim_start_matches("mailto:")
+                                .eq_ignore_ascii_case(address)
+                        })
+            })
+        })
+    };
+    let (alice, bob, carol) = parties(test);
+    for uid in ["pin-11o", "pin-11o2"] {
+        let (bob_start, carol_start) = (
+            inbox_ids(test, bob.id).await,
+            inbox_ids(test, carol.id).await,
+        );
+        let path = event_path(&alice, uid);
+        alice
+            .client
+            .request_with_headers(
+                "PUT",
+                &path,
+                [CONTENT_TYPE],
+                with_override(
+                    &recurring_invite(uid, &[CAROL], &[BOB, CAROL]),
+                    uid,
+                    Z,
+                    "",
+                    &[BOB],
+                ),
+            )
+            .await
+            .with_status(StatusCode::CREATED);
+        assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+        assert_eq!(trigger_drain(CAROL, STRONG).await, 207);
+        let bob_copy = copy_href(test, bob.id, uid).await;
+        let carol_copy = copy_href(test, carol.id, uid).await;
+        assert!(
+            lists(&parse(&body(&bob.client, &bob_copy).await), Some(X), BOB),
+            "{uid}: bob's copy lists him on X"
+        );
+
+        // bob's key changes; alice removes bob and carol from X.
+        let original = substitute_public_key(test, bob.id, &writer_key(), true).await;
+        let carol_before = inbox_ids(test, carol.id).await;
+        assert_eq!(
+            rewrite(&alice.client, &path, |body| edit_override(
+                &body,
+                X,
+                |line| {
+                    let lower = line.to_ascii_lowercase();
+                    if line.starts_with("ATTENDEE")
+                        && (lower.ends_with(&format!("mailto:{BOB}"))
+                            || lower.ends_with(&format!("mailto:{CAROL}")))
+                    {
+                        None
+                    } else {
+                        Some(line.to_string())
+                    }
+                }
+            ))
+            .await,
+            StatusCode::NO_CONTENT
+        );
+        let entries = withheld(test, alice.id, BOB).await;
+        assert_eq!(entries.len(), 1, "{uid}");
+        assert_eq!(
+            (
+                entries[0].instances.master,
+                entries[0].instances.keys.clone(),
+                entries[0].instances.all
+            ),
+            (false, vec![X_KEY], false),
+            "{uid}: the organizer-side entry records the withheld CANCEL's X"
+        );
+        // carol, an ordinary attendee, gets the CANCEL directly.
+        assert_eq!(
+            methods(&opened(test, carol.id, &carol_before).await),
+            [Some(ICalendarMethod::Cancel)],
+            "{uid}"
+        );
+        assert_eq!(trigger_drain(CAROL, STRONG).await, 207);
+        assert_eq!(
+            status_in(&carol.client, &carol_copy, Some(X)).await,
+            Some(ICalendarStatus::Cancelled),
+            "{uid}: X cancelled for carol"
+        );
+        substitute_public_key(test, bob.id, &original, true).await;
+
+        let before = inbox_ids(test, bob.id).await;
+        let items = if uid == "pin-11o" {
+            let fp = display_fingerprint(&served(test, bob.id).await);
+            // Upgrade ruling 135 (M10): under one outbound recipient the
+            // full state's split errs; that is a failure, not "nothing to
+            // send", so the entry stays.
+            let admin = test.account("admin@example.com").clone();
+            admin
+                .registry_update_setting(
+                    CalendarScheduling {
+                        max_recipients: 1,
+                        ..Default::default()
+                    },
+                    &[Property::MaxRecipients],
+                )
+                .await;
+            admin.reload_settings().await;
+            let reply = pin(ALICE, BOB, &fp).await.expect(200);
+            admin
+                .registry_update_setting(CalendarScheduling::default(), &[Property::MaxRecipients])
+                .await;
+            admin.reload_settings().await;
+            assert_eq!(
+                (reply["failed"].clone(), reply["dropped"].clone()),
+                (serde_json::json!(1), serde_json::json!(0)),
+                "{uid}: a split error is a failure: {reply:?}"
+            );
+            assert_eq!(withheld(test, alice.id, BOB).await.len(), 1, "{uid}: kept");
+            assert!(opened(test, bob.id, &before).await.is_empty());
+            assert_eq!(pin(ALICE, BOB, &fp).await.expect(200)["delivered"], 1);
+            let items = opened(test, bob.id, &before).await;
+            assert_eq!(
+                methods(&items),
+                [
+                    Some(ICalendarMethod::Request),
+                    Some(ICalendarMethod::Cancel)
+                ],
+                "{uid}: the slice, then X's CANCEL"
+            );
+            items
+        } else {
+            assert_eq!(
+                rewrite(&alice.client, &path, |body| edit_override(
+                    &body,
+                    Z,
+                    |line| {
+                        Some(line.replace(
+                            &format!("SUMMARY:fo-title {uid}"),
+                            &format!("SUMMARY:fo-title {uid} Z v2"),
+                        ))
+                    }
+                ))
+                .await,
+                StatusCode::NO_CONTENT
+            );
+            let items = opened(test, bob.id, &before).await;
+            assert_eq!(
+                methods(&items),
+                [
+                    Some(ICalendarMethod::Request),
+                    Some(ICalendarMethod::Cancel),
+                    Some(ICalendarMethod::Request)
+                ],
+                "{uid}: the slice and X's CANCEL, then the Z partial"
+            );
+            assert!(
+                instance_of(&items[2], Some(Z)).is_some()
+                    && instance_of(&items[2], Some(X)).is_none(),
+                "{uid}: the Z partial: {}",
+                items[2]
+            );
+            items
+        };
+        assert!(
+            instance_of(&items[0], Some(Z)).is_some()
+                && instance_of(&items[0], Some(X)).is_none()
+                && instance_of(&items[0], None).is_none(),
+            "{uid}: the slice is Z alone: {}",
+            items[0]
+        );
+        assert!(
+            instance_of(&items[1], Some(X)).is_some()
+                && instance_of(&items[1], Some(Z)).is_none()
+                && instance_of(&items[1], None).is_none()
+                && !lists(&items[1], Some(X), BOB),
+            "{uid}: X's CANCEL, listing nobody: {}",
+            items[1]
+        );
+        assert!(withheld(test, alice.id, BOB).await.is_empty(), "{uid}");
+
+        assert_eq!(trigger_drain(BOB, STRONG).await, 207);
+        let copy = parse(&body(&bob.client, &bob_copy).await);
+        assert!(
+            instance_of(&copy, Some(X)).is_none_or(|component| {
+                component.status() == Some(&ICalendarStatus::Cancelled)
+            }),
+            "{uid}: X cancelled or absent for bob: {copy}"
+        );
+        assert!(
+            !lists(&copy, Some(X), BOB),
+            "{uid}: bob's copy no longer lists him on X: {copy}"
+        );
+        assert!(lists(&copy, Some(Z), BOB), "{uid}: bob keeps Z: {copy}");
+        if uid == "pin-11o2" {
+            assert!(copy.to_string().contains("Z v2"), "{uid}: {copy}");
+        }
+
+        // Cleanup.
+        delete_event(&alice, &path).await;
+        clear_recipient(test, &bob, &bob_start, uid).await;
+        clear_recipient(test, &carol, &carol_start, uid).await;
+    }
 }
 
 /// Spec 9 case 12 (spec 5.1): partial changes to the existing overrides A

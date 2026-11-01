@@ -1480,8 +1480,102 @@ pub async fn test_reply(test: &mut TestServer) {
         "a reply from the wrong principal applied"
     );
 
+    // 11. The delegate's invitation is the delegate's slice (upgrade ruling
+    // 131): key1's recurring event invites key2 to the series and to an
+    // override of the second occurrence that key3 does not attend. key2
+    // delegates the series (the master) to key3; key1's drain builds the
+    // full REQUEST for key3 and splits it as 1.0 splits upstream's own
+    // messages, so key3's item holds the master only, not the override.
+    let uid11 = "za-drain-r11";
+    let organizer11 = format!("{KEY1_CAL}drain-r11.ics");
+    let recurring11 = invite(uid11, START_A, &["key2@example.com"])
+        .replace(
+            "DURATION:PT1H\r\n",
+            "DURATION:PT1H\r\nRRULE:FREQ=DAILY;COUNT=5\r\n",
+        )
+        .replace(
+            "END:VEVENT\r\nEND:VCALENDAR\r\n",
+            &format!(
+                concat!(
+                    "END:VEVENT\r\nBEGIN:VEVENT\r\nUID:{uid}\r\n",
+                    "DTSTAMP:20240101T000000Z\r\nRECURRENCE-ID:{start}\r\n",
+                    "DTSTART:{start}\r\nDURATION:PT1H\r\nSEQUENCE:0\r\n",
+                    "SUMMARY:fo-title {uid} override\r\nORGANIZER:mailto:key1@example.com\r\n",
+                    "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:key2@example.com\r\n",
+                    "END:VEVENT\r\nEND:VCALENDAR\r\n"
+                ),
+                uid = uid11,
+                start = START_B
+            ),
+        );
+    key1.client
+        .request_with_headers("PUT", &organizer11, [CONTENT_TYPE], recurring11)
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    let copy11 = copy_href(test, key2.id, uid11).await;
+    // key2's master only: its ATTENDEE delegated, key3 added beside it.
+    let delegated11 = body(&key2.client, &copy11)
+        .await
+        .replace("\r\n ", "")
+        .split("BEGIN:VEVENT")
+        .enumerate()
+        .map(|(at, part)| {
+            if at == 0 || part.contains("RECURRENCE-ID") {
+                part.to_string()
+            } else {
+                part.replace(
+                    "PARTSTAT=NEEDS-ACTION",
+                    "PARTSTAT=DELEGATED;DELEGATED-TO=\"mailto:key3@example.com\"",
+                )
+                .replace(
+                    "END:VEVENT",
+                    "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;DELEGATED-FROM=\"mailto:key2@example.com\":mailto:key3@example.com\r\nEND:VEVENT",
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("BEGIN:VEVENT");
+    key2.client
+        .request_with_headers("PUT", &copy11, [CONTENT_TYPE], delegated11)
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    assert_eq!(pending_ids(test, key1.id).await.len(), 1);
+    let before3 = inbox_ids(test, key3.id).await;
+    assert_eq!(trigger_drain(key1.name, STRONG).await, 207);
+    let key3_items = new_inbox_items(test, key3.id, &before3).await;
+    assert_eq!(
+        key3_items.len(),
+        1,
+        "key3 has exactly one new item: the organizer's series invitation"
+    );
+    let (item11, _) = open_pending_item_as(test, key3.id, STRONG, key3_items[0].0).await;
+    let item11_text = item11.to_string();
+    let vevents: Vec<_> = item11
+        .components
+        .iter()
+        .filter(|component| component.component_type.is_scheduling_object())
+        .collect();
+    assert_eq!(
+        vevents.len(),
+        1,
+        "the delegate's item holds only its instances: {item11_text}"
+    );
+    assert!(
+        !vevents[0].is_recurrence_override(),
+        "the delegate's one instance is the master: {item11_text}"
+    );
+    assert!(
+        !item11_text.contains("override"),
+        "the delegate's item carries the override it does not attend: {item11_text}"
+    );
+    assert!(pending_ids(test, key1.id).await.is_empty());
+    assert_eq!(trigger_drain(key3.name, STRONG).await, 207);
+
     // Cleanup.
     for (party, uid) in [
+        (&key2, uid11),
+        (&key3, uid11),
         (&key2, uid),
         (&key2, uid2),
         (&key2, uid3),
@@ -1503,8 +1597,15 @@ pub async fn test_reply(test: &mut TestServer) {
             .with_status(StatusCode::NO_CONTENT);
     }
     for name in [
-        "drain-r1", "drain-r2", "drain-r3", "drain-r4", "drain-r5", "drain-r7", "drain-r8",
+        "drain-r1",
+        "drain-r2",
+        "drain-r3",
+        "drain-r4",
+        "drain-r5",
+        "drain-r7",
+        "drain-r8",
         "drain-r9",
+        "drain-r11",
     ] {
         key1.client
             .request_with_headers("DELETE", &format!("{KEY1_CAL}{name}.ics"), [NO_REPLY], "")
