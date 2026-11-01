@@ -8574,6 +8574,119 @@ used the uncommitted `ZA_ONLY` selector (`task-7f2/selector.py`) with
   net:** `system::oidc` (`oidc.rs:824`, the device flow's valid-code login), and
   `smtp::inbound::antispam` (N27's TLS close). Neither touches fork code changed here.
 
+## Task 8
+
+### Part 8a: the OSS product binary and the local-server scripts
+
+Run on 2026-11-01 at `47cf1e710` (code `6fd9a131f`), Apple Silicon (arm64), Rust 1.99.0.
+
+#### The build
+
+- Command, in its own Cargo process (no harness build ran alongside it):
+  `cargo build --release --locked -p stalwart --no-default-features --features rocks`.
+  `--locked` only asserts that `Cargo.lock` is unchanged. The build was cold for the release
+  profile (fat LTO, one codegen unit): 1,351 s wall clock (22.5 minutes; user 2,541 s),
+  exit 0, no warnings.
+- The binary: `target/release/stalwart`, 83,156,944 bytes (79 MiB), Mach-O arm64, SHA-256
+  `abc99657ca43e8e0aca7b7e89c03883545c2f7fd015950a744a515fa8a4f0054`. `--version` prints
+  `Stalwart Server fork v0.1.1-beta.1 (upstream v0.16.27 aa47d8ef…; source 47cf1e710…; clean)`:
+  `fork-release.toml` still names the 0.16.27 base, which Task 9 updates (its Interfaces).
+- **Feature graph** (`cargo tree --locked -e features -p stalwart --no-default-features
+  --features rocks`, and the per-package list `-e normal,build -f '{p} [{f}]'`): no
+  `enterprise`, `test_mode`, `za_test`, `dns-update/test_provider` or `mail-auth/test`
+  anywhere (none of these strings occurs in the 5,817-line tree). Every workspace crate
+  builds with no features except `stalwart [rocks]` and `store [num_cpus, rayon, rocks,
+  rocksdb]`; `vault`, `common`, `store`, `http` and `groupware` carry none. `dev_mode` is
+  off. The graph includes `scim` and `scim-proto`, as upstream 1.0.1's OSS build and the
+  fork's 0.16 base did (`main` and `http` depend on `scim`, which depends on `scim-proto`).
+  Every `scim` module is `cfg(feature = "enterprise")`; `scim-proto` compiles but nothing
+  outside `scim`'s gated modules references it, and the binary holds none of its strings
+  (the one `application/scim+json` is `types`' media-type catalogue).
+- **Edition and database version.** From the code: `common/src/lib.rs` sets
+  `DATABASE_SCHEMA_VERSION_BASE = 7` (1.0.0) and `DATABASE_SCHEMA_OSS_FLAG = 1 << 31`; the
+  build without `enterprise` writes `7 | OSS_FLAG = 0x80000007`, a build with it writes `7`.
+  `Server::verify_schema_version` (`common/src/manager/schema.rs`, called from `main` after
+  boot) writes the value on a new install, as a big-endian `u32` under key `[0x00]`
+  (`SystemKind::SchemaVersion`) in subspace `System` (`u`), and refuses any other value:
+  the other edition, a pre-1.0 store, or a newer one. From a fresh store: after the first
+  recovery boot, the write-ahead log holds a put to column family 26, which the manifest
+  maps to `u`, of key `00` and value `80 00 00 07` (base 7, OSS flag set). Every later
+  normal boot of that store passed the check.
+
+#### Script changes
+
+Commits `b043efaec`, `4858fa463`, `9746f89e2` and `429930fea`.
+
+- `provision.sh`: 1.0's registry field names, `NetworkListener.implicitTls` (was
+  `tlsImplicit`) and `Domain.enable` (was `isEnabled`). The 1.0 server refuses the old names
+  ("Invalid key for object"), so the 0.16 script created no listener and no domain.
+- `env.sh`, `tls-cert.sh`: the default `ZA_RUN_DIR` is `.run-1.0/` (git-ignored by `.*`),
+  so the scripts never reach the 0.16 `.run/`.
+- `provision.sh`, `start.sh`: the IMAP listener offers STARTTLS (`useTls: true`,
+  `implicitTls: false`). IMAP refuses a login without TLS (`LOGINDISABLED`;
+  `Imap.allowPlainTextAuth` defaults to off at 1.0 as at 0.16), and the listener had no
+  TLS, so no IMAP login was possible on the local server. This is a behaviour change of the
+  script, needed for the smoke's IMAP logins; it is not a 1.0 regression.
+- `leakcheck.sh`: at 1.0 the server compresses its archives with zstd, most against the
+  dictionaries in `resources/zstd/`, and RocksDB compresses 23 of 27 column families' blocks
+  with LZ4. The 0.16 byte search, run on the smoke's store, found neither the ordinary
+  account's event title (its positive control) nor `X-ZA-KEY`, so its zeros meant nothing.
+  The script now searches each file's raw bytes, every LZ4 block it finds in the `.sst` and
+  `.blob` files (RocksDB's form, a varint32 size then the body; every offset is tried and a
+  body counts only if it decodes to exactly that size) and every zstd frame in either, and
+  reports the frames it could not decode. Its checks and output lines are unchanged, plus
+  that report. It needs Python 3.14 or later (`compression.zstd`).
+- `smoke.sh`, `gatecheck.sh`, `gatecheck3.sh`, `start-recovery.sh`: unchanged; they ran
+  as they are.
+- README: the shipping build, the new state directory and why a 0.16 store cannot be
+  reused, the edition stamp, trusting the new certificate, STARTTLS, the renamed fields, the
+  1.0 scan. `CLAUDE.md`'s local-run line names `.run-1.0/` (nothing else in it changed).
+
+#### Smoke results
+
+Fresh `ZA_RUN_DIR` `.run-1.0/` in the worktree. A first pass found the IMAP and scan gaps
+above; after the fixes the directory was deleted and every step rerun from nothing, on the
+committed scripts. That second run:
+
+1. `tls-cert.sh`: certificate and key written (key 0600). The trust command was not run.
+2. `start-recovery.sh` then `provision.sh`: three listeners, the domain, the certificate,
+   the settings update (`ok`), `alice` and `plain` created.
+3. Stopped with SIGINT (clean, 2 s), restarted with `start.sh`: listeners on 8080, 8443 and
+   1143; the store opened.
+4. `smoke.sh` (bob): every line as expected (207, 401, 207, 207, 401, 207, recovery 207,
+   registry password edit refused). `gatecheck.sh` for alice and for bob: 403, 403, 405,
+   207 (address book), 403, all as expected. `gatecheck3.sh`: every check as expected except
+   check 1 (alice gets `calendar-auto-schedule`), check 6 (alice's schedule inbox and outbox
+   URLs answer 200) and 8a (a `Schedule-Tag` is returned), which are the README's recorded
+   historical expectations since plan 10 reopened the scheduling gates.
+
+By hand:
+
+- Accounts: `x:Account/get` lists `alice`, `bob` and `plain`, all `User`. `plain` holds a
+  password and its `setup-token` is refused (409); `alice` has none.
+- alice's setup flow: `setup-token` issued, `setup` 200; a replay of the token 409.
+- CalDAV PUT then GET, for plain and alice: 201, then 200 with the summary and UID read
+  back.
+- IMAP over `::1` (another program holds `127.0.0.1:1143`): before STARTTLS the server
+  advertises `LOGINDISABLED STARTTLS`; after it, LOGIN OK for plain and for alice.
+- IMAP APPEND then FETCH `BODY[]`: OK and read back byte for byte, for both accounts.
+- After a further stop and restart, both accounts' event and message read back.
+- `leakcheck.sh`: alice's event title, mail subject and body and gatecheck3's alice canary
+  in 0 files; plain's event title, mail subject and body and gatecheck3's plain canary in 1
+  file each; `X-ZA-KEY` in 1 file; 50 LZ4 blocks and 8 zstd frames decoded, 0 undecodable.
+- No credential appears in the server logs.
+
+#### Held, and notes for the other parts
+
+- Nothing in the product failed.
+- For 8b: `tests/caldav_client/runner.py:303` creates its domain with `isEnabled`, which
+  1.0 refuses; its listener create already omits `tlsImplicit`.
+- `fork-release.toml`'s upstream tag and commit (0.16.27) reach `--version` and the boot
+  trace; Task 9 owns them.
+- The scan's decoding is a heuristic over RocksDB's on-disk forms, not a reader of the SST
+  format: a block it cannot find stays unread, though the positive control and the
+  undecodable-frame count bound that.
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
