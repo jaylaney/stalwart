@@ -243,6 +243,7 @@ fn generation(event: &ZaEvent) -> u32 {
 }
 
 pub async fn test(test: &mut TestServer) {
+    propfind_admission_races(test).await;
     grantee_http_write_races(test).await;
     sharing_http_races(test).await;
     sharing_destruction_contracts(test).await;
@@ -4440,4 +4441,231 @@ async fn calendar_dead_property_last_writer_wins(
         .await
         .with_status(StatusCode::NO_CONTENT);
     admin.destroy_account(plain).await;
+}
+
+/// Ruling 142: a grantee's PROPFIND parked at `PROPFIND_ADMITTED_PAUSE`, after
+/// `foreign_calendar_contexts` admitted the granted calendar and before any
+/// item is read, while the owner (i) revokes the grant or (ii) deletes the
+/// calendar. Each form (allprop, a named prop, propname) runs against the
+/// owner's home (a home listing) and against the calendar itself. A deletion
+/// serves nothing of the calendar or its event; after either change a new
+/// request is refused (403). The in-flight answer to a revocation is
+/// held for a ruling (part 7f3): items are read through the admission memo,
+/// so the refusal arms (`refusal`, `za_propname_item`'s Forbidden-in-a-home-
+/// listing and `Err` arms) are not reached from this race.
+async fn propfind_admission_races(test: &mut TestServer) {
+    use crate::utils::za::{sharing_dav_request, za_post};
+    use serde_json::json;
+    const USER: &str = "race-propfind-owner@example.com";
+    const READER: &str = "race-propfind-reader@example.com";
+    const HOME: &str = "/dav/cal/race-propfind-owner%40example.com/";
+    const ALLPROP: &str = "<D:propfind xmlns:D=\"DAV:\"><D:allprop/></D:propfind>";
+    const PROP: &str = "<D:propfind xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\" xmlns:X=\"urn:x-race-propfind\"><D:prop><D:displayname/><D:getetag/><C:calendar-data/><X:note/></D:prop></D:propfind>";
+    const PROPNAME: &str = "<D:propfind xmlns:D=\"DAV:\"><D:propname/></D:propfind>";
+    const CANARIES: [&str; 5] = [
+        "race-propfind-calendar-name",
+        "race-propfind-summary",
+        "race-propfind-note",
+        "urn:x-race-propfind",
+        "event.ics",
+    ];
+    println!("Running PROPFIND admission races...");
+    let admin = test.account("admin@example.com").clone();
+    for name in [USER, READER] {
+        let account = admin
+            .create_key_user_account(name, STRONG, name, &[], user_permissions())
+            .await;
+        test.insert_account(account);
+    }
+    let owner_id = test.account(USER).id().document_id();
+    let reader_id = test.account(READER).id().document_id();
+    let owner = DummyWebDavClient::new(owner_id, USER, STRONG, USER);
+    let key = test
+        .server
+        .za_served_public_key(reader_id)
+        .await
+        .unwrap()
+        .unwrap();
+    super::pinning::pin(USER, READER, &vault::keys::display_fingerprint(&key))
+        .await
+        .expect(200);
+    let mut failures = Vec::new();
+    for change in ["revoke", "delete"] {
+        for (form, body) in [("allprop", ALLPROP), ("prop", PROP), ("propname", PROPNAME)] {
+            for target in ["home", "calendar"] {
+                let slug = format!("race-propfind-{change}-{form}-{target}");
+                let calendar_path = format!("{HOME}{slug}/");
+                let event_path = format!("{calendar_path}event.ics");
+                owner
+                    .request(
+                        "MKCALENDAR",
+                        &calendar_path,
+                        &MKCAL.replace(">Race<", ">race-propfind-calendar-name<"),
+                    )
+                    .await
+                    .with_status(StatusCode::CREATED);
+                owner
+                    .request_with_headers(
+                        "PUT",
+                        &event_path,
+                        [("content-type", "text/calendar")],
+                        &super::sharing::sharing_event(&format!("{slug}-uid"))
+                            .replace("share-read-private-summary", "race-propfind-summary"),
+                    )
+                    .await
+                    .with_status(StatusCode::CREATED);
+                for path in [&calendar_path, &event_path] {
+                    owner
+                        .request(
+                            "PROPPATCH",
+                            path,
+                            "<D:propertyupdate xmlns:D=\"DAV:\" xmlns:X=\"urn:x-race-propfind\"><D:set><D:prop><X:note>race-propfind-note</X:note></D:prop></D:set></D:propertyupdate>",
+                        )
+                        .await
+                        .with_status(StatusCode::MULTI_STATUS);
+                }
+                za_post(
+                    "shares/grant",
+                    &json!({"username":USER,"password":STRONG,"calendar":slug,"address":READER,"level":"view"}),
+                )
+                .await
+                .expect(200);
+                let path = if target == "home" {
+                    HOME.to_string()
+                } else {
+                    calendar_path.clone()
+                };
+                // The control: before the change, the same request serves the
+                // calendar, its event and both dead properties' names.
+                let control =
+                    sharing_dav_request(READER, "PROPFIND", &path, &[("depth", "1")], body).await;
+                if control.status != StatusCode::MULTI_STATUS
+                    || !control.body.contains(if target == "home" {
+                        &calendar_path
+                    } else {
+                        &event_path
+                    })
+                    || (form != "allprop" && !control.body.contains("urn:x-race-propfind"))
+                {
+                    failures.push(format!(
+                        "{slug}: control {}: {}",
+                        control.status, control.body
+                    ));
+                }
+                let parked =
+                    HookParked::start(reader_id, test_hooks::set_propfind_admitted_pause, {
+                        let path = path.clone();
+                        async move {
+                            sharing_dav_request(READER, "PROPFIND", &path, &[("depth", "1")], body)
+                                .await
+                        }
+                    })
+                    .await;
+                if change == "revoke" {
+                    za_post(
+                        "shares/revoke",
+                        &json!({"username":USER,"password":STRONG,"calendar":slug,"grant":reader_id}),
+                    )
+                    .await
+                    .expect(200);
+                } else {
+                    owner
+                        .request_with_headers(
+                            "DELETE",
+                            &calendar_path,
+                            [super::fanout::NO_REPLY],
+                            "",
+                        )
+                        .await
+                        .with_status(StatusCode::NO_CONTENT);
+                }
+                let response = parked.finish().await;
+                let served = CANARIES
+                    .into_iter()
+                    .filter(|canary| response.body.contains(canary))
+                    .collect::<Vec<_>>();
+                println!(
+                    "propfind race {slug}: in flight {}, served {served:?}",
+                    response.status
+                );
+                if change == "delete" {
+                    // Nothing of the deleted calendar or its event is served:
+                    // no name, content or dead property (value, or name in a
+                    // propname listing); allprop and prop answer each of the
+                    // admitted hrefs 404. Propname still lists the admitted
+                    // hrefs with the static property names alone (no store
+                    // read decides them), held for a ruling with the
+                    // revocation below.
+                    let data = served
+                        .iter()
+                        .filter(|canary| {
+                            **canary != "event.ics"
+                                && (form == "propname" || **canary != "urn:x-race-propfind")
+                        })
+                        .collect::<Vec<_>>();
+                    let found = [&calendar_path, &event_path]
+                        .into_iter()
+                        .filter(|path| target == "calendar" || **path == calendar_path)
+                        .any(|path| {
+                            let item = super::sharing::response_of(&response.body, path);
+                            !item.is_empty() && item.contains("200 OK")
+                        });
+                    if response.status != StatusCode::MULTI_STATUS
+                        || !data.is_empty()
+                        || (form != "propname" && found)
+                    {
+                        failures.push(format!(
+                            "{slug}: in flight {}, served {data:?}: {}",
+                            response.status, response.body
+                        ));
+                    }
+                } else {
+                    // Held for a ruling (part 7f3): the request admitted before
+                    // the revocation is answered from its admission memo, so
+                    // `refusal` and `za_propname_item`'s arms do not run and
+                    // the calendar is served in full. The ruling-strength
+                    // assertion is kept in the plan workspace
+                    // (`task-7f3/case-ruling-strength.diff`).
+                    println!("propfind race {slug}: held for a ruling");
+                }
+                // A request after the change is refused before admission: the
+                // reader holds no other grant on the owner, so the URI gate
+                // answers 403 for the home and for the calendar alike, and a
+                // deleted calendar's existence is not disclosed.
+                let after =
+                    sharing_dav_request(READER, "PROPFIND", &path, &[("depth", "1")], body).await;
+                let refused = after.status == StatusCode::FORBIDDEN && !after.body.contains(&slug);
+                if !refused {
+                    failures.push(format!(
+                        "{slug}: after the change {}: {}",
+                        after.status, after.body
+                    ));
+                }
+                if change == "revoke" {
+                    owner
+                        .request_with_headers(
+                            "DELETE",
+                            &calendar_path,
+                            [super::fanout::NO_REPLY],
+                            "",
+                        )
+                        .await
+                        .with_status(StatusCode::NO_CONTENT);
+                }
+            }
+        }
+    }
+    owner
+        .request("DELETE", &format!("{HOME}default/"), "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    DummyWebDavClient::new(reader_id, READER, STRONG, READER)
+        .delete_default_containers()
+        .await;
+    test.wait_for_tasks().await;
+    assert!(
+        failures.is_empty(),
+        "PROPFIND admission races (ruling 142):\n{}",
+        failures.join("\n")
+    );
 }

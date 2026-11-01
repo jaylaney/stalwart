@@ -11259,7 +11259,7 @@ async fn container_note(client: &DummyWebDavClient, path: &str) -> String {
 
 /// The `response` element of a multistatus `body` whose `href` is `path`,
 /// or an empty string.
-fn response_of<'x>(body: &'x str, path: &str) -> &'x str {
+pub(super) fn response_of<'x>(body: &'x str, path: &str) -> &'x str {
     body.split(":response>")
         .find(|response| response.contains(&format!(">{path}<")))
         .unwrap_or_default()
