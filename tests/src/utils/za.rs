@@ -1303,6 +1303,111 @@ impl<T> Drop for HookParked<T> {
     }
 }
 
+/// Upgrade ruling 156: one of `common::za::test_hooks`' pause slots, as the
+/// test found it, restored when the guard drops (also when the test panics),
+/// so a slot the test armed and a failure left set cannot park a later
+/// module's request. The value restored is the prior one, not `None`. A pause
+/// still armed in the slot at the drop, other than the prior one, is
+/// released first, so a request parked on it does not stay parked.
+#[must_use = "dropping the guard restores the slot"]
+pub struct PauseSlotGuard {
+    slot: &'static std::sync::Mutex<Option<Arc<HookPause>>>,
+    prior: Option<Arc<HookPause>>,
+}
+
+impl PauseSlotGuard {
+    pub fn new(slot: &'static std::sync::Mutex<Option<Arc<HookPause>>>) -> Self {
+        let prior = slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        PauseSlotGuard { slot, prior }
+    }
+}
+
+impl Drop for PauseSlotGuard {
+    fn drop(&mut self) {
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(armed) = slot.as_ref()
+            && !self
+                .prior
+                .as_ref()
+                .is_some_and(|prior| Arc::ptr_eq(prior, armed))
+        {
+            armed.release.notify_one();
+        }
+        *slot = self.prior.take();
+    }
+}
+
+/// Upgrade ruling 156: `CalendarScheduling`'s `max_recipients` set for the
+/// guard's lifetime. `restore` puts the prior value back and reloads the
+/// settings; a guard dropped without it (a panic) does the same from its
+/// drop, on a thread of its own, so a failure cannot leave the cap set for
+/// later modules.
+#[must_use = "dropping the guard restores max_recipients"]
+pub struct MaxRecipientsGuard {
+    admin: Option<Account>,
+    prior: u64,
+}
+
+impl MaxRecipientsGuard {
+    pub async fn set(admin: &Account, max_recipients: u64) -> Self {
+        use registry::schema::{prelude::Property, structs::CalendarScheduling};
+        let prior = admin
+            .registry_get::<CalendarScheduling>(types::id::Id::singleton())
+            .await
+            .max_recipients;
+        admin
+            .registry_update_setting(
+                CalendarScheduling {
+                    max_recipients,
+                    ..Default::default()
+                },
+                &[Property::MaxRecipients],
+            )
+            .await;
+        admin.reload_settings().await;
+        MaxRecipientsGuard {
+            admin: Some(admin.clone()),
+            prior,
+        }
+    }
+
+    pub async fn restore(mut self) {
+        if let Some(admin) = self.admin.take() {
+            set_max_recipients(&admin, self.prior).await;
+        }
+    }
+}
+
+impl Drop for MaxRecipientsGuard {
+    fn drop(&mut self) {
+        if let Some(admin) = self.admin.take() {
+            let prior = self.prior;
+            let _ = std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a runtime for the restore")
+                    .block_on(set_max_recipients(&admin, prior));
+            })
+            .join();
+        }
+    }
+}
+
+async fn set_max_recipients(admin: &Account, max_recipients: u64) {
+    use registry::schema::{prelude::Property, structs::CalendarScheduling};
+    admin
+        .registry_update_setting(
+            CalendarScheduling {
+                max_recipients,
+                ..Default::default()
+            },
+            &[Property::MaxRecipients],
+        )
+        .await;
+    admin.reload_settings().await;
+}
+
 /// The task manager's consumer held at `TASK_CONSUMER_PAUSE`; dropping it
 /// releases the consumer.
 pub struct ConsumerHeld {

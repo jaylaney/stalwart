@@ -692,6 +692,9 @@ async fn plain_update_trace_exhausted(test: &TestServer, failures: &mut Vec<Stri
     };
 
     let traced = super::mail::Traced::start(&[EventType::Store(StoreEvent::AssertValueFailed)]);
+    // Ruling 156: the slot is restored to its prior value when the case
+    // ends or fails, and a pause it leaves armed is released.
+    let slot = crate::utils::za::PauseSlotGuard::new(&test_hooks::UPDATE_COMMIT_PAUSE);
     let mut pause = Arc::new(HookPause::new(owner));
     test_hooks::set_update_commit_pause(Some(pause.clone()));
     let body = super::sharing::sharing_event("review-plain-exhausted")
@@ -722,7 +725,7 @@ async fn plain_update_trace_exhausted(test: &TestServer, failures: &mut Vec<Stri
         }
     }
     let response = request.await.unwrap();
-    test_hooks::set_update_commit_pause(None);
+    drop(slot);
     let events = traced.finish().await;
     if response.status != StatusCode::SERVICE_UNAVAILABLE
         || response.headers.get("retry-after").is_none()

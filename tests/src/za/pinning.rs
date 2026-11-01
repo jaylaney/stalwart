@@ -1698,13 +1698,41 @@ async fn case_11_withheld_then_declined(test: &TestServer) {
 /// master), so it is followed by a CANCEL of X naming bob alone:
 /// (`pin-11o`) after a `contacts/pin` redelivery; (`pin-11o2`) instead,
 /// ahead of alice's later change to Z, whose partial would otherwise cover
-/// bob. In both, bob's copy ends with X cancelled, as carol's does. As in
-/// carol's copy, upstream's CANCEL merge leaves the recipient's own line on
-/// the cancelled X (a CANCEL that does not name the recipient fails its
-/// snapshot), and X lists no one else.
+/// bob; (`pin-11o3`, upgrade ruling 153) after bob DECLINED Z, his only
+/// remaining instance, so his slice is empty: the `contacts/pin` redelivery
+/// sends the CANCEL of X alone. In all three, bob's copy ends with X
+/// cancelled, as carol's does. As in carol's copy, upstream's CANCEL merge
+/// leaves the recipient's own line on the cancelled X (a CANCEL that does
+/// not name the recipient fails its snapshot), and X lists no one else.
+/// Upgrade ruling 152: canary SUMMARY, DESCRIPTION and LOCATION values on the
+/// master (which bob never attends) and on X (written with his removal)
+/// reach none of bob's items and not his copy.
 async fn case_11_withheld_override_removal(test: &TestServer) {
     const Z: &str = "20990304T100000Z";
     const X_KEY: (i64, bool) = (4_076_128_800, false);
+    const MASTER_CANARIES: &str = concat!(
+        "SUMMARY:canary-pin11-master-summary\r\n",
+        "DESCRIPTION:canary-pin11-master-description\r\n",
+        "LOCATION:canary-pin11-master-location\r\n"
+    );
+    const X_CANARIES: &str = concat!(
+        "SUMMARY:canary-pin11-x-summary\r\n",
+        "DESCRIPTION:canary-pin11-x-description\r\n",
+        "LOCATION:canary-pin11-x-location"
+    );
+    let canaries = |text: &str| {
+        [
+            "canary-pin11-master-summary",
+            "canary-pin11-master-description",
+            "canary-pin11-master-location",
+            "canary-pin11-x-summary",
+            "canary-pin11-x-description",
+            "canary-pin11-x-location",
+        ]
+        .into_iter()
+        .filter(|canary| text.contains(canary))
+        .collect::<Vec<_>>()
+    };
     let lists = |ical: &ICalendar, recurrence_id: Option<&str>, address: &str| {
         instance_of(ical, recurrence_id).is_some_and(|component| {
             component.entries.iter().any(|entry| {
@@ -1722,36 +1750,70 @@ async fn case_11_withheld_override_removal(test: &TestServer) {
         })
     };
     let (alice, bob, carol) = parties(test);
-    for uid in ["pin-11o", "pin-11o2"] {
+    for uid in ["pin-11o", "pin-11o2", "pin-11o3"] {
         let (bob_start, carol_start) = (
             inbox_ids(test, bob.id).await,
             inbox_ids(test, carol.id).await,
         );
         let path = event_path(&alice, uid);
+        let created = with_override(
+            &recurring_invite(uid, &[CAROL], &[BOB, CAROL]),
+            uid,
+            Z,
+            "",
+            &[BOB],
+        )
+        .replacen(&format!("SUMMARY:fo-title {uid}\r\n"), MASTER_CANARIES, 1);
+        assert_eq!(canaries(&created).len(), 3, "{uid}: {created}");
         alice
             .client
-            .request_with_headers(
-                "PUT",
-                &path,
-                [CONTENT_TYPE],
-                with_override(
-                    &recurring_invite(uid, &[CAROL], &[BOB, CAROL]),
-                    uid,
-                    Z,
-                    "",
-                    &[BOB],
-                ),
-            )
+            .request_with_headers("PUT", &path, [CONTENT_TYPE], created)
             .await
             .with_status(StatusCode::CREATED);
         assert_eq!(trigger_drain(BOB, STRONG).await, 207);
         assert_eq!(trigger_drain(CAROL, STRONG).await, 207);
         let bob_copy = copy_href(test, bob.id, uid).await;
         let carol_copy = copy_href(test, carol.id, uid).await;
+        let created_copy = body(&bob.client, &bob_copy).await;
         assert!(
-            lists(&parse(&body(&bob.client, &bob_copy).await), Some(X), BOB),
+            lists(&parse(&created_copy), Some(X), BOB),
             "{uid}: bob's copy lists him on X"
         );
+        assert!(
+            canaries(&created_copy).is_empty(),
+            "{uid}: bob's slice holds no master: {created_copy}"
+        );
+        if uid == "pin-11o3" {
+            // bob declines Z, his only instance after the removal below, so
+            // his slice of the full state is empty (upgrade ruling 153).
+            assert_eq!(
+                rewrite(&bob.client, &bob_copy, |body| edit_override(
+                    &body,
+                    Z,
+                    |line| {
+                        if line.starts_with("ATTENDEE")
+                            && line
+                                .to_ascii_lowercase()
+                                .ends_with(&format!("mailto:{BOB}"))
+                        {
+                            Some(with_partstat(line, "DECLINED"))
+                        } else {
+                            Some(line.to_string())
+                        }
+                    }
+                ))
+                .await,
+                StatusCode::NO_CONTENT
+            );
+            assert_eq!(trigger_drain(ALICE, STRONG).await, 207);
+            assert_eq!(
+                partstat_in(&alice.client, &path, Some(Z), BOB)
+                    .await
+                    .as_deref(),
+                Some("DECLINED"),
+                "{uid}: alice's Z holds bob's decline"
+            );
+        }
 
         // bob's key changes; alice removes bob and carol from X.
         let original = substitute_public_key(test, bob.id, &writer_key(), true).await;
@@ -1767,6 +1829,10 @@ async fn case_11_withheld_override_removal(test: &TestServer) {
                             || lower.ends_with(&format!("mailto:{CAROL}")))
                     {
                         None
+                    } else if line.starts_with("SUMMARY:") {
+                        // Upgrade ruling 152: X's new content, written as
+                        // bob leaves it.
+                        Some(X_CANARIES.to_string())
                     } else {
                         Some(line.to_string())
                     }
@@ -1801,27 +1867,33 @@ async fn case_11_withheld_override_removal(test: &TestServer) {
         substitute_public_key(test, bob.id, &original, true).await;
 
         let before = inbox_ids(test, bob.id).await;
-        let items = if uid == "pin-11o" {
+        let items = if uid == "pin-11o3" {
+            let fp = display_fingerprint(&served(test, bob.id).await);
+            let reply = pin(ALICE, BOB, &fp).await.expect(200);
+            assert_eq!(
+                (reply["delivered"].clone(), reply["dropped"].clone()),
+                (serde_json::json!(1), serde_json::json!(0)),
+                "{uid}: the replay goes without a slice: {reply:?}"
+            );
+            let items = opened(test, bob.id, &before).await;
+            assert_eq!(
+                methods(&items),
+                [Some(ICalendarMethod::Cancel)],
+                "{uid}: X's CANCEL alone"
+            );
+            items
+        } else if uid == "pin-11o" {
             let fp = display_fingerprint(&served(test, bob.id).await);
             // Upgrade ruling 135 (M10): under one outbound recipient the
             // full state's split errs; that is a failure, not "nothing to
             // send", so the entry stays.
-            let admin = test.account("admin@example.com").clone();
-            admin
-                .registry_update_setting(
-                    CalendarScheduling {
-                        max_recipients: 1,
-                        ..Default::default()
-                    },
-                    &[Property::MaxRecipients],
-                )
-                .await;
-            admin.reload_settings().await;
+            // Upgrade ruling 156: a guard restores the prior cap, also on a
+            // failure.
+            let cap =
+                crate::utils::za::MaxRecipientsGuard::set(test.account("admin@example.com"), 1)
+                    .await;
             let reply = pin(ALICE, BOB, &fp).await.expect(200);
-            admin
-                .registry_update_setting(CalendarScheduling::default(), &[Property::MaxRecipients])
-                .await;
-            admin.reload_settings().await;
+            cap.restore().await;
             assert_eq!(
                 (reply["failed"].clone(), reply["dropped"].clone()),
                 (serde_json::json!(1), serde_json::json!(0)),
@@ -1873,22 +1945,34 @@ async fn case_11_withheld_override_removal(test: &TestServer) {
             );
             items
         };
+        let cancel = if uid == "pin-11o3" {
+            &items[0]
+        } else {
+            assert!(
+                instance_of(&items[0], Some(Z)).is_some()
+                    && instance_of(&items[0], Some(X)).is_none()
+                    && instance_of(&items[0], None).is_none(),
+                "{uid}: the slice is Z alone: {}",
+                items[0]
+            );
+            &items[1]
+        };
         assert!(
-            instance_of(&items[0], Some(Z)).is_some()
-                && instance_of(&items[0], Some(X)).is_none()
-                && instance_of(&items[0], None).is_none(),
-            "{uid}: the slice is Z alone: {}",
-            items[0]
+            instance_of(cancel, Some(X)).is_some()
+                && instance_of(cancel, Some(Z)).is_none()
+                && instance_of(cancel, None).is_none()
+                && lists(cancel, Some(X), BOB)
+                && !lists(cancel, Some(X), CAROL),
+            "{uid}: X's CANCEL, naming bob alone: {cancel}"
         );
-        assert!(
-            instance_of(&items[1], Some(X)).is_some()
-                && instance_of(&items[1], Some(Z)).is_none()
-                && instance_of(&items[1], None).is_none()
-                && lists(&items[1], Some(X), BOB)
-                && !lists(&items[1], Some(X), CAROL),
-            "{uid}: X's CANCEL, naming bob alone: {}",
-            items[1]
-        );
+        for item in &items {
+            let text = item.to_string();
+            assert!(
+                canaries(&text).is_empty(),
+                "{uid}: bob's item carries content he never saw: {:?}: {text}",
+                canaries(&text)
+            );
+        }
         assert!(withheld(test, alice.id, BOB).await.is_empty(), "{uid}");
 
         assert_eq!(trigger_drain(BOB, STRONG).await, 207);
@@ -1909,8 +1993,22 @@ async fn case_11_withheld_override_removal(test: &TestServer) {
             "{uid}: bob's X lists no one alice removed but him: {copy}"
         );
         assert!(lists(&copy, Some(Z), BOB), "{uid}: bob keeps Z: {copy}");
+        assert!(
+            canaries(&copy.to_string()).is_empty(),
+            "{uid}: bob's copy holds content he never saw: {:?}: {copy}",
+            canaries(&copy.to_string())
+        );
         if uid == "pin-11o2" {
             assert!(copy.to_string().contains("Z v2"), "{uid}: {copy}");
+        }
+        if uid == "pin-11o3" {
+            assert_eq!(
+                partstat_in(&bob.client, &bob_copy, Some(Z), BOB)
+                    .await
+                    .as_deref(),
+                Some("DECLINED"),
+                "{uid}: bob's Z keeps his decline"
+            );
         }
 
         // Cleanup.

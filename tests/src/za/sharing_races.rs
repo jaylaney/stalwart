@@ -4453,6 +4453,12 @@ async fn calendar_dead_property_last_writer_wins(
 /// already in flight finishes on its own copy of the keys (rulings 148-150):
 /// a revocation's in-flight answer equals the unparked control's, a deletion
 /// serves no data, and a new request after either change is refused (403).
+/// Ruling 155: (iii) revoke-then-write, against the calendar with allprop and
+/// the named prop: the grant revoked while the request is parked, then the
+/// owner's PUT of the event under the rotated generation, then the release.
+/// The in-flight answer serves none of the new content, and the event fails
+/// as an item (its own 500 inside the 207), not as the request; the
+/// calendar itself is still answered from the memo.
 /// Under that memo the refusal arms (`refusal`, `za_propname_item`'s
 /// Forbidden-in-a-home-listing and `Err` arms) are not reached from this
 /// race; they stay as defence in depth (ruling 149).
@@ -4473,6 +4479,9 @@ async fn propfind_admission_races(test: &mut TestServer) {
         "event.ics",
     ];
     println!("Running PROPFIND admission races...");
+    // Ruling 156: the pause slot is restored when the case ends or fails.
+    let _slot = crate::utils::za::PauseSlotGuard::new(&test_hooks::PROPFIND_ADMITTED_PAUSE);
+    const ROTATED: &str = "race-propfind-rotated-summary";
     let admin = test.account("admin@example.com").clone();
     for name in [USER, READER] {
         let account = admin
@@ -4493,9 +4502,14 @@ async fn propfind_admission_races(test: &mut TestServer) {
         .await
         .expect(200);
     let mut failures = Vec::new();
-    for change in ["revoke", "delete"] {
+    for change in ["revoke", "delete", "revoke-write"] {
         for (form, body) in [("allprop", ALLPROP), ("prop", PROP), ("propname", PROPNAME)] {
             for target in ["home", "calendar"] {
+                // Ruling 155's step reads the event's content: the calendar
+                // listing, with a form that opens it.
+                if change == "revoke-write" && (target == "home" || form == "propname") {
+                    continue;
+                }
                 let slug = format!("race-propfind-{change}-{form}-{target}");
                 let calendar_path = format!("{HOME}{slug}/");
                 let event_path = format!("{calendar_path}event.ics");
@@ -4564,13 +4578,27 @@ async fn propfind_admission_races(test: &mut TestServer) {
                         }
                     })
                     .await;
-                if change == "revoke" {
+                if change != "delete" {
                     za_post(
                         "shares/revoke",
                         &json!({"username":USER,"password":STRONG,"calendar":slug,"grant":reader_id}),
                     )
                     .await
                     .expect(200);
+                    if change == "revoke-write" {
+                        // The owner's write after the revocation, sealed
+                        // under the rotated generation.
+                        owner
+                            .request_with_headers(
+                                "PUT",
+                                &event_path,
+                                [("content-type", "text/calendar")],
+                                &super::sharing::sharing_event(&format!("{slug}-uid"))
+                                    .replace("share-read-private-summary", ROTATED),
+                            )
+                            .await
+                            .with_status(StatusCode::NO_CONTENT);
+                    }
                 } else {
                     owner
                         .request_with_headers(
@@ -4591,7 +4619,25 @@ async fn propfind_admission_races(test: &mut TestServer) {
                     "propfind race {slug}: in flight {}, served {served:?}",
                     response.status
                 );
-                if change == "delete" {
+                if change == "revoke-write" {
+                    // Ruling 155: the new content is not served in the
+                    // clear, and the event fails as an item: its response
+                    // is answered 500 within the 207, while the calendar's
+                    // own response is still served from the memo.
+                    let event_item = super::sharing::response_of(&response.body, &event_path);
+                    let calendar_item = super::sharing::response_of(&response.body, &calendar_path);
+                    if response.status != StatusCode::MULTI_STATUS
+                        || response.body.contains(ROTATED)
+                        || !event_item.contains("500")
+                        || event_item.contains("200 OK")
+                        || !calendar_item.contains("200 OK")
+                    {
+                        failures.push(format!(
+                            "{slug}: in flight {} after the rotated write: {}",
+                            response.status, response.body
+                        ));
+                    }
+                } else if change == "delete" {
                     // Nothing of the deleted calendar or its event is served:
                     // no name, content or dead property (value, or name in a
                     // propname listing). Allprop and prop answer each of the
@@ -4648,7 +4694,7 @@ async fn propfind_admission_races(test: &mut TestServer) {
                         after.status, after.body
                     ));
                 }
-                if change == "revoke" {
+                if change != "delete" {
                     owner
                         .request_with_headers(
                             "DELETE",

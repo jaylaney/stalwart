@@ -1574,8 +1574,73 @@ pub async fn test_reply(test: &mut TestServer) {
     assert!(pending_ids(test, key1.id).await.is_empty());
     assert_eq!(trigger_drain(key3.name, STRONG).await, 207);
 
+    // 12. Upgrade ruling 154: the delegate's invitation's split fails
+    // (`max_recipients` 1, at the one new delegate), so key3 gets no item;
+    // the REPLY still applies, and key1's stored event carries `5.1` on
+    // key3's ATTENDEE line, so the organizer sees the failure. The cap is
+    // set after key2's REPLY is sent (its own split would fail too) and a
+    // guard restores the prior value.
+    let uid12 = "za-drain-r12";
+    let organizer12 = format!("{KEY1_CAL}drain-r12.ics");
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &organizer12,
+            [CONTENT_TYPE],
+            invite(uid12, START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    let copy12 = copy_href(test, key2.id, uid12).await;
+    let delegated12 = body(&key2.client, &copy12)
+        .await
+        .replace("\r\n ", "")
+        .replace(
+            "PARTSTAT=NEEDS-ACTION",
+            "PARTSTAT=DELEGATED;DELEGATED-TO=\"mailto:key3@example.com\"",
+        )
+        .replace(
+            "END:VEVENT",
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;DELEGATED-FROM=\"mailto:key2@example.com\":mailto:key3@example.com\r\nEND:VEVENT",
+        );
+    key2.client
+        .request_with_headers("PUT", &copy12, [CONTENT_TYPE], delegated12)
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    assert_eq!(pending_ids(test, key1.id).await.len(), 1);
+    let before12 = inbox_ids(test, key3.id).await;
+    let cap = crate::utils::za::MaxRecipientsGuard::set(test.account("admin@example.com"), 1).await;
+    assert_eq!(trigger_drain(key1.name, STRONG).await, 207);
+    cap.restore().await;
+    assert!(
+        new_inbox_items(test, key3.id, &before12).await.is_empty(),
+        "the split failed: key3 is not invited"
+    );
+    assert!(
+        pending_ids(test, key1.id).await.is_empty(),
+        "the REPLY applied"
+    );
+    assert_eq!(
+        partstat_of(&key1.client, &organizer12, "key2@example.com")
+            .await
+            .as_deref(),
+        Some("DELEGATED")
+    );
+    let organizer12_body = body(&key1.client, &organizer12).await;
+    assert_eq!(
+        crate::utils::za::schedule_statuses(
+            &organizer12_body,
+            calcard::icalendar::ICalendarProperty::Attendee,
+            "key3@example.com"
+        ),
+        ["5.1"],
+        "the uninvited delegate's 5.1: {organizer12_body}"
+    );
+
     // Cleanup.
     for (party, uid) in [
+        (&key2, uid12),
         (&key2, uid11),
         (&key3, uid11),
         (&key2, uid),
@@ -1608,6 +1673,7 @@ pub async fn test_reply(test: &mut TestServer) {
         "drain-r8",
         "drain-r9",
         "drain-r11",
+        "drain-r12",
     ] {
         key1.client
             .request_with_headers("DELETE", &format!("{KEY1_CAL}{name}.ics"), [NO_REPLY], "")
