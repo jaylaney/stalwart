@@ -7878,6 +7878,271 @@ those fails first at the same recipient cap, so no test can reach it.
   ordinary attendee's too (carol, through upstream's own CANCEL). The case asserts parity
   instead: X cancelled for bob as for carol, and no one else alice removed listed on it.
 
+#### Fix round 1, part 7f2
+
+Part 7f2 settles the Task 7 review's test and record findings: rulings 133 (I3, M12), 134
+(I4), 135's remaining minors and 129. It adds tests only; no product code changed.
+
+##### Ruling 133: the plain-suite reruns
+
+Every uncaught class (a) or (b) mutation whose hook runs for ordinary accounts was rerun
+against plain `webdav::webdav_tests` and plain `jmap::jmap_tests`, with part 7d2's
+definitions behind the `ZA_MUT` switch (method below). The hooks that run for key accounts
+only were not rerun: a057 and a159 (the key account's redaction flags), the IMAP R34 group
+(`a082`-`a094`, `b039`: a foreign key account's routes), a106 and b007 (a key account's
+downloads), a142 (the key cache's sweep), b014 (a key account's thread subject) and a022 (not
+reached).
+
+| Id | Plain CalDAV | Plain JMAP | Outcome |
+|---|---|---|---|
+| a063 | passed | passed | not caught: a test was added (below) |
+| a108 | passed | passed | not caught: an accepted residual |
+| a001 | passed | passed | not caught by the plain suites; caught by the new `za::password` case |
+| a011 | passed | passed | not caught: an accepted residual |
+| a013 | passed | passed | not caught by the plain suites; caught by the new `za::caches` case |
+| a014 | passed | passed | not caught: an accepted residual |
+| a018 | passed | passed | not caught by the plain suites; caught by the new `za::caches` case |
+| a062 | passed | passed | not caught: an accepted residual |
+| a070 | passed | passed | not caught by the plain suites; caught by the new `za::tracing` case |
+| a072 | passed | passed | not caught by the plain suites; caught by the new `za::tracing` case |
+| a158 | passed | passed | not caught: not a lost catch (below), an accepted residual |
+| b034 | passed | passed | not caught: an accepted residual |
+
+`a063` stayed uncaught, so `groupware::calendar::delegation::tests` gains
+`cancel_splits_a_recurring_event_per_recipient`. The master names the writer, and override X
+names the writer and an external attendee, so the unsplit CANCEL (the series, with the
+writer's attendee line) is addressed to both. Under each policy the test asserts
+`itip_cancel`'s output equals `itip_messages_per_recipient`'s over the unsplit message:
+- with every attendee visible, one message to both;
+- under `RecipientOnly`, one CANCEL each, holding the series alone (no RECURRENCE-ID) and no
+  other recipient's address, so the external attendee's CANCEL names no attendee.
+
+`a063` fails it (`delegation.rs:1025`): the public CANCEL is the unsplit one.
+
+##### Ruling 134: ruling 122's remaining tests
+
+- **`common/src/za/metadata.rs:165-201`** (`za::mail::fence`,
+  `setup_refuses_object_metadata`). The account's `Owner` counter on another owner's mailboxes
+  counts no container (left so by the case before). A private container of the account,
+  written straight under that owner, is not counted, and is still found by the second pass:
+  `za_has_object_metadata` is true and `setup-token` answers 409 "account already holds
+  object metadata" without writing a record. Once it is cleared, the check is false.
+- **`services/src/index_queue/za.rs:114-126`** (`za::index_task::test_destroyed_stub`). A
+  message whose header section starts with the stub's format byte, and whose thread subject is
+  in its headers (two `Subject` headers, the last one empty), is planted in the key account and
+  in an ordinary control (`plainmail38`). Its un-index reads the account's classification:
+  - the key account's takes the stub's empty subject and leaves the threading key of the
+    header section's subject;
+  - the control's takes upstream's subject and clears it.
+  The fixture's leftover key is cleared after.
+- **`imap/src/core/za.rs:50-58`** (`za::mail::gates`, `group_member_stale_token`). A second
+  IMAP session of the group's member lists the group owner's share and selects nothing. The
+  owner is provisioned, and the session's token still names it (ruling R5 invalidates the
+  group's entry, not the member's). The session's IDLE, woken by a delivery to the member,
+  reports `* LIST (\NonExistent) … "Shared Folders/plainmail11@example.com/INBOX"` first, as
+  upstream reports a revoked share. Its next LIST no longer names the owner.
+- **`dav/src/common/propfind/za.rs`, `za_propname_item`** (`za::sharing`,
+  `conversion_carries_dead_property_containers`). After the grant, a depth-1 `propname` of
+  the converted calendar lists the calendar and its event, each with its dead property's name
+  (`urn:x-container` `note`), for the owner and the grantee, and serves no value. The
+  grantee's depth-1 `propname` of the owner's home lists the granted calendar with the name,
+  and no other calendar. The event's names are opened under its own read context.
+- **The refusal arms** (`propfind/za.rs`'s `refusal`, and `za_propname_item`'s
+  `Forbidden`-in-a-home-listing and `Err` arms) stay untested. A foreign listing admits only
+  the calendars `foreign_calendar_contexts` resolved with a fresh own-id grant, and a multiget
+  href is refused at `validate_uri` first. So these arms run only when a grant is revoked, or
+  a calendar deleted, between that admission and the item's read in the same request. No test
+  hook pauses there, so this is a race-only path, recorded as such. `za_propname_item`'s
+  `parent_id` arm for an event (`:400-401`) is now reached by the case above.
+- **`fanout.rs`'s 7 newly uncovered lines** are `write_item_inner`'s reparse-failure arm of
+  ruling 94 (`:1452-1457` in 7d1b's numbering; the `ok_or_else` closure after
+  `za_item_shape`). 7f1 left them uncovered. Upstream's builders always emit text that
+  reparses, so the arm cannot run without a fault, as 7d1b recorded. The unit
+  `seal::item::tests::a_message_without_a_component_has_no_shape` pins the two shapes
+  `za_item_shape` refuses (a VCALENDAR root alone, and a tree with no root), which are what
+  that arm turns into a recipient's failure.
+
+##### Ruling 135: the minors
+
+- **M1, M2.** `tests/src/za/inbox.rs` now says a pending item and a missing href both answer
+  404 at 1.0 (since `a5cddf448`, ruling 136). `tests/src/za/mail/uploads.rs` now says `gates`
+  reaches only the copy-into refusal, and no session reaches the copy-out one (ruling 99).
+- **M3-M5 (`dispositions.json`).** `webdav-key-raw-event` is limited to `webdav-key`.
+  `sharing-move-bytes-oversize` is `internals_replaced_no_equivalent`. `leak-fetch-email` is
+  `internals_replaced_no_equivalent`, limited to `za-tests` and `za-tests-fs-blob`, with no
+  equivalent. The gates' self-tests pass (32 run, 2 skipped).
+- **M6.** `scripts/tests/README.md` counts 30 offline tests; the run reports 32, with the two
+  `--real` tests skipped.
+- **M7, the IMAP R34 group (`a082`, `a083`, `a087`, `a092`, `a094`, `b039`).** Part 7d2's
+  reason was wrong. Each route is reached: `rf_2_stale_grant`'s session, opened before the
+  account was provisioned, selects the foreign mailbox. It then sends FETCH BODY[], STORE,
+  EXPUNGE, FETCH FLAGS, SEARCH, SORT and GETMETADATA against it
+  (`tests/src/za/mail/gates.rs`). Each route is masked by another: `sync_view`'s route,
+  `check_mailbox_acl`'s, or the keyless-read refusal. One combined switch, `g001`, disables
+  all six together. `mail::gates` catches it (`utils/imap.rs:260`, from
+  `assert_imap_refused`): the EXPUNGE answers upstream's ACL refusal ("You do not have the
+  required permissions to remove messages") instead of the fork's keyless refusal. So the
+  layer as a whole is guarded. Each route alone remains an accepted residual (`b039` with
+  them): a single route can regress while the others still mask it.
+- **M8 (`b008`, `b009`).** Rerun with the narrow selectors the review names:
+  - `b008` hung under `leak::test_mail` and under `mail::search` (the watchdog stopped each
+    after 60 index-partition waits). No assertion fired.
+  - `b009` passed both.
+  Two tests were added:
+  - `za::index_task::test_destroyed_stub`'s delivery wait is bounded (60 s). It panics with
+    the named cause: "the key account's index partition did not drain: its message was not
+    indexed from its stub (mail spec 5.5)".
+  - `za::index_task::test` plants a legacy, unsealed event in the key account
+    (`plant_event`). Its index entry must drain within a bounded 30 s, and the Calendar index
+    must hold nothing of the account. A build of it would carry R58's vault-absence fence and
+    fail against the account's vault record.
+
+  The review's first option, "a unit test that a key account's email document holds only
+  `ReceivedAt` and `Size`", does not apply at 1.0: the document holds the ids only (ruling
+  64), and `za::index_task::assert_visible_fields_only` already checks that.
+- **M9** (`za::sharing_review::plain_update_trace_exhausted`, option (b) of the 7c
+  investigation's N6). The plain PUT is parked at its commit on each of its four attempts:
+  the first and the dispatcher's three replays. A row-only change commits at each park, and
+  the pause is re-armed before each release, so every replay parks in turn. The PUT answers
+  503 with `Retry-After`. Its `AssertValueFailed` trace, for the request's URL, has a
+  `CausedBy` in `crates/dav/src/calendar/update.rs`. `plain_update_trace` keeps ruling 95's
+  single-park case (204, both changes kept).
+- **M11.** Plain `imap::antispam`'s three `$Junk` checks read the FLAGS list through
+  `has_junk_flag`, as the key variant does (now `pub(crate)` in `imap/za_variants.rs`).
+- **M14, the trace and credential tests.**
+  - `a001` (`za::password`). A grant-backed Bearer token of `key1` answers 200 on
+    `/jmap/session`. After `/api/vault/password`, the same token answers 401, while its grant
+    still exists, so the credential version is what refuses it.
+  - `a070` and `a072` (`za::tracing`, `credential_inputs_are_not_traced`). Every event type is
+    captured while the test sends:
+    - a malformed `Basic` value, and a `Basic` value with no colon, each with a canary;
+    - an unknown mechanism (`Negotiate`) with a canary;
+    - two `/auth/token` forms (an authorization code with a client secret, and a device code),
+      each field a canary.
+
+    Each request comes from its own forwarded address. No event and no answer carries a
+    canary, and the Basic decode's refusal is traced (the control).
+  - `a057` (`za::mail::traces`, `delivery_sieve_runtime_error_is_redacted`). The key account
+    and the ordinary control each activate a personal script that includes a script named
+    after the subject. No script of that name exists, so delivery ends in `ScriptNotFound`
+    and the implicit keep. For the key account, both runtime errors record the marker (the
+    trusted DATA-stage script's and its own), and no event carries a canary. The control's
+    reason is `Included script "subject-canary" not found.`
+    The test build panics on a delivery-time `error` (`ScriptErrorMessage`,
+    `email/src/sieve/ingest.rs`'s `test_mode` arm), so `include` provides the
+    subject-derived failure.
+  - `a159` (`za::mail::traces`). The module configures a domain DNSBL whose zone is
+    `value + '.za-dnsbl.test'`. The test resolver answers every uncached name as not found, so
+    each domain the message holds, the body's included, traces its zone (`Spam(Dnsbl)`). For
+    the key delivery every zone is the marker, and the scan finds no canary. For the control
+    a zone names `domain-canary.net.za-dnsbl.test`. The test resolver could serve the zone,
+    so this is a test, not a residual.
+- **`a158`: not a lost catch.** At 1.0, as at 0.16, a trap only marks the transaction for
+  training (`train_spam`, `analysis/score.rs`), and the sample is stored. Tokens are built
+  in three places:
+  - the training task, from stored samples, which a key account never has (6.1 step 4,
+    R52);
+  - `spam_classify`'s two classifier arms, which run only once a model is trained and
+    loaded.
+
+  0.16's `spam_build_tokens` had the same three callers. The ZA suite trains no model, so
+  neither version reached token building on the delivery path. The hook stays an accepted
+  residual. Its optional test would train a classifier in the traces fixture.
+- **Optional tests, both added** (`za::caches`).
+  - `a013`: an HTTP Basic login of `plain` is cached; an `Account`-only invalidation drops
+    it; the next request verifies afresh and is cached again.
+  - `a018`: the fingerprint key is not the zero key, and the fingerprints it yields are not
+    the zero key's. The draw's difference between `Inner`s is not checked, because the suite
+    cannot build a second `Inner` (`Caches::parse` needs a bootstrap).
+
+##### Ruling 129
+
+`webdav::za_variants::alarm` waits, for at most 20 s, until both alarm emails are delivered,
+polling every 250 ms. It used a fixed 6 s wait. `cal_alarm` waits the same way.
+
+##### Accepted residuals (rulings 130, 133 and 135)
+
+| Id | Hook | Cost if it regresses |
+|---|---|---|
+| a011 | `invalidate.rs`'s account-epoch bumps | a stale loader publish after an invalidation goes unnoticed (race-only) |
+| a014 | `principals.rs`'s account-loader epoch fence | the same, for the account loader |
+| a022 | `boot.rs`'s startup key-cache line | none (a diagnostic; the harness never boots through `BootManager`) |
+| a062 | `delete_with_events`' calendar fences | a calendar delete racing a grant or conversion change is unpinned |
+| a106 | `jmap/blob/download.rs`'s key-account calendar-blob refusal | an embedded-blob download of a legacy unsealed key event's binary `ATTACH` could be served |
+| a108 | `calendar_event/set.rs`'s identity tombstone on JMAP writes (plain suites rerun: not caught) | a plain owner's JMAP move or destroy could leave a grantee's sync without the identity tombstone |
+| a142 | the scheduled key sweep | only on-access expiry enforces the idle bound if the scheduler wiring breaks |
+| a158 | R56's quiet lookup in token building | reached only with a trained classifier; a key message's body domains could be traced as cache events |
+| b007 | `has_access_blob`'s foreign-key branch | low: layered behind `a004`'s filter |
+| b014 | the key flag on a deleted message's thread subject | now pinned by ruling 134's index-queue case (caught, below) |
+| b034 | PROPPATCH's calendar fences alone | a PROPPATCH raced between the post-pause re-read and the commit is unpinned |
+| b039 and the R34 routes | FETCH's route (and `a082`, `a083`, `a087`, `a092`, `a094`) | one route can regress while the others mask it; the layer is caught (`g001`) |
+
+##### Mutation rows (appended to `task-7d/mutations.tsv`)
+
+Method as part 7d2's (ruling 127). Part 7d2's definitions for the ids used here, one group
+switch (`g001`) and 7f2's own six mutations (`h001`-`h006`) were applied together behind the
+`ZA_MUT` switch, with part 7d2's uncommitted `ZA_ONLY` selector in `tests/src/za/mod.rs`. The
+`tests` binary was built and copied out of the tree, and the tree was restored with
+`git checkout`. The unit mutations ran on the switched tree before the restore. Phase 0 (the reruns)
+used a build of `0c5f59c91`; phase 2 (the new tests' mutations) used a build of `28450f64e`.
+Definitions: `task-7f2/muts.py` and `own.py`. Runner: `task-7f2/run.py`. Drivers: `drive0.sh`,
+`drive2.sh`. Logs: `task-7f2/logs/`. Every unmutated control passed: plain CalDAV, plain JMAP,
+key IMAP and the ZA selections of phase 0, the ten ZA selections of phase 2, and the groupware
+unit set.
+
+Phase 2: each new test against its mutation (the selection that holds the test). Every one
+failed under its mutation, at the assertion named.
+
+| Id | Mutation | Selection | Failing assertion |
+|---|---|---|---|
+| a063 | `itip_cancel` returns the unsplit organizer CANCEL | unit `groupware` | `delegation.rs:1025`: under `RecipientOnly` one message to both, not one each |
+| h005 | `za_item_shape` accepts every reparsed tree | unit `groupware` | `seal/item.rs:964`: a root alone has a shape |
+| a001 | a key account's credential version stays constant | `password` | `password.rs:174`: the old token still answers 200 |
+| a013 | the `Account` arm keeps HTTP auth entries | `caches` | `caches.rs:93`: the cached authentication survives |
+| a018 | the fingerprint key is all zeros | `caches` | `caches.rs:112`: the zero key |
+| a070 | ruling 28's errors carry the raw Authorization value | `tracing` | `tracing.rs:296`: `Auth(Error)` has `Id="!trace-canary-basic-4f7a!"` |
+| a072 | the OAuth form is read through the traced body reader | `tracing` | `tracing.rs:296`: `Http(RequestBody)` carries the code canary |
+| a057 | a key account's delivery Sieve run is not redacted | `mail::traces` | `mail/traces.rs:374`: `Sieve(RuntimeError)` quotes `subject-canary` |
+| a159 | DNSBL zones and errors are not redacted | `mail::traces` | `mail/traces.rs:386`: the key delivery's zones name `domain-canary.net` and `url-canary.net` |
+| h001 | `za_has_object_metadata`'s second pass is skipped | `mail::fence` | `mail/fence.rs:3089`: the uncounted container is not found |
+| h004 | `za_unlist_key_accounts` reports no change | `mail::gates` | `mail/gates.rs:1424`: the IDLE's first update is the member's STATUS |
+| h002 | `ZaUnindexAccount::for_row` answers ordinary | `index_task::test_destroyed_stub` | `index_task.rs:707`: the key account's threading key is cleared |
+| b014 | the un-index's key flag is dropped (7d2's switch) | `index_task::test_destroyed_stub` | `index_task.rs:707`, the same |
+| b008 | a key account's message gets upstream's document (7d2's switch) | `index_task::test_destroyed_stub` | `index_task.rs:645`: the bounded wait's named panic |
+| b009 | a key account's event is indexed (7d2's switch) | `index_task::test` | `utils/za.rs:2199`: the legacy event's entry does not drain in 30 s (the partition retries: its fenced build fails) |
+| h003 | `za_propname_item` gives an event no read context | `sharing::conversion_carries_dead_property_containers` | `sharing.rs:11472`: the event's dead-property name is not listed |
+| h006 | the plain update's commit error carries no `update.rs` location | `sharing_review` | `sharing_review.rs:624`: the `AssertValueFailed` trace lost its DAV location |
+
+Phase 0: ruling 133's reruns (the table above), `g001` (M7: caught by `mail::gates`, the
+EXPUNGE refusal at `utils/imap.rs:260`; key IMAP and full ZA were not needed), and M8's
+narrow reruns (`b008`: hangs under `leak::test_mail` and `mail::search`; `b009`: passed
+both).
+
+##### Runs (logs in `task-7c/logs/`)
+
+All at `28450f64e` with a clean tree, numbered on from part 7f1:
+- `units-6`: `cargo test -p groupware --lib`, 177 passed.
+- `za-93`: 1 passed (350 s). `zafs-7` (`BLOB_STORE=FileSystem`): 1 passed (344 s).
+- `caldav-plain-28` and `caldav-key-25`: 1 passed each (27 s, 24 s).
+- `imap-plain-17` and `imap-key-14`: 1 passed each (12 s, 14 s).
+- `jmap-plain-50` and `jmap-key-31`: 1 passed each (134 s, 99 s).
+- `up-system-system_tests-20`: 1 passed (62 s).
+- `smtp-10` (CI's `SPAM_RULES_URL`): 73 passed, 3 failed (`dkim2_dsn_is_signed`,
+  `queue_retry`, `dkim2_all_disclosed`, each "No matching queue event" or the retry count
+  under the parallel run), 3 ignored. They were rerun by name, as CI reruns them:
+  - `smtp-flake-4`, the three together: `dkim2_dsn_is_signed` passed, and the other two
+    failed again in parallel;
+  - `smtp-flake-5` (`dkim2_all_disclosed`) and `smtp-flake-6` (`queue_retry`), each alone:
+    passed.
+
+  `dkim2_all_disclosed` is not in CLAUDE.md's list of timing-flaky SMTP tests. It failed the
+  same way in `smtp-1` (part 7c). This part touched no SMTP code or test.
+
+Development runs on the uncommitted tests: `za-92` (347 s), `imap-plain-16` and `caldav-key-24`,
+all passed. Mutation logs: `task-7f2/logs/` (`p0-*`, `p2-*`) and
+`task-7c/logs/mut7f2-units-*`. The coverage gate was not rerun: an instrumented build needs
+about 24 GB and 12 GB was free.
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
@@ -8280,6 +8545,19 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `za::sharing::revoke_cleanup_does_not_rewrite_sealed_event` (fork, part 7f1, ruling 128) | After the revoke the case plants a per-user preference of the grantee in one event's content archive; it then also asserts the calendar's last change id is unchanged and the preference still stored, beside the unchanged bytes and ETags. | None in 1.0: the case was vacuous for its own subject (7d2's `c001` passed it). Upstream's cleanup selects events by their content's preferences (`clean_calendar_items`), so without a candidate preference it had nothing to rewrite. |
 | `za::drain::test_reply` step 11 (fork, part 7f1, ruling 131) | New step: the delegate's item holds the master only. Its override names only the organizer, because a master delegation of an attendee who is also on the override reaches the override too. | 1.0 splits organizer messages per recipient (`itip_messages_per_recipient`); the drain's delegating merge now does too. |
 | `za::pinning::case_11_withheld_override_removal` (fork, part 7f1, rulings 132 and 135) | New case. bob's copy is asserted to end with X cancelled, as the ordinary attendee's does, listing no one alice removed but bob. It is not asserted to drop bob's own line from X. | Upstream's CANCEL merge (`inbound.rs`, the CANCEL arm) replaces an instance's ATTENDEE lines with the CANCEL's, and a CANCEL must name the recipient to pass its snapshot, so the recipient's line stays on the cancelled X for every attendee. |
+| `imap::antispam` (upstream, part 7f2, ruling 135 M11) | The three `$Junk` checks (messages 11, 12 and 10) read the FETCH response's FLAGS list through `has_junk_flag` instead of matching a substring of the whole answer; the header checks are unchanged. | None in 1.0: the substring check could be satisfied by message text. 1.0 lists the server-set attachment keyword first, so `$Junk` is not the list's first flag (the key variant's helper, part 7c). |
+| `webdav::za_variants::alarm` (fork, part 7f2, ruling 129) | The fixed 6 s wait for the two alarm emails becomes a poll every 250 ms for at most 20 s; the count and content assertions are unchanged. | None in 1.0: a timing artefact (the alarm task and the delivery run on their own; one email was late once, part 7d2's a030 run). |
+| `za::sharing_review::plain_update_trace_exhausted` (fork, part 7f2, ruling 135 M9) | New case: four parked attempts, each losing its assertion, answer 503 with `Retry-After`, and the `AssertValueFailed` trace's `CausedBy` names `crates/dav/src/calendar/update.rs`. Restores 0.16's trace-location check, which ruling 95 dropped from `plain_update_trace`. | 1.0's DAV dispatcher replays a keyless write after an assertion failure, up to `MAX_CONFLICT_RETRIES` (3), so only an exhausted replay surfaces the error. |
+| `za::index_task::test_destroyed_stub` (fork, part 7f2, rulings 134 and 135 M8) | The delivery wait is bounded at 60 s with a named panic; a stub-like row with its thread subject in its headers is planted in the key account and an ordinary control, and the un-index is asserted to keep the key account's threading key and clear the control's. | 1.0's un-index reads a row's header section only when its thread subject is there (`ZaUnindexAccount::for_row`); 1.0's index queue retries a failing partition forever, so an unbounded wait hangs instead of failing. |
+| `za::index_task::test` (fork, part 7f2, ruling 135 M8) | Adds a legacy unsealed event in the key account: its index entry drains within 30 s and the Calendar index holds nothing of the account. | 1.0's index queue (no terminal failure; R58's fence on a plain calendar document). |
+| `za::mail::gates::group_member_stale_token` (fork, part 7f2, ruling 134) | Adds a second member session whose IDLE reports the share as `\NonExistent` after the owner is provisioned, and whose LIST no longer names it. | None in 1.0: ruling 122's coverage of `za_unlist_key_accounts`'s change report. |
+| `za::mail::fence::setup_refuses_object_metadata` (fork, part 7f2, ruling 134) | Adds an uncounted private container under a counter that counts none: setup is refused with 409, then allowed once it is cleared. | 1.0's object metadata (`Collection::Metadata`, ruling 66). |
+| `za::sharing::conversion_carries_dead_property_containers` (fork, part 7f2, ruling 134) | Adds depth-1 `propname` checks after the grant: the calendar and its event list their dead property's name for owner and grantee, and the grantee's home listing names only the granted calendar. | 1.0's separate dead-property containers (rulings 16, 23, 29). |
+| `za::password::test` (fork, part 7f2, ruling 135 M14) | Adds a grant-backed Bearer token answering 200 before the password change and 401 after, its grant still stored. | 1.0 binds each access token to a grant and a credential version (`za_grant_token`). |
+| `za::tracing::test` (fork, part 7f2, ruling 135 M14) | Adds `credential_inputs_are_not_traced`: malformed Basic values, an unknown mechanism and two OAuth token forms leave no canary in any event or answer. | None in 1.0: the review's M14 (ruling 28's hooks; issue #20's untraced OAuth form). |
+| `za::mail::traces` (fork, part 7f2, ruling 135 M14) | The module configures a domain DNSBL; `delivery_leaves_no_content_in_events` asserts the key delivery's DNSBL zones are the marker and the control's name the body's domain. New `delivery_sieve_runtime_error_is_redacted`: a personal script's `ScriptNotFound` on the subject is redacted for the key account and quoted for the control. | The test build panics on a delivery-time `error` (`ScriptErrorMessage`'s `test_mode` arm), so the case uses `include`. |
+| `za::caches::test` (fork, part 7f2, ruling 135) | Adds `account_invalidation_drops_http_auth` and `fingerprint_key_is_drawn`. | None in 1.0: the review's optional tests for a013 and a018. |
+| `groupware::calendar::delegation::tests::cancel_splits_a_recurring_event_per_recipient` and `seal::item::tests::a_message_without_a_component_has_no_shape` (fork units, part 7f2, rulings 133 and 134) | New. | 1.0 splits an organizer CANCEL per recipient (`itip_cancel`); ruling 94's item shape. |
 
 ## Task 1 check
 
