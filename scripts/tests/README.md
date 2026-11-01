@@ -8,6 +8,25 @@ Task 1's rulings 7, 8, 25, 31 and 32 set their rules.
 - `check_coverage.py`: the fork-owned cohort's line coverage.
 - `gate_common.py`: what both share. It loads the dispositions file and parses listing captures.
 - `test_gates.py`: offline self-tests of both gates. They need no cargo.
+- `coverage_net.py`: the baseline's 19-step `cargo llvm-cov --no-report` net, which writes the
+  per-step exports and the merged export both gates read.
+- `capture_listings.py`: the libtest listing of every CI step, for the inventory gate.
+
+The `gates` job of `.github/workflows/test.yml` runs the net, the captures and both gates,
+weekly and on manual dispatch. Locally, the same sequence is:
+
+```sh
+export STORE=RocksDb RUST_MIN_STACK=16777216 UNIT_TEST_FEATURES="<test.yml's list>"
+python3 -I scripts/tests/coverage_net.py --out /tmp/net
+python3 -I scripts/tests/capture_listings.py --out /tmp/listings
+mkdir -p /tmp/src-candidate && git archive HEAD tests crates | tar -x -C /tmp/src-candidate
+python3 -I tests/qualification/tools/strict_rule.py functions \
+  --exports /tmp/net/steps --sources /tmp/src-candidate --out /tmp/functions-candidate.json
+```
+
+then the two gate commands below, with `--listing /tmp/listings/list`, `--ignored-listing
+/tmp/listings/ign` and `--merged /tmp/net/merged.json`. The automation step needs Docker; without
+it the step fails twice and the gates report what it did not run.
 
 Both gates build on `tests/qualification/tools/` (`strict_rule.py`, `cohort.py`,
 `rustscan.py`; see the README there) and reimplement neither the strict rule nor the cohort
@@ -101,11 +120,11 @@ for k, v in sorted(c.items()):
     if v["kind"] in ("ci_step", "ignored_listing"): print(k, "\t", v["command"])'
 ```
 
-Use each step's 1.0 command, from `.github/workflows/test.yml` once Task 8 rewrites it.
-Before then:
-- the workspace unit step's feature list is the outcome note's "`UNIT_TEST_FEATURES` for 1.0";
-- `http` is `-p http@1.0.1`;
-- each selection move's `to_command` gives its new step.
+Use each step's 1.0 command, from `.github/workflows/test.yml`; `capture_listings.py` holds
+them, and a change to a step's command needs the same change there. The workspace unit step's
+features are test.yml's `UNIT_TEST_FEATURES`, and each selection move's `to_command` is its new
+step's (Task 8 confirmed both moves: the unit-tests job's "SMTP Unit Tests (without
+enterprise)" and "HTTP Unit Tests").
 
 Capture under the integration rows' environment (`STORE=RocksDb RUST_MIN_STACK=16777216`).
 
