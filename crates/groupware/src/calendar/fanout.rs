@@ -2360,7 +2360,9 @@ mod tests {
         assert!(full[1].from_organizer);
         let cancel = full[1].message.to_string();
         assert!(
-            cancel.contains("STATUS:CANCELLED") && !cancel.contains("ATTENDEE"),
+            cancel.contains("STATUS:CANCELLED")
+                && cancel.contains(&format!("ATTENDEE:mailto:{BOB}"))
+                && !cancel.contains(CAROL),
             "{cancel}"
         );
 

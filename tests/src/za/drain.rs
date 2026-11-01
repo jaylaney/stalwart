@@ -1481,11 +1481,13 @@ pub async fn test_reply(test: &mut TestServer) {
     );
 
     // 11. The delegate's invitation is the delegate's slice (upgrade ruling
-    // 131): key1's recurring event invites key2 to the series and to an
-    // override of the second occurrence that key3 does not attend. key2
-    // delegates the series (the master) to key3; key1's drain builds the
-    // full REQUEST for key3 and splits it as 1.0 splits upstream's own
-    // messages, so key3's item holds the master only, not the override.
+    // 131): key1's recurring event invites key2 to the series, and its
+    // override of the second occurrence names only key1 itself, so neither
+    // key2 nor, after the delegation, key3 attends it (a delegation of an
+    // instance key2 attends would reach that instance too). key2 delegates
+    // the series (the master) to key3; key1's drain builds the full REQUEST
+    // for key3 and splits it as 1.0 splits upstream's own messages, so
+    // key3's item holds the master only, not the override.
     let uid11 = "za-drain-r11";
     let organizer11 = format!("{KEY1_CAL}drain-r11.ics");
     let recurring11 = invite(uid11, START_A, &["key2@example.com"])
@@ -1501,7 +1503,7 @@ pub async fn test_reply(test: &mut TestServer) {
                     "DTSTAMP:20240101T000000Z\r\nRECURRENCE-ID:{start}\r\n",
                     "DTSTART:{start}\r\nDURATION:PT1H\r\nSEQUENCE:0\r\n",
                     "SUMMARY:fo-title {uid} override\r\nORGANIZER:mailto:key1@example.com\r\n",
-                    "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:key2@example.com\r\n",
+                    "ATTENDEE;PARTSTAT=ACCEPTED:mailto:key1@example.com\r\n",
                     "END:VEVENT\r\nEND:VCALENDAR\r\n"
                 ),
                 uid = uid11,

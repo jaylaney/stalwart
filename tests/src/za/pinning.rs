@@ -1695,11 +1695,13 @@ async fn case_11_withheld_then_declined(test: &TestServer) {
 /// removing bob and carol from X withholds bob's CANCEL of X (his entry
 /// records X), while carol, an ordinary attendee, gets hers directly. bob's
 /// full state cannot carry the removal (his slice is Z alone, without the
-/// master), so it is followed by a CANCEL of X: (`pin-11o`) after a
-/// `contacts/pin` redelivery; (`pin-11o2`) instead, ahead of alice's later
-/// change to Z, whose partial would otherwise cover bob. In both, bob's
-/// copy ends with X cancelled or absent and no longer listing him, as
-/// carol's ends with X cancelled.
+/// master), so it is followed by a CANCEL of X naming bob alone:
+/// (`pin-11o`) after a `contacts/pin` redelivery; (`pin-11o2`) instead,
+/// ahead of alice's later change to Z, whose partial would otherwise cover
+/// bob. In both, bob's copy ends with X cancelled, as carol's does. As in
+/// carol's copy, upstream's CANCEL merge leaves the recipient's own line on
+/// the cancelled X (a CANCEL that does not name the recipient fails its
+/// snapshot), and X lists no one else.
 async fn case_11_withheld_override_removal(test: &TestServer) {
     const Z: &str = "20990304T100000Z";
     const X_KEY: (i64, bool) = (4_076_128_800, false);
@@ -1882,8 +1884,9 @@ async fn case_11_withheld_override_removal(test: &TestServer) {
             instance_of(&items[1], Some(X)).is_some()
                 && instance_of(&items[1], Some(Z)).is_none()
                 && instance_of(&items[1], None).is_none()
-                && !lists(&items[1], Some(X), BOB),
-            "{uid}: X's CANCEL, listing nobody: {}",
+                && lists(&items[1], Some(X), BOB)
+                && !lists(&items[1], Some(X), CAROL),
+            "{uid}: X's CANCEL, naming bob alone: {}",
             items[1]
         );
         assert!(withheld(test, alice.id, BOB).await.is_empty(), "{uid}");
@@ -1896,9 +1899,14 @@ async fn case_11_withheld_override_removal(test: &TestServer) {
             }),
             "{uid}: X cancelled or absent for bob: {copy}"
         );
+        assert_eq!(
+            status_in(&bob.client, &bob_copy, Some(X)).await,
+            status_in(&carol.client, &carol_copy, Some(X)).await,
+            "{uid}: bob's X as the ordinary attendee's"
+        );
         assert!(
-            !lists(&copy, Some(X), BOB),
-            "{uid}: bob's copy no longer lists him on X: {copy}"
+            !lists(&copy, Some(X), CAROL),
+            "{uid}: bob's X lists no one alice removed but him: {copy}"
         );
         assert!(lists(&copy, Some(Z), BOB), "{uid}: bob keeps Z: {copy}");
         if uid == "pin-11o2" {

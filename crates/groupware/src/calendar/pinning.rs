@@ -119,6 +119,11 @@ pub fn za_full_state_for(
 /// (`CancelScope::Instance` over the address forms of `to`, so the
 /// component lists none of the instance's current attendees) at the
 /// instance's committed SEQUENCE, then split per recipient under `policy`.
+/// Each component names the recipient with a bare ATTENDEE line per
+/// address of `to`: the tree no longer holds its line, which upstream's
+/// own CANCEL copies from the superseded tree, and the recipient's
+/// snapshot of a message that names none of its addresses fails
+/// (`NotOrganizerNorAttendee`), so its drain would not merge it.
 /// A recorded instance the tree has no component for is built from the
 /// master, its RECURRENCE-ID and DTSTART the recorded UTC instant (with
 /// RANGE=THISANDFUTURE when recorded so), at the master's SEQUENCE, as
@@ -171,7 +176,7 @@ pub fn za_withheld_cancels(
             .components
             .iter()
             .find(|(id, _)| instance_key(id) == Some((date, this_and_future)));
-        let component = match present {
+        let mut component = match present {
             Some((_, snapshot)) if attends(snapshot) => continue,
             Some((id, snapshot)) => {
                 cancelled.push(id.clone());
@@ -223,6 +228,12 @@ pub fn za_withheld_cancels(
                 component
             }
         };
+        for address in to {
+            component.add_property(
+                ICalendarProperty::Attendee,
+                ICalendarValue::Text(format!("mailto:{address}")),
+            );
+        }
         let comp_id = message.components.len() as u32;
         message.components[0].component_ids.push(comp_id);
         message.components.push(component);
@@ -913,9 +924,10 @@ mod tests {
 
     /// Upgrade ruling 132: the recorded removals bob no longer attends, X
     /// (an override without him, at its committed SEQUENCE) and the
-    /// master-generated day 5 (at the master's), in one CANCEL that lists
-    /// no attendee; not Z, which he attends; nothing under `all`, for an
-    /// empty `to`, or for a master attendee's master-generated instance.
+    /// master-generated day 5 (at the master's), in one CANCEL that names
+    /// bob alone on each, not X's remaining attendee; not Z, which he
+    /// attends; nothing under `all`, for an empty `to`, or for a master
+    /// attendee's master-generated instance.
     #[test]
     fn withheld_cancels_carry_only_the_removals() {
         // A is X (day 2), C is Z (day 4), D the master-generated day 5.
@@ -941,9 +953,15 @@ mod tests {
         assert_eq!(components_of(cancel), [(Some(A), 3), (Some(D), 1)]);
         let text = cancel.message.to_string();
         assert!(
-            !text.contains("ATTENDEE") && text.matches("STATUS:CANCELLED").count() == 2,
+            !text.contains("key3@example.com")
+                && text.matches(&format!("ATTENDEE:mailto:{BOB}")).count() == 2
+                && text.matches("ATTENDEE").count() == 2
+                && text.matches("STATUS:CANCELLED").count() == 2,
             "{text}"
         );
+        // bob's own snapshot of it, as his drain takes it, holds both.
+        let bob_view = itip_snapshot(&cancel.message, &bob(), false).expect("bob is named");
+        assert_eq!(bob_view.components.len(), 2);
 
         assert!(
             za_withheld_cancels(&tree, &alice(), BOB, &[], &recorded_xzw, policy())
