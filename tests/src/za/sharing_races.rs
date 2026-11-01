@@ -4447,12 +4447,15 @@ async fn calendar_dead_property_last_writer_wins(
 /// `foreign_calendar_contexts` admitted the granted calendar and before any
 /// item is read, while the owner (i) revokes the grant or (ii) deletes the
 /// calendar. Each form (allprop, a named prop, propname) runs against the
-/// owner's home (a home listing) and against the calendar itself. A deletion
-/// serves nothing of the calendar or its event; after either change a new
-/// request is refused (403). The in-flight answer to a revocation is
-/// held for a ruling (part 7f3): items are read through the admission memo,
-/// so the refusal arms (`refusal`, `za_propname_item`'s Forbidden-in-a-home-
-/// listing and `Err` arms) are not reached from this race.
+/// owner's home (a home listing) and against the calendar itself. Sharing
+/// spec 4.4 lets a read-only request memoize its admitted calendar contexts
+/// within 4.6's in-flight read window, where a revoked grantee's request
+/// already in flight finishes on its own copy of the keys (rulings 148-150):
+/// a revocation's in-flight answer equals the unparked control's, a deletion
+/// serves no data, and a new request after either change is refused (403).
+/// Under that memo the refusal arms (`refusal`, `za_propname_item`'s
+/// Forbidden-in-a-home-listing and `Err` arms) are not reached from this
+/// race; they stay as defence in depth (ruling 149).
 async fn propfind_admission_races(test: &mut TestServer) {
     use crate::utils::za::{sharing_dav_request, za_post};
     use serde_json::json;
@@ -4591,11 +4594,10 @@ async fn propfind_admission_races(test: &mut TestServer) {
                 if change == "delete" {
                     // Nothing of the deleted calendar or its event is served:
                     // no name, content or dead property (value, or name in a
-                    // propname listing); allprop and prop answer each of the
-                    // admitted hrefs 404. Propname still lists the admitted
-                    // hrefs with the static property names alone (no store
-                    // read decides them), held for a ruling with the
-                    // revocation below.
+                    // propname listing). Allprop and prop answer each of the
+                    // admitted hrefs 404. Propname (ruling 150) lists each
+                    // admitted href with 200 and the static property names
+                    // alone: no store read decides that listing.
                     let data = served
                         .iter()
                         .filter(|canary| {
@@ -4603,30 +4605,35 @@ async fn propfind_admission_races(test: &mut TestServer) {
                                 && (form == "propname" || **canary != "urn:x-race-propfind")
                         })
                         .collect::<Vec<_>>();
-                    let found = [&calendar_path, &event_path]
+                    let shape = [&calendar_path, &event_path]
                         .into_iter()
                         .filter(|path| target == "calendar" || **path == calendar_path)
-                        .any(|path| {
+                        .all(|path| {
                             let item = super::sharing::response_of(&response.body, path);
-                            !item.is_empty() && item.contains("200 OK")
+                            if form == "propname" {
+                                item.contains("200 OK") && item.contains("<D:getetag/>")
+                            } else {
+                                item.is_empty() || !item.contains("200 OK")
+                            }
                         });
-                    if response.status != StatusCode::MULTI_STATUS
-                        || !data.is_empty()
-                        || (form != "propname" && found)
-                    {
+                    if response.status != StatusCode::MULTI_STATUS || !data.is_empty() || !shape {
                         failures.push(format!(
                             "{slug}: in flight {}, served {data:?}: {}",
                             response.status, response.body
                         ));
                     }
-                } else {
-                    // Held for a ruling (part 7f3): the request admitted before
-                    // the revocation is answered from its admission memo, so
-                    // `refusal` and `za_propname_item`'s arms do not run and
-                    // the calendar is served in full. The ruling-strength
-                    // assertion is kept in the plan workspace
-                    // (`task-7f3/case-ruling-strength.diff`).
-                    println!("propfind race {slug}: held for a ruling");
+                } else if response.status != control.status || response.body != control.body {
+                    // Rulings 148 and 149, sharing spec 4.4 and 4.6: a read-only
+                    // request memoizes the calendar contexts it admitted for
+                    // its own duration ("within 4.6's accepted in-flight read
+                    // window"), and "a revoked grantee's request already in
+                    // flight finishes on its own copy of the keys". So the
+                    // in-flight answer to a revocation is the control's, and
+                    // the refusal arms are not reached from this race.
+                    failures.push(format!(
+                        "{slug}: in flight {} differs from the control's {}: {}",
+                        response.status, control.status, response.body
+                    ));
                 }
                 // A request after the change is refused before admission: the
                 // reader holds no other grant on the owner, so the URI gate
