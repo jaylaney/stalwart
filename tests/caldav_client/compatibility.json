@@ -38,26 +38,6 @@
           "line": 415
         }
       },
-      "calendar/testAlarm": {
-        "outcome": "xfailed",
-        "exception": "AssertionError",
-        "reason": "Inherited server alarm time-range query returns zero events for the 07:40-07:55 query whose alarm is 07:45; test expects one. Event creation passes; alarm query compatibility remains a known gap.",
-        "source": "Pinned tests/test_caldav.py:2279 and caldav/compatibility_hints.py:stalwart search.time-range.alarm=False; unmasked diagnostic assertion len==1 observed0.",
-        "failure": {
-          "file": "tests/test_caldav.py",
-          "line": 2279
-        }
-      },
-      "calendar/testTodoDatesearch": {
-        "outcome": "xfailed",
-        "exception": "AssertionError",
-        "reason": "Inherited VTODO date search returns four resources where the pinned test initially expects five. Upstream Stalwart profile marks recurring todos and DTSTART-less date searches fragile; retain this exact test as strict xfail rather than importing broad flags.",
-        "source": "Pinned tests/test_caldav.py:3621; caldav/compatibility_hints.py:stalwart search.recurrences.includes-implicit.todo and search.time-range.todo.no-dtstart; unmasked diagnostic observed4 expected5.",
-        "failure": {
-          "file": "tests/test_caldav.py",
-          "line": 3621
-        }
-      },
       "calendar/testRecurringDateSearch": {
         "outcome": "xfailed",
         "exception": "AssertionError",
@@ -66,16 +46,6 @@
         "failure": {
           "file": "tests/test_caldav.py",
           "line": 4391
-        }
-      },
-      "calendar/testRecurringDateWithExceptionSearch": {
-        "outcome": "xfailed",
-        "exception": "AssertionError",
-        "reason": "Client-side recurrence exception expansion returns two correct instances, but server-side expansion returns three including the overridden original. The mandatory strict recurrence flow checks client-side overrides and adjacent instances only; it does not cover this server-side gap.",
-        "source": "Pinned tests/test_caldav.py:4469; caldav/compatibility_hints.py:stalwart search.recurrences.expanded.exception; unmasked diagnostic observed3 expected2.",
-        "failure": {
-          "file": "tests/test_caldav.py",
-          "line": 4469
         }
       }
     }
@@ -119,26 +89,6 @@
           "line": 415
         }
       },
-      "calendar/testAlarm": {
-        "outcome": "xfailed",
-        "exception": "AssertionError",
-        "reason": "Inherited server alarm time-range query returns zero events for the 07:40-07:55 query whose alarm is 07:45; test expects one. Event creation passes; alarm query compatibility remains a known gap.",
-        "source": "Pinned tests/test_caldav.py:2279 and caldav/compatibility_hints.py:stalwart search.time-range.alarm=False; unmasked diagnostic assertion len==1 observed0.",
-        "failure": {
-          "file": "tests/test_caldav.py",
-          "line": 2279
-        }
-      },
-      "calendar/testTodoDatesearch": {
-        "outcome": "xfailed",
-        "exception": "AssertionError",
-        "reason": "Inherited VTODO date search returns four resources where the pinned test initially expects five. Upstream Stalwart profile marks recurring todos and DTSTART-less date searches fragile; retain this exact test as strict xfail rather than importing broad flags.",
-        "source": "Pinned tests/test_caldav.py:3621; caldav/compatibility_hints.py:stalwart search.recurrences.includes-implicit.todo and search.time-range.todo.no-dtstart; unmasked diagnostic observed4 expected5.",
-        "failure": {
-          "file": "tests/test_caldav.py",
-          "line": 3621
-        }
-      },
       "calendar/testRecurringDateSearch": {
         "outcome": "xfailed",
         "exception": "AssertionError",
@@ -147,16 +97,6 @@
         "failure": {
           "file": "tests/test_caldav.py",
           "line": 4391
-        }
-      },
-      "calendar/testRecurringDateWithExceptionSearch": {
-        "outcome": "xfailed",
-        "exception": "AssertionError",
-        "reason": "Client-side recurrence exception expansion returns two correct instances, but server-side expansion returns three including the overridden original. The mandatory strict recurrence flow checks client-side overrides and adjacent instances only; it does not cover this server-side gap.",
-        "source": "Pinned tests/test_caldav.py:4469; caldav/compatibility_hints.py:stalwart search.recurrences.expanded.exception; unmasked diagnostic observed3 expected2.",
-        "failure": {
-          "file": "tests/test_caldav.py",
-          "line": 4469
         }
       }
     }
