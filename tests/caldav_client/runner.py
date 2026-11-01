@@ -279,9 +279,17 @@ class ProductServer:
 
     def bootstrap(self):
         self.start(recovery=True)
+        self.provision()
+        stop_child(self.child)
+        self.child = None
+        self.start(recovery=False)
+
+    def provision(self):
+        # The recovery server's settings, shared with tests/product/fresh_store.py, which
+        # adds its own listeners after these. Registry field names are 1.0's.
         # Disable background application downloads: these fixtures exercise only CalDAV.
         for application in self.objects("Application"):
-            self.update("Application", application["id"], {"enabled": False})
+            self.update("Application", application["id"], {"enable": False})
         self.create("NetworkListener", {"name": "client-ci", "protocol": "http",
                     "bind": {f"127.0.0.1:{self.http_port}": True}, "useTls": False})
         self.create("Asn", {"@type": "Disabled"})
@@ -294,41 +302,49 @@ class ProductServer:
             self.create("SpamSettings", {"enable": False, "spamFilterRulesUrl": None})
         self.create("Tracer", {"@type": "Stdout", "enable": True, "ansi": False,
                                "level": "warn"})
-        stop_child(self.child)
-        self.child = None
-        self.start(recovery=False)
 
     def users(self, mode):
         domain_name = f"{mode}.client-ci.test"
-        domain = self.create("Domain", {"name": domain_name, "isEnabled": True,
-                            "certificateManagement": {"@type": "Manual"},
-                            "dnsManagement": {"@type": "Manual"},
-                            "dkimManagement": {"@type": "Manual"}})
+        domain = self.domain(domain_name)
         users = []
         for name in ("alice", "bob", "carol"):
-            username = f"{name}@{domain_name}"
-            password = secrets.token_urlsafe(32)
-            self.redactor.credentials(username, password)
-            credentials = {} if mode == "key" else {"0": {"@type": "Password", "secret": password}}
-            self.create("Account", {"@type": "User", "name": name, "domainId": domain,
-                                    "credentials": credentials})
-            if mode == "key":
-                token = response_string(self.request("/api/vault/setup-token",
-                                                     {"account": username}),
-                                        "token", "public API /api/vault/setup-token")
-                self.redactor.secret(token)
-                setup = self.request("/api/vault/setup", {"username": username, "token": token,
-                                                         "password": password}, auth=False)
-                recovery_key = response_string(setup, "recovery_key", "public API /api/vault/setup")
-                self.redactor.secret(recovery_key)
-                new_password = secrets.token_urlsafe(32)
-                self.redactor.credentials(username, new_password)
-                self.request("/api/vault/password", {"username": username, "password": password,
-                                                     "new_password": new_password}, auth=False)
-                password = new_password
+            username, password = self.account(domain, domain_name, name, key=mode == "key")
             users.append({"url": self.url + "/dav/cal/" + username + "/",
                           "username": username, "password": password})
         return users
+
+    def domain(self, domain_name):
+        return self.create("Domain", {"name": domain_name, "enable": True,
+                           "certificateManagement": {"@type": "Manual"},
+                           "dnsManagement": {"@type": "Manual"},
+                           "dkimManagement": {"@type": "Manual"}})
+
+    def account(self, domain, domain_name, name, key):
+        """Create a user; a key account then completes the vault setup flow.
+
+        Returns the login address and its current password (the password is redacted).
+        """
+        username = f"{name}@{domain_name}"
+        password = secrets.token_urlsafe(32)
+        self.redactor.credentials(username, password)
+        credentials = {} if key else {"0": {"@type": "Password", "secret": password}}
+        self.create("Account", {"@type": "User", "name": name, "domainId": domain,
+                                "credentials": credentials})
+        if key:
+            token = response_string(self.request("/api/vault/setup-token",
+                                                 {"account": username}),
+                                    "token", "public API /api/vault/setup-token")
+            self.redactor.secret(token)
+            setup = self.request("/api/vault/setup", {"username": username, "token": token,
+                                                     "password": password}, auth=False)
+            recovery_key = response_string(setup, "recovery_key", "public API /api/vault/setup")
+            self.redactor.secret(recovery_key)
+            new_password = secrets.token_urlsafe(32)
+            self.redactor.credentials(username, new_password)
+            self.request("/api/vault/password", {"username": username, "password": password,
+                                                 "new_password": new_password}, auth=False)
+            password = new_password
+        return username, password
 
     def close(self):
         try:
