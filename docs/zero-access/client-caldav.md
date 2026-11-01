@@ -53,8 +53,9 @@ missing classes, individual tests, parameter cases, strict flows, reports, or fi
 runs. The runner clears caller pytest options and third-party plugin autoloading.
 
 `tests/caldav_client/compatibility.json` is the reviewed exception policy. Every feature change and
-expected skip/xfail needs an explanation. The per-mode policies intentionally duplicate the same
-records for now, keeping each account mode independently reviewable. The runner rejects unknown
+expected skip/xfail needs an explanation. The per-mode policies duplicate their shared records,
+keeping each account mode independently reviewable; at 1.0 the ordinary-account policy also holds
+two records of its own (below). The runner rejects unknown
 feature names; the plugin fails unlisted skips, xfails, xpasses, missing policy tests, and stale
 exceptions that start passing. It does not inherit the upstream `stalwart` profile's broad flags.
 Upstream's `testCheckCompatibility` intentionally skips because the optional server tester's
@@ -83,19 +84,33 @@ Server-side all-day and exception expansion remain known gaps tracked by the pre
 expected failures; the mandatory client-side recurrence flow does not cover or compensate for those
 gaps. vdirsyncer and native/physical client acceptance remain separate work.
 
-The pinned local run on 2026-10-25 passed the 72-case ordinary manifest (66 passed, one skipped,
-five xfailed) and 77-case key manifest (71 passed, one skipped, five xfailed). All five new strict
-sharing flows passed without compatibility exceptions. The exact commands, identities, earlier
-failed attempts and sanitized logs are recorded in the
+The pinned local run on 2026-10-25, on the 0.16 base, passed the 72-case ordinary manifest (66
+passed, one skipped, five xfailed) and 77-case key manifest (71 passed, one skipped, five xfailed).
+All five new strict sharing flows passed without compatibility exceptions. The exact commands,
+identities, earlier failed attempts and sanitized logs are recorded in the
 [coverage outcome](../superpowers/plans/2026-10-25-calendar-sharing-client-coverage-outcome.md).
 Native/physical client acceptance and GitHub Actions results remain separate evidence.
+
+On upstream 1.0.1 (the upgrade's Task 8, recorded in its
+[outcome note](../superpowers/plans/2026-10-27-stalwart-1-upgrade-outcome.md)):
+
+- `testAlarm`, `testTodoDatesearch` and `testRecurringDateWithExceptionSearch` pass in both modes,
+  so their strict xfails were removed and they are ordinary required passes.
+- The sharing flow's If-Match race uses live per-principal properties: the owner's `displayname`
+  and the grantee's `calendar-description`. At 1.0 a calendar's dead properties (`calendar-color`)
+  sit outside the archive whose hash is the collection's ETag, so a dead-only PROPPATCH leaves the
+  ETag unchanged. A separate case asserts that for owner and grantee: the ETag stays, a
+  stale-If-Match colour PROPPATCH answers 207, the last writer wins, and the colour stays shared.
+- Two ordinary-account records (below): the delegation flow is a strict xfail, and
+  `testSearchEvent` a non-strict one. Both stay required passes for key accounts.
 
 ## Compatibility findings
 
 The policy below is based on the pinned source and unmasked diagnostics against the fresh worktree
-product. Both modes reproduced six failures, 64 passes, and two skips before the policy. The policy
-applies identically in both account modes. These are compatibility limits, not successful product
-assertions or native-client acceptance.
+product. On the 0.16 base, both modes reproduced six failures, 64 passes, and two skips before the
+policy. The shared records apply identically in both account modes; the last two rows are
+ordinary-account (plain mode) records only. These are compatibility limits, not successful
+product assertions or native-client acceptance.
 
 | Test/feature | Recorded behavior and boundary | Evidence at the client pin |
 | --- | --- | --- |
@@ -105,15 +120,20 @@ assertions or native-client acceptance.
 | `scheduling.mailbox.inbox-delivery=true` | Local iTIP request history is readable in the inbox after import. This says nothing about external iMIP. | Strict flow requires matching UID and METHOD:REQUEST history; design section 6.6. |
 | `testCheckCompatibility` (skip) | The optional separately released server checker is intentionally omitted upstream because its probes do not match the pinned feature matrix. | `pyproject.toml` test dependencies and `test_caldav.py:1634-1645`. |
 | `testPrincipals` (strict xfail) | The upstream test calls deprecated `DAVClient.principals()`, which emits DeprecationWarning under upstream's warnings-as-errors configuration before principal search executes. This is an upstream client-test defect. | `test_caldav.py:2017`, `davclient.py:415`, `pyproject.toml` warning policy. |
-| `testAlarm` (strict xfail) | Creating the event succeeds; the server returns zero events for the 07:40–07:55 alarm-range query whose alarm is 07:45, where the test expects one. Alarm-range search remains an inherited gap. | `test_caldav.py:2279`; upstream Stalwart hint disables `search.time-range.alarm`. |
-| `testTodoDatesearch` (strict xfail) | The inherited VTODO date query returns four resources where the first count assertion expects five. No broad recurring-todo or DTSTART-less-task flags are imported to hide it. | `test_caldav.py:3621`; upstream Stalwart hints mark recurring todos and DTSTART-less date search fragile. |
 | `testRecurringDateSearch` (strict xfail) | Client expansion passes; explicit server expansion retains the original all-day DTSTART year instead of the searched anniversary year. | `test_caldav.py:4391`; diagnostic expected one `DTSTART;VALUE=DATE:2026`, found zero. |
-| `testRecurringDateWithExceptionSearch` (strict xfail) | Client exception expansion produces the two correct instances; server expansion returns three including the overridden original. | `test_caldav.py:4469`; upstream Stalwart hint records `search.recurrences.expanded.exception` fragile. |
+| `testAlarm`, `testTodoDatesearch`, `testRecurringDateWithExceptionSearch` (pass) | Strict xfails on the 0.16 base (alarm-range search, a VTODO date query, server expansion of an exception). They pass on 1.0.1 in both modes, so their records were removed. | Task 8 runs; no single 1.0.1 changelog entry names them. |
+| `testSearchEvent` (non-strict xfail, plain only) | 1.0 indexes an ordinary account's calendar text asynchronously; a text search right after a PUT can miss. The test recreates its calendar, PUTs three events and searches their summaries at once, so it passes or fails on that race. It may pass; a failure is accepted only at one of the four summary-search assertions. A per-test retry was tried first and failed all three attempts, since each attempt recreates the calendar and searches right after its PUTs. Key accounts search in memory and stay a required pass. | `test_caldav.py:2793`, `2804`, `2810`, `2815`; 3 of 20 immediate text searches found a new event, 20 of 20 within 5 s. |
+| `flows/test_delegation_and_organizer_mediated_status` (strict xfail, plain only) | 1.0 refuses a delegator-forwarded REQUEST (sender must be the organizer): its attendee path sends the delegate's REQUEST from the delegator, and its own iTIP ingest refuses it, so Carol is never invited. Key accounts invite the delegate through the organizer-side drain and stay a required pass. If 1.0's behaviour changes, the unexpected pass fails CI. | Carol's poll at `tests/caldav_client/test_flows.py:164` fails in `poll_event` at `:67`; server log `calendar.itip-message-error` "Sender is not the organizer". |
 
-Every xfail is constrained to the observed call-phase exception type and deepest source file/line;
-setup and teardown failures always fail. An expected call failure followed by a teardown failure
-still fails. Xfails are strict: an unexpected pass fails CI and requires revisiting the record.
-Other failures remain failures. Mandatory strict flows cannot be listed in the exception policy, and
-the complete test/report manifest remains required. In particular, recurring exception client
-behavior, key-account Carol-before-Alice absence, and Bob's unchanged delegate status/inbox before
-an organizer update have no waivers.
+Every xfail is constrained to the observed call-phase exception type (`AssertionError`,
+`DeprecationWarning`, or `Failed`, pytest's own failure) and deepest source file/line, after
+pytest's hidden frames are left out as its report does; a record may also name that frame's
+caller (`via`). Setup and teardown failures always fail. An expected call failure followed by a
+teardown failure still fails. Xfails are strict: an unexpected pass fails CI and requires
+revisiting the record. The one exception is a record marked `"strict": false`, which may also
+pass. A record may list several lines (`lines`) where one race fails at more than one
+assertion. Other failures remain failures. A
+mandatory strict flow can be listed only as a strict xfail, never as a skip or a non-strict
+xfail, and the complete test/report manifest remains required. In particular, recurring exception
+client behavior, key-account Carol-before-Alice absence, and Bob's unchanged delegate status/inbox
+before an organizer update have no waivers.
