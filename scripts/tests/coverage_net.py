@@ -154,8 +154,9 @@ class Net:
         log = self.out / "logs" / f"{step}.attempt{attempt}.log"
         start, began = now(), time.time()
         with open(log, "wb") as output:
-            child = subprocess.Popen(cmd, cwd=REPO, env=self.env(extra), stdout=output,
-                                     stderr=subprocess.STDOUT, start_new_session=True)
+            child = subprocess.Popen(cmd, cwd=REPO, env=self.env(extra), stdin=subprocess.DEVNULL,
+                                     stdout=output, stderr=subprocess.STDOUT,
+                                     start_new_session=True)
             try:
                 status = child.wait(timeout=timeout)
             except subprocess.TimeoutExpired:

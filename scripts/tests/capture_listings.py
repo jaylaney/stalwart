@@ -22,8 +22,13 @@ import argparse
 import datetime
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
+
+# A listing that builds its binaries from cold can take a while; one that outlasts this is
+# stopped (with its process group) and reported, instead of holding the job.
+COMMAND_TIMEOUT = 45 * 60
 
 REPO = Path(__file__).resolve().parents[2]
 BASE_ENV = {"STORE": "RocksDb", "RUST_MIN_STACK": "16777216"}
@@ -104,9 +109,19 @@ def run(cmd, extra):
         env.pop(key, None)
     env.update(BASE_ENV)
     env.update(extra)
-    result = subprocess.run(cmd, cwd=REPO, env=env, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True)
-    return result.returncode, result.stdout
+    print(f"{now()} start: {' '.join(cmd)[:200]}", flush=True)
+    child = subprocess.Popen(cmd, cwd=REPO, env=env, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                             start_new_session=True)
+    try:
+        output, _ = child.communicate(timeout=COMMAND_TIMEOUT)
+        status = child.returncode
+    except subprocess.TimeoutExpired:
+        os.killpg(child.pid, signal.SIGKILL)
+        output, _ = child.communicate()
+        status = "timeout"
+    print(f"{now()} exit {status}", flush=True)
+    return status, output
 
 
 def capture(out, name, spec, ignored, unit_features):
