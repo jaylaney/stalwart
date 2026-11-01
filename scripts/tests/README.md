@@ -160,7 +160,8 @@ At 0.16.27, upstream's inline test modules sat in their own files; at 1.0 they l
 python3 -I scripts/tests/test_gates.py -v
 ```
 
-The 28 offline tests take about 4 seconds. Their docstring lists the cases:
+The 30 offline tests take about 4 seconds; the run reports 32, the two `--real` tests below
+skipped. Their docstring lists the cases:
 - the strict rule on synthetic exports, run through `strict_rule.py functions`;
 - listing faults against a candidate built from the committed baseline's own records;
 - coverage exports one line below each threshold, with a restored test file that would

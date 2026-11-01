@@ -311,7 +311,7 @@
   },
   {
    "id": "sharing-move-bytes-oversize",
-   "kind": "subject_deleted",
+   "kind": "internals_replaced_no_equivalent",
    "scope": "case",
    "subjects": [
     {
@@ -321,12 +321,16 @@
      "case": "the byte-oversize MOVE case"
     }
    ],
-   "evidence": "Ruling 81 (N4): the byte-oversize case inside `controls` is retired as unreachable at 1.0 (a collection MOVE rewrites rows only: 120 operations, 12,516 bytes for 30 events of 230 KB); the operations and split cases stay and the byte budget stays in the code. Ruling 103, settled in part 7d1: the function still executes under the strict rule in every step where it executed at 0.16.27, and neither gate fails on the retired case, so the entry is documentation (scope `case`, never applied by the gates). Expectation ledger: `za::sharing_move_atomic` (part 7c2)."
+   "evidence": "Ruling 81 (N4): the byte-oversize case inside `controls` is retired as unreachable at 1.0 (a collection MOVE rewrites rows only: 120 operations, 12,516 bytes for 30 events of 230 KB); the operations and split cases stay and the byte budget stays in the code. Ruling 103, settled in part 7d1: the function still executes under the strict rule in every step where it executed at 0.16.27, and neither gate fails on the retired case, so the entry is documentation (scope `case`, never applied by the gates). Expectation ledger: `za::sharing_move_atomic` (part 7c2). Kind corrected by ruling 135 (M4): the case is unreachable at 1.0, not deleted, and has no equivalent."
   },
   {
    "id": "leak-fetch-email",
-   "kind": "internals_replaced_equivalent",
+   "kind": "internals_replaced_no_equivalent",
    "scope": "function",
+   "steps": [
+    "za-tests",
+    "za-tests-fs-blob"
+   ],
    "subjects": [
     {
      "file": "tests/src/utils/server.rs",
@@ -334,19 +338,15 @@
      "name": "fetch_email"
     }
    ],
-   "equivalents": [
-    {
-     "file": "tests/src/za/leak.rs",
-     "in": null,
-     "name": "scan"
-    }
-   ],
-   "evidence": "Part 7d1 (the candidate's net): `za::leak::scan` no longer calls `TestServer::fetch_email`; it reads each message's metadata row in the immutable class itself and its blob, and reports a message without a row as a violation instead of panicking. Expectation ledger `za::leak::scan` and `token_hits` (part 6d: \"A message's row is checked in `Immutable` as a `MetadataRow` stub\"). `fetch_email` still runs in `webdav-plain`, where no disposition is needed."
+   "evidence": "Part 7d1 (the candidate's net): `za::leak::scan` no longer calls `TestServer::fetch_email`; it reads each message's metadata row in the immutable class itself and its blob, and reports a message without a row as a violation instead of panicking. Expectation ledger `za::leak::scan` and `token_hits` (part 6d: \"A message's row is checked in `Immutable` as a `MetadataRow` stub\"). `fetch_email` still runs in `webdav-plain`, where no disposition is needed. Ruling 135 (M5): `scan` is already required in both ZA steps, so naming it as the equivalent added no requirement; the entry is a no-equivalent excusal limited to those two steps."
   },
   {
    "id": "webdav-key-raw-event",
    "kind": "internals_replaced_equivalent",
    "scope": "function",
+   "steps": [
+    "webdav-key"
+   ],
    "subjects": [
     {
      "file": "tests/src/za/dav_seal.rs",
@@ -361,7 +361,7 @@
      "name": "raw_event_records"
     }
    ],
-   "evidence": "Part 4c, \"How the existing modules were adapted\": `webdav/za_variants.rs` reads the schedule tag from the row and scans both records (`raw_event_records`, `StoredEvent::bytes`) where 0.16 called `raw_event`, because 1.0 splits an event into a row and a content record. `raw_event` still runs in both ZA steps."
+   "evidence": "Part 4c, \"How the existing modules were adapted\": `webdav/za_variants.rs` reads the schedule tag from the row and scans both records (`raw_event_records`, `StoredEvent::bytes`) where 0.16 called `raw_event`, because 1.0 splits an event into a row and a content record. `raw_event` still runs in both ZA steps. Limited to `webdav-key` (ruling 135, M3): `raw_event` still runs in `za-tests` and `za-tests-fs-blob`, where `raw_event_records` runs too, so an unlimited entry would excuse its loss there."
   },
   {
    "id": "lookup-unreachable-empty-checks",
