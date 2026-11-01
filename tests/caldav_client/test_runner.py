@@ -367,11 +367,27 @@ def test_safe_failure(case, monkeypatch):
         self.assertTrue(runner.check_outcomes({"testNew": "skipped"}, policy))
         self.assertTrue(runner.check_outcomes({"testKnown": "passed"}, policy))
 
-    def test_strict_flows_cannot_be_added_to_exception_policy(self):
+    def test_strict_flows_can_only_be_strict_expected_failures(self):
         with self.assertRaises(ValueError):
-            runner.check_outcomes({"flows/test_invitation": "xfailed"}, {
-                "flows/test_invitation": {"outcome": "xfailed", "exception": "AssertionError",
-                                          "reason": "bad waiver", "source": "fixture"}})
+            runner.check_outcomes({"flows/test_invitation": "skipped"}, {
+                "flows/test_invitation": {"outcome": "skipped", "reason": "bad waiver",
+                                          "source": "fixture"}})
+        record = {"outcome": "xfailed", "exception": "Failed", "reason": "ruling 166",
+                  "source": "fixture"}
+        self.assertEqual(runner.check_outcomes({"flows/test_invitation": "xfailed"},
+                                               {"flows/test_invitation": record}), [])
+        self.assertTrue(runner.check_outcomes({"flows/test_invitation": "passed"},
+                                              {"flows/test_invitation": record}))
+
+    def test_failure_fingerprint_via_must_be_a_relative_location(self):
+        expected = {"calendar/testKnown"}
+        for via in ({"file": "/abs.py", "line": 3}, {"file": "a.py", "line": 0},
+                    {"file": "../a.py", "line": 3}, {"file": "a.py", "line": 3, "x": 1}, []):
+            with self.subTest(via=via), self.assertRaises(ValueError):
+                runner.validate_policy({"features": {}, "outcomes": {"calendar/testKnown": {
+                    "outcome": "xfailed", "exception": "Failed", "reason": "why",
+                    "source": "fixture",
+                    "failure": {"file": "a.py", "line": 3, "via": via}}}}, expected)
 
     def test_policy_cannot_accept_an_actual_failure(self):
         with self.assertRaises(ValueError):
@@ -485,6 +501,86 @@ def test_safe_failure(case, monkeypatch):
                                            "source": "fixture"}})
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertIn("COMPATIBILITY POLICY", result.stdout)
+
+    def test_flow_xfail_matches_pytest_fail_at_its_location_and_caller_only(self):
+        # A strict flow's poll fails through pytest.fail inside a helper (ruling 166). The
+        # record names the helper's line and its caller's; pytest's hidden frame is skipped.
+        source = ("import pytest\n"
+                  "def poll(ok):\n"
+                  "    if not ok:\n"
+                  "        pytest.fail('did not reach its state')  # poll\n"
+                  "def test_delegation():\n"
+                  "    poll(BODY_A)  # first\n"
+                  "    poll(BODY_B)  # second\n")
+        lines = {tag: next(i for i, text in enumerate(source.splitlines(), 1)
+                           if "# " + tag in text) for tag in ("poll", "first", "second")}
+        cases = {
+            "expected": ("True", "False", "second", 0),
+            "other caller": ("False", "True", "second", 1),
+            "xpass": ("True", "True", "second", 1),
+        }
+        for name, (first, second, via, expected_exit) in cases.items():
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as raw:
+                body = source.replace("BODY_A", first).replace("BODY_B", second)
+                result = self.policy_case(Path(raw), body, {
+                    "flows/test_delegation": {
+                        "outcome": "xfailed", "exception": "Failed", "reason": "fixture",
+                        "source": "fixture", "failure": {
+                            "file": "test_flows.py", "line": lines["poll"],
+                            "via": {"file": "test_flows.py", "line": lines[via]}}}},
+                    expected=["flows/test_delegation"], filename="test_flows.py")
+                self.assertEqual(result.returncode, expected_exit, result.stdout + result.stderr)
+
+    def test_non_strict_xfail_accepts_a_pass_or_a_failure_at_its_lines_only(self):
+        # Ruling 167: plain-mode testSearchEvent races 1.0's asynchronous calendar index.
+        source = ("class TestForServerStalwartPlain:\n"
+                  "    def testKnown(self):\n"
+                  "        assert FIRST  # first\n"
+                  "        assert SECOND  # second\n"
+                  "        assert THIRD  # third\n")
+        lines = {tag: next(i for i, text in enumerate(source.splitlines(), 1)
+                           if "# " + tag in text) for tag in ("first", "second", "third")}
+        record = {"outcome": "xfailed", "strict": False, "exception": "AssertionError",
+                  "reason": "fixture", "source": "fixture",
+                  "failure": {"file": "test_sample.py",
+                              "lines": [lines["second"], lines["third"]]}}
+        cases = {
+            "pass": (("True", "True", "True"), 0, "1 passed"),
+            "listed line": (("True", "False", "True"), 0, "1 xfailed"),
+            "other listed line": (("True", "True", "False"), 0, "1 xfailed"),
+            "unlisted line": (("False", "True", "True"), 1, "1 failed"),
+        }
+        for name, (values, expected_exit, summary) in cases.items():
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as raw:
+                body = source
+                for tag, value in zip(("FIRST", "SECOND", "THIRD"), values):
+                    body = body.replace(tag, value)
+                result = self.policy_case(Path(raw), body, {"calendar/testKnown": record})
+                output = result.stdout + result.stderr
+                self.assertEqual(result.returncode, expected_exit, output)
+                self.assertIn(summary, output)
+        with self.subTest(case="key mode has no record"), tempfile.TemporaryDirectory() as raw:
+            body = source.replace("FIRST", "True").replace("SECOND", "False")
+            result = self.policy_case(Path(raw), body.replace("THIRD", "True"), mode="key")
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
+    def test_strictness_is_only_for_expected_failures_and_never_for_flows(self):
+        base = {"reason": "why", "source": "fixture"}
+        xfail = {**base, "outcome": "xfailed", "exception": "AssertionError",
+                 "failure": {"file": "a.py", "line": 3}}
+        for name, record in (("calendar/testKnown", {**base, "outcome": "skipped",
+                                                     "strict": False}),
+                             ("calendar/testKnown", {**xfail, "strict": "no"}),
+                             ("flows/test_known", {**xfail, "strict": False})):
+            with self.subTest(name=name, record=record), self.assertRaises(ValueError):
+                runner.check_outcomes({}, {name: record})
+        for failure in ({"file": "a.py", "lines": []}, {"file": "a.py", "lines": [3, 3]},
+                        {"file": "a.py", "line": 3, "lines": [4]},
+                        {"file": "a.py", "lines": [0]}, {"file": "a.py", "lines": 3}):
+            with self.subTest(failure=failure), self.assertRaises(ValueError):
+                runner.validate_policy({"features": {}, "outcomes": {
+                    "calendar/testKnown": {**xfail, "strict": False, "failure": failure}}},
+                    {"calendar/testKnown"})
 
     def test_malformed_policy_is_usage_error_before_test_runs(self):
         records = [

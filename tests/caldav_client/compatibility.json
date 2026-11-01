@@ -47,6 +47,36 @@
           "file": "tests/test_caldav.py",
           "line": 4391
         }
+      },
+      "calendar/testSearchEvent": {
+        "outcome": "xfailed",
+        "strict": false,
+        "exception": "AssertionError",
+        "reason": "1.0 indexes calendar text asynchronously; a search right after a PUT can miss",
+        "source": "Pinned tests/test_caldav.py:2690-2815: testSearchEvent recreates its calendar, PUTs three events and text-searches their summaries at once. At 1.0 an ordinary account's calendar text search reads the search index, written after the PUT: a text-match calendar-query right after each of 20 PUTs found the event 3 times, and within 5 s 20 times. Failures seen at lines 2793 and 2804; 2810 and 2815 are the same searches. A per-test retry (ruling 167) failed all three attempts, since each attempt recreates the calendar and searches right after its PUTs. Key mode searches in memory and stays a required pass.",
+        "failure": {
+          "file": "tests/test_caldav.py",
+          "lines": [
+            2793,
+            2804,
+            2810,
+            2815
+          ]
+        }
+      },
+      "flows/test_delegation_and_organizer_mediated_status": {
+        "outcome": "xfailed",
+        "exception": "Failed",
+        "reason": "1.0 refuses a delegator-forwarded REQUEST (sender must be the organizer)",
+        "source": "Upstream 1.0.1 crates/groupware/src/calendar/itip.rs:174-181 refuses a REQUEST whose sender is not the organizer, while its attendee path (scheduling/attendee.rs, \"Invite new delegates\") sends the delegate's REQUEST from the delegator; server log: calendar.itip-message-error \"Sender is not the organizer\". Carol's poll at tests/caldav_client/test_flows.py:164 times out. Key mode invites the delegate through the organizer-side drain and stays a required pass.",
+        "failure": {
+          "file": "tests/caldav_client/test_flows.py",
+          "line": 67,
+          "via": {
+            "file": "tests/caldav_client/test_flows.py",
+            "line": 164
+          }
+        }
       }
     }
   },
