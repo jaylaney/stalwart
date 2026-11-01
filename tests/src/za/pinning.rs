@@ -1751,7 +1751,9 @@ async fn case_11_withheld_override_removal(test: &TestServer) {
     };
     let (alice, bob, carol) = parties(test);
     for uid in ["pin-11o", "pin-11o2", "pin-11o3"] {
-        let (bob_start, carol_start) = (
+        // alice's start too: `pin-11o3`'s decline reaches her inbox.
+        let (alice_start, bob_start, carol_start) = (
+            inbox_ids(test, alice.id).await,
             inbox_ids(test, bob.id).await,
             inbox_ids(test, carol.id).await,
         );
@@ -2013,6 +2015,7 @@ async fn case_11_withheld_override_removal(test: &TestServer) {
 
         // Cleanup.
         delete_event(&alice, &path).await;
+        alice.delete_items_since(test, &alice_start).await;
         clear_recipient(test, &bob, &bob_start, uid).await;
         clear_recipient(test, &carol, &carol_start, uid).await;
     }
