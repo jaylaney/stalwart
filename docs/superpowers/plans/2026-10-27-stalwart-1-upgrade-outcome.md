@@ -7550,68 +7550,66 @@ Restored with `git checkout -- <files>`, the same two builds and `unit-tests` we
 
 ### Task 7 results
 
-Consolidated from parts 7a to 7d. The authoritative run of each row is the last one listed
-here; the part sections above hold every attempt. Every Cargo command starts with
-`export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$PATH"`; integration rows also set
-`STORE=RocksDb RUST_MIN_STACK=16777216`, `ZA_KEY_ACCOUNTS=1` on key rows only (unset on plain
-rows). Logs: `task-7c/logs/` (matrix), `task-7d/` (net and gates), `task-7d2/` (this part).
+The record of Task 7 is the final SHA `6fd9a131f` (fix round 2, part 7f4, ruling 157). Every
+row below ran at it, on a clean tree: once uninstrumented, and once in the 19-step llvm-cov
+net plus `za-cache-swap`. The part sections above hold every earlier attempt, at earlier SHAs.
+Every Cargo command starts with `export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$PATH"`.
+Integration rows also set `STORE=RocksDb RUST_MIN_STACK=16777216`, and `ZA_KEY_ACCOUNTS=1` on
+key rows only (unset on plain rows). Logs: `task-7c/logs/` (the uninstrumented rows),
+`task-7d/coverage-7f4/` (the net) and `task-7d/gates/7f4/` (the gates).
 
-#### Compile checks (part 7a, at `ce4ee7c9a`)
+#### Compile checks (at `6fd9a131f`)
 
 | Check | Result |
 |---|---|
 | `cargo check -p stalwart --no-default-features --features rocks` | pass, no warning |
 | `cargo fmt --all --check` | pass |
 | `cargo check --workspace --tests` | pass, no warning |
-| `cargo test -p tests --no-run` | pass (the macOS linker's unwind-table size warning only) |
-| `cargo test --workspace --exclude tests --exclude scim --exclude scim-proto --lib --bins --no-run --features "$UNIT_TEST_FEATURES"` | pass, no warning (at `31d192cad`) |
+| `cargo test -p tests --no-run` | pass (built by the ZA row) |
+| `cargo test --workspace --exclude tests --exclude scim --exclude scim-proto --lib --bins --no-run --features "$UNIT_TEST_FEATURES"` | pass (built by the workspace-units row) |
 
-#### The matrix
+#### The matrix (at `6fd9a131f`)
 
-Two final runs cover the matrix: the uninstrumented one at `3de0dfff2` (part 7c4), and the
-19-step llvm-cov net at the final SHA `52ee3ad8c` (part 7f3, ruling 141; 7d1b's net at
-`b39124246` is in its section above). Since `3de0dfff2`, `tests` and `crates` gained part
-7d1b's five unit tests and one ZA case, fix round 1's kernel fixes and tests (parts 7f1, 7f2)
-and part 7f3's test hook and case. Counts are passed / failed / ignored. "Attempts" counts
-every run of the row in parts 7c to 7c4 (`task-7c/logs/`).
+Counts are passed / failed / ignored. "Attempts" counts the runs at `6fd9a131f`. The earlier
+history of each row (parts 7c to 7f3) is in the part sections above.
 
-| Row | Command | `3de0dfff2` (7c4) | `52ee3ad8c` (7f3 net) | Attempts, failures and retries |
+| Row | Command | Uninstrumented at `6fd9a131f` (log) | Net at `6fd9a131f` (step, wall) | Attempts, failures and retries at `6fd9a131f` |
 |---|---|---|---|---|
-| Formatting | `cargo fmt --all --check` | rc 0 | rc 0 at `c46b7293d` and at this part's commits | none |
-| Workspace units | `cargo test --workspace --exclude tests --exclude scim --exclude scim-proto --lib --bins --features "$UNIT_TEST_FEATURES"` (net: `--exclude-from-test scim --exclude-from-test scim-proto --lib --bins --tests --no-fail-fast -- --exact --skip <98 tests-crate tests>`) | 555 / 0 / 2 (`units-2`) | 568 / 0 / 2 | 2 runs; the two ignored are 0.16's `classifier::sgd::tests::text_classifier` and `modules::pyzor::test::send_message` |
-| Vault and groupware | `cargo test -p vault -p groupware --features vault/test_mode` | 213 / 0 / 0 (`vaultgw-2`) | in the unit step (223 listed) | 2 runs |
-| ZA | `cargo test -p tests za::za_tests -- --exact --nocapture` | 1 / 0 / 0 (`za-88`) | 1 / 0 / 0 (6:17) | 88 runs: 78 failures in 7c fixed in place or held for rulings 79-96, then 7c2-7c4's kernel fixes (rulings 91-94) |
-| ZA leak unit | `cargo test -p tests za::leak::tests::try_archive_short_values_are_not_archives -- --exact` | 1 / 0 / 0 (`zaleak-3`) | 1 / 0 / 0 | 3 runs |
-| ZA filesystem blobs | the ZA command with `BLOB_STORE=FileSystem` | 1 / 0 / 0 (`zafs-5`) | 1 / 0 / 0 (6:10) | 5 runs, each green once the held edits were in |
-| ZA cache swap | `cargo test -p tests za::cache_swap::cache_swap_tests -- --exact --nocapture` | 1 / 0 / 0 | 1 / 0 / 0 (extra step) | 3 runs: a part 6c test bug fixed |
-| CalDAV plain | `cargo test -p tests webdav::webdav_tests -- --exact --nocapture` | 1 / 0 / 0 (`caldav-plain-27`) | 1 / 0 / 0 | 27 runs: port defects (`a5cddf448`), status changes, the `put_get` blob leftover, 1.0 fixtures; no `cal_itip` DTSTAMP flake |
-| CalDAV key | the same with `ZA_KEY_ACCOUNTS=1` | 1 / 0 / 0 (`caldav-key-22`) | 1 / 0 / 0 | 22 runs |
-| `webdav::cal_query::` | `cargo test -p tests webdav::cal_query::` | 2 / 0 / 1 | 2 / 0 / 1 | 2 runs; the ignored test is 0.16's |
-| IMAP plain | `cargo test -p tests imap::imap_tests -- --exact --nocapture` | 1 / 0 / 0 (`imap-plain-15`) | 1 / 0 / 0 | 15 runs: 1.0 fixtures (`body_structure`, `fetch`, `acl`) |
-| IMAP key | the same with `ZA_KEY_ACCOUNTS=1` | 1 / 0 / 0 (`imap-key-13`) | 1 / 0 / 0 | 13 runs |
-| JMAP plain | `cargo test -p tests jmap::jmap_tests -- --exact --nocapture` | 1 / 0 / 0 (`jmap-plain-49`) | 1 / 0 / 0 | 49 runs, driven by ruling 107; `calendar::notification` passed in every run that reached it |
-| JMAP key | the same with `ZA_KEY_ACCOUNTS=1` | 1 / 0 / 0 (`jmap-key-30`) | 1 / 0 / 0 | 30 runs |
-| `store::store_tests` | `cargo test -p tests store::store_tests -- --nocapture` | 1 / 0 / 0 | 1 / 0 / 0 | 4 runs: a 7a-ported `MailboxUid` write fixed |
-| `store::blob::blob_tests` | by its exact name | 1 / 0 / 0 | 1 / 0 / 0 | 2 runs |
-| `store::lookup::lookup_tests` | by its exact name | 1 / 0 / 0 | 1 / 0 / 0 | 2 runs |
-| `store::search_tests` | by its exact name | 1 / 0 / 0 | 1 / 0 / 0 (8:44) | 3 runs: ruling 76's `QueueId` range |
-| `telemetry::telemetry_tests` | by its exact name (ruling 33's removals) | 1 / 0 / 0 | 1 / 0 / 0 | 6 runs: the webhook delivery |
-| `system::system_tests` | `cargo test -p tests system::system_tests -- --nocapture` (SEL sub-tests removed) | 1 / 0 / 0 (`up-system-system_tests-19`) | 1 / 0 / 0 at attempt 1 (1:01) | 19 runs in 7c-7c4; in 7d1b's net, attempt 1 failed `system::oidc`'s `client_secret_basic` exchange (N32, the one-second code lifetime under instrumentation), fixed by ruling 125 in this part |
-| SMTP | `cargo test -p tests smtp` with CI's `SPAM_RULES_URL` | 76 / 0 / 3 (`smtp-9`) | 74 / 2 / 3, then 2 / 0 / 0 rerun by name | 9 runs plus 3 named reruns: `antispam` once (N27, its HTTP reload closed during TLS) passed alone; at `6ca04a058` the documented flakes `dkim2_dsn_is_signed` and `queue_retry` passed when rerun by name; at `52ee3ad8c` `dkim2_dsn_is_signed` and `dkim2_all_disclosed` (not on CLAUDE.md's list, 7f2's open item) passed when rerun by name |
-| CI only (Docker): `directory`, `automation::automation_tests` | Task 8's CI jobs | not run | `automation-tests` fails both attempts: no Docker socket here (disposition `needs_docker_ci_only`) | settles at Task 8 |
+| Formatting | `cargo fmt --all --check` | rc 0 | - | 1 |
+| Workspace units | `cargo test --workspace --exclude tests --exclude scim --exclude scim-proto --lib --bins --features "$UNIT_TEST_FEATURES"` (net: `--exclude-from-test scim --exclude-from-test scim-proto --lib --bins --tests --no-fail-fast -- --exact --skip <98 tests-crate tests>`) | 568 / 0 / 2 (`units-7`) | 570 / 0 / 2 (`unit-tests`, 0:13) | 1 each; the two ignored are 0.16's `classifier::sgd::tests::text_classifier` and `modules::pyzor::test::send_message` |
+| Vault and groupware | `cargo test -p vault -p groupware --features vault/test_mode` | 225 / 0 / 0 (`vaultgw-3`) | in the unit step | 1 |
+| ZA | `cargo test -p tests za::za_tests -- --exact --nocapture` | 1 / 0 / 0 (`za-96`, 339 s) | 1 / 0 / 0 (`za-tests`, 6:49) | 1 each. At `82a5ed6c0`, the first net's ZA step failed in `gating::test_scheduling` (`gating.rs:673`: key1's inbox held `pin-11o3`'s processed decline); the case now deletes alice's items, and that net was stopped (fix round 2, below) |
+| ZA leak unit | `cargo test -p tests za::leak::tests::try_archive_short_values_are_not_archives -- --exact` | - | 1 / 0 / 0 (`leak-unit-test`) | 1 |
+| ZA filesystem blobs | the ZA command with `BLOB_STORE=FileSystem` | 1 / 0 / 0 (`zafs-8`, 340 s) | 1 / 0 / 0 (`za-tests-fs-blob`, 6:20) | 1 each |
+| ZA cache swap | `cargo test -p tests za::cache_swap::cache_swap_tests -- --exact --nocapture` | - | 1 / 0 / 0 (`za-cache-swap`, the extra step) | 1 |
+| CalDAV plain | `cargo test -p tests webdav::webdav_tests -- --exact --nocapture` | 1 / 0 / 0 (`caldav-plain-29`) | 1 / 0 / 0 (`webdav-plain`) | 1 each; no `cal_itip` DTSTAMP flake |
+| CalDAV key | the same with `ZA_KEY_ACCOUNTS=1` | 1 / 0 / 0 (`caldav-key-27`) | 1 / 0 / 0 (`webdav-key`) | 1 each |
+| `webdav::cal_query::` | `cargo test -p tests webdav::cal_query::` | - | 2 / 0 / 1 (`cal-query-tests`) | 1; the ignored test is 0.16's |
+| IMAP plain | `cargo test -p tests imap::imap_tests -- --exact --nocapture` | 1 / 0 / 0 (`imap-plain-18`) | 1 / 0 / 0 (`imap-plain`) | 1 each |
+| IMAP key | the same with `ZA_KEY_ACCOUNTS=1` | 1 / 0 / 0 (`imap-key-15`) | 1 / 0 / 0 (`imap-key`) | 1 each |
+| JMAP plain | `cargo test -p tests jmap::jmap_tests -- --exact --nocapture` | 1 / 0 / 0 (`jmap-plain-51`) | 1 / 0 / 0 (`jmap-plain`, 2:17) | 1 each; `calendar::notification` passed |
+| JMAP key | the same with `ZA_KEY_ACCOUNTS=1` | 1 / 0 / 0 (`jmap-key-32`) | 1 / 0 / 0 (`jmap-key`, 1:35) | 1 each |
+| `store::store_tests` | `cargo test -p tests store::store_tests -- --nocapture` | - | 1 / 0 / 0 | 1 |
+| `store::blob::blob_tests` | by its exact name | - | 1 / 0 / 0 | 1 |
+| `store::lookup::lookup_tests` | by its exact name | - | 1 / 0 / 0 | 1 |
+| `store::search_tests` | by its exact name | - | 1 / 0 / 0 (8:13) | 1 |
+| `telemetry::telemetry_tests` | by its exact name (ruling 33's removals) | - | 1 / 0 / 0 | 1 |
+| `system::system_tests` | `cargo test -p tests system::system_tests -- --nocapture` (SEL sub-tests removed) | 0 / 1 / 0 (`up-system-system_tests-21`), then 1 / 0 / 0 (`-22`, 60 s) | 1 / 0 / 0 (`system-tests`, attempt 1) | the first uninstrumented run failed in `system::oidc` at `oidc.rs:824`: the device flow's "valid code" login answered `Failure` instead of `Verified` (10 s into the suite; a timing failure of the class of N32 and ruling 125). It passed on the rerun and in the net |
+| SMTP | `cargo test -p tests smtp` with CI's `SPAM_RULES_URL` | 75 / 1 / 3 (`smtp-11`), then `antispam` 1 / 0 / 0 by name (`smtp-flake-7`) | 76 / 0 / 3 (`smtp`, attempt 1) | uninstrumented: `smtp::inbound::antispam::antispam` failed once on its JMAP request (the server closed the TLS connection without `close_notify`, as N27 at part 7c), and passed by name; the net passed at attempt 1 with no flake |
+| CI only (Docker): `directory`, `automation::automation_tests` | Task 8's CI jobs | not run | `automation-tests` fails both attempts in `ensure_acme()` (`tests/src/utils/containers.rs:316`): no Docker here (disposition `needs_docker_ci_only`) | settles at Task 8 |
 
-New-case completion: every new case of parts 4c, 5d, 6d, 7d1b, 7f1, 7f2 and 7f3 is a sub-call
-of the ZA suite or a unit test. The inventory gate counted every ZA call executed in both ZA
-steps of the final net, and the unit listing holds the new unit tests (568 tests).
+New-case completion: every new case of parts 4c, 5d, 6d, 7d1b, 7f1 to 7f4 is a sub-call of the
+ZA suite or a unit test. The inventory gate counted every ZA call executed in both ZA steps of
+the net, and the unit listing holds the new unit tests (570 tests in the net's unit step).
 
-#### The gates (part 7f3, at the final SHA `52ee3ad8c`)
+#### The gates (at `6fd9a131f`)
 
 | Gate | Command | Result |
 |---|---|---|
-| Inventory | `python3 -I scripts/tests/check_test_inventory.py --baseline tests/qualification/baseline-0.16.27.json --dispositions tests/qualification/dispositions.json --listing task-7d/capture-final/list --ignored-listing task-7d/capture-final/ign --executed task-7d/gates/7f3/functions.json` | 9 failures, all `move_unconfirmed` (the seven DKIM tests and the two `http` `za_test` tests); they settle at Task 8 (ruling 124). Exit 0 with the two moves confirmed in a scratch copy. Excused: 20 `internals_replaced_equivalent`, 2 `internals_replaced_no_equivalent`, 202 `sel_only`, 22 `subject_deleted` (7d1b at `b39124246`: the same 9) |
-| Coverage | `python3 -I scripts/tests/check_coverage.py --baseline tests/qualification/baseline-0.16.27.json --dispositions tests/qualification/dispositions.json --merged task-7d/coverage-final/merged.json --sources task-7d/src-7f3` | pass: full 21,300 / 22,030 (96.69%, 67 lines of margin), runtime-only 12,383 / 13,037 (94.98%, 41 lines) (7d1b at `b39124246`: 51 and 32 lines) |
-| Gate self-tests | `python3 -I scripts/tests/test_gates.py` and the disposable changes I, L and N31 | 28 offline tests pass (7b); each disposable change turns its gate from pass to fail and passes again once restored (7d1, 7d1b) |
-| Ported-file diff | every ported test file against `5b914ddb5`: added `return`, `cfg!`, `#[cfg]`, `#[ignore]`, removed `.await`, added `let _ =` or `drop(` | every addition has an expectation-ledger row (7d1) |
+| Inventory | `python3 -I scripts/tests/check_test_inventory.py --baseline tests/qualification/baseline-0.16.27.json --dispositions tests/qualification/dispositions.json --listing task-7d/capture-7f4/list --ignored-listing task-7d/capture-7f4/ign --executed task-7d/gates/7f4/functions.json` | 9 failures, all `move_unconfirmed`: the seven DKIM tests and the two `http` `za_test` tests. They settle at Task 8 (ruling 124). The gate exits 0 with the two moves confirmed in a scratch copy. It checked 795 tests, 29 configurations, 272 call-steps, 3,833 helper-steps, 24 tail-steps and 14 loop-steps. Excused: 20 `internals_replaced_equivalent`, 2 `internals_replaced_no_equivalent`, 202 `sel_only`, 22 `subject_deleted`. These are the same 9 failures as at `52ee3ad8c` (7f3) and `b39124246` (7d1b) |
+| Coverage | `python3 -I scripts/tests/check_coverage.py --baseline tests/qualification/baseline-0.16.27.json --dispositions tests/qualification/dispositions.json --merged task-7d/coverage-7f4/merged.json --sources task-7d/src-7f4` | pass. Full: 21,512 / 22,244 (96.71%), 72 lines of margin. Runtime-only: 12,450 / 13,106 (94.99%), 43 lines. (At `52ee3ad8c`, 7f3: 67 and 41 lines.) |
+| Gate self-tests | `python3 -I scripts/tests/test_gates.py` and the disposable changes I, L and N31 | 28 offline tests pass (7b); each disposable change turns its gate from pass to fail, and it passes again once restored (7d1, 7d1b). Not rerun: no gate script changed since (only `dispositions.json` and the README, at `28450f64e`) |
+| Ported-file diff | every ported test file against `5b914ddb5`: added `return`, `cfg!`, `#[cfg]`, `#[ignore]`, removed `.await`, added `let _ =` or `drop(` | every addition has an expectation-ledger row (7d1, and fix round 2's `drop(slot)` in `plain_update_trace_exhausted`) |
 #### The hook-disable mutation sample (part 7d2)
 
 Ruling 126 sets the sample. The full table, one row per mutation with its command, outcome
@@ -8364,6 +8362,218 @@ after a deletion: accepted) and 151 (`dkim2_all_disclosed` joins CLAUDE.md's lis
 timing-flaky SMTP tests at Task 9). The net at `52ee3ad8c` stands: the follow-up commit
 changes only the case's assertions.
 
+#### Fix round 2
+
+Fix round 2 (part 7f4) fixes the five findings of the scoped re-review of fix round 1: N1
+(Important) and N2 to N5 (Minor), by rulings 152 to 156. Ruling 157 then reruns the coverage
+net and both gates, and every matrix row, at one final SHA, which is the Task 7 record in
+"### Task 7 results". Upstream's cancel builder and its split are unchanged; the fork filters
+the builder's component. No stored layout changed. Scratch work, drivers and logs are in the
+plan workspace under `task-7f4/`.
+
+Commits:
+- `2b25edf00`: the kernel fixes (rulings 152, 153, 154) and two unit tests;
+- `710c4e1e3`: the tests (rulings 152 to 156);
+- `82a5ed6c0`: key-pinning spec 5.1;
+- `6fd9a131f`: `pin-11o3`'s cleanup of alice's inbox (found by the first net, below), the
+  final SHA of the net and the matrix;
+- this note.
+
+##### The fixes
+
+- **Ruling 152 (N1): the replayed CANCEL carries no content** (`groupware/src/calendar/
+  pinning.rs`, `za_withheld_cancels`).
+  - Both arms still build each component with upstream's `CancelScope::Instance(..)
+    .build_component`, then pass it through the new `za_cancel_only`. That keeps UID,
+    ORGANIZER, RECURRENCE-ID, SEQUENCE, DTSTAMP and STATUS (the builder's CANCELLED), and
+    drops everything else the builder copied: SUMMARY, DESCRIPTION, LOCATION, CREATED,
+    LAST-MODIFIED, DTSTART, DTEND, DURATION, DUE, and any ATTENDEE line.
+  - The component then gets DTSTART at the RECURRENCE-ID's value (with the RECURRENCE-ID's
+    TZID and VALUE, through upstream's `itip_date_entry`; the master arm already set it to the
+    recorded instant) and the recipient's bare ATTENDEE lines, as before.
+  - **DTSTART: which merge needs it.** Neither merge fails without it. The drain's merge is
+    upstream's `itip_process_message` (CANCEL arm, `scheduling/inbound.rs`). For an instance
+    the copy holds, that arm replaces only ORGANIZER, ATTENDEE, STATUS and SEQUENCE, so the
+    copy keeps its own DTSTART. For an instance the copy lacks, it adds the CANCEL's component
+    as the copy's cancelled override, as it stands (less STATUS and X- properties). calcard's
+    expansion would fall back to the RECURRENCE-ID for an override without DTSTART
+    (`icalendar/dates.rs`), but the stored override would be an invalid VEVENT (RFC 5545
+    3.6.1: DTSTART is required outside a METHOD object), served as is to native clients. So
+    DTSTART is kept for upstream's CANCEL merge's add-component arm, at the RECURRENCE-ID's
+    value, which tells the recipient nothing new. Upstream's own exclusion CANCEL carries a
+    DTSTART for the same reason (`scheduling/organizer.rs`).
+  - **The iTIP summary.** `ItipSummary::Cancel` was upstream's `build_instances_summary`,
+    which carries the instance's or the master's SUMMARY, DESCRIPTION and LOCATION. It is now
+    `recurrence_times`: one DTSTART field per cancelled instance at its RECURRENCE-ID's time
+    (`recurrence_time` for an instance in the tree; for one generated from the master, the
+    recorded instant in the master's time zone), and no guest list.
+  - So the recipient learns only the RECURRENCE-IDs of instances it was on, as ruling 132's
+    cost and spec 5.1 say.
+- **Ruling 153 (N2): the replay goes even when the slice is empty** (`za_full_state_for`).
+  The CANCEL's recipients are the address forms the slice reached, as before; when the slice
+  is empty, they are the forms the tree names for the recipient on an ATTENDEE the server
+  schedules (the new `za_scheduled_forms`: normalized to the recipient,
+  `is_server_scheduling`). So a recipient who DECLINED its remaining instances without
+  SCHEDULE-FORCE-SEND, or has RSVP=FALSE there, still gets the CANCEL. A form the tree marks
+  SCHEDULE-AGENT=CLIENT or NONE everywhere yields no recipient, so nothing is built and the
+  entry is dropped: correct under RFC 6638.
+  - Retirement needs no other change. In the fan-out, `full_state` now returns the CANCEL, and
+    phase 4 retires the entry only when every item, the full state's included, was written.
+    In `contacts/pin`, the messages are no longer empty, so the entry is not dropped; it is
+    retired only on `1.2` for the address (the existing outcome match).
+- **Ruling 154 (N3): `5.1` for the delegates of a failed split** (`drain.rs`, the delegating
+  merge). The addresses of the restricted messages are kept when `itip_messages_per_recipient`
+  errs (`inspect_err`), and the builders' error arm sets `5.1` on their ATTENDEE lines with
+  the fan-out's `za_set_schedule_status`. An error of `organizer_request_full` itself, or of
+  the snapshot, sets nothing, as before.
+- **Ruling 155 (N4): a write after the revocation** (`za::sharing_races::
+  propfind_admission_races`). A third change, `revoke-write`, runs against the calendar with
+  allprop and the named prop (the forms whose listing opens the event): park the grantee's
+  PROPFIND at `PROPFIND_ADMITTED_PAUSE`, revoke the grant, have the owner PUT the event (204)
+  with a new SUMMARY, then release. The case asserts a 207 that does not contain the new
+  SUMMARY, an event response with a 500 and no `200 OK`, and a calendar response that is
+  still `200 OK` (served from the memo, ruling 148). The home target is not run, because a
+  depth-1 home listing names no event. Propname is not run either, because it reads no
+  content. Both runs printed what was served: the calendar's name, the calendar's dead
+  property and the hrefs; no event content.
+- **Ruling 156 (N5): drop guards that restore the prior value** (`tests/src/utils/za.rs`).
+  - `MaxRecipientsGuard` reads `CalendarScheduling.max_recipients` from the registry, sets
+    the cap, and restores the value it read. `restore()` restores it on the normal path. A
+    guard dropped without it (a panic) restores the value from its drop, on a thread with its
+    own runtime. `pin-11o` and the new drain step use it.
+  - `PauseSlotGuard` saves one of `common::za::test_hooks`' pause slots as the test found it,
+    and puts that value back on drop. A pause the test left armed in the slot is released
+    first, so a parked request does not stay parked. `plain_update_trace_exhausted` (for
+    `UPDATE_COMMIT_PAUSE`) and `propfind_admission_races` (for `PROPFIND_ADMITTED_PAUSE`)
+    hold one each. In `propfind_admission_races`, `HookParked` still clears the slot after
+    each request; the guard restores the prior value when the case ends.
+
+##### Key-pinning spec
+
+Section 5.1, item (1), describes ruling 152's reduced component and summary, with the DTSTART
+reason. It describes ruling 153's replay without a slice, and retirement only once the replay
+is delivered. The SCHEDULE-AGENT=CLIENT or NONE limit joins ruling 139's limits. Its sentence
+"the recipient learns only the RECURRENCE-IDs of instances it was on" now holds.
+
+##### Limits recorded (added to part 7f1's list)
+
+- An address the tree marks SCHEDULE-AGENT=CLIENT or NONE wherever it names it gets no
+  replay, and its entry is dropped. The server does not schedule for such an address (RFC
+  6638), so this is correct (ruling 153).
+
+##### Tests
+
+- Unit tests (`groupware`):
+  - `pinning::withheld_cancels_carry_no_content` plants canary SUMMARY, DESCRIPTION and
+    LOCATION values on the master and on X, and also new CREATED and LAST-MODIFIED values and
+    a moved X (DTSTART 15:00, DTEND 17:00). It asserts that none of them reaches the CANCEL
+    or its summary, in the present-component arm (X) or the master-generated arm (day 5).
+    Each component holds exactly ATTENDEE, DTSTAMP, DTSTART, ORGANIZER, RECURRENCE-ID,
+    SEQUENCE, STATUS and UID; DTSTART equals the RECURRENCE-ID; the one ATTENDEE is bob's bare
+    line. The summary is two DTSTART fields at the two RECURRENCE-ID instants.
+  - `pinning::a_recorded_removal_is_replayed_without_a_slice`: bob DECLINED on Z, or
+    RSVP=FALSE there. His slice is empty, and the full state is one CANCEL to bob of X and day
+    5. With SCHEDULE-AGENT=CLIENT or NONE it is empty.
+- `za::pinning::case_11_withheld_override_removal`:
+  - All three sub-cases create the event with canary SUMMARY, DESCRIPTION and LOCATION values
+    on the master, and alice's removal writes canary values on X. Bob's created copy holds no
+    canary (his slice holds no master). None of bob's items since the change, and not his
+    final copy, holds any canary. Each sub-case deletes alice's inbox items since its start.
+  - New `pin-11o3` (ruling 153): bob declines Z in his copy, and alice's drain records it.
+    Then alice removes bob and carol from X while bob's key differs. After the key is
+    restored, `contacts/pin` answers `delivered` 1 and `dropped` 0. Bob's one new item is X's
+    CANCEL naming bob alone. After his drain, X is cancelled as in carol's copy, and his Z
+    keeps his DECLINED.
+- `za::drain::test_reply` step 12 (`za-drain-r12`, ruling 154): key2 delegates a
+  single-instance event to key3. Key1's drain then runs under `max_recipients` 1 (set after
+  key2's REPLY went out, through the guard). Key3 gets no item. The REPLY applies (key2
+  DELEGATED). Key1's stored event carries `SCHEDULE-STATUS=5.1` on key3's ATTENDEE, and only
+  that.
+- `za::sharing_races::propfind_admission_races`: the `revoke-write` step above (ruling 155).
+
+##### Mutation rows (appended to `task-7d/mutations.tsv`)
+
+Method as part 7f1's: each mutation behind the `ZA_MUT` switch (`task-7f4/muts.py`), all
+applied together, the groupware unit binary and the tests binary built once and copied out
+(`task-7f4/bin/`), the switches then removed (`muts.py unapply`) before the commits. ZA runs
+used the uncommitted `ZA_ONLY` selector (`task-7f2/selector.py`) with
+`ZA_ONLY=drain::test_reply,pinning`. Both controls (`ZA_MUT` unset) passed: the unit set
+(168 `calendar::` tests) and the ZA selection.
+
+| Id | Ruling | Mutation | Outcome | Failing assertion |
+|---|---|---|---|---|
+| f006 | 152 | the replayed CANCEL component keeps every property upstream's builder copied (`za_cancel_only` returns at once) | caught | unit `withheld_cancels_carry_no_content`: canary-master-summary reached the CANCEL; ZA `pin-11o`: bob's item carries X's canary SUMMARY, DESCRIPTION and LOCATION |
+| f007 | 152 | the CANCEL's iTIP summary is upstream's `build_instances_summary` | caught by the unit test only | unit `withheld_cancels_carry_no_content`: canary-x-summary reached the summary. The ZA selection passes: the fan-out seals the message, not its summary, into the item |
+| f008 | 153 | the empty-slice skip restored | caught | unit `a_recorded_removal_is_replayed_without_a_slice` (the DECLINED case); ZA `pin-11o3`: `contacts/pin` answered `delivered` 0, `dropped` 1 |
+| f009 | 154 | no `5.1` in the split-error arm | caught by ZA only | drain step 12: no SCHEDULE-STATUS on key3's ATTENDEE line. No unit test reaches the drain's merge |
+
+##### Runs
+
+- Development: `task-7f4/logs/dev-1.log`, `ZA_ONLY=drain::test_reply,pinning,sharing_review,
+  sharing::test,sharing_races`, unmutated, 1 passed (80 s).
+- **The first net, at `82a5ed6c0`, was stopped.** Its ZA step failed at attempt 1 in
+  `gating::test_scheduling` (`gating.rs:673`): key1's scheduling inbox held one item, where
+  the test expects none. `pin-11o3`'s decline of Z is a REPLY to alice (key1), and her drain
+  leaves the processed item in her inbox. The development run's selection did not include
+  `gating`. The case now deletes alice's items since its start (`6fd9a131f`). The listings,
+  the net and the matrix were then rerun from the start at `6fd9a131f`.
+- At `6fd9a131f`: `za-96`, the whole ZA suite, 1 passed (339 s), then the matrix, the
+  listing capture, the net and both gates ("### Task 7 results").
+
+##### The net at the final SHA (ruling 157)
+
+- **SHA.** `6fd9a131f`, on a clean tree (`task-7d/coverage-7f4/sha.txt`). This note's commit
+  changes only docs. The sources are `git archive 6fd9a131f tests crates`
+  (`task-7d/src-7f4`).
+- **Tools.** Part 7f3's copies, unchanged (`task-7f3/tools/`): `capture.py`, `cov_driver.py`
+  (with `COV_SKIP_LIST` naming `capture-7f4`'s imap listing), `merge.py` and `gates.sh`. The
+  same 19 steps as the baseline, plus `za-cache-swap`, each exported from its own profile.
+  The 19 are merged into `coverage-7f4/merged.json`, and the 20 into `merged-plus-swap.json`.
+  The record is `task-7d/steps-final.tsv`; 7f3's is kept as `task-7d/steps-7f3.tsv`.
+- **Listings.** The 28 listings and 28 ignored listings were recaptured at `6fd9a131f`
+  (`task-7d/capture-7f4/`). Against 7f3's, only the workspace unit step and the vault and
+  groupware step changed: each lists the two new `pinning` unit tests (570 in the workspace
+  unit step). The ignored listings are unchanged.
+- **Steps.** Every step passed at attempt 1 except `automation-tests`, which failed both
+  attempts in `ensure_acme()` (no Docker), as before. `smtp` passed at attempt 1 (76 / 0 / 3)
+  with no flake. `system-tests` passed at attempt 1.
+- **Coverage gate: OK.** Full 21,512 / 22,244 (96.71%) against 17,821 / 18,490 (96.38%): 72
+  lines over the 21,440 needed. Runtime-only 12,450 / 13,106 (94.99%) against 10,646 / 11,246
+  (94.66%): 43 lines over the 12,407 needed. Cross-multiplied: full
+  `21512 * 18490 = 397756880 >= 17821 * 22244 = 396410324`; runtime-only
+  `12450 * 11246 = 140012700 >= 10646 * 13106 = 139526476`. Against `52ee3ad8c`, the runtime
+  cohort grew by 69 lines and 67 of them are covered (margins: full 67 to 72, runtime 41 to
+  43).
+  - `pinning.rs`: runtime 388 / 412 (7f3: 338 / 358). Its new uncovered lines are
+    `za_scheduled_forms`'s three early returns (no normalizable recipient, a tree no snapshot
+    reads, a tree not organized locally), the repeated-address branch of
+    `za_full_state_for`'s recipient list, and the `?` of the CANCEL's split error there (the
+    slice's split fails first at the same cap). `drain.rs`: runtime 1,126 / 1,199 (7f3: 1,109 / 1,184).
+  - The files below their baseline fraction are the seven 7f3 listed (`common/src/auth/
+    vault.rs`, `email/src/message/za/view.rs`, `fanout.rs`, `seal/collection.rs`,
+    `sharing/resolve.rs`, `sharing/test.rs`, `http/src/api/shares.rs`), with the same
+    counts. Neither touched file is among them.
+  - Beside the cohort: `restored_tests` 11,612 / 12,017, the port's fork test files
+    383 / 428, the `tests` crate 101,388 / 109,078 (92.95%), the upstream product
+    198,342 / 369,061.
+- **Inventory gate: FAIL with the same 9 `move_unconfirmed` failures** (the seven DKIM tests
+  and the two `http` `za_test` tests, which wait for Task 8's step names, ruling 124). No
+  other failure. With the scratch dispositions in which the two Task 8 moves are confirmed
+  (`task-7d/scratch-dispositions-task8-moves-confirmed.json`, never committed), it exits 0.
+- The net's unit step rewrote `crates/dav-proto/resources/requests/*.json` (the upstream
+  test that writes its output); they were restored with `git checkout` before this note's
+  commit.
+
+##### Needs a ruling (part 7f4)
+
+- **DTSTART (ruling 152's "check, and say which").** Neither merge needs it to succeed. It is
+  kept because upstream's CANCEL merge stores a component the copy lacks as the copy's
+  override, and a stored VEVENT without DTSTART is invalid (above). Confirm, or drop it and
+  accept such overrides.
+- **Two uninstrumented timing failures at the final SHA, each passing on its rerun and in the
+  net:** `system::oidc` (`oidc.rs:824`, the device flow's valid-code login), and
+  `smtp::inbound::antispam` (N27's TLS close). Neither touches fork code changed here.
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
@@ -8779,6 +8989,11 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `za::mail::traces` (fork, part 7f2, ruling 135 M14) | The module configures a domain DNSBL; `delivery_leaves_no_content_in_events` asserts the key delivery's DNSBL zones are the marker and the control's name the body's domain. New `delivery_sieve_runtime_error_is_redacted`: a personal script's `ScriptNotFound` on the subject is redacted for the key account and quoted for the control. | The test build panics on a delivery-time `error` (`ScriptErrorMessage`'s `test_mode` arm), so the case uses `include`. |
 | `za::caches::test` (fork, part 7f2, ruling 135) | Adds `account_invalidation_drops_http_auth` and `fingerprint_key_is_drawn`. | None in 1.0: the review's optional tests for a013 and a018. |
 | `groupware::calendar::delegation::tests::cancel_splits_a_recurring_event_per_recipient` and `seal::item::tests::a_message_without_a_component_has_no_shape` (fork units, part 7f2, rulings 133 and 134) | New. | 1.0 splits an organizer CANCEL per recipient (`itip_cancel`); ruling 94's item shape. |
+| `groupware::calendar::pinning::tests::{withheld_cancels_carry_no_content, a_recorded_removal_is_replayed_without_a_slice}` (fork units, part 7f4, rulings 152 and 153) | New. The first plants canary content on the master and on X and asserts the replayed CANCEL's components and summary carry none of it (both arms); the second asserts the replay of an empty slice (DECLINED, RSVP=FALSE) and none under SCHEDULE-AGENT=CLIENT or NONE. | None in 1.0: the re-review's N1 and N2 (upstream's `CancelScope::build_component` copies SUMMARY, DESCRIPTION, LOCATION and the times; upstream's `send_update_messages` leaves a DECLINED or RSVP=FALSE attendee's slice empty). |
+| `za::pinning::case_11_withheld_override_removal` (fork, part 7f4, rulings 152, 153 and 156) | The event is created with canary SUMMARY, DESCRIPTION and LOCATION values on the master, and alice's removal writes canary values on X; the case asserts no canary in bob's created copy, his items after the change or his final copy. New sub-case `pin-11o3`: bob DECLINED Z, so `contacts/pin` delivers X's CANCEL alone (`delivered` 1, `dropped` 0) and his copy ends with X cancelled and Z still DECLINED. `pin-11o`'s recipient cap is set and restored through `MaxRecipientsGuard` (the prior value, also on a panic). Each sub-case deletes alice's inbox items since its start (`pin-11o3`'s processed decline stays in her inbox). | None in 1.0: rulings 152 and 153 (the re-review's N1 and N2), and ruling 156 (N5). |
+| `za::drain::test_reply` step 12 (fork, part 7f4, ruling 154) | New step (`za-drain-r12`): the delegate invitation's split fails under `max_recipients` 1; key3 gets no item, the REPLY applies, and key1's event carries `5.1` on key3's ATTENDEE line. | 1.0's split (`itip_messages_per_recipient`) refuses a message whose recipients reach `max_recipients`. |
+| `za::sharing_races::propfind_admission_races` (fork, part 7f4, rulings 155 and 156) | New change `revoke-write` (allprop and prop, the calendar target): revoke, then the owner's PUT of the event, while the grantee's PROPFIND is parked; the in-flight 207 serves no new content and answers the event 500, the calendar still 200. `PauseSlotGuard` restores `PROPFIND_ADMITTED_PAUSE` to its prior value when the case ends. | None in 1.0: the re-review's N4 (a write under the rotated generation inside ruling 148's in-flight window) and N5. |
+| `za::sharing_review::plain_update_trace_exhausted` (fork, part 7f4, ruling 156) | `set_update_commit_pause(None)` after the response becomes `drop(slot)` of a `PauseSlotGuard` taken before the first arm, which restores the slot's prior value (also on a panic) and releases a pause left armed. Assertions unchanged. | None in 1.0: the re-review's N5. |
 
 ## Task 1 check
 
