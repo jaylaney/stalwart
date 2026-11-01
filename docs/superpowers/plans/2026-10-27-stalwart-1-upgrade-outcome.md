@@ -7735,6 +7735,149 @@ again (370 s).
   `cal_alarm` now polls, by part 7c4's ledger row), and one `webdav::cal_itip` mismatch. Both
   passed on rerun. Should the alarm variant poll as upstream's test does?
 
+#### Fix round 1, part 7f1
+
+Part 7f1 fixes the kernel findings of the Task 7 review: I1 and I2, which are the class of
+7c3's N3 and N7 (a fork path that skips or cannot repair 1.0's per-recipient split), the
+minor M10, and ruling 128's vacuous named case. Upstream's builders and its split are
+unchanged; the fork calls them. No stored layout changed.
+
+##### The fixes
+
+- **Ruling 131 (I1): the drain's delegating merge** (`groupware/src/calendar/drain.rs`).
+  The organizer messages it builds for new delegates (`organizer_request_full` on the merged
+  tree, restricted to the new delegates) now pass through `itip_messages_per_recipient`
+  under the event's `RecipientPolicy` (`event.meta.flags`), after the restriction. A
+  delegate gets its 1.0 slice: the instances it attends, and no attendee list the policy
+  hides. A split error takes the builders' error arm: traced (`ItipMessageError`, "delegate
+  invitation not built"), and the REPLY still applies.
+- **Ruling 132 (I2): a withheld removal from an override.**
+  - *Record* (`fanout.rs`, `decide` and the new `cancel_instances`). When the fan-out
+    refuses an organizer CANCEL to a recipient, the entry's existing `instances` field
+    (`ZaInstances`) unions the CANCEL's components that carry a RECURRENCE-ID, by the
+    drain's `InstanceKey`, read as `refused_instances` reads a REPLY: the same 64-key cap,
+    the same `all` overflow (a CANCEL with no snapshot sets `all`). The master is never
+    recorded. `ZaInstances` expresses this without a layout change. The doc comments of
+    `ZaWithheld.instances` and `ZaInstances` (`vault/src/pins.rs`) are updated.
+  - *Replay* (`pinning.rs`, `za_full_state_for` and `za_withheld_cancels`). The
+    organizer's full state is the slice (`za_full_request_for`, as before) and then, when the
+    slice sends anything, one CANCEL from the organizer to the address forms the slice
+    reached. It holds a component for each recorded instance that the committed tree no
+    longer has the address attend, built by upstream's `CancelScope::Instance` over those
+    addresses (so it lists none of the instance's current attendees) at the instance's
+    committed SEQUENCE, plus a bare ATTENDEE line per address, and is split per recipient.
+    The line is needed: upstream's own CANCEL copies the removed attendee's line from the
+    superseded tree, which the full state does not have, and the recipient's snapshot of a
+    CANCEL that names none of its addresses fails (`NotOrganizerNorAttendee`), so its drain
+    would not merge it (seen in run za-90). A recorded instance the tree has no
+    component for is built from the master, with the recorded UTC instant as RECURRENCE-ID
+    and DTSTART (RANGE=THISANDFUTURE when recorded so), at the master's SEQUENCE, as
+    upstream builds an exclusion's CANCEL; it is skipped when the address attends the
+    master. An instance the address attends again gets no component. Both callers use
+    `za_full_state_for`: `contacts/pin` (`http/src/api/contacts.rs`) and the fan-out's
+    `full_state`.
+  - *Coverage.* `full_state` does not take `requests_cover`'s skip while an organizer-side
+    entry records instance keys (and has not overflowed). The master-CANCEL skip stays.
+  - *Retirement and overflow.* The instances retire with the entry, as before. An entry
+    whose instances overflowed (`all`) keeps the behaviour without the record.
+- **Ruling 135, M10: a split error is a failure.** `za_full_request_for` and
+  `za_full_state_for` return `Result`; only the split's error is an `Err` (a builder that
+  builds nothing is still "nothing to send"). `contacts/pin` traces it and answers
+  `Outcome::Failed`, so the entry is kept (and rotated to the end of the record).
+  The fan-out treats it the same way: the recipient's status is `5.1`, its own messages are
+  still written, and the entry is not retired. `drain::itip_reason` is now `pub`, so both
+  traces name a fixed reason.
+- **Ruling 128: `revoke_cleanup_does_not_rewrite_sealed_event`** (`tests/src/za/sharing.rs`).
+  After the revoke, while the queued cleanup waits, the case plants a per-user preference of
+  the grantee (who has lost access) in `one.ics`'s content archive. Upstream's cleanup
+  selects exactly such an event (`clean_calendar_items`) and rewrites its content without
+  the preference. The case then asserts, after the cleanup ran, that the content and row
+  bytes, the ETags and the calendar's last change id are unchanged and that the planted
+  preference is still stored.
+
+##### Key-pinning spec
+
+Section 5.1, item (1), after ruling 91's amendment, now describes the record and the replay,
+the coverage exception, the retirement, the `all` limit and M10's failure. Section 4.1's
+`instances` row and the paragraph after the table say what organizer-side entries record.
+
+##### Tests
+
+- Unit tests (`groupware`): `fanout::a_refused_cancel_records_its_instances`,
+  `fanout::a_recorded_removal_is_replayed_after_the_slice`,
+  `pinning::withheld_cancels_carry_only_the_removals`,
+  `pinning::a_split_error_is_not_nothing_to_send` (`max_recipients` 1).
+- `za::drain::test_reply` step 11 (`za-drain-r11`): a recurring event whose override X
+  names key2 only; key2 delegates the master to key3; key3's item holds one VEVENT, the
+  master, and not the override.
+- `za::pinning::case_11_withheld_override_removal` (`pin-11o`, `pin-11o2`): bob on X and Z,
+  carol on the master and X. alice removes both from X while bob's key differs: bob's entry
+  records X, and carol gets her CANCEL directly (X cancelled in her copy). (i) Under
+  `max_recipients` 1, `contacts/pin` answers `failed` 1 and keeps the entry (M10); then it
+  delivers the Z slice and X's CANCEL. (ii) Instead, alice's change to Z delivers the slice,
+  X's CANCEL and the Z partial. In both, bob's copy ends with X cancelled, as carol's does,
+  listing no one alice removed but bob, and keeps Z. Upstream's CANCEL merge leaves the
+  recipient's own line on a cancelled instance, for carol as for bob, so the brief's "no
+  longer lists him on X" is not reachable through upstream's merge (a ruling item).
+
+##### Runs (logs in `task-7c/logs/`)
+
+- `units-3`, `units-5`: `cargo test -p groupware`, 175 passed. `units-4`:
+  `cargo test -p http@1.0.1 --features test_mode`, 6 passed.
+- `za-89`: failed in the new drain step 11 (its first override named key2, so the master
+  delegation reached the override too and key3 attended it; the step's override now names
+  only the organizer). `za-90`: failed in `case_11_withheld_override_removal`: the replayed
+  CANCEL named no address of bob's, so his snapshot of it failed and his drain did not
+  merge it (fixed: the bare ATTENDEE line above). `za-91`: 1 passed (339 s).
+- `zafs-6` (`BLOB_STORE=FileSystem`): 1 passed. `caldav-key-23` (`ZA_KEY_ACCOUNTS=1`,
+  `webdav::webdav_tests`): 1 passed.
+
+##### Mutation rows (appended to `task-7d/mutations.tsv`)
+
+Method as part 7d2's: each mutation behind the `ZA_MUT` switch, all applied together and
+built once, one enabled per run, then removed with `git checkout -- crates`. Controls with
+`ZA_MUT` unset: `mut7f1-units-control` (groupware lib) and `mut7f1-za-control` (ZA) passed.
+
+| Id | Mutation | Outcome | Failing assertion |
+|---|---|---|---|
+| f001 | ruling 131: the delegate REQUEST not split | caught | `za::drain` step 11 (`drain.rs:1561`): the delegate's item held the override |
+| f002 | ruling 132: an organizer-side refusal records no instances | caught by ZA (the unit set passes: its record test calls `cancel_instances` directly) | `case_11_withheld_override_removal` (`pinning.rs:1780`): the entry records X |
+| f003 | ruling 132: the full state is the slice alone, no replayed CANCEL | caught | unit `a_recorded_removal_is_replayed_after_the_slice`; ZA `pinning.rs:1834` |
+| f004 | ruling 132: the coverage skip regardless of recorded instances | caught | unit `a_recorded_removal_is_replayed_after_the_slice`; ZA `pinning.rs:1859` (`pin-11o2`) |
+| f005 | ruling 135 (M10): the split error read as nothing to send | caught | unit `a_split_error_is_not_nothing_to_send`; ZA `pinning.rs:1825` (dropped 1, failed 0) |
+| c001 | rerun: `ShareRevokeCleanup` stages a key owner's calendar data | caught by the named case | `revoke_cleanup_does_not_rewrite_sealed_event` (`sharing.rs:11136`): bytes rewritten |
+
+Not run: the fan-out caller's `5.1` for a failed full state. A change's full state goes to an
+address that the change's own upstream messages already reach, and upstream's split of
+those fails first at the same recipient cap, so no test can reach it.
+
+##### Limits recorded
+
+- An entry whose instances overflowed (`all`) keeps the behaviour without the record.
+- A master CANCEL is never recorded (it cancels every instance of the copy), so an attendee
+  removed from the master while it stays on an override keeps a stale master once the full
+  state replaces the withheld CANCEL. This is outside ruling 132 (a removal from an
+  override).
+- When every instance the address attended is removed, the tree no longer names it, so
+  `contacts/pin` drops the entry (`za_side`) and the change's full state is skipped
+  ("relationship ended"): no replay. This is spec 5.1's existing rule.
+- A recorded instance the tree has no component for is cancelled at the master's
+  SEQUENCE; if the copy holds that override at a higher SEQUENCE, the drain refuses the
+  CANCEL (`OutOfSequence`).
+- A master attendee with recorded instances now gets the full state with the CANCEL even
+  where the change's own REQUEST would have covered it; the CANCEL then meets an instance
+  the slice's EXDATE already removed and adds a cancelled override, as the accepted A2
+  case does.
+
+##### Needs a ruling (part 7f1)
+
+- **The recipient's own line stays on the cancelled override.** The brief asks that bob's
+  copy "no longer lists him on X". Upstream's CANCEL merge replaces an instance's ATTENDEE
+  lines with the CANCEL's lines, and a CANCEL must name the recipient to pass the
+  recipient's snapshot. So every attendee's cancelled X keeps that attendee's own line: the
+  ordinary attendee's too (carol, through upstream's own CANCEL). The case asserts parity
+  instead: X cancelled for bob as for carol, and no one else alice removed listed on it.
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
@@ -8132,6 +8275,11 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `utils::cleanup::{search_store_destroy, store_destroy_sql_indexes}` (harness, part 7d1 diff check) | `#[cfg(feature = "postgres")]` and `#[cfg(feature = "mysql")]` arms for 1.0's PostgreSQL and MySQL search stores. | `store/src/lib.rs:421-427`: 1.0's `SearchStore` has `PostgreSQL` and `MySQL` variants, compiled only with those features; the "Harness" notes (Task 2: "`search_store_destroy` cover[s] 1.0's subspaces and search stores"). |
 | `za::mail::reads::without_attachment_flag` (fork, part 7d1 diff check) | Returns the answer unchanged when it holds no FLAGS item. | Ruling 114: `$hasattachment` is set at ingest for an ordinary account and never for a key account (plan 13 ruling 55), so the plain answer is compared without it. |
 | `system::oidc` (upstream, part 7d2, ruling 125) | The authorization-code lifetime the test sets on the running core is 60 s (0.16: 1 s). No assertion waits a code out: the expiry case is the device flow's user code (`user_code_expiry`, still 1 s), and a reused code is refused because the token endpoint deletes an authorization code on exchange and marks a device code issued. | None in 1.0: a timing artefact (ruling 125, the class of ruling 117). Under the instrumented build the exchange could land after the one-second code had expired. |
+| `groupware::calendar::pinning::tests::the_full_request_names_only_its_recipient` (fork unit, part 7f1) | `za_full_request_for`'s result is unwrapped before its checks. Assertions unchanged. | None in 1.0: ruling 135 (M10) makes the function return the split's error instead of an empty list. |
+| `groupware::calendar::fanout::tests::the_full_state_is_skipped_when_own_requests_cover_the_address` (fork unit, part 7f1) | Its helper `bob_after` takes the entry's recorded instances (empty here) and unwraps `full_state`'s new `Result`. Assertions unchanged. | None in 1.0: rulings 132 and 135 (M10). |
+| `za::sharing::revoke_cleanup_does_not_rewrite_sealed_event` (fork, part 7f1, ruling 128) | After the revoke the case plants a per-user preference of the grantee in one event's content archive; it then also asserts the calendar's last change id is unchanged and the preference still stored, beside the unchanged bytes and ETags. | None in 1.0: the case was vacuous for its own subject (7d2's `c001` passed it). Upstream's cleanup selects events by their content's preferences (`clean_calendar_items`), so without a candidate preference it had nothing to rewrite. |
+| `za::drain::test_reply` step 11 (fork, part 7f1, ruling 131) | New step: the delegate's item holds the master only. Its override names only the organizer, because a master delegation of an attendee who is also on the override reaches the override too. | 1.0 splits organizer messages per recipient (`itip_messages_per_recipient`); the drain's delegating merge now does too. |
+| `za::pinning::case_11_withheld_override_removal` (fork, part 7f1, rulings 132 and 135) | New case. bob's copy is asserted to end with X cancelled, as the ordinary attendee's does, listing no one alice removed but bob. It is not asserted to drop bob's own line from X. | Upstream's CANCEL merge (`inbound.rs`, the CANCEL arm) replaces an instance's ATTENDEE lines with the CANCEL's, and a CANCEL must name the recipient to pass its snapshot, so the recipient's line stays on the cancelled X for every attendee. |
 
 ## Task 1 check
 
