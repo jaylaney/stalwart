@@ -8687,6 +8687,174 @@ By hand:
   format: a block it cannot find stays unread, though the positive control and the
   undecodable-frame count bound that.
 
+### Part 8b: the fresh-store gate and the independent CalDAV runner
+
+Run on 2026-11-01 at `311bd30ba` and after, against the part 8a binary
+(`target/release/stalwart`, unchanged, not rebuilt). Every server took ports it picked
+itself; no `.run/` or `.run-1.0/` directory was touched.
+
+#### env.sh (ruling 164)
+
+`367cfcbac`: `env.sh` takes its own path from `BASH_SOURCE` under bash and from zsh's `%x`
+prompt expansion under zsh (evaluated only there; bash cannot parse it), then the root from
+that path. From a directory outside the repository, all six cases resolved `REPO_ROOT` to
+the worktree: bash and zsh each running a script that sources `env.sh`, `bash -c` and
+`zsh -c` sourcing it, and bash and zsh executing it. No `.run-1.0/` appeared in the main
+checkout.
+
+#### The harness
+
+`tests/product/fresh_store.py` (`99e0bd179`), CLI
+`python3 -B tests/product/fresh_store.py --binary PATH --log-dir PATH`, with
+`--state-dir PATH` (a new directory; an existing path is refused, there is no conversion
+mode; the default is a temporary directory removed at the end) and `--timeout SECONDS`
+(default 900, the whole run).
+
+- Its server is the CalDAV runner's: `FreshServer` subclasses `runner.ProductServer`
+  (`tests/caldav_client/runner.py`), whose recovery-mode settings moved into
+  `ProductServer.provision` and whose account creation moved into `domain` and `account`
+  (`58efda6ce`, no behaviour change for the runner). The gate adds an IMAP and an SMTP
+  submission listener, both on implicit TLS (the server's own self-signed fallback
+  certificate). Both harnesses therefore set up the server the same way, by construction.
+- Public interfaces only: the registry JMAP API as the recovery administrator, the vault,
+  contacts and share endpoints, CalDAV, JMAP, IMAP and SMTP submission. No test-only
+  product behaviour.
+- It prints step names and check names only; its two retained logs (`server.log`,
+  `fresh-store.log`) go through the runner's exact redaction (passwords, `user:password`,
+  their JSON, URL and Base64 forms, setup tokens, recovery keys, the admin credential).
+- Each readback check must report; one that does not fails the run.
+
+The failure tests, `tests/product/test_fresh_store.py`
+(`python3 -B -m unittest discover -s tests/product -p test_fresh_store.py -v`): nine
+tests, all pass (6.3 s). They run the gate against stand-in binaries that print the
+administrator credential they are given, and assert a nonzero exit, the failure reason in
+the harness log and the printed output, no credential (plain or Base64) anywhere retained or
+printed, `[REDACTED]` in the server log, and no stand-in left running: a wrong binary path,
+a failed startup (exits at once), a failed provisioning (`x:NetworkListener/set`
+refused), a restart crash (the third start exits), a missing readback (one check never
+reports), a missing message (its check fails), a timeout (`--timeout 3` against a server
+that never answers; the run ends within 30 s and reaps it), and an existing state directory
+and an existing log directory (both refused before any start).
+
+#### Create, restart and readback
+
+Fresh store, then: one ordinary account (`ordinary`) and two key accounts (`keyalpha`,
+`keybeta`) with the setup flow (setup token, setup, password change); `contacts/lookup` and
+`contacts/pin` in both directions; one SMTP submission (the ordinary account, to all three)
+and one IMAP APPEND per account, each a multipart message holding a `message/rfc822` part
+whose own multipart carries a 3 KiB binary attachment (every byte value plus random
+bytes); per account a calendar with four preferences (displayname, description, timezone
+id, colour) and a daily five-instance series with an override of its third instance;
+`keyalpha`'s calendar shared with `keybeta`: view (read 200, write 403), edit (write 201,
+read by the owner), revoke (read and write refused), regrant at view. Then the gate waited
+for the SMTP queue (`x:QueuedMessage/query`) and the index queues (`x:IndexQueueStatus`)
+to be empty and no task to be due (`x:Task`; a failed or stalled task fails the gate). One
+task stays scheduled for later: the revoke's `ShareRevokeCleanup`, due five minutes after
+it, which is not work in flight and is carried across the restart. SIGTERM stopped the
+server in about 1 s with exit status 0, and the same binary restarted on the same store.
+
+Readback, every check on new connections, all passed (three full runs, the last at
+`99e0bd179`):
+
+1. Mail, ordinary account: the APPEND message byte for byte, the SMTP-delivered one
+   present.
+2. Mail, key accounts: the same for both.
+3. Attachments: the nested message's binary attachment decodes to the original bytes in
+   all six messages.
+4. Calendar preferences: all four, per account.
+5. Recurrence: master (RRULE, summary, UID) and override (RECURRENCE-ID, moved start,
+   summary) as written, and a `calendar-query` expanded over the range returns the five
+   instances with the moved one, per account.
+6. Pins: both accounts' `contacts` listings equal to before the restart, each holding the
+   other's pin at the fingerprint looked up.
+7. Sharing permissions: both share listings equal to before; the owner's lists the grantee's
+   active view grant, the grantee's lists the owner's calendar at view; the grantee reads
+   (200) and cannot write (403).
+8. Revoke and regrant after the restart: revoke refuses the grantee's read and write;
+   regrant at edit lets the grantee write (201) and the owner read it.
+9. Keyless refusal: the administrator's session (which holds no keys) gets JMAP
+   `forbidden` with the keyless text for both key accounts' mail and 403 on their
+   calendars, while it reads the ordinary account's two messages and calendar (the
+   controls).
+
+#### The independent CalDAV runner
+
+python-caldav at `111ae14b875f40d100d5259820f10210f00e20f9`, cloned into the plan workspace;
+`requirements.txt` installed into a Python 3.14.10 virtual environment there, with the
+clone installed into it as CI does (`pip install --no-deps --no-build-isolation`).
+
+- Schema fixes (`58efda6ce`): `Domain.isEnabled` and `Application.enabled` are `enable` at
+  1.0 (the server refuses the old names). No other 0.16 name remained in the runner's
+  provisioning; its listener create already omitted `tlsImplicit`.
+- The unit suite (`python3 -B -m unittest discover -s tests/caldav_client -p
+  test_runner.py -v`): 30 tests, all pass, before and after every change here.
+- First runs (two, identical): plain 65 passed, 4 failed, 1 skipped, 2 xfailed of 72; key
+  70 passed, 4 failed, 1 skipped, 2 xfailed of 77. In both modes `calendar/testAlarm`,
+  `testTodoDatesearch` and `testRecurringDateWithExceptionSearch` passed against their
+  strict xfail records; plain also failed `flows/test_delegation_and_organizer_mediated_status`
+  and key `flows/test_shared_calendar_properties_and_etags`.
+- Changes, by the coordinator's rulings on these failures:
+  - `3bd6dcd2a`: the three stale strict xfails are now expected passes, in both modes (1.0
+    fixed those upstream gaps; no single 1.0.1 changelog entry names them). This narrows
+    the exceptions; the remaining ones (`testCheckCompatibility` skipped, `testPrincipals`
+    and `testRecurringDateSearch` xfailed) are unchanged, and so is the manifest.
+  - `25a894aec`: `test_shared_calendar_properties_and_etags`, ruling 96's class. At 1.0 a
+    dead-property PROPPATCH (`calendar-color`) leaves the collection's ETag unchanged after
+    the property first exists, for ordinary and key accounts alike (twelve PROPPATCHes of
+    distinct colours: the ETag changed on the first only, the value was stored every
+    time; displayname changed it every time). The grantee's 412 race moves to
+    `calendar-description`, a live per-principal property, beside the owner's displayname
+    race; a new case asserts 1.0's dead-property behaviour for owner and grantee (ETag
+    unchanged, stale If-Match 207, last writer wins, the colour still shared). The flow
+    runs in key mode only (`test_sharing.py` is key-only: sharing needs key accounts), so
+    plain mode has no counterpart to change; the Rust `sharing_races` case covers an
+    ordinary account.
+- Final runs at `25a894aec`: key 74 passed, 1 skipped, 2 xfailed of 77, **passed**. Plain:
+  67 or 68 passed, 1 skipped, 2 xfailed of 72, **failed** in all four runs on the delegation
+  flow, and in three of them on `calendar/testSearchEvent` too (both held, below).
+
+#### Held
+
+1. **Plain-mode delegation (`flows/test_delegation_and_organizer_mediated_status`).**
+   Diagnosed: an upstream inconsistency in 1.0.1, and a parity divergence. When bob
+   delegates to carol, 1.0's attendee path still sends the delegate's REQUEST from bob
+   (`scheduling/attendee.rs`, "Invite new delegates"), but 1.0's `itip_ingest`
+   (`calendar/itip.rs:174-181`, new at 1.0) refuses a REQUEST, ADD, CANCEL, PUBLISH or
+   DECLINECOUNTER whose sender is not the organizer; 0.16 accepted any organizer or
+   attendee. The server log at debug shows `calendar.itip-message-sent` from bob to carol,
+   then `calendar.itip-message-error` "Sender is not the organizer"; the organizer's copy
+   does record bob as DELEGATED with carol added. Key mode passes because the fork's
+   drain fans the delegate's invitation out from the organizer's side (its delegating
+   merge), not from bob. So on 1.0 a key account's delegate is invited and a plain
+   account's is not. Smallest reproduction (raw CalDAV, three accounts): alice PUTs an
+   event inviting bob; bob PUTs his copy with `PARTSTAT=DELEGATED;DELEGATED-TO=carol` and a
+   carol ATTENDEE with `DELEGATED-FROM=bob`; carol's calendar never receives the event
+   (plain), while it does within 15 s once the organizer's reads drain the reply (key).
+   The test is unchanged; it fails in plain mode.
+2. **Plain-mode `calendar/testSearchEvent`** (`tests/test_caldav.py:2793`, the
+   `summary="Bastille Day Party"` search returns nothing), three failures in four runs
+   after the change above, none in the two runs before it. Diagnosed: at 1.0 an ordinary
+   account's calendar text search reads the search index, which is written asynchronously
+   after the PUT. A text-match `calendar-query` sent right after each of 20 PUTs found the
+   new event 3 times out of 20, and within 5 s 20 times; a key account (whose search does
+   not use the index) found it 20 out of 20 at once. The test passes or fails on that race,
+   which also explains its two earlier passes. Not changed; no exception added.
+
+The CalDAV runner's plain mode is therefore red on these two; the key mode and the fresh-store
+gate are green. Nothing in the product was changed.
+
+#### Notes
+
+- `docs/zero-access/client-caldav.md` still describes the three former xfails as expected
+  failures (its lines 87 and 108-111) and the sharing flow's colour race; it is outside
+  this part's files.
+- `x:IndexQueueStatus/get` returned an empty list throughout, including right after the
+  seeding, so the drain's index condition held at once; the readback found every message,
+  which bounds it.
+- The gate's state directory defaults to the system temporary directory; `--log-dir` must
+  not pass through a symbolic link (the runner's `log_directory` refuses one, so a macOS
+  `/var/...` path must be given as `/private/var/...`).
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
@@ -9107,6 +9275,8 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `za::drain::test_reply` step 12 (fork, part 7f4, ruling 154) | New step (`za-drain-r12`): the delegate invitation's split fails under `max_recipients` 1; key3 gets no item, the REPLY applies, and key1's event carries `5.1` on key3's ATTENDEE line. | 1.0's split (`itip_messages_per_recipient`) refuses a message whose recipients reach `max_recipients`. |
 | `za::sharing_races::propfind_admission_races` (fork, part 7f4, rulings 155 and 156) | New change `revoke-write` (allprop and prop, the calendar target): revoke, then the owner's PUT of the event, while the grantee's PROPFIND is parked; the in-flight 207 serves no new content and answers the event 500, the calendar still 200. `PauseSlotGuard` restores `PROPFIND_ADMITTED_PAUSE` to its prior value when the case ends. | None in 1.0: the re-review's N4 (a write under the rotated generation inside ruling 148's in-flight window) and N5. |
 | `za::sharing_review::plain_update_trace_exhausted` (fork, part 7f4, ruling 156) | `set_update_commit_pause(None)` after the response becomes `drop(slot)` of a `PauseSlotGuard` taken before the first arm, which restores the slot's prior value (also on a panic) and releases a pause left armed. Assertions unchanged. | None in 1.0: the re-review's N5. |
+| `tests/caldav_client` `calendar/testAlarm`, `testTodoDatesearch`, `testRecurringDateWithExceptionSearch` (independent CalDAV runner, part 8b) | Their strict xfail records are removed in both modes: each is an expected pass. | 1.0 answers the alarm time-range query, the VTODO date search and the server-side expansion of an overridden instance as the pinned tests expect; not tied to a single 1.0.1 changelog entry. |
+| `tests/caldav_client` `flows/test_shared_calendar_properties_and_etags` (part 8b, ruling 96's class) | The grantee's If-Match race uses `calendar-description` instead of `calendar-color`; a new case asserts that a dead-only PROPPATCH leaves the ETag unchanged and a stale If-Match answers 207 with the last writer winning, for owner and grantee. | 1.0 keeps a calendar's dead properties outside the archive whose hash is the collection's ETag. |
 
 ## Task 1 check
 
