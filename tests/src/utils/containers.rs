@@ -359,10 +359,59 @@ async fn ensure_pebble() {
         })
         .await;
     wait_for_tcp(14000).await;
-    // The mapped port accepts connections before Pebble listens behind it;
-    // on a fresh hosted runner the first ACME request came 50 ms after the
-    // port opened and failed to connect. Wait for the directory itself.
-    wait_for_http("https://localhost:14000/dir").await;
+    wait_for_pebble().await;
+}
+
+/// Waits for Pebble's directory at the URL the tests' ACME providers use.
+/// The mapped port can accept connections before Pebble answers behind it,
+/// and on hosted runners the server's first ACME request failed to connect
+/// (upgrade part Z2). On a timeout the panic carries the last answer for
+/// `localhost` and for `127.0.0.1`, and Docker's view of the container.
+async fn wait_for_pebble() {
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("Failed to build HTTP client");
+    let start = Instant::now();
+    loop {
+        let mut answers = Vec::new();
+        for url in ["https://localhost:14000/dir", "https://127.0.0.1:14000/dir"] {
+            answers.push(match client.get(url).send().await {
+                Ok(response) => {
+                    if url.contains("localhost") && response.status().is_success() {
+                        return;
+                    }
+                    format!("{url}: HTTP {}", response.status())
+                }
+                Err(err) => format!("{url}: {err:?}"),
+            });
+        }
+        if start.elapsed() > READY_TIMEOUT {
+            let docker = |args: &[&str]| {
+                std::process::Command::new("docker")
+                    .args(args)
+                    .output()
+                    .map(|out| {
+                        format!(
+                            "{}{}",
+                            String::from_utf8_lossy(&out.stdout),
+                            String::from_utf8_lossy(&out.stderr)
+                        )
+                    })
+                    .unwrap_or_else(|err| err.to_string())
+            };
+            panic!(
+                "Timed out waiting for Pebble's directory: {answers:#?}\n\
+                 docker ps -a:\n{}\ndocker port stalwart-test-pebble:\n{}\n\
+                 docker logs stalwart-test-pebble:\n{}",
+                docker(&["ps", "-a"]),
+                docker(&["port", "stalwart-test-pebble"]),
+                docker(&["logs", "stalwart-test-pebble"])
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 pub async fn ensure_powerdns() {
