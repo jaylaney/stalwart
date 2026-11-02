@@ -292,6 +292,8 @@ def main():
         return 0
     if args.out is None:
         parser.error("--out is required")
+    if ci_steps.refuse_diverged_workflow():
+        return 1
     unknown = [s for s in args.steps if s not in STEPS]
     if unknown:
         parser.error("unknown steps: " + " ".join(unknown))

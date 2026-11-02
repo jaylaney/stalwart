@@ -116,6 +116,8 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("configurations", nargs="*")
     args = parser.parse_args()
+    if ci_steps.refuse_diverged_workflow():
+        return 1
     unit_features = os.environ.get("UNIT_TEST_FEATURES", "").strip()
     if not unit_features:
         parser.error("UNIT_TEST_FEATURES must be set (test.yml's workspace unit features)")

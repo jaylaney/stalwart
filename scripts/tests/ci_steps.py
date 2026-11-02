@@ -525,6 +525,18 @@ def check_workflow(text):
     return problems
 
 
+def refuse_diverged_workflow(workflow=WORKFLOW):
+    """Ruling 186: the captures and the net run only while test.yml matches `STEPS`. Prints
+    each difference to stderr and answers True when there is one."""
+    problems = check_workflow(Path(workflow).read_text())
+    for problem in problems:
+        print("FAIL", problem, file=sys.stderr)
+    if problems:
+        print(f"refusing to run: {len(problems)} difference(s) between ci_steps.STEPS and "
+              f"{workflow} (see scripts/tests/ci_steps.py)", file=sys.stderr)
+    return bool(problems)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
