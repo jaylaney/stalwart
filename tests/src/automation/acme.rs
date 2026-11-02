@@ -378,48 +378,23 @@ pub async fn test(test: &TestServer) {
     account.registry_destroy_all(ObjectType::Certificate).await;
     account.registry_destroy_all(ObjectType::Task).await;
 
-    // Test ACME using DNS-01 challenge
-    let dns_acme_id = account
-        .registry_create_object(AcmeProvider {
+    // Test ACME using DNS-PERSIST-01 challenge. 1.0 refuses the provider
+    // unless the ACME directory advertises both accountHashPrefix and
+    // issuerDomainNames (`DirectoryMeta::require_persist_support`), and
+    // Pebble's directory meta carries neither (only caaIdentities,
+    // externalAccountRequired and profiles), so 1.0 cannot issue through it.
+    // 0.16 created the provider and issued `persist.org`'s certificate.
+    account
+        .registry_create_object_expect_err(AcmeProvider {
             description: "Pebble ACME provider".to_string(),
             directory: "https://localhost:14000/dir".to_string(),
             contact: Map::new(vec!["mailto:hello@persist.org".to_string()]),
             challenge_type: AcmeChallengeType::DnsPersist01,
             ..Default::default()
         })
-        .await;
-    let persist_domain_id = account
-        .registry_create_object(Domain {
-            name: "persist.org".to_string(),
-            certificate_management: CertificateManagement::Automatic(
-                CertificateManagementProperties {
-                    acme_provider_id: dns_acme_id,
-                    subject_alternative_names: Default::default(),
-                },
-            ),
-            dkim_management: DkimManagement::Manual,
-            dns_management: DnsManagement::Automatic(DnsManagementProperties {
-                dns_server_id: pebble_dns_id,
-                publish_records: Map::new(vec![DnsRecordType::Caa]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        })
-        .await;
-    test.wait_for_tasks_skip_not_due().await;
-    let certificate = account
-        .registry_get_all::<Certificate>()
         .await
-        .into_iter()
-        .next()
-        .unwrap()
-        .1;
-    let mut sans = certificate.subject_alternative_names.into_inner();
-    sans.sort();
-    assert_eq!(
-        sans,
-        vec!["*.persist.org".to_string(), "persist.org".to_string()]
-    );
+        .assert_type(SetErrorType::InvalidProperties)
+        .assert_description_contains("does not support DNS-PERSIST-01");
 
     // Test preferred chain selection against the alternate chains Pebble offers (RFC 8555 7.4.2)
     let pebble_roots = pebble_root_common_names().await;
@@ -655,12 +630,9 @@ pub async fn test(test: &TestServer) {
         )
         .await;
     account
-        .registry_destroy(
-            ObjectType::Domain,
-            [tls_domain_id, dns_domain_id, persist_domain_id],
-        )
+        .registry_destroy(ObjectType::Domain, [tls_domain_id, dns_domain_id])
         .await
-        .assert_destroyed(&[tls_domain_id, dns_domain_id, persist_domain_id]);
+        .assert_destroyed(&[tls_domain_id, dns_domain_id]);
     account.registry_destroy_all(ObjectType::DnsServer).await;
     account.registry_destroy_all(ObjectType::AcmeProvider).await;
     account.registry_destroy_all(ObjectType::Certificate).await;
