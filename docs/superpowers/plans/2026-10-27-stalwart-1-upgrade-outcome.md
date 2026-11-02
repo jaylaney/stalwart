@@ -10058,9 +10058,10 @@ with a superset of the owner's addresses, so they answer the 412 the first run w
   `za_self_cancel` with `.ok().flatten()`. It is left as it is: a DELETE never had a recipient
   412 (0.16 had no limit check there), and the first run's `itip_cancel` is read with `.ok()`
   on the same path (`remove_all_za_at`, `crates/groupware/src/calendar/storage.rs`),
-  as upstream's delete does, so over the limit neither run sends a CANCEL. Recorded for a
-  ruling: over the limit, a delegated delete no longer sends the writer's own CANCELs, which
-  0.16 sent. No other caller reads `za_self_*` or `itip_cancel_from_snapshot` in the fork.
+  as upstream's delete does, so over the limit neither run sends a CANCEL. Ruling 198 keeps
+  it: the delegated delete now matches 1.0's owner delete, and a 412 there would leave an
+  over-limit event undeletable by its grantee. The accepted difference from 0.16: over the
+  limit, a delegated delete no longer sends the writer's own CANCELs. No other caller reads `za_self_*` or `itip_cancel_from_snapshot` in the fork.
 
 Mutations (rows of `task-7d/mutations.tsv`, by `pr-review-fix/muts.py`; `z027` is part 9a's):
 
