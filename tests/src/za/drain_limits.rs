@@ -399,6 +399,71 @@ pub async fn test(test: &mut TestServer) {
     let cancelled_p = super::drain::body(&key2.client, &copy_p).await;
     assert!(cancelled_p.contains("STATUS:CANCELLED"), "{cancelled_p}");
 
+    // 7. Upgrade ruling 188: the owner's DELETE of a pending item is
+    // honoured once the session's drain gave up on it (its `skipped` set,
+    // after `DRAIN_ITEM_FAILURE_LIMIT` failures); its GET stays 404. In
+    // another session, whose drain has not given up on it, the DELETE still
+    // answers 404 and the item stays.
+    let uid_d = "za-limit-d";
+    let stuck = plant_inbox_item(
+        test,
+        key2.id,
+        &request_tree(uid_d, "key1@example.com", "key2@example.com"),
+        PlantedItem::Pending {
+            pair: Some(("key2@example.com", [0x5d; 16])),
+            reply_token: None,
+        },
+        key1.id,
+        None,
+    )
+    .await;
+    let stuck_href = format!("{}{stuck}.ics", key2.inbox());
+    // Ahead of the failures: an app password is a vault write, which starts
+    // the password session afresh (its drain state with it).
+    let app_delete = za_app_password(key2.name, STRONG, "drain limits, delete").await;
+    test_hooks::set_drain_fail_item(Some((key2.id, stuck)));
+    test_hooks::set_drain_retry_override(Some(0));
+    for _ in 0..DRAIN_ITEM_FAILURE_LIMIT {
+        assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    }
+    assert!(pending_ids(test, key2.id).await.contains(&stuck));
+    assert_eq!(
+        crate::utils::http::HttpRequest::with_credentials(8899, key2.name, &app_delete)
+            .send_full(hyper::Method::DELETE, &stuck_href, None, None)
+            .await
+            .status
+            .as_u16(),
+        404,
+        "another session deleted an item its drain has not given up on"
+    );
+    assert!(pending_ids(test, key2.id).await.contains(&stuck));
+    // The session that gave up: the drain's own requests' credentials.
+    let session = crate::utils::http::HttpRequest::with_credentials(8899, key2.name, STRONG);
+    assert_eq!(
+        session
+            .send_full(hyper::Method::GET, &stuck_href, None, None)
+            .await
+            .status
+            .as_u16(),
+        404,
+        "a pending item is served"
+    );
+    assert_eq!(
+        session
+            .send_full(hyper::Method::DELETE, &stuck_href, None, None)
+            .await
+            .status
+            .as_u16(),
+        204,
+        "the owner's DELETE of an item its drain gave up on"
+    );
+    assert!(
+        !inbox_ids(test, key2.id).await.contains(&stuck),
+        "the honoured DELETE left the item"
+    );
+    test_hooks::set_drain_fail_item(None);
+    test_hooks::set_drain_retry_override(None);
+
     // Cleanup.
     for name in ["limit-1", "limit-2", "limit-4"] {
         key1.client
@@ -418,7 +483,7 @@ pub async fn test(test: &mut TestServer) {
             .with_status(StatusCode::NO_CONTENT);
     }
     key2.delete_items_since(test, &start2).await;
-    for app in [&app_fail, &app_fresh, &app_wait] {
+    for app in [&app_fail, &app_fresh, &app_wait, &app_delete] {
         let credential_id = AppPassword::parse(app).unwrap().credential_id;
         za_post(
             "app-password/revoke",

@@ -3332,8 +3332,9 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
 /// ordinary account (each answers `notCreated` with `forbidden`, upstream's
 /// "Another process modified" answer to an assertion failure), and a
 /// `CalendarEventNotification/set` destroy (the commit's error answers the
-/// method with `serverUnavailable`): no calendar or notification change is
-/// logged while the record is planted, and each commits once it is cleared.
+/// method with `serverUnavailable`); ruling 189 adds the DAV inbox DELETE
+/// of an item (503): no calendar or notification change is logged while the
+/// record is planted, and each commits once it is cleared.
 async fn calendar_writes_lose_to_provisioning(test: &TestServer) -> (Account, Account) {
     use hyper::StatusCode;
     println!("calendar_writes_lose_to_provisioning");
@@ -3441,6 +3442,17 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
     )
     .await;
     let item_id = types::id::Id::from(item).to_string();
+    // Ruling 189: an item the DAV inbox DELETE takes.
+    let dav_item = crate::utils::za::plant_inbox_item(
+        test,
+        id,
+        &crate::za::inbox::invitation("cal-fence-dav-item", "fence dav item"),
+        crate::utils::za::PlantedItem::Plain { flags: 0 },
+        source_id,
+        None,
+    )
+    .await;
+    let dav_item_href = format!("/dav/itip/plainmail39%40example.com/inbox/{dav_item}.ics");
     let account_id = account.id_string().to_string();
     let jmap_writes = [
         (
@@ -3644,6 +3656,14 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
         );
     }
     let before_items = notification_change_id().await;
+    dav.request("DELETE", &dav_item_href, "")
+        .await
+        .with_status(StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        notification_change_id().await,
+        before_items,
+        "the inbox DELETE stored a change while the account holds a vault record"
+    );
     for (method, body) in &jmap_writes {
         let response = account.jmap_method_call(method, body.clone()).await;
         println!("{method} while the record is planted: {}", response.0);
@@ -3707,6 +3727,9 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
             );
         }
     }
+    dav.request("DELETE", &dav_item_href, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
     // The accounts' destruction removes their calendars, events and items.
     (account, source)
 }

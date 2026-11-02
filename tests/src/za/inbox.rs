@@ -516,6 +516,8 @@ pub async fn test_expiry(test: &mut TestServer) {
     .await;
 
     // The account purges, as the scheduler runs them: no session of key1.
+    // Ruling 189: key1's `AutoExpunge` trace counts the one item expunged.
+    let traced = super::mail::Traced::start(&[trc::EventType::Store(trc::StoreEvent::AutoExpunge)]);
     for account_id in [key1.id(), plain.id()] {
         admin
             .registry_create_object(Task::AccountMaintenance(TaskAccountMaintenance {
@@ -527,6 +529,20 @@ pub async fn test_expiry(test: &mut TestServer) {
     }
     test.wait_for_tasks().await;
     hold(prior).await;
+    let totals = traced
+        .finish()
+        .await
+        .into_iter()
+        .filter(|event| event.account_id == Some(id as u64))
+        .map(|event| {
+            event
+                .keys
+                .iter()
+                .find(|(key, _)| *key == trc::Key::Total)
+                .and_then(|(_, value)| value.to_uint())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(totals, vec![Some(1)], "key1's AutoExpunge total");
     assert!(
         stored_item(test, id, pending).await.is_some(),
         "the purge removed a pending item"

@@ -14,9 +14,10 @@ use crate::utils::{
     server::TestServer,
     webdav::DummyWebDavClient,
     za::{
-        destroy_inbox_item, envelope_wrap, hold_task_consumer, inbox_ids, inbox_item_is_pending,
-        item_attendees, item_method, item_sequence, itip_tasks_for, mail_count, new_inbox_items,
-        open_pending_item_as, schedule_statuses, wait_for_delivery, za_uid_leases, za_unlock,
+        PlantedItem, destroy_inbox_item, envelope_wrap, hold_task_consumer, inbox_ids,
+        inbox_item_is_pending, item_attendees, item_method, item_sequence, itip_tasks_for,
+        mail_count, new_inbox_items, open_pending_item_as, plant_inbox_item, schedule_statuses,
+        wait_for_delivery, za_uid_leases, za_unlock,
     },
 };
 use ::registry::{
@@ -734,19 +735,39 @@ pub async fn test_failures(test: &mut TestServer) {
         .await;
     admin.reload_settings().await;
 
-    // 7e. Upgrade ruling 176 (B-M3): key2's inbox at upstream's
-    // `maxCalendarEventNotifications`, its current item count. key2 gets 5.1
-    // and no item (a count check: nothing of its inbox is evicted); key3 is
-    // unaffected.
+    // 7e. Upgrade rulings 176 (B-M3) and 187: key2's inbox at upstream's
+    // `maxCalendarEventNotifications`, its current item count.
+    // (1) Every stored item pending (the backlog cap): key2 gets 5.1 and no
+    // item, nothing evicted; key3 is unaffected.
+    // (2) With drained items stored too: the oldest drained one is evicted
+    // (upstream's rolling window), an older pending one is kept, and the
+    // invitation is delivered.
+    let quota = |limit: usize| {
+        json!({ Property::Quotas: {
+            StorageQuota::MaxCalendarEventNotifications.as_str(): limit
+        } })
+    };
+    let pending_oldest = plant_inbox_item(
+        test,
+        key2.id,
+        &super::inbox::invitation("za-fo-held-p", "fo-held-p"),
+        PlantedItem::Pending {
+            pair: None,
+            reply_token: None,
+        },
+        key1.id,
+        Some(store::write::now() as i64 - 300),
+    )
+    .await;
     let held2 = inbox_ids(test, key2.id).await;
+    for id in &held2 {
+        assert!(
+            inbox_item_is_pending(test, key2.id, *id).await,
+            "precondition: key2 holds only pending items"
+        );
+    }
     admin
-        .registry_update_object(
-            ObjectType::Account,
-            key2_account,
-            json!({ Property::Quotas: {
-                StorageQuota::MaxCalendarEventNotifications.as_str(): held2.len()
-            } }),
-        )
+        .registry_update_object(ObjectType::Account, key2_account, quota(held2.len()))
         .await;
     let before3 = inbox_ids(test, key3.id).await;
     let notify = format!("{KEY1_CAL}fo-notify.ics");
@@ -766,7 +787,7 @@ pub async fn test_failures(test: &mut TestServer) {
     assert_eq!(
         inbox_ids(test, key2.id).await,
         held2,
-        "an item reached key2 past its notification limit, or one was evicted"
+        "an item reached key2 past its backlog cap, or a pending one was evicted"
     );
     assert_eq!(new_inbox_items(test, key3.id, &before3).await.len(), 1);
     assert_eq!(
@@ -777,6 +798,53 @@ pub async fn test_failures(test: &mut TestServer) {
         attendee_statuses(&key1.client, &notify, "key3@example.com").await,
         ["1.2"]
     );
+    let drained_old = plant_inbox_item(
+        test,
+        key2.id,
+        &super::inbox::invitation("za-fo-held-d1", "fo-held-d1"),
+        PlantedItem::Drained { password: STRONG },
+        key1.id,
+        Some(store::write::now() as i64 - 200),
+    )
+    .await;
+    let drained_new = plant_inbox_item(
+        test,
+        key2.id,
+        &super::inbox::invitation("za-fo-held-d2", "fo-held-d2"),
+        PlantedItem::Drained { password: STRONG },
+        key1.id,
+        Some(store::write::now() as i64 - 100),
+    )
+    .await;
+    let held2 = inbox_ids(test, key2.id).await;
+    admin
+        .registry_update_object(ObjectType::Account, key2_account, quota(held2.len()))
+        .await;
+    let rolling = format!("{KEY1_CAL}fo-rolling.ics");
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &rolling,
+            [CONTENT_TYPE],
+            invite("za-fo-rolling", START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(
+        attendee_statuses(&key1.client, &rolling, "key2@example.com").await,
+        ["1.2"],
+        "the rolling window refused the invitation"
+    );
+    let after2 = inbox_ids(test, key2.id).await;
+    assert!(
+        !after2.contains(&drained_old),
+        "the oldest drained item was not evicted"
+    );
+    assert!(
+        after2.contains(&pending_oldest) && after2.contains(&drained_new),
+        "the eviction took a pending item or a newer drained one"
+    );
+    assert_eq!(after2.len(), held2.len(), "{after2:?}");
     admin
         .registry_update_object(
             ObjectType::Account,
@@ -784,6 +852,7 @@ pub async fn test_failures(test: &mut TestServer) {
             json!({ Property::Quotas: {} }),
         )
         .await;
+    key2.delete_items_since(test, &start2).await;
 
     // 7f. Upgrade ruling 176 (B-M7): the quota check measures the sealed
     // item. A control invitation gives the plaintext message's size (the
@@ -1031,6 +1100,7 @@ pub async fn test_failures(test: &mut TestServer) {
         "fo-quota",
         "fo-size",
         "fo-notify",
+        "fo-rolling",
         "fo-sealed-a",
         "fo-sealed-b",
         "fo-receive",

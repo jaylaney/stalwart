@@ -740,12 +740,14 @@ pub async fn test_grants_die_with_the_marker(test: &mut TestServer) {
         .unwrap();
     // The refresh route's checks before the client's: the token validates
     // and names a stored grant of the account.
-    let refreshable = async |test: &TestServer| {
-        let info = test
+    let refreshable = async |test: &TestServer, refresh: &str| {
+        let Ok(info) = test
             .server
-            .validate_access_token(GrantType::RefreshToken.into(), &refresh)
+            .validate_access_token(GrantType::RefreshToken.into(), refresh)
             .await
-            .expect("the refresh token validates");
+        else {
+            return false;
+        };
         let grant = info.grant.expect("a grant-bound refresh token");
         test.server
             .oauth_grant(grant.id)
@@ -759,7 +761,7 @@ pub async fn test_grants_die_with_the_marker(test: &mut TestServer) {
         "control: the access token before setup-token"
     );
     assert!(
-        refreshable(test).await,
+        refreshable(test, &refresh).await,
         "control: the grant before setup-token"
     );
 
@@ -769,7 +771,7 @@ pub async fn test_grants_die_with_the_marker(test: &mut TestServer) {
         "the grant outlived the marker write"
     );
     assert!(
-        !refreshable(test).await,
+        !refreshable(test, &refresh).await,
         "the grant's refresh token still finds its grant"
     );
     assert_eq!(
@@ -778,5 +780,61 @@ pub async fn test_grants_die_with_the_marker(test: &mut TestServer) {
         "the grant's access token outlived the marker write"
     );
     account.recovery_key = Some(za_setup(NAME, &token, STRONG).await);
+
+    // Upgrade ruling 185: a grant minted for the key account with credential
+    // version 0, as one minted in the window between the marker write's
+    // revocation query and its invalidation would carry. Its access and
+    // refresh tokens are refused, while the same grant's tokens at the
+    // account's own version (the vault revision) work: the control.
+    let (grant_id, current) =
+        crate::utils::za::za_grant_token(&test.server, NAME, OAuthScopes::ALL).await;
+    let version = test
+        .server
+        .access_token(id)
+        .await
+        .unwrap()
+        .credential_version();
+    assert!(
+        version >= 1,
+        "a key account's version is its vault revision"
+    );
+    let unversioned = test
+        .server
+        .encode_grant_access_token(id, NAME, grant_id, 0)
+        .unwrap();
+    let refresh_at = |credential_version| {
+        test.server
+            .encode_refresh_token(RefreshTokenParams {
+                account_id: id,
+                account_name: NAME,
+                grant: TokenGrant {
+                    id: grant_id,
+                    generation: 0,
+                },
+                rotated_at: now(),
+                credential_version,
+                scope: None,
+            })
+            .unwrap()
+    };
+    assert_eq!(
+        super::caches::session_status(&current).await,
+        200,
+        "control: the grant's access token at the account's version"
+    );
+    assert!(
+        refreshable(test, &refresh_at(version)).await,
+        "control: the grant's refresh token at the account's version"
+    );
+    assert_eq!(
+        super::caches::session_status(&unversioned).await,
+        401,
+        "a version-0 access token of a key account was accepted"
+    );
+    assert!(
+        !refreshable(test, &refresh_at(0)).await,
+        "a version-0 refresh token of a key account validated"
+    );
+    crate::utils::za::za_revoke_grant(&test.server, grant_id).await;
     test.insert_account(account);
 }
