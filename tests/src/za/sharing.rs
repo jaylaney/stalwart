@@ -8180,6 +8180,7 @@ async fn sharing_lifecycle_differential(test: &mut TestServer) {
     .replace("ATTENDEE;", "ATTENDEE;SCHEDULE-FORCE-SEND=REQUEST;");
     sharing_compare_lifecycle(test, "force-sole", &[Some(value), None], &[LIFE_BOB], true).await;
     sharing_http_schedule_contracts(test).await;
+    sharing_http_recipient_limit(test).await;
     sharing_lifecycle_negative_and_exception(test).await;
     alice
         .client
@@ -9048,6 +9049,104 @@ fn sharing_sent_by(
 }
 
 /// Cases9/10 exercise the actual foreign-DAV scheduling caller and ordinary receiver.
+/// PR review ruling 197: an edit grantee's PUT of an owner-organized event
+/// whose attendees are the grantee's own two addresses. The merged first run
+/// has nothing to send, while the owner-only second run builds both personal
+/// invitations and meets `CalendarScheduling.maxRecipients = 2` in the
+/// per-recipient split (upgrade ruling 93). The PUT answers 412, as 0.16's
+/// combined limit check did, and stores nothing: on create no event and no
+/// inbox item, on update the stored event unchanged and no inbox item. The
+/// create under the prior cap is the control.
+async fn sharing_http_recipient_limit(test: &mut TestServer) {
+    use super::{
+        drain::body,
+        fanout::{CONTENT_TYPE, NO_REPLY, Party, uid_copies},
+    };
+    use crate::utils::za::{MaxRecipientsGuard, copy_href, inbox_ids, pending_ids};
+    println!("Running the delegated second run's recipient limit (PR review ruling 197)...");
+    let admin = test.account("admin@example.com").clone();
+    let alice = Party::new(test, LIFE_ALICE);
+    let bob = Party::new(test, LIFE_BOB);
+    let make = |uid, summary| {
+        sharing_lifecycle_body(
+            uid,
+            summary,
+            "20990301T100000Z",
+            &[LIFE_BOB, LIFE_ALIAS],
+            &[],
+        )
+    };
+    let alice_before = inbox_ids(test, alice.id).await;
+    let bob_before = inbox_ids(test, bob.id).await;
+
+    // Create.
+    let created = "case-recipient-limit-create";
+    let path = format!("{LIFE_PATH}{created}.ics");
+    let cap = MaxRecipientsGuard::set(&admin, 2).await;
+    bob.client
+        .request_with_headers("PUT", &path, [CONTENT_TYPE], make(created, "limit"))
+        .await
+        .with_status(StatusCode::PRECONDITION_FAILED);
+    cap.restore().await;
+    assert_eq!(
+        uid_copies(test, alice.id, created).await,
+        0,
+        "the refused create stored the event"
+    );
+    assert_eq!(
+        inbox_ids(test, bob.id).await,
+        bob_before,
+        "the refused create delivered an invitation"
+    );
+
+    // Update: the control's create under the prior cap delivers both
+    // invitations, which the drain takes.
+    let updated = "case-recipient-limit-update";
+    let path = format!("{LIFE_PATH}{updated}.ics");
+    bob.client
+        .request_with_headers("PUT", &path, [CONTENT_TYPE], make(updated, "limit-v1"))
+        .await
+        .with_status(StatusCode::CREATED);
+    sharing_drain_step(test, &bob).await;
+    let bob_created = inbox_ids(test, bob.id).await;
+    assert_ne!(
+        bob_created, bob_before,
+        "control: the create under the prior cap delivered no invitation"
+    );
+    let cap = MaxRecipientsGuard::set(&admin, 2).await;
+    bob.client
+        .request_with_headers("PUT", &path, [CONTENT_TYPE], make(updated, "limit-v2"))
+        .await
+        .with_status(StatusCode::PRECONDITION_FAILED);
+    cap.restore().await;
+    let stored = body(&alice.client, &path).await;
+    assert!(
+        stored.contains("SUMMARY:limit-v1") && !stored.contains("SUMMARY:limit-v2"),
+        "the refused update changed the stored event: {stored}"
+    );
+    assert!(
+        pending_ids(test, bob.id).await.is_empty() && inbox_ids(test, bob.id).await == bob_created,
+        "the refused update delivered an invitation"
+    );
+
+    for party in [&alice, &bob] {
+        if uid_copies(test, party.id, updated).await > 0 {
+            party
+                .client
+                .request_with_headers(
+                    "DELETE",
+                    &copy_href(test, party.id, updated).await,
+                    [NO_REPLY],
+                    "",
+                )
+                .await
+                .with_status(StatusCode::NO_CONTENT);
+        }
+    }
+    alice.delete_items_since(test, &alice_before).await;
+    bob.delete_items_since(test, &bob_before).await;
+}
+
 async fn sharing_http_schedule_contracts(test: &mut TestServer) {
     use super::{
         drain::{body, partstat_of, set_partstat},

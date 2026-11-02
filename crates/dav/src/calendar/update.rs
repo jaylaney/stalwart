@@ -42,8 +42,8 @@ use groupware::{
         CalendarEvent, CalendarEventContent, CalendarEventData, SupportedComponent,
         alerts::{DefaultAlerts, DefaultAlertsResolver, DefaultAlertsView, ICalendarDefaultAlerts},
         delegation::{
-            ZaDelegationResolution, ZaSelfOperation, za_combine_delegated, za_finalize,
-            za_resolve_delegation, za_self_create, za_self_update,
+            ZaDelegationResolution, ZaSelfMessages, ZaSelfOperation, za_combine_delegated,
+            za_finalize, za_resolve_delegation, za_self_create, za_self_update,
         },
         fanout::{ZaFanOut, ZaFanOutKind, ZaFanOutMessage, ZaSource, za_set_schedule_status},
         identity::ParticipantIdentityAddresses,
@@ -1223,14 +1223,13 @@ fn za_schedule(
     document_id: Option<u32>,
 ) -> crate::Result<Option<Vec<ZaFanOutMessage>>> {
     // The second run sees the pre-finalize trees.
-    let second = resolution.and_then(|resolution| {
-        match old {
+    let second = match resolution {
+        Some(resolution) => za_second_run(match old {
             Some(old) => za_self_update(old, ical, &roles.writer, &roles.owner, resolution, policy),
             None => za_self_create(ical, &roles.writer, &roles.owner, resolution, policy),
-        }
-        .ok()
-        .flatten()
-    });
+        })?,
+        None => None,
+    };
     let result = match old {
         Some(old) => itip_update(ical, old, roles.sender.addresses(), policy),
         None => itip_create(ical, roles.sender.addresses(), policy),
@@ -1240,11 +1239,8 @@ fn za_schedule(
     let first = match result {
         Ok(messages) => Some(messages),
         Err(err) => {
-            if let Some(failed_precondition) = err.failed_precondition() {
-                return Err(DavError::Condition(
-                    DavErrorCondition::new(StatusCode::PRECONDITION_FAILED, failed_precondition)
-                        .with_details(err.to_string()),
-                ));
+            if let Some(error) = za_itip_precondition(&err) {
+                return Err(error);
             }
             trc::event!(
                 Calendar(trc::CalendarEvent::ItipMessageError),
@@ -1306,6 +1302,33 @@ fn za_schedule(
         )));
     }
     Ok(Some(messages))
+}
+
+/// A scheduling error that fails a precondition, as the 412 a PUT answers.
+fn za_itip_precondition(err: &ItipError) -> Option<DavError> {
+    err.failed_precondition().map(|failed_precondition| {
+        DavError::Condition(
+            DavErrorCondition::new(StatusCode::PRECONDITION_FAILED, failed_precondition)
+                .with_details(err.to_string()),
+        )
+    })
+}
+
+/// PR review ruling 197: the delegated second run's outcome. A failed
+/// precondition (the per-recipient split's `TooManyRecipients` among them,
+/// since upgrade ruling 93) fails the PUT with the first run's 412, before
+/// any fan-out or persistence; `NothingToSend` and the other errors without
+/// one stay a run that built nothing, as before.
+fn za_second_run(
+    result: Result<Option<ZaSelfMessages>, ItipError>,
+) -> crate::Result<Option<ZaSelfMessages>> {
+    match result {
+        Ok(second) => Ok(second),
+        Err(err) => match za_itip_precondition(&err) {
+            Some(error) => Err(error),
+            None => Ok(None),
+        },
+    }
 }
 
 /// What a key account's PUT create carries from the handler's checks to
@@ -1545,4 +1568,43 @@ async fn za_create_event(
     Ok(HttpResponse::new(StatusCode::CREATED)
         .with_etag_opt(serves_submitted_ical.then_some(etag))
         .with_schedule_tag_opt(schedule_tag))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PR review ruling 197: the delegated second run's recipient limit
+    /// fails the PUT with the first run's 412; the outcomes without a
+    /// failed precondition stay a run that built nothing.
+    #[test]
+    fn second_run_fails_only_on_a_failed_precondition() {
+        match za_second_run(Err(ItipError::TooManyRecipients)) {
+            Err(DavError::Condition(condition)) => {
+                assert_eq!(condition.code, StatusCode::PRECONDITION_FAILED);
+                assert_eq!(
+                    condition.condition,
+                    DavErrorCondition::new(
+                        StatusCode::PRECONDITION_FAILED,
+                        CalCondition::MaxAttendeesPerInstance
+                    )
+                    .condition
+                );
+            }
+            Err(_) => panic!("the recipient limit failed with another error"),
+            Ok(_) => panic!("the second run's recipient limit was swallowed"),
+        }
+        for benign in [
+            ItipError::NothingToSend,
+            ItipError::NotOrganizer,
+            ItipError::OtherSchedulingAgent,
+            ItipError::NoSchedulingInfo,
+        ] {
+            assert!(
+                matches!(za_second_run(Err(benign)), Ok(None)),
+                "a benign second-run outcome failed the PUT"
+            );
+        }
+        assert!(matches!(za_second_run(Ok(None)), Ok(None)));
+    }
 }

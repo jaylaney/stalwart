@@ -465,6 +465,61 @@ mod tests {
             .unwrap()
     }
 
+    /// PR review ruling 197: when the writer's own addresses are the
+    /// attendees of an owner-organized event, the merged first run has
+    /// nothing to send, while the owner-only second run builds their
+    /// invitations and so meets the recipient limit (upgrade ruling 93's
+    /// split). It reports `TooManyRecipients`, which the PUT turns into its
+    /// 412, on create and on update; one recipient more of headroom builds
+    /// both invitations (the control).
+    #[test]
+    fn second_run_reports_the_recipient_limit() {
+        let owner = account(1, &[OWNER]);
+        let writer = account(2, &[WRITER, WRITER_ALIAS]);
+        let merged = account(2, &[WRITER, WRITER_ALIAS, OWNER]);
+        let res = resolution(
+            &writer,
+            &owner,
+            &[WRITER, WRITER_ALIAS],
+            &[WRITER, WRITER_ALIAS],
+            &[],
+        );
+        let limited = |max_recipients| RecipientPolicy {
+            max_recipients,
+            ..policy()
+        };
+        let attendees = [(WRITER, ""), (WRITER_ALIAS, "")];
+        let old = event(OWNER, &attendees, "original", "20990301T100000Z", "");
+        let new = event(OWNER, &attendees, "changed", "20990301T100000Z", "");
+
+        let mut first = old.clone();
+        assert!(matches!(
+            itip_create(&mut first, &merged.addresses, limited(2)),
+            Err(ItipError::NothingToSend)
+        ));
+        assert!(matches!(
+            za_self_create(&old, &writer, &owner, &res, limited(2)),
+            Err(ItipError::TooManyRecipients)
+        ));
+        assert!(matches!(
+            za_self_update(&old, &new, &writer, &owner, &res, limited(2)),
+            Err(ItipError::TooManyRecipients)
+        ));
+        for built in [
+            za_self_create(&old, &writer, &owner, &res, limited(3)),
+            za_self_update(&old, &new, &writer, &owner, &res, limited(3)),
+        ] {
+            let built = built.unwrap().unwrap();
+            let mut to = built
+                .messages()
+                .iter()
+                .flat_map(|message| message.to.iter().cloned())
+                .collect::<Vec<_>>();
+            to.sort();
+            assert_eq!(to, [WRITER_ALIAS, WRITER]);
+        }
+    }
+
     #[test]
     fn second_run_uses_owner_locality() {
         let owner = account(1, &[OWNER, SHARED]);
