@@ -113,9 +113,12 @@ impl Server {
     /// - a `Shared` container on any of its objects except an address book,
     ///   a card or a file, whose DAV dead properties DAV keeps in the clear
     ///   for every account (design, "Other object kinds"): a mailbox's,
-    ///   message's, Sieve script's or calendar's container, a server-level
-    ///   IMAP annotation (`Collection::Principal`), or one left on a
-    ///   destroyed document;
+    ///   message's, Sieve script's, calendar's or event's container, a
+    ///   server-level IMAP annotation (`Collection::Principal`), one left on
+    ///   a destroyed document, and one on any other collection (a
+    ///   notification, an identity, a submission, and every collection
+    ///   upstream adds): only the three DAV collections are excluded, so the
+    ///   check fails closed;
     /// - any `Private` container on its objects (another account's private
     ///   metadata, which stays until `purge_private_metadata` runs when its
     ///   object is destroyed);

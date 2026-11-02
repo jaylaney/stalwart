@@ -494,8 +494,10 @@ async fn za_download_upload(
             opened
         }
         // `za_mail_keys` answers `None` only for an account that is not a
-        // key account (any longer): the bytes as stored.
-        None => return Ok(Some(BlobContents::Plain(blob))),
+        // key account (any longer, its vault record removed after the
+        // sealed-source check). Upgrade ruling 176 (lens C): a sealed source
+        // is never read raw, so the upload is not found.
+        None => return Ok(None),
     };
     let bytes = match &blob_id.section {
         Some(section) => match decode_section(&opened, section) {

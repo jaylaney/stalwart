@@ -873,12 +873,15 @@ impl EmailIngest for Server {
         let mut private_commit = PrivateMetadataCommit::default();
         if let Some(metadata) = metadata {
             // Ruling 66: a private container's viewer was read as ordinary
-            // too; the owner's assertion is the fence above.
+            // too; the owner's assertion is the fence above, in the same
+            // commit chunk (upgrade ruling 176: asserted once).
             if !za_key
-                && let Some(fence) = self.za_metadata_fence(
-                    account_id,
-                    metadata.private.as_ref().map(|write| write.viewer_id),
-                )
+                && let Some(fence) = metadata
+                    .private
+                    .as_ref()
+                    .map(|write| write.viewer_id)
+                    .filter(|viewer_id| *viewer_id != account_id)
+                    .and_then(|viewer_id| self.za_metadata_fence(viewer_id, None))
             {
                 fence.apply(batch);
             }
