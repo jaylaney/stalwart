@@ -297,8 +297,12 @@ impl VaultApi for Server {
         body: Vec<u8>,
     ) -> trc::Result<HttpResponse> {
         if endpoint == "setup-token" && sub.is_none() {
-            let HttpAuthenticated { access_token, .. } =
-                self.authenticate_headers(req, session).await?;
+            // Hold the concurrency slot until the handler returns.
+            let HttpAuthenticated {
+                in_flight: _in_flight,
+                access_token,
+                ..
+            } = self.authenticate_headers(req, session).await?;
             access_token.enforce_permission(Permission::SysAccountUpdate)?;
             return za_setup_token(self, parse(&body)?).await;
         }

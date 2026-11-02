@@ -1408,6 +1408,69 @@ async fn set_max_recipients(admin: &Account, max_recipients: u64) {
     admin.reload_settings().await;
 }
 
+/// PR review ruling 196: `Jmap`'s `max_concurrent_requests` (the per-account
+/// HTTP concurrency limit) set for the guard's lifetime. Tokens built while
+/// it is set carry it, so a test sets it before its caller first
+/// authenticates. `restore` puts the prior value back and reloads the
+/// settings; a guard dropped without it (a panic) does the same from its
+/// drop, on a thread of its own, as `MaxRecipientsGuard` does.
+#[must_use = "dropping the guard restores max_concurrent_requests"]
+pub struct ConcurrentRequestsGuard {
+    admin: Option<Account>,
+    prior: Option<u64>,
+}
+
+impl ConcurrentRequestsGuard {
+    pub async fn set(admin: &Account, max_concurrent_requests: u64) -> Self {
+        use registry::schema::structs::Jmap;
+        let prior = admin
+            .registry_get::<Jmap>(types::id::Id::singleton())
+            .await
+            .max_concurrent_requests;
+        set_max_concurrent_requests(admin, Some(max_concurrent_requests)).await;
+        ConcurrentRequestsGuard {
+            admin: Some(admin.clone()),
+            prior,
+        }
+    }
+
+    pub async fn restore(mut self) {
+        if let Some(admin) = self.admin.take() {
+            set_max_concurrent_requests(&admin, self.prior).await;
+        }
+    }
+}
+
+impl Drop for ConcurrentRequestsGuard {
+    fn drop(&mut self) {
+        if let Some(admin) = self.admin.take() {
+            let prior = self.prior;
+            let _ = std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a runtime for the restore")
+                    .block_on(set_max_concurrent_requests(&admin, prior));
+            })
+            .join();
+        }
+    }
+}
+
+async fn set_max_concurrent_requests(admin: &Account, max_concurrent_requests: Option<u64>) {
+    use registry::schema::{prelude::Property, structs::Jmap};
+    admin
+        .registry_update_setting(
+            Jmap {
+                max_concurrent_requests,
+                ..Default::default()
+            },
+            &[Property::MaxConcurrentRequests],
+        )
+        .await;
+    admin.reload_settings().await;
+}
+
 /// The task manager's consumer held at `TASK_CONSUMER_PAUSE`; dropping it
 /// releases the consumer.
 pub struct ConsumerHeld {

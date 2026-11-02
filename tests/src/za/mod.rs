@@ -134,6 +134,7 @@ pub async fn za_tests() {
     setup::test(&mut test).await;
     setup::test_data_check(&mut test).await;
     setup::test_grants_die_with_the_marker(&mut test).await;
+    setup::test_setup_token_concurrency(&mut test).await;
     disabled::test(&mut test).await;
     password::test(&mut test).await;
     app_password::test(&mut test).await;

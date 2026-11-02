@@ -838,3 +838,62 @@ pub async fn test_grants_die_with_the_marker(test: &mut TestServer) {
     crate::utils::za::za_revoke_grant(&test.server, grant_id).await;
     test.insert_account(account);
 }
+
+/// PR review ruling 196: `setup-token` holds its caller's HTTP concurrency
+/// slot until it returns, as 0.16 did and as 1.0's other API handlers do.
+/// With the limit at one, a provisioning caller (`SysAccountUpdate`, without
+/// `UnlimitedRequests`) whose first request is parked inside the handler
+/// (`SETUP_TOKEN_PAUSE`, after the first emptiness check) is refused a
+/// second concurrent request for the limit; once the first returns, the slot
+/// is free again (the control).
+pub async fn test_setup_token_concurrency(test: &mut TestServer) {
+    use crate::utils::za::{ConcurrentRequestsGuard, HookParked};
+    use common::za::test_hooks;
+    use registry::schema::enums::Permission;
+    println!("Running zero-access setup-token concurrency test...");
+    const CALLER: &str = "setup-token-limit-caller@example.com";
+    const TARGET: &str = "setup-token-limit@example.com";
+    let admin = test.account("admin@example.com").clone();
+    // Set before the caller's first request, so its token carries the limit.
+    let limit = ConcurrentRequestsGuard::set(&admin, 1).await;
+    let caller = admin
+        .create_user_account(
+            CALLER,
+            STRONG,
+            "Provisioner",
+            &[],
+            vec![Permission::SysAccountUpdate],
+        )
+        .await;
+    let mut target = admin
+        .create_passwordless_user_account(TARGET, STRONG, "Limit", &[], user_permissions())
+        .await;
+    let target_id = target.id().document_id();
+
+    let first = caller.clone();
+    let parked = HookParked::start(target_id, test_hooks::set_setup_token_pause, async move {
+        za_post_as(&first, "setup-token", &json!({ "account": TARGET })).await
+    })
+    .await;
+    let second = za_post_as(&caller, "setup-token", &json!({ "account": TARGET })).await;
+    assert_eq!(
+        second.status, 400,
+        "a second setup-token ran while the first held the caller's only slot: {}",
+        second.body
+    );
+    assert_eq!(
+        second.body["limit"], "maxConcurrentRequests",
+        "the second setup-token was refused for another reason: {}",
+        second.body
+    );
+    parked.finish().await.expect(200);
+    // Control: the first request released its slot when it returned.
+    let token = za_post_as(&caller, "setup-token", &json!({ "account": TARGET }))
+        .await
+        .str(200, "token");
+    limit.restore().await;
+
+    target.recovery_key = Some(za_setup(TARGET, &token, STRONG).await);
+    test.insert_account(target);
+    admin.destroy_account(caller).await;
+}
