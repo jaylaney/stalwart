@@ -559,7 +559,8 @@ pub(crate) async fn za_dead_fence(
 
 /// Upgrade ruling 173 (plan 13's R26 residual closed): the provisioning
 /// fence of an ordinary calendar writer's batch. A DAV PUT, COPY, MOVE,
-/// DELETE or MKCOL of a `Calendar` or `CalendarEvent` that read `to` (and
+/// DELETE, MKCOL, PROPPATCH or ACL (ruling 181) of a `Calendar` or
+/// `CalendarEvent` that read `to` (and
 /// `from`, the source a move writes) as ordinary accounts commits no chunk
 /// once either holds a vault record (`za_provisioning_fence_per_chunk`), as
 /// ruling 70 fences the same objects' dead-property containers and mail's

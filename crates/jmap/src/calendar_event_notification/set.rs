@@ -63,6 +63,8 @@ impl CalendarEventNotificationSet for Server {
             .caused_by(trc::location!())?;
 
         let mut batch = BatchBuilder::new();
+        // Upgrade ruling 181: JMAP calendars serve ordinary accounts only.
+        self.za_provisioning_fence_per_chunk(&mut batch, account_id);
         for (id, _) in request.unwrap_create() {
             response.not_created.append(
                 id,

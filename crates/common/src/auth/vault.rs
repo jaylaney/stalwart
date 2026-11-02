@@ -557,11 +557,14 @@ impl Server {
 
     /// Upgrade ruling 173 (plan 13's R26 residual closed): the provisioning
     /// fence of an ordinary calendar writer's batch, in the current commit
-    /// chunk and in every later one (`za_assert_absent_per_chunk`), so a
-    /// DAV PUT, COPY, MOVE, DELETE or MKCOL of a `Calendar` or
-    /// `CalendarEvent` that read `account_id` as an ordinary account
-    /// commits no chunk once the account holds a vault record. It is added
-    /// once, at the head of the batch, and keeps the caller's selection.
+    /// chunk and in every later one (`za_assert_absent_per_chunk`), so an
+    /// ordinary writer of `Calendar` or `CalendarEvent` rows or content (DAV
+    /// PUT, COPY, MOVE, DELETE, MKCOL, PROPPATCH and ACL; JMAP `Calendar/set`,
+    /// `CalendarEvent/set` and `/copy`, `CalendarEventNotification/set`;
+    /// upgrade rulings 173 and 181) that read `account_id` as an ordinary
+    /// account commits no chunk once the account holds a vault record. It
+    /// is added once, at the head of the batch, and keeps the caller's
+    /// selection.
     /// Spec 12's rule 32 class: it applies to every ordinary account.
     /// Nothing on PostgreSQL or MySQL, as `za_provisioning_fence`.
     pub fn za_provisioning_fence_per_chunk(&self, batch: &mut BatchBuilder, account_id: u32) {

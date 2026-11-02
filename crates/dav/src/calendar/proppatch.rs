@@ -240,6 +240,9 @@ impl CalendarPropPatchRequestHandler for Server {
         let dead = DeadPatch::take(&mut request.ops, DisplayName::Live);
         let has_live_changes = !request.ops.is_empty();
         let mut batch = BatchBuilder::new();
+        if za_keys.is_none() {
+            crate::common::za::za_ordinary_fence(self, &mut batch, account_id, None);
+        }
         let mut items = PropStatBuilder::default();
         let mut retry_event = None;
 

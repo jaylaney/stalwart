@@ -203,6 +203,8 @@ impl JmapCalendarEventCopy for Server {
 
         // Prepare batch
         let mut batch = BatchBuilder::new();
+        // Upgrade ruling 181: JMAP calendars serve ordinary accounts only.
+        self.za_provisioning_fence_per_chunk(&mut batch, account_id);
         let mut context = EventSetContext {
             cache: &cache,
             access_token,

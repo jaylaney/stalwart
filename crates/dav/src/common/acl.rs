@@ -179,6 +179,8 @@ impl DavAclHandler for Server {
             let mut batch = BatchBuilder::new();
             match container {
                 ArchivedResource::Calendar(calendar) => {
+                    // A key account's calendar is refused above.
+                    crate::common::za::za_ordinary_fence(self, &mut batch, account_id, None);
                     let mut new_calendar = calendar
                         .deserialize::<Calendar>()
                         .caused_by(trc::location!())?;

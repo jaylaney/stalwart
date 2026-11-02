@@ -110,6 +110,8 @@ impl CalendarSet for Server {
 
         // Process creates
         let mut batch = BatchBuilder::new();
+        // Upgrade ruling 181: JMAP calendars serve ordinary accounts only.
+        self.za_provisioning_fence_per_chunk(&mut batch, account_id);
         'create: for (id, mut object) in request.unwrap_create() {
             if !quota.has_room(created_slots.len()) {
                 response.not_created.append(

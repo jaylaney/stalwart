@@ -245,6 +245,8 @@ impl CalendarEventSet for Server {
 
         // Process creates
         let mut batch = BatchBuilder::new();
+        // Upgrade ruling 181: JMAP calendars serve ordinary accounts only.
+        self.za_provisioning_fence_per_chunk(&mut batch, account_id);
         let send_scheduling_messages = request.arguments.send_scheduling_messages.unwrap_or(false);
         let mut created_slots = PendingCreates::new();
         let mut created_server_set = Vec::new();
