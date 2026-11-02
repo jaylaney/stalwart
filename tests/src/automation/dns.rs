@@ -21,6 +21,10 @@ use registry::{
 };
 use serde_json::json;
 
+// 1.0 publishes `_validation-persist` TXT records only for a DNS-PERSIST-01
+// provider whose ACME directory advertises accountHashPrefix and
+// issuerDomainNames (`common/src/network/dns/records.rs`); 0.16 published one
+// for every ACME-managed domain, so this zone listed it for example.org.
 const EXPECTED_ZONE: &str = r#"example.org. IN CAA 0 iodef "mailto:postmaster@example.org"
 example.org. IN CAA 0 issue "pebble.letsencrypt.org"
 autoconfig.example.org. IN CNAME mail.example.org.
@@ -59,7 +63,6 @@ _dmarc.example.org. IN TXT "v=DMARC1; p=reject; rua=mailto:postmaster@example.or
 _mta-sts.example.org. IN TXT "v=STSv1; id=12942536112359691423"
 _smtp._tls.example.org. IN TXT "v=TLSRPTv1; rua=mailto:postmaster@example.org"
 _ua-auto-config.example.org. IN TXT "v=UAAC1; a=sha256; d=9X2mMgWAc10oSPuRKZSFBwPXEQpnxkS7SXPO8PC7euM="
-_validation-persist.example.org. IN TXT "pebble.letsencrypt.org; accounturi=REDACTED"
 dummy-v1-ed25519._domainkey.example.org. IN TXT "v=DKIM1; k=ed25519; h=sha256; p=REDACTED"
 dummy-v1-rsa._domainkey.example.org. IN TXT "v=DKIM1; k=rsa; h=sha256; p=REDACTED"
 example.org. IN TXT "v=spf1 mx -all"
