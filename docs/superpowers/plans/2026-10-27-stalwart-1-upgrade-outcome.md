@@ -9659,6 +9659,126 @@ job by job:
 - C10 Gates: success, in 1 h 45 min (the net reran `queue_retry` by name; inventory OK;
   coverage 21,596 / 22,331 and 12,534 / 13,193).
 
+## Task 9
+
+### Part 9a
+
+The code-side items of Task 9: the fork's release metadata, the provenance verifier, ruling
+184's test and CI fixes, ruling 191's two fixes, and the release build's Git watch (ruling
+178's CI note). Run on 2026-11-02, Apple Silicon (arm64). Scratch work, drivers and logs are
+in the plan workspace under `task-9a/`.
+
+Commits:
+- `6d0574a14`: the release metadata and the verifier's upstream checks (D7);
+- `5ea053c85`: the build script watches only Git metadata that exists; CI's pack-refs steps go;
+- `a691be768`: ruling 184 (`wait_for_http` timeouts, Keycloak pinned, the net's step logs kept);
+- `a4f759aed`: ruling 191's N14;
+- `2867bc24f`: ruling 191's N10 and its case, the code SHA of the CI run and the product build;
+- this note.
+
+#### The metadata
+
+- `fork-release.toml`: `version = "0.2.0-beta.1"`, `upstream_tag = "v1.0.1"`,
+  `upstream_commit = "23b69755cb3cd8ecd952fe0443c5ac067a506184"`. `git ls-remote` against
+  upstream (read-only) reports `refs/tags/v1.0.1` at that commit, a lightweight tag; the local
+  `v1.0.1` tag agrees.
+- `crates/main/Cargo.toml` and its `Cargo.lock` entry carry `0.2.0-beta.1`, by the existing
+  contract: `release.rs` asserts the shipping manifest's version equals the file's, and the
+  metadata test's `VERSION` pins the real manifest. Internal crates keep `1.0.1`. No source
+  SHA is written anywhere; no tag was created or moved.
+- `CHANGELOG-fork.md` and `docs/releases.md` still name `0.1.1-beta.1`; part 9b updates them.
+
+#### The verifier checks (D7)
+
+`verify_product.py`'s new `verify_upstream`, run after the checkout check, refuses:
+- an `upstream_tag` that names another commit than `upstream_commit`. The tag is read from a
+  local tag when there is one, and from `PINNED_UPSTREAM_TAGS` (v0.16.27 and v1.0.1) when the
+  checkout has none (a release checkout fetches no upstream tags); a tag in neither is
+  refused, and a local tag and a pin must agree;
+- an `upstream_commit` that is not an ancestor of the source (`git merge-base --is-ancestor`);
+  a checkout where that cannot be decided (a shallow clone) is refused, not passed;
+- a stale pin: a later known upstream release (a pin, or a local `v*` tag) whose commit
+  descends from `upstream_commit` and is in the source's history. Without this check the D7
+  case itself (0.16.27's tag and commit, consistent and an ancestor, on a 1.0.1 base) passed.
+  Checked on this checkout: the 0.16.27 pin is refused as stale; the 1.0.1 pin passes.
+
+`product-build.yml`'s checkout takes `fetch-depth: 0` for the ancestry checks; that workflow
+was not dispatched (not authorized), so the change is checked by the unit tests only.
+
+Results: `python3 -B scripts/tests/test_release_metadata.py` 9 tests OK (one new: missing Git
+metadata is not watched, and `packed-refs` is once Git creates it); `python3 -B -m unittest
+discover -s scripts/release -p 'test_*.py' -v` 21 tests OK (8 new: the latest tag passes, a
+tag naming another commit, a commit outside the history, a stale pin by local tag and by
+pin, the pinned table standing in for a missing tag, a pin disagreeing with the local tag, a
+shallow checkout, and the real pin matching `fork-release.toml`).
+
+#### The product
+
+`cargo build --release --locked -p stalwart --no-default-features --features rocks`, in its own
+Cargo process at `2867bc24f` (clean): 1,385 s wall clock, exit 0, no warnings. Binary
+83,156,944 bytes, Mach-O arm64, SHA-256
+`9dfef8262a8969d61d25a8574c5e850daec7f9272729e18186ad27744a77ba18`.
+- `--version`: `Stalwart Server fork v0.2.0-beta.1 (upstream v1.0.1
+  23b69755cb3cd8ecd952fe0443c5ac067a506184; source 2867bc24f8bc78da3665ace7065800f2319ac263;
+  clean)`.
+- `--help` starts with the same line, then upstream's usage (`--config`, `--export`,
+  `--import`, `--console`).
+- `verify_product.py` against the binary (branch ref, no ELF inspection on macOS) passes and
+  writes `fork_version 0.2.0-beta.1`, `release_tag fork-v0.2.0-beta.1`, `features ["rocks"]`;
+  with `--ref refs/tags/fork-v0.1.1-beta.1` it refuses.
+- Features (`cargo tree --locked -e features`, 5,817 lines): no `enterprise`, `test_mode`,
+  `za_test` or `test_provider`. Workspace crates carry no features except `stalwart [rocks]`
+  and `store [num_cpus, rayon, rocks, rocksdb]`; the vendored libraries (`calcard`,
+  `jmap-tools`, `sieve-rs`, `smtp-proto`) keep their default features, as at Task 8a.
+
+#### The fixes
+
+- **Build identity watch** (`common/build_support/release.rs`). Cargo reruns a build script
+  whose watched path is missing, so a checkout with no `packed-refs` rebuilt `common` on every
+  cargo command. Only Git paths that exist are watched now; Git creates `packed-refs` by moving
+  loose refs out of `refs`, which is watched, so the next build watches it. The provenance
+  contract is unchanged (tracked files are still watched whether present or not). The seven
+  "Pack Git refs" steps of `test.yml` are removed.
+- **Ruling 184.** `wait_for_http` (`tests/src/utils/containers.rs`) bounds each probe (5 s
+  connect, 10 s request). Keycloak is pinned to `26.8.1`: the run logs do not record the image,
+  but quay.io's `latest` has been 26.8.1 (digest `sha256:3f3c5f8e…`) since 2026-10-31, before
+  the last green run's pull. The gates job's sanitize and upload steps run whenever the job is
+  not cancelled, and add the net's step logs (`$GATES/net/logs/*.log`), redacted like the
+  reports, under `net-logs/` in the `gates-receipt` artifact.
+- **Ruling 191, N10** (`fanout.rs`, `write_item_inner`). A zero `maxEventNotifications`
+  answers `5.1` before any eviction, as upstream's `NotificationQuota` does. Case:
+  `za::fanout::test_failures` step 7e (3): with a drained item stored, a limit of 0 gives
+  `5.1`, no item, nothing evicted.
+- **Ruling 191, N14** (`ci_steps.py`). `check_workflow` requires the style job's "Check Gates"
+  step once, running exactly `ci_steps.py` and `test_gates.py`, with no `if` or other keys,
+  and no `if` on the style job. `test_gates.py` gains `test_the_style_job_runs_this_check`.
+
+#### The mutation row
+
+Row `z027`, by the `ZA_MUT` switch (`task-9a/muts9a.py`, with the uncommitted `ZA_ONLY`
+selector from part Z3). The control passed.
+
+| Row | Mutation | Outcome |
+|---|---|---|
+| z027 | the zero-limit refusal removed | caught: `test_failures` 7e (3), the drained item evicted and the invitation delivered |
+
+#### Runs
+
+- `cargo fmt --all --check`: clean. `cargo test -p groupware --lib --features test_mode`: 179
+  passed. The tests crate builds with only the existing macOS linker note.
+- ZA suite (`cargo test -p tests za::za_tests`): first run failed at `gating.rs:674`, because
+  the new step's event `fo-zero.ics` was not in the module's cleanup list; with it added,
+  passed in 367 s.
+- `ci_steps.py`: 0 differences. `test_gates.py`: 43 tests OK, 2 skipped.
+- CI: a dispatch of `test.yml` at `2867bc24f`, run
+  [41432100574](https://github.com/jaylaney/stalwart/actions/runs/41432100574). At the time of
+  writing: Check Style success (with N14's check), Unit Tests success, Test success (the
+  directory suite included), Upstream Suites success; Zero-access Test, Fresh OSS Store
+  Restart and C10 Gates still running, and Independent CalDAV Client not started. One passing
+  directory step does not prove ruling 184's fix: the hang appeared in 2 of 11 runs. The N10
+  change is product code, so the gates job's coverage margins are this run's; part 9b records
+  the remaining jobs and the margins.
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
