@@ -7551,13 +7551,55 @@ Restored with `git checkout -- <files>`, the same two builds and `unit-tests` we
 
 ### Task 7 results
 
-The record of Task 7 is the final SHA `6fd9a131f` (fix round 2, part 7f4, ruling 157). Every
-row below ran at it, on a clean tree: once uninstrumented, and once in the 19-step llvm-cov
-net plus `za-cache-swap`. The part sections above hold every earlier attempt, at earlier SHAs.
-Every Cargo command starts with `export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$PATH"`.
-Integration rows also set `STORE=RocksDb RUST_MIN_STACK=16777216`, and `ZA_KEY_ACCOUNTS=1` on
-key rows only (unset on plain rows). Logs: `task-7c/logs/` (the uninstrumented rows),
-`task-7d/coverage-7f4/` (the net) and `task-7d/gates/7f4/` (the gates).
+The record of Task 7 is the final SHA `a2b78bbb0` (final fix part Z2, ruling 177): its code
+and tests, with product code unchanged since `2469e15f0` (part Z1). The local matrix, the
+19-step llvm-cov net plus `za-cache-swap`, both gates and the CI run all ran at it, on a clean
+tree; "#### The final record (at `a2b78bbb0`)" below holds them. The record at `6fd9a131f`
+(fix round 2, part 7f4, ruling 157) follows it unchanged, and the part sections above hold
+every earlier attempt. Every Cargo command starts with
+`export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$PATH"`. Integration rows also
+set `STORE=RocksDb RUST_MIN_STACK=16777216`, and `ZA_KEY_ACCOUNTS=1` on key rows only (unset
+on plain rows).
+
+#### The final record (at `a2b78bbb0`)
+
+Logs: `task-7c/logs/` (the uninstrumented rows), `final-fix-z2/logs/` (the compile checks and
+the driver), `task-7d/capture-z2/` (the listings), `task-7d/coverage-z2/` (the net) and
+`task-7d/gates/z2/` (the gates), all in the plan workspace. The tools are part 7f3's
+(`task-7f3/tools/`), as parts 7f3 and 7f4 ran them, driven by `final-fix-z2/drive.sh`.
+
+| Check or row | Result at `a2b78bbb0` |
+|---|---|
+| `cargo check -p stalwart --no-default-features --features rocks` | pass, no warning |
+| `cargo fmt --all --check` | pass |
+| `cargo check --workspace --tests` | pass, no warning |
+| ZA (`za-99`), ZA with `BLOB_STORE=FileSystem` (`zafs-11`) | 1 / 0 / 0 (393 s), 1 / 0 / 0 (368 s) |
+| ZA cache swap (`swap-4`) | 1 / 0 / 0 |
+| CalDAV plain, key (`caldav-plain-32`, `caldav-key-30`) | 1 / 0 / 0 each |
+| IMAP plain, key (`imap-plain-20`, `imap-key-17`) | 1 / 0 / 0 each |
+| JMAP plain, key (`jmap-plain-54`, `jmap-key-35`) | 1 / 0 / 0 each |
+| `system::system_tests` (`up-system-system_tests-24`) | 1 / 0 / 0 |
+| SMTP with CI's `SPAM_RULES_URL` (`smtp-13`) | 76 / 0 / 3, no flake |
+| Workspace units, CI's step (`units-10`) | 571 / 0 / 2, in 35 binaries |
+| Vault and groupware (`vaultgw-5`) | 225 / 0 / 0 |
+| Listings (`capture-z2`) | 28 listings and 28 ignored-only listings, every command exit 0 |
+| The net (`coverage-z2/steps.tsv`) | every step passed at attempt 1, except `smtp` (`dkim2_dsn_is_signed`, a documented flake, passed rerun by name) and `automation-tests` (both attempts fail in `ensure_acme()`: no Docker here; it passes in CI, below). The unit step: 573 / 0 / 2 |
+| Inventory gate | **OK**: 795 tests, 29 configurations, 272 call-steps, 3,833 helper-steps, 24 tail-steps, 14 loop-steps; excused 20 `internals_replaced_equivalent`, 2 `internals_replaced_no_equivalent`, 202 `sel_only`, 22 `subject_deleted`; 2,356 executed functions from the 19 exports |
+| Coverage gate | **OK**. Full 21,560 / 22,292 (96.72%) against 17,821 / 18,490, 74 lines over the 21,486 needed (`21560 * 18490 = 398644400 >= 17821 * 22292 = 397265732`). Runtime-only 12,498 / 13,154 (95.01%) against 10,646 / 11,246, 45 lines over the 12,453 needed (`12498 * 11246 = 140552508 >= 10646 * 13154 = 140037484`). Five cohort files are below their baseline fraction, as at `6fd9a131f` less two (`common/src/auth/vault.rs` and `sharing/resolve.rs` are back above): `email/src/message/za/view.rs` 266 / 288, `calendar/fanout.rs` 1,532 / 1,605, `seal/collection.rs` 809 / 829, `sharing/test.rs` 60 / 61, `http/src/api/shares.rs` 449 / 468; the gate has no per-file floor (ruling 179, D6) |
+| Gate self-tests (`python3 -I scripts/tests/test_gates.py`) | 42 run, 2 skipped (`--real`), pass; the ten `WorkflowTests` among them |
+| CI | run [41396778101](https://github.com/jaylaney/stalwart/actions/runs/41396778101), a dispatch of `test.yml` at `a2b78bbb0`: **success, every job green**, the C10 Gates job included (both gates pass in CI with the local figures above); "#### The final net, the gates and the CI runs" under "### Fix part Z2" lists each job |
+
+Against `6fd9a131f` (margins 72 and 43 lines), part Z1's product code added 48 lines to the
+cohort in each count (22,244 to 22,292 full, 13,106 to 13,154 runtime-only), and all 48 are
+covered. CI's own net at `0fce81db9` (the same product code, run 41375595989) gave 21,559 /
+22,292 and 12,497 / 13,154, one line less in each (a timing-dependent path); its nets at
+`a2b78bbb0` (runs 41390914882 and 41396778101) gave the local figures exactly.
+
+#### The record at `6fd9a131f` (part 7f4)
+
+The tables below are part 7f4's, at `6fd9a131f`, kept as they were. Logs: `task-7c/logs/`
+(the uninstrumented rows), `task-7d/coverage-7f4/` (the net) and `task-7d/gates/7f4/` (the
+gates).
 
 #### Compile checks (at `6fd9a131f`)
 
@@ -9288,6 +9330,183 @@ step again rewrote the dav-proto request fixtures, which were restored with `git
 - Ruling 182 accepted lens C's M1 without a test: its mutation, z015, stays not caught,
   reachable only by a race between two reads of one request; no hook is added.
 
+### Fix part Z2
+
+Part Z2 applies ruling 177: the check that ties the gates' step commands to the workflow
+(final review D4), the three test failures that occurred only in CI (ruling 170's holds), and
+with them D5; then the final coverage net, both gates and the CI run, all at one SHA. Jay
+authorized two GitHub actions for it: pushing the branch and dispatching `test.yml` on it.
+No product code changed: every commit is in `scripts/tests/` or `tests/`. Scratch work, the
+driver and the CI logs are in the plan workspace under `final-fix-z2/`.
+
+Commits:
+- `136a04774`: the step table and the workflow check (D4);
+- `0fce81db9`: the first fixes of the three holds;
+- `4b6aff499`: the issuer routing is licensed at 1.0 (ruling 33); ACME providers need a
+  description;
+- `5cee98fb4`, `7bf0e38fd`, `7d05f3976`: Pebble's readiness (a wait on the directory, the
+  diagnostics that found the cause, and the User-Agent the probe needs);
+- `9c4858bdb`: 1.0 refuses DNS-PERSIST-01 against Pebble's directory;
+- `a2b78bbb0`: the DNS zone without 0.16's persist record, the final SHA;
+- this note.
+
+#### D4: one step table, checked against `test.yml`
+
+- **`scripts/tests/ci_steps.py`** holds the one table, `STEPS`: every `cargo test` step of
+  `test.yml`'s test, unit-tests, upstream-suites and zero-access jobs, with its command as the
+  workflow writes it, the environment it adds, its `if`, its rerun ("same", "by-name" or none),
+  its gate configuration and its net step. `capture_listings.py` derives each listing command
+  from it (`listing_command`: `--lib --bins --tests` added as the baseline captured, the
+  unfiltered section for a filtered tests-crate step), and `coverage_net.py` each step that
+  measures a CI step (`net_command`: `cargo test` becomes `cargo llvm-cov --no-report test`);
+  the two builds and the unit step keep the baseline's own commands. Every derived command is
+  byte-for-byte the command each script held before.
+- **`check_workflow`** parses `test.yml` with a parser of the YAML subset the workflow uses
+  (no packages; anything outside the subset is reported, not skipped) and reports: a step
+  missing or renamed; a changed first `cargo test` command (a narrowed filter, a dropped
+  feature, a `--skip`); a changed rerun; a changed environment (workflow, job and step `env`
+  merged, compared exactly with the table's, so a removed `ZA_KEY_ACCOUNTS` or an added
+  `ZA_ONLY` or `RUSTFLAGS` counts); a job or step that overrides `UNIT_TEST_FEATURES`, which
+  the capture reads from the workflow; a changed job or step `if` (an `if: false` drops a
+  step); `continue-on-error`, `working-directory` or any other step key outside `name`, `if`,
+  `run`, `env` and `shell`; a `cargo test` step of those four jobs that the table does not
+  hold; and a gates job whose net or capture step runs fewer steps or configurations.
+- **The cache-swap step** is in the table without a configuration or a net step (new at 1.0,
+  ruling 20: the baseline has neither; its test is listed in the tests binary's unfiltered
+  sections), so its command and environment are pinned too.
+- **Self-tests.** `test_gates.py` gains ten offline cases (`WorkflowTests`): the committed
+  workflow matches the table; edited copies with each fault above fail, each naming the step;
+  and the net's step names and commands equal the baseline's (`helpers.steps`,
+  `subtests.steps`), its CI steps' commands and environments equal the table's, and the
+  capture covers every baseline `ci_step` configuration. The run reports 42 tests, 2 skipped
+  (`--real`).
+- **The disposable edit.** With `test.yml`'s ZA command narrowed to `za::za_tests::setup` and
+  the IMAP commands given `--skip search`, `test_gates.py` failed (3 cases) and
+  `ci_steps.py` reported four differences, one per edited step; restored, both passed
+  (`final-fix-z2/logs/d4-edited.log`, `d4-restored.log`).
+
+#### The three CI holds, under ruling 44
+
+Each was verified in CI, and each needed more than its first fix: the suites had never run
+past their first failure at 1.0.
+
+1. **`directory::issuer`: an intended 1.0 change (ruling 33's class).** At 1.0 a domain's
+   directory is consulted, by the token's domain or its issuer, only while
+   `is_enterprise_edition()` (`common/src/auth/authentication.rs`, `get_directory_for_domain`
+   and `get_directory_for_issuer`, SEL snippets), and the tests run without a licence. With no
+   default directory the token reaches no OIDC directory, so 1.0 answers 401. The test now
+   expects 401 without a licence and 200 with one. The brief's lead holds as well: 1.0's
+   `unscopedTokens` defaults to `reject` and the token asks for `openid` only
+   (`token_access`), so the test's directory sets `interoperable` for a licensed run; that
+   part could not be exercised without a licence. Run 41375595989 showed the 401 remaining
+   after the scope fix alone. The directory suite's later sub-tests (`sql`,
+   `synchronization`, `integration`), which had never run at 1.0, pass.
+2. **`automation` ACME: intended 1.0 changes and a timing artefact, settled in five steps.**
+   - 1.0's `AcmeProvider` has three server-set properties 0.16's lacked
+     (`accountHashPrefix`, `issuerDomainNames`, `caaIdentities`). The test helper sent them,
+     and a create naming one is refused with `invalidPatch` before any other check, which was
+     the held failure. 1.0 did not change the error class for a server-set write; the test
+     never meant to write them. `registry_create` now strips them, and the expectation
+     (`invalidProperties`, "At least one contact email is required") stands.
+   - 1.0's `AcmeProvider` also has a required `description`, and a string patch refuses an
+     empty value: every test literal now sets one.
+   - The first ACME request failed to connect 50 ms after `ensure_acme` returned: the mapped
+     port accepts connections before Pebble listens behind it (Pebble takes about a second).
+     The harness now waits for Pebble's directory (`wait_for_pebble`). Its first version
+     timed out: Pebble answers a request without a User-Agent with 400 (RFC 8555 section
+     6.1), which the added diagnostics showed (the answers for `localhost` and `127.0.0.1`,
+     and `docker ps`, `port` and `logs`). The probe now sends one, as the server's ACME client
+     does.
+   - 1.0 refuses a DNS-PERSIST-01 provider whose directory does not advertise both
+     `accountHashPrefix` and `issuerDomainNames` (`DirectoryMeta::require_persist_support`),
+     and Pebble 2.10.1's directory meta carries only `caaIdentities`,
+     `externalAccountRequired` and `profiles`. The case now expects that refusal; 0.16's
+     `persist.org` issuance cannot run against this Pebble.
+   - `automation::dns`: 1.0 publishes `_validation-persist` records only for such a provider
+     (`common/src/network/dns/records.rs`); 0.16 published one for every ACME-managed domain.
+     The expected zone drops the line.
+   With these, the automation suite passes in CI, and so does the gates job's net (D5).
+3. **IMAP `UID SORT (DATE SUBJECT)`: an accidental tie that 0.16 broke deterministically.**
+   UIDs 2, 3, 7, 8 and 9 have no top-level Date that parses (001 has `Date: Whenever`, 002,
+   006, 007 and 008 none). 1.0 dates such a message by its INTERNALDATE (`received_at` plus a
+   zero offset, `sent_at_offset`; RFC 5256 section 2.2), so their DATE is the second each
+   APPEND landed in. 0.16 indexed no `SentAt` for them (`email/src/message/index/search.rs` at
+   `9601038de`), so they sorted as one undated group by SUBJECT whatever the clock did. The
+   fixture's messages never tie on both DATE and SUBJECT. When the appends span a second
+   boundary, 1.0's group splits by second: CI's `6,4:5,1,10,3,2,9,7:8` is UIDs 2 and 3 in one
+   second and 7, 8 and 9 in the next. A local run with a 1.1 s pause before UID 5's APPEND
+   (a disposable edit) reproduced CI's answer exactly against the old expectation, and passed
+   with the new one. The test now builds the expected set from the five INTERNALDATEs (a
+   `UID FETCH ... (INTERNALDATE)`), then their base subjects; within one second it is the
+   former expectation. No case was added for the tie order: no two fixture messages tie on
+   both keys. For a full tie, 1.0.1 keeps the order of ascending document ids (a stable sort
+   over the result bitmap, `store/src/search/local.rs`, `QueryResults::into_sorted`), which
+   is the mailbox order here but is not RFC 5256's sequence order once a message keeps an
+   older document id in a mailbox (a MOVE keeps it); that is a code reading, not a run.
+
+#### The final net, the gates and the CI runs
+
+The record is "### Task 7 results", which names `a2b78bbb0` throughout. CI ran eight times
+in this part, each a dispatch of `test.yml` on the branch:
+
+| Run | SHA | Result |
+|---|---|---|
+| [41375595989](https://github.com/jaylaney/stalwart/actions/runs/41375595989) | `0fce81db9` | Directory 401 (hold 1's second cause), Automation `invalidPatch` on `description`; the gates' net failed on Automation alone, and both gates passed: coverage 21,559 / 22,292 and 12,497 / 13,154 |
+| [41378027623](https://github.com/jaylaney/stalwart/actions/runs/41378027623) | `4b6aff499` | Test green (the directory suite whole, IMAP); Automation: the first ACME request failed to connect |
+| [41380559601](https://github.com/jaylaney/stalwart/actions/runs/41380559601) | `5cee98fb4` | Automation: the readiness wait timed out (the probe's missing User-Agent); Test hung in the directory suite and was stopped at its 60-minute timeout (below) |
+| [41383738137](https://github.com/jaylaney/stalwart/actions/runs/41383738137) | `7bf0e38fd` | Automation: the diagnostics showed Pebble up and answering 400 |
+| [41385904923](https://github.com/jaylaney/stalwart/actions/runs/41385904923) | `7d05f3976` | Automation: TLS-ALPN-01, HTTP-01 and DNS-01 issued; DNS-PERSIST-01 refused |
+| [41388767201](https://github.com/jaylaney/stalwart/actions/runs/41388767201) | `9c4858bdb` | Automation: ACME and DKIM passed; `automation::dns` failed on the persist record |
+| [41390914882](https://github.com/jaylaney/stalwart/actions/runs/41390914882) | `a2b78bbb0` | Every job green but Test: the directory suite hung (below) and the job was stopped at its 60-minute timeout. Its gates job is green: the net passed (Automation's instrumented attempt 1 failed and its rerun passed; the net's step logs are not uploaded when the job passes), and coverage 21,560 / 22,292 and 12,498 / 13,154, inventory OK |
+| [41396778101](https://github.com/jaylaney/stalwart/actions/runs/41396778101) | `a2b78bbb0` | **success: every job green** (the final run) |
+
+Every other job of these runs passed, except each gates job before `a2b78bbb0`, whose net
+failed on the same Automation step. A run's later jobs ran on after a newer one was
+dispatched; none was cancelled by hand.
+
+The final run, [41396778101](https://github.com/jaylaney/stalwart/actions/runs/41396778101),
+at `a2b78bbb0`, job by job. No step used its rerun, except as noted.
+- Check Style: success.
+- Unit Tests: success, 593 passed and 2 ignored (workspace 571, SMTP without enterprise 16,
+  HTTP 6).
+- Test: success. Directory (the whole suite, `issuer` with its 401), SMTP 76 passed and 3
+  ignored, IMAP (the SORT expectation from the INTERNALDATEs), JMAP.
+- Upstream Suites: success. `cal_query` (2 passed, 1 ignored), store, blob, lookup, search,
+  telemetry, system, and automation (ACME, DKIM, DNS, RFC 2136) passed.
+- Zero-access Test: success, 233 passed: vault and groupware 225, the leak unit test, ZA, ZA
+  with filesystem blobs, cache swap, CalDAV plain and key, IMAP and JMAP key.
+- Independent CalDAV Client: success. Harness 34 tests; plain 68 passed, 1 skipped, 3 xfailed
+  (`testSearchEvent` passed: its record is non-strict); key 74 passed, 1 skipped, 2 xfailed.
+- Fresh OSS Store Restart: success. 9 failure tests, then 9 readback checks after the
+  restart.
+- C10 Gates: success, in 1 h 46 min. The net passed every step (`smtp` reran its three
+  documented flakes by name: `antispam`, `lmtp_delivery`, `queue_retry`); the capture (28
+  listings, 28 ignored-only), 2,356 executed functions; inventory `result: OK`; coverage full
+  21,560 / 22,292 and runtime-only 12,498 / 13,154, `result: OK`. D5 is settled: the job is
+  green, so a red one now means a gate or the net failed.
+
+#### Held and notes
+
+- **The directory suite hung twice** in the eleven runs at 1.0 (part 8c's three and this
+  part's eight: runs 41380559601 and 41390914882, each in "OIDC account discovery tests"
+  until the job's 60-minute timeout); at `a2b78bbb0` it passed in the next run. Neither log
+  shows a cause.
+  A likely one, not confirmed: `tests/src/utils/containers.rs`'s `wait_for_http` builds its
+  client without a request timeout, so a container that accepts a connection and never
+  answers holds the probe past its 180 s deadline (Keycloak's `latest` image pull, which has
+  no deadline either, is the other candidate). A per-request timeout would turn the first
+  into a retry; it is not made here, since the cause is not shown and the change would move
+  the record's SHA. This needs a ruling.
+- **DNS-PERSIST-01 cannot be tested against Pebble at 1.0**: no Pebble release advertises
+  `accountHashPrefix` or `issuerDomainNames` in its directory. 1.0.1's requirement may track
+  a newer revision of the dns-persist draft than Pebble 2.10.1 implements; the issuance path
+  goes untested until a test ACME server advertises both.
+- **1.0.1's tie order** (item 3): a possible deviation from RFC 5256 for messages that tie on
+  every sort key, from a code reading only.
+- The listing capture, the net and the matrix ran with part 7f3's tools, which are copies of
+  the committed scripts' commands; the committed scripts (now reading `ci_steps.py`) ran in CI
+  in every gates job above.
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
@@ -9721,6 +9940,12 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `za::fanout::test_failures` (fork, part Z1, ruling 176 B-M3 and B-M7) | Adds steps 7e (the recipient at its notification count limit: 5.1, no item, none evicted) and 7f (a disk quota between the plaintext and the sealed sizes: 5.1, no item). | 1.0's `MaxCalendarEventNotifications` object quota (`NotificationQuota`). |
 | `za::fanout::test_storage_guards` (fork, part Z1, ruling 176 B-M1 and B-M2) | New: `delete_with_events_za` with another account's keys is refused; a sealed event's delete without its key domain fails; each with a control. | None in 1.0: the review's B-M1 and B-M2. |
 | `store::write::batch::za_chunk_assert_tests` and `directory::core::secret::za_tests::totp_url_error_quotes_nothing` (fork units, part Z1, rulings 173 and 176 A3) | New. | 1.0's commit chunks (`add_commit_point`); totp-rs 6.0's URL errors quote the component that fails to parse. |
+| `directory::issuer::test` (upstream, part Z2, rulings 33 and 177) | Without a licence (`is_enterprise_edition()` false, as in every run here) the token is expected to answer 401, not 200; with a licence the former 200 stands. The token request (`openid` only) and the claim checks are unchanged. The test's OIDC directory also sets `unscopedTokens` to `interoperable`, so that a licensed run is not refused for the token's scopes. | Ruling 33 (no test licence): at 1.0 a domain's directory is consulted, by the token's domain or by its issuer, only while `is_enterprise_edition()` (`common/src/auth/authentication.rs`, `get_directory_for_domain` and `get_directory_for_issuer`, SEL snippets); otherwise only the default directory is, and the test has none. And `directory/src/backend/oidc/lookup.rs` (`token_access`): 1.0 refuses a token with none of the `urn:ietf:params:oauth:scope:{mail,contacts,calendars,files}` scopes while `unscopedTokens` is `reject`, its default (`registry/src/schema/enums.rs`); the test realm defines none of those scopes. |
+| `automation::acme` and `automation::dns` (upstream, part Z2, ruling 177) | Each `AcmeProvider` literal sets a `description`, and `registry_create` (`tests/src/utils/registry.rs`, `remove_server_set_props`) strips an `AcmeProvider`'s `accountHashPrefix`, `issuerDomainNames` and `caaIdentities`. The provider without a contact is still expected to fail with `invalidProperties` ("At least one contact email is required"). | 1.0's `AcmeProvider` has four fields 0.16's lacked: three server-set (`registry/src/schema/structs_impl.rs`, `assert_server_set`; a create that names one is refused with `invalidPatch`, "Cannot modify server set property") and a required `description`, whose string patch refuses an empty value ("Invalid value for property."). Both refusals come before the contact check. |
+| `automation::acme`, the DNS-PERSIST-01 case (upstream, part Z2, ruling 177) | The provider's create is expected to fail with `invalidProperties` ("... does not support DNS-PERSIST-01 ..."); the `persist.org` domain, its certificate check and its id in the cleanup are removed. The TLS-ALPN-01, HTTP-01, DNS-01 and preferred-chain cases are unchanged. | `common/src/network/acme/persist.rs` (`DirectoryMeta::require_persist_support`): 1.0 refuses a DNS-PERSIST-01 provider whose ACME directory does not advertise both `accountHashPrefix` and `issuerDomainNames`; Pebble 2.10.1's directory meta carries only `caaIdentities`, `externalAccountRequired` and `profiles`. 0.16 created the provider and issued the certificate. |
+| `automation::dns::test`, `EXPECTED_ZONE` (upstream, part Z2, ruling 177) | The `_validation-persist.example.org.` TXT line is removed from the expected zone. | `common/src/network/dns/records.rs`: 1.0 publishes `_validation-persist` records only for a DNS-PERSIST-01 provider whose directory advertises `accountHashPrefix` and `issuerDomainNames` (`PersistRecordBuilder::new`); 0.16 published one for every ACME-managed domain. The test's provider uses TLS-ALPN-01. |
+| `tests/src/utils/containers.rs`, `ensure_pebble` (harness, part Z2, ruling 177) | After the mapped port opens, the harness waits for Pebble's directory (`wait_for_pebble`: `https://localhost:14000/dir` answering with success, a User-Agent sent, at most 180 s); on a timeout it reports the answers for `localhost` and `127.0.0.1` and `docker ps`, `docker port` and `docker logs` of the container. | None in 1.0: a timing artefact. The mapped port accepts connections before Pebble listens behind it (about a second), and on a hosted runner the server's first ACME request came 50 ms after the port opened. Pebble answers a request without a User-Agent with 400 (RFC 8555 section 6.1). |
+| `imap::search::test`, `UID SORT RETURN (COUNT ALL) (DATE SUBJECT)` (upstream, part Z2, ruling 177) | The expected `ALL` set is built from the INTERNALDATEs of UIDs 2, 3, 7, 8 and 9 (a `UID FETCH ... (INTERNALDATE)`): `6,4:5,1,10`, then those five by INTERNALDATE and, within one second, by base subject (9, 3, 7, 8, 2). When all five land in one second it is the former expectation `6,4:5,1,10,9,3,7:8,2`. The MySQL branch is unchanged. | `email/src/message/sortkeys.rs` (`cache_comparator`, `SentAt`) and `messagedata.rs` (`sent_at_offset`): 1.0 dates a message whose Date header is missing or does not parse by its INTERNALDATE (`received_at` plus a zero offset; RFC 5256 section 2.2). 0.16 indexed no `SentAt` for such a message (`email/src/message/index/search.rs:154-164` at `9601038de`), so they sorted as one undated group by SUBJECT whatever the clock did. The five fixture messages have no usable Date, so 1.0's order depends on the second each APPEND landed in. |
 
 ## Task 1 check
 
