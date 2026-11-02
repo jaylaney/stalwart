@@ -201,6 +201,9 @@ const DEAD_WRITER: &str = "plainmail37@example.com";
 /// `calendar_writes_lose_to_provisioning`'s account (upgrade ruling 173), an
 /// ordinary one that writes calendars and events over DAV.
 const CALENDAR_WRITER: &str = "plainmail39@example.com";
+/// The ordinary account whose shared event `calendar_writes_lose_to_provisioning`
+/// copies into the writer's calendar over JMAP (upgrade ruling 181).
+const CALENDAR_SOURCE: &str = "plainmail40@example.com";
 const PLAIN: &str = "plainmail3@example.com";
 /// The organizer of `forward_race_imip_side_write`'s invitation, which it
 /// sends through authenticated submission.
@@ -267,7 +270,7 @@ pub async fn test(test: &mut TestServer) {
         setup_refuses_object_metadata(test, &admin).await;
     let metadata_writer = metadata_writes_lose_to_provisioning(test).await;
     let dead_writer = dead_property_writes_lose_to_provisioning(test).await;
-    let calendar_writer = calendar_writes_lose_to_provisioning(test).await;
+    let (calendar_writer, calendar_source) = calendar_writes_lose_to_provisioning(test).await;
 
     // The accounts that log in empty their own mailboxes; the others are
     // pending or credentialless, and the account's destruction removes
@@ -331,6 +334,7 @@ pub async fn test(test: &mut TestServer) {
         metadata_writer,
         dead_writer,
         calendar_writer,
+        calendar_source,
     ] {
         admin.destroy_account(account).await;
     }
@@ -3320,7 +3324,17 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
 /// COPY, MOVE and DELETE each answer 503 and store nothing (the account's
 /// calendar change log does not move). With the record cleared, the same
 /// writes commit (the control).
-async fn calendar_writes_lose_to_provisioning(test: &TestServer) -> Account {
+///
+/// Upgrade ruling 181 adds the other ordinary writers: a PROPPATCH of a
+/// calendar's and an event's live property and an ACL on a calendar (503,
+/// as the others); and over JMAP a `Calendar/set` create, a
+/// `CalendarEvent/set` create and a `CalendarEvent/copy` from another
+/// ordinary account (each answers `notCreated` with `forbidden`, upstream's
+/// "Another process modified" answer to an assertion failure), and a
+/// `CalendarEventNotification/set` destroy (the commit's error answers the
+/// method with `serverUnavailable`): no calendar or notification change is
+/// logged while the record is planted, and each commits once it is cleared.
+async fn calendar_writes_lose_to_provisioning(test: &TestServer) -> (Account, Account) {
     use hyper::StatusCode;
     println!("calendar_writes_lose_to_provisioning");
     const HOME: &str = "/dav/cal/plainmail39@example.com/";
@@ -3368,9 +3382,120 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
             .await
             .unwrap()
     };
+    let notification_change_id = async || {
+        test.server
+            .store()
+            .get_last_change_id(
+                id,
+                types::collection::SyncCollection::CalendarEventNotification.into(),
+            )
+            .await
+            .unwrap()
+    };
+    // Ruling 181's JMAP sources: an ordinary account's event shared with
+    // the writer, and an item in the writer's inbox.
+    let source = admin
+        .create_user_account(CALENDAR_SOURCE, STRONG, "Fence", &[], user_permissions())
+        .await;
+    let source_id = source.id().document_id();
+    let source_dav = crate::utils::webdav::DummyWebDavClient::new(
+        source_id,
+        CALENDAR_SOURCE,
+        STRONG,
+        CALENDAR_SOURCE,
+    );
+    source_dav
+        .request(
+            "PUT",
+            "/dav/cal/plainmail40@example.com/default/fence-source.ics",
+            &ical("cal-fence-source", "fence source"),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let writer_principal = format!(
+        "{}/plainmail39%40example.com/",
+        groupware::DavResourceName::Principal.base_path()
+    );
+    source_dav
+        .acl(
+            "/dav/cal/plainmail40@example.com/default/",
+            &writer_principal,
+            ["read"],
+        )
+        .await
+        .with_status(StatusCode::OK);
+    let source_event = types::id::Id::from(
+        crate::za::dav_seal::resource_id(test, source_id, "default/fence-source.ics").await,
+    )
+    .to_string();
+    let default_calendar =
+        types::id::Id::from(crate::za::dav_seal::resource_id(test, id, "default").await)
+            .to_string();
+    let item = crate::utils::za::plant_inbox_item(
+        test,
+        id,
+        &crate::za::inbox::invitation("cal-fence-item", "fence item"),
+        crate::utils::za::PlantedItem::Plain { flags: 0 },
+        source_id,
+        None,
+    )
+    .await;
+    let item_id = types::id::Id::from(item).to_string();
+    let account_id = account.id_string().to_string();
+    let jmap_writes = [
+        (
+            "Calendar/set",
+            json!({ "accountId": account_id, "create": { "j1": { "name": "fence jmap" } } }),
+        ),
+        (
+            "CalendarEvent/set",
+            json!({ "accountId": account_id, "create": { "j1": {
+                "title": "fence jmap event",
+                "start": "2026-10-22T09:00:00",
+                "duration": "PT1H",
+                "timeZone": "Etc/UTC",
+                "uid": "cal-fence-jmap",
+                "calendarIds": { &default_calendar: true },
+            } } }),
+        ),
+        (
+            "CalendarEvent/copy",
+            json!({
+                "fromAccountId": source.id_string(),
+                "accountId": account_id,
+                "create": { "j1": {
+                    "id": source_event,
+                    "calendarIds": { &default_calendar: true },
+                } },
+            }),
+        ),
+        (
+            "CalendarEventNotification/set",
+            json!({ "accountId": account_id, "destroy": [item_id] }),
+        ),
+    ];
 
     // (method, path, destination, body, the control's status)
-    let writes: [(&str, String, Option<String>, String, StatusCode); 9] = [
+    let proppatch = |name: &str| {
+        format!(
+            concat!(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>",
+                "<D:propertyupdate xmlns:D=\"DAV:\"><D:set><D:prop>",
+                "<D:displayname>{}</D:displayname>",
+                "</D:prop></D:set></D:propertyupdate>"
+            ),
+            name
+        )
+    };
+    let acl = format!(
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?><D:acl xmlns:D=\"DAV:\">",
+            "<D:ace><D:principal><D:href>{}/plainmail40%40example.com/</D:href></D:principal>",
+            "<D:grant><D:privilege><D:read/></D:privilege></D:grant></D:ace></D:acl>"
+        ),
+        groupware::DavResourceName::Principal.base_path()
+    );
+    let writes: [(&str, String, Option<String>, String, StatusCode); 12] = [
         (
             "PUT",
             path("default/fence-new.ics"),
@@ -3434,6 +3559,21 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
             String::new(),
             StatusCode::NO_CONTENT,
         ),
+        (
+            "PROPPATCH",
+            path("fence-src/"),
+            None,
+            proppatch("fence calendar renamed"),
+            StatusCode::MULTI_STATUS,
+        ),
+        (
+            "PROPPATCH",
+            path("default/fence-1.ics"),
+            None,
+            proppatch("fence event renamed"),
+            StatusCode::MULTI_STATUS,
+        ),
+        ("ACL", path("fence-src/"), None, acl.clone(), StatusCode::OK),
     ];
     let send =
         async |method: &str, target: &str, destination: Option<&str>, body: &str| match destination
@@ -3488,6 +3628,9 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
             String::new(),
             StatusCode::NO_CONTENT,
         ),
+        &writes[9],
+        &writes[10],
+        &writes[11],
     ];
     let before = change_id().await;
     for (method, target, destination, body, _) in refused {
@@ -3498,6 +3641,39 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
             change_id().await,
             before,
             "{method} {target} stored a change while the account holds a vault record"
+        );
+    }
+    let before_items = notification_change_id().await;
+    for (method, body) in &jmap_writes {
+        let response = account.jmap_method_call(method, body.clone()).await;
+        println!("{method} while the record is planted: {}", response.0);
+        let answer = &response.0["methodResponses"][0];
+        if *method == "CalendarEventNotification/set" {
+            assert!(
+                answer[0] == "error"
+                    || answer[1]["destroyed"]
+                        .as_array()
+                        .is_none_or(|destroyed| destroyed.is_empty()),
+                "{method} destroyed while the account holds a vault record: {answer}"
+            );
+        } else {
+            assert!(
+                answer[1]["created"]
+                    .as_object()
+                    .is_none_or(|created| created.is_empty())
+                    && answer[1]["notCreated"]["j1"].is_object(),
+                "{method} created while the account holds a vault record: {answer}"
+            );
+        }
+        assert_eq!(
+            change_id().await,
+            before,
+            "{method} stored a change while the account holds a vault record"
+        );
+        assert_eq!(
+            notification_change_id().await,
+            before_items,
+            "{method} stored a change while the account holds a vault record"
         );
     }
 
@@ -3515,6 +3691,22 @@ END:VEVENT\r\nEND:VCALENDAR\r\n"
             .with_status(*status);
         assert_ne!(change_id().await, before, "control: {method} {target}");
     }
-    // The account's destruction removes its calendars and events.
-    account
+    for (method, body) in &jmap_writes {
+        let response = account.jmap_method_call(method, body.clone()).await;
+        let answer = &response.0["methodResponses"][0];
+        if *method == "CalendarEventNotification/set" {
+            assert_eq!(
+                answer[1]["destroyed"][0].as_str(),
+                Some(item_id.as_str()),
+                "control: {method}: {answer}"
+            );
+        } else {
+            assert!(
+                answer[1]["created"]["j1"].is_object(),
+                "control: {method}: {answer}"
+            );
+        }
+    }
+    // The accounts' destruction removes their calendars, events and items.
+    (account, source)
 }
