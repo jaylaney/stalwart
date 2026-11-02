@@ -86,19 +86,35 @@ its upstream updates during merges; do not insert fork release entries there.
 ## Release implementation
 
 The first preview is `0.1.0-beta.1`, tagged `fork-v0.1.0-beta.1` and titled
-`release-0.1.0-beta-1`. `fork-release.toml` is the fork identity source: it records the fork
-version and upstream base tag/full commit. The shipping `stalwart` package version must match
-it. The current candidate is `0.1.1-beta.1`, with fully integrated upstream `v0.16.27`
-(`aa47d8ef7bfba7200d3293198ac2592747b20e73`). Internal upstream crate versions and numeric
-compatibility checks follow `0.16.27`; the fork-owned `vault` crate retains `0.16.25`.
-The published `fork-v0.1.0-beta.1` tag and artifacts remain immutable.
+`release-0.1.0-beta-1`; `0.1.1-beta.1` (tag `fork-v0.1.1-beta.1`) followed on upstream
+`v0.16.27`. `fork-release.toml` is the fork identity source: it records the fork version and
+upstream base tag/full commit. The shipping `stalwart` package version must match it. The
+current candidate is `0.2.0-beta.1`, with fully integrated upstream `v1.0.1`
+(`23b69755cb3cd8ecd952fe0443c5ac067a506184`). Internal upstream crate versions and numeric
+compatibility checks follow `1.0.1`; the fork-owned `vault` crate retains `0.16.25`. The
+published `fork-v0.1.0-beta.1` and `fork-v0.1.1-beta.1` tags and artifacts remain immutable.
 
-This candidate uses public upstream and fork tests for qualification and adds no private-test
-dependency, stored-format migration or legacy reader. Record fresh candidate results before
-publication; existing results do not establish new backend, cluster, platform or native-client
-qualification. The upstream 1.0 port remains deferred, and integrating .27 is not an ongoing
-upstream .16 support commitment. Preserve backups and verify restoration; this update does
-not establish binary-only rollback safety.
+`0.2.0-beta.1` is a limited prerelease. It supports fresh stores only: upstream 1.0.1 cannot
+open a store written by upstream 0.16 or by the fork's `0.1.x` releases, and the fork adds no
+conversion or legacy reader. An existing installation moves by provisioning a fresh store and
+setting its key accounts up again, keeping the old store and the `0.1.x` binary for rollback;
+rollback restores the old store as it was, without the writes made after the cutover. This
+candidate uses public upstream and fork tests for qualification and adds no private-test
+dependency. Record fresh candidate results before publication; existing results do not
+establish new backend, cluster, platform or native-client qualification, and results from
+the `0.1.x` base are not evidence for this candidate. Its pending gates, each needing its own
+authorization or session, are: the exact-source Linux product build and verification through
+`product-build.yml`; the native Calendar and Mail client checklist against that build; and a
+clean-context whole-branch review. SQL backends, clusters, other platforms and the external
+protocol suites are not qualified. The candidate stays a prerelease until its applicable
+gates pass; the [fork changelog](../CHANGELOG-fork.md) records its automated results.
+
+`scripts/release/verify_product.py` checks the upstream pin as well as the binary: the pinned
+tag must name `upstream_commit` (from a local tag, or from `PINNED_UPSTREAM_TAGS` when the
+checkout has none), that commit must be an ancestor of the source (a shallow clone is
+refused), and no later known upstream release may be in the source's history. Each upstream
+merge adds its tag to `PINNED_UPSTREAM_TAGS`; `product-build.yml` checks out the full history
+(`fetch-depth: 0`) for the ancestry checks.
 
 The build generates the operator identity used by `--version`, help, startup logs and console.
 It includes the full fork source commit and clean/dirty checkout state. In a source archive
