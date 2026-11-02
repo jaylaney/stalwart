@@ -521,7 +521,7 @@ jobs:
             ${{ runner.temp }}/fresh-store-logs/fresh-store.log
 
   gates:
-    name: C10 Gates
+    name: Test Retention Gates
     needs: style
     # The inventory and coverage gates of the 1.0 upgrade (scripts/tests,
     # tests/qualification): the baseline's 19-step `cargo llvm-cov

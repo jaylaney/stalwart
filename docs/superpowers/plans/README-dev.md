@@ -74,7 +74,7 @@ Then, in the same branch:
   purpose; classify it.
 - Run the gates. `python3 -I scripts/tests/ci_steps.py` (the workflow check) and
   `python3 -I scripts/tests/test_gates.py` run in CI's Check Style job. Dispatch
-  `test.yml` on the branch: its C10 Gates job (weekly and dispatch only) runs the coverage
+  `test.yml` on the branch: its Test Retention Gates job (weekly and dispatch only) runs the coverage
   net and the inventory and coverage gates against
   `tests/qualification/baseline-0.16.27.json`, and the other jobs run every suite, the
   independent CalDAV client and the fresh-store restart gate.

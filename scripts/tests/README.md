@@ -1,4 +1,4 @@
-# The C10 gates
+# The test retention gates (C10)
 
 Two gates compare a candidate (the fork on upstream 1.0.1) with the 0.16.27 baseline,
 `tests/qualification/baseline-0.16.27.json`. Task 7 of the upgrade plan defines them, and
