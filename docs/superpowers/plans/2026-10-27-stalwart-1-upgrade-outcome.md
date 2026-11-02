@@ -9067,8 +9067,11 @@ Commits:
 - `57f94d37c`: ruling 176's lens C items;
 - `928867f7d`: the cases;
 - `e25854b4f`: A3's unit test moved to a quoting parser error (found by its mutation), the
-  final SHA of the matrix;
-- this note.
+  SHA of the first full matrix;
+- `0cb5171ff`: this note's first version;
+- `b3a2af53c`: ruling 181, the remaining ordinary calendar writers;
+- `2469e15f0`: ruling 181's writers in the fence case, the final SHA;
+- this note's update.
 
 #### The fixes
 
@@ -9101,6 +9104,18 @@ Commits:
     holds no keys), MKCOL (`mkcol.rs`, likewise) and `copy_event`, `move_event`,
     `rename_event`, `copy_container` and `rename_container` (`copy_move.rs`; a move fences
     its source too, a container rename only on the upstream path).
+- **Ruling 181: R26 closed entirely.** The adjudication of this part's first report put the
+  same per-chunk fence on every other ordinary writer of `Calendar` or `CalendarEvent` rows
+  or content, each one call at the upstream site: DAV PROPPATCH of a calendar or an event on
+  the upstream path (`dav/src/calendar/proppatch.rs`, when the writer holds no keys; ruling
+  70 fenced only its dead-property containers), DAV ACL on a calendar (`dav/src/common/
+  acl.rs`, the calendar arm; a key account's calendar is refused before it), and JMAP
+  `Calendar/set`, `CalendarEvent/set`, `CalendarEvent/copy` (the destination account) and
+  `CalendarEventNotification/set` (`jmap/src/calendar/set.rs`, `calendar_event/{set,copy}.rs`,
+  `calendar_event_notification/set.rs`), which serve ordinary accounts only
+  (`za_assert_calendar_allowed`), through `za_provisioning_fence_per_chunk`. A request that
+  writes nothing still commits nothing: the fence's own operations leave the batch empty.
+  Address books, contacts and files stay unfenced: key accounts keep those in the clear.
 - **Ruling 174 (R-b): the inbox expiry keeps pending items**
   (`groupware/src/calendar/storage.rs`, `itip_auto_expunge`). The archives callback skips a
   row whose flags carry `EVENT_NOTIFICATION_ZA_PENDING`. Only a key account's sealed items
@@ -9166,7 +9181,15 @@ Commits:
 - `za::mail::fence::calendar_writes_lose_to_provisioning` (ruling 173, `plainmail39`): a
   vault record planted behind the cached ordinary classification; a PUT create and update,
   an MKCALENDAR, an event's COPY, MOVE and DELETE, and a calendar's COPY, MOVE and DELETE
-  each answer 503 and log no change; with the record cleared, the same writes commit.
+  each answer 503 and log no change; with the record cleared, the same writes commit. Ruling
+  181 adds a PROPPATCH of a calendar's and an event's display name and an ACL on a calendar
+  (503 too), and over JMAP a `Calendar/set` and a `CalendarEvent/set` create and a
+  `CalendarEvent/copy` from a second ordinary account (`plainmail40`, its calendar shared by
+  DAV ACL), each answered `notCreated` with `forbidden` ("Another process modified ...",
+  upstream's answer to an assertion failure), and a `CalendarEventNotification/set` destroy
+  of a planted item, answered by the method error `serverUnavailable` (the commit's error).
+  No calendar or notification change is logged while the record is planted; each commits
+  once it is cleared.
 - `za::inbox::test_expiry` (ruling 174), rewritten: `expungeSchedulingInboxAfter` one second
   (restored after); key1's pending item survives the purge, its drained item and an ordinary
   account's item are expunged.
@@ -9180,8 +9203,9 @@ Commits:
 - Units: `store::write::batch::za_chunk_assert_tests` (every chunk, the trailing one
   included, holds the assertion ahead of its writes, and no write's selection changes; no
   assertion unless asked) and `directory::core::secret::za_tests::totp_url_error_quotes_nothing`.
-- Not tested: lens C's M1 is reachable only by a race between two reads with no test hook
-  between them; B-M2's DAV arm is unreachable by construction.
+- Not tested: lens C's M1 is reachable only by a race between two reads of one request,
+  with no test hook between them; ruling 182 accepts that, with no hook. B-M2's DAV arm is
+  unreachable by construction.
 
 B-M4 changed the suite's cleanups: a client can no longer delete a pending item, so
 `Party::delete_items` (now taking the server), the `leak` cleanups and drain step D
@@ -9191,9 +9215,9 @@ did before ruling 174.
 
 #### The mutation rows
 
-Rows `z001` to `z015` of `task-7d/mutations.tsv`, by the `ZA_MUT` switch (part 7d2's
-method; the switches and the `ZA_ONLY` selector stayed uncommitted, `final-fix-z1/muts.py`).
-The control (every selected module, `ZA_MUT` unset) passed.
+Rows `z001` to `z021` of `task-7d/mutations.tsv`, by the `ZA_MUT` switch (part 7d2's
+method; the switches and the `ZA_ONLY` selector stayed uncommitted, `final-fix-z1/muts.py`
+and, for ruling 181, `muts2.py`). Each control (the selected modules, `ZA_MUT` unset) passed.
 
 | Row | Mutation | Outcome |
 |---|---|---|
@@ -9211,7 +9235,13 @@ The control (every selected module, `ZA_MUT` unset) passed.
 | z012 | no notification count check | caught: `test_failures` 7e |
 | z013 | a pending item's DELETE proceeds | caught: `inbox::test`, 204 |
 | z014 | the quota measures the plaintext | caught: `test_failures` 7f |
-| z015 | the sealed upload served raw | not caught: a race with no test hook |
+| z015 | the sealed upload served raw | not caught: a race with no test hook (accepted, ruling 182) |
+| z016 | no fence on PROPPATCH | caught: `mail::fence`, the calendar PROPPATCH answers 207 |
+| z017 | no fence on a calendar ACL | caught: `mail::fence`, 200 |
+| z018 | no fence on `Calendar/set` | caught: `mail::fence`, created |
+| z019 | no fence on `CalendarEvent/set` | caught: `mail::fence`, created |
+| z020 | no fence on `CalendarEvent/copy` | caught: `mail::fence`, created |
+| z021 | no fence on `CalendarEventNotification/set` | caught: `mail::fence`, destroyed |
 
 #### Runs at `e25854b4f`
 
@@ -9235,20 +9265,28 @@ files; no source file changed, and the fixtures were restored with `git checkout
 shipping check `cargo check -p stalwart --no-default-features --features rocks` passed with
 no warning, and `cargo fmt --all --check` passed.
 
-#### Needs a ruling
+#### Runs at `2469e15f0` (after ruling 181)
 
-- **Ordinary calendar writers outside ruling 173's list.** The ruling names the DAV PUT,
-  COPY, MOVE, DELETE and MKCOL batches. Other ordinary writers of `Calendar` and
-  `CalendarEvent` rows still commit without the per-chunk fence: DAV PROPPATCH of live
-  properties alone (`dav/src/calendar/proppatch.rs`; ruling 70 fences only its dead-property
-  containers), DAV ACL on a calendar (`dav/src/common/acl.rs`), and JMAP `Calendar/set`,
-  `CalendarEvent/set`, `CalendarEvent/copy` and `CalendarEventNotification/set` for ordinary
-  accounts (`jmap/src/calendar*/`). JMAP's `CalendarEvent/set` create writes event content,
-  the same exposure as a DAV PUT. Each would take the same one-line `za_ordinary_fence` (or
-  the common helper) call. Close them, or record them as R26's remaining residual.
-- **Lens C's M1 has no test.** It needs a vault record removed between two reads of one
-  request, and no test hook sits between them. Add a hook, or accept the mutation row's "not
-  caught".
+Logs in `task-7c/logs/`, through `matrix4.sh`. Ruling 181 touches only the DAV and JMAP
+calendar writers, so the IMAP, `system_tests` and SMTP rows were not rerun; their
+`e25854b4f` runs above stand.
+
+| Row | Log | Result |
+|---|---|---|
+| ZA | `za-98` | pass (362 s) |
+| ZA, `BLOB_STORE=FileSystem` | `zafs-10` | pass (366 s) |
+| CalDAV plain, key | `caldav-plain-31`, `caldav-key-29` | pass, pass |
+| JMAP plain, key | `jmap-plain-53`, `jmap-key-34` | pass, pass |
+| Workspace units (CI's step) | `units-9` | 571 passed, 0 failed, 2 ignored |
+
+The shipping check passed with no warning, and `cargo fmt --all --check` passed. The units
+step again rewrote the dav-proto request fixtures, which were restored with `git checkout`.
+
+#### Rulings on this part's first report
+
+- Ruling 181 closed R26 entirely (above).
+- Ruling 182 accepted lens C's M1 without a test: its mutation, z015, stays not caught,
+  reachable only by a race between two reads of one request; no hook is added.
 
 ## Conflict ledger
 
@@ -9676,7 +9714,7 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `za::registry::test` (fork, part Z1, ruling 172) | Adds the order checks: an unsorted `x:Account/query` is descending, a sort on `id` ascending, the reverse of each other. | The same. |
 | `za::tracing::test` (fork, part Z1, rulings 171 and 176 A2) | Adds `bearer_values_are_not_traced` (an undecodable Bearer value over HTTP, SMTP AUTH OAUTHBEARER and XOAUTH2, and IMAP AUTHENTICATE, in no event or answer) and `login_type_errors_are_not_traced` (a type error in the `/api/auth` body). | None in 1.0: the review's A1 (`decode_access_token`'s details, 0.16 and 1.0 alike) and A2. |
 | `za::setup::test_grants_die_with_the_marker` (fork, part Z1, ruling 175) | New: a grant minted before `setup-token` is deleted by the marker write; its access token answers 401 and its refresh token finds no grant. | 1.0's grant-bound tokens; the refresh grant re-encodes credential version 0 (plan 13's R37). |
-| `za::mail::fence` (fork, part Z1, ruling 173) | Adds `calendar_writes_lose_to_provisioning`: nine ordinary DAV calendar writes answer 503 and log no change while a vault record is planted, and commit once it is cleared. | None in 1.0: plan 13's R26 residual, closed. |
+| `za::mail::fence` (fork, part Z1, rulings 173 and 181) | Adds `calendar_writes_lose_to_provisioning`: twelve ordinary DAV calendar writes answer 503 and four JMAP calendar writes fail (`notCreated` `forbidden`, or `serverUnavailable`), logging no change while a vault record is planted, and all commit once it is cleared. | None in 1.0: plan 13's R26 residual, closed. |
 | `za::inbox::test_expiry` (fork, part Z1, ruling 174) | Rewritten. It asserted that the purge removes an expired pending item (the recorded loss); with `expungeSchedulingInboxAfter` one second it now asserts that the pending item survives while a drained one and an ordinary account's one are expunged. | None in 1.0: invitations spec 6.6's recorded expiry, closed by ruling 174. |
 | `za::inbox::test` (fork, part Z1, ruling 176 B-M4) | Adds a DELETE of the pending item, answered 404, the item still stored. | None in 1.0: the review's B-M4. |
 | `za::drain::test_lease` step D, `za::fanout::Party::delete_items`, the `za::leak` inbox cleanups (fork, part Z1, ruling 176 B-M4) | A pending item is deleted at store level (`destroy_inbox_item`, `delete_inbox_item`) where a client DELETE removed it; `delete_items` takes the server. Step D still deletes the item under a parked pass. | The same: a client's DELETE of a pending item answers 404. |
