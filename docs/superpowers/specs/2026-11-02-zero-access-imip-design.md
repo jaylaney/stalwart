@@ -257,9 +257,13 @@ permitted differences:
 4. `SCHEDULE-STATUS`, in stored copies and the CANCELs that copy it (Jay's
    decision 9).
 5. Timing: the key account's inbound effects follow its next DAV request.
-6. The inbox row's `changed_by` and the fork's flag bits (D4); the message
-   trees compare, and every key-side item must have
-   `EVENT_NOTIFICATION_ZA_PENDING` clear once drained (8.3).
+6. The inbox row: `changed_by` (D4), `calendar_ids` and flags (a sealed item
+   is always `EVENT_NOTIFICATION_PRIVATE` with no calendar ids,
+   `seal/item.rs:137-153`, while upstream's notification carries the event's
+   audience flags and its calendar, `itip.rs:344-351`, `:984-993`). The
+   oracle compares message trees, not rows, and requires
+   `EVENT_NOTIFICATION_ZA_PENDING` clear on every key-side item once drained
+   (8.3).
 7. SEQUENCE values key pinning's reconciliation raised (its 5.1), the
    `SENT-BY` scrub (release 4 6.2, point 1) and a failed submission, which
    upstream's task retries and the fork only traces (Jay's decision 9), none
@@ -409,9 +413,9 @@ method but REQUEST, CANCEL or REPLY stays a permanent error). The mail arm:
    - **REPLY with an event:** `merge` with `Incoming::Mail`, authenticated as
      upstream authenticates it: `handle_reply` updates only the attendee whose
      address equals the sender; no token is read or required. The delegating
-     fan-out (`drain.rs:1272-1437`) runs only when the stored event's
-     ORGANIZER is one of the account's own addresses, that is, on the
-     organizer's copy: when the merge adds delegates there, it runs as
+     fan-out (the `Incoming::Reply` arm, `drain.rs:1309-1458`) runs only when
+     the stored event's ORGANIZER is one of the account's own addresses, that
+     is, on the organizer's copy: when the merge adds delegates there, it runs as
      release 2 section 6.4 says (D15). A delegate's REPLY into a delegator's
      copy (an attendee's copy) takes upstream's guarded arm, applies
      upstream's merge and fans out nothing, as upstream sends nothing then.
@@ -547,7 +551,7 @@ receives it as sealed mail and gets no calendar effect, since 4.1 step 4
 refuses iMIP whose sender (the organizer) is a local key account (section 6).
 That holds only when the ORGANIZER is the key account's own address. A
 consequence, recorded and not changed: a key organizer that organizes under a
-group's or list's address is mailed as the group (D12), so a key member's
+group's address is mailed as the group (D12), so a key member's
 delivery sees a sender that is not a key account, passes 4.1 step 4 (and
 auto-add, the group being a local principal) and gets an item, which its
 drain applies, as an ordinary member's ingest does.
@@ -648,8 +652,8 @@ for the caller to submit after its commit.
 - **Status.** A new `ITIP_STATUS_SENT = "1.1"` (RFC 6638 "sent, delivery not
   confirmed") in `fanout.rs`, rank 0 in `status_rank`, is written into the
   tree before the commit (`za_set_schedule_status`, `fanout.rs:1108-1146`) for
-  every mail-class recipient a message addresses, except in an internal-only
-  fan-out (D15), where it records `5.3`: handed to the mailer. It
+  every mail-class recipient a message addresses: handed to the mailer. In an
+  internal-only fan-out (D15) such a recipient records `5.3` instead. `1.1`
   lands on the recipient's property (the ATTENDEE, or the ORGANIZER for a
   REPLY); a later REPLY merge replaces it with upstream's `2.0`. Writing
   nothing, as upstream, would leave an earlier fan-out's `5.3` or `5.1` in
@@ -669,10 +673,11 @@ for the caller to submit after its commit.
   one (Jay's decision 9's direction); upstream's per-event tasks commit with
   their events.
 - None is retried (there is no task). For an event that still exists, the
-  next change that builds a message for the recipient resends. A lost DELETE
-  CANCEL (a crash after the commit, a failed or unregistered submission, a
-  collection DELETE's later chunk failing) is permanent: the event is gone, so
-  no later change to it exists, and the outside attendees keep a live copy.
+  next change that builds a message for the recipient resends. A DELETE's
+  lost message (the organizer's CANCEL or the attendee's declined REPLY; a
+  crash after the commit, a failed or unregistered submission, a collection
+  DELETE's later chunk failing) is permanent: the event is gone, so no later
+  change to it exists, and the outside parties keep a stale state.
   Upstream's task retries for three days, and commits with the event.
 - **Cost.** One SMTP queue write per mail attempt inside the request, bounded
   by `itip_outbound_max_recipients` (default 100, `za_schedule`'s 412) per
@@ -747,9 +752,9 @@ alarm, a change without scheduling content) mails nobody.
   (4.1 step 4), even from client-side scheduling. So a key member of a local
   list or group a key organizer invites under its own address receives the
   email sealed, with no calendar effect; a group receives it into the group's
-  own mailbox (Jay's decision 10). An organizer address that is a group's or
-  list's is mailed as the group, and its key members' deliveries get items
-  their drains apply (5.1): a recorded consequence.
+  own mailbox (Jay's decision 10). An organizer address that is a group's is
+  mailed as the group, and its key members' deliveries get items their drains
+  apply (5.1): a recorded consequence.
 - A local key account that cannot receive: not attempted, never mailed.
 - The task queue for a key account's scheduling; JMAP calendars.
 
@@ -845,20 +850,32 @@ the sharing modules:
   `update_commit_pause_point` and `delete_commit_pause_point`: three cases,
   create, update and DELETE, kept for path coverage. They return before
   `commit_batch`, so a case also fails the store's commit itself after every
-  precommit step has run: an update PUT and a DELETE, each carrying a
-  distinct change, are parked at those pause points; a competing revision of
-  the event commits; the loser is released, loses its assertion inside
-  `commit_batch`, and its distinct message never reaches the sink. The
+  precommit step has run: an update PUT and a single-event DELETE, each
+  carrying a distinct change, are parked at those pause points; a competing
+  revision of the event commits; the loser is released, loses its assertion
+  inside `commit_batch`, and its distinct message never reaches the sink. The
   handlers' bounded retry runs only when a calendar context changed
   (`za_refresh_event`, `calendar/mod.rs:803-822`; the DELETE's retry at
-  `delete.rs:506-530`), which an event revision does not change, so the
-  released loser fails on its first commit. A collection DELETE whose commit
-  is forced to split, by the existing `FORCE_COMMIT_SPLIT`
-  (`crates/store/src/za_test.rs:113`, read by `BatchBuilder::commit_point`),
-  and whose second chunk fails, by a new test hook `SECOND_CHUNK_FAIL_ONCE` in
-  `za_test.rs` that `write_batch` consults before its second chunk
-  (`crates/store/src/dispatch/store.rs:299-311`), mails nothing and traces the
-  loss (5.4). A key organizer inviting a local mailing list with
+  `delete.rs:506-553`), which an event revision does not change, so the
+  released loser fails on its first commit. The create's counterpart: a create
+  PUT parked at `commit_pause_point` while another session takes over its UID
+  lease (the lease-duration override in `common::za::test_hooks`), then
+  released, fails through `za_lost_create_fence` (`za_refresh_event` returns
+  `None`), and no mail reaches the sink. The REFRESH answer's: two sessions
+  drain the same mail-borne REFRESH item and exactly one answer reaches the
+  sink, the item deletion's assertion admitting one session (D14). A
+  collection DELETE whose commit is forced to split, by the existing
+  `FORCE_COMMIT_SPLIT` (`crates/store/src/za_test.rs:113`, read by
+  `BatchBuilder::commit_point`), and whose second chunk fails, by a new test
+  hook `SECOND_CHUNK_FAIL_ONCE` in `za_test.rs` that `write_batch` consults
+  before its second chunk (`crates/store/src/dispatch/store.rs:299-311`),
+  mails nothing and traces the loss (5.4). The hook is one-shot and keyed to
+  the batch's current account, like the other za hooks (`za_test.rs:9-12`),
+  and is armed before the DELETE, since that path has no pause point
+  (`delete_commit_pause_point` runs only with `retry_event`). The case uses at
+  least two events with outside attendees and asserts that the first chunk's
+  event is gone, the later one remains, and nothing is mailed. A key
+  organizer inviting a local mailing list with
   a key member and a plain member: the list is mailed once with `1.1`, the
   plain member's ingest imports it, and the key member's mailbox holds the
   sealed email while its inbox gets no item (Jay's decision 10); the
@@ -869,7 +886,8 @@ the sharing modules:
 No test forges a mail-borne item in the store: Jay's decision 11 accepts that
 exposure, and issue #72 owns its qualification test. The new modules turn the
 drain on with the `DrainOn` guard (`tests/src/za/drain.rs`), since the suite
-sets `DRAIN_SKIP_ALL` after setup (`tests/src/za/mod.rs:131`).
+sets `DRAIN_SKIP_ALL` after setup (`tests/src/za/mod.rs:132`), and so does
+any existing module whose changed assertions need a drain (`gating.rs`).
 
 This release's outside parties live at `remote.test`. At setup, before any
 module, the suite routes every non-local domain (a catch-all
@@ -897,11 +915,12 @@ accounts' emails take upstream's body without RSVP links and compare after
 normalizing volatile values only. Its precondition: both oracle accounts hold
 a ContactCard for `imip-org@remote.test` (created before the first step,
 deleted at the end), rather than auto-add on, so the first REQUEST imports on
-both sides; the oracle asserts the event exists on both sides before it
-compares. After each step it triggers the key account's drain and waits for
-delivery, asserts every key-side inbox item has `EVENT_NOTIFICATION_ZA_PENDING`
-clear, compares the number of inbox items and of sink messages per account
-(not one per step), then compares, normalized as 3.3 lists: the stored events
+both sides. After each step it triggers the key account's drain and waits for
+delivery, asserts the expected object on both sides (present after each
+inbound step; absent on both after a DELETE), asserts every key-side inbox
+item has `EVENT_NOTIFICATION_ZA_PENDING` clear, and compares the counts of
+inbox items and sink messages each account produced in that step, then
+compares, normalized as 3.3 lists: the stored events
 (DAV GET), each drained item's tree against the matching plain notification's
 message, and each message the sink got (From, To, Subject, Auto-Submitted,
 Reply-To, the method, the decoded text, HTML and ICS parts). Any other
@@ -949,8 +968,11 @@ layer's envelope events and their keys, accepted transit metadata (section 7):
   (whose sub-addressing rule resolves to a local part no account has), both
   store `1.1` (written before the commit), and their RCPT rejections are
   verified through section 7's stage-and-code trace. `5.1` stays
-  only for failures found before the commit (a lookup failure). Their
-  addresses may appear in the SMTP layer's events only.
+  only for failures found before the commit (a lookup failure). Events
+  carrying the submission's SMTP span id (the cache lookup, the
+  sub-addressing evaluation, RCPT) may name them; no other event may,
+  including any emitted before the PUT's commit returns. The module's
+  existing never-appears controls stay for every event outside that span.
 - `tests/src/za/leak.rs` (canary events with `remote.test` attendees): mail
   sunk and queue blobs purged before the scan. `itip_tasks_for`
   (`tests/src/utils/za.rs:1508`) stays.
@@ -981,7 +1003,7 @@ go in the plan's outcome note):
 | RSVP links on | `imip::outbound`, an RSVP URL in the body |
 | Plain local accounts left `NotInternal` | `imip::outbound`, no mail and `5.3` |
 | A key account without a public key mailed | `imip::outbound`, mail to `imip-pending` |
-| Mail submitted before the commit, on any path | `imip::outbound`, the case in which the store's commit itself fails (a competing revision; the loser's message at the sink), with the create, update and DELETE hook cases for path coverage |
+| Mail submitted before the commit (create, update, DELETE; the REFRESH answer before its item's deletion) | `imip::outbound`, the update and single-event DELETE case whose store commit fails (the loser's message at the sink), the create's lost-lease case and the two-session REFRESH case (two answers at the sink), with the create, update and DELETE hook cases for path coverage |
 | Mail sent for a chunked collection DELETE whose later chunk fails | `imip::outbound`, the `SECOND_CHUNK_FAIL_ONCE` case: mail at the sink |
 | A local mailing list left `NotInternal` | `imip::outbound`, the list case: no mail and `5.3` |
 | The token rule applied to mail recipients | `imip::outbound`, no REPLY to the outside organizer |
@@ -1055,7 +1077,9 @@ ordinary account's behaviour, and every new branch is a key account's. It adds:
     includes groups); an active local key account's address is never mailed,
     and is reached only through the sealed fan-out, whatever its state. A local
     list or group is mailed as upstream mails it; its key members receive the
-    email sealed, with no calendar effect.
+    email sealed, with no calendar effect, unless the ORGANIZER is a group's
+    address, whose invitation key members receive as from a plain local sender
+    (5.1, a recorded consequence).
 43. A mail-borne item is written only at delivery, for a sender upstream's
     `is_authenticated()` accepts and that is not a local key account, sealed
     to the served public key, with the sender only in `X-ZA-SENDER`. No field
