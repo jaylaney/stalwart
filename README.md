@@ -53,11 +53,22 @@ Cluster pubsub is required for prompt invalidation; a missed broadcast is not sy
 eviction of already resident keys.
 
 Some metadata remains visible, including event times, recurrence rules, identifiers, plaintext sizes,
-filenames and sync history. The
+filenames and sync history. Each event's standard classification (`CLASS` PUBLIC, PRIVATE
+or CONFIDENTIAL) is visible too, so that sharers can hide events; any other `CLASS` value
+stays sealed. The
 [design and threat model](docs/superpowers/specs/2026-10-06-zero-access-calendar-design.md)
 describes the sealed fields, visible metadata, key lifetime and security boundaries in detail.
 
 ## Development
+
+The fork is based on upstream Stalwart `v1.0.1`. Its own release version (currently
+`0.2.0-beta.1`, recorded in `fork-release.toml`) is independent of upstream's version;
+`stalwart --version` prints both, with the source commit.
+
+Fresh stores only: a build on the 1.0 base cannot open a store written by upstream 0.16 or
+by the fork's earlier 0.16-based releases (`0.1.x`), and there is no conversion. Those stores
+are not supported. Moving an installation means a fresh store and new account setup (new
+setup tokens and enrolment), keeping the old store and binary for rollback.
 
 Build the fork from source with stable Rust:
 
@@ -71,12 +82,16 @@ On macOS with Homebrew's keg-only rustup, first run:
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
 ```
 
-RocksDB needs the Xcode command line tools on macOS.
+RocksDB needs the Xcode command line tools on macOS. The workspace holds two packages named
+`http` (the server's and the crates.io crate it depends on through `telemetry`), so select
+the server's as `-p http@1.0.1`.
 
 The product build excludes enterprise features. Do not deploy builds with the `test_mode`
 feature, which weakens password hashing for tests.
 
-- [Developer notes](docs/superpowers/plans/README-dev.md): build, test and account setup details.
+- [Developer notes](docs/superpowers/plans/README-dev.md): build, test and account setup details,
+  and the upstream-merge procedure (fetch a verified release tag by URL, pin it for the
+  release verifier, run the gates).
 - [Release policy](docs/releases.md): independent versions, upstream provenance and release checks.
 - [Fork changelog](CHANGELOG-fork.md): changes and upgrade notes for fork releases.
 - [Manual client checklist](docs/zero-access/manual-checklist.md): CalDAV client verification.
