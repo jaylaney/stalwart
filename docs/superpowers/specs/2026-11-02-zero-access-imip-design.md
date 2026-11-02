@@ -1,6 +1,6 @@
 # Zero-access calendar: invitations by email (iMIP, release 5) design spec
 
-Date: 2026-11-02. Status: revision 3, draft for review. Revision 3 answers
+Date: 2026-11-02. Status: revision 3, approved 2026-11-02. Revision 3 answers
 the re-reviews of revision 2 (Jay's codex review's R2-1 to R2-3 and an
 internal review's G1 to G13): the attendee-side REPLY gate and the
 internal-only delegating fan-out (4.3, 5.4, 5.5, 8.2, 8.6; G1, G2), the
