@@ -643,6 +643,8 @@ impl CalendarUpdateRequestHandler for Server {
             // Prepare write batch
             let mut batch = BatchBuilder::new();
             batch.with_account_id(account_id);
+            // Upgrade ruling 173: this batch commits only on the upstream path.
+            crate::common::za::za_ordinary_fence(self, &mut batch, account_id, None);
             self.limit_disk_quota(&mut batch, &account);
             let notify_event_flags = new_event.flags | event.inner.flags.to_native();
             if let Some(old_ical) = old_ical.filter(|_| {
@@ -1101,6 +1103,7 @@ impl CalendarUpdateRequestHandler for Server {
             // Prepare write batch
             let mut batch = BatchBuilder::new();
             batch.with_account_id(account_id);
+            crate::common::za::za_ordinary_fence(self, &mut batch, account_id, None);
             self.limit_disk_quota(&mut batch, &account);
             let document_id = batch.reserve_document_id(account_id, Collection::CalendarEvent);
             let notify_calendar_ids = event.calendar_ids().collect::<Vec<_>>();

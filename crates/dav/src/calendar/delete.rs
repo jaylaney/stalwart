@@ -109,6 +109,9 @@ impl CalendarDeleteRequestHandler for Server {
 
         // Fetch entry
         let mut batch = BatchBuilder::new();
+        if za_keys.is_none() {
+            crate::common::za::za_ordinary_fence(self, &mut batch, account_id, None);
+        }
         if delete_resource.is_container() {
             // Deleting the default calendar is not allowed
             #[cfg(not(any(feature = "dev_mode", feature = "test_mode")))]
@@ -375,6 +378,14 @@ impl CalendarDeleteRequestHandler for Server {
                 {
                     context.assert_in(&mut batch);
                     contexts.push(context);
+                } else {
+                    // Upgrade ruling 176 (B-M2): a key account's delete needs
+                    // its key domain; it never takes upstream's queueing.
+                    return Err(za_calendar_error(
+                        groupware::calendar::sharing::resolve::ZaCalendarError::Forbidden,
+                        account_id,
+                        calendar_id,
+                    ));
                 }
             }
             let cutoff = store::write::now() as i64;

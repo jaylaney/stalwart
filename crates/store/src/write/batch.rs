@@ -58,6 +58,7 @@ impl BatchBuilder {
             has_index_tasks: false,
             task_types: TaskTypes::default(),
             priority: CommitPriority::Default,
+            za_chunk_asserts: Vec::new(),
         }
     }
 
@@ -697,6 +698,7 @@ impl BatchBuilder {
         self.batch_ops = 0;
         self.batch_size = 0;
         self.last_index_partition = None;
+        self.za_push_chunk_asserts();
         if let Some(account_id) = self.current_account_id {
             self.ops.push(Operation::AccountId { account_id });
         }
@@ -1223,6 +1225,61 @@ impl BatchBuilder {
     }
 }
 
+impl BatchBuilder {
+    /// Zero-access fork (upgrade ruling 173): asserts that the `(account_id,
+    /// collection, document_id, class)` key is absent in the current commit
+    /// chunk and again at the head of every later one, so no chunk of the
+    /// batch commits while the key is stored. `write_batch` commits each
+    /// chunk as its own transaction, and `add_commit_point` re-emits only the
+    /// account and the collection, so an assertion placed once would cover
+    /// only its own chunk. Unlike `za_assert_absent_in_every_chunk` it takes
+    /// any batch, as it is added while the batch is built: the caller's
+    /// account, collection and document selection is restored here, and
+    /// after a commit point `add_commit_point` re-emits the account and the
+    /// collection after the assertions, as it would without them.
+    pub fn za_assert_absent_per_chunk(
+        &mut self,
+        account_id: u32,
+        collection: Collection,
+        document_id: u32,
+        class: ValueClass,
+    ) -> &mut Self {
+        self.za_chunk_asserts
+            .push((account_id, collection, document_id, class));
+        self.za_push_chunk_asserts();
+        if let Some(account_id) = self.current_account_id {
+            self.ops.push(Operation::AccountId { account_id });
+        }
+        if let Some(collection) = self.current_collection {
+            self.ops.push(Operation::Collection { collection });
+        }
+        if let Some(document_id) = self.current_document_id {
+            self.ops.push(Operation::DocumentId { document_id });
+        }
+        self
+    }
+
+    /// The assertions of `za_assert_absent_per_chunk`, pushed without
+    /// changing the recorded selection.
+    fn za_push_chunk_asserts(&mut self) {
+        for (account_id, collection, document_id, class) in &self.za_chunk_asserts {
+            self.ops.push(Operation::AccountId {
+                account_id: *account_id,
+            });
+            self.ops.push(Operation::Collection {
+                collection: *collection,
+            });
+            self.ops.push(Operation::DocumentId {
+                document_id: PendingId::Assigned(*document_id),
+            });
+            self.ops.push(Operation::AssertValue {
+                class: class.clone(),
+                assert_value: AssertValue::None,
+            });
+        }
+    }
+}
+
 impl Default for BatchBuilder {
     fn default() -> Self {
         Self::new()
@@ -1233,3 +1290,105 @@ impl Default for BatchBuilder {
 #[rustfmt::skip]
 #[path = "../../../../../stalwart-tests/unit/store/src/write/batch/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod za_chunk_assert_tests {
+    use super::*;
+
+    const VAULT: ValueClass = ValueClass::Property(150);
+
+    /// Upgrade ruling 173: `za_assert_absent_per_chunk` puts its assertion in
+    /// the chunk it is added to and in every chunk after a commit point, the
+    /// trailing one included, and no write's account, collection or
+    /// document changes for it (an executor's cursor, replayed per chunk).
+    #[test]
+    fn every_chunk_asserts_and_keeps_the_selection() {
+        let mut batch = BatchBuilder::new();
+        batch
+            .with_account_id(7)
+            .with_collection(Collection::CalendarEvent)
+            .with_document(3);
+        batch.za_assert_absent_per_chunk(9, Collection::Principal, 0, VAULT);
+        batch.set(ValueClass::Property(1), vec![1u8]);
+        batch.add_commit_point();
+        batch
+            .with_document(4)
+            .set(ValueClass::Property(2), vec![2u8]);
+        batch.add_commit_point();
+        batch
+            .with_document(5)
+            .set(ValueClass::Property(3), vec![3u8]);
+        batch.add_commit_point();
+
+        let mut iterator = batch.commit_points();
+        let points = iterator.iter().collect::<Vec<_>>();
+        assert_eq!(
+            points.len(),
+            4,
+            "three commit points and the trailing chunk"
+        );
+        let mut writes = Vec::new();
+        for point in points {
+            let chunk = batch.build_one(point);
+            let (mut account, mut collection, mut document) = (None, None, None);
+            let mut asserted = false;
+            for op in chunk.ops.iter() {
+                match op {
+                    Operation::AccountId { account_id } => account = Some(*account_id),
+                    Operation::Collection { collection: c } => collection = Some(*c),
+                    Operation::DocumentId { document_id } => document = Some(*document_id),
+                    Operation::AssertValue { class, .. } => {
+                        assert_eq!(
+                            (account, collection, document),
+                            (
+                                Some(9),
+                                Some(Collection::Principal),
+                                Some(PendingId::Assigned(0))
+                            )
+                        );
+                        assert!(matches!(class, ValueClass::Property(150)));
+                        asserted = true;
+                    }
+                    Operation::Value { class, .. } => {
+                        assert!(asserted, "a write ahead of its chunk's assertion");
+                        writes.push((account, collection, document, class.clone()));
+                    }
+                    _ => {}
+                }
+            }
+            assert!(asserted, "a chunk without the assertion");
+        }
+        assert_eq!(writes.len(), 3);
+        for (n, (account, collection, document, class)) in writes.into_iter().enumerate() {
+            assert_eq!(account, Some(7), "write {n}");
+            assert_eq!(collection, Some(Collection::CalendarEvent), "write {n}");
+            assert_eq!(
+                document,
+                Some(PendingId::Assigned(3 + n as u32)),
+                "write {n}"
+            );
+            assert!(
+                matches!(class, ValueClass::Property(p) if p as usize == n + 1),
+                "write {n}"
+            );
+        }
+    }
+
+    /// A batch without the assertion is left as upstream builds it.
+    #[test]
+    fn no_assertion_unless_asked() {
+        let mut batch = BatchBuilder::new();
+        batch
+            .with_account_id(7)
+            .with_collection(Collection::CalendarEvent)
+            .with_document(3)
+            .set(ValueClass::Property(1), vec![1u8]);
+        batch.add_commit_point();
+        assert!(
+            !batch
+                .ops()
+                .iter()
+                .any(|op| matches!(op, Operation::AssertValue { .. }))
+        );
+    }
+}

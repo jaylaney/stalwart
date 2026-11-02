@@ -118,6 +118,9 @@ impl CalendarMkColRequestHandler for Server {
         let personal_id = access_token.personal_id(account_id, Collection::Calendar);
         calendar.preferences_mut(personal_id).flags |= CALENDAR_SUBSCRIBED;
         let mut batch = BatchBuilder::new();
+        if za_keys.is_none() {
+            crate::common::za::za_ordinary_fence(self, &mut batch, account_id, None);
+        }
         let document_id = batch.reserve_document_id(account_id, Collection::Calendar);
         let mut return_prop_stat = None;
         let mut is_mkcalendar = false;

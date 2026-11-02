@@ -542,6 +542,9 @@ pub struct BatchBuilder {
     task_types: TaskTypes,
     priority: CommitPriority,
     ops: Vec<Operation>,
+    /// Zero-access fork (upgrade ruling 173): the keys asserted absent at
+    /// the head of every commit chunk (`za_assert_absent_per_chunk`).
+    za_chunk_asserts: Vec<(u32, Collection, u32, ValueClass)>,
 }
 
 #[derive(Debug, Default)]

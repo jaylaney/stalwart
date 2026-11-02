@@ -23,7 +23,7 @@ use std::{borrow::Cow, collections::HashMap, future::Future, sync::Arc};
 use store::{
     ValueKey,
     write::{
-        Archive, ArchiveBytes,
+        Archive, ArchiveBytes, BatchBuilder,
         metadata::{MetadataBuf, StoredMetadata},
         serialize::rkyv_deserialize,
     },
@@ -555,6 +555,27 @@ pub(crate) async fn za_dead_fence(
     } else {
         server.za_metadata_fence(account_id, None)
     })
+}
+
+/// Upgrade ruling 173 (plan 13's R26 residual closed): the provisioning
+/// fence of an ordinary calendar writer's batch. A DAV PUT, COPY, MOVE,
+/// DELETE or MKCOL of a `Calendar` or `CalendarEvent` that read `to` (and
+/// `from`, the source a move writes) as ordinary accounts commits no chunk
+/// once either holds a vault record (`za_provisioning_fence_per_chunk`), as
+/// ruling 70 fences the same objects' dead-property containers and mail's
+/// ordinary writers fence theirs. Added once, right after the batch is
+/// created, on the upstream path only (a key account's write is sealed and
+/// would fail its own assertion).
+pub(crate) fn za_ordinary_fence(
+    server: &Server,
+    batch: &mut BatchBuilder,
+    to: u32,
+    from: Option<u32>,
+) {
+    server.za_provisioning_fence_per_chunk(batch, to);
+    if let Some(from) = from.filter(|from| *from != to) {
+        server.za_provisioning_fence_per_chunk(batch, from);
+    }
 }
 
 /// The scope of a key account's dead-property container (upgrade rulings 16
