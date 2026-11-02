@@ -9979,7 +9979,11 @@ enrolment (new keys, so contacts pin afresh). Keep the pre-cutover store snapsho
     delegates are invited by the drain. Whether to mitigate for ordinary accounts is open.
 - A4 (ruling 179): every vault write (a password change, an app password, a TOTP enrolment)
   revokes the key account's OAuth grants, because the credential version is the vault
-  revision. A UX question; it is the 0.16 design.
+  revision. It is the 0.16 design. Decided by Jay on 2026-11-02: kept. Password and
+  app-password clients re-verify and are unaffected; only OAuth and Bearer sessions are
+  signed out. The alternative, a separate token generation bumped only by a password
+  change, a recovery and a TOTP enrolment, is worth revisiting if Circulo's clients come to
+  hold OAuth tokens for key accounts.
 - N26 (ruling 118): a key account's JMAP session still advertises the CalendarEvent and
   ContactCard blob types and the new file-node sort options, which the server then refuses
   (plan 13's open question about advertised sort options is of the same class).
