@@ -1,5 +1,9 @@
 # Stalwart 1.0.1 upgrade execution outcome
 
+Status, 2026-11-02: Tasks 1 to 9 are done. "### Final record" under "## Task 9" indexes the
+qualification record, and "### Handover" lists the pending gates and the decisions for the
+pull request. The status line below is Task 1's.
+
 Status: Task 1, 2026-10-30. The hook inventory and merge prediction (part B) come from a dry
 merge; the interface sheet (part C) was checked against the v1.0.1 source; the reduced
 baseline (part A) is `tests/qualification/baseline-0.16.27.json`. The primary's decisions
@@ -1659,8 +1663,8 @@ Flags:
 | `common/src/manager/defaults.rs:63` | `cfg(not(feature = "test_mode"))` | `common/src/manager/defaults.rs:57` `cfg(not(stalwart_tests))` | bootstrap skips default objects (application, system settings, ASN, tracing and metrics stores, default data) | every suite: the harness boots from its own registry objects | restore under `test_mode` |
 | `common/src/manager/defaults.rs:85` | `cfg(not(any(feature = "dev_mode", feature = "test_mode")))` | `common/src/manager/defaults.rs:79` `cfg(not(any(feature = "dev_mode", stalwart_tests)))` | (same) | (same) | (same) |
 | `common/src/manager/defaults.rs:497` | `cfg(not(any(feature = "dev_mode", feature = "test_mode")))` | `common/src/manager/defaults.rs:477` `cfg(not(any(feature = "dev_mode", stalwart_tests)))` | (same) | (same) | (same) |
-| `common/src/manager/defaults.rs:514` | `cfg(not(feature = "test_mode"))` | `common/src/manager/defaults.rs:498` `cfg(not(stalwart_tests))` | (same) | (same) | (same) |
-| `common/src/manager/defaults.rs:521` | `cfg(not(feature = "test_mode"))` | `common/src/manager/defaults.rs:506` `cfg(not(stalwart_tests))` | (same) | (same) | (same) |
+| `common/src/manager/defaults.rs:514` | `cfg(not(feature = "test_mode"))` | `common/src/manager/defaults.rs:498` `cfg(not(stalwart_tests))` | (same) | (same) | proposed: restore under `test_mode`. Not applied: the site is inside an SEL snippet, left as supplied (Task 2's "Not restored"; final review D8). Enterprise-built test servers insert the default `TracingStore` |
+| `common/src/manager/defaults.rs:521` | `cfg(not(feature = "test_mode"))` | `common/src/manager/defaults.rs:506` `cfg(not(stalwart_tests))` | (same) | (same) | proposed: restore under `test_mode`. Not applied: the site is inside an SEL snippet, left as supplied (Task 2's "Not restored"; final review D8). Enterprise-built test servers insert the default `MetricsStore` |
 | `common/src/manager/defaults.rs:544` | `cfg(not(feature = "test_mode"))` | `common/src/manager/defaults.rs:530` `cfg(not(stalwart_tests))` | (same) | (same) | (same) |
 | `common/src/network/acme/http.rs:29` | `cfg(any(feature = "dev_mode", feature = "test_mode"))` | `common/src/network/acme/http.rs:28` `cfg(any(feature = "dev_mode", stalwart_tests))` | ACME client accepts invalid certificates on localhost | automation::acme (Docker; CI only) | restore under `test_mode` |
 | `common/src/network/dns/records.rs:420` | `cfg(feature = "test_mode")` | removed: `provider_domain` (`records.rs:453`) has no test branch | provider domain fixed to `pebble.letsencrypt.org` | automation::acme, automation::dns (Docker) | restore under `test_mode` (v1.0.1 removed the override) |
@@ -9780,6 +9784,201 @@ selector from part Z3). The control passed.
   directory step does not prove ruling 184's fix: the hang appeared in 2 of 11 runs. The N10
   change is product code, so the gates job's coverage margins are this run's; part 9b records
   the remaining jobs and the margins.
+
+### Part 9b
+
+The documentation items of Task 9: `CLAUDE.md` rewritten for the 1.0.1 base, the README and
+the developer guide, the changelog entry and the release policy for `0.2.0-beta.1`, the
+manual checklist marked pending for this candidate, NR1's wording (ruling 160) with ruling
+139's limits in key-pinning spec 5.1, final review D8's record on the test-hook table, this
+note's final record and the handover. No code changed. Run on 2026-11-02.
+
+### Final record
+
+The upgrade's qualification record, item by item. Each item points to the section that holds
+it; the figures here are a summary.
+
+**Record SHAs.** The test matrix, the coverage net and both gates ran at `f135a9881`
+("### Task 7 results", "#### The final record (at `f135a9881`)"). Part 9a then changed
+product code once (`2867bc24f`, ruling 191's N10, with its case) and test and CI code
+(ruling 184's fixes, N14). `2867bc24f` is the code SHA of the final CI run and of the
+product build below; the docs commits after it change no code.
+
+**Hook dispositions.**
+- Every fork hook in an upstream file: "### Hook inventory" (485 hooks in 154 files under
+  `crates/`, plus 3 in the root `Cargo.toml`; categories a, b, c, d), with "### Moved hook
+  targets" and "### Deleted paths and their disposition" for the moved and deleted targets.
+  Each owner's part section records the port of its hooks at the v1.0.1 site.
+- Every conflicted path: "## Conflict ledger", 112 rows, every one resolved.
+- Upstream test hooks: the table in "#### Upstream test hooks (for Task 2)" (144 sites: 121
+  restore, 11 not needed, 10 subject deleted, 2 in an SEL-only file) and the outcome in
+  "### Upstream test hooks" (Task 2). Final review D8: the two `defaults.rs:498` and `:506`
+  rows were proposed for restoring but sit inside an SEL snippet, so they were left as
+  supplied (not ported); the table's rows now say so, matching the
+  `tasks/maintenance.rs:145` record in the conflict ledger. Enterprise-built test servers
+  therefore insert the default `TracingStore` and `MetricsStore`.
+- The fork's own test hooks at 1.0: `CLAUDE.md`'s list, which matches
+  `crates/common/src/za/test_hooks.rs` and `crates/store/src/za_test.rs`
+  (`INDEX_GUARD_FAIL_ONCE` retired, `PROPFIND_ADMITTED_PAUSE` and `FORCE_COMMIT_SPLIT` new).
+
+**Test dispositions.** `tests/qualification/dispositions.json`, built in part 7b ("#### The
+dispositions file") and confirmed in part 7d1 ("#### Dispositions confirmed or added") and
+part 8c (ruling 124's two selection moves confirmed). The inventory gate's excused counts at
+the record: 20 `internals_replaced_equivalent`, 2 `internals_replaced_no_equivalent`, 202
+`sel_only`, 22 `subject_deleted`. Inline test modules: "### Inline test modules the merge
+removes" and "### Restored unit test modules" (132 modules dispositioned: 110 restored in
+fork-owned files, 7 fork modules kept inline, 22 SEL-only `scim` and `scim-proto` ones not
+restored).
+
+**The expectation ledger.** "## Expectation ledger": 282 rows, one per changed assertion,
+early return, `cfg` skip or new `#[ignore]` in a ported test, each with the 1.0 change behind
+it. Part 7d1's ported-file diff found no addition without a row.
+
+**Coverage against the baseline.** At `f135a9881`, locally and in CI run
+[41413846293](https://github.com/jaylaney/stalwart/actions/runs/41413846293) alike: inventory
+gate OK (795 tests, 29 configurations); coverage gate OK, full 21,596 / 22,331 (96.71%)
+against the baseline's 17,821 / 18,490, 72 lines of margin, and runtime-only 12,534 / 13,193
+(95.00%) against 10,646 / 11,246, 44 lines of margin ("#### The final record (at
+`f135a9881`)"). The gate has no per-file floor (ruling 179, D6). At `2867bc24f`, CI run
+41432100574's gates job: inventory gate OK (795 tests, 29 configurations, the same excused counts, 2,356 executed functions from 28 listings and 28 ignored-only ones); coverage gate OK, full 21,599 / 22,335 (96.70%), 72 lines over the 21,527 needed (`21599 * 18490 = 399365510 >= 17821 * 22335 = 398032035`), and runtime-only 12,537 / 13,197 (95.00%), 44 lines over the 12,493 needed (`12537 * 11246 = 140991102 >= 10646 * 13197 = 140495262`). N10 added 4 lines to the cohort in each count, 3 of them covered, so both margins are unchanged.
+
+**The private-test slot count.** "### Private-test slots in v1.0.1": v1.0.1 has 562
+`stalwart-tests` slots (535 test-only, 27 support), none of which compiles in any build of
+this fork, since none sets `stalwart_tests`. Upstream's private suites are not public, so no
+result here covers them.
+
+**The python-caldav result.** Part 8b ("#### The independent CalDAV runner") and part 8c
+("#### Runner and test fixes"): python-caldav at `111ae14b875f40d100d5259820f10210f00e20f9`;
+key mode a required pass (74 passed, 1 skipped, 2 xfailed of 77); plain mode passes with two
+recorded exceptions, the strict xfail of ruling 166 and the non-strict xfail of ruling 167
+(67 or 68 passed, 1 skipped, 3 or 4 xfailed of 72). Every CI run from part 8c's run 2 on
+passed this job. At `2867bc24f`: CI run 41432100574's Independent CalDAV Client job passed: harness 34 tests; plain 68 passed, 1 skipped, 3 xfailed (`testSearchEvent` passed, its record being non-strict); key 74 passed, 1 skipped, 2 xfailed.
+
+**The exact commands and counts, failures and retries.**
+- At `f135a9881`: "### Task 7 results", "#### The final record (at `f135a9881`)": every
+  compile check and matrix row with its command, counts and log name; SMTP's
+  `dkim2_dsn_is_signed` and `queue_retry` failed in the full filter and passed rerun by name;
+  `automation` needs Docker and ran in CI only. Earlier records follow it there.
+- Part 8c ("#### `test.yml` at 1.0", "#### The runs", "#### Held"): CI's jobs and commands,
+  three runs, the workflow fixes and the three CI-only holds.
+- Part Z2 ("#### The three CI holds, under ruling 44", "#### The final net, the gates and the
+  CI runs"): the holds settled, eight CI runs, the directory hang twice in eleven runs.
+- Part Z3 ("#### Runs"): CI run 41413846293 at `f135a9881`, every job green.
+- Part 9a ("#### Runs"): the metadata and verifier suites (9 and 21 tests), the groupware
+  units (179), the ZA suite (green on its second run, after `fo-zero.ics` joined its cleanup
+  list), `ci_steps.py` (0 differences), `test_gates.py` (43 tests, 2 skipped), mutation z027
+  caught.
+- CI run [41432100574](https://github.com/jaylaney/stalwart/actions/runs/41432100574) at
+  `2867bc24f`, job by job, below.
+
+**The OSS product result.**
+- Part 8a ("#### The build", "#### Smoke results"): the shipping configuration
+  (`cargo build --release --locked -p stalwart --no-default-features --features rocks`) on
+  macOS arm64; no `enterprise`, `test_mode`, `za_test`, `test_provider` or `mail-auth/test`
+  feature in the graph; the store stamped `0x80000007` (schema base 7, OSS flag); the local
+  smoke and leak scan on a fresh `.run-1.0/` store.
+- Part 8b ("#### Create, restart and readback"): the fresh-store gate, nine readback checks
+  after a restart, green; CI's Fresh OSS Store Restart job runs it on Linux in every run.
+- Part 9a ("#### The product"): the same command at `2867bc24f` (1,385 s, no warnings),
+  SHA-256 `9dfef8262a8969d61d25a8574c5e850daec7f9272729e18186ad27744a77ba18`, `--version`
+  `Stalwart Server fork v0.2.0-beta.1 (upstream v1.0.1
+  23b69755cb3cd8ecd952fe0443c5ac067a506184; source
+  2867bc24f8bc78da3665ace7065800f2319ac263; clean)`; `verify_product.py` passes on it and
+  refuses a wrong fork tag. This is a local macOS build, not the Linux shipping artifact.
+
+**The independent review.** "## Final review": four Fable lenses (A: authentication, the
+vault, sessions and traces; B: calendar; C: mail and search; D: the merge, the test hooks,
+the gates and CI) at `a57c0fb35`, product code at `6fd9a131f`: no Critical, 3 Important, 25
+Minor, 3 ruling revisits, adjudicated in rulings 171-180. Fix parts Z1 and Z2, then a scoped
+Fable re-review (16 addressed, 2 partly, 8 new Minor; rulings 185-189), fix part Z3, and a
+second scoped re-review (7 addressed, 1 accepted as recorded, 6 new Minor). Ruling 191 closed
+the review: no Critical or Important finding remains; N10 and N14 were fixed in part 9a, N9,
+N13 and N16 accepted, N12 recorded as a limit. **Deviation (ruling 192):** the lenses were
+given the execution ledger and its rulings, where the plan specifies a reviewer with clean
+context and no prior finding conclusions. A clean-context review is offered at the PR stage.
+
+**Pending gates.**
+- The Linux product qualification: an exact-source build through `product-build.yml`,
+  recording the clean source SHA, checksum, attestation, CPU baseline and measured GLIBC
+  requirement of the real artifact. Its dispatch needs Jay's authorization; its
+  `fetch-depth: 0` change (part 9a) is checked only by unit tests until then.
+- The native Calendar and Mail client checklist (`docs/zero-access/manual-checklist.md`,
+  marked pending for this candidate with the exact build).
+- The clean-context review above.
+
+**Excluded stores and platforms.** RocksDB only: no SQL (PostgreSQL, MySQL, SQLite as a data
+store), FoundationDB or cluster claim follows from these runs, and the provisioning checks'
+recorded limits on other search stores stand. Platforms run: macOS arm64 locally and GitHub's
+`ubuntu-latest` x86_64 in CI; the shipping artifact is unqualified until the product build
+above. The external protocol suites (Dovecot imaptest, Fastmail's JMAP test suite, Apple's
+CalDAVTester) are deferred by the design's scope exclusions, and upstream's private suites
+are not run. Directory's Bearer arm of the external-directory refusal (a Keycloak case) is
+not covered, and DNS-PERSIST-01 issuance is untested against Pebble 2.10.1.
+
+**CI 41432100574's final results** (a dispatch of `test.yml` at `2867bc24f`):
+
+Every job succeeded, the run's conclusion is `success`.
+
+| Job | Result | Detail |
+|---|---|---|
+| Check Style | success | `cargo fmt --all --check`; the Check Gates step: `ci_steps.py` 0 differences, `test_gates.py` 43 tests OK, 2 skipped (N14's check included) |
+| Unit Tests | success | 593 passed, 2 ignored over the three steps (workspace 571 and 2 ignored, SMTP without enterprise 16, HTTP 6) |
+| Test | success | Directory passed whole, no hang (one run does not prove ruling 184's fix); SMTP 75 passed, 1 failed, 3 ignored in the full filter, `dkim2_dsn_is_signed` (a documented flake) passed rerun by name; IMAP passed; JMAP passed without its rerun |
+| Upstream Suites | success | `cal_query` 2 passed, 1 ignored; store, blob, lookup, search, telemetry, system and automation passed |
+| Zero-access Test | success | vault and groupware units (179 and 46), the leak unit test, ZA and ZA with filesystem blobs on their first attempt (451 s and 445 s), cache swap, CalDAV plain on its rerun (the first attempt failed in upstream's `cal_itip`, `tests/src/webdav/cal_itip.rs:243`, the documented DTSTAMP flake) and key on its first, IMAP and JMAP key |
+| Independent CalDAV Client | success | harness 34 tests; plain 68 passed, 1 skipped, 3 xfailed; key 74 passed, 1 skipped, 2 xfailed |
+| Fresh OSS Store Restart | success | 9 failure tests, the product build, then 9 readback checks after the restart |
+| C10 Gates | success | 1 h 32 min. The net passed every step; `smtp`'s first attempt failed in `smtp::reporting::analyze::report_analyze` (instrumented; not on the documented flaky list) and passed rerun by name. Inventory and coverage gates OK with the figures under "Coverage against the baseline"; the sanitized `gates-receipt` artifact was uploaded |
+
+### Handover
+
+Notes for Jay. None of these needs a code change on this branch.
+
+**The Circulo account repository** (`~/Development/circulo-account`, its `docs/api.md`). Not
+edited here.
+- Setup can now answer 409 "account already holds object metadata" (ruling 66), after "account
+  has unfinished tasks" and before "account already holds spam training samples". The page
+  should show it like the other 409s.
+- Field policy 2 makes an event's `CLASS` visible to the operator when it is PUBLIC, PRIVATE
+  or CONFIDENTIAL. Any privacy claim on the page that says every event property except times
+  and recurrence is sealed needs that exception.
+
+**The deploy repository.** The `mail.circolo.me` cutover is a rebuild on a fresh store: 1.0.1
+cannot open the 0.16 store. Every account is created again, with new setup tokens and new
+enrolment (new keys, so contacts pin afresh). Keep the pre-cutover store snapshot and the
+0.16-based binary for rollback; a rollback loses whatever was written after the cutover.
+
+**Decisions for the PR stage.**
+- Two behaviours inherited from upstream 1.0.1, both recorded without a fork change:
+  - the CANCEL's SCHEDULE-STATUS (ruling 109): upstream's cancel builder copies each
+    ATTENDEE line with its SCHEDULE-STATUS (and SCHEDULE-AGENT, SCHEDULE-FORCE-SEND), which
+    its REQUEST builders strip, so a key-pinning refusal's status (`3.8`) is visible to the
+    event's other attendees in a CANCEL. It is a status code, with no key material, and 0.16
+    did the same. Related (ruling 113): the CANCEL to a removed attendee carries a summary of
+    the organizer's new event;
+  - an ordinary account's delegate is not invited when the delegator forwards the REQUEST,
+    because 1.0 accepts a REQUEST only from the organizer (ruling 166). Key accounts'
+    delegates are invited by the drain. Whether to mitigate for ordinary accounts is open.
+- A4 (ruling 179): every vault write (a password change, an app password, a TOTP enrolment)
+  revokes the key account's OAuth grants, because the credential version is the vault
+  revision. A UX question; it is the 0.16 design.
+- N26 (ruling 118): a key account's JMAP session still advertises the CalendarEvent and
+  ContactCard blob types and the new file-node sort options, which the server then refuses
+  (plan 13's open question about advertised sort options is of the same class).
+- Ruling 139's stale-master limit: an attendee removed from an event's master while an
+  override still names it keeps a stale master once the full state replaces a withheld
+  CANCEL.
+- N12 (ruling 191): a pending invitation the drain keeps failing is hidden from listings, so
+  the owner's honoured DELETE needs its href; the durable remedy (a cross-session failure
+  count) is future work.
+- Ruling 102: a key account reaches its quota sooner, by about 485 bytes per sealed event
+  and 491 per calendar.
+
+**Pending gates and authorizations.**
+- Dispatching `product-build.yml` for the exact-source Linux build.
+- Running the native client checklist against that build.
+- The optional clean-context Fable review of the whole branch.
+- Opening the pull request.
 
 ## Conflict ledger
 
