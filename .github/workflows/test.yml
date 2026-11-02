@@ -98,15 +98,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Pack Git refs
-        # common's build script (crates/common/build_support/release.rs)
-        # watches .git/packed-refs for the build identity. actions/checkout
-        # leaves none, and cargo reruns a build script whose watched path is
-        # missing, so every cargo command recompiled common and everything
-        # above it (about two minutes a command). Packing the refs creates
-        # the file; the source state stays clean.
-        run: git pack-refs --all
-
       # External services (OpenLDAP, Keycloak, PostgreSQL, MySQL, Redis, NATS,
       # MinIO, OpenSearch, Meilisearch) are provisioned on demand by the test
       # suite via testcontainers using the Docker daemon available on the
@@ -205,15 +196,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Pack Git refs
-        # common's build script (crates/common/build_support/release.rs)
-        # watches .git/packed-refs for the build identity. actions/checkout
-        # leaves none, and cargo reruns a build script whose watched path is
-        # missing, so every cargo command recompiled common and everything
-        # above it (about two minutes a command). Packing the refs creates
-        # the file; the source state stays clean.
-        run: git pack-refs --all
-
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
@@ -262,15 +244,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-
-      - name: Pack Git refs
-        # common's build script (crates/common/build_support/release.rs)
-        # watches .git/packed-refs for the build identity. actions/checkout
-        # leaves none, and cargo reruns a build script whose watched path is
-        # missing, so every cargo command recompiled common and everything
-        # above it (about two minutes a command). Packing the refs creates
-        # the file; the source state stays clean.
-        run: git pack-refs --all
 
       # External services (the ACME and PowerDNS test servers) are provisioned
       # on demand by the test suite via testcontainers using the Docker daemon
@@ -331,15 +304,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-
-      - name: Pack Git refs
-        # common's build script (crates/common/build_support/release.rs)
-        # watches .git/packed-refs for the build identity. actions/checkout
-        # leaves none, and cargo reruns a build script whose watched path is
-        # missing, so every cargo command recompiled common and everything
-        # above it (about two minutes a command). Packing the refs creates
-        # the file; the source state stays clean.
-        run: git pack-refs --all
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
@@ -464,15 +428,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Pack Git refs
-        # common's build script (crates/common/build_support/release.rs)
-        # watches .git/packed-refs for the build identity. actions/checkout
-        # leaves none, and cargo reruns a build script whose watched path is
-        # missing, so every cargo command recompiled common and everything
-        # above it (about two minutes a command). Packing the refs creates
-        # the file; the source state stays clean.
-        run: git pack-refs --all
-
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
@@ -532,15 +487,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Pack Git refs
-        # common's build script (crates/common/build_support/release.rs)
-        # watches .git/packed-refs for the build identity. actions/checkout
-        # leaves none, and cargo reruns a build script whose watched path is
-        # missing, so every cargo command recompiled common and everything
-        # above it (about two minutes a command). Packing the refs creates
-        # the file; the source state stays clean.
-        run: git pack-refs --all
-
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
@@ -599,15 +545,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-
-      - name: Pack Git refs
-        # common's build script (crates/common/build_support/release.rs)
-        # watches .git/packed-refs for the build identity. actions/checkout
-        # leaves none, and cargo reruns a build script whose watched path is
-        # missing, so every cargo command recompiled common and everything
-        # above it (about two minutes a command). Packing the refs creates
-        # the file; the source state stays clean.
-        run: git pack-refs --all
 
       - name: Make room on /mnt
         run: |

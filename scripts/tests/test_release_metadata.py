@@ -12,7 +12,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 UPSTREAM = "18f4e9505027d790fd7e9fdad7f922be6719101d"
-VERSION = "0.1.1-beta.1"
+VERSION = "0.2.0-beta.1"
 
 
 class ReleaseMetadata(unittest.TestCase):
@@ -193,6 +193,22 @@ class ReleaseMetadata(unittest.TestCase):
         self.git("commit", "-qm", "linked revision")
         third = self.git("rev-parse", "HEAD")
         self.assertIn(f"source {third}; clean)", cargo_identity())
+
+    def test_missing_git_metadata_is_not_watched(self):
+        # A fresh clone has no packed-refs; watching it would rerun the build script on
+        # every cargo command. Once Git creates it, it is watched.
+        self.init_git()
+        packed = Path(self.git("rev-parse", "--path-format=absolute",
+                               "--git-path", "packed-refs"))
+        self.assertFalse(packed.exists(), "precondition: no packed-refs")
+        watched = [line.removeprefix("cargo:rerun-if-changed=")
+                   for line in self.run_build().stdout.splitlines()
+                   if line.startswith("cargo:rerun-if-changed=")]
+        self.assertNotIn(str(packed), watched)
+        for path in watched:
+            self.assertTrue(Path(path).exists(), f"watched path missing: {path}")
+        self.git("pack-refs", "--all")
+        self.assertIn(f"cargo:rerun-if-changed={packed}", self.run_build().stdout)
 
     def test_linked_worktree_and_packed_refs_are_watched(self):
         self.init_git()
