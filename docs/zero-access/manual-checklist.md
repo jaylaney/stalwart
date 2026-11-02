@@ -1,14 +1,14 @@
 # Zero-access calendar: manual client checklist
 
-**Status for the `0.2.0-beta.1` candidate (upstream `v1.0.1`): pending.** No native client
-has been run against this candidate. The build to test is the shipping configuration
-(`cargo build --release --locked -p stalwart --no-default-features --features rocks`) at
-source commit `2867bc24f8bc78da3665ace7065800f2319ac263` or a later candidate commit, whose
-`--version` reads `Stalwart Server fork v0.2.0-beta.1 (upstream v1.0.1
+**Status for the `0.2.0-beta.1` prerelease (upstream `v1.0.1`): pending.** No native client
+has been run against this release. The build to test is the published `fork-v0.2.0-beta.1`
+shipping artifact (the GitHub prerelease `release-0.2.0-beta-1`), built in the shipping
+configuration (`cargo build --release --locked -p stalwart --no-default-features --features
+rocks`), whose `--version` reads `Stalwart Server fork v0.2.0-beta.1 (upstream v1.0.1
 23b69755cb3cd8ecd952fe0443c5ac067a506184; source <commit>; clean)`; record the exact line and
 the binary's checksum with the results. Run it on a fresh store (1.0 cannot open a 0.16 one),
 with accounts set up afresh. Results recorded against the 0.16-based releases (`0.1.x`) are
-not evidence for this candidate.
+not evidence for this release.
 
 Run once per release against a server built from this branch, with TOTP
 enrolled on one of the two accounts used.
