@@ -1617,6 +1617,7 @@ pub async fn plant_inbox_item(
                 &public,
                 pairs.as_ref(),
                 reply_token.as_ref(),
+                None,
             )
             .unwrap();
             fork_item = Some(true);

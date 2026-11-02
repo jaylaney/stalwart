@@ -13,14 +13,19 @@
 //!   associated data naming the recipient and the UID. The root may carry
 //!   the recipient's token pair in a sealed `X-ZA-EXTRA` bound to the same
 //!   recipient and UID (a REQUEST or CANCEL), or the replier's token as the
-//!   visible `X-ZA-RSVP-TOKEN` (a REPLY). Written by the fan-out (plan 9),
-//!   opened only by the drain (plan 10, invariant 11).
+//!   visible `X-ZA-RSVP-TOKEN` (a REPLY), both written by the fan-out (plan
+//!   9); or, on a mail-borne item, the sender's address in a sealed
+//!   `X-ZA-SENDER` bound to the same recipient and UID, written at mail
+//!   delivery (imip spec 4.1 step 6, 4.2). Opened only by the drain (plan
+//!   10, invariant 11).
 //! - drained: resealed under the owner's event wrapping key (`mk`), with
-//!   neither carrier. Written by the drain, read by the inbox views.
+//!   none of the three carriers. Written by the drain, read by the inbox
+//!   views.
 //!
 //! Carrier order on the root, as its last entries: `X-ZA-SEALED` (if any),
-//! then `X-ZA-RSVP-TOKEN` or `X-ZA-EXTRA` (pending only, at most one), then
-//! `X-ZA-KEY`. Any of them anywhere else is a stray carrier.
+//! then `X-ZA-RSVP-TOKEN`, `X-ZA-EXTRA` or `X-ZA-SENDER` (pending only, at
+//! most one), then `X-ZA-KEY`. Any of them anywhere else, or beside another
+//! of the three, is a stray carrier.
 
 use super::{
     event::{open_extra, seal_extra},
@@ -28,8 +33,8 @@ use super::{
     token::{TOKEN_LEN, TokenPairs},
     tree::{
         EXTRA_PROP, KEY_PROP, SealError, WRAP_PK, entry_text, has_stray_carriers, is_carrier,
-        open_key_envelope, open_pk_envelope, seal_key_envelope, seal_pk_envelope, seal_tree,
-        text_entry, unseal_tree,
+        open_bytes, open_key_envelope, open_pk_envelope, seal_bytes, seal_key_envelope,
+        seal_pk_envelope, seal_tree, text_entry, unseal_tree,
     },
 };
 use crate::calendar::{
@@ -60,13 +65,21 @@ pub const RSVP_TOKEN_PROP: &str = "X-ZA-RSVP-TOKEN";
 pub const AAD_ITIP_KEY: &str = "itip-key";
 /// Purpose of a pending item's `X-ZA-EXTRA` bundle.
 const AAD_ITIP_EXTRA: &str = "itip-extra";
+/// A mail-borne pending item's sender: its address, sealed with the item's
+/// DEK (imip spec 4.2, D4). Only mail delivery writes it.
+pub const SENDER_PROP: &str = "X-ZA-SENDER";
+/// Purpose of a pending item's `X-ZA-SENDER` bundle (imip spec 4.2).
+const AAD_ITIP_SENDER: &str = "itip-sender";
 
-/// What a pending item carries besides its tree. No `Debug`: tokens.
+/// What a pending item carries besides its tree. No `Debug`: tokens and an
+/// address.
 pub struct PendingCarriers {
     /// The recipient's own pair (a REQUEST or CANCEL).
     pub pair: Option<TokenPairs>,
     /// The replier's token (a REPLY).
     pub reply_token: Option<Zeroizing<[u8; TOKEN_LEN]>>,
+    /// A mail-borne item's sender address (imip spec 4.2).
+    pub sender: Option<String>,
 }
 
 fn uid_of(ical: &ICalendar) -> String {
@@ -94,6 +107,15 @@ fn pending_key_aad(account_id: u32, uid: &str) -> Vec<u8> {
 /// bundle, bound like an event's (spec 9).
 fn extra_aad(account_id: u32, uid: &str) -> Vec<u8> {
     let mut out = aad(AAD_ITIP_EXTRA, account_id);
+    out.push(b'|');
+    out.extend_from_slice(uid.as_bytes());
+    out
+}
+
+/// `za/v1|itip-sender|<recipient>|<uid>`: a mail-borne pending item's
+/// `X-ZA-SENDER` bundle, bound like `X-ZA-EXTRA` (imip spec 4.2).
+fn sender_aad(recipient_id: u32, uid: &str) -> Vec<u8> {
+    let mut out = aad(AAD_ITIP_SENDER, recipient_id);
     out.push(b'|');
     out.extend_from_slice(uid.as_bytes());
     out
@@ -218,18 +240,23 @@ fn pop_envelope(ical: &mut ICalendar) -> Result<Vec<u8>, SealError> {
 
 /// Seals a plaintext item tree for `recipient_id` in its pending form (spec
 /// 5.3 steps 1-3). `pair` is the recipient's own pair (a REQUEST or
-/// CANCEL), `reply_token` the replier's token (a REPLY); never both. A
-/// refused public key leaves the tree unchanged.
+/// CANCEL), `reply_token` the replier's token (a REPLY), `sender` a
+/// mail-borne item's sender address (imip spec 4.2); at most one of the
+/// three. A refused carrier or public key leaves the tree unchanged.
 pub fn seal_pending_item(
     ical: &mut ICalendar,
     recipient_id: u32,
     recipient_public: &[u8; PUBLIC_KEY_LEN],
     pair: Option<&TokenPairs>,
     reply_token: Option<&[u8; TOKEN_LEN]>,
+    sender: Option<&str>,
 ) -> Result<(), SealError> {
     check_root(ical)?;
     if pair.is_some() && reply_token.is_some() {
         return Err(SealError::Structure("a pair and a reply token"));
+    }
+    if sender.is_some() && (pair.is_some() || reply_token.is_some()) {
+        return Err(SealError::Structure("a sender and another carrier"));
     }
     if pair.is_some_and(|pair| pair.len() != 1) {
         return Err(SealError::Structure("an item carries one pair"));
@@ -247,13 +274,20 @@ pub fn seal_pending_item(
     if let Some(token) = reply_token {
         root.push(text_entry(RSVP_TOKEN_PROP, URL_SAFE_NO_PAD.encode(token)));
     }
+    if let Some(sender) = sender {
+        root.push(text_entry(
+            SENDER_PROP,
+            seal_bytes(&dek, &sender_aad(recipient_id, &uid), sender.as_bytes()),
+        ));
+    }
     root.push(text_entry(KEY_PROP, STANDARD.encode(envelope)));
     Ok(())
 }
 
 /// Opens a pending item in place with the recipient's private key (the
-/// drain, spec 6.4 step 1) and returns what it carries. On `Err` the tree
-/// must be discarded.
+/// drain, spec 6.4 step 1) and returns what it carries: a pair, a reply
+/// token or a sender (imip spec 4.2), at most one. On `Err` the tree must
+/// be discarded.
 pub fn open_pending_item(
     ical: &mut ICalendar,
     recipient_id: u32,
@@ -265,10 +299,17 @@ pub fn open_pending_item(
     let uid = uid_of(ical);
     let envelope = pop_envelope(ical)?;
     let dek = open_pk_envelope(&envelope, private_key, &pending_key_aad(recipient_id, &uid))?;
+    // At most one carrier, popped from just ahead of the key envelope; a
+    // second one, or one anywhere else, stays for the stray check.
     let root = &mut ical.components[0].entries;
     let extra = root.pop_if(|e| is_carrier(e, EXTRA_PROP));
     let reply = if extra.is_none() {
         root.pop_if(|e| is_carrier(e, RSVP_TOKEN_PROP))
+    } else {
+        None
+    };
+    let sender = if extra.is_none() && reply.is_none() {
+        root.pop_if(|e| is_carrier(e, SENDER_PROP))
     } else {
         None
     };
@@ -304,12 +345,32 @@ pub fn open_pending_item(
         }
         None => None,
     };
+    let sender = match sender {
+        Some(carrier) => {
+            let plain = open_bytes(
+                &dek,
+                &sender_aad(recipient_id, &uid),
+                entry_text(&carrier).ok_or(SealError::Format)?,
+            )?;
+            Some(
+                std::str::from_utf8(&plain)
+                    .map_err(|_| SealError::Format)?
+                    .to_string(),
+            )
+        }
+        None => None,
+    };
     unseal_tree(ical, &dek, recipient_id, ITIP_SCOPE)?;
-    Ok(PendingCarriers { pair, reply_token })
+    Ok(PendingCarriers {
+        pair,
+        reply_token,
+        sender,
+    })
 }
 
 /// Reseals a plaintext item tree under the owner's keys: the drained form
-/// (spec 6.4 step 5), with neither `X-ZA-EXTRA` nor `X-ZA-RSVP-TOKEN`.
+/// (spec 6.4 step 5), with none of `X-ZA-EXTRA`, `X-ZA-RSVP-TOKEN` and
+/// `X-ZA-SENDER`.
 pub fn seal_drained_item(
     ical: &mut ICalendar,
     keys: &SessionKeys,
@@ -391,7 +452,7 @@ mod tests {
         CalendarEventContent, CalendarEventData,
         seal::{
             event::{ZaEvent, seal_event, unseal_event},
-            tree::SEALED_PROP,
+            tree::{FORMAT_V1, PAD, SEALED_PROP},
         },
     };
     use calcard::{
@@ -399,7 +460,7 @@ mod tests {
         common::timezone::Tz,
         icalendar::{ICalendarEntry, ICalendarProperty, ICalendarValue},
     };
-    use vault::keys::{WRAP_LEN, generate_keypair};
+    use vault::keys::{NONCE_LEN, TAG_LEN, WRAP_LEN, derive_public_key, generate_keypair};
 
     const ITEM: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nMETHOD:REQUEST\r\nX-WR-CALNAME:item-root-canary\r\nBEGIN:VEVENT\r\nUID:item-1\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990102T090000Z\r\nDTEND:20990102T100000Z\r\nSEQUENCE:0\r\nSUMMARY:item-summary-canary\r\nORGANIZER;CN=Org:mailto:org@example.com\r\nATTENDEE;CN=Att;PARTSTAT=NEEDS-ACTION:mailto:att@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 
@@ -428,7 +489,7 @@ mod tests {
     fn pending(pair: Option<&TokenPairs>, reply: Option<&[u8; TOKEN_LEN]>) -> (ICalendar, Secret) {
         let (public, private) = generate_keypair();
         let mut ical = tree();
-        seal_pending_item(&mut ical, 9, &public, pair, reply).unwrap();
+        seal_pending_item(&mut ical, 9, &public, pair, reply, None).unwrap();
         (ical, private)
     }
 
@@ -467,7 +528,7 @@ mod tests {
     fn sealed_item_record_reads_no_plaintext_and_is_owner_only() {
         let (public, _) = generate_keypair();
         let mut ical = tree();
-        seal_pending_item(&mut ical, 9, &public, None, None).unwrap();
+        seal_pending_item(&mut ical, 9, &public, None, None, None).unwrap();
         let (row, content) =
             sealed_item_record(ical.clone(), ChangedBy::PrincipalId(3), Some(5), true);
         assert!(row.calendar_ids.is_empty(), "never reaped by upstream");
@@ -548,7 +609,7 @@ mod tests {
         let pair = carriers.pair.expect("pair");
         assert_eq!(pair.len(), 1);
         assert!(pair.matches("att@example.com", &[7; TOKEN_LEN]));
-        assert!(carriers.reply_token.is_none());
+        assert!(carriers.reply_token.is_none() && carriers.sender.is_none());
     }
 
     #[test]
@@ -566,7 +627,7 @@ mod tests {
         let carriers = open_pending_item(&mut opened, 9, &private).unwrap();
         assert_eq!(opened, tree());
         assert_eq!(carriers.reply_token.as_deref(), Some(&token));
-        assert!(carriers.pair.is_none());
+        assert!(carriers.pair.is_none() && carriers.sender.is_none());
         // Neither carrier: the root ends with its bundle, then the key.
         let (bare, private) = pending(None, None);
         let n = bare.components[0].entries.len();
@@ -655,15 +716,22 @@ mod tests {
         two.insert("other@example.com", [8; TOKEN_LEN]);
         let mut ical = tree();
         assert_eq!(
-            seal_pending_item(&mut ical, 9, &public, Some(&two), None),
+            seal_pending_item(&mut ical, 9, &public, Some(&two), None, None),
             Err(SealError::Structure("an item carries one pair"))
         );
         assert_eq!(
-            seal_pending_item(&mut ical, 9, &public, Some(&pair()), Some(&[1; TOKEN_LEN])),
+            seal_pending_item(
+                &mut ical,
+                9,
+                &public,
+                Some(&pair()),
+                Some(&[1; TOKEN_LEN]),
+                None
+            ),
             Err(SealError::Structure("a pair and a reply token"))
         );
         assert_eq!(
-            seal_pending_item(&mut ical, 9, &[0u8; PUBLIC_KEY_LEN], None, None),
+            seal_pending_item(&mut ical, 9, &[0u8; PUBLIC_KEY_LEN], None, None, None),
             Err(SealError::Structure("recipient public key"))
         );
         assert_eq!(ical, tree(), "a refused seal leaves the tree untouched");
@@ -747,7 +815,7 @@ mod tests {
         let mut sealed = tree();
         seal_drained_item(&mut sealed, &keys, 9).unwrap();
         let n = sealed.components[0].entries.len();
-        for carrier in [RSVP_TOKEN_PROP, EXTRA_PROP] {
+        for carrier in [RSVP_TOKEN_PROP, EXTRA_PROP, SENDER_PROP] {
             let mut item = sealed.clone();
             root(&mut item).insert(n - 1, text_entry(carrier, "AA".into()));
             assert_eq!(
@@ -843,7 +911,7 @@ mod tests {
         // Pending (Review Focus 3): an unseal failure, never opened here.
         let (public, _) = generate_keypair();
         let mut ical = tree();
-        seal_pending_item(&mut ical, 9, &public, None, None).unwrap();
+        seal_pending_item(&mut ical, 9, &public, None, None, None).unwrap();
         let (row, stored) = stored_item(ical, true);
         assert!(archived_item_is_pending(
             row.unarchive::<CalendarEventNotification>().unwrap()
@@ -942,7 +1010,7 @@ mod tests {
         let (public, private) = generate_keypair();
         let keys = keys();
         let mut item = shaped.clone();
-        seal_pending_item(&mut item, 9, &public, Some(&pair()), None).unwrap();
+        seal_pending_item(&mut item, 9, &public, Some(&pair()), None, None).unwrap();
         open_pending_item(&mut item, 9, &private).unwrap();
         assert_eq!(item, shaped);
         seal_drained_item(&mut item, &keys, 9).unwrap();
@@ -950,7 +1018,7 @@ mod tests {
         assert_eq!(ICalendar::parse(item.to_string()).unwrap(), item);
     }
     /// Upgrade ruling 94's failure arm (ruling 134, `fanout.rs`'s
-    /// `write_item_inner`): a message whose text does not reparse as a
+    /// `za_write_pending_item`): a message whose text does not reparse as a
     /// VCALENDAR holding a component has no shape, so the fan-out writes no
     /// item and records the recipient's failure. Upstream's builders never
     /// emit one; these are the two shapes the check refuses.
@@ -966,5 +1034,230 @@ mod tests {
             za_item_shape(&ICalendar::default()).is_none(),
             "a tree with no root"
         );
+    }
+
+    /// The recipient key pair of the sender tests' items: fixed, so an item
+    /// built by hand and one `seal_pending_item` wrote open with one key.
+    fn private() -> Secret {
+        Secret::from_bytes([0x5a; 32])
+    }
+
+    fn public() -> [u8; PUBLIC_KEY_LEN] {
+        derive_public_key(&private())
+    }
+
+    const SENDER: &str = "imip-org@remote.test";
+
+    /// A sealed pending item, its recipient and the private key that opens
+    /// it.
+    struct Sealed {
+        tree: ICalendar,
+        private: Secret,
+        recipient: u32,
+    }
+
+    /// A pending item for `recipient` and `uid` carrying `SENDER`, as
+    /// `seal_pending_item` writes it, sealed to `public()`.
+    fn sealed_with_sender(recipient: u32, uid: &str) -> Sealed {
+        let mut tree = with_uid(&tree(), uid);
+        seal_pending_item(&mut tree, recipient, &public(), None, None, Some(SENDER)).unwrap();
+        Sealed {
+            tree,
+            private: private(),
+            recipient,
+        }
+    }
+
+    /// A pending item for `recipient` and `uid` under `dek`, sealed to
+    /// `public()` by hand, with the root carriers `carriers` names between
+    /// its bundles and its key envelope, in that order, each one well-formed
+    /// for that recipient and UID (`seal_pending_item` writes at most one).
+    fn hand_seal(recipient: u32, uid: &str, dek: &Secret, carriers: &[&str]) -> ICalendar {
+        let mut ical = with_uid(&tree(), uid);
+        let envelope = seal_pk_envelope(dek, &public(), &pending_key_aad(recipient, uid)).unwrap();
+        seal_tree(&mut ical, dek, recipient, ITIP_SCOPE);
+        for name in carriers {
+            let text = match *name {
+                EXTRA_PROP => {
+                    seal_extra(dek, &extra_aad(recipient, uid), None, Some(&pair())).unwrap()
+                }
+                RSVP_TOKEN_PROP => URL_SAFE_NO_PAD.encode([3u8; TOKEN_LEN]),
+                SENDER_PROP => seal_bytes(dek, &sender_aad(recipient, uid), SENDER.as_bytes()),
+                other => panic!("not a pending carrier: {other}"),
+            };
+            root(&mut ical).push(text_entry(name, text));
+        }
+        root(&mut ical).push(text_entry(KEY_PROP, STANDARD.encode(envelope)));
+        ical
+    }
+
+    /// `hand_seal` for recipient 9 and `item-1` under a fresh DEK.
+    fn hand_built(carriers: &[&str]) -> ICalendar {
+        hand_seal(9, "item-1", &Secret::random(), carriers)
+    }
+
+    /// Item A's `X-ZA-SENDER` entry moved into an item B for `recipient`
+    /// and `uid`, ahead of B's key envelope. B is sealed under A's DEK when
+    /// the recipient or the UID differs from A's, so only the carrier's
+    /// associated data is wrong in B, and under its own DEK when both are
+    /// A's, so only the DEK is.
+    fn transplant_sender(a: &Sealed, recipient: u32, uid: &str) -> Sealed {
+        let a_uid = uid_of(&a.tree);
+        let a_dek = open_pk_envelope(
+            &envelope_of(&a.tree),
+            &a.private,
+            &pending_key_aad(a.recipient, &a_uid),
+        )
+        .unwrap();
+        let dek = if (recipient, uid) == (a.recipient, a_uid.as_str()) {
+            Secret::random()
+        } else {
+            a_dek
+        };
+        let entries = &a.tree.components[0].entries;
+        let carrier = entries[entries.len() - 2].clone();
+        assert!(is_carrier(&carrier, SENDER_PROP));
+        let mut tree = hand_seal(recipient, uid, &dek, &[]);
+        let at = tree.components[0].entries.len() - 1;
+        root(&mut tree).insert(at, carrier);
+        Sealed {
+            tree,
+            private: private(),
+            recipient,
+        }
+    }
+
+    /// A sender item whose `X-ZA-SENDER` moved into its VEVENT, ahead of
+    /// that component's `X-ZA-SEALED`.
+    fn sender_in_vevent() -> ICalendar {
+        let mut item = sealed_with_sender(9, "item-1").tree;
+        let n = item.components[0].entries.len();
+        let sender = root(&mut item).remove(n - 2);
+        let vevent = &mut item.components[1].entries;
+        let at = vevent.len() - 1;
+        vevent.insert(at, sender);
+        item
+    }
+
+    #[test]
+    fn a_sender_carrier_round_trips() {
+        let (public, private) = generate_keypair();
+        let mut ical = tree();
+        seal_pending_item(
+            &mut ical,
+            9,
+            &public,
+            None,
+            None,
+            Some("imip-org@remote.test"),
+        )
+        .unwrap();
+        assert!(
+            !ical.to_string().contains("imip-org"),
+            "the address is sealed"
+        );
+        // Imip spec 4.2: [.., X-ZA-SEALED, X-ZA-SENDER, X-ZA-KEY], the
+        // sender a format 1 bundle padded to 256 bytes.
+        let entries = &ical.components[0].entries;
+        let n = entries.len();
+        assert!(is_carrier(&entries[n - 1], KEY_PROP));
+        assert!(is_carrier(&entries[n - 2], SENDER_PROP));
+        assert!(is_carrier(&entries[n - 3], SEALED_PROP));
+        let bundle = STANDARD
+            .decode(entry_text(&entries[n - 2]).unwrap())
+            .unwrap();
+        assert_eq!(bundle[0], FORMAT_V1);
+        assert_eq!(bundle.len(), 1 + NONCE_LEN + TAG_LEN + PAD);
+        let carriers = open_pending_item(&mut ical, 9, &private).unwrap();
+        assert_eq!(carriers.sender.as_deref(), Some("imip-org@remote.test"));
+        assert!(carriers.pair.is_none() && carriers.reply_token.is_none());
+        assert_eq!(ical, tree());
+    }
+
+    #[test]
+    fn the_sender_carrier_binds_recipient_uid_and_dek() {
+        // The `X-ZA-SENDER` entry of item A moved into item B: B for another
+        // recipient (same UID), B with another UID (same recipient), and B with
+        // the same recipient and UID but its own DEK.
+        for (recipient, uid) in [(10, "item-1"), (9, "item-2"), (9, "item-1")] {
+            let mut moved = transplant_sender(&sealed_with_sender(9, "item-1"), recipient, uid);
+            // Control: B without the moved entry opens, so the entry alone
+            // fails.
+            let mut control = moved.tree.clone();
+            let n = control.components[0].entries.len();
+            root(&mut control).remove(n - 2);
+            assert!(
+                open_pending_item(&mut control, recipient, &moved.private).is_ok(),
+                "{recipient} {uid}"
+            );
+            let opened = open_pending_item(&mut moved.tree, recipient, &moved.private);
+            assert!(opened.is_err(), "{recipient} {uid}");
+            assert_eq!(opened.err(), Some(SealError::Aead), "{recipient} {uid}");
+        }
+    }
+
+    #[test]
+    fn a_sender_beside_another_carrier_or_out_of_place_is_stray() {
+        // Controls: each carrier alone, built by hand, opens.
+        for carrier in [EXTRA_PROP, RSVP_TOKEN_PROP, SENDER_PROP] {
+            assert!(
+                open_pending_item(&mut hand_built(&[carrier]), 9, &private()).is_ok(),
+                "{carrier}"
+            );
+        }
+        for carriers in [
+            &["X-ZA-EXTRA", "X-ZA-SENDER"][..],
+            &["X-ZA-SENDER", "X-ZA-EXTRA"],
+            &["X-ZA-RSVP-TOKEN", "X-ZA-SENDER"],
+            &["X-ZA-SENDER", "X-ZA-RSVP-TOKEN"],
+        ] {
+            assert_eq!(
+                open_pending_item(&mut hand_built(carriers), 9, &private()).err(),
+                Some(SealError::Structure("misplaced carrier")),
+                "{carriers:?}"
+            );
+        }
+        assert_eq!(
+            open_pending_item(&mut sender_in_vevent(), 9, &private()).err(),
+            Some(SealError::Structure("misplaced carrier"))
+        );
+        // [.., X-ZA-SENDER, X-ZA-SEALED, X-ZA-KEY].
+        let mut swapped = sealed_with_sender(9, "item-1").tree;
+        let n = swapped.components[0].entries.len();
+        root(&mut swapped).swap(n - 3, n - 2);
+        assert_eq!(
+            open_pending_item(&mut swapped, 9, &private()).err(),
+            Some(SealError::Structure("misplaced carrier"))
+        );
+        assert_eq!(
+            seal_pending_item(
+                &mut tree(),
+                9,
+                &public(),
+                Some(&pair()),
+                None,
+                Some("a@b.test")
+            ),
+            Err(SealError::Structure("a sender and another carrier"))
+        );
+        assert_eq!(
+            seal_pending_item(
+                &mut tree(),
+                9,
+                &public(),
+                None,
+                Some(&[1; TOKEN_LEN]),
+                Some("a@b.test")
+            ),
+            Err(SealError::Structure("a sender and another carrier"))
+        );
+    }
+
+    #[test]
+    fn the_drained_form_carries_no_sender() {
+        let mut ical = sealed_with_sender(9, "item-1").tree;
+        open_pending_item(&mut ical, 9, &private()).unwrap();
+        seal_drained_item(&mut ical, &keys(), 9).unwrap();
+        assert!(!ical.to_string().contains(SENDER_PROP));
     }
 }

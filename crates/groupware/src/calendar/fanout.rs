@@ -1449,14 +1449,15 @@ async fn write_item(
     reply_token: Option<&[u8; TOKEN_LEN]>,
     fence: Option<&ZaUidLease>,
 ) -> trc::Result<&'static str> {
-    match write_item_inner(
+    match za_write_pending_item(
         server,
-        sender_id,
+        ChangedBy::PrincipalId(sender_id),
         recipient_id,
         public_key,
         message,
         pair,
         reply_token,
+        None,
         fence,
     )
     .await
@@ -1477,19 +1478,25 @@ async fn write_item(
     }
 }
 
-/// `Ok(false)` when the inbound size limit or the recipient's quota refuses
-/// the item (step 5); `Ok(true)` once it is committed (steps 1-4). With a
-/// `fence`, the item's batch asserts the lease (whose key is global), so a
-/// write after a takeover fails with an assertion failure.
+/// One pending item in `recipient_id`'s scheduling inbox, sealed to
+/// `public_key` with at most one carrier: the recipient's `pair` or the
+/// replier's `reply_token` (the fan-out, spec 5.3), or a mail-borne item's
+/// `sender` (imip spec 4.1 step 6, 4.2). Its row names `changed_by`.
+/// `Ok(false)` when the inbound size limit, the notification limit or the
+/// recipient's quota refuses the item (step 5); `Ok(true)` once it is
+/// committed (steps 1-4). With a `fence`, the item's batch asserts the
+/// lease (whose key is global), so a write after a takeover fails with an
+/// assertion failure.
 #[allow(clippy::too_many_arguments)]
-async fn write_item_inner(
+pub async fn za_write_pending_item(
     server: &Server,
-    sender_id: u32,
+    changed_by: ChangedBy,
     recipient_id: u32,
     public_key: &[u8; 32],
     message: &ICalendar,
     pair: Option<&TokenPairs>,
     reply_token: Option<&[u8; TOKEN_LEN]>,
+    sender: Option<&str>,
     fence: Option<&ZaUidLease>,
 ) -> trc::Result<bool> {
     // Step 5: the two checks upstream's ingest makes.
@@ -1533,12 +1540,21 @@ async fn write_item_inner(
             .details("zero-access: iTIP message does not reparse")
             .caused_by(trc::location!())
     })?;
-    // Steps 1-3 (plan 8): the tree sealed to the recipient's public key.
-    seal_pending_item(&mut tree, recipient_id, public_key, pair, reply_token)
-        .map_err(|err| seal_error(err, recipient_id, u32::MAX))?;
+    // Steps 1-3 (plan 8): the tree sealed to the recipient's public key,
+    // with its carrier.
+    seal_pending_item(
+        &mut tree,
+        recipient_id,
+        public_key,
+        pair,
+        reply_token,
+        sender,
+    )
+    .map_err(|err| seal_error(err, recipient_id, u32::MAX))?;
     // Only a quota limit is "over quota"; any other error reaches the
-    // `write_item` trace (as upstream's `copy_message` matches it). Upgrade
-    // ruling 176 (B-M7): measured on the sealed item, the size stored.
+    // caller's trace, `write_item`'s for the fan-out (as upstream's
+    // `copy_message` matches it). Upgrade ruling 176 (B-M7): measured on
+    // the sealed item, the size stored.
     match server
         .has_available_quota(account.as_ref(), SizeWriter::ical(&tree) as u64)
         .await
@@ -1554,7 +1570,7 @@ async fn write_item_inner(
     // ruling 13) and its id is reserved in the batch itself.
     #[cfg(feature = "test_mode")]
     common::za::test_hooks::fan_out_pause_point(recipient_id).await;
-    let (item, content) = sealed_item_record(tree, ChangedBy::PrincipalId(sender_id), None, true);
+    let (item, content) = sealed_item_record(tree, changed_by, None, true);
     let mut batch = BatchBuilder::new();
     // Ahead of the insert: the assertion and the insert share the batch's
     // first commit point.

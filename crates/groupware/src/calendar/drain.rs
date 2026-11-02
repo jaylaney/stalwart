@@ -1827,7 +1827,7 @@ impl ItemCtx<'_> {
     }
 }
 
-/// Only a quota limit is "over quota", as `fanout::write_item_inner`
+/// Only a quota limit is "over quota", as `fanout::za_write_pending_item`
 /// classifies it; any other error of the quota check is a store error.
 fn is_over_quota(err: &trc::Error) -> bool {
     err.matches(trc::EventType::Limit(trc::LimitEvent::Quota))

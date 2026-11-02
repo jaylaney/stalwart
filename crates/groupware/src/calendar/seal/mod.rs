@@ -23,9 +23,9 @@ pub use event::{
     unseal_event_pairs,
 };
 pub use item::{
-    AAD_ITIP_KEY, ITIP_SCOPE, PendingCarriers, RSVP_TOKEN_PROP, archived_item_is_pending,
-    item_is_sealed, open_drained_item, open_pending_item, seal_drained_item, seal_pending_item,
-    unseal_item_archive,
+    AAD_ITIP_KEY, ITIP_SCOPE, PendingCarriers, RSVP_TOKEN_PROP, SENDER_PROP,
+    archived_item_is_pending, item_is_sealed, open_drained_item, open_pending_item,
+    seal_drained_item, seal_pending_item, unseal_item_archive,
 };
 pub use token::{TOKEN_LEN, TokenPairs, tokens_equal};
 pub use tree::{
