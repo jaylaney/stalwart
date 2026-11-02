@@ -195,16 +195,13 @@ fn refused_cases(test: &TestServer, key: &Party) -> Vec<Refused> {
             oversized_request(to, test.server.core.groupware.itip_inbound_max_ical_size),
             false,
         ),
-        // Step 3: a method that does not continue.
+        // Step 3: a method that does not continue, for a UID the account
+        // knows (`delivered_request`'s pending item), so step 5 would let
+        // it through.
         case(
             "PUBLISH",
             "dmarc-org@remote.test",
-            itip_mail(
-                ORG,
-                to,
-                "PUBLISH",
-                &event("imip-in-publish", ORG, &[to], 0, ""),
-            ),
+            itip_mail(ORG, to, "PUBLISH", &event("imip-in-1", ORG, &[to], 0, "")),
             false,
         ),
         // Step 4: a local key account's own mail.
