@@ -41,6 +41,26 @@ def load_metadata(root):
     return metadata
 
 
+def verify_upstream_version(root, metadata):
+    """The pinned upstream tag's version equals the internal crates' package version.
+
+    The internal crates keep upstream's version (`crates/common/Cargo.toml`), and every
+    upstream merge brings the new one. So a pin left unchanged after a merge (for example
+    `v0.16.27` on a 1.0.1 base) is refused even when no later upstream tag is known
+    (`PINNED_UPSTREAM_TAGS` not extended, no local upstream tags): the Task 9 review's M1.
+    """
+    with (root / "crates/common/Cargo.toml").open("rb") as source:
+        crate_version = tomllib.load(source).get("package", {}).get("version")
+    tag = metadata["upstream_tag"]
+    if not isinstance(crate_version, str) or not crate_version:
+        raise ValueError("crates/common/Cargo.toml has no package version")
+    if tag.removeprefix("v") != crate_version:
+        raise ValueError(
+            f"upstream_tag {tag} does not match the internal crates' version {crate_version} "
+            "(crates/common/Cargo.toml); fork-release.toml's upstream pin is stale"
+        )
+
+
 def validate_identity(metadata, version_output, help_output, source_commit, ref):
     if not COMMIT.fullmatch(source_commit):
         raise ValueError("source commit must be a full lowercase hexadecimal commit")
@@ -162,6 +182,7 @@ def main():
     try:
         metadata = load_metadata(root)
         verify_checkout(root, args.source_commit)
+        verify_upstream_version(root, metadata)
         verify_upstream(root, metadata, args.source_commit)
         binary_environment = os.environ.copy()
         binary_environment.pop("CONFIG_PATH", None)

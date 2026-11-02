@@ -174,8 +174,8 @@ jobs:
     name: Unit Tests
     needs: style
     # Every unit test of crates/* except the Enterprise-licensed scim and
-    # scim-proto crates (570 in the workspace step at 1.0, two of them
-    # #[ignore]d, and 16 in the smtp step), in three steps:
+    # scim-proto crates (571 passed and 2 #[ignore]d in the workspace step at
+    # 1.0, 16 in the smtp step and 6 in the http step), in three steps:
     # the workspace step, then smtp without enterprise and http with its
     # test_mode, which the workspace step's features cannot select. It runs
     # on every trigger, a push to main included: it holds the fork's own unit

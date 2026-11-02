@@ -195,6 +195,41 @@ class VerifyProductTests(unittest.TestCase):
         (root / "crates/main/Cargo.toml").write_text(
             f'[package]\nname = "stalwart"\nversion = "{VERSION}"\n'
         )
+        (root / "crates/common").mkdir(parents=True)
+        (root / "crates/common/Cargo.toml").write_text(
+            '[package]\nname = "common"\nversion = "0.16.26"\n'
+        )
+
+    def test_the_upstream_tag_matches_the_internal_crate_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_metadata(root)
+            verify_product.verify_upstream_version(root, METADATA)
+
+    def test_a_stale_upstream_tag_left_on_a_newer_base_is_refused(self):
+        # The Task 9 review's M1: a 0.16.27 pin left unchanged on a 1.0.1 base, with no
+        # later upstream tag known to the other checks.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_metadata(root)
+            (root / "crates/common/Cargo.toml").write_text(
+                '[package]\nname = "common"\nversion = "1.0.1"\n'
+            )
+            stale = {**METADATA, "upstream_tag": "v0.16.27"}
+            with self.assertRaisesRegex(ValueError, "stale"):
+                verify_product.verify_upstream_version(root, stale)
+
+    def test_a_missing_internal_crate_version_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_metadata(root)
+            (root / "crates/common/Cargo.toml").write_text('[package]\nname = "common"\n')
+            with self.assertRaises(ValueError):
+                verify_product.verify_upstream_version(root, METADATA)
+
+    def test_the_real_upstream_tag_matches_the_internal_crates(self):
+        root = Path(verify_product.__file__).parents[2]
+        verify_product.verify_upstream_version(root, verify_product.load_metadata(root))
 
     def test_glibc_requirement_uses_numeric_version_order(self):
         with tempfile.TemporaryDirectory() as directory:
