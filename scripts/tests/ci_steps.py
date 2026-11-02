@@ -16,7 +16,8 @@ tests-crate steps (`net_command`), so the gates capture and measure what CI runs
 difference: a step missing or renamed, a changed command (a narrowed filter, a dropped feature),
 a changed environment, a changed `if`, a changed rerun, a step that may fail without failing its
 job (`continue-on-error`), a `cargo test` step the table does not hold, or a gates job that runs
-the net or the capture on fewer steps. `test_gates.py` runs it on the committed workflow (it must
+the net or the capture on fewer steps, or a style job that no longer runs this check and
+`test_gates.py` on every trigger. `test_gates.py` runs it on the committed workflow (it must
 find nothing) and on edited copies. Run as a command, it checks the committed workflow, or PATH,
 and exits 1 if it finds a difference.
 
@@ -63,6 +64,12 @@ GATES_COMMANDS = {
     "Capture CI step listings":
         'python3 -I scripts/tests/capture_listings.py --out "$GATES/listings"',
 }
+
+# Final review N14: the style job's step that runs this check and the gates' self-tests on every
+# trigger. Dropping it, renaming it or giving it (or its job) an `if` would silence both.
+STYLE_JOB = "style"
+STYLE_STEP = "Check Gates"
+STYLE_COMMANDS = ["python3 -I scripts/tests/ci_steps.py", "python3 -I scripts/tests/test_gates.py"]
 
 # Keys a gated step may have. Anything else (continue-on-error, working-directory, ...) can change
 # what the step runs or whether its failure counts.
@@ -493,6 +500,26 @@ def check_workflow(text):
                                                  or UNIT_FEATURES in step_env):
             problems.append(f"{where}: overrides the workflow-level {UNIT_FEATURES}, which the "
                             "gates' capture reads")
+
+    style = jobs.get(STYLE_JOB)
+    where = f"job {STYLE_JOB}, step {STYLE_STEP!r}"
+    if not isinstance(style, dict):
+        problems.append(f"job {STYLE_JOB}: missing")
+    else:
+        for key in sorted((JOB_FORBIDDEN | {"if"}) & set(style)):
+            problems.append(f"job {STYLE_JOB}: has {key}")
+        matches = [item for item in style.get("steps") or []
+                   if isinstance(item, dict) and item.get("name") == STYLE_STEP]
+        if len(matches) != 1:
+            problems.append(f"{where}: {'missing (dropped or renamed)' if not matches else 'not unique'}")
+        else:
+            item = matches[0]
+            for key in sorted(set(item) - {"name", "run", "shell"}):
+                problems.append(f"{where}: has {key}")
+            lines = [line.strip() for line in (item.get("run") or "").splitlines()
+                     if line.strip()]
+            if lines != STYLE_COMMANDS:
+                problems.append(f"{where}: runs {lines}, expected {STYLE_COMMANDS}")
 
     gates = jobs.get(GATES_JOB)
     if not isinstance(gates, dict):

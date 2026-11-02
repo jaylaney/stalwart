@@ -807,6 +807,29 @@ class WorkflowTests(unittest.TestCase):
                                "test.yml__test__imap-tests")
         self.assertReports(problems, "job gates", "Capture CI step listings")
 
+    def test_the_style_job_runs_this_check(self):
+        # Final review N14: the step that runs the check is itself checked.
+        step = ("      - name: Check Gates\n        run: |\n"
+                "          python3 -I scripts/tests/ci_steps.py\n"
+                "          python3 -I scripts/tests/test_gates.py\n")
+        problems = self.edited(step, "")
+        self.assertReports(problems, "job style", "'Check Gates'", "missing")
+        problems = self.edited(step, step.replace("Check Gates", "Gates"))
+        self.assertReports(problems, "job style", "'Check Gates'", "missing")
+        problems = self.edited(step, step.replace("        run: |\n",
+                                                  "        if: false\n        run: |\n"))
+        self.assertReports(problems, "job style", "'Check Gates'", "has if")
+        problems = self.edited(step, step.replace("        run: |\n",
+                                                  "        continue-on-error: true\n"
+                                                  "        run: |\n"))
+        self.assertReports(problems, "job style", "has continue-on-error")
+        problems = self.edited(step, step.replace(
+            "          python3 -I scripts/tests/test_gates.py\n", ""))
+        self.assertReports(problems, "job style", "'Check Gates'", "runs")
+        problems = self.edited("    name: Check Style\n",
+                               "    name: Check Style\n    if: github.event_name == 'push'\n")
+        self.assertReports(problems, "job style: has if")
+
     def test_unsupported_yaml_is_reported_not_skipped(self):
         problems = self.edited("  test:\n    name: Test\n", "  test: &test\n    name: Test\n")
         self.assertTrue(problems and problems[0].startswith("test.yml:"), problems)
