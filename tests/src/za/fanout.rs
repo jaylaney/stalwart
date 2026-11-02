@@ -845,6 +845,34 @@ pub async fn test_failures(test: &mut TestServer) {
         "the eviction took a pending item or a newer drained one"
     );
     assert_eq!(after2.len(), held2.len(), "{after2:?}");
+    // (3) Upgrade ruling 191 (N10): a zero limit refuses, as upstream does,
+    // even with a drained item to evict: 5.1, no item, nothing evicted.
+    assert!(
+        !inbox_item_is_pending(test, key2.id, drained_new).await,
+        "precondition: key2 holds a drained item"
+    );
+    admin
+        .registry_update_object(ObjectType::Account, key2_account, quota(0))
+        .await;
+    let zero = format!("{KEY1_CAL}fo-zero.ics");
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &zero,
+            [CONTENT_TYPE],
+            invite("za-fo-zero", START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(
+        inbox_ids(test, key2.id).await,
+        after2,
+        "a zero limit evicted an item or delivered one"
+    );
+    assert_eq!(
+        attendee_statuses(&key1.client, &zero, "key2@example.com").await,
+        ["5.1"]
+    );
     admin
         .registry_update_object(
             ObjectType::Account,
@@ -1101,6 +1129,7 @@ pub async fn test_failures(test: &mut TestServer) {
         "fo-size",
         "fo-notify",
         "fo-rolling",
+        "fo-zero",
         "fo-sealed-a",
         "fo-sealed-b",
         "fo-receive",

@@ -1504,19 +1504,25 @@ async fn write_item_inner(
     // Upgrade rulings 176 (B-M3) and 187: at upstream's notification limit
     // the oldest drained notification is evicted, upstream's rolling window
     // (`NotificationQuota::reserve`); a pending item is never evicted, so
-    // when every stored notification is pending the item is refused.
+    // when every stored notification is pending the item is refused. Upgrade
+    // ruling 191 (N10): a zero limit refuses before any eviction, as upstream.
     let mut evict = None;
     if let Some(limit) =
         server.object_quota_limit(&account, StorageQuota::MaxCalendarEventNotifications)
-        && server
+    {
+        if limit == 0 {
+            return Ok(false);
+        }
+        if server
             .count_documents(recipient_id, Collection::CalendarEventNotification, limit)
             .await
             .caused_by(trc::location!())?
             >= limit
-    {
-        match za_oldest_drained_notification(server, recipient_id).await? {
-            Some(oldest) => evict = Some(oldest),
-            None => return Ok(false),
+        {
+            match za_oldest_drained_notification(server, recipient_id).await? {
+                Some(oldest) => evict = Some(oldest),
+                None => return Ok(false),
+            }
         }
     }
     // Upgrade ruling 94: the shape upstream queues (its text round-trip),
