@@ -160,6 +160,7 @@ pub async fn test(test: &TestServer) {
     // ACME provider creation should fail without a contact email
     account
         .registry_create_object_expect_err(AcmeProvider {
+            description: "Pebble ACME provider".to_string(),
             directory: "https://localhost:14000/dir".to_string(),
             ..Default::default()
         })
@@ -170,6 +171,7 @@ pub async fn test(test: &TestServer) {
     // Create an ACME provider using TLS-ALPN-01 challenge
     let tls_acme_id = account
         .registry_create_object(AcmeProvider {
+            description: "Pebble ACME provider".to_string(),
             directory: "https://localhost:14000/dir".to_string(),
             contact: Map::new(vec!["mailto:hello@tls.org".to_string()]),
             challenge_type: AcmeChallengeType::TlsAlpn01,
@@ -292,6 +294,7 @@ pub async fn test(test: &TestServer) {
     // Test ACME using HTTP-01 challenge and the server domain "mail.example.org"
     let http_acme_id = account
         .registry_create_object(AcmeProvider {
+            description: "Pebble ACME provider".to_string(),
             directory: "https://localhost:14000/dir".to_string(),
             contact: Map::new(vec!["mailto:hello@example.org".to_string()]),
             challenge_type: AcmeChallengeType::Http01,
@@ -336,6 +339,7 @@ pub async fn test(test: &TestServer) {
     // Test ACME using DNS-01 challenge
     let dns_acme_id = account
         .registry_create_object(AcmeProvider {
+            description: "Pebble ACME provider".to_string(),
             directory: "https://localhost:14000/dir".to_string(),
             contact: Map::new(vec!["mailto:hello@dns.org".to_string()]),
             challenge_type: AcmeChallengeType::Dns01,
@@ -377,6 +381,7 @@ pub async fn test(test: &TestServer) {
     // Test ACME using DNS-01 challenge
     let dns_acme_id = account
         .registry_create_object(AcmeProvider {
+            description: "Pebble ACME provider".to_string(),
             directory: "https://localhost:14000/dir".to_string(),
             contact: Map::new(vec!["mailto:hello@persist.org".to_string()]),
             challenge_type: AcmeChallengeType::DnsPersist01,
@@ -427,6 +432,7 @@ pub async fn test(test: &TestServer) {
     // Renew without a preferred chain to discover the default root
     let default_acme_id = account
         .registry_create_object(AcmeProvider {
+            description: "Pebble ACME provider".to_string(),
             directory: "https://localhost:14000/dir".to_string(),
             contact: Map::new(vec!["mailto:hello@chain.org".to_string()]),
             challenge_type: AcmeChallengeType::TlsAlpn01,
@@ -482,6 +488,7 @@ pub async fn test(test: &TestServer) {
         .expect("an alternate root distinct from the default");
     let preferred_acme_id = account
         .registry_create_object(AcmeProvider {
+            description: "Pebble ACME provider".to_string(),
             directory: "https://localhost:14000/dir".to_string(),
             contact: Map::new(vec!["mailto:hello@chainalt.org".to_string()]),
             challenge_type: AcmeChallengeType::TlsAlpn01,
@@ -545,6 +552,7 @@ pub async fn test(test: &TestServer) {
 
         let reuse_acme_id = account
             .registry_create_object(AcmeProvider {
+                description: "Pebble ACME provider".to_string(),
                 directory: "https://localhost:14000/dir".to_string(),
                 contact: Map::new(vec!["mailto:hello@reuse.org".to_string()]),
                 challenge_type: AcmeChallengeType::TlsAlpn01,

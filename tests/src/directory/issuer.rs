@@ -48,7 +48,8 @@ pub async fn test() {
             // defaults to `reject`). This test's token asks for `openid`
             // only, and the test realm defines none of those scopes, so the
             // directory accepts unscoped tokens with the interoperable
-            // scopes; the subject here is the issuer routing.
+            // scopes; the subject here is the issuer routing (licensed at
+            // 1.0, below).
             unscoped_tokens: OidcUnscopedTokenPolicy::Interoperable,
             ..Default::default()
         }))
@@ -86,11 +87,26 @@ pub async fn test() {
     }
     assert_eq!(claims["iss"], json!(ISSUER));
 
-    assert_eq!(
-        session_status(&token).await,
-        200,
-        "A bearer token without a username claim did not reach the domain's OIDC directory"
-    );
+    // Upgrade ruling 33: at 1.0, routing a token to a domain's directory, by
+    // the token's domain or by its issuer, is a licensed feature
+    // (`get_directory_for_domain` and `get_directory_for_issuer` consult a
+    // domain's directory only while `is_enterprise_edition()`), and these
+    // tests run without a licence. With no default directory, the token then
+    // reaches no OIDC directory and 1.0 answers 401; 0.16's test licence
+    // routed it.
+    if test.server.is_enterprise_edition() {
+        assert_eq!(
+            session_status(&token).await,
+            200,
+            "A bearer token without a username claim did not reach the domain's OIDC directory"
+        );
+    } else {
+        assert_eq!(
+            session_status(&token).await,
+            401,
+            "Without a licence, a bearer token reached a directory other than the default one"
+        );
+    }
 }
 
 fn access_token_claims(token: &str) -> serde_json::Value {

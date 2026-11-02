@@ -96,6 +96,7 @@ pub async fn test(test: &TestServer) {
         .await;
     let acme_provider_id = account
         .registry_create_object(AcmeProvider {
+            description: "Pebble ACME provider".to_string(),
             directory: "https://localhost:14000/dir".to_string(),
             contact: Map::new(vec!["mailto:hello@example.org".to_string()]),
             challenge_type: AcmeChallengeType::TlsAlpn01,
