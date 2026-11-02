@@ -250,8 +250,18 @@ impl OAuthApiHandler for Server {
         origin: RequestOrigin<'_>,
         body: Vec<u8>,
     ) -> trc::Result<HttpResponse> {
+        // Zero-access fork (upgrade ruling 176, A2): the body carries the
+        // secret and serde's messages can quote values, so only the error's
+        // category and position are reported, as `api/vault.rs` does.
         let request = serde_json::from_slice::<LoginRequest>(&body).map_err(|err| {
-            trc::EventType::Resource(trc::ResourceEvent::BadParameters).from_json_error(err)
+            trc::EventType::Resource(trc::ResourceEvent::BadParameters)
+                .reason(format!(
+                    "{:?} error at line {}, column {}",
+                    err.classify(),
+                    err.line(),
+                    err.column()
+                ))
+                .details("JSON deserialization failed")
         })?;
 
         let response = match request {

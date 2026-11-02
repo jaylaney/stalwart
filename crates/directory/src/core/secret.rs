@@ -72,14 +72,11 @@ pub async fn verify_mfa_secret_hash(
 
 /// Checks `code` against an `otpauth://` URL with the same semantics as
 /// `verify_mfa_secret_hash` (current window only). The URL holds the TOTP
-/// secret, so it is never attached to the error.
+/// secret, so it is never attached to the error, nor is the parser's
+/// message, which can quote a component of it (upgrade ruling 176, A3).
 pub fn verify_totp_code(totp_uri: &str, code: &str) -> trc::Result<bool> {
     Ok(Totp::from_url(totp_uri)
-        .map_err(|err| {
-            trc::AuthEvent::Error
-                .reason(err)
-                .details("Invalid TOTP URL")
-        })?
+        .map_err(|_| trc::AuthEvent::Error.into_err().details("Invalid TOTP URL"))?
         .check_current(code)
         .is_some())
 }
@@ -484,3 +481,20 @@ mod tests;
 #[cfg(test)]
 #[path = "secret_restored_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod za_tests {
+    use super::verify_totp_code;
+
+    /// Upgrade ruling 176 (A3): an `otpauth://` URL the parser refuses
+    /// reaches no part of the error, the parser's message included.
+    #[test]
+    fn totp_url_error_quotes_nothing() {
+        const CANARY: &str = "ZACANARY0189";
+        let url = format!("otpauth://totp/Stalwart:za?secret={CANARY}&issuer=Stalwart");
+        let err = verify_totp_code(&url, "123456").expect_err("an invalid secret");
+        let text = format!("{err:?} {err}");
+        assert!(!text.contains(CANARY), "{text}");
+        assert!(text.contains("Invalid TOTP URL"), "{text}");
+    }
+}

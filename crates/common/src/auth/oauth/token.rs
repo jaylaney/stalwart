@@ -6,7 +6,6 @@
 
 use super::{GrantType, crypto::SymmetricEncrypt};
 use crate::Server;
-use compact_str::CompactString;
 use encodify::base64::URL_SAFE_NO_PAD;
 use std::time::SystemTime;
 use store::{
@@ -165,12 +164,14 @@ impl Server {
         expected_grant_type: Option<GrantType>,
         token_: &str,
     ) -> trc::Result<TokenInfo> {
+        // Zero-access fork (upgrade ruling 171): an undecodable value is a
+        // bearer credential (a foreign token or a misplaced password), so it
+        // is not attached to the error.
         let token = open_token(&self.core.oauth.token_cipher, token_).map_err(|_| {
             trc::AuthEvent::Error
                 .into_err()
                 .ctx(trc::Key::Reason, FAILED_TO_DECODE_TOKEN)
                 .caused_by(trc::location!())
-                .details(CompactString::from(token_))
         })?;
 
         let now = seconds_since_oauth_epoch();

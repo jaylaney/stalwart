@@ -52,7 +52,7 @@ use registry::{
         prelude::{Object, ObjectInner, ObjectType},
         structs::{Account, Credential, PasswordCredential, SecondaryCredential, UserAccount},
     },
-    types::{datetime::UTCDateTime, id::ObjectId},
+    types::{datetime::UTCDateTime, id::ObjectId, list::List},
 };
 use sha2::{Digest, Sha256};
 use std::{future::Future, net::IpAddr, sync::Arc};
@@ -535,6 +535,28 @@ async fn za_invalidate_mailbox_grantees(server: &Server, account_id: u32) {
     }
 }
 
+/// Upgrade ruling 175 (plan 13's R37 closed): the marker write is a
+/// password change, so it takes upstream's credentials-changed path
+/// (`process_credentials_update`, which queues `revoke_oauth_grants`). A
+/// grant minted while the account had no credential (its credential version
+/// 0, which its refreshes re-encode) dies with the marker. A failure is
+/// traced, not returned: the marker is written.
+async fn za_revoke_marker_grants(
+    server: &Server,
+    account_id: u32,
+    before: &List<Credential>,
+    after: &List<Credential>,
+) {
+    let mut changes = CacheInvalidationBuilder::default();
+    changes.process_credentials_update(account_id, before, after);
+    if let Err(err) = server.invalidate_caches(changes).await {
+        trc::error!(
+            err.account_id(account_id)
+                .details("Zero-access grant revocation failed after the marker write")
+        );
+    }
+}
+
 /// Refusal with a status other than 401 (e.g. 409 on an active account):
 /// counted like a failed attempt, so probing for account states is delayed,
 /// rate-limited and banned like guessing credentials. A ban or a fail2ban
@@ -817,9 +839,11 @@ async fn za_setup_token(server: &Server, request: SetupTokenRequest) -> trc::Res
                 secret: ZA_MARKER.to_string(),
                 ..Default::default()
             }));
+        let credentials = account.credentials.clone();
         if !za_registry_update(server, account_id, &reg, account).await? {
             return Ok(conflict("registry write failed, re-issue the token"));
         }
+        za_revoke_marker_grants(server, account_id, &reg.account.credentials, &credentials).await;
 
         // (3) Invalidate classification and cached authentication again: the
         // marker is what classifies the account.
