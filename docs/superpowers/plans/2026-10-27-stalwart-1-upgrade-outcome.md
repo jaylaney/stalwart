@@ -10002,6 +10002,86 @@ enrolment (new keys, so contacts pin afresh). Keep the pre-cutover store snapsho
 - The optional clean-context Fable review of the whole branch.
 - Opening the pull request.
 
+### PR review fixes
+
+Two P2 findings of the review of PR #69, both port regressions, fixed by rulings 196 and 197.
+Run on 2026-11-02, Apple Silicon (arm64). Scratch work, drivers and the mutation script are in
+the plan workspace under `pr-review-fix/`; the logs are in `task-7c/logs/`.
+
+Commits:
+- `4a3dcde7f`: ruling 196, the setup-token concurrency slot;
+- `7b088e8dc`: ruling 197, the delegated second run's failed preconditions;
+- this note.
+
+**Ruling 196.** The setup-token arm of `handle_vault_request` (`crates/http/src/api/vault.rs`)
+destructured `HttpAuthenticated { access_token, .. }`, which dropped `in_flight` at once, so the
+caller's concurrency slot was released before `za_setup_token`'s scans and writes. It now binds
+`in_flight: _in_flight` until the handler returns, as 0.16 did and as `api/mod.rs`'s `account`
+and `schema` arms do. New ZA case `setup::test_setup_token_concurrency`, after
+`test_grants_die_with_the_marker`: with `Jmap.maxConcurrentRequests` at one (the new
+`ConcurrentRequestsGuard` in `tests/src/utils/za.rs`, which restores the prior value and
+reloads the settings, also from its drop), a provisioning caller
+(`setup-token-limit-caller@example.com`, `SysAccountUpdate` without `UnlimitedRequests`) parks
+one setup-token at `SETUP_TOKEN_PAUSE`; a second concurrent request is refused with 400 and
+`limit: maxConcurrentRequests`; the parked one then answers 200, and a third, after it, 200
+(the control). The target (`setup-token-limit@example.com`) is set up and destroyed with the
+suite's key accounts; the caller is destroyed at the end of the case.
+
+**Ruling 197.** `za_schedule` (`crates/dav/src/calendar/update.rs`) read the delegated second
+run (`za_self_update` and `za_self_create`) with `.ok().flatten()`. Since ruling 93 that run
+splits per recipient (`retain_writer_messages` calls `itip_messages_per_recipient`), so its
+`TooManyRecipients` was swallowed: an edit grantee's PUT of an owner-organized event whose
+attendees are the grantee's own addresses could succeed with neither personal invitation,
+where 0.16 answered 412 through the combined limit check. The second run's outcome now goes
+through `za_second_run`: a failed precondition fails the PUT with the first run's 412
+(`za_itip_precondition`, which the first run now shares: `err.failed_precondition()` to a 412
+`DavError::Condition`) before any fan-out or persistence; `NothingToSend` and the other errors
+without a precondition still build nothing. The second run's other failed preconditions are
+structural (`MultipleOrganizer`, `MultipleUid`, `MultipleObjectTypes`,
+`MultipleObjectInstances`) or `OrganizerMismatch`, which the first run meets on the same trees
+with a superset of the owner's addresses, so they answer the 412 the first run would.
+- Unit tests: `calendar::update::tests::second_run_fails_only_on_a_failed_precondition` (dav;
+  `TooManyRecipients` gives 412 `MaxAttendeesPerInstance`, the benign errors and `Ok(None)`
+  give `Ok(None)`) and `calendar::delegation::tests::second_run_reports_the_recipient_limit`
+  (groupware; with `max_recipients` 2 the merged first run has nothing to send while
+  `za_self_create` and `za_self_update` report `TooManyRecipients`; with 3 both build the two
+  invitations).
+- ZA case `sharing_http_recipient_limit`, after `sharing_http_schedule_contracts` in the
+  lifecycle differential: `CalendarScheduling.maxRecipients` at 2 (`MaxRecipientsGuard`), Bob,
+  Alice's edit grantee, PUTs an Alice-organized event whose attendees are Bob's address and
+  his alias. The create answers 412 and stores no event and no inbox item; an event created
+  under the prior cap (the control, its invitations drained) is updated under the cap of 2,
+  which answers 412, leaves the stored event unchanged and delivers nothing. UIDs
+  `case-recipient-limit-create` and `case-recipient-limit-update`; the case deletes its copies
+  and inbox items.
+- The other swallowing over the second-run builders: `crates/dav/src/calendar/delete.rs` reads
+  `za_self_cancel` with `.ok().flatten()`. It is left as it is: a DELETE never had a recipient
+  412 (0.16 had no limit check there), and the first run's `itip_cancel` is read with `.ok()`
+  on the same path (`remove_all_za_at`, `crates/groupware/src/calendar/storage.rs`),
+  as upstream's delete does, so over the limit neither run sends a CANCEL. Recorded for a
+  ruling: over the limit, a delegated delete no longer sends the writer's own CANCELs, which
+  0.16 sent. No other caller reads `za_self_*` or `itip_cancel_from_snapshot` in the fork.
+
+Mutations (rows of `task-7d/mutations.tsv`, by `pr-review-fix/muts.py`; `z027` is part 9a's):
+
+| Row | Mutation | Outcome |
+|---|---|---|
+| z028 | the port's `..` restored: `in_flight` dropped at once | caught: `setup::test_setup_token_concurrency`, the second request answered 200 |
+| z029 | the second run's errors swallowed again | caught: the dav unit test, and `sharing_http_recipient_limit`'s create answered 201 |
+
+No expectation-ledger row: no existing assertion changed.
+
+Runs at `7b088e8dc` (logs in `task-7c/logs/`):
+- `fmt-2`: `cargo fmt --all --check`, clean;
+- `units-12`: `cargo test -p groupware --lib`, 180 passed;
+- `units-13`: `cargo test -p dav --lib`, 4 passed;
+- `units-14`: `cargo test -p http@1.0.1 --lib --bins --features test_mode,enterprise`, 6 passed;
+- `za-102`: `za::za_tests`, passed (395 s);
+- `zafs-13`: `za::za_tests` with `BLOB_STORE=FileSystem`, passed (371 s);
+- `caldav-key-32`: key-mode `webdav::webdav_tests`, passed;
+- `product-check-1`: `cargo check -p stalwart --no-default-features --features rocks`, no
+  warning.
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
