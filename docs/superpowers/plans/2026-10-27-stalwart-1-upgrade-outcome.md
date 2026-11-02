@@ -7551,17 +7551,52 @@ Restored with `git checkout -- <files>`, the same two builds and `unit-tests` we
 
 ### Task 7 results
 
-The record of Task 7 is the final SHA `a2b78bbb0` (final fix part Z2, ruling 177): its code
-and tests, with product code unchanged since `2469e15f0` (part Z1). The local matrix, the
-19-step llvm-cov net plus `za-cache-swap`, both gates and the CI run all ran at it, on a clean
-tree; "#### The final record (at `a2b78bbb0`)" below holds them. The record at `6fd9a131f`
-(fix round 2, part 7f4, ruling 157) follows it unchanged, and the part sections above hold
-every earlier attempt. Every Cargo command starts with
+The record of Task 7 is the final SHA `f135a9881` (final fix part Z3, rulings 185 to 189):
+its code and tests. The local matrix, the 19-step llvm-cov net plus `za-cache-swap`, both
+gates and the CI run all ran at it, on a clean tree; "#### The final record (at
+`f135a9881`)" below holds them. The record at `a2b78bbb0` (part Z2) and the one at
+`6fd9a131f` (fix round 2, part 7f4, ruling 157) follow it unchanged, and the part sections
+above hold every earlier attempt. Every Cargo command starts with
 `export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$PATH"`. Integration rows also
 set `STORE=RocksDb RUST_MIN_STACK=16777216`, and `ZA_KEY_ACCOUNTS=1` on key rows only (unset
 on plain rows).
 
-#### The final record (at `a2b78bbb0`)
+#### The final record (at `f135a9881`)
+
+Logs: `task-7c/logs/` (the uninstrumented rows), `final-fix-z3/logs/` (the compile checks and
+the drivers), `task-7d/capture-z3/` (the listings), `task-7d/coverage-z3/` (the net) and
+`task-7d/gates/z3/` (the gates), all in the plan workspace. The tools are part 7f3's, driven
+by `final-fix-z3/drive.sh` and, for the net and the gates, `final-fix-z3/drive-net.sh`: the
+first net stopped at its free-space floor before `build-B` (the listing capture had rebuilt
+`target/debug`); it reran with the floor at 8 GiB (`COV_MIN_FREE=8`), and free space never
+fell below 34 GiB.
+
+| Check or row | Result at `f135a9881` |
+|---|---|
+| `cargo check -p stalwart --no-default-features --features rocks` | pass, no warning |
+| `cargo fmt --all --check` | pass |
+| `cargo check --workspace --tests` | pass, no warning |
+| ZA (`za-100`), ZA with `BLOB_STORE=FileSystem` (`zafs-12`) | 1 / 0 / 0 (366 s), 1 / 0 / 0 (368 s) |
+| ZA cache swap (`swap-5`) | 1 / 0 / 0 |
+| CalDAV plain, key (`caldav-plain-33`, `caldav-key-31`) | 1 / 0 / 0 each |
+| IMAP plain, key (`imap-plain-21`, `imap-key-18`) | 1 / 0 / 0 each |
+| JMAP plain, key (`jmap-plain-55`, `jmap-key-36`) | 1 / 0 / 0 each |
+| `system::system_tests` (`up-system-system_tests-25`) | 1 / 0 / 0 |
+| SMTP with CI's `SPAM_RULES_URL` (`smtp-14`) | 74 / 2 / 3: `dkim2_dsn_is_signed` and `queue_retry`, documented flakes, each passed rerun by name (`smtp-flake-10`, `-11`) |
+| Workspace units, CI's step (`units-11`) | 571 / 0 / 2 |
+| Vault and groupware (`vaultgw-6`) | 225 / 0 / 0 (the units step had rewritten the dav-proto request fixtures, restored with `git checkout`) |
+| Listings (`capture-z3`) | 28 listings and 28 ignored-only listings, every command exit 0 |
+| The net (`coverage-z3`) | every step passed at attempt 1, except `smtp` (`dkim2_dsn_is_signed`, passed rerun by name) and `automation-tests` (both attempts fail: no Docker here; it passes in CI, below) |
+| Inventory gate | **OK**: 795 tests, 29 configurations, 272 call-steps, 3,833 helper-steps, 24 tail-steps, 14 loop-steps; excused 20 `internals_replaced_equivalent`, 2 `internals_replaced_no_equivalent`, 202 `sel_only`, 22 `subject_deleted`; 2,356 executed functions from the 19 exports |
+| Coverage gate | **OK**. Full 21,596 / 22,331 (96.71%) against 17,821 / 18,490, 72 lines over the 21,524 needed (`21596 * 18490 = 399310040 >= 17821 * 22331 = 397960751`). Runtime-only 12,534 / 13,193 (95.00%) against 10,646 / 11,246, 44 lines over the 12,490 needed (`12534 * 11246 = 140957364 >= 10646 * 13193 = 140452678`). The same five cohort files as at `a2b78bbb0` are below their baseline fraction (`calendar/fanout.rs` now 1,542 / 1,615); the gate has no per-file floor (ruling 179, D6) |
+| Gate self-tests and workflow check | `test_gates.py` 42 run, 2 skipped, pass; `ci_steps.py` 0 differences; both now also run in CI's Check Style job (ruling 186) |
+| CI | run [41413846293](https://github.com/jaylaney/stalwart/actions/runs/41413846293), a dispatch of `test.yml` at `f135a9881`: **success, every job green**, the C10 Gates job included (inventory OK; coverage 21,596 / 22,331 and 12,534 / 13,193, the local figures exactly; its net reran `queue_retry` by name); Check Style ran the new "Check Gates" step |
+
+Part Z3's product code added 39 lines to the cohort in each count (22,292 to 22,331 full,
+13,154 to 13,193 runtime-only), 36 of them covered in each, so each margin fell by 2 and 1
+against `a2b78bbb0`'s 74 and 45.
+
+#### The record at `a2b78bbb0` (part Z2)
 
 Logs: `task-7c/logs/` (the uninstrumented rows), `final-fix-z2/logs/` (the compile checks and
 the driver), `task-7d/capture-z2/` (the listings), `task-7d/coverage-z2/` (the net) and
@@ -9507,6 +9542,123 @@ at `a2b78bbb0`, job by job. No step used its rerun, except as noted.
   the committed scripts' commands; the committed scripts (now reading `ci_steps.py`) ran in CI
   in every gates job above.
 
+### Fix part Z3
+
+A scoped re-review of parts Z1 and Z2 (Jay's multi-Fable authorization) found 16 findings
+addressed, 2 partly addressed (rulings 175 and 177) and 8 new minors, none critical or
+important. Rulings 185 to 189 settle them. Part Z3 applies them on `f9aa47bc1`, then reruns
+the local matrix, the net and both gates, and CI, at one SHA. No stored layout changed.
+Scratch work, drivers and logs are in the plan workspace under `final-fix-z3/`.
+
+Commits:
+- `652b6b17a`: rulings 185, 187, 188 and 189 (product code);
+- `5f9e1cc98`: ruling 186 (the workflow check in CI and in the gate tools);
+- `f135a9881`: the cases, the final SHA;
+- this note.
+
+#### The fixes
+
+- **Ruling 185: a key account refuses version-0 grant tokens** (`common/src/auth/vault.rs`,
+  `za_refuse_unversioned_token`, one call each in `authenticate_oauth_token` and
+  `validate_access_token`). A key account's credential version is its vault revision, at
+  least 1. A grant-bound token (access or refresh) of version 0 was therefore minted while the
+  account had no credential, and upstream's version check exempts 0. Such a token is now
+  refused with `TokenExpired`. This closes the window ruling 175 left: a grant minted between
+  the marker write's revocation query and its invalidation survived on every node. The
+  account is read with `account()`, which fails closed. Only version-0 tokens look it up.
+  Tokens bound to no grant (live tokens, RSVP links) carry 0 by design and are not checked.
+- **Ruling 186: the workflow check runs in CI.** `test.yml`'s Check Style job adds a "Check
+  Gates" step. It runs `python3 -I scripts/tests/ci_steps.py` (`check_workflow`) and
+  `python3 -I scripts/tests/test_gates.py`, with stdlib only and no cargo, on every trigger.
+  `capture_listings.py` and `coverage_net.py` refuse to run (exit 1) while `check_workflow`
+  reports a difference (`ci_steps.refuse_diverged_workflow`).
+  - Disposable edit: the ZA step's filter narrowed to `za::za_tests::setup`. `ci_steps.py`
+    reported the one difference and exited 1. Both tools refused before any cargo command.
+    `test_gates.py` failed 2 tests.
+  - Restored: 0 differences, 42 tests OK, 2 skipped.
+  - Logs: `final-fix-z3/logs/d186-edited.log` and `d186-restored.log`.
+- **Ruling 187 (N3): upstream's rolling window, less pending items** (`fanout.rs`,
+  `write_item_inner`; `storage.rs`, `za_oldest_drained_notification`). At the recipient's
+  `maxEventNotifications`, the fan-out deletes the oldest notification without the pending
+  bit, in the item's batch, asserting the row it read. This is upstream's eviction,
+  `NotificationQuota::reserve`. When every stored notification is pending (the backlog cap),
+  it answers `5.1` and evicts nothing.
+- **Ruling 188 (N4): an item the drain gave up on can be deleted**
+  (`dav/src/calendar/scheduling.rs`, `dav/src/common/za.rs` `za_drain_gave_up`). The owner's
+  inbox DELETE of a pending item is honoured while it is in the session's drain `skipped` set
+  (after `DRAIN_ITEM_FAILURE_LIMIT` failures in the session). Its GET stays 404, and so does
+  a DELETE of a pending item the drain has not given up on. Cost: a stuck item takes up to
+  three drain passes before it can be deleted. Every vault write (an app password, a TOTP
+  enrolment) starts the account's sessions afresh, and their skipped sets with them (ruling
+  179's A4).
+- **Ruling 189:**
+  - **N5.** Ruling 70's container assertion (`DeadWrite::za_fence`, from `za_dead_fence` in
+    `dead/patch.rs`) is gone from the calendar PROPPATCH and MKCOL. Their ordinary batches
+    carry the per-chunk fence of rulings 173 and 181, so each chunk asserts once.
+    `za_dead_fence` stays for the container copies of `dead/containers.rs`.
+  - **N6.** An ordinary account's DAV inbox DELETE is fenced (ruling 181's class), as JMAP's
+    `CalendarEventNotification/set` is.
+  - **N8.** `itip_auto_expunge` traces `AutoExpunge` after the archives callback, with the
+    count it expunged, and none when every row was pending.
+  - **N7.** The count race (two fan-outs that both read `limit - 1`) is accepted: it is
+    bounded and minor, and upstream's `NotificationQuota` has the same cross-request race.
+
+#### The cases
+
+- `za::setup::test_grants_die_with_the_marker` (ruling 185). After setup, a fresh grant of
+  `keymail35`:
+  - its access and refresh tokens at the account's version work (the control);
+  - the same grant's version-0 access token answers 401;
+  - its version-0 refresh token does not validate.
+- `za::fanout::test_failures` step 7e (ruling 187), rewritten:
+  - with only pending items stored (a planted one, older than the rest), key2 at its count
+    gets `5.1` and no item, and nothing is evicted;
+  - with two drained items planted too, a new invitation is delivered (`1.2`), the oldest
+    drained item is evicted, and the older pending item and the newer drained item stay.
+- `za::drain_limits::test` step 7 (ruling 188). A pending item fails the password session's
+  drain three times and is skipped. Then:
+  - an app-password session's DELETE answers 404 and the item stays;
+  - the password session's GET answers 404;
+  - the password session's DELETE answers 204, and the item is gone.
+
+  The app password is created before the failures, because creating it later would start
+  the password session afresh.
+- `za::mail::fence::calendar_writes_lose_to_provisioning` (ruling 189): the DAV inbox DELETE
+  of a planted item answers 503 and logs no notification change while the vault record is
+  planted, and 204 once it is cleared.
+- `za::inbox::test_expiry` (ruling 189): key1's `AutoExpunge` event reports a total of 1 (the
+  drained item), not 2.
+
+#### The mutation rows
+
+Rows `z022` to `z026` of `task-7d/mutations.tsv`, by the `ZA_MUT` switch
+(`final-fix-z3/muts3.py`, with the uncommitted `ZA_ONLY` selector). The control (the
+selected modules, `ZA_MUT` unset) passed in 65 s.
+
+| Row | Mutation | Outcome |
+|---|---|---|
+| z022 | a key account's version-0 grant tokens accepted | caught: `setup`, the version-0 access token answers 200 |
+| z023 | no eviction at the limit (B-M3 as it was) | caught: `test_failures` 7e, the rolling window answers 5.1 |
+| z024 | the oldest notification evicted even when pending | caught: `test_failures` 7e, the backlog cap evicts the pending item |
+| z025 | a skipped item's DELETE answers 404 | caught: `drain_limits` step 7 |
+| z026 | the ordinary inbox DELETE unfenced | caught: `mail::fence`, 204 |
+
+#### Runs
+
+The local matrix, the net and both gates ran at `f135a9881`; "### Task 7 results" above
+holds them as the final record. CI ran once, a dispatch of `test.yml` at `f135a9881`, run
+[41413846293](https://github.com/jaylaney/stalwart/actions/runs/41413846293): **success**,
+job by job:
+- Check Style: success, with the new "Check Gates" step (ruling 186);
+- Unit Tests: success;
+- Test: success (the directory suite whole, SMTP, IMAP, JMAP; no hang);
+- Upstream Suites: success (automation included);
+- Zero-access Test: success;
+- Independent CalDAV Client: success;
+- Fresh OSS Store Restart: success;
+- C10 Gates: success, in 1 h 45 min (the net reran `queue_retry` by name; inventory OK;
+  coverage 21,596 / 22,331 and 12,534 / 13,193).
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
@@ -9946,6 +10098,11 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `automation::dns::test`, `EXPECTED_ZONE` (upstream, part Z2, ruling 177) | The `_validation-persist.example.org.` TXT line is removed from the expected zone. | `common/src/network/dns/records.rs`: 1.0 publishes `_validation-persist` records only for a DNS-PERSIST-01 provider whose directory advertises `accountHashPrefix` and `issuerDomainNames` (`PersistRecordBuilder::new`); 0.16 published one for every ACME-managed domain. The test's provider uses TLS-ALPN-01. |
 | `tests/src/utils/containers.rs`, `ensure_pebble` (harness, part Z2, ruling 177) | After the mapped port opens, the harness waits for Pebble's directory (`wait_for_pebble`: `https://localhost:14000/dir` answering with success, a User-Agent sent, at most 180 s); on a timeout it reports the answers for `localhost` and `127.0.0.1` and `docker ps`, `docker port` and `docker logs` of the container. | None in 1.0: a timing artefact. The mapped port accepts connections before Pebble listens behind it (about a second), and on a hosted runner the server's first ACME request came 50 ms after the port opened. Pebble answers a request without a User-Agent with 400 (RFC 8555 section 6.1). |
 | `imap::search::test`, `UID SORT RETURN (COUNT ALL) (DATE SUBJECT)` (upstream, part Z2, ruling 177) | The expected `ALL` set is built from the INTERNALDATEs of UIDs 2, 3, 7, 8 and 9 (a `UID FETCH ... (INTERNALDATE)`): `6,4:5,1,10`, then those five by INTERNALDATE and, within one second, by base subject (9, 3, 7, 8, 2). When all five land in one second it is the former expectation `6,4:5,1,10,9,3,7:8,2`. The MySQL branch is unchanged. | `email/src/message/sortkeys.rs` (`cache_comparator`, `SentAt`) and `messagedata.rs` (`sent_at_offset`): 1.0 dates a message whose Date header is missing or does not parse by its INTERNALDATE (`received_at` plus a zero offset; RFC 5256 section 2.2). 0.16 indexed no `SentAt` for such a message (`email/src/message/index/search.rs:154-164` at `9601038de`), so they sorted as one undated group by SUBJECT whatever the clock did. The five fixture messages have no usable Date, so 1.0's order depends on the second each APPEND landed in. |
+| `za::setup::test_grants_die_with_the_marker` (fork, part Z3, ruling 185) | Adds a fresh grant of the key account after setup: its tokens at the account's version work (control), its version-0 access token answers 401 and its version-0 refresh token does not validate. | 1.0's grant-bound tokens and `assert_credential_version`'s exemption of version 0. |
+| `za::fanout::test_failures` step 7e (fork, part Z3, ruling 187) | Rewritten. Ruling 176's case (5.1 at the count, nothing evicted) now holds only when every stored item is pending; with drained items planted, the oldest drained one is evicted and the invitation is delivered (`1.2`), an older pending one and a newer drained one kept. The step deletes what it planted. | 1.0's `NotificationQuota::reserve` evicts the oldest notification at `maxEventNotifications`. |
+| `za::drain_limits::test` step 7 (fork, part Z3, ruling 188) | New: a pending item skipped by the password session's drain is deleted by that session (204, GET 404); another session's DELETE answers 404. | None in 1.0: the re-review's N4. |
+| `za::mail::fence::calendar_writes_lose_to_provisioning` (fork, part Z3, ruling 189) | Adds the DAV inbox DELETE of a planted item: 503 and no notification change while the vault record is planted, 204 once cleared. | None in 1.0: the re-review's N6. |
+| `za::inbox::test_expiry` (fork, part Z3, ruling 189) | Adds key1's `AutoExpunge` total, 1 (the drained item). | None in 1.0: the re-review's N8. |
 
 ## Task 1 check
 
