@@ -25,8 +25,11 @@ use crate::{
         },
         privacy::ICalendarPrivacy,
         schedule::{AlarmTasks, EventAlarmScheduler, EventAlarmUsers, EventAlarms},
-        seal::{ZaEvent, ZaKeyDomain, seal_error, unseal_event_in_domain},
-        sharing::resolve::za_owned_calendar_context,
+        seal::{
+            SealError, ZaEvent, ZaKeyDomain, archived_event_is_sealed, seal_error,
+            unseal_event_in_domain,
+        },
+        sharing::resolve::{ZaCalendarError, za_owned_calendar_context},
     },
     scheduling::{ItipMessages, event_cancel::itip_cancel, recipient::RecipientPolicy},
 };
@@ -132,6 +135,11 @@ impl ItipAutoExpunge for Server {
                 let event = event_
                     .to_unarchived::<CalendarEventNotification>()
                     .caused_by(trc::location!())?;
+                // Upgrade ruling 174: a sealed item the drain has not opened
+                // waits for it (invitations spec 6.6), however old.
+                if crate::calendar::seal::archived_item_is_pending(event.inner) {
+                    return Ok(true);
+                }
                 DestroyArchive(event)
                     .delete(changed_by, account_id, document_id, &mut batch)
                     .caused_by(trc::location!())?;
@@ -488,6 +496,12 @@ impl DestroyArchive<Archive<&ArchivedCalendar>> {
         // Process deletions
         let calendar_id = document_id;
         let context = match za_keys {
+            // Upgrade ruling 176 (B-M1): the calendar is `account_id`'s, so
+            // keys of another account (a grantee's) are refused, never used
+            // to resolve a context in their own account.
+            Some(keys) if keys.account_id != account_id => {
+                return Err(ZaCalendarError::Forbidden.into_store_error(account_id, calendar_id));
+            }
             Some(keys) => Some(
                 za_owned_calendar_context(server, keys, calendar_id)
                     .await
@@ -1036,6 +1050,16 @@ impl DestroyArchive<Archive<&ArchivedCalendarEvent>> {
             .with_document(document_id);
 
         if send_itip && let Some(content) = content {
+            // Upgrade ruling 176 (B-M2): a sealed event's CANCEL is built in
+            // its key domain only; without it the delete fails rather than
+            // reach upstream's queueing.
+            if domain.is_none() && archived_event_is_sealed(content.inner) {
+                return Err(seal_error(
+                    SealError::Structure("sealed event without its key domain"),
+                    account_id,
+                    document_id,
+                ));
+            }
             let content = content
                 .deserialize::<CalendarEventContent>()
                 .caused_by(trc::location!())?;

@@ -63,6 +63,7 @@
 
 use crate::{
     SizeWriter,
+    cache::GroupwareCache,
     calendar::{
         ChangedBy,
         delegation::{ZaDelegationResolution, ZaResolvedAccount},
@@ -99,7 +100,7 @@ use common::{
     },
     za::lease::ZaUidLease,
 };
-use registry::schema::enums::Permission;
+use registry::schema::enums::{Permission, StorageQuota};
 use store::{
     rand,
     write::{BatchBuilder, now},
@@ -1499,17 +1500,19 @@ async fn write_item_inner(
         .account(recipient_id)
         .await
         .caused_by(trc::location!())?;
-    // Only a quota limit is "over quota"; any other error reaches the
-    // `write_item` trace (as upstream's `copy_message` matches it).
-    match server
-        .has_available_quota(account.as_ref(), size as u64)
-        .await
+    // Upgrade ruling 176 (B-M3): upstream's notification count limit, as a
+    // count only. Upstream's iMIP path evicts the oldest notification at the
+    // limit (`NotificationQuota::reserve`), which here could be a pending
+    // item the drain has not opened, so the item is refused instead.
+    if let Some(limit) =
+        server.object_quota_limit(&account, StorageQuota::MaxCalendarEventNotifications)
+        && server
+            .count_documents(recipient_id, Collection::CalendarEventNotification, limit)
+            .await
+            .caused_by(trc::location!())?
+            >= limit
     {
-        Ok(_) => {}
-        Err(err) if err.matches(trc::EventType::Limit(trc::LimitEvent::Quota)) => {
-            return Ok(false);
-        }
-        Err(err) => return Err(err.caused_by(trc::location!())),
+        return Ok(false);
     }
     // Upgrade ruling 94: the shape upstream queues (its text round-trip),
     // without the split's unreferenced placeholder components.
@@ -1522,6 +1525,19 @@ async fn write_item_inner(
     // Steps 1-3 (plan 8): the tree sealed to the recipient's public key.
     seal_pending_item(&mut tree, recipient_id, public_key, pair, reply_token)
         .map_err(|err| seal_error(err, recipient_id, u32::MAX))?;
+    // Only a quota limit is "over quota"; any other error reaches the
+    // `write_item` trace (as upstream's `copy_message` matches it). Upgrade
+    // ruling 176 (B-M7): measured on the sealed item, the size stored.
+    match server
+        .has_available_quota(account.as_ref(), SizeWriter::ical(&tree) as u64)
+        .await
+    {
+        Ok(_) => {}
+        Err(err) if err.matches(trc::EventType::Limit(trc::LimitEvent::Quota)) => {
+            return Ok(false);
+        }
+        Err(err) => return Err(err.caused_by(trc::location!())),
+    }
     // Step 4: the item, its own batch in the recipient's account. At 1.0 its
     // record is built without plaintext (`sealed_item_record`, upgrade
     // ruling 13) and its id is reserved in the batch itself.

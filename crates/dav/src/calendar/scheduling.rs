@@ -250,6 +250,19 @@ impl CalendarEventNotificationHandler for Server {
             .await
             .caused_by(trc::location!())?
             .ok_or(DavError::Code(StatusCode::NOT_FOUND))?;
+        // Upgrade ruling 176 (B-M4): a pending item is not there for a
+        // client until drained, so its DELETE answers 404 as its GET does.
+        if za_item_hidden(
+            self,
+            access_token,
+            account_id,
+            Collection::CalendarEventNotification,
+            &event_,
+        )
+        .await?
+        {
+            return Err(DavError::Code(StatusCode::NOT_FOUND));
+        }
         let event = event_
             .to_unarchived::<CalendarEventNotification>()
             .caused_by(trc::location!())?;
