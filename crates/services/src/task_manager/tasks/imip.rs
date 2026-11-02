@@ -212,10 +212,6 @@ pub(crate) struct ImipContext {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SenderLookup {
     Traced,
-    #[expect(
-        dead_code,
-        reason = "constructed by the fork's submitter, services::za_imip (iMIP spec 5.3)"
-    )]
     Quiet,
 }
 

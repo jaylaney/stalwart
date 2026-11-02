@@ -995,6 +995,15 @@ pub async fn queued_recipients(test: &TestServer) -> Vec<String> {
 /// them panics, after ten seconds, naming what is still queued.
 pub async fn wait_for_delivery(test: &TestServer) {
     test.wait_for_tasks().await;
+    wait_for_queue(test).await;
+    // Ingest can queue index tasks of its own.
+    test.wait_for_tasks().await;
+}
+
+/// Waits until the SMTP queue is empty, without waiting for tasks: the
+/// iMIP modules read outbound mail at the sink once its delivery is done.
+/// Panics after ten seconds, naming what is still queued.
+pub async fn wait_for_queue(test: &TestServer) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let queued = queued_recipients(test).await;
@@ -1007,8 +1016,6 @@ pub async fn wait_for_delivery(test: &TestServer) {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    // Ingest can queue index tasks of its own.
-    test.wait_for_tasks().await;
 }
 
 /// A scheduling inbox item as tests read it at 1.0: the notification row's

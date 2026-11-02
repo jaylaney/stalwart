@@ -12,8 +12,127 @@
 //! sender lookup, RSVP links off and the session's redaction flag on, so the
 //! email is upstream's minus the RSVP block (D11, D12).
 
+use crate::task_manager::tasks::imip::{ImipSubmitOptions, SenderLookup, imip_context};
+use common::{
+    Server,
+    config::server::{DEFAULT_TLS_TIMEOUT, ServerProtocol},
+    network::{ServerInstance, TcpAcceptor, limiter::ConcurrencyLimiter},
+    za::imip::{ZA_IMIP_FAILED, ZaImipMail, ZaImipOutcome, za_register_imip_submitter},
+};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, OnceLock},
+};
+use tokio::sync::watch;
+use utils::snowflake::SnowflakeIdGenerator;
+
+/// Registers `submit` as the process's iMIP submitter (spec 5.3); called
+/// from `spawn_services`, which the binary and the test harness run.
+pub fn register() {
+    za_register_imip_submitter(submit);
+}
+
+fn submit(server: Server, mail: ZaImipMail) -> Pin<Box<dyn Future<Output = ZaImipOutcome> + Send>> {
+    Box::pin(async move { submit_one(&server, mail).await })
+}
+
+/// The dummy server instance of the local SMTP sessions, built as the task
+/// manager builds its own (`task_manager::manager::spawn_task_manager`);
+/// its `span_id_gen` gives each submission a session id of its own.
+fn instance() -> Arc<ServerInstance> {
+    static INSTANCE: OnceLock<Arc<ServerInstance>> = OnceLock::new();
+    INSTANCE
+        .get_or_init(|| {
+            Arc::new(ServerInstance {
+                id: "_local".to_string(),
+                protocol: ServerProtocol::Smtp,
+                acceptor: TcpAcceptor::Plain,
+                limiter: ConcurrencyLimiter::new(100),
+                tls_timeout: DEFAULT_TLS_TIMEOUT,
+                shutdown_rx: watch::channel(false).1,
+                proxy_networks: vec![],
+                span_id_gen: Arc::new(SnowflakeIdGenerator::new()),
+            })
+        })
+        .clone()
+}
+
+/// Upstream's composer for one (message, recipient): the setup with the
+/// sender's domain (as `send_imip` derives it), the per-message step with
+/// the quiet sender lookup (D17), and the per-recipient submission with RSVP
+/// links off and the session's redaction flag on (D12). The SMTP response
+/// text is not kept: only its stage and reply code.
+async fn submit_one(server: &Server, mail: ZaImipMail) -> ZaImipOutcome {
+    let ZaImipMail {
+        account_id,
+        document_id,
+        contents,
+    } = mail;
+    let mut recipients = contents.to.iter();
+    let (Some(recipient), None) = (recipients.next(), recipients.next()) else {
+        return failed(trc::StoreEvent::UnexpectedError.into_err(), account_id);
+    };
+    let sender_domain = contents.from.rsplit('@').next().unwrap_or("localhost");
+
+    let context = match imip_context(server, account_id, document_id, sender_domain).await {
+        Ok(context) => context,
+        Err(err) => return failed(err, account_id),
+    };
+    let Some(mut composer) = context
+        .composer(server, &contents, SenderLookup::Quiet)
+        .await
+    else {
+        return failed(trc::StoreEvent::UnexpectedError.into_err(), account_id);
+    };
+    let instance = instance();
+    let session_id = instance.span_id_gen.generate();
+    match composer
+        .submit(
+            server,
+            &context,
+            instance,
+            recipient.as_str(),
+            ImipSubmitOptions {
+                rsvp: false,
+                za_redact: true,
+                session_id,
+            },
+        )
+        .await
+    {
+        Ok(Ok(queue_id)) => ZaImipOutcome::Queued(queue_id),
+        Ok(Err(rejection)) => ZaImipOutcome::Refused {
+            stage: rejection.stage,
+            code: reply_code(&rejection.response),
+        },
+        Err(err) => failed(err, account_id),
+    }
+}
+
+/// A context, composer or submission error: traced with the account id and
+/// the fixed details, never the message or an address.
+fn failed(err: trc::Error, account_id: u32) -> ZaImipOutcome {
+    trc::error!(
+        err.account_id(account_id)
+            .caused_by(trc::location!())
+            .details(ZA_IMIP_FAILED)
+    );
+    ZaImipOutcome::Failed
+}
+
+/// The reply code of an SMTP response: its leading three digits, else 0.
+pub(crate) fn reply_code(response: &str) -> u16 {
+    response
+        .get(..3)
+        .filter(|code| code.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::reply_code;
     use crate::task_manager::tasks::imip::{ItipTemplate, RenderedBody, compose_imip_message};
     use calcard::icalendar::ICalendarProperty;
     use common::DEFAULT_LOGO_BASE64;
@@ -271,5 +390,12 @@ mod tests {
             .calendar_reply_as
             .replace("$name", "imip-att@remote.test");
         assert!(!rendered.html.contains(&reply_as) && !rendered.html.contains("?i="));
+    }
+
+    #[test]
+    fn reply_codes_are_read_from_the_response() {
+        assert_eq!(reply_code("550 5.1.2 Mailbox does not exist."), 550);
+        assert_eq!(reply_code("451 4.3.0 try later"), 451);
+        assert_eq!((reply_code(""), reply_code("abc")), (0, 0));
     }
 }

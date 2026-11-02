@@ -27,6 +27,9 @@
 //! - `COMMIT_FAIL_ONCE`: the commit of a key account's PUT create fails once
 //!   with an internal error after its fan-out, keyed by the account
 //!   (`dav::calendar::za_commit_create`).
+//! - `IMIP_SUBMIT_FAIL_ONCE`: the account's next iMIP submission answers
+//!   `Failed` without reaching the submitter, keyed by the event's account
+//!   (`common::za::imip::za_imip_submit`, iMIP spec 5.3).
 //! - `TASK_CONSUMER_PAUSE`: the task manager's consumer loop takes no task
 //!   while it is held; global (`services::task_manager::manager`).
 //! - The lease-duration override: stands in for `ZA_UID_LEASE_SECS`, which
@@ -147,6 +150,9 @@ pub static TASK_CONSUMER_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 /// The account whose next key-account PUT create fails its commit.
 pub static COMMIT_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
 
+/// The account whose next iMIP submission fails.
+pub static IMIP_SUBMIT_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+
 pub static DRAIN_LOOKUP_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
 pub static DRAIN_LEASE_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
@@ -228,6 +234,12 @@ pub fn set_task_consumer_pause(pause: Option<Arc<Pause>>) {
 
 pub fn set_commit_fail_once(account_id: Option<u32>) {
     *COMMIT_FAIL_ONCE.lock().unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+pub fn set_imip_submit_fail_once(account_id: Option<u32>) {
+    *IMIP_SUBMIT_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = account_id;
 }
 
 pub fn set_lease_secs_override(secs: Option<u64>) {
@@ -467,6 +479,11 @@ pub fn take_drain_fail(account_id: u32) -> bool {
 /// Whether the commit of `account_id` must fail now; clears the flag.
 pub fn take_commit_fail(account_id: u32) -> bool {
     take_flag(&COMMIT_FAIL_ONCE, account_id)
+}
+
+/// Whether the iMIP submission of `account_id` must fail now; clears the flag.
+pub fn take_imip_submit_fail(account_id: u32) -> bool {
+    take_flag(&IMIP_SUBMIT_FAIL_ONCE, account_id)
 }
 
 /// Whether the account's next private-key unwrap must fail; clears the flag.

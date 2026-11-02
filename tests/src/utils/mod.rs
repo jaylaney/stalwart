@@ -19,6 +19,7 @@ pub mod registry;
 pub mod server;
 pub mod sieve;
 pub mod smtp;
+pub mod smtp_sink;
 pub mod storage;
 pub mod temp_dir;
 pub mod webdav;
