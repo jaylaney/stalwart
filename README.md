@@ -82,8 +82,8 @@ On macOS with Homebrew's keg-only rustup, first run:
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
 ```
 
-RocksDB needs the Xcode command line tools on macOS. The workspace holds two packages named
-`http` (the server's and the crates.io crate it depends on through `telemetry`), so select
+RocksDB needs the Xcode command line tools on macOS. The dependency graph holds two packages named
+`http` (the server's and the crates.io crate that hyper, reqwest and others use), so select
 the server's as `-p http@1.0.1`.
 
 The product build excludes enterprise features. Do not deploy builds with the `test_mode`

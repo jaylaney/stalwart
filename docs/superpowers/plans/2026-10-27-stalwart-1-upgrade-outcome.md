@@ -9675,7 +9675,10 @@ The code-side items of Task 9: the fork's release metadata, the provenance verif
 in the plan workspace under `task-9a/`.
 
 Commits:
-- `6d0574a14`: the release metadata and the verifier's upstream checks (D7);
+- `6d0574a14`: the release metadata and the verifier's upstream checks (D7). Bisect note
+  (ruling 193): this commit alone fails `scripts/tests/test_release_metadata.py`, because the
+  test's `VERSION` constant (`0.2.0-beta.1`) landed in the next commit, `5ea053c85`; the pair
+  is consistent from `5ea053c85` on, and history is not rewritten;
 - `5ea053c85`: the build script watches only Git metadata that exists; CI's pack-refs steps go;
 - `a691be768`: ruling 184 (`wait_for_http` timeouts, Keycloak pinned, the net's step logs kept);
 - `a4f759aed`: ruling 191's N14;
@@ -9793,6 +9796,19 @@ manual checklist marked pending for this candidate, NR1's wording (ruling 160) w
 139's limits in key-pinning spec 5.1, final review D8's record on the test-hook table, this
 note's final record and the handover. No code changed. Run on 2026-11-02.
 
+The Task 9 review's I1 and M1-M9 were then fixed (ruling 195). M1 is the one code change:
+`verify_product.py`'s `verify_upstream_version` refuses an `upstream_tag` whose version
+differs from the internal crates' package version (`crates/common/Cargo.toml`), so a pin left
+unchanged after a merge is refused even when neither `PINNED_UPSTREAM_TAGS` nor a local tag
+knows the later release. Four new unit tests (the match passes; a 0.16.27 pin on a 1.0.1
+base, and a missing crate version, are refused; the real tree passes):
+`python3 -B scripts/tests/test_release_metadata.py` 9 tests OK, and
+`python3 -B -m unittest discover -s scripts/release -p 'test_*.py' -v` 25 tests OK. The rest
+are documentation: the CalDAV client's exception records (I1), the `-p http` ambiguity's
+cause (M2), three stale details in `CLAUDE.md` (M3, M4, M8), the expectation-ledger count
+(M5), ruling 193's bisect note (M6), the `PrincipalField` file (M7) and a workflow comment's
+unit-test count (M9; `ci_steps.py` still reports 0 differences).
+
 ### Final record
 
 The upgrade's qualification record, item by item. Each item points to the section that holds
@@ -9830,7 +9846,9 @@ removes" and "### Restored unit test modules" (132 modules dispositioned: 110 re
 fork-owned files, 7 fork modules kept inline, 22 SEL-only `scim` and `scim-proto` ones not
 restored).
 
-**The expectation ledger.** "## Expectation ledger": 282 rows, one per changed assertion,
+**The expectation ledger.** "## Expectation ledger": 288 data rows (every table line after
+the header and its separator; 282 of them name a single test, the other 6 a suite or a group
+of callers), one per changed assertion,
 early return, `cfg` skip or new `#[ignore]` in a ported test, each with the 1.0 change behind
 it. Part 7d1's ported-file diff found no addition without a row.
 

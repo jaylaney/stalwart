@@ -59,7 +59,8 @@ must stay a prerelease and claims no general client or production readiness.
   commit, and the source commit, for example `Stalwart Server fork v0.2.0-beta.1 (upstream
   v1.0.1 23b69755cb3cd8ecd952fe0443c5ac067a506184; source <commit>; clean)`. The release
   verifier also checks that the upstream pin names its tag's commit, is an ancestor of the
-  source, and is the latest known upstream release in the source's history.
+  source, is the latest known upstream release in the source's history, and matches the
+  internal crates' upstream version.
 
 ### Compatibility and upgrade instructions
 

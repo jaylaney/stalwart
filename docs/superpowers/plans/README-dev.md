@@ -6,7 +6,7 @@ provenance, and the release checklist. Record fork release changes in the
 
 - Base: upstream Stalwart `v1.0.1` (commit `23b69755cb3cd8ecd952fe0443c5ac067a506184`). The fork's own version, now `0.2.0-beta.1`, is independent of it: `fork-release.toml` records both, the shipping `stalwart` package carries the fork version, and the internal crates keep upstream's `1.0.1` (the fork-owned `vault` crate keeps `0.16.25`). `stalwart --version` prints the fork version, the upstream tag and commit, and the source commit.
 - Fresh stores only. A 1.0-based build cannot open a store written by upstream 0.16 or by the fork's 0.16-based releases (`0.1.x`), and there is no conversion: the server stamps a new store with its schema version and edition and refuses any other. Old stores are unsupported; move an installation by provisioning a fresh store (new setup tokens, new enrolment), keeping the old store and binary for rollback. The local-server scripts default to `.run-1.0/` for this reason.
-- Package names: `-p http` is ambiguous (1.0's `telemetry` crate depends on the crates.io `http` crate); select the fork's with `-p http@1.0.1`. `cargo fmt` rejects that form, so format it with `cargo fmt --manifest-path crates/http/Cargo.toml`.
+- Package names: `-p http` is ambiguous (the dependency graph also holds the crates.io `http` crate, through hyper, reqwest, axum and others); select the fork's with `-p http@1.0.1`. `cargo fmt` rejects that form, so format it with `cargo fmt --manifest-path crates/http/Cargo.toml`.
 - Toolchain: stable Rust via rustup. Xcode command line tools for RocksDB.
 - On this machine rustup is installed via Homebrew (keg-only): `export PATH="/opt/homebrew/opt/rustup/bin:$PATH"` before using cargo. The curl installer in the plan is not needed.
 - Build (tests): `STORE=RocksDb RUST_MIN_STACK=16777216 cargo build -p tests`
@@ -61,8 +61,9 @@ Then, in the same branch:
 
 - Add the tag and its full commit to `PINNED_UPSTREAM_TAGS` in
   `scripts/release/verify_product.py`. The verifier refuses a `fork-release.toml` whose
-  upstream pin names another commit than its tag, is not an ancestor of the source, or is
-  older than a known release in the source's history; a release checkout fetches no upstream
+  upstream pin names another commit than its tag, is not an ancestor of the source, is
+  older than a known release in the source's history, or names another version than the
+  internal crates' (`crates/common/Cargo.toml`); a release checkout fetches no upstream
   tags, so it reads the table. Update `fork-release.toml`'s `upstream_tag` and
   `upstream_commit` when the fork release that ships the merge is prepared, and run
   `python3 -B scripts/tests/test_release_metadata.py` and
@@ -102,10 +103,10 @@ migration effects explicitly; ciphertext rides in existing fields and moves with
   login, so lazy re-sealing is possible. At 1.0 dead properties no longer ride in the
   `X-ZA-EXTRA` bundle: they are object-metadata containers (`seal::container`), so a change
   to `types::metadata` needs the same check.
-- Numeric collisions: `PrincipalField::ZeroAccessVault = 150` and `ZeroAccessPins = 151`
-  (`crates/types/src/field.rs`) and `ACCOUNT_IS_KEY_ACCOUNT = 1 << 9`
-  (`crates/common/src/auth/mod.rs`) sit in gaps upstream has not used; confirm the merge did
-  not take any of them. `VanishedCollection::CalendarIdentity = 250`
+- Numeric collisions: three values sit in gaps upstream has not used; confirm the merge did
+  not take any of them. `PrincipalField::ZeroAccessVault = 150` and
+  `PrincipalField::ZeroAccessPins = 151` are in `crates/types/src/field.rs`;
+  `ACCOUNT_IS_KEY_ACCOUNT = 1 << 9` is in `crates/common/src/auth/mod.rs`. `VanishedCollection::CalendarIdentity = 250`
   (`crates/types/src/collection.rs`) separately reserves a log-collection byte; preserve
   existing 251–254 and check this reservation at the same merge gate.
 - Visibility policy: upstream code that derives data (time ranges, alarms, the UID index,

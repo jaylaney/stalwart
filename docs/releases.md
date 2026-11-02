@@ -112,7 +112,9 @@ gates pass; the [fork changelog](../CHANGELOG-fork.md) records its automated res
 `scripts/release/verify_product.py` checks the upstream pin as well as the binary: the pinned
 tag must name `upstream_commit` (from a local tag, or from `PINNED_UPSTREAM_TAGS` when the
 checkout has none), that commit must be an ancestor of the source (a shallow clone is
-refused), and no later known upstream release may be in the source's history. Each upstream
+refused), no later known upstream release may be in the source's history, and the tag's
+version must equal the internal crates' package version (`crates/common/Cargo.toml`), so a
+pin left unchanged after a merge is refused even when no later tag is known. Each upstream
 merge adds its tag to `PINNED_UPSTREAM_TAGS`; `product-build.yml` checks out the full history
 (`fetch-depth: 0`) for the ancestry checks.
 
