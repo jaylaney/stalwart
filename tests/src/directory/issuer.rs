@@ -8,6 +8,7 @@ use crate::utils::{containers, server::TestServerBuilder};
 use base64::{Engine, engine::general_purpose};
 use registry::{
     schema::{
+        enums::OidcUnscopedTokenPolicy,
         prelude::{ObjectType, Property},
         structs::{Action, Directory, OidcDirectory},
     },
@@ -41,6 +42,14 @@ pub async fn test() {
             claim_name: Some("name".to_string()),
             claim_groups: Some("groups".to_string()),
             accepted_audiences: Map::new(vec!["stalwart".to_string()]),
+            // 1.0 refuses a token that carries none of the
+            // urn:ietf:params:oauth:scope:{mail,contacts,calendars,files}
+            // scopes unless the directory says otherwise (`unscopedTokens`
+            // defaults to `reject`). This test's token asks for `openid`
+            // only, and the test realm defines none of those scopes, so the
+            // directory accepts unscoped tokens with the interoperable
+            // scopes; the subject here is the issuer routing.
+            unscoped_tokens: OidcUnscopedTokenPolicy::Interoperable,
             ..Default::default()
         }))
         .await;

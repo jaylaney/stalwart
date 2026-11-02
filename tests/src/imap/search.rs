@@ -194,15 +194,74 @@ pub async fn test(imap: &mut ImapConnection, imap_check: &mut ImapConnection, te
         .await
         .assert_equals("* SORT 6 4 1");
 
+    // UIDs 2, 3, 7, 8 and 9 have no Date header that parses, so 1.0 dates
+    // them by their INTERNALDATE (RFC 5256, section 2.2): the second each
+    // APPEND landed in. 0.16 gave them no sent date and sorted them as one
+    // group by SUBJECT, whatever the clock did. When the appends span a
+    // second boundary (seen on hosted runners), 1.0's group splits by
+    // second, so the expected order comes from their INTERNALDATEs: by
+    // DATE, then by SUBJECT within a second. In one second, 1.0 sorts
+    // message 9 (no subject) between 10 and 3 (the order upstream's comment
+    // recorded); 0.16 sorted it last.
+    let mut expected = vec![6, 4, 5, 1, 10];
+    expected.extend(undated_in_sort_order(imap_check).await);
     imap.send("UID SORT RETURN (COUNT ALL) (DATE SUBJECT) UTF-8 ALL")
         .await;
     imap.assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        // 1.0 sorts message 9 between 10 and 3 (the order upstream's
-        // comment recorded); 0.16 sorted it last.
-        .assert_contains(if !test.server.search_store().is_mysql() {
-            "COUNT 10 ALL 6,4:5,1,10,9,3,7:8,2"
+        .assert_contains(&if !test.server.search_store().is_mysql() {
+            format!("COUNT 10 ALL {}", sequence_set(&expected))
         } else {
-            "COUNT 10 ALL 9,3,7:8,2,6,4:5,1,10"
+            "COUNT 10 ALL 9,3,7:8,2,6,4:5,1,10".to_string()
         });
+}
+
+/// The UIDs whose Date header is missing or does not parse, in
+/// `(DATE SUBJECT)` order: by INTERNALDATE, then by base subject (9 has
+/// none, then 3, 7, 8 and 2).
+async fn undated_in_sort_order(imap: &mut ImapConnection) -> Vec<u32> {
+    const BY_SUBJECT: [u32; 5] = [9, 3, 7, 8, 2];
+    imap.send("UID FETCH 2:3,7:9 (INTERNALDATE)").await;
+    let mut dated = imap
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .iter()
+        .filter_map(|line| {
+            let uid = line
+                .split_once("UID ")?
+                .1
+                .split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse::<u32>()
+                .ok()?;
+            let date = line.split_once("INTERNALDATE \"")?.1.split_once('"')?.0;
+            let date = chrono::DateTime::parse_from_str(date, "%d-%b-%Y %H:%M:%S %z")
+                .unwrap_or_else(|err| panic!("Bad INTERNALDATE {date:?}: {err}"));
+            let rank = BY_SUBJECT.iter().position(|&u| u == uid)?;
+            Some((date.timestamp(), rank, uid))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(dated.len(), 5, "Missing INTERNALDATEs: {dated:?}");
+    dated.sort_unstable();
+    dated.into_iter().map(|(_, _, uid)| uid).collect()
+}
+
+/// A UID list in the sequence-set form ESEARCH's `ALL` uses: each run of
+/// consecutive ascending UIDs as `first:last`.
+fn sequence_set(uids: &[u32]) -> String {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    while start < uids.len() {
+        let mut end = start;
+        while end + 1 < uids.len() && uids[end + 1] == uids[end] + 1 {
+            end += 1;
+        }
+        parts.push(if start == end {
+            uids[start].to_string()
+        } else {
+            format!("{}:{}", uids[start], uids[end])
+        });
+        start = end + 1;
+    }
+    parts.join(",")
 }
