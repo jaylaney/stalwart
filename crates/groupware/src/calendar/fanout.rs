@@ -62,10 +62,10 @@
 //! and the committed values return for `za_set_sequences`.
 
 use crate::{
-    SizeWriter,
+    DestroyArchive, SizeWriter,
     cache::GroupwareCache,
     calendar::{
-        ChangedBy,
+        CalendarEventNotification, ChangedBy,
         delegation::{ZaDelegationResolution, ZaResolvedAccount},
         drain::{InstanceKey, instance_key, itip_reason},
         pinning::{za_decline_all, za_full_state_for, za_participation_replies},
@@ -75,6 +75,7 @@ use crate::{
             seal_error, seal_pending_item,
         },
         sequence_floor::{ZaSequence, za_instance_keys, za_reconcile_sequences},
+        storage::za_oldest_drained_notification,
     },
     scheduling::{
         Email, ItipError, ItipMessage,
@@ -1500,10 +1501,11 @@ async fn write_item_inner(
         .account(recipient_id)
         .await
         .caused_by(trc::location!())?;
-    // Upgrade ruling 176 (B-M3): upstream's notification count limit, as a
-    // count only. Upstream's iMIP path evicts the oldest notification at the
-    // limit (`NotificationQuota::reserve`), which here could be a pending
-    // item the drain has not opened, so the item is refused instead.
+    // Upgrade rulings 176 (B-M3) and 187: at upstream's notification limit
+    // the oldest drained notification is evicted, upstream's rolling window
+    // (`NotificationQuota::reserve`); a pending item is never evicted, so
+    // when every stored notification is pending the item is refused.
+    let mut evict = None;
     if let Some(limit) =
         server.object_quota_limit(&account, StorageQuota::MaxCalendarEventNotifications)
         && server
@@ -1512,7 +1514,10 @@ async fn write_item_inner(
             .caused_by(trc::location!())?
             >= limit
     {
-        return Ok(false);
+        match za_oldest_drained_notification(server, recipient_id).await? {
+            Some(oldest) => evict = Some(oldest),
+            None => return Ok(false),
+        }
     }
     // Upgrade ruling 94: the shape upstream queues (its text round-trip),
     // without the split's unreferenced placeholder components.
@@ -1549,6 +1554,15 @@ async fn write_item_inner(
     // first commit point.
     if let Some(fence) = fence {
         fence.assert_in(&mut batch);
+    }
+    if let Some((evicted_id, evicted)) = &evict {
+        DestroyArchive(
+            evicted
+                .to_unarchived::<CalendarEventNotification>()
+                .caused_by(trc::location!())?,
+        )
+        .delete(account.changed_by(), recipient_id, *evicted_id, &mut batch)
+        .caused_by(trc::location!())?;
     }
     let document_id =
         batch.reserve_document_id(recipient_id, Collection::CalendarEventNotification);

@@ -555,6 +555,36 @@ impl Server {
         }
     }
 
+    /// Upgrade ruling 185: a key account's credential version is its vault
+    /// revision, at least 1, so an OAuth grant's token (access or refresh) of
+    /// version 0 was minted while the account had no credential. Tokens
+    /// bound to no grant (live tokens, RSVP links) carry 0 by design and are
+    /// not checked here. Upstream exempts version 0 from the
+    /// version check; for a key account it is refused (`TokenExpired`), which
+    /// closes the window of ruling 175 where a grant minted between the
+    /// marker write's revocation query and its invalidation survives. Read
+    /// with `account()`, which fails closed; only version-0 tokens look.
+    pub async fn za_refuse_unversioned_token(
+        &self,
+        account_id: u32,
+        credential_version: u64,
+    ) -> trc::Result<()> {
+        if credential_version == 0
+            && self
+                .account(account_id)
+                .await
+                .caused_by(trc::location!())?
+                .is_key_account()
+        {
+            Err(trc::AuthEvent::TokenExpired
+                .into_err()
+                .account_id(account_id)
+                .details("zero-access: unversioned token of a key account"))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Upgrade ruling 173 (plan 13's R26 residual closed): the provisioning
     /// fence of an ordinary calendar writer's batch, in the current commit
     /// chunk and in every later one (`za_assert_absent_per_chunk`), so an

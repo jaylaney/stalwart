@@ -178,8 +178,6 @@ impl CalendarMkColRequestHandler for Server {
         }
         if let Some(dead_write) = &dead_write {
             calendar.set_metadata_kinds(dead_write.kinds);
-            // Ruling 70: a plaintext container's ordinary-writer assertion.
-            dead_write.za_fence(&mut batch);
         }
         if let Some(write) = dead_write.and_then(|dead_write| dead_write.write) {
             write

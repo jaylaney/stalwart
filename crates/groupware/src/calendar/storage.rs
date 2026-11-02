@@ -111,15 +111,11 @@ impl ItipAutoExpunge for Server {
             return Ok(());
         }
 
-        trc::event!(
-            Store(trc::StoreEvent::AutoExpunge),
-            AccountId = account_id,
-            Collection = Collection::CalendarEventNotification.as_str(),
-            Total = destroy_ids.len(),
-        );
-
         // Tombstone messages
         let mut batch = BatchBuilder::new();
+        // Upgrade ruling 189: the trace counts the items expunged, not the
+        // pending ones kept (ruling 174).
+        let mut expunged = 0u64;
         let changed_by = self
             .account(account_id)
             .await
@@ -143,11 +139,22 @@ impl ItipAutoExpunge for Server {
                 DestroyArchive(event)
                     .delete(changed_by, account_id, document_id, &mut batch)
                     .caused_by(trc::location!())?;
+                expunged += 1;
                 Ok(true)
             },
         )
         .await
         .caused_by(trc::location!())?;
+
+        if expunged == 0 {
+            return Ok(());
+        }
+        trc::event!(
+            Store(trc::StoreEvent::AutoExpunge),
+            AccountId = account_id,
+            Collection = Collection::CalendarEventNotification.as_str(),
+            Total = expunged,
+        );
 
         self.commit_batch(batch).await.caused_by(trc::location!())?;
 
@@ -1477,6 +1484,45 @@ impl NotificationUsage {
             cursor: None,
         })
     }
+}
+
+/// Upgrade ruling 187: the fan-out's eviction at the recipient's
+/// `maxEventNotifications`, upstream's rolling window
+/// (`NotificationQuota::reserve`) less the items the drain has not opened:
+/// the oldest notification whose row has no pending bit, with its stored
+/// row, or `None` when every stored notification is pending (the backlog
+/// cap: the fan-out then answers `5.1`). The caller deletes it in the item's
+/// batch, which asserts the row it read.
+pub(crate) async fn za_oldest_drained_notification(
+    server: &Server,
+    account_id: u32,
+) -> trc::Result<Option<(u32, Archive<ArchiveBytes>)>> {
+    let mut cursor = None;
+    while let Some(next) = server
+        .oldest_notification(account_id, cursor)
+        .await
+        .caused_by(trc::location!())?
+    {
+        cursor = Some(next);
+        if let Some(stored) = server
+            .store()
+            .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
+                account_id,
+                Collection::CalendarEventNotification,
+                next.document_id,
+            ))
+            .await
+            .caused_by(trc::location!())?
+            && !crate::calendar::seal::archived_item_is_pending(
+                stored
+                    .unarchive::<CalendarEventNotification>()
+                    .caused_by(trc::location!())?,
+            )
+        {
+            return Ok(Some((next.document_id, stored)));
+        }
+    }
+    Ok(None)
 }
 
 pub trait DirectChangeNotification: Sync + Send {

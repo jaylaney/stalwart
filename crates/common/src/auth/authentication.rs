@@ -606,6 +606,8 @@ impl Server {
                 .details("Access token is not bound to an OAuth grant"));
         };
         let inner = self.access_token(token_info.account_id).await?;
+        self.za_refuse_unversioned_token(token_info.account_id, token_info.credential_version)
+            .await?;
         assert_credential_version(token_info.credential_version, inner.credential_version())?;
         let token_scope = self
             .oauth_grant_scope(grant.id, token_info.account_id)

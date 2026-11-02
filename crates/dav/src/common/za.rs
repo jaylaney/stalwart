@@ -252,6 +252,25 @@ pub(crate) async fn za_item_hidden(
     stored_item_is_pending(stored)
 }
 
+/// Upgrade ruling 188 (the re-review's N4): whether this session's drain gave
+/// up on the owner's pending item (its `skipped` set, after
+/// `DRAIN_ITEM_FAILURE_LIMIT` failures in the session). Such an item would
+/// otherwise stay forever: the expiry keeps pending items (ruling 174) and
+/// a client cannot delete a hidden one (B-M4), so the owner's DELETE is
+/// honoured for it. Only the owner's own session's state is read.
+pub(crate) async fn za_drain_gave_up(
+    access_token: &AccessToken,
+    account_id: u32,
+    document_id: u32,
+) -> bool {
+    match access_token.session_keys() {
+        Some(keys) if keys.account_id == account_id => {
+            keys.drain().lock().await.is_skipped(document_id)
+        }
+        _ => false,
+    }
+}
+
 /// Invitations spec 6.6: [`za_item_hidden`] for a path taken from the
 /// resource cache whose row is not loaded, as the `propname` form of
 /// PROPFIND has it. Same gate, so other collections and non-key accounts

@@ -5,17 +5,13 @@
  */
 
 use super::DeadTarget;
-use crate::{
-    PropStatBuilder,
-    common::za::{ZaDeadSeal, za_dead_fence},
-};
+use crate::{PropStatBuilder, common::za::ZaDeadSeal};
 use common::{
     Server,
     storage::{
         dav::{DISPLAY_NAME_PROPERTY, FilePresence},
         metadata::{ContainerChange, MetadataWrite},
     },
-    za::metadata::ZaMetadataFence,
 };
 use dav_proto::schema::{
     property::{DavProperty, DavValue, WebDavProperty},
@@ -62,19 +58,6 @@ pub(crate) struct DeadWrite {
     pub write: Option<MetadataWrite>,
     pub kinds: MetadataKinds,
     pub file_presence: FilePresence,
-    /// Ruling 70: the ordinary-writer assertion of a plaintext calendar or
-    /// event container write; the caller applies it before `write`.
-    pub za_fence: Option<ZaMetadataFence>,
-}
-
-impl DeadWrite {
-    /// Ruling 70: adds the fence, if any, before the caller builds `write`
-    /// into the same commit chunk.
-    pub fn za_fence(&self, batch: &mut store::write::BatchBuilder) {
-        if let Some(fence) = self.za_fence.filter(|_| self.write.is_some()) {
-            fence.apply(batch);
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,23 +261,13 @@ impl DeadPatch {
         let file_presence = view
             .as_ref()
             .map_or(FilePresence::NONE, FilePresence::from_view);
-        let za_fence = match &change {
-            Some(_) => {
-                za_dead_fence(
-                    server,
-                    target.account_id,
-                    target.collection,
-                    Some(za.is_some()),
-                )
-                .await?
-            }
-            None => None,
-        };
+        // Ruling 70's ordinary-writer assertion of a plaintext calendar or
+        // event container is the calendar handler's per-chunk fence
+        // (`za_ordinary_fence`, upgrade rulings 181 and 189): one per chunk.
         Ok(Some(DeadWrite {
             write: change.map(|change| change.into_write(&owner, target.collection, target.log)),
             kinds,
             file_presence,
-            za_fence,
         }))
     }
 }

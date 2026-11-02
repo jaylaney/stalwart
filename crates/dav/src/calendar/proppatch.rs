@@ -350,11 +350,6 @@ impl CalendarPropPatchRequestHandler for Server {
                     )
                     .await
                     .caused_by(trc::location!())?;
-                    // Ruling 70: a plaintext container's ordinary-writer
-                    // assertion.
-                    if let Some(dead_write) = &dead_write {
-                        dead_write.za_fence(&mut batch);
-                    }
                     if let Some(write) = dead_write.and_then(|dead_write| dead_write.write) {
                         write
                             .build(document_id.into(), &mut batch)
@@ -370,7 +365,6 @@ impl CalendarPropPatchRequestHandler for Server {
                         )
                         .caused_by(trc::location!())?;
                 } else if let Some(dead_write) = dead_write.as_mut() {
-                    dead_write.za_fence(&mut batch);
                     if let Some(write) = dead_write.write.take() {
                         write
                             .build(document_id.into(), &mut batch)
@@ -473,10 +467,6 @@ impl CalendarPropPatchRequestHandler for Server {
                 let mut new_etag = None;
                 for context in &event_contexts {
                     context.assert_in(&mut batch);
-                }
-                // Ruling 70: a plaintext container's ordinary-writer assertion.
-                if let Some(dead_write) = &dead_write {
-                    dead_write.za_fence(&mut batch);
                 }
                 if let Some(write) = dead_write
                     .as_mut()

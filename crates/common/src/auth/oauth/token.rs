@@ -204,6 +204,10 @@ impl Server {
         token: &str,
     ) -> trc::Result<TokenInfo> {
         let mut token = self.decode_access_token(expected_grant_type, token)?;
+        if token.grant.is_some() {
+            self.za_refuse_unversioned_token(token.account_id, token.credential_version)
+                .await?;
+        }
 
         if token.credential_version != 0 {
             let inner = self

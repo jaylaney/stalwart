@@ -251,7 +251,8 @@ impl CalendarEventNotificationHandler for Server {
             .caused_by(trc::location!())?
             .ok_or(DavError::Code(StatusCode::NOT_FOUND))?;
         // Upgrade ruling 176 (B-M4): a pending item is not there for a
-        // client until drained, so its DELETE answers 404 as its GET does.
+        // client until drained, so its DELETE answers 404 as its GET does;
+        // ruling 188: unless this session's drain gave up on it.
         if za_item_hidden(
             self,
             access_token,
@@ -260,6 +261,7 @@ impl CalendarEventNotificationHandler for Server {
             &event_,
         )
         .await?
+            && !crate::common::za::za_drain_gave_up(access_token, account_id, document_id).await
         {
             return Err(DavError::Code(StatusCode::NOT_FOUND));
         }
@@ -286,6 +288,11 @@ impl CalendarEventNotificationHandler for Server {
 
         // Delete event
         let mut batch = BatchBuilder::new();
+        // Upgrade ruling 189: an ordinary account's inbox delete is fenced
+        // as JMAP's `CalendarEventNotification/set` is (ruling 181).
+        if !crate::common::za::is_key_account(self, account_id).await? {
+            crate::common::za::za_ordinary_fence(self, &mut batch, account_id, None);
+        }
         DestroyArchive(event)
             .delete(
                 access_token.changed_by(),
