@@ -602,27 +602,36 @@ jobs:
             --out "$GATES/coverage.json" 2>&1 | tee "$GATES/coverage.out"
 
       - name: Sanitize gate output
-        # Only the gates' reports and the net's step table are kept: test
-        # names, step names, counts and source locations. Test logs and
-        # profiles are not uploaded. Any Basic or Bearer credential, and any
-        # password, secret or token assignment, is redacted all the same.
-        if: failure()
+        # The gates' reports, the net's step table and, by upgrade ruling
+        # 184, the net's step logs (kept on success too, for a step that
+        # passed only on its second attempt): test names, step names, counts,
+        # source locations and test output. Profiles are not uploaded. Any
+        # Basic or Bearer credential, and any password, secret or token
+        # assignment, is redacted.
+        if: ${{ !cancelled() }}
         shell: bash
         run: |
-          mkdir -p "$RUNNER_TEMP/gates-receipt"
-          for file in "$GATES/inventory.out" "$GATES/coverage.out" "$GATES/functions.log" \
-                      "$GATES/net/steps.tsv"; do
-            [ -f "$file" ] || continue
+          mkdir -p "$RUNNER_TEMP/gates-receipt/net-logs"
+          redact() {
             sed -E \
               -e 's/(Basic|Bearer) [A-Za-z0-9._~+\/=-]+/\1 [REDACTED]/g' \
               -e 's/((password|secret|token)[A-Za-z_]*["]?[=:] *["]?)[^" ,}]+/\1[REDACTED]/Ig' \
-              "$file" > "$RUNNER_TEMP/gates-receipt/$(basename "$file")"
+              "$1" > "$2"
+          }
+          for file in "$GATES/inventory.out" "$GATES/coverage.out" "$GATES/functions.log" \
+                      "$GATES/net/steps.tsv"; do
+            [ -f "$file" ] || continue
+            redact "$file" "$RUNNER_TEMP/gates-receipt/$(basename "$file")"
+          done
+          for file in "$GATES"/net/logs/*.log; do
+            [ -f "$file" ] || continue
+            redact "$file" "$RUNNER_TEMP/gates-receipt/net-logs/$(basename "$file")"
           done
           grep -h "^## exit\|^# config" "$GATES"/listings/list/*.txt "$GATES"/listings/ign/*.txt \
             > "$RUNNER_TEMP/gates-receipt/listing-exits.txt" 2>/dev/null || true
 
       - name: Retain sanitized gate output
-        if: failure()
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7.0.1
         with:
           name: gates-receipt

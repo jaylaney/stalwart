@@ -279,7 +279,9 @@ pub async fn ensure_meilisearch() {
 pub async fn ensure_keycloak() {
     KEYCLOAK
         .get_or_init(|| async {
-            GenericImage::new("quay.io/keycloak/keycloak", "latest")
+            // Upgrade ruling 184: a fixed release, not `latest` (26.8.1 is
+            // the image `latest` named when CI's directory suite last passed).
+            GenericImage::new("quay.io/keycloak/keycloak", "26.8.1")
                 .with_env_var("KC_BOOTSTRAP_ADMIN_USERNAME", "admin")
                 .with_env_var("KC_BOOTSTRAP_ADMIN_PASSWORD", "admin")
                 .with_env_var("KC_HTTP_PORT", "9080")
@@ -542,8 +544,12 @@ async fn wait_for_tcp(port: u16) {
 }
 
 async fn wait_for_http(url: &str) {
+    // Upgrade ruling 184: each probe is bounded, so a connection the service
+    // accepts but never answers cannot outlast READY_TIMEOUT.
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
         .build()
         .expect("Failed to build HTTP client");
     let start = Instant::now();
