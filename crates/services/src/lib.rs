@@ -20,6 +20,7 @@ pub mod broadcast;
 pub mod index_queue;
 pub mod state_manager;
 pub mod task_manager;
+pub mod za_imip;
 
 pub trait StartServices: Sync + Send {
     fn start_services(&mut self) -> impl Future<Output = ()> + Send;

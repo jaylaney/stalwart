@@ -2472,4 +2472,69 @@ mod tests {
             "the control: upstream's text carries the address"
         );
     }
+
+    // iMIP spec 3.1 item 2: the start of `itip_ingest`, extracted. The
+    // fixtures are of the `imip-*` family (spec 8.2).
+    const REPLY_WITHOUT_ORGANIZER: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nMETHOD:REPLY\r\nBEGIN:VEVENT\r\nUID:imip-fill-1\r\nDTSTAMP:20260101T000000Z\r\nATTENDEE;PARTSTAT=ACCEPTED:mailto:imip-att@remote.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    const CANCEL_WITHOUT_ORGANIZER: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nMETHOD:CANCEL\r\nBEGIN:VEVENT\r\nUID:imip-fill-2\r\nDTSTAMP:20260101T000000Z\r\nATTENDEE:mailto:imip-att@remote.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    const REQUEST_FROM_ORG: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:imip-rule-1\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20990102T090000Z\r\nDTEND:20990102T100000Z\r\nSEQUENCE:0\r\nORGANIZER:mailto:imip-org@remote.test\r\nATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:imip-key@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    const REPLY_FROM_ATT: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nMETHOD:REPLY\r\nBEGIN:VEVENT\r\nUID:imip-rule-2\r\nDTSTAMP:20260101T000000Z\r\nSEQUENCE:0\r\nORGANIZER:mailto:imip-key@example.com\r\nATTENDEE;PARTSTAT=ACCEPTED:mailto:imip-att@remote.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    /// The ORGANIZER values of every component, in order.
+    fn organizers(ical: &ICalendar) -> Vec<String> {
+        ical.components
+            .iter()
+            .flat_map(|comp| comp.entries.iter())
+            .filter(|entry| entry.name == ICalendarProperty::Organizer)
+            .filter_map(|entry| entry.values.first().and_then(|v| v.as_text()))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn the_exchange_fill_adds_an_organizer_only_where_missing() {
+        use crate::calendar::itip::{itip_fill_organizer, itip_parse_inbound};
+        let mut reply = parse(REPLY_WITHOUT_ORGANIZER); // ATTENDEE imip-att, no ORGANIZER
+        itip_fill_organizer(&mut reply, "imip-key@example.com");
+        assert_eq!(organizers(&reply), ["mailto:imip-key@example.com"]);
+        itip_fill_organizer(&mut reply, "other@example.com");
+        assert_eq!(
+            organizers(&reply),
+            ["mailto:imip-key@example.com"],
+            "idempotent"
+        );
+        let mut cancel = parse(CANCEL_WITHOUT_ORGANIZER);
+        itip_fill_organizer(&mut cancel, "imip-key@example.com");
+        assert!(organizers(&cancel).is_empty(), "REPLY and REQUEST only");
+        assert!(matches!(
+            itip_parse_inbound("not ical", "x@example.com"),
+            Err(ItipError::ICalendarParseError)
+        ));
+        // The parse runs the fill, in `itip_ingest`'s order.
+        let parsed = itip_parse_inbound(REPLY_WITHOUT_ORGANIZER, "imip-key@example.com")
+            .unwrap_or_else(|_| panic!("the reply parses"));
+        assert_eq!(organizers(&parsed), ["mailto:imip-key@example.com"]);
+    }
+
+    #[test]
+    fn the_sender_rule_follows_the_method() {
+        use crate::calendar::itip::itip_sender_snapshot;
+        let own = vec!["imip-key@example.com".to_string()];
+        let request = parse(REQUEST_FROM_ORG); // ORGANIZER imip-org, ATTENDEE imip-key
+        assert!(itip_sender_snapshot(&request, &own, "imip-org@remote.test").is_ok());
+        assert!(matches!(
+            itip_sender_snapshot(&request, &own, "imip-att@remote.test"),
+            Err(ItipError::SenderIsNotOrganizer)
+        ));
+        let reply = parse(REPLY_FROM_ATT); // ORGANIZER imip-key, ATTENDEE imip-att
+        assert!(itip_sender_snapshot(&reply, &own, "imip-att@remote.test").is_ok());
+        assert!(
+            itip_sender_snapshot(&reply, &own, "imip-key@example.com").is_ok(),
+            "3.2 item 12"
+        );
+        assert!(matches!(
+            itip_sender_snapshot(&reply, &own, "imip-stranger@remote.test"),
+            Err(ItipError::SenderIsNotOrganizerNorAttendee)
+        ));
+    }
 }
