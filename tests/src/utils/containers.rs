@@ -363,13 +363,17 @@ async fn ensure_pebble() {
 }
 
 /// Waits for Pebble's directory at the URL the tests' ACME providers use.
-/// The mapped port can accept connections before Pebble answers behind it,
-/// and on hosted runners the server's first ACME request failed to connect
-/// (upgrade part Z2). On a timeout the panic carries the last answer for
+/// The mapped port accepts connections before Pebble listens behind it
+/// (Pebble takes about a second to start), and on hosted runners the
+/// server's first ACME request, 50 ms after the port opened, failed to
+/// connect (upgrade part Z2). Pebble refuses a request without a User-Agent
+/// (RFC 8555 section 6.1) with 400, so the probe sends one, as the server's
+/// ACME client does. On a timeout the panic carries the last answer for
 /// `localhost` and for `127.0.0.1`, and Docker's view of the container.
 async fn wait_for_pebble() {
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
+        .user_agent("stalwart-tests")
         .timeout(Duration::from_secs(5))
         .build()
         .expect("Failed to build HTTP client");
