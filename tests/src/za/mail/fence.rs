@@ -765,7 +765,10 @@ async fn forward_race_imip_side_write(test: &TestServer, admin: &Account) -> (Ac
     parked.finish().await;
 
     assert_first_attempt_lost(test, traced, FENCE10, id).await;
-    assert_no_calendar_data(test, id, "the stale delivery's iMIP processing").await;
+    // The queue's retry may already have run, and from release 5 it writes
+    // a `pk`-sealed pending item (iMIP spec 4.1, 8.5), so this holds either
+    // way.
+    assert_no_plaintext_calendar_data(test, id, "the stale delivery's iMIP processing").await;
     wait_for_delivery(test).await;
     let ids = message_ids(test, id).await;
     assert_eq!(ids.len(), 1, "the queue's retry delivered the message");
@@ -793,19 +796,23 @@ async fn forward_race_imip_side_write(test: &TestServer, admin: &Account) -> (Ac
     (account, organizer)
 }
 
-/// The account holds no calendar event and no scheduling inbox item.
-async fn assert_no_calendar_data(test: &TestServer, account_id: u32, after: &str) {
-    for collection in [
-        Collection::CalendarEvent,
-        Collection::CalendarEventNotification,
-    ] {
+/// The account holds no calendar event, and every scheduling inbox item it
+/// holds is pending and sealed to the served key (`WRAP_PK`): a key
+/// account's mail-borne item (iMIP spec 4.1), never an ordinary ingest's.
+async fn assert_no_plaintext_calendar_data(test: &TestServer, account_id: u32, after: &str) {
+    assert!(
+        !test
+            .server
+            .za_has_documents(account_id, Collection::CalendarEvent)
+            .await
+            .unwrap(),
+        "{after} stored a CalendarEvent document"
+    );
+    for (item_id, item) in inbox_items(test, account_id).await {
         assert!(
-            !test
-                .server
-                .za_has_documents(account_id, collection)
-                .await
-                .unwrap(),
-            "{after} stored a {collection:?} document"
+            item.flags & EVENT_NOTIFICATION_ZA_PENDING != 0
+                && envelope_wrap(&item.event) == Some(WRAP_PK),
+            "{after} stored inbox item {item_id} that is not a pending pk-sealed item"
         );
     }
 }
