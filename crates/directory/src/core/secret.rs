@@ -487,12 +487,16 @@ mod za_tests {
     use super::verify_totp_code;
 
     /// Upgrade ruling 176 (A3): an `otpauth://` URL the parser refuses
-    /// reaches no part of the error, the parser's message included.
+    /// reaches no part of the error. totp-rs 6.0's messages quote the
+    /// component that fails to parse (here `digits`; its secret error quotes
+    /// nothing), so the parser's message is not attached.
     #[test]
     fn totp_url_error_quotes_nothing() {
         const CANARY: &str = "ZACANARY0189";
-        let url = format!("otpauth://totp/Stalwart:za?secret={CANARY}&issuer=Stalwart");
-        let err = verify_totp_code(&url, "123456").expect_err("an invalid secret");
+        let url = format!(
+            "otpauth://totp/Stalwart:za?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&digits={CANARY}&issuer=Stalwart"
+        );
+        let err = verify_totp_code(&url, "123456").expect_err("an invalid digits value");
         let text = format!("{err:?} {err}");
         assert!(!text.contains(CANARY), "{text}");
         assert!(text.contains("Invalid TOTP URL"), "{text}");
