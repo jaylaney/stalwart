@@ -768,7 +768,7 @@ async fn forward_race_imip_side_write(test: &TestServer, admin: &Account) -> (Ac
     // The queue's retry may already have run, and from release 5 it writes
     // a `pk`-sealed pending item (iMIP spec 4.1, 8.5), so this holds either
     // way.
-    assert_no_plaintext_calendar_data(test, id, "the stale delivery's iMIP processing").await;
+    assert_no_calendar_data(test, id, "the stale delivery's iMIP processing").await;
     wait_for_delivery(test).await;
     let ids = message_ids(test, id).await;
     assert_eq!(ids.len(), 1, "the queue's retry delivered the message");
@@ -799,7 +799,7 @@ async fn forward_race_imip_side_write(test: &TestServer, admin: &Account) -> (Ac
 /// The account holds no calendar event, and every scheduling inbox item it
 /// holds is pending and sealed to the served key (`WRAP_PK`): a key
 /// account's mail-borne item (iMIP spec 4.1), never an ordinary ingest's.
-async fn assert_no_plaintext_calendar_data(test: &TestServer, account_id: u32, after: &str) {
+async fn assert_no_calendar_data(test: &TestServer, account_id: u32, after: &str) {
     assert!(
         !test
             .server
