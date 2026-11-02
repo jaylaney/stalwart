@@ -18,7 +18,10 @@ every step's profile. It writes:
   DIR/profdata/           each step's merged profile
 
 Step names and commands are the baseline's (`helpers.steps` in
-`tests/qualification/baseline-0.16.27.json`; the upgrade outcome note's part 7d1). A step that
+`tests/qualification/baseline-0.16.27.json`; the upgrade outcome note's part 7d1). Each step
+that measures a CI step takes its command and environment from `ci_steps.STEPS`, the table
+`capture_listings.py` reads too and `test_gates.py` checks against test.yml and the baseline;
+the two builds and the unit step are the baseline's own commands. A step that
 fails is run once more: the same command, except `smtp`, which reruns its failed tests by name
 (the documented timing flakes). Every attempt's profile counts. The exit status is 1 when a step
 failed both attempts or a build or export failed; every other step still runs and is exported,
@@ -33,17 +36,19 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import time
 
-REPO = Path(__file__).resolve().parents[2]
-BASE_ENV = {"STORE": "RocksDb", "RUST_MIN_STACK": "16777216"}
-# The SMTP step's rules release; the same URL as test.yml's SMTP step.
-SPAM_URL = ("https://github.com/stalwartlabs/spam-filter/releases/download/v3.0.3/"
-            "spam-filter-rules.json.gz")
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ci_steps  # noqa: E402
+
+REPO = ci_steps.REPO
+BASE_ENV = ci_steps.BASE_ENV
 # Leave dependency, toolchain and generated sources out of the exports, as the baseline did.
 EXTERNAL_RE = r"(/\.cargo/|/rustc/|/\.rustup/|/target/)"
 # Variables a step sets itself; any value from the caller is removed.
@@ -51,44 +56,36 @@ STEP_VARIABLES = ("ZA_KEY_ACCOUNTS", "BLOB_STORE", "SPAM_RULES_URL", "RUSTFLAGS"
 LLVM_TEST = ["cargo", "llvm-cov", "--no-report", "test"]
 WORKSPACE = ["--workspace", "--exclude-from-test", "scim", "--exclude-from-test", "scim-proto",
              "--lib", "--bins", "--tests", "--no-fail-fast"]
+# The baseline net's order, and each step's timeout in seconds (default one hour).
+ORDER = ["build-A", "build-B", "leak-unit-test", "unit-tests", "za-tests", "za-tests-fs-blob",
+         "webdav-plain", "webdav-key", "imap-plain", "imap-key", "jmap-plain", "jmap-key", "smtp",
+         "system-tests", "store-tests", "blob-tests", "lookup-tests", "search-tests",
+         "telemetry-tests", "cal-query-tests", "automation-tests"]
+TIMEOUTS = {"za-tests": 3 * 3600, "za-tests-fs-blob": 3 * 3600, "blob-tests": 1800,
+            "lookup-tests": 1800, "search-tests": 2 * 3600, "telemetry-tests": 1800,
+            "cal-query-tests": 1800, "automation-tests": 1800}
 
 
-def tests_step(filter_, env=None, exact=False, rerun="same", timeout=3600):
-    cmd = LLVM_TEST + ["-p", "tests", filter_, "--"] + (["--exact"] if exact else []) + [
-        "--nocapture"]
-    return dict(cmd=cmd, env=env or {}, rerun=rerun, timeout=timeout)
+def ci_step(name):
+    """A net step measuring a CI step: its command and environment are that step's."""
+    step = ci_steps.net_steps()[name]
+    return dict(cmd=ci_steps.net_command(step, LLVM_TEST), env=dict(step.env),
+                rerun="by-name" if step.rerun == "by-name" else "same",
+                timeout=TIMEOUTS.get(name, 3600))
 
 
-# The order is the baseline net's.
-STEPS = {
+OWN_STEPS = {
     "build-A": dict(cmd=LLVM_TEST + WORKSPACE + ["--", "zz_no_such_test_zz"], env={},
                     rerun="build", timeout=4 * 3600),
     "build-B": dict(cmd=LLVM_TEST + ["-p", "tests", "zz_no_such_test_zz_2", "--", "--nocapture"],
                     env={}, rerun="build", timeout=4 * 3600),
-    "leak-unit-test": tests_step("za::leak::tests::try_archive_short_values_are_not_archives",
-                                 exact=True),
     # The tests crate's own tests are skipped here: the other steps run them.
     "unit-tests": dict(cmd=LLVM_TEST + WORKSPACE + ["--", "--exact"], env={}, rerun="same",
                        timeout=2 * 3600, skip_tests_crate=True),
-    "za-tests": tests_step("za::za_tests", timeout=3 * 3600),
-    "za-tests-fs-blob": tests_step("za::za_tests", env={"BLOB_STORE": "FileSystem"},
-                                   timeout=3 * 3600),
-    "webdav-plain": tests_step("webdav::webdav_tests"),
-    "webdav-key": tests_step("webdav::webdav_tests", env={"ZA_KEY_ACCOUNTS": "1"}),
-    "imap-plain": tests_step("imap::imap_tests"),
-    "imap-key": tests_step("imap::imap_tests", env={"ZA_KEY_ACCOUNTS": "1"}),
-    "jmap-plain": tests_step("jmap::jmap_tests"),
-    "jmap-key": tests_step("jmap::jmap_tests", env={"ZA_KEY_ACCOUNTS": "1"}),
-    "smtp": tests_step("smtp", env={"SPAM_RULES_URL": SPAM_URL}, rerun="by-name"),
-    "system-tests": tests_step("system::system_tests"),
-    "store-tests": tests_step("store::store_tests"),
-    "blob-tests": tests_step("store::blob::blob_tests", timeout=1800),
-    "lookup-tests": tests_step("store::lookup::lookup_tests", timeout=1800),
-    "search-tests": tests_step("store::search_tests", timeout=2 * 3600),
-    "telemetry-tests": tests_step("telemetry::telemetry_tests", timeout=1800),
-    "cal-query-tests": tests_step("webdav::cal_query::", timeout=1800),
-    "automation-tests": tests_step("automation::automation_tests", timeout=1800),
 }
+STEPS = {name: OWN_STEPS[name] if name in OWN_STEPS else ci_step(name) for name in ORDER}
+# A failed `smtp` attempt reruns its failed tests by name, as test.yml's SMTP step does.
+BY_NAME_RETRY = LLVM_TEST + shlex.split(ci_steps.BY_NAME_RETRY)[2:-1]
 
 
 def now():
@@ -237,7 +234,7 @@ class Net:
             retry = cmd
             if spec["rerun"] == "by-name":
                 names = attempts[0]["names"]
-                retry = LLVM_TEST + ["-p", "tests", "--", "--exact", "--nocapture"] + names
+                retry = BY_NAME_RETRY + names
                 if not names:
                     retry = None
             if retry is not None:

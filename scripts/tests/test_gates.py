@@ -16,7 +16,12 @@ command (`python3 -I`), and checks its exit status and the failure it names:
     synchronous sub-test, and the dispositions file's renames and selection moves;
   - the coverage gate on a synthetic merged export over the cohort's 40 paths: the baseline's exact
     fractions pass; one line below either threshold fails although a restored test file adds 50,000
-    covered lines; a missing cohort file and an uncovered addition fail.
+    covered lines; a missing cohort file and an uncovered addition fail;
+  - the CI workflow against `ci_steps.STEPS`, the table the net and the capture read: the committed
+    test.yml matches it; a narrowed filter, a dropped feature, a changed environment, a dropped,
+    renamed or disabled step, a narrowed rerun, `continue-on-error`, an untracked `cargo test`
+    step and a gates job that runs fewer steps are each reported; and the net and the capture
+    follow the table and the baseline's step names and commands.
 
 Usage:
   python3 -I scripts/tests/test_gates.py [-v] [--real DIR]
@@ -40,7 +45,10 @@ sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import gate_common  # noqa: E402,F401  (puts tests/qualification/tools on the path)
+import capture_listings  # noqa: E402
+import ci_steps  # noqa: E402
 import cohort  # noqa: E402
+import coverage_net  # noqa: E402
 import strict_rule  # noqa: E402
 
 ROOT = gate_common.ROOT
@@ -684,6 +692,148 @@ class CoverageTests(unittest.TestCase):
         disp["cohort"]["additions"] = []
         code, out = self.gate(merged, disp)
         self.assertEqual(code, 0, out)
+
+
+# ====================================================================== the CI workflow
+class WorkflowTests(unittest.TestCase):
+    """`ci_steps.STEPS`, the one table both the net and the capture read, against test.yml (ruling
+    177, final review D4): the committed workflow matches it, and each edit that would let CI run
+    less than the gates measure is reported."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(ci_steps.WORKFLOW, encoding="utf-8") as f:
+            cls.text = f.read()
+
+    def edited(self, old, new):
+        self.assertEqual(self.text.count(old), 1, f"anchor not unique in test.yml: {old!r}")
+        return ci_steps.check_workflow(self.text.replace(old, new))
+
+    def assertReports(self, problems, *parts):
+        self.assertTrue(any(all(part in problem for part in parts) for problem in problems),
+                        f"no problem names {parts}: {problems}")
+
+    def test_the_committed_workflow_matches_the_table(self):
+        self.assertEqual(ci_steps.check_workflow(self.text), [])
+
+    def test_a_narrowed_filter_fails(self):
+        problems = self.edited(
+            "run: |\n          cargo test -p tests za::za_tests -- --nocapture || {\n"
+            "            echo \"::warning title=za_tests::run failed;",
+            "run: |\n          cargo test -p tests za::za_tests::setup -- --nocapture || {\n"
+            "            echo \"::warning title=za_tests::run failed;")
+        self.assertReports(problems, "'Zero-access Tests'", "command is",
+                           "za::za_tests::setup")
+        problems = self.edited("run: cargo test -p tests imap -- --nocapture",
+                               "run: cargo test -p tests imap::imap_tests -- --nocapture")
+        self.assertReports(problems, "'IMAP Tests'", "command is")
+
+    def test_a_dropped_feature_fails(self):
+        problems = self.edited(
+            "run: cargo test -p http@1.0.1 --lib --bins --features test_mode,enterprise",
+            "run: cargo test -p http@1.0.1 --lib --bins --features test_mode")
+        self.assertReports(problems, "'HTTP Unit Tests'", "command is")
+        problems = self.edited("run: cargo test -p smtp --lib --bins --features test_mode",
+                               "run: cargo test -p smtp --lib --bins")
+        self.assertReports(problems, "'SMTP Unit Tests (without enterprise)'", "command is")
+        # The workspace step's list is the workflow's, which the capture reads; a job that
+        # overrides it would list features the capture never sees.
+        problems = self.edited(
+            "timeout-minutes: 75\n\n    env:\n      STORE: RocksDb\n",
+            "timeout-minutes: 75\n\n    env:\n      STORE: RocksDb\n"
+            "      UNIT_TEST_FEATURES: common/test_mode\n")
+        self.assertReports(problems, "'Workspace Unit Tests'", "overrides")
+        problems = self.edited('--lib --bins --features "$UNIT_TEST_FEATURES"',
+                               "--lib --bins --features common/test_mode")
+        self.assertReports(problems, "'Workspace Unit Tests'", "command is")
+
+    def test_a_changed_environment_fails(self):
+        problems = self.edited(
+            "run: cargo test -p tests imap::imap_tests -- --nocapture\n"
+            "        env:\n          ZA_KEY_ACCOUNTS: \"1\"\n",
+            "run: cargo test -p tests imap::imap_tests -- --nocapture\n")
+        self.assertReports(problems, "'IMAP Tests (key accounts)'", "ZA_KEY_ACCOUNTS")
+        problems = self.edited("          BLOB_STORE: FileSystem\n",
+                               "          BLOB_STORE: FileSystem\n          ZA_ONLY: setup\n")
+        self.assertReports(problems, "filesystem blob store", "ZA_ONLY")
+        problems = self.edited("SPAM_RULES_URL: https://github.com/stalwartlabs/spam-filter/"
+                               "releases/download/v3.0.3/",
+                               "SPAM_RULES_URL: https://github.com/stalwartlabs/spam-filter/"
+                               "releases/download/v3.0.2/")
+        self.assertReports(problems, "'SMTP Tests'", "SPAM_RULES_URL")
+        problems = self.edited("    timeout-minutes: 120\n\n    env:\n      STORE: RocksDb\n",
+                               "    timeout-minutes: 120\n\n    env:\n      STORE: Sqlite\n")
+        self.assertReports(problems, "job zero-access", "STORE")
+
+    def test_a_dropped_or_disabled_step_fails(self):
+        problems = self.edited("      - name: Automation Tests\n", "      - name: Automation\n")
+        self.assertReports(problems, "'Automation Tests'", "missing")
+        self.assertReports(problems, "'Automation'", "not in ci_steps.STEPS")
+        problems = self.edited(
+            "      - name: Zero-access Cache Swap Tests\n        if: ${{ !cancelled() }}\n",
+            "      - name: Zero-access Cache Swap Tests\n        if: false\n")
+        self.assertReports(problems, "'Zero-access Cache Swap Tests'", "if is")
+        problems = self.edited("  upstream-suites:\n    name: Upstream Suites\n    needs: style\n",
+                               "  upstream-suites:\n    name: Upstream Suites\n    needs: style\n"
+                               "    continue-on-error: true\n")
+        self.assertReports(problems, "job upstream-suites", "continue-on-error")
+
+    def test_a_narrowed_rerun_fails(self):
+        problems = self.edited("cargo test -p tests -- --exact --nocapture $failed",
+                               "cargo test -p tests -- --exact --nocapture $failed --skip dkim")
+        self.assertReports(problems, "'SMTP Tests'", "rerun")
+        problems = self.edited(
+            "            echo \"::warning title=jmap_tests::plain-mode run failed; retrying once "
+            "(known calendar::notification flake)\"\n"
+            "            cargo test -p tests jmap::jmap_tests -- --nocapture\n",
+            "            echo \"::warning title=jmap_tests::plain-mode run failed; retrying once "
+            "(known calendar::notification flake)\"\n"
+            "            cargo test -p tests jmap::jmap_tests::x -- --nocapture\n")
+        self.assertReports(problems, "'JMAP Tests (plain accounts)'", "rerun")
+
+    def test_an_untracked_cargo_test_step_fails(self):
+        problems = self.edited(
+            "      - name: CalDAV Tests (plain accounts)\n",
+            "      - name: Extra\n        run: cargo test -p tests za::extra -- --nocapture\n\n"
+            "      - name: CalDAV Tests (plain accounts)\n")
+        self.assertReports(problems, "'Extra'", "not in ci_steps.STEPS")
+
+    def test_the_gates_job_runs_the_whole_net_and_every_capture(self):
+        problems = self.edited('coverage_net.py --out "$GATES/net"',
+                               'coverage_net.py --out "$GATES/net" za-tests')
+        self.assertReports(problems, "job gates", "Coverage net")
+        problems = self.edited('capture_listings.py --out "$GATES/listings"',
+                               'capture_listings.py --out "$GATES/listings" '
+                               "test.yml__test__imap-tests")
+        self.assertReports(problems, "job gates", "Capture CI step listings")
+
+    def test_unsupported_yaml_is_reported_not_skipped(self):
+        problems = self.edited("  test:\n    name: Test\n", "  test: &test\n    name: Test\n")
+        self.assertTrue(problems and problems[0].startswith("test.yml:"), problems)
+
+    def test_the_net_and_the_capture_follow_the_table_and_the_baseline(self):
+        with open(BASELINE, encoding="utf-8") as f:
+            baseline = json.load(f)
+        net = coverage_net.STEPS
+        self.assertEqual(set(net) - {"build-A", "build-B"}, set(baseline["helpers"]["steps"]))
+        for name, recorded in baseline["subtests"]["steps"].items():
+            self.assertEqual(" ".join(net[name]["cmd"]), recorded["command"], name)
+            env = dict(pair.split("=", 1) for pair in recorded["env"].split())
+            self.assertEqual({**coverage_net.BASE_ENV, **net[name]["env"]}, env, name)
+        for name, step in ci_steps.net_steps().items():
+            self.assertEqual(net[name]["cmd"][4:], step.argv[2:], name)
+            self.assertEqual(net[name]["env"], step.env, name)
+        configurations = capture_listings.configurations("FEATURES")
+        required = {name for name, c in baseline["libtest"]["configurations"].items()
+                    if c["kind"] == "ci_step"}
+        self.assertLessEqual(required, set(configurations))
+        for name, step in ci_steps.captured_steps().items():
+            self.assertEqual(configurations[name]["env"], step.env, name)
+            cmd = [a for a in configurations[name]["cmd"] if a not in ci_steps.LISTING_TARGETS]
+            argv = ci_steps.expand(step.argv, "FEATURES")
+            if "--" not in argv:
+                argv = argv + ["--"]
+            self.assertEqual(cmd, [a for a in argv if a not in ci_steps.LISTING_TARGETS], name)
 
 
 # ====================================================================== the real baseline

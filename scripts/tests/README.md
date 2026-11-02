@@ -11,6 +11,11 @@ Task 1's rulings 7, 8, 25, 31 and 32 set their rules.
 - `coverage_net.py`: the baseline's 19-step `cargo llvm-cov --no-report` net, which writes the
   per-step exports and the merged export both gates read.
 - `capture_listings.py`: the libtest listing of every CI step, for the inventory gate.
+- `ci_steps.py`: the one table of the CI steps both of those read (each step's command,
+  environment, `if` and rerun as test.yml writes them), and `check_workflow`, which compares it
+  with `.github/workflows/test.yml`. A change to a gated step in test.yml needs the same change
+  in the table, or the self-tests fail (`python3 -I scripts/tests/ci_steps.py` runs the check
+  alone).
 
 The `gates` job of `.github/workflows/test.yml` runs the net, the captures and both gates,
 weekly and on manual dispatch. Locally, the same sequence is:
@@ -120,8 +125,9 @@ for k, v in sorted(c.items()):
     if v["kind"] in ("ci_step", "ignored_listing"): print(k, "\t", v["command"])'
 ```
 
-Use each step's 1.0 command, from `.github/workflows/test.yml`; `capture_listings.py` holds
-them, and a change to a step's command needs the same change there. The workspace unit step's
+Use each step's 1.0 command, from `.github/workflows/test.yml`; `ci_steps.STEPS` holds them for
+`capture_listings.py` and `coverage_net.py`, and the self-tests fail until a change to a step's
+command, environment or condition in test.yml is made there too. The workspace unit step's
 features are test.yml's `UNIT_TEST_FEATURES`, and each selection move's `to_command` is its new
 step's (Task 8 confirmed both moves: the unit-tests job's "SMTP Unit Tests (without
 enterprise)" and "HTTP Unit Tests").
@@ -179,12 +185,16 @@ At 0.16.27, upstream's inline test modules sat in their own files; at 1.0 they l
 python3 -I scripts/tests/test_gates.py -v
 ```
 
-The 30 offline tests take about 4 seconds; the run reports 32, the two `--real` tests below
+The 40 offline tests take about 4 seconds; the run reports 42, the two `--real` tests below
 skipped. Their docstring lists the cases:
 - the strict rule on synthetic exports, run through `strict_rule.py functions`;
 - listing faults against a candidate built from the committed baseline's own records;
 - coverage exports one line below each threshold, with a restored test file that would
-  otherwise offset the drop.
+  otherwise offset the drop;
+- the CI workflow against `ci_steps.STEPS`: the committed test.yml matches it, and edited copies
+  with a narrowed filter, a dropped feature, a changed environment, a dropped, renamed or
+  disabled step, a narrowed rerun, `continue-on-error`, an untracked `cargo test` step or a gates
+  job that runs fewer steps each fail; the net's steps are the baseline's names and commands.
 
 ### The baseline as its own candidate
 

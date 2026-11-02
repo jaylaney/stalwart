@@ -10,13 +10,14 @@ Writes DIR/list/<configuration>.txt and DIR/ign/<configuration>--ignored-only.tx
 `-- --list` (or `-- --ignored --list`) output of one CI step's command, stdout and stderr
 together, in the baseline's capture format. With no CONFIGURATION it captures all of them.
 
-The commands mirror `.github/workflows/test.yml`'s steps, as the configuration names do
-(`test.yml__<job>__<step>`). Keep them in step: a change to a step's command needs the same
-change here. The workspace unit step's features come from `UNIT_TEST_FEATURES`, which
-test.yml sets once for both jobs that use it; the variable is required. Tests crate steps
-list with `--lib --bins --tests`, as the baseline's captures did, and filtered steps also
-capture the unfiltered listing of the same binaries. Run it from any directory of the
-repository. Needs Python 3.9 or later and no packages.
+The CI steps' commands and environments come from `ci_steps.STEPS`, the one table both this
+tool and `coverage_net.py` read, and which `test_gates.py` checks against
+`.github/workflows/test.yml`; the configuration names are `test.yml__<job>__<step>`. The
+workspace unit step's features come from `UNIT_TEST_FEATURES`, which test.yml sets once for
+both jobs that use it; the variable is required. Tests crate steps list with `--lib --bins
+--tests`, as the baseline's captures did, and filtered steps also capture the unfiltered listing
+of the same binaries. Run it from any directory of the repository. Needs Python 3.9 or later
+and no packages.
 """
 import argparse
 import datetime
@@ -26,21 +27,17 @@ import signal
 import subprocess
 import sys
 
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ci_steps  # noqa: E402
+
 # A listing that builds its binaries from cold can take a while; one that outlasts this is
 # stopped (with its process group) and reported, instead of holding the job.
 COMMAND_TIMEOUT = 45 * 60
 
-REPO = Path(__file__).resolve().parents[2]
-BASE_ENV = {"STORE": "RocksDb", "RUST_MIN_STACK": "16777216"}
-SPAM = ("https://github.com/stalwartlabs/spam-filter/releases/download/v3.0.3/"
-        "spam-filter-rules.json.gz")
-TESTS = ["cargo", "test", "-p", "tests", "--lib", "--bins", "--tests"]
-
-
-def tests_step(filter_, env=None, exact=False):
-    tail = ["--exact", "--nocapture"] if exact else ["--nocapture"]
-    return dict(cmd=TESTS + [filter_, "--"] + tail, unfiltered=TESTS + ["--"] + tail,
-                env=env or {})
+REPO = ci_steps.REPO
+BASE_ENV = ci_steps.BASE_ENV
+TESTS = ci_steps.TESTS_CRATE + ci_steps.LISTING_TARGETS
 
 
 def plain(cmd):
@@ -48,55 +45,19 @@ def plain(cmd):
 
 
 def configurations(unit_features):
-    workspace = ["cargo", "test", "--workspace", "--exclude", "tests", "--exclude", "scim",
-                 "--exclude", "scim-proto", "--lib", "--bins", "--features", unit_features]
-    key = {"ZA_KEY_ACCOUNTS": "1"}
-    return {
-        "test.yml__test__directory-tests": tests_step("directory"),
-        "test.yml__test__imap-tests": tests_step("imap"),
-        "test.yml__test__jmap-tests": tests_step("jmap"),
-        "test.yml__test__smtp-tests": tests_step("smtp", {"SPAM_RULES_URL": SPAM}),
-        "test.yml__unit-tests__workspace-unit-tests": plain(workspace),
-        # Ruling 53 and the http test_mode step: the two selection moves' targets.
-        "test.yml__unit-tests__smtp-unit-tests-without-enterprise": plain(
-            ["cargo", "test", "-p", "smtp", "--lib", "--bins", "--features", "test_mode"]),
-        "test.yml__unit-tests__http-unit-tests": plain(
-            ["cargo", "test", "-p", "http@1.0.1", "--lib", "--bins", "--features",
-             "test_mode,enterprise"]),
-        "test.yml__upstream-suites__automation-tests": tests_step("automation::automation_tests"),
-        "test.yml__upstream-suites__blob-tests": tests_step("store::blob::blob_tests"),
-        "test.yml__upstream-suites__caldav-query-expansion-tests": tests_step(
-            "webdav::cal_query::"),
-        "test.yml__upstream-suites__lookup-tests": tests_step("store::lookup::lookup_tests"),
-        "test.yml__upstream-suites__search-tests": tests_step("store::search_tests"),
-        "test.yml__upstream-suites__store-tests": tests_step("store::store_tests"),
-        "test.yml__upstream-suites__system-tests": tests_step("system::system_tests"),
-        "test.yml__upstream-suites__telemetry-tests": tests_step("telemetry::telemetry_tests"),
-        "test.yml__zero-access__caldav-tests-key-accounts": tests_step("webdav::webdav_tests",
-                                                                       key),
-        "test.yml__zero-access__caldav-tests-plain-accounts": tests_step("webdav::webdav_tests"),
-        "test.yml__zero-access__imap-tests-key-accounts": tests_step("imap::imap_tests", key),
-        "test.yml__zero-access__imap-tests-plain-accounts-push-only": tests_step(
-            "imap::imap_tests"),
-        "test.yml__zero-access__jmap-tests-key-accounts": tests_step("jmap::jmap_tests", key),
-        "test.yml__zero-access__jmap-tests-plain-accounts-push-only": tests_step(
-            "jmap::jmap_tests"),
-        "test.yml__zero-access__vault-and-groupware-unit-tests": dict(
-            cmd=["cargo", "test", "-p", "vault", "-p", "groupware", "--features",
-                 "vault/test_mode", "--lib", "--bins", "--tests", "--", "--nocapture"],
-            unfiltered=None, env={}),
-        "test.yml__zero-access__zero-access-leak-scanner-unit-test": tests_step(
-            "za::leak::tests::try_archive_short_values_are_not_archives", exact=True),
-        "test.yml__zero-access__zero-access-tests": tests_step("za::za_tests"),
-        "test.yml__zero-access__zero-access-tests-filesystem-blob-store": tests_step(
-            "za::za_tests", {"BLOB_STORE": "FileSystem"}),
-        # Package captures whose ignored-only listings the baseline requires.
+    every = {}
+    for name, step in ci_steps.captured_steps().items():
+        cmd, unfiltered = ci_steps.listing_command(step, unit_features)
+        every[name] = dict(cmd=cmd, unfiltered=unfiltered, env=dict(step.env))
+    # Package captures whose ignored-only listings the baseline requires.
+    every.update({
         "exists__nlp__default": plain(["cargo", "test", "-p", "nlp", "--lib", "--bins",
                                        "--tests"]),
         "exists__spam-filter__default": plain(["cargo", "test", "-p", "spam-filter", "--lib",
                                                "--bins", "--tests"]),
         "exists__tests__default": plain(list(TESTS)),
-    }
+    })
+    return every
 
 
 def now():
