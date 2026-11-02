@@ -359,6 +359,10 @@ async fn ensure_pebble() {
         })
         .await;
     wait_for_tcp(14000).await;
+    // The mapped port accepts connections before Pebble listens behind it;
+    // on a fresh hosted runner the first ACME request came 50 ms after the
+    // port opened and failed to connect. Wait for the directory itself.
+    wait_for_http("https://localhost:14000/dir").await;
 }
 
 pub async fn ensure_powerdns() {
