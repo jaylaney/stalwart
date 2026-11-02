@@ -104,9 +104,9 @@ prerelease uses public upstream and fork tests for qualification and adds no pri
 dependency. Record fresh results before publication; existing results do not
 establish new backend, cluster, platform or native-client qualification, and results from
 the `0.1.x` base are not evidence for this prerelease. Its exact-source Linux product build
-runs from the tag through `product-build.yml`, and the published release notes record its
-verification. Its remaining gates, each needing its own session, are the native Calendar and
-Mail client checklist against the published build and a clean-context whole-branch review.
+ran from the tag through `product-build.yml`, and the published release notes record its
+verification. The native Calendar and Mail client checklist passed on the deployed build on
+2026-11-02, per Jay; its remaining gate is a clean-context whole-branch review.
 SQL backends, clusters, other platforms and the external
 protocol suites are not qualified. It stays a prerelease until its applicable
 gates pass; the [fork changelog](../CHANGELOG-fork.md) records its automated results.

@@ -106,7 +106,9 @@ records every command and result; its "Final record" section indexes them. In su
   dispatch).
 - The test retention gates were run again on `main` at `32d264cba`
   ([run 41484056674](https://github.com/jaylaney/stalwart/actions/runs/41484056674))
-  alongside the release build; the published release notes record their result.
+  alongside the release build, and passed with every other job of that run: 795 tests;
+  full 21,639 / 22,374 and runtime-only 12,539 / 13,198 covered lines, each 74 and 45 lines
+  above the 0.16.27 baseline's fraction.
 - Release-preparation checks, rerun at the preparation commit: 9 release-metadata tests
   (`python3 -I scripts/tests/test_release_metadata.py`) and 25 product-verifier tests
   (`python3 -B -I -m unittest discover -s scripts/release -p 'test_*.py'`) passed. A local
@@ -115,18 +117,19 @@ records every command and result; its "Final record" section indexes them. In su
 - The final whole-branch review ran as four Fable lenses and two scoped re-reviews; no
   Critical or Important finding remains.
 
-Pending gates:
+Gates beyond the automated runs, recorded after publication:
 
-- the exact-source Linux shipping build and its verification run from the tag through
-  `product-build.yml`. The published release notes record that run, the checksums, the
-  attestation and the measured GLIBC requirement of the real artifact; this entry predates
-  the build and records none of them;
+- the exact-source Linux shipping build and its verification, run from the tag through
+  `product-build.yml`: passed
+  ([run 41485088188](https://github.com/jaylaney/stalwart/actions/runs/41485088188)). The
+  published release notes record the checksums, the attestation and the measured GLIBC
+  requirement of the real artifact;
 - the native Apple Calendar (macOS and iOS), Thunderbird, DAVx5 and mail-client checklist
-  against the published build, under the
-  [manual checklist](docs/zero-access/manual-checklist.md); results from the `0.1.x` base
-  are not evidence for this release;
-- a clean-context whole-branch review: the final review's four lenses were given the
-  execution ledger and its rulings, which is not the clean context the plan specifies.
+  under the [manual checklist](docs/zero-access/manual-checklist.md): passed on the deployed
+  `fork-v0.2.0-beta.1` build, 2026-11-02, per Jay, with no per-client breakdown recorded;
+  results from the `0.1.x` base are not evidence for this release;
+- a clean-context whole-branch review: pending. The final review's four lenses were given
+  the execution ledger and its rulings, which is not the clean context the plan specifies.
 
 Not qualified: SQL and FoundationDB stores, multi-node execution, platforms other than the
 ones named above, upstream's private test suites and the external protocol suites (Dovecot
