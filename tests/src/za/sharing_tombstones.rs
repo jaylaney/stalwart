@@ -17,9 +17,9 @@ use groupware::{cache::GroupwareCache, calendar::Calendar};
 use hyper::StatusCode;
 use serde_json::json;
 use store::{
-    IterateParams, Key, LogKey, SUBSPACE_LOGS, ValueKey,
+    IterateParams, Key, LogKey, Subspace, ValueKey,
     query::log::Query,
-    write::{AlignedBytes, AnyClass, Archive, BatchBuilder, ValueClass},
+    write::{AnyClass, Archive, ArchiveBytes, BatchBuilder, ValueClass},
 };
 use types::collection::{Collection, SyncCollection, VanishedCollection};
 
@@ -80,7 +80,7 @@ async fn grant(slug: &str) {
 }
 async fn id(test: &TestServer, owner: u32, slug: &str) -> u32 {
     test.server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap()
         .by_path(slug)
@@ -88,7 +88,7 @@ async fn id(test: &TestServer, owner: u32, slug: &str) -> u32 {
         .document_id()
 }
 async fn rename_fixture(test: &TestServer, owner: u32, calendar_id: u32, name: &str) {
-    let stored: Archive<AlignedBytes> = test
+    let stored: Archive<ArchiveBytes> = test
         .server
         .store()
         .get_value(ValueKey::archive(owner, Collection::Calendar, calendar_id))
@@ -100,11 +100,7 @@ async fn rename_fixture(test: &TestServer, owner: u32, calendar_id: u32, name: &
     let mut batch = BatchBuilder::new();
     calendar
         .update(
-            test.server
-                .account_info(owner)
-                .await
-                .unwrap()
-                .account_tenant_ids(),
+            test.server.account_info(owner).await.unwrap().changed_by(),
             stored.to_unarchived::<Calendar>().unwrap(),
             owner,
             calendar_id,
@@ -151,8 +147,15 @@ async fn seed(
         .commit_batch(batch)
         .await
         .unwrap()
-        .last_change_id(owner)
-        .unwrap()
+        .last_change_id(owner, SyncCollection::Calendar)
+}
+/// A LEB128 length, as 1.0's vanished-name log writes it.
+fn leb128(buf: &mut Vec<u8>, mut value: usize) {
+    while value >= 0x80 {
+        buf.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    buf.push(value as u8);
 }
 fn identity(id: u32, path: &str) -> String {
     format!("{id:08x}:{path}")
@@ -338,7 +341,9 @@ async fn controls(
     assert!(
         response
             .hrefs()
-            .contains(&format!("{HOME}Family%20Trips/escaped.ics").as_str())
+            .contains(&format!("{HOME}Family%20Trips/escaped.ics").as_str()),
+        "{:?}",
+        response.hrefs()
     );
     let token = initial(bob).await;
     for name in ["page-one.ics", "page-two.ics"] {
@@ -409,10 +414,14 @@ async fn controls(
         1
     );
     // Legacy raw records keep exact bytes, and self-key sync keeps ordinary output.
-    let mut expected = path.as_bytes().to_vec();
-    expected.push(0);
+    // 1.0's name log (`VanishedItems::serialize`): each name as a LEB128 length
+    // and its bytes, a later one as the shared-prefix length, then the rest's
+    // length and bytes (0.16 wrote each name followed by a NUL).
+    let mut expected = Vec::new();
+    leb128(&mut expected, path.len());
     expected.extend_from_slice(path.as_bytes());
-    expected.push(0);
+    leb128(&mut expected, path.len());
+    leb128(&mut expected, 0);
     assert_eq!(bytes(test, owner, 252, commit).await, Some(expected));
     let own = sync(alice, &format!("{HOME}granted/"), &token)
         .await
@@ -626,7 +635,11 @@ async fn purge_publication_gap(
 async fn scan_races(test: &TestServer, owner: u32, reader: u32, granted: u32) {
     let client = move || DummyWebDavClient::new(reader, READER, STRONG, READER);
     let scope = format!("{HOME}granted/");
+    // Ruling 82: at 1.0 a sync whose token is current reads no log
+    // (`token_range` is `(id, id)`), so the token is one change behind: the
+    // sync reads both streams and parks between them.
     let token = initial(&client()).await;
+    seed(test, owner, granted, &[], &[]).await;
     let request_scope = scope.clone();
     let parked = HookParked::start(owner, test_hooks::set_calendar_sync_log_pause, async move {
         sync(
@@ -646,7 +659,20 @@ async fn scan_races(test: &TestServer, owner: u32, reader: u32, granted: u32) {
         &[identity(granted, &path)],
     )
     .await;
-    refused(parked.finish().await);
+    // Both reads are bounded by the snapshot taken before them, so the
+    // change written between them is in neither: the sync answers without
+    // it, consistently, and the next sync reports it. (0.16's unbounded
+    // reads saw it in one stream only and refused the token.)
+    let answer = parked.finish().await;
+    assert_eq!(answer.status, StatusCode::MULTI_STATUS, "{:?}", answer.body);
+    assert!(!answer.expect_body().contains("between-reads.ics"));
+    let next = sync(&client(), &scope, answer.sync_token())
+        .await
+        .with_status(StatusCode::MULTI_STATUS);
+    assert!(
+        next.hrefs().contains(&path.as_str()),
+        "the next sync reports the change written between the reads"
+    );
     let token = initial(&client()).await;
     let path = format!("{scope}purged.ics");
     seed(
@@ -691,7 +717,7 @@ async fn retention(test: &TestServer) {
                 };
                 batch.set(
                     ValueClass::Any(AnyClass {
-                        subspace: SUBSPACE_LOGS,
+                        subspace: Subspace::Logs,
                         key: LogKey {
                             account_id: owner,
                             collection,
@@ -704,7 +730,7 @@ async fn retention(test: &TestServer) {
             }
         }
     }
-    test.server.store().write(batch.build_all()).await.unwrap();
+    test.server.store().write_batch(&mut batch).await.unwrap();
     test.server
         .delete_changes(account, Some(1), None)
         .await
@@ -785,8 +811,11 @@ async fn ordinary_owner(test: &TestServer) {
         .await
         .unwrap()
         .unwrap();
-    let mut expected = path.as_bytes().to_vec();
-    expected.push(0);
+    // 1.0's name log: the LEB128 length, then the bytes (0.16 ended the name
+    // with a NUL).
+    let mut expected = Vec::new();
+    leb128(&mut expected, path.len());
+    expected.extend_from_slice(path.as_bytes());
     assert_eq!(
         bytes(test, owner, 252, deleted).await,
         Some(expected),
@@ -804,7 +833,7 @@ async fn ordinary_owner(test: &TestServer) {
     assert!(response.expect_body().contains("404 Not Found"));
     let calendar = test
         .server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap()
         .by_path("ordinary")

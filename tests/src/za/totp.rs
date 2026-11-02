@@ -76,11 +76,14 @@ async fn registry_state(test: &TestServer) -> (Option<String>, u64) {
         .await
         .unwrap()
         .unwrap();
-    let ObjectInner::Account(structs::Account::User(account)) = object.inner else {
+    let ObjectInner::Account(account) = object.inner else {
+        panic!("not an account");
+    };
+    let structs::Account::User(account) = *account else {
         panic!("not a user account");
     };
     (
-        account.password_credential().unwrap().otp_auth.clone(),
+        account.password_credential().unwrap().otp_url.clone(),
         object.revision,
     )
 }
@@ -219,8 +222,7 @@ pub async fn test(test: &mut TestServer) {
     // cached, and the password alone no longer logs in afterwards.
     caldav(STRONG, StatusCode::MULTI_STATUS).await;
     test.server
-        .invalidate_local_caches(&[CacheInvalidation::AccessToken(id)])
-        .await;
+        .invalidate_local_caches(&[CacheInvalidation::AccessToken(id)]);
     let (registry_totp, registry_revision) = registry_state(test).await;
     assert_eq!(registry_totp, None);
     let before = test.server.za_vault_record(id).await.unwrap().unwrap();

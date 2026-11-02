@@ -4,37 +4,70 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::assert_is_unique_uid;
+use super::{CalendarComponentSupport, assert_event_privacy_access, assert_is_unique_uid};
 use crate::{
     DavError, DavMethod,
     common::{
+        ContainerOperation, assert_parent_limit,
+        dead::{
+            ContainerRequest, ContainerWrites, DeadContainers, check_growth, container_kinds,
+            copy_growth, read_container,
+        },
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
-        za::ZeroAccessGate,
+        za::{ZeroAccessGate, za_mutation_context, za_reseal_container},
     },
     file::DavFileResource,
 };
-use calcard::common::timezone::Tz;
-use common::{DavName, Server, auth::AccessToken};
+use common::{
+    DavName, GroupwareResources, Server,
+    auth::AccessToken,
+    storage::{
+        batch::MAX_BATCH_DOCUMENTS,
+        index::PresenceFlags,
+        metadata::{StoredContainer, StoredEntry},
+    },
+};
 use dav_proto::{Depth, RequestHeaders};
+use groupware::calendar::{
+    seal::{
+        ZaContainerOf, ZaContainerScope, ZaEvent, classify_event_storage, rewrap_event, seal_error,
+    },
+    sharing::resolve::{ZaCalendarContext, calendars_changed, za_calendar_context},
+};
 use groupware::{
     DestroyArchive,
     cache::GroupwareCache,
-    calendar::{Calendar, CalendarEvent, CalendarPreferences, Timezone},
+    calendar::{
+        CALENDAR_SUBSCRIBED, Calendar, CalendarEvent, CalendarEventContent, CalendarPreferences,
+        EVENT_HAS_ALARMS, Timezone,
+        alerts::{CalendarSettings, DefaultAlertsResolver},
+        identity::{CalendarAddresses, ParticipantIdentityAddresses},
+        privacy::{EventPrivacy, EventViewer},
+        rights::{EventAcl, StoredEventOwnership},
+        schedule::{AlarmTasks, EventAlarmScheduler, EventAlarmUsers},
+        storage::{DirectChangeNotification, NotificationQuota},
+    },
 };
 use http_proto::HttpResponse;
 use hyper::StatusCode;
-use store::write::{BatchBuilder, now};
+use registry::schema::enums::StorageQuota;
+use std::collections::{BTreeMap, BTreeSet};
+use store::write::{BatchBuilder, PendingId, now};
+use store::write::{MergeResult, ValueClass, metadata::MetadataBuf};
 use store::{
     ValueKey,
-    write::{AlignedBytes, Archive, ValueClass},
+    roaring::RoaringBitmap,
+    write::{Archive, ArchiveBytes},
 };
 use trc::AddContext;
 use types::{
     acl::Acl,
     collection::{Collection, SyncCollection},
-    field::PrincipalField,
+    field::{CalendarEventField, Field, PrincipalField},
+    metadata::MetadataKinds,
 };
+use utils::map::bitmap::Bitmap;
 
 pub(crate) trait CalendarCopyMoveRequestHandler: Sync + Send {
     fn handle_calendar_copy_move_request(
@@ -59,7 +92,7 @@ impl CalendarCopyMoveRequestHandler for Server {
             .into_owned_uri()?;
         let from_account_id = from_resource_.account_id;
         let from_resources = self
-            .fetch_dav_resources(
+            .fetch_groupware_resources(
                 access_token.account_id(),
                 from_account_id,
                 SyncCollection::Calendar,
@@ -89,19 +122,29 @@ impl CalendarCopyMoveRequestHandler for Server {
         }
 
         // Validate ACL
-        if !access_token.is_member(from_account_id)
+        let is_from_owner = access_token.is_member(from_account_id);
+        if !from_resource.is_container() {
+            assert_event_privacy_access(
+                from_resource.resource.event_flags(),
+                EventViewer::new(is_from_owner),
+            )?;
+        }
+        if !is_from_owner
             && !from_resources.has_access_to_container(
                 access_token,
                 if from_resource.is_container() {
                     from_resource.document_id()
                 } else {
-                    from_resource.parent_id().unwrap()
+                    from_resource
+                        .parent_id()
+                        .ok_or(DavError::Code(StatusCode::NOT_FOUND))?
                 },
                 Acl::ReadItems,
             )
         {
             return Err(DavError::Code(StatusCode::FORBIDDEN));
         }
+        let container_operation = ContainerOperation::from_move(is_move);
 
         // Validate destination
         let destination = self
@@ -121,10 +164,18 @@ impl CalendarCopyMoveRequestHandler for Server {
             .ok_or(DavError::Code(StatusCode::BAD_GATEWAY))?;
         self.za_refuse_cross_account(from_account_id, to_account_id)
             .await?;
+        let is_to_owner = access_token.is_member(to_account_id);
+        if !from_resource.is_container()
+            && !is_to_owner
+            && !EventPrivacy::from_flags(from_resource.resource.event_flags().unwrap_or_default())
+                .is_public()
+        {
+            return Err(DavError::Code(StatusCode::FORBIDDEN));
+        }
         let to_resources = if to_account_id == from_account_id {
             from_resources.clone()
         } else {
-            self.fetch_dav_resources(
+            self.fetch_groupware_resources(
                 access_token.account_id(),
                 to_account_id,
                 SyncCollection::Calendar,
@@ -138,6 +189,11 @@ impl CalendarCopyMoveRequestHandler for Server {
             .resource
             .ok_or(DavError::Code(StatusCode::BAD_GATEWAY))?;
         let to_resource = to_resources.by_path(destination_resource_name);
+        let visible_to_resource = to_resource.filter(|resource| {
+            is_to_owner
+                || EventPrivacy::from_flags(resource.resource.event_flags().unwrap_or_default())
+                    != EventPrivacy::Secret
+        });
         self.validate_headers(
             access_token,
             headers,
@@ -155,7 +211,7 @@ impl CalendarCopyMoveRequestHandler for Server {
                 },
                 ResourceState {
                     account_id: to_account_id,
-                    collection: to_resource
+                    collection: visible_to_resource
                         .map(|r| {
                             if r.is_container() {
                                 Collection::Calendar
@@ -164,7 +220,11 @@ impl CalendarCopyMoveRequestHandler for Server {
                             }
                         })
                         .unwrap_or(Collection::Calendar),
-                    document_id: Some(to_resource.map(|r| r.document_id()).unwrap_or(u32::MAX)),
+                    document_id: Some(
+                        visible_to_resource
+                            .map(|r| r.document_id())
+                            .unwrap_or(u32::MAX),
+                    ),
                     path: destination_resource_name,
                     ..Default::default()
                 },
@@ -191,29 +251,23 @@ impl CalendarCopyMoveRequestHandler for Server {
 
             match (from_resource.is_container(), to_resource.is_container()) {
                 (true, true) => {
-                    let from_children_ids = from_resources
-                        .subtree(from_resource_name)
-                        .filter(|r| !r.is_container())
-                        .map(|r| r.document_id())
-                        .collect::<Vec<_>>();
-                    let to_document_ids = to_resources
+                    let from_children_ids = container_operation.event_ids(
+                        &from_resources,
+                        from_resource_name,
+                        EventViewer::new(is_from_owner),
+                    )?;
+                    let to_children = to_resources
                         .subtree(destination_resource_name)
                         .filter(|r| !r.is_container())
-                        .map(|r| r.document_id())
+                        .map(|r| (r.document_id(), r.resource.metadata_kinds()))
                         .collect::<Vec<_>>();
 
                     // Validate ACLs
-                    if !access_token.is_member(to_account_id)
-                        || (!access_token.is_member(from_account_id)
-                            && !from_resources.has_access_to_container(
-                                access_token,
-                                from_resource.document_id(),
-                                if is_move {
-                                    Acl::RemoveItems
-                                } else {
-                                    Acl::ReadItems
-                                },
-                            ))
+                    if !is_to_owner
+                        || (!is_from_owner
+                            && !from_resources
+                                .container_acl(access_token, from_resource.document_id())
+                                .contains_all(container_operation.required_acls()))
                     {
                         return Err(DavError::Code(StatusCode::FORBIDDEN));
                     }
@@ -222,13 +276,15 @@ impl CalendarCopyMoveRequestHandler for Server {
                     copy_container(
                         self,
                         access_token,
+                        &from_resources,
+                        &to_resources,
                         from_account_id,
                         from_resource.document_id(),
                         from_children_ids,
                         from_resources.format_collection(from_resource_name),
                         to_account_id,
                         to_resource.document_id().into(),
-                        to_document_ids,
+                        to_children,
                         new_name,
                         is_move,
                     )
@@ -240,8 +296,9 @@ impl CalendarCopyMoveRequestHandler for Server {
                     let to_calendar_id = to_resource.parent_id().unwrap();
 
                     // Validate ACL
-                    if (!access_token.is_member(from_account_id)
-                        && !from_resources.has_access_to_container(
+                    let mut own_events = OwnEventAccess::new(self, access_token);
+                    let may_take = access_token.is_member(from_account_id)
+                        || from_resources.has_access_to_container(
                             access_token,
                             from_calendar_id,
                             if is_move {
@@ -249,21 +306,50 @@ impl CalendarCopyMoveRequestHandler for Server {
                             } else {
                                 Acl::ReadItems
                             },
-                        ))
-                        || (!access_token.is_member(to_account_id)
-                            && !to_resources.has_access_to_container(
-                                access_token,
-                                to_calendar_id,
-                                Acl::RemoveItems,
-                            ))
-                    {
+                        )
+                        || (is_move
+                            && own_events
+                                .may_manage(
+                                    &from_resources,
+                                    from_calendar_id,
+                                    from_account_id,
+                                    from_resource.document_id(),
+                                )
+                                .await?);
+                    let may_overwrite = may_take
+                        && (access_token.is_member(to_account_id)
+                            || to_resources
+                                .container_acl(access_token, to_calendar_id)
+                                .contains_all([Acl::AddItems, Acl::RemoveItems].into_iter())
+                            || (own_events
+                                .may_manage(
+                                    &to_resources,
+                                    to_calendar_id,
+                                    to_account_id,
+                                    to_resource.document_id(),
+                                )
+                                .await?
+                                && own_events
+                                    .may_manage(
+                                        &to_resources,
+                                        to_calendar_id,
+                                        from_account_id,
+                                        from_resource.document_id(),
+                                    )
+                                    .await?));
+                    if !may_overwrite {
                         return Err(DavError::Code(StatusCode::FORBIDDEN));
                     }
+                    assert_event_privacy_access(
+                        to_resource.resource.event_flags(),
+                        EventViewer::new(is_to_owner),
+                    )?;
 
                     if is_move {
                         move_event(
                             self,
                             access_token,
+                            &to_resources,
                             from_account_id,
                             from_resource.document_id(),
                             from_calendar_id,
@@ -279,6 +365,7 @@ impl CalendarCopyMoveRequestHandler for Server {
                         copy_event(
                             self,
                             access_token,
+                            &to_resources,
                             from_account_id,
                             from_resource.document_id(),
                             from_calendar_id,
@@ -305,8 +392,9 @@ impl CalendarCopyMoveRequestHandler for Server {
                 // Validate ACL
                 let from_calendar_id = from_resource.parent_id().unwrap();
                 let to_calendar_id = parent_resource.document_id();
-                if (!access_token.is_member(from_account_id)
-                    && !from_resources.has_access_to_container(
+                let mut own_events = OwnEventAccess::new(self, access_token);
+                let may_take = access_token.is_member(from_account_id)
+                    || from_resources.has_access_to_container(
                         access_token,
                         from_calendar_id,
                         if is_move {
@@ -314,14 +402,32 @@ impl CalendarCopyMoveRequestHandler for Server {
                         } else {
                             Acl::ReadItems
                         },
-                    ))
-                    || (!access_token.is_member(to_account_id)
-                        && !to_resources.has_access_to_container(
+                    )
+                    || (is_move
+                        && own_events
+                            .may_manage(
+                                &from_resources,
+                                from_calendar_id,
+                                from_account_id,
+                                from_resource.document_id(),
+                            )
+                            .await?);
+                let may_add = may_take
+                    && (access_token.is_member(to_account_id)
+                        || to_resources.has_access_to_container(
                             access_token,
                             to_calendar_id,
                             Acl::AddItems,
-                        ))
-                {
+                        )
+                        || own_events
+                            .may_manage(
+                                &to_resources,
+                                to_calendar_id,
+                                from_account_id,
+                                from_resource.document_id(),
+                            )
+                            .await?);
+                if !may_add {
                     return Err(DavError::Code(StatusCode::FORBIDDEN));
                 }
 
@@ -333,6 +439,7 @@ impl CalendarCopyMoveRequestHandler for Server {
                         move_event(
                             self,
                             access_token,
+                            &to_resources,
                             from_account_id,
                             from_resource.document_id(),
                             from_calendar_id,
@@ -360,6 +467,7 @@ impl CalendarCopyMoveRequestHandler for Server {
                     copy_event(
                         self,
                         access_token,
+                        &to_resources,
                         from_account_id,
                         from_resource.document_id(),
                         from_calendar_id,
@@ -377,36 +485,32 @@ impl CalendarCopyMoveRequestHandler for Server {
                 }
 
                 // Shared users cannot create containers
-                if !access_token.is_member(to_account_id) {
+                if !is_to_owner {
                     return Err(DavError::Code(StatusCode::FORBIDDEN));
                 }
 
                 // Validate ACLs
-                if !access_token.is_member(from_account_id)
-                    && !from_resources.has_access_to_container(
-                        access_token,
-                        from_resource.document_id(),
-                        if is_move {
-                            Acl::RemoveItems
-                        } else {
-                            Acl::ReadItems
-                        },
-                    )
+                if !is_from_owner
+                    && !from_resources
+                        .container_acl(access_token, from_resource.document_id())
+                        .contains_all(container_operation.required_acls())
                 {
                     return Err(DavError::Code(StatusCode::FORBIDDEN));
                 }
 
                 // Copy/move container
-                let from_children_ids = from_resources
-                    .subtree(from_resource_name)
-                    .filter(|r| !r.is_container())
-                    .map(|r| r.document_id())
-                    .collect::<Vec<_>>();
+                let from_children_ids = container_operation.event_ids(
+                    &from_resources,
+                    from_resource_name,
+                    EventViewer::new(is_from_owner),
+                )?;
                 if is_move {
                     if from_account_id != to_account_id {
                         copy_container(
                             self,
                             access_token,
+                            &from_resources,
+                            &to_resources,
                             from_account_id,
                             from_resource.document_id(),
                             if headers.depth != Depth::Zero {
@@ -437,6 +541,8 @@ impl CalendarCopyMoveRequestHandler for Server {
                     copy_container(
                         self,
                         access_token,
+                        &from_resources,
+                        &to_resources,
                         from_account_id,
                         from_resource.document_id(),
                         if headers.depth != Depth::Zero {
@@ -460,10 +566,56 @@ impl CalendarCopyMoveRequestHandler for Server {
     }
 }
 
+struct OwnEventAccess<'x> {
+    server: &'x Server,
+    access_token: &'x AccessToken,
+    identities: Option<CalendarAddresses>,
+}
+
+impl<'x> OwnEventAccess<'x> {
+    fn new(server: &'x Server, access_token: &'x AccessToken) -> Self {
+        OwnEventAccess {
+            server,
+            access_token,
+            identities: None,
+        }
+    }
+
+    async fn may_manage(
+        &mut self,
+        resources: &GroupwareResources,
+        calendar_id: u32,
+        account_id: u32,
+        document_id: u32,
+    ) -> crate::Result<bool> {
+        if !EventAcl::for_calendar(resources, self.access_token, calendar_id).may_manage_own_items()
+        {
+            return Ok(false);
+        }
+        let identities = match self.identities.as_ref() {
+            Some(identities) => identities,
+            None => self.identities.get_or_insert(
+                self.server
+                    .account_identity_addresses(self.access_token.account_id())
+                    .await
+                    .caused_by(trc::location!())?,
+            ),
+        };
+
+        Ok(self
+            .server
+            .stored_event_ownership(account_id, document_id, identities)
+            .await
+            .caused_by(trc::location!())?
+            .may_write_own())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn copy_event(
     server: &Server,
     access_token: &AccessToken,
+    to_resources: &GroupwareResources,
     from_account_id: u32,
     from_document_id: u32,
     from_calendar_id: u32,
@@ -492,7 +644,7 @@ async fn copy_event(
     // Fetch event
     let event_ = server
         .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
             from_account_id,
             Collection::CalendarEvent,
             from_document_id,
@@ -504,26 +656,28 @@ async fn copy_event(
         .to_unarchived::<CalendarEvent>()
         .caused_by(trc::location!())?;
     let mut batch = BatchBuilder::new();
+    crate::common::za::za_ordinary_fence(server, &mut batch, to_account_id, None);
 
     // Validate UID
     assert_is_unique_uid(
-        server,
-        server
-            .fetch_dav_resources(
-                access_token.account_id(),
-                to_account_id,
-                SyncCollection::Calendar,
-            )
-            .await
-            .caused_by(trc::location!())?
-            .as_ref(),
+        to_resources,
+        access_token,
         to_account_id,
         to_calendar_id,
-        event.inner.data.event.uids().next(),
-    )
-    .await?;
+        Some(event.inner.uid.as_str()).filter(|uid| !uid.is_empty()),
+    )?;
+    let checked_content = server
+        .assert_stored_event_supported(
+            from_account_id,
+            from_document_id,
+            to_account_id,
+            to_calendar_id,
+        )
+        .await?;
 
-    let changed_by = access_token.account_tenant_ids();
+    let changed_by = access_token.changed_by();
+    let event_flags = event.inner.flags.to_native();
+    let mut quota = NotificationQuota::default();
     if from_account_id == to_account_id {
         let mut new_event = event
             .deserialize::<CalendarEvent>()
@@ -532,17 +686,84 @@ async fn copy_event(
             name: new_name.to_string(),
             parent_id: to_calendar_id,
         });
+        server
+            .notify_calendar_addition(
+                access_token,
+                to_account_id,
+                PendingId::Assigned(from_document_id),
+                to_calendar_id,
+                event_flags,
+                (from_account_id, from_document_id),
+                &mut quota,
+                &mut batch,
+            )
+            .await
+            .caused_by(trc::location!())?;
+        assert_parent_limit(
+            event.inner.names.len(),
+            new_event.names.len(),
+            server.core.groupware.max_calendars_per_event,
+        )?;
+        server
+            .reschedule_event_alarms(
+                from_account_id,
+                from_document_id,
+                event.inner,
+                None,
+                &new_event
+                    .names
+                    .iter()
+                    .map(DavName::parent_id)
+                    .collect::<Vec<_>>(),
+                &mut AlarmTasks::None,
+                &mut DefaultAlertsResolver::default(),
+                &mut batch,
+            )
+            .await
+            .caused_by(trc::location!())?;
         new_event
-            .update(
+            .update_meta(
                 changed_by,
                 event,
                 from_account_id,
                 from_document_id,
+                None,
                 &mut batch,
             )
             .caused_by(trc::location!())?;
     } else {
-        let next_email_alarm = event.inner.data.next_alarm(now() as i64, Tz::Floating);
+        let content_ = match checked_content {
+            Some(content_) => content_,
+            None => server
+                .store()
+                .get_value::<Archive<ArchiveBytes>>(ValueKey::property(
+                    from_account_id,
+                    Collection::CalendarEvent,
+                    from_document_id,
+                    CalendarEventField::Content,
+                ))
+                .await
+                .caused_by(trc::location!())?
+                .ok_or(DavError::Code(StatusCode::NOT_FOUND))?,
+        };
+        let mut new_content = content_
+            .deserialize::<CalendarEventContent>()
+            .caused_by(trc::location!())?;
+        new_content
+            .preferences
+            .retain(|preferences| preferences.account_id == access_token.account_id());
+        let next_email_alarms = server
+            .next_event_alarms(
+                to_account_id,
+                &EventAlarmUsers::new(to_account_id, &new_content)?
+                    .with_event_flags(event.inner.flags.to_native()),
+                &new_content.data,
+                &[to_calendar_id],
+                now() as i64,
+                &mut DefaultAlertsResolver::default(),
+            )
+            .await
+            .caused_by(trc::location!())?;
         let mut new_event = event
             .deserialize::<CalendarEvent>()
             .caused_by(trc::location!())?;
@@ -550,17 +771,62 @@ async fn copy_event(
             name: new_name.to_string(),
             parent_id: to_calendar_id,
         }];
-        let to_document_id = server
-            .store()
-            .assign_document_ids(to_account_id, Collection::CalendarEvent, 1)
+        let container = read_container(
+            server,
+            from_account_id,
+            Collection::CalendarEvent,
+            from_document_id,
+            event.inner.metadata_kinds(),
+        )
+        .await
+        .caused_by(trc::location!())?;
+        check_growth(
+            server,
+            to_account_id,
+            container
+                .as_ref()
+                .map_or(0, |container| copy_growth(container, None)),
+        )
+        .await
+        .caused_by(trc::location!())?;
+        new_event.set_metadata_kinds(container_kinds(container.as_ref()));
+        if to_document_id.is_none() {
+            server.assert_object_quota(
+                &*server.account(to_account_id).await?,
+                StorageQuota::MaxCalendarEvents,
+                1,
+                || to_resources.resources.count(false),
+            )?;
+        }
+        let to_document_id = batch.reserve_document_id(to_account_id, Collection::CalendarEvent);
+        server
+            .notify_calendar_addition(
+                access_token,
+                to_account_id,
+                to_document_id.into(),
+                to_calendar_id,
+                event_flags,
+                (from_account_id, from_document_id),
+                &mut quota,
+                &mut batch,
+            )
             .await
             .caused_by(trc::location!())?;
+        if let Some(container) = &container {
+            let mut copies = ContainerWrites::new(to_account_id, Collection::CalendarEvent);
+            copies
+                .copy(server, container, to_document_id, None, &mut batch)
+                .await
+                .caused_by(trc::location!())?;
+        }
         new_event
             .insert(
+                new_content,
                 changed_by,
                 to_account_id,
                 to_document_id,
-                next_email_alarm,
+                None,
+                next_email_alarms,
                 &mut batch,
             )
             .caused_by(trc::location!())?;
@@ -570,7 +836,7 @@ async fn copy_event(
         // Overwrite event on destination
         let event_ = server
             .store()
-            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
                 to_account_id,
                 Collection::CalendarEvent,
                 to_document_id,
@@ -586,16 +852,31 @@ async fn copy_event(
                 .await
                 .caused_by(trc::location!())?;
 
+            server
+                .notify_calendar_removal(
+                    access_token,
+                    to_account_id,
+                    to_document_id,
+                    to_calendar_id,
+                    event.inner.flags.to_native(),
+                    &mut quota,
+                    &mut batch,
+                )
+                .await
+                .caused_by(trc::location!())?;
             DestroyArchive(event)
                 .delete(
+                    server,
                     &account_info,
                     to_account_id,
                     to_document_id,
                     to_calendar_id,
                     None,
+                    None,
                     false,
                     &mut batch,
                 )
+                .await
                 .caused_by(trc::location!())?;
         }
 
@@ -608,7 +889,6 @@ async fn copy_event(
         .commit_batch(batch)
         .await
         .caused_by(trc::location!())?;
-    server.notify_task_queue();
 
     response
 }
@@ -617,6 +897,7 @@ async fn copy_event(
 async fn move_event(
     server: &Server,
     access_token: &AccessToken,
+    to_resources: &GroupwareResources,
     from_account_id: u32,
     from_document_id: u32,
     from_calendar_id: u32,
@@ -647,7 +928,7 @@ async fn move_event(
     // Fetch event
     let event_ = server
         .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
             from_account_id,
             Collection::CalendarEvent,
             from_document_id,
@@ -672,42 +953,56 @@ async fn move_event(
         || to_document_id.is_none()
     {
         assert_is_unique_uid(
-            server,
-            server
-                .fetch_dav_resources(
-                    access_token.account_id(),
-                    to_account_id,
-                    SyncCollection::Calendar,
-                )
-                .await
-                .caused_by(trc::location!())?
-                .as_ref(),
+            to_resources,
+            access_token,
             to_account_id,
             to_calendar_id,
-            event.inner.data.event.uids().next(),
-        )
-        .await?;
+            Some(event.inner.uid.as_str()).filter(|uid| !uid.is_empty()),
+        )?;
     }
+    let checked_content = if from_account_id != to_account_id || from_calendar_id != to_calendar_id
+    {
+        server
+            .assert_stored_event_supported(
+                from_account_id,
+                from_document_id,
+                to_account_id,
+                to_calendar_id,
+            )
+            .await?
+    } else {
+        None
+    };
 
     let account_info = server
         .account_info(access_token.account_id())
         .await
         .caused_by(trc::location!())?;
     let mut batch = BatchBuilder::new();
+    crate::common::za::za_ordinary_fence(server, &mut batch, to_account_id, Some(from_account_id));
+    let event_flags = event.inner.flags.to_native();
+    let mut quota = NotificationQuota::default();
+    if from_calendar_id != to_calendar_id || from_account_id != to_account_id {
+        server
+            .notify_calendar_removal(
+                access_token,
+                from_account_id,
+                from_document_id,
+                from_calendar_id,
+                event_flags,
+                &mut quota,
+                &mut batch,
+            )
+            .await
+            .caused_by(trc::location!())?;
+    }
     if from_account_id == to_account_id {
-        let mut name_idx = None;
-        for (idx, name) in event.inner.names.iter().enumerate() {
-            if name.parent_id == from_calendar_id {
-                name_idx = Some(idx);
-                break;
-            }
-        }
-
-        let name_idx = if let Some(name_idx) = name_idx {
-            name_idx
-        } else {
-            return Err(DavError::Code(StatusCode::NOT_FOUND));
-        };
+        let name_idx = event
+            .inner
+            .names
+            .iter()
+            .position(|name| name.parent_id == from_calendar_id)
+            .ok_or(DavError::Code(StatusCode::NOT_FOUND))?;
 
         let mut new_event = event
             .deserialize::<CalendarEvent>()
@@ -717,18 +1012,82 @@ async fn move_event(
             name: new_name.to_string(),
             parent_id: to_calendar_id,
         });
+        if from_calendar_id != to_calendar_id {
+            server
+                .notify_calendar_addition(
+                    access_token,
+                    to_account_id,
+                    PendingId::Assigned(from_document_id),
+                    to_calendar_id,
+                    event_flags,
+                    (from_account_id, from_document_id),
+                    &mut quota,
+                    &mut batch,
+                )
+                .await
+                .caused_by(trc::location!())?;
+        }
+        server
+            .reschedule_event_alarms(
+                from_account_id,
+                from_document_id,
+                event.inner,
+                None,
+                &new_event
+                    .names
+                    .iter()
+                    .map(DavName::parent_id)
+                    .collect::<Vec<_>>(),
+                &mut AlarmTasks::None,
+                &mut DefaultAlertsResolver::default(),
+                &mut batch,
+            )
+            .await
+            .caused_by(trc::location!())?;
         new_event
-            .update(
-                access_token.account_tenant_ids(),
+            .update_meta(
+                access_token.changed_by(),
                 event.clone(),
                 from_account_id,
                 from_document_id,
+                None,
                 &mut batch,
             )
             .caused_by(trc::location!())?;
         batch.log_calendar_vanished(from_calendar_id, from_resource_path);
     } else {
-        let next_email_alarm = event.inner.data.next_alarm(now() as i64, Tz::Floating);
+        let content_ = match checked_content {
+            Some(content_) => content_,
+            None => server
+                .store()
+                .get_value::<Archive<ArchiveBytes>>(ValueKey::property(
+                    from_account_id,
+                    Collection::CalendarEvent,
+                    from_document_id,
+                    CalendarEventField::Content,
+                ))
+                .await
+                .caused_by(trc::location!())?
+                .ok_or(DavError::Code(StatusCode::NOT_FOUND))?,
+        };
+        let mut new_content = content_
+            .deserialize::<CalendarEventContent>()
+            .caused_by(trc::location!())?;
+        new_content
+            .preferences
+            .retain(|preferences| preferences.account_id == access_token.account_id());
+        let next_email_alarms = server
+            .next_event_alarms(
+                to_account_id,
+                &EventAlarmUsers::new(to_account_id, &new_content)?
+                    .with_event_flags(event.inner.flags.to_native()),
+                &new_content.data,
+                &[to_calendar_id],
+                now() as i64,
+                &mut DefaultAlertsResolver::default(),
+            )
+            .await
+            .caused_by(trc::location!())?;
         let mut new_event = event
             .deserialize::<CalendarEvent>()
             .caused_by(trc::location!())?;
@@ -736,30 +1095,93 @@ async fn move_event(
             name: new_name.to_string(),
             parent_id: to_calendar_id,
         }];
+        let container = read_container(
+            server,
+            from_account_id,
+            Collection::CalendarEvent,
+            from_document_id,
+            event.inner.metadata_kinds(),
+        )
+        .await
+        .caused_by(trc::location!())?;
+        check_growth(
+            server,
+            to_account_id,
+            container
+                .as_ref()
+                .map_or(0, |container| copy_growth(container, None)),
+        )
+        .await
+        .caused_by(trc::location!())?;
+        new_event.set_metadata_kinds(container_kinds(container.as_ref()));
 
+        let source_cleanup = server
+            .container_cleanup_from(
+                access_token.changed_by(),
+                from_account_id,
+                Collection::CalendarEvent,
+                container
+                    .as_ref()
+                    .map(|container| StoredEntry::from_container(from_document_id, container)),
+            )
+            .await
+            .caused_by(trc::location!())?;
         DestroyArchive(event)
-            .delete(
+            .delete_with_cleanup(
+                server,
                 &account_info,
                 from_account_id,
                 from_document_id,
                 from_calendar_id,
+                Some(content_),
+                &mut AlarmTasks::None,
                 from_resource_path.into(),
-                false,
+                &source_cleanup,
                 &mut batch,
             )
-            .caused_by(trc::location!())?;
-
-        let to_document_id = server
-            .store()
-            .assign_document_ids(to_account_id, Collection::CalendarEvent, 1)
             .await
             .caused_by(trc::location!())?;
+
+        let to_account = server.account(to_account_id).await?;
+        if to_document_id.is_none()
+            && server
+                .object_quota_limit(&to_account, StorageQuota::MaxCalendarEvents)
+                .is_some()
+        {
+            server.assert_object_quota(&to_account, StorageQuota::MaxCalendarEvents, 1, || {
+                to_resources.resources.count(false)
+            })?;
+        }
+
+        let to_document_id = batch.reserve_document_id(to_account_id, Collection::CalendarEvent);
+        server
+            .notify_calendar_addition(
+                access_token,
+                to_account_id,
+                to_document_id.into(),
+                to_calendar_id,
+                event_flags,
+                (from_account_id, from_document_id),
+                &mut quota,
+                &mut batch,
+            )
+            .await
+            .caused_by(trc::location!())?;
+        if let Some(container) = &container {
+            let mut copies = ContainerWrites::new(to_account_id, Collection::CalendarEvent);
+            copies
+                .copy(server, container, to_document_id, None, &mut batch)
+                .await
+                .caused_by(trc::location!())?;
+        }
         new_event
             .insert(
-                access_token.account_tenant_ids(),
+                new_content,
+                access_token.changed_by(),
                 to_account_id,
                 to_document_id,
-                next_email_alarm,
+                None,
+                next_email_alarms,
                 &mut batch,
             )
             .caused_by(trc::location!())?;
@@ -769,7 +1191,7 @@ async fn move_event(
         // Overwrite event on destination
         let event_ = server
             .store()
-            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
                 to_account_id,
                 Collection::CalendarEvent,
                 to_document_id,
@@ -781,16 +1203,31 @@ async fn move_event(
                 .to_unarchived::<CalendarEvent>()
                 .caused_by(trc::location!())?;
 
+            server
+                .notify_calendar_removal(
+                    access_token,
+                    to_account_id,
+                    to_document_id,
+                    to_calendar_id,
+                    event.inner.flags.to_native(),
+                    &mut quota,
+                    &mut batch,
+                )
+                .await
+                .caused_by(trc::location!())?;
             DestroyArchive(event)
                 .delete(
+                    server,
                     &account_info,
                     to_account_id,
                     to_document_id,
                     to_calendar_id,
                     None,
+                    None,
                     false,
                     &mut batch,
                 )
+                .await
                 .caused_by(trc::location!())?;
         }
 
@@ -803,7 +1240,6 @@ async fn move_event(
         .commit_batch(batch)
         .await
         .caused_by(trc::location!())?;
-    server.notify_task_queue();
 
     response
 }
@@ -838,7 +1274,7 @@ async fn rename_event(
     // Fetch event
     let event_ = server
         .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
             account_id,
             Collection::CalendarEvent,
             document_id,
@@ -862,12 +1298,14 @@ async fn rename_event(
     new_event.names[name_idx].name = new_name.to_string();
 
     let mut batch = BatchBuilder::new();
+    crate::common::za::za_ordinary_fence(server, &mut batch, account_id, None);
     new_event
-        .update(
-            access_token.account_tenant_ids(),
+        .update_meta(
+            access_token.changed_by(),
             event,
             account_id,
             document_id,
+            None,
             &mut batch,
         )
         .caused_by(trc::location!())?;
@@ -876,7 +1314,6 @@ async fn rename_event(
         .commit_batch(batch)
         .await
         .caused_by(trc::location!())?;
-    server.notify_task_queue();
 
     Ok(HttpResponse::new(StatusCode::CREATED))
 }
@@ -885,13 +1322,15 @@ async fn rename_event(
 async fn copy_container(
     server: &Server,
     access_token: &AccessToken,
+    from_resources: &GroupwareResources,
+    to_resources: &GroupwareResources,
     from_account_id: u32,
     from_document_id: u32,
     from_children_ids: Vec<u32>,
     from_resource_path: String,
     to_account_id: u32,
     to_document_id: Option<u32>,
-    to_children_ids: Vec<u32>,
+    to_children: Vec<(u32, MetadataKinds)>,
     new_name: &str,
     remove_source: bool,
 ) -> crate::Result<HttpResponse> {
@@ -905,7 +1344,10 @@ async fn copy_container(
             from_children_ids,
             from_resource_path,
             to_document_id,
-            to_children_ids,
+            to_children
+                .into_iter()
+                .map(|(document_id, _)| document_id)
+                .collect(),
             new_name,
             remove_source,
         )
@@ -914,7 +1356,7 @@ async fn copy_container(
     // Fetch calendar
     let calendar_ = server
         .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
             from_account_id,
             Collection::Calendar,
             from_document_id,
@@ -928,42 +1370,110 @@ async fn copy_container(
     let mut calendar = old_calendar
         .deserialize::<Calendar>()
         .caused_by(trc::location!())?;
+    let calendar_container = read_container(
+        server,
+        from_account_id,
+        Collection::Calendar,
+        from_document_id,
+        old_calendar.inner.metadata_kinds(),
+    )
+    .await
+    .caused_by(trc::location!())?;
+    calendar.set_metadata_kinds(container_kinds(calendar_container.as_ref()));
+    let event_containers = if from_account_id != to_account_id {
+        let mut request = ContainerRequest::default();
+        for &document_id in &from_children_ids {
+            if from_resources
+                .item_by_id(document_id)
+                .is_some_and(|item| !item.metadata_kinds().is_empty())
+            {
+                request.insert(from_account_id, Collection::CalendarEvent, document_id);
+            }
+        }
+        request.load(server).await.caused_by(trc::location!())?
+    } else {
+        DeadContainers::default()
+    };
+    let mut event_copies = ContainerWrites::new(to_account_id, Collection::CalendarEvent);
+    let source_cleanup = server
+        .container_cleanup_from(
+            access_token.changed_by(),
+            from_account_id,
+            Collection::CalendarEvent,
+            event_containers
+                .stored_entries(from_account_id, Collection::CalendarEvent)
+                .filter(|_| remove_source),
+        )
+        .await
+        .caused_by(trc::location!())?;
+    check_growth(
+        server,
+        to_account_id,
+        calendar_container
+            .as_ref()
+            .map_or(0, |container| copy_growth(container, None))
+            + event_containers.stored_len(),
+    )
+    .await
+    .caused_by(trc::location!())?;
+
+    // Validate quota
+    let to_account = server.account(to_account_id).await?;
+    let has_container_quota = to_document_id.is_none()
+        && server
+            .object_quota_limit(&to_account, StorageQuota::MaxCalendars)
+            .is_some();
+    let has_item_quota = from_account_id != to_account_id
+        && server
+            .object_quota_limit(&to_account, StorageQuota::MaxCalendarEvents)
+            .is_some();
+    let to_alarm_ids = if to_document_id.is_some() {
+        to_resources.event_ids_with_flags(EVENT_HAS_ALARMS)
+    } else {
+        RoaringBitmap::new()
+    };
+    let to_resources = (has_container_quota || has_item_quota).then_some(to_resources);
+    if has_container_quota && let Some(to_resources) = &to_resources {
+        server.assert_object_quota(&to_account, StorageQuota::MaxCalendars, 1, || {
+            to_resources.resources.count(true)
+        })?;
+    }
+    let deleted_events = match &to_resources {
+        Some(to_resources) if has_item_quota => to_children
+            .iter()
+            .filter(|(document_id, _)| {
+                to_resources
+                    .resources
+                    .find(*document_id, false)
+                    .is_some_and(|item| item.child_names().len() <= 1)
+            })
+            .count(),
+        _ => 0,
+    };
 
     // Prepare write batch
     let mut batch = BatchBuilder::new();
+    crate::common::za::za_ordinary_fence(
+        server,
+        &mut batch,
+        to_account_id,
+        remove_source.then_some(from_account_id),
+    );
 
-    if remove_source {
-        DestroyArchive(old_calendar)
-            .delete(
-                access_token.account_tenant_ids(),
-                from_account_id,
-                from_document_id,
-                from_resource_path.into(),
-                &mut batch,
-            )
-            .caused_by(trc::location!())?;
-
-        // Reset default calendar id
-        let default_calendar_id = server
-            .store()
-            .get_value::<u32>(ValueKey {
-                account_id: from_account_id,
-                collection: Collection::Principal.into(),
-                document_id: 0,
-                class: ValueClass::Property(PrincipalField::DefaultCalendarId.into()),
-            })
-            .await
-            .caused_by(trc::location!())?;
-        if default_calendar_id.is_some_and(|id| id == from_document_id) {
-            batch
-                .with_account_id(from_account_id)
-                .with_collection(Collection::Principal)
-                .with_document(0)
-                .clear(PrincipalField::DefaultCalendarId);
-        }
-    }
-
-    let preference = calendar.preferences.into_iter().next().unwrap();
+    let personal_id = access_token.personal_id(from_account_id, Collection::Calendar);
+    let preference = calendar
+        .preferences
+        .iter()
+        .position(|preferences| preferences.account_id == personal_id)
+        .or_else(|| {
+            calendar
+                .preferences
+                .iter()
+                .position(|preferences| preferences.account_id == from_account_id)
+        })
+        .map(|idx| calendar.preferences.swap_remove(idx))
+        .unwrap_or_default();
+    let mut default_alerts = DefaultAlertsResolver::default();
     calendar.name = new_name.to_string();
     calendar.acls.clear();
     calendar.preferences = vec![CalendarPreferences {
@@ -973,7 +1483,7 @@ async fn copy_container(
         default_alerts: preference.default_alerts,
         sort_order: 0,
         color: preference.color,
-        flags: 0,
+        flags: CALENDAR_SUBSCRIBED,
         time_zone: Timezone::Default,
     }];
 
@@ -986,7 +1496,7 @@ async fn copy_container(
         // Overwrite destination
         let calendar_ = server
             .store()
-            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
                 to_account_id,
                 Collection::Calendar,
                 to_document_id,
@@ -997,14 +1507,33 @@ async fn copy_container(
             let calendar = calendar_
                 .to_unarchived::<Calendar>()
                 .caused_by(trc::location!())?;
+            let cleanup = server
+                .preload_container_cleanup(
+                    access_token.changed_by(),
+                    to_account_id,
+                    Collection::CalendarEvent,
+                    &to_children
+                        .iter()
+                        .filter(|(_, kinds)| !kinds.is_empty())
+                        .map(|(document_id, _)| *document_id)
+                        .collect(),
+                )
+                .await
+                .caused_by(trc::location!())?;
 
             DestroyArchive(calendar)
                 .delete_with_events(
                     server,
+                    access_token,
                     &account_info,
                     to_account_id,
                     to_document_id,
-                    to_children_ids,
+                    to_children
+                        .into_iter()
+                        .map(|(document_id, _)| document_id)
+                        .collect(),
+                    &to_alarm_ids,
+                    &cleanup,
                     None,
                     false,
                     &mut batch,
@@ -1013,17 +1542,27 @@ async fn copy_container(
                 .caused_by(trc::location!())?;
         }
 
-        to_document_id
+        PendingId::Assigned(to_document_id)
     } else {
-        server
-            .store()
-            .assign_document_ids(to_account_id, Collection::Calendar, 1)
-            .await
-            .caused_by(trc::location!())?
+        PendingId::Slot(batch.reserve_document_id(to_account_id, Collection::Calendar))
     };
+    let parent_id = to_document_id;
+    let alarm_calendar_id = parent_id.assigned().unwrap_or(u32::MAX);
+    default_alerts.set_calendar_settings(
+        to_account_id,
+        alarm_calendar_id,
+        CalendarSettings::from(&calendar),
+    );
+    if let Some(container) = &calendar_container {
+        let mut copies = ContainerWrites::new(to_account_id, Collection::Calendar);
+        copies
+            .copy(server, container, to_document_id, None, &mut batch)
+            .await
+            .caused_by(trc::location!())?;
+    }
     calendar
         .insert(
-            access_token.account_tenant_ids(),
+            access_token.changed_by(),
             to_account_id,
             to_document_id,
             &mut batch,
@@ -1032,109 +1571,233 @@ async fn copy_container(
 
     // Copy children
     let mut required_space = 0;
-    for from_child_document_id in from_children_ids {
-        if let Some(event_) = server
-            .store()
-            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+    let mut created_events = 0;
+    let mut from_children_ids = from_children_ids;
+    from_children_ids.sort_unstable();
+    from_children_ids.dedup();
+    let is_cross_account = from_account_id != to_account_id;
+    let alarm_ids = from_resources.event_ids_with_flags(EVENT_HAS_ALARMS);
+    let mut content_ids = Vec::new();
+    for chunk in from_children_ids.chunks(MAX_BATCH_DOCUMENTS) {
+        content_ids.clear();
+        content_ids.extend(
+            chunk
+                .iter()
+                .copied()
+                .filter(|document_id| is_cross_account || alarm_ids.contains(*document_id)),
+        );
+        let mut archives = server
+            .archive_chunk(
                 from_account_id,
                 Collection::CalendarEvent,
-                from_child_document_id,
-            ))
-            .await?
-        {
-            let event = event_
-                .to_unarchived::<CalendarEvent>()
-                .caused_by(trc::location!())?;
-            let mut new_name = None;
-
-            for name in event.inner.names.iter() {
-                if name.parent_id == to_document_id {
-                    continue;
-                } else if name.parent_id == from_document_id {
-                    new_name = Some(name.name.to_string());
-                }
-            }
-            let new_name = if let Some(new_name) = new_name {
-                DavName {
-                    name: new_name,
-                    parent_id: to_document_id,
-                }
-            } else {
-                continue;
-            };
-            let event = event_
-                .to_unarchived::<CalendarEvent>()
-                .caused_by(trc::location!())?;
-            let mut new_event = event
-                .deserialize::<CalendarEvent>()
-                .caused_by(trc::location!())?;
-
-            if from_account_id == to_account_id {
-                if remove_source {
-                    new_event
-                        .names
-                        .retain(|name| name.parent_id != from_document_id);
-                }
-
-                new_event.names.push(new_name);
-                new_event
-                    .update(
-                        access_token.account_tenant_ids(),
-                        event,
-                        from_account_id,
-                        from_child_document_id,
-                        &mut batch,
-                    )
+                chunk,
+                Some((CalendarEventField::Content.field(), &content_ids)),
+            )
+            .await
+            .caused_by(trc::location!())?;
+        let mut tasks = if !is_cross_account || remove_source {
+            AlarmTasks::for_chunk(from_account_id, chunk, &alarm_ids, &archives)?
+        } else {
+            AlarmTasks::None
+        };
+        for &from_child_document_id in chunk {
+            if let Some(event_) = archives.take_archive(from_child_document_id) {
+                let event = event_
+                    .to_unarchived::<CalendarEvent>()
                     .caused_by(trc::location!())?;
-            } else {
-                let next_email_alarm = event.inner.data.next_alarm(now() as i64, Tz::Floating);
-                if remove_source {
-                    DestroyArchive(event)
-                        .delete(
-                            &account_info,
+                let mut new_name = None;
+
+                for name in event.inner.names.iter() {
+                    if parent_id
+                        .assigned()
+                        .is_some_and(|parent| name.parent_id == parent)
+                    {
+                        continue;
+                    } else if name.parent_id == from_document_id {
+                        new_name = Some(name.name.to_string());
+                    }
+                }
+                let new_name = if let Some(new_name) = new_name {
+                    DavName {
+                        name: new_name,
+                        parent_id: parent_id.assigned().unwrap_or_default(),
+                    }
+                } else {
+                    continue;
+                };
+                let mut new_event = event
+                    .deserialize::<CalendarEvent>()
+                    .caused_by(trc::location!())?;
+
+                if from_account_id == to_account_id {
+                    if remove_source {
+                        new_event
+                            .names
+                            .retain(|name| name.parent_id != from_document_id);
+                    }
+
+                    let calendar_ids = new_event
+                        .names
+                        .iter()
+                        .map(DavName::parent_id)
+                        .chain([alarm_calendar_id])
+                        .collect::<Vec<_>>();
+                    new_event.names.push(new_name);
+                    assert_parent_limit(
+                        event.inner.names.len(),
+                        new_event.names.len(),
+                        server.core.groupware.max_calendars_per_event,
+                    )?;
+                    server
+                        .reschedule_event_alarms(
                             from_account_id,
                             from_child_document_id,
-                            from_document_id,
-                            None,
-                            false,
+                            event.inner,
+                            archives.take_value(from_child_document_id),
+                            &calendar_ids,
+                            &mut tasks,
+                            &mut default_alerts,
+                            &mut batch,
+                        )
+                        .await
+                        .caused_by(trc::location!())?;
+                    new_event
+                        .update_meta(
+                            access_token.changed_by(),
+                            event,
+                            from_account_id,
+                            from_child_document_id,
+                            parent_id.slot(),
+                            &mut batch,
+                        )
+                        .caused_by(trc::location!())?;
+                } else {
+                    let content_ = archives
+                        .take_value(from_child_document_id)
+                        .ok_or(DavError::Code(StatusCode::NOT_FOUND))?;
+                    let mut new_content = content_
+                        .deserialize::<CalendarEventContent>()
+                        .caused_by(trc::location!())?;
+                    new_content
+                        .preferences
+                        .retain(|preferences| preferences.account_id == access_token.account_id());
+                    let next_email_alarms = server
+                        .next_event_alarms(
+                            to_account_id,
+                            &EventAlarmUsers::new(to_account_id, &new_content)?
+                                .with_event_flags(event.inner.flags.to_native()),
+                            &new_content.data,
+                            &[alarm_calendar_id],
+                            now() as i64,
+                            &mut default_alerts,
+                        )
+                        .await
+                        .caused_by(trc::location!())?;
+
+                    if remove_source {
+                        DestroyArchive(event)
+                            .delete_with_cleanup(
+                                server,
+                                &account_info,
+                                from_account_id,
+                                from_child_document_id,
+                                from_document_id,
+                                Some(content_),
+                                &mut tasks,
+                                None,
+                                &source_cleanup,
+                                &mut batch,
+                            )
+                            .await
+                            .caused_by(trc::location!())?;
+                    }
+                    let to_document_id =
+                        batch.reserve_document_id(to_account_id, Collection::CalendarEvent);
+                    let container = event_containers.get(
+                        from_account_id,
+                        Collection::CalendarEvent,
+                        from_child_document_id,
+                    );
+                    new_event.set_metadata_kinds(container_kinds(container));
+                    if let Some(container) = container {
+                        event_copies
+                            .copy(server, container, to_document_id, None, &mut batch)
+                            .await
+                            .caused_by(trc::location!())?;
+                    }
+                    new_event.names = vec![new_name];
+                    required_space += new_event.size as u64;
+                    created_events += 1;
+                    new_event
+                        .insert(
+                            new_content,
+                            access_token.changed_by(),
+                            to_account_id,
+                            to_document_id,
+                            parent_id.slot(),
+                            next_email_alarms,
                             &mut batch,
                         )
                         .caused_by(trc::location!())?;
                 }
-                let to_document_id = server
-                    .store()
-                    .assign_document_ids(to_account_id, Collection::CalendarEvent, 1)
-                    .await
-                    .caused_by(trc::location!())?;
-                new_event.names = vec![new_name];
-                required_space += new_event.size as u64;
-                new_event
-                    .insert(
-                        access_token.account_tenant_ids(),
-                        to_account_id,
-                        to_document_id,
-                        next_email_alarm,
-                        &mut batch,
-                    )
-                    .caused_by(trc::location!())?;
             }
         }
     }
 
+    if has_item_quota
+        && created_events > deleted_events
+        && let Some(to_resources) = &to_resources
+    {
+        server.assert_object_quota(
+            &to_account,
+            StorageQuota::MaxCalendarEvents,
+            created_events - deleted_events,
+            || to_resources.resources.count(false),
+        )?;
+    }
+
     if from_account_id != to_account_id && required_space > 0 {
         server
-            .has_available_quota(
-                server.account(to_account_id).await?.as_ref(),
-                required_space,
-            )
+            .has_available_quota(&to_account, required_space)
             .await?;
+    }
+
+    if remove_source {
+        let calendar_cleanup = server
+            .container_cleanup_from(
+                access_token.changed_by(),
+                from_account_id,
+                Collection::Calendar,
+                calendar_container
+                    .as_ref()
+                    .map(|container| StoredEntry::from_container(from_document_id, container)),
+            )
+            .await
+            .caused_by(trc::location!())?;
+        DestroyArchive(old_calendar)
+            .delete_with_cleanup(
+                server,
+                access_token.changed_by(),
+                from_account_id,
+                from_document_id,
+                from_resource_path.into(),
+                &calendar_cleanup,
+                &mut batch,
+            )
+            .await
+            .caused_by(trc::location!())?;
+
+        batch
+            .with_account_id(from_account_id)
+            .with_collection(Collection::Principal)
+            .with_document(0)
+            .clear_if_equals(PrincipalField::DefaultCalendarId, from_document_id);
     }
 
     server
         .commit_batch(batch)
         .await
         .caused_by(trc::location!())?;
-    server.notify_task_queue();
 
     if !is_overwrite {
         Ok(HttpResponse::new(StatusCode::CREATED))
@@ -1164,7 +1827,7 @@ async fn rename_container(
     // Fetch calendar
     let calendar_ = server
         .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
             account_id,
             Collection::Calendar,
             document_id,
@@ -1195,9 +1858,12 @@ async fn rename_container(
     }
 
     let mut batch = BatchBuilder::new();
+    if context.is_none() {
+        crate::common::za::za_ordinary_fence(server, &mut batch, account_id, None);
+    }
     new_calendar
         .update(
-            access_token.account_tenant_ids(),
+            access_token.changed_by(),
             calendar,
             account_id,
             document_id,
@@ -1219,13 +1885,12 @@ async fn rename_container(
                 .ok_or(DavError::Code(StatusCode::FORBIDDEN))?,
             document_id,
             Some(groupware::calendar::sharing::boundary::ZaBoundaryCommit {
-                change_id: assigned.last_change_id(account_id)?,
+                change_id: assigned.last_change_id(account_id, SyncCollection::Calendar),
             }),
         )
         .await
         .map_err(|error| super::za_calendar_error(error, account_id, document_id))?;
     }
-    server.notify_task_queue();
 
     Ok(HttpResponse::new(StatusCode::CREATED))
 }
@@ -1249,6 +1914,7 @@ fn linked_move_refusal(owner_id: u32) -> DavError {
 
 /// COPY has an operation-specific 403 contract. Do not pass it through the
 /// seal/write resolver helper, whose shared-linked refusal is a PUT's 409.
+#[allow(clippy::too_many_arguments)]
 async fn za_move_contexts(
     server: &Server,
     token: &AccessToken,
@@ -1259,9 +1925,7 @@ async fn za_move_contexts(
     is_move: bool,
     overwrite: bool,
     is_collection: bool,
-) -> crate::Result<Vec<groupware::calendar::sharing::resolve::ZaCalendarContext>> {
-    use crate::common::za::za_mutation_context;
-    use utils::map::bitmap::Bitmap;
+) -> crate::Result<Vec<ZaCalendarContext>> {
     let source_required = Bitmap::new().with_item(if is_move {
         Acl::RemoveItems
     } else {
@@ -1288,7 +1952,7 @@ async fn za_move_contexts(
         .names
         .iter()
         .map(|name| name.parent_id)
-        .collect::<std::collections::BTreeSet<_>>()
+        .collect::<BTreeSet<_>>()
     {
         if parent == source {
             continue;
@@ -1332,7 +1996,7 @@ async fn za_move_contexts(
 /// the addressed destination does not change the other parent's link or payload.
 struct ZaOverwriteFence {
     calendar_id: u32,
-    stored: Option<Archive<AlignedBytes>>,
+    stored: Option<Archive<ArchiveBytes>>,
 }
 
 impl ZaOverwriteFence {
@@ -1342,9 +2006,9 @@ impl ZaOverwriteFence {
             .with_collection(Collection::Calendar)
             .with_document(self.calendar_id);
         if let Some(stored) = &self.stored {
-            batch.assert_value(types::field::Field::ARCHIVE, stored);
+            batch.assert_value(Field::ARCHIVE, stored);
         } else {
-            batch.assert_value(types::field::Field::ARCHIVE, ());
+            batch.assert_value(Field::ARCHIVE, ());
         }
     }
 }
@@ -1367,12 +2031,12 @@ async fn za_overwrite_fences(
     event: &CalendarEvent,
     target: u32,
 ) -> crate::Result<Vec<ZaOverwriteFence>> {
-    let target_context = crate::common::za::za_mutation_context(
+    let target_context = za_mutation_context(
         server,
         token,
         owner,
         target,
-        utils::map::bitmap::Bitmap::new().with_item(Acl::RemoveItems),
+        Bitmap::new().with_item(Acl::RemoveItems),
     )
     .await
     .map_err(|error| super::za_calendar_error(error, owner, target))?
@@ -1386,17 +2050,38 @@ async fn za_overwrite_fences(
         .iter()
         .map(|name| name.parent_id)
         .filter(|parent| *parent != target)
-        .collect::<std::collections::BTreeSet<_>>()
+        .collect::<BTreeSet<_>>()
     {
         fences.push(ZaOverwriteFence {
             calendar_id: parent,
             stored: server
                 .store()
                 .get_value(ValueKey::archive(owner, Collection::Calendar, parent))
-                .await?,
+                .await
+                .caused_by(trc::location!())?,
         });
     }
     Ok(fences)
+}
+
+/// The stored content archive of an event (upgrade: the tree lives outside
+/// the metadata row at 1.0).
+async fn za_event_content(
+    server: &Server,
+    owner: u32,
+    event_id: u32,
+) -> crate::Result<Archive<ArchiveBytes>> {
+    server
+        .store()
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::property(
+            owner,
+            Collection::CalendarEvent,
+            event_id,
+            CalendarEventField::Content,
+        ))
+        .await
+        .caused_by(trc::location!())?
+        .ok_or(DavError::Code(StatusCode::NOT_FOUND))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1414,14 +2099,15 @@ pub(super) async fn za_copy_move_event(
     schedule_tag: Option<u32>,
     is_move: bool,
 ) -> crate::Result<HttpResponse> {
-    let original: Archive<AlignedBytes> = server
+    let original: Archive<ArchiveBytes> = server
         .store()
         .get_value(ValueKey::archive(
             owner,
             Collection::CalendarEvent,
             event_id,
         ))
-        .await?
+        .await
+        .caused_by(trc::location!())?
         .ok_or(DavError::Code(StatusCode::NOT_FOUND))?;
     za_copy_move_stored_event(
         server,
@@ -1442,11 +2128,16 @@ pub(super) async fn za_copy_move_event(
     .await
 }
 
+/// A key account's event COPY (a new link to the same document) or MOVE
+/// (its link moved; across key domains, the event's envelope and its dead
+/// property container rewrapped into the target's, ruling 29). Every
+/// calendar involved is asserted in the write, which retries once after a
+/// calendar change.
 #[allow(clippy::too_many_arguments)]
 async fn za_copy_move_stored_event(
     server: &Server,
     token: &AccessToken,
-    keys: &vault::session::SessionKeys,
+    _keys: &vault::session::SessionKeys,
     owner: u32,
     event_id: u32,
     source: u32,
@@ -1457,13 +2148,11 @@ async fn za_copy_move_stored_event(
     schedule_tag: Option<u32>,
     is_move: bool,
     is_collection: bool,
-    original: Archive<AlignedBytes>,
+    original: Archive<ArchiveBytes>,
 ) -> crate::Result<HttpResponse> {
-    use groupware::calendar::{
-        seal::{classify_event_storage, rewrap_event, seal_error},
-        sharing::resolve::calendars_changed,
-    };
-    let event = original.deserialize::<CalendarEvent>()?;
+    let event = original
+        .deserialize::<CalendarEvent>()
+        .caused_by(trc::location!())?;
     if schedule_tag.is_some() && event.schedule_tag != schedule_tag {
         return Err(DavError::Code(StatusCode::PRECONDITION_FAILED));
     }
@@ -1479,25 +2168,52 @@ async fn za_copy_move_stored_event(
         is_collection,
     )
     .await?;
-    classify_event_storage(&event).map_err(|error| seal_error(error, owner, event_id))?;
+    let content_ = za_event_content(server, owner, event_id).await?;
+    let content = content_
+        .deserialize::<CalendarEventContent>()
+        .caused_by(trc::location!())?;
+    classify_event_storage(&content).map_err(|error| seal_error(error, owner, event_id))?;
     if source != target || (!is_move && overwrite.is_none()) {
         assert_is_unique_uid(
-            server,
             server
-                .fetch_dav_resources(token.account_id(), owner, SyncCollection::Calendar)
-                .await?
+                .fetch_groupware_resources(token.account_id(), owner, SyncCollection::Calendar)
+                .await
+                .caused_by(trc::location!())?
                 .as_ref(),
+            token,
             owner,
             target,
-            event.data.event.uids().next(),
-        )
-        .await?;
+            Some(event.uid.as_str()).filter(|uid| !uid.is_empty()),
+        )?;
     }
-    let overwritten: Option<Archive<AlignedBytes>> = if let Some(id) = overwrite {
+    if source != target {
+        server
+            .assert_stored_event_supported(owner, event_id, owner, target)
+            .await?;
+    }
+    let names_after = event.names.len() + usize::from(!is_move);
+    assert_parent_limit(
+        event.names.len(),
+        names_after,
+        server.core.groupware.max_calendars_per_event,
+    )?;
+    // The event's dead-property container (ruling 29): it follows the event
+    // into the target's key domain.
+    let container = read_container(
+        server,
+        owner,
+        Collection::CalendarEvent,
+        event_id,
+        event.metadata_kinds(),
+    )
+    .await
+    .caused_by(trc::location!())?;
+    let overwritten: Option<Archive<ArchiveBytes>> = if let Some(id) = overwrite {
         server
             .store()
             .get_value(ValueKey::archive(owner, Collection::CalendarEvent, id))
-            .await?
+            .await
+            .caused_by(trc::location!())?
     } else {
         None
     };
@@ -1506,36 +2222,43 @@ async fn za_copy_move_stored_event(
             server,
             token,
             owner,
-            &stored.deserialize::<CalendarEvent>()?,
+            &stored
+                .deserialize::<CalendarEvent>()
+                .caused_by(trc::location!())?,
             target,
         )
         .await?
     } else {
         Vec::new()
     };
-    let account = server.account_info(token.account_id()).await?;
+    let account = server
+        .account_info(token.account_id())
+        .await
+        .caused_by(trc::location!())?;
     let cutoff = now() as i64;
     for attempt in 0..2 {
-        let mut changed = event.clone();
+        let mut changed = ZaEvent::new(event.clone(), content.clone());
         let from = &contexts[0].domain;
         let to = &contexts.last().unwrap().domain;
         // A reverting shared domain still owns old CK envelopes. Its write
         // mode selects the new wrap only after the original DEK is opened.
         let domain_changes =
             (from.calendar_id(), from.domain_id()) != (to.calendar_id(), to.domain_id());
-        if is_move && domain_changes {
+        let rewraps = is_move && domain_changes;
+        if rewraps {
             rewrap_event(&mut changed, from, to)
                 .map_err(|error| seal_error(error, owner, event_id))?;
         }
         if is_move {
             let index = changed
+                .meta
                 .names
                 .iter()
                 .position(|name| name.parent_id == source)
                 .unwrap();
-            changed.names.swap_remove(index);
+            changed.meta.names.swap_remove(index);
         }
-        changed.names.push(DavName {
+        changed.meta.names.push(DavName {
             name: new_name.to_owned(),
             parent_id: target,
         });
@@ -1546,37 +2269,89 @@ async fn za_copy_move_stored_event(
         for fence in &overwrite_fences {
             fence.assert_in(owner, &mut batch);
         }
-        changed.update_at(
-            token.account_tenant_ids(),
-            original.to_unarchived::<CalendarEvent>()?,
-            owner,
-            event_id,
-            cutoff,
-            &mut batch,
-        )?;
+        if let Some(container) = container.as_ref().filter(|_| rewraps) {
+            let resealed = za_reseal_container(
+                container,
+                from,
+                ZaContainerOf::Event(&event.uid),
+                to,
+                ZaContainerScope::Event(&event.uid),
+                owner,
+                event_id,
+            )?;
+            ContainerWrites::new(owner, Collection::CalendarEvent)
+                .copy(
+                    server,
+                    &resealed,
+                    event_id,
+                    Some(StoredContainer::from(container)),
+                    &mut batch,
+                )
+                .await
+                .caused_by(trc::location!())?;
+        }
+        let stored_event = original
+            .to_unarchived::<CalendarEvent>()
+            .caused_by(trc::location!())?;
+        let (meta, new_content) = changed.into_parts();
+        if rewraps {
+            meta.update_full_at(
+                new_content,
+                token.changed_by(),
+                stored_event,
+                content_
+                    .unarchive::<CalendarEventContent>()
+                    .caused_by(trc::location!())?,
+                owner,
+                event_id,
+                None,
+                cutoff,
+                &mut batch,
+            )
+            .caused_by(trc::location!())?;
+        } else {
+            meta.update_meta_at(
+                token.changed_by(),
+                stored_event,
+                owner,
+                event_id,
+                None,
+                cutoff,
+                &mut batch,
+            )
+            .caused_by(trc::location!())?;
+        }
         if let Some(path) = &vanished {
             batch.log_calendar_vanished(source, path.clone());
         }
         if let (Some(id), Some(stored)) = (overwrite, &overwritten) {
-            // update_at can end a large chunk; fence the overwrite's chunk too.
+            // The event write can end a large chunk; fence the overwrite's chunk too.
             for context in &contexts {
                 context.assert_in(&mut batch);
             }
             for fence in &overwrite_fences {
                 fence.assert_in(owner, &mut batch);
             }
-            let result = DestroyArchive(stored.to_unarchived::<CalendarEvent>()?).delete_za_at(
+            let result = DestroyArchive(
+                stored
+                    .to_unarchived::<CalendarEvent>()
+                    .caused_by(trc::location!())?,
+            )
+            .delete_za_at(
+                server,
                 &account,
                 owner,
                 id,
                 target,
                 None,
+                None,
                 false,
-                Some(keys),
                 Some(to),
                 cutoff,
                 &mut batch,
-            )?;
+            )
+            .await
+            .caused_by(trc::location!())?;
             #[cfg(feature = "test_mode")]
             common::za::test_hooks::record_move_overwrite_message(owner, id, result.is_some());
             let _ = result;
@@ -1610,7 +2385,9 @@ async fn za_copy_move_stored_event(
                         server,
                         token,
                         owner,
-                        &stored.deserialize::<CalendarEvent>()?,
+                        &stored
+                            .deserialize::<CalendarEvent>()
+                            .caused_by(trc::location!())?,
                         target,
                     )
                     .await?
@@ -1631,28 +2408,43 @@ async fn za_copy_move_stored_event(
     unreachable!()
 }
 
+/// The source calendar's container sealed for a key-account calendar copy's
+/// destination (rulings 16 and 29), and the kinds the destination records.
+fn za_copy_calendar_container(
+    container: Option<&MetadataBuf>,
+    from: &ZaCalendarContext,
+    to: &groupware::calendar::seal::ZaKeyDomain,
+    target: u32,
+) -> crate::Result<(Option<MetadataBuf>, MetadataKinds)> {
+    let Some(container) = container else {
+        return Ok((None, MetadataKinds::NONE));
+    };
+    let resealed = za_reseal_container(
+        container,
+        &from.domain,
+        ZaContainerOf::Calendar(from.calendar_id),
+        to,
+        ZaContainerScope::Calendar(Some(target)),
+        from.owner_id,
+        target,
+    )?;
+    let kinds = resealed.kinds();
+    Ok((Some(resealed), kinds))
+}
+
 /// Existing-destination key collection MOVE is deliberately bounded to one
 /// physical transaction. No event or destination prefix is published on loss.
 #[allow(clippy::too_many_arguments)]
 async fn za_move_overwrite_container(
     server: &Server,
     token: &AccessToken,
-    keys: &vault::session::SessionKeys,
+    _keys: &vault::session::SessionKeys,
     owner: u32,
     source: u32,
     source_path: String,
     target: u32,
     new_name: &str,
 ) -> crate::Result<HttpResponse> {
-    use groupware::calendar::{
-        seal::{classify_event_storage, seal_error},
-        sharing::resolve::za_calendar_context,
-    };
-    use std::collections::{BTreeMap, BTreeSet};
-    use store::write::{MergeResult, Params};
-    use types::field::Field;
-    use utils::map::bitmap::Bitmap;
-
     let remove = Bitmap::new().with_item(Acl::RemoveItems);
     let target_required = remove.with_item(Acl::AddItems);
     let mut contexts = Vec::new();
@@ -1686,37 +2478,58 @@ async fn za_move_overwrite_container(
             account_id: owner,
             collection: 0,
             document_id: 0,
-            class: ValueClass::ChangeId,
+            class: ValueClass::ChangeId(SyncCollection::Calendar.into()),
         })
-        .await?;
+        .await
+        .caused_by(trc::location!())?;
     let expected = sampled
         .checked_add(1)
         .filter(|_| sampled >= 0)
         .ok_or(DavError::Code(StatusCode::CONFLICT))? as u64;
     let mut events = Vec::new();
+    let mut is_over_cap = false;
     server
-        .archives(owner, Collection::CalendarEvent, &(), |id, stored| {
-            let event = stored.unarchive::<CalendarEvent>()?;
-            if event.names.iter().any(|name| {
-                let parent = name.parent_id.to_native();
-                parent == source || parent == target
-            }) {
-                events.push((id, stored));
-                // Even one selector per document would exceed the operation cap.
-                if events.len() > 1000 {
-                    return Err(trc::StoreEvent::AssertValueFailed.into_err());
+        .archives(
+            owner,
+            Collection::CalendarEvent,
+            Field::ARCHIVE,
+            &(),
+            |id, stored| {
+                let event = stored.unarchive::<CalendarEvent>()?;
+                if event.names.iter().any(|name| {
+                    let parent = name.parent_id.to_native();
+                    parent == source || parent == target
+                }) {
+                    events.push((id, stored));
+                    // Even one selector per document would exceed the operation cap.
+                    if events.len() > 1000 {
+                        is_over_cap = true;
+                        return Ok(false);
+                    }
                 }
-            }
-            Ok(true)
-        })
-        .await?;
+                Ok(true)
+            },
+        )
+        .await
+        .caused_by(trc::location!())?;
+    if is_over_cap {
+        return Err(DavError::Code(StatusCode::CONFLICT));
+    }
 
     let mut other_fences = BTreeMap::new();
     for (id, stored) in &events {
-        let event = stored.deserialize::<CalendarEvent>()?;
+        let event = stored
+            .deserialize::<CalendarEvent>()
+            .caused_by(trc::location!())?;
         let from_source = event.names.iter().any(|name| name.parent_id == source);
         if from_source {
-            classify_event_storage(&event).map_err(|error| seal_error(error, owner, *id))?;
+            let content = za_event_content(server, owner, *id).await?;
+            classify_event_storage(
+                &content
+                    .deserialize::<CalendarEventContent>()
+                    .caused_by(trc::location!())?,
+            )
+            .map_err(|error| seal_error(error, owner, *id))?;
         }
         for parent in event
             .names
@@ -1747,16 +2560,40 @@ async fn za_move_overwrite_container(
                         stored: server
                             .store()
                             .get_value(ValueKey::archive(owner, Collection::Calendar, parent))
-                            .await?,
+                            .await
+                            .caused_by(trc::location!())?,
                     },
                 );
             }
         }
     }
 
-    let mut calendar = contexts[0].stored.deserialize::<Calendar>()?;
+    let source_calendar = contexts[0]
+        .stored
+        .to_unarchived::<Calendar>()
+        .caused_by(trc::location!())?;
+    let source_container = read_container(
+        server,
+        owner,
+        Collection::Calendar,
+        source,
+        source_calendar.inner.metadata_kinds(),
+    )
+    .await
+    .caused_by(trc::location!())?;
+    let (container, kinds) = za_copy_calendar_container(
+        source_container.as_ref(),
+        &contexts[0],
+        &contexts[1].domain,
+        target,
+    )?;
+    let mut calendar = contexts[0]
+        .stored
+        .deserialize::<Calendar>()
+        .caused_by(trc::location!())?;
     calendar.name = new_name.to_owned();
     calendar.acls.clear();
+    calendar.set_metadata_kinds(kinds);
     let preference = calendar
         .preferences
         .into_iter()
@@ -1769,7 +2606,7 @@ async fn za_move_overwrite_container(
         default_alerts: preference.default_alerts,
         sort_order: 0,
         color: preference.color,
-        flags: 0,
+        flags: CALENDAR_SUBSCRIBED,
         time_zone: Timezone::Default,
     }];
     let default = server
@@ -1780,8 +2617,12 @@ async fn za_move_overwrite_container(
             document_id: 0,
             class: ValueClass::Property(PrincipalField::DefaultCalendarId.into()),
         })
-        .await?;
-    let account = server.account_info(token.account_id()).await?;
+        .await
+        .caused_by(trc::location!())?;
+    let account = server
+        .account_info(token.account_id())
+        .await
+        .caused_by(trc::location!())?;
     let cutoff = now() as i64;
     let mut batch = BatchBuilder::new();
     // Every retained original calendar assertion precedes any replacement of
@@ -1796,20 +2637,16 @@ async fn za_move_overwrite_container(
         .with_account_id(owner)
         .with_collection(Collection::Calendar)
         .with_document(source)
-        .merge_fnc(
-            Field::ARCHIVE,
-            Params::with_capacity(2)
-                .with_u64(owner as u64)
-                .with_u64(expected),
-            |params, ids, _| {
-                if ids.last_change_id(params.u64(0) as u32)? != params.u64(1) {
-                    return Err(trc::StoreEvent::AssertValueFailed.into_err());
-                }
-                Ok(MergeResult::Skip)
-            },
-        );
+        .merge_fnc(Field::ARCHIVE, move |ids, _| {
+            if ids.last_change_id(owner, SyncCollection::Calendar) != expected {
+                return Err(trc::StoreEvent::AssertValueFailed.into_err());
+            }
+            Ok(MergeResult::Skip)
+        });
     for (id, stored) in &events {
-        let mut event = stored.deserialize::<CalendarEvent>()?;
+        let mut event = stored
+            .deserialize::<CalendarEvent>()
+            .caused_by(trc::location!())?;
         if let Some(name) = event
             .names
             .iter()
@@ -1825,45 +2662,72 @@ async fn za_move_overwrite_container(
                 name,
                 parent_id: target,
             });
-            event.update_at(
-                token.account_tenant_ids(),
-                stored.to_unarchived::<CalendarEvent>()?,
-                owner,
-                *id,
-                cutoff,
-                &mut batch,
-            )?;
+            event
+                .update_meta_at(
+                    token.changed_by(),
+                    stored
+                        .to_unarchived::<CalendarEvent>()
+                        .caused_by(trc::location!())?,
+                    owner,
+                    *id,
+                    None,
+                    cutoff,
+                    &mut batch,
+                )
+                .caused_by(trc::location!())?;
         } else {
-            DestroyArchive(stored.to_unarchived::<CalendarEvent>()?).delete_za_at(
+            DestroyArchive(
+                stored
+                    .to_unarchived::<CalendarEvent>()
+                    .caused_by(trc::location!())?,
+            )
+            .delete_za_at(
+                server,
                 &account,
                 owner,
                 *id,
                 target,
                 None,
+                None,
                 false,
-                Some(keys),
                 Some(&contexts[1].domain),
                 cutoff,
                 &mut batch,
-            )?;
+            )
+            .await
+            .caused_by(trc::location!())?;
         }
     }
-    DestroyArchive(contexts[1].stored.to_unarchived::<Calendar>()?).delete(
-        token.account_tenant_ids(),
-        owner,
-        target,
-        None,
-        &mut batch,
-    )?;
-    calendar.insert(token.account_tenant_ids(), owner, target, &mut batch)?;
+    DestroyArchive(
+        contexts[1]
+            .stored
+            .to_unarchived::<Calendar>()
+            .caused_by(trc::location!())?,
+    )
+    .delete(server, token.changed_by(), owner, target, None, &mut batch)
+    .await
+    .caused_by(trc::location!())?;
+    if let Some(container) = &container {
+        ContainerWrites::new(owner, Collection::Calendar)
+            .copy(server, container, target, None, &mut batch)
+            .await
+            .caused_by(trc::location!())?;
+    }
+    calendar
+        .insert(token.changed_by(), owner, target, &mut batch)
+        .caused_by(trc::location!())?;
     // Keep source id explicit: this tombstone belongs to the removed source.
-    DestroyArchive(contexts[0].stored.to_unarchived::<Calendar>()?).delete(
-        token.account_tenant_ids(),
-        owner,
-        source,
-        Some(source_path),
-        &mut batch,
-    )?;
+    DestroyArchive(source_calendar)
+        .delete(
+            server,
+            token.changed_by(),
+            owner,
+            source,
+            Some(source_path),
+            &mut batch,
+        )
+        .await
+        .caused_by(trc::location!())?;
     if default == Some(source) {
         batch
             .with_account_id(owner)
@@ -1872,16 +2736,17 @@ async fn za_move_overwrite_container(
             .assert_value(PrincipalField::DefaultCalendarId, source)
             .clear(PrincipalField::DefaultCalendarId);
     }
-    // Materialize *all* logs and consume saved split points before admission.
-    // Known SetFnc callbacks are ObjectIndexBuilder's archive replacement: their
-    // output is no longer than the archived Bytes input (version+marker included).
-    // The only MergeFnc above returns Skip. This is not an arbitrary callback bound.
-    let slices = batch.commit_points().iter().count();
-    let operations = batch.ops().len();
+    // One physical transaction: no commit point may have been taken, the
+    // open chunk is within upstream's commit limits, and its input bytes
+    // (`accounted_input_bytes`, which first materializes the change logs and
+    // counters; its merges are the metadata viewer states and
+    // `clear_if_equals`, within its per-operation allowance) are within 5 MB.
     let bytes = batch.accounted_input_bytes();
+    let slices = batch.commit_point_count() + 1;
+    let operations = batch.ops().len();
     #[cfg(feature = "test_mode")]
     common::za::test_hooks::record_calendar_move_plan(owner, operations, bytes, slices);
-    if slices != 1 || operations > 1000 || bytes > 5_000_000 {
+    if slices != 1 || operations > 1000 || bytes > 5_000_000 || batch.is_large_batch() {
         return Err(DavError::Code(StatusCode::CONFLICT));
     }
     #[cfg(feature = "test_mode")]
@@ -1942,8 +2807,6 @@ async fn za_copy_container(
         )
         .await;
     }
-    use crate::common::za::za_mutation_context;
-    use utils::map::bitmap::Bitmap;
     let required = Bitmap::new().with_item(if is_move {
         Acl::RemoveItems
     } else {
@@ -1961,21 +2824,29 @@ async fn za_copy_container(
     for child in children {
         if let Some(stored) = server
             .store()
-            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
                 owner,
                 Collection::CalendarEvent,
                 child,
             ))
-            .await?
+            .await
+            .caused_by(trc::location!())?
         {
-            let event = stored.deserialize::<CalendarEvent>()?;
-            groupware::calendar::seal::classify_event_storage(&event)
-                .map_err(|error| groupware::calendar::seal::seal_error(error, owner, child))?;
+            let event = stored
+                .deserialize::<CalendarEvent>()
+                .caused_by(trc::location!())?;
+            let content = za_event_content(server, owner, child).await?;
+            classify_event_storage(
+                &content
+                    .deserialize::<CalendarEventContent>()
+                    .caused_by(trc::location!())?,
+            )
+            .map_err(|error| seal_error(error, owner, child))?;
             for parent in event
                 .names
                 .iter()
                 .map(|name| name.parent_id)
-                .collect::<std::collections::BTreeSet<_>>()
+                .collect::<BTreeSet<_>>()
             {
                 if contexts.iter().any(|context| context.calendar_id == parent) {
                     continue;
@@ -1994,7 +2865,23 @@ async fn za_copy_container(
             }
         }
     }
-    let mut calendar = contexts[0].stored.deserialize::<Calendar>()?;
+    let source_calendar = contexts[0]
+        .stored
+        .to_unarchived::<Calendar>()
+        .caused_by(trc::location!())?;
+    let source_container = read_container(
+        server,
+        owner,
+        Collection::Calendar,
+        source,
+        source_calendar.inner.metadata_kinds(),
+    )
+    .await
+    .caused_by(trc::location!())?;
+    let mut calendar = contexts[0]
+        .stored
+        .deserialize::<Calendar>()
+        .caused_by(trc::location!())?;
     calendar.name = new_name.to_owned();
     calendar.acls.clear();
     // The source is unshared; preserve its owner's complete encrypted entry.
@@ -2010,10 +2897,14 @@ async fn za_copy_container(
         default_alerts: preference.default_alerts,
         sort_order: 0,
         color: preference.color,
-        flags: 0,
+        flags: CALENDAR_SUBSCRIBED,
         time_zone: Timezone::Default,
     }];
-    let account = server.account_info(token.account_id()).await?;
+    let owner_domain = groupware::calendar::seal::ZaKeyDomain::owner(keys);
+    let account = server
+        .account_info(token.account_id())
+        .await
+        .caused_by(trc::location!())?;
     let cutoff = now() as i64;
     let target = if let Some(id) = overwrite {
         let context = za_mutation_context(
@@ -2034,18 +2925,21 @@ async fn za_copy_container(
         for child in overwritten_children {
             if let Some(stored) = server
                 .store()
-                .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
                     owner,
                     Collection::CalendarEvent,
                     child,
                 ))
-                .await?
+                .await
+                .caused_by(trc::location!())?
             {
                 let unlink_fences = za_overwrite_fences(
                     server,
                     token,
                     owner,
-                    &stored.deserialize::<CalendarEvent>()?,
+                    &stored
+                        .deserialize::<CalendarEvent>()
+                        .caused_by(trc::location!())?,
                     id,
                 )
                 .await?;
@@ -2057,52 +2951,98 @@ async fn za_copy_container(
                     parent.assert_in(owner, &mut batch);
                 }
                 context.assert_in(&mut batch);
-                DestroyArchive(stored.to_unarchived::<CalendarEvent>()?).delete_za_at(
+                DestroyArchive(
+                    stored
+                        .to_unarchived::<CalendarEvent>()
+                        .caused_by(trc::location!())?,
+                )
+                .delete_za_at(
+                    server,
                     &account,
                     owner,
                     child,
                     id,
                     None,
+                    None,
                     false,
-                    Some(keys),
                     Some(&context.domain),
                     cutoff,
                     &mut batch,
-                )?;
+                )
+                .await
+                .caused_by(trc::location!())?;
                 #[cfg(feature = "test_mode")]
                 common::za::test_hooks::delete_commit_pause_point(owner).await;
-                server.commit_batch(batch).await?;
+                server
+                    .commit_batch(batch)
+                    .await
+                    .caused_by(trc::location!())?;
             }
         }
+        let (container, kinds) =
+            za_copy_calendar_container(source_container.as_ref(), &contexts[0], &owner_domain, id)?;
+        calendar.set_metadata_kinds(kinds);
         let mut batch = BatchBuilder::new();
         for source in &contexts {
             source.assert_in(&mut batch);
         }
         context.assert_in(&mut batch);
-        DestroyArchive(context.stored.to_unarchived::<Calendar>()?).delete(
-            token.account_tenant_ids(),
-            owner,
-            id,
-            None,
-            &mut batch,
-        )?;
+        DestroyArchive(
+            context
+                .stored
+                .to_unarchived::<Calendar>()
+                .caused_by(trc::location!())?,
+        )
+        .delete(server, token.changed_by(), owner, id, None, &mut batch)
+        .await
+        .caused_by(trc::location!())?;
         for source in &contexts {
             source.assert_in(&mut batch);
         }
-        calendar.insert(token.account_tenant_ids(), owner, id, &mut batch)?;
-        server.commit_batch(batch).await?;
+        if let Some(container) = &container {
+            ContainerWrites::new(owner, Collection::Calendar)
+                .copy(server, container, id, None, &mut batch)
+                .await
+                .caused_by(trc::location!())?;
+        }
+        calendar
+            .insert(token.changed_by(), owner, id, &mut batch)
+            .caused_by(trc::location!())?;
+        server
+            .commit_batch(batch)
+            .await
+            .caused_by(trc::location!())?;
         id
     } else {
+        // Ruling 14: a reservation-only batch assigns an id that is never
+        // reused, so the copied container binds the destination's id (ruling 16).
+        let mut reservation = BatchBuilder::new();
+        let slot = reservation.reserve_document_id(owner, Collection::Calendar);
         let id = server
-            .store()
-            .assign_document_ids(owner, Collection::Calendar, 1)
-            .await?;
+            .commit_batch(reservation)
+            .await
+            .caused_by(trc::location!())?
+            .slot(slot);
+        let (container, kinds) =
+            za_copy_calendar_container(source_container.as_ref(), &contexts[0], &owner_domain, id)?;
+        calendar.set_metadata_kinds(kinds);
         let mut batch = BatchBuilder::new();
         for context in &contexts {
             context.assert_in(&mut batch);
         }
-        calendar.insert(token.account_tenant_ids(), owner, id, &mut batch)?;
-        server.commit_batch(batch).await?;
+        if let Some(container) = &container {
+            ContainerWrites::new(owner, Collection::Calendar)
+                .copy(server, container, id, None, &mut batch)
+                .await
+                .caused_by(trc::location!())?;
+        }
+        calendar
+            .insert(token.changed_by(), owner, id, &mut batch)
+            .caused_by(trc::location!())?;
+        server
+            .commit_batch(batch)
+            .await
+            .caused_by(trc::location!())?;
         id
     };
     let target_context = za_mutation_context(
@@ -2152,13 +3092,17 @@ async fn za_copy_container(
         target_context.assert_in(&mut batch);
         // The destination holds the preflight source metadata. Keep that
         // original source CAS so a newer property or slug survives a conflict.
-        DestroyArchive(contexts[0].stored.to_unarchived::<Calendar>()?).delete(
-            token.account_tenant_ids(),
-            owner,
-            source,
-            Some(source_path),
-            &mut batch,
-        )?;
+        DestroyArchive(source_calendar)
+            .delete(
+                server,
+                token.changed_by(),
+                owner,
+                source,
+                Some(source_path),
+                &mut batch,
+            )
+            .await
+            .caused_by(trc::location!())?;
         let default = server
             .store()
             .get_value::<u32>(ValueKey {
@@ -2167,7 +3111,8 @@ async fn za_copy_container(
                 document_id: 0,
                 class: ValueClass::Property(PrincipalField::DefaultCalendarId.into()),
             })
-            .await?;
+            .await
+            .caused_by(trc::location!())?;
         if default == Some(source) {
             batch
                 .with_account_id(owner)
@@ -2177,7 +3122,10 @@ async fn za_copy_container(
         }
         #[cfg(feature = "test_mode")]
         common::za::test_hooks::calendar_move_delete_pause_point(owner).await;
-        server.commit_batch(batch).await?;
+        server
+            .commit_batch(batch)
+            .await
+            .caused_by(trc::location!())?;
     }
     server.notify_task_queue();
     Ok(HttpResponse::new(if overwrite.is_some() {

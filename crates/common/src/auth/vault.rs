@@ -29,9 +29,8 @@ use store::{
     Deserialize, IterateParams, Serialize, SerializeInfallible, Store, ValueKey,
     search::IndexDocument,
     write::{
-        AlignedBytes, Archive, Archiver, BatchBuilder, RegistryClass, SearchIndex,
-        SearchIndexClass, SearchIndexId, SearchIndexType, TaskQueueClass, ValueClass,
-        assert::AssertValue, now,
+        Archive, ArchiveBytes, Archiver, BatchBuilder, Compression, RegistryClass, SearchIndex,
+        SearchIndexClass, TaskId, TaskQueueClass, ValueClass, assert::AssertValue, now,
     },
 };
 use trc::AddContext;
@@ -121,8 +120,11 @@ pub(crate) async fn vault_read_store(
         Some((&version, _)) => return Err(vault_unsupported(account_id, version)),
         None => return Err(vault_corrupted(account_id)),
     };
-    let record = <Archive<AlignedBytes> as Deserialize>::deserialize(archived)
-        .and_then(|archive| archive.deserialize::<VaultRecord>())
+    // Checked decoding (1.0 archive configuration): the archive's integrity
+    // hash, then rkyv's validation; never the unchecked access. A failure is
+    // reported without the stored bytes, which the store's own errors carry.
+    let record = <Archive<ArchiveBytes> as Deserialize>::deserialize(archived)
+        .and_then(|archive| archive.deserialize_untrusted::<VaultRecord>())
         .map_err(|_| vault_corrupted(account_id))?;
     if record.version != VAULT_RECORD_VERSION {
         return Err(vault_unsupported(account_id, record.version));
@@ -186,7 +188,7 @@ pub(crate) async fn vault_delete_store(
             AssertValue::Hash(previous.cas),
         )
         .clear(PrincipalField::ZeroAccessVault);
-    store.write(batch.build_all()).await.map(|_| ())
+    store.write_batch(&mut batch).await.map(|_| ())
 }
 
 /// The one vault batch, shared by the raw write (`vault_write_store`) and
@@ -204,7 +206,9 @@ async fn vault_batch_write(
     previous: Option<&VaultRead>,
     pins: Option<ZaPinWrite<'_>>,
 ) -> trc::Result<()> {
-    let archive = Archiver::new(record.clone())
+    // Uncompressed: the record is mostly key wraps and hashes, and the vault
+    // crate stays independent of the store's compression settings.
+    let archive = Archiver::with_compression(record.clone(), Compression::None)
         .serialize()
         .caused_by(trc::location!())?;
     let mut value = Vec::with_capacity(archive.len() + 1);
@@ -229,7 +233,7 @@ async fn vault_batch_write(
     if let Some(pins) = pins {
         batch.set(PrincipalField::ZeroAccessPins, pins.sealed);
     }
-    store.write(batch.build_all()).await.map(|_| ())
+    store.write_batch(&mut batch).await.map(|_| ())
 }
 
 /// Attempts of one pin-record write, a single assertion or a vault batch
@@ -347,7 +351,7 @@ pub(crate) async fn pin_write_store(
         .with_document(0)
         .assert_value(PrincipalField::ZeroAccessPins, write.previous.assertion())
         .set(PrincipalField::ZeroAccessPins, write.sealed);
-    store.write(batch.build_all()).await.map(|_| ())
+    store.write_batch(&mut batch).await.map(|_| ())
 }
 
 /// Key pinning spec 4.4-4.5: sets `record.revision` to the previous revision
@@ -410,6 +414,36 @@ pub(crate) async fn served_public_key_store(
     }
 }
 
+/// One `only_first`, `no_values` scan of `class` over every document of
+/// `collection` in the account.
+pub(crate) async fn has_field_store(
+    store: &Store,
+    account_id: u32,
+    collection: Collection,
+    class: ValueClass,
+) -> trc::Result<bool> {
+    let key = |document_id| ValueKey {
+        account_id,
+        collection: collection.into(),
+        document_id,
+        class: class.clone(),
+    };
+    let mut found = false;
+    store
+        .iterate(
+            IterateParams::new(key(0), key(u32::MAX))
+                .no_values()
+                .only_first(),
+            |_, _| {
+                found = true;
+                Ok(false)
+            },
+        )
+        .await
+        .caused_by(trc::location!())?;
+    Ok(found)
+}
+
 impl Server {
     /// Spec 3: whether `account_id` is a key account. An unknown account id
     /// is not a key account, so upstream's outcome stands for it (plan 3
@@ -423,6 +457,32 @@ impl Server {
             .await
             .caused_by(trc::location!())?
             .is_some_and(|account| account.is_key_account()))
+    }
+
+    /// Mail spec 6.3: a key account's mailboxes are left out of another
+    /// account's listing, a grant made before it was provisioned included.
+    /// The rule of ruling R34 enforces this at use time, so a failed lookup
+    /// is logged and lists the account (review M6). The order of `access_to`
+    /// (sorted by account id) is kept.
+    pub(crate) async fn za_filter_access_to(
+        &self,
+        access_to: Box<[crate::auth::AccessTo]>,
+    ) -> Box<[crate::auth::AccessTo]> {
+        let mut access_to = access_to.into_vec();
+        for entry in access_to.iter_mut() {
+            match self.za_is_key_account(entry.account_id).await {
+                Ok(true) => {
+                    entry.collections.remove(Collection::Mailbox);
+                    entry.collections.remove(Collection::Email);
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    trc::error!(err.caused_by(trc::location!()));
+                }
+            }
+        }
+        access_to.retain(|a| !a.collections.is_empty());
+        access_to.into_boxed_slice()
     }
 
     pub async fn za_vault_record(&self, account_id: u32) -> trc::Result<Option<VaultRead>> {
@@ -477,37 +537,95 @@ impl Server {
         Ok(())
     }
 
-    /// Mail spec 6.1, the provisioning fence: appended as the last ops of a
-    /// batch that stores into `account_id` read as an ordinary account, it
-    /// commits the batch only while the account holds no vault record. Last,
-    /// because the context it selects is not restored for later ops. Nothing
-    /// on PostgreSQL or MySQL: key accounts cannot exist there (`setup-token`
-    /// refuses) and the assertion would be no fence.
+    /// Mail spec 6.1, the provisioning fence: added to a batch that stores
+    /// into `account_id` read as an ordinary account, in each commit chunk
+    /// that holds its writes, it commits the chunk only while the account
+    /// holds no vault record. The mail callers add it first, right after
+    /// `with_account_id` (`email_ingest_into`, `copy_message`), the training
+    /// path before its samples and again after each commit point, and the
+    /// iTIP writes before each commit point. It selects the `Principal`
+    /// collection and document 0 and does not restore the caller's
+    /// selection, so the caller re-selects its collection and document after
+    /// it (every later op of those callers names its keys or selects them
+    /// again). Nothing on PostgreSQL or MySQL: key accounts cannot exist
+    /// there (`setup-token` refuses) and the assertion would be no fence.
     pub fn za_provisioning_fence(&self, batch: &mut BatchBuilder, account_id: u32) {
         if !self.store().is_pg_or_mysql() {
-            batch
-                .with_account_id(account_id)
-                .with_collection(Collection::Principal)
-                .with_document(0)
-                .assert_value(PrincipalField::ZeroAccessVault, AssertValue::None);
+            crate::za::metadata::za_assert_no_vault(batch, account_id);
+        }
+    }
+
+    /// Upgrade ruling 185: a key account's credential version is its vault
+    /// revision, at least 1, so an OAuth grant's token (access or refresh) of
+    /// version 0 was minted while the account had no credential. Tokens
+    /// bound to no grant (live tokens, RSVP links) carry 0 by design and are
+    /// not checked here. Upstream exempts version 0 from the
+    /// version check; for a key account it is refused (`TokenExpired`), which
+    /// closes the window of ruling 175 where a grant minted between the
+    /// marker write's revocation query and its invalidation survives. Read
+    /// with `account()`, which fails closed; only version-0 tokens look.
+    pub async fn za_refuse_unversioned_token(
+        &self,
+        account_id: u32,
+        credential_version: u64,
+    ) -> trc::Result<()> {
+        if credential_version == 0
+            && self
+                .account(account_id)
+                .await
+                .caused_by(trc::location!())?
+                .is_key_account()
+        {
+            Err(trc::AuthEvent::TokenExpired
+                .into_err()
+                .account_id(account_id)
+                .details("zero-access: unversioned token of a key account"))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Upgrade ruling 173 (plan 13's R26 residual closed): the provisioning
+    /// fence of an ordinary calendar writer's batch, in the current commit
+    /// chunk and in every later one (`za_assert_absent_per_chunk`), so an
+    /// ordinary writer of `Calendar` or `CalendarEvent` rows or content (DAV
+    /// PUT, COPY, MOVE, DELETE, MKCOL, PROPPATCH and ACL; JMAP `Calendar/set`,
+    /// `CalendarEvent/set` and `/copy`, `CalendarEventNotification/set`;
+    /// upgrade rulings 173 and 181) that read `account_id` as an ordinary
+    /// account commits no chunk once the account holds a vault record. It
+    /// is added once, at the head of the batch, and keeps the caller's
+    /// selection.
+    /// Spec 12's rule 32 class: it applies to every ordinary account.
+    /// Nothing on PostgreSQL or MySQL, as `za_provisioning_fence`.
+    pub fn za_provisioning_fence_per_chunk(&self, batch: &mut BatchBuilder, account_id: u32) {
+        if !self.store().is_pg_or_mysql() {
+            batch.za_assert_absent_per_chunk(
+                account_id,
+                Collection::Principal,
+                0,
+                PrincipalField::ZeroAccessVault.into(),
+            );
         }
     }
 
     /// Mail ruling R58, spec 12's rule 32 for the index worker: a search
     /// document built from `account_id` read as an ordinary account is
     /// written by the internal search store only while the account holds no
-    /// vault record, asserted in the document's first commit chunk (the one
-    /// with its `Document` key). A superseded execution (a worker that
-    /// outlived its task lease) therefore cannot write after provisioning,
-    /// and a first chunk that commits first is seen by the recheck's
-    /// document scan (R51). Ruling R62 conditions every later chunk on that
-    /// `Document` key (`Store::index`), so a chunk that commits after the
-    /// document's unindex writes nothing. Nothing on PostgreSQL or MySQL,
-    /// as `za_provisioning_fence`, or without an internal search store. On
-    /// a search store other than the data store (a separate FoundationDB
+    /// vault record. At 1.0 the document carries the assertion's key, and
+    /// `account_batch` (`store/src/search/index.rs`) places the assertion
+    /// at the head of every commit chunk of the account's index pass
+    /// (`BatchBuilder::za_assert_absent_in_every_chunk`; Task 1's ruling
+    /// 18), whose `Document` keys come after its term merges. So no chunk
+    /// of a superseded pass (a worker that lost its partition lock while
+    /// another node ran the partition) commits after provisioning, and a
+    /// chunk that commits before it is seen by the recheck's scans (R51 and
+    /// R62's term scans). R62's per-chunk `Document`-key guard and R63's
+    /// confirmation read are retired at 1.0: one worker runs a partition's
+    /// entries in order (part 6a). Nothing on PostgreSQL or MySQL, as
+    /// `za_provisioning_fence`, or without an internal search store. On a
+    /// search store other than the data store (a separate FoundationDB
     /// store among them) the assertion reads the search store's key space
-    /// and passes vacuously: R51's recorded limit. R62's guard holds there,
-    /// since the `Document` key lives in the search store.
+    /// and passes vacuously: R51's recorded limit.
     pub fn za_index_fence(&self, document: IndexDocument, account_id: u32) -> IndexDocument {
         if self.store().is_pg_or_mysql() || self.search_store().internal_fts().is_none() {
             document
@@ -668,33 +786,19 @@ impl Server {
     }
 
     /// True when any document of `collection` in the account holds the
-    /// property `field`. Mail ruling R46: a destroyed message's metadata
-    /// archive (`EmailField::Metadata`) outlives its archive until the
-    /// scheduled unindex task runs.
+    /// field `field`. Mail ruling R46: a destroyed message's metadata
+    /// archive (`EmailField::Metadata`) outlives its archive until the index
+    /// queue's unindex runs. The field is scanned in the class 1.0 stores it
+    /// in, which its `Into<ValueClass>` picks: `EmailField::Metadata` and
+    /// `SortKeys` are `ValueClass::Immutable` (`Subspace::Immutable`), the
+    /// archive and other fields `ValueClass::Property`.
     pub async fn za_has_property(
         &self,
         account_id: u32,
         collection: Collection,
-        field: impl Into<u8>,
+        field: impl Into<ValueClass>,
     ) -> trc::Result<bool> {
-        let field = field.into();
-        let mut found = false;
-        self.store()
-            .iterate(
-                IterateParams::new(
-                    ValueKey::property(account_id, collection, 0, field),
-                    ValueKey::property(account_id, collection, u32::MAX, field),
-                )
-                .no_values()
-                .only_first(),
-                |_, _| {
-                    found = true;
-                    Ok(false)
-                },
-            )
-            .await
-            .caused_by(trc::location!())?;
-        Ok(found)
+        has_field_store(self.store(), account_id, collection, field.into()).await
     }
 
     /// Mail ruling R52: true when any spam training sample is indexed under
@@ -726,25 +830,85 @@ impl Server {
         Ok(found)
     }
 
-    /// Mail ruling R54: true when the task queue holds an `IndexDocument`,
-    /// `UnindexDocument`, `MergeThreads` or `CalendarItipMessage` task of the
-    /// account, pending, retrying, in flight or failed. A task's record stays
-    /// in the queue from the batch that schedules it until the worker's
-    /// `update_tasks`, so an index write still in flight is seen here before
-    /// it lands; a retained merge task holds a subject of up to 15 bytes
-    /// verbatim (`CheekyHash`). The queue has no per-account range: one pass
-    /// over every task record, stopping at the first hit.
+    /// Mail ruling R54: true when the account has unfinished work that would
+    /// write its data after provisioning, pending, retrying, in flight or
+    /// failed. At 1.0 that is two scans (ruling 22):
+    ///
+    /// - the index queue (`SearchIndexClass::Queue`, in the data store) of
+    ///   each account-partitioned index: Email, Calendar, Contacts and File.
+    ///   An entry stays from the batch that queues it (an index or unindex,
+    ///   `queue_document_index` or `queue_document_unindex`) until the index
+    ///   worker's batch clears it, so a write still in flight is seen here
+    ///   before it lands, and a failed partition keeps its entries; the
+    ///   partition's status key (its retry state) counts too;
+    /// - the task queue, for the account's `MergeThreads`,
+    ///   `CalendarItipMessage` and `ShareRevokeCleanup` tasks. A retained merge task holds the
+    ///   thread's subject hash (`TaskMergeThreads.thread_name`, the hash's
+    ///   string form), not the subject. The task queue has no per-account range:
+    ///   one pass over every task record, stopping at the first hit.
+    ///
+    /// The match over `Task` is exhaustive on purpose: a task type upstream
+    /// adds stops the build here and must be classified.
     pub async fn za_has_tasks(&self, account_id: u32) -> trc::Result<bool> {
-        let task = |id| ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task { id }));
+        for index in [
+            SearchIndex::Email,
+            SearchIndex::Calendar,
+            SearchIndex::Contacts,
+            SearchIndex::File,
+        ] {
+            let (from, to) = SearchIndexClass::queue_range(index, account_id);
+            let mut found = false;
+            self.store()
+                .iterate(
+                    IterateParams::new(
+                        ValueKey::from(ValueClass::SearchIndex(from)),
+                        ValueKey::from(ValueClass::SearchIndex(to)),
+                    )
+                    .no_values()
+                    .only_first(),
+                    |_, _| {
+                        found = true;
+                        Ok(false)
+                    },
+                )
+                .await
+                .caused_by(trc::location!())?;
+            if found {
+                return Ok(true);
+            }
+            // The partition's status key (`SearchIndexClass::QueueStatus`):
+            // set when a pass fails and cleared by the next pass that
+            // completes. A failing partition retries with backoff and never
+            // fails terminally, so its entries above are still stored; a
+            // status left without entries is cleared by the partition's
+            // next pass, so it blocks only until then.
+            if self
+                .store()
+                .get_value::<RawValue>(ValueKey::from(ValueClass::SearchIndex(
+                    SearchIndexClass::QueueStatus {
+                        index,
+                        partition: account_id,
+                    },
+                )))
+                .await
+                .caused_by(trc::location!())?
+                .is_some()
+            {
+                return Ok(true);
+            }
+        }
+
+        let task = |id| {
+            ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task {
+                id: TaskId::Assigned(id),
+            }))
+        };
         let mut found = false;
         self.store()
             .iterate(
                 IterateParams::new(task(0), task(u64::MAX)).ascending(),
                 |_, value| {
                     let owner = match Task::deserialize(value)? {
-                        Task::IndexDocument(task) | Task::UnindexDocument(task) => {
-                            Some(task.account_id)
-                        }
                         Task::MergeThreads(task) => Some(task.account_id),
                         Task::CalendarItipMessage(task) => Some(task.account_id),
                         // Content-free (ids and times) and possibly due days
@@ -754,17 +918,30 @@ impl Server {
                         // reindex sweeps.
                         Task::AccountMaintenance(_) => None,
                         // Not a provisioning state.
-                        Task::DestroyAccount(_) | Task::RestoreArchivedItem(_) => None,
+                        Task::DestroyAccount(_) => None,
+                        // Purges grantee references after a revoked share
+                        // of the owner's object. The record holds only the
+                        // owner, and counts for it (design, "Indexing,
+                        // metadata and cache snapshots"); its grantee-side
+                        // writes are container counters, not content, and
+                        // its staging skips key-account owners
+                        // (`services::task_manager::tasks::grantee_cleanup`).
+                        Task::ShareRevokeCleanup(task) => Some(task.account_id),
                         // No account.
-                        Task::IndexTrace(_)
-                        | Task::DmarcReport(_)
+                        Task::DmarcReport(_)
                         | Task::TlsReport(_)
-                        | Task::TenantMaintenance(_)
+                        | Task::DmarcReportWindow(_)
+                        | Task::TlsReportWindow(_)
                         | Task::StoreMaintenance(_)
                         | Task::SpamFilterMaintenance(_)
                         | Task::AcmeRenewal(_)
                         | Task::DkimManagement(_)
                         | Task::DnsManagement(_) => None,
+                        // The enterprise-only task types (no account's
+                        // provisioning state, and absent from the OSS
+                        // product, whose build stays exhaustive here).
+                        #[cfg(feature = "enterprise")]
+                        _ => None,
                     };
                     found = owner.is_some_and(|owner| owner.document_id() == account_id);
                     Ok(!found)
@@ -810,13 +987,10 @@ impl Server {
             return Ok(false);
         };
         let document = |document_id| {
-            ValueKey::from(ValueClass::SearchIndex(SearchIndexClass {
+            ValueKey::from(ValueClass::SearchIndex(SearchIndexClass::Document {
                 index,
-                id: SearchIndexId::Account {
-                    account_id,
-                    document_id,
-                },
-                typ: SearchIndexType::Document,
+                account_id,
+                document_id,
             }))
         };
         let mut found = false;
@@ -1335,6 +1509,49 @@ mod tests {
         assert!(vault_read_store(&store, 6).await.unwrap().is_none());
     }
 
+    /// Mail ruling R46 at 1.0: a destroyed message's metadata archive
+    /// (field 71) is written as upstream writes it (`batch.set` with
+    /// `EmailField::Metadata`, which 1.0 stores as `ValueClass::Immutable`)
+    /// and found by `za_has_property`'s scan of the same field. 0.16's scan
+    /// of the property class cannot even be built here: 1.0's key
+    /// serializer asserts in debug builds that Email field 71 is never a
+    /// `ValueClass::Property` (`store/src/write/key.rs:785-797`), and in
+    /// release builds that range is empty.
+    #[tokio::test]
+    async fn the_metadata_scan_reads_the_class_1_0_stores_it_in() {
+        use types::field::EmailField;
+
+        let store = EphemeralStore::open();
+        let mut batch = BatchBuilder::new();
+        batch
+            .with_account_id(12)
+            .with_collection(Collection::Email)
+            .with_document(3)
+            .set(EmailField::Metadata, vec![1, 2, 3]);
+        store.write_batch(&mut batch).await.unwrap();
+
+        assert!(matches!(
+            ValueClass::from(EmailField::Metadata),
+            ValueClass::Immutable(_)
+        ));
+        assert!(
+            has_field_store(&store, 12, Collection::Email, EmailField::Metadata.into())
+                .await
+                .unwrap()
+        );
+        // Another account, and the archive class, see nothing.
+        assert!(
+            !has_field_store(&store, 13, Collection::Email, EmailField::Metadata.into())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !has_field_store(&store, 12, Collection::Email, Field::ARCHIVE.into())
+                .await
+                .unwrap()
+        );
+    }
+
     async fn write_raw(store: &Store, account_id: u32, value: Vec<u8>) {
         let mut batch = BatchBuilder::new();
         batch
@@ -1342,7 +1559,7 @@ mod tests {
             .with_collection(Collection::Principal)
             .with_document(0)
             .set(PrincipalField::ZeroAccessVault, value);
-        store.write(batch.build_all()).await.unwrap();
+        store.write_batch(&mut batch).await.unwrap();
     }
 
     #[tokio::test]
@@ -1350,7 +1567,9 @@ mod tests {
         let store = EphemeralStore::open();
         let mut record = VaultRecord::pending(vec![7; 32], 100);
         record.totp_url = Some("otpauth://totp/secret-marker".into());
-        let archive = Archiver::new(record).serialize().unwrap();
+        let archive = Archiver::with_compression(record, Compression::None)
+            .serialize()
+            .unwrap();
 
         // Unknown leading version byte, valid archive after it.
         let mut raw = vec![VAULT_RECORD_VERSION + 1];
@@ -1876,7 +2095,7 @@ mod tests {
             .with_collection(Collection::Principal)
             .with_document(0)
             .set(PrincipalField::ZeroAccessPins, value);
-        store.write(batch.build_all()).await.unwrap();
+        store.write_batch(&mut batch).await.unwrap();
     }
 
     #[tokio::test]

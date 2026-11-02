@@ -51,7 +51,7 @@ async fn asn() {
             result.asn.as_ref().and_then(|r| r.name.as_deref()),
             Some(asn_name)
         );
-        assert_eq!(result.country.as_ref().map(|s| s.as_str()), Some(country));
+        assert_eq!(result.country.as_deref(), Some(country));
     }
 
     admin
@@ -60,7 +60,7 @@ async fn asn() {
                 common::manager::defaults::ASN_IPV4.to_string(),
                 common::manager::defaults::ASN_IPV6.to_string(),
             ]),
-            expires: 86_400_100u64.into(),
+            refresh_interval: 86_400_100u64.into(),
             geo_urls: Map::new(vec![
                 common::manager::defaults::GEO_IPV4.to_string(),
                 common::manager::defaults::GEO_IPV6.to_string(),
@@ -103,6 +103,6 @@ async fn asn() {
             result.asn.as_ref().and_then(|r| r.name.as_deref()),
             Some(asn_name)
         );
-        assert_eq!(result.country.as_ref().map(|s| s.as_str()), Some(country));
+        assert_eq!(result.country.as_deref(), Some(country));
     }
 }

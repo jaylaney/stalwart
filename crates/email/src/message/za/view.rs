@@ -5,12 +5,13 @@
  */
 
 //! Mail spec 5.2, 7, 10: the unsealed view a reader takes of a key
-//! account's message. A reader reads the stored archive as today, obtains
-//! the account's keys once per operation (`za_mail_keys`), replaces the
-//! archive with `za_metadata_view` and opens the blob it reads with
-//! `za_open_message_blob`. A plaintext archive (an ordinary account's, or a
-//! key account's pre-existing message, spec 6.6) passes through unchanged.
-//! A message whose stub or blob does not open is unreadable: a
+//! account's message. A reader reads the stored metadata row as today
+//! (`MetadataRow`: a key account's reader needs the row, since a stub's
+//! structure alone names only the sealed blob), obtains the account's keys
+//! once per operation (`za_mail_keys`), replaces the row with
+//! `za_metadata_view` and opens the blob it reads with
+//! `za_open_message_blob`. An ordinary account's row passes through
+//! unchanged. A message whose stub or blob does not open is unreadable: a
 //! `DataCorruption` the reader turns into its protocol's per-message failure
 //! (`za_readable`).
 
@@ -18,18 +19,14 @@ use super::{
     MailWrap, blob_needs_private_key, is_stub, new_dek, open_mail_blob, open_stub, seal_mail_blob,
     seal_mail_envelope, stub_needs_private_key,
 };
-use crate::message::metadata::MessageMetadata;
+use crate::message::metadata::{ArchivedMessageMetadata, MetadataRow};
 use common::{
     Server,
     auth::AccessToken,
     za::{ZA_TRACE_MAIL_COPY, ZA_TRACE_MAIL_KEYLESS, mail::za_keyless_refusal},
 };
 use groupware::calendar::seal::{SealError, seal_error};
-use std::{borrow::Cow, future::Future, sync::Arc};
-use store::{
-    Deserialize, Serialize,
-    write::{AlignedBytes, Archive, ArchiveVersion, Archiver},
-};
+use std::{future::Future, sync::Arc};
 use trc::AddContext;
 use types::{
     blob::{BlobClass, BlobId},
@@ -46,6 +43,15 @@ pub const ZA_REASON_UNREADABLE: &str = "zero-access: unreadable message";
 /// source (`za_refuse_raw_source`).
 pub const ZA_TRACE_RAW_SOURCE: &str = "zero-access: raw read of a sealed source";
 
+/// A reader's metadata row (`za_metadata_view`).
+pub struct ZaMetadataRow {
+    /// The stored row, or the stub's full row opened.
+    pub row: MetadataRow,
+    /// The stored row was a stub that was opened: the message's blob is
+    /// sealed, and the reader passes this to `za_open_message_blob`.
+    pub opened: bool,
+}
+
 pub trait ZaMailView: Sync + Send {
     /// The keys a read of `account_id`'s mail uses: `Some` when the token
     /// holds that account's keys, `None` only when it is not a key account
@@ -59,35 +65,42 @@ pub trait ZaMailView: Sync + Send {
         account_id: u32,
     ) -> impl Future<Output = trc::Result<Option<Arc<SessionKeys>>>> + Send;
 
-    /// Mail spec 7: the metadata archive a reader uses in place of
-    /// `stored`. `keys` is `za_mail_keys`'s answer for the account, so
-    /// `None` means an ordinary account: the stub check runs only on key
-    /// accounts' archives (spec 5.2, ruling R29), and without keys `stored`
-    /// is borrowed as it is, whatever its first byte. With keys, a
-    /// plaintext archive (spec 6.6) is borrowed too, and a stub is opened
-    /// (the account's private key unwrapped only for a `pk` envelope) into
-    /// an owned archive of the full metadata; one that does not open is
-    /// unreadable. Contract: the result is `Cow::Owned` exactly when the
-    /// stored archive is a stub that was opened, so a reader passes
-    /// `matches!(view, Cow::Owned(_))` to `za_open_message_blob`.
+    /// Mail spec 7: the metadata row a reader uses in place of `stored`.
+    /// `keys` is `za_mail_keys`'s answer for the account, so `None` means an
+    /// ordinary account: the stub check runs only on key accounts' rows
+    /// (spec 5.2, ruling R29), and without keys `stored` is returned as it
+    /// is, whatever its first header byte. With keys, a stub is opened (the
+    /// account's private key unwrapped only for a `pk` envelope) into the
+    /// full row; one that does not open is unreadable. A key account's row
+    /// that is not a stub is returned as it is (`opened: false`).
     ///
-    /// As `unseal_event_archive`'s view, this one is read-only: it is never
-    /// written back, never passed to a write as its current value
-    /// (`AssertValue`) and never cached; writes start from the stored stub.
-    /// Unlike the calendar view it does not carry the stored `version`: it
-    /// is `Unversioned`, so passing it to a write as the current value fails
-    /// the archive assertion instead of writing over the stub.
-    fn za_metadata_view<'x>(
+    /// As `unseal_event_archive`'s view, this one is read-only: its row is
+    /// never written back, never copied (`index_verbatim` takes the stored
+    /// bytes) and never cached; writes start from the stored stub.
+    fn za_metadata_view(
         &self,
-        stored: &'x Archive<AlignedBytes>,
+        stored: MetadataRow,
         keys: Option<&SessionKeys>,
         account_id: u32,
         document_id: u32,
-    ) -> impl Future<Output = trc::Result<Cow<'x, Archive<AlignedBytes>>>> + Send;
+    ) -> impl Future<Output = trc::Result<ZaMetadataRow>> + Send;
+
+    /// `za_metadata_view` for a reader that holds the stored row by
+    /// reference (a batch read): the stub's full row opened, or `None` when
+    /// the reader uses `stored` as it is (an ordinary account, or a key
+    /// account's row that is not a stub). The same checks and errors as the
+    /// view, which calls it.
+    fn za_open_metadata_row(
+        &self,
+        stored: &MetadataRow,
+        keys: Option<&SessionKeys>,
+        account_id: u32,
+        document_id: u32,
+    ) -> impl Future<Output = trc::Result<Option<MetadataRow>>> + Send;
 
     /// Mail spec 7: the message blob a reader uses in place of `bytes`, the
-    /// blob read for a message whose stored archive is a stub
-    /// (`stored_is_stub`, the view's `Cow::Owned`), opened with `keys`
+    /// blob read for a message whose stored row is a stub
+    /// (`stored_is_stub`, the view's `opened`), opened with `keys`
     /// (`za_mail_keys`'s answer, as for the view). A plaintext message's
     /// blob, or any blob read without keys, is returned as read. Either way
     /// the bytes are held in a `Zeroizing` buffer for the request; a reader
@@ -103,8 +116,9 @@ pub trait ZaMailView: Sync + Send {
 
     /// Mail spec 5.7: whether `blob_id` is a sealed source, by its owning
     /// account and class, not by the session asking: a key account's
-    /// `Reserved` blob (an upload) or `Linked` blob of `Collection::Email`
-    /// (a message, opened through its stub, or a section of one).
+    /// `Reserved` blob (an upload) or `Linked` or `Embedded` blob of
+    /// `Collection::Email` (a message, opened through its stub, or a
+    /// section of one).
     fn za_is_sealed_source(
         &self,
         blob_id: &BlobId,
@@ -176,30 +190,48 @@ impl ZaMailView for Server {
         }
     }
 
-    async fn za_metadata_view<'x>(
+    async fn za_metadata_view(
         &self,
-        stored: &'x Archive<AlignedBytes>,
+        stored: MetadataRow,
         keys: Option<&SessionKeys>,
         account_id: u32,
         document_id: u32,
-    ) -> trc::Result<Cow<'x, Archive<AlignedBytes>>> {
+    ) -> trc::Result<ZaMetadataRow> {
+        Ok(
+            match self
+                .za_open_metadata_row(&stored, keys, account_id, document_id)
+                .await?
+            {
+                Some(row) => ZaMetadataRow { row, opened: true },
+                None => ZaMetadataRow {
+                    row: stored,
+                    opened: false,
+                },
+            },
+        )
+    }
+
+    async fn za_open_metadata_row(
+        &self,
+        stored: &MetadataRow,
+        keys: Option<&SessionKeys>,
+        account_id: u32,
+        document_id: u32,
+    ) -> trc::Result<Option<MetadataRow>> {
         let Some(keys) = keys else {
-            return Ok(Cow::Borrowed(stored));
+            return Ok(None);
         };
-        let stub = stored
-            .unarchive::<MessageMetadata>()
-            .caused_by(trc::location!())?;
-        if !is_stub(stub) {
-            return Ok(Cow::Borrowed(stored));
+        if !is_stub(stored).caused_by(trc::location!())? {
+            return Ok(None);
         }
-        let private_key = if stub_needs_private_key(stub)
+        let private_key = if stub_needs_private_key(stored)
             .map_err(|err| za_unreadable(err, account_id, document_id))?
         {
             Some(za_private_key(self, keys, Some(document_id)).await?)
         } else {
             None
         };
-        za_open_stub_archive(stored, keys, private_key, account_id, document_id).map(Cow::Owned)
+        za_open_stub_row(stored, keys, private_key, account_id, document_id).map(Some)
     }
 
     async fn za_open_message_blob(
@@ -231,10 +263,15 @@ impl ZaMailView for Server {
                 account_id,
                 collection,
                 ..
+            }
+            | BlobClass::Embedded {
+                account_id,
+                collection,
+                ..
             } if collection == u8::from(Collection::Email) => {
                 self.za_is_key_account(account_id).await
             }
-            BlobClass::Linked { .. } => Ok(false),
+            BlobClass::Linked { .. } | BlobClass::Embedded { .. } => Ok(false),
         }
     }
 
@@ -312,38 +349,18 @@ pub(crate) fn za_sealing_error(err: SealError, account_id: u32) -> trc::Error {
         .caused_by(trc::location!())
 }
 
-/// Mail spec 5.2, 7: the stub `stored` opened into the view's archive: the
-/// full metadata, serialized as `index_message` serializes it and read back
-/// as the store reads an archive, `Unversioned` (see `za_metadata_view`).
-/// Errors name the message only (`za_unreadable`), never its content.
-pub fn za_open_stub_archive(
-    stored: &Archive<AlignedBytes>,
+/// Mail spec 5.2, 7: the stub `stored` opened into the view's row: the
+/// full metadata row, decoded with a checked access (`open_stub`). Errors
+/// name the message only (`za_unreadable`), never its content.
+pub fn za_open_stub_row(
+    stored: &MetadataRow,
     keys: &SessionKeys,
     private_key: Option<&Secret>,
     account_id: u32,
     document_id: u32,
-) -> trc::Result<Archive<AlignedBytes>> {
-    let unreadable = |err| za_unreadable(err, account_id, document_id);
-    let stub = stored
-        .unarchive::<MessageMetadata>()
-        .caused_by(trc::location!())?;
-    let metadata = open_stub(stub, keys, private_key, account_id).map_err(unreadable)?;
-    // Only the intermediate serialized buffer is zeroized; the decoded
-    // metadata and the view's own bytes are not.
-    let bytes = Zeroizing::new(
-        Archiver::new(metadata)
-            .serialize()
-            .map_err(|_| unreadable(SealError::Format))?,
-    );
-    let mut view = <Archive<AlignedBytes> as Deserialize>::deserialize(&bytes)
-        .map_err(|_| unreadable(SealError::Format))?;
-    view.version = ArchiveVersion::Unversioned;
-    // An unversioned archive is read with a checked access, whose error
-    // would quote the bytes: check it here, under the fixed error, so the
-    // reader's own access cannot fail.
-    view.unarchive::<MessageMetadata>()
-        .map_err(|_| unreadable(SealError::Format))?;
-    Ok(view)
+) -> trc::Result<MetadataRow> {
+    open_stub(stored, keys, private_key, account_id)
+        .map_err(|err| za_unreadable(err, account_id, document_id))
 }
 
 /// Mail spec 10: a stub or blob that does not open, `seal_error`'s
@@ -370,6 +387,32 @@ pub fn za_readable<T>(result: trc::Result<T>) -> trc::Result<Option<T>> {
         }
         Err(err) => Err(err),
     }
+}
+
+/// Mail spec 5.2, ruling 55: whether a key account's message has an
+/// attachment, read from its opened row's structure. Upstream sets the
+/// attachment keywords at ingest from the parsed message
+/// (`MessageMetadata::build`'s `has_attachments`); a key account's message
+/// stores neither keyword, so JMAP `hasAttachment` reads this instead. The
+/// rule is upstream's on the stored view: an attachment of the root message
+/// that is not inline, or that is a message (`message/rfc822`,
+/// `message/global` included). Recorded limit: a part beyond the row's
+/// `MAX_PART_ENTRIES` is not stored, so a message whose only attachment lies
+/// there reads `false` where upstream's keyword would say `true`.
+pub fn za_has_attachment(metadata: &ArchivedMessageMetadata) -> bool {
+    metadata.root().attachments().any(|part| {
+        !part
+            .content_disposition()
+            .is_some_and(|disposition| disposition.is_inline())
+            || part.is_message()
+            || part.content_type().is_some_and(|content_type| {
+                content_type.ctype().eq_ignore_ascii_case("message")
+                    && content_type.subtype().is_some_and(|subtype| {
+                        subtype.eq_ignore_ascii_case("rfc822")
+                            || subtype.eq_ignore_ascii_case("global")
+                    })
+            })
+    })
 }
 
 /// The account's private key for a `pk` envelope; a key that does not open
@@ -408,14 +451,12 @@ fn za_keyless(account_id: u32) -> trc::Error {
 mod tests {
     use super::*;
     use crate::message::{
-        metadata::ArchivedMessageMetadata,
+        metadata::{ExtraHeaders, HeaderId, MessageMetadata},
         za::{MailWrap, new_dek, seal_mail_envelope, seal_stub},
     };
-    use mail_parser::{Header, HeaderName, HeaderValue, Message, MessageParser, PartType};
-    use std::collections::VecDeque;
-    use store::{Deserialize, Serialize, write::Archiver};
+    use mail_parser::MessageParser;
+    use store::Deserialize;
     use types::blob_hash::BlobHash;
-    use utils::chained_bytes::ChainedBytes;
     use vault::keys::Secret;
 
     /// Mail spec 7, review F5: the shapes whose offsets a reader applies.
@@ -428,6 +469,8 @@ mod tests {
         "From: alice@example.com\r\nSubject: report\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"mix\"\r\n\r\n--mix\r\nContent-Type: text/plain\r\n\r\nSee the attached report.\r\n--mix\r\nContent-Type: application/pdf; name=\"report.pdf\"\r\nContent-Disposition: attachment; filename=\"report.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQKJcOkw7zDtsOfCjIgMCBvYmoKPDwvTGVuZ3RoIDMgMCBSPj4Kc3RyZWFtCg==\r\n--mix--\r\n",
         // A nested message/rfc822 whose inner message has its own attachment.
         "From: alice@example.com\r\nSubject: forwarded\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"outer\"\r\n\r\n--outer\r\nContent-Type: text/plain\r\n\r\nForwarded message below.\r\n--outer\r\nContent-Type: message/rfc822\r\n\r\nFrom: carol@example.com\r\nSubject: inner\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"inner\"\r\n\r\n--inner\r\nContent-Type: text/plain\r\n\r\nInner body text.\r\n--inner\r\nContent-Type: application/octet-stream; name=\"inner.bin\"\r\nContent-Disposition: attachment; filename=\"inner.bin\"\r\nContent-Transfer-Encoding: base64\r\n\r\naW5uZXIgYXR0YWNobWVudA==\r\n--inner--\r\n\r\n--outer--\r\n",
+        // A base64 message/rfc822 nested twice (a decoded source chain).
+        "From: alice@example.com\r\nSubject: encoded\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"o\"\r\n\r\n--o\r\nContent-Type: message/rfc822\r\nContent-Transfer-Encoding: base64\r\n\r\nU3ViamVjdDogZW5jb2RlZCBpbm5lcg0KDQpFbmNvZGVkIGlubmVyIGJvZHku\r\n--o--\r\n",
         // An 8-bit body with a long folded header.
         "From: alice@example.com\r\nSubject: a long subject that is folded across\r\n several lines of the header block so that\r\n the parser has to unfold it again\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\nCaf\u{e9}, d\u{e9}j\u{e0} vu, na\u{ef}ve fa\u{e7}ade: an 8-bit body.\r\n",
         // A header block only.
@@ -435,62 +478,69 @@ mod tests {
     ];
     const DELIVERED_TO: &[u8] = b"Delivered-To: x@example.com\r\n";
 
-    /// The text of every text and HTML part, per message in the order
-    /// `build_metadata_contents` numbers them (the root, then nested
-    /// messages as they are found).
-    fn original_texts(message: &Message<'_>) -> Vec<Vec<Option<String>>> {
-        let mut queue = VecDeque::from([message]);
-        let mut texts = Vec::new();
-        while let Some(message) = queue.pop_front() {
-            texts.push(
-                message
-                    .parts
-                    .iter()
-                    .map(|part| match &part.body {
-                        PartType::Text(text) | PartType::Html(text) => Some(text.to_string()),
-                        PartType::Message(nested) => {
-                            queue.push_back(nested);
-                            None
-                        }
-                        _ => None,
-                    })
-                    .collect(),
-            );
-        }
+    /// The text of every text and HTML part of every message, nested ones
+    /// included, as the parser reads it.
+    fn original_texts(raw: &[u8]) -> Vec<String> {
+        let message = MessageParser::new().parse(raw).unwrap();
+        let mut texts = message
+            .parts()
+            .filter_map(|part| part.text().map(|text| text.into_owned()))
+            .collect::<Vec<_>>();
+        texts.sort();
         texts
     }
 
-    /// `Archiver::new(..).serialize()`, then the store's read side.
-    fn archive(metadata: MessageMetadata) -> Archive<AlignedBytes> {
-        let bytes = Archiver::new(metadata).serialize().unwrap();
-        <Archive<AlignedBytes> as Deserialize>::deserialize(&bytes).unwrap()
-    }
-
     /// The full metadata of a delivery: `Delivered-To` prepended.
-    fn full_metadata(raw: &[u8]) -> MessageMetadata {
+    fn full_metadata(raw: &[u8], blob_hash: BlobHash) -> crate::message::metadata::NewMetadata {
         let message = MessageParser::new().parse(raw).unwrap();
-        let delivered_to = Header {
-            name: HeaderName::DeliveredTo,
-            value: HeaderValue::Text("x@example.com".into()),
-            offset_field: 0,
-            offset_start: 13,
-            offset_end: DELIVERED_TO.len() as u32,
-        };
-        MessageMetadata::build(
-            message,
-            DELIVERED_TO.to_vec(),
-            vec![delivered_to],
-            BlobHash::generate(b"sealed bytes"),
-            1_700_000_000,
-        )
+        let mut extra = ExtraHeaders::default();
+        extra.push(HeaderId::DELIVERED_TO, "x@example.com");
+        MessageMetadata::build(&message, &extra, blob_hash)
     }
 
-    /// The reconstructed message: `raw_headers || raw[blob_body_offset..]`.
-    fn reconstruct<'x>(metadata: &'x ArchivedMessageMetadata, raw: &'x [u8]) -> ChainedBytes<'x> {
-        ChainedBytes::new(metadata.raw_headers.as_ref()).with_last(
-            raw.get(metadata.blob_body_offset.to_native() as usize..)
-                .unwrap_or_default(),
-        )
+    /// Every text part's text, read through upstream's sources.
+    fn texts(row: &MetadataRow, raw: &[u8]) -> Vec<String> {
+        let metadata = row.unarchive().unwrap();
+        let headers = row.raw_headers().unwrap();
+        let source = metadata.raw_message(Some(&headers), raw);
+        let mut texts = Vec::new();
+        for message in metadata.messages() {
+            let source = metadata.source(message, source).unwrap();
+            for part in message.parts() {
+                if let Some(text) = part.text(&source) {
+                    texts.push(text.text.into_owned());
+                }
+            }
+        }
+        texts.sort();
+        texts
+    }
+
+    /// Ruling 55: the attachment bit read from the opened row matches the
+    /// one upstream derives from the parsed message, for every corpus shape
+    /// and for an inline part and a nested message.
+    #[test]
+    fn the_opened_row_answers_has_attachment_as_upstream() {
+        const EXTRA: &[&str] = &[
+            // An inline image only: no attachment.
+            "From: alice@example.com\r\nSubject: inline\r\nMIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"rel\"\r\n\r\n--rel\r\nContent-Type: text/html\r\n\r\n<img src=\"cid:i\">\r\n--rel\r\nContent-Type: image/png\r\nContent-Disposition: inline\r\nContent-ID: <i>\r\nContent-Transfer-Encoding: base64\r\n\r\naW1hZ2U=\r\n--rel--\r\n",
+            // An inline message/global part: an attachment for upstream.
+            "From: alice@example.com\r\nSubject: global\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"g\"\r\n\r\n--g\r\nContent-Type: text/plain\r\n\r\nBody.\r\n--g\r\nContent-Type: message/global\r\nContent-Disposition: inline\r\n\r\nSubject: inner\r\n\r\nInner.\r\n--g--\r\n",
+        ];
+        let mut seen = [false, false];
+        for text in CORPUS.iter().chain(EXTRA) {
+            let raw = text.as_bytes();
+            let built = full_metadata(raw, BlobHash::generate(b"blob"));
+            let expected = built.has_attachments;
+            seen[usize::from(expected)] = true;
+            let row = MetadataRow::deserialize(&built.encode().unwrap()).unwrap();
+            assert_eq!(
+                za_has_attachment(row.unarchive().unwrap()),
+                expected,
+                "{text}"
+            );
+        }
+        assert_eq!(seen, [true, true], "both answers are exercised");
     }
 
     #[test]
@@ -498,73 +548,55 @@ mod tests {
         let keys = SessionKeys::new(7, 1, Secret::random());
         for (index, text) in CORPUS.iter().enumerate() {
             let raw = text.as_bytes();
-            let full = archive(full_metadata(raw));
+            let hash = BlobHash::generate(b"sealed bytes");
+            let full =
+                MetadataRow::deserialize(&full_metadata(raw, hash.clone()).encode().unwrap())
+                    .unwrap();
             let dek = new_dek();
             let envelope = seal_mail_envelope(&dek, MailWrap::Session(&keys), 7).unwrap();
-            let stored = archive(seal_stub(full_metadata(raw), &dek, &envelope, 7).unwrap());
-            let view = za_open_stub_archive(&stored, &keys, None, 7, 1).unwrap();
-            assert_eq!(
-                view.version,
-                ArchiveVersion::Unversioned,
-                "message {index}: the view never matches the stub's version"
-            );
-            // The opened metadata is the full metadata, every field (preview,
-            // headers, body lists, `rcvd_attach`, contents): the same rkyv
-            // bytes.
-            assert_eq!(
-                view.as_bytes(),
-                full.as_bytes(),
-                "message {index}: the opened metadata"
-            );
-            assert_ne!(stored.as_bytes(), full.as_bytes());
-            let view = view.unarchive::<MessageMetadata>().unwrap();
-            let full = full.unarchive::<MessageMetadata>().unwrap();
-            assert!(!full.raw_headers.is_empty() && !full.contents[0].parts.is_empty());
+            let stored = MetadataRow::deserialize(
+                &seal_stub(full_metadata(raw, hash), &dek, &envelope, 7, 4096).unwrap(),
+            )
+            .unwrap();
+            let view = za_open_stub_row(&stored, &keys, None, 7, 1).unwrap();
 
-            let message = reconstruct(view, raw);
+            // The opened row is the full row, every field: the same structure
+            // and the same header section.
+            let structure = |row: &MetadataRow| {
+                format!(
+                    "{:?}",
+                    rkyv::deserialize::<MessageMetadata, rkyv::rancor::Error>(
+                        row.unarchive().unwrap()
+                    )
+                    .unwrap()
+                )
+            };
+            assert_eq!(structure(&view), structure(&full), "message {index}");
+            assert_ne!(structure(&stored), structure(&full), "message {index}");
             assert_eq!(
-                message.to_bytes(),
+                view.raw_headers().unwrap(),
+                full.raw_headers().unwrap(),
+                "message {index}"
+            );
+
+            // The reconstructed message: the header section, then the blob
+            // from the body offset.
+            let metadata = view.unarchive().unwrap();
+            let headers = view.raw_headers().unwrap();
+            assert_eq!(
+                metadata
+                    .raw_message(Some(&headers), raw)
+                    .whole()
+                    .unwrap()
+                    .to_vec(),
                 [DELIVERED_TO, raw].concat(),
                 "message {index}: the delivery header and the message"
             );
-            assert_eq!(message.to_bytes(), reconstruct(full, raw).to_bytes());
 
-            let view_decoded = view.decode_contents(message.clone());
-            let full_decoded = full.decode_contents(message.clone());
-            let texts = original_texts(&MessageParser::new().parse(raw).unwrap());
-            assert_eq!(view.contents.len(), full.contents.len(), "message {index}");
-            assert_eq!(view.contents.len(), texts.len(), "message {index}");
-            for (id, (view_contents, full_contents)) in
-                view.contents.iter().zip(full.contents.iter()).enumerate()
-            {
-                assert_eq!(view_contents.parts.len(), full_contents.parts.len());
-                for (part_id, (part, full_part)) in view_contents
-                    .parts
-                    .iter()
-                    .zip(full_contents.parts.iter())
-                    .enumerate()
-                {
-                    let what = format!("message {index}, contents {id}, part {part_id}");
-                    for (range, full_range) in [
-                        (part.header_to_end(), full_part.header_to_end()),
-                        (part.body_to_end(), full_part.body_to_end()),
-                    ] {
-                        assert_eq!(range, full_range, "{what}");
-                        assert_eq!(
-                            view_decoded.raw_message_section(id, range),
-                            full_decoded.raw_message_section(id, full_range),
-                            "{what}"
-                        );
-                    }
-                    if let Some(original) = &texts[id][part_id] {
-                        assert_eq!(
-                            view_decoded.text_part(id, u32::from(part.offset_header) as usize),
-                            Some(original.as_str()),
-                            "{what}"
-                        );
-                    }
-                }
-            }
+            // Upstream's part readers find every text part's text, nested and
+            // decoded messages included.
+            assert_eq!(texts(&view, raw), original_texts(raw), "message {index}");
+            assert_eq!(texts(&view, raw), texts(&full, raw), "message {index}");
         }
     }
 }

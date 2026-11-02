@@ -15,7 +15,7 @@ use super::{
 use crate::utils::{
     server::TestServer,
     webdav::DummyWebDavClient,
-    za::{AcceptAnyCert, SERVER_URL},
+    za::{AcceptAnyCert, Conn, SERVER_URL},
 };
 use ::registry::{
     schema::{
@@ -37,10 +37,12 @@ use tokio_rustls::{
     rustls::{self, pki_types::ServerName},
 };
 use trc::{
-    AuthEvent, CalendarEvent, Collector, EvalEvent, EventType, HttpEvent, JmapEvent, StoreEvent,
+    AuthEvent, CacheEvent, CalendarEvent, Collector, EvalEvent, EventType, HttpEvent, JmapEvent,
     ipc::subscriber::{Interests, SubscriberBuilder},
 };
 
+/// The implicit-TLS IMAP listener.
+const IMAP_TLS_PORT: u16 = 9992;
 const KEY_CANARY: &str = "trace-canary-key-9f3c";
 const PLAIN_CANARY: &str = "trace-canary-plain-7a1d";
 const KEY_JMAP_CANARY: &str = "trace-canary-jmap-key-3b7e";
@@ -162,13 +164,23 @@ async fn put_and_report(client: &DummyWebDavClient, collection: &str, uid: &str,
         )
         .await
         .with_status(StatusCode::CREATED);
-    let body = client
-        .request_with_headers("REPORT", collection, [("depth", "1")], query(canary))
-        .await
-        .with_status(StatusCode::MULTI_STATUS)
-        .body
-        .unwrap();
-    assert!(body.contains(canary), "{body}");
+    // An ordinary account's text match reads 1.0's Calendar search index,
+    // which the index queue writes after the PUT: retried until it is
+    // written (bounded). A key account's is matched in memory.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let body = client
+            .request_with_headers("REPORT", collection, [("depth", "1")], query(canary))
+            .await
+            .with_status(StatusCode::MULTI_STATUS)
+            .body
+            .unwrap();
+        if body.contains(canary) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{body}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 /// POST a `Core/echo` call carrying `canary` to `/jmap`; the echoed
@@ -197,6 +209,234 @@ fn http_client() -> reqwest::Client {
         .danger_accept_invalid_certs(true)
         .build()
         .unwrap()
+}
+
+/// Ruling 135 (M14, mutations a070 and a072): no credential-bearing input
+/// of a request that fails before or during authentication reaches any
+/// event, for every account (the account is unknown there). Ruling 28's
+/// Basic decode and unsupported-mechanism errors carry no part of the
+/// Authorization value, a malformed one or one of an unknown mechanism; and
+/// an OAuth token request's form (`/auth/token`), with a code, a client
+/// secret or a device code, is read untraced (issue #20). Each request comes
+/// from its own forwarded address, so its failure is charged to no other
+/// client. The Basic decode's error event is the control: the subscriber
+/// sees the refusals.
+async fn credential_inputs_are_not_traced() {
+    println!("credential_inputs_are_not_traced");
+    const BASIC_CANARY: &str = "trace-canary-basic-4f7a";
+    const NO_COLON_CANARY: &str = "trace-canary-nocolon-8b21";
+    const MECHANISM_CANARY: &str = "trace-canary-mechanism-3c5e";
+    const CODE_CANARY: &str = "trace-canary-code-6a0d";
+    const SECRET_CANARY: &str = "trace-canary-secret-1f9b";
+    const DEVICE_CANARY: &str = "trace-canary-device-7e42";
+    let traced = super::mail::Traced::start(EventType::variants());
+    let mut answers = Vec::new();
+    for (n, authorization) in [
+        format!("Basic !{BASIC_CANARY}!"),
+        format!("Basic {}", STANDARD.encode(NO_COLON_CANARY)),
+        format!("Negotiate {MECHANISM_CANARY}"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = http_client()
+            .get(format!("{SERVER_URL}/jmap/session"))
+            .header("authorization", authorization)
+            .header("x-forwarded-for", format!("10.77.1.{}", n + 1))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        assert!(status.is_client_error(), "a malformed credential: {status}");
+        answers.push(response.text().await.unwrap());
+    }
+    for (n, form) in [
+        format!(
+            "grant_type=authorization_code&code={CODE_CANARY}&client_id=za-trace-client\
+             &client_secret={SECRET_CANARY}&redirect_uri=https%3A%2F%2Fclient.example.com%2Fcb"
+        ),
+        format!(
+            "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code\
+             &device_code={DEVICE_CANARY}&client_id=za-trace-client"
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let response = http_client()
+            .post(format!("{SERVER_URL}/auth/token"))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("x-forwarded-for", format!("10.77.2.{}", n + 1))
+            .body(form)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        assert!(
+            status.is_client_error(),
+            "a refused token request: {status}"
+        );
+        answers.push(response.text().await.unwrap());
+    }
+    let events = traced.finish().await;
+    assert!(
+        events
+            .iter()
+            .any(|event| event.typ == EventType::Auth(AuthEvent::Error)
+                && event.details == "Failed to decode Basic auth request."),
+        "control: the Basic decode's refusal was not traced"
+    );
+    for canary in [
+        BASIC_CANARY,
+        NO_COLON_CANARY,
+        MECHANISM_CANARY,
+        CODE_CANARY,
+        SECRET_CANARY,
+        DEVICE_CANARY,
+    ] {
+        for event in &events {
+            assert!(
+                !event.text.contains(canary),
+                "{:?} carries {canary}: {}",
+                event.typ,
+                event.text
+            );
+        }
+        assert!(
+            !answers.iter().any(|answer| answer.contains(canary)),
+            "an answer quotes {canary}: {answers:?}"
+        );
+    }
+}
+
+/// Upgrade ruling 171 (finding A1): a Bearer value this server cannot
+/// decode is a credential (a foreign token, or a password a client put in
+/// the Bearer field), so no event carries it, for every account (the
+/// account is unknown there). Each value goes over HTTP (`Authorization:
+/// Bearer`), SMTP AUTH (OAUTHBEARER and XOAUTH2, on the submission
+/// listener) and IMAP AUTHENTICATE OAUTHBEARER, each in its own capture;
+/// the canaries are one value with the internal token's prefix (`sw1.`)
+/// and one without. The decode failure's own event is the control.
+async fn bearer_values_are_not_traced() {
+    println!("bearer_values_are_not_traced");
+    const CANARIES: [&str; 2] = [
+        "sw1.trace-canary-bearer-prefixed-5d3a",
+        "trace-canary-bearer-bare-8e61",
+    ];
+    const USER: &str = "plain@example.com";
+    const DECODE_FAILURE: &str = "Failed to decode token.";
+    let check = |protocol: &str, canary: &str, events: &[super::mail::TracedEvent]| {
+        assert!(
+            events
+                .iter()
+                .any(|event| event.text.contains(DECODE_FAILURE)),
+            "control: {protocol} traced no decode failure for {canary}"
+        );
+        for event in events {
+            assert!(
+                !event.text.contains(canary),
+                "{protocol}: {:?} carries {canary}: {}",
+                event.typ,
+                event.text
+            );
+        }
+    };
+    for (n, canary) in CANARIES.into_iter().enumerate() {
+        let traced = super::mail::Traced::start(EventType::variants());
+        let response = http_client()
+            .get(format!("{SERVER_URL}/jmap/session"))
+            .header("authorization", format!("Bearer {canary}"))
+            .header("x-forwarded-for", format!("10.77.3.{}", n + 1))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "an undecodable Bearer");
+        let answer = response.text().await.unwrap();
+        assert!(!answer.contains(canary), "the answer quotes {canary}");
+        check("HTTP", canary, &traced.finish().await);
+
+        for (mechanism, response) in [
+            (
+                "OAUTHBEARER",
+                STANDARD.encode(format!("n,a={USER},\u{1}auth=Bearer {canary}\u{1}\u{1}")),
+            ),
+            (
+                "XOAUTH2",
+                STANDARD.encode(format!("user={USER}\u{1}auth=Bearer {canary}\u{1}\u{1}")),
+            ),
+        ] {
+            let traced = super::mail::Traced::start(EventType::variants());
+            let mut conn = Conn::open_smtp(super::raw_input::SUBMISSION_PORT).await;
+            conn.send("EHLO bearer-trace.test\r\n").await;
+            conn.until(&["250 "]).await;
+            // The failure is a 334 challenge; the client's answer ends it.
+            conn.exchange(&format!("AUTH {mechanism} {response}\r\n"), "334")
+                .await;
+            conn.send("AQ==\r\n").await;
+            let line = conn.until(&["4", "5"]).await;
+            assert!(
+                line.starts_with("535"),
+                "SMTP {mechanism} answered {line:?}"
+            );
+            conn.exchange("QUIT\r\n", "221").await;
+            check(&format!("SMTP {mechanism}"), canary, &traced.finish().await);
+        }
+
+        let traced = super::mail::Traced::start(EventType::variants());
+        let mut conn = Conn::open(IMAP_TLS_PORT).await;
+        conn.until(&["* OK"]).await;
+        let response = STANDARD.encode(format!("n,a={USER},\u{1}auth=Bearer {canary}\u{1}\u{1}"));
+        conn.exchange(&format!("b1 AUTHENTICATE OAUTHBEARER {response}\r\n"), "+")
+            .await;
+        conn.exchange("AQ==\r\n", "b1 NO").await;
+        conn.exchange("b2 LOGOUT\r\n", "b2 OK").await;
+        check("IMAP", canary, &traced.finish().await);
+    }
+}
+
+/// Upgrade ruling 176 (A2): a type error in the `/api/auth` login body
+/// (read untraced, as it carries the account's secret) is reported by its
+/// category and position only. serde's own message quotes a string given
+/// where another type is expected; neither the answer nor any event carries
+/// that value. The error's own event is the control.
+async fn login_type_errors_are_not_traced() {
+    println!("login_type_errors_are_not_traced");
+    const CANARY: &str = "trace-canary-login-type-2b9e";
+    let traced = super::mail::Traced::start(EventType::variants());
+    let response = http_client()
+        .post(format!("{SERVER_URL}/api/auth"))
+        .header("content-type", "application/json")
+        .header("x-forwarded-for", "10.77.4.1")
+        .body(
+            json!({ "type": "authConsent", "token": "t", "query": "q", "consent": CANARY })
+                .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    assert!(status.is_client_error(), "a malformed login body: {status}");
+    let answer = response.text().await.unwrap();
+    assert!(
+        !answer.contains(CANARY),
+        "the answer quotes the value: {answer}"
+    );
+    let events = traced.finish().await;
+    assert!(
+        events
+            .iter()
+            .any(|event| event.text.contains("JSON deserialization failed")),
+        "control: the login body's parse error was not traced"
+    );
+    for event in &events {
+        assert!(
+            !event.text.contains(CANARY),
+            "{:?} carries the value: {}",
+            event.typ,
+            event.text
+        );
+    }
 }
 
 /// DAV OPTIONS with a wrong Basic credential, from its own forwarded address
@@ -475,6 +715,9 @@ async fn ws_bad_arguments(user: &str, secret: &str, canary: &str) {
 
 pub async fn test(test: &mut TestServer) {
     println!("Running zero-access HTTP trace tests...");
+    credential_inputs_are_not_traced().await;
+    bearer_values_are_not_traced().await;
+    login_type_errors_are_not_traced().await;
     let key1 = test.account("key1@example.com").clone();
     let key_client = DummyWebDavClient::new(
         key1.id().document_id(),
@@ -506,7 +749,7 @@ pub async fn test(test: &mut TestServer) {
         .registry_create_object(Domain {
             name: SUBADDR_DOMAIN.to_string(),
             aliases: Map::new(vec![SUBADDR_DOMAIN_ALIAS.to_string()]),
-            is_enabled: true,
+            enable: true,
             certificate_management: CertificateManagement::Manual,
             dns_management: DnsManagement::Manual,
             dkim_management: DkimManagement::Manual,
@@ -538,8 +781,8 @@ pub async fn test(test: &mut TestServer) {
         EventType::Jmap(JmapEvent::InvalidResultReference),
         EventType::Auth(AuthEvent::Failed),
         EventType::Calendar(CalendarEvent::ItipMessageError),
-        EventType::Store(StoreEvent::CacheHit),
-        EventType::Store(StoreEvent::CacheMiss),
+        EventType::Cache(CacheEvent::Hit),
+        EventType::Cache(CacheEvent::Miss),
         EventType::Eval(EvalEvent::Result),
         EventType::Eval(EvalEvent::Error),
     ];
@@ -547,7 +790,7 @@ pub async fn test(test: &mut TestServer) {
     for event_type in traced {
         interests.set(event_type);
     }
-    let (_tx, mut rx) = SubscriberBuilder::new(SUBSCRIBER_ID.into())
+    let (_tx, mut rx, _) = SubscriberBuilder::new(SUBSCRIBER_ID.into())
         .set_interests(traced)
         .with_lossy(false)
         .register();
@@ -861,8 +1104,8 @@ pub async fn test(test: &mut TestServer) {
     // Recipient lookups: the subscriber sees upstream's cache events with
     // the looked-up local part, and none carries a key account's attendee.
     let lookups = [
-        traced_as(EventType::Store(StoreEvent::CacheHit)),
-        traced_as(EventType::Store(StoreEvent::CacheMiss)),
+        traced_as(EventType::Cache(CacheEvent::Hit)),
+        traced_as(EventType::Cache(CacheEvent::Miss)),
     ]
     .join("\n");
     assert!(

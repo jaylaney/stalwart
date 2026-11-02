@@ -6,9 +6,8 @@
 
 use crate::{
     DavError, DavErrorCondition, DavMethod,
-    calendar::freebusy::CalendarFreebusyRequestHandler,
+    calendar::freebusy::{CalendarFreebusyRequestHandler, FreeBusyScope},
     common::{
-        ETag,
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
         za::{ZeroAccessGate, za_item_hidden, za_item_view},
@@ -31,17 +30,27 @@ use dav_proto::{
     },
 };
 use groupware::{
-    DestroyArchive, cache::GroupwareCache, calendar::CalendarEventNotification, strip_mailto_scheme,
+    DestroyArchive,
+    cache::GroupwareCache,
+    calendar::{
+        CalendarEventNotification, CalendarEventNotificationContent,
+        availability::AvailabilityCalendars,
+    },
+    strip_mailto_scheme,
 };
 use http_proto::HttpResponse;
 use hyper::StatusCode;
+use registry::schema::enums::Permission;
 use store::{
     ValueKey,
-    write::{AlignedBytes, Archive},
+    write::{Archive, ArchiveBytes},
 };
 use store::{ahash::AHashMap, write::BatchBuilder};
 use trc::AddContext;
-use types::collection::{Collection, SyncCollection};
+use types::{
+    collection::{Collection, SyncCollection},
+    field::CalendarNotificationField,
+};
 use utils::sanitize_email;
 
 pub(crate) trait CalendarEventNotificationHandler: Sync + Send {
@@ -62,7 +71,7 @@ pub(crate) trait CalendarEventNotificationHandler: Sync + Send {
         &self,
         access_token: &AccessToken,
         headers: &RequestHeaders<'_>,
-        bytes: Vec<u8>,
+        bytes: &[u8],
     ) -> impl Future<Output = crate::Result<HttpResponse>> + Send;
 }
 
@@ -80,7 +89,7 @@ impl CalendarEventNotificationHandler for Server {
             .into_owned_uri()?;
         let account_id = resource_.account_id;
         let resources = self
-            .fetch_dav_resources(
+            .fetch_groupware_resources(
                 access_token.account_id(),
                 account_id,
                 SyncCollection::CalendarEventNotification,
@@ -106,7 +115,7 @@ impl CalendarEventNotificationHandler for Server {
         // Fetch event
         let event_ = self
             .store()
-            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
                 account_id,
                 Collection::CalendarEventNotification,
                 resource.document_id(),
@@ -130,18 +139,12 @@ impl CalendarEventNotificationHandler for Server {
             return Err(DavError::Code(StatusCode::NOT_FOUND));
         }
         let za_keys = self.za_session_keys(access_token, account_id).await?;
-        let view_ = za_item_view(
-            &event_,
-            za_keys.as_ref(),
-            account_id,
-            resource.document_id(),
-        )?;
-        let event = view_
+        let event = event_
             .unarchive::<CalendarEventNotification>()
             .caused_by(trc::location!())?;
 
         // Validate headers
-        let etag = event_.etag();
+        let etag = format!("\"{}\"", event.etag.to_native());
         self.validate_headers(
             access_token,
             headers,
@@ -163,13 +166,40 @@ impl CalendarEventNotificationHandler for Server {
             .with_etag(etag)
             .with_last_modified(Rfc1123DateTime::new(i64::from(event.modified)).to_string());
 
-        let ical = event.event.to_string();
-
-        if !is_head {
-            Ok(response.with_binary_body(ical))
-        } else {
-            Ok(response.with_content_length(ical.len()))
+        // A key account's stored size is the sealed message's: measure the view.
+        if is_head && za_keys.is_none() {
+            return Ok(response.with_content_length(event.size.to_native() as usize));
         }
+
+        let content_ = self
+            .store()
+            .get_value::<Archive<ArchiveBytes>>(ValueKey::property(
+                account_id,
+                Collection::CalendarEventNotification,
+                resource.document_id(),
+                CalendarNotificationField::Content,
+            ))
+            .await
+            .caused_by(trc::location!())?
+            .ok_or(DavError::Code(StatusCode::NOT_FOUND))?;
+        let view_ = za_item_view(
+            &content_,
+            za_keys.as_ref(),
+            account_id,
+            resource.document_id(),
+        )?;
+        let content = view_
+            .unarchive::<CalendarEventNotificationContent>()
+            .caused_by(trc::location!())?;
+
+        let mut body = String::with_capacity(event.size.to_native() as usize);
+        if let Some(ical) = content.calendar_data() {
+            let _ = ical.write_to(&mut body);
+        }
+        if is_head {
+            return Ok(response.with_content_length(body.len()));
+        }
+        Ok(response.with_binary_body(body))
     }
 
     async fn handle_scheduling_delete_request(
@@ -188,7 +218,7 @@ impl CalendarEventNotificationHandler for Server {
             .filter(|r| !r.is_empty())
             .ok_or(DavError::Code(StatusCode::FORBIDDEN))?;
         let resources = self
-            .fetch_dav_resources(
+            .fetch_groupware_resources(
                 access_token.account_id(),
                 account_id,
                 SyncCollection::CalendarEventNotification,
@@ -212,7 +242,7 @@ impl CalendarEventNotificationHandler for Server {
         let document_id = resource.document_id();
         let event_ = self
             .store()
-            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
                 account_id,
                 Collection::CalendarEventNotification,
                 document_id,
@@ -220,6 +250,24 @@ impl CalendarEventNotificationHandler for Server {
             .await
             .caused_by(trc::location!())?
             .ok_or(DavError::Code(StatusCode::NOT_FOUND))?;
+        // Upgrade ruling 176 (B-M4): a pending item is not there for a
+        // client until drained, so its DELETE answers 404 as its GET does;
+        // ruling 188: unless this session's drain gave up on it.
+        if za_item_hidden(
+            self,
+            access_token,
+            account_id,
+            Collection::CalendarEventNotification,
+            &event_,
+        )
+        .await?
+            && !crate::common::za::za_drain_gave_up(access_token, account_id, document_id).await
+        {
+            return Err(DavError::Code(StatusCode::NOT_FOUND));
+        }
+        let event = event_
+            .to_unarchived::<CalendarEventNotification>()
+            .caused_by(trc::location!())?;
 
         // Validate headers
         self.validate_headers(
@@ -229,7 +277,7 @@ impl CalendarEventNotificationHandler for Server {
                 account_id,
                 collection: Collection::CalendarEventNotification,
                 document_id: document_id.into(),
-                etag: event_.etag().into(),
+                etag: format!("\"{}\"", event.inner.etag.to_native()).into(),
                 path: delete_path,
                 ..Default::default()
             }],
@@ -238,15 +286,16 @@ impl CalendarEventNotificationHandler for Server {
         )
         .await?;
 
-        let event = event_
-            .to_unarchived::<CalendarEventNotification>()
-            .caused_by(trc::location!())?;
-
         // Delete event
         let mut batch = BatchBuilder::new();
+        // Upgrade ruling 189: an ordinary account's inbox delete is fenced
+        // as JMAP's `CalendarEventNotification/set` is (ruling 181).
+        if !crate::common::za::is_key_account(self, account_id).await? {
+            crate::common::za::za_ordinary_fence(self, &mut batch, account_id, None);
+        }
         DestroyArchive(event)
             .delete(
-                access_token.account_tenant_ids(),
+                access_token.changed_by(),
                 account_id,
                 document_id,
                 &mut batch,
@@ -262,7 +311,7 @@ impl CalendarEventNotificationHandler for Server {
         &self,
         access_token: &AccessToken,
         headers: &RequestHeaders<'_>,
-        bytes: Vec<u8>,
+        bytes: &[u8],
     ) -> crate::Result<HttpResponse> {
         // Validate URI
         let resource = self
@@ -280,7 +329,7 @@ impl CalendarEventNotificationHandler for Server {
                 CalCondition::MaxResourceSize(self.core.groupware.max_ical_size as u32),
             )));
         }
-        let itip_raw = std::str::from_utf8(&bytes).map_err(|_| {
+        let itip_raw = std::str::from_utf8(bytes).map_err(|_| {
             DavError::Condition(
                 DavErrorCondition::new(
                     StatusCode::BAD_REQUEST,
@@ -390,11 +439,26 @@ impl CalendarEventNotificationHandler for Server {
         let mut response = ScheduleResponse::default();
 
         for (email, attendee) in attendees {
-            if let Some(account_id) = self
+            let account_id = match self
                 .account_id_from_email(&email, true)
                 .await
                 .caused_by(trc::location!())?
             {
+                Some(account_id)
+                    if access_token.is_member(account_id)
+                        || access_token.has_permission(Permission::SysAccountQuery) =>
+                {
+                    Some(account_id)
+                }
+                Some(account_id) => self
+                    .try_account(account_id)
+                    .await
+                    .caused_by(trc::location!())?
+                    .filter(|account| account.is_same_tenant(access_token))
+                    .map(|_| account_id),
+                None => None,
+            };
+            if let Some(account_id) = account_id {
                 // Spec 9: a key account's free-busy is not offered; answer
                 // as for an unknown or unpermitted calendar user.
                 if crate::common::za::is_key_account(self, account_id).await? {
@@ -407,57 +471,65 @@ impl CalendarEventNotificationHandler for Server {
                     continue;
                 }
                 let resources = self
-                    .fetch_dav_resources(
+                    .fetch_groupware_resources(
                         access_token.account_id(),
                         account_id,
                         SyncCollection::Calendar,
                     )
                     .await
                     .caused_by(trc::location!())?;
-                if let Some(resource) = self
-                    .core
-                    .groupware
-                    .default_calendar_name
-                    .as_ref()
-                    .and_then(|name| resources.by_path(name))
-                {
-                    let mut free_busy = self
-                        .build_freebusy_object(
-                            access_token,
-                            FreeBusyQuery::new(from_date.timestamp(), to_date.timestamp()),
-                            &resources,
-                            account_id,
-                            resource,
-                        )
-                        .await?;
-
-                    // Add iTIP method
-                    free_busy.components[0].entries.push(ICalendarEntry {
-                        name: ICalendarProperty::Method,
-                        params: vec![],
-                        values: vec![ICalendarValue::Method(ICalendarMethod::Reply)],
-                    });
-
-                    // Add properties
-                    let component = &mut free_busy.components[1];
-                    component.entries.push(organizer.clone());
-                    component.entries.push(attendee.clone());
-                    if let Some(uid) = uid {
-                        component.entries.push(uid.clone());
-                    }
-
+                let Some(calendars) =
+                    AvailabilityCalendars::owner(&resources, account_id, access_token)
+                else {
                     response.items.0.push(ScheduleResponseItem {
                         recipient: Href(format!("mailto:{email}")),
-                        request_status: "2.0;Success".into(),
-                        calendar_data: Some(free_busy.to_string()),
-                    });
-                } else {
-                    response.items.0.push(ScheduleResponseItem {
-                        recipient: Href(format!("mailto:{email}")),
-                        request_status: "3.7;Default calendar not found".into(),
+                        request_status: "3.8;No authority".into(),
                         calendar_data: None,
                     });
+                    continue;
+                };
+                let mut free_busy = match self
+                    .build_freebusy_object(
+                        access_token,
+                        FreeBusyQuery::new(from_date.timestamp(), to_date.timestamp()),
+                        &resources,
+                        account_id,
+                        FreeBusyScope::Account(calendars),
+                    )
+                    .await
+                {
+                    Ok(free_busy) => free_busy,
+                    Err(DavError::Code(code)) if code == StatusCode::PAYLOAD_TOO_LARGE => {
+                        response.items.0.push(ScheduleResponseItem {
+                            recipient: Href(format!("mailto:{email}")),
+                            request_status: "3.10;Request entity too large".into(),
+                            calendar_data: None,
+                        });
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
+
+                // Add iTIP method
+                free_busy.components[0].entries.push(ICalendarEntry {
+                    name: ICalendarProperty::Method,
+                    params: vec![],
+                    values: [ICalendarValue::Method(ICalendarMethod::Reply)].into(),
+                });
+
+                // Add properties
+                let component = &mut free_busy.components[1];
+                component.entries.push(organizer.clone());
+                component.entries.push(attendee.clone());
+                if let Some(uid) = uid {
+                    component.entries.push(uid.clone());
                 }
+
+                response.items.0.push(ScheduleResponseItem {
+                    recipient: Href(format!("mailto:{email}")),
+                    request_status: "2.0;Success".into(),
+                    calendar_data: Some(free_busy.to_string()),
+                });
             } else {
                 response.items.0.push(ScheduleResponseItem {
                     recipient: Href(format!("mailto:{email}")),

@@ -4,6 +4,9 @@ See the [release policy](../../releases.md) for independent versioning, tags, up
 provenance, and the release checklist. Record fork release changes in the
 [fork changelog](../../../CHANGELOG-fork.md); the root `CHANGELOG.md` remains upstream history.
 
+- Base: upstream Stalwart `v1.0.1` (commit `23b69755cb3cd8ecd952fe0443c5ac067a506184`). The fork's own version, now `0.2.0-beta.1`, is independent of it: `fork-release.toml` records both, the shipping `stalwart` package carries the fork version, and the internal crates keep upstream's `1.0.1` (the fork-owned `vault` crate keeps `0.16.25`). `stalwart --version` prints the fork version, the upstream tag and commit, and the source commit.
+- Fresh stores only. A 1.0-based build cannot open a store written by upstream 0.16 or by the fork's 0.16-based releases (`0.1.x`), and there is no conversion: the server stamps a new store with its schema version and edition and refuses any other. Old stores are unsupported; move an installation by provisioning a fresh store (new setup tokens, new enrolment), keeping the old store and binary for rollback. The local-server scripts default to `.run-1.0/` for this reason.
+- Package names: `-p http` is ambiguous (the dependency graph also holds the crates.io `http` crate, through hyper, reqwest, axum and others); select the fork's with `-p http@1.0.1`. `cargo fmt` rejects that form, so format it with `cargo fmt --manifest-path crates/http/Cargo.toml`.
 - Toolchain: stable Rust via rustup. Xcode command line tools for RocksDB.
 - On this machine rustup is installed via Homebrew (keg-only): `export PATH="/opt/homebrew/opt/rustup/bin:$PATH"` before using cargo. The curl installer in the plan is not needed.
 - Build (tests): `STORE=RocksDb RUST_MIN_STACK=16777216 cargo build -p tests`
@@ -17,7 +20,7 @@ provenance, and the release checklist. Record fork release changes in the
 - Full verification: `cargo test -p vault -p groupware -p common`, then `za::za_tests`, then `webdav::webdav_tests` in both modes.
 - Manual client checklist: `docs/zero-access/manual-checklist.md`.
 - Known limits (spec 2): the running server holds plaintext while serving a request and receives the password on every CalDAV request; the authentication cache and the key cache are process-local and bounded (15 minutes idle, 60 minutes hard cap).
-- rustfmt: `cargo fmt -p <crate> -- --check` works for most crates; for http use `cargo fmt --manifest-path crates/http/Cargo.toml -- --check` (cargo rejects `-p http@0.16.27` for fmt).
+- rustfmt: `cargo fmt -p <crate> -- --check` works for most crates; for http use `cargo fmt --manifest-path crates/http/Cargo.toml -- --check` (cargo rejects `-p http@1.0.1` for fmt).
 - Never open upstream issues or PRs from this fork (see AGENTS.md).
 - Zero-access account API tests: `STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests`
 - CalDAV suite against key accounts: `STORE=RocksDb RUST_MIN_STACK=16777216 ZA_KEY_ACCOUNTS=1 cargo test -p tests webdav_tests`. In that mode the `acl`, `cal_alarm`, `cal_scheduling` and `copy_move` modules run the four key-mode variants in `tests/src/webdav/za_variants.rs` (`acl`, `alarm`, `scheduling`, `copy_move`) instead of skipping.
@@ -27,7 +30,7 @@ provenance, and the release checklist. Record fork release changes in the
 
 ## Operating zero-access accounts
 
-- Provisioning: an administrator with `sysAccountUpdate` calls `POST /api/vault/setup-token` with `{ "account": "<address>" }` for a user account that has no password credential and no calendar data; the response carries a one-time token (7 days). The user then calls `POST /api/vault/setup` with `{ "username", "token", "password" }` and receives the recovery key, shown once. No administrator ever chooses or sees the password.
+- Provisioning: an administrator with `sysAccountUpdate` calls `POST /api/vault/setup-token` with `{ "account": "<address>" }` for a user account that has no password credential and holds no data (the 409 reasons are in `CLAUDE.md`'s "Where release 3 lives"; at 1.0 they include "account already holds object metadata"); the response carries a one-time token (7 days). The user then calls `POST /api/vault/setup` with `{ "username", "token", "password" }` and receives the recovery key, shown once. No administrator ever chooses or sees the password.
 - Marker: a key account's registry password credential holds the literal `$za$` instead of a hash. It classifies the account; the real verifier and key wraps live in the vault record. Credential edits through the registry API are refused for key accounts; password, recovery key, app passwords and TOTP are managed only through `/api/vault/*`.
 - Corrupt or missing vault record: a key account whose marker has no usable record cannot log in (the refusal names `zero-access vault record missing` in the log). This only arises from data loss; recovery is operator intervention (restore the record from backup). There is no in-band reset: the server cannot recreate the keys.
 - Key cache: unlocked keys are held per node in process memory only, never shared across a cluster or written to disk. Each node applies `ZA_KEY_IDLE_SECS` (sliding idle timeout, 900), `ZA_KEY_MAX_AGE_SECS` (hard cap from login, 3600) and `ZA_KEY_MAX_ENTRIES` (LRU bound, 10000), swept every 30 seconds; a node logs the effective values at startup. `SessionKeys` are attached by the HTTP layer for one request, and by the IMAP and POP3 login handlers for the life of the authenticated connection (mail spec 3.3; mail logins do not use the key cache: each derives afresh and the keys live in the connection's own state); WebSocket, EventSource, ManageSieve and SMTP sessions never hold them.
@@ -35,73 +38,89 @@ provenance, and the release checklist. Record fork release changes in the
 
 ## Merging upstream
 
-The current integrated upstream base is Stalwart `v0.16.27`, commit
-`aa47d8ef7bfba7200d3293198ac2592747b20e73`; the proposed fork preview is
-`0.1.1-beta.1`. The upstream 1.0 port remains deferred. This integration does not
-promise ongoing upstream .16 maintenance or support.
+The current integrated upstream base is Stalwart `v1.0.1`, commit
+`23b69755cb3cd8ecd952fe0443c5ac067a506184`, on fresh stores only; the fork preview is
+`0.2.0-beta.1`. The fork moved from `v0.16.27` by the plan
+[`2026-10-27-stalwart-1-upgrade.md`](2026-10-27-stalwart-1-upgrade.md); its
+[outcome note](2026-10-27-stalwart-1-upgrade-outcome.md) records the merge, the hook
+inventory, the conflict ledger and the qualification. The 0.16-based line (`0.1.x`) is not
+maintained, and its stores do not open on 1.0.
 
 Plan each future upstream integration separately. Merge a verified release tag, never the
 tip of `main`, in an isolated branch/worktree; never rebase the published branch or add an
-`upstream` remote. For example, from the isolated branch prepared for the .27 integration:
+`upstream` remote. For example, for a later 1.0 release:
 
 ```sh
-git fetch https://github.com/stalwartlabs/stalwart.git tag v0.16.27 --no-tags
-git rev-parse 'v0.16.27^{commit}'
-# Verify the result equals aa47d8ef7bfba7200d3293198ac2592747b20e73 before merging.
-git merge --no-ff v0.16.27
+git fetch https://github.com/stalwartlabs/stalwart.git tag v1.0.2 --no-tags
+git rev-parse 'v1.0.2^{commit}'
+# Verify the commit against upstream's published release before merging.
+git merge --no-ff v1.0.2
 ```
 
-Scan upstream changes in the hotspot files before merging, run the full net below,
-and have the conflict resolutions reviewed. Qualification uses public upstream and fork
-tests, with no private upstream suite dependency. Record exact candidate commands/results;
-this .27 update adds no stored-format migration or legacy reader and establishes no new
-backend, cluster, platform or native-client qualification. Back up the database, blob store
-and configuration and verify restoration before testing existing data; replacing only the
-binary is not a rollback guarantee.
+Then, in the same branch:
 
-Merge hotspots (fork insertions inside upstream files; everything else lives
-in fork-owned modules and merges cleanly):
+- Add the tag and its full commit to `PINNED_UPSTREAM_TAGS` in
+  `scripts/release/verify_product.py`. The verifier refuses a `fork-release.toml` whose
+  upstream pin names another commit than its tag, is not an ancestor of the source, is
+  older than a known release in the source's history, or names another version than the
+  internal crates' (`crates/common/Cargo.toml`); a release checkout fetches no upstream
+  tags, so it reads the table. Update `fork-release.toml`'s `upstream_tag` and
+  `upstream_commit` when the fork release that ships the merge is prepared, and run
+  `python3 -B scripts/tests/test_release_metadata.py` and
+  `python3 -B -m unittest discover -s scripts/release -p 'test_*.py' -v`.
+- Re-read the merge hotspots and silent dependencies that `CLAUDE.md` lists, with the
+  upstream changes to each. The exhaustive matches (the IMAP and JMAP filter and sort
+  classifications, `Server::za_has_tasks` over `Task`) stop the build on a new variant on
+  purpose; classify it.
+- Run the gates. `python3 -I scripts/tests/ci_steps.py` (the workflow check) and
+  `python3 -I scripts/tests/test_gates.py` run in CI's Check Style job. Dispatch
+  `test.yml` on the branch: its Test Retention Gates job (weekly and dispatch only) runs the coverage
+  net and the inventory and coverage gates against
+  `tests/qualification/baseline-0.16.27.json`, and the other jobs run every suite, the
+  independent CalDAV client and the fresh-store restart gate.
 
-- `crates/common/src/auth/authentication.rs` (marker diversion in
-  `route_auth_request`) and `crates/http/src/auth/authenticate.rs`
-  (keyed-fingerprint auth cache, restructured).
-- `crates/dav/src/common/uri.rs` (gate call), `crates/dav/src/request.rs`
-  (calendar REPORT prefix check), `crates/dav/src/common/propfind.rs` (the
-  loader's `za_archive_view` call), `crates/dav/src/calendar/{update,get,
-  freebusy,mkcol,proppatch,copy_move}.rs` (seal/unseal insertions).
-- `crates/jmap/src/registry/mapping/{principal,account}.rs` (credential
-  edit refusals).
-- The 24 non-enterprise warnings in `store`, `common`, `jmap` and `services`
-  are upstream's; silence them when those files are touched by a merge, not
-  before.
+Qualification uses public upstream and fork tests, with no private upstream suite dependency
+(upstream's `stalwart-tests` slots compile only under `--cfg stalwart_tests`, which no build
+here sets). Record exact candidate commands and results. A merge that changes the store's
+schema version needs a fresh store again; there is no conversion. Back up the database, blob
+store and configuration and verify restoration before testing existing data; replacing only
+the binary is not a rollback guarantee.
+
+Merge hotspots: `CLAUDE.md` lists them per release, and the upgrade outcome note's hook
+inventory gives each fork hook in an upstream file with its contract and guarding tests.
+The two oldest remain the most conflict-prone: `crates/common/src/auth/authentication.rs`
+(the marker diversion in `route_auth_request`) and `crates/http/src/auth/authenticate.rs`
+(the resident-key lookup, the generation fence and the impersonation marker inside
+upstream's auth cache).
 
 Storage checks at every merge (preserve stored struct layouts and verify upstream
 migration effects explicitly; ciphertext rides in existing fields and moves with them):
 
-- calcard version: sealed bundles embed calcard's rkyv layout for
-  `ICalendarEntry` and `ICalendarParameter`, and `X-ZA-EXTRA` embeds
-  `types::DeadProperty`. If a merge bumps calcard (pinned at 0.3.x in
-  `crates/groupware/Cargo.toml`) or changes `DeadProperty`, old bundles need a
-  versioned reader keyed on the bundle format byte before the binary ships;
-  the user's key is available at login, so lazy re-sealing is possible.
-- Numeric collisions: `PrincipalField::ZeroAccessVault = 150`
-  (`crates/types/src/field.rs`) and `ACCOUNT_IS_KEY_ACCOUNT = 1 << 9`
-  (`crates/common/src/auth/mod.rs`) sit in gaps upstream has not used; confirm
-  the merge did not take either. `VanishedCollection::CalendarIdentity = 250`
-  (`crates/types/src/collection.rs`) separately reserves a log-collection byte;
-  preserve existing 251–254 and check this reservation at the same merge gate.
-- Visibility policy: upstream migrations that recompute derived data (time
-  ranges, alarms, the UID index) read only properties the policy keeps
-  visible; a merge that adds a new derived value must be checked against
+- calcard: sealed bundles embed calcard's rkyv layout for `ICalendarEntry` and
+  `ICalendarParameter`. At 1.0 calcard is a workspace crate (`crates/calcard`), so it changes
+  with upstream merges. If a merge changes that layout, old bundles need a versioned reader
+  keyed on the bundle format byte before the binary ships; the user's key is available at
+  login, so lazy re-sealing is possible. At 1.0 dead properties no longer ride in the
+  `X-ZA-EXTRA` bundle: they are object-metadata containers (`seal::container`), so a change
+  to `types::metadata` needs the same check.
+- Numeric collisions: three values sit in gaps upstream has not used; confirm the merge did
+  not take any of them. `PrincipalField::ZeroAccessVault = 150` and
+  `PrincipalField::ZeroAccessPins = 151` are in `crates/types/src/field.rs`;
+  `ACCOUNT_IS_KEY_ACCOUNT = 1 << 9` is in `crates/common/src/auth/mod.rs`. `VanishedCollection::CalendarIdentity = 250`
+  (`crates/types/src/collection.rs`) separately reserves a log-collection byte; preserve
+  existing 251–254 and check this reservation at the same merge gate.
+- Visibility policy: upstream code that derives data (time ranges, alarms, the UID index,
+  the privacy flags from `CLASS` under field policy 2) reads only properties the policy
+  keeps visible; a merge that adds a new derived value must be checked against
   `crates/groupware/src/calendar/seal/policy.rs`.
 - Generated files (`crates/registry/src/schema/*`, `crates/trc/src/event/
   enums.rs`) carry no fork edits; take upstream's version outright.
 
-Regression net after a merge, in this order: `cargo test -p vault`,
-`-p groupware`, `-p common`, `-p http@0.16.27 --features test_mode`;
-`za_tests`; `webdav_tests` in baseline and `ZA_KEY_ACCOUNTS=1` mode; the
-product build warning-free in `vault`, `groupware`, `dav` and `http`. The
-key-account mode of the upstream suite is the real guard: it runs upstream's
+Regression net after a merge, in this order: `cargo test -p vault`, `-p groupware`,
+`-p common`, `-p http@1.0.1 --lib --bins --features test_mode,enterprise`; `za_tests` and
+`za::cache_swap::cache_swap_tests`; `webdav_tests`, `imap_tests` and `jmap_tests` in
+baseline and `ZA_KEY_ACCOUNTS=1` mode; the product build warning-free; then the CI dispatch
+above. The key-account mode of the upstream suites is the real guard: it runs upstream's
 own tests against sealed data.
 
 ## Sharing key calendars
@@ -129,7 +148,7 @@ retaining the exact Cargo arguments below.
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
 cargo fmt --all --check
 cargo test -p vault -p groupware -p common
-cargo test -p http@0.16.27 --features test_mode
+cargo test -p http@1.0.1 --lib --bins --features test_mode,enterprise
 STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests za::za_tests -- --nocapture
 STORE=RocksDb RUST_MIN_STACK=16777216 cargo test -p tests webdav::webdav_tests
 STORE=RocksDb RUST_MIN_STACK=16777216 ZA_KEY_ACCOUNTS=1 cargo test -p tests webdav::webdav_tests

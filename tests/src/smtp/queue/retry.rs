@@ -194,7 +194,7 @@ async fn queue_retry() {
                     _ => panic!("unexpected status {queue_id}: {status:?}"),
                 }
             }
-            Some(QueueEvent::Refresh) | Some(QueueEvent::ReloadSettings) => (),
+            Some(QueueEvent::Refresh(_)) | Some(QueueEvent::ReloadSettings) => (),
             None | Some(QueueEvent::Stop) | Some(QueueEvent::Paused(_)) => break,
         }
 
@@ -218,6 +218,7 @@ async fn queue_retry() {
                 .server
                 .read_message(event.queue_id, QueueName::default())
                 .await
+                .unwrap()
                 .unwrap();
             if message.message.return_path.is_empty() {
                 message

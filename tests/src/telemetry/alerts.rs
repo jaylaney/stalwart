@@ -5,7 +5,6 @@
  */
 
 use crate::utils::server::TestServer;
-use common::BuildServer;
 use registry::{
     schema::{
         prelude::ObjectType,
@@ -81,32 +80,11 @@ pub async fn test(test: &TestServer) {
     );
     assert_eq!(Collector::read_metric(MetricType::DomainCount), 3.0);
 
-    // Process alerts
-    let message = test
-        .server
-        .inner
-        .build_server()
-        .process_alerts()
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
-    assert_eq!(message.from, "alert@example.com");
-    assert_eq!(message.to, vec!["jdoe@example.com".to_string()]);
-    let body = String::from_utf8(message.body).unwrap();
-    assert!(
-        body.contains("Sorry for the bad news, but we found 3 domains and 5 cluster errors."),
-        "{body:?}"
-    );
-    assert!(body.contains("Subject: Found 5 cluster errors"), "{body:?}");
-    assert!(
-        body.contains("From: \"Alert Subsystem\" <alert@example.com>"),
-        "{body:?}"
-    );
-    assert!(body.contains("To: <jdoe@example.com>"), "{body:?}");
-
-    // Make sure the event was triggered
-    assert_eq!(Collector::read_metric(MetricType::TelemetryAlertEvent), 1.0);
+    // Upgrade ruling 33: processing the alerts, and the alert email and
+    // alert event it produces, needs a licence (`process_alerts` reads
+    // `core.enterprise`, which is `None` without one). With no test licence
+    // that part takes the SEL-only disposition; the in-memory metrics above
+    // are OSS and stay.
 
     // Cleanup
     admin.registry_destroy_all(ObjectType::Alert).await;

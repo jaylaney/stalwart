@@ -1,5 +1,15 @@
 # Zero-access calendar: manual client checklist
 
+**Status for the `0.2.0-beta.1` candidate (upstream `v1.0.1`): pending.** No native client
+has been run against this candidate. The build to test is the shipping configuration
+(`cargo build --release --locked -p stalwart --no-default-features --features rocks`) at
+source commit `2867bc24f8bc78da3665ace7065800f2319ac263` or a later candidate commit, whose
+`--version` reads `Stalwart Server fork v0.2.0-beta.1 (upstream v1.0.1
+23b69755cb3cd8ecd952fe0443c5ac067a506184; source <commit>; clean)`; record the exact line and
+the binary's checksum with the results. Run it on a fresh store (1.0 cannot open a 0.16 one),
+with accounts set up afresh. Results recorded against the 0.16-based releases (`0.1.x`) are
+not evidence for this candidate.
+
 Run once per release against a server built from this branch, with TOTP
 enrolled on one of the two accounts used.
 
@@ -36,7 +46,7 @@ Use two disposable, setup-complete key accounts, an owner and grantee, with app 
 5. Revoke by the grant id listed by `shares`. Confirm the grantee loses it on the next refresh; grant again and confirm it reappears. Rename the owner's calendar and confirm discovery/sync after the boundary. Compare initial sync and incremental sync behavior where the client exposes it.
 6. Turn assisted discovery off and confirm Thunderbird finds the shared calendar through the second `calendar-home-set` href. DAVx5 is optional. A recipient who is also a grantee should answer an invitation from their own copy.
 
-Native status for this outcome: **pending** for macOS Apple Calendar, iOS Apple Calendar and Thunderbird. No native-client session was exercised in Task 12; qualified disposable native sessions and trusted-TLS setup remain pending. This checklist is not a completed native acceptance record. Record any unavailable device, credentials, certificate, network reachability or missing observation as pending.
+Native status for the release-4 outcome (on the 0.16 base): **pending** for macOS Apple Calendar, iOS Apple Calendar and Thunderbird, and pending again for `0.2.0-beta.1` (above). No native-client session was exercised in Task 12; qualified disposable native sessions and trusted-TLS setup remain pending. This checklist is not a completed native acceptance record. Record any unavailable device, credentials, certificate, network reachability or missing observation as pending.
 
 ## Mail
 

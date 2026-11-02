@@ -12,7 +12,7 @@ use super::STRONG;
 use crate::utils::{
     server::TestServer,
     webdav::DummyWebDavClient,
-    za::{PlantedItem, plant_inbox_item, rewrite_inbox_item, za_unlock},
+    za::{PlantedItem, destroy_inbox_item, plant_inbox_item, rewrite_inbox_item, za_unlock},
 };
 use ::registry::schema::{
     enums::TaskAccountMaintenanceType,
@@ -24,7 +24,7 @@ use groupware::calendar::{EVENT_NOTIFICATION_ZA_PENDING, seal::seal_drained_item
 use hyper::StatusCode;
 use store::{
     ValueKey,
-    write::{AlignedBytes, Archive, now},
+    write::{Archive, ArchiveBytes, now},
 };
 use types::collection::Collection;
 
@@ -66,10 +66,10 @@ pub async fn stored_item(
     test: &TestServer,
     account_id: u32,
     document_id: u32,
-) -> Option<Archive<AlignedBytes>> {
+) -> Option<Archive<ArchiveBytes>> {
     test.server
         .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
             account_id,
             Collection::CalendarEventNotification,
             document_id,
@@ -160,6 +160,15 @@ pub async fn test(test: &mut TestServer) {
         .request_with_headers("PROPFIND", &pending_href, [("depth", "0")], PROPFIND_DATA)
         .await
         .with_status(StatusCode::NOT_FOUND);
+    // Upgrade ruling 176 (B-M4): DELETE too, and the item stays.
+    client
+        .request("DELETE", &pending_href, "")
+        .await
+        .with_status(StatusCode::NOT_FOUND);
+    assert!(
+        stored_item(test, id, pending).await.is_some(),
+        "the refused DELETE removed the pending item"
+    );
     // PR #34 review: the `propname` form hides it too, listed (depth 1) or
     // named (depth 0); a visible item still answers.
     let hrefs: Vec<String> = client
@@ -191,9 +200,10 @@ pub async fn test(test: &mut TestServer) {
         .map(str::to_string)
         .collect();
     assert!(hrefs.contains(&drained_href), "{hrefs:?}");
-    // RFC 4791 7.9: a calendar-multiget may ask for `propname`, but the
-    // release 1 guard binds it to the calendar collection, so it never reaches
-    // the inbox (every inbox href is 404) and the propname fix need not cover it.
+    // RFC 4791 7.9: a calendar-multiget may ask for `propname`. 0.16 bound
+    // every multiget to the calendar collection, so each inbox href was 404;
+    // 1.0 routes a scheduling multiget to the inbox's items, so the visible
+    // item answers with its names and the pending one is still not served.
     let body = client
         .request(
             "REPORT",
@@ -212,22 +222,30 @@ pub async fn test(test: &mut TestServer) {
             .unwrap_or_default()
     };
     assert!(
-        entry(&pending_href).contains("HTTP/1.1 404")
-            && entry(&drained_href).contains("HTTP/1.1 404"),
+        !entry(&pending_href).contains("200 OK") && entry(&drained_href).contains("200 OK"),
         "{body}"
     );
-    // Review Focus 1: a multiget naming it answers 404 for that href.
+    // Review Focus 1: a multiget naming it answers exactly as for an href
+    // that names no item: 404 for both, at 0.16 and at 1.0 (the pending
+    // item's 404 since `a5cddf448`, ruling 136).
     let body = client
         .multiget_calendar(KEY_INBOX, &[pending_href.as_str()])
         .await
         .response
         .body
         .unwrap();
-    assert!(
-        body.contains(&pending_href)
-            && body.contains("HTTP/1.1 404")
-            && !body.contains("inbox-pending-canary"),
-        "{body}"
+    let missing_href = format!("{KEY_INBOX}4294967.ics");
+    let missing = client
+        .multiget_calendar(KEY_INBOX, &[missing_href.as_str()])
+        .await
+        .response
+        .body
+        .unwrap();
+    assert!(!body.contains("inbox-pending-canary"), "{body}");
+    assert_eq!(
+        body.replace(&pending_href, "HREF"),
+        missing.replace(&missing_href, "HREF"),
+        "a pending item is answered unlike a missing one"
     );
     // An initial sync-collection does not report it either.
     let body = client
@@ -340,7 +358,8 @@ pub async fn test(test: &mut TestServer) {
         .unwrap();
     assert_eq!(parse(&body), parse(&plain_ical));
 
-    // Cleanup: upstream's DELETE removes an item whatever its flags.
+    // Cleanup: upstream's DELETE, for the three items as they now stand
+    // (the pending item's bit was cleared above).
     for href in [&pending_href, &drained_href, &legacy_href] {
         client
             .request("DELETE", href, "")
@@ -427,60 +446,116 @@ pub async fn test_sync(test: &mut TestServer) {
     test.wait_for_tasks().await;
 }
 
-/// Spec 6.6: upstream's inbox expiry deletes by creation time and needs no
-/// key, so it also removes pending items older than the hold period.
+/// Upgrade ruling 174 (R-b): upstream's inbox expiry deletes by creation
+/// time and needs no key, but a pending item waits for the drain however
+/// old it is (invitations spec 6.6): an invitee who connects no client
+/// within `expungeSchedulingInboxAfter` keeps the invitation. With the hold
+/// period set to one second, the account purge removes key1's drained item
+/// and the ordinary account's item, and keeps key1's pending one.
 pub async fn test_expiry(test: &mut TestServer) {
+    use ::registry::schema::{prelude::Property, structs::DataRetention};
+    use ::registry::types::duration::Duration;
     println!("Running zero-access inbox expiry test...");
     let admin = test.account("admin@example.com").clone();
     let key1 = test.account("key1@example.com").clone();
+    let plain = test.account("plain@example.com").clone();
     let id = key1.id().document_id();
+    let plain_id = plain.id().document_id();
     let sender = test.account("key2@example.com").id().document_id();
-    let client = DummyWebDavClient::new(id, key1.name(), STRONG, key1.name());
-    let pending = || PlantedItem::Pending {
-        pair: None,
-        reply_token: None,
+    let prior = admin
+        .registry_get::<DataRetention>(types::id::Id::singleton())
+        .await
+        .expunge_scheduling_inbox_after;
+    let hold = |after: Option<Duration>| {
+        let admin = admin.clone();
+        async move {
+            admin
+                .registry_update_setting(
+                    DataRetention {
+                        expunge_scheduling_inbox_after: after,
+                        ..Default::default()
+                    },
+                    &[Property::ExpungeSchedulingInboxAfter],
+                )
+                .await;
+            admin.reload_settings().await;
+        }
     };
-    // Older than the default 30-day `expungeSchedulingInboxAfter`.
-    let old = plant_inbox_item(
+    hold(Some(Duration::from_millis(1000))).await;
+    // Every item is ten seconds old: past the one-second hold period.
+    let created = Some(now() as i64 - 10);
+    let pending = plant_inbox_item(
         test,
         id,
         &invitation("za-inbox-old", "inbox-old-canary"),
-        pending(),
+        PlantedItem::Pending {
+            pair: None,
+            reply_token: None,
+        },
         sender,
-        Some(now() as i64 - 31 * 86_400),
+        created,
     )
     .await;
-    let fresh = plant_inbox_item(
+    let drained = plant_inbox_item(
         test,
         id,
-        &invitation("za-inbox-fresh", "inbox-fresh-canary"),
-        pending(),
+        &invitation("za-inbox-old-drained", "inbox-old-drained-canary"),
+        PlantedItem::Drained { password: STRONG },
         sender,
-        None,
+        created,
+    )
+    .await;
+    let ordinary = plant_inbox_item(
+        test,
+        plain_id,
+        &invitation("za-inbox-old-plain", "inbox-old-plain-canary"),
+        PlantedItem::Plain { flags: 0 },
+        sender,
+        created,
     )
     .await;
 
-    // The account purge, as the scheduler runs it: no session of key1.
-    admin
-        .registry_create_object(Task::AccountMaintenance(TaskAccountMaintenance {
-            account_id: key1.id(),
-            maintenance_type: TaskAccountMaintenanceType::Purge,
-            status: TaskStatus::now(),
-        }))
-        .await;
+    // The account purges, as the scheduler runs them: no session of key1.
+    // Ruling 189: key1's `AutoExpunge` trace counts the one item expunged.
+    let traced = super::mail::Traced::start(&[trc::EventType::Store(trc::StoreEvent::AutoExpunge)]);
+    for account_id in [key1.id(), plain.id()] {
+        admin
+            .registry_create_object(Task::AccountMaintenance(TaskAccountMaintenance {
+                account_id,
+                maintenance_type: TaskAccountMaintenanceType::Purge,
+                status: TaskStatus::now(),
+            }))
+            .await;
+    }
     test.wait_for_tasks().await;
+    hold(prior).await;
+    let totals = traced
+        .finish()
+        .await
+        .into_iter()
+        .filter(|event| event.account_id == Some(id as u64))
+        .map(|event| {
+            event
+                .keys
+                .iter()
+                .find(|(key, _)| *key == trc::Key::Total)
+                .and_then(|(_, value)| value.to_uint())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(totals, vec![Some(1)], "key1's AutoExpunge total");
     assert!(
-        stored_item(test, id, old).await.is_none(),
-        "an expired pending item survived the purge"
+        stored_item(test, id, pending).await.is_some(),
+        "the purge removed a pending item"
     );
     assert!(
-        stored_item(test, id, fresh).await.is_some(),
-        "the purge removed a fresh item"
+        stored_item(test, id, drained).await.is_none(),
+        "an expired drained item survived the purge"
+    );
+    assert!(
+        stored_item(test, plain_id, ordinary).await.is_none(),
+        "an ordinary account's expired item survived the purge"
     );
 
-    client
-        .request("DELETE", &item_href(KEY_INBOX, fresh), "")
-        .await
-        .with_status(StatusCode::NO_CONTENT);
+    destroy_inbox_item(test, id, pending).await;
     test.wait_for_tasks().await;
 }

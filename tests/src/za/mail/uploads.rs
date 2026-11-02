@@ -13,14 +13,14 @@
 
 use super::{
     Traced, assert_sealed, assert_sealed_upload, deliver, key_mail_account, message_ids,
-    message_with, new_message, open_message, stored_metadata,
+    message_with, new_message, open_message, stored_hash,
 };
 use crate::{
     utils::{
         account::Account,
         jmap::JmapResponse,
         server::TestServer,
-        za::{bearer_token, wait_for_delivery},
+        za::{wait_for_delivery, za_bearer_token},
     },
     za::{
         STRONG,
@@ -30,18 +30,14 @@ use crate::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use common::za::ZA_MAIL_KEYLESS;
-use email::{mailbox::INBOX_ID, message::metadata::MessageMetadata};
+use email::mailbox::INBOX_ID;
 use groupware::calendar::seal::{WRAP_MK, WRAP_PK};
 use registry::schema::{enums::Permission, prelude::ObjectType};
 use serde_json::{Value, json};
 use std::{str::FromStr, time::Duration};
-use store::{IterateParams, SUBSPACE_BLOB_LINK, U32_LEN, U64_LEN, write::AnyKey};
+use store::{IterateParams, Subspace, U32_LEN, U64_LEN, write::AnyKey};
 use trc::{EventType, SecurityEvent};
-use types::{
-    blob::BlobId,
-    blob_hash::{BLOB_HASH_LEN, BlobHash},
-    id::Id,
-};
+use types::{blob::BlobId, blob_hash::BLOB_HASH_LEN, id::Id};
 
 const KEY: &str = "keymail6@example.com";
 const OTHER_KEY: &str = "keymail7@example.com";
@@ -268,6 +264,21 @@ fn assert_refused(reply: &JmapResponse, what: &str) {
     );
 }
 
+/// Ruling 84: 1.0's own check refused the method call first, with `error`
+/// (`accountNotFound`, `fromAccountNotFound`): nothing is read or written.
+fn assert_account_refused(reply: &JmapResponse, error: &str, what: &str) {
+    assert_eq!(
+        reply.0["methodResponses"][0][0], "error",
+        "{what}: {:?}",
+        reply.0
+    );
+    assert_eq!(
+        reply.0["methodResponses"][0][1]["type"], error,
+        "{what}: {:?}",
+        reply.0
+    );
+}
+
 /// `pointer` of the first method response, which must exist (an update's
 /// entry may be `null`).
 fn accepted<'x>(reply: &'x JmapResponse, pointer: &str, what: &str) -> &'x Value {
@@ -286,11 +297,11 @@ async fn temporary_links(test: &TestServer, account_id: u32) -> usize {
         .iterate(
             IterateParams::new(
                 AnyKey {
-                    subspace: SUBSPACE_BLOB_LINK,
+                    subspace: Subspace::BlobLink,
                     key: vec![0u8],
                 },
                 AnyKey {
-                    subspace: SUBSPACE_BLOB_LINK,
+                    subspace: Subspace::BlobLink,
                     key: vec![u8::MAX; 64],
                 },
             )
@@ -385,7 +396,7 @@ async fn upload_without_keys_is_refused(
     let links = temporary_links(test, id).await;
     let other_links = temporary_links(test, other_id).await;
 
-    let token = bearer_token(KEY, STRONG).await;
+    let token = za_bearer_token(&test.server, KEY).await;
     let traced = Traced::start(&[EventType::Security(SecurityEvent::Unauthorized)]);
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -507,13 +518,7 @@ async fn sealed_upload_imported_and_attached(test: &TestServer, key: &Account, s
     let document_id = new_message(test, id, &before).await;
     assert_eq!(Id::from_str(&email_id).unwrap().document_id(), document_id);
     assert_sealed(test, id, document_id, WRAP_MK).await;
-    let stored_hash = BlobHash::from(
-        &stored_metadata(test, id, document_id)
-            .await
-            .unarchive::<MessageMetadata>()
-            .unwrap()
-            .blob_hash,
-    );
+    let stored_hash = stored_hash(test, id, document_id).await;
     assert_ne!(
         stored_hash,
         BlobId::from_base32(&blob_id).unwrap().hash,
@@ -613,7 +618,11 @@ async fn raw_consumers(
                     "FileNode/set",
                     json!({
                         "accountId": own,
-                        "create": { "f": { "name": "za-raw.bin", "blobId": blob_id } }
+                        "create": { "f": {
+                            "@type": "File",
+                            "name": "za-raw.bin",
+                            "blobId": blob_id
+                        } }
                     }),
                 )
                 .await,
@@ -638,7 +647,9 @@ async fn raw_consumers(
                     json!({
                         "fromAccountId": own,
                         "accountId": shared.0,
+                        // 1.0 reads the source from the entry's `id`.
                         "create": { copy_from: {
+                            "id": copy_from,
                             "parentId": shared.1,
                             "name": "za-raw-copy.bin",
                             "blobId": blob_id
@@ -693,8 +704,18 @@ async fn blob_copy(
         .await
 }
 
-/// A `FileNode/set` create of one node in `account`; its id.
-async fn file_node(session: &Account, account: &Account, node: Value) -> String {
+/// A `FileNode/set` create of one node in `account`; its id. 1.0 requires
+/// the node's `@type` on creation: a `File` with a blob, else a `Directory`.
+async fn file_node(session: &Account, account: &Account, mut node: Value) -> String {
+    let kind = if node.get("blobId").is_some() {
+        "File"
+    } else {
+        "Directory"
+    };
+    node.as_object_mut()
+        .unwrap()
+        .entry("@type")
+        .or_insert_with(|| kind.into());
     let reply = session
         .jmap_method_call(
             "FileNode/set",
@@ -757,9 +778,18 @@ async fn raw_consumers_are_refused(
             "FileNode/set",
             json!({
                 "accountId": other_plain.id_string(),
+                // 1.0 splits a content change into `mayModifyContent`.
                 "update": { &shared_folder: { "shareWith": {
-                    key.id_string(): { "mayRead": true, "mayAddChildren": true },
-                    plain.id_string(): { "mayRead": true, "mayAddChildren": true }
+                    key.id_string(): {
+                        "mayRead": true,
+                        "mayAddChildren": true,
+                        "mayModifyContent": true
+                    },
+                    plain.id_string(): {
+                        "mayRead": true,
+                        "mayAddChildren": true,
+                        "mayModifyContent": true
+                    }
                 } } }
             }),
         )
@@ -829,6 +859,23 @@ async fn raw_consumers_are_refused(
                         .unwrap()
                         .to_string(),
                 );
+            } else if what == "FileNode/copy" {
+                // Ruling 84: the key account's own node is a folder (none of
+                // its uploads can become a file's blob), whose copy 1.0's
+                // kind check refuses before the raw-source refusal; nothing
+                // is created. The copy of a File node below reaches it.
+                let text = format!("{:?}", reply.0);
+                assert!(
+                    text.contains("blobId is only defined for File nodes."),
+                    "{what} of {source} by the key account: {text}"
+                );
+                assert!(
+                    reply
+                        .pointer("/methodResponses/0/1/created")
+                        .is_none_or(|created| created.is_null()
+                            || created.as_object().is_some_and(|c| c.is_empty())),
+                    "{what} of {source} by the key account created a node: {text}"
+                );
             } else {
                 assert_refused(&reply, &format!("{what} of {source} by the key account"));
                 raw_refusals += 1;
@@ -857,22 +904,62 @@ async fn raw_consumers_are_refused(
                 raw_refusals += 1;
             }
         }
+        // Ruling 84: the key account's copy of a File node, the shared
+        // plain file, into its own folder with the sealed source as its
+        // blob reaches the raw-source refusal (1.0 requires `accountId`
+        // and `fromAccountId` to differ).
+        let reply = key
+            .jmap_method_call(
+                "FileNode/copy",
+                json!({
+                    "fromAccountId": other_plain.id_string(),
+                    "accountId": key.id_string(),
+                    "create": { &shared_file: {
+                        "id": &shared_file,
+                        "parentId": &key_folder,
+                        "name": "za-raw-copy.bin",
+                        "blobId": source
+                    } }
+                }),
+            )
+            .await;
+        assert_refused(
+            &reply,
+            &format!("FileNode/copy of a File node with {source} by the key account"),
+        );
+        raw_refusals += 1;
         // A plain `fromAccountId` does not hide the blob's owner.
         assert_refused(
             &blob_copy(plain, other_plain, plain, &[source]).await,
             &format!("Blob/copy of {source} from a plain account"),
         );
         raw_refusals += 1;
-        // Spec 9: no blob copy out of a key account.
-        assert_refused(
+        // Spec 9: no blob copy out of a key account. Ruling 84: the plain
+        // session cannot reach the key account, so 1.0 refuses its
+        // `fromAccountId` first, and the key session's copy into the plain
+        // account that shares only a file folder with it is refused as
+        // `accountNotSupportedByMethod`. `gates` reaches the fork's refusal
+        // of a blob copy into a key account through a mail share; no session
+        // reaches its refusal of one out of a key account (ruling 99, 1.0
+        // refuses first).
+        assert_account_refused(
             &blob_copy(plain, key, plain, &[source]).await,
+            "fromAccountNotFound",
+            &format!("Blob/copy of {source} out of the key account by a plain account"),
+        );
+        assert_account_refused(
+            &blob_copy(key, key, other_plain, &[source]).await,
+            "accountNotSupportedByMethod",
             &format!("Blob/copy of {source} out of the key account"),
         );
     }
-    // Spec 9: no blob copy into a key account, even of a plain blob.
-    assert_refused(
+    // Spec 9: no blob copy into a key account, even of a plain blob. Ruling
+    // 84: the key session cannot reach `plain`, so 1.0 refuses that
+    // `fromAccountId` first.
+    assert_account_refused(
         &blob_copy(key, plain, key, &[&plain_upload]).await,
-        "Blob/copy into the key account",
+        "fromAccountNotFound",
+        "Blob/copy into the key account from an account it cannot reach",
     );
 
     // A sealed source anywhere in the call refuses it before its first
@@ -943,6 +1030,7 @@ async fn raw_consumers_are_refused(
             json!({
                 "accountId": other_plain.id_string(),
                 "create": { "n": {
+                    "@type": "File",
                     "name": "from-key.bin",
                     "parentId": &shared_folder,
                     "blobId": &shared_blob
@@ -976,6 +1064,7 @@ async fn raw_consumers_are_refused(
                 "fromAccountId": plain.id_string(),
                 "accountId": other_plain.id_string(),
                 "create": { &plain_file: {
+                    "id": &plain_file,
                     "parentId": &shared_folder,
                     "name": "copied.bin",
                     "blobId": &plain_upload
@@ -1045,11 +1134,9 @@ async fn raw_consumers_are_refused(
         vec![Some(u64::from(key_id)); raw_refusals],
         "one trace per refused raw read, naming the blob's owner"
     );
-    assert_eq!(
-        refused(COPY_REFUSED),
-        vec![Some(u64::from(key_id)); sources.len() + 1],
-        "one trace per refused blob copy"
-    );
+    // Ruling 84: every blob copy above is refused by 1.0's own checks
+    // first, so none traces the fork's copy refusal.
+    assert_eq!(refused(COPY_REFUSED), Vec::<Option<u64>>::new());
 
     // The key account's copy of the shared plain blob is its own upload,
     // sealed; its script holds the upload's plaintext.

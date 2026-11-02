@@ -551,7 +551,7 @@ fn bundle_envelope(text: &str, calendar: u32, generations: &[u32]) -> Result<(),
 
 fn sealed_timezone(entry: &CalendarPreferences) -> Result<(), SealError> {
     use crate::calendar::seal::{
-        policy::{is_visible_parameter, is_visible_property},
+        policy::{is_visible_entry, is_visible_parameter},
         tree::{SEALED_PROP, is_carrier},
     };
     use calcard::icalendar::ICalendarValue;
@@ -566,7 +566,7 @@ fn sealed_timezone(entry: &CalendarPreferences) -> Result<(), SealError> {
                         return Err(SealError::Structure("timezone carrier"));
                     };
                     sealed_bundle(text)?;
-                } else if !is_visible_property(&component.component_type, &property.name)
+                } else if !is_visible_entry(&component.component_type, property)
                     || property
                         .params
                         .iter()
@@ -590,7 +590,7 @@ pub(crate) fn za_replace_calendar_entries(
     entries: Vec<CalendarPreferences>,
     acls: Vec<AclGrant>,
 ) -> Result<(), SealError> {
-    if entries.is_empty() || !calendar.dead_properties.0.is_empty() {
+    if entries.is_empty() {
         return Err(SealError::Structure("calendar entries"));
     }
     let mut ids = HashSet::with_capacity(entries.len());

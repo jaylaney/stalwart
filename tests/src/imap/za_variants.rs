@@ -293,7 +293,7 @@ pub async fn fetch(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
     .await;
     imap.assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_contains("FLAGS (Flag_009)")
+        .assert_contains("FLAGS (flag_009)")
         .assert_contains("RFC822.SIZE 1457")
         .assert_contains("UID 10")
         .assert_contains("INTERNALDATE")
@@ -314,21 +314,24 @@ pub async fn fetch(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
             "(\"John Smîth\" NIL \"john\" \"example.com\")",
             "(NIL NIL NIL NIL)) NIL NIL NIL NIL)"
         ))
+        // 1.0's writer: a body's MD5 is its Content-MD5 header (none here),
+        // a missing transfer encoding is "7bit", and a message/rfc822
+        // part counts its lines (0.16: computed MD5s, NIL, 0).
         .assert_contains(concat!(
             "BODYSTRUCTURE ((\"text\" \"html\" (\"charset\" \"us-ascii\") NIL NIL ",
-            "\"base64\" 239 3 \"07aab44e51c5f1833a5d19f2e1804c4b\" NIL NIL NIL)",
-            "(\"message\" \"rfc822\" NIL NIL NIL NIL 723 ",
+            "\"base64\" 239 3 NIL NIL NIL NIL)",
+            "(\"message\" \"rfc822\" NIL NIL NIL \"7bit\" 723 ",
             "(NIL \"Exporting my book about coffee tables\" ",
             "((\"Cosmo Kramer\" NIL \"kramer\" \"kramerica.com\")) ",
             "((\"Cosmo Kramer\" NIL \"kramer\" \"kramerica.com\")) ",
             "((\"Cosmo Kramer\" NIL \"kramer\" \"kramerica.com\")) ",
             "NIL NIL NIL NIL NIL) ",
             "((\"text\" \"plain\" (\"charset\" \"utf-16\") NIL NIL ",
-            "\"quoted-printable\" 228 3 \"3a942a99cdd8a099ae107d3867ec20fb\" NIL NIL NIL)",
+            "\"quoted-printable\" 228 3 NIL NIL NIL NIL)",
             "(\"image\" \"gif\" (\"name\" \"Book about ☕ tables.gif\") ",
-            "NIL NIL \"Base64\" 56 \"d40fa7f401e9dc2df56cbb740d65ff52\" ",
+            "NIL NIL \"Base64\" 56 NIL ",
             "(\"attachment\" NIL) NIL NIL) \"mixed\" (\"boundary\" \"giddyup\") NIL NIL NIL)",
-            " 0 \"cdb0382a03a15601fb1b3c7422521620\" NIL NIL NIL) ",
+            " 19 NIL NIL NIL NIL) ",
             "\"mixed\" (\"boundary\" \"festivus\") NIL NIL NIL)"
         ));
 
@@ -347,7 +350,7 @@ pub async fn fetch(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
     // Fetch bodyparts
     imap.send(concat!(
         "UID FETCH 10 (BINARY[1] BINARY.SIZE[1] BODY[1.TEXT] BODY[2.1.HEADER] ",
-        "BINARY[2.1] BODY[MIME] BODY[HEADER.FIELDS (From)]<10.8>)"
+        "BINARY[2.1] BODY[1.MIME] BODY[HEADER.FIELDS (From)]<10.8>)"
     ))
     .await;
     imap.assert_read(Type::Tagged, ResponseType::Ok)
@@ -357,7 +360,10 @@ pub async fn fetch(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
         .assert_contains("BODY[1.TEXT] {239}")
         .assert_contains("BODY[2.1.HEADER] {88}")
         .assert_contains("BINARY[2.1] ~{108}")
-        .assert_contains("BODY[MIME] {54}")
+        // 1.0 refuses MIME without a part number (RFC 3501's section-spec,
+        // "Expected a part number before 'MIME'"); 0.16 answered the
+        // message's header for BODY[MIME].
+        .assert_contains("BODY[1.MIME] {")
         .assert_contains("BODY[HEADER.FIELDS (FROM)]<10> {8}")
         .assert_contains("&ldquo;exporting&rdquo;")
         .assert_contains("PGh0bWw+PHA+")
@@ -373,7 +379,7 @@ pub async fn fetch(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
     imap.send("UID FETCH 10 (FLAGS)").await;
     imap.assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_contains("FLAGS (Flag_009)");
+        .assert_contains("FLAGS (flag_009)");
 
     // Switch to SELECT mode
     imap.send("SELECT INBOX").await;
@@ -392,7 +398,7 @@ pub async fn fetch(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
     imap.send("UID FETCH 10 (FLAGS)").await;
     imap.assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_contains("FLAGS (Flag_009)");
+        .assert_contains("FLAGS (flag_009)");
 
     // Fetching a body section should set the \Seen flag
     imap.send("UID FETCH 10 (BODY[1.TEXT])").await;
@@ -444,7 +450,9 @@ pub async fn fetch(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
     // A failing command in a pipelined batch does not swallow the tagged completion of the commands queued behind it
     imap.send_raw(concat!(
         "_p UID FETCH 1:* (UID) (CHANGEDSINCE 1 VANISHED)\r\n",
-        "_x FETCH 1 (UID)\r\n"
+        // `UID FETCH` and `FETCH` are different commands, which 1.0 runs as two
+        // concurrent tasks; the same command keeps the pair in one ordered batch.
+        "_x UID FETCH 1 (UID)\r\n"
     ))
     .await;
     imap.assert_read(Type::Tagged, ResponseType::Ok)
@@ -705,7 +713,8 @@ pub async fn acl(imap_john: &mut ImapConnection, test: &TestServer) {
     imap_jane
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_equals("* LISTRIGHTS \"INBOX\" \"jdoe@example.com\" r l ws i et k x p a");
+        // 1.0 lists the METADATA annotation right `n` (RFC 5464 6).
+        .assert_equals("* LISTRIGHTS \"INBOX\" \"jdoe@example.com\" r l ws i et k x p n a");
 
     // Jane's grants on her own INBOX are refused, so nothing is shared
     assert_noperm(&mut imap_jane, "SETACL INBOX jdoe@example.com lr").await;
@@ -821,10 +830,12 @@ pub async fn acl(imap_john: &mut ImapConnection, test: &TestServer) {
 
     // Grant access to Bill and check ACLs
     imap_admin.send("GETACL INBOX").await;
+    // 1.0 lists rights in RFC 4314 order (l r s w i p k x t e n a); 0.16
+    // listed them in its own order (`rl`, `tewsrxl`).
     imap_admin
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_contains("\"jdoe@example.com\" rl");
+        .assert_contains("\"jdoe@example.com\" lr");
     imap_admin
         .send("SETACL INBOX foobar@example.com lrxtws")
         .await;
@@ -833,8 +844,8 @@ pub async fn acl(imap_john: &mut ImapConnection, test: &TestServer) {
     imap_admin
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_contains("\"jdoe@example.com\" rl")
-        .assert_contains("\"foobar@example.com\" tewsrxl");
+        .assert_contains("\"jdoe@example.com\" lr")
+        .assert_contains("\"foobar@example.com\" lrswxte");
     imap_bill.send("LIST \"\" \"*\"").await;
     imap_bill
         .assert_read(Type::Tagged, ResponseType::Ok)
@@ -853,7 +864,7 @@ pub async fn acl(imap_john: &mut ImapConnection, test: &TestServer) {
     imap_john
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_equals(&format!("* MYRIGHTS \"{shared}\" rl"));
+        .assert_equals(&format!("* MYRIGHTS \"{shared}\" lr"));
 
     // John should not be able to append messages
     assert_append_message(
@@ -872,7 +883,7 @@ pub async fn acl(imap_john: &mut ImapConnection, test: &TestServer) {
     imap_john
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_equals(&format!("* MYRIGHTS \"{shared}\" rli"));
+        .assert_equals(&format!("* MYRIGHTS \"{shared}\" lri"));
     let uid = assert_append_message(
         imap_john,
         &shared,
@@ -934,7 +945,7 @@ pub async fn acl(imap_john: &mut ImapConnection, test: &TestServer) {
     imap_admin
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_contains("\"jdoe@example.com\" rl")
+        .assert_contains("\"jdoe@example.com\" lr")
         .assert_count("foobar@example.com", 0);
 
     // Bill should not have access to the admin's Inbox anymore
@@ -1063,31 +1074,33 @@ pub async fn antispam(test: &TestServer) {
     }
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     imap_admin.send_ok("SELECT INBOX").await;
-    imap_admin.send("FETCH 11 (FLAGS RFC822.TEXT)").await;
-    imap_admin
+    // The checks read headers: 1.0's RFC822.TEXT is the body only (RFC 3501
+    // 6.4.5, as BODY[TEXT]), where 0.16 returned the whole message.
+    imap_admin.send("FETCH 11 (FLAGS RFC822)").await;
+    let lines = imap_admin
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_not_contains("FLAGS ($Junk")
         .assert_contains("Subject: can someone explain")
         .assert_contains("X-Spam-Status: No")
         .assert_contains("PROB_HAM_HIGH");
-    imap_admin.send("FETCH 12 (FLAGS RFC822.TEXT)").await;
-    imap_admin
+    assert!(!has_junk_flag(&lines), "{lines:?}");
+    imap_admin.send("FETCH 12 (FLAGS RFC822)").await;
+    let lines = imap_admin
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_not_contains("FLAGS ($Junk")
         .assert_contains("Subject: classifier test")
         .assert_contains("X-Spam-Status: No")
         .assert_contains_any(&["PROB_SPAM_UNCERTAIN", "PROB_HAM_LOW"]);
+    assert!(!has_junk_flag(&lines), "{lines:?}");
     imap_admin.send_ok("SELECT \"Junk Mail\"").await;
-    imap_admin.send("FETCH 10 (FLAGS RFC822.TEXT)").await;
-    imap_admin
+    imap_admin.send("FETCH 10 (FLAGS RFC822)").await;
+    let lines = imap_admin
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_contains("FLAGS ($Junk")
         .assert_contains("Subject: save up to")
         .assert_contains("X-Spam-Status: Yes")
         .assert_contains("PROB_SPAM_HIGH");
+    assert!(has_junk_flag(&lines), "{lines:?}");
     imap_admin.send_ok("MOVE 10 INBOX").await;
     let samples = admin.spam_training_samples().await;
     assert_eq!(samples.iter().filter(|x| !x.1.is_spam).count(), 11);
@@ -1204,4 +1217,15 @@ pub async fn antispam(test: &TestServer) {
     assert_eq!(samples_for(support_id, false).await, 1);
     assert_eq!(samples_for(jane_id, false).await, 0);
     assert_eq!(samples_for(jane_id, true).await, 0);
+}
+
+/// Whether the FETCH response's FLAGS list holds `$Junk`. 1.0 lists the
+/// server-set `$hasattachment` or `$hasnoattachment` keyword of an ordinary
+/// account's message first, so `$Junk` is not the list's first flag.
+pub(crate) fn has_junk_flag(lines: &[String]) -> bool {
+    lines
+        .iter()
+        .find_map(|line| line.split_once("FETCH (FLAGS ("))
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .is_some_and(|(flags, _)| flags.split(' ').any(|flag| flag == "$Junk"))
 }

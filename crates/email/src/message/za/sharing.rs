@@ -13,22 +13,28 @@
 use crate::mailbox::Mailbox;
 use common::Server;
 use trc::AddContext;
-use types::collection::Collection;
+use types::{collection::Collection, field::Field};
 
 /// The accounts named in the ACL grants of `account_id`'s mailboxes, each
 /// once, read from the stored mailbox archives.
 pub async fn za_mailbox_grantees(server: &Server, account_id: u32) -> trc::Result<Vec<u32>> {
     let mut grantees = Vec::new();
     server
-        .archives(account_id, Collection::Mailbox, &(), |_, archive| {
-            for grant in archive.unarchive::<Mailbox>()?.acls.iter() {
-                let grantee = grant.account_id.to_native();
-                if !grantees.contains(&grantee) {
-                    grantees.push(grantee);
+        .archives(
+            account_id,
+            Collection::Mailbox,
+            Field::ARCHIVE,
+            &(),
+            |_, archive| {
+                for grant in archive.unarchive::<Mailbox>()?.acls.iter() {
+                    let grantee = grant.account_id.to_native();
+                    if !grantees.contains(&grantee) {
+                        grantees.push(grantee);
+                    }
                 }
-            }
-            Ok(true)
-        })
+                Ok(true)
+            },
+        )
         .await
         .caused_by(trc::location!())?;
     Ok(grantees)

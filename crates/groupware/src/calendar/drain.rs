@@ -62,51 +62,60 @@
 //! delivers nothing more and defers, as on a lost commit fence.
 
 use crate::{
-    DestroyArchive,
+    DestroyArchive, SizeWriter,
     cache::GroupwareCache,
     calendar::{
-        CalendarEvent, CalendarEventData, CalendarEventNotification, ChangedBy,
-        EVENT_NOTIFICATION_IS_CHANGE,
-        fanout::{ZaFanOut, ZaFanOutKind, ZaFanOutMessage, ZaSource, za_set_schedule_status},
+        CalendarEvent, CalendarEventContent, CalendarEventData, CalendarEventNotification,
+        CalendarEventNotificationContent, ChangedBy, EVENT_NOTIFICATION_IS_CHANGE,
+        alerts::{DefaultAlerts, DefaultAlertsResolver},
+        fanout::{
+            ZaFanOut, ZaFanOutKind, ZaFanOutMessage, ZaScheduleStatus, ZaSource,
+            za_set_schedule_status,
+        },
+        privacy::{EventPrivacy, ICalendarPrivacy},
+        schedule::{AlarmTasks, EventAlarmScheduler, EventAlarmUsers},
         seal::{
-            PendingCarriers, SealError, TOKEN_LEN, TokenPairs, archived_item_is_pending,
+            PendingCarriers, SealError, TOKEN_LEN, TokenPairs, ZaEvent, archived_item_is_pending,
+            item::{into_item_message, sealed_item_record},
             open_pending_item, seal_drained_item, seal_error, seal_event_in_domain,
             unseal_event_in_domain,
         },
-        sequence::za_set_sequences,
+        sequence_floor::za_set_sequences,
         sharing::resolve::{za_owned_calendar_context, za_owned_event_contexts},
-        storage::ItipAutoExpunge,
     },
     scheduling::{
-        Attendee, InstanceId, ItipError, ItipSnapshots, ical_size,
+        Attendee, InstanceId, ItipError, ItipSnapshots,
         inbound::{
             MergeAction, MergeResult, itip_import_message, itip_merge_changes, itip_method,
             itip_process_message,
         },
+        itip::ITIP_STATUS_DELIVERY_FAILED,
         organizer::organizer_request_full,
+        recipient::{RecipientPolicy, itip_messages_per_recipient},
         snapshot::itip_snapshot,
     },
 };
 use ahash::{AHashMap, AHashSet};
 use calcard::{
     common::timezone::Tz,
-    icalendar::{ICalendar, ICalendarMethod},
+    icalendar::{ICalendar, ICalendarMethod, ICalendarProperty},
 };
 use common::{
     DavName, Server,
     auth::AccountInfo,
-    storage::index::ObjectIndexBuilder,
+    storage::index::SplitUpdate,
     za::lease::{ZaUidLease, ZaUidLeaseGuard},
 };
+use registry::schema::enums::StorageQuota;
 use std::{future::Future, sync::Arc};
 use store::{
-    ValueKey, rand,
-    write::{AlignedBytes, Archive, BatchBuilder, now},
+    rand,
+    write::{Archive, ArchiveBytes, BatchBuilder, Slot, now},
 };
 use trc::AddContext;
 use types::{
     collection::{Collection, SyncCollection},
-    field::CalendarEventField,
+    field::{CalendarEventField, CalendarNotificationField, Field},
 };
 use vault::session::{PassState, SessionKeys, ZaDrainState};
 use zeroize::Zeroizing;
@@ -370,7 +379,7 @@ async fn enumerate(
     // The snapshot: the inbox change id observed before enumeration, from
     // the same since-query upstream runs for a request's own collection.
     let snapshot = server
-        .fetch_dav_resources(
+        .fetch_groupware_resources(
             account_id,
             account_id,
             SyncCollection::CalendarEventNotification,
@@ -381,39 +390,43 @@ async fn enumerate(
     if state.cursor().is_some_and(|cursor| cursor >= snapshot) {
         return Ok(None);
     }
+    // Every item row in document id order (the iteration's key order).
     let mut pending = Vec::new();
-    for document_id in server
-        .itip_ids(account_id)
+    server
+        .archives(
+            account_id,
+            Collection::CalendarEventNotification,
+            Field::ARCHIVE,
+            &(),
+            |document_id, stored| {
+                if archived_item_is_pending(stored.unarchive::<CalendarEventNotification>()?) {
+                    pending.push(document_id);
+                }
+                Ok(true)
+            },
+        )
         .await
-        .caused_by(trc::location!())?
-    {
-        if let Some(stored) = read_item(server, account_id, document_id).await?
-            && archived_item_is_pending(
-                stored
-                    .unarchive::<CalendarEventNotification>()
-                    .caused_by(trc::location!())?,
-            )
-        {
-            pending.push(document_id);
-        }
-    }
+        .caused_by(trc::location!())?;
     Ok(Some((snapshot, pending)))
 }
 
+/// An item's row and content archives, read together; `None` when either
+/// is gone.
 async fn read_item(
     server: &Server,
     account_id: u32,
     document_id: u32,
-) -> trc::Result<Option<Archive<AlignedBytes>>> {
-    server
-        .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+) -> trc::Result<Option<(Archive<ArchiveBytes>, Archive<ArchiveBytes>)>> {
+    let (row, content) = server
+        .archive_and_field(
             account_id,
             Collection::CalendarEventNotification,
             document_id,
-        ))
+            CalendarNotificationField::Content.field(),
+        )
         .await
-        .caused_by(trc::location!())
+        .caused_by(trc::location!())?;
+    Ok(row.zip(content))
 }
 
 /// Spec 6.4: the private key once, then each item in document id order,
@@ -496,12 +509,13 @@ struct ItemCtx<'a> {
     server: &'a Server,
     account_info: &'a AccountInfo,
     keys: &'a SessionKeys,
-    /// The stored archive as read; every write asserts it.
-    stored: Archive<AlignedBytes>,
+    /// The stored row as read; every write asserts it.
+    stored: Archive<ArchiveBytes>,
+    /// The stored content as read, the current content of the rewrite.
+    stored_content: Archive<ArchiveBytes>,
     document_id: u32,
     changed_by: ChangedBy,
     created: i64,
-    size: u32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -541,7 +555,7 @@ async fn drain_item(
     }
     // Re-read (spec 6.3, "The pass"): an item that is gone, or that another
     // session drained, is skipped.
-    let Some(stored) = read_item(server, account_id, document_id)
+    let Some((stored, stored_content)) = read_item(server, account_id, document_id)
         .await
         .map_err(no_uid)?
     else {
@@ -554,8 +568,12 @@ async fn drain_item(
     if !archived_item_is_pending(archived) {
         return Ok(ItemOutcome::Done);
     }
-    let mut item = stored
+    let item = stored
         .deserialize::<CalendarEventNotification>()
+        .caused_by(trc::location!())
+        .map_err(no_uid)?;
+    let content = stored_content
+        .deserialize::<CalendarEventNotificationContent>()
         .caused_by(trc::location!())
         .map_err(no_uid)?;
     let ctx = ItemCtx {
@@ -563,18 +581,22 @@ async fn drain_item(
         account_info,
         keys,
         stored,
+        stored_content,
         document_id,
         changed_by: item.changed_by.clone(),
         created: item.created,
-        size: item.size,
+    };
+    // A pending row the fan-out did not write (any other content shape)
+    // cannot be opened: permanent, as an undecodable item.
+    let Some(mut tree) = into_item_message(content) else {
+        return item_outcome(ctx.delete_undecodable("not a sealed item").await, None);
     };
     // Step 1: open. A failure is permanent (spec 6.5): the private key
     // never changes, so nothing will ever read this item.
-    let carriers = match open_pending_item(&mut item.event, account_id, private_key) {
+    let carriers = match open_pending_item(&mut tree, account_id, private_key) {
         Ok(carriers) => carriers,
         Err(err) => return item_outcome(ctx.delete_undecodable(seal_reason(&err)).await, None),
     };
-    let tree = item.event;
     // An unknown or missing METHOD cannot come from the fan-out: permanent.
     let method = match itip_method(&tree) {
         Ok(ICalendarMethod::Request) => Method::Request,
@@ -918,20 +940,18 @@ async fn import(
         lease.release().await;
         return ctx.reject(tree, None, &err).await;
     }
-    // Upstream's two checks: quota for the plaintext size (the item's, as
-    // the fan-out computed it) and the default calendar. Only a quota
-    // limit is the iTIP-level rejection; a failed counter read is a store
-    // error that keeps the item pending (spec 6.5), as the fan-out
-    // classifies it.
+    // Upstream's checks (1.0.1 `itip_ingest`, import branch): the default
+    // calendar, then the in-batch disk and object quotas below. The fork
+    // also checks the quota for the plaintext size first, so an over-quota
+    // item is kept as history. Only a quota limit is the iTIP-level
+    // rejection; a failed counter read is a store error that keeps the
+    // item pending (spec 6.5), as the fan-out classifies it.
+    let account = server
+        .account(account_id)
+        .await
+        .caused_by(trc::location!())?;
     if let Err(err) = server
-        .has_available_quota(
-            server
-                .account(account_id)
-                .await
-                .caused_by(trc::location!())?
-                .as_ref(),
-            ctx.size as u64,
-        )
+        .has_available_quota(account.as_ref(), SizeWriter::ical(&tree) as u64)
         .await
     {
         lease.release().await;
@@ -942,31 +962,48 @@ async fn import(
         };
     }
     let Some(parent_id) = server
-        .get_or_create_default_calendar(account_id, account_id)
+        .get_or_create_default_calendar(ctx.account_info.account(), ctx.account_info.account())
         .await
         .caused_by(trc::location!())?
     else {
         lease.release().await;
         return ctx.reject(tree, None, &ItipError::NoDefaultCalendar).await;
     };
-    let mut next_email_alarm = None;
     let now = now() as i64;
-    let mut event = CalendarEvent {
+    let meta = CalendarEvent {
         names: vec![DavName {
             name: format!("{}_{}.ics", now, rand::random::<u64>()),
             parent_id,
         }],
+        schedule_tag: Some(1),
+        ..Default::default()
+    };
+    let content = CalendarEventContent {
         data: CalendarEventData::new_for(
             event_tree,
             Tz::Floating,
             server.core.groupware.max_ical_instances,
-            &mut next_email_alarm,
+            &DefaultAlerts::disabled(),
             true,
         ),
-        size: ctx.size,
-        schedule_tag: Some(1),
         ..Default::default()
     };
+    // Computed on the plaintext view; the alarm data is visible, so sealing
+    // (below) changes none of it.
+    let next_email_alarms = server
+        .next_event_alarms(
+            account_id,
+            &EventAlarmUsers::new(account_id, &content)
+                .caused_by(trc::location!())?
+                .with_event_flags(meta.flags),
+            &content.data,
+            &[parent_id],
+            now,
+            &mut DefaultAlertsResolver::default(),
+        )
+        .await
+        .caused_by(trc::location!())?;
+    let mut event = ZaEvent::new(meta, content);
     // Spec 3.3, "Attendee side": the copy takes the pair the item carried.
     let context = za_owned_calendar_context(server, ctx.keys, parent_id)
         .await
@@ -977,29 +1014,34 @@ async fn import(
             .map_err(|error| error.into_store_error(account_id, parent_id))?;
     seal_event_in_domain(&mut event, &context.domain, pair.as_ref())
         .map_err(|err| seal_error(err, account_id, u32::MAX))?;
-    let document_id = server
-        .store()
-        .assign_document_ids(account_id, Collection::CalendarEvent, 1)
-        .await
-        .caused_by(trc::location!())?;
     #[cfg(feature = "test_mode")]
     common::za::test_hooks::drain_lease_pause_point(account_id).await;
     let mut batch = BatchBuilder::new();
+    batch.with_account_id(account_id);
+    server.limit_disk_quota(&mut batch, &account);
+    server.limit_object_quota(&mut batch, &account, StorageQuota::MaxCalendarEvents);
+    // The new event's id is reserved in this batch: nothing before the
+    // commit needs it (no fan-out here); the item records it as a pending
+    // id, as upstream's ingest records its notification's event.
+    let document_id = batch.reserve_document_id(account_id, Collection::CalendarEvent);
     // Spec 6.3 step 3: fenced on the lease, with the item rewrite ahead of
     // the insert (one write; see the module doc).
     lease.lease().assert_in(&mut batch);
     context.assert_in(&mut batch);
-    ctx.rewrite_in(&mut batch, tree, Some(document_id), 0)?;
-    event
-        .insert(
-            ctx.account_info.account_tenant_ids(),
-            account_id,
-            document_id,
-            next_email_alarm,
-            &mut batch,
-        )
-        .caused_by(trc::location!())?;
-    ctx.commit(batch, Some(lease)).await
+    ctx.rewrite_in(&mut batch, tree.clone(), ItemEvent::Pending(document_id), 0)?;
+    let (meta, content) = event.into_parts();
+    meta.insert(
+        content,
+        ctx.account_info.changed_by(),
+        account_id,
+        document_id,
+        None,
+        next_email_alarms,
+        &mut batch,
+    )
+    .caused_by(trc::location!())?;
+    ctx.commit_or_reject_quota(batch, Some(lease), tree, None)
+        .await
 }
 
 enum Step {
@@ -1090,13 +1132,13 @@ async fn merge(
     let server = ctx.server;
     let account_id = ctx.keys.account_id;
     let addresses = ctx.account_info.addresses();
-    let Some(archive) = server
-        .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+    let (Some(archive), Some(content_archive)) = server
+        .archive_and_field(
             account_id,
             Collection::CalendarEvent,
             event_id,
-        ))
+            CalendarEventField::Content.field(),
+        )
         .await
         .caused_by(trc::location!())?
     else {
@@ -1105,15 +1147,24 @@ async fn merge(
     let event_ = archive
         .to_unarchived::<CalendarEvent>()
         .caused_by(trc::location!())?;
-    let mut event = event_
-        .deserialize::<CalendarEvent>()
+    let content_ = content_archive
+        .to_unarchived::<CalendarEventContent>()
         .caused_by(trc::location!())?;
+    let mut event = ZaEvent::new(
+        event_
+            .deserialize::<CalendarEvent>()
+            .caused_by(trc::location!())?,
+        content_
+            .deserialize::<CalendarEventContent>()
+            .caused_by(trc::location!())?,
+    );
     let parent_id = event
+        .meta
         .names
         .first()
         .ok_or_else(|| trc::StoreEvent::DataCorruption.into_err())?
         .parent_id;
-    let contexts = za_owned_event_contexts(server, ctx.keys, &event, parent_id)
+    let contexts = za_owned_event_contexts(server, ctx.keys, &event.meta, parent_id)
         .await
         .map_err(|error| error.into_store_error(account_id, event_id))?;
     let contexts =
@@ -1154,7 +1205,7 @@ async fn merge(
         Incoming::Request(_) | Incoming::Cancel => sender_addresses[0].clone(),
     };
     let (step, is_organizer_update, before, event_uid) = {
-        let snapshots = match itip_snapshot(&event.data.event, addresses, false) {
+        let snapshots = match itip_snapshot(&event.content.data.event, addresses, false) {
             Ok(snapshots) => snapshots,
             Err(err) => return ctx.reject(tree, Some(event_id), &err).await,
         };
@@ -1173,11 +1224,12 @@ async fn merge(
             Step::Reject(ItipError::OutOfSequence)
         } else {
             match itip_process_message(
-                &event.data.event,
+                &event.content.data.event,
                 snapshots,
                 &tree,
                 itip_snapshots,
                 sender_address.clone(),
+                RecipientPolicy::new(&server.core.groupware, event.meta.flags),
             ) {
                 Ok(MergeResult::Actions(changes)) => Step::Merge(changes),
                 Ok(MergeResult::None) => Step::Nothing,
@@ -1196,24 +1248,35 @@ async fn merge(
         Step::Nothing => return ctx.rewrite_only(tree, Some(event_id), 0).await,
         Step::Merge(changes) => changes,
     };
-    itip_merge_changes(&mut event.data.event, &tree, changes);
-    event.size = ical_size(&event.data.event) as u32;
-    if event.size > server.core.groupware.max_ical_size as u32 {
+    // 1.0.1's `commit_itip_merge`: the stored classification is kept when
+    // the merge would change it. Upstream reads it from the row's flags,
+    // which it derives from the stored tree (`refresh_from_content`); here
+    // it is read from the unsealed stored tree itself, because a sealed
+    // non-standard CLASS leaves the sealed row's flags clear (field policy
+    // 2's recorded limit) while the tree an ordinary account stores would
+    // have set them. So the kept classification, and the tree, are an
+    // ordinary account's for every value.
+    let privacy = stored_classification(&event.content.data.event);
+    if let Err(err) = itip_merge_changes(&mut event.content.data.event, &tree, changes) {
+        return ctx.reject(tree, Some(event_id), &err).await;
+    }
+    keep_classification(&mut event.content.data.event, privacy);
+    // The plaintext size, as upstream's merge measures it; the stored size
+    // is the sealed tree's (`refresh_from_content`).
+    let new_size = SizeWriter::ical(&event.content.data.event) as u32;
+    if new_size > server.core.groupware.max_ical_size as u32 {
         return ctx
             .reject(tree, Some(event_id), &ItipError::EventTooLarge)
             .await;
     }
-    let extra_bytes = (event.size as u64).saturating_sub(event_.inner.size.to_native() as u64);
+    let account = server
+        .account(account_id)
+        .await
+        .caused_by(trc::location!())?;
+    let extra_bytes = (new_size as u64).saturating_sub(event_.inner.size.to_native() as u64);
     if extra_bytes > 0
         && let Err(err) = server
-            .has_available_quota(
-                server
-                    .account(account_id)
-                    .await
-                    .caused_by(trc::location!())?
-                    .as_ref(),
-                extra_bytes,
-            )
+            .has_available_quota(account.as_ref(), extra_bytes)
             .await
     {
         return if is_over_quota(&err) {
@@ -1244,7 +1307,10 @@ async fn merge(
         // upstream's organizer request builder on the merged tree,
         // restricted to the new attendees (spec 6.4, "Delegates").
         Incoming::Reply(_) => {
-            let new_attendees = match itip_snapshot(&event.data.event, addresses, false) {
+            // Upgrade ruling 154: the new delegates whose invitation's split
+            // failed, for their `5.1`.
+            let mut split_failed: Vec<String> = Vec::new();
+            let new_attendees = match itip_snapshot(&event.content.data.event, addresses, false) {
                 Ok(after) => {
                     // Compared per instance, so a delegate who already
                     // attends another instance is new to this one, and an
@@ -1262,20 +1328,37 @@ async fn merge(
                     if new_attendees.is_empty() {
                         Ok(None)
                     } else {
-                        organizer_request_full(&event.data.event, &after, None, false)
-                            .map(|messages| Some((new_attendees, messages)))
+                        // Restricted to the new attendees, then split per
+                        // recipient under the event's policy as 1.0 splits
+                        // upstream's own organizer messages (upgrade ruling
+                        // 131): each delegate gets its slice. A split error
+                        // is the builders' error, and the delegates it
+                        // leaves uninvited get `5.1` (upgrade ruling 154).
+                        organizer_request_full(&event.content.data.event, &after, None, false)
+                            .and_then(|mut messages| {
+                                for message in &mut messages {
+                                    message.to.retain(|to| {
+                                        new_attendees.contains(&to.to_ascii_lowercase())
+                                    });
+                                }
+                                messages.retain(|message| !message.to.is_empty());
+                                let delegates: Vec<String> = messages
+                                    .iter()
+                                    .flat_map(|message| message.to.iter().cloned())
+                                    .collect();
+                                itip_messages_per_recipient(
+                                    messages,
+                                    RecipientPolicy::new(&server.core.groupware, event.meta.flags),
+                                )
+                                .inspect_err(|_| split_failed = delegates)
+                            })
+                            .map(Some)
                     }
                 }
                 Err(err) => Err(err),
             };
             match new_attendees {
-                Ok(Some((new_attendees, mut messages))) => {
-                    for message in &mut messages {
-                        message
-                            .to
-                            .retain(|to| new_attendees.contains(&to.to_ascii_lowercase()));
-                    }
-                    messages.retain(|message| !message.to.is_empty());
+                Ok(Some(messages)) => {
                     if !messages.is_empty() {
                         // Two sessions of the organizer (two drain locks)
                         // can both pass the re-read of this REPLY, and the
@@ -1322,12 +1405,13 @@ async fn merge(
                                 .map(ZaFanOutMessage::upstream)
                                 .collect(),
                             pairs.take(),
-                            &event.data.event,
+                            &event.content.data.event,
                             ZaSource {
                                 document_id: event_id,
                                 uid: &event_uid,
                             },
                             ZaFanOutKind::Change,
+                            RecipientPolicy::new(&server.core.groupware, event.meta.flags),
                             reply_lease.as_ref().map(|lease| lease.lease()),
                             None,
                         )
@@ -1348,13 +1432,16 @@ async fn merge(
                         }
                         Err(err) => return Err(err.caused_by(trc::location!())),
                     };
-                    za_set_schedule_status(&mut event.data.event, &fan_out.statuses);
-                    za_set_sequences(&mut event.data.event, &fan_out.sequences);
+                    za_set_schedule_status(&mut event.content.data.event, &fan_out.statuses);
+                    za_set_sequences(&mut event.content.data.event, &fan_out.sequences);
                     pairs = fan_out.pairs;
                 }
                 Ok(None) => {}
                 // The reply still applies; the delegate's invitation is
-                // not built. Traced as upstream traces a builder error.
+                // not built. Traced as upstream traces a builder error. A
+                // split error (upgrade ruling 154) is each uninvited new
+                // delegate's `5.1` on its ATTENDEE lines, so the organizer
+                // sees the failure, as a failed delivery shows it.
                 Err(err) => {
                     trc::event!(
                         Calendar(trc::CalendarEvent::ItipMessageError),
@@ -1363,29 +1450,84 @@ async fn merge(
                         Reason = itip_reason(&err),
                         Details = "zero-access: delegate invitation not built",
                     );
+                    let statuses: Vec<ZaScheduleStatus> = split_failed
+                        .into_iter()
+                        .map(|address| ZaScheduleStatus {
+                            address,
+                            on_organizer: false,
+                            status: ITIP_STATUS_DELIVERY_FAILED,
+                        })
+                        .collect();
+                    za_set_schedule_status(&mut event.content.data.event, &statuses);
                 }
             }
         }
     }
+    // 1.0.1's `commit_itip_merge`: the calendar's default alerts, the
+    // alarms before and after, on the plaintext view (their data is
+    // visible, so sealing below changes none of it).
     let now = now() as i64;
-    let prev_email_alarm = event_.inner.data.next_alarm(now, Tz::Floating);
-    let mut next_email_alarm = None;
-    event.data = CalendarEventData::new_for(
-        event.data.event,
+    let mut resolver = DefaultAlertsResolver::default();
+    let calendar_ids = event
+        .meta
+        .names
+        .iter()
+        .map(DavName::parent_id)
+        .collect::<Vec<_>>();
+    let default_alerts = resolver
+        .resolve_for_content(
+            server,
+            account_id,
+            account_id,
+            &event.content,
+            calendar_ids.iter().copied(),
+        )
+        .await
+        .caused_by(trc::location!())?;
+    let prev_email_alarms = server
+        .next_event_alarms(
+            account_id,
+            &EventAlarmUsers::new(account_id, content_.inner)
+                .caused_by(trc::location!())?
+                .with_event_flags(event_.inner.flags.to_native()),
+            &content_.inner.data,
+            &calendar_ids,
+            now,
+            &mut resolver,
+        )
+        .await
+        .caused_by(trc::location!())?;
+    event.content.data = CalendarEventData::new_for(
+        std::mem::take(&mut event.content.data.event),
         Tz::Floating,
         server.core.groupware.max_ical_instances,
-        &mut next_email_alarm,
+        &default_alerts,
         true,
     );
+    let next_email_alarms = server
+        .next_event_alarms(
+            account_id,
+            &EventAlarmUsers::new(account_id, &event.content)
+                .caused_by(trc::location!())?
+                .with_event_flags(event.meta.flags),
+            &event.content.data,
+            &calendar_ids,
+            now,
+            &mut resolver,
+        )
+        .await
+        .caused_by(trc::location!())?;
     if is_organizer_update {
-        match &mut event.schedule_tag {
+        match &mut event.meta.schedule_tag {
             Some(schedule_tag) => *schedule_tag += 1,
-            None => event.schedule_tag = Some(1),
+            None => event.meta.schedule_tag = Some(1),
         }
     }
     seal_event_in_domain(&mut event, &contexts[0].domain, pairs.as_ref())
         .map_err(|err| seal_error(err, account_id, event_id))?;
     let mut batch = BatchBuilder::new();
+    batch.with_account_id(account_id);
+    server.limit_disk_quota(&mut batch, &account);
     // A delegating REPLY is fenced on its lease first, as `import` is.
     if let Some(lease) = &reply_lease {
         lease.lease().assert_in(&mut batch);
@@ -1393,32 +1535,88 @@ async fn merge(
     for context in &contexts {
         context.assert_in(&mut batch);
     }
-    // The item rewrite first, ahead of the event update (one write; see
-    // the module doc).
-    ctx.rewrite_in(
-        &mut batch,
-        tree,
-        Some(event_id),
-        EVENT_NOTIFICATION_IS_CHANGE,
-    )?;
-    event
-        .update(
-            ctx.account_info.account_tenant_ids(),
-            event_,
+    // The alarm tasks and the item rewrite first, ahead of the event update,
+    // whose commit point closes the chunk: one transaction under the
+    // fences (see the module doc).
+    server
+        .replace_event_alarms(
             account_id,
             event_id,
+            prev_email_alarms,
+            next_email_alarms,
+            &mut AlarmTasks::None,
             &mut batch,
         )
+        .await
         .caused_by(trc::location!())?;
-    if prev_email_alarm != next_email_alarm {
-        if let Some(prev_alarm) = prev_email_alarm {
-            prev_alarm.delete_task(&mut batch);
-        }
-        if let Some(next_alarm) = next_email_alarm {
-            next_alarm.write_task(&mut batch);
+    ctx.rewrite_in(
+        &mut batch,
+        tree.clone(),
+        ItemEvent::Assigned(event_id),
+        EVENT_NOTIFICATION_IS_CHANGE,
+    )?;
+    let (meta, content) = event.into_parts();
+    meta.update_full(
+        content,
+        ctx.account_info.changed_by(),
+        event_,
+        content_.inner,
+        account_id,
+        event_id,
+        None,
+        &mut batch,
+    )
+    .caused_by(trc::location!())?;
+    ctx.commit_or_reject_quota(batch, reply_lease, tree, Some(event_id))
+        .await
+}
+
+/// The classification upstream's merge preserves, read from the unsealed
+/// stored tree: what `refresh_from_content` derives for an ordinary
+/// account's stored tree, so `EventPrivacy::from_flags` of its row.
+fn stored_classification(stored: &ICalendar) -> EventPrivacy {
+    stored.privacy()
+}
+
+/// `commit_itip_merge`'s preservation, verbatim: a scheduling component
+/// whose merged CLASS reads differently from `stored` gets `stored` back.
+fn keep_classification(merged: &mut ICalendar, stored: EventPrivacy) {
+    if merged
+        .components
+        .iter()
+        .filter(|component| component.component_type.is_scheduling_object())
+        .any(|component| {
+            component
+                .entries
+                .iter()
+                .filter(|entry| entry.name == ICalendarProperty::Class)
+                .filter_map(|entry| entry.values.first())
+                .map(EventPrivacy::from_value)
+                .max()
+                .unwrap_or_default()
+                != stored
+        })
+    {
+        merged.set_privacy(stored);
+    }
+}
+
+/// The event an item's rewrite records: assigned, or reserved in the same
+/// batch (an import).
+#[derive(Clone, Copy)]
+enum ItemEvent {
+    None,
+    Assigned(u32),
+    Pending(Slot),
+}
+
+impl From<Option<u32>> for ItemEvent {
+    fn from(event_id: Option<u32>) -> Self {
+        match event_id {
+            Some(event_id) => ItemEvent::Assigned(event_id),
+            None => ItemEvent::None,
         }
     }
-    ctx.commit(batch, reply_lease).await
 }
 
 impl ItemCtx<'_> {
@@ -1426,12 +1624,14 @@ impl ItemCtx<'_> {
     /// this pass read, pending. Another session that finished it (or a
     /// deletion) while this one waited for the lease leaves nothing to do.
     async fn still_pending(&self) -> trc::Result<bool> {
-        let Some(current) = read_item(self.server, self.keys.account_id, self.document_id).await?
+        let Some((current, current_content)) =
+            read_item(self.server, self.keys.account_id, self.document_id).await?
         else {
             return Ok(false);
         };
-        Ok(current.as_bytes() == self.stored.as_bytes()
+        Ok(current.inner == self.stored.inner
             && current.version == self.stored.version
+            && current_content.inner == self.stored_content.inner
             && archived_item_is_pending(
                 current
                     .unarchive::<CalendarEventNotification>()
@@ -1441,42 +1641,49 @@ impl ItemCtx<'_> {
 
     /// Spec 6.4 step 5: the item resealed under the master key, bit
     /// cleared, no carrier, `event_id` and the change flag as upstream's
-    /// ingest sets them, `created` kept. No commit point of its own: the
-    /// callers put it ahead of the event write, or end the batch
+    /// ingest sets them, `created` kept. The record is
+    /// `sealed_item_record`'s (upgrade ruling 13): the content is
+    /// `Itip { message: <the drained sealed tree>, previous: None,
+    /// current: None }`, never a plaintext snapshot. No commit point of its
+    /// own: the callers put it ahead of the event write, or end the batch
     /// themselves.
     fn rewrite_in(
         &self,
         batch: &mut BatchBuilder,
         mut tree: ICalendar,
-        event_id: Option<u32>,
+        event: impl Into<ItemEvent>,
         flags: u16,
     ) -> trc::Result<()> {
         let account_id = self.keys.account_id;
         seal_drained_item(&mut tree, self.keys, account_id)
             .map_err(|err| seal_error(err, account_id, self.document_id))?;
-        let item = CalendarEventNotification {
-            event: tree,
-            event_id,
-            changed_by: self.changed_by.clone(),
-            flags,
-            size: self.size,
-            created: self.created,
-            modified: now() as i64,
+        let (event_id, pending_event) = match event.into() {
+            ItemEvent::None => (None, None),
+            ItemEvent::Assigned(event_id) => (Some(event_id), None),
+            ItemEvent::Pending(slot) => (None, Some(slot)),
         };
+        let (mut item, content) =
+            sealed_item_record(tree, self.changed_by.clone(), event_id, false);
+        item.flags |= flags;
+        item.created = self.created;
+        item.modified = now() as i64;
+        let update = SplitUpdate::full(
+            self.stored
+                .to_unarchived::<CalendarEventNotification>()
+                .caused_by(trc::location!())?,
+            self.stored_content
+                .unarchive::<CalendarEventNotificationContent>()
+                .caused_by(trc::location!())?,
+            item,
+            content,
+            (),
+        )
+        .caused_by(trc::location!())?;
         batch
             .with_account_id(account_id)
             .with_collection(Collection::CalendarEventNotification)
             .with_document(self.document_id)
-            .custom(
-                ObjectIndexBuilder::new()
-                    .with_current(
-                        self.stored
-                            .to_unarchived::<CalendarEventNotification>()
-                            .caused_by(trc::location!())?,
-                    )
-                    .with_changes(item)
-                    .with_changed_by(self.account_info.account_tenant_ids()),
-            )
+            .custom(update.into_builder(self.account_info.changed_by(), pending_event))
             .caused_by(trc::location!())?;
         Ok(())
     }
@@ -1489,7 +1696,7 @@ impl ItemCtx<'_> {
         flags: u16,
     ) -> trc::Result<bool> {
         let mut batch = BatchBuilder::new();
-        self.rewrite_in(&mut batch, tree, event_id, flags)?;
+        self.rewrite_in(&mut batch, tree, ItemEvent::from(event_id), flags)?;
         batch.commit_point();
         self.commit(batch, None).await
     }
@@ -1558,7 +1765,7 @@ impl ItemCtx<'_> {
                 .caused_by(trc::location!())?,
         )
         .delete(
-            self.account_info.account_tenant_ids(),
+            self.account_info.changed_by(),
             self.keys.account_id,
             self.document_id,
             &mut batch,
@@ -1599,13 +1806,31 @@ impl ItemCtx<'_> {
             Err(err) => Err(err.caused_by(trc::location!())),
         }
     }
+
+    /// `commit`, except that the in-batch quota limits upstream's ingest
+    /// applies (1.0.1: `limit_disk_quota`, `limit_object_quota`) reject the
+    /// item as history, as the fork's own quota check does, instead of
+    /// counting as the item's failure.
+    async fn commit_or_reject_quota(
+        &self,
+        batch: BatchBuilder,
+        lease: Option<ZaUidLeaseGuard>,
+        tree: ICalendar,
+        event_id: Option<u32>,
+    ) -> trc::Result<bool> {
+        match self.commit(batch, lease).await {
+            Err(err) if is_over_quota(&err) => {
+                self.reject(tree, event_id, &ItipError::QuotaExceeded).await
+            }
+            result => result,
+        }
+    }
 }
 
 /// Only a quota limit is "over quota", as `fanout::write_item_inner`
 /// classifies it; any other error of the quota check is a store error.
 fn is_over_quota(err: &trc::Error) -> bool {
     err.matches(trc::EventType::Limit(trc::LimitEvent::Quota))
-        || err.matches(trc::EventType::Limit(trc::LimitEvent::TenantQuota))
 }
 
 /// A fixed name per `SealError`; its `Structure` text is a fixed string too.
@@ -1619,7 +1844,7 @@ fn seal_reason(err: &SealError) -> &'static str {
 /// A fixed name per `ItipError` variant: upstream traces `to_string()`,
 /// whose `SenderIsNotParticipant` and `UnknownParticipant` texts carry an
 /// address (spec 10).
-fn itip_reason(err: &ItipError) -> &'static str {
+pub fn itip_reason(err: &ItipError) -> &'static str {
     match err {
         ItipError::NoSchedulingInfo => "NoSchedulingInfo",
         ItipError::OtherSchedulingAgent => "OtherSchedulingAgent",
@@ -1640,6 +1865,7 @@ fn itip_reason(err: &ItipError) -> &'static str {
         ItipError::OutOfSequence => "OutOfSequence",
         ItipError::OrganizerIsLocalAddress => "OrganizerIsLocalAddress",
         ItipError::SenderIsNotOrganizerNorAttendee => "SenderIsNotOrganizerNorAttendee",
+        ItipError::SenderIsNotOrganizer => "SenderIsNotOrganizer",
         ItipError::SenderIsNotParticipant(_) => "SenderIsNotParticipant",
         ItipError::UnknownParticipant(_) => "UnknownParticipant",
         ItipError::UnsupportedMethod(_) => "UnsupportedMethod",
@@ -1649,6 +1875,7 @@ fn itip_reason(err: &ItipError) -> &'static str {
         ItipError::QuotaExceeded => "QuotaExceeded",
         ItipError::NoDefaultCalendar => "NoDefaultCalendar",
         ItipError::AutoAddDisabled => "AutoAddDisabled",
+        ItipError::TooManyRecipients => "TooManyRecipients",
     }
 }
 
@@ -1680,6 +1907,257 @@ mod tests {
 
     fn organizer() -> Vec<String> {
         vec!["org@example.com".to_string()]
+    }
+
+    /// The drain's merge path on the attendee's copy, as `merge` runs it:
+    /// upstream's processing and merge on the unsealed tree, then the seal.
+    fn merged_and_sealed(stored: &str, incoming: &str) -> (ZaEvent, ZaEvent) {
+        use crate::calendar::seal::{ZaKeyDomain, seal_event, unseal_event};
+        use vault::{keys::Secret, session::SessionKeys};
+        let keys = SessionKeys::new(9, 1, Secret::random());
+        let attendee = vec!["att@example.com".to_string()];
+        let content = |ical| CalendarEventContent {
+            data: CalendarEventData::new(ical, Tz::Floating, 100),
+            ..Default::default()
+        };
+        let mut event = ZaEvent::new(
+            CalendarEvent {
+                names: vec![DavName {
+                    name: "e.ics".into(),
+                    parent_id: 1,
+                }],
+                ..Default::default()
+            },
+            content(parse(stored)),
+        );
+        seal_event(&mut event, &keys, 9, None).unwrap();
+        unseal_event_in_domain(&mut event, &ZaKeyDomain::owner(&keys)).unwrap();
+        let itip = parse(incoming);
+        let snapshots = itip_snapshot(&event.content.data.event, &attendee, false).unwrap();
+        let itip_snapshots = itip_snapshot(&itip, &attendee, false).unwrap();
+        let policy = RecipientPolicy {
+            visibility: crate::scheduling::recipient::AttendeeVisibility::All,
+            max_recipients: usize::MAX,
+            max_instances: usize::MAX,
+        };
+        let MergeResult::Actions(changes) = itip_process_message(
+            &event.content.data.event,
+            snapshots,
+            &itip,
+            itip_snapshots,
+            "org@example.com".into(),
+            policy,
+        )
+        .unwrap() else {
+            panic!("no merge");
+        };
+        itip_merge_changes(&mut event.content.data.event, &itip, changes).unwrap();
+        event.content.data = CalendarEventData::new_for(
+            std::mem::take(&mut event.content.data.event),
+            Tz::Floating,
+            100,
+            &DefaultAlerts::disabled(),
+            true,
+        );
+        let plain = event.clone();
+        seal_event(&mut event, &keys, 9, None).unwrap();
+        let sealed = event.clone();
+        unseal_event(&mut event, &keys, 9).unwrap();
+        assert_eq!(
+            event, plain,
+            "the merged event round-trips through the seal"
+        );
+        (plain, sealed)
+    }
+
+    #[test]
+    fn incoming_timezone_update_survives_seal() {
+        // A REQUEST that moves one occurrence of a weekly series into a
+        // timezone the stored copy does not have yet: the merge adds the
+        // VTIMEZONE and the override, and the seal keeps both, their TZIDs
+        // and the time ranges computed on the plaintext.
+        const STORED: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\nUID:tz-1\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990105T090000Z\r\nDTEND:20990105T100000Z\r\nRRULE:FREQ=WEEKLY;COUNT=4\r\nSEQUENCE:0\r\nSUMMARY:tz canary\r\nORGANIZER:mailto:org@example.com\r\nATTENDEE;PARTSTAT=ACCEPTED:mailto:att@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        const INCOMING: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nMETHOD:REQUEST\r\nBEGIN:VTIMEZONE\r\nTZID:Europe/Berlin\r\nBEGIN:STANDARD\r\nDTSTART:19701025T030000\r\nRRULE:FREQ=YEARLY;BYDAY=-1SU;BYMONTH=10\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100\r\nTZNAME:CET\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nDTSTART:19700329T020000\r\nRRULE:FREQ=YEARLY;BYDAY=-1SU;BYMONTH=3\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0200\r\nTZNAME:CEST\r\nEND:DAYLIGHT\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:tz-1\r\nDTSTAMP:20240102T000000Z\r\nRECURRENCE-ID:20990112T090000Z\r\nDTSTART;TZID=Europe/Berlin:20990112T150000\r\nDTEND;TZID=Europe/Berlin:20990112T160000\r\nSEQUENCE:1\r\nSUMMARY:tz canary moved\r\nORGANIZER:mailto:org@example.com\r\nATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:att@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let (plain, sealed) = merged_and_sealed(STORED, INCOMING);
+        let tz = |event: &ZaEvent| {
+            event
+                .content
+                .data
+                .event
+                .components
+                .iter()
+                .filter(|c| {
+                    c.component_type == calcard::icalendar::ICalendarComponentType::VTimezone
+                })
+                .count()
+        };
+        assert_eq!(tz(&plain), 1, "the merge added the VTIMEZONE");
+        assert_eq!(tz(&sealed), 1, "the seal kept it");
+        assert_eq!(
+            plain.content.data.event.components.len(),
+            sealed.content.data.event.components.len()
+        );
+        assert_eq!(
+            plain.content.data.time_ranges,
+            sealed.content.data.time_ranges
+        );
+        let dump = sealed.content.data.event.to_string();
+        assert!(dump.contains("TZID=Europe/Berlin"), "{dump}");
+        assert!(!dump.contains("canary"), "{dump}");
+        assert!(!dump.contains("CEST"), "TZNAME is sealed: {dump}");
+        // The sealed tree's time ranges, recomputed as upstream's builder
+        // would from the stored tree, are the plaintext's.
+        let recomputed =
+            CalendarEventData::new(sealed.content.data.event.clone(), Tz::Floating, 100);
+        assert_eq!(recomputed.time_ranges, plain.content.data.time_ranges);
+    }
+
+    /// Review M1: the drain's merge keeps the stored classification as an
+    /// ordinary account's `commit_itip_merge` does, for every stored value,
+    /// a sealed non-standard one included.
+    #[test]
+    fn the_merge_keeps_the_classification_an_ordinary_account_keeps() {
+        use crate::calendar::seal::{ZaKeyDomain, seal_event};
+        use common::storage::index::SplitObject;
+        use vault::{keys::Secret, session::SessionKeys};
+        let stored_tree = |class: &str| {
+            parse(&format!(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\nUID:class-2\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990105T090000Z\r\nDTEND:20990105T100000Z\r\nSEQUENCE:0\r\nCLASS:{class}\r\nORGANIZER:mailto:org@example.com\r\nATTENDEE;PARTSTAT=ACCEPTED:mailto:att@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+            ))
+        };
+        let incoming = |class: Option<&str>| {
+            let class = class.map_or(String::new(), |class| format!("CLASS:{class}\r\n"));
+            parse(&format!(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:class-2\r\nDTSTAMP:20240102T000000Z\r\nDTSTART:20990105T100000Z\r\nDTEND:20990105T110000Z\r\nSEQUENCE:1\r\n{class}ORGANIZER:mailto:org@example.com\r\nATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:att@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+            ))
+        };
+        let attendee = vec!["att@example.com".to_string()];
+        let policy = || RecipientPolicy {
+            visibility: crate::scheduling::recipient::AttendeeVisibility::All,
+            max_recipients: usize::MAX,
+            max_instances: usize::MAX,
+        };
+        let merge = |stored: &ICalendar, itip: &ICalendar| {
+            let mut merged = stored.clone();
+            let MergeResult::Actions(changes) = itip_process_message(
+                stored,
+                itip_snapshot(stored, &attendee, false).unwrap(),
+                itip,
+                itip_snapshot(itip, &attendee, false).unwrap(),
+                "org@example.com".into(),
+                policy(),
+            )
+            .unwrap() else {
+                panic!("no merge");
+            };
+            itip_merge_changes(&mut merged, itip, changes).unwrap();
+            merged
+        };
+        let row_flags = |tree: &ICalendar| {
+            let content = CalendarEventContent {
+                data: CalendarEventData::new(tree.clone(), Tz::Floating, 100),
+                ..Default::default()
+            };
+            let mut meta = CalendarEvent::default();
+            meta.refresh_from_content(&content, ());
+            meta.flags
+        };
+        let keys = SessionKeys::new(9, 1, Secret::random());
+        let domain = ZaKeyDomain::owner(&keys);
+        for class in ["PUBLIC", "PRIVATE", "CONFIDENTIAL", "X-SOMETHING"] {
+            for update in [None, Some("PUBLIC"), Some("PRIVATE"), Some("X-OTHER")] {
+                let stored = stored_tree(class);
+                let itip = incoming(update);
+                // An ordinary account: upstream's merge, the classification
+                // read from the row's flags over the plaintext tree.
+                let mut ordinary = merge(&stored, &itip);
+                keep_classification(&mut ordinary, EventPrivacy::from_flags(row_flags(&stored)));
+                // A key account: the drain, on the unsealed stored tree.
+                let mut sealed = ZaEvent::new(
+                    CalendarEvent {
+                        names: vec![DavName {
+                            name: "e.ics".into(),
+                            parent_id: 1,
+                        }],
+                        ..Default::default()
+                    },
+                    CalendarEventContent {
+                        data: CalendarEventData::new(stored.clone(), Tz::Floating, 100),
+                        ..Default::default()
+                    },
+                );
+                seal_event(&mut sealed, &keys, 9, None).unwrap();
+                let mut sealed_row = CalendarEvent::default();
+                sealed_row.refresh_from_content(&sealed.content, ());
+                unseal_event_in_domain(&mut sealed, &domain).unwrap();
+                let privacy = stored_classification(&sealed.content.data.event);
+                assert_eq!(privacy, EventPrivacy::from_flags(row_flags(&stored)));
+                if class == "X-SOMETHING" {
+                    // The sealed row reads public: the flags are not the
+                    // stored classification's source (review M1).
+                    assert!(EventPrivacy::from_flags(sealed_row.flags).is_public());
+                    assert!(!privacy.is_public());
+                }
+                let mut drained = merge(&sealed.content.data.event, &itip);
+                keep_classification(&mut drained, privacy);
+                assert_eq!(drained, ordinary, "{class} <- {update:?}");
+                // The flags upstream derives from what each stores agree,
+                // except for the recorded limit: a non-standard value stays
+                // sealed, so the sealed row's flags are clear.
+                let mut stored_sealed = ZaEvent::new(sealed.meta.clone(), {
+                    let mut content = sealed.content.clone();
+                    content.data.event = drained.clone();
+                    content
+                });
+                seal_event(&mut stored_sealed, &keys, 9, None).unwrap();
+                let mut meta = CalendarEvent::default();
+                meta.refresh_from_content(&stored_sealed.content, ());
+                let expected = if drained.privacy() != EventPrivacy::Public
+                    && drained.to_string().contains("CLASS:X-")
+                {
+                    0
+                } else {
+                    row_flags(&ordinary)
+                        & (crate::calendar::EVENT_PRIVATE | crate::calendar::EVENT_SECRET)
+                };
+                assert_eq!(
+                    meta.flags & (crate::calendar::EVENT_PRIVATE | crate::calendar::EVENT_SECRET),
+                    expected,
+                    "{class} <- {update:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn standard_class_stays_visible_and_derives_the_flags() {
+        use crate::calendar::{EVENT_PRIVATE, EVENT_SECRET};
+        use common::storage::index::SplitObject;
+        for (class, private, secret) in [
+            ("PUBLIC", false, false),
+            ("PRIVATE", true, false),
+            ("CONFIDENTIAL", false, true),
+            // The recorded limit: a non-standard value is sealed, so the
+            // stored tree reads as public and both flags stay clear.
+            ("X-SOMETHING", false, false),
+        ] {
+            let (_, mut sealed) = merged_and_sealed(
+                &format!(
+                    "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\nUID:class-1\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990105T090000Z\r\nDTEND:20990105T100000Z\r\nSEQUENCE:0\r\nCLASS:{class}\r\nORGANIZER:mailto:org@example.com\r\nATTENDEE;PARTSTAT=ACCEPTED:mailto:att@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+                ),
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:class-1\r\nDTSTAMP:20240102T000000Z\r\nDTSTART:20990105T100000Z\r\nDTEND:20990105T110000Z\r\nSEQUENCE:1\r\nORGANIZER:mailto:org@example.com\r\nATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:att@example.com\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+            );
+            let dump = sealed.content.data.event.to_string();
+            assert_eq!(
+                dump.contains(&format!("CLASS:{class}")),
+                class != "X-SOMETHING",
+                "{class}: {dump}"
+            );
+            let content = std::mem::take(&mut sealed.content);
+            sealed.meta.refresh_from_content(&content, ());
+            assert_eq!(sealed.meta.flags & EVENT_PRIVATE != 0, private, "{class}");
+            assert_eq!(sealed.meta.flags & EVENT_SECRET != 0, secret, "{class}");
+        }
     }
 
     #[test]
@@ -1926,6 +2404,72 @@ mod tests {
             candidates
                 .iter()
                 .any(|candidate| candidate.sent_by.as_deref() == Some("writer1@example.com"))
+        );
+    }
+
+    /// Spec 10: the drain traces a fixed name per `ItipError`, never the
+    /// error's payload; `SenderIsNotParticipant` and `UnknownParticipant`
+    /// carry an address, which upstream's `to_string()` would trace. Every
+    /// variant has its own name.
+    #[test]
+    fn itip_reasons_are_fixed_names_without_payload() {
+        let canary = "drain-reason-canary@example.com";
+        let errors = [
+            ItipError::NoSchedulingInfo,
+            ItipError::OtherSchedulingAgent,
+            ItipError::NotOrganizer,
+            ItipError::NotOrganizerNorAttendee,
+            ItipError::NothingToSend,
+            ItipError::MissingUid,
+            ItipError::MultipleUid,
+            ItipError::MultipleOrganizer,
+            ItipError::MultipleObjectTypes,
+            ItipError::MultipleObjectInstances,
+            ItipError::CannotModifyProperty(ICalendarProperty::Summary),
+            ItipError::CannotModifyInstance,
+            ItipError::CannotModifyAddress,
+            ItipError::OrganizerMismatch,
+            ItipError::MissingMethod,
+            ItipError::InvalidComponentType,
+            ItipError::OutOfSequence,
+            ItipError::OrganizerIsLocalAddress,
+            ItipError::SenderIsNotOrganizerNorAttendee,
+            ItipError::SenderIsNotOrganizer,
+            ItipError::SenderIsNotParticipant(canary.to_string()),
+            ItipError::UnknownParticipant(canary.to_string()),
+            ItipError::UnsupportedMethod(ICalendarMethod::Publish),
+            ItipError::ICalendarParseError,
+            ItipError::EventNotFound,
+            ItipError::EventTooLarge,
+            ItipError::QuotaExceeded,
+            ItipError::NoDefaultCalendar,
+            ItipError::AutoAddDisabled,
+            ItipError::TooManyRecipients,
+        ];
+        let mut names = AHashSet::new();
+        for err in &errors {
+            let name = itip_reason(err);
+            assert!(
+                !name.is_empty() && name.chars().all(|c| c.is_ascii_alphabetic()),
+                "{name:?} is not a bare variant name"
+            );
+            assert!(!name.contains("canary") && !name.contains('@'));
+            assert!(names.insert(name), "{name} names two variants");
+        }
+        assert_eq!(names.len(), errors.len());
+        assert_eq!(
+            itip_reason(&ItipError::SenderIsNotParticipant(canary.to_string())),
+            "SenderIsNotParticipant"
+        );
+        assert_eq!(
+            itip_reason(&ItipError::UnknownParticipant(canary.to_string())),
+            "UnknownParticipant"
+        );
+        assert!(
+            ItipError::UnknownParticipant(canary.to_string())
+                .to_string()
+                .contains(canary),
+            "the control: upstream's text carries the address"
         );
     }
 }

@@ -66,7 +66,6 @@ async fn sieve_scripts() {
                 else_: "'foobar.org'".into(),
                 ..Default::default()
             },
-            duplicate_expiry: (86_400u64 * 100 * 7).into(),
             max_cpu_cycles: 10000,
             max_nested_includes: 5,
             max_out_messages: 5,
@@ -80,7 +79,7 @@ async fn sieve_scripts() {
             namespace: "sql".into(),
             store: LookupStore::Sqlite(SqliteStore {
                 path: format!("{}/smtp_sieve.db", test.tmp_dir()),
-                pool_max_connections: 10,
+                pool_max_connections: Some(10),
                 pool_workers: None,
             }),
         })
@@ -215,7 +214,7 @@ async fn sieve_scripts() {
             .set_variable("from", "john.doe@example.org")
             .with_envelope(&test.server, &session, 0)
             .await;
-        match test.server.run_script(name.into(), script, params).await {
+        match test.server.run_script(name.into(), &script, params).await {
             ScriptResult::Accept { .. } => (),
             ScriptResult::Reject(message) => panic!("{}", message),
             err => {
@@ -258,7 +257,7 @@ async fn sieve_scripts() {
 
         match test
             .server
-            .run_script("spamtest_include".into(), spamtest_script.clone(), params)
+            .run_script("spamtest_include".into(), &spamtest_script, params)
             .await
         {
             ScriptResult::Reject(message) => {

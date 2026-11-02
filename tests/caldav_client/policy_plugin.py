@@ -47,7 +47,8 @@ def pytest_collection_modifyitems(session, config, items):
         record = policy["outcomes"].get(_keys[item.nodeid], {})
         if record.get("outcome") == "xfailed":
             failure = record.get("failure", {})
-            if not failure.get("file") or not isinstance(failure.get("line"), int):
+            if not failure.get("file") or not isinstance(failure.get("line", failure.get("lines")),
+                                                          (int, list)):
                 raise pytest.UsageError("Expected failure must name its observed source location")
             _records[item.nodeid] = record
 
@@ -61,15 +62,28 @@ def pytest_runtest_makereport(item, call):
     if report.when != "call" or record is None:
         return
     if report.passed:
+        # A non-strict expected failure (ruling 167) may pass; a strict one may not.
+        if record.get("strict", True) is False:
+            return
         report.outcome = "failed"
         report.longrepr = "XPASS: stale compatibility policy: " + record["reason"]
     elif report.failed and call.excinfo is not None:
         exception_types = {"AssertionError": AssertionError,
-                           "DeprecationWarning": DeprecationWarning}
-        entry = call.excinfo.traceback[-1]
+                           "DeprecationWarning": DeprecationWarning,
+                           "Failed": pytest.fail.Exception}
+        # Leave out pytest's own hidden frames (pytest.fail's), as its report does.
+        traceback = call.excinfo.traceback.filter(call.excinfo)
+        entry = traceback[-1]
         failure = record["failure"]
-        location_matches = (str(entry.path).endswith("/" + failure["file"])
-                            and entry.lineno + 1 == failure["line"])
+
+        def at(entry, location):
+            lines = location["lines"] if "lines" in location else [location["line"]]
+            return (str(entry.path).endswith("/" + location["file"])
+                    and entry.lineno + 1 in lines)
+
+        # `via`, when recorded, is the caller of the failing frame.
+        location_matches = at(entry, failure) and (
+            "via" not in failure or (len(traceback) > 1 and at(traceback[-2], failure["via"])))
         if call.excinfo.type is exception_types[record["exception"]] and location_matches:
             report.outcome = "skipped"
             report.longrepr = (str(entry.path), entry.lineno + 1, record["reason"])

@@ -172,7 +172,7 @@ fn dns_server(protocol: IpProtocol) -> DnsServer {
         member_tenant_id: None,
         timeout: Duration::from_millis(10_000),
         ttl: Duration::from_millis(60_000),
-        polling_interval: Duration::from_millis(100),
+        poll_interval: Duration::from_millis(100),
         propagation_timeout: Duration::from_millis(10_000),
         propagation_delay: None,
     })

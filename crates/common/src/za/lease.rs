@@ -12,22 +12,24 @@
 //! lease was taken over therefore cannot commit; the duration only decides
 //! how long a crashed holder blocks others.
 //!
-//! The key lives in the data store as an in-memory-class key, written
-//! through `Server::store()` the way `try_lock` writes one when the
-//! in-memory store is the data store, and never through the in-memory store
-//! dispatch: the fenced commit needs the lease and the event in one
-//! transaction. The generic `purge_in_memory_store` skips the
-//! `KV_LOCK_ZA_UID` range, since its unconditional clear would delete a
-//! replacement lease; `sweep_expired_uid_leases` (spec 6.3 step 4), run by
-//! the maintenance task's purge step, is the only cleanup of lease keys and
-//! clears each expired lease with an assertion on the value it read.
+//! The key lives in the data store, written through `Server::store()` and
+//! never through the in-memory store: the fenced commit needs the lease and
+//! the event in one transaction. At 1.0 (ruling 24) it is a
+//! `ValueClass::Any` key in `Subspace::System` whose first byte is
+//! `store::ZA_UID_LEASE_PREFIX`. That subspace otherwise holds only the
+//! schema version (key `0x00`) and the cluster's node-id leases
+//! (`0x01 || node id`), and no upstream purge, account destruction,
+//! change-log truncation or search-queue clear reaches it, so
+//! `sweep_expired_uid_leases` (spec 6.3 step 4), run by the maintenance
+//! task's purge step, is the only cleanup of lease keys; it clears each
+//! expired lease with an assertion on the value it read.
 
-use crate::{KV_LOCK_ZA_UID, auth::vault::RawValue};
+use crate::auth::vault::RawValue;
 use sha2::{Digest, Sha256};
 use std::{sync::LazyLock, time::Duration};
 use store::{
-    IterateParams, Store, U64_LEN, ValueKey, rand,
-    write::{BatchBuilder, InMemoryClass, ValueClass, assert::AssertValue, now},
+    IterateParams, Store, Subspace, U64_LEN, ValueKey, ZA_UID_LEASE_PREFIX, rand,
+    write::{AnyClass, BatchBuilder, ValueClass, assert::AssertValue, now},
 };
 use trc::AddContext;
 use xxhash_rust::xxh3::xxh3_64;
@@ -67,11 +69,11 @@ pub fn lease_secs() -> u64 {
     *LEASE_SECS
 }
 
-/// `KV_LOCK_ZA_UID || account_id (u32 BE) || SHA-256(uid)`: fixed length
-/// whatever the UID.
+/// `ZA_UID_LEASE_PREFIX || account_id (u32 BE) || SHA-256(uid)`: fixed
+/// length whatever the UID.
 pub fn lease_key(account_id: u32, uid: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(LEASE_KEY_LEN);
-    key.push(KV_LOCK_ZA_UID);
+    key.push(ZA_UID_LEASE_PREFIX);
     key.extend_from_slice(&account_id.to_be_bytes());
     key.extend_from_slice(Sha256::digest(uid.as_bytes()).as_slice());
     key
@@ -81,8 +83,8 @@ pub fn lease_key(account_id: u32, uid: &str) -> Vec<u8> {
 /// iterates it).
 pub fn lease_key_range() -> (ValueKey<ValueClass>, ValueKey<ValueClass>) {
     (
-        ValueKey::from(lease_class(vec![KV_LOCK_ZA_UID])),
-        ValueKey::from(lease_class(vec![KV_LOCK_ZA_UID + 1])),
+        ValueKey::from(lease_class(vec![ZA_UID_LEASE_PREFIX])),
+        ValueKey::from(lease_class(vec![ZA_UID_LEASE_PREFIX + 1])),
     )
 }
 
@@ -126,7 +128,7 @@ pub async fn clear_uid_leases(store: &Store, expired: Vec<(Vec<u8>, u64)>) -> tr
         let mut batch = BatchBuilder::new();
         batch.assert_value(lease_class(key.clone()), AssertValue::Hash(hash));
         batch.clear(lease_class(key));
-        match store.write(batch.build_all()).await {
+        match store.write_batch(&mut batch).await {
             Ok(_) => cleared += 1,
             Err(err) if err.is_assertion_failure() => {}
             Err(err) => return Err(err.caused_by(trc::location!())),
@@ -142,8 +144,14 @@ pub async fn sweep_expired_uid_leases(store: &Store) -> trc::Result<usize> {
     clear_uid_leases(store, expired).await
 }
 
+/// The subspace that holds every lease (ruling 24).
+pub const LEASE_SUBSPACE: Subspace = Subspace::System;
+
 fn lease_class(key: Vec<u8>) -> ValueClass {
-    ValueClass::InMemory(InMemoryClass::Key(key))
+    ValueClass::Any(AnyClass {
+        subspace: LEASE_SUBSPACE,
+        key,
+    })
 }
 
 /// A held lease: its key and this holder's exact value
@@ -194,7 +202,7 @@ impl ZaUidLease {
                 },
             );
             batch.set(lease_class(key.clone()), value.clone());
-            match store.write(batch.build_all()).await {
+            match store.write_batch(&mut batch).await {
                 Ok(_) => return Ok(Some(ZaUidLease { key, value })),
                 Err(err) if err.is_assertion_failure() => continue,
                 Err(err) => return Err(err.caused_by(trc::location!())),
@@ -227,7 +235,7 @@ impl ZaUidLease {
             AssertValue::Hash(xxh3_64(&self.value)),
         );
         batch.clear(lease_class(self.key.clone()));
-        let err = match store.write(batch.build_all()).await {
+        let err = match store.write_batch(&mut batch).await {
             Ok(_) => return true,
             Err(err) => err,
         };
@@ -301,7 +309,7 @@ impl Drop for ZaUidLeaseGuard {
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
-    use store::{InMemoryStore, backend::ephemeral::EphemeralStore, dispatch::lookup::KeyValue};
+    use store::backend::ephemeral::EphemeralStore;
 
     async fn stored(store: &Store, account_id: u32, uid: &str) -> Option<Vec<u8>> {
         store
@@ -314,7 +322,7 @@ mod tests {
     async fn write_raw(store: &Store, account_id: u32, uid: &str, value: Vec<u8>) {
         let mut batch = BatchBuilder::new();
         batch.set(lease_class(lease_key(account_id, uid)), value);
-        store.write(batch.build_all()).await.unwrap();
+        store.write_batch(&mut batch).await.unwrap();
     }
 
     fn expired_value(fence: u8) -> Vec<u8> {
@@ -332,14 +340,14 @@ mod tests {
             lease_class(b"za-lease-test-payload".to_vec()),
             vec![0xFF; 8],
         );
-        store.write(batch.build_all()).await.map(|_| ())
+        store.write_batch(&mut batch).await.map(|_| ())
     }
 
     #[test]
     fn lease_key_is_fixed_length_and_binds_account_and_uid() {
         let key = lease_key(7, "uid-a");
         assert_eq!(key.len(), LEASE_KEY_LEN);
-        assert_eq!(key[0], KV_LOCK_ZA_UID);
+        assert_eq!(key[0], ZA_UID_LEASE_PREFIX);
         assert_eq!(&key[1..5], &7u32.to_be_bytes());
         assert_eq!(&key[5..], Sha256::digest(b"uid-a").as_slice());
         assert_ne!(key, lease_key(7, "uid-b"));
@@ -372,7 +380,7 @@ mod tests {
         // Plan 10's sweep removed the expired key after the commit.
         let mut batch = BatchBuilder::new();
         batch.clear(lease_class(lease_key(5, "purged")));
-        store.write(batch.build_all()).await.unwrap();
+        store.write_batch(&mut batch).await.unwrap();
         assert!(
             lease.release(&store).await,
             "an absent key is already released"
@@ -380,9 +388,11 @@ mod tests {
         assert!(stored(&store, 5, "purged").await.is_none());
     }
 
-    /// The generic in-memory purge clears expired keys without an
-    /// assertion, so it would delete a replacement lease taken between its
-    /// scan and its clear; it skips the lease range (PR #35 review).
+    /// The generic purge must not clear lease keys without an assertion, or
+    /// it would delete a replacement lease taken between its scan and its
+    /// clear (PR #35 review). At 1.0 (ruling 24) the generic purge is
+    /// `Store::purge_store`, which clears zero counters; the lease subspace
+    /// holds none, and the control shows the purge ran.
     #[tokio::test]
     async fn the_generic_purge_leaves_lease_keys() {
         let store = EphemeralStore::open();
@@ -391,17 +401,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let control = KeyValue::<()>::build_key(25, b"za-purge-control");
-        let mut value = (now() - 1).to_be_bytes().to_vec();
-        value.extend_from_slice(b"payload");
+        let control = ValueClass::Any(AnyClass {
+            subspace: Subspace::Counter,
+            key: b"za-purge-control".to_vec(),
+        });
         let mut batch = BatchBuilder::new();
-        batch.set(lease_class(control.clone()), value);
-        store.write(batch.build_all()).await.unwrap();
+        batch.set(control.clone(), 0i64.to_le_bytes().to_vec());
+        store.write_batch(&mut batch).await.unwrap();
 
-        InMemoryStore::from(store.clone())
-            .purge_in_memory_store()
-            .await
-            .unwrap();
+        store.purge_store().await.unwrap();
 
         assert!(
             stored(&store, 9, "stale").await.is_some(),
@@ -413,11 +421,11 @@ mod tests {
         );
         assert!(
             store
-                .get_value::<RawValue>(ValueKey::from(lease_class(control)))
+                .get_value::<RawValue>(ValueKey::from(control))
                 .await
                 .unwrap()
                 .is_none(),
-            "the purge kept an expired key of another prefix"
+            "the purge kept a zero counter"
         );
         assert!(commit_fenced(&store, &live).await.is_ok());
         assert!(live.release(&store).await);

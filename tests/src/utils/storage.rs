@@ -4,9 +4,10 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::utils::cleanup::{search_store_destroy, store_assert_is_empty_except_vaults};
+use crate::utils::cleanup::{search_store_destroy, store_assert_is_empty_except_account_state};
 use crate::utils::registry::UnwrapRegistryId;
-use common::Server;
+use ahash::AHashSet;
+use common::{Server, storage::search::SearchIndexStatus};
 use registry::schema::structs::{Task, TaskStatus};
 use registry::{
     schema::{
@@ -24,8 +25,8 @@ use registry::{
 };
 use store::write::now;
 use store::{
-    Deserialize, IterateParams, ValueKey,
-    write::{TaskQueueClass, ValueClass},
+    Deserialize, IterateParams, Subspace, U32_LEN, ValueKey,
+    write::{AnyKey, SearchIndex, SearchIndexClass, TaskId, TaskQueueClass, ValueClass},
 };
 use store::{RegistryStore, registry::write::RegistryWrite};
 
@@ -129,13 +130,13 @@ async fn build_blob_store(typ: BlobStoreType, path: &str) -> BlobStore {
         BlobStoreType::S3 => {
             crate::utils::containers::ensure_minio().await;
             BlobStore::S3(S3Store {
-                access_key: PublicStringOptional::Value(PublicStringValue {
+                access_key_id: PublicStringOptional::Value(PublicStringValue {
                     value: "minioadmin".into(),
                 }),
                 bucket: "stalwart".into(),
                 region: S3StoreRegion::Custom(S3StoreCustomRegion {
-                    custom_endpoint: "http://localhost:9000".into(),
-                    custom_region: "eu-central-1".into(),
+                    url: "http://localhost:9000".into(),
+                    region: "eu-central-1".into(),
                 }),
                 secret_key: SecretKeyOptional::Value(SecretKeyValue {
                     secret: "minioadmin".into(),
@@ -199,6 +200,18 @@ async fn build_search_store(typ: SearchStoreType, _path: &str) -> SearchStore {
     }
 }
 
+/// Waits until the task queue and the search index queue hold nothing more
+/// to run.
+///
+/// - Scheduled tasks (`TaskQueueClass::Task`): a task due later is skipped
+///   with `skip_not_due`, a failed one with `skip_permanent_failures`.
+/// - The search index queue (subspace `SearchQueue`): its entries
+///   (`SearchIndexClass::Queue`), the markers of the partitions that hold
+///   queued work (`QueueIndex`, set when an entry is queued and cleared when
+///   the partition drains) and the status keys of failed partitions
+///   (`QueueStatus`, written while they wait for a retry). A partition whose
+///   retry is due later is skipped with `skip_not_due`, entries included. The
+///   index queue has no permanent failure: a failed partition is retried.
 pub async fn wait_for_tasks(server: &Server, skip_not_due: bool, skip_permanent_failures: bool) {
     let mut count = 0;
     loop {
@@ -209,8 +222,12 @@ pub async fn wait_for_tasks(server: &Server, skip_not_due: bool, skip_permanent_
             .data
             .iterate(
                 IterateParams::new(
-                    ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task { id: 0 })),
-                    ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task { id: u64::MAX })),
+                    ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task {
+                        id: TaskId::Assigned(0),
+                    })),
+                    ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task {
+                        id: TaskId::Assigned(u64::MAX),
+                    })),
                 )
                 .ascending(),
                 |_, value| {
@@ -229,10 +246,18 @@ pub async fn wait_for_tasks(server: &Server, skip_not_due: bool, skip_permanent_
             .await
             .unwrap();
 
+        let pending_index = pending_search_index_partitions(server, skip_not_due).await;
+
         if let Some(task) = has_index_tasks {
             count += 1;
             if count % 10 == 0 {
                 println!("Waiting for pending task {:?}...", task);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        } else if !pending_index.is_empty() {
+            count += 1;
+            if count % 10 == 0 {
+                println!("Waiting for search index partitions {:?}...", pending_index);
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         } else {
@@ -241,27 +266,113 @@ pub async fn wait_for_tasks(server: &Server, skip_not_due: bool, skip_permanent_
     }
 }
 
+/// The search index partitions, as (index, partition), that still hold
+/// queue entries, a queued-work marker or a failure status.
+async fn pending_search_index_partitions(
+    server: &Server,
+    skip_not_due: bool,
+) -> Vec<(SearchIndex, u32)> {
+    let mut pending: AHashSet<(SearchIndex, u32)> = AHashSet::new();
+    let mut deferred: AHashSet<(SearchIndex, u32)> = AHashSet::new();
+    let now = now();
+
+    server
+        .core
+        .storage
+        .data
+        .iterate(
+            IterateParams::new(
+                AnyKey {
+                    subspace: Subspace::SearchQueue,
+                    key: vec![0u8],
+                },
+                AnyKey {
+                    subspace: Subspace::SearchQueue,
+                    key: vec![u8::MAX; 16],
+                },
+            )
+            .ascending(),
+            |key, value| {
+                let partition = if key.first() == Some(&SearchIndexClass::QUEUE_CONTROL) {
+                    // Control keys: QUEUE_CONTROL, index, partition, kind
+                    let index = key.get(1).copied().and_then(SearchIndex::try_from_u8);
+                    let partition = key
+                        .get(2..2 + U32_LEN)
+                        .and_then(|bytes| bytes.try_into().ok())
+                        .map(u32::from_be_bytes);
+                    let kind = key.get(2 + U32_LEN).copied();
+                    match (index, partition, kind) {
+                        (Some(index), Some(partition), Some(kind)) => {
+                            if kind == SearchIndexClass::CONTROL_STATUS
+                                && skip_not_due
+                                && SearchIndexStatus::deserialize(value)?.next_retry > now
+                            {
+                                deferred.insert((index, partition));
+                            }
+                            (index, partition)
+                        }
+                        _ => panic!("Unexpected search index queue control key {key:?}"),
+                    }
+                } else {
+                    // Queue entries: index, id prefix, id suffix, created at
+                    let index = key.first().copied().and_then(SearchIndex::try_from_u8);
+                    let id_prefix = key
+                        .get(1..1 + U32_LEN)
+                        .and_then(|bytes| bytes.try_into().ok())
+                        .map(u32::from_be_bytes);
+                    match (index, id_prefix) {
+                        (Some(index), Some(id_prefix)) => {
+                            (index, SearchIndexClass::queue_partition(index, id_prefix))
+                        }
+                        _ => panic!("Unexpected search index queue key {key:?}"),
+                    }
+                };
+                pending.insert(partition);
+
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+
+    pending
+        .into_iter()
+        .filter(|partition| !deferred.contains(partition))
+        .collect()
+}
+
 pub async fn assert_is_empty(server: &Server, include_registry: bool) {
     // Wait for pending index tasks
     wait_for_tasks(server, false, false).await;
 
     // Assert is empty
-    let vault_accounts = store_assert_is_empty_except_vaults(
+    let account_state = store_assert_is_empty_except_account_state(
         server.store(),
         server.core.storage.blob.clone(),
         include_registry,
     )
     .await;
-    for account_id in vault_accounts {
-        assert!(
-            server
-                .registry()
-                .object::<registry::schema::structs::Account>(account_id.into())
-                .await
-                .unwrap()
-                .is_some(),
-            "Found a zero-access vault or pin record of destroyed account {account_id}"
-        );
+    for (account_ids, what) in [
+        (
+            &account_state.vault_accounts,
+            "a zero-access vault or pin record",
+        ),
+        (
+            &account_state.share_notification_accounts,
+            "share notifications",
+        ),
+    ] {
+        for &account_id in account_ids {
+            assert!(
+                server
+                    .registry()
+                    .object::<registry::schema::structs::Account>(account_id.into())
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "Found {what} of destroyed account {account_id}"
+            );
+        }
     }
     search_store_destroy(server.search_store()).await;
 

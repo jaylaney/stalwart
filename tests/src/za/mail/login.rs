@@ -18,13 +18,16 @@ use crate::{
         imap::{ImapConnection, Type},
         pop3::{Pop3Connection, ResponseType as Pop3Reply},
         server::TestServer,
-        za::{Conn, bearer_token, code, totp_url, wait_for_delivery, za_app_password, za_post},
+        za::{
+            Conn, code, totp_url, wait_for_delivery, za_app_password, za_bearer_token,
+            za_grant_token, za_post, za_revoke_grant,
+        },
     },
     za::STRONG,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use common::{
-    auth::credential::AppPassword,
+    auth::{credential::AppPassword, oauth::scope::OAuthScopes},
     za::{ZA_MAIL_LOGIN_REFUSED, ZA_TRACE_MAIL_LOGIN},
 };
 use imap_proto::ResponseType;
@@ -85,7 +88,7 @@ pub async fn test(test: &mut TestServer) {
 fn baseline(test: &TestServer, id: u32) -> usize {
     let caches = &test.server.inner.cache;
     caches.za_keys.remove_account(id);
-    caches.http_auth.clear();
+    caches.grant_revocations.clear(&caches.http_auth);
     live_keys(id)
 }
 
@@ -212,7 +215,7 @@ async fn pop3_logins(test: &TestServer, id: u32, app: &str) {
 
 async fn keyless_mechanisms_are_refused(test: &TestServer, id: u32) {
     println!("keyless_mechanisms_are_refused");
-    let token = bearer_token(NAME, STRONG).await;
+    let token = za_bearer_token(&test.server, NAME).await;
     let base = baseline(test, id);
     let oauthbearer = STANDARD.encode(format!("n,a={NAME},\u{1}auth=Bearer {token}\u{1}\u{1}"));
     let xoauth2 = STANDARD.encode(format!("user={NAME}\u{1}auth=Bearer {token}\u{1}\u{1}"));
@@ -256,7 +259,7 @@ async fn keyless_mechanisms_are_refused(test: &TestServer, id: u32) {
 
     // Control: an ordinary account's Bearer login takes upstream's path.
     let plain = test.account("plain@example.com");
-    let token = bearer_token(plain.name(), plain.secret()).await;
+    let (grant_id, token) = za_grant_token(&test.server, plain.name(), OAuthScopes::ALL).await;
     let oauthbearer = STANDARD.encode(format!(
         "n,a={},\u{1}auth=Bearer {token}\u{1}\u{1}",
         plain.name()
@@ -269,6 +272,7 @@ async fn keyless_mechanisms_are_refused(test: &TestServer, id: u32) {
     )
     .await;
     imap.exchange("p2 LOGOUT\r\n", "p2 OK").await;
+    za_revoke_grant(&test.server, grant_id).await;
 }
 
 /// Ruling R49 of plan 13: each keyless login refusal of the key account
@@ -297,7 +301,7 @@ async fn assert_login_refusals_traced(traced: Traced, id: u32, expected: usize, 
 /// on IMAP and on POP3 (both count against `core.imap.max_auth_failures`).
 async fn refusals_are_not_auth_failures(test: &TestServer, id: u32) {
     println!("refusals_are_not_auth_failures");
-    let token = bearer_token(NAME, STRONG).await;
+    let token = za_bearer_token(&test.server, NAME).await;
     let base = baseline(test, id);
     let refusals = test.server.core.imap.max_auth_failures + 1;
     let oauthbearer = STANDARD.encode(format!("n,a={NAME},\u{1}auth=Bearer {token}\u{1}\u{1}"));

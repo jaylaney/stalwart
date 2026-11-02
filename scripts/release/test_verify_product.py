@@ -19,11 +19,99 @@ SOURCE = "a" * 40
 METADATA = {"version": VERSION, "upstream_tag": "v0.16.26", "upstream_commit": UPSTREAM}
 
 
-def identity(source=SOURCE, state="clean"):
+def identity(source=SOURCE, state="clean", upstream=UPSTREAM):
     return (
-        f"Stalwart Server fork v{VERSION} (upstream v0.16.26 {UPSTREAM}; "
+        f"Stalwart Server fork v{VERSION} (upstream v0.16.26 {upstream}; "
         f"source {source}; {state})"
     )
+
+
+def git(root, *args):
+    return subprocess.check_output(
+        ["git", "-C", str(root), "-c", "user.name=Fixture", "-c",
+         "user.email=fixture@example.invalid", *args], text=True,
+    ).strip()
+
+
+def commit(root, message):
+    (root / "history.txt").write_text(message + "\n")
+    git(root, "add", "history.txt")
+    git(root, "commit", "-qm", message)
+    return git(root, "rev-parse", "HEAD")
+
+
+class VerifyUpstreamTests(unittest.TestCase):
+    """Final review D7: a stale or inconsistent upstream pin is refused."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name) / "fork"
+        self.root.mkdir()
+        git(self.root, "init", "-q", "-b", "main")
+        self.old = commit(self.root, "upstream old")
+        git(self.root, "tag", "v1.0.0")
+        self.new = commit(self.root, "upstream new")
+        git(self.root, "tag", "-a", "-m", "annotated", "v1.1.0")
+        self.source = commit(self.root, "fork")
+        git(self.root, "checkout", "-q", "-b", "side", self.old)
+        self.side = commit(self.root, "unmerged upstream")
+        git(self.root, "checkout", "-q", "main")
+        pinned = patch.dict(verify_product.PINNED_UPSTREAM_TAGS, clear=True)
+        pinned.start()
+        self.addCleanup(pinned.stop)
+
+    def verify(self, tag, upstream, source=None):
+        verify_product.verify_upstream(
+            self.root, {"upstream_tag": tag, "upstream_commit": upstream},
+            source or self.source,
+        )
+
+    def test_the_latest_merged_tag_passes(self):
+        self.verify("v1.1.0", self.new)
+
+    def test_a_tag_that_names_another_commit_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "names"):
+            self.verify("v1.1.0", self.old)
+
+    def test_a_commit_outside_the_source_history_is_refused(self):
+        git(self.root, "tag", "v1.2.0", self.side)
+        with self.assertRaisesRegex(ValueError, "not an ancestor"):
+            self.verify("v1.2.0", self.side)
+
+    def test_a_stale_pin_is_refused(self):
+        # Consistent and in the history, but a later upstream release is merged.
+        with self.assertRaisesRegex(ValueError, "stale"):
+            self.verify("v1.0.0", self.old)
+        git(self.root, "tag", "-d", "v1.1.0")
+        self.verify("v1.0.0", self.old)
+        verify_product.PINNED_UPSTREAM_TAGS["v1.1.0"] = self.new
+        with self.assertRaisesRegex(ValueError, "stale"):
+            self.verify("v1.0.0", self.old)
+
+    def test_the_pinned_table_stands_in_for_a_missing_local_tag(self):
+        git(self.root, "tag", "-d", "v1.1.0")
+        with self.assertRaisesRegex(ValueError, "neither a local tag nor"):
+            self.verify("v1.1.0", self.new)
+        verify_product.PINNED_UPSTREAM_TAGS["v1.1.0"] = self.new
+        self.verify("v1.1.0", self.new)
+        verify_product.PINNED_UPSTREAM_TAGS["v1.1.0"] = self.old
+        with self.assertRaisesRegex(ValueError, "pinned tag"):
+            self.verify("v1.1.0", self.new)
+
+    def test_a_local_tag_and_the_pinned_table_must_agree(self):
+        verify_product.PINNED_UPSTREAM_TAGS["v1.1.0"] = self.old
+        with self.assertRaisesRegex(ValueError, "pinned tag"):
+            self.verify("v1.1.0", self.new)
+
+    def test_a_shallow_checkout_cannot_be_checked(self):
+        shallow = self.root.parent / "shallow"
+        subprocess.run(["git", "clone", "-q", "--depth", "1", "--no-local", str(self.root),
+                        str(shallow)], check=True)
+        self.root = shallow
+        verify_product.PINNED_UPSTREAM_TAGS["v1.1.0"] = self.new
+        with self.assertRaisesRegex(ValueError, "shallow"):
+            self.verify("v1.1.0", self.new)
 
 
 class VerifyProductTests(unittest.TestCase):
@@ -74,6 +162,11 @@ class VerifyProductTests(unittest.TestCase):
             with self.subTest(source=source), self.assertRaises(ValueError):
                 self.validate(source=source)
 
+    def test_the_real_pins_match_fork_release_metadata(self):
+        metadata = verify_product.load_metadata(Path(verify_product.__file__).parents[2])
+        self.assertEqual(verify_product.PINNED_UPSTREAM_TAGS.get(metadata["upstream_tag"]),
+                         metadata["upstream_commit"])
+
     def test_metadata_and_manifest_versions_must_match(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -93,14 +186,50 @@ class VerifyProductTests(unittest.TestCase):
                 verify_product.load_metadata(root)
 
     @staticmethod
-    def write_metadata(root):
+    def write_metadata(root, upstream=UPSTREAM):
         (root / "crates/main").mkdir(parents=True)
         (root / "fork-release.toml").write_text(
-            "".join(f'{key} = "{value}"\n' for key, value in METADATA.items())
+            "".join(f'{key} = "{value}"\n'
+                    for key, value in {**METADATA, "upstream_commit": upstream}.items())
         )
         (root / "crates/main/Cargo.toml").write_text(
             f'[package]\nname = "stalwart"\nversion = "{VERSION}"\n'
         )
+        (root / "crates/common").mkdir(parents=True)
+        (root / "crates/common/Cargo.toml").write_text(
+            '[package]\nname = "common"\nversion = "0.16.26"\n'
+        )
+
+    def test_the_upstream_tag_matches_the_internal_crate_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_metadata(root)
+            verify_product.verify_upstream_version(root, METADATA)
+
+    def test_a_stale_upstream_tag_left_on_a_newer_base_is_refused(self):
+        # The Task 9 review's M1: a 0.16.27 pin left unchanged on a 1.0.1 base, with no
+        # later upstream tag known to the other checks.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_metadata(root)
+            (root / "crates/common/Cargo.toml").write_text(
+                '[package]\nname = "common"\nversion = "1.0.1"\n'
+            )
+            stale = {**METADATA, "upstream_tag": "v0.16.27"}
+            with self.assertRaisesRegex(ValueError, "stale"):
+                verify_product.verify_upstream_version(root, stale)
+
+    def test_a_missing_internal_crate_version_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_metadata(root)
+            (root / "crates/common/Cargo.toml").write_text('[package]\nname = "common"\n')
+            with self.assertRaises(ValueError):
+                verify_product.verify_upstream_version(root, METADATA)
+
+    def test_the_real_upstream_tag_matches_the_internal_crates(self):
+        root = Path(verify_product.__file__).parents[2]
+        verify_product.verify_upstream_version(root, verify_product.load_metadata(root))
 
     def test_glibc_requirement_uses_numeric_version_order(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -122,8 +251,10 @@ class VerifyProductTests(unittest.TestCase):
     def test_cli_reads_help_on_stderr_without_config_and_writes_provenance(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            self.write_metadata(root)
             subprocess.run(["git", "init", "-q", str(root)], check=True)
+            upstream = commit(root, "upstream")
+            git(root, "tag", "v0.16.26")
+            self.write_metadata(root, upstream)
             subprocess.run(["git", "-C", str(root), "add", "."], check=True)
             subprocess.run(
                 ["git", "-C", str(root), "-c", "user.name=Fixture", "-c",
@@ -138,7 +269,7 @@ class VerifyProductTests(unittest.TestCase):
                 f"#!{sys.executable}\nimport os, sys\n"
                 "assert 'CONFIG_PATH' not in os.environ\n"
                 "stream = sys.stderr if sys.argv[1] == '--help' else sys.stdout\n"
-                f"print({identity(source)!r}, file=stream)\n"
+                f"print({identity(source, upstream=upstream)!r}, file=stream)\n"
             )
             binary.chmod(0o755)
             output = root / "stalwart.provenance.json"
@@ -155,7 +286,7 @@ class VerifyProductTests(unittest.TestCase):
             provenance = json.loads(output.read_text())
             self.assertEqual(provenance["source_commit"], source)
             self.assertEqual(provenance["fork_version"], VERSION)
-            self.assertEqual(provenance["upstream_commit"], UPSTREAM)
+            self.assertEqual(provenance["upstream_commit"], upstream)
             self.assertEqual(provenance["target"], "x86_64-unknown-linux-gnu")
             self.assertEqual(provenance["cpu_baseline"], "x86-64-v2")
             self.assertEqual(provenance["features"], ["rocks"])

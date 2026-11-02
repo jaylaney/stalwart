@@ -4,8 +4,9 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-//! Mail spec 8 and 5.5: a key account's search index holds the arrival time
-//! and the size only, so IMAP SEARCH, SORT and THREAD and JMAP Email/query,
+//! Mail spec 8 and 5.5: a key account's search index holds its messages' ids
+//! only (ruling 64; the arrival time and the size are served from the
+//! message cache), so IMAP SEARCH, SORT and THREAD and JMAP Email/query,
 //! Email/queryChanges and SearchSnippet/get serve what those fields (and the
 //! flags, mailboxes and threads) answer and refuse everything that needs a
 //! message's content, with a clear error and not an empty result. An
@@ -19,7 +20,7 @@ use crate::{
         imap::{AssertResult, ImapConnection, Type},
         jmap::JmapResponse,
         server::TestServer,
-        za::wait_for_delivery,
+        za::{search_keys, wait_for_delivery},
     },
     za::{STRONG, user_permissions},
 };
@@ -28,10 +29,7 @@ use email::mailbox::{DRAFTS_ID, INBOX_ID};
 use imap_proto::ResponseType;
 use mail_parser::DateTime;
 use serde_json::{Map, Value, json};
-use store::{
-    IterateParams, SUBSPACE_SEARCH_INDEX,
-    write::{AnyKey, SearchIndex, now},
-};
+use store::write::{SearchIndex, now};
 use trc::{EventType, ImapEvent, SecurityEvent};
 use types::id::Id;
 
@@ -378,6 +376,10 @@ fn refused_commands() -> Vec<(String, &'static str)> {
         "TEXT x",
         "TO x",
         "OR FROM x SEEN",
+        // Ruling 55: 1.0 sets the attachment keywords from the parsed
+        // message, which a key account's message never carries.
+        "KEYWORD $HasAttachment",
+        "UNKEYWORD $HasNoAttachment",
     ] {
         commands.push((format!("SEARCH {key}"), "* SEARCH"));
     }
@@ -753,18 +755,87 @@ async fn jmap_refused_filters_and_sorts(key: &Fixture, plain: &Fixture) {
             json!({ "sentBefore": "2030-01-01T00:00:00Z" }),
         ),
         ("sentAfter", json!({ "sentAfter": "2020-01-01T00:00:00Z" })),
+        // Ruling 57: 1.0's object-metadata conditions; a key account's
+        // message holds no object metadata.
+        (
+            "metadataExists",
+            json!({ "metadataExists": "za-search/key" }),
+        ),
+        // Ruling 55: the attachment keywords the server sets at ingest, in
+        // any case, which a key account's message never carries.
+        ("hasKeyword", json!({ "hasKeyword": "$hasattachment" })),
+        ("notKeyword", json!({ "notKeyword": "$HasNoAttachment" })),
+        (
+            "allInThreadHaveKeyword",
+            json!({ "allInThreadHaveKeyword": "$HASATTACHMENT" }),
+        ),
+        (
+            "someInThreadHaveKeyword",
+            json!({ "someInThreadHaveKeyword": "$hasnoattachment" }),
+        ),
+        (
+            "noneInThreadHaveKeyword",
+            json!({ "noneInThreadHaveKeyword": "$HasAttachment" }),
+        ),
     ];
-    let sorts = ["from", "to", "cc", "subject", "sentAt"];
+    // 1.0 sorts by no `cc` for any account (`EmailComparator::Cc` answers
+    // `unsupportedSort` upstream), so it is not a refusal of this rule.
+    let sorts = ["from", "to", "subject", "sentAt"]
+        .map(|property| {
+            (
+                property,
+                json!({ "property": property, "isAscending": true }),
+            )
+        })
+        .into_iter()
+        .chain([
+            // Ruling 55, as for the keyword filters.
+            (
+                "hasKeyword",
+                json!({
+                    "property": "hasKeyword",
+                    "keyword": "$HasAttachment",
+                    "isAscending": true,
+                }),
+            ),
+            (
+                "allInThreadHaveKeyword",
+                json!({
+                    "property": "allInThreadHaveKeyword",
+                    "keyword": "$hasnoattachment",
+                    "isAscending": true,
+                }),
+            ),
+            (
+                "someInThreadHaveKeyword",
+                json!({
+                    "property": "someInThreadHaveKeyword",
+                    "keyword": "$hasattachment",
+                    "isAscending": true,
+                }),
+            ),
+        ])
+        .collect::<Vec<_>>();
 
     for fixture in [key, plain] {
         let is_key = std::ptr::eq(fixture, key);
         let context = fixture.account.name();
         for (property, filter) in &filters {
+            // 1.0 reads object-metadata conditions only for a request that
+            // names the metadata capability.
             let reply = fixture
                 .account
-                .jmap_method_call(
-                    "Email/query",
-                    query_args(&fixture.account, Some(filter.clone()), None, false),
+                .jmap_request(
+                    &[
+                        "urn:ietf:params:jmap:core",
+                        "urn:ietf:params:jmap:mail",
+                        "urn:ietf:params:jmap:metadata",
+                    ],
+                    json!([[
+                        "Email/query",
+                        query_args(&fixture.account, Some(filter.clone()), None, false),
+                        "0"
+                    ]]),
                 )
                 .await;
             if is_key {
@@ -815,17 +886,12 @@ async fn jmap_refused_filters_and_sorts(key: &Fixture, plain: &Fixture) {
         } else {
             assert_eq!(reply.name_at(0), "Email/query", "{context}: {:?}", reply.0);
         }
-        for property in sorts {
+        for (property, sort) in &sorts {
             let reply = fixture
                 .account
                 .jmap_method_call(
                     "Email/query",
-                    query_args(
-                        &fixture.account,
-                        None,
-                        Some(json!([{ "property": property, "isAscending": true }])),
-                        false,
-                    ),
+                    query_args(&fixture.account, None, Some(json!([sort])), false),
                 )
                 .await;
             if is_key {
@@ -964,74 +1030,34 @@ async fn jmap_refused_filters_and_sorts(key: &Fixture, plain: &Fixture) {
     }
 }
 
-/// What the account's Email search records hold: the documents' ids, the
-/// term and the field entries (`store/src/write/key.rs`: the class byte is
-/// the index, plus 0 for a term, 1 << 6 for a field, 2 << 6 for a document).
-#[derive(Default)]
-struct SearchRecords {
-    documents: Vec<u32>,
-    terms: usize,
-    fields: usize,
-}
-
-async fn search_records(test: &TestServer, account_id: u32) -> SearchRecords {
-    let mut records = SearchRecords::default();
-    test.server
-        .store()
-        .iterate(
-            IterateParams::new(
-                AnyKey {
-                    subspace: SUBSPACE_SEARCH_INDEX,
-                    key: vec![0u8],
-                },
-                AnyKey {
-                    subspace: SUBSPACE_SEARCH_INDEX,
-                    key: vec![u8::MAX; 64],
-                },
-            )
-            .no_values(),
-            |key, _| {
-                if SearchIndex::try_from_u8(key[0] & 0x3f) == Some(SearchIndex::Email)
-                    && key.get(1..5) == Some(account_id.to_be_bytes().as_slice())
-                {
-                    match key[0] >> 6 {
-                        0 => records.terms += 1,
-                        1 => records.fields += 1,
-                        2 => {
-                            assert_eq!(key.len(), 9, "a document key: {key:?}");
-                            records
-                                .documents
-                                .push(u32::from_be_bytes(key[5..9].try_into().unwrap()));
-                        }
-                        class => panic!("search key class {class}: {key:?}"),
-                    }
-                }
-                Ok(true)
-            },
-        )
-        .await
-        .unwrap();
-    records.documents.sort_unstable();
-    records
-}
-
-/// Mail spec 5.5: after the index tasks, the key account's search records
-/// are one document per message, with the two visible fields and no term;
-/// the ordinary account's include terms.
+/// Mail spec 5.5 and ruling 64: after the index passes, the key account's
+/// search records are one document per message holding its ids only (1.0's
+/// Email index has no arrival-time or size field: both are served from the
+/// message cache) and no term; the ordinary account's include terms. Read
+/// from the internal search store's `SearchDocument` and `SearchTerm`
+/// subspaces (`utils::za::search_keys`).
 async fn visible_field_document(test: &TestServer, key_id: u32, plain_id: u32) {
     println!("visible_field_document");
-    if test.server.store().is_pg_or_mysql() {
+    if test.server.search_store().internal_fts().is_none() {
         return;
     }
-    let key = search_records(test, key_id).await;
-    assert_eq!(key.documents, message_ids(test, key_id).await, "documents");
-    assert_eq!(key.documents.len(), 4);
+    let key = search_keys(test, key_id, SearchIndex::Email).await;
+    let mut documents = key.document_ids();
+    documents.sort_unstable();
+    assert_eq!(documents, message_ids(test, key_id).await, "documents");
+    assert_eq!(documents.len(), 4);
     assert_eq!(key.terms, 0, "a key account's index holds no term");
-    assert_eq!(
-        key.fields, 8,
-        "a key account's index holds the arrival time and the size of each message"
+    assert!(
+        key.documents_are_ids_only(),
+        "a key account's search document holds more than its ids: {key:?}"
     );
-    let plain = search_records(test, plain_id).await;
-    assert_eq!(plain.documents, message_ids(test, plain_id).await);
+    let plain = search_keys(test, plain_id, SearchIndex::Email).await;
+    let mut documents = plain.document_ids();
+    documents.sort_unstable();
+    assert_eq!(documents, message_ids(test, plain_id).await);
     assert!(plain.terms > 0, "the control's index holds terms");
+    assert!(
+        !plain.documents_are_ids_only(),
+        "the control's documents list their terms"
+    );
 }

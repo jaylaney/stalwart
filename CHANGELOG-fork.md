@@ -6,6 +6,119 @@ The inherited [CHANGELOG.md](CHANGELOG.md) records upstream Stalwart history.
 
 ## Unreleased
 
+## 0.2.0-beta.1 — candidate, not yet released
+
+A limited prerelease on upstream Stalwart `v1.0.1`. The immutable tag will be
+`fork-v0.2.0-beta.1`; the release date, the tag and the published notes are set at
+publication, which needs its own authorization. Until its pending gates pass (below) it
+must stay a prerelease and claims no general client or production readiness.
+
+### Provenance
+
+- Fork source: the commit resolved by `git rev-parse 'fork-v0.2.0-beta.1^{commit}'` once the
+  tag exists. The published release notes and shipped `stalwart.provenance.json` record the
+  exact full commit.
+- Fully integrated upstream base: Stalwart `v1.0.1`, commit
+  `23b69755cb3cd8ecd952fe0443c5ac067a506184`
+  ([release notes](https://github.com/stalwartlabs/stalwart/releases/tag/v1.0.1)), fetched
+  by URL and pinned in `fork-release.toml` and in the verifier's `PINNED_UPSTREAM_TAGS`.
+- No additional upstream backports are recorded separately for this preview.
+- The published `fork-v0.1.0-beta.1` and `fork-v0.1.1-beta.1` tags and artifacts retain their
+  original identity.
+
+### Changes
+
+- Moves the fork from upstream `v0.16.27` to upstream `v1.0.1`. Every zero-access feature is
+  carried over: key accounts, sealed calendars, invitations between key accounts, key
+  pinning, calendar sharing and key-account mail at rest. Ordinary accounts take 1.0.1's
+  behaviour.
+- Field policy 2: an event's, task's or journal's `CLASS` is visible to the operator when its
+  value is PUBLIC, PRIVATE or CONFIDENTIAL, so that sharers can hide events; any other value
+  stays sealed.
+- 1.0's object metadata (DAV dead properties, IMAP annotations, JMAP metadata) is refused for
+  key accounts, and setup refuses an account that already holds some with 409 "account
+  already holds object metadata".
+- 1.0 indexes in a queue of its own. Setup refuses an account with queued index work (409
+  "account has unfinished tasks"); after a transient failure an administrator resets the
+  partition with `x:IndexQueueStatus/set`, and after a permanent one deletes the offending
+  document or the account. A key account's mail search document now holds only its ids.
+- Every account: an undecodable Bearer value is no longer quoted in authentication traces,
+  and HTTP request traces print `[redacted]` for `Authorization`, `Proxy-Authorization` and
+  `Cookie` headers. Every ordinary calendar write asserts that the account was not
+  provisioned in the meantime, as ordinary mail writes already did.
+- Setting up a key account revokes OAuth grants minted before it, and a key account refuses
+  a grant token minted while it had no credential. The scheduling inbox's expiry no longer
+  removes invitations the drain has not yet opened.
+- A key account's sealed events and calendars use about 485 and 491 bytes more quota each
+  than their plaintext, which 1.0 enforces at commit.
+- Inherited from upstream 1.0.1 for ordinary accounts: a delegate is not invited when the
+  delegator forwards the REQUEST (1.0 accepts a REQUEST only from the organizer), and
+  calendar text search sees an event only once the asynchronous index has caught up. Key
+  accounts' delegates are still invited, by the drain.
+- The shipping binary's `--version` and help name the fork version, the upstream tag and
+  commit, and the source commit, for example `Stalwart Server fork v0.2.0-beta.1 (upstream
+  v1.0.1 23b69755cb3cd8ecd952fe0443c5ac067a506184; source <commit>; clean)`. The release
+  verifier also checks that the upstream pin names its tag's commit, is an ancestor of the
+  source, is the latest known upstream release in the source's history, and matches the
+  internal crates' upstream version.
+
+### Compatibility and upgrade instructions
+
+Fresh stores only. Upstream 1.0.1 cannot open a store written by upstream 0.16 or by the
+fork's `0.1.x` releases, and the fork adds no conversion: the server stamps a new store with
+its schema version and edition and refuses any other. Stores from `0.1.x` are not
+supported. Moving an installation from `0.1.x` means a rebuild on a fresh store: create the
+accounts again, issue new setup tokens and enrol each key account again (new keys), and reload data through the clients. Keep the pre-cutover store
+snapshot and the `0.1.x` binary for rollback; a rollback restores the old store as it was,
+without anything written after the cutover. Back up the complete database, blob store and
+configuration and verify restoration before any test.
+
+The planned shipping configuration is Linux `x86_64-unknown-linux-gnu` with RocksDB,
+without the enterprise and `test_mode` features, and requires an `x86-64-v2` CPU. Check the
+artifact's provenance for its highest referenced GLIBC symbol version and test its runtime
+dependencies on the deployment host; it is not a static or broadly portable musl build.
+
+The existing key-account privacy and functionality limits remain described in the
+[README](README.md) and [sharing API](docs/zero-access/calendar-sharing-api.md). Key-account
+JMAP calendars, calendar full-text search, re-sharing, free/busy-only grants, cross-server
+sharing and key-account mail sharing remain refused or deferred.
+
+### Verification and outstanding gates
+
+The [upgrade outcome](docs/superpowers/plans/2026-10-27-stalwart-1-upgrade-outcome.md)
+records every command and result; its "Final record" section indexes them. In summary:
+
+- The test matrix, the coverage net and both C10 gates ran at `f135a9881`, every row green
+  (documented SMTP flakes passed rerun by name). CI's `test.yml` at `2867bc24f`, the
+  candidate's last code change,
+  [run 41432100574](https://github.com/jaylaney/stalwart/actions/runs/41432100574), passed
+  every job: style and the gates' workflow check, unit tests (593 passed), upstream's suites,
+  the zero-access suites in both blob-store modes and in plain and key mode, the independent
+  python-caldav client (plain 68 passed, 3 xfailed; key 74 passed, 2 xfailed), the fresh
+  store restart gate, and the C10 inventory and coverage gates (full 21,599 / 22,335 and
+  runtime-only 12,537 / 13,197 covered lines, each 72 and 44 lines above the 0.16.27
+  baseline's fraction).
+- Release-preparation checks: 9 release-metadata tests and 21 product-verifier tests passed.
+  A local shipping-configuration build at `2867bc24f` (macOS arm64, not a release artifact)
+  printed the expected identity and carried no enterprise or test feature.
+- The final whole-branch review ran as four Fable lenses and two scoped re-reviews; no
+  Critical or Important finding remains.
+
+Pending gates, each needing its own authorization or session:
+
+- the exact-source Linux shipping build and its verification through `product-build.yml`
+  (checksum, attestation, CPU baseline and measured GLIBC requirement of the real
+  artifact); no Linux artifact of this candidate has been qualified;
+- the native Apple Calendar (macOS and iOS), Thunderbird, DAVx5 and mail-client checklist
+  against that build, under the [manual checklist](docs/zero-access/manual-checklist.md);
+  results from the `0.1.x` base are not evidence for this candidate;
+- a clean-context whole-branch review: the final review's four lenses were given the
+  execution ledger and its rulings, which is not the clean context the plan specifies.
+
+Not qualified: SQL and FoundationDB stores, multi-node execution, platforms other than the
+ones named above, upstream's private test suites and the external protocol suites (Dovecot
+imaptest, Fastmail's JMAP test suite, Apple's CalDAVTester).
+
 ## 0.1.1-beta.1 — 2026-10-29
 
 Immutable tag: `fork-v0.1.1-beta.1`. This preview remains a prerelease.

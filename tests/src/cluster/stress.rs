@@ -7,7 +7,7 @@
 use crate::utils::server::{DestroyAllMailboxes, TestServer, TestServerBuilder};
 use email::{
     cache::{MessageCacheFetch, email::MessageCacheAccess},
-    message::metadata::MessageData,
+    message::messagedata::MessageData,
 };
 use futures::future::join_all;
 use jmap_client::{
@@ -21,7 +21,6 @@ use store::{
     ValueKey,
     rand::{self, RngExt},
     roaring::RoaringBitmap,
-    write::{AlignedBytes, Archive},
 };
 use types::{collection::Collection, id::Id};
 
@@ -215,9 +214,8 @@ async fn email_tests(test: &TestServer) {
         let cache = server.get_cached_messages(TEST_USER_ID).await.unwrap();
         let email_ids = cache
             .emails
-            .items
             .iter()
-            .map(|e| e.document_id)
+            .map(|e| e.document_id())
             .collect::<RoaringBitmap>();
         let mailbox_ids = cache
             .mailboxes
@@ -230,7 +228,7 @@ async fn email_tests(test: &TestServer) {
         for mailbox in mailboxes.iter() {
             let mailbox_id = Id::from_str(mailbox).unwrap().document_id();
             let email_ids_in_mailbox =
-                RoaringBitmap::from_iter(cache.in_mailbox(mailbox_id).map(|m| m.document_id));
+                RoaringBitmap::from_iter(cache.in_mailbox(mailbox_id).map(|m| m.document_id()));
             let mut email_ids_check = email_ids_in_mailbox.clone();
             email_ids_check &= &email_ids;
             assert_eq!(email_ids_in_mailbox, email_ids_check);
@@ -240,7 +238,7 @@ async fn email_tests(test: &TestServer) {
             for email_id in &email_ids_in_mailbox {
                 if let Some(mailbox_tags) = server
                     .store()
-                    .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                    .get_value::<MessageData>(ValueKey::archive(
                         TEST_USER_ID,
                         Collection::Email,
                         email_id,
@@ -248,7 +246,7 @@ async fn email_tests(test: &TestServer) {
                     .await
                     .unwrap()
                 {
-                    let mailbox_tags = mailbox_tags.deserialize::<MessageData>().unwrap().mailboxes;
+                    let mailbox_tags = mailbox_tags.mailboxes;
                     if mailbox_tags.len() != 1 {
                         panic!(
                             "Email ORM has more than one mailbox {:?}! Id {} in mailbox {} with messages {:?}",

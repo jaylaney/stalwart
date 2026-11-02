@@ -139,14 +139,15 @@ pub async fn test(test: &mut TestServer) {
     let account = test.server.account(key1_id).await.unwrap();
     assert!(account.is_key_account());
     assert_eq!(
-        account.za_generation, 3,
+        account.za_generation(),
+        3,
         "pending record was revision 1, the reissue made it 2, setup made it 3"
     );
-    assert!(account.za_public_key.is_some());
+    assert!(account.za_public_key().is_some());
     // Registry: marker only, no TOTP.
     let password = registry_password(test, key1.id()).await;
     assert_eq!(password.secret, "$za$");
-    assert!(password.otp_auth.is_none());
+    assert!(password.otp_url.is_none());
 
     // CalDAV login with the new password; second request is a cache hit that carries keys.
     let client = DummyWebDavClient::new(key1_id, "key1@example.com", STRONG, "key1@example.com");
@@ -162,8 +163,7 @@ pub async fn test(test: &mut TestServer) {
     assert_eq!(test.server.inner.cache.za_keys.len(), 1);
     // Invalidation drops the resident keys.
     test.server
-        .invalidate_local_caches(&[CacheInvalidation::AccessToken(key1_id)])
-        .await;
+        .invalidate_local_caches(&[CacheInvalidation::AccessToken(key1_id)]);
     assert_eq!(test.server.inner.cache.za_keys.len(), 0);
     // Wrong password, and the literal marker as a password, are refused.
     for bad in ["wrong password here", "$za$"] {
@@ -181,13 +181,11 @@ pub async fn test(test: &mut TestServer) {
         .with_collection(types::collection::Collection::Principal)
         .with_document(0)
         .clear(types::field::PrincipalField::ZeroAccessVault);
-    test.server.store().write(batch.build_all()).await.unwrap();
-    test.server
-        .invalidate_local_caches(&[
-            CacheInvalidation::AccessToken(key1_id),
-            CacheInvalidation::Account(key1_id),
-        ])
-        .await;
+    test.server.store().write_batch(&mut batch).await.unwrap();
+    test.server.invalidate_local_caches(&[
+        CacheInvalidation::AccessToken(key1_id),
+        CacheInvalidation::Account(key1_id),
+    ]);
     assert!(test.server.account(key1_id).await.unwrap().is_key_account());
     client
         .request("PROPFIND", "/dav/cal/key1@example.com/", "")
@@ -204,12 +202,10 @@ pub async fn test(test: &mut TestServer) {
         .za_vault_write(key1_id, &saved.record, None)
         .await
         .unwrap();
-    test.server
-        .invalidate_local_caches(&[
-            CacheInvalidation::AccessToken(key1_id),
-            CacheInvalidation::Account(key1_id),
-        ])
-        .await;
+    test.server.invalidate_local_caches(&[
+        CacheInvalidation::AccessToken(key1_id),
+        CacheInvalidation::Account(key1_id),
+    ]);
     client
         .request("PROPFIND", "/dav/cal/key1@example.com/", "")
         .await
@@ -301,7 +297,7 @@ pub async fn test(test: &mut TestServer) {
             }],
             ..Default::default()
         }
-        .insert(account_info.account_tenant_ids(), key4_id, 0, &mut batch)
+        .insert(account_info.changed_by(), key4_id, 0, &mut batch)
         .unwrap();
         test.server.commit_batch(batch).await.unwrap();
     }
@@ -412,12 +408,7 @@ pub async fn test_data_check(test: &mut TestServer) {
             }],
             ..Default::default()
         }
-        .insert(
-            account_info.account_tenant_ids(),
-            key6_id,
-            calendar_id,
-            &mut batch,
-        )
+        .insert(account_info.changed_by(), key6_id, calendar_id, &mut batch)
         .unwrap();
         test.server.commit_batch(batch).await.unwrap();
     }
@@ -430,14 +421,14 @@ pub async fn test_data_check(test: &mut TestServer) {
         use groupware::{DestroyArchive, calendar::Calendar};
         use store::{
             ValueKey,
-            write::{AlignedBytes, Archive},
+            write::{Archive, ArchiveBytes},
         };
         use types::collection::Collection;
         let account_info = test.server.account_info(key6_id).await.unwrap();
         let archive = test
             .server
             .store()
-            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
                 key6_id,
                 Collection::Calendar,
                 calendar_id,
@@ -448,12 +439,14 @@ pub async fn test_data_check(test: &mut TestServer) {
         let mut batch = store::write::BatchBuilder::new();
         DestroyArchive(archive.to_unarchived::<Calendar>().unwrap())
             .delete(
-                account_info.account_tenant_ids(),
+                &test.server,
+                account_info.changed_by(),
                 key6_id,
                 calendar_id,
                 None,
                 &mut batch,
             )
+            .await
             .unwrap();
         test.server.commit_batch(batch).await.unwrap();
     }
@@ -524,22 +517,27 @@ pub async fn test_data_check(test: &mut TestServer) {
     .await;
     let event_id = 0u32;
     {
-        use groupware::calendar::{CalendarEvent, CalendarEventData};
+        use groupware::calendar::{CalendarEvent, CalendarEventContent, CalendarEventData};
         let account_info = test.server.account_info(key6_id).await.unwrap();
         let mut batch = store::write::BatchBuilder::new();
+        // 1.0 splits an event into its row and its content record.
         CalendarEvent {
             names: vec![common::DavName {
                 name: "stray.ics".into(),
                 parent_id: 2,
             }],
-            data: CalendarEventData::default(),
             ..Default::default()
         }
         .insert(
-            account_info.account_tenant_ids(),
+            CalendarEventContent {
+                data: CalendarEventData::default(),
+                ..Default::default()
+            },
+            account_info.changed_by(),
             key6_id,
             event_id,
             None,
+            Default::default(),
             &mut batch,
         )
         .unwrap();
@@ -557,14 +555,14 @@ pub async fn test_data_check(test: &mut TestServer) {
         use groupware::{DestroyArchive, calendar::CalendarEvent};
         use store::{
             ValueKey,
-            write::{AlignedBytes, Archive},
+            write::{Archive, ArchiveBytes},
         };
         use types::collection::Collection;
         let account_info = test.server.account_info(key6_id).await.unwrap();
         let archive = test
             .server
             .store()
-            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+            .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
                 key6_id,
                 Collection::CalendarEvent,
                 event_id,
@@ -574,7 +572,16 @@ pub async fn test_data_check(test: &mut TestServer) {
             .expect("event archive");
         let mut batch = store::write::BatchBuilder::new();
         DestroyArchive(archive.to_unarchived::<CalendarEvent>().unwrap())
-            .delete_all(&account_info, key6_id, event_id, false, &mut batch)
+            .delete_all(
+                &test.server,
+                &account_info,
+                key6_id,
+                event_id,
+                None,
+                false,
+                &mut batch,
+            )
+            .await
             .unwrap();
         test.server.commit_batch(batch).await.unwrap();
     }
@@ -615,7 +622,7 @@ async fn insert_default_calendar(
         ..Default::default()
     }
     .insert(
-        account_info.account_tenant_ids(),
+        account_info.changed_by(),
         account_id,
         document_id,
         &mut batch,
@@ -628,14 +635,14 @@ async fn remove_calendar(test: &TestServer, account_id: u32, document_id: u32) {
     use groupware::{DestroyArchive, calendar::Calendar};
     use store::{
         ValueKey,
-        write::{AlignedBytes, Archive},
+        write::{Archive, ArchiveBytes},
     };
     use types::collection::Collection;
     let account_info = test.server.account_info(account_id).await.unwrap();
     let archive = test
         .server
         .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
             account_id,
             Collection::Calendar,
             document_id,
@@ -646,12 +653,14 @@ async fn remove_calendar(test: &TestServer, account_id: u32, document_id: u32) {
     let mut batch = store::write::BatchBuilder::new();
     DestroyArchive(archive.to_unarchived::<Calendar>().unwrap())
         .delete(
-            account_info.account_tenant_ids(),
+            &test.server,
+            account_info.changed_by(),
             account_id,
             document_id,
             None,
             &mut batch,
         )
+        .await
         .unwrap();
     test.server.commit_batch(batch).await.unwrap();
 }
@@ -684,4 +693,207 @@ async fn registry_password(test: &TestServer, id: Id) -> PasswordCredential {
         .unwrap()
         .into_password_credential()
         .unwrap()
+}
+
+/// Upgrade ruling 175 (plan 13's R37 closed): an OAuth grant minted while
+/// the account had no credential carries credential version 0, which every
+/// refresh re-encodes and no version check refuses. The marker write of
+/// `setup-token` is a password change and takes upstream's
+/// credentials-changed path, which deletes the account's grants: after it,
+/// the grant's access token is refused and its refresh token finds no grant
+/// (the refresh route's `InvalidGrant`). Before it, both work (the control).
+pub async fn test_grants_die_with_the_marker(test: &mut TestServer) {
+    use common::auth::oauth::{
+        GrantType,
+        scope::OAuthScopes,
+        token::{RefreshTokenParams, TokenGrant},
+    };
+    println!("Running zero-access setup-token grant revocation test...");
+    const NAME: &str = "keymail35@example.com";
+    let admin = test.account("admin@example.com").clone();
+    let mut account = admin
+        .create_passwordless_user_account(NAME, STRONG, "Grant", &[], user_permissions())
+        .await;
+    let id = account.id().document_id();
+    let (grant_id, access) =
+        crate::utils::za::za_grant_token(&test.server, NAME, OAuthScopes::ALL).await;
+    let credential_version = test
+        .server
+        .access_token(id)
+        .await
+        .unwrap()
+        .credential_version();
+    assert_eq!(credential_version, 0, "a credential-less account's version");
+    let refresh = test
+        .server
+        .encode_refresh_token(RefreshTokenParams {
+            account_id: id,
+            account_name: NAME,
+            grant: TokenGrant {
+                id: grant_id,
+                generation: 0,
+            },
+            rotated_at: now(),
+            credential_version,
+            scope: None,
+        })
+        .unwrap();
+    // The refresh route's checks before the client's: the token validates
+    // and names a stored grant of the account.
+    let refreshable = async |test: &TestServer, refresh: &str| {
+        let Ok(info) = test
+            .server
+            .validate_access_token(GrantType::RefreshToken.into(), refresh)
+            .await
+        else {
+            return false;
+        };
+        let grant = info.grant.expect("a grant-bound refresh token");
+        test.server
+            .oauth_grant(grant.id)
+            .await
+            .unwrap()
+            .is_some_and(|stored| stored.account_id() == id)
+    };
+    assert_eq!(
+        super::caches::session_status(&access).await,
+        200,
+        "control: the access token before setup-token"
+    );
+    assert!(
+        refreshable(test, &refresh).await,
+        "control: the grant before setup-token"
+    );
+
+    let token = za_setup_token(&admin, NAME).await;
+    assert!(
+        test.server.oauth_grant(grant_id).await.unwrap().is_none(),
+        "the grant outlived the marker write"
+    );
+    assert!(
+        !refreshable(test, &refresh).await,
+        "the grant's refresh token still finds its grant"
+    );
+    assert_eq!(
+        super::caches::session_status(&access).await,
+        401,
+        "the grant's access token outlived the marker write"
+    );
+    account.recovery_key = Some(za_setup(NAME, &token, STRONG).await);
+
+    // Upgrade ruling 185: a grant minted for the key account with credential
+    // version 0, as one minted in the window between the marker write's
+    // revocation query and its invalidation would carry. Its access and
+    // refresh tokens are refused, while the same grant's tokens at the
+    // account's own version (the vault revision) work: the control.
+    let (grant_id, current) =
+        crate::utils::za::za_grant_token(&test.server, NAME, OAuthScopes::ALL).await;
+    let version = test
+        .server
+        .access_token(id)
+        .await
+        .unwrap()
+        .credential_version();
+    assert!(
+        version >= 1,
+        "a key account's version is its vault revision"
+    );
+    let unversioned = test
+        .server
+        .encode_grant_access_token(id, NAME, grant_id, 0)
+        .unwrap();
+    let refresh_at = |credential_version| {
+        test.server
+            .encode_refresh_token(RefreshTokenParams {
+                account_id: id,
+                account_name: NAME,
+                grant: TokenGrant {
+                    id: grant_id,
+                    generation: 0,
+                },
+                rotated_at: now(),
+                credential_version,
+                scope: None,
+            })
+            .unwrap()
+    };
+    assert_eq!(
+        super::caches::session_status(&current).await,
+        200,
+        "control: the grant's access token at the account's version"
+    );
+    assert!(
+        refreshable(test, &refresh_at(version)).await,
+        "control: the grant's refresh token at the account's version"
+    );
+    assert_eq!(
+        super::caches::session_status(&unversioned).await,
+        401,
+        "a version-0 access token of a key account was accepted"
+    );
+    assert!(
+        !refreshable(test, &refresh_at(0)).await,
+        "a version-0 refresh token of a key account validated"
+    );
+    crate::utils::za::za_revoke_grant(&test.server, grant_id).await;
+    test.insert_account(account);
+}
+
+/// PR review ruling 196: `setup-token` holds its caller's HTTP concurrency
+/// slot until it returns, as 0.16 did and as 1.0's other API handlers do.
+/// With the limit at one, a provisioning caller (`SysAccountUpdate`, without
+/// `UnlimitedRequests`) whose first request is parked inside the handler
+/// (`SETUP_TOKEN_PAUSE`, after the first emptiness check) is refused a
+/// second concurrent request for the limit; once the first returns, the slot
+/// is free again (the control).
+pub async fn test_setup_token_concurrency(test: &mut TestServer) {
+    use crate::utils::za::{ConcurrentRequestsGuard, HookParked};
+    use common::za::test_hooks;
+    use registry::schema::enums::Permission;
+    println!("Running zero-access setup-token concurrency test...");
+    const CALLER: &str = "setup-token-limit-caller@example.com";
+    const TARGET: &str = "setup-token-limit@example.com";
+    let admin = test.account("admin@example.com").clone();
+    // Set before the caller's first request, so its token carries the limit.
+    let limit = ConcurrentRequestsGuard::set(&admin, 1).await;
+    let caller = admin
+        .create_user_account(
+            CALLER,
+            STRONG,
+            "Provisioner",
+            &[],
+            vec![Permission::SysAccountUpdate],
+        )
+        .await;
+    let mut target = admin
+        .create_passwordless_user_account(TARGET, STRONG, "Limit", &[], user_permissions())
+        .await;
+    let target_id = target.id().document_id();
+
+    let first = caller.clone();
+    let parked = HookParked::start(target_id, test_hooks::set_setup_token_pause, async move {
+        za_post_as(&first, "setup-token", &json!({ "account": TARGET })).await
+    })
+    .await;
+    let second = za_post_as(&caller, "setup-token", &json!({ "account": TARGET })).await;
+    assert_eq!(
+        second.status, 400,
+        "a second setup-token ran while the first held the caller's only slot: {}",
+        second.body
+    );
+    assert_eq!(
+        second.body["limit"], "maxConcurrentRequests",
+        "the second setup-token was refused for another reason: {}",
+        second.body
+    );
+    parked.finish().await.expect(200);
+    // Control: the first request released its slot when it returned.
+    let token = za_post_as(&caller, "setup-token", &json!({ "account": TARGET }))
+        .await
+        .str(200, "token");
+    limit.restore().await;
+
+    target.recovery_key = Some(za_setup(TARGET, &token, STRONG).await);
+    test.insert_account(target);
+    admin.destroy_account(caller).await;
 }

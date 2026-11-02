@@ -127,26 +127,11 @@ pub static STEMMER_MAP: &[Option<Algorithm>] = &[
     None,                        // None = 70,
 ];
 
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/nlp/src/language/stemmer/tests.rs"]
+mod tests;
+
 #[cfg(test)]
-mod tests {
-
-    use super::*;
-
-    #[test]
-    fn stemmer() {
-        let inputs = [
-            (
-                "love loving lovingly loved lovely",
-                Language::English,
-                "love",
-            ),
-            ("querer queremos quer", Language::Spanish, "quer"),
-        ];
-
-        for (input, language, result) in inputs {
-            for token in Stemmer::new(input, language, 40) {
-                assert_eq!(token.stemmed_word.unwrap_or(token.word), result);
-            }
-        }
-    }
-}
+#[path = "stemmer_restored_tests.rs"]
+mod tests;

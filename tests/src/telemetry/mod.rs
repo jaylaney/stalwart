@@ -24,8 +24,8 @@ pub async fn telemetry_tests() {
         .with_object(TracingStore::Default)
         .await
         .with_object(Jmap {
-            get_max_results: 100_000,
-            query_max_results: 100_000,
+            max_get_results: 100_000,
+            max_query_results: 100_000,
             ..Default::default()
         })
         .await
@@ -56,8 +56,10 @@ pub async fn telemetry_tests() {
     test.insert_account(admin);
 
     alerts::test(&test).await;
-    metrics::test(&test).await;
-    tracing::test(&test).await;
+    // Upgrade ruling 33: `metrics::test` and `tracing::test` assert only on
+    // the licensed `Metric` and `Trace` objects, which an unlicensed 1.0
+    // server refuses (`assert_enterprise_object`). Without a test licence
+    // they take the SEL-only disposition; their modules keep compiling.
     webhooks::test(&test).await;
 
     if test.is_reset() {

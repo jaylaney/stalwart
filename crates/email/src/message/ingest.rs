@@ -6,54 +6,61 @@
 
 use super::crypto::{EncryptMessage, EncryptMessageError};
 use crate::{
-    cache::{MessageCacheFetch, email::MessageCacheAccess, mailbox::MailboxCacheAccess},
-    mailbox::{INBOX_ID, JUNK_ID, SENT_ID, TRASH_ID, UidMailbox},
+    mailbox::{INBOX_ID, JUNK_ID, TRASH_ID},
     message::{
         crypto::EncryptionFlags,
-        index::{IndexMessage, extractors::VisitText},
-        metadata::{MessageData, MessageMetadata},
-        za::ingest::{za_index_stub, za_ingest_wrap, za_stage_sealed},
+        delivery::SenderAuthentication,
+        index::IndexMessage,
+        ingest_metadata::IngestMetadata,
+        messagedata::{EmailMessageData, MessageData, PendingMessageData},
+        metadata::{AddressHeader, ExtraHeaders, HeaderId, MetadataStructure, Occurrence},
+        thread::ThreadFields,
+        za::ingest::{za_index_stub, za_ingest_wrap, za_metadata_refusal, za_stage_sealed},
     },
 };
-use common::{Server, auth::AccessToken};
+use common::{
+    MAX_RECEIVED_AT, MessageUid, Server, auth::AccessToken,
+    storage::metadata::PrivateMetadataCommit,
+};
+use compact_str::{CompactString, ToCompactString};
 use groupware::{
     calendar::itip::{ItipIngest, ItipIngestError},
     scheduling::{ItipError, ItipMessages},
 };
-use mail_parser::{
-    Header, HeaderName, HeaderValue, Message, MessageParser, MimeHeaders, PartType,
-    parsers::fields::thread::thread_name,
-};
+use mail_parser::{Message, MessageParser, thread_name};
+use recheck::PendingThread;
 use registry::{
     schema::{
-        enums::IndexDocumentType,
+        enums::StorageQuota,
         prelude::{ObjectType, Permission, Property},
-        structs::{SpamTrainingSample, Task, TaskIndexDocument, TaskMergeThreads, TaskStatus},
+        structs::{SpamTrainingSample, Task, TaskMergeThreads, TaskStatus},
     },
     types::{EnumImpl, ObjectImpl, datetime::UTCDateTime, id::ObjectId, map::Map},
 };
 use std::future::Future;
-use std::{borrow::Cow, cmp::Ordering, fmt::Write, time::Instant};
-use store::write::{AlignedBytes, Archive, RegistryClass};
+use std::{borrow::Cow, cmp::Ordering, time::Instant};
 use store::{
-    IndexKeyPrefix, IterateParams, SerializeInfallible, U32_LEN, ValueKey,
+    Deserialize, IterateParams, SerializeInfallible, U32_LEN, U128_LEN, ValueKey,
     ahash::AHashMap,
+    roaring::RoaringBitmap,
     write::{
-        AssignedId, AssignedIds, BatchBuilder, BlobLink, BlobOp, IndexPropertyClass, ValueClass,
-        key::DeserializeBigEndian, now,
+        AssignedIds, BatchBuilder, BlobLink, BlobOp, IndexPropertyClass, Patch, PatchSource,
+        PendingId, QueueDocumentId, SearchIndex, SizedSetValue, Slot, SlotRange, ValueClass,
+        blob::BlobLinkValue, key::DeserializeBigEndian, now,
     },
 };
+use store::{write::RegistryClass, xxhash_rust::xxh3::xxh3_128};
+use tinyvec::TinyVec;
 use trc::{AddContext, MessageIngestEvent, SpamEvent};
 use types::{
     blob::{BlobClass, BlobId},
     blob_hash::BlobHash,
     collection::{Collection, SyncCollection},
-    field::{ContactField, EmailField, MailboxField},
+    field::{ContactField, EmailField},
     id::Id,
     keyword::Keyword,
-    special_use::SpecialUse,
 };
-use utils::{cheeky_hash::CheekyHash, sanitize_email, snowflake::SnowflakeIdGenerator};
+use utils::{hash128::Hash128, sanitize_email, snowflake::SnowflakeIdGenerator};
 
 #[derive(Default)]
 pub struct IngestedEmail {
@@ -63,6 +70,31 @@ pub struct IngestedEmail {
     pub blob_id: BlobId,
     pub size: usize,
     pub imap_uids: Vec<u32>,
+    pub thread_recheck: Option<PendingThread>,
+}
+
+pub enum PendingIngest {
+    Queued(PendingEmail),
+    Duplicate(IngestedEmail),
+}
+
+pub struct PendingEmail {
+    account_id: u32,
+    document_slot: Slot,
+    uid_slots: SlotRange,
+    thread_id: PendingId,
+    blob_hash: BlobHash,
+    size: u64,
+    thread_recheck: Option<PendingThread>,
+    private_commit: PrivateMetadataCommit,
+    event: MessageIngestEvent,
+    mailbox_ids: Vec<u32>,
+    message_id: Option<String>,
+    session_id: u64,
+    start_time: Instant,
+    /// Mail spec 5.4, ruling 59: a key account's message, which an
+    /// `IngestGroup` records under no thread (`za_group_thread`).
+    za_key: bool,
 }
 
 pub struct IngestEmail<'x> {
@@ -74,6 +106,7 @@ pub struct IngestEmail<'x> {
     pub keywords: Vec<Keyword>,
     pub received_at: Option<u64>,
     pub source: IngestSource<'x>,
+    pub metadata: Option<Box<IngestMetadata>>,
     pub session_id: u64,
 }
 
@@ -81,7 +114,8 @@ pub struct IngestEmail<'x> {
 pub enum IngestSource<'x> {
     Smtp {
         deliver_to: &'x str,
-        is_sender_authenticated: bool,
+        envelope_from: &'x str,
+        sender_authentication: SenderAuthentication,
         is_spam: bool,
     },
     Jmap {
@@ -98,24 +132,28 @@ pub trait EmailIngest: Sync + Send {
         &self,
         params: IngestEmail,
     ) -> impl Future<Output = trc::Result<IngestedEmail>> + Send;
+    fn email_ingest_into(
+        &self,
+        params: &mut IngestEmail,
+        batch: &mut BatchBuilder,
+        group_thread: Option<PendingId>,
+    ) -> impl Future<Output = trc::Result<PendingIngest>> + Send;
+    fn email_ingest_finish(
+        &self,
+        pending: PendingEmail,
+        assigned_ids: &AssignedIds,
+    ) -> impl Future<Output = IngestedEmail> + Send;
     fn find_thread_id(
         &self,
         account_id: u32,
         thread_name: &str,
-        message_ids: &[CheekyHash],
+        message_ids: &[u128],
     ) -> impl Future<Output = trc::Result<ThreadResult>> + Send;
-    fn assign_email_ids(
-        &self,
-        account_id: u32,
-        mailbox_ids: impl IntoIterator<Item = u32> + Sync + Send,
-        generate_email_id: bool,
-    ) -> impl Future<Output = trc::Result<impl Iterator<Item = u32> + 'static>> + Send;
-    fn add_account_spam_sample(
+    fn add_account_spam_samples(
         &self,
         batch: &mut BatchBuilder,
         account_id: u32,
-        document_id: u32,
-        is_spam: bool,
+        samples: SpamSamples,
         span_id: u64,
     ) -> impl Future<Output = trc::Result<()>> + Send;
 
@@ -125,6 +163,7 @@ pub trait EmailIngest: Sync + Send {
         account_id: u32,
         batch: &mut BatchBuilder,
         hash: BlobHash,
+        size: u64,
         from: String,
         subject: String,
         is_spam: bool,
@@ -133,154 +172,254 @@ pub trait EmailIngest: Sync + Send {
     );
 }
 
+#[derive(Default)]
+pub struct SpamSamples {
+    documents: RoaringBitmap,
+    spam: RoaringBitmap,
+    prepared: Vec<SpamSample>,
+}
+
+pub struct SpamSample {
+    hash: BlobHash,
+    size: u64,
+    from: String,
+    subject: String,
+    is_spam: bool,
+}
+
+impl SpamSample {
+    pub fn from_metadata(bytes: &[u8], is_spam: bool) -> trc::Result<Self> {
+        let structure = MetadataStructure::deserialize(bytes)?;
+        let metadata = structure.unarchive().caused_by(trc::location!())?;
+        let envelope = metadata.root().envelope();
+        Ok(SpamSample {
+            hash: metadata.blob_hash(),
+            size: metadata.blob_size() as u64,
+            from: envelope
+                .addresses(AddressHeader::From, Occurrence::Last)
+                .first()
+                .and_then(|mailbox| mailbox.address)
+                .unwrap_or_default()
+                .to_string(),
+            subject: thread_name(envelope.subject().unwrap_or_default()).to_string(),
+            is_spam,
+        })
+    }
+}
+
+impl SpamSamples {
+    pub fn add(&mut self, document_id: u32, is_spam: bool) {
+        self.documents.insert(document_id);
+        if is_spam {
+            self.spam.insert(document_id);
+        } else {
+            self.spam.remove(document_id);
+        }
+    }
+
+    pub fn add_sample(&mut self, sample: SpamSample) {
+        self.prepared.push(sample);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.documents.is_empty() && self.prepared.is_empty()
+    }
+}
+
 pub struct ThreadResult {
     pub thread_id: Option<u32>,
-    pub thread_hash: CheekyHash,
+    pub thread_hash: Hash128,
     pub merge_ids: Vec<u32>,
     pub duplicate_ids: Vec<u32>,
+    pub matched_ids: Vec<u32>,
+    pub bucket_full: bool,
 }
 
 impl EmailIngest for Server {
-    #[allow(clippy::blocks_in_conditions)]
     async fn email_ingest(&self, mut params: IngestEmail<'_>) -> trc::Result<IngestedEmail> {
+        let mut batch = BatchBuilder::new();
+        let pending = match self
+            .email_ingest_into(&mut params, &mut batch, None)
+            .await?
+        {
+            PendingIngest::Queued(pending) => pending,
+            PendingIngest::Duplicate(email) => return Ok(email),
+        };
+        let queues = batch.queue_notify();
+        let assigned_ids = self
+            .store()
+            .write_batch(&mut batch)
+            .await
+            .caused_by(trc::location!())?;
+        self.inner.mark_caches_stale_from(&assigned_ids);
+        let email = self.email_ingest_finish(pending, &assigned_ids).await;
+        self.notify_queues(queues).await;
+        Ok(email)
+    }
+
+    #[allow(clippy::blocks_in_conditions)]
+    async fn email_ingest_into(
+        &self,
+        params: &mut IngestEmail<'_>,
+        batch: &mut BatchBuilder,
+        group_thread: Option<PendingId>,
+    ) -> trc::Result<PendingIngest> {
         // Check quota
         let start_time = Instant::now();
         let account_id = params.access_token.account_id();
+        // SPDX-SnippetBegin
+        // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+        // SPDX-License-Identifier: LicenseRef-SEL
+        #[cfg(feature = "enterprise")]
         let tenant_id = params.access_token.tenant_id();
+        // SPDX-SnippetEnd
         let mut raw_message_len = params.raw_message.len() as u64;
         let account = self.account(account_id).await.caused_by(trc::location!())?;
         #[cfg(feature = "test_mode")]
         common::za::ingest_pause_point(account_id).await;
         // Mail spec 6.1, 6.2: a key account's message is sealed, its key
-        // wrapped as chosen here, before any write.
+        // wrapped as chosen here, before any operation of the batch (a
+        // refusal here leaves a group's batch as it was).
         let za_key = account.is_key_account();
         let za_wrap = if za_key {
+            if params.metadata.is_some() {
+                return Err(za_metadata_refusal(account_id));
+            }
             Some(za_ingest_wrap(self, params.access_token, account_id, params.source).await?)
         } else {
             None
         };
-        self.has_available_quota(&account, raw_message_len)
-            .await
-            .caused_by(trc::location!())?;
+        let limits = &self.core.email.limits;
+        if matches!(
+            params.source,
+            IngestSource::Smtp { .. } | IngestSource::Restore
+        ) {
+            params.mailbox_ids.truncate(limits.mailboxes_per_email);
+            if !params.keywords.is_empty() {
+                params.keywords = Keyword::unique(
+                    std::mem::take(&mut params.keywords)
+                        .into_iter()
+                        .filter(|keyword| limits.is_keyword_allowed(keyword)),
+                );
+                params.keywords.truncate(limits.keywords_per_email);
+            }
+        } else if let Err(err) = limits.validate_email(params.mailbox_ids.len(), &params.keywords) {
+            return Err(
+                trc::EventType::MessageIngest(trc::MessageIngestEvent::Error)
+                    .ctx(trc::Key::Code, 550)
+                    .ctx(trc::Key::Reason, err.to_string()),
+            );
+        }
+        let mut metadata = params.metadata.take();
+        if let Some(metadata) = metadata.as_deref_mut() {
+            metadata.shared = metadata
+                .shared
+                .take()
+                .filter(|container| container.kinds().intersects(MessageData::TRACKED_METADATA));
+        }
+        // SPDX-SnippetBegin
+        // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+        // SPDX-License-Identifier: LicenseRef-SEL
+        #[cfg(feature = "enterprise")]
+        self.has_available_tenant_quota(
+            &account,
+            raw_message_len
+                + metadata
+                    .as_deref()
+                    .and_then(|metadata| metadata.shared.as_ref())
+                    .map_or(0, |container| container.len() as u64),
+        )
+        .await
+        .caused_by(trc::location!())?;
+        // SPDX-SnippetEnd
 
         // Parse message
         let mut raw_message = Cow::from(params.raw_message);
-        let mut message = params.message.ok_or_else(|| {
+        let mut message = params.message.take().ok_or_else(|| {
             trc::EventType::MessageIngest(trc::MessageIngestEvent::Error)
                 .ctx(trc::Key::Code, 550)
                 .ctx(trc::Key::Reason, "Failed to parse e-mail message.")
         })?;
 
         // Obtain message references and thread name
-        let mut message_id = None;
-        let mut message_ids = Vec::new();
-        let thread_result = {
-            let mut subject = "";
-            for header in message.root_part().headers().iter().rev() {
-                match &header.name {
-                    HeaderName::MessageId => header.value.visit_text(|id| {
-                        if !id.is_empty() {
-                            if message_id.is_none() {
-                                message_id = id.to_string().into();
-                            }
-                            message_ids.push(CheekyHash::new(id.as_bytes()));
-                        }
-                    }),
-                    HeaderName::InReplyTo
-                    | HeaderName::References
-                    | HeaderName::ResentMessageId => {
-                        header.value.visit_text(|id| {
-                            if !id.is_empty() {
-                                message_ids.push(CheekyHash::new(id.as_bytes()));
-                            }
-                        });
-                    }
-                    HeaderName::Subject if subject.is_empty() => {
-                        subject = thread_name(match &header.value {
-                            HeaderValue::Text(text) => text.as_ref(),
-                            HeaderValue::TextList(list) if !list.is_empty() => {
-                                list.first().unwrap().as_ref()
-                            }
-                            _ => "",
-                        });
-                    }
-                    _ => (),
-                }
+        let fields = ThreadFields::scan(&message);
+        let mut thread_result = if za_key {
+            // Mail spec 5.4: no thread lookup and no threading key; the
+            // message gets a thread of its own, whatever its group.
+            ThreadResult {
+                thread_id: None,
+                thread_hash: Hash128::default(),
+                merge_ids: vec![],
+                duplicate_ids: vec![],
+                matched_ids: vec![],
+                bucket_full: false,
             }
-
-            message_ids.sort_unstable();
-            message_ids.dedup();
-
-            if za_key {
-                // Mail spec 5.4: no thread lookup and no threading key; the
-                // thread-less arm below gives the message a thread of its
-                // own. The Message-ID stays out of the ingest event.
-                message_id = Some("[redacted]".into());
-                ThreadResult {
-                    thread_id: None,
-                    thread_hash: CheekyHash::NULL,
-                    merge_ids: vec![],
-                    duplicate_ids: vec![],
-                }
-            } else {
-                self.find_thread_id(account_id, subject, &message_ids)
-                    .await?
-            }
+        } else {
+            self.find_thread_id(account_id, fields.subject, &fields.message_ids)
+                .await?
         };
+        let group_slot = match group_thread {
+            _ if za_key => None,
+            Some(PendingId::Slot(slot)) if thread_result.thread_id.is_none() => Some(slot),
+            Some(PendingId::Assigned(thread_id)) if thread_result.thread_id.is_none() => {
+                thread_result.thread_id = Some(thread_id);
+                None
+            }
+            _ => None,
+        };
+        let ThreadFields {
+            message_id,
+            sent_at,
+            message_ids,
+            ..
+        } = fields;
+        // Mail spec 5.2: the Date header stays in the stub.
+        let sent_at = sent_at.filter(|_| !za_key);
 
         // Skip duplicate messages for SMTP ingestion
-        if !thread_result.duplicate_ids.is_empty() && params.source.is_smtp() && !za_key {
-            // Fetch cached messages
-            let cache = self
-                .get_cached_messages(account_id)
-                .await
-                .caused_by(trc::location!())?;
+        if !thread_result.duplicate_ids.is_empty()
+            && params.source.is_smtp()
+            && Box::pin(checks::has_duplicate_in(
+                self,
+                account_id,
+                &thread_result.duplicate_ids,
+                params.mailbox_ids.first().copied().unwrap_or(INBOX_ID),
+            ))
+            .await
+            .caused_by(trc::location!())?
+        {
+            trc::event!(
+                MessageIngest(MessageIngestEvent::Duplicate),
+                SpanId = params.session_id,
+                AccountId = account_id,
+                MessageId = message_id,
+            );
 
-            // Skip duplicate messages
-            let target_mailbox_id = params.mailbox_ids.first().copied().unwrap_or(INBOX_ID);
-            if cache
-                .in_mailboxes(&[target_mailbox_id, JUNK_ID])
-                .any(|m| thread_result.duplicate_ids.contains(&m.document_id))
-            {
-                trc::event!(
-                    MessageIngest(MessageIngestEvent::Duplicate),
-                    SpanId = params.session_id,
-                    AccountId = account_id,
-                    MessageId = message_id,
-                );
-
-                return Ok(IngestedEmail {
-                    document_id: 0,
-                    thread_id: 0,
-                    change_id: u64::MAX,
-                    blob_id: BlobId::default(),
-                    imap_uids: Vec::new(),
-                    size: 0,
-                });
-            }
+            return Ok(PendingIngest::Duplicate(IngestedEmail {
+                document_id: 0,
+                thread_id: 0,
+                change_id: u64::MAX,
+                blob_id: BlobId::default(),
+                imap_uids: Vec::new(),
+                size: 0,
+                thread_recheck: None,
+            }));
         }
 
         // Spam classification and training
         let mut train_spam = None;
-        let mut extra_headers = String::new();
-        let mut extra_headers_parsed = Vec::new();
+        let mut extra_headers = ExtraHeaders::default();
         let mut itip_messages = Vec::new();
         let is_spam = match params.source {
             IngestSource::Smtp {
                 deliver_to,
-                is_sender_authenticated,
+                envelope_from,
+                sender_authentication,
                 mut is_spam,
             } => {
                 // Add delivered to header
                 if self.core.smtp.session.data.add_delivered_to {
-                    extra_headers = format!("Delivered-To: {deliver_to}\r\n");
-                    extra_headers_parsed.push(Header {
-                        name: HeaderName::DeliveredTo,
-                        value: HeaderValue::Text(deliver_to.into()),
-                        offset_field: 0,
-                        offset_start: 13,
-                        offset_end: extra_headers.len() as u32,
-                    });
+                    extra_headers.push(HeaderId::DELIVERED_TO, deliver_to);
                 }
 
                 // Spam training on confirmed false positives
@@ -296,7 +435,7 @@ impl EmailIngest for Server {
                             .and_then(|s| s.address())
                             .and_then(sanitize_email)
                         && sender != deliver_to
-                        && is_sender_authenticated
+                        && sender_authentication.is_authenticated()
                         && self
                             .document_exists(
                                 account_id,
@@ -324,59 +463,38 @@ impl EmailIngest for Server {
                     if is_spam
                         && self.core.spam.trusted_reply
                         && let Some(thread_id) = thread_result.thread_id
+                        && Box::pin(checks::is_trusted_reply(
+                            self,
+                            account_id,
+                            thread_id,
+                            &thread_result.matched_ids,
+                        ))
+                        .await
+                        .caused_by(trc::location!())?
                     {
-                        let cache = self
-                            .get_cached_messages(account_id)
-                            .await
-                            .caused_by(trc::location!())?;
-                        let sent_folder_id = cache
-                            .mailbox_by_role(&SpecialUse::Sent)
-                            .map(|m| m.document_id)
-                            .unwrap_or(SENT_ID);
-
-                        if cache
-                            .in_thread(thread_id)
-                            .any(|m| m.mailboxes.iter().any(|mb| mb.mailbox_id == sent_folder_id))
+                        is_spam = false;
+                        if self
+                            .core
+                            .spam
+                            .classifier
+                            .as_ref()
+                            .is_some_and(|c| c.auto_learn_reply_ham)
                         {
-                            is_spam = false;
-                            if self
-                                .core
-                                .spam
-                                .classifier
-                                .as_ref()
-                                .is_some_and(|c| c.auto_learn_reply_ham)
-                            {
-                                train_spam = Some(false);
-                            }
-                            overridden = Some("trusted-reply");
+                            train_spam = Some(false);
                         }
+                        overridden = Some("trusted-reply");
                     }
 
                     // Add Spam-Status header
-                    const HEADER: &str = "X-Spam-Status";
-                    let offset_field = extra_headers.len();
-                    let offset_start = offset_field + HEADER.len() + 1;
                     let result = if is_spam { "Yes" } else { "No" };
                     if let Some(reason) = overridden {
-                        let _ = write!(
-                            &mut extra_headers,
-                            "{HEADER}: {result}, reason={reason}\r\n",
+                        extra_headers.push(
+                            HeaderId::X_SPAM_STATUS,
+                            &format!("{result}, reason={reason}"),
                         );
                     } else {
-                        let _ = write!(&mut extra_headers, "{HEADER}: {result}\r\n",);
+                        extra_headers.push(HeaderId::X_SPAM_STATUS, result);
                     }
-
-                    extra_headers_parsed.push(Header {
-                        name: HeaderName::Other(HEADER.into()),
-                        value: HeaderValue::Text(
-                            extra_headers[offset_start + 1..extra_headers.len() - 2]
-                                .to_string()
-                                .into(),
-                        ),
-                        offset_field: offset_field as u32,
-                        offset_start: offset_start as u32,
-                        offset_end: extra_headers.len() as u32,
-                    });
 
                     if is_spam && params.mailbox_ids == [INBOX_ID] {
                         params.mailbox_ids[0] = JUNK_ID;
@@ -387,42 +505,50 @@ impl EmailIngest for Server {
                 // iMIP processing
                 if self.core.groupware.itip_enabled
                     && !is_spam
-                    && is_sender_authenticated
-                    && !account.is_key_account()
+                    && !za_key
+                    && sender_authentication.is_authenticated()
                     && params
                         .access_token
                         .has_permission(Permission::CalendarSchedulingReceive)
                 {
-                    let account_info = self
-                        .build_account_info(account.clone())
-                        .await
-                        .caused_by(trc::location!())?;
+                    let mut account_info = None;
                     let mut sender = None;
-                    for part in &message.parts {
+                    for part in message.root().parts() {
                         if part.content_type().is_some_and(|ct| {
                             ct.ctype().eq_ignore_ascii_case("text")
                                 && ct
                                     .subtype()
                                     .is_some_and(|st| st.eq_ignore_ascii_case("calendar"))
                                 && ct.has_attribute("method")
-                        }) && let Some(itip_message) = part.text_contents()
+                        }) && let Some(itip_message) = part.text()
                         {
                             if itip_message.len() < self.core.groupware.itip_inbound_max_ical_size {
                                 if let Some(sender) = sender.get_or_insert_with(|| {
-                                    message
-                                        .from()
-                                        .and_then(|s| s.first())
-                                        .and_then(|s| s.address())
-                                        .and_then(sanitize_email)
+                                    if sender_authentication == SenderAuthentication::Submission {
+                                        sanitize_email(envelope_from)
+                                    } else {
+                                        message
+                                            .from()
+                                            .and_then(|s| s.first())
+                                            .and_then(|s| s.address())
+                                            .and_then(sanitize_email)
+                                    }
                                 }) {
-                                    match self
-                                        .itip_ingest(
-                                            &account_info,
-                                            sender,
-                                            deliver_to,
-                                            itip_message,
-                                        )
-                                        .await
+                                    let account_info = match &account_info {
+                                        Some(account_info) => account_info,
+                                        None => account_info.insert(
+                                            self.build_account_info(account.clone())
+                                                .await
+                                                .caused_by(trc::location!())?,
+                                        ),
+                                    };
+                                    match Box::pin(self.itip_ingest(
+                                        account_info,
+                                        sender,
+                                        deliver_to,
+                                        &itip_message,
+                                    ))
+                                    .await
                                     {
                                         Ok(message) => {
                                             if let Some(message) = message {
@@ -431,7 +557,7 @@ impl EmailIngest for Server {
                                             trc::event!(
                                                 Calendar(trc::CalendarEvent::ItipMessageReceived),
                                                 SpanId = params.session_id,
-                                                From = sender.to_string(),
+                                                From = CompactString::from(&*sender),
                                                 AccountId = account_id,
                                             );
                                         }
@@ -445,9 +571,9 @@ impl EmailIngest for Server {
                                                             trc::CalendarEvent::ItipMessageError
                                                         ),
                                                         SpanId = params.session_id,
-                                                        From = sender.to_string(),
+                                                        From = CompactString::from(&*sender),
                                                         AccountId = account_id,
-                                                        Details = err.to_string(),
+                                                        Details = err.to_compact_string(),
                                                     )
                                                 }
                                             }
@@ -465,7 +591,7 @@ impl EmailIngest for Server {
                                         .from()
                                         .and_then(|a| a.first())
                                         .and_then(|a| a.address())
-                                        .map(|a| a.to_string()),
+                                        .map(CompactString::from),
                                     AccountId = account_id,
                                     Details = "iMIP message too large",
                                     Limit = self.core.groupware.itip_inbound_max_ical_size,
@@ -499,18 +625,12 @@ impl EmailIngest for Server {
                     params.received_at = message
                         .root_part()
                         .headers()
-                        .iter()
-                        .filter_map(|header| {
-                            if let (HeaderName::Received, HeaderValue::Received(received)) =
-                                (&header.name, &header.value)
-                            {
-                                received
-                                    .date
-                                    .filter(|dt| dt.is_valid())
-                                    .map(|dt| dt.to_timestamp() as u64)
-                            } else {
-                                None
-                            }
+                        .all_received()
+                        .filter_map(|received| {
+                            received
+                                .date()
+                                .filter(|dt| dt.is_valid())
+                                .map(|dt| dt.to_timestamp() as u64)
                         })
                         .max();
                 }
@@ -527,6 +647,7 @@ impl EmailIngest for Server {
 
         // Encrypt message
         let do_encrypt = match params.source {
+            IngestSource::Jmap { .. } if params.keywords.contains(&Keyword::Draft) => false,
             IngestSource::Jmap { .. } | IngestSource::Imap { .. } => {
                 self.core.email.encrypt
                     && self.core.email.encrypt_append
@@ -539,7 +660,7 @@ impl EmailIngest for Server {
         let do_encrypt = do_encrypt && !za_key;
         let is_encrypted = if do_encrypt
             && !message.is_encrypted()
-            && let Some(encrypt_keys) = &account.encryption_key
+            && let Some(encrypt_keys) = account.encryption_key()
         {
             match message.encrypt(encrypt_keys, account.flags).await {
                 Ok(new_raw_message) => {
@@ -561,22 +682,6 @@ impl EmailIngest for Server {
                         train_spam = None;
                     }
 
-                    // Remove contents from parsed message
-                    for part in &mut message.parts {
-                        match &mut part.body {
-                            PartType::Text(txt) | PartType::Html(txt) => {
-                                *txt = Cow::from("");
-                            }
-                            PartType::Binary(bin) | PartType::InlineBinary(bin) => {
-                                *bin = Cow::from(&[][..]);
-                            }
-                            PartType::Message(_) => {
-                                part.body = PartType::Binary(Cow::from(&[][..]));
-                            }
-                            PartType::Multipart(_) => (),
-                        }
-                    }
-
                     true
                 }
                 Err(EncryptMessageError::Error(err)) => {
@@ -596,6 +701,8 @@ impl EmailIngest for Server {
         // Store blob
         let mut za_sealed = None;
         let (blob_hash, blob_hold) = if let Some(wrap) = &za_wrap {
+            // Mail spec 6.1 step 3: the sealed blob, never the queue's or the
+            // upload's plaintext one.
             let (sealed, staged) =
                 za_stage_sealed(self, wrap, account_id, raw_message.as_ref()).await?;
             za_sealed = Some(sealed);
@@ -603,57 +710,95 @@ impl EmailIngest for Server {
         } else if !is_encrypted && let Some(blob_hash) = params.blob_hash {
             (blob_hash.clone(), None)
         } else {
-            self.put_temporary_blob(account_id, raw_message.as_ref(), 60)
-                .await
-                .map(|(hash, op)| (hash, Some(op)))
-                .caused_by(trc::location!())?
-        };
-
-        // Assign IMAP UIDs
-        let mut mailbox_ids = Vec::with_capacity(params.mailbox_ids.len());
-        let mut imap_uids = Vec::with_capacity(params.mailbox_ids.len());
-        let mut ids = self
-            .assign_email_ids(account_id, params.mailbox_ids.iter().copied(), true)
+            self.hold_blob(
+                account_id,
+                BlobHash::generate(raw_message.as_ref()),
+                raw_message.as_ref(),
+                60,
+            )
             .await
-            .caused_by(trc::location!())?;
-        let document_id = ids.next().unwrap();
-        for (uid, mailbox_id) in ids.zip(params.mailbox_ids.iter().copied()) {
-            mailbox_ids.push(UidMailbox::new(mailbox_id, uid));
-            imap_uids.push(uid);
-        }
+            .map(|(hash, hold)| (hash, Some(hold)))
+            .caused_by(trc::location!())?
+        };
 
         // Build write batch
-        let mut batch = BatchBuilder::new();
-        let mailbox_ids_event = mailbox_ids
-            .iter()
-            .map(|m| trc::Value::from(m.mailbox_id))
-            .collect::<Vec<_>>();
         batch.with_account_id(account_id);
+        // Mail spec 6.1, the provisioning fence: an account read as ordinary
+        // takes the message only while it holds no vault record. A message's
+        // operations sit in one commit chunk (nothing here adds a commit
+        // point), so each chunk holding them carries the assertion.
+        if !za_key {
+            self.za_provisioning_fence(batch, account_id);
+        }
+        self.limit_disk_quota(batch, &account);
+        self.limit_object_quota(batch, &account, StorageQuota::MaxEmails);
+
+        // Reserve a document id and one IMAP UID per target mailbox
+        let document_slot = batch.reserve_document_id(account_id, Collection::Email);
+        let uid_slots = batch.reserve_uids(account_id, params.mailbox_ids.iter().copied());
+        let mailbox_ids: TinyVec<[MessageUid; 2]> = params
+            .mailbox_ids
+            .iter()
+            .copied()
+            .map(MessageUid::new_unassigned)
+            .collect();
 
         // Determine thread id
-        let thread_id = if let Some(thread_id) = thread_result.thread_id {
-            thread_id
-        } else {
-            batch
-                .with_collection(Collection::Thread)
-                .with_document(document_id)
-                .log_container_insert(SyncCollection::Thread);
-            document_id
+        let thread_slot = match (thread_result.thread_id, group_slot) {
+            (_, Some(slot)) => Some(slot),
+            (None, None) => {
+                batch
+                    .with_collection(Collection::Thread)
+                    .create_document(document_slot)
+                    .log_container_insert(SyncCollection::Thread);
+                Some(document_slot)
+            }
+            (Some(_), None) => None,
         };
 
-        let data = MessageData {
-            mailboxes: mailbox_ids.into_boxed_slice(),
-            keywords: params.keywords.into_boxed_slice(),
-            thread_id,
-            size: (message.raw_message.len() + extra_headers.len()) as u32,
+        let mut keywords = 0;
+        let mut keywords_extra = Vec::new();
+        let received_at = params.received_at.unwrap_or_else(now).min(MAX_RECEIVED_AT);
+        for keyword in std::mem::take(&mut params.keywords) {
+            match keyword.into_id() {
+                Ok(id) => keywords |= 1 << id,
+                Err(name) => keywords_extra.push(name),
+            }
+        }
+        let mut data = PendingMessageData {
+            data: MessageData {
+                mailboxes: mailbox_ids,
+                keywords,
+                keywords_extra,
+                thread_id: thread_result.thread_id.unwrap_or_default(),
+                size: (message.raw().len() + extra_headers.len()) as u32,
+                received_at,
+                sent_at: MessageData::sent_at_offset(sent_at, received_at),
+                change_id: 0,
+            },
+            uid_slots,
+            thread_slot,
+            change_id: None,
         };
+        if let Some(container) = metadata
+            .as_deref()
+            .and_then(|metadata| metadata.shared.as_ref())
+        {
+            data.data.set_metadata_kinds(container.kinds());
+        }
+        let thread_ref = data.thread_id();
 
         // Request spam training
         if let Some(learn_spam) = train_spam {
             self.add_spam_sample(
                 account_id,
-                &mut batch,
+                batch,
                 params.blob_hash.unwrap_or(&blob_hash).clone(),
+                if params.blob_hash.is_some() {
+                    params.raw_message.len()
+                } else {
+                    raw_message.len()
+                } as u64,
                 message
                     .from()
                     .and_then(|s| s.first())
@@ -667,114 +812,196 @@ impl EmailIngest for Server {
             );
         }
 
+        let thread_info = ThreadInfo {
+            thread_id: thread_ref,
+            ref_ids: &message_ids,
+        };
+        batch
+            .with_collection(Collection::Email)
+            .create_document(document_slot);
         if let Some(sealed) = za_sealed {
-            za_index_stub(
-                &mut batch,
-                sealed,
-                tenant_id,
-                document_id,
-                message,
-                extra_headers.into_bytes(),
-                extra_headers_parsed,
-                data,
-                params.received_at.unwrap_or_else(now),
-            )?;
-        } else {
-            batch
-                .with_collection(Collection::Email)
-                .with_document(document_id)
-                .index_message(
+            // Mail spec 5.2, 5.4: the stub in place of the metadata row; no
+            // threading key, no object metadata (refused above), no thread
+            // merge or recheck, no iTIP; the index entry as for any message
+            // (the worker indexes the visible fields only). The Message-ID
+            // stays out of the ingest event.
+            za_index_stub(batch, sealed, &message, &extra_headers, data)
+                .caused_by(trc::location!())?;
+            batch.queue_document_index(SearchIndex::Email, account_id, QueueDocumentId::Current);
+            if let Some(blob_hold) = blob_hold {
+                blob_hold.release(batch);
+            }
+            return Ok(PendingIngest::Queued(PendingEmail {
+                account_id,
+                document_slot,
+                uid_slots,
+                thread_id: thread_ref,
+                blob_hash,
+                size: raw_message_len,
+                thread_recheck: None,
+                private_commit: PrivateMetadataCommit::default(),
+                event: ingest_event(params.source, is_spam),
+                mailbox_ids: std::mem::take(&mut params.mailbox_ids),
+                message_id: Some("[redacted]".into()),
+                session_id: params.session_id,
+                start_time,
+                za_key: true,
+            }));
+        }
+        // SPDX-SnippetBegin
+        // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+        // SPDX-License-Identifier: LicenseRef-SEL
+        #[cfg(feature = "enterprise")]
+        batch
+            .index_message(tenant_id, &message, &extra_headers, blob_hash.clone(), data)
+            .caused_by(trc::location!())?;
+        // SPDX-SnippetEnd
+        #[cfg(not(feature = "enterprise"))]
+        batch
+            .index_message(&message, &extra_headers, blob_hash.clone(), data)
+            .caused_by(trc::location!())?;
+        batch
+            .set(
+                ValueClass::IndexProperty(IndexPropertyClass::Hash {
+                    property: EmailField::Threading.into(),
+                    hash: thread_result.thread_hash,
+                }),
+                thread_info,
+            )
+            .queue_document_index(SearchIndex::Email, account_id, QueueDocumentId::Current);
+
+        let mut private_commit = PrivateMetadataCommit::default();
+        if let Some(metadata) = metadata {
+            // Ruling 66: a private container's viewer was read as ordinary
+            // too; the owner's assertion is the fence above, in the same
+            // commit chunk (upgrade ruling 176: asserted once).
+            if !za_key
+                && let Some(fence) = metadata
+                    .private
+                    .as_ref()
+                    .map(|write| write.viewer_id)
+                    .filter(|viewer_id| *viewer_id != account_id)
+                    .and_then(|viewer_id| self.za_metadata_fence(viewer_id, None))
+            {
+                fence.apply(batch);
+            }
+            metadata
+                .build(
+                    batch,
+                    account_id,
+                    // SPDX-SnippetBegin
+                    // SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+                    // SPDX-License-Identifier: LicenseRef-SEL
+                    #[cfg(feature = "enterprise")]
                     tenant_id,
-                    message,
-                    extra_headers.into_bytes(),
-                    extra_headers_parsed,
-                    blob_hash.clone(),
-                    data,
-                    params.received_at.unwrap_or_else(now),
+                    // SPDX-SnippetEnd
+                    PendingId::Slot(document_slot),
+                    &mut private_commit,
                 )
-                .caused_by(trc::location!())?
-                .set(
-                    ValueClass::IndexProperty(IndexPropertyClass::Hash {
-                        property: EmailField::Threading.into(),
-                        hash: thread_result.thread_hash,
-                    }),
-                    ThreadInfo::serialize(thread_id, &message_ids),
-                )
-                .schedule_task(Task::IndexDocument(TaskIndexDocument {
-                    account_id: account_id.into(),
-                    document_id: document_id.into(),
-                    document_type: IndexDocumentType::Email,
-                    status: TaskStatus::now(),
-                }));
+                .caused_by(trc::location!())?;
         }
 
         if let Some(blob_hold) = blob_hold {
-            batch.clear(blob_hold);
+            blob_hold.release(batch);
         }
 
         // Merge threads if necessary
-        if (!thread_result.merge_ids.is_empty()
-            || matches!(
-                params.source,
-                IngestSource::Jmap { .. } | IngestSource::Imap { .. }
-            ))
-            && !za_key
-        {
+        let thread_recheck = if !thread_result.merge_ids.is_empty() {
             batch.schedule_task(Task::MergeThreads(TaskMergeThreads {
                 account_id: account_id.into(),
                 status: TaskStatus::now(),
                 thread_name: thread_result.thread_hash.to_string(),
                 message_ids: Map::new(message_ids.into_iter().map(|id| id.to_string()).collect()),
             }));
-        }
+            None
+        } else if !message_ids.is_empty()
+            && matches!(
+                params.source,
+                IngestSource::Jmap { .. } | IngestSource::Imap { .. }
+            )
+        {
+            Some(PendingThread::new(
+                thread_result.thread_hash,
+                message_ids,
+                thread_result.bucket_full,
+            ))
+        } else {
+            None
+        };
 
         // Add iTIP responses to batch
         if !itip_messages.is_empty() {
             ItipMessages::new(itip_messages)
-                .queue(&mut batch)
+                .queue(batch)
                 .caused_by(trc::location!())?;
         }
 
-        // Mail spec 6.1, the provisioning fence: an account read as ordinary
-        // takes the message only while it holds no vault record.
-        if !za_key {
-            self.za_provisioning_fence(&mut batch, account_id);
-        }
+        Ok(PendingIngest::Queued(PendingEmail {
+            account_id,
+            document_slot,
+            uid_slots,
+            thread_id: thread_ref,
+            blob_hash,
+            size: raw_message_len,
+            thread_recheck,
+            private_commit,
+            event: ingest_event(params.source, is_spam),
+            mailbox_ids: std::mem::take(&mut params.mailbox_ids),
+            message_id,
+            session_id: params.session_id,
+            start_time,
+            za_key: false,
+        }))
+    }
 
-        // Insert and obtain ids
-        let change_id = self
-            .store()
-            .write(batch.build_all())
-            .await
-            .caused_by(trc::location!())?
-            .last_change_id(account_id)?;
-
-        // Request FTS index
-        self.notify_task_queue();
+    async fn email_ingest_finish(
+        &self,
+        pending: PendingEmail,
+        assigned_ids: &AssignedIds,
+    ) -> IngestedEmail {
+        let PendingEmail {
+            account_id,
+            document_slot,
+            uid_slots,
+            thread_id,
+            blob_hash,
+            size,
+            thread_recheck,
+            private_commit,
+            event,
+            mailbox_ids,
+            message_id,
+            session_id,
+            start_time,
+            za_key: _,
+        } = pending;
+        self.private_metadata_committed(private_commit, assigned_ids)
+            .await;
+        let change_id = assigned_ids.last_change_id(account_id, SyncCollection::Email);
+        let document_id = assigned_ids.slot(document_slot);
+        let thread_id = match thread_id {
+            PendingId::Assigned(thread_id) => thread_id,
+            PendingId::Slot(slot) => assigned_ids.slot(slot),
+        };
+        let imap_uids = assigned_ids.slots(uid_slots).collect::<Vec<_>>();
 
         trc::event!(
-            MessageIngest(match params.source {
-                IngestSource::Smtp { .. } =>
-                    if !is_spam {
-                        MessageIngestEvent::Ham
-                    } else {
-                        MessageIngestEvent::Spam
-                    },
-                IngestSource::Jmap { .. } | IngestSource::Restore => MessageIngestEvent::JmapAppend,
-                IngestSource::Imap { .. } => MessageIngestEvent::ImapAppend,
-            }),
-            SpanId = params.session_id,
+            MessageIngest(event),
+            SpanId = session_id,
             AccountId = account_id,
             DocumentId = document_id,
-            MailboxId = mailbox_ids_event,
+            MailboxId = mailbox_ids
+                .iter()
+                .map(|mailbox_id| trc::Value::from(*mailbox_id))
+                .collect::<Vec<_>>(),
             BlobId = blob_hash.to_hex(),
             ChangeId = change_id,
             MessageId = message_id,
-            Size = raw_message_len,
+            Size = size,
             Elapsed = start_time.elapsed(),
         );
 
-        Ok(IngestedEmail {
+        IngestedEmail {
             document_id,
             thread_id,
             change_id,
@@ -787,26 +1014,25 @@ impl EmailIngest for Server {
                 },
                 section: None,
             },
-            size: raw_message_len as usize,
+            size: size as usize,
             imap_uids,
-        })
+            thread_recheck,
+        }
     }
 
     async fn find_thread_id(
         &self,
         account_id: u32,
         thread_name: &str,
-        message_ids: &[CheekyHash],
+        message_ids: &[u128],
     ) -> trc::Result<ThreadResult> {
         let mut result = ThreadResult {
             thread_id: None,
-            thread_hash: CheekyHash::new(if !thread_name.is_empty() {
-                thread_name
-            } else {
-                "!"
-            }),
+            thread_hash: thread_hash(thread_name),
             merge_ids: vec![],
             duplicate_ids: vec![],
+            matched_ids: vec![],
+            bucket_full: false,
         };
 
         if message_ids.is_empty() {
@@ -814,21 +1040,17 @@ impl EmailIngest for Server {
         }
 
         // Find thread ids
-        let key_len = IndexKeyPrefix::len() + result.thread_hash.len() + U32_LEN;
+        let thread_class = IndexPropertyClass::Hash {
+            property: EmailField::Threading.into(),
+            hash: result.thread_hash,
+        };
+        let key_len = thread_class.key_len();
         let document_id_pos = key_len - U32_LEN;
         let mut thread_merge = ThreadMerge::new();
+        let mut rows = 0;
         self.store()
             .iterate(
                 IterateParams::new(
-                    ValueKey {
-                        account_id,
-                        collection: Collection::Email.into(),
-                        document_id: 0,
-                        class: ValueClass::IndexProperty(IndexPropertyClass::Hash {
-                            property: EmailField::Threading.into(),
-                            hash: result.thread_hash,
-                        }),
-                    },
                     ValueKey {
                         account_id,
                         collection: Collection::Email.into(),
@@ -838,29 +1060,40 @@ impl EmailIngest for Server {
                             hash: result.thread_hash,
                         }),
                     },
+                    ValueKey {
+                        account_id,
+                        collection: Collection::Email.into(),
+                        document_id: 0,
+                        class: ValueClass::IndexProperty(IndexPropertyClass::Hash {
+                            property: EmailField::Threading.into(),
+                            hash: result.thread_hash,
+                        }),
+                    },
                 )
-                .ascending(),
+                .limit(THREAD_SCAN_WINDOW),
                 |key, value| {
+                    rows += 1;
                     if key.len() == key_len {
                         // Find matching references
                         let references = value.get(U32_LEN..).unwrap_or_default();
 
                         if has_message_id(message_ids, references) {
-                            let document_id = key.deserialize_be_u32(document_id_pos)?;
+                            let document_id = !key.deserialize_be_u32(document_id_pos)?;
                             let thread_id = value.deserialize_be_u32(0)?;
 
-                            if message_ids.len() == references.len() / CheekyHash::HASH_SIZE
+                            if message_ids.len() == references.len() / U128_LEN
                                 && references
-                                    .as_chunks::<{ CheekyHash::HASH_SIZE }>()
+                                    .as_chunks::<U128_LEN>()
                                     .0
                                     .iter()
                                     .zip(message_ids.iter())
-                                    .all(|(a, b)| a == b.as_raw_bytes())
+                                    .all(|(a, b)| u128::from_be_bytes(*a) == *b)
                             {
                                 result.duplicate_ids.push(document_id);
                             }
 
                             thread_merge.add(thread_id, document_id);
+                            result.matched_ids.push(document_id);
                         }
                     }
 
@@ -869,6 +1102,7 @@ impl EmailIngest for Server {
             )
             .await
             .caused_by(trc::location!())?;
+        result.bucket_full = rows >= THREAD_SCAN_WINDOW;
 
         match thread_merge.num_thread_ids() {
             0 => Ok(result),
@@ -887,93 +1121,69 @@ impl EmailIngest for Server {
         }
     }
 
-    async fn assign_email_ids(
-        &self,
-        account_id: u32,
-        mailbox_ids: impl IntoIterator<Item = u32> + Sync + Send,
-        generate_email_id: bool,
-    ) -> trc::Result<impl Iterator<Item = u32> + 'static> {
-        // Increment UID next
-        let mut batch = BatchBuilder::new();
-        batch.with_account_id(account_id);
-
-        let mut expected_ids = 0;
-        if generate_email_id {
-            batch
-                .with_collection(Collection::Email)
-                .add_and_get(ValueClass::DocumentId, 1);
-            expected_ids += 1;
-        }
-
-        batch.with_collection(Collection::Mailbox);
-
-        for mailbox_id in mailbox_ids {
-            batch
-                .with_document(mailbox_id)
-                .add_and_get(MailboxField::UidCounter, 1);
-            expected_ids += 1;
-        }
-
-        let ids = if expected_ids > 0 {
-            self.core.storage.data.write(batch.build_all()).await?
-        } else {
-            AssignedIds::default()
-        };
-        if ids.ids.len() == expected_ids {
-            Ok(ids.ids.into_iter().map(|id| match id {
-                AssignedId::Counter(id) => id as u32,
-                AssignedId::ChangeId(_) => unreachable!(),
-            }))
-        } else {
-            Err(trc::StoreEvent::UnexpectedError
-                .caused_by(trc::location!())
-                .ctx(trc::Key::Reason, "No all document ids were generated"))
-        }
-    }
-
-    async fn add_account_spam_sample(
+    async fn add_account_spam_samples(
         &self,
         batch: &mut BatchBuilder,
         account_id: u32,
-        document_id: u32,
-        is_spam: bool,
+        samples: SpamSamples,
         span_id: u64,
     ) -> trc::Result<()> {
-        if self.core.spam.classifier.is_some()
+        if self.core.spam.classifier.is_none()
+            || samples.is_empty()
             // Mail spec 6.4: no training sample for a key account, whichever
             // caller (IMAP STORE, COPY and MOVE, Email/set, Email/copy).
-            && !self.za_is_key_account(account_id).await?
-            && let Some(archive) = self
-                .store()
-                .get_value::<Archive<AlignedBytes>>(ValueKey::property(
-                    account_id,
-                    Collection::Email,
-                    document_id,
-                    EmailField::Metadata,
-                ))
-                .await
-                .caused_by(trc::location!())?
+            || self.za_is_key_account(account_id).await?
         {
-            #[cfg(feature = "test_mode")]
-            common::za::train_pause_point(account_id).await;
-            let metadata = archive
-                .to_unarchived::<MessageMetadata>()
-                .caused_by(trc::location!())?;
-            let part = metadata.inner.root_part();
+            return Ok(());
+        }
+        #[cfg(feature = "test_mode")]
+        common::za::train_pause_point(account_id).await;
 
+        let SpamSamples {
+            documents,
+            spam,
+            prepared,
+        } = samples;
+        batch.with_account_id(account_id);
+        // Mail ruling R55: the account was read as ordinary, so every commit
+        // chunk of its samples asserts that it holds no vault record.
+        self.za_provisioning_fence(batch, account_id);
+        for sample in prepared {
             self.add_spam_sample(
                 account_id,
                 batch,
-                (&metadata.inner.blob_hash).into(),
-                part.from().unwrap_or_default().to_string(),
-                thread_name(part.subject().unwrap_or_default()).to_string(),
-                is_spam,
+                sample.hash,
+                sample.size,
+                sample.from,
+                sample.subject,
+                sample.is_spam,
                 true,
                 span_id,
             );
+            za_training_commit_point(self, batch, account_id);
+        }
+        if documents.is_empty() {
+            return Ok(());
         }
 
-        Ok(())
+        self.message_metadata(account_id, &documents, |document_id, bytes| {
+            let sample = SpamSample::from_metadata(bytes, spam.contains(document_id))?;
+            self.add_spam_sample(
+                account_id,
+                batch,
+                sample.hash,
+                sample.size,
+                sample.from,
+                sample.subject,
+                sample.is_spam,
+                true,
+                span_id,
+            );
+            za_training_commit_point(self, batch, account_id);
+            Ok(true)
+        })
+        .await
+        .caused_by(trc::location!())
     }
 
     fn add_spam_sample(
@@ -981,6 +1191,7 @@ impl EmailIngest for Server {
         account_id: u32,
         batch: &mut BatchBuilder,
         hash: BlobHash,
+        size: u64,
         from: String,
         subject: String,
         is_spam: bool,
@@ -1009,7 +1220,10 @@ impl EmailIngest for Server {
                         hash,
                         to: BlobLink::Temporary { until },
                     },
-                    ObjectId::new(ObjectType::SpamTrainingSample, item_id.into()).serialize(),
+                    BlobLinkValue::new(size).with_object_id(ObjectId::new(
+                        ObjectType::SpamTrainingSample,
+                        item_id.into(),
+                    )),
                 )
                 .set(
                     ValueClass::Registry(RegistryClass::Item { object_id, item_id }),
@@ -1036,26 +1250,45 @@ impl EmailIngest for Server {
     }
 }
 
-pub fn has_message_id(a: &[CheekyHash], b: &[u8]) -> bool {
-    let mut i = 0;
-    let mut j = 0;
+pub fn thread_hash(thread_name: &str) -> Hash128 {
+    Hash128::from(xxh3_128(
+        if !thread_name.is_empty() {
+            thread_name
+        } else {
+            "!"
+        }
+        .as_bytes(),
+    ))
+}
 
-    let a_len = a.len();
-    let b_len = b.len() / CheekyHash::HASH_SIZE;
+pub fn has_message_id(a: &[u128], b: &[u8]) -> bool {
+    sorted_intersect(
+        a.iter().copied(),
+        b.as_chunks::<U128_LEN>()
+            .0
+            .iter()
+            .map(|chunk| u128::from_be_bytes(*chunk)),
+    )
+}
 
-    while i < a_len && j < b_len {
-        match a[i]
-            .as_raw_bytes()
-            .as_slice()
-            .cmp(&b[j * CheekyHash::HASH_SIZE..(j + 1) * CheekyHash::HASH_SIZE])
-        {
-            std::cmp::Ordering::Equal => return true,
-            std::cmp::Ordering::Less => i += 1,
-            std::cmp::Ordering::Greater => j += 1,
+fn sorted_intersect(mut a: impl Iterator<Item = u128>, mut b: impl Iterator<Item = u128>) -> bool {
+    let (Some(mut left), Some(mut right)) = (a.next(), b.next()) else {
+        return false;
+    };
+
+    loop {
+        match left.cmp(&right) {
+            Ordering::Equal => return true,
+            Ordering::Less => match a.next() {
+                Some(next) => left = next,
+                None => return false,
+            },
+            Ordering::Greater => match b.next() {
+                Some(next) => right = next,
+                None => return false,
+            },
         }
     }
-
-    false
 }
 
 impl IngestSource<'_> {
@@ -1064,18 +1297,60 @@ impl IngestSource<'_> {
     }
 }
 
-pub struct ThreadInfo;
-
-impl ThreadInfo {
-    pub fn serialize(thread_id: u32, ref_ids: &[CheekyHash]) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(U32_LEN + 1 + ref_ids.len() * CheekyHash::HASH_SIZE);
-        buf.extend_from_slice(&thread_id.to_be_bytes());
-        for ref_id in ref_ids {
-            buf.extend_from_slice(ref_id.as_raw_bytes());
-        }
-        buf
+/// Mail ruling R55: `commit_point`, then the provisioning fence again when it
+/// started a new commit chunk, so every chunk of a training batch carries it.
+fn za_training_commit_point(server: &Server, batch: &mut BatchBuilder, account_id: u32) {
+    let chunks = batch.commit_point_count();
+    batch.commit_point();
+    if batch.commit_point_count() != chunks {
+        server.za_provisioning_fence(batch, account_id);
     }
 }
+
+/// The ingest event of a message from `source` (upstream's match, shared by
+/// the key-account branch of `email_ingest_into`).
+fn ingest_event(source: IngestSource<'_>, is_spam: bool) -> MessageIngestEvent {
+    match source {
+        IngestSource::Smtp { .. } => {
+            if !is_spam {
+                MessageIngestEvent::Ham
+            } else {
+                MessageIngestEvent::Spam
+            }
+        }
+        IngestSource::Jmap { .. } | IngestSource::Restore => MessageIngestEvent::JmapAppend,
+        IngestSource::Imap { .. } => MessageIngestEvent::ImapAppend,
+    }
+}
+
+pub struct ThreadInfo<'x> {
+    pub thread_id: PendingId,
+    pub ref_ids: &'x [u128],
+}
+
+impl From<ThreadInfo<'_>> for SizedSetValue {
+    fn from(info: ThreadInfo<'_>) -> Self {
+        let mut buf = Vec::with_capacity(U32_LEN + 1 + info.ref_ids.len() * U128_LEN);
+        buf.extend_from_slice(&info.thread_id.assigned().unwrap_or_default().to_be_bytes());
+        for ref_id in info.ref_ids {
+            buf.extend_from_slice(ref_id.to_be_bytes().as_slice());
+        }
+
+        match info.thread_id {
+            PendingId::Slot(slot) => (
+                buf,
+                vec![Patch {
+                    offset: 0,
+                    source: PatchSource::SlotBeU32(slot),
+                }],
+            )
+                .into(),
+            PendingId::Assigned(_) => buf.into(),
+        }
+    }
+}
+
+const THREAD_SCAN_WINDOW: usize = 256;
 
 pub struct ThreadMerge {
     entries: AHashMap<u32, Vec<u32>>,
@@ -1159,3 +1434,11 @@ impl ThreadMerge {
         }
     }
 }
+
+mod checks;
+pub mod group;
+pub mod recheck;
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/email/src/message/ingest/tests.rs"]
+mod tests;

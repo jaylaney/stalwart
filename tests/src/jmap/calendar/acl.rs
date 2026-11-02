@@ -13,6 +13,8 @@ use jmap_proto::{
 use serde_json::json;
 use types::id::Id;
 
+// 1.0 lists `maySetMetadata` among the rights (`Acl::ModifyMetadata`): an
+// owner holds it, and no grant below gives it.
 pub async fn test(test: &TestServer) {
     println!("Running Calendar ACL tests...");
     let john = test.account("jdoe@example.com");
@@ -107,7 +109,8 @@ pub async fn test(test: &TestServer) {
             "mayWriteOwn": true,
             "mayReadFreeBusy": true,
             "mayUpdatePrivate": true,
-            "mayRSVP": true
+            "mayRSVP": true,
+            "maySetMetadata": true
         },
         "shareWith": {}
         }));
@@ -134,7 +137,9 @@ pub async fn test(test: &TestServer) {
         .await
         .method_response()
         .typ(),
-        "forbidden"
+        // 1.0: an account the session cannot reach is not found (RFC 8620
+        // 3.6.2); 0.16 answered forbidden.
+        "accountNotFound"
     );
 
     // Share calendar with Jane
@@ -177,7 +182,8 @@ pub async fn test(test: &TestServer) {
                 "mayWriteOwn": false,
                 "mayReadFreeBusy": false,
                 "mayUpdatePrivate": false,
-                "mayRSVP": false
+                "mayRSVP": false,
+                "maySetMetadata": false
             }
         }
         }));
@@ -206,7 +212,8 @@ pub async fn test(test: &TestServer) {
             "mayWriteOwn": false,
             "mayReadFreeBusy": false,
             "mayUpdatePrivate": false,
-            "mayRSVP": false
+            "mayRSVP": false,
+            "maySetMetadata": false
         }
         }));
     jane.jmap_get_account(
@@ -264,7 +271,8 @@ pub async fn test(test: &TestServer) {
             "mayWriteOwn": false,
             "mayReadFreeBusy": false,
             "mayUpdatePrivate": false,
-            "mayRSVP": false
+            "mayRSVP": false,
+            "maySetMetadata": false
           },
           "newRights": {
             "mayReadItems": true,
@@ -274,17 +282,28 @@ pub async fn test(test: &TestServer) {
             "mayWriteOwn": false,
             "mayReadFreeBusy": false,
             "mayUpdatePrivate": false,
-            "mayRSVP": false
+            "mayRSVP": false,
+            "maySetMetadata": false
           },
           "name": null
         }));
 
-    // Updating and deleting should fail
+    // Updating and deleting should fail.
+    // 1.0 checks a sharee's update by what it changes: an empty patch changes
+    // nothing and is accepted; a sharing change needs `Share`.
+    jane.jmap_update_account(
+        john,
+        MethodObject::Calendar,
+        [(&john_calendar_id, json!({}))],
+        Vec::<(&str, &str)>::new(),
+    )
+    .await
+    .updated(&john_calendar_id);
     assert_eq!(
         jane.jmap_update_account(
             john,
             MethodObject::Calendar,
-            [(&john_calendar_id, json!({}))],
+            [(&john_calendar_id, json!({"shareWith": {}}))],
             Vec::<(&str, &str)>::new(),
         )
         .await
@@ -304,17 +323,21 @@ pub async fn test(test: &TestServer) {
         .description(),
         "You are not allowed to delete this calendar."
     );
-    assert!(
+    // 1.0 checks an event update by what it changes (`groupware/src/calendar/
+    // rights.rs`), so the read-only sharee's refusal is tested with a change;
+    // 0.16 refused the empty patch with "You are not allowed to modify
+    // calendar ...".
+    assert_eq!(
         jane.jmap_update_account(
             john,
             MethodObject::CalendarEvent,
-            [(&john_event_id, json!({}))],
+            [(&john_event_id, json!({"title": "Changed by Jane"}))],
             Vec::<(&str, &str)>::new(),
         )
         .await
         .not_updated(&john_event_id)
-        .description()
-        .contains("You are not allowed to modify calendar"),
+        .description(),
+        "You are not allowed to modify this event."
     );
     assert!(
         jane.jmap_destroy_account(
@@ -329,7 +352,8 @@ pub async fn test(test: &TestServer) {
         .contains("You are not allowed to remove events from calendar"),
     );
 
-    // Grant Jane write access
+    // Grant Jane write access (1.0 derives mayWriteOwn, mayUpdatePrivate and
+    // mayRSVP from mayWriteAll in every rights object; 0.16 listed them false)
     john.jmap_update(
         MethodObject::Calendar,
         [(
@@ -363,10 +387,11 @@ pub async fn test(test: &TestServer) {
             "mayWriteAll": true,
             "mayDelete": true,
             "mayShare": false,
-            "mayWriteOwn": false,
+            "mayWriteOwn": true,
             "mayReadFreeBusy": false,
-            "mayUpdatePrivate": false,
-            "mayRSVP": false
+            "mayUpdatePrivate": true,
+            "mayRSVP": true,
+            "maySetMetadata": false
         }
         }));
 
@@ -412,17 +437,19 @@ pub async fn test(test: &TestServer) {
             "mayWriteOwn": false,
             "mayReadFreeBusy": false,
             "mayUpdatePrivate": false,
-            "mayRSVP": false
+            "mayRSVP": false,
+            "maySetMetadata": false
           },
           "newRights": {
             "mayReadItems": true,
             "mayWriteAll": true,
             "mayDelete": true,
             "mayShare": false,
-            "mayWriteOwn": false,
+            "mayWriteOwn": true,
             "mayReadFreeBusy": false,
-            "mayUpdatePrivate": false,
-            "mayRSVP": false
+            "mayUpdatePrivate": true,
+            "mayRSVP": true,
+            "maySetMetadata": false
           },
           "name": null
         }));
@@ -616,7 +643,9 @@ pub async fn test(test: &TestServer) {
         .await
         .method_response()
         .typ(),
-        "forbidden"
+        // 1.0: an account the session cannot reach is not found (RFC 8620
+        // 3.6.2); 0.16 answered forbidden.
+        "accountNotFound"
     );
 
     // Verify Jane received a share notification with the updated rights
@@ -657,10 +686,11 @@ pub async fn test(test: &TestServer) {
             "mayWriteAll": true,
             "mayDelete": true,
             "mayShare": false,
-            "mayWriteOwn": false,
+            "mayWriteOwn": true,
             "mayReadFreeBusy": false,
-            "mayUpdatePrivate": false,
-            "mayRSVP": false
+            "mayUpdatePrivate": true,
+            "mayRSVP": true,
+            "maySetMetadata": false
           },
           "newRights": {
             "mayReadItems": false,
@@ -670,7 +700,8 @@ pub async fn test(test: &TestServer) {
             "mayWriteOwn": false,
             "mayReadFreeBusy": false,
             "mayUpdatePrivate": false,
-            "mayRSVP": false
+            "mayRSVP": false,
+            "maySetMetadata": false
           },
           "name": null
         }));
@@ -704,8 +735,11 @@ pub async fn test(test: &TestServer) {
         [john_calendar_id.as_str()]
     );
 
-    // Destroy all mailboxes
+    // Destroy all mailboxes. 1.0 also notifies John of the changes Jane made to
+    // his shared calendar (CalendarEventNotification), which 0.16 did not.
     john.destroy_all_calendars().await;
     jane.destroy_all_calendars().await;
+    john.destroy_all_event_notifications().await;
+    jane.destroy_all_event_notifications().await;
     test.assert_is_empty().await;
 }

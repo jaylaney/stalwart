@@ -11,6 +11,8 @@ use jmap_proto::{
 };
 use serde_json::json;
 
+// 1.0 lists `maySetMetadata` among the rights (`Acl::ModifyMetadata`): an
+// owner holds it, and no grant below gives it.
 pub async fn test(test: &TestServer) {
     println!("Running File Storage ACL tests...");
     let john = test.account("jdoe@example.com");
@@ -23,6 +25,7 @@ pub async fn test(test: &TestServer) {
         .jmap_create(
             MethodObject::FileNode,
             [json!({
+                "@type": "Directory",
                 "name": "Test #1",
             })],
             Vec::<(&str, &str)>::new(),
@@ -45,6 +48,7 @@ pub async fn test(test: &TestServer) {
     .list()[0]
         .assert_is_equal(json!({
         "id": john_folder_id,
+        "@type": "Directory",
         "name": "Test #1",
         "myRights": {
           "mayRead": true,
@@ -52,9 +56,11 @@ pub async fn test(test: &TestServer) {
           "mayRename": true,
           "mayDelete": true,
           "mayModifyContent": true,
-          "mayShare": true
+          "mayShare": true,
+          "maySetMetadata": true
         },
-        "shareWith": {}
+        // 1.0 answers null for a node with no shares (`file/get.rs`).
+        "shareWith": null
         }));
 
     // Obtain share notifications
@@ -79,7 +85,9 @@ pub async fn test(test: &TestServer) {
         .await
         .method_response()
         .typ(),
-        "forbidden"
+        // 1.0: an account the session cannot reach is not found (RFC 8620
+        // 3.6.2); 0.16 answered forbidden.
+        "accountNotFound"
     );
 
     // Share folder with Jane
@@ -112,6 +120,7 @@ pub async fn test(test: &TestServer) {
     .list()[0]
         .assert_is_equal(json!({
         "id": john_folder_id,
+        "@type": "Directory",
         "name": "Test #1",
         "shareWith": {
             &jane_id : {
@@ -120,7 +129,8 @@ pub async fn test(test: &TestServer) {
                 "mayRename": false,
                 "mayDelete": false,
                 "mayModifyContent": false,
-                "mayShare": false
+                "mayShare": false,
+                "maySetMetadata": false
             }
         }
         }));
@@ -140,6 +150,7 @@ pub async fn test(test: &TestServer) {
     .list()[0]
         .assert_is_equal(json!({
         "id": john_folder_id,
+        "@type": "Directory",
         "name": "Test #1",
         "myRights": {
             "mayRead": true,
@@ -147,7 +158,8 @@ pub async fn test(test: &TestServer) {
             "mayRename": false,
             "mayDelete": false,
             "mayModifyContent": false,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
         }
         }));
 
@@ -191,7 +203,8 @@ pub async fn test(test: &TestServer) {
             "mayRename": false,
             "mayDelete": false,
             "mayModifyContent": false,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
           },
           "newRights": {
             "mayRead": true,
@@ -199,23 +212,34 @@ pub async fn test(test: &TestServer) {
             "mayRename": false,
             "mayDelete": false,
             "mayModifyContent": false,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
           },
           "name": null
         }));
 
-    // Updating and deleting should fail
+    // Updating and deleting should fail.
+    // 1.0 checks a sharee's update property by property: an empty patch changes
+    // nothing and is accepted; a rename needs `Modify`.
+    jane.jmap_update_account(
+        john,
+        MethodObject::FileNode,
+        [(&john_folder_id, json!({}))],
+        Vec::<(&str, &str)>::new(),
+    )
+    .await
+    .updated(&john_folder_id);
     assert_eq!(
         jane.jmap_update_account(
             john,
             MethodObject::FileNode,
-            [(&john_folder_id, json!({}))],
+            [(&john_folder_id, json!({"name": "Renamed by Jane"}))],
             Vec::<(&str, &str)>::new(),
         )
         .await
         .not_updated(&john_folder_id)
         .description(),
-        "You are not allowed to modify this file node."
+        "You are not allowed to rename or move this file node."
     );
     assert_eq!(
         jane.jmap_destroy_account(
@@ -227,7 +251,8 @@ pub async fn test(test: &TestServer) {
         .await
         .not_destroyed(&john_folder_id)
         .description(),
-        "You are not allowed to delete this file node."
+        // 1.0's refusal of a destroy without the right (`not_permitted`).
+        "You do not have permission to perform this operation."
     );
 
     // Grant Jane write access
@@ -260,6 +285,7 @@ pub async fn test(test: &TestServer) {
     .list()[0]
         .assert_is_equal(json!({
         "id": john_folder_id,
+        "@type": "Directory",
         "name": "Test #1",
         "myRights": {
             "mayRead": true,
@@ -267,7 +293,8 @@ pub async fn test(test: &TestServer) {
             "mayRename": true,
             "mayDelete": true,
             "mayModifyContent": true,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
         }
         }));
 
@@ -311,7 +338,8 @@ pub async fn test(test: &TestServer) {
             "mayRename": false,
             "mayDelete": false,
             "mayModifyContent": false,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
           },
           "newRights": {
             "mayRead": true,
@@ -319,7 +347,8 @@ pub async fn test(test: &TestServer) {
             "mayRename": true,
             "mayDelete": true,
             "mayModifyContent": true,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
           },
           "name": null
         }));
@@ -330,6 +359,7 @@ pub async fn test(test: &TestServer) {
             john,
             MethodObject::FileNode,
             [json!({
+                "@type": "Directory",
                 "name": "A new shared folder",
             })],
             Vec::<(&str, &str)>::new()
@@ -364,6 +394,7 @@ pub async fn test(test: &TestServer) {
     .list()[0]
         .assert_is_equal(json!({
         "id": john_folder_id,
+        "@type": "Directory",
         "name": "Jane's updated name",
         }));
 
@@ -393,8 +424,10 @@ pub async fn test(test: &TestServer) {
     .list()[0]
         .assert_is_equal(json!({
         "id": john_folder_id,
+        "@type": "Directory",
         "name": "Jane's updated name",
-        "shareWith": {}
+        // 1.0 answers null for a node with no shares (`file/get.rs`).
+        "shareWith": null
         }));
 
     // Verify Jane can no longer access the folder or its contacts
@@ -408,7 +441,9 @@ pub async fn test(test: &TestServer) {
         .await
         .method_response()
         .typ(),
-        "forbidden"
+        // 1.0: an account the session cannot reach is not found (RFC 8620
+        // 3.6.2); 0.16 answered forbidden.
+        "accountNotFound"
     );
 
     // Verify Jane received a share notification with the updated rights
@@ -450,7 +485,8 @@ pub async fn test(test: &TestServer) {
             "mayRename": true,
             "mayDelete": true,
             "mayModifyContent": true,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
           },
           "newRights": {
             "mayRead": false,
@@ -458,7 +494,8 @@ pub async fn test(test: &TestServer) {
             "mayRename": false,
             "mayDelete": false,
             "mayModifyContent": false,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
           },
           "name": null
         }));
@@ -485,7 +522,7 @@ pub async fn test(test: &TestServer) {
     let jane_folder_id = jane
         .jmap_create(
             MethodObject::FileNode,
-            [json!({"name": "jane-src"})],
+            [json!({"@type": "Directory", "name": "jane-src"})],
             Vec::<(&str, &str)>::new(),
         )
         .await
@@ -520,6 +557,7 @@ pub async fn test(test: &TestServer) {
     .list()[0]
         .assert_is_equal(json!({
             "id": &copied_id,
+            "@type": "Directory",
             "name": "copied-here",
             "parentId": &john_folder_id,
         }));
@@ -531,7 +569,7 @@ pub async fn test(test: &TestServer) {
     )
     .await
     .list()[0]
-        .assert_is_equal(json!({ "id": &jane_folder_id }));
+        .assert_is_equal(json!({ "id": &jane_folder_id, "@type": "Directory" }));
 
     // onExists=rename on copy: colliding into John's folder again must echo the new name
     let renamed_copy = jane
@@ -542,7 +580,12 @@ pub async fn test(test: &TestServer) {
                 "accountId": john.id_string(),
                 "onExists": "rename",
                 "create": {
-                    &jane_folder_id: { "parentId": &john_folder_id, "name": "copied-here" }
+                    // 1.0 reads the source id from "id" (RFC 8620 5.4).
+                    &jane_folder_id: {
+                        "id": &jane_folder_id,
+                        "parentId": &john_folder_id,
+                        "name": "copied-here"
+                    }
                 }
             },
             "0"

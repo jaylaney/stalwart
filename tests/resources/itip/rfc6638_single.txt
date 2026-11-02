@@ -26,7 +26,7 @@ from: cyrus@example.com
 to: bernard@example.net, mike@example.org, wilfredo@example.com
 summary: invite
 summary.attendee: Participants([ItipParticipant { email: "cyrus@example.com", name: Some("Cyrus Daboo"), is_organizer: true }, ItipParticipant { email: "bernard@example.net", name: Some("Bernard Desruisseaux"), is_organizer: false }, ItipParticipant { email: "mike@example.org", name: Some("Mike Douglass"), is_organizer: false }, ItipParticipant { email: "wilfredo@example.com", name: Some("Wilfredo Sanchez Vega"), is_organizer: false }])
-summary.dtstart: Time(ItipTime { start: 1243958400, tz_id: 32768 })
+summary.dtstart: Time(ItipTime { start: 1243958400, tz_id: 32768, kind: DateTime })
 summary.summary: Text("Lunch")
 BEGIN:VCALENDAR
 METHOD:REQUEST
@@ -166,7 +166,7 @@ from: wilfredo@example.com
 to: cyrus@example.com
 summary: rsvp ACCEPTED
 summary.attendee: Participants([ItipParticipant { email: "cyrus@example.com", name: Some("Cyrus Daboo"), is_organizer: true }, ItipParticipant { email: "bernard@example.net", name: Some("Bernard Desruisseaux"), is_organizer: false }, ItipParticipant { email: "mike@example.org", name: Some("Mike Douglass"), is_organizer: false }, ItipParticipant { email: "wilfredo@example.com", name: Some("Wilfredo Sanchez Vega"), is_organizer: false }])
-summary.dtstart: Time(ItipTime { start: 1243958400, tz_id: 32768 })
+summary.dtstart: Time(ItipTime { start: 1243958400, tz_id: 32768, kind: DateTime })
 summary.summary: Text("Lunch")
 BEGIN:VCALENDAR
 METHOD:REPLY

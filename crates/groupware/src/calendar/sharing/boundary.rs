@@ -20,7 +20,7 @@ use crate::calendar::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use common::Server;
-use store::write::{AlignedBytes, Archive, BatchBuilder};
+use store::write::{Archive, ArchiveBytes, BatchBuilder};
 use types::collection::SyncCollection;
 use vault::session::SessionKeys;
 
@@ -148,7 +148,7 @@ pub async fn za_complete_boundary(
     keys: &SessionKeys,
     calendar_id: u32,
     own_commit: Option<ZaBoundaryCommit>,
-) -> Result<Archive<AlignedBytes>, ZaCalendarError> {
+) -> Result<Archive<ArchiveBytes>, ZaCalendarError> {
     let attempts = if own_commit.is_some() { 2 } else { 1 };
     for attempt in 0..attempts {
         let context = za_owned_calendar_context(server, keys, calendar_id).await?;
@@ -173,7 +173,7 @@ pub async fn za_complete_boundary(
         let account = server.account_info(keys.account_id).await?;
         let mut batch = BatchBuilder::new();
         calendar.update(
-            account.account_tenant_ids(),
+            account.changed_by(),
             context.stored.to_unarchived::<Calendar>()?,
             keys.account_id,
             calendar_id,

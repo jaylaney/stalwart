@@ -10,14 +10,26 @@
 # folder; it sets no shell options, so the sourcing script's own stay in force.
 #
 # Per-machine state (data store, TLS files, logs, local.env) lives in ZA_RUN_DIR, which
-# defaults to .run/ in the repository (git-ignored). Per-machine secrets go in
-# $ZA_RUN_DIR/local.env, which is sourced here and never tracked.
+# defaults to .run-1.0/ in the repository (git-ignored). Per-machine secrets go in
+# $ZA_RUN_DIR/local.env, which is sourced here and never tracked. The 1.0 server cannot open
+# a store written by 0.16 (the old default, .run/), and there is no conversion, so 1.0 uses
+# its own state directory.
 #
 # Overridable from the environment: ZA_RUN_DIR, STALWART_BIN, BASE, ZA_ACCOUNT_PAGE_ORIGIN.
 # Required (usually from local.env): STALWART_RECOVERY_ADMIN.
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ZA_RUN_DIR="${ZA_RUN_DIR:-$REPO_ROOT/.run}"
+# The repository root, from this file's own path, never from the caller's working directory.
+# bash gives the sourced or executed file in BASH_SOURCE; zsh leaves BASH_SOURCE empty and
+# gives it in the prompt expansion %x. The zsh form is a syntax error in bash, so it is
+# evaluated only under zsh.
+if [ -n "${ZSH_VERSION:-}" ]; then
+  eval '_za_env_src="${(%):-%x}"'
+else
+  _za_env_src="${BASH_SOURCE[0]}"
+fi
+REPO_ROOT="$(cd "$(dirname "$_za_env_src")/../.." && pwd)"
+unset _za_env_src
+ZA_RUN_DIR="${ZA_RUN_DIR:-$REPO_ROOT/.run-1.0}"
 
 # The state directory must exist before local.env can be put in it.
 mkdir -p "$ZA_RUN_DIR"

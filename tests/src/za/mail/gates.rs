@@ -21,7 +21,7 @@ use crate::{
         imap::{AssertResult, ImapConnection, Type},
         jmap::JmapResponse,
         server::TestServer,
-        za::{bearer_token, wait_for_delivery, za_setup, za_setup_token},
+        za::{wait_for_delivery, za_bearer_token, za_setup, za_setup_token},
     },
     za::{
         STRONG,
@@ -113,7 +113,7 @@ pub async fn test(test: &mut TestServer) {
     keyless_tokens_hit_the_dispatcher_gate(test, &key).await;
     impersonation_is_refused(&admin, &key, &plain).await;
     master_user_login_is_foreign(&admin, &key, &plain).await;
-    oauth_grant_refused_for_impersonation(&admin, &key).await;
+    oauth_grant_refused_for_impersonation(&admin, &key, &plain).await;
     cross_account_copies_are_refused(test, &key, &plain, &other_plain).await;
     sharing_is_refused_on_key_mailboxes(&key, &plain).await;
     let stale = rf_2_stale_grant(test, &admin, &plain, &other_plain).await;
@@ -197,6 +197,15 @@ fn assert_refused(response: &Value, what: &str) {
 fn assert_forbidden(response: &Value, what: &str) {
     assert_eq!(response[0], "error", "{what}: {response}");
     assert_eq!(response[1]["type"], "forbidden", "{what}: {response}");
+    assert!(!response.to_string().contains(CANARY), "{what}: {response}");
+}
+
+/// Ruling 84: 1.0's own check refused the method call first, with `error`
+/// (`accountNotFound`, `fromAccountNotFound`), before the fork's refusal:
+/// nothing is read or written, and no content is answered.
+fn assert_account_refused(response: &Value, error: &str, what: &str) {
+    assert_eq!(response[0], "error", "{what}: {response}");
+    assert_eq!(response[1]["type"], error, "{what}: {response}");
     assert!(!response.to_string().contains(CANARY), "{what}: {response}");
 }
 
@@ -425,7 +434,7 @@ async fn keyless_tokens_hit_the_dispatcher_gate(test: &TestServer, key: &Account
     ];
 
     let channels = [
-        Keyless::Bearer(bearer_token(KEY, STRONG).await),
+        Keyless::Bearer(za_bearer_token(&test.server, KEY).await),
         Keyless::WebSocket(ws_connect(KEY, STRONG).await),
     ];
     let traced = Traced::start(&[EventType::Security(SecurityEvent::Unauthorized)]);
@@ -690,12 +699,16 @@ async fn cross_account_copies_are_refused(
         ),
         "Email/copy into the key account by its own client",
     );
-    assert_forbidden(
+    // Ruling 84: the plain session cannot reach the key account, so 1.0
+    // refuses its `accountId` first; the key account's own client above
+    // meets the fork's refusal.
+    assert_account_refused(
         first(
             &plain
                 .jmap_method_call("Email/copy", copy(plain, key, &plain_email))
                 .await,
         ),
+        "accountNotFound",
         "Email/copy into the key account",
     );
     let blob_copy = |from: &Account, to: &Account, id: &str| {
@@ -712,12 +725,27 @@ async fn cross_account_copies_are_refused(
         ),
         "Blob/copy into the key account",
     );
-    assert_forbidden(
+    // Ruling 84: the plain session cannot reach the key account, so 1.0
+    // refuses its `fromAccountId` first; the key account's own session,
+    // whose access to the plain account is a mailbox share, is refused a
+    // blob copy into it as `accountNotSupportedByMethod`. No session reaches
+    // the fork's refusal of a blob copy out of a key account; its refusal of
+    // one into a key account is the copy above.
+    assert_account_refused(
         first(
             &plain
                 .jmap_method_call("Blob/copy", blob_copy(key, plain, &key_blob))
                 .await,
         ),
+        "fromAccountNotFound",
+        "Blob/copy out of the key account by the plain account",
+    );
+    assert_account_refused(
+        first(
+            &key.jmap_method_call("Blob/copy", blob_copy(key, plain, &key_blob))
+                .await,
+        ),
+        "accountNotSupportedByMethod",
         "Blob/copy out of the key account",
     );
 
@@ -783,10 +811,10 @@ async fn cross_account_copies_are_refused(
         .collect::<Vec<_>>();
     copies.sort_unstable();
     // IMAP COPY and MOVE and JMAP Email/copy name the source account,
-    // Blob/copy the key account, the R31 refusals the source's owner: the
-    // key account seven times, the plain account for the two copies into
-    // the key account.
-    let mut expected = vec![Some(u64::from(key_id)); 7];
+    // Blob/copy the key account, the R31 refusals the source's owner.
+    // Ruling 84: the copies 1.0 refuses first trace nothing, which leaves
+    // the key account six times (0.16: seven) and the plain account twice.
+    let mut expected = vec![Some(u64::from(key_id)); 6];
     expected.extend([Some(u64::from(plain_id)); 2]);
     expected.sort_unstable();
     assert_eq!(copies, expected, "the copy refusals' traces: {events:?}");
@@ -997,6 +1025,10 @@ async fn rf_2_stale_grant(
         .await
         .assert_contains(&shared_name);
     imap.send_ok(&format!("SELECT \"{shared_name}\"")).await;
+    // Control for the metadata case below: the share's annotations, read
+    // while the account is plain.
+    imap.send_ok(&format!("GETMETADATA \"{shared_name}\" /shared/comment"))
+        .await;
     let mailbox_get = json!({ "accountId": stale.id_string(), "ids": null });
     assert_eq!(
         first(
@@ -1054,6 +1086,22 @@ async fn rf_2_stale_grant(
     ] {
         assert_imap_refused(&mut imap, command).await;
     }
+    // Ruling 66 (the Task 6 review's F6): the ordinary session's metadata
+    // commands on the key account's mailbox are refused, by
+    // `metadata_mailbox`'s check or, once the session's mailboxes are
+    // resynchronized without the share, as a mailbox not found; nothing is
+    // stored either way.
+    for command in [
+        format!("GETMETADATA \"{shared_name}\" /shared/comment"),
+        format!("SETMETADATA \"{shared_name}\" (/shared/comment \"stale-canary\")"),
+    ] {
+        imap.send(&command).await;
+        imap.assert_read(Type::Tagged, ResponseType::No).await;
+    }
+    assert!(
+        !test.server.za_has_object_metadata(stale_id).await.unwrap(),
+        "the stale grantee stored object metadata on the key account's mailbox"
+    );
     for (method, args) in [
         ("Mailbox/get", mailbox_get.clone()),
         (
@@ -1061,8 +1109,12 @@ async fn rf_2_stale_grant(
             json!({ "accountId": stale.id_string(), "filter": { "inMailbox": inbox() } }),
         ),
     ] {
-        assert_refused(
+        // Ruling 84: 1.0 rechecks the account's access on each call, and
+        // the provisioned account left the grantee's token (the filter in
+        // `build_access_token`), so the WebSocket's call no longer finds it.
+        assert_account_refused(
             &socket.call(plain, method, args).await,
+            "accountNotFound",
             &format!("{method} over the grantee's WebSocket"),
         );
     }
@@ -1144,8 +1196,10 @@ async fn rf_2_stale_grant(
     imap.assert_read(Type::Tagged, ResponseType::No).await;
     imap.send_ok("LOGOUT").await;
 
-    assert_forbidden(
+    // Ruling 84: as over the WebSocket, the account is not found.
+    assert_account_refused(
         first(&plain.jmap_method_call("Mailbox/get", mailbox_get).await),
+        "accountNotFound",
         "Mailbox/get of the provisioned account",
     );
     assert!(
@@ -1154,7 +1208,7 @@ async fn rf_2_stale_grant(
             .is_none(),
         "the session object lists the provisioned account"
     );
-    assert_forbidden(
+    assert_account_refused(
         first(
             &plain
                 .jmap_method_call(
@@ -1166,6 +1220,7 @@ async fn rf_2_stale_grant(
                 )
                 .await,
         ),
+        "accountNotFound",
         "Email/get of the provisioned account's message",
     );
     assert_eq!(
@@ -1322,6 +1377,14 @@ async fn group_member_stale_token(
         .await
         .assert_contains(&shared_name);
     imap.send_ok(&format!("SELECT \"{shared_name}\"")).await;
+    // A second session of the member, which lists the share and selects
+    // nothing: its IDLE reports the share's removal (ruling 134).
+    let mut idle = ImapConnection::connect(b"_l ").await;
+    idle.authenticate(MEMBER, STRONG).await;
+    idle.send(r#"LIST "" "*""#).await;
+    idle.assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_contains(&shared_name);
     let mailbox_get = json!({ "accountId": shared.id_string(), "ids": null });
     assert_eq!(
         first(
@@ -1342,6 +1405,42 @@ async fn group_member_stale_token(
     )
     .await;
     let shared_doc = message_ids(test, shared_id).await[0];
+
+    // Ruling 134 (`za_unlist_key_accounts`, ruling R34): the member's token
+    // still names the provisioned account, so the IDLE's mailbox sync, woken
+    // by a delivery to the member, drops the share and reports it deleted
+    // (`\NonExistent`, as upstream reports a revoked share) before any
+    // status of the member's own mailboxes.
+    idle.send("IDLE").await;
+    idle.assert_read(Type::Continuation, ResponseType::Ok).await;
+    deliver(
+        test,
+        SENDER,
+        MEMBER,
+        &message_with("gates group idle wake", "gates group idle body"),
+    )
+    .await;
+    let update = idle.assert_read(Type::Status, ResponseType::Ok).await;
+    assert!(
+        update
+            .iter()
+            .any(|line| line.starts_with("* LIST (\\NonExistent)") && line.contains(&shared_name)),
+        "the IDLE did not report the share's removal first: {update:?}"
+    );
+    idle.send_untagged("DONE").await;
+    let lines = idle.assert_read(Type::Tagged, ResponseType::Ok).await;
+    assert!(
+        !lines
+            .iter()
+            .chain(update.iter())
+            .any(|line| line.contains("canary")),
+        "content in the IDLE's updates: {lines:?}"
+    );
+    idle.send(r#"LIST "" "*""#).await;
+    idle.assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_not_contains(GROUP_OWNER);
+    idle.send_ok("LOGOUT").await;
 
     let traced = Traced::start(&[EventType::Security(SecurityEvent::Unauthorized)]);
     for (method, args) in [
@@ -1618,7 +1717,7 @@ async fn impersonated_session_is_foreign(test: &mut TestServer, admin: &Account)
 }
 
 /// The OAuth client of `oauth_grant_refused_for_impersonation` (the suite
-/// requires no client registration, as `bearer_token`).
+/// requires no client registration at 0.16; see `za_grant_token` for 1.0).
 const OAUTH_CLIENT: &str = "za-gates-test";
 const OAUTH_REDIRECT: &str = "https://client.example.com/callback";
 
@@ -1682,20 +1781,42 @@ async fn device_token(base: &Account, device_code: &str) -> Value {
 /// and issues no code, an authorization code (`authCode`) or a device grant
 /// (`authDevice`, whose device code stays pending); the trace names the
 /// account. The same logins for a plain account are granted (the control).
-async fn oauth_grant_refused_for_impersonation(admin: &Account, key: &Account) {
+async fn oauth_grant_refused_for_impersonation(admin: &Account, key: &Account, plain: &Account) {
     println!("oauth_grant_refused_for_impersonation");
+    // 1.0 grants only to a registered client (0.16 took any client id).
+    let client = admin
+        .registry_create_object(registry::schema::structs::OAuthClient {
+            client_id: OAUTH_CLIENT.to_string(),
+            redirect_uris: vec![OAUTH_REDIRECT.to_string()].into(),
+            grant_types: vec![
+                registry::schema::enums::OAuthGrantType::AuthorizationCode,
+                registry::schema::enums::OAuthGrantType::DeviceCode,
+            ]
+            .into(),
+            ..Default::default()
+        })
+        .await;
     let key_id = key.id().document_id();
     let traced = Traced::start(&[EventType::Security(SecurityEvent::Unauthorized)]);
     for (account, refused) in [(KEY, true), (PLAIN, false)] {
         let master = format!("{account}%{}", admin.name());
+        // 1.0's login API takes the authorization endpoint's query string
+        // (with an S256 challenge) and the consent, and answers a granted
+        // login with `authenticated` and the redirect carrying the code.
+        let query = format!(
+            "response_type=code&client_id={OAUTH_CLIENT}&redirect_uri={}\
+             &code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM\
+             &code_challenge_method=S256&state=za-gates",
+            OAUTH_REDIRECT.replace(':', "%3A").replace('/', "%2F")
+        );
         let reply = api_auth(
             key,
             json!({
                 "type": "authCode",
                 "accountName": &master,
                 "accountSecret": admin.secret(),
-                "clientId": OAUTH_CLIENT,
-                "redirectUri": OAUTH_REDIRECT,
+                "query": query,
+                "consent": true,
             }),
         )
         .await;
@@ -1707,7 +1828,10 @@ async fn oauth_grant_refused_for_impersonation(admin: &Account, key: &Account) {
             );
         } else {
             assert!(
-                reply["client_code"].is_string(),
+                reply["type"] == "authenticated"
+                    && reply["location"]
+                        .as_str()
+                        .is_some_and(|location| location.contains("code=")),
                 "control: authCode for {account}: {reply}"
             );
         }
@@ -1720,6 +1844,7 @@ async fn oauth_grant_refused_for_impersonation(admin: &Account, key: &Account) {
                 "accountName": &master,
                 "accountSecret": admin.secret(),
                 "code": user_code,
+                "consent": true,
             }),
         )
         .await;
@@ -1754,4 +1879,25 @@ async fn oauth_grant_refused_for_impersonation(admin: &Account, key: &Account) {
         .map(|e| e.account_id)
         .collect::<Vec<_>>();
     assert_eq!(refused, vec![Some(u64::from(key_id)); 2], "the refusals");
+    // The controls' grants (1.0 stores an OAuth grant per authorization),
+    // which the plain account owns.
+    let grants = plain
+        .registry_get_all::<registry::schema::structs::OAuthGrant>()
+        .await
+        .into_iter()
+        .filter(|(_, grant)| grant.client_id == OAUTH_CLIENT)
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+    assert!(!grants.is_empty(), "the controls' grants");
+    plain
+        .registry_destroy(
+            registry::schema::prelude::ObjectType::OAuthGrant,
+            grants.clone(),
+        )
+        .await
+        .assert_destroyed(&grants);
+    admin
+        .registry_destroy(registry::schema::prelude::ObjectType::OAuthClient, [client])
+        .await
+        .assert_destroyed(&[client]);
 }

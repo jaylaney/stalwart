@@ -135,7 +135,10 @@ pub async fn test(test: &TestServer) {
         .collect::<AHashSet<_>>(),
     );
 
-    // Verify event contents
+    // Verify event contents. A full get at 1.0 also returns the JMAP for
+    // Calendars properties (asserted on their own below) and JSCalendar's
+    // `version`, and a server-set `created` that `assert_eq_ignoring_updated`
+    // leaves out like `updated`.
     let response = account
         .jmap_get(
             MethodObject::CalendarEvent,
@@ -148,6 +151,11 @@ pub async fn test(test: &TestServer) {
         &response.list()[0],
         event_1
             .with_property(JSCalendarProperty::<Id>::Id, event_1_id.as_str())
+            .with_property(JSCalendarProperty::<Id>::MayInviteSelf, true)
+            .with_property(JSCalendarProperty::<Id>::MayInviteOthers, true)
+            .with_property(JSCalendarProperty::<Id>::HideAttendees, true)
+            .with_property(JSCalendarProperty::<Id>::UseDefaultAlerts, false)
+            .with_property("version", "2.0")
             .with_property(JSCalendarProperty::<Id>::IsDraft, true)
             .with_property(JSCalendarProperty::<Id>::IsOrigin, true),
     );
@@ -155,12 +163,19 @@ pub async fn test(test: &TestServer) {
         &response.list()[1],
         event_2
             .with_property(JSCalendarProperty::<Id>::Id, event_2_id.as_str())
+            .with_property(JSCalendarProperty::<Id>::MayInviteSelf, false)
+            .with_property(JSCalendarProperty::<Id>::MayInviteOthers, false)
+            .with_property(JSCalendarProperty::<Id>::HideAttendees, false)
+            .with_property(JSCalendarProperty::<Id>::UseDefaultAlerts, true)
+            .with_property("version", "2.0")
             .with_property(JSCalendarProperty::<Id>::IsDraft, false)
             .with_property(JSCalendarProperty::<Id>::IsOrigin, true)
+            // 1.0 keeps the calendar's default alert id ("abc"; 0.16 numbered
+            // it k1) and leaves out an override's unchanged duration.
             .with_property(
                 JSCalendarProperty::<Id>::Alerts,
                 json!({
-                  "k1": {
+                  "abc": {
                     "action": "display",
                     "trigger": {
                       "@type": "OffsetTrigger",
@@ -169,12 +184,32 @@ pub async fn test(test: &TestServer) {
                     "@type": "Alert"
                   }
                 }),
+            )
+            .with_property(
+                JSCalendarProperty::<Id>::RecurrenceOverrides,
+                json!({
+                  "2006-01-04T12:00:00": {
+                    "title": "Event #2 bis",
+                    "start": "2006-01-04T14:00:00",
+                    "updated": "2006-02-06T00:11:21Z"
+                  },
+                  "2006-01-06T12:00:00": {
+                    "title": "Event #2 bis bis",
+                    "start": "2006-01-06T14:00:00",
+                    "updated": "2006-02-06T00:11:21Z"
+                  }
+                }),
             ),
     );
     assert_eq_ignoring_updated(
         &response.list()[2],
         event_3
             .with_property(JSCalendarProperty::<Id>::Id, event_3_id.as_str())
+            .with_property(JSCalendarProperty::<Id>::MayInviteSelf, false)
+            .with_property(JSCalendarProperty::<Id>::MayInviteOthers, false)
+            .with_property(JSCalendarProperty::<Id>::HideAttendees, false)
+            .with_property(JSCalendarProperty::<Id>::UseDefaultAlerts, false)
+            .with_property("version", "2.0")
             .with_property(JSCalendarProperty::<Id>::IsDraft, false)
             .with_property(JSCalendarProperty::<Id>::IsOrigin, false),
     );
@@ -251,21 +286,25 @@ pub async fn test(test: &TestServer) {
               "2006-01-06T12:00:00": {
                 "updated": "2006-02-06T00:11:21Z",
                 "start": "2006-01-06T14:00:00",
-                "title": "Event #2 bis bis",
-                "duration": "PT1H"
+                "title": "Event #2 bis bis"
               }
             },
             "id": "c"
           },
           {
             "title": "Event #3",
+            // 1.0's reduceParticipants keeps the participants it returns
+            // whole (their status and roles); 0.16 kept the address and the
+            // owner role only.
             "participants": {
               "3f5bc8c0-c722-5345-b7d9-5a899db08a30": {
                 "calendarAddress": "mailto:cyrus@example.com",
                 "@type": "Participant",
                 "roles": {
-                  "owner": true
-                }
+                  "owner": true,
+                  "chair": true
+                },
+                "participationStatus": "accepted"
               }
             },
             "id": "d"
@@ -448,13 +487,11 @@ pub async fn test(test: &TestServer) {
                 "2006-01-04T12:00:00": {
                     "title": "Event two overridden",
                     "start": "2006-01-04T14:00:00",
-                    "duration": "PT1H",
                     "updated": "2006-02-06T00:11:21Z"
                 },
                 "2006-01-06T12:00:00": {
                     "title": "Event two overridden twice",
                     "start": "2006-01-06T14:00:00",
-                    "duration": "PT1H",
                     "updated": "2006-02-06T00:11:21Z"
                 }
             },
@@ -552,6 +589,8 @@ pub async fn test(test: &TestServer) {
         )
         .await
         .list_array()
+        // 1.0: a non-recurring event's instance has no base event
+        // (`baseEventId` null); 0.16 named the event itself.
         .assert_is_equal(json!([
           {
             "duration": "PT1H",
@@ -559,7 +598,7 @@ pub async fn test(test: &TestServer) {
             "start": "2006-01-02T10:00:00",
             "timeZone": "US/Eastern",
             "id": &ids[0],
-            "baseEventId": &event_1_id
+            "baseEventId": null
           },
           {
             "recurrenceId": "2006-01-02T12:00:00",
@@ -585,7 +624,7 @@ pub async fn test(test: &TestServer) {
             "duration": "PT2H",
             "title": "Event three",
             "id": &ids[3],
-            "baseEventId": &event_3_id
+            "baseEventId": null
           },
           {
             "recurrenceId": "2006-01-04T12:00:00",
@@ -703,7 +742,15 @@ END:VCALENDAR
       "CONFERENCE": true
     },
     "organizerCalendarAddress": "mailto:jsmith@example.com",
-    "duration": "P2DT7H30M"
+    "duration": "P2DT7H30M",
+    // 1.0's parse also lists the server-set properties, null for a parsed
+    // event, and the JSCalendar version.
+    "id": null,
+    "baseEventId": null,
+    "calendarIds": null,
+    "isDraft": null,
+    "isOrigin": null,
+    "version": "2.0"
   }
 ]));
 
@@ -729,7 +776,7 @@ END:VCALENDAR
     let dav_client = account.webdav_client();
     let resources = test
         .server
-        .fetch_dav_resources(account_id, account_id, SyncCollection::Calendar)
+        .fetch_groupware_resources(account_id, account_id, SyncCollection::Calendar)
         .await
         .unwrap();
     let path = format!(
@@ -738,9 +785,9 @@ END:VCALENDAR
         resources
             .paths
             .iter()
-            .find(|v| v.parent_id.is_some())
+            .find(|(_, v)| v.parent_id != common::NO_ID)
+            .map(|(chunk, v)| chunk.path_str(v))
             .unwrap()
-            .path
     );
 
     let ical = dav_client
@@ -749,7 +796,7 @@ END:VCALENDAR
         .with_status(StatusCode::OK)
         .expect_body()
         .lines()
-        .filter(|line| !line.starts_with("DTSTAMP"))
+        .filter(|line| !line.starts_with("DTSTAMP") && !line.starts_with("CREATED"))
         .map(String::from)
         .collect::<AHashSet<_>>();
     let expected_ical = TEST_ICAL_1
@@ -1072,7 +1119,27 @@ fn test_jscalendar_participants(uid: &str, organizer: Option<&str>) -> Value {
 }
 
 pub fn assert_eq_ignoring_updated(got: &Value, expected: Value) {
-    strip_updated(got.clone()).assert_is_equal(strip_updated(expected));
+    let mut got = got.clone();
+    strip_unexpected_created(&mut got, &expected);
+    strip_updated(got).assert_is_equal(strip_updated(expected));
+}
+
+/// 1.0 sets a server `created` timestamp on an event the fixture created
+/// without one; it is left out where the expectation names none.
+fn strip_unexpected_created(got: &mut Value, expected: &Value) {
+    match (got, expected) {
+        (Value::Object(got), Value::Object(expected)) => {
+            if !expected.contains_key("created") {
+                got.remove("created");
+            }
+        }
+        (Value::Array(got), Value::Array(expected)) => {
+            for (got, expected) in got.iter_mut().zip(expected) {
+                strip_unexpected_created(got, expected);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn strip_updated(mut value: Value) -> Value {
@@ -1180,15 +1247,59 @@ pub fn test_jscalendar_4() -> Value {
     })
 }
 
+// 1.0's CalDAV view of the JMAP event: its PRODID, the referenced time zone,
+// the description, SEQUENCE and the alert (with its JSCalendar id) the event
+// holds by then, and a server CREATED (left out of the comparison).
 const TEST_ICAL_1: &str = r#"BEGIN:VCALENDAR
 VERSION:2.0
+PRODID:-//Stalwart Labs LLC//Stalwart Server//EN
 BEGIN:VEVENT
 DTSTART;TZID=US/Eastern:20060102T100000
 UID:74855313FA803DA593CD579A@example.com
 DURATION:PT1H
 SUMMARY:Event one
+DESCRIPTION:Event one
 DTSTAMP:20060206T001102Z
 CATEGORIES:work
+SEQUENCE:1
+BEGIN:VALARM
+ACTION:DISPLAY
+TRIGGER:PT15M
+JSID:abc
+END:VALARM
 END:VEVENT
+BEGIN:VTIMEZONE
+TZID:US/Eastern
+BEGIN:STANDARD
+DTSTART:20051230T190000
+TZNAME:EST
+TZOFFSETFROM:-0500
+TZOFFSETTO:-0500
+END:STANDARD
+BEGIN:DAYLIGHT
+DTSTART:20060402T020000
+TZNAME:EDT
+TZOFFSETFROM:-0500
+TZOFFSETTO:-0400
+END:DAYLIGHT
+BEGIN:STANDARD
+DTSTART:20061029T020000
+TZNAME:EST
+TZOFFSETFROM:-0400
+TZOFFSETTO:-0500
+END:STANDARD
+BEGIN:DAYLIGHT
+DTSTART:20070311T020000
+TZNAME:EDT
+TZOFFSETFROM:-0500
+TZOFFSETTO:-0400
+END:DAYLIGHT
+BEGIN:STANDARD
+DTSTART:20071104T020000
+TZNAME:EST
+TZOFFSETFROM:-0400
+TZOFFSETTO:-0500
+END:STANDARD
+END:VTIMEZONE
 END:VCALENDAR
 "#;

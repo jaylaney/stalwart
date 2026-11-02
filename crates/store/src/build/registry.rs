@@ -104,6 +104,11 @@ impl RegistryStore {
     }
 
     #[inline(always)]
+    pub fn process_nonce(&self) -> [u8; 16] {
+        self.0.process_nonce
+    }
+
+    #[inline(always)]
     pub fn is_recovery_mode(&self) -> bool {
         self.0.env_recovery_mode
     }
@@ -129,6 +134,8 @@ impl RegistryStore {
         inner
     }
 
+    /// Zero-access fork: the test harness's constructors (0.16.27's, with
+    /// 1.0.1's process nonce).
     #[cfg(feature = "test_mode")]
     pub fn clone_with_public_url(&self, url: String) -> Self {
         let mut inner = self.0.as_ref().clone();
@@ -156,6 +163,7 @@ impl RegistryStore {
                 env_hostname: hostname,
                 env_public_url: None,
                 id_generator: utils::snowflake::SnowflakeIdGenerator::new(),
+                process_nonce: rand::random(),
             },
             true,
         )
@@ -163,3 +171,8 @@ impl RegistryStore {
         .unwrap()
     }
 }
+
+#[cfg(stalwart_tests)]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/store/src/build/registry/test_support.rs"]
+mod test_support;

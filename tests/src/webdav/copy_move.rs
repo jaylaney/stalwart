@@ -147,7 +147,15 @@ pub async fn test(test: &TestServer, assisted_discovery: bool) {
                 ["D:getetag"],
             )
             .await
-            .with_href_count(2)
+            // 1.0 logs every descendant of a moved file container
+            // (`log_descendant_updates`), whose hrefs changed, so the
+            // changes hold the renamed subtree as well as the old root;
+            // calendars and address books keep the two entries.
+            .with_href_count(if resource_type == DavResourceName::File {
+                hierarchy.len() + 1
+            } else {
+                2
+            })
             .into_propfind_response(None);
         changes
             .properties(&hierarchy_root)
@@ -604,7 +612,9 @@ pub async fn test(test: &TestServer, assisted_discovery: bool) {
                         "",
                     )
                     .await
-                    .with_status(StatusCode::PRECONDITION_FAILED)
+                    // A UID conflict is 403 at 1.0 (0.16: 412), as ruling 50
+                    // records.
+                    .with_status(StatusCode::FORBIDDEN)
                     .with_failed_precondition(
                         if resource_type == DavResourceName::Cal {
                             "A:no-uid-conflict.D:href"
@@ -764,7 +774,8 @@ pub async fn test(test: &TestServer, assisted_discovery: bool) {
                     StatusCode::CREATED => {
                         num_success += 1;
                     }
-                    StatusCode::PRECONDITION_FAILED => {
+                    // 1.0 answers an exceeded quota 507 (0.16: 412).
+                    StatusCode::INSUFFICIENT_STORAGE => {
                         did_fail = true;
                         break;
                     }

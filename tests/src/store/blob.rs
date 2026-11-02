@@ -6,15 +6,15 @@
 
 use crate::utils::{cleanup::store_destroy, server::TestServerBuilder};
 use ahash::AHashMap;
-use email::message::metadata::MessageMetadata;
+use email::message::metadata::{MessageMetadata, MetadataRow};
 use registry::{
     schema::{enums::CompressionAlgo, structs::Jmap},
     types::duration::Duration,
 };
-use services::task_manager::destroy_account::destroy_account_blobs;
+use services::task_manager::tasks::destroy_account::destroy_account_blobs;
 use store::{
-    BlobStore, Serialize, SerializeInfallible,
-    write::{Archiver, BatchBuilder, BlobLink, BlobOp, ValueClass, now},
+    BlobStore, SerializeInfallible, Store, ValueKey,
+    write::{BatchBuilder, BlobLink, BlobOp, ValueClass, now},
 };
 use types::{blob::BlobClass, blob_hash::BlobHash, collection::Collection, field::EmailField};
 
@@ -57,18 +57,13 @@ pub async fn blob_tests() {
     // Reserve blob
     let until = now() + 1;
     store
-        .write(
-            BatchBuilder::new()
-                .with_account_id(0)
-                .set(
-                    BlobOp::Link {
-                        to: BlobLink::Temporary { until },
-                        hash: hash.clone(),
-                    },
-                    1024u32.serialize(),
-                )
-                .build_all(),
-        )
+        .write_batch(BatchBuilder::new().with_account_id(0).set(
+            BlobOp::Link {
+                to: BlobLink::Temporary { until },
+                hash: hash.clone(),
+            },
+            1024u32.serialize(),
+        ))
         .await
         .unwrap();
 
@@ -83,11 +78,7 @@ pub async fn blob_tests() {
 
     // Commit blob
     store
-        .write(
-            BatchBuilder::new()
-                .set(BlobOp::Commit { hash: hash.clone() }, Vec::new())
-                .build_all(),
-        )
+        .write_batch(BatchBuilder::new().set(BlobOp::Commit { hash: hash.clone() }, Vec::new()))
         .await
         .unwrap();
 
@@ -103,30 +94,30 @@ pub async fn blob_tests() {
 
     // AccountId 0 should be able to read blob
     assert!(
-        store
-            .blob_has_access(
-                &hash,
-                BlobClass::Reserved {
-                    account_id: 0,
-                    expires: until
-                }
-            )
-            .await
-            .unwrap()
+        blob_has_access(
+            &store,
+            &hash,
+            BlobClass::Reserved {
+                account_id: 0,
+                expires: until
+            }
+        )
+        .await
+        .unwrap()
     );
 
     // AccountId 1 should not be able to read blob
     assert!(
-        !store
-            .blob_has_access(
-                &hash,
-                BlobClass::Reserved {
-                    account_id: 1,
-                    expires: until
-                }
-            )
-            .await
-            .unwrap()
+        !blob_has_access(
+            &store,
+            &hash,
+            BlobClass::Reserved {
+                account_id: 1,
+                expires: until
+            }
+        )
+        .await
+        .unwrap()
     );
 
     // Purge expired blobs
@@ -141,16 +132,16 @@ pub async fn blob_tests() {
 
     // AccountId 0 should not be able to read blob
     assert!(
-        !store
-            .blob_has_access(
-                &hash,
-                BlobClass::Reserved {
-                    account_id: 0,
-                    expires: until
-                }
-            )
-            .await
-            .unwrap()
+        !blob_has_access(
+            &store,
+            &hash,
+            BlobClass::Reserved {
+                account_id: 0,
+                expires: until
+            }
+        )
+        .await
+        .unwrap()
     );
 
     // Blob should no longer be in store
@@ -202,23 +193,23 @@ pub async fn blob_tests() {
                     },
                     vec![],
                 )
+                // 1.0 keeps a message's metadata row in the immutable
+                // class, where account destruction reads its blob hash.
                 .set(
-                    ValueClass::Property(EmailField::Metadata.into()),
-                    Archiver::new(MessageMetadata {
-                        contents: Default::default(),
-                        rcvd_attach: Default::default(),
-                        blob_hash: hash.clone(),
-                        blob_body_offset: Default::default(),
-                        preview: Default::default(),
-                        raw_headers: Default::default(),
-                    })
-                    .serialize()
+                    ValueClass::Immutable(EmailField::Metadata.into()),
+                    MetadataRow::encode(
+                        MessageMetadata {
+                            blob_hash: hash.clone(),
+                            ..Default::default()
+                        },
+                        &[],
+                    )
                     .unwrap(),
                 );
         };
         batch.set(BlobOp::Commit { hash: hash.clone() }, vec![]);
 
-        store.write(batch.build_all()).await.unwrap();
+        store.write_batch(&mut batch).await.unwrap();
         blob_store
             .put_blob(hash.as_ref(), blob.as_slice(), CompressionAlgo::Lz4)
             .await
@@ -282,7 +273,7 @@ pub async fn blob_tests() {
     {
         let hash = BlobHash::generate(blob.as_slice());
         let ct = pos == 0;
-        assert!(store.blob_has_access(&hash, blob_class).await.unwrap() ^ ct);
+        assert!(blob_has_access(&store, &hash, blob_class).await.unwrap() ^ ct);
         assert!(store.blob_exists(&hash).await.unwrap() ^ ct);
         assert!(
             blob_store
@@ -296,22 +287,22 @@ pub async fn blob_tests() {
 
     // AccountId 0 should not have access to accountId 1's blobs
     assert!(
-        !store
-            .blob_has_access(
-                BlobHash::generate(b"123".as_slice()),
-                BlobClass::Linked {
-                    account_id: 0,
-                    collection: 0,
-                    document_id: 0,
-                }
-            )
-            .await
-            .unwrap()
+        !blob_has_access(
+            &store,
+            BlobHash::generate(b"123".as_slice()),
+            BlobClass::Linked {
+                account_id: 0,
+                collection: 0,
+                document_id: 0,
+            }
+        )
+        .await
+        .unwrap()
     );
 
     // Unlink blob
     store
-        .write(
+        .write_batch(
             BatchBuilder::new()
                 .with_account_id(0)
                 .with_collection(Collection::Email)
@@ -319,8 +310,7 @@ pub async fn blob_tests() {
                 .clear(BlobOp::Link {
                     hash: BlobHash::generate(b"789".as_slice()),
                     to: BlobLink::Document,
-                })
-                .build_all(),
+                }),
         )
         .await
         .unwrap();
@@ -375,7 +365,7 @@ pub async fn blob_tests() {
     {
         let ct = pos == 0;
         let hash = BlobHash::generate(blob.as_slice());
-        assert!(store.blob_has_access(&hash, blob_class).await.unwrap() ^ ct);
+        assert!(blob_has_access(&store, &hash, blob_class).await.unwrap() ^ ct);
         assert!(store.blob_exists(&hash).await.unwrap() ^ ct);
         assert!(
             blob_store
@@ -432,7 +422,7 @@ pub async fn blob_tests() {
     {
         let ct = pos == 0;
         let hash = BlobHash::generate(blob.as_slice());
-        assert!(store.blob_has_access(&hash, blob_class).await.unwrap() ^ ct);
+        assert!(blob_has_access(&store, &hash, blob_class).await.unwrap() ^ ct);
         assert!(store.blob_exists(&hash).await.unwrap() ^ ct);
         assert!(
             blob_store
@@ -530,4 +520,44 @@ async fn test_store(store: BlobStore) {
             .unwrap()
             .is_none()
     );
+}
+
+/// 0.16's `Store::blob_has_access`, which 1.0 removed: whether the link of
+/// `class` to `hash` is stored (an unexpired reservation, or a document's
+/// link).
+async fn blob_has_access(
+    store: &Store,
+    hash: impl AsRef<BlobHash>,
+    class: impl AsRef<BlobClass>,
+) -> trc::Result<bool> {
+    let key = match class.as_ref() {
+        BlobClass::Reserved {
+            account_id,
+            expires,
+        } if *expires > now() => ValueKey {
+            account_id: *account_id,
+            collection: 0,
+            document_id: 0,
+            class: ValueClass::Blob(BlobOp::Link {
+                hash: hash.as_ref().clone(),
+                to: BlobLink::Temporary { until: *expires },
+            }),
+        },
+        BlobClass::Linked {
+            account_id,
+            collection,
+            document_id,
+        } => ValueKey {
+            account_id: *account_id,
+            collection: *collection,
+            document_id: *document_id,
+            class: ValueClass::Blob(BlobOp::Link {
+                hash: hash.as_ref().clone(),
+                to: BlobLink::Document,
+            }),
+        },
+        _ => return Ok(false),
+    };
+
+    store.key_exists(key).await
 }

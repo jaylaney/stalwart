@@ -15,22 +15,29 @@ use crate::utils::{
     smtp::SmtpConnection,
     za::{wait_for_delivery, za_unlock},
 };
+use common::{Server, auth::AccessToken};
 use email::{
     cache::MessageCacheFetch,
+    mailbox::INBOX_ID,
     message::{
-        metadata::MessageMetadata,
-        za::{MAIL_FORMAT_V1, is_stub, open_mail_blob, open_stub},
+        ingest::{
+            IngestEmail, IngestSource,
+            group::{IngestGroup, ThreadKey},
+        },
+        metadata::MetadataRow,
+        za::{MAIL_FORMAT_V1, is_stub, open_mail_blob, open_stub, stub_structure},
     },
 };
 use groupware::calendar::seal::WRAP_MK;
+use mail_parser::{Message, MessageParser};
 use registry::schema::structs::SpamTrainingSample;
 use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 use store::{
-    IterateParams, Serialize, ValueKey,
-    write::{AlignedBytes, Archive, Archiver, BatchBuilder, IndexPropertyClass, ValueClass},
+    Deserialize, IterateParams, ValueKey,
+    write::{BatchBuilder, IndexPropertyClass, ValueClass, serialize::RawValue},
 };
 use tokio::sync::mpsc;
 use trc::{
@@ -38,7 +45,7 @@ use trc::{
     ipc::subscriber::{EventBatch, Interests, SubscriberBuilder},
 };
 use types::{blob::BlobId, blob_hash::BlobHash, collection::Collection, field::EmailField};
-use utils::cheeky_hash::CheekyHash;
+use utils::hash128::Hash128;
 
 pub mod delivery;
 pub mod fence;
@@ -94,24 +101,84 @@ pub fn live_keys(account_id: u32) -> usize {
     vault::session::live::session_keys(account_id)
 }
 
-/// The message's metadata archive (`EmailField::Metadata`, field 71), as
-/// stored.
-pub async fn stored_metadata(
+/// The message's metadata row (`EmailField::Metadata`, field 71, in the
+/// immutable class at 1.0), as stored: a stub for a key account's message.
+pub async fn stored_metadata(test: &TestServer, account_id: u32, document_id: u32) -> MetadataRow {
+    MetadataRow::deserialize(&stored_metadata_bytes(test, account_id, document_id).await)
+        .unwrap_or_else(|err| panic!("message {account_id}/{document_id}: bad row: {err:?}"))
+}
+
+/// The message's metadata row's stored bytes (`stored_metadata`).
+pub async fn stored_metadata_bytes(
     test: &TestServer,
     account_id: u32,
     document_id: u32,
-) -> Archive<AlignedBytes> {
+) -> Vec<u8> {
     test.server
         .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::property(
-            account_id,
-            Collection::Email,
-            document_id,
-            EmailField::Metadata,
-        ))
+        .get_value::<RawValue>(metadata_key(account_id, document_id))
         .await
         .unwrap()
         .unwrap_or_else(|| panic!("no metadata for message {account_id}/{document_id}"))
+        .0
+}
+
+/// Whether the message has a metadata row at all.
+pub async fn has_metadata(test: &TestServer, account_id: u32, document_id: u32) -> bool {
+    test.server
+        .store()
+        .get_value::<RawValue>(metadata_key(account_id, document_id))
+        .await
+        .unwrap()
+        .is_some()
+}
+
+/// The key of a message's metadata row (`read_metadata_batch`'s).
+pub fn metadata_key(account_id: u32, document_id: u32) -> ValueKey<ValueClass> {
+    ValueKey::immutable(
+        account_id,
+        Collection::Email,
+        document_id,
+        EmailField::Metadata,
+    )
+}
+
+/// Every metadata row the account holds, by document id, read from the
+/// store (not the message cache): a row a batch left behind without its
+/// `MessageData` shows here and not in `message_ids`.
+pub async fn metadata_rows(test: &TestServer, account_id: u32) -> Vec<(u32, MetadataRow)> {
+    let mut rows = Vec::new();
+    test.server
+        .store()
+        .iterate(
+            IterateParams::new(
+                metadata_key(account_id, 0),
+                metadata_key(account_id, u32::MAX),
+            ),
+            |key, value| {
+                let document_id = u32::from_be_bytes(key[key.len() - 4..].try_into().unwrap());
+                rows.push((document_id, MetadataRow::deserialize(value)?));
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+    rows
+}
+
+/// The blob hash a stored row names: a stub's is the sealed blob's.
+pub async fn stored_hash(test: &TestServer, account_id: u32, document_id: u32) -> BlobHash {
+    stored_metadata(test, account_id, document_id)
+        .await
+        .unarchive()
+        .unwrap()
+        .blob_hash()
+}
+
+/// Whether a stored row is a stub (`is_stub`, the format byte at the head
+/// of its header section).
+pub fn row_is_stub(row: &MetadataRow) -> bool {
+    is_stub(row).unwrap()
 }
 
 /// The blob `hash`, decoded as readers decode it.
@@ -132,9 +199,7 @@ pub async fn message_ids(test: &TestServer, account_id: u32) -> Vec<u32> {
         .await
         .unwrap()
         .emails
-        .items
-        .iter()
-        .map(|m| m.document_id)
+        .document_ids()
         .collect::<Vec<_>>();
     ids.sort_unstable();
     ids
@@ -152,26 +217,30 @@ pub async fn new_message(test: &TestServer, account_id: u32, before: &[u32]) -> 
 }
 
 /// The threading index keys (`EmailField::Threading`, property 90) of one
-/// message: every hash of the account's property is scanned.
+/// message: every hash of the account's property is scanned. At 1.0 the
+/// key ends with the inverted document id (`store/src/write/key.rs`), so
+/// the scan runs from the highest document id (inverted: 0) with the
+/// lowest hash to the lowest (inverted: `u32::MAX`) with the highest.
 pub async fn threading_keys(test: &TestServer, account_id: u32, document_id: u32) -> usize {
-    let key = |document_id, hash| ValueKey {
+    let key = |document_id, hash: u128| ValueKey {
         account_id,
         collection: Collection::Email.into(),
         document_id,
         class: ValueClass::IndexProperty(IndexPropertyClass::Hash {
             property: EmailField::Threading.into(),
-            hash,
+            hash: Hash128::from(hash),
         }),
     };
+    let suffix = (!document_id).to_be_bytes();
     let mut found = 0;
     test.server
         .store()
         .iterate(
-            IterateParams::new(key(0, CheekyHash::NULL), key(u32::MAX, CheekyHash::FULL))
+            IterateParams::new(key(u32::MAX, 0), key(0, u128::MAX))
                 .ascending()
                 .no_values(),
             |key, _| {
-                if key.ends_with(&document_id.to_be_bytes()) {
+                if key.ends_with(&suffix) {
                     found += 1;
                 }
                 Ok(true)
@@ -185,15 +254,18 @@ pub async fn threading_keys(test: &TestServer, account_id: u32, document_id: u32
 /// Mail spec 5.1, 5.2, 5.4: the message is a stub whose bundle and blob are
 /// wrapped as `wrap` (`WRAP_PK` or `WRAP_MK`), and it has no threading key.
 pub async fn assert_sealed(test: &TestServer, account_id: u32, document_id: u32, wrap: u8) {
-    let archive = stored_metadata(test, account_id, document_id).await;
-    let stub = archive.unarchive::<MessageMetadata>().unwrap();
+    let stub = stored_metadata(test, account_id, document_id).await;
     assert!(
-        is_stub(stub),
+        row_is_stub(&stub),
         "message {account_id}/{document_id} is stored in the clear"
     );
     // `0x01 || policy || wrap || ..`
-    assert_eq!(stub.raw_headers[2], wrap, "the stub's envelope wrap");
-    let blob = stored_blob(test, &BlobHash::from(&stub.blob_hash)).await;
+    assert_eq!(
+        stub.raw_headers().unwrap()[2],
+        wrap,
+        "the stub's envelope wrap"
+    );
+    let blob = stored_blob(test, &stub.unarchive().unwrap().blob_hash()).await;
     assert_eq!(blob[0], MAIL_FORMAT_V1, "the blob's format byte");
     assert_eq!(blob[2], wrap, "the blob's envelope wrap");
     assert_eq!(
@@ -230,59 +302,58 @@ pub async fn assert_sealed_upload(
     assert_eq!(opened.as_slice(), plain, "the opened upload");
 }
 
-/// Mail spec 6.1: no message of the account is stored in the clear; every
-/// message archive (`stored_metadata`) is a stub.
+/// Mail spec 6.1: no message of the account is stored in the clear: every
+/// metadata row the account holds (`metadata_rows`, so a row without its
+/// `MessageData` counts too) is a stub.
 pub async fn assert_no_plaintext(test: &TestServer, account_id: u32) {
-    for document_id in message_ids(test, account_id).await {
-        let archive = stored_metadata(test, account_id, document_id).await;
+    for (document_id, row) in metadata_rows(test, account_id).await {
         assert!(
-            is_stub(archive.unarchive::<MessageMetadata>().unwrap()),
+            row_is_stub(&row),
             "message {account_id}/{document_id} is stored in the clear"
         );
     }
 }
 
 /// The message opened with the account's keys, unlocked from `password`:
-/// the full metadata and the raw message.
+/// the full metadata row and the raw message.
 pub async fn open_message(
     test: &TestServer,
     account_id: u32,
     password: &str,
     document_id: u32,
-) -> (MessageMetadata, Vec<u8>) {
+) -> (MetadataRow, Vec<u8>) {
     let keys = za_unlock(test, account_id, password).await;
     let private_key = test.server.za_private_key(&keys).await.unwrap();
-    let archive = stored_metadata(test, account_id, document_id).await;
-    let stub = archive.unarchive::<MessageMetadata>().unwrap();
-    let metadata = open_stub(stub, &keys, Some(private_key), account_id)
+    let stub = stored_metadata(test, account_id, document_id).await;
+    let metadata = open_stub(&stub, &keys, Some(private_key), account_id)
         .unwrap_or_else(|err| panic!("the stub does not open: {err}"));
-    let blob = stored_blob(test, &BlobHash::from(&stub.blob_hash)).await;
+    let blob = stored_blob(test, &stub.unarchive().unwrap().blob_hash()).await;
     let raw = open_mail_blob(&blob, &keys, Some(private_key), account_id)
         .unwrap_or_else(|err| panic!("the blob does not open: {err}"));
     (metadata, raw.to_vec())
 }
 
 /// Mail spec 10: the stub rewritten with one byte flipped in its bundle's
-/// tag, at the end of `raw_headers`, as a well-formed archive: the archive
-/// reads, the bundle does not open.
+/// tag, at the end of its header section, as a well-formed row: the row
+/// reads (its structure is rebuilt by `stub_structure` for the same blob
+/// and lengths), the bundle does not open.
 pub async fn corrupt_stub(test: &TestServer, account_id: u32, document_id: u32) {
-    let mut stub = stored_metadata(test, account_id, document_id)
-        .await
-        .deserialize::<MessageMetadata>()
-        .unwrap();
-    assert_eq!(stub.raw_headers[0], MAIL_FORMAT_V1, "not a stub");
-    let last = stub.raw_headers.len() - 1;
-    stub.raw_headers[last] ^= 1;
+    let stub = stored_metadata(test, account_id, document_id).await;
+    let mut bundle = stub.raw_headers().unwrap().into_owned();
+    assert_eq!(bundle[0], MAIL_FORMAT_V1, "not a stub");
+    let structure = stub.unarchive().unwrap();
+    let (blob_hash, sealed_len) = (structure.blob_hash(), structure.blob_size());
+    let last = bundle.len() - 1;
+    bundle[last] ^= 1;
+    let row =
+        MetadataRow::encode(stub_structure(blob_hash, bundle.len(), sealed_len), &bundle).unwrap();
     let mut batch = BatchBuilder::new();
     batch
         .with_account_id(account_id)
         .with_collection(Collection::Email)
         .with_document(document_id)
-        .set(
-            EmailField::Metadata,
-            Archiver::new(stub).serialize().unwrap(),
-        );
-    test.server.store().write(batch.build_all()).await.unwrap();
+        .set(EmailField::Metadata, row);
+    test.server.store().write_batch(&mut batch).await.unwrap();
 }
 
 /// Mail spec 10: the blob `hash` rewritten with one byte flipped in its
@@ -304,6 +375,76 @@ pub async fn corrupt_blob(test: &TestServer, hash: &BlobHash) {
         .put_blob(hash.as_slice(), &blob, test.server.core.email.compression)
         .await
         .unwrap();
+}
+
+/// The parameters IMAP APPEND passes for one message into INBOX
+/// (`imap/src/op/append.rs`): `message` is the parsed `raw`, or `None` for
+/// a message that did not parse (a rejection, which a group keeps its
+/// batch after).
+pub fn append_params<'x>(
+    raw: &'x str,
+    message: Option<Message<'x>>,
+    access_token: &'x AccessToken,
+) -> IngestEmail<'x> {
+    IngestEmail {
+        raw_message: raw.as_bytes(),
+        message,
+        blob_hash: None,
+        access_token,
+        mailbox_ids: vec![INBOX_ID],
+        keywords: vec![],
+        received_at: None,
+        source: IngestSource::Imap {
+            train_classifier: true,
+        },
+        metadata: None,
+        session_id: 0,
+    }
+}
+
+/// `raw` ingested into `group` as a grouped IMAP APPEND ingests it: parsed,
+/// with its thread key (`ThreadKey::new`), so messages of one thread in the
+/// group share a pending thread (`IngestGroup::ingest`). Nothing is written
+/// until `IngestGroup::flush`.
+pub async fn group_ingest(
+    server: &Server,
+    group: &mut IngestGroup,
+    access_token: &AccessToken,
+    raw: &str,
+) -> trc::Result<()> {
+    let message = MessageParser::new().parse(raw.as_bytes());
+    let key = message.as_ref().map(ThreadKey::new).unwrap_or_default();
+    group
+        .ingest(server, append_params(raw, message, access_token), key)
+        .await
+}
+
+/// A token of `account_id` without keys: an ordinary account's session, or
+/// one that classified the account before it was provisioned.
+pub fn keyless_token(account_id: u32) -> AccessToken {
+    AccessToken::from_id_maybe_invalid(account_id)
+}
+
+/// A token of `account_id` holding its keys, unlocked from `password`, as
+/// a key account's IMAP or HTTP session holds them.
+pub async fn keyed_token(test: &TestServer, account_id: u32, password: &str) -> AccessToken {
+    AccessToken::from_id_maybe_invalid(account_id)
+        .with_session_keys(za_unlock(test, account_id, password).await)
+}
+
+/// A reply to `parent` (a `message_with` message): the same thread name
+/// (`Re:` and the parent's subject) and the parent's `Message-ID` in its
+/// `In-Reply-To` and `References`, so the two share a thread key.
+pub fn reply_to(parent: &str, subject: &str, body: &str) -> String {
+    let parent_id = parent
+        .lines()
+        .find_map(|line| line.strip_prefix("Message-ID: "))
+        .expect("the parent has a Message-ID")
+        .to_string();
+    message_with(&format!("Re: {subject}"), body).replace(
+        "Date: ",
+        &format!("In-Reply-To: {parent_id}\r\nReferences: {parent_id}\r\nDate: "),
+    )
 }
 
 /// Spam training samples (`RegistryClass::Item` records), every account's.
@@ -355,7 +496,7 @@ impl Traced {
             "za-mail-traced-{}",
             TRACED_SUBSCRIBERS.fetch_add(1, Ordering::Relaxed)
         );
-        let (_tx, rx) = SubscriberBuilder::new(id.clone())
+        let (_tx, rx, _) = SubscriberBuilder::new(id.clone())
             .set_interests(types.iter().copied())
             .with_lossy(false)
             .register();

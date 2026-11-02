@@ -16,7 +16,7 @@ use jmap::api::ToJmapHttpResponse;
 use jmap_proto::error::request::RequestError;
 use registry::{
     schema::{
-        enums::EventPolicy,
+        enums::{EventPolicy, TracingLevel},
         prelude::ObjectType,
         structs::{SecretKeyOptional, SecretKeyValue, WebHook},
     },
@@ -69,6 +69,9 @@ pub async fn test(test: &TestServer) {
                     .collect(),
             ),
             events_policy: EventPolicy::Include,
+            // 1.0 adds a level to webhooks (default Info); the connection
+            // and DSN success events are Debug.
+            level: TracingLevel::Debug,
             ..Default::default()
         })
         .await;
@@ -103,9 +106,16 @@ pub async fn test(test: &TestServer) {
     // Enable the webhook
     webhook.assert_is_empty();
     webhook.accept();
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Check for events
+    // Check for events. 1.0 retries the rejected payload and then sends the
+    // pending ones a throttle period apart, so the check waits (bounded) for
+    // every expected event where 0.16 slept 200 ms.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !webhook.contains_all(&["smtp.connection-start", "message-ingest.", "delivery.dsn"])
+        && std::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     webhook.assert_contains(&[
         "smtp.connection-start",
         "message-ingest.",
@@ -118,15 +128,28 @@ pub async fn test(test: &TestServer) {
     admin.registry_destroy_all(ObjectType::WebHook).await;
     admin.reload_settings().await;
     admin.destroy_account(john).await;
-    test.server
+    // Without a licence 1.0 configures no tracing store (ruling 39), so
+    // there is nothing to purge.
+    if let Err(err) = test
+        .server
         .tracing_store()
         .purge_spans(Duration::from_secs(0), test.server.search_store().into())
         .await
-        .unwrap();
+    {
+        assert!(
+            err.matches(trc::EventType::Store(trc::StoreEvent::NotConfigured)),
+            "{err:?}"
+        );
+    }
     test.cleanup().await;
 }
 
 impl MockWebhookEndpoint {
+    pub fn contains_all(&self, expected: &[&str]) -> bool {
+        let events = serde_json::to_string(&*self.events.lock()).unwrap();
+        expected.iter().all(|string| events.contains(string))
+    }
+
     pub fn assert_contains(&self, expected: &[&str]) {
         let events =
             serde_json::to_string_pretty(&self.events.lock().drain(..).collect::<Vec<_>>())

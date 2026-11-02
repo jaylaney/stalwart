@@ -7,11 +7,7 @@
 use super::{
     Namespaces,
     property::{DavProperty, Privilege},
-    request::{DavPropertyValue, Filter},
-};
-use calcard::{
-    icalendar::{ICalendarComponentType, ICalendarParameterName, ICalendarProperty},
-    vcard::{VCardParameterName, VCardProperty},
+    request::DavPropertyValue,
 };
 use hyper::StatusCode;
 use std::{borrow::Cow, fmt::Display};
@@ -238,9 +234,7 @@ pub enum CalCondition {
     NoUidConflict(Href),
     InitializeCalendarCollection,
     SupportedCalendarData,
-    SupportedFilter(
-        Vec<Filter<Vec<ICalendarComponentType>, ICalendarProperty, ICalendarParameterName>>,
-    ),
+    SupportedFilter,
     SupportedCollation(String),
     SupportedCalendarComponent,
     MinDateTime,
@@ -263,7 +257,7 @@ pub enum CalCondition {
 pub enum CardCondition {
     SupportedAddressData,
     SupportedAddressDataConversion,
-    SupportedFilter(Vec<Filter<(), VCardProperty, VCardParameterName>>),
+    SupportedFilter,
     SupportedCollation(String),
     ValidAddressData,
     NoUidConflict(Href),
@@ -350,7 +344,7 @@ impl CalCondition {
             CalCondition::NoUidConflict(_) => "NoUidConflict",
             CalCondition::InitializeCalendarCollection => "InitializeCalendarCollection",
             CalCondition::SupportedCalendarData => "SupportedCalendarData",
-            CalCondition::SupportedFilter(_) => "SupportedFilter",
+            CalCondition::SupportedFilter => "SupportedFilter",
             CalCondition::SupportedCollation(_) => "SupportedCollation",
             CalCondition::MinDateTime => "MinDateTime",
             CalCondition::MaxDateTime => "MaxDateTime",
@@ -375,7 +369,7 @@ impl CardCondition {
         match self {
             CardCondition::SupportedAddressData => "SupportedAddressData",
             CardCondition::SupportedAddressDataConversion => "SupportedAddressDataConversion",
-            CardCondition::SupportedFilter(_) => "SupportedFilter",
+            CardCondition::SupportedFilter => "SupportedFilter",
             CardCondition::SupportedCollation(_) => "SupportedCollation",
             CardCondition::ValidAddressData => "ValidAddressData",
             CardCondition::NoUidConflict(_) => "NoUidConflict",
@@ -395,36 +389,11 @@ impl Condition {
     }
 }
 
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../stalwart-tests/unit/dav-proto/src/schema/response/serde_impl.rs"]
+mod serde_impl;
+
 #[cfg(test)]
-mod serde_impl {
-    use super::Status;
-    use hyper::StatusCode;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    impl Serialize for Status {
-        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-        where
-            S: Serializer,
-        {
-            // Serialize the status code as a u16
-            serializer.serialize_u16(self.0.as_u16())
-        }
-    }
-
-    impl<'de> Deserialize<'de> for Status {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            // Deserialize as u16
-            let status_value = u16::deserialize(deserializer)?;
-
-            // Convert u16 to StatusCode
-            let status_code = StatusCode::try_from(status_value).map_err(|_| {
-                serde::de::Error::custom(format!("Invalid status code: {}", status_value))
-            })?;
-
-            Ok(Status(status_code))
-        }
-    }
-}
+#[path = "response_restored_tests.rs"]
+mod serde_impl;

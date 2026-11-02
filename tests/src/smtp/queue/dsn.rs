@@ -49,17 +49,23 @@ async fn generate_dsn() {
             return_path: "sender@foobar.org".into(),
             recipients: vec![Recipient {
                 address: "foobar@example.org".into(),
-                status: Status::PermanentFailure(ErrorDetails {
-                    entity: "mx.example.org".into(),
-                    details: Error::UnexpectedResponse(UnexpectedResponse {
-                        command: "RCPT TO:<foobar@example.org>".into(),
-                        response: Response {
-                            code: 550,
-                            esc: [5, 1, 2],
-                            message: "User does not exist".into(),
-                        },
-                    }),
-                }),
+                status: Status::PermanentFailure(
+                    ErrorDetails {
+                        entity: "mx.example.org".into(),
+                        details: Error::UnexpectedResponse(
+                            UnexpectedResponse {
+                                command: "RCPT TO:<foobar@example.org>".into(),
+                                response: Response {
+                                    code: 550,
+                                    esc: [5, 1, 2],
+                                    message: "User does not exist".into(),
+                                },
+                            }
+                            .into(),
+                        ),
+                    }
+                    .into(),
+                ),
                 flags: 0,
                 orcpt: None,
                 retry: Schedule::now(),
@@ -72,6 +78,7 @@ async fn generate_dsn() {
             priority: 0,
             blob_hash: BlobHash::generate(dsn_original.as_bytes()),
             metadata: Default::default(),
+            tenant_ids: Default::default(),
             received_from_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             received_via_port: 0,
         },
@@ -146,14 +153,17 @@ async fn generate_dsn() {
     // Success DSN
     message.message.recipients.push(Recipient {
         address: "jane@example.org".into(),
-        status: Status::Completed(HostResponse {
-            hostname: "mx2.example.org".into(),
-            response: Response {
-                code: 250,
-                esc: [2, 1, 5],
-                message: "Message accepted for delivery".into(),
-            },
-        }),
+        status: Status::Completed(
+            HostResponse {
+                hostname: "mx2.example.org".into(),
+                response: Response {
+                    code: 250,
+                    esc: [2, 1, 5],
+                    message: "Message accepted for delivery".into(),
+                },
+            }
+            .into(),
+        ),
         flags,
         orcpt: None,
         retry: Schedule::now(),
@@ -168,10 +178,13 @@ async fn generate_dsn() {
     // Delay DSN
     message.message.recipients.push(Recipient {
         address: "john.doe@example.org".into(),
-        status: Status::TemporaryFailure(ErrorDetails {
-            entity: "mx.domain.org".into(),
-            details: Error::ConnectionError("Connection timeout".into()),
-        }),
+        status: Status::TemporaryFailure(
+            ErrorDetails {
+                entity: "mx.domain.org".into(),
+                details: Error::ConnectionError("Connection timeout".into()),
+            }
+            .into(),
+        ),
         flags,
         orcpt: Some("jdoe@example.org".into()),
         retry: Schedule::now(),
@@ -199,17 +212,23 @@ async fn generate_dsn() {
     // A DSN that cannot be written is retried rather than marked as sent
     message.message.recipients = vec![Recipient {
         address: "carol@example.org".into(),
-        status: Status::PermanentFailure(ErrorDetails {
-            entity: "mx.example.org".into(),
-            details: Error::UnexpectedResponse(UnexpectedResponse {
-                command: "RCPT TO:<carol@example.org>".into(),
-                response: Response {
-                    code: 550,
-                    esc: [5, 1, 2],
-                    message: "User does not exist".into(),
-                },
-            }),
-        }),
+        status: Status::PermanentFailure(
+            ErrorDetails {
+                entity: "mx.example.org".into(),
+                details: Error::UnexpectedResponse(
+                    UnexpectedResponse {
+                        command: "RCPT TO:<carol@example.org>".into(),
+                        response: Response {
+                            code: 550,
+                            esc: [5, 1, 2],
+                            message: "User does not exist".into(),
+                        },
+                    }
+                    .into(),
+                ),
+            }
+            .into(),
+        ),
         flags,
         orcpt: None,
         retry: Schedule::now(),

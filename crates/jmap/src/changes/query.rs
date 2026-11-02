@@ -7,10 +7,14 @@
 use super::get::ChangesLookup;
 use crate::email::za::za_refuse_content_query;
 use crate::{
-    api::request::resolve_account_id, calendar_event::query::CalendarEventQuery,
+    api::{auth::JmapAuthorization, request::resolve_account_id},
+    calendar_event::query::CalendarEventQuery,
     calendar_event_notification::query::CalendarEventNotificationQuery,
-    contact::query::ContactCardQuery, email::query::EmailQuery, file::query::FileNodeQuery,
-    mailbox::query::MailboxQuery, share_notification::query::ShareNotificationQuery,
+    contact::query::ContactCardQuery,
+    email::query::EmailQuery,
+    file::query::FileNodeQuery,
+    mailbox::query::MailboxQuery,
+    share_notification::query::ShareNotificationQuery,
     submission::query::EmailSubmissionQuery,
 };
 use common::{Server, auth::AccessToken};
@@ -20,15 +24,18 @@ use jmap_proto::{
         query_changes::{AddedItem, QueryChangesRequest, QueryChangesResponse},
     },
     object::{JmapObject, NullObject},
-    request::{QueryChangesRequestMethod, method::MethodObject},
+    request::{QueryChangesRequestMethod, capability::CapabilityIds, method::MethodObject},
 };
 use std::future::Future;
+use store::ahash::AHashSet;
+use types::id::Id;
 
 pub trait QueryChanges: Sync + Send {
     fn query_changes(
         &self,
         request: QueryChangesRequestMethod,
         access_token: &AccessToken,
+        using: CapabilityIds,
     ) -> impl Future<Output = trc::Result<QueryChangesResponse>> + Send;
 }
 
@@ -37,6 +44,7 @@ impl QueryChanges for Server {
         &self,
         request: QueryChangesRequestMethod,
         access_token: &AccessToken,
+        using: CapabilityIds,
     ) -> trc::Result<QueryChangesResponse> {
         let mut response;
         let mut is_mutable = true;
@@ -54,6 +62,7 @@ impl QueryChanges for Server {
                         build_changes_request(&request),
                         MethodObject::Email,
                         access_token,
+                        using,
                     )
                     .await?
                     .response;
@@ -81,7 +90,9 @@ impl QueryChanges for Server {
                         .as_ref()
                         .is_some_and(|sort| sort.iter().any(|s| !s.is_immutable()));
 
-                results = self.email_query((*request).into(), access_token).await?;
+                results = self
+                    .email_query((*request).into(), access_token, using)
+                    .await?;
             }
             QueryChangesRequestMethod::Mailbox(mut request) => {
                 // Query changes
@@ -91,6 +102,7 @@ impl QueryChanges for Server {
                         build_changes_request(&request),
                         MethodObject::Mailbox,
                         access_token,
+                        using,
                     )
                     .await?
                     .response;
@@ -103,7 +115,9 @@ impl QueryChanges for Server {
                 }
 
                 up_to_id = request.up_to_id;
-                results = self.mailbox_query((*request).into(), access_token).await?;
+                results = self
+                    .mailbox_query((*request).into(), access_token, using)
+                    .await?;
             }
             QueryChangesRequestMethod::EmailSubmission(mut request) => {
                 // Query changes
@@ -117,6 +131,7 @@ impl QueryChanges for Server {
                         build_changes_request(&request),
                         MethodObject::EmailSubmission,
                         access_token,
+                        using,
                     )
                     .await?
                     .response;
@@ -143,6 +158,7 @@ impl QueryChanges for Server {
                         build_changes_request(&request),
                         MethodObject::ContactCard,
                         access_token,
+                        using,
                     )
                     .await?
                     .response;
@@ -156,7 +172,7 @@ impl QueryChanges for Server {
 
                 up_to_id = request.up_to_id;
                 results = self
-                    .contact_card_query((*request).into(), access_token)
+                    .contact_card_query((*request).into(), access_token, using)
                     .await?;
             }
             QueryChangesRequestMethod::FileNode(mut request) => {
@@ -171,6 +187,7 @@ impl QueryChanges for Server {
                         build_changes_request(&request),
                         MethodObject::FileNode,
                         access_token,
+                        using,
                     )
                     .await?
                     .response;
@@ -184,10 +201,14 @@ impl QueryChanges for Server {
 
                 up_to_id = request.up_to_id;
                 results = self
-                    .file_node_query((*request).into(), access_token)
+                    .file_node_query((*request).into(), access_token, using)
                     .await?;
             }
             QueryChangesRequestMethod::CalendarEvent(mut request) => {
+                if request.arguments.expand_recurrences.unwrap_or(false) {
+                    return Err(trc::JmapEvent::CannotCalculateChanges.into_err());
+                }
+
                 // Query changes
                 resolve_account_id(
                     &mut request.account_id,
@@ -199,6 +220,7 @@ impl QueryChanges for Server {
                         build_changes_request(&request),
                         MethodObject::CalendarEvent,
                         access_token,
+                        using,
                     )
                     .await?
                     .response;
@@ -212,7 +234,7 @@ impl QueryChanges for Server {
 
                 up_to_id = request.up_to_id;
                 results = self
-                    .calendar_event_query((*request).into(), access_token)
+                    .calendar_event_query((*request).into(), access_token, using)
                     .await?;
             }
             QueryChangesRequestMethod::CalendarEventNotification(mut request) => {
@@ -227,6 +249,7 @@ impl QueryChanges for Server {
                         build_changes_request(&request),
                         MethodObject::CalendarEventNotification,
                         access_token,
+                        using,
                     )
                     .await?
                     .response;
@@ -255,6 +278,7 @@ impl QueryChanges for Server {
                         build_changes_request(&request),
                         MethodObject::ShareNotification,
                         access_token,
+                        using,
                     )
                     .await?
                     .response;
@@ -272,23 +296,32 @@ impl QueryChanges for Server {
             QueryChangesRequestMethod::Principal(_) => {
                 return Err(trc::JmapEvent::CannotCalculateChanges.into_err());
             }
-            QueryChangesRequestMethod::Quota(_) => {
+            QueryChangesRequestMethod::Quota(mut request) => {
+                resolve_account_id(&mut request.account_id, MethodObject::Quota, access_token)?;
+                access_token.assert_is_member(request.account_id)?;
                 return Err(trc::JmapEvent::CannotCalculateChanges.into_err());
             }
         }
 
         if has_changes {
             if is_mutable {
+                let changed = changes
+                    .created
+                    .iter()
+                    .chain(changes.updated.iter())
+                    .copied()
+                    .collect::<AHashSet<Id>>();
                 for (index, id) in results.ids.into_iter().enumerate() {
-                    if changes.created.contains(&id) || changes.updated.contains(&id) {
+                    if changed.contains(&id) {
                         response.added.push(AddedItem::new(id, index));
                     }
                 }
 
                 response.removed = changes.updated;
             } else {
+                let created = changes.created.iter().copied().collect::<AHashSet<Id>>();
                 for (index, id) in results.ids.into_iter().enumerate() {
-                    if changes.created.contains(&id) {
+                    if created.contains(&id) {
                         response.added.push(AddedItem::new(id, index));
                     }
                     if matches!(up_to_id, Some(up_to_id) if up_to_id == id) {
@@ -312,6 +345,7 @@ fn build_changes_request<T: JmapObject>(req: &QueryChangesRequest<T>) -> Changes
         account_id: req.account_id,
         since_state: req.since_query_state.clone(),
         max_changes: req.max_changes,
+        ignore_metadata_only_changes: Some(false),
     }
 }
 

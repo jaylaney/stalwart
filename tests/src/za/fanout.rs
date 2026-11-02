@@ -14,8 +14,9 @@ use crate::utils::{
     server::TestServer,
     webdav::DummyWebDavClient,
     za::{
-        envelope_wrap, hold_task_consumer, inbox_ids, item_attendees, item_method, item_sequence,
-        itip_tasks_for, mail_count, new_inbox_items, open_pending_item_as, schedule_statuses,
+        PlantedItem, destroy_inbox_item, envelope_wrap, hold_task_consumer, inbox_ids,
+        inbox_item_is_pending, item_attendees, item_method, item_sequence, itip_tasks_for,
+        mail_count, new_inbox_items, open_pending_item_as, plant_inbox_item, schedule_statuses,
         wait_for_delivery, za_uid_leases, za_unlock,
     },
 };
@@ -70,14 +71,19 @@ impl Party {
         format!("/dav/itip/{}/inbox/", self.name.replace('@', "%40"))
     }
 
-    /// Deletes inbox items by href: upstream's DELETE, unchanged for pending
-    /// items (plan 8).
-    pub async fn delete_items(&self, ids: impl IntoIterator<Item = u32>) {
+    /// Deletes inbox items: by href (upstream's DELETE), except pending
+    /// ones, which a client's DELETE answers 404 for (upgrade ruling 176,
+    /// B-M4) and which go at store level.
+    pub async fn delete_items(&self, test: &TestServer, ids: impl IntoIterator<Item = u32>) {
         for id in ids {
-            self.client
-                .request("DELETE", &format!("{}{id}.ics", self.inbox()), "")
-                .await
-                .with_status(StatusCode::NO_CONTENT);
+            if inbox_item_is_pending(test, self.id, id).await {
+                destroy_inbox_item(test, self.id, id).await;
+            } else {
+                self.client
+                    .request("DELETE", &format!("{}{id}.ics", self.inbox()), "")
+                    .await
+                    .with_status(StatusCode::NO_CONTENT);
+            }
         }
     }
 
@@ -88,7 +94,7 @@ impl Party {
             .into_iter()
             .filter(|id| !before.contains(id))
             .collect();
-        self.delete_items(ids).await;
+        self.delete_items(test, ids).await;
     }
 }
 
@@ -209,6 +215,11 @@ pub async fn test(test: &mut TestServer) {
         0,
         "plain's inbox received an item"
     );
+    // Per-user event data (calendar spec, near line 717): the scheduling
+    // write of the organizer's copy stores no preferences.
+    let (_, mixed_id) =
+        super::dav_seal::raw_event_records(test, key1.id, "default/fo-mixed.ics").await;
+    crate::utils::za::assert_no_event_preferences(test, key1.id, mixed_id).await;
     let items = new_inbox_items(test, key2.id, &start2).await;
     assert_eq!(items.len(), 1, "key2's inbox holds exactly one new item");
     let (item_id, item) = &items[0];
@@ -693,10 +704,10 @@ pub async fn test_failures(test: &mut TestServer) {
     admin
         .registry_update_setting(
             CalendarScheduling {
-                itip_max_size: 100,
+                max_itip_size: 100,
                 ..Default::default()
             },
-            &[Property::ItipMaxSize],
+            &[Property::MaxItipSize],
         )
         .await;
     admin.reload_settings().await;
@@ -720,9 +731,219 @@ pub async fn test_failures(test: &mut TestServer) {
         ["5.1"]
     );
     admin
-        .registry_update_setting(CalendarScheduling::default(), &[Property::ItipMaxSize])
+        .registry_update_setting(CalendarScheduling::default(), &[Property::MaxItipSize])
         .await;
     admin.reload_settings().await;
+
+    // 7e. Upgrade rulings 176 (B-M3) and 187: key2's inbox at upstream's
+    // `maxCalendarEventNotifications`, its current item count.
+    // (1) Every stored item pending (the backlog cap): key2 gets 5.1 and no
+    // item, nothing evicted; key3 is unaffected.
+    // (2) With drained items stored too: the oldest drained one is evicted
+    // (upstream's rolling window), an older pending one is kept, and the
+    // invitation is delivered.
+    let quota = |limit: usize| {
+        json!({ Property::Quotas: {
+            StorageQuota::MaxCalendarEventNotifications.as_str(): limit
+        } })
+    };
+    let pending_oldest = plant_inbox_item(
+        test,
+        key2.id,
+        &super::inbox::invitation("za-fo-held-p", "fo-held-p"),
+        PlantedItem::Pending {
+            pair: None,
+            reply_token: None,
+        },
+        key1.id,
+        Some(store::write::now() as i64 - 300),
+    )
+    .await;
+    let held2 = inbox_ids(test, key2.id).await;
+    for id in &held2 {
+        assert!(
+            inbox_item_is_pending(test, key2.id, *id).await,
+            "precondition: key2 holds only pending items"
+        );
+    }
+    admin
+        .registry_update_object(ObjectType::Account, key2_account, quota(held2.len()))
+        .await;
+    let before3 = inbox_ids(test, key3.id).await;
+    let notify = format!("{KEY1_CAL}fo-notify.ics");
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &notify,
+            [CONTENT_TYPE],
+            invite(
+                "za-fo-notify",
+                START_A,
+                &["key2@example.com", "key3@example.com"],
+            ),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(
+        inbox_ids(test, key2.id).await,
+        held2,
+        "an item reached key2 past its backlog cap, or a pending one was evicted"
+    );
+    assert_eq!(new_inbox_items(test, key3.id, &before3).await.len(), 1);
+    assert_eq!(
+        attendee_statuses(&key1.client, &notify, "key2@example.com").await,
+        ["5.1"]
+    );
+    assert_eq!(
+        attendee_statuses(&key1.client, &notify, "key3@example.com").await,
+        ["1.2"]
+    );
+    let drained_old = plant_inbox_item(
+        test,
+        key2.id,
+        &super::inbox::invitation("za-fo-held-d1", "fo-held-d1"),
+        PlantedItem::Drained { password: STRONG },
+        key1.id,
+        Some(store::write::now() as i64 - 200),
+    )
+    .await;
+    let drained_new = plant_inbox_item(
+        test,
+        key2.id,
+        &super::inbox::invitation("za-fo-held-d2", "fo-held-d2"),
+        PlantedItem::Drained { password: STRONG },
+        key1.id,
+        Some(store::write::now() as i64 - 100),
+    )
+    .await;
+    let held2 = inbox_ids(test, key2.id).await;
+    admin
+        .registry_update_object(ObjectType::Account, key2_account, quota(held2.len()))
+        .await;
+    let rolling = format!("{KEY1_CAL}fo-rolling.ics");
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &rolling,
+            [CONTENT_TYPE],
+            invite("za-fo-rolling", START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(
+        attendee_statuses(&key1.client, &rolling, "key2@example.com").await,
+        ["1.2"],
+        "the rolling window refused the invitation"
+    );
+    let after2 = inbox_ids(test, key2.id).await;
+    assert!(
+        !after2.contains(&drained_old),
+        "the oldest drained item was not evicted"
+    );
+    assert!(
+        after2.contains(&pending_oldest) && after2.contains(&drained_new),
+        "the eviction took a pending item or a newer drained one"
+    );
+    assert_eq!(after2.len(), held2.len(), "{after2:?}");
+    // (3) Upgrade ruling 191 (N10): a zero limit refuses, as upstream does,
+    // even with a drained item to evict: 5.1, no item, nothing evicted.
+    assert!(
+        !inbox_item_is_pending(test, key2.id, drained_new).await,
+        "precondition: key2 holds a drained item"
+    );
+    admin
+        .registry_update_object(ObjectType::Account, key2_account, quota(0))
+        .await;
+    let zero = format!("{KEY1_CAL}fo-zero.ics");
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &zero,
+            [CONTENT_TYPE],
+            invite("za-fo-zero", START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(
+        inbox_ids(test, key2.id).await,
+        after2,
+        "a zero limit evicted an item or delivered one"
+    );
+    assert_eq!(
+        attendee_statuses(&key1.client, &zero, "key2@example.com").await,
+        ["5.1"]
+    );
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            key2_account,
+            json!({ Property::Quotas: {} }),
+        )
+        .await;
+    key2.delete_items_since(test, &start2).await;
+
+    // 7f. Upgrade ruling 176 (B-M7): the quota check measures the sealed
+    // item. A control invitation gives the plaintext message's size (the
+    // item opened) and the stored sealed item's; key2's disk quota is then
+    // set midway between the two above its usage, so an invitation of the
+    // same shape fits as plaintext but not sealed: 5.1 and no item.
+    let sealed_a = format!("{KEY1_CAL}fo-sealed-a.ics");
+    let before2 = inbox_ids(test, key2.id).await;
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &sealed_a,
+            [CONTENT_TYPE],
+            invite("za-fo-sealed-a", START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let control = new_inbox_items(test, key2.id, &before2).await;
+    assert_eq!(control.len(), 1, "control: the invitation's item");
+    let sealed_size = groupware::SizeWriter::ical(&control[0].1.event) as u64;
+    let (opened, _) = open_pending_item_as(test, key2.id, STRONG, control[0].0).await;
+    let plain_size = groupware::SizeWriter::ical(&opened) as u64;
+    assert!(
+        sealed_size > plain_size + 200,
+        "the sealed item ({sealed_size}) is not larger than the message ({plain_size})"
+    );
+    key2.delete_items(test, [control[0].0]).await;
+    let used = test.server.get_used_quota_account(key2.id).await.unwrap() as u64;
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            key2_account,
+            json!({ Property::Quotas: {
+                StorageQuota::MaxDiskQuota.as_str(): used + (plain_size + sealed_size) / 2
+            } }),
+        )
+        .await;
+    let sealed_b = format!("{KEY1_CAL}fo-sealed-b.ics");
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &sealed_b,
+            [CONTENT_TYPE],
+            invite("za-fo-sealed-b", START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(
+        inbox_ids(test, key2.id).await,
+        before2,
+        "an item whose sealed size is over key2's quota reached it"
+    );
+    assert_eq!(
+        attendee_statuses(&key1.client, &sealed_b, "key2@example.com").await,
+        ["5.1"]
+    );
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            key2_account,
+            json!({ Property::Quotas: {} }),
+        )
+        .await;
 
     // 7d. A key account without `CalendarSchedulingReceive` (spec 5.2): not
     // attempted. The permission is revoked through the registry as
@@ -906,6 +1127,11 @@ pub async fn test_failures(test: &mut TestServer) {
     for name in [
         "fo-quota",
         "fo-size",
+        "fo-notify",
+        "fo-rolling",
+        "fo-zero",
+        "fo-sealed-a",
+        "fo-sealed-b",
         "fo-receive",
         "fo-restored",
         "fo-commit",
@@ -1078,12 +1304,18 @@ pub async fn test_plain_owner(test: &mut TestServer) {
         0,
         "a plain task was already queued"
     );
+    // 1.0's handlers schedule from the calendar owner's addresses (0.16's
+    // `scheduling_account_info` used the writer's), so the event key1
+    // writes into plain's calendar names plain as its organizer.
     key1.client
         .request_with_headers(
             "PUT",
             SHARED_PLAIN,
             [CONTENT_TYPE],
-            invite("za-fo-shared", START_A, &["key2@example.com"]),
+            invite("za-fo-shared", START_A, &["key2@example.com"]).replace(
+                "ORGANIZER:mailto:key1@example.com",
+                "ORGANIZER:mailto:plain@example.com",
+            ),
         )
         .await
         .with_status(StatusCode::CREATED);
@@ -1149,4 +1381,128 @@ pub async fn test_plain_owner(test: &mut TestServer) {
         .request("DELETE", "/dav/cal/plain@example.com/default", "")
         .await
         .with_status(StatusCode::NO_CONTENT);
+}
+
+/// Upgrade ruling 176 (B-M1, B-M2): two guards of the calendar delete path
+/// that no DAV request reaches today (a collection DELETE needs `Delete`,
+/// which no share level grants, and a key account's event DELETE always
+/// has its key domain), so the store functions are called directly.
+/// - B-M1: `delete_with_events_za` on key1's calendar with key2's keys is
+///   refused (`Unauthorized`), never resolved in key2's account; with
+///   key1's own keys it builds (the control).
+/// - B-M2: deleting key1's sealed scheduled event without its key domain
+///   fails before upstream's CANCEL is built or queued; with the domain it
+///   returns the fan-out's message (the control).
+///
+/// Neither batch is committed.
+pub async fn test_storage_guards(test: &mut TestServer) {
+    use common::{auth::BuildAccessToken, storage::metadata::ContainerCleanup};
+    use groupware::calendar::{Calendar, CalendarEvent, seal::ZaKeyDomain};
+    use store::{roaring::RoaringBitmap, write::BatchBuilder};
+    println!("Running zero-access calendar storage guard tests...");
+    let key1 = Party::new(test, "key1@example.com");
+    let key2 = Party::new(test, "key2@example.com");
+    let keys1 = za_unlock(test, key1.id, STRONG).await;
+    let keys2 = za_unlock(test, key2.id, STRONG).await;
+    let account_info = test.server.account_info(key1.id).await.unwrap();
+    let access_token = test.server.access_token(key1.id).await.unwrap().build();
+    let start2 = inbox_ids(test, key2.id).await;
+
+    // B-M1.
+    let guard_cal = "/dav/cal/key1%40example.com/fo-guard/";
+    key1.client
+        .request("MKCALENDAR", guard_cal, MKCALENDAR)
+        .await
+        .with_status(StatusCode::CREATED);
+    let calendar_id = super::dav_seal::resource_id(test, key1.id, "fo-guard").await;
+    let delete_calendar = async |keys: &SessionKeys| {
+        let calendar = super::dav_seal::raw_calendar(test, key1.id, "fo-guard").await;
+        let mut batch = BatchBuilder::new();
+        groupware::DestroyArchive(calendar.to_unarchived::<Calendar>().unwrap())
+            .delete_with_events_za(
+                &test.server,
+                &access_token,
+                &account_info,
+                key1.id,
+                calendar_id,
+                vec![],
+                &RoaringBitmap::new(),
+                &ContainerCleanup::empty(Collection::CalendarEvent),
+                None,
+                false,
+                Some(keys),
+                &mut batch,
+            )
+            .await
+            .map(|_| ())
+    };
+    let err = delete_calendar(&keys2)
+        .await
+        .expect_err("another account's keys resolved key1's calendar");
+    assert!(
+        err.matches(trc::EventType::Security(trc::SecurityEvent::Unauthorized)),
+        "{err:?}"
+    );
+    delete_calendar(&keys1)
+        .await
+        .expect("control: the owner's keys");
+    key1.client
+        .request("DELETE", guard_cal, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+
+    // B-M2.
+    let guard_event = format!("{KEY1_CAL}fo-guard.ics");
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &guard_event,
+            [CONTENT_TYPE],
+            invite("za-fo-guard", START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let default_id = super::dav_seal::resource_id(test, key1.id, "default").await;
+    let domain = ZaKeyDomain::owner(&keys1);
+    let delete_event = async |domain: Option<&ZaKeyDomain>| {
+        let (records, document_id) =
+            super::dav_seal::raw_event_records(test, key1.id, "default/fo-guard.ics").await;
+        let mut batch = BatchBuilder::new();
+        groupware::DestroyArchive(records.meta.to_unarchived::<CalendarEvent>().unwrap())
+            .delete_za_at(
+                &test.server,
+                &account_info,
+                key1.id,
+                document_id,
+                default_id,
+                None,
+                None,
+                true,
+                domain,
+                store::write::now() as i64,
+                &mut batch,
+            )
+            .await
+    };
+    let err = delete_event(None)
+        .await
+        .map(|message| message.is_some())
+        .expect_err("a sealed event's CANCEL was built without its key domain");
+    assert!(
+        format!("{err:?}").contains("sealed event without its key domain"),
+        "{err:?}"
+    );
+    assert!(
+        delete_event(Some(&domain))
+            .await
+            .map_err(|err| format!("{err:?}"))
+            .expect("control: the key domain")
+            .is_some_and(|message| message.messages.is_some()),
+        "control: no CANCEL for the fan-out"
+    );
+    key1.client
+        .request_with_headers("DELETE", &guard_event, [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    key2.delete_items_since(test, &start2).await;
 }

@@ -9,28 +9,26 @@
 
 use super::STRONG;
 use crate::utils::{server::TestServer, webdav::DummyWebDavClient};
-use groupware::{cache::GroupwareCache, calendar::CalendarEvent};
+use groupware::cache::GroupwareCache;
 use hyper::StatusCode;
 use std::time::Duration;
-use store::{
-    ValueKey,
-    write::{AlignedBytes, Archive, BatchBuilder},
-};
 use trc::{
     CalendarEvent as TraceCalendarEvent, Collector, EventType, Key,
     ipc::subscriber::{Interests, SubscriberBuilder},
 };
-use types::collection::{Collection, SyncCollection};
+use types::collection::SyncCollection;
 
 const SUBSCRIBER_ID: &str = "za-expansion-test";
 const CONTENT_TYPE: (&str, &str) = ("content-type", "text/calendar; charset=utf-8");
 const SUMMARY_CANARY: &str = "expansion-canary-summary-5b1e";
 const DESCRIPTION_CANARY: &str = "expansion-canary-description-8c3f";
 
-/// An RRULE that ends before it starts: calcard reports an expansion error.
+/// A rule in an unsupported RSCALE: calcard reports an RRULE error whose
+/// text names the scale. (1.0's calcard expands an UNTIL before DTSTART,
+/// 0.16's fixture, to no instance without an error.)
 fn bad_rrule(uid: &str) -> String {
     format!(
-        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\nBEGIN:VEVENT\r\nUID:{uid}\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20240102T090000Z\r\nRRULE:FREQ=DAILY;UNTIL=20200101T000000Z\r\nSUMMARY:{SUMMARY_CANARY}\r\nDESCRIPTION:{DESCRIPTION_CANARY}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\nBEGIN:VEVENT\r\nUID:{uid}\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20240102T090000Z\r\nRRULE:RSCALE=HEBREW;FREQ=YEARLY;COUNT=2\r\nSUMMARY:{SUMMARY_CANARY}\r\nDESCRIPTION:{DESCRIPTION_CANARY}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
     )
 }
 
@@ -55,35 +53,14 @@ fn strings(value: &trc::Value, out: &mut Vec<String>) {
 /// Empties the first stored time range's instances, keeping everything else
 /// (including the seal): `expand` then returns `None` at query time.
 async fn break_time_ranges(test: &TestServer, account_id: u32, document_id: u32) {
-    let stored = test
-        .server
-        .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
-            account_id,
-            Collection::CalendarEvent,
-            document_id,
-        ))
-        .await
-        .unwrap()
-        .unwrap();
-    let mut event = stored.deserialize::<CalendarEvent>().unwrap();
-    let mut ranges = event.data.time_ranges.into_vec();
+    // 1.0 splits the event: the time ranges live in the content record.
+    let stored = crate::utils::za::stored_event(test, account_id, document_id).await;
+    let mut event = stored.za_event();
+    let mut ranges = std::mem::take(&mut event.content.data.time_ranges).into_vec();
     assert!(!ranges.is_empty());
     ranges[0].instances = Box::default();
-    event.data.time_ranges = ranges.into_boxed_slice();
-    let account_info = test.server.account_info(account_id).await.unwrap();
-    let mut batch = BatchBuilder::new();
-    event
-        .update(
-            account_info.account_tenant_ids(),
-            stored.to_unarchived::<CalendarEvent>().unwrap(),
-            account_id,
-            document_id,
-            &mut batch,
-        )
-        .unwrap();
-    test.server.commit_batch(batch).await.unwrap();
-    test.server.notify_task_queue();
+    event.content.data.time_ranges = ranges.into_boxed_slice();
+    crate::utils::za::write_stored_event(test, account_id, document_id, &stored, event).await;
 }
 
 pub async fn test(test: &mut TestServer) {
@@ -108,7 +85,7 @@ pub async fn test(test: &mut TestServer) {
     let event_type = EventType::Calendar(TraceCalendarEvent::RuleExpansionError);
     let mut interests = Interests::default();
     interests.set(event_type);
-    let (_tx, mut rx) = SubscriberBuilder::new(SUBSCRIBER_ID.into())
+    let (_tx, mut rx, _) = SubscriberBuilder::new(SUBSCRIBER_ID.into())
         .set_interests([event_type])
         .with_lossy(false)
         .register();
@@ -145,7 +122,7 @@ pub async fn test(test: &mut TestServer) {
         test.wait_for_tasks().await;
         let document_id = test
             .server
-            .fetch_dav_resources(*id, *id, SyncCollection::Calendar)
+            .fetch_groupware_resources(*id, *id, SyncCollection::Calendar)
             .await
             .unwrap()
             .by_path(&format!("{name}/broken-{who}.ics"))
@@ -172,7 +149,9 @@ pub async fn test(test: &mut TestServer) {
             for (key, value) in event.keys.iter() {
                 strings(value, &mut all);
                 match key {
-                    Key::Details => {
+                    // 1.0 names the event's UID in `ResourceUid` (0.16 in
+                    // `Details`).
+                    Key::Details | Key::ResourceUid => {
                         let mut d = Vec::new();
                         strings(value, &mut d);
                         details = d.join("");
@@ -212,7 +191,9 @@ pub async fn test(test: &mut TestServer) {
     for (details, reason, _, account_id, document_id) in &captured {
         if details.starts_with("za-chrono-") {
             assert!(
-                reason.iter().any(|s| s == "chrono error"),
+                reason
+                    .iter()
+                    .any(|s| s == "Failed to expand stored time ranges"),
                 "unexpected chrono reason: {dump}"
             );
             let (_, expected_account, expected_document) = broken
@@ -233,12 +214,17 @@ pub async fn test(test: &mut TestServer) {
             assert_eq!(reason, &["RRule error".to_string()], "key reason: {dump}");
         } else if details == "za-rrule-plain" {
             assert!(
-                reason.iter().any(|s| s.contains("Until date")),
+                reason.iter().any(|s| s.contains("HEBREW")),
                 "plain reason must stay upstream's text: {dump}"
             );
         }
     }
-    for (_, _, all, ..) in &captured {
+    // The key account's events. An ordinary account's PUT-time event carries
+    // 1.0 upstream's `Contents` (non-key accounts take upstream's path).
+    for (_, _, all, ..) in captured
+        .iter()
+        .filter(|(details, ..)| details.ends_with("-key"))
+    {
         for forbidden in [
             SUMMARY_CANARY,
             DESCRIPTION_CANARY,

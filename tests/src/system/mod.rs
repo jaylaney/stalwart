@@ -5,7 +5,6 @@
  */
 
 pub mod antispam;
-pub mod archiving;
 pub mod authentication;
 pub mod authorization;
 pub mod crypto;
@@ -16,16 +15,29 @@ pub mod purge;
 pub mod quota;
 pub mod security;
 pub mod task;
-pub mod tenant;
 
 use crate::utils::server::TestServerBuilder;
-use registry::schema::structs::{Expression, Imap, MtaStageAuth};
+use registry::schema::{
+    enums::NetworkListenerProtocol,
+    structs::{Expression, Imap, MtaStageAuth},
+};
+
+/// Submission over implicit TLS: 1.0 offers the bearer SASL mechanisms
+/// only over TLS, so `oidc::test` authenticates with OAUTHBEARER here.
+pub const SUBMISSION_PORT: u16 = 4467;
 
 #[tokio::test(flavor = "multi_thread")]
 pub async fn system_tests() {
     let mut test = TestServerBuilder::new("system_tests")
         .await
         .with_default_listeners()
+        .await
+        .with_listener(
+            NetworkListenerProtocol::Smtp,
+            "submissions",
+            SUBMISSION_PORT,
+            true,
+        )
         .await
         .with_object(Imap {
             allow_plain_text_auth: true,
@@ -62,14 +74,12 @@ pub async fn system_tests() {
     authentication::test(&test).await;
     oidc::test(&mut test).await;
     authorization::test(&mut test).await;
-    tenant::test(&mut test).await;
     security::test(&mut test).await;
     quota::test(&mut test).await;
     purge::test(&mut test).await;
     delivery::test(&mut test).await;
     crypto::test(&mut test).await;
     antispam::test(&mut test).await;
-    archiving::test(&mut test).await;
     task::test(&mut test).await;
 
     if test.is_reset() {

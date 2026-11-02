@@ -197,21 +197,15 @@ pub async fn test(test: &TestServer) {
                 }
             },
             "recurrenceOverrides": {
+                // 1.0 stores an override as a patch of what differs from the
+                // master (RFC 8984 4.3.5); 0.16 stored the instance whole.
                 "2007-03-06T12:00:00": {
                     "title": "Standup with guests",
-                    "start": "2007-03-06T12:00:00",
-                    "duration": "PT1H",
-                    "locations": {
-                        "loc1": {
-                            "@type": "Location",
-                            "name": "Room B"
-                        }
-                    }
+                    "locations/loc1/name": "Room B"
                 },
                 "2007-03-07T12:00:00": {
                     "title": "Moved standup, renamed",
-                    "start": "2007-03-07T15:00:00",
-                    "duration": "PT1H"
+                    "start": "2007-03-07T15:00:00"
                 }
             }
         }),
@@ -390,14 +384,22 @@ pub async fn test(test: &TestServer) {
         );
     }
 
-    // Properties that are not per-occurrence are rejected
+    // Properties that are not per-occurrence are rejected. 1.0 ignores such a
+    // property when the value equals the base event's (see below) and
+    // rejects any other value, so each value here differs from the base's;
+    // 0.16 rejected the base's own calendarIds too, and ignored the inherited
+    // properties whatever their values.
     for property in [
-        json!({"calendarIds": {&calendar_id: true}}),
+        json!({"calendarIds": {}}),
         json!({"isDraft": true}),
         json!({"utcStart": "2007-03-06T17:00:00Z"}),
         json!({"utcEnd": "2007-03-06T18:00:00Z"}),
         json!({"mayInviteSelf": true}),
         json!({"useDefaultAlerts": true}),
+        json!({"uid": "somebody-elses-uid@example.com"}),
+        json!({"recurrenceRule": {"frequency": "weekly"}}),
+        json!({"privacy": "private"}),
+        json!({"participants/xyz/calendarAddress": "mailto:nobody@example.com"}),
     ] {
         let response = account
             .jmap_update(
@@ -413,7 +415,8 @@ pub async fn test(test: &TestServer) {
         );
     }
 
-    // Properties an occurrence inherits from the base event are ignored, not rejected
+    // Properties an occurrence inherits from the base event are ignored, not
+    // rejected, when they carry the base's values (1.0)
     account
         .jmap_update(
             MethodObject::CalendarEvent,
@@ -422,10 +425,10 @@ pub async fn test(test: &TestServer) {
                 json!({
                     "@type": "Event",
                     "title": "Ignoring inherited properties",
-                    "uid": "somebody-elses-uid@example.com",
-                    "recurrenceRule": {"frequency": "weekly"},
-                    "privacy": "private",
-                    "participants/xyz/calendarAddress": "mailto:nobody@example.com"
+                    "uid": "recurring-instances@example.com",
+                    "recurrenceRule": null,
+                    "privacy": null,
+                    "calendarIds": {&calendar_id: true}
                 }),
             )],
             Vec::<(&str, &str)>::new(),
@@ -482,10 +485,11 @@ pub async fn test(test: &TestServer) {
     );
     test.wait_for_tasks().await;
 
-    // A synthetic id of a non-recurring event refers to the event itself
+    // A non-recurring event expands to itself: 1.0 returns its own id (and no
+    // base event), where 0.16 returned a synthetic instance id for it
     let instances = expand_instances(account, &calendar_id).await;
     let id = instance_id(&instances, "2007-03-12T09:00:00");
-    assert_ne!(id, single_id);
+    assert_eq!(id, single_id);
     account
         .jmap_update(
             MethodObject::CalendarEvent,
@@ -608,18 +612,13 @@ pub async fn test(test: &TestServer) {
     let account_id = account.id().document_id();
     let resources = test
         .server
-        .fetch_dav_resources(account_id, account_id, SyncCollection::Calendar)
+        .fetch_groupware_resources(account_id, account_id, SyncCollection::Calendar)
         .await
         .unwrap();
     let calendar_document_id = Id::from_str(&calendar_id).unwrap().document_id();
     let calendar_path = resources
-        .paths
-        .iter()
-        .find(|path| {
-            path.parent_id.is_none()
-                && resources.resources[path.resource_idx].document_id == calendar_document_id
-        })
-        .map(|path| format!("{}{}", resources.base_path, path.path))
+        .container_resource_path_by_id(calendar_document_id)
+        .map(|path| format!("{}{}", resources.base_path, path.path()))
         .unwrap();
 
     dav_client
@@ -648,10 +647,15 @@ pub async fn test(test: &TestServer) {
         instance(&instances, "2007-03-07T14:00:00").text_field("recurrenceId"),
         "2007-03-07T12:00:00"
     );
-    for start in ["2007-03-08T14:00:00", "2007-03-09T14:00:00"] {
+    // 1.0 gives an occurrence that the this-and-future change shifted its
+    // original time as recurrenceId (12:00); 0.16 gave its shifted start.
+    for (start, recurrence_id) in [
+        ("2007-03-08T14:00:00", "2007-03-08T12:00:00"),
+        ("2007-03-09T14:00:00", "2007-03-09T12:00:00"),
+    ] {
         assert_eq!(
             instance(&instances, start).text_field("recurrenceId"),
-            start
+            recurrence_id
         );
         let id = instance_id(&instances, start);
         let response = account

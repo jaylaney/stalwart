@@ -4,13 +4,11 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::{
-    directory::oidc::get_token_for_client,
-    utils::{containers, server::TestServerBuilder},
-};
+use crate::utils::{containers, server::TestServerBuilder};
 use base64::{Engine, engine::general_purpose};
 use registry::{
     schema::{
+        enums::OidcUnscopedTokenPolicy,
         prelude::{ObjectType, Property},
         structs::{Action, Directory, OidcDirectory},
     },
@@ -43,8 +41,16 @@ pub async fn test() {
             claim_username: "email".to_string(),
             claim_name: Some("name".to_string()),
             claim_groups: Some("groups".to_string()),
-            require_audience: Some("stalwart".to_string()),
-            require_scopes: Map::new(vec!["openid".to_string()]),
+            accepted_audiences: Map::new(vec!["stalwart".to_string()]),
+            // 1.0 refuses a token that carries none of the
+            // urn:ietf:params:oauth:scope:{mail,contacts,calendars,files}
+            // scopes unless the directory says otherwise (`unscopedTokens`
+            // defaults to `reject`). This test's token asks for `openid`
+            // only, and the test realm defines none of those scopes, so the
+            // directory accepts unscoped tokens with the interoperable
+            // scopes; the subject here is the issuer routing (licensed at
+            // 1.0, below).
+            unscoped_tokens: OidcUnscopedTokenPolicy::Interoperable,
             ..Default::default()
         }))
         .await;
@@ -81,11 +87,26 @@ pub async fn test() {
     }
     assert_eq!(claims["iss"], json!(ISSUER));
 
-    assert_eq!(
-        session_status(&token).await,
-        200,
-        "A bearer token without a username claim did not reach the domain's OIDC directory"
-    );
+    // Upgrade ruling 33: at 1.0, routing a token to a domain's directory, by
+    // the token's domain or by its issuer, is a licensed feature
+    // (`get_directory_for_domain` and `get_directory_for_issuer` consult a
+    // domain's directory only while `is_enterprise_edition()`), and these
+    // tests run without a licence. With no default directory, the token then
+    // reaches no OIDC directory and 1.0 answers 401; 0.16's test licence
+    // routed it.
+    if test.server.is_enterprise_edition() {
+        assert_eq!(
+            session_status(&token).await,
+            200,
+            "A bearer token without a username claim did not reach the domain's OIDC directory"
+        );
+    } else {
+        assert_eq!(
+            session_status(&token).await,
+            401,
+            "Without a licence, a bearer token reached a directory other than the default one"
+        );
+    }
 }
 
 fn access_token_claims(token: &str) -> serde_json::Value {
@@ -112,4 +133,80 @@ async fn session_status(token: &str) -> u16 {
         .expect("Failed to send session request")
         .status()
         .as_u16()
+}
+
+/// Requests an access token for `username` from the test issuer with the
+/// resource owner password credentials grant (RFC 6749, section 4.3). The
+/// client authenticates with HTTP Basic, its identifier and secret each
+/// form-urlencoded first (section 2.3.1). The token endpoint is the one the
+/// issuer's discovery document names.
+///
+/// Zero-access fork (upgrade Task 2): written from RFC 6749. The helper this
+/// test used at 0.16 sat in an SEL-only file, which the fork does not carry.
+async fn get_token_for_client(
+    client_id: &str,
+    client_secret: &str,
+    username: &str,
+    password: &str,
+    scope: &str,
+) -> String {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+
+    // The token endpoint
+    let discovery: serde_json::Value = client
+        .get(format!("{ISSUER}/.well-known/openid-configuration"))
+        .send()
+        .await
+        .expect("Failed to fetch the issuer's discovery document")
+        .json()
+        .await
+        .expect("Failed to parse the issuer's discovery document");
+    let token_endpoint = discovery["token_endpoint"]
+        .as_str()
+        .expect("The discovery document names no token endpoint");
+
+    // Client authentication (section 2.3.1)
+    let credentials = format!(
+        "{}:{}",
+        form_urlencoded::byte_serialize(client_id.as_bytes()).collect::<String>(),
+        form_urlencoded::byte_serialize(client_secret.as_bytes()).collect::<String>()
+    );
+    let authorization = format!(
+        "Basic {}",
+        general_purpose::STANDARD.encode(credentials.as_bytes())
+    );
+
+    // Access token request (section 4.3.2)
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "password")
+        .append_pair("username", username)
+        .append_pair("password", password)
+        .append_pair("scope", scope)
+        .finish();
+    let response = client
+        .post(token_endpoint)
+        .header(reqwest::header::AUTHORIZATION, authorization)
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        )
+        .body(body)
+        .send()
+        .await
+        .expect("Failed to send the token request");
+
+    // Access token response (sections 4.3.3 and 5.1)
+    let status = response.status();
+    let response: serde_json::Value = response
+        .json()
+        .await
+        .expect("Failed to parse the token response");
+    assert_eq!(status, 200, "The token request failed: {response}");
+    response["access_token"]
+        .as_str()
+        .expect("The token response holds no access token")
+        .to_string()
 }

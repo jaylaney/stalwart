@@ -20,7 +20,7 @@ use registry::schema::enums::Permission;
 use std::{collections::BTreeMap, sync::Arc};
 use store::{
     ValueKey,
-    write::{AlignedBytes, Archive, BatchBuilder},
+    write::{Archive, ArchiveBytes, BatchBuilder},
 };
 use types::{
     acl::{Acl, AclGrant},
@@ -81,7 +81,7 @@ pub struct ZaCalendarContext {
     pub owner_id: u32,
     pub calendar_id: u32,
     pub personal_id: u32,
-    pub stored: Archive<AlignedBytes>,
+    pub stored: Archive<ArchiveBytes>,
     pub domain: ZaKeyDomain,
     pub boundary: Option<ZaSyncBoundary>,
 }
@@ -175,12 +175,12 @@ async fn read_calendar(
     server: &Server,
     owner_id: u32,
     calendar_id: u32,
-) -> Result<Archive<AlignedBytes>, ZaCalendarError> {
+) -> Result<Archive<ArchiveBytes>, ZaCalendarError> {
     #[cfg(feature = "test_mode")]
     super::test::record_read(owner_id, calendar_id);
     server
         .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
             owner_id,
             Collection::Calendar,
             calendar_id,
@@ -289,7 +289,7 @@ fn validate_sealed_entries(
 }
 
 pub(super) fn resolve_owner_stored(
-    stored: Archive<AlignedBytes>,
+    stored: Archive<ArchiveBytes>,
     keys: &SessionKeys,
     calendar_id: u32,
 ) -> Result<ZaCalendarContext, ZaCalendarError> {
@@ -366,7 +366,7 @@ pub(super) fn resolve_owner_stored(
 }
 
 fn resolve_stored_calendar(
-    stored: Archive<AlignedBytes>,
+    stored: Archive<ArchiveBytes>,
     token: &AccessToken,
     owner_id: u32,
     calendar_id: u32,
@@ -561,8 +561,8 @@ mod tests {
         .with_session_keys(keys)
     }
 
-    fn archive(calendar: &Calendar) -> Archive<AlignedBytes> {
-        <Archive<AlignedBytes> as Deserialize>::deserialize(
+    fn archive(calendar: &Calendar) -> Archive<ArchiveBytes> {
+        <Archive<ArchiveBytes> as Deserialize>::deserialize(
             &Archiver::new(calendar.clone()).serialize().unwrap(),
         )
         .unwrap()
@@ -629,7 +629,7 @@ mod tests {
             &owner_ring,
         )
         .unwrap();
-        let (envelope, bundle) = seal_shared_properties(&Default::default(), &domain).unwrap();
+        let (envelope, bundle) = seal_shared_properties(&domain).unwrap();
         own.name.push_str(&format!("|{envelope}|{bundle}"));
         let grantee = seal_personal_entry(
             &CalendarPreferences {
@@ -1047,19 +1047,19 @@ mod tests {
         )
         .unwrap();
         let Entry::ICalendar(tree) = Parser::new("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:resolver-envelope\r\nDTSTART:20240101T090000Z\r\nSUMMARY:Private summary\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n").entry() else { panic!() };
-        let mut event = CalendarEvent::default();
-        event.names.push(common::DavName {
+        let mut event = crate::calendar::seal::ZaEvent::default();
+        event.meta.names.push(common::DavName {
             name: "event.ics".into(),
             parent_id: CALENDAR,
         });
-        event.data.event = tree;
+        event.content.data.event = tree;
         seal_event_in_domain(&mut event, &context.domain, None).unwrap();
         for (offset, bytes) in [
             (2usize, (CALENDAR + 1).to_be_bytes()),
             (6, 3u32.to_be_bytes()),
         ] {
             let mut damaged = event.clone();
-            let key = damaged.data.event.components[0]
+            let key = damaged.content.data.event.components[0]
                 .entries
                 .iter_mut()
                 .find(|entry| crate::calendar::seal::tree::is_carrier(entry, "X-ZA-KEY"))
@@ -1077,7 +1077,7 @@ mod tests {
             resolve_stored_calendar(archive(&next), &token, OWNER, CALENDAR, Bitmap::new(), None)
                 .unwrap();
         assert!(unseal_event_in_domain(&mut event.clone(), &next.domain).is_err());
-        let mut linked = event.clone();
+        let mut linked = event.meta.clone();
         linked.names.push(common::DavName {
             name: "other.ics".into(),
             parent_id: CALENDAR,

@@ -12,7 +12,7 @@
 
 use super::{
     assert_sealed, assert_sealed_upload, key_mail_account, message_ids, message_with, new_message,
-    open_message, spam_samples, stored_metadata,
+    open_message, row_is_stub, spam_samples, stored_hash, stored_metadata,
 };
 use crate::{
     utils::{
@@ -26,11 +26,7 @@ use crate::{
 use common::{auth::AccessToken, za::ZA_MAIL_KEYLESS};
 use email::{
     mailbox::{INBOX_ID, JUNK_ID},
-    message::{
-        ingest::{EmailIngest, IngestEmail, IngestSource},
-        metadata::MessageMetadata,
-        za::is_stub,
-    },
+    message::ingest::{EmailIngest, IngestEmail, IngestSource},
 };
 use groupware::calendar::seal::WRAP_MK;
 use imap_proto::{ResponseType, protocol::SerializeResponse};
@@ -97,13 +93,7 @@ fn contains(haystack: &[u8], needle: &str) -> bool {
 
 /// The stub's blob hash.
 async fn blob_hash_of(test: &TestServer, id: u32, document_id: u32) -> BlobHash {
-    BlobHash::from(
-        &stored_metadata(test, id, document_id)
-            .await
-            .unarchive::<MessageMetadata>()
-            .unwrap()
-            .blob_hash,
-    )
+    stored_hash(test, id, document_id).await
 }
 
 /// The session's token carries the keys (`refresh_access_token`), so the
@@ -147,7 +137,8 @@ async fn email_set_create_is_sealed_under_mk(test: &TestServer, key: &Account, i
         "{}",
         String::from_utf8_lossy(&raw)
     );
-    assert!(meta.preview.contains("created body"), "{}", meta.preview);
+    let preview = meta.unarchive().unwrap().preview().to_string();
+    assert!(preview.contains("created body"), "{preview}");
 }
 
 /// Mail spec 5.7, 6.2: the upload is sealed under `mk`; the imported
@@ -271,6 +262,7 @@ async fn keyless_session_writes_are_refused(test: &TestServer, id: u32) {
                 keywords: vec![],
                 received_at: None,
                 source,
+                metadata: None,
                 session_id: 0,
             })
             .await
@@ -314,9 +306,8 @@ async fn rf_3_append_into_plain_share(test: &TestServer, plain_id: u32) {
     imap.send_ok("LOGOUT").await;
 
     let document_id = new_message(test, plain_id, &before).await;
-    let archive = stored_metadata(test, plain_id, document_id).await;
     assert!(
-        !is_stub(archive.unarchive::<MessageMetadata>().unwrap()),
+        !row_is_stub(&stored_metadata(test, plain_id, document_id).await),
         "the plain account's message is sealed"
     );
     owner.send_ok("SELECT INBOX").await;

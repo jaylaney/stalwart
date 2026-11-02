@@ -4,10 +4,44 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use calcard::icalendar::{ICalendarComponentType, ICalendarParameterName, ICalendarProperty};
+use calcard::icalendar::{
+    ICalendarClassification, ICalendarComponentType, ICalendarEntry, ICalendarParameterName,
+    ICalendarProperty, ICalendarValue,
+};
 
-/// Recorded with every sealed object (spec 6).
+/// Recorded with every sealed object (spec 6). Field policy version 2 (spec
+/// 6, revision 8) keeps this byte at 1: it opens every key-wrap envelope and
+/// is bound into the associated data, and version 2 changes no format. It is
+/// a property of the store: a Stalwart 1.0 store starts fresh, and every
+/// object in it is written under version 2.
 pub const POLICY_VERSION: u8 = 1;
+
+/// Field policy version 2, levels 1 and 2 with the value level for CLASS:
+/// whether `entry` stays visible in a component of type `component`. CLASS
+/// is visible on VEVENT, VTODO and VJOURNAL when its one value is PUBLIC,
+/// PRIVATE or CONFIDENTIAL; any other CLASS is sealed. Upstream derives
+/// `EVENT_PRIVATE` and `EVENT_SECRET` from the stored tree, so no fork code
+/// computes them. Every other property follows `is_visible_property`.
+pub fn is_visible_entry(component: &ICalendarComponentType, entry: &ICalendarEntry) -> bool {
+    match &entry.name {
+        ICalendarProperty::Class => {
+            matches!(
+                component,
+                ICalendarComponentType::VEvent
+                    | ICalendarComponentType::VTodo
+                    | ICalendarComponentType::VJournal
+            ) && matches!(
+                entry.values.as_slice(),
+                [ICalendarValue::Classification(
+                    ICalendarClassification::Public
+                        | ICalendarClassification::Private
+                        | ICalendarClassification::Confidential
+                )]
+            )
+        }
+        name => is_visible_property(component, name),
+    }
+}
 
 /// Three-level allowlist, level 1 and 2: component type and property.
 /// Anything not listed is sealed, including every `X-` property, with two
@@ -18,10 +52,10 @@ pub const POLICY_VERSION: u8 = 1;
 /// - On VTIMEZONE, `X-LIC-LOCATION` and `X-MICROSOFT-CDO-TZID` are visible
 ///   (case-insensitively): calcard resolves a timezone by name only (TZID, else
 ///   these two), so they must survive sealing.
-pub fn is_visible_property(
-    component: &ICalendarComponentType,
-    property: &ICalendarProperty,
-) -> bool {
+///
+/// CLASS is decided by its value (`is_visible_entry`), so it is not listed
+/// here; callers decide entries, never bare names.
+fn is_visible_property(component: &ICalendarComponentType, property: &ICalendarProperty) -> bool {
     use ICalendarComponentType as C;
     use ICalendarProperty as P;
     if matches!(property, P::Uid) {
@@ -82,6 +116,88 @@ mod tests {
         ICalendarComponentType as C, ICalendarParameterName as N, ICalendarProperty as P,
     };
 
+    fn entry(name: P, values: Vec<ICalendarValue>) -> ICalendarEntry {
+        ICalendarEntry {
+            name,
+            params: vec![],
+            values: values.into(),
+        }
+    }
+
+    fn class(class: ICalendarClassification) -> ICalendarEntry {
+        entry(P::Class, vec![ICalendarValue::Classification(class)])
+    }
+
+    #[test]
+    fn standard_class_is_visible_on_event_task_and_journal() {
+        for ct in [C::VEvent, C::VTodo, C::VJournal] {
+            for value in [
+                ICalendarClassification::Public,
+                ICalendarClassification::Private,
+                ICalendarClassification::Confidential,
+            ] {
+                assert!(
+                    is_visible_entry(&ct, &class(value.clone())),
+                    "{value:?} in {ct:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn other_class_values_and_components_stay_sealed() {
+        let public = class(ICalendarClassification::Public);
+        for ct in [
+            C::VCalendar,
+            C::VAlarm,
+            C::VFreebusy,
+            C::VTimezone,
+            C::Standard,
+            C::Daylight,
+            C::VAvailability,
+            C::Other("X-THING".into()),
+        ] {
+            assert!(!is_visible_entry(&ct, &public), "CLASS in {ct:?}");
+        }
+        for values in [
+            vec![ICalendarValue::Text("X-SOMETHING".into())],
+            vec![ICalendarValue::Text("PUBLIC".into())],
+            vec![],
+            vec![
+                ICalendarValue::Classification(ICalendarClassification::Public),
+                ICalendarValue::Classification(ICalendarClassification::Private),
+            ],
+        ] {
+            assert!(
+                !is_visible_entry(&C::VEvent, &entry(P::Class, values.clone())),
+                "{values:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parsed_extension_class_stays_sealed() {
+        for (text, visible) in [
+            ("PUBLIC", true),
+            ("PRIVATE", true),
+            ("CONFIDENTIAL", true),
+            ("X-SOMETHING", false),
+        ] {
+            let ical = calcard::icalendar::ICalendar::parse(format!(
+                "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:x\r\n\
+                 DTSTART:20250101T000000Z\r\nCLASS:{text}\r\nEND:VEVENT\r\n\
+                 END:VCALENDAR\r\n"
+            ))
+            .unwrap();
+            let entry = ical.components[1]
+                .entries
+                .iter()
+                .find(|e| e.name == P::Class)
+                .unwrap();
+            assert_eq!(is_visible_entry(&C::VEvent, entry), visible, "{text}");
+        }
+    }
+
     #[test]
     fn event_allowlist_matches_spec_section_6() {
         for ct in [C::VEvent, C::VTodo, C::VJournal] {
@@ -118,7 +234,6 @@ mod tests {
                 P::Resources,
                 P::Attach,
                 P::RelatedTo,
-                P::Class,
                 P::Priority,
                 P::Color,
                 P::Conference,
@@ -129,6 +244,16 @@ mod tests {
             ] {
                 assert!(!is_visible_property(&ct, &p), "{p:?} in {ct:?}");
             }
+            // Policy version 2: CLASS is decided by its value.
+            assert!(!is_visible_property(&ct, &P::Class));
+            assert!(is_visible_entry(
+                &ct,
+                &class(ICalendarClassification::Confidential)
+            ));
+            assert!(!is_visible_entry(
+                &ct,
+                &entry(P::Class, vec![ICalendarValue::Text("X-SOMETHING".into())])
+            ));
         }
     }
 

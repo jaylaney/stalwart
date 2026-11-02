@@ -28,6 +28,9 @@ pub async fn test(test: &TestServer) {
             .with_status(hyper::StatusCode::CREATED);
         hrefs.push(href);
     }
+    // 1.0 answers addressbook-query from the Contacts search index, which an
+    // index task fills after each PUT; 0.16 matched the cards directly.
+    test.wait_for_tasks().await;
     let uri_sarah = hrefs[0].as_str();
     let uri_carlos = hrefs[1].as_str();
     let uri_acme = hrefs[2].as_str();
@@ -120,7 +123,9 @@ END:VCARD
             properties: Default::default(),
             version: None,
         }))
-        .with_values([VCARD3.replace('\n', "\r\n").as_str()]);
+        // 1.0 writes a newline inside a parameter value as RFC 6868's `^n`; the
+        // fixture spells it `\n`, which 0.16 wrote back as given.
+        .with_values([VCARD3.replace("\\n", "^n").replace('\n', "\r\n").as_str()]);
 
     // Test 4: Search using limit
     client

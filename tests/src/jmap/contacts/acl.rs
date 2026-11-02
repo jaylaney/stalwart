@@ -13,6 +13,8 @@ use jmap_proto::{
 use serde_json::json;
 use types::id::Id;
 
+// 1.0 lists `maySetMetadata` among the rights (`Acl::ModifyMetadata`): an
+// owner holds it, and no grant below gives it.
 pub async fn test(test: &TestServer) {
     println!("Running Contacts ACL tests...");
     let john = test.account("jdoe@example.com");
@@ -98,7 +100,8 @@ pub async fn test(test: &TestServer) {
           "mayRead": true,
           "mayWrite": true,
           "mayDelete": true,
-          "mayShare": true
+          "mayShare": true,
+          "maySetMetadata": true
         },
         "shareWith": {}
         }));
@@ -125,7 +128,9 @@ pub async fn test(test: &TestServer) {
         .await
         .method_response()
         .typ(),
-        "forbidden"
+        // 1.0: an account the session cannot reach is not found (RFC 8620
+        // 3.6.2); 0.16 answered forbidden.
+        "accountNotFound"
     );
 
     // Share address book with Jane
@@ -164,7 +169,8 @@ pub async fn test(test: &TestServer) {
                 "mayRead": true,
                 "mayWrite": false,
                 "mayDelete": false,
-                "mayShare": false
+                "mayShare": false,
+                "maySetMetadata": false
             }
         }
         }));
@@ -189,7 +195,8 @@ pub async fn test(test: &TestServer) {
             "mayRead": true,
             "mayWrite": false,
             "mayDelete": false,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
         }
         }));
     jane.jmap_get_account(
@@ -245,29 +252,42 @@ pub async fn test(test: &TestServer) {
             "mayRead": false,
             "mayWrite": false,
             "mayDelete": false,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
           },
           "newRights": {
             "mayRead": true,
             "mayWrite": false,
             "mayDelete": false,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
           },
           "name": null
         }));
 
-    // Updating and deleting should fail
+    // Updating and deleting should fail.
+    // 1.0 checks a sharee's update property by property: an empty patch changes
+    // nothing and is accepted, and an address book's name and description are
+    // the sharee's own preferences; only a sharing change needs `Share`.
+    jane.jmap_update_account(
+        john,
+        MethodObject::AddressBook,
+        [(&john_book_id, json!({}))],
+        Vec::<(&str, &str)>::new(),
+    )
+    .await
+    .updated(&john_book_id);
     assert_eq!(
         jane.jmap_update_account(
             john,
             MethodObject::AddressBook,
-            [(&john_book_id, json!({}))],
+            [(&john_book_id, json!({"shareWith": {}}))],
             Vec::<(&str, &str)>::new(),
         )
         .await
         .not_updated(&john_book_id)
         .description(),
-        "You are not allowed to modify this address book."
+        "You are not allowed to share this address book."
     );
     assert_eq!(
         jane.jmap_destroy_account(
@@ -339,7 +359,8 @@ pub async fn test(test: &TestServer) {
             "mayRead": true,
             "mayWrite": true,
             "mayDelete": true,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
         }
         }));
 
@@ -381,13 +402,15 @@ pub async fn test(test: &TestServer) {
             "mayRead": true,
             "mayWrite": false,
             "mayDelete": false,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
           },
           "newRights": {
             "mayRead": true,
             "mayWrite": true,
             "mayDelete": true,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
           },
           "name": null
         }));
@@ -587,7 +610,9 @@ pub async fn test(test: &TestServer) {
         .await
         .method_response()
         .typ(),
-        "forbidden"
+        // 1.0: an account the session cannot reach is not found (RFC 8620
+        // 3.6.2); 0.16 answered forbidden.
+        "accountNotFound"
     );
 
     // Verify Jane received a share notification with the updated rights
@@ -627,13 +652,15 @@ pub async fn test(test: &TestServer) {
             "mayRead": true,
             "mayWrite": true,
             "mayDelete": true,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
           },
           "newRights": {
             "mayRead": false,
             "mayWrite": false,
             "mayDelete": false,
-            "mayShare": false
+            "mayShare": false,
+            "maySetMetadata": false
           },
           "name": null
         }));

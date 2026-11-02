@@ -29,8 +29,9 @@ pub async fn test(test: &TestServer) {
         Vec::<Id>::new()
     );
 
-    // Insert test metrics
-    test.server.insert_test_metrics().await;
+    // Insert test metrics. Upgrade ruling 33: `insert_test_metrics` lives
+    // in the SEL-only `common/src/telemetry/metrics/test_data.rs`, which is
+    // not restored, and `telemetry_tests` no longer calls this sub-test.
 
     // Fetch all metrics
     let metric_ids = admin

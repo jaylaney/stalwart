@@ -35,7 +35,7 @@ async fn limits() {
                 }]),
                 else_: "60m".into(),
             },
-            timeout: Expression {
+            idle_timeout: Expression {
                 match_: List::from_iter([ExpressionMatch {
                     if_: "remote_ip = '10.0.0.2'".into(),
                     then: "500ms".into(),

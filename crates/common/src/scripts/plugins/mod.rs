@@ -28,7 +28,7 @@ pub struct PluginContext<'x> {
     pub server: &'x Server,
     pub message: &'x Message<'x>,
     pub modifications: &'x mut Vec<ScriptModification>,
-    pub arguments: Vec<Variable>,
+    pub arguments: Vec<Variable<'x>>,
     /// Mail ruling R59: a key account's message or transaction; the plugin
     /// traces carry no value the script evaluated.
     pub za_redact: bool,
@@ -75,7 +75,7 @@ impl RegisterSievePlugins for FunctionMap {
 }
 
 impl Core {
-    pub async fn run_plugin(&self, id: u32, ctx: PluginContext<'_>) -> Input {
+    pub async fn run_plugin(&self, id: u32, ctx: PluginContext<'_>) -> Input<'static> {
         #[cfg(feature = "test_mode")]
         if id == PLUGINS_REGISTER.len() as u32 {
             return test_print(ctx);
@@ -112,14 +112,21 @@ impl Core {
                     err
                 };
                 trc::error!(err.span_id(session_id).details("Sieve runtime error"));
-                Input::FncResult(Variable::default())
+                Input::Value(Variable::default())
             }
         }
     }
 }
 
+#[cfg(stalwart_tests)]
+#[rustfmt::skip]
+#[path = "../../../../../../stalwart-tests/unit/common/src/scripts/plugins/test_support.rs"]
+mod test_support;
+
+/// The `print` test plugin, written fork-owned from 0.16's (1.0 moved
+/// upstream's into a private slot).
 #[cfg(feature = "test_mode")]
-pub fn test_print(ctx: PluginContext<'_>) -> Input {
+fn test_print(ctx: PluginContext<'_>) -> Input<'static> {
     println!("{}", ctx.arguments[0].to_string());
-    Input::True
+    Input::Bool(true)
 }

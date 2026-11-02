@@ -16,6 +16,7 @@ from test_flows import attendee, event_data, partstat, people
 
 
 DAV = "DAV:"
+CALDAV = "urn:ietf:params:xml:ns:caldav"
 APPLE = "http://apple.com/ns/ical/"
 
 
@@ -148,20 +149,21 @@ def dav(client, url, method="GET", body="", headers=None):
 
 
 def properties(client, url):
-    body = (f'<D:propfind xmlns:D="{DAV}" xmlns:A="{APPLE}"><D:prop>'
-            '<D:displayname/><A:calendar-color/><D:getetag/></D:prop></D:propfind>')
+    body = (f'<D:propfind xmlns:D="{DAV}" xmlns:C="{CALDAV}" xmlns:A="{APPLE}"><D:prop>'
+            '<D:displayname/><C:calendar-description/><A:calendar-color/><D:getetag/>'
+            '</D:prop></D:propfind>')
     status, reply = dav(client, url, "PROPFIND", body, {"Depth": "0"})
     assert status == 207
     root = ET.fromstring(reply._raw)
     return {tag: root.findtext(f".//{{{namespace}}}{tag}")
-            for namespace, tag in ((DAV, "displayname"), (APPLE, "calendar-color"),
-                                   (DAV, "getetag"))}
+            for namespace, tag in ((DAV, "displayname"), (CALDAV, "calendar-description"),
+                                   (APPLE, "calendar-color"), (DAV, "getetag"))}
 
 
 def property_patch(tag, value):
-    prefix = "D" if tag == "displayname" else "A"
-    return (f'<D:propertyupdate xmlns:D="{DAV}" xmlns:A="{APPLE}"><D:set><D:prop>'
-            f'<{prefix}:{tag}>{value}</{prefix}:{tag}>'
+    prefix = {"displayname": "D", "calendar-description": "C"}.get(tag, "A")
+    return (f'<D:propertyupdate xmlns:D="{DAV}" xmlns:C="{CALDAV}" xmlns:A="{APPLE}">'
+            f'<D:set><D:prop><{prefix}:{tag}>{value}</{prefix}:{tag}>'
             '</D:prop></D:set></D:propertyupdate>')
 
 
@@ -232,11 +234,13 @@ def test_shared_calendar_properties_and_etags(people):
         assert owner_properties["displayname"] == "Owner shared calendar"
         assert bob_properties["displayname"] == "Bob personal name"
         assert owner_properties["calendar-color"] == bob_properties["calendar-color"] == "#123456FF"
+        # The If-Match race uses live per-principal properties: at 1.0 a calendar's dead
+        # properties (calendar-color) are not part of its ETag (below).
         for client, url, tag, competing, stale, current, unconditional in (
             (principals[0].client, calendar.url, "displayname", "Competing owner name",
              "Stale owner name", "Current owner name", "Unconditional owner name"),
-            (principals[1].client, bob.url, "calendar-color", "#222222FF",
-             "#333333FF", "#444444FF", "#555555FF"),
+            (principals[1].client, bob.url, "calendar-description", "Competing Bob note",
+             "Stale Bob note", "Current Bob note", "Unconditional Bob note"),
         ):
             old_etag = properties(client, url)["getetag"]
             assert old_etag
@@ -251,6 +255,24 @@ def test_shared_calendar_properties_and_etags(people):
             assert properties(client, url)[tag] == current
             assert dav(client, url, "PROPPATCH", property_patch(tag, unconditional))[0] == 207
             assert properties(client, url)[tag] == unconditional
+        assert properties(principals[0].client, calendar.url)["calendar-description"] != (
+            "Unconditional Bob note")
+        # 1.0 keeps a calendar's dead properties outside the archive whose hash is the
+        # collection's ETag: a dead-only PROPPATCH leaves the ETag unchanged, so an If-Match
+        # read before a competing change still matches; 207, and the last writer wins. The
+        # shared colour stays shared between owner and grantee.
+        for client, url, competing, stale in (
+            (principals[0].client, calendar.url, "#222222FF", "#333333FF"),
+            (principals[1].client, bob.url, "#444444FF", "#555555FF"),
+        ):
+            old_etag = properties(client, url)["getetag"]
+            assert old_etag
+            assert dav(client, url, "PROPPATCH",
+                       property_patch("calendar-color", competing))[0] == 207
+            assert properties(client, url)["getetag"] == old_etag
+            assert dav(client, url, "PROPPATCH", property_patch("calendar-color", stale),
+                       {"If-Match": old_etag})[0] == 207
+            assert properties(client, url)["calendar-color"] == stale
         assert properties(principals[0].client, calendar.url)["calendar-color"] == "#555555FF"
     finally:
         calendar.delete()

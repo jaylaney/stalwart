@@ -12,8 +12,9 @@
 //! changes only.
 
 use super::{
-    assert_sealed, corrupt_blob, corrupt_stub, deliver, key_mail_account, message_ids,
-    message_with, new_message, open_message, stored_metadata,
+    assert_no_plaintext, assert_sealed, corrupt_blob, corrupt_stub, deliver, group_ingest,
+    key_mail_account, keyed_token, keyless_token, message_ids, message_with, new_message,
+    open_message, row_is_stub, stored_hash, stored_metadata,
 };
 use crate::{
     utils::{
@@ -23,7 +24,7 @@ use crate::{
         push::{PUSH_ORIGIN, spawn_mock_push_server},
         server::TestServer,
         smtp::SmtpConnection,
-        za::{bearer_token, plant_plain_message, wait_for_delivery},
+        za::{plant_plain_message, wait_for_delivery, za_bearer_token},
     },
     za::{STRONG, user_permissions},
 };
@@ -38,8 +39,8 @@ use common::{
 use email::{
     mailbox::{DRAFTS_ID, SENT_ID},
     message::{
-        metadata::MessageMetadata,
-        za::{is_stub, view::ZaMailView},
+        ingest::group::IngestGroup,
+        za::{open_stub, view::ZaMailView},
     },
     push::{EmailPush, Urgency},
 };
@@ -47,19 +48,16 @@ use groupware::calendar::seal::{WRAP_MK, WRAP_PK};
 use imap_proto::{ResponseType, protocol::SerializeResponse as ImapResponse};
 use jmap_proto::object::push_subscription::EmailPushProperty;
 use pop3::protocol::response::SerializeResponse as Pop3Response;
+use registry::schema::prelude::ObjectType;
 use serde_json::{Value, json};
 use services::state_manager::email_push::build_email_push_object;
-use std::{
-    borrow::Cow,
-    time::{Duration, Instant},
-};
-use store::{Serialize, write::Archiver};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use trc::{
     Collector, EventType, Key, StoreEvent,
     ipc::subscriber::{Interests, SubscriberBuilder},
 };
-use types::{blob_hash::BlobHash, id::Id};
+use types::{blob::BlobClass, collection::Collection, id::Id};
 
 const KEY: &str = "keymail5@example.com";
 const PLAIN: &str = "plainmail3@example.com";
@@ -122,10 +120,16 @@ pub async fn test(test: &mut TestServer) {
     push_is_state_only(test, &key, &plain).await;
     rf_1_idle_delivery(test, &key).await;
     rf_5_large_header_block(test, &key).await;
+    assigned_ids_preserve_sealed_read_offsets(test, &key, &plain).await;
 
     for account in [&key, &plain, &bcc] {
         test.destroy_all_mailboxes(account).await;
     }
+    // The grouped ingest trains as IMAP APPEND does: the ordinary
+    // account's samples.
+    admin
+        .registry_destroy_all(ObjectType::SpamTrainingSample)
+        .await;
     wait_for_delivery(test).await;
 }
 
@@ -219,6 +223,37 @@ fn normalize(answer: &str, address: &str) -> String {
         out.replace_range(start..end, &size.to_string());
     }
     out
+}
+
+/// The keyword 1.0 sets on an ordinary account's message with an
+/// attachment (ruling 55).
+const ATTACHMENT_FLAG: &str = "$hasattachment";
+
+/// `answer` with `ATTACHMENT_FLAG` taken out of its last FLAGS item, and
+/// whether it was there.
+fn without_attachment_flag(answer: &str) -> (String, bool) {
+    let Some(open) = answer.rfind("FLAGS (") else {
+        return (answer.to_string(), false);
+    };
+    let start = open + "FLAGS (".len();
+    let Some(len) = answer[start..].find(')') else {
+        return (answer.to_string(), false);
+    };
+    let flags = answer[start..start + len].split(' ').collect::<Vec<_>>();
+    let kept = flags
+        .iter()
+        .filter(|flag| **flag != ATTACHMENT_FLAG)
+        .copied()
+        .collect::<Vec<_>>();
+    (
+        format!(
+            "{}{}{}",
+            &answer[..start],
+            kept.join(" "),
+            &answer[start + len..]
+        ),
+        kept.len() + 1 == flags.len(),
+    )
 }
 
 /// A JMAP object with its `id` and `blobId` values removed at every level,
@@ -346,6 +381,7 @@ async fn offsets_round_trip(key: &Account, plain: &Account) {
                 "preview",
                 "size",
                 "hasAttachment",
+                "sentAt",
             ],
         )
         .await;
@@ -501,11 +537,24 @@ async fn offsets_round_trip(key: &Account, plain: &Account) {
     let (plain_fetched, plain_email, plain_whole, plain_parsed) = &answers[1];
     assert_eq!(key_parsed, plain_parsed, "Email/parse");
     assert_eq!(key_parsed["subject"], "reads corpus", "{key_parsed}");
+    // Ruling 55: at 1.0 the server sets `$hasattachment` on an ordinary
+    // account's message and none on a key account's (spec 5.2), so the one
+    // difference is that flag in the FLAGS item a non-peek FETCH adds.
     for (attribute, (key, plain)) in FETCH_ATTRIBUTES
         .iter()
         .zip(key_fetched.iter().zip(plain_fetched))
     {
-        assert_eq!(key, plain, "FETCH {attribute}");
+        assert!(
+            !key.contains(ATTACHMENT_FLAG),
+            "FETCH {attribute}: a key account's FLAGS carry {ATTACHMENT_FLAG}: {key}"
+        );
+        let has_flags = key.contains("FLAGS (");
+        let (plain, removed) = without_attachment_flag(plain);
+        assert_eq!(
+            removed, has_flags,
+            "FETCH {attribute}: the ordinary account's FLAGS and {ATTACHMENT_FLAG}: {plain}"
+        );
+        assert_eq!(key, &plain, "FETCH {attribute}");
     }
     let body = &key_fetched[0];
     for expected in [
@@ -589,7 +638,7 @@ async fn pop3_retr_and_top(key: &Account, plain: &Account) {
 async fn keyless_reads_are_refused(test: &TestServer, key: &Account, corpus_doc: u32) {
     println!("keyless_reads_are_refused");
     let key_id = key.id().document_id();
-    let token = bearer_token(KEY, STRONG).await;
+    let token = za_bearer_token(&test.server, KEY).await;
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(Duration::from_secs(5))
@@ -668,17 +717,30 @@ async fn keyless_reads_are_refused(test: &TestServer, key: &Account, corpus_doc:
         "{err:?}"
     );
     // Ruling R29: the refusal is `za_mail_keys`'s; without keys (an
-    // ordinary account's read) the view and the opener pass the stored
-    // archive and bytes through, even a stub's.
-    assert!(is_stub(stored.unarchive::<MessageMetadata>().unwrap()));
+    // ordinary account's read) the view and the opener pass the stored row
+    // and bytes through, even a stub's. At 1.0 the view takes the row it
+    // replaces (`ZaMetadataRow`), and the batch readers' opener answers
+    // `None` for "use the stored row".
+    assert!(row_is_stub(&stored));
+    let stored_headers = stored.raw_headers().unwrap().into_owned();
+    assert!(
+        test.server
+            .za_open_metadata_row(&stored, None, key_id, corpus_doc)
+            .await
+            .unwrap()
+            .is_none(),
+        "the batch opener opened a stub without keys"
+    );
     let view = test
         .server
-        .za_metadata_view(&stored, None, key_id, corpus_doc)
+        .za_metadata_view(stored, None, key_id, corpus_doc)
         .await
         .unwrap();
-    assert!(
-        matches!(&view, Cow::Borrowed(borrowed) if std::ptr::eq(*borrowed, &stored)),
-        "the stored archive, borrowed"
+    assert!(!view.opened, "the view opened a stub without keys");
+    assert_eq!(
+        view.row.raw_headers().unwrap().as_ref(),
+        stored_headers.as_slice(),
+        "the stored row, as it is"
     );
     let blob = test
         .server
@@ -701,9 +763,8 @@ async fn plain_header_block_with_the_format_byte(test: &TestServer, plain: &Acco
     );
     let document_id = plant_plain_message(test, plain_id, &crafted).await;
     test.wait_for_tasks().await;
-    let archive = stored_metadata(test, plain_id, document_id).await;
     assert!(
-        is_stub(archive.unarchive::<MessageMetadata>().unwrap()),
+        row_is_stub(&stored_metadata(test, plain_id, document_id).await),
         "the planted header block does not start with the format byte"
     );
 
@@ -764,7 +825,11 @@ async fn content_free_reads_open_nothing(test: &TestServer, key: &Account) {
     // private key yet.
     let fresh_keys = || {
         test.server.inner.cache.za_keys.remove_account(key_id);
-        test.server.inner.cache.http_auth.clear();
+        test.server
+            .inner
+            .cache
+            .grant_revocations
+            .clear(&test.server.inner.cache.http_auth);
     };
 
     let mut imap = imap_session(key, b"_f ").await;
@@ -839,13 +904,7 @@ async fn corrupted_stub_and_blob(test: &TestServer, key: &Account) {
     .await;
     let blob_doc = new_message(test, key_id, &before).await;
     corrupt_stub(test, key_id, stub_doc).await;
-    let blob_hash = BlobHash::from(
-        &stored_metadata(test, key_id, blob_doc)
-            .await
-            .unarchive::<MessageMetadata>()
-            .unwrap()
-            .blob_hash,
-    );
+    let blob_hash = stored_hash(test, key_id, blob_doc).await;
     corrupt_blob(test, &blob_hash).await;
 
     let traced = [EventType::Store(StoreEvent::DataCorruption)];
@@ -853,7 +912,7 @@ async fn corrupted_stub_and_blob(test: &TestServer, key: &Account) {
     for event_type in traced {
         interests.set(event_type);
     }
-    let (_tx, mut rx) = SubscriberBuilder::new(SUBSCRIBER_ID.into())
+    let (_tx, mut rx, _) = SubscriberBuilder::new(SUBSCRIBER_ID.into())
         .set_interests(traced)
         .with_lossy(false)
         .register();
@@ -988,14 +1047,17 @@ async fn legacy_plaintext_is_served_as_plaintext(
     let legacy_doc = plant_plain_message(test, key_id, &legacy).await;
     test.wait_for_tasks().await;
 
-    let archive = stored_metadata(test, key_id, legacy_doc).await;
-    let stored = archive.unarchive::<MessageMetadata>().unwrap();
-    assert!(!is_stub(stored), "the planted message reads as a stub");
-    assert!(!stored.contents.is_empty() && !stored.contents[0].parts.is_empty());
+    let row = stored_metadata(test, key_id, legacy_doc).await;
+    assert!(!row_is_stub(&row), "the planted message reads as a stub");
+    let stored = row.unarchive().unwrap();
+    assert!(!stored.messages.is_empty() && !stored.parts.is_empty());
     assert_sealed(test, key_id, corpus_doc, WRAP_PK).await;
-    let archive = stored_metadata(test, key_id, corpus_doc).await;
-    let stub = archive.unarchive::<MessageMetadata>().unwrap();
-    assert!(!stub.contents.is_empty() && !stub.contents[0].parts.is_empty());
+    // At 1.0 a stub's structure holds one binary root part
+    // (`stub_structure`) and no message entry; the discriminator is the
+    // format byte, not an empty structure.
+    let row = stored_metadata(test, key_id, corpus_doc).await;
+    let stub = row.unarchive().unwrap();
+    assert_eq!(stub.parts.len(), 1, "the stub's structure");
 
     let mut imap = imap_session(key, b"_l ").await;
     let fetched = imap_answer(&mut imap, "FETCH 2 (BODY[])").await;
@@ -1443,19 +1505,520 @@ async fn rf_5_large_header_block(test: &TestServer, key: &Account) {
         );
     }
 
-    let archive = stored_metadata(test, key_id, document_id).await;
-    let bundle = archive
-        .unarchive::<MessageMetadata>()
-        .unwrap()
-        .raw_headers
-        .len();
-    assert!(bundle > 8192, "the bundle is {bundle} bytes");
-    let (full, _) = open_message(test, key_id, STRONG, document_id).await;
-    let header_block = full.raw_headers.len();
-    let view_archive = Archiver::new(full).serialize().unwrap().len();
+    // At 1.0 the row compresses its header section past the dictionary's
+    // watermark (`MetadataRow::encode`): the opened row's is compressed.
     assert!(
-        view_archive < header_block,
-        "the view's archive ({view_archive} bytes) is not compressed below the header block ({header_block} bytes)"
+        row_is_stub(&stored_metadata(test, key_id, document_id).await),
+        "the large message is stored in the clear"
+    );
+    let (full, _) = open_message(test, key_id, STRONG, document_id).await;
+    let header_block = full.raw_headers().unwrap().len();
+    assert!(
+        full.headers_compressed(),
+        "the opened row's header section ({header_block} bytes) is not compressed"
     );
     clear_messages(key).await;
+}
+
+/// The attributes `assigned_ids_preserve_sealed_read_offsets` compares,
+/// one `UID FETCH` each: the whole message, the outer text, the nested
+/// message (a base64 `message/rfc822`) and its parts, the outer
+/// attachment's encoded body, the decoded sizes, the structure and the
+/// envelope.
+const ASSIGNED_FETCH: &[&str] = &[
+    "BODY.PEEK[]",
+    "BODY.PEEK[HEADER]",
+    "BODY.PEEK[1]",
+    "BODY.PEEK[2]",
+    "BODY.PEEK[2.1]",
+    "BODY.PEEK[2.2]",
+    "BODY.PEEK[3]",
+    "BINARY.SIZE[2.2]",
+    "BINARY.SIZE[3]",
+    "BODYSTRUCTURE",
+    "ENVELOPE",
+    "RFC822.SIZE",
+];
+
+/// The decoded bytes of the nested message's attachment in fixture `n`.
+fn assigned_inner_bytes(n: u8) -> Vec<u8> {
+    [
+        format!("assigned inner attachment {n} ").as_bytes(),
+        &[0x00, 0x01, 0xfe, 0xff, n],
+    ]
+    .concat()
+}
+
+/// The decoded bytes of the outer attachment in fixture `n`.
+fn assigned_outer_bytes(n: u8) -> Vec<u8> {
+    [
+        format!("assigned outer attachment {n} ").as_bytes(),
+        &[0xff, 0x00, n, 0x80],
+    ]
+    .concat()
+}
+
+/// Fixture `n`'s nested message: a multipart with a text part and a
+/// base64 attachment of its own.
+fn assigned_inner(n: u8) -> String {
+    format!(
+        "From: Inner <inner@example.org>\r\n\
+         Subject: assigned inner {n}\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: multipart/mixed; boundary=\"inner{n}\"\r\n\
+         \r\n\
+         --inner{n}\r\n\
+         Content-Type: text/plain\r\n\
+         \r\n\
+         assigned inner body canary {n}\r\n\
+         --inner{n}\r\n\
+         Content-Type: application/octet-stream; name=\"inner{n}.bin\"\r\n\
+         Content-Disposition: attachment; filename=\"inner{n}.bin\"\r\n\
+         Content-Transfer-Encoding: base64\r\n\
+         \r\n\
+         {}\r\n\
+         --inner{n}--\r\n",
+        STANDARD.encode(assigned_inner_bytes(n)),
+    )
+}
+
+/// The extended read fixture `n`: a multipart/mixed message holding a text
+/// part, a base64-encoded `message/rfc822` (`assigned_inner`) and a base64
+/// attachment, with a unique `Message-ID`.
+fn assigned_fixture(n: u8) -> String {
+    format!(
+        "From: Sender <sender@example.org>\r\n\
+         To: Recipient <recipient@example.com>\r\n\
+         Subject: assigned ids {n}\r\n\
+         Message-ID: <{:016x}.za-assigned@example.org>\r\n\
+         Date: Wed, 21 Oct 2026 1{n}:00:00 +0200\r\n\
+         MIME-Version: 1.0\r\n\
+         Content-Type: multipart/mixed; boundary=\"outer{n}\"\r\n\
+         \r\n\
+         --outer{n}\r\n\
+         Content-Type: text/plain; charset=us-ascii\r\n\
+         \r\n\
+         assigned body canary {n}\r\n\
+         --outer{n}\r\n\
+         Content-Type: message/rfc822\r\n\
+         Content-Transfer-Encoding: base64\r\n\
+         \r\n\
+         {}\r\n\
+         --outer{n}\r\n\
+         Content-Type: application/octet-stream; name=\"outer{n}.bin\"\r\n\
+         Content-Disposition: attachment; filename=\"outer{n}.bin\"\r\n\
+         Content-Transfer-Encoding: base64\r\n\
+         \r\n\
+         {}\r\n\
+         --outer{n}--\r\n",
+        store::rand::random::<u64>(),
+        STANDARD.encode(assigned_inner(n)),
+        STANDARD.encode(assigned_outer_bytes(n)),
+    )
+}
+
+/// An IMAP answer with its sequence number and UID replaced, so two
+/// accounts' answers for the same message compare equal.
+fn normalize_uid(answer: &str, uid: u32) -> String {
+    let answer = answer.replace(&format!("UID {uid}"), "UID <uid>");
+    match answer
+        .strip_prefix("* ")
+        .and_then(|rest| rest.split_once(" FETCH "))
+    {
+        Some((_, rest)) => format!("* <seq> FETCH {rest}"),
+        None => answer,
+    }
+}
+
+/// A JMAP object with its `id`, `blobId` and `threadId` values removed at
+/// every level (they name documents, which differ between accounts).
+fn strip_ids(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for key in ["id", "blobId", "threadId"] {
+                map.remove(key);
+            }
+            map.values_mut().for_each(strip_ids);
+        }
+        Value::Array(list) => list.iter_mut().for_each(strip_ids),
+        _ => {}
+    }
+}
+
+/// The part named `name` among `parts` (a JMAP `attachments` list).
+fn part_named<'x>(parts: &'x Value, name: &str) -> &'x Value {
+    parts
+        .as_array()
+        .and_then(|parts| parts.iter().find(|part| part["name"] == name))
+        .unwrap_or_else(|| panic!("no part {name} in {parts}"))
+}
+
+/// Task 5 of the 1.0 upgrade: a grouped ingest (`IngestGroup`) seals each
+/// message under its pending slot and learns its document id, thread and
+/// UID only from the flush (`AssignedIds`, `email_ingest_finish`). Three
+/// extended fixtures, each with a base64 `message/rfc822` holding an
+/// attachment of its own, go to the key account in one group (with the
+/// session's keys) and to the ordinary account in another. By the ids the
+/// flush assigned, every key-account message is the one sealed for it (its
+/// stub opens into its own row and blob, bound to its account), and every
+/// read answers the ordinary account's: FETCH of the nested parts by UID,
+/// `Email/get`, the downloads of each attachment and of the nested
+/// message, and the nested message's own attachment through `Email/parse`
+/// of its section (the decoded bytes, byte for byte). Without keys and
+/// with a corrupted stub or blob, the same reads are refused or fail
+/// alone.
+async fn assigned_ids_preserve_sealed_read_offsets(
+    test: &TestServer,
+    key: &Account,
+    plain: &Account,
+) {
+    println!("assigned_ids_preserve_sealed_read_offsets");
+    let key_id = key.id().document_id();
+    let plain_id = plain.id().document_id();
+    let fixtures = [1u8, 2, 3].map(assigned_fixture);
+    // A fourth message, without an attachment: `hasAttachment` false from
+    // the opened row (ruling 55), as the ordinary account's keyword says.
+    let no_attachment = message_with("assigned no attachment", "assigned plain canary");
+    let messages = fixtures
+        .iter()
+        .chain([&no_attachment])
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut grouped = Vec::new();
+    for (account, token) in [
+        (key, keyed_token(test, key_id, STRONG).await),
+        (plain, keyless_token(plain_id)),
+    ] {
+        let account_id = account.id().document_id();
+        let mut group = IngestGroup::default();
+        for raw in &messages {
+            group_ingest(&test.server, &mut group, &token, raw)
+                .await
+                .unwrap();
+        }
+        let ingested = group.flush(&test.server).await.unwrap();
+        assert_eq!(ingested.len(), messages.len(), "{}", account.name());
+        for (email, raw) in ingested.iter().zip(&messages) {
+            assert_eq!(
+                email.blob_id.class,
+                BlobClass::Linked {
+                    account_id,
+                    collection: Collection::Email.into(),
+                    document_id: email.document_id,
+                },
+                "{}: the result's owner",
+                account.name()
+            );
+            assert_eq!(email.size, raw.len(), "{}", account.name());
+            assert_eq!(email.imap_uids.len(), 1, "{}", account.name());
+        }
+        grouped.push(ingested);
+    }
+    let (key_emails, plain_emails) = (&grouped[0], &grouped[1]);
+
+    // Each key-account message, by its assigned id, is the one sealed for
+    // it: its stub opens into a row naming its own sealed blob, the blob
+    // into its own bytes, and the bundle is bound to the account.
+    let keys = crate::utils::za::za_unlock(test, key_id, STRONG).await;
+    for (email, raw) in key_emails.iter().zip(&messages) {
+        assert_sealed(test, key_id, email.document_id, WRAP_MK).await;
+        assert_eq!(email.thread_id, email.document_id, "a thread of its own");
+        assert_eq!(
+            email.blob_id.hash,
+            stored_hash(test, key_id, email.document_id).await
+        );
+        let (opened, bytes) = open_message(test, key_id, STRONG, email.document_id).await;
+        assert_eq!(bytes, raw.as_bytes(), "message {}", email.document_id);
+        assert_eq!(
+            opened.unarchive().unwrap().blob_hash(),
+            email.blob_id.hash,
+            "the opened row names the sealed blob"
+        );
+        let stub = stored_metadata(test, key_id, email.document_id).await;
+        assert!(
+            open_stub(&stub, &keys, None, plain_id).is_err(),
+            "a stub opened under another account"
+        );
+    }
+    assert_no_plaintext(test, key_id).await;
+
+    // The reads, by the assigned UIDs and ids, equal the ordinary account's.
+    let mut key_imap = imap_session(key, b"_a ").await;
+    let mut plain_imap = imap_session(plain, b"_a ").await;
+    for (n, ((key_email, plain_email), raw)) in key_emails
+        .iter()
+        .zip(plain_emails)
+        .zip(&fixtures)
+        .enumerate()
+    {
+        let n = n as u8 + 1;
+        let (key_uid, plain_uid) = (key_email.imap_uids[0], plain_email.imap_uids[0]);
+        for attribute in ASSIGNED_FETCH {
+            let key_answer = normalize_uid(
+                &imap_answer(&mut key_imap, &format!("UID FETCH {key_uid} ({attribute})")).await,
+                key_uid,
+            );
+            let plain_answer = normalize_uid(
+                &imap_answer(
+                    &mut plain_imap,
+                    &format!("UID FETCH {plain_uid} ({attribute})"),
+                )
+                .await,
+                plain_uid,
+            );
+            assert_eq!(
+                key_answer, plain_answer,
+                "fixture {n}: UID FETCH {attribute}"
+            );
+            assert!(
+                key_answer.contains("UID <uid>"),
+                "fixture {n}: {attribute} did not answer its UID: {key_answer}"
+            );
+        }
+        let whole = imap_answer(&mut key_imap, &format!("UID FETCH {key_uid} (BODY.PEEK[])")).await;
+        assert!(
+            whole.contains(raw.as_str()),
+            "fixture {n}: BODY[] is not the message"
+        );
+
+        let mut answers = Vec::new();
+        for (account, email) in [(key, key_email), (plain, plain_email)] {
+            let id = Id::from_parts(email.thread_id, email.document_id).to_string();
+            let (list, not_found) = email_get(
+                account,
+                Some(vec![id]),
+                &[
+                    "id",
+                    "blobId",
+                    "subject",
+                    "sentAt",
+                    "size",
+                    "preview",
+                    "hasAttachment",
+                    "headers",
+                    "bodyStructure",
+                    "bodyValues",
+                    "textBody",
+                    "attachments",
+                ],
+            )
+            .await;
+            assert!(not_found.is_empty(), "{}: {not_found:?}", account.name());
+            let email = list[0].clone();
+            assert_eq!(email["subject"], format!("assigned ids {n}"), "{email}");
+
+            // The outer attachment and the nested message, downloaded.
+            let outer = part_named(&email["attachments"], &format!("outer{n}.bin"));
+            let (status, bytes) = download(account, outer["blobId"].as_str().unwrap()).await;
+            assert_eq!(status, 200, "{}: the outer attachment", account.name());
+            assert_eq!(bytes, assigned_outer_bytes(n), "{}", account.name());
+            let nested = email["attachments"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|part| part["type"] == "message/rfc822")
+                .unwrap_or_else(|| panic!("no nested message in {email}"));
+            let nested_blob = nested["blobId"].as_str().unwrap().to_string();
+            let (status, bytes) = download(account, &nested_blob).await;
+            assert_eq!(status, 200, "{}: the nested message", account.name());
+            assert_eq!(
+                bytes,
+                assigned_inner(n).as_bytes(),
+                "{}: the nested message's decoded bytes",
+                account.name()
+            );
+
+            // The nested message's own attachment, through its section.
+            let parsed = account
+                .jmap_method_call(
+                    "Email/parse",
+                    json!({
+                        "accountId": account.id_string(),
+                        "blobIds": [nested_blob],
+                        "properties": ["subject", "attachments", "bodyValues", "textBody"],
+                        "fetchAllBodyValues": true,
+                    }),
+                )
+                .await;
+            let parsed = parsed
+                .pointer(&format!("/methodResponses/0/1/parsed/{nested_blob}"))
+                .unwrap_or_else(|| panic!("{}: Email/parse: {:?}", account.name(), parsed.0))
+                .clone();
+            assert_eq!(parsed["subject"], format!("assigned inner {n}"), "{parsed}");
+            let inner = part_named(&parsed["attachments"], &format!("inner{n}.bin"));
+            let inner_blob = inner["blobId"].as_str().unwrap().to_string();
+            let (status, bytes) = download(account, &inner_blob).await;
+            assert_eq!(status, 200, "{}: the nested attachment", account.name());
+            assert_eq!(
+                bytes,
+                assigned_inner_bytes(n),
+                "{}: the nested attachment's decoded bytes",
+                account.name()
+            );
+
+            let mut email = email;
+            strip_ids(&mut email);
+            let mut parsed = parsed;
+            strip_ids(&mut parsed);
+            answers.push((email, parsed, nested_blob, inner_blob));
+        }
+        let (key_email_json, key_parsed, key_nested, key_inner) = &answers[0];
+        let (plain_email_json, plain_parsed, _, _) = &answers[1];
+        assert_eq!(key_email_json, plain_email_json, "fixture {n}: Email/get");
+        assert_eq!(key_parsed, plain_parsed, "fixture {n}: Email/parse");
+        assert_eq!(key_email_json["hasAttachment"], true, "{key_email_json}");
+
+        // Owner binding: the ordinary account cannot read the key account's
+        // sections (not found, as without a grant: ruling 60), and a token
+        // without the key account's keys is refused.
+        for blob_id in [key_nested, key_inner] {
+            let (status, bytes) = download(plain, blob_id).await;
+            assert_eq!(
+                status, 404,
+                "fixture {n}: another account's download of a sealed section"
+            );
+            assert!(
+                !String::from_utf8_lossy(&bytes).contains("canary")
+                    && !bytes
+                        .windows(assigned_inner_bytes(n).len())
+                        .any(|w| w == assigned_inner_bytes(n)),
+                "fixture {n}: the refused download carries content"
+            );
+        }
+        let token = za_bearer_token(&test.server, KEY).await;
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        for blob_id in [key_nested, key_inner] {
+            let response = client
+                .get(format!(
+                    "{}/jmap/download/{}/{blob_id}/blob",
+                    key.base_url(),
+                    key.id_string()
+                ))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap();
+            assert!(
+                status == 403 && body.contains(ZA_MAIL_KEYLESS) && !body.contains("canary"),
+                "fixture {n}: a keyless section download: {status}: {body}"
+            );
+        }
+    }
+    key_imap.send_ok("LOGOUT").await;
+    plain_imap.send_ok("LOGOUT").await;
+
+    // The message without an attachment: the content-derived properties,
+    // read from the opened row, equal the ordinary account's.
+    let mut answers = Vec::new();
+    for (account, email) in [(key, &key_emails[3]), (plain, &plain_emails[3])] {
+        let id = Id::from_parts(email.thread_id, email.document_id).to_string();
+        let (list, not_found) = email_get(
+            account,
+            Some(vec![id]),
+            &[
+                "id",
+                "hasAttachment",
+                "sentAt",
+                "size",
+                "preview",
+                "subject",
+            ],
+        )
+        .await;
+        assert!(not_found.is_empty(), "{}: {not_found:?}", account.name());
+        let mut email = list[0].clone();
+        strip_ids(&mut email);
+        answers.push(email);
+    }
+    assert_eq!(answers[0], answers[1], "the message without an attachment");
+    assert_eq!(answers[0]["hasAttachment"], false, "{}", answers[0]);
+    assert!(
+        answers[0]["sentAt"]
+            .as_str()
+            .is_some_and(|sent| sent.starts_with("2026-10-20T")),
+        "the Date header's sentAt: {}",
+        answers[0]
+    );
+
+    // Corrupt reads fail their own message only: the first fixture's stub
+    // and the last one's blob; the middle one still reads.
+    let (stub_email, middle, blob_email) = (&key_emails[0], &key_emails[1], &key_emails[2]);
+    corrupt_stub(test, key_id, stub_email.document_id).await;
+    corrupt_blob(
+        test,
+        &stored_hash(test, key_id, blob_email.document_id).await,
+    )
+    .await;
+    let mut imap = imap_session(key, b"_a ").await;
+    for email in [stub_email, blob_email] {
+        imap.send(&format!(
+            "UID FETCH {} (BODY.PEEK[2.2])",
+            email.imap_uids[0]
+        ))
+        .await;
+        let lines = imap.assert_read(Type::Tagged, ResponseType::No).await;
+        assert_eq!(
+            lines.last().unwrap(),
+            &format!("_a NO [SERVERBUG] {ZA_MAIL_UNREADABLE}"),
+            "a corrupted message's section read"
+        );
+        assert!(
+            !lines.join("\r\n").contains("canary"),
+            "a corrupted message's read carries content"
+        );
+    }
+    let answer = imap_answer(
+        &mut imap,
+        &format!("UID FETCH {} (BODY.PEEK[1])", middle.imap_uids[0]),
+    )
+    .await;
+    assert!(answer.contains("assigned body canary 2"), "{answer}");
+    imap.send_ok("LOGOUT").await;
+    let ids = key_emails
+        .iter()
+        .map(|email| key_email_id(email.document_id))
+        .collect::<Vec<_>>();
+    // `bodyValues` reads the blob (a subject comes from the opened stub), as
+    // `corrupted_stub_and_blob` reads it.
+    let (list, mut not_found) = email_get(
+        key,
+        Some(ids[..3].to_vec()),
+        &["id", "subject", "bodyValues"],
+    )
+    .await;
+    not_found.sort();
+    let mut unreadable = vec![ids[0].clone(), ids[2].clone()];
+    unreadable.sort();
+    assert_eq!(not_found, unreadable, "the corrupted messages");
+    assert_eq!(list.len(), 1, "{list:?}");
+    assert_eq!(list[0]["subject"], "assigned ids 2");
+
+    let destroyed = key
+        .jmap_destroy("Email", &ids, Vec::<(&str, &str)>::new())
+        .await
+        .destroyed()
+        .count();
+    assert_eq!(destroyed, ids.len(), "the key account's grouped messages");
+    let plain_ids = plain_emails
+        .iter()
+        .map(|email| Id::from_parts(email.thread_id, email.document_id).to_string())
+        .collect::<Vec<_>>();
+    let destroyed = plain
+        .jmap_destroy("Email", &plain_ids, Vec::<(&str, &str)>::new())
+        .await
+        .destroyed()
+        .count();
+    assert_eq!(
+        destroyed,
+        plain_ids.len(),
+        "the ordinary account's grouped messages"
+    );
+    test.wait_for_tasks().await;
 }

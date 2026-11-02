@@ -31,7 +31,6 @@ static OPENLDAP: OnceCell<ContainerAsync<GenericImage>> = OnceCell::const_new();
 static CHALLTESTSRV: OnceCell<ContainerAsync<GenericImage>> = OnceCell::const_new();
 static PEBBLE: OnceCell<ContainerAsync<GenericImage>> = OnceCell::const_new();
 static POWERDNS: OnceCell<ContainerAsync<GenericImage>> = OnceCell::const_new();
-static SCIM_TESTER: OnceCell<ContainerAsync<GenericImage>> = OnceCell::const_new();
 
 const OPENLDAP_LDAPI_URL: &str = "ldapi://%2Fvar%2Frun%2Fslapd%2Fldapi/";
 
@@ -280,7 +279,9 @@ pub async fn ensure_meilisearch() {
 pub async fn ensure_keycloak() {
     KEYCLOAK
         .get_or_init(|| async {
-            GenericImage::new("quay.io/keycloak/keycloak", "latest")
+            // Upgrade ruling 184: a fixed release, not `latest` (26.8.1 is
+            // the image `latest` named when CI's directory suite last passed).
+            GenericImage::new("quay.io/keycloak/keycloak", "26.8.1")
                 .with_env_var("KC_BOOTSTRAP_ADMIN_USERNAME", "admin")
                 .with_env_var("KC_BOOTSTRAP_ADMIN_PASSWORD", "admin")
                 .with_env_var("KC_HTTP_PORT", "9080")
@@ -300,41 +301,6 @@ pub async fn ensure_keycloak() {
         })
         .await;
     wait_for_http("http://localhost:9080/realms/stalwart/.well-known/openid-configuration").await;
-}
-
-pub async fn ensure_scim_tester() -> &'static ContainerAsync<GenericImage> {
-    SCIM_TESTER
-        .get_or_init(|| async {
-            let image = GenericBuildableImage::new("stalwart-test-scim-tester", "local")
-                .with_dockerfile_string(include_str!("../../docker/scim/Dockerfile"))
-                .build_image()
-                .await
-                .expect("Failed to build the SCIM tester image");
-            image
-                .with_host("host.docker.internal", Host::HostGateway)
-                .with_startup_timeout(READY_TIMEOUT)
-                .with_container_name("stalwart-test-scim-tester")
-                .with_reuse(ReuseDirective::Always)
-                .start()
-                .await
-                .expect("Failed to start the SCIM tester container")
-        })
-        .await
-}
-
-pub async fn scim_tester_exec(args: &[&str]) -> (String, String) {
-    let mut result = ensure_scim_tester()
-        .await
-        .exec(ExecCommand::new(args.iter().copied()).with_cmd_ready_condition(CmdWaitFor::exit()))
-        .await
-        .expect("Failed to exec the SCIM driver");
-    let stdout = result.stdout_to_vec().await.unwrap_or_default();
-    let stderr = result.stderr_to_vec().await.unwrap_or_default();
-
-    (
-        String::from_utf8_lossy(&stdout).into_owned(),
-        String::from_utf8_lossy(&stderr).into_owned(),
-    )
 }
 
 pub async fn ensure_acme() {
@@ -395,6 +361,63 @@ async fn ensure_pebble() {
         })
         .await;
     wait_for_tcp(14000).await;
+    wait_for_pebble().await;
+}
+
+/// Waits for Pebble's directory at the URL the tests' ACME providers use.
+/// The mapped port accepts connections before Pebble listens behind it
+/// (Pebble takes about a second to start), and on hosted runners the
+/// server's first ACME request, 50 ms after the port opened, failed to
+/// connect (upgrade part Z2). Pebble refuses a request without a User-Agent
+/// (RFC 8555 section 6.1) with 400, so the probe sends one, as the server's
+/// ACME client does. On a timeout the panic carries the last answer for
+/// `localhost` and for `127.0.0.1`, and Docker's view of the container.
+async fn wait_for_pebble() {
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .user_agent("stalwart-tests")
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("Failed to build HTTP client");
+    let start = Instant::now();
+    loop {
+        let mut answers = Vec::new();
+        for url in ["https://localhost:14000/dir", "https://127.0.0.1:14000/dir"] {
+            answers.push(match client.get(url).send().await {
+                Ok(response) => {
+                    if url.contains("localhost") && response.status().is_success() {
+                        return;
+                    }
+                    format!("{url}: HTTP {}", response.status())
+                }
+                Err(err) => format!("{url}: {err:?}"),
+            });
+        }
+        if start.elapsed() > READY_TIMEOUT {
+            let docker = |args: &[&str]| {
+                std::process::Command::new("docker")
+                    .args(args)
+                    .output()
+                    .map(|out| {
+                        format!(
+                            "{}{}",
+                            String::from_utf8_lossy(&out.stdout),
+                            String::from_utf8_lossy(&out.stderr)
+                        )
+                    })
+                    .unwrap_or_else(|err| err.to_string())
+            };
+            panic!(
+                "Timed out waiting for Pebble's directory: {answers:#?}\n\
+                 docker ps -a:\n{}\ndocker port stalwart-test-pebble:\n{}\n\
+                 docker logs stalwart-test-pebble:\n{}",
+                docker(&["ps", "-a"]),
+                docker(&["port", "stalwart-test-pebble"]),
+                docker(&["logs", "stalwart-test-pebble"])
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 pub async fn ensure_powerdns() {
@@ -521,8 +544,12 @@ async fn wait_for_tcp(port: u16) {
 }
 
 async fn wait_for_http(url: &str) {
+    // Upgrade ruling 184: each probe is bounded, so a connection the service
+    // accepts but never answers cannot outlast READY_TIMEOUT.
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
         .build()
         .expect("Failed to build HTTP client");
     let start = Instant::now();

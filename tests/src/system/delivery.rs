@@ -5,17 +5,16 @@
  */
 
 use crate::utils::{
-    account::Account, imap::AssertResult, jmap::JmapUtils, server::TestServer, smtp::SmtpConnection,
+    account::Account, imap::AssertResult, server::TestServer, smtp::SmtpConnection,
 };
 use common::{Server, auth::BuildAccessToken};
 use email::{
     cache::{MessageCacheFetch, email::MessageCacheAccess},
     mailbox::{INBOX_ID, JUNK_ID, SENT_ID},
-    message::metadata::MessageMetadata,
+    message::metadata::MetadataRow,
 };
 use groupware::DavResourceName;
 use jmap::blob::download::BlobDownload;
-use jmap_proto::error::set::SetErrorType;
 use registry::{
     schema::{
         enums::StorageQuota,
@@ -25,15 +24,11 @@ use registry::{
             SpamTrainingSample,
         },
     },
-    types::{EnumImpl, datetime::UTCDateTime, float::Float, list::List, map::Map},
+    types::{EnumImpl, float::Float, list::List, map::Map},
 };
 use serde_json::json;
 use std::time::Duration;
-use store::{
-    ValueKey,
-    roaring::RoaringBitmap,
-    write::{AlignedBytes, Archive, now},
-};
+use store::{Deserialize, ValueKey, roaring::RoaringBitmap, write::serialize::RawValue};
 use types::{
     blob::{BlobClass, BlobId},
     collection::Collection,
@@ -122,7 +117,7 @@ pub async fn test(test: &mut TestServer) {
             aliases: List::from_iter([EmailAlias {
                 name: "corporate".to_string(),
                 domain_id,
-                enabled: true,
+                enable: true,
                 ..Default::default()
             }]),
             domain_id,
@@ -152,7 +147,7 @@ pub async fn test(test: &mut TestServer) {
         .await
         .unwrap();
 
-    assert_eq!(john_cache.emails.items.len(), 1);
+    assert_eq!(john_cache.emails.len(), 1);
     assert_eq!(john_cache.in_mailbox(INBOX_ID).count(), 1);
     assert_eq!(john_cache.in_mailbox(JUNK_ID).count(), 0);
 
@@ -173,69 +168,16 @@ pub async fn test(test: &mut TestServer) {
             .is_none()
     );
 
-    // Masked email tests
-    john.registry_create_many(
-        ObjectType::MaskedEmail,
-        [json!({
-            Property::EmailDomain: "invalid.org"
-        })],
-    )
-    .await
-    .not_created(0)
-    .to_set_error()
-    .assert_type(SetErrorType::Forbidden)
-    .assert_description_contains("The specified domain is not valid for this account.");
-
-    let response = john
-        .registry_create_many(
-            ObjectType::MaskedEmail,
-            [json!({
-                Property::EmailDomain: "example.org",
-                Property::EmailPrefix: "secretive",
-                Property::ExpiresAt: UTCDateTime::from_timestamp((now() + 1) as i64)
-            })],
-        )
-        .await;
-    let masked = response.created(0);
-    let masked_prefix_id = masked.object_id();
-    let masked_prefix_email = masked.text_field("email").to_string();
-    assert!(
-        masked_prefix_email.starts_with("secretive")
-            && masked_prefix_email.ends_with("@example.org"),
-        "Unexpected masked email: {masked_prefix_email}"
-    );
-
-    let response = john
-        .registry_create_many(
-            ObjectType::MaskedEmail,
-            [json!({
-                Property::EmailDomain: "example.org",
-            })],
-        )
-        .await;
-    let masked = response.created(0);
-    let masked_random_id = masked.object_id();
-    let masked_random_email = masked.text_field("email").to_string();
-    assert!(
-        masked_random_email.contains(".") && masked_random_email.ends_with("@example.org"),
-        "Unexpected masked email: {masked_random_email}"
-    );
-
-    john.registry_create_many(
-        ObjectType::MaskedEmail,
-        [json!({
-            Property::EmailDomain: "example.org",
-        })],
-    )
-    .await
-    .not_created(0)
-    .to_set_error()
-    .assert_type(SetErrorType::OverQuota);
-
-    // Test spam filtering using masked email
+    // Upgrade ruling 33: 0.16 created two masked emails for john here (and
+    // checked the domain and quota refusals), delivered the two spam cases
+    // below to them, checked them with VRFY and destroyed them. An unlicensed
+    // 1.0 server refuses `MaskedEmail` (`assert_enterprise_object`), so with
+    // no test licence the masked-email parts take the SEL-only disposition.
+    // The spam cases are OSS and stay, delivered to john's alias instead.
+    // Test spam filtering
     lmtp.ingest(
         "bill@example.org",
-        &[masked_prefix_email.as_str()],
+        &["john.doe@example.org"],
         concat!(
             "From: bill@example.org\r\n",
             "To: john.doe@example.org\r\n",
@@ -254,13 +196,13 @@ pub async fn test(test: &mut TestServer) {
         .unwrap();
     let inbox_ids = john_cache
         .in_mailbox(INBOX_ID)
-        .map(|e| e.document_id)
+        .map(|e| e.document_id())
         .collect::<RoaringBitmap>();
     let junk_ids = john_cache
         .in_mailbox(JUNK_ID)
-        .map(|e| e.document_id)
+        .map(|e| e.document_id())
         .collect::<RoaringBitmap>();
-    assert_eq!(john_cache.emails.items.len(), 2);
+    assert_eq!(john_cache.emails.len(), 2);
     assert_eq!(inbox_ids.len(), 1);
     assert_eq!(junk_ids.len(), 1);
     assert_message_headers_contains(
@@ -272,7 +214,7 @@ pub async fn test(test: &mut TestServer) {
     .await;
     assert_eq!(john.spam_training_samples().await, vec![]);
 
-    // CardDAV spam override, using masked email
+    // CardDAV spam override
     let dav_client = john.webdav_client();
     dav_client
         .request(
@@ -293,7 +235,7 @@ END:VCARD
         .with_status(hyper::StatusCode::CREATED);
     lmtp.ingest(
         "dmarc-bill@example.org",
-        &[masked_random_email.as_str()],
+        &["john.doe@example.org"],
         concat!(
             "From: dmarc-bill@example.org\r\n",
             "To: john.doe@example.org\r\n",
@@ -312,13 +254,13 @@ END:VCARD
         .unwrap();
     let inbox_ids = john_cache
         .in_mailbox(INBOX_ID)
-        .map(|e| e.document_id)
+        .map(|e| e.document_id())
         .collect::<RoaringBitmap>();
     let junk_ids = john_cache
         .in_mailbox(JUNK_ID)
-        .map(|e| e.document_id)
+        .map(|e| e.document_id())
         .collect::<RoaringBitmap>();
-    assert_eq!(john_cache.emails.items.len(), 3);
+    assert_eq!(john_cache.emails.len(), 3);
     assert_eq!(inbox_ids.len(), 2);
     assert_eq!(junk_ids.len(), 1);
     dav_client.delete_default_containers().await;
@@ -360,7 +302,6 @@ END:VCARD
             .await
             .unwrap()
             .emails
-            .items
             .len(),
         4
     );
@@ -387,13 +328,13 @@ END:VCARD
         .unwrap();
     let inbox_ids = john_cache
         .in_mailbox(INBOX_ID)
-        .map(|e| e.document_id)
+        .map(|e| e.document_id())
         .collect::<RoaringBitmap>();
     let junk_ids = john_cache
         .in_mailbox(JUNK_ID)
-        .map(|e| e.document_id)
+        .map(|e| e.document_id())
         .collect::<RoaringBitmap>();
-    assert_eq!(john_cache.emails.items.len(), 5);
+    assert_eq!(john_cache.emails.len(), 5);
     assert_eq!(inbox_ids.len(), 3);
     assert_eq!(junk_ids.len(), 1);
     assert_message_headers_contains(
@@ -418,8 +359,6 @@ END:VCARD
     lmtp.vrfy("jdoe@example.org", 2).await;
     lmtp.vrfy("members@example.org", 5).await;
     lmtp.vrfy("non_existant@example.org", 5).await;
-    lmtp.vrfy(masked_random_email.as_str(), 2).await;
-    lmtp.vrfy(masked_prefix_email.as_str(), 5).await; // Should have expired
 
     // Delivering to a mailing list
     lmtp.ingest(
@@ -445,7 +384,6 @@ END:VCARD
                 .await
                 .unwrap()
                 .emails
-                .items
                 .len(),
             num_messages,
             "for {}",
@@ -485,7 +423,6 @@ END:VCARD
                 .await
                 .unwrap()
                 .emails
-                .items
                 .len(),
             num_messages,
             "for {}",
@@ -521,32 +458,35 @@ END:VCARD
         let account_id = account.id().document_id();
         let cache = test.server.get_cached_messages(account_id).await.unwrap();
         assert_eq!(
-            cache.emails.items.len(),
+            cache.emails.len(),
             num_messages,
             "for {}",
             account.id_string()
         );
         let access_token = test.server.access_token(account_id).await.unwrap().build();
 
-        for document_id in cache.in_mailbox(INBOX_ID).map(|e| e.document_id) {
-            let metadata = message_metadata(&test.server, account_id, document_id).await;
+        for document_id in cache.in_mailbox(INBOX_ID).map(|e| e.document_id()) {
+            // 1.0's row keeps the raw headers beside the archived metadata.
+            let row = message_metadata(&test.server, account_id, document_id).await;
+            let metadata = row.unarchive().unwrap();
+            let raw_headers = row.raw_headers().unwrap();
+            let blob_hash = metadata.blob_hash();
             let partial_message = test
                 .server
                 .blob_store()
-                .get_blob(metadata.blob_hash.0.as_ref(), 0..usize::MAX)
+                .get_blob(blob_hash.as_slice(), 0..usize::MAX)
                 .await
                 .unwrap()
                 .unwrap();
 
-            assert_ne!(metadata.blob_body_offset, 0);
+            assert_ne!(metadata.blob_body_offset(), 0);
             let expected_full_message = String::from_utf8(
-                ChainedBytes::new(metadata.raw_headers.as_ref())
-                    .with_last(
-                        partial_message
-                            .get(metadata.blob_body_offset as usize..)
-                            .unwrap_or_default(),
-                    )
-                    .to_bytes(),
+                ChainedBytes::from_blob(
+                    raw_headers.as_ref(),
+                    &partial_message,
+                    metadata.blob_body_offset(),
+                )
+                .to_vec(),
             )
             .unwrap();
             assert!(
@@ -558,7 +498,7 @@ END:VCARD
                 test.server
                     .blob_download(
                         &BlobId {
-                            hash: metadata.blob_hash,
+                            hash: blob_hash,
                             class: BlobClass::Linked {
                                 account_id,
                                 collection: Collection::Email.into(),
@@ -570,7 +510,8 @@ END:VCARD
                     )
                     .await
                     .unwrap()
-                    .unwrap(),
+                    .unwrap()
+                    .into_bytes(),
             )
             .unwrap();
             assert_eq!(full_message, expected_full_message, "for {account_id}");
@@ -722,12 +663,6 @@ END:VCARD
     );
 
     // Remove test data
-    john.registry_destroy(
-        ObjectType::MaskedEmail,
-        [masked_prefix_id, masked_random_id],
-    )
-    .await
-    .assert_destroyed(&[masked_prefix_id, masked_random_id]);
     for account in [&john, &jane, &bill] {
         test.destroy_all_mailboxes(account).await;
     }
@@ -779,27 +714,31 @@ async fn message_headers(server: &Server, account_id: u32, document_id: u32) -> 
     std::str::from_utf8(
         message_metadata(server, account_id, document_id)
             .await
-            .raw_headers
+            .raw_headers()
+            .unwrap()
             .as_ref(),
     )
     .unwrap()
     .to_string()
 }
 
-async fn message_metadata(server: &Server, account_id: u32, document_id: u32) -> MessageMetadata {
-    server
-        .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::property(
-            account_id,
-            Collection::Email,
-            document_id,
-            EmailField::Metadata,
-        ))
-        .await
-        .unwrap()
-        .unwrap()
-        .deserialize::<MessageMetadata>()
-        .unwrap()
+/// The message's metadata row: field 71 in the immutable class at 1.0.
+async fn message_metadata(server: &Server, account_id: u32, document_id: u32) -> MetadataRow {
+    MetadataRow::deserialize(
+        &server
+            .store()
+            .get_value::<RawValue>(ValueKey::immutable(
+                account_id,
+                Collection::Email,
+                document_id,
+                EmailField::Metadata,
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .0,
+    )
+    .unwrap()
 }
 
 async fn inbox_count(server: &Server, account: &Account) -> usize {
@@ -808,6 +747,5 @@ async fn inbox_count(server: &Server, account: &Account) -> usize {
         .await
         .unwrap()
         .emails
-        .items
         .len()
 }

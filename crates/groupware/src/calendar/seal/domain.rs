@@ -33,7 +33,10 @@ struct SharedDomain {
 }
 
 impl ZaKeyDomain {
-    pub(crate) fn owner(keys: &SessionKeys) -> Self {
+    /// The owner's own domain (its event wrapping key). Public for DAV's
+    /// MKCOL, which seals a new calendar's dead properties before the
+    /// calendar has a context (upgrade ruling 16).
+    pub fn owner(keys: &SessionKeys) -> Self {
         Self {
             owner_id: keys.account_id,
             principal_id: keys.account_id,
@@ -205,6 +208,48 @@ impl ZaKeyDomain {
             _ => open_key_envelope(envelope, self.ewk()?, &event_key_aad(self.owner_id, uid)),
         }
     }
+
+    /// A dead-property container's data key, wrapped like an event's (upgrade
+    /// ruling 16): under the collection key when the domain is shared and not
+    /// reverting, else under the event wrapping key. Its own purposes, so a
+    /// container envelope never opens as an event's.
+    pub(super) fn seal_container_key(
+        &self,
+        dek: &Secret,
+        scope: &[u8],
+    ) -> Result<Vec<u8>, SealError> {
+        if self.shared.is_some() && !self.is_reverting() {
+            self.seal_ck(dek, "ck-container-dek", Some(scope))
+        } else {
+            Ok(seal_key_envelope(
+                dek,
+                self.ewk()?,
+                &container_key_aad(self.owner_id, scope),
+            ))
+        }
+    }
+
+    pub(super) fn open_container_key(
+        &self,
+        envelope: &[u8],
+        scope: &[u8],
+    ) -> Result<Secret, SealError> {
+        match envelope.get(1) {
+            Some(&WRAP_CK) => self.open_ck(envelope, "ck-container-dek", Some(scope)),
+            _ => open_key_envelope(
+                envelope,
+                self.ewk()?,
+                &container_key_aad(self.owner_id, scope),
+            ),
+        }
+    }
+}
+
+fn container_key_aad(owner: u32, scope: &[u8]) -> Vec<u8> {
+    let mut out = aad("container-key", owner);
+    out.push(b'|');
+    out.extend_from_slice(scope);
+    out
 }
 
 fn event_key_aad(owner: u32, uid: &str) -> Vec<u8> {

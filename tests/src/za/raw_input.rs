@@ -392,7 +392,7 @@ pub async fn test(test: &mut TestServer) {
     for event_type in traced {
         interests.set(event_type);
     }
-    let (_tx, mut rx) = SubscriberBuilder::new(SUBSCRIBER_ID.into())
+    let (_tx, mut rx, _) = SubscriberBuilder::new(SUBSCRIBER_ID.into())
         .set_interests(traced)
         .with_lossy(false)
         .register();

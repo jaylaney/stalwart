@@ -4,7 +4,11 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use super::{UploadResponse, download::BlobDownload};
+use super::{
+    UploadResponse,
+    download::{BlobAccess, BlobDownload},
+    embedded::EmbeddedBlobs,
+};
 use common::{Server, auth::AccessToken};
 use email::message::za::view::ZaMailView;
 use jmap_proto::{
@@ -17,7 +21,7 @@ use jmap_proto::{
 use registry::schema::enums::Permission;
 use std::future::Future;
 use trc::AddContext;
-use types::id::Id;
+use types::{blob::BlobClass, id::Id};
 
 #[cfg(feature = "test_mode")]
 pub static DISABLE_UPLOAD_QUOTA: std::sync::atomic::AtomicBool =
@@ -77,6 +81,7 @@ impl BlobUpload for Server {
 
         'outer: for (create_id, upload_object) in request.create {
             let mut data = Vec::new();
+            let mut data_memory = Vec::new();
 
             for data_source in upload_object.data {
                 let bytes = match data_source {
@@ -109,7 +114,9 @@ impl BlobUpload for Server {
                         // Mail spec 5.7: never a sealed source's stored bytes,
                         // a reference to an upload of this call included.
                         self.za_refuse_raw_source(&id).await?;
-                        if !self.has_access_blob(&id, access_token).await? {
+                        let BlobAccess::Allowed { size } =
+                            self.has_access_blob(&id, access_token).await?
+                        else {
                             response.not_created.append(
                                 create_id,
                                 SetError::forbidden().with_description(format!(
@@ -117,29 +124,43 @@ impl BlobUpload for Server {
                                 )),
                             );
                             continue 'outer;
-                        }
+                        };
 
                         let offset = offset.unwrap_or(0);
                         let length = length
                             .map(|length| length.saturating_add(offset))
                             .unwrap_or(usize::MAX);
-                        let bytes = if let Some(section) = &id.section {
-                            self.get_blob_section(&id.hash, section)
+                        let window = |bytes: Vec<u8>| {
+                            if offset == 0 && length == usize::MAX {
+                                bytes
+                            } else {
+                                bytes
+                                    .get(offset..std::cmp::min(length, bytes.len()))
+                                    .unwrap_or_default()
+                                    .to_vec()
+                            }
+                        };
+                        let bytes = if matches!(id.class, BlobClass::Embedded { .. }) {
+                            self.embedded_blob(&id)
+                                .await
+                                .caused_by(trc::location!())?
+                                .map(window)
+                        } else if let Some(section) = &id.section {
+                            self.fetch_blob_section(&id.hash, section, size)
                                 .await?
-                                .map(|bytes| {
-                                    if offset == 0 && length == usize::MAX {
-                                        bytes
-                                    } else {
-                                        bytes
-                                            .get(offset..std::cmp::min(length, bytes.len()))
-                                            .unwrap_or_default()
-                                            .to_vec()
-                                    }
+                                .map(|blob| {
+                                    let (bytes, memory) = blob.into_parts();
+                                    data_memory.push(memory);
+                                    window(bytes)
                                 })
                         } else {
-                            self.blob_store()
-                                .get_blob(id.hash.as_slice(), offset..length)
+                            self.fetch_blob(&id.hash, offset..length, size)
                                 .await?
+                                .map(|blob| {
+                                    let (bytes, memory) = blob.into_parts();
+                                    data_memory.push(memory);
+                                    bytes
+                                })
                         };
                         if let Some(bytes) = bytes {
                             bytes

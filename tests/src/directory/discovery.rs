@@ -76,12 +76,7 @@ fn oidc_test_directory() -> OidcDirectory {
         claim_username: "preferred_username".to_string(),
         claim_name: Some("name".to_string()),
         claim_groups: Some("groups".to_string()),
-        require_audience: Some("stalwart".to_string()),
-        require_scopes: Map::new(vec![
-            "email".to_string(),
-            "profile".to_string(),
-            "openid".to_string(),
-        ]),
+        accepted_audiences: Map::new(vec!["stalwart".to_string()]),
         ..Default::default()
     }
 }

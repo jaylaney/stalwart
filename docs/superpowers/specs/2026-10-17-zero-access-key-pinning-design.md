@@ -286,15 +286,18 @@ is inside; nothing precedes the nonce.
 | | `address` | `String` | The refused recipient's address, normalized as pins are (section 4.3). |
 | | `since` | `i64` | Unix seconds of the first refusal. |
 | | `refusal_id` | `u64` | 64 random bits, regenerated on every refusal of the entry (a new entry gets one too), so a delivery retires exactly the refusal it consumed (section 5.2, phase 4). |
-| | `instances` | `ZaInstances` | Attendee-side entries only: the instance keys of the refused REPLYs, `master: bool`, `keys: Vec<(i64, bool)>` (the drain's `InstanceKey`: the RECURRENCE-ID resolved to a UTC instant with the REPLY tree's own VTIMEZONEs, and the THISANDFUTURE flag; not upstream's `InstanceId`, whose `RecurrenceId` carries a positional entry id, and not the RECURRENCE-ID text) and `all: bool`. Every refused REPLY unions its scheduling components in. The master does not count toward the 64-key cap; past it `all` is set, meaning every qualifying instance, and `keys` is cleared and stays empty. Organizer-side entries leave it empty. |
+| | `instances` | `ZaInstances` | Attendee-side entries: the instance keys of the refused REPLYs, `master: bool`, `keys: Vec<(i64, bool)>` (the drain's `InstanceKey`: the RECURRENCE-ID resolved to a UTC instant with the REPLY tree's own VTIMEZONEs, and the THISANDFUTURE flag; not upstream's `InstanceId`, whose `RecurrenceId` carries a positional entry id, and not the RECURRENCE-ID text) and `all: bool`. Every refused REPLY unions its scheduling components in. The master does not count toward the 64-key cap; past it `all` is set, meaning every qualifying instance, and `keys` is cleared and stays empty. Organizer-side entries (upgrade ruling 132, section 5.1): the instance keys of the refused per-instance CANCELs addressed to the recipient, each CANCEL component with a RECURRENCE-ID read the same way, unioned across refusals under the same cap and overflow; `master` is never set. |
 
 An entry's identity is (`document_id`, `uid`, `address`): document ids are a
 monotonic per-account counter never reused, a MOVE keeps the id and a COPY
 gives one document two names, so no calendar id is part of it. An entry holds
 no message (delivery rebuilds current state, sections 5.1 and 6.4) and is
-small. Organizer-side entries record no instances: the full REQUEST alone
-reconciles the copy (`is_full_update` removals) and imports a never-received
-copy whole. The structs have a silent `Debug` (they hold addresses).
+small. Organizer-side entries record only the instances of refused
+per-instance CANCELs (upgrade ruling 132): the full REQUEST reconciles the
+copy (`is_full_update` removals) and imports a never-received copy whole,
+except for a removal from an override of an attendee that does not attend
+the master, which its slice cannot express (section 5.1, item 1). The
+structs have a silent `Debug` (they hold addresses).
 
 ### 4.2 Reads and writes
 
@@ -484,7 +487,67 @@ upstream's messages for it:
    after a whole-event CANCEL or a removal); for an attendee, the event still
    exists (not after a DELETE). For an organizer it is
    `organizer_request_full(committed_tree, fresh_snapshot, None, false)` for
-   that attendee, without a second `itip_finalize` (no second SEQUENCE bump);
+   that attendee, without a second `itip_finalize` (no second SEQUENCE bump),
+   split per recipient under the event's `RecipientPolicy` as upstream 1.0
+   splits its own messages (`itip_messages_per_recipient`): at 1.0 an
+   attendee's copy of the full update is that attendee's slice, the
+   instances it attends, with the series' EXDATEs for overrides it does not
+   attend when it attends the master, and without the master when it does
+   not. Such a slice cannot express a removal from an override: upstream's
+   REQUEST merge removes absent instances only for a full update (one
+   carrying the master), so for an attendee off the master a withheld
+   CANCEL of an override it was removed from would never reach its copy.
+   So (upgrade ruling 132) a refused per-instance CANCEL records its
+   instance keys on the organizer-side entry (section 4.1), and the
+   organizer's full state, after the address's slice, sends one CANCEL
+   from the organizer to the address forms the slice reached, with a
+   component for each recorded instance the committed tree no longer has
+   the address attend. When the slice is empty because the address
+   DECLINED every instance it attends without SCHEDULE-FORCE-SEND, or has
+   RSVP=FALSE there (upgrade ruling 153), the CANCEL still goes, to the
+   address forms the tree names for it on an ATTENDEE the server
+   schedules: the replay does not depend on a REQUEST going out, and the
+   entry retires only once the replay is delivered, from the fan-out and
+   from `contacts/pin` alike. Each component is built by upstream's cancel
+   builder (`CancelScope::Instance` over those addresses, so it lists none
+   of the instance's current attendees) at the instance's committed
+   SEQUENCE, or, for an instance the tree has no component for, from the
+   master at the master's SEQUENCE with the recorded instant as
+   RECURRENCE-ID (skipped when the address attends the master). It then
+   keeps only what a CANCEL needs (upgrade ruling 152): UID, ORGANIZER,
+   RECURRENCE-ID, SEQUENCE, DTSTAMP and STATUS:CANCELLED, plus DTSTART at
+   the RECURRENCE-ID's value (upstream's CANCEL merge stores a component the
+   copy lacks as its cancelled override, and a stored VEVENT needs a
+   DTSTART) and a bare ATTENDEE line for each of those addresses (upstream's
+   own CANCEL copies the removed attendee's line from the superseded tree,
+   which the full state no longer has, and a CANCEL naming none of the
+   recipient's addresses fails its snapshot). No SUMMARY, DESCRIPTION,
+   LOCATION, CREATED, LAST-MODIFIED, DTEND, DURATION or DUE of the instance
+   or of the master is carried, and the message's iTIP summary holds only
+   the instances' RECURRENCE-ID times. The CANCEL is then split per
+   recipient as above. An instance the address attends again gets none;
+   the recipient learns only the RECURRENCE-IDs and committed SEQUENCE of
+   instances it was on (the SEQUENCE is inherent: the copy's merge refuses a
+   CANCEL below the copy's own as `OutOfSequence`, so the recipient can
+   tell how many significant revisions followed its removal). The
+   coverage skip below does not apply while the entry records instance
+   keys, and the instances retire with the entry. An entry whose instances
+   overflowed (`all`) keeps the behaviour without the record, a recorded
+   limit, as does a master CANCEL (never recorded: it cancels every
+   instance of the copy), so an attendee removed from the master while an
+   override still names it keeps a stale master once the full state
+   replaces the withheld CANCEL (upgrade ruling 139); so does an override CANCEL whose instance the
+   copy holds at a higher SEQUENCE than the master's when the tree has no
+   component for it (the drain answers `OutOfSequence`); and so does an
+   address the tree marks SCHEDULE-AGENT=CLIENT or NONE wherever it names
+   it: the server does not schedule for it (RFC 6638), so no replay is
+   built and the entry is dropped, which is correct. A master attendee
+   with recorded instances gets the full state with the CANCEL even where
+   the change's own REQUEST would have covered it; the CANCEL then meets
+   an instance the slice's EXDATE already removed and adds a cancelled
+   override, as the accepted A2 case does (upgrade ruling 139). A split error of
+   the full state is a failure (`5.1`, the entry kept), not "nothing to
+   send" (upgrade ruling 135);
    for an attendee, the refused instances' current participation (section 6.4's
    helper), one REPLY per local address they are attended as that holds a token
    in the copy's pairs, each routed with its own address's token as any REPLY,
@@ -493,12 +556,20 @@ upstream's messages for it:
    The entry is retired only when every one of them and upstream's messages
    were written. Both are built from the state being committed, reconciled
    (below), never from a superseded tree: the deletion flag marks a
-   pre-deletion one. Item (1) is skipped when any message of item (2) is a
-   METHOD:REQUEST containing the master scheduling component (no
-   RECURRENCE-ID): upstream routes every master change to the full update,
-   partial REQUESTs hold only overrides, and `ItipSummary` cannot tell them
-   apart (when the master has no attendees the full REQUEST lacks it, the skip
-   does not fire, and the full state is a harmless duplicate). It is also
+   pre-deletion one. Item (1) is skipped when the organizer's own
+   METHOD:REQUESTs of item (2) already carry the address's full view: for
+   each address of an ATTENDEE of the committed tree that normalizes to the
+   entry's address (parsed as upstream's split parses it), one REQUEST to
+   that address carries every scheduling instance whose ATTENDEEs name it,
+   instances compared by `InstanceKey`. At 1.0 upstream routes every master
+   change to the full update and delivers it to each attendee as its slice,
+   so this skip fires for every attendee of a master change, master
+   attendee or not; for an attendee of the master it reduces to 0.16's rule
+   (a REQUEST holding the master). A partial REQUEST that misses an
+   instance the address attends does not skip it. An exclusion-only master
+   edit (only EXDATEs added) is sent by 1.0 as a CANCEL with RECURRENCE-IDs,
+   not as the full update, so an entry holder then gets the full state and
+   that CANCEL, which merges as a no-op (accepted). It is also
    skipped when one is a METHOD:CANCEL with the master component (the address
    removed from the master while an override still names it; the CANCEL then
    cancels every instance of the copy, upstream's `cancel_all_instances`,

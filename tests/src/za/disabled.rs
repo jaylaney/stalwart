@@ -8,17 +8,14 @@ use super::{STRONG, user_permissions};
 use crate::utils::{
     account::Account,
     server::TestServer,
-    za::{caldav_from, za_post, za_post_from, za_setup, za_setup_token},
+    za::{caldav_from, za_post, za_post_from, za_setup_token},
 };
 use hyper::StatusCode;
 use registry::{
     schema::{
         enums::Permission,
         prelude::{ObjectType, Property},
-        structs::{
-            self, CertificateManagement, DkimManagement, DnsManagement, Domain, Permissions,
-            PermissionsList, Tenant, UserAccount,
-        },
+        structs::{Permissions, PermissionsList},
     },
     types::map::Map,
 };
@@ -126,54 +123,9 @@ pub async fn test(test: &mut TestServer) {
     caldav_from(FAIL_IP, name, STRONG2, StatusCode::MULTI_STATUS).await;
     admin.destroy_account(account).await;
 
-    // recover on a disabled tenant: the account has no disabled permission of its own.
-    let tenant_id = admin
-        .registry_create_object(Tenant {
-            name: "Disabled Tenant".to_string(),
-            ..Default::default()
-        })
-        .await;
-    let domain_id = admin
-        .registry_create_object(Domain {
-            name: "disabled-tenant.org".to_string(),
-            member_tenant_id: tenant_id.into(),
-            certificate_management: CertificateManagement::Manual,
-            dns_management: DnsManagement::Manual,
-            dkim_management: DkimManagement::Manual,
-            ..Default::default()
-        })
-        .await;
-    let name = "member@disabled-tenant.org";
-    let account_id = admin
-        .registry_create_object(structs::Account::User(UserAccount {
-            name: "member".to_string(),
-            domain_id,
-            member_tenant_id: tenant_id.into(),
-            permissions: Permissions::Merge(PermissionsList {
-                disabled_permissions: Map::default(),
-                enabled_permissions: Map::new(user_permissions()),
-            }),
-            ..Default::default()
-        }))
-        .await;
-    let account = Account::new(name, STRONG, &[], "Tenant Member", account_id);
-    let token = za_setup_token(&admin, name).await;
-    let recovery = za_setup(name, &token, STRONG).await;
-    set_disabled(&admin, ObjectType::Tenant, tenant_id, true).await;
-    za_post(
-        "recover",
-        &json!({ "username": name, "recovery_key": recovery, "new_password": STRONG2 }),
-    )
-    .await
-    .expect(403);
-    admin.destroy_account(account).await;
-    admin
-        .registry_destroy(ObjectType::Domain, [domain_id])
-        .await
-        .assert_destroyed(&[domain_id]);
-    admin
-        .registry_destroy(ObjectType::Tenant, [tenant_id])
-        .await
-        .assert_destroyed(&[tenant_id]);
+    // 0.16 also refused `recover` for a member of a disabled tenant. 1.0
+    // applies a tenant's permissions only under a licence (the SEL
+    // snippet of `effective_permissions`), so that case takes the SEL-only
+    // disposition (ruling 79, ruling 33).
     test.wait_for_tasks().await;
 }

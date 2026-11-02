@@ -45,17 +45,18 @@ use crate::{
     thread::get::ThreadGet,
     vacation::{get::VacationResponseGet, set::VacationResponseSet},
 };
-use common::{Server, auth::AccessToken};
+use common::{Server, auth::AccessToken, network::memory::MemoryReservation};
+use compact_str::format_compact;
 use email::message::za::view::ZaMailView;
 use http_proto::HttpSessionData;
 use jmap_proto::{
     request::{
         Call, CopyRequestMethod, GetRequestMethod, INVALID_ACCOUNT_ID, ParseRequestMethod,
         QueryRequestMethod, Request, RequestMethod, SetRequestMethod,
-        capability::Capability,
+        capability::{Capability, CapabilityIds},
         method::{MethodName, MethodObject},
     },
-    response::{Response, ResponseMethod, SetResponseMethod},
+    response::{CopyResponseMethod, Response, ResponseMethod, SetResponseMethod},
 };
 use std::future::Future;
 use std::time::Instant;
@@ -68,8 +69,10 @@ pub trait RequestHandler: Sync + Send {
         request: Request<'x>,
         access_token: &AccessToken,
         session: &HttpSessionData,
+        reservation: &mut MemoryReservation,
     ) -> impl Future<Output = Response<'x>> + Send;
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_method_call<'x>(
         &self,
         method: RequestMethod<'x>,
@@ -77,6 +80,8 @@ pub trait RequestHandler: Sync + Send {
         access_token: &AccessToken,
         next_call: &mut Option<Call<RequestMethod<'x>>>,
         session: &HttpSessionData,
+        using: CapabilityIds,
+        reservation: &mut MemoryReservation,
     ) -> impl Future<Output = trc::Result<ResponseMethod<'x>>> + Send;
 }
 
@@ -86,6 +91,7 @@ impl RequestHandler for Server {
         request: Request<'x>,
         access_token: &AccessToken,
         session: &HttpSessionData,
+        reservation: &mut MemoryReservation,
     ) -> Response<'x> {
         let add_created_ids = request.created_ids.is_some();
         let using = request.using;
@@ -108,12 +114,12 @@ impl RequestHandler for Server {
             }
 
             if !matches!(call.method, RequestMethod::Error(_)) {
-                let capability = call.name.obj.capability();
+                let capability = call.name.capability();
                 if capability != Capability::Stalwart && !using.contains(capability) {
                     response.push_response(
                         call.id,
                         MethodName::error(),
-                        trc::JmapEvent::UnknownMethod.into_err().details(format!(
+                        trc::JmapEvent::UnknownMethod.into_err().details(format_compact!(
                             "Method {} requires capability {} which is not present in the \"using\" property.",
                             call.name,
                             capability.as_str()
@@ -135,6 +141,8 @@ impl RequestHandler for Server {
                         access_token,
                         &mut next_call,
                         session,
+                        using,
+                        reservation,
                     )
                     .await
                 {
@@ -191,6 +199,24 @@ impl RequestHandler for Server {
                                     }
                                 }
                             }
+                            ResponseMethod::Copy(copy_response) => {
+                                // Add created ids
+                                match copy_response {
+                                    CopyResponseMethod::Email(copy_response) => {
+                                        copy_response.update_created_ids(&mut response);
+                                    }
+                                    CopyResponseMethod::ContactCard(copy_response) => {
+                                        copy_response.update_created_ids(&mut response);
+                                    }
+                                    CopyResponseMethod::CalendarEvent(copy_response) => {
+                                        copy_response.update_created_ids(&mut response);
+                                    }
+                                    CopyResponseMethod::FileNode(copy_response) => {
+                                        copy_response.update_created_ids(&mut response);
+                                    }
+                                    CopyResponseMethod::Blob(_) => {}
+                                }
+                            }
                             ResponseMethod::ImportEmail(import_response) => {
                                 // Add created ids
                                 import_response.update_created_ids(&mut response);
@@ -244,6 +270,8 @@ impl RequestHandler for Server {
         access_token: &AccessToken,
         next_call: &mut Option<Call<RequestMethod<'x>>>,
         session: &HttpSessionData,
+        using: CapabilityIds,
+        reservation: &mut MemoryReservation,
     ) -> trc::Result<ResponseMethod<'x>> {
         let op_start = Instant::now();
 
@@ -258,7 +286,9 @@ impl RequestHandler for Server {
                     access_token.assert_has_access(req.account_id, Collection::Email)?;
                     za_assert_mail_keys(self, access_token, req.account_id).await?;
 
-                    self.email_get(*req, access_token).await?.into()
+                    self.email_get(*req, access_token, using, reservation)
+                        .await?
+                        .into()
                 }
                 GetRequestMethod::Mailbox(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
@@ -266,7 +296,7 @@ impl RequestHandler for Server {
                     self.za_assert_mail_route(access_token, req.account_id.document_id())
                         .await?;
 
-                    self.mailbox_get(*req, access_token).await?.into()
+                    self.mailbox_get(*req, access_token, using).await?.into()
                 }
                 GetRequestMethod::Thread(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
@@ -298,7 +328,9 @@ impl RequestHandler for Server {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_is_member(req.account_id)?;
 
-                    self.sieve_script_get(*req).await?.into()
+                    self.sieve_script_get(*req, access_token, using)
+                        .await?
+                        .into()
                 }
                 GetRequestMethod::VacationResponse(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
@@ -326,41 +358,50 @@ impl RequestHandler for Server {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_has_access(req.account_id, Collection::AddressBook)?;
 
-                    self.address_book_get(*req, access_token).await?.into()
+                    self.address_book_get(*req, access_token, using)
+                        .await?
+                        .into()
                 }
                 GetRequestMethod::ContactCard(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_has_access(req.account_id, Collection::ContactCard)?;
 
-                    self.contact_card_get(*req, access_token).await?.into()
+                    self.contact_card_get(*req, access_token, using, reservation)
+                        .await?
+                        .into()
                 }
                 GetRequestMethod::FileNode(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_has_access(req.account_id, Collection::FileNode)?;
 
-                    self.file_node_get(*req, access_token).await?.into()
+                    self.file_node_get(*req, access_token, using).await?.into()
                 }
-                GetRequestMethod::PrincipalAvailability(req) => self
-                    .principal_get_availability(*req, access_token)
-                    .await?
-                    .into(),
+                GetRequestMethod::PrincipalAvailability(mut req) => {
+                    resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
+
+                    self.principal_get_availability(*req, access_token)
+                        .await?
+                        .into()
+                }
                 GetRequestMethod::Calendar(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_has_access(req.account_id, Collection::Calendar)?;
                     za_assert_calendar_allowed(self, req.account_id).await?;
 
-                    self.calendar_get(*req, access_token).await?.into()
+                    self.calendar_get(*req, access_token, using).await?.into()
                 }
                 GetRequestMethod::CalendarEvent(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_has_access(req.account_id, Collection::CalendarEvent)?;
                     za_assert_calendar_allowed(self, req.account_id).await?;
 
-                    self.calendar_event_get(*req, access_token).await?.into()
+                    self.calendar_event_get(*req, access_token, using, reservation)
+                        .await?
+                        .into()
                 }
                 GetRequestMethod::CalendarEventNotification(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
-                    access_token.assert_is_member(req.account_id)?;
+                    access_token.assert_has_access(req.account_id, Collection::CalendarEvent)?;
                     za_assert_calendar_allowed(self, req.account_id).await?;
 
                     self.calendar_event_notification_get(*req, access_token)
@@ -369,10 +410,12 @@ impl RequestHandler for Server {
                 }
                 GetRequestMethod::ParticipantIdentity(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
-                    access_token.assert_is_member(req.account_id)?;
+                    access_token.assert_has_access(req.account_id, Collection::CalendarEvent)?;
                     za_assert_calendar_allowed(self, req.account_id).await?;
 
-                    self.participant_identity_get(*req).await?.into()
+                    self.participant_identity_get(*req, access_token)
+                        .await?
+                        .into()
                 }
                 GetRequestMethod::ShareNotification(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
@@ -384,13 +427,9 @@ impl RequestHandler for Server {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_is_member(req.account_id)?;
 
-                    Box::pin(self.registry_get(
-                        method_name.obj.unwrap_registry(),
-                        *req,
-                        access_token,
-                    ))
-                    .await?
-                    .into()
+                    self.registry_get(method_name.obj.unwrap_registry(), *req, access_token)
+                        .await?
+                        .into()
                 }
             },
             RequestMethod::Query(req) => match req {
@@ -400,7 +439,7 @@ impl RequestHandler for Server {
                     self.za_assert_mail_route(access_token, req.account_id.document_id())
                         .await?;
 
-                    self.email_query(*req, access_token).await?.into()
+                    self.email_query(*req, access_token, using).await?.into()
                 }
                 QueryRequestMethod::Mailbox(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
@@ -408,7 +447,7 @@ impl RequestHandler for Server {
                     self.za_assert_mail_route(access_token, req.account_id.document_id())
                         .await?;
 
-                    self.mailbox_query(*req, access_token).await?.into()
+                    self.mailbox_query(*req, access_token, using).await?.into()
                 }
                 QueryRequestMethod::EmailSubmission(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
@@ -422,11 +461,14 @@ impl RequestHandler for Server {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_is_member(req.account_id)?;
 
-                    self.sieve_script_query(*req).await?.into()
+                    self.sieve_script_query(*req, access_token, using)
+                        .await?
+                        .into()
                 }
-                QueryRequestMethod::Principal(req) => {
-                    self.principal_query(*req, access_token).await?.into()
-                }
+                QueryRequestMethod::Principal(req) => self
+                    .principal_query(*req, access_token, using)
+                    .await?
+                    .into(),
                 QueryRequestMethod::Quota(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_is_member(req.account_id)?;
@@ -437,37 +479,45 @@ impl RequestHandler for Server {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_has_access(req.account_id, Collection::AddressBook)?;
 
-                    self.address_book_query(*req, access_token).await?.into()
+                    self.address_book_query(*req, access_token, using)
+                        .await?
+                        .into()
                 }
                 QueryRequestMethod::ContactCard(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_has_access(req.account_id, Collection::ContactCard)?;
 
-                    self.contact_card_query(*req, access_token).await?.into()
+                    self.contact_card_query(*req, access_token, using)
+                        .await?
+                        .into()
                 }
                 QueryRequestMethod::FileNode(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_has_access(req.account_id, Collection::FileNode)?;
 
-                    self.file_node_query(*req, access_token).await?.into()
+                    self.file_node_query(*req, access_token, using)
+                        .await?
+                        .into()
                 }
                 QueryRequestMethod::Calendar(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_has_access(req.account_id, Collection::Calendar)?;
                     za_assert_calendar_allowed(self, req.account_id).await?;
 
-                    self.calendar_query(*req, access_token).await?.into()
+                    self.calendar_query(*req, access_token, using).await?.into()
                 }
                 QueryRequestMethod::CalendarEvent(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_has_access(req.account_id, Collection::CalendarEvent)?;
                     za_assert_calendar_allowed(self, req.account_id).await?;
 
-                    self.calendar_event_query(*req, access_token).await?.into()
+                    self.calendar_event_query(*req, access_token, using)
+                        .await?
+                        .into()
                 }
                 QueryRequestMethod::CalendarEventNotification(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
-                    access_token.assert_is_member(req.account_id)?;
+                    access_token.assert_has_access(req.account_id, Collection::CalendarEvent)?;
                     za_assert_calendar_allowed(self, req.account_id).await?;
 
                     self.calendar_event_notification_query(*req, access_token)
@@ -484,13 +534,9 @@ impl RequestHandler for Server {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_is_member(req.account_id)?;
 
-                    Box::pin(self.registry_query(
-                        method_name.obj.unwrap_registry(),
-                        *req,
-                        access_token,
-                    ))
-                    .await?
-                    .into()
+                    self.registry_query(method_name.obj.unwrap_registry(), *req, access_token)
+                        .await?
+                        .into()
                 }
             },
             RequestMethod::Set(req) => match req {
@@ -500,7 +546,9 @@ impl RequestHandler for Server {
                     self.za_assert_mail_route(access_token, req.account_id.document_id())
                         .await?;
 
-                    self.email_set(*req, access_token, session).await?.into()
+                    self.email_set(*req, access_token, session, using)
+                        .await?
+                        .into()
                 }
                 SetRequestMethod::Mailbox(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
@@ -508,7 +556,7 @@ impl RequestHandler for Server {
                     self.za_assert_mail_route(access_token, req.account_id.document_id())
                         .await?;
 
-                    self.mailbox_set(*req, access_token).await?.into()
+                    self.mailbox_set(*req, access_token, using).await?.into()
                 }
                 SetRequestMethod::Identity(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
@@ -533,7 +581,7 @@ impl RequestHandler for Server {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_is_member(req.account_id)?;
 
-                    self.sieve_script_set(*req, access_token, session)
+                    self.sieve_script_set(*req, access_token, session, using)
                         .await?
                         .into()
                 }
@@ -547,7 +595,7 @@ impl RequestHandler for Server {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_has_access(req.account_id, Collection::AddressBook)?;
 
-                    self.address_book_set(*req, access_token, session)
+                    self.address_book_set(*req, access_token, session, using)
                         .await?
                         .into()
                 }
@@ -555,7 +603,7 @@ impl RequestHandler for Server {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_has_access(req.account_id, Collection::ContactCard)?;
 
-                    self.contact_card_set(*req, access_token, session)
+                    self.contact_card_set(*req, access_token, session, using)
                         .await?
                         .into()
                 }
@@ -563,7 +611,7 @@ impl RequestHandler for Server {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_has_access(req.account_id, Collection::FileNode)?;
 
-                    self.file_node_set(*req, access_token, session)
+                    self.file_node_set(*req, access_token, session, using)
                         .await?
                         .into()
                 }
@@ -578,20 +626,22 @@ impl RequestHandler for Server {
                     access_token.assert_has_access(req.account_id, Collection::Calendar)?;
                     za_assert_calendar_allowed(self, req.account_id).await?;
 
-                    self.calendar_set(*req, access_token, session).await?.into()
+                    self.calendar_set(*req, access_token, session, using)
+                        .await?
+                        .into()
                 }
                 SetRequestMethod::CalendarEvent(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                     access_token.assert_has_access(req.account_id, Collection::CalendarEvent)?;
                     za_assert_calendar_allowed(self, req.account_id).await?;
 
-                    self.calendar_event_set(*req, access_token, session)
+                    self.calendar_event_set(*req, access_token, session, using)
                         .await?
                         .into()
                 }
                 SetRequestMethod::CalendarEventNotification(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
-                    access_token.assert_is_member(req.account_id)?;
+                    access_token.assert_has_access(req.account_id, Collection::CalendarEvent)?;
                     za_assert_calendar_allowed(self, req.account_id).await?;
 
                     self.calendar_event_notification_set(*req, access_token, session)
@@ -600,10 +650,12 @@ impl RequestHandler for Server {
                 }
                 SetRequestMethod::ParticipantIdentity(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
-                    access_token.assert_is_member(req.account_id)?;
+                    access_token.assert_has_access(req.account_id, Collection::CalendarEvent)?;
                     za_assert_calendar_allowed(self, req.account_id).await?;
 
-                    self.participant_identity_set(*req).await?.into()
+                    self.participant_identity_set(*req, access_token)
+                        .await?
+                        .into()
                 }
                 SetRequestMethod::Registry(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
@@ -622,67 +674,91 @@ impl RequestHandler for Server {
             RequestMethod::Changes(mut req) => {
                 resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
 
-                self.changes(*req, method_name.obj, access_token)
+                self.changes(*req, method_name.obj, access_token, using)
                     .await?
                     .into_method_response()
             }
             RequestMethod::Copy(req) => match req {
                 CopyRequestMethod::Email(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
-                    resolve_account_id(&mut req.from_account_id, method_name.obj, access_token)?;
+                    resolve_from_account_id(
+                        &mut req.from_account_id,
+                        method_name.obj,
+                        access_token,
+                    )?;
 
                     access_token
                         .assert_has_access(req.account_id, Collection::Email)?
-                        .assert_has_access(req.from_account_id, Collection::Email)?;
+                        .assert_has_source_access(req.from_account_id, Collection::Email)?;
                     za_assert_mail_keys(self, access_token, req.account_id).await?;
                     za_assert_mail_keys(self, access_token, req.from_account_id).await?;
 
-                    self.email_copy(*req, access_token, next_call, session)
+                    self.email_copy(*req, access_token, next_call, session, using)
                         .await?
                         .into()
                 }
                 CopyRequestMethod::Blob(mut req) => {
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
+                    resolve_from_account_id(
+                        &mut req.from_account_id,
+                        method_name.obj,
+                        access_token,
+                    )?;
                     access_token.assert_is_member(req.account_id)?;
+                    if !access_token.has_account_access(req.from_account_id.document_id()) {
+                        return Err(trc::JmapEvent::FromAccountNotFound.into_err());
+                    }
                     za_assert_mail_keys(self, access_token, req.account_id).await?;
 
                     self.blob_copy(*req, access_token).await?.into()
                 }
                 CopyRequestMethod::ContactCard(mut req) => {
-                    resolve_account_id(&mut req.from_account_id, method_name.obj, access_token)?;
+                    resolve_from_account_id(
+                        &mut req.from_account_id,
+                        method_name.obj,
+                        access_token,
+                    )?;
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
 
                     access_token
                         .assert_has_access(req.account_id, Collection::ContactCard)?
-                        .assert_has_access(req.from_account_id, Collection::ContactCard)?;
+                        .assert_has_source_access(req.from_account_id, Collection::ContactCard)?;
 
-                    self.contact_card_copy(*req, access_token, next_call, session)
+                    self.contact_card_copy(*req, access_token, next_call, session, using)
                         .await?
                         .into()
                 }
                 CopyRequestMethod::CalendarEvent(mut req) => {
-                    resolve_account_id(&mut req.from_account_id, method_name.obj, access_token)?;
+                    resolve_from_account_id(
+                        &mut req.from_account_id,
+                        method_name.obj,
+                        access_token,
+                    )?;
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
 
                     access_token
                         .assert_has_access(req.account_id, Collection::CalendarEvent)?
-                        .assert_has_access(req.from_account_id, Collection::CalendarEvent)?;
+                        .assert_has_source_access(req.from_account_id, Collection::CalendarEvent)?;
                     za_assert_calendar_allowed(self, req.account_id).await?;
                     za_assert_calendar_allowed(self, req.from_account_id).await?;
 
-                    self.calendar_event_copy(*req, access_token, next_call, session)
+                    self.calendar_event_copy(*req, access_token, next_call, session, using)
                         .await?
                         .into()
                 }
                 CopyRequestMethod::FileNode(mut req) => {
-                    resolve_account_id(&mut req.from_account_id, method_name.obj, access_token)?;
+                    resolve_from_account_id(
+                        &mut req.from_account_id,
+                        method_name.obj,
+                        access_token,
+                    )?;
                     resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
 
                     access_token
                         .assert_has_access(req.account_id, Collection::FileNode)?
-                        .assert_has_access(req.from_account_id, Collection::FileNode)?;
+                        .assert_has_source_access(req.from_account_id, Collection::FileNode)?;
 
-                    self.file_node_copy(*req, access_token, next_call, session)
+                    self.file_node_copy(*req, access_token, next_call, session, using)
                         .await?
                         .into()
                 }
@@ -692,7 +768,9 @@ impl RequestHandler for Server {
                 access_token.assert_has_access(req.account_id, Collection::Email)?;
                 za_assert_mail_keys(self, access_token, req.account_id).await?;
 
-                self.email_import(*req, access_token, session).await?.into()
+                self.email_import(*req, access_token, session, using)
+                    .await?
+                    .into()
             }
             RequestMethod::Parse(req) => match req {
                 ParseRequestMethod::Email(mut req) => {
@@ -716,7 +794,9 @@ impl RequestHandler for Server {
                     self.calendar_event_parse(*req, access_token).await?.into()
                 }
             },
-            RequestMethod::QueryChanges(req) => self.query_changes(req, access_token).await?.into(),
+            RequestMethod::QueryChanges(req) => {
+                self.query_changes(req, access_token, using).await?.into()
+            }
             RequestMethod::SearchSnippet(mut req) => {
                 resolve_account_id(&mut req.account_id, method_name.obj, access_token)?;
                 access_token.assert_has_access(req.account_id, Collection::Email)?;
@@ -751,7 +831,7 @@ impl RequestHandler for Server {
 
         trc::event!(
             Jmap(JmapEvent::MethodCall),
-            Id = method_name.as_str(),
+            Command = method_name.as_str(),
             SpanId = session.session_id,
             AccountId = access_token.account_id(),
             Elapsed = op_start.elapsed(),
@@ -828,6 +908,20 @@ async fn za_method_error_for_trace(
     } else {
         error
     }
+}
+
+pub(crate) fn resolve_from_account_id(
+    account_id: &mut Id,
+    obj: MethodObject,
+    access_token: &AccessToken,
+) -> trc::Result<()> {
+    resolve_account_id(account_id, obj, access_token).map_err(|err| {
+        if err.matches(trc::EventType::Jmap(JmapEvent::AccountNotFound)) {
+            trc::JmapEvent::FromAccountNotFound.into_err()
+        } else {
+            err
+        }
+    })
 }
 
 pub(crate) fn resolve_account_id(

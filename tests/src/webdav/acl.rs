@@ -86,10 +86,13 @@ pub async fn test(test: &TestServer) {
             .await
             .with_status(StatusCode::OK);
         if is_file {
+            // 1.0 sets ACLs on containers only: a file node takes its
+            // folder's (`dav/src/common/acl.rs`), and an ACL on the file
+            // itself is refused. 0.16 accepted one per file.
             owner_client
                 .acl(&owner_file, sharee_principal.as_str(), ["read"])
                 .await
-                .with_status(StatusCode::OK);
+                .with_status(StatusCode::FORBIDDEN);
         }
         sharee_client
             .propfind_with_headers(
@@ -259,7 +262,7 @@ pub async fn test(test: &TestServer) {
                     ["read", "write-content", "write-properties"],
                 )
                 .await
-                .with_status(StatusCode::OK);
+                .with_status(StatusCode::FORBIDDEN);
         }
         let response = owner_client
             .propfind(&owner_folder, [DavProperty::WebDav(WebDavProperty::Acl)])
@@ -316,21 +319,28 @@ pub async fn test(test: &TestServer) {
             .request("PUT", &owner_file, &owner_file_content)
             .await
             .with_status(StatusCode::NO_CONTENT);
+        // 1.0 maps write-content to modifying existing items only (RFC 3744
+        // 3.10); creating one needs bind, which 0.16's write-content also
+        // granted. The sharee creates the file once Test 11 grants write.
         sharee_client
             .request("PUT", &sharee_created_file, resource_type.generate())
             .await
-            .with_status(StatusCode::CREATED);
+            .with_status(StatusCode::FORBIDDEN);
 
         // Test 11: Grant delete access to the sharee and verify
         owner_client
             .acl(&owner_folder, sharee_principal.as_str(), ["read", "write"])
             .await
             .with_status(StatusCode::OK);
+        sharee_client
+            .request("PUT", &sharee_created_file, resource_type.generate())
+            .await
+            .with_status(StatusCode::CREATED);
         if is_file {
             owner_client
                 .acl(&owner_file, sharee_principal.as_str(), ["read", "write"])
                 .await
-                .with_status(StatusCode::OK);
+                .with_status(StatusCode::FORBIDDEN);
             owner_client
                 .acl(
                     &sharee_created_file,
@@ -338,7 +348,7 @@ pub async fn test(test: &TestServer) {
                     ["read", "write"],
                 )
                 .await
-                .with_status(StatusCode::OK);
+                .with_status(StatusCode::FORBIDDEN);
         }
         sharee_client
             .request_with_headers(
@@ -353,10 +363,24 @@ pub async fn test(test: &TestServer) {
             .request("DELETE", &sharee_created_file, "")
             .await
             .with_status(StatusCode::NO_CONTENT);
-        sharee_client
-            .request("DELETE", &owner_folder, "")
-            .await
-            .with_status(StatusCode::NO_CONTENT);
+        if is_file {
+            sharee_client
+                .request("DELETE", &owner_folder, "")
+                .await
+                .with_status(StatusCode::NO_CONTENT);
+        } else {
+            // 1.0's write privilege no longer carries the right to delete a
+            // shared calendar or address book itself (`Acl::Delete`, which
+            // 0.16's write granted), so the owner deletes it.
+            sharee_client
+                .request("DELETE", &owner_folder, "")
+                .await
+                .with_status(StatusCode::FORBIDDEN);
+            owner_client
+                .request("DELETE", &owner_folder, "")
+                .await
+                .with_status(StatusCode::NO_CONTENT);
+        }
 
         // Test 12: Share and unshare a resource
         owner_client

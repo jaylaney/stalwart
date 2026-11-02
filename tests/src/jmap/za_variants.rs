@@ -18,7 +18,7 @@ use crate::{
     jmap::{
         files,
         mail::{
-            acl::assert_forbidden,
+            acl::{assert_account_not_found, assert_forbidden, assert_from_account_not_found},
             changes::{LogAction, ParseState},
             query::create as create_query_corpus,
             query_changes::QueryChanges,
@@ -37,8 +37,9 @@ use ::email::{
     cache::MessageCacheFetch,
     mailbox::{INBOX_ID, Mailbox, TRASH_ID},
     message::{
+        delivery::SenderAuthentication,
         ingest::{EmailIngest, IngestEmail, IngestSource},
-        metadata::MessageData,
+        messagedata::MessageData,
     },
     push::{EmailPush, Urgency},
 };
@@ -81,14 +82,13 @@ use std::{
 use store::{
     ValueKey,
     rand::{self, RngExt},
-    write::{AlignedBytes, Archive, BatchBuilder},
+    write::BatchBuilder,
 };
 use tokio::sync::mpsc;
 use types::{
     collection::{Collection, SyncCollection},
     id::Id,
     keyword::Keyword,
-    special_use::SpecialUse,
 };
 
 /// Mail spec 8: method response `n` is the error `kind` (`unsupportedFilter`
@@ -161,6 +161,14 @@ struct CorpusMessage {
     keywords: AHashSet<String>,
     mailboxes: AHashSet<String>,
     thread_id: String,
+}
+
+impl CorpusMessage {
+    /// 1.0 stores a keyword in lower case (`Keyword::other`), so the corpus
+    /// is matched case-insensitively.
+    fn has_keyword(&self, keyword: &str) -> bool {
+        self.keywords.contains(&keyword.to_ascii_lowercase())
+    }
 }
 
 /// Every message of the account, by JMAP id.
@@ -259,14 +267,10 @@ pub async fn query(test: &TestServer) {
         for mailbox_id in 1545..3010 {
             batch
                 .with_document(mailbox_id)
+                // 1.0's `Mailbox` keeps its role in `flags` (0: none).
                 .custom(ObjectIndexBuilder::<(), _>::new().with_changes(Mailbox {
-                    name: format!("Mailbox {mailbox_id}"),
-                    role: SpecialUse::None,
-                    parent_id: 0,
-                    sort_order: None,
                     uid_validity: 0,
-                    subscribers: vec![],
-                    acls: vec![],
+                    ..Mailbox::new(format!("Mailbox {mailbox_id}"))
                 }))
                 .unwrap();
         }
@@ -274,7 +278,7 @@ pub async fn query(test: &TestServer) {
             .core
             .storage
             .data
-            .write(batch.build_all())
+            .write_batch(&mut batch)
             .await
             .unwrap();
 
@@ -286,12 +290,11 @@ pub async fn query(test: &TestServer) {
         assert_eq!(
             cached
                 .emails
-                .items
                 .iter()
-                .map(|m| m.thread_id)
+                .map(|m| m.thread_id())
                 .collect::<AHashSet<_>>()
                 .len(),
-            cached.emails.items.len()
+            cached.emails.len()
         );
         test.wait_for_tasks().await;
     }
@@ -444,7 +447,7 @@ async fn query_refusals(account: &Account) {
 async fn query_served(account: &Account, corpus: &AHashMap<String, CorpusMessage>) {
     type Matcher = Box<dyn Fn(&CorpusMessage) -> bool>;
     let and = |conditions: Vec<Value>| json!({ "operator": "AND", "conditions": conditions });
-    let has = |keyword: &'static str| move |m: &CorpusMessage| m.keywords.contains(keyword);
+    let has = |keyword: &'static str| move |m: &CorpusMessage| m.has_keyword(keyword);
     let mailbox_1768 = Id::new(1768u64).to_string();
     let others = [1991u64, 1870, 2011, 1951, 1902, 1808, 1963]
         .into_iter()
@@ -482,19 +485,19 @@ async fn query_served(account: &Account, corpus: &AHashMap<String, CorpusMessage
         (
             "notKeyword",
             json!({ "notKeyword": "artist" }),
-            Box::new(|m| !m.keywords.contains("artist")),
+            Box::new(|m| !m.has_keyword("artist")),
         ),
         (
             "NOT hasKeyword",
             json!({ "operator": "NOT", "conditions": [{ "hasKeyword": "N0" }] }),
-            Box::new(|m| !m.keywords.contains("N0")),
+            Box::new(|m| !m.has_keyword("N0")),
         ),
         (
             "OR hasKeyword",
             json!({ "operator": "OR", "conditions": [
                 { "hasKeyword": "Bronze" }, { "hasKeyword": "artist" }
             ] }),
-            Box::new(|m| m.keywords.contains("Bronze") || m.keywords.contains("artist")),
+            Box::new(|m| m.has_keyword("Bronze") || m.has_keyword("artist")),
         ),
         (
             "inMailbox",
@@ -518,7 +521,7 @@ async fn query_served(account: &Account, corpus: &AHashMap<String, CorpusMessage
                 json!({ "allInThreadHaveKeyword": "N" }),
                 json!({ "before": date(1800) }),
             ]),
-            Box::new(|m| m.keywords.contains("N") && m.received_at < 1800),
+            Box::new(|m| m.has_keyword("N") && m.received_at < 1800),
         ),
         (
             "noneInThreadHaveKeyword",
@@ -526,7 +529,7 @@ async fn query_served(account: &Account, corpus: &AHashMap<String, CorpusMessage
                 json!({ "noneInThreadHaveKeyword": "N" }),
                 json!({ "after": date(1995) }),
             ]),
-            Box::new(|m| !m.keywords.contains("N") && m.received_at >= 1995),
+            Box::new(|m| !m.has_keyword("N") && m.received_at >= 1995),
         ),
         (
             "someInThreadHaveKeyword",
@@ -534,7 +537,7 @@ async fn query_served(account: &Account, corpus: &AHashMap<String, CorpusMessage
                 json!({ "someInThreadHaveKeyword": "Bronze" }),
                 json!({ "before": date(1878) }),
             ]),
-            Box::new(|m| m.keywords.contains("Bronze") && m.received_at < 1878),
+            Box::new(|m| m.has_keyword("Bronze") && m.received_at < 1878),
         ),
         (
             "hasKeyword in a range",
@@ -543,7 +546,7 @@ async fn query_served(account: &Account, corpus: &AHashMap<String, CorpusMessage
                 json!({ "before": date(1840) }),
                 json!({ "hasKeyword": "T" }),
             ]),
-            Box::new(|m| m.keywords.contains("T") && (1786..1840).contains(&m.received_at)),
+            Box::new(|m| m.has_keyword("T") && (1786..1840).contains(&m.received_at)),
         ),
         (
             "minSize",
@@ -924,11 +927,21 @@ pub async fn query_changes(test: &TestServer) {
             }
             LogAction::Update(id) => {
                 let id = *id_map.get(id).unwrap();
+                // 1.0's `log_item_update` logs only under a current
+                // account, so the batch names it.
                 let mut batch = BatchBuilder::new();
                 batch
+                    .with_account_id(account.id().document_id())
+                    .with_collection(Collection::Email)
                     .with_document(id.document_id())
-                    .log_item_update(SyncCollection::Email, id.prefix_id().into());
-                server.store().write(batch.build_all()).await.unwrap();
+                    .log_item_update(SyncCollection::Email, Some(id.prefix_id().into()));
+                server.store().write_batch(&mut batch).await.unwrap();
+                // A raw write skips `commit_batch`'s cache invalidation, and 1.0
+                // serves a message-cache snapshot for up to 5 s without
+                // revalidating it.
+                server
+                    .inner
+                    .mark_cache_stale(account.id().document_id(), SyncCollection::Email);
                 updated_ids.insert(id);
             }
             LogAction::Delete(id) => {
@@ -940,9 +953,11 @@ pub async fn query_changes(test: &TestServer) {
                 let id = *id_map.get(from).unwrap();
                 let new_id = Id::from_parts(thread_id, id.document_id());
 
-                let old_message_ = server
+                // 1.0 stores `MessageData` in its own encoding, not as an
+                // rkyv archive.
+                let old_message = server
                     .store()
-                    .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+                    .get_value::<MessageData>(ValueKey::archive(
                         account.id().document_id(),
                         Collection::Email,
                         id.document_id(),
@@ -950,29 +965,30 @@ pub async fn query_changes(test: &TestServer) {
                     .await
                     .unwrap()
                     .unwrap();
-                let old_message = old_message_.to_unarchived::<MessageData>().unwrap();
-                let mut new_message = old_message.deserialize::<MessageData>().unwrap();
+                let mut new_message = old_message.clone();
                 new_message.thread_id = thread_id;
 
+                let mut batch = BatchBuilder::new();
+                batch
+                    .with_account_id(account.id().document_id())
+                    .with_collection(Collection::Email)
+                    .with_document(id.document_id())
+                    .custom(
+                        ObjectIndexBuilder::new()
+                            .with_current(old_message)
+                            .with_changes(new_message),
+                    )
+                    .unwrap();
                 server
                     .core
                     .storage
                     .data
-                    .write(
-                        BatchBuilder::new()
-                            .with_account_id(account.id().document_id())
-                            .with_collection(Collection::Email)
-                            .with_document(id.document_id())
-                            .custom(
-                                ObjectIndexBuilder::new()
-                                    .with_current(old_message)
-                                    .with_changes(new_message),
-                            )
-                            .unwrap()
-                            .build_all(),
-                    )
+                    .write_batch(&mut batch)
                     .await
                     .unwrap();
+                server
+                    .inner
+                    .mark_cache_stale(account.id().document_id(), SyncCollection::Email);
 
                 id_map.insert(*to, new_id);
                 if type1_ids.contains(&id) {
@@ -1260,7 +1276,6 @@ pub async fn copy(test: &TestServer) {
             .await
             .unwrap()
             .emails
-            .items
             .len(),
         0
     );
@@ -1497,9 +1512,11 @@ pub async fn thread_merge(test: &TestServer) {
                         received_at: None,
                         source: IngestSource::Smtp {
                             deliver_to: "test@domain.org",
-                            is_sender_authenticated: true,
+                            envelope_from: "sender@domain.org",
+                            sender_authentication: SenderAuthentication::DmarcPass,
                             is_spam: false,
                         },
+                        metadata: None,
                         session_id: 0,
                     })
                     .await
@@ -1525,13 +1542,12 @@ pub async fn thread_merge(test: &TestServer) {
     }
     test.wait_for_tasks().await;
     let cached = test.server.get_cached_messages(account_id).await.unwrap();
-    assert_eq!(messages, cached.emails.items.len());
+    assert_eq!(messages, cached.emails.len());
     assert!(
         cached
             .emails
-            .items
             .iter()
-            .all(|m| m.thread_id == m.document_id),
+            .all(|m| m.thread_id() == m.document_id()),
         "a sealed message is its own thread"
     );
     println!("Deleting all messages...");
@@ -1628,13 +1644,13 @@ pub async fn acl(test: &TestServer) {
         "Owned by john in inbox"
     );
     for (account, email) in [(jane, first("jane")), (sales, first("sales"))] {
-        assert_forbidden(
+        assert_account_not_found(
             john_client
                 .set_default_account_id(account.id_string())
                 .email_get(&email, [Property::Subject].into())
                 .await,
         );
-        assert_forbidden(
+        assert_account_not_found(
             john_client
                 .set_default_account_id(account.id_string())
                 .mailbox_get(&inbox_id, None::<Vec<_>>)
@@ -1656,13 +1672,13 @@ pub async fn acl(test: &TestServer) {
             "Jane's grant on her INBOX",
         );
     }
-    assert_forbidden(
+    assert_account_not_found(
         john_client
             .set_default_account_id(jane.id_string())
             .email_get(&first("jane"), [Property::Subject].into())
             .await,
     );
-    assert_forbidden(
+    assert_account_not_found(
         john_client
             .set_default_account_id(jane.id_string())
             .email_changes("n", None)
@@ -1679,7 +1695,7 @@ pub async fn acl(test: &TestServer) {
         .unwrap()
         .unwrap()
         .take_blob_id();
-    assert_forbidden(
+    assert_from_account_not_found(
         john_client
             .set_default_account_id(john.id_string())
             .blob_copy(jane.id_string(), &blob_id)
@@ -1712,12 +1728,14 @@ pub async fn acl(test: &TestServer) {
             }),
         )
         .await;
+    // John has no access to Jane's account: 1.0 answers accountNotFound
+    // before the fork's refusal is reached.
     assert_eq!(reply.0["methodResponses"][0][0], "error", "{reply:?}");
     assert_eq!(
-        reply.0["methodResponses"][0][1]["type"], "forbidden",
+        reply.0["methodResponses"][0][1]["type"], "accountNotFound",
         "{reply:?}"
     );
-    assert_forbidden(
+    assert_account_not_found(
         john_client
             .set_default_account_id(jane.id_string())
             .email_copy(
@@ -1940,9 +1958,6 @@ pub async fn acl(test: &TestServer) {
         )
         .await
         .unwrap();
-    // An unindex queued before the import's index write can orphan the document (an
-    // upstream task-worker race, which `za::mail::fence`'s in-flight index tests pin).
-    test.wait_for_tasks().await;
     john_client
         .set_default_account_id(admin.id_string())
         .email_destroy(&email_id)
@@ -2100,7 +2115,7 @@ pub async fn acl(test: &TestServer) {
             .mailbox_update_acl(&inbox_id, bill.id_string(), [ACL::ReadItems])
             .await,
     );
-    assert_forbidden(
+    assert_account_not_found(
         bill_client
             .set_default_account_id(admin.id_string())
             .email_query(None::<email::query::Filter>, None::<Vec<_>>)
@@ -2167,7 +2182,7 @@ pub async fn acl(test: &TestServer) {
         .mailbox_update_acl(&inbox_id, john.id_string(), [])
         .await
         .unwrap();
-    assert_forbidden(
+    assert_account_not_found(
         john_client
             .set_default_account_id(admin.id_string())
             .email_get(&first("admin"), [Property::Subject].into())
@@ -2276,7 +2291,7 @@ pub async fn acl(test: &TestServer) {
             "Created by john in sales"
         );
     }
-    assert_forbidden(
+    assert_account_not_found(
         bill_client
             .set_default_account_id(sales.id_string())
             .email_get(&email_id, [Property::Subject].into())
@@ -2293,7 +2308,7 @@ pub async fn acl(test: &TestServer) {
             }),
         )
         .await;
-    assert_forbidden(
+    assert_account_not_found(
         john_client
             .set_default_account_id(sales.id_string())
             .email_get(&email_id, [Property::Subject].into())
@@ -2321,6 +2336,10 @@ async fn next_push(rx: &mut mpsc::Receiver<Value>, wait: Duration) -> Value {
         result => panic!("Timeout waiting for push: {result:?}"),
     }
 }
+
+/// See `core::push_subscription`: a throttled push is sent at the next retry
+/// (`push_retry_wait`, 1 s by default).
+const PUSH_SETTLE: Duration = Duration::from_millis(2500);
 
 async fn no_push(rx: &mut mpsc::Receiver<Value>) {
     if let Ok(message) = tokio::time::timeout(Duration::from_millis(1000), rx.recv()).await {
@@ -2393,6 +2412,11 @@ pub async fn push_subscription(test: &TestServer) {
         state_change(&next_push(&mut event_rx, wait).await, account),
         names(&["Mailbox"])
     );
+    // As upstream's test: a creation's later Mailbox change arrives at the
+    // throttled batch's retry (1.0), and is drained before the type change.
+    while let Ok(Some(push)) = tokio::time::timeout(PUSH_SETTLE, event_rx.recv()).await {
+        assert_eq!(state_change(&push, account), names(&["Mailbox"]));
+    }
 
     // Receive states just for the requested types
     client
@@ -2403,7 +2427,9 @@ pub async fn push_subscription(test: &TestServer) {
         .mailbox_update_sort_order(&mailbox_id, 123)
         .await
         .unwrap();
-    no_push(&mut event_rx).await;
+    if let Ok(message) = tokio::time::timeout(PUSH_SETTLE, event_rx.recv()).await {
+        panic!("Received a message when expecting nothing: {message:?}");
+    }
     client.push_subscription_destroy(&push_id).await.unwrap();
 
     // Only one verification per minute is allowed
@@ -3088,9 +3114,9 @@ pub async fn file_node(test: &TestServer) {
         .jmap_create(
             MethodObject::FileNode,
             [
-                json!({ "name": "Root Folder", "parentId": null }),
-                json!({ "name": "Sub Folder", "parentId": "#i0" }),
-                json!({ "name": "Sub-sub Folder", "parentId": "#i1" }),
+                json!({"@type": "Directory",  "name": "Root Folder", "parentId": null }),
+                json!({"@type": "Directory",  "name": "Sub Folder", "parentId": "#i0" }),
+                json!({"@type": "Directory",  "name": "Sub-sub Folder", "parentId": "#i1" }),
             ],
             Vec::<(&str, &str)>::new(),
         )
@@ -3130,10 +3156,11 @@ pub async fn file_node(test: &TestServer) {
             "accountId": account.id_string(),
             "create": {
               "i0": {
+                "@type": "File",
                 "name": "hello.txt",
                 "parentId": &root_folder_id,
                 "blobId": "#hello",
-                "type": "text/plain",
+                "mediaType": "text/plain",
               }
             }
           },
@@ -3180,7 +3207,7 @@ pub async fn file_node(test: &TestServer) {
                 FileNodeProperty::BlobId,
                 FileNodeProperty::Name,
                 FileNodeProperty::ParentId,
-                FileNodeProperty::Type,
+                FileNodeProperty::MediaType,
                 FileNodeProperty::Size,
             ],
             [&file_id],
@@ -3189,9 +3216,10 @@ pub async fn file_node(test: &TestServer) {
     let blob_id = response.list()[0].blob_id().to_string();
     response.list()[0].assert_is_equal(json!({
         "id": &file_id,
+        "@type": "File",
         "name": "hello.txt",
         "parentId": &root_folder_id,
-        "type": "text/plain",
+        "mediaType": "text/plain",
         "size": 11,
         "blobId": &blob_id,
     }));
@@ -3209,11 +3237,11 @@ pub async fn file_node(test: &TestServer) {
         .jmap_create(
             MethodObject::FileNode,
             [
-                json!({ "name": "Sub Folder", "parentId": &root_folder_id }),
-                json!({ "name": "Folder under file", "parentId": &file_id }),
-                json!({ "name": "My/Sub/Folder" }),
-                json!({ "name": "." }),
-                json!({ "name": ".." }),
+                json!({"@type": "Directory",  "name": "Sub Folder", "parentId": &root_folder_id }),
+                json!({"@type": "Directory",  "name": "Folder under file", "parentId": &file_id }),
+                json!({"@type": "Directory",  "name": "My/Sub/Folder" }),
+                json!({"@type": "Directory",  "name": "." }),
+                json!({"@type": "Directory",  "name": ".." }),
             ],
             Vec::<(&str, &str)>::new(),
         )
@@ -3277,11 +3305,13 @@ pub async fn file_node(test: &TestServer) {
     assert_eq!(list.len(), 2);
     list[0].assert_is_equal(json!({
         "id": &sub_folder_id,
+        "@type": "Directory",
         "name": "Renamed Sub Folder",
         "parentId": &root_folder_id,
     }));
     list[1].assert_is_equal(json!({
         "id": &file_id,
+        "@type": "File",
         "name": "renamed-hello.txt",
         "parentId": &root_folder_id,
     }));
@@ -3370,6 +3400,12 @@ pub async fn calendars(test: &TestServer) {
             "ParticipantIdentity/get",
             json!({ "accountId": id, "ids": null }),
         ),
+        // New at 1.0 (0.16 answered `cannotCalculateChanges`): refused as
+        // `/get` and `/set` are, naming the request's account.
+        (
+            "ParticipantIdentity/changes",
+            json!({ "accountId": id, "sinceState": "n" }),
+        ),
     ] {
         let reply = account.jmap_method_call(method, args).await;
         assert_eq!(
@@ -3410,9 +3446,15 @@ pub async fn principal_get(test: &TestServer) {
     let bill_id = bill.id_string();
     let sales_id = sales.id_string();
 
+    // 1.0's session object sets the per-account limits (mailboxes per email,
+    // address books per card, file node depth), lists more file-node sort
+    // options and the node types, CalendarEvent and ContactCard blobs and the
+    // principals:owner capability, and drops imapsieve from the Sieve
+    // extensions.
     // Validate session object capabilities: upstream's object, minus the
     // account's calendar capabilities (release 1 spec 9).
     let response = john.jmap_session_object().await.into_inner();
+    let john_account = response["accounts"][john_id.to_string().as_str()].clone();
     let application_server_key =
         response["capabilities"]["urn:ietf:params:jmap:webpush-vapid"]["applicationServerKey"]
             .clone();
@@ -3463,7 +3505,7 @@ pub async fn principal_get(test: &TestServer) {
           "isReadOnly": false,
           "accountCapabilities": {
             "urn:ietf:params:jmap:mail": {
-              "maxMailboxesPerEmail": null,
+              "maxMailboxesPerEmail": 100,
               "maxMailboxDepth": 10,
               "maxSizeMailboxName": 255,
               "maxSizeAttachmentsPerEmail": 50000000,
@@ -3498,7 +3540,7 @@ pub async fn principal_get(test: &TestServer) {
             },
             "urn:ietf:params:jmap:vacationresponse": {},
             "urn:ietf:params:jmap:contacts": {
-              "maxAddressBooksPerCard": null,
+              "maxAddressBooksPerCard": 10,
               "mayCreateAddressBook": true
             },
             "urn:ietf:params:jmap:contacts:parse": {},
@@ -3535,7 +3577,6 @@ pub async fn principal_get(test: &TestServer) {
                 "foreverypart",
                 "ihave",
                 "imap4flags",
-                "imapsieve",
                 "include",
                 "index",
                 "mailbox",
@@ -3569,7 +3610,9 @@ pub async fn principal_get(test: &TestServer) {
               "supportedTypeNames": [
                 "Email",
                 "Thread",
-                "SieveScript"
+                "SieveScript",
+                "CalendarEvent",
+                "ContactCard"
               ],
               "supportedDigestAlgorithms": [
                 "sha",
@@ -3585,7 +3628,7 @@ pub async fn principal_get(test: &TestServer) {
               "maxAvailabilityDuration": "P52W1D",
             },
             "urn:ietf:params:jmap:filenode": {
-              "maxFileNodeDepth": null,
+              "maxFileNodeDepth": 64,
               "maxSizeFileNodeName": 255,
               "forbiddenNameChars": "/<>:\"\\|?*",
               "forbiddenNodeNames": [
@@ -3619,7 +3662,16 @@ pub async fn principal_get(test: &TestServer) {
               "fileNodeQuerySortOptions": [
                 "name",
                 "size",
-                "nodeType"
+                "created",
+                "modified",
+                "mediaType",
+                "nodeType",
+                "tree"
+              ],
+              "supportedNodeTypes": [
+                "Directory",
+                "File",
+                "SymLink"
               ],
               "mayCreateTopLevelFileNode": true,
               "caseInsensitiveNames": false,
@@ -3628,6 +3680,10 @@ pub async fn principal_get(test: &TestServer) {
               "webWriteUrlTemplate": null
             },
             "urn:ietf:params:jmap:mail:share": {},
+            "urn:ietf:params:jmap:principals:owner": {
+              "accountIdForPrincipal": john_id,
+              "principalId": john_id
+            },
             "urn:stalwart:jmap": {}
           }
         }
@@ -3705,36 +3761,35 @@ pub async fn principal_get(test: &TestServer) {
         .await;
     let list = response.list();
     assert_eq!(list.len(), 4);
+    // 1.0 lists a principal's accounts only where the session can reach them
+    // (RFC 9670 `accounts`), as the session's Account objects: John's own
+    // account is the one the session object above describes, and the other
+    // principals list none. The time zone is `timeZone`. 0.16 listed every
+    // principal's account capabilities and named the field `timezone`.
     for (item, (id, email, description)) in list.iter().zip([
         (john_id, "jdoe@example.com", "John Doe"),
         (jane_id, "jane.smith@example.com", "Jane Smith"),
         (bill_id, "bill@example.com", "Bill Foobar"),
     ]) {
+        let accounts = if id == john_id {
+            json!({ id: john_account.clone() })
+        } else {
+            Value::Null
+        };
         item.assert_is_equal(json!({
           "id": id,
           "type": "individual",
           "email": email,
           "description": description,
           "name": email,
-          "timezone": null,
+          "timeZone": null,
           "capabilities": {
             "urn:ietf:params:jmap:mail": {},
             "urn:ietf:params:jmap:contacts": {},
             "urn:ietf:params:jmap:filenode": {},
             "urn:ietf:params:jmap:principals": {}
           },
-          "accounts": {
-            id: {
-              "urn:ietf:params:jmap:mail": {},
-              "urn:ietf:params:jmap:contacts": {},
-              "urn:ietf:params:jmap:filenode": {},
-              "urn:ietf:params:jmap:principals": {},
-              "urn:ietf:params:jmap:principals:owner": {
-                "accountIdForPrincipal": id,
-                "principalId": id
-              }
-            }
-          }
+          "accounts": accounts
         }));
     }
     list[3].assert_is_equal(json!({
@@ -3743,31 +3798,19 @@ pub async fn principal_get(test: &TestServer) {
       "email": "sales@example.com",
       "description": "Sales Group",
       "name": "sales@example.com",
-      "timezone": null,
+      "timeZone": null,
       "capabilities": {
         "urn:ietf:params:jmap:mail": {},
         "urn:ietf:params:jmap:contacts": {},
-        "urn:ietf:params:jmap:calendars": {},
+        "urn:ietf:params:jmap:calendars": {
+          "accountId": null,
+          "mayGetAvailability": true,
+          "mayShareWith": true,
+          "calendarAddress": "mailto:sales@example.com"
+        },
         "urn:ietf:params:jmap:filenode": {},
         "urn:ietf:params:jmap:principals": {}
       },
-      "accounts": {
-        sales_id: {
-          "urn:ietf:params:jmap:mail": {},
-          "urn:ietf:params:jmap:contacts": {},
-          "urn:ietf:params:jmap:calendars": {
-            "accountId": sales_id,
-            "mayGetAvailability": true,
-            "mayShareWith": true,
-            "calendarAddress": "mailto:sales@example.com"
-          },
-          "urn:ietf:params:jmap:filenode": {},
-          "urn:ietf:params:jmap:principals": {},
-          "urn:ietf:params:jmap:principals:owner": {
-            "accountIdForPrincipal": sales_id,
-            "principalId": sales_id
-          }
-        }
-      }
+      "accounts": null
     }));
 }

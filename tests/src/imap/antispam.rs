@@ -5,7 +5,7 @@
  */
 
 use crate::{
-    imap::Type,
+    imap::{Type, za_variants::has_junk_flag},
     system::antispam::{HAM, SPAM, TEST},
     utils::{imap::AssertResult, server::TestServer, smtp::SmtpConnection},
 };
@@ -19,7 +19,7 @@ use registry::schema::{
 use spam_filter::modules::classifier::SpamTrainer;
 use store::{
     Deserialize,
-    write::{AlignedBytes, Archive},
+    write::{Archive, ArchiveBytes},
 };
 
 pub async fn test(test: &TestServer) {
@@ -93,25 +93,38 @@ pub async fn test(test: &TestServer) {
     }
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     imap.send_ok("SELECT INBOX").await;
-    imap.send("FETCH 11 (FLAGS RFC822.TEXT)").await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_not_contains("FLAGS ($Junk")
+    // The checks read headers: 1.0's RFC822.TEXT is the body only (RFC 3501
+    // 6.4.5, as BODY[TEXT]), where 0.16 returned the whole message.
+    // The `$Junk` checks read the FLAGS list (`has_junk_flag`, as the key
+    // variant does), so message text cannot satisfy them.
+    imap.send("FETCH 11 (FLAGS RFC822)").await;
+    let lines = imap.assert_read(Type::Tagged, ResponseType::Ok).await;
+    assert!(
+        !has_junk_flag(&lines),
+        "message 11 is flagged $Junk: {lines:?}"
+    );
+    lines
         .assert_contains("Subject: can someone explain")
         .assert_contains("X-Spam-Status: No")
         .assert_contains("PROB_HAM_HIGH");
-    imap.send("FETCH 12 (FLAGS RFC822.TEXT)").await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_not_contains("FLAGS ($Junk")
+    imap.send("FETCH 12 (FLAGS RFC822)").await;
+    let lines = imap.assert_read(Type::Tagged, ResponseType::Ok).await;
+    assert!(
+        !has_junk_flag(&lines),
+        "message 12 is flagged $Junk: {lines:?}"
+    );
+    lines
         .assert_contains("Subject: classifier test")
         .assert_contains("X-Spam-Status: No")
         .assert_contains_any(&["PROB_SPAM_UNCERTAIN", "PROB_HAM_LOW"]);
     imap.send_ok("SELECT \"Junk Mail\"").await;
-    imap.send("FETCH 10 (FLAGS RFC822.TEXT)").await;
-    imap.assert_read(Type::Tagged, ResponseType::Ok)
-        .await
-        .assert_contains("FLAGS ($Junk")
+    imap.send("FETCH 10 (FLAGS RFC822)").await;
+    let lines = imap.assert_read(Type::Tagged, ResponseType::Ok).await;
+    assert!(
+        has_junk_flag(&lines),
+        "message 10 is not flagged $Junk: {lines:?}"
+    );
+    lines
         .assert_contains("Subject: save up to")
         .assert_contains("X-Spam-Status: Yes")
         .assert_contains("PROB_SPAM_HIGH");
@@ -191,7 +204,7 @@ pub async fn spam_classifier_model(server: &Server) -> SpamTrainer {
         .get_blob(SPAM_TRAINER_KEY, 0..usize::MAX)
         .await
         .and_then(|archive| match archive {
-            Some(archive) => <Archive<AlignedBytes> as Deserialize>::deserialize(&archive)
+            Some(archive) => <Archive<ArchiveBytes> as Deserialize>::deserialize(&archive)
                 .and_then(|archive| archive.deserialize_untrusted::<SpamTrainer>())
                 .map(Some),
             None => Ok(None),

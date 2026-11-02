@@ -72,18 +72,47 @@ def stop_child(child, timeout=10):
 
 def check_outcomes(outcomes, policy):
     for name, record in policy.items():
-        if name.startswith("flows/"):
-            raise ValueError("Strict client flows cannot have compatibility exceptions")
+        # A strict flow can only be a strict expected failure (ruling 166): never a skip.
+        if name.startswith("flows/") and (record.get("outcome") != "xfailed"
+                                          or record.get("strict", True) is not True):
+            raise ValueError("Strict client flows can only have strict expected failures")
         if record.get("outcome") not in ("skipped", "xfailed") or not record.get("reason"):
             raise ValueError(f"Invalid compatibility outcome record: {name}")
+        # Only an expected failure can be non-strict (ruling 167): it may also pass.
+        if "strict" in record and (type(record["strict"]) is not bool
+                                   or record.get("outcome") != "xfailed"):
+            raise ValueError(f"Invalid compatibility strictness: {name}")
     problems = []
     for name, outcome in outcomes.items():
-        expected = policy.get(name, {}).get("outcome", "passed")
-        if outcome != expected:
+        record = policy.get(name, {})
+        expected = record.get("outcome", "passed")
+        if outcome != expected and not (record.get("strict", True) is False
+                                        and outcome == "passed"):
             problems.append(f"{name}: expected {expected}, got {outcome}")
     for name in policy.keys() - outcomes.keys():
         problems.append(f"policy test was not collected: {name}")
     return problems
+
+
+# The exception types an expected failure may record. `Failed` is pytest.fail's exception,
+# which the strict flows' polls raise when an event never reaches its state.
+EXCEPTIONS = ("AssertionError", "DeprecationWarning", "Failed")
+
+
+def valid_line(line):
+    return type(line) is int and line >= 1
+
+
+def valid_location(location):
+    # One observed line, or (`lines`) the several lines one race can fail at.
+    if not isinstance(location, dict) or ("line" in location) == ("lines" in location):
+        return False
+    lines = location.get("lines", [location.get("line")])
+    return (isinstance(location.get("file"), str)
+            and bool(location["file"]) and not Path(location["file"]).is_absolute()
+            and ".." not in Path(location["file"]).parts
+            and isinstance(lines, list) and bool(lines) and len(lines) == len(set(lines))
+            and all(valid_line(line) for line in lines))
 
 
 def validate_policy(policy, expected):
@@ -99,12 +128,11 @@ def validate_policy(policy, expected):
             raise ValueError(f"Undocumented compatibility exception: {name}")
         if record.get("outcome") == "xfailed":
             failure = record.get("failure")
-            if (record.get("exception") not in ("AssertionError", "DeprecationWarning")
-                    or not isinstance(failure, dict)
-                    or not isinstance(failure.get("file"), str)
-                    or not failure["file"] or Path(failure["file"]).is_absolute()
-                    or ".." in Path(failure["file"]).parts
-                    or type(failure.get("line")) is not int or failure["line"] < 1):
+            if (record.get("exception") not in EXCEPTIONS
+                    or not valid_location(failure)
+                    or not set(failure) <= {"file", "line", "lines", "via"}
+                    or ("via" in failure and (not valid_location(failure["via"])
+                                              or set(failure["via"]) != {"file", "line"}))):
                 raise ValueError(f"Invalid compatibility failure fingerprint: {name}")
     check_outcomes({}, policy["outcomes"])
     from caldav.compatibility_hints import FeatureSet
@@ -279,9 +307,17 @@ class ProductServer:
 
     def bootstrap(self):
         self.start(recovery=True)
+        self.provision()
+        stop_child(self.child)
+        self.child = None
+        self.start(recovery=False)
+
+    def provision(self):
+        # The recovery server's settings, shared with tests/product/fresh_store.py, which
+        # adds its own listeners after these. Registry field names are 1.0's.
         # Disable background application downloads: these fixtures exercise only CalDAV.
         for application in self.objects("Application"):
-            self.update("Application", application["id"], {"enabled": False})
+            self.update("Application", application["id"], {"enable": False})
         self.create("NetworkListener", {"name": "client-ci", "protocol": "http",
                     "bind": {f"127.0.0.1:{self.http_port}": True}, "useTls": False})
         self.create("Asn", {"@type": "Disabled"})
@@ -294,41 +330,49 @@ class ProductServer:
             self.create("SpamSettings", {"enable": False, "spamFilterRulesUrl": None})
         self.create("Tracer", {"@type": "Stdout", "enable": True, "ansi": False,
                                "level": "warn"})
-        stop_child(self.child)
-        self.child = None
-        self.start(recovery=False)
 
     def users(self, mode):
         domain_name = f"{mode}.client-ci.test"
-        domain = self.create("Domain", {"name": domain_name, "isEnabled": True,
-                            "certificateManagement": {"@type": "Manual"},
-                            "dnsManagement": {"@type": "Manual"},
-                            "dkimManagement": {"@type": "Manual"}})
+        domain = self.domain(domain_name)
         users = []
         for name in ("alice", "bob", "carol"):
-            username = f"{name}@{domain_name}"
-            password = secrets.token_urlsafe(32)
-            self.redactor.credentials(username, password)
-            credentials = {} if mode == "key" else {"0": {"@type": "Password", "secret": password}}
-            self.create("Account", {"@type": "User", "name": name, "domainId": domain,
-                                    "credentials": credentials})
-            if mode == "key":
-                token = response_string(self.request("/api/vault/setup-token",
-                                                     {"account": username}),
-                                        "token", "public API /api/vault/setup-token")
-                self.redactor.secret(token)
-                setup = self.request("/api/vault/setup", {"username": username, "token": token,
-                                                         "password": password}, auth=False)
-                recovery_key = response_string(setup, "recovery_key", "public API /api/vault/setup")
-                self.redactor.secret(recovery_key)
-                new_password = secrets.token_urlsafe(32)
-                self.redactor.credentials(username, new_password)
-                self.request("/api/vault/password", {"username": username, "password": password,
-                                                     "new_password": new_password}, auth=False)
-                password = new_password
+            username, password = self.account(domain, domain_name, name, key=mode == "key")
             users.append({"url": self.url + "/dav/cal/" + username + "/",
                           "username": username, "password": password})
         return users
+
+    def domain(self, domain_name):
+        return self.create("Domain", {"name": domain_name, "enable": True,
+                           "certificateManagement": {"@type": "Manual"},
+                           "dnsManagement": {"@type": "Manual"},
+                           "dkimManagement": {"@type": "Manual"}})
+
+    def account(self, domain, domain_name, name, key):
+        """Create a user; a key account then completes the vault setup flow.
+
+        Returns the login address and its current password (the password is redacted).
+        """
+        username = f"{name}@{domain_name}"
+        password = secrets.token_urlsafe(32)
+        self.redactor.credentials(username, password)
+        credentials = {} if key else {"0": {"@type": "Password", "secret": password}}
+        self.create("Account", {"@type": "User", "name": name, "domainId": domain,
+                                "credentials": credentials})
+        if key:
+            token = response_string(self.request("/api/vault/setup-token",
+                                                 {"account": username}),
+                                    "token", "public API /api/vault/setup-token")
+            self.redactor.secret(token)
+            setup = self.request("/api/vault/setup", {"username": username, "token": token,
+                                                     "password": password}, auth=False)
+            recovery_key = response_string(setup, "recovery_key", "public API /api/vault/setup")
+            self.redactor.secret(recovery_key)
+            new_password = secrets.token_urlsafe(32)
+            self.redactor.credentials(username, new_password)
+            self.request("/api/vault/password", {"username": username, "password": password,
+                                                 "new_password": new_password}, auth=False)
+            password = new_password
+        return username, password
 
     def close(self):
         try:

@@ -5,9 +5,17 @@ Scripts for running the fork's server on a developer machine and checking the ze
 The folder splits into two parts:
 
 - **Tracked scripts**, in this folder (`scripts/local-server/`).
-- **Per-machine state**, in the state directory `$ZA_RUN_DIR`, which defaults to `.run/` in the repository and is ignored by git: the RocksDB data store (`rocks.db`), `datastore.json`, `local.env` (secrets), `tls/` (certificate and key) and any logs you keep.
+- **Per-machine state**, in the state directory `$ZA_RUN_DIR`, which defaults to `.run-1.0/` in the repository and is ignored by git: the RocksDB data store (`rocks.db`), `datastore.json`, `local.env` (secrets), `tls/` (certificate and key) and any logs you keep.
 
 Nothing in the state directory is meant to be copied to another machine. The registry stores the absolute paths of the certificate files, so a state directory is tied to its location; on a new machine, start a fresh one with the steps below.
+
+## Moving from 0.16 to 1.0
+
+The fork is now based on Stalwart 1.0.1. A 1.0 server cannot open a data store that 0.16 wrote, and there is no conversion: its schema check stops the startup ("The data store was created by a Stalwart version prior to 1.0"). So 1.0 needs a fresh state directory, and the scripts now default to `.run-1.0/` instead of 0.16's `.run/`.
+
+- Leave an existing `.run/` alone. It holds 0.16 state that only a 0.16 binary can use. Don't point `ZA_RUN_DIR` at it with a 1.0 binary: the schema check runs only after the boot has opened the store.
+- Run every step below again on the new directory: a new certificate, a new `local.env`, recovery boot, provisioning, setup flows. Trust the new certificate as well (step 2).
+- 1.0 also stamps each store with its edition. The shipping build (no `enterprise` feature) writes the open-source edition's schema version, `0x80000007` (version 7 with the OSS flag, bit 31); a build with `enterprise`, such as the Rust test harness's, writes plain `7`. Neither edition opens the other's store ("created by the Stalwart ... edition and cannot be opened by this edition"), so use one build per state directory.
 
 ## First run on a new machine
 
@@ -41,7 +49,7 @@ All paths below are relative to the repository root.
 
    The certificate is valid for 800 days; rerun `tls-cert.sh --force` (and trust the new one) when it expires.
 
-3. Create `.run/local.env` (the directory exists after step 2) with the fallback admin, and keep it private (`chmod 600`):
+3. Create `.run-1.0/local.env` (the directory exists after step 2) with the fallback admin, and keep it private (`chmod 600`):
 
    ```
    export STALWART_RECOVERY_ADMIN=admin:<password>
@@ -71,7 +79,7 @@ All paths below are relative to the repository root.
    scripts/local-server/start.sh
    ```
 
-   The server logs nothing in normal mode until a stdout tracer is configured in the registry. To keep a log, pipe the output, for example `scripts/local-server/start.sh 2>&1 | tee .run/server.log`.
+   The server logs nothing in normal mode until a stdout tracer is configured in the registry. To keep a log, pipe the output, for example `scripts/local-server/start.sh 2>&1 | tee .run-1.0/server.log`.
 
 8. In another terminal, run the end-to-end check:
 
@@ -87,9 +95,11 @@ Later runs need only `start.sh`.
 | ----- | ---- | --------- |
 | http  | 8080 | plain     |
 | https | 8443 | TLS (the self-signed certificate) |
-| imap  | 1143 | plain     |
+| imap  | 1143 | plain, with STARTTLS (the self-signed certificate) |
 
 Apple Calendar refuses Basic authentication over plain HTTP: add the account with the TLS listener (`https://127.0.0.1:8443`, SSL on) and trust the certificate first (step 2).
+
+IMAP refuses a login on a connection without TLS (it advertises `LOGINDISABLED`, since the `Imap` settings' `allowPlainTextAuth` stays off), so a client issues `STARTTLS` first. Before the 1.0 scripts the listener had no TLS at all, and no login was possible over it.
 
 If another program already holds `127.0.0.1:1143`, the IMAP listener on `[::]:1143` is still reachable through `::1`.
 
@@ -107,12 +117,12 @@ By address only; no passwords are kept in this folder.
 All scripts load `env.sh` first.
 
 - `env.sh`: sourced by the others, not run. Resolves the repository root from its own location and sets the defaults below. It creates `$ZA_RUN_DIR` and, if missing, `datastore.json` (a RocksDB store at `$ZA_RUN_DIR/rocks.db`; an existing file is never touched). It sources `$ZA_RUN_DIR/local.env` when present and stops with a message if `STALWART_RECOVERY_ADMIN` is unset. It exports `STALWART_RECOVERY_ADMIN`, `ZA_ACCOUNT_PAGE_ORIGIN` (default `http://localhost:5173`, used only when unset) and `CURL_CA_BUNDLE` (`$ZA_RUN_DIR/tls/cert.pem`).
-  - Reads: `ZA_RUN_DIR` (default `.run/` in the repository), `STALWART_BIN` (default `target/release/stalwart`), `BASE` (default `https://127.0.0.1:8443`), `ZA_ACCOUNT_PAGE_ORIGIN`, `STALWART_RECOVERY_ADMIN` (required).
+  - Reads: `ZA_RUN_DIR` (default `.run-1.0/` in the repository), `STALWART_BIN` (default `target/release/stalwart`), `BASE` (default `https://127.0.0.1:8443`), `ZA_ACCOUNT_PAGE_ORIGIN`, `STALWART_RECOVERY_ADMIN` (required).
 - `tls-cert.sh [--force]`: writes a self-signed certificate and key to `$ZA_RUN_DIR/tls/` (`cert.pem`, `key.pem`, mode 0600) for `localhost`, `127.0.0.1`, `::1` and any extra names in `ZA_TLS_EXTRA_SAN` (comma-separated). Refuses to overwrite without `--force`, then prints the command that trusts the certificate. Does not load `env.sh`, so it works before `local.env` exists.
   - Reads: `ZA_RUN_DIR`, `ZA_TLS_EXTRA_SAN`.
 - `start-recovery.sh`: first boot in recovery mode, one plain-HTTP listener on 8080, no listeners written. Runs from `$ZA_RUN_DIR`.
   - Reads: the `env.sh` variables.
-- `provision.sh`: against the recovery server, through the registry JMAP API as the fallback admin, creates, in this order, the `http`, `imap` and `https` listeners, the domain `example.com`, a `Certificate` from `$ZA_RUN_DIR/tls/`, one update of the settings singleton (default certificate, default domain `example.com`, default hostname), the user `alice` with no credentials, and, only when `PLAIN_PASS` is set, the user `plain` with that password. The settings update is skipped with a message if the certificate or the domain could not be created. Refuses to run if the certificate files are missing.
+- `provision.sh`: against the recovery server, through the registry JMAP API as the fallback admin, creates, in this order, the `http`, `imap` (STARTTLS) and `https` listeners, the domain `example.com`, a `Certificate` from `$ZA_RUN_DIR/tls/`, one update of the settings singleton (default certificate, default domain `example.com`, default hostname), the user `alice` with no credentials, and, only when `PLAIN_PASS` is set, the user `plain` with that password. The settings update is skipped with a message if the certificate or the domain could not be created. Refuses to run if the certificate files are missing.
   - Reads: the `env.sh` variables, `ZA_HOSTNAME` (optional; the default hostname, default `mail.example.com`), `PLAIN_PASS` (optional).
 - `start.sh`: normal mode, listeners from the registry. Runs from `$ZA_RUN_DIR`.
   - Reads: the `env.sh` variables.
@@ -122,11 +132,12 @@ All scripts load `env.sh` first.
   - Reads: the `env.sh` variables.
 - `gatecheck3.sh`: the release 1 (plan 3) gating checks over `curl`. Its expectations are historical until the script is updated: plan 10 reopened the scheduling gates, so key accounts now get the auto-schedule `OPTIONS` header and the scheduling URLs on their principal, and checks 1 and 6 differ from the script's expectations by design; the invitation checks 8 and 9 predate release 2's invitations. Check 6's propstat parsing is a text heuristic.
   - Reads: the `env.sh` variables, `ALICE_PASS` and `PLAIN_PASS` (both required).
-- `leakcheck.sh <word>...`: greps `$ZA_RUN_DIR/rocks.db` for words that must not be at rest and reports how many data files contain each. Sealed content: 0. The `X-ZA-KEY` marker must appear once a key account has written, and a non-key account's event title (the positive control) must show up.
+- `leakcheck.sh <word>...`: searches `$ZA_RUN_DIR/rocks.db` for words that must not be at rest and reports how many data files contain each. Sealed content: 0. The `X-ZA-KEY` marker must appear once a key account has written, and a non-key account's event title (the positive control) must show up. At 1.0 the server compresses its archives with zstd (against the dictionaries in `resources/zstd/`) and RocksDB compresses most blocks with LZ4, so a plain `grep` sees almost no stored content. The script therefore searches each file's raw bytes, every LZ4 block it finds in the `.sst` and `.blob` files, and every zstd frame in either, and prints how many blocks and frames it decoded and how many frames it could not (expect 0). Needs Python 3.14 or later (`compression.zstd`).
   - Reads: the `env.sh` variables.
 
 ## Notes
 
 - Registry objects are edited with JMAP `x:<Type>/set` calls as the admin; the settings singletons are addressed by the id string `singleton`.
-- RocksDB scans (`leakcheck.sh`) see only flushed files: wait a couple of seconds after a write before scanning.
+- 1.0 renamed some registry fields that hand-written provisioning may use: `NetworkListener.tlsImplicit` is now `implicitTls`, and `Domain.isEnabled` is now `enable`. The old names are refused ("Invalid key for object").
+- RocksDB scans (`leakcheck.sh`) see the files on disk: the write-ahead log (`*.log`) holds recent writes until they are flushed into `.sst` files. Wait a couple of seconds after a write before scanning.
 - Rebuild the release binary after pulling code changes; the running server does not pick them up.

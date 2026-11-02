@@ -11,7 +11,7 @@
 //! component's last entry (`X-ZA-SEALED`). Unsealing puts every removed item
 //! back at its original index.
 
-use super::policy::{POLICY_VERSION, is_visible_parameter, is_visible_property};
+use super::policy::{POLICY_VERSION, is_visible_entry, is_visible_parameter};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use calcard::icalendar::{
     ICalendar, ICalendarComponent, ICalendarEntry, ICalendarParameter, ICalendarProperty,
@@ -121,7 +121,7 @@ pub fn text_entry(name: &str, text: String) -> ICalendarEntry {
     ICalendarEntry {
         name: ICalendarProperty::Other(name.to_string()),
         params: Vec::new(),
-        values: vec![ICalendarValue::Text(text)],
+        values: [ICalendarValue::Text(text)].into(),
     }
 }
 
@@ -363,7 +363,7 @@ fn seal_component(component: &mut ICalendarComponent, dek: &Secret, aad: &[u8]) 
     let original = std::mem::take(&mut component.entries);
     let mut kept = Vec::with_capacity(original.len());
     for (index, entry) in original.into_iter().enumerate() {
-        if !is_visible_property(&component.component_type, &entry.name) {
+        if !is_visible_entry(&component.component_type, &entry) {
             removals.entries.push(RemovedEntry {
                 index: index as u32,
                 entry,
@@ -479,7 +479,7 @@ mod tests {
         ical.components.iter().all(|c| {
             c.entries.iter().all(|e| {
                 is_carrier(e, SEALED_PROP)
-                    || (is_visible_property(&c.component_type, &e.name)
+                    || (is_visible_entry(&c.component_type, e)
                         && e.params.iter().all(|p| is_visible_parameter(&p.name)))
             })
         })

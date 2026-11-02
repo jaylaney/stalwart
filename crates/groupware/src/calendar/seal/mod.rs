@@ -7,6 +7,7 @@
 //! Zero-access sealing of calendar data (spec 6, 7).
 
 pub mod collection;
+pub mod container;
 pub mod domain;
 pub mod event;
 pub mod item;
@@ -34,8 +35,13 @@ pub use tree::{
 };
 
 pub use collection::{calendar_view_in_domain, seal_calendar_changes};
+pub use container::{
+    ZaContainerOf, ZaContainerScope, container_is_ck, is_sealed_container, open_container,
+    reseal_container, rewrap_container, seal_container,
+};
 pub use domain::ZaKeyDomain;
 pub use event::{
-    ZaEventStorageKind, classify_event_storage, event_pairs_in_domain, event_view_in_domain,
-    rewrap_event, seal_event_in_domain, unseal_event_in_domain,
+    ZaEvent, ZaEventStorageKind, ZaEventView, classify_event_storage, event_pairs_in_domain,
+    event_view_in_domain, reseal_event_in_domain, rewrap_event, seal_event_in_domain,
+    unseal_event_in_domain,
 };

@@ -11,21 +11,36 @@ use crate::{
         vault::{za_cors_preflight, za_is_vault_path, za_with_cors},
     },
     auth::{
-        authenticate::{Authenticator, HttpHeaders},
+        authenticate::{Authenticator, HttpAuthenticated, HttpHeaders},
         oauth::{
-            FormData, auth::OAuthApiHandler, openid::OpenIdHandler,
-            registration::ClientRegistrationHandler, token::TokenHandler,
+            FormData,
+            auth::OAuthApiHandler,
+            authorize::{PROTECTED_RESOURCE_PATH, resource_metadata_url},
+            logout::EndSessionHandler,
+            openid::{OidcMetadataRequest, OpenIdHandler},
+            registration::ClientRegistrationHandler,
+            request_origin,
+            token::TokenHandler,
         },
     },
     form::FormHandler,
+    stream::InFlightStream,
 };
 use common::{
     BuildServer, Inner, KV_ACME, Server,
+    auth::oauth::{client::RequestOrigin, scope::OAuthScopes},
+    config::telemetry::PrometheusAuth,
     ipc::PushEvent,
-    manager::application::Resource,
-    network::{SessionData, SessionManager, SessionStream},
+    manager::{
+        app_client::APP_CLIENT_DOCUMENT,
+        application::{AppClientDocument, Resource},
+    },
+    network::{
+        SessionData, SessionManager, SessionStream, forwarded::ClientIp, memory::MemoryClass,
+    },
     za::{ZA_MAIL_KEYLESS, ZA_TRACE_MAIL_KEYLESS, mail::za_is_keyless_refusal},
 };
+use compact_str::{CompactString, ToCompactString};
 use dav::{DavMethod, request::DavRequestHandler};
 use groupware::DavResourceName;
 use http_proto::{
@@ -35,15 +50,19 @@ use http_proto::{
 };
 use hyper::{
     Method, StatusCode, body,
-    header::{self, CONTENT_ENCODING, CONTENT_TYPE},
+    header::{
+        self, CONTENT_ENCODING, CONTENT_SECURITY_POLICY, CONTENT_TYPE, HOST, X_FRAME_OPTIONS,
+    },
     server::conn::http1,
     service::service_fn,
 };
 use hyper_util::rt::{TokioIo, TokioTimer};
 use jmap::{
     api::{
-        ToJmapHttpResponse, event_source::EventSourceHandler, request::RequestHandler,
-        session::SessionHandler,
+        ToJmapHttpResponse,
+        event_source::EventSourceHandler,
+        request::RequestHandler,
+        session::{SessionHandler, allowed_capabilities},
     },
     blob::{download::BlobDownload, upload::BlobUpload},
     websocket::upgrade::WebSocketUpgrade,
@@ -60,8 +79,9 @@ use scim::request::ScimRequestHandler;
 // SPDX-SnippetEnd
 use percent_encoding::percent_decode_str;
 use registry::schema::enums::Permission;
-use std::{net::IpAddr, str::FromStr, sync::Arc};
+use std::{str::FromStr, sync::Arc};
 use store::dispatch::lookup::KeyValue;
+use telemetry::prometheus::negotiate::negotiate;
 use trc::SecurityEvent;
 use types::{blob::BlobId, id::Id};
 
@@ -109,8 +129,11 @@ impl ParseHttp for Server {
                 match (path.next().unwrap_or_default(), req.method()) {
                     ("", &Method::POST) => {
                         // Authenticate request
-                        let (_in_flight, access_token) =
-                            self.authenticate_headers(&req, &session).await?;
+                        let HttpAuthenticated {
+                            in_flight: _in_flight,
+                            access_token,
+                            ..
+                        } = self.authenticate_headers(&req, &session).await?;
 
                         if let Some(content_type) = req.headers().get(CONTENT_TYPE) {
                             let is_json = content_type
@@ -130,74 +153,64 @@ impl ParseHttp for Server {
                             }
                         }
 
-                        if za_jmap_untraced(self, access_token.account_id()).await {
-                            let bytes = fetch_body_untraced(
-                                &mut req,
-                                if !access_token.has_permission(Permission::UnlimitedUploads) {
-                                    self.core.jmap.upload_max_size
-                                } else {
-                                    0
-                                },
-                            )
-                            .await
-                            .ok_or_else(|| trc::LimitEvent::SizeRequest.into_err())?;
-
-                            let request = match Request::parse(
-                                &bytes,
-                                self.core.jmap.request_max_calls,
-                                self.core.jmap.request_max_size,
-                            ) {
-                                Ok(request) => request,
-                                // Spec section 10, "Traces": the parser's
-                                // details and reason can echo the body.
-                                Err(err)
-                                    if err.matches(trc::EventType::Jmap(
-                                        trc::JmapEvent::NotRequest,
-                                    )) =>
-                                {
-                                    return Err(trc::JmapEvent::NotRequest
-                                        .into_err()
-                                        .reason("invalid JMAP request"));
-                                }
-                                Err(err) => return Err(err),
-                            };
-
-                            return Ok(self
-                                .handle_jmap_request(request, &access_token, &session)
-                                .await
-                                .into_http_response()
-                                .with_untraced_body());
+                        // Spec section 10, "Traces": a key account's request
+                        // and response bodies are never traced.
+                        let untraced = za_jmap_untraced(self, access_token.account_id()).await;
+                        let max_size = if !access_token.has_permission(Permission::UnlimitedUploads)
+                        {
+                            self.core.jmap.upload_max_size
+                        } else {
+                            0
+                        };
+                        let bytes = if untraced {
+                            fetch_body_untraced(&mut req, max_size).await
+                        } else {
+                            fetch_body(&mut req, max_size, session.session_id).await
                         }
-
-                        let bytes = fetch_body(
-                            &mut req,
-                            if !access_token.has_permission(Permission::UnlimitedUploads) {
-                                self.core.jmap.upload_max_size
-                            } else {
-                                0
-                            },
-                            session.session_id,
-                        )
-                        .await
                         .ok_or_else(|| trc::LimitEvent::SizeRequest.into_err())?;
 
-                        return Ok(self
-                            .handle_jmap_request(
-                                Request::parse(
-                                    &bytes,
-                                    self.core.jmap.request_max_calls,
-                                    self.core.jmap.request_max_size,
-                                )?,
-                                &access_token,
-                                &session,
-                            )
+                        let mut request = match Request::parse(
+                            &bytes,
+                            self.core.jmap.request_max_calls,
+                            self.core.jmap.request_max_size,
+                        ) {
+                            Ok(request) => request,
+                            // Spec section 10, "Traces": the parser's details
+                            // and reason can echo the body.
+                            Err(err)
+                                if untraced
+                                    && err.matches(trc::EventType::Jmap(
+                                        trc::JmapEvent::NotRequest,
+                                    )) =>
+                            {
+                                return Err(trc::JmapEvent::NotRequest
+                                    .into_err()
+                                    .reason("invalid JMAP request"));
+                            }
+                            Err(err) => return Err(err),
+                        };
+                        request.using = allowed_capabilities(&access_token, request.using);
+
+                        let mut reservation = self.memory_reservation(MemoryClass::Read);
+                        let response = self
+                            .handle_jmap_request(request, &access_token, &session, &mut reservation)
                             .await
-                            .into_http_response());
+                            .into_http_response();
+                        return Ok(if untraced {
+                            response.with_untraced_body()
+                        } else {
+                            response
+                        });
                     }
                     ("download", &Method::GET) => {
                         // Authenticate request
-                        let (_in_flight, access_token) =
-                            self.authenticate_headers(&req, &session).await?;
+                        let HttpAuthenticated {
+                            in_flight: _in_flight,
+                            access_token,
+                            ..
+                        } = self.authenticate_headers(&req, &session).await?;
+                        let access_token =
+                            access_token.assert_allows_oauth_scopes(OAuthScopes::INTEROPERABLE)?;
 
                         if let (Some(_), Some(blob_id), Some(name)) = (
                             path.next().and_then(|p| Id::from_str(p).ok()),
@@ -205,35 +218,44 @@ impl ParseHttp for Server {
                             path.next(),
                         ) {
                             // Ruling R30: the keyless refusal answers 403.
-                            let blob = match self.blob_download(&blob_id, &access_token).await {
+                            let contents = match self.blob_contents(&blob_id, &access_token).await {
                                 Err(err) if za_is_keyless_refusal(&err) => {
                                     return Ok(za_keyless_response());
                                 }
-                                blob => blob?,
+                                contents => contents?,
                             };
-                            return match blob {
-                                Some(blob) => Ok(DownloadResponse {
-                                    filename: name.to_string(),
-                                    content_type: req
-                                        .uri()
-                                        .query()
-                                        .and_then(|q| {
-                                            form_urlencoded::parse(q.as_bytes())
-                                                .find(|(k, _)| k == "accept")
-                                                .map(|(_, v)| v.into_owned())
-                                        })
-                                        .unwrap_or("application/octet-stream".to_string()),
-                                    blob,
+                            return match contents {
+                                Some(contents) => {
+                                    let (prefix, blob) = contents.into_http_parts()?;
+                                    Ok(DownloadResponse {
+                                        filename: name.to_string(),
+                                        content_type: req
+                                            .uri()
+                                            .query()
+                                            .and_then(|q| {
+                                                form_urlencoded::parse(q.as_bytes())
+                                                    .find(|(k, _)| k == "accept")
+                                                    .map(|(_, v)| v.into_owned())
+                                            })
+                                            .unwrap_or("application/octet-stream".to_string()),
+                                        prefix,
+                                        blob,
+                                    }
+                                    .into_http_response())
                                 }
-                                .into_http_response()),
                                 None => Err(trc::ResourceEvent::NotFound.into_err()),
                             };
                         }
                     }
                     ("upload", &Method::POST) => {
                         // Authenticate request
-                        let (_in_flight, access_token) =
-                            self.authenticate_headers(&req, &session).await?;
+                        let HttpAuthenticated {
+                            in_flight: _in_flight,
+                            access_token,
+                            ..
+                        } = self.authenticate_headers(&req, &session).await?;
+                        let access_token =
+                            access_token.assert_allows_oauth_scopes(OAuthScopes::INTEROPERABLE)?;
 
                         if let Some(account_id) = path.next().and_then(|p| Id::from_str(p).ok()) {
                             // Mail spec 4, 5.7: an upload into a key account
@@ -307,8 +329,13 @@ impl ParseHttp for Server {
                     }
                     ("eventsource", &Method::GET) => {
                         // Authenticate request
-                        let (_in_flight, access_token) =
-                            self.authenticate_headers(&req, &session).await?;
+                        let HttpAuthenticated {
+                            in_flight: _in_flight,
+                            access_token,
+                            ..
+                        } = self.authenticate_headers(&req, &session).await?;
+                        let access_token =
+                            access_token.assert_allows_oauth_scopes(OAuthScopes::INTEROPERABLE)?;
 
                         // A stream outlives the key residency bound (spec 5).
                         return self
@@ -317,14 +344,20 @@ impl ParseHttp for Server {
                     }
                     ("ws", &Method::GET) => {
                         // Authenticate request
-                        let (_in_flight, access_token) =
-                            self.authenticate_headers(&req, &session).await?;
+                        let HttpAuthenticated {
+                            in_flight: _in_flight,
+                            access_token,
+                            epoch,
+                        } = self.authenticate_headers(&req, &session).await?;
+                        let access_token =
+                            access_token.assert_allows_oauth_scopes(OAuthScopes::INTEROPERABLE)?;
 
                         // A WebSocket outlives the key residency bound (spec 5).
                         return self
                             .upgrade_websocket_connection(
                                 req,
                                 access_token.without_session_keys(),
+                                epoch,
                                 session,
                             )
                             .await;
@@ -332,8 +365,11 @@ impl ParseHttp for Server {
                     ("session", &Method::GET) => {
                         return if req.headers().contains_key(header::AUTHORIZATION) {
                             // Authenticate request
-                            let (_in_flight, access_token) =
-                                self.authenticate_headers(&req, &session).await?;
+                            let HttpAuthenticated {
+                                in_flight: _in_flight,
+                                access_token,
+                                ..
+                            } = self.authenticate_headers(&req, &session).await?;
 
                             self.handle_session_resource(
                                 self.core.network.http.url_https.to_string(),
@@ -377,8 +413,11 @@ impl ParseHttp for Server {
                         ),
                     (Some(resource), Some(method)) => {
                         // Authenticate request
-                        let (_in_flight, access_token) =
-                            self.authenticate_headers(&req, &session).await?;
+                        let HttpAuthenticated {
+                            in_flight: _in_flight,
+                            access_token,
+                            ..
+                        } = self.authenticate_headers(&req, &session).await?;
 
                         self.handle_dav_request(req, access_token, &session, resource, method)
                             .await
@@ -410,21 +449,36 @@ impl ParseHttp for Server {
                     self.is_http_anonymous_request_allowed(session.remote_ip)
                         .await?;
 
-                    return self.handle_oauth_metadata().await;
+                    return self
+                        .handle_oauth_metadata(request_origin(&req, &session))
+                        .await;
                 }
                 ("oauth-protected-resource", &Method::GET) => {
                     // Limit anonymous requests
                     self.is_http_anonymous_request_allowed(session.remote_ip)
                         .await?;
 
-                    return self.handle_oauth_protected_resource().await;
+                    return self
+                        .handle_oauth_protected_resource(
+                            request_origin(&req, &session),
+                            req.uri()
+                                .path()
+                                .strip_prefix(PROTECTED_RESOURCE_PATH)
+                                .unwrap_or_default(),
+                        )
+                        .await;
                 }
                 ("openid-configuration", &Method::GET) => {
                     // Limit anonymous requests
                     self.is_http_anonymous_request_allowed(session.remote_ip)
                         .await?;
 
-                    return self.handle_oidc_metadata(false).await;
+                    return self
+                        .handle_oidc_metadata(
+                            OidcMetadataRequest::WellKnown,
+                            request_origin(&req, &session),
+                        )
+                        .await;
                 }
                 ("acme-challenge", &Method::GET) if self.has_acme_http_providers() => {
                     if let Some(token) = path.next() {
@@ -445,8 +499,7 @@ impl ParseHttp for Server {
                         .await?;
 
                     return if let Some(policy) = &self.core.smtp.session.mta_sts_policy {
-                        Ok(Resource::new("text/plain", policy.to_string().into_bytes())
-                            .into_http_response())
+                        Ok(Resource::new("text/plain", policy.text.clone()).into_http_response())
                     } else {
                         Err(trc::ResourceEvent::NotFound.into_err())
                     };
@@ -461,13 +514,14 @@ impl ParseHttp for Server {
                             req.headers()
                                 .get(header::HOST)
                                 .and_then(|h| h.to_str().ok())
-                                .map(|h| h.rsplit_once(':').map_or(h, |(h, _)| h))
+                                .map(pacc_domain)
                                 .unwrap_or_default(),
                         )
                         .await?
                         .into_bytes(),
                     )
                     .into_http_response()
+                    .with_sandbox_policy()
                     .with_cors_unrestricted());
                 }
                 ("mail-v1.xml", &Method::GET) => {
@@ -478,7 +532,7 @@ impl ParseHttp for Server {
                     return self
                         .handle_autoconfig_request(req.uri().query())
                         .await
-                        .map(|resource| resource.into_http_response());
+                        .map(|resource| resource.into_http_response().with_sandbox_policy());
                 }
                 ("autoconfig", &Method::GET)
                     if path.next().unwrap_or_default() == "mail"
@@ -488,10 +542,14 @@ impl ParseHttp for Server {
                     self.is_http_anonymous_request_allowed(session.remote_ip)
                         .await?;
 
-                    return self
-                        .handle_autoconfig_request(req.uri().query())
-                        .await
-                        .map(|resource| resource.into_http_response().with_cors_unrestricted());
+                    return self.handle_autoconfig_request(req.uri().query()).await.map(
+                        |resource| {
+                            resource
+                                .into_http_response()
+                                .with_sandbox_policy()
+                                .with_cors_unrestricted()
+                        },
+                    );
                 }
                 (_, &Method::OPTIONS) => {
                     return Ok(HttpResponse::new(StatusCode::NO_CONTENT).with_cors_unrestricted());
@@ -511,19 +569,27 @@ impl ParseHttp for Server {
 
                     return self.handle_token_request(&mut req, session).await;
                 }
+                ("revoke", &Method::POST) => {
+                    self.is_http_anonymous_request_allowed(session.remote_ip)
+                        .await?;
+
+                    return self.handle_token_revocation(&mut req, session).await;
+                }
                 ("introspect", &Method::POST) => {
                     // Authenticate request
-                    let (_in_flight, access_token) =
-                        self.authenticate_headers(&req, &session).await?;
+                    let _auth = self.authenticate_headers(&req, &session).await?;
 
                     return self
-                        .handle_token_introspect(&mut req, &access_token, session.session_id)
+                        .handle_token_introspect(&mut req, session.session_id)
                         .await;
                 }
                 ("userinfo", &Method::GET) => {
                     // Authenticate request
-                    let (_in_flight, access_token) =
-                        self.authenticate_headers(&req, &session).await?;
+                    let HttpAuthenticated {
+                        in_flight: _in_flight,
+                        access_token,
+                        ..
+                    } = self.authenticate_headers(&req, &session).await?;
 
                     return self
                         .handle_userinfo_request(access_token.account_id())
@@ -533,6 +599,12 @@ impl ParseHttp for Server {
                     return self
                         .handle_oauth_registration_request(&mut req, session)
                         .await;
+                }
+                ("logout", &Method::GET | &Method::POST) => {
+                    self.is_http_anonymous_request_allowed(session.remote_ip)
+                        .await?;
+
+                    return self.handle_end_session(&mut req, &session).await;
                 }
                 ("jwks.json", &Method::GET) => {
                     // Limit anonymous requests
@@ -553,7 +625,7 @@ impl ParseHttp for Server {
             "scim" => {
                 let (_in_flight, access_token) = if req.authorization().is_some() {
                     match self.authenticate_headers(&req, &session).await {
-                        Ok((in_flight, access_token)) => (in_flight, Some(access_token)),
+                        Ok(auth) => (auth.in_flight, Some(auth.access_token)),
                         Err(err) => {
                             let response =
                                 scim::error::Error::from(err).into_response(session.session_id);
@@ -569,7 +641,7 @@ impl ParseHttp for Server {
                     (None, None)
                 };
 
-                return Ok(self.handle_scim_request(req, session, access_token).await);
+                return Ok(Box::pin(self.handle_scim_request(req, session, access_token)).await);
             }
             // SPDX-SnippetEnd
             "api" => {
@@ -588,7 +660,13 @@ impl ParseHttp for Server {
                 let response = match self.handle_api_request(&mut req, &session).await {
                     Ok(response) => response,
                     Err(err) => {
-                        let response = err.into_http_response(AuthChallenge::Bearer);
+                        let response = err.into_http_response(AuthChallenge::Bearer, || {
+                            resource_metadata_url(
+                                self,
+                                request_origin(&req, &session),
+                                req.uri().path(),
+                            )
+                        });
                         trc::error!(err.span_id(session.session_id));
                         response
                     }
@@ -606,7 +684,7 @@ impl ParseHttp for Server {
                     return self
                         .handle_autoconfig_request(req.uri().query())
                         .await
-                        .map(|resource| resource.into_http_response());
+                        .map(|resource| resource.into_http_response().with_sandbox_policy());
                 }
             }
             "calendar" => {
@@ -656,7 +734,7 @@ impl ParseHttp for Server {
                             fetch_body(&mut req, 8192, session.session_id).await,
                         )
                         .await
-                        .map(|resource| resource.into_http_response());
+                        .map(|resource| resource.into_http_response().with_sandbox_policy());
                 } else if document_name.eq_ignore_ascii_case("autodiscover.json") {
                     // Limit anonymous requests
                     self.is_http_anonymous_request_allowed(session.remote_ip)
@@ -669,11 +747,14 @@ impl ParseHttp for Server {
                     return self
                         .handle_autodiscover_v2_request(req.uri().query(), path_email.as_deref())
                         .await
-                        .map(|result| match result {
-                            Ok(resource) => resource.into_http_response(),
-                            Err(err) => HttpResponse::new(StatusCode::BAD_REQUEST)
-                                .with_content_type("application/json; charset=utf-8")
-                                .with_text_body(err),
+                        .map(|result| {
+                            match result {
+                                Ok(resource) => resource.into_http_response(),
+                                Err(err) => HttpResponse::new(StatusCode::BAD_REQUEST)
+                                    .with_content_type("application/json; charset=utf-8")
+                                    .with_text_body(err),
+                            }
+                            .with_sandbox_policy()
                         });
                 }
             }
@@ -712,22 +793,28 @@ impl ParseHttp for Server {
             "metrics" => match path.next().unwrap_or_default() {
                 "prometheus" => {
                     if let Some(prometheus) = &self.core.metrics.prometheus {
-                        if let Some(auth) = &prometheus.auth
-                            && req
-                                .authorization_basic()
-                                .is_none_or(|secret| secret != auth)
-                        {
+                        if req.method() != Method::GET {
+                            return Ok(HttpResponse::new(StatusCode::METHOD_NOT_ALLOWED)
+                                .with_header(header::ALLOW, "GET"));
+                        }
+                        if matches!(prometheus.auth, PrometheusAuth::None) {
+                            self.is_http_anonymous_request_allowed(session.remote_ip)
+                                .await?;
+                        } else if !prometheus.auth.is_authorized(req.authorization_basic()) {
                             return Err(trc::AuthEvent::Failed
                                 .into_err()
                                 .details("Invalid or missing credentials.")
                                 .caused_by(trc::location!()));
                         }
 
-                        return Ok(Resource::new(
-                            "text/plain; version=0.0.4",
-                            self.export_prometheus_metrics().await?.into_bytes(),
-                        )
-                        .into_http_response());
+                        let format = negotiate(
+                            req.headers()
+                                .get(header::ACCEPT)
+                                .map(|value| value.as_bytes()),
+                        );
+                        return Ok(HttpResponse::new(StatusCode::OK)
+                            .with_content_type(format.content_type())
+                            .with_binary_body(self.export_prometheus_metrics(prometheus, format)));
                     }
                 }
                 "otel" => {
@@ -760,7 +847,10 @@ impl ParseHttp for Server {
                     .await
                 {
                     Ok(Some(resource)) => {
-                        return Ok(resource.into_http_response());
+                        return Ok(resource
+                            .into_http_response()
+                            .with_image_sandbox_policy()
+                            .with_content_disposition("inline; filename=\"logo\""));
                     }
                     Ok(None) => {
                         return Err(trc::ResourceEvent::NotFound.into_err());
@@ -795,15 +885,39 @@ impl ParseHttp for Server {
                 return Ok(HttpResponse::new(StatusCode::OK)
                     .with_content_type("text/html; charset=utf-8")
                     .with_header(CONTENT_ENCODING, "gzip")
+                    .with_header(X_FRAME_OPTIONS, "DENY")
+                    .with_header(CONTENT_SECURITY_POLICY, "frame-ancestors 'none'")
                     .with_binary_body(LOGIN_PAGE));
             }
             external => {
                 if path.next().is_none() {
                     if !external.is_empty() {
+                        if !self.inner.data.applications.has_prefix(external)
+                            && ban_scanned_path(self, req.uri().path(), &session).await?
+                        {
+                            return Err(trc::ResourceEvent::NotFound.into_err());
+                        }
                         return Ok(HttpResponse::redirect(format!("/{external}/")));
                     } else if let Some(url) = &self.core.network.http.redirect_root {
                         return Ok(HttpResponse::redirect(url.clone()));
                     }
+                } else if req.uri().path().get(external.len() + 2..) == Some(APP_CLIENT_DOCUMENT)
+                    && let Some(response) = match self
+                        .application_client_document(external, request_origin(&req, &session))
+                    {
+                        AppClientDocument::Document(document) => {
+                            Some(Ok(Resource::new("application/json", document)
+                                .into_http_response()
+                                .with_no_cache()
+                                .with_cors_unrestricted()))
+                        }
+                        AppClientDocument::Untrusted => {
+                            Some(Err(trc::ResourceEvent::NotFound.into_err()))
+                        }
+                        AppClientDocument::NotShipped => None,
+                    }
+                {
+                    return response;
                 } else if let Some(resource) = self
                     .inner
                     .data
@@ -828,29 +942,37 @@ impl ParseHttp for Server {
         }
 
         // Block dangerous URLs
-        let path = req.uri().path();
-        if self.is_http_banned_path(path, session.remote_ip).await? {
-            trc::event!(
-                Security(SecurityEvent::ScanBan),
-                SpanId = session.session_id,
-                RemoteIp = session.remote_ip,
-                Path = path.to_string(),
-            );
-        }
+        ban_scanned_path(self, req.uri().path(), &session).await?;
 
         Err(trc::ResourceEvent::NotFound.into_err())
     }
 }
 
+async fn ban_scanned_path(
+    server: &Server,
+    path: &str,
+    session: &HttpSessionData,
+) -> trc::Result<bool> {
+    let banned = server.is_http_banned_path(path, session.remote_ip).await?;
+    if banned {
+        trc::event!(
+            Security(SecurityEvent::ScanBan),
+            SpanId = session.session_id,
+            RemoteIp = session.remote_ip,
+            Path = CompactString::from(path),
+        );
+    }
+    Ok(banned)
+}
+
 async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionData<T>) {
-    let _in_flight = session.in_flight;
     let is_tls = session.stream.is_tls();
 
     if let Err(http_err) = http1::Builder::new()
         .timer(TokioTimer::new())
         .keep_alive(true)
         .serve_connection(
-            TokioIo::new(session.stream),
+            TokioIo::new(InFlightStream::new(session.stream, session.in_flight)),
             service_fn(|req: hyper::Request<body::Incoming>| {
                 let instance = session.instance.clone();
                 let inner = inner.clone();
@@ -859,65 +981,62 @@ async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionDat
                     let server = inner.build_server();
 
                     // Obtain remote IP
-                    let remote_ip = if !server.core.network.http.use_forwarded {
-                        trc::event!(
-                            Http(trc::HttpEvent::RequestUrl),
-                            SpanId = session.session_id,
-                            Url = req.uri().to_string(),
-                        );
-
-                        session.remote_ip
-                    } else if let Some(forwarded_for) = req
-                        .headers()
-                        .get(header::FORWARDED)
-                        .and_then(|h| h.to_str().ok())
-                        .and_then(|h| {
-                            let h = h.to_ascii_lowercase();
-                            h.split_once("for=").and_then(|(_, rest)| {
-                                let mut start_ip = usize::MAX;
-                                let mut end_ip = usize::MAX;
-
-                                for (pos, ch) in rest.char_indices() {
-                                    match ch {
-                                        '0'..='9' | 'a'..='f' | ':' | '.' => {
-                                            if start_ip == usize::MAX {
-                                                start_ip = pos;
-                                            }
-                                            end_ip = pos;
-                                        }
-                                        '"' | '[' | ' ' if start_ip == usize::MAX => {}
-                                        _ => {
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                rest.get(start_ip..=end_ip)
-                                    .and_then(|h| h.parse::<IpAddr>().ok())
-                            })
-                        })
-                        .or_else(|| {
-                            req.headers()
-                                .get("X-Forwarded-For")
-                                .and_then(|h| h.to_str().ok())
-                                .map(|h| h.split_once(',').map_or(h, |(ip, _)| ip).trim())
-                                .and_then(|h| h.parse::<IpAddr>().ok())
-                        })
+                    let remote_ip = match server
+                        .core
+                        .network
+                        .http
+                        .remote_ip_source
+                        .resolve(req.headers())
                     {
-                        trc::event!(
-                            Http(trc::HttpEvent::RequestUrl),
-                            SpanId = session.session_id,
-                            RemoteIp = forwarded_for,
-                            Url = req.uri().to_string(),
-                        );
+                        ClientIp::Peer => {
+                            trc::event!(
+                                Http(trc::HttpEvent::RequestUrl),
+                                SpanId = session.session_id,
+                                Url = req.uri().to_compact_string(),
+                            );
 
-                        forwarded_for
-                    } else {
-                        trc::event!(
-                            Http(trc::HttpEvent::XForwardedMissing),
-                            SpanId = session.session_id,
-                        );
-                        session.remote_ip
+                            session.remote_ip
+                        }
+                        ClientIp::Forwarded(forwarded_for) => {
+                            trc::event!(
+                                Http(trc::HttpEvent::RequestUrl),
+                                SpanId = session.session_id,
+                                RemoteIp = forwarded_for,
+                                Url = req.uri().to_compact_string(),
+                            );
+
+                            forwarded_for
+                        }
+                        ClientIp::Missing if session.remote_ip.is_loopback() => {
+                            trc::event!(
+                                Http(trc::HttpEvent::RequestUrl),
+                                SpanId = session.session_id,
+                                Url = req.uri().to_compact_string(),
+                            );
+
+                            session.remote_ip
+                        }
+                        ClientIp::Missing => {
+                            trc::event!(
+                                Http(trc::HttpEvent::XForwardedMissing),
+                                SpanId = session.session_id,
+                            );
+                            session.remote_ip
+                        }
+                        ClientIp::Invalid => {
+                            trc::event!(
+                                Http(trc::HttpEvent::XForwardedInvalid),
+                                ListenerId = instance.id.clone(),
+                                RemoteIp = session.remote_ip,
+                                SpanId = session.session_id,
+                            );
+
+                            return Ok::<_, hyper::Error>(
+                                JsonProblemResponse(StatusCode::BAD_REQUEST)
+                                    .into_http_response()
+                                    .build(),
+                            );
+                        }
                     };
 
                     // Check if the remote IP has been blocked
@@ -940,23 +1059,44 @@ async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionDat
                     let is_vault_path = za_is_vault_path(req.uri().path());
 
                     // Parse HTTP request
-                    let response = match Box::pin(server.parse_http_request(
-                        req,
-                        HttpSessionData {
-                            instance,
-                            local_ip: session.local_ip,
-                            local_port: session.local_port,
-                            remote_ip,
-                            remote_port: session.remote_port,
-                            is_tls,
-                            session_id: session.session_id,
-                        },
-                    ))
-                    .await
+                    let challenge_uri = req.uri().clone();
+                    let challenge_host = req.headers().get(HOST).cloned();
+                    let response = match server
+                        .parse_http_request(
+                            req,
+                            HttpSessionData {
+                                instance,
+                                local_ip: session.local_ip,
+                                local_port: session.local_port,
+                                remote_ip,
+                                remote_port: session.remote_port,
+                                is_tls,
+                                session_id: session.session_id,
+                            },
+                        )
+                        .await
                     {
                         Ok(response) => response,
                         Err(err) => {
-                            let response = err.into_http_response(AuthChallenge::BearerAndBasic);
+                            let response =
+                                err.into_http_response(AuthChallenge::BearerAndBasic, || {
+                                    resource_metadata_url(
+                                        &server,
+                                        RequestOrigin {
+                                            is_tls,
+                                            authority: challenge_host
+                                                .as_ref()
+                                                .and_then(|host| host.to_str().ok())
+                                                .or_else(|| {
+                                                    challenge_uri
+                                                        .authority()
+                                                        .map(|authority| authority.as_str())
+                                                })
+                                                .unwrap_or_default(),
+                                        },
+                                        challenge_uri.path(),
+                                    )
+                                });
                             trc::error!(err.span_id(session.session_id));
                             response
                         }
@@ -972,7 +1112,7 @@ async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionDat
                                 HttpResponseBody::Text(value) => {
                                     trc::Value::String(value.as_str().into())
                                 }
-                                HttpResponseBody::Binary(_) => {
+                                HttpResponseBody::Binary(_) | HttpResponseBody::Prefixed(_) => {
                                     trc::Value::String("[binary data]".into())
                                 }
                                 HttpResponseBody::Stream(_) => {
@@ -1015,14 +1155,14 @@ async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionDat
     {
         if http_err.is_parse() {
             let server = inner.build_server();
-            if !server.core.network.http.use_forwarded {
+            if server.core.network.http.remote_ip_source.is_peer() {
                 match server.is_scanner_fail2banned(session.remote_ip).await {
                     Ok(true) => {
                         trc::event!(
                             Security(SecurityEvent::ScanBan),
                             SpanId = session.session_id,
                             RemoteIp = session.remote_ip,
-                            Reason = http_err.to_string(),
+                            Reason = http_err.to_compact_string(),
                         );
                         return;
                     }
@@ -1040,7 +1180,7 @@ async fn handle_session<T: SessionStream>(inner: Arc<Inner>, session: SessionDat
         trc::event!(
             Http(trc::HttpEvent::Error),
             SpanId = session.session_id,
-            Reason = http_err.to_string(),
+            Reason = http_err.to_compact_string(),
         );
     }
 }
@@ -1077,42 +1217,21 @@ fn za_keyless_response() -> HttpResponse {
         .with_untraced_body()
 }
 
-#[cfg(test)]
-mod tests {
-    use flate2::read::GzDecoder;
-    use std::io::Read;
+const PACC_HOST_PREFIX: &str = "ua-auto-config.";
 
-    const PAGES: [(&str, &[u8], &str); 2] = [
-        (
-            "calendar-rsvp.html",
-            super::RSVP_PAGE,
-            include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../resources/html-templates/calendar-rsvp.html.min"
-            )),
-        ),
-        (
-            "login.html",
-            super::LOGIN_PAGE,
-            include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../resources/html-templates/login.html.min"
-            )),
-        ),
-    ];
-
-    #[test]
-    fn gzipped_static_pages_are_in_sync() {
-        for (name, gzipped, minified) in PAGES {
-            let mut decoded = String::new();
-            GzDecoder::new(gzipped)
-                .read_to_string(&mut decoded)
-                .unwrap_or_else(|err| panic!("{name}.min.gz failed to decompress: {err}"));
-
-            assert_eq!(
-                decoded, minified,
-                "{name}.min.gz is stale, re-run resources/scripts/minify_html.sh --gzip"
-            );
-        }
-    }
+fn pacc_domain(host: &str) -> &str {
+    let host = host.rsplit_once(':').map_or(host, |(host, _)| host);
+    host.get(..PACC_HOST_PREFIX.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(PACC_HOST_PREFIX))
+        .and_then(|_| host.get(PACC_HOST_PREFIX.len()..))
+        .unwrap_or(host)
 }
+
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../stalwart-tests/unit/http/src/request/tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "request_restored_tests.rs"]
+mod tests;

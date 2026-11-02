@@ -42,20 +42,21 @@ use common::{
 };
 use groupware::{
     calendar::{
-        CalendarEvent,
-        drain::{ZaDrain, ZaHeldBack},
+        CalendarEvent, CalendarEventContent,
+        drain::{ZaDrain, ZaHeldBack, itip_reason},
         fanout::{
             ITIP_STATUS_KEY_REFUSED, ZaFanOut, ZaFanOutKind, ZaFanOutMessage, ZaScheduleStatus,
             ZaSource, za_set_schedule_status,
         },
         itip::ItipSendStatus,
-        pinning::{za_full_request_for, za_participation_replies},
-        seal::{TokenPairs, seal_error, seal_event_in_domain, unseal_event_in_domain},
-        sequence::{ZaSequence, za_set_sequences},
+        pinning::{za_full_state_for, za_participation_replies},
+        seal::{TokenPairs, ZaEvent, seal_error, seal_event_in_domain, unseal_event_in_domain},
+        sequence_floor::{ZaSequence, za_set_sequences},
         sharing::resolve::za_owned_event_contexts,
     },
     scheduling::{
         itip::{ITIP_STATUS_DELIVERED, ITIP_STATUS_NOT_ATTEMPTED},
+        recipient::RecipientPolicy,
         snapshot::itip_snapshot,
     },
 };
@@ -63,10 +64,10 @@ use http_proto::{HttpResponse, HttpSessionData};
 use std::collections::BTreeMap;
 use store::{
     ValueKey,
-    write::{AlignedBytes, Archive, BatchBuilder, now},
+    write::{Archive, ArchiveBytes, BatchBuilder, now},
 };
 use trc::AddContext;
-use types::collection::Collection;
+use types::{collection::Collection, field::CalendarEventField};
 
 /// Withheld entries one `contacts/pin` call attempts at most; the rest are
 /// `remaining` (spec 6.4), and an attendee-side entry waiting behind the
@@ -651,14 +652,13 @@ async fn za_redeliver_entry(
     let Some(archive) = za_event_archive(server, account_id, document_id).await? else {
         return Ok(Outcome::Dropped);
     };
-    let mut event = archive
-        .deserialize::<CalendarEvent>()
-        .caused_by(trc::location!())?;
+    let mut event = za_event_pair(&archive)?;
     let contexts = za_owned_event_contexts(
         server,
         keys,
-        &event,
+        &event.meta,
         event
+            .meta
             .names
             .first()
             .ok_or_else(|| trc::StoreEvent::DataCorruption.into_err())?
@@ -672,17 +672,17 @@ async fn za_redeliver_entry(
             .map_err(|error| error.into_store_error(account_id, document_id))?;
     let pairs = unseal_event_in_domain(&mut event, &contexts[0].domain)
         .map_err(|err| seal_error(err, account_id, document_id))?;
-    if event.data.event.uids().next() != Some(entry.uid.as_str()) {
+    if event.content.data.event.uids().next() != Some(entry.uid.as_str()) {
         return Ok(Outcome::Dropped);
     }
-    let Some(side) = za_side(&event, addresses, &entry.address) else {
+    let Some(side) = za_side(&event.content, addresses, &entry.address) else {
         return Ok(Outcome::Dropped);
     };
     if !ItipSendStatus::resolve(
         server,
         &verified.access_token,
         account_info,
-        event.data.event_range_end(),
+        event.content.data.event_range_end(),
         true,
     )
     .is_send_sealed()
@@ -690,13 +690,37 @@ async fn za_redeliver_entry(
         return Ok(Outcome::Dropped);
     }
 
-    // Step 2: the full current state for this one recipient.
-    let tree = &event.data.event;
+    // Step 2: the full current state for this one recipient, split as
+    // upstream splits its messages (upgrade ruling 91).
+    let tree = &event.content.data.event;
+    let policy = RecipientPolicy::new(&server.core.groupware, event.meta.flags);
     let (messages, lease) = match side {
         Side::Organizer => {
-            let Some(message) = za_full_request_for(tree, addresses, &entry.address) else {
-                return Ok(Outcome::Dropped);
+            // The slice, then the CANCELs of the recorded removals (upgrade
+            // ruling 132). A split error is a failure, so the entry stays
+            // (upgrade ruling 135, M10).
+            let messages = match za_full_state_for(
+                tree,
+                addresses,
+                &entry.address,
+                &entry.instances,
+                policy,
+            ) {
+                Ok(messages) => messages,
+                Err(err) => {
+                    trc::event!(
+                        Calendar(trc::CalendarEvent::ItipMessageError),
+                        AccountId = account_id,
+                        DocumentId = document_id,
+                        Reason = itip_reason(&err),
+                        Details = "zero-access: full state not built",
+                    );
+                    return Ok(Outcome::Failed);
+                }
             };
+            if messages.is_empty() {
+                return Ok(Outcome::Dropped);
+            }
             // The organizer's UID lease, as the delegating merge holds it.
             let Some(lease) = ZaUidLease::acquire(server.store(), account_id, &entry.uid)
                 .await
@@ -705,7 +729,7 @@ async fn za_redeliver_entry(
                 return Ok(Outcome::Failed);
             };
             (
-                vec![message],
+                messages,
                 Some(ZaUidLeaseGuard::new(server.store().clone(), lease)),
             )
         }
@@ -743,6 +767,7 @@ async fn za_redeliver_entry(
                 uid: &entry.uid,
             },
             ZaFanOutKind::Redelivery,
+            policy,
             lease.as_ref().map(|lease| lease.lease()),
             None,
         )
@@ -785,8 +810,8 @@ async fn za_redeliver_entry(
         // Step 4: the status, resealed under the assertion on the stored
         // archive; the schedule tag is unchanged.
         None => {
-            za_set_schedule_status(&mut event.data.event, &fan_out.statuses);
-            za_set_sequences(&mut event.data.event, &fan_out.sequences);
+            za_set_schedule_status(&mut event.content.data.event, &fan_out.statuses);
+            za_set_sequences(&mut event.content.data.event, &fan_out.sequences);
             match za_reseal(
                 server,
                 verified,
@@ -819,28 +844,62 @@ async fn za_redeliver_entry(
     result
 }
 
-/// The account's stored event, as written.
+/// The account's stored event as written: its metadata row and its content
+/// archive (1.0 splits the two).
+struct ZaStoredEvent {
+    meta: Archive<ArchiveBytes>,
+    content: Archive<ArchiveBytes>,
+}
+
 async fn za_event_archive(
     server: &Server,
     account_id: u32,
     document_id: u32,
-) -> trc::Result<Option<Archive<AlignedBytes>>> {
-    server
+) -> trc::Result<Option<ZaStoredEvent>> {
+    let Some(meta) = server
         .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
             account_id,
             Collection::CalendarEvent,
             document_id,
         ))
         .await
-        .caused_by(trc::location!())
+        .caused_by(trc::location!())?
+    else {
+        return Ok(None);
+    };
+    Ok(server
+        .store()
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::property(
+            account_id,
+            Collection::CalendarEvent,
+            document_id,
+            CalendarEventField::Content,
+        ))
+        .await
+        .caused_by(trc::location!())?
+        .map(|content| ZaStoredEvent { meta, content }))
+}
+
+/// The stored pair, deserialized for the seal codec.
+fn za_event_pair(archive: &ZaStoredEvent) -> trc::Result<ZaEvent> {
+    Ok(ZaEvent::new(
+        archive
+            .meta
+            .deserialize::<CalendarEvent>()
+            .caused_by(trc::location!())?,
+        archive
+            .content
+            .deserialize::<CalendarEventContent>()
+            .caused_by(trc::location!())?,
+    ))
 }
 
 /// Whether the account organizes the event or attends it, when the tree
 /// still names `address` as the other party: an ATTENDEE when the ORGANIZER
 /// is one of `addresses`, else the ORGANIZER.
-fn za_side(event: &CalendarEvent, addresses: &[String], address: &str) -> Option<Side> {
-    let snapshots = itip_snapshot(&event.data.event, addresses, false).ok()?;
+fn za_side(content: &CalendarEventContent, addresses: &[String], address: &str) -> Option<Side> {
+    let snapshots = itip_snapshot(&content.data.event, addresses, false).ok()?;
     let names = |email: &str| za_normalize_address(email).as_deref() == Some(address);
     if snapshots.organizer.email.is_local {
         snapshots
@@ -859,14 +918,14 @@ fn za_side(event: &CalendarEvent, addresses: &[String], address: &str) -> Option
 }
 
 /// Step 4's write: `event` (unsealed, its status set) sealed with `pairs`
-/// and committed as an update asserting `archive`, the stored bytes it was
-/// read from.
+/// and committed as a full update asserting `archive`, the stored bytes it
+/// was read from (both its row and its content).
 async fn za_reseal(
     server: &Server,
     verified: &ZaVerified,
-    account_info: &AccountInfo,
-    archive: &Archive<AlignedBytes>,
-    mut event: CalendarEvent,
+    _account_info: &AccountInfo,
+    archive: &ZaStoredEvent,
+    mut event: ZaEvent,
     pairs: Option<&TokenPairs>,
     document_id: u32,
 ) -> trc::Result<()> {
@@ -874,8 +933,9 @@ async fn za_reseal(
     let contexts = za_owned_event_contexts(
         server,
         &verified.keys,
-        &event,
+        &event.meta,
         event
+            .meta
             .names
             .first()
             .ok_or_else(|| trc::StoreEvent::DataCorruption.into_err())?
@@ -893,21 +953,29 @@ async fn za_reseal(
     seal_event_in_domain(&mut event, &contexts[0].domain, pairs)
         .map_err(|err| seal_error(err, account_id, document_id))?;
     let current = archive
+        .meta
         .to_unarchived::<CalendarEvent>()
+        .caused_by(trc::location!())?;
+    let current_content = archive
+        .content
+        .unarchive::<CalendarEventContent>()
         .caused_by(trc::location!())?;
     let mut batch = BatchBuilder::new();
     for context in &contexts {
         context.assert_in(&mut batch);
     }
-    event
-        .update(
-            account_info.account_tenant_ids(),
-            current,
-            account_id,
-            document_id,
-            &mut batch,
-        )
-        .caused_by(trc::location!())?;
+    let (meta, content) = event.into_parts();
+    meta.update_full(
+        content,
+        verified.access_token.changed_by(),
+        current,
+        current_content,
+        account_id,
+        document_id,
+        None,
+        &mut batch,
+    )
+    .caused_by(trc::location!())?;
     server
         .commit_batch(batch)
         .await
@@ -934,14 +1002,13 @@ async fn za_reseal_again(
     let Some(archive) = za_event_archive(server, account_id, document_id).await? else {
         return Ok(());
     };
-    let mut event = archive
-        .deserialize::<CalendarEvent>()
-        .caused_by(trc::location!())?;
+    let mut event = za_event_pair(&archive)?;
     let contexts = za_owned_event_contexts(
         server,
         &verified.keys,
-        &event,
+        &event.meta,
         event
+            .meta
             .names
             .first()
             .ok_or_else(|| trc::StoreEvent::DataCorruption.into_err())?
@@ -968,8 +1035,8 @@ async fn za_reseal_again(
     if !unchanged {
         return Ok(());
     }
-    za_set_schedule_status(&mut event.data.event, statuses);
-    za_set_sequences(&mut event.data.event, sequences);
+    za_set_schedule_status(&mut event.content.data.event, statuses);
+    za_set_sequences(&mut event.content.data.event, sequences);
     match za_reseal(
         server,
         verified,

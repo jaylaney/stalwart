@@ -10,7 +10,7 @@
 
 use super::{
     STRONG,
-    dav_seal::raw_event,
+    dav_seal::{raw_event, raw_event_records},
     fanout::{
         CONTENT_TYPE, KEY1_CAL, MKCALENDAR, NO_REPLY, Party, START_A, START_B, attendee_statuses,
         invite, pair_token, stored_pairs, stored_sequence, uid_copies,
@@ -22,10 +22,10 @@ use crate::utils::{
     server::TestServer,
     webdav::DummyWebDavClient,
     za::{
-        HookParked, PlantedItem, copy_href, envelope_wrap, inbox_ids, inbox_items, item_method,
-        item_partstat, new_inbox_items, open_pending_item_as, pending_ids, plant_inbox_item,
-        rewrite_inbox_item, trigger_drain, wait_for_delivery, za_app_password, za_post,
-        za_uid_leases, za_unlock,
+        HookParked, InboxItem, PlantedItem, assert_no_event_preferences, copy_href, envelope_wrap,
+        inbox_ids, inbox_items, item_method, item_partstat, new_inbox_items, open_pending_item_as,
+        pending_ids, plant_inbox_item, rewrite_inbox_item, trigger_drain, wait_for_delivery,
+        za_app_password, za_post, za_uid_leases, za_unlock,
     },
 };
 use ::registry::{
@@ -46,7 +46,8 @@ use common::{
 };
 use groupware::cache::GroupwareCache;
 use groupware::calendar::{
-    CalendarEvent, ChangedBy, EVENT_NOTIFICATION_IS_CHANGE, EVENT_NOTIFICATION_ZA_PENDING,
+    CalendarEvent, CalendarEventContent, ChangedBy, EVENT_NOTIFICATION_IS_CHANGE,
+    EVENT_NOTIFICATION_ZA_PENDING,
 };
 use hyper::{Method, StatusCode};
 use serde_json::json;
@@ -89,11 +90,7 @@ pub fn relative(href: &str) -> String {
 }
 
 /// The stored item `document_id` of `account_id`.
-pub async fn stored_item(
-    test: &TestServer,
-    account_id: u32,
-    document_id: u32,
-) -> groupware::calendar::CalendarEventNotification {
+pub async fn stored_item(test: &TestServer, account_id: u32, document_id: u32) -> InboxItem {
     inbox_items(test, account_id)
         .await
         .into_iter()
@@ -175,14 +172,18 @@ pub async fn test(test: &mut TestServer) {
         "{copy}"
     );
     let rel = relative(&href);
-    let (archive, _) = raw_event(test, key2.id, &rel).await;
+    let (records, copy_id) = raw_event_records(test, key2.id, &rel).await;
     assert!(
-        archive
+        records
+            .meta
             .unarchive::<CalendarEvent>()
             .unwrap()
             .schedule_tag
             .is_some()
     );
+    // Per-user event data (calendar spec, near line 717): the drain's import
+    // stores none.
+    assert_no_event_preferences(test, key2.id, copy_id).await;
     // Spec 3.3, "Attendee side": the copy's bundle holds key2's pair, the
     // token key1 handed out, and nothing else.
     let key2_token = *stored_pairs(test, &keys1, key1.id, "default/drain-1.ics")
@@ -267,6 +268,8 @@ pub async fn test(test: &mut TestServer) {
     );
     assert_eq!(stored_sequence(&key2.client, &href).await, 1);
     assert_eq!(uid_copies(test, key2.id, uid).await, 1);
+    // Nor does the drain's merge.
+    assert_no_event_preferences(test, key2.id, copy_id).await;
     let item = stored_item(test, key2.id, update_item[0]).await;
     assert_eq!(item.flags & EVENT_NOTIFICATION_ZA_PENDING, 0);
     assert_ne!(
@@ -406,6 +409,7 @@ async fn test_timezone_merge(test: &mut TestServer) {
             .unarchive::<groupware::calendar::Calendar>()
             .unwrap()
             .preferences(key2.id)
+            .unwrap()
             .time_zone
             .tz(),
         Some(Tz::UTC)
@@ -512,8 +516,9 @@ async fn test_timezone_merge(test: &mut TestServer) {
             assert_eq!(shown.matches("RECURRENCE-ID:20990117T140000Z").count(), 1);
             assert!(shown.contains("DTSTART;TZID=za-drain-paris:20990117T140000"));
             let definitions = shown.matches("TZID:za-drain-paris\r\n").count();
-            let (archive, _) = raw_event(test, key2.id, &rel).await;
-            let stored = archive.unarchive::<CalendarEvent>().unwrap();
+            let (records, _) = raw_event_records(test, key2.id, &rel).await;
+            let archive = records.content.clone();
+            let stored = archive.unarchive::<CalendarEventContent>().unwrap();
             let sealed = stored.data.event.to_string();
             assert!(sealed.contains("X-ZA-KEY:") && sealed.contains("X-ZA-SEALED:"));
             let item = stored_item(test, key2.id, item_id).await;
@@ -523,10 +528,7 @@ async fn test_timezone_merge(test: &mut TestServer) {
                 "drain-tzname-canary",
                 "drain-tzcomment-canary",
             ] {
-                assert!(
-                    !String::from_utf8_lossy(archive.as_bytes()).contains(canary),
-                    "event leaked {canary}"
-                );
+                assert!(!records.bytes().contains(canary), "event leaked {canary}");
                 assert!(
                     !item.event.to_string().contains(canary),
                     "item leaked {canary}"
@@ -534,7 +536,7 @@ async fn test_timezone_merge(test: &mut TestServer) {
             }
             let resources = test
                 .server
-                .fetch_dav_resources(key2.id, key2.id, SyncCollection::Calendar)
+                .fetch_groupware_resources(key2.id, key2.id, SyncCollection::Calendar)
                 .await
                 .unwrap();
             let cached = resources
@@ -554,6 +556,7 @@ async fn test_timezone_merge(test: &mut TestServer) {
                 .expand(
                     Tz::UTC,
                     TimeRange::new(stamp("20990101T000000Z"), stamp("20990201T000000Z")),
+                    types::OverlapRule::CalDav,
                 )
                 .unwrap();
             expanded.sort_unstable_by_key(|instance| instance.start);
@@ -1477,8 +1480,169 @@ pub async fn test_reply(test: &mut TestServer) {
         "a reply from the wrong principal applied"
     );
 
+    // 11. The delegate's invitation is the delegate's slice (upgrade ruling
+    // 131): key1's recurring event invites key2 to the series, and its
+    // override of the second occurrence names only key1 itself, so neither
+    // key2 nor, after the delegation, key3 attends it (a delegation of an
+    // instance key2 attends would reach that instance too). key2 delegates
+    // the series (the master) to key3; key1's drain builds the full REQUEST
+    // for key3 and splits it as 1.0 splits upstream's own messages, so
+    // key3's item holds the master only, not the override.
+    let uid11 = "za-drain-r11";
+    let organizer11 = format!("{KEY1_CAL}drain-r11.ics");
+    let recurring11 = invite(uid11, START_A, &["key2@example.com"])
+        .replace(
+            "DURATION:PT1H\r\n",
+            "DURATION:PT1H\r\nRRULE:FREQ=DAILY;COUNT=5\r\n",
+        )
+        .replace(
+            "END:VEVENT\r\nEND:VCALENDAR\r\n",
+            &format!(
+                concat!(
+                    "END:VEVENT\r\nBEGIN:VEVENT\r\nUID:{uid}\r\n",
+                    "DTSTAMP:20240101T000000Z\r\nRECURRENCE-ID:{start}\r\n",
+                    "DTSTART:{start}\r\nDURATION:PT1H\r\nSEQUENCE:0\r\n",
+                    "SUMMARY:fo-title {uid} override\r\nORGANIZER:mailto:key1@example.com\r\n",
+                    "ATTENDEE;PARTSTAT=ACCEPTED:mailto:key1@example.com\r\n",
+                    "END:VEVENT\r\nEND:VCALENDAR\r\n"
+                ),
+                uid = uid11,
+                start = START_B
+            ),
+        );
+    key1.client
+        .request_with_headers("PUT", &organizer11, [CONTENT_TYPE], recurring11)
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    let copy11 = copy_href(test, key2.id, uid11).await;
+    // key2's master only: its ATTENDEE delegated, key3 added beside it.
+    let delegated11 = body(&key2.client, &copy11)
+        .await
+        .replace("\r\n ", "")
+        .split("BEGIN:VEVENT")
+        .enumerate()
+        .map(|(at, part)| {
+            if at == 0 || part.contains("RECURRENCE-ID") {
+                part.to_string()
+            } else {
+                part.replace(
+                    "PARTSTAT=NEEDS-ACTION",
+                    "PARTSTAT=DELEGATED;DELEGATED-TO=\"mailto:key3@example.com\"",
+                )
+                .replace(
+                    "END:VEVENT",
+                    "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;DELEGATED-FROM=\"mailto:key2@example.com\":mailto:key3@example.com\r\nEND:VEVENT",
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("BEGIN:VEVENT");
+    key2.client
+        .request_with_headers("PUT", &copy11, [CONTENT_TYPE], delegated11)
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    assert_eq!(pending_ids(test, key1.id).await.len(), 1);
+    let before3 = inbox_ids(test, key3.id).await;
+    assert_eq!(trigger_drain(key1.name, STRONG).await, 207);
+    let key3_items = new_inbox_items(test, key3.id, &before3).await;
+    assert_eq!(
+        key3_items.len(),
+        1,
+        "key3 has exactly one new item: the organizer's series invitation"
+    );
+    let (item11, _) = open_pending_item_as(test, key3.id, STRONG, key3_items[0].0).await;
+    let item11_text = item11.to_string();
+    let vevents: Vec<_> = item11
+        .components
+        .iter()
+        .filter(|component| component.component_type.is_scheduling_object())
+        .collect();
+    assert_eq!(
+        vevents.len(),
+        1,
+        "the delegate's item holds only its instances: {item11_text}"
+    );
+    assert!(
+        !vevents[0].is_recurrence_override(),
+        "the delegate's one instance is the master: {item11_text}"
+    );
+    assert!(
+        !item11_text.contains("override"),
+        "the delegate's item carries the override it does not attend: {item11_text}"
+    );
+    assert!(pending_ids(test, key1.id).await.is_empty());
+    assert_eq!(trigger_drain(key3.name, STRONG).await, 207);
+
+    // 12. Upgrade ruling 154: the delegate's invitation's split fails
+    // (`max_recipients` 1, at the one new delegate), so key3 gets no item;
+    // the REPLY still applies, and key1's stored event carries `5.1` on
+    // key3's ATTENDEE line, so the organizer sees the failure. The cap is
+    // set after key2's REPLY is sent (its own split would fail too) and a
+    // guard restores the prior value.
+    let uid12 = "za-drain-r12";
+    let organizer12 = format!("{KEY1_CAL}drain-r12.ics");
+    key1.client
+        .request_with_headers(
+            "PUT",
+            &organizer12,
+            [CONTENT_TYPE],
+            invite(uid12, START_A, &["key2@example.com"]),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    let copy12 = copy_href(test, key2.id, uid12).await;
+    let delegated12 = body(&key2.client, &copy12)
+        .await
+        .replace("\r\n ", "")
+        .replace(
+            "PARTSTAT=NEEDS-ACTION",
+            "PARTSTAT=DELEGATED;DELEGATED-TO=\"mailto:key3@example.com\"",
+        )
+        .replace(
+            "END:VEVENT",
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;DELEGATED-FROM=\"mailto:key2@example.com\":mailto:key3@example.com\r\nEND:VEVENT",
+        );
+    key2.client
+        .request_with_headers("PUT", &copy12, [CONTENT_TYPE], delegated12)
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    assert_eq!(pending_ids(test, key1.id).await.len(), 1);
+    let before12 = inbox_ids(test, key3.id).await;
+    let cap = crate::utils::za::MaxRecipientsGuard::set(test.account("admin@example.com"), 1).await;
+    assert_eq!(trigger_drain(key1.name, STRONG).await, 207);
+    cap.restore().await;
+    assert!(
+        new_inbox_items(test, key3.id, &before12).await.is_empty(),
+        "the split failed: key3 is not invited"
+    );
+    assert!(
+        pending_ids(test, key1.id).await.is_empty(),
+        "the REPLY applied"
+    );
+    assert_eq!(
+        partstat_of(&key1.client, &organizer12, "key2@example.com")
+            .await
+            .as_deref(),
+        Some("DELEGATED")
+    );
+    let organizer12_body = body(&key1.client, &organizer12).await;
+    assert_eq!(
+        crate::utils::za::schedule_statuses(
+            &organizer12_body,
+            calcard::icalendar::ICalendarProperty::Attendee,
+            "key3@example.com"
+        ),
+        ["5.1"],
+        "the uninvited delegate's 5.1: {organizer12_body}"
+    );
+
     // Cleanup.
     for (party, uid) in [
+        (&key2, uid12),
+        (&key2, uid11),
+        (&key3, uid11),
         (&key2, uid),
         (&key2, uid2),
         (&key2, uid3),
@@ -1500,8 +1664,16 @@ pub async fn test_reply(test: &mut TestServer) {
             .with_status(StatusCode::NO_CONTENT);
     }
     for name in [
-        "drain-r1", "drain-r2", "drain-r3", "drain-r4", "drain-r5", "drain-r7", "drain-r8",
+        "drain-r1",
+        "drain-r2",
+        "drain-r3",
+        "drain-r4",
+        "drain-r5",
+        "drain-r7",
+        "drain-r8",
         "drain-r9",
+        "drain-r11",
+        "drain-r12",
     ] {
         key1.client
             .request_with_headers("DELETE", &format!("{KEY1_CAL}{name}.ics"), [NO_REPLY], "")
@@ -1740,16 +1912,17 @@ pub async fn test_lease(test: &mut TestServer) {
     test_hooks::set_drain_retry_override(Some(0));
 
     // A. Drain versus drain (spec 6.3, 11). Two fan-outs for one UID
-    // publish the lower document id late. The late one is key1's PUT, held
-    // at the fan-out pause after its item's id was assigned; key1 holds
+    // publish one item late. The late one is key1's PUT, held at the
+    // fan-out pause (at 1.0 its item's id is assigned at commit, after the
+    // pause, so the late item has the higher id; ruling 80); key1 holds
     // its own creation lease for the UID while held, so the second
     // fan-out comes from another organizer, key3, whose PUT of the same
-    // UID contends on nothing and delivers the higher id. Session 1 drains
-    // the higher id and is held, holding key2's creation lease, right
-    // before its commit; the first PUT then commits the lower id. Session
+    // UID contends on nothing and delivers its item first. Session 1
+    // drains key3's item and is held, holding key2's creation lease, right
+    // before its commit; the first PUT then commits the late item. Session
     // 2 drains: both items find no event, the lease is busy, both stay
     // pending. Session 1 commits one copy (key3's invitation); its next
-    // request finds the lower id, whose ORGANIZER differs, and keeps it as
+    // request finds the late item, whose ORGANIZER differs, and keeps it as
     // history. Exactly one copy, both items drained.
     let uid = "za-drain-l1";
     let parked_put = HookParked::start(
@@ -1787,10 +1960,15 @@ pub async fn test_lease(test: &mut TestServer) {
     assert_eq!(parked_put.finish().await, 201, "the held PUT");
     let both = pending_ids(test, key2.id).await;
     assert_eq!(both.len(), 2);
+    // Ruling 80: the late item is the held PUT's, whatever its id. 1.0
+    // reserves an item's id in its batch at commit, after the fan-out
+    // pause, so it takes the higher id (0.16 assigned it before the pause:
+    // the lower one).
     assert!(
-        both[0] < both[1] && both[1] == high[0],
-        "the lower id arrived late: {both:?}"
+        both.contains(&high[0]),
+        "key3's item stays pending: {both:?}"
     );
+    let late_id = *both.iter().find(|id| **id != high[0]).unwrap();
     let waited = std::time::Instant::now();
     assert_eq!(
         trigger_drain(key2.name, &app).await,
@@ -1816,7 +1994,7 @@ pub async fn test_lease(test: &mut TestServer) {
     );
     assert_eq!(
         pending_ids(test, key2.id).await,
-        [both[0]],
+        [late_id],
         "the late item waits for a pass"
     );
     assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
@@ -1843,7 +2021,7 @@ pub async fn test_lease(test: &mut TestServer) {
             .get("key2@example.com"),
         Some(&key3_token)
     );
-    let late = stored_item(test, key2.id, both[0]).await;
+    let late = stored_item(test, key2.id, late_id).await;
     assert_eq!(late.flags & EVENT_NOTIFICATION_IS_CHANGE, 0);
     assert!(late.event_id.is_some());
     let copy_body = body(&key2.client, &copy).await;
@@ -1969,9 +2147,9 @@ pub async fn test_lease(test: &mut TestServer) {
     assert_eq!(za_uid_leases(test).await, 0);
 
     // D. The item deleted under a pass (Review Focus 1): session 1 holds
-    // the lease before its commit; session 2 deletes the item by href; the
-    // commit loses the item's assertion, nothing is imported, the lease is
-    // released, the request succeeds.
+    // the lease before its commit; the item is deleted; the commit loses the
+    // item's assertion, nothing is imported, the lease is released, the
+    // request succeeds.
     let uid4 = "za-drain-l4";
     key1.client
         .request_with_headers(
@@ -1990,17 +2168,10 @@ pub async fn test_lease(test: &mut TestServer) {
         trigger_drain(key2.name, STRONG),
     )
     .await;
-    test_hooks::set_drain_skip(key2.id);
-    let item_href = format!("{}{}.ics", key2.inbox(), item[0]);
-    assert_eq!(
-        crate::utils::http::HttpRequest::with_credentials(8899, key2.name, &app)
-            .send_full(hyper::Method::DELETE, &item_href, None, None)
-            .await
-            .status
-            .as_u16(),
-        204
-    );
-    test_hooks::clear_drain_skip(key2.id);
+    // Upgrade ruling 176 (B-M4): a client's DELETE of a pending item
+    // answers 404, so the item goes at store level (as the inbox expiry
+    // removed it before ruling 174), under the parked pass.
+    crate::utils::za::destroy_inbox_item(test, key2.id, item[0]).await;
     assert_eq!(session_1.finish().await, 207);
     assert_eq!(
         uid_copies(test, key2.id, uid4).await,
@@ -2550,7 +2721,7 @@ pub async fn test_errors(test: &mut TestServer) {
     rewrite_inbox_item(test, key2.id, corrupt, |item| {
         // The root's last entry is `X-ZA-KEY`; its text becomes garbage.
         let envelope = item.event.components[0].entries.last_mut().unwrap();
-        envelope.values = vec![ICalendarValue::Text("AAAA".to_string())];
+        envelope.values = vec![ICalendarValue::Text("AAAA".to_string())].into();
     })
     .await;
     assert_eq!(pending_ids(test, key2.id).await.len(), 2);
@@ -2784,6 +2955,146 @@ pub async fn test_errors(test: &mut TestServer) {
     }
     key1.delete_items_since(test, &start1).await;
     key2.delete_items_since(test, &start2).await;
+    assert_eq!(za_uid_leases(test).await, 0);
+    test.wait_for_tasks_skip_not_due().await;
+}
+
+/// Upgrade part 4c (Task 4's `incoming_timezone_update_survives_seal`, end to
+/// end): the organizer moves one occurrence of a weekly series into a
+/// timezone the attendee's copy does not have yet. The update reaches the
+/// attendee through the fan-out and the drain's merge (which propagates
+/// `itip_merge_changes`'s result at 1.0); the merged copy keeps the new
+/// VTIMEZONE and the override with its TZID, stores them sealed (the zone's
+/// name is content), and upstream's builder derives the instance times from
+/// the stored tree as from the plaintext: a time-range REPORT finds the
+/// moved occurrence at its new UTC time and not at its old one.
+pub async fn incoming_timezone_update_survives_seal(test: &mut TestServer) {
+    println!("Running zero-access incoming timezone update tests...");
+    let _drain = DrainOn::new();
+    let key1 = Party::new(test, "key1@example.com");
+    let key2 = Party::new(test, "key2@example.com");
+    let start1 = inbox_ids(test, key1.id).await;
+    let start2 = inbox_ids(test, key2.id).await;
+    let uid = "za-drain-tz-seal";
+    let organizer = format!("{KEY1_CAL}{uid}.ics");
+    let master = invite(uid, "20990105T090000Z", &["key2@example.com"]).replace(
+        "DURATION:PT1H",
+        "DURATION:PT1H\r\nRRULE:FREQ=WEEKLY;COUNT=4",
+    );
+    key1.client
+        .request_with_headers("PUT", &organizer, [CONTENT_TYPE], master.clone())
+        .await
+        .with_status(StatusCode::CREATED);
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    let href = copy_href(test, key2.id, uid).await;
+    let before = body(&key2.client, &href).await;
+    assert!(!before.contains("BEGIN:VTIMEZONE"), "{before}");
+
+    // The organizer's update: the master at SEQUENCE 1 and an override that
+    // moves the second occurrence to 15:00 Berlin (14:00Z in January).
+    let zone = concat!(
+        "BEGIN:VTIMEZONE\r\nTZID:Europe/Berlin\r\nBEGIN:STANDARD\r\n",
+        "DTSTART:19701025T030000\r\nRRULE:FREQ=YEARLY;BYDAY=-1SU;BYMONTH=10\r\n",
+        "TZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100\r\nTZNAME:tz-seal-name-canary\r\n",
+        "END:STANDARD\r\nBEGIN:DAYLIGHT\r\nDTSTART:19700329T020000\r\n",
+        "RRULE:FREQ=YEARLY;BYDAY=-1SU;BYMONTH=3\r\nTZOFFSETFROM:+0100\r\n",
+        "TZOFFSETTO:+0200\r\nTZNAME:CEST\r\nEND:DAYLIGHT\r\nEND:VTIMEZONE\r\n"
+    );
+    let series = master
+        .split_once("BEGIN:VEVENT")
+        .unwrap()
+        .1
+        .trim_end_matches("END:VCALENDAR\r\n")
+        .replace("SEQUENCE:0", "SEQUENCE:1");
+    let update = format!(
+        concat!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\n{zone}BEGIN:VEVENT{series}",
+            "BEGIN:VEVENT\r\nUID:{uid}\r\nDTSTAMP:20240101T000000Z\r\nSEQUENCE:1\r\n",
+            "RECURRENCE-ID:20990112T090000Z\r\nDTSTART;TZID=Europe/Berlin:20990112T150000\r\n",
+            "DURATION:PT1H\r\nSUMMARY:tz-seal-moved-canary\r\n",
+            "ORGANIZER:mailto:key1@example.com\r\n",
+            "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:key2@example.com\r\n",
+            "END:VEVENT\r\nEND:VCALENDAR\r\n"
+        ),
+        zone = zone,
+        series = series,
+        uid = uid
+    );
+    key1.client
+        .request_with_headers("PUT", &organizer, [CONTENT_TYPE], update)
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    assert_eq!(
+        pending_ids(test, key2.id).await.len(),
+        1,
+        "the update reached key2"
+    );
+    assert_eq!(trigger_drain(key2.name, STRONG).await, 207);
+    assert!(pending_ids(test, key2.id).await.is_empty());
+    assert_eq!(uid_copies(test, key2.id, uid).await, 1);
+
+    // The merged copy as key2's client reads it.
+    let merged = body(&key2.client, &href).await;
+    assert!(
+        merged.contains("TZID:Europe/Berlin")
+            && merged.contains("TZNAME:tz-seal-name-canary")
+            && merged.contains("RECURRENCE-ID:20990112T090000Z")
+            && merged.contains("DTSTART;TZID=Europe/Berlin:20990112T150000")
+            && merged.contains("tz-seal-moved-canary"),
+        "{merged}"
+    );
+    // As stored: sealed, the rules and the TZID visible, the name sealed.
+    let (records, copy_id) = raw_event_records(test, key2.id, &relative(&href)).await;
+    let stored = records.tree().to_string();
+    assert!(
+        stored.contains("X-ZA-KEY:")
+            && stored.contains("TZID:Europe/Berlin")
+            && stored.contains("DTSTART;TZID=Europe/Berlin:20990112T150000"),
+        "{stored}"
+    );
+    for canary in ["tz-seal-name-canary", "tz-seal-moved-canary", "fo-title"] {
+        assert!(
+            !records.bytes().contains(canary),
+            "{canary} stored in the clear"
+        );
+    }
+    assert_no_event_preferences(test, key2.id, copy_id).await;
+    // Upstream's builder derives the instances from the stored tree.
+    let report = |start: &str, end: &str| {
+        format!(
+            "<C:calendar-query xmlns:D=\"DAV:\" xmlns:C=\"urn:ietf:params:xml:ns:caldav\"><D:prop><D:getetag/></D:prop><C:filter><C:comp-filter name=\"VCALENDAR\"><C:comp-filter name=\"VEVENT\"><C:time-range start=\"{start}\" end=\"{end}\"/></C:comp-filter></C:comp-filter></C:filter></C:calendar-query>"
+        )
+    };
+    let calendar = "/dav/cal/key2%40example.com/default/";
+    let mut found = Vec::new();
+    for (start, end) in [
+        ("20990112T135500Z", "20990112T140500Z"),
+        ("20990112T085500Z", "20990112T090500Z"),
+        ("20990119T085500Z", "20990119T090500Z"),
+    ] {
+        let response = key2
+            .client
+            .request_with_headers("REPORT", calendar, [("depth", "1")], report(start, end))
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+        found.push(response.hrefs().contains(&href.as_str()));
+    }
+    assert_eq!(
+        found,
+        [true, false, true],
+        "moved occurrence, its old slot, the next occurrence"
+    );
+
+    key2.client
+        .request_with_headers("DELETE", &href, [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    key1.client
+        .request_with_headers("DELETE", &organizer, [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    key2.delete_items_since(test, &start2).await;
+    key1.delete_items_since(test, &start1).await;
     assert_eq!(za_uid_leases(test).await, 0);
     test.wait_for_tasks_skip_not_due().await;
 }

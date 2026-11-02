@@ -403,10 +403,10 @@ impl DummyWebDavClient {
         for (key, _) in &expect_set {
             patch_prop.get(key.as_ref()).with_status(StatusCode::OK);
         }
+        // 1.0 answers a removed property 200 OK in its propstat (RFC 4918
+        // 9.2.1); 0.16 answered 204.
         for key in &expect_remove {
-            patch_prop
-                .get(key.as_ref())
-                .with_status(StatusCode::NO_CONTENT);
+            patch_prop.get(key.as_ref()).with_status(StatusCode::OK);
         }
 
         let response = self
@@ -825,6 +825,7 @@ impl DavResponse {
         let mut href_status = StatusCode::OK;
         let mut props = Vec::new();
         let mut prop = DavItem::default();
+        let mut empty_namespace: Option<String> = None;
 
         for (key, value) in &result.response.xml {
             match key.as_str() {
@@ -871,6 +872,20 @@ impl DavResponse {
                             props.push(std::mem::take(&mut prop));
                         }
 
+                        // 1.0 declares the empty default namespace on an
+                        // unprefixed element (`xmlns=""`): the attribute
+                        // stands for the element, as an empty value, which
+                        // the element's text replaces when it has one.
+                        if let Some(element) = prop_name.strip_suffix(".[xmlns]")
+                            && value.is_empty()
+                        {
+                            prop.values
+                                .entry(element.to_string())
+                                .or_default()
+                                .push(String::new());
+                            empty_namespace = Some(element.to_string());
+                            continue;
+                        }
                         let (prop_name, prop_value) =
                             if let Some((prop_name, prop_sub_name)) = prop_name.split_once('.') {
                                 if value.is_empty() {
@@ -881,10 +896,15 @@ impl DavResponse {
                             } else {
                                 (prop_name, value.to_string())
                             };
-                        prop.values
-                            .entry(prop_name.to_string())
-                            .or_default()
-                            .push(prop_value);
+                        let values = prop.values.entry(prop_name.to_string()).or_default();
+                        if empty_namespace
+                            .take()
+                            .is_some_and(|element| element == prop_name)
+                            && values.last().is_some_and(|value| value.is_empty())
+                        {
+                            values.pop();
+                        }
+                        values.push(prop_value);
                     }
                 }
             }
@@ -1143,7 +1163,7 @@ fn undeclared_xml_prefix(xml: &str) -> Option<String> {
         };
 
         if matches!(resolved, ResolveResult::Unknown(_)) {
-            return Some(String::from_utf8_lossy(name.as_ref()).into_owned());
+            return Some(AsRef::<str>::as_ref(&name).to_string());
         }
 
         buf.clear();
@@ -1161,12 +1181,12 @@ fn flatten_xml(xml: &str) -> Vec<(String, String)> {
     loop {
         match reader.read_event_into(&mut buf).unwrap() {
             Event::Start(ref e) => {
-                let name = str::from_utf8(e.name().as_ref()).unwrap().to_string();
+                let name = e.name().as_ref().to_string();
                 path.push(name);
                 let base_path = path.join(".");
                 for attr in e.attributes() {
                     let attr = attr.unwrap();
-                    let key = str::from_utf8(attr.key.as_ref()).unwrap().to_string();
+                    let key = attr.key.as_ref().to_string();
                     let value = attr.normalized_value(XmlVersion::Implicit1_0).unwrap();
                     let value_str = value.trim().to_string();
 
@@ -1175,13 +1195,13 @@ fn flatten_xml(xml: &str) -> Vec<(String, String)> {
                 text_content = None;
             }
             Event::Empty(ref e) => {
-                let name = str::from_utf8(e.name().as_ref()).unwrap().to_string();
+                let name = e.name().as_ref().to_string();
                 let base_path = format!("{}.{}", path.join("."), name);
                 let mut has_attrs = false;
 
                 for attr in e.attributes() {
                     let attr = attr.unwrap();
-                    let key = str::from_utf8(attr.key.as_ref()).unwrap().to_string();
+                    let key = attr.key.as_ref().to_string();
                     let value = attr.normalized_value(XmlVersion::Implicit1_0).unwrap();
                     let value_str = value.trim().to_string();
                     has_attrs = true;
@@ -1193,7 +1213,7 @@ fn flatten_xml(xml: &str) -> Vec<(String, String)> {
                 }
             }
             Event::Text(e) => {
-                let text = e.xml_content(XmlVersion::Implicit1_0).unwrap();
+                let text = e.xml_content(XmlVersion::Implicit1_0);
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {
                     if let Some(text_content) = text_content.as_mut() {
@@ -1204,20 +1224,18 @@ fn flatten_xml(xml: &str) -> Vec<(String, String)> {
                 }
             }
             Event::GeneralRef(entity) => {
-                let entity_slice: &[u8] = entity.as_ref();
+                let entity_slice: &str = entity.as_ref();
                 let value: Cow<str> = match entity_slice {
-                    b"lt" => "<".into(),
-                    b"gt" => ">".into(),
-                    b"amp" => "&".into(),
-                    b"apos" => "'".into(),
-                    b"quot" => "\"".into(),
+                    "lt" => "<".into(),
+                    "gt" => ">".into(),
+                    "amp" => "&".into(),
+                    "apos" => "'".into(),
+                    "quot" => "\"".into(),
                     _ => {
                         if let Ok(Some(gr)) = entity.resolve_char_ref() {
                             gr.to_string().into()
                         } else {
-                            std::str::from_utf8(entity.as_ref())
-                                .unwrap_or_default()
-                                .into()
+                            entity_slice.to_string().into()
                         }
                     }
                 };
@@ -1229,7 +1247,7 @@ fn flatten_xml(xml: &str) -> Vec<(String, String)> {
                 }
             }
             Event::CData(e) => {
-                text_content = Some(std::str::from_utf8(e.as_ref()).unwrap().to_string());
+                text_content = Some(e.as_ref().to_string());
             }
             Event::End(_) => {
                 if let Some(text) = text_content.take() {

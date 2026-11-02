@@ -6,7 +6,7 @@
 
 use crate::utils::server::{TestServer, TestServerBuilder};
 use ::registry::schema::{
-    enums::{NetworkListenerProtocol, Permission},
+    enums::{ClientIpSource, NetworkListenerProtocol, Permission},
     prelude::Property,
     structs::{Expression, Http, Imap, MtaStageAuth, Rate},
 };
@@ -14,6 +14,7 @@ use ::registry::types::duration::Duration;
 use common::za::test_hooks;
 
 pub mod app_password;
+pub mod cache_swap;
 pub mod caches;
 pub mod cors;
 pub mod dav_gate;
@@ -88,14 +89,14 @@ pub async fn za_tests() {
     admin
         .registry_update_setting(
             Http {
-                use_x_forwarded: true,
+                client_ip_source: ClientIpSource::XForwardedFor,
                 rate_limit_anonymous: Some(Rate {
                     count: 10000,
                     period: Duration::from_millis(60000),
                 }),
                 ..Default::default()
             },
-            &[Property::UseXForwarded, Property::RateLimitAnonymous],
+            &[Property::ClientIpSource, Property::RateLimitAnonymous],
         )
         .await;
     // The cache module logs a key account in over plain-text IMAP.
@@ -132,6 +133,8 @@ pub async fn za_tests() {
 
     setup::test(&mut test).await;
     setup::test_data_check(&mut test).await;
+    setup::test_grants_die_with_the_marker(&mut test).await;
+    setup::test_setup_token_concurrency(&mut test).await;
     disabled::test(&mut test).await;
     password::test(&mut test).await;
     app_password::test(&mut test).await;
@@ -147,10 +150,13 @@ pub async fn za_tests() {
     dav_seal::test_collections(&mut test).await;
     dav_seal::test_conditional(&mut test).await;
     dav_seal::test_legacy(&mut test).await;
+    dav_seal::test_dead_properties(&mut test).await;
+    dav_seal::split_metadata_only_update_keeps_sealed_content(&mut test).await;
     fanout::test_task_queue(&mut test).await;
     fanout::test(&mut test).await;
     fanout::test_failures(&mut test).await;
     fanout::test_plain_owner(&mut test).await;
+    fanout::test_storage_guards(&mut test).await;
     reply::test(&mut test).await;
     uid_lease::test(&mut test).await;
     drain::test(&mut test).await;
@@ -159,12 +165,18 @@ pub async fn za_tests() {
     drain::test_lease(&mut test).await;
     drain::test_cursor(&mut test).await;
     drain::test_errors(&mut test).await;
+    drain::incoming_timezone_update_survives_seal(&mut test).await;
     drain_limits::test(&mut test).await;
     pinning::test(&mut test).await;
     sharing_move_atomic::test(&mut test).await;
     sharing_tombstones::test(&mut test).await;
     sharing_review::test(&mut test).await;
     sharing::test(&mut test).await;
+    sharing::sharing_class_differential(&mut test).await;
+    sharing::sharing_class_inbound(&mut test).await;
+    sharing::cleanup_cannot_restore_revoked_ring(&mut test).await;
+    sharing::revoke_cleanup_does_not_rewrite_sealed_event(&mut test).await;
+    sharing::conversion_carries_dead_property_containers(&mut test).await;
     sharing_races::test(&mut test).await;
     sweep::test(&mut test).await;
     tracing::test(&mut test).await;
@@ -172,6 +184,7 @@ pub async fn za_tests() {
     expansion::test(&mut test).await;
     gating::test(&mut test).await;
     gating::test_scheduling(&mut test).await;
+    gating::test_metadata(&mut test).await;
     websocket::test(&mut test).await;
     pairs::test(&mut test).await;
     inbox::test(&mut test).await;
@@ -184,6 +197,11 @@ pub async fn za_tests() {
     leak::test_index_control(&mut test).await;
     index_task::test(&mut test).await;
     index_task::test_sealed_archive(&mut test).await;
+    index_task::test_destroyed_stub(&mut test).await;
+    index_task::test_reindex(&mut test).await;
+    index_task::test_attachment_indexer(&mut test).await;
+    index_task::test_index_retry(&mut test).await;
+    index_task::test_mid_pass_provisioning(&mut test).await;
     mail::login::test(&mut test).await;
     mail::delivery::test(&mut test).await;
     mail::writes::test(&mut test).await;
@@ -193,6 +211,9 @@ pub async fn za_tests() {
     mail::gates::test(&mut test).await;
     mail::search::test(&mut test).await;
     mail::traces::test(&mut test).await;
+    // Last: part 6a expects this case to reproduce a recorded residual (the
+    // destroy window), and a failure here loses no other module.
+    index_task::test_mid_pass_deletion(&mut test).await;
 
     destroy_key_accounts(&test).await;
     test.assert_is_empty().await;

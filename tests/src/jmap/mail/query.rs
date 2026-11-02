@@ -25,7 +25,7 @@ use store::{
     ahash::AHashMap,
     write::{BatchBuilder, now},
 };
-use types::{collection::Collection, id::Id, special_use::SpecialUse};
+use types::{collection::Collection, id::Id};
 
 const MAX_THREADS: usize = 100;
 const MAX_MESSAGES: usize = 1000;
@@ -51,12 +51,13 @@ pub async fn test(test: &TestServer) {
                 .with_document(mailbox_id)
                 .custom(ObjectIndexBuilder::<(), _>::new().with_changes(Mailbox {
                     name: format!("Mailbox {mailbox_id}"),
-                    role: SpecialUse::None,
                     parent_id: 0,
                     sort_order: None,
                     uid_validity: 0,
                     subscribers: vec![],
                     acls: vec![],
+                    // 1.0 keeps the role in the flags; 0 is no role.
+                    flags: 0,
                 }))
                 .unwrap();
         }
@@ -64,7 +65,7 @@ pub async fn test(test: &TestServer) {
             .core
             .storage
             .data
-            .write(batch.build_all())
+            .write_batch(&mut batch)
             .await
             .unwrap();
 
@@ -78,9 +79,8 @@ pub async fn test(test: &TestServer) {
                 .await
                 .unwrap()
                 .emails
-                .items
                 .iter()
-                .map(|m| m.thread_id)
+                .map(|m| m.thread_id())
                 .collect::<AHashSet<_>>()
                 .len(),
             MAX_THREADS
@@ -306,10 +306,12 @@ pub async fn query(client: &Client, can_stem: bool) {
                 email::query::Comparator::from(),
                 email::query::Comparator::sent_at(),
             ],
+            // 1.0's `after` is inclusive (RFC 8621 4.4.1), so the four messages
+            // received at 1875 (N01558, N01952, N02120, T10251) match.
             vec![
-                "N01559", "N02123", "N01940", "N03594", "N01494", "N04271", "N04326", "N01610",
-                "N02920", "N01587", "T00167", "T00168", "N01554", "N01535", "N01536", "N01622",
-                "N01754", "N01594",
+                "N01559", "N02123", "N01558", "N01952", "N02120", "N01940", "N03594", "N01494",
+                "T10251", "N04271", "N04326", "N01610", "N02920", "N01587", "T00167", "T00168",
+                "N01554", "N01535", "N01536", "N01622", "N01754", "N01594",
             ],
         ),
         (
@@ -322,10 +324,11 @@ pub async fn query(client: &Client, can_stem: bool) {
                 email::query::Comparator::from(),
                 email::query::Comparator::sent_at(),
             ],
+            // The 1875 messages, as above (`after` is inclusive at 1.0).
             vec![
                 "N04326", "N01610", "N02920", "N01587", "T00167", "T00168", "N01554", "N01535",
-                "N01536", "N01622", "N01754", "N01594", "N01559", "N02123", "N01940", "N03594",
-                "N01494", "N04271",
+                "N01536", "N01622", "N01754", "N01594", "N01559", "N02123", "N01558", "N01952",
+                "N02120", "N01940", "N03594", "N01494", "T10251", "N04271",
             ],
         ),
         (
@@ -335,7 +338,7 @@ pub async fn query(client: &Client, can_stem: bool) {
                 (email::query::Filter::has_keyword("T")),
             ]),
             vec![
-                email::query::Comparator::has_keyword("attributed to"),
+                email::query::Comparator::has_keyword("attributed_to"),
                 email::query::Comparator::from(),
                 email::query::Comparator::sent_at(),
             ],
@@ -355,7 +358,7 @@ pub async fn query(client: &Client, can_stem: bool) {
                 (email::query::Filter::has_keyword("T")),
             ]),
             vec![
-                email::query::Comparator::has_keyword("attributed to").descending(),
+                email::query::Comparator::has_keyword("attributed_to").descending(),
                 email::query::Comparator::from(),
                 email::query::Comparator::sent_at(),
             ],
@@ -813,7 +816,10 @@ pub async fn create(test: &TestServer, account: &Account) {
                 || keyword == "artist"
                 || keyword == "Bronze"
             {
-                keywords.push(keyword);
+                // 1.0 refuses a keyword holding a space ("Invalid keyword.",
+                // RFC 8621's IMAP atom), so "attributed to" is stored as
+                // "attributed_to".
+                keywords.push(keyword.replace(' ', "_"));
             }
         }
 

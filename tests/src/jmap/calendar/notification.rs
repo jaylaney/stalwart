@@ -120,17 +120,23 @@ pub async fn test(test: &TestServer) {
             .await;
         let notification = &response.list()[0];
         *event_id = notification.text_field("calendarEventId").to_string();
+        // 1.0 names the changer's calendar address, returns the requested
+        // comment and eventPatch as null, and the event's JSCalendar version
+        // and server-set created timestamp.
         notification.assert_is_equal(json!({
           "id": &notification_id,
           "created": &notification.text_field("created"),
           "changedBy": {
             "name": "John Doe",
             "email": "jdoe@example.com",
-            "principalId": &john_id
+            "principalId": &john_id,
+            "calendarAddress": "mailto:jdoe@example.com"
           },
+          "comment": null,
           "type": "created",
           "calendarEventId": event_id,
           "isDraft": false,
+          "eventPatch": null,
           "event": john_event
             .clone()
             .with_property(
@@ -138,6 +144,12 @@ pub async fn test(test: &TestServer) {
                 notification
                     .text_field("event/updated")
             )
+            .with_property(
+                "created",
+                notification
+                    .text_field("event/created")
+            )
+            .with_property("version", "2.0")
         }));
 
         // Verify the event exists
@@ -212,18 +224,21 @@ pub async fn test(test: &TestServer) {
                 "name": "Jane Smith",
                 "email": "jane.smith@example.com",
                 "principalId": &jane_id,
+                "calendarAddress": "mailto:jane.smith@example.com",
             })
         } else {
             json!({
                 "name": "Bill Foobar",
                 "email": "bill@example.com",
                 "principalId": &bill_id,
+                "calendarAddress": "mailto:bill@example.com",
             })
         };
 
         response.list()[0].assert_is_equal(json!({
             "id": &notification_id,
             "changedBy": changed_by,
+            "comment": null,
             "type": "updated",
             "calendarEventId": &john_event_id,
             "isDraft": false
@@ -367,8 +382,10 @@ pub async fn test(test: &TestServer) {
         "changedBy": {
             "name": "John Doe",
             "email": "jdoe@example.com",
-            "principalId": &john_id
+            "principalId": &john_id,
+            "calendarAddress": "mailto:jdoe@example.com"
         },
+        "comment": null,
         "type": "updated",
         "calendarEventId": &bill_event_id,
         "isDraft": false

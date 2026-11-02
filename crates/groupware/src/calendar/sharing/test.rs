@@ -45,7 +45,7 @@ pub fn prepare_shared_calendar(
         collection_keys,
         ring.reverting,
     )?;
-    let (envelope, bundle) = seal_shared_properties(&calendar.dead_properties, &domain)?;
+    let (envelope, bundle) = seal_shared_properties(&domain)?;
     let entries = calendar
         .preferences
         .iter()
@@ -65,7 +65,6 @@ pub fn prepare_shared_calendar(
             Ok(sealed)
         })
         .collect::<Result<Vec<_>, SealError>>()?;
-    calendar.dead_properties = Default::default();
     let acls = calendar.acls.clone();
     za_replace_calendar_entries(&mut calendar, keys.account_id, calendar_id, entries, acls)?;
     Ok(calendar)

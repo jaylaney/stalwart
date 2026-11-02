@@ -140,10 +140,13 @@ pub async fn test(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
         modseqs[0]
     ))
     .await;
+    // 1.0 lists every UID expunged from the mailbox since the modseq, including
+    // UIDs created and expunged after it (0.16 netted them out of its change log).
     imap.assert_read(Type::Tagged, ResponseType::Ok)
         .await
         .assert_count("FETCH (", 3)
-        .assert_count("VANISHED", 0);
+        .assert_count("VANISHED", 1)
+        .assert_contains("VANISHED (EARLIER) 1:2");
 
     // Fetch changes since SEQ 1, UID MOVE should count as a deletion
     imap.send(&format!(
@@ -231,10 +234,13 @@ pub async fn test(imap: &mut ImapConnection, imap_check: &mut ImapConnection) {
     imap_check
         .send(&format!("SEARCH MODSEQ {}", modseqs[4]))
         .await;
+    // 1.0's MODSEQ criterion is inclusive (RFC 7162 3.1.5: equal to or greater
+    // than), so UID 3, last changed at that modseq, matches; 0.16 read the
+    // change log after it.
     imap_check
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_contains("SEARCH 2 3 (MODSEQ");
+        .assert_contains("SEARCH 1 2 3 (MODSEQ");
 
     // Store unchanged since
     imap.send(&format!(

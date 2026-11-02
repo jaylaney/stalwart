@@ -68,7 +68,7 @@ async fn milter_session() {
                 else_: "true".into(),
                 ..Default::default()
             },
-            hostname: "127.0.0.1".into(),
+            host: "127.0.0.1".into(),
             port: 9332,
             use_tls: false,
             stages: Map::new(vec![MtaStage::Data]),
@@ -657,10 +657,18 @@ async fn milter_client_test() {
 
     let r = client.data().await.unwrap();
     println!("DATA: {:?}", r);
-    let r = client.headers(message.headers_raw()).await.unwrap();
+    let r = client
+        .headers(message.root_part().headers().iter().map(|header| {
+            (
+                header.raw_name(),
+                std::str::from_utf8(header.raw_value()).unwrap(),
+            )
+        }))
+        .await
+        .unwrap();
     println!("HEADERS: {:?}", r);
     let r = client
-        .body(&message.raw_message()[message.root_part().raw_body_offset() as usize..])
+        .body(&message.raw()[message.root_part().offset_body() as usize..])
         .await
         .unwrap();
     println!("BODY: {:?}", r);

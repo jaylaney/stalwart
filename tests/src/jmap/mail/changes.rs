@@ -156,7 +156,7 @@ pub async fn test(test: &TestServer) {
                         .log_item_delete(SyncCollection::Email, None);
                 }
                 LogAction::UpdateChild(id) => {
-                    batch.log_container_property_change(SyncCollection::Email, id as u32);
+                    batch.log_container_property_change(SyncCollection::Email, (id as u32).into());
                 }
                 LogAction::Move(old_id, new_id) => {
                     batch
@@ -172,9 +172,14 @@ pub async fn test(test: &TestServer) {
             .core
             .storage
             .data
-            .write(batch.build_all())
+            .write_batch(&mut batch)
             .await
             .unwrap();
+        // A raw write skips `commit_batch`'s cache invalidation, and 1.0 serves a
+        // message-cache snapshot for up to 5 s without revalidating it.
+        server
+            .inner
+            .mark_cache_stale(account.id().document_id(), SyncCollection::Email);
 
         let mut new_state = State::Initial;
         for (test_num, state) in (states).iter().enumerate() {

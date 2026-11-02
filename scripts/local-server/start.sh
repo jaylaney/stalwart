@@ -7,7 +7,7 @@
 #
 
 # Phase 2: normal mode. Listeners come from the registry (created by provision.sh):
-# HTTP on 8080 (plain), HTTPS on 8443 (TLS), IMAP on 1143 (plain).
+# HTTP on 8080 (plain), HTTPS on 8443 (TLS), IMAP on 1143 (plain with STARTTLS).
 # Runs in the foreground from the state directory ($ZA_RUN_DIR); see env.sh for the settings.
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/env.sh"

@@ -81,30 +81,57 @@
 //!   account (`http::api::vault`, mail spec 6.1's recheck).
 //! - `FORCE_SQL_STORE`: `setup-token` answers as on PostgreSQL or MySQL
 //!   (mail spec 6.1).
-//! - `INDEX_WRITE_PAUSE`: in the index worker after its documents are built
-//!   and immediately before the search store's write, keyed by the account
-//!   of an `IndexDocument` task of the batch
-//!   (`services::task_manager::index`, mail ruling R54).
+//! - `INDEX_WRITE_PAUSE`: in the index worker after a pass's documents are
+//!   built and immediately before the search store's write, keyed by the
+//!   partition's account, for a pass that holds a document to write (mail
+//!   ruling R54). At 0.16 its call site was `services::task_manager::index`;
+//!   at 1.0 it is `services::index_queue::index::process_items`, before
+//!   `Sink::flush`. The pass's queue entries stay stored while it is held.
 //! - `TRAIN_PAUSE`: in `add_account_spam_sample` after the message's
 //!   metadata read and before the sample is added to the batch, keyed by
 //!   the sample's account (`email::message::ingest`, mail ruling R55).
-//! - `INDEX_CHUNK_PAUSE`: in `Store::index` after a multi-chunk document's
-//!   first commit chunk and before its second, keyed by the document's
-//!   account (`store::search::index`, mail ruling R62); defined in
-//!   `store::za_test` and re-exported here.
-//! - `INDEX_GUARD_FAIL_ONCE`: the account's next later commit chunk of a
-//!   guarded search document is not written and fails with
-//!   `AssertValueFailed`, as FoundationDB reports a read error at the
-//!   guard's assertion (`store::search::index`, mail ruling R63); defined in
-//!   `store::za_test` and re-exported here.
+//! - `INDEX_CHUNK_PAUSE`: in `Store::index_account_documents` after an
+//!   index pass's first commit chunk and before its second, keyed by the
+//!   pass's account (`store::search::index`); defined in `store::za_test`
+//!   and re-exported here. 0.16's `INDEX_GUARD_FAIL_ONCE` is retired with
+//!   R62's per-chunk guard and R63's confirmation read (Task 6, ruling 19).
+//! - `FORCE_COMMIT_SPLIT` (ruling 18): while it names an account, every
+//!   `BatchBuilder::commit_point()` of a batch whose current account is that
+//!   account, or of a batch with no current account, adds a commit point.
+//!   The second kind also covers batches that are not the test's: other
+//!   accounts' search-index passes, the index queue's bookkeeping batch and
+//!   registry-mapping batches split too while it is set. Defined in
+//!   `store::za_test`; set it through `ForceCommitSplit`, whose drop clears
+//!   it, so a test that panics while it is set does not leave every later
+//!   batch splitting.
+//! - `PROPFIND_ADMITTED_PAUSE` (upgrade ruling 142): in a foreign key
+//!   account's calendar PROPFIND, after `foreign_calendar_contexts` admitted
+//!   the calendars and before any item is read, keyed by the requesting
+//!   principal (`dav::common::propfind::za`).
 
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
 };
-pub use store::za_test::{
-    INDEX_GUARD_FAIL_ONCE, Pause, set_index_chunk_pause, set_index_guard_fail_once,
-};
+pub use store::za_test::{FORCE_COMMIT_SPLIT, Pause, set_index_chunk_pause};
+
+/// Sets `FORCE_COMMIT_SPLIT` to `account_id` for the guard's lifetime; the
+/// drop clears it, also when the test panics.
+#[must_use = "dropping the guard clears FORCE_COMMIT_SPLIT"]
+pub struct ForceCommitSplit(());
+
+impl ForceCommitSplit {
+    pub fn new(account_id: u32) -> Self {
+        store::za_test::set_force_commit_split(Some(account_id));
+        ForceCommitSplit(())
+    }
+}
+
+impl Drop for ForceCommitSplit {
+    fn drop(&mut self) {
+        store::za_test::set_force_commit_split(None);
+    }
+}
 
 pub static FAN_OUT_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
 
@@ -731,4 +758,15 @@ pub fn set_calendar_history_purge_pause(pause: Option<Arc<Pause>>) {
 }
 pub async fn calendar_history_purge_pause_point(owner: u32) {
     wait(take_for(&CALENDAR_HISTORY_PURGE_PAUSE, owner)).await;
+}
+
+/// Foreign calendar PROPFIND after `foreign_calendar_contexts`' fresh own-id
+/// admission and before any item is read (upgrade ruling 142), keyed by the
+/// requesting principal (the grantee), so the owner's own requests pass.
+pub static PROPFIND_ADMITTED_PAUSE: Mutex<Option<Arc<Pause>>> = Mutex::new(None);
+pub fn set_propfind_admitted_pause(pause: Option<Arc<Pause>>) {
+    set_slot(&PROPFIND_ADMITTED_PAUSE, pause);
+}
+pub async fn propfind_admitted_pause_point(reader: u32) {
+    wait(take_for(&PROPFIND_ADMITTED_PAUSE, reader)).await;
 }

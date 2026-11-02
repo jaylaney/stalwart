@@ -83,7 +83,8 @@ pub async fn test(
     imap_jane
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_equals("* LISTRIGHTS \"INBOX\" \"jdoe@example.com\" r l ws i et k x p a");
+        // 1.0 lists the METADATA annotation right `n` (RFC 5464 6).
+        .assert_equals("* LISTRIGHTS \"INBOX\" \"jdoe@example.com\" r l ws i et k x p n a");
 
     // Jane shares her Inbox to John, expect a Shared Folders item in John's list
     imap_jane.send("SETACL INBOX jdoe@example.com lr").await;
@@ -98,10 +99,12 @@ pub async fn test(
 
     // Grant access to Bill and check ACLs
     imap_jane.send("GETACL INBOX").await;
+    // 1.0 lists rights in RFC 4314 order (l r s w i p k x t e n a); 0.16
+    // listed them in its own order (`rl`, `tewsrxl`).
     imap_jane
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_contains("\"jdoe@example.com\" rl");
+        .assert_contains("\"jdoe@example.com\" lr");
 
     imap_jane
         .send("SETACL INBOX foobar@example.com lrxtws")
@@ -112,8 +115,8 @@ pub async fn test(
     imap_jane
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_contains("\"jdoe@example.com\" rl")
-        .assert_contains("\"foobar@example.com\" tewsrxl");
+        .assert_contains("\"jdoe@example.com\" lr")
+        .assert_contains("\"foobar@example.com\" lrswxte");
 
     imap_bill.send("LIST \"\" \"*\"").await;
     imap_bill
@@ -135,7 +138,7 @@ pub async fn test(
     imap_john
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_equals("* MYRIGHTS \"Shared Folders/jane.smith@example.com/INBOX\" rl");
+        .assert_equals("* MYRIGHTS \"Shared Folders/jane.smith@example.com/INBOX\" lr");
 
     // John should not be able to append messages
     assert_append_message(
@@ -156,7 +159,7 @@ pub async fn test(
     imap_john
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_equals("* MYRIGHTS \"Shared Folders/jane.smith@example.com/INBOX\" rli");
+        .assert_equals("* MYRIGHTS \"Shared Folders/jane.smith@example.com/INBOX\" lri");
     assert_append_message(
         imap_john,
         "Shared Folders/jane.smith@example.com/INBOX",
@@ -372,7 +375,7 @@ pub async fn test(
     imap_jane
         .assert_read(Type::Tagged, ResponseType::Ok)
         .await
-        .assert_contains("\"jdoe@example.com\" rl")
+        .assert_contains("\"jdoe@example.com\" lr")
         .assert_count("foobar@example.com", 0);
 
     // Bill should not have access to Jane's Inbox anymore

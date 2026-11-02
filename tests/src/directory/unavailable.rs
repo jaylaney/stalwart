@@ -4,7 +4,10 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use directory::{Credentials, Directory, UnavailableDirectory, backend::oidc::OpenIdDirectory};
+use directory::{
+    Credentials, Directory, UnavailableDirectory, backend::oidc::OpenIdDirectory,
+    core::verifier::PasswordVerifier,
+};
 use registry::{
     schema::{enums::DirectoryType, structs},
     types::map::Map,
@@ -24,9 +27,9 @@ pub async fn test() {
         claim_name: None,
         claim_groups: None,
         username_domain: None,
-        require_audience: None,
-        require_scopes: Map::new(vec![]),
         member_tenant_id: None,
+        accepted_audiences: Map::new(vec![]),
+        ..Default::default()
     })
     .await
     .expect_err("Discovery against an unreachable issuer must fail");
@@ -38,20 +41,26 @@ pub async fn test() {
 
     let oidc = Directory::Unavailable(UnavailableDirectory::new(DirectoryType::Oidc, error));
     assert!(
-        oidc.authenticate(&Credentials::Basic {
-            username: "john.doe@example.org".to_string(),
-            secret: "this is an OIDC password".to_string(),
-            mfa_token: None,
-        })
+        oidc.authenticate(
+            &Credentials::Basic {
+                username: "john.doe@example.org".to_string(),
+                secret: "this is an OIDC password".to_string(),
+                mfa_token: None,
+            },
+            &PasswordVerifier::default(),
+        )
         .await
         .is_err(),
         "Password authentication must not fall back to internal credentials"
     );
     assert!(
-        oidc.authenticate(&Credentials::Bearer {
-            username: None,
-            token: "not a token".to_string(),
-        })
+        oidc.authenticate(
+            &Credentials::Bearer {
+                username: None,
+                token: "not a token".to_string(),
+            },
+            &PasswordVerifier::default(),
+        )
         .await
         .is_err()
     );
@@ -64,11 +73,14 @@ pub async fn test() {
         "LDAP bind password is required when bind DN is set",
     ));
     assert!(
-        ldap.authenticate(&Credentials::Basic {
-            username: "john.doe@example.org".to_string(),
-            secret: "this is John's LDAP password".to_string(),
-            mfa_token: None,
-        })
+        ldap.authenticate(
+            &Credentials::Basic {
+                username: "john.doe@example.org".to_string(),
+                secret: "this is John's LDAP password".to_string(),
+                mfa_token: None,
+            },
+            &PasswordVerifier::default(),
+        )
         .await
         .is_err()
     );

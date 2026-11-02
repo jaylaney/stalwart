@@ -322,29 +322,39 @@ pub async fn alarm(test: &TestServer) {
         )
         .await
         .with_status(StatusCode::CREATED);
-    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
-    let messages = test
-        .server
-        .get_cached_messages(client.account_id)
-        .await
-        .unwrap();
-    assert_eq!(messages.emails.items.len(), 2);
+    // Ruling 129: both alarms fall due about 5 s from now; their delivery is
+    // awaited for a bounded time, as `cal_alarm` waits (a fixed 6 s wait
+    // failed once while the alarm task and the delivery ran on their own).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let messages = loop {
+        let messages = test
+            .server
+            .get_cached_messages(client.account_id)
+            .await
+            .unwrap();
+        if messages.emails.len() >= 2 || std::time::Instant::now() >= deadline {
+            break messages;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    };
+    assert_eq!(messages.emails.len(), 2);
     // Spec 11: the generic email still carries the event's start time.
     let start = TextFormatter::new("en").unwrap().field_to_string(
         &ItipValue::Time(ItipTime {
             start,
             tz_id: Tz::UTC.as_id(),
+            kind: Default::default(),
         }),
         DateStyle::Short,
     );
-    for message in messages.emails.items.iter() {
+    for message in messages.emails.iter() {
         // Mail spec 5.1: a key account's message is stored sealed, so it is
         // read opened with the account's keys.
         let (_, contents) = open_message(
             test,
             client.account_id,
             account.secret(),
-            message.document_id,
+            message.document_id(),
         )
         .await;
         let message = MessageParser::new().parse(&contents).unwrap();
@@ -361,14 +371,8 @@ pub async fn alarm(test: &TestServer) {
             "recipient is the account address, not the alarm attendee"
         );
         let html =
-            String::from_utf8(message.html_bodies().next().unwrap().contents().to_vec()).unwrap();
-        let text = message
-            .html_bodies()
-            .next()
-            .unwrap()
-            .text_contents()
-            .unwrap()
-            .to_string();
+            String::from_utf8(message.html_bodies().next().unwrap().as_bytes().to_vec()).unwrap();
+        let text = message.html_bodies().next().unwrap().to_string();
         assert!(
             html.contains(
                 "/dav/cal/john%40example.com/default/its-alarming-how-charming-i-feel.ics"
@@ -521,13 +525,14 @@ pub async fn scheduling(test: &TestServer) {
             && !copy_body.contains("METHOD:"),
         "{copy_body}"
     );
-    let (copy_archive, _) = crate::za::dav_seal::raw_event(
+    // At 1.0 the copy is a row and a content record; the scan covers both.
+    let (copy_records, _) = crate::za::dav_seal::raw_event_records(
         test,
         jane.account_id,
         &format!("default/{}", copy.rsplit('/').next().unwrap()),
     )
     .await;
-    assert!(!String::from_utf8_lossy(copy_archive.as_bytes()).contains("sched-canary"));
+    assert!(!copy_records.bytes().contains("sched-canary"));
     // The event is readable by its owner with attendees intact, and jane's
     // ATTENDEE says delivered.
     let body = john
@@ -547,9 +552,12 @@ pub async fn scheduling(test: &TestServer) {
         schedule_statuses(&body, ICalendarProperty::Attendee, "jane@example.com"),
         ["1.2"]
     );
-    let (archive, _) = crate::za::dav_seal::raw_event(test, john.account_id, "default/s.ics").await;
+    // The schedule tag is on the row.
+    let (records, _) =
+        crate::za::dav_seal::raw_event_records(test, john.account_id, "default/s.ics").await;
     assert!(
-        archive
+        records
+            .meta
             .unarchive::<CalendarEvent>()
             .unwrap()
             .schedule_tag
@@ -606,14 +614,14 @@ pub async fn scheduling(test: &TestServer) {
     assert_eq!(stored_sequence(&jane, &copy).await, 1);
     assert!(pending_ids(test, jane.account_id).await.is_empty());
     assert_eq!(uid_copies(test, jane.account_id, "za-sched-1").await, 1);
-    let (copy_archive, _) = crate::za::dav_seal::raw_event(
+    let (copy_records, _) = crate::za::dav_seal::raw_event_records(
         test,
         jane.account_id,
         &format!("default/{}", copy.rsplit('/').next().unwrap()),
     )
     .await;
     assert!(
-        !String::from_utf8_lossy(copy_archive.as_bytes()).contains("sched-canary-moved"),
+        !copy_records.bytes().contains("sched-canary-moved"),
         "the drained update left the moved title in the clear"
     );
     assert_eq!(copy_href(test, jane.account_id, "za-sched-1").await, copy);
@@ -722,7 +730,7 @@ pub async fn alarm_override(test: &TestServer) {
     wait_for_delivery(test).await;
     let messages = test.server.get_cached_messages(id).await.unwrap();
     assert_eq!(
-        messages.emails.items.len(),
+        messages.emails.len(),
         1,
         "exactly one email reached the account"
     );
@@ -731,7 +739,7 @@ pub async fn alarm_override(test: &TestServer) {
         test,
         id,
         account.secret(),
-        messages.emails.items[0].document_id,
+        messages.emails.at(0).unwrap().document_id(),
     )
     .await;
     let message = MessageParser::new().parse(&contents).unwrap();
@@ -749,7 +757,10 @@ pub async fn alarm_override(test: &TestServer) {
         String::from_utf8_lossy(&contents)
     );
     assert_eq!(
-        message.header_raw("Auto-Submitted").map(str::trim),
+        message
+            .headers()
+            .get("Auto-Submitted")
+            .map(|header| std::str::from_utf8(header.raw_value()).unwrap().trim()),
         Some("auto-generated"),
         "the alarm email is auto-generated"
     );

@@ -10,12 +10,12 @@ use ahash::AHashSet;
 use calcard::{common::timezone::Tz, icalendar::ICalendar};
 use groupware::{
     DavResourceName,
-    calendar::{CalendarEventData, alarm::ExpandAlarm, expand::CalendarEventExpansion},
+    calendar::{CalendarEventData, expand::CalendarEventExpansion},
 };
 use hyper::StatusCode;
 use std::str::FromStr;
 use store::write::serialize::rkyv_unarchive;
-use types::TimeRange;
+use types::{OverlapRule, TimeRange};
 
 pub async fn test(test: &TestServer) {
     println!("Running REPORT calendar-query & free-busy-query tests...");
@@ -42,6 +42,9 @@ pub async fn test(test: &TestServer) {
             .await
             .with_status(StatusCode::CREATED);
     }
+    // 1.0 answers filters on event text and parameters (Test 7) from the
+    // Calendar search index, which an index task fills after each PUT.
+    test.wait_for_tasks().await;
 
     // Test 1: Partial Retrieval of Events by Time Range
     let response = client
@@ -253,26 +256,12 @@ fn roundtrip_expansion(ics: &str, ignore_errors: bool) {
         .events
         .into_iter()
         .map(|e| {
-            let e = e.try_into_date_time().unwrap();
-            let start = e.start.timestamp();
-            let end = e.end.timestamp();
-            let mut min = std::cmp::min(start, end);
-            let mut max = std::cmp::max(start, end);
-
-            for alarm in ical.alarms_for_id(e.comp_id) {
-                if let Some(alarm_time) = alarm
-                    .expand_alarm(0, 0)
-                    .and_then(|alarm| alarm.delta.to_timestamp(start, end, Tz::UTC))
-                {
-                    if alarm_time < min {
-                        min = alarm_time;
-                    }
-
-                    if alarm_time > max {
-                        max = alarm_time;
-                    }
-                }
-            }
+            let (start, end) = e.timestamps();
+            // 1.0's stored range spans the instances only; its alarms are
+            // kept apart (`CalendarEventData::alarms`). 0.16 widened the
+            // range to every alarm's time, which this check mirrored.
+            let min = std::cmp::min(start, end);
+            let max = std::cmp::max(start, end);
 
             if min < min_utc {
                 min_utc = min;
@@ -283,15 +272,20 @@ fn roundtrip_expansion(ics: &str, ignore_errors: bool) {
             CalendarEventExpansion {
                 comp_id: e.comp_id,
                 own_recurrence_id: None,
+                series_recurrence_id: None,
                 start,
                 end,
                 start_naive: 0,
+                end_naive: 0,
+                start_tz: Tz::UTC,
+                end_tz: Tz::UTC,
+                flags: Default::default(),
             }
         })
         .collect::<Vec<_>>();
 
     // Verify min/max UTC timestamps
-    let event_data = CalendarEventData::new(ical, Tz::UTC, 100, &mut None);
+    let event_data = CalendarEventData::new(ical, Tz::UTC, 100);
     let from_time = event_data.base_time_utc as i64 + event_data.base_offset;
     let to_time = from_time + event_data.duration as i64;
 
@@ -322,6 +316,7 @@ fn roundtrip_expansion(ics: &str, ignore_errors: bool) {
                 start: i64::MIN,
                 end: i64::MAX,
             },
+            OverlapRule::CalDav,
         )
         .unwrap();
 
@@ -351,9 +346,16 @@ fn roundtrip_expansion(ics: &str, ignore_errors: bool) {
             a.comp_id.cmp(&b.comp_id)
         }
     });
+    // Only the component and the instants are compared, as at 0.16; 1.0's
+    // added fields are cleared on both sides like 0.16's naive ones.
     for event in events.iter_mut().chain(events_archive.iter_mut()) {
         event.own_recurrence_id = None;
+        event.series_recurrence_id = None;
         event.start_naive = 0;
+        event.end_naive = 0;
+        event.start_tz = Tz::UTC;
+        event.end_tz = Tz::UTC;
+        event.flags = Default::default();
     }
 
     assert_eq!(events, events_archive);
@@ -363,7 +365,7 @@ fn roundtrip_expansion(ics: &str, ignore_errors: bool) {
 fn calendar_expand_dst_fallback() {
     let akl = Tz::from_str("Pacific/Auckland").unwrap();
     let ical = ICalendar::parse(ICAL_DST_FALLBACK_ICS).unwrap();
-    let event_data = CalendarEventData::new(ical, akl, 1000, &mut None);
+    let event_data = CalendarEventData::new(ical, akl, 1000);
     let expanded_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&event_data).unwrap();
     let archive = rkyv_unarchive::<CalendarEventData>(&expanded_bytes).unwrap();
 
@@ -374,6 +376,7 @@ fn calendar_expand_dst_fallback() {
                 start: 1782777600,
                 end: 1786579200,
             },
+            OverlapRule::CalDav,
         )
         .unwrap();
     assert!(
@@ -388,6 +391,7 @@ fn calendar_expand_dst_fallback() {
                 start: 1775260800,
                 end: 1775433600,
             },
+            OverlapRule::CalDav,
         )
         .unwrap();
     assert_eq!(
@@ -400,7 +404,7 @@ fn calendar_expand_dst_fallback() {
 #[test]
 fn calendar_expand_beyond_indexable_span() {
     let ical = ICalendar::parse(ICAL_UNBOUNDED_YEARLY_ICS).unwrap();
-    let event_data = CalendarEventData::new(ical, Tz::UTC, 3000, &mut None);
+    let event_data = CalendarEventData::new(ical, Tz::UTC, 3000);
     let expanded_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&event_data).unwrap();
     let archive = rkyv_unarchive::<CalendarEventData>(&expanded_bytes).unwrap();
 
@@ -411,6 +415,7 @@ fn calendar_expand_beyond_indexable_span() {
                 start: i64::MIN,
                 end: i64::MAX,
             },
+            OverlapRule::CalDav,
         )
         .unwrap();
 
@@ -437,6 +442,7 @@ fn calendar_expand_beyond_indexable_span() {
                 start: JUNE_2027_START,
                 end: JUNE_2027_END,
             },
+            OverlapRule::CalDav,
         )
         .unwrap();
     assert_eq!(in_2027.len(), 1);
@@ -694,6 +700,8 @@ const REPORT_3: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
    </C:calendar-query>
 "#;
 
+// 1.0 keeps an expanded override's RECURRENCE-ID at the instance it replaces
+// (RFC 4791 7.8.3's example: 17:00 here); 0.16 gave its moved start.
 const REPORT_3_EXPECTED_ABCD2: &str = r#"BEGIN:VCALENDAR
 VERSION:2.0
 PRODID:-//Example Corp.//CalDAV Client//EN
@@ -707,7 +715,7 @@ UID:00959BC664CA650E933C892C@example.com
 END:VEVENT
 BEGIN:VEVENT
 DTSTART:20060104T190000Z
-RECURRENCE-ID:20060104T190000Z
+RECURRENCE-ID:20060104T170000Z
 DTSTAMP:20060206T001121Z
 DURATION:PT1H
 SUMMARY:Event #2 bis

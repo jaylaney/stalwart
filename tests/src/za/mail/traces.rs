@@ -45,7 +45,8 @@ use registry::{
         prelude::{ObjectType, Property},
         structs::{
             Expression, ExpressionMatch, MemoryLookupKey, MtaMilter, MtaStageData,
-            SieveSystemScript, SpamClassifier, SpamRule, SpamRuleHeader, SpamTag, SpamTagScore,
+            SieveSystemScript, SpamClassifier, SpamDnsblServer, SpamDnsblServerDomain, SpamRule,
+            SpamRuleHeader, SpamTag, SpamTagScore,
         },
     },
     types::{float::Float, list::List, map::Map},
@@ -53,8 +54,8 @@ use registry::{
 use serde_json::json;
 use std::time::Duration;
 use trc::{
-    EvalEvent, EventType, HttpEvent, ImapEvent, Key, MessageIngestEvent, MilterEvent, Pop3Event,
-    SieveEvent, SmtpEvent, SpamEvent, StoreEvent,
+    CacheEvent, EvalEvent, EventType, HttpEvent, ImapEvent, Key, MessageIngestEvent, MilterEvent,
+    Pop3Event, SieveEvent, SmtpEvent, SpamEvent, StoreEvent,
 };
 use types::id::Id;
 
@@ -83,6 +84,15 @@ const CANARIES: &[&str] = &[
     "mech-canary",
 ];
 const VACATION_CANARY: &str = "vacation-canary";
+/// The DNSBL zone `configure` appends to each checked domain.
+const DNSBL_ZONE: &str = "za-dnsbl.test";
+/// A personal Sieve script that includes a script named after the subject;
+/// none exists, so its run ends in a runtime error quoting the subject
+/// (`ScriptNotFound`), and the implicit keep files the message.
+const DELIVERY_ERROR_SCRIPT: &str = r#"require ["include", "variables"];
+if header :matches "subject" "*" { set "name" "${1}"; }
+include "${name}";
+"#;
 
 pub async fn test(test: &mut TestServer) {
     println!("Running zero-access mail trace tests...");
@@ -99,6 +109,7 @@ pub async fn test(test: &mut TestServer) {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     delivery_leaves_no_content_in_events(test).await;
+    delivery_sieve_runtime_error_is_redacted(test, &key, &plain).await;
     trusted_script_include_name_is_redacted(test).await;
     smtp_submission_by_a_key_account_is_redacted(test, &key, &plain).await;
     pipelined_rcpt_and_bdat_are_redacted(test, &key).await;
@@ -135,6 +146,7 @@ struct Settings {
     trap_key: Id,
     header_rule: Id,
     script: Id,
+    dnsbl: Id,
 }
 
 /// The trusted DATA-stage script. `ihave` is the one capability the trusted
@@ -158,7 +170,7 @@ async fn configure(admin: &Account) -> Settings {
                 else_: "true".into(),
                 ..Default::default()
             },
-            hostname: "127.0.0.1".into(),
+            host: "127.0.0.1".into(),
             port: 9332,
             use_tls: false,
             stages: Map::new(vec![MtaStage::Data]),
@@ -227,6 +239,25 @@ async fn configure(admin: &Account) -> Settings {
             &[Property::EnableSpamFilter, Property::Script],
         )
         .await;
+    // A domain DNSBL whose zone names each domain the message holds, the
+    // body's included (ruling 135, mutation a159). The test resolver
+    // answers every uncached name as not found, so each check traces its
+    // zone and no tag is added.
+    let dnsbl = admin
+        .registry_create_object(SpamDnsblServer::Domain(SpamDnsblServerDomain {
+            tag: Expression {
+                else_: "'ZA_TRACES_DNSBL'".into(),
+                ..Default::default()
+            },
+            zone: Expression {
+                else_: format!("value + '.{DNSBL_ZONE}'"),
+                ..Default::default()
+            },
+            name: "za-traces-dnsbl".into(),
+            description: None,
+            enable: true,
+        }))
+        .await;
     admin.reload_settings().await;
     admin.reload_lookup_stores().await;
     Settings {
@@ -235,6 +266,7 @@ async fn configure(admin: &Account) -> Settings {
         trap_key,
         header_rule,
         script,
+        dnsbl,
     }
 }
 
@@ -245,6 +277,7 @@ async fn unconfigure(admin: &Account, settings: Settings) {
         (ObjectType::MemoryLookupKey, settings.trap_key),
         (ObjectType::SpamRule, settings.header_rule),
         (ObjectType::SieveSystemScript, settings.script),
+        (ObjectType::SpamDnsblServer, settings.dnsbl),
     ] {
         admin
             .registry_destroy(object, [id])
@@ -363,6 +396,55 @@ fn assert_any_contains(values: &[String], needle: &str, what: &str) {
     );
 }
 
+/// Ruling 135 (M14, mutation a057; mail spec 10, ruling R59): a key
+/// account's own Sieve script that fails at delivery on a value derived
+/// from the subject traces its runtime error with the marker as its
+/// reason, and no event carries the subject; the message is still filed.
+/// The ordinary account's same script is the control: its reason names
+/// the subject.
+async fn delivery_sieve_runtime_error_is_redacted(
+    test: &TestServer,
+    key: &Account,
+    plain: &Account,
+) {
+    println!("delivery_sieve_runtime_error_is_redacted");
+    for account in [key, plain] {
+        let account_id = account.id().document_id();
+        let client = account.jmap_client().await;
+        let script_id = client
+            .sieve_script_create("za-traces-delivery", DELIVERY_ERROR_SCRIPT, true)
+            .await
+            .unwrap()
+            .take_id();
+        let before = message_ids(test, account_id).await;
+        let traced = Traced::start(traced_types());
+        deliver(test, SENDER, account.name(), &canary_message()).await;
+        let events = traced.finish().await;
+        new_message(test, account_id, &before).await;
+        let reasons = events
+            .iter()
+            .filter(|event| event.typ == EventType::Sieve(SieveEvent::RuntimeError))
+            .filter_map(|event| value(event, Key::Reason))
+            .collect::<Vec<_>>();
+        if account.name() == KEY {
+            assert_no_canary(&events, "a key account's delivery-time Sieve error");
+            assert!(
+                reasons.iter().filter(|reason| *reason == MARKER).count() >= 2,
+                "the key delivery's two runtime errors (the trusted DATA-stage script's \
+                 and the account's own) record the marker: {reasons:?}"
+            );
+        } else {
+            assert_any_contains(
+                &reasons,
+                "Included script \"subject-canary\" not found",
+                "control: the delivery-time Sieve error",
+            );
+        }
+        client.sieve_script_deactivate().await.unwrap();
+        client.sieve_script_destroy(&script_id).await.unwrap();
+    }
+}
+
 /// Spec 10 (review F2): a delivery over LMTP to a key account leaves no
 /// content in any event. The milter is sent the plaintext (transit) but its
 /// events record the marker; the DATA reads are masked while the envelope
@@ -403,11 +485,17 @@ async fn delivery_leaves_no_content_in_events(test: &TestServer) {
         let list_names = values(
             &events,
             EventType::Sieve(SieveEvent::ListNotFound),
-            Key::Details,
+            // 1.0 names the list in `Name` (0.16: `Details`).
+            Key::Name,
         );
+        let dnsbl_zones = [SpamEvent::Dnsbl, SpamEvent::DnsblError]
+            .into_iter()
+            .flat_map(|event| values(&events, EventType::Spam(event), Key::Hostname))
+            .collect::<Vec<_>>();
         assert_eq!(message_ids.len(), 1, "{to}: one ingest event");
         assert_any_contains(&reads, "RCPT TO", to);
         if to == KEY {
+            assert_all_redacted(&dnsbl_zones, "the DNSBL zones of a key delivery");
             assert_no_canary(&events, "a delivery to a key account");
             assert_all_redacted(
                 &script_errors,
@@ -428,6 +516,11 @@ async fn delivery_leaves_no_content_in_events(test: &TestServer) {
                 "control: the milter writes",
             );
             assert_any_contains(&message_ids, "msgid-canary@example.com", "control");
+            assert_any_contains(
+                &dnsbl_zones,
+                &format!("domain-canary.net.{DNSBL_ZONE}"),
+                "control: the DNSBL zone of the body's address",
+            );
             assert_any_contains(&reads, "body-canary", "control: the DATA reads");
             assert_any_contains(
                 &values(&events, EventType::Eval(EvalEvent::Result), Key::Result),
@@ -443,7 +536,8 @@ async fn delivery_leaves_no_content_in_events(test: &TestServer) {
             assert_any_contains(
                 &plugin_errors
                     .iter()
-                    .map(|event| value(event, Key::Id).unwrap_or_default())
+                    // 1.0 names the store in `Name` (0.16: `Id`).
+                    .map(|event| value(event, Key::Name).unwrap_or_default())
                     .collect::<Vec<_>>(),
                 "subject-canary",
                 "control: the plugin error's store name",
@@ -452,13 +546,13 @@ async fn delivery_leaves_no_content_in_events(test: &TestServer) {
             // the body names, and the ordinary lookup traces them (the URL's
             // registrable domain may already be in the negative cache).
             assert_any_contains(
-                &values(&events, EventType::Store(StoreEvent::CacheMiss), Key::Key),
+                &values(&events, EventType::Cache(CacheEvent::Miss), Key::Key),
                 "domain-canary",
                 "control: the domain lookup of the body's address",
             );
-            let lookups = [StoreEvent::CacheMiss, StoreEvent::CacheHit]
+            let lookups = [CacheEvent::Miss, CacheEvent::Hit]
                 .into_iter()
-                .flat_map(|event| values(&events, EventType::Store(event), Key::Key))
+                .flat_map(|event| values(&events, EventType::Cache(event), Key::Key))
                 .collect::<Vec<_>>();
             assert_any_contains(
                 &lookups,

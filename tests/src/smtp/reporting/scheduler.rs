@@ -4,21 +4,18 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
+use crate::smtp::reporting::DmarcRecordBuilder;
 use crate::utils::server::TestServerBuilder;
 use common::{
     config::smtp::report::AggregateFrequency,
     ipc::{DmarcEvent, PolicyType, TlsEvent},
 };
-use mail_auth::{
-    common::parse::TxtRecordParser,
-    dmarc::Dmarc,
-    mta_sts::TlsRpt,
-    report::{ActionDisposition, DmarcResult, Record},
-};
+use mail_auth::{dmarc::DmarcRecord, dns::TxtRecordParser, mta_sts::TlsRptRecord};
 use registry::schema::structs::{
     DmarcInternalReport, DmarcReportSettings, Expression, TlsInternalReport, TlsReportSettings,
 };
 use smtp::reporting::{dmarc::DmarcReporting, tls::TlsReporting};
+use smtp_report::dmarc::{Disposition, DmarcStatus, Record};
 use std::sync::Arc;
 
 #[tokio::test]
@@ -35,7 +32,7 @@ async fn report_scheduler() {
     let admin = test.account("admin");
     admin
         .registry_create_object(DmarcReportSettings {
-            aggregate_max_report_size: Expression {
+            max_aggregate_report_size: Expression {
                 else_: "500".into(),
                 ..Default::default()
             },
@@ -67,16 +64,17 @@ async fn report_scheduler() {
     test.expect_reload_settings().await;
 
     // Schedule two events with a same policy and another one with a different policy
-    let dmarc_record =
-        Arc::new(Dmarc::parse(b"v=DMARC1; p=quarantine; rua=mailto:dmarc@foobar.org").unwrap());
+    let dmarc_record = Arc::new(
+        DmarcRecord::parse(b"v=DMARC1; p=quarantine; rua=mailto:dmarc@foobar.org").unwrap(),
+    );
     test.server
         .schedule_dmarc(Box::new(DmarcEvent {
             domain: "foobar.org".to_string(),
-            report_record: Record::new()
+            report_record: Record::default()
                 .with_source_ip("192.168.1.2".parse().unwrap())
-                .with_action_disposition(ActionDisposition::Pass)
-                .with_dmarc_dkim_result(DmarcResult::Pass)
-                .with_dmarc_spf_result(DmarcResult::Fail)
+                .with_action_disposition(Disposition::Pass)
+                .with_dmarc_dkim_result(DmarcStatus::Pass)
+                .with_dmarc_spf_result(DmarcStatus::Fail)
                 .with_envelope_from("hello@example.org")
                 .with_envelope_to("other@example.org")
                 .with_header_from("bye@example.org"),
@@ -91,11 +89,11 @@ async fn report_scheduler() {
         test.server
             .schedule_dmarc(Box::new(DmarcEvent {
                 domain: "foobar.org".to_string(),
-                report_record: Record::new()
+                report_record: Record::default()
                     .with_source_ip("192.168.1.2".parse().unwrap())
-                    .with_action_disposition(ActionDisposition::Pass)
-                    .with_dmarc_dkim_result(DmarcResult::Pass)
-                    .with_dmarc_spf_result(DmarcResult::Fail)
+                    .with_action_disposition(Disposition::Pass)
+                    .with_dmarc_dkim_result(DmarcStatus::Pass)
+                    .with_dmarc_spf_result(DmarcStatus::Fail)
                     .with_envelope_from("hello@example.org")
                     .with_envelope_to("other@example.org")
                     .with_header_from("bye@example.org"),
@@ -106,15 +104,15 @@ async fn report_scheduler() {
             .await;
     }
     let dmarc_record =
-        Arc::new(Dmarc::parse(b"v=DMARC1; p=reject; rua=mailto:dmarc@foobar.org").unwrap());
+        Arc::new(DmarcRecord::parse(b"v=DMARC1; p=reject; rua=mailto:dmarc@foobar.org").unwrap());
     test.server
         .schedule_dmarc(Box::new(DmarcEvent {
             domain: "foobar.org".to_string(),
-            report_record: Record::new()
+            report_record: Record::default()
                 .with_source_ip("a:b:c::e:f".parse().unwrap())
-                .with_action_disposition(ActionDisposition::Reject)
-                .with_dmarc_dkim_result(DmarcResult::Fail)
-                .with_dmarc_spf_result(DmarcResult::Pass),
+                .with_action_disposition(Disposition::Reject)
+                .with_dmarc_dkim_result(DmarcStatus::Fail)
+                .with_dmarc_spf_result(DmarcStatus::Pass),
             dmarc_record: dmarc_record.clone(),
             interval: AggregateFrequency::Weekly,
             span_id: 0,
@@ -122,7 +120,8 @@ async fn report_scheduler() {
         .await;
 
     // Schedule TLS event
-    let tls_record = Arc::new(TlsRpt::parse(b"v=TLSRPTv1;rua=mailto:reports@foobar.org").unwrap());
+    let tls_record =
+        Arc::new(TlsRptRecord::parse(b"v=TLSRPTv1;rua=mailto:reports@foobar.org").unwrap());
     test.server
         .schedule_tls(Box::new(TlsEvent {
             domain: "foobar.org".to_string(),
@@ -170,18 +169,20 @@ async fn report_scheduler() {
     let mut total_dmarc_policies = 0;
     for (_, report) in test.read_report_events::<DmarcInternalReport>().await {
         total_dmarc_policies += 1;
-        assert_eq!(
-            report.deliver_at.timestamp() - report.created_at.timestamp(),
-            7 * 86400
-        );
+        // 1.0: the report covers its window (`created_at` is its start)
+        // and is delivered `SEND_DELAY` (300 s) plus a jitter under 600 s
+        // after the window ends; 0.16 delivered it at the window's end.
+        let delay = report.deliver_at.timestamp() - report.created_at.timestamp() - 7 * 86400;
+        assert!((300..900).contains(&delay), "delivery delay {delay}");
     }
     for (_, report) in test.read_report_events::<TlsInternalReport>().await {
         total_tls += 1;
         total_tls_policies += report.report.policies.len();
-        assert_eq!(
-            report.deliver_at.timestamp() - report.created_at.timestamp(),
-            86400
-        );
+        // 1.0: the report covers its window (`created_at` is its start)
+        // and is delivered `SEND_DELAY` (300 s) plus a jitter under 600 s
+        // after the window ends; 0.16 delivered it at the window's end.
+        let delay = report.deliver_at.timestamp() - report.created_at.timestamp() - 86400;
+        assert!((300..900).contains(&delay), "delivery delay {delay}");
     }
     assert_eq!(total_tls, 1);
     assert_eq!(total_tls_policies, 3);

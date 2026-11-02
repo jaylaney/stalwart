@@ -16,7 +16,10 @@ use calcard::{
 use common::{
     auth::vault::{RawValue, VaultRead, ZaMark, ZaVerification},
     ipc::CacheInvalidation,
-    storage::index::ObjectIndexBuilder,
+    storage::{
+        index::{GroupwareWrite, ObjectIndexBuilder},
+        search::SearchIndexStatus,
+    },
     za::{
         lease::lease_key_range,
         test_hooks::{self, Pause as HookPause},
@@ -24,40 +27,44 @@ use common::{
 };
 use email::{
     cache::MessageCacheFetch,
-    mailbox::{INBOX_ID, UidMailbox},
+    mailbox::INBOX_ID,
     message::{
-        ingest::EmailIngest,
-        metadata::{MessageData, MessageMetadata},
+        ingest::{ThreadInfo, thread_hash},
+        messagedata::{MessageData, PendingMessageData},
+        metadata::{ExtraHeaders, MessageMetadata},
+        sortkeys::MessageSortKeys,
+        thread::ThreadFields,
     },
 };
 use groupware::{
     cache::GroupwareCache,
     calendar::{
-        CalendarEvent, CalendarEventData, CalendarEventNotification, ChangedBy,
-        EVENT_NOTIFICATION_ZA_PENDING,
+        CalendarEvent, CalendarEventContent, CalendarEventData, CalendarEventNotification,
+        CalendarEventNotificationContent, ChangedBy, EVENT_NOTIFICATION_ZA_PENDING,
+        alerts::DefaultAlertsResolver,
+        schedule::{EventAlarmScheduler, EventAlarmUsers},
         seal::{
-            PendingCarriers, TokenPairs, open_pending_item, seal_drained_item, seal_event,
-            seal_pending_item, tree::KEY_PROP,
+            PendingCarriers, TokenPairs, ZaEvent,
+            item::{into_item_message, item_message},
+            open_pending_item, seal_drained_item, seal_event, seal_pending_item,
+            tree::KEY_PROP,
         },
-        storage::ItipAutoExpunge,
     },
     scheduling::inbound::itip_method,
 };
 use http::auth::authenticate::za_test::{self, Pause};
 use hyper::{Method, StatusCode};
 use mail_parser::MessageParser;
-use registry::schema::{
-    enums::IndexDocumentType,
-    structs::{Task, TaskIndexDocument, TaskStatus},
-};
+use registry::schema::structs::Task;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{future::Future, sync::Arc, time::Duration};
 use store::{
-    Deserialize, IterateParams, Serialize as _, ValueKey,
+    Deserialize, IterateParams, Subspace, U32_LEN, ValueKey,
     write::{
-        AlignedBytes, Archive, Archiver, BatchBuilder, BlobLink, BlobOp, TaskQueueClass,
-        ValueClass, now,
+        AnyKey, Archive, ArchiveBytes, ArchiveVersion, BatchBuilder, BlobLink, BlobOp,
+        IndexPropertyClass, QueueDocumentId, SearchIndex, SearchIndexClass, TaskId, TaskQueueClass,
+        ValueClass, blob::BlobLinkValue, key::DeserializeBigEndian, now,
     },
 };
 use tokio::{
@@ -75,7 +82,7 @@ use tokio_rustls::{
     },
 };
 use types::collection::{Collection, SyncCollection};
-use types::field::{CalendarEventField, EmailField, PrincipalField};
+use types::field::{CalendarEventField, CalendarNotificationField, EmailField, PrincipalField};
 use vault::{
     keys::{
         AAD_PRIVATE_KEY, AAD_PRIVATE_KEY_PINNED, Secret, aad, generate_keypair, unwrap_key,
@@ -305,15 +312,16 @@ pub async fn caldav_from(fail_ip: &str, name: &str, secret: &str, status: Status
 }
 
 pub fn assert_nothing_cached(test: &TestServer, account_id: u32) {
+    // 1.0's `HttpAuthEntries` has no iterator; `retain` visits every entry.
+    let cached = std::sync::atomic::AtomicBool::new(false);
+    test.server.inner.cache.http_auth.retain(|entry| {
+        if entry.account_id == account_id {
+            cached.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        true
+    });
     assert!(
-        !test
-            .server
-            .inner
-            .cache
-            .http_auth
-            .inner()
-            .iter()
-            .any(|(_, v)| v.account_id == account_id),
+        !cached.into_inner(),
         "no cached authentication for the account"
     );
     assert!(
@@ -485,120 +493,478 @@ async fn insert_event(
 ) -> u32 {
     let calendar_id = test
         .server
-        .fetch_dav_resources(account_id, account_id, SyncCollection::Calendar)
+        .fetch_groupware_resources(account_id, account_id, SyncCollection::Calendar)
         .await
         .unwrap()
         .by_path(calendar)
         .unwrap_or_else(|| panic!("calendar {calendar} not found"))
         .document_id();
-    let size = ical.len() as u32;
     let ical = match calcard::Parser::new(ical).entry() {
         calcard::Entry::ICalendar(ical) => ical,
         other => panic!("{other:?}"),
     };
-    let mut next_alarm = None;
-    let mut event = CalendarEvent {
+    // At 1.0 an event is a metadata row and a content record; upstream's
+    // builder derives the row's size, range and privacy flags from the
+    // content it is given (`refresh_from_content`).
+    let meta = CalendarEvent {
         names: vec![common::DavName {
             name: name.into(),
             parent_id: calendar_id,
         }],
-        data: CalendarEventData::new(ical, Tz::Floating, 100, &mut next_alarm),
-        size,
         schedule_tag,
         ..Default::default()
     };
+    let content = CalendarEventContent {
+        data: CalendarEventData::new(ical, Tz::Floating, 100),
+        ..Default::default()
+    };
+    // The next email alarm, computed on the plaintext as a PUT does.
+    let next_alarms = test
+        .server
+        .next_event_alarms(
+            account_id,
+            &EventAlarmUsers::new(account_id, &content)
+                .unwrap()
+                .with_event_flags(meta.flags),
+            &content.data,
+            &[calendar_id],
+            store::write::now() as i64,
+            &mut DefaultAlertsResolver::default(),
+        )
+        .await
+        .unwrap();
+    let mut event = ZaEvent::new(meta, content);
     if let Some((keys, pairs)) = seal {
         seal_event(&mut event, keys, account_id, Some(pairs)).unwrap();
     }
-    let account_info = test.server.account_info(account_id).await.unwrap();
-    let document_id = test
+    let (meta, content) = event.into_parts();
+    let changed_by = test
         .server
-        .store()
-        .assign_document_ids(account_id, Collection::CalendarEvent, 1)
+        .account_info(account_id)
         .await
-        .unwrap();
+        .unwrap()
+        .changed_by();
     let mut batch = BatchBuilder::new();
-    event
-        .insert(
-            account_info.account_tenant_ids(),
-            account_id,
-            document_id,
-            next_alarm,
-            &mut batch,
-        )
-        .unwrap();
-    test.server.commit_batch(batch).await.unwrap();
+    let slot = batch.reserve_document_id(account_id, Collection::CalendarEvent);
+    meta.insert(
+        content,
+        changed_by,
+        account_id,
+        slot,
+        None,
+        next_alarms,
+        &mut batch,
+    )
+    .unwrap();
+    let document_id = test.server.commit_batch(batch).await.unwrap().slot(slot);
     // A direct store write neither wakes the task manager nor refreshes the
     // DAV resource cache the way the DAV handlers do.
     test.server.notify_task_queue();
     test.server
-        .invalidate_local_caches(&[CacheInvalidation::DavResources(account_id)])
-        .await;
+        .invalidate_local_caches(&[CacheInvalidation::GroupwareResources(account_id)]);
     document_id
+}
+
+/// The stored records of the account's event `document_id` at 1.0: the
+/// metadata row (`Field::ARCHIVE`) and the content archive
+/// (`CalendarEventField::Content`).
+pub async fn event_records(
+    test: &TestServer,
+    account_id: u32,
+    document_id: u32,
+) -> (Archive<ArchiveBytes>, Archive<ArchiveBytes>) {
+    let meta = test
+        .server
+        .store()
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
+            account_id,
+            Collection::CalendarEvent,
+            document_id,
+        ))
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("no event row {account_id}/{document_id}"));
+    let content = test
+        .server
+        .store()
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::property(
+            account_id,
+            Collection::CalendarEvent,
+            document_id,
+            CalendarEventField::Content,
+        ))
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("no event content {account_id}/{document_id}"));
+    (meta, content)
+}
+
+/// An event's two stored records, read together, as the 0.16 tests read
+/// the one event archive.
+#[derive(Clone)]
+pub struct StoredEvent {
+    pub meta: Archive<ArchiveBytes>,
+    pub content: Archive<ArchiveBytes>,
+    /// Both records' versions: 0.16's one archive version. Any write
+    /// changes the row's; a full write changes both.
+    pub version: (ArchiveVersion, ArchiveVersion),
+}
+
+impl StoredEvent {
+    /// The deserialized pair, as the seal codec takes it.
+    pub fn za_event(&self) -> ZaEvent {
+        ZaEvent::new(
+            self.meta.deserialize::<CalendarEvent>().unwrap(),
+            self.content.deserialize::<CalendarEventContent>().unwrap(),
+        )
+    }
+
+    /// The stored tree (sealed for a key account).
+    pub fn tree(&self) -> &calcard::icalendar::ArchivedICalendar {
+        &self
+            .content
+            .unarchive::<CalendarEventContent>()
+            .unwrap()
+            .data
+            .event
+    }
+
+    /// `seal::event_pairs_in_domain` on the stored records.
+    pub fn pairs_in(
+        &self,
+        domain: &groupware::calendar::seal::ZaKeyDomain,
+    ) -> Result<Option<TokenPairs>, groupware::calendar::seal::SealError> {
+        groupware::calendar::seal::event_pairs_in_domain(
+            &self.meta.deserialize::<CalendarEvent>().unwrap(),
+            &self.content,
+            domain,
+        )
+    }
+
+    /// The event's ETag as upstream serves it at 1.0: the row's `etag`
+    /// (content hash xor row hash), quoted.
+    pub fn etag(&self) -> String {
+        format!(
+            "\"{}\"",
+            self.meta
+                .unarchive::<CalendarEvent>()
+                .unwrap()
+                .etag
+                .to_native()
+        )
+    }
+
+    /// The time of the next email alarm upstream's scheduler derives from
+    /// the stored content (alarm data is visible, so a sealed event's
+    /// stored alarms are the plaintext's), as a write schedules it.
+    pub async fn next_alarm_time(
+        &self,
+        test: &TestServer,
+        account_id: u32,
+        calendar_id: u32,
+    ) -> Option<i64> {
+        let meta = self.meta.deserialize::<CalendarEvent>().unwrap();
+        let content = self.content.deserialize::<CalendarEventContent>().unwrap();
+        test.server
+            .next_event_alarms(
+                account_id,
+                &EventAlarmUsers::new(account_id, &content)
+                    .unwrap()
+                    .with_event_flags(meta.flags),
+                &content.data,
+                &[calendar_id],
+                store::write::now() as i64,
+                &mut DefaultAlertsResolver::default(),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .map(|alarm| alarm.alarm_time)
+    }
+
+    /// Row and content bytes, concatenated: 0.16's one archive's bytes, for
+    /// "byte-identical" assertions.
+    pub fn as_bytes(&self) -> Vec<u8> {
+        let mut bytes = self.meta.as_bytes().to_vec();
+        bytes.extend_from_slice(self.content.as_bytes());
+        bytes
+    }
+
+    /// Row and content bytes together (`event_bytes`).
+    pub fn bytes(&self) -> String {
+        event_bytes(&self.meta, &self.content)
+    }
+}
+
+/// `event_records` as a `StoredEvent`.
+pub async fn stored_event(test: &TestServer, account_id: u32, document_id: u32) -> StoredEvent {
+    let (meta, content) = event_records(test, account_id, document_id).await;
+    StoredEvent {
+        version: (meta.version, content.version),
+        meta,
+        content,
+    }
+}
+
+/// Writes `event` over `stored` with upstream's full split update (row
+/// and content, conditional on the stored row), bypassing every handler:
+/// 0.16's `CalendarEvent::update` in the tests. Wakes the task manager.
+pub async fn write_stored_event(
+    test: &TestServer,
+    account_id: u32,
+    document_id: u32,
+    stored: &StoredEvent,
+    event: ZaEvent,
+) {
+    let changed_by = test
+        .server
+        .account_info(account_id)
+        .await
+        .unwrap()
+        .changed_by();
+    let (meta, content) = event.into_parts();
+    let mut batch = BatchBuilder::new();
+    meta.update_full(
+        content,
+        changed_by,
+        stored.meta.to_unarchived::<CalendarEvent>().unwrap(),
+        stored.content.unarchive::<CalendarEventContent>().unwrap(),
+        account_id,
+        document_id,
+        None,
+        &mut batch,
+    )
+    .unwrap();
+    test.server.commit_batch(batch).await.unwrap();
+    test.server.notify_task_queue();
+    test.server
+        .invalidate_local_caches(&[CacheInvalidation::GroupwareResources(account_id)]);
+}
+
+/// The raw stored bytes of a document's shared metadata container
+/// (`MetadataClass::Shared`), decompressed: the container that holds a
+/// calendar's or event's dead properties at 1.0. `None` when absent.
+pub async fn shared_container(
+    test: &TestServer,
+    account_id: u32,
+    collection: Collection,
+    document_id: u32,
+) -> Option<Vec<u8>> {
+    test.server
+        .metadata_container(account_id, collection, document_id)
+        .await
+        .unwrap()
+        .map(|container| container.view().as_bytes().to_vec())
+}
+
+/// A plaintext dead-property container holding `properties`, each a
+/// (namespace, name, text) DAV property: what a legacy writer or an
+/// ordinary account stores at 1.0.
+pub fn plain_dav_container(properties: &[(&str, &str, &str)]) -> types::metadata::EncodedMetadata {
+    use types::metadata::{MetadataBuilder, XmlName, XmlNode, XmlValue};
+    let mut builder = MetadataBuilder::new();
+    for (namespace, name, text) in properties {
+        builder
+            .set_dav(
+                XmlName::owned(Some(namespace.to_string()), name.to_string()),
+                &XmlValue {
+                    lang: None,
+                    attributes: Vec::new(),
+                    children: vec![XmlNode::Text(text.to_string().into())],
+                },
+            )
+            .unwrap();
+    }
+    builder.encode().expect("a non-empty container")
+}
+
+/// Writes `container` (or removes the stored one with `None`) as the
+/// document's shared metadata container through upstream's keyless writer
+/// (`ContainerChange`, `MetadataWrite`: quota, assertion, no seal), and
+/// rewrites the row's presence bits as the DAV handlers do. The store
+/// writer of a legacy, unsealed container, for negative controls and the
+/// conversion fixtures.
+pub async fn plant_container(
+    test: &TestServer,
+    account_id: u32,
+    collection: Collection,
+    document_id: u32,
+    container: Option<types::metadata::EncodedMetadata>,
+) {
+    use common::storage::{
+        index::RewritePresence,
+        metadata::{ContainerChange, MetadataLog},
+    };
+    use groupware::calendar::Calendar;
+    use types::metadata::MetadataEdit;
+    let owner = test.server.account(account_id).await.unwrap();
+    let previous = test
+        .server
+        .metadata_container(account_id, collection, document_id)
+        .await
+        .unwrap();
+    let Some(change) = ContainerChange::new(previous.as_ref(), container, MetadataEdit::Write)
+    else {
+        return;
+    };
+    let row = test
+        .server
+        .store()
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(account_id, collection, document_id))
+        .await
+        .unwrap()
+        .expect("the container's document");
+    let mut batch = BatchBuilder::new();
+    // Logged as the DAV writer logs it (`DeadTarget`): the presence rewrite
+    // patches the row's change id, which the logged change assigns.
+    let log = match collection {
+        Collection::Calendar => MetadataLog::Container,
+        _ => MetadataLog::Item { prefix: None },
+    };
+    let presence = change
+        .into_write(&owner, collection, log)
+        .build(store::write::PendingId::Assigned(document_id), &mut batch)
+        .unwrap();
+    match collection {
+        Collection::Calendar => Calendar::rewrite_presence(
+            &row.to_unarchived::<Calendar>().unwrap(),
+            presence.after,
+            account_id,
+            document_id,
+            &mut batch,
+        ),
+        Collection::CalendarEvent => CalendarEvent::rewrite_presence(
+            &row.to_unarchived::<CalendarEvent>().unwrap(),
+            presence.after,
+            account_id,
+            document_id,
+            &mut batch,
+        ),
+        other => panic!("no presence rewrite for {other:?}"),
+    }
+    .unwrap();
+    test.server.commit_batch(batch).await.unwrap();
+    test.server
+        .invalidate_local_caches(&[CacheInvalidation::GroupwareResources(account_id)]);
+}
+
+/// Every stored byte of an event, row and content together, for canary
+/// scans: at 1.0 either record could carry a leak (the row holds the
+/// display name, the content the tree).
+pub fn event_bytes(meta: &Archive<ArchiveBytes>, content: &Archive<ArchiveBytes>) -> String {
+    let mut text = String::from_utf8_lossy(meta.as_bytes()).to_string();
+    text.push_str(&String::from_utf8_lossy(content.as_bytes()));
+    text
+}
+
+/// Upgrade part 4c (per-user event data, calendar spec table near line
+/// 717): a key account's event content never carries per-user
+/// preferences, whichever path wrote it.
+pub async fn assert_no_event_preferences(test: &TestServer, account_id: u32, document_id: u32) {
+    let (_, content) = event_records(test, account_id, document_id).await;
+    let content = content.unarchive::<CalendarEventContent>().unwrap();
+    assert!(
+        content.preferences.is_empty(),
+        "event {account_id}/{document_id} holds {} preference entries",
+        content.preferences.len()
+    );
 }
 
 /// Mail spec 6.6: a plaintext message in INBOX, as an account that held
 /// mail before it became a key account would hold one. `email_ingest`
 /// seals every message of a key account, so the message is written here as
-/// its ordinary path writes one (`index_message`: the blob linked,
-/// `MessageData`, the metadata archive) with its thread container and index
-/// task, as `plant_event` writes an unsealed event. Returns the document id.
+/// 1.0's ordinary path writes one (`email_ingest_into` and `index_message`,
+/// `email/src/message/{ingest,index/metadata}.rs`): the blob held and
+/// linked at its length, a thread of its own, `MessageData` with the
+/// attachment keyword upstream sets, the sort keys, the plaintext metadata
+/// row, the threading key and the message's index-queue entry. Nothing here
+/// asserts vault absence: it plants into key accounts too, as `plant_event`
+/// writes an unsealed event. Returns the document id.
 pub async fn plant_plain_message(test: &TestServer, account_id: u32, raw: &str) -> u32 {
     let server = &test.server;
+    let message = MessageParser::new()
+        .parse(raw.as_bytes())
+        .expect("a planted message parses");
     let (blob_hash, blob_hold) = server
-        .put_temporary_blob(account_id, raw.as_bytes(), 60)
+        .hold_blob(
+            account_id,
+            types::blob_hash::BlobHash::generate(raw.as_bytes()),
+            raw.as_bytes(),
+            60,
+        )
         .await
         .unwrap();
-    let mut ids = server
-        .assign_email_ids(account_id, [INBOX_ID], true)
-        .await
-        .unwrap();
-    let document_id = ids.next().unwrap();
-    let uid = ids.next().unwrap();
-    let metadata = MessageMetadata::build(
-        MessageParser::new().parse(raw.as_bytes()).unwrap(),
-        Vec::new(),
-        Vec::new(),
-        blob_hash.clone(),
-        now(),
-    );
-    let data = MessageData {
-        mailboxes: vec![UidMailbox::new(INBOX_ID, uid)].into_boxed_slice(),
-        keywords: Box::default(),
-        thread_id: document_id,
-        size: raw.len() as u32,
-    };
+    let built = MessageMetadata::build(&message, &ExtraHeaders::default(), blob_hash.clone());
+    let fields = ThreadFields::scan(&message);
+    let received_at = now();
+    let keywords = 1u32
+        << if built.has_attachments {
+            types::keyword::HASATTACHMENT
+        } else {
+            types::keyword::HASNOATTACHMENT
+        };
+
     let mut batch = BatchBuilder::new();
+    batch.with_account_id(account_id);
+    let document_slot = batch.reserve_document_id(account_id, Collection::Email);
+    let uid_slots = batch.reserve_uids(account_id, [INBOX_ID]);
     batch
-        .with_account_id(account_id)
         .with_collection(Collection::Thread)
-        .with_document(document_id)
-        .log_container_insert(SyncCollection::Thread)
+        .create_document(document_slot)
+        .log_container_insert(SyncCollection::Thread);
+    let data = PendingMessageData {
+        data: MessageData {
+            mailboxes: [common::MessageUid::new_unassigned(INBOX_ID)]
+                .into_iter()
+                .collect(),
+            keywords,
+            keywords_extra: Vec::new(),
+            thread_id: 0,
+            size: raw.len() as u32,
+            received_at,
+            sent_at: MessageData::sent_at_offset(fields.sent_at, received_at),
+            change_id: 0,
+        },
+        uid_slots,
+        thread_slot: Some(document_slot),
+        change_id: None,
+    };
+    let thread_id = data.thread_id();
+    batch
         .with_collection(Collection::Email)
-        .with_document(document_id)
+        .create_document(document_slot)
         .set(
             BlobOp::Link {
                 hash: blob_hash,
                 to: BlobLink::Document,
             },
-            Vec::new(),
+            BlobLinkValue::new(message.raw().len()),
         )
         .custom(ObjectIndexBuilder::<(), _>::new().with_changes(data))
         .unwrap()
         .set(
-            EmailField::Metadata,
-            Archiver::new(metadata).serialize().unwrap(),
+            EmailField::SortKeys,
+            MessageSortKeys::from_message(&message).serialize(),
         )
-        .schedule_task(Task::IndexDocument(TaskIndexDocument {
-            account_id: account_id.into(),
-            document_id: document_id.into(),
-            document_type: IndexDocumentType::Email,
-            status: TaskStatus::now(),
-        }))
-        .clear(blob_hold);
-    server.commit_batch(batch).await.unwrap();
-    server.notify_task_queue();
-    document_id
+        .set(EmailField::Metadata, built.encode().unwrap())
+        .set(
+            ValueClass::IndexProperty(IndexPropertyClass::Hash {
+                property: EmailField::Threading.into(),
+                hash: thread_hash(fields.subject),
+            }),
+            ThreadInfo {
+                thread_id,
+                ref_ids: &fields.message_ids,
+            },
+        )
+        .queue_document_index(SearchIndex::Email, account_id, QueueDocumentId::Current);
+    blob_hold.release(&mut batch);
+    server
+        .commit_batch(batch)
+        .await
+        .unwrap()
+        .slot(document_slot)
 }
 
 /// Emails in the account's mailboxes.
@@ -608,7 +974,6 @@ pub async fn mail_count(test: &TestServer, account_id: u32) -> usize {
         .await
         .unwrap()
         .emails
-        .items
         .len()
 }
 
@@ -646,38 +1011,114 @@ pub async fn wait_for_delivery(test: &TestServer) {
     test.wait_for_tasks().await;
 }
 
-/// The account's scheduling inbox items, by ascending document id, as
-/// stored (pending items included; clients never see those).
-pub async fn inbox_items(
+/// A scheduling inbox item as tests read it at 1.0: the notification row's
+/// fields and its iTIP message (`CalendarEventNotificationContent::Itip`'s
+/// `message`; for upstream's own `Direct` content, its current or previous
+/// snapshot), so 0.16's `item.event` and `item.flags` reads keep their
+/// meaning.
+#[derive(Debug, Clone)]
+pub struct InboxItem {
+    pub event: ICalendar,
+    pub event_id: Option<u32>,
+    pub changed_by: ChangedBy,
+    pub calendar_ids: Vec<u32>,
+    pub flags: u16,
+    pub size: u32,
+    pub created: i64,
+    pub modified: i64,
+    pub content: CalendarEventNotificationContent,
+}
+
+impl InboxItem {
+    fn new(meta: CalendarEventNotification, content: CalendarEventNotificationContent) -> Self {
+        let event = match &content {
+            CalendarEventNotificationContent::Itip { message, .. } => message.clone(),
+            CalendarEventNotificationContent::Direct { previous, current } => current
+                .as_ref()
+                .or(previous.as_ref())
+                .cloned()
+                .unwrap_or_default(),
+        };
+        InboxItem {
+            event,
+            event_id: meta.event_id,
+            changed_by: meta.changed_by,
+            calendar_ids: meta.calendar_ids,
+            flags: meta.flags,
+            size: meta.size,
+            created: meta.created,
+            modified: meta.modified,
+            content,
+        }
+    }
+
+    /// True for an item the fork wrote (`seal::item_message`): an `Itip`
+    /// content with no plaintext snapshot.
+    pub fn is_fork_item(&self) -> bool {
+        item_message(&self.content).is_some()
+    }
+}
+
+/// The stored records of an inbox item: its row and its content archive.
+pub async fn inbox_records(
     test: &TestServer,
     account_id: u32,
-) -> Vec<(u32, CalendarEventNotification)> {
+    document_id: u32,
+) -> Option<(Archive<ArchiveBytes>, Archive<ArchiveBytes>)> {
+    let meta = test
+        .server
+        .store()
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::archive(
+            account_id,
+            Collection::CalendarEventNotification,
+            document_id,
+        ))
+        .await
+        .unwrap()?;
+    let content = test
+        .server
+        .store()
+        .get_value::<Archive<ArchiveBytes>>(ValueKey::property(
+            account_id,
+            Collection::CalendarEventNotification,
+            document_id,
+            CalendarNotificationField::Content,
+        ))
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("item {account_id}/{document_id} has no content record"));
+    Some((meta, content))
+}
+
+/// The account's scheduling inbox items, by ascending document id, as
+/// stored (pending items included; clients never see those).
+pub async fn inbox_items(test: &TestServer, account_id: u32) -> Vec<(u32, InboxItem)> {
     let mut items = Vec::new();
-    for document_id in test.server.itip_ids(account_id).await.unwrap() {
-        if let Some(stored) = test
-            .server
-            .store()
-            .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
-                account_id,
-                Collection::CalendarEventNotification,
-                document_id,
-            ))
-            .await
-            .unwrap()
-        {
+    for document_id in inbox_ids(test, account_id).await {
+        if let Some((meta, content)) = inbox_records(test, account_id, document_id).await {
             items.push((
                 document_id,
-                stored.deserialize::<CalendarEventNotification>().unwrap(),
+                InboxItem::new(
+                    meta.deserialize::<CalendarEventNotification>().unwrap(),
+                    content
+                        .deserialize::<CalendarEventNotificationContent>()
+                        .unwrap(),
+                ),
             ));
         }
     }
     items
 }
 
-/// The document ids of the account's scheduling inbox items.
+/// The document ids of the account's scheduling inbox items (0.16's
+/// `itip_ids`: at 1.0 every item is indexed by its creation time).
 pub async fn inbox_ids(test: &TestServer, account_id: u32) -> Vec<u32> {
     test.server
-        .itip_ids(account_id)
+        .document_ids(
+            account_id,
+            Collection::CalendarEventNotification,
+            CalendarNotificationField::Created,
+        )
         .await
         .unwrap()
         .into_iter()
@@ -689,7 +1130,7 @@ pub async fn new_inbox_items(
     test: &TestServer,
     account_id: u32,
     before: &[u32],
-) -> Vec<(u32, CalendarEventNotification)> {
+) -> Vec<(u32, InboxItem)> {
     inbox_items(test, account_id)
         .await
         .into_iter()
@@ -729,21 +1170,18 @@ pub async fn open_pending_item_as(
     let wrap = saved_wrap(test, recipient).await;
     let (private_key, _) = unwrap_private_key(&wrap, keys.mk(), recipient)
         .unwrap_or_else(|_| panic!("the private-key wrap of account {recipient} does not open"));
-    let stored = test
-        .server
-        .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
-            recipient,
-            Collection::CalendarEventNotification,
-            document_id,
-        ))
+    let (_, content) = inbox_records(test, recipient, document_id)
         .await
-        .unwrap()
         .expect("inbox item");
-    let mut item = stored.deserialize::<CalendarEventNotification>().unwrap();
-    let carriers = open_pending_item(&mut item.event, recipient, &private_key)
+    let mut message = into_item_message(
+        content
+            .deserialize::<CalendarEventNotificationContent>()
+            .unwrap(),
+    )
+    .unwrap_or_else(|| panic!("item {document_id} is not a fork item"));
+    let carriers = open_pending_item(&mut message, recipient, &private_key)
         .unwrap_or_else(|err| panic!("item {document_id} does not open: {err:?}"));
-    (item.event, carriers)
+    (message, carriers)
 }
 
 /// The METHOD on an iTIP tree's root (visible on a sealed item too).
@@ -865,6 +1303,174 @@ impl<T> Drop for HookParked<T> {
     }
 }
 
+/// Upgrade ruling 156: one of `common::za::test_hooks`' pause slots, as the
+/// test found it, restored when the guard drops (also when the test panics),
+/// so a slot the test armed and a failure left set cannot park a later
+/// module's request. The value restored is the prior one, not `None`. A pause
+/// still armed in the slot at the drop, other than the prior one, is
+/// released first, so a request parked on it does not stay parked.
+#[must_use = "dropping the guard restores the slot"]
+pub struct PauseSlotGuard {
+    slot: &'static std::sync::Mutex<Option<Arc<HookPause>>>,
+    prior: Option<Arc<HookPause>>,
+}
+
+impl PauseSlotGuard {
+    pub fn new(slot: &'static std::sync::Mutex<Option<Arc<HookPause>>>) -> Self {
+        let prior = slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        PauseSlotGuard { slot, prior }
+    }
+}
+
+impl Drop for PauseSlotGuard {
+    fn drop(&mut self) {
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(armed) = slot.as_ref()
+            && !self
+                .prior
+                .as_ref()
+                .is_some_and(|prior| Arc::ptr_eq(prior, armed))
+        {
+            armed.release.notify_one();
+        }
+        *slot = self.prior.take();
+    }
+}
+
+/// Upgrade ruling 156: `CalendarScheduling`'s `max_recipients` set for the
+/// guard's lifetime. `restore` puts the prior value back and reloads the
+/// settings; a guard dropped without it (a panic) does the same from its
+/// drop, on a thread of its own, so a failure cannot leave the cap set for
+/// later modules.
+#[must_use = "dropping the guard restores max_recipients"]
+pub struct MaxRecipientsGuard {
+    admin: Option<Account>,
+    prior: u64,
+}
+
+impl MaxRecipientsGuard {
+    pub async fn set(admin: &Account, max_recipients: u64) -> Self {
+        use registry::schema::{prelude::Property, structs::CalendarScheduling};
+        let prior = admin
+            .registry_get::<CalendarScheduling>(types::id::Id::singleton())
+            .await
+            .max_recipients;
+        admin
+            .registry_update_setting(
+                CalendarScheduling {
+                    max_recipients,
+                    ..Default::default()
+                },
+                &[Property::MaxRecipients],
+            )
+            .await;
+        admin.reload_settings().await;
+        MaxRecipientsGuard {
+            admin: Some(admin.clone()),
+            prior,
+        }
+    }
+
+    pub async fn restore(mut self) {
+        if let Some(admin) = self.admin.take() {
+            set_max_recipients(&admin, self.prior).await;
+        }
+    }
+}
+
+impl Drop for MaxRecipientsGuard {
+    fn drop(&mut self) {
+        if let Some(admin) = self.admin.take() {
+            let prior = self.prior;
+            let _ = std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a runtime for the restore")
+                    .block_on(set_max_recipients(&admin, prior));
+            })
+            .join();
+        }
+    }
+}
+
+async fn set_max_recipients(admin: &Account, max_recipients: u64) {
+    use registry::schema::{prelude::Property, structs::CalendarScheduling};
+    admin
+        .registry_update_setting(
+            CalendarScheduling {
+                max_recipients,
+                ..Default::default()
+            },
+            &[Property::MaxRecipients],
+        )
+        .await;
+    admin.reload_settings().await;
+}
+
+/// PR review ruling 196: `Jmap`'s `max_concurrent_requests` (the per-account
+/// HTTP concurrency limit) set for the guard's lifetime. Tokens built while
+/// it is set carry it, so a test sets it before its caller first
+/// authenticates. `restore` puts the prior value back and reloads the
+/// settings; a guard dropped without it (a panic) does the same from its
+/// drop, on a thread of its own, as `MaxRecipientsGuard` does.
+#[must_use = "dropping the guard restores max_concurrent_requests"]
+pub struct ConcurrentRequestsGuard {
+    admin: Option<Account>,
+    prior: Option<u64>,
+}
+
+impl ConcurrentRequestsGuard {
+    pub async fn set(admin: &Account, max_concurrent_requests: u64) -> Self {
+        use registry::schema::structs::Jmap;
+        let prior = admin
+            .registry_get::<Jmap>(types::id::Id::singleton())
+            .await
+            .max_concurrent_requests;
+        set_max_concurrent_requests(admin, Some(max_concurrent_requests)).await;
+        ConcurrentRequestsGuard {
+            admin: Some(admin.clone()),
+            prior,
+        }
+    }
+
+    pub async fn restore(mut self) {
+        if let Some(admin) = self.admin.take() {
+            set_max_concurrent_requests(&admin, self.prior).await;
+        }
+    }
+}
+
+impl Drop for ConcurrentRequestsGuard {
+    fn drop(&mut self) {
+        if let Some(admin) = self.admin.take() {
+            let prior = self.prior;
+            let _ = std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("a runtime for the restore")
+                    .block_on(set_max_concurrent_requests(&admin, prior));
+            })
+            .join();
+        }
+    }
+}
+
+async fn set_max_concurrent_requests(admin: &Account, max_concurrent_requests: Option<u64>) {
+    use registry::schema::{prelude::Property, structs::Jmap};
+    admin
+        .registry_update_setting(
+            Jmap {
+                max_concurrent_requests,
+                ..Default::default()
+            },
+            &[Property::MaxConcurrentRequests],
+        )
+        .await;
+    admin.reload_settings().await;
+}
+
 /// The task manager's consumer held at `TASK_CONSUMER_PAUSE`; dropping it
 /// releases the consumer.
 pub struct ConsumerHeld {
@@ -905,8 +1511,12 @@ pub async fn itip_tasks_for(test: &TestServer, account_id: u32) -> usize {
         .store()
         .iterate(
             IterateParams::new(
-                ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task { id: 0 })),
-                ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task { id: u64::MAX })),
+                ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task {
+                    id: TaskId::Assigned(0),
+                })),
+                ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task {
+                    id: TaskId::Assigned(u64::MAX),
+                })),
             )
             .ascending(),
             |_, value| {
@@ -977,6 +1587,8 @@ pub async fn plant_inbox_item(
     created: Option<i64>,
 ) -> u32 {
     let mut tree = parse_ical(ical);
+    // `Some(pending)` for the fork's own item shape, `None` for a plain one.
+    let mut fork_item = None;
     let flags = match item {
         PlantedItem::Pending { pair, reply_token } => {
             let record = test
@@ -1000,92 +1612,200 @@ pub async fn plant_inbox_item(
                 reply_token.as_ref(),
             )
             .unwrap();
+            fork_item = Some(true);
             EVENT_NOTIFICATION_ZA_PENDING
         }
         PlantedItem::Drained { password } => {
             let keys = za_unlock(test, account_id, password).await;
             seal_drained_item(&mut tree, &keys, account_id).unwrap();
+            fork_item = Some(false);
             0
         }
         PlantedItem::Plain { flags } => flags,
     };
+    // Upgrade ruling 13: a fork item is a row and an `Itip` content with no
+    // snapshot (`seal::item::sealed_item_record`'s shape); the row's size
+    // comes from upstream's builder. A planted plain item keeps that shape
+    // with the flags given.
     let now = store::write::now() as i64;
-    let item = CalendarEventNotification {
-        event: tree,
-        event_id: None,
-        changed_by: ChangedBy::PrincipalId(sender),
-        flags,
-        size: ical.len() as u32,
-        created: created.unwrap_or(now),
-        modified: now,
+    let (mut meta, content) = match fork_item {
+        Some(pending) => groupware::calendar::seal::item::sealed_item_record(
+            tree,
+            ChangedBy::PrincipalId(sender),
+            None,
+            pending,
+        ),
+        None => (
+            CalendarEventNotification {
+                changed_by: ChangedBy::PrincipalId(sender),
+                flags,
+                ..Default::default()
+            },
+            CalendarEventNotificationContent::Itip {
+                message: tree,
+                previous: None,
+                current: None,
+            },
+        ),
     };
-    let account_info = test.server.account_info(account_id).await.unwrap();
-    let document_id = test
+    meta.created = created.unwrap_or(now);
+    meta.modified = now;
+    let changed_by = test
         .server
-        .store()
-        .assign_document_ids(account_id, Collection::CalendarEventNotification, 1)
+        .account_info(account_id)
         .await
-        .unwrap();
+        .unwrap()
+        .changed_by();
     let mut batch = BatchBuilder::new();
+    let slot = batch.reserve_document_id(account_id, Collection::CalendarEventNotification);
     batch
         .with_account_id(account_id)
         .with_collection(Collection::CalendarEventNotification)
-        .with_document(document_id)
+        .with_pending_document(slot.into())
         .custom(
             ObjectIndexBuilder::<(), _>::new()
-                .with_changes(item)
-                .with_changed_by(account_info.account_tenant_ids()),
+                .with_changes(GroupwareWrite::full(meta, content, ()).unwrap())
+                .with_changed_by(changed_by),
         )
         .unwrap()
         .commit_point();
-    test.server.commit_batch(batch).await.unwrap();
+    let document_id = test.server.commit_batch(batch).await.unwrap().slot(slot);
     test.server
-        .invalidate_local_caches(&[CacheInvalidation::DavResources(account_id)])
-        .await;
+        .invalidate_local_caches(&[CacheInvalidation::GroupwareResources(account_id)]);
     document_id
 }
 
 /// Rewrites a planted item in place, same document id, as the drain's commit
-/// will (spec 6.4 step 5): `edit` changes the stored item, and the write
-/// asserts the archive it read.
+/// does (spec 6.4 step 5): `edit` changes the stored item, and the write
+/// asserts the row it read (`SplitUpdate::full` over the row and content).
 pub async fn rewrite_inbox_item(
     test: &TestServer,
     account_id: u32,
     document_id: u32,
-    edit: impl FnOnce(&mut CalendarEventNotification),
+    edit: impl FnOnce(&mut InboxItem),
 ) {
-    let stored = test
+    let (meta_archive, content_archive) = inbox_records(test, account_id, document_id)
+        .await
+        .expect("inbox item");
+    let meta = meta_archive
+        .deserialize::<CalendarEventNotification>()
+        .unwrap();
+    let mut item = InboxItem::new(
+        meta.clone(),
+        content_archive
+            .deserialize::<CalendarEventNotificationContent>()
+            .unwrap(),
+    );
+    edit(&mut item);
+    let content = match item.content {
+        CalendarEventNotificationContent::Itip {
+            previous, current, ..
+        } => CalendarEventNotificationContent::Itip {
+            message: item.event,
+            previous,
+            current,
+        },
+        direct => direct,
+    };
+    let next = CalendarEventNotification {
+        event_id: item.event_id,
+        changed_by: item.changed_by,
+        calendar_ids: item.calendar_ids,
+        flags: item.flags,
+        created: item.created,
+        modified: store::write::now() as i64,
+        ..meta
+    };
+    let changed_by = test
         .server
-        .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
-            account_id,
-            Collection::CalendarEventNotification,
-            document_id,
-        ))
+        .account_info(account_id)
         .await
         .unwrap()
-        .expect("inbox item");
-    let mut item = stored.deserialize::<CalendarEventNotification>().unwrap();
-    edit(&mut item);
-    item.modified = store::write::now() as i64;
-    let account_info = test.server.account_info(account_id).await.unwrap();
+        .changed_by();
     let mut batch = BatchBuilder::new();
     batch
         .with_account_id(account_id)
         .with_collection(Collection::CalendarEventNotification)
         .with_document(document_id)
         .custom(
-            ObjectIndexBuilder::new()
-                .with_current(stored.to_unarchived::<CalendarEventNotification>().unwrap())
-                .with_changes(item)
-                .with_changed_by(account_info.account_tenant_ids()),
+            common::storage::index::SplitUpdate::full(
+                meta_archive
+                    .to_unarchived::<CalendarEventNotification>()
+                    .unwrap(),
+                content_archive
+                    .unarchive::<CalendarEventNotificationContent>()
+                    .unwrap(),
+                next,
+                content,
+                (),
+            )
+            .unwrap()
+            .into_builder(changed_by, None),
         )
         .unwrap()
         .commit_point();
     test.server.commit_batch(batch).await.unwrap();
     test.server
-        .invalidate_local_caches(&[CacheInvalidation::DavResources(account_id)])
-        .await;
+        .invalidate_local_caches(&[CacheInvalidation::GroupwareResources(account_id)]);
+}
+
+/// True for a stored inbox item whose pending bit is set (spec 9).
+pub async fn inbox_item_is_pending(test: &TestServer, account_id: u32, document_id: u32) -> bool {
+    inbox_records(test, account_id, document_id)
+        .await
+        .is_some_and(|(meta, _)| {
+            groupware::calendar::seal::archived_item_is_pending(
+                meta.unarchive::<CalendarEventNotification>().unwrap(),
+            )
+        })
+}
+
+/// Deletes an inbox item at store level, as `itip_auto_expunge` does. Upgrade
+/// ruling 176 (B-M4): a client's DELETE of a pending item answers 404, as
+/// its GET does, so cleanups (and the races that need an item gone under
+/// the drain) remove pending items here.
+pub async fn destroy_inbox_item(test: &TestServer, account_id: u32, document_id: u32) {
+    let Some((meta, _)) = inbox_records(test, account_id, document_id).await else {
+        return;
+    };
+    let changed_by = test
+        .server
+        .account_info(account_id)
+        .await
+        .unwrap()
+        .changed_by();
+    let mut batch = BatchBuilder::new();
+    groupware::DestroyArchive(meta.to_unarchived::<CalendarEventNotification>().unwrap())
+        .delete(changed_by, account_id, document_id, &mut batch)
+        .unwrap();
+    test.server.commit_batch(batch).await.unwrap();
+    test.server
+        .invalidate_local_caches(&[CacheInvalidation::GroupwareResources(account_id)]);
+}
+
+/// Deletes `client`'s own inbox item: by href (upstream's DELETE, 204), or
+/// at store level when it is pending (`destroy_inbox_item`).
+pub async fn delete_inbox_item(
+    test: &TestServer,
+    client: &crate::utils::webdav::DummyWebDavClient,
+    account_id: u32,
+    document_id: u32,
+) {
+    if inbox_item_is_pending(test, account_id, document_id).await {
+        destroy_inbox_item(test, account_id, document_id).await;
+    } else {
+        client
+            .request(
+                "DELETE",
+                &format!(
+                    "/dav/itip/{}/inbox/{document_id}.ics",
+                    client.name.replace('@', "%40")
+                ),
+                "",
+            )
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
 }
 
 /// An app password of `name`: a second session of the account (invitations
@@ -1099,53 +1819,73 @@ pub async fn za_app_password(name: &str, password: &str, description: &str) -> S
     .str(200, "app_password")
 }
 
-/// An OAuth access token of `name`, through the server's own flow: an
-/// authorization code from `/api/auth`, exchanged at `/auth/token` (the
-/// suite requires no client registration). The token holds no keys.
-pub async fn bearer_token(name: &str, password: &str) -> String {
-    const CLIENT_ID: &str = "za-bearer-test";
-    const REDIRECT_URI: &str = "https://client.example.com/callback";
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .unwrap();
-    let reply: Value = client
-        .post(format!("{SERVER_URL}/api/auth"))
-        .json(&json!({
-            "type": "authCode",
-            "accountName": name,
-            "accountSecret": password,
-            "clientId": CLIENT_ID,
-            "redirectUri": REDIRECT_URI,
-        }))
-        .send()
+/// An OAuth grant of `name` restricted to `scopes`, for a third-party
+/// (`Registered`) client, and an access token bound to it, minted
+/// in-process with the server's own helpers. 1.0 binds every access token
+/// to a grant and resolves only registered, stateless or metadata-document
+/// clients, so 0.16's `/api/auth` and `/auth/token` flow no longer applies; the
+/// caller revokes the grant (`GrantDeletion`) when it is done. Returns the
+/// grant id and the token.
+pub async fn za_grant_token(
+    server: &common::Server,
+    name: &str,
+    scopes: common::auth::oauth::scope::OAuthScopes,
+) -> (u64, String) {
+    let account_id = server
+        .account_id_from_email(name, false)
         .await
         .unwrap()
-        .json()
+        .unwrap_or_else(|| panic!("no account {name}"));
+    let grant_id = server
+        .create_oauth_grant(common::auth::oauth::grant::NewOAuthGrant {
+            account_id,
+            client_id: "za-test-client",
+            client_name: None,
+            client_kind: registry::schema::enums::OAuthClientKind::Registered,
+            scopes,
+            remote_ip: std::net::IpAddr::from([127, 0, 0, 1]),
+        })
         .await
         .unwrap();
-    let code = reply["client_code"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no authorization code: {reply}"));
-    let reply: Value = client
-        .post(format!("{SERVER_URL}/auth/token"))
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("client_id", CLIENT_ID),
-            ("redirect_uri", REDIRECT_URI),
-        ])
-        .send()
+    let credential_version = server
+        .access_token(account_id)
         .await
         .unwrap()
-        .json()
-        .await
+        .credential_version();
+    let token = server
+        .encode_grant_access_token(account_id, name, grant_id, credential_version)
         .unwrap();
-    reply["access_token"]
-        .as_str()
-        .unwrap_or_else(|| panic!("no access token: {reply}"))
-        .to_string()
+    (grant_id, token)
+}
+
+/// Deletes the grant `za_grant_token` created and applies its invalidation
+/// (1.0's `GrantRevocations::evict`).
+pub async fn za_revoke_grant(server: &common::Server, grant_id: u64) {
+    let stored = server
+        .oauth_grant(grant_id)
+        .await
+        .unwrap()
+        .expect("the grant exists");
+    let mut invalidator = common::cache::invalidate::CacheInvalidationBuilder::default();
+    assert!(
+        server
+            .delete_oauth_grant(
+                stored,
+                common::auth::oauth::grant::GrantDeletion::Unconditional,
+                &mut invalidator,
+            )
+            .await
+            .unwrap()
+    );
+    server.invalidate_caches(invalidator).await.unwrap();
+}
+
+/// An OAuth access token of `name` with every scope (`za_grant_token`). The
+/// token holds no keys.
+pub async fn za_bearer_token(server: &common::Server, name: &str) -> String {
+    za_grant_token(server, name, common::auth::oauth::scope::OAuthScopes::ALL)
+        .await
+        .1
 }
 
 /// A fresh TOTP enrolment URL (a random 20-byte secret).
@@ -1292,7 +2032,7 @@ pub async fn copy_href(test: &TestServer, account_id: u32, uid: &str) -> String 
     assert_eq!(ids.len(), 1, "{uid}: {} copies", ids.len());
     let resources = test
         .server
-        .fetch_dav_resources(account_id, account_id, SyncCollection::Calendar)
+        .fetch_groupware_resources(account_id, account_id, SyncCollection::Calendar)
         .await
         .unwrap();
     // Calendars and events number their documents separately, so a
@@ -1462,7 +2202,7 @@ pub async fn set_raw_pins(test: &TestServer, account_id: u32, raw: Option<&[u8]>
         Some(raw) => batch.set(PrincipalField::ZeroAccessPins, raw.to_vec()),
         None => batch.clear(PrincipalField::ZeroAccessPins),
     };
-    test.server.store().write(batch.build_all()).await.unwrap();
+    test.server.store().write_batch(&mut batch).await.unwrap();
 }
 
 /// The account's vault revision, its authentication generation.
@@ -1491,7 +2231,7 @@ pub fn normalize_sharing_copy(mut ical: ICalendar, uid: &str) -> ICalendar {
         });
         for entry in &mut component.entries {
             if entry.name == ICalendarProperty::Uid {
-                entry.values = vec![ICalendarValue::Text(uid.into())];
+                entry.values = vec![ICalendarValue::Text(uid.into())].into();
             } else if entry.name == ICalendarProperty::Organizer {
                 entry
                     .params
@@ -1555,4 +2295,340 @@ pub async fn sharing_dav_request(
         headers,
         body,
     }
+}
+
+/// The account-partitioned indexes of 1.0's index queue (Task 1's ruling
+/// 22): their partition is the account, so their entries and status key
+/// are the account's.
+pub const ACCOUNT_INDEXES: [SearchIndex; 4] = [
+    SearchIndex::Email,
+    SearchIndex::Calendar,
+    SearchIndex::Contacts,
+    SearchIndex::File,
+];
+
+/// One entry of 1.0's search index queue (`SearchIndexClass::Queue`, in the
+/// data store): the index, the document and whether it indexes (`true`,
+/// value `1`) or unindexes (value `0`), as `read_queue` reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueEntry {
+    pub index: SearchIndex,
+    pub document_id: u32,
+    pub insert: bool,
+}
+
+/// The account's index-queue entries in every account-partitioned index,
+/// in queue order (index, document, creation). A key is the index byte, the
+/// partition (the account, u32 BE), the document id (u32 BE) and the
+/// creation id (u64 BE).
+pub async fn queue_entries(test: &TestServer, account_id: u32) -> Vec<QueueEntry> {
+    let mut entries = Vec::new();
+    for index in ACCOUNT_INDEXES {
+        let (from, to) = SearchIndexClass::queue_range(index, account_id);
+        test.server
+            .store()
+            .iterate(
+                IterateParams::new(
+                    ValueKey::from(ValueClass::SearchIndex(from)),
+                    ValueKey::from(ValueClass::SearchIndex(to)),
+                )
+                .ascending(),
+                |key, value| {
+                    entries.push(QueueEntry {
+                        index,
+                        document_id: key.deserialize_be_u32(1 + U32_LEN)?,
+                        insert: value.first().is_some_and(|action| *action != 0),
+                    });
+                    Ok(true)
+                },
+            )
+            .await
+            .unwrap();
+    }
+    entries
+}
+
+/// The status key of the account's partition in `index`
+/// (`SearchIndexClass::QueueStatus`): set by a failed pass, by
+/// `x:IndexQueueStatus/set` and by `hold_index_partition`, cleared by the
+/// next pass that completes.
+pub async fn partition_status(
+    test: &TestServer,
+    index: SearchIndex,
+    account_id: u32,
+) -> Option<SearchIndexStatus> {
+    test.server
+        .search_index_status(index, account_id)
+        .await
+        .unwrap()
+}
+
+/// The reason `hold_index_partition` writes into the status key.
+pub const HELD_REASON: &str = "held by the za suite";
+
+/// Holds the account's partition of `index` in the index queue: its status
+/// key is written as a failed pass writes it (and as `x:IndexQueueStatus/set`
+/// with a `Failed` status does), with its retry an hour away, so the
+/// manager's scan skips the partition (`scan_index_queue` skips a status
+/// whose retry is in the future) while its entries stay stored. 1.0's
+/// stand-in for 0.16's held task consumer, which does not hold the index
+/// queue. Call it only while the partition is idle (no pass in flight);
+/// `TestServer::wait_for_tasks` waits for a held partition, so release it
+/// first.
+pub async fn hold_index_partition(test: &TestServer, index: SearchIndex, account_id: u32) {
+    let mut batch = BatchBuilder::new();
+    batch.set(
+        ValueClass::SearchIndex(SearchIndexClass::QueueStatus {
+            index,
+            partition: account_id,
+        }),
+        SearchIndexStatus {
+            next_retry: now() + 3600,
+            attempts: 0,
+            reason: HELD_REASON.to_string(),
+        }
+        .serialize(),
+    );
+    test.server.store().write_batch(&mut batch).await.unwrap();
+}
+
+/// Releases `hold_index_partition`'s hold (or a failed pass's retry state,
+/// as `x:IndexQueueStatus/set` with a `Running` status does): the status key
+/// is cleared and the manager is woken, so the partition runs at once.
+/// Takes a `Server` so a parked request's future can call it.
+pub async fn release_index_partition(server: &common::Server, index: SearchIndex, account_id: u32) {
+    let mut batch = BatchBuilder::new();
+    batch.clear(ValueClass::SearchIndex(SearchIndexClass::QueueStatus {
+        index,
+        partition: account_id,
+    }));
+    server.store().write_batch(&mut batch).await.unwrap();
+    server.notify_index_queue();
+}
+
+/// Waits (at most `limit`) until the account has no index-queue entry and no
+/// partition status in any account-partitioned index; panics naming what is
+/// left. Unlike `TestServer::wait_for_tasks`, it does not wait out a
+/// partition's retry delay: it fails if the queue is not drained in time.
+pub async fn wait_for_index_queue(test: &TestServer, account_id: u32, limit: Duration) {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        let entries = queue_entries(test, account_id).await;
+        let mut statuses = Vec::new();
+        for index in ACCOUNT_INDEXES {
+            if let Some(status) = partition_status(test, index, account_id).await {
+                statuses.push((index, status));
+            }
+        }
+        if entries.is_empty() && statuses.is_empty() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the index queue of account {account_id} did not drain in {limit:?}: \
+             entries {entries:?}, statuses {statuses:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The internal search store (the suites run on it).
+pub fn internal_search(test: &TestServer) -> store::Store {
+    test.server
+        .search_store()
+        .internal_fts()
+        .expect("the suite runs on the internal search store")
+        .clone()
+}
+
+/// Writes `documents` into the account's `index` straight through the
+/// internal search store, as the index worker's flush writes them (one
+/// `index_account_documents` pass). 1.0's `SearchStore::index` is not
+/// available on the internal store.
+pub async fn index_search_documents(
+    test: &TestServer,
+    index: SearchIndex,
+    account_id: u32,
+    documents: Vec<store::search::IndexDocument>,
+) {
+    internal_search(test)
+        .index_account_documents(account_id, index, documents, vec![])
+        .await
+        .unwrap();
+}
+
+/// Unindexes `document_ids` of the account's `index` as the index worker's
+/// deletions do: each stored `Document` key and every term it lists.
+pub async fn unindex_search_documents(
+    test: &TestServer,
+    index: SearchIndex,
+    account_id: u32,
+    document_ids: Vec<u32>,
+) {
+    internal_search(test)
+        .index_account_documents(account_id, index, vec![], document_ids)
+        .await
+        .unwrap();
+}
+
+/// Removes every key of the account in `index` (`Store::unindex_account`,
+/// the range delete account destruction runs): R62's remedy for orphaned
+/// terms.
+pub async fn unindex_search_account(test: &TestServer, index: SearchIndex, account_id: u32) {
+    internal_search(test)
+        .unindex_account(index, account_id)
+        .await
+        .unwrap();
+}
+
+/// The stored value of a search document that holds no term and no field
+/// position (`Document::encode` then `Writer::into_document`,
+/// `store/src/search/{term,codec}.rs`, crate-private): the term count 0,
+/// the field count 0 (LEB128) and the plain marker 0. A key account's
+/// Email document holds its ids only (ruling 64), so its stored value is
+/// exactly this.
+pub const IDS_ONLY_DOCUMENT: [u8; 3] = [0, 0, 0];
+
+/// The account's keys in one index of the internal search store: its
+/// `Document` keys (`Subspace::SearchDocument`: the index byte, the account
+/// id and the document id) with their values, and its `Term` keys
+/// (`Subspace::SearchTerm`: the index byte, the account id, the term group,
+/// the term's `CheekyHash` key bytes, their length, the field and the block
+/// id, u16 BE), with each term's key bytes, which are the token itself for
+/// one of up to 16 bytes. 1.0 has no separate `Index` keys: integer and
+/// keyword fields are terms too.
+#[derive(Default)]
+pub struct SearchKeys {
+    pub documents: Vec<(u32, Vec<u8>)>,
+    pub terms: usize,
+    pub term_payloads: Vec<Vec<u8>>,
+}
+
+impl SearchKeys {
+    pub fn is_empty(&self) -> bool {
+        self.documents.is_empty() && self.terms == 0
+    }
+
+    pub fn document_ids(&self) -> Vec<u32> {
+        self.documents.iter().map(|(id, _)| *id).collect()
+    }
+
+    pub fn holds_term(&self, token: &str) -> bool {
+        self.term_payloads
+            .iter()
+            .any(|payload| payload == token.as_bytes())
+    }
+
+    /// Whether every stored document holds its ids only (`IDS_ONLY_DOCUMENT`).
+    pub fn documents_are_ids_only(&self) -> bool {
+        self.documents
+            .iter()
+            .all(|(_, value)| value.as_slice() == IDS_ONLY_DOCUMENT)
+    }
+}
+
+/// Counts only: the payloads of a large document would flood a failure.
+impl std::fmt::Debug for SearchKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "documents {:?} ({} ids only), {} term keys",
+            self.document_ids(),
+            self.documents
+                .iter()
+                .filter(|(_, value)| value.as_slice() == IDS_ONLY_DOCUMENT)
+                .count(),
+            self.terms
+        )
+    }
+}
+
+/// `SearchKeys` of `account_id` in `index`, read raw from the internal
+/// search store.
+pub async fn search_keys(test: &TestServer, account_id: u32, index: SearchIndex) -> SearchKeys {
+    const TERM_BASE: usize = 1 + U32_LEN + 1;
+    let store = internal_search(test);
+    let mut prefix = vec![index.to_u8()];
+    prefix.extend_from_slice(&account_id.to_be_bytes());
+    let mut end = prefix.clone();
+    end.extend_from_slice(&[u8::MAX; 64]);
+    let mut keys = SearchKeys::default();
+    store
+        .iterate(
+            IterateParams::new(
+                AnyKey {
+                    subspace: Subspace::SearchDocument,
+                    key: prefix.clone(),
+                },
+                AnyKey {
+                    subspace: Subspace::SearchDocument,
+                    key: end.clone(),
+                },
+            ),
+            |key, value| {
+                if key.len() == 1 + U32_LEN * 2 {
+                    keys.documents
+                        .push((key.deserialize_be_u32(1 + U32_LEN)?, value.to_vec()));
+                }
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .iterate(
+            IterateParams::new(
+                AnyKey {
+                    subspace: Subspace::SearchTerm,
+                    key: prefix,
+                },
+                AnyKey {
+                    subspace: Subspace::SearchTerm,
+                    key: end,
+                },
+            )
+            .no_values(),
+            |key, _| {
+                keys.terms += 1;
+                // The term's key bytes: after the base, before its length,
+                // field and block id.
+                if let Some(payload) = key
+                    .len()
+                    .checked_sub(4)
+                    .and_then(|end| key.get(TERM_BASE..end))
+                {
+                    keys.term_payloads.push(payload.to_vec());
+                }
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+    keys
+}
+
+/// Deletes the account's event `document_id` straight from the store, as a
+/// DELETE does without its scheduling (`DestroyArchive::delete_all`: the
+/// row, the content record, the alarms and the index-queue unindex entry),
+/// and wakes the index queue.
+pub async fn delete_event_records(test: &TestServer, account_id: u32, document_id: u32) {
+    let (meta, content) = event_records(test, account_id, document_id).await;
+    let account_info = test.server.account_info(account_id).await.unwrap();
+    let mut batch = BatchBuilder::new();
+    groupware::DestroyArchive(meta.to_unarchived::<CalendarEvent>().unwrap())
+        .delete_all(
+            &test.server,
+            &account_info,
+            account_id,
+            document_id,
+            Some(content),
+            false,
+            &mut batch,
+        )
+        .await
+        .unwrap();
+    test.server.commit_batch(batch).await.unwrap();
+    test.server.notify_index_queue();
+    test.server
+        .invalidate_local_caches(&[CacheInvalidation::GroupwareResources(account_id)]);
 }

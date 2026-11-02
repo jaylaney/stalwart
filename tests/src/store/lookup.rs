@@ -4,13 +4,10 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::utils::{
-    cleanup::{store_assert_is_empty, store_destroy},
-    server::TestServerBuilder,
-};
+use crate::utils::server::TestServerBuilder;
 use registry::schema::structs::Rate;
 use registry::types::duration::Duration;
-use store::{InMemoryStore, dispatch::lookup::KeyValue};
+use store::dispatch::lookup::KeyValue;
 
 #[tokio::test]
 pub async fn lookup_tests() {
@@ -25,15 +22,17 @@ pub async fn lookup_tests() {
         "Testing in-memory store {}...",
         std::env::var("MEMORY_STORE").unwrap_or_else(|_| "default".to_string())
     );
-    if let InMemoryStore::Store(store) = &store {
-        store_destroy(store).await;
-    } else {
-        // Reset redis counter
-        store
-            .key_set(KeyValue::new("abc", "0".as_bytes().to_vec()))
-            .await
-            .unwrap();
-    }
+    // Upgrade ruling 75 (subject deleted): 1.0 has no in-memory store kept in the
+    // data store (`InMemoryStore::Sql` refuses every operation), so 0.16's
+    // `InMemoryStore::Store` branches, their `store_destroy` and
+    // `store_assert_is_empty` checks, and the `purge_in_memory_store` calls
+    // (a local store expires entries when read) have no subject. 1.0 has
+    // no `counter_get`: a counter is read as an increment by zero.
+    // Reset the counter
+    store
+        .key_set(KeyValue::new("abc", "0".as_bytes().to_vec()))
+        .await
+        .unwrap();
 
     // Test key
     let key = "xyz".as_bytes().to_vec();
@@ -41,7 +40,6 @@ pub async fn lookup_tests() {
         .key_set(KeyValue::new(key.clone(), "world".to_string().into_bytes()))
         .await
         .unwrap();
-    store.purge_in_memory_store().await.unwrap();
     assert_eq!(
         store.key_get::<String>(key.clone()).await.unwrap(),
         Some("world".to_string())
@@ -59,51 +57,54 @@ pub async fn lookup_tests() {
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
     assert_eq!(None, store.key_get::<String>(key.clone()).await.unwrap());
 
-    store.purge_in_memory_store().await.unwrap();
-    if let InMemoryStore::Store(store) = &store {
-        store_assert_is_empty(store, store.clone().into(), false).await;
-    }
-
     // Test counter
     let key = "abc".as_bytes().to_vec();
+    store.key_incr(KeyValue::new(key.clone(), 1)).await.unwrap();
+    assert_eq!(
+        1,
+        store.key_incr(KeyValue::new(key.clone(), 0)).await.unwrap()
+    );
+    store.key_incr(KeyValue::new(key.clone(), 2)).await.unwrap();
+    assert_eq!(
+        3,
+        store.key_incr(KeyValue::new(key.clone(), 0)).await.unwrap()
+    );
     store
-        .counter_incr(KeyValue::new(key.clone(), 1), true)
+        .key_incr(KeyValue::new(key.clone(), -3))
         .await
         .unwrap();
-    assert_eq!(1, store.counter_get(key.clone()).await.unwrap());
-    store
-        .counter_incr(KeyValue::new(key.clone(), 2), true)
-        .await
-        .unwrap();
-    assert_eq!(3, store.counter_get(key.clone()).await.unwrap());
-    store
-        .counter_incr(KeyValue::new(key.clone(), -3), false)
-        .await
-        .unwrap();
-    assert_eq!(0, store.counter_get(key.clone()).await.unwrap());
+    assert_eq!(
+        0,
+        store.key_incr(KeyValue::new(key.clone(), 0)).await.unwrap()
+    );
 
     // Test counter expiry
     let key = "fgh".as_bytes().to_vec();
     store
-        .counter_incr(KeyValue::new(key.clone(), 1).expires(1), false)
+        .key_incr(KeyValue::new(key.clone(), 1).expires(1))
         .await
         .unwrap();
-    assert_eq!(1, store.counter_get(key.clone()).await.unwrap());
+    assert_eq!(
+        1,
+        store.key_incr(KeyValue::new(key.clone(), 0)).await.unwrap()
+    );
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    store.purge_in_memory_store().await.unwrap();
-    assert_eq!(0, store.counter_get(key.clone()).await.unwrap());
+    assert_eq!(
+        0,
+        store.key_incr(KeyValue::new(key.clone(), 0)).await.unwrap()
+    );
 
     // Test rate limiter
     assert!(
         store
-            .is_rate_allowed(0, "rate".as_bytes(), &rate, false)
+            .is_rate_allowed(0, "rate".as_bytes(), &rate)
             .await
             .unwrap()
             .is_none()
     );
     assert!(
         store
-            .is_rate_allowed(0, "rate".as_bytes(), &rate, false)
+            .is_rate_allowed(0, "rate".as_bytes(), &rate)
             .await
             .unwrap()
             .is_some()
@@ -111,16 +112,12 @@ pub async fn lookup_tests() {
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     assert!(
         store
-            .is_rate_allowed(0, "rate".as_bytes(), &rate, false)
+            .is_rate_allowed(0, "rate".as_bytes(), &rate)
             .await
             .unwrap()
             .is_none()
     );
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    store.purge_in_memory_store().await.unwrap();
-    if let InMemoryStore::Store(store) = &store {
-        store_assert_is_empty(store, store.clone().into(), false).await;
-    }
 
     // Test locking
     for iteration in [1, 2] {
@@ -143,7 +140,6 @@ pub async fn lookup_tests() {
         // Wait 2 seconds for the lock to expire
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
     }
-    store.purge_in_memory_store().await.unwrap();
 
     // Failed lock attempts must not extend the lock expiry
     assert!(store.try_lock(0, "lock".as_bytes(), 2).await.unwrap());
@@ -157,10 +153,6 @@ pub async fn lookup_tests() {
     }
     assert!(acquired, "Abandoned lock was never released");
     store.remove_lock(0, "lock".as_bytes()).await.unwrap();
-    store.purge_in_memory_store().await.unwrap();
-    if let InMemoryStore::Store(store) = &store {
-        store_assert_is_empty(store, store.clone().into(), false).await;
-    }
 
     // Test prefix delete
     store
@@ -181,10 +173,7 @@ pub async fn lookup_tests() {
             .await
             .unwrap();
         store
-            .counter_incr(
-                KeyValue::with_prefix(0, pack_u32(1, v), 123).expires(3600),
-                false,
-            )
+            .key_incr(KeyValue::with_prefix(0, pack_u32(1, v), 123).expires(3600))
             .await
             .unwrap();
     }
@@ -212,7 +201,10 @@ pub async fn lookup_tests() {
         assert_ne!(
             0,
             store
-                .counter_get(KeyValue::<()>::build_key(0, pack_u32(1, v)))
+                .key_incr(KeyValue::new(
+                    KeyValue::<()>::build_key(0, pack_u32(1, v)),
+                    0
+                ))
                 .await
                 .unwrap()
         );
@@ -247,7 +239,10 @@ pub async fn lookup_tests() {
         assert_eq!(
             0,
             store
-                .counter_get(KeyValue::<()>::build_key(0, pack_u32(1, v)))
+                .key_incr(KeyValue::new(
+                    KeyValue::<()>::build_key(0, pack_u32(1, v)),
+                    0
+                ))
                 .await
                 .unwrap()
         );
@@ -289,10 +284,6 @@ pub async fn lookup_tests() {
             .unwrap()
             .as_deref()
     );
-
-    if let InMemoryStore::Store(store) = &store {
-        store_assert_is_empty(store, store.clone().into(), false).await;
-    }
 }
 
 fn pack_u32(a: u32, b: u32) -> Vec<u8> {

@@ -25,6 +25,8 @@ pub async fn test(test: &TestServer) {
         let base_path = format!("{}/john%40example.com", resource_type.base_path());
 
         // Test 1: Creating a collection under an unmapped resource without providing a lock token should fail
+        // (1.0 echoes the owner's `href` in the DAV namespace the request gave it;
+        // 0.16 echoed it unprefixed.)
         let path = format!("{base_path}/do-not-write");
         let response = client
             .lock_create(&path, "super-owner", true, "infinity", "Second-123")
@@ -32,7 +34,7 @@ pub async fn test(test: &TestServer) {
             .with_status(StatusCode::CREATED);
         let lock_token = response
             .with_value(
-                "D:prop.D:lockdiscovery.D:activelock.D:owner.href",
+                "D:prop.D:lockdiscovery.D:activelock.D:owner.D:href",
                 "super-owner",
             )
             .with_value("D:prop.D:lockdiscovery.D:activelock.D:depth", "infinity")
@@ -55,7 +57,7 @@ pub async fn test(test: &TestServer) {
             .await
             .with_status(StatusCode::OK)
             .with_value(
-                "D:prop.D:lockdiscovery.D:activelock.D:owner.href",
+                "D:prop.D:lockdiscovery.D:activelock.D:owner.D:href",
                 "super-owner",
             )
             .with_any_value(
@@ -117,7 +119,7 @@ pub async fn test(test: &TestServer) {
             props
                 .get(DavProperty::WebDav(WebDavProperty::LockDiscovery))
                 .with_some_values([
-                    "D:activelock.D:owner.href:super-owner",
+                    "D:activelock.D:owner.D:href:super-owner",
                     "D:activelock.D:depth:infinity",
                     format!("D:activelock.D:locktoken.D:href:{lock_token}").as_str(),
                     format!("D:activelock.D:lockroot.D:href:{path}").as_str(),
@@ -162,7 +164,7 @@ pub async fn test(test: &TestServer) {
         client
             .lock_create(
                 &path,
-                (0..=test.server.core.groupware.dead_property_size.unwrap() + 1)
+                (0..=test.server.core.metadata.max_entry_size + 1)
                     .map(|_| "a")
                     .collect::<String>()
                     .as_str(),

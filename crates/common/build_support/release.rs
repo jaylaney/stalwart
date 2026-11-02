@@ -124,7 +124,14 @@ pub fn emit(root: &Path) {
                 &["rev-parse", "--path-format=absolute", "--git-path", name],
             )
             .expect("Failed to locate Git build metadata");
-            watch(Path::new(path.trim()));
+            // Cargo reruns a build script whose watched path is missing, so
+            // a path Git has not created yet (`packed-refs` in a fresh clone)
+            // is not watched. Git creates it only by moving loose refs out of
+            // `refs`, which is watched, so the next build watches it.
+            let path = Path::new(path.trim());
+            if path.exists() {
+                watch(path);
+            }
         }
         // Track dirty-state changes too, not only branch/ref changes. NUL delimiters preserve spaces.
         let files = git(root, &["ls-files", "-z"]).expect("Failed to enumerate source files");

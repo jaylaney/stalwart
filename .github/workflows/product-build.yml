@@ -34,6 +34,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
+          # verify_product.py checks that the pinned upstream commit is in the
+          # source's history, and that no later upstream release is.
+          fetch-depth: 0
 
       - name: Record source commit
         id: source

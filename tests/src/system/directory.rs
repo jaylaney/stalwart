@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use crate::utils::{jmap::JmapUtils, server::TestServer};
+use crate::utils::server::TestServer;
 use common::{
     auth::{ACCOUNT_IS_USER, EmailAddress, EmailCache},
     network::RcptResolution,
@@ -38,7 +38,7 @@ pub async fn test(test: &TestServer) {
             dns_management: DnsManagement::Manual,
             dkim_management: DkimManagement::Manual,
             aliases: Map::new(vec!["beispiel.de".to_string()]),
-            is_enabled: true,
+            enable: true,
             catch_all_address: Some("catchy@example.com".to_string()),
             sub_addressing: SubAddressing::Enabled,
             ..Default::default()
@@ -122,7 +122,7 @@ pub async fn test(test: &TestServer) {
             aliases: List::from_iter([EmailAlias {
                 name: "inva..lid".to_string(),
                 domain_id,
-                enabled: true,
+                enable: true,
                 ..Default::default()
             }]),
             ..Default::default()
@@ -144,7 +144,7 @@ pub async fn test(test: &TestServer) {
             aliases: List::from_iter([EmailAlias {
                 name: "jdoe".to_string(),
                 domain_id,
-                enabled: true,
+                enable: true,
                 ..Default::default()
             }]),
             quotas: VecMap::from_iter([
@@ -164,8 +164,7 @@ pub async fn test(test: &TestServer) {
     assert_eq!(account_cache.quota_disk, 1024);
     assert_eq!(
         account_cache
-            .quota_objects
-            .as_ref()
+            .object_quotas()
             .unwrap()
             .get(StorageQuota::MaxEmails),
         100
@@ -277,35 +276,13 @@ pub async fn test(test: &TestServer) {
     let account_cache = test.server.account(account_id.document_id()).await.unwrap();
     assert!(account_cache.id_member_of.as_ref().is_empty());
 
-    // Create a masked email
-    let john = crate::utils::account::Account::new(
-        "johndoe@example.com",
-        "hello world",
-        &[],
-        "John",
-        account_id,
-    );
-    let response = john
-        .registry_create_many(
-            ObjectType::MaskedEmail,
-            [json!({
-                Property::EmailPrefix: "test",
-            })],
-        )
-        .await;
-    let masked = response.created(0);
-    let masked_id = masked.object_id();
-    let masked_email = masked.text_field("email").to_string();
+    // Upgrade ruling 33: 0.16 created a masked email here and resolved it
+    // (`account_id_from_email`, `rcpt_resolve`). An unlicensed 1.0 server
+    // refuses `MaskedEmail` (`assert_enterprise_object`), so with no test
+    // licence those parts take the SEL-only disposition.
     assert_eq!(
         test.server
             .account_id_from_email("johndoe@example.com", true)
-            .await
-            .unwrap(),
-        Some(account_id.document_id())
-    );
-    assert_eq!(
-        test.server
-            .account_id_from_email(&masked_email, true)
             .await
             .unwrap(),
         Some(account_id.document_id())
@@ -438,7 +415,7 @@ pub async fn test(test: &TestServer) {
     let domain_2_id = account
         .registry_create_object(Domain {
             name: "another-example.com".to_string(),
-            is_enabled: true,
+            enable: true,
             certificate_management: CertificateManagement::Manual,
             dns_management: DnsManagement::Manual,
             dkim_management: DkimManagement::Manual,
@@ -545,19 +522,12 @@ pub async fn test(test: &TestServer) {
             .unwrap(),
         RcptResolution::UnknownRecipient
     );
-    assert_eq!(
-        test.server
-            .rcpt_resolve(masked_email.as_str(), true, 0)
-            .await
-            .unwrap(),
-        RcptResolution::Rewrite("johndoe@example.com".into())
-    );
 
     // Catch-all addresses have to be resolved rather than accepted verbatim
     let domain_3_id = account
         .registry_create_object(Domain {
             name: "list-catch-all.com".to_string(),
-            is_enabled: true,
+            enable: true,
             certificate_management: CertificateManagement::Manual,
             dns_management: DnsManagement::Manual,
             dkim_management: DkimManagement::Manual,
@@ -568,7 +538,7 @@ pub async fn test(test: &TestServer) {
     let domain_4_id = account
         .registry_create_object(Domain {
             name: "subaddress-catch-all.com".to_string(),
-            is_enabled: true,
+            enable: true,
             certificate_management: CertificateManagement::Manual,
             dns_management: DnsManagement::Manual,
             dkim_management: DkimManagement::Manual,
@@ -628,9 +598,6 @@ pub async fn test(test: &TestServer) {
     );
 
     // Delete everything
-    john.registry_destroy(ObjectType::MaskedEmail, [masked_id])
-        .await
-        .assert_destroyed(&[masked_id]);
     account
         .registry_destroy(ObjectType::MailingList, [list_id])
         .await

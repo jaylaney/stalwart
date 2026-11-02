@@ -31,26 +31,34 @@ pub async fn test(test: &TestServer) {
 
     tokio::time::sleep(std::time::Duration::from_secs(6)).await;
 
-    // Check that the alarm was sent
-    let messages = test
+    // Check that the alarm was sent. Both alarms are due by now; the test
+    // waits a bounded time for their delivery (one had not landed after 6 s
+    // in `caldav-plain-24`; the alarm task and the delivery run on their own).
+    let mut messages = test
         .server
         .get_cached_messages(client.account_id)
         .await
         .unwrap();
-    assert_eq!(messages.emails.items.len(), 2);
+    for _ in 0..40 {
+        if messages.emails.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        messages = test
+            .server
+            .get_cached_messages(client.account_id)
+            .await
+            .unwrap();
+    }
+    assert_eq!(messages.emails.len(), 2);
 
-    for (idx, message) in messages.emails.items.iter().enumerate() {
+    for (idx, message) in messages.emails.iter().enumerate() {
         let contents = test
-            .fetch_email(client.account_id, message.document_id)
+            .fetch_email(client.account_id, message.document_id())
             .await;
 
         let message = MessageParser::new().parse(&contents).unwrap();
-        let contents = message
-            .html_bodies()
-            .next()
-            .unwrap()
-            .text_contents()
-            .unwrap();
+        let contents = message.html_bodies().next().unwrap();
 
         if idx == 0 {
             // First alarm does not have a summary or description
@@ -81,7 +89,7 @@ pub async fn test(test: &TestServer) {
         );
 
         // The logo is an inline part, so the template must reference it by cid: URI
-        let html = message.html_bodies().next().unwrap().contents().to_vec();
+        let html = message.html_bodies().next().unwrap().as_bytes().to_vec();
         let html = String::from_utf8(html).unwrap();
         assert!(
             html.contains("src=\"cid:logo."),

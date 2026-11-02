@@ -9,12 +9,13 @@ use crate::{
     DavError, DavMethod, PropStatBuilder,
     common::{
         ExtractETag,
+        dead::{DeadPatch, DeadTarget, DisplayName},
         lock::{LockRequestHandler, ResourceState},
         uri::DavUriResource,
-        za::ZeroAccessGate,
+        za::{ZaDeadSeal, ZeroAccessGate},
     },
 };
-use common::{Server, auth::AccessToken};
+use common::{Server, auth::AccessToken, storage::index::PresenceFlags};
 use dav_proto::{
     RequestHeaders, Return,
     schema::{Namespace, request::MkCol, response::MkColResponse},
@@ -22,15 +23,19 @@ use dav_proto::{
 use groupware::{
     cache::GroupwareCache,
     calendar::{
-        Calendar, CalendarPreferences,
-        seal::{seal_calendar, seal_error},
+        CALENDAR_SUBSCRIBED, Calendar, CalendarPreferences,
+        seal::{ZaKeyDomain, seal_calendar, seal_error},
     },
 };
 use http_proto::HttpResponse;
 use hyper::StatusCode;
+use registry::schema::enums::StorageQuota;
 use store::write::BatchBuilder;
 use trc::AddContext;
-use types::collection::{Collection, SyncCollection};
+use types::{
+    collection::{Collection, SyncCollection},
+    metadata::MetadataKinds,
+};
 
 pub(crate) trait CalendarMkColRequestHandler: Sync + Send {
     fn handle_calendar_mkcol_request(
@@ -60,20 +65,26 @@ impl CalendarMkColRequestHandler for Server {
             .ok_or(DavError::Code(StatusCode::FORBIDDEN))?;
         if !access_token.is_member(account_id) {
             return Err(DavError::Code(StatusCode::FORBIDDEN));
-        } else if name.contains('/')
-            || self
-                .fetch_dav_resources(
-                    access_token.account_id(),
-                    account_id,
-                    SyncCollection::Calendar,
-                )
-                .await
-                .caused_by(trc::location!())?
-                .by_path(name)
-                .is_some()
-        {
+        }
+        let resources = self
+            .fetch_groupware_resources(
+                access_token.account_id(),
+                account_id,
+                SyncCollection::Calendar,
+            )
+            .await
+            .caused_by(trc::location!())?;
+        if name.contains('/') || resources.by_path(name).is_some() {
             return Err(DavError::Code(StatusCode::METHOD_NOT_ALLOWED));
         }
+
+        // Validate quota
+        self.assert_object_quota(
+            &*self.account(account_id).await?,
+            StorageQuota::MaxCalendars,
+            1,
+            || resources.resources.count(true),
+        )?;
 
         // Validate headers
         self.validate_headers(
@@ -97,24 +108,56 @@ impl CalendarMkColRequestHandler for Server {
             preferences: vec![CalendarPreferences {
                 account_id,
                 name: name.to_string(),
+                flags: CALENDAR_SUBSCRIBED,
                 ..Default::default()
             }],
             ..Default::default()
         };
 
         // Apply MKCOL properties
+        let personal_id = access_token.personal_id(account_id, Collection::Calendar);
+        calendar.preferences_mut(personal_id).flags |= CALENDAR_SUBSCRIBED;
+        let mut batch = BatchBuilder::new();
+        if za_keys.is_none() {
+            crate::common::za::za_ordinary_fence(self, &mut batch, account_id, None);
+        }
+        let document_id = batch.reserve_document_id(account_id, Collection::Calendar);
         let mut return_prop_stat = None;
         let mut is_mkcalendar = false;
-        if let Some(mkcol) = request {
+        let mut dead_write = None;
+        if let Some(mut mkcol) = request {
             let mut prop_stat = PropStatBuilder::default();
             is_mkcalendar = mkcol.is_mkcalendar;
-            if !self.apply_calendar_properties(
-                access_token.personal_id(account_id, Collection::Calendar),
+            let dead = DeadPatch::take_values(&mut mkcol.props, DisplayName::Live);
+            self.apply_calendar_properties(
+                personal_id,
                 &mut calendar,
                 false,
                 mkcol.props,
                 &mut prop_stat,
-            ) {
+            );
+            // Ruling 16: a key account's container is sealed in the owner's
+            // domain, unbound from the pending id until its next write.
+            let za_domain = za_keys.as_deref().map(ZaKeyDomain::owner);
+            let za_seal = za_domain
+                .as_ref()
+                .map(|domain| ZaDeadSeal::calendar(domain, account_id, None));
+            dead_write = dead
+                .apply_za(
+                    self,
+                    DeadTarget::container(
+                        account_id,
+                        Collection::Calendar,
+                        document_id,
+                        MetadataKinds::NONE,
+                    ),
+                    za_seal.as_ref(),
+                    &mut prop_stat,
+                )
+                .await
+                .caused_by(trc::location!())?;
+            if prop_stat.has_errors() {
+                prop_stat.fail_dependencies();
                 return Ok(HttpResponse::new(StatusCode::FORBIDDEN).with_xml_body(
                     MkColResponse::new(prop_stat.build())
                         .with_namespace(Namespace::CalDav)
@@ -127,28 +170,33 @@ impl CalendarMkColRequestHandler for Server {
             }
         }
 
+        // Prepare write batch
+        calendar.sync_owner_preferences(account_id, personal_id);
         if let Some(keys) = &za_keys {
             seal_calendar(&mut calendar, keys, account_id)
                 .map_err(|err| seal_error(err, account_id, u32::MAX))?;
         }
-
-        // Prepare write batch
-        let mut batch = BatchBuilder::new();
-        let document_id = self
-            .store()
-            .assign_document_ids(account_id, Collection::Calendar, 1)
-            .await
-            .caused_by(trc::location!())?;
+        if let Some(dead_write) = &dead_write {
+            calendar.set_metadata_kinds(dead_write.kinds);
+        }
+        if let Some(write) = dead_write.and_then(|dead_write| dead_write.write) {
+            write
+                .build(document_id.into(), &mut batch)
+                .caused_by(trc::location!())?;
+        }
         calendar
             .insert(
-                access_token.account_tenant_ids(),
+                access_token.changed_by(),
                 account_id,
                 document_id,
                 &mut batch,
             )
             .caused_by(trc::location!())?;
-        let etag = batch.etag();
-        self.commit_batch(batch).await.caused_by(trc::location!())?;
+        let etag = self
+            .commit_batch(batch)
+            .await
+            .caused_by(trc::location!())?
+            .etag();
 
         if let Some(prop_stat) = return_prop_stat {
             Ok(HttpResponse::new(StatusCode::CREATED)

@@ -13,9 +13,10 @@
 //! is refused on PostgreSQL and MySQL, where the assertion is no fence.
 
 use super::{
-    Traced, assert_no_plaintext, assert_sealed, deliver,
+    Traced, append_params, assert_no_plaintext, assert_sealed, deliver,
     delivery::{configure, temporarily_failed, unconfigure},
-    message_ids, message_with, stored_blob, stored_metadata,
+    group_ingest, keyed_token, keyless_token, message_ids, message_with, metadata_key,
+    metadata_rows, open_message, reply_to, row_is_stub, stored_blob, stored_hash, stored_metadata,
 };
 use crate::{
     utils::{
@@ -24,11 +25,16 @@ use crate::{
         server::TestServer,
         smtp::SmtpConnection,
         za::{
-            Conn, HookParked, hold_task_consumer, plant_event, wait_for_delivery, za_post_as,
-            za_setup, za_setup_token,
+            Conn, HookParked, delete_event_records, hold_index_partition, index_search_documents,
+            internal_search, partition_status, plant_event, queue_entries, release_index_partition,
+            search_keys, stored_event, unindex_search_account, unindex_search_documents,
+            wait_for_delivery, wait_for_index_queue, write_stored_event, za_post_as, za_setup,
+            za_setup_token,
         },
     },
-    za::{STRONG, raw_input::SUBMISSION_PORT, user_permissions},
+    za::{
+        STRONG, index_task::emulate_superseding_node, raw_input::SUBMISSION_PORT, user_permissions,
+    },
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use calcard::common::timezone::Tz;
@@ -41,16 +47,19 @@ use email::{
     cache::MessageCacheFetch,
     mailbox::{INBOX_ID, JUNK_ID},
     message::{
+        copy::CopySources,
         copy::EmailCopy,
         delete::EmailDeletion,
-        ingest::{EmailIngest, IngestEmail, IngestSource},
-        metadata::MessageMetadata,
-        za::is_stub,
+        delivery::SenderAuthentication,
+        ingest::{
+            EmailIngest, IngestEmail, IngestSource,
+            group::{IngestGroup, ThreadKey},
+        },
     },
 };
-use groupware::{
-    DestroyArchive,
-    calendar::{CalendarEvent, CalendarEventData, seal::WRAP_PK},
+use groupware::calendar::{
+    CalendarEventData,
+    seal::{WRAP_MK, WRAP_PK},
 };
 use mail_parser::MessageParser;
 use nlp::language::Language;
@@ -68,17 +77,17 @@ use registry::{
 use serde_json::json;
 use std::time::{Duration, Instant};
 use store::{
-    Deserialize, IterateParams, SUBSPACE_SEARCH_INDEX, U32_LEN, U64_LEN, ValueKey,
+    Deserialize, IterateParams, U32_LEN, U64_LEN, ValueKey,
     registry::write::{RegistryWrite, RegistryWriteResult},
     roaring::RoaringBitmap,
-    search::{
-        CalendarSearchField, EmailSearchField, IndexDocument, SearchField, SearchFilter,
-        SearchQuery,
-    },
+    search::{CalendarSearchField, EmailSearchField, IndexDocument},
     write::{
-        AlignedBytes, AnyKey, Archive, BatchBuilder, BlobLink, BlobOp, SearchIndex,
-        SearchIndexClass, SearchIndexId, SearchIndexType, TaskQueueClass, ValueClass,
-        key::DeserializeBigEndian, now,
+        BatchBuilder, BlobLink, BlobOp, SearchIndex, SearchIndexClass, TaskId, TaskQueueClass,
+        ValueClass,
+        key::DeserializeBigEndian,
+        metadata::{MetadataClass, ViewerState},
+        now,
+        serialize::RawValue,
     },
 };
 use trc::{EventType, Key, SecurityEvent, StoreEvent};
@@ -146,39 +155,55 @@ const CHUNKED: &str = "keymail23@example.com";
 const CHUNKED_EVENT: &str = "keymail24@example.com";
 /// `superseded_index_tail_loses_to_provisioning`'s account (ruling R62).
 const SUPERSEDED_TAIL: &str = "keymail25@example.com";
-/// Its ordinary control, whose multi-chunk index write passes the guard.
+/// Its ordinary control, whose multi-chunk index write passes the fence.
 const SUPERSEDED_TAIL_CONTROL: &str = "plainmail18@example.com";
-/// `failed_guard_with_its_document_stored_defers_the_task`'s account, an
-/// ordinary one (ruling R63).
-const GUARD_FAILED: &str = "plainmail19@example.com";
+/// `plainmail19`, `plainmail21` and `plainmail22` belonged to the R63 cases
+/// retired at 1.0 (part 6d); they stay unallocated.
 /// `unindex_between_calendar_merge_chunks_leaves_no_terms`'s account
 /// (ruling R63).
 const MERGE_UNINDEXED: &str = "keymail26@example.com";
 /// `multi_chunk_calendar_merge_is_written_whole`'s account, an ordinary one
 /// (ruling R63).
 const MERGE_CONTROL: &str = "plainmail20@example.com";
-/// `stopped_document_leaves_its_batch_written`'s account whose document
-/// stops (ruling R63).
-const BATCH_STOPPED: &str = "plainmail21@example.com";
-/// The account of that batch's other document, which the pause does not
-/// park.
-const BATCH_OTHER: &str = "plainmail22@example.com";
-/// Under the smallest deferral of an index task's failed first attempt:
-/// the default retry strategy (exponential backoff from a 60 s initial
-/// delay, a jitter factor from 0.5 to 1.5) defers it by at least 30 s from
-/// the whole second of the failure, so by more than 29 s.
-const UNDER_THE_DEFERRAL: Duration = Duration::from_secs(15);
 /// The token the merge tests' updated DESCRIPTION ends with: 13 bytes, so
 /// stored verbatim, and new to the event.
 const MERGE_CANARY: &str = "zzmergecanary";
 /// The token `large_body` ends with: 12 bytes, so stored verbatim in its
-/// `Term` key (`CheekyHash`), and longer than the body's five-byte tokens,
-/// so written in a later commit chunk than the first.
+/// `Term` key (`CheekyHash`), and written after the body's `c`-tokens, in
+/// the pass's last commit chunk: 1.0 writes an account's term merges in key
+/// order (`account_term_key_order`).
 const TAIL_CANARY: &str = "zztailcanary";
+/// `grouped_ingest_provisioning_wins_before_flush`'s account (Task 5 of the
+/// 1.0 upgrade).
+const GROUPED: &str = "keymail27@example.com";
+/// Its ordinary control, whose group flushes in the clear.
+const GROUPED_CONTROL: &str = "plainmail24@example.com";
+/// `grouped_rejection_discards_uncommitted_plain_metadata`'s account, refused
+/// in mid-group once provisioned.
+const REJECTED: &str = "keymail29@example.com";
+/// Its ordinary account, whose group keeps its batch after a rejection.
+const REJECTED_CONTROL: &str = "plainmail25@example.com";
 /// `train_batch_loses_to_provisioning`'s source account (ruling R55).
 const TRAINED: &str = "keymail19@example.com";
 /// `train_batch_loses_to_provisioning`'s destination, an ordinary account.
 const TRAIN_DESTINATION: &str = "plainmail16@example.com";
+/// `setup_refuses_object_metadata`'s account (ruling 66, the Task 6
+/// review's F1).
+const OBJECT_METADATA: &str = "keymail34@example.com";
+/// The ordinary owner of the mailbox it holds a private container on.
+const OBJECT_METADATA_OWNER: &str = "plainmail34@example.com";
+/// `metadata_writes_lose_to_provisioning`'s account, an ordinary one that
+/// logs in.
+const METADATA_WRITER: &str = "plainmail35@example.com";
+/// `dead_property_writes_lose_to_provisioning`'s account (ruling 70), an
+/// ordinary one that writes calendar dead properties over DAV.
+const DEAD_WRITER: &str = "plainmail37@example.com";
+/// `calendar_writes_lose_to_provisioning`'s account (upgrade ruling 173), an
+/// ordinary one that writes calendars and events over DAV.
+const CALENDAR_WRITER: &str = "plainmail39@example.com";
+/// The ordinary account whose shared event `calendar_writes_lose_to_provisioning`
+/// copies into the writer's calendar over JMAP (upgrade ruling 181).
+const CALENDAR_SOURCE: &str = "plainmail40@example.com";
 const PLAIN: &str = "plainmail3@example.com";
 /// The organizer of `forward_race_imip_side_write`'s invitation, which it
 /// sends through authenticated submission.
@@ -213,6 +238,10 @@ pub async fn test(test: &mut TestServer) {
     let fence3 = reverse_race_setup_token_aborts(test, &admin).await;
     let fence4 = reverse_race_reissue_keeps_the_marker(test, &admin).await;
     let fence11 = reissue_repairs_an_aborted_issuance(test, &admin).await;
+    let (grouped, grouped_control) =
+        grouped_ingest_provisioning_wins_before_flush(test, &admin).await;
+    let (rejected, rejected_control) =
+        grouped_rejection_discards_uncommitted_plain_metadata(test, &admin).await;
     let (fence5, fence6) = copy_message_race(test, &admin).await;
     copy_message_refuses_key_accounts(test, &fence1, &fence5, &fence6).await;
     let (trained, train_destination) = train_batch_loses_to_provisioning(test, &admin).await;
@@ -232,17 +261,34 @@ pub async fn test(test: &mut TestServer) {
     let chunked_event = unindex_between_calendar_index_chunks_leaves_no_terms(test, &admin).await;
     let (superseded_tail, superseded_tail_control) =
         superseded_index_tail_loses_to_provisioning(test, &admin).await;
-    let guard_failed = failed_guard_with_its_document_stored_defers_the_task(test, &admin).await;
+    // Retired at 1.0 with R62's guard and R63's confirmation read (Task 1's
+    // ruling 19, part 6a): `failed_guard_with_its_document_stored_defers_the_task`
+    // and `stopped_document_leaves_its_batch_written`.
     let merge_unindexed = unindex_between_calendar_merge_chunks_leaves_no_terms(test, &admin).await;
     let merge_control = multi_chunk_calendar_merge_is_written_whole(test, &admin).await;
-    let (batch_stopped, batch_other) =
-        stopped_document_leaves_its_batch_written(test, &admin).await;
+    let (object_metadata, object_metadata_owner) =
+        setup_refuses_object_metadata(test, &admin).await;
+    let metadata_writer = metadata_writes_lose_to_provisioning(test).await;
+    let dead_writer = dead_property_writes_lose_to_provisioning(test).await;
+    let (calendar_writer, calendar_source) = calendar_writes_lose_to_provisioning(test).await;
 
     // The accounts that log in empty their own mailboxes; the others are
     // pending or credentialless, and the account's destruction removes
     // what they hold.
     for account in [
-        &fence1, &fence2, &plain, &fence10, &organizer, &fence3, &fence4, &fence11, &fence5,
+        &fence1,
+        &fence2,
+        &plain,
+        &fence10,
+        &organizer,
+        &fence3,
+        &fence4,
+        &fence11,
+        &grouped,
+        &grouped_control,
+        &rejected,
+        &rejected_control,
+        &fence5,
         &fence6,
     ] {
         test.destroy_all_mailboxes(account).await;
@@ -257,6 +303,10 @@ pub async fn test(test: &mut TestServer) {
         fence3,
         fence4,
         fence11,
+        grouped,
+        grouped_control,
+        rejected,
+        rejected_control,
         fence5,
         fence6,
         trained,
@@ -277,14 +327,22 @@ pub async fn test(test: &mut TestServer) {
         chunked_event,
         superseded_tail,
         superseded_tail_control,
-        guard_failed,
         merge_unindexed,
         merge_control,
-        batch_stopped,
-        batch_other,
+        object_metadata,
+        object_metadata_owner,
+        metadata_writer,
+        dead_writer,
+        calendar_writer,
+        calendar_source,
     ] {
         admin.destroy_account(account).await;
     }
+    // The grouped ingests train as IMAP APPEND does: the ordinary
+    // controls' samples.
+    admin
+        .registry_destroy_all(ObjectType::SpamTrainingSample)
+        .await;
     test.wait_for_tasks().await;
     unconfigure(&admin, schedule_id).await;
     wait_for_delivery(test).await;
@@ -350,7 +408,10 @@ async fn registry_user(server: &Server, id: Id) -> (Object, structs::UserAccount
         .await
         .unwrap()
         .unwrap();
-    let ObjectInner::Account(structs::Account::User(user)) = &object.inner else {
+    let ObjectInner::Account(account) = &object.inner else {
+        panic!("not an account");
+    };
+    let structs::Account::User(user) = account.as_ref() else {
         panic!("not a user account");
     };
     let user = user.clone();
@@ -377,7 +438,7 @@ pub(super) async fn set_marker(server: &Server, id: Id, marker: bool) {
     let result = server
         .registry()
         .write(RegistryWrite::Update {
-            object: &Object::new(ObjectInner::Account(structs::Account::User(user))),
+            object: &Object::new(ObjectInner::Account(Box::new(structs::Account::User(user)))),
             id,
             old_object: &old_object,
         })
@@ -464,7 +525,65 @@ async fn queued_blob(test: &TestServer, address: &str) -> Vec<u8> {
 
 /// The purge as the scheduler runs it, once every temporary link expired.
 async fn expire_and_purge_blobs(test: &TestServer, admin: &Account) {
-    test.blob_expire_all().await;
+    // At 1.0 a staged blob whose batch never committed has no commit entry,
+    // only its temporary link, which the purge reads to delete the blob: the
+    // links are expired in place (0.16's helper deleted them, which leaves
+    // such a blob unreachable at 1.0).
+    let from_key = ValueKey {
+        account_id: 0,
+        collection: 0,
+        document_id: 0,
+        class: ValueClass::Blob(BlobOp::Commit {
+            hash: BlobHash::default(),
+        }),
+    };
+    let to_key = ValueKey {
+        account_id: u32::MAX,
+        collection: u8::MAX,
+        document_id: u32::MAX,
+        class: ValueClass::Blob(BlobOp::Link {
+            hash: BlobHash::new_max(),
+            to: BlobLink::Document,
+        }),
+    };
+    let mut links = Vec::new();
+    test.server
+        .store()
+        .iterate(
+            IterateParams::new(from_key, to_key).ascending(),
+            |key, value| {
+                if key.len() == BLOB_HASH_LEN + U32_LEN + U64_LEN {
+                    links.push((
+                        BlobHash::try_from_hash_slice(&key[..BLOB_HASH_LEN]).unwrap(),
+                        key.deserialize_be_u32(BLOB_HASH_LEN)?,
+                        key.deserialize_be_u64(BLOB_HASH_LEN + U32_LEN)?,
+                        value.to_vec(),
+                    ));
+                }
+                Ok(true)
+            },
+        )
+        .await
+        .unwrap();
+    let mut batch = BatchBuilder::new();
+    for (hash, account_id, until, value) in links {
+        batch
+            .with_account_id(account_id)
+            .clear(ValueClass::Blob(BlobOp::Link {
+                hash: hash.clone(),
+                to: BlobLink::Temporary { until },
+            }))
+            .set(
+                ValueClass::Blob(BlobOp::Link {
+                    hash,
+                    to: BlobLink::Temporary { until: 1 },
+                }),
+                value,
+            );
+    }
+    if !batch.is_empty() {
+        test.server.store().write_batch(&mut batch).await.unwrap();
+    }
     admin
         .registry_create_object(Task::StoreMaintenance(TaskStoreMaintenance {
             maintenance_type: TaskStoreMaintenanceType::PurgeBlob,
@@ -477,13 +596,7 @@ async fn expire_and_purge_blobs(test: &TestServer, admin: &Account) {
 
 /// The blob hash of the account's message `document_id`.
 async fn message_hash(test: &TestServer, account_id: u32, document_id: u32) -> BlobHash {
-    BlobHash::from(
-        &stored_metadata(test, account_id, document_id)
-            .await
-            .unarchive::<MessageMetadata>()
-            .unwrap()
-            .blob_hash,
-    )
+    stored_hash(test, account_id, document_id).await
 }
 
 /// Review F1: a delivery that classified the account as ordinary before
@@ -590,9 +703,10 @@ async fn forward_race_with_a_staged_blob(test: &TestServer, admin: &Account) -> 
         assert!(
             test.server
                 .store()
-                .blob_has_access(&staged, &plain_link)
+                .blob_link_size(&staged, &plain_link)
                 .await
-                .unwrap(),
+                .unwrap()
+                .is_some(),
             "the plain account no longer links the staged hash"
         );
         assert_eq!(
@@ -829,12 +943,7 @@ async fn reissue_repairs_an_aborted_issuance(test: &TestServer, admin: &Account)
     deliver(test, SENDER, FENCE11, &message_with("after", "after-body")).await;
     let after = super::new_message(test, id, &before).await;
     assert!(
-        !is_stub(
-            stored_metadata(test, id, after)
-                .await
-                .unarchive::<MessageMetadata>()
-                .unwrap()
-        ),
+        !row_is_stub(&stored_metadata(test, id, after).await),
         "the ordinary account's delivery is plaintext"
     );
 
@@ -962,6 +1071,268 @@ async fn reverse_race_reissue_keeps_the_marker(test: &TestServer, admin: &Accoun
     account
 }
 
+/// Task 5 of the 1.0 upgrade: a grouped ingest (`IngestGroup`, IMAP
+/// APPEND's and JMAP's) classifies each message when it is ingested into
+/// the group and writes nothing until the flush. An account provisioned in
+/// between (its `setup-token` and setup complete: the group's messages are
+/// in memory only, so the emptiness check and the recheck see nothing)
+/// wins: every message the group classified as ordinary carries the
+/// provisioning fence in its own commit chunk, so the flush fails its
+/// assertion and commits nothing, no message, metadata row, threading key
+/// or sample. The plaintext the group staged is left to its temporary
+/// links (spec 6.1's allowed residue), which the purge removes. The client's
+/// retry, now with the account's keys, stores the same messages sealed.
+/// The control, an ordinary account's identical group, flushes in the
+/// clear, threaded.
+async fn grouped_ingest_provisioning_wins_before_flush(
+    test: &TestServer,
+    admin: &Account,
+) -> (Account, Account) {
+    println!("grouped_ingest_provisioning_wins_before_flush");
+    let account = passwordless(admin, GROUPED).await;
+    let id = account.id().document_id();
+    let control = admin
+        .create_user_account(GROUPED_CONTROL, STRONG, "Fence", &[], user_permissions())
+        .await;
+    let control_id = control.id().document_id();
+    // The system folders, so INBOX exists for both.
+    message_ids(test, id).await;
+    message_ids(test, control_id).await;
+    let first = message_with("grouped fence", "grouped-first-canary");
+    let reply = reply_to(&first, "grouped fence", "grouped-reply-canary");
+    let messages = [&first, &reply];
+
+    // The control: the same group for an ordinary account commits both,
+    // in the clear, the reply in its parent's pending thread.
+    let mut group = IngestGroup::default();
+    for raw in messages {
+        group_ingest(&test.server, &mut group, &keyless_token(control_id), raw)
+            .await
+            .unwrap();
+    }
+    let controls = group.flush(&test.server).await.unwrap();
+    assert_eq!(controls.len(), 2, "control: the ordinary group's flush");
+    for email in &controls {
+        assert!(
+            !row_is_stub(&stored_metadata(test, control_id, email.document_id).await),
+            "control: the ordinary group stored a stub"
+        );
+        assert_eq!(
+            super::threading_keys(test, control_id, email.document_id).await,
+            1,
+            "control: the ordinary group's message is threaded"
+        );
+    }
+    assert_eq!(controls[1].thread_id, controls[0].thread_id);
+
+    // The race: classified as ordinary, then provisioned before the flush.
+    let stale = keyless_token(id);
+    let mut group = IngestGroup::default();
+    for raw in messages {
+        group_ingest(&test.server, &mut group, &stale, raw)
+            .await
+            .unwrap();
+    }
+    let token = za_setup_token(admin, GROUPED).await;
+    za_setup(GROUPED, &token, STRONG).await;
+    let err = match group.flush(&test.server).await {
+        Err(err) => err,
+        Ok(ingested) => panic!(
+            "the stale group committed {} messages after provisioning",
+            ingested.len()
+        ),
+    };
+    assert!(err.is_assertion_failure(), "the flush's failure: {err:?}");
+    assert!(
+        message_ids(test, id).await.is_empty(),
+        "the stale group stored a message"
+    );
+    assert!(
+        metadata_rows(test, id).await.is_empty(),
+        "the stale group left a metadata row"
+    );
+    assert!(
+        !test.server.za_has_spam_samples(id).await.unwrap(),
+        "the stale group stored a sample"
+    );
+    assert!(
+        group.flush(&test.server).await.unwrap().is_empty(),
+        "the failed flush kept its batch"
+    );
+    let staged = temporary_links(test, id).await;
+    for raw in messages {
+        assert!(
+            staged.contains(&BlobHash::generate(raw.as_bytes())),
+            "the stale group did not stage its plaintext"
+        );
+    }
+
+    // The retry, with the session's keys: sealed under them.
+    let keyed = keyed_token(test, id, STRONG).await;
+    let mut group = IngestGroup::default();
+    for raw in messages {
+        group_ingest(&test.server, &mut group, &keyed, raw)
+            .await
+            .unwrap();
+    }
+    let ingested = group.flush(&test.server).await.unwrap();
+    assert_eq!(ingested.len(), 2, "the keyed retry's flush");
+    let mut documents = Vec::new();
+    for (email, raw) in ingested.iter().zip(messages) {
+        assert_sealed(test, id, email.document_id, WRAP_MK).await;
+        assert_eq!(email.thread_id, email.document_id, "a thread of its own");
+        let (_, opened) = open_message(test, id, STRONG, email.document_id).await;
+        assert_eq!(opened, raw.as_bytes(), "the retried message");
+        documents.push(email.document_id);
+    }
+    documents.sort_unstable();
+    assert_eq!(message_ids(test, id).await, documents);
+    assert_eq!(
+        metadata_rows(test, id).await.len(),
+        2,
+        "a metadata row without its message"
+    );
+    assert_no_plaintext(test, id).await;
+
+    expire_and_purge_blobs(test, admin).await;
+    let staged = temporary_links(test, id).await;
+    for raw in messages {
+        assert!(
+            !staged.contains(&BlobHash::generate(raw.as_bytes())),
+            "the stale group's staged plaintext survived the purge"
+        );
+    }
+    (account, control)
+}
+
+/// Task 5 of the 1.0 upgrade: a group discards its batch after an error
+/// that is not a rejection (`IngestGroup::ingest`), so a message refused in
+/// mid-group leaves none of the plaintext metadata the group already held
+/// for an earlier one. The account is classified as ordinary for the first
+/// message, then provisioned; the second, ingested with the same keyless
+/// token, is now a key account's and is refused (`za_keyless_refusal`,
+/// before any operation of the batch). The flush then commits nothing, and
+/// the client's retry with the account's keys stores both sealed, with no
+/// metadata row left over. The control, an ordinary account: a message that
+/// does not parse is a rejection, after which a group keeps its batch, and
+/// the rejected message adds nothing to it; its retry, parsed, adds one
+/// message and one row.
+async fn grouped_rejection_discards_uncommitted_plain_metadata(
+    test: &TestServer,
+    admin: &Account,
+) -> (Account, Account) {
+    println!("grouped_rejection_discards_uncommitted_plain_metadata");
+    let account = passwordless(admin, REJECTED).await;
+    let id = account.id().document_id();
+    let control = admin
+        .create_user_account(REJECTED_CONTROL, STRONG, "Fence", &[], user_permissions())
+        .await;
+    let control_id = control.id().document_id();
+    message_ids(test, id).await;
+    message_ids(test, control_id).await;
+    let first = message_with("grouped refusal", "refusal-first-canary");
+    let second = message_with("grouped refusal second", "refusal-second-canary");
+
+    let stale = keyless_token(id);
+    let mut group = IngestGroup::default();
+    group_ingest(&test.server, &mut group, &stale, &first)
+        .await
+        .unwrap();
+    let token = za_setup_token(admin, REJECTED).await;
+    za_setup(REJECTED, &token, STRONG).await;
+    let err = group_ingest(&test.server, &mut group, &stale, &second)
+        .await
+        .expect_err("a keyless ingest into a key account");
+    assert!(
+        err.matches(EventType::Jmap(trc::JmapEvent::Forbidden))
+            && err.value_as_str(Key::Details) == Some(ZA_MAIL_KEYLESS),
+        "the refusal: {err:?}"
+    );
+    assert!(
+        group.flush(&test.server).await.unwrap().is_empty(),
+        "the refusal left the first message in the group's batch"
+    );
+    assert!(
+        message_ids(test, id).await.is_empty() && metadata_rows(test, id).await.is_empty(),
+        "the discarded group stored a message or a metadata row"
+    );
+
+    let keyed = keyed_token(test, id, STRONG).await;
+    let mut group = IngestGroup::default();
+    for raw in [&first, &second] {
+        group_ingest(&test.server, &mut group, &keyed, raw)
+            .await
+            .unwrap();
+    }
+    let ingested = group.flush(&test.server).await.unwrap();
+    assert_eq!(ingested.len(), 2, "the keyed retry's flush");
+    for (email, raw) in ingested.iter().zip([&first, &second]) {
+        assert_sealed(test, id, email.document_id, WRAP_MK).await;
+        let (_, opened) = open_message(test, id, STRONG, email.document_id).await;
+        assert_eq!(opened, raw.as_bytes(), "the retried message");
+    }
+    let rows = metadata_rows(test, id).await;
+    let mut documents = ingested.iter().map(|e| e.document_id).collect::<Vec<_>>();
+    documents.sort_unstable();
+    assert_eq!(
+        rows.iter()
+            .map(|(document_id, _)| *document_id)
+            .collect::<Vec<_>>(),
+        documents,
+        "the account's metadata rows are the retry's messages"
+    );
+    assert_eq!(message_ids(test, id).await, documents);
+    assert_no_plaintext(test, id).await;
+
+    // The control: a rejection keeps the batch, and adds nothing to it.
+    let ordinary = keyless_token(control_id);
+    let mut group = IngestGroup::default();
+    group_ingest(&test.server, &mut group, &ordinary, &first)
+        .await
+        .unwrap();
+    let err = group
+        .ingest(
+            &test.server,
+            append_params(&second, None, &ordinary),
+            ThreadKey::default(),
+        )
+        .await
+        .expect_err("an unparsed message is rejected");
+    assert!(
+        err.matches(EventType::MessageIngest(trc::MessageIngestEvent::Error)),
+        "the rejection: {err:?}"
+    );
+    let kept = group.flush(&test.server).await.unwrap();
+    assert_eq!(kept.len(), 1, "control: the rejection discarded the batch");
+    let rows = metadata_rows(test, control_id).await;
+    assert_eq!(
+        rows.iter()
+            .map(|(document_id, _)| *document_id)
+            .collect::<Vec<_>>(),
+        [kept[0].document_id],
+        "the rejected message left a metadata row"
+    );
+    assert!(!row_is_stub(&rows[0].1), "control: an ordinary message");
+    let mut group = IngestGroup::default();
+    group_ingest(&test.server, &mut group, &ordinary, &second)
+        .await
+        .unwrap();
+    let retried = group.flush(&test.server).await.unwrap();
+    assert_eq!(retried.len(), 1, "the control's retry");
+    let mut documents = vec![kept[0].document_id, retried[0].document_id];
+    documents.sort_unstable();
+    assert_eq!(
+        metadata_rows(test, control_id)
+            .await
+            .iter()
+            .map(|(document_id, _)| *document_id)
+            .collect::<Vec<_>>(),
+        documents
+    );
+    assert_eq!(message_ids(test, control_id).await, documents);
+    (account, control)
+}
+
 /// Mail spec 6.3 and ruling R3 of plan 13: a cross-account copy that read
 /// its destination as ordinary before the destination was provisioned loses
 /// its assertion at commit, which surfaces as a method-level server error,
@@ -979,8 +1350,8 @@ async fn copy_message_race(test: &TestServer, admin: &Account) -> (Account, Acco
     message_ids(test, to_id).await;
     let email_id = {
         let cache = test.server.get_cached_messages(from_id).await.unwrap();
-        let item = &cache.emails.items[0];
-        Id::from_parts(item.thread_id, item.document_id).to_string()
+        let item = cache.emails.iter().next().unwrap();
+        Id::from_parts(item.thread_id(), item.document_id()).to_string()
     };
 
     let copy = json!({
@@ -1064,9 +1435,32 @@ async fn copy_message_refuses_key_accounts(
         (plain_id, plain_before[0], empty_id, "into a key account"),
         (key_id, key_doc, plain_id, "out of a key account"),
     ] {
+        // 1.0's `copy_message` takes the source row its caller read
+        // (`CopySources`, as `Email/copy` and IMAP COPY read it) and the
+        // destination's account; the refusal reads the row's account
+        // (`CopySource::account_id`) and the destination, not the row.
+        let source = CopySources::new(from, vec![document_id])
+            .take(&test.server, document_id)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("no source row for {from}/{document_id}"));
+        let to_account = test.server.account(to).await.unwrap();
         let err = match test
             .server
-            .copy_message(from, document_id, to, vec![INBOX_ID], vec![], None, 0)
+            .copy_message(
+                source,
+                &to_account,
+                // The tenant budget: the parameter exists in an `enterprise`
+                // build of `email`, which the tests crate always enables
+                // (`tests/Cargo.toml`); the budget is upstream's AGPL type,
+                // unlimited as for an account without a tenant.
+                &mut common::storage::quota::DiskQuotaBudget::unlimited(),
+                vec![INBOX_ID],
+                vec![],
+                now(),
+                None,
+                0,
+            )
             .await
         {
             Err(err) => err,
@@ -1132,10 +1526,10 @@ async fn train_batch_loses_to_provisioning(
     message_ids(test, to_id).await;
     let (email_id, document_id) = {
         let cache = test.server.get_cached_messages(from_id).await.unwrap();
-        let item = &cache.emails.items[0];
+        let item = cache.emails.iter().next().unwrap();
         (
-            Id::from_parts(item.thread_id, item.document_id).to_string(),
-            item.document_id,
+            Id::from_parts(item.thread_id(), item.document_id()).to_string(),
+            item.document_id(),
         )
     };
     let hash = message_hash(test, from_id, document_id).await;
@@ -1222,9 +1616,11 @@ async fn stress_the_fence(test: &TestServer, admin: &Account) -> Account {
                     received_at: None,
                     source: IngestSource::Smtp {
                         deliver_to: FENCE7,
-                        is_sender_authenticated: true,
+                        envelope_from: SENDER,
+                        sender_authentication: SenderAuthentication::DmarcPass,
                         is_spam: false,
                     },
+                    metadata: None,
                     session_id: 0,
                 })
                 .await
@@ -1257,9 +1653,8 @@ async fn stress_the_fence(test: &TestServer, admin: &Account) -> Account {
                     "run {run}: the message committed after the vault record"
                 );
                 assert_eq!(stored.len(), 1, "run {run}");
-                let archive = stored_metadata(test, account_id, stored[0]).await;
                 assert!(
-                    !is_stub(archive.unarchive::<MessageMetadata>().unwrap()),
+                    !row_is_stub(&stored_metadata(test, account_id, stored[0]).await),
                     "run {run}: an ordinary ingest stored a stub"
                 );
                 outcomes[0] += 1;
@@ -1285,10 +1680,16 @@ async fn stress_the_fence(test: &TestServer, admin: &Account) -> Account {
             .unwrap();
         if !stored.is_empty() {
             let mut batch = BatchBuilder::new();
+            let changed_by = test
+                .server
+                .account_info(account_id)
+                .await
+                .unwrap()
+                .changed_by();
             test.server
                 .emails_delete(
                     account_id,
-                    None,
+                    changed_by,
                     &mut batch,
                     RoaringBitmap::from_iter(stored),
                 )
@@ -1321,10 +1722,44 @@ async fn stress_the_fence(test: &TestServer, admin: &Account) -> Account {
     }
     expire_and_purge_blobs(test, admin).await;
     for hash in &staged_only {
-        assert!(
-            !readable(hash).await,
-            "a lost run's staged blob survived the purge"
-        );
+        if readable(hash).await {
+            // The links that still hold it.
+            let mut links = Vec::new();
+            test.server
+                .store()
+                .iterate(
+                    IterateParams::new(
+                        ValueKey {
+                            account_id: 0,
+                            collection: 0,
+                            document_id: 0,
+                            class: ValueClass::Blob(BlobOp::Commit { hash: hash.clone() }),
+                        },
+                        ValueKey {
+                            account_id: u32::MAX,
+                            collection: u8::MAX,
+                            document_id: u32::MAX,
+                            class: ValueClass::Blob(BlobOp::Link {
+                                hash: BlobHash::new_max(),
+                                to: BlobLink::Document,
+                            }),
+                        },
+                    )
+                    .ascending()
+                    .no_values(),
+                    |key, _| {
+                        if key.starts_with(hash.as_slice()) {
+                            links.push(key[BLOB_HASH_LEN..].to_vec());
+                            Ok(true)
+                        } else {
+                            Ok(false)
+                        }
+                    },
+                )
+                .await
+                .unwrap();
+            panic!("a lost run's staged blob survived the purge, held by {links:?}");
+        }
     }
     account
 }
@@ -1375,30 +1810,25 @@ async fn setup_refuses_existing_mail(test: &TestServer, admin: &Account) -> Acco
     account
 }
 
-/// The metadata archive (field 71) of message `document_id`, if stored.
-async fn metadata_archive(
-    test: &TestServer,
-    account_id: u32,
-    document_id: u32,
-) -> Option<Archive<AlignedBytes>> {
+/// The metadata row (field 71, immutable at 1.0) of message
+/// `document_id`, if stored.
+async fn metadata_archive(test: &TestServer, account_id: u32, document_id: u32) -> Option<Vec<u8>> {
     test.server
         .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::property(
-            account_id,
-            Collection::Email,
-            document_id,
-            EmailField::Metadata,
-        ))
+        .get_value::<RawValue>(metadata_key(account_id, document_id))
         .await
         .unwrap()
+        .map(|value| value.0)
 }
 
 /// Ruling R46 of plan 13 (review F1): destroying a message removes its
-/// `MessageData` (field 50) at once and leaves its plaintext metadata
-/// archive (field 71), blob link and search document to the scheduled
-/// unindex task. While that task has not run, issuance answers the same 409
-/// as for mail present (spec 6.6's "empty the mailbox, then provision"); it
-/// succeeds once the task has run.
+/// `MessageData` (field 50) at once and leaves its plaintext metadata row
+/// (field 71), blob link and search document to its unindex, which 1.0's
+/// index queue runs (`delete_email_metadata`). While that has not run,
+/// issuance answers the same 409 as for mail present (spec 6.6's "empty the
+/// mailbox, then provision"); it succeeds once it has run. The account's
+/// Email partition is held (`hold_index_partition`: 0.16 held the task
+/// consumer, which does not hold 1.0's index queue).
 async fn setup_refuses_a_pending_unindex(test: &TestServer, admin: &Account) -> Account {
     println!("setup_refuses_a_pending_unindex");
     let account = passwordless(admin, PENDING_UNINDEX).await;
@@ -1413,10 +1843,10 @@ async fn setup_refuses_a_pending_unindex(test: &TestServer, admin: &Account) -> 
     let ids = message_ids(test, id).await;
     assert_eq!(ids.len(), 1, "{ids:?}");
 
-    let held = hold_task_consumer(test).await;
+    hold_index_partition(test, SearchIndex::Email, id).await;
     admin.destroy_all_mailboxes_for_account(id).await;
-    // The window: the message's `MessageData` is gone, its metadata archive
-    // is not.
+    // The window: the message's `MessageData` is gone, its metadata row is
+    // not, and its unindex entry is queued.
     assert!(
         !test
             .server
@@ -1427,16 +1857,19 @@ async fn setup_refuses_a_pending_unindex(test: &TestServer, admin: &Account) -> 
     );
     assert!(
         metadata_archive(test, id, ids[0]).await.is_some(),
-        "the metadata archive was removed before the unindex task ran"
+        "the metadata row was removed before the unindex ran"
+    );
+    assert!(
+        queue_entries(test, id)
+            .await
+            .iter()
+            .any(|entry| entry.document_id == ids[0] && !entry.insert),
+        "the destroy queued no unindex"
     );
     // Ruling R51 would refuse on the message's search document too: it is
-    // removed here, ahead of the held unindex task, so field 71 alone
-    // carries the refusal (R46's pin on the internal search store).
-    let mut query = SearchQuery::new(SearchIndex::Email);
-    query
-        .add_filter(SearchFilter::eq(SearchField::AccountId, id))
-        .add_filter(SearchFilter::eq(SearchField::DocumentId, ids[0]));
-    test.server.search_store().unindex(query).await.unwrap();
+    // removed here, ahead of the held unindex, so field 71 alone carries the
+    // refusal (R46's pin on the internal search store).
+    unindex_search_documents(test, SearchIndex::Email, id, vec![ids[0]]).await;
     assert!(
         !test.server.za_has_email_search_documents(id).await.unwrap(),
         "the message's search document is still stored"
@@ -1445,18 +1878,18 @@ async fn setup_refuses_a_pending_unindex(test: &TestServer, admin: &Account) -> 
     assert_eq!(
         reply.expect(409)["error"],
         "account already holds mail",
-        "issuance while the destroyed message's metadata archive is stored"
+        "issuance while the destroyed message's metadata row is stored"
     );
     assert!(
         test.server.za_vault_record(id).await.unwrap().is_none(),
         "the refused issuance wrote a record"
     );
 
-    drop(held);
+    release_index_partition(&test.server, SearchIndex::Email, id).await;
     test.wait_for_tasks().await;
     assert!(
         metadata_archive(test, id, ids[0]).await.is_none(),
-        "the unindex task left the metadata archive"
+        "the unindex left the metadata row"
     );
     za_setup_token(admin, PENDING_UNINDEX).await;
     account
@@ -1495,7 +1928,7 @@ async fn setup_refuses_spam_samples(test: &TestServer, admin: &Account) -> Accou
 
     admin.destroy_all_mailboxes_for_account(id).await;
     test.wait_for_tasks().await;
-    // Only the sample is left: no message, no metadata archive.
+    // Only the sample is left: no message, no metadata row.
     assert!(
         !test
             .server
@@ -1530,22 +1963,16 @@ async fn setup_refuses_spam_samples(test: &TestServer, admin: &Account) -> Accou
     account
 }
 
-/// Ruling R51 of plan 13 (re-review N1): the unindex task deletes a
-/// message's search document in a write after the one that clears its
-/// metadata archive, and that write can fail or be skipped, leaving an
-/// Email search document that outlived its message. Issuance is refused
-/// while the internal search store holds one for the account (planted here
-/// through the search store, with no Email archive and no metadata archive)
-/// and succeeds once it is removed.
+/// Ruling R51 of plan 13 (re-review N1): an Email search document can
+/// outlive its message (a deletion that failed or was skipped after the
+/// metadata row was cleared). Issuance is refused while the internal search
+/// store holds one for the account (planted here through the store's index
+/// pass, with no Email archive and no metadata row) and succeeds once it is
+/// removed.
 async fn setup_refuses_an_orphaned_search_document(test: &TestServer, admin: &Account) -> Account {
     println!("setup_refuses_an_orphaned_search_document");
     let account = passwordless(admin, ORPHANED).await;
     let id = account.id().document_id();
-    let search = test.server.search_store();
-    assert!(
-        search.internal_fts().is_some(),
-        "the suite runs on the internal search store"
-    );
     let mut document = IndexDocument::new(SearchIndex::Email)
         .with_account_id(id)
         .with_document_id(0);
@@ -1554,8 +1981,7 @@ async fn setup_refuses_an_orphaned_search_document(test: &TestServer, admin: &Ac
         "orphaned search document",
         Language::English,
     );
-    document.index_unsigned(EmailSearchField::ReceivedAt, now());
-    search.index(vec![document]).await.unwrap();
+    index_search_documents(test, SearchIndex::Email, id, vec![document]).await;
     assert!(
         !test
             .server
@@ -1581,19 +2007,21 @@ async fn setup_refuses_an_orphaned_search_document(test: &TestServer, admin: &Ac
         "the refused issuance wrote a record"
     );
 
-    let mut query = SearchQuery::new(SearchIndex::Email);
-    query
-        .add_filter(SearchFilter::eq(SearchField::AccountId, id))
-        .add_filter(SearchFilter::eq(SearchField::DocumentId, 0u32));
-    search.unindex(query).await.unwrap();
+    unindex_search_documents(test, SearchIndex::Email, id, vec![0]).await;
     za_setup_token(admin, ORPHANED).await;
     account
 }
 
-/// The task records of `account_id` that ruling R54 counts (index, unindex,
-/// thread merge, iTIP), in queue order.
+/// The task records of `account_id` that ruling R54 counts in the task
+/// queue at 1.0 (thread merge, iTIP, share-revocation cleanup), in queue
+/// order. Index work is no longer a task: its queue entries are read by
+/// `queue_entries`.
 async fn account_tasks(test: &TestServer, account_id: u32) -> Vec<Task> {
-    let key = |id| ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task { id }));
+    let key = |id| {
+        ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task {
+            id: TaskId::Assigned(id),
+        }))
+    };
     let mut tasks = Vec::new();
     test.server
         .store()
@@ -1602,11 +2030,9 @@ async fn account_tasks(test: &TestServer, account_id: u32) -> Vec<Task> {
             |_, value| {
                 let task = Task::deserialize(value)?;
                 let owner = match &task {
-                    Task::IndexDocument(task) | Task::UnindexDocument(task) => {
-                        Some(task.account_id)
-                    }
                     Task::MergeThreads(task) => Some(task.account_id),
                     Task::CalendarItipMessage(task) => Some(task.account_id),
+                    Task::ShareRevokeCleanup(task) => Some(task.account_id),
                     _ => None,
                 };
                 if owner.is_some_and(|owner| owner.document_id() == account_id) {
@@ -1620,20 +2046,26 @@ async fn account_tasks(test: &TestServer, account_id: u32) -> Vec<Task> {
     tasks
 }
 
-/// Ruling R54 of plan 13 (PR #51 review 1, P2-1): the index worker builds an
-/// ordinary message's full document, then writes it; the message's unindex
-/// task runs in a worker of its own and can finish in between, so neither
-/// the metadata archive (R46) nor the search document (R51) is there when
-/// issuance checks, and the document lands afterwards. Issuance is refused
-/// while the index task's record is in the queue; once the document is
-/// written, R51's scan refuses on it; after it is removed, issuance succeeds.
+/// Ruling R54 of plan 13 at 1.0, and the index queue's ordering (Task 6,
+/// ruling 63): the 0.16 interleaving reproduced. At 0.16 the index worker
+/// built an ordinary message's full document and the message's unindex
+/// task, in a worker of its own, finished before the build was written, so
+/// the document landed afterwards with nothing to remove it. At 1.0 the
+/// build is parked (`INDEX_WRITE_PAUSE`, after the pass's documents are
+/// built and before the search store's write) and the message destroyed:
+/// its unindex entry is queued before the parked write runs, in the same
+/// partition, which one worker runs in order. While parked, issuance is
+/// refused (the message's row is stored until the unindex runs: R46). Once
+/// released, the stale document lands and the partition's next batch
+/// removes it: no late document survives, and issuance succeeds without any
+/// cleanup. If the reproduction orphaned the document, this case fails.
 async fn setup_refuses_an_in_flight_index_write(test: &TestServer, admin: &Account) -> Account {
     println!("setup_refuses_an_in_flight_index_write");
     test.wait_for_tasks().await;
     let account = passwordless(admin, IN_FLIGHT).await;
     let id = account.id().document_id();
     let message = message_with("in flight", "in-flight-body");
-    // The delivery commits; its index task builds the document and parks.
+    // The delivery commits; its index pass builds the document and parks.
     let parked = HookParked::start(id, test_hooks::set_index_write_pause, async move {
         SmtpConnection::connect()
             .await
@@ -1645,35 +2077,21 @@ async fn setup_refuses_an_in_flight_index_write(test: &TestServer, admin: &Accou
     assert_eq!(ids.len(), 1, "{ids:?}");
 
     admin.destroy_all_mailboxes_for_account(id).await;
-    // The unindex task runs and clears its record while the index task
-    // stays parked: only the index task's record is left.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let tasks = account_tasks(test, id).await;
-        if metadata_archive(test, id, ids[0]).await.is_none()
-            && matches!(tasks.as_slice(), [Task::IndexDocument(_)])
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the unindex task did not finish: {tasks:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
     assert!(
-        !test
-            .server
-            .za_has_documents(id, Collection::Email)
+        queue_entries(test, id)
             .await
-            .unwrap()
-            && !test.server.za_has_email_search_documents(id).await.unwrap(),
-        "the account still holds the message or its search document"
+            .iter()
+            .any(|entry| entry.document_id == ids[0] && !entry.insert),
+        "the unindex was not queued before the parked write"
+    );
+    assert!(
+        !test.server.za_has_email_search_documents(id).await.unwrap(),
+        "the parked write landed early"
     );
     let reply = za_post_as(admin, "setup-token", &json!({ "account": IN_FLIGHT })).await;
     assert_eq!(
         reply.expect(409)["error"],
-        "account has unfinished tasks",
+        "account already holds mail",
         "issuance while an index write of the account is in flight"
     );
     assert!(
@@ -1682,34 +2100,27 @@ async fn setup_refuses_an_in_flight_index_write(test: &TestServer, admin: &Accou
     );
 
     parked.finish().await;
-    test.wait_for_tasks().await;
+    wait_for_index_queue(test, id, Duration::from_secs(10)).await;
+    let keys = search_keys(test, id, SearchIndex::Email).await;
     assert!(
-        test.server.za_has_email_search_documents(id).await.unwrap(),
-        "the released index task wrote no document"
+        keys.is_empty(),
+        "the late index write outlived the message's unindex (the 0.16 interleaving orphaned it): {keys:?}"
     );
-    let reply = za_post_as(admin, "setup-token", &json!({ "account": IN_FLIGHT })).await;
-    assert_eq!(
-        reply.expect(409)["error"],
-        "account already holds mail",
-        "issuance while the late document is stored"
+    assert!(
+        metadata_archive(test, id, ids[0]).await.is_none(),
+        "the unindex left the metadata row"
     );
-    let mut query = SearchQuery::new(SearchIndex::Email);
-    query
-        .add_filter(SearchFilter::eq(SearchField::AccountId, id))
-        .add_filter(SearchFilter::eq(SearchField::DocumentId, ids[0]));
-    test.server.search_store().unindex(query).await.unwrap();
     za_setup_token(admin, IN_FLIGHT).await;
     account
 }
 
-/// Ruling R60 of plan 13 (PR #51 review 2, the adjacent gap): the calendar
-/// twin of `setup_refuses_an_in_flight_index_write`. An ordinary event's
-/// index task builds its full document (summary, description, location,
-/// participants) and parks; the event is deleted and its unindex task, in a
-/// worker of its own, finds nothing to delete. Issuance is refused while the
-/// index task's record is in the queue (R54); once the document is written
-/// and the task cleared, R51's scan, which covers calendar documents too,
-/// refuses on it; after it is removed, issuance succeeds.
+/// Ruling R60 of plan 13, at 1.0: the calendar twin of
+/// `setup_refuses_an_in_flight_index_write`. An ordinary event's index pass
+/// builds its full document (summary, description, location, participants)
+/// and parks; the event is deleted, which queues its unindex entry behind
+/// the parked pass. Issuance is refused while the entries are queued
+/// (R54's queue scan); once released, the late document lands and the
+/// partition's next batch removes it, and issuance succeeds.
 async fn setup_refuses_an_in_flight_calendar_index_write(
     test: &TestServer,
     admin: &Account,
@@ -1718,48 +2129,17 @@ async fn setup_refuses_an_in_flight_calendar_index_write(
     test.wait_for_tasks().await;
     let account = passwordless(admin, IN_FLIGHT_EVENT).await;
     let id = account.id().document_id();
-    // The event is planted while the consumer is held; released with the
-    // pause set, the consumer dispatches its index task, which builds the
-    // document and parks.
-    let held = hold_task_consumer(test).await;
+    // The event is planted while its partition is held; released with the
+    // pause set, the partition's pass builds the document and parks.
+    hold_index_partition(test, SearchIndex::Calendar, id).await;
     let event_id = plant_event(test, id, "default", "in-flight.ics", IN_FLIGHT_ICAL, None).await;
+    let server = test.server.clone();
     let parked = HookParked::start(id, test_hooks::set_index_write_pause, async move {
-        drop(held);
+        release_index_partition(&server, SearchIndex::Calendar, id).await;
     })
     .await;
 
-    // The event is deleted: an unindex task, which runs and clears its
-    // record while the index task stays parked.
-    let account_info = test.server.account_info(id).await.unwrap();
-    let archive = test
-        .server
-        .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
-            id,
-            Collection::CalendarEvent,
-            event_id,
-        ))
-        .await
-        .unwrap()
-        .expect("the event's archive");
-    let mut batch = BatchBuilder::new();
-    DestroyArchive(archive.to_unarchived::<CalendarEvent>().unwrap())
-        .delete_all(&account_info, id, event_id, false, &mut batch)
-        .unwrap();
-    test.server.commit_batch(batch).await.unwrap();
-    test.server.notify_task_queue();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let tasks = account_tasks(test, id).await;
-        if matches!(tasks.as_slice(), [Task::IndexDocument(_)]) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the unindex task did not finish: {tasks:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    delete_event_records(test, id, event_id).await;
     assert!(
         !test
             .server
@@ -1785,41 +2165,24 @@ async fn setup_refuses_an_in_flight_calendar_index_write(
     );
 
     parked.finish().await;
-    test.wait_for_tasks().await;
+    wait_for_index_queue(test, id, Duration::from_secs(10)).await;
+    let keys = search_keys(test, id, SearchIndex::Calendar).await;
     assert!(
-        test.server
-            .za_has_calendar_search_documents(id)
-            .await
-            .unwrap(),
-        "the released index task wrote no document"
+        keys.is_empty(),
+        "the late calendar index write outlived the event's unindex: {keys:?}"
     );
-    let reply = za_post_as(admin, "setup-token", &json!({ "account": IN_FLIGHT_EVENT })).await;
-    assert_eq!(
-        reply.expect(409)["error"],
-        "account already holds calendar data",
-        "issuance while the late calendar document is stored"
-    );
-    assert!(
-        test.server.za_vault_record(id).await.unwrap().is_none(),
-        "the refused issuance wrote a record"
-    );
-    let mut query = SearchQuery::new(SearchIndex::Calendar);
-    query
-        .add_filter(SearchFilter::eq(SearchField::AccountId, id))
-        .add_filter(SearchFilter::eq(SearchField::DocumentId, event_id));
-    test.server.search_store().unindex(query).await.unwrap();
     za_setup_token(admin, IN_FLIGHT_EVENT).await;
     account
 }
 
 /// Ruling R54 of plan 13 (PR #51 review 1, P2-3): an ordinary APPEND or JMAP
 /// create schedules a thread-merge task whose `thread_name` and
-/// `message_ids` are `CheekyHash` strings, which hold an input of up to 15
+/// `message_ids` are `CheekyHash` strings, which hold an input of up to 16
 /// bytes verbatim; a task that exhausted its retries is kept as failed and
 /// never runs again, and destroying the message leaves it. Issuance is
 /// refused while one of the account's is in the queue (planted here as
-/// failed, so the consumer never takes it) and succeeds once the operator
-/// destroys it through `x:Task/set`.
+/// failed, so the task manager never takes it) and succeeds once the
+/// operator destroys it through `x:Task/set`.
 async fn setup_refuses_a_failed_merge_task(test: &TestServer, admin: &Account) -> Account {
     println!("setup_refuses_a_failed_merge_task");
     let account = passwordless(admin, FAILED_MERGE).await;
@@ -1844,7 +2207,7 @@ async fn setup_refuses_a_failed_merge_task(test: &TestServer, admin: &Account) -
             }),
         }),
     );
-    test.server.store().write(batch.build_all()).await.unwrap();
+    test.server.store().write_batch(&mut batch).await.unwrap();
     assert_eq!(account_tasks(test, id).await.len(), 1, "the planted task");
 
     let reply = za_post_as(admin, "setup-token", &json!({ "account": FAILED_MERGE })).await;
@@ -1873,19 +2236,30 @@ async fn setup_refuses_a_failed_merge_task(test: &TestServer, admin: &Account) -
     account
 }
 
-/// Ruling R58 of plan 13 (PR #51 review 2, P2-6): an index worker (A) that
-/// built an ordinary message's full document and stalled past its task
-/// lease is superseded on a cluster by another node's execution (B), which
-/// finds the message gone and clears the task's record; R54 and R51 then
-/// pass, and the account is provisioned. When A resumes, the internal search
-/// store's write of its document asserts in its first commit chunk that the
-/// account holds no vault record, so nothing of it lands; A's update is
-/// dropped (its task record is gone) and nothing is rescheduled. B is
-/// simulated by clearing the task's `Due` and `Task` records, what its
-/// `Ignored` update clears; the harness has one task manager. An ordinary
-/// account's document passes the same fence (the control), and its task
-/// clearing shows that A's batch ended: the index worker runs one batch at a
-/// time.
+/// Waits (at most 10 s) until the account's partition in `index` is in
+/// retry (its status key set by a failed pass).
+async fn wait_for_retry_state(test: &TestServer, index: SearchIndex, account_id: u32) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while partition_status(test, index, account_id).await.is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the partition of account {account_id} did not enter its retry state"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Ruling R58 of plan 13 (PR #51 review 2, P2-6) at 1.0: an index pass (A)
+/// that built an ordinary message's full document and stalled past its
+/// partition lock is superseded on a cluster by another node's execution
+/// (B), which runs the message's unindex and clears the partition's entries;
+/// R46, R54 and R51 then pass and the account is provisioned. When A
+/// resumes, the vault-absence assertion its document carries, in every
+/// commit chunk of its pass (ruling 18), fails: nothing of it lands, and the
+/// partition enters its retry state, which one reset drains. B is simulated
+/// (`index_task::emulate_superseding_node`); the harness has one index
+/// manager. An ordinary account's document passes the same fence (the
+/// control).
 async fn superseded_index_write_loses_to_provisioning(
     test: &TestServer,
     admin: &Account,
@@ -1897,7 +2271,7 @@ async fn superseded_index_write_loses_to_provisioning(
     let control = passwordless(admin, SUPERSEDED_CONTROL).await;
     let control_id = control.id().document_id();
     let message = message_with("superseded", "superseded-body");
-    // A: the delivery commits; its index task classifies the account as
+    // A: the delivery commits; its index pass classifies the account as
     // ordinary, builds the full document and parks before the write.
     let parked = HookParked::start(id, test_hooks::set_index_write_pause, async move {
         SmtpConnection::connect()
@@ -1910,63 +2284,16 @@ async fn superseded_index_write_loses_to_provisioning(
     assert_eq!(ids.len(), 1, "{ids:?}");
 
     admin.destroy_all_mailboxes_for_account(id).await;
-    // The unindex task runs and clears its record while A stays parked.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let tasks = account_tasks(test, id).await;
-        if metadata_archive(test, id, ids[0]).await.is_none()
-            && matches!(tasks.as_slice(), [Task::IndexDocument(_)])
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the unindex task did not finish: {tasks:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    // B, after A's lease expired: its retries find no message, and its
-    // `Ignored` update clears the task's `Due` and `Task` records.
-    let mut records = Vec::new();
-    test.server
-        .store()
-        .iterate(
-            IterateParams::new(
-                ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task { id: 0 })),
-                ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task { id: u64::MAX })),
-            )
-            .ascending(),
-            |key, value| {
-                if let Task::IndexDocument(task) = Task::deserialize(value)?
-                    && task.account_id.document_id() == id
-                {
-                    let due = Task::IndexDocument(task).due_timestamp();
-                    records.push((key.deserialize_be_u64(U64_LEN)?, due));
-                }
-                Ok(true)
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(records.len(), 1, "A's task record: {records:?}");
-    let mut batch = BatchBuilder::new();
-    for (task_id, due) in records {
-        batch
-            .clear(ValueClass::TaskQueue(TaskQueueClass::Due {
-                id: task_id,
-                due,
-            }))
-            .clear(ValueClass::TaskQueue(TaskQueueClass::Task { id: task_id }));
-    }
-    test.server.store().write(batch.build_all()).await.unwrap();
+    // B, after A's lease expired.
+    emulate_superseding_node(test, id, &ids).await;
     assert!(
-        account_tasks(test, id).await.is_empty(),
-        "B's update left the task record"
+        queue_entries(test, id).await.is_empty()
+            && metadata_archive(test, id, ids[0]).await.is_none(),
+        "B's execution left an entry or the row"
     );
 
-    // Every term passes: no message, no metadata archive, no task, no
-    // sample, no search document.
+    // Every term passes: no message, no metadata row, no entry, no sample,
+    // no search key.
     let token = za_setup_token(admin, SUPERSEDED).await;
     za_setup(SUPERSEDED, &token, STRONG).await;
     assert_eq!(
@@ -1981,9 +2308,21 @@ async fn superseded_index_write_loses_to_provisioning(
         "setup did not complete"
     );
 
-    // A resumes and attempts its write; the control's index task runs after
-    // A's batch and its update.
+    // A resumes and attempts its write.
     parked.finish().await;
+    wait_for_retry_state(test, SearchIndex::Email, id).await;
+    assert!(
+        search_keys(test, id, SearchIndex::Email).await.is_empty(),
+        "the superseded write landed in the key account's index"
+    );
+    release_index_partition(&test.server, SearchIndex::Email, id).await;
+    wait_for_index_queue(test, id, Duration::from_secs(10)).await;
+    assert!(
+        search_keys(test, id, SearchIndex::Email).await.is_empty(),
+        "the reset's retry wrote into the key account's index"
+    );
+
+    // The control's document passes the fence.
     deliver(
         test,
         SENDER,
@@ -1991,7 +2330,6 @@ async fn superseded_index_write_loses_to_provisioning(
         &message_with("superseded control", "superseded-control-body"),
     )
     .await;
-    test.wait_for_tasks().await;
     assert!(
         test.server
             .za_has_email_search_documents(control_id)
@@ -1999,127 +2337,16 @@ async fn superseded_index_write_loses_to_provisioning(
             .unwrap(),
         "the control's document was not written"
     );
-    assert!(
-        !test.server.za_has_email_search_documents(id).await.unwrap(),
-        "the superseded write landed in the key account's index"
-    );
-    assert!(
-        account_tasks(test, id).await.is_empty(),
-        "the superseded execution was rescheduled"
-    );
 
     admin.destroy_all_mailboxes_for_account(control_id).await;
     (account, control)
 }
 
-/// The account's raw keys in one search index of the internal search store
-/// (`store/src/write/key.rs`): its `Document` keys, its `Term` keys and its
-/// `Index` keys, and each `Term` key's `CheekyHash` payload, which is the
-/// token itself for one of up to 15 bytes.
-#[derive(Default)]
-struct SearchKeys {
-    documents: usize,
-    terms: usize,
-    fields: usize,
-    term_payloads: Vec<Vec<u8>>,
-}
-
-impl SearchKeys {
-    fn is_empty(&self) -> bool {
-        self.documents == 0 && self.terms == 0 && self.fields == 0
-    }
-
-    fn holds_term(&self, token: &str) -> bool {
-        self.term_payloads
-            .iter()
-            .any(|payload| payload == token.as_bytes())
-    }
-}
-
-/// Counts only: the payloads of a large document would flood a failure.
-impl std::fmt::Debug for SearchKeys {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} document, {} term ({} canary) and {} field keys",
-            self.documents,
-            self.terms,
-            if self.holds_term(TAIL_CANARY) {
-                "with the"
-            } else {
-                "no"
-            },
-            self.fields
-        )
-    }
-}
-
-/// The keys of `account_id` in `index`, read raw from the search index
-/// subspace. Key layout: the class (the index code, Email 0 and Calendar 1,
-/// with the type in its top bits: `Term` 0, `Index` 0x40, `Document` 0x80),
-/// the account id (u32 BE), then for a `Term` key the payload, its length
-/// byte, the field and the document id (u32 BE).
-async fn search_keys(test: &TestServer, account_id: u32, index: SearchIndex) -> SearchKeys {
-    let store = test
-        .server
-        .search_store()
-        .internal_fts()
-        .expect("the suite runs on the internal search store");
-    let code = match index {
-        SearchIndex::Email => 0u8,
-        SearchIndex::Calendar => 1u8,
-        _ => panic!("no account keys are read for this index"),
-    };
-    let mut keys = SearchKeys::default();
-    for class in [code, code | 0x40, code | 0x80] {
-        let mut from = vec![class];
-        from.extend_from_slice(&account_id.to_be_bytes());
-        let mut to = from.clone();
-        to.extend_from_slice(&[u8::MAX; 64]);
-        let mut found: Vec<Vec<u8>> = Vec::new();
-        store
-            .iterate(
-                IterateParams::new(
-                    AnyKey {
-                        subspace: SUBSPACE_SEARCH_INDEX,
-                        key: from,
-                    },
-                    AnyKey {
-                        subspace: SUBSPACE_SEARCH_INDEX,
-                        key: to,
-                    },
-                )
-                .no_values(),
-                |key, _| {
-                    found.push(key.to_vec());
-                    Ok(true)
-                },
-            )
-            .await
-            .unwrap();
-        match class & 0xC0 {
-            0x00 => {
-                keys.terms += found.len();
-                keys.term_payloads
-                    .extend(found.into_iter().filter_map(|key| {
-                        key.get(1 + U32_LEN..key.len().checked_sub(2 + U32_LEN)?)
-                            .map(<[u8]>::to_vec)
-                    }));
-            }
-            0x40 => keys.fields += found.len(),
-            _ => keys.documents += found.len(),
-        }
-    }
-    keys
-}
-
 /// 2,400 distinct five-byte tokens (`c0000` to `c2399`, 16 to a line) and
-/// then `canary`: with the headers indexed in test mode, about 2,500 index
-/// operations, so three commit chunks (`BatchBuilder::commit_point` splits
-/// above 1,000). `write_index` writes the terms in `CheekyHash` order, by
-/// length first, so a canary longer than five bytes lands in a later chunk
-/// than the first, and the `Index` keys (the subject and the addresses) in
-/// the last.
+/// then `canary`: about 2,400 term merges, so the pass splits after every
+/// 1,000 (`build_batch`'s `add_commit_point`) into three commit chunks, its
+/// `Document` key in the last. Terms are written in key order, so a canary
+/// that starts with `zz` lands in the last chunk.
 fn large_body(canary: &str) -> String {
     let mut body = String::new();
     for line in 0..150 {
@@ -2134,9 +2361,8 @@ fn large_body(canary: &str) -> String {
 }
 
 /// `unindex_between_calendar_index_chunks_leaves_no_terms`'s event: no
-/// alarm, no organizer (so its only tasks are its index and unindex
-/// tasks), and a DESCRIPTION of `large_body`'s tokens and the canary,
-/// folded at 70 octets.
+/// alarm, no organizer (so its only work is its index and unindex), and a
+/// DESCRIPTION of `large_body`'s tokens and the canary, folded at 70 octets.
 fn chunked_ical() -> String {
     event_ical(
         "chunked-event@example.com",
@@ -2145,7 +2371,7 @@ fn chunked_ical() -> String {
 }
 
 /// An event with `uid` and `description`, folded at 70 octets: no alarm,
-/// no organizer, so its only tasks are its index and unindex tasks.
+/// no organizer, so its only work is its index and unindex.
 fn event_ical(uid: &str, description: &str) -> String {
     let description = format!("DESCRIPTION:{description}");
     let folded = description
@@ -2170,58 +2396,25 @@ fn event_ical(uid: &str, description: &str) -> String {
     )
 }
 
-/// Waits (at most 10 s) until the account's unindex task has run and
-/// cleared its record while its index task stays parked: the message's
-/// metadata archive is gone, when `message_id` names one, and only the
-/// index task's record is left.
-async fn wait_for_the_unindex(test: &TestServer, account_id: u32, message_id: Option<u32>) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let tasks = account_tasks(test, account_id).await;
-        let unindexed = match message_id {
-            Some(message_id) => metadata_archive(test, account_id, message_id)
-                .await
-                .is_none(),
-            None => true,
-        };
-        if unindexed && matches!(tasks.as_slice(), [Task::IndexDocument(_)]) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the unindex task did not finish: {tasks:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-/// Indexes `document` for the account straight into the search store, then
-/// clears its `Document` key, leaving the `Term` and `Index` keys it wrote
-/// unlisted: the shape of an orphaned tail, of a calendar merge that lost
-/// its clears and of an Email re-index whose terms changed.
+/// Indexes `document` for the account straight into the internal search
+/// store, then clears its `Document` key, leaving the terms it wrote
+/// unlisted: the shape of a tail written after its document's unindex, of a
+/// calendar merge that lost its clears, and of the lost-lease residual
+/// (part 6a).
 async fn plant_orphaned_keys(
     test: &TestServer,
     account_id: u32,
     index: SearchIndex,
     document: IndexDocument,
 ) {
-    let search = test.server.search_store();
-    search.index(vec![document]).await.unwrap();
+    index_search_documents(test, index, account_id, vec![document]).await;
     let mut batch = BatchBuilder::new();
-    batch.clear(ValueClass::SearchIndex(SearchIndexClass {
+    batch.clear(ValueClass::SearchIndex(SearchIndexClass::Document {
         index,
-        id: SearchIndexId::Account {
-            account_id,
-            document_id: 0,
-        },
-        typ: SearchIndexType::Document,
+        account_id,
+        document_id: 0,
     }));
-    search
-        .internal_fts()
-        .expect("the suite runs on the internal search store")
-        .write(batch.build_all())
-        .await
-        .unwrap();
+    internal_search(test).write_batch(&mut batch).await.unwrap();
 }
 
 /// `setup-token` for the account `name` (id `id`) answers 409 with
@@ -2241,27 +2434,22 @@ async fn assert_refused(
     );
 }
 
-/// Ruling R62 of plan 13 (PR #51 review 3, P2-8): a search document's
-/// `Term` and `Index` keys can outlive its `Document` key (a later chunk
-/// written before R62's guard, a calendar merge that lost its clears, an
-/// Email re-index whose terms changed), and R51's and R60's scans read the
-/// `Document` keys only. Issuance is refused while the internal search
-/// store holds any `Term` or `Index` key of the account in the Email index
-/// (as for mail) or the Calendar index (as for calendar data); each case is
-/// planted alone, and issuance succeeds once the account-wide unindex has
-/// removed the keys. Neither scan reads the other index's keys or another
-/// account's (ruling R63).
+/// Ruling R62 of plan 13 (PR #51 review 3, P2-8), kept at 1.0 (Task 1's
+/// ruling 19): a search document's terms can outlive its `Document` key
+/// (the lost-lease residual, a calendar merge that lost its clears), and
+/// R51's and R60's scans read the `Document` keys only. Issuance is refused
+/// while the internal search store holds any term of the account in the
+/// Email index (as for mail) or the Calendar index (as for calendar data);
+/// each case is planted alone, and issuance succeeds once the account-wide
+/// unindex has removed the keys. Neither scan reads the other index's keys
+/// or another account's. 1.0 has no separate `Index` keys (0.16's
+/// "ReceivedAt alone" case): every field is a term.
 async fn setup_refuses_orphaned_search_terms(test: &TestServer, admin: &Account) -> Account {
     println!("setup_refuses_orphaned_search_terms");
     let account = passwordless(admin, ORPHANED_TERMS).await;
     let id = account.id().document_id();
-    let search = test.server.search_store();
-    assert!(
-        search.internal_fts().is_some(),
-        "the suite runs on the internal search store"
-    );
 
-    // Email `Term` keys only: Body is a text field, not an indexed one.
+    // Email terms only.
     let mut document = IndexDocument::new(SearchIndex::Email)
         .with_account_id(id)
         .with_document_id(0);
@@ -2269,7 +2457,7 @@ async fn setup_refuses_orphaned_search_terms(test: &TestServer, admin: &Account)
     plant_orphaned_keys(test, id, SearchIndex::Email, document).await;
     let keys = search_keys(test, id, SearchIndex::Email).await;
     assert!(
-        keys.documents == 0 && keys.terms > 0 && keys.fields == 0,
+        keys.documents.is_empty() && keys.terms > 0,
         "Email terms alone were not planted: {keys:?}"
     );
     assert!(
@@ -2286,49 +2474,13 @@ async fn setup_refuses_orphaned_search_terms(test: &TestServer, admin: &Account)
         "an orphaned Email term of the account is stored",
     )
     .await;
-    search
-        .unindex(SearchQuery::new(SearchIndex::Email).with_account_id(id))
-        .await
-        .unwrap();
+    unindex_search_account(test, SearchIndex::Email, id).await;
     assert!(
         !test.server.za_has_email_search_terms(id).await.unwrap(),
         "the account-wide unindex left Email terms"
     );
 
-    // An Email `Index` key only: ReceivedAt is indexed and not text.
-    let mut document = IndexDocument::new(SearchIndex::Email)
-        .with_account_id(id)
-        .with_document_id(0);
-    document.index_unsigned(EmailSearchField::ReceivedAt, now());
-    plant_orphaned_keys(test, id, SearchIndex::Email, document).await;
-    let keys = search_keys(test, id, SearchIndex::Email).await;
-    assert!(
-        keys.documents == 0 && keys.terms == 0 && keys.fields == 1,
-        "an Email field alone was not planted: {keys:?}"
-    );
-    assert!(
-        test.server.za_has_email_search_terms(id).await.unwrap()
-            && !test.server.za_has_calendar_search_terms(id).await.unwrap(),
-        "the scans do not see the orphaned Email field alone"
-    );
-    assert_refused(
-        test,
-        admin,
-        (ORPHANED_TERMS, id),
-        "account already holds mail",
-        "an orphaned Email field of the account is stored",
-    )
-    .await;
-    search
-        .unindex(SearchQuery::new(SearchIndex::Email).with_account_id(id))
-        .await
-        .unwrap();
-    assert!(
-        !test.server.za_has_email_search_terms(id).await.unwrap(),
-        "the account-wide unindex left an Email field"
-    );
-
-    // Calendar `Term` keys only: Title is a text field, not an indexed one.
+    // Calendar terms only.
     let mut document = IndexDocument::new(SearchIndex::Calendar)
         .with_account_id(id)
         .with_document_id(0);
@@ -2340,7 +2492,7 @@ async fn setup_refuses_orphaned_search_terms(test: &TestServer, admin: &Account)
     plant_orphaned_keys(test, id, SearchIndex::Calendar, document).await;
     let keys = search_keys(test, id, SearchIndex::Calendar).await;
     assert!(
-        keys.documents == 0 && keys.terms > 0 && keys.fields == 0,
+        keys.documents.is_empty() && keys.terms > 0,
         "Calendar terms alone were not planted: {keys:?}"
     );
     assert!(
@@ -2361,24 +2513,20 @@ async fn setup_refuses_orphaned_search_terms(test: &TestServer, admin: &Account)
         "an orphaned Calendar term of the account is stored",
     )
     .await;
-    search
-        .unindex(SearchQuery::new(SearchIndex::Calendar).with_account_id(id))
-        .await
-        .unwrap();
+    unindex_search_account(test, SearchIndex::Calendar, id).await;
     assert!(
         !test.server.za_has_calendar_search_terms(id).await.unwrap(),
         "the account-wide unindex left Calendar terms"
     );
 
-    // Ruling R63: orphans of another account, at the adjacent id above
-    // (account ids are assigned in order, so none holds it yet), are not
-    // the account's: its scans stay false.
+    // Orphans of another account, at the adjacent id above (account ids
+    // are assigned in order, so none holds it yet), are not the account's:
+    // its scans stay false.
     let neighbour = id + 1;
     let mut document = IndexDocument::new(SearchIndex::Email)
         .with_account_id(neighbour)
         .with_document_id(0);
     document.index_text(EmailSearchField::Body, "orphanterm", Language::English);
-    document.index_unsigned(EmailSearchField::ReceivedAt, now());
     plant_orphaned_keys(test, neighbour, SearchIndex::Email, document).await;
     let mut document = IndexDocument::new(SearchIndex::Calendar)
         .with_account_id(neighbour)
@@ -2407,10 +2555,7 @@ async fn setup_refuses_orphaned_search_terms(test: &TestServer, admin: &Account)
         "the account's scans see the adjacent account's orphans"
     );
     for index in [SearchIndex::Email, SearchIndex::Calendar] {
-        search
-            .unindex(SearchQuery::new(index).with_account_id(neighbour))
-            .await
-            .unwrap();
+        unindex_search_account(test, index, neighbour).await;
     }
     assert!(
         !test
@@ -2430,17 +2575,17 @@ async fn setup_refuses_orphaned_search_terms(test: &TestServer, admin: &Account)
     account
 }
 
-/// Ruling R62 of plan 13 (PR #51 review 3, P2-8): `Store::index` writes a
-/// large document in several commit chunks, its `Document` key in the
-/// first, and the message's unindex task, in a worker of its own, can run
-/// between two of them: it deletes the `Document` key and every key that
-/// key lists. Before R62 the later chunks then wrote `Term` and `Index`
-/// keys that nothing lists (short tokens, the subject and the addresses
-/// verbatim), the task cleared, and issuance passed R51's document scan.
-/// With R62's guard every later chunk of a fenced document asserts that its
-/// `Document` key is stored, so the rest of the document is not written,
-/// the task ends without a retry (ruling R63: within `UNDER_THE_DEFERRAL`
-/// of the release), and the account provisions cleanly.
+/// Ruling R62 of plan 13 (PR #51 review 3, P2-8), flipped at 1.0 (Task 1's
+/// ruling 19, part 6a): at 0.16 the message's unindex task ran in a worker
+/// of its own between two commit chunks of the message's index write, so
+/// the later chunks wrote terms nothing listed, and R62's per-chunk guard
+/// stopped them. At 1.0 the unindex is an entry of the same partition,
+/// which one worker runs in order: with the pass parked after chunk 0
+/// (`INDEX_CHUNK_PAUSE`) and the message destroyed, the unindex waits;
+/// issuance is refused meanwhile (the row is stored: R46). Released, the
+/// pass writes its later chunks whole and the next batch's unindex removes
+/// the document and every term: nothing is left, and the account
+/// provisions. The guard is retired.
 async fn unindex_between_index_chunks_leaves_no_terms(
     test: &TestServer,
     admin: &Account,
@@ -2450,8 +2595,7 @@ async fn unindex_between_index_chunks_leaves_no_terms(
     let account = passwordless(admin, CHUNKED).await;
     let id = account.id().document_id();
     let message = message_with("chunked subject", &large_body(TAIL_CANARY));
-    // The delivery commits; its index task writes the document's first
-    // chunk and parks before the second.
+    // The delivery commits; its index pass writes chunk 0 and parks.
     let parked = HookParked::start(id, test_hooks::set_index_chunk_pause, async move {
         SmtpConnection::connect()
             .await
@@ -2461,20 +2605,24 @@ async fn unindex_between_index_chunks_leaves_no_terms(
     .await;
     let keys = search_keys(test, id, SearchIndex::Email).await;
     assert!(
-        keys.documents == 1 && keys.terms > 0 && !keys.holds_term(TAIL_CANARY),
+        keys.documents.is_empty() && keys.terms > 0 && !keys.holds_term(TAIL_CANARY),
         "chunk 0 alone was not written: {keys:?}"
     );
     let ids = message_ids(test, id).await;
     assert_eq!(ids.len(), 1, "{ids:?}");
 
     admin.destroy_all_mailboxes_for_account(id).await;
-    wait_for_the_unindex(test, id, Some(ids[0])).await;
-    let keys = search_keys(test, id, SearchIndex::Email).await;
-    assert!(keys.is_empty(), "the unindex left chunk 0's keys: {keys:?}");
+    assert!(
+        queue_entries(test, id)
+            .await
+            .iter()
+            .any(|entry| entry.document_id == ids[0] && !entry.insert),
+        "the destroy queued no unindex"
+    );
     let reply = za_post_as(admin, "setup-token", &json!({ "account": CHUNKED })).await;
     assert_eq!(
         reply.expect(409)["error"],
-        "account has unfinished tasks",
+        "account already holds mail",
         "issuance while the index write of the account is between chunks"
     );
     assert!(
@@ -2482,35 +2630,23 @@ async fn unindex_between_index_chunks_leaves_no_terms(
         "the refused issuance wrote a record"
     );
 
-    let released = Instant::now();
     parked.finish().await;
-    test.wait_for_tasks().await;
-    let elapsed = released.elapsed();
-    assert!(
-        elapsed < UNDER_THE_DEFERRAL,
-        "the index task ended {elapsed:?} after the release: deferred, not ended without an error"
-    );
+    wait_for_index_queue(test, id, Duration::from_secs(10)).await;
     let keys = search_keys(test, id, SearchIndex::Email).await;
     assert!(
         keys.is_empty(),
         "the later chunks outlived the unindex: {keys:?}"
     );
-    assert!(
-        account_tasks(test, id).await.is_empty(),
-        "the index task is still queued"
-    );
     za_setup_token(admin, CHUNKED).await;
     account
 }
 
-/// Ruling R62 of plan 13: the calendar twin of
-/// `unindex_between_index_chunks_leaves_no_terms`, built like
-/// `setup_refuses_an_in_flight_calendar_index_write`. An ordinary event
-/// whose description fills three commit chunks is indexed; its first chunk
-/// is written, and the event is deleted before the second, so its unindex
-/// task removes the `Document` key and what it lists. The later chunks
-/// (the description's other tokens, the canary, the `Uid` verbatim in an
-/// `Index` key) are not written.
+/// Ruling R62 of plan 13, flipped at 1.0: the calendar twin of
+/// `unindex_between_index_chunks_leaves_no_terms`. An ordinary event whose
+/// description fills three commit chunks is indexed; its pass parks after
+/// chunk 0 and the event is deleted, which queues its unindex behind the
+/// pass; issuance is refused meanwhile (R54's queue scan). Released, the
+/// pass completes and the unindex removes everything.
 async fn unindex_between_calendar_index_chunks_leaves_no_terms(
     test: &TestServer,
     admin: &Account,
@@ -2519,82 +2655,52 @@ async fn unindex_between_calendar_index_chunks_leaves_no_terms(
     test.wait_for_tasks().await;
     let account = passwordless(admin, CHUNKED_EVENT).await;
     let id = account.id().document_id();
-    // The event is planted while the consumer is held; released with the
-    // pause set, the consumer dispatches its index task, which writes the
-    // document's first chunk and parks before the second.
-    let held = hold_task_consumer(test).await;
+    hold_index_partition(test, SearchIndex::Calendar, id).await;
     let event_id = plant_event(test, id, "default", "chunked.ics", &chunked_ical(), None).await;
+    let server = test.server.clone();
     let parked = HookParked::start(id, test_hooks::set_index_chunk_pause, async move {
-        drop(held);
+        release_index_partition(&server, SearchIndex::Calendar, id).await;
     })
     .await;
     let keys = search_keys(test, id, SearchIndex::Calendar).await;
     assert!(
-        keys.documents == 1 && keys.terms > 0 && !keys.holds_term(TAIL_CANARY),
+        keys.documents.is_empty() && keys.terms > 0 && !keys.holds_term(TAIL_CANARY),
         "chunk 0 alone was not written: {keys:?}"
     );
 
-    // The event is deleted: an unindex task, which runs and clears its
-    // record while the index task stays parked.
-    let account_info = test.server.account_info(id).await.unwrap();
-    let archive = test
-        .server
-        .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
-            id,
-            Collection::CalendarEvent,
-            event_id,
-        ))
-        .await
-        .unwrap()
-        .expect("the event's archive");
-    let mut batch = BatchBuilder::new();
-    DestroyArchive(archive.to_unarchived::<CalendarEvent>().unwrap())
-        .delete_all(&account_info, id, event_id, false, &mut batch)
-        .unwrap();
-    test.server.commit_batch(batch).await.unwrap();
-    test.server.notify_task_queue();
-    wait_for_the_unindex(test, id, None).await;
-    let keys = search_keys(test, id, SearchIndex::Calendar).await;
-    assert!(keys.is_empty(), "the unindex left chunk 0's keys: {keys:?}");
-    let reply = za_post_as(admin, "setup-token", &json!({ "account": CHUNKED_EVENT })).await;
-    assert_eq!(
-        reply.expect(409)["error"],
+    delete_event_records(test, id, event_id).await;
+    assert_refused(
+        test,
+        admin,
+        (CHUNKED_EVENT, id),
         "account has unfinished tasks",
-        "issuance while the calendar index write of the account is between chunks"
-    );
-    assert!(
-        test.server.za_vault_record(id).await.unwrap().is_none(),
-        "the refused issuance wrote a record"
-    );
+        "the calendar index write of the account is between chunks",
+    )
+    .await;
 
     parked.finish().await;
-    test.wait_for_tasks().await;
+    wait_for_index_queue(test, id, Duration::from_secs(10)).await;
     let keys = search_keys(test, id, SearchIndex::Calendar).await;
     assert!(
         keys.is_empty(),
         "the later calendar chunks outlived the unindex: {keys:?}"
     );
-    assert!(
-        account_tasks(test, id).await.is_empty(),
-        "the index task is still queued"
-    );
     za_setup_token(admin, CHUNKED_EVENT).await;
     account
 }
 
-/// Ruling R62 of plan 13 (P2-8's second route): on a cluster, an index
-/// worker (A) that wrote a large document's first chunk and stalled past
-/// its task lease before the second is superseded by another node's
-/// execution (B), which finds the message gone and clears the task's
-/// record; the message's unindex has removed the `Document` key and what it
-/// lists, so every term passes and the account is provisioned. R58's
-/// assertion is in the first chunk only; when A resumes, its later chunks
-/// assert that the `Document` key is stored (R62), so nothing of them lands
-/// in the key account's index. B is simulated as in
-/// `superseded_index_write_loses_to_provisioning`. An ordinary account's
-/// multi-chunk document passes the guard (the control), and its task
-/// clearing shows that A's batch ended.
+/// Ruling R62's cluster route (P2-8's second route), at 1.0 under ruling
+/// 18: an index pass (A) that wrote a large message's chunk 0 and stalled
+/// past its partition lock is superseded by another node's execution (B,
+/// simulated), which runs the message's unindex: the `Document` key is not
+/// written yet (it is in the last chunk), so B's deletion finds no stored
+/// document and chunk 0's terms are left, listed by nothing (part 6a's
+/// lost-lease residual). R62's kept term scan refuses issuance on them;
+/// after the account-wide unindex (the remedy) the account is provisioned.
+/// When A resumes, its later chunks fail the vault-absence assertion each
+/// carries: nothing of them lands, the partition enters its retry state,
+/// and one reset drains it. An ordinary account's multi-chunk document is
+/// written whole (the control).
 async fn superseded_index_tail_loses_to_provisioning(
     test: &TestServer,
     admin: &Account,
@@ -2606,8 +2712,7 @@ async fn superseded_index_tail_loses_to_provisioning(
     let control = passwordless(admin, SUPERSEDED_TAIL_CONTROL).await;
     let control_id = control.id().document_id();
     let message = message_with("superseded tail", &large_body(TAIL_CANARY));
-    // A: the delivery commits; its index task writes the document's first
-    // chunk and parks before the second.
+    // A: the delivery commits; its index pass writes chunk 0 and parks.
     let parked = HookParked::start(id, test_hooks::set_index_chunk_pause, async move {
         SmtpConnection::connect()
             .await
@@ -2619,51 +2724,23 @@ async fn superseded_index_tail_loses_to_provisioning(
     assert_eq!(ids.len(), 1, "{ids:?}");
 
     admin.destroy_all_mailboxes_for_account(id).await;
-    wait_for_the_unindex(test, id, Some(ids[0])).await;
+    // B, after A's lease expired.
+    emulate_superseding_node(test, id, &ids).await;
     let keys = search_keys(test, id, SearchIndex::Email).await;
-    assert!(keys.is_empty(), "the unindex left chunk 0's keys: {keys:?}");
-
-    // B, after A's lease expired: its retries find no message, and its
-    // `Ignored` update clears the task's `Due` and `Task` records.
-    let mut records = Vec::new();
-    test.server
-        .store()
-        .iterate(
-            IterateParams::new(
-                ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task { id: 0 })),
-                ValueKey::from(ValueClass::TaskQueue(TaskQueueClass::Task { id: u64::MAX })),
-            )
-            .ascending(),
-            |key, value| {
-                if let Task::IndexDocument(task) = Task::deserialize(value)?
-                    && task.account_id.document_id() == id
-                {
-                    let due = Task::IndexDocument(task).due_timestamp();
-                    records.push((key.deserialize_be_u64(U64_LEN)?, due));
-                }
-                Ok(true)
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(records.len(), 1, "A's task record: {records:?}");
-    let mut batch = BatchBuilder::new();
-    for (task_id, due) in records {
-        batch
-            .clear(ValueClass::TaskQueue(TaskQueueClass::Due {
-                id: task_id,
-                due,
-            }))
-            .clear(ValueClass::TaskQueue(TaskQueueClass::Task { id: task_id }));
-    }
-    test.server.store().write(batch.build_all()).await.unwrap();
     assert!(
-        account_tasks(test, id).await.is_empty(),
-        "B's update left the task record"
+        keys.documents.is_empty() && keys.terms > 0,
+        "B's deletion did not leave chunk 0's terms: {keys:?}"
     );
+    assert_refused(
+        test,
+        admin,
+        (SUPERSEDED_TAIL, id),
+        "account already holds mail",
+        "chunk 0's terms outlived the superseding unindex",
+    )
+    .await;
+    unindex_search_account(test, SearchIndex::Email, id).await;
 
-    // Every term passes: no message, no metadata archive, no task, no
-    // sample, no search key.
     let token = za_setup_token(admin, SUPERSEDED_TAIL).await;
     za_setup(SUPERSEDED_TAIL, &token, STRONG).await;
     assert_eq!(
@@ -2678,9 +2755,18 @@ async fn superseded_index_tail_loses_to_provisioning(
         "setup did not complete"
     );
 
-    // A resumes and attempts its later chunks; the control's index task
-    // runs after A's batch and its update.
+    // A resumes: chunk 1 fails its assertion.
     parked.finish().await;
+    wait_for_retry_state(test, SearchIndex::Email, id).await;
+    let keys = search_keys(test, id, SearchIndex::Email).await;
+    assert!(
+        keys.is_empty(),
+        "the superseded tail landed in the key account's index: {keys:?}"
+    );
+    release_index_partition(&test.server, SearchIndex::Email, id).await;
+    wait_for_index_queue(test, id, Duration::from_secs(10)).await;
+
+    // The control's multi-chunk document, written whole.
     deliver(
         test,
         SENDER,
@@ -2688,88 +2774,31 @@ async fn superseded_index_tail_loses_to_provisioning(
         &message_with("superseded tail control", &large_body(TAIL_CANARY)),
     )
     .await;
-    test.wait_for_tasks().await;
     let control_keys = search_keys(test, control_id, SearchIndex::Email).await;
     assert!(
-        control_keys.documents == 1
+        control_keys.documents.len() == 1
             && control_keys.terms > 2000
-            && control_keys.holds_term(TAIL_CANARY)
-            && control_keys.fields > 0,
+            && control_keys.holds_term(TAIL_CANARY),
         "the control's multi-chunk document was not written whole: {control_keys:?}"
-    );
-    let keys = search_keys(test, id, SearchIndex::Email).await;
-    assert!(
-        keys.is_empty(),
-        "the superseded tail landed in the key account's index: {keys:?}"
-    );
-    assert!(
-        account_tasks(test, id).await.is_empty(),
-        "the superseded execution was rescheduled"
     );
 
     admin.destroy_all_mailboxes_for_account(control_id).await;
     (account, control)
 }
 
-/// Replaces the stored event's iCalendar data as a PUT does
-/// (`CalendarEvent::update`), which schedules its index task: a merge with
-/// the event's stored `Document` key.
+/// Replaces the stored event's iCalendar data as a PUT does (upstream's
+/// full split update over the row and the content), which queues its index
+/// entry: a merge with the event's stored `Document` key.
 async fn update_event(test: &TestServer, account_id: u32, event_id: u32, ical: &str) {
-    let archive = test
-        .server
-        .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
-            account_id,
-            Collection::CalendarEvent,
-            event_id,
-        ))
-        .await
-        .unwrap()
-        .expect("the event's archive");
-    let current = archive.to_unarchived::<CalendarEvent>().unwrap();
-    let mut event = current.deserialize::<CalendarEvent>().unwrap();
+    let stored = stored_event(test, account_id, event_id).await;
+    let mut event = stored.za_event();
     let parsed = match calcard::Parser::new(ical).entry() {
         calcard::Entry::ICalendar(ical) => ical,
         other => panic!("{other:?}"),
     };
-    let mut next_alarm = None;
-    event.size = ical.len() as u32;
-    event.data = CalendarEventData::new(parsed, Tz::Floating, 100, &mut next_alarm);
-    let account_info = test.server.account_info(account_id).await.unwrap();
-    let mut batch = BatchBuilder::new();
-    event
-        .update(
-            account_info.account_tenant_ids(),
-            current,
-            account_id,
-            event_id,
-            &mut batch,
-        )
-        .unwrap();
-    test.server.commit_batch(batch).await.unwrap();
-    test.server.notify_task_queue();
-}
-
-/// Deletes the stored event, which schedules its unindex task.
-async fn delete_event(test: &TestServer, account_id: u32, event_id: u32) {
-    let account_info = test.server.account_info(account_id).await.unwrap();
-    let archive = test
-        .server
-        .store()
-        .get_value::<Archive<AlignedBytes>>(ValueKey::archive(
-            account_id,
-            Collection::CalendarEvent,
-            event_id,
-        ))
-        .await
-        .unwrap()
-        .expect("the event's archive");
-    let mut batch = BatchBuilder::new();
-    DestroyArchive(archive.to_unarchived::<CalendarEvent>().unwrap())
-        .delete_all(&account_info, account_id, event_id, false, &mut batch)
-        .unwrap();
-    test.server.commit_batch(batch).await.unwrap();
-    test.server.notify_task_queue();
+    event.content.data = CalendarEventData::new(parsed, Tz::Floating, 100);
+    write_stored_event(test, account_id, event_id, &stored, event).await;
+    test.server.notify_index_queue();
 }
 
 /// The merge tests' updated DESCRIPTION: a few tokens, none of the large
@@ -2778,100 +2807,14 @@ fn short_description() -> String {
     format!("short merged text {MERGE_CANARY}")
 }
 
-/// Ruling R63 of plan 13 (round 5's re-reviews, opus F1 and fable F1):
-/// FoundationDB evaluates an assertion's read error as a mismatch
-/// (`AssertValueFailed`), so a transient read error at a later chunk's
-/// guard stopped an ordinary document as R62 stops one whose `Document`
-/// key an unindex deleted: its later chunks were never written and its
-/// task cleared. `Store::index` now re-reads the `Document` key after a
-/// later chunk's failed guard and returns the error while the key is
-/// stored, so the worker defers the batch and the retry writes the
-/// document whole. The read error is simulated by `INDEX_GUARD_FAIL_ONCE`
-/// (the suites run no FoundationDB): an ordinary account's multi-chunk
-/// message whose second chunk is not written and fails its guard. The
-/// retry waits out the default deferral (at least 30 s).
-async fn failed_guard_with_its_document_stored_defers_the_task(
-    test: &TestServer,
-    admin: &Account,
-) -> Account {
-    println!("failed_guard_with_its_document_stored_defers_the_task");
-    test.wait_for_tasks().await;
-    let account = passwordless(admin, GUARD_FAILED).await;
-    let id = account.id().document_id();
-    test_hooks::set_index_guard_fail_once(Some(id));
-    SmtpConnection::connect()
-        .await
-        .ingest(
-            SENDER,
-            &[GUARD_FAILED],
-            &message_with("guard failed", &large_body(TAIL_CANARY)),
-        )
-        .await;
-
-    // The message and its index task commit together; the task writes chunk
-    // 0, fails chunk 1's guard and ends deferred, or cleared if the
-    // failure stopped the document.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let deferred = loop {
-        let index_tasks = account_tasks(test, id)
-            .await
-            .into_iter()
-            .filter(|task| matches!(task, Task::IndexDocument(_)))
-            .collect::<Vec<_>>();
-        match index_tasks.as_slice() {
-            [task] if matches!(task.status(), TaskStatus::Retry(_)) => break true,
-            [] if !message_ids(test, id).await.is_empty() => break false,
-            _ => {}
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the index task did not end: {index_tasks:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
-    assert!(
-        deferred,
-        "the failed guard stopped the document and its task was cleared"
-    );
-    assert!(
-        test_hooks::INDEX_GUARD_FAIL_ONCE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_none(),
-        "the guard failure was not taken"
-    );
-    let keys = search_keys(test, id, SearchIndex::Email).await;
-    assert!(
-        keys.documents == 1 && keys.terms > 0 && !keys.holds_term(TAIL_CANARY),
-        "chunk 0 alone was not written: {keys:?}"
-    );
-
-    // The retry, once due, writes the document whole.
-    test.wait_for_tasks().await;
-    let keys = search_keys(test, id, SearchIndex::Email).await;
-    assert!(
-        keys.documents == 1 && keys.terms > 2000 && keys.holds_term(TAIL_CANARY) && keys.fields > 0,
-        "the retry did not write the document whole: {keys:?}"
-    );
-    assert!(
-        account_tasks(test, id).await.is_empty(),
-        "the index task is still queued"
-    );
-
-    admin.destroy_all_mailboxes_for_account(id).await;
-    account
-}
-
-/// Ruling R63 of plan 13 (opus F4, fable F3): a calendar update's index
-/// write merges with the stored document: chunk 0 sets the new `Document`
-/// key and the new-only keys, then come the clears of the old-only keys,
-/// in later chunks when there are many. An unindex between two of those
-/// chunks deletes the new `Document` key and what it lists; R62's guard
-/// then stopped the rest, clears included, so the old version's keys that
-/// the later chunks clear stayed, listed by nothing, and issuance answered
-/// 409 for good. `Store::index` now writes a stopped document's remaining
-/// clears without the guard and drops its sets, so nothing of the account
-/// is left in the Calendar index and the account provisions.
+/// Ruling R63 of plan 13 (opus F4, fable F3), flipped at 1.0: a calendar
+/// update's index pass merges with the stored document, its clears of the
+/// old-only terms spread over several commit chunks. At 0.16 an unindex
+/// between two of them stopped the rest and left old-only keys. At 1.0 the
+/// event's deletion queues its unindex behind the parked merge (the same
+/// partition, in order); issuance is refused meanwhile; released, the merge
+/// completes and the unindex removes the document and every term, so the
+/// account provisions.
 async fn unindex_between_calendar_merge_chunks_leaves_no_terms(
     test: &TestServer,
     admin: &Account,
@@ -2893,45 +2836,36 @@ async fn unindex_between_calendar_merge_chunks_leaves_no_terms(
     test.wait_for_tasks().await;
     let keys = search_keys(test, id, SearchIndex::Calendar).await;
     assert!(
-        keys.documents == 1 && keys.terms > 2000 && keys.holds_term(TAIL_CANARY),
+        keys.documents.len() == 1 && keys.terms > 2000 && keys.holds_term(TAIL_CANARY),
         "the event was not indexed whole: {keys:?}"
     );
 
-    // The update is committed while the consumer is held; released with the
-    // pause set, its merge writes chunk 0 (the new `Document` key, the
-    // new-only keys, the first clears) and parks before the second.
-    let held = hold_task_consumer(test).await;
+    // The update is committed while the partition is held; released with
+    // the pause set, its merge writes chunk 0 and parks before the second.
+    hold_index_partition(test, SearchIndex::Calendar, id).await;
     update_event(test, id, event_id, &event_ical(uid, &short_description())).await;
+    let server = test.server.clone();
     let parked = HookParked::start(id, test_hooks::set_index_chunk_pause, async move {
-        drop(held);
+        release_index_partition(&server, SearchIndex::Calendar, id).await;
     })
     .await;
-    let keys = search_keys(test, id, SearchIndex::Calendar).await;
-    assert!(
-        keys.documents == 1 && keys.holds_term(MERGE_CANARY) && keys.terms > 1000,
-        "chunk 0 of a merge whose clears span later chunks was not written alone: {keys:?}"
-    );
 
-    // The event is deleted: its unindex removes the new `Document` key and
-    // what it lists, and leaves the old-only keys not yet cleared.
-    delete_event(test, id, event_id).await;
-    wait_for_the_unindex(test, id, None).await;
-    let keys = search_keys(test, id, SearchIndex::Calendar).await;
-    assert!(
-        keys.documents == 0 && !keys.holds_term(MERGE_CANARY) && keys.terms > 0,
-        "the unindex left no old-only key for the later chunks to clear: {keys:?}"
-    );
+    delete_event_records(test, id, event_id).await;
+    assert_refused(
+        test,
+        admin,
+        (MERGE_UNINDEXED, id),
+        "account has unfinished tasks",
+        "the calendar merge of the account is between chunks",
+    )
+    .await;
 
     parked.finish().await;
-    test.wait_for_tasks().await;
+    wait_for_index_queue(test, id, Duration::from_secs(10)).await;
     let keys = search_keys(test, id, SearchIndex::Calendar).await;
     assert!(
         keys.is_empty(),
-        "the stopped merge's old-only keys outlived the unindex: {keys:?}"
-    );
-    assert!(
-        account_tasks(test, id).await.is_empty(),
-        "the index task is still queued"
+        "the merge's keys outlived the unindex: {keys:?}"
     );
     za_setup_token(admin, MERGE_UNINDEXED).await;
     account
@@ -2939,10 +2873,8 @@ async fn unindex_between_calendar_merge_chunks_leaves_no_terms(
 
 /// Ruling R63 of plan 13 (fable F5): the merge path's positive control. An
 /// ordinary event whose description fills three commit chunks is indexed,
-/// then updated to a short description; its merge (the new `Document` key
-/// and the new-only keys in chunk 0, the old-only keys' clears in later
-/// chunks, each later chunk past the guard) leaves one `Document` key, the
-/// new tokens, and none of the old-only ones.
+/// then updated to a short description; its merge leaves one `Document`
+/// key, the new tokens, and none of the old-only ones.
 async fn multi_chunk_calendar_merge_is_written_whole(
     test: &TestServer,
     admin: &Account,
@@ -2964,7 +2896,7 @@ async fn multi_chunk_calendar_merge_is_written_whole(
     test.wait_for_tasks().await;
     let keys = search_keys(test, id, SearchIndex::Calendar).await;
     assert!(
-        keys.documents == 1 && keys.terms > 2000 && keys.holds_term(TAIL_CANARY),
+        keys.documents.len() == 1 && keys.terms > 2000 && keys.holds_term(TAIL_CANARY),
         "the event was not indexed whole: {keys:?}"
     );
 
@@ -2972,99 +2904,832 @@ async fn multi_chunk_calendar_merge_is_written_whole(
     test.wait_for_tasks().await;
     let keys = search_keys(test, id, SearchIndex::Calendar).await;
     assert!(
-        keys.documents == 1
+        keys.documents.len() == 1
             && keys.holds_term(MERGE_CANARY)
             && !keys.holds_term(TAIL_CANARY)
             && (0..2400).all(|token| !keys.holds_term(&format!("c{token:04}"))),
         "the multi-chunk merge was not written whole: {keys:?}"
     );
 
-    delete_event(test, id, event_id).await;
+    delete_event_records(test, id, event_id).await;
     test.wait_for_tasks().await;
     account
 }
 
-/// Ruling R63 of plan 13 (opus F2): a document that stops at a later
-/// chunk's failed guard ends without an error, and the batch's other
-/// documents are still written. One `Store::index` call holds two fenced
-/// multi-chunk Email documents of two ordinary accounts, fenced as the
-/// index worker fences them (`za_index_fence`); the worker's own batches
-/// cannot be made to hold both deterministically, since its dispatcher
-/// locks each task between two sends. The first document parks after its
-/// chunk 0 and is unindexed before it resumes: the call returns `Ok`, the
-/// first document leaves nothing, and the second, of an account the pause
-/// does not park, is written whole.
-async fn stopped_document_leaves_its_batch_written(
+/// Writes `container` (or removes the stored one with `None`) as the
+/// object-metadata container of `owner_id`'s document, through upstream's
+/// writers (`ContainerChange`, then `MetadataWrite` or, with a viewer,
+/// `PrivateMetadataWrite` and its counters), without the presence bits:
+/// what an ordinary writer leaves before provisioning, including on a
+/// document that no longer exists.
+async fn write_object_metadata(
     test: &TestServer,
-    admin: &Account,
-) -> (Account, Account) {
-    println!("stopped_document_leaves_its_batch_written");
-    test.wait_for_tasks().await;
-    let stopped = passwordless(admin, BATCH_STOPPED).await;
-    let stopped_id = stopped.id().document_id();
-    let other = passwordless(admin, BATCH_OTHER).await;
-    let other_id = other.id().document_id();
-    let document = |account_id: u32| {
-        let mut document = IndexDocument::new(SearchIndex::Email)
-            .with_account_id(account_id)
-            .with_document_id(0);
-        document.index_text(
-            EmailSearchField::Body,
-            &large_body(TAIL_CANARY),
-            Language::English,
-        );
-        document.index_unsigned(EmailSearchField::ReceivedAt, now());
-        test.server.za_index_fence(document, account_id)
+    owner_id: u32,
+    viewer_id: Option<u32>,
+    collection: Collection,
+    document_id: u32,
+    container: Option<types::metadata::EncodedMetadata>,
+) {
+    use common::storage::metadata::{ContainerChange, MetadataLog, PrivateMetadataCommit};
+    use types::metadata::MetadataEdit;
+    let previous = match viewer_id {
+        Some(viewer_id) => test
+            .server
+            .private_metadata_container(owner_id, viewer_id, collection, document_id)
+            .await
+            .unwrap(),
+        None => test
+            .server
+            .metadata_container(owner_id, collection, document_id)
+            .await
+            .unwrap(),
     };
-    let documents = vec![document(stopped_id), document(other_id)];
-    let search = test.server.search_store().clone();
-    let parked = HookParked::start(stopped_id, test_hooks::set_index_chunk_pause, async move {
-        search.index(documents).await
-    })
-    .await;
-    let keys = search_keys(test, stopped_id, SearchIndex::Email).await;
-    assert!(
-        keys.documents == 1 && keys.terms > 0 && !keys.holds_term(TAIL_CANARY),
-        "chunk 0 alone was not written: {keys:?}"
-    );
-    let keys = search_keys(test, other_id, SearchIndex::Email).await;
-    assert!(
-        keys.is_empty(),
-        "the batch's other document was written first: {keys:?}"
-    );
-
-    // The first document's unindex, as its task runs it.
-    let mut query = SearchQuery::new(SearchIndex::Email);
-    query
-        .add_filter(SearchFilter::eq(SearchField::AccountId, stopped_id))
-        .add_filter(SearchFilter::eq(SearchField::DocumentId, 0u32));
-    test.server.search_store().unindex(query).await.unwrap();
-    let keys = search_keys(test, stopped_id, SearchIndex::Email).await;
-    assert!(keys.is_empty(), "the unindex left chunk 0's keys: {keys:?}");
-
-    let result = parked.finish().await;
-    assert!(
-        result.is_ok(),
-        "the stopped document ended its batch with an error: {result:?}"
-    );
-    let keys = search_keys(test, stopped_id, SearchIndex::Email).await;
-    assert!(
-        keys.is_empty(),
-        "the stopped document's later chunks were written: {keys:?}"
-    );
-    let keys = search_keys(test, other_id, SearchIndex::Email).await;
-    assert!(
-        keys.documents == 1
-            && keys.terms > 2000
-            && keys.holds_term(TAIL_CANARY)
-            && keys.fields == 1,
-        "the batch's other document was not written whole: {keys:?}"
-    );
-
+    let Some(change) = ContainerChange::new(previous.as_ref(), container, MetadataEdit::Write)
+    else {
+        return;
+    };
+    let mut batch = BatchBuilder::new();
+    let mut commit = PrivateMetadataCommit::default();
+    let document = store::write::PendingId::Assigned(document_id);
+    match viewer_id {
+        Some(viewer_id) => {
+            let viewer = test.server.account(viewer_id).await.unwrap();
+            change
+                .into_private_write(owner_id, &viewer, collection, MetadataLog::None)
+                .build(document, &mut batch, &mut commit)
+                .unwrap();
+        }
+        None => {
+            let owner = test.server.account(owner_id).await.unwrap();
+            change
+                .into_write(&owner, collection, MetadataLog::None)
+                .build(document, &mut batch)
+                .unwrap();
+        }
+    }
     test.server
-        .search_store()
-        .unindex(SearchQuery::new(SearchIndex::Email).with_account_id(other_id))
+        .commit_metadata_batch(batch, commit)
         .await
         .unwrap();
-    (stopped, other)
+}
+
+/// Ruling 66 (the Task 6 review's F1): issuance is refused while the account
+/// holds object metadata in the clear, and proceeds once it is removed. Each
+/// container is written through upstream's writers as an ordinary writer
+/// leaves it before provisioning (an impersonating operator or a grantee with
+/// `ModifyMetadata`): a mailbox's shared container, a server-level IMAP
+/// annotation, another account's private container on a destroyed message of
+/// the account (Email destruction releases only the shared container), and
+/// the account's own private container on another account's mailbox (its
+/// `Owner` counter; once removed, the counter stays and counts none). An
+/// address book's container, DAV dead properties kept in the clear for every
+/// account, is permitted.
+async fn setup_refuses_object_metadata(test: &TestServer, admin: &Account) -> (Account, Account) {
+    use crate::utils::za::plain_dav_container;
+    println!("setup_refuses_object_metadata");
+    let account = passwordless(admin, OBJECT_METADATA).await;
+    let id = account.id().document_id();
+    let owner = admin
+        .create_user_account(
+            OBJECT_METADATA_OWNER,
+            STRONG,
+            "Fence",
+            &[],
+            user_permissions(),
+        )
+        .await;
+    let owner_id = owner.id().document_id();
+    let container = || plain_dav_container(&[("urn:za:fence", "note", "object metadata canary")]);
+    // (what, the object's owner, the viewer of a private container, the
+    // collection, the document).
+    let cases = [
+        (
+            "a mailbox's shared container",
+            id,
+            None,
+            Collection::Mailbox,
+            INBOX_ID,
+        ),
+        (
+            "a server-level annotation",
+            id,
+            None,
+            Collection::Principal,
+            0,
+        ),
+        (
+            "another account's private container on a destroyed message",
+            id,
+            Some(owner_id),
+            Collection::Email,
+            u32::MAX - 7,
+        ),
+        (
+            "its private container on another account's mailbox",
+            owner_id,
+            Some(id),
+            Collection::Mailbox,
+            INBOX_ID,
+        ),
+    ];
+    assert!(!test.server.za_has_object_metadata(id).await.unwrap());
+    for (what, owner_id, viewer_id, collection, document_id) in cases {
+        write_object_metadata(
+            test,
+            owner_id,
+            viewer_id,
+            collection,
+            document_id,
+            Some(container()),
+        )
+        .await;
+        let reply = za_post_as(admin, "setup-token", &json!({ "account": OBJECT_METADATA })).await;
+        assert_eq!(
+            reply.expect(409)["error"],
+            "account already holds object metadata",
+            "issuance while the account holds {what}"
+        );
+        assert!(
+            test.server.za_vault_record(id).await.unwrap().is_none(),
+            "the refused issuance wrote a record ({what})"
+        );
+        write_object_metadata(test, owner_id, viewer_id, collection, document_id, None).await;
+        assert!(
+            !test.server.za_has_object_metadata(id).await.unwrap(),
+            "{what} was not removed"
+        );
+    }
+    // Ruling 134 (`za_has_object_metadata`'s second pass): the last case
+    // left the account's `Owner` counter on `owner`'s mailboxes counting no
+    // container. A private container of the account stored under `owner`
+    // that the counter does not count (written straight to the store) is
+    // still found through it, and refuses issuance.
+    let counter = test
+        .server
+        .store()
+        .get_value::<RawValue>(ValueKey {
+            account_id: id,
+            collection: Collection::Mailbox.into(),
+            document_id: 0,
+            class: ValueClass::Metadata(MetadataClass::Owner { owner: owner_id }),
+        })
+        .await
+        .unwrap();
+    let counter = counter.map(|counter| ViewerState::deserialize(&counter.0).unwrap());
+    assert!(
+        counter.is_some_and(|counter| counter.containers == 0),
+        "the fixture needs a counter that counts none: {counter:?}"
+    );
+    let write_uncounted = async |set: bool| {
+        let mut batch = BatchBuilder::new();
+        batch
+            .with_account_id(owner_id)
+            .with_collection(Collection::Mailbox)
+            .with_document(INBOX_ID);
+        let class = ValueClass::Metadata(MetadataClass::Private { viewer: id });
+        if set {
+            batch.set(class, vec![1, 2, 3]);
+        } else {
+            batch.clear(class);
+        }
+        test.server.store().write_batch(&mut batch).await.unwrap();
+    };
+    write_uncounted(true).await;
+    assert!(
+        test.server.za_has_object_metadata(id).await.unwrap(),
+        "an uncounted private container on another account's object"
+    );
+    let reply = za_post_as(admin, "setup-token", &json!({ "account": OBJECT_METADATA })).await;
+    assert_eq!(
+        reply.expect(409)["error"],
+        "account already holds object metadata",
+        "issuance while the account holds an uncounted private container"
+    );
+    assert!(test.server.za_vault_record(id).await.unwrap().is_none());
+    write_uncounted(false).await;
+    assert!(!test.server.za_has_object_metadata(id).await.unwrap());
+    // Permitted: an address book's dead properties.
+    write_object_metadata(
+        test,
+        id,
+        None,
+        Collection::AddressBook,
+        0,
+        Some(container()),
+    )
+    .await;
+    assert!(
+        !test.server.za_has_object_metadata(id).await.unwrap(),
+        "an address book's container refuses issuance"
+    );
+    write_object_metadata(test, id, None, Collection::AddressBook, 0, None).await;
+
+    za_setup_token(admin, OBJECT_METADATA).await;
+    (account, owner)
+}
+
+/// Ruling 66 (the Task 6 review's F1), the writers' fence: a container
+/// write whose accounts were read as ordinary commits only while the
+/// account holds no vault record, as mail's ordinary writers do (mail spec
+/// 6.1). A pending record is written straight to the store, as
+/// `setup-token` writes it but without the invalidation, so the account
+/// stays classified as ordinary in the caches the writers read: JMAP's
+/// `Mailbox/set` with metadata, IMAP `SETMETADATA` on a mailbox and a
+/// private server annotation all fail and store nothing. With the record
+/// removed, the same writes commit (the controls).
+async fn metadata_writes_lose_to_provisioning(test: &TestServer) -> Account {
+    use crate::utils::imap::Type;
+    use imap_proto::ResponseType;
+    println!("metadata_writes_lose_to_provisioning");
+    const USING: &[&str] = &[
+        "urn:ietf:params:jmap:core",
+        "urn:ietf:params:jmap:mail",
+        "urn:ietf:params:jmap:metadata",
+    ];
+    let admin = test.account("admin@example.com").clone();
+    let account = admin
+        .create_user_account(METADATA_WRITER, STRONG, "Fence", &[], user_permissions())
+        .await;
+    let id = account.id().document_id();
+    let reply = account
+        .jmap_request(
+            USING,
+            json!([["Mailbox/set", {
+                "accountId": account.id_string(),
+                "create": { "m": { "name": "fence-metadata" } }
+            }, "0"]]),
+        )
+        .await;
+    let mailbox = reply.method_response()["created"]["m"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("Mailbox/set: {:?}", reply.0))
+        .to_string();
+    let mut imap = ImapConnection::connect(b"_f ").await;
+    imap.authenticate(METADATA_WRITER, STRONG).await;
+    let jmap_write = async |value: serde_json::Value| {
+        account
+            .jmap_request(
+                USING,
+                json!([["Mailbox/set", {
+                    "accountId": account.id_string(),
+                    "update": { (mailbox.as_str()): { "metadata": value } }
+                }, "0"]]),
+            )
+            .await
+    };
+    let note = || json!({ "example.com": { "note": "fence-canary" } });
+    const IMAP_WRITES: [&str; 2] = [
+        "SETMETADATA INBOX (/shared/comment \"fence-canary\")",
+        "SETMETADATA \"\" (/private/comment \"fence-canary\")",
+    ];
+
+    let record = VaultRecord::pending(vec![0x5a; 32], i64::MAX);
+    test.server.za_vault_write(id, &record, None).await.unwrap();
+    assert!(
+        !test.server.account(id).await.unwrap().is_key_account(),
+        "the planted record changed the cached classification"
+    );
+    let reply = jmap_write(note()).await;
+    assert!(
+        reply.method_response()["updated"]
+            .get(mailbox.as_str())
+            .is_none(),
+        "Mailbox/set with metadata committed while the account holds a vault record: {:?}",
+        reply.0
+    );
+    for command in IMAP_WRITES {
+        imap.send(command).await;
+        imap.assert_read(Type::Tagged, ResponseType::No).await;
+    }
+    assert!(
+        !test.server.za_has_object_metadata(id).await.unwrap(),
+        "a container write committed while the account holds a vault record"
+    );
+
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(id)
+        .with_collection(Collection::Principal)
+        .with_document(0)
+        .clear(types::field::PrincipalField::ZeroAccessVault);
+    test.server.store().write_batch(&mut batch).await.unwrap();
+    let reply = jmap_write(note()).await;
+    assert!(
+        reply.method_response()["updated"]
+            .get(mailbox.as_str())
+            .is_some(),
+        "the control's Mailbox/set with metadata: {:?}",
+        reply.0
+    );
+    for command in IMAP_WRITES {
+        imap.send_ok(command).await;
+    }
+    assert!(
+        test.server.za_has_object_metadata(id).await.unwrap(),
+        "the controls stored no container"
+    );
+    // The account's destruction removes the mailbox's container.
+    imap.send_ok("SETMETADATA INBOX (/shared/comment NIL)")
+        .await;
+    imap.send_ok("SETMETADATA \"\" (/private/comment NIL)")
+        .await;
+    imap.send_ok("LOGOUT").await;
+    account
+}
+
+/// Ruling 70 (the Task 6 re-review's N1): a calendar or event dead-property
+/// PROPPATCH by a writer that classified the account as ordinary carries the
+/// vault-absence assertion. A vault record is planted behind the cached
+/// classification, as a `setup-token` that commits after the writer read the
+/// account; the calendar's and the event's plaintext container writes then
+/// fail their assertion (503, nothing stored). With the record cleared, the
+/// same writes commit (the control).
+async fn dead_property_writes_lose_to_provisioning(test: &TestServer) -> Account {
+    use hyper::StatusCode;
+    println!("dead_property_writes_lose_to_provisioning");
+    const CALENDAR: &str = "/dav/cal/plainmail37@example.com/default/";
+    const EVENT: &str = "/dav/cal/plainmail37@example.com/default/dead-fence.ics";
+    const ICAL: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//fence//EN\r\n\
+BEGIN:VEVENT\r\nUID:dead-fence-1\r\nDTSTAMP:20261020T090000Z\r\n\
+DTSTART:20261021T090000Z\r\nDTEND:20261021T100000Z\r\nSUMMARY:dead fence\r\n\
+END:VEVENT\r\nEND:VCALENDAR\r\n";
+    let proppatch = |value: &str| {
+        format!(
+            concat!(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>",
+                "<D:propertyupdate xmlns:D=\"DAV:\" xmlns:X=\"urn:x-dead-fence\">",
+                "<D:set><D:prop><X:dead-fence>{}</X:dead-fence></D:prop></D:set>",
+                "</D:propertyupdate>"
+            ),
+            value
+        )
+    };
+    let admin = test.account("admin@example.com").clone();
+    let account = admin
+        .create_user_account(DEAD_WRITER, STRONG, "Fence", &[], user_permissions())
+        .await;
+    let id = account.id().document_id();
+    let dav = crate::utils::webdav::DummyWebDavClient::new(id, DEAD_WRITER, STRONG, DEAD_WRITER);
+    dav.request("PUT", EVENT, ICAL)
+        .await
+        .with_status(StatusCode::CREATED);
+    assert!(
+        !test.server.za_has_object_metadata(id).await.unwrap(),
+        "the account holds a container before the fenced writes"
+    );
+
+    let record = VaultRecord::pending(vec![0x5b; 32], i64::MAX);
+    test.server.za_vault_write(id, &record, None).await.unwrap();
+    assert!(
+        !test.server.account(id).await.unwrap().is_key_account(),
+        "the planted record changed the cached classification"
+    );
+    for path in [CALENDAR, EVENT] {
+        dav.request("PROPPATCH", path, proppatch("dead-fence-canary"))
+            .await
+            .with_status(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    assert!(
+        !test.server.za_has_object_metadata(id).await.unwrap(),
+        "a calendar container write committed while the account holds a vault record"
+    );
+
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(id)
+        .with_collection(Collection::Principal)
+        .with_document(0)
+        .clear(types::field::PrincipalField::ZeroAccessVault);
+    test.server.store().write_batch(&mut batch).await.unwrap();
+    for path in [CALENDAR, EVENT] {
+        dav.request("PROPPATCH", path, proppatch("dead-fence-control"))
+            .await
+            .with_status(StatusCode::MULTI_STATUS);
+    }
+    assert!(
+        test.server.za_has_object_metadata(id).await.unwrap(),
+        "the controls stored no container"
+    );
+    // The account's destruction removes the calendar, its event and their
+    // containers.
+    account
+}
+
+/// Upgrade ruling 173 (plan 13's R26 residual closed): the ordinary
+/// calendar writers carry the vault-absence assertion in every commit chunk,
+/// as ruling 70's dead-property writes do. A vault record is planted behind
+/// the cached ordinary classification, as a `setup-token` that commits after
+/// the writer read the account. Then a PUT create and update, a COPY and a
+/// MOVE of an event, an event's DELETE, an MKCALENDAR, and a calendar's
+/// COPY, MOVE and DELETE each answer 503 and store nothing (the account's
+/// calendar change log does not move). With the record cleared, the same
+/// writes commit (the control).
+///
+/// Upgrade ruling 181 adds the other ordinary writers: a PROPPATCH of a
+/// calendar's and an event's live property and an ACL on a calendar (503,
+/// as the others); and over JMAP a `Calendar/set` create, a
+/// `CalendarEvent/set` create and a `CalendarEvent/copy` from another
+/// ordinary account (each answers `notCreated` with `forbidden`, upstream's
+/// "Another process modified" answer to an assertion failure), and a
+/// `CalendarEventNotification/set` destroy (the commit's error answers the
+/// method with `serverUnavailable`); ruling 189 adds the DAV inbox DELETE
+/// of an item (503): no calendar or notification change is logged while the
+/// record is planted, and each commits once it is cleared.
+async fn calendar_writes_lose_to_provisioning(test: &TestServer) -> (Account, Account) {
+    use hyper::StatusCode;
+    println!("calendar_writes_lose_to_provisioning");
+    const HOME: &str = "/dav/cal/plainmail39@example.com/";
+    let ical = |uid: &str, summary: &str| {
+        format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//fence//EN\r\n\
+BEGIN:VEVENT\r\nUID:{uid}\r\nDTSTAMP:20261020T090000Z\r\n\
+DTSTART:20261021T090000Z\r\nDTEND:20261021T100000Z\r\nSUMMARY:{summary}\r\n\
+END:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+    };
+    let admin = test.account("admin@example.com").clone();
+    let account = admin
+        .create_user_account(CALENDAR_WRITER, STRONG, "Fence", &[], user_permissions())
+        .await;
+    let id = account.id().document_id();
+    let dav =
+        crate::utils::webdav::DummyWebDavClient::new(id, CALENDAR_WRITER, STRONG, CALENDAR_WRITER);
+    let path = |rest: &str| format!("{HOME}{rest}");
+    dav.request(
+        "PUT",
+        &path("default/fence-1.ics"),
+        &ical("cal-fence-1", "fence one"),
+    )
+    .await
+    .with_status(StatusCode::CREATED);
+    dav.request(
+        "MKCALENDAR",
+        &path("fence-src/"),
+        crate::za::fanout::MKCALENDAR,
+    )
+    .await
+    .with_status(StatusCode::CREATED);
+    dav.request(
+        "PUT",
+        &path("fence-src/fence-3.ics"),
+        &ical("cal-fence-3", "fence three"),
+    )
+    .await
+    .with_status(StatusCode::CREATED);
+    let change_id = async || {
+        test.server
+            .store()
+            .get_last_change_id(id, types::collection::SyncCollection::Calendar.into())
+            .await
+            .unwrap()
+    };
+    let notification_change_id = async || {
+        test.server
+            .store()
+            .get_last_change_id(
+                id,
+                types::collection::SyncCollection::CalendarEventNotification.into(),
+            )
+            .await
+            .unwrap()
+    };
+    // Ruling 181's JMAP sources: an ordinary account's event shared with
+    // the writer, and an item in the writer's inbox.
+    let source = admin
+        .create_user_account(CALENDAR_SOURCE, STRONG, "Fence", &[], user_permissions())
+        .await;
+    let source_id = source.id().document_id();
+    let source_dav = crate::utils::webdav::DummyWebDavClient::new(
+        source_id,
+        CALENDAR_SOURCE,
+        STRONG,
+        CALENDAR_SOURCE,
+    );
+    source_dav
+        .request(
+            "PUT",
+            "/dav/cal/plainmail40@example.com/default/fence-source.ics",
+            &ical("cal-fence-source", "fence source"),
+        )
+        .await
+        .with_status(StatusCode::CREATED);
+    let writer_principal = format!(
+        "{}/plainmail39%40example.com/",
+        groupware::DavResourceName::Principal.base_path()
+    );
+    source_dav
+        .acl(
+            "/dav/cal/plainmail40@example.com/default/",
+            &writer_principal,
+            ["read"],
+        )
+        .await
+        .with_status(StatusCode::OK);
+    let source_event = types::id::Id::from(
+        crate::za::dav_seal::resource_id(test, source_id, "default/fence-source.ics").await,
+    )
+    .to_string();
+    let default_calendar =
+        types::id::Id::from(crate::za::dav_seal::resource_id(test, id, "default").await)
+            .to_string();
+    let item = crate::utils::za::plant_inbox_item(
+        test,
+        id,
+        &crate::za::inbox::invitation("cal-fence-item", "fence item"),
+        crate::utils::za::PlantedItem::Plain { flags: 0 },
+        source_id,
+        None,
+    )
+    .await;
+    let item_id = types::id::Id::from(item).to_string();
+    // Ruling 189: an item the DAV inbox DELETE takes.
+    let dav_item = crate::utils::za::plant_inbox_item(
+        test,
+        id,
+        &crate::za::inbox::invitation("cal-fence-dav-item", "fence dav item"),
+        crate::utils::za::PlantedItem::Plain { flags: 0 },
+        source_id,
+        None,
+    )
+    .await;
+    let dav_item_href = format!("/dav/itip/plainmail39%40example.com/inbox/{dav_item}.ics");
+    let account_id = account.id_string().to_string();
+    let jmap_writes = [
+        (
+            "Calendar/set",
+            json!({ "accountId": account_id, "create": { "j1": { "name": "fence jmap" } } }),
+        ),
+        (
+            "CalendarEvent/set",
+            json!({ "accountId": account_id, "create": { "j1": {
+                "title": "fence jmap event",
+                "start": "2026-10-22T09:00:00",
+                "duration": "PT1H",
+                "timeZone": "Etc/UTC",
+                "uid": "cal-fence-jmap",
+                "calendarIds": { &default_calendar: true },
+            } } }),
+        ),
+        (
+            "CalendarEvent/copy",
+            json!({
+                "fromAccountId": source.id_string(),
+                "accountId": account_id,
+                "create": { "j1": {
+                    "id": source_event,
+                    "calendarIds": { &default_calendar: true },
+                } },
+            }),
+        ),
+        (
+            "CalendarEventNotification/set",
+            json!({ "accountId": account_id, "destroy": [item_id] }),
+        ),
+    ];
+
+    // (method, path, destination, body, the control's status)
+    let proppatch = |name: &str| {
+        format!(
+            concat!(
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>",
+                "<D:propertyupdate xmlns:D=\"DAV:\"><D:set><D:prop>",
+                "<D:displayname>{}</D:displayname>",
+                "</D:prop></D:set></D:propertyupdate>"
+            ),
+            name
+        )
+    };
+    let acl = format!(
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?><D:acl xmlns:D=\"DAV:\">",
+            "<D:ace><D:principal><D:href>{}/plainmail40%40example.com/</D:href></D:principal>",
+            "<D:grant><D:privilege><D:read/></D:privilege></D:grant></D:ace></D:acl>"
+        ),
+        groupware::DavResourceName::Principal.base_path()
+    );
+    let writes: [(&str, String, Option<String>, String, StatusCode); 12] = [
+        (
+            "PUT",
+            path("default/fence-new.ics"),
+            None,
+            ical("cal-fence-new", "fence new"),
+            StatusCode::CREATED,
+        ),
+        (
+            "PUT",
+            path("default/fence-1.ics"),
+            None,
+            ical("cal-fence-1", "fence one changed"),
+            StatusCode::NO_CONTENT,
+        ),
+        (
+            "MKCALENDAR",
+            path("fence-made/"),
+            None,
+            crate::za::fanout::MKCALENDAR.to_string(),
+            StatusCode::CREATED,
+        ),
+        (
+            "COPY",
+            path("default/fence-1.ics"),
+            Some(path("fence-src/fence-copy.ics")),
+            String::new(),
+            StatusCode::CREATED,
+        ),
+        (
+            "MOVE",
+            path("fence-src/fence-copy.ics"),
+            Some(path("fence-made/fence-moved.ics")),
+            String::new(),
+            StatusCode::CREATED,
+        ),
+        (
+            "DELETE",
+            path("default/fence-new.ics"),
+            None,
+            String::new(),
+            StatusCode::NO_CONTENT,
+        ),
+        (
+            "COPY",
+            path("fence-src/"),
+            Some(path("fence-cal-copy/")),
+            String::new(),
+            StatusCode::CREATED,
+        ),
+        (
+            "MOVE",
+            path("fence-cal-copy/"),
+            Some(path("fence-cal-moved/")),
+            String::new(),
+            StatusCode::CREATED,
+        ),
+        (
+            "DELETE",
+            path("fence-cal-moved/"),
+            None,
+            String::new(),
+            StatusCode::NO_CONTENT,
+        ),
+        (
+            "PROPPATCH",
+            path("fence-src/"),
+            None,
+            proppatch("fence calendar renamed"),
+            StatusCode::MULTI_STATUS,
+        ),
+        (
+            "PROPPATCH",
+            path("default/fence-1.ics"),
+            None,
+            proppatch("fence event renamed"),
+            StatusCode::MULTI_STATUS,
+        ),
+        ("ACL", path("fence-src/"), None, acl.clone(), StatusCode::OK),
+    ];
+    let send =
+        async |method: &str, target: &str, destination: Option<&str>, body: &str| match destination
+        {
+            Some(destination) => {
+                dav.request_with_headers(method, target, [("destination", destination)], body)
+                    .await
+            }
+            None => dav.request(method, target, body).await,
+        };
+
+    let record = VaultRecord::pending(vec![0x5c; 32], i64::MAX);
+    test.server.za_vault_write(id, &record, None).await.unwrap();
+    assert!(
+        !test.server.account(id).await.unwrap().is_key_account(),
+        "the planted record changed the cached classification"
+    );
+    // The refused writes run against the objects as the setup left them:
+    // the copy and the copied calendar do not exist yet, so the MOVEs and
+    // the DELETEs take the existing ones instead.
+    let refused = [
+        &writes[0],
+        &writes[1],
+        &writes[2],
+        &writes[3],
+        &(
+            "MOVE",
+            path("default/fence-1.ics"),
+            Some(path("fence-src/fence-moved.ics")),
+            String::new(),
+            StatusCode::CREATED,
+        ),
+        &(
+            "DELETE",
+            path("default/fence-1.ics"),
+            None,
+            String::new(),
+            StatusCode::NO_CONTENT,
+        ),
+        &writes[6],
+        &(
+            "MOVE",
+            path("fence-src/"),
+            Some(path("fence-cal-moved/")),
+            String::new(),
+            StatusCode::CREATED,
+        ),
+        &(
+            "DELETE",
+            path("fence-src/"),
+            None,
+            String::new(),
+            StatusCode::NO_CONTENT,
+        ),
+        &writes[9],
+        &writes[10],
+        &writes[11],
+    ];
+    let before = change_id().await;
+    for (method, target, destination, body, _) in refused {
+        send(method, target, destination.as_deref(), body)
+            .await
+            .with_status(StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            change_id().await,
+            before,
+            "{method} {target} stored a change while the account holds a vault record"
+        );
+    }
+    let before_items = notification_change_id().await;
+    dav.request("DELETE", &dav_item_href, "")
+        .await
+        .with_status(StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        notification_change_id().await,
+        before_items,
+        "the inbox DELETE stored a change while the account holds a vault record"
+    );
+    for (method, body) in &jmap_writes {
+        let response = account.jmap_method_call(method, body.clone()).await;
+        println!("{method} while the record is planted: {}", response.0);
+        let answer = &response.0["methodResponses"][0];
+        if *method == "CalendarEventNotification/set" {
+            assert!(
+                answer[0] == "error"
+                    || answer[1]["destroyed"]
+                        .as_array()
+                        .is_none_or(|destroyed| destroyed.is_empty()),
+                "{method} destroyed while the account holds a vault record: {answer}"
+            );
+        } else {
+            assert!(
+                answer[1]["created"]
+                    .as_object()
+                    .is_none_or(|created| created.is_empty())
+                    && answer[1]["notCreated"]["j1"].is_object(),
+                "{method} created while the account holds a vault record: {answer}"
+            );
+        }
+        assert_eq!(
+            change_id().await,
+            before,
+            "{method} stored a change while the account holds a vault record"
+        );
+        assert_eq!(
+            notification_change_id().await,
+            before_items,
+            "{method} stored a change while the account holds a vault record"
+        );
+    }
+
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(id)
+        .with_collection(Collection::Principal)
+        .with_document(0)
+        .clear(types::field::PrincipalField::ZeroAccessVault);
+    test.server.store().write_batch(&mut batch).await.unwrap();
+    for (method, target, destination, body, status) in &writes {
+        let before = change_id().await;
+        send(method, target, destination.as_deref(), body)
+            .await
+            .with_status(*status);
+        assert_ne!(change_id().await, before, "control: {method} {target}");
+    }
+    for (method, body) in &jmap_writes {
+        let response = account.jmap_method_call(method, body.clone()).await;
+        let answer = &response.0["methodResponses"][0];
+        if *method == "CalendarEventNotification/set" {
+            assert_eq!(
+                answer[1]["destroyed"][0].as_str(),
+                Some(item_id.as_str()),
+                "control: {method}: {answer}"
+            );
+        } else {
+            assert!(
+                answer[1]["created"]["j1"].is_object(),
+                "control: {method}: {answer}"
+            );
+        }
+    }
+    dav.request("DELETE", &dav_item_href, "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    // The accounts' destruction removes their calendars, events and items.
+    (account, source)
 }

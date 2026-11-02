@@ -12,9 +12,12 @@ use groupware::{cache::GroupwareCache, calendar::CalendarEvent};
 use hyper::StatusCode;
 use store::{
     ValueKey,
-    write::{AlignedBytes, Archive, ArchiveVersion},
+    write::{Archive, ArchiveBytes, ArchiveVersion},
 };
-use types::collection::{Collection, SyncCollection};
+use types::{
+    collection::{Collection, SyncCollection},
+    field::{CalendarEventField, Field},
+};
 
 const USER: &str = "sharing-move-atomic@example.com";
 const HOME: &str = "/dav/cal/sharing-move-atomic%40example.com/";
@@ -54,7 +57,7 @@ async fn archive(
     owner: u32,
     collection: Collection,
     id: u32,
-) -> Option<Archive<AlignedBytes>> {
+) -> Option<Archive<ArchiveBytes>> {
     test.server
         .store()
         .get_value(ValueKey::archive(owner, collection, id))
@@ -63,20 +66,31 @@ async fn archive(
 }
 async fn id(test: &TestServer, owner: u32, path: &str) -> u32 {
     test.server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap()
         .by_path(path)
         .unwrap()
         .document_id()
 }
-async fn snapshot(test: &TestServer, owner: u32) -> Vec<(u8, u32, ArchiveVersion, Vec<u8>)> {
+/// Every calendar row, event row and event content record of `owner`: at
+/// 1.0 an event's tree is in its own content record, which a MOVE must
+/// leave as it does the row.
+async fn snapshot(test: &TestServer, owner: u32) -> Vec<(u8, u8, u32, ArchiveVersion, Vec<u8>)> {
     let mut result = Vec::new();
-    for collection in [Collection::Calendar, Collection::CalendarEvent] {
+    for (collection, field) in [
+        (Collection::Calendar, Field::ARCHIVE),
+        (Collection::CalendarEvent, Field::ARCHIVE),
+        (
+            Collection::CalendarEvent,
+            CalendarEventField::Content.field(),
+        ),
+    ] {
         test.server
-            .archives(owner, collection, &(), |id, stored| {
+            .archives(owner, collection, field, &(), |id, stored| {
                 result.push((
                     collection.into(),
+                    field.inner(),
                     id,
                     stored.version,
                     stored.as_bytes().to_vec(),
@@ -144,7 +158,9 @@ pub async fn test(test: &mut TestServer) {
         .with_status(StatusCode::MULTI_STATUS);
     let quota = test.server.get_used_quota_account(owner).await.unwrap();
     let status = parked.finish().await;
-    if status != StatusCode::CONFLICT {
+    // A lost commit assertion: 1.0 answers 503 with Retry-After where 0.16
+    // answered 409 (`dav/src/request.rs`).
+    if status != StatusCode::SERVICE_UNAVAILABLE {
         failures.push(format!("metadata race returned {status}"));
     }
     if !readable(
@@ -233,7 +249,8 @@ pub async fn test(test: &mut TestServer) {
     let after_create = snapshot(test, owner).await;
     let quota = test.server.get_used_quota_account(owner).await.unwrap();
     let status = parked.finish().await;
-    if status != StatusCode::CONFLICT
+    // A lost commit assertion: 503 at 1.0, as above.
+    if status != StatusCode::SERVICE_UNAVAILABLE
         || archive(test, owner, Collection::Calendar, source_id)
             .await
             .is_none()
@@ -261,7 +278,7 @@ pub async fn test(test: &mut TestServer) {
     controls(test, owner, &client).await;
     let resources = test
         .server
-        .fetch_dav_resources(owner, owner, SyncCollection::Calendar)
+        .fetch_groupware_resources(owner, owner, SyncCollection::Calendar)
         .await
         .unwrap();
     let paths = resources
@@ -360,7 +377,12 @@ async fn controls(test: &TestServer, owner: u32, client: &DummyWebDavClient) {
         }
         let after_competing = snapshot(test, owner).await;
         let quota = test.server.get_used_quota_account(owner).await.unwrap();
-        assert_eq!(parked.finish().await, StatusCode::CONFLICT, "{kind}");
+        // A lost commit assertion: 503 at 1.0 (409 at 0.16).
+        assert_eq!(
+            parked.finish().await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{kind}"
+        );
         assert_eq!(
             snapshot(test, owner).await,
             after_competing,
@@ -538,7 +560,8 @@ async fn controls(test: &TestServer, owner: u32, client: &DummyWebDavClient) {
         assert_eq!(
             parked.finish().await,
             if concurrent {
-                StatusCode::CONFLICT
+                // A lost commit assertion: 503 at 1.0 (409 at 0.16).
+                StatusCode::SERVICE_UNAVAILABLE
             } else {
                 StatusCode::NO_CONTENT
             }
@@ -567,11 +590,11 @@ async fn controls(test: &TestServer, owner: u32, client: &DummyWebDavClient) {
     }
 
     // Cross each cap independently; a small source control still commits one slice.
-    for (label, count, padding) in [
-        ("operations", 360, 0),
-        ("bytes", 30, 230_000),
-        ("split", 999, 0),
-    ] {
+    // Ruling 81: 0.16's third case, a byte oversize (30 events of 230 KB),
+    // is retired as unreachable at 1.0: a collection MOVE rewrites rows
+    // only (it planned 120 operations and 12,516 bytes), so no event content
+    // reaches the 5 MB byte budget, which stays in the code.
+    for (label, count) in [("operations", 360), ("split", 999)] {
         let source = format!("budget-{label}-source");
         let target = format!("budget-{label}-target");
         for slug in [&source, &target] {
@@ -579,13 +602,7 @@ async fn controls(test: &TestServer, owner: u32, client: &DummyWebDavClient) {
         }
         put(client, &target, "old.ics", &format!("budget-{label}-old")).await;
         for n in 0..count {
-            let mut event = super::sharing::sharing_event(&format!("budget-{label}-{n}"));
-            if padding > 0 {
-                event = event.replace(
-                    "END:VEVENT",
-                    &format!("DESCRIPTION:{}\r\nEND:VEVENT", "p".repeat(padding)),
-                );
-            }
+            let event = super::sharing::sharing_event(&format!("budget-{label}-{n}"));
             client
                 .request_with_headers(
                     "PUT",
@@ -621,10 +638,8 @@ async fn controls(test: &TestServer, owner: u32, client: &DummyWebDavClient) {
         );
         if label == "operations" {
             assert!(operations > 1000 && bytes < 5_000_000);
-        } else if label == "split" {
-            assert!(operations > 1000 && bytes < 5_000_000 && slices > 1);
         } else {
-            assert!(operations <= 1000 && bytes > 5_000_000 && slices == 1);
+            assert!(operations > 1000 && bytes < 5_000_000 && slices > 1);
         }
     }
     test_hooks::take_calendar_move_plans(owner);
@@ -643,22 +658,28 @@ async fn controls(test: &TestServer, owner: u32, client: &DummyWebDavClient) {
     // Every stored event name still has a live parent after all race/control cases.
     let mut calendars = std::collections::BTreeSet::new();
     test.server
-        .archives(owner, Collection::Calendar, &(), |id, _| {
+        .archives(owner, Collection::Calendar, Field::ARCHIVE, &(), |id, _| {
             calendars.insert(id);
             Ok(true)
         })
         .await
         .unwrap();
     test.server
-        .archives(owner, Collection::CalendarEvent, &(), |_, stored| {
-            for name in stored.unarchive::<CalendarEvent>()?.names.iter() {
-                assert!(
-                    calendars.contains(&name.parent_id.to_native()),
-                    "event name has a deleted parent"
-                );
-            }
-            Ok(true)
-        })
+        .archives(
+            owner,
+            Collection::CalendarEvent,
+            Field::ARCHIVE,
+            &(),
+            |_, stored| {
+                for name in stored.unarchive::<CalendarEvent>()?.names.iter() {
+                    assert!(
+                        calendars.contains(&name.parent_id.to_native()),
+                        "event name has a deleted parent"
+                    );
+                }
+                Ok(true)
+            },
+        )
         .await
         .unwrap();
 }
@@ -674,5 +695,5 @@ async fn set_default(test: &TestServer, owner: u32, id: u32) {
             types::field::PrincipalField::DefaultCalendarId,
             id.serialize(),
         );
-    test.server.store().write(batch.build_all()).await.unwrap();
+    test.server.store().write_batch(&mut batch).await.unwrap();
 }

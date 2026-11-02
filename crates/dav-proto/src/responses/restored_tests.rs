@@ -1,0 +1,553 @@
+/*
+ * SPDX-FileCopyrightText: 2020 Stalwart Labs LLC <hello@stalw.art>
+ *
+ * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
+ */
+
+use std::fmt::Display;
+
+use calcard::{icalendar::ICalendar, vcard::VCard};
+use hyper::StatusCode;
+use mail_parser::DateTime;
+use types::metadata::{EncodedDavValue, XmlElement, XmlName, XmlNode, XmlValue};
+
+use crate::{
+    Depth,
+    parser::{Token, tokenizer::Tokenizer},
+    responses::XmlCdataEscape,
+    schema::{
+        Namespace,
+        property::{
+            ActiveLock, CalDavProperty, CardDavProperty, DavValue, LockScope, Privilege,
+            ResourceType, Rfc1123DateTime, SupportedLock, WebDavProperty,
+        },
+        request::DavPropertyValue,
+        response::{
+            Ace, AclRestrictions, BaseCondition, ErrorResponse, GrantDeny, Href, List,
+            MkColResponse, MultiStatus, Principal, PrincipalSearchProperty,
+            PrincipalSearchPropertySet, PropResponse, PropStat, RequiredPrincipal, Resource,
+            Response, ScheduleResponse, ScheduleResponseItem, SupportedPrivilege,
+        },
+    },
+};
+
+// 1.0 replaced 0.16's `DeadProperty` tag list with `XmlValue`, stored
+// encoded (`EncodedDavValue`); a lock owner is built that way.
+fn owner(children: Vec<XmlNode<'static>>) -> EncodedDavValue {
+    XmlValue {
+        lang: None,
+        attributes: vec![],
+        children,
+    }
+    .to_encoded()
+    .unwrap()
+}
+
+impl<T: Display> List<T> {
+    pub fn new(vec: impl IntoIterator<Item = T>) -> Self {
+        List(vec.into_iter().collect())
+    }
+}
+
+impl From<ICalendar> for DavValue {
+    fn from(v: ICalendar) -> Self {
+        DavValue::ICalendar(v)
+    }
+}
+
+impl From<VCard> for DavValue {
+    fn from(v: VCard) -> Self {
+        DavValue::VCard(v)
+    }
+}
+
+#[test]
+fn parse_responses() {
+    for (num, test) in [
+        // 001.xml
+        ErrorResponse::new(BaseCondition::LockTokenSubmitted(List::new([Href(
+            "/locked/".to_string(),
+        )])))
+        .to_string(),
+        // 002.xml
+        MultiStatus::new(vec![Response::new_propstat(
+            "http://www.example.com/file",
+            vec![
+                PropStat::new(DavPropertyValue::new(
+                    WebDavProperty::DisplayName,
+                    "Box type A",
+                )),
+                PropStat::new(DavPropertyValue::new(
+                    WebDavProperty::DisplayName,
+                    "Box type B",
+                ))
+                .with_status(StatusCode::FORBIDDEN)
+                .with_response_description(
+                    "The user does not have access to the DingALing property.",
+                ),
+            ],
+        )])
+        .with_response_description("There has been an access violation error.")
+        .to_string(),
+        // 003.xml
+        MultiStatus::new(vec![
+            Response::new_propstat(
+                "/container/",
+                vec![PropStat::new_list(vec![
+                    DavPropertyValue::new(
+                        WebDavProperty::CreationDate,
+                        DateTime::parse_rfc3339("1997-12-01T17:42:21-08:00Z").unwrap(),
+                    ),
+                    DavPropertyValue::new(WebDavProperty::DisplayName, "Example collection"),
+                    DavPropertyValue::new(
+                        WebDavProperty::ResourceType,
+                        vec![ResourceType::Collection],
+                    ),
+                    DavPropertyValue::new(WebDavProperty::SupportedLock, SupportedLock::default()),
+                ])],
+            ),
+            Response::new_propstat(
+                "/container/front.html",
+                vec![PropStat::new_list(vec![
+                    DavPropertyValue::new(
+                        WebDavProperty::CreationDate,
+                        DateTime::parse_rfc3339("1997-12-01T18:27:21-08:00").unwrap(),
+                    ),
+                    DavPropertyValue::new(WebDavProperty::DisplayName, "Example HTML resource"),
+                    DavPropertyValue::new(WebDavProperty::GetContentLength, 4525u64),
+                    DavPropertyValue::new(WebDavProperty::GetContentType, "text/html"),
+                    DavPropertyValue::new(WebDavProperty::GetETag, "\"zzyzx\""),
+                    DavPropertyValue::new(
+                        WebDavProperty::GetLastModified,
+                        DavValue::Rfc1123Date(Rfc1123DateTime::new(
+                            DateTime::parse_rfc822("Mon, 12 Jan 1998 09:25:56 GMT")
+                                .unwrap()
+                                .to_timestamp(),
+                        )),
+                    ),
+                    DavPropertyValue::new(WebDavProperty::ResourceType, DavValue::Null),
+                    DavPropertyValue::new(WebDavProperty::SupportedLock, SupportedLock::default()),
+                ])],
+            ),
+        ])
+        .to_string(),
+        // 004.xml
+        MultiStatus::new(vec![
+            Response::new_status(
+                ["http://www.example.com/container/resource3"],
+                StatusCode::LOCKED,
+            )
+            .with_error(BaseCondition::LockTokenSubmitted(List(vec![]))),
+        ])
+        .to_string(),
+        // 005.xml
+        PropResponse::new(vec![DavPropertyValue::new(
+            WebDavProperty::LockDiscovery,
+            vec![
+                ActiveLock::new(
+                    "http://example.com/workspace/webdav/proposal.doc",
+                    LockScope::Exclusive,
+                )
+                .with_owner(owner(vec![XmlNode::Element(XmlElement {
+                    name: XmlName::borrowed(Some("DAV:"), "href"),
+                    prefix: Some("D".into()),
+                    attributes: vec![],
+                    children: vec![XmlNode::Text("http://example.org/~ejw/contact.html".into())],
+                })]))
+                .with_timeout(604800)
+                .with_lock_token("urn:uuid:e71d4fae-5dec-22d6-fea5-00a0c91e6be4"),
+            ],
+        )])
+        .to_string(),
+        // 006.xml
+        MultiStatus::new(vec![Response::new_propstat(
+            "http://www.example.com/container/",
+            vec![PropStat::new_list(vec![DavPropertyValue::new(
+                WebDavProperty::LockDiscovery,
+                vec![
+                    ActiveLock::new("http://www.example.com/container/", LockScope::Shared)
+                        .with_owner(owner(vec![XmlNode::Text("Jane Smith".into())]))
+                        .with_depth(Depth::Zero)
+                        .with_lock_token("urn:uuid:f81de2ad-7f3d-a1b2-4f3c-00a0c91a9d76"),
+                ],
+            )])],
+        )])
+        .to_string(),
+        // 007.xml
+        ErrorResponse::new(BaseCondition::LockTokenSubmitted(List(vec![Href(
+            "/workspace/webdav/".to_string(),
+        )])))
+        .to_string(),
+        // 008.xml
+        MultiStatus::new(vec![
+            Response::new_propstat(
+                "http://cal.example.com/bernard/work/abcd2.ics",
+                vec![PropStat::new_list(vec![
+                    DavPropertyValue::new(WebDavProperty::GetETag, "\"fffff-abcd2\""),
+                    DavPropertyValue::new(
+                        CalDavProperty::CalendarData(Default::default()),
+                        DavValue::CData(
+                            r#"BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+DTSTART;TZID=US/Eastern:20060106T140000
+DURATION:PT1H
+RECURRENCE-ID;TZID=US/Eastern:20060106T120000
+SUMMARY:Event #2 bis bis
+UID:00959BC664CA650E933C892C@example.com
+END:VEVENT
+END:VCALENDAR
+"#
+                            .to_string(),
+                        ),
+                    ),
+                ])],
+            ),
+            Response::new_propstat(
+                "http://cal.example.com/bernard/work/abcd3.ics",
+                vec![PropStat::new_list(vec![
+                    DavPropertyValue::new(WebDavProperty::GetETag, "\"fffff-abcd3\""),
+                    DavPropertyValue::new(
+                        CalDavProperty::CalendarData(Default::default()),
+                        DavValue::CData(
+                            r#"BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Example Corp.//CalDAV Client//EN
+BEGIN:VEVENT
+DTSTART;TZID=US/Eastern:20060104T100000
+DURATION:PT1H
+SUMMARY:Event #3
+UID:DC6C50A017428C5216A2F1CD@example.com
+END:VEVENT
+END:VCALENDAR
+"#
+                            .to_string(),
+                        ),
+                    ),
+                ])],
+            ),
+        ])
+        .with_namespace(Namespace::CalDav)
+        .to_string(),
+        // 009.xml
+        MkColResponse::new(vec![PropStat::new_list(vec![
+            DavPropertyValue::new(WebDavProperty::ResourceType, DavValue::Null),
+            DavPropertyValue::new(WebDavProperty::DisplayName, DavValue::Null),
+            DavPropertyValue::new(CardDavProperty::AddressbookDescription, DavValue::Null),
+        ])])
+        .with_namespace(Namespace::CardDav)
+        .to_string(),
+        // 010.xml
+        MultiStatus::new(vec![Response::new_propstat(
+            "/home/bernard/addressbook/v102.vcf",
+            vec![PropStat::new_list(vec![
+                DavPropertyValue::new(WebDavProperty::GetETag, "\"23ba4d-ff11fb\""),
+                DavPropertyValue::new(
+                    CardDavProperty::AddressData {
+                        properties: Default::default(),
+                        version: None,
+                    },
+                    DavValue::CData(
+                        r#"BEGIN:VCARD
+VERSION:3.0
+NICKNAME:me
+UID:34222-232@example.com
+FN:Cyrus Daboo
+EMAIL:daboo@example.com
+END:VCARD
+"#
+                        .to_string(),
+                    ),
+                ),
+            ])],
+        )])
+        .with_namespace(Namespace::CardDav)
+        .to_string(),
+        // 011.xml
+        MultiStatus::new(vec![
+            Response::new_status(
+                ["/home/bernard/addressbook/"],
+                StatusCode::INSUFFICIENT_STORAGE,
+            )
+            .with_error(BaseCondition::NumberOfMatchesWithinLimit)
+            .with_response_description("Only two matching records were returned"),
+            Response::new_propstat(
+                "/home/bernard/addressbook/v102.vcf",
+                vec![PropStat::new_list(vec![DavPropertyValue::new(
+                    WebDavProperty::GetETag,
+                    "\"23ba4d-ff11fb\"",
+                )])],
+            ),
+            Response::new_propstat(
+                "/home/bernard/addressbook/v104.vcf",
+                vec![PropStat::new_list(vec![DavPropertyValue::new(
+                    WebDavProperty::GetETag,
+                    "\"23ba4d-ff11fc\"",
+                )])],
+            ),
+        ])
+        .with_namespace(Namespace::CardDav)
+        .to_string(),
+        // 012.xml
+        ErrorResponse::new(BaseCondition::NeedPrivileges(List(vec![
+            Resource::new("/a", Privilege::Unbind),
+            Resource::new("/c", Privilege::Bind),
+        ])))
+        .to_string(),
+        // 013.xml
+        PrincipalSearchPropertySet::new(vec![
+            PrincipalSearchProperty::new(WebDavProperty::DisplayName, "Full name"),
+            PrincipalSearchProperty::new(WebDavProperty::DisplayName, "Job title"),
+        ])
+        .to_string(),
+        // 014.xml
+        MultiStatus::new(vec![Response::new_propstat(
+            "http://www.example.com/papers/",
+            vec![PropStat::new_list(vec![DavPropertyValue::new(
+                WebDavProperty::SupportedPrivilegeSet,
+                vec![
+                    SupportedPrivilege::new(Privilege::All, "Any operation")
+                        .with_abstract()
+                        .with_supported_privilege(
+                            SupportedPrivilege::new(Privilege::Read, "Read any object")
+                                .with_supported_privilege(
+                                    SupportedPrivilege::new(Privilege::ReadAcl, "Read ACL")
+                                        .with_abstract(),
+                                )
+                                .with_supported_privilege(
+                                    SupportedPrivilege::new(
+                                        Privilege::ReadCurrentUserPrivilegeSet,
+                                        "Read current user privilege set property",
+                                    )
+                                    .with_abstract(),
+                                ),
+                        )
+                        .with_supported_privilege(
+                            SupportedPrivilege::new(Privilege::Write, "Write any object")
+                                .with_supported_privilege(
+                                    SupportedPrivilege::new(Privilege::WriteAcl, "Write ACL")
+                                        .with_abstract(),
+                                )
+                                .with_supported_privilege(SupportedPrivilege::new(
+                                    Privilege::WriteProperties,
+                                    "Write properties",
+                                ))
+                                .with_supported_privilege(SupportedPrivilege::new(
+                                    Privilege::WriteContent,
+                                    "Write resource content",
+                                )),
+                        )
+                        .with_supported_privilege(SupportedPrivilege::new(
+                            Privilege::Unlock,
+                            "Unlock resource",
+                        )),
+                ],
+            )])],
+        )])
+        .to_string(),
+        // 015.xml
+        MultiStatus::new(vec![Response::new_propstat(
+            "http://www.example.com/papers/",
+            vec![PropStat::new_list(vec![DavPropertyValue::new(
+                WebDavProperty::CurrentUserPrivilegeSet,
+                vec![Privilege::Read],
+            )])],
+        )])
+        .to_string(),
+        // 016.xml
+        MultiStatus::new(vec![Response::new_propstat(
+            "http://www.example.com/papers/",
+            vec![PropStat::new_list(vec![DavPropertyValue::new(
+                WebDavProperty::Acl,
+                vec![
+                    Ace::new(
+                        Principal::Href(Href(
+                            "http://www.example.com/acl/groups/maintainers".to_string(),
+                        )),
+                        GrantDeny::grant(vec![Privilege::Write]),
+                    ),
+                    Ace::new(Principal::All, GrantDeny::grant(vec![Privilege::Read])),
+                ],
+            )])],
+        )])
+        .to_string(),
+        // 017.xml
+        MultiStatus::new(vec![Response::new_propstat(
+            "http://www.example.com/papers/",
+            vec![PropStat::new_list(vec![DavPropertyValue::new(
+                WebDavProperty::AclRestrictions,
+                AclRestrictions::new()
+                    .with_grant_only()
+                    .with_required_principal(RequiredPrincipal::All),
+            )])],
+        )])
+        .to_string(),
+        // 018.xml
+        MultiStatus::new(vec![Response::new_propstat(
+            "http://www.example.com/papers/",
+            vec![PropStat::new_list(vec![DavPropertyValue::new(
+                WebDavProperty::PrincipalCollectionSet,
+                vec![
+                    Href("http://www.example.com/acl/users/".to_string()),
+                    Href("http://www.example.com/acl/groups/".to_string()),
+                ],
+            )])],
+        )])
+        .to_string(),
+        // 019.xml
+        MultiStatus::new(vec![Response::new_propstat(
+            "http://www.example.com/top/container/",
+            vec![PropStat::new_list(vec![
+                DavPropertyValue::new(
+                    WebDavProperty::Owner,
+                    vec![Href("http://www.example.com/users/gclemm".to_string())],
+                ),
+                DavPropertyValue::new(
+                    WebDavProperty::SupportedPrivilegeSet,
+                    vec![
+                        SupportedPrivilege::new(Privilege::All, "Any operation")
+                            .with_abstract()
+                            .with_supported_privilege(SupportedPrivilege::new(
+                                Privilege::Read,
+                                "Read any object",
+                            ))
+                            .with_supported_privilege(
+                                SupportedPrivilege::new(Privilege::Write, "Write any object")
+                                    .with_abstract(),
+                            )
+                            .with_supported_privilege(SupportedPrivilege::new(
+                                Privilege::ReadAcl,
+                                "Read the ACL",
+                            ))
+                            .with_supported_privilege(SupportedPrivilege::new(
+                                Privilege::WriteAcl,
+                                "Write the ACL",
+                            )),
+                    ],
+                ),
+                DavPropertyValue::new(
+                    WebDavProperty::CurrentUserPrivilegeSet,
+                    vec![Privilege::Read, Privilege::ReadAcl],
+                ),
+                DavPropertyValue::new(
+                    WebDavProperty::Acl,
+                    vec![
+                        Ace::new(
+                            Principal::Href(Href(
+                                "http://www.example.com/users/esedlar".to_string(),
+                            )),
+                            GrantDeny::grant(vec![
+                                Privilege::Read,
+                                Privilege::Write,
+                                Privilege::ReadAcl,
+                            ]),
+                        ),
+                        Ace::new(
+                            Principal::Href(Href(
+                                "http://www.example.com/groups/mrktng".to_string(),
+                            )),
+                            GrantDeny::deny(vec![Privilege::Read]),
+                        ),
+                        Ace::new(
+                            Principal::Property(List(vec![DavPropertyValue::new(
+                                WebDavProperty::Owner,
+                                DavValue::Null,
+                            )])),
+                            GrantDeny::grant(vec![Privilege::ReadAcl, Privilege::WriteAcl]),
+                        ),
+                        Ace::new(Principal::All, GrantDeny::grant(vec![Privilege::Read]))
+                            .with_inherited("http://www.example.com/top"),
+                    ],
+                ),
+            ])],
+        )])
+        .to_string(),
+        // 020.xml
+        ScheduleResponse {
+            items: List(vec![
+                ScheduleResponseItem {
+                    recipient: Href("mailto:wilfredo@example.com".to_string()),
+                    request_status: "2.0;Success".into(),
+                    calendar_data: Some("BEGIN:VCALENDAR".to_string()),
+                },
+                ScheduleResponseItem {
+                    recipient: Href("mailto:bernard@example.net".to_string()),
+                    request_status: "2.0;Success".into(),
+                    calendar_data: Some("END:VCALENDAR".to_string()),
+                },
+                ScheduleResponseItem {
+                    recipient: Href("mailto:mike@example.org".to_string()),
+                    request_status: "3.7;Invalid calendar user".into(),
+                    calendar_data: None,
+                },
+            ]),
+        }
+        .to_string(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let xml =
+            std::fs::read_to_string(format!("resources/responses/{:03}.xml", num + 1)).unwrap();
+        let mut output_token = Tokenizer::new(test.as_bytes());
+        let mut expected_token = Tokenizer::new(xml.as_bytes());
+        let mut output_tokens = Vec::new();
+        let mut expected_tokens = Vec::new();
+
+        for (tokens, tokenizer) in [
+            (&mut output_tokens, &mut output_token),
+            (&mut expected_tokens, &mut expected_token),
+        ] {
+            while let Ok(token) = tokenizer.token() {
+                if token == Token::Eof {
+                    break;
+                }
+                match (tokens.last_mut(), token) {
+                    (Some(Token::Text(text)), Token::Text(new_text)) => {
+                        *text = format!("{}{}", text, new_text).into();
+                    }
+                    (_, element) => {
+                        tokens.push(element.into_owned());
+                    }
+                }
+            }
+        }
+
+        assert!(!output_tokens.is_empty());
+        assert!(!expected_tokens.is_empty());
+        assert_eq!(output_tokens.len(), expected_tokens.len());
+
+        for (output, expected) in output_tokens.iter().zip(expected_tokens.iter()) {
+            if output != expected {
+                eprintln!("{test}");
+            }
+            assert_eq!(output, expected, "failed for {:03}.xml", num + 1);
+        }
+    }
+}
+
+#[test]
+fn escape_cdata() {
+    for (test, expected) in [
+        ("", "<![CDATA[]]>"),
+        ("hello", "<![CDATA[hello]]>"),
+        ("hello world", "<![CDATA[hello world]]>"),
+        ("<hello>", "<![CDATA[<hello>]]>"),
+        ("&hello;", "<![CDATA[&hello;]]>"),
+        ("'hello'", "<![CDATA['hello']]>"),
+        ("\"hello\"", "<![CDATA[\"hello\"]]>"),
+        ("<>&'\"", "<![CDATA[<>&'\"]]>"),
+        (">", "<![CDATA[>]]>"),
+        ("]]>]", "<![CDATA[]]]]><![CDATA[>]]]>"),
+        ("]]>", "<![CDATA[]]]]><![CDATA[>]]>"),
+        ("hello]]>world", "<![CDATA[hello]]]]><![CDATA[>world]]>"),
+        (
+            "hello]]><nasty-xml>pure-evil</nasty-xml>",
+            "<![CDATA[hello]]]]><![CDATA[><nasty-xml>pure-evil</nasty-xml>]]>",
+        ),
+    ] {
+        let mut output = String::new();
+        test.write_cdata_escaped_to(&mut output).unwrap();
+        assert_eq!(output, expected, "failed for input: {test:?}");
+    }
+}

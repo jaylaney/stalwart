@@ -58,25 +58,33 @@
 //!
 //! Ahead of phase 1, unless the fan-out is a deletion, a clone of the
 //! sender's tree and the messages are reconciled (spec 5.1,
-//! `sequence::za_reconcile_sequences`); the phases build from that clone,
+//! `sequence_floor::za_reconcile_sequences`); the phases build from that clone,
 //! and the committed values return for `za_set_sequences`.
 
 use crate::{
+    DestroyArchive, SizeWriter,
+    cache::GroupwareCache,
     calendar::{
-        CalendarEventNotification, ChangedBy, EVENT_NOTIFICATION_ZA_PENDING,
+        CalendarEventNotification, ChangedBy,
         delegation::{ZaDelegationResolution, ZaResolvedAccount},
-        drain::instance_key,
-        pinning::{za_decline_all, za_full_request_for, za_participation_replies},
-        seal::{TOKEN_LEN, TokenPairs, seal_error, seal_pending_item},
-        sequence::{ZaSequence, za_reconcile_sequences},
+        drain::{InstanceKey, instance_key, itip_reason},
+        pinning::{za_decline_all, za_full_state_for, za_participation_replies},
+        seal::{
+            TOKEN_LEN, TokenPairs,
+            item::{sealed_item_record, za_item_shape},
+            seal_error, seal_pending_item,
+        },
+        sequence_floor::{ZaSequence, za_instance_keys, za_reconcile_sequences},
+        storage::za_oldest_drained_notification,
     },
     scheduling::{
-        Email, ItipMessage, ical_size,
+        Email, ItipError, ItipMessage,
         inbound::itip_method,
         itip::{
             ITIP_STATUS_DELIVERED, ITIP_STATUS_DELIVERY_FAILED, ITIP_STATUS_INVALID_USER,
             ITIP_STATUS_NOT_ATTEMPTED,
         },
+        recipient::RecipientPolicy,
         snapshot::itip_snapshot,
     },
 };
@@ -93,7 +101,7 @@ use common::{
     },
     za::lease::ZaUidLease,
 };
-use registry::schema::enums::Permission;
+use registry::schema::enums::{Permission, StorageQuota};
 use store::{
     rand,
     write::{BatchBuilder, now},
@@ -138,10 +146,10 @@ pub struct ZaFanOutResult {
 /// DELETE built from the unsealed stored event (spec 5.5), with what the
 /// fan-out needs from that event.
 pub struct ZaDeleteMessage {
-    /// `itip_cancel`'s message; `None` when it builds nothing, since an
-    /// attendee's DELETE enters the fan-out even then (key pinning spec
-    /// 5.1 item 2).
-    pub message: Option<ItipMessage<ICalendar>>,
+    /// `itip_cancel`'s messages, after upstream's per-recipient split;
+    /// `None` when it builds nothing, since an attendee's DELETE enters the
+    /// fan-out even then (key pinning spec 5.1 item 2).
+    pub messages: Option<Vec<ItipMessage<ICalendar>>>,
     /// The stored event's token pairs.
     pub pairs: Option<TokenPairs>,
     /// The unsealed stored tree.
@@ -150,6 +158,9 @@ pub struct ZaDeleteMessage {
     /// pinning spec 5.1).
     pub document_id: u32,
     pub uid: String,
+    /// The policy `itip_cancel` split the messages under, for the delegated
+    /// second run's split (upgrade ruling 93).
+    pub policy: RecipientPolicy,
 }
 
 /// The sender's event a fan-out delivers for (key pinning spec 5.1): its
@@ -265,7 +276,9 @@ pub trait ZaFanOut: Sync + Send {
     /// The pin-record writes carry no fence (key pinning spec 5.5).
     /// Unless `kind` is `Deletion`, the messages and a clone of `event` are
     /// first reconciled (key pinning spec 5.1); the result's `sequences`
-    /// are the clone's committed values.
+    /// are the clone's committed values. `policy` is the event's
+    /// `RecipientPolicy`, under which a change's full state is split per
+    /// recipient as upstream's messages were (upgrade ruling 91).
     #[allow(clippy::too_many_arguments)]
     fn za_fan_out(
         &self,
@@ -278,6 +291,7 @@ pub trait ZaFanOut: Sync + Send {
         event: &ICalendar,
         source: ZaSource<'_>,
         kind: ZaFanOutKind,
+        policy: RecipientPolicy,
         fence: Option<&ZaUidLease>,
         resolution: Option<&ZaDelegationResolution>,
     ) -> impl Future<Output = trc::Result<ZaFanOutResult>> + Send;
@@ -296,6 +310,7 @@ impl ZaFanOut for Server {
         event: &ICalendar,
         source: ZaSource<'_>,
         kind: ZaFanOutKind,
+        policy: RecipientPolicy,
         fence: Option<&ZaUidLease>,
         resolution: Option<&ZaDelegationResolution>,
     ) -> trc::Result<ZaFanOutResult> {
@@ -561,6 +576,9 @@ impl ZaFanOut for Server {
         // organizer-side entry, one REPLY per local address for an
         // attendee-side one.
         let mut full_states: AHashMap<&str, Vec<ItipMessage<ICalendar>>> = AHashMap::new();
+        // Upgrade ruling 135 (M10): a full state whose split failed is that
+        // recipient's `5.1`; its entry stays, its own messages still go.
+        let mut failed_full: AHashSet<&str> = AHashSet::new();
         if !delegated
             && kind == ZaFanOutKind::Change
             && let Some(record) = decided
@@ -578,9 +596,24 @@ impl ZaFanOut for Server {
                         key,
                         entry,
                         &union,
+                        policy,
                     )
                 {
-                    full_states.insert(key.as_str(), full);
+                    match full {
+                        Ok(full) => {
+                            full_states.insert(key.as_str(), full);
+                        }
+                        Err(err) => {
+                            trc::event!(
+                                Calendar(trc::CalendarEvent::ItipMessageError),
+                                AccountId = sender_id,
+                                DocumentId = source.document_id,
+                                Reason = itip_reason(&err),
+                                Details = "zero-access: full state not built",
+                            );
+                            failed_full.insert(key.as_str());
+                        }
+                    }
                 }
             }
         }
@@ -607,6 +640,15 @@ impl ZaFanOut for Server {
                                 // never stops the recipient's own messages. A
                                 // full-state REPLY carries the token of its own
                                 // `from`, routed as any REPLY (none: `5.3`).
+                                if failed_full.remove(key) {
+                                    not_written.insert(key);
+                                    record_status(
+                                        &mut statuses,
+                                        attempt.address,
+                                        attempt.route.on_organizer(),
+                                        ITIP_STATUS_DELIVERY_FAILED,
+                                    );
+                                }
                                 for mut full in full_states.remove(key).unwrap_or_default() {
                                     za_mark_sent_by(&mut full, writer_account, event_account);
                                     let full_route = if is_reply_message(&full) {
@@ -839,7 +881,9 @@ fn decide(
                         source.uid,
                         address,
                         now,
-                        reply_instances(attempts, address, addresses).as_ref(),
+                        reply_instances(attempts, address, addresses)
+                            .or_else(|| cancel_instances(attempts, address, addresses))
+                            .as_ref(),
                     );
                     changed = true;
                 }
@@ -880,13 +924,20 @@ fn retire(state: &ZaPinState, consumed: &[(&str, u64)], source: ZaSource<'_>) ->
 
 /// The two-item rule's full current state for `key`, which holds `entry`
 /// (spec 5.1 item 1), from the reconciled committed tree: an organizer's
-/// full REQUEST for the address, or an attendee's refused instances'
-/// current participation, one REPLY per local address they are attended as
-/// whose token `pairs` holds (`za_participation_replies`, as `contacts/pin`
-/// builds it). `None` when it is skipped: one of the address's own messages
-/// is a REQUEST or a CANCEL carrying the master, the relationship ended (the
-/// organizer's tree names no ATTENDEE with the address), or the full state
-/// yields nothing.
+/// full REQUEST for the address, split under `policy` as upstream's full
+/// update is (the address's slice, upgrade ruling 91), followed by the
+/// CANCELs of the entry's recorded instances the address no longer attends
+/// (`za_full_state_for`, upgrade ruling 132), or an attendee's refused
+/// instances' current participation, one REPLY per local address they are
+/// attended as whose token `pairs` holds (`za_participation_replies`, as
+/// `contacts/pin` builds it). `None` when it is skipped: one of the
+/// address's own messages is a CANCEL carrying the master, the address's
+/// own organizer REQUESTs already carry every instance it attends
+/// (`requests_cover`; never while an organizer-side entry records instance
+/// keys), the relationship ended (the organizer's tree names no ATTENDEE
+/// with the address), or the full state yields nothing. `Some(Err)` is the
+/// split's error (upgrade ruling 135, M10).
+#[allow(clippy::too_many_arguments)]
 fn full_state(
     event: &ICalendar,
     addresses: &[String],
@@ -895,13 +946,18 @@ fn full_state(
     key: &str,
     entry: &ZaWithheld,
     pairs: &TokenPairs,
-) -> Option<Vec<ItipMessage<ICalendar>>> {
+    policy: RecipientPolicy,
+) -> Option<Result<Vec<ItipMessage<ICalendar>>, ItipError>> {
     let own = || {
         attempts
             .iter()
             .filter(move |attempt| attempt.key.as_deref() == Some(key))
     };
-    if own().any(|attempt| carries_master(&attempt.message.message)) {
+    // Upgrade ruling 132: own REQUESTs cannot carry a recorded removal.
+    let records_removals = is_organizer && !entry.instances.all && !entry.instances.keys.is_empty();
+    if own().any(|attempt| cancels_master(&attempt.message.message))
+        || (!records_removals && requests_cover(event, attempts, key))
+    {
         return None;
     }
     if is_organizer {
@@ -913,14 +969,17 @@ fn full_state(
         {
             return None;
         }
-        za_full_request_for(event, addresses, key).map(|full| vec![full])
+        match za_full_state_for(event, addresses, key, &entry.instances, policy) {
+            Ok(full) => (!full.is_empty()).then_some(Ok(full)),
+            Err(err) => Some(Err(err)),
+        }
     } else {
         // Only alongside a REPLY of the change's own to the address.
         if !own().any(|attempt| attempt.is_reply) {
             return None;
         }
         let full = za_participation_replies(event, addresses, &entry.instances, Some(pairs));
-        (!full.is_empty()).then_some(full)
+        (!full.is_empty()).then_some(Ok(full))
     }
 }
 
@@ -929,20 +988,97 @@ fn is_reply_message(message: &ItipMessage<ICalendar>) -> bool {
     matches!(itip_method(&message.message), Ok(ICalendarMethod::Reply))
 }
 
-/// A REQUEST or CANCEL holding a scheduling component without
-/// RECURRENCE-ID: upstream routes every master change to the full update,
-/// and a master CANCEL cancels every instance of the copy (spec 5.1).
-fn carries_master(message: &ICalendar) -> bool {
-    matches!(
-        itip_method(message),
-        Ok(ICalendarMethod::Request | ICalendarMethod::Cancel)
-    ) && message.components.iter().any(|comp| {
-        comp.component_type.is_scheduling_object()
-            && !comp
-                .entries
-                .iter()
-                .any(|entry| entry.name == ICalendarProperty::RecurrenceId)
-    })
+/// A CANCEL holding a scheduling component without RECURRENCE-ID: a master
+/// CANCEL cancels every instance of the copy (spec 5.1).
+fn cancels_master(message: &ICalendar) -> bool {
+    matches!(itip_method(message), Ok(ICalendarMethod::Cancel))
+        && message.components.iter().any(|comp| {
+            comp.component_type.is_scheduling_object()
+                && !comp
+                    .entries
+                    .iter()
+                    .any(|entry| entry.name == ICalendarProperty::RecurrenceId)
+        })
+}
+
+/// Whether the change's own organizer REQUESTs already carry `key`'s full
+/// view (spec 5.1 item 1 as amended for 1.0, upgrade ruling 91). At 1.0
+/// upstream splits its messages per recipient, so an address's copy of the
+/// full update is its slice, the instances it attends, master or not. For
+/// every address of an ATTENDEE of the committed tree `event` that
+/// normalizes to `key` (parsed with `Email::new`, as the split parses
+/// them), one REQUEST from the organizer to that address must carry every
+/// scheduling instance whose ATTENDEEs name it, compared by `InstanceKey`.
+/// `false` when the tree names no such address. For an attendee of the
+/// master this is the 0.16 rule (a REQUEST carrying the master), since its
+/// slice of a master change carries the master and each override it
+/// attends.
+fn requests_cover(event: &ICalendar, attempts: &[Attempt<'_>], key: &str) -> bool {
+    let address_of = |value: &str| Email::new(value, &[]).map(|email| email.email);
+    let mut attended: AHashMap<String, AHashSet<InstanceKey>> = AHashMap::new();
+    for (comp_id, instance) in za_instance_keys(event) {
+        for entry in &event.components[comp_id as usize].entries {
+            if entry.name == ICalendarProperty::Attendee
+                && let Some(address) = entry
+                    .values
+                    .first()
+                    .and_then(|value| value.as_text())
+                    .and_then(address_of)
+                && za_normalize_address(&address).as_deref() == Some(key)
+            {
+                attended.entry(address).or_default().insert(instance);
+            }
+        }
+    }
+    !attended.is_empty()
+        && attended.iter().all(|(address, instances)| {
+            attempts.iter().any(|attempt| {
+                attempt.key.as_deref() == Some(key)
+                    && attempt.message.from_organizer
+                    && address_of(attempt.address).as_ref() == Some(address)
+                    && matches!(
+                        itip_method(&attempt.message.message),
+                        Ok(ICalendarMethod::Request)
+                    )
+                    && {
+                        let carried: AHashSet<InstanceKey> =
+                            za_instance_keys(&attempt.message.message)
+                                .into_iter()
+                                .map(|(_, instance)| instance)
+                                .collect();
+                        instances.is_subset(&carried)
+                    }
+            })
+        })
+}
+
+/// The instances of the organizer's per-instance CANCELs refused for `key`
+/// (spec 4.1 as amended by upgrade ruling 132): each CANCEL component with
+/// a RECURRENCE-ID, by the drain's `InstanceKey` as `refused_instances`
+/// reads it, the master not recorded (a master CANCEL cancels every
+/// instance; the full state is skipped for it). `None` when no message to
+/// `key` is an organizer CANCEL.
+fn cancel_instances(
+    attempts: &[Attempt<'_>],
+    key: &str,
+    addresses: &[String],
+) -> Option<ZaInstances> {
+    let mut instances: Option<ZaInstances> = None;
+    for attempt in attempts.iter().filter(|attempt| {
+        attempt.key.as_deref() == Some(key)
+            && attempt.message.from_organizer
+            && matches!(
+                itip_method(&attempt.message.message),
+                Ok(ICalendarMethod::Cancel)
+            )
+    }) {
+        let mut refused = refused_instances(&attempt.message.message, addresses);
+        refused.master = false;
+        instances
+            .get_or_insert_with(ZaInstances::default)
+            .union(&refused);
+    }
+    instances
 }
 
 /// The instances of the REPLYs refused for `key` (spec 4.1), `None` when no
@@ -1357,7 +1493,7 @@ async fn write_item_inner(
     fence: Option<&ZaUidLease>,
 ) -> trc::Result<bool> {
     // Step 5: the two checks upstream's ingest makes.
-    let size = ical_size(message);
+    let size = SizeWriter::ical(message);
     if size >= server.core.groupware.itip_inbound_max_ical_size {
         return Ok(false);
     }
@@ -1365,51 +1501,83 @@ async fn write_item_inner(
         .account(recipient_id)
         .await
         .caused_by(trc::location!())?;
+    // Upgrade rulings 176 (B-M3) and 187: at upstream's notification limit
+    // the oldest drained notification is evicted, upstream's rolling window
+    // (`NotificationQuota::reserve`); a pending item is never evicted, so
+    // when every stored notification is pending the item is refused. Upgrade
+    // ruling 191 (N10): a zero limit refuses before any eviction, as upstream.
+    let mut evict = None;
+    if let Some(limit) =
+        server.object_quota_limit(&account, StorageQuota::MaxCalendarEventNotifications)
+    {
+        if limit == 0 {
+            return Ok(false);
+        }
+        if server
+            .count_documents(recipient_id, Collection::CalendarEventNotification, limit)
+            .await
+            .caused_by(trc::location!())?
+            >= limit
+        {
+            match za_oldest_drained_notification(server, recipient_id).await? {
+                Some(oldest) => evict = Some(oldest),
+                None => return Ok(false),
+            }
+        }
+    }
+    // Upgrade ruling 94: the shape upstream queues (its text round-trip),
+    // without the split's unreferenced placeholder components.
+    let mut tree = za_item_shape(message).ok_or_else(|| {
+        trc::StoreEvent::UnexpectedError
+            .into_err()
+            .details("zero-access: iTIP message does not reparse")
+            .caused_by(trc::location!())
+    })?;
+    // Steps 1-3 (plan 8): the tree sealed to the recipient's public key.
+    seal_pending_item(&mut tree, recipient_id, public_key, pair, reply_token)
+        .map_err(|err| seal_error(err, recipient_id, u32::MAX))?;
     // Only a quota limit is "over quota"; any other error reaches the
-    // `write_item` trace (as upstream's `copy_message` matches it).
+    // `write_item` trace (as upstream's `copy_message` matches it). Upgrade
+    // ruling 176 (B-M7): measured on the sealed item, the size stored.
     match server
-        .has_available_quota(account.as_ref(), size as u64)
+        .has_available_quota(account.as_ref(), SizeWriter::ical(&tree) as u64)
         .await
     {
         Ok(_) => {}
-        Err(err)
-            if err.matches(trc::EventType::Limit(trc::LimitEvent::Quota))
-                || err.matches(trc::EventType::Limit(trc::LimitEvent::TenantQuota)) =>
-        {
+        Err(err) if err.matches(trc::EventType::Limit(trc::LimitEvent::Quota)) => {
             return Ok(false);
         }
         Err(err) => return Err(err.caused_by(trc::location!())),
     }
-    // Steps 1-3 (plan 8): the tree sealed to the recipient's public key.
-    let mut tree = message.clone();
-    seal_pending_item(&mut tree, recipient_id, public_key, pair, reply_token)
-        .map_err(|err| seal_error(err, recipient_id, u32::MAX))?;
-    // Step 4: the item, its own batch in the recipient's account.
-    let document_id = server
-        .store()
-        .assign_document_ids(recipient_id, Collection::CalendarEventNotification, 1)
-        .await
-        .caused_by(trc::location!())?;
+    // Step 4: the item, its own batch in the recipient's account. At 1.0 its
+    // record is built without plaintext (`sealed_item_record`, upgrade
+    // ruling 13) and its id is reserved in the batch itself.
     #[cfg(feature = "test_mode")]
     common::za::test_hooks::fan_out_pause_point(recipient_id).await;
+    let (item, content) = sealed_item_record(tree, ChangedBy::PrincipalId(sender_id), None, true);
     let mut batch = BatchBuilder::new();
     // Ahead of the insert: the assertion and the insert share the batch's
     // first commit point.
     if let Some(fence) = fence {
         fence.assert_in(&mut batch);
     }
-    CalendarEventNotification {
-        event: tree,
-        event_id: None,
-        changed_by: ChangedBy::PrincipalId(sender_id),
-        flags: EVENT_NOTIFICATION_ZA_PENDING,
-        size: size as u32,
-        ..Default::default()
+    if let Some((evicted_id, evicted)) = &evict {
+        DestroyArchive(
+            evicted
+                .to_unarchived::<CalendarEventNotification>()
+                .caused_by(trc::location!())?,
+        )
+        .delete(account.changed_by(), recipient_id, *evicted_id, &mut batch)
+        .caused_by(trc::location!())?;
     }
-    .insert(
-        account.account_tenant_ids(),
+    let document_id =
+        batch.reserve_document_id(recipient_id, Collection::CalendarEventNotification);
+    item.insert(
+        content,
+        account.changed_by(),
         recipient_id,
         document_id,
+        None,
         &mut batch,
     )
     .caused_by(trc::location!())?;
@@ -1924,5 +2092,330 @@ mod tests {
                     .iter()
                     .all(|parameter| parameter.name != ICalendarParameterName::SentBy))
         );
+    }
+
+    /// Upgrade ruling 91's coverage rule, from 1.0's own split messages. A
+    /// daily event of alice's (key1): carol (key3) on the master; override
+    /// X carries `x_attendees`, override Z bob (key2).
+    fn coverage_event(master: &[&str], x_attendees: &[&str], master_extra: &str) -> ICalendar {
+        let attendees = |list: &[&str]| {
+            list.iter()
+                .map(|address| {
+                    format!("ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{address}\r\n")
+                })
+                .collect::<String>()
+        };
+        let vevent = |rid: Option<&str>, summary: &str, list: &[&str]| {
+            let instance = match rid {
+                None => format!(
+                    "DTSTART:20990301T100000Z\r\nRRULE:FREQ=DAILY;COUNT=5\r\n{master_extra}"
+                ),
+                Some(rid) => format!("RECURRENCE-ID:{rid}\r\nDTSTART:{rid}\r\n"),
+            };
+            format!(
+                concat!(
+                    "BEGIN:VEVENT\r\nUID:fo-cover\r\nDTSTAMP:20240101T000000Z\r\n{}",
+                    "DURATION:PT1H\r\nSEQUENCE:0\r\nSUMMARY:{}\r\n",
+                    "ORGANIZER:mailto:key1@example.com\r\n{}END:VEVENT\r\n"
+                ),
+                instance,
+                summary,
+                attendees(list)
+            )
+        };
+        parse(&format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\n{}{}{}END:VCALENDAR\r\n",
+            vevent(None, "master", master),
+            vevent(Some("20990302T100000Z"), "x", x_attendees),
+            vevent(Some("20990304T100000Z"), "z", &["key2@example.com"]),
+        ))
+    }
+
+    /// `full_state` for bob as alice's fan-out decides it after the change
+    /// from `old` to `new`, built by upstream's `itip_update` (with its
+    /// per-recipient split); with the messages bob is sent.
+    fn bob_after(
+        old: &ICalendar,
+        new: ICalendar,
+        instances: ZaInstances,
+    ) -> (
+        Option<Vec<ItipMessage<ICalendar>>>,
+        Vec<ItipMessage<ICalendar>>,
+    ) {
+        use crate::scheduling::{
+            event_update::itip_update,
+            recipient::{AttendeeVisibility, RecipientPolicy},
+        };
+        const BOB: &str = "key2@example.com";
+        let policy = RecipientPolicy {
+            visibility: AttendeeVisibility::All,
+            max_recipients: usize::MAX,
+            max_instances: usize::MAX,
+        };
+        let alice = vec!["key1@example.com".to_string()];
+        let mut committed = new;
+        let messages = itip_update(&mut committed, old, &alice, policy).unwrap();
+        let attempts: Vec<Attempt<'_>> = messages
+            .iter()
+            .filter(|message| message.to.iter().any(|to| to == BOB))
+            .map(|message| Attempt {
+                message,
+                address: BOB,
+                is_reply: false,
+                route: Route::NotAttempted {
+                    on_organizer: false,
+                },
+                key: Some(BOB.to_string()),
+                self_allowed: false,
+            })
+            .collect();
+        let entry = ZaWithheld {
+            document_id: 1,
+            uid: "fo-cover".into(),
+            address: BOB.into(),
+            since: 0,
+            refusal_id: 1,
+            instances,
+        };
+        let full = full_state(
+            &committed,
+            &alice,
+            true,
+            &attempts,
+            BOB,
+            &entry,
+            &TokenPairs::default(),
+            policy,
+        )
+        .map(|full| full.expect("no split error"));
+        drop(attempts);
+        let own = messages
+            .into_iter()
+            .filter(|message| message.to.iter().any(|to| to == BOB))
+            .collect();
+        (full, own)
+    }
+
+    fn instances(message: &ItipMessage<ICalendar>) -> Vec<InstanceKey> {
+        let mut keys: Vec<InstanceKey> = za_instance_keys(&message.message)
+            .into_iter()
+            .map(|(_, instance)| instance)
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    #[test]
+    fn the_full_state_is_skipped_when_own_requests_cover_the_address() {
+        const X: InstanceKey = Some((4_076_128_800, false));
+        const Z: InstanceKey = Some((4_076_301_600, false));
+        const BOB: &str = "key2@example.com";
+        const CAROL: &str = "key3@example.com";
+        let method = |message: &ItipMessage<ICalendar>| itip_method(&message.message).ok().cloned();
+
+        // Case 11 Mixed: dave added to the master, bob removed from X. bob,
+        // on Z only, gets the full update's Z slice and X's CANCEL; the
+        // slice covers him, so no full state.
+        let old = coverage_event(&[CAROL], &[BOB, CAROL], "");
+        let new = coverage_event(&[CAROL, "dave@external.test"], &[CAROL], "");
+        let (full, own) = bob_after(&old, new, ZaInstances::default());
+        assert!(full.is_none(), "covered by the Z slice");
+        assert_eq!(
+            own.iter().map(method).collect::<Vec<_>>(),
+            [
+                Some(ICalendarMethod::Request),
+                Some(ICalendarMethod::Cancel)
+            ]
+        );
+        assert_eq!(instances(&own[0]), [Z], "the Z-only slice");
+
+        // Still fires: bob on X and Z, not the master; only Z changes. Z's
+        // partial does not cover X: the full state is his X and Z slice,
+        // without the master.
+        let old = coverage_event(&[CAROL], &[BOB, CAROL], "");
+        let new = coverage_event(&[CAROL], &[BOB, CAROL], "")
+            .to_string()
+            .replace("SUMMARY:z\r\n", "SUMMARY:z v2\r\n");
+        let (full, own) = bob_after(&old, parse(&new), ZaInstances::default());
+        assert_eq!(own.len(), 1);
+        assert_eq!(instances(&own[0]), [Z]);
+        let full = full.expect("the full state fires");
+        assert_eq!(full.len(), 1);
+        assert_eq!(full[0].to, vec![BOB.to_string()]);
+        assert_eq!(method(&full[0]), Some(ICalendarMethod::Request));
+        assert_eq!(instances(&full[0]), [X, Z], "his slice, no master");
+
+        // A master attendee: a master change's slice carries the master and
+        // his overrides (0.16's `carries_master` rule).
+        let old = coverage_event(&[BOB, CAROL], &[BOB, CAROL], "");
+        let new = coverage_event(&[BOB, CAROL], &[BOB, CAROL], "LOCATION:moved\r\n");
+        let (full, own) = bob_after(&old, new, ZaInstances::default());
+        assert!(full.is_none());
+        assert_eq!(instances(&own[0]), [None, X, Z]);
+
+        // Upgrade ruling 91, A2: an exclusion-only master edit is a CANCEL
+        // with RECURRENCE-IDs at 1.0, not a REQUEST: the full state fires,
+        // and carries the EXDATE.
+        let old = coverage_event(&[BOB, CAROL], &[BOB, CAROL], "");
+        let new = coverage_event(&[BOB, CAROL], &[BOB, CAROL], "EXDATE:20990303T100000Z\r\n");
+        let (full, own) = bob_after(&old, new, ZaInstances::default());
+        assert_eq!(
+            own.iter().map(method).collect::<Vec<_>>(),
+            [Some(ICalendarMethod::Cancel)]
+        );
+        assert!(!cancels_master(&own[0].message));
+        let full = full.expect("the full state fires");
+        assert_eq!(full.len(), 1);
+        assert!(
+            full[0]
+                .message
+                .to_string()
+                .contains("EXDATE:20990303T100000Z")
+        );
+    }
+
+    /// Upgrade ruling 132: a refused organizer CANCEL records its
+    /// per-instance components, never the master; a REPLY-less recipient
+    /// without a CANCEL records nothing.
+    #[test]
+    fn a_refused_cancel_records_its_instances() {
+        use crate::scheduling::{
+            event_update::itip_update,
+            recipient::{AttendeeVisibility, RecipientPolicy},
+        };
+        const X: (i64, bool) = (4_076_128_800, false);
+        const BOB: &str = "key2@example.com";
+        const CAROL: &str = "key3@example.com";
+        let policy = RecipientPolicy {
+            visibility: AttendeeVisibility::All,
+            max_recipients: usize::MAX,
+            max_instances: usize::MAX,
+        };
+        let alice = vec!["key1@example.com".to_string()];
+        fn attempts_for<'m>(
+            messages: &'m [ItipMessage<ICalendar>],
+            address: &'static str,
+        ) -> Vec<Attempt<'m>> {
+            messages
+                .iter()
+                .filter(|message| message.to.iter().any(|to| to == address))
+                .map(|message| Attempt {
+                    message,
+                    address,
+                    is_reply: false,
+                    route: Route::NotAttempted {
+                        on_organizer: false,
+                    },
+                    key: Some(address.to_string()),
+                    self_allowed: false,
+                })
+                .collect()
+        }
+
+        // bob removed from X: his CANCEL of X is recorded.
+        let old = coverage_event(&[CAROL], &[BOB, CAROL], "");
+        let mut new = coverage_event(&[CAROL], &[CAROL], "");
+        let messages = itip_update(&mut new, &old, &alice, policy).unwrap();
+        let attempts = attempts_for(&messages, BOB);
+        assert_eq!(
+            cancel_instances(&attempts, BOB, &alice),
+            Some(ZaInstances {
+                master: false,
+                keys: vec![X],
+                all: false,
+            })
+        );
+        assert!(reply_instances(&attempts, BOB, &alice).is_none());
+
+        // bob removed from the master while on Z: the master CANCEL records
+        // no master.
+        let old = coverage_event(&[BOB, CAROL], &[CAROL], "");
+        let mut new = coverage_event(&[CAROL], &[CAROL], "");
+        let messages = itip_update(&mut new, &old, &alice, policy).unwrap();
+        let attempts = attempts_for(&messages, BOB);
+        assert!(
+            attempts
+                .iter()
+                .any(|attempt| cancels_master(&attempt.message.message))
+        );
+        assert!(
+            cancel_instances(&attempts, BOB, &alice).is_none_or(|instances| !instances.master),
+            "the master is never recorded organizer-side"
+        );
+
+        // carol, sent only a REQUEST, records nothing.
+        let old = coverage_event(&[CAROL], &[BOB, CAROL], "");
+        let mut new = coverage_event(&[CAROL], &[CAROL], "LOCATION:moved\r\n");
+        let messages = itip_update(&mut new, &old, &alice, policy).unwrap();
+        let attempts = attempts_for(&messages, CAROL);
+        assert!(!attempts.is_empty());
+        assert!(cancel_instances(&attempts, CAROL, &alice).is_none());
+    }
+
+    /// Upgrade ruling 132: an organizer-side entry recording X, bob no
+    /// longer on X. A change to Z alone: the Z partial covers bob's
+    /// attended set, yet the full state fires (no coverage skip while the
+    /// entry records instance keys) and is his Z slice, then the CANCEL of
+    /// X. With bob on X again, no CANCEL; under `all`, today's skip.
+    #[test]
+    fn a_recorded_removal_is_replayed_after_the_slice() {
+        const X: (i64, bool) = (4_076_128_800, false);
+        const Z: InstanceKey = Some((4_076_301_600, false));
+        const BOB: &str = "key2@example.com";
+        const CAROL: &str = "key3@example.com";
+        let method = |message: &ItipMessage<ICalendar>| itip_method(&message.message).ok().cloned();
+        let recorded = ZaInstances {
+            master: false,
+            keys: vec![X],
+            all: false,
+        };
+        let z_change = |x_attendees: &[&str]| {
+            let old = coverage_event(&[CAROL], x_attendees, "");
+            let new = coverage_event(&[CAROL], x_attendees, "")
+                .to_string()
+                .replace("SUMMARY:z\r\n", "SUMMARY:z v2\r\n");
+            (old, parse(&new))
+        };
+
+        let (old, new) = z_change(&[CAROL]);
+        let (full, own) = bob_after(&old, new.clone(), ZaInstances::default());
+        assert!(full.is_none(), "without a record, the Z partial covers bob");
+        assert_eq!(own.len(), 1);
+        let (full, _) = bob_after(&old, new, recorded.clone());
+        let full = full.expect("the full state fires");
+        assert_eq!(
+            full.iter().map(method).collect::<Vec<_>>(),
+            [
+                Some(ICalendarMethod::Request),
+                Some(ICalendarMethod::Cancel)
+            ]
+        );
+        assert_eq!(instances(&full[0]), [Z], "his slice");
+        assert_eq!(instances(&full[1]), [Some(X)], "then X's CANCEL");
+        assert_eq!(full[1].to, vec![BOB.to_string()]);
+        assert!(full[1].from_organizer);
+        let cancel = full[1].message.to_string();
+        assert!(
+            cancel.contains("STATUS:CANCELLED")
+                && cancel.contains(&format!("ATTENDEE:mailto:{BOB}"))
+                && !cancel.contains(CAROL),
+            "{cancel}"
+        );
+
+        // bob on X again: no CANCEL, the slice holds X.
+        let (old, new) = z_change(&[BOB, CAROL]);
+        let (full, _) = bob_after(&old, new, recorded);
+        let full = full.expect("no coverage skip while instances are recorded");
+        assert_eq!(full.len(), 1);
+        assert_eq!(instances(&full[0]), [Some(X), Z]);
+
+        // Overflowed: today's behaviour.
+        let (old, new) = z_change(&[CAROL]);
+        let every = ZaInstances {
+            master: false,
+            keys: vec![],
+            all: true,
+        };
+        assert!(bob_after(&old, new, every).0.is_none());
     }
 }

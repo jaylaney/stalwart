@@ -12,7 +12,7 @@ use dav_proto::schema::property::{
 };
 use groupware::DavResourceName;
 use hyper::StatusCode;
-use types::dead_property::DeadElementTag;
+use types::metadata::XmlName;
 
 pub async fn test(test: &TestServer, assisted_discovery: bool) {
     let client = test.account("jane@example.com").webdav_client();
@@ -424,7 +424,9 @@ pub async fn test(test: &TestServer, assisted_discovery: bool) {
                         ]);
                     properties
                         .get(DavProperty::CalDav(CalDavProperty::SupportedCollationSet))
+                        // 1.0 also advertises i;octet.
                         .with_values([
+                            "A:supported-collation:i;octet",
                             "A:supported-collation:i;unicode-casemap",
                             "A:supported-collation:i;ascii-casemap",
                         ]);
@@ -464,7 +466,9 @@ pub async fn test(test: &TestServer, assisted_discovery: bool) {
                             ]);
                         properties
                             .get(DavProperty::CardDav(CardDavProperty::SupportedCollationSet))
+                            // 1.0 also advertises i;octet.
                             .with_values([
+                                "B:supported-collation:i;octet",
                                 "B:supported-collation:i;unicode-casemap",
                                 "B:supported-collation:i;ascii-casemap",
                             ]);
@@ -550,13 +554,20 @@ pub async fn test(test: &TestServer, assisted_discovery: bool) {
                 )
                 .await
                 .with_status(StatusCode::MULTI_STATUS);
-            client
+            let response = client
                 .propfind(path, [DavProperty::WebDav(WebDavProperty::GetETag)])
-                .await
-                .properties(path)
-                .get(DavProperty::WebDav(WebDavProperty::GetETag))
-                .with_status(StatusCode::OK)
-                .without_values([etag.as_str()]);
+                .await;
+            let properties = response.properties(path);
+            let etag_after = properties.get(DavProperty::WebDav(WebDavProperty::GetETag));
+            etag_after.with_status(StatusCode::OK);
+            if resource_type == DavResourceName::File {
+                // 1.0 keeps a file node's display name as a property beside
+                // the node, outside its ETag (`FileNode.etag`), so the ETag
+                // is unchanged; 0.16 stored it in the node.
+                etag_after.with_values([etag.as_str()]);
+            } else {
+                etag_after.without_values([etag.as_str()]);
+            }
 
             // Test 12: PROPPATCH set on DAV properties
             client
@@ -572,9 +583,9 @@ pub async fn test(test: &TestServer, assisted_discovery: bool) {
                             "2000-01-01T00:00:00Z",
                         ),
                         (
-                            DavProperty::DeadProperty(DeadElementTag::new(
+                            DavProperty::Dead(XmlName::owned(
+                                Some("http://example.com/ns/".to_string()),
                                 "my-dead-element".to_string(),
-                                Some("xmlns=\"http://example.com/ns/\" prop=\"abc\"".to_string()),
                             )),
                             "this is a dead but exciting element",
                         ),
@@ -585,9 +596,9 @@ pub async fn test(test: &TestServer, assisted_discovery: bool) {
                 .patch_and_check(
                     path,
                     [(
-                        DavProperty::DeadProperty(DeadElementTag::new(
+                        DavProperty::Dead(XmlName::owned(
+                            Some("http://example.com/ns/".to_string()),
                             "my-dead-element".to_string(),
-                            Some("xmlns=\"http://example.com/ns/\" prop=\"xyz\"".to_string()),
                         )),
                         "this is a modified dead but exciting element",
                     )],
@@ -597,9 +608,9 @@ pub async fn test(test: &TestServer, assisted_discovery: bool) {
             // Test 13: PROPPATCH remove on DAV properties
             let mut props = vec![
                 (
-                    DavProperty::DeadProperty(DeadElementTag::new(
+                    DavProperty::Dead(XmlName::owned(
+                        Some("http://example.com/ns/".to_string()),
                         "my-dead-element".to_string(),
-                        Some("xmlns=\"http://example.com/ns/\"".to_string()),
                     )),
                     "",
                 ),
@@ -687,9 +698,9 @@ pub async fn test(test: &TestServer, assisted_discovery: bool) {
             // Test 17: PROPPATCH should fail on large properties
             let mut chunky_props = vec![
                 DavProperty::WebDav(WebDavProperty::DisplayName),
-                DavProperty::DeadProperty(DeadElementTag::new(
+                DavProperty::Dead(XmlName::owned(
+                    Some("http://example.com/ns/".to_string()),
                     "my-chunky-dead-element".to_string(),
-                    Some("xmlns=\"http://example.com/ns/\"".to_string()),
                 )),
             ];
             if !is_file {
@@ -704,17 +715,16 @@ pub async fn test(test: &TestServer, assisted_discovery: bool) {
             let chunky_live_contents = (0..=(test.server.core.groupware.live_property_size + 1))
                 .map(|_| "a")
                 .collect::<String>();
-            let chunky_dead_contents =
-                (0..=(test.server.core.groupware.dead_property_size.unwrap() + 1))
-                    .map(|_| "a")
-                    .collect::<String>();
+            let chunky_dead_contents = (0..=(test.server.core.metadata.max_entry_size + 1))
+                .map(|_| "a")
+                .collect::<String>();
             let response = client
                 .proppatch(
                     path,
                     chunky_props.iter().map(|prop| {
                         (
                             prop.clone(),
-                            if matches!(prop, DavProperty::DeadProperty(_)) {
+                            if matches!(prop, DavProperty::Dead(_)) {
                                 &chunky_dead_contents
                             } else {
                                 &chunky_live_contents
@@ -728,9 +738,44 @@ pub async fn test(test: &TestServer, assisted_discovery: bool) {
                 .await
                 .into_propfind_response(None);
             let props = response.properties(path);
-            for prop in chunky_props {
-                props
-                    .get(prop)
+            // 1.0's PROPPATCH is atomic (RFC 4918 9.2): for calendars and
+            // address books (collections and items), the dead properties are
+            // applied after the live ones and are not attempted once a live one
+            // fails, so they answer 424. A file node's display name is itself a
+            // dead property, so every property under /dav/file is checked in one
+            // dead patch and answers 507.
+            let live_then_dead = resource_type != DavResourceName::File;
+            for prop in &chunky_props {
+                if live_then_dead && matches!(prop, DavProperty::Dead(_)) {
+                    let result = props.get(prop.clone());
+                    result.with_status(StatusCode::FAILED_DEPENDENCY);
+                    assert_eq!(result.prop.description, None);
+                } else {
+                    props
+                        .get(prop.clone())
+                        .with_status(StatusCode::INSUFFICIENT_STORAGE)
+                        .with_description("Property value is too long");
+                }
+            }
+            if live_then_dead {
+                // The dead property's own size check, alone in its PROPPATCH.
+                let dead_prop = chunky_props
+                    .iter()
+                    .find(|prop| matches!(prop, DavProperty::Dead(_)))
+                    .unwrap()
+                    .clone();
+                let response = client
+                    .proppatch(
+                        path,
+                        [(dead_prop.clone(), chunky_dead_contents.as_str())],
+                        [],
+                        [],
+                    )
+                    .await
+                    .into_propfind_response(None);
+                response
+                    .properties(path)
+                    .get(dead_prop)
                     .with_status(StatusCode::INSUFFICIENT_STORAGE)
                     .with_description("Property value is too long");
             }

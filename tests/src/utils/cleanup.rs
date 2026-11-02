@@ -10,62 +10,117 @@ use ::registry::{
 };
 use store::{
     ValueKey,
-    write::{key::DeserializeBigEndian, *},
+    write::{
+        key::{CounterKind, DeserializeBigEndian, SystemKind},
+        *,
+    },
     *,
 };
 use trc::AddContext;
 use types::{
     blob_hash::{BLOB_HASH_LEN, BlobHash},
-    collection::Collection,
+    collection::{Collection, SyncCollection},
     field::PrincipalField,
 };
+
+// The key range that covers a whole subspace. Every key of 1.0's data store
+// is shorter than this upper bound, or starts below it.
+const KEY_RANGE_END: [u8; 16] = [u8::MAX; 16];
+
+/// What the emptiness check does with the keys left in one subspace. 1.0's
+/// `Subspace` enum is closed, and `subspace_rule` matches it with no
+/// catch-all arm, so a subspace that upstream adds stops the build here and
+/// must be classified.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rule {
+    /// Every key left here is a leftover. `with_values` prints the value too.
+    Leftover { with_values: bool },
+    /// Registry items: singletons and the fixture types are kept, the rest
+    /// are leftovers.
+    RegistryItems,
+    /// Registry index keys, kept for the same types as `RegistryItems`.
+    RegistryIndex,
+    /// Registry primary keys and references, kept for the same types.
+    RegistryPrimaryKey,
+    /// Counters: the document-id and change-id counters are deleted, the
+    /// registry id counters kept (as at 0.16), and any other counter that the
+    /// store purge did not remove (it removes zero counters) is a leftover.
+    Counters,
+    /// Properties: a zero-access vault or pin record is reported to the
+    /// caller, which checks that its account still exists; the rest are
+    /// leftovers.
+    Properties,
+    /// The schema version and the node-id claims are kept; the rest are
+    /// leftovers.
+    System,
+    /// The internal search store's terms and documents. They are leftovers,
+    /// except on PostgreSQL and MySQL, which keep the search index in tables
+    /// of their own and create no such subspace (`Subspace::is_internal_fts`).
+    InternalSearch,
+    /// The change logs, deleted after the check as at 0.16. 1.0 also keeps
+    /// share notifications here, as log entries of
+    /// `SyncCollection::ShareNotification`: an account's own state, written on
+    /// every grant, change and revoke, and deleted with the logs. Their
+    /// accounts are reported to the caller, which checks that each still
+    /// exists (destroying an account clears its `Logs` prefix).
+    Logs,
+}
+
+fn subspace_rule(subspace: Subspace) -> Rule {
+    match subspace {
+        Subspace::Acl => Rule::Leftover { with_values: true },
+        Subspace::RegistryIndex => Rule::RegistryIndex,
+        Subspace::Immutable => Rule::Leftover { with_values: true },
+        Subspace::Directory => Rule::RegistryItems,
+        Subspace::QueueMessage => Rule::Leftover { with_values: true },
+        Subspace::TaskQueue => Rule::Leftover { with_values: true },
+        Subspace::RegistryPrimaryKey => Rule::RegistryPrimaryKey,
+        Subspace::ReportOut => Rule::Leftover { with_values: true },
+        Subspace::Indexes => Rule::Leftover { with_values: false },
+        Subspace::DeletedItems => Rule::Leftover { with_values: true },
+        Subspace::BlobLink => Rule::Leftover { with_values: true },
+        Subspace::Logs => Rule::Logs,
+        Subspace::Counter => Rule::Counters,
+        Subspace::TelemetrySpan => Rule::Leftover { with_values: true },
+        Subspace::Property => Rule::Properties,
+        Subspace::QueueEvent => Rule::Leftover { with_values: true },
+        Subspace::ReportIn => Rule::Leftover { with_values: true },
+        Subspace::Registry => Rule::RegistryItems,
+        Subspace::Blobs => Rule::Leftover { with_values: true },
+        Subspace::IndexProperty => Rule::Leftover { with_values: false },
+        Subspace::SpamSamples => Rule::RegistryItems,
+        Subspace::TelemetryMetric => Rule::Leftover { with_values: true },
+        Subspace::SearchTerm => Rule::InternalSearch,
+        Subspace::SearchDocument => Rule::InternalSearch,
+        Subspace::SearchQueue => Rule::Leftover { with_values: true },
+        Subspace::System => Rule::System,
+    }
+}
+
+fn subspace_range(subspace: Subspace) -> (AnyKey<Vec<u8>>, AnyKey<Vec<u8>>) {
+    (
+        AnyKey {
+            subspace,
+            key: vec![0u8],
+        },
+        AnyKey {
+            subspace,
+            key: KEY_RANGE_END.to_vec(),
+        },
+    )
+}
 
 pub async fn store_destroy(store: &Store) {
     store_destroy_sql_indexes(store).await;
 
-    for subspace in [
-        SUBSPACE_ACL,
-        SUBSPACE_TASK_QUEUE,
-        SUBSPACE_INDEXES,
-        SUBSPACE_DELETED_ITEMS,
-        SUBSPACE_SPAM_SAMPLES,
-        SUBSPACE_BLOB_LINK,
-        SUBSPACE_LOGS,
-        SUBSPACE_IN_MEMORY_COUNTER,
-        SUBSPACE_IN_MEMORY_VALUE,
-        SUBSPACE_COUNTER,
-        SUBSPACE_PROPERTY,
-        SUBSPACE_REGISTRY,
-        SUBSPACE_BLOBS,
-        SUBSPACE_QUEUE_MESSAGE,
-        SUBSPACE_QUEUE_EVENT,
-        SUBSPACE_QUOTA,
-        SUBSPACE_REPORT_OUT,
-        SUBSPACE_REPORT_IN,
-        SUBSPACE_TELEMETRY_SPAN,
-        SUBSPACE_TELEMETRY_METRIC,
-        SUBSPACE_SEARCH_INDEX,
-        SUBSPACE_REGISTRY_IDX,
-        SUBSPACE_REGISTRY_PK,
-        SUBSPACE_DIRECTORY,
-    ] {
-        if subspace == SUBSPACE_SEARCH_INDEX && store.is_pg_or_mysql() {
+    for subspace in Subspace::ALL.iter().copied() {
+        // PostgreSQL and MySQL create no table for the internal search store
+        if subspace.is_internal_fts() && store.is_pg_or_mysql() {
             continue;
         }
 
-        store
-            .delete_range(
-                AnyKey {
-                    subspace,
-                    key: vec![0u8],
-                },
-                AnyKey {
-                    subspace,
-                    key: vec![u8::MAX; 16],
-                },
-            )
-            .await
-            .unwrap();
+        let (from_key, to_key) = subspace_range(subspace);
+        store.delete_range(from_key, to_key).await.unwrap();
     }
 }
 
@@ -73,19 +128,29 @@ pub async fn search_store_destroy(store: &SearchStore) {
     match &store {
         SearchStore::Store(store) => {
             store_destroy_sql_indexes(store).await;
-        }
-        SearchStore::ElasticSearch(store) => {
-            if let Err(err) = store.drop_indexes().await {
-                eprintln!("Failed to drop elasticsearch indexes: {}", err);
+            if !store.is_pg_or_mysql() {
+                for subspace in [Subspace::SearchTerm, Subspace::SearchDocument] {
+                    let (from_key, to_key) = subspace_range(subspace);
+                    store.delete_range(from_key, to_key).await.unwrap();
+                }
             }
-            store.create_indexes().await.unwrap();
         }
-        SearchStore::MeiliSearch(store) => {
-            if let Err(err) = store.drop_indexes().await {
-                eprintln!("Failed to drop meilisearch indexes: {}", err);
-            }
-            store.create_indexes().await.unwrap();
+        #[cfg(feature = "postgres")]
+        SearchStore::PostgreSQL(store) => {
+            store_destroy_sql_indexes(&Store::PostgreSQL(store.clone())).await;
         }
+        #[cfg(feature = "mysql")]
+        SearchStore::MySQL(store) => {
+            store_destroy_sql_indexes(&Store::MySQL(store.clone())).await;
+        }
+        SearchStore::ElasticSearch(_) | SearchStore::MeiliSearch(_) => {
+            // 1.0 moved `drop_indexes` for these two stores into upstream's
+            // private test support; no CI step uses them (upgrade test-hook
+            // table, "not needed by the retained suite").
+            panic!("Resetting an ElasticSearch or MeiliSearch search store is not supported.");
+        }
+        #[allow(unreachable_patterns)]
+        _ => panic!("Resetting this search store is not supported in the tests."),
     }
 }
 
@@ -98,6 +163,7 @@ async fn store_destroy_sql_indexes(store: &Store) {
                 SearchIndex::Email,
                 SearchIndex::Calendar,
                 SearchIndex::Contacts,
+                SearchIndex::File,
                 SearchIndex::Tracing,
             ] {
                 #[cfg(feature = "postgres")]
@@ -114,7 +180,13 @@ async fn store_destroy_sql_indexes(store: &Store) {
 }
 
 pub async fn store_blob_expire_all(store: &Store) {
-    // Delete all temporary hashes
+    // Expire every temporary link in place, as the purge would find it once
+    // its hold ran out. 0.16's helper deleted the links. At 1.0 a blob held
+    // for a batch that never committed (`Server::hold_blob`, for example a
+    // DAV PUT refused for quota) has no commit entry, only its temporary
+    // link, and the purge reads that link to delete the blob: a deleted link
+    // leaves the blob in the blob store, unreachable.
+    const EXPIRED: u64 = 1;
     let from_key = ValueKey {
         account_id: 0,
         collection: 0,
@@ -137,7 +209,7 @@ pub async fn store_blob_expire_all(store: &Store) {
     store
         .iterate(
             IterateParams::new(from_key, to_key).ascending(),
-            |key, _| {
+            |key, value| {
                 if key.len() == BLOB_HASH_LEN + U32_LEN + U64_LEN {
                     let account_id = key
                         .deserialize_be_u32(BLOB_HASH_LEN)
@@ -152,10 +224,20 @@ pub async fn store_blob_expire_all(store: &Store) {
                         .deserialize_be_u64(BLOB_HASH_LEN + U32_LEN)
                         .caused_by(trc::location!())?;
 
-                    batch.clear(ValueClass::Blob(BlobOp::Link {
-                        hash,
-                        to: BlobLink::Temporary { until },
-                    }));
+                    if until > EXPIRED {
+                        batch
+                            .clear(ValueClass::Blob(BlobOp::Link {
+                                hash: hash.clone(),
+                                to: BlobLink::Temporary { until },
+                            }))
+                            .set(
+                                ValueClass::Blob(BlobOp::Link {
+                                    hash,
+                                    to: BlobLink::Temporary { until: EXPIRED },
+                                }),
+                                value.to_vec(),
+                            );
+                    }
                 }
 
                 Ok(true)
@@ -163,177 +245,104 @@ pub async fn store_blob_expire_all(store: &Store) {
         )
         .await
         .unwrap();
-    store.write(batch.build_all()).await.unwrap();
-}
-
-pub async fn store_lookup_expire_all(store: &Store) {
-    // Delete all temporary counters
-    let from_key = ValueKey::from(ValueClass::InMemory(InMemoryClass::Key(vec![0u8])));
-    let to_key = ValueKey::from(ValueClass::InMemory(InMemoryClass::Key(vec![u8::MAX; 10])));
-
-    let mut expired_keys = Vec::new();
-    let mut expired_counters = Vec::new();
-
-    store
-        .iterate(IterateParams::new(from_key, to_key), |key, value| {
-            let expiry = value.deserialize_be_u64(0).caused_by(trc::location!())?;
-            if expiry == 0 {
-                expired_counters.push(key.to_vec());
-            } else if expiry != u64::MAX {
-                expired_keys.push(key.to_vec());
-            }
-            Ok(true)
-        })
-        .await
-        .unwrap();
-
-    if !expired_keys.is_empty() {
-        let mut batch = BatchBuilder::new();
-        for key in expired_keys {
-            batch.any_op(Operation::Value {
-                class: ValueClass::InMemory(InMemoryClass::Key(key)),
-                op: ValueOp::Clear,
-            });
-            if batch.is_large_batch() {
-                store.write(batch.build_all()).await.unwrap();
-                batch = BatchBuilder::new();
-            }
-        }
-        if !batch.is_empty() {
-            store.write(batch.build_all()).await.unwrap();
-        }
-    }
-
-    if !expired_counters.is_empty() {
-        let mut batch = BatchBuilder::new();
-        for key in expired_counters {
-            batch.any_op(Operation::Value {
-                class: ValueClass::InMemory(InMemoryClass::Counter(key.clone())),
-                op: ValueOp::Clear,
-            });
-            batch.any_op(Operation::Value {
-                class: ValueClass::InMemory(InMemoryClass::Key(key)),
-                op: ValueOp::Clear,
-            });
-            if batch.is_large_batch() {
-                store.write(batch.build_all()).await.unwrap();
-                batch = BatchBuilder::new();
-            }
-        }
-        if !batch.is_empty() {
-            store.write(batch.build_all()).await.unwrap();
-        }
+    if !batch.is_empty() {
+        store.write_batch(&mut batch).await.unwrap();
     }
 }
 
 pub async fn store_assert_is_empty(store: &Store, blob_store: BlobStore, include_registry: bool) {
-    let vault_accounts =
-        store_assert_is_empty_except_vaults(store, blob_store, include_registry).await;
+    let account_state =
+        store_assert_is_empty_except_account_state(store, blob_store, include_registry).await;
     assert!(
-        vault_accounts.is_empty(),
-        "Found zero-access vault records of accounts {vault_accounts:?}"
+        account_state.vault_accounts.is_empty(),
+        "Found zero-access vault records of accounts {:?}",
+        account_state.vault_accounts
+    );
+    assert!(
+        account_state.share_notification_accounts.is_empty(),
+        "Found share notifications of accounts {:?}",
+        account_state.share_notification_accounts
     );
 }
 
+/// The keys that live exactly as long as their account, which the emptiness
+/// check leaves to its caller: the caller checks that each account still
+/// exists.
+#[derive(Debug, Default)]
+pub struct AccountState {
+    /// Accounts holding a zero-access vault or pin record (kept).
+    pub vault_accounts: Vec<u32>,
+    /// Accounts that held share notifications (deleted with the logs).
+    pub share_notification_accounts: Vec<u32>,
+}
+
 /// Like `store_assert_is_empty`, but returns the accounts holding a
-/// zero-access vault record instead of reporting them. The caller must check
-/// that each account still exists: a vault record lives exactly as long as
-/// its account.
+/// zero-access vault record or a share notification instead of reporting
+/// them. The caller must check that each account still exists.
 #[allow(unused_variables)]
 #[must_use]
-pub async fn store_assert_is_empty_except_vaults(
+pub async fn store_assert_is_empty_except_account_state(
     store: &Store,
     blob_store: BlobStore,
     include_registry: bool,
-) -> Vec<u32> {
+) -> AccountState {
+    // 0.16 also expired the in-memory keys kept in the data store here
+    // (`store_lookup_expire_all`). 1.0 keeps no in-memory values in the data
+    // store: `InMemoryStore` has no data-store variant, so that step has no
+    // subject.
     store_blob_expire_all(store).await;
-    store_lookup_expire_all(store).await;
-    for shard_idx in 0..=u8::MAX {
-        store
-            .purge_blobs(blob_store.clone(), shard_idx)
-            .await
-            .unwrap();
-    }
+    store.purge_blobs_all_shards(blob_store).await.unwrap();
     store.purge_store().await.unwrap();
 
     let store = store.clone();
     let mut failed = false;
     let mut delete_batch = BatchBuilder::new();
     let mut vault_accounts = Vec::new();
+    let mut share_notification_accounts = Vec::new();
 
-    for (subspace, with_values) in [
-        (SUBSPACE_ACL, true),
-        (SUBSPACE_TASK_QUEUE, true),
-        (SUBSPACE_IN_MEMORY_VALUE, true),
-        (SUBSPACE_IN_MEMORY_COUNTER, false),
-        (SUBSPACE_PROPERTY, true),
-        (SUBSPACE_QUEUE_MESSAGE, true),
-        (SUBSPACE_QUEUE_EVENT, true),
-        (SUBSPACE_REPORT_OUT, true),
-        (SUBSPACE_REPORT_IN, true),
-        (SUBSPACE_DELETED_ITEMS, true),
-        (SUBSPACE_SPAM_SAMPLES, true),
-        (SUBSPACE_BLOB_LINK, true),
-        (SUBSPACE_BLOBS, true),
-        (SUBSPACE_COUNTER, false),
-        (SUBSPACE_QUOTA, false),
-        (SUBSPACE_INDEXES, false),
-        (SUBSPACE_TELEMETRY_SPAN, true),
-        (SUBSPACE_TELEMETRY_METRIC, true),
-        (SUBSPACE_SEARCH_INDEX, true),
-        (SUBSPACE_REGISTRY, true),
-        (SUBSPACE_REGISTRY_IDX, false),
-        (SUBSPACE_REGISTRY_PK, true),
-        (SUBSPACE_DIRECTORY, true),
-    ] {
-        if subspace == SUBSPACE_SEARCH_INDEX && store.is_pg_or_mysql() {
-            continue;
-        }
-
-        let from_key = AnyKey {
-            subspace,
-            key: vec![0u8],
+    for subspace in Subspace::ALL.iter().copied() {
+        let rule = subspace_rule(subspace);
+        let with_values = match rule {
+            Rule::InternalSearch if store.is_pg_or_mysql() => continue,
+            Rule::Leftover { with_values } => with_values,
+            Rule::RegistryIndex => false,
+            Rule::Logs => false,
+            Rule::Counters
+            | Rule::RegistryItems
+            | Rule::RegistryPrimaryKey
+            | Rule::Properties
+            | Rule::System
+            | Rule::InternalSearch => subspace.shape() != Shape::Presence,
         };
-        let to_key = AnyKey {
-            subspace,
-            key: vec![u8::MAX; 10],
-        };
+        let (from_key, to_key) = subspace_range(subspace);
 
         store
             .iterate(
                 IterateParams::new(from_key, to_key).set_values(with_values),
                 |key, value| {
-                    match subspace {
-                        SUBSPACE_COUNTER
-                            if key.len() == U32_LEN + 1
-                                || key.len() == U32_LEN
-                                || key.len() == U16_LEN =>
-                        {
-                            // Message ID, change ID counters and registry counters
-                            if key.len() != U16_LEN {
-                                // Keep registry counters, delete the rest
+                    match rule {
+                        Rule::Counters => {
+                            let kind = key.first().copied().unwrap_or(u8::MAX);
+                            if kind == CounterKind::DocumentId.byte()
+                                || kind == CounterKind::ChangeId.byte()
+                            {
+                                // Document-id and change-id counters
                                 delete_batch.clear(ValueClass::Any(AnyClass {
                                     subspace,
                                     key: key.to_vec(),
                                 }));
+                                return Ok(true);
+                            } else if kind == CounterKind::RegistryId.byte() {
+                                // Registry id counters are kept
+                                return Ok(true);
                             }
-                            return Ok(true);
-                        }
-                        SUBSPACE_INDEXES => {
                             println!(
-                                concat!(
-                                    "Found index key, account {}, collection {}, ",
-                                    "document {}, property {}, value {:?}: {:?}"
-                                ),
-                                u32::from_be_bytes(key[0..4].try_into().unwrap()),
-                                key[4],
-                                u32::from_be_bytes(key[key.len() - 4..].try_into().unwrap()),
-                                key[5],
-                                String::from_utf8_lossy(&key[6..key.len() - 4]),
-                                key
+                                "Found counter of kind {kind}: {:?} = {:?}",
+                                key,
+                                value.deserialize_be_u64(0).ok()
                             );
                         }
-                        SUBSPACE_REGISTRY | SUBSPACE_DIRECTORY | SUBSPACE_SPAM_SAMPLES => {
+                        Rule::RegistryItems => {
                             let object_id =
                                 ObjectType::from_id(key.deserialize_be_u16(0).unwrap()).unwrap();
 
@@ -343,11 +352,13 @@ pub async fn store_assert_is_empty_except_vaults(
                             let item_id = key.deserialize_be_u64(U16_LEN).unwrap();
 
                             println!(
-                                "Found registry item for object type {:?} and id {}",
-                                object_id, item_id
+                                "Found registry item in {:?} for object type {:?} and id {}",
+                                subspace.name(),
+                                object_id,
+                                item_id
                             );
                         }
-                        SUBSPACE_REGISTRY_IDX => {
+                        Rule::RegistryIndex => {
                             let mut id = key.deserialize_be_u16(0).unwrap();
                             if id == u16::MAX {
                                 id = key.deserialize_be_u16(U16_LEN).unwrap();
@@ -364,9 +375,13 @@ pub async fn store_assert_is_empty_except_vaults(
                                 object_id, key
                             );
                         }
-                        SUBSPACE_REGISTRY_PK => {
+                        Rule::RegistryPrimaryKey => {
                             let mut id = key.deserialize_be_u16(0).unwrap();
-                            if id == u16::MAX {
+                            if id == RegistryClass::REFERENCE_MARKER {
+                                // A reference, which 1.0 prefixes with a marker:
+                                // as at 0.16, its target's type decides
+                                id = key.deserialize_be_u16(U16_LEN).unwrap();
+                            } else if id == u16::MAX {
                                 id = value.deserialize_be_u16(0).unwrap();
                             }
                             let object_id = ObjectType::from_id(id).unwrap();
@@ -375,11 +390,23 @@ pub async fn store_assert_is_empty_except_vaults(
                             }
 
                             println!(
-                                "Found registry primary key for object type {:?}: {:?}",
+                                "Found registry primary key or reference for object type {:?}: {:?}",
                                 object_id, key
                             );
                         }
-                        SUBSPACE_PROPERTY
+                        Rule::Logs => {
+                            // Change-log entries and share notifications, deleted below
+                            if key.len() == U32_LEN + 1 + U64_LEN
+                                && key[U32_LEN] == u8::from(SyncCollection::ShareNotification)
+                            {
+                                let account_id = key.deserialize_be_u32(0).unwrap();
+                                if !share_notification_accounts.contains(&account_id) {
+                                    share_notification_accounts.push(account_id);
+                                }
+                            }
+                            return Ok(true);
+                        }
+                        Rule::Properties
                             if key.len() == U32_LEN + 2 + U32_LEN
                                 && key[U32_LEN] == Collection::Principal as u8
                                 && (key[U32_LEN + 1] == PrincipalField::ZeroAccessVault as u8
@@ -392,10 +419,35 @@ pub async fn store_assert_is_empty_except_vaults(
                             vault_accounts.push(key.deserialize_be_u32(0).unwrap());
                             return Ok(true);
                         }
-                        _ => {
+                        Rule::System
+                            if key == [SystemKind::SchemaVersion as u8]
+                                || (key.len() == 1 + U16_LEN
+                                    && key[0] == SystemKind::NodeId as u8) =>
+                        {
+                            // The schema version and the node-id claims
+                            return Ok(true);
+                        }
+                        Rule::Leftover { with_values: false } if subspace == Subspace::Indexes => {
+                            println!(
+                                concat!(
+                                    "Found index key, account {}, collection {}, ",
+                                    "document {}, property {}, value {:?}: {:?}"
+                                ),
+                                u32::from_be_bytes(key[0..4].try_into().unwrap()),
+                                key[4],
+                                u32::from_be_bytes(key[key.len() - 4..].try_into().unwrap()),
+                                key[5],
+                                String::from_utf8_lossy(&key[6..key.len() - 4]),
+                                key
+                            );
+                        }
+                        Rule::Leftover { .. }
+                        | Rule::Properties
+                        | Rule::System
+                        | Rule::InternalSearch => {
                             println!(
                                 "Found key in {:?}: {:?} ({:?}) = {:?} ({:?})",
-                                char::from(subspace),
+                                subspace.name(),
                                 key,
                                 String::from_utf8_lossy(key),
                                 value,
@@ -413,37 +465,21 @@ pub async fn store_assert_is_empty_except_vaults(
     }
 
     // Delete logs and counters
-    store
-        .delete_range(
-            AnyKey {
-                subspace: SUBSPACE_LOGS,
-                key: &[0u8],
-            },
-            AnyKey {
-                subspace: SUBSPACE_LOGS,
-                key: &[
-                    u8::MAX,
-                    u8::MAX,
-                    u8::MAX,
-                    u8::MAX,
-                    u8::MAX,
-                    u8::MAX,
-                    u8::MAX,
-                ],
-            },
-        )
-        .await
-        .unwrap();
+    let (from_key, to_key) = subspace_range(Subspace::Logs);
+    store.delete_range(from_key, to_key).await.unwrap();
 
     if !delete_batch.is_empty() {
-        store.write(delete_batch.build_all()).await.unwrap();
+        store.write_batch(&mut delete_batch).await.unwrap();
     }
 
     if failed {
         panic!("Store is not empty.");
     }
 
-    vault_accounts
+    AccountState {
+        vault_accounts,
+        share_notification_accounts,
+    }
 }
 
 fn is_allowed_registry_type(object_type: ObjectType) -> bool {

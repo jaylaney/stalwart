@@ -17,6 +17,13 @@ import tomllib
 TARGET = "x86_64-unknown-linux-gnu"
 CPU_BASELINE = "x86-64-v2"
 COMMIT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+# Upstream release tags the verifier can resolve without a local tag (final review D7).
+# Upstream's tags are lightweight, and a release checkout fetches none of them. Pin the
+# new tag here when merging an upstream release, as `git ls-remote` against upstream reports it.
+PINNED_UPSTREAM_TAGS = {
+    "v0.16.27": "aa47d8ef7bfba7200d3293198ac2592747b20e73",
+    "v1.0.1": "23b69755cb3cd8ecd952fe0443c5ac067a506184",
+}
 
 
 def load_metadata(root):
@@ -32,6 +39,26 @@ def load_metadata(root):
     if manifest.get("package", {}).get("version") != metadata["version"]:
         raise ValueError("shipping package version does not match fork-release.toml")
     return metadata
+
+
+def verify_upstream_version(root, metadata):
+    """The pinned upstream tag's version equals the internal crates' package version.
+
+    The internal crates keep upstream's version (`crates/common/Cargo.toml`), and every
+    upstream merge brings the new one. So a pin left unchanged after a merge (for example
+    `v0.16.27` on a 1.0.1 base) is refused even when no later upstream tag is known
+    (`PINNED_UPSTREAM_TAGS` not extended, no local upstream tags): the Task 9 review's M1.
+    """
+    with (root / "crates/common/Cargo.toml").open("rb") as source:
+        crate_version = tomllib.load(source).get("package", {}).get("version")
+    tag = metadata["upstream_tag"]
+    if not isinstance(crate_version, str) or not crate_version:
+        raise ValueError("crates/common/Cargo.toml has no package version")
+    if tag.removeprefix("v") != crate_version:
+        raise ValueError(
+            f"upstream_tag {tag} does not match the internal crates' version {crate_version} "
+            "(crates/common/Cargo.toml); fork-release.toml's upstream pin is stale"
+        )
 
 
 def validate_identity(metadata, version_output, help_output, source_commit, ref):
@@ -67,6 +94,63 @@ def verify_checkout(root, source_commit):
         raise ValueError("release checkout has tracked modifications")
 
 
+def git_status(root, *args):
+    return subprocess.run(
+        ["git", "-C", str(root), *args], capture_output=True, text=True, timeout=30
+    )
+
+
+def is_ancestor(root, ancestor, descendant):
+    result = git_status(root, "merge-base", "--is-ancestor", ancestor, descendant)
+    if result.returncode not in (0, 1):
+        raise ValueError(
+            f"cannot check whether {ancestor} is an ancestor of {descendant} "
+            "(a shallow checkout? fetch the full history)"
+        )
+    return result.returncode == 0
+
+
+def local_upstream_tags(root):
+    """Local `v*` tags, the names upstream's releases use, as {tag: commit}."""
+    listing = git_status(
+        root, "for-each-ref", "--format=%(refname:strip=2) %(objectname) %(*objectname)",
+        "refs/tags/v*",
+    )
+    if listing.returncode != 0:
+        raise ValueError("cannot list the checkout's tags")
+    tags = {}
+    for line in listing.stdout.splitlines():
+        name, *objects = line.split()
+        tags[name] = objects[-1]
+    return tags
+
+
+def verify_upstream(root, metadata, source_commit):
+    """Final review D7: the pinned upstream commit is the one the tag names, it is in the
+    source's history, and no later known upstream release is."""
+    tag, commit = metadata["upstream_tag"], metadata["upstream_commit"]
+    local = local_upstream_tags(root)
+    names = {source: known[tag] for source, known in
+             (("local tag", local), ("pinned tag", PINNED_UPSTREAM_TAGS)) if tag in known}
+    if not names:
+        raise ValueError(
+            f"upstream tag {tag} is neither a local tag nor in PINNED_UPSTREAM_TAGS; fetch it "
+            "by URL or pin it"
+        )
+    for source, named in names.items():
+        if named != commit:
+            raise ValueError(f"upstream_tag {tag} ({source}) names {named}, not upstream_commit "
+                             f"{commit}")
+    if not is_ancestor(root, commit, source_commit):
+        raise ValueError(f"upstream_commit {commit} is not an ancestor of the source")
+    for later, named in sorted({**PINNED_UPSTREAM_TAGS, **local}.items()):
+        if (named != commit and git_status(root, "cat-file", "-e", f"{named}^{{commit}}")
+                .returncode == 0 and is_ancestor(root, named, source_commit)
+                and is_ancestor(root, commit, named)):
+            raise ValueError(f"upstream {later} ({named}) is merged after the pinned {tag}; "
+                             "fork-release.toml is stale")
+
+
 def minimum_glibc(binary, root):
     with (root / ".cargo/config.toml").open("rb") as source:
         config = tomllib.load(source)
@@ -98,6 +182,8 @@ def main():
     try:
         metadata = load_metadata(root)
         verify_checkout(root, args.source_commit)
+        verify_upstream_version(root, metadata)
+        verify_upstream(root, metadata, args.source_commit)
         binary_environment = os.environ.copy()
         binary_environment.pop("CONFIG_PATH", None)
         version = command_output([str(binary), "--version"], env=binary_environment)

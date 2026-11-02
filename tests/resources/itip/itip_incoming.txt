@@ -59,7 +59,7 @@ from: a@example.com
 to: b@example.com
 summary: invite
 summary.attendee: Participants([ItipParticipant { email: "a@example.com", name: None, is_organizer: true }, ItipParticipant { email: "b@example.com", name: None, is_organizer: false }])
-summary.dtstart: Time(ItipTime { start: 889034400, tz_id: 32768 })
+summary.dtstart: Time(ItipTime { start: 889034400, tz_id: 32768, kind: DateTime })
 summary.location: Text("Conference Room A")
 summary.summary: Text("Review Accounts")
 BEGIN:VCALENDAR
@@ -109,7 +109,7 @@ from: a@example.com
 to: b@example.com
 summary: invite
 summary.attendee: Participants([ItipParticipant { email: "a@example.com", name: None, is_organizer: true }, ItipParticipant { email: "b@example.com", name: None, is_organizer: false }])
-summary.dtstart: Time(ItipTime { start: 889034400, tz_id: 32768 })
+summary.dtstart: Time(ItipTime { start: 889034400, tz_id: 32768, kind: DateTime })
 summary.location: Text("Conference Room A")
 summary.summary: Text("Review Accounts")
 BEGIN:VCALENDAR

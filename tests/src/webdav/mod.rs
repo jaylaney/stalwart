@@ -7,7 +7,6 @@
 use crate::utils::server::TestServerBuilder;
 pub use crate::utils::za::key_accounts_mode;
 use ahash::AHashMap;
-use common::{DavResource, DavResources};
 use groupware::DavResourceName;
 use hyper::StatusCode;
 use registry::{
@@ -44,9 +43,13 @@ pub mod za_variants;
 
 // In key-account mode MKCALENDAR seals the new collection, and the sealed
 // preferences name (marker, envelope, padded bundle) is charged against the
-// account quota (Calendar::size). Upstream's put_get quota test expects room
-// for a calendar PUT in the 1024-byte quota, so key accounts get this extra.
-const SEALED_COLLECTION_QUOTA_OVERHEAD: u64 = 640;
+// account quota (Calendar::size); a sealed event is charged more than its
+// content too. Upstream's put_get quota test expects room for two calendar
+// PUTs in the 1024-byte quota, so key accounts get this extra. At 1.0 the
+// sealed collection charges 491 bytes more than an ordinary one and a sealed
+// event 485 bytes more than its content (measured; 1.0 checks the whole
+// charge at commit, where 0.16 checked the content's length before writing).
+const SEALED_COLLECTION_QUOTA_OVERHEAD: u64 = 491 + 2 * 485;
 
 #[tokio::test(flavor = "multi_thread")]
 pub async fn webdav_tests() {
@@ -258,16 +261,6 @@ pub async fn webdav_tests() {
     // Remove test data
     if test.is_reset() {
         test.temp_dir.delete();
-    }
-}
-
-pub trait DavResourcesTest {
-    fn items(&self) -> Vec<DavResource>;
-}
-
-impl DavResourcesTest for DavResources {
-    fn items(&self) -> Vec<DavResource> {
-        self.resources.clone()
     }
 }
 

@@ -6,10 +6,13 @@
 
 use super::STRONG;
 use crate::{
-    utils::{server::TestServer, webdav::DummyWebDavClient},
+    utils::{
+        server::TestServer,
+        webdav::DummyWebDavClient,
+        za::{za_grant_token, za_revoke_grant},
+    },
     webdav::{TEST_ICAL_1, TEST_ICAL_2},
 };
-use common::auth::oauth::GrantType;
 use hyper::StatusCode;
 
 const CALENDAR_QUERY: &str = r#"<?xml version="1.0" encoding="utf-8" ?>
@@ -99,18 +102,13 @@ pub async fn test(test: &mut TestServer) {
     // address book answers) but carries no keys, so calendar paths refuse
     // it (spec 4.2). Minted in-process: it is the token the server issues at
     // the end of an OAuth flow, and the tests crate has no OAuth client.
-    let token = test
-        .server
-        .encode_access_token(
-            GrantType::AccessToken,
-            key1_id,
-            "key1@example.com",
-            3600,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+    // 1.0 accepts only grant-backed access tokens.
+    let (key_grant, token) = za_grant_token(
+        &test.server,
+        "key1@example.com",
+        common::auth::oauth::scope::OAuthScopes::ALL,
+    )
+    .await;
     let mut bearer_client =
         DummyWebDavClient::new(key1_id, "key1@example.com", STRONG, "key1@example.com");
     bearer_client.credentials = format!("Bearer {token}");
@@ -139,18 +137,12 @@ pub async fn test(test: &mut TestServer) {
         .with_status(StatusCode::FORBIDDEN);
     // Control: a Bearer token of the non-key account reads its own calendars.
     let plain_id = plain.id().document_id();
-    let token = test
-        .server
-        .encode_access_token(
-            GrantType::AccessToken,
-            plain_id,
-            plain.name(),
-            3600,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+    let (plain_grant, token) = za_grant_token(
+        &test.server,
+        plain.name(),
+        common::auth::oauth::scope::OAuthScopes::ALL,
+    )
+    .await;
     let mut plain_bearer =
         DummyWebDavClient::new(plain_id, plain.name(), plain.secret(), plain.name());
     plain_bearer.credentials = format!("Bearer {token}");
@@ -158,6 +150,9 @@ pub async fn test(test: &mut TestServer) {
         .request("PROPFIND", "/dav/cal/plain@example.com/", "")
         .await
         .with_status(StatusCode::MULTI_STATUS);
+    for grant in [key_grant, plain_grant] {
+        za_revoke_grant(&test.server, grant).await;
+    }
     // Another user without any grant: 403 (as upstream), unchanged.
     plain_client
         .request("PROPFIND", "/dav/cal/key1@example.com/", "")

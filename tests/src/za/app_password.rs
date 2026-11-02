@@ -162,7 +162,10 @@ async fn bump_registry_revision(test: &TestServer) {
         .unwrap();
     let old_object = Object::with_revision(object.inner.clone(), object.revision);
     let mut inner = object.inner;
-    let ObjectInner::Account(structs::Account::User(user)) = &mut inner else {
+    let ObjectInner::Account(account) = &mut inner else {
+        panic!("not an account");
+    };
+    let structs::Account::User(user) = account.as_mut() else {
         panic!("not a user account");
     };
     user.description = Some(format!("Key Seven, revision {}", object.revision));
@@ -449,8 +452,7 @@ pub async fn test(test: &mut TestServer) {
     );
     assert!(registry_app_ids(test).await.contains(&replacement_id));
     test.server
-        .invalidate_local_caches(&[CacheInvalidation::AccessToken(id)])
-        .await;
+        .invalidate_local_caches(&[CacheInvalidation::AccessToken(id)]);
     caldav(&replacement, StatusCode::MULTI_STATUS).await;
     revoke(replacement_id).await.expect(200);
 
@@ -470,8 +472,7 @@ pub async fn test(test: &mut TestServer) {
     let (desk, desk_id) = create("Desk").await;
     caldav(&desk, StatusCode::MULTI_STATUS).await;
     test.server
-        .invalidate_local_caches(&[CacheInvalidation::AccessToken(id)])
-        .await;
+        .invalidate_local_caches(&[CacheInvalidation::AccessToken(id)]);
     let parked = park_login(id, NAME, &desk).await;
     revoke(desk_id).await.expect(200);
     assert_eq!(parked.finish().await, 207, "verified before the revocation");
