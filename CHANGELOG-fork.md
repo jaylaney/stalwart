@@ -6,18 +6,17 @@ The inherited [CHANGELOG.md](CHANGELOG.md) records upstream Stalwart history.
 
 ## Unreleased
 
-## 0.2.0-beta.1 — candidate, not yet released
+## 0.2.0-beta.1 — 2026-11-02
 
-A limited prerelease on upstream Stalwart `v1.0.1`. The immutable tag will be
-`fork-v0.2.0-beta.1`; the release date, the tag and the published notes are set at
-publication, which needs its own authorization. Until its pending gates pass (below) it
-must stay a prerelease and claims no general client or production readiness.
+Immutable tag: `fork-v0.2.0-beta.1`. A limited prerelease on upstream Stalwart `v1.0.1`,
+published as a GitHub prerelease. It claims no general client or production readiness until
+its pending gates (below) pass.
 
 ### Provenance
 
-- Fork source: the commit resolved by `git rev-parse 'fork-v0.2.0-beta.1^{commit}'` once the
-  tag exists. The published release notes and shipped `stalwart.provenance.json` record the
-  exact full commit.
+- Fork source: the commit the tag `fork-v0.2.0-beta.1` names, resolved by
+  `git rev-parse 'fork-v0.2.0-beta.1^{commit}'`. The published release notes and shipped
+  `stalwart.provenance.json` record the exact full commit.
 - Fully integrated upstream base: Stalwart `v1.0.1`, commit
   `23b69755cb3cd8ecd952fe0443c5ac067a506184`
   ([release notes](https://github.com/stalwartlabs/stalwart/releases/tag/v1.0.1)), fetched
@@ -88,30 +87,44 @@ sharing and key-account mail sharing remain refused or deferred.
 The [upgrade outcome](docs/superpowers/plans/2026-10-27-stalwart-1-upgrade-outcome.md)
 records every command and result; its "Final record" section indexes them. In summary:
 
-- The test matrix, the coverage net and both C10 gates ran at `f135a9881`, every row green
+- The test matrix, the coverage net and the test retention gates (the design's C10 inventory
+  and coverage gates) ran at `f135a9881`, every row green
   (documented SMTP flakes passed rerun by name). CI's `test.yml` at `2867bc24f`, the
-  candidate's last code change,
+  last code change before PR #69's review,
   [run 41432100574](https://github.com/jaylaney/stalwart/actions/runs/41432100574), passed
   every job: style and the gates' workflow check, unit tests (593 passed), upstream's suites,
   the zero-access suites in both blob-store modes and in plain and key mode, the independent
   python-caldav client (plain 68 passed, 3 xfailed; key 74 passed, 2 xfailed), the fresh
-  store restart gate, and the C10 inventory and coverage gates (full 21,599 / 22,335 and
+  store restart gate, and the test retention gates (full 21,599 / 22,335 and
   runtime-only 12,537 / 13,197 covered lines, each 72 and 44 lines above the 0.16.27
   baseline's fraction).
-- Release-preparation checks: 9 release-metadata tests and 21 product-verifier tests passed.
-  A local shipping-configuration build at `2867bc24f` (macOS arm64, not a release artifact)
-  printed the expected identity and carried no enterprise or test feature.
+- PR #69's review found two port regressions (the setup-token request's concurrency slot,
+  and a delegated PUT that could exceed the recipient limit), fixed with tests in
+  `4a3dcde7f` and `7b088e8dc`. CI's `test.yml` on the PR's final commit `b69bb841b`,
+  [run 41472049105](https://github.com/jaylaney/stalwart/actions/runs/41472049105), passed
+  every job that runs on pull requests (the test retention gates run only weekly and on
+  dispatch).
+- The test retention gates were run again on `main` at `32d264cba`
+  ([run 41484056674](https://github.com/jaylaney/stalwart/actions/runs/41484056674))
+  alongside the release build; the published release notes record their result.
+- Release-preparation checks, rerun at the preparation commit: 9 release-metadata tests
+  (`python3 -I scripts/tests/test_release_metadata.py`) and 25 product-verifier tests
+  (`python3 -B -I -m unittest discover -s scripts/release -p 'test_*.py'`) passed. A local
+  shipping-configuration build at `2867bc24f` (macOS arm64, not a release artifact) printed
+  the expected identity and carried no enterprise or test feature.
 - The final whole-branch review ran as four Fable lenses and two scoped re-reviews; no
   Critical or Important finding remains.
 
-Pending gates, each needing its own authorization or session:
+Pending gates:
 
-- the exact-source Linux shipping build and its verification through `product-build.yml`
-  (checksum, attestation, CPU baseline and measured GLIBC requirement of the real
-  artifact); no Linux artifact of this candidate has been qualified;
+- the exact-source Linux shipping build and its verification run from the tag through
+  `product-build.yml`. The published release notes record that run, the checksums, the
+  attestation and the measured GLIBC requirement of the real artifact; this entry predates
+  the build and records none of them;
 - the native Apple Calendar (macOS and iOS), Thunderbird, DAVx5 and mail-client checklist
-  against that build, under the [manual checklist](docs/zero-access/manual-checklist.md);
-  results from the `0.1.x` base are not evidence for this candidate;
+  against the published build, under the
+  [manual checklist](docs/zero-access/manual-checklist.md); results from the `0.1.x` base
+  are not evidence for this release;
 - a clean-context whole-branch review: the final review's four lenses were given the
   execution ledger and its rulings, which is not the clean context the plan specifies.
 
