@@ -526,17 +526,26 @@ upstream's messages for it:
    or of the master is carried, and the message's iTIP summary holds only
    the instances' RECURRENCE-ID times. The CANCEL is then split per
    recipient as above. An instance the address attends again gets none;
-   the recipient learns only the RECURRENCE-IDs of instances it was on. The
+   the recipient learns only the RECURRENCE-IDs and committed SEQUENCE of
+   instances it was on (the SEQUENCE is inherent: the copy's merge refuses a
+   CANCEL below the copy's own as `OutOfSequence`, so the recipient can
+   tell how many significant revisions followed its removal). The
    coverage skip below does not apply while the entry records instance
    keys, and the instances retire with the entry. An entry whose instances
    overflowed (`all`) keeps the behaviour without the record, a recorded
    limit, as does a master CANCEL (never recorded: it cancels every
-   instance of the copy); so does an override CANCEL whose instance the
+   instance of the copy), so an attendee removed from the master while an
+   override still names it keeps a stale master once the full state
+   replaces the withheld CANCEL (upgrade ruling 139); so does an override CANCEL whose instance the
    copy holds at a higher SEQUENCE than the master's when the tree has no
    component for it (the drain answers `OutOfSequence`); and so does an
    address the tree marks SCHEDULE-AGENT=CLIENT or NONE wherever it names
    it: the server does not schedule for it (RFC 6638), so no replay is
-   built and the entry is dropped, which is correct. A split error of
+   built and the entry is dropped, which is correct. A master attendee
+   with recorded instances gets the full state with the CANCEL even where
+   the change's own REQUEST would have covered it; the CANCEL then meets
+   an instance the slice's EXDATE already removed and adds a cancelled
+   override, as the accepted A2 case does (upgrade ruling 139). A split error of
    the full state is a failure (`5.1`, the entry kept), not "nothing to
    send" (upgrade ruling 135);
    for an attendee, the refused instances' current participation (section 6.4's

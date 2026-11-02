@@ -8485,8 +8485,9 @@ Commits:
     `recurrence_times`: one DTSTART field per cancelled instance at its RECURRENCE-ID's time
     (`recurrence_time` for an instance in the tree; for one generated from the master, the
     recorded instant in the master's time zone), and no guest list.
-  - So the recipient learns only the RECURRENCE-IDs of instances it was on, as ruling 132's
-    cost and spec 5.1 say.
+  - So the recipient learns only the RECURRENCE-IDs and committed SEQUENCE of instances it
+    was on, as ruling 132's cost and spec 5.1 say (NR1, ruling 160: the SEQUENCE is inherent,
+    since the copy's merge refuses a CANCEL below its own SEQUENCE).
 - **Ruling 153 (N2): the replay goes even when the slice is empty** (`za_full_state_for`).
   The CANCEL's recipients are the address forms the slice reached, as before; when the slice
   is empty, they are the forms the tree names for the recipient on an ATTENDEE the server
@@ -8531,7 +8532,8 @@ Commits:
 Section 5.1, item (1), describes ruling 152's reduced component and summary, with the DTSTART
 reason. It describes ruling 153's replay without a slice, and retirement only once the replay
 is delivered. The SCHEDULE-AGENT=CLIENT or NONE limit joins ruling 139's limits. Its sentence
-"the recipient learns only the RECURRENCE-IDs of instances it was on" now holds.
+"the recipient learns only the RECURRENCE-IDs and committed SEQUENCE of instances it was on"
+now holds (worded so by Task 9, NR1).
 
 ##### Limits recorded (added to part 7f1's list)
 
