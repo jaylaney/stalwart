@@ -25,11 +25,12 @@ use crate::{
         server::TestServer,
         smtp::SmtpConnection,
         za::{
-            Conn, HookParked, delete_event_records, hold_index_partition, index_search_documents,
-            internal_search, partition_status, plant_event, queue_entries, release_index_partition,
-            search_keys, stored_event, unindex_search_account, unindex_search_documents,
-            wait_for_delivery, wait_for_index_queue, write_stored_event, za_post_as, za_setup,
-            za_setup_token,
+            Conn, HookParked, delete_event_records, destroy_inbox_item, envelope_wrap,
+            hold_index_partition, inbox_items, index_search_documents, internal_search,
+            open_pending_item_as, partition_status, plant_event, queue_entries,
+            release_index_partition, search_keys, stored_event, unindex_search_account,
+            unindex_search_documents, wait_for_delivery, wait_for_index_queue, write_stored_event,
+            za_post_as, za_setup, za_setup_token,
         },
     },
     za::{
@@ -58,7 +59,7 @@ use email::{
     },
 };
 use groupware::calendar::{
-    CalendarEventData,
+    CalendarEventData, EVENT_NOTIFICATION_ZA_PENDING,
     seal::{WRAP_MK, WRAP_PK},
 };
 use mail_parser::MessageParser;
@@ -743,7 +744,9 @@ async fn forward_race_with_a_staged_blob(test: &TestServer, admin: &Account) -> 
 /// own; that batch takes the fence too, so provisioning in between leaves
 /// no plaintext calendar data. The invitation comes from a local organizer
 /// through authenticated submission, as upstream's iMIP gate requires (an
-/// authenticated sender; a local principal's invitation is auto-added).
+/// authenticated sender; a local principal's invitation is auto-added). The
+/// sealed retry writes a `pk`-sealed mail-borne pending item and no event
+/// (iMIP spec 4.1, 8.5), which the test deletes.
 async fn forward_race_imip_side_write(test: &TestServer, admin: &Account) -> (Account, Account) {
     println!("forward_race_imip_side_write");
     let account = passwordless(admin, FENCE10).await;
@@ -768,7 +771,25 @@ async fn forward_race_imip_side_write(test: &TestServer, admin: &Account) -> (Ac
     assert_eq!(ids.len(), 1, "the queue's retry delivered the message");
     assert_sealed(test, id, ids[0], WRAP_PK).await;
     assert_no_plaintext(test, id).await;
-    assert_no_calendar_data(test, id, "the sealed retry").await;
+    // iMIP spec 4.1, 8.5: the sealed retry stores no event and one pending
+    // item sealed to the served key, the organizer in its carrier (before
+    // release 5, no calendar data at all).
+    assert!(
+        !test
+            .server
+            .za_has_documents(id, Collection::CalendarEvent)
+            .await
+            .unwrap(),
+        "the sealed retry stored an event"
+    );
+    let items = inbox_items(test, id).await;
+    assert_eq!(items.len(), 1, "the sealed retry's inbox items");
+    let (item_id, item) = &items[0];
+    assert_ne!(item.flags & EVENT_NOTIFICATION_ZA_PENDING, 0);
+    assert_eq!(envelope_wrap(&item.event), Some(WRAP_PK));
+    let (_, carriers) = open_pending_item_as(test, id, STRONG, *item_id).await;
+    assert_eq!(carriers.sender.as_deref(), Some(ORGANIZER));
+    destroy_inbox_item(test, id, *item_id).await;
     (account, organizer)
 }
 

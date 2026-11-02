@@ -172,6 +172,7 @@ pub async fn za_tests() {
     drain::incoming_timezone_update_survives_seal(&mut test).await;
     drain_limits::test(&mut test).await;
     pinning::test(&mut test).await;
+    imip::inbound::test(&mut test).await;
     imip::outbound::test(&mut test).await;
     sharing_move_atomic::test(&mut test).await;
     sharing_tombstones::test(&mut test).await;

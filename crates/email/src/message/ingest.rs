@@ -15,7 +15,10 @@ use crate::{
         messagedata::{EmailMessageData, MessageData, PendingMessageData},
         metadata::{AddressHeader, ExtraHeaders, HeaderId, MetadataStructure, Occurrence},
         thread::ThreadFields,
-        za::ingest::{za_index_stub, za_ingest_wrap, za_metadata_refusal, za_stage_sealed},
+        za::{
+            imip::za_imip_item,
+            ingest::{za_index_stub, za_ingest_wrap, za_metadata_refusal, za_stage_sealed},
+        },
     },
 };
 use common::{
@@ -505,7 +508,6 @@ impl EmailIngest for Server {
                 // iMIP processing
                 if self.core.groupware.itip_enabled
                     && !is_spam
-                    && !za_key
                     && sender_authentication.is_authenticated()
                     && params
                         .access_token
@@ -522,6 +524,24 @@ impl EmailIngest for Server {
                                 && ct.has_attribute("method")
                         }) && let Some(itip_message) = part.text()
                         {
+                            // iMIP spec 4.1: a key account's part becomes a
+                            // sealed mail-borne item, never `itip_ingest`, and
+                            // nothing reaches `itip_messages`.
+                            if za_key {
+                                Box::pin(za_imip_item(
+                                    self,
+                                    &account,
+                                    za_wrap.as_ref(),
+                                    &itip_message,
+                                    sender_authentication,
+                                    envelope_from,
+                                    &message,
+                                    deliver_to,
+                                    params.session_id,
+                                ))
+                                .await;
+                                continue;
+                            }
                             if itip_message.len() < self.core.groupware.itip_inbound_max_ical_size {
                                 if let Some(sender) = sender.get_or_insert_with(|| {
                                     if sender_authentication == SenderAuthentication::Submission {

@@ -1145,6 +1145,17 @@ pub async fn new_inbox_items(
         .collect()
 }
 
+/// The account's mail-borne inbox items (iMIP spec 4.2, D4), pending or
+/// drained, by ascending document id: the rows whose `changed_by` is
+/// `CalendarAddress("")`.
+pub async fn mail_borne_items(test: &TestServer, account_id: u32) -> Vec<(u32, InboxItem)> {
+    inbox_items(test, account_id)
+        .await
+        .into_iter()
+        .filter(|(_, item)| item.changed_by == ChangedBy::CalendarAddress(String::new()))
+        .collect()
+}
+
 /// The wrap type of a stored tree's `X-ZA-KEY` envelope (`1` mk, `2` pk), or
 /// `None` when the root does not end with one.
 pub fn envelope_wrap(ical: &ICalendar) -> Option<u8> {

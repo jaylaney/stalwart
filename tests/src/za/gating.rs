@@ -13,13 +13,16 @@ use crate::utils::{
     jmap::{JmapResponse, JmapUtils},
     server::TestServer,
     webdav::DummyWebDavClient,
-    za::{SERVER_URL, mail_count, plant_event, wait_for_delivery},
+    za::{
+        SERVER_URL, delete_inbox_item, inbox_ids, mail_count, new_inbox_items, pending_ids,
+        plant_event, wait_for_delivery,
+    },
 };
 use common::auth::oauth::GrantType;
 use dav_proto::schema::property::{DavProperty, PrincipalProperty};
 use groupware::cache::GroupwareCache;
 use groupware::calendar::{
-    CalendarEvent, CalendarEventContent,
+    CalendarEvent, CalendarEventContent, ChangedBy, EVENT_NOTIFICATION_ZA_PENDING,
     itip::{ItipIngest, RsvpError, RsvpRequest, RsvpResponse},
 };
 use hyper::StatusCode;
@@ -526,6 +529,8 @@ pub async fn test_scheduling(test: &mut TestServer) {
     // that does not move shows the sender sent nothing.
     let plain_mail = mail_count(test, plain_id).await;
     let key_mail = mail_count(test, key1_id).await;
+    // key1's inbox items before this test, so it deletes only its own.
+    let key_items = inbox_ids(test, key1_id).await;
 
     // Organizer is a key account (invitations spec 5.1, `SendSealed`): the
     // schedule tag is set as upstream sets it. plain is a non-key account,
@@ -646,9 +651,14 @@ pub async fn test_scheduling(test: &mut TestServer) {
     );
 
     // Attendee is a key account: the invitation (and its cancellation) never
-    // reaches its scheduling inbox or calendar. The email itself lands in its
-    // mailbox (mail is not sealed in this release), as the mail-count asserts
-    // below show.
+    // reaches its calendar or the DAV listing of its scheduling inbox. The
+    // email itself lands in its mailbox, as the mail-count asserts below
+    // show, and delivery turns it into a mail-borne pending item, which the
+    // listing hides (iMIP spec 4.1, 4.5, 8.5).
+    let (key_before, key_pending) = (
+        inbox_ids(test, key1_id).await,
+        pending_ids(test, key1_id).await,
+    );
     plain_client
         .request(
             "MKCALENDAR",
@@ -667,9 +677,23 @@ pub async fn test_scheduling(test: &mut TestServer) {
         .await
         .with_status(StatusCode::CREATED);
     wait_for_delivery(test).await;
-    // The invitation email itself was delivered, so the empty inbox and
-    // calendar below are the ingest gate's doing, not timing.
+    // The invitation email itself was delivered, so the empty listing and
+    // calendar below are not timing.
     assert_eq!(mail_count(test, key1_id).await, key_mail + 1);
+    // iMIP spec 4.1, 4.5, 8.5: at store level, one more pending item, a
+    // mail-borne one (the drain is skipped, so nothing imports it).
+    assert_eq!(
+        pending_ids(test, key1_id).await.len(),
+        key_pending.len() + 1,
+        "the plain organizer's invitation left no pending item"
+    );
+    let invited = new_inbox_items(test, key1_id, &key_before).await;
+    assert!(
+        invited.len() == 1
+            && invited[0].1.changed_by == ChangedBy::CalendarAddress(String::new())
+            && invited[0].1.flags & EVENT_NOTIFICATION_ZA_PENDING != 0,
+        "the new item is not one mail-borne pending item"
+    );
     assert_eq!(members(&key_client, key_inbox).await, Vec::<String>::new());
     assert_eq!(members(&key_client, key_cal).await, Vec::<String>::new());
 
@@ -774,10 +798,17 @@ pub async fn test_scheduling(test: &mut TestServer) {
         .await
         .with_status(StatusCode::NO_CONTENT);
     wait_for_delivery(test).await;
-    // The CANCEL email was delivered too; the ingest gate dropped it.
+    // The CANCEL email was delivered too; whatever item delivery made of it
+    // is pending, hidden from the listing (iMIP spec 4.1, 8.5).
     assert_eq!(mail_count(test, key1_id).await, key_mail + 2);
     assert_eq!(members(&key_client, key_inbox).await, Vec::<String>::new());
     assert_eq!(members(&key_client, key_cal).await, Vec::<String>::new());
+    // iMIP spec 8.5: this test's mail-borne items go with it.
+    for id in inbox_ids(test, key1_id).await {
+        if !key_items.contains(&id) {
+            delete_inbox_item(test, &key_client, key1_id, id).await;
+        }
+    }
     plain_client
         .request("DELETE", plain_cal, "")
         .await

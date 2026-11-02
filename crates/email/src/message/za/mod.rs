@@ -6,6 +6,7 @@
 
 //! Zero-access sealing of mail (mail spec 3, 5).
 
+pub mod imip;
 pub mod ingest;
 pub mod seal;
 pub mod sharing;

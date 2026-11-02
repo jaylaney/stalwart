@@ -16,8 +16,8 @@ use crate::utils::{
     za::{
         PlantedItem, destroy_inbox_item, envelope_wrap, hold_task_consumer, inbox_ids,
         inbox_item_is_pending, item_attendees, item_method, item_sequence, itip_tasks_for,
-        mail_count, new_inbox_items, open_pending_item_as, plant_inbox_item, schedule_statuses,
-        wait_for_delivery, za_uid_leases, za_unlock,
+        mail_borne_items, mail_count, new_inbox_items, open_pending_item_as, plant_inbox_item,
+        schedule_statuses, wait_for_delivery, za_uid_leases, za_unlock,
     },
 };
 use ::registry::{
@@ -1160,7 +1160,8 @@ const PLAIN_INVITE: &str = concat!(
 /// Spec 11, task queue: with the consumer held, a key organizer's PUT and
 /// DELETE queue no `CalendarItipMessage` task (they fan out instead); a
 /// plain organizer's PUT does (control), and its invitation reaches key2 as
-/// mail only (test 6).
+/// mail (test 6), which delivery turns into a mail-borne pending item (iMIP
+/// spec 4.1, 4.5, 8.5).
 pub async fn test_task_queue(test: &mut TestServer) {
     println!("Running zero-access task queue tests...");
     let key1 = Party::new(test, "key1@example.com");
@@ -1213,6 +1214,7 @@ pub async fn test_task_queue(test: &mut TestServer) {
         .with_status(StatusCode::CREATED);
     let key2_mail = mail_count(test, key2.id).await;
     let before2 = inbox_ids(test, key2.id).await;
+    let mail_borne2 = mail_borne_items(test, key2.id).await.len();
     let held = hold_task_consumer(test).await;
     plain_client
         .request_with_headers(
@@ -1235,11 +1237,21 @@ pub async fn test_task_queue(test: &mut TestServer) {
         key2_mail + 1,
         "the mail reached key2"
     );
+    // iMIP spec 4.1, 4.5, 8.5: the mail's invitation became one mail-borne
+    // pending item (it was "nothing in key2's inbox" before release 5), its
+    // sender the plain organizer, in the carrier only.
     assert_eq!(
-        inbox_ids(test, key2.id).await,
-        before2,
-        "nothing in key2's inbox"
+        mail_borne_items(test, key2.id).await.len(),
+        mail_borne2 + 1,
+        "one mail-borne item in key2's inbox"
     );
+    let items = new_inbox_items(test, key2.id, &before2).await;
+    assert_eq!(items.len(), 1, "one item in key2's inbox");
+    let (item_id, item) = &items[0];
+    assert_eq!(item.changed_by, ChangedBy::CalendarAddress(String::new()));
+    assert_ne!(item.flags & EVENT_NOTIFICATION_ZA_PENDING, 0);
+    let (_, carriers) = open_pending_item_as(test, key2.id, STRONG, *item_id).await;
+    assert_eq!(carriers.sender.as_deref(), Some("plain@example.com"));
     assert_eq!(
         uid_copies(test, key2.id, "za-fo-plain").await,
         0,
@@ -1265,10 +1277,30 @@ pub async fn test_task_queue(test: &mut TestServer) {
 
 const SHARED_PLAIN: &str = "/dav/cal/plain%40example.com/default/fo-shared.ics";
 
+/// The methods of the account's inbox items written since `before`,
+/// asserting that each is a mail-borne pending item (iMIP spec 4.2, D4).
+async fn new_mail_borne_methods(
+    test: &TestServer,
+    account_id: u32,
+    before: &[u32],
+) -> Vec<Option<ICalendarMethod>> {
+    new_inbox_items(test, account_id, before)
+        .await
+        .iter()
+        .map(|(_, item)| {
+            assert_eq!(item.changed_by, ChangedBy::CalendarAddress(String::new()));
+            assert_ne!(item.flags & EVENT_NOTIFICATION_ZA_PENDING, 0);
+            item_method(&item.event)
+        })
+        .collect()
+}
+
 /// Final review F1: the sending state follows the calendar owner's key
 /// status, not the authenticated account's. key1 (a key account) writes an
 /// invitation into plain's shared calendar: upstream's path, a task and then
-/// mail, for the PUT and for the DELETE; no item and no lease.
+/// mail, for the PUT and for the DELETE; no fan-out item and no lease. Each
+/// mail becomes a mail-borne pending item in key2's inbox at delivery (iMIP
+/// spec 4.1, 4.5, 8.5; plan 15's spec question 1), deleted before cleanup.
 pub async fn test_plain_owner(test: &mut TestServer) {
     println!("Running zero-access plain-owner scheduling tests...");
     let key1 = Party::new(test, "key1@example.com");
@@ -1341,6 +1373,14 @@ pub async fn test_plain_owner(test: &mut TestServer) {
         key2_mail + 1,
         "the invitation reached key2 as mail"
     );
+    // iMIP spec 4.1, 4.5, 8.5 (spec question 1): the mail's REQUEST became
+    // one mail-borne pending item at delivery.
+    assert_eq!(
+        new_mail_borne_methods(test, key2.id, &start2).await,
+        [Some(ICalendarMethod::Request)],
+        "the invitation's mail-borne item"
+    );
+    let after_request = inbox_ids(test, key2.id).await;
 
     // The DELETE (no `Schedule-Reply: F`) follows the owner too: upstream's
     // CANCEL task.
@@ -1356,7 +1396,7 @@ pub async fn test_plain_owner(test: &mut TestServer) {
     );
     assert_eq!(
         inbox_ids(test, key2.id).await,
-        start2,
+        after_request,
         "a plain calendar's CANCEL reached key2's inbox"
     );
     drop(held);
@@ -1366,6 +1406,14 @@ pub async fn test_plain_owner(test: &mut TestServer) {
         key2_mail + 2,
         "the CANCEL reached key2 as mail"
     );
+    // iMIP spec 4.1 step 5, D3, 8.5 (spec question 1): the CANCEL's UID is
+    // known by the pending REQUEST item, so it became a second one.
+    assert_eq!(
+        new_mail_borne_methods(test, key2.id, &after_request).await,
+        [Some(ICalendarMethod::Cancel)],
+        "the CANCEL's mail-borne item"
+    );
+    key2.delete_items_since(test, &start2).await;
 
     // Cleanup: revoke the grant; `plain` outlives the suite, so drop the
     // calendar.

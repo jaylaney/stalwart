@@ -27,6 +27,29 @@ pub const ZA_IMIP_FAILED: &str = "zero-access: iMIP submission failed";
 /// was registered.
 pub const ZA_IMIP_UNREGISTERED: &str = "zero-access: iMIP submitter not registered";
 
+// Delivery (spec 4.1, section 7, D17): the fixed strings of the events
+// `email::message::za::imip::za_imip_item` traces for a key account's
+// inbound iMIP part.
+
+/// The trace details of an iTIP-level refusal at delivery (the reason is
+/// the refusal's fixed name): no item is written.
+pub const ZA_IMIP_NOT_TAKEN: &str = "zero-access: iMIP not taken";
+/// Spec 4.1 step 4: the reason when the sender is a local key account.
+pub const ZA_IMIP_KEY_SENDER: &str = "zero-access: iMIP from a key account";
+/// The reason when the item writer refused the item (the inbound size, the
+/// notification limit or the quota).
+pub const ZA_IMIP_ITEM_REFUSED: &str = "zero-access: inbox item refused";
+/// The reason when a delivery's wrap is the session's keys, which an SMTP
+/// delivery's token never holds: no item is written.
+pub const ZA_IMIP_SESSION_WRAP: &str = "zero-access: iMIP delivery holds session keys";
+/// The details of an error that stopped the item's write.
+pub const ZA_IMIP_WRITE_FAILED: &str = "zero-access: iMIP item not written";
+/// The details of a store error from a lookup keyed by the sender's address
+/// or the UID, traced with its type and the account id only (section 7).
+pub const ZA_IMIP_LOOKUP_FAILED: &str = "zero-access: iMIP sender lookup failed";
+/// Upstream's details for an iMIP part over `itip_inbound_max_ical_size`.
+pub const ZA_IMIP_TOO_LARGE: &str = "iMIP message too large";
+
 /// One (message, recipient) of spec 5.3: the event's account (upstream's
 /// task account), the event's document id, and one message as
 /// `ItipMessages::new` fills it, with `to` the one recipient. No `Debug`:
