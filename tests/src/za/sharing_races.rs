@@ -412,7 +412,7 @@ pub async fn test(test: &mut TestServer) {
     ] {
         let account = test.account(name).id().document_id();
         super::fanout::Party::new(test, name)
-            .delete_items(crate::utils::za::inbox_ids(test, account).await)
+            .delete_items(test, crate::utils::za::inbox_ids(test, account).await)
             .await;
         crate::utils::za::za_unpin(test, account, STRONG).await;
     }
@@ -1231,7 +1231,7 @@ async fn drain_and_contacts_use_current_domain(
         .await
         .with_status(StatusCode::NO_CONTENT);
     super::fanout::Party::new(test, RECEIVER)
-        .delete_items(crate::utils::za::inbox_ids(test, receiver).await)
+        .delete_items(test, crate::utils::za::inbox_ids(test, receiver).await)
         .await;
     test_hooks::set_drain_retry_override(None);
     // The owner source remains for the enclosing calendar cleanup.

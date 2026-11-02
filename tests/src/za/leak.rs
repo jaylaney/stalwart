@@ -1725,17 +1725,7 @@ pub async fn test_drain(test: &mut TestServer) {
     {
         for id in inbox_ids(test, account_id).await {
             if !before.contains(&id) {
-                client
-                    .request(
-                        "DELETE",
-                        &format!(
-                            "/dav/itip/{}/inbox/{id}.ics",
-                            client.name.replace('@', "%40")
-                        ),
-                        "",
-                    )
-                    .await
-                    .with_status(StatusCode::NO_CONTENT);
+                crate::utils::za::delete_inbox_item(test, client, account_id, id).await;
             }
         }
     }
@@ -2671,14 +2661,7 @@ pub async fn test(test: &mut TestServer) {
                 .any(|v| v.contains(&key) && v.ends_with(&format!("missing {KEY_PROP}"))),
             "the scanner must catch the unsealed item:\n{report}"
         );
-        client
-            .request(
-                "DELETE",
-                &format!("/dav/itip/key2%40example.com/inbox/{negative}.ics"),
-                "",
-            )
-            .await
-            .with_status(StatusCode::NO_CONTENT);
+        crate::utils::za::delete_inbox_item(test, &client, id, negative).await;
     }
     key1.request_with_headers(
         "DELETE",
@@ -2689,14 +2672,7 @@ pub async fn test(test: &mut TestServer) {
     .await
     .with_status(StatusCode::NO_CONTENT);
     for item in [request_id, reply_id, drained_id, fan_out_item] {
-        client
-            .request(
-                "DELETE",
-                &format!("/dav/itip/key2%40example.com/inbox/{item}.ics"),
-                "",
-            )
-            .await
-            .with_status(StatusCode::NO_CONTENT);
+        crate::utils::za::delete_inbox_item(test, &client, id, item).await;
     }
 
     test.wait_for_tasks().await;
@@ -3410,14 +3386,7 @@ async fn test_shared_structure(test: &mut TestServer) {
     for (name, id) in [(BOB, bob), (CAROL, carol)] {
         let client = DummyWebDavClient::new(id, name, STRONG, name);
         for item in inbox_ids(test, id).await {
-            client
-                .request(
-                    "DELETE",
-                    &format!("/dav/itip/{}/inbox/{item}.ics", name.replace('@', "%40")),
-                    "",
-                )
-                .await
-                .with_status(StatusCode::NO_CONTENT);
+            crate::utils::za::delete_inbox_item(test, &client, id, item).await;
         }
     }
     test.wait_for_tasks().await;

@@ -198,6 +198,9 @@ const METADATA_WRITER: &str = "plainmail35@example.com";
 /// `dead_property_writes_lose_to_provisioning`'s account (ruling 70), an
 /// ordinary one that writes calendar dead properties over DAV.
 const DEAD_WRITER: &str = "plainmail37@example.com";
+/// `calendar_writes_lose_to_provisioning`'s account (upgrade ruling 173), an
+/// ordinary one that writes calendars and events over DAV.
+const CALENDAR_WRITER: &str = "plainmail39@example.com";
 const PLAIN: &str = "plainmail3@example.com";
 /// The organizer of `forward_race_imip_side_write`'s invitation, which it
 /// sends through authenticated submission.
@@ -264,6 +267,7 @@ pub async fn test(test: &mut TestServer) {
         setup_refuses_object_metadata(test, &admin).await;
     let metadata_writer = metadata_writes_lose_to_provisioning(test).await;
     let dead_writer = dead_property_writes_lose_to_provisioning(test).await;
+    let calendar_writer = calendar_writes_lose_to_provisioning(test).await;
 
     // The accounts that log in empty their own mailboxes; the others are
     // pending or credentialless, and the account's destruction removes
@@ -326,6 +330,7 @@ pub async fn test(test: &mut TestServer) {
         object_metadata_owner,
         metadata_writer,
         dead_writer,
+        calendar_writer,
     ] {
         admin.destroy_account(account).await;
     }
@@ -3303,5 +3308,213 @@ END:VEVENT\r\nEND:VCALENDAR\r\n";
     );
     // The account's destruction removes the calendar, its event and their
     // containers.
+    account
+}
+
+/// Upgrade ruling 173 (plan 13's R26 residual closed): the ordinary
+/// calendar writers carry the vault-absence assertion in every commit chunk,
+/// as ruling 70's dead-property writes do. A vault record is planted behind
+/// the cached ordinary classification, as a `setup-token` that commits after
+/// the writer read the account. Then a PUT create and update, a COPY and a
+/// MOVE of an event, an event's DELETE, an MKCALENDAR, and a calendar's
+/// COPY, MOVE and DELETE each answer 503 and store nothing (the account's
+/// calendar change log does not move). With the record cleared, the same
+/// writes commit (the control).
+async fn calendar_writes_lose_to_provisioning(test: &TestServer) -> Account {
+    use hyper::StatusCode;
+    println!("calendar_writes_lose_to_provisioning");
+    const HOME: &str = "/dav/cal/plainmail39@example.com/";
+    let ical = |uid: &str, summary: &str| {
+        format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//fence//EN\r\n\
+BEGIN:VEVENT\r\nUID:{uid}\r\nDTSTAMP:20261020T090000Z\r\n\
+DTSTART:20261021T090000Z\r\nDTEND:20261021T100000Z\r\nSUMMARY:{summary}\r\n\
+END:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+    };
+    let admin = test.account("admin@example.com").clone();
+    let account = admin
+        .create_user_account(CALENDAR_WRITER, STRONG, "Fence", &[], user_permissions())
+        .await;
+    let id = account.id().document_id();
+    let dav =
+        crate::utils::webdav::DummyWebDavClient::new(id, CALENDAR_WRITER, STRONG, CALENDAR_WRITER);
+    let path = |rest: &str| format!("{HOME}{rest}");
+    dav.request(
+        "PUT",
+        &path("default/fence-1.ics"),
+        &ical("cal-fence-1", "fence one"),
+    )
+    .await
+    .with_status(StatusCode::CREATED);
+    dav.request(
+        "MKCALENDAR",
+        &path("fence-src/"),
+        crate::za::fanout::MKCALENDAR,
+    )
+    .await
+    .with_status(StatusCode::CREATED);
+    dav.request(
+        "PUT",
+        &path("fence-src/fence-3.ics"),
+        &ical("cal-fence-3", "fence three"),
+    )
+    .await
+    .with_status(StatusCode::CREATED);
+    let change_id = async || {
+        test.server
+            .store()
+            .get_last_change_id(id, types::collection::SyncCollection::Calendar.into())
+            .await
+            .unwrap()
+    };
+
+    // (method, path, destination, body, the control's status)
+    let writes: [(&str, String, Option<String>, String, StatusCode); 9] = [
+        (
+            "PUT",
+            path("default/fence-new.ics"),
+            None,
+            ical("cal-fence-new", "fence new"),
+            StatusCode::CREATED,
+        ),
+        (
+            "PUT",
+            path("default/fence-1.ics"),
+            None,
+            ical("cal-fence-1", "fence one changed"),
+            StatusCode::NO_CONTENT,
+        ),
+        (
+            "MKCALENDAR",
+            path("fence-made/"),
+            None,
+            crate::za::fanout::MKCALENDAR.to_string(),
+            StatusCode::CREATED,
+        ),
+        (
+            "COPY",
+            path("default/fence-1.ics"),
+            Some(path("fence-src/fence-copy.ics")),
+            String::new(),
+            StatusCode::CREATED,
+        ),
+        (
+            "MOVE",
+            path("fence-src/fence-copy.ics"),
+            Some(path("fence-made/fence-moved.ics")),
+            String::new(),
+            StatusCode::CREATED,
+        ),
+        (
+            "DELETE",
+            path("default/fence-new.ics"),
+            None,
+            String::new(),
+            StatusCode::NO_CONTENT,
+        ),
+        (
+            "COPY",
+            path("fence-src/"),
+            Some(path("fence-cal-copy/")),
+            String::new(),
+            StatusCode::CREATED,
+        ),
+        (
+            "MOVE",
+            path("fence-cal-copy/"),
+            Some(path("fence-cal-moved/")),
+            String::new(),
+            StatusCode::CREATED,
+        ),
+        (
+            "DELETE",
+            path("fence-cal-moved/"),
+            None,
+            String::new(),
+            StatusCode::NO_CONTENT,
+        ),
+    ];
+    let send =
+        async |method: &str, target: &str, destination: Option<&str>, body: &str| match destination
+        {
+            Some(destination) => {
+                dav.request_with_headers(method, target, [("destination", destination)], body)
+                    .await
+            }
+            None => dav.request(method, target, body).await,
+        };
+
+    let record = VaultRecord::pending(vec![0x5c; 32], i64::MAX);
+    test.server.za_vault_write(id, &record, None).await.unwrap();
+    assert!(
+        !test.server.account(id).await.unwrap().is_key_account(),
+        "the planted record changed the cached classification"
+    );
+    // The refused writes run against the objects as the setup left them:
+    // the copy and the copied calendar do not exist yet, so the MOVEs and
+    // the DELETEs take the existing ones instead.
+    let refused = [
+        &writes[0],
+        &writes[1],
+        &writes[2],
+        &writes[3],
+        &(
+            "MOVE",
+            path("default/fence-1.ics"),
+            Some(path("fence-src/fence-moved.ics")),
+            String::new(),
+            StatusCode::CREATED,
+        ),
+        &(
+            "DELETE",
+            path("default/fence-1.ics"),
+            None,
+            String::new(),
+            StatusCode::NO_CONTENT,
+        ),
+        &writes[6],
+        &(
+            "MOVE",
+            path("fence-src/"),
+            Some(path("fence-cal-moved/")),
+            String::new(),
+            StatusCode::CREATED,
+        ),
+        &(
+            "DELETE",
+            path("fence-src/"),
+            None,
+            String::new(),
+            StatusCode::NO_CONTENT,
+        ),
+    ];
+    let before = change_id().await;
+    for (method, target, destination, body, _) in refused {
+        send(method, target, destination.as_deref(), body)
+            .await
+            .with_status(StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            change_id().await,
+            before,
+            "{method} {target} stored a change while the account holds a vault record"
+        );
+    }
+
+    let mut batch = BatchBuilder::new();
+    batch
+        .with_account_id(id)
+        .with_collection(Collection::Principal)
+        .with_document(0)
+        .clear(types::field::PrincipalField::ZeroAccessVault);
+    test.server.store().write_batch(&mut batch).await.unwrap();
+    for (method, target, destination, body, status) in &writes {
+        let before = change_id().await;
+        send(method, target, destination.as_deref(), body)
+            .await
+            .with_status(*status);
+        assert_ne!(change_id().await, before, "control: {method} {target}");
+    }
+    // The account's destruction removes its calendars and events.
     account
 }

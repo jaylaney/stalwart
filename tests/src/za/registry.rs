@@ -22,6 +22,33 @@ pub async fn test(test: &mut TestServer) {
     let admin = test.account("admin@example.com").clone();
     let key = test.account("key1@example.com").clone();
 
+    // Upgrade ruling 172: a registry query without a sort lists ids in
+    // 1.0.1's default order, descending, in test builds as in the product;
+    // a sort on `id` lists them ascending.
+    let unsorted = admin
+        .registry_query_ids(
+            ObjectType::Account,
+            Vec::<(&str, &str)>::new(),
+            Vec::<&str>::new(),
+        )
+        .await;
+    assert!(unsorted.len() > 2, "{unsorted:?}");
+    assert!(
+        unsorted.windows(2).all(|pair| pair[0].id() > pair[1].id()),
+        "the default order is not descending: {unsorted:?}"
+    );
+    let sorted = admin
+        .registry_query_ids(ObjectType::Account, Vec::<(&str, &str)>::new(), ["id"])
+        .await;
+    assert!(
+        sorted.windows(2).all(|pair| pair[0].id() < pair[1].id()),
+        "a sort on id is not ascending: {sorted:?}"
+    );
+    assert_eq!(
+        sorted.iter().rev().collect::<Vec<_>>(),
+        unsorted.iter().collect::<Vec<_>>()
+    );
+
     // Admin password reset through the registry.
     admin
         .registry_update_object_expect_err(

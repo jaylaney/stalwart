@@ -694,3 +694,89 @@ async fn registry_password(test: &TestServer, id: Id) -> PasswordCredential {
         .into_password_credential()
         .unwrap()
 }
+
+/// Upgrade ruling 175 (plan 13's R37 closed): an OAuth grant minted while
+/// the account had no credential carries credential version 0, which every
+/// refresh re-encodes and no version check refuses. The marker write of
+/// `setup-token` is a password change and takes upstream's
+/// credentials-changed path, which deletes the account's grants: after it,
+/// the grant's access token is refused and its refresh token finds no grant
+/// (the refresh route's `InvalidGrant`). Before it, both work (the control).
+pub async fn test_grants_die_with_the_marker(test: &mut TestServer) {
+    use common::auth::oauth::{
+        GrantType,
+        scope::OAuthScopes,
+        token::{RefreshTokenParams, TokenGrant},
+    };
+    println!("Running zero-access setup-token grant revocation test...");
+    const NAME: &str = "keymail35@example.com";
+    let admin = test.account("admin@example.com").clone();
+    let mut account = admin
+        .create_passwordless_user_account(NAME, STRONG, "Grant", &[], user_permissions())
+        .await;
+    let id = account.id().document_id();
+    let (grant_id, access) =
+        crate::utils::za::za_grant_token(&test.server, NAME, OAuthScopes::ALL).await;
+    let credential_version = test
+        .server
+        .access_token(id)
+        .await
+        .unwrap()
+        .credential_version();
+    assert_eq!(credential_version, 0, "a credential-less account's version");
+    let refresh = test
+        .server
+        .encode_refresh_token(RefreshTokenParams {
+            account_id: id,
+            account_name: NAME,
+            grant: TokenGrant {
+                id: grant_id,
+                generation: 0,
+            },
+            rotated_at: now(),
+            credential_version,
+            scope: None,
+        })
+        .unwrap();
+    // The refresh route's checks before the client's: the token validates
+    // and names a stored grant of the account.
+    let refreshable = async |test: &TestServer| {
+        let info = test
+            .server
+            .validate_access_token(GrantType::RefreshToken.into(), &refresh)
+            .await
+            .expect("the refresh token validates");
+        let grant = info.grant.expect("a grant-bound refresh token");
+        test.server
+            .oauth_grant(grant.id)
+            .await
+            .unwrap()
+            .is_some_and(|stored| stored.account_id() == id)
+    };
+    assert_eq!(
+        super::caches::session_status(&access).await,
+        200,
+        "control: the access token before setup-token"
+    );
+    assert!(
+        refreshable(test).await,
+        "control: the grant before setup-token"
+    );
+
+    let token = za_setup_token(&admin, NAME).await;
+    assert!(
+        test.server.oauth_grant(grant_id).await.unwrap().is_none(),
+        "the grant outlived the marker write"
+    );
+    assert!(
+        !refreshable(test).await,
+        "the grant's refresh token still finds its grant"
+    );
+    assert_eq!(
+        super::caches::session_status(&access).await,
+        401,
+        "the grant's access token outlived the marker write"
+    );
+    account.recovery_key = Some(za_setup(NAME, &token, STRONG).await);
+    test.insert_account(account);
+}

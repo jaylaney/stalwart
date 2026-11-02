@@ -133,6 +133,7 @@ pub async fn za_tests() {
 
     setup::test(&mut test).await;
     setup::test_data_check(&mut test).await;
+    setup::test_grants_die_with_the_marker(&mut test).await;
     disabled::test(&mut test).await;
     password::test(&mut test).await;
     app_password::test(&mut test).await;
@@ -154,6 +155,7 @@ pub async fn za_tests() {
     fanout::test(&mut test).await;
     fanout::test_failures(&mut test).await;
     fanout::test_plain_owner(&mut test).await;
+    fanout::test_storage_guards(&mut test).await;
     reply::test(&mut test).await;
     uid_lease::test(&mut test).await;
     drain::test(&mut test).await;

@@ -1686,6 +1686,65 @@ pub async fn rewrite_inbox_item(
         .invalidate_local_caches(&[CacheInvalidation::GroupwareResources(account_id)]);
 }
 
+/// True for a stored inbox item whose pending bit is set (spec 9).
+pub async fn inbox_item_is_pending(test: &TestServer, account_id: u32, document_id: u32) -> bool {
+    inbox_records(test, account_id, document_id)
+        .await
+        .is_some_and(|(meta, _)| {
+            groupware::calendar::seal::archived_item_is_pending(
+                meta.unarchive::<CalendarEventNotification>().unwrap(),
+            )
+        })
+}
+
+/// Deletes an inbox item at store level, as `itip_auto_expunge` does. Upgrade
+/// ruling 176 (B-M4): a client's DELETE of a pending item answers 404, as
+/// its GET does, so cleanups (and the races that need an item gone under
+/// the drain) remove pending items here.
+pub async fn destroy_inbox_item(test: &TestServer, account_id: u32, document_id: u32) {
+    let Some((meta, _)) = inbox_records(test, account_id, document_id).await else {
+        return;
+    };
+    let changed_by = test
+        .server
+        .account_info(account_id)
+        .await
+        .unwrap()
+        .changed_by();
+    let mut batch = BatchBuilder::new();
+    groupware::DestroyArchive(meta.to_unarchived::<CalendarEventNotification>().unwrap())
+        .delete(changed_by, account_id, document_id, &mut batch)
+        .unwrap();
+    test.server.commit_batch(batch).await.unwrap();
+    test.server
+        .invalidate_local_caches(&[CacheInvalidation::GroupwareResources(account_id)]);
+}
+
+/// Deletes `client`'s own inbox item: by href (upstream's DELETE, 204), or
+/// at store level when it is pending (`destroy_inbox_item`).
+pub async fn delete_inbox_item(
+    test: &TestServer,
+    client: &crate::utils::webdav::DummyWebDavClient,
+    account_id: u32,
+    document_id: u32,
+) {
+    if inbox_item_is_pending(test, account_id, document_id).await {
+        destroy_inbox_item(test, account_id, document_id).await;
+    } else {
+        client
+            .request(
+                "DELETE",
+                &format!(
+                    "/dav/itip/{}/inbox/{document_id}.ics",
+                    client.name.replace('@', "%40")
+                ),
+                "",
+            )
+            .await
+            .with_status(StatusCode::NO_CONTENT);
+    }
+}
+
 /// An app password of `name`: a second session of the account (invitations
 /// spec 6.3, two key-cache entries), through `/api/vault/app-password`.
 pub async fn za_app_password(name: &str, password: &str, description: &str) -> String {

@@ -2147,9 +2147,9 @@ pub async fn test_lease(test: &mut TestServer) {
     assert_eq!(za_uid_leases(test).await, 0);
 
     // D. The item deleted under a pass (Review Focus 1): session 1 holds
-    // the lease before its commit; session 2 deletes the item by href; the
-    // commit loses the item's assertion, nothing is imported, the lease is
-    // released, the request succeeds.
+    // the lease before its commit; the item is deleted; the commit loses the
+    // item's assertion, nothing is imported, the lease is released, the
+    // request succeeds.
     let uid4 = "za-drain-l4";
     key1.client
         .request_with_headers(
@@ -2168,17 +2168,10 @@ pub async fn test_lease(test: &mut TestServer) {
         trigger_drain(key2.name, STRONG),
     )
     .await;
-    test_hooks::set_drain_skip(key2.id);
-    let item_href = format!("{}{}.ics", key2.inbox(), item[0]);
-    assert_eq!(
-        crate::utils::http::HttpRequest::with_credentials(8899, key2.name, &app)
-            .send_full(hyper::Method::DELETE, &item_href, None, None)
-            .await
-            .status
-            .as_u16(),
-        204
-    );
-    test_hooks::clear_drain_skip(key2.id);
+    // Upgrade ruling 176 (B-M4): a client's DELETE of a pending item
+    // answers 404, so the item goes at store level (as the inbox expiry
+    // removed it before ruling 174), under the parked pass.
+    crate::utils::za::destroy_inbox_item(test, key2.id, item[0]).await;
     assert_eq!(session_1.finish().await, 207);
     assert_eq!(
         uid_copies(test, key2.id, uid4).await,

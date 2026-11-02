@@ -1066,7 +1066,7 @@ async fn copy_move_test(test: &mut TestServer) {
         .await
         .with_status(StatusCode::NO_CONTENT);
     super::fanout::Party::new(test, READER)
-        .delete_items(inbox_ids(test, reader_id).await)
+        .delete_items(test, inbox_ids(test, reader_id).await)
         .await;
     crate::utils::za::set_raw_pins(test, owner_id, None).await;
     crate::utils::za::set_raw_pins(test, reader_id, None).await;
@@ -7959,7 +7959,9 @@ async fn sharing_compare_lifecycle(
         }
     }
     for party in [&alice, &bob, &carol] {
-        party.delete_items(inbox_ids(test, party.id).await).await;
+        party
+            .delete_items(test, inbox_ids(test, party.id).await)
+            .await;
     }
 }
 
@@ -9768,7 +9770,9 @@ async fn sharing_http_schedule_contracts(test: &mut TestServer) {
         }
     }
     for party in [&alice, &bob, &carol, &dave] {
-        party.delete_items(inbox_ids(test, party.id).await).await;
+        party
+            .delete_items(test, inbox_ids(test, party.id).await)
+            .await;
     }
     dave.client.delete_default_containers().await;
     println!(
