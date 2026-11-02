@@ -1711,7 +1711,7 @@ Flags:
 | `jmap/src/mailbox/query.rs:63` | `cfg(any(feature = "dev_mode", feature = "test_mode"))` | `jmap/src/mailbox/query.rs:105` `cfg(any(feature = "dev_mode", stalwart_tests))` | a mailbox named `__sleep` sleeps 1 s (concurrent-request tests) | system::security | restore under `test_mode` |
 | `jmap/src/push/set.rs:445` | `cfg(feature = "test_mode")` | removed: `validate_push_url` (`push/set.rs:427`) has no loopback exemption | loopback push URLs allowed; a unit-test assertion | jmap::core::push_subscription (loopback receiver), za::mail::reads (state-only push); the `cfg!` sits in the 0.16.27 inline test module | restore under `test_mode` (v1.0.1 removed the loopback exemption); the unit assertion returns with its restored module |
 | `jmap/src/push/set.rs:586` | `cfg!(feature = "test_mode")` | with the inline test module, now the slot `push/set.rs:513` (`all(test, stalwart_tests)`) | (same) | (same) | (same) |
-| `jmap/src/registry/query.rs:400` | `cfg(feature = "test_mode")` | removed: `registry/query.rs:470` always sorts descending | registry queries default to ascending id order | suites that read `x:*/query` results in order (tests/src/utils/registry.rs callers) | restore under `test_mode` (v1.0.1 removed the test order; a silent change for ordered assertions) |
+| `jmap/src/registry/query.rs:400` | `cfg(feature = "test_mode")` | removed: `registry/query.rs:470` always sorts descending | registry queries default to ascending id order | suites that read `x:*/query` results in order (tests/src/utils/registry.rs callers) | restore under `test_mode` (v1.0.1 removed the test order; a silent change for ordered assertions). Retired by ruling 172 (fix part Z1): 1.0.1's unconditional descending default in every build; no suite caller reads an unsorted result in order |
 | `jmap/src/registry/query.rs:408` | `cfg(not(feature = "test_mode"))` | kept ungated (`registry/query.rs:470`) | (same) | (same) | (same) |
 | `services/src/state_manager/http.rs:257` | `cfg!(feature = "test_mode")` | `services/src/state_manager/http.rs:261` `cfg!(stalwart_tests)` | push HTTP client accepts invalid certificates | jmap::core::push_subscription | restore under `test_mode` |
 | `services/src/state_manager/push.rs:247` | `cfg(feature = "test_mode")` | `services/src/state_manager/push.rs:257` `cfg(stalwart_tests)` | `skip_checks` push URLs bypass the verification | jmap::core::push_subscription, jmap key-mode push_subscription, za::mail::reads | restore under `test_mode` |
@@ -3546,7 +3546,8 @@ Of the table's 121 "restore" rows:
     restored in `provider_domain` (1.0 removed the branch);
   - `email`: `mailbox/{destroy,manage}.rs`, `message/index/search.rs`;
   - `jmap`: `api/event_source.rs`, `mailbox/query.rs`; `registry/query.rs`: 0.16's ascending
-    default order restored under `test_mode` (1.0 removed it);
+    default order restored under `test_mode` (1.0 removed it), retired by ruling 172 (fix
+    part Z1): test builds take 1.0.1's descending default;
   - the push loopback exemption (`jmap/src/push/set.rs:445` at 0.16): Task 1's table says
     1.0 removed it, but it moved. 1.0's `validate_push_url` goes through `OutboundPolicy`,
     whose `is_public_domain` and `is_permitted_ip` (`utils/src/outbound.rs:246`, `:269`)
@@ -9041,6 +9042,214 @@ The gates job took about 1 h 45 min: the instrumented builds and the 19 steps ab
 minutes. Its 330-minute timeout stays, for a cold cache and runner variance. The other jobs
 took 20 to 45 minutes each; the CalDAV client starts after `zero-access`.
 
+## Final review
+
+The final whole-branch review of the fork on 1.0.1 ran as four lenses (A: authentication, the
+vault, sessions and traces; B: calendar; C: mail and search; D: the merge, the test hooks, the
+gates and CI) at `a57c0fb35`, with product code final at `6fd9a131f`. It found no critical
+defect: 3 Important findings, 25 Minor ones and 3 ruling revisits, adjudicated in rulings 171
+to 180. The fix batch runs in two parts. Part Z1 (below) applies the product fixes of rulings
+171 to 176 with their cases, mutations and the local matrix. Part Z2 takes ruling 177 (the
+gates check and the three CI holds), the final coverage net, the push and the CI run. Ruling
+178's records go to Task 9; ruling 179's items are accepted as recorded.
+
+### Fix part Z1
+
+No stored layout changed. Each product fix is a call or a short branch at an upstream site,
+with its logic in a fork module, except ruling 172, which removes the fork's change to an
+upstream file. Scratch work, drivers and logs are in the plan workspace under
+`final-fix-z1/`.
+
+Commits:
+- `0d27a13c4`: rulings 171, 172, 175 and ruling 176's A2 and A3;
+- `fbbb8c61c`: ruling 173, and ruling 176's B-M2 arm in `dav/src/calendar/delete.rs`;
+- `8b3a46199`: ruling 174 and ruling 176's B-M1, B-M2, B-M3, B-M4 and B-M7;
+- `57f94d37c`: ruling 176's lens C items;
+- `928867f7d`: the cases;
+- `e25854b4f`: A3's unit test moved to a quoting parser error (found by its mutation), the
+  final SHA of the matrix;
+- this note.
+
+#### The fixes
+
+- **Ruling 171 (A1): no Bearer value in an authentication trace**
+  (`common/src/auth/oauth/token.rs`). `decode_access_token` no longer attaches the value it
+  could not decode as the error's `Details`, so the `causedBy` event of the traced
+  `AuthEvent::Failed` carries the fixed reason only. It applies to every account: the
+  account is unknown before authentication. This is a new invariant-9 exception of issue
+  #20's pre-authentication class; ruling 178 adds it to the exception list.
+- **Ruling 172 (D1): 1.0.1's registry query order** (`jmap/src/registry/query.rs`). The
+  default sort is 1.0.1's unconditional descending id order; the `cfg!(feature =
+  "test_mode")` ascending branch is gone, so the file equals 1.0.1's. Every ordered caller
+  in `tests/src` was read: none reads an unsorted result in order (each compares one id, a
+  count, a set, or sorts first; `smtp/management/report.rs:216` sorts, `:249` and
+  `system/authorization.rs:278`, `:329` compare one id or none). So no caller changes, and
+  `za::registry` now pins the order: unsorted descending, a sort on `id` ascending.
+- **Ruling 173 (R-a): ordinary calendar writes are fenced in every commit chunk**. This closes
+  plan 13's R26 residual, in spec 12's rule 32 class (an invariant-9 exception for every
+  ordinary account). One assertion read per commit chunk of an ordinary calendar write.
+  - `store/src/write/batch.rs`: `BatchBuilder::za_assert_absent_per_chunk` asserts a key's
+    absence in the current chunk, restoring the caller's account, collection and document,
+    and records it; `add_commit_point` re-emits the recorded assertions at the head of each
+    new chunk, before its own re-selection of the account and the collection (one line,
+    `za_push_chunk_asserts`). The builder's new field is not stored.
+  - `common/src/auth/vault.rs`: `za_provisioning_fence_per_chunk` (the vault-absence key;
+    nothing on PostgreSQL or MySQL, as `za_provisioning_fence`).
+  - `dav/src/common/za.rs`: `za_ordinary_fence(server, batch, to, from)`, called once right
+    after the batch is created on the upstream path of the PUT update and create
+    (`calendar/update.rs`), the event and calendar DELETE (`delete.rs`, when the writer
+    holds no keys), MKCOL (`mkcol.rs`, likewise) and `copy_event`, `move_event`,
+    `rename_event`, `copy_container` and `rename_container` (`copy_move.rs`; a move fences
+    its source too, a container rename only on the upstream path).
+- **Ruling 174 (R-b): the inbox expiry keeps pending items**
+  (`groupware/src/calendar/storage.rs`, `itip_auto_expunge`). The archives callback skips a
+  row whose flags carry `EVENT_NOTIFICATION_ZA_PENDING`. Only a key account's sealed items
+  carry the bit, so ordinary accounts expire as upstream. Invitations spec 6.6's recorded
+  loss of an undrained invitation to the expiry is gone.
+- **Ruling 175 (R37): `setup-token` revokes the account's OAuth grants**
+  (`http/src/api/vault.rs`). After the marker's registry write, `za_revoke_marker_grants`
+  passes the credentials before and after it to upstream's
+  `CacheInvalidationBuilder::process_credentials_update`, which queues
+  `revoke_oauth_grants`, and applies it. A grant minted while the account had no credential
+  (credential version 0, which every refresh re-encodes and no version check refuses) dies
+  with the marker. Plan 13's R37 residual is closed. Ruling 179's A4 (every vault write
+  revokes a key account's tokens) stands as recorded.
+- **Ruling 176, the product minors:**
+  - A2 (`http/src/auth/oauth/auth.rs`): `/api/auth`'s JSON errors carry serde's category and
+    position only, as `api/vault.rs` reports its own; never a value from the body.
+  - A3 (`directory/src/core/secret.rs`): `verify_totp_code` attaches no parser message.
+    totp-rs 6.0's URL errors quote the component that fails to parse (its invalid-secret
+    error quotes nothing).
+  - B-M1 (`storage.rs`, `delete_with_events_za`): keys of another account than the
+    calendar's owner (`account_id`) are refused (`Unauthorized`), never used to resolve a
+    context in their own account.
+  - B-M2: a sealed event's delete without its key domain fails before upstream's CANCEL is
+    built or queued (`remove_all_za_at`); and `dav/src/calendar/delete.rs` refuses (403) a
+    key account's event delete whose context resolves to none, instead of falling through.
+    Neither is reachable by a DAV request today.
+  - B-M3 (`fanout.rs`, `write_item_inner`): an item is refused with `5.1` once the
+    recipient's notification count (upstream's `count_documents`) has reached
+    `MaxCalendarEventNotifications`. A count, no eviction: upstream's
+    `NotificationQuota::reserve` evicts the oldest notification at the limit, which here
+    could be a pending item, so it does not fit.
+  - B-M4 (`dav/src/calendar/scheduling.rs`): an inbox DELETE of a pending item answers 404,
+    as its GET does (`za_item_hidden`). A client can no longer delete an undrained
+    invitation; the inbox expiry no longer does either (ruling 174), so a pending item goes
+    only with its drain or its account.
+  - B-M7 (`fanout.rs`): the item's quota check measures the sealed item, after sealing; the
+    inbound size limit still measures the message, as upstream's ingest does.
+  - Lens C M1 (`jmap/src/blob/download.rs`, `za_download_upload`): when the keys lookup
+    answers `None` after the sealed-source check (the vault record removed between the two
+    reads), the upload is not found, instead of its sealed bytes served raw.
+  - Lens C M2 (`email/src/message/{ingest,copy}.rs`): a true duplicate (no commit point
+    between the ingest's or the copy's provisioning fence and the container write), so
+    `ZaMetadataFence` asserts only the private container's viewer there, when it differs
+    from the owner.
+  - Lens C M6 (`common/src/za/metadata.rs`): `za_has_object_metadata`'s comment names every
+    collection a `Shared` container counts on (all but the three DAV plaintext ones).
+
+#### The cases
+
+- `za::tracing::bearer_values_are_not_traced` (ruling 171): two undecodable Bearer values,
+  one with the internal token prefix (`sw1.`), each over HTTP, SMTP AUTH OAUTHBEARER and
+  XOAUTH2 on the submission listener, and IMAP AUTHENTICATE OAUTHBEARER, each in its own
+  capture of every event type: no event and no answer carries the value; each capture holds
+  the decode failure's event (the control).
+- `za::tracing::login_type_errors_are_not_traced` (A2): a string where `consent` expects a
+  boolean; neither the answer nor any event carries it.
+- `za::registry::test` (ruling 172): the unsorted `x:Account/query` is descending, a sort on
+  `id` ascending, the one the reverse of the other.
+- `za::setup::test_grants_die_with_the_marker` (ruling 175, `keymail35`): a grant and a
+  refresh token minted before `setup-token`; before it, the access token answers 200 and the
+  refresh token names a stored grant; after it, the grant is gone, the refresh token finds
+  none (the refresh route's `InvalidGrant`) and the access token answers 401.
+- `za::mail::fence::calendar_writes_lose_to_provisioning` (ruling 173, `plainmail39`): a
+  vault record planted behind the cached ordinary classification; a PUT create and update,
+  an MKCALENDAR, an event's COPY, MOVE and DELETE, and a calendar's COPY, MOVE and DELETE
+  each answer 503 and log no change; with the record cleared, the same writes commit.
+- `za::inbox::test_expiry` (ruling 174), rewritten: `expungeSchedulingInboxAfter` one second
+  (restored after); key1's pending item survives the purge, its drained item and an ordinary
+  account's item are expunged.
+- `za::inbox::test` (B-M4): the pending item's DELETE answers 404 and the item stays.
+- `za::fanout::test_failures` steps 7e (B-M3: key2 at its notification count limit gets
+  `5.1` and no item, nothing evicted, key3 unaffected) and 7f (B-M7: key2's disk quota set
+  midway between a control item's plaintext and sealed sizes; the next invitation gets `5.1`
+  and no item).
+- `za::fanout::test_storage_guards` (B-M1, B-M2): the store functions called directly, with
+  controls; neither batch is committed.
+- Units: `store::write::batch::za_chunk_assert_tests` (every chunk, the trailing one
+  included, holds the assertion ahead of its writes, and no write's selection changes; no
+  assertion unless asked) and `directory::core::secret::za_tests::totp_url_error_quotes_nothing`.
+- Not tested: lens C's M1 is reachable only by a race between two reads with no test hook
+  between them; B-M2's DAV arm is unreachable by construction.
+
+B-M4 changed the suite's cleanups: a client can no longer delete a pending item, so
+`Party::delete_items` (now taking the server), the `leak` cleanups and drain step D
+(`za::drain::test_lease`, the item deleted under a parked pass) delete pending items at store
+level (`destroy_inbox_item`, `delete_inbox_item` in `tests/src/utils/za.rs`), as the expiry
+did before ruling 174.
+
+#### The mutation rows
+
+Rows `z001` to `z015` of `task-7d/mutations.tsv`, by the `ZA_MUT` switch (part 7d2's
+method; the switches and the `ZA_ONLY` selector stayed uncommitted, `final-fix-z1/muts.py`).
+The control (every selected module, `ZA_MUT` unset) passed.
+
+| Row | Mutation | Outcome |
+|---|---|---|
+| z001 | the Bearer value back in the details | caught: `za::tracing`, HTTP's `Auth(Failed)` carries the canary |
+| z002 | the test-mode ascending default restored | caught: `za::registry`, not descending |
+| z003 | no per-chunk fence | caught: `mail::fence`, the PUT create answers 201 |
+| z004 | the assertion not re-emitted after a commit point | caught by the store unit test; the ZA case passes (its writes are one chunk) |
+| z005 | pending items expunged | caught: `inbox::test_expiry` |
+| z006 | no revocation at the marker | caught: the grant outlives the marker |
+| z007 | serde's message back | caught: `za::tracing`, the reason quotes the canary |
+| z008 | the parser message back | caught by the unit test, once it quoted a component (the first build's secret case was not: totp-rs quotes no secret) |
+| z009 | another account's keys used | caught: `test_storage_guards`, `NotFound` where `Unauthorized` is expected |
+| z010 | a sealed delete without its domain proceeds | caught: `test_storage_guards` |
+| z011 | the DAV arm proceeds without a context | not caught: unreachable by construction |
+| z012 | no notification count check | caught: `test_failures` 7e |
+| z013 | a pending item's DELETE proceeds | caught: `inbox::test`, 204 |
+| z014 | the quota measures the plaintext | caught: `test_failures` 7f |
+| z015 | the sealed upload served raw | not caught: a race with no test hook |
+
+#### Runs at `e25854b4f`
+
+Logs in `task-7c/logs/`, through `task-7c/run.sh` (`matrix4.sh`), all at `e25854b4f`:
+
+| Row | Log | Result |
+|---|---|---|
+| ZA | `za-97` | pass (400 s) |
+| ZA, `BLOB_STORE=FileSystem` | `zafs-9` | pass (365 s) |
+| CalDAV plain, key | `caldav-plain-30`, `caldav-key-28` | pass, pass |
+| IMAP plain, key | `imap-plain-19`, `imap-key-16` | pass, pass |
+| JMAP plain, key | `jmap-plain-52`, `jmap-key-33` | pass, pass |
+| `system_tests` | `up-system-system_tests-23` | pass |
+| SMTP (CI's `SPAM_RULES_URL`) | `smtp-12` | 74 passed, 2 failed: `dkim2_dsn_is_signed` (a known flake) and `dkim2_all_disclosed` (failed and passed alone in part 7f2 too); each passed rerun by name (`smtp-flake-8`, `-9`) |
+| Workspace units (CI's step) | `units-8` | 571 passed, 0 failed, 2 ignored, in 35 binaries |
+| vault and groupware (`vault/test_mode`) | `vaultgw-4` | 225 passed |
+
+The units step rewrote `crates/dav-proto/resources/requests/*.json` (the upstream test that
+writes its output, as in part 7f4), so `vaultgw-4` and the two SMTP reruns log 26 dirty
+files; no source file changed, and the fixtures were restored with `git checkout`. The
+shipping check `cargo check -p stalwart --no-default-features --features rocks` passed with
+no warning, and `cargo fmt --all --check` passed.
+
+#### Needs a ruling
+
+- **Ordinary calendar writers outside ruling 173's list.** The ruling names the DAV PUT,
+  COPY, MOVE, DELETE and MKCOL batches. Other ordinary writers of `Calendar` and
+  `CalendarEvent` rows still commit without the per-chunk fence: DAV PROPPATCH of live
+  properties alone (`dav/src/calendar/proppatch.rs`; ruling 70 fences only its dead-property
+  containers), DAV ACL on a calendar (`dav/src/common/acl.rs`), and JMAP `Calendar/set`,
+  `CalendarEvent/set`, `CalendarEvent/copy` and `CalendarEventNotification/set` for ordinary
+  accounts (`jmap/src/calendar*/`). JMAP's `CalendarEvent/set` create writes event content,
+  the same exposure as a DAV PUT. Each would take the same one-line `za_ordinary_fence` (or
+  the common helper) call. Close them, or record them as R26's remaining residual.
+- **Lens C's M1 has no test.** It needs a vault record removed between two reads of one
+  request, and no test hook sits between them. Add a hook, or accept the mutation row's "not
+  caught".
+
 ## Conflict ledger
 
 **The real merge, 2026-10-30.** In the worktree, on `stalwart-1-upgrade` at `9601038de`,
@@ -9463,6 +9672,17 @@ Filled from Task 2 onward: every changed assertion, early return, `cfg` skip or 
 | `za::sharing_review::plain_update_trace_exhausted` (fork, part 7f4, ruling 156) | `set_update_commit_pause(None)` after the response becomes `drop(slot)` of a `PauseSlotGuard` taken before the first arm, which restores the slot's prior value (also on a panic) and releases a pause left armed. Assertions unchanged. | None in 1.0: the re-review's N5. |
 | `tests/caldav_client` `calendar/testAlarm`, `testTodoDatesearch`, `testRecurringDateWithExceptionSearch` (independent CalDAV runner, part 8b) | Their strict xfail records are removed in both modes: each is an expected pass. | 1.0 answers the alarm time-range query, the VTODO date search and the server-side expansion of an overridden instance as the pinned tests expect; not tied to a single 1.0.1 changelog entry. |
 | `tests/caldav_client` `flows/test_shared_calendar_properties_and_etags` (part 8b, ruling 96's class) | The grantee's If-Match race uses `calendar-description` instead of `calendar-color`; a new case asserts that a dead-only PROPPATCH leaves the ETag unchanged and a stale If-Match answers 207 with the last writer winning, for owner and grantee. | 1.0 keeps a calendar's dead properties outside the archive whose hash is the collection's ETag. |
+| Ordered `registry_query` and `x:*/query` callers in `tests/src` (fork, part Z1, ruling 172) | Unchanged: each was read, and none reads an unsorted result in order (each compares one id or none, a count or a set, or sorts first: `smtp/management/report.rs:216` sorts, `:249` and `system/authorization.rs:278`, `:329` compare one id or none). | `jmap/src/registry/query.rs`: 1.0.1's unconditional descending default; the fork's `test_mode` ascending default is retired. |
+| `za::registry::test` (fork, part Z1, ruling 172) | Adds the order checks: an unsorted `x:Account/query` is descending, a sort on `id` ascending, the reverse of each other. | The same. |
+| `za::tracing::test` (fork, part Z1, rulings 171 and 176 A2) | Adds `bearer_values_are_not_traced` (an undecodable Bearer value over HTTP, SMTP AUTH OAUTHBEARER and XOAUTH2, and IMAP AUTHENTICATE, in no event or answer) and `login_type_errors_are_not_traced` (a type error in the `/api/auth` body). | None in 1.0: the review's A1 (`decode_access_token`'s details, 0.16 and 1.0 alike) and A2. |
+| `za::setup::test_grants_die_with_the_marker` (fork, part Z1, ruling 175) | New: a grant minted before `setup-token` is deleted by the marker write; its access token answers 401 and its refresh token finds no grant. | 1.0's grant-bound tokens; the refresh grant re-encodes credential version 0 (plan 13's R37). |
+| `za::mail::fence` (fork, part Z1, ruling 173) | Adds `calendar_writes_lose_to_provisioning`: nine ordinary DAV calendar writes answer 503 and log no change while a vault record is planted, and commit once it is cleared. | None in 1.0: plan 13's R26 residual, closed. |
+| `za::inbox::test_expiry` (fork, part Z1, ruling 174) | Rewritten. It asserted that the purge removes an expired pending item (the recorded loss); with `expungeSchedulingInboxAfter` one second it now asserts that the pending item survives while a drained one and an ordinary account's one are expunged. | None in 1.0: invitations spec 6.6's recorded expiry, closed by ruling 174. |
+| `za::inbox::test` (fork, part Z1, ruling 176 B-M4) | Adds a DELETE of the pending item, answered 404, the item still stored. | None in 1.0: the review's B-M4. |
+| `za::drain::test_lease` step D, `za::fanout::Party::delete_items`, the `za::leak` inbox cleanups (fork, part Z1, ruling 176 B-M4) | A pending item is deleted at store level (`destroy_inbox_item`, `delete_inbox_item`) where a client DELETE removed it; `delete_items` takes the server. Step D still deletes the item under a parked pass. | The same: a client's DELETE of a pending item answers 404. |
+| `za::fanout::test_failures` (fork, part Z1, ruling 176 B-M3 and B-M7) | Adds steps 7e (the recipient at its notification count limit: 5.1, no item, none evicted) and 7f (a disk quota between the plaintext and the sealed sizes: 5.1, no item). | 1.0's `MaxCalendarEventNotifications` object quota (`NotificationQuota`). |
+| `za::fanout::test_storage_guards` (fork, part Z1, ruling 176 B-M1 and B-M2) | New: `delete_with_events_za` with another account's keys is refused; a sealed event's delete without its key domain fails; each with a control. | None in 1.0: the review's B-M1 and B-M2. |
+| `store::write::batch::za_chunk_assert_tests` and `directory::core::secret::za_tests::totp_url_error_quotes_nothing` (fork units, part Z1, rulings 173 and 176 A3) | New. | 1.0's commit chunks (`add_commit_point`); totp-rs 6.0's URL errors quote the component that fails to parse. |
 
 ## Task 1 check
 
