@@ -783,18 +783,14 @@ impl CalendarUpdateRequestHandler for Server {
                     #[cfg(feature = "test_mode")]
                     common::za::test_hooks::update_commit_pause_point(account_id).await;
                     #[cfg(feature = "test_mode")]
-                    let fail =
-                        attempt == 0 && common::za::test_hooks::take_update_commit_fail(account_id);
-                    #[cfg(not(feature = "test_mode"))]
-                    let fail = false;
-                    let committed = if fail {
-                        Err(trc::StoreEvent::UnexpectedError
+                    if attempt == 0 && common::za::test_hooks::take_update_commit_fail(account_id) {
+                        za_mail.dropped();
+                        return Err(trc::StoreEvent::UnexpectedError
                             .into_err()
-                            .details("zero-access test hook: update commit failure"))
-                    } else {
-                        self.commit_batch(batch).await
-                    };
-                    match committed {
+                            .details("zero-access test hook: update commit failure")
+                            .into());
+                    }
+                    match self.commit_batch(batch).await {
                         Ok(_) => {
                             self.notify_task_queue();
                             // iMIP spec 5.4: mail only once the commit

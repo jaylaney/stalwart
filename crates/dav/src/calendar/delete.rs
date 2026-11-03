@@ -511,20 +511,17 @@ impl CalendarDeleteRequestHandler for Server {
             common::za::test_hooks::delete_commit_pause_point(account_id).await;
         }
         #[cfg(feature = "test_mode")]
-        let fail = za_keys.is_some() && common::za::test_hooks::take_delete_commit_fail(account_id);
-        #[cfg(not(feature = "test_mode"))]
-        let fail = false;
+        if za_keys.is_some() && common::za::test_hooks::take_delete_commit_fail(account_id) {
+            za_mail.dropped();
+            return Err(trc::StoreEvent::UnexpectedError
+                .into_err()
+                .details("zero-access test hook: delete commit failure")
+                .into());
+        }
         // iMIP spec 5.4: every error return of the commit drops the mail
         // attempts, traced, before returning.
         let committed: crate::Result<()> = async {
-            let committed = if fail {
-                Err(trc::StoreEvent::UnexpectedError
-                    .into_err()
-                    .details("zero-access test hook: delete commit failure"))
-            } else {
-                self.commit_batch(batch).await
-            };
-            match committed {
+            match self.commit_batch(batch).await {
                 Ok(_) => {}
                 Err(error) if error.is_assertion_failure() && !contexts.is_empty() => {
                     // A calendar change (a grant, a rotation or a conversion) lost
