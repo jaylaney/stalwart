@@ -89,24 +89,26 @@ The first preview is `0.1.0-beta.1`, tagged `fork-v0.1.0-beta.1` and titled
 `release-0.1.0-beta-1`; `0.1.1-beta.1` (tag `fork-v0.1.1-beta.1`) followed on upstream
 `v0.16.27`. `fork-release.toml` is the fork identity source: it records the fork version and
 upstream base tag/full commit. The shipping `stalwart` package version must match it. The
-current candidate is `0.2.0-beta.1`, with fully integrated upstream `v1.0.1`
-(`23b69755cb3cd8ecd952fe0443c5ac067a506184`). Internal upstream crate versions and numeric
-compatibility checks follow `1.0.1`; the fork-owned `vault` crate retains `0.16.25`. The
-published `fork-v0.1.0-beta.1` and `fork-v0.1.1-beta.1` tags and artifacts remain immutable.
+current prerelease is `0.2.0-beta.1` (tag `fork-v0.2.0-beta.1`), with fully integrated
+upstream `v1.0.1` (`23b69755cb3cd8ecd952fe0443c5ac067a506184`). Internal upstream crate
+versions and numeric compatibility checks follow `1.0.1`; the fork-owned `vault` crate
+retains `0.16.25`. The published `fork-v0.1.0-beta.1`, `fork-v0.1.1-beta.1` and
+`fork-v0.2.0-beta.1` tags and artifacts remain immutable.
 
 `0.2.0-beta.1` is a limited prerelease. It supports fresh stores only: upstream 1.0.1 cannot
 open a store written by upstream 0.16 or by the fork's `0.1.x` releases, and the fork adds no
 conversion or legacy reader. An existing installation moves by provisioning a fresh store and
 setting its key accounts up again, keeping the old store and the `0.1.x` binary for rollback;
 rollback restores the old store as it was, without the writes made after the cutover. This
-candidate uses public upstream and fork tests for qualification and adds no private-test
-dependency. Record fresh candidate results before publication; existing results do not
+prerelease uses public upstream and fork tests for qualification and adds no private-test
+dependency. Record fresh results before publication; existing results do not
 establish new backend, cluster, platform or native-client qualification, and results from
-the `0.1.x` base are not evidence for this candidate. Its pending gates, each needing its own
-authorization or session, are: the exact-source Linux product build and verification through
-`product-build.yml`; the native Calendar and Mail client checklist against that build; and a
-clean-context whole-branch review. SQL backends, clusters, other platforms and the external
-protocol suites are not qualified. The candidate stays a prerelease until its applicable
+the `0.1.x` base are not evidence for this prerelease. Its exact-source Linux product build
+ran from the tag through `product-build.yml`, and the published release notes record its
+verification. The native Calendar and Mail client checklist passed on the deployed build on
+2026-11-02, per Jay; its remaining gate is a clean-context whole-branch review.
+SQL backends, clusters, other platforms and the external
+protocol suites are not qualified. It stays a prerelease until its applicable
 gates pass; the [fork changelog](../CHANGELOG-fork.md) records its automated results.
 
 `scripts/release/verify_product.py` checks the upstream pin as well as the binary: the pinned

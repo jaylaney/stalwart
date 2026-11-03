@@ -418,26 +418,76 @@ jobs:
         env:
           ZA_KEY_ACCOUNTS: "1"
 
+  # Builds the shipping binary (RocksDB, no enterprise or test mode) once, for
+  # the two jobs that test it: caldav-client and fresh-store. It starts as soon
+  # as style passes, so neither job waits for a build of its own.
+  product-build:
+    name: Build Product
+    needs: style
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # verify_product.py checks that the pinned upstream commit is in the
+          # source's history, and that no later upstream release is.
+          fetch-depth: 0
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify release tooling
+        run: python3 -B -m unittest discover -s scripts/release -p 'test_*.py' -v
+
+      - name: Build product (RocksDB, no enterprise or test mode)
+        run: cargo build --release --locked -p stalwart --no-default-features --features rocks
+
+      # The release verifier (product-build.yml's), run on every CI build so a
+      # release-identity break shows on the pull request, not at tag time. The
+      # provenance goes outside target/, so it is not uploaded; attestation
+      # stays in product-build.yml only.
+      - name: Verify shipping identity
+        run: |
+          python3 scripts/release/verify_product.py \
+            --binary target/release/stalwart \
+            --source-commit "$(git rev-parse HEAD)" --ref "$GITHUB_REF" \
+            --inspect-elf --output "$RUNNER_TEMP/stalwart.provenance.json"
+
+      # An artifact upload drops the executable bit, so the binary travels in a tar archive.
+      - name: Package product binary
+        run: tar -C target/release -cf "$RUNNER_TEMP/stalwart-product.tar" stalwart
+
+      - name: Upload product binary
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: stalwart-product
+          path: ${{ runner.temp }}/stalwart-product.tar
+          retention-days: 1
+          if-no-files-found: error
+
   caldav-client:
     name: Independent CalDAV Client
-    # Avoid the expensive release build when the cheaper suites fail.
-    needs: zero-access
+    needs: product-build
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
-      - name: Build product (RocksDB, no enterprise or test mode)
-        run: cargo build --release --locked -p stalwart --no-default-features --features rocks
+      - name: Download product binary
+        uses: actions/download-artifact@v8
+        with:
+          name: stalwart-product
+          path: ${{ runner.temp }}/product
+
+      - name: Extract product binary
+        run: tar -xf "$RUNNER_TEMP/product/stalwart-product.tar" -C "$RUNNER_TEMP/product"
 
       - name: Fetch pinned independent client suite
         run: |
@@ -453,7 +503,7 @@ jobs:
       - name: Third-party CalDAV suites and strict scheduling flows (plain and key)
         run: |
           "$RUNNER_TEMP/caldav-venv/bin/python" tests/caldav_client/runner.py \
-            --binary target/release/stalwart \
+            --binary "$RUNNER_TEMP/product/stalwart" \
             --caldav-source "$RUNNER_TEMP/python-caldav" \
             --log-dir "$RUNNER_TEMP/caldav-client-logs"
 
@@ -472,11 +522,12 @@ jobs:
 
   fresh-store:
     name: Fresh OSS Store Restart
-    needs: style
+    needs: product-build
     # The shipping product (RocksDB, no enterprise or test mode), built in
-    # this job's own Cargo process, apart from the enterprise-enabled test
-    # builds. The gate creates a fresh store, an ordinary account and two key
-    # accounts, seeds mail, calendars, pins and sharing through public
+    # the product-build job's own Cargo process, apart from the
+    # enterprise-enabled test builds. The gate creates a fresh store, an
+    # ordinary account and two key accounts, seeds mail, calendars, pins and
+    # sharing through public
     # interfaces, stops the server, restarts the same binary on the same
     # store and reads everything back on new connections
     # (tests/product/fresh_store.py). Its failure tests run first; they use
@@ -487,9 +538,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
@@ -498,13 +546,19 @@ jobs:
       - name: Check gate failure boundaries
         run: python -B -m unittest discover -s tests/product -p test_fresh_store.py -v
 
-      - name: Build product (RocksDB, no enterprise or test mode)
-        run: cargo build --release --locked -p stalwart --no-default-features --features rocks
+      - name: Download product binary
+        uses: actions/download-artifact@v8
+        with:
+          name: stalwart-product
+          path: ${{ runner.temp }}/product
+
+      - name: Extract product binary
+        run: tar -xf "$RUNNER_TEMP/product/stalwart-product.tar" -C "$RUNNER_TEMP/product"
 
       - name: Fresh store create, restart and readback
         run: |
           python -B tests/product/fresh_store.py \
-            --binary target/release/stalwart \
+            --binary "$RUNNER_TEMP/product/stalwart" \
             --log-dir "$RUNNER_TEMP/fresh-store-logs"
 
       - name: Retain sanitized fresh-store failure diagnostics
