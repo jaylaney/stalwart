@@ -1608,6 +1608,9 @@ async fn merge(
                                 uid: &event_uid,
                             },
                             ZaFanOutKind::Change,
+                            // iMIP spec 5.5 (D15): internal delegates only,
+                            // in the release 2 arm and the mail arm alike.
+                            true,
                             RecipientPolicy::new(&server.core.groupware, event.meta.flags),
                             reply_lease.as_ref().map(|lease| lease.lease()),
                             None,

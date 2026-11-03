@@ -4711,6 +4711,7 @@ async fn delegated_run(
             } else {
                 ZaFanOutKind::Change
             },
+            false,
             RecipientPolicy::new(&test.server.core.groupware, 0),
             None,
             Some(&resolution),
@@ -4820,6 +4821,7 @@ async fn delegated_scheduling_tests(test: &mut TestServer) {
                 uid: "task9-source",
             },
             ZaFanOutKind::Change,
+            false,
             RecipientPolicy::new(&test.server.core.groupware, 0),
             None,
             Some(&resolution),
@@ -5281,7 +5283,10 @@ async fn delegated_identity_and_groups(test: &mut TestServer, owner_id: u32, wri
     let (_, result, counts) =
         delegated_run(test, &owner, &writer, &keys, 0, None, tree, None).await;
     assert_eq!(counts, vec![1]);
-    assert_eq!(result.statuses[0].status, "5.3");
+    // iMIP spec 5.1 (D9) and Jay's decision 10: a group is a local account
+    // that is never a key account, so the mail class: handed to the mailer
+    // (`1.1`), where release 4 recorded not attempted (`5.3`).
+    assert_eq!(result.statuses[0].status, "1.1");
     let text = delegated_tree("task9-writer-group-suppressed", &[WRITER_GROUP])
         .to_string()
         .replace(
@@ -6310,6 +6315,7 @@ async fn delegated_attendee_and_alias_edges(test: &TestServer, owner_id: u32, wr
                 uid: "task9-fallback",
             },
             ZaFanOutKind::Deletion,
+            false,
             RecipientPolicy::new(&test.server.core.groupware, 0),
             None,
             None,
@@ -6447,6 +6453,7 @@ async fn delegated_attendee_and_alias_edges(test: &TestServer, owner_id: u32, wr
                 uid,
             },
             ZaFanOutKind::Change,
+            false,
             RecipientPolicy::new(&test.server.core.groupware, 0),
             None,
             None,
@@ -6546,6 +6553,7 @@ async fn delegated_attendee_and_alias_edges(test: &TestServer, owner_id: u32, wr
                 uid: "task9-subaddress",
             },
             ZaFanOutKind::Change,
+            false,
             RecipientPolicy::new(&test.server.core.groupware, 0),
             None,
             None,
@@ -6584,6 +6592,7 @@ async fn delegated_attendee_and_alias_edges(test: &TestServer, owner_id: u32, wr
                 uid: "task9-subaddress",
             },
             ZaFanOutKind::Change,
+            false,
             RecipientPolicy::new(&test.server.core.groupware, 0),
             None,
             None,
@@ -6663,6 +6672,7 @@ async fn delegated_owner_exclusion_precedes_eligibility(
                 uid: "task9-owner-store-failure",
             },
             ZaFanOutKind::Change,
+            false,
             RecipientPolicy::new(&test.server.core.groupware, 0),
             None,
             Some(&resolution),
@@ -6720,6 +6730,7 @@ async fn delegated_owner_exclusion_precedes_eligibility(
                 uid: "task9-owner-store-failure",
             },
             ZaFanOutKind::Change,
+            false,
             RecipientPolicy::new(&test.server.core.groupware, 0),
             None,
             Some(&resolution),
@@ -6745,6 +6756,7 @@ async fn delegated_owner_exclusion_precedes_eligibility(
                     uid: "task9-owner-store-failure"
                 },
                 ZaFanOutKind::Change,
+                false,
                 RecipientPolicy::new(&test.server.core.groupware, 0),
                 None,
                 Some(&resolution)
@@ -7719,10 +7731,12 @@ async fn sharing_compare_lifecycle(
                 });
                 source_pair_sets.push(Some(present));
                 if label.contains("sole-group") {
+                    // iMIP spec 5.1 (D9) and Jay's decision 10: the group is
+                    // the mail class, handed to the mailer (`1.1`).
                     assert!(
                         statuses_for(&source_statuses[run], "sharing-life-team@example.com")
                             .iter()
-                            .all(|status| status == "5.3")
+                            .all(|status| status == "1.1")
                     );
                     assert!(
                         !statuses_for(&source_statuses[run], "sharing-life-team@example.com")

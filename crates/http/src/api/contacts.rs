@@ -767,6 +767,8 @@ async fn za_redeliver_entry(
                 uid: &entry.uid,
             },
             ZaFanOutKind::Redelivery,
+            // iMIP spec 5.5: redelivery is a key-recipient mechanism.
+            true,
             policy,
             lease.as_ref().map(|lease| lease.lease()),
             None,

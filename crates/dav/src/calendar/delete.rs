@@ -490,6 +490,7 @@ impl CalendarDeleteRequestHandler for Server {
                         uid: &message.uid,
                     },
                     ZaFanOutKind::Deletion,
+                    false,
                     message.policy,
                     None,
                     resolution.as_ref(),

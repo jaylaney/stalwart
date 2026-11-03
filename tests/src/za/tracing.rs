@@ -884,14 +884,16 @@ pub async fn test(test: &mut TestServer) {
         )
         .await
         .with_status(StatusCode::CREATED);
+    // iMIP spec 5.1, 5.4: an address no account has is the mail class,
+    // handed to the mailer (`1.1`), where release 2 recorded `5.3`.
     assert_eq!(
         attendee_statuses(&key_client, &invite_path, LOOKUP_LOCAL_ATTENDEE).await,
-        ["5.3"]
+        ["1.1"]
     );
     // The rule resolves the attendee to a local part no account has.
     assert_eq!(
         attendee_statuses(&key_client, &invite_path, SUBADDR_ATTENDEE).await,
-        ["5.3"]
+        ["1.1"]
     );
     key_client
         .request("DELETE", &invite_path, "")

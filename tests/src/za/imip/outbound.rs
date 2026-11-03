@@ -11,23 +11,31 @@
 use super::{ATT, deliver, event, is_request_for, itip_mail};
 use crate::{
     utils::{
+        account::Account,
         server::TestServer,
         smtp_sink::sink,
         za::{
             HookParked, inbox_ids, new_inbox_items, queued_recipients, trigger_drain,
-            wait_for_queue, za_app_password,
+            wait_for_queue, za_app_password, za_setup_token,
         },
     },
     za::{
         STRONG,
         drain::DrainOn,
-        fanout::{NO_REPLY, Party},
+        fanout::{NO_REPLY, Party, attendee_statuses},
         mail::{Traced, TracedEvent},
-        uid_lease::put,
+        uid_lease::{self, put},
         user_permissions,
     },
 };
-use ::registry::{schema::structs::TaskCalendarItipContents, types::map::Map};
+use ::registry::{
+    schema::{
+        enums::Permission,
+        prelude::{ObjectType, Property},
+        structs::{MailingList, Permissions, PermissionsList, TaskCalendarItipContents},
+    },
+    types::map::Map,
+};
 use common::za::{
     imip::{ZaImipMail, ZaImipOutcome, za_imip_submit},
     test_hooks,
@@ -36,24 +44,119 @@ use groupware::scheduling::ItipSummary;
 use hyper::StatusCode;
 use std::collections::HashSet;
 use trc::{CalendarEvent, EventType, Key};
+use types::id::Id;
 
 /// The key organizer of this module's cases.
 pub const OUT_KEY: &str = "imip-out-key@example.com";
+/// A second key account: an internal recipient (iMIP spec 5.1).
+pub const OUT_KEY2: &str = "imip-out-key2@example.com";
+/// A plain local account: a mail recipient (D9).
+pub const OUT_PLAIN: &str = "imip-out-plain@example.com";
+/// A key account without `CalendarSchedulingReceive`: not attempted (5.1).
+const NOPERM: &str = "imip-noperm@example.com";
+/// A key account whose setup is pending, so it serves no public key: not
+/// attempted (5.1).
+const PENDING: &str = "imip-pending@example.com";
+/// A local mailing list of `OUT_KEY2` and `OUT_PLAIN`: a mail recipient
+/// (Jay's decision 10).
+const LIST: &str = "imip-list@example.com";
 
 /// The seam case's iTIP REQUEST from `OUT_KEY` to `ATT`.
 const SEAM_ICS: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//imip seam//EN\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:imip-out-seam\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20990105T090000Z\r\nDTEND:20990105T100000Z\r\nSUMMARY:Seam\r\nORGANIZER:mailto:imip-out-key@example.com\r\nATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:imip-att@remote.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 
 pub async fn test(test: &mut TestServer) {
     println!("Running zero-access iMIP outbound tests...");
-    let account = test
-        .account("admin@example.com")
-        .create_key_user_account(OUT_KEY, STRONG, "iMIP out key", &[], user_permissions())
+    let admin = test.account("admin@example.com").clone();
+    for (name, description) in [
+        (OUT_KEY, "iMIP out key"),
+        (OUT_KEY2, "iMIP out key two"),
+        (NOPERM, "iMIP no receive"),
+    ] {
+        let account = admin
+            .create_key_user_account(name, STRONG, description, &[], user_permissions())
+            .await;
+        test.insert_account(account);
+    }
+    // As `fanout::test` removes it from key3.
+    admin
+        .registry_update_object(
+            ObjectType::Account,
+            test.account(NOPERM).id(),
+            serde_json::json!({ Property::Permissions: Permissions::Merge(PermissionsList {
+                disabled_permissions: Map::new(vec![Permission::CalendarSchedulingReceive]),
+                enabled_permissions: Map::new(user_permissions()),
+            }) }),
+        )
         .await;
-    test.insert_account(account);
+    // Passwordless with a setup token: a key account that serves no key.
+    let pending = admin
+        .create_passwordless_user_account(PENDING, STRONG, "iMIP pending", &[], user_permissions())
+        .await;
+    za_setup_token(&admin, PENDING).await;
+    let plain = admin
+        .create_user_account(OUT_PLAIN, STRONG, "iMIP out plain", &[], user_permissions())
+        .await;
+    let domain_id = admin.find_or_create_domain("example.com").await;
+    let list = admin
+        .registry_create_object(MailingList {
+            name: LIST.split_once('@').unwrap().0.to_string(),
+            domain_id,
+            recipients: Map::new(vec![OUT_KEY2.to_string(), OUT_PLAIN.to_string()]),
+            ..Default::default()
+        })
+        .await;
     let owner = Party::new(test, OUT_KEY);
+    let key2 = Party::new(test, OUT_KEY2);
+    let start2 = inbox_ids(test, key2.id).await;
 
     seam(test, &owner).await;
     refresh_two_sessions(test, &owner).await;
+    statuses(test, &owner).await;
+
+    cleanup(
+        test,
+        &admin,
+        &owner,
+        (&key2, &start2),
+        [pending, plain],
+        list,
+    )
+    .await;
+}
+
+/// Deletes what the module created: its event, `OUT_KEY2`'s items, the
+/// pending and plain accounts and the list. The key accounts go with the
+/// suite's (`destroy_key_accounts`).
+async fn cleanup(
+    test: &TestServer,
+    admin: &Account,
+    owner: &Party,
+    (key2, start2): (&Party, &[u32]),
+    accounts: [Account; 2],
+    list: Id,
+) {
+    owner
+        .client
+        .request_with_headers("DELETE", &statuses_path(owner), [NO_REPLY], "")
+        .await
+        .with_status(StatusCode::NO_CONTENT);
+    key2.delete_items_since(test, start2).await;
+    for account in accounts {
+        admin.destroy_account(account).await;
+    }
+    admin
+        .registry_destroy(ObjectType::MailingList, [list])
+        .await
+        .assert_destroyed(&[list]);
+    test.wait_for_tasks().await;
+}
+
+/// The href of `statuses`' event.
+fn statuses_path(owner: &Party) -> String {
+    format!(
+        "/dav/cal/{}/default/imip-out-1.ics",
+        owner.name.replace('@', "%40")
+    )
 }
 
 /// Spec 5.3, D11, D12: one (message, recipient) in process memory, handed to
@@ -184,6 +287,50 @@ async fn refresh_two_sessions(test: &TestServer, owner: &Party) {
         .request_with_headers("DELETE", &href, [NO_REPLY], "")
         .await
         .with_status(StatusCode::NO_CONTENT);
+}
+
+/// Spec 5.1, 5.4, D9, decision 10: the status of each class.
+async fn statuses(_test: &TestServer, owner: &Party) {
+    let path = statuses_path(owner);
+    assert_eq!(
+        uid_lease::put(
+            owner.name,
+            STRONG,
+            path.clone(),
+            event(
+                "imip-out-1",
+                owner.name,
+                &[
+                    ATT,
+                    "imip-out-plain@example.com",
+                    "imip-out-key2@example.com",
+                    "imip-pending@example.com",
+                    "imip-noperm@example.com",
+                    "imip-out-key+sub@example.com",
+                    "imip-list@example.com"
+                ],
+                0,
+                ""
+            )
+        )
+        .await,
+        201
+    );
+    for (address, status) in [
+        (ATT, "1.1"),
+        ("imip-out-plain@example.com", "1.1"),
+        ("imip-list@example.com", "1.1"),
+        ("imip-out-key2@example.com", "1.2"),
+        ("imip-pending@example.com", "5.3"),
+        ("imip-noperm@example.com", "5.3"),
+        ("imip-out-key+sub@example.com", "5.3"),
+    ] {
+        assert_eq!(
+            attendee_statuses(&owner.client, &path, address).await,
+            [status],
+            "{address}"
+        );
+    }
 }
 
 /// D17, invariant 47: the submission's own lookups are quiet and its own

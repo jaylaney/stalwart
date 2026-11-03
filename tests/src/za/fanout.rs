@@ -5,7 +5,10 @@
  */
 
 //! Invitations spec 5: a key account's own request delivers sealed pending
-//! items to internal key recipients instead of queueing mail. Plan 9 has no
+//! items to internal key recipients instead of queueing mail. A recipient of
+//! iMIP's mail class (iMIP spec 5.1: no local account, or a local account
+//! that is not a key account) records `1.1` instead and is handed to the
+//! mailer after the commit, never through the task queue. Plan 9 has no
 //! drain, so the tests read items at store level and open them with the
 //! recipient's private key (`open_pending_item_as`).
 
@@ -183,7 +186,8 @@ pub async fn test(test: &mut TestServer) {
     let start5 = inbox_ids(test, key5.id).await;
 
     // 1. Invite with a mixed attendee list (spec 5.2, 5.3): key2 is
-    // internal; plain is a non-key account; outsider is external.
+    // internal; plain (a non-key account) and outsider (external) are of
+    // iMIP's mail class (iMIP spec 5.1).
     let plain_items = inbox_ids(test, plain_id).await;
     let plain_mail = mail_count(test, plain_id).await;
     let mixed = format!("{KEY1_CAL}fo-mixed.ics");
@@ -266,13 +270,15 @@ pub async fn test(test: &mut TestServer) {
         attendee_statuses(&key1.client, &mixed, "key2@example.com").await,
         ["1.2"]
     );
+    // iMIP spec 5.4: the mail class is handed to the mailer (`1.1`), where
+    // release 2 recorded not attempted (`5.3`).
     assert_eq!(
         attendee_statuses(&key1.client, &mixed, "plain@example.com").await,
-        ["5.3"]
+        ["1.1"]
     );
     assert_eq!(
         attendee_statuses(&key1.client, &mixed, "outsider@remote.test").await,
-        ["5.3"]
+        ["1.1"]
     );
     // No mail (invariant 12). The task queue is read with the consumer held
     // in `test_task_queue` (Task 5).
@@ -481,8 +487,8 @@ pub async fn test(test: &mut TestServer) {
 
     // 2 (continued). key1 DELETEs the event: each internal attendee gets a
     // CANCEL built from the unsealed stored tree, with its pair (spec 5.5).
-    // Each CANCEL carries the stored SEQUENCE plus one; plain (5.3) gets no
-    // mail.
+    // Each CANCEL carries the stored SEQUENCE plus one; plain (the mail
+    // class) gets no mail through the task queue.
     let stored_sequence = stored_sequence(&key1.client, &mixed).await;
     let plain_mail = mail_count(test, plain_id).await;
     let before2 = inbox_ids(test, key2.id).await;

@@ -25,6 +25,15 @@
 //! and so caches, the recipient's access token to read its permissions, as
 //! upstream's delivery does for its recipients.
 //!
+//! iMIP spec 5.1, 5.2: an address that resolves to no local account, or to
+//! a local account that is not a key account, is of the mail class (D9). It
+//! receives every message upstream's builders address to it (D10), routed
+//! `Route::Mail`: its property records `1.1` (`ITIP_STATUS_SENT`) and the
+//! result returns one mail attempt per (message, address) for the caller
+//! to submit after its commit (5.4). Under `internal_only` (D15) a mail
+//! recipient is not attempted (`5.3`) and yields no attempt. A mail
+//! recipient is never decided, pinned or given a withheld entry.
+//!
 //! Key pinning spec 5: before sealing to an internal recipient, the fan-out
 //! compares its served key with the key the sender's pin record holds for
 //! the normalized address (4.3), and refuses a different one: no item, the
@@ -32,9 +41,10 @@
 //! withheld entry for the source event (`ZaSource`) unless the fan-out is a
 //! deletion. It runs in four phases (5.2):
 //!
-//! 1. Resolve every attempted address once, reading its served key, then
-//!    read the pin record (and the wrap's mark when the record is absent or
-//!    unusable), keeping the refusal id of each entry a delivery consumes.
+//! 1. Resolve every address once, reading an internal one's served key,
+//!    and route it by its class; then read the pin record (and the wrap's
+//!    mark when the record is absent or unusable), keeping the refusal id
+//!    of each entry a delivery consumes.
 //!    An attendee's DELETE without a REPLY of upstream's declines through
 //!    the fork's `za_decline_all` when its copy holds an entry for an
 //!    internal ORGANIZER (5.1 item 2).
@@ -123,8 +133,9 @@ pub struct ZaScheduleStatus {
     /// On the ORGANIZER property (a reply to the organizer) instead of the
     /// recipient's ATTENDEE properties.
     pub on_organizer: bool,
-    /// `ITIP_STATUS_DELIVERED`, `ITIP_STATUS_NOT_ATTEMPTED`,
-    /// `ITIP_STATUS_DELIVERY_FAILED` or `ITIP_STATUS_KEY_REFUSED`.
+    /// `ITIP_STATUS_DELIVERED`, `ITIP_STATUS_SENT`,
+    /// `ITIP_STATUS_NOT_ATTEMPTED`, `ITIP_STATUS_DELIVERY_FAILED` or
+    /// `ITIP_STATUS_KEY_REFUSED`.
     pub status: &'static str,
 }
 
@@ -140,6 +151,11 @@ pub struct ZaFanOutResult {
     /// The reconciliation's committed values (key pinning spec 5.1), for
     /// `za_set_sequences` on the same tree, next to the statuses.
     pub sequences: Vec<ZaSequence>,
+    /// iMIP spec 5.4: one attempt per (message, mail-class address), in
+    /// message order, built from the reconciled, `SENT-BY`-marked message,
+    /// for the caller to submit once its commit returns `Ok`. Empty under
+    /// `internal_only`.
+    pub mail: Vec<ZaImipMail>,
 }
 
 /// A CANCEL (organizer) or declined REPLY (attendee) that a key account's
@@ -306,6 +322,11 @@ pub trait ZaFanOut: Sync + Send {
     /// are the clone's committed values. `policy` is the event's
     /// `RecipientPolicy`, under which a change's full state is split per
     /// recipient as upstream's messages were (upgrade ruling 91).
+    /// iMIP spec 5.4: every mail-class recipient a message addresses
+    /// records `1.1` and yields one attempt in the result's `mail`, which
+    /// the caller submits after its commit; with `internal_only` (D15: the
+    /// drain's delegating merge and `contacts/pin`) it records `5.3` and
+    /// yields none.
     #[allow(clippy::too_many_arguments)]
     fn za_fan_out(
         &self,
@@ -318,6 +339,7 @@ pub trait ZaFanOut: Sync + Send {
         event: &ICalendar,
         source: ZaSource<'_>,
         kind: ZaFanOutKind,
+        internal_only: bool,
         policy: RecipientPolicy,
         fence: Option<&ZaUidLease>,
         resolution: Option<&ZaDelegationResolution>,
@@ -337,6 +359,7 @@ impl ZaFanOut for Server {
         event: &ICalendar,
         source: ZaSource<'_>,
         kind: ZaFanOutKind,
+        internal_only: bool,
         policy: RecipientPolicy,
         fence: Option<&ZaUidLease>,
         resolution: Option<&ZaDelegationResolution>,
@@ -394,9 +417,9 @@ impl ZaFanOut for Server {
             stored_pairs.clone().unwrap_or_default()
         };
 
-        // Phase 1: route every (message, address); resolve each attempted
-        // address once, by its normalized form, with its served key; then
-        // read the pin record.
+        // Phase 1: resolve every address once, by its normalized form (an
+        // internal one with its served key), and route every (message,
+        // address) by its class (iMIP spec 5.2); then read the pin record.
         let mut recipients: AHashMap<String, Recipient> = AHashMap::new();
         let mut internal: Vec<(String, [u8; 32])> = Vec::new();
         let mut read = None;
@@ -449,40 +472,64 @@ impl ZaFanOut for Server {
             let method = itip_method(&message.message).ok();
             let is_reply = matches!(method, Some(ICalendarMethod::Reply));
             for address in &message.to {
-                let route = route(method, message, address, organizer.as_ref(), &union);
-                // An address that does not sanitize is not internal.
+                // iMIP spec 5.2: every address that sanitizes is resolved,
+                // whatever its route; one that does not is neither internal
+                // nor mailed (upstream's `3.7`).
+                let normalized = za_normalize_address(address);
+                let recipient = match &normalized {
+                    Some(key) => Some(match recipients.get(key) {
+                        Some(recipient) => *recipient,
+                        None => {
+                            let recipient = match resolved.take_if(|(cached, _)| cached == key) {
+                                Some((_, recipient)) => recipient,
+                                None => {
+                                    let allow_self = resolution.is_some()
+                                        && messages.iter().any(|candidate| {
+                                            candidate.provenance
+                                                == ZaMessageProvenance::DelegatedSelf
+                                                && candidate.message.to.iter().any(|address| {
+                                                    za_normalize_address(address).as_ref()
+                                                        == Some(key)
+                                                })
+                                        });
+                                    resolve_recipient(
+                                        self,
+                                        sender_id,
+                                        key,
+                                        resolution
+                                            .and_then(|resolution| resolution.accounts.get(key)),
+                                        allow_self,
+                                        resolution.map(|_| event_account.account_id),
+                                    )
+                                    .await
+                                }
+                            };
+                            recipients.insert(key.clone(), recipient);
+                            recipient
+                        }
+                    }),
+                    None => None,
+                };
+                let route = route(
+                    method,
+                    message,
+                    address,
+                    organizer.as_ref(),
+                    &union,
+                    matches!(recipient, Some(Recipient::Mail)),
+                );
+                // Only an attempt routed `Deliver` makes its recipient
+                // internal, so nothing else is decided or pinned (iMIP
+                // spec 5.2).
                 let key = match route {
-                    Route::Deliver { .. } => za_normalize_address(address),
-                    Route::NotAttempted { .. } => None,
+                    Route::Deliver { .. } => normalized,
+                    Route::NotAttempted { .. } | Route::Mail { .. } => None,
                 };
                 if let Some(key) = &key
-                    && !recipients.contains_key(key)
+                    && let Some(Recipient::Internal { public_key, .. }) = recipient
+                    && !internal.iter().any(|(internal, _)| internal == key)
                 {
-                    let recipient = match resolved.take_if(|(cached, _)| cached == key) {
-                        Some((_, recipient)) => recipient,
-                        None => {
-                            let allow_self = resolution.is_some()
-                                && messages.iter().any(|candidate| {
-                                    candidate.provenance == ZaMessageProvenance::DelegatedSelf
-                                        && candidate.message.to.iter().any(|address| {
-                                            za_normalize_address(address).as_ref() == Some(key)
-                                        })
-                                });
-                            resolve_recipient(
-                                self,
-                                sender_id,
-                                key,
-                                resolution.and_then(|resolution| resolution.accounts.get(key)),
-                                allow_self,
-                                resolution.map(|_| event_account.account_id),
-                            )
-                            .await
-                        }
-                    };
-                    if let Recipient::Internal { public_key, .. } = recipient {
-                        internal.push((key.clone(), public_key));
-                    }
-                    recipients.insert(key.clone(), recipient);
+                    internal.push((key.clone(), public_key));
                 }
                 attempts.push(Attempt {
                     message,
@@ -645,10 +692,26 @@ impl ZaFanOut for Server {
             }
         }
         let mut statuses = Vec::new();
+        let mut mail = Vec::new();
         let mut not_written: AHashSet<&str> = AHashSet::new();
         for attempt in &attempts {
             let status = match &attempt.route {
                 Route::NotAttempted { .. } => ITIP_STATUS_NOT_ATTEMPTED,
+                // iMIP spec 5.4, D15: an internal-only fan-out does not
+                // attempt the mail class.
+                Route::Mail { .. } if internal_only => ITIP_STATUS_NOT_ATTEMPTED,
+                // iMIP spec 5.4: handed to the mailer, which the caller runs
+                // after its commit; `attempt.message` is reconciled and
+                // `SENT-BY`-marked.
+                Route::Mail { .. } => {
+                    mail.push(za_imip_mail(
+                        event_account.account_id,
+                        source.document_id,
+                        attempt.message,
+                        attempt.address,
+                    ));
+                    ITIP_STATUS_SENT
+                }
                 Route::Deliver {
                     pair, reply_token, ..
                 } => match attempt.key.as_deref().map(|key| (key, recipients.get(key))) {
@@ -678,6 +741,8 @@ impl ZaFanOut for Server {
                                 }
                                 for mut full in full_states.remove(key).unwrap_or_default() {
                                     za_mark_sent_by(&mut full, writer_account, event_account);
+                                    // To an internal recipient: release 2's
+                                    // route.
                                     let full_route = if is_reply_message(&full) {
                                         Some(route(
                                             Some(&ICalendarMethod::Reply),
@@ -685,12 +750,15 @@ impl ZaFanOut for Server {
                                             attempt.address,
                                             organizer.as_ref(),
                                             &union,
+                                            false,
                                         ))
                                     } else {
                                         None
                                     };
                                     let carrier = match &full_route {
-                                        Some(Route::NotAttempted { .. }) => None,
+                                        Some(Route::NotAttempted { .. } | Route::Mail { .. }) => {
+                                            None
+                                        }
                                         Some(Route::Deliver {
                                             pair, reply_token, ..
                                         }) => Some((pair.as_ref(), reply_token.as_deref())),
@@ -743,7 +811,12 @@ impl ZaFanOut for Server {
                         }
                     }
                     Some((_, Some(Recipient::Failed))) => ITIP_STATUS_DELIVERY_FAILED,
-                    Some((_, Some(Recipient::NotInternal | Recipient::Internal { .. }) | None))
+                    // A mail recipient never routes `Deliver`.
+                    Some((
+                        _,
+                        Some(Recipient::NotInternal | Recipient::Mail | Recipient::Internal { .. })
+                        | None,
+                    ))
                     | None => ITIP_STATUS_NOT_ATTEMPTED,
                 },
             };
@@ -827,6 +900,7 @@ impl ZaFanOut for Server {
             pairs: pairs.filter(|pairs| !pairs.is_empty()),
             statuses,
             sequences,
+            mail,
         })
     }
 }
@@ -1173,10 +1247,18 @@ pub fn za_set_schedule_status(ical: &mut ICalendar, statuses: &[ZaScheduleStatus
 
 #[derive(Clone, Copy)]
 enum Recipient {
+    /// Another local key account that receives scheduling and serves a
+    /// public key.
     Internal {
         account_id: u32,
         public_key: [u8; 32],
     },
+    /// iMIP spec 5.1 (D9): no local account, or a local account that is not
+    /// a key account.
+    Mail,
+    /// Neither: the sender's own account, the event owner on the
+    /// delegated-organizer path, or a key account without
+    /// `CalendarSchedulingReceive` or a served key. Never mailed.
     NotInternal,
     Failed,
 }
@@ -1190,29 +1272,42 @@ enum Route {
         pair: Option<TokenPairs>,
         reply_token: Option<Zeroizing<[u8; TOKEN_LEN]>>,
     },
+    /// iMIP spec 5.2: a mail recipient, handed to the mailer.
+    Mail {
+        on_organizer: bool,
+    },
 }
 
 impl Route {
     fn on_organizer(&self) -> bool {
         match self {
-            Route::NotAttempted { on_organizer } | Route::Deliver { on_organizer, .. } => {
-                *on_organizer
-            }
+            Route::NotAttempted { on_organizer }
+            | Route::Deliver { on_organizer, .. }
+            | Route::Mail { on_organizer } => *on_organizer,
         }
     }
 }
 
 /// Spec 5.2: whether `recipient` of `message` is attempted, and with which
-/// carrier (spec 5.3 step 1).
+/// carrier (spec 5.3 step 1). iMIP spec 5.2 (D10): a mail recipient
+/// (`mail`) gets every message upstream's builders address to it, whatever
+/// the method; release 2's restrictions below apply to internal recipients
+/// only.
 fn route(
     method: Option<&ICalendarMethod>,
     message: &ItipMessage<ICalendar>,
     recipient: &str,
     organizer: Option<&Email>,
     union: &TokenPairs,
+    mail: bool,
 ) -> Route {
     let to_organizer =
         organizer.is_some_and(|organizer| organizer.email.eq_ignore_ascii_case(recipient));
+    if mail {
+        return Route::Mail {
+            on_organizer: to_organizer,
+        };
+    }
     match method {
         // An attendee-originated REQUEST (a delegate invitation) is not
         // attempted: delegates receive their token from the organizer's
@@ -1323,6 +1418,11 @@ fn current_attendee_pairs(
 /// authority"), the bare code.
 pub const ITIP_STATUS_KEY_REFUSED: &str = "3.8";
 
+/// iMIP spec 5.4: RFC 6638 "sent, delivery not confirmed", for a mail
+/// recipient handed to the mailer; written before the commit, the mail
+/// submitted after it.
+pub const ITIP_STATUS_SENT: &str = "1.1";
+
 /// The instances a refused REPLY carries (key pinning spec 4.1): the master
 /// for a component without RECURRENCE-ID, else the drain's `instance_key`
 /// from the REPLY's own snapshot, its RECURRENCE-ID resolved with the
@@ -1349,6 +1449,7 @@ fn status_rank(status: &str) -> u8 {
         ITIP_STATUS_KEY_REFUSED => 3,
         ITIP_STATUS_DELIVERY_FAILED => 2,
         ITIP_STATUS_NOT_ATTEMPTED => 1,
+        ITIP_STATUS_SENT | ITIP_STATUS_DELIVERED => 0,
         _ => 0,
     }
 }
@@ -1378,8 +1479,9 @@ fn record_status(
 }
 
 /// Spec 5.2: whether `address` (normalized) is an internal key account,
-/// with its served key. A lookup error, the served key's included, is that
-/// recipient's delivery failure, traced without the address.
+/// with its served key, or of the mail class (iMIP spec 5.1). A lookup
+/// error, the served key's included, is that recipient's delivery failure,
+/// traced without the address.
 async fn resolve_recipient(
     server: &Server,
     sender_id: u32,
@@ -1409,9 +1511,12 @@ async fn resolve_inner(
     allow_self: bool,
     excluded_owner: Option<u32>,
 ) -> trc::Result<Recipient> {
+    // iMIP spec 5.1 (D9): no local account (a list, a disabled address and
+    // a domain that is not local included), or a local account that is not
+    // a key account, is the mail class.
     let account_id = match raw {
         Some(ZaResolvedAccount::Account(id)) => *id,
-        Some(ZaResolvedAccount::NotFound) => return Ok(Recipient::NotInternal),
+        Some(ZaResolvedAccount::NotFound) => return Ok(Recipient::Mail),
         // The producer already traced this lookup failure; reuse it unchanged.
         Some(ZaResolvedAccount::Failed) => return Ok(Recipient::Failed),
         None => {
@@ -1420,7 +1525,7 @@ async fn resolve_inner(
                 return Err(trc::StoreEvent::UnexpectedError.into_err());
             }
             let Some(id) = server.za_account_id_from_email(address).await? else {
-                return Ok(Recipient::NotInternal);
+                return Ok(Recipient::Mail);
             };
             id
         }
@@ -1432,13 +1537,14 @@ async fn resolve_inner(
     if (account_id == sender_id && !allow_self) || excluded_owner == Some(account_id) {
         return Ok(Recipient::NotInternal);
     }
-    // `za_is_key_account`'s lookup.
+    // `za_is_key_account`'s lookup; an id it no longer finds is no local
+    // account.
     if !server
         .try_account(account_id)
         .await?
         .is_some_and(|account| account.is_key_account())
     {
-        return Ok(Recipient::NotInternal);
+        return Ok(Recipient::Mail);
     }
     if !server
         .access_token(account_id)
@@ -1679,6 +1785,7 @@ mod tests {
         recipient: &str,
         organizer: Option<&Email>,
         union: &TokenPairs,
+        mail: bool,
     ) -> Route {
         route(
             itip_method(&message.message).ok(),
@@ -1686,6 +1793,7 @@ mod tests {
             recipient,
             organizer,
             union,
+            mail,
         )
     }
 
@@ -1749,7 +1857,7 @@ mod tests {
         union.insert("bob@example.com", [1; TOKEN_LEN]);
         for method in ["REQUEST", "CANCEL"] {
             let ours = message("org@example.com", true, method);
-            match route_of(&ours, "bob@example.com", organizer.as_ref(), &union) {
+            match route_of(&ours, "bob@example.com", organizer.as_ref(), &union, false) {
                 Route::Deliver {
                     on_organizer: false,
                     pair: Some(pair),
@@ -1763,7 +1871,13 @@ mod tests {
             let delegate = message("bob@example.com", false, method);
             assert!(
                 matches!(
-                    route_of(&delegate, "dave@example.com", organizer.as_ref(), &union),
+                    route_of(
+                        &delegate,
+                        "dave@example.com",
+                        organizer.as_ref(),
+                        &union,
+                        false
+                    ),
                     Route::NotAttempted {
                         on_organizer: false
                     }
@@ -1774,7 +1888,13 @@ mod tests {
         // A removed attendee with no stored pair: delivered without a pair.
         let cancel = message("org@example.com", true, "CANCEL");
         assert!(matches!(
-            route_of(&cancel, "dave@example.com", organizer.as_ref(), &union),
+            route_of(
+                &cancel,
+                "dave@example.com",
+                organizer.as_ref(),
+                &union,
+                false
+            ),
             Route::Deliver { pair: None, .. }
         ));
     }
@@ -1792,7 +1912,7 @@ mod tests {
         let mut own = TokenPairs::new();
         own.insert("bob@example.com", [5; TOKEN_LEN]);
         let reply = message("bob@example.com", false, "REPLY");
-        match route_of(&reply, "ORG@example.com", organizer.as_ref(), &own) {
+        match route_of(&reply, "ORG@example.com", organizer.as_ref(), &own, false) {
             Route::Deliver {
                 on_organizer: true,
                 pair: None,
@@ -1802,7 +1922,7 @@ mod tests {
         }
         assert!(
             matches!(
-                route_of(&reply, "carol@example.com", organizer.as_ref(), &own),
+                route_of(&reply, "carol@example.com", organizer.as_ref(), &own, false),
                 Route::NotAttempted {
                     on_organizer: false
                 }
@@ -1815,7 +1935,8 @@ mod tests {
                     &reply,
                     "org@example.com",
                     organizer.as_ref(),
-                    &TokenPairs::new()
+                    &TokenPairs::new(),
+                    false
                 ),
                 Route::NotAttempted { on_organizer: true }
             ),
@@ -1823,9 +1944,75 @@ mod tests {
         );
         let refresh = message("bob@example.com", false, "REFRESH");
         assert!(matches!(
-            route_of(&refresh, "org@example.com", organizer.as_ref(), &own),
+            route_of(&refresh, "org@example.com", organizer.as_ref(), &own, false),
             Route::NotAttempted { on_organizer: true }
         ));
+    }
+
+    #[test]
+    fn a_mail_recipient_gets_every_message_and_internal_ones_keep_release_2_routes() {
+        let organizer = Email::new("mailto:org@example.com", &organizer_addresses());
+        let union = TokenPairs::new(); // no token for anyone
+        // (message, recipient, routed Deliver when internal)
+        let cases = [
+            // A token-less REPLY to the ORGANIZER.
+            (
+                message("att@remote.test", false, "REPLY"),
+                "org@example.com",
+                false,
+            ),
+            // An attendee-originated REQUEST.
+            (
+                message("att@remote.test", false, "REQUEST"),
+                "dlg@remote.test",
+                false,
+            ),
+            // A REPLY to a delegator.
+            (
+                message("dlg@remote.test", false, "REPLY"),
+                "att@remote.test",
+                false,
+            ),
+            (
+                message("org@example.com", true, "CANCEL"),
+                "att@remote.test",
+                true,
+            ),
+        ];
+        for (msg, to, deliver) in &cases {
+            assert!(
+                matches!(
+                    route_of(msg, to, organizer.as_ref(), &union, true),
+                    Route::Mail { .. }
+                ),
+                "{to}"
+            );
+            assert_eq!(
+                matches!(
+                    route_of(msg, to, organizer.as_ref(), &union, false),
+                    Route::Deliver { .. }
+                ),
+                *deliver,
+                "{to}: release 2's route"
+            );
+        }
+        assert!(matches!(
+            route_of(
+                &cases[0].0,
+                "org@example.com",
+                organizer.as_ref(),
+                &union,
+                true
+            ),
+            Route::Mail { on_organizer: true }
+        ));
+    }
+
+    #[test]
+    fn sent_ranks_below_every_failure() {
+        assert!(status_rank(ITIP_STATUS_SENT) < status_rank(ITIP_STATUS_NOT_ATTEMPTED));
+        assert!(status_rank(ITIP_STATUS_SENT) < status_rank(ITIP_STATUS_DELIVERY_FAILED));
+        assert_eq!(status_rank(ITIP_STATUS_SENT), 0);
     }
 
     #[test]
