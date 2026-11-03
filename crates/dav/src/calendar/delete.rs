@@ -584,18 +584,23 @@ impl CalendarDeleteRequestHandler for Server {
         // The committed deletion retires every grant. Evict the grantees'
         // resident collection-key sessions and authorization only after that
         // commit succeeds, using the same channel as share mutations.
-        if !deleted_grantees.is_empty() {
+        let invalidated = if !deleted_grantees.is_empty() {
             let mut invalidation = CacheInvalidationBuilder::default();
             for grantee in deleted_grantees {
                 invalidation.invalidate(CacheInvalidation::AccessToken(grantee));
             }
-            self.invalidate_caches(invalidation).await?;
-        }
-        if za_keys.is_some() {
+            self.invalidate_caches(invalidation).await
+        } else {
+            Ok(())
+        };
+        if invalidated.is_ok() && za_keys.is_some() {
             self.notify_task_queue();
         }
-        // iMIP spec 5.4: the deletion (or its retry) committed.
+        // iMIP spec 5.4, section 7: the deletion (or its retry) committed, so
+        // its mail goes whether or not the invalidation failed; the
+        // invalidation's error is returned after.
         common::za::imip::za_imip_submit_all(self, za_mail).await;
+        invalidated?;
 
         Ok(HttpResponse::new(StatusCode::NO_CONTENT))
     }
