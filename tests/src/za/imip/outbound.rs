@@ -100,6 +100,9 @@ const UNROUTED_DISABLED: &str = "imip-off@imip-catchall.test";
 const UNROUTED_NOBODY: &str = "imip-out-nobody@example.com";
 /// PR review ruling O-1: the outside address the throttled case mails.
 const THROTTLED: &str = "imip-throttled@remote.test";
+/// A plain account the seam case destroys at once: an event's account the
+/// registry no longer finds when its mail is submitted.
+const GONE: &str = "imip-out-gone@example.com";
 
 /// The seam case's iTIP REQUEST from `OUT_KEY` to `ATT`.
 const SEAM_ICS: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//imip seam//EN\r\nMETHOD:REQUEST\r\nBEGIN:VEVENT\r\nUID:imip-out-seam\r\nDTSTAMP:20260101T000000Z\r\nDTSTART:20990105T090000Z\r\nDTEND:20990105T100000Z\r\nSUMMARY:Seam\r\nORGANIZER:mailto:imip-out-key@example.com\r\nATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:imip-att@remote.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
@@ -254,10 +257,17 @@ async fn seam(test: &TestServer, owner: &Party) {
             summary: serde_json::to_string(&ItipSummary::Invite(vec![])).unwrap(),
         },
     };
+    // An account destroyed between a commit and its submissions.
+    let admin = test.account("admin@example.com").clone();
+    let gone = admin
+        .create_user_account(GONE, STRONG, "iMIP gone", &[], user_permissions())
+        .await;
+    let gone_id = gone.id().document_id();
+    admin.destroy_account(gone).await;
     // iMIP spec 5.4: earlier writes (`imip::inbound`'s key organizer
     // inviting ATT) are mailed too; this case counts only its own.
     sink().clear();
-    // Every event of the three submissions below, for `assert_quiet`.
+    // Every event of the four submissions below, for `assert_quiet`.
     let traced = Traced::start(EventType::variants());
     assert!(matches!(
         za_imip_submit(&test.server, mail(ATT)).await,
@@ -296,9 +306,28 @@ async fn seam(test: &TestServer, owner: &Party) {
         ZaImipOutcome::Failed
     ));
     test_hooks::set_imip_submit_fail_once(None);
+    // The event's account the registry no longer finds: the submitter's
+    // context fails, traced, nothing sent.
+    let mut orphan = mail(ATT);
+    orphan.account_id = gone_id;
+    assert!(matches!(
+        za_imip_submit(&test.server, orphan).await,
+        ZaImipOutcome::Failed
+    ));
     wait_for_queue(test).await;
     assert!(sink().take_to(ATT).is_empty());
-    assert_quiet(&traced.finish().await, owner);
+    let events = traced.finish().await;
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.account_id == Some(gone_id as u64)
+                && event.typ == EventType::Calendar(CalendarEvent::ItipMessageError)
+                && event.details == ZA_IMIP_FAILED)
+            .count(),
+        1,
+        "the orphaned submission's failure is traced once"
+    );
+    assert_quiet(&events, owner);
 }
 
 /// D14, 8.2: two sessions drain one REFRESH item; exactly one answer goes out.
@@ -764,7 +793,10 @@ async fn delegation_to_outside(test: &TestServer, attendee: &Party) {
         .with_status(StatusCode::NO_CONTENT);
 }
 
-/// D12, release 4: a grantee's write mails from the owner's address with SENT-BY.
+/// D12, release 4: a grantee's write mails from the owner's address with
+/// SENT-BY. PR review ruling P1 on the delegated-organizer path: its
+/// attendee at a local address with no entry is withheld (`5.1`, traced
+/// without the address, never mailed).
 async fn grantee_write(test: &TestServer, owner: &Party, grantee: &Party) {
     let calendar = format!("/dav/cal/{}/imip-shared/", owner.name.replace('@', "%40"));
     owner
@@ -788,18 +820,48 @@ async fn grantee_write(test: &TestServer, owner: &Party, grantee: &Party) {
     .await
     .expect(200);
     sink().clear();
+    let traced = Traced::start(&[EventType::Calendar(CalendarEvent::ItipMessageError)]);
     let path = format!("{calendar}imip-out-g.ics");
     assert_eq!(
         put(
             grantee.name,
             STRONG,
             path.clone(),
-            event("imip-out-g", owner.name, &[ATT], 0, "")
+            event("imip-out-g", owner.name, &[ATT, UNROUTED_NOBODY], 0, "")
         )
         .await,
         201
     );
     wait_for_queue(test).await;
+    assert_eq!(
+        attendee_statuses(&owner.client, &path, UNROUTED_NOBODY).await,
+        ["5.1"],
+        "the grantee's write did not withhold the local address"
+    );
+    let unrouted = traced
+        .finish()
+        .await
+        .into_iter()
+        .filter(|event| event.account_id == Some(owner.id as u64))
+        .inspect(|event| {
+            assert!(
+                !event.text.contains('@'),
+                "an iMIP event carries an address: {}",
+                event.text
+            )
+        })
+        .filter(|event| event.details == ZA_IMIP_UNROUTED)
+        .count();
+    assert_eq!(unrouted, 1, "the withheld address is traced once");
+    assert_eq!(
+        sink()
+            .messages()
+            .iter()
+            .map(|message| message.rcpt_to.clone())
+            .collect::<Vec<_>>(),
+        [vec![ATT.to_string()]],
+        "only the outside address is mailed"
+    );
     let to_att = sink().take_to(ATT);
     assert_eq!(to_att.len(), 1, "the grantee's invitation");
     assert!(is_request_for(&to_att[0], "imip-out-g"));

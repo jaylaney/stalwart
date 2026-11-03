@@ -4007,12 +4007,14 @@ async fn c9_redelivery_stays_internal(test: &TestServer) {
     carol.delete_items_since(test, &carol_start).await;
 }
 
-/// Final review ruling A-2 (fail closed; spec 5.2's amendment pending Jay's
-/// confirmation): alice invites bob at `BOB_ALIAS`, which pins bob's key
-/// for that address. The address then moves to a plain account (bob loses
-/// it, a plain account gets it as an alias), as an operator's remap would.
-/// alice's next edit records `3.8` for it and mails nothing; after alice
-/// forgets the pin, her next edit mails the plain account (`1.1`).
+/// Final review ruling A-2 (fail closed, a spec 5.2 amendment Jay confirmed
+/// on 2026-11-03): a mail-class address that holds a contact pin in the
+/// sender's pin record is never mailed (`3.8`). alice invites bob at
+/// `BOB_ALIAS`, which pins bob's key for that address. The address then
+/// moves to a plain account (bob loses it, a plain account gets it as an
+/// alias), as an operator's remap would. alice's next edit records `3.8`
+/// for it and mails nothing; after alice forgets the pin, her next edit
+/// mails the plain account (`1.1`).
 async fn a2_remapped_pin_withholds_mail(test: &TestServer) {
     const UID: &str = "pin-a2";
     const PLAIN: &str = "pin-remap-plain@example.com";

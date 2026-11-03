@@ -662,6 +662,13 @@ impl Server {
 
     /// The pin record, and the mark only when the record is not usable.
     pub async fn za_pin_state(&self, keys: &SessionKeys) -> trc::Result<ZaPinState> {
+        #[cfg(feature = "test_mode")]
+        if crate::za::test_hooks::take_pin_read_fail(keys.account_id) {
+            return Err(trc::StoreEvent::UnexpectedError
+                .into_err()
+                .details("zero-access test hook: pin state read failure")
+                .caused_by(trc::location!()));
+        }
         let pins = self.za_pin_read(keys).await?;
         let mark = if pins.is_usable() {
             None
