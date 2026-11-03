@@ -20,12 +20,13 @@ use super::{
 use crate::utils::{
     http::HttpRequest,
     server::TestServer,
+    smtp_sink::sink,
     webdav::DummyWebDavClient,
     za::{
         HookParked, VaultReply, copy_href, inbox_ids, item_method, item_partstat, new_inbox_items,
         open_pending_item_as, pending_ids, pin_record, raw_pins, restore_wrap, rewrap_legacy,
-        saved_wrap, set_raw_pins, substitute_public_key, trigger_drain, vault_revision, wrap_mark,
-        write_pin_record, writer_key, za_post, za_unpin,
+        saved_wrap, set_raw_pins, substitute_public_key, trigger_drain, vault_revision,
+        wait_for_queue, wrap_mark, write_pin_record, writer_key, za_post, za_unpin,
     },
 };
 use ::registry::{
@@ -1269,6 +1270,10 @@ async fn case_11_mixed(test: &TestServer) {
         .await,
         StatusCode::NO_CONTENT
     );
+    // iMIP spec 5.4, 8.5: dave, an outside attendee, is mailed after the
+    // commit, to the sink.
+    wait_for_queue(test).await;
+    assert!(!sink().take_to("dave@external.test").is_empty());
     let items = opened(test, bob.id, &before).await;
     assert_eq!(
         methods(&items),

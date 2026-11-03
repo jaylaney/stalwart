@@ -11,11 +11,15 @@
 use super::{
     STRONG,
     fanout::{START_A, attendee_statuses, invite},
+    imip::is_request_for,
+    uid_lease,
 };
 use crate::utils::{
+    http::HttpRequest,
     server::TestServer,
+    smtp_sink::sink,
     webdav::DummyWebDavClient,
-    za::{AcceptAnyCert, Conn, SERVER_URL},
+    za::{AcceptAnyCert, Conn, HookParked, SERVER_URL, wait_for_queue},
 };
 use ::registry::{
     schema::{
@@ -28,17 +32,20 @@ use ::registry::{
     types::{list::List, map::Map},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use hyper::StatusCode;
+use common::za::test_hooks;
+use hyper::{Method, StatusCode};
 use serde_json::json;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc;
 use tokio_rustls::{
     TlsConnector,
     rustls::{self, pki_types::ServerName},
 };
 use trc::{
     AuthEvent, CacheEvent, CalendarEvent, Collector, EvalEvent, EventType, HttpEvent, JmapEvent,
-    ipc::subscriber::{Interests, SubscriberBuilder},
+    Key,
+    ipc::subscriber::{EventBatch, Interests, SubscriberBuilder},
 };
 
 /// The implicit-TLS IMAP listener.
@@ -149,6 +156,64 @@ fn strings(value: &trc::Value, out: &mut Vec<String>) {
         trc::Value::Array(items) => items.iter().for_each(|v| strings(v, out)),
         trc::Value::Event(err) => err.keys().iter().for_each(|(_, v)| strings(v, out)),
         _ => {}
+    }
+}
+
+/// Where a captured event was emitted relative to the key organizer's
+/// scheduling writes (iMIP spec 8.5): while the write was parked before its
+/// commit, after its commit (its submissions and their delivery), or
+/// elsewhere in the module.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Window {
+    Other,
+    PreCommit,
+    PostCommit,
+}
+
+/// One captured event: its type, its window, its span id, its `Reason` and
+/// `Code`, and every string it carries.
+struct Captured {
+    typ: EventType,
+    window: Window,
+    span: Option<u64>,
+    reason: Option<String>,
+    code: Option<u64>,
+    values: String,
+}
+
+/// The SMTP session's and the queue's events: transit metadata (iMIP spec
+/// section 7).
+fn is_transit(typ: EventType) -> bool {
+    matches!(
+        typ,
+        EventType::Smtp(_) | EventType::Delivery(_) | EventType::Queue(_)
+    )
+}
+
+/// Moves every event the subscriber holds into `into`, tagged `window`.
+fn capture(rx: &mut mpsc::Receiver<EventBatch>, window: Window, into: &mut Vec<Captured>) {
+    while let Ok(batch) = rx.try_recv() {
+        for event in batch {
+            let mut values = Vec::new();
+            let (mut span, mut reason, mut code) = (None, None, None);
+            for (key, value) in event.keys.iter() {
+                strings(value, &mut values);
+                match (key, value) {
+                    (Key::SpanId, trc::Value::UInt(id)) => span = Some(*id),
+                    (Key::Reason, trc::Value::String(text)) => reason = Some(text.to_string()),
+                    (Key::Code, trc::Value::UInt(value)) => code = Some(*value),
+                    _ => {}
+                }
+            }
+            into.push(Captured {
+                typ: event.inner.typ,
+                window,
+                span,
+                reason,
+                code,
+                values: values.join("\n"),
+            });
+        }
     }
 }
 
@@ -772,7 +837,7 @@ pub async fn test(test: &mut TestServer) {
     // `jmap.invalid-arguments` a method call's rejected arguments.
     // The negative assertions below are bounded by these event types: an
     // address traced through an unsubscribed event type is not caught.
-    let traced = [
+    let mut traced = vec![
         EventType::Http(HttpEvent::RequestBody),
         EventType::Http(HttpEvent::ResponseBody),
         EventType::Jmap(JmapEvent::NotRequest),
@@ -786,12 +851,20 @@ pub async fn test(test: &mut TestServer) {
         EventType::Eval(EvalEvent::Result),
         EventType::Eval(EvalEvent::Error),
     ];
+    // iMIP spec 8.5: the SMTP session and the queue that carry the key
+    // organizer's emails, so their spans can be set aside below.
+    traced.extend(
+        EventType::variants()
+            .iter()
+            .copied()
+            .filter(|typ| is_transit(*typ)),
+    );
     let mut interests = Interests::default();
-    for event_type in traced {
-        interests.set(event_type);
+    for event_type in &traced {
+        interests.set(*event_type);
     }
     let (_tx, mut rx, _) = SubscriberBuilder::new(SUBSCRIBER_ID.into())
-        .set_interests(traced)
+        .set_interests(traced.iter().copied())
         .with_lossy(false)
         .register();
     Collector::union_interests(interests);
@@ -870,22 +943,65 @@ pub async fn test(test: &mut TestServer) {
     assert!(dav.contains("calendar-auto-schedule"), "{dav}");
     // Invitations spec 10: the key account's fan-out looks its attendees up
     // without tracing them, on the PUT and again on the DELETE's CANCEL.
+    // iMIP spec 5.4, 8.5: each write is parked at its commit pause point
+    // while the events emitted before its commit are captured (where no
+    // event may name an attendee), then released: its emails are submitted
+    // after the commit and delivered, and those events are captured apart.
+    // Three recipients each: the raw client (5 s).
     let invite_path = format!("{key_cal}trace-invite.ics");
-    key_client
-        .request_with_headers(
-            "PUT",
-            &invite_path,
-            [CONTENT_TYPE],
+    let mut captured = Vec::new();
+    let parked = HookParked::start(
+        key1.id().document_id(),
+        test_hooks::set_commit_pause,
+        uid_lease::put(
+            "key1@example.com",
+            STRONG,
+            invite_path.clone(),
             invite(
                 "trace-invite",
                 START_A,
                 &[LOOKUP_LOCAL_ATTENDEE, LOOKUP_EXT_ATTENDEE, SUBADDR_ATTENDEE],
             ),
-        )
-        .await
-        .with_status(StatusCode::CREATED);
+        ),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    capture(&mut rx, Window::PreCommit, &mut captured);
+    assert_eq!(parked.finish().await, 201);
+    wait_for_queue(test).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    capture(&mut rx, Window::PostCommit, &mut captured);
+    // The two unknown local attendees are refused at RCPT after the commit
+    // (iMIP spec 5.4, section 7: the stage and the reply code).
+    let rcpt_refusals = |captured: &[Captured]| {
+        captured
+            .iter()
+            .filter(|event| {
+                event.window == Window::PostCommit
+                    && event.typ == EventType::Calendar(CalendarEvent::ItipMessageError)
+                    && event.reason.as_deref() == Some("RCPT-TO")
+                    && event.code.is_some_and(|code| code / 100 == 5)
+            })
+            .count()
+    };
+    assert_eq!(
+        rcpt_refusals(&captured),
+        2,
+        "the PUT's two unknown local attendees were not refused at RCPT"
+    );
+    // The external attendee reaches the sink.
+    assert_eq!(
+        sink()
+            .take_to(LOOKUP_EXT_ATTENDEE)
+            .iter()
+            .filter(|message| is_request_for(message, "trace-invite"))
+            .count(),
+        1,
+        "the external attendee was not mailed"
+    );
     // iMIP spec 5.1, 5.4: an address no account has is the mail class,
-    // handed to the mailer (`1.1`), where release 2 recorded `5.3`.
+    // handed to the mailer (`1.1`, written before the commit), where release
+    // 2 recorded `5.3`.
     assert_eq!(
         attendee_statuses(&key_client, &invite_path, LOOKUP_LOCAL_ATTENDEE).await,
         ["1.1"]
@@ -895,10 +1011,37 @@ pub async fn test(test: &mut TestServer) {
         attendee_statuses(&key_client, &invite_path, SUBADDR_ATTENDEE).await,
         ["1.1"]
     );
-    key_client
-        .request("DELETE", &invite_path, "")
-        .await
-        .with_status(StatusCode::NO_CONTENT);
+    capture(&mut rx, Window::Other, &mut captured);
+    let request = HttpRequest::with_credentials(8899, "key1@example.com", STRONG);
+    let path = invite_path.clone();
+    let parked = HookParked::start(
+        key1.id().document_id(),
+        test_hooks::set_delete_commit_pause,
+        async move {
+            request
+                .send_full(Method::DELETE, &path, None, None)
+                .await
+                .status
+                .as_u16()
+        },
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    capture(&mut rx, Window::PreCommit, &mut captured);
+    assert_eq!(parked.finish().await, 204);
+    wait_for_queue(test).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    capture(&mut rx, Window::PostCommit, &mut captured);
+    assert_eq!(
+        rcpt_refusals(&captured),
+        4,
+        "the DELETE's two CANCELs to unknown local attendees were not refused at RCPT"
+    );
+    assert_eq!(
+        sink().take_to(LOOKUP_EXT_ATTENDEE).len(),
+        1,
+        "the external attendee was not mailed its CANCEL"
+    );
     // Positive control: upstream's login looks up the nonexistent name.
     assert_eq!(
         login_wrong_password(LOOKUP_AUTH_USER).await.status(),
@@ -914,19 +1057,18 @@ pub async fn test(test: &mut TestServer) {
     );
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    let mut seen = Vec::new();
-    let mut typed = Vec::new();
-    while let Ok(batch) = rx.try_recv() {
-        for event in batch {
-            let mut values = Vec::new();
-            for (_, value) in event.keys.iter() {
-                strings(value, &mut values);
-            }
-            let values = values.join("\n");
-            typed.push((event.inner.typ, values.clone()));
-            seen.push(values);
-        }
-    }
+    capture(&mut rx, Window::Other, &mut captured);
+    // The module's other checks read the event types they always read: the
+    // transit events are subscribed for the spans alone.
+    let typed = captured
+        .iter()
+        .filter(|event| !is_transit(event.typ))
+        .map(|event| (event.typ, event.values.clone()))
+        .collect::<Vec<_>>();
+    let seen = typed
+        .iter()
+        .map(|(_, values)| values.clone())
+        .collect::<Vec<_>>();
     // The quiet path runs the rule, observably and without a trace. The
     // account's creation traces are drained first.
     let sub_user_id = admin
@@ -1114,28 +1256,57 @@ pub async fn test(test: &mut TestServer) {
         lookups.contains(LOOKUP_AUTH_CANARY),
         "no login lookup trace captured: {lookups}"
     );
+    // iMIP spec 8.5: the attendee canaries are checked over the events
+    // outside the submissions' spans. An event is inside when its span is
+    // that of an SMTP, delivery or queue event naming the canary, or when it
+    // is a cache lookup emitted after a write's commit: the SMTP session's
+    // own RCPT lookups and the queue's route evaluation carry no span id at
+    // HEAD (`common::cache::principals`). Every event emitted before a
+    // write's commit (the fan-out's lookups) is outside.
+    let outside = |canary: &str| {
+        let spans = captured
+            .iter()
+            .filter(|event| is_transit(event.typ) && event.values.contains(canary))
+            .filter_map(|event| event.span)
+            .collect::<HashSet<_>>();
+        captured
+            .iter()
+            .filter(|event| event.values.contains(canary))
+            .filter(|event| {
+                event.window == Window::PreCommit
+                    || !(is_transit(event.typ)
+                        || event.span.is_some_and(|span| spans.contains(&span))
+                        || (event.window == Window::PostCommit
+                            && matches!(event.typ, EventType::Cache(_))))
+            })
+            .map(|event| format!("{:?}: {}", event.typ, event.values))
+            .collect::<Vec<_>>()
+    };
+    // Positive control: the submissions' SMTP layer names them.
     assert!(
-        !all.contains(LOOKUP_LOCAL_CANARY),
-        "a key account's local attendee traced: {all}"
+        captured
+            .iter()
+            .any(|event| is_transit(event.typ) && event.values.contains(LOOKUP_LOCAL_CANARY)),
+        "no transit event named the local attendee"
     );
-    assert!(
-        !all.contains(LOOKUP_DOMAIN_CANARY),
-        "a key account's external attendee domain traced: {all}"
-    );
+    for (canary, what) in [
+        (LOOKUP_LOCAL_CANARY, "local attendee"),
+        (LOOKUP_DOMAIN_CANARY, "external attendee domain"),
+        (SUBADDR_CANARY, "sub-addressed attendee"),
+        (SUBADDR_DOMAIN_CANARY, "sub-addressing domain"),
+    ] {
+        let named = outside(canary);
+        assert!(
+            named.is_empty(),
+            "a key account's {what} traced outside the submissions: {named:#?}"
+        );
+    }
     // Custom sub-addressing: the subscriber sees upstream's evaluation
     // result, and none carries a key account's attendee.
     let eval_results = traced_as(EventType::Eval(EvalEvent::Result));
     assert!(
         eval_results.contains(SUBADDR_AUTH_CANARY),
         "no sub-addressing evaluation trace captured: {eval_results}"
-    );
-    assert!(
-        !all.contains(SUBADDR_CANARY),
-        "a key account's sub-addressed attendee traced: {all}"
-    );
-    assert!(
-        !all.contains(SUBADDR_DOMAIN_CANARY),
-        "a key account's sub-addressing domain traced: {all}"
     );
 
     test.wait_for_tasks().await;

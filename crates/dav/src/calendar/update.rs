@@ -710,7 +710,9 @@ impl CalendarUpdateRequestHandler for Server {
                 .map_err(|err| seal_error(err, account_id, document_id))?;
                 // Spec 5.3-5.4: after every check of the request and
                 // immediately before the sealed commit, the items go out; the
-                // fan-out decides the pairs the bundle keeps.
+                // fan-out decides the pairs the bundle keeps. Its mail
+                // attempts wait for the commit (iMIP spec 5.4, decision 9).
+                let mut za_mail = Vec::new();
                 if let Some(messages) = za_messages {
                     // The stored UID, which the new one was validated equal to.
                     let fan_out = self
@@ -737,6 +739,7 @@ impl CalendarUpdateRequestHandler for Server {
                     za_set_schedule_status(&mut new_content.data.event, &fan_out.statuses);
                     za_set_sequences(&mut new_content.data.event, &fan_out.sequences);
                     pairs = fan_out.pairs;
+                    za_mail = fan_out.mail;
                 }
                 // Ruling 15: the name stays in the sealed bundle.
                 new_event.display_name = view.display_name.clone();
@@ -779,9 +782,24 @@ impl CalendarUpdateRequestHandler for Server {
                     .caused_by(trc::location!())?;
                     #[cfg(feature = "test_mode")]
                     common::za::test_hooks::update_commit_pause_point(account_id).await;
-                    match self.commit_batch(batch).await {
+                    #[cfg(feature = "test_mode")]
+                    let fail =
+                        attempt == 0 && common::za::test_hooks::take_update_commit_fail(account_id);
+                    #[cfg(not(feature = "test_mode"))]
+                    let fail = false;
+                    let committed = if fail {
+                        Err(trc::StoreEvent::UnexpectedError
+                            .into_err()
+                            .details("zero-access test hook: update commit failure"))
+                    } else {
+                        self.commit_batch(batch).await
+                    };
+                    match committed {
                         Ok(_) => {
                             self.notify_task_queue();
+                            // iMIP spec 5.4: mail only once the commit
+                            // (or the bounded retry's) returned `Ok`.
+                            common::za::imip::za_imip_submit_all(self, za_mail).await;
                             return Ok(HttpResponse::new(StatusCode::NO_CONTENT)
                                 .with_etag_opt(serves_submitted_ical.then_some(etag))
                                 .with_schedule_tag_opt(schedule_tag));
@@ -1400,6 +1418,9 @@ async fn za_create_event(
     // lease: a creator whose lease was taken over writes no item after its
     // successor's.
     let mut pairs = None;
+    // iMIP spec 5.4, decision 9: the fan-out's mail attempts wait for the
+    // commit.
+    let mut za_mail = Vec::new();
     if let Some(messages) = messages {
         let fan_out = match server
             .za_fan_out(
@@ -1446,6 +1467,7 @@ async fn za_create_event(
         za_set_schedule_status(&mut content.data.event, &fan_out.statuses);
         za_set_sequences(&mut content.data.event, &fan_out.sequences);
         pairs = fan_out.pairs;
+        za_mail = fan_out.mail;
     }
 
     let serves_submitted_ical = if is_owner {
@@ -1566,6 +1588,9 @@ async fn za_create_event(
             .caused_by(trc::location!())?;
     }
     server.notify_task_queue();
+    // iMIP spec 5.4: reached only once the commit (or `za_commit_create`'s
+    // retry) returned `Ok`; every failure returned above.
+    common::za::imip::za_imip_submit_all(server, za_mail).await;
 
     Ok(HttpResponse::new(StatusCode::CREATED)
         .with_etag_opt(serves_submitted_ical.then_some(etag))

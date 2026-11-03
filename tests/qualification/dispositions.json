@@ -620,6 +620,19 @@
    {
     "from": {
      "file": "tests/src/za/mail/fence.rs",
+     "in": null,
+     "name": "expire_and_purge_blobs"
+    },
+    "to": {
+     "file": "tests/src/utils/za.rs",
+     "in": null,
+     "name": "expire_and_purge_blobs"
+    },
+    "evidence": "Plan 15 (release 5, iMIP) Task 7: `expire_and_purge_blobs` (every temporary blob link expired in place, then the scheduler's blob purge) moved unchanged to `utils::za`, shared by `fence.rs` and the leak modules, which purge the queue blobs outbound iMIP mail leaves before their whole-store scans (iMIP spec 8.5)."
+   },
+   {
+    "from": {
+     "file": "tests/src/za/mail/fence.rs",
      "in": "<impl SearchKeys>",
      "name": "holds_term"
     },

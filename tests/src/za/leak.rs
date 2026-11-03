@@ -77,12 +77,12 @@ use crate::{
         smtp::SmtpConnection,
         webdav::DummyWebDavClient,
         za::{
-            Conn, IDS_ONLY_DOCUMENT, PlantedItem, copy_href, hold_index_partition,
-            hold_task_consumer, inbox_ids, internal_search, itip_tasks_for, new_inbox_items,
-            pending_ids, pin_record, plain_dav_container, plant_container, plant_event,
-            plant_inbox_item, plant_plain_message, plant_sealed_event, queued_recipients,
-            release_index_partition, substitute_public_key, trigger_drain, wait_for_delivery,
-            za_unlock,
+            Conn, IDS_ONLY_DOCUMENT, PlantedItem, copy_href, expire_and_purge_blobs,
+            hold_index_partition, hold_task_consumer, inbox_ids, internal_search, itip_tasks_for,
+            new_inbox_items, pending_ids, pin_record, plain_dav_container, plant_container,
+            plant_event, plant_inbox_item, plant_plain_message, plant_sealed_event,
+            queued_recipients, release_index_partition, substitute_public_key, trigger_drain,
+            wait_for_delivery, wait_for_queue, za_unlock,
         },
     },
     za::drain::{DrainOn, body, set_partstat},
@@ -210,13 +210,19 @@ const VISIBLE_CANARIES: &[&str] = &["mailkw-canary", "mailbox-canary"];
 const DRAIN_EVENT: &str = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//za//EN\r\nBEGIN:VEVENT\r\nUID:leak-drain\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990105T090000Z\r\nDTEND:20990105T100000Z\r\nSEQUENCE:0\r\nSUMMARY:draintitle-canary\r\nLOCATION:drainloc-canary\r\nDESCRIPTION:draindesc-canary\r\nORGANIZER:mailto:key1@example.com\r\nATTENDEE;CN=draincn-canary;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:key2@example.com\r\nATTENDEE:mailto:drainaddr-canary@remote.test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 
 /// A future invitation organized by the key account to a local non-key
-/// account: with iTIP gated it is stored sealed and nothing is sent.
+/// account, stored sealed. The attendee is `SCHEDULE-AGENT=CLIENT` (iMIP
+/// spec question 7): plain is of iMIP's mail class, and a mailed invitation
+/// would put `sched-canary` in plain's mailbox, calendar and search index in
+/// the clear (exposure the spec accepts for a plain local recipient), where
+/// the whole-store scan reports it; with the client scheduling, upstream's
+/// builder makes no message for it, so nothing is sent and the event still
+/// tests the organizer's sealed copy.
 const SCHED_EVENT: &str = concat!(
     "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//t//EN\r\nBEGIN:VEVENT\r\n",
     "UID:leak-sched\r\nDTSTAMP:20240101T000000Z\r\nDTSTART:20990102T090000Z\r\n",
     "DTEND:20990102T100000Z\r\nSUMMARY:sched-canary\r\n",
     "ORGANIZER:mailto:key2@example.com\r\n",
-    "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:plain@example.com\r\n",
+    "ATTENDEE;PARTSTAT=NEEDS-ACTION;RSVP=TRUE;SCHEDULE-AGENT=CLIENT:mailto:plain@example.com\r\n",
     "END:VEVENT\r\nEND:VCALENDAR\r\n"
 );
 
@@ -1649,6 +1655,11 @@ pub async fn test_drain(test: &mut TestServer) {
         shown.contains("draintitle-canary") && shown.contains("draincn-canary"),
         "{shown}"
     );
+    // iMIP spec 8.5: the invitation's email to the outside attendee is sunk
+    // and its queue blob purged before the scans; as the first leak module,
+    // this purge also removes the queue blobs that the earlier modules'
+    // outbound mail left.
+    sink_and_purge_held(test).await;
     let drained = scan(test, key2_id).await;
     assert!(
         drained.violations.is_empty(),
@@ -1681,6 +1692,7 @@ pub async fn test_drain(test: &mut TestServer) {
         !token_hits(test, &[token]).await.is_empty(),
         "the positive control: the pending reply's visible token"
     );
+    sink_and_purge_held(test).await;
     let pending_scan = scan(test, key1_id).await;
     assert!(
         pending_scan.violations.is_empty(),
@@ -1693,6 +1705,7 @@ pub async fn test_drain(test: &mut TestServer) {
         token_hits(test, &[token]).await.is_empty(),
         "the token in the clear after the organizer's drain"
     );
+    sink_and_purge_held(test).await;
     let after_reply = scan(test, key1_id).await;
     assert!(
         after_reply.violations.is_empty(),
@@ -1823,6 +1836,17 @@ fn mail_canary_message(n: u32) -> String {
          --za-leak--\r\n",
         STANDARD.encode("mailattach-canary")
     )
+}
+
+/// iMIP spec 8.5: once the outbound mail is at the sink, its queue blobs
+/// (which hold the canaries) are purged before a scan. While the task
+/// consumer is held the scheduler's purge task cannot run, so these are
+/// `expire_and_purge_blobs`'s two steps run in place: every temporary link
+/// expired, then the purge.
+async fn sink_and_purge_held(test: &TestServer) {
+    wait_for_queue(test).await;
+    test.blob_expire_all().await;
+    purge_blobs(test).await;
 }
 
 /// Deletes every unlinked blob, as the purge does: a delivered message's
@@ -2339,6 +2363,9 @@ pub async fn test(test: &mut TestServer) {
         "key1's invitation reached key2 once"
     );
     let fan_out_item = fan_out_items[0].0;
+    // iMIP spec 8.5: the email to the outside attendee is sunk and its queue
+    // blob purged before the scan.
+    sink_and_purge_held(test).await;
     let pending = scan(test, id).await;
     assert!(
         pending.violations.is_empty(),
@@ -2493,6 +2520,9 @@ pub async fn test(test: &mut TestServer) {
     )
     .await;
 
+    // iMIP spec 8.5: every email sunk and the queue blobs purged first.
+    wait_for_queue(test).await;
+    expire_and_purge_blobs(test, test.account("admin@example.com")).await;
     let result = scan(test, id).await;
     println!(
         "Leak scan: {} records, {} archives, {} blobs, {} search index records ({} of the account, none calendar), {} events, {} calendars, {} items, {} emails",

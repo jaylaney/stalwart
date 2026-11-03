@@ -56,6 +56,12 @@ pub const ZA_IMIP_TOO_LARGE: &str = "iMIP message too large";
 /// would have left no inbox item (the reason is the outcome's fixed name).
 pub const ZA_IMIP_ITEM_DELETED: &str = "zero-access: mail-borne item deleted";
 
+// The callers (spec 5.4, Jay's decision 9).
+
+/// The details of a DELETE's mail attempts dropped because its commit
+/// returned an error: nothing is submitted (section 7).
+pub const ZA_IMIP_DROPPED: &str = "zero-access: iMIP mail dropped, the deletion did not commit";
+
 /// One (message, recipient) of spec 5.3: the event's account (upstream's
 /// task account), the event's document id, and one message as
 /// `ItipMessages::new` fills it, with `to` the one recipient. No `Debug`:
@@ -133,6 +139,24 @@ pub async fn za_imip_submit(server: &Server, mail: ZaImipMail) -> ZaImipOutcome 
 pub async fn za_imip_submit_all(server: &Server, mails: Vec<ZaImipMail>) {
     for mail in mails {
         za_imip_submit(server, mail).await;
+    }
+}
+
+/// Spec 5.4, section 7: a DELETE whose commit returned an error mails
+/// nothing; traces one `ItipMessageError` per distinct event (document id)
+/// among the dropped attempts, with ids and the fixed reason only.
+pub fn za_imip_trace_dropped(account_id: u32, mails: &[ZaImipMail]) {
+    let mut traced = Vec::new();
+    for mail in mails {
+        if !traced.contains(&mail.document_id) {
+            traced.push(mail.document_id);
+            trc::event!(
+                Calendar(trc::CalendarEvent::ItipMessageError),
+                AccountId = account_id,
+                DocumentId = mail.document_id,
+                Details = ZA_IMIP_DROPPED,
+            );
+        }
     }
 }
 

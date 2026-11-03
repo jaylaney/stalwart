@@ -8442,6 +8442,10 @@ async fn sharing_lifecycle_negative_and_exception(test: &mut TestServer) {
             test.server.invalidate_all_local_negative_caches();
         }
     }
+    // iMIP spec 5.1, 8.5 (Jay's decision 10): the writer-only group is of the
+    // mail class, so its lifecycles mailed it; the group outlives the module,
+    // and what it received goes (it cannot sign in: the admin clears it).
+    crate::utils::za::clear_received_scheduling_as(test, &admin, wg.document_id()).await;
 }
 
 async fn grantee_gate_controls(

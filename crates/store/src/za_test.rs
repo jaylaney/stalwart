@@ -40,6 +40,11 @@
 //!   count): an index pass splits between its term merges only when it holds
 //!   more than 1000 of them, as a document with more than 1000 distinct terms
 //!   does.
+//! - `SECOND_CHUNK_FAIL_ONCE` (iMIP spec 5.4, 8.2): `Store::write_batch`
+//!   fails a batch before its second commit chunk, after its first chunk is
+//!   written, when the batch's current account is the named account; one
+//!   shot. Set it beside `FORCE_COMMIT_SPLIT`, so a fixture-sized batch
+//!   reaches a second chunk.
 
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
@@ -126,6 +131,30 @@ pub fn force_commit_split(account_id: Option<u32>) -> bool {
     }
 }
 
+/// The account whose next batch fails before its second commit chunk.
+pub static SECOND_CHUNK_FAIL_ONCE: Mutex<Option<u32>> = Mutex::new(None);
+
+pub fn set_second_chunk_fail_once(account_id: Option<u32>) {
+    *SECOND_CHUNK_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = account_id;
+}
+
+/// Whether the batch whose current account is `account_id` must fail before
+/// its second commit chunk: only an exact match of the named account; clears
+/// the slot when it answers `true`.
+pub fn take_second_chunk_fail(account_id: Option<u32>) -> bool {
+    let mut slot = SECOND_CHUNK_FAIL_ONCE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if account_id.is_some() && *slot == account_id {
+        *slot = None;
+        true
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,6 +164,15 @@ mod tests {
     };
     use nlp::language::Language;
     use types::collection::Collection;
+
+    /// The hooks are process-wide, and the test harness runs tests on
+    /// parallel threads: every test that sets `FORCE_COMMIT_SPLIT`, or whose
+    /// batch it would split (a pass with no current account), holds this.
+    static PROCESS_HOOKS: Mutex<()> = Mutex::new(());
+
+    fn hold_process_hooks() -> std::sync::MutexGuard<'static, ()> {
+        PROCESS_HOOKS.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn batch_of(account_id: u32) -> BatchBuilder {
         let mut batch = BatchBuilder::new();
@@ -179,6 +217,7 @@ mod tests {
         // Account ids no other test of this crate uses.
         const SPLIT: u32 = 0x5a5a_0001;
         const OTHER: u32 = 0x5a5a_0002;
+        let _hooks = hold_process_hooks();
 
         assert_eq!(batch_of(SPLIT).commit_point_count(), 0);
         assert_eq!(index_pass_of(SPLIT).commit_point_count(), 0);
@@ -207,6 +246,7 @@ mod tests {
 
         // An account id no other test of this crate uses.
         const MID_PASS: u32 = 0x5a5a_0201;
+        let _hooks = hold_process_hooks();
         let vault: ValueClass = PrincipalField::ZeroAccessVault.into();
         let text = (0..2500)
             .map(|n| format!("term{n:05}"))
@@ -265,5 +305,51 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// The documents of `batch_of(account_id)` whose property is stored.
+    async fn written_documents(store: &crate::Store, account_id: u32) -> Vec<u32> {
+        let mut written = Vec::new();
+        for document_id in 0..3 {
+            if store
+                .get_value::<crate::write::serialize::RawValue>(crate::ValueKey::property(
+                    account_id,
+                    Collection::Email,
+                    document_id,
+                    1u8,
+                ))
+                .await
+                .unwrap()
+                .is_some()
+            {
+                written.push(document_id);
+            }
+        }
+        written
+    }
+
+    /// Spec 8.2: a forced-split batch whose second chunk fails keeps its first
+    /// chunk, returns the error, and the hook is spent; another account's batch is untouched.
+    #[tokio::test]
+    async fn the_second_chunk_fails_once_for_its_account() {
+        use crate::{Store, backend::ephemeral::EphemeralStore};
+
+        const FAILS: u32 = 0x5a5a_0301;
+        const OTHER: u32 = 0x5a5a_0302;
+        let _hooks = hold_process_hooks();
+        let store: Store = EphemeralStore::open();
+        set_force_commit_split(Some(FAILS));
+        set_second_chunk_fail_once(Some(FAILS));
+        assert!(store.write_batch(&mut batch_of(FAILS)).await.is_err());
+        set_force_commit_split(None);
+        assert_eq!(
+            written_documents(&store, FAILS).await,
+            [0],
+            "the first chunk stands"
+        );
+        assert!(!take_second_chunk_fail(Some(FAILS)), "one-shot");
+        set_second_chunk_fail_once(Some(FAILS));
+        assert!(store.write_batch(&mut batch_of(OTHER)).await.is_ok());
+        set_second_chunk_fail_once(None);
     }
 }

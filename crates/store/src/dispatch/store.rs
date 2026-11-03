@@ -301,9 +301,22 @@ impl Store {
         crate::dispatch::StoreOps::count_write_batch();
 
         let mut assigned_ids = AssignedIds::default();
+        // iMIP spec 8.2: `SECOND_CHUNK_FAIL_ONCE`, keyed by the batch's
+        // current account, fails the batch after its first chunk.
+        #[cfg(feature = "test_mode")]
+        let (account_id, mut chunk) = (builder.last_account_id(), 0usize);
         let mut commit_points = builder.commit_points();
 
         for commit_point in commit_points.iter() {
+            #[cfg(feature = "test_mode")]
+            {
+                if chunk == 1 && crate::za_test::take_second_chunk_fail(account_id) {
+                    return Err(StoreEvent::UnexpectedError
+                        .into_err()
+                        .details("zero-access test hook: second chunk failure"));
+                }
+                chunk += 1;
+            }
             let batch = builder.build_one(commit_point);
             self.write(batch, &mut assigned_ids).await?;
         }
